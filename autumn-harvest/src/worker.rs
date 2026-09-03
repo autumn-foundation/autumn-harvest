@@ -18307,7 +18307,7 @@ async fn process_workflow_task(
             Some(policy) => {
                 crate::hot_swap::with_module_host(
                     policy
-                        .for_task()
+                        .clone()
                         .with_optional_build_id(prepared.execution.assigned_build_id.clone())
                         .with_optional_pinned_module(pinned_module.clone()),
                     workflow_drive,

@@ -89,7 +89,7 @@
 //! code is a use-after-free rather than a refcount decrement. See
 //! `docs/rnd/hot-code-swap.md` §3.
 
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet};
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -100,7 +100,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::context::WorkflowContext;
-use crate::error::HarvestError;
+use crate::error::{HarvestError, TimeoutType};
 use crate::wasm_activities::{WasmCapabilities, WasmLimits, WasmModuleStore};
 
 /// Wire-format version of the decide-loop ABI.
@@ -686,6 +686,10 @@ pub struct ModuleRegistry {
     /// `BTreeMap` rather than `HashMap` so [`Self::descriptors`] has a stable,
     /// reproducible order for diagnostics and tests.
     bindings: RwLock<BTreeMap<(String, String), Arc<LoadedWorkflowModule>>>,
+    /// Guest decisions already taken, shared by every task on this worker
+    /// (issue #967, Codex review round 2). See [`DecisionCache`] for why the
+    /// process is the right lifetime and why sharing is sound.
+    decisions: Mutex<DecisionCache>,
     /// Bumped by every [`Self::unload_build`]. A load captures it before
     /// compiling and refuses to insert if it moved, so a retirement cannot be
     /// silently undone by a sync that was already in flight.
@@ -717,7 +721,13 @@ impl Default for ModuleRegistry {
 
 /// One entry of a [`ModuleRegistry::load_modules`] batch: an identity and the
 /// compiled module to bind to it.
-struct PreparedBinding {
+/// A module that has been verified and compiled but not yet bound.
+///
+/// Public so a caller can interleave fetching and compiling — see
+/// [`ModuleRegistry::prepare_module`] — while still binding the whole build
+/// atomically.
+#[derive(Debug)]
+pub struct PreparedBinding {
     key: (String, String),
     loaded: Arc<LoadedWorkflowModule>,
 }
@@ -742,6 +752,7 @@ impl ModuleRegistry {
         Self {
             store,
             bindings: RwLock::new(BTreeMap::new()),
+            decisions: Mutex::new(DecisionCache::new()),
             generation: AtomicU64::new(0),
         }
     }
@@ -960,6 +971,65 @@ impl ModuleRegistry {
         self.commit(prepared, generation)
     }
 
+    /// The worker's decision cache.
+    ///
+    /// # Errors
+    ///
+    /// [`HotSwapError`] is not used here; the guard is returned so a caller can
+    /// read [`DecisionCache::stats`]. Poisoning is surfaced as `None`.
+    #[must_use]
+    pub fn decisions(&self) -> Option<std::sync::MutexGuard<'_, DecisionCache>> {
+        self.decisions.lock().ok()
+    }
+
+    /// The registry generation to pass back to [`commit_prepared`](Self::commit_prepared).
+    ///
+    /// Read it *before* the first [`prepare_module`](Self::prepare_module) so an
+    /// `unload_build` racing the load is detected at commit time.
+    #[must_use]
+    pub fn load_generation(&self) -> u64 {
+        self.generation.load(Ordering::Acquire)
+    }
+
+    /// Verify and compile one module without binding it.
+    ///
+    /// Pair with [`load_generation`](Self::load_generation) and
+    /// [`commit_prepared`](Self::commit_prepared) to load a whole build
+    /// atomically **without holding every module's source bytes at once**
+    /// (issue #967, Codex review round 2): fetch a payload, prepare it, drop the
+    /// payload, repeat, then commit. [`load_modules`](Self::load_modules) is the
+    /// convenience form for callers that already hold the whole batch.
+    ///
+    /// # Errors
+    ///
+    /// Any [`HotSwapError`] from [`verify_module_bytes`], plus
+    /// [`HotSwapError::Compile`].
+    pub fn prepare_module(
+        &self,
+        build_id: &str,
+        workflow_name: &str,
+        bytes: &[u8],
+        verification: &ModuleVerification<'_>,
+    ) -> Result<PreparedBinding, HotSwapError> {
+        self.prepare(build_id, workflow_name, bytes, verification)
+    }
+
+    /// Bind every [`PreparedBinding`] at once, or none of them.
+    ///
+    /// # Errors
+    ///
+    /// [`HotSwapError::DuplicateRegistration`] if any binding would change what
+    /// a `(build_id, workflow_name)` means — including two entries within this
+    /// batch disagreeing — and [`HotSwapError::UnloadedDuringLoad`] if the
+    /// registry's generation moved since `generation` was read.
+    pub fn commit_prepared(
+        &self,
+        prepared: Vec<PreparedBinding>,
+        generation: u64,
+    ) -> Result<Vec<ModuleDescriptor>, HotSwapError> {
+        self.commit(prepared, generation)
+    }
+
     /// Resolve the module bound to `(build_id, workflow_name)`, if any.
     #[must_use]
     pub fn get(&self, build_id: &str, workflow_name: &str) -> Option<Arc<LoadedWorkflowModule>> {
@@ -1066,40 +1136,127 @@ pub struct ModuleHost {
     /// what makes the documented "unloading is safe for in-flight invocations"
     /// guarantee true rather than merely likely.
     pub pinned_module: Option<Arc<LoadedWorkflowModule>>,
-    /// Decisions already taken for this workflow task, keyed by the exact
-    /// request bytes that produced them (issue #967, Codex review round 1).
-    ///
-    /// Under DD-1 the executor re-invokes the workflow from the top on every
-    /// decision cycle, so without a cache the guest is re-asked for steps
-    /// `0..n` on the nth activity completion — quadratic guest work over a run,
-    /// and a long run can burn its whole
-    /// [`DECIDE_RUN_WALL_CLOCK`] budget replaying decisions it already took.
-    /// A per-invocation map cannot help: one invocation visits each step
-    /// exactly once, in increasing order, so it never reads its own writes. The
-    /// cache has to outlive the invocation, which is why it lives on the host —
-    /// task-local, so it is scoped to exactly one execution's drive.
-    ///
-    /// Keyed by the module identity plus the [`encode_decide_request`] output,
-    /// rather than by step index. The guest is a pure function of the request,
-    /// so the request bytes *are* the cache key: an entry can only ever be
-    /// reused for a call that would have been given byte-identical input, to
-    /// byte-identical code. That makes the reuse sound by construction instead
-    /// of by an argument about which prefixes are stable. The identity prefix is
-    /// load-bearing — a `DecideRequest` carries no build id, so without it v1's
-    /// answer would be reusable for v2.
-    ///
-    /// Populate a fresh one per task with [`for_task`](Self::for_task); cloning
-    /// a prototype shares its cache.
-    pub decisions: Arc<Mutex<HashMap<Vec<u8>, DecideResponse>>>,
 }
 
-/// Hard ceiling on cached decisions per workflow task.
+/// Hard ceiling on entries in a registry's decision cache.
 ///
-/// One cycle can add at most [`MAX_DECIDE_STEPS`] entries and later cycles
-/// re-derive the same keys, so a well-behaved run settles well below this. The
-/// bound exists so a guest that somehow varies its request stream cannot grow
-/// the map without limit for the life of the task.
-const MAX_CACHED_DECISIONS: usize = MAX_DECIDE_STEPS * 4;
+/// The cache lives for the worker process (see [`DecisionCache`]), so this is
+/// the bound that keeps it from growing without limit. Entries are small — a
+/// 32-byte digest and one `DecideResponse` — because the key is a hash of the
+/// request rather than the request itself, which can be up to
+/// [`MAX_DECIDE_REQUEST_BYTES`].
+pub const MAX_CACHED_DECISIONS: usize = 4096;
+
+/// A worker-process-lifetime cache of guest decisions, bounded and
+/// insertion-ordered (issue #967, Codex review round 2).
+///
+/// **Why the process and not the task.** The first cut of this cache lived on
+/// `ModuleHost`, installed fresh per workflow task. That is the wrong lifetime:
+/// an ordinary activity *ends* the task, and the workflow resumes in a new
+/// `process_workflow_task` call (only local activities re-drive in place), so
+/// the cache was reset on every durable cycle and the O(n²) it existed to remove
+/// survived untouched in production.
+///
+/// **Why sharing across executions is sound.** The guest is a pure function of
+/// its request, under deny-all capabilities — no clock, no randomness. Two calls
+/// with the same key are therefore two calls that must return the same answer,
+/// whoever is asking. The key is a digest of `(build_id, module_hash, request
+/// bytes)`, so an entry can only ever be reused for byte-identical input to
+/// byte-identical code; the module identity is load-bearing, since a
+/// `DecideRequest` carries no build id and v1/v2 of one workflow see identical
+/// input at step 0.
+///
+/// Eviction is oldest-first rather than true LRU: a decision's value is
+/// concentrated in the cycles right after it is taken, and an insertion-ordered
+/// map keeps the implementation something a reader can check by eye.
+#[derive(Debug, Default)]
+pub struct DecisionCache {
+    entries: BTreeMap<u64, ([u8; 32], DecideResponse)>,
+    index: BTreeMap<[u8; 32], u64>,
+    next_seq: u64,
+    hits: u64,
+    misses: u64,
+}
+
+impl DecisionCache {
+    /// An empty cache, usable from a `const fn` constructor.
+    #[must_use]
+    pub const fn new() -> Self {
+        Self {
+            entries: BTreeMap::new(),
+            index: BTreeMap::new(),
+            next_seq: 0,
+            hits: 0,
+            misses: 0,
+        }
+    }
+
+    /// Digest of the guest's exact input, together with the code that will see
+    /// it.
+    #[must_use]
+    pub fn key(build_id: &str, module_hash: &str, request_bytes: &[u8]) -> [u8; 32] {
+        use sha2::{Digest as _, Sha256};
+        let mut hasher = Sha256::new();
+        // Length-prefixed so no two distinct triples can share a preimage.
+        for field in [build_id.as_bytes(), module_hash.as_bytes(), request_bytes] {
+            hasher.update((field.len() as u64).to_be_bytes());
+            hasher.update(field);
+        }
+        hasher.finalize().into()
+    }
+
+    /// The decision recorded for `key`, if any. Records a hit or a miss.
+    pub fn get(&mut self, key: &[u8; 32]) -> Option<DecideResponse> {
+        let found = self
+            .index
+            .get(key)
+            .and_then(|seq| self.entries.get(seq))
+            .map(|(_, response)| response.clone());
+        if found.is_some() {
+            self.hits += 1;
+        } else {
+            self.misses += 1;
+        }
+        found
+    }
+
+    /// Record `response` for `key`, evicting the oldest entry if full.
+    pub fn insert(&mut self, key: [u8; 32], response: DecideResponse) {
+        if self.index.contains_key(&key) {
+            return;
+        }
+        while self.entries.len() >= MAX_CACHED_DECISIONS {
+            let Some((&oldest, _)) = self.entries.iter().next() else {
+                break;
+            };
+            if let Some((evicted, _)) = self.entries.remove(&oldest) {
+                self.index.remove(&evicted);
+            }
+        }
+        let seq = self.next_seq;
+        self.next_seq += 1;
+        self.entries.insert(seq, (key, response));
+        self.index.insert(key, seq);
+    }
+
+    /// `(hits, misses)` since the process started — for tests and diagnostics.
+    #[must_use]
+    pub const fn stats(&self) -> (u64, u64) {
+        (self.hits, self.misses)
+    }
+
+    /// How many decisions are currently cached.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    /// Whether the cache holds no decisions.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+}
 
 impl ModuleHost {
     /// A host over `registry` with no build bound, deny-all capabilities, the
@@ -1114,7 +1271,6 @@ impl ModuleHost {
             allowed_activities: None,
             allow_queue_override: false,
             pinned_module: None,
-            decisions: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -1162,30 +1318,6 @@ impl ModuleHost {
     pub const fn allowing_queue_override(mut self) -> Self {
         self.allow_queue_override = true;
         self
-    }
-
-    /// Clone this host as the policy for **one** workflow task, with an empty
-    /// decision cache.
-    ///
-    /// The worker stores a `ModuleHost` prototype and clones it per task. A
-    /// plain `Clone` would share the prototype's `decisions` `Arc` across every
-    /// execution on the worker, which is not what
-    /// [`decisions`](Self::decisions) documents and not what its key can
-    /// support: cache entries are scoped by the module identity below, but a
-    /// process-wide map would still accumulate for the worker's whole life
-    /// rather than for one drive. Use this, not `Clone`, at a dispatch seam.
-    #[must_use]
-    pub fn for_task(&self) -> Self {
-        Self {
-            registry: Arc::clone(&self.registry),
-            build_id: self.build_id.clone(),
-            capabilities: self.capabilities.clone(),
-            limits: self.limits,
-            allowed_activities: self.allowed_activities.clone(),
-            allow_queue_override: self.allow_queue_override,
-            pinned_module: self.pinned_module.clone(),
-            decisions: Arc::new(Mutex::new(HashMap::new())),
-        }
     }
 
     /// Pin the binding the dispatch path already resolved, so the trampoline
@@ -1368,9 +1500,39 @@ fn outcome_for_guest(err: &HarvestError) -> Option<DecideOutcome> {
             details: details.clone(),
             error: bound_guest_text(&err.to_string()),
         }),
-        // NonDeterministic, Cancelled, PayloadTooLarge, Config, Database, ...
-        // all mean "the engine cannot carry this run forward", not "your step
-        // failed". They propagate.
+        // An activity-scoped timeout is an activity OUTCOME, not an engine
+        // failure (issue #967, Codex review round 2). `execute_activity_raw`
+        // produces it from `HistoryMatch::TimedOut`, so it is history-backed and
+        // replay-deterministic on exactly the same footing as `ActivityFailed` —
+        // and the engine itself pairs the two everywhere it classifies a step
+        // result (`context.rs`, `dag.rs`). Withholding it gave a hosted workflow
+        // strictly less than its statically-linked twin: a timeout a native
+        // handler can catch and recover from killed a hosted run outright.
+        //
+        // The `timeout_type` split is the part that matters, and is why this is
+        // not simply "hand `Timeout` over". `WorkflowExecution` and
+        // `WorkflowChain` are the *run's* own deadline, not a step's; handing
+        // either to the guest would let a module answer `Complete` and carry on
+        // past the deadline the engine just enforced — the same shape of mistake
+        // as handing over a replay divergence.
+        HarvestError::Timeout {
+            timeout_type:
+                timeout_type @ (TimeoutType::StartToClose
+                | TimeoutType::ScheduleToStart
+                | TimeoutType::ScheduleToClose
+                | TimeoutType::Heartbeat),
+            ..
+        } => Some(DecideOutcome::Err {
+            // A stable, matchable class, mirroring how `error_type` lets a guest
+            // branch without parsing a `Display` string that differs between the
+            // inline and replayed delivery paths.
+            error_type: format!("harvest.timeout.{timeout_type}"),
+            details: None,
+            error: bound_guest_text(&err.to_string()),
+        }),
+        // NonDeterministic, Cancelled, PayloadTooLarge, Config, Database, the
+        // workflow-scoped timeouts, ... all mean "the engine cannot carry this
+        // run forward", not "your step failed". They propagate.
         _ => None,
     }
 }
@@ -1554,27 +1716,19 @@ pub fn module_workflow_handler(
             let encoded = encode_decide_request(&request).map_err(|why| {
                 format!("failed to encode the decide request for step {step_index}: {why}")
             })?;
-            // The cache key is the request bytes PREFIXED with the module
+            // The cache key digests the request TOGETHER WITH the module
             // identity. `DecideRequest` deliberately carries no build id — the
             // guest has no business knowing which version it is — so the request
             // bytes alone are ambiguous across builds: v1 and v2 of one workflow
             // see byte-identical input at step 0, and a key without the identity
             // would let v1's decision be served to v2, silently defeating the
-            // swap this whole spike is about. Prefixing with
-            // `(build_id, module_hash)` makes an entry reusable only for the
-            // exact code that produced it.
-            let mut key = Vec::with_capacity(encoded.len() + build_id.len() + 80);
-            key.extend_from_slice(build_id.as_bytes());
-            key.push(0);
-            key.extend_from_slice(module.descriptor().module_hash.as_bytes());
-            key.push(0);
-            key.extend_from_slice(&encoded);
+            // swap this whole spike is about.
+            let key = DecisionCache::key(&build_id, &module.descriptor().module_hash, &encoded);
             let cached = host
-                .decisions
-                .lock()
-                .map_err(|_| "the module host's decision cache is poisoned".to_string())?
-                .get(&key)
-                .cloned();
+                .registry
+                .decisions()
+                .ok_or_else(|| "the decision cache is poisoned".to_string())?
+                .get(&key);
             let response = if let Some(cached) = cached {
                 cached
             } else {
@@ -1587,14 +1741,10 @@ pub fn module_workflow_handler(
                 let started = Instant::now();
                 let response = decide_encoded(&host, &limits, &module, &encoded, step_index)?;
                 guest_time = guest_time.saturating_add(started.elapsed());
-                let mut cache = host
-                    .decisions
-                    .lock()
-                    .map_err(|_| "the module host's decision cache is poisoned".to_string())?;
-                if cache.len() < MAX_CACHED_DECISIONS {
-                    cache.insert(key, response.clone());
-                }
-                drop(cache);
+                host.registry
+                    .decisions()
+                    .ok_or_else(|| "the decision cache is poisoned".to_string())?
+                    .insert(key, response.clone());
                 // NOTE: deliberately no `yield_now()` here (issue #967, Codex
                 // review round 1). `executor::run_workflow_handler_cycle` drives
                 // the handler inside `tokio::time::timeout(SUSPENSION_TIMEOUT)`,
@@ -1802,6 +1952,52 @@ mod tests {
                 assert!(details.is_some(), "structured detail is carried");
             }
             other => panic!("an activity failure IS the guest's business, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn activity_scoped_timeouts_are_the_guests_business_but_run_scoped_ones_are_not() {
+        // Codex review round 2. `execute_activity_raw` builds this from
+        // `HistoryMatch::TimedOut`, so it is history-backed and replay-
+        // deterministic on the same footing as `ActivityFailed` — and the engine
+        // pairs the two everywhere it classifies a step result. Withholding it
+        // gave a hosted workflow strictly less than its statically-linked twin:
+        // a timeout a native handler can catch killed a hosted run outright.
+        for timeout_type in [
+            TimeoutType::StartToClose,
+            TimeoutType::ScheduleToStart,
+            TimeoutType::ScheduleToClose,
+            TimeoutType::Heartbeat,
+        ] {
+            let err = HarvestError::Timeout {
+                timeout_type: timeout_type.clone(),
+                task_name: "charge".to_string(),
+            };
+            match outcome_for_guest(&err) {
+                Some(DecideOutcome::Err { error_type, .. }) => assert_eq!(
+                    error_type,
+                    format!("harvest.timeout.{timeout_type}"),
+                    "the guest needs a stable class to branch on, not a Display string"
+                ),
+                other => {
+                    panic!("an activity timeout IS an activity outcome, got {other:?}")
+                }
+            }
+        }
+
+        // The split that matters. These are the RUN's own deadline, not a step's
+        // — handing either to the guest would let a module answer `Complete` and
+        // carry on past the deadline the engine just enforced, which is the same
+        // shape of mistake as handing over a replay divergence.
+        for timeout_type in [TimeoutType::WorkflowExecution, TimeoutType::WorkflowChain] {
+            assert!(
+                outcome_for_guest(&HarvestError::Timeout {
+                    timeout_type: timeout_type.clone(),
+                    task_name: "pipeline".to_string(),
+                })
+                .is_none(),
+                "{timeout_type} is the run's deadline and must propagate"
+            );
         }
     }
 

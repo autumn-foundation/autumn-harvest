@@ -336,21 +336,35 @@ it should be named rather than discovered later:
   Two details of that cache are load-bearing, and the first cut of the spike got
   both wrong (Codex review round 1):
 
-  * **It cannot live in the handler future.** A map created inside the trampoline
-    is written and read by a single monotonically increasing pass over
-    `0..MAX_DECIDE_STEPS`, so it never reads its own writes and the quadratic
-    stands untouched. The cache has to outlive the invocation, which is why it
-    lives on `ModuleHost` — task-local, therefore scoped to exactly one
-    execution's drive, and installed fresh by `ModuleHost::for_task` rather than
-    shared by `Clone` from the worker's stored prototype.
+  * **It has to outlive the workflow task, not just the invocation.** Two cuts
+    of this got the lifetime wrong before it was right, and the reason is worth
+    stating because it is a property of DD-1 that is easy to misjudge. A map
+    created *inside the trampoline* is written and read by a single
+    monotonically increasing pass over `0..MAX_DECIDE_STEPS`, so it never reads
+    its own writes. Moving it to `ModuleHost`, installed per workflow task, is
+    still not enough: an ordinary activity **ends the task**, and the workflow
+    resumes in a new `process_workflow_task` call — only *local* activities
+    re-drive in place — so a per-task cache is reset on every durable cycle and
+    the quadratic survives untouched in production. The cache therefore lives on
+    the `ModuleRegistry`, for the worker process.
   * **The key must carry the module identity.** A `DecideRequest` deliberately
     contains no build id — the guest has no business knowing its own version — so
     v1 and v2 of one workflow see byte-identical input at step 0. Keying on the
     request bytes alone would let v1's decision be served to v2, silently
-    defeating the very swap this report recommends. The key is
-    `(build_id, module_hash)` prefixed onto the encoded request, which makes an
-    entry reusable only for the exact code that produced it
+    defeating the very swap this report recommends. The key is a digest of
+    `(build_id, module_hash, request bytes)`, length-prefixed so no two distinct
+    triples share a preimage, which makes an entry reusable only for the exact
+    code that produced it
     (`the_decision_cache_never_serves_one_builds_answer_to_another`).
+
+  Sharing one cache across executions is sound for the same reason the whole
+  design is: the guest is a pure function of its request under deny-all
+  capabilities, so two calls with the same key are two calls that must return the
+  same answer, whoever is asking. The bound is a count
+  (`MAX_CACHED_DECISIONS`) rather than a byte budget precisely because the key is
+  a 32-byte digest rather than the request itself, which may be up to
+  `MAX_DECIDE_REQUEST_BYTES`; eviction is oldest-first
+  (`the_decision_cache_is_bounded_and_evicts_oldest_first`).
 
 The other cost is C5's: a decision runs inline on the decision-cycle thread —
 and, per C9 below, *must*, since the host may not introduce an await that records
@@ -599,10 +613,30 @@ because `nd_details` alone does not fail the executor's success arm. That is the
 #603 ND-blocking net switched off for every hosted workflow, by the one component
 whose whole justification is that it does not need new safety machinery.
 
-`outcome_for_guest` now hands the guest **only** `HarvestError::ActivityFailed`.
-Divergences, cancellations, payload-limit and config errors propagate as the
-engine intended. `only_activity_outcomes_are_handed_to_the_guest` pins the
-classification.
+`outcome_for_guest` hands the guest **only** genuine step outcomes:
+`HarvestError::ActivityFailed`, and the four *activity-scoped* timeouts
+(`StartToClose`, `ScheduleToStart`, `ScheduleToClose`, `Heartbeat`). Divergences,
+cancellations, payload-limit and config errors propagate as the engine intended.
+`only_activity_outcomes_are_handed_to_the_guest` pins the classification.
+
+The timeout half of that was itself a correction (Codex review round 2), and the
+error it fixes is the *mirror image* of the one above. `execute_activity_raw`
+builds `HarvestError::Timeout` from `HistoryMatch::TimedOut`, so a timeout is
+history-backed and replay-deterministic on exactly the same footing as
+`ActivityFailed` — and the engine pairs the two everywhere it classifies a step
+result. Withholding it gave a hosted workflow strictly *less* than its
+statically-linked twin: a timeout a native handler can catch and compensate for
+killed a hosted run outright. Where over-delivering an error lets a guest swallow
+a divergence, under-delivering one silently removes recovery the platform
+otherwise guarantees.
+
+The `timeout_type` split is the part that carries the weight, and is why this is
+not simply "hand `Timeout` over". `WorkflowExecution` and `WorkflowChain` are the
+**run's own deadline**, not a step's; handing either to the guest would let a
+module answer `Complete` and carry on past a deadline the engine had just
+enforced — the same shape of mistake as handing over a replay divergence.
+`activity_scoped_timeouts_are_the_guests_business_but_run_scoped_ones_are_not`
+pins both halves.
 
 ---
 

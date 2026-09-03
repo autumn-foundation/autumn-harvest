@@ -301,6 +301,9 @@ const CITED_TESTS: &[&str] = &[
     // Codex review round 1.
     "the_decision_cache_never_serves_one_builds_answer_to_another",
     "the_trampoline_never_yields_between_decisions",
+    // Codex review round 2.
+    "activity_scoped_timeouts_are_the_guests_business_but_run_scoped_ones_are_not",
+    "the_decision_cache_is_bounded_and_evicts_oldest_first",
     "a_signed_module_cannot_be_rebound_under_another_build_id",
     "a_failing_module_leaves_the_whole_build_unbound",
     "a_guest_may_not_schedule_an_activity_the_host_did_not_allow",

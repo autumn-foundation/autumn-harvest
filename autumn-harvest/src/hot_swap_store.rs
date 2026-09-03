@@ -41,7 +41,7 @@ use std::sync::Arc;
 
 use crate::hot_swap::{
     MAX_WORKFLOW_MODULE_BYTES, ModuleDescriptor, ModuleRegistry, ModuleVerification,
-    compute_module_hash, verify_module_bytes,
+    PreparedBinding, compute_module_hash, verify_module_bytes,
 };
 
 /// One `harvest_workflow_modules` row, payload included.
@@ -373,17 +373,29 @@ pub async fn retire_build_modules(
 ///
 /// # Memory
 ///
-/// Payloads are fetched **one at a time**, so peak host residency is one module
-/// (≤ [`MAX_WORKFLOW_MODULE_BYTES`]) rather than the whole build. Selecting a
-/// build's payloads in one query would let a single oversized or numerous set of
-/// rows — which an attacker with `INSERT` chooses, not the publish path —
-/// materialise unbounded bytes before any ceiling was consulted.
+/// Each payload is fetched, compiled, and **dropped before the next is
+/// fetched**, so peak residency in *source bytes* is one module
+/// (≤ [`MAX_WORKFLOW_MODULE_BYTES`]) rather than the whole build.
+///
+/// Fetching one row at a time is not on its own enough, and an earlier cut of
+/// this function proved it: it read every payload into a `Vec` and only then
+/// compiled, so the aggregate was resident anyway. The table's `CHECK` bounds a
+/// single row at 32 MiB but nothing bounds how many workflow names a build has —
+/// which an attacker with `INSERT` chooses, not the publish path — so a build
+/// with enough valid rows could OOM the worker during sync.
+///
+/// What is still held for the whole build is the *compiled* artifacts, and that
+/// is irreducible: binding atomically means having every module in hand before
+/// binding any (see above). Compiled code is materially smaller than the WASM
+/// source it came from, and unlike the source it is what the worker is about to
+/// keep resident regardless.
 ///
 /// # Compilation
 ///
 /// Cranelift compilation is CPU-bound and is neither fuel- nor epoch-bounded, so
-/// it runs on [`tokio::task::spawn_blocking`] rather than occupying an async
-/// worker thread — the same rule `wasm_store` established for guest invocation.
+/// each module is compiled on [`tokio::task::spawn_blocking`] rather than
+/// occupying an async worker thread — the same rule `wasm_store` established for
+/// guest invocation.
 ///
 /// # Errors
 ///
@@ -409,49 +421,71 @@ pub async fn sync_build_into_registry(
         )));
     }
 
-    // Fetch + verify + compile everything before binding anything.
-    let mut prepared: Vec<(String, Vec<u8>, Option<String>, String)> =
-        Vec::with_capacity(names.len());
+    // Fetch, verify and compile ONE module at a time, then bind them all at
+    // once. The obvious shape — read every payload into a `Vec`, then compile —
+    // holds the whole build's source bytes resident simultaneously (issue #967,
+    // Codex review round 2). Each row is capped at 32 MiB by the table's CHECK,
+    // but nothing caps the number of workflow names in a build, so the aggregate
+    // is unbounded and a large enough build OOMs the worker during sync. Here a
+    // payload is dropped as soon as it has been compiled, so peak residency in
+    // source bytes is one module rather than the whole build.
+    //
+    // Atomicity is unaffected: `prepare_module` verifies and compiles without
+    // binding, and `commit_prepared` binds the whole batch or none of it — so a
+    // build whose third module fails still leaves the first two unbound. The
+    // generation is read BEFORE the first prepare, so an `unload_build` racing
+    // the sync is caught at commit rather than silently reviving a retired build.
+    let generation = registry.load_generation();
+    let mut prepared: Vec<PreparedBinding> = Vec::with_capacity(names.len());
     for descriptor in &names {
         let row = fetch_workflow_module(conn, build_id, &descriptor.workflow_name)
             .await?
             .ok_or_else(|| {
                 HarvestError::Config(format!(
-                    "workflow module `{}` for build `{build_id}` vanished between listing and                      fetch; retry the sync",
+                    "workflow module `{}` for build `{build_id}` vanished between listing and \
+                     fetch; retry the sync",
                     descriptor.workflow_name
                 ))
             })?;
-        prepared.push((
-            row.workflow_name,
-            row.module_bytes,
-            row.signature,
-            row.module_hash,
-        ));
+
+        let registry = Arc::clone(registry);
+        let build = build_id.to_string();
+        let key = signing_key.map(<[u8]>::to_vec);
+        // Cranelift compilation is CPU-bound and neither fuel- nor
+        // epoch-bounded, so it runs off the async worker threads — the rule
+        // `wasm_store` established for guest invocation.
+        let one = tokio::task::spawn_blocking(move || {
+            let mut verification = ModuleVerification::none().with_expected_hash(&row.module_hash);
+            if let Some(signature) = row.signature.as_deref() {
+                verification = verification.with_signature(signature);
+            }
+            if let Some(key) = key.as_deref() {
+                verification = verification.with_signing_key(key);
+            }
+            registry
+                .prepare_module(&build, &row.workflow_name, &row.module_bytes, &verification)
+                .map_err(|e| {
+                    HarvestError::Config(format!(
+                        "refusing to load the workflow modules for build `{build}`: {e}"
+                    ))
+                })
+            // `row` — and with it this module's source bytes — is dropped here,
+            // before the next fetch.
+        })
+        .await
+        .map_err(|join_err| {
+            HarvestError::Config(format!(
+                "workflow-module compilation task for build `{build_id}` failed to join: \
+                 {join_err}"
+            ))
+        })??;
+        prepared.push(one);
     }
 
     let registry = Arc::clone(registry);
     let build = build_id.to_string();
-    let key = signing_key.map(<[u8]>::to_vec);
     tokio::task::spawn_blocking(move || {
-        let batch: Vec<(&str, &str, &[u8], ModuleVerification<'_>)> = prepared
-            .iter()
-            .map(|(workflow_name, bytes, signature, hash)| {
-                let mut verification = ModuleVerification::none().with_expected_hash(hash);
-                if let Some(signature) = signature.as_deref() {
-                    verification = verification.with_signature(signature);
-                }
-                if let Some(key) = key.as_deref() {
-                    verification = verification.with_signing_key(key);
-                }
-                (
-                    build.as_str(),
-                    workflow_name.as_str(),
-                    bytes.as_slice(),
-                    verification,
-                )
-            })
-            .collect();
-        registry.load_modules(&batch).map_err(|e| {
+        registry.commit_prepared(prepared, generation).map_err(|e| {
             HarvestError::Config(format!(
                 "refusing to load the workflow modules for build `{build}`: {e}"
             ))
@@ -460,7 +494,7 @@ pub async fn sync_build_into_registry(
     .await
     .map_err(|join_err| {
         HarvestError::Config(format!(
-            "workflow-module compilation task for build `{build_id}` failed to join: {join_err}"
+            "workflow-module binding task for build `{build_id}` failed to join: {join_err}"
         ))
     })?
 }

@@ -706,12 +706,13 @@ pub use webhook_trigger::{
 #[cfg(feature = "hot-code-swap")]
 pub use hot_swap::{
     DECIDE_ABI_VERSION, DECIDE_FUEL, DECIDE_MAX_WALL_CLOCK, DECIDE_MEMORY_BYTES,
-    DECIDE_RUN_WALL_CLOCK, DecideOutcome, DecideRequest, DecideResponse, HotSwapError,
-    LoadedWorkflowModule, MAX_DECIDE_REQUEST_BYTES, MAX_DECIDE_STEPS, MAX_GUEST_TEXT_BYTES,
-    MAX_WORKFLOW_MODULE_BYTES, MIN_SIGNING_KEY_BYTES, ModuleDescriptor, ModuleHost, ModuleRegistry,
-    ModuleVerification, clamp_decide_limits, compute_module_hash, default_decide_limits,
-    encode_decide_request, is_module_hosted, module_workflow_handler, sign_module_binding,
-    verify_module_bytes, with_module_host,
+    DECIDE_RUN_WALL_CLOCK, DecideOutcome, DecideRequest, DecideResponse, DecisionCache,
+    HotSwapError, LoadedWorkflowModule, MAX_CACHED_DECISIONS, MAX_DECIDE_REQUEST_BYTES,
+    MAX_DECIDE_STEPS, MAX_GUEST_TEXT_BYTES, MAX_WORKFLOW_MODULE_BYTES, MIN_SIGNING_KEY_BYTES,
+    ModuleDescriptor, ModuleHost, ModuleRegistry, ModuleVerification, PreparedBinding,
+    clamp_decide_limits, compute_module_hash, default_decide_limits, encode_decide_request,
+    is_module_hosted, module_workflow_handler, sign_module_binding, verify_module_bytes,
+    with_module_host,
 };
 #[cfg(feature = "hot-code-swap")]
 pub use hot_swap_store::{

@@ -139,18 +139,47 @@ change to the replay surface**.
   anyone who extends this boundary, and it is C5 restated: the oneshot suspension
   model gives the executor no way to tell "the host is thinking" from "the
   workflow is suspended".
-- **The quadratic is actually removed now.** Under DD-1 the trampoline restarts
-  at step 0 every cycle, so a run with `n` awaits asks the guest `O(n²)` times.
-  The memo meant to fix that was created *inside* the handler future, where a
-  single monotonically increasing pass writes every entry and reads none — it
-  could never hit. The cache moved to `ModuleHost`, task-local and therefore
-  scoped to one execution's drive, installed fresh by `for_task` so a cloned
-  prototype does not become a worker-lifetime map. Its key is the encoded request
-  **prefixed with `(build_id, module_hash)`**: a `DecideRequest` deliberately
-  carries no build id, so v1 and v2 of one workflow see byte-identical input at
-  step 0, and keying on the request alone would serve v1's decision to v2 —
-  silently defeating the swap the spike exists to demonstrate
+- **The quadratic is actually removed now, and the lifetime took two goes.**
+  Under DD-1 the trampoline restarts at step 0 every cycle, so a run with `n`
+  awaits asks the guest `O(n²)` times. The memo meant to fix that was created
+  *inside* the handler future, where a single monotonically increasing pass
+  writes every entry and reads none — it could never hit. Moving it to
+  `ModuleHost`, per workflow task, was still wrong: an ordinary activity **ends
+  the task** (only local activities re-drive in place), so the workflow resumes
+  in a new `process_workflow_task` call and a per-task cache is reset on every
+  durable cycle. It lives on the `ModuleRegistry` now, for the worker process,
+  bounded and oldest-first. Sharing it across executions is sound for the same
+  reason the whole design is: the guest is a pure function of its request.
+  Its key is a digest of **`(build_id, module_hash, request bytes)`**,
+  length-prefixed: a `DecideRequest` deliberately carries no build id, so v1 and
+  v2 of one workflow see byte-identical input at step 0, and keying on the
+  request alone would serve v1's decision to v2 — silently defeating the swap the
+  spike exists to demonstrate
   (`the_decision_cache_never_serves_one_builds_answer_to_another`).
+- **An activity timeout is a step outcome, and now reaches the guest.** The
+  mirror image of the ND bug above. `execute_activity_raw` builds
+  `HarvestError::Timeout` from `HistoryMatch::TimedOut`, so it is history-backed
+  and replay-deterministic on the same footing as `ActivityFailed` — and the
+  engine pairs the two everywhere it classifies a step result. Withholding it
+  gave a hosted workflow strictly *less* than its statically-linked twin: a
+  timeout a native handler catches and compensates for killed a hosted run
+  outright. Where over-delivering an error lets a guest swallow a divergence,
+  under-delivering one silently removes recovery the platform otherwise
+  guarantees. Only the four **activity-scoped** types cross the boundary;
+  `WorkflowExecution` and `WorkflowChain` are the run's own deadline and still
+  propagate, because a guest that could see those could answer `Complete` past a
+  deadline the engine had just enforced.
+- **A build's modules are no longer all resident at once during sync.** Sync read
+  every payload into a `Vec` and only then compiled, so the whole build's source
+  bytes were resident together — the table's `CHECK` caps a row at 32 MiB but
+  nothing caps how many workflow names a build has, so a large enough build could
+  OOM a worker mid-sync. Each payload is now fetched, compiled on
+  `spawn_blocking`, and dropped before the next is fetched; atomic binding is
+  preserved by splitting `prepare_module` (verify + compile) from
+  `commit_prepared` (bind all or none). The doc comment claiming one-module peak
+  residency is now true rather than aspirational, and says plainly that the
+  *compiled* artifacts are still held for the whole build, which atomicity makes
+  irreducible.
 - **A load batch may not bind two modules to one key.** `load_modules` compared
   each entry only against what was *already* bound, which knows nothing about the
   batch, so two different modules for one `(build_id, workflow_name)` with

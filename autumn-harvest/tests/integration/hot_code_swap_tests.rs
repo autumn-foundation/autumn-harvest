@@ -38,9 +38,10 @@ use autumn_harvest::build_routing::{
 use autumn_harvest::context::WorkflowContext;
 use autumn_harvest::event::WorkflowEvent;
 use autumn_harvest::hot_swap::{
-    DecideOutcome, DecideRequest, DecideResponse, HotSwapError, ModuleHost, ModuleRegistry,
-    ModuleVerification, compute_module_hash, encode_decide_request, module_workflow_handler,
-    sign_module_binding, verify_module_bytes, with_module_host,
+    DecideOutcome, DecideRequest, DecideResponse, DecisionCache, HotSwapError,
+    MAX_CACHED_DECISIONS, ModuleHost, ModuleRegistry, ModuleVerification, compute_module_hash,
+    encode_decide_request, module_workflow_handler, sign_module_binding, verify_module_bytes,
+    with_module_host,
 };
 use autumn_harvest::hot_swap_store::{
     fetch_workflow_module, list_workflow_modules_for_build, publish_workflow_module,
@@ -2305,24 +2306,37 @@ async fn the_trampoline_never_yields_between_decisions() {
 }
 
 #[tokio::test]
-async fn decisions_are_cached_across_decision_cycles_not_within_one() {
-    // P2. The memo was created inside the handler future, and one invocation
-    // visits each step exactly once in increasing order — so it was written and
-    // never read, leaving the documented O(n^2) guest work fully in place. The
-    // cache has to outlive the invocation, which is why it lives on the host.
+async fn decisions_are_reused_across_separate_workflow_tasks() {
+    // Codex review round 2 corrected my round-1 fix, and the reason my own test
+    // missed it is worth stating: it asserted the cache had ENTRIES, not that it
+    // ever produced a HIT. Insertions prove nothing — the broken version
+    // inserted on every step too.
+    //
+    // The substance: an ordinary activity ENDS the workflow task. Only local
+    // activities re-drive in place, so a hosted workflow resumes in a NEW
+    // `process_workflow_task` call, and a cache installed per task is reset on
+    // every durable cycle — leaving the O(n^2) exactly where it was. The cache
+    // therefore lives on the registry, for the worker process.
     let registry = registry_with(&[("wf-v2", "pipeline", pipeline_v2_bytes())]);
-    let host = host(&registry, "wf-v2");
-    let outcome = with_module_host(
-        host.clone(),
-        env().run(module_workflow_handler, json!({"order": 1})),
-    )
-    .await;
-    assert_eq!(outcome.result.expect("completes"), json!("v2-done"));
 
-    let cached = host.decisions.lock().expect("cache is not poisoned").len();
+    // Two independent drives, as two separate tasks would be.
+    for _ in 0..2 {
+        let outcome = with_module_host(
+            ModuleHost::new(Arc::clone(&registry)).with_build_id("wf-v2"),
+            env().run(module_workflow_handler, json!({"order": 1})),
+        )
+        .await;
+        assert_eq!(outcome.result.expect("completes"), json!("v2-done"));
+    }
+
+    let (hits, misses) = registry.decisions().expect("cache is not poisoned").stats();
     assert!(
-        cached >= 2,
-        "the host-scoped cache must retain decisions across cycles, held {cached}"
+        hits > 0,
+        "the second drive must reuse the first's decisions; got {hits} hits / {misses} misses"
+    );
+    assert!(
+        misses > 0,
+        "the first drive must have populated the cache ({misses} misses expected)"
     );
 }
 
@@ -2330,23 +2344,25 @@ async fn decisions_are_cached_across_decision_cycles_not_within_one() {
 async fn the_decision_cache_never_serves_one_builds_answer_to_another() {
     // A `DecideRequest` carries no build id — the guest has no business knowing
     // its own version — so v1 and v2 of one workflow see byte-identical input at
-    // step 0. Keying the cache on the request bytes alone would let v1's
-    // decision be served to v2, silently defeating the swap the spike exists to
-    // demonstrate. The key is prefixed with `(build_id, module_hash)`.
+    // step 0. Keying the cache on the request alone would let v1's decision be
+    // served to v2, silently defeating the swap the spike exists to
+    // demonstrate. The key digests the request TOGETHER WITH
+    // `(build_id, module_hash)`.
+    //
+    // Sharper now than in round 1: the cache is process-wide, so both builds
+    // genuinely share one map rather than merely sharing a host.
     let registry = registry_with(&[
         ("wf-v1", "pipeline", pipeline_v1_bytes()),
         ("wf-v2", "pipeline", pipeline_v2_bytes()),
     ]);
-    // One host, deliberately reused across both builds — the harshest case.
-    let shared = ModuleHost::new(Arc::clone(&registry));
 
     let v1 = with_module_host(
-        shared.clone().with_build_id("wf-v1"),
+        ModuleHost::new(Arc::clone(&registry)).with_build_id("wf-v1"),
         env().run(module_workflow_handler, json!({})),
     )
     .await;
     let v2 = with_module_host(
-        shared.clone().with_build_id("wf-v2"),
+        ModuleHost::new(Arc::clone(&registry)).with_build_id("wf-v2"),
         env().run(module_workflow_handler, json!({})),
     )
     .await;
@@ -2359,36 +2375,64 @@ async fn the_decision_cache_never_serves_one_builds_answer_to_another() {
     );
 }
 
-#[tokio::test]
-async fn for_task_does_not_share_the_prototypes_decision_cache() {
-    // The worker clones a stored prototype per task. A plain `Clone` shares the
-    // `Arc`, making the cache process-wide for the worker's whole life rather
-    // than scoped to one drive.
-    let registry = registry_with(&[("wf-v1", "pipeline", pipeline_v1_bytes())]);
-    let prototype = ModuleHost::new(Arc::clone(&registry))
-        .with_build_id("wf-v1")
-        .allowing_activities(["charge"]);
+#[test]
+fn the_decision_cache_is_bounded_and_evicts_oldest_first() {
+    // The cache lives for the worker process, so the bound is what stops it
+    // growing without limit. Entries are a 32-byte digest plus a response
+    // precisely so this ceiling can be a count.
+    let mut cache = DecisionCache::new();
+    let key_for = |i: usize| DecisionCache::key("wf-v1", "hash", &i.to_be_bytes());
 
-    let scoped = prototype.for_task();
+    let first = key_for(0);
+    for i in 0..(MAX_CACHED_DECISIONS + 8) {
+        cache.insert(
+            key_for(i),
+            DecideResponse::Complete {
+                output: json!(i as u64),
+            },
+        );
+    }
+
     assert_eq!(
-        scoped.allowed_activities, prototype.allowed_activities,
-        "for_task carries the policy forward"
-    );
-
-    let outcome = with_module_host(
-        scoped.clone(),
-        env().run(module_workflow_handler, json!({})),
-    )
-    .await;
-    assert_eq!(outcome.result.expect("completes"), json!("v1-done"));
-
-    assert!(
-        !scoped.decisions.lock().expect("not poisoned").is_empty(),
-        "the task's own cache was populated"
+        cache.len(),
+        MAX_CACHED_DECISIONS,
+        "the cache must not grow past its ceiling"
     );
     assert!(
-        prototype.decisions.lock().expect("not poisoned").is_empty(),
-        "the prototype's cache must stay untouched, or it is a worker-lifetime map"
+        cache.get(&first).is_none(),
+        "the oldest entry must have been evicted"
+    );
+    let newest = key_for(MAX_CACHED_DECISIONS + 7);
+    assert!(
+        cache.get(&newest).is_some(),
+        "the newest entry must survive"
+    );
+}
+
+#[test]
+fn the_decision_cache_key_separates_build_workflow_and_request() {
+    // Length-prefixed, so no two distinct triples share a preimage — otherwise
+    // `("ab", "c", ..)` and `("a", "bc", ..)` would collide and one build could
+    // be served another's answer through the back door.
+    let a = DecisionCache::key("ab", "c", b"x");
+    let b = DecisionCache::key("a", "bc", b"x");
+    assert_ne!(a, b, "the key must not be a naive concatenation");
+
+    assert_eq!(
+        DecisionCache::key("wf", "h", b"r"),
+        DecisionCache::key("wf", "h", b"r")
+    );
+    assert_ne!(
+        DecisionCache::key("wf1", "h", b"r"),
+        DecisionCache::key("wf2", "h", b"r")
+    );
+    assert_ne!(
+        DecisionCache::key("wf", "h1", b"r"),
+        DecisionCache::key("wf", "h2", b"r")
+    );
+    assert_ne!(
+        DecisionCache::key("wf", "h", b"r1"),
+        DecisionCache::key("wf", "h", b"r2")
     );
 }
 
