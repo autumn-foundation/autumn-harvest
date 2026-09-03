@@ -22,7 +22,7 @@
       "Adding a new read-only route",
       "Narrowing an existing error response to be more specific"
     ],
-    "conditional_shape_note": "Issue #756 partial-availability carve-out to \"Changing the type of a response field\": the cross-shard list read endpoints GET /workflows (non-paginated), GET /workers, GET /admin/schedules, GET /dead-letters, and GET /dags return a CONDITIONAL 200 shape \u2014 a bare JSON array when every expected shard is reachable (status == complete), or a degraded object { \"<items>\": [...], \"status\": \"partial\"|\"unavailable\", \"unavailable_shards\": [{ \"shard_id\", \"reason\" }] } when a shard is unavailable. This is NOT a breaking change to any currently-successful response: the all-reachable array is byte-for-byte identical to the pre-#756 shape, and the object form only replaces what was previously a whole-request 500 (a failed, non-successful response), so no client that received a successful response before can observe a changed type. The paginated GET /workflows object shape and the aggregate/health object endpoints (GET /dead-letters/aggregate, GET /workers/health) instead gain status/unavailable_shards as always-present ADDITIVE fields (a non-breaking change)."
+    "conditional_shape_note": "Issue #756 partial-availability carve-out to \"Changing the type of a response field\": the cross-shard list read endpoints GET /workflows (non-paginated), GET /workers, GET /admin/schedules, GET /dead-letters, and GET /dags return a CONDITIONAL 200 shape — a bare JSON array when every expected shard is reachable (status == complete), or a degraded object { \"<items>\": [...], \"status\": \"partial\"|\"unavailable\", \"unavailable_shards\": [{ \"shard_id\", \"reason\" }] } when a shard is unavailable. This is NOT a breaking change to any currently-successful response: the all-reachable array is byte-for-byte identical to the pre-#756 shape, and the object form only replaces what was previously a whole-request 500 (a failed, non-successful response), so no client that received a successful response before can observe a changed type. The paginated GET /workflows object shape and the aggregate/health object endpoints (GET /dead-letters/aggregate, GET /workers/health) instead gain status/unavailable_shards as always-present ADDITIVE fields (a non-breaking change)."
   },
   "auth_note": "Route authorization posture is classified in issue #174. This contract records the route surface and category; auth enforcement is separate.",
   "audit_note": "Mutating routes (read_only: false) are covered by the audit trail (issue #158). The audit endpoint itself is read-only.",
@@ -137,7 +137,7 @@
       "success_response": {
         "status": 200,
         "free_form": true,
-        "description": "Without pagination params: bare JSON array of execution objects on the happy path (backward compatible); on shard degradation the { workflows, status, unavailable_shards } envelope (see below). With cursor/page_size/order: JSON object {\"workflows\": [...], \"next_cursor\": <string|null>, \"status\": \"complete\"|\"partial\"|\"unavailable\", \"unavailable_shards\": [{ \"shard_id\", \"reason\" }]} \u2014 for the paginated object shape, status and unavailable_shards are ALWAYS present (additive fields; status is \"complete\" and unavailable_shards is [] on the happy path). Partial availability (issue #756): when a shard is unreachable this endpoint returns 200 with the union of reachable-shard results (the non-paginated bare array degrades to the same { workflows, status, unavailable_shards } object) instead of failing the whole request with a 500; an unreachable shard is named in unavailable_shards rather than being silently dropped. On the happy path (all shards reachable) the non-paginated response shape is byte-for-byte unchanged. With history_bloat_min_events set (issue #704): each returned row additionally carries history_event_count (an integer, omitted on every other request); rows are always non-terminal and sorted by history_event_count descending regardless of any order= param (which is rejected when combined -- see the history_bloat_min_events param description). The unrelated pre-existing min_history_events filter (issue #493) composes with state=/order=/pagination normally and does not affect sort order or add history_event_count to the response."
+        "description": "Without pagination params: bare JSON array of execution objects on the happy path (backward compatible); on shard degradation the { workflows, status, unavailable_shards } envelope (see below). With cursor/page_size/order: JSON object {\"workflows\": [...], \"next_cursor\": <string|null>, \"status\": \"complete\"|\"partial\"|\"unavailable\", \"unavailable_shards\": [{ \"shard_id\", \"reason\" }]} — for the paginated object shape, status and unavailable_shards are ALWAYS present (additive fields; status is \"complete\" and unavailable_shards is [] on the happy path). Partial availability (issue #756): when a shard is unreachable this endpoint returns 200 with the union of reachable-shard results (the non-paginated bare array degrades to the same { workflows, status, unavailable_shards } object) instead of failing the whole request with a 500; an unreachable shard is named in unavailable_shards rather than being silently dropped. On the happy path (all shards reachable) the non-paginated response shape is byte-for-byte unchanged. With history_bloat_min_events set (issue #704): each returned row additionally carries history_event_count (an integer, omitted on every other request); rows are always non-terminal and sorted by history_event_count descending regardless of any order= param (which is rejected when combined -- see the history_bloat_min_events param description). The unrelated pre-existing min_history_events filter (issue #493) composes with state=/order=/pagination normally and does not affect sort order or add history_event_count to the response."
       },
       "error_responses": [
         {
@@ -152,6 +152,7 @@
           "status": 400,
           "description": "Malformed query string: a percent-encoded byte sequence in the query does not decode to valid UTF-8."
         }
+
       ]
     },
     {
@@ -224,6 +225,7 @@
           "status": 400,
           "description": "Malformed query string: a percent-encoded byte sequence in the query does not decode to valid UTF-8."
         }
+
       ]
     },
     {
@@ -313,6 +315,7 @@
           "status": 400,
           "description": "Malformed query string: a percent-encoded byte sequence in the query does not decode to valid UTF-8."
         }
+
       ]
     },
     {
@@ -414,6 +417,7 @@
           "status": 400,
           "description": "Malformed query string: a percent-encoded byte sequence in the query does not decode to valid UTF-8."
         }
+
       ],
       "idempotency": "Fully idempotent; read-only."
     },
@@ -465,6 +469,7 @@
           "status": 400,
           "description": "Malformed query string: a percent-encoded byte sequence in the query does not decode to valid UTF-8."
         }
+
       ]
     },
     {
@@ -515,6 +520,7 @@
           "status": 400,
           "description": "Malformed query string: a percent-encoded byte sequence in the query does not decode to valid UTF-8."
         }
+
       ]
     },
     {
@@ -585,6 +591,7 @@
           "status": 400,
           "description": "Malformed query string: a percent-encoded byte sequence in the query does not decode to valid UTF-8."
         }
+
       ]
     },
     {
@@ -592,7 +599,7 @@
       "path": "/workflows/{id}/tree",
       "category": "workflow",
       "read_only": true,
-      "description": "Recursive cross-shard execution lineage tree (issue #621): the full descendant tree rooted at {id}, so an operator triaging a DLQ/stuck alert can locate the failed descendant of a multi-level saga in ONE call instead of hand-walking parent_id links level by level and shard by shard. Rooting at a mid-tree node returns just the subtree below it; the chosen root is always depth 0 and still reports its own parent_id. Each node carries execution_id, workflow_name, workflow_id, state, started_at, closed_at, parent_id, depth, shard_id, and the spawn relationship (await_mode `awaited`/`detached` plus parent_close_policy when detached); children is always an array, empty for a leaf (never an error). The walk fans out across every readable shard (the iter_shards() aggregation pattern), so a child placed on a different shard than its parent by rendezvous hashing still appears. Recursion is bounded by max_depth (default 20, ceiling 50) and max_nodes (default 1000, ceiling 10000, counted INCLUDING the root); hitting either sets truncated=true with a machine-readable truncation_reason (`max_depth` | `max_nodes`) and names the dropped subtrees' parents in truncated_parent_ids (bounded, with truncated_parents_capped when it overflowed) \u2014 never a silent cap. Only parents that PROVABLY have children are named (via a bounded existence probe), so an operator is never sent chasing a subtree that does not exist. A visited-set guarantees each execution_id appears exactly once and a malformed parent_id loop terminates instead of recursing. `?summary=true` returns the per-state DESCENDANT roll-up (counts keyed by lowercased state, every known state always present even at 0; the root's own state is echoed on `root` and excluded from counts) plus total_descendants, for an at-a-glance health check without transferring the tree. Cross-shard degradation (issue #756): an unreachable shard is named in unavailable_shards with status `partial`/`unavailable` rather than failing the whole call \u2014 a triage read must not 500 during the incident it exists to diagnose. NOT admin-gated, matching GET /workflows/{id}/children (which already traverses depth cross-shard over the same rows). SNAPSHOT CONSISTENCY: shards are read independently, so a tree may be marginally time-skewed across shards; acceptable for triage. Adds no WorkflowEvent variant, no migration, appends no events, performs no writes. A malformed percent-encoded query-string byte sequence (an invalid UTF-8 byte, or an incomplete/non-hex `%` escape) is rejected with a 400 before any parameter is parsed, rather than silently substituting the Unicode replacement character and proceeding with a wrong-but-plausible value (issue #1151, sweeping the issue #774 `queue-coverage` fix to every other raw-pairs route).",
+      "description": "Recursive cross-shard execution lineage tree (issue #621): the full descendant tree rooted at {id}, so an operator triaging a DLQ/stuck alert can locate the failed descendant of a multi-level saga in ONE call instead of hand-walking parent_id links level by level and shard by shard. Rooting at a mid-tree node returns just the subtree below it; the chosen root is always depth 0 and still reports its own parent_id. Each node carries execution_id, workflow_name, workflow_id, state, started_at, closed_at, parent_id, depth, shard_id, and the spawn relationship (await_mode `awaited`/`detached` plus parent_close_policy when detached); children is always an array, empty for a leaf (never an error). The walk fans out across every readable shard (the iter_shards() aggregation pattern), so a child placed on a different shard than its parent by rendezvous hashing still appears. Recursion is bounded by max_depth (default 20, ceiling 50) and max_nodes (default 1000, ceiling 10000, counted INCLUDING the root); hitting either sets truncated=true with a machine-readable truncation_reason (`max_depth` | `max_nodes`) and names the dropped subtrees' parents in truncated_parent_ids (bounded, with truncated_parents_capped when it overflowed) — never a silent cap. Only parents that PROVABLY have children are named (via a bounded existence probe), so an operator is never sent chasing a subtree that does not exist. A visited-set guarantees each execution_id appears exactly once and a malformed parent_id loop terminates instead of recursing. `?summary=true` returns the per-state DESCENDANT roll-up (counts keyed by lowercased state, every known state always present even at 0; the root's own state is echoed on `root` and excluded from counts) plus total_descendants, for an at-a-glance health check without transferring the tree. Cross-shard degradation (issue #756): an unreachable shard is named in unavailable_shards with status `partial`/`unavailable` rather than failing the whole call — a triage read must not 500 during the incident it exists to diagnose. NOT admin-gated, matching GET /workflows/{id}/children (which already traverses depth cross-shard over the same rows). SNAPSHOT CONSISTENCY: shards are read independently, so a tree may be marginally time-skewed across shards; acceptable for triage. Adds no WorkflowEvent variant, no migration, appends no events, performs no writes. A malformed percent-encoded query-string byte sequence (an invalid UTF-8 byte, or an incomplete/non-hex `%` escape) is rejected with a 400 before any parameter is parsed, rather than silently substituting the Unicode replacement character and proceeding with a wrong-but-plausible value (issue #1151, sweeping the issue #774 `queue-coverage` fix to every other raw-pairs route).",
       "params": [
         {
           "name": "id",
@@ -604,13 +611,13 @@
           "name": "max_depth",
           "in": "query",
           "required": false,
-          "description": "Recursion depth cap below the root. Default 20, must be 1\u201350. Out of range is rejected with 400 rather than silently clamped."
+          "description": "Recursion depth cap below the root. Default 20, must be 1–50. Out of range is rejected with 400 rather than silently clamped."
         },
         {
           "name": "max_nodes",
           "in": "query",
           "required": false,
-          "description": "Total node cap INCLUDING the root. Default 1000, must be 1\u201310000. Out of range is rejected with 400."
+          "description": "Total node cap INCLUDING the root. Default 1000, must be 1–10000. Out of range is rejected with 400."
         },
         {
           "name": "summary",
@@ -650,7 +657,7 @@
         },
         {
           "status": 503,
-          "description": "The root's own shard could not be queried, so existence is undetermined (retriable): the id encodes a shard this deployment knows about (router-readable or default) but which has no configured storage pool on this node \u2014 the normal state mid a shard-add rollout \u2014 or that shard's pool connection could not be acquired. Deliberately not a 404: answering 'not found' would be a false negative for a run that may exist on its own shard. Note this applies only to the ROOT lookup; an unreachable shard encountered during the DESCENDANT walk degrades to 200 with status=partial and the shard named in unavailable_shards."
+          "description": "The root's own shard could not be queried, so existence is undetermined (retriable): the id encodes a shard this deployment knows about (router-readable or default) but which has no configured storage pool on this node — the normal state mid a shard-add rollout — or that shard's pool connection could not be acquired. Deliberately not a 404: answering 'not found' would be a false negative for a run that may exist on its own shard. Note this applies only to the ROOT lookup; an unreachable shard encountered during the DESCENDANT walk degrades to 200 with status=partial and the shard named in unavailable_shards."
         },
         {
           "status": 500,
@@ -660,6 +667,7 @@
           "status": 400,
           "description": "Malformed query string: a percent-encoded byte sequence in the query does not decode to valid UTF-8."
         }
+
       ],
       "idempotency": "Fully idempotent; read-only. A point-in-time snapshot assembled per-shard."
     },
@@ -768,7 +776,7 @@
           "name": "limit",
           "in": "query",
           "required": false,
-          "description": "Page size; default 200. Values above 1000 are clamped down; a value <= 0 is rejected with 400 rather than clamped up."
+          "description": "Page size; default 200. Values above 1000 are clamped down; a value \u003c= 0 is rejected with 400 rather than clamped up."
         },
         {
           "name": "cursor",
@@ -825,6 +833,7 @@
           "status": 400,
           "description": "Malformed query string: a percent-encoded byte sequence in the query does not decode to valid UTF-8."
         }
+
       ],
       "idempotency": "Fully idempotent; read-only."
     },
@@ -833,7 +842,7 @@
       "path": "/workflows/{id}/awaitables",
       "category": "workflow",
       "read_only": true,
-      "description": "Open-awaitables diagnostic (issue #615): names every open awaitable the execution is currently parked on, across six categories \u2014 pending activities (regular/local/external), unfired durable timers, awaited-but-unfulfilled signals (by name), pending child workflows (name + child exec id), unresolved await_condition parks, and pending updates \u2014 plus mutex acquires (#691) and external-workflow operations (#757) when present. The wait-set is derived by replaying recorded history read-only to the current suspension point (the #612 drive machinery), so it sees awaited-but-ABSENT inputs the side tables cannot (an unsent signal, a never-true condition). Each awaitable carries kind, name/identifier, a since timestamp derived from recorded history, and a deadline where one applies (timer fire time, signal/child race deadline, external schedule-to-close, activity schedule-to-close/start-to-close from the task row). Payload-free: names, ids, and timestamps only \u2014 never inputs/payloads/update args \u2014 so read-path payload decoding (issue #608) is deliberately skipped. Admin-gated (the eligibility endpoints' posture). Terminal executions return 200 with an empty awaitables list and wait_set = \"terminal\". Each category is bounded to the first category_cap entries with overflow reported in truncated/truncated_kinds. When the replay drive is unavailable (handler not registered on this node, classic DAG, encrypted history without decode, replay timeout/panic, a detected replay divergence, or a replay that reaches terminal on a non-terminal run), wait_set degrades to \"history_only\" with wait_set_reason naming why \u2014 activities/timers/children/updates still report from the event-log scan, but awaited-unsent signals and await_condition parks are not observable in that mode. Read path is shard-local (routed via the exec id's embedded shard); no cross-shard fan-out. Appends no events, performs no writes, adds no new WorkflowEvent variant.",
+      "description": "Open-awaitables diagnostic (issue #615): names every open awaitable the execution is currently parked on, across six categories — pending activities (regular/local/external), unfired durable timers, awaited-but-unfulfilled signals (by name), pending child workflows (name + child exec id), unresolved await_condition parks, and pending updates — plus mutex acquires (#691) and external-workflow operations (#757) when present. The wait-set is derived by replaying recorded history read-only to the current suspension point (the #612 drive machinery), so it sees awaited-but-ABSENT inputs the side tables cannot (an unsent signal, a never-true condition). Each awaitable carries kind, name/identifier, a since timestamp derived from recorded history, and a deadline where one applies (timer fire time, signal/child race deadline, external schedule-to-close, activity schedule-to-close/start-to-close from the task row). Payload-free: names, ids, and timestamps only — never inputs/payloads/update args — so read-path payload decoding (issue #608) is deliberately skipped. Admin-gated (the eligibility endpoints' posture). Terminal executions return 200 with an empty awaitables list and wait_set = \"terminal\". Each category is bounded to the first category_cap entries with overflow reported in truncated/truncated_kinds. When the replay drive is unavailable (handler not registered on this node, classic DAG, encrypted history without decode, replay timeout/panic, a detected replay divergence, or a replay that reaches terminal on a non-terminal run), wait_set degrades to \"history_only\" with wait_set_reason naming why — activities/timers/children/updates still report from the event-log scan, but awaited-unsent signals and await_condition parks are not observable in that mode. Read path is shard-local (routed via the exec id's embedded shard); no cross-shard fan-out. Appends no events, performs no writes, adds no new WorkflowEvent variant.",
       "params": [
         {
           "name": "id",
@@ -977,7 +986,7 @@
       "category": "workflow",
       "read_only": true,
       "post_for_body_only": true,
-      "description": "Replay ONE execution's recorded history against the currently-registered #[workflow] handler on this node and return a structured determinism verdict (issue #614). POST is used instead of GET because it drives a replay of the workflow function; this route never writes workflow events and performs no writes (read-only, admin-gated). The DB connection is dropped before user code is driven, and the replay is pure in-memory replay. Answers 'will \u2014 or did \u2014 this run diverge under the code deployed right now?': useful for a PAUSED or non-determinism-blocked RUNNING run (the divergence object mirrors the #603 block diagnostic: kind/event_index/expected/actual), or a terminal FAILED run for retroactive forensics. The verdict is one of: clean (message 'no divergence under current code'), diverged (with a divergence object), workflow_failed (with a failure object), not_registered (the workflow type is not registered on this node), or not_replayable_dag (a classic DAG is not on the replay path). Since issue #952 a terminal FAILED run whose history REPRODUCES its recorded failure under the current code is 'clean' (reproducing a recorded failure is not a divergence) and carries that error in the failure object, with message 'no divergence under current code; the recorded failure was reproduced'; 'workflow_failed' remains for a replay that failed where the recorded history did not. All five verdicts return 200 \u2014 the diagnosis, not the HTTP status, carries the answer. The replay runs in canary mode, so a healthy in-flight run parked mid-flight (a PAUSED/RUNNING frontier suspension) is correctly reported clean rather than a false diverged; a terminal run externally sealed mid-await (TIMED_OUT/cancelled/terminated) is likewise clean. The replay is bounded by WorkerConfig::query_timeout; the query_timeout bound applies to async-yielding replays, and a workflow that busy-loops synchronously without ever awaiting is out of scope, exactly as for the live executor.",
+      "description": "Replay ONE execution's recorded history against the currently-registered #[workflow] handler on this node and return a structured determinism verdict (issue #614). POST is used instead of GET because it drives a replay of the workflow function; this route never writes workflow events and performs no writes (read-only, admin-gated). The DB connection is dropped before user code is driven, and the replay is pure in-memory replay. Answers 'will — or did — this run diverge under the code deployed right now?': useful for a PAUSED or non-determinism-blocked RUNNING run (the divergence object mirrors the #603 block diagnostic: kind/event_index/expected/actual), or a terminal FAILED run for retroactive forensics. The verdict is one of: clean (message 'no divergence under current code'), diverged (with a divergence object), workflow_failed (with a failure object), not_registered (the workflow type is not registered on this node), or not_replayable_dag (a classic DAG is not on the replay path). Since issue #952 a terminal FAILED run whose history REPRODUCES its recorded failure under the current code is 'clean' (reproducing a recorded failure is not a divergence) and carries that error in the failure object, with message 'no divergence under current code; the recorded failure was reproduced'; 'workflow_failed' remains for a replay that failed where the recorded history did not. All five verdicts return 200 — the diagnosis, not the HTTP status, carries the answer. The replay runs in canary mode, so a healthy in-flight run parked mid-flight (a PAUSED/RUNNING frontier suspension) is correctly reported clean rather than a false diverged; a terminal run externally sealed mid-await (TIMED_OUT/cancelled/terminated) is likewise clean. The replay is bounded by WorkerConfig::query_timeout; the query_timeout bound applies to async-yielding replays, and a workflow that busy-loops synchronously without ever awaiting is out of scope, exactly as for the live executor.",
       "idempotency": "Read-only (no events written, no state recomputed); safe to retry.",
       "params": [
         {
@@ -1034,7 +1043,7 @@
       "path": "/workflows/{id}/stream",
       "category": "workflow",
       "read_only": true,
-      "description": "Server-Sent Events stream of the EPHEMERAL live-output progress chunks a running workflow publishes via ctx.publish_progress (issue #791). Chunks are ordered over Postgres LISTEN/NOTIFY with sub-second delivery. This is a best-effort side channel: chunks are never recorded in harvest_events, never replayed, and there is NO backfill on (re)connect \u2014 a subscriber that connects after a chunk was published will not see it (chunk content may be non-deterministic precisely because it is never stored). Each SSE message carries id (a monotonic, epoch-prefixed seq \u2014 a gap means a missed chunk) plus event:progress and data (the raw chunk JSON, NOT re-wrapped). A final event:end frame is emitted when the execution reaches a terminal state and the stream then closes; event:error is sent if the LISTEN connection drops. Keepalive :ping comments keep proxies from idling the connection; the terminal-close poll cadence is a modest default bounded by the configured SSE keepalive interval. AUTH: this route inherits the management API's configured auth middleware (HarvestPlugin::api_with_auth); it is deliberately NOT admin-gated (AC5 \u2014 end-users stream their own workflows). If no api_with_auth middleware is configured the route is open \u2014 embedders exposing streams to untrusted end-users should configure api_with_auth or front it with their own auth. The engine only checks that the execution exists (else 404) \u2014 exec_id is effectively a bearer capability for this run's live chunk CONTENT, so embedders exposing sensitive output MUST add per-execution authorization. Each subscriber holds one dedicated (non-pooled) Postgres LISTEN connection for the stream's lifetime; embedders should rate-limit and/or cap concurrent streams per user to avoid DB connection exhaustion (a global concurrent-stream cap is a possible future enhancement).",
+      "description": "Server-Sent Events stream of the EPHEMERAL live-output progress chunks a running workflow publishes via ctx.publish_progress (issue #791). Chunks are ordered over Postgres LISTEN/NOTIFY with sub-second delivery. This is a best-effort side channel: chunks are never recorded in harvest_events, never replayed, and there is NO backfill on (re)connect — a subscriber that connects after a chunk was published will not see it (chunk content may be non-deterministic precisely because it is never stored). Each SSE message carries id (a monotonic, epoch-prefixed seq — a gap means a missed chunk) plus event:progress and data (the raw chunk JSON, NOT re-wrapped). A final event:end frame is emitted when the execution reaches a terminal state and the stream then closes; event:error is sent if the LISTEN connection drops. Keepalive :ping comments keep proxies from idling the connection; the terminal-close poll cadence is a modest default bounded by the configured SSE keepalive interval. AUTH: this route inherits the management API's configured auth middleware (HarvestPlugin::api_with_auth); it is deliberately NOT admin-gated (AC5 — end-users stream their own workflows). If no api_with_auth middleware is configured the route is open — embedders exposing streams to untrusted end-users should configure api_with_auth or front it with their own auth. The engine only checks that the execution exists (else 404) — exec_id is effectively a bearer capability for this run's live chunk CONTENT, so embedders exposing sensitive output MUST add per-execution authorization. Each subscriber holds one dedicated (non-pooled) Postgres LISTEN connection for the stream's lifetime; embedders should rate-limit and/or cap concurrent streams per user to avoid DB connection exhaustion (a global concurrent-stream cap is a possible future enhancement).",
       "params": [
         {
           "name": "id",
@@ -1046,7 +1055,7 @@
       "request_body": null,
       "success_response": {
         "status": 200,
-        "note": "Content-Type: text/event-stream. Frames: event:progress (data = the published chunk JSON, id = monotonic seq), a terminal event:end, or event:error. If the execution is already terminal at connect, a single event:end frame is sent and the stream closes. SEQ CLIENT CONTRACT: id is a monotonic per-execution LOGICAL-POSITION identity (not a per-chunk counter). Subscribers should dedupe by seq (keep-first) for at-most-once-per-position display, and use forward seq JUMPS to detect gaps after reconnect. A re-driven workflow position re-emits the SAME seq (best-effort); a re-emitted chunk MAY carry different content for non-deterministic chunks \u2014 the first-delivered is canonical. seq is per exec_id; a continue-as-new successor is a new exec_id on a new stream whose seq restarts. Chunks may be DROPPED best-effort under back-pressure (slow client) \u2014 the monotonic seq lets the client detect the resulting gap.",
+        "note": "Content-Type: text/event-stream. Frames: event:progress (data = the published chunk JSON, id = monotonic seq), a terminal event:end, or event:error. If the execution is already terminal at connect, a single event:end frame is sent and the stream closes. SEQ CLIENT CONTRACT: id is a monotonic per-execution LOGICAL-POSITION identity (not a per-chunk counter). Subscribers should dedupe by seq (keep-first) for at-most-once-per-position display, and use forward seq JUMPS to detect gaps after reconnect. A re-driven workflow position re-emits the SAME seq (best-effort); a re-emitted chunk MAY carry different content for non-deterministic chunks — the first-delivered is canonical. seq is per exec_id; a continue-as-new successor is a new exec_id on a new stream whose seq restarts. Chunks may be DROPPED best-effort under back-pressure (slow client) — the monotonic seq lets the client detect the resulting gap.",
         "free_form": true
       },
       "error_responses": [
@@ -1127,7 +1136,7 @@
           {
             "name": "conflict_policy",
             "required": false,
-            "description": "How to handle a collision with a currently-ACTIVE (RUNNING/PAUSED) prior run (issue #685). Orthogonal to reuse_policy (which governs terminal priors). One of: unspecified (default \u2014 each reuse policy's native active behavior, byte-for-byte identical to today), fail (409 AlreadyExists), use_existing (return the existing run, 200, no new WorkflowStarted), terminate_existing (cancel the active prior and start fresh, 201). Sending the field (even 'unspecified') surfaces a started_fresh boolean in the response (true = fresh run created, false = attached to the existing run); omitting it keeps the response byte-for-byte identical to today. terminate_existing requires admin authentication, because it can cancel a live prior; the other values (unspecified, fail, use_existing) do not \u2014 except that unspecified inherits the reuse policy's native behavior, so reuse_policy=terminate_if_running with an omitted/unspecified conflict_policy still requires admin. Not supported combined with a throttle/debounce/batch policy \u2014 the start is deferred and has no active prior to resolve at request time (400). An unknown value returns 400."
+            "description": "How to handle a collision with a currently-ACTIVE (RUNNING/PAUSED) prior run (issue #685). Orthogonal to reuse_policy (which governs terminal priors). One of: unspecified (default — each reuse policy's native active behavior, byte-for-byte identical to today), fail (409 AlreadyExists), use_existing (return the existing run, 200, no new WorkflowStarted), terminate_existing (cancel the active prior and start fresh, 201). Sending the field (even 'unspecified') surfaces a started_fresh boolean in the response (true = fresh run created, false = attached to the existing run); omitting it keeps the response byte-for-byte identical to today. terminate_existing requires admin authentication, because it can cancel a live prior; the other values (unspecified, fail, use_existing) do not — except that unspecified inherits the reuse policy's native behavior, so reuse_policy=terminate_if_running with an omitted/unspecified conflict_policy still requires admin. Not supported combined with a throttle/debounce/batch policy — the start is deferred and has no active prior to resolve at request time (400). An unknown value returns 400."
           },
           {
             "name": "start_at",
@@ -1204,7 +1213,7 @@
         },
         {
           "status": 401,
-          "description": "Requires admin authentication only when the request can forcibly cancel a currently-ACTIVE (RUNNING/PAUSED) prior \u2014 i.e. the resolved active-conflict behavior is Terminate (issue #685): conflict_policy=terminate_existing (any reuse_policy), or reuse_policy=terminate_if_running with the default/omitted conflict_policy. Non-destructive combinations \u2014 e.g. reuse_policy=terminate_if_running combined with conflict_policy=use_existing (the idempotent-starter shape) or conflict_policy=fail \u2014 cannot cancel a live run and do NOT require admin. Returned only when admin is required and admin auth is absent."
+          "description": "Requires admin authentication only when the request can forcibly cancel a currently-ACTIVE (RUNNING/PAUSED) prior — i.e. the resolved active-conflict behavior is Terminate (issue #685): conflict_policy=terminate_existing (any reuse_policy), or reuse_policy=terminate_if_running with the default/omitted conflict_policy. Non-destructive combinations — e.g. reuse_policy=terminate_if_running combined with conflict_policy=use_existing (the idempotent-starter shape) or conflict_policy=fail — cannot cancel a live run and do NOT require admin. Returned only when admin is required and admin auth is absent."
         },
         {
           "status": 409,
@@ -1576,8 +1585,8 @@
       "path": "/workflows/{id}/rerun",
       "category": "workflow",
       "read_only": false,
-      "description": "Re-run a terminal workflow execution: start a BRAND-NEW execution from the source run's recorded start parameters. When the re-run reuses the source's business key (the default), the source row is SEALED to CONTINUED_AS_NEW so the business key is free for the new run \u2014 its recorded prior state is returned as source_prior_state, and its output/error/completed_at are preserved untouched. Admin-only. Provenance on the new run is start_source='rerun', start_source_ref=<source execution id>, started_by=<actor>. Cloned verbatim from the source row: input (unless overridden), queue, memo, search attributes (minus the six replay-non-determinism diagnostic keys), execution timeout, chain timeout, SLA, owner/runbook_url/severity, context headers, workflow retry policy, and completion callbacks. NOT preserved: priority (it is not stored on the execution row), and schedule provenance (schedule_id / scheduled_for / origin are cleared, matching the reset-fork precedent \u2014 an operator intervention is deliberately excluded from scheduled carryover). The new run always begins a fresh continue-as-new chain and a fresh retry chain (attempt 1).",
-      "idempotency": "NOT idempotent. A second identical re-run returns 409: the first re-run sealed the source to CONTINUED_AS_NEW, which is no longer a re-runnable state \u2014 re-run the new run instead. (A re-run under an explicit workflow_id override does not seal the source, so the source stays re-runnable under a different key.)",
+      "description": "Re-run a terminal workflow execution: start a BRAND-NEW execution from the source run's recorded start parameters. When the re-run reuses the source's business key (the default), the source row is SEALED to CONTINUED_AS_NEW so the business key is free for the new run — its recorded prior state is returned as source_prior_state, and its output/error/completed_at are preserved untouched. Admin-only. Provenance on the new run is start_source='rerun', start_source_ref=<source execution id>, started_by=<actor>. Cloned verbatim from the source row: input (unless overridden), queue, memo, search attributes (minus the six replay-non-determinism diagnostic keys), execution timeout, chain timeout, SLA, owner/runbook_url/severity, context headers, workflow retry policy, and completion callbacks. NOT preserved: priority (it is not stored on the execution row), and schedule provenance (schedule_id / scheduled_for / origin are cleared, matching the reset-fork precedent — an operator intervention is deliberately excluded from scheduled carryover). The new run always begins a fresh continue-as-new chain and a fresh retry chain (attempt 1).",
+      "idempotency": "NOT idempotent. A second identical re-run returns 409: the first re-run sealed the source to CONTINUED_AS_NEW, which is no longer a re-runnable state — re-run the new run instead. (A re-run under an explicit workflow_id override does not seal the source, so the source stays re-runnable under a different key.)",
       "params": [
         {
           "name": "id",
@@ -1593,7 +1602,7 @@
           {
             "name": "input",
             "required": false,
-            "description": "Optional replacement input for the new run. Omitted = clone the source's stored input VERBATIM \u2014 it is never decoded, so an encrypted or codec-encoded input re-runs byte-identically. A JSON null IS a valid override (it replaces the clone with null); omit the field entirely to clone. Required when the source's input has been erased (issue #495)."
+            "description": "Optional replacement input for the new run. Omitted = clone the source's stored input VERBATIM — it is never decoded, so an encrypted or codec-encoded input re-runs byte-identically. A JSON null IS a valid override (it replaces the clone with null); omit the field entirely to clone. Required when the source's input has been erased (issue #495)."
           },
           {
             "name": "workflow_id",
@@ -1618,7 +1627,7 @@
       "error_responses": [
         {
           "status": 400,
-          "description": "Malformed execution id or malformed JSON body; the target is a registered DAG (use the DAG trigger/retry routes); the workflow type carries a debounce, throttle, or batch policy \u2014 those defer the start and return no execution id, so a re-run cannot honour its 201 contract; an explicitly supplied `input` override violates the workflow's published input JSON Schema (issue #373), which returns the standard {error: \"input validation failed\", violations: [{message, field_path}]} body (only an OVERRIDE is validated: a verbatim clone of the source's stored input is never re-validated, so a run started under an older or looser schema stays re-runnable); or the source's stored `completion_callbacks` value cannot be parsed as JSON (issue #605) \u2014 a standard RFC 7807 {detail: <message>} body naming the source execution."
+          "description": "Malformed execution id or malformed JSON body; the target is a registered DAG (use the DAG trigger/retry routes); the workflow type carries a debounce, throttle, or batch policy — those defer the start and return no execution id, so a re-run cannot honour its 201 contract; an explicitly supplied `input` override violates the workflow's published input JSON Schema (issue #373), which returns the standard {error: \"input validation failed\", violations: [{message, field_path}]} body (only an OVERRIDE is validated: a verbatim clone of the source's stored input is never re-validated, so a run started under an older or looser schema stays re-runnable); or the source's stored `completion_callbacks` value cannot be parsed as JSON (issue #605) — a standard RFC 7807 {detail: <message>} body naming the source execution."
         },
         {
           "status": 401,
@@ -1630,19 +1639,19 @@
         },
         {
           "status": 409,
-          "description": "Source is not terminal (RUNNING/PAUSED); source is CONTINUED_AS_NEW (re-run the chain's latest run instead); source already has an automatic workflow-level retry successor (issue #523 \u2014 re-run the chain's latest attempt instead); source input has been erased (issue #495) and no explicit input was supplied; the source's shard has been drained out of writable_shards (this entire operation is pinned to the source's physical shard \u2014 a re-run can only ever land there, so an operator draining that shard blocks new re-runs of its work just like any other new admission); a workflow_id override routes to a DIFFERENT shard than the source (cross-shard workflow_id overrides are not supported \u2014 re-run without an override, or start a fresh execution directly under the target workflow_id); source is schedule-attributed and sealing it would break the schedule's carryover and run-history lineage (issues #488 / #534 \u2014 re-run with an explicit workflow_id override instead, which never seals the source); the target business key is currently held by a different live execution (including a workflow_id override that is already in use); or a stored context_headers / workflow_retry_policy value on the source cannot be parsed as JSON (a faithful clone must never silently drop a field)."
+          "description": "Source is not terminal (RUNNING/PAUSED); source is CONTINUED_AS_NEW (re-run the chain's latest run instead); source already has an automatic workflow-level retry successor (issue #523 — re-run the chain's latest attempt instead); source input has been erased (issue #495) and no explicit input was supplied; the source's shard has been drained out of writable_shards (this entire operation is pinned to the source's physical shard — a re-run can only ever land there, so an operator draining that shard blocks new re-runs of its work just like any other new admission); a workflow_id override routes to a DIFFERENT shard than the source (cross-shard workflow_id overrides are not supported — re-run without an override, or start a fresh execution directly under the target workflow_id); source is schedule-attributed and sealing it would break the schedule's carryover and run-history lineage (issues #488 / #534 — re-run with an explicit workflow_id override instead, which never seals the source); the target business key is currently held by a different live execution (including a workflow_id override that is already in use); or a stored context_headers / workflow_retry_policy value on the source cannot be parsed as JSON (a faithful clone must never silently drop a field)."
         },
         {
           "status": 413,
-          "description": "The new run's input exceeds the effective workflow-input byte cap (issue #252). Fires on an oversized `input` override, and \u2014 notably \u2014 can also fire on the VERBATIM CLONE of a source that started successfully under a larger cap, if an operator has since LOWERED `max_workflow_input_bytes` (globally or for this workflow type). In that case the source is re-runnable only by supplying a smaller `input` override or by raising the cap back."
+          "description": "The new run's input exceeds the effective workflow-input byte cap (issue #252). Fires on an oversized `input` override, and — notably — can also fire on the VERBATIM CLONE of a source that started successfully under a larger cap, if an operator has since LOWERED `max_workflow_input_bytes` (globally or for this workflow type). In that case the source is re-runnable only by supplying a smaller `input` override or by raising the cap back."
         },
         {
           "status": 422,
-          "description": "A completion callback target CLONED VERBATIM from the source (issue #605) is no longer admissible under the live SSRF policy \u2014 e.g. it was valid when the source started but has since been dropped from the host allowlist. Body: {error: \"completion callback target rejected\", url, rejection}, where `rejection` is a machine-readable SsrfRejection object (tag: `code`, e.g. HostNotAllowlisted/SchemeNotAllowed/IpLiteralNotAllowed). Only fires when the source has `completion_callbacks` recorded; a source with none is unaffected. Nothing is started and the source is never sealed."
+          "description": "A completion callback target CLONED VERBATIM from the source (issue #605) is no longer admissible under the live SSRF policy — e.g. it was valid when the source started but has since been dropped from the host allowlist. Body: {error: \"completion callback target rejected\", url, rejection}, where `rejection` is a machine-readable SsrfRejection object (tag: `code`, e.g. HostNotAllowlisted/SchemeNotAllowed/IpLiteralNotAllowed). Only fires when the source has `completion_callbacks` recorded; a source with none is unaffected. Nothing is started and the source is never sealed."
         },
         {
           "status": 503,
-          "description": "An admission gate blocked the new start \u2014 same body shape as any gated start (error, gate_id, reason)."
+          "description": "An admission gate blocked the new start — same body shape as any gated start (error, gate_id, reason)."
         },
         {
           "status": 500,
@@ -3049,6 +3058,7 @@
           "status": 400,
           "description": "Malformed query string: a percent-encoded byte sequence in the query does not decode to valid UTF-8."
         }
+
       ]
     },
     {
@@ -3550,6 +3560,7 @@
           "status": 400,
           "description": "Malformed query string: a percent-encoded byte sequence in the query does not decode to valid UTF-8."
         }
+
       ]
     },
     {
@@ -3655,6 +3666,7 @@
           "status": 400,
           "description": "Malformed query string: a percent-encoded byte sequence in the query does not decode to valid UTF-8."
         }
+
       ]
     },
     {
@@ -3832,7 +3844,7 @@
           "status",
           "unavailable_shards"
         ],
-        "notes": "Polymorphic response. A real submit (dry_run false/omitted) returns 202 Accepted with {batch_job_id}. When dry_run is true, returns 200 with a read-only preview: {dry_run:true, action, filter (the normalized filter echoed back), matched_count, per_shard (array of {shard_id, matched_count} summing to matched_count), sample (array of up to sample_cap {execution_id, workflow_name, state} rows ordered by id ascending, global across all shards), sample_cap (100), sample_truncated (matched_count > sample.len()), status ('complete'|'partial'), unavailable_shards (array of {shard_id, reason}, omitted when empty)}. Partial-shard degradation (mirrors POST /workflows/batch_reset): when a shard is unreachable the preview returns 200 with status='partial' naming the unavailable shard instead of failing with a 500 \u2014 and matched_count is then a LOWER BOUND over reachable shards only. A dry_run is admin-only (this route is Mutating) and does NOT validate signal_name/payload \u2014 the real submit may still 400. An empty/criteria-less filter is rejected 400 with the same guard as a real submit."
+        "notes": "Polymorphic response. A real submit (dry_run false/omitted) returns 202 Accepted with {batch_job_id}. When dry_run is true, returns 200 with a read-only preview: {dry_run:true, action, filter (the normalized filter echoed back), matched_count, per_shard (array of {shard_id, matched_count} summing to matched_count), sample (array of up to sample_cap {execution_id, workflow_name, state} rows ordered by id ascending, global across all shards), sample_cap (100), sample_truncated (matched_count > sample.len()), status ('complete'|'partial'), unavailable_shards (array of {shard_id, reason}, omitted when empty)}. Partial-shard degradation (mirrors POST /workflows/batch_reset): when a shard is unreachable the preview returns 200 with status='partial' naming the unavailable shard instead of failing with a 500 — and matched_count is then a LOWER BOUND over reachable shards only. A dry_run is admin-only (this route is Mutating) and does NOT validate signal_name/payload — the real submit may still 400. An empty/criteria-less filter is rejected 400 with the same guard as a real submit."
       },
       "error_responses": [
         {
@@ -4732,7 +4744,7 @@
       "path": "/admin/canary",
       "category": "admin",
       "read_only": true,
-      "description": "Synthetic liveness canary freshness report (issue #796). Reports, per (queue, shard), the age of the most recent COMPLETED built-in probe run so an operator or staleness alert can tell a live pipeline from a wedged one (workers polling but never completing, a stalled scheduler tick, a write-blocked shard). The probe grid is the configured probe queues \u00d7 the router's writable shards, so a write-blocked or empty shard surfaces as a stale probe rather than being silently absent. Each probes[] entry carries queue, shard, last_success_at, age_of_last_success_secs, last_roundtrip_ms, success_count, failure_count, and stale (true when the last success is older than the staleness window or there has been no success). Fans out across shards; an unreachable shard is named in unavailable_shards and drops status to partial/unavailable rather than failing the call wholesale. When the canary is disabled an empty complete report is returned. Distinct from the #512 replay canary (POST /admin/workflows/replay-canary), which validates code changes by replaying histories.",
+      "description": "Synthetic liveness canary freshness report (issue #796). Reports, per (queue, shard), the age of the most recent COMPLETED built-in probe run so an operator or staleness alert can tell a live pipeline from a wedged one (workers polling but never completing, a stalled scheduler tick, a write-blocked shard). The probe grid is the configured probe queues × the router's writable shards, so a write-blocked or empty shard surfaces as a stale probe rather than being silently absent. Each probes[] entry carries queue, shard, last_success_at, age_of_last_success_secs, last_roundtrip_ms, success_count, failure_count, and stale (true when the last success is older than the staleness window or there has been no success). Fans out across shards; an unreachable shard is named in unavailable_shards and drops status to partial/unavailable rather than failing the call wholesale. When the canary is disabled an empty complete report is returned. Distinct from the #512 replay canary (POST /admin/workflows/replay-canary), which validates code changes by replaying histories.",
       "params": [],
       "request_body": null,
       "success_response": {
@@ -5068,6 +5080,7 @@
           "status": 400,
           "description": "Malformed query string: a percent-encoded byte sequence in the query does not decode to valid UTF-8."
         }
+
       ]
     },
     {
@@ -5381,6 +5394,7 @@
           "status": 400,
           "description": "Malformed query string: a percent-encoded byte sequence in the query does not decode to valid UTF-8."
         }
+
       ]
     },
     {
@@ -5471,6 +5485,7 @@
           "status": 400,
           "description": "Malformed query string: a percent-encoded byte sequence in the query does not decode to valid UTF-8."
         }
+
       ]
     },
     {
@@ -5553,6 +5568,7 @@
           "status": 400,
           "description": "Malformed query string: a percent-encoded byte sequence in the query does not decode to valid UTF-8."
         }
+
       ]
     },
     {
@@ -6667,6 +6683,7 @@
           "status": 400,
           "description": "Malformed query string: a percent-encoded byte sequence in the query does not decode to valid UTF-8."
         }
+
       ]
     },
     {
@@ -7400,7 +7417,7 @@
       "path": "/admin/gates",
       "category": "admission_gates",
       "read_only": true,
-      "description": "List all active (non-lifted) admission gates. The response also carries a `producers` block enumerating every in-process workflow-start producer and whether it is `gated`, `gated_at_admission` (deferred-fire producers gated at HTTP admission whose scanner fire is exempt-with-bypass-counter), `gated_at_relay` (gated authoritatively at relay/fire time on the target/real queue: the cross-shard completion-trigger relay blocks + drops a matching gate, and \u2014 since issue #1053 \u2014 the throttle scanner blocks + re-defers a matching gate; else both count the bypass), or `exempt_by_design` (with a rationale), so the admission-gate contract is discoverable without reading source (issue #618).",
+      "description": "List all active (non-lifted) admission gates. The response also carries a `producers` block enumerating every in-process workflow-start producer and whether it is `gated`, `gated_at_admission` (deferred-fire producers gated at HTTP admission whose scanner fire is exempt-with-bypass-counter), `gated_at_relay` (gated authoritatively at relay/fire time on the target/real queue: the cross-shard completion-trigger relay blocks + drops a matching gate, and — since issue #1053 — the throttle scanner blocks + re-defers a matching gate; else both count the bypass), or `exempt_by_design` (with a rationale), so the admission-gate contract is discoverable without reading source (issue #618).",
       "idempotency": "Read-only; always idempotent.",
       "params": [],
       "request_body": {
@@ -7529,7 +7546,7 @@
       "path": "/admin/tokens",
       "category": "api_tokens",
       "read_only": true,
-      "description": "List all scoped API tokens as metadata only (issue #942). The plaintext secret and its hash are never returned \u2014 only id, name, scope, created_at, expires_at, last_used_at, revoked_at.",
+      "description": "List all scoped API tokens as metadata only (issue #942). The plaintext secret and its hash are never returned — only id, name, scope, created_at, expires_at, last_used_at, revoked_at.",
       "idempotency": "Read-only; always idempotent.",
       "params": [],
       "request_body": {
@@ -7750,7 +7767,7 @@
           "name": "queue_name",
           "in": "path",
           "required": true,
-          "description": "The task queue to release, matched EXACTLY. Leading or trailing whitespace is rejected with a 400 rather than trimmed, symmetrically with the pause route \u2014 see its description for why. Send the exact name."
+          "description": "The task queue to release, matched EXACTLY. Leading or trailing whitespace is rejected with a 400 rather than trimmed, symmetrically with the pause route — see its description for why. Send the exact name."
         }
       ],
       "request_body": {
@@ -8258,6 +8275,7 @@
           "status": 400,
           "description": "Malformed query string: a percent-encoded byte sequence in the query does not decode to valid UTF-8."
         }
+
       ]
     },
     {
@@ -8367,6 +8385,7 @@
           "status": 400,
           "description": "Malformed query string: a percent-encoded byte sequence in the query does not decode to valid UTF-8."
         }
+
       ]
     },
     {
