@@ -315,6 +315,17 @@ pub mod handle;
 #[cfg(feature = "db")]
 pub mod handle_typed;
 pub mod history_export;
+/// Hot code swap for workflow definitions via runtime modules (issue #967).
+///
+/// R&D spike. Hosts a `#[workflow]` body as a runtime-loaded WebAssembly
+/// module registered under an explicit `BuildId`, so the shipped build-routing
+/// machinery governs a swap with no new safety machinery and no replay-surface
+/// change. See `docs/rnd/hot-code-swap.md`.
+#[cfg(feature = "hot-code-swap")]
+pub mod hot_swap;
+/// Postgres registry for hot-swappable workflow modules (issue #967).
+#[cfg(feature = "hot-code-swap")]
+pub mod hot_swap_store;
 pub mod info;
 /// Activity execution interceptors (issue #680): an ordered middleware chain
 /// wrapping every activity execution on the worker (regular + local).
@@ -690,6 +701,23 @@ pub use version_usage::{
 pub use webhook_trigger::{
     WebhookCtx, WebhookHandlerError, WebhookHandlerFn, WebhookTarget, WebhookTriggerInfo,
     validate_webhook_triggers,
+};
+
+#[cfg(feature = "hot-code-swap")]
+pub use hot_swap::{
+    DECIDE_ABI_VERSION, DECIDE_FUEL, DECIDE_MAX_WALL_CLOCK, DECIDE_MEMORY_BYTES,
+    DECIDE_RUN_WALL_CLOCK, DecideOutcome, DecideRequest, DecideResponse, HotSwapError,
+    LoadedWorkflowModule, MAX_DECIDE_REQUEST_BYTES, MAX_DECIDE_STEPS, MAX_GUEST_TEXT_BYTES,
+    MAX_WORKFLOW_MODULE_BYTES, MIN_SIGNING_KEY_BYTES, ModuleDescriptor, ModuleHost, ModuleRegistry,
+    ModuleVerification, clamp_decide_limits, compute_module_hash, default_decide_limits,
+    encode_decide_request, is_module_hosted, module_workflow_handler, sign_module_binding,
+    verify_module_bytes, with_module_host,
+};
+#[cfg(feature = "hot-code-swap")]
+pub use hot_swap_store::{
+    WorkflowModuleRow, fetch_workflow_module, list_workflow_modules,
+    list_workflow_modules_for_build, publish_workflow_module, retire_build_modules,
+    sync_build_into_registry,
 };
 
 #[cfg(feature = "wasm-activities")]
