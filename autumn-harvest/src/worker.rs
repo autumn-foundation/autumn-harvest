@@ -17756,7 +17756,8 @@ async fn suspended_command_event_count(
 }
 
 #[allow(clippy::too_many_arguments)]
-async fn move_workflow_to_dlq_for_history_cap(
+#[doc(hidden)]
+pub async fn move_workflow_to_dlq_for_history_cap(
     conn: &mut AsyncPgConnection,
     task: &TaskQueueItem,
     exec_id: ExecutionId,
@@ -17775,6 +17776,22 @@ async fn move_workflow_to_dlq_for_history_cap(
         Box::pin(conn.transaction::<_, HarvestError, _>(async |conn| {
             use crate::schema::harvest_workflow_executions::dsl as exec_dsl;
             let reason = reason.clone();
+            // Issue #1184 (Codex review round 3, P1): this transaction had no
+            // ownership recheck at all -- a stale dispatcher whose claim had
+            // already moved could still DLQ and terminally fail a run its new
+            // owner was actively driving. Lock the execution row FIRST (the
+            // documented `harvest_task_queue` convention -- see
+            // `lock_workflow_execution_row_only`'s doc comment -- and this
+            // function's own subsequent `update_workflow_execution_failed`
+            // write to that same row), before the task-row claim check, so
+            // this can never invert against `timeout::enforce_workflow_timeout`
+            // /`force_fail_activity`'s execution-then-task lock order.
+            lock_workflow_execution_row_only(conn, exec_id).await?;
+            if !queue::claim_still_held_for_update(conn, task.id, worker_id, task.crash_strikes)
+                .await?
+            {
+                return Err(HarvestError::TerminalWriteClaimAmbiguous { task_id: task.id });
+            }
             let (owner, severity) = exec_dsl::harvest_workflow_executions
                 .find(exec_id.as_uuid())
                 .select((exec_dsl::owner, exec_dsl::severity))
@@ -18046,21 +18063,6 @@ async fn fail_workflow_for_history_cap(
     cap: u64,
 ) -> HarvestResult<Vec<crate::completion_trigger::DeferredTriggerStart>> {
     let terminal_count = u64::try_from(next_event_id).unwrap_or(0).saturating_add(1);
-    telemetry.metrics.record_workflow_completed(
-        &execution.workflow_name,
-        &task.queue_name,
-        started_at.elapsed().as_secs_f64(),
-        WorkflowStatus::Failed,
-    );
-    telemetry
-        .metrics
-        .record_workflow_history_size(&execution.workflow_name, terminal_count);
-    crate::telemetry::emit_workflow_terminal(
-        &*telemetry.metrics,
-        &execution.workflow_name,
-        &task.queue_name,
-        WorkflowStatus::Failed,
-    );
 
     // Issue #704 (PR #1139 review, second round): decide the crossing from
     // `terminal_count` -- the DURABLE post-failure event count, computed
@@ -18107,6 +18109,33 @@ async fn fail_workflow_for_history_cap(
         registry.payload_codecs(),
     )
     .await?;
+
+    // Issue #1184 (Codex review round 3, self-applied): emitted only now
+    // that `move_workflow_to_dlq_for_history_cap`'s transaction has actually
+    // committed -- that transaction gained an ownership guard in this same
+    // change (Codex round 3, P1) and can now roll back for a blameless
+    // claim-ambiguity reason, not just a genuine DB error. Emitting these
+    // before the call (the previous ordering) meant a rolled-back attempt
+    // still counted a decision that was never durably persisted, and the
+    // eventual real attempt counts it again -- the identical class of bug
+    // fixed for the ordinary terminal-outcome path in
+    // `emit_pending_workflow_metrics` (round 2, P2); same fix, applied here
+    // for consistency since this path has the same new failure mode.
+    telemetry.metrics.record_workflow_completed(
+        &execution.workflow_name,
+        &task.queue_name,
+        started_at.elapsed().as_secs_f64(),
+        WorkflowStatus::Failed,
+    );
+    telemetry
+        .metrics
+        .record_workflow_history_size(&execution.workflow_name, terminal_count);
+    crate::telemetry::emit_workflow_terminal(
+        &*telemetry.metrics,
+        &execution.workflow_name,
+        &task.queue_name,
+        WorkflowStatus::Failed,
+    );
 
     // Issue #704 (PR #1139 review, Nth round): emit/stamp the crossing only
     // AFTER `move_workflow_to_dlq_for_history_cap` above has returned `Ok`

@@ -19,6 +19,7 @@
 
 use std::time::Duration;
 
+use autumn_harvest::dlq::DeadLetterReason;
 use autumn_harvest::event::WorkflowEvent;
 use autumn_harvest::models::{NewWorkflowExecution, TaskQueueItem, WorkflowExecution};
 use autumn_harvest::queue::{self, EnqueueParams, TaskType};
@@ -28,8 +29,9 @@ use autumn_harvest::types::ExecutionId;
 use autumn_harvest::worker::{
     HandlerRegistry, PreloadedFailureHistory, WorkflowTaskPersistence, check_paused_and_park,
     fail_execution_on_error, fail_task_and_execution_with_history,
-    persist_child_workflow_completion, persist_child_workflow_failure, persist_workflow_completion,
-    persist_workflow_continue_as_new, persist_workflow_failure,
+    move_workflow_to_dlq_for_history_cap, persist_child_workflow_completion,
+    persist_child_workflow_failure, persist_workflow_completion, persist_workflow_continue_as_new,
+    persist_workflow_failure,
 };
 
 use chrono::Utc;
@@ -843,4 +845,55 @@ async fn fail_execution_on_error_passes_terminal_write_claim_ambiguous_through_u
         .expect("the task row is untouched");
     assert_eq!(reloaded.state, "RUNNING");
     assert_eq!(reloaded.worker_id.as_deref(), Some("dispatcher-a"));
+}
+
+// ---------------------------------------------------------------------------
+// move_workflow_to_dlq_for_history_cap -- Codex review round 3, P1: the
+// hard-cap terminal-failure/DLQ path had no ownership check at all. A stale
+// dispatcher whose claim had already moved could still DLQ and terminally
+// fail a run its new owner was actively driving.
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn move_workflow_to_dlq_for_history_cap_makes_no_terminal_decision_when_the_claim_moved() {
+    let (url, _container) = setup_db().await;
+    let (exec_id, task) = seed_claimed_task(&url, "q1184-history-cap", "dispatcher-a").await;
+    steal_claim(&url, task.id).await;
+
+    let reason = DeadLetterReason::HistoryCapExceeded {
+        count: 10_000,
+        cap: 10_000,
+        workflow_type: "issue1184_wf".to_string(),
+    };
+
+    let mut conn = connect(&url).await;
+    let result = move_workflow_to_dlq_for_history_cap(
+        &mut conn,
+        &task,
+        exec_id,
+        1,
+        "dispatcher-a",
+        None,
+        reason,
+        None,
+        &autumn_harvest::payload_codec::PayloadCodecs::default(),
+    )
+    .await;
+
+    assert_eq!(
+        result
+            .expect_err("a hard-cap DLQ write whose claim moved must not commit")
+            .terminal_write_claim_ambiguous(),
+        Some(task.id),
+        "the sentinel must name the exact task whose ownership is ambiguous"
+    );
+
+    let history = load_history(&url, exec_id).await;
+    assert!(
+        !history
+            .iter()
+            .any(|e| matches!(e, WorkflowEvent::WorkflowFailed { .. })),
+        "a dispatcher that lost the claim must append no terminal event; got {history:?}"
+    );
+    assert_thief_untouched(&url, exec_id, task.id, "RUNNING", "RUNNING").await;
 }
