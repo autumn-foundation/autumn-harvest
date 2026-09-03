@@ -919,6 +919,19 @@ pub(crate) fn deployment_is_multi_shard() -> bool {
     fanout_shards(&pool_shards, global_router_snapshot().as_ref()).len() > 1
 }
 
+/// [`deployment_is_multi_shard`] for integration tests in other crates.
+///
+/// The gate is crate-internal, but whether it answers correctly for a given
+/// installed topology is observable behaviour worth pinning from outside —
+/// `autumn-harvest-plugin/tests/resolve_installs_selected_pool.rs` asserts that
+/// a runtime resolving a multi-shard pool gates as multi-shard. Not part of the
+/// operator-facing surface.
+#[doc(hidden)]
+#[must_use]
+pub fn deployment_is_multi_shard_for_tests() -> bool {
+    deployment_is_multi_shard()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

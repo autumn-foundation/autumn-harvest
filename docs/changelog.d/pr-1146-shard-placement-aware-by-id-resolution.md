@@ -341,6 +341,44 @@ at dropped databases. The suite is registered in `.github/ci/integration-suites.
 compile but never run). The issue #751 suite (26 tests) and the cross-workflow /
 cross-shard / sharding suites pass unchanged.
 
+**Codex round 8 (one P1, on the merged head).** The inline gate consulted a
+process global that the runtime does not necessarily run against.
+`ShardedDbPool::single`/`from_map` self-install into `GLOBAL_SHARDED_POOL` at
+*construction*, so the global holds whichever pool was built **last**;
+`resolve_runtime_storage_pool` selects by precedence — a runner-level
+`HarvestRunnerResources::sharded_pool` beats `WorkerConfig::with_sharded_pool` —
+and its sharded arm wrapped that choice in `HarvestDbPool::sharded`, a `const
+fn` that installs nothing. Build the multi-shard override first and a
+single-shard worker-config pool second, and the runtime runs multi-shard while
+the global says single-shard.
+
+`deployment_is_multi_shard` then answers "single", inline delivery is allowed,
+and a caller whose shard holds a stale terminal copy of the key records a
+permanent `not_running` against a run that is live elsewhere — precisely the
+wrong terminal this issue exists to remove, re-entered through the gate meant to
+prevent it. Failing closed does not help: the function is not wrong about the
+pool it was handed, it is handed the wrong pool. A multi-shard *router* masks it
+(`fanout_shards` unions the router's readable set with the pool's), so the hole
+needs a one-shard router as well — which is why it survived the earlier rounds.
+
+Fixed at the root rather than at the gate. `resolve_runtime_storage_pool` now
+installs the pool it selects, via a new `shard::install_global_sharded_pool`
+(the sibling of `install_global_router`), which is what its own doc comment
+already promised — "resolve the storage pool the runtime will run against **and
+install it**" was true only of the single-shard arm. Threading the topology into
+the gate, as the review suggested, would have fixed one consumer and left the
+by-id fan-out, the timeout sweeps and completion triggers still reading a pool
+the runtime is not using; installing the selection fixes all of them at once.
+Issue #700 P4 is unaffected — the boot gate uses `select_runtime_gate_shards`,
+which still installs nothing, and `tests/gate_no_global_install.rs` still passes.
+
+`tests/resolve_installs_selected_pool.rs` pins it, in its own binary because
+`GLOBAL_SHARDED_POOL` is process-wide: it constructs the two pools in the
+divergent order, asserts the precondition that the global disagrees with what
+precedence will select, then asserts that after resolution the global carries
+the resolved topology and that the gate reports multi-shard. Verified red on
+revert.
+
 **Documented in** `docs/sharding.md` (new *Business-key addressing finds a
 pinned run wherever it is* section under issue #697), `docs/security-posture.md`
 (the #697/#751 interaction bullet, rewritten from a limitation to the resolved

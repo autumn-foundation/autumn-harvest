@@ -843,6 +843,26 @@ pub fn install_global_router(router: ShardRouter) {
     }
 }
 
+/// Install a `ShardedDbPool` into the global registry.
+///
+/// `ShardedDbPool::single` and `from_map` already self-install at
+/// construction, so the global normally reflects whichever pool was built
+/// **last** — which is not necessarily the pool the runtime went on to select.
+/// A runtime that resolves a pool by precedence (see
+/// `runner::resolve_runtime_storage_pool`) must therefore re-install its
+/// choice, or every consumer of the global — the by-id fan-out, the inline
+/// gate, completion triggers, the timeout sweeps — reads a pool the runtime is
+/// not using (issue #1146 review).
+///
+/// Same caveat as [`install_global_router`]: this is runtime-initialization
+/// API, not something to call from a temporary constructor.
+#[cfg(feature = "db")]
+pub fn install_global_sharded_pool(pool: ShardedDbPool) {
+    if let Ok(mut lock) = GLOBAL_SHARDED_POOL.write() {
+        *lock = Some(pool);
+    }
+}
+
 #[cfg(feature = "db")]
 impl ShardedDbPool {
     /// Wrap an existing single pool as a one-shard sharded pool at `ShardId(0)`.
