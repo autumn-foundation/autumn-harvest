@@ -173,6 +173,9 @@ const MANAGED_PROVIDER_SUFFIXES: &[(&str, &str)] = &[
     (".fly.dev", "Fly.io"),
 ];
 
+/// The connection keyword — and URI query parameter — that selects TLS.
+const SSLMODE_KEY: &str = "sslmode";
+
 /// `sslmode` values that demand a TLS handshake.
 const TLS_REQUIRING_SSLMODES: &[&str] = &["require", "verify-ca", "verify-full"];
 
@@ -306,21 +309,18 @@ fn refuse_non_local_host(name: &str) -> Option<RefusalReason> {
 /// [`classify_database_url`] is the backstop, and it sees the spellings this
 /// does not.
 fn tls_requiring_sslmode(dsn: &str) -> Option<String> {
-    let mut modes: Box<dyn Iterator<Item = String>> = if dsn::is_uri_dsn(dsn) {
-        Box::new(
-            dsn::uri_query_parameters(dsn)
-                .filter(|(key, _)| key.eq_ignore_ascii_case("sslmode"))
-                .map(|(_, value)| value.to_ascii_lowercase()),
-        )
+    let demands_tls = |mode: &String| TLS_REQUIRING_SSLMODES.contains(&mode.as_str());
+    if dsn::is_uri_dsn(dsn) {
+        dsn::uri_query_parameters(dsn)
+            .filter(|(key, _)| key.eq_ignore_ascii_case(SSLMODE_KEY))
+            .map(|(_, value)| value.to_ascii_lowercase())
+            .find(demands_tls)
     } else {
-        Box::new(
-            dsn::keyword_options(dsn)
-                .into_iter()
-                .filter(|option| option.key.eq_ignore_ascii_case("sslmode"))
-                .map(|option| option.value.to_ascii_lowercase()),
-        )
-    };
-    modes.find(|mode| TLS_REQUIRING_SSLMODES.contains(&mode.as_str()))
+        dsn::keyword_options(dsn)
+            .filter(|option| option.key.eq_ignore_ascii_case(SSLMODE_KEY))
+            .map(|option| option.value.to_ascii_lowercase())
+            .find(demands_tls)
+    }
 }
 
 /// The segment of `value` that reads as a production environment, if any.

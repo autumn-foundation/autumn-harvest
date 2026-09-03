@@ -64,83 +64,119 @@ pub(super) struct KeywordOption<'a> {
 /// standing — in a banner whose entire purpose is to be safe to paste into an
 /// issue.
 ///
+/// Lazy, so a caller looking for one option ([`safety`](super::safety) wants
+/// `sslmode`) stops at it rather than decoding every later value — including
+/// the password — into a `String` it never reads.
+///
 /// Deliberately **lenient**: a token with no `=` is skipped, and an
 /// unterminated quote or a trailing `\` ends the scan where it ends the string,
 /// rather than failing the whole read. Both callers already have an authority
 /// for malformed input — `Config::from_str` refuses it, and the banner must
 /// still print something — so bailing out would only lose the options that were
-/// legible. The walk advances on every iteration, so it terminates on any
-/// input.
-pub(super) fn keyword_options(dsn: &str) -> Vec<KeywordOption<'_>> {
-    let bytes = dsn.as_bytes();
-    let mut options = Vec::new();
-    let mut index = 0;
+/// legible.
+pub(super) const fn keyword_options(dsn: &str) -> KeywordOptions<'_> {
+    KeywordOptions { dsn, index: 0 }
+}
 
-    while index < bytes.len() {
-        // Whitespace between options.
-        while index < bytes.len() && bytes[index].is_ascii_whitespace() {
-            index += 1;
-        }
-        if index >= bytes.len() {
-            break;
+/// The options of a keyword/value connection string, in the order written.
+///
+/// Yields non-overlapping [`KeywordOption::value_span`]s that only ever move
+/// forward, which is what makes a span-splice rewrite safe.
+pub(super) struct KeywordOptions<'a> {
+    /// The string being scanned.
+    dsn: &'a str,
+    /// How far into `dsn` the scan has reached, always a character boundary.
+    index: usize,
+}
+
+impl<'a> Iterator for KeywordOptions<'a> {
+    type Item = KeywordOption<'a>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let bytes = self.dsn.as_bytes();
+
+        // A token with no `=` is not an option, so keep going until one is —
+        // every pass consumes at least one byte, so this terminates.
+        while self.index < bytes.len() {
+            // Whitespace between options.
+            while self.index < bytes.len() && bytes[self.index].is_ascii_whitespace() {
+                self.index += 1;
+            }
+            if self.index >= bytes.len() {
+                return None;
+            }
+
+            // Keyword: up to the `=` or the whitespace that ends it.
+            let key_start = self.index;
+            while self.index < bytes.len()
+                && bytes[self.index] != b'='
+                && !bytes[self.index].is_ascii_whitespace()
+            {
+                self.index += 1;
+            }
+            let key = &self.dsn[key_start..self.index];
+
+            // libpq permits whitespace on either side of the `=`.
+            while self.index < bytes.len() && bytes[self.index].is_ascii_whitespace() {
+                self.index += 1;
+            }
+            if self.index >= bytes.len() || bytes[self.index] != b'=' {
+                // A bare token with no value. `self.index` is past `key_start`
+                // here — the loop above only stops on `=` (handled) or on
+                // whitespace it then consumed — so the scan still advances.
+                continue;
+            }
+            self.index += 1;
+            while self.index < bytes.len() && bytes[self.index].is_ascii_whitespace() {
+                self.index += 1;
+            }
+
+            let value_start = self.index;
+            let value = self.take_value();
+            return Some(KeywordOption {
+                key,
+                value,
+                value_span: value_start..self.index,
+            });
         }
 
-        // Keyword: up to the `=` or the whitespace that ends it.
-        let key_start = index;
-        while index < bytes.len() && bytes[index] != b'=' && !bytes[index].is_ascii_whitespace() {
-            index += 1;
-        }
-        let key = &dsn[key_start..index];
+        None
+    }
+}
 
-        // libpq permits whitespace on either side of the `=`.
-        while index < bytes.len() && bytes[index].is_ascii_whitespace() {
-            index += 1;
-        }
-        if index >= bytes.len() || bytes[index] != b'=' {
-            // A bare token with no value: not an option. `index` is past
-            // `key_start` here — the loop above only stops on `=` (handled) or
-            // on whitespace it consumed — so the walk still advances.
-            continue;
-        }
-        index += 1;
-        while index < bytes.len() && bytes[index].is_ascii_whitespace() {
-            index += 1;
-        }
-
-        let value_start = index;
+impl KeywordOptions<'_> {
+    /// Consume one value from the cursor: a single-quoted span, or everything
+    /// up to the next unescaped whitespace. Returns it unquoted and unescaped.
+    fn take_value(&mut self) -> String {
+        let bytes = self.dsn.as_bytes();
         let mut value = String::new();
-        if index < bytes.len() && bytes[index] == b'\'' {
-            index += 1;
-            while index < bytes.len() {
-                match bytes[index] {
-                    b'\\' if index + 1 < bytes.len() => {
-                        index += 1 + push_char(dsn, index + 1, &mut value);
+
+        if self.index < bytes.len() && bytes[self.index] == b'\'' {
+            self.index += 1;
+            while self.index < bytes.len() {
+                match bytes[self.index] {
+                    b'\\' if self.index + 1 < bytes.len() => {
+                        self.index += 1 + push_char(self.dsn, self.index + 1, &mut value);
                     }
                     b'\'' => {
-                        index += 1;
+                        self.index += 1;
                         break;
                     }
-                    _ => index += push_char(dsn, index, &mut value),
+                    _ => self.index += push_char(self.dsn, self.index, &mut value),
                 }
             }
         } else {
-            while index < bytes.len() && !bytes[index].is_ascii_whitespace() {
-                if bytes[index] == b'\\' && index + 1 < bytes.len() {
-                    index += 1 + push_char(dsn, index + 1, &mut value);
+            while self.index < bytes.len() && !bytes[self.index].is_ascii_whitespace() {
+                if bytes[self.index] == b'\\' && self.index + 1 < bytes.len() {
+                    self.index += 1 + push_char(self.dsn, self.index + 1, &mut value);
                 } else {
-                    index += push_char(dsn, index, &mut value);
+                    self.index += push_char(self.dsn, self.index, &mut value);
                 }
             }
         }
 
-        options.push(KeywordOption {
-            key,
-            value,
-            value_span: value_start..index,
-        });
+        value
     }
-
-    options
 }
 
 /// Append the character at byte offset `at` to `out`, returning its width.
@@ -208,4 +244,197 @@ pub(super) fn percent_decoded(text: &str) -> String {
         }
     }
     String::from_utf8_lossy(&out).into_owned()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{is_uri_dsn, keyword_options, percent_decoded, uri_query_parameters};
+
+    /// `(key, unescaped value, the value exactly as written)` for every option.
+    fn options(dsn: &str) -> Vec<(&str, String, &str)> {
+        keyword_options(dsn)
+            .map(|option| (option.key, option.value, &dsn[option.value_span]))
+            .collect()
+    }
+
+    #[test]
+    fn the_syntax_test_is_the_clients_own_prefix_rule() {
+        for uri in [
+            "postgres://u@localhost/app",
+            "postgresql://u@localhost/app",
+            "  postgres://u@localhost/app",
+        ] {
+            assert!(is_uri_dsn(uri), "{uri}");
+        }
+        for keyword_value in [
+            "host=localhost dbname=app",
+            // Not the client's spelling, so not a URI to the client either.
+            "POSTGRES://u@localhost/app",
+            "postgres:/u@localhost/app",
+            "dbname=postgres://x",
+            "",
+        ] {
+            assert!(!is_uri_dsn(keyword_value), "{keyword_value}");
+        }
+    }
+
+    #[test]
+    fn a_quoted_value_is_consumed_whole_and_reported_as_written() {
+        assert_eq!(
+            options("host=localhost password='foo hunter2' dbname=app"),
+            [
+                ("host", "localhost".to_owned(), "localhost"),
+                ("password", "foo hunter2".to_owned(), "'foo hunter2'"),
+                ("dbname", "app".to_owned(), "app"),
+            ]
+        );
+    }
+
+    #[test]
+    fn an_escape_is_resolved_in_both_the_quoted_and_the_bare_form() {
+        assert_eq!(
+            options(r"password='a\'b' user=c\ d"),
+            [
+                ("password", "a'b".to_owned(), r"'a\'b'"),
+                // The escaped space does not end the bare value.
+                ("user", "c d".to_owned(), r"c\ d"),
+            ]
+        );
+    }
+
+    #[test]
+    fn whitespace_around_the_equals_sign_is_permitted_as_libpq_permits_it() {
+        assert_eq!(
+            options("sslmode = verify-full"),
+            [("sslmode", "verify-full".to_owned(), "verify-full")]
+        );
+    }
+
+    #[test]
+    fn a_value_containing_an_option_is_a_value_and_not_an_option() {
+        // The whole point of #1286: this string has exactly one `sslmode`-shaped
+        // run of text in it, and it is not a key.
+        assert_eq!(
+            options("host=localhost password='sslmode=require'"),
+            [
+                ("host", "localhost".to_owned(), "localhost"),
+                (
+                    "password",
+                    "sslmode=require".to_owned(),
+                    "'sslmode=require'"
+                ),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_bare_token_is_skipped_without_swallowing_the_option_after_it() {
+        assert_eq!(
+            options("bareword host=localhost"),
+            [("host", "localhost".to_owned(), "localhost")]
+        );
+    }
+
+    #[test]
+    fn a_multibyte_escape_advances_by_the_whole_character() {
+        // Stepping two bytes past a `\` would leave the cursor inside `é` and
+        // the next slice would panic on a non-character boundary.
+        assert_eq!(
+            options(r"password='\é' host=localhost"),
+            [
+                ("password", "é".to_owned(), r"'\é'"),
+                ("host", "localhost".to_owned(), "localhost"),
+            ]
+        );
+    }
+
+    #[test]
+    fn malformed_syntax_ends_the_scan_rather_than_failing_or_hanging() {
+        // Every one of these is something a developer can type. None may
+        // diverge, and each must still surrender the options it could read.
+        for dsn in [
+            "host=localhost password='unterminated",
+            r"host=localhost password=trailing\",
+            r"password='\",
+            "host=",
+            "=",
+            "'",
+            "   ",
+            "",
+            "sslmode",
+        ] {
+            let scanned = options(dsn);
+            assert!(
+                scanned.len() <= 2,
+                "{dsn:?} should not invent options: {scanned:?}"
+            );
+        }
+        assert_eq!(
+            options("host=localhost password='unterminated")
+                .first()
+                .map(|(key, _, _)| *key),
+            Some("host"),
+            "an option before the malformed one is still readable"
+        );
+    }
+
+    #[test]
+    fn spans_are_forward_only_and_never_overlap() {
+        // What makes the banner's span-splice rewrite safe.
+        let dsn = r"a=1 b='2 3' c=4\ 5 d= e='' f=6";
+        let mut previous_end = 0;
+        for option in keyword_options(dsn) {
+            assert!(
+                option.value_span.start >= previous_end,
+                "{option:?} overlaps or precedes the span before it"
+            );
+            assert!(
+                option.value_span.start <= option.value_span.end,
+                "{option:?}"
+            );
+            previous_end = option.value_span.end;
+        }
+        assert!(previous_end <= dsn.len());
+    }
+
+    #[test]
+    fn a_query_parameters_value_is_never_read_as_the_next_key() {
+        assert_eq!(
+            uri_query_parameters("postgres://u:pw@localhost/app?application_name=sslmode=require")
+                .collect::<Vec<_>>(),
+            [("application_name".to_owned(), "sslmode=require".to_owned())]
+        );
+    }
+
+    #[test]
+    fn query_keys_and_values_are_decoded_the_way_the_client_decodes_them() {
+        assert_eq!(
+            uri_query_parameters("postgres://u@localhost/app?%73slmode=verify%2Dfull")
+                .collect::<Vec<_>>(),
+            [("sslmode".to_owned(), "verify-full".to_owned())]
+        );
+    }
+
+    #[test]
+    fn a_dsn_with_no_query_string_has_no_parameters() {
+        for dsn in [
+            "postgres://u:pw@localhost/sslmode=require",
+            "postgres://u@localhost/app",
+            "postgres://u@localhost/app?",
+        ] {
+            assert_eq!(
+                uri_query_parameters(dsn).count(),
+                0,
+                "{dsn} carries no `key=value` query parameter"
+            );
+        }
+    }
+
+    #[test]
+    fn a_malformed_escape_is_left_exactly_as_written() {
+        assert_eq!(percent_decoded("%zz"), "%zz");
+        assert_eq!(percent_decoded("%4"), "%4");
+        assert_eq!(percent_decoded("%"), "%");
+        assert_eq!(percent_decoded("plain"), "plain");
+    }
 }
