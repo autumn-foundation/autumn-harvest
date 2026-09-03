@@ -235,6 +235,21 @@ jobs:
       - name: Run docs/rnd/determinism-static-analysis.md guards (also on docs-only PRs)
         run: "cargo test -p autumn-harvest --no-default-features --features testing --test integration determinism_static_analysis_docs::"
 
+      # Folio corpus harness: internal link check across all of docs/ (see
+      # docs/audits/corpus-link-check.py). Same reasoning as the docs-only
+      # guards above — a broken link is exactly the change class a docs-only
+      # PR is most likely to introduce, and the `test` matrix below skips
+      # entirely on docs-only changes. Pure Python stdlib, no deps, no
+      # network — costs a couple of seconds. Exits 1 only on a broken link
+      # inside the reader corpus; a broken link inside docs/plans/,
+      # docs/changelog.d/, docs/rnd/, docs/assays/, or docs/perf-artifacts/
+      # (historical/process records, not indexed reference pages) is
+      # reported but does not fail the build. Orphan pages are reported,
+      # not gated — an orphan is a findability defect to triage, not a hard
+      # error the way a dead link is.
+      - name: Folio corpus link check (docs/audits/corpus-link-check.py)
+        run: python3 docs/audits/corpus-link-check.py
+
   test:
     name: Test (${{ matrix.os }})
     needs: [lint, changes]
