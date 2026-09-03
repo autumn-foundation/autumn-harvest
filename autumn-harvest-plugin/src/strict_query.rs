@@ -1,5 +1,7 @@
-//! Strict percent-decoding for raw HTTP query strings (issue #1151, extracted
-//! from the issue #774 fix for `GET /admin/queue-coverage`).
+//! Strict percent-decoding for raw HTTP query strings.
+//!
+//! Extracted from the issue #774 fix for `GET /admin/queue-coverage` and
+//! shared by every other route swept in issue #1151.
 //!
 //! axum's built-in `Query<T>` extractor is backed by
 //! `serde_urlencoded`/`form_urlencoded`, both of which *always* succeed by
@@ -53,14 +55,17 @@ impl std::fmt::Display for InvalidQueryEncoding {
 impl std::error::Error for InvalidQueryEncoding {}
 
 /// The `400` JSON response body `GET /admin/queue-coverage` returns for
-/// [`InvalidQueryEncoding`] — the original, already-shipped and tested
-/// (issue #774) `{"error": "..."}` shape, distinct from [`AutumnError`]'s
-/// RFC-7807-flavored `{"detail": "...", "status": 400, ...}` shape every
-/// *other* strict-query route uses. Kept exactly as issue #774 shipped it
-/// (see `queue_coverage_integration.rs`'s existing malformed-encoding tests,
-/// which assert on this literal shape) rather than folded into
+/// [`InvalidQueryEncoding`].
+///
+/// The original, already-shipped and tested (issue #774) `{"error": "..."}`
+/// shape, distinct from [`AutumnError`]'s RFC-7807-flavored `{"detail":
+/// "...", "status": 400, ...}` shape every *other* strict-query route uses.
+/// Kept exactly as issue #774 shipped it (see
+/// `queue_coverage_integration.rs`'s existing malformed-encoding tests, which
+/// assert on this literal shape) rather than folded into
 /// [`decode_or_autumn_error_response`] purely for issue #1151's sweep —
 /// changing a shipped, tested route's error contract is out of scope here.
+#[must_use]
 pub fn bad_request_response() -> Response {
     (
         StatusCode::BAD_REQUEST,
@@ -69,11 +74,13 @@ pub fn bad_request_response() -> Response {
         .into_response()
 }
 
-/// Decode an optional raw query string (as returned by
-/// `axum::extract::RawQuery`) into `(key, value)` pairs for a handler whose
-/// return type is `Result<_, AutumnError>` — the majority shape across
-/// [`crate::api`]'s read routes. A missing query string (`None`) is an empty
-/// pair list, matching axum's own `Query<T>` behavior for an absent `?`.
+/// Decode an optional raw query string into `(key, value)` pairs for a
+/// handler whose return type is `Result<_, AutumnError>`.
+///
+/// The majority shape across [`crate::api`]'s read routes. Takes the value
+/// `axum::extract::RawQuery` returns; a missing query string (`None`) is an
+/// empty pair list, matching axum's own `Query<T>` behavior for an absent
+/// `?`.
 ///
 /// # Errors
 ///
@@ -93,15 +100,22 @@ pub fn decode_or_autumn_error(
 }
 
 /// Decode an optional raw query string into `(key, value)` pairs for
-/// `GET /admin/queue-coverage` specifically — the one route whose malformed-
-/// query `400` predates this shared module (issue #774) and is proven, by
-/// name, in `queue_coverage_integration.rs`. See [`bad_request_response`]
-/// for why its shape is not [`AutumnError`]'s.
+/// `GET /admin/queue-coverage` specifically.
+///
+/// The one route whose malformed-query `400` predates this shared module
+/// (issue #774) and is proven, by name, in `queue_coverage_integration.rs`.
+/// See [`bad_request_response`] for why its shape is not [`AutumnError`]'s.
 ///
 /// # Errors
 ///
 /// Returns a ready-made [`bad_request_response`] on [`InvalidQueryEncoding`]
 /// for the caller to `return` directly.
+///
+/// `Response` is a large `Err` variant, but every strict-query call site
+/// already `match`es and returns it immediately without storing or
+/// propagating it further, so boxing would only add an allocation with no
+/// benefit here.
+#[allow(clippy::result_large_err)]
 pub fn decode_or_bad_request(raw_query: Option<&str>) -> Result<Vec<(String, String)>, Response> {
     match raw_query.map(parse_raw_query_pairs_strict) {
         None => Ok(Vec::new()),
@@ -111,20 +125,25 @@ pub fn decode_or_bad_request(raw_query: Option<&str>) -> Result<Vec<(String, Str
 }
 
 /// Decode an optional raw query string into `(key, value)` pairs for a
-/// handler whose return type is `axum::response::Response` (an infallible
-/// signature that converts errors internally via `.into_response()`) but
-/// whose *other* invalid-param `400`s are [`AutumnError`]-shaped (the
-/// `Err(error) => return error.into_response()` idiom used throughout
-/// [`crate::api`]). Using this instead of [`decode_or_bad_request`] keeps a
-/// route's malformed-query `400` in the SAME body shape as its own other
-/// `400`s, rather than introducing a second, inconsistent error shape on the
-/// same route (issue #1151 review).
+/// handler whose return type is `axum::response::Response`.
+///
+/// For an infallible-signature handler (one that converts errors internally
+/// via `.into_response()`) whose *other* invalid-param `400`s are
+/// [`AutumnError`]-shaped (the `Err(error) => return error.into_response()`
+/// idiom used throughout [`crate::api`]). Using this instead of
+/// [`decode_or_bad_request`] keeps a route's malformed-query `400` in the
+/// SAME body shape as its own other `400`s, rather than introducing a
+/// second, inconsistent error shape on the same route (issue #1151 review).
 ///
 /// # Errors
 ///
 /// Returns a ready-made `400` [`Response`] built from
 /// [`AutumnError::bad_request_msg`] on [`InvalidQueryEncoding`], for the
 /// caller to `return` directly.
+///
+/// See [`decode_or_bad_request`]'s doc comment for why the large `Err`
+/// variant is allowed rather than boxed.
+#[allow(clippy::result_large_err)]
 pub fn decode_or_autumn_error_response(
     raw_query: Option<&str>,
 ) -> Result<Vec<(String, String)>, Response> {
