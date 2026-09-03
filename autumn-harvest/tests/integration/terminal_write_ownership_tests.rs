@@ -25,9 +25,10 @@ use autumn_harvest::queue::{self, EnqueueParams, TaskType};
 use autumn_harvest::schema::{harvest_task_queue, harvest_workflow_executions};
 use autumn_harvest::types::ExecutionId;
 use autumn_harvest::worker::{
-    PreloadedFailureHistory, check_paused_and_park, fail_task_and_execution_with_history,
-    persist_child_workflow_completion, persist_child_workflow_failure,
-    persist_workflow_completion, persist_workflow_failure,
+    HandlerRegistry, PreloadedFailureHistory, WorkflowTaskPersistence, check_paused_and_park,
+    fail_task_and_execution_with_history, persist_child_workflow_completion,
+    persist_child_workflow_failure, persist_workflow_completion, persist_workflow_continue_as_new,
+    persist_workflow_failure,
 };
 use autumn_harvest::store;
 
@@ -519,4 +520,110 @@ async fn fail_task_and_execution_with_history_makes_no_terminal_decision_when_th
         .expect("the task row survives an undecided dispatch");
     assert_eq!(reloaded.state, "RUNNING", "must not be marked FAILED by the stale dispatcher");
     assert_eq!(reloaded.worker_id.as_deref(), Some("thief"));
+}
+
+// ---------------------------------------------------------------------------
+// fail_task_and_execution_with_history -- the `Unavailable` branch (execution
+// exists, but its history failed to load), which has its own independent
+// guard placed before its two bare `update_workflow_execution_failed` /
+// `queue::fail_task` writes.
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn fail_task_and_execution_with_history_makes_no_terminal_decision_when_the_claim_moved_and_history_is_unavailable()
+ {
+    let (url, _container) = setup_db().await;
+    let (exec_id, task) = seed_claimed_task(&url, "q1184-history-unavailable", "dispatcher-a").await;
+    steal_claim(&url, task.id).await;
+
+    let mut conn = connect(&url).await;
+    let result = fail_task_and_execution_with_history(
+        &mut conn,
+        &task,
+        "dispatcher-a",
+        "boom",
+        PreloadedFailureHistory::Unavailable { exec_id },
+        &autumn_harvest::payload_codec::PayloadCodecs::default(),
+    )
+    .await;
+
+    assert_eq!(
+        result
+            .expect_err("a fail-only write whose claim moved must not commit")
+            .terminal_write_claim_ambiguous(),
+        Some(task.id),
+    );
+
+    let execution = load_execution(&url, exec_id).await;
+    assert_eq!(
+        execution.state, "RUNNING",
+        "must not be marked FAILED by the stale dispatcher"
+    );
+    let reloaded = load_tasks(&url, exec_id)
+        .await
+        .into_iter()
+        .find(|t| t.id == task.id)
+        .expect("the task row survives an undecided dispatch");
+    assert_eq!(reloaded.state, "RUNNING", "must not be marked FAILED by the stale dispatcher");
+    assert_eq!(reloaded.worker_id.as_deref(), Some("thief"));
+}
+
+// ---------------------------------------------------------------------------
+// persist_workflow_continue_as_new -- a related gap of the identical shape
+// found while auditing this call chain (not originally named in issue
+// #1184's confirmed call-site list): the transaction that seals the
+// predecessor execution (CONTINUED_AS_NEW) and completes its task row had no
+// ownership check either.
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn persist_workflow_continue_as_new_makes_no_terminal_decision_when_the_claim_moved() {
+    let (url, _container) = setup_db().await;
+    let (exec_id, task) = seed_claimed_task(&url, "q1184-continue-as-new", "dispatcher-a").await;
+    steal_claim(&url, task.id).await;
+
+    let execution = load_execution(&url, exec_id).await;
+    // Same-type continuation (`new_workflow_type: None`) needs no registered
+    // workflow type at all -- `classify_continue_as_new_target` resolves it
+    // to `SameType` without touching the registry or the database, so an
+    // empty registry is a faithful, minimal fixture for this guard.
+    let registry = HandlerRegistry::new(Vec::new(), Vec::new());
+    let persistence = WorkflowTaskPersistence::new_for_test(
+        &task,
+        "dispatcher-a",
+        exec_id,
+        1,
+        Duration::ZERO,
+        None,
+        None,
+        None,
+    );
+
+    let mut conn = connect(&url).await;
+    let result = persist_workflow_continue_as_new(
+        &mut conn,
+        &registry,
+        persistence,
+        &execution,
+        serde_json::json!({}),
+        None,
+    )
+    .await;
+
+    assert_eq!(
+        result
+            .expect_err("a continue-as-new seal whose claim moved must not commit")
+            .terminal_write_claim_ambiguous(),
+        Some(task.id),
+        "the sentinel must name the exact task whose ownership is ambiguous"
+    );
+
+    let history = load_history(&url, exec_id).await;
+    assert!(
+        !history
+            .iter()
+            .any(|e| matches!(e, WorkflowEvent::WorkflowContinuedAsNew { .. })),
+        "a dispatcher that lost the claim must append no terminal event; got {history:?}"
+    );
+    assert_thief_untouched(&url, exec_id, task.id, "RUNNING", "RUNNING").await;
 }

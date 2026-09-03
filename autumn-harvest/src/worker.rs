@@ -1437,8 +1437,13 @@ struct PreparedWorkflowTask {
     was_cache_hit: bool,
 }
 
+/// `#[doc(hidden)]`: test-support-reachable, not semver-stable surface --
+/// pub only so [`WorkflowTaskPersistence::new_for_test`] can be named from an
+/// integration test that drives [`persist_workflow_continue_as_new`] directly
+/// (issue #1184).
+#[doc(hidden)]
 #[derive(Debug, Clone)]
-struct WorkflowTaskPersistence<'a> {
+pub struct WorkflowTaskPersistence<'a> {
     task: &'a TaskQueueItem,
     worker_id: &'a str,
     exec_id: ExecutionId,
@@ -1460,6 +1465,36 @@ struct WorkflowTaskPersistence<'a> {
 }
 
 impl<'a> WorkflowTaskPersistence<'a> {
+    /// Test-only constructor so an integration test can drive
+    /// [`persist_workflow_continue_as_new`] directly without reconstructing
+    /// this crate's full dispatch cycle. `#[doc(hidden)]`: test-support, not
+    /// semver-stable surface -- same convention as [`preload_failure_history`]
+    /// and the other `#[doc(hidden)] pub` items in this module.
+    #[doc(hidden)]
+    #[must_use]
+    #[allow(clippy::too_many_arguments)]
+    pub const fn new_for_test(
+        task: &'a TaskQueueItem,
+        worker_id: &'a str,
+        exec_id: ExecutionId,
+        next_event_id: i32,
+        sticky_timeout: Duration,
+        carryover_result: Option<serde_json::Value>,
+        carryover_error: Option<String>,
+        carryover_scheduled_time: Option<chrono::DateTime<chrono::Utc>>,
+    ) -> Self {
+        Self {
+            task,
+            worker_id,
+            exec_id,
+            next_event_id,
+            sticky_timeout,
+            carryover_result,
+            carryover_error,
+            carryover_scheduled_time,
+        }
+    }
+
     /// Build a sticky hint bound to this worker, or `None` when sticky routing
     /// is disabled (timeout == 0).
     const fn sticky_hint(&self) -> Option<queue::StickyHint<'a>> {
@@ -16397,7 +16432,8 @@ fn resolve_continue_as_new_successor_defaults<'a>(
 }
 
 #[allow(clippy::too_many_lines)]
-async fn persist_workflow_continue_as_new(
+#[doc(hidden)]
+pub async fn persist_workflow_continue_as_new(
     conn: &mut AsyncPgConnection,
     registry: &HandlerRegistry,
     persistence: WorkflowTaskPersistence<'_>,
