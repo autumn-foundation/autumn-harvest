@@ -62,6 +62,16 @@ it was. Both shapes are pinned by tests, and the second one is the point.
   and by the same bound. That was a second instance of the same bug the issue did
   not name.
 
+**A second unrunnable documented command, found by the new CI step.** With the
+401 fixed, the CI job got one step further and cargo itself failed: exit `101`,
+"could not determine which binary to run", because `autumn-harvest-cli` ships
+two binaries (`harvest`, `harvest-replay`) and declared no `default-run`. The
+bare `cargo run -p autumn-harvest-cli -- …` form the docs use in **58 places**
+across `README.md`, the three example READMEs, the getting-started guide and the
+triage runbook could not work as written for anyone — the same shape of bug as
+the 401, one layer down. Fixed with `default-run = "harvest"`, matching what
+`examples/quickstart` already does for its own two binaries.
+
 **No migration, no new `WorkflowEvent` variant, no `harvest_events` writer** —
 none of the append-only invariants are anywhere near this. The read-only operator
 role (#776) is untouched: it is a separate opt-in `enforce_read_only_class` layer

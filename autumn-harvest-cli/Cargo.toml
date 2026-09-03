@@ -8,6 +8,15 @@ license.workspace = true
 repository.workspace = true
 homepage = "https://github.com/autumn-foundation/autumn-harvest"
 readme = "../README.md"
+# The crate ships two binaries (`harvest`, `harvest-replay`), which makes a bare
+# `cargo run -p autumn-harvest-cli -- …` ambiguous — cargo exits 101 with "could
+# not determine which binary to run" before the CLI's own argument parsing is
+# ever reached. That exact form is what the docs tell users to run in 58 places
+# across README.md, the three example READMEs, the getting-started guide and the
+# triage runbook, so without this key every one of them fails as written. Naming
+# the primary binary here fixes them all at once and keeps the documented
+# command the thing users can actually paste (issue #1284).
+default-run = "harvest"
 keywords = ["workflow", "durable", "cli", "orchestration", "autumn"]
 categories = ["command-line-utilities", "asynchronous"]
 
