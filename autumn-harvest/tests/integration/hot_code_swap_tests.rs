@@ -1532,6 +1532,70 @@ async fn publishing_verifies_the_signature_it_is_asked_to_store() {
     );
 }
 
+#[tokio::test]
+async fn signing_can_be_introduced_and_rotated_on_an_existing_build() {
+    // Codex review round 4. The identical-bytes republish path cleared
+    // `retired_at` and left the row's OLD (or NULL) signature in place. So a
+    // republish carrying a signature valid under a NEW key returned success and
+    // then made the next sync with that key reject the very row it had just
+    // accepted — introducing or rotating signing would have required minting a
+    // new build id, i.e. a deploy, which is exactly the coupling this design
+    // exists to remove.
+    let (mut conn, _c) = db().await;
+    let bytes = pipeline_v1_bytes();
+    let hash = compute_module_hash(&bytes);
+
+    // Published unsigned first: the pre-signing state of an existing build.
+    publish_workflow_module(&mut conn, "wf-v1", "pipeline", &bytes, None, None)
+        .await
+        .expect("unsigned publish");
+    let registry = Arc::new(ModuleRegistry::new());
+    sync_build_into_registry(&mut conn, &registry, "wf-v1", Some(OPERATOR_KEY))
+        .await
+        .expect_err("an unsigned row must not satisfy a key-configured sync");
+
+    // Introduce signing by republishing the SAME bytes with a signature.
+    let signature = sign_module_binding(OPERATOR_KEY, "wf-v1", "pipeline", &hash).expect("sign");
+    publish_workflow_module(
+        &mut conn,
+        "wf-v1",
+        "pipeline",
+        &bytes,
+        Some(&signature),
+        Some(OPERATOR_KEY),
+    )
+    .await
+    .expect("republishing identical bytes with a signature is the rotation path");
+
+    let registry = Arc::new(ModuleRegistry::new());
+    sync_build_into_registry(&mut conn, &registry, "wf-v1", Some(OPERATOR_KEY))
+        .await
+        .expect("the stored signature must now satisfy the sync");
+    assert!(registry.get("wf-v1", "pipeline").is_some());
+
+    // And rotate to a second key the same way.
+    let rotated = sign_module_binding(ATTACKER_KEY, "wf-v1", "pipeline", &hash).expect("sign");
+    publish_workflow_module(
+        &mut conn,
+        "wf-v1",
+        "pipeline",
+        &bytes,
+        Some(&rotated),
+        Some(ATTACKER_KEY),
+    )
+    .await
+    .expect("rotation republish");
+
+    let registry = Arc::new(ModuleRegistry::new());
+    sync_build_into_registry(&mut conn, &registry, "wf-v1", Some(ATTACKER_KEY))
+        .await
+        .expect("the rotated signature must satisfy a sync under the new key");
+    let registry = Arc::new(ModuleRegistry::new());
+    sync_build_into_registry(&mut conn, &registry, "wf-v1", Some(OPERATOR_KEY))
+        .await
+        .expect_err("the superseded key must no longer verify");
+}
+
 // ── the AC3 end-to-end demonstration ──────────────────────────────────────────
 
 /// Publish v2 under a new build id while the process is running, ramp new
@@ -2393,6 +2457,7 @@ fn the_decision_cache_is_bounded_in_bytes_not_just_entries() {
         !cache.insert(
             DecisionCache::key("wf-v1", "hash", b"fat"),
             DecideResponse::Complete { output: json!(fat) },
+            Duration::ZERO,
         ),
         "a response over the per-entry ceiling must be refused, not cached"
     );
@@ -2407,6 +2472,7 @@ fn the_decision_cache_is_bounded_in_bytes_not_just_entries() {
             DecideResponse::Complete {
                 output: json!(format!("{chunky}{i}")),
             },
+            Duration::ZERO,
         );
         assert!(
             cache.retained_bytes() <= MAX_CACHED_DECISION_BYTES,
@@ -2417,6 +2483,35 @@ fn the_decision_cache_is_bounded_in_bytes_not_just_entries() {
     assert!(
         cache.retained_bytes() > 0,
         "the cache should still be doing its job"
+    );
+}
+
+#[test]
+fn a_cache_hit_is_charged_to_the_run_budget_like_a_recomputation() {
+    // Codex review round 4. A hit used to be free, which made the run's TERMINAL
+    // OUTCOME depend on cache residency: the same workflow with the same history
+    // would complete when its earlier decisions were still resident and fail
+    // when unrelated executions had evicted them, or when one response exceeded
+    // `MAX_CACHED_RESPONSE_BYTES` and was never cached. That is the class of
+    // defect `MAX_DECIDE_STEPS` is a compile-time constant to avoid, arriving
+    // through the optimisation instead. The cache may make a run cheaper; it may
+    // not change what the run decides.
+    let mut cache = DecisionCache::new();
+    let key = DecisionCache::key("wf-v1", "hash", b"step-0");
+    let spent = Duration::from_millis(250);
+
+    assert!(cache.insert(
+        key,
+        DecideResponse::Complete {
+            output: json!("done")
+        },
+        spent,
+    ));
+
+    let (_, recorded) = cache.get(&key).expect("the decision is cached");
+    assert_eq!(
+        recorded, spent,
+        "a hit must report what the decision originally cost, so the budget is          charged identically whether the step was recomputed or served"
     );
 }
 
@@ -2432,6 +2527,7 @@ fn the_decision_cache_evicts_oldest_first() {
             DecideResponse::Complete {
                 output: json!(i as u64),
             },
+            Duration::ZERO,
         );
     }
 
@@ -2573,5 +2669,32 @@ fn the_example_readme_documents_the_wire_format_the_host_actually_sends() {
     assert!(
         !example.contains("abi_version"),
         "the ABI version is a host-side constant and is never sent"
+    );
+
+    // Codex review round 4: the failure outcome's shape must be documented as
+    // the host actually sends it. An example showing only `kind` and `error`
+    // would make a guest with a strict schema reject every failed-activity
+    // request, and would push a guest that does parse it onto `error` — a
+    // diagnostic string that differs between the inline and replayed delivery
+    // paths, so branching on it behaves differently on replay than it did live.
+    let err_example = readme
+        .lines()
+        .find(|line| line.starts_with(r#"{"kind":"err""#))
+        .expect("the README shows a failed DecideOutcome");
+    let encoded_err = serde_json::to_string(&DecideOutcome::Err {
+        error_type: "CircuitOpen".to_string(),
+        details: Some(json!({"retry_after_secs": 30})),
+        error: "...".to_string(),
+    })
+    .expect("encodes");
+    assert_eq!(
+        field_names(err_example),
+        field_names(&encoded_err),
+        "the README's failure example must name exactly the fields, in the \
+         order, that `DecideOutcome::Err` serialises"
+    );
+    assert!(
+        readme.contains("Branch on `error_type`, never on `error`"),
+        "the README must say which field is the stable contract"
     );
 }

@@ -30,11 +30,30 @@ run(DecideRequest) -> DecideResponse
 {"kind":"fail","error":"..."}                         // workflow returns Err(error)
 ```
 
-`resolved[i]` is the outcome of the activity the guest asked for at step `i`,
-either `{"kind":"ok","output":...}` or `{"kind":"err","error":"..."}`. The guest
-therefore sees **only** history-backed values — never a host clock, never
-randomness — which is what makes the hosted workflow replay-deterministic by
-construction.
+`resolved[i]` is the outcome of the activity the guest asked for at step `i`:
+
+```jsonc
+// DecideOutcome — one of:
+{"kind":"ok","output":{...}}
+
+// A failure carries THREE fields, not one. `error_type` is always present.
+{"kind":"err","error_type":"CircuitOpen","details":{"retry_after_secs":30},"error":"..."}
+{"kind":"err","error_type":"harvest.timeout.StartToClose","details":null,"error":"..."}
+```
+
+**Branch on `error_type`, never on `error`.** `error_type` is the stable class —
+the activity's own failure type, or `harvest.timeout.<TimeoutType>` for an
+activity timeout — and `details` is its structured payload (`null` when there is
+none). `error` is a human-readable string for diagnostics only: it is not part of
+the contract and differs between the inline and replayed delivery paths, so a
+guest that parses it will behave differently on replay than it did live. A guest
+with a strict schema must also expect `error_type` on every `err` outcome; an
+earlier draft of this example showed only `kind` and `error`, which would have
+made such a guest reject every failed-activity request.
+
+The guest therefore sees **only** history-backed values — never a host clock,
+never randomness — which is what makes the hosted workflow replay-deterministic
+by construction.
 
 Transport is byte-for-byte the `memory` / `alloc` / `run` core-WASM contract
 documented in [`../wasm-guests/README.md`](../wasm-guests/README.md): `run`

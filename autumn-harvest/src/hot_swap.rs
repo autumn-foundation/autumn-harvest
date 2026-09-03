@@ -1204,6 +1204,17 @@ struct CachedDecision {
     key: [u8; 32],
     response: DecideResponse,
     bytes: usize,
+    /// How long the guest took to produce this decision when it was actually
+    /// computed (issue #967, Codex review round 4).
+    ///
+    /// Charged to the run's budget again on every cache HIT, so the accounting
+    /// is the same whether a step was recomputed or served from cache. Without
+    /// it a cache hit was free and a miss was not, which made the run's
+    /// *terminal outcome* depend on cache residency — on whether unrelated
+    /// executions had evicted the entry, or whether the response happened to
+    /// exceed `MAX_CACHED_RESPONSE_BYTES`. That is exactly the class of defect
+    /// `MAX_DECIDE_STEPS` is a compile-time constant to avoid.
+    guest_time: Duration,
 }
 
 impl DecisionCache {
@@ -1235,12 +1246,12 @@ impl DecisionCache {
     }
 
     /// The decision recorded for `key`, if any. Records a hit or a miss.
-    pub fn get(&mut self, key: &[u8; 32]) -> Option<DecideResponse> {
+    pub fn get(&mut self, key: &[u8; 32]) -> Option<(DecideResponse, Duration)> {
         let found = self
             .index
             .get(key)
             .and_then(|seq| self.entries.get(seq))
-            .map(|entry| entry.response.clone());
+            .map(|entry| (entry.response.clone(), entry.guest_time));
         if found.is_some() {
             self.hits += 1;
         } else {
@@ -1255,7 +1266,12 @@ impl DecisionCache {
     /// A response larger than [`MAX_CACHED_RESPONSE_BYTES`] is **not** cached:
     /// the guest is simply re-asked for that step, which is what happened before
     /// the cache existed. Returns whether the decision was retained.
-    pub fn insert(&mut self, key: [u8; 32], response: DecideResponse) -> bool {
+    pub fn insert(
+        &mut self,
+        key: [u8; 32],
+        response: DecideResponse,
+        guest_time: Duration,
+    ) -> bool {
         if self.index.contains_key(&key) {
             return false;
         }
@@ -1288,6 +1304,7 @@ impl DecisionCache {
                 key,
                 response,
                 bytes,
+                guest_time,
             },
         );
         self.index.insert(key, seq);
@@ -1598,6 +1615,18 @@ fn outcome_for_guest(err: &HarvestError) -> Option<DecideOutcome> {
     }
 }
 
+/// The run-scoped guest budget was exhausted.
+///
+/// One constructor so the cached and recomputed paths report identically —
+/// a difference in the message would be a difference in the run's observable
+/// outcome, which is the very thing charging cache hits exists to prevent.
+fn run_budget_exceeded(build_id: &str) -> String {
+    format!(
+        "workflow module for build `{build_id}` exceeded the {DECIDE_RUN_WALL_CLOCK:?} \
+         cumulative guest budget for one decision cycle"
+    )
+}
+
 /// The statically-linked [`WorkflowHandlerFn`](crate::info::WorkflowHandlerFn)
 /// that hosts a runtime-loaded module.
 ///
@@ -1790,22 +1819,35 @@ pub fn module_workflow_handler(
                 .decisions()
                 .ok_or_else(|| "the decision cache is poisoned".to_string())?
                 .get(&key);
-            let response = if let Some(cached) = cached {
+            // The budget is charged for a step whether it was recomputed or
+            // served from cache (issue #967, Codex review round 4). A cache hit
+            // used to be free, which made the run's TERMINAL OUTCOME depend on
+            // cache residency: the same workflow, with the same history, would
+            // complete when its earlier decisions happened to still be resident
+            // and fail when unrelated executions had evicted them — or when one
+            // response exceeded `MAX_CACHED_RESPONSE_BYTES` and was never cached
+            // at all. That is precisely the class of defect `MAX_DECIDE_STEPS`
+            // is a compile-time constant to avoid, arriving through the
+            // optimisation instead. The cache is allowed to make a run
+            // *cheaper*; it is not allowed to change what the run *decides*.
+            let response = if let Some((cached, recorded)) = cached {
+                guest_time = guest_time.saturating_add(recorded);
+                if guest_time >= DECIDE_RUN_WALL_CLOCK {
+                    return Err(run_budget_exceeded(&build_id));
+                }
                 cached
             } else {
                 if guest_time >= DECIDE_RUN_WALL_CLOCK {
-                    return Err(format!(
-                        "workflow module for build `{build_id}` exceeded the \
-                         {DECIDE_RUN_WALL_CLOCK:?} cumulative guest budget for one decision cycle"
-                    ));
+                    return Err(run_budget_exceeded(&build_id));
                 }
                 let started = Instant::now();
                 let response = decide_encoded(&host, &limits, &module, &encoded, step_index)?;
-                guest_time = guest_time.saturating_add(started.elapsed());
+                let elapsed = started.elapsed();
+                guest_time = guest_time.saturating_add(elapsed);
                 host.registry
                     .decisions()
                     .ok_or_else(|| "the decision cache is poisoned".to_string())?
-                    .insert(key, response.clone());
+                    .insert(key, response.clone(), elapsed);
 
                 // NOTE: deliberately no `yield_now()` here (issue #967, Codex
                 // review round 1). `executor::run_workflow_handler_cycle` drives

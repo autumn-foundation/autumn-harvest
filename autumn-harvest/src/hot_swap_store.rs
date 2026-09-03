@@ -204,16 +204,43 @@ pub async fn publish_workflow_module(
         // worker re-seeds a build it already published. If the row was retired,
         // republishing the same bytes revives it — which is the whole reason
         // retirement is a tombstone rather than a delete.
+        //
+        // The SIGNATURE is written too (issue #967, Codex review round 4), and
+        // that is not cosmetic: it is the only way to introduce or rotate
+        // signing for a build that already exists. Clearing `retired_at` alone
+        // left the old (or NULL) signature in place, so a republish carrying a
+        // signature valid under a NEW key returned success and then made
+        // `sync_build_into_registry(.., Some(new_key))` reject the very row it
+        // had just accepted — key rotation would have required minting a new
+        // build id, i.e. a deploy, which is precisely the coupling this design
+        // exists to remove.
+        //
+        // Safe because the signature was verified against the caller's key
+        // above, before any write: an unverifiable signature never reaches
+        // here. The bytes are unchanged and the hash is re-derived from them,
+        // so this rebinds the same content to a fresh attestation of the same
+        // `(build_id, workflow_name, module_hash)` tuple — it cannot smuggle in
+        // different code.
         diesel::sql_query(
-            "UPDATE harvest_workflow_modules SET retired_at = NULL \
-             WHERE build_id = $1 AND workflow_name = $2 AND retired_at IS NOT NULL",
+            "UPDATE harvest_workflow_modules SET retired_at = NULL, signature = $3 \
+             WHERE build_id = $1 AND workflow_name = $2",
         )
         .bind::<diesel::sql_types::Text, _>(build_id)
         .bind::<diesel::sql_types::Text, _>(workflow_name)
+        .bind::<diesel::sql_types::Nullable<diesel::sql_types::Text>, _>(signature)
         .execute(conn)
         .await
         .map_err(database_error)?;
-        return Ok((&existing).into());
+        return fetch_workflow_module_including_retired(conn, build_id, workflow_name)
+            .await?
+            .as_ref()
+            .map(Into::into)
+            .ok_or_else(|| {
+                HarvestError::Config(format!(
+                    "publish of `{workflow_name}` under build `{build_id}` was retired \
+                     concurrently with its own republish; retry the publish"
+                ))
+            });
     }
 
     Err(HarvestError::Config(format!(
@@ -494,9 +521,28 @@ pub async fn sync_build_into_registry(
     //
     // Failing is the right answer rather than quietly loading the subset,
     // because "this build is loaded" is the claim the worker acts on when it
-    // decides which executions it can serve. The caller retries and gets a
-    // consistent snapshot; the alternative is a worker confidently half-serving
-    // a build, which §8 argues is worse than not serving it at all.
+    // decides which executions it can serve; the alternative is a worker
+    // confidently half-serving a build, which §8 argues is worse than not
+    // serving it at all.
+    //
+    // BUT THIS DETECTS THE RACE, IT DOES NOT CLOSE IT (Codex review round 4,
+    // correcting a claim round 3 made too strongly). A publish landing after
+    // this re-read and before `commit_prepared` below is still missed. The
+    // window shrinks from "the whole fetch-and-compile pass", which is N
+    // compilations long, to "one `spawn_blocking` dispatch" — worth having,
+    // since the long window is the one a publish realistically lands in — but a
+    // narrower race is not an absent one, and a second snapshot cannot make it
+    // one.
+    //
+    // Nor would a REPEATABLE READ snapshot over the reads fix it: that makes the
+    // semantics well-defined ("the build as of instant T") without changing the
+    // operational fact that a module published after T is missing from a worker
+    // reporting success. The race is not closable at this layer at all, because
+    // a build's membership is open-ended by design — publishing a NEW
+    // `(build_id, workflow_name)` is allowed; only an existing name's bytes are
+    // immutable. Closing it needs build-level sealing, which is carried forward
+    // as limitation 7 in `docs/rnd/hot-code-swap.md` with the reason it is not
+    // done here.
     let after = list_workflow_modules_for_build(conn, build_id).await?;
     if after != names {
         return Err(HarvestError::Config(format!(

@@ -381,6 +381,20 @@ it should be named rather than discovered later:
   stated in entries is a bound on the wrong thing whenever the guest chooses the
   entry size.**
 
+  * **A cache hit is charged to the run's budget exactly as a recomputation
+    is.** A free hit made the run's *terminal outcome* depend on cache
+    residency: the same workflow, on the same history, would complete while its
+    earlier decisions were still resident and fail once unrelated executions had
+    evicted them — or when one response exceeded `MAX_CACHED_RESPONSE_BYTES` and
+    so was never cached at all. That is the defect `MAX_DECIDE_STEPS` is a
+    compile-time constant to avoid (§5), arriving through the optimisation
+    instead. Each entry records what the decision cost when it was computed, and
+    a hit charges that; both paths report the same error through one
+    constructor, since even a differing message is a differing observable
+    outcome. **The cache may make a run cheaper; it may not change what the run
+    decides**
+    (`a_cache_hit_is_charged_to_the_run_budget_like_a_recomputation`).
+
 The other cost is C5's: a decision runs inline on the decision-cycle thread —
 and, per C9 below, *must*, since the host may not introduce an await that records
 no command. `DECIDE_RUN_WALL_CLOCK` (10 s) is therefore the worst case for how
@@ -950,16 +964,31 @@ residuals is worse than one that has more of them:
    activities the workflow's own registration declares, not "any registered
    activity unless configured otherwise".
 6. **HMAC is the wrong primitive for the stated threat model** (§6): every
-   verifier can forge. Ed25519 with CI-held private keys is the answer.
+   verifier can forge. Ed25519 with CI-held private keys is the answer. Note
+   that *rotating* a key does not require a new build id: republishing identical
+   bytes with a signature valid under the new key rebinds the attestation in
+   place, which is what makes introducing signing to an existing build possible
+   at all (`signing_can_be_introduced_and_rotated_on_an_existing_build`).
 7. **A build has no sealed manifest, so a sync detects the race rather than
    preventing it.** Publishing a *new* `(build_id, workflow_name)` under an
    existing build is allowed by design — the primary key makes an existing
    name's bytes immutable, not the build's membership — so the set of modules a
    build contains can legitimately change while a worker is syncing it.
    `sync_build_into_registry` re-reads the manifest before committing and fails
-   with a retry instruction if it moved, which keeps the postcondition honest
-   ("a successful sync means the whole build as of a consistent moment") but
-   leaves a publish racing a fleet-wide sync able to make several workers retry.
+   with a retry instruction if it moved. That **narrows** the window — from the
+   whole fetch-and-compile pass, which is N compilations long and the one a
+   publish realistically lands in, to a single `spawn_blocking` dispatch — but it
+   does **not close** it, and an earlier draft of this report claimed otherwise.
+   A publish landing between the re-read and the commit is still missed.
+
+   The race is not closable at that layer. A `REPEATABLE READ` snapshot over the
+   reads would make the semantics well-defined ("the build as of instant T")
+   without changing the operational fact that a module published after T is
+   absent from a worker reporting success. What makes it unclosable is that a
+   build's membership is **open-ended by design**: publishing a new
+   `(build_id, workflow_name)` is allowed, and only an existing name's bytes are
+   immutable. There is therefore no moment at which "this build is complete" is
+   a knowable fact — which is the argument *for* sealing, not a detail of it.
 
    The GA-shaped answer is a **sealed build**: publishing appends to a build
    until it is sealed, after which membership is fixed and a sync reads a

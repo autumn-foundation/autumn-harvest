@@ -171,6 +171,33 @@ change to the replay surface**.
   form, recorded in the report because it will outlive this cache: **a bound
   stated in entries is a bound on the wrong thing whenever the guest chooses the
   entry size.**
+- **The cache may make a run cheaper; it may not change what the run decides.**
+  A cache hit was free while a recomputation was charged to the run's cumulative
+  guest budget, so the same workflow on the same history would complete while
+  its earlier decisions were still resident and fail once unrelated executions
+  had evicted them — or when one response exceeded the per-entry ceiling and was
+  never cached at all. A terminal outcome turning on cache residency is exactly
+  the defect `MAX_DECIDE_STEPS` is a compile-time constant to avoid, arriving
+  through the optimisation instead. Each entry now records what its decision
+  cost, a hit charges that, and both paths report through one error constructor,
+  since even a differing message is a differing observable outcome.
+- **Signing can be introduced or rotated on a build that already exists.** The
+  identical-bytes republish path cleared `retired_at` and left the row's old (or
+  NULL) signature, so a republish carrying a signature valid under a new key
+  returned success and then made the next sync with that key reject the row it
+  had just accepted — rotation would have required minting a new build id, i.e.
+  a deploy, the exact coupling this design exists to remove. The signature is
+  written too; safe because it is verified against the caller's key before any
+  write, and the bytes are unchanged, so it rebinds the same content to a fresh
+  attestation of the same tuple rather than smuggling in different code.
+- **The guest-facing failure shape is documented as the host actually sends
+  it.** The example showed `{"kind":"err","error":"..."}`; the real outcome
+  always carries `error_type` and may carry `details`. A guest with a strict
+  schema would have rejected every failed-activity request, and one branching on
+  the advertised field would have parsed `error` — a diagnostic string that
+  differs between the inline and replayed delivery paths, so branching on it
+  behaves differently on replay than it did live. The guard now diffs the
+  failure example against a real `DecideOutcome::Err` too.
 - **A sync now refuses a build whose module set moved under it.** Publishing a
   *new* `(build_id, workflow_name)` under an existing build is allowed by design
   — the primary key only makes an existing name's bytes immutable — so a module
@@ -181,7 +208,12 @@ change to the replay surface**.
   committing and a change fails the sync with a retry instruction, because "this
   build is loaded" is the claim the worker acts on when deciding which
   executions it can serve, and a worker confidently half-serving a build is the
-  failure §8 argues is worse than not serving it at all.
+  failure §8 argues is worse than not serving it at all. This **narrows** the
+  window — from the whole fetch-and-compile pass to one `spawn_blocking`
+  dispatch — rather than closing it: a build's membership is open-ended by
+  design, so there is no moment at which "this build is complete" is knowable
+  and no snapshot can make one. Closing it needs build-level sealing, carried
+  forward as limitation 7 with the reason it is not paid for here.
 - **An activity timeout is a step outcome, and now reaches the guest.** The
   mirror image of the ND bug above. `execute_activity_raw` builds
   `HarvestError::Timeout` from `HistoryMatch::TimedOut`, so it is history-backed

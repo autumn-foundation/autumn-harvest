@@ -306,6 +306,9 @@ const CITED_TESTS: &[&str] = &[
     "the_decision_cache_evicts_oldest_first",
     // Codex review round 3.
     "the_decision_cache_is_bounded_in_bytes_not_just_entries",
+    // Codex review round 4.
+    "a_cache_hit_is_charged_to_the_run_budget_like_a_recomputation",
+    "signing_can_be_introduced_and_rotated_on_an_existing_build",
     "a_signed_module_cannot_be_rebound_under_another_build_id",
     "a_failing_module_leaves_the_whole_build_unbound",
     "a_guest_may_not_schedule_an_activity_the_host_did_not_allow",
