@@ -109,6 +109,14 @@ jobs:
         with:
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
+      - name: Check default-run for multi-binary packages
+        # Guards the defect class that silently broke `cargo run -p
+        # quickstart` and `cargo run -p autumn-harvest-cli -- ...` (the
+        # documented command in 50+ places, including the quickstart's own
+        # "Step 3 — Run preflight") for weeks with fully green CI, because
+        # the `quickstart`/build-only CI jobs run `cargo build`, which can't
+        # itself be ambiguous. See scripts/check-default-run.sh.
+        run: ./scripts/check-default-run.sh
       - name: Check formatting
         run: cargo fmt --all -- --check
       - name: Clippy autumn-harvest
@@ -605,7 +613,43 @@ jobs:
             echo "::error::quickstart app never became healthy"; exit 1
           fi
 
-          # 2. Trigger the `greeting` workflow (README step 4) and capture its execution_id.
+          # 2. Run the exact README "Step 3 — Run preflight" command. The
+          # binary must resolve (this is the check-default-run.sh regression
+          # class); the admin route itself may still 401 in the dev profile
+          # with no session (issue #1284, a getting-started auth-flow
+          # question tracked and decided separately, not this job's to fix).
+          # Only that specific, already-diagnosed outcome is tolerated — any
+          # other nonzero exit (wrong default-run binary, a crash, a changed
+          # error shape) fails the step rather than being swallowed by a
+          # blanket `|| true`.
+          #
+          # GitHub Actions' default `shell: bash` runs steps as `bash -eo
+          # pipefail {0}` — errexit is already on before this script's own
+          # `set -uo pipefail` ever runs. A plain `cli_out="$(cmd)"` where
+          # `cmd` is expected to exit nonzero (the known 401 case) would abort
+          # the whole step right there, before `cli_status=$?` is even
+          # reached. Wrapping the assignment as an `if` condition is the
+          # standard way to capture a command's real exit status without
+          # tripping errexit — `if`/`elif` conditions are explicitly exempt.
+          if cli_out="$(cargo run -p autumn-harvest-cli -- --base-url http://localhost:3000/api/harvest preflight 2>&1)"; then
+            cli_status=0
+          else
+            cli_status=$?
+          fi
+          if echo "${cli_out}" | grep -q "could not determine which binary to run"; then
+            echo "${cli_out}"
+            echo "::error::cargo run -p autumn-harvest-cli -- ... is ambiguous (missing default-run)"; exit 1
+          fi
+          if [ "${cli_status}" -eq 0 ]; then
+            echo "cli resolved and preflight succeeded"
+          elif [ "${cli_status}" -eq 1 ] && echo "${cli_out}" | grep -q "harvest API returned 401"; then
+            echo "cli resolved and ran (see issue #1284 for the known dev-profile 401)"
+          else
+            echo "${cli_out}"
+            echo "::error::cargo run -p autumn-harvest-cli -- ... preflight failed unexpectedly (exit ${cli_status}), not the known issue #1284 401"; exit 1
+          fi
+
+          # 3. Trigger the `greeting` workflow (README step 4) and capture its execution_id.
           resp="$(curl -sf -X POST \
             http://localhost:3000/api/harvest/workflows/greeting/start \
             -H 'Content-Type: application/json' \
@@ -617,7 +661,7 @@ jobs:
             echo "::error::no execution_id in start response"; exit 1
           fi
 
-          # 3. Poll until COMPLETED. The workflow has a 30s durable timer between
+          # 4. Poll until COMPLETED. The workflow has a 30s durable timer between
           # its two activities, so this needs headroom well past 30s.
           for i in $(seq 1 90); do
             state="$(curl -s "http://localhost:3000/api/harvest/workflows/${eid}" \
