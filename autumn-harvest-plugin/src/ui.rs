@@ -8304,12 +8304,20 @@ async fn execute_schedule_trigger_ui(
     // still occupies an active slot for overlap/Skip enforcement (issue #383),
     // matching the scheduler and backfill counters. The async block returns None
     // if any shard is unreachable — used for fail-closed Skip enforcement.
+    // The `schedule_id` disjunct (issue #1160) also counts a cross-type
+    // continue-as-new successor of this schedule -- otherwise a manual trigger
+    // could double-dispatch a schedule whose active run has already changed
+    // type mid-chain, matching `scheduler::schedule_running_basis`.
     let running_count: Option<i64> = async {
         let mut total: i64 = 0;
         for (_, shard_pool) in pool.iter_shards() {
             let mut c = acquire_conn(shard_pool).await.ok()?;
             let n: i64 = harvest_workflow_executions::table
-                .filter(harvest_workflow_executions::workflow_name.eq(workflow_name))
+                .filter(
+                    harvest_workflow_executions::workflow_name
+                        .eq(workflow_name)
+                        .or(harvest_workflow_executions::schedule_id.eq(Some(row.id))),
+                )
                 .filter(harvest_workflow_executions::state.eq_any(["RUNNING", "PAUSED"]))
                 .count()
                 .get_result(&mut c)

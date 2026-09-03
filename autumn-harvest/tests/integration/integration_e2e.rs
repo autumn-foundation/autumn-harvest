@@ -10257,6 +10257,27 @@ async fn insert_manual_trigger_execution(
     exec_id
 }
 
+/// Count `harvest_schedule_decisions` rows recording a `max_active_runs_reached`
+/// skip for `schedule_id` (`decision = "skipped"`, `reason_code =
+/// "max_active_runs_reached"` -- see `schedule_decision::record_decision_graceful`
+/// and the `OverlapAction::Drop` branch in `tick_one_workflow_schedule`). A
+/// positive control: proves the tick actually ran and took the capacity-gated
+/// branch, rather than a test merely observing "nothing happened" for an
+/// unrelated reason (e.g. the schedule never ticked at all).
+async fn count_max_active_runs_skip_decisions(database_url: &str, schedule_id: Uuid) -> i64 {
+    use autumn_harvest::schema::harvest_schedule_decisions::dsl;
+    let mut conn = <AsyncPgConnection as diesel_async::AsyncConnection>::establish(database_url)
+        .await
+        .expect("failed to connect for decision count query");
+    dsl::harvest_schedule_decisions
+        .filter(dsl::schedule_id.eq(Some(schedule_id)))
+        .filter(dsl::reason_code.eq("max_active_runs_reached"))
+        .count()
+        .get_result::<i64>(&mut conn)
+        .await
+        .expect("decision count query failed")
+}
+
 /// (issue #1160, AC1) `Skip` + `max_active_runs`: a cross-type continue-as-new
 /// successor of the SAME schedule (same `schedule_id`, different
 /// `workflow_name`) must still count toward the schedule's `max_active_runs`.
@@ -10305,13 +10326,14 @@ async fn overlap_policy_skip_counts_a_cross_type_successor_toward_max_active_run
     let ws = WorkflowSchedule::new(wf_name, Schedule::Cron("*/2 * * * * *".to_string()))
         .with_max_active_runs(1)
         .with_overlap_policy(OverlapPolicy::Skip);
+    let schedule_id: Uuid;
     {
         use autumn_harvest::schema::harvest_schedules::dsl as sched_dsl;
         let mut conn = pool.get().await.expect("pool get failed");
         register_workflow_schedules(&mut conn, std::slice::from_ref(&ws))
             .await
             .expect("register_workflow_schedules failed");
-        let schedule_id: Uuid = sched_dsl::harvest_schedules
+        schedule_id = sched_dsl::harvest_schedules
             .filter(sched_dsl::workflow_name.eq(wf_name))
             .select(sched_dsl::id)
             .first(&mut conn)
@@ -10350,6 +10372,15 @@ async fn overlap_policy_skip_counts_a_cross_type_successor_toward_max_active_run
     assert_eq!(
         successor_still_running, 1,
         "the pre-seeded cross-type successor must remain RUNNING under Skip (untouched)"
+    );
+    // Positive control: prove the tick actually ran and took the
+    // capacity-gated Skip branch, not merely that nothing happened for some
+    // unrelated reason (e.g. the schedule never ticked at all).
+    let skip_decisions = count_max_active_runs_skip_decisions(&database_url, schedule_id).await;
+    assert!(
+        skip_decisions >= 1,
+        "expected at least one max_active_runs_reached skip decision recorded for the \
+         schedule, got {skip_decisions} -- did the tick actually run?"
     );
 
     scheduler.shutdown();
@@ -10401,11 +10432,19 @@ async fn overlap_policy_skip_still_counts_a_manual_trigger_run_of_the_same_type(
     let ws = WorkflowSchedule::new(wf_name, Schedule::Cron("*/2 * * * * *".to_string()))
         .with_max_active_runs(1)
         .with_overlap_policy(OverlapPolicy::Skip);
+    let schedule_id: Uuid;
     {
+        use autumn_harvest::schema::harvest_schedules::dsl as sched_dsl;
         let mut conn = pool.get().await.expect("pool get failed");
         register_workflow_schedules(&mut conn, std::slice::from_ref(&ws))
             .await
             .expect("register_workflow_schedules failed");
+        schedule_id = sched_dsl::harvest_schedules
+            .filter(sched_dsl::workflow_name.eq(wf_name))
+            .select(sched_dsl::id)
+            .first(&mut conn)
+            .await
+            .expect("schedule row must exist after registration");
         insert_manual_trigger_execution(&mut conn, wf_name).await;
     }
 
@@ -10430,6 +10469,13 @@ async fn overlap_policy_skip_still_counts_a_manual_trigger_run_of_the_same_type(
         }
         tokio::time::sleep(Duration::from_millis(400)).await;
     }
+    // Positive control: same reasoning as the sibling cross-type test above.
+    let skip_decisions = count_max_active_runs_skip_decisions(&database_url, schedule_id).await;
+    assert!(
+        skip_decisions >= 1,
+        "expected at least one max_active_runs_reached skip decision recorded for the \
+         schedule, got {skip_decisions} -- did the tick actually run?"
+    );
 
     scheduler.shutdown();
     let _ = scheduler.join().await;
@@ -10521,6 +10567,15 @@ async fn overlap_policy_cancel_other_reaches_a_cross_type_successor() {
     .await
     .expect("issue #1160: CancelOther timed out waiting to reach the cross-type successor within 12 s");
 
+    // Shut the scheduler down before taking any further counts: with
+    // OverlapPolicy::CancelOther and this cron cadence, every subsequent tick
+    // cancels the current run and dispatches a new one, so wf_name's total
+    // execution count grows monotonically for as long as the scheduler keeps
+    // ticking -- an equality assertion taken while it's still running would
+    // be flaky by construction.
+    scheduler.shutdown();
+    let _ = scheduler.join().await;
+
     assert!(
         predecessor_cancelled >= 1,
         "issue #1160: CancelOther must cancel the cross-type predecessor, got {predecessor_cancelled}"
@@ -10529,16 +10584,119 @@ async fn overlap_policy_cancel_other_reaches_a_cross_type_successor() {
         running, 1,
         "CancelOther: exactly 1 {wf_name} execution must be RUNNING after cleanup, got {running}"
     );
-    // The predecessor must never have been double-counted as an extra
-    // wf_name-named run: total for wf_name itself stays exactly 1.
-    let wf_name_total = count_executions_for_workflow(&database_url, wf_name).await;
+    // The predecessor was cancelled, not duplicated: exactly one execution
+    // ever carried predecessor_type.
+    let predecessor_total = count_executions_for_workflow(&database_url, predecessor_type).await;
     assert_eq!(
-        wf_name_total, 1,
-        "CancelOther: exactly 1 execution total named {wf_name}, got {wf_name_total}"
+        predecessor_total, 1,
+        "CancelOther: exactly 1 execution total named {predecessor_type}, got {predecessor_total}"
+    );
+}
+
+/// (issue #1160, AC2) `TerminateOther` must be able to terminate a cross-type
+/// continue-as-new successor of the same schedule -- the symmetric case of
+/// `overlap_policy_cancel_other_reaches_a_cross_type_successor` above.
+/// `terminate_in_flight_runs` got the identical fix (drop the redundant
+/// `workflow_name` filter, select on `schedule_id` alone) via the shared
+/// `load_overlap_cleanup_targets` helper, but exercised independently since
+/// `TerminateOther` takes a different `OverlapAction` branch in
+/// `tick_one_workflow_schedule`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn overlap_policy_terminate_other_reaches_a_cross_type_successor() {
+    let (database_url, _container) = setup_test_database_url_or_env().await;
+    let wf_name = "overlap_1160_terminate_wf";
+    let predecessor_type = "overlap_1160_terminate_wf_predecessor";
+    let registry = Arc::new(HandlerRegistry::new(
+        vec![WorkflowInfo {
+            quota: None,
+            declared_activities: None,
+            declared_children: None,
+            mcp: false,
+            name: wf_name,
+            module: "integration_e2e",
+            handler: slow_workflow,
+            execution_timeout: None,
+            chain_execution_timeout: None,
+            sla: None,
+            concurrency: None,
+
+            debounce: None,
+            batch: None,
+            throttle: None,
+            max_input_bytes: None,
+
+            owner: None,
+            runbook_url: None,
+            severity: None,
+            description: None,
+            input_schema: None,
+            output_schema: None,
+            error_schema: None,
+            retry_policy: None,
+        }],
+        vec![],
+    ));
+    let pool = build_test_pool(&database_url);
+
+    let ws = WorkflowSchedule::new(wf_name, Schedule::Cron("*/2 * * * * *".to_string()))
+        .with_max_active_runs(1)
+        .with_overlap_policy(OverlapPolicy::TerminateOther);
+    {
+        use autumn_harvest::schema::harvest_schedules::dsl as sched_dsl;
+        let mut conn = pool.get().await.expect("pool get failed");
+        register_workflow_schedules(&mut conn, std::slice::from_ref(&ws))
+            .await
+            .expect("register_workflow_schedules failed");
+        let schedule_id: Uuid = sched_dsl::harvest_schedules
+            .filter(sched_dsl::workflow_name.eq(wf_name))
+            .select(sched_dsl::id)
+            .first(&mut conn)
+            .await
+            .expect("schedule row must exist after registration");
+        insert_cross_type_scheduled_execution(&mut conn, predecessor_type, schedule_id).await;
+    }
+
+    let workflow_schedules = Arc::new(vec![ws]);
+    let scheduler = SchedulerRuntime::spawn(
+        pool.clone(),
+        Arc::clone(&registry),
+        Arc::new(DagCatalog::default()),
+        Arc::clone(&workflow_schedules),
     );
 
+    let (predecessor_terminated, running) = tokio::time::timeout(Duration::from_secs(12), async {
+        loop {
+            let c = count_executions_in_state(&database_url, predecessor_type, "TERMINATED").await;
+            let r = count_running_executions(&database_url, wf_name).await;
+            if c >= 1 && r == 1 {
+                return (c, r);
+            }
+            tokio::time::sleep(Duration::from_millis(300)).await;
+        }
+    })
+    .await
+    .expect(
+        "issue #1160: TerminateOther timed out waiting to reach the cross-type successor within 12 s",
+    );
+
+    // Same rationale as the CancelOther test: shut down before taking any
+    // further counts, since wf_name's total grows on every subsequent tick.
     scheduler.shutdown();
     let _ = scheduler.join().await;
+
+    assert!(
+        predecessor_terminated >= 1,
+        "issue #1160: TerminateOther must terminate the cross-type predecessor, got {predecessor_terminated}"
+    );
+    assert_eq!(
+        running, 1,
+        "TerminateOther: exactly 1 {wf_name} execution must be RUNNING after cleanup, got {running}"
+    );
+    let predecessor_total = count_executions_for_workflow(&database_url, predecessor_type).await;
+    assert_eq!(
+        predecessor_total, 1,
+        "TerminateOther: exactly 1 execution total named {predecessor_type}, got {predecessor_total}"
+    );
 }
 
 /// (overlap-d) `BufferOne` durability: buffered slots survive a scheduler restart.

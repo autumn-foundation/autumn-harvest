@@ -26555,7 +26555,11 @@ async fn load_schedule_overdue_aux_by_shard(
         //
         // Keyed by (schedule_id, name) rather than name alone (issue #1160):
         // `schedule_running_basis_batch`'s cross-type disjunct means the
-        // result is looked up per schedule, not per name.
+        // result is looked up per schedule, not per name. No BTreeSet dedup
+        // needed here (unlike the pre-#1160 name-only batch): a dag_name and
+        // a different row's workflow_name can collide on the same string,
+        // but keying by `s.id` (unique) rather than by name means a
+        // collision no longer risks two schedules sharing one basis lookup.
         let schedule_names: Vec<(uuid::Uuid, &str)> = schedules
             .iter()
             .map(|s| {
@@ -27976,11 +27980,17 @@ async fn trigger_schedule_now(
     // For Skip policy, fail closed: if the running-count query fails on any shard,
     // treat it as saturated rather than silently firing through.
     if effective_overlap_policy == autumn_harvest::OverlapPolicy::Skip {
-        let is_saturated =
-            match query_running_count(&pool, &ScheduleKind::Workflow, &workflow_name).await {
-                Ok(running) => running >= i64::from(schedule.max_active_runs),
-                Err(_) => true,
-            };
+        let is_saturated = match query_running_count(
+            &pool,
+            &ScheduleKind::Workflow,
+            &workflow_name,
+            schedule.id,
+        )
+        .await
+        {
+            Ok(running) => running >= i64::from(schedule.max_active_runs),
+            Err(_) => true,
+        };
         if is_saturated {
             let ar = NewAuditRecord {
                 actor: &actor,
@@ -29102,7 +29112,7 @@ pub(crate) async fn schedule_backfill_inner(
 
     // Dry-run: query current running count and project what would happen.
     if request.dry_run {
-        let running = query_running_count_best_effort(&pool, &kind, &name).await;
+        let running = query_running_count_best_effort(&pool, &kind, &name, schedule_id).await;
         // Workflow IDs are derived from original_slot (not fire_time), so duplicate
         // detection must use the same set of timestamps that dispatch will use.
         let original_slots: Vec<_> = timestamp_pairs.iter().map(|(orig, _)| *orig).collect();
@@ -29225,7 +29235,7 @@ pub(crate) async fn schedule_backfill_inner(
     // Count running executions once before the loop; track dispatched_this_call separately
     // so we don't re-query on every timestamp. This value gates max_active_runs,
     // so non-dry-run dispatch must not treat count failures as zero.
-    let running_at_start = match query_running_count(&pool, &kind, &name).await {
+    let running_at_start = match query_running_count(&pool, &kind, &name, schedule_id).await {
         Ok(count) => count,
         Err(count_failures) => {
             let status = "partial";
@@ -30362,12 +30372,16 @@ pub(crate) async fn schedule_backfill_inner(
 /// Count active (RUNNING or PAUSED) workflow executions or DAG runs for the
 /// named entity. A PAUSED run still occupies an active slot for
 /// `max_active_runs`/overlap enforcement (issue #383), matching the scheduler.
+/// The `schedule_id` disjunct (issue #1160) also counts a cross-type
+/// continue-as-new successor of this schedule, matching
+/// `scheduler::schedule_running_basis`.
 /// Returns the total count across all shards, or all shard failures that made
 /// the count unsafe to use for `max_active_runs` enforcement.
 async fn query_running_count(
     pool: &HarvestDbPool,
     kind: &ScheduleKind,
     name: &str,
+    schedule_id: uuid::Uuid,
 ) -> Result<i64, Vec<BackfillShardFailure>> {
     let mut total = 0i64;
     let mut failures = Vec::new();
@@ -30383,7 +30397,11 @@ async fn query_running_count(
         // Both DAG and Workflow kinds query harvest_workflow_executions since
         // DAGs are now unified as workflows (issue #256 step 5).
         let count_result = harvest_workflow_executions::table
-            .filter(harvest_workflow_executions::workflow_name.eq(name))
+            .filter(
+                harvest_workflow_executions::workflow_name
+                    .eq(name)
+                    .or(harvest_workflow_executions::schedule_id.eq(Some(schedule_id))),
+            )
             .filter(harvest_workflow_executions::state.eq_any(["RUNNING", "PAUSED"]))
             .count()
             .get_result::<i64>(&mut conn)
@@ -30412,8 +30430,11 @@ async fn query_running_count_best_effort(
     pool: &HarvestDbPool,
     kind: &ScheduleKind,
     name: &str,
+    schedule_id: uuid::Uuid,
 ) -> i64 {
-    query_running_count(pool, kind, name).await.unwrap_or(0)
+    query_running_count(pool, kind, name, schedule_id)
+        .await
+        .unwrap_or(0)
 }
 
 /// Fan out across shards summing pending (not-yet-fired) start-throttle rows

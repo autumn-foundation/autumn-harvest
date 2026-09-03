@@ -601,10 +601,10 @@ async fn schedule_running_basis_counts_a_cross_type_successor_additively() {
          ) VALUES
          ('{schedule_a_id}', NULL, '*/30 * * * * *', 'UTC', false, 1, false,
           NOW() + interval '1 hour', NOW(), NOW(), '{schedule_a}', 'default', 0,
-          'skip', '[]'::jsonb, 1, NULL, 'run_previous_business_day'),
+          'skip', '[]'::jsonb, 1, NULL, 'skip'),
          ('{schedule_b_id}', NULL, '*/30 * * * * *', 'UTC', false, 1, false,
           NOW() + interval '1 hour', NOW(), NOW(), '{schedule_b}', 'default', 0,
-          'skip', '[]'::jsonb, 1, NULL, 'run_previous_business_day');
+          'skip', '[]'::jsonb, 1, NULL, 'skip');
 
          -- A manual-trigger run of schedule A's OWN type: schedule_id NULL,
          -- origin = manual_trigger. Must still count toward A (regression guard).
