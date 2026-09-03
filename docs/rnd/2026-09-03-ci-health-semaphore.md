@@ -274,7 +274,7 @@ gh api --paginate \
   | jq '.workflow_runs[] | select(.run_attempt > 1)'
 
 gh api --paginate \
-  "repos/autumn-foundation/autumn-harvest/actions/workflows/ci.yml/runs?event=push&status=completed&per_page=100" \
+  "repos/autumn-foundation/autumn-harvest/actions/workflows/ci.yml/runs?event=push&branch=trunk-dev&status=completed&per_page=100" \
   | jq '.workflow_runs[] | select(.run_attempt > 1)'
 ```
 
