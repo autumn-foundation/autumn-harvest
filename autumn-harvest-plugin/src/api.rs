@@ -10334,7 +10334,7 @@ async fn export_workflow_history(
     headers: axum::http::HeaderMap,
     maybe_session: Option<Extension<Session>>,
 ) -> axum::response::Response {
-    let pairs = match crate::strict_query::decode_or_bad_request(raw_query.as_deref()) {
+    let pairs = match crate::strict_query::decode_or_autumn_error_response(raw_query.as_deref()) {
         Ok(pairs) => pairs,
         Err(response) => return response,
     };
@@ -10416,7 +10416,7 @@ async fn export_workflow_histories(
     headers: axum::http::HeaderMap,
     maybe_session: Option<Extension<Session>>,
 ) -> axum::response::Response {
-    let pairs = match crate::strict_query::decode_or_bad_request(raw_query.as_deref()) {
+    let pairs = match crate::strict_query::decode_or_autumn_error_response(raw_query.as_deref()) {
         Ok(pairs) => pairs,
         Err(response) => return response,
     };
@@ -10474,7 +10474,7 @@ async fn export_workflow_history_sample(
     headers: axum::http::HeaderMap,
     maybe_session: Option<Extension<Session>>,
 ) -> axum::response::Response {
-    let pairs = match crate::strict_query::decode_or_bad_request(raw_query.as_deref()) {
+    let pairs = match crate::strict_query::decode_or_autumn_error_response(raw_query.as_deref()) {
         Ok(pairs) => pairs,
         Err(response) => return response,
     };
@@ -10826,7 +10826,7 @@ async fn get_workflow_result(
     headers: axum::http::HeaderMap,
     maybe_session: Option<Extension<Session>>,
 ) -> axum::response::Response {
-    let pairs = match crate::strict_query::decode_or_bad_request(raw_query.as_deref()) {
+    let pairs = match crate::strict_query::decode_or_autumn_error_response(raw_query.as_deref()) {
         Ok(pairs) => pairs,
         Err(response) => return response,
     };
@@ -49585,7 +49585,7 @@ mod tests {
         let response = get_workflow_result(
             Extension(state),
             Path(exec_id.to_string()),
-            Query(Vec::new()),
+            axum::extract::RawQuery(None),
             axum::http::HeaderMap::new(),
             None,
         )

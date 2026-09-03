@@ -43,6 +43,28 @@ fn build_app() -> HarvestApiApp {
     harvest_api_router(api_state).with_state(autumn_web::AppState::for_test())
 }
 
+/// Every route's `400` body carries [`crate::strict_query::MALFORMED_QUERY_MESSAGE`]
+/// (asserted by substring match, not full-body equality), but not in the same
+/// JSON shape: `GET /admin/queue-coverage` keeps its original, already-shipped
+/// `{"error": "..."}` shape (issue #774), while every other route -- whose
+/// *other* invalid-param `400`s are already `AutumnError`-shaped -- wraps the
+/// same message in `AutumnError`'s RFC-7807-flavored `{"detail": "...", ...}`
+/// body instead, so a route's malformed-query `400` never introduces a SECOND,
+/// inconsistent error shape alongside its own other `400`s (issue #1151
+/// review). See `strict_query.rs`'s `decode_or_bad_request` vs.
+/// `decode_or_autumn_error_response` doc comments for the full rationale.
+fn assert_malformed_query_body(name: &str, body: &Value) {
+    let message = body
+        .get("error")
+        .or_else(|| body.get("detail"))
+        .and_then(Value::as_str);
+    assert_eq!(
+        message,
+        Some("malformed query string: invalid percent-encoded UTF-8"),
+        "{name}: unexpected error body {body:?}"
+    );
+}
+
 async fn get_json(app: &HarvestApiApp, uri: &str) -> (StatusCode, Value) {
     let response = app
         .clone()
@@ -120,11 +142,7 @@ async fn every_raw_pairs_route_400s_on_a_malformed_percent_encoded_value() {
              (?queue_name=%FF), not silently decode to U+FFFD and proceed: \
              got {status} with body {body:?}"
         );
-        assert_eq!(
-            body.get("error").and_then(Value::as_str),
-            Some("malformed query string: invalid percent-encoded UTF-8"),
-            "{name}: unexpected error body {body:?}"
-        );
+        assert_malformed_query_body(name, &body);
     }
 }
 
@@ -146,11 +164,7 @@ async fn every_raw_pairs_route_400s_on_a_malformed_percent_encoded_key() {
             "{name} must 400 on a malformed percent-encoded query KEY \
              (?%FF=1): got {status} with body {body:?}"
         );
-        assert_eq!(
-            body.get("error").and_then(Value::as_str),
-            Some("malformed query string: invalid percent-encoded UTF-8"),
-            "{name}: unexpected error body {body:?}"
-        );
+        assert_malformed_query_body(name, &body);
     }
 }
 
@@ -170,10 +184,6 @@ async fn every_raw_pairs_route_400s_on_a_syntactically_invalid_percent_escape() 
             "{name} must 400 on a syntactically invalid percent escape \
              (?queue_name=orders%GG): got {status} with body {body:?}"
         );
-        assert_eq!(
-            body.get("error").and_then(Value::as_str),
-            Some("malformed query string: invalid percent-encoded UTF-8"),
-            "{name}: unexpected error body {body:?}"
-        );
+        assert_malformed_query_body(name, &body);
     }
 }

@@ -53,9 +53,15 @@ impl std::fmt::Display for InvalidQueryEncoding {
 
 impl std::error::Error for InvalidQueryEncoding {}
 
-/// The standard `400` JSON response body every strict-query route returns
-/// for [`InvalidQueryEncoding`], shared so the wording and shape can never
-/// drift between the 20 call sites that need it (issue #1151).
+/// The `400` JSON response body `GET /admin/queue-coverage` returns for
+/// [`InvalidQueryEncoding`] — the original, already-shipped and tested
+/// (issue #774) `{"error": "..."}` shape, distinct from [`AutumnError`]'s
+/// RFC-7807-flavored `{"detail": "...", "status": 400, ...}` shape every
+/// *other* strict-query route uses. Kept exactly as issue #774 shipped it
+/// (see `queue_coverage_integration.rs`'s existing malformed-encoding tests,
+/// which assert on this literal shape) rather than folded into
+/// [`decode_or_autumn_error_response`] purely for issue #1151's sweep —
+/// changing a shipped, tested route's error contract is out of scope here.
 pub fn bad_request_response() -> Response {
     (
         StatusCode::BAD_REQUEST,
@@ -83,10 +89,11 @@ pub fn decode_or_autumn_error(raw_query: Option<&str>) -> Result<Vec<(String, St
     }
 }
 
-/// Decode an optional raw query string into `(key, value)` pairs for a
-/// handler whose return type is `axum::response::Response` (an infallible
-/// signature that converts errors internally via `.into_response()`) rather
-/// than `Result<_, AutumnError>`.
+/// Decode an optional raw query string into `(key, value)` pairs for
+/// `GET /admin/queue-coverage` specifically — the one route whose malformed-
+/// query `400` predates this shared module (issue #774) and is proven, by
+/// name, in `queue_coverage_integration.rs`. See [`bad_request_response`]
+/// for why its shape is not [`AutumnError`]'s.
 ///
 /// # Errors
 ///
@@ -97,6 +104,31 @@ pub fn decode_or_bad_request(raw_query: Option<&str>) -> Result<Vec<(String, Str
         None => Ok(Vec::new()),
         Some(Ok(pairs)) => Ok(pairs),
         Some(Err(InvalidQueryEncoding)) => Err(bad_request_response()),
+    }
+}
+
+/// Decode an optional raw query string into `(key, value)` pairs for a
+/// handler whose return type is `axum::response::Response` (an infallible
+/// signature that converts errors internally via `.into_response()`) but
+/// whose *other* invalid-param `400`s are [`AutumnError`]-shaped (the
+/// `Err(error) => return error.into_response()` idiom used throughout
+/// [`crate::api`]). Using this instead of [`decode_or_bad_request`] keeps a
+/// route's malformed-query `400` in the SAME body shape as its own other
+/// `400`s, rather than introducing a second, inconsistent error shape on the
+/// same route (issue #1151 review).
+///
+/// # Errors
+///
+/// Returns a ready-made `400` [`Response`] built from
+/// [`AutumnError::bad_request_msg`] on [`InvalidQueryEncoding`], for the
+/// caller to `return` directly.
+pub fn decode_or_autumn_error_response(raw_query: Option<&str>) -> Result<Vec<(String, String)>, Response> {
+    match raw_query.map(parse_raw_query_pairs_strict) {
+        None => Ok(Vec::new()),
+        Some(Ok(pairs)) => Ok(pairs),
+        Some(Err(InvalidQueryEncoding)) => {
+            Err(AutumnError::bad_request_msg(MALFORMED_QUERY_MESSAGE).into_response())
+        }
     }
 }
 
@@ -336,17 +368,22 @@ mod tests {
 
     #[test]
     fn decode_or_autumn_error_treats_absent_query_as_empty_pairs() {
-        assert_eq!(decode_or_autumn_error(None), Ok(Vec::new()));
+        // AutumnError does not implement PartialEq, so the Ok side is
+        // asserted directly rather than via assert_eq! on the whole Result.
+        assert_eq!(
+            decode_or_autumn_error(None).expect("absent query must decode"),
+            Vec::new()
+        );
     }
 
     #[test]
     fn decode_or_autumn_error_decodes_well_formed_pairs() {
         assert_eq!(
-            decode_or_autumn_error(Some("a=1&b=2")),
-            Ok(vec![
+            decode_or_autumn_error(Some("a=1&b=2")).expect("well-formed pairs must decode"),
+            vec![
                 ("a".to_string(), "1".to_string()),
                 ("b".to_string(), "2".to_string()),
-            ])
+            ]
         );
     }
 
@@ -357,12 +394,30 @@ mod tests {
 
     #[test]
     fn decode_or_bad_request_treats_absent_query_as_empty_pairs() {
-        assert_eq!(decode_or_bad_request(None), Ok(Vec::new()));
+        assert_eq!(
+            decode_or_bad_request(None).expect("absent query must decode"),
+            Vec::new()
+        );
     }
 
     #[test]
     fn decode_or_bad_request_returns_400_response_on_malformed_encoding() {
         let response = decode_or_bad_request(Some("queue_name=%FF"))
+            .expect_err("malformed encoding must be rejected");
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[test]
+    fn decode_or_autumn_error_response_treats_absent_query_as_empty_pairs() {
+        assert_eq!(
+            decode_or_autumn_error_response(None).expect("absent query must decode"),
+            Vec::new()
+        );
+    }
+
+    #[test]
+    fn decode_or_autumn_error_response_returns_400_on_malformed_encoding() {
+        let response = decode_or_autumn_error_response(Some("queue_name=%FF"))
             .expect_err("malformed encoding must be rejected");
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     }
