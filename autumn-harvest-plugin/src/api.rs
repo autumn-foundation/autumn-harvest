@@ -25409,10 +25409,12 @@ async fn get_schedule(
                 .as_deref()
                 .or(sched.workflow_name.as_deref())
                 .unwrap_or("");
-            // Tick-exact shard-local basis (RUNNING/PAUSED + #607 pending throttle).
-            at_capacity = autumn_harvest::scheduler::schedule_running_basis(&mut conn, name)
-                .await
-                .is_ok_and(|basis| basis >= i64::from(sched.max_active_runs));
+            // Tick-exact shard-local basis (RUNNING/PAUSED, cross-type #1160
+            // successors of this schedule_id included, + #607 pending throttle).
+            at_capacity =
+                autumn_harvest::scheduler::schedule_running_basis(&mut conn, name, sched.id)
+                    .await
+                    .is_ok_and(|basis| basis >= i64::from(sched.max_active_runs));
             effective_fire_at = autumn_harvest::scheduler::resolve_effective_fire_at(
                 &mut conn,
                 sched.calendar_name.as_deref(),
@@ -26026,14 +26028,15 @@ async fn upsert_workflow_schedule_and_read_back(
     // the `harvest.schedule.overdue` gauge correctly suppress it to `false` —
     // breaking the read == gauge == tick invariant (issue #696, Codex round 2).
     // Reuse the single-source `scheduler::schedule_running_basis` (shard-local
-    // `RUNNING`/`PAUSED` count + #607 pending-throttle backlog) that list/get use;
-    // a count failure falls back to `false` (don't suppress the wedge signal).
+    // `RUNNING`/`PAUSED` count, cross-type #1160 successors of this schedule_id
+    // included, + #607 pending-throttle backlog) that list/get use; a count
+    // failure falls back to `false` (don't suppress the wedge signal).
     let name = row
         .dag_name
         .as_deref()
         .or(row.workflow_name.as_deref())
         .unwrap_or("");
-    let at_capacity = autumn_harvest::scheduler::schedule_running_basis(conn, name)
+    let at_capacity = autumn_harvest::scheduler::schedule_running_basis(conn, name, row.id)
         .await
         .is_ok_and(|basis| basis >= i64::from(row.max_active_runs));
     // Calendar-adjusted fire time (Codex round 3), resolved on the same shard
@@ -26544,25 +26547,31 @@ async fn load_schedule_overdue_aux_by_shard(
         // queries plus `resolve_effective_fire_at`'s calendar-exclusions
         // load) with exactly two grouped queries covering every schedule on
         // the shard at once (issue #786-class N+1; Ledger perf pass). A
-        // failed running-basis batch degrades to "0 running" for every name
-        // via `unwrap_or_default()`, the same as the old per-row
+        // failed running-basis batch degrades to "0 running" for every
+        // schedule via `unwrap_or_default()`, the same as the old per-row
         // `Err(_) => false` arm: it never *suppresses* an overdue wedge
         // signal, only fails to hide one. The exclusions batch below is
         // handled differently -- see the comment at its call site.
-        let names: Vec<&str> = schedules
+        //
+        // Keyed by (schedule_id, name) rather than name alone (issue #1160):
+        // `schedule_running_basis_batch`'s cross-type disjunct means the
+        // result is looked up per schedule, not per name.
+        let schedule_names: Vec<(uuid::Uuid, &str)> = schedules
             .iter()
             .map(|s| {
-                s.dag_name
-                    .as_deref()
-                    .or(s.workflow_name.as_deref())
-                    .unwrap_or("")
+                (
+                    s.id,
+                    s.dag_name
+                        .as_deref()
+                        .or(s.workflow_name.as_deref())
+                        .unwrap_or(""),
+                )
             })
-            .collect::<std::collections::BTreeSet<_>>()
-            .into_iter()
             .collect();
-        let basis = autumn_harvest::scheduler::schedule_running_basis_batch(&mut conn, &names)
-            .await
-            .unwrap_or_default();
+        let basis =
+            autumn_harvest::scheduler::schedule_running_basis_batch(&mut conn, &schedule_names)
+                .await
+                .unwrap_or_default();
 
         let calendar_names: Vec<&str> = schedules
             .iter()
@@ -26587,13 +26596,10 @@ async fn load_schedule_overdue_aux_by_shard(
                 .ok();
 
         for s in schedules {
-            let name = s
-                .dag_name
-                .as_deref()
-                .or(s.workflow_name.as_deref())
-                .unwrap_or("");
-            // Tick-exact shard-local basis (RUNNING/PAUSED + #607 pending throttle).
-            let at_capacity = basis.get(name).copied().unwrap_or(0) >= i64::from(s.max_active_runs);
+            // Tick-exact shard-local basis (RUNNING/PAUSED, cross-type #1160
+            // successors of this schedule_id included, + #607 pending throttle).
+            let at_capacity =
+                basis.get(&s.id).copied().unwrap_or(0) >= i64::from(s.max_active_runs);
             // Calendar-adjusted fire time (Codex round 3), computed in-memory
             // against this shard's preloaded exclusions map -- or the raw
             // anchor (`None`) if that load failed, never a silent "no
