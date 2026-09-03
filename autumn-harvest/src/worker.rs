@@ -18096,6 +18096,17 @@ async fn fail_workflow_for_history_cap(
             execution.history_bloat_warned_at.is_some(),
         );
 
+    // Issue #1184 (Codex review round 5): captured here, before the DLQ
+    // transaction below, not after it returns. `record_workflow_completed`
+    // defines this value as handler runtime; reading `started_at.elapsed()`
+    // after `move_workflow_to_dlq_for_history_cap` returns would fold in
+    // that call's own persistence latency (row locks, the DLQ/cascade
+    // writes), inflating `harvest.workflow.duration` for hard-cap failures
+    // whenever that transaction is slow. The metric is still only emitted
+    // once the transaction has actually committed (below) -- only the
+    // measurement moves, not the emission.
+    let duration_secs = started_at.elapsed().as_secs_f64();
+
     let reason = DeadLetterReason::HistoryCapExceeded {
         count: event_count,
         cap,
@@ -18128,7 +18139,7 @@ async fn fail_workflow_for_history_cap(
     telemetry.metrics.record_workflow_completed(
         &execution.workflow_name,
         &task.queue_name,
-        started_at.elapsed().as_secs_f64(),
+        duration_secs,
         WorkflowStatus::Failed,
     );
     telemetry
