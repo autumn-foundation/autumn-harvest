@@ -222,6 +222,21 @@ warmup call too. `claims_per_sec = total_claimed / wall_secs`.
 > claimer's `truncated` state is implied by having collected fewer than its
 > planned `per_claimer` observations).
 >
+> **Post-review correction, round 2 (Codex, on the P1/P2 fix commit).** **P2
+> follow-up — connection establishment itself was still unbounded.** Each
+> claimer's `RedisTaskQueue::connect` was called sequentially, after
+> `deadline` was already computed, but with no timeout of its own; an
+> unreachable or stalled Redis could hang `run_cell` past
+> `BENCH_SCENARIO_SECS` before a single claim was ever attempted, with no
+> `truncated` report to show for it. Fixed by wrapping each connect in
+> `tokio::time::timeout(deadline.saturating_duration_since(Instant::now()),
+> ...)`, mirroring the same pattern `claim_bench_support.rs` uses around its
+> own pool checkout. This is a defensive fix for a failure mode this
+> sandbox's local, always-reachable Redis never actually hit — re-running
+> the registered cell after the fix reproduced the same range (18,974.27
+> claims/s on one spot-check), so it is not folded into a new set of four
+> repeats.
+>
 > Both fixes changed the *mechanism*, not the *conclusion*: the corrected
 > registered-cell mean (18,933.43 claims/s across four runs, see Assay) is
 > within the pre-fix runs' range (15,319.64-19,140.83) and clears the same

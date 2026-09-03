@@ -217,9 +217,19 @@ async fn run_cell(backlog: usize, redis_url: &str, scenario_budget: Duration) ->
             key_prefix: prefix.clone(),
             ..RedisTaskQueueConfig::default()
         };
-        let queue = RedisTaskQueue::connect(redis_url, cfg)
-            .await
-            .expect("connect to local redis");
+        // Post-review correction: bound connection establishment by the
+        // remaining scenario deadline too, mirroring the Postgres harness's
+        // `tokio::time::timeout(..., pool.get())` around checkout — an
+        // unbounded connect to an unreachable/stalled Redis would otherwise
+        // hang `run_cell` past `BENCH_SCENARIO_SECS` with no truncated
+        // report to show for it.
+        let queue = tokio::time::timeout(
+            deadline.saturating_duration_since(Instant::now()),
+            RedisTaskQueue::connect(redis_url, cfg),
+        )
+        .await
+        .expect("connect to local redis timed out at the scenario deadline")
+        .expect("connect to local redis");
         let worker_id = format!("matchbench-worker-{c}");
         let queues = Arc::clone(&queues);
         let rotation = Arc::clone(&rotation);
