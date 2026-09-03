@@ -1352,6 +1352,11 @@ async fn run_strict_with_ctx(
 /// context. If execution reaches the end of the recorded history and suspends,
 /// it returns `WorkflowOutcome::Suspended` rather than a non-determinism error.
 /// If it suspends *before* all events in history are processed, it fails.
+///
+/// The same frontier tolerance applies if execution instead *completes*
+/// (issue #1175): a command emitted after recorded history is fully consumed
+/// is forward progress, not drift, whether the workflow parks on it or
+/// returns — the two terminal paths agree.
 #[allow(
     clippy::implicit_hasher,
     clippy::too_many_lines,
@@ -1488,46 +1493,39 @@ pub(crate) async fn run_workflow_canary(
                             handler_panic: false,
                             unhandled_signals: std::collections::BTreeMap::new(),
                         }
-                    } else if ctx.at_terminal_failure_frontier() {
-                        // Issue #952: the recorded history is sealed by a
-                        // terminal `WorkflowFailed`, so it stops at the failure
-                        // point and carries nothing to compare a post-failure
-                        // command against. A build that FIXED the failing check
-                        // (a raised payload cap, a now-registered handler) runs
-                        // past that point and completes — that is the fix
-                        // working, not drift, and the deploy gate must not
-                        // report it. Drift before the failure point is still
-                        // caught: every recorded event the code REACHED was
-                        // matched positionally above, and this arm runs only
-                        // after `history_has_unconsumed_events()` came back
-                        // false, so nothing recorded was skipped either.
-                        WorkflowOutcome::Completed {
-                            output,
-                            unhandled_signals: std::collections::BTreeMap::new(),
-                        }
-                    } else if ctx
-                        .drain_commands()
-                        .iter()
-                        .any(is_replay_significant_command)
-                    {
-                        let nd = ctx.take_nd_details().or_else(|| {
-                            Some(crate::error::NonDeterministicDetails {
-                                event_index: i32::try_from(ctx.replay_position()).ok(),
-                                expected: Some("<no new commands>".to_string()),
-                                actual: Some("<new commands emitted>".to_string()),
-                                workflow_type: Some(ctx.workflow_type().to_string()),
-                                build_id: ctx.build_id().map(String::from),
-                            })
-                        });
-                        WorkflowOutcome::Failed {
-                            error: "non-deterministic replay: new commands emitted beyond \
-                                    recorded history"
-                                .to_string(),
-                            non_deterministic_details: nd,
-                            handler_panic: false,
-                            unhandled_signals: std::collections::BTreeMap::new(),
-                        }
                     } else {
+                        // Every execution this function replays is by definition
+                        // non-terminal, so reaching the end of the workflow function
+                        // with recorded history fully consumed is always a legitimate
+                        // outcome here — never a stricter case than the sibling
+                        // `Err(_elapsed)` (suspended) arm below, which tolerates the
+                        // same frontier by checking only
+                        // `history_has_unconsumed_events()` before returning
+                        // `Suspended` with its drained commands. Two situations reach
+                        // this arm:
+                        //
+                        // - Issue #952: history sealed by a terminal `WorkflowFailed`
+                        //   (`ctx.at_terminal_failure_frontier()`). A build that FIXED
+                        //   the failing check (a raised payload cap, a now-registered
+                        //   handler) runs past that point and completes — that is the
+                        //   fix working, not drift.
+                        // - Issue #1175: a replay-significant command (e.g. the
+                        //   `RecordSideEffect` from `ctx.system_now()` / `new_uuid()`
+                        //   / `random_*()`) emitted past the frontier used to be
+                        //   rejected here even outside a failure tail — unlike the
+                        //   suspended arm's identical situation. That command is the
+                        //   candidate build making forward progress, not divergence.
+                        //
+                        // In both cases, drift before the frontier is still caught:
+                        // every recorded event the code reached was matched
+                        // positionally above (this arm runs only after
+                        // `history_has_unconsumed_events()` came back false), and a
+                        // command that mismatches recorded history (wrong activity
+                        // name, wrong order, …) resolves to `Diverged`/`NoMatch` in
+                        // the matcher and fails the cycle long before it would reach
+                        // here. `drain_commands()` is intentionally not called: no
+                        // caller reads pending commands off a `Completed` canary
+                        // outcome, and `ctx` is dropped with the buffer intact.
                         WorkflowOutcome::Completed {
                             output,
                             unhandled_signals: std::collections::BTreeMap::new(),

@@ -3607,6 +3607,115 @@ async fn a_random_range_at_the_in_flight_frontier_is_not_drift() {
     assert_eq!(report.exit_code(), 0, "must not block promotion: {report}");
 }
 
+// ---------------------------------------------------------------------------
+// Issue #1175 — the completing path must agree with the suspended path
+// ---------------------------------------------------------------------------
+//
+// `run_workflow_canary` has two terminal arms that both reach the frontier
+// with recorded history fully consumed: the `Err(_elapsed)` (suspended) arm
+// and the `Ok(Ok(output))` (completing) arm. The suspended arm tolerates a
+// command emitted at the frontier (that's `workflow_system_now_then_park`
+// above: the tests pass because the workflow *parks* on `step_two` after
+// reading the clock). The completing arm did not: a workflow that reads the
+// clock at the frontier and then returns `Ok` — rather than parking on
+// another activity — used to reject with "new commands emitted beyond
+// recorded history", even though nothing about finishing instead of parking
+// makes the wall-clock read any less legitimate. For an in-flight execution,
+// which is all `replay_bundle` ever replays, reaching the end of the
+// function is exactly as valid an outcome as parking on the next await
+// point.
+
+/// Consumes the recorded activity, reads the wall clock at the frontier, then
+/// **completes** instead of parking — the shape from issue #1175.
+fn workflow_system_now_then_complete<'a>(
+    ctx: &'a WorkflowContext,
+    _input: Value,
+) -> Pin<Box<dyn Future<Output = Result<Value, String>> + Send + 'a>> {
+    Box::pin(async move {
+        ctx.execute_activity_raw("step_one", Value::Null, "default")
+            .await
+            .map_err(|e| e.to_string())?;
+        let _ = ctx.system_now();
+        Ok(Value::Null)
+    })
+}
+
+#[tokio::test]
+async fn a_run_that_completes_after_a_builtin_side_effect_at_the_frontier_is_not_drift() {
+    let dir = tempfile::tempdir().unwrap();
+    write(
+        dir.path(),
+        "a.json",
+        &in_flight_at_frontier_snapshot_json("wf"),
+    );
+
+    let report = ReplayVerifier::new()
+        .register_fn("wf", workflow_system_now_then_complete as WorkflowHandlerFn)
+        .replay_bundle(dir.path())
+        .await;
+
+    assert_eq!(report.total, 1);
+    assert_eq!(
+        report.succeeded, 1,
+        "a run that reads the clock at the frontier and then completes is making \
+         forward progress, not drifting: {report}"
+    );
+    assert!(
+        report.diverged.is_empty(),
+        "expected zero drift, got: {:?}",
+        report.diverged
+    );
+    assert_eq!(report.exit_code(), 0, "must not block promotion: {report}");
+}
+
+/// The control: the completing-path relaxation must not swallow genuine
+/// drift. A handler that replays a *different* activity name than the one
+/// recorded still resolves to a mismatch in the matcher — a check that fires
+/// long before the (now-relaxed) "new commands beyond history" guard — and
+/// must still be reported as drift even though this workflow also completes
+/// rather than parking.
+fn workflow_wrong_activity_then_complete<'a>(
+    ctx: &'a WorkflowContext,
+    _input: Value,
+) -> Pin<Box<dyn Future<Output = Result<Value, String>> + Send + 'a>> {
+    Box::pin(async move {
+        ctx.execute_activity_raw("not_step_one", Value::Null, "default")
+            .await
+            .map_err(|e| e.to_string())?;
+        Ok(Value::Null)
+    })
+}
+
+#[tokio::test]
+async fn a_completing_run_with_a_mismatched_activity_is_still_drift() {
+    let dir = tempfile::tempdir().unwrap();
+    write(
+        dir.path(),
+        "a.json",
+        &in_flight_at_frontier_snapshot_json("wf"),
+    );
+
+    let report = ReplayVerifier::new()
+        .register_fn(
+            "wf",
+            workflow_wrong_activity_then_complete as WorkflowHandlerFn,
+        )
+        .replay_bundle(dir.path())
+        .await;
+
+    assert_eq!(report.total, 1);
+    assert_eq!(
+        report.succeeded, 0,
+        "a mismatched activity name must still be reported as drift: {report}"
+    );
+    assert_eq!(
+        report.diverged.len(),
+        1,
+        "expected one drift entry: {report}"
+    );
+    assert_eq!(report.exit_code(), 1, "divergence must exit non-zero");
+}
+
 /// The retained half: strict replay (issue #251 `verify_dir`) must still reject a
 /// built-in read past the end of recorded history.
 ///
