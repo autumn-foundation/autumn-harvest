@@ -76,6 +76,7 @@ use serde::Serialize;
 
 use crate::context::WorkflowCommand;
 use crate::event::WorkflowEvent;
+use crate::types::{ActivityExecId, ExecutionId};
 
 /// Default per-category bound applied by the management endpoint.
 ///
@@ -260,25 +261,36 @@ struct OpenTimerArm {
 #[derive(Default)]
 struct HistoryIndex {
     /// `activity_id` → (name, scheduled-at) for regular activities.
-    activities: HashMap<String, (String, DateTime<Utc>)>,
+    ///
+    /// Keyed by the native `ActivityExecId` (a `Copy` newtype over `Uuid`,
+    /// not `String`): every insert/lookup on this history-derived index sees
+    /// each activity id at least twice (open, then closed), so keying by the
+    /// 16-byte `Copy` id instead of a formatted 36-byte hyphenated string
+    /// avoids a `Uuid::to_string()` allocation-plus-format AND a
+    /// variable-length `SipHash` pass on every touch — a wide fan-out's
+    /// history scan is the whole cost of this index, so both add up.
+    activities: HashMap<ActivityExecId, (String, DateTime<Utc>)>,
     /// activity ids with a recorded terminal (completed/failed/timed out/
     /// externally resolved).
-    closed_activities: HashSet<String>,
+    closed_activities: HashSet<ActivityExecId>,
     /// `activity_id` → (name, scheduled-at) for local activities.
-    local_activities: HashMap<String, (String, DateTime<Utc>)>,
+    local_activities: HashMap<ActivityExecId, (String, DateTime<Utc>)>,
     /// local activity ids with a recorded terminal (completed/exhausted).
-    closed_local_activities: HashSet<String>,
+    closed_local_activities: HashSet<ActivityExecId>,
     /// `activity_id` → (name, awaiting-since, deadline) for external handoffs.
-    external_activities: HashMap<String, ExternalActivityMeta>,
+    external_activities: HashMap<ActivityExecId, ExternalActivityMeta>,
     /// Per-timer-id FIFO of open (unpaired) arms: `TimerFired`/`TimerCancelled`
     /// closes the oldest open arm (the poll-loop re-arm idiom).
     open_timer_arms: HashMap<String, VecDeque<OpenTimerArm>>,
     /// Insertion order of timer ids (stable reporting order).
     timer_order: Vec<String>,
     /// Child exec id → (workflow name, started-at) for open awaited children.
-    children: HashMap<String, (String, DateTime<Utc>)>,
+    ///
+    /// Keyed by the native `ExecutionId` (`Copy`, same rationale as
+    /// `activities` above).
+    children: HashMap<ExecutionId, (String, DateTime<Utc>)>,
     /// Insertion order of open children.
-    child_order: Vec<String>,
+    child_order: Vec<ExecutionId>,
     /// Update id → (handler name, admitted-at) for unresolved updates,
     /// in admission order.
     pending_updates: Vec<(String, String, DateTime<Utc>)>,
@@ -318,16 +330,14 @@ fn build_history_index(rows: &[(DateTime<Utc>, WorkflowEvent)]) -> HistoryIndex 
             WorkflowEvent::ActivityScheduled {
                 activity_id, name, ..
             } => {
-                index
-                    .activities
-                    .insert(activity_id.to_string(), (name.clone(), *at));
+                index.activities.insert(*activity_id, (name.clone(), *at));
             }
             WorkflowEvent::ActivityCompleted { activity_id, .. }
             | WorkflowEvent::ActivityFailed { activity_id, .. }
             | WorkflowEvent::ActivityTimedOut { activity_id, .. }
             | WorkflowEvent::ActivityCompletedExternally { activity_id, .. }
             | WorkflowEvent::ActivityFailedExternally { activity_id, .. } => {
-                index.closed_activities.insert(activity_id.to_string());
+                index.closed_activities.insert(*activity_id);
             }
             WorkflowEvent::ActivityAwaitingExternal {
                 activity_id,
@@ -340,7 +350,7 @@ fn build_history_index(rows: &[(DateTime<Utc>, WorkflowEvent)]) -> HistoryIndex 
                     .and_then(|secs| at.checked_add_signed(ChronoDuration::seconds(secs)));
                 index
                     .external_activities
-                    .insert(activity_id.to_string(), (name.clone(), *at, deadline));
+                    .insert(*activity_id, (name.clone(), *at, deadline));
             }
             WorkflowEvent::ActivityExternalDeadlineExtended { activity_id, .. } => {
                 // The extension event carries no new deadline value (the real
@@ -348,7 +358,7 @@ fn build_history_index(rows: &[(DateTime<Utc>, WorkflowEvent)]) -> HistoryIndex 
                 // clear the recorded one: reporting the ORIGINAL
                 // schedule-to-close as still due after an operator extended it
                 // would be actively misleading (replay review).
-                if let Some(meta) = index.external_activities.get_mut(&activity_id.to_string()) {
+                if let Some(meta) = index.external_activities.get_mut(activity_id) {
                     meta.2 = None;
                 }
             }
@@ -357,13 +367,11 @@ fn build_history_index(rows: &[(DateTime<Utc>, WorkflowEvent)]) -> HistoryIndex 
             } => {
                 index
                     .local_activities
-                    .insert(activity_id.to_string(), (name.clone(), *at));
+                    .insert(*activity_id, (name.clone(), *at));
             }
             WorkflowEvent::LocalActivityCompleted { activity_id, .. }
             | WorkflowEvent::LocalActivityExhausted { activity_id, .. } => {
-                index
-                    .closed_local_activities
-                    .insert(activity_id.to_string());
+                index.closed_local_activities.insert(*activity_id);
             }
             WorkflowEvent::TimerStarted {
                 timer_id,
@@ -404,9 +412,10 @@ fn build_history_index(rows: &[(DateTime<Utc>, WorkflowEvent)]) -> HistoryIndex 
                 workflow_name,
                 ..
             } => {
-                let id = child_id.to_string();
-                index.child_order.push(id.clone());
-                index.children.insert(id, (workflow_name.clone(), *at));
+                index.child_order.push(*child_id);
+                index
+                    .children
+                    .insert(*child_id, (workflow_name.clone(), *at));
             }
             WorkflowEvent::ChildWorkflowCompleted { child_id, .. }
             | WorkflowEvent::ChildWorkflowFailed { child_id, .. } => {
@@ -416,7 +425,7 @@ fn build_history_index(rows: &[(DateTime<Utc>, WorkflowEvent)]) -> HistoryIndex 
                 // oldest open reserved arm matching the child's workflow name
                 // at its terminal. On a timer-win the fired arm was already
                 // closed and the loser's synthetic terminal is a no-op here.
-                if let Some((child_name, _)) = index.children.remove(&child_id.to_string()) {
+                if let Some((child_name, _)) = index.children.remove(child_id) {
                     close_race_arm_for(&mut index, reserved_child_race_name, &child_name);
                 }
             }
@@ -564,18 +573,18 @@ fn timer_arm_metadata(
     (since, deadline)
 }
 
-fn activity_awaitable_by_id(index: &HistoryIndex, activity_id: &str) -> Awaitable {
+fn activity_awaitable_by_id(index: &HistoryIndex, activity_id: ActivityExecId) -> Awaitable {
     let mut awaitable = Awaitable::new(AwaitableKind::Activity);
     awaitable.id = Some(activity_id.to_string());
-    if let Some((name, since)) = index.activities.get(activity_id) {
+    if let Some((name, since)) = index.activities.get(&activity_id) {
         awaitable.name = Some(name.clone());
         awaitable.since = Some(*since);
-    } else if let Some((name, since, deadline)) = index.external_activities.get(activity_id) {
+    } else if let Some((name, since, deadline)) = index.external_activities.get(&activity_id) {
         awaitable.name = Some(name.clone());
         awaitable.since = Some(*since);
         awaitable.deadline = *deadline;
         awaitable.external = true;
-    } else if let Some((name, since)) = index.local_activities.get(activity_id) {
+    } else if let Some((name, since)) = index.local_activities.get(&activity_id) {
         awaitable.name = Some(name.clone());
         awaitable.since = Some(*since);
         awaitable.local = true;
@@ -602,19 +611,19 @@ fn project_replayed(index: &HistoryIndex, commands: &[WorkflowCommand]) -> Vec<A
             WorkflowCommand::ScheduleActivity {
                 activity_id, name, ..
             } => {
-                let mut awaitable = activity_awaitable_by_id(index, &activity_id.to_string());
+                let mut awaitable = activity_awaitable_by_id(index, *activity_id);
                 if awaitable.name.is_none() {
                     awaitable.name = Some(name.clone());
                 }
                 awaitables.push(awaitable);
             }
             WorkflowCommand::WaitForActivity { activity_id, .. } => {
-                awaitables.push(activity_awaitable_by_id(index, &activity_id.to_string()));
+                awaitables.push(activity_awaitable_by_id(index, *activity_id));
             }
             WorkflowCommand::RunLocalActivity {
                 activity_id, name, ..
             } => {
-                let mut awaitable = activity_awaitable_by_id(index, &activity_id.to_string());
+                let mut awaitable = activity_awaitable_by_id(index, *activity_id);
                 awaitable.local = true;
                 if awaitable.name.is_none() {
                     awaitable.name = Some(name.clone());
@@ -627,7 +636,7 @@ fn project_replayed(index: &HistoryIndex, commands: &[WorkflowCommand]) -> Vec<A
                 schedule_to_close_secs,
                 ..
             } => {
-                let mut awaitable = activity_awaitable_by_id(index, &activity_id.to_string());
+                let mut awaitable = activity_awaitable_by_id(index, *activity_id);
                 awaitable.external = true;
                 if awaitable.name.is_none() {
                     awaitable.name = Some(name.clone());
@@ -690,14 +699,13 @@ fn project_replayed(index: &HistoryIndex, commands: &[WorkflowCommand]) -> Vec<A
                 ..
             } => {
                 let mut awaitable = Awaitable::new(AwaitableKind::ChildWorkflow);
-                let id = child_id.to_string();
-                if let Some((name, since)) = index.children.get(&id) {
+                if let Some((name, since)) = index.children.get(child_id) {
                     awaitable.name = Some(name.clone());
                     awaitable.since = Some(*since);
                 } else {
                     awaitable.name = Some(workflow_name.clone());
                 }
-                awaitable.id = Some(id);
+                awaitable.id = Some(child_id.to_string());
                 awaitables.push(awaitable);
             }
             WorkflowCommand::AwaitExternalWorkflow { target, .. } => {
@@ -866,7 +874,7 @@ fn project_history_only(
     let mut awaitables: Vec<Awaitable> = Vec::new();
 
     // Open regular activities, in scheduling order.
-    let mut open_activities: Vec<(&String, &(String, DateTime<Utc>))> = index
+    let mut open_activities: Vec<(&ActivityExecId, &(String, DateTime<Utc>))> = index
         .activities
         .iter()
         .filter(|(id, _)| !index.closed_activities.contains(*id))
@@ -874,14 +882,14 @@ fn project_history_only(
     open_activities.sort_by_key(|(_, (_, at))| *at);
     for (id, (name, since)) in open_activities {
         let mut awaitable = Awaitable::new(AwaitableKind::Activity);
-        awaitable.id = Some(id.clone());
+        awaitable.id = Some(id.to_string());
         awaitable.name = Some(name.clone());
         awaitable.since = Some(*since);
         awaitables.push(awaitable);
     }
 
     // Open external-handoff activities.
-    let mut open_external: Vec<(&String, &ExternalActivityMeta)> = index
+    let mut open_external: Vec<(&ActivityExecId, &ExternalActivityMeta)> = index
         .external_activities
         .iter()
         .filter(|(id, _)| !index.closed_activities.contains(*id))
@@ -889,7 +897,7 @@ fn project_history_only(
     open_external.sort_by_key(|(_, (_, at, _))| *at);
     for (id, (name, since, deadline)) in open_external {
         let mut awaitable = Awaitable::new(AwaitableKind::Activity);
-        awaitable.id = Some(id.clone());
+        awaitable.id = Some(id.to_string());
         awaitable.name = Some(name.clone());
         awaitable.since = Some(*since);
         awaitable.deadline = *deadline;
@@ -898,7 +906,7 @@ fn project_history_only(
     }
 
     // Open local activities (scheduled, possibly mid-retry, no terminal).
-    let mut open_local: Vec<(&String, &(String, DateTime<Utc>))> = index
+    let mut open_local: Vec<(&ActivityExecId, &(String, DateTime<Utc>))> = index
         .local_activities
         .iter()
         .filter(|(id, _)| !index.closed_local_activities.contains(*id))
@@ -906,7 +914,7 @@ fn project_history_only(
     open_local.sort_by_key(|(_, (_, at))| *at);
     for (id, (name, since)) in open_local {
         let mut awaitable = Awaitable::new(AwaitableKind::Activity);
-        awaitable.id = Some(id.clone());
+        awaitable.id = Some(id.to_string());
         awaitable.name = Some(name.clone());
         awaitable.since = Some(*since);
         awaitable.local = true;
@@ -977,7 +985,7 @@ fn project_history_only(
     for child_id in &index.child_order {
         if let Some((name, since)) = index.children.get(child_id) {
             let mut awaitable = Awaitable::new(AwaitableKind::ChildWorkflow);
-            awaitable.id = Some(child_id.clone());
+            awaitable.id = Some(child_id.to_string());
             awaitable.name = Some(name.clone());
             awaitable.since = Some(*since);
             awaitable.deadline = child_race_deadlines
