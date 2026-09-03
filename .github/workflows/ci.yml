@@ -109,6 +109,14 @@ jobs:
         with:
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
+      - name: Check default-run for multi-binary packages
+        # Guards the defect class that silently broke `cargo run -p
+        # quickstart` and `cargo run -p autumn-harvest-cli -- ...` (the
+        # documented command in 50+ places, including the quickstart's own
+        # "Step 3 — Run preflight") for weeks with fully green CI, because
+        # the `quickstart`/build-only CI jobs run `cargo build`, which can't
+        # itself be ambiguous. See scripts/check-default-run.sh.
+        run: ./scripts/check-default-run.sh
       - name: Check formatting
         run: cargo fmt --all -- --check
       - name: Clippy autumn-harvest
