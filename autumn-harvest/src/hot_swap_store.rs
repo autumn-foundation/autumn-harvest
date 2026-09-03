@@ -482,6 +482,31 @@ pub async fn sync_build_into_registry(
         prepared.push(one);
     }
 
+    // Re-read the build's manifest and refuse to commit if it moved under us
+    // (issue #967, Codex review round 3). The listing above is a snapshot, and
+    // publishing a NEW `(build_id, workflow_name)` under an existing build is
+    // allowed by design — the primary key only makes an existing name's bytes
+    // immutable. So a module published mid-sync would be missed, and the sync
+    // would report success while the worker lacked a module for a workflow its
+    // build compatibility admits: every task for that workflow becomes a
+    // capability-miss redelivery until someone syncs again. A retirement racing
+    // the sync is the same hazard in the other direction.
+    //
+    // Failing is the right answer rather than quietly loading the subset,
+    // because "this build is loaded" is the claim the worker acts on when it
+    // decides which executions it can serve. The caller retries and gets a
+    // consistent snapshot; the alternative is a worker confidently half-serving
+    // a build, which §8 argues is worse than not serving it at all.
+    let after = list_workflow_modules_for_build(conn, build_id).await?;
+    if after != names {
+        return Err(HarvestError::Config(format!(
+            "build `{build_id}`'s module set changed while it was being synced ({} modules at \
+             the start, {} now); nothing was loaded. Retry the sync.",
+            names.len(),
+            after.len()
+        )));
+    }
+
     let registry = Arc::clone(registry);
     let build = build_id.to_string();
     tokio::task::spawn_blocking(move || {

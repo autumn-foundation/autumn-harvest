@@ -1138,14 +1138,33 @@ pub struct ModuleHost {
     pub pinned_module: Option<Arc<LoadedWorkflowModule>>,
 }
 
-/// Hard ceiling on entries in a registry's decision cache.
+/// Hard ceiling on the NUMBER of entries in a registry's decision cache.
 ///
-/// The cache lives for the worker process (see [`DecisionCache`]), so this is
-/// the bound that keeps it from growing without limit. Entries are small — a
-/// 32-byte digest and one `DecideResponse` — because the key is a hash of the
-/// request rather than the request itself, which can be up to
-/// [`MAX_DECIDE_REQUEST_BYTES`].
+/// A count alone is **not** a memory bound, and reading it as one was a real bug
+/// (issue #967, Codex review round 3): the key is a 32-byte digest, but the
+/// *value* is a whole `DecideResponse`, which a guest may return at up to
+/// [`WASM_MAX_OUTPUT_BYTES`](crate::wasm_activities::WASM_MAX_OUTPUT_BYTES)
+/// — 4 MiB. A guest returning a distinct large response per request could
+/// therefore have filled 4096 entries with ~16 GiB and OOM'd the worker,
+/// walking straight past the per-invocation memory ceiling the sandbox
+/// enforces. [`MAX_CACHED_DECISION_BYTES`] is the bound that actually holds;
+/// this one just keeps the map's own overhead in check.
 pub const MAX_CACHED_DECISIONS: usize = 4096;
+
+/// Total bytes of cached responses a registry will retain.
+///
+/// This is the real bound on the decision cache. Retained memory is
+/// **at most** this, whatever the guest returns.
+pub const MAX_CACHED_DECISION_BYTES: usize = 8 * 1024 * 1024;
+
+/// Largest single response the cache will retain.
+///
+/// A decision is an activity name plus its input, or a final output; 64 KiB is
+/// already generous for one. Refusing to cache anything larger means a single
+/// fat response cannot evict the whole cache to make room for itself, and costs
+/// only the optimisation for that one step — the guest is still re-asked, which
+/// is exactly what happened before any cache existed.
+pub const MAX_CACHED_RESPONSE_BYTES: usize = 64 * 1024;
 
 /// A worker-process-lifetime cache of guest decisions, bounded and
 /// insertion-ordered (issue #967, Codex review round 2).
@@ -1171,11 +1190,20 @@ pub const MAX_CACHED_DECISIONS: usize = 4096;
 /// map keeps the implementation something a reader can check by eye.
 #[derive(Debug, Default)]
 pub struct DecisionCache {
-    entries: BTreeMap<u64, ([u8; 32], DecideResponse)>,
+    entries: BTreeMap<u64, CachedDecision>,
     index: BTreeMap<[u8; 32], u64>,
     next_seq: u64,
+    bytes: usize,
     hits: u64,
     misses: u64,
+}
+
+/// One cached decision, with the retained size that bounds it.
+#[derive(Debug)]
+struct CachedDecision {
+    key: [u8; 32],
+    response: DecideResponse,
+    bytes: usize,
 }
 
 impl DecisionCache {
@@ -1186,6 +1214,7 @@ impl DecisionCache {
             entries: BTreeMap::new(),
             index: BTreeMap::new(),
             next_seq: 0,
+            bytes: 0,
             hits: 0,
             misses: 0,
         }
@@ -1211,7 +1240,7 @@ impl DecisionCache {
             .index
             .get(key)
             .and_then(|seq| self.entries.get(seq))
-            .map(|(_, response)| response.clone());
+            .map(|entry| entry.response.clone());
         if found.is_some() {
             self.hits += 1;
         } else {
@@ -1220,23 +1249,55 @@ impl DecisionCache {
         found
     }
 
-    /// Record `response` for `key`, evicting the oldest entry if full.
-    pub fn insert(&mut self, key: [u8; 32], response: DecideResponse) {
+    /// Record `response` for `key`, evicting oldest-first to stay within both
+    /// [`MAX_CACHED_DECISIONS`] and [`MAX_CACHED_DECISION_BYTES`].
+    ///
+    /// A response larger than [`MAX_CACHED_RESPONSE_BYTES`] is **not** cached:
+    /// the guest is simply re-asked for that step, which is what happened before
+    /// the cache existed. Returns whether the decision was retained.
+    pub fn insert(&mut self, key: [u8; 32], response: DecideResponse) -> bool {
         if self.index.contains_key(&key) {
-            return;
+            return false;
         }
-        while self.entries.len() >= MAX_CACHED_DECISIONS {
+        // The response's own serialised size is what the cache retains, so it is
+        // what the budget has to be measured in. Counting entries and assuming
+        // they are small is precisely the mistake this replaces.
+        let Ok(bytes) = serde_json::to_vec(&response).map(|encoded| encoded.len()) else {
+            return false;
+        };
+        if bytes > MAX_CACHED_RESPONSE_BYTES {
+            return false;
+        }
+        while self.entries.len() >= MAX_CACHED_DECISIONS
+            || self.bytes.saturating_add(bytes) > MAX_CACHED_DECISION_BYTES
+        {
             let Some((&oldest, _)) = self.entries.iter().next() else {
                 break;
             };
-            if let Some((evicted, _)) = self.entries.remove(&oldest) {
-                self.index.remove(&evicted);
+            if let Some(evicted) = self.entries.remove(&oldest) {
+                self.index.remove(&evicted.key);
+                self.bytes = self.bytes.saturating_sub(evicted.bytes);
             }
         }
         let seq = self.next_seq;
         self.next_seq += 1;
-        self.entries.insert(seq, (key, response));
+        self.bytes = self.bytes.saturating_add(bytes);
+        self.entries.insert(
+            seq,
+            CachedDecision {
+                key,
+                response,
+                bytes,
+            },
+        );
         self.index.insert(key, seq);
+        true
+    }
+
+    /// Bytes of cached responses currently retained.
+    #[must_use]
+    pub const fn retained_bytes(&self) -> usize {
+        self.bytes
     }
 
     /// `(hits, misses)` since the process started — for tests and diagnostics.
@@ -1745,6 +1806,7 @@ pub fn module_workflow_handler(
                     .decisions()
                     .ok_or_else(|| "the decision cache is poisoned".to_string())?
                     .insert(key, response.clone());
+
                 // NOTE: deliberately no `yield_now()` here (issue #967, Codex
                 // review round 1). `executor::run_workflow_handler_cycle` drives
                 // the handler inside `tokio::time::timeout(SUSPENSION_TIMEOUT)`,

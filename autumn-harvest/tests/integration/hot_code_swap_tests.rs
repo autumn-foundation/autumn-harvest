@@ -39,9 +39,9 @@ use autumn_harvest::context::WorkflowContext;
 use autumn_harvest::event::WorkflowEvent;
 use autumn_harvest::hot_swap::{
     DecideOutcome, DecideRequest, DecideResponse, DecisionCache, HotSwapError,
-    MAX_CACHED_DECISIONS, ModuleHost, ModuleRegistry, ModuleVerification, compute_module_hash,
-    encode_decide_request, module_workflow_handler, sign_module_binding, verify_module_bytes,
-    with_module_host,
+    MAX_CACHED_DECISION_BYTES, MAX_CACHED_DECISIONS, MAX_CACHED_RESPONSE_BYTES, ModuleHost,
+    ModuleRegistry, ModuleVerification, compute_module_hash, encode_decide_request,
+    module_workflow_handler, sign_module_binding, verify_module_bytes, with_module_host,
 };
 use autumn_harvest::hot_swap_store::{
     fetch_workflow_module, list_workflow_modules_for_build, publish_workflow_module,
@@ -2376,10 +2376,52 @@ async fn the_decision_cache_never_serves_one_builds_answer_to_another() {
 }
 
 #[test]
-fn the_decision_cache_is_bounded_and_evicts_oldest_first() {
-    // The cache lives for the worker process, so the bound is what stops it
-    // growing without limit. Entries are a 32-byte digest plus a response
-    // precisely so this ceiling can be a count.
+fn the_decision_cache_is_bounded_in_bytes_not_just_entries() {
+    // Codex review round 3, and the finding is a regression my own round-2 fix
+    // introduced: a count is NOT a memory bound. The key is a 32-byte digest but
+    // the VALUE is a whole `DecideResponse`, which a guest may return at up to
+    // `WASM_MAX_OUTPUT_BYTES` (4 MiB) — so 4096 entries could retain ~16 GiB and
+    // OOM the worker, walking straight past the per-invocation memory ceiling
+    // the sandbox enforces. I had written "entries are small" in the doc comment
+    // and never checked what made them small.
+    let mut cache = DecisionCache::new();
+
+    // A response over the per-entry ceiling is not cached at all, so one fat
+    // response cannot evict the whole cache to make room for itself.
+    let fat = "x".repeat(MAX_CACHED_RESPONSE_BYTES + 1024);
+    assert!(
+        !cache.insert(
+            DecisionCache::key("wf-v1", "hash", b"fat"),
+            DecideResponse::Complete { output: json!(fat) },
+        ),
+        "a response over the per-entry ceiling must be refused, not cached"
+    );
+    assert_eq!(cache.len(), 0);
+    assert_eq!(cache.retained_bytes(), 0);
+
+    // Many merely-large responses stay under the total budget by eviction.
+    let chunky = "y".repeat(MAX_CACHED_RESPONSE_BYTES / 2);
+    for i in 0..512_usize {
+        cache.insert(
+            DecisionCache::key("wf-v1", "hash", &i.to_be_bytes()),
+            DecideResponse::Complete {
+                output: json!(format!("{chunky}{i}")),
+            },
+        );
+        assert!(
+            cache.retained_bytes() <= MAX_CACHED_DECISION_BYTES,
+            "the cache must never exceed its byte budget; at {i} it held {}",
+            cache.retained_bytes()
+        );
+    }
+    assert!(
+        cache.retained_bytes() > 0,
+        "the cache should still be doing its job"
+    );
+}
+
+#[test]
+fn the_decision_cache_evicts_oldest_first() {
     let mut cache = DecisionCache::new();
     let key_for = |i: usize| DecisionCache::key("wf-v1", "hash", &i.to_be_bytes());
 

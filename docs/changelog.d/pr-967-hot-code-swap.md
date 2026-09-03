@@ -156,6 +156,32 @@ change to the replay surface**.
   request alone would serve v1's decision to v2 — silently defeating the swap the
   spike exists to demonstrate
   (`the_decision_cache_never_serves_one_builds_answer_to_another`).
+- **A cache bounded in entries is not bounded in memory.** The decision cache's
+  ceiling was a count, on the reasoning that "entries are small" — which was
+  never checked. The key is a 32-byte digest, but the *value* is a whole
+  `DecideResponse`, and a guest may return up to `WASM_MAX_OUTPUT_BYTES` (4 MiB)
+  per decision: `MAX_CACHED_DECISIONS` of those is ~16 GiB, reached by a guest
+  that simply returns a distinct large response each time. That is the
+  per-invocation memory ceiling the sandbox enforces, defeated through the one
+  structure deliberately built to outlive an invocation. The operative bound is
+  now `MAX_CACHED_DECISION_BYTES` (8 MiB retained), with
+  `MAX_CACHED_RESPONSE_BYTES` (64 KiB) refusing any single response large enough
+  to evict the cache to make room for itself — a refusal costs only the
+  optimisation for that step, since the guest is simply re-asked. The general
+  form, recorded in the report because it will outlive this cache: **a bound
+  stated in entries is a bound on the wrong thing whenever the guest chooses the
+  entry size.**
+- **A sync now refuses a build whose module set moved under it.** Publishing a
+  *new* `(build_id, workflow_name)` under an existing build is allowed by design
+  — the primary key only makes an existing name's bytes immutable — so a module
+  published between the manifest listing and the commit was silently missed, and
+  the sync reported success while the worker lacked a module for a workflow its
+  build compatibility admits: every task for it becomes a capability-miss
+  redelivery until someone syncs again. The manifest is re-read before
+  committing and a change fails the sync with a retry instruction, because "this
+  build is loaded" is the claim the worker acts on when deciding which
+  executions it can serve, and a worker confidently half-serving a build is the
+  failure §8 argues is worse than not serving it at all.
 - **An activity timeout is a step outcome, and now reaches the guest.** The
   mirror image of the ND bug above. `execute_activity_raw` builds
   `HarvestError::Timeout` from `HistoryMatch::TimedOut`, so it is history-backed

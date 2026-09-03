@@ -364,7 +364,22 @@ it should be named rather than discovered later:
   (`MAX_CACHED_DECISIONS`) rather than a byte budget precisely because the key is
   a 32-byte digest rather than the request itself, which may be up to
   `MAX_DECIDE_REQUEST_BYTES`; eviction is oldest-first
-  (`the_decision_cache_is_bounded_and_evicts_oldest_first`).
+  (`the_decision_cache_evicts_oldest_first`).
+
+  A count, though, is **not** a memory bound, and reading it as one was a real
+  bug: the key is a digest, but the *value* is a whole `DecideResponse`, which a
+  guest may return at up to `WASM_MAX_OUTPUT_BYTES` (4 MiB). Filling
+  `MAX_CACHED_DECISIONS` entries could therefore have retained ~16 GiB and
+  OOM'd the worker — walking straight past the per-invocation memory ceiling the
+  sandbox enforces, via the one structure that outlives an invocation. The
+  operative bound is `MAX_CACHED_DECISION_BYTES` (8 MiB of retained responses),
+  with `MAX_CACHED_RESPONSE_BYTES` (64 KiB) refusing to cache any single
+  response big enough to evict the cache to make room for itself; a refused
+  response costs only the optimisation for that step
+  (`the_decision_cache_is_bounded_in_bytes_not_just_entries`). The general
+  lesson, and it applies to any cache added to this boundary later: **a bound
+  stated in entries is a bound on the wrong thing whenever the guest chooses the
+  entry size.**
 
 The other cost is C5's: a decision runs inline on the decision-cycle thread —
 and, per C9 below, *must*, since the host may not introduce an await that records
