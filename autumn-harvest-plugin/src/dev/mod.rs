@@ -35,10 +35,12 @@
 //! | [`session`] | On-disk session record and the pure reap decision |
 //! | [`reaper`] | Reclaim what a killed run left behind |
 //! | [`banner`] | The start banner and the copy-pasteable trigger command |
+//! | `dsn` | How a DSN is spelled, shared by `safety` and `banner` |
 //! | [`sample`] | The built-in `dev_greeting` sample workflow |
 
 pub mod banner;
 pub mod discovery;
+mod dsn;
 pub mod postgres;
 pub mod reaper;
 pub mod safety;
