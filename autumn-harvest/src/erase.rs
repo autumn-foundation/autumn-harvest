@@ -483,7 +483,12 @@ mod db {
             ));
         };
 
-        let mut conn = crate::shard_rebalance::conn_for_shard(pool, *live).await?;
+        // The live residence resolves tolerantly: a single-pool deployment
+        // registers one pool under one shard id, and the run's row is in it
+        // whatever its id's shard bits say. Prior residences below keep the
+        // exact form -- a sealed source is one specific database, and falling
+        // back to the default there would scrub the wrong copy.
+        let mut conn = crate::shard_rebalance::conn_for_live_shard(pool, *live).await?;
         let mut outcome = erase_workflow_payloads(&mut conn, exec_id, reason).await?;
         drop(conn);
 

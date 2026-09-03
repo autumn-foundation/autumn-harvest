@@ -601,10 +601,10 @@ pub fn history_fingerprint(events: &[crate::event::WorkflowEvent]) -> String {
 pub use db::{
     MigrationBatchReport, MigrationOutcome, MigrationRecord, ShardMigrationCandidate,
     abort_migration, activate_target, assert_schema_parity, begin_migration, commit_cutover,
-    conn_for_execution_forwarded, conn_for_shard, list_migration_candidates, load_migration,
-    migrate_execution, migrate_quiescent_executions, observe_quiescence, residence_chain,
-    resolve_execution_shard, resolve_target_shard, resume_incomplete_migrations, shard_of_held_row,
-    stage_copy, verify_target_copy,
+    conn_for_execution_forwarded, conn_for_live_shard, conn_for_shard, list_migration_candidates,
+    load_migration, migrate_execution, migrate_quiescent_executions, observe_quiescence,
+    residence_chain, resolve_execution_shard, resolve_target_shard, resume_incomplete_migrations,
+    shard_of_held_row, stage_copy, verify_target_copy,
 };
 
 #[cfg(feature = "db")]
@@ -2639,8 +2639,15 @@ mod db {
     ) -> HarvestResult<ShardId> {
         let origin = pool.routed_shard_for_execution(exec_id);
         let mut current = origin;
-        for _ in 0..MAX_FORWARD_HOPS {
-            let mut conn = checkout(pool, current).await?;
+        for hop in 0..MAX_FORWARD_HOPS {
+            // The ORIGIN hop is tolerant (see `checkout_entry`); every hop after
+            // it follows a stored pointer that names one specific database and
+            // must resolve there or fail.
+            let mut conn = if hop == 0 {
+                checkout_entry(pool, current).await?
+            } else {
+                checkout(pool, current).await?
+            };
             match read_forward(&mut conn, exec_id).await? {
                 None => return Ok(current),
                 Some(next) => current = next,
@@ -2690,7 +2697,7 @@ mod db {
         exec_id: ExecutionId,
     ) -> HarvestResult<Vec<ShardId>> {
         let live = resolve_execution_shard(pool, exec_id).await?;
-        let mut conn = checkout(pool, live).await?;
+        let mut conn = checkout_entry(pool, live).await?;
         // The execution row first, and the SUMMARY as the fallback. After a
         // migrated run terminates, the live shard's retention janitor deletes
         // the execution row and keeps only a compact
@@ -2815,6 +2822,17 @@ mod db {
         shard: ShardId,
     ) -> HarvestResult<diesel_async::pooled_connection::deadpool::Object<AsyncPgConnection>> {
         checkout(pool, shard).await
+    }
+
+    /// Check out a connection for an execution's **live** residence, tolerating
+    /// a deployment that registers no pool under that shard id. See
+    /// [`checkout_entry`] for why the live residence resolves this way and a
+    /// prior residence deliberately does not.
+    pub async fn conn_for_live_shard(
+        pool: &ShardedDbPool,
+        shard: ShardId,
+    ) -> HarvestResult<diesel_async::pooled_connection::deadpool::Object<AsyncPgConnection>> {
+        checkout_entry(pool, shard).await
     }
 
     /// The forwarding probe: "has this execution been rebalanced off this
@@ -3017,6 +3035,38 @@ mod db {
         .bind::<Integer, _>(target_shard.as_i32())
         .execute(&mut *conn)
         .await;
+    }
+
+    /// Check out a connection for an execution's **entry point** -- the shard
+    /// its id hashes to, or the shard it lives on now.
+    ///
+    /// Unlike [`checkout`], this falls back to the pool's default shard when no
+    /// pool is registered for `shard`, which is exactly the contract of
+    /// [`ShardedDbPool::pool_for`] that every other read path in the engine uses
+    /// to reach a run's own database. A single-pool deployment -- the default,
+    /// and every non-sharded test harness -- registers one pool under one shard
+    /// id, so an `ExecutionId` whose shard bits name anything else would
+    /// otherwise be unreachable even though its row is sitting right there.
+    ///
+    /// Safe because every query behind it is keyed by execution id: a fallback
+    /// that lands on the wrong database finds no row and answers `NotFound`,
+    /// never another run's data.
+    ///
+    /// Deliberately NOT used for a shard named by a `migrated_to_shard` pointer
+    /// or by a migration record. Those name one specific database, and a silent
+    /// fallback to the default there would resolve the run to the wrong shard --
+    /// or, on the erase path, scrub the wrong copy.
+    async fn checkout_entry(
+        pool: &ShardedDbPool,
+        shard: ShardId,
+    ) -> HarvestResult<diesel_async::pooled_connection::deadpool::Object<AsyncPgConnection>> {
+        pool.pool_for(shard)
+            .get()
+            .await
+            .map_err(|e| HarvestError::ShardUnavailable {
+                shard_id: shard.as_i32(),
+                reason: format!("pool checkout failed: {e}"),
+            })
     }
 
     async fn checkout(

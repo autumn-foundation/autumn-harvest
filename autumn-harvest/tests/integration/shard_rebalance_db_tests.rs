@@ -47,8 +47,8 @@ use autumn_harvest::shard_rebalance::{
     MigrationOutcome, MigrationPhase, QuiescenceBlocker, abort_migration, activate_target,
     assess_quiescence, begin_migration, commit_cutover, history_fingerprint,
     list_migration_candidates, load_migration, migrate_execution, migrate_quiescent_executions,
-    observe_quiescence, resolve_execution_shard, resume_incomplete_migrations, stage_copy,
-    verify_target_copy,
+    observe_quiescence, residence_chain, resolve_execution_shard, resume_incomplete_migrations,
+    stage_copy, verify_target_copy,
 };
 use autumn_harvest::store;
 use autumn_harvest::types::{ExecutionId, ShardId};
@@ -199,8 +199,27 @@ async fn insert_execution(
     workflow_name: &str,
     workflow_id: &str,
 ) -> ExecutionId {
+    insert_execution_with_id(
+        conn,
+        workflow_name,
+        workflow_id,
+        ExecutionId::new_for_shard(SOURCE),
+        SOURCE,
+    )
+    .await
+}
+
+/// Insert a `RUNNING` root execution under a caller-chosen `ExecutionId`, so a
+/// test can mint an id whose shard bits deliberately disagree with the shard
+/// the row physically lives on.
+async fn insert_execution_with_id(
+    conn: &mut AsyncPgConnection,
+    workflow_name: &str,
+    workflow_id: &str,
+    exec_id: ExecutionId,
+    resident_shard: ShardId,
+) -> ExecutionId {
     use autumn_harvest::schema::harvest_workflow_executions;
-    let exec_id = ExecutionId::new_for_shard(SOURCE);
     let row = NewWorkflowExecution {
         quota_key: None,
         continued_from_exec_id: None,
@@ -209,7 +228,7 @@ async fn insert_execution(
         workflow_name,
         workflow_id,
         run_id: Uuid::new_v4(),
-        shard_id: SOURCE.as_i32(),
+        shard_id: resident_shard.as_i32(),
         input: json!({"seed": 1}),
         parent_id: None,
         queue_name: "default",
@@ -2274,5 +2293,63 @@ async fn cancelling_a_sealed_source_is_left_pending_not_reported_delivered() {
     assert_eq!(
         state_of(&mut target, exec_id).await.as_deref(),
         Some("RUNNING")
+    );
+}
+
+/// A single-pool deployment must still reach its own executions, whatever the
+/// shard bits in their ids say.
+///
+/// `ShardedDbPool::single` -- the shape of every pre-sharding deployment, and of
+/// the plugin's own test harness -- registers exactly one pool, at `ShardId(0)`.
+/// An `ExecutionId` minted while a different shard was configured (or by any
+/// caller that encodes one) then names a shard for which `exact_pool_for`
+/// returns `None`. Resolving the run's own residence through the exact lookup
+/// therefore answered `ShardUnavailable` for a row sitting in the only database
+/// there is, and the erase path surfaced that as a 503 -- including for an
+/// execution under a legal hold, which must answer 409 and never a transport
+/// error that invites a retry.
+///
+/// The live residence resolves through `pool_for`'s default fallback instead,
+/// which is how every other read path in the engine reaches a run's database.
+/// Safe because the lookup is keyed by execution id: a fallback landing on the
+/// wrong database finds no row, never another run's data. Prior residences keep
+/// the exact form and are covered by the retired/unreachable tests above.
+#[tokio::test]
+async fn single_pool_resolves_an_execution_whose_id_encodes_another_shard() {
+    let (url, _guard) = setup_isolated_db().await;
+    let pool = ShardedDbPool::single(build_pool(&url));
+
+    // The only pool is at ShardId(0); this id says it belongs to shard 7.
+    let foreign = ShardId::new(7);
+    let exec_id = {
+        let mut conn = <AsyncPgConnection as AsyncConnection>::establish(&url)
+            .await
+            .expect("connect");
+        insert_execution_with_id(
+            &mut conn,
+            "entity",
+            "single-pool-foreign-id",
+            ExecutionId::new_for_shard(foreign),
+            SOURCE,
+        )
+        .await
+    };
+
+    let live = resolve_execution_shard(&pool, exec_id)
+        .await
+        .expect("a single-pool deployment must resolve its own execution");
+    assert_eq!(
+        live, foreign,
+        "the id still names shard 7; it is the POOL lookup that falls back, \
+         so the resolved residence is reported as the id's own shard"
+    );
+
+    let chain = residence_chain(&pool, exec_id)
+        .await
+        .expect("residence chain must not report the only database unavailable");
+    assert_eq!(
+        chain,
+        vec![foreign],
+        "a run that never migrated has a one-shard residence chain"
     );
 }

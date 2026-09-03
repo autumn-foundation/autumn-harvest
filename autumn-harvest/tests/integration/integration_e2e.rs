@@ -245,7 +245,29 @@ const INIT_SQL: &str = concat!(
     // issue #946: quota_key column on harvest_workflow_executions, referenced
     // by every WorkflowExecution::as_select() read-back in this suite (and in
     // every suite that borrows `setup_test_database_url_or_env` from here).
-    include_str!("../../migrations/20260725000000_harvest_workflow_quotas/up.sql")
+    include_str!("../../migrations/20260725000000_harvest_workflow_quotas/up.sql"),
+    "\n",
+    // Dependency of the shard-rebalancing migration below, which adds a column
+    // to `harvest_execution_summaries`. INIT_SQL is deliberately partial, so
+    // this table was never part of it before; without this line the rebalancing
+    // migration aborts mid-bundle with `relation "harvest_execution_summaries"
+    // does not exist`, leaving the execution columns added but
+    // `harvest_shard_migrations` never created.
+    include_str!("../../migrations/20260710000001_harvest_execution_summaries/up.sql"),
+    "\n",
+    // issue #964: migrated_to_shard/migrated_at/migrated_from_shards columns on
+    // harvest_workflow_executions, plus migrated_from_shards on
+    // harvest_execution_summaries. REQUIRED for the same reason as the quota
+    // migration above -- `WorkflowExecution::as_select()` names every column, so
+    // every read-back in this suite (and in every suite that borrows
+    // `setup_test_database_url_or_env` from here) fails with
+    // `column harvest_workflow_executions.migrated_to_shard does not exist`,
+    // including plain root starts that have nothing to do with rebalancing.
+    //
+    // This suite runs against a testcontainer built from INIT_SQL, NOT against
+    // a migrated database, so a local run with HARVEST_TEST_DATABASE_URL set
+    // cannot catch the omission -- that path skips INIT_SQL entirely.
+    include_str!("../../migrations/20260902131705_harvest_shard_rebalancing/up.sql")
 );
 
 /// The minimal "legacy" migration set used by the upgrade-path regression
