@@ -37,7 +37,7 @@ current for the audited revision, not as prose.
 | Is harvest's determinism core backend-portable? | **Yes, already.** It consumes plain values (`ExecutionId`, `Vec<WorkflowEvent>`, a handler `fn`, JSON) — no connection, no trait object. |
 | Is harvest's *coordination* layer backend-portable? | **No.** Multi-worker claim, push notification, and cross-connection locking are the three load-bearing Postgres features, and SQLite substitutes them only by dropping capability. |
 | Did the prototype work? | **Yes — 4/4 durability scenarios**, plus cross-backend replay. Now productized. |
-| Should core grow a `StorageBackend` trait? | **No.** Buildable, but costed below at a scale the benefit does not justify — 23 of 52 coupled modules are portable only by dropping a capability or reimplementing wholesale, for a use case that does not share the Postgres concurrency model. |
+| Should core grow a `StorageBackend` trait? | **No.** Buildable, but costed below at a scale the benefit does not justify — 24 of 53 coupled modules are portable only by dropping a capability or reimplementing wholesale, for a use case that does not share the Postgres concurrency model. |
 | What shipped instead? | `autumn-harvest-sqlite` — reuses the determinism core wholesale, reimplements persistence only. |
 
 The one-sentence version: **the valuable half of harvest is already portable
@@ -54,7 +54,7 @@ module counts at the audited revision, recomputed by CI:
 
 | Mechanism | Reach | Portable? |
 |---|---|---|
-| `diesel` query layer | 52 modules | Query construction is mechanical; the *type* layer is not. |
+| `diesel` query layer | 53 modules | Query construction is mechanical; the *type* layer is not. |
 | `skip-locked` claim (`FOR UPDATE SKIP LOCKED`) | 15 modules | Only by dropping multi-worker concurrency. |
 | `row-lock` blocking row lock (Diesel `.for_update()`) | 17 modules | Subsumed by the single write lock. |
 | `interval-sql` (`INTERVAL '…'`, `make_interval()`) | 13 modules | Yes — integer epoch milliseconds. |
@@ -70,7 +70,7 @@ Plus **95 migrations** written in Postgres DDL (`JSONB`, `TIMESTAMPTZ`,
 which apply to SQLite. The SQLite crate does not translate them; it declares
 its own schema.
 
-**52 of the 107 core modules** exhibit at least one mechanism — a shade under
+**53 of the 108 core modules** exhibit at least one mechanism — a shade under
 half. That ratio is the headline finding, and it cuts *both* ways: the
 determinism core really is clean, and the persistence layer really is
 saturated.
@@ -107,7 +107,7 @@ have grown past that round's 18 as new Postgres-only syntax lands; each module
 the open rule newly catches has so far already been (b) or (c). The counts move;
 the classifications do not.
 
-That 37 of the 52 coupled modules hand-write SQL is therefore the more
+That 37 of the 53 coupled modules hand-write SQL is therefore the more
 decision-relevant number than any dialect tally. It is the volume of query text
 a second backend must re-author by hand, and it is knowable exactly.
 
@@ -178,6 +178,7 @@ Classification rule:
 | `error` | diesel, skip-locked | (c) | **Comment-only consumer, like `concurrency` above and `store` below.** `SuspendedClaimAmbiguous` (issue #1182) represents the ambiguity a `SKIP LOCKED` claim probe can produce; a single-writer engine has no such ambiguity to represent, so the variant itself would not exist there. |
 | `event_batch` | diesel, skip-locked, to_regclass, raw-pg-sql, raw-sql | (c) | Scanner claim. |
 | `execution` | diesel, skip-locked, row-lock, interval-sql, raw-pg-sql, raw-sql | (c) | Start/reuse matrix under `FOR UPDATE`; row-lock ordering is load-bearing. |
+| `external_target_location` | diesel | (c) | Placement-aware resolution for `workflow_id`-addressed signal/cancel (#1146). Like `cross_shard_child` above, the coupling is **architectural, not syntactic**: the module exists *because* there is more than one database. It answers "which shard holds this business key?" by fanning a read across every expected shard and merging the per-shard answers. A single-file SQLite deployment has exactly one shard, so the fan-out has nothing to do — the engine's own single-shard short-circuit already skips it — and the whole module would be dropped, leaving the shard-local resolver it delegates to (`execution::resolve_execution_id_by_workflow_id`) as the entire answer. Its lone mechanism is the `AsyncPgConnection` in its signatures. |
 | `external_task` | diesel, row-lock | (b) | `find_by_token_locked` serialises completion/failure; subsumed. |
 | `handle` | diesel | (a) | Read paths. |
 | `heartbeat` | diesel | (a) | Batched last-write-wins update. |
@@ -211,7 +212,7 @@ Classification rule:
 | `worker` | diesel, skip-locked, row-lock, advisory-lock, listen/notify, raw-pg-sql, raw-sql | (c) | The dispatch loop; wakeups and persistence are interleaved. |
 | `workers` | diesel, interval-sql, raw-pg-sql, raw-sql | (b) | Fleet registry rows, but the sticky-lease filter embeds `NOW()` and the capability-miss fleet lookup adds an `INTERVAL` liveness window plus a `queues @> to_jsonb($2::text)` containment test. SQLite: `CURRENT_TIMESTAMP`/epoch ms; JSON1 `EXISTS (SELECT 1 FROM json_each(queues) …)` for the containment. |
 
-**Totals: (a) 6 · (b) 23 · (c) 23.**
+**Totals: (a) 6 · (b) 23 · (c) 24.**
 
 The shape matters more than the totals. The (a) column is genuinely
 mechanical CRUD. The (b) column is dominated by **pessimistic row locking**:
@@ -316,7 +317,7 @@ absence of demand for what it would buy.
 
 | Component | Scope |
 |---|---|
-| Trait definition + Postgres impl | ~52 modules touched |
+| Trait definition + Postgres impl | ~53 modules touched |
 | Rewriting scanners against the trait | ~13 modules, each with a concurrency contract to re-specify |
 | Type-layer abstraction | `models.rs` + `schema.rs` wholesale |
 | Test matrix | Every DB-gated suite runs twice, with per-backend expectations where semantics diverge |
@@ -359,7 +360,7 @@ shape*. The structural fix is to stop resting a recommendation on one limb. It
 rests instead on the audit's measurements, none of which any review round has
 disputed:
 
-- **23 modules are class (c)** — portable only by dropping a capability or
+- **24 modules are class (c)** — portable only by dropping a capability or
   reimplementing wholesale — against 6 that are trivially trait-able.
 - **37 modules reach for raw SQL**, so their portability cannot be read off
   their Diesel usage at all.
@@ -367,7 +368,7 @@ disputed:
   side (*Known capability losses*, below), so the second backend is not the same
   product with a different file on disk.
 - The companion crate delivered that capability at **structurally zero cost** to
-  the Postgres path, against a seam sized above at ~52 modules touched.
+  the Postgres path, against a seam sized above at ~53 modules touched.
 
 Each subsection below is a cost, weighed against that. None is offered as a
 proof that the trait is impossible; the previous section establishes that it is

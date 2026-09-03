@@ -9,6 +9,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
+use autumn_harvest::types::ShardId;
 use autumn_harvest::worker::DbPool;
 use autumn_harvest::workers::WorkerRow;
 use chrono::{DateTime, Utc};
@@ -94,16 +95,23 @@ pub fn expected_shards(
     api_state: &HarvestApiState,
     pools: &BTreeMap<i32, DbPool>,
 ) -> BTreeSet<i32> {
-    let mut shards: BTreeSet<i32> = pools.keys().copied().collect();
-    if let Ok(runtime) = api_state.runtime() {
+    // Delegates to the canonical core rule (issue #1146). The engine's own
+    // by-business-key resolution
+    // (`external_target_location::resolve_location_by_workflow_id`) fans out
+    // over exactly this set, and a management-API read that inspected a
+    // different set of shards than the engine would answer differently about
+    // the same key. Keeping one definition removes that drift by construction,
+    // the way `select_resolved_run` already does for the ranking.
+    let pool_shards: Vec<ShardId> = pools.keys().copied().map(ShardId::new).collect();
+    let runtime = api_state.runtime().ok();
+    let router_parts = runtime.as_ref().map(|runtime| {
         let router = runtime.router();
-        shards.extend(router.readable_shards().iter().map(|s| s.as_i32()));
-        shards.insert(router.default_shard().as_i32());
-    }
-    if shards.is_empty() {
-        shards.insert(0);
-    }
-    shards
+        (router.readable_shards(), router.default_shard())
+    });
+    autumn_harvest::external_target_location::fanout_shards_from_parts(&pool_shards, router_parts)
+        .into_iter()
+        .map(ShardId::as_i32)
+        .collect()
 }
 
 /// Seconds elapsed from `started_at` to `observed_at`, clamped to zero.
