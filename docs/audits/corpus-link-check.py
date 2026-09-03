@@ -85,11 +85,19 @@ PROCESS_ARTIFACT_PREFIXES = (
 # to — is never examined (found in review: README.md's `#license` badge
 # link would go unchecked).
 _LABEL = r"(?:[^\[\]]|\[[^\[\]]*\])*"
-LINK_RE = re.compile(rf"\[{_LABEL}\]\(([^)\s]+)(?:\s+\"[^\"]*\")?\)")
+# CommonMark's optional link/image title accepts three delimiter forms —
+# "double", 'single', or (parenthesized) — not just double quotes. A
+# double-quote-only pattern fails to match the WHOLE link on a single- or
+# paren-quoted title (the destination capture needs the trailing `)` right
+# after it, which isn't there), so a link written `[x](missing.md 'title')`
+# would be entirely invisible to this checker — silently exempt from ever
+# being reported broken. Same three-form set REF_DEF_RE already used below.
+_TITLE = r'(?:"[^"]*"|\'[^\']*\'|\([^)]*\))'
+LINK_RE = re.compile(rf"\[{_LABEL}\]\(([^)\s]+)(?:\s+{_TITLE})?\)")
 # Bare image `![alt](src)`, checked independently so a *local* image's `src`
 # still gets a missing-file check even when the image is ALSO wrapped in an
 # outer link (and so consumed into LINK_RE's label, per above).
-IMAGE_RE = re.compile(r"!\[[^\]]*\]\(([^)\s]+)(?:\s+\"[^\"]*\")?\)")
+IMAGE_RE = re.compile(rf"!\[[^\]]*\]\(([^)\s]+)(?:\s+{_TITLE})?\)")
 # Reference-style: `[text][ref]` / collapsed `[text][]` (ref == text).
 REF_USE_RE = re.compile(r"\[([^\]]*)\]\[([^\]]*)\]")
 # Bare shortcut reference `[ref]` — only counts if `ref` matches a real
