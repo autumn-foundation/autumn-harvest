@@ -17066,6 +17066,18 @@ struct PendingWorkflowMetrics {
     history_size: Option<u64>,
     is_continued_as_new: bool,
     terminal: TerminalMetricsKind,
+    /// `harvest.workflow.duration`'s value, measured here rather than at
+    /// emission time (Codex review round 4, P2): `record_workflow_completed`
+    /// documents this as HANDLER runtime, so it must stop the clock the
+    /// moment the decision cycle itself finished, not after the emitter's
+    /// post-commit housekeeping (deferred schedule counters, unfinished-
+    /// handler checks, history-bloat reads/retries) has also run -- those are
+    /// unrelated DB latency this metric must not absorb.
+    duration_secs: f64,
+    /// `harvest.canary.roundtrip`'s value (start-requested → completed
+    /// wall-clock, AC5) for the SAME reason as `duration_secs`: `Some` only
+    /// for a canary's `Completed` outcome, `None` otherwise (unused).
+    canary_roundtrip_secs: Option<f64>,
 }
 
 /// Which terminal (or non-terminal) shape this cycle's outcome had, for
@@ -17099,14 +17111,13 @@ fn emit_pending_workflow_metrics(
     execution: &WorkflowExecution,
     queue_name: &str,
     build_id: &str,
-    started_at: std::time::Instant,
     pending: &PendingWorkflowMetrics,
 ) {
     if !pending.is_canary {
         telemetry.metrics.record_workflow_completed(
             &execution.workflow_name,
             queue_name,
-            started_at.elapsed().as_secs_f64(),
+            pending.duration_secs,
             pending.status,
         );
         if let Some(history_size) = pending.history_size {
@@ -17132,20 +17143,13 @@ fn emit_pending_workflow_metrics(
     match &pending.terminal {
         TerminalMetricsKind::Completed => {
             if pending.is_canary {
-                // Round-trip = start-requested → completed wall-clock (AC5).
-                // Clamp a clock-skew negative delta to 0 (`.to_std()` errs on
-                // a negative chrono duration), mirroring the update-duration
-                // clamping precedent.
-                let roundtrip_secs = (chrono::Utc::now() - execution.started_at)
-                    .to_std()
-                    .map_or(0.0, |delta| delta.as_secs_f64());
                 telemetry
                     .metrics
                     .record_canary_success(queue_name, pending.canary_shard);
                 telemetry.metrics.record_canary_roundtrip(
                     queue_name,
                     pending.canary_shard,
-                    roundtrip_secs,
+                    pending.canary_roundtrip_secs.unwrap_or(0.0),
                 );
             } else {
                 crate::telemetry::emit_workflow_terminal(
@@ -19623,6 +19627,29 @@ async fn process_workflow_task(
         WorkflowOutcome::ContinuedAsNew { .. } => TerminalMetricsKind::ContinuedAsNew,
         WorkflowOutcome::Suspended { .. } => TerminalMetricsKind::Suspended,
     };
+    // Issue #1184 (Codex review round 4, P2): stop these clocks HERE, at the
+    // moment the decision cycle itself finished -- not at emission time in
+    // the `Persisted` arm below, which runs only after the persist
+    // transaction plus its own post-commit housekeeping (deferred schedule
+    // counters, unfinished-handler checks, history-bloat reads/retries).
+    // Both metrics document themselves as handler/decision-cycle timing, so
+    // absorbing that unrelated later latency would inflate them and distort
+    // executor-latency SLOs.
+    let duration_secs = started_at.elapsed().as_secs_f64();
+    let canary_roundtrip_secs = if is_canary && matches!(&outcome, WorkflowOutcome::Completed { .. })
+    {
+        // Round-trip = start-requested → completed wall-clock (AC5). Clamp a
+        // clock-skew negative delta to 0 (`.to_std()` errs on a negative
+        // chrono duration), mirroring the update-duration clamping
+        // precedent.
+        Some(
+            (chrono::Utc::now() - prepared.execution.started_at)
+                .to_std()
+                .map_or(0.0, |delta| delta.as_secs_f64()),
+        )
+    } else {
+        None
+    };
     let pending_workflow_metrics = PendingWorkflowMetrics {
         status,
         is_canary,
@@ -19630,6 +19657,8 @@ async fn process_workflow_task(
         history_size,
         is_continued_as_new,
         terminal: terminal_metrics_kind,
+        duration_secs,
+        canary_roundtrip_secs,
     };
 
     // Issue #603 fix: if this execution was previously ND-blocked, this cycle
@@ -19994,7 +20023,6 @@ async fn process_workflow_task(
                 &prepared.execution,
                 &task.queue_name,
                 build_id,
-                started_at,
                 &pending_workflow_metrics,
             );
         }
