@@ -34,7 +34,7 @@ use autumn_harvest::store;
 
 use chrono::Utc;
 use diesel::prelude::*;
-use diesel_async::{AsyncConnection, AsyncPgConnection, RunQueryDsl};
+use diesel_async::{AsyncConnection, AsyncPgConnection, RunQueryDsl, SimpleAsyncConnection};
 use testcontainers::ContainerAsync;
 use testcontainers::ImageExt;
 use testcontainers_modules::postgres::Postgres;
@@ -355,9 +355,16 @@ async fn persist_child_workflow_completion_makes_no_terminal_decision_when_the_c
     let (exec_id, task) = seed_claimed_task(&url, "q1184-child-completion", "dispatcher-a").await;
     steal_claim(&url, task.id).await;
 
-    // The guard runs before the parent is ever touched, so an unregistered
-    // placeholder parent id is fine -- it must never be reached.
-    let parent_exec_id = ExecutionId::new();
+    // A REAL parent execution, not a dangling placeholder id: if the guard
+    // were absent, this write would otherwise proceed far enough to reach
+    // `wake_parent_for_child_completion`, whose own unrelated `NotFound` on a
+    // nonexistent parent would roll the transaction back for the wrong
+    // reason and mask the guard's absence (Codex-equivalent self-review
+    // finding). A real parent lets an unguarded write actually succeed
+    // end-to-end, so `.expect_err(...)` genuinely depends on the guard.
+    let mut seed_conn = connect(&url).await;
+    let parent_exec_id =
+        seed_execution(&mut seed_conn, "issue1184_parent_wf", serde_json::json!({})).await;
 
     let mut conn = connect(&url).await;
     let result = persist_child_workflow_completion(
@@ -401,7 +408,12 @@ async fn persist_child_workflow_failure_makes_no_terminal_decision_when_the_clai
     let (exec_id, task) = seed_claimed_task(&url, "q1184-child-failure", "dispatcher-a").await;
     steal_claim(&url, task.id).await;
 
-    let parent_exec_id = ExecutionId::new();
+    // See the identical comment in the completion test above: a real parent
+    // execution, not a dangling placeholder, so an unguarded write would
+    // actually succeed end-to-end instead of failing for an unrelated reason.
+    let mut seed_conn = connect(&url).await;
+    let parent_exec_id =
+        seed_execution(&mut seed_conn, "issue1184_parent_wf", serde_json::json!({})).await;
 
     let mut conn = connect(&url).await;
     let result = persist_child_workflow_failure(
@@ -626,4 +638,140 @@ async fn persist_workflow_continue_as_new_makes_no_terminal_decision_when_the_cl
         "a dispatcher that lost the claim must append no terminal event; got {history:?}"
     );
     assert_thief_untouched(&url, exec_id, task.id, "RUNNING", "RUNNING").await;
+}
+
+// ---------------------------------------------------------------------------
+// SKIP LOCKED false-positive recovery -- the sibling of #1182's
+// `a_dispatcher_that_still_owns_the_claim_is_released_when_skip_locked_is_a_false_positive`.
+// `claim_still_held_for_update`'s `SKIP LOCKED` guard never blocks, so a
+// claim that merely lost a race against an unrelated, transient lock holder
+// (not a genuine transfer) reads identically to a real loss. The standalone
+// release this drives into (`queue::release_terminal_workflow_claim`, wired
+// through `handle_ambiguous_terminal_write_claim` in production) is a plain
+// blocking UPDATE specifically so it waits out that contention and recovers
+// the task instead of stranding it -- proven here the same way the #1182
+// sibling proves it for `release_suspended_workflow_claim`.
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn a_dispatcher_that_still_owns_the_claim_is_released_when_skip_locked_is_a_false_positive_1184()
+ {
+    let (url, _container) = setup_db().await;
+    let (exec_id, task) = seed_claimed_task(&url, "q1184-lock-contention", "dispatcher-a").await;
+
+    // Stand in for a concurrent, unrelated transaction that happens to hold
+    // this exact row's lock for a moment -- without touching `worker_id` or
+    // `crash_strikes`, so ownership never actually changes hands.
+    let mut conn_lock = connect(&url).await;
+    conn_lock
+        .batch_execute("BEGIN")
+        .await
+        .expect("begin should succeed");
+    diesel::sql_query("UPDATE harvest_task_queue SET wake_requested = TRUE WHERE id = $1")
+        .bind::<diesel::sql_types::Uuid, _>(task.id)
+        .execute(&mut conn_lock)
+        .await
+        .expect("hold the row's lock without changing ownership");
+
+    // The guarded write's SKIP LOCKED probe will read the row as contended
+    // (by `conn_lock`, above), not transferred. The standalone release
+    // blocks on the held lock rather than skipping it, so this must run
+    // concurrently with the lock hold.
+    let dispatch_handle = tokio::spawn({
+        let url = url.clone();
+        let task = task.clone();
+        async move {
+            let mut conn = connect(&url).await;
+
+            let probe_started = std::time::Instant::now();
+            let ambiguous_task_id = persist_workflow_failure(
+                &mut conn,
+                task.id,
+                exec_id,
+                1,
+                "dispatcher-a",
+                task.crash_strikes,
+                "boom",
+                None,
+                None,
+                None,
+                None,
+                None,
+                autumn_harvest::types::Priority::default(),
+                &autumn_harvest::payload_codec::PayloadCodecs::default(),
+            )
+            .await
+            .expect_err("SKIP LOCKED never waits, so the row reads as contended immediately")
+            .terminal_write_claim_ambiguous()
+            .expect("must be the ambiguous-claim sentinel");
+            let probe_elapsed = probe_started.elapsed();
+
+            // The standalone release, exactly as `process_task` performs it
+            // (via `handle_ambiguous_terminal_write_claim`) after the
+            // enclosing transaction has already rolled back -- this is the
+            // call that actually blocks on `conn_lock`'s held lock, never
+            // the probe above.
+            let released = queue::release_terminal_workflow_claim(
+                &mut conn,
+                ambiguous_task_id,
+                "dispatcher-a",
+                task.crash_strikes,
+            )
+            .await?;
+            Ok::<_, autumn_harvest::HarvestError>((probe_elapsed, released))
+        }
+    });
+
+    // Give the spawned probe time to run and reach the blocking release
+    // before the lock is released.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    conn_lock
+        .batch_execute("COMMIT")
+        .await
+        .expect("release the held row lock");
+
+    let (probe_elapsed, released) = dispatch_handle
+        .await
+        .expect("the dispatch task must not panic")
+        .expect("the guarded write and its release fallback must not error");
+    assert!(
+        probe_elapsed < Duration::from_millis(250),
+        "the ambiguity probe must never wait on the row's lock -- it took \
+         {probe_elapsed:?}, but the lock was held for 300ms before this test even \
+         released it, so a probe that blocked would exceed that bound"
+    );
+    assert!(
+        released,
+        "a claim that was never actually lost must be released"
+    );
+
+    // No terminal decision was made -- the run is untouched.
+    let history = load_history(&url, exec_id).await;
+    assert!(
+        !history
+            .iter()
+            .any(|e| matches!(e, WorkflowEvent::WorkflowFailed { .. })),
+        "a false-positive ClaimLost must never terminally fail the run; got {history:?}"
+    );
+    let execution = load_execution(&url, exec_id).await;
+    assert_eq!(execution.state, "RUNNING");
+
+    // The task was released back to the pool for a fresh dispatch attempt --
+    // this is the part an incomplete fix (log-and-return on the ambiguous
+    // sentinel) would fail: the row would still show `state = "RUNNING"`,
+    // `worker_id = Some("dispatcher-a")`, forever.
+    let reloaded = load_tasks(&url, exec_id)
+        .await
+        .into_iter()
+        .next()
+        .expect("the task row survives an undecided dispatch");
+    assert_eq!(
+        reloaded.state, "PENDING",
+        "a claim that was never actually lost must be released, not stranded RUNNING"
+    );
+    assert_eq!(
+        reloaded.worker_id, None,
+        "the release must clear ownership so any capable worker can re-claim it"
+    );
 }
