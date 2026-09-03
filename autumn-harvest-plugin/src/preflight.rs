@@ -1733,7 +1733,10 @@ mod tests {
         open.set_deployment_profile("dev");
         let result = check_admin_auth_boundary(&open);
         assert_eq!(result.status, PreflightStatus::Pass);
-        assert_eq!(result.details["unauthenticated_access"], serde_json::json!(true));
+        assert_eq!(
+            result.details["unauthenticated_access"],
+            serde_json::json!(true)
+        );
         assert!(
             result.summary.contains("reachable unauthenticated"),
             "summary must name the posture, got: {}",

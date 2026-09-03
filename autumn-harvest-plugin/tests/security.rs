@@ -1995,11 +1995,7 @@ async fn hermes_non_dev_profile_rejects_unauthenticated_admin_route() {
     api_state.set_deployment_profile("prod");
     let app = app_with_api_state(api_state);
 
-    let res = app
-        .clone()
-        .oneshot(get("/admin/preflight"))
-        .await
-        .unwrap();
+    let res = app.clone().oneshot(get("/admin/preflight")).await.unwrap();
     assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
 
     let res = app
@@ -2031,10 +2027,7 @@ async fn hermes_declared_auth_boundary_still_short_circuits_in_dev() {
     api_state.set_admin_auth_boundary(true);
     let app = app_with_api_state(api_state);
 
-    let res = app
-        .oneshot(get("/admin/preflight"))
-        .await
-        .unwrap();
+    let res = app.oneshot(get("/admin/preflight")).await.unwrap();
     assert_ne!(res.status(), StatusCode::UNAUTHORIZED);
     assert_ne!(res.status(), StatusCode::FORBIDDEN);
 }

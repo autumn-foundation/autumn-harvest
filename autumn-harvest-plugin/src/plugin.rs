@@ -2901,7 +2901,15 @@ mod tests {
             !dev_admin_api_is_open("dev", true),
             "a declared boundary closes the dev profile"
         );
-        for profile in ["prod", "staging", "test", "unknown", "", "development", "DEV"] {
+        for profile in [
+            "prod",
+            "staging",
+            "test",
+            "unknown",
+            "",
+            "development",
+            "DEV",
+        ] {
             assert!(
                 !dev_admin_api_is_open(profile, false),
                 "profile {profile:?} is not `dev` and stays fail-closed"

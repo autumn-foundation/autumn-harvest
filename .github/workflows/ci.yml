@@ -590,7 +590,46 @@ jobs:
             echo "::error::quickstart app never became healthy"; exit 1
           fi
 
-          # 2. Trigger the `greeting` workflow (README step 4) and capture its execution_id.
+          # 2. README step 3 — run preflight with the EXACT documented command.
+          #
+          # Issue #1284: this step is the whole reason the job cannot stop at
+          # "the app boots". The documented command is a bare cookieless HTTP
+          # call, and it answered 401 for everyone until the dev profile was
+          # taught to admit an unauthenticated caller. The unit tests in
+          # `security.rs` pin the gate; only this step pins it against a REAL
+          # autumn-web app, whose unconditional session layer inserts an empty
+          # non-cookie-backed `Session` before the harvest router ever sees the
+          # request — the shape that made the bug survive a plausible fix.
+          #
+          # Assert the raw status first so a regression reads as "401 came
+          # back", not as an opaque CLI exit code.
+          code="$(curl -s -o /dev/null -w '%{http_code}' \
+            http://localhost:3000/api/harvest/admin/preflight)"
+          echo "GET /admin/preflight -> ${code}"
+          if [ "${code}" = "401" ] || [ "${code}" = "403" ]; then
+            echo "::error::regression of issue #1284: the documented dev-profile preflight call is gated (${code}); AUTUMN_PROFILE=dev must serve the management API to an unauthenticated caller"
+            exit 1
+          fi
+          if [ "${code}" != "200" ]; then
+            echo "::error::preflight returned ${code}, expected 200"; exit 1
+          fi
+
+          # Then the documented command itself. Exit codes are deploy-gate
+          # friendly: 0 = pass, 2 = warn, 1 = fail or a transport/API error.
+          # Both 0 and 2 are accepted (a single-worker CI app can legitimately
+          # warn); 1 is not, and is what a re-gated route would produce.
+          # `set -e` is deliberately NOT used here (this script runs under
+          # `set -uo pipefail` only), so `$?` is read directly.
+          cargo run -p autumn-harvest-cli -- \
+            --base-url http://localhost:3000/api/harvest preflight
+          preflight_exit=$?
+          echo "harvest preflight exit=${preflight_exit}"
+          if [ "${preflight_exit}" != "0" ] && [ "${preflight_exit}" != "2" ]; then
+            echo "::error::harvest preflight exited ${preflight_exit}; README step 3 must pass (0) or warn (2), never fail"
+            exit 1
+          fi
+
+          # 3. Trigger the `greeting` workflow (README step 4) and capture its execution_id.
           resp="$(curl -sf -X POST \
             http://localhost:3000/api/harvest/workflows/greeting/start \
             -H 'Content-Type: application/json' \
@@ -602,7 +641,7 @@ jobs:
             echo "::error::no execution_id in start response"; exit 1
           fi
 
-          # 3. Poll until COMPLETED. The workflow has a 30s durable timer between
+          # 4. Poll until COMPLETED. The workflow has a 30s durable timer between
           # its two activities, so this needs headroom well past 30s.
           for i in $(seq 1 90); do
             state="$(curl -s "http://localhost:3000/api/harvest/workflows/${eid}" \
