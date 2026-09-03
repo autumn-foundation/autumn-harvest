@@ -19,7 +19,12 @@ set -uo pipefail
 
 cd "$(dirname "${BASH_SOURCE[0]}")/.."
 
-violations="$(cargo metadata --no-deps --format-version=1 2>/dev/null | python3 -c '
+# `pipefail` alone doesn't abort the script on a failed pipeline inside a
+# command substitution — it only sets $?, which nothing would check without
+# this explicit `if !`. Without it, a `cargo metadata` or parser failure
+# left `violations` empty and this script printed "OK" over a workspace it
+# never actually inspected.
+if ! violations="$(cargo metadata --no-deps --format-version=1 2>/dev/null | python3 -c '
 import json, sys
 
 data = json.load(sys.stdin)
@@ -31,7 +36,10 @@ for pkg in data["packages"]:
 
 for name, bins in bad:
     print(f"{name}: bins={bins}")
-')"
+')"; then
+  echo "check-default-run.sh: failed to inspect the workspace (cargo metadata or the parser errored) — failing closed instead of reporting a false OK." >&2
+  exit 1
+fi
 
 if [ -n "$violations" ]; then
   echo "The following packages define multiple [[bin]] targets with no default-run," >&2
