@@ -510,6 +510,37 @@ fn classify_locates_the_query_string_after_the_userinfo_as_the_client_does() {
 }
 
 #[test]
+fn redaction_survives_leading_whitespace_before_the_scheme() {
+    // Codex round 2 (P1). `is_uri_dsn` ignores leading whitespace for the
+    // *decision*, so `redact_dsn` takes the URI branch — and the query locator
+    // has to ignore it the same way or it finds no scheme, reports no query,
+    // and hands back a DSN whose password was never looked at. The gate allows
+    // this DSN (it trims before classifying, then sees loopback), so the banner
+    // really does render it.
+    for dsn in [
+        "  postgres://u@localhost/db?password=hunter2",
+        "\tpostgresql://u@localhost/db?password=hunter2",
+        "\n postgres://u@localhost/db?sslmode=disable&password=hunter2",
+    ] {
+        assert!(
+            matches!(classify_database_url(dsn), DatabaseSafety::Allowed),
+            "precondition: the gate must allow {dsn:?} for the banner to render it"
+        );
+        let redacted = redact_dsn(dsn);
+        assert!(
+            !redacted.contains("hunter2"),
+            "leading whitespace must not hide the query string: {dsn:?} -> {redacted:?}"
+        );
+    }
+    // The whitespace itself is still preserved — what the developer typed is
+    // what the banner shows.
+    assert_eq!(
+        redact_dsn("  postgres://u@localhost/db?password=hunter2"),
+        "  postgres://u@localhost/db?password=***"
+    );
+}
+
+#[test]
 fn redaction_finds_a_query_password_behind_a_question_mark_in_the_userinfo() {
     // The same locator, in the direction that leaks rather than over-refuses:
     // splitting at the first `?` made `a=1@localhost/db` the whole "query", so

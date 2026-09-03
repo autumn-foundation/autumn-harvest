@@ -99,7 +99,14 @@ direction of the same bug in the banner — `postgres://x?a=1@localhost/db?passw
 printed the credential, because the real `password=` parameter sat behind what
 the old split had already consumed as the whole query.
 
-**Test evidence.** Sixteen new tests in
+`query_start` skips leading whitespace before looking for the scheme, because
+`is_uri_dsn` skips it for the URI/keyword decision — the two have to make the
+same allowance or a space-prefixed DSN goes down the URI branch and is then
+reported as having no query string, which left `HARVEST_DEV_DATABASE_URL="  postgres://u@localhost/db?password=hunter2"`
+printing its password. Offsets stay absolute, so the whitespace reaches the
+banner exactly as it was typed.
+
+**Test evidence.** Seventeen new tests in
 `autumn-harvest-plugin/tests/dev_runtime_tests.rs` (both reproductions from the
 issue, both still-refused cases, `options`/`application_name` values, a URI path
 segment, percent-encoded keys and values, an adversarial-syntax sweep asserting

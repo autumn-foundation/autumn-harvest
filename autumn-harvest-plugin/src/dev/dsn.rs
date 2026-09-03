@@ -234,10 +234,19 @@ pub(super) struct QueryParameter {
 /// `/` or `?`, and a path stops at `?`, so either way the query begins at the
 /// first `?` that follows the credentials.
 pub(super) fn query_start(dsn: &str) -> Option<usize> {
-    let after_scheme = ["postgres://", "postgresql://"]
-        .into_iter()
-        .find(|scheme| dsn.starts_with(scheme))?
-        .len();
+    // Leading whitespace is skipped for locating the scheme and nothing else —
+    // the same allowance [`is_uri_dsn`] makes, and it has to be the same one.
+    // `is_uri_dsn` sends a space-prefixed DSN down the URI branch, so a locator
+    // that then finds no scheme reports "no query string" and hands the banner
+    // back a DSN whose password was never looked at. Offsets stay absolute, so
+    // a splice still lands on the right bytes and the whitespace survives into
+    // the banner exactly as the developer typed it.
+    let scheme_at = dsn.len() - dsn.trim_start().len();
+    let after_scheme = scheme_at
+        + ["postgres://", "postgresql://"]
+            .into_iter()
+            .find(|scheme| dsn[scheme_at..].starts_with(scheme))?
+            .len();
     // Credentials run to the first `@` anywhere in the rest — or there are
     // none, and the walk starts at the authority.
     let after_credentials = dsn[after_scheme..]
@@ -560,6 +569,12 @@ mod tests {
             ("postgresql://u@localhost/db?a=2", Some("a=2")),
             // Not a URI at all: no scheme, so no query to find.
             ("host=localhost dbname=db?a=2", None),
+            // Leading whitespace is skipped for the scheme, exactly as
+            // `is_uri_dsn` skips it — otherwise the two disagree about whether
+            // this is a URI at all, and the query goes unnoticed.
+            ("  postgres://u@localhost/db?a=2", Some("a=2")),
+            ("\t\npostgresql://u@localhost/db?a=2", Some("a=2")),
+            ("  postgres://u@localhost/db", None),
         ] {
             assert_eq!(
                 query_start(dsn).map(|start| &dsn[start..]),
