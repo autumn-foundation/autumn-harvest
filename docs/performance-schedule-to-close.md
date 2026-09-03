@@ -13,7 +13,7 @@ backlog depths where this environment's measurements reproduced identically
 across three independent capture runs (1,000 and 10,000 rows), populating
 `schedule_to_close_at` adds a small, real, stable buffer cost to the claim
 query -- **+5.7% and +3.6%** respectively -- corroborated by two standalone
-MVCC-bloat scripts (**+4.7%** and **+5.2%**). None of this comes close to the
+MVCC-bloat scripts, one bulk and one per-row (**+5.2%** both). None of this comes close to the
 20% impact floor; no fix is proposed or needed for the row-level cost.
 
 **Two things this page found alongside that are not as clean, and are
@@ -203,18 +203,24 @@ Every `UPDATE` to a claimed row -- including the claim `UPDATE` itself in
 carries the column's value forward, exactly the mechanism
 `docs/performance-capability-labels.md`'s "Write-side cost" section
 documents for `required_capabilities`. Two independent, standalone,
-single-statement-or-single-transaction corroborations (which is what makes
-these two reproduce cleanly where the live 10,001-call drain below does
-not -- neither leaves a ~15-minute window for autovacuum to run partway
-through): artifacts
-`docs/perf-artifacts/schedule-to-close-claim-predicate/claim_update_bloat_corroboration.{sql,txt}`:
+single-transaction corroborations (which is what makes these two reproduce
+cleanly where the live 10,001-call drain below does not -- neither leaves a
+~15-minute window for autovacuum to run partway through, since neither
+commits until the whole simulated drain finishes): artifacts
+`docs/perf-artifacts/schedule-to-close-claim-predicate/claim_update_bloat_corroboration.{sql,txt}`
+and
+`docs/perf-artifacts/schedule-to-close-claim-predicate/claim_update_bloat_loop_corroboration.{sql,txt}`:
 
 | seeding + update shape | no-schedule-to-close heap-page growth | schedule-to-close heap-page growth | extra growth |
 |---|---:|---:|---:|
 | one bulk `UPDATE ... WHERE state = 'PENDING'` (10,000 rows, one statement) | 250 | 263 | +5.2% |
-| 10,000 individual `SELECT ... FOR UPDATE SKIP LOCKED` + `UPDATE` pairs, PL/pgSQL loop (single transaction) | 233 | 244 | +4.7% |
+| 10,000 individual `SELECT ... FOR UPDATE SKIP LOCKED` + `UPDATE` pairs, PL/pgSQL loop (still one transaction end to end) | 250 | 263 | +5.2% |
 
-Both land close to the `EXPLAIN` band above (2.5-6%).
+The two access shapes land on the **identical** result: within a single
+transaction (no commit boundaries in between), whether the 10,000 rows are
+touched by one bulk statement or by 10,000 individual per-row statements
+does not change the heap-page-growth outcome. Both are close to the
+`EXPLAIN` band above (2.5-6%).
 
 The instrumented captures also snapshotted `pg_stat_user_tables` immediately
 before and after the real 10,000-claim headline drain -- a ~15-minute window
@@ -274,8 +280,9 @@ a correctness difference.
   claim-count equivalence between the two states as a correctness check.
 - `docs/perf-artifacts/schedule-to-close-claim-predicate/` -- the committed
   (third-run) `EXPLAIN` captures, `pg_stat_statements` snapshots,
-  heap-growth snapshots, the standalone bulk-UPDATE bloat-corroboration
-  script and its output, and a `fixture-summary.txt`.
+  heap-growth snapshots, the two standalone bloat-corroboration scripts
+  (bulk `UPDATE` and per-row PL/pgSQL loop) and their output, and a
+  `fixture-summary.txt`.
 - `autumn-harvest/scripts/schedule_to_close_claim_perf_repro.sh` -- a
   reproduction script that re-runs the capture test.
 - This doc.
@@ -304,10 +311,11 @@ instability](#the-100k-depth-plan-instability) and [Write-side
 cost](#write-side-cost) above; this is expected, not a reproduction failure.
 The 1,000- and 10,000-row `EXPLAIN` buffer counts should reproduce exactly.
 
-**They do NOT regenerate `claim_update_bloat_corroboration.txt`** -- that
-script is independent of the Rust harness and is never invoked by the repro
-command above. After any schema, index, or storage-layout change to
-`harvest_task_queue`, re-run it explicitly, or the committed corroboration
+**They do NOT regenerate `claim_update_bloat_corroboration.txt` or
+`claim_update_bloat_loop_corroboration.txt`** -- both scripts are
+independent of the Rust harness and neither is invoked by the repro command
+above. After any schema, index, or storage-layout change to
+`harvest_task_queue`, re-run both explicitly, or the committed corroboration
 output will silently go stale even though the primary `EXPLAIN`/
 `pg_stat_statements` captures are fresh:
 
@@ -327,10 +335,14 @@ createdb -h localhost -U postgres harvest_perf_scratch
 export DATABASE_URL=postgres://postgres:postgres@localhost:5432/harvest_perf_scratch
 (cd autumn-harvest && diesel migration run)
 
-# 2. Run the corroboration script against the scratch database only.
+# 2. Run both corroboration scripts against the scratch database only.
 psql "$DATABASE_URL" \
   -f docs/perf-artifacts/schedule-to-close-claim-predicate/claim_update_bloat_corroboration.sql \
   > docs/perf-artifacts/schedule-to-close-claim-predicate/claim_update_bloat_corroboration.txt
+
+psql "$DATABASE_URL" \
+  -f docs/perf-artifacts/schedule-to-close-claim-predicate/claim_update_bloat_loop_corroboration.sql \
+  > docs/perf-artifacts/schedule-to-close-claim-predicate/claim_update_bloat_loop_corroboration.txt
 
 # 3. Tear the scratch database down when done.
 dropdb -h localhost -U postgres harvest_perf_scratch

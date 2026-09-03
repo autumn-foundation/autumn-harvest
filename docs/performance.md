@@ -1168,8 +1168,9 @@ from the benchmark are directly comparable.
     the row level**: a small, real buffer cost (+3.6% to +5.7%, reproduced to
     the exact buffer count across three independent capture runs at the
     1,000- and 10,000-row depths), corroborated by two standalone MVCC-bloat
-    scripts (+4.7%, +5.2%) — nowhere near the 20% impact floor. No fix is
-    proposed or needed for that row-level cost. Two things did **not**
+    scripts, one bulk and one per-row (+5.2% both) — nowhere near the 20%
+    impact floor. No fix is proposed or needed for that row-level cost.
+    Two things did **not**
     reproduce cleanly and are reported as open rather than smoothed into one
     number: at the 100,000-row depth the planner chose a markedly more
     expensive plan specifically for the `schedule_to_close_at`-populated

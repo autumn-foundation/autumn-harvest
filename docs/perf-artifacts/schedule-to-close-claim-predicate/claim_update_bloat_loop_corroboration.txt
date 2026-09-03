@@ -1,0 +1,35 @@
+Timing is off.
+TRUNCATE TABLE
+INSERT 0 10000
+VACUUM
+        label        | heap_pages 
+---------------------+------------
+ no-stc-before-drain |        213
+(1 row)
+
+DO
+       label        | heap_pages 
+--------------------+------------
+ no-stc-after-drain |        463
+(1 row)
+
+TRUNCATE TABLE
+INSERT 0 10000
+VACUUM
+      label       | heap_pages 
+------------------+------------
+ stc-before-drain |        223
+(1 row)
+
+DO
+      label      | heap_pages 
+-----------------+------------
+ stc-after-drain |        486
+(1 row)
+
+ no_stc_delta_pages | stc_delta_pages | extra_pages | extra_pct_more_growth_from_schedule_to_close 
+--------------------+-----------------+-------------+----------------------------------------------
+                250 |             263 |          13 |                                          5.2
+(1 row)
+
+TRUNCATE TABLE
