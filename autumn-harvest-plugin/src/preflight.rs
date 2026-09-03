@@ -1488,10 +1488,23 @@ fn check_admin_auth_boundary(api_state: &HarvestApiState) -> PreflightCheckResul
         PreflightStatus::Fail
     };
 
+    // Issue #1284: in the `dev` profile with no declared boundary, a caller
+    // that presents no session cookie reaches every admin route
+    // unauthenticated — which is what makes the quickstart's own documented
+    // `harvest preflight` step work. That is deliberate, but it must never be
+    // silent: report it as data on the check that already describes the auth
+    // posture, so `harvest preflight --output json` and the compact table both
+    // carry it. Always present (never conditionally omitted) so a CI script can
+    // assert on the field rather than on its absence.
+    let unauthenticated_access = is_dev && !has_boundary;
+
     check(
         "admin_auth_boundary",
         status,
         match status {
+            PreflightStatus::Pass if unauthenticated_access => {
+                "admin API is reachable unauthenticated: the dev profile is mounted without an auth boundary"
+            }
             PreflightStatus::Pass if is_dev => {
                 "admin API auth boundary is optional for the dev profile"
             }
@@ -1516,6 +1529,7 @@ fn check_admin_auth_boundary(api_state: &HarvestApiState) -> PreflightCheckResul
         json!({
             "profile": profile,
             "auth_boundary_present": has_boundary,
+            "unauthenticated_access": unauthenticated_access,
         }),
     )
 }
@@ -1706,6 +1720,51 @@ mod tests {
     use autumn_harvest::scanner_health::Scanner;
 
     use super::*;
+
+    /// **Issue #1284.** The dev-profile management API is reachable
+    /// unauthenticated, which is deliberate but must never be silent. The
+    /// posture is reported as a stable `unauthenticated_access` boolean on the
+    /// check that already describes the auth boundary, so a release script can
+    /// assert on the field rather than string-match a message. It is always
+    /// present — never conditionally omitted — for exactly that reason.
+    #[test]
+    fn admin_auth_boundary_reports_unauthenticated_dev_access() {
+        let open = HarvestApiState::new();
+        open.set_deployment_profile("dev");
+        let result = check_admin_auth_boundary(&open);
+        assert_eq!(result.status, PreflightStatus::Pass);
+        assert_eq!(result.details["unauthenticated_access"], serde_json::json!(true));
+        assert!(
+            result.summary.contains("reachable unauthenticated"),
+            "summary must name the posture, got: {}",
+            result.summary
+        );
+
+        // A declared boundary closes it, in the same profile.
+        let closed = HarvestApiState::new();
+        closed.set_deployment_profile("dev");
+        closed.set_admin_auth_boundary(true);
+        let result = check_admin_auth_boundary(&closed);
+        assert_eq!(result.status, PreflightStatus::Pass);
+        assert_eq!(
+            result.details["unauthenticated_access"],
+            serde_json::json!(false)
+        );
+
+        // Non-dev profiles never report unauthenticated access — they are
+        // fail-closed whether or not a boundary is declared, and a `fail`
+        // status there is the pre-existing signal.
+        for profile in ["prod", "staging", "unknown"] {
+            let state = HarvestApiState::new();
+            state.set_deployment_profile(profile);
+            let result = check_admin_auth_boundary(&state);
+            assert_eq!(
+                result.details["unauthenticated_access"],
+                serde_json::json!(false),
+                "profile {profile:?} must not report unauthenticated access"
+            );
+        }
+    }
 
     /// Build a `WorkerRow` with the given registered `shard_assignments`.
     fn worker_row_with_shard_assignments(shard_assignments: &[i64], queues: &[&str]) -> WorkerRow {
