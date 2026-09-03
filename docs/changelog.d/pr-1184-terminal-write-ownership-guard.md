@@ -82,3 +82,31 @@ that was never actually lost still gets released, mirroring #1182's own
 `a_dispatcher_that_still_owns_the_claim_is_released_when_skip_locked_is_a_false_positive`).
 All 9 new tests plus the 46 pre-existing #1182/#804 `capability_miss_tests`
 pass against a real Postgres 16.
+
+**Codex automated review, five rounds, all addressed:** (1) `HandlerNotRegistered`
+was the only sentinel `fail_execution_on_error` exempted from its fallback
+`fail_task_and_execution` call — the new `TerminalWriteClaimAmbiguous` needed
+the same passthrough, or a claim that cleared between the two checks would
+still commit a spurious `WorkflowFailed`; (2) the activity arm of `process_task`
+only forwarded `HandlerNotRegistered` to the shared release-handler
+interception, stranding an activity-side ambiguity instead of releasing the
+claim; (3) `release_suspended_workflow_claim_query`'s SQL unconditionally
+cleared `activity_name`, so an activity task released through this path lost
+its handler name — fixed with the same `CASE WHEN task_type = 'workflow'`
+guard `park_workflow_task_query` already uses; (4) `process_workflow_task`
+emitted completion/history-size/terminal/canary metrics *before* the
+persistence transaction, so a rolled-back ambiguous-claim attempt still
+counted a non-durable outcome and the eventual real attempt counted it again
+— fixed by computing the derived facts into a `PendingWorkflowMetrics` value
+and deferring the actual `emit_pending_workflow_metrics` call to fire only
+after the transaction commits (with `duration_secs` and
+`canary_roundtrip_secs` still measured at the original pre-transaction point,
+so the metric keeps meaning handler runtime rather than commit latency);
+(5) `move_workflow_to_dlq_for_history_cap` had no ownership recheck at all —
+the same class of gap this issue closes elsewhere — fixed with the identical
+`lock_workflow_execution_row_only` + `claim_still_held_for_update` guard,
+and a fifth-round finding that `fail_workflow_for_history_cap` read
+`started_at.elapsed()` *after* that DLQ transaction returned (folding its
+own persistence latency into the duration metric) was fixed the same way as
+finding (4): capture the elapsed value before the transaction, defer only
+the emission.
