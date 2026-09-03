@@ -20,10 +20,11 @@
 //! documented `400` JSON error shape the route already uses for other
 //! invalid-param cases — see [`bad_request_response`] for the shared shape.
 
+use autumn_web::error::AutumnError;
+use autumn_web::reexports::axum;
 use axum::Json;
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
-use autumn_web::error::AutumnError;
 
 /// The message every strict-query route's `400` carries for
 /// [`InvalidQueryEncoding`], shared so the wording can never drift between
