@@ -34,9 +34,12 @@ reported but do not fail the run — an orphan is a findability defect to
 triage, not a hard error). A broken link inside a process/working-artifact
 subtree (docs/plans/, docs/changelog.d/, docs/rnd/, docs/assays/,
 docs/perf-artifacts/ — see PROCESS_ARTIFACT_PREFIXES) is still reported but
-does NOT fail the run: those are historical records a reader doesn't land
-on mid-task, not the corpus this gate protects. Run from anywhere; paths
-are resolved relative to the repo root.
+does NOT fail the run, UNLESS a reader can actually reach that page by
+following crosslinks from the real corpus (transitively) — a page under one
+of those prefixes that a corpus page cites as required reading (e.g.
+docs/rnd/determinism-static-analysis.md, cited from docs/harvest-verify.md)
+is graded as corpus, not exempted, because a reader really does land there.
+Run from anywhere; paths are resolved relative to the repo root.
 """
 import argparse
 import json
@@ -73,7 +76,20 @@ PROCESS_ARTIFACT_PREFIXES = (
     "docs/perf-artifacts/",
 )
 
-LINK_RE = re.compile(r"\[[^\]]*\]\(([^)\s]+)(?:\s+\"[^\"]*\")?\)")
+# Inline link `[label](dest)`. `label` allows ONE level of nested `[...]`
+# (bare, no further nesting) so a linked image `[![alt](src)](dest)` — this
+# corpus's badge-link idiom, e.g. the license badge in README.md — matches
+# as a single link whose captured target is the OUTER `dest`, not the inner
+# image `src`. Without this, regex non-overlap means the inner `![alt](src)`
+# consumes the match and `dest` — the thing a reader actually navigates
+# to — is never examined (found in review: README.md's `#license` badge
+# link would go unchecked).
+_LABEL = r"(?:[^\[\]]|\[[^\[\]]*\])*"
+LINK_RE = re.compile(rf"\[{_LABEL}\]\(([^)\s]+)(?:\s+\"[^\"]*\")?\)")
+# Bare image `![alt](src)`, checked independently so a *local* image's `src`
+# still gets a missing-file check even when the image is ALSO wrapped in an
+# outer link (and so consumed into LINK_RE's label, per above).
+IMAGE_RE = re.compile(r"!\[[^\]]*\]\(([^)\s]+)(?:\s+\"[^\"]*\")?\)")
 # Reference-style: `[text][ref]` / collapsed `[text][]` (ref == text).
 REF_USE_RE = re.compile(r"\[([^\]]*)\]\[([^\]]*)\]")
 # Bare shortcut reference `[ref]` — only counts if `ref` matches a real
@@ -208,6 +224,15 @@ def extract_link_targets(text: str):
         targets.append(m.group(1))
         consumed.append(m.span())
 
+    # Independent of the spans above: a *local* image's own `src` should
+    # still get a missing-file check even when the image sits inside an
+    # outer link's label (and so was consumed into that link's single
+    # match above, per LINK_RE's docstring) — e.g. a linked local
+    # screenshot. No anchor is possible on an image target, so this only
+    # ever contributes a "missing file" check, never "missing anchor".
+    for m in IMAGE_RE.finditer(text):
+        targets.append(m.group(1))
+
     for m in REF_USE_RE.finditer(text):
         label, ref = m.group(1), m.group(2)
         key = (ref if ref else label).strip().lower()
@@ -249,7 +274,7 @@ def main():
         return heading_cache[p]
 
     broken = []  # (source, raw_target, reason)
-    inbound = {p: 0 for p in files}
+    inbound_sources = {p: set() for p in files}  # target -> {source pages}
 
     for src in files:
         text = strip_code_spans_and_fences(
@@ -286,7 +311,7 @@ def main():
                     if readme in file_set:
                         resolved = readme
                 if resolved in file_set:
-                    inbound[resolved] = inbound.get(resolved, 0) + 1
+                    inbound_sources.setdefault(resolved, set()).add(src)
 
             if anchor:
                 target_for_headings = resolved if resolved.exists() else None
@@ -298,14 +323,54 @@ def main():
     def rel_posix(p: Path) -> str:
         return p.relative_to(REPO_ROOT).as_posix()
 
-    def is_process_artifact(p: Path) -> bool:
+    def under_process_prefix(p: Path) -> bool:
         return rel_posix(p).startswith(PROCESS_ARTIFACT_PREFIXES)
+
+    # A page under a process-artifact prefix is graded as "process" (exempt
+    # from CI-blocking, exempt from orphan grading) ONLY if a reader
+    # actually has no path to it via a real markdown LINK from the corpus.
+    # Being under docs/plans/ or docs/rnd/ is not enough on its own: review
+    # found a counter-example the blanket prefix-only rule got wrong —
+    # docs/rnd/determinism-static-analysis.md is required reading, actually
+    # hyperlinked (with anchors) repeatedly from docs/harvest-verify.md and
+    # docs/workflow-determinism-guide.md, not just mentioned in prose; the
+    # same is true of docs/rnd/sqlite-feasibility.md from
+    # docs/sqlite-backend.md. Both are corpus pages sending readers into a
+    # "process" subtree on purpose, so the target is corpus too — and so is
+    # anything THAT page in turn links to (transitive: a reader keeps
+    # following crosslinks — this is also why docs/rnd/wasm-activities-spike.md
+    # is reclassified, one hop further out, via docs/shipped-work.md).
+    # `docs/assays/0001-redis-adapter-throughput-ceiling.md` and
+    # `docs/plans/2026-09-01-e2e-benchmark-suite.md`, by contrast, are only
+    # ever CITED as plain backtick-quoted paths in prose (docs/
+    # autumn-workflow-architecture.md, docs/benchmarks.md) — not a real
+    # `[...](...)` a reader can click — so they correctly stay exempt; that
+    # citation-without-a-link gap is itself a findability defect, just a
+    # different one than this harness fixes here. Computed as a
+    # reachability closure seeded from every non-process page, rather than
+    # hand-maintaining an exception list that silently goes stale the next
+    # time someone adds or removes a crosslink.
+    corpus_reachable = {
+        p
+        for p in files
+        if p.is_relative_to(REPO_ROOT / "docs") and not under_process_prefix(p)
+    }
+    worklist = list(corpus_reachable)
+    while worklist:
+        cur = worklist.pop()
+        for target, sources in inbound_sources.items():
+            if cur in sources and target not in corpus_reachable:
+                corpus_reachable.add(target)
+                worklist.append(target)
+
+    def is_process_artifact(p: Path) -> bool:
+        return under_process_prefix(p) and p not in corpus_reachable
 
     orphans = [
         p
         for p in files
         if p.is_relative_to(REPO_ROOT / "docs")
-        and inbound.get(p, 0) == 0
+        and len(inbound_sources.get(p, ())) == 0
         and not is_process_artifact(p)
     ]
 
