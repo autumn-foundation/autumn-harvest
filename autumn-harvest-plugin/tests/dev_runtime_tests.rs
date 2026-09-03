@@ -153,6 +153,190 @@ fn classify_refuses_an_sslmode_the_client_itself_cannot_use() {
     );
 }
 
+// ---------------------------------------------------------------------------
+// AC4 — the `sslmode` scan is syntax-aware, not positional (issue #1286)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn classify_allows_a_keyword_value_dsn_whose_password_contains_sslmode_text() {
+    // A bare `dsn.find("sslmode=")` cannot tell a key from the inside of a
+    // value, so a legal loopback database with this password was refused as
+    // TLS-requiring — a message describing a state the DSN is not in. The
+    // closing `'` is what made the extracted value read as exactly `require`.
+    let dsn = "host=localhost password='sslmode=require' dbname=harvest_dev";
+    let safety = classify_database_url(dsn);
+    assert!(
+        matches!(safety, DatabaseSafety::Allowed),
+        "a password that merely contains the text `sslmode=require` is not an \
+         sslmode key: {dsn} -> {safety:?}"
+    );
+}
+
+#[test]
+fn classify_allows_a_uri_whose_parameter_value_contains_sslmode_text() {
+    // Same root cause in the other syntax: `application_name`'s VALUE was
+    // scanned as if it were the query string's own key.
+    let dsn = "postgres://u:pw@localhost/app?application_name=sslmode=require";
+    let safety = classify_database_url(dsn);
+    assert!(
+        matches!(safety, DatabaseSafety::Allowed),
+        "another parameter's value is not the query string's own key: {dsn} -> {safety:?}"
+    );
+}
+
+#[test]
+fn classify_allows_other_keyword_values_that_contain_sslmode_text() {
+    // Not just `password`: any value at all. `options` is the realistic one —
+    // it carries arbitrary server settings — and an unquoted value is scanned
+    // by the same code path as a quoted one.
+    for dsn in [
+        "host=127.0.0.1 dbname=harvest_dev options='-c sslmode=require'",
+        "host=127.0.0.1 dbname=harvest_dev application_name=sslmode=require",
+        "host=127.0.0.1 dbname=harvest_dev password=sslmode=verify-full",
+    ] {
+        let safety = classify_database_url(dsn);
+        assert!(
+            matches!(safety, DatabaseSafety::Allowed),
+            "{dsn} carries no sslmode key at all -> {safety:?}"
+        );
+    }
+}
+
+#[test]
+fn classify_still_refuses_a_real_sslmode_key_in_keyword_value_syntax() {
+    // The reason the textual scan exists at all: `tokio_postgres` models only
+    // `disable`/`prefer`/`require`, so `verify-ca` and `verify-full` — the two
+    // strongest signals of a remote managed database — would otherwise arrive
+    // as an opaque parse error rather than as the specific thing they are.
+    for (dsn, expected) in [
+        ("host=localhost sslmode=verify-ca dbname=harvest_dev", "verify-ca"),
+        (
+            "host=localhost sslmode=verify-full dbname=harvest_dev",
+            "verify-full",
+        ),
+        ("host=localhost sslmode=require dbname=harvest_dev", "require"),
+        // libpq permits whitespace around `=` and single-quoted values, and
+        // both spellings are a real `sslmode` key.
+        ("host=localhost sslmode = verify-full", "verify-full"),
+        ("host=localhost sslmode='verify-ca'", "verify-ca"),
+        // A quoted value with an escaped quote inside still terminates where
+        // libpq says it does, so the key after it is still a key.
+        (
+            r"host=localhost password='a\'b' sslmode=verify-full",
+            "verify-full",
+        ),
+    ] {
+        let safety = classify_database_url(dsn);
+        let DatabaseSafety::Refused(RefusalReason::TlsRequired { sslmode }) = &safety else {
+            panic!("{dsn} demands TLS and must be refused as such, got {safety:?}");
+        };
+        assert_eq!(sslmode, expected, "{dsn}");
+    }
+}
+
+#[test]
+fn classify_still_refuses_a_real_sslmode_key_in_uri_syntax() {
+    for (dsn, expected) in [
+        (
+            "postgres://u:pw@db.example.com/app?sslmode=verify-full",
+            "verify-full",
+        ),
+        (
+            "postgres://u:pw@localhost/app?application_name=x&sslmode=verify-ca",
+            "verify-ca",
+        ),
+        (
+            "postgresql://u:pw@localhost/app?sslmode=require&application_name=x",
+            "require",
+        ),
+    ] {
+        let safety = classify_database_url(dsn);
+        let DatabaseSafety::Refused(RefusalReason::TlsRequired { sslmode }) = &safety else {
+            panic!("{dsn} demands TLS and must be refused as such, got {safety:?}");
+        };
+        assert_eq!(sslmode, expected, "{dsn}");
+    }
+}
+
+#[test]
+fn classify_reads_a_percent_encoded_sslmode_key_the_way_the_client_does() {
+    // `tokio_postgres` percent-decodes URI query keys and values before it
+    // matches them, so `%73slmode=verify-full` IS the sslmode parameter as far
+    // as the code that dials is concerned. Comparing the raw bytes would miss
+    // it, and `get_ssl_mode()` cannot name it because the client refuses to
+    // parse `verify-full` at all.
+    for dsn in [
+        "postgres://u:pw@db.example.com/app?%73slmode=verify-full",
+        "postgres://u:pw@db.example.com/app?sslmode=verify%2Dfull",
+    ] {
+        let safety = classify_database_url(dsn);
+        assert!(
+            matches!(
+                safety,
+                DatabaseSafety::Refused(RefusalReason::TlsRequired { .. })
+            ),
+            "{dsn} -> {safety:?}"
+        );
+    }
+}
+
+#[test]
+fn classify_does_not_read_a_uri_path_or_userinfo_as_a_query_parameter() {
+    // Everything before the `?` is authority and path, never parameters. A
+    // database whose name happens to contain the text is still just a name.
+    let dsn = "postgres://u:pw@localhost/sslmode=require";
+    let safety = classify_database_url(dsn);
+    assert!(
+        !matches!(
+            safety,
+            DatabaseSafety::Refused(RefusalReason::TlsRequired { .. })
+        ),
+        "a path segment is not a query parameter: {dsn} -> {safety:?}"
+    );
+}
+
+#[test]
+fn classify_terminates_and_never_panics_on_adversarial_dsn_syntax() {
+    // The scan walks quotes and `\` escapes by hand. Unterminated quotes,
+    // trailing escapes, empty values and multi-byte characters after an escape
+    // are all inputs a developer can type, and none of them may hang the dev
+    // runtime or slice a `String` off a character boundary.
+    for dsn in [
+        "host=localhost password='unterminated",
+        r"host=localhost password=trailing\",
+        r"host=localhost password='\",
+        "host=localhost sslmode=",
+        "host=localhost sslmode=''",
+        "host=localhost =novalue sslmode=verify-ca",
+        "bareword host=localhost",
+        r"host=localhost password='\é' sslmode=verify-full",
+        "host=localhost password=é sslmode=verify-full",
+        "sslmode",
+        "=",
+        "'",
+        "postgres://u@localhost/app?",
+        "postgres://u@localhost/app?&&=&",
+        "postgres://u@localhost/app?%",
+        "postgres://u@localhost/app?%zz=1",
+    ] {
+        // The verdict is not the point; not diverging is.
+        let _ = classify_database_url(dsn);
+        let _ = redact_dsn(dsn);
+    }
+}
+
+#[test]
+fn redaction_still_covers_a_password_next_to_a_multibyte_escape() {
+    // The keyword scanner is shared with the safety gate after #1286, so the
+    // banner's whole reason for existing — never printing a credential — is
+    // asserted against the shared implementation too.
+    let dsn = r"host=localhost password='hunter2\é x' dbname=harvest_dev";
+    let redacted = redact_dsn(dsn);
+    assert!(!redacted.contains("hunter2"), "{redacted}");
+    assert!(redacted.contains("host=localhost"), "{redacted}");
+    assert!(redacted.contains("dbname=harvest_dev"), "{redacted}");
+}
+
 #[test]
 fn classify_refuses_a_hostaddr_that_points_somewhere_else() {
     // `hostaddr` is NOT a synonym for `host`: when both are present it is the
