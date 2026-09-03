@@ -469,6 +469,62 @@ fn classify_does_not_read_a_uri_userinfo_as_a_query_parameter() {
 }
 
 #[test]
+fn classify_locates_the_query_string_after_the_userinfo_as_the_client_does() {
+    // Codex round 1 (P2). The first `?` is NOT the query delimiter.
+    // `tokio_postgres` reads userinfo with `take_until(&['@'])` over the whole
+    // remaining string BEFORE it looks for a query, so everything here up to
+    // the `@` is the *username* and these DSNs have no query string at all.
+    // Splitting at the first `?` invents a parameter out of a credential — and
+    // when the invented key percent-decodes to `sslmode`, the gate refuses a
+    // loopback database it should have allowed. That is the very bug #1286 is
+    // about, reintroduced through the other syntax.
+    for dsn in [
+        "postgres://u?%73slmode=verify-full&x=y@localhost/app",
+        "postgres://u?sslmode=verify-full@localhost/app",
+        "postgres://u?sslmode=require&x=y@localhost/harvest_dev",
+    ] {
+        let safety = classify_database_url(dsn);
+        assert!(
+            matches!(safety, DatabaseSafety::Allowed),
+            "the text before the `@` is a username, not a query string: {dsn} -> {safety:?}"
+        );
+    }
+
+    // ...and a real query string after the userinfo is still read.
+    for (dsn, expected) in [
+        (
+            "postgres://u?x=y@localhost/app?sslmode=verify-full",
+            "verify-full",
+        ),
+        (
+            "postgres://u:pw@localhost/app?sslmode=verify-ca",
+            "verify-ca",
+        ),
+    ] {
+        let safety = classify_database_url(dsn);
+        let DatabaseSafety::Refused(RefusalReason::TlsRequired { sslmode }) = &safety else {
+            panic!("{dsn} carries a real sslmode parameter, got {safety:?}");
+        };
+        assert_eq!(sslmode, expected, "{dsn}");
+    }
+}
+
+#[test]
+fn redaction_finds_a_query_password_behind_a_question_mark_in_the_userinfo() {
+    // The same locator, in the direction that leaks rather than over-refuses:
+    // splitting at the first `?` made `a=1@localhost/db` the whole "query", so
+    // the real `password=` parameter after it was never seen.
+    let dsn = "postgres://x?a=1@localhost/db?password=hunter2";
+    let redacted = redact_dsn(dsn);
+    assert!(!redacted.contains("hunter2"), "{redacted:?}");
+    // Nothing else is reshaped: the `?a=1` really is part of the username.
+    assert!(
+        redacted.starts_with("postgres://x?a=1@localhost/db?"),
+        "{redacted:?}"
+    );
+}
+
+#[test]
 fn classify_refuses_a_hostaddr_that_points_somewhere_else() {
     // `hostaddr` is NOT a synonym for `host`: when both are present it is the
     // address actually dialled, and `host` is only the TLS/SNI name. A gate that

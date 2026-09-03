@@ -218,36 +218,57 @@ pub(super) struct QueryParameter {
     pub value_span: Range<usize>,
 }
 
+/// Where a URI DSN's query string starts — the byte just past its `?` — or
+/// `None` when it has none.
+///
+/// **Not simply the first `?`.** `tokio_postgres` reads userinfo with
+/// `take_until(&['@'])` across the whole remaining string *before* it looks for
+/// anything else, so in `postgres://u?x=1&y=z@localhost/app` the `?x=1&y=z` is
+/// part of the **username** and the DSN has no query string at all. Splitting
+/// at the first `?` there invents a parameter out of a credential — and when
+/// the invented key percent-decodes to `sslmode`, the gate refuses a loopback
+/// database it should have allowed, which is exactly the defect #1286 exists to
+/// remove, reintroduced through the other syntax.
+///
+/// After the credentials the client's walk is unambiguous: the host stops at
+/// `/` or `?`, and a path stops at `?`, so either way the query begins at the
+/// first `?` that follows the credentials.
+pub(super) fn query_start(dsn: &str) -> Option<usize> {
+    let after_scheme = ["postgres://", "postgresql://"]
+        .into_iter()
+        .find(|scheme| dsn.starts_with(scheme))?
+        .len();
+    // Credentials run to the first `@` anywhere in the rest — or there are
+    // none, and the walk starts at the authority.
+    let after_credentials = dsn[after_scheme..]
+        .find('@')
+        .map_or(after_scheme, |at| after_scheme + at + 1);
+    dsn[after_credentials..]
+        .find('?')
+        .map(|at| after_credentials + at + 1)
+}
+
 /// The query-string parameters of a **URI** DSN, keys and values percent-decoded.
 ///
-/// Splitting on `&` and then on the first `=` is exactly what the client's URI
-/// reader does, so a parameter's *value* can never be mistaken for the query
-/// string's own key — which is how `?application_name=sslmode=require` came to
-/// be read as a TLS demand.
-///
-/// The query is taken to start at the first `?`. That is what
-/// [`redact_dsn`](super::banner::redact_dsn) has always assumed and it is right
-/// for every DSN the client accepts here, but it is **not** exactly the client's
-/// own rule: `tokio_postgres` reads userinfo up to the first `@` before it looks
-/// for a `?`, so in `postgres://u?x=1@host/db?sslmode=require` the `?x=1` is
-/// part of the *username* and the real query starts later. Splitting early can
-/// therefore only cause parameters to be missed, never invented — which for
-/// [`safety`](super::safety) means falling back on the authoritative
-/// `get_ssl_mode()`, and is why that backstop is not optional.
+/// Splitting on `&` and then on the first `=` is exactly what the client's
+/// `parse_params` does, so a parameter's *value* can never be mistaken for the
+/// query string's own key — which is how `?application_name=sslmode=require`
+/// came to be read as a TLS demand. The query itself is located by
+/// [`query_start`], not by the first `?`.
 pub(super) fn uri_query_parameters(dsn: &str) -> impl Iterator<Item = QueryParameter> + '_ {
-    let query_start = dsn.find('?').map_or(dsn.len(), |at| at + 1);
-    dsn[query_start..]
+    let start = query_start(dsn).unwrap_or(dsn.len());
+    dsn[start..]
         .split('&')
-        .scan(query_start, |offset, pair| {
-            let start = *offset;
+        .scan(start, |offset, pair| {
+            let pair_start = *offset;
             // Past this pair and the `&` that ended it. The last pair has no
             // `&`, and the extra byte is never read because the scan stops.
             *offset += pair.len() + 1;
-            Some((start, pair))
+            Some((pair_start, pair))
         })
-        .filter_map(|(start, pair)| {
+        .filter_map(|(pair_start, pair)| {
             let (key, value) = pair.split_once('=')?;
-            let value_start = start + key.len() + 1;
+            let value_start = pair_start + key.len() + 1;
             Some(QueryParameter {
                 key: percent_decoded(key),
                 value: percent_decoded(value),
@@ -291,7 +312,7 @@ pub(super) fn percent_decoded(text: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{is_uri_dsn, keyword_options, percent_decoded, uri_query_parameters};
+    use super::{is_uri_dsn, keyword_options, percent_decoded, query_start, uri_query_parameters};
 
     /// `(key, unescaped value, the value exactly as written)` for every option.
     fn options(dsn: &str) -> Vec<(&str, String, &str)> {
@@ -517,6 +538,35 @@ mod tests {
                 ("b".to_owned(), "2"),
             ]
         );
+    }
+
+    #[test]
+    fn the_query_starts_after_the_userinfo_not_at_the_first_question_mark() {
+        // `postgres://u?x=1@host/db` has a USERNAME of `u?x=1`. The client
+        // consumes credentials to the first `@` before it looks for a query,
+        // so a `?` before that `@` is an ordinary character in a credential.
+        for (dsn, expected) in [
+            ("postgres://u?x=1@localhost/db", None),
+            ("postgres://u?x=1&y=z@localhost/db", None),
+            ("postgres://u?x=1@localhost/db?a=2", Some("a=2")),
+            ("postgres://u:pw@localhost/db?a=2", Some("a=2")),
+            ("postgres://localhost/db?a=2", Some("a=2")),
+            // No path: the host stops at the `?` and the query starts there.
+            ("postgres://localhost?a=2", Some("a=2")),
+            // An `@` AFTER the `?` is credentials too, as far as the client is
+            // concerned — so everything before it, query-looking or not, is a
+            // username, and what follows has no query at all.
+            ("postgres://localhost/db?a=2@c", None),
+            ("postgresql://u@localhost/db?a=2", Some("a=2")),
+            // Not a URI at all: no scheme, so no query to find.
+            ("host=localhost dbname=db?a=2", None),
+        ] {
+            assert_eq!(
+                query_start(dsn).map(|start| &dsn[start..]),
+                expected,
+                "{dsn}"
+            );
+        }
     }
 
     #[test]

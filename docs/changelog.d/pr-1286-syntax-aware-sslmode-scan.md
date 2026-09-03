@@ -83,7 +83,23 @@ separators — including U+000B, which is ASCII but which
 change, no public API change. `dev::dsn` is a private module; the only exported
 signature that moved is none.
 
-**Test evidence.** Fourteen new tests in
+**A second regression caught by Codex, and the rule that replaces it.** The URI
+branch first took the query to start at the first `?`. It does not:
+`tokio_postgres` reads userinfo with `take_until(&['@'])` across the whole
+remaining string *before* it looks for anything else, so in
+`postgres://u?%73slmode=verify-full&x=y@localhost/app` the `?…` is part of the
+**username** and the DSN has no query string at all. Splitting early invented a
+parameter out of a credential, and because the invented key percent-decodes to
+`sslmode`, the gate refused a loopback database it should have allowed — the
+defect this change exists to remove, reintroduced through the other syntax.
+`dsn::query_start` now walks it as the client does: credentials to the first
+`@`, then the first `?` after them (the host stops at `/` or `?` and a path
+stops at `?`, so the two agree from there). The same locator fixes the leaking
+direction of the same bug in the banner — `postgres://x?a=1@localhost/db?password=hunter2`
+printed the credential, because the real `password=` parameter sat behind what
+the old split had already consumed as the whole query.
+
+**Test evidence.** Sixteen new tests in
 `autumn-harvest-plugin/tests/dev_runtime_tests.rs` (both reproductions from the
 issue, both still-refused cases, `options`/`application_name` values, a URI path
 segment, percent-encoded keys and values, an adversarial-syntax sweep asserting

@@ -183,9 +183,12 @@ pub fn redact_dsn(dsn: &str) -> String {
         // has to see the whole string to consume quoted values whole.
         return redact_keyword_value(dsn);
     }
-    let Some(question) = dsn.find('?') else {
+    // The query is located the way the client locates it — after the userinfo —
+    // so a `?` inside a username cannot hide the real `password=` behind it.
+    let Some(query) = dsn::query_start(dsn) else {
         return redact_userinfo(dsn);
     };
+    let question = query - 1;
     let mut out = redact_userinfo(&dsn[..question]);
     // Splice over each password value's span, exactly as the keyword/value
     // branch does, so every other byte of the query string — including a
