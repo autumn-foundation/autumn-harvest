@@ -11826,7 +11826,7 @@ pub async fn fail_task_and_execution_with_history(
     // transaction), so this is safe to call unconditionally regardless of
     // caller context.
     Box::pin(conn.transaction::<(), HarvestError, _>(async |conn| {
-        // Codex round-1 P1 (self-review): `Unavailable`/`Loaded` both touch
+        // Issue #1184 self-review finding: `Unavailable`/`Loaded` both touch
         // the execution row (directly here, or via `persist_workflow_failure`
         // below), and this function is reached from callers -- notably
         // `fail_task_and_execution`'s session-acquire/session-release paths
@@ -11834,11 +11834,12 @@ pub async fn fail_task_and_execution_with_history(
         // that open no transaction and so hold no prior lock at all. Taking
         // the task-row claim check FIRST there would lock the task row before
         // the execution row, inverting the documented `harvest_task_queue`
-        // convention (execution row first) and opening a real ABBA cycle
-        // against `timeout::force_fail_activity`, which locks the SAME two
-        // rows in the documented order (execution, then the specific task).
-        // Lock the execution row here, before any task-row touch, so every
-        // branch below is safe regardless of what the caller already held.
+        // convention (execution row first, see `lock_workflow_execution_row_only`'s
+        // own doc comment) and opening a real ABBA cycle against
+        // `timeout::force_fail_activity`, which locks the SAME two rows in
+        // the documented order (execution, then the specific task). Lock the
+        // execution row here, before any task-row touch, so every branch
+        // below is safe regardless of what the caller already held.
         if let Some(exec_id) = preloaded.exec_id() {
             lock_workflow_execution_row_only(conn, exec_id).await?;
         }
@@ -11887,27 +11888,6 @@ pub async fn fail_task_and_execution_with_history(
         .map(|_| ())
     }))
     .await
-}
-
-/// Lock the execution row alone, with no history load -- for a caller that
-/// only needs the lock's ordering guarantee (issue #1184) and not the row's
-/// data. A lighter-weight sibling of
-/// [`lock_workflow_execution_row_and_load_history`] for exactly that case.
-async fn lock_workflow_execution_row_only(
-    conn: &mut AsyncPgConnection,
-    exec_id: ExecutionId,
-) -> HarvestResult<()> {
-    use crate::schema::harvest_workflow_executions::dsl as exec_dsl;
-    exec_dsl::harvest_workflow_executions
-        .find(exec_id.as_uuid())
-        .select(exec_dsl::id)
-        .for_update()
-        .first::<uuid::Uuid>(conn)
-        .await
-        .optional()
-        .map_err(crate::error::database_error)?
-        .ok_or_else(|| HarvestError::NotFound(format!("workflow execution {exec_id}")))?;
-    Ok(())
 }
 
 async fn finalize_activity_completion(
