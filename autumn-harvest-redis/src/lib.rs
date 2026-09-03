@@ -2,11 +2,14 @@
 //!
 //! This crate provides a high-throughput "escape hatch" for the
 //! `autumn-harvest` workflow engine. The default Postgres-backed queue (using
-//! `SELECT ... FOR UPDATE SKIP LOCKED`) is operationally simple but eventually
-//! hits a ceiling around ten thousand task claims per second due to lock
-//! contention. Moving the ephemeral task queue onto Redis Streams lifts that
-//! ceiling while leaving Postgres as the sole source of truth for workflow
-//! state and event history.
+//! `SELECT ... FOR UPDATE SKIP LOCKED`) is operationally simple but its
+//! measured claim throughput (`docs/performance.md`) falls well short of the
+//! "ten thousand task claims per second" figure once cited here — see
+//! `docs/assays/0001-redis-adapter-throughput-ceiling.md` for this crate's own
+//! measured standalone throughput and how it compares. Moving the ephemeral
+//! task queue onto Redis Streams raises that ceiling substantially, while
+//! leaving Postgres as the sole source of truth for workflow state and event
+//! history.
 //!
 //! ## Scope
 //!

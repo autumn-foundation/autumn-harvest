@@ -2,3 +2,7 @@
 Cargo.lock
 .env*
 .claude/
+__pycache__/
+
+# Nested cargo target dirs (e.g. per-agent --target-dir runs inside member crates)
+**/target/

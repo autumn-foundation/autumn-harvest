@@ -29,7 +29,7 @@ tracing = { workspace = true }
 
 [dev-dependencies]
 # `testing` gives the cross-backend replay harness (`WorkflowReplayer`).
-autumn-harvest = { path = "../autumn-harvest", default-features = false, features = ["testing"] }
+autumn-harvest = { version = "0.6.0", path = "../autumn-harvest", default-features = false, features = ["testing"] }
 # Used directly by the orphan-reclaim test to inspect raw `harvest_tasks` state.
 rusqlite = { workspace = true }
 tempfile = "3"

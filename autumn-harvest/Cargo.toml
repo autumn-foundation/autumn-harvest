@@ -80,11 +80,19 @@ diesel_migrations = { workspace = true, optional = true }
 # 0.7.18 is the first release with the RUSTSEC advisory fix; pin the floor so a
 # downstream lockfile can't silently resolve back to a vulnerable 0.7.x.
 tokio-postgres = { version = "0.7.18", optional = true }
-metrics = { version = "0.24", optional = true }
+# 0.24.6 is the first non-yanked 0.24.x release; pin the floor for the same
+# reason as tokio-postgres above (a downstream lockfile shouldn't be able to
+# freshly resolve the yanked 0.24.5).
+metrics = { version = "0.24.6", optional = true }
 schemars = { version = "0.8", optional = true }
 # wasmtime 46's own minimum Rust is 1.94, so the `wasm-activities` feature that
 # enables these has an effective MSRV of 1.94 (the crate's core MSRV stays 1.88).
-wasmtime = { version = "46", optional = true }
+# 46.0.3 is the first release with all four RUSTSEC-2026-0222/0223/0268/0269
+# fixes; pin the floor so a downstream consumer enabling `wasm-activities`
+# can't silently resolve back to a vulnerable 46.0.x (same reasoning as
+# tokio-postgres above — a workspace's own Cargo.lock never propagates to
+# downstream consumers, only the manifest constraint does).
+wasmtime = { version = "46.0.3", optional = true }
 wat = { version = "1", optional = true }
 
 [[test]]

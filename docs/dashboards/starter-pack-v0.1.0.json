@@ -3480,6 +3480,55 @@
           "description": "Execution summaries GC'd by the tiered-retention summary pass (issue #752). Distinct from the history-row retention deletions above; a sustained zero while eligible summaries exist means the summary GC is lagging."
         },
         {
+          "id": 953,
+          "type": "timeseries",
+          "title": "Rate-limit buckets \u2014 idle buckets collected (issue #1127)",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "gridPos": {
+            "h": 8,
+            "w": 12,
+            "x": 12,
+            "y": 68
+          },
+          "fieldConfig": {
+            "defaults": {
+              "unit": "ops",
+              "custom": {
+                "fillOpacity": 10,
+                "showPoints": "never",
+                "lineWidth": 1
+              }
+            },
+            "overrides": []
+          },
+          "options": {
+            "legend": {
+              "displayMode": "list",
+              "placement": "bottom",
+              "showLegend": true
+            },
+            "tooltip": {
+              "mode": "multi",
+              "sort": "desc"
+            }
+          },
+          "targets": [
+            {
+              "refId": "A",
+              "expr": "sum by (family) (rate(harvest_retention_rate_limit_buckets_deleted_total[$__rate_interval]))",
+              "legendFormat": "{{family}}",
+              "datasource": {
+                "type": "prometheus",
+                "uid": "${datasource}"
+              }
+            }
+          ],
+          "description": "Inert per-tenant rate-limit buckets collected by the retention janitor's idle-bucket GC (issue #1127), by key family. harvest_rate_limit_buckets rows are auto-registered and were never deleted before this, so the two caller-keyed families (dyn-rate, start-throttle) grew one row per tenant forever. A flat zero while the table keeps growing means the GC is off (rate_limit_bucket_retention_secs = null) or every candidate is pinned by a live dependent \u2014 GET /admin/retention reports the per-shard count either way. The bucket key is deliberately NOT a label: it is the unbounded value this pass exists to collect."
+        },
+        {
           "id": 931,
           "type": "timeseries",
           "title": "Dispatch rate by shard",

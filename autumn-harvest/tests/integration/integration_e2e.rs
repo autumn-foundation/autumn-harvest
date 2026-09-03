@@ -267,7 +267,16 @@ const INIT_SQL: &str = concat!(
     // This suite runs against a testcontainer built from INIT_SQL, NOT against
     // a migrated database, so a local run with HARVEST_TEST_DATABASE_URL set
     // cannot catch the omission -- that path skips INIT_SQL entirely.
-    include_str!("../../migrations/20260902131705_harvest_shard_rebalancing/up.sql")
+    include_str!("../../migrations/20260902131705_harvest_shard_rebalancing/up.sql"),
+    "\n",
+    // issue #1127: last_registered_at/baseline_set_at columns on
+    // harvest_rate_limit_buckets. REQUIRED for the same reason as the #945
+    // columns above -- `queue::ensure_rate_limit_bucket` references
+    // `last_registered_at` unconditionally, and it runs inside the SAME
+    // transaction as every dynamic-per-key activity enqueue, so without these
+    // columns that decision transaction rolls back and the workflow never
+    // progresses (a silent timeout, not an obvious error).
+    include_str!("../../migrations/20260902133132_harvest_rate_limit_bucket_gc/up.sql")
 );
 
 /// The minimal "legacy" migration set used by the upgrade-path regression

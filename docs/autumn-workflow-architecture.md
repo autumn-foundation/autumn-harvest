@@ -989,7 +989,7 @@ The `harvest_task_queue` table is also partitioned by `queue_name` using list pa
 
 ### 8.3 History Retention
 
-Harvest ships an opt-in retention janitor for completed workflow histories. Operators configure `RetentionConfig` on `HarvestBuilder`; default behavior is disabled (`max_age = None`), so upgrading does not delete any rows until explicitly enabled.
+Harvest ships an opt-in retention janitor for completed workflow histories. Operators configure `RetentionConfig` on `HarvestBuilder`; default behavior for **workflow history** is disabled (`max_age = None`), so upgrading deletes no history until explicitly enabled. Two janitor passes ARE on by default: audit-log purging (`audit_retention_days`, 90 days) and the idle rate-limit-bucket GC (`rate_limit_bucket_retention_secs`, 7 days — issue #1127), the latter collecting only provably inert per-tenant token buckets.
 
 When enabled, each tick selects terminal workflow executions older than `max_age` and deletes them transactionally. Rows in `harvest_events`, `harvest_task_queue`, `harvest_timers`, and `harvest_signals` are removed by `ON DELETE CASCADE`; `harvest_dead_letters` rows are deleted explicitly in the same retention transaction because `workflow_exec_id` is not a foreign key.
 
@@ -1009,10 +1009,12 @@ Autumn Harvest uses Postgres as the task queue. No external broker (Redis, Rabbi
 
 - **Operational simplicity.** Autumn already requires Postgres. Adding Redis or RabbitMQ doubles the infrastructure surface area for a capability (queueing) that Postgres handles well at the scale Harvest targets.
 - **Transactional consistency.** Enqueuing a task and recording an event in the workflow history happens in a single Postgres transaction. With an external broker, you need distributed transactions or outbox patterns.
-- **Sufficient throughput.** With `SKIP LOCKED`, Postgres can handle thousands of dequeues per second. Harvest targets workloads up to ~10,000 tasks/second, which is well within Postgres' capability.
+- **Sufficient throughput.** With `SKIP LOCKED`, Postgres can handle thousands of dequeues per second, though the measured ceiling is well below the "~10,000 tasks/second" figure once cited here — see the measured numbers below.
 - **Simplicity of deployment.** One binary, one database. This matters enormously for adoption.
 
-**When Postgres is not enough:** If a deployment needs >10,000 tasks/second sustained, Harvest will support an optional `autumn-harvest-redis` adapter crate (Phase 4) that uses Redis Streams for the task queue while keeping Postgres for history and state. But this is an escape hatch, not the default path.
+**Measured, not targeted.** The "~10,000 tasks/second" framing above described a target, not a measurement, and the measured claim path falls well short of it: `docs/performance.md` publishes 640 claims/sec at an 8-concurrent-claimer / 1,000-row-backlog scenario on a 4-core reference machine, falling to 29/sec at a 10,000-row backlog. The bottleneck is a documented, partially-fixed structural query-plan defect (a non-indexable `ORDER BY` forcing a full sequential scan and sort per claim), not a flat ops/sec wall — see that page for the detail and the fixes already landed.
+
+**When Postgres is not enough:** an optional `autumn-harvest-redis` adapter crate exists (see `autumn-harvest-redis/`) that uses Redis Streams for the task queue while keeping Postgres for history and state — an escape hatch, not the default path. Its standalone throughput has been measured (docs/assays/0001-redis-adapter-throughput-ceiling.md), and the founding ">10,000 tasks/second, reliably sustained" claim looks achievable, not refuted: draining a 1,000-entry backlog with 8 claim-only workers averaged 12,004 claims/sec across three runs. That number is *not* a matched comparison against the Postgres figure above — two attempts at matching the workload shape (queue topology, drain fraction, backlog depth held roughly constant) both turned out to miss how `docs/performance.md`'s own harness actually works, so no multiplier is reported. A narrower, artificially-constrained sub-question this assay separately posed — an always-near-empty queue at exactly 8 concurrent workers — did miss 10,000/sec (~8,760 mean); see the report for why that is not the same finding. More importantly, **the adapter is not yet wired into the worker** (`autumn-harvest-redis/src/lib.rs` documents the required transactional-boundary refactor as unbuilt), so it cannot be turned on by an operator today regardless of throughput.
 
 ### 9.2 Queue Semantics
 

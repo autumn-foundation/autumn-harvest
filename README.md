@@ -52,6 +52,11 @@ child workflows, idempotency, and operating the service — read
 Upgrading an existing deployment? See the
 [0.4.0 → 0.5.0 upgrade guide](docs/upgrading/0.5.0.md).
 
+Working on the engine itself? [`docs/architecture.md`](docs/architecture.md) is
+the workspace, design-decision, module and macro reference, and
+[`docs/shipped-work.md`](docs/shipped-work.md) is the verbatim record of what
+has shipped.
+
 Need a real reference instead of the tiny hello-world path? See:
 
 - [`examples/billing-autumn-web/`](examples/billing-autumn-web/) for a full Autumn web billing

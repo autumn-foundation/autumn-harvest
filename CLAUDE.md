@@ -95,3 +95,18 @@ two `harvest_events` writers, not three.
 
 If you add another exception, it belongs in this list, with its own scope
 guarantee and its own proof.
+
+## Project Documentation
+
+`CLAUDE.md` holds agent instructions and engine invariants only. Do not park
+architecture notes, changelog entries, or a record of shipped work here — those
+have homes:
+
+- [`docs/architecture.md`](docs/architecture.md) — workspace layout, crate
+  relationships, design decisions, module guide, macro-usage patterns,
+  development commands, DB schema reference. Cross-references throughout
+  `docs/` and the source comments point at its sections.
+- [`docs/shipped-work.md`](docs/shipped-work.md) — the verbatim shipped-work
+  record. Two guard suites read it as data, so treat it as load-bearing.
+- [`docs/changelog.d/README.md`](docs/changelog.d/README.md) — where a feature
+  PR's changelog entry goes (a fragment file, never the shared phase list).

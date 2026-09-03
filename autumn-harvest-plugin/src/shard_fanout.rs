@@ -49,7 +49,8 @@ pub fn pools_by_shard(api_state: &HarvestApiState) -> BTreeMap<i32, DbPool> {
 /// A shard the router knows about but for which this process has no pool yet
 /// (e.g. mid a shard-add rollout — the router's `readable_shards` is widened
 /// before every process has the new shard's pool wired up, see the workspace
-/// CLAUDE.md "add a shard" procedure) must still appear in the returned set so
+/// `docs/architecture.md` "add a shard" procedure) must still appear in the
+/// returned set so
 /// callers report it `unavailable` rather than silently omitting it from the
 /// fan-out — an omitted shard would let a completeness `status` read
 /// `complete` even though that shard was never queried.

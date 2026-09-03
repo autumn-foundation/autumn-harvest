@@ -136,7 +136,7 @@ fn build_app(urls: &[String]) -> HarvestApiApp {
 }
 
 /// Build an app whose **router** knows about more shards than this process has
-/// pools for — the mid-rollout topology from the CLAUDE.md "add a shard"
+/// pools for — the mid-rollout topology from the `docs/architecture.md` "add a shard"
 /// procedure, where `readable_shards` is widened before every process has the
 /// new shard's pool wired up.
 fn build_app_with_router_knowing_extra_shard(
@@ -634,7 +634,8 @@ async fn two_logical_shards_sharing_one_database_do_not_double_count() {
 /// A shard the **router** knows about but this process has no pool for must be
 /// reported `unavailable`, never silently omitted (Codex round-19 P1).
 ///
-/// This is the mid-rollout topology from the CLAUDE.md "add a shard" procedure:
+/// This is the mid-rollout topology from the `docs/architecture.md` "add a shard"
+/// procedure:
 /// `readable_shards` is widened *before* every process has the new shard's pool
 /// wired up. Enumerating only `pool.iter_shards()` omits that shard from BOTH
 /// `inspected_shards` and `unavailable_shards` — and `SampleStatus::from_counts`

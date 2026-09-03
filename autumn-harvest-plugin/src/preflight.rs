@@ -439,8 +439,13 @@ const HARVEST_WRITE_PRIVILEGE_REQUIREMENTS: &[(&str, &[&str])] = &[
         &["SELECT", "INSERT", "UPDATE", "DELETE"],
     ),
     (
+        // DELETE is required by the idle-bucket GC (issue #1127). Without it
+        // here, a least-privilege role passes preflight and then every janitor
+        // tick fails with `permission denied`, swallowed into a warn log with a
+        // zero count — indistinguishable from "nothing was eligible" while the
+        // table grows unbounded, which is the exact bug the GC exists to fix.
         "harvest_rate_limit_buckets",
-        &["SELECT", "INSERT", "UPDATE"],
+        &["SELECT", "INSERT", "UPDATE", "DELETE"],
     ),
 ];
 

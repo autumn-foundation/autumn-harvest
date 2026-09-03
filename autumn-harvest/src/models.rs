@@ -598,6 +598,15 @@ pub struct RateLimitBucket {
     /// take precedence, per-field, over the declared baseline) while this is
     /// set and in the future (issue #945).
     pub override_expires_at: Option<DateTime<Utc>>,
+    /// When `queue::ensure_rate_limit_bucket` last (re-)registered this bucket
+    /// (issue #1127). Part of the idle-bucket GC's idleness clock; `None` on a
+    /// row that has not been registered since the upgrade.
+    pub last_registered_at: Option<DateTime<Utc>>,
+    /// When an operator last wrote this bucket's permanent baseline through
+    /// `POST /admin/rate-limits/{key}` (issue #332). Non-`None` makes the row
+    /// **exempt** from the idle-bucket GC (issue #1127), so this is also the
+    /// answer to "why is this bucket never collected?".
+    pub baseline_set_at: Option<DateTime<Utc>>,
 }
 
 /// Insert struct for a rate limit bucket.
