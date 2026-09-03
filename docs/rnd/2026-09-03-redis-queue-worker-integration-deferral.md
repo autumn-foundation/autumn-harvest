@@ -79,7 +79,10 @@ currently hits.
 
 ## Default path
 
-Postgres remains the only usable task-queue backend. `autumn-harvest-redis`
+Postgres remains the only task-queue backend usable by the main
+`autumn-harvest` worker/server runtime this record is about (the separate
+`autumn-harvest-sqlite` crate is its own embedded backend with its own queue
+and worker, unaffected by this decision either way). `autumn-harvest-redis`
 stays shipped-but-unintegrated, already correctly caveated in
 `docs/autumn-workflow-architecture.md:1017` ("the adapter is not yet wired
 into the worker... cannot be turned on by an operator today"). No operator
@@ -88,11 +91,18 @@ this line closing.
 
 ## Seam kept open
 
-The task-queue adapter boundary is already drawn: `autumn-harvest-redis`
-implements the same conceptual queue operations (`enqueue`/`claim`/`complete`/
-`fail`/`recover_pending`) as the Postgres path, as an independent, optional
-crate. Nothing needs to be un-done to resume this later — the seam is the
-crate boundary itself.
+Only half-drawn. `autumn-harvest-redis` defines a `TaskQueueAdapter` trait
+covering the same conceptual operations
+(`enqueue`/`claim`/`complete`/`fail`/`recover_pending`) as the Postgres path,
+but that trait's own doc comment (`autumn-harvest-redis/src/adapter.rs:3-9`)
+says it has exactly one production implementation — Redis — because
+adapting the Postgres function-shaped API in `worker.rs` to it is itself
+"a non-trivial refactor," not yet attempted. So what's kept is Redis-side
+scaffolding and a target shape, not a shared abstraction both backends
+already implement; the worker/Postgres side of that boundary is still to
+be designed whenever this is picked back up. Nothing built so far needs to
+be un-done, but resuming this is not just "plug the worker into an
+existing seam."
 
 ## Trigger to revisit
 
