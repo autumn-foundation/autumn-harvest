@@ -7313,8 +7313,7 @@ pub async fn persist_workflow_completion(
             // transaction holds says nothing about `harvest_task_queue`
             // ownership -- a stale dispatcher whose claim was reclaimed
             // elsewhere must make no terminal decision here.
-            if !queue::claim_still_held_for_update(conn, task_id, worker_id, crash_strikes).await?
-            {
+            if !queue::claim_still_held_for_update(conn, task_id, worker_id, crash_strikes).await? {
                 return Err(HarvestError::TerminalWriteClaimAmbiguous { task_id });
             }
             store::append_events_offloaded_with_codecs(
@@ -7513,8 +7512,7 @@ pub async fn persist_workflow_failure(
             // Issue #1184: re-derive the task-row claim under its own lock
             // before committing this failure -- see the identical guard in
             // `persist_workflow_completion` for the rationale.
-            if !queue::claim_still_held_for_update(conn, task_id, worker_id, crash_strikes).await?
-            {
+            if !queue::claim_still_held_for_update(conn, task_id, worker_id, crash_strikes).await? {
                 return Err(HarvestError::TerminalWriteClaimAmbiguous { task_id });
             }
             store::append_events_with_codecs(
@@ -12292,8 +12290,7 @@ pub async fn persist_child_workflow_completion(
             // Issue #1184: same task-row ownership recheck as
             // `persist_workflow_completion` -- see its guard for the
             // rationale.
-            if !queue::claim_still_held_for_update(conn, task_id, worker_id, crash_strikes).await?
-            {
+            if !queue::claim_still_held_for_update(conn, task_id, worker_id, crash_strikes).await? {
                 return Err(HarvestError::TerminalWriteClaimAmbiguous { task_id });
             }
             store::append_events_with_codecs(conn, exec_id, &[event], next_event_id, codecs)
@@ -12357,8 +12354,7 @@ pub async fn persist_child_workflow_failure(
             let message = decoded.message.clone();
             // Issue #1184: same task-row ownership recheck as
             // `persist_workflow_failure` -- see its guard for the rationale.
-            if !queue::claim_still_held_for_update(conn, task_id, worker_id, crash_strikes).await?
-            {
+            if !queue::claim_still_held_for_update(conn, task_id, worker_id, crash_strikes).await? {
                 return Err(HarvestError::TerminalWriteClaimAmbiguous { task_id });
             }
             store::append_events_with_codecs(

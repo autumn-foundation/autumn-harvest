@@ -23,6 +23,7 @@ use autumn_harvest::event::WorkflowEvent;
 use autumn_harvest::models::{NewWorkflowExecution, TaskQueueItem, WorkflowExecution};
 use autumn_harvest::queue::{self, EnqueueParams, TaskType};
 use autumn_harvest::schema::{harvest_task_queue, harvest_workflow_executions};
+use autumn_harvest::store;
 use autumn_harvest::types::ExecutionId;
 use autumn_harvest::worker::{
     HandlerRegistry, PreloadedFailureHistory, WorkflowTaskPersistence, check_paused_and_park,
@@ -30,7 +31,6 @@ use autumn_harvest::worker::{
     persist_child_workflow_failure, persist_workflow_completion, persist_workflow_continue_as_new,
     persist_workflow_failure,
 };
-use autumn_harvest::store;
 
 use chrono::Utc;
 use diesel::prelude::*;
@@ -179,7 +179,11 @@ async fn seed_claimed_task(
     .await
     .expect("claim task");
 
-    let task = load_tasks(url, exec_id).await.into_iter().next().expect("the seeded task row");
+    let task = load_tasks(url, exec_id)
+        .await
+        .into_iter()
+        .next()
+        .expect("the seeded task row");
     (exec_id, task)
 }
 
@@ -530,7 +534,10 @@ async fn fail_task_and_execution_with_history_makes_no_terminal_decision_when_th
         .into_iter()
         .find(|t| t.id == task.id)
         .expect("the task row survives an undecided dispatch");
-    assert_eq!(reloaded.state, "RUNNING", "must not be marked FAILED by the stale dispatcher");
+    assert_eq!(
+        reloaded.state, "RUNNING",
+        "must not be marked FAILED by the stale dispatcher"
+    );
     assert_eq!(reloaded.worker_id.as_deref(), Some("thief"));
 }
 
@@ -545,7 +552,8 @@ async fn fail_task_and_execution_with_history_makes_no_terminal_decision_when_th
 async fn fail_task_and_execution_with_history_makes_no_terminal_decision_when_the_claim_moved_and_history_is_unavailable()
  {
     let (url, _container) = setup_db().await;
-    let (exec_id, task) = seed_claimed_task(&url, "q1184-history-unavailable", "dispatcher-a").await;
+    let (exec_id, task) =
+        seed_claimed_task(&url, "q1184-history-unavailable", "dispatcher-a").await;
     steal_claim(&url, task.id).await;
 
     let mut conn = connect(&url).await;
@@ -576,7 +584,10 @@ async fn fail_task_and_execution_with_history_makes_no_terminal_decision_when_th
         .into_iter()
         .find(|t| t.id == task.id)
         .expect("the task row survives an undecided dispatch");
-    assert_eq!(reloaded.state, "RUNNING", "must not be marked FAILED by the stale dispatcher");
+    assert_eq!(
+        reloaded.state, "RUNNING",
+        "must not be marked FAILED by the stale dispatcher"
+    );
     assert_eq!(reloaded.worker_id.as_deref(), Some("thief"));
 }
 

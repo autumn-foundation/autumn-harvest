@@ -830,9 +830,7 @@ pub enum HarvestError {
     /// holding the execution row would risk. See
     /// [`Self::SuspendedClaimAmbiguous`]'s doc comment for the full
     /// explanation.
-    #[error(
-        "a workflow-task terminal write could not confirm it still owns the task's claim"
-    )]
+    #[error("a workflow-task terminal write could not confirm it still owns the task's claim")]
     TerminalWriteClaimAmbiguous {
         /// The task-queue row whose ownership could not be confirmed.
         task_id: Uuid,
