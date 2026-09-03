@@ -2697,6 +2697,42 @@ async fn zz_capture_schedule_to_close_claim_evidence() {
         total_buffers: i64,
     }
 
+    // Heap-growth snapshot helper, used immediately before and after the real
+    // drain loop below: isolates how much of the aggregate pg_stat_statements
+    // buffer delta is attributable to MVCC bloat accumulating over the drain
+    // itself (10,000 individual claim UPDATEs with no VACUUM in between, the
+    // real production shape) rather than to the wider row alone -- a
+    // single-call EXPLAIN snapshot, seeded fresh and rolled back inside a
+    // transaction, can never see this: it never accumulates dead tuples.
+    #[derive(QueryableByName, Debug, Clone, Copy)]
+    struct HeapStatRow {
+        #[diesel(sql_type = diesel::sql_types::BigInt)]
+        heap_pages: i64,
+        #[diesel(sql_type = diesel::sql_types::BigInt)]
+        n_live_tup: i64,
+        #[diesel(sql_type = diesel::sql_types::BigInt)]
+        n_dead_tup: i64,
+    }
+    async fn heap_stats(label: &str, when: &str, conn: &mut AsyncPgConnection) -> HeapStatRow {
+        let rows: Vec<HeapStatRow> = diesel::sql_query(
+            "SELECT pg_relation_size('harvest_task_queue') / 8192 AS heap_pages, \
+                    n_live_tup, n_dead_tup \
+             FROM pg_stat_user_tables WHERE relname = 'harvest_task_queue'",
+        )
+        .load(conn)
+        .await
+        .expect("pg_relation_size/pg_stat_user_tables query failed");
+        let row = rows.into_iter().next().expect(
+            "no pg_stat_user_tables row for harvest_task_queue -- \
+             autovacuum stats not yet populated for this fresh table",
+        );
+        eprintln!(
+            "label={label} when={when} heap_pages={} n_live_tup={} n_dead_tup={}",
+            row.heap_pages, row.n_live_tup, row.n_dead_tup
+        );
+        row
+    }
+
     let Some(bench) = bench_db_or_skip().await else {
         eprintln!("no database reachable; nothing captured");
         return;
@@ -2906,41 +2942,8 @@ async fn zz_capture_schedule_to_close_claim_evidence() {
                 .expect("re-analyze before the stat-snapshot drain");
         }
 
-        // Heap-growth snapshot immediately before the drain starts: isolates
-        // how much of the aggregate pg_stat_statements buffer delta (below)
-        // is attributable to MVCC bloat accumulating over the drain itself
-        // (10,000 individual claim UPDATEs with no VACUUM in between, the
-        // real production shape) rather than to the wider row alone -- a
-        // single-call EXPLAIN snapshot, seeded fresh and rolled back inside a
-        // transaction, can never see this: it never accumulates dead tuples.
-        #[derive(QueryableByName, Debug, Clone, Copy)]
-        struct HeapStatRow {
-            #[diesel(sql_type = diesel::sql_types::BigInt)]
-            heap_pages: i64,
-            #[diesel(sql_type = diesel::sql_types::BigInt)]
-            n_live_tup: i64,
-            #[diesel(sql_type = diesel::sql_types::BigInt)]
-            n_dead_tup: i64,
-        }
-        async fn heap_stats(label: &str, when: &str, conn: &mut AsyncPgConnection) -> HeapStatRow {
-            let rows: Vec<HeapStatRow> = diesel::sql_query(
-                "SELECT pg_relation_size('harvest_task_queue') / 8192 AS heap_pages, \
-                        n_live_tup, n_dead_tup \
-                 FROM pg_stat_user_tables WHERE relname = 'harvest_task_queue'",
-            )
-            .load(conn)
-            .await
-            .expect("pg_relation_size/pg_stat_user_tables query failed");
-            let row = rows.into_iter().next().expect(
-                "no pg_stat_user_tables row for harvest_task_queue -- \
-                 autovacuum stats not yet populated for this fresh table",
-            );
-            eprintln!(
-                "label={label} when={when} heap_pages={} n_live_tup={} n_dead_tup={}",
-                row.heap_pages, row.n_live_tup, row.n_dead_tup
-            );
-            row
-        }
+        // Heap-growth snapshot immediately before the drain starts -- see
+        // heap_stats()'s doc comment above for why this matters.
         let heap_before = heap_stats(label, "before-drain", &mut stats_conn).await;
 
         // Drive the real claim path repeatedly so pg_stat_statements
