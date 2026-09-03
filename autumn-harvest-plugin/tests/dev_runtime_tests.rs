@@ -332,15 +332,140 @@ fn classify_terminates_and_never_panics_on_adversarial_dsn_syntax() {
 }
 
 #[test]
+fn redaction_covers_a_password_separated_by_non_ascii_whitespace() {
+    // The Postgres client separates keyword/value options on the Unicode
+    // `White_Space` property, so a no-break space genuinely starts a new
+    // option and this DSN really does carry a password the client will use.
+    // A scanner that only knows ASCII whitespace swallows the whole tail into
+    // `host`'s value, finds no `password` key, and prints the credential in
+    // the one string whose entire purpose is to be safe to paste into an issue.
+    let dsn = "host=localhost\u{a0}password=hunter2\u{a0}dbname=app";
+    let redacted = redact_dsn(dsn);
+    assert!(
+        !redacted.contains("hunter2"),
+        "a password after a no-break space is still a password: {redacted:?}"
+    );
+    assert!(redacted.contains("dbname=app"), "{redacted:?}");
+}
+
+#[test]
 fn redaction_still_covers_a_password_next_to_a_multibyte_escape() {
     // The keyword scanner is shared with the safety gate after #1286, so the
     // banner's whole reason for existing — never printing a credential — is
     // asserted against the shared implementation too.
+    // Asserted as an EXACT string, not by absence of the password: `value_span`
+    // is new API, and a one-byte slip at either end of it either leaks the edge
+    // of a credential or eats the option next to it. Both survive a
+    // `!contains("hunter2")` check.
     let dsn = r"host=localhost password='hunter2\é x' dbname=harvest_dev";
-    let redacted = redact_dsn(dsn);
-    assert!(!redacted.contains("hunter2"), "{redacted}");
-    assert!(redacted.contains("host=localhost"), "{redacted}");
-    assert!(redacted.contains("dbname=harvest_dev"), "{redacted}");
+    assert_eq!(
+        redact_dsn(dsn),
+        "host=localhost password=*** dbname=harvest_dev"
+    );
+    // The same, one option earlier and unquoted, so the span ends at whitespace
+    // rather than at a closing quote.
+    assert_eq!(
+        redact_dsn(r"password=hunter2\é host=localhost"),
+        "password=*** host=localhost"
+    );
+}
+
+#[test]
+fn classify_considers_every_sslmode_occurrence_not_just_the_last() {
+    // The client keeps the LAST value for a duplicated key. This scan refuses
+    // if ANY occurrence demands TLS, which is the failing-closed side of that
+    // disagreement — and costs nothing real, because a DSN naming `verify-*`
+    // anywhere is one `Config::from_str` refuses outright.
+    for dsn in [
+        "host=localhost sslmode=disable sslmode=verify-full dbname=app",
+        "host=localhost sslmode=verify-full sslmode=disable dbname=app",
+        "postgres://u@localhost/app?sslmode=disable&sslmode=verify-full",
+        "postgres://u@localhost/app?sslmode=verify-full&sslmode=disable",
+    ] {
+        let safety = classify_database_url(dsn);
+        let DatabaseSafety::Refused(RefusalReason::TlsRequired { sslmode }) = &safety else {
+            panic!("{dsn} names verify-full and must be refused as such, got {safety:?}");
+        };
+        assert_eq!(sslmode, "verify-full", "{dsn}");
+    }
+}
+
+#[test]
+fn classify_matches_the_sslmode_key_and_value_case_insensitively() {
+    // Wider than the client, deliberately: `tokio_postgres` matches these
+    // exactly and would reject every one of them as an unknown option or an
+    // invalid value. Refusing with the reason rather than "could not be
+    // understood" is strictly more useful, and both answers are a refusal.
+    for dsn in [
+        "host=localhost SSLMODE=verify-full dbname=app",
+        "host=localhost SslMode=require dbname=app",
+        "host=localhost sslmode=VERIFY-FULL dbname=app",
+        "postgres://u@localhost/app?SSLMODE=verify-full",
+        "postgres://u@localhost/app?sslmode=Require",
+    ] {
+        let safety = classify_database_url(dsn);
+        assert!(
+            matches!(
+                safety,
+                DatabaseSafety::Refused(RefusalReason::TlsRequired { .. })
+            ),
+            "{dsn} -> {safety:?}"
+        );
+    }
+}
+
+#[test]
+fn classify_reaches_the_verdicts_the_substring_scan_used_to_short_circuit() {
+    // Refusing on text found inside a value did not just cost a good message:
+    // it returned BEFORE the host and name checks, so the DSN's real problem
+    // was never reported. These are the verdicts that were unreachable.
+    let remote_hostaddr = classify_database_url(
+        "postgres://u@localhost/app?hostaddr=203.0.113.5&application_name=sslmode=require",
+    );
+    assert!(
+        matches!(
+            remote_hostaddr,
+            DatabaseSafety::Refused(RefusalReason::RemoteHost { .. })
+        ),
+        "the remote hostaddr is the real problem here: {remote_hostaddr:?}"
+    );
+
+    let remote_host = classify_database_url(
+        "host=localhost,db.example.com dbname=app password='sslmode=require'",
+    );
+    assert!(
+        matches!(
+            remote_host,
+            DatabaseSafety::Refused(RefusalReason::RemoteHost { .. })
+        ),
+        "{remote_host:?}"
+    );
+
+    let production =
+        classify_database_url("host=localhost dbname=app_production password='sslmode=require'");
+    assert!(
+        matches!(
+            production,
+            DatabaseSafety::Suspicious(SuspicionReason::ProductionShapedName { .. })
+        ),
+        "a production-shaped local name is an opt-in, not a refusal: {production:?}"
+    );
+}
+
+#[test]
+fn classify_does_not_read_a_uri_userinfo_as_a_query_parameter() {
+    // Everything before the `?` is authority and path. A password or username
+    // that happens to contain the text is still just a credential.
+    for dsn in [
+        "postgres://u:sslmode=require@localhost/app",
+        "postgres://sslmode=require:pw@localhost/app",
+    ] {
+        let safety = classify_database_url(dsn);
+        assert!(
+            matches!(safety, DatabaseSafety::Allowed),
+            "{dsn} carries no sslmode parameter -> {safety:?}"
+        );
+    }
 }
 
 #[test]

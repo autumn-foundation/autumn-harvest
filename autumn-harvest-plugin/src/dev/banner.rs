@@ -12,7 +12,7 @@
 use std::fmt::Write as _;
 use std::path::PathBuf;
 
-use super::dsn::{self, percent_decoded};
+use super::dsn;
 
 /// Where the runtime's storage came from, which is also what may be promised
 /// about its teardown.
@@ -183,15 +183,25 @@ pub fn redact_dsn(dsn: &str) -> String {
         // has to see the whole string to consume quoted values whole.
         return redact_keyword_value(dsn);
     }
-    let (base, query) = match dsn.split_once('?') {
-        Some((base, query)) => (base, Some(query)),
-        None => (dsn, None),
+    let Some(question) = dsn.find('?') else {
+        return redact_userinfo(dsn);
     };
-    let redacted_base = redact_userinfo(base);
-    match query {
-        Some(query) => format!("{redacted_base}?{}", redact_query_password(query)),
-        None => redacted_base,
+    let mut out = redact_userinfo(&dsn[..question]);
+    // Splice over each password value's span, exactly as the keyword/value
+    // branch does, so every other byte of the query string — including a
+    // percent-encoded `password` key, which is not itself a secret — reaches
+    // the banner as the developer typed it.
+    let mut copied = question;
+    for parameter in dsn::uri_query_parameters(dsn) {
+        if !parameter.key.eq_ignore_ascii_case("password") {
+            continue;
+        }
+        out.push_str(&dsn[copied..parameter.value_span.start]);
+        out.push_str("***");
+        copied = parameter.value_span.end;
     }
+    out.push_str(&dsn[copied..]);
+    out
 }
 
 /// Redact `user:password@host` in the pre-query part of a URI, or `password=`
@@ -215,29 +225,6 @@ fn redact_userinfo(base: &str) -> String {
         Some((user, _)) => format!("{scheme}{user}:***{host}{tail}"),
         None => base.to_owned(),
     }
-}
-
-/// Redact a `password=` parameter in a URI query string.
-///
-/// The key is percent-decoded before it is compared. `tokio_postgres`'s URI
-/// parser decodes query keys before matching them, so `?%70assword=` **is** the
-/// password parameter as far as the code that dials is concerned — and
-/// comparing the raw key printed the whole credential in the banner.
-fn redact_query_password(query: &str) -> String {
-    query
-        .split('&')
-        .map(|pair| {
-            if pair
-                .split_once('=')
-                .is_some_and(|(key, _)| percent_decoded(key).eq_ignore_ascii_case("password"))
-            {
-                "password=***".to_owned()
-            } else {
-                pair.to_owned()
-            }
-        })
-        .collect::<Vec<_>>()
-        .join("&")
 }
 
 /// Redact `password=` from a keyword/value connection string.

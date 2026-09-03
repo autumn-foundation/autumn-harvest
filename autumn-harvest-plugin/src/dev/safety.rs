@@ -213,9 +213,12 @@ pub fn classify_database_url(dsn: &str) -> DatabaseSafety {
         }
     };
 
-    // The authoritative TLS check, for a spelling the textual scan cannot see
-    // (a percent-encoded key, say). Both are needed: this one cannot tell
-    // `require` from `verify-full`, and that one cannot see through encoding.
+    // The authoritative TLS check. Both are needed, and neither subsumes the
+    // other: this one cannot tell `require` from `verify-full` — the client
+    // collapses every TLS mode it accepts into `Require` — while that one
+    // reads the DSN's text and so misses any spelling it declines to split on
+    // (a `?` swallowed into a URI's userinfo, say). This is the one that
+    // decides, and it sees exactly what the client will dial.
     if config.get_ssl_mode() == tokio_postgres::config::SslMode::Require {
         return DatabaseSafety::Refused(RefusalReason::TlsRequired {
             sslmode: "require".to_owned(),
@@ -312,8 +315,8 @@ fn tls_requiring_sslmode(dsn: &str) -> Option<String> {
     let demands_tls = |mode: &String| TLS_REQUIRING_SSLMODES.contains(&mode.as_str());
     if dsn::is_uri_dsn(dsn) {
         dsn::uri_query_parameters(dsn)
-            .filter(|(key, _)| key.eq_ignore_ascii_case(SSLMODE_KEY))
-            .map(|(_, value)| value.to_ascii_lowercase())
+            .filter(|parameter| parameter.key.eq_ignore_ascii_case(SSLMODE_KEY))
+            .map(|parameter| parameter.value.to_ascii_lowercase())
             .find(demands_tls)
     } else {
         dsn::keyword_options(dsn)
