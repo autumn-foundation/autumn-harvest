@@ -2156,3 +2156,336 @@ mod one_worker_process {
         );
     }
 }
+
+// ══ Codex review round 1 regressions ══════════════════════════════════════════
+//
+// One test per finding, each written to fail against the code as reviewed.
+
+#[tokio::test]
+async fn the_activity_allowlist_survives_the_worker_dispatch_seam() {
+    // P1. `HandlerRegistry` stored only the `ModuleRegistry`, so the dispatch
+    // seam built a fresh `ModuleHost::new` per task — whose `allowed_activities`
+    // is `None`. Every restriction an operator configured through
+    // `allowing_activities` was therefore discarded on the one path that
+    // matters, and production guests could schedule any activity the worker
+    // knew. The registry now stores the whole policy; this pins that the
+    // allowlist is what dispatch reads back.
+    let registry = registry_with(&[("wf-v1", "pipeline", pipeline_v1_bytes())]);
+    let configured = ModuleHost::new(Arc::clone(&registry))
+        .allowing_activities(["refund"])
+        .allowing_queue_override();
+
+    let handlers =
+        autumn_harvest::worker::HandlerRegistry::new(vec![], vec![]).with_module_host(configured);
+
+    let policy = handlers
+        .module_host()
+        .expect("module hosting is configured on the registry");
+    assert_eq!(
+        policy
+            .allowed_activities
+            .as_ref()
+            .expect("the allowlist reaches dispatch")
+            .iter()
+            .collect::<Vec<_>>(),
+        vec!["refund"],
+        "dispatch must read the operator's allowlist, not a default one"
+    );
+    assert!(
+        policy.allow_queue_override,
+        "dispatch must read the operator's queue-override switch"
+    );
+    assert!(
+        handlers.module_registry().is_some(),
+        "the registry is still reachable through the stored policy"
+    );
+
+    // `with_module_registry` remains the unrestricted shorthand, and says so.
+    let defaulted = autumn_harvest::worker::HandlerRegistry::new(vec![], vec![])
+        .with_module_registry(Arc::clone(&registry));
+    let defaulted = defaulted.module_host().expect("configured");
+    assert!(defaulted.allowed_activities.is_none());
+    assert!(!defaulted.allow_queue_override);
+}
+
+#[tokio::test]
+async fn a_pinned_module_survives_an_unload_that_races_the_dispatch() {
+    // P1. The worker seam resolves the module before dispatch so a miss is a
+    // typed capability miss rather than a terminal failure. It then dropped the
+    // `Arc` and let the trampoline look the binding up a *second* time — so an
+    // `unload_build` landing between the two turned a passed capability check
+    // into `Err(String)`, i.e. exactly the terminal `WorkflowFailed` the
+    // pre-check exists to avoid, and contradicted the safety analysis's claim
+    // that unloading is safe for in-flight invocations.
+    let registry = registry_with(&[("wf-v1", "pipeline", pipeline_v1_bytes())]);
+    let pinned = registry
+        .get("wf-v1", "pipeline")
+        .expect("dispatch resolves the module");
+
+    // The race: the binding is gone before the handler ever runs.
+    assert_eq!(registry.unload_build("wf-v1"), 1);
+    assert!(registry.get("wf-v1", "pipeline").is_none());
+
+    let outcome = with_module_host(
+        host(&registry, "wf-v1").with_pinned_module(pinned),
+        env().run(module_workflow_handler, json!({"order": 1})),
+    )
+    .await;
+
+    assert_eq!(
+        outcome.result.expect("the pinned module still runs"),
+        json!("v1-done"),
+        "an unload must not destroy an execution that already resolved its module"
+    );
+}
+
+#[tokio::test]
+async fn an_unpinned_host_still_reports_a_missing_module() {
+    // The fallback path is for direct/embedder use and must keep failing loudly
+    // rather than silently running nothing.
+    let registry = registry_with(&[("wf-v1", "pipeline", pipeline_v1_bytes())]);
+    assert_eq!(registry.unload_build("wf-v1"), 1);
+
+    let outcome = with_module_host(
+        host(&registry, "wf-v1"),
+        env().run(module_workflow_handler, json!({})),
+    )
+    .await;
+    let err = outcome.result.expect_err("no module is loaded");
+    assert!(
+        err.contains("no workflow module is loaded"),
+        "unexpected error: {err}"
+    );
+}
+
+#[tokio::test]
+async fn the_trampoline_never_yields_between_decisions() {
+    // P1, and the subtlest of the three. `executor::run_workflow_handler_cycle`
+    // drives the handler inside `tokio::time::timeout(SUSPENSION_TIMEOUT)` —
+    // 100ms — and a workflow that returns `Poll::Pending` is BY DEFINITION
+    // treated as suspended. A `yield_now()` between guest decisions was
+    // therefore the one point at which that timer could fire while the
+    // trampoline had not yet recorded a command, yielding a zero-command
+    // suspension: a workflow parked on nothing, which the worker fails
+    // terminally.
+    //
+    // The invariant that replaces it: the trampoline's ONLY await is
+    // `execute_activity_raw`, which pushes its `ScheduleActivity` command before
+    // parking. Every suspension a hosted workflow can produce therefore carries
+    // a command, exactly as a statically-linked one's does. This test pins the
+    // source, because the failure it guards against is a timing race that a
+    // functional test reproduces only flakily.
+    let src = include_str!("../../src/hot_swap.rs");
+    let handler_start = src
+        .find("pub fn module_workflow_handler(")
+        .expect("the trampoline is where the guard expects it");
+    let body = &src[handler_start..];
+    let live: String = body
+        .lines()
+        .filter(|line| !line.trim_start().starts_with("//"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        !live.contains("yield_now"),
+        "the trampoline must not yield between decisions: a `Poll::Pending` \
+         without a recorded command is read as a zero-command suspension and \
+         fails the workflow terminally"
+    );
+
+    // And the guest still completes when its decisions are the slow part.
+    let outcome = with_module_host(
+        host(
+            &registry_with(&[("wf-v1", "pipeline", pipeline_v1_bytes())]),
+            "wf-v1",
+        ),
+        env().run(module_workflow_handler, json!({"order": 1})),
+    )
+    .await;
+    assert_eq!(outcome.result.expect("completes"), json!("v1-done"));
+}
+
+#[tokio::test]
+async fn decisions_are_cached_across_decision_cycles_not_within_one() {
+    // P2. The memo was created inside the handler future, and one invocation
+    // visits each step exactly once in increasing order — so it was written and
+    // never read, leaving the documented O(n^2) guest work fully in place. The
+    // cache has to outlive the invocation, which is why it lives on the host.
+    let registry = registry_with(&[("wf-v2", "pipeline", pipeline_v2_bytes())]);
+    let host = host(&registry, "wf-v2");
+    let outcome = with_module_host(
+        host.clone(),
+        env().run(module_workflow_handler, json!({"order": 1})),
+    )
+    .await;
+    assert_eq!(outcome.result.expect("completes"), json!("v2-done"));
+
+    let cached = host.decisions.lock().expect("cache is not poisoned").len();
+    assert!(
+        cached >= 2,
+        "the host-scoped cache must retain decisions across cycles, held {cached}"
+    );
+}
+
+#[tokio::test]
+async fn the_decision_cache_never_serves_one_builds_answer_to_another() {
+    // A `DecideRequest` carries no build id — the guest has no business knowing
+    // its own version — so v1 and v2 of one workflow see byte-identical input at
+    // step 0. Keying the cache on the request bytes alone would let v1's
+    // decision be served to v2, silently defeating the swap the spike exists to
+    // demonstrate. The key is prefixed with `(build_id, module_hash)`.
+    let registry = registry_with(&[
+        ("wf-v1", "pipeline", pipeline_v1_bytes()),
+        ("wf-v2", "pipeline", pipeline_v2_bytes()),
+    ]);
+    // One host, deliberately reused across both builds — the harshest case.
+    let shared = ModuleHost::new(Arc::clone(&registry));
+
+    let v1 = with_module_host(
+        shared.clone().with_build_id("wf-v1"),
+        env().run(module_workflow_handler, json!({})),
+    )
+    .await;
+    let v2 = with_module_host(
+        shared.clone().with_build_id("wf-v2"),
+        env().run(module_workflow_handler, json!({})),
+    )
+    .await;
+
+    assert_eq!(v1.result.expect("v1 completes"), json!("v1-done"));
+    assert_eq!(
+        v2.result.expect("v2 completes"),
+        json!("v2-done"),
+        "v2 must not be served v1's cached decision"
+    );
+}
+
+#[tokio::test]
+async fn for_task_does_not_share_the_prototypes_decision_cache() {
+    // The worker clones a stored prototype per task. A plain `Clone` shares the
+    // `Arc`, making the cache process-wide for the worker's whole life rather
+    // than scoped to one drive.
+    let registry = registry_with(&[("wf-v1", "pipeline", pipeline_v1_bytes())]);
+    let prototype = ModuleHost::new(Arc::clone(&registry))
+        .with_build_id("wf-v1")
+        .allowing_activities(["charge"]);
+
+    let scoped = prototype.for_task();
+    assert_eq!(
+        scoped.allowed_activities, prototype.allowed_activities,
+        "for_task carries the policy forward"
+    );
+
+    let outcome = with_module_host(
+        scoped.clone(),
+        env().run(module_workflow_handler, json!({})),
+    )
+    .await;
+    assert_eq!(outcome.result.expect("completes"), json!("v1-done"));
+
+    assert!(
+        !scoped.decisions.lock().expect("not poisoned").is_empty(),
+        "the task's own cache was populated"
+    );
+    assert!(
+        prototype.decisions.lock().expect("not poisoned").is_empty(),
+        "the prototype's cache must stay untouched, or it is a worker-lifetime map"
+    );
+}
+
+#[test]
+fn a_load_batch_may_not_bind_two_modules_to_one_key() {
+    // P2. Both `prepare` calls succeed and the commit-time duplicate check
+    // compared each entry only against the ALREADY-BOUND map — which knows
+    // nothing about the batch — so with nothing bound beforehand the insert loop
+    // let the last entry silently overwrite the first, bypassing the immutable-
+    // binding guarantee `load_modules` exists to enforce.
+    let registry = Arc::new(ModuleRegistry::new());
+    let v1 = pipeline_v1_bytes();
+    let v2 = pipeline_v2_bytes();
+    let none = ModuleVerification::none();
+
+    let err = registry
+        .load_modules(&[
+            ("wf-v1", "pipeline", v1.as_slice(), none),
+            ("wf-v1", "pipeline", v2.as_slice(), none),
+        ])
+        .expect_err("two modules may not claim one (build_id, workflow_name)");
+    assert!(
+        matches!(err, HotSwapError::DuplicateRegistration { .. }),
+        "unexpected error: {err}"
+    );
+    assert_eq!(
+        registry.len(),
+        0,
+        "a refused batch must bind nothing at all"
+    );
+
+    // The same key twice with the SAME bytes is still idempotent, not an error.
+    registry
+        .load_modules(&[
+            ("wf-v1", "pipeline", v1.as_slice(), none),
+            ("wf-v1", "pipeline", v1.as_slice(), none),
+        ])
+        .expect("identical bytes under one key stay idempotent");
+    assert_eq!(registry.len(), 1);
+}
+
+#[test]
+fn the_example_readme_documents_the_wire_format_the_host_actually_sends() {
+    // P2. The README's `DecideRequest` example carried an `abi_version` field
+    // the host has never transmitted (the ABI version is a host-side constant,
+    // deliberately not on the wire), so a guest written from the example could
+    // require or branch on a field it would never receive.
+    let readme = include_str!("../../examples/workflow-modules/README.md");
+    let example = readme
+        .lines()
+        .find(|line| line.starts_with(r#"{"step":0"#))
+        .expect("the README shows a DecideRequest example");
+
+    let encoded = encode_decide_request(&DecideRequest {
+        step: 0,
+        workflow: "checkout".to_string(),
+        input: json!({}),
+        resolved: vec![],
+    })
+    .expect("encodes");
+    let encoded = String::from_utf8(encoded).expect("utf-8");
+
+    let field_names = |s: &str| -> Vec<String> {
+        let mut out = Vec::new();
+        let bytes: Vec<char> = s.chars().collect();
+        let mut depth = 0usize;
+        let mut i = 0usize;
+        while i < bytes.len() {
+            match bytes[i] {
+                '{' | '[' => depth += 1,
+                '}' | ']' => depth -= 1,
+                '"' if depth == 1 => {
+                    let start = i + 1;
+                    let mut j = start;
+                    while j < bytes.len() && bytes[j] != '"' {
+                        j += 1;
+                    }
+                    if j + 1 < bytes.len() && bytes[j + 1] == ':' {
+                        out.push(bytes[start..j].iter().collect());
+                    }
+                    i = j;
+                }
+                _ => {}
+            }
+            i += 1;
+        }
+        out
+    };
+
+    assert_eq!(
+        field_names(example),
+        field_names(&encoded),
+        "the README's wire example must name exactly the fields, in the order, \
+         that `encode_decide_request` emits"
+    );
+    assert!(
+        !example.contains("abi_version"),
+        "the ABI version is a host-side constant and is never sent"
+    );
+}

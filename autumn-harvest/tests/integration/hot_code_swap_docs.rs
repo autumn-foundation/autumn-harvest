@@ -298,6 +298,9 @@ const CITED_TESTS: &[&str] = &[
     "the_hosts_encoder_never_reorders_keys_the_way_a_json_value_would",
     "an_activity_failure_is_handed_to_the_guest_rather_than_failing_the_run",
     "only_activity_outcomes_are_handed_to_the_guest",
+    // Codex review round 1.
+    "the_decision_cache_never_serves_one_builds_answer_to_another",
+    "the_trampoline_never_yields_between_decisions",
     "a_signed_module_cannot_be_rebound_under_another_build_id",
     "a_failing_module_leaves_the_whole_build_unbound",
     "a_guest_may_not_schedule_an_activity_the_host_did_not_allow",
@@ -505,4 +508,90 @@ fn every_guest_response_is_valid_json_for_the_decide_abi() {
             );
         }
     }
+}
+
+// ── Codex review round 1: keep the report's numbers and its C9 claim honest ────
+
+/// Every `(constant, value)` the report quotes as a number in prose.
+///
+/// The report is the deliverable a reader reaches a go/no-go from, so a figure
+/// in it that no longer matches the code is worse than no figure at all. Two had
+/// already drifted (`MAX_DECIDE_STEPS` quoted as 512 against 64;
+/// `DECIDE_MAX_WALL_CLOCK` as 500 ms against 5 s) before this guard existed.
+const REPORT_CONSTANTS: &[(&str, &str)] = &[
+    ("MAX_DECIDE_STEPS", "64"),
+    ("DECIDE_MAX_WALL_CLOCK", "5 s"),
+    ("DECIDE_RUN_WALL_CLOCK", "10 s"),
+];
+
+#[test]
+fn the_reports_quoted_constants_match_the_source() {
+    let source = read_src("src/hot_swap.rs");
+    let report = read_report();
+
+    // What the source actually declares, so the table above cannot itself drift.
+    let declared = |name: &str| -> String {
+        let needle = format!("pub const {name}");
+        let line = source
+            .lines()
+            .find(|line| line.trim_start().starts_with(&needle))
+            .unwrap_or_else(|| panic!("`{name}` is no longer declared in src/hot_swap.rs"));
+        line.to_string()
+    };
+
+    for (name, quoted) in REPORT_CONSTANTS {
+        let line = declared(name);
+        let digits: String = quoted.chars().filter(char::is_ascii_digit).collect();
+        assert!(
+            line.contains(&digits),
+            "the report quotes `{name}` as `{quoted}`, but the source declares: {line}"
+        );
+        assert!(
+            report.contains(&format!("`{name}`")),
+            "the report should name `{name}` where it quotes its value"
+        );
+    }
+
+    // And the stale figures specifically must not come back.
+    assert!(
+        !report.contains("`MAX_DECIDE_STEPS` (512)"),
+        "MAX_DECIDE_STEPS is 64, not 512"
+    );
+    assert!(
+        !report.contains("`DECIDE_MAX_WALL_CLOCK` (500 ms)"),
+        "DECIDE_MAX_WALL_CLOCK is 5 s, not 500 ms"
+    );
+}
+
+#[test]
+fn the_report_records_the_no_await_without_a_command_constraint() {
+    // Codex review round 1's sharpest finding was that a `yield_now()` between
+    // guest decisions is read by `executor::run_workflow_handler_cycle` — which
+    // drives the handler inside `tokio::time::timeout(SUSPENSION_TIMEOUT)` — as a
+    // zero-command suspension, failing the workflow terminally. That is a
+    // property of the boundary, not a bug in one line, so it belongs in the
+    // report as a constraint a future extender will read.
+    let report = read_report();
+    assert!(
+        report.contains("C9"),
+        "the report must carry the C9 constraint: the host may not introduce an \
+         await that records no command"
+    );
+    assert!(
+        report.contains("SUSPENSION_TIMEOUT"),
+        "C9 has to name `SUSPENSION_TIMEOUT`, the mechanism that makes it true"
+    );
+    assert!(
+        report.contains("zero-command suspension"),
+        "C9 has to name the failure mode it prevents"
+    );
+
+    // The mechanism the constraint asserts is really there.
+    let executor = read_src("src/executor.rs");
+    assert!(
+        executor.contains("tokio::time::timeout(SUSPENSION_TIMEOUT"),
+        "C9's premise is that the executor drives the handler inside \
+         `tokio::time::timeout(SUSPENSION_TIMEOUT, ..)`; if that changed, the \
+          constraint needs re-deriving rather than re-asserting"
+    );
 }

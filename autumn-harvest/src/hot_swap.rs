@@ -89,11 +89,11 @@
 //! code is a use-after-free rather than a refcount decrement. See
 //! `docs/rnd/hot-code-swap.md` §3.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, PoisonError, RwLock};
+use std::sync::{Arc, Mutex, PoisonError, RwLock};
 use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
@@ -858,16 +858,37 @@ impl ModuleRegistry {
         // Re-take the duplicate decision for every entry before mutating
         // anything, so a batch that would conflict leaves the registry
         // untouched rather than half-applied.
-        for entry in &prepared {
-            if let Some(existing) = bindings.get(&entry.key)
-                && existing.descriptor.module_hash != entry.loaded.descriptor.module_hash
-            {
-                return Err(HotSwapError::DuplicateRegistration {
-                    build_id: entry.key.0.clone(),
-                    workflow_name: entry.key.1.clone(),
-                    existing: existing.descriptor.module_hash.clone(),
-                    attempted: entry.loaded.descriptor.module_hash.clone(),
-                });
+        //
+        // Two checks, not one. The first compares each entry against what is
+        // *already* bound. The second compares the entries against **each
+        // other** (issue #967, Codex review round 1): a batch carrying two
+        // different modules for one `(build_id, workflow_name)` passes the first
+        // check trivially when nothing is bound yet — `bindings` does not know
+        // about the batch — and the insert loop below would then let the last
+        // entry silently overwrite the first, which is precisely the immutable-
+        // binding guarantee this method exists to enforce. Rejecting it as a
+        // `DuplicateRegistration` keeps one answer to "what does this build id
+        // mean for this workflow" regardless of how the modules were submitted.
+        // Scoped so the borrows of `prepared` end before the insert loop moves it.
+        {
+            let mut seen: BTreeMap<&(String, String), &str> = BTreeMap::new();
+            for entry in &prepared {
+                let attempted = entry.loaded.descriptor.module_hash.as_str();
+                let existing = bindings
+                    .get(&entry.key)
+                    .map(|bound| bound.descriptor.module_hash.as_str())
+                    .or_else(|| seen.get(&entry.key).copied());
+                if let Some(existing) = existing
+                    && existing != attempted
+                {
+                    return Err(HotSwapError::DuplicateRegistration {
+                        build_id: entry.key.0.clone(),
+                        workflow_name: entry.key.1.clone(),
+                        existing: existing.to_string(),
+                        attempted: attempted.to_string(),
+                    });
+                }
+                seen.insert(&entry.key, attempted);
             }
         }
 
@@ -1031,7 +1052,54 @@ pub struct ModuleHost {
     /// `false` by default. Letting a guest pick any queue name in the shard is
     /// lateral movement, not configuration.
     pub allow_queue_override: bool,
+    /// The binding the dispatch path already resolved, held for the life of the
+    /// invocation (issue #967, Codex review round 1).
+    ///
+    /// The worker seam resolves the module *before* dispatch so a miss is a
+    /// typed capability miss rather than a terminal failure. Dropping that `Arc`
+    /// and looking the binding up a second time inside the trampoline would
+    /// reopen the window it was meant to close: an
+    /// [`unload_build`](ModuleRegistry::unload_build) landing between the two
+    /// lookups makes the second one miss, and *there* a miss is an
+    /// `Err(String)` — a terminal `WorkflowFailed` for an execution that had
+    /// already passed the capability check. Holding the `Arc` across dispatch is
+    /// what makes the documented "unloading is safe for in-flight invocations"
+    /// guarantee true rather than merely likely.
+    pub pinned_module: Option<Arc<LoadedWorkflowModule>>,
+    /// Decisions already taken for this workflow task, keyed by the exact
+    /// request bytes that produced them (issue #967, Codex review round 1).
+    ///
+    /// Under DD-1 the executor re-invokes the workflow from the top on every
+    /// decision cycle, so without a cache the guest is re-asked for steps
+    /// `0..n` on the nth activity completion — quadratic guest work over a run,
+    /// and a long run can burn its whole
+    /// [`DECIDE_RUN_WALL_CLOCK`] budget replaying decisions it already took.
+    /// A per-invocation map cannot help: one invocation visits each step
+    /// exactly once, in increasing order, so it never reads its own writes. The
+    /// cache has to outlive the invocation, which is why it lives on the host —
+    /// task-local, so it is scoped to exactly one execution's drive.
+    ///
+    /// Keyed by the module identity plus the [`encode_decide_request`] output,
+    /// rather than by step index. The guest is a pure function of the request,
+    /// so the request bytes *are* the cache key: an entry can only ever be
+    /// reused for a call that would have been given byte-identical input, to
+    /// byte-identical code. That makes the reuse sound by construction instead
+    /// of by an argument about which prefixes are stable. The identity prefix is
+    /// load-bearing — a `DecideRequest` carries no build id, so without it v1's
+    /// answer would be reusable for v2.
+    ///
+    /// Populate a fresh one per task with [`for_task`](Self::for_task); cloning
+    /// a prototype shares its cache.
+    pub decisions: Arc<Mutex<HashMap<Vec<u8>, DecideResponse>>>,
 }
+
+/// Hard ceiling on cached decisions per workflow task.
+///
+/// One cycle can add at most [`MAX_DECIDE_STEPS`] entries and later cycles
+/// re-derive the same keys, so a well-behaved run settles well below this. The
+/// bound exists so a guest that somehow varies its request stream cannot grow
+/// the map without limit for the life of the task.
+const MAX_CACHED_DECISIONS: usize = MAX_DECIDE_STEPS * 4;
 
 impl ModuleHost {
     /// A host over `registry` with no build bound, deny-all capabilities, the
@@ -1045,6 +1113,8 @@ impl ModuleHost {
             limits: default_decide_limits(),
             allowed_activities: None,
             allow_queue_override: false,
+            pinned_module: None,
+            decisions: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -1091,6 +1161,52 @@ impl ModuleHost {
     #[must_use]
     pub const fn allowing_queue_override(mut self) -> Self {
         self.allow_queue_override = true;
+        self
+    }
+
+    /// Clone this host as the policy for **one** workflow task, with an empty
+    /// decision cache.
+    ///
+    /// The worker stores a `ModuleHost` prototype and clones it per task. A
+    /// plain `Clone` would share the prototype's `decisions` `Arc` across every
+    /// execution on the worker, which is not what
+    /// [`decisions`](Self::decisions) documents and not what its key can
+    /// support: cache entries are scoped by the module identity below, but a
+    /// process-wide map would still accumulate for the worker's whole life
+    /// rather than for one drive. Use this, not `Clone`, at a dispatch seam.
+    #[must_use]
+    pub fn for_task(&self) -> Self {
+        Self {
+            registry: Arc::clone(&self.registry),
+            build_id: self.build_id.clone(),
+            capabilities: self.capabilities.clone(),
+            limits: self.limits,
+            allowed_activities: self.allowed_activities.clone(),
+            allow_queue_override: self.allow_queue_override,
+            pinned_module: self.pinned_module.clone(),
+            decisions: Arc::new(Mutex::new(HashMap::new())),
+        }
+    }
+
+    /// Pin the binding the dispatch path already resolved, so the trampoline
+    /// uses *that* module rather than looking it up again.
+    ///
+    /// See [`pinned_module`](Self::pinned_module) for why the second lookup is
+    /// a correctness problem and not just a wasted read.
+    #[must_use]
+    pub fn with_pinned_module(mut self, module: Arc<LoadedWorkflowModule>) -> Self {
+        self.pinned_module = Some(module);
+        self
+    }
+
+    /// Pin an optional binding — the shape the worker seam has, where a
+    /// non-module-hosted workflow resolves nothing.
+    #[must_use]
+    pub fn with_optional_pinned_module(
+        mut self,
+        module: Option<Arc<LoadedWorkflowModule>>,
+    ) -> Self {
+        self.pinned_module = module;
         self
     }
 
@@ -1186,34 +1302,38 @@ pub fn encode_decide_request(request: &DecideRequest) -> Result<Vec<u8>, String>
     Ok(bytes)
 }
 
-/// Invoke a guest for one decision.
+/// Invoke a guest for one decision, from an already-encoded request.
+///
+/// Takes bytes rather than a [`DecideRequest`] because the caller encodes the
+/// request anyway — those exact bytes are the decision cache's key (see
+/// [`ModuleHost::decisions`]), so encoding once and passing it through keeps the
+/// cache key and the guest's input the same object by construction. `step` is
+/// carried alongside only for the error message.
 ///
 /// Reuses the issue-#965 sandbox: same engine, same fresh per-invocation store,
 /// same fuel/epoch/memory bounding, same bounds-checked linear-memory ABI, same
 /// host-glue panic containment. The spike adds no second sandbox and no new
 /// `unsafe`.
-fn decide(
+fn decide_encoded(
     host: &ModuleHost,
     limits: &WasmLimits,
     module: &LoadedWorkflowModule,
-    request: &DecideRequest,
+    request_bytes: &[u8],
+    step: u32,
 ) -> Result<DecideResponse, String> {
-    let request_bytes = encode_decide_request(request)?;
-
     let raw = crate::wasm_activities::invoke_wasm_guest_bytes(
         host.registry.store(),
         module.module(),
-        &request_bytes,
+        request_bytes,
         &host.capabilities,
         limits,
         Some(limits.max_wall_clock),
     )
     .map_err(|failure| {
         format!(
-            "workflow module {} (build `{}`) failed at step {}: {}",
+            "workflow module {} (build `{}`) failed at step {step}: {}",
             module.descriptor().module_hash,
             module.descriptor().build_id,
-            request.step,
             bound_guest_text(&failure.to_string()),
         )
     })?;
@@ -1391,34 +1511,72 @@ pub fn module_workflow_handler(
                  assigned build id, so no module version can be resolved for it"
             )
         })?;
-        let module = host
-            .registry
-            .get(&build_id, &workflow_name)
-            .ok_or_else(|| {
-                format!(
-                    "no workflow module is loaded for build `{build_id}` and workflow \
+        // Prefer the binding the dispatch path already resolved. Re-resolving
+        // here would reopen the unload race the pre-dispatch check exists to
+        // close — see `ModuleHost::pinned_module`. The registry lookup remains
+        // the fallback for callers that bind a host directly (tests, embedders
+        // driving a workflow outside the worker seam).
+        let module = match host.pinned_module.clone() {
+            Some(pinned) => pinned,
+            None => host
+                .registry
+                .get(&build_id, &workflow_name)
+                .ok_or_else(|| {
+                    format!(
+                        "no workflow module is loaded for build `{build_id}` and workflow \
                  `{workflow_name}`"
-                )
-            })?;
+                    )
+                })?,
+        };
         // Re-clamp: `limits` is a `pub` field, so a caller can assign past
         // `with_limits`. These ceilings are what the safety analysis reasons
         // about, so the dispatch path must not trust the struct.
         let limits = clamp_decide_limits(host.limits);
 
-        // Under DD-1 the workflow restarts at step 0 on every decision cycle.
-        // The guest is a pure function of `(input, resolved)`, so a decision
-        // taken earlier in *this* invocation can be reused rather than
-        // recomputed — turning an O(n^2) cycle into O(1) new guest calls and
-        // removing the unbounded per-poll occupancy that came with it.
-        let mut memo: BTreeMap<u32, DecideResponse> = BTreeMap::new();
+        // Under DD-1 the workflow restarts at step 0 on every decision cycle, so
+        // the decisions for steps `0..n` are re-derived on every one of them.
+        // The cache that removes that quadratic lives on the *host* (task-local,
+        // one execution's drive) rather than in this future: a map created here
+        // is written and read in the same monotonically increasing pass and can
+        // never hit. See `ModuleHost::decisions`.
         let mut guest_time = Duration::ZERO;
         let mut resolved: Vec<DecideOutcome> = Vec::new();
 
         for step in 0..MAX_DECIDE_STEPS {
             let step_index = u32::try_from(step)
                 .expect("step is bounded by MAX_DECIDE_STEPS, far below u32::MAX");
-            let response = if let Some(cached) = memo.get(&step_index) {
-                cached.clone()
+            let request = DecideRequest {
+                step: step_index,
+                workflow: workflow_name.clone(),
+                input: input.clone(),
+                resolved: resolved.clone(),
+            };
+            let encoded = encode_decide_request(&request).map_err(|why| {
+                format!("failed to encode the decide request for step {step_index}: {why}")
+            })?;
+            // The cache key is the request bytes PREFIXED with the module
+            // identity. `DecideRequest` deliberately carries no build id — the
+            // guest has no business knowing which version it is — so the request
+            // bytes alone are ambiguous across builds: v1 and v2 of one workflow
+            // see byte-identical input at step 0, and a key without the identity
+            // would let v1's decision be served to v2, silently defeating the
+            // swap this whole spike is about. Prefixing with
+            // `(build_id, module_hash)` makes an entry reusable only for the
+            // exact code that produced it.
+            let mut key = Vec::with_capacity(encoded.len() + build_id.len() + 80);
+            key.extend_from_slice(build_id.as_bytes());
+            key.push(0);
+            key.extend_from_slice(module.descriptor().module_hash.as_bytes());
+            key.push(0);
+            key.extend_from_slice(&encoded);
+            let cached = host
+                .decisions
+                .lock()
+                .map_err(|_| "the module host's decision cache is poisoned".to_string())?
+                .get(&key)
+                .cloned();
+            let response = if let Some(cached) = cached {
+                cached
             } else {
                 if guest_time >= DECIDE_RUN_WALL_CLOCK {
                     return Err(format!(
@@ -1426,21 +1584,36 @@ pub fn module_workflow_handler(
                          {DECIDE_RUN_WALL_CLOCK:?} cumulative guest budget for one decision cycle"
                     ));
                 }
-                let request = DecideRequest {
-                    step: step_index,
-                    workflow: workflow_name.clone(),
-                    input: input.clone(),
-                    resolved: resolved.clone(),
-                };
                 let started = Instant::now();
-                let response = decide(&host, &limits, &module, &request)?;
+                let response = decide_encoded(&host, &limits, &module, &encoded, step_index)?;
                 guest_time = guest_time.saturating_add(started.elapsed());
-                memo.insert(step_index, response.clone());
-                // Give the runtime a chance to preempt between fresh decisions.
-                // The executor reads a `Poll::Pending` with a zero command delta
-                // and a self-wake as a spin to keep driving (see `DriveStep`),
-                // so this is safe here in a way a real host await is not.
-                tokio::task::yield_now().await;
+                let mut cache = host
+                    .decisions
+                    .lock()
+                    .map_err(|_| "the module host's decision cache is poisoned".to_string())?;
+                if cache.len() < MAX_CACHED_DECISIONS {
+                    cache.insert(key, response.clone());
+                }
+                drop(cache);
+                // NOTE: deliberately no `yield_now()` here (issue #967, Codex
+                // review round 1). `executor::run_workflow_handler_cycle` drives
+                // the handler inside `tokio::time::timeout(SUSPENSION_TIMEOUT)`,
+                // and a workflow that goes `Pending` is *by definition* treated
+                // as suspended. Yielding between decisions is therefore the one
+                // place the 100ms timer can fire while the trampoline has not
+                // yet recorded a command, producing a zero-command suspension —
+                // a workflow parked on nothing, which the worker fails
+                // terminally. It looks like ordinary runtime politeness and is
+                // actually a correctness hazard.
+                //
+                // The invariant this preserves: the trampoline's *only* await is
+                // `execute_activity_raw`, which pushes its `ScheduleActivity`
+                // command before parking on the oneshot. Every suspension the
+                // executor can observe from a hosted workflow therefore carries
+                // a command, exactly as a statically-linked workflow's does. A
+                // slow guest blocks the poll instead of yielding — bounded by
+                // fuel (the operative, deterministic budget) and by the wall
+                // clock backstop.
                 response
             };
 

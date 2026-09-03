@@ -83,7 +83,20 @@ change to the replay surface**.
   same typed `HandlerNotRegistered` capability miss the unknown-workflow-type
   check uses (#804) — so a worker that has not yet synced a build, or retired it
   early, leaves the work for a capable peer. Resolving inside the handler would
-  have made it an `Err(String)`, i.e. a terminal `WorkflowFailed`.
+  have made it an `Err(String)`, i.e. a terminal `WorkflowFailed`. The resolved
+  `Arc` is then **held** for the invocation and handed to the trampoline: a
+  second lookup could miss where the first hit — an `unload_build` landing
+  between them — turning a passed capability check into exactly the terminal
+  failure the check exists to prevent, and falsifying the safety analysis's claim
+  that unloading is safe for in-flight work.
+- **The guest's policy is the operator's, not a default.** The worker stores a
+  whole `ModuleHost` prototype rather than just the registry, and dispatch clones
+  it per task (`for_task`) before stamping on the execution's build id and
+  module. Storing only the registry meant the dispatch seam built a fresh
+  `ModuleHost::new` per task — discarding the activity allowlist and the
+  queue-override switch on the one path that matters, so a production guest could
+  schedule any activity the worker knew while the tests, which bind a host
+  directly, showed the restriction working.
 - **Zero replay-surface change, proved not asserted.** No new `WorkflowEvent`
   variant, no event-JSON change, no `HistoryMatcher`/executor change, no third
   in-place writer of `harvest_events.event_data`. Four tests carry it:
@@ -110,6 +123,39 @@ change to the replay surface**.
   cumulative per-cycle guest budget, and a `MAX_DECIDE_STEPS` ceiling checked
   *before* scheduling so the last permitted step cannot run a real activity and
   then fail the run for not terminating.
+- **C9: the host may not introduce an await that records no command.** The
+  boundary's least obvious constraint, and the one that cost a line of code that
+  looked like good manners. `executor::run_workflow_handler_cycle` drives the
+  handler inside `tokio::time::timeout(SUSPENSION_TIMEOUT)` — 100 ms — and a
+  workflow returning `Poll::Pending` is *by definition* how a suspension is
+  detected. A `yield_now()` between guest decisions was therefore the one point
+  at which that timer could fire before the trampoline had scheduled anything,
+  producing a zero-command suspension: a workflow parked on nothing, which the
+  worker fails terminally. It is gone, and what replaces it is an invariant
+  rather than a knob — the trampoline's *only* await is `execute_activity_raw`,
+  which records its `ScheduleActivity` before parking, so every suspension a
+  hosted workflow can produce carries a command exactly as a statically-linked
+  one's does. The general form is now C9 in the report, because it constrains
+  anyone who extends this boundary, and it is C5 restated: the oneshot suspension
+  model gives the executor no way to tell "the host is thinking" from "the
+  workflow is suspended".
+- **The quadratic is actually removed now.** Under DD-1 the trampoline restarts
+  at step 0 every cycle, so a run with `n` awaits asks the guest `O(n²)` times.
+  The memo meant to fix that was created *inside* the handler future, where a
+  single monotonically increasing pass writes every entry and reads none — it
+  could never hit. The cache moved to `ModuleHost`, task-local and therefore
+  scoped to one execution's drive, installed fresh by `for_task` so a cloned
+  prototype does not become a worker-lifetime map. Its key is the encoded request
+  **prefixed with `(build_id, module_hash)`**: a `DecideRequest` deliberately
+  carries no build id, so v1 and v2 of one workflow see byte-identical input at
+  step 0, and keying on the request alone would serve v1's decision to v2 —
+  silently defeating the swap the spike exists to demonstrate
+  (`the_decision_cache_never_serves_one_builds_answer_to_another`).
+- **A load batch may not bind two modules to one key.** `load_modules` compared
+  each entry only against what was *already* bound, which knows nothing about the
+  batch, so two different modules for one `(build_id, workflow_name)` with
+  nothing bound beforehand let the last silently overwrite the first — through
+  the very API whose purpose is the immutable binding.
 - **The AC3 demonstration, twice.** `hot_swap_ramp_and_rollback_without_a_restart`
   drives the whole swap against a real Postgres and the real shipped routing APIs:
   v1 published and loaded, v2 published and hot-loaded under a new build id with no

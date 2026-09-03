@@ -18,8 +18,11 @@ run(DecideRequest) -> DecideResponse
 ```
 
 ```jsonc
-// DecideRequest — `step` is FIRST, deliberately; see below.
-{"step":0,"abi_version":1,"workflow":"checkout","input":{...},"resolved":[...]}
+// DecideRequest — every field, in wire order. `step` is FIRST, deliberately;
+// see below. There is no `abi_version` field: the ABI version is a host-side
+// constant (`hot_swap::DECIDE_ABI_VERSION`) and is deliberately NOT transmitted,
+// so do not write a guest that requires or branches on one.
+{"step":0,"workflow":"checkout","input":{...},"resolved":[...]}
 
 // DecideResponse — one of:
 {"kind":"await","activity":"charge","input":{...}}   // host awaits it, re-invokes at step+1
@@ -52,8 +55,9 @@ only holds for `step <= 9`; every guest here uses at most 3 steps.
 The offset holds only because the host serialises the `DecideRequest` **struct**
 directly, via `hot_swap::encode_decide_request`. Routing it through a
 `serde_json::Value` would sort the keys alphabetically (a `Value`'s object is a
-`BTreeMap`), putting `abi_version` first and making every guest here read a step
-of `'r' - '0'`. The first cut of the spike did exactly that; it is now pinned by
+`BTreeMap`), putting `input` first and making every guest here read a step digit
+that is really the `n` of `"input"`. The first cut of the spike did exactly that;
+it is now pinned by
 `the_hosts_encoder_never_reorders_keys_the_way_a_json_value_would`.
 
 ## The guests

@@ -328,17 +328,37 @@ instructions, and the activity it schedules dominates by orders of magnitude. Bu
 it is a real asymptotic cost of *re-invocation* as the re-entrancy strategy, and
 it should be named rather than discovered later:
 
-* it is why `MAX_DECIDE_STEPS` (512) is a ceiling rather than a target, and why
-  `ModuleHost::with_max_decide_steps` can only tighten it;
-* the obvious GA mitigation is a per-cycle memo of `step -> DecideResponse`,
-  which is sound precisely because the guest is a pure function of
-  `(input, resolved)` — the same property §7 rests on. It collapses the cycle's
-  cost to `O(1)` new decisions and the run's to `O(n)`.
+* it is why `MAX_DECIDE_STEPS` is a ceiling rather than a target;
+* the mitigation is a **task-scoped decision cache**, sound precisely because the
+  guest is a pure function of its request — the same property §7 rests on. It
+  collapses the cycle's cost to `O(1)` new decisions and the run's to `O(n)`.
 
-The other cost is C5's: a decision runs inline on the decision-cycle thread, so
-`DECIDE_MAX_WALL_CLOCK` (500 ms) is also the worst case for how long one workflow
-task can occupy a runtime worker. That is a policy number, not a law, and a
-deployment with many hosted workflows should size its worker pool knowing it.
+  Two details of that cache are load-bearing, and the first cut of the spike got
+  both wrong (Codex review round 1):
+
+  * **It cannot live in the handler future.** A map created inside the trampoline
+    is written and read by a single monotonically increasing pass over
+    `0..MAX_DECIDE_STEPS`, so it never reads its own writes and the quadratic
+    stands untouched. The cache has to outlive the invocation, which is why it
+    lives on `ModuleHost` — task-local, therefore scoped to exactly one
+    execution's drive, and installed fresh by `ModuleHost::for_task` rather than
+    shared by `Clone` from the worker's stored prototype.
+  * **The key must carry the module identity.** A `DecideRequest` deliberately
+    contains no build id — the guest has no business knowing its own version — so
+    v1 and v2 of one workflow see byte-identical input at step 0. Keying on the
+    request bytes alone would let v1's decision be served to v2, silently
+    defeating the very swap this report recommends. The key is
+    `(build_id, module_hash)` prefixed onto the encoded request, which makes an
+    entry reusable only for the exact code that produced it
+    (`the_decision_cache_never_serves_one_builds_answer_to_another`).
+
+The other cost is C5's: a decision runs inline on the decision-cycle thread —
+and, per C9 below, *must*, since the host may not introduce an await that records
+no command. `DECIDE_RUN_WALL_CLOCK` (10 s) is therefore the worst case for how
+long one workflow task can occupy a runtime worker, with `DECIDE_MAX_WALL_CLOCK`
+(5 s) bounding any single decision inside it. Those are policy numbers, not laws,
+and a deployment with many hosted workflows should size its worker pool knowing
+them. Fuel, not the clock, is the *operative* budget — see §8.4.
 
 ### What a hosted workflow can and cannot express
 
@@ -727,7 +747,7 @@ honestly named.
 * **Cumulative:** `DECIDE_RUN_WALL_CLOCK` bounds the guest time of a whole
   decision cycle, so per-decision budgets cannot be composed into unbounded
   occupancy of a runtime worker thread.
-* **Decision count:** `MAX_DECIDE_STEPS` (512). Without it a guest answering
+* **Decision count:** `MAX_DECIDE_STEPS` (64). Without it a guest answering
   `Await` forever would append activity events without bound — a durable,
   replayable denial of service rather than a transient one
   (`a_guest_that_never_completes_is_stopped_by_the_decide_step_cap`).
@@ -746,18 +766,44 @@ back-to-back inside a single `poll`. The real bound was
 there was none. With `max_concurrent_workflows` defaulting to 20, a handful of
 such executions wedge every runtime thread in the process.
 
-Three changes close it, and they compose:
+Two changes close it:
 
-1. **Per-cycle memoisation** of `step -> DecideResponse`, sound because the guest
-   is a pure function of `(input, resolved)` — the same property §7 rests on. A
-   cycle now performs **one** new decision, not *n+1*.
-2. **`yield_now` between fresh decisions**, so the scheduler and the workflow-body
-   timeout can preempt. (Safe here specifically: the executor reads a
-   `Poll::Pending` with a zero command delta and a self-wake as a spin to keep
-   driving, not as a park.)
-3. **`DECIDE_RUN_WALL_CLOCK`**, a cumulative guest budget for the whole cycle, so
+1. **A task-scoped decision cache** (above), sound because the guest is a pure
+   function of its request — the same property §7 rests on. A cycle now performs
+   **one** new decision, not *n+1*.
+2. **`DECIDE_RUN_WALL_CLOCK`**, a cumulative guest budget for the whole cycle, so
    per-decision budgets cannot be composed into unbounded occupancy even if the
-   memo is defeated.
+   cache is defeated.
+
+A third change was tried and **withdrawn as unsound**, and the reason is a
+constraint on this whole boundary rather than a detail of the fix:
+
+> **C9 — the host may not introduce an await that does not record a command.**
+> `executor::run_workflow_handler_cycle` drives the handler inside
+> `tokio::time::timeout(SUSPENSION_TIMEOUT)` (100 ms), and a workflow that
+> returns `Poll::Pending` is *by definition* how a suspension is detected. A
+> `yield_now()` between fresh decisions — added, reasonably enough, so the
+> scheduler could preempt a long decision sequence — is therefore the one point
+> at which that timer can fire while the trampoline has not yet scheduled
+> anything, producing a **zero-command suspension**: a workflow parked on
+> nothing, which the worker fails terminally. It reads as ordinary runtime
+> politeness and is a correctness hazard.
+>
+> What replaces it is an invariant rather than a tuning knob: the trampoline's
+> **only** await is `execute_activity_raw`, which pushes its `ScheduleActivity`
+> command *before* parking on the oneshot. Every suspension a hosted workflow can
+> produce therefore carries a command, exactly as a statically-linked workflow's
+> does — including the case where the guest was slow enough that the 100 ms
+> window had already closed, since by then the command is recorded. A slow guest
+> blocks the poll instead of yielding, bounded by fuel (the operative,
+> deterministic budget) and by the wall-clock backstop. Pinned by
+> `the_trampoline_never_yields_between_decisions`.
+>
+> The general form, for anyone extending this boundary: **host-side machinery
+> between a workflow's awaits must be synchronous.** The oneshot suspension model
+> (DD-1) gives the executor no way to distinguish "the host is thinking" from
+> "the workflow is suspended", which is C5 restated — and C5 is why the decision
+> call is inline in the first place.
 
 Cancellation is still **not** threaded into a running decision, so worker
 shutdown cannot interrupt one mid-flight; it waits out the per-decision backstop.

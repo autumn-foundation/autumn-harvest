@@ -607,11 +607,22 @@ pub struct HandlerRegistry {
     /// resolved and its guest run instead. Empty = no WASM activities.
     #[cfg(feature = "wasm-activities")]
     wasm_activities: HashMap<String, crate::wasm_store::WasmBinding>,
-    /// Loaded hot-swappable workflow modules (issue #967). `None` (the default)
-    /// means no module hosting is configured and the workflow dispatch path is
-    /// byte-for-byte what it was.
+    /// The module-hosting policy for this worker (issue #967). `None` (the
+    /// default) means no module hosting is configured and the workflow dispatch
+    /// path is byte-for-byte what it was.
+    ///
+    /// A whole [`ModuleHost`](crate::hot_swap::ModuleHost) rather than just the
+    /// registry, because the host carries the guest's *policy* — the activity
+    /// allowlist, the queue-override switch, the capability grant and the
+    /// decide budget — and dispatch has to apply the operator's policy, not a
+    /// default one. Storing only the registry meant the dispatch seam built a
+    /// fresh `ModuleHost::new` per task, silently discarding every restriction
+    /// configured through `allowing_activities` and leaving production guests
+    /// able to schedule any activity the worker knows (Codex review round 1).
+    /// Dispatch clones this prototype and stamps the execution's build id and
+    /// resolved module onto the clone.
     #[cfg(feature = "hot-code-swap")]
-    module_registry: Option<Arc<crate::hot_swap::ModuleRegistry>>,
+    module_host: Option<crate::hot_swap::ModuleHost>,
     /// Shared engine + compiled-module cache for WASM activities (issue #965).
     /// One per worker, created lazily by the builder. `None` = no WASM
     /// activities registered.
@@ -793,7 +804,7 @@ impl HandlerRegistry {
             #[cfg(feature = "wasm-activities")]
             wasm_activities: HashMap::new(),
             #[cfg(feature = "hot-code-swap")]
-            module_registry: None,
+            module_host: None,
             #[cfg(feature = "wasm-activities")]
             wasm_store: None,
             #[cfg(feature = "wasm-activities")]
@@ -1015,16 +1026,36 @@ impl HandlerRegistry {
         self.wasm_activities.get(activity_name)
     }
 
-    /// Attach the process's loaded workflow-module registry (issue #967).
+    /// Attach the process's loaded workflow-module registry (issue #967), with
+    /// the default guest policy: deny-all capabilities, the default decide
+    /// budget, **no** activity allowlist and no queue override.
     ///
     /// Present = this worker hosts module-backed workflows, and the workflow
     /// dispatch path binds a [`ModuleHost`](crate::hot_swap::ModuleHost) around
     /// each handler drive. Absent (the default) = the dispatch path is
     /// byte-for-byte what it was.
+    ///
+    /// Use [`with_module_host`](Self::with_module_host) to restrict what the
+    /// guest may do: "no allowlist" means a guest may schedule **any** activity
+    /// this worker has registered.
     #[cfg(feature = "hot-code-swap")]
     #[must_use]
-    pub fn with_module_registry(mut self, registry: Arc<crate::hot_swap::ModuleRegistry>) -> Self {
-        self.module_registry = Some(registry);
+    pub fn with_module_registry(self, registry: Arc<crate::hot_swap::ModuleRegistry>) -> Self {
+        self.with_module_host(crate::hot_swap::ModuleHost::new(registry))
+    }
+
+    /// Attach a fully configured module-hosting policy (issue #967).
+    ///
+    /// The prototype's activity allowlist, queue-override switch, capability
+    /// grant and decide budget are the ones every module-hosted workflow on this
+    /// worker runs under; dispatch clones it per task and stamps on the
+    /// execution's assigned build id and its pre-resolved module. Its
+    /// `build_id` and `pinned_module` are therefore ignored here — they are
+    /// per-execution facts, not worker configuration.
+    #[cfg(feature = "hot-code-swap")]
+    #[must_use]
+    pub fn with_module_host(mut self, host: crate::hot_swap::ModuleHost) -> Self {
+        self.module_host = Some(host);
         self
     }
 
@@ -1032,8 +1063,15 @@ impl HandlerRegistry {
     /// (issue #967).
     #[cfg(feature = "hot-code-swap")]
     #[must_use]
-    pub const fn module_registry(&self) -> Option<&Arc<crate::hot_swap::ModuleRegistry>> {
-        self.module_registry.as_ref()
+    pub fn module_registry(&self) -> Option<&Arc<crate::hot_swap::ModuleRegistry>> {
+        self.module_host.as_ref().map(|host| &host.registry)
+    }
+
+    /// The worker's module-hosting policy prototype, if configured (issue #967).
+    #[cfg(feature = "hot-code-swap")]
+    #[must_use]
+    pub const fn module_host(&self) -> Option<&crate::hot_swap::ModuleHost> {
+        self.module_host.as_ref()
     }
 
     /// Borrow the shared WASM module store, if any WASM activity is registered
@@ -1219,6 +1257,11 @@ impl std::fmt::Debug for HandlerRegistry {
                 "wasm_module_registration_count",
                 &self.wasm_module_registrations.len(),
             );
+        // Issue #967: print whether module hosting is configured, not the
+        // registry itself — its `Debug` walks every binding and reads the
+        // compiled-module cache, which is far more than a registry dump wants.
+        #[cfg(feature = "hot-code-swap")]
+        d.field("workflow_module_hosting", &self.module_host.is_some());
         d.finish()
     }
 }
@@ -17953,8 +17996,17 @@ async fn process_workflow_task(
     // PENDING for a capable peer and only escalates to terminal failure once the
     // redelivery budget is exhausted. Which is exactly right — "this worker
     // cannot run this build" is a property of the worker, not of the execution.
+    //
+    // The resolved `Arc` is KEPT (Codex review round 1), not merely tested for
+    // presence, and handed to the handler as `ModuleHost::pinned_module`. A
+    // second lookup inside the trampoline could miss where this one hit — an
+    // `unload_build` landing between the two — and a miss *there* is an
+    // `Err(String)`, i.e. the terminal failure this check exists to avoid, for
+    // an execution that had already passed it. Holding the binding for the life
+    // of the invocation is also what makes the safety analysis's claim that
+    // unloading is safe for in-flight work true rather than merely likely.
     #[cfg(feature = "hot-code-swap")]
-    if crate::hot_swap::is_module_hosted(workflow.handler) {
+    let pinned_module = if crate::hot_swap::is_module_hosted(workflow.handler) {
         let resolved = registry.module_registry().and_then(|modules| {
             prepared
                 .execution
@@ -17962,14 +18014,17 @@ async fn process_workflow_task(
                 .as_deref()
                 .and_then(|build| modules.get(build, &prepared.execution.workflow_name))
         });
-        if resolved.is_none() {
+        let Some(resolved) = resolved else {
             return Err(HarvestError::HandlerNotRegistered {
                 kind: CapabilityMissKind::Workflow.as_str(),
                 name: prepared.execution.workflow_name.clone(),
                 phase: CapabilityMissPhase::BeforeHandler,
             });
-        }
-    }
+        };
+        Some(resolved)
+    } else {
+        None
+    };
 
     let telemetry = registry.telemetry().clone();
 
@@ -18242,12 +18297,19 @@ async fn process_workflow_task(
             registry.default_activity_retry_policy(),
             registry.default_activity_start_to_close(),
         );
+        // Clone the worker's configured policy — allowlist, queue-override
+        // switch, capability grant, decide budget — and stamp the per-execution
+        // facts onto the clone. Constructing a fresh `ModuleHost::new` here
+        // instead would silently run every production guest under the *default*
+        // (unrestricted) policy (Codex review round 1).
         #[cfg(feature = "hot-code-swap")]
-        let (run_outcome, pending_cmds, execute_span) = match registry.module_registry() {
-            Some(modules) => {
+        let (run_outcome, pending_cmds, execute_span) = match registry.module_host() {
+            Some(policy) => {
                 crate::hot_swap::with_module_host(
-                    crate::hot_swap::ModuleHost::new(std::sync::Arc::clone(modules))
-                        .with_optional_build_id(prepared.execution.assigned_build_id.clone()),
+                    policy
+                        .for_task()
+                        .with_optional_build_id(prepared.execution.assigned_build_id.clone())
+                        .with_optional_pinned_module(pinned_module.clone()),
                     workflow_drive,
                 )
                 .await
@@ -20042,7 +20104,11 @@ async fn process_task(
             // decision cycle's state (clippy::large_futures).
             let cycle = Box::pin(async {
                 let mut conn = pool.get().await.map_err(crate::error::database_error)?;
-                let outcome = process_workflow_task(
+                // Boxed for the same reason the enclosing `cycle` is
+                // (clippy::large_futures): `process_workflow_task`'s state is
+                // large enough on its own that inlining it here grows every
+                // future that awaits this one.
+                let outcome = Box::pin(process_workflow_task(
                     &mut conn,
                     registry.as_ref(),
                     &task,
@@ -20056,7 +20122,7 @@ async fn process_task(
                     workflow_panic_max_attempts,
                     workflow_task_deadline,
                     &frontier_reset_committed,
-                )
+                ))
                 .await;
                 Ok::<_, HarvestError>((conn, outcome))
             });
@@ -26334,7 +26400,9 @@ pub async fn chaos_drive_one_workflow_task(
             u32,
         >::new()));
         let frontier_reset_committed = std::sync::atomic::AtomicBool::new(false);
-        process_workflow_task(
+        // Boxed for the same reason as the production call site
+        // (clippy::large_futures).
+        Box::pin(process_workflow_task(
             &mut conn,
             registry.as_ref(),
             &task,
@@ -26348,7 +26416,7 @@ pub async fn chaos_drive_one_workflow_task(
             3,
             None,
             &frontier_reset_committed,
-        )
+        ))
         .await
     })
     .await
