@@ -2733,6 +2733,12 @@ async fn zz_capture_schedule_to_close_claim_evidence() {
         row
     }
 
+    // A far-future deadline: never elapses during this capture, so it excludes
+    // nothing and isolates the predicate's evaluation cost from any change in
+    // which rows are eligible -- the same "made to match, not exclude" design
+    // the capability-labels capture uses for its requirement.
+    const SCHEDULE_TO_CLOSE_SQL: &str = "NOW() + INTERVAL '1 hour'";
+
     let Some(bench) = bench_db_or_skip().await else {
         eprintln!("no database reachable; nothing captured");
         return;
@@ -2748,12 +2754,6 @@ async fn zz_capture_schedule_to_close_claim_evidence() {
 
     let mut summary_lines: Vec<String> = Vec::new();
     let raw = autumn_harvest::queue::claim_task_query();
-
-    // A far-future deadline: never elapses during this capture, so it excludes
-    // nothing and isolates the predicate's evaluation cost from any change in
-    // which rows are eligible -- the same "made to match, not exclude" design
-    // the capability-labels capture uses for its requirement.
-    const SCHEDULE_TO_CLOSE_SQL: &str = "NOW() + INTERVAL '1 hour'";
 
     // One EXPLAIN capture per published backlog depth, at both labels, from
     // the SAME seeded backlog (the no-schedule-to-close capture's EXPLAIN
