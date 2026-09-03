@@ -33,7 +33,12 @@
 //! (active-run-first, else most-recent terminal). This is the same rule the
 //! management API's by-id resolution already uses
 //! (`api::resolve_workflow_by_business_id`, issue #805), now available to the
-//! engine itself so the two cannot disagree about where a business key lives.
+//! engine itself so the two cannot disagree about *which shards count* or
+//! *which run wins*. The traversal itself is still separate — the management
+//! API keeps its own loop, which fails closed with a 503 on the first
+//! un-poolable shard and has no alias dedupe — so this is a shared rule, not a
+//! shared implementation. Converging the two is worth doing and is not done
+//! here.
 //!
 //! Two properties are load-bearing and are what a naive fan-out gets wrong:
 //!
@@ -73,12 +78,15 @@
 //!   holds** ([`resolve_location_by_workflow_id_with`]'s `held` argument), so
 //!   the fan-out never re-enters that pool.
 //! * `resolve_delivery_route` short-circuits entirely when only one shard is
-//!   expected, so a single-shard deployment issues no fan-out at all and is
-//!   byte-for-byte what it was before this module existed.
-//! * Every remaining acquisition is bounded by
-//!   [`crate::audit_export::SHARD_ACQUIRE_BOUND`]; a shard that does not yield
-//!   a connection in time becomes an [`UninspectedShard`] — i.e. `Indeterminate`
-//!   and a retry — rather than an indefinite park.
+//!   expected, so a single-shard deployment issues no fan-out at all and takes
+//!   the same route it took pre-#1146.
+//! * Every remaining peer probe — acquisition *and* query — is bounded by
+//!   [`FANOUT_PEER_BOUND`]; a shard that does not answer in time becomes an
+//!   [`UninspectedShard`] — i.e. `Indeterminate` and a retry — rather than an
+//!   indefinite park. Note this covers the probes this module makes; the
+//!   cross-shard *delivery* query that follows a resolution is deliberately
+//!   left unbounded, since timing out mid-write is a different risk calculation
+//!   than timing out a read-only probe.
 //!
 //! [`UninspectableShards`] then memoizes, for the length of one sweep, the
 //! shards that already failed, so a backlog of N pending rows pays that bound
@@ -130,6 +138,7 @@ pub enum TargetLocation {
     /// `run` may be terminal — the caller applies its own semantics to that
     /// (issue #751: a terminal current run fails a signal `not_running` and
     /// satisfies a cancel as a no-op success).
+    #[non_exhaustive]
     Found {
         /// The shard whose database holds `run`.
         shard: ShardId,
@@ -455,7 +464,7 @@ pub const FANOUT_PEER_BOUND: std::time::Duration = std::time::Duration::from_sec
 /// An outbox sweep processes one pending row per step and may see hundreds in a
 /// backlog. A shard that failed to hand over a connection on the first row has
 /// not recovered by the two-hundredth, and each re-probe costs the full
-/// [`crate::audit_export::SHARD_ACQUIRE_BOUND`] — so without this, one
+/// [`FANOUT_PEER_BOUND`] — so without this, one
 /// unreachable shard turns a sweep into `rows × bound` of dead wall-clock,
 /// starving every scanner resident sequenced after the outbox.
 ///
@@ -529,8 +538,11 @@ pub async fn resolve_location_by_workflow_id(
 /// what a separate connection would.
 ///
 /// `memo` carries the shards this sweep has already failed to reach, so a
-/// backlog pays [`crate::audit_export::SHARD_ACQUIRE_BOUND`] once per shard
-/// rather than once per row.
+/// backlog pays [`FANOUT_PEER_BOUND`] once per shard rather than once per row.
+/// The cross-shard *delivery* acquisition that follows a resolution is not
+/// memoized — it is a different pool reached on a different code path — so a
+/// target pool that was reachable during the fan-out and busy at delivery still
+/// costs its own bound per row.
 ///
 /// The fan-out is **sequential**, and holds at most one connection beyond the
 /// caller's own at a time. Read-only: no row is locked and nothing is written.
@@ -597,12 +609,41 @@ pub async fn resolve_location_by_workflow_id_with(
             {
                 Ok(Some(run)) => candidates.push((shard, run)),
                 Ok(None) => {}
-                Err(e) => mark_uninspected(
-                    &mut uninspected,
-                    memo,
-                    shard,
-                    format!("resolution query failed: {e}"),
-                ),
+                Err(e) => {
+                    // A failed query on the HELD connection is not merely "this
+                    // shard is uninspected". It ran inside the caller's own open
+                    // transaction, and in Postgres any statement error aborts
+                    // that transaction: every later statement on `conn` fails
+                    // with 25P02, including the append of the terminal event.
+                    //
+                    // Carrying on would be actively unsafe rather than merely
+                    // incomplete. A live winner on a peer shard yields `Found`,
+                    // the delivery runs on the PEER's connection and commits
+                    // there independently, and only afterwards does the caller
+                    // discover it can no longer record that it delivered. The
+                    // row stays pending and the next sweep delivers again —
+                    // and a signal without an idempotency key is not idempotent,
+                    // so that is a duplicate signal, the exact hazard the signal
+                    // path refuses to take elsewhere.
+                    //
+                    // Stop the fan-out instead: `Indeterminate` routes to
+                    // `DeliveryRoute::Retry`, which returns without touching
+                    // `conn` again, so the aborted transaction rolls back
+                    // harmlessly and the row is retried intact.
+                    //
+                    // Deliberately NOT memoized: the abort scopes to this row's
+                    // transaction, not to the sweep. The next row opens a fresh
+                    // one, and recording the caller's shard as uninspectable
+                    // would degrade every remaining row over a fault that is
+                    // already gone.
+                    uninspected.push(UninspectedShard {
+                        shard,
+                        reason: format!(
+                            "resolution query failed on the caller's own connection,                              aborting its transaction: {e}"
+                        ),
+                    });
+                    return TargetLocation::Indeterminate { uninspected };
+                }
             }
             continue;
         }
@@ -624,10 +665,15 @@ pub async fn resolve_location_by_workflow_id_with(
             continue;
         };
 
-        // An alias of a pool this fan-out already read — including the one that
-        // supplied `held`. Its database has been inspected; re-acquiring it
-        // would at best duplicate a row and at worst (a one-connection pool)
-        // deadlock against the connection the caller is still holding.
+        // An alias of a pool this fan-out has already probed — including the
+        // one that supplied `held`. Note "probed", not "read": the entry is
+        // pushed before the probe runs, so a sibling whose probe FAILED also
+        // suppresses its aliases. That is still correct, and deliberately so —
+        // the failed sibling is already in `uninspected`, so the fan-out is
+        // non-authoritative either way — but the reason is "we have already
+        // paid for this database", not "we have read it". Re-acquiring would at
+        // best duplicate a row and at worst (a one-connection pool) deadlock
+        // against the connection the caller is still holding.
         if probed
             .iter()
             .any(|probed_pool| same_underlying_pool(probed_pool, shard_pool))
@@ -707,12 +753,13 @@ async fn probe_peer_shard(
     workflow_id: &str,
 ) -> Result<Option<ResolvedRun>, String> {
     let probe = tokio::time::timeout(FANOUT_PEER_BOUND, async {
-        let mut conn = match tokio::time::timeout(FANOUT_ACQUIRE_BOUND, shard_pool.get()).await {
+        let acquire_bound = peer_acquire_bound(shard_pool);
+        let mut conn = match tokio::time::timeout(acquire_bound, shard_pool.get()).await {
             Ok(Ok(conn)) => conn,
             Ok(Err(e)) => return Err(format!("could not acquire a connection: {e}")),
             Err(_elapsed) => {
                 return Err(format!(
-                    "no connection available within {FANOUT_ACQUIRE_BOUND:?} (pool busy or \
+                    "no connection available within {acquire_bound:?} (pool busy or \
                  unreachable)"
                 ));
             }
@@ -726,6 +773,39 @@ async fn probe_peer_shard(
     match probe {
         Ok(result) => result,
         Err(_elapsed) => Err(format!("shard did not answer within {FANOUT_PEER_BOUND:?}")),
+    }
+}
+
+/// How long may this peer pool be given to hand over a connection?
+///
+/// [`FANOUT_ACQUIRE_BOUND`] exists for exactly one hazard: two per-shard
+/// scanners waiting on each other's **held** connections. That hazard needs the
+/// pool to be at capacity with nothing free — only then does acquiring mean
+/// waiting for another task to release something.
+///
+/// When the pool has an idle connection, or room to open one, `Pool::get()` is
+/// not queueing behind anybody: it is a DNS + TCP + TLS + Postgres startup and
+/// auth handshake. Holding that to 250 ms is a different decision than bounding
+/// a wait, and a badly wrong one, because it does not converge. `deadpool`
+/// records a new object only *after* `Manager::create()` resolves, so a
+/// cancelled connect leaves the pool exactly as cold as it found it, and the
+/// per-sweep memo then allows only one attempt per shard per sweep. A peer
+/// whose handshake reliably takes longer than the bound is therefore
+/// uninspectable **forever**, not slow — and by-id delivery to it never
+/// completes. Peer pools are routinely cold: in the one-process-per-shard
+/// deployment `docs/sharding.md` recommends, nothing in the process ever uses
+/// them except this fan-out.
+///
+/// So the tight bound is applied only in the case it was written for, and
+/// everything else gets the whole probe budget. [`FANOUT_PEER_BOUND`] still
+/// wraps the result either way, so the worst case per shard is unchanged
+/// (issue #1146).
+pub(crate) fn peer_acquire_bound(pool: &DbPool) -> std::time::Duration {
+    let status = pool.status();
+    if status.available > 0 || status.size < status.max_size {
+        FANOUT_PEER_BOUND
+    } else {
+        FANOUT_ACQUIRE_BOUND
     }
 }
 
@@ -817,13 +897,25 @@ pub(crate) fn global_router_snapshot() -> Option<ShardRouter> {
 ///
 /// Derived from the same expected-shard set the fan-out itself uses, so the
 /// two cannot disagree about what "single shard" means.
+///
+/// **Fails closed.** The two answers are not symmetric in cost: answering
+/// "multi-shard" when the deployment is single-shard only routes a delivery
+/// through the outbox that could have gone inline, costing one poll interval;
+/// answering "single-shard" when it is not re-opens issue #1146 on the inline
+/// path, which is a wrong terminal in an append-only history. So a
+/// `GLOBAL_SHARDED_POOL` lock this cannot read — poisoned by a panic while a
+/// writer held it — is treated as "assume multi-shard" rather than allowed to
+/// collapse to the single-shard default via an empty shard list.
 #[must_use]
 pub(crate) fn deployment_is_multi_shard() -> bool {
-    let pool_shards = crate::shard::GLOBAL_SHARDED_POOL
-        .read()
-        .ok()
-        .and_then(|guard| guard.as_ref().map(ShardedDbPool::shard_ids))
+    let Ok(guard) = crate::shard::GLOBAL_SHARDED_POOL.read() else {
+        return true;
+    };
+    let pool_shards = guard
+        .as_ref()
+        .map(ShardedDbPool::shard_ids)
         .unwrap_or_default();
+    drop(guard);
     fanout_shards(&pool_shards, global_router_snapshot().as_ref()).len() > 1
 }
 
@@ -1072,6 +1164,84 @@ mod tests {
             !inline_delivery_allowed(&by_id(), ShardId::new(0), true),
             "with more than one shard the caller's shard-local view can hold a \
              stale terminal run of the key while the live one is elsewhere"
+        );
+    }
+
+    // ---- The per-sweep memo (issue #1146). ----
+    //
+    // Its whole purpose is to make a failing shard cost `shards × bound` rather
+    // than `rows × bound` across one sweep. Every DB test seeds exactly one
+    // pending row, so nothing there can tell a working memo from a memo that is
+    // never consulted.
+
+    #[test]
+    fn the_memo_reports_back_a_shard_it_recorded() {
+        let memo = UninspectableShards::new();
+        assert_eq!(memo.recorded(ShardId::new(1)), None);
+        memo.record(ShardId::new(1), "no pool".to_string());
+        assert_eq!(memo.recorded(ShardId::new(1)), Some("no pool".to_string()));
+        assert_eq!(
+            memo.recorded(ShardId::new(2)),
+            None,
+            "recording one shard must not implicate another"
+        );
+    }
+
+    #[test]
+    fn the_memo_keeps_the_first_reason_it_was_given() {
+        // The short-circuit path deliberately does not re-record, so an operator
+        // sees the original diagnosis rather than a later re-derivation of it.
+        let memo = UninspectableShards::new();
+        memo.record(
+            ShardId::new(1),
+            "could not acquire a connection".to_string(),
+        );
+        memo.record(ShardId::new(1), "something later and vaguer".to_string());
+        assert_eq!(
+            memo.recorded(ShardId::new(1)),
+            Some("could not acquire a connection".to_string())
+        );
+    }
+
+    #[test]
+    fn one_run_reported_by_two_aliased_shards_is_not_two_live_runs() {
+        // Two logical shard ids backed by pools this fan-out could not prove are
+        // the same database (two independently built pools on one URL) each
+        // return the SAME row. That must not read as the ambiguous
+        // "two live runs of one key" state, which would withhold every cancel's
+        // terminal forever. `other_live` filters on `exec_id`, so it does not.
+        let only = run(0, "RUNNING", 10);
+        let merged = merge_locations(
+            vec![(ShardId::new(0), only.clone()), (ShardId::new(1), only)],
+            Vec::new(),
+        );
+        assert!(
+            merged.is_authoritative_for_key(),
+            "the same run seen twice is one run"
+        );
+        match merged {
+            TargetLocation::Found { other_live, .. } => assert!(other_live.is_empty()),
+            other => panic!("expected Found, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_pool_with_room_to_open_a_connection_gets_the_full_probe_budget() {
+        // Regression for the cold-connect trap: the tight acquisition bound is
+        // for waiting on another task's connection, never for a handshake. A
+        // pool that has not opened one yet is not waiting on anybody.
+        let manager = diesel_async::pooled_connection::AsyncDieselConnectionManager::<
+            diesel_async::AsyncPgConnection,
+        >::new("postgres://unused:unused@127.0.0.1:1/unused");
+        let pool: DbPool = deadpool::managed::Pool::builder(manager)
+            .max_size(2)
+            .build()
+            .expect("pool builds");
+        assert_eq!(pool.status().size, 0, "a fresh pool has opened nothing");
+        assert_eq!(
+            peer_acquire_bound(&pool),
+            FANOUT_PEER_BOUND,
+            "an unopened pool must be allowed to finish its handshake"
         );
     }
 }

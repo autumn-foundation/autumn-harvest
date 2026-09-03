@@ -37,9 +37,11 @@ Two rules are load-bearing, and are what a naive fan-out gets wrong:
   run on another is an ordinary state. Stopping at the first shard that returns
   a row would signal the dead one and report `not_running` while the target is
   alive. Every expected shard is asked before a terminal answer is accepted.
-  A **live** winner, by contrast, is authoritative immediately — at most one run
-  per key is active — so a delivery is never withheld because an unrelated shard
-  is down.
+  A **live** winner is still delivered to over a partial view — a live run in
+  hand is a real recipient — but it is not thereby authoritative *for the key*:
+  `(workflow_name, workflow_id)` uniqueness is shard-local, so a shard that was
+  not read may hold another live run. A signal may act on that; a cancel may act
+  but may not report. See rounds 2 and 3 below.
 - **"Could not inspect" is never "not there."** A shard with no pool in this
   process (mid a shard-add rollout) or one that cannot be reached yields
   `TargetLocation::Indeterminate`, and the outbox leaves the row pending.
@@ -64,7 +66,10 @@ the fast path and are byte-for-byte unchanged. Multi-shard deployments defer to
 the outbox, which is one sweep of latency on an already-asynchronous path and is
 where the hash already sent `(N-1)/N` of these deliveries.
 
-**No migration, no new `WorkflowEvent` variant, no write-path change**, and
+**No migration, no new `WorkflowEvent` variant, and no new `harvest_events`
+writer** — though *when* and *in which transaction* a terminal event is written
+does change for multi-shard by-id delivery, and a cancel's terminal can now be
+withheld to a later sweep. Resolution itself is read-only, and
 `harvest_events` gains no new writer — the resolution is read-only and the
 `ExternalTarget` type is untouched, so replay determinism is unaffected by
 construction. `ExecutionId`-addressed signal/cancel is entirely unchanged: the
@@ -87,9 +92,12 @@ later resident of the scanner tick, exactly the hazard `codec_rotation.rs` and
 `audit_export.rs` were each fixed for. Three rules close it: the single-shard
 short-circuit above; the caller's own shard probed on the connection already in
 hand (equivalent under READ COMMITTED, where each statement takes a fresh
-snapshot); and every remaining acquisition bounded by
-`audit_export::SHARD_ACQUIRE_BOUND`, with a per-sweep memo so a backlog of
-pending rows pays that bound once per shard rather than once per row. A shard
+snapshot); and every remaining peer probe — acquisition *and* query — bounded
+by `FANOUT_PEER_BOUND`, with a tighter `FANOUT_ACQUIRE_BOUND` applied to the
+acquisition when, and only when, the pool is at capacity with nothing free (the
+one case where acquiring means waiting on another task rather than opening a
+connection), and a per-sweep memo so a backlog of pending rows pays that bound
+once per shard rather than once per row. A shard
 that times out becomes `Indeterminate` — a retry — not a wrong answer.
 
 **Note for the changelog collator.** `docs/shipped-work.md`'s issue #751 entry
@@ -142,7 +150,8 @@ shard-local read that disagrees leaves the row pending for a global re-resolve
 instead of recording anything. It terminates by construction: once the key is
 terminal everywhere the global winner is terminal, the expectation is `false`,
 and the verdict is recorded as before. The rule is a pure `classify_by_id_outcome`
-with an exhaustive unit matrix — the window it guards is microseconds wide and
+with a unit matrix over every reachable row — the window it guards is
+microseconds wide and
 has no test seam, so the classifier is split out for the same reason
 `worker::classify_cross_shard_continue_as_new` is. (A randomized end-to-end race
 test was written first and **discarded**: it passed with the fix disabled, because
@@ -290,9 +299,9 @@ per-row `by-id target resolution inconclusive` warning naming the shard, and
 **Test evidence, TDD red → green → refactor.** The three end-to-end outbox tests
 were written first and observed failing against the pre-fix engine with exactly
 the issue's symptom (`ExternalSignalFailed` / `ExternalCancelFailed` with
-`target_unknown` against a running target). 12 no-database unit tests in
+`target_unknown` against a running target). 15 no-database unit tests in
 `external_target_location` cover the merge rules, the expected-shard union and
-the inline gate. `tests/integration/shard_placement_by_id_tests.rs` adds **16
+the inline gate. `tests/integration/shard_placement_by_id_tests.rs` adds **22
 DB-backed tests against two genuinely separate Postgres databases** — a single
 database mocked as two shards cannot distinguish "found by fanning out" from
 "found because both shards are the same table" — and deliberately does not

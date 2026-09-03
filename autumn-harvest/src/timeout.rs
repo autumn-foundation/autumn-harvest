@@ -2801,7 +2801,7 @@ pub async fn enforce_external_signals_outbox(
                 .await;
 
                 let terminal_opt = match route {
-                    // `fanout_complete` is deliberately unused on the signal
+                    // `may_assert_key_state` is deliberately unused on the signal
                     // path: a live run found over a partial view is still real
                     // delivery, and re-delivery is not idempotent without an
                     // idempotency key, so staying pending would duplicate the
@@ -2849,8 +2849,17 @@ pub async fn enforce_external_signals_outbox(
                         // acquisition predates #1146 — it has always served
                         // cross-shard `ExecutionId` delivery — and was
                         // unbounded until now.
+                        //
+                        // The bound is chosen from the pool's own state rather
+                        // than fixed: the tight one applies only when the pool
+                        // is at capacity with nothing free, the only case where
+                        // acquiring means waiting on another task. A pool that
+                        // merely has to open a connection is doing a handshake,
+                        // and holding a cold connect to 250 ms would fail it
+                        // forever rather than slowly. See
+                        // `external_target_location::peer_acquire_bound`.
                         let mut target_conn = match tokio::time::timeout(
-                            crate::external_target_location::FANOUT_ACQUIRE_BOUND,
+                            crate::external_target_location::peer_acquire_bound(pool),
                             pool.get(),
                         )
                         .await
@@ -3317,7 +3326,7 @@ pub async fn enforce_external_cancels_outbox(
                     // Bounded for the same reason as the signal outbox above
                     // (issue #1146, Codex round 1 P1).
                     let mut target_conn = match tokio::time::timeout(
-                        crate::external_target_location::FANOUT_ACQUIRE_BOUND,
+                        crate::external_target_location::peer_acquire_bound(pool),
                         pool.get(),
                     )
                     .await
@@ -3537,12 +3546,13 @@ pub async fn enforce_external_cancels_outbox(
                 // side, which is why it survived them both.
                 for (exec_id, workflow_name) in deferred_checks {
                     let same_pool_as_caller = outer_sharded_pool.as_ref().is_none_or(|pool| {
-                        pool.exact_pool_for_execution(exec_id).is_some_and(|e_pool| {
-                            crate::external_target_location::same_underlying_pool(
-                                e_pool,
-                                pool.pool_for(caller_shard),
-                            )
-                        })
+                        pool.exact_pool_for_execution(exec_id)
+                            .is_some_and(|e_pool| {
+                                crate::external_target_location::same_underlying_pool(
+                                    e_pool,
+                                    pool.pool_for(caller_shard),
+                                )
+                            })
                     });
                     if same_pool_as_caller {
                         if let Err(e) = check_and_report_unfinished_handlers(
@@ -4606,6 +4616,27 @@ mod tests {
     fn a_live_expectation_met_by_a_live_read_is_recorded() {
         assert_eq!(
             classify_by_id_outcome(true, false, false),
+            ByIdVerdict::Record
+        );
+    }
+
+    #[test]
+    fn a_terminal_expectation_met_by_a_live_read_is_recorded() {
+        // The last reachable row of the matrix, and the disagreement in the
+        // OPPOSITE direction to the one the `expected_live` rule exists for: the
+        // global resolution ranked a terminal run as the current one, and the
+        // shard-local read then found a live run — a new run of the key started
+        // in the window between the two reads.
+        //
+        // Recorded, not left pending. The shard-local read is the more recent of
+        // the two views AND it is the one the delivery actually ran against, so
+        // its outcome describes what really happened to a real run. The
+        // `LeavePending` rule is deliberately asymmetric: it exists only to stop
+        // a *terminal-or-absent* shard-local read from durably failing a request
+        // whose target the global view had just seen alive somewhere else. There
+        // is no equivalent hazard here — nothing is being wrongly failed.
+        assert_eq!(
+            classify_by_id_outcome(false, false, false),
             ByIdVerdict::Record
         );
     }

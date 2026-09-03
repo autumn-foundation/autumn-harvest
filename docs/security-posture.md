@@ -328,11 +328,12 @@ by its stable `(workflow_name, workflow_id)` business key instead of its
 
   Two properties matter for posture rather than correctness. Resolution
   **reads at most two rows per shard** for the addressed key — an
-  authorization-neutral read the caller could already perform on its own shard,
-  and one that returns only the target's own execution id/state/start time,
-  never another tenant's data. And a shard that cannot be inspected yields a **retry**, never a
-  `target_unknown`, so an operator watching a partial outage sees stalled
-  by-id deliveries rather than silent false failures. Business-key addressing
+  authorization-neutral read: the management API's by-id endpoints (issue #805)
+  already fan the identical query across every shard for any read-authenticated
+  caller, and it returns only the target's own execution id/state/start time,
+  never another tenant's data. And a shard that cannot be inspected yields a
+  **retry**, never a `target_unknown`, so an operator watching a partial outage
+  sees stalled by-id deliveries rather than silent false failures. Business-key addressing
   remains an *address, not a secret*: the caveat above about building
   `workflow_name`/`workflow_id` from attacker-influenced data is unchanged and
   is now the only gate, since placement no longer accidentally hides a pinned

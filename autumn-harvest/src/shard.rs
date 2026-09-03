@@ -725,10 +725,12 @@ impl ShardRouter {
 /// shard has been drained out of `writable_shards` since the workflow was
 /// placed, which moves where the same key re-hashes.
 ///
-/// Its two remaining callers — `worker::reject_cross_shard_continue_as_new` and
-/// `execution`'s re-run `workflow_id`-override guard — use it as a proxy for a
+/// Its remaining callers — `worker::reject_cross_shard_continue_as_new` and the
+/// deprecated [`ShardedDbPool::exact_pool_for_target`] — use it as a proxy for a
 /// *third* question: "which shard would a shard-local uniqueness check for this
-/// key run on?" Both create the new run on an **existing** run's shard (the
+/// key run on?" (`execution`'s re-run `workflow_id`-override guard asks the same
+/// question, but reaches `pick_for_new_workflow` directly rather than through
+/// this function.) Those guards create the new run on an **existing** run's shard (the
 /// predecessor's, the re-run source's), never on the hashed one, and both refuse
 /// the operation when the two differ — because the uniqueness index they rely on
 /// lives on one shard and cannot see a live run of the key on another. That

@@ -737,6 +737,12 @@ async fn outbox_never_reports_target_unknown_while_a_shard_cannot_be_inspected()
 
     let types = history_event_types(&mut caller_conn, caller).await;
     assert!(
+        types.contains(&"ExternalSignalRequested".to_string()),
+        "positive control: the request itself must still be in the caller's \
+         history, so the negative assertions below are read against a history \
+         that actually loaded; got {types:?}"
+    );
+    assert!(
         !types.contains(&"ExternalSignalFailed".to_string()),
         "an un-inspectable shard must never be turned into a durable \
          `target_unknown` failure; got {types:?}"
@@ -963,6 +969,12 @@ async fn outbox_cancel_by_id_never_reports_target_unknown_while_a_shard_cannot_b
     .expect("cancel outbox sweep should succeed");
 
     let types = history_event_types(&mut caller_conn, caller).await;
+    assert!(
+        types.contains(&"ExternalCancelRequested".to_string()),
+        "positive control: the request itself must still be in the caller's \
+         history, so the negative assertions below are read against a history \
+         that actually loaded; got {types:?}"
+    );
     assert!(
         !types.contains(&"ExternalCancelFailed".to_string())
             && !types.contains(&"ExternalCancelDelivered".to_string()),
@@ -1385,7 +1397,6 @@ async fn worker_by_id_signal_is_not_delivered_inline_against_a_stale_terminal_on
     )
     .await
     .expect("start the live target on shard 1");
-    tokio::time::sleep(Duration::from_millis(300)).await;
 
     start_or_load_workflow_execution(
         &mut conn0,
@@ -1442,6 +1453,93 @@ async fn worker_by_id_signal_is_not_delivered_inline_against_a_stale_terminal_on
 
     worker.shutdown();
     let _ = handle.await;
+}
+
+#[tokio::test]
+async fn outbox_does_not_wait_on_a_peer_shard_whose_query_never_answers() {
+    let _guard = TEST_MUTEX.lock().await;
+    let shards = TwoShards::start().await;
+    let router = two_shard_router();
+    autumn_harvest::shard::install_global_router(router.clone());
+    let _topology = GlobalTopologyGuard::new(shards.pools[&ShardId::new(0)].clone());
+
+    // `FANOUT_ACQUIRE_BOUND` bounds the CHECKOUT; `FANOUT_PEER_BOUND` bounds the
+    // whole probe, and exists for a hazard the checkout bound cannot see: a peer
+    // that hands over a connection and then never answers on it. Its doc names
+    // an `ACCESS EXCLUSIVE` DDL lock as the everyday cause, which is exactly
+    // what this builds — the peer pool has a FREE connection, so acquisition
+    // succeeds immediately and only the query stalls.
+    //
+    // Without the outer bound this test hangs forever rather than failing, so
+    // the sweep is wrapped in a timeout of its own: a regression must surface as
+    // a red test, never as a wedged CI job.
+    let sharded = ShardedDbPool::from_map(shards.pools.clone(), ShardId::new(0));
+
+    let workflow_id = key_hashing_to(&router, "stalled_peer_wf", "stalled", ShardId::new(0));
+    let caller = ExecutionId::new_for_shard(ShardId::new(0));
+    let mut caller_conn = shards.conn(ShardId::new(0)).await;
+    seed_signal_caller(
+        &mut caller_conn,
+        caller,
+        "stalled-caller",
+        "stalled_peer_wf",
+        &workflow_id,
+    )
+    .await;
+
+    // Take an ACCESS EXCLUSIVE lock on shard 1's executions table and hold it
+    // for the duration of the sweep. Any plain SELECT against that table now
+    // blocks for as long as the lock is held.
+    let mut locker = shards.conn(ShardId::new(1)).await;
+    locker
+        .batch_execute("BEGIN; LOCK TABLE harvest_workflow_executions IN ACCESS EXCLUSIVE MODE")
+        .await
+        .expect("take the DDL lock on the peer shard");
+
+    let metrics = autumn_harvest::telemetry::NoOpMetrics;
+    let started = std::time::Instant::now();
+    let swept = tokio::time::timeout(
+        autumn_harvest::external_target_location::FANOUT_PEER_BOUND * 8,
+        autumn_harvest::timeout::enforce_external_signals_outbox(
+            &mut caller_conn,
+            &metrics,
+            Duration::from_millis(0),
+            &Some(sharded),
+            &[ShardId::new(0)],
+            &autumn_harvest::payload_codec::PayloadCodecs::default(),
+        ),
+    )
+    .await;
+    let elapsed = started.elapsed();
+
+    // Release the lock before asserting, so a failure does not strand the
+    // database for whatever runs next.
+    locker
+        .batch_execute("ROLLBACK")
+        .await
+        .expect("release the DDL lock");
+
+    swept
+        .expect("the sweep must RETURN when a peer's query stalls, not hang on it")
+        .expect("signal outbox sweep should succeed");
+    assert!(
+        elapsed < autumn_harvest::external_target_location::FANOUT_PEER_BOUND * 4,
+        "a stalled peer must cost about one probe budget, not accumulate — \
+         took {elapsed:?}"
+    );
+
+    let types = history_event_types(&mut caller_conn, caller).await;
+    assert!(
+        types.contains(&"ExternalSignalRequested".to_string()),
+        "positive control: the request must still be in the caller's history; \
+         got {types:?}"
+    );
+    assert!(
+        !types.contains(&"ExternalSignalFailed".to_string())
+            && !types.contains(&"ExternalSignalDelivered".to_string()),
+        "a peer that never answered is uninspected, not absent: the row stays \
+         pending rather than becoming a durable `target_unknown`; got {types:?}"
+    );
 }
 
 // ─────────────────────────────────────────────────────────────────────────
@@ -1521,6 +1619,12 @@ async fn outbox_does_not_wait_on_a_peer_shard_whose_only_connection_is_busy() {
     // And it must leave the row pending, not conclude anything from the shard
     // it could not read.
     let types = history_event_types(&mut pooled, caller).await;
+    assert!(
+        types.contains(&"ExternalSignalRequested".to_string()),
+        "positive control: the request itself must still be in the caller's \
+         history, so the negative assertions below are read against a history \
+         that actually loaded; got {types:?}"
+    );
     assert!(
         !types.contains(&"ExternalSignalFailed".to_string())
             && !types.contains(&"ExternalSignalDelivered".to_string()),
