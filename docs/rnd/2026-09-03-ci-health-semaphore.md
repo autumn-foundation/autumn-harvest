@@ -41,8 +41,9 @@ runs, and a reader diffing runs needs to check which case they're looking
 at.
 
 What it does not mean is "fast": the `ubuntu-latest` leg of `test` is
-consistently the slowest of the three, at ~150–155 minutes end to end across
-the three sampled runs, and it is the leg every PR is actually gated on.
+consistently the slowest of the three, at 132–155 minutes end to end across
+the three sampled runs (table below), and it is the leg every PR is actually
+gated on.
 
 ## 🌡️ Symptom — timing decomposition
 
@@ -90,10 +91,16 @@ documented, repeatedly, in the test sources themselves: `mutex_tests.rs`
 `transactional_start_tests.rs` (a lock held "safe under `--test-threads=1`
 because it always..."), `capability_miss_tests.rs` ("the whole module shares
 one database"), `integration_e2e.rs` (explicitly reasons about the 2-vCPU
-GitHub runner). This is load-bearing, intentional design, not an oversight —
-and `chaos_tests.rs` notes that on its testcontainers path "each test owns
-its database", i.e. at least one suite in the manifest is *not* subject to
-the shared-Postgres constraint the blanket `--test-threads=1` exists for.
+GitHub runner). This is load-bearing, intentional design, not an oversight.
+
+A per-test-isolated-database pattern does exist in this codebase, just not
+inside the 119-row manifest: `chaos_tests.rs` notes that on its
+testcontainers path "each test owns its database" — but that suite is gated
+behind the `chaos` feature (off by default, never in `default`) and runs
+only via the separate, non-gating `chaos.yml` workflow (on-demand +
+nightly), not through `run-suites.sh`. It's evidence the pattern is known
+and already implemented once in this repository, not evidence that any of
+the 119 manifest suites currently avoid the shared-Postgres constraint.
 
 **Test-vs-product verdict: this is a test/harness-architecture question, not
 a product bug.** Nothing here suggests the execution engine itself is slow;
@@ -112,24 +119,30 @@ both outside what this report can ship on its own authority:
    doing, not inferring from a timing chart.
 2. **Removing the serialization constraint** without adding runners would
    require auditing all 119 suites' actual isolation requirements (which
-   ones truly share mutable global/DB state vs. which ones, like the
-   `chaos_tests.rs` testcontainers path, already don't) — a correctness-
-   sensitive, per-suite audit, not a mechanical CI change.
+   ones truly share mutable global/DB state vs. which ones could move to a
+   per-test-database pattern) — a correctness-sensitive, per-suite audit,
+   not a mechanical CI change. None of the 119 manifest suites currently use
+   such a pattern (see Diagnosis above); `chaos_tests.rs` shows it's already
+   implemented once in this repository, outside the manifest, as a
+   precedent to adapt rather than a suite to point an owner at directly.
 
 Both are legitimate next steps; neither is a same-day CI-config edit. **This
 report's recommendation is a ranked next step, not a change:** an owner
 should decide whether to (a) spend the extra runner budget on sharding the
 `linux` manifest rows across N parallel jobs against N isolated Postgres
-databases (isolation already exists on the testcontainers path as a
-worked example), or (b) accept ~150 minutes as the honest cost of this
-suite's actual work and leave it alone. Either is a legitimate call; this
-report only supplies the number.
+databases, adapting the per-test-database pattern `chaos_tests.rs` already
+uses outside the manifest, or (b) accept 132–155 minutes as the honest cost
+of this suite's actual work and leave it alone. Either is a legitimate call;
+this report only supplies the number.
 
 ## 🔬 Flake census (secondary finding, not actioned)
 
 Searched for `flaky`/`flake`/`quarantine` in source, comments, and `#[ignore]`
-reasons (45 total `#[ignore]`s, zero without a reason string — no orphaned
-skips, nothing resembling an un-owned quarantine).
+reasons: 25 actual `#[ignore = "..."]` attributes repo-wide
+(`grep -rEn '^\s*#\[ignore(\s*=|\])'`, syntax-anchored so it excludes the ~20
+textual `#[ignore` mentions inside comments/doc-strings, mostly in
+`ci_run_coverage.rs`'s own guard-test descriptions), zero of the 25 without a
+reason string — no orphaned skips, nothing resembling an un-owned quarantine.
 
 Two prior CI-timing-flake fixes exist in `slot_tuner.rs`, both from real
 incidents: `tuner_loop_samples_pool_pressure_once_per_tick_for_both_slot_types`
@@ -198,10 +211,17 @@ unzip logs.zip -d ci_logs
 # consecutive ones -- see this memo's PR description for the ~40-line parser.
 ```
 
-Rerun-button / escape sampling:
+Rerun-button / escape sampling (`--paginate` to cover the full ~150-run
+`pull_request` sample and the ~30-run `push` sample this report used, not
+just the first page):
 
 ```sh
-gh api "repos/autumn-foundation/autumn-harvest/actions/workflows/ci.yml/runs?event=pull_request&status=completed&per_page=100" \
+gh api --paginate \
+  "repos/autumn-foundation/autumn-harvest/actions/workflows/ci.yml/runs?event=pull_request&status=completed&per_page=100" \
+  | jq '.workflow_runs[] | select(.run_attempt > 1)'
+
+gh api --paginate \
+  "repos/autumn-foundation/autumn-harvest/actions/workflows/ci.yml/runs?event=push&status=completed&per_page=100" \
   | jq '.workflow_runs[] | select(.run_attempt > 1)'
 ```
 
