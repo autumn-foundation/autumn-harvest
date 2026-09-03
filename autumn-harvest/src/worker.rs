@@ -7058,11 +7058,13 @@ async fn update_workflow_execution_failed(
 /// safe at both call sites: each shares `pause_workflow_execution`'s `FOR
 /// UPDATE` row lock, so a concurrent resume serialises after this check
 /// commits and issues its own wake.
-async fn check_paused_and_park(
+#[doc(hidden)]
+pub async fn check_paused_and_park(
     conn: &mut AsyncPgConnection,
     exec_uuid: uuid::Uuid,
     task_id: uuid::Uuid,
     worker_id: &str,
+    crash_strikes: i32,
     sticky_timeout: Duration,
 ) -> HarvestResult<bool> {
     use crate::schema::harvest_workflow_executions::dsl as exec_dsl;
@@ -7076,6 +7078,16 @@ async fn check_paused_and_park(
         .map_err(crate::error::database_error)?;
     if locked_state.as_deref() != Some("PAUSED") {
         return Ok(false);
+    }
+    // Issue #1184: the execution row lock above says nothing about who still
+    // holds the TASK row's claim -- a poison-pill reclaim, an operator
+    // requeue, or a concurrent claim race on `harvest_task_queue` can move it
+    // without touching `harvest_workflow_executions` at all. Re-derive that
+    // ownership under its own row lock (the established #804/#1182 guard)
+    // before parking: a stale dispatcher must not misdirect a row a new
+    // owner is now driving by re-parking it under its own now-invalid claim.
+    if !queue::claim_still_held_for_update(conn, task_id, worker_id, crash_strikes).await? {
+        return Err(HarvestError::TerminalWriteClaimAmbiguous { task_id });
     }
     let sticky = if sticky_timeout.is_zero() {
         None
@@ -7110,7 +7122,16 @@ async fn block_workflow_for_non_determinism(
         use crate::schema::harvest_workflow_executions::dsl as exec_dsl;
         let error_owned = error_owned.clone();
         let patch = patch.clone();
-        if check_paused_and_park(conn, exec_uuid, task_id, worker_id, sticky_timeout).await? {
+        if check_paused_and_park(
+            conn,
+            exec_uuid,
+            task_id,
+            worker_id,
+            task.crash_strikes,
+            sticky_timeout,
+        )
+        .await?
+        {
             return Ok(true);
         }
 
@@ -7232,12 +7253,14 @@ fn resolve_workflow_concurrency(
 }
 
 #[allow(clippy::too_many_arguments)]
-async fn persist_workflow_completion(
+#[doc(hidden)]
+pub async fn persist_workflow_completion(
     conn: &mut AsyncPgConnection,
     task_id: uuid::Uuid,
     exec_id: ExecutionId,
     next_event_id: i32,
     worker_id: &str,
+    crash_strikes: i32,
     output: serde_json::Value,
     metrics: Option<&(dyn crate::telemetry::MetricsRecorder + Send + Sync)>,
     offloader: Option<&crate::payload_store::PayloadOffloader>,
@@ -7250,6 +7273,15 @@ async fn persist_workflow_completion(
     };
     let (deferred, closed_children) =
         Box::pin(conn.transaction::<_, HarvestError, _>(async |conn| {
+            // Issue #1184: re-derive the task-row claim under its own lock
+            // before committing this completion. The execution row lock this
+            // transaction holds says nothing about `harvest_task_queue`
+            // ownership -- a stale dispatcher whose claim was reclaimed
+            // elsewhere must make no terminal decision here.
+            if !queue::claim_still_held_for_update(conn, task_id, worker_id, crash_strikes).await?
+            {
+                return Err(HarvestError::TerminalWriteClaimAmbiguous { task_id });
+            }
             store::append_events_offloaded_with_codecs(
                 conn,
                 exec_id,
@@ -7313,12 +7345,14 @@ async fn check_and_report_unfinished_handlers_for_worker(
 }
 
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
-async fn persist_workflow_failure(
+#[doc(hidden)]
+pub async fn persist_workflow_failure(
     conn: &mut AsyncPgConnection,
     task_id: uuid::Uuid,
     exec_id: ExecutionId,
     next_event_id: i32,
     worker_id: &str,
+    crash_strikes: i32,
     error: &str,
     nd_details: Option<&crate::error::NonDeterministicDetails>,
     execution: Option<&WorkflowExecution>,
@@ -7441,6 +7475,13 @@ async fn persist_workflow_failure(
             let decoded = decoded.clone();
             let retry_fire_info = retry_fire_info.clone();
             let exec_ref = execution;
+            // Issue #1184: re-derive the task-row claim under its own lock
+            // before committing this failure -- see the identical guard in
+            // `persist_workflow_completion` for the rationale.
+            if !queue::claim_still_held_for_update(conn, task_id, worker_id, crash_strikes).await?
+            {
+                return Err(HarvestError::TerminalWriteClaimAmbiguous { task_id });
+            }
             store::append_events_with_codecs(
                 conn,
                 exec_id,
@@ -11740,37 +11781,62 @@ pub async fn fail_task_and_execution_with_history(
     // same registry replay decodes with.
     codecs: &crate::payload_codec::PayloadCodecs,
 ) -> HarvestResult<()> {
-    let (exec_id, next_event_id) = match preloaded {
-        PreloadedFailureHistory::NoExecution => {
-            return fail_task_only(conn, task.id, error).await;
-        }
-        PreloadedFailureHistory::Unavailable { exec_id } => {
-            update_workflow_execution_failed(conn, exec_id, worker_id, error, None).await?;
-            return queue::fail_task(conn, task.id, error).await;
-        }
-        PreloadedFailureHistory::Loaded {
+    let task_id = task.id;
+    let crash_strikes = task.crash_strikes;
+    // Issue #1184: guard the `NoExecution`/`Unavailable` branches' writes
+    // (which, unlike the `Loaded` branch below, do not already run inside
+    // `persist_workflow_failure`'s own guarded transaction) with the same
+    // ownership recheck, and wrap them in a transaction so the check and the
+    // write it protects commit or roll back together. `conn.transaction`
+    // nests transparently as a SAVEPOINT when this is already called from
+    // inside one (e.g. `commit_terminal_failure_if_still_claimed`'s own
+    // transaction), so this is safe to call unconditionally regardless of
+    // caller context.
+    Box::pin(conn.transaction::<(), HarvestError, _>(async |conn| {
+        let (exec_id, next_event_id) = match preloaded {
+            PreloadedFailureHistory::NoExecution => {
+                if !queue::claim_still_held_for_update(conn, task_id, worker_id, crash_strikes)
+                    .await?
+                {
+                    return Err(HarvestError::TerminalWriteClaimAmbiguous { task_id });
+                }
+                return fail_task_only(conn, task_id, error).await;
+            }
+            PreloadedFailureHistory::Unavailable { exec_id } => {
+                if !queue::claim_still_held_for_update(conn, task_id, worker_id, crash_strikes)
+                    .await?
+                {
+                    return Err(HarvestError::TerminalWriteClaimAmbiguous { task_id });
+                }
+                update_workflow_execution_failed(conn, exec_id, worker_id, error, None).await?;
+                return queue::fail_task(conn, task_id, error).await;
+            }
+            PreloadedFailureHistory::Loaded {
+                exec_id,
+                next_event_id,
+            } => (exec_id, next_event_id),
+        };
+
+        persist_workflow_failure(
+            conn,
+            task_id,
             exec_id,
             next_event_id,
-        } => (exec_id, next_event_id),
-    };
-
-    persist_workflow_failure(
-        conn,
-        task.id,
-        exec_id,
-        next_event_id,
-        worker_id,
-        error,
-        None,
-        None,
-        None,
-        None,
-        None,
-        crate::types::Priority::default(),
-        codecs,
-    )
+            worker_id,
+            crash_strikes,
+            error,
+            None,
+            None,
+            None,
+            None,
+            None,
+            crate::types::Priority::default(),
+            codecs,
+        )
+        .await
+        .map(|_| ())
+    }))
     .await
-    .map(|_| ())
 }
 
 async fn finalize_activity_completion(
@@ -12150,12 +12216,14 @@ pub async fn wake_parent_for_child_failure(
 }
 
 #[allow(clippy::too_many_arguments)]
-async fn persist_child_workflow_completion(
+#[doc(hidden)]
+pub async fn persist_child_workflow_completion(
     conn: &mut AsyncPgConnection,
     task_id: uuid::Uuid,
     exec_id: ExecutionId,
     next_event_id: i32,
     worker_id: &str,
+    crash_strikes: i32,
     parent_exec_id: ExecutionId,
     output: serde_json::Value,
     metrics: Option<&(dyn crate::telemetry::MetricsRecorder + Send + Sync)>,
@@ -12170,6 +12238,13 @@ async fn persist_child_workflow_completion(
     let (deferred, closed_children) =
         Box::pin(conn.transaction::<_, HarvestError, _>(async |conn| {
             let output = output.clone();
+            // Issue #1184: same task-row ownership recheck as
+            // `persist_workflow_completion` -- see its guard for the
+            // rationale.
+            if !queue::claim_still_held_for_update(conn, task_id, worker_id, crash_strikes).await?
+            {
+                return Err(HarvestError::TerminalWriteClaimAmbiguous { task_id });
+            }
             store::append_events_with_codecs(conn, exec_id, &[event], next_event_id, codecs)
                 .await?;
             update_workflow_execution_completed(conn, exec_id, worker_id, &output).await?;
@@ -12201,12 +12276,14 @@ async fn persist_child_workflow_completion(
 }
 
 #[allow(clippy::too_many_arguments)]
-async fn persist_child_workflow_failure(
+#[doc(hidden)]
+pub async fn persist_child_workflow_failure(
     conn: &mut AsyncPgConnection,
     task_id: uuid::Uuid,
     exec_id: ExecutionId,
     next_event_id: i32,
     worker_id: &str,
+    crash_strikes: i32,
     parent_exec_id: ExecutionId,
     error: &str,
     nd_details: Option<&crate::error::NonDeterministicDetails>,
@@ -12227,6 +12304,12 @@ async fn persist_child_workflow_failure(
         Box::pin(conn.transaction::<_, HarvestError, _>(async |conn| {
             let raw_error = error.to_string();
             let message = decoded.message.clone();
+            // Issue #1184: same task-row ownership recheck as
+            // `persist_workflow_failure` -- see its guard for the rationale.
+            if !queue::claim_still_held_for_update(conn, task_id, worker_id, crash_strikes).await?
+            {
+                return Err(HarvestError::TerminalWriteClaimAmbiguous { task_id });
+            }
             store::append_events_with_codecs(
                 conn,
                 exec_id,
@@ -15694,6 +15777,7 @@ async fn reject_child_continue_as_new(
             persistence.exec_id,
             persistence.next_event_id,
             persistence.worker_id,
+            persistence.task.crash_strikes,
             error,
             None,
             None,
@@ -15711,6 +15795,7 @@ async fn reject_child_continue_as_new(
             persistence.exec_id,
             persistence.next_event_id,
             persistence.worker_id,
+            persistence.task.crash_strikes,
             parent_exec_id,
             error,
             None,
@@ -15824,6 +15909,7 @@ async fn check_continue_as_new_type<'a>(
         persistence.exec_id,
         persistence.next_event_id,
         persistence.worker_id,
+        persistence.task.crash_strikes,
         &error,
         None,
         None,
@@ -16368,6 +16454,7 @@ async fn persist_workflow_continue_as_new(
     // database as its predecessor.
     let new_exec_id = ExecutionId::new_for_shard(persistence.exec_id.shard());
     let task_id = persistence.task.id;
+    let crash_strikes = persistence.task.crash_strikes;
     let exec_id = persistence.exec_id;
     // Provenance ref for the successor is the predecessor execution id (#740).
     let predecessor_exec_id_str = exec_id.to_string();
@@ -16489,6 +16576,7 @@ async fn persist_workflow_continue_as_new(
             exec_id,
             next_event_id,
             worker_id,
+            persistence.task.crash_strikes,
             &error,
             None,
             None,
@@ -16586,6 +16674,14 @@ async fn persist_workflow_continue_as_new(
     enqueue.rate_limit_key = persistence.task.rate_limit_key.clone();
 
     Box::pin(conn.transaction::<(), HarvestError, _>(async |conn| {
+        // Issue #1184: this transaction seals the predecessor
+        // (CONTINUED_AS_NEW) and completes its task row -- an ordinary
+        // terminal write not enumerated by name in the issue, but the same
+        // shape as `persist_workflow_completion`'s gap, found while auditing
+        // this call chain. Guard it the same way before anything is written.
+        if !queue::claim_still_held_for_update(conn, task_id, worker_id, crash_strikes).await? {
+            return Err(HarvestError::TerminalWriteClaimAmbiguous { task_id });
+        }
         // Append the terminal continued-as-new marker to the old run.
         store::append_events_offloaded_with_codecs(
             conn,
@@ -16715,6 +16811,7 @@ async fn persist_workflow_outcome(
                 persistence.exec_id,
                 persistence.next_event_id,
                 persistence.worker_id,
+                persistence.task.crash_strikes,
                 parent_id,
                 output,
                 Some(registry.telemetry().metrics.as_ref()),
@@ -16731,6 +16828,7 @@ async fn persist_workflow_outcome(
                 persistence.exec_id,
                 persistence.next_event_id,
                 persistence.worker_id,
+                persistence.task.crash_strikes,
                 output,
                 Some(registry.telemetry().metrics.as_ref()),
                 registry.payload_offloader(),
@@ -16763,6 +16861,7 @@ async fn persist_workflow_outcome(
                 persistence.exec_id,
                 persistence.next_event_id,
                 persistence.worker_id,
+                persistence.task.crash_strikes,
                 parent_id,
                 &error,
                 non_deterministic_details.as_ref(),
@@ -16800,6 +16899,7 @@ async fn persist_workflow_outcome(
                 persistence.exec_id,
                 persistence.next_event_id,
                 persistence.worker_id,
+                persistence.task.crash_strikes,
                 &error,
                 non_deterministic_details.as_ref(),
                 Some(execution),
@@ -19517,7 +19617,16 @@ async fn process_workflow_task(
 
     let persist_flow = Box::pin(conn.transaction::<WorkflowPersistFlow, HarvestError, _>(
         async |conn| {
-            if check_paused_and_park(conn, exec_uuid, task.id, worker_id, sticky_timeout).await? {
+            if check_paused_and_park(
+                conn,
+                exec_uuid,
+                task.id,
+                worker_id,
+                task.crash_strikes,
+                sticky_timeout,
+            )
+            .await?
+            {
                 return Ok(WorkflowPersistFlow::ParkedPaused);
             }
 
@@ -19905,6 +20014,45 @@ async fn handle_ambiguous_suspended_claim(
     }))
 }
 
+/// Issue #1184: the [`handle_ambiguous_suspended_claim`] counterpart for the
+/// broader set of ordinary terminal-write guards (complete/fail/pause-park)
+/// this issue adds -- performs the release for an ambiguous *terminal-write*
+/// claim if `error` names one, and returns `None` (a no-op) for every other
+/// error. Same call-site placement and the same reason: the release is
+/// intentionally blocking, so it must run after
+/// [`run_under_workflow_body_budget`] has returned rather than inside it.
+async fn handle_ambiguous_terminal_write_claim(
+    conn: &mut AsyncPgConnection,
+    task: &TaskQueueItem,
+    worker_id: &str,
+    error: &HarvestError,
+) -> Option<HarvestResult<TaskDispatchOutcome>> {
+    let task_id = error.terminal_write_claim_ambiguous()?;
+    let released =
+        match queue::release_terminal_workflow_claim(conn, task_id, worker_id, task.crash_strikes)
+            .await
+        {
+            Ok(released) => released,
+            Err(err) => return Some(Err(err)),
+        };
+    tracing::info!(
+        task_id = %task_id,
+        queue = %task.queue_name,
+        released,
+        "an ordinary workflow-task terminal write (complete, fail, or pause-park) could not \
+         confirm ownership (a genuine transfer, or a concurrent, unrelated lock holder), so \
+         the enclosing transaction was rolled back and no terminal decision was made; the \
+         task was released back to the queue if it was still ours"
+    );
+    // The handler ran to a real conclusion this cycle (a completion, a
+    // failure, or a pause-park) and only the final claim recheck found
+    // ambiguity, so -- exactly like the #1182 sibling above -- this is
+    // genuine evidence of health: clear the issue #494 timeout strike.
+    Some(Ok(TaskDispatchOutcome::Released {
+        clears_timeout_strike: true,
+    }))
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn process_task(
     pool: &DbPool,
@@ -20025,6 +20173,15 @@ async fn process_task(
     // has already returned -- rather than inside `process_workflow_task`.
     // See `handle_ambiguous_suspended_claim`'s doc comment for why.
     if let Some(result) = handle_ambiguous_suspended_claim(&mut conn, &task, worker_id, error).await
+    {
+        return result;
+    }
+    // Issue #1184: same interception point and the same reason, for the
+    // broader set of ordinary terminal-write guards (complete/fail/
+    // pause-park) this issue adds. A disjoint error variant from the #1182
+    // check above, so at most one of the two ever matches.
+    if let Some(result) =
+        handle_ambiguous_terminal_write_claim(&mut conn, &task, worker_id, error).await
     {
         return result;
     }

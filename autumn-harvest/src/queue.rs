@@ -3197,6 +3197,40 @@ pub async fn release_suspended_workflow_claim(
     worker_id: &str,
     crash_strikes: i32,
 ) -> HarvestResult<bool> {
+    release_workflow_claim_inner(conn, task_id, worker_id, crash_strikes).await
+}
+
+/// [`release_suspended_workflow_claim`] under a name that does not imply
+/// suspension, for issue #1184's broader set of ordinary terminal-write
+/// guards (complete/fail/pause-park). Identical query, identical
+/// "still-ours -> release for a fresh attempt, already-moved -> no-op"
+/// contract: the handler ran to a real conclusion this cycle (a completion,
+/// a failure, or a park) either way, so the same crash-strikes/capability-miss
+/// reset the #1182 release performs is equally warranted here -- see
+/// [`release_suspended_workflow_claim_query`]'s doc comment for why that reset
+/// is safe and correct. Mirrors the existing
+/// [`park_workflow_task`]/[`park_workflow_task_preserving_capability_misses`]
+/// pair, which likewise share one `_inner` implementation under two
+/// call-site-appropriate names.
+///
+/// # Errors
+///
+/// Returns [`crate::error::HarvestError::Database`] if the query fails.
+pub async fn release_terminal_workflow_claim(
+    conn: &mut AsyncPgConnection,
+    task_id: Uuid,
+    worker_id: &str,
+    crash_strikes: i32,
+) -> HarvestResult<bool> {
+    release_workflow_claim_inner(conn, task_id, worker_id, crash_strikes).await
+}
+
+async fn release_workflow_claim_inner(
+    conn: &mut AsyncPgConnection,
+    task_id: Uuid,
+    worker_id: &str,
+    crash_strikes: i32,
+) -> HarvestResult<bool> {
     // Only the row's *existence* matters -- the id is bound, not read back.
     #[derive(diesel::QueryableByName)]
     struct IdRow {

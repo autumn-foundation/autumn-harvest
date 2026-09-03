@@ -207,6 +207,8 @@ mod start_source_tests;
 mod sticky_routing_tests;
 mod telemetry_span_tests;
 #[cfg(feature = "db")]
+mod terminal_write_ownership_tests;
+#[cfg(feature = "db")]
 mod throttle_tests;
 #[cfg(feature = "db")]
 mod transactional_activity_tests;
