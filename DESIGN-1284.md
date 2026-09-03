@@ -250,20 +250,46 @@ the behaviour is byte-for-byte what it was.
 
 ## 7. Test matrix
 
-`autumn-harvest-plugin/tests/security.rs` (no database required — the gate
-answers before any handler runs).
+Reconciled against the tests as shipped (names are verbatim). No database is
+required for any of them — the gate answers before any handler runs.
 
-| Test | AC | Shape |
+`autumn-harvest-plugin/tests/security.rs`:
+
+| Test (`hermes_` prefix) | AC | Shape |
 |------|----|-------|
 | `dev_profile_admits_preflight_with_no_session_extension` | AC1 | `dev`, no `Session` extension → not `401`/`403` |
 | `dev_profile_admits_preflight_with_fresh_cookieless_session` | AC1 | `dev`, `Session::new_for_test_without_cookie` (the quickstart's real shape) → not `401`/`403` |
-| `dev_profile_admits_admin_route_with_no_session_extension` | AC1 | as above on a second admin route, so the fix is the gate and not one handler |
-| `dev_profile_still_requires_configured_key_for_established_session` | AC3 | `dev`, cookie-backed session with the wrong key → `401` (the existing `…hard_coded_admin_id` guarantee, restated against `/admin/preflight`) |
-| `non_dev_profile_rejects_cookieless_session_on_admin_route` | AC2 | `prod`, cookieless session → `401` |
-| `unknown_profile_rejects_cookieless_session_on_admin_route` | AC2 | default (`unknown`) profile, cookieless session → `401` |
+| `dev_profile_admits_second_admin_route_when_unauthenticated` | AC1 | as above on `/admin/shards/health`, so the fix is the shared gate and not one handler |
+| `dev_profile_still_requires_configured_key_for_established_session` | AC3 | `dev`, cookie-backed session with the wrong key → `401` |
+| `dev_profile_admits_established_session_with_configured_key` | AC3 | `dev`, cookie-backed session with the configured key → not `401`/`403` (the positive direction) |
+| `non_dev_profile_rejects_unauthenticated_admin_route` | AC2 | `prod`, **both** unauthenticated shapes → `401` |
+| `unknown_profile_rejects_unauthenticated_admin_route` | AC2 | default (`unknown`) profile, cookieless session → `401` |
 | `declared_auth_boundary_still_short_circuits_in_dev` | AC4 | `dev` + `set_admin_auth_boundary(true)` → not `401` (precedence unchanged) |
-| existing `eris_*` suite, unmodified | AC8 | all still pass |
-| `preflight_integration.rs` dev-profile check detail | AC6 | `admin_auth_boundary` check carries `unauthenticated_access: true` in `dev`, `false` otherwise |
+| existing `eris_*` suite, unmodified | AC8 | all still pass (108/108 in the file) |
+
+Unit tests, inline with the code they pin:
+
+| Test | AC | Shape |
+|------|----|-------|
+| `plugin::tests::dev_admin_api_is_open_only_without_a_boundary_in_the_dev_profile` | AC6 | the startup-warning predicate fires for, and only for, the open configuration (includes `"DEV"` and `""` non-matches) |
+| `preflight::tests::admin_auth_boundary_reports_unauthenticated_dev_access` | AC6 | `admin_auth_boundary` carries `unauthenticated_access: true` in open `dev`, `false` when a boundary is declared and for `prod`/`staging`/`unknown` |
+
+End-to-end, `.github/workflows/ci.yml` (quickstart job):
+
+| Check | AC | Shape |
+|------|----|-------|
+| `GET /api/harvest/admin/preflight` raw status | AC1 | against a **real** autumn-web app, whose unconditional session layer produces the `Some(session)` shape the unit tests simulate; `401`/`403` fails the job by name |
+| the documented `harvest … preflight` command | AC1, AC7 | exit `0` (pass) or `2` (warn) accepted, `1` fails — pins the README command itself, not just the route |
+
+### Known coverage gap
+
+`warn_if_dev_admin_api_is_open`'s **predicate** is unit-tested, but its **call
+site** in `start_harvest_runtime` is not: deleting that one line would leave
+every test green. Pinning it needs a booted `AppState` plus a `tracing`
+subscriber capture, which is precisely the cost the predicate was split out to
+avoid. Accepted deliberately — the observable half of AC6 that a release script
+can actually gate on is `preflight`'s `unauthenticated_access` field, which *is*
+pinned on both sides.
 
 ---
 
