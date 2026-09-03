@@ -470,8 +470,9 @@ Three things to read here:
    > **Follow-up (issue #1177):** the `CASE` key is *sufficient* to force this
    > plan shape, but it is not *necessary* — removing it would not restore
    > sort-elision, because any one of the query's other residual `WHERE`
-   > predicates independently forces the identical `Seq Scan` + `Sort` shape,
-   > including several that are total no-ops at 100% selectivity. See
+   > predicates independently forces the same collapsed shape (a full-backlog
+   > scan plus `Sort`), including several that are total no-ops at 100%
+   > selectivity. See
    > [any residual predicate defeats sort-elision](#any-residual-predicate-defeats-sort-elision-issue-1177)
    > below. Point 1 above remains accurate as far as it goes; it is incomplete
    > as an explanation of the superlinear scaling, since dropping the `CASE`
@@ -527,15 +528,15 @@ own, that finding invites a natural next step: drop the `CASE` (or index the
 sticky columns) and the ordering falls back to `priority DESC, scheduled_at` —
 exactly `idx_harvest_tq_poll`'s key — so the cheap plan should return.
 
-**It does not.** Issue #1177 reproduces, with the `CASE` removed entirely from
-`ORDER BY` and `idx_harvest_tq_poll` *forced* via `enable_seqscan=off;
-enable_bitmapscan=off` so the planner has no other index to fall back to, that
-adding **any single one** of the query's other residual `WHERE` predicates —
+**It does not.** Issue #1177 reproduces that, with the `CASE` removed entirely
+from `ORDER BY` (leaving only `priority DESC, scheduled_at` — an exact match
+for `idx_harvest_tq_poll`'s key) and **no planner hints in play**, adding
+**any single one** of the query's other residual `WHERE` predicates —
 including several with **zero actual selectivity** (100% of rows pass the
-filter) — collapses the plan back to a full-backlog scan (`Seq Scan` for most
-predicates tested, `Bitmap Heap Scan` for a few) plus a `Sort` that replaces
-the index-order pushdown. This holds with and without `FOR UPDATE SKIP
-LOCKED`.
+filter) — is already enough on its own for the planner to choose a
+full-backlog scan (`Seq Scan` for most predicates tested, `Bitmap Heap Scan`
+for a few) plus a `Sort`, instead of the ordered index scan. This holds with
+and without `FOR UPDATE SKIP LOCKED`.
 
 Ten predicates were tested independently against a 255 020-row fixture
 (119 940 PENDING rows in the `default` queue), each added alone to the base
@@ -546,35 +547,55 @@ OR-chains (#235, #606), the queue-pause anti-join (#619), the
 both capability-label predicates (#382), the `rate_limit_key` `EXISTS`
 (#332/#699), the `schedule_to_close_at` check (#378), and the concurrency-key
 gate (#247). **All ten** independently reproduce the collapse — even the
-ones that are total no-ops in the fixture (`Rows Removed by Filter: 0`),
-which rules out a selectivity-misestimate explanation.
+ones that are total no-ops in the fixture (`Rows Removed by Filter: 0`).
+That figure is the *actual*, execution-time row count, not the planner's
+pre-execution selectivity *estimate*; by itself it doesn't prove the
+estimate was accurate, so it doesn't on its own rule out a selectivity
+misestimate. What does rule that out is the separate diagnostic below: it
+shows the sort-elision candidate isn't rejected on a cost comparison at all
+— it is never generated as a candidate in the first place, regardless of
+what any selectivity estimate says.
+
+**A separate, narrower diagnostic goes further, for the sticky-routing
+predicate specifically.** With the competing `idx_harvest_tq_coverage_sample`
+index hidden and `enable_seqscan=off; enable_bitmapscan=off` set
+(session-local, inside a rolled-back transaction) to bias the planner away
+from those plan types — these are cost penalties, not a hard directive, which
+is exactly why the natural, unhinted ten-predicate results above still show
+`Seq Scan`/`Bitmap Heap Scan` for most rows rather than being universally
+overridden — Postgres does walk `idx_harvest_tq_poll` for the sticky
+predicate, already producing rows in the required order. But it still
+inserts a redundant `Sort` node on top and materialises every matching row
+before applying `LIMIT 1`, rather than eliding the sort.
 
 Two separate, compounding effects are at work, not one:
 
 1. **Any residual `Filter` on an otherwise index-order-matching scan defeats
-   sort-elision and `LIMIT` pushdown**, independent of `FOR UPDATE`. Forcing
-   `idx_harvest_tq_poll` — already producing rows in the required order —
-   still inserts a redundant `Sort` node and materialises every matching row
-   before applying `LIMIT 1`. The sort-elision/limit-pushdown candidate plan
-   is not generated at all once a residual `Filter` sits on the scan; this is
-   not a cost-based choice of a worse plan over a better one the planner
-   considered. Reproduced this consistently across all ten predicates in this
-   fixture, this alone makes every claim O(backlog), with or without the
-   `CASE` key — the mechanism inside the planner that treats a residual
-   `Filter` as disqualifying an otherwise pathkey-matching scan from
-   sort-elision is not independently derived here, only observed.
+   sort-elision and `LIMIT` pushdown**, independent of `FOR UPDATE` — shown
+   directly by the forced-index diagnostic above for the sticky predicate,
+   and consistent with (though not independently re-run as the same
+   diagnostic for) the other nine predicates' natural-planner results. The
+   sort-elision/limit-pushdown candidate plan is not generated at all once a
+   residual `Filter` sits on the scan; this is not a cost-based choice of a
+   worse plan over a better one the planner considered. With or without the
+   `CASE` key, this alone makes every claim O(backlog) in this fixture — the
+   mechanism inside the planner that treats a residual `Filter` as
+   disqualifying an otherwise pathkey-matching scan from sort-elision is not
+   independently derived here, only observed.
 2. **`FOR UPDATE SKIP LOCKED` additionally disables the bounded Top-N sort**
    once (1) has already forced a `Sort` node to exist. Without `FOR UPDATE`,
-   the same forced-index plan restores a bounded Top-N heapsort (in-memory, no
-   disk spill) — it still scans the full eligible set to get there, but stays
-   in memory. With `FOR UPDATE SKIP LOCKED`, the sort is unbounded and spills
-   to disk past a few hundred thousand rows (`Sort Method: external merge
-   Disk: 5640-7057kB` in the #1177 fixture).
+   the same forced-index plan (again, the sticky-predicate diagnostic)
+   restores a bounded Top-N heapsort (in-memory, no disk spill) — it still
+   scans the full eligible set to get there, but stays in memory. With `FOR
+   UPDATE SKIP LOCKED`, the sort is unbounded and spills to disk past a few
+   hundred thousand rows (`Sort Method: external merge Disk: 5640-7057kB` in
+   the #1177 fixture).
 
 A semantically-identical rewrite — the ordered scan wrapped in a subquery,
-with the residual filter applied as an outer `WHERE` — does not help either;
-the planner flattens it back into the identical `Seq Scan` + external-merge
-`Sort` shape. This is not a syntax-sensitivity quirk with a free rewrite.
+with the residual filter applied as an outer `WHERE` — does not help either,
+for the same sticky-predicate case; the planner flattens it back into the
+identical collapsed shape. This is not a syntax-sensitivity quirk with a
+free rewrite.
 
 **This reproduction is issue #1177's own**, cited here rather than
 independently re-run for this page. Unlike
@@ -612,12 +633,19 @@ exactly-once-claim, and `SKIP LOCKED`-concurrency-safety invariants by
 someone with full context on `queue.rs`. It is out of scope for this page and
 is not decided here; it is tracked separately as issue #1340.
 
-This also resolves the [known limitations](#known-limitations) bullet that
-listed `schedule_to_close` (#378), worker sessions (#606) and sticky routing
-(#235) as "cheap inline column tests" whose cost was simply unmeasured:
-measured here, each is independently sufficient — regardless of the value it
-is tested against — to trigger the full O(backlog) plan. They were never
-cheap; they were untested.
+This also corrects, without fully resolving, the
+[known limitations](#known-limitations) bullet that called `schedule_to_close`
+(#378), worker sessions (#606) and sticky routing (#235) "cheap inline column
+tests": reproduced here, each independently defeats sort-elision regardless
+of the value it is tested against, so "cheap" was never an established
+finding — it was this page's own retracted reading of their *plan-eligibility*
+effect. Their marginal *cost* on the attribution table above is a different
+question and remains unmeasured: in the full production query the `CASE` key
+and the always-present queue-pause/`schedule_to_close`-adjacent predicates
+already force the same collapsed plan shape regardless of these three, so
+their own incremental contribution can't be isolated this way — that would
+still need the seed-variant scenario work [known limitations](#known-limitations)
+already calls for.
 
 **Zero engine impact.** Like issue #786 and every fix on this page, this
 finding changes nothing about `claim_task_query()`: no new `WorkflowEvent`
@@ -1284,15 +1312,19 @@ from the benchmark are directly comparable.
     the correlated anti-join with a one-time prefilter — see
     [the queue-pause anti-join fix](#the-queue-pause-anti-join-fix).
   * **`schedule_to_close` (#378), worker sessions (#606), sticky routing
-    (#235)** — not cheap. Issue #1177 measured these directly: each
+    (#235)** — their cost on the attribution table above is still unmeasured;
+    that remains scenario work, same as before. What issue #1177 adds is a
+    different kind of evidence, not a cost figure: in isolation, each
     independently defeats sort-elision and `LIMIT` pushdown regardless of the
-    value it is tested against, reproducing the identical `Seq Scan` +
-    external-merge `Sort` collapse this page's own headline finding
-    describes. See
+    value it is tested against, reproducing the same collapsed plan shape
+    this page's own headline finding describes. See
     [any residual predicate defeats sort-elision](#any-residual-predicate-defeats-sort-elision-issue-1177).
-    "cheap inline column tests" was this page's own now-retracted reading —
-    it never measured them, and the value tested against turns out not to
-    matter.
+    In the full production query the `CASE` key and the always-present
+    predicates already force that same collapse regardless of these three, so
+    their own marginal cost still can't be isolated this way. "cheap inline
+    column tests" was this page's own now-retracted reading of their
+    *plan-eligibility* effect, not a corrected *cost* measurement — replacing
+    one unsupported cost claim with another would be no improvement.
 
   Adding these is scenario work, not query work: each needs a seed variant and a
   report row, on a bench that already runs 15-30 minutes.

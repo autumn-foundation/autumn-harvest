@@ -9,27 +9,37 @@ columns, and the cheap index-ordered plan should return.
 
 Issue #1177 reproduces that this does not happen. With the `CASE` removed
 entirely from `ORDER BY` (leaving only `priority DESC, scheduled_at`, an
-exact match for `idx_harvest_tq_poll`'s key) and with `idx_harvest_tq_poll`
-forced via planner hints so the optimizer has no other index to fall back
-to, adding any single one of the query's other residual `WHERE` predicates —
-including several with zero actual selectivity (100% of rows pass) —
-independently collapses the plan straight back to `Seq Scan` + external-merge
-`Sort`. This holds with and without `FOR UPDATE SKIP LOCKED`. Ten predicates
-were tested independently against a 255 020-row fixture; all ten reproduce
-the collapse, ruling out a selectivity-misestimate explanation. Two separate,
-compounding effects are documented: (1) any residual `Filter` on an
-otherwise index-order-matching scan defeats sort-elision and `LIMIT`
-pushdown regardless of `FOR UPDATE`, and (2) `FOR UPDATE SKIP LOCKED`
-additionally disables the bounded Top-N sort once (1) has already forced a
-`Sort` node, turning bounded in-memory work into an unbounded external sort
-that spills to disk at scale.
+exact match for `idx_harvest_tq_poll`'s key) and no planner hints in play,
+adding any single one of the query's other residual `WHERE` predicates —
+including several with zero actual selectivity (100% of rows pass) — is
+already enough on its own for the planner to fall back to a full-backlog
+scan (`Seq Scan` for most predicates tested, `Bitmap Heap Scan` for a few)
+plus a `Sort`, instead of the ordered index scan. This holds with and
+without `FOR UPDATE SKIP LOCKED`. Ten predicates were tested independently
+against a 255 020-row fixture; all ten reproduce the collapse. A separate,
+narrower diagnostic — for the sticky-routing predicate specifically, with
+the competing index hidden and `enable_seqscan`/`enable_bitmapscan` set to
+bias (not force) the planner away from those plan shapes — shows Postgres
+still inserts a redundant `Sort` even while walking `idx_harvest_tq_poll`
+itself: the sort-elision candidate isn't losing a cost comparison, it's
+never generated as a candidate at all. Two separate, compounding effects are
+documented: (1) any residual `Filter` on an otherwise index-order-matching
+scan defeats sort-elision and `LIMIT` pushdown regardless of `FOR UPDATE`,
+and (2) `FOR UPDATE SKIP LOCKED` additionally disables the bounded Top-N
+sort once (1) has already forced a `Sort` node — the unlocked variant stays
+a bounded in-memory heapsort; only the locked variant spills to an unbounded
+external-merge sort on disk at scale.
 
-This also resolves the "Known limitations" bullet that called
-`schedule_to_close` (#378), worker sessions (#606) and sticky routing (#235)
-"cheap inline column tests" whose cost was simply unmeasured: measured now,
-each is independently sufficient to trigger the same O(backlog) plan
-regardless of the value it is tested against — they were never cheap, they
-were untested.
+This also corrects, without fully resolving, the "Known limitations" bullet
+that called `schedule_to_close` (#378), worker sessions (#606) and sticky
+routing (#235) "cheap inline column tests": reproduced here, each
+independently defeats sort-elision regardless of the value it is tested
+against, so "cheap" was never an established finding. That is a
+plan-eligibility result, not a cost measurement — their marginal cost on the
+attribution table remains unmeasured (the `CASE` key and always-present
+predicates already force the same collapse regardless of these three, so
+their own incremental cost can't be isolated this way), and stays scenario
+work.
 
 **Zero engine impact (AC6-equivalent): no new `WorkflowEvent` variant, no
 migration, no schema change, no public API change, and the claim query is
