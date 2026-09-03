@@ -44,9 +44,13 @@ boundary refactor be scheduled now? **No — deferred, pending a trigger below.*
   plan (`docs/performance.md:434-462`) that names the mechanism precisely
   (`Sort Key` leads with a non-indexable `CASE` on `sticky_worker_id`/
   `sticky_until`, defeating `idx_harvest_tq_poll`'s ordering). Diagnosed,
-  not designed — but still a single-file, storage-agnostic query problem
-  with a known root cause, which is a smaller unknown than standing up and
-  maintaining a second datastore's worker integration.
+  not designed. It is also Postgres-specific, not storage-agnostic: the
+  defect lives inside `claim_task_query()`'s SQL (`autumn-harvest/src/
+  queue.rs:605-779`), tied to `idx_harvest_tq_poll`, `NOW()`, and `FOR
+  UPDATE SKIP LOCKED`; a fix helps only the Postgres backend and may need
+  a migration for a supporting index. That narrows the comparison: it is
+  a smaller, better-scoped unknown than a second datastore's worker
+  integration, not a free one.
 - **The crate's own throughput claim doesn't settle the case either way.**
   The `Prospect` spike (`docs/assays/0001-...md`) measured the standalone
   adapter honestly: it misses 10k ops/sec at the registered 8-worker
@@ -64,8 +68,9 @@ boundary refactor be scheduled now? **No — deferred, pending a trigger below.*
 undo. Building it now and reverting later: the standalone crate is already an
 isolated, optional workspace member, so ripping out an unshipped integration
 attempt is cheap in itself, but the refactor's natural landing zone is
-`worker.rs` — already the repo's single largest file (35,926 lines) and its
-second-most-coupled by commit-touch frequency (170 touches, 31.0% of all
+`worker.rs` — already the repo's second-largest file (36,170 lines, behind
+only `autumn-harvest-plugin/src/api.rs` at 55,261) and its second-most-coupled
+by commit-touch frequency (170 touches, 31.0% of all
 commits with `*.rs` changes over full history; `worker.rs` × `context.rs` is
 the single strongest co-change edge in the repo at 87 commits). Landing an
 unforced, atomicity-changing refactor in that file today adds coordination
@@ -102,7 +107,8 @@ Independent of this record and not gated by it: the non-indexable `ORDER BY`
 sort key in `queue::claim_task` (`docs/performance.md:454-462`) is a
 diagnosed, unscoped defect — its root cause is known, no rewrite has been
 proposed or evaluated yet. Whatever fix eventually emerges is a two-way
-door (a query/index change, reversible in hours) and storage-agnostic —
-it is the implementing team's call to pick up and design whenever, per
+door (a query/index change, reversible in hours), Postgres-specific, and
+possibly needing a migration for a supporting index — it is the
+implementing team's call to pick up and design whenever, per
 Keystone's own charter on sub-2-week reversible decisions, not something
 this record resolves.
