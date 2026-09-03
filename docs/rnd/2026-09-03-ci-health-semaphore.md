@@ -9,9 +9,12 @@ findings report handed to the team, not a fix.
 only path a PR into `trunk-dev`/`trunk` waits on), `.github/ci/run-suites.sh`
 + `integration-suites.txt` (the manifest-driven integration-suite runner),
 and Actions run/job history for the `CI` workflow via the GitHub API —
-~150 `pull_request`-event runs and 7 recent `push`-event (`trunk-dev`) runs
-sampled, plus full step-level timing and per-suite log timestamps pulled for
-three `push`-event runs on `trunk-dev` (2026-08-31, 2026-09-02, 2026-09-03).
+~150 `pull_request`-event runs and 30 `push`-event (`trunk-dev`) runs sampled
+for the rerun-button census (of the 30 push runs, 7 completed with a
+non-cancelled conclusion — the rest were superseded by `cancel-in-progress`
+before finishing), plus full step-level timing and per-suite log timestamps
+pulled for three of those 7 completed `push`-event runs on `trunk-dev`
+(2026-08-31, 2026-09-02, 2026-09-03).
 
 ## 🎯 Verdict path
 
@@ -57,8 +60,10 @@ on `trunk-dev` (all green):
 | `33712626699` (2026-09-03) | 155.3 min | 84.3 min | 54.3% |
 
 One step — `bash .github/ci/run-suites.sh run linux`, 119 sequential
-`cargo test` invocations against a shared Docker Postgres, each internally
-`--test-threads=1` — consistently owns **54–58% of the slowest leg's wall
+`cargo test` invocations each internally `--test-threads=1` (see Diagnosis
+below for what that serialization actually buys, which is more mixed than
+"shared Postgres" alone) — consistently owns **54–58% of the slowest leg's
+wall
 time**, and that leg is on the path every PR waits on end to end. No other
 step comes close: the next-largest ubuntu-leg step across all three runs is
 `Compile plugin integration test suites (manifest, all OSes)` at 5–8 minutes.
@@ -81,59 +86,95 @@ this is deterministic, reproducible wall time, not nondeterminism — it does
 not fit the flake-rate protocol and isn't being reported as one.
 
 **Root-cause category: forced full serialization across an unbounded suite
-count, with the constraint asserted but not decomposed by suite.** The
-runner script pins `--test-threads=1` on every `linux`/`linuxpart` row "serial
-for shared Postgres" (`run-suites.sh` comment), and drives all 119 matching
-rows through one `while read` loop — one `cargo test` process at a time, full
-stop, for the whole step. That constraint is real and specifically
-documented, repeatedly, in the test sources themselves: `mutex_tests.rs`
-("several tests set the process-global mutex lease TTL"),
-`transactional_start_tests.rs` (a lock held "safe under `--test-threads=1`
-because it always..."), `capability_miss_tests.rs` ("the whole module shares
-one database"), `integration_e2e.rs` (explicitly reasons about the 2-vCPU
-GitHub runner). This is load-bearing, intentional design, not an oversight.
+count — but the constraint is not one uniform reason.** (An earlier draft of
+this section cited it as more uniform than it is — corrected below at the
+`capability_miss_tests.rs` citation.) The runner script
+pins `--test-threads=1` on every `linux`/`linuxpart` row "serial for shared
+Postgres" (`run-suites.sh` comment), and drives all 119 matching rows through
+one `while read` loop — one `cargo test` process at a time, full stop, for
+the whole step. What's actually behind that constraint, per-suite:
 
-A per-test-isolated-database pattern does exist in this codebase, just not
-inside the 119-row manifest: `chaos_tests.rs` notes that on its
-testcontainers path "each test owns its database" — but that suite is gated
-behind the `chaos` feature (off by default, never in `default`) and runs
-only via the separate, non-gating `chaos.yml` workflow (on-demand +
-nightly), not through `run-suites.sh`. It's evidence the pattern is known
-and already implemented once in this repository, not evidence that any of
-the 119 manifest suites currently avoid the shared-Postgres constraint.
+1. **Genuine cross-test shared mutable state (a minority, confirmed).**
+   `mutex_tests.rs` ("several tests set the process-global mutex lease TTL")
+   and `transactional_start_tests.rs` (a lock held "safe under
+   `--test-threads=1` because it always...") depend on process-global state,
+   not just the database — these need in-process serialization regardless of
+   DB isolation.
+2. **Documented CI-runner resource contention — the best-evidenced mechanism
+   here, and the one this report under-weighted originally.**
+   `integration_e2e.rs` carries an extensive incident writeup (five rounds of
+   CI failures, PR #901 and issue #604) concluding the flakiness was "pure
+   scheduling-contention on a shared, 2-vCPU CI runner asked to make progress
+   on 11 genuinely concurrent, DB-heavy decision cycles at once" — not a
+   logic bug, and not fundamentally a database-sharing problem. That test
+   now runs 12 OS threads *inside itself*, explicitly relying on the rest of
+   the suite being serialized around it ("this whole suite runs with
+   `--test-threads=1`, so this is the only test using this many OS threads
+   at any given moment"). This is evidence for *runner capacity*, not
+   *shared-database correctness*, as (at least one) real constraint.
+3. **Many manifest suites already run per-test-isolated, not against a
+   shared database, in CI as configured today.** `HARVEST_TEST_DATABASE_URL`
+   is not set anywhere in the `test` job (confirmed: absent from `ci.yml`,
+   no matching secret reference) — so every suite whose `setup_db()`
+   falls back to booting a fresh testcontainers Postgres when that variable
+   is unset (36 files match this pattern by grep, `capability_miss_tests.rs`
+   and `integration_e2e.rs` included) is *already* getting a throwaway,
+   per-test database in the CI runs this report measured, not one shared
+   instance. `capability_miss_tests.rs`'s "the whole module shares one
+   database" comment describes the *other* branch of `setup_db()` — a
+   developer pointing it at a real shared Postgres locally via
+   `HARVEST_TEST_DATABASE_URL` — not what happens in CI. I cited that
+   comment as evidence for the shared-Postgres constraint in the original
+   version of this section; that citation was wrong, and I've removed it.
 
 **Test-vs-product verdict: this is a test/harness-architecture question, not
 a product bug.** Nothing here suggests the execution engine itself is slow;
-it's that 119 independent `cargo test` invocations, sharing one Postgres
-instance, are being walked one at a time by design.
+it's that 119 independent `cargo test` invocations are being walked one at a
+time, for a mix of real correctness reasons (category 1) and a documented,
+previously-litigated runner-capacity reason (category 2) — with category 3
+meaning the DB-sharing story specifically is weaker evidence than the
+runner-capacity story for a meaningful chunk of the manifest.
 
 ## 🔧 Treatment — routed, not applied
 
 I did not open a fix PR for this. The two paths that would cut this time are
-both outside what this report can ship on its own authority:
+both outside what this report can ship on its own authority, and the
+category-2 finding above raises the bar on the second one:
 
 1. **More parallelism** (matrix-shard the manifest across additional runner
-   legs, or run suites concurrently against isolated per-shard databases)
-   is *new CI spend* — additional concurrent runner-minutes — which the
-   CI-health charter this report follows requires asking a human before
-   doing, not inferring from a timing chart.
-2. **Removing the serialization constraint** without adding runners would
-   require auditing all 119 suites' actual isolation requirements (which
-   ones truly share mutable global/DB state vs. which ones could move to a
-   per-test-database pattern) — a correctness-sensitive, per-suite audit,
-   not a mechanical CI change. None of the 119 manifest suites currently use
-   such a pattern (see Diagnosis above); `chaos_tests.rs` shows it's already
-   implemented once in this repository, outside the manifest, as a
-   precedent to adapt rather than a suite to point an owner at directly.
+   legs, or raise `--test-threads` for suites that don't need category-1
+   serialization) is *new CI spend* if it means more concurrent runners —
+   which the CI-health charter this report follows requires asking a human
+   before doing, not inferring from a timing chart. It may not even help
+   without that spend: `integration_e2e.rs`'s own incident history says the
+   2-vCPU shared-runner class chokes on DB-heavy concurrency well short of
+   119 suites' worth, so raising thread/shard count on the *same* runner
+   class risks reproducing the exact failure mode that test's five CI
+   incidents already diagnosed and fixed around.
+2. **Removing the serialization constraint per-suite** would require
+   auditing all 119 rows against the three categories above (which need
+   category-1 process-global-state serialization, which are already
+   per-test-isolated per category 3 and could potentially move to a higher
+   `--test-threads` *if* runner capacity allows it, and which are actually
+   category-2-constrained by the runner class itself) — a correctness- and
+   capacity-sensitive per-suite audit, not a mechanical CI change. `36` of
+   the 119 rows match the per-test-isolation pattern by grep (a superset
+   estimate, not a verified count of which are safe to parallelize);
+   `chaos_tests.rs` (feature-gated, outside the manifest, run only via the
+   separate `chaos.yml`) is a precedent that the pattern works in this
+   codebase, not evidence about any manifest suite specifically.
 
-Both are legitimate next steps; neither is a same-day CI-config edit. **This
-report's recommendation is a ranked next step, not a change:** an owner
-should decide whether to (a) spend the extra runner budget on sharding the
-`linux` manifest rows across N parallel jobs against N isolated Postgres
-databases, adapting the per-test-database pattern `chaos_tests.rs` already
-uses outside the manifest, or (b) accept 132–155 minutes as the honest cost
-of this suite's actual work and leave it alone. Either is a legitimate call;
-this report only supplies the number.
+Both are legitimate next steps; neither is a same-day CI-config edit, and
+the second is more promising than my original version of this report
+credited (some suites may parallelize for free, no new runner spend, once
+audited) but is gated on confirming runner capacity actually tolerates it
+for each suite. **This report's recommendation is a ranked next step, not a
+change:** an owner should decide whether to (a) fund an audit of the
+already-isolated suites' actual parallelization headroom on the current
+2-vCPU runner class before touching CI config, (b) spend the extra runner
+budget on sharding regardless, or (c) accept 132–155 minutes as the honest
+cost of this suite's actual work and leave it alone. Either is a legitimate
+call; this report only supplies the number.
 
 ## 🔬 Flake census (secondary finding, not actioned)
 
@@ -170,20 +211,32 @@ already named.
 
 ## 📊 Escape analysis & rerun-click trend
 
-- **Reverts:** one in `trunk-dev`'s actual history (`git log --all --oneline
-  | grep -i revert` against the fetched branch refs): `08b1207`, a `Bolt`
+- **Reverts:** `git log --oneline origin/trunk-dev | grep -i revert` finds
+  one commit reachable from `trunk-dev`: `08b1207`, a `Bolt`
   micro-optimization reverted for a negative benchmark result — not a CI
-  escape, not a production bug. This is the "reverted before merge, caught by
-  review/benchmark rather than by an escaped bug" pattern, and it is the only
-  instance of that pattern reachable from `trunk-dev`: a same-shaped commit,
-  `d4b149a` ("DLQ aggregate grouping — extract + profile (negative result,
-  reverted after review)"), exists as a loose object in this checkout but
-  `git merge-base --is-ancestor d4b149a origin/trunk-dev` is false and no ref
-  contains it — it is unreachable pre-squash history from a PR that squashed
-  to a different, reverted-before-merge commit, not part of the branch this
-  census covers, and not a second data point beyond `08b1207`'s pattern.
-  No commit resembling a shipped-then-reverted **production** escape was
-  found.
+  escape, not a production bug. The same query against `origin/trunk` (the
+  production branch, and this report's first pass only had `trunk-dev`
+  fetched locally, which understated this — corrected here against a full
+  `git fetch` of all ~400 branches this repository carries) finds a second:
+  `26f6632`, `Revert "fix: gate shard rollouts on readiness"`, reverting
+  `b960a15` 54 minutes after it was committed (2026-05-07). Checked whether
+  either commit reached a tagged release before the revert:
+  `git merge-base --is-ancestor b960a15 v0.2.0` is false (v0.2.0 predates it)
+  and `v0.3.0` (the next tag) only contains the *revert*, not the original —
+  so, like `08b1207`, this is a same-day catch-and-revert that never shipped,
+  not a production escape. A third candidate, `d4b149a` ("DLQ aggregate
+  grouping — extract + profile (negative result, reverted after review)"),
+  exists as a git object in this checkout but `git merge-base --is-ancestor
+  d4b149a origin/trunk` (checked against both branches now) is false and no
+  ref among the ~400 fetched contains it — unreachable pre-squash history
+  from a PR that squashed to a different, reverted-before-merge commit, not
+  part of either branch's real history. Two further SHAs a reviewer cited
+  (`db99a5d`, `b3432f3e`) are not valid objects anywhere in this repository
+  even after the full fetch (`git cat-file -t` fails on both against every
+  fetched ref). Net: two reverts total across `trunk` + `trunk-dev`
+  combined, both same-day catch-and-reverts that never reached a release —
+  no commit resembling a shipped-then-reverted **production** escape was
+  found in either branch's history.
 - **Rerun-button usage:** 0 runs with `run_attempt > 1` across ~150 sampled
   `pull_request`-event runs and 30 `push`-event runs. No reflexive-rerun
   culture; consistent with a pipeline whose red is currently trusted enough
@@ -232,7 +285,7 @@ cargo test -p autumn-harvest --no-default-features --lib \
   slot_tuner::tests::tuner_loop_applies_decision_each_tick_for_both_slot_types \
   -- --exact --test-threads=1   # repeat N times under CPU load
 
-cargo test -p autumn-harvest --no-default-features --lib --skip zz_
+cargo test -p autumn-harvest --no-default-features --lib -- --skip zz_
 # repeat N times at default parallelism; grep the one test's line each run
 ```
 
