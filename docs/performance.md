@@ -1162,11 +1162,23 @@ from the benchmark are directly comparable.
     pauses a queue closed that specific gap and, as a direct result, replaced
     the correlated anti-join with a one-time prefilter — see
     [the queue-pause anti-join fix](#the-queue-pause-anti-join-fix).
-  * **`schedule_to_close` (#378), worker sessions (#606), sticky routing
-    (#235)** — cheap inline column tests, against columns the seed leaves null.
+  * **`schedule_to_close` (#378)** — measured directly:
+    `docs/performance-schedule-to-close.md` seeds `schedule_to_close_at`
+    (rather than leaving it null) and **confirms this page's own suspicion**:
+    a small, real buffer cost (+2.5% to +6% across four independent
+    measurement methods — single-call `EXPLAIN` at two backlog depths, a real
+    10,001-call `pg_stat_statements` drain, and two standalone MVCC-bloat
+    corroboration scripts), nowhere near the 20% impact floor. No fix is
+    proposed or needed. One caveat the page reports rather than hides: at the
+    100,000-row depth the planner occasionally (once in two capture runs)
+    chose a markedly more expensive plan specifically for the
+    `schedule_to_close_at`-populated table — see that page's "100k-depth plan
+    instability" section, which does not claim a confirmed mechanism for it.
+  * **Worker sessions (#606), sticky routing (#235)** — still cheap inline
+    column tests, against columns the seed leaves null; not yet measured.
 
-  Adding these is scenario work, not query work: each needs a seed variant and a
-  report row, on a bench that already runs 15-30 minutes.
+  Adding one of these is scenario work, not query work: each needs a seed
+  variant and a report row, on a bench that already runs 15-30 minutes.
 * **Queue count is a parameter, but it is not swept.** `Scenario.queues`
   parameterizes how many distinct queues the backlog spreads across, and every
   published row holds it at 4. Backlog depth and claimer count *are* varied.
@@ -1200,6 +1212,12 @@ from the benchmark are directly comparable.
 * `docs/perf-artifacts/capability-labels-claim-predicate/` — committed
   `EXPLAIN`/`pg_stat_statements` evidence for that measurement.
 * `autumn-harvest/scripts/capability_labels_claim_perf_repro.sh` — regenerates
+  that evidence from a clean checkout.
+* `docs/performance-schedule-to-close.md` — the `schedule_to_close_at` claim
+  predicate (#378) measurement referenced above.
+* `docs/perf-artifacts/schedule-to-close-claim-predicate/` — committed
+  `EXPLAIN`/`pg_stat_statements`/heap-growth evidence for that measurement.
+* `autumn-harvest/scripts/schedule_to_close_claim_perf_repro.sh` — regenerates
   that evidence from a clean checkout.
 * `docs/performance-history-ceiling.md` — a separate scanner, not part of
   `claim_task_query()`: the workflow-history-ceiling check
