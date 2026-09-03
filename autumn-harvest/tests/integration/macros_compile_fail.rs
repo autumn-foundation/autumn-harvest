@@ -35,6 +35,10 @@ fn compile_fail_cases() {
     t.compile_fail("tests/compile_fail/rate_limit_missing_rps.rs");
     t.compile_fail("tests/compile_fail/rate_limit_flat_and_nested.rs");
     t.compile_fail("tests/compile_fail/rate_limit_key_reserved_prefix.rs");
+    // Issue #1127: the second collectable namespace, reserved here for the
+    // same reason -- the idle-bucket GC collects it, and a static key in it
+    // is re-registered only at worker startup.
+    t.compile_fail("tests/compile_fail/rate_limit_key_start_throttle_prefix.rs");
     t.compile_fail("tests/compile_fail/dag_invalid_execution_timeout.rs");
     t.compile_fail("tests/compile_fail/dag_invalid_sla.rs");
     t.compile_fail("tests/compile_fail/dag_unsupported_attribute.rs");

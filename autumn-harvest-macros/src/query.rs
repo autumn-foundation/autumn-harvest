@@ -180,22 +180,29 @@ pub fn query_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         }
         tokens
     };
+    // See `update.rs`'s identical hoist (and its comment) for why this is a
+    // single shared block spliced into both `impl_block` arms rather than
+    // two hand-kept-in-sync copies.
+    let method_defs = quote! {
+        /// Execute this typed query in-process.
+        pub async fn #method_name(
+            handle: &::autumn_harvest::WorkflowHandle,
+            #(#params),*
+        ) -> ::autumn_harvest::HarvestResult<#ok_type> {
+            let args = #serialize_payload;
+            let info = #stub_ident::info();
+            let q_info = #companion_name();
+            let raw = handle.execute_query_in_process(&info, &q_info, #fn_name_str, args).await?;
+            ::autumn_harvest::serde_json::from_value(raw)
+                .map_err(::autumn_harvest::error::HarvestError::Serialization)
+        }
+    };
+
     let impl_block = if path_tokens.is_empty() {
         quote! {
             ::autumn_harvest::cfg_db! {
                 impl #stub_ident {
-                    /// Execute this typed query in-process.
-                    pub async fn #method_name(
-                        handle: &::autumn_harvest::WorkflowHandle,
-                        #(#params),*
-                    ) -> ::autumn_harvest::HarvestResult<#ok_type> {
-                        let args = #serialize_payload;
-                        let info = #stub_ident::info();
-                        let q_info = #companion_name();
-                        let raw = handle.execute_query_in_process(&info, &q_info, #fn_name_str, args).await?;
-                        ::autumn_harvest::serde_json::from_value(raw)
-                            .map_err(::autumn_harvest::error::HarvestError::Serialization)
-                    }
+                    #method_defs
                 }
             }
         }
@@ -206,18 +213,7 @@ pub fn query_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                     use super::*;
                     use #leading_colon #(#nested_path_tokens::)*#stub_ident;
                     impl #stub_ident {
-                        /// Execute this typed query in-process.
-                        pub async fn #method_name(
-                            handle: &::autumn_harvest::WorkflowHandle,
-                            #(#params),*
-                        ) -> ::autumn_harvest::HarvestResult<#ok_type> {
-                            let args = #serialize_payload;
-                            let info = #stub_ident::info();
-                            let q_info = #companion_name();
-                            let raw = handle.execute_query_in_process(&info, &q_info, #fn_name_str, args).await?;
-                            ::autumn_harvest::serde_json::from_value(raw)
-                                .map_err(::autumn_harvest::error::HarvestError::Serialization)
-                        }
+                        #method_defs
                     }
                 }
             }
@@ -376,4 +372,100 @@ fn to_pascal_case(s: &str) -> String {
 
 fn extract_ok_type(output: &syn::ReturnType) -> syn::Type {
     crate::extract_ok_type(output)
+}
+
+// ── Characterization tests ──────────────────────────────────────────────────
+//
+// `query_macro` generates the typed-stub `#method_name` twice: once for the
+// same-module case (`path_tokens.is_empty()`) and once wrapped in a private
+// `mod` for the nested-module case. See `update.rs`'s
+// `same_module_vs_nested_module_parity_tests` for the sibling case (and a
+// real missed-fix defect this shape produced there, commit 896978eb). Query
+// handlers have no update-with-start analogue, so there's no missed-fix
+// history here yet, but the same two-copy risk exists.
+#[cfg(test)]
+mod same_module_vs_nested_module_parity_tests {
+    use super::query_macro;
+    use quote::quote;
+
+    /// See `update.rs`'s identically-named helper for why this is needed:
+    /// `quote!`'s fallback (`cargo test`) `Display` renders doc comments as
+    /// raw string literals (`r"..."`) whose content can itself contain `]`.
+    fn strip_docs(s: &str) -> String {
+        const PREFIX: &str = "# [doc = r\"";
+        let mut out = String::new();
+        let mut rest = s;
+        loop {
+            match rest.find(PREFIX) {
+                None => {
+                    out.push_str(rest);
+                    break;
+                }
+                Some(start) => {
+                    out.push_str(&rest[..start]);
+                    let after_prefix = &rest[start + PREFIX.len()..];
+                    let quote_end = after_prefix
+                        .find('"')
+                        .expect("unterminated raw string in doc attribute");
+                    let after_quote = &after_prefix[quote_end + 1..];
+                    let close = after_quote
+                        .find(']')
+                        .expect("expected ']' closing the doc attribute");
+                    rest = &after_quote[close + 1..];
+                }
+            }
+        }
+        out
+    }
+
+    fn extract_impl_body(full: &str, stub_ident: &str) -> String {
+        let marker = format!("impl {stub_ident} {{");
+        let start = full
+            .find(&marker)
+            .unwrap_or_else(|| panic!("no `{marker}` in generated output:\n{full}"))
+            + marker.len();
+        let mut depth = 1i32;
+        let bytes = full.as_bytes();
+        let mut i = start;
+        while i < bytes.len() && depth > 0 {
+            match bytes[i] as char {
+                '{' => depth += 1,
+                '}' => depth -= 1,
+                _ => {}
+            }
+            i += 1;
+        }
+        strip_docs(full[start..i - 1].trim())
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ")
+    }
+
+    fn generate(workflow_path: &str) -> String {
+        let attr = quote! { workflow = #workflow_path };
+        let item = quote! {
+            fn my_query(ctx: &WorkflowContext, n: u32) -> Result<u32, String> {
+                Ok(n)
+            }
+        };
+        query_macro(attr, item).to_string()
+    }
+
+    #[test]
+    fn same_module_and_nested_module_branches_generate_identical_impl_bodies() {
+        let same_module = generate("MyWorkflow");
+        let nested = generate("some_mod::MyWorkflow");
+
+        let same_module_body = extract_impl_body(&same_module, "MyWorkflowStub");
+        let nested_body = extract_impl_body(&nested, "MyWorkflowStub");
+
+        assert_eq!(
+            same_module_body, nested_body,
+            "the same-module and nested-module branches of `query_macro` must \
+             generate identical method bodies (module wrapper and doc comments \
+             aside) -- see update.rs's sibling test for why this class of \
+             divergence is a real, previously-shipped risk"
+        );
+        assert!(same_module_body.contains("execute_query_in_process"));
+    }
 }

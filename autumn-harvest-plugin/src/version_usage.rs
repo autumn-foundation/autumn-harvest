@@ -175,24 +175,11 @@ async fn observe_shard(
     pool: Option<DbPool>,
     mut filters: VersionUsageFilters,
 ) -> ShardObservation {
-    let Some(pool) = pool else {
-        return ShardObservation {
-            shard_id,
-            rows: Vec::new(),
-            error: Some(format!("shard {shard_id} has no configured storage pool")),
-        };
+    let mut conn = match shard_fanout::acquire_shard_conn(shard_id, pool).await {
+        Ok(conn) => conn,
+        Err(observation) => return observation,
     };
-
     filters.shard_id = Some(shard_id);
-    let Ok(mut conn) = pool.get().await else {
-        return ShardObservation {
-            shard_id,
-            rows: Vec::new(),
-            error: Some(format!(
-                "database connection for shard {shard_id} could not be acquired"
-            )),
-        };
-    };
     match load_version_usage(&mut conn, &filters).await {
         Ok(rows) => ShardObservation {
             shard_id,

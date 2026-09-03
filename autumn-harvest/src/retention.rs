@@ -46,6 +46,30 @@ const MIN_MAX_AGE: Duration = Duration::from_secs(1);
 const MAX_MAX_AGE: Duration = Duration::from_secs(60 * 60 * 24 * 365 * 10);
 const DEFAULT_ARCHIVAL_TIMEOUT_SECS: u64 = 30;
 
+/// Default idle window before an inert per-tenant rate-limit bucket is
+/// collected (issue #1127): 7 days.
+///
+/// Long enough that a weekly-cadence tenant keeps its bucket across a quiet
+/// weekend, short enough that a one-off tenant's row does not outlive its
+/// usefulness by months. The collector is on by default because unbounded
+/// growth is a *bug*, not a tuning preference — a fix that every deployment
+/// has to opt into fixes nothing for the deployments that do not know they
+/// have the problem. Every swept row is provably inert (see
+/// [`crate::queue::sweep_idle_rate_limit_buckets`]), and
+/// [`RetentionConfig::without_rate_limit_bucket_gc`] turns it off outright.
+pub const DEFAULT_RATE_LIMIT_BUCKET_RETENTION_SECS: u64 = 7 * 24 * 60 * 60;
+
+/// Shortest configurable idle window for the rate-limit bucket GC (issue
+/// #1127): 1 hour.
+///
+/// The floor is load-bearing, not decorative. The GC's interlock against a
+/// concurrently-committing enqueue is that any `ensure_rate_limit_bucket` for a
+/// stale bucket locks the row and refreshes `updated_at` (see
+/// [`crate::queue::RATE_LIMIT_BUCKET_TOUCH_INTERVAL_SECS`]). A window shorter
+/// than that touch interval would let a bucket become GC-eligible *without* the
+/// ensure path having touched it, reopening the stranding race.
+pub const MIN_RATE_LIMIT_BUCKET_RETENTION: Duration = Duration::from_secs(60 * 60);
+
 /// Default byte cap for an opt-in captured summary payload (issue #752).
 ///
 /// A `result`/`error` value larger than this is replaced with a typed
@@ -323,6 +347,15 @@ pub struct RetentionConfig {
     /// byte-for-byte identical to pre-#752 behavior: hard delete, no summary.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub summary: Option<SummaryPolicy>,
+    /// Idle window after which an inert per-tenant rate-limit bucket is
+    /// collected (issue #1127). `None` disables the sweep entirely.
+    ///
+    /// `harvest_rate_limit_buckets` rows are auto-registered `ON CONFLICT DO
+    /// NOTHING` and, before this, were never deleted — so the two
+    /// caller-keyed families (`dyn-rate:{expr}:{resolved}`, issue #699, and
+    /// `start-throttle:{workflow}:{key}`, issue #607) grew one row per tenant
+    /// forever. Defaults to [`DEFAULT_RATE_LIMIT_BUCKET_RETENTION_SECS`].
+    pub rate_limit_bucket_retention_secs: Option<u64>,
     /// Partition maintenance for the opt-in partitioned `harvest_events`
     /// layout (issue #958).
     ///
@@ -417,6 +450,7 @@ impl Default for RetentionConfig {
             schedule_decision_retention_days: 7,
             archival_timeout_secs: DEFAULT_ARCHIVAL_TIMEOUT_SECS,
             summary: None,
+            rate_limit_bucket_retention_secs: Some(DEFAULT_RATE_LIMIT_BUCKET_RETENTION_SECS),
             partitions: PartitionMaintenanceConfig::default(),
         }
     }
@@ -538,6 +572,43 @@ impl RetentionConfig {
         self.summary
     }
 
+    /// Set the idle window for the rate-limit bucket GC (issue #1127).
+    ///
+    /// Validated against
+    /// the [`MIN_RATE_LIMIT_BUCKET_RETENTION`] … `MAX_MAX_AGE` range at build
+    /// time; an out-of-range window fails the build rather than silently
+    /// clamping.
+    #[must_use]
+    pub const fn with_rate_limit_bucket_retention(mut self, window: Duration) -> Self {
+        self.rate_limit_bucket_retention_secs = Some(window.as_secs());
+        self
+    }
+
+    /// Disable the rate-limit bucket GC (issue #1127).
+    ///
+    /// The table then grows one row per tenant key forever, which is the
+    /// pre-#1127 behavior — so this is for incident response, not tuning.
+    #[must_use]
+    pub const fn without_rate_limit_bucket_gc(mut self) -> Self {
+        self.rate_limit_bucket_retention_secs = None;
+        self
+    }
+
+    /// The rate-limit bucket GC's idle window, or `None` when it is off
+    /// (issue #1127).
+    #[must_use]
+    pub fn rate_limit_bucket_retention(&self) -> Option<Duration> {
+        self.rate_limit_bucket_retention_secs
+            .map(Duration::from_secs)
+    }
+
+    /// Whether the rate-limit bucket GC pass should run this tick (issue
+    /// #1127).
+    #[must_use]
+    pub const fn rate_limit_bucket_gc_active(&self) -> bool {
+        self.rate_limit_bucket_retention_secs.is_some()
+    }
+
     /// Safely unpacks the raw configuration integer into a standard rust [`Duration`], gracefully
     /// handling systems where the feature is entirely turned off.
     #[must_use]
@@ -652,11 +723,26 @@ impl RetentionConfig {
                 MAX_MAX_AGE.as_secs()
             ));
         }
+        // The rate-limit bucket GC window has its own, higher floor (issue
+        // #1127): below it a bucket could go GC-eligible without the ensure
+        // path having locked it, reopening the stranding race. Fails the build
+        // rather than clamping, matching every other horizon here.
+        if let Some(window) = self.rate_limit_bucket_retention()
+            && !(MIN_RATE_LIMIT_BUCKET_RETENTION..=MAX_MAX_AGE).contains(&window)
+        {
+            return Err(format!(
+                "rate_limit_bucket_retention must be between {}s and {}s",
+                MIN_RATE_LIMIT_BUCKET_RETENTION.as_secs(),
+                MAX_MAX_AGE.as_secs()
+            ));
+        }
         Ok(())
     }
 
-    /// Returns `true` if any retention features (workflow history, per-type
-    /// history overrides, audit log, or schedule decision purging) are enabled.
+    /// Returns `true` if any retention feature is enabled: workflow-history
+    /// retention (global or per-type), audit-log purging, schedule-decision
+    /// purging, bounded summary GC (issue #752), partition maintenance (issue
+    /// #958), or the idle rate-limit-bucket GC (issue #1127).
     ///
     /// Per-workflow-type overrides count as enabling workflow-history retention
     /// even when the global `max_age` is unset (issue #737), so an
@@ -686,6 +772,12 @@ impl RetentionConfig {
             // off — which is exactly the broken case; the stock config
             // (`audit_retention_days: 90`) already spawned.
             || self.partitions.enabled
+            // Issue #1127: the bucket GC is work in its own right too. Without
+            // this, a deployment that turned every other horizon off would
+            // leave `rate_limit_bucket_retention_secs` reading as configured
+            // while the runtime never spawned to honour it, and the table would
+            // keep growing one row per tenant key.
+            || self.rate_limit_bucket_gc_active()
     }
 }
 
@@ -731,6 +823,64 @@ pub struct RetentionTickResult {
     /// each cohort that was considered and the reason it was left alone.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub partition_maintenance: Option<crate::partition::MaintenanceOutcome>,
+    /// Idle rate-limit-bucket GC outcome for this shard this tick (issue
+    /// #1127).
+    ///
+    /// `None` when the GC is disabled — deliberately distinct from
+    /// `Some(collected: 0)` ("it ran and everything was live or pinned") and
+    /// from `Some(error: ...)` ("it could not run"), which a bare counter
+    /// collapses into one indistinguishable zero. Same shape and same reason as
+    /// `partition_maintenance`. Reported through `GET /admin/retention`, so "is
+    /// the table still growing, and why?" has an answer that needs no metrics
+    /// pipeline.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rate_limit_bucket_gc: Option<RateLimitBucketGcOutcome>,
+}
+
+/// One shard's idle rate-limit-bucket GC result for one tick (issue #1127).
+#[derive(Debug, Clone, Serialize, Default, PartialEq, Eq)]
+pub struct RateLimitBucketGcOutcome {
+    /// Buckets collected, per bounded key family (`dyn-rate` /
+    /// `start-throttle`). Under `dry_run` these are would-collect counts.
+    pub collected_by_family: BTreeMap<String, u64>,
+    /// Total across families — the number an operator watches.
+    pub collected: u64,
+    /// Whether this was a read-only `dry_run` preview rather than a real pass.
+    /// A preview reports what a real pass *would* collect and deletes nothing,
+    /// so a non-zero `collected` here is a forecast, not work done.
+    pub dry_run: bool,
+    /// Why this shard's pass did not run, when it did not. A shard that keeps
+    /// reporting an error is exactly what an operator needs to see, and without
+    /// this it would be indistinguishable from a shard with nothing to do.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+/// Constructors used only by the janitor loop, which is itself `db`-gated —
+/// without this the no-`db` build (linted through `autumn-harvest-sqlite`) sees
+/// them as dead code. The struct stays ungated: it is a field of
+/// [`RetentionTickResult`], which every build can serialize.
+#[cfg(feature = "db")]
+impl RateLimitBucketGcOutcome {
+    /// A completed pass (real, or a `dry_run` preview).
+    #[must_use]
+    fn collected(collected_by_family: BTreeMap<String, u64>, dry_run: bool) -> Self {
+        Self {
+            collected: collected_by_family.values().sum(),
+            collected_by_family,
+            dry_run,
+            error: None,
+        }
+    }
+
+    /// A pass that could not run on this shard.
+    #[must_use]
+    fn failed(error: String) -> Self {
+        Self {
+            error: Some(error),
+            ..Self::default()
+        }
+    }
 }
 
 /// The current overall status of the retention subsystem.
@@ -801,6 +951,26 @@ impl RetentionMonitor {
         }
     }
 
+    /// Record this shard's rate-limit bucket GC count (issue #1127) without
+    /// disturbing the history-retention counters already reported this tick.
+    ///
+    /// A separate updater for the same reason as
+    /// [`Self::update_partitions`]: the GC pass runs outside the
+    /// history-retention phase gate (a deployment with no history horizon must
+    /// still collect buckets), so it cannot ride along in that phase's
+    /// `update`.
+    #[cfg(feature = "db")]
+    fn update_rate_limit_buckets(&self, shard: ShardId, outcome: RateLimitBucketGcOutcome) {
+        let mut guard = self.inner.lock().expect("retention monitor lock poisoned");
+        if let Some(existing) = guard
+            .per_shard
+            .iter_mut()
+            .find(|x| x.shard == u16::try_from(shard.as_i32()).unwrap_or(0))
+        {
+            existing.rate_limit_bucket_gc = Some(outcome);
+        }
+    }
+
     #[cfg(feature = "db")]
     fn update(&self, shard: ShardId, result: RetentionTickResult) {
         let mut guard = self.inner.lock().expect("retention monitor lock poisoned");
@@ -830,10 +1000,13 @@ pub struct RetentionRuntime {
 
 #[cfg(feature = "db")]
 impl RetentionRuntime {
-    /// # Panics
+    /// Returns `None` when nothing in `config` is enabled.
     ///
-    /// Panics inside the spawned task if the enabled config is missing `max_age`
-    /// (which cannot happen when `config.enabled()` is `true`).
+    /// A config can be enabled for a reason other than a history horizon —
+    /// partition maintenance (issue #958) or the idle rate-limit-bucket GC
+    /// (issue #1127) each spawn the runtime on their own — so `max_age` being
+    /// unset is an ordinary, fully-supported state here: the history-retention
+    /// phase is gated on `loosest_cutoff_age()` and is simply skipped.
     #[must_use]
     #[allow(clippy::too_many_lines)]
     pub fn spawn(
@@ -1166,6 +1339,97 @@ impl RetentionRuntime {
                                 Err(err) => {
                                     tracing::warn!(shard = %shard, error = %err, "harvest execution-summary GC failed");
                                 }
+                            }
+                        }
+                    }
+                }
+
+                // Idle rate-limit bucket GC (issue #1127): collect inert
+                // per-tenant token buckets so `harvest_rate_limit_buckets`
+                // stops growing one row per caller-supplied key forever.
+                //
+                // Deliberately OUTSIDE the history-retention phase gate: bucket
+                // growth is driven by *dispatch* traffic, not by how long
+                // finished histories are kept, so a deployment that retains
+                // history forever still has to collect buckets.
+                //
+                // Shard-local and best-effort, exactly like the audit/schedule/
+                // summary purges above: a shard that fails is reported and
+                // retried next tick rather than failing the whole tick, because
+                // reclamation here is independent of everything else the
+                // janitor just did. Reported, not merely logged — otherwise
+                // `GET /admin/retention` would keep serving the last successful
+                // tick's count and a permanently-failing shard would look
+                // exactly like an idle one.
+                //
+                // Under `dry_run` the pass still runs, as a read-only PREVIEW:
+                // it deletes nothing and reports what it *would* collect (the
+                // same affordance `purge_expired_summaries` offers). A
+                // collector that is on by default is precisely the kind an
+                // operator wants to preview first.
+                if config.rate_limit_bucket_gc_active()
+                    && let Some(window) = config.rate_limit_bucket_retention()
+                    && let Ok(window) = chrono::Duration::from_std(window)
+                {
+                    let cutoff = Utc::now() - window;
+                    for (shard, pool) in pools.iter_shards() {
+                        let mut conn = match pool.get().await {
+                            Ok(conn) => conn,
+                            Err(error) => {
+                                tracing::warn!(
+                                    shard = %shard,
+                                    error = %error,
+                                    "harvest rate-limit bucket GC could not acquire a connection"
+                                );
+                                monitor_task.update_rate_limit_buckets(
+                                    shard,
+                                    RateLimitBucketGcOutcome::failed(error.to_string()),
+                                );
+                                continue;
+                            }
+                        };
+                        match crate::queue::sweep_idle_rate_limit_buckets(
+                            &mut conn,
+                            cutoff,
+                            config.batch_size,
+                            config.dry_run,
+                        )
+                        .await
+                        {
+                            Ok(by_family) => {
+                                let total: u64 = by_family.values().sum();
+                                // Real deletes only: a preview's would-collect
+                                // counts must never move a counter an operator
+                                // reads as work actually done.
+                                if !config.dry_run {
+                                    for (family, count) in &by_family {
+                                        metrics.record_rate_limit_buckets_deleted(family, *count);
+                                    }
+                                }
+                                if total > 0 {
+                                    tracing::info!(
+                                        shard = %shard,
+                                        deleted = total,
+                                        dry_run = config.dry_run,
+                                        window_secs = window.num_seconds(),
+                                        "harvest idle rate-limit buckets collected"
+                                    );
+                                }
+                                monitor_task.update_rate_limit_buckets(
+                                    shard,
+                                    RateLimitBucketGcOutcome::collected(by_family, config.dry_run),
+                                );
+                            }
+                            Err(err) => {
+                                tracing::warn!(
+                                    shard = %shard,
+                                    error = %err,
+                                    "harvest idle rate-limit bucket GC failed"
+                                );
+                                monitor_task.update_rate_limit_buckets(
+                                    shard,
+                                    RateLimitBucketGcOutcome::failed(err.to_string()),
+                                );
                             }
                         }
                     }
@@ -3044,8 +3308,12 @@ mod tests {
                 ..PartitionMaintenanceConfig::default()
             },
             ..Default::default()
-        };
-        // no purging AND no partition maintenance is not enabled
+        }
+        // Issue #1127: the idle rate-limit bucket GC is on by default and is
+        // itself an enabling reason, so "nothing enabled" now has to switch it
+        // off too.
+        .without_rate_limit_bucket_gc();
+        // no purging AND no partition maintenance AND no bucket GC is not enabled
         assert!(!config.enabled());
 
         // …but partition maintenance ALONE is (issue #958). An opted-in
@@ -3158,11 +3426,13 @@ mod tests {
                 ..PartitionMaintenanceConfig::default()
             },
             ..config
-        };
+        }
+        // Issue #1127: the bucket GC is on by default and enabling on its own.
+        .without_rate_limit_bucket_gc();
         assert!(
             !config.enabled(),
-            "an unbounded-summary-only config with no history/audit horizon and no \
-             partition maintenance is not enabled"
+            "an unbounded-summary-only config with no history/audit horizon, no \
+             partition maintenance and no bucket GC is not enabled"
         );
 
         // But a history horizon + unbounded summary IS enabled (via history).
@@ -3194,6 +3464,96 @@ mod tests {
         let config = RetentionConfig::with_max_age(Duration::from_secs(3600))
             .with_summary_retention(SummaryPolicy::unbounded());
         assert!(config.validate().is_ok());
+    }
+
+    // -----------------------------------------------------------------------
+    // Idle rate-limit-bucket GC config (issue #1127)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn rate_limit_bucket_gc_is_on_by_default_at_seven_days() {
+        // Unbounded growth is a BUG, so the collector is on out of the box.
+        let config = RetentionConfig::default();
+        assert_eq!(
+            config.rate_limit_bucket_retention(),
+            Some(Duration::from_secs(
+                DEFAULT_RATE_LIMIT_BUCKET_RETENTION_SECS
+            ))
+        );
+        assert_eq!(DEFAULT_RATE_LIMIT_BUCKET_RETENTION_SECS, 7 * 24 * 60 * 60);
+        assert!(config.rate_limit_bucket_gc_active());
+    }
+
+    #[test]
+    fn rate_limit_bucket_gc_window_is_configurable_and_disablable() {
+        let config = RetentionConfig::default()
+            .with_rate_limit_bucket_retention(Duration::from_secs(6 * 60 * 60));
+        assert_eq!(
+            config.rate_limit_bucket_retention(),
+            Some(Duration::from_secs(6 * 60 * 60))
+        );
+
+        let off = RetentionConfig::default().without_rate_limit_bucket_gc();
+        assert_eq!(off.rate_limit_bucket_retention(), None);
+        assert!(!off.rate_limit_bucket_gc_active());
+    }
+
+    #[test]
+    fn a_zero_window_is_rejected_rather_than_collecting_everything_now() {
+        // `Some(0)` would leave the GC ACTIVE with a cutoff of "now", i.e.
+        // collect every full, unpinned bucket immediately — reopening the
+        // stranding race the touch interval closes. It must fail the build, not
+        // be treated as "disabled".
+        let zero = RetentionConfig::default().with_rate_limit_bucket_retention(Duration::ZERO);
+        assert!(zero.rate_limit_bucket_gc_active(), "zero is not 'disabled'");
+        assert!(zero.validate().is_err());
+    }
+
+    #[test]
+    fn rate_limit_bucket_gc_validate_bounds_the_window() {
+        // Below the floor: a window shorter than the ensure-path touch
+        // interval would reopen the stranding race.
+        let too_short = RetentionConfig::default().with_rate_limit_bucket_retention(
+            MIN_RATE_LIMIT_BUCKET_RETENTION
+                .checked_sub(Duration::from_secs(1))
+                .expect("the floor is well above 1s"),
+        );
+        assert!(too_short.validate().is_err());
+
+        let too_long = RetentionConfig::default()
+            .with_rate_limit_bucket_retention(MAX_MAX_AGE + Duration::from_secs(1));
+        assert!(too_long.validate().is_err());
+
+        assert!(
+            RetentionConfig::default()
+                .with_rate_limit_bucket_retention(MIN_RATE_LIMIT_BUCKET_RETENTION)
+                .validate()
+                .is_ok()
+        );
+        assert!(RetentionConfig::default().validate().is_ok());
+    }
+
+    #[test]
+    fn a_gc_only_config_still_spawns_the_janitor() {
+        let config = RetentionConfig {
+            max_age_secs: None,
+            audit_retention_days: 0,
+            schedule_decision_retention_days: 0,
+            partitions: PartitionMaintenanceConfig {
+                enabled: false,
+                ..PartitionMaintenanceConfig::default()
+            },
+            ..RetentionConfig::default()
+        };
+        assert!(config.rate_limit_bucket_gc_active());
+        assert!(
+            config.enabled(),
+            "a bucket-GC-only config must still spawn the retention runtime, \
+             or the table grows unbounded with nothing to collect it"
+        );
+
+        let off = config.without_rate_limit_bucket_gc();
+        assert!(!off.enabled());
     }
 
     #[test]

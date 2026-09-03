@@ -1776,12 +1776,6 @@ async fn start_harvest_runtime(
         }
     }
 
-    // Issue #700 AC4 (P1 fix): capture a shard-0 pool handle for the boot-time
-    // orphaned-workflow gate (run just below, before HarvestRunner::start
-    // spawns workers) BEFORE `harvest_pool` is moved into the runner resources.
-    // `DbPool` (a deadpool handle) is cheap to clone.
-    let gate_pool = harvest_pool.clone();
-
     let mut runner_resources = HarvestRunnerResources::new(harvest_pool)
         .with_app_state(runtime_state.clone())
         .with_shard_router(router);
@@ -1827,111 +1821,34 @@ async fn start_harvest_runtime(
 
     // Issue #700 AC4 (P1 fix): boot-time orphaned-workflow-type reachability gate.
     // Run it HERE — BEFORE `HarvestRunner::start` spawns the worker poll loop and
-    // the scanners — not after. Under `orphaned_workflows = fail` + `worker_enabled`,
-    // a worker spawned by `HarvestRunner::start` could CLAIM and terminally FAIL an
-    // orphaned-type execution (no registered handler -> WorkflowFailed + FAILED
-    // state) during the boot window before an after-the-fact abort tore the runner
-    // down — defeating the gate's protective purpose. Placing the gate before any
-    // task can be claimed closes that window; on Abort we `return Err` with nothing
-    // to tear down (no runner / gate-refresh / outbox spawned yet, no admission
+    // the scanners, and before any admission global is published — not after.
+    // Under `orphaned_workflows = fail` + `worker_enabled`, a worker spawned by
+    // `HarvestRunner::start` could CLAIM and terminally FAIL an orphaned-type
+    // execution (no registered handler -> WorkflowFailed + FAILED state) during
+    // the boot window before an after-the-fact abort tore the runner down —
+    // defeating the gate's protective purpose. Placing the gate before any task
+    // can be claimed closes that window; on Abort we `return Err` with nothing to
+    // tear down (no runner / gate-refresh / outbox spawned yet, no admission
     // globals published).
     //
-    // Both gate inputs are available before the runner starts: `registered` is
-    // derived directly from the owned `built` (workflow names UNION unified-DAG
-    // names, replicating `build_workflow_reachability_report`'s registry-key +
-    // `registered_dag_names` union EXACTLY — `registry.workflows` does NOT hold
-    // unified-DAG names, so the DAG union is load-bearing), and `gate_pool` is the
-    // shard-0 pool clone captured above. The plugin is single-shard-only (multi-shard
-    // configs were rejected just above), so a single-shard report reads the identical
-    // rows the started-runtime cross-shard fan-out would. `off` skips the check;
-    // default `warn` never blocks boot. Crash-loop safety: a DB read failure is
-    // encoded as `status == Unavailable`, and `startup_orphan_decision(Fail, .,
-    // Unavailable) == Warn` (never Abort).
-    {
-        use crate::config::OrphanStartupAction;
-        use crate::workflow_reachability::{
-            ReachabilityVerdict, StartupOrphanDecision, build_reachability_report_single_shard,
-            startup_orphan_decision,
-        };
-
-        let orphan_action = harvest_config.startup.orphaned_workflows;
-        if orphan_action != OrphanStartupAction::Off {
-            let registered: std::collections::BTreeSet<String> = built
-                .workflow_infos()
-                .iter()
-                .map(|info| info.name.to_string())
-                .chain(
-                    built
-                        .dags()
-                        .iter()
-                        .filter(|dag| dag.workflow_handler.is_some())
-                        .map(|dag| dag.name.to_string()),
-                )
-                .collect();
-
-            // Select the SAME shard-0 storage pool `HarvestRunner::start` will
-            // run the workers against (issue #700 P2). `PreparedHarvestRuntime::build`
-            // gives `WorkerConfig::with_sharded_pool` PRECEDENCE over
-            // `harvest_pool`, so a `HarvestBuilder::with_sharded_pool` deployment
-            // would otherwise have the gate query `harvest_pool` while the
-            // workers poll a DIFFERENT database — the gate could validate the
-            // wrong DB, miss an orphan, and the worker would then start
-            // polling+failing it. `select_runtime_shard0_pool` shares the exact
-            // precedence `build` uses (the runner-resources override, which the
-            // plugin never sets; WorkerConfig's sharded pool; the harvest_pool
-            // clone) via `pick_runtime_pool_source`, so gate and runner agree by
-            // construction. Critically it is READ-ONLY (issue #700 P4): it reads
-            // shard 0 from an already-constructed `ShardedDbPool`, or returns the
-            // `harvest_pool` handle directly, and never calls
-            // `ShardedDbPool::single`/`from_map` — so an aborting gate installs
-            // no `GLOBAL_SHARDED_POOL` and stays side-effect-free (the real
-            // global install happens later in `HarvestRunner::start`, unchanged).
-            let gate_shard0_pool = crate::runner::select_runtime_shard0_pool(
-                runner_resources.sharded_pool_override(),
-                built.worker_config().sharded_pool.as_ref(),
-                &gate_pool,
-            );
-            let report =
-                build_reachability_report_single_shard(&registered, &gate_shard0_pool, None).await;
-            let orphaned_types: Vec<&str> = report
-                .items
-                .iter()
-                .filter(|item| item.verdict == ReachabilityVerdict::Orphaned)
-                .map(|item| item.workflow_type.as_str())
-                .collect();
-            match startup_orphan_decision(orphan_action, report.orphaned, report.status) {
-                StartupOrphanDecision::Continue => {}
-                StartupOrphanDecision::Warn => {
-                    tracing::warn!(
-                        orphaned_types = ?orphaned_types,
-                        total_orphaned_executions = report.total_orphaned_executions,
-                        status = ?report.status,
-                        "orphaned workflow types detected at startup: their #[workflow] \
-                         handlers are no longer registered and in-flight runs would wedge \
-                         on replay. See docs/runbooks/safe-deploy.md \
-                         (Pre-cutover handler-coverage gate) and safe-handler-removal.md."
-                    );
-                }
-                StartupOrphanDecision::Abort => {
-                    tracing::error!(
-                        orphaned_types = ?orphaned_types,
-                        total_orphaned_executions = report.total_orphaned_executions,
-                        "refusing startup (harvest.startup.orphaned_workflows = fail): \
-                         orphaned workflow types have in-flight runs but no registered \
-                         handler, so those runs would wedge on replay. The gate runs \
-                         before workers spawn, so no run was claimed or failed."
-                    );
-                    return Err(AutumnError::service_unavailable_msg(format!(
-                        "refusing startup: {} orphaned workflow type(s) with in-flight \
-                         runs have no registered handler ({} stranded executions): {:?}",
-                        orphaned_types.len(),
-                        report.total_orphaned_executions,
-                        orphaned_types,
-                    )));
-                }
-            }
-        }
-    }
+    // The gate itself lives in `runner::run_startup_orphan_gate` (issue #1128),
+    // which `HarvestRunner::start` also calls so the STANDALONE embedder path
+    // gets the identical fail-fast. One implementation, so the registered-set
+    // union, the pool precedence, the decision table and the operator-facing
+    // messages cannot drift between the two boot paths. Everything it needs is
+    // available before the runner starts: `built` (workflow names UNION
+    // unified-DAG names) and `runner_resources` (the pool the runner will
+    // resolve, plus the router). It is READ-ONLY and installs no process global,
+    // so an aborting gate is side-effect-free (issue #700 P4).
+    //
+    // `runner_resources` is marked below with `with_startup_orphan_gate_already_run()`
+    // so `HarvestRunner::start` does not repeat the scan for this boot.
+    crate::runner::run_startup_orphan_gate(
+        harvest_config.startup.orphaned_workflows,
+        &built,
+        &runner_resources,
+    )
+    .await?;
 
     // issue #618 (F11 + F1 re-review): publish the SAME gate-cache Arc the
     // management API uses into the process-global static BEFORE
@@ -1963,7 +1880,13 @@ async fn start_harvest_runtime(
     // keeping both only on `.commit()`.
     admission_guard.publish_metrics(std::sync::Arc::clone(&built.telemetry().metrics));
 
-    let runner = HarvestRunner::start(built, &harvest_config, runner_resources).await?;
+    let runner = HarvestRunner::start(
+        built,
+        &harvest_config,
+        // The gate above already ran for this boot (issue #1128).
+        runner_resources.with_startup_orphan_gate_already_run(),
+    )
+    .await?;
     let harvest_db_pool = runner.storage_pool();
     // Defense-in-depth: the pre-flight above catches WorkerConfig::with_sharded_pool;
     // this catches any future path that sets runner_resources.sharded_pool.
@@ -2283,10 +2206,11 @@ async fn start_harvest_runtime(
     });
     api_state.install(runner.api_runtime());
 
-    // The boot-time orphaned-workflow-type reachability gate (issue #700 AC4)
-    // runs earlier — BEFORE `HarvestRunner::start` spawns any worker — so a
-    // `fail` action cannot let a worker claim and terminally fail an orphaned
-    // run before the abort. See the gate block above the runner start.
+    // The boot-time orphaned-workflow-type reachability gate (issue #700 AC4,
+    // shared with the standalone runner path by issue #1128) runs earlier —
+    // BEFORE `HarvestRunner::start` spawns any worker — so a `fail` action
+    // cannot let a worker claim and terminally fail an orphaned run before the
+    // abort. See the gate call above the runner start.
 
     // Issue #944: spawn one consumer loop per registered broker binding, after
     // `api_state.install(...)` above so the very first message a connector
@@ -3396,6 +3320,12 @@ mod tests {
                 outbox: HarvestOutboxConfig::default(),
                 batch: crate::config::HarvestBatchConfig::default(),
                 readiness: crate::config::HarvestReadinessConfig::default(),
+                // Deliberately the DEFAULT action (`warn`), not `off`: the
+                // classic-DAG rejection is pure configuration validation that
+                // `start` runs BEFORE the issue-#1128 orphan gate, so this
+                // `--lib` test stays DB-free with the gate fully enabled. If the
+                // rejection ever moved back behind the gate, this test would
+                // start reaching for a database it has no access to.
                 startup: crate::config::HarvestStartupConfig::default(),
             },
             HarvestRunnerResources::new(pool),

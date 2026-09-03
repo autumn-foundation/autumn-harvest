@@ -1201,3 +1201,8 @@ from the benchmark are directly comparable.
   `EXPLAIN`/`pg_stat_statements` evidence for that measurement.
 * `autumn-harvest/scripts/capability_labels_claim_perf_repro.sh` — regenerates
   that evidence from a clean checkout.
+* `docs/performance-history-ceiling.md` — a separate scanner, not part of
+  `claim_task_query()`: the workflow-history-ceiling check
+  (`timeout::enforce_workflow_history_ceiling`, issue #493) fixed a
+  correlated `harvest_events` event-count subquery that was evaluated twice
+  per RUNNING execution on every timeout-scanner tick.

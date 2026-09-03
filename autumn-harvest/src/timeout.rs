@@ -211,6 +211,40 @@ pub const fn schedule_to_close_timeout_query() -> &'static str {
          AND e.state = 'PAUSED')"
 }
 
+/// SQL query behind [`enforce_workflow_history_ceiling`] (issue #493):
+/// RUNNING workflow executions whose durable event count has reached the
+/// operator-configured ceiling.
+///
+/// The per-execution event count is a correlated `COUNT(*)` against
+/// `harvest_events` (served by `idx_harvest_events_exec_last`, so each
+/// evaluation is an indexed lookup, not a table scan) -- but it is needed in
+/// two places: the `SELECT` list (to report `event_count` to the caller) and
+/// the `WHERE` clause (to filter on it, since a `SELECT`-list alias is not
+/// visible to the `WHERE` clause that filters the same query). Writing the
+/// subquery out twice makes Postgres evaluate it twice per row: once to
+/// filter, once more (for surviving rows) to project -- confirmed by
+/// `EXPLAIN`, see `docs/performance-history-ceiling.md`. A plain
+/// derived-table wrap (`SELECT ... FROM (SELECT ..., count) sub WHERE
+/// sub.count >= $1`) does not fix this -- Postgres pulls the subquery up
+/// into the outer query and re-duplicates the correlated expression at each
+/// reference site, reproducing the identical two-`SubPlan` shape (also
+/// confirmed by `EXPLAIN` while evaluating this fix). A `MATERIALIZED` CTE
+/// opts out of that pull-up, so the count is computed exactly once per
+/// RUNNING row and both the `SELECT` list and the `WHERE` clause read the
+/// same computed column.
+#[must_use]
+pub const fn workflow_history_ceiling_query() -> &'static str {
+    "WITH oversized_candidates AS MATERIALIZED (\
+         SELECT id, workflow_id, workflow_name, queue_name, parent_id, parent_close_policy, \
+             (SELECT COUNT(*) FROM harvest_events \
+              WHERE workflow_exec_id = harvest_workflow_executions.id)::bigint AS event_count \
+         FROM harvest_workflow_executions \
+         WHERE state = 'RUNNING') \
+     SELECT id, workflow_id, workflow_name, queue_name, parent_id, parent_close_policy, event_count \
+     FROM oversized_candidates \
+     WHERE event_count >= $1"
+}
+
 /// SQL query to find RUNNING workflow executions that have exceeded either their
 /// per-run `execution_timeout` deadline (issue #243) OR their chain-scoped
 /// lifetime cap deadline (issue #617).
@@ -4380,17 +4414,11 @@ pub async fn enforce_workflow_history_ceiling(
     }
 
     let ceiling_i64 = i64::try_from(ceiling).unwrap_or(i64::MAX);
-    let oversized: Vec<OversizedRow> = diesel::sql_query(
-        "SELECT id, workflow_id, workflow_name, queue_name, parent_id, parent_close_policy, \
-         (SELECT COUNT(*) FROM harvest_events WHERE workflow_exec_id = harvest_workflow_executions.id)::bigint AS event_count \
-         FROM harvest_workflow_executions \
-         WHERE state = 'RUNNING' \
-         AND (SELECT COUNT(*) FROM harvest_events WHERE workflow_exec_id = harvest_workflow_executions.id) >= $1",
-    )
-    .bind::<BigInt, _>(ceiling_i64)
-    .load(conn)
-    .await
-    .map_err(crate::error::database_error)?;
+    let oversized: Vec<OversizedRow> = diesel::sql_query(workflow_history_ceiling_query())
+        .bind::<BigInt, _>(ceiling_i64)
+        .load(conn)
+        .await
+        .map_err(crate::error::database_error)?;
 
     let count = oversized.len();
 
@@ -5105,6 +5133,52 @@ mod tests {
         // carve-out — see the dedicated test below.)
         assert!(!heartbeat_timeout_query().contains("PAUSED"));
         assert!(!start_to_close_timeout_query().contains("PAUSED"));
+    }
+
+    #[test]
+    fn workflow_history_ceiling_query_references_correct_columns() {
+        let sql = workflow_history_ceiling_query();
+        assert!(
+            sql.contains("FROM harvest_workflow_executions"),
+            "should query harvest_workflow_executions"
+        );
+        assert!(
+            sql.contains("state = 'RUNNING'"),
+            "should filter to RUNNING executions only"
+        );
+        assert!(
+            sql.contains("harvest_events"),
+            "should consult the durable event log"
+        );
+        assert!(
+            sql.contains("event_count >= $1"),
+            "should filter on the operator-supplied ceiling bind"
+        );
+    }
+
+    /// The correlated `harvest_events` event-count subquery must appear
+    /// exactly once in `workflow_history_ceiling_query()` -- one
+    /// `MATERIALIZED` CTE definition, referenced (not re-evaluated) by both
+    /// the reported `event_count` column and the `WHERE event_count >= $1`
+    /// filter. Two occurrences would mean the query regressed to evaluating
+    /// the correlated `COUNT(*)` once per RUNNING row for the filter and
+    /// again, separately, for the projection -- exactly the shape
+    /// `docs/performance-history-ceiling.md` measures and fixes.
+    #[test]
+    fn workflow_history_ceiling_query_counts_events_exactly_once_per_row() {
+        let sql = workflow_history_ceiling_query();
+        assert_eq!(
+            sql.matches("SELECT COUNT(*) FROM harvest_events").count(),
+            1,
+            "the correlated event-count subquery must be written exactly \
+             once; got:\n{sql}"
+        );
+        assert!(
+            sql.contains("MATERIALIZED"),
+            "the event-count CTE must be MATERIALIZED so Postgres cannot \
+             pull it up and re-duplicate the correlated subquery at each \
+             reference site (SELECT list + WHERE clause); got:\n{sql}"
+        );
     }
 
     #[test]

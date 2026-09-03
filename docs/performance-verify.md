@@ -95,7 +95,7 @@ Baseline (unmodified `HEAD`):
 
 Everything above `is_contained_in` in this list is `serde_json`'s own
 generic deserialization machinery — the harvest replay engine's stored-event
-wire format (adjacently-tagged `{"type": ..., "data": ...}`, per CLAUDE.md's
+wire format (adjacently-tagged `{"type": ..., "data": ...}`, per `docs/architecture.md`'s
 explicit "never change this tagging" contract) plus third-party `serde_json`
 internals, both already flagged out-of-scope by the prior
 `performance-schema-validation-lazy-path.md` pass. `uuid::parser::try_parse`

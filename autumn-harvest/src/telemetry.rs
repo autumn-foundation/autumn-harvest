@@ -474,6 +474,19 @@ pub const METRIC_RETENTION_DELETED: &str = "harvest.retention.deleted";
 /// two tiers. Labeled by the low-cardinality `workflow` registry key.
 pub const METRIC_SUMMARY_DELETED: &str = "harvest.retention.summary_deleted";
 
+/// Counter: inert per-tenant rate-limit buckets collected by the idle-bucket GC
+/// pass (issue #1127).
+///
+/// Labeled by [`METRIC_LABEL_RATE_LIMIT_FAMILY`] — `dyn-rate` or
+/// `start-throttle` — and **never** by the bucket key. The key is the very
+/// thing whose cardinality is unbounded (one value per tenant, forever), which
+/// is why these buckets need collecting at all; labelling by it would trade an
+/// unbounded table for an unbounded metric series. Per-key bucket state stays
+/// observable through `GET /admin/rate-limits`, matching the same decision made
+/// for the per-key gauges (issue #699) and for `harvest.codec.reencrypted`
+/// (issue #948).
+pub const METRIC_RATE_LIMIT_BUCKETS_DELETED: &str = "harvest.retention.rate_limit_buckets_deleted";
+
 /// Histogram: wall-clock latency of query handler invocations (seconds).
 ///
 /// Labelled with `query.name` (low-cardinality handler name registered by the
@@ -1572,6 +1585,11 @@ pub const METRIC_LABEL_SOURCE: &str = "source";
 
 /// Metric label: the workflow name.
 pub const METRIC_LABEL_WORKFLOW: &str = "workflow";
+
+/// Label: the bounded rate-limit key *family* (`dyn-rate` / `start-throttle`),
+/// used by [`METRIC_RATE_LIMIT_BUCKETS_DELETED`] in place of the unbounded
+/// bucket key (issue #1127).
+pub const METRIC_LABEL_RATE_LIMIT_FAMILY: &str = "family";
 /// Metric label: the low-cardinality workflow type.
 pub const METRIC_LABEL_WORKFLOW_TYPE: &str = "workflow.type";
 /// Metric label: the activity name.
@@ -2492,6 +2510,16 @@ pub trait MetricsRecorder: Send + Sync {
     /// independently. Emitted for real deletes only (never dry-run).
     fn record_summary_deleted(&self, workflow: &str, count: u64) {
         let _ = (workflow, count);
+    }
+
+    /// Number of inert per-tenant rate-limit buckets the idle-bucket GC pass
+    /// collected on one shard in one tick, per key family (issue #1127).
+    ///
+    /// Maps to the counter [`METRIC_RATE_LIMIT_BUCKETS_DELETED`], labeled with
+    /// the bounded `family` (`dyn-rate` / `start-throttle`) and never with the
+    /// unbounded bucket key. Emitted for real deletes only (never dry-run).
+    fn record_rate_limit_buckets_deleted(&self, family: &str, count: u64) {
+        let _ = (family, count);
     }
 
     /// Current number of RUNNING tasks for a concurrency group key.
@@ -3702,6 +3730,10 @@ mod tests {
             "harvest.concurrency.superseded"
         );
         assert_eq!(METRIC_SUMMARY_DELETED, "harvest.retention.summary_deleted");
+        assert_eq!(
+            METRIC_RATE_LIMIT_BUCKETS_DELETED,
+            "harvest.retention.rate_limit_buckets_deleted"
+        );
         // issue #618: exempt-by-design start producers increment this counter.
         assert_eq!(METRIC_ADMISSION_BYPASSED, "harvest.admission.bypassed");
         assert_eq!(METRIC_LABEL_PRODUCER, "producer");
@@ -4464,6 +4496,7 @@ mod tests {
         rec.record_retention_tick(0, 100, 50, 0.02);
         rec.record_retention_deleted("onboarding", 50);
         rec.record_summary_deleted("onboarding", 50);
+        rec.record_rate_limit_buckets_deleted("dyn-rate", 12);
         rec.record_workflow_non_determinism("onboarding", "v1.0.0");
         rec.record_workflow_nondeterministic_block("onboarding", "default");
         rec.record_workflow_history_bloat("onboarding");

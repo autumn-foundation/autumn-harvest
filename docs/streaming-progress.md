@@ -45,7 +45,7 @@ Where it fits among the neighboring read surfaces:
 | Surface | Direction | Shape | Audience | Durable? |
 |---|---|---|---|---|
 | **`ctx.publish_progress` + `GET /stream`** (this) | push | ordered author-defined chunks, live | end-user | no (ephemeral) |
-| [`set_current_details`](../CLAUDE.md) (#473/#593) | pull | one overwriting status string | operator/end-user | yes (a column) |
+| [`set_current_details`](architecture.md#current-details--operator-status-breadcrumb-issue-593) (#473/#593) | pull | one overwriting status string | operator/end-user | yes (a column) |
 | Engine-event SSE tail (#324) | push | engine machinery (`ActivityScheduled`/…) | **operator only** (admin-gated) | reads durable events |
 | Await-completion long-poll (#527) | pull | terminal result only | end-user | yes (the result) |
 | Durable per-execution logs (#790) | pull | persisted triage record | operator | yes |
@@ -222,7 +222,7 @@ Explicitly **not** provided by this feature (see the issue for rationale):
 
 - `autumn-harvest/examples/streaming_agent.rs` — a worked AI-agent-shaped example
   that publishes per-step chunks and documents the `curl -N` consumer.
-- [`set_current_details`](../CLAUDE.md) (#473/#593) — the single-value pull status
+- [`set_current_details`](architecture.md#current-details--operator-status-breadcrumb-issue-593) (#473/#593) — the single-value pull status
   companion.
 - Engine-event SSE tail (#324) — the admin-only operator triage stream.
 - Await-completion long-poll (#527) — terminal result delivery.

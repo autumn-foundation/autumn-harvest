@@ -1,0 +1,9 @@
+label=before
+fixture: 500 schedules, 3 shared calendars (every 10th schedule references one), RUNNING/PAUSED executions seeded for every 4th schedule's workflow, pending-throttle rows seeded for every 7th
+request: GET /admin/schedules
+returned_rows=500
+aux_statement_shapes=4
+total_calls=1550
+total_buffers=2185
+request_total_calls=1557
+request_total_buffers=2218

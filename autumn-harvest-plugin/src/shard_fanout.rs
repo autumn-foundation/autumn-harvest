@@ -15,7 +15,7 @@ use autumn_harvest::workers::WorkerRow;
 use chrono::{DateTime, Utc};
 use serde::Serialize;
 
-use crate::api::HarvestApiState;
+use crate::api::{HarvestApiState, PoolConn, acquire_conn};
 
 /// Outcome of a single-shard query: either a successful row set or an error.
 #[derive(Debug)]
@@ -26,6 +26,41 @@ pub struct ShardObservation<R> {
     pub rows: Vec<R>,
     /// Error description when the shard could not be queried.
     pub error: Option<String>,
+}
+
+/// Resolve `pool` to a live connection for `shard_id`, or the
+/// [`ShardObservation`] error a fan-out read should record for this shard.
+///
+/// Every per-shard fan-out query starts the same way: a shard the router has
+/// no pool for is `"has no configured storage pool"`; a pool that fails to
+/// hand out a connection is `"could not be acquired"`. Centralising that
+/// prelude here means a new fan-out read model implements only its own query
+/// against the returned connection, not this guard by hand — it was
+/// hand-copied into eight read models before this extraction.
+///
+/// # Errors
+///
+/// Returns the [`ShardObservation`] the caller should record for this shard
+/// when no pool is configured for it, or when a connection could not be
+/// acquired from the pool.
+pub async fn acquire_shard_conn<R>(
+    shard_id: i32,
+    pool: Option<DbPool>,
+) -> Result<PoolConn, ShardObservation<R>> {
+    let Some(pool) = pool else {
+        return Err(ShardObservation {
+            shard_id,
+            rows: Vec::new(),
+            error: Some(format!("shard {shard_id} has no configured storage pool")),
+        });
+    };
+    acquire_conn(&pool).await.map_err(|_| ShardObservation {
+        shard_id,
+        rows: Vec::new(),
+        error: Some(format!(
+            "database connection for shard {shard_id} could not be acquired"
+        )),
+    })
 }
 
 /// Collect per-shard connection pools available in `api_state`.
@@ -50,7 +85,8 @@ pub fn pools_by_shard(api_state: &HarvestApiState) -> BTreeMap<i32, DbPool> {
 /// A shard the router knows about but for which this process has no pool yet
 /// (e.g. mid a shard-add rollout — the router's `readable_shards` is widened
 /// before every process has the new shard's pool wired up, see the workspace
-/// CLAUDE.md "add a shard" procedure) must still appear in the returned set so
+/// `docs/architecture.md` "add a shard" procedure) must still appear in the
+/// returned set so
 /// callers report it `unavailable` rather than silently omitting it from the
 /// fan-out — an omitted shard would let a completeness `status` read
 /// `complete` even though that shard was never queried.
@@ -269,6 +305,50 @@ pub fn collect_fanout_rows<R>(observations: Vec<ShardObservation<R>>) -> FanoutR
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── acquire_shard_conn (characterizes the prelude previously hand-copied
+    //    into canary.rs, status_summary.rs, usage.rs, workflow_count.rs,
+    //    workflow_reachability.rs, queue_coverage.rs, version_gate_retirement.rs
+    //    and version_usage.rs) ───────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn acquire_shard_conn_no_pool_reports_shard_id_and_message() {
+        let result: Result<PoolConn, ShardObservation<i64>> = acquire_shard_conn(7, None).await;
+        let Err(observation) = result else {
+            panic!("no pool must be an error observation");
+        };
+        assert_eq!(observation.shard_id, 7);
+        assert!(observation.rows.is_empty());
+        assert_eq!(
+            observation.error.as_deref(),
+            Some("shard 7 has no configured storage pool")
+        );
+    }
+
+    #[tokio::test]
+    async fn acquire_shard_conn_unreachable_pool_reports_shard_id_and_message() {
+        // Nothing listens on this port, so `pool.get()` fails fast (connection
+        // refused) without needing a live database.
+        let manager = diesel_async::pooled_connection::AsyncDieselConnectionManager::<
+            diesel_async::AsyncPgConnection,
+        >::new("postgres://user:pass@127.0.0.1:1/db");
+        let pool: DbPool = deadpool::managed::Pool::builder(manager)
+            .max_size(1)
+            .build()
+            .expect("failed to build unreachable test pool");
+
+        let result: Result<PoolConn, ShardObservation<i64>> =
+            acquire_shard_conn(3, Some(pool)).await;
+        let Err(observation) = result else {
+            panic!("unreachable pool must be an error observation");
+        };
+        assert_eq!(observation.shard_id, 3);
+        assert!(observation.rows.is_empty());
+        assert_eq!(
+            observation.error.as_deref(),
+            Some("database connection for shard 3 could not be acquired")
+        );
+    }
 
     fn obs<R>(shard_id: i32, rows: Vec<R>, error: Option<&str>) -> ShardObservation<R> {
         ShardObservation {
