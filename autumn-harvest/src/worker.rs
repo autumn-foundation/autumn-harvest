@@ -3340,6 +3340,11 @@ async fn persist_external_signal_inline(
             // so the terminal metric is recorded after commit.
             let mut cancel_metrics: Vec<(String, String)> = Vec::new();
             let mut deferred_checks: Vec<(ExecutionId, String)> = Vec::new();
+            // Resolved once per batch rather than per item: it reads the
+            // process-global router/pool, which cannot change inside this
+            // transaction (issue #1146).
+            let multi_shard_deployment =
+                crate::external_target_location::deployment_is_multi_shard();
 
             for item in items {
                 match item {
@@ -3370,16 +3375,20 @@ async fn persist_external_signal_inline(
                             new_events.push(requested);
                         }
 
-                        // If cross-shard, skip inline delivery entirely and
-                        // let the background outbox handle it. An
-                        // undeterminable owning shard (`None`, only possible
-                        // for a `WorkflowId` target when the process-global
-                        // router isn't initialized) falls back to "assume
-                        // same shard as the caller" — see
-                        // `external_target_owning_shard`'s doc comment.
-                        if crate::shard::external_target_owning_shard(&run.target)
-                            .is_some_and(|owning| owning != exec_id.shard())
-                        {
+                        // If this delivery cannot be proven to land on the
+                        // caller's own shard, skip inline delivery entirely and
+                        // let the background outbox handle it — that is where
+                        // the placement-aware cross-shard resolution runs
+                        // (issue #1146). An `ExecutionId` target is compared
+                        // against its authoritative encoded shard; a
+                        // `WorkflowId` target is inline-eligible only in a
+                        // single-shard deployment. See
+                        // `external_target_location::inline_delivery_allowed`.
+                        if !crate::external_target_location::inline_delivery_allowed(
+                            &run.target,
+                            exec_id.shard(),
+                            multi_shard_deployment,
+                        ) {
                             continue;
                         }
 
@@ -3517,12 +3526,15 @@ async fn persist_external_signal_inline(
                             new_events.push(requested);
                         }
 
-                        // Cross-shard: leave for the outbox scanner. See the
-                        // identical comment on the signal arm above for the
-                        // undeterminable-owning-shard fallback.
-                        if crate::shard::external_target_owning_shard(&run.target)
-                            .is_some_and(|owning| owning != exec_id.shard())
-                        {
+                        // Not provably same-shard: leave for the outbox
+                        // scanner. See the identical comment on the signal arm
+                        // above for why a `WorkflowId` target is inline-eligible
+                        // only in a single-shard deployment (issue #1146).
+                        if !crate::external_target_location::inline_delivery_allowed(
+                            &run.target,
+                            exec_id.shard(),
+                            multi_shard_deployment,
+                        ) {
                             continue;
                         }
 
@@ -15852,15 +15864,21 @@ enum SuccessorSlot {
 /// Left unguarded that silently breaks two things a multi-shard deployment
 /// relies on:
 ///
-/// 1. **`workflow_id`-addressed signal/cancel/await (issue #751)** resolves its
-///    target with `shard::external_target_owning_shard`, which hashes the new
-///    pair — so it queries the wrong database and reports the live successor as
-///    `target_unknown`. That is precisely the addressing mode this feature tells
-///    callers to use for an entity that changes type.
-/// 2. **`(workflow_name, workflow_id)` uniqueness**, because
+/// 1. **`(workflow_name, workflow_id)` uniqueness**, because
 ///    [`resolve_successor_slot`] can only see the predecessor's shard: a live
 ///    run of the target type sitting on the hash-derived shard is invisible, so
 ///    the successor is created alongside it and two live runs share one key.
+///
+/// Issue #1146 removed the *second* reason this guard originally carried —
+/// that `workflow_id`-addressed signal/cancel (issue #751) resolved its target
+/// by hashing the new pair and would therefore report the relocated successor
+/// `target_unknown`. By-id delivery now finds a run wherever it lives
+/// (`external_target_location::resolve_location_by_workflow_id`), so
+/// reachability is no longer at stake. The uniqueness reason above is
+/// untouched and is on its own sufficient: two live runs under one business key
+/// is a corrupt state no addressing scheme can repair. Relaxing this guard into
+/// a real cross-shard occupancy check — which #1146's fan-out now makes
+/// possible — is a genuine follow-up, deliberately not taken here.
 ///
 /// So this fails the transition **closed**, matching what the feature already
 /// does for every other unsupported target (blank, unregistered, DAG, occupied
@@ -15937,10 +15955,9 @@ fn classify_cross_shard_continue_as_new(
         "continue_as_new into '{target}' would place the successor on shard {predecessor_shard} \
          (the predecessor's shard, since the seal and the successor insert are one transaction), \
          but the key ('{target}', '{workflow_id}') routes to shard {}. Cross-shard relocation is \
-         not supported, and proceeding would make the successor unreachable by workflow_id-\
-         addressed signal/cancel (issue #751) and could admit a second live run of the target type \
-         on the routed shard. Keep this entity on one type and branch internally, or run a \
-         single-shard deployment",
+         not supported: proceeding could admit a second live run of the target type on the routed \
+         shard, because the uniqueness check can only see the predecessor's shard. Keep this \
+         entity on one type and branch internally, or run a single-shard deployment",
         target_shard.as_i32()
     ))
 }
@@ -23487,6 +23504,38 @@ impl Worker {
         // below would never start at all — stranding every healthy shard. A
         // bounded failure instead arms that shard's pending flag, which its own
         // heartbeat task retries. See `shard_acquire_bound`.
+        // Cross-shard reads need a connection this process does not already
+        // hold. One timeout checker runs per assigned shard and holds its own
+        // shard pool's connection for the whole `enforce_timeouts_once` pass, so
+        // a pool of one has nothing left for a peer's read: `workflow_id`-addressed
+        // signal/cancel resolution (issue #1146) and cross-shard `ExecutionId`
+        // delivery (issue #492, which has always had this requirement) both
+        // degrade to "peer uninspected, retry next tick" for as long as the peer's
+        // own pass is running. Both are bounded, so nothing wedges — but progress
+        // then depends on a peer's connection happening to be free, which is not
+        // a guarantee. Two connections per shard pool makes it one.
+        //
+        // Warn rather than refuse: a single-shard process needs no peer read at
+        // all, this one may simply not use by-id addressing, and refusing to
+        // start over a capacity hint would be a far worse failure than the
+        // degradation it prevents.
+        for shortfall in under_provisioned_shard_pools(&shard_targets) {
+            let shards: Vec<i32> = shortfall.shards.iter().map(|s| s.as_i32()).collect();
+            tracing::warn!(
+                worker_id = %self.config.worker_id,
+                shards = ?shards,
+                max_size = shortfall.max_size,
+                needed = shortfall.needed,
+                "shard pool is provisioned below the {} connections this process needs \
+                 from it: {} of this worker's scanners run against it and each holds one \
+                 for its whole pass, leaving none for a peer shard's cross-shard read. \
+                 Cross-shard signal/cancel delivery will degrade to retries. See \
+                 docs/sharding.md",
+                shortfall.needed,
+                shortfall.shards.len()
+            );
+        }
+
         let startup_bound = shard_acquire_bound(true, self.config.poll_interval);
         let mut registration_pending_per_shard: Vec<Arc<AtomicBool>> =
             Vec::with_capacity(shard_targets.len());
@@ -26220,6 +26269,66 @@ pub async fn chaos_drive_one_workflow_task(
 // Tests (unit, no DB)
 // ---------------------------------------------------------------------------
 
+/// A physical shard pool this process has provisioned below what it needs.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct PoolShortfall {
+    /// Every logical shard this worker polls against this one physical pool.
+    /// More than one means an aliased (colocated) topology.
+    pub(crate) shards: Vec<crate::types::ShardId>,
+    /// The pool's configured `max_size`.
+    pub(crate) max_size: usize,
+    /// Connections this process needs from it: one per local scanner sharing
+    /// it, plus one for a peer's cross-shard read.
+    pub(crate) needed: usize,
+}
+
+/// Which of this worker's shard pools cannot serve their own scanners *and* a
+/// peer's cross-shard read.
+///
+/// Grouped by **physical** pool, not by logical shard, and that is the whole
+/// point. `ShardedDbPool::pool_for` hands back the same `DbPool` for every
+/// logical shard aliased onto one database, while `spawn_monitoring_tasks`
+/// spawns one timeout checker per logical *assignment* — so a colocated
+/// topology puts N scanners on one pool, each holding a connection for its
+/// whole pass. Counting per logical shard therefore under-counts demand by
+/// exactly the aliasing factor: shards 0 and 1 sharing a pool at `max_size = 2`
+/// look fine twice over, while between them they can hold both connections and
+/// leave a third shard's checker unable to probe that database at all (issue
+/// #1146, Codex round 9 P1).
+///
+/// The requirement for one physical pool is therefore `local scanners + 1`, not
+/// a flat 2. Identity comes from `same_underlying_pool`, the same test the
+/// delivery paths use, so the warning and the routing cannot disagree about
+/// what "one pool" means.
+pub(crate) fn under_provisioned_shard_pools(
+    shard_targets: &[(crate::types::ShardId, DbPool)],
+) -> Vec<PoolShortfall> {
+    let mut groups: Vec<(DbPool, Vec<crate::types::ShardId>)> = Vec::new();
+    for (shard, pool) in shard_targets {
+        if let Some((_, shards)) = groups
+            .iter_mut()
+            .find(|(known, _)| crate::external_target_location::same_underlying_pool(known, pool))
+        {
+            shards.push(*shard);
+        } else {
+            groups.push((pool.clone(), vec![*shard]));
+        }
+    }
+
+    groups
+        .into_iter()
+        .filter_map(|(pool, shards)| {
+            let max_size = pool.status().max_size;
+            let needed = shards.len() + 1;
+            (max_size < needed).then_some(PoolShortfall {
+                shards,
+                max_size,
+                needed,
+            })
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -26799,6 +26908,102 @@ mod tests {
             .max_size(1)
             .build()
             .expect("pool builds without connecting")
+    }
+
+    /// A pool tagged by `max_size`. Cloning one yields a handle to the SAME
+    /// underlying pool — which is exactly what `ShardedDbPool::pool_for`
+    /// returns for two logical shards aliased onto one database.
+    fn sized_pool(max_size: usize) -> DbPool {
+        let manager = diesel_async::pooled_connection::AsyncDieselConnectionManager::<
+            diesel_async::AsyncPgConnection,
+        >::new("postgres://unused@127.0.0.1:1/none");
+        deadpool::managed::Pool::builder(manager)
+            .max_size(max_size)
+            .build()
+            .expect("pool builds without connecting")
+    }
+
+    #[test]
+    fn a_two_connection_pool_serving_one_shard_is_sufficient() {
+        use crate::types::ShardId;
+        let targets = vec![
+            (ShardId::new(0), sized_pool(2)),
+            (ShardId::new(1), sized_pool(2)),
+        ];
+        assert_eq!(
+            under_provisioned_shard_pools(&targets),
+            Vec::new(),
+            "one scanner plus one peer slot is exactly the documented minimum",
+        );
+    }
+
+    #[test]
+    fn a_one_connection_pool_is_short_by_the_peer_slot() {
+        use crate::types::ShardId;
+        let targets = vec![
+            (ShardId::new(0), sized_pool(1)),
+            (ShardId::new(1), sized_pool(2)),
+        ];
+        assert_eq!(
+            under_provisioned_shard_pools(&targets),
+            vec![PoolShortfall {
+                shards: vec![ShardId::new(0)],
+                max_size: 1,
+                needed: 2,
+            }],
+        );
+    }
+
+    /// The aliased case the per-logical-shard check could not see. Two logical
+    /// shards on one physical pool at `max_size = 2` passed a `max_size < 2`
+    /// test twice, while between them holding both connections and starving a
+    /// third shard's cross-shard read (issue #1146, Codex round 9 P1).
+    #[test]
+    fn two_shards_aliased_onto_one_pool_need_a_third_connection() {
+        use crate::types::ShardId;
+        let shared = sized_pool(2);
+        let targets = vec![
+            (ShardId::new(0), shared.clone()),
+            (ShardId::new(1), shared),
+            (ShardId::new(2), sized_pool(2)),
+        ];
+        assert_eq!(
+            under_provisioned_shard_pools(&targets),
+            vec![PoolShortfall {
+                shards: vec![ShardId::new(0), ShardId::new(1)],
+                max_size: 2,
+                needed: 3,
+            }],
+            "the shared pool must be reported once, for both shards, needing one \
+             connection per local scanner plus a peer slot",
+        );
+    }
+
+    /// Aliasing is reported against the pool, not multiplied per shard: three
+    /// logical shards on one pool are one shortfall naming three shards.
+    #[test]
+    fn an_aliased_pool_is_reported_once_not_once_per_shard() {
+        use crate::types::ShardId;
+        let shared = sized_pool(1);
+        let targets = vec![
+            (ShardId::new(0), shared.clone()),
+            (ShardId::new(1), shared.clone()),
+            (ShardId::new(2), shared),
+        ];
+        let shortfalls = under_provisioned_shard_pools(&targets);
+        assert_eq!(shortfalls.len(), 1, "one physical pool, one warning");
+        assert_eq!(shortfalls[0].needed, 4);
+        assert_eq!(shortfalls[0].shards.len(), 3);
+    }
+
+    /// A pool sized for its aliases is not flagged — the check must not simply
+    /// warn whenever aliasing is present.
+    #[test]
+    fn an_aliased_pool_sized_for_its_scanners_is_not_flagged() {
+        use crate::types::ShardId;
+        let shared = sized_pool(3);
+        let targets = vec![(ShardId::new(0), shared.clone()), (ShardId::new(1), shared)];
+        assert_eq!(under_provisioned_shard_pools(&targets), Vec::new());
     }
 
     fn default_runtime_config() -> WorkerRuntimeConfig {

@@ -301,6 +301,10 @@ pub mod event_batch;
 #[doc(hidden)]
 pub mod execution;
 pub mod executor;
+/// Shard-placement-aware resolution for `workflow_id`-addressed external
+/// signal/cancel targets (issue #1146).
+#[cfg(feature = "db")]
+pub mod external_target_location;
 #[cfg(feature = "db")]
 pub mod external_task;
 pub mod failure;

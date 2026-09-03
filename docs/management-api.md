@@ -357,7 +357,7 @@ curl -i "$BASE/workflows/by-id/order_flow/does-not-exist"   # HTTP 404
 | `state` | string | Filter by execution state (e.g. `RUNNING`, `COMPLETED`) |
 | `limit` | integer | Maximum rows to return (default 200, max 200) |
 | `search_attr` | repeated | `key:value` pairs against `search_attrs` JSONB (exact-match equality; value is always a string) |
-| `search_attr_filter` | repeated | Typed comparison/set predicate `key:op:value` against `search_attrs` JSONB. See [Typed search-attribute predicates](#typed-search-attribute-predicates-getworkflows). |
+| `search_attr_filter` | repeated | Typed comparison/set predicate `key:op:value` against `search_attrs` JSONB. See [Typed search-attribute predicates](#typed-search-attribute-predicates-get-workflows). |
 | `no_progress_minutes` | integer | Return stalled workflows with no task activity for N minutes |
 | `sla_breached` | bool | Filter to executions that have breached their SLA |
 | `page_size` | integer | Per-page limit for keyset pagination (1–200; overrides `limit`). Presence activates the opt-in paginated envelope. |

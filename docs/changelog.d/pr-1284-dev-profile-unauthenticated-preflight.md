@@ -65,12 +65,27 @@ it was. Both shapes are pinned by tests, and the second one is the point.
 **A second unrunnable documented command, found by the new CI step.** With the
 401 fixed, the CI job got one step further and cargo itself failed: exit `101`,
 "could not determine which binary to run", because `autumn-harvest-cli` ships
-two binaries (`harvest`, `harvest-replay`) and declared no `default-run`. The
-bare `cargo run -p autumn-harvest-cli -- …` form the docs use in **58 places**
-across `README.md`, the three example READMEs, the getting-started guide and the
-triage runbook could not work as written for anyone — the same shape of bug as
-the 401, one layer down. Fixed with `default-run = "harvest"`, matching what
-`examples/quickstart` already does for its own two binaries.
+two binaries (`harvest`, `harvest-replay`) and declared no `default-run` — so
+the bare `cargo run -p autumn-harvest-cli -- …` form the docs use in dozens of
+places could not work as written. The same shape of bug as the 401, one layer
+down. This branch fixed it with `default-run = "harvest"`; **#1319 landed the
+same fix on `trunk-dev` independently**, with a `scripts/check-default-run.sh`
+guard, while this PR was in review. The merge keeps #1319's version and its
+guard — this branch carries no `Cargo.toml` change any more.
+
+Worth recording because a plain `git merge` did *not* surface it: both sides
+added the key in different parts of `[package]`, so git auto-merged them into a
+**duplicate `default-run`** — an invalid manifest that no conflict marker warned
+about.
+
+**The quickstart CI step is the union of both issues' guards.** #1319's step
+tolerated a `401` from the admin route as a known-deferred outcome, citing this
+very issue. That tolerance is now removed: with #1284 fixed, a `401` there is a
+regression, not a known state. The step keeps #1319's ambiguous-binary check and
+its errexit-safe status capture (an `if` condition — the same `bash -e` hazard
+this branch had independently found and fixed), and adds the raw-status
+assertion so a re-gated route reads as "401 came back" rather than an opaque
+exit code.
 
 **No migration, no new `WorkflowEvent` variant, no `harvest_events` writer** —
 none of the append-only invariants are anywhere near this. The read-only operator

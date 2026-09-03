@@ -411,21 +411,9 @@ async fn observe_shard(
     pool: Option<DbPool>,
     filter: Option<String>,
 ) -> ShardObservation<WorkflowTypeNonTerminalCount> {
-    let Some(pool) = pool else {
-        return ShardObservation {
-            shard_id,
-            rows: Vec::new(),
-            error: Some(format!("shard {shard_id} has no configured storage pool")),
-        };
-    };
-    let Ok(mut conn) = pool.get().await else {
-        return ShardObservation {
-            shard_id,
-            rows: Vec::new(),
-            error: Some(format!(
-                "database connection for shard {shard_id} could not be acquired"
-            )),
-        };
+    let mut conn = match shard_fanout::acquire_shard_conn(shard_id, pool).await {
+        Ok(conn) => conn,
+        Err(observation) => return observation,
     };
     match non_terminal_counts_by_workflow_name(&mut conn, Some(shard_id), filter.as_deref()).await {
         Ok(rows) => ShardObservation {

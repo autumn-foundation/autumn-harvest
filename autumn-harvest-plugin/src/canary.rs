@@ -777,21 +777,9 @@ async fn load_canary_rows(conn: &mut AsyncPgConnection) -> Result<Vec<CanaryRow>
 /// unreachable shard never fails the whole fan-out — the merge folds it into
 /// `unavailable_shards` and a `partial`/`unavailable` status instead.
 async fn observe_canary_shard(shard_id: i32, pool: Option<DbPool>) -> ShardObservation<CanaryRow> {
-    let Some(pool) = pool else {
-        return ShardObservation {
-            shard_id,
-            rows: Vec::new(),
-            error: Some(format!("shard {shard_id} has no configured storage pool")),
-        };
-    };
-    let Ok(mut conn) = pool.get().await else {
-        return ShardObservation {
-            shard_id,
-            rows: Vec::new(),
-            error: Some(format!(
-                "database connection for shard {shard_id} could not be acquired"
-            )),
-        };
+    let mut conn = match shard_fanout::acquire_shard_conn(shard_id, pool).await {
+        Ok(conn) => conn,
+        Err(observation) => return observation,
     };
     match load_canary_rows(&mut conn).await {
         Ok(rows) => ShardObservation {

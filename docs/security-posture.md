@@ -338,23 +338,30 @@ by its stable `(workflow_name, workflow_id)` business key instead of its
   above](#data-residency-and-shard-placement-issue-697) — the string is an
   address, not a secret, and reaching it should be gated by your embedding
   application, not by Harvest.
-- **Shard resolution assumes the default (`Auto`) placement (issue #697
+- **Shard resolution is placement-aware (issue #1146, closing the #697
   interaction).** Resolving which shard owns a `(workflow_name, workflow_id)`
-  target re-derives the same rendezvous hash a fresh start would use
-  (`shard::external_target_owning_shard`) — it does not, and cannot without a
-  directory lookup, see an explicit shard pin applied at start time
-  (`ShardPlacement::Shard`/`ShardPlacement::ResidencyKey`). A workflow started
-  with an explicit pin can therefore be unreachable — or, in a genuinely
-  pathological multi-tenant layout, misresolved to a shard hosting an
-  unrelated `(workflow_name, workflow_id)` pair — via business-key targeting.
-  This is a correctness limitation, not a privilege-escalation vector (a
-  misresolution surfaces as `target_unknown`/`NoRunFound`, never as access to
-  a target the caller could not otherwise reach), but it means
-  business-key-addressed signal/cancel should be reserved for workflows known
-  to use the default placement; address an explicitly shard-pinned workflow
-  by `ExecutionId` instead. A shard-placement-aware directory lookup for
-  business-key targeting is a documented follow-up, out of scope for issue
-  #751.
+  target used to re-derive the rendezvous hash a fresh start would use
+  (`shard::external_target_owning_shard`), which cannot see an explicit shard
+  pin applied at start time (`ShardPlacement::Shard`/`ShardPlacement::ResidencyKey`)
+  or a shard drained out of `writable_shards` since placement — so an
+  explicitly pinned workflow could be unreachable by business-key targeting.
+  Delivery now resolves by observation instead
+  (`external_target_location::resolve_location_by_workflow_id` fans out
+  across every expected shard and merges the per-shard answers), so any
+  placement is addressable.
+
+  Two properties matter for posture rather than correctness. Resolution
+  **reads at most two rows per shard** for the addressed key — an
+  authorization-neutral read: the management API's by-id endpoints (issue #805)
+  already fan the identical query across every shard for any read-authenticated
+  caller, and it returns only the target's own execution id/state/start time,
+  never another tenant's data. And a shard that cannot be inspected yields a
+  **retry**, never a `target_unknown`, so an operator watching a partial outage
+  sees stalled by-id deliveries rather than silent false failures. Business-key addressing
+  remains an *address, not a secret*: the caveat above about building
+  `workflow_name`/`workflow_id` from attacker-influenced data is unchanged and
+  is now the only gate, since placement no longer accidentally hides a pinned
+  workflow.
 
 ---
 

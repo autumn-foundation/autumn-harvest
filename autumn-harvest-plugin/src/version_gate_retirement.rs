@@ -19,6 +19,7 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use crate::api::{HarvestApiState, map_error};
+use crate::shard_fanout;
 
 /// Query string accepted by `GET /admin/version-gates/retirement-check`.
 #[derive(Debug, Clone, Deserialize)]
@@ -122,12 +123,7 @@ pub struct RetirementShardInspection {
     pub error: Option<String>,
 }
 
-#[derive(Debug)]
-struct ShardObservation {
-    shard_id: i32,
-    rows: Vec<RetirementCheckShardRow>,
-    error: Option<String>,
-}
+type ShardObservation = shard_fanout::ShardObservation<RetirementCheckShardRow>;
 
 #[derive(Debug, Clone, Eq, PartialEq, Ord, PartialOrd)]
 struct RetirementKey {
@@ -173,7 +169,7 @@ pub async fn build_retirement_check_report(
     };
 
     let expected_shards = expected_shards(api_state, query.shard_id);
-    let pools = pools_by_shard(api_state);
+    let pools = shard_fanout::pools_by_shard(api_state);
 
     let observations = expected_shards
         .iter()
@@ -222,40 +218,16 @@ fn expected_shards(api_state: &HarvestApiState, shard_filter: Option<i32>) -> BT
     shards
 }
 
-fn pools_by_shard(api_state: &HarvestApiState) -> BTreeMap<i32, DbPool> {
-    api_state.storage_pool().map_or_else(
-        |_| BTreeMap::new(),
-        |pool| {
-            pool.iter_shards()
-                .map(|(shard, db_pool)| (shard.as_i32(), db_pool.clone()))
-                .collect()
-        },
-    )
-}
-
 async fn observe_shard(
     shard_id: i32,
     pool: Option<DbPool>,
     mut filters: RetirementCheckFilters,
 ) -> ShardObservation {
-    let Some(pool) = pool else {
-        return ShardObservation {
-            shard_id,
-            rows: Vec::new(),
-            error: Some(format!("shard {shard_id} has no configured storage pool")),
-        };
+    let mut conn = match shard_fanout::acquire_shard_conn(shard_id, pool).await {
+        Ok(conn) => conn,
+        Err(observation) => return observation,
     };
-
     filters.shard_id = Some(shard_id);
-    let Ok(mut conn) = pool.get().await else {
-        return ShardObservation {
-            shard_id,
-            rows: Vec::new(),
-            error: Some(format!(
-                "database connection for shard {shard_id} could not be acquired"
-            )),
-        };
-    };
 
     match load_retirement_check(&mut conn, &filters).await {
         Ok(rows) => ShardObservation {
@@ -385,8 +357,8 @@ fn blocker_from_accumulator(
         terminal_executions: acc.terminal_executions,
         oldest_blocker_started_at: acc.oldest_blocker_started_at,
         newest_blocker_started_at: acc.newest_blocker_started_at,
-        oldest_blocker_age_secs: age_secs(observed_at, acc.oldest_blocker_started_at),
-        newest_blocker_age_secs: age_secs(observed_at, acc.newest_blocker_started_at),
+        oldest_blocker_age_secs: shard_fanout::age_secs(observed_at, acc.oldest_blocker_started_at),
+        newest_blocker_age_secs: shard_fanout::age_secs(observed_at, acc.newest_blocker_started_at),
         sample_active_execution_ids: acc.sample_active_execution_ids.clone(),
         shard_coverage: RetirementShardCoverage {
             inspected_shards: inspected_shards.iter().copied().collect(),
@@ -394,13 +366,6 @@ fn blocker_from_accumulator(
             unavailable_shards: unavailable_shards.iter().copied().collect(),
         },
     }
-}
-
-fn age_secs(observed_at: DateTime<Utc>, started_at: DateTime<Utc>) -> i64 {
-    observed_at
-        .signed_duration_since(started_at)
-        .num_seconds()
-        .max(0)
 }
 
 const fn compute_status(

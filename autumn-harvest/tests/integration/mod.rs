@@ -187,6 +187,8 @@ mod scheduler_overdue_tests;
 mod scheduler_registration_tests;
 mod security;
 #[cfg(feature = "db")]
+mod shard_placement_by_id_tests;
+#[cfg(feature = "db")]
 mod sharded_runtime_tests;
 mod sharding_unit;
 mod signal_tests;

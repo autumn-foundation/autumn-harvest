@@ -109,6 +109,14 @@ jobs:
         with:
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
+      - name: Check default-run for multi-binary packages
+        # Guards the defect class that silently broke `cargo run -p
+        # quickstart` and `cargo run -p autumn-harvest-cli -- ...` (the
+        # documented command in 50+ places, including the quickstart's own
+        # "Step 3 — Run preflight") for weeks with fully green CI, because
+        # the `quickstart`/build-only CI jobs run `cargo build`, which can't
+        # itself be ambiguous. See scripts/check-default-run.sh.
+        run: ./scripts/check-default-run.sh
       - name: Check formatting
         run: cargo fmt --all -- --check
       - name: Clippy autumn-harvest
@@ -234,6 +242,21 @@ jobs:
       # whole workflow unparseable.
       - name: Run docs/rnd/determinism-static-analysis.md guards (also on docs-only PRs)
         run: "cargo test -p autumn-harvest --no-default-features --features testing --test integration determinism_static_analysis_docs::"
+
+      # Folio corpus harness: internal link check across all of docs/ (see
+      # docs/audits/corpus-link-check.py). Same reasoning as the docs-only
+      # guards above — a broken link is exactly the change class a docs-only
+      # PR is most likely to introduce, and the `test` matrix below skips
+      # entirely on docs-only changes. Pure Python stdlib, no deps, no
+      # network — costs a couple of seconds. Exits 1 only on a broken link
+      # inside the reader corpus; a broken link inside docs/plans/,
+      # docs/changelog.d/, docs/rnd/, docs/assays/, or docs/perf-artifacts/
+      # (historical/process records, not indexed reference pages) is
+      # reported but does not fail the build. Orphan pages are reported,
+      # not gated — an orphan is a findability defect to triage, not a hard
+      # error the way a dead link is.
+      - name: Folio corpus link check (docs/audits/corpus-link-check.py)
+        run: python3 docs/audits/corpus-link-check.py
 
   test:
     name: Test (${{ matrix.os }})
@@ -592,17 +615,25 @@ jobs:
 
           # 2. README step 3 — run preflight with the EXACT documented command.
           #
-          # Issue #1284: this step is the whole reason the job cannot stop at
-          # "the app boots". The documented command is a bare cookieless HTTP
-          # call, and it answered 401 for everyone until the dev profile was
-          # taught to admit an unauthenticated caller. The unit tests in
-          # `security.rs` pin the gate; only this step pins it against a REAL
-          # autumn-web app, whose unconditional session layer inserts an empty
-          # non-cookie-backed `Session` before the harvest router ever sees the
-          # request — the shape that made the bug survive a plausible fix.
+          # Two regression classes meet here, from two issues:
           #
-          # Assert the raw status first so a regression reads as "401 came
-          # back", not as an opaque CLI exit code.
+          #   * #1319 — the bare `cargo run -p autumn-harvest-cli -- …` form the
+          #     docs use everywhere must resolve to a binary at all. Without
+          #     `default-run` cargo exits 101 ("could not determine which binary
+          #     to run") before the CLI parses a single argument.
+          #   * #1284 — the admin route behind it must actually answer. It 401'd
+          #     for every cookieless caller until the dev profile was taught to
+          #     admit one; only this step pins that against a REAL autumn-web
+          #     app, whose unconditional session layer inserts an empty
+          #     non-cookie-backed `Session` before the harvest router ever sees
+          #     the request — the shape that made the bug survive a plausible
+          #     fix.
+          #
+          # #1284 is FIXED as of this commit, so the 401 tolerance this step
+          # carried while that issue was open is deliberately GONE: a 401 here
+          # is now a regression, not a known outcome. Assert the raw status
+          # first so it reads as "401 came back" rather than as an opaque CLI
+          # exit code.
           code="$(curl -s -o /dev/null -w '%{http_code}' \
             http://localhost:3000/api/harvest/admin/preflight)"
           echo "GET /admin/preflight -> ${code}"
@@ -617,23 +648,28 @@ jobs:
           # Then the documented command itself. Exit codes are deploy-gate
           # friendly: 0 = pass, 2 = warn, 1 = fail or a transport/API error.
           # Both 0 and 2 are accepted (a single-worker CI app can legitimately
-          # warn); 1 is not, and is what a re-gated route would produce.
+          # warn); 1 is not.
           #
-          # The `|| preflight_exit=$?` is load-bearing: this step declares no
-          # `shell:`, so GitHub runs it as `bash -e {0}` and the script's own
-          # `set -uo pipefail` adds `-u`/`pipefail` WITHOUT clearing that `-e`.
-          # A bare invocation would therefore abort the step on the warn (2)
-          # this check explicitly accepts, and would exit before the error
-          # message below could name a re-gated route. A command on the left of
-          # `||` is exempt from `-e`, so this reads the status under either
-          # shell mode.
-          preflight_exit=0
-          cargo run -p autumn-harvest-cli -- \
-            --base-url http://localhost:3000/api/harvest preflight \
-            || preflight_exit=$?
-          echo "harvest preflight exit=${preflight_exit}"
-          if [ "${preflight_exit}" != "0" ] && [ "${preflight_exit}" != "2" ]; then
-            echo "::error::harvest preflight exited ${preflight_exit}; README step 3 must pass (0) or warn (2), never fail"
+          # Capturing the status is load-bearing: this step declares no
+          # `shell:`, so GitHub runs it with errexit already on, and the
+          # script's own `set -uo pipefail` adds `-u`/`pipefail` WITHOUT
+          # clearing it. A bare assignment from a command that exits nonzero
+          # would abort the step before the status could be read. An `if`
+          # condition is explicitly exempt from errexit, and capturing combined
+          # output also feeds the #1319 ambiguity check below.
+          if cli_out="$(cargo run -p autumn-harvest-cli -- \
+            --base-url http://localhost:3000/api/harvest preflight 2>&1)"; then
+            cli_status=0
+          else
+            cli_status=$?
+          fi
+          echo "${cli_out}"
+          echo "harvest preflight exit=${cli_status}"
+          if echo "${cli_out}" | grep -q "could not determine which binary to run"; then
+            echo "::error::regression of issue #1319: cargo run -p autumn-harvest-cli -- … is ambiguous (missing default-run)"; exit 1
+          fi
+          if [ "${cli_status}" != "0" ] && [ "${cli_status}" != "2" ]; then
+            echo "::error::harvest preflight exited ${cli_status}; README step 3 must pass (0) or warn (2), never fail"
             exit 1
           fi
 
