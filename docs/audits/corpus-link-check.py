@@ -123,9 +123,13 @@ REF_USE_RE = re.compile(r"\[([^\]]*)\]\[([^\]]*)\]")
 # `(` or `[` — so this never double-matches those.
 SHORTCUT_RE = re.compile(r"\[([^\]]+)\](?!\(|\[)")
 # Reference definition line: `[ref]: target "optional title"`, optionally
-# indented up to 3 spaces, optionally angle-bracketed target.
+# indented up to 3 spaces. Target is either bare (no whitespace) or
+# angle-bracketed — the latter is CommonMark's only way to put a space in a
+# reference-definition target (`[ref]: <a b.md>`), so the destination
+# alternation must accept it (same shape as `_DEST` above); `unwrap_angle_dest`
+# strips the brackets once captured, same as for inline links.
 REF_DEF_RE = re.compile(
-    r'(?m)^[ \t]{0,3}\[([^\]]+)\]:[ \t]*<?([^\s>]+)>?'
+    r"(?m)^[ \t]{0,3}\[([^\]]+)\]:[ \t]*(<[^<>]*>|\S+)"
     r'(?:[ \t]+(?:"[^"]*"|\'[^\']*\'|\([^)]*\)))?[ \t]*$'
 )
 # CommonMark allows up to 3 leading spaces on an ATX heading (4+ makes it an
@@ -142,16 +146,42 @@ HEADING_RE = re.compile(r"^[ \t]{0,3}(#{1,6})\s+(.+?)\s*#*$", re.MULTILINE)
 #     ========
 # Excludes a text line that looks like a list item, table row, or ATX
 # heading itself, to avoid misreading an ordinary `---` divider or table
-# separator as a heading underline for unrelated prose above it.
+# separator as a heading underline for unrelated prose above it. The
+# underline itself may carry up to 3 leading spaces, same CommonMark
+# allowance as an ATX `#` (HEADING_RE above) or a fence delimiter.
 SETEXT_RE = re.compile(
-    r"(?m)^(?!\s*$)(?!#)(?!\s*[-*+]\s)(?!\s*\|)([^\n]+)\n(?:=+|-{2,})[ \t]*$"
+    r"(?m)^(?!\s*$)(?!#)(?!\s*[-*+]\s)(?!\s*\|)([^\n]+)\n[ \t]{0,3}(?:=+|-{2,})[ \t]*$"
 )
 # CommonMark fenced code blocks may open with EITHER 3+ backticks OR 3+
-# tildes, not just backticks. A `~~~`-fenced example never toggles fence
-# mode under a backtick-only pattern, so a Markdown-*looking* link or
-# heading written inside it as sample text (not a real link) gets scanned
-# as if it were live corpus content.
-FENCE_RE = re.compile(r"^(?:```|~~~)")
+# tildes, not just backticks — and the block only closes on a run of the
+# SAME character at least as long as the opener (so a ``` example quoted
+# inside a longer ```` fence, or a backtick fence nested inside a tilde
+# one, doesn't false-close the block early). `mask_fenced_lines` tracks
+# both the character and the run length across the whole file, not just a
+# same/different toggle.
+FENCE_OPEN_RE = re.compile(r"^[ \t]{0,3}(`{3,}|~{3,})")
+
+
+def mask_fenced_lines(lines):
+    """Blank every line of every fenced code block (open, body, close)."""
+    out = []
+    fence_char = None
+    fence_len = 0
+    for line in lines:
+        if fence_char is None:
+            m = FENCE_OPEN_RE.match(line)
+            if m:
+                fence_char, fence_len = m.group(1)[0], len(m.group(1))
+                out.append("")
+                continue
+            out.append(line)
+            continue
+        if re.match(
+            rf"^[ \t]{{0,3}}{re.escape(fence_char)}{{{fence_len},}}[ \t]*$", line
+        ):
+            fence_char, fence_len = None, 0
+        out.append("")
+    return out
 
 
 def slugify(heading: str) -> str:
@@ -187,15 +217,7 @@ def headings_of(path: Path) -> set:
     # heading. Blanked, not dropped: dropping the lines entirely would pull
     # a paragraph and a later `===`/`---` into false adjacency across a
     # removed fence, misdetecting a Setext heading that was never there.
-    lines = text.splitlines()
-    out, in_fence = [], False
-    for line in lines:
-        if FENCE_RE.match(line.strip()):
-            in_fence = not in_fence
-            out.append("")
-            continue
-        out.append("" if in_fence else line)
-    body = "\n".join(out)
+    body = "\n".join(mask_fenced_lines(text.splitlines()))
 
     # ATX and Setext headings interleaved, in document order — duplicate-
     # slug numbering (the `-1`, `-2` suffix GitHub appends) depends on the
@@ -218,26 +240,16 @@ CODE_SPAN_RE = re.compile(r"(`+).*?\1")
 
 
 def strip_code_spans_and_fences(text: str) -> str:
-    lines = text.splitlines()
-    out, in_fence = [], False
-    for line in lines:
-        if FENCE_RE.match(line.strip()):
-            in_fence = not in_fence
-            out.append("")
-            continue
-        if in_fence:
-            out.append("")
-            continue
-        # Inline code spans (`` `code` ``) commonly hold regex character
-        # classes, JSON paths, or Rust slice syntax — e.g. `[A-Za-z0-9_-]`
-        # or `["execution"]["id"]` — which look exactly like a markdown
-        # reference-style link (`[a][b]`) to a regex with no concept of
-        # code spans. Strip these BEFORE the link/reference regexes run, or
-        # every such snippet in the corpus reports as an "undefined
-        # reference" false positive (found in review: docs/shipped-work.md
-        # has several).
-        out.append(CODE_SPAN_RE.sub("", line))
-    return "\n".join(out)
+    # Inline code spans (`` `code` ``) commonly hold regex character
+    # classes, JSON paths, or Rust slice syntax — e.g. `[A-Za-z0-9_-]`
+    # or `["execution"]["id"]` — which look exactly like a markdown
+    # reference-style link (`[a][b]`) to a regex with no concept of
+    # code spans. Strip these BEFORE the link/reference regexes run, or
+    # every such snippet in the corpus reports as an "undefined
+    # reference" false positive (found in review: docs/shipped-work.md
+    # has several).
+    lines = mask_fenced_lines(text.splitlines())
+    return "\n".join(CODE_SPAN_RE.sub("", line) for line in lines)
 
 
 def is_external_or_special(target: str) -> bool:
@@ -261,7 +273,7 @@ def extract_link_targets(text: str):
     defs = {}
 
     def collect_def(m):
-        defs[m.group(1).strip().lower()] = m.group(2)
+        defs[m.group(1).strip().lower()] = unwrap_angle_dest(m.group(2))
         return ""  # remove the definition line so it can't also match as prose
 
     text = REF_DEF_RE.sub(collect_def, text)
