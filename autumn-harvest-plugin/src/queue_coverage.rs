@@ -85,11 +85,15 @@ use crate::shard_fanout::{self, FanoutStatus, ShardObservation};
 // reimplementing it. The `queue_coverage` handler itself now calls
 // `crate::strict_query::decode_or_queue_coverage_bad_request` directly, and
 // this module's own doc comments reference the strict decoder by its full
-// path -- the only remaining user of a bare `parse_raw_query_pairs_strict`
-// name in this module is the integration test below, so it's imported
-// test-only rather than as a module-wide (let alone `pub`) re-export.
-#[cfg(test)]
-use crate::strict_query::parse_raw_query_pairs_strict;
+// path, so nothing in THIS crate needs the re-export below any more.
+//
+// It stays `pub` anyway (Codex review, PR #1334): `autumn-harvest-plugin` is
+// a published library crate, and `parse_raw_query_pairs_strict`/
+// `InvalidQueryEncoding` were already public at this path when issue #774
+// shipped -- dropping them would be a source-breaking change for any
+// external crate that imported `autumn_harvest_plugin::queue_coverage::
+// parse_raw_query_pairs_strict` directly, not merely internal dead code.
+pub use crate::strict_query::{InvalidQueryEncoding, parse_raw_query_pairs_strict};
 
 /// Query string accepted by `GET /admin/queue-coverage`.
 #[derive(Debug, Clone, Default, Deserialize)]
