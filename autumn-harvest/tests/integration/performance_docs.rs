@@ -585,6 +585,90 @@ fn the_paused_rows_delta_is_not_attributed_to_the_predicate() {
     }
 }
 
+/// The sticky-routing `CASE` key is *sufficient* to force `Seq Scan` + `Sort`,
+/// but issue #1177 shows it is not *necessary*: with the `CASE` removed
+/// entirely from `ORDER BY` and `idx_harvest_tq_poll` forced via planner
+/// hints, adding any single one of the query's other residual `WHERE`
+/// predicates — including several with zero actual selectivity —
+/// independently reproduces the identical collapse.
+///
+/// Read on its own, [the plan](#the-plan)'s original wording ("the claim
+/// query's `ORDER BY` leads with a non-indexable `CASE` expression, so
+/// `idx_harvest_tq_poll` cannot serve the ordering") invites the natural next
+/// step of "drop the `CASE`, get the cheap plan back". Issue #1177 exists
+/// because that reading does not survive a reproduction. This pins the
+/// correction so the CASE-is-sufficient reading cannot silently return.
+#[test]
+fn the_case_key_is_not_published_as_sufficient_to_restore_the_cheap_plan() {
+    let doc = read_performance_doc();
+
+    assert!(
+        doc.contains("## Any residual predicate defeats sort-elision (issue #1177)"),
+        "docs/performance.md must keep the section documenting that any one \
+         of the claim query's residual `WHERE` predicates independently \
+         defeats sort-elision and `LIMIT` pushdown, not only the sticky \
+         `CASE` key. Without it, [the plan](#the-plan) reads as though \
+         fixing the `CASE` key alone would restore the cheap index-ordered \
+         plan."
+    );
+    assert!(
+        doc.contains("Fixing that key would not be sufficient on its own"),
+        "the TL;DR must state up front that fixing the `CASE` sort key alone \
+         would not restore the cheap plan — any other residual predicate \
+         independently defeats sort-elision too (issue #1177)."
+    );
+    assert!(
+        doc.contains("Follow-up (issue #1177)"),
+        "[the plan](#the-plan) section must carry a follow-up callout, in \
+         the same style as the issue #619 callout beside it, pointing readers \
+         at the #1177 correction before they walk away with the CASE-only \
+         reading."
+    );
+
+    // Phrases that would assert the CASE key is the sole/sufficient fix target.
+    for banned in [
+        "dropping the CASE key restores",
+        "removing the CASE key restores",
+        "fixing the sort key restores the cheap plan",
+        "indexing the sticky columns would restore",
+    ] {
+        assert!(
+            !asserted_in_own_voice(&doc, banned),
+            "docs/performance.md says \"{banned}\", which reads as though the \
+             `CASE` key is the sole obstacle to the cheap plan. Issue #1177 \
+             shows any one of the other residual `WHERE` predicates \
+             independently defeats sort-elision too, `CASE` or no `CASE`."
+        );
+    }
+}
+
+/// The "Known limitations" bullet for `schedule_to_close`/sessions/sticky
+/// routing called them "cheap inline column tests" on the strength of never
+/// having measured them. Issue #1177 measured them — each independently
+/// defeats sort-elision regardless of the value it is tested against — so
+/// "cheap" was never an established finding, and the bullet must not keep
+/// asserting it.
+#[test]
+fn known_limitations_no_longer_calls_the_unmeasured_predicates_cheap() {
+    let doc = read_performance_doc();
+
+    assert!(
+        !asserted_in_own_voice(&doc, "cheap inline column tests"),
+        "docs/performance.md's Known limitations section still calls the \
+         `schedule_to_close`/session/sticky-routing predicates \"cheap inline \
+         column tests\" in its own voice. Issue #1177 measured them: each \
+         independently defeats sort-elision regardless of the value it is \
+         tested against, so they were never cheap — they were untested."
+    );
+    assert!(
+        doc.contains("not cheap. Issue #1177 measured these"),
+        "the Known limitations bullet for `schedule_to_close` (#378), worker \
+         sessions (#606) and sticky routing (#235) must state that issue \
+         #1177 measured them and found each independently sufficient to \
+         collapse the plan, replacing the retracted \"cheap\" framing."
+    );
+}
+
 /// These guards must actually execute on a docs-only pull request.
 ///
 /// The whole point of this file is to catch prose that drifts from the tables
