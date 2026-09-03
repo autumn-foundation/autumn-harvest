@@ -270,7 +270,10 @@ pub enum QueryReplayOutcome {
 ///   every replay (the guard reconstructs from the recorded `MutexGranted`
 ///   anchor), so a mutex-holding workflow that completes/continues with the
 ///   guard dropped must NOT be flagged as "new commands emitted beyond recorded
-///   history" on the strict/canary replay path.
+///   history" on the strict replay path. (Issue #1175: canary replay's
+///   completing path doesn't call this function at all any more, so the
+///   question doesn't arise there — every command past the frontier is
+///   tolerated, bookkeeping or not.)
 ///
 /// This is the **single source of truth** for two callers that must agree, so
 /// the command classification is never re-enumerated by hand:
@@ -1494,15 +1497,13 @@ pub(crate) async fn run_workflow_canary(
                             unhandled_signals: std::collections::BTreeMap::new(),
                         }
                     } else {
-                        // Every execution this function replays is by definition
-                        // non-terminal, so reaching the end of the workflow function
-                        // with recorded history fully consumed is always a legitimate
-                        // outcome here — never a stricter case than the sibling
-                        // `Err(_elapsed)` (suspended) arm below, which tolerates the
-                        // same frontier by checking only
-                        // `history_has_unconsumed_events()` before returning
-                        // `Suspended` with its drained commands. Two situations reach
-                        // this arm:
+                        // Reaching the end of the workflow function with recorded
+                        // history fully consumed is always a legitimate outcome here
+                        // — never a stricter case than the sibling `Err(_elapsed)`
+                        // (suspended) arm below, which tolerates the same frontier by
+                        // checking only `history_has_unconsumed_events()` before
+                        // returning `Suspended` with its drained commands. Two
+                        // situations reach this arm:
                         //
                         // - Issue #952: history sealed by a terminal `WorkflowFailed`
                         //   (`ctx.at_terminal_failure_frontier()`). A build that FIXED

@@ -12,10 +12,10 @@ workflow that consumed all recorded history, read the wall clock, and then
 returned `Ok` (rather than parking on another activity) was reported as
 `0 clean, 1 diverged` on completely unchanged code.
 
-Every execution `run_workflow_canary` replays is by definition non-terminal,
-so reaching the end of the workflow function is exactly as legitimate an
-outcome as parking on the next await point — the candidate build is making
-forward progress either way. The completing-path rejection is dropped; that
+Reaching the end of the workflow function with recorded history fully
+consumed is exactly as legitimate an outcome here as parking on the next
+await point — the candidate build is making forward progress either way,
+whether it happens to return or await next. The completing-path rejection is dropped; that
 arm now falls into the same `else` branch that already returns `Completed`
 for the issue #952 `at_terminal_failure_frontier()` case (the two produced
 an identical `WorkflowOutcome::Completed` once the rejection was removed, so
@@ -44,8 +44,12 @@ return `Ok` — reproduces `0 clean, 1 diverged` before the fix, `1 clean` after
 and its control, `a_completing_run_with_a_mismatched_activity_is_still_drift`
 (a handler that replays a different activity name than recorded still exits
 non-zero, proving the relaxation doesn't swallow real divergence). Both run
-through `replay_bundle`, the same path all three consumers share. The
-existing `strict_replay_still_rejects_a_builtin_side_effect_past_end_of_history`
-continues to cover the retained strict-mode rejection. Full crate suite green:
-2328 lib unit tests, 1851 integration tests (including all 78
-`replay_drift_tests`), `cargo clippy --all-targets` clean.
+through `replay_bundle`, the same path all three consumers share (`replay_bundle`,
+`WorkflowReplayer::run_canary`, `replay_diagnosis` all resolve to the same
+`replay_canary_snapshot_effective` → `run_workflow_canary` call). A new
+`strict_replay_still_rejects_a_completing_run_with_a_builtin_side_effect_past_end_of_history`
+pairs with the pre-existing `strict_replay_still_rejects_a_builtin_side_effect_past_end_of_history`
+(the parking shape) to confirm strict mode's rejection survives unchanged for
+the completing shape too. Full crate suite green: 2328 lib unit tests, 1852
+integration tests (including all 79 `replay_drift_tests`), `cargo clippy
+--all-targets` clean.

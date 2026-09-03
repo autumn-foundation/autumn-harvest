@@ -3754,3 +3754,52 @@ async fn strict_replay_still_rejects_a_builtin_side_effect_past_end_of_history()
          read guard), not merely as parking on step_two: {detail}"
     );
 }
+
+/// The completing-shape counterpart of the test above: strict replay must
+/// still reject a run that emits a built-in side effect past the end of
+/// recorded history even when the workflow *completes* afterward rather than
+/// parking on a further activity.
+///
+/// `workflow_system_now_then_complete` consumes only the recorded history and
+/// returns `Ok` — nothing to park on. Note the rejection here is still
+/// classified as `SideEffectDrift` (the built-in's own deferred
+/// non-determinism error, `ctx.take_deferred_nd_error()`, fires ahead of the
+/// `Ok(Ok(output))` arm's own "new commands emitted beyond recorded history"
+/// completing-path check — the same as the parking test above): a built-in
+/// read is caught before it ever reaches that later check, whether the
+/// workflow goes on to park or to complete. That later check — verified by
+/// code-review to be byte-identical to its pre-#1175 form in
+/// `run_strict_with_ctx` — remains reachable for a non-built-in significant
+/// command; this test's job is only to confirm the built-in guard survives
+/// completing, not to force that specific later branch.
+#[tokio::test]
+async fn strict_replay_still_rejects_a_completing_run_with_a_builtin_side_effect_past_end_of_history()
+ {
+    let dir = tempfile::tempdir().unwrap();
+    write(
+        dir.path(),
+        "a.json",
+        &in_flight_at_frontier_snapshot_json("wf"),
+    );
+
+    let report = ReplayVerifier::new()
+        .register_fn("wf", workflow_system_now_then_complete as WorkflowHandlerFn)
+        .verify_dir(dir.path())
+        .await;
+
+    assert_eq!(
+        report.succeeded, 0,
+        "strict replay must still reject a completing run that emits a built-in \
+         side effect past end of history: {report:?}"
+    );
+    assert_eq!(
+        report.failed, 1,
+        "expected the strict rejection: {report:?}"
+    );
+    let detail = format!("{:?}", report.results);
+    assert!(
+        detail.contains("SideEffectDrift"),
+        "the strict rejection must be classified as side-effect drift, exactly like \
+         the parking shape above — completing must not carve out an exception: {detail}"
+    );
+}
