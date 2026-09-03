@@ -436,6 +436,16 @@ def main():
                 resolved = (src.parent / path_part).resolve()
 
             if path_part != "":
+                if not resolved.is_relative_to(REPO_ROOT):
+                    # A `../`-heavy target that walks out of the checkout
+                    # (`../../../../etc/passwd`) can coincidentally exist on
+                    # the machine running this script (any Linux box has an
+                    # `/etc/passwd`) even though GitHub can never resolve it
+                    # to anything — it isn't a path in this repository. Flag
+                    # it before the exists() check below would otherwise
+                    # trust that coincidence and call it fine.
+                    broken.append((src, target, "escapes repository root"))
+                    continue
                 if not resolved.exists():
                     broken.append((src, target, "missing file"))
                     continue
