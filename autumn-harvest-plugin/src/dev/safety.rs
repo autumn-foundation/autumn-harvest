@@ -37,6 +37,8 @@ use std::fmt;
 use std::net::IpAddr;
 use std::str::FromStr as _;
 
+use super::dsn;
+
 /// Verdict for one candidate storage DSN.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
@@ -190,14 +192,12 @@ pub fn classify_database_url(dsn: &str) -> DatabaseSafety {
         });
     }
 
-    // TLS is checked textually FIRST, before the client parser gets a look.
-    // `tokio_postgres` models only `disable`/`prefer`/`require`, so
-    // `verify-ca` and `verify-full` — the two strongest signals that this is a
-    // remote managed database — would otherwise arrive as an opaque parse
+    // TLS is checked from the DSN's own text FIRST, before the client parser
+    // gets a look. `tokio_postgres` models only `disable`/`prefer`/`require`,
+    // so `verify-ca` and `verify-full` — the two strongest signals that this is
+    // a remote managed database — would otherwise arrive as an opaque parse
     // error rather than as the specific thing they are.
-    if let Some(mode) = textual_sslmode(trimmed)
-        && TLS_REQUIRING_SSLMODES.contains(&mode.as_str())
-    {
+    if let Some(mode) = tls_requiring_sslmode(trimmed) {
         return DatabaseSafety::Refused(RefusalReason::TlsRequired { sslmode: mode });
     }
 
@@ -280,17 +280,47 @@ fn refuse_non_local_host(name: &str) -> Option<RefusalReason> {
     })
 }
 
-/// The `sslmode` as literally written, in either DSN form.
+/// The first TLS-demanding `sslmode` a DSN spells out, read the way the client
+/// reads it.
+///
+/// **Syntax-aware, not positional.** This was a bare `dsn.find("sslmode=")`,
+/// which has no idea whether it landed on a key or on the inside of a value, so
+/// any DSN merely *containing* the text was refused as TLS-requiring — a legal
+/// loopback `password=\'sslmode=require\'` among them (issue #1286). Which
+/// syntax a DSN is in is decided first, by the same prefix test
+/// `Config::from_str` uses, and then only a real top-level `sslmode` key
+/// counts: an option of a keyword/value string, or a query parameter of a URI.
+///
+/// Keys are matched case-insensitively and, in a URI, after percent-decoding —
+/// wider than the client, which would reject those spellings outright. Erring
+/// wide only trades one refusal for a better-named one; erring narrow would
+/// lose a TLS demand the client cannot name at all.
+///
+/// **Every** `sslmode` occurrence is considered, not the last one the client
+/// would keep. A DSN that says `verify-full` anywhere is one `Config::from_str`
+/// refuses anyway, so naming it costs nothing and stays on the failing-closed
+/// side of a duplicated key.
 ///
 /// Only ever used to refuse *more* than the client parser would, so a miss is
-/// safe: the authoritative `get_ssl_mode()` check above is the backstop.
-fn textual_sslmode(dsn: &str) -> Option<String> {
-    let at = dsn.find("sslmode=")? + "sslmode=".len();
-    let value: String = dsn[at..]
-        .chars()
-        .take_while(|ch| !ch.is_whitespace() && *ch != '&' && *ch != '\'')
-        .collect();
-    (!value.is_empty()).then(|| value.to_ascii_lowercase())
+/// safe: the authoritative `get_ssl_mode()` check in
+/// [`classify_database_url`] is the backstop, and it sees the spellings this
+/// does not.
+fn tls_requiring_sslmode(dsn: &str) -> Option<String> {
+    let mut modes: Box<dyn Iterator<Item = String>> = if dsn::is_uri_dsn(dsn) {
+        Box::new(
+            dsn::uri_query_parameters(dsn)
+                .filter(|(key, _)| key.eq_ignore_ascii_case("sslmode"))
+                .map(|(_, value)| value.to_ascii_lowercase()),
+        )
+    } else {
+        Box::new(
+            dsn::keyword_options(dsn)
+                .into_iter()
+                .filter(|option| option.key.eq_ignore_ascii_case("sslmode"))
+                .map(|option| option.value.to_ascii_lowercase()),
+        )
+    };
+    modes.find(|mode| TLS_REQUIRING_SSLMODES.contains(&mode.as_str()))
 }
 
 /// The segment of `value` that reads as a production environment, if any.

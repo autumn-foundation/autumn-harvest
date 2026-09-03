@@ -396,7 +396,7 @@ fn postmaster_is_the_recorded_one(record: &SessionRecord, pid: u32) -> bool {
 /// tokenless record "because it derives the pid from the data directory itself
 /// rather than trusting the record". That is wrong, and stating it stopped the
 /// gap being noticed. `pg_ctl stop` reads `postmaster.pid`, which a `SIGKILL`
-/// leaves **stale** — PostgreSQL only removes it on a clean shutdown — then
+/// leaves **stale** — `PostgreSQL` only removes it on a clean shutdown — then
 /// checks `kill(pid, 0)` and signals. A reused pid passes that liveness check
 /// and nothing there verifies identity, so `pg_ctl` trusts a stale pid file
 /// exactly as much as this code would have trusted a stale record. The liveness

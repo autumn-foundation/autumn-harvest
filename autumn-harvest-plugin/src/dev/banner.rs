@@ -12,6 +12,8 @@
 use std::fmt::Write as _;
 use std::path::PathBuf;
 
+use super::dsn::{self, percent_decoded};
+
 /// Where the runtime's storage came from, which is also what may be promised
 /// about its teardown.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -176,7 +178,7 @@ pub fn render_banner(inputs: &BannerInputs) -> String {
 /// about what the string means.
 #[must_use]
 pub fn redact_dsn(dsn: &str) -> String {
-    if !is_uri_dsn(dsn) {
+    if !dsn::is_uri_dsn(dsn) {
         // Keyword/value: no query string exists to separate, and the scanner
         // has to see the whole string to consume quoted values whole.
         return redact_keyword_value(dsn);
@@ -190,18 +192,6 @@ pub fn redact_dsn(dsn: &str) -> String {
         Some(query) => format!("{redacted_base}?{}", redact_query_password(query)),
         None => redacted_base,
     }
-}
-
-/// Whether libpq — and `tokio_postgres::Config::from_str` — would read this as
-/// a URI rather than a keyword/value string.
-///
-/// The test is the literal prefix, case-sensitively, and nothing else: that is
-/// the client's own rule, and matching it exactly is the point. Leading
-/// whitespace is ignored for the *decision* only; the string itself is redacted
-/// unchanged so what the developer pastes still looks like what they typed.
-fn is_uri_dsn(dsn: &str) -> bool {
-    let trimmed = dsn.trim_start();
-    trimmed.starts_with("postgresql://") || trimmed.starts_with("postgres://")
 }
 
 /// Redact `user:password@host` in the pre-query part of a URI, or `password=`
@@ -250,109 +240,35 @@ fn redact_query_password(query: &str) -> String {
         .join("&")
 }
 
-/// Percent-decode a query key, for comparison only.
-///
-/// Deliberately not a general URI decoder and deliberately not applied to
-/// values: nothing in the DSN is re-encoded or reshaped by redaction, so a
-/// non-password parameter is emitted byte-for-byte as the developer typed it.
-/// A malformed escape is left alone, exactly as `percent_decode` leaves it.
-fn percent_decoded(key: &str) -> String {
-    let bytes = key.as_bytes();
-    let mut out = Vec::with_capacity(bytes.len());
-    let mut index = 0;
-    while index < bytes.len() {
-        if bytes[index] == b'%'
-            && index + 2 < bytes.len()
-            && let Some(high) = char::from(bytes[index + 1]).to_digit(16)
-            && let Some(low) = char::from(bytes[index + 2]).to_digit(16)
-        {
-            // Both digits are < 16, so the sum is < 256 and the cast is exact.
-            #[allow(clippy::cast_possible_truncation)]
-            out.push((high * 16 + low) as u8);
-            index += 3;
-        } else {
-            out.push(bytes[index]);
-            index += 1;
-        }
-    }
-    String::from_utf8_lossy(&out).into_owned()
-}
-
 /// Redact `password=` from a keyword/value connection string.
 ///
-/// A real scanner, not `split_whitespace()`. libpq allows a value to be
-/// single-quoted, and a quoted password may contain spaces: tokenizing
+/// Reads the string with the shared scanner ([`dsn::keyword_options`]) rather
+/// than tokenizing on whitespace, because libpq allows a value to be
+/// single-quoted and a quoted password may contain spaces: splitting
 /// `password='foo hunter2'` on whitespace redacts `password='foo` and leaves
 /// `hunter2'` standing in a string whose entire purpose is to be safe to paste
-/// into an issue. Quoted spans (with `\` escapes, which libpq honours inside
-/// them) are consumed whole.
+/// into an issue.
+///
+/// Rewriting is a splice over each password value's byte span, so every byte
+/// the scanner did not identify as a password value is emitted unchanged — the
+/// redaction cannot reshape a DSN it merely walked past.
 fn redact_keyword_value(dsn: &str) -> String {
-    let chars: Vec<char> = dsn.chars().collect();
     let mut out = String::with_capacity(dsn.len());
-    let mut i = 0;
-
-    while i < chars.len() {
-        if chars[i].is_whitespace() {
-            out.push(chars[i]);
-            i += 1;
+    let mut copied = 0;
+    for option in dsn::keyword_options(dsn) {
+        // Exactly the `password` keyword, as before this shared the scanner:
+        // everything else (host, dbname, user, port) is what makes one database
+        // tellable from another in a banner, and widening the match is a
+        // behaviour change that belongs in its own change, not in a refactor.
+        if !option.key.eq_ignore_ascii_case("password") {
             continue;
         }
-
-        // Key: up to `=` or whitespace.
-        let key_start = i;
-        while i < chars.len() && chars[i] != '=' && !chars[i].is_whitespace() {
-            i += 1;
-        }
-        let key: String = chars[key_start..i].iter().collect();
-        out.push_str(&key);
-
-        // libpq permits spaces around the `=`.
-        while i < chars.len() && chars[i].is_whitespace() {
-            out.push(chars[i]);
-            i += 1;
-        }
-        if i >= chars.len() || chars[i] != '=' {
-            // A bare token, already copied verbatim.
-            continue;
-        }
-        out.push('=');
-        i += 1;
-        while i < chars.len() && chars[i].is_whitespace() {
-            out.push(chars[i]);
-            i += 1;
-        }
-
-        // Value: a quoted span, or everything up to the next unescaped space.
-        let value_start = i;
-        if i < chars.len() && chars[i] == '\'' {
-            i += 1;
-            while i < chars.len() {
-                if chars[i] == '\\' && i + 1 < chars.len() {
-                    i += 2;
-                    continue;
-                }
-                if chars[i] == '\'' {
-                    i += 1;
-                    break;
-                }
-                i += 1;
-            }
-        } else {
-            while i < chars.len() && !chars[i].is_whitespace() {
-                if chars[i] == '\\' && i + 1 < chars.len() {
-                    i += 2;
-                    continue;
-                }
-                i += 1;
-            }
-        }
-
-        if key.eq_ignore_ascii_case("password") {
-            out.push_str("***");
-        } else {
-            out.extend(chars[value_start..i].iter());
-        }
+        // Options come back in order with non-overlapping spans, so `copied`
+        // only ever moves forward.
+        out.push_str(&dsn[copied..option.value_span.start]);
+        out.push_str("***");
+        copied = option.value_span.end;
     }
-
+    out.push_str(&dsn[copied..]);
     out
 }

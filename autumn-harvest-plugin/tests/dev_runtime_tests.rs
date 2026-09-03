@@ -209,12 +209,18 @@ fn classify_still_refuses_a_real_sslmode_key_in_keyword_value_syntax() {
     // strongest signals of a remote managed database — would otherwise arrive
     // as an opaque parse error rather than as the specific thing they are.
     for (dsn, expected) in [
-        ("host=localhost sslmode=verify-ca dbname=harvest_dev", "verify-ca"),
+        (
+            "host=localhost sslmode=verify-ca dbname=harvest_dev",
+            "verify-ca",
+        ),
         (
             "host=localhost sslmode=verify-full dbname=harvest_dev",
             "verify-full",
         ),
-        ("host=localhost sslmode=require dbname=harvest_dev", "require"),
+        (
+            "host=localhost sslmode=require dbname=harvest_dev",
+            "require",
+        ),
         // libpq permits whitespace around `=` and single-quoted values, and
         // both spellings are a real `sslmode` key.
         ("host=localhost sslmode = verify-full", "verify-full"),
