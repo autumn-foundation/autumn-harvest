@@ -4332,10 +4332,23 @@ async fn get_workflow_by_id(
 async fn get_workflow_result_by_id(
     Extension(api_state): Extension<HarvestApiState>,
     Path((workflow_name, workflow_id)): Path<(String, String)>,
-    Query(pairs): Query<Vec<(String, String)>>,
+    axum::extract::RawQuery(raw_query): axum::extract::RawQuery,
     headers: axum::http::HeaderMap,
     maybe_session: Option<Extension<Session>>,
 ) -> axum::response::Response {
+    // Issue #1151 review: reject a malformed query string up front, before
+    // the business-id resolution DB lookup below -- otherwise an unknown
+    // workflow_id or an unreachable shard would mask the malformed query
+    // behind a 404/503 instead of the documented 400, and the lookup would
+    // run for a request that was always going to be rejected. The delegate
+    // (`get_workflow_result`) decodes `raw_query` again once resolution
+    // succeeds; this is a cheap, side-effect-free re-parse, not a
+    // functional duplication.
+    if let Err(response) =
+        crate::strict_query::decode_or_autumn_error_response(raw_query.as_deref())
+    {
+        return response;
+    }
     let exec_id =
         match resolve_workflow_by_business_id(&api_state, &workflow_name, &workflow_id).await {
             Ok(id) => id,
@@ -4344,7 +4357,7 @@ async fn get_workflow_result_by_id(
     let mut resp = get_workflow_result(
         Extension(api_state),
         Path(exec_id.to_string()),
-        Query(pairs),
+        axum::extract::RawQuery(raw_query),
         headers,
         maybe_session,
     )
@@ -4379,8 +4392,15 @@ async fn get_workflow_stack_by_id(
 async fn list_workflow_children_by_id(
     Extension(api_state): Extension<HarvestApiState>,
     Path((workflow_name, workflow_id)): Path<(String, String)>,
-    Query(pairs): Query<Vec<(String, String)>>,
+    axum::extract::RawQuery(raw_query): axum::extract::RawQuery,
 ) -> axum::response::Response {
+    // Issue #1151 review: same early-reject rationale as
+    // `get_workflow_result_by_id` above.
+    if let Err(response) =
+        crate::strict_query::decode_or_autumn_error_response(raw_query.as_deref())
+    {
+        return response;
+    }
     let exec_id =
         match resolve_workflow_by_business_id(&api_state, &workflow_name, &workflow_id).await {
             Ok(id) => id,
@@ -4389,7 +4409,7 @@ async fn list_workflow_children_by_id(
     let out = list_workflow_children(
         Extension(api_state),
         Path(exec_id.to_string()),
-        Query(pairs),
+        axum::extract::RawQuery(raw_query),
     )
     .await;
     finalize_by_id(out, exec_id)
@@ -8298,32 +8318,21 @@ async fn shards_health(
 ///
 /// The one thing this endpoint *does* reject outright is a malformed query
 /// string: the raw query is parsed via
-/// [`crate::queue_coverage::parse_raw_query_pairs_strict`] rather than
-/// axum's built-in `Query<Vec<(String, String)>>` extractor, so an invalid
+/// [`crate::strict_query::parse_raw_query_pairs_strict`] rather than axum's
+/// built-in `Query<Vec<(String, String)>>` extractor, so an invalid
 /// percent-encoded byte sequence (e.g. `?queue_name=%FF`) returns the
 /// documented `400` JSON error instead of silently substituting `U+FFFD`
 /// and reporting a false-clean result for a scoped deploy gate (issue #774
-/// review).
+/// review; swept to every other raw-pairs route by issue #1151).
 async fn queue_coverage(
     Extension(api_state): Extension<HarvestApiState>,
     axum::extract::RawQuery(raw_query): axum::extract::RawQuery,
 ) -> axum::response::Response {
-    let pairs = match raw_query
-        .as_deref()
-        .map(crate::queue_coverage::parse_raw_query_pairs_strict)
-    {
-        None => Vec::new(),
-        Some(Ok(pairs)) => pairs,
-        Some(Err(crate::queue_coverage::InvalidQueryEncoding)) => {
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(serde_json::json!({
-                    "error": "malformed query string: invalid percent-encoded UTF-8"
-                })),
-            )
-                .into_response();
-        }
-    };
+    let pairs =
+        match crate::strict_query::decode_or_queue_coverage_bad_request(raw_query.as_deref()) {
+            Ok(pairs) => pairs,
+            Err(response) => return response,
+        };
     let query = crate::queue_coverage::QueueCoverageQuery::from_query_pairs(&pairs);
     Json(crate::queue_coverage::build_queue_coverage_report(&api_state, query).await)
         .into_response()
@@ -9196,9 +9205,10 @@ mod stack_state_tests {
 
 async fn list_workflows(
     Extension(api_state): Extension<HarvestApiState>,
-    Query(pairs): Query<Vec<(String, String)>>,
+    axum::extract::RawQuery(raw_query): axum::extract::RawQuery,
 ) -> Result<axum::response::Response, AutumnError> {
     use axum::response::IntoResponse as _;
+    let pairs = crate::strict_query::decode_or_autumn_error(raw_query.as_deref())?;
     let filters = parse_workflow_filters(&pairs)?;
     // PR #1139 review: `no_progress_minutes` (stalled-workflow discovery,
     // issue #486) and `history_bloat_min_events` (history-bloat discovery,
@@ -9462,8 +9472,9 @@ pub struct SummaryListPage {
 /// false` so a summary is never mistaken for a live execution.
 async fn list_workflow_summaries(
     Extension(api_state): Extension<HarvestApiState>,
-    Query(pairs): Query<Vec<(String, String)>>,
+    axum::extract::RawQuery(raw_query): axum::extract::RawQuery,
 ) -> Result<Json<SummaryListPage>, AutumnError> {
+    let pairs = crate::strict_query::decode_or_autumn_error(raw_query.as_deref())?;
     let filters = parse_summary_filters(&pairs)?;
     let (summaries, next_cursor) = load_summaries_from_shards(&api_state, &filters).await?;
     let items: Vec<SummaryListItem> = summaries
@@ -9560,8 +9571,9 @@ async fn load_summaries_from_shards(
 /// is named in `unavailable_shards` rather than failing the call wholesale.
 async fn count_workflows(
     Extension(api_state): Extension<HarvestApiState>,
-    Query(pairs): Query<Vec<(String, String)>>,
+    axum::extract::RawQuery(raw_query): axum::extract::RawQuery,
 ) -> Result<Json<WorkflowCountResponse>, AutumnError> {
+    let pairs = crate::strict_query::decode_or_autumn_error(raw_query.as_deref())?;
     let params = WorkflowCountParams::from_query_pairs(&pairs, KNOWN_WORKFLOW_STATES)
         .map_err(AutumnError::bad_request_msg)?;
     Ok(Json(
@@ -9579,8 +9591,9 @@ async fn count_workflows(
 /// `unavailable_shards` rather than failing the call wholesale.
 async fn usage_report(
     Extension(api_state): Extension<HarvestApiState>,
-    Query(pairs): Query<Vec<(String, String)>>,
+    axum::extract::RawQuery(raw_query): axum::extract::RawQuery,
 ) -> Result<Json<UsageResponse>, AutumnError> {
+    let pairs = crate::strict_query::decode_or_autumn_error(raw_query.as_deref())?;
     let ceiling = api_state.usage_window_ceiling();
     let params = UsageParams::from_query_pairs(&pairs, chrono::Utc::now(), ceiling)
         .map_err(AutumnError::bad_request_msg)?;
@@ -10345,10 +10358,14 @@ fn terminal_workflow_states() -> Vec<String> {
 async fn export_workflow_history(
     Extension(api_state): Extension<HarvestApiState>,
     Path(id): Path<String>,
-    Query(pairs): Query<Vec<(String, String)>>,
+    axum::extract::RawQuery(raw_query): axum::extract::RawQuery,
     headers: axum::http::HeaderMap,
     maybe_session: Option<Extension<Session>>,
 ) -> axum::response::Response {
+    let pairs = match crate::strict_query::decode_or_autumn_error_response(raw_query.as_deref()) {
+        Ok(pairs) => pairs,
+        Err(response) => return response,
+    };
     let exec_id = match parse_execution_id(&id) {
         Ok(id) => id,
         Err(error) => return error.into_response(),
@@ -10423,10 +10440,14 @@ async fn export_workflow_history(
 
 async fn export_workflow_histories(
     Extension(api_state): Extension<HarvestApiState>,
-    Query(pairs): Query<Vec<(String, String)>>,
+    axum::extract::RawQuery(raw_query): axum::extract::RawQuery,
     headers: axum::http::HeaderMap,
     maybe_session: Option<Extension<Session>>,
 ) -> axum::response::Response {
+    let pairs = match crate::strict_query::decode_or_autumn_error_response(raw_query.as_deref()) {
+        Ok(pairs) => pairs,
+        Err(response) => return response,
+    };
     let query = match parse_history_batch_export_query(&pairs) {
         Ok(query) => query,
         Err(error) => return error.into_response(),
@@ -10477,10 +10498,14 @@ async fn export_workflow_histories(
 /// no state transition, no event appended, no task claimed.
 async fn export_workflow_history_sample(
     Extension(api_state): Extension<HarvestApiState>,
-    Query(pairs): Query<Vec<(String, String)>>,
+    axum::extract::RawQuery(raw_query): axum::extract::RawQuery,
     headers: axum::http::HeaderMap,
     maybe_session: Option<Extension<Session>>,
 ) -> axum::response::Response {
+    let pairs = match crate::strict_query::decode_or_autumn_error_response(raw_query.as_deref()) {
+        Ok(pairs) => pairs,
+        Err(response) => return response,
+    };
     let query = match parse_history_sample_export_query(&pairs) {
         Ok(query) => query,
         Err(error) => return error.into_response(),
@@ -10726,10 +10751,11 @@ fn parse_workflow_history_query(
 async fn get_workflow_history(
     Extension(api_state): Extension<HarvestApiState>,
     Path(id): Path<String>,
-    Query(pairs): Query<Vec<(String, String)>>,
+    axum::extract::RawQuery(raw_query): axum::extract::RawQuery,
     headers: axum::http::HeaderMap,
     maybe_session: Option<Extension<Session>>,
 ) -> Result<Json<WorkflowHistoryPage>, AutumnError> {
+    let pairs = crate::strict_query::decode_or_autumn_error(raw_query.as_deref())?;
     let exec_id = parse_execution_id(&id)?;
     let (limit, after_id, event_types) = parse_workflow_history_query(&pairs)?;
     // Read-path payload decoding (issue #608): decode-only-when-admin.
@@ -10824,10 +10850,14 @@ async fn get_workflow_history(
 async fn get_workflow_result(
     Extension(api_state): Extension<HarvestApiState>,
     Path(id): Path<String>,
-    Query(pairs): Query<Vec<(String, String)>>,
+    axum::extract::RawQuery(raw_query): axum::extract::RawQuery,
     headers: axum::http::HeaderMap,
     maybe_session: Option<Extension<Session>>,
 ) -> axum::response::Response {
+    let pairs = match crate::strict_query::decode_or_autumn_error_response(raw_query.as_deref()) {
+        Ok(pairs) => pairs,
+        Err(response) => return response,
+    };
     let exec_id = match parse_execution_id(&id) {
         Ok(id) => id,
         Err(error) => return error.into_response(),
@@ -11106,8 +11136,9 @@ fn workflow_result_pending_response() -> axum::response::Response {
 async fn list_workflow_children(
     Extension(api_state): Extension<HarvestApiState>,
     Path(id): Path<String>,
-    Query(pairs): Query<Vec<(String, String)>>,
+    axum::extract::RawQuery(raw_query): axum::extract::RawQuery,
 ) -> Result<Json<WorkflowChildrenResponse>, AutumnError> {
+    let pairs = crate::strict_query::decode_or_autumn_error(raw_query.as_deref())?;
     let exec_id = parse_execution_id(&id)?;
     let filters = parse_workflow_children_filters(&pairs)?;
 
@@ -11357,8 +11388,9 @@ async fn load_workflow_children_tree_from_shards(
 async fn get_workflow_tree(
     Extension(api_state): Extension<HarvestApiState>,
     Path(id): Path<String>,
-    Query(pairs): Query<Vec<(String, String)>>,
+    axum::extract::RawQuery(raw_query): axum::extract::RawQuery,
 ) -> Result<axum::response::Response, AutumnError> {
+    let pairs = crate::strict_query::decode_or_autumn_error(raw_query.as_deref())?;
     let exec_id = parse_execution_id(&id)?;
     let params = parse_lineage_query(&pairs)?;
 
@@ -11952,8 +11984,9 @@ impl From<external_task::ExternalHandoffRow> for ExternalHandoffResponse {
 
 async fn list_external_handoffs(
     Extension(api_state): Extension<HarvestApiState>,
-    Query(pairs): Query<Vec<(String, String)>>,
+    axum::extract::RawQuery(raw_query): axum::extract::RawQuery,
 ) -> Result<Json<ExternalHandoffListResponse>, AutumnError> {
+    let pairs = crate::strict_query::decode_or_autumn_error(raw_query.as_deref())?;
     let filters = parse_external_handoff_filters(&pairs)?;
     let limit = filters.limit;
     let (mut rows, coverage) = load_external_handoffs_from_shards(&api_state, &filters).await?;
@@ -12399,8 +12432,9 @@ fn parse_workflow_logs_query(
 async fn get_workflow_logs(
     Extension(api_state): Extension<HarvestApiState>,
     Path(id): Path<String>,
-    Query(pairs): Query<Vec<(String, String)>>,
+    axum::extract::RawQuery(raw_query): axum::extract::RawQuery,
 ) -> Result<Json<WorkflowLogsResponse>, AutumnError> {
+    let pairs = crate::strict_query::decode_or_autumn_error(raw_query.as_deref())?;
     let exec_id = parse_execution_id(&id)?;
     let (limit, cursor, levels, since) = parse_workflow_logs_query(&pairs)?;
 
@@ -25810,8 +25844,9 @@ async fn observe_schedule_runs_shard(
 async fn list_schedule_runs_handler(
     Extension(api_state): Extension<HarvestApiState>,
     Path(id_str): Path<String>,
-    Query(pairs): Query<Vec<(String, String)>>,
+    axum::extract::RawQuery(raw_query): axum::extract::RawQuery,
 ) -> Result<Json<schedule_runs::ScheduleRunsResponse>, AutumnError> {
+    let pairs = crate::strict_query::decode_or_autumn_error(raw_query.as_deref())?;
     let schedule_id = parse_uuid(&id_str, "schedule id")?;
     let params = schedule_runs::ScheduleRunsParams::from_query_pairs(&pairs, chrono::Utc::now())
         .map_err(AutumnError::bad_request_msg)?;
@@ -30916,8 +30951,9 @@ async fn list_dead_letters(
 /// on the happy path).
 async fn aggregate_dead_letters(
     Extension(api_state): Extension<HarvestApiState>,
-    Query(pairs): Query<Vec<(String, String)>>,
+    axum::extract::RawQuery(raw_query): axum::extract::RawQuery,
 ) -> Result<Json<Value>, AutumnError> {
+    let pairs = crate::strict_query::decode_or_autumn_error(raw_query.as_deref())?;
     let params = dlq::DlqAggregateParams::from_query_pairs(&pairs, chrono::Utc::now())
         .map_err(AutumnError::bad_request_msg)?;
 
@@ -43280,8 +43316,9 @@ pub(crate) fn dedup_workers_by_freshest(rows: Vec<WorkerRow>) -> Vec<WorkerRow> 
 
 async fn list_workers_handler(
     Extension(api_state): Extension<HarvestApiState>,
-    Query(pairs): Query<Vec<(String, String)>>,
+    axum::extract::RawQuery(raw_query): axum::extract::RawQuery,
 ) -> Result<Json<Value>, AutumnError> {
+    let pairs = crate::strict_query::decode_or_autumn_error(raw_query.as_deref())?;
     let filters = parse_worker_filters_api(&pairs)?;
     let stale_threshold = api_state.worker_stale_threshold();
 
@@ -43785,8 +43822,9 @@ async fn request_drain_handler(
 
 async fn drain_preview_handler(
     Extension(api_state): Extension<HarvestApiState>,
-    Query(pairs): Query<Vec<(String, String)>>,
+    axum::extract::RawQuery(raw_query): axum::extract::RawQuery,
 ) -> Result<Json<Vec<DrainPreviewItem>>, AutumnError> {
+    let pairs = crate::strict_query::decode_or_autumn_error(raw_query.as_deref())?;
     let filters = parse_worker_filters_api(&pairs)?;
     let stale_threshold = api_state.worker_stale_threshold();
     let pool = api_state.storage_pool().map_err(map_error)?;
@@ -49724,7 +49762,7 @@ mod tests {
         let response = get_workflow_result(
             Extension(state),
             Path(exec_id.to_string()),
-            Query(Vec::new()),
+            axum::extract::RawQuery(None),
             axum::http::HeaderMap::new(),
             None,
         )

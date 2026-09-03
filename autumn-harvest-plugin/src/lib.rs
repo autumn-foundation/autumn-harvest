@@ -47,6 +47,12 @@ pub mod shard_fanout;
 pub mod shard_health;
 pub mod state;
 pub mod status_summary;
+/// Strict percent-decoding for raw HTTP query strings.
+///
+/// Shared by every management API route that filters on a raw `(key, value)`
+/// pair list (issue #1151, extracted from the issue #774 `queue-coverage`
+/// fix).
+pub mod strict_query;
 pub mod ui;
 pub mod usage;
 pub mod version_gate_retirement;
