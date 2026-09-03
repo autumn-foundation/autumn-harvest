@@ -601,6 +601,7 @@ fn the_paused_rows_delta_is_not_attributed_to_the_predicate() {
 #[test]
 fn the_case_key_is_not_published_as_sufficient_to_restore_the_cheap_plan() {
     let doc = read_performance_doc();
+    let flat = collapse_ws(&doc);
 
     assert!(
         doc.contains("## Any residual predicate defeats sort-elision (issue #1177)"),
@@ -612,13 +613,13 @@ fn the_case_key_is_not_published_as_sufficient_to_restore_the_cheap_plan() {
          plan."
     );
     assert!(
-        doc.contains("Fixing that key would not be sufficient on its own"),
+        flat.contains("Fixing that key would not be sufficient on its own"),
         "the TL;DR must state up front that fixing the `CASE` sort key alone \
          would not restore the cheap plan — any other residual predicate \
          independently defeats sort-elision too (issue #1177)."
     );
     assert!(
-        doc.contains("Follow-up (issue #1177)"),
+        flat.contains("Follow-up (issue #1177)"),
         "[the plan](#the-plan) section must carry a follow-up callout, in \
          the same style as the issue #619 callout beside it, pointing readers \
          at the #1177 correction before they walk away with the CASE-only \
@@ -631,9 +632,17 @@ fn the_case_key_is_not_published_as_sufficient_to_restore_the_cheap_plan() {
         "removing the CASE key restores",
         "fixing the sort key restores the cheap plan",
         "indexing the sticky columns would restore",
+        "dropping the CASE key is sufficient",
+        "removing the CASE key is sufficient",
+        "the CASE expression restores",
+        "the CASE expression alone restores",
+        "the cheap plan returns once the CASE",
+        "the cheap plan comes back once the CASE",
+        "get the cheap plan back",
+        "gets you back to the indexed plan",
     ] {
         assert!(
-            !asserted_in_own_voice(&doc, banned),
+            !asserted_in_own_voice(&flat, banned),
             "docs/performance.md says \"{banned}\", which reads as though the \
              `CASE` key is the sole obstacle to the cheap plan. Issue #1177 \
              shows any one of the other residual `WHERE` predicates \

@@ -1,4 +1,4 @@
-## Phase X.Y — Correct `docs/performance.md`'s claim-plan attribution: any residual predicate defeats sort-elision, not just the sticky CASE (issue #1177)
+## Docs — Correct `docs/performance.md`'s claim-plan attribution: any residual predicate defeats sort-elision, not just the sticky CASE (issue #1177)
 
 `docs/performance.md` (issue #786) measured `claim_task`'s superlinear
 backlog scaling and attributed it to one specific mechanism: the claim
