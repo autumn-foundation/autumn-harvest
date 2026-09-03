@@ -93,11 +93,26 @@ _LABEL = r"(?:[^\[\]]|\[[^\[\]]*\])*"
 # would be entirely invisible to this checker — silently exempt from ever
 # being reported broken. Same three-form set REF_DEF_RE already used below.
 _TITLE = r'(?:"[^"]*"|\'[^\']*\'|\([^)]*\))'
-LINK_RE = re.compile(rf"\[{_LABEL}\]\(([^)\s]+)(?:\s+{_TITLE})?\)")
+# CommonMark also allows an angle-bracketed destination — `[x](<a b.md>)` —
+# specifically so a path containing a space can be written at all (the bare
+# form `[^)\s]+` stops at the first space). Captured as one alternative
+# inside the same group; `unwrap_angle_dest` strips the brackets afterward.
+# Without this, `<management-api.md>` (brackets included) is what gets
+# resolved against the filesystem, which never exists — a real file falsely
+# reported missing — and a bracketed destination containing a space isn't
+# matched by the bare form at all, so it's silently skipped.
+_DEST = r"(<[^<>]*>|[^)\s]+)"
+LINK_RE = re.compile(rf"\[{_LABEL}\]\({_DEST}(?:\s+{_TITLE})?\)")
 # Bare image `![alt](src)`, checked independently so a *local* image's `src`
 # still gets a missing-file check even when the image is ALSO wrapped in an
 # outer link (and so consumed into LINK_RE's label, per above).
-IMAGE_RE = re.compile(rf"!\[[^\]]*\]\(([^)\s]+)(?:\s+{_TITLE})?\)")
+IMAGE_RE = re.compile(rf"!\[[^\]]*\]\({_DEST}(?:\s+{_TITLE})?\)")
+
+
+def unwrap_angle_dest(target: str) -> str:
+    if target.startswith("<") and target.endswith(">"):
+        return target[1:-1]
+    return target
 # Reference-style: `[text][ref]` / collapsed `[text][]` (ref == text).
 REF_USE_RE = re.compile(r"\[([^\]]*)\]\[([^\]]*)\]")
 # Bare shortcut reference `[ref]` — only counts if `ref` matches a real
@@ -120,7 +135,23 @@ REF_DEF_RE = re.compile(
 # Requiring column 0 misses all of those and reports every link into one as
 # a "missing anchor" false positive.
 HEADING_RE = re.compile(r"^[ \t]{0,3}(#{1,6})\s+(.+?)\s*#*$", re.MULTILINE)
-FENCE_RE = re.compile(r"^```")
+# Setext headings: a non-blank text line immediately followed (no blank
+# line between) by a line of only `=` (H1) or 2+ `-` (H2) — CommonMark's
+# other heading syntax, e.g.
+#     My title
+#     ========
+# Excludes a text line that looks like a list item, table row, or ATX
+# heading itself, to avoid misreading an ordinary `---` divider or table
+# separator as a heading underline for unrelated prose above it.
+SETEXT_RE = re.compile(
+    r"(?m)^(?!\s*$)(?!#)(?!\s*[-*+]\s)(?!\s*\|)([^\n]+)\n(?:=+|-{2,})[ \t]*$"
+)
+# CommonMark fenced code blocks may open with EITHER 3+ backticks OR 3+
+# tildes, not just backticks. A `~~~`-fenced example never toggles fence
+# mode under a backtick-only pattern, so a Markdown-*looking* link or
+# heading written inside it as sample text (not a real link) gets scanned
+# as if it were live corpus content.
+FENCE_RE = re.compile(r"^(?:```|~~~)")
 
 
 def slugify(heading: str) -> str:
@@ -151,20 +182,31 @@ def corpus_files():
 
 def headings_of(path: Path) -> set:
     text = path.read_text(encoding="utf-8", errors="replace")
-    # Drop fenced code blocks so a `#` comment inside a snippet isn't read
-    # as a heading.
+    # Blank out fenced code blocks so a `#` comment (or a divider line that
+    # would misread as a Setext underline) inside a snippet isn't read as a
+    # heading. Blanked, not dropped: dropping the lines entirely would pull
+    # a paragraph and a later `===`/`---` into false adjacency across a
+    # removed fence, misdetecting a Setext heading that was never there.
     lines = text.splitlines()
     out, in_fence = [], False
     for line in lines:
         if FENCE_RE.match(line.strip()):
             in_fence = not in_fence
+            out.append("")
             continue
-        if not in_fence:
-            out.append(line)
+        out.append("" if in_fence else line)
     body = "\n".join(out)
+
+    # ATX and Setext headings interleaved, in document order — duplicate-
+    # slug numbering (the `-1`, `-2` suffix GitHub appends) depends on the
+    # order headings actually appear in, not on which syntax found them.
+    matches = [(m.start(), m.group(2)) for m in HEADING_RE.finditer(body)]
+    matches += [(m.start(), m.group(1).strip()) for m in SETEXT_RE.finditer(body)]
+    matches.sort(key=lambda pair: pair[0])
+
     slugs = set()
     seen = {}
-    for _, title in HEADING_RE.findall(body):
+    for _, title in matches:
         base = slugify(title)
         n = seen.get(base, 0)
         slugs.add(base if n == 0 else f"{base}-{n}")
@@ -229,7 +271,7 @@ def extract_link_targets(text: str):
     consumed = []  # spans already claimed by inline/reference-style matches
 
     for m in LINK_RE.finditer(text):
-        targets.append(m.group(1))
+        targets.append(unwrap_angle_dest(m.group(1)))
         consumed.append(m.span())
 
     # Independent of the spans above: a *local* image's own `src` should
@@ -239,7 +281,7 @@ def extract_link_targets(text: str):
     # screenshot. No anchor is possible on an image target, so this only
     # ever contributes a "missing file" check, never "missing anchor".
     for m in IMAGE_RE.finditer(text):
-        targets.append(m.group(1))
+        targets.append(unwrap_angle_dest(m.group(1)))
 
     for m in REF_USE_RE.finditer(text):
         label, ref = m.group(1), m.group(2)
@@ -274,6 +316,9 @@ def main():
 
     files = corpus_files()
     file_set = set(files)
+    top_level_sources = {
+        REPO_ROOT / name for name in TOP_LEVEL_SOURCES if (REPO_ROOT / name).exists()
+    }
     heading_cache = {}
 
     def headings(p: Path) -> set:
@@ -361,7 +406,8 @@ def main():
     corpus_reachable = {
         p
         for p in files
-        if p.is_relative_to(REPO_ROOT / "docs") and not under_process_prefix(p)
+        if (p.is_relative_to(REPO_ROOT / "docs") or p in top_level_sources)
+        and not under_process_prefix(p)
     }
     worklist = list(corpus_reachable)
     while worklist:
