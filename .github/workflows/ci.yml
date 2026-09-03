@@ -618,11 +618,19 @@ jobs:
           # friendly: 0 = pass, 2 = warn, 1 = fail or a transport/API error.
           # Both 0 and 2 are accepted (a single-worker CI app can legitimately
           # warn); 1 is not, and is what a re-gated route would produce.
-          # `set -e` is deliberately NOT used here (this script runs under
-          # `set -uo pipefail` only), so `$?` is read directly.
+          #
+          # The `|| preflight_exit=$?` is load-bearing: this step declares no
+          # `shell:`, so GitHub runs it as `bash -e {0}` and the script's own
+          # `set -uo pipefail` adds `-u`/`pipefail` WITHOUT clearing that `-e`.
+          # A bare invocation would therefore abort the step on the warn (2)
+          # this check explicitly accepts, and would exit before the error
+          # message below could name a re-gated route. A command on the left of
+          # `||` is exempt from `-e`, so this reads the status under either
+          # shell mode.
+          preflight_exit=0
           cargo run -p autumn-harvest-cli -- \
-            --base-url http://localhost:3000/api/harvest preflight
-          preflight_exit=$?
+            --base-url http://localhost:3000/api/harvest preflight \
+            || preflight_exit=$?
           echo "harvest preflight exit=${preflight_exit}"
           if [ "${preflight_exit}" != "0" ] && [ "${preflight_exit}" != "2" ]; then
             echo "::error::harvest preflight exited ${preflight_exit}; README step 3 must pass (0) or warn (2), never fail"

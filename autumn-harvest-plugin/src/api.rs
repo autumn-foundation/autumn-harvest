@@ -5411,6 +5411,10 @@ pub(crate) async fn has_harvest_admin_access(
     //   - Callers with no established session only. A cookie-backed session is
     //     still judged by `admin_auth_session_key`, so an embedder running its
     //     own auth middleware in `dev` keeps exactly the gate it has today.
+    //     Read this as a compatibility bound, not a security barrier: a caller
+    //     is always free to simply omit its cookie. What keeps the posture safe
+    //     is the `dev`-only bound plus the network boundary, which is why the
+    //     startup warning says "do not expose this process beyond localhost".
     //   - An embedder-declared boundary still short-circuits above, and the
     //     scoped-token path (#942) short-circuits earlier still, in
     //     `require_harvest_admin`.

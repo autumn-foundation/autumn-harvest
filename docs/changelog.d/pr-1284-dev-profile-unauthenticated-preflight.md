@@ -57,8 +57,8 @@ it was. Both shapes are pinned by tests, and the second one is the point.
   string-matching a summary. The `dev`-profile summary now reads "admin API is
   reachable unauthenticated…" rather than "…boundary is optional".
 - Side effect, deliberate and documented: `has_harvest_admin_access` also drives
-  Vantage UI redaction, the describe-route filter and the high-impact route
-  guards, so the quickstart's **dashboard** admin pages work for the same reason
+  Vantage UI redaction, payload decode-on-read (`read_path_decoder`, #608) and
+  the high-impact route guards, so the quickstart's **dashboard** admin pages work for the same reason
   and by the same bound. That was a second instance of the same bug the issue did
   not name.
 

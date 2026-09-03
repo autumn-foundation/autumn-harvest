@@ -39,7 +39,7 @@ Implicit-but-binding (from the repo's own invariants, not the issue text):
 | AC | Requirement |
 |----|-------------|
 | AC8 | No existing security assertion regresses. `autumn-harvest-plugin/tests/security.rs` already pins the dev-profile session-key semantics (`eris_builtin_guard_does_not_accept_hard_coded_admin_id`, `eris_builtin_guard_honors_configured_session_key`) and the unauthenticated-blocked set. All must still pass unchanged. |
-| AC9 | `has_harvest_admin_access` is not only the `require_harvest_admin` gate — it also drives Vantage UI redaction (`ui.rs`), the describe-route filter, and the high-impact route guards in `api.rs`. The change's blast radius across all of those must be deliberate, not incidental. |
+| AC9 | `has_harvest_admin_access` is not only the `require_harvest_admin` gate — it also drives Vantage UI redaction (`ui.rs`), payload decode-on-read (`read_path_decoder`, #608) and the high-impact route guards in `api.rs`. The change's blast radius across all of those must be deliberate, not incidental. |
 | AC10 | The read-only operator role (#776) boundary is unaffected: it is a separate, opt-in `enforce_read_only_class` layer keyed off `CLASSIFIED_ROUTES`, and nothing here touches it. |
 
 ---
@@ -233,8 +233,14 @@ fragment.
 |-----------|--------|
 | `api.rs` `require_harvest_admin` | Admin routes (incl. `/admin/preflight`) reachable — **the fix**. |
 | `ui.rs:1392`, `ui.rs:1461` | Vantage dashboard admin pages and log panes render instead of `401` — same root cause, intended. |
-| `api.rs:5728` (describe-route filter) | Describe routes stop filtering as non-admin. |
-| `api.rs:16033`, `16508`, `18668`, `19768`, `20157`, `20828`, `41053` | High-impact route guards (terminate-if-running starts, bulk DLQ operations, payload decode-on-read, …) admit the local caller. |
+| `api.rs` `read_path_decoder` | Payload decode-on-read (#608): the local caller is treated as admin, so — *and only where the deployment already opted in via `decode_payloads_on_read`* — reads return decoded rather than stored (possibly ciphertext) payloads. |
+| `api.rs` `start_workflow` (both guards), `signal_with_start_workflow`, `update_with_start_workflow` | The `terminate_if_running` / terminate-existing start conflict guards admit the local caller. |
+| `api.rs` `batch_start_workflows`, `batch_reset_workflows` | Bulk start/reset operations admit the local caller. |
+| `api.rs` `stream_execution_events` | The event-stream guard admits the local caller. |
+
+Call sites are named by function rather than line number on purpose: this table
+ships in the same commit that inserts ~60 lines into `api.rs`, so any line
+numbers written here would be stale before the first reader ever opened it.
 
 All of these are `dev`-only and boundary-absent-only. In every other profile, and
 in any deployment that declares a boundary or presents an established session,
