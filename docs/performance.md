@@ -570,18 +570,34 @@ before applying `LIMIT 1`, rather than eliding the sort.
 
 Two separate, compounding effects are at work, not one:
 
-1. **Any residual `Filter` on an otherwise index-order-matching scan defeats
+1. **In this reproduction, every residual `Filter` tested defeats
    sort-elision and `LIMIT` pushdown**, independent of `FOR UPDATE` — shown
    directly by the forced-index diagnostic above for the sticky predicate,
    and consistent with (though not independently re-run as the same
-   diagnostic for) the other nine predicates' natural-planner results. The
-   sort-elision/limit-pushdown candidate plan is not generated at all once a
-   residual `Filter` sits on the scan; this is not a cost-based choice of a
-   worse plan over a better one the planner considered. With or without the
-   `CASE` key, this alone makes every claim O(backlog) in this fixture — the
-   mechanism inside the planner that treats a residual `Filter` as
-   disqualifying an otherwise pathkey-matching scan from sort-elision is not
-   independently derived here, only observed.
+   diagnostic for) the other nine predicates' natural-planner results. For
+   the sticky predicate, the sort-elision/limit-pushdown candidate plan is
+   not generated at all once its residual `Filter` sits on the scan; this is
+   not a cost-based choice of a worse plan over a better one the planner
+   considered.
+
+   **This is not a general Postgres rule, and this page does not claim it is
+   one.** `idx_harvest_tq_coverage_sample`'s own migration
+   (`20260718000000_harvest_queue_coverage_sample_index/up.sql`) documents
+   the opposite case in this same codebase: `sample_execution_ids`'s
+   `workflow_exec_id IS NOT NULL` filter is not itself index-satisfied, is
+   evaluated per candidate row during the same ordered walk, and the scan
+   *does* still stop early at `LIMIT 5` without a `Sort` node — for every
+   queue except a pathological one. Whatever distinguishes
+   `claim_task_query()`'s tested predicates from that case — `SubPlan`-bearing
+   filters (`EXISTS`, `jsonb_array_elements`) versus a plain scalar NULL
+   check, the forced-index diagnostic choosing a *parallel* index scan
+   (`Gather`/`Gather Merge` semantics differ from a serial scan), or
+   something else — is not established here. What issue #1177 establishes is
+   narrower and still load-bearing: for the specific query and predicates
+   tested, sort-elision does not survive adding any one of them; that is
+   demonstrably not a `CASE`-key-specific problem, but it is not shown to be
+   a universal one either. With or without the `CASE` key, this alone makes
+   every claim O(backlog) in this fixture.
 2. **`FOR UPDATE SKIP LOCKED` additionally disables the bounded Top-N sort**
    once (1) has already forced a `Sort` node to exist. Without `FOR UPDATE`,
    the same forced-index plan (again, the sticky-predicate diagnostic)
@@ -611,6 +627,17 @@ has since replaced it with a CTE-backed lookup. That specific predicate's
 contribution to the collapse has not been independently re-tested against
 the current query; the other nine are unaffected by that fix and remain as
 implemented today.
+
+**Untested scope: multiple queues.** The base query binds
+`queue_name = ANY($1)`; issue #1177's own text does not say how many queue
+names `$1` held during its reproduction (its fixture describes rows seeded
+into a single `default` queue). This page's own attribution-table scenarios
+default `Scenario.queues` to 4 (see
+[known limitations](#known-limitations)). A btree index scan *can*, in
+principle, still produce output in the index's overall order across a
+multi-value leading-column match without an extra `Sort` — whether that
+holds for `idx_harvest_tq_poll` specifically, and whether it changes
+anything about the ten-predicate finding above, has not been checked here.
 
 **What this means for the query as it stands today:** there is no realistic
 deployment shape that gets the cheap index-ordered plan back, because
