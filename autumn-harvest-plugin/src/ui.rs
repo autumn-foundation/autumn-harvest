@@ -1200,8 +1200,6 @@ async fn list_workflows_ui(
         state_filter.as_deref(),
         workflow_name_filter.as_deref(),
         search_attr_pair.as_ref(),
-        started_after,
-        started_before,
         &started_after_raw,
         started_after_error.as_deref(),
         &started_before_raw,
@@ -1219,7 +1217,10 @@ async fn list_workflows_ui(
 /// query) while `raw_display` echoes exactly what the operator typed and
 /// `error` carries a message to render next to the field — so a typo drops
 /// one filter instead of the whole page (see `list_workflows_ui`).
-fn parse_started_bound(raw: Option<&str>, field: &str) -> (Option<DateTime<Utc>>, String, Option<String>) {
+fn parse_started_bound(
+    raw: Option<&str>,
+    field: &str,
+) -> (Option<DateTime<Utc>>, String, Option<String>) {
     let Some(trimmed) = raw.map(str::trim).filter(|v| !v.is_empty()) else {
         return (None, String::new(), None);
     };
@@ -4170,8 +4171,6 @@ fn render_workflow_list(
     state_filter: Option<&str>,
     workflow_name_filter: Option<&str>,
     search_attr_filter: Option<&(String, String)>,
-    started_after: Option<DateTime<Utc>>,
-    started_before: Option<DateTime<Utc>>,
     started_after_raw: &str,
     started_after_error: Option<&str>,
     started_before_raw: &str,
@@ -4249,7 +4248,7 @@ fn render_workflow_list(
             }
         }
 
-        (render_pagination(page, limit, has_next, state_filter, workflow_name_filter, search_attr_filter, started_after, started_before, exec_id_search))
+        (render_pagination(page, limit, has_next, state_filter, workflow_name_filter, search_attr_filter, started_after_raw, started_before_raw, exec_id_search))
     };
 
     layout("Workflows · Vantage", &body, "")
@@ -4336,8 +4335,8 @@ fn render_pagination(
     state_filter: Option<&str>,
     workflow_name_filter: Option<&str>,
     search_attr_filter: Option<&(String, String)>,
-    started_after: Option<DateTime<Utc>>,
-    started_before: Option<DateTime<Utc>>,
+    started_after_raw: &str,
+    started_before_raw: &str,
     exec_id_search: Option<&str>,
 ) -> Markup {
     let base_query = build_query_string(
@@ -4345,8 +4344,8 @@ fn render_pagination(
         state_filter,
         workflow_name_filter,
         search_attr_filter,
-        started_after,
-        started_before,
+        started_after_raw,
+        started_before_raw,
         exec_id_search,
     );
 
@@ -4379,8 +4378,8 @@ fn build_query_string(
     state_filter: Option<&str>,
     workflow_name_filter: Option<&str>,
     search_attr_filter: Option<&(String, String)>,
-    started_after: Option<DateTime<Utc>>,
-    started_before: Option<DateTime<Utc>>,
+    started_after_raw: &str,
+    started_before_raw: &str,
     exec_id_search: Option<&str>,
 ) -> String {
     let mut out = String::new();
@@ -4397,11 +4396,15 @@ fn build_query_string(
         let _ = write!(out, "&search_attr_key={}", url_encode(key));
         let _ = write!(out, "&search_attr_value={}", url_encode(value));
     }
-    if let Some(after) = started_after {
-        let _ = write!(out, "&started_after={}", url_encode(&after.to_rfc3339()));
+    // Carries the raw text through, valid or not — a bound the operator is
+    // still correcting (an invalid value with its inline error, see
+    // `parse_started_bound`) must not silently vanish from a Next/Previous
+    // link before they've resolved it.
+    if !started_after_raw.is_empty() {
+        let _ = write!(out, "&started_after={}", url_encode(started_after_raw));
     }
-    if let Some(before) = started_before {
-        let _ = write!(out, "&started_before={}", url_encode(&before.to_rfc3339()));
+    if !started_before_raw.is_empty() {
+        let _ = write!(out, "&started_before={}", url_encode(started_before_raw));
     }
     if let Some(search) = exec_id_search {
         let _ = write!(out, "&exec_id_search={}", url_encode(search));
@@ -10641,7 +10644,8 @@ mod tests {
     /// caller-supplied text (not a re-formatted RFC 3339 string) with no error.
     #[test]
     fn parse_started_bound_accepts_valid_rfc3339() {
-        let (parsed, raw, error) = parse_started_bound(Some("2026-01-01T00:00:00Z"), "started_after");
+        let (parsed, raw, error) =
+            parse_started_bound(Some("2026-01-01T00:00:00Z"), "started_after");
         assert_eq!(raw, "2026-01-01T00:00:00Z");
         assert!(error.is_none());
         assert_eq!(
@@ -10662,8 +10666,14 @@ mod tests {
     #[test]
     fn parse_started_bound_rejects_invalid_value_without_erroring() {
         let (parsed, raw, error) = parse_started_bound(Some("yesterday"), "started_after");
-        assert_eq!(parsed, None, "an invalid bound must not be applied to the query");
-        assert_eq!(raw, "yesterday", "the operator's exact raw input is echoed back");
+        assert_eq!(
+            parsed, None,
+            "an invalid bound must not be applied to the query"
+        );
+        assert_eq!(
+            raw, "yesterday",
+            "the operator's exact raw input is echoed back"
+        );
         let error = error.expect("an invalid bound must carry a redisplayable error");
         assert!(
             error.contains("started_after") && error.contains("RFC 3339"),
@@ -10673,7 +10683,10 @@ mod tests {
 
     #[test]
     fn parse_started_bound_blank_or_missing_is_not_an_error() {
-        assert_eq!(parse_started_bound(None, "started_after"), (None, String::new(), None));
+        assert_eq!(
+            parse_started_bound(None, "started_after"),
+            (None, String::new(), None)
+        );
         assert_eq!(
             parse_started_bound(Some("   "), "started_after"),
             (None, String::new(), None)
@@ -11138,27 +11151,19 @@ mod tests {
     #[test]
     fn build_query_string_omits_default_limit() {
         assert_eq!(
-            build_query_string(DEFAULT_PAGE_SIZE, None, None, None, None, None, None),
+            build_query_string(DEFAULT_PAGE_SIZE, None, None, None, "", "", None),
             ""
         );
         assert_eq!(
-            build_query_string(10, None, None, None, None, None, None),
+            build_query_string(10, None, None, None, "", "", None),
             "&limit=10"
         );
         assert_eq!(
-            build_query_string(
-                DEFAULT_PAGE_SIZE,
-                Some("FAILED"),
-                None,
-                None,
-                None,
-                None,
-                None
-            ),
+            build_query_string(DEFAULT_PAGE_SIZE, Some("FAILED"), None, None, "", "", None),
             "&state=FAILED"
         );
         assert_eq!(
-            build_query_string(50, Some("with space"), None, None, None, None, None),
+            build_query_string(50, Some("with space"), None, None, "", "", None),
             "&limit=50&state=with%20space"
         );
     }
@@ -11171,16 +11176,53 @@ mod tests {
                 None,
                 Some("onboarding"),
                 None,
-                None,
-                None,
+                "",
+                "",
                 None
             ),
             "&workflow_name=onboarding"
         );
         let pair = ("tenant".to_string(), "acme".to_string());
         assert_eq!(
-            build_query_string(DEFAULT_PAGE_SIZE, None, None, Some(&pair), None, None, None),
+            build_query_string(DEFAULT_PAGE_SIZE, None, None, Some(&pair), "", "", None),
             "&search_attr_key=tenant&search_attr_value=acme"
+        );
+    }
+
+    /// The Codex review finding on this PR: a Next/Previous link must not
+    /// silently drop an invalid `started_after`/`started_before` an operator
+    /// is still correcting — that would clear the value and its inline error
+    /// (see `parse_started_bound`) via a click that looks unrelated to the
+    /// filter form, one page after the operator typed it.
+    #[test]
+    fn build_query_string_preserves_invalid_date_text_for_pagination() {
+        assert_eq!(
+            build_query_string(DEFAULT_PAGE_SIZE, None, None, None, "yesterday", "", None),
+            "&started_after=yesterday"
+        );
+        assert_eq!(
+            build_query_string(DEFAULT_PAGE_SIZE, None, None, None, "", "not-a-date", None),
+            "&started_before=not-a-date"
+        );
+    }
+
+    /// `started_after_raw`/`started_before_raw` is the operator's exact typed
+    /// text on success too (`parse_started_bound` returns `trimmed`, not a
+    /// reformatted `DateTime`), so a link preserves e.g. the `Z` suffix as
+    /// typed rather than normalizing it to `+00:00`.
+    #[test]
+    fn build_query_string_includes_valid_started_after_before() {
+        assert_eq!(
+            build_query_string(
+                DEFAULT_PAGE_SIZE,
+                None,
+                None,
+                None,
+                "2026-01-01T00:00:00Z",
+                "2026-12-31T23:59:59Z",
+                None
+            ),
+            "&started_after=2026-01-01T00%3A00%3A00Z&started_before=2026-12-31T23%3A59%3A59Z"
         );
     }
 
