@@ -515,9 +515,13 @@ fn resolve_backlog_bucket_state(
 
 /// Ensure a token bucket exists for `key`, preserving any operator override.
 ///
-/// Mirrors the activity limiter's `register_rate_limit_buckets`
-/// (`INSERT … ON CONFLICT (key) DO NOTHING`, initial `tokens = burst`), so a
-/// rate change across a deploy does not silently reset a live bucket.
+/// Delegates to [`crate::queue::ensure_rate_limit_bucket`] rather than
+/// re-issuing the same `INSERT`: the two paths write the *same* table with the
+/// same "never reset a live bucket" contract, and since issue #1127 that
+/// statement also carries the stale-row touch that interlocks a registration
+/// against the idle-bucket GC. A second copy of it here would silently miss
+/// that interlock, and a deferred start whose bucket was collected mid-flight
+/// can never debit a token again.
 #[cfg(feature = "db")]
 async fn ensure_throttle_bucket(
     conn: &mut diesel_async::AsyncPgConnection,
@@ -525,19 +529,7 @@ async fn ensure_throttle_bucket(
     refill_per_sec: f64,
     burst: f64,
 ) -> crate::error::HarvestResult<()> {
-    use diesel_async::RunQueryDsl;
-    diesel::sql_query(
-        "INSERT INTO harvest_rate_limit_buckets (key, refill_rate, burst, tokens, last_refilled_at) \
-         VALUES ($1, $2, $3, $3, NOW()) \
-         ON CONFLICT (key) DO NOTHING",
-    )
-    .bind::<diesel::sql_types::Text, _>(key)
-    .bind::<diesel::sql_types::Double, _>(refill_per_sec)
-    .bind::<diesel::sql_types::Double, _>(burst)
-    .execute(conn)
-    .await
-    .map_err(crate::error::database_error)?;
-    Ok(())
+    crate::queue::ensure_rate_limit_bucket(conn, key, refill_per_sec, burst).await
 }
 
 /// Whether any pending-start row already exists for a bucket key.
@@ -840,14 +832,35 @@ pub async fn reserve_or_defer(
     let key = bucket_key(params.workflow_name, params.throttle_key);
     let now = Utc::now();
 
-    // (2) FIFO fast-path guard: an existing backlog means we must append, not
+    // (2) Ensure the bucket BEFORE either outcome below, backlog or not.
+    //
+    // It has to be before the FIFO guard, not inside its no-backlog branch
+    // (issue #1127, Codex review round 1 P1). Every path from here persists a
+    // dependent on this bucket — a reserved token, or a pending row the scanner
+    // will later debit — and the idle-bucket GC's anti-join can only see
+    // dependents that were already COMMITTED when it took its snapshot. On the
+    // append path the old code touched the bucket not at all: an observed
+    // backlog row that the scanner drops (a `schedule_to_start` stale-out
+    // debits no token) between the check and this insert leaves the sweep
+    // seeing an idle, full, dependent-free bucket, and the pending row we then
+    // commit references a bucket that no longer exists. `fire_claimed_throttle_row`
+    // fails closed on a missing bucket, so that start would sit deferred
+    // forever.
+    //
+    // Ensuring here closes it the same way the enqueue path does: the
+    // registration touch locks any GC-eligible row for the rest of this
+    // transaction, so the sweep skips it (and an ensure that lost the race
+    // re-inserts the bucket). It is also a robustness win in its own right —
+    // the append path previously appended to a backlog whose bucket might not
+    // exist at all, which nothing would ever have created.
+    ensure_throttle_bucket(conn, &key, params.refill_per_sec, params.burst).await?;
+
+    // (3) FIFO fast-path guard: an existing backlog means we must append, not
     // jump the queue.
-    if !pending_backlog_exists(conn, &key).await? {
-        // (3) No backlog — ensure the bucket and try to reserve a token.
-        ensure_throttle_bucket(conn, &key, params.refill_per_sec, params.burst).await?;
-        if crate::queue::try_consume_rate_limit_token(conn, &key).await? {
-            return Ok(ThrottleAdmission::Reserved { bucket_key: key });
-        }
+    if !pending_backlog_exists(conn, &key).await?
+        && crate::queue::try_consume_rate_limit_token(conn, &key).await?
+    {
+        return Ok(ThrottleAdmission::Reserved { bucket_key: key });
     }
 
     // Defer: durably persist the start before any WorkflowStarted event exists.

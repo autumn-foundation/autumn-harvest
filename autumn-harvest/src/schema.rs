@@ -647,6 +647,18 @@ diesel::table! {
         /// it elapses every consumer reverts to the declared baseline with no
         /// operator action or background sweeper needed (issue #945).
         override_expires_at -> Nullable<Timestamptz>,
+        /// When `queue::ensure_rate_limit_bucket` last (re-)registered this
+        /// bucket (issue #1127). Part of the idle-bucket GC's idleness clock,
+        /// and deliberately not `updated_at`, which keeps its "an operator or
+        /// config write changed this bucket" meaning. `NULL` on a pre-#1127
+        /// row until the first registration stamps it.
+        last_registered_at -> Nullable<Timestamptz>,
+        /// When an operator last wrote this bucket's PERMANENT baseline via
+        /// `POST /admin/rate-limits/{key}` (issue #332). A bucket carrying this
+        /// is exempt from the idle-bucket GC (issue #1127) — collecting it
+        /// would silently revert deliberate operator intent to the
+        /// code-declared rate.
+        baseline_set_at -> Nullable<Timestamptz>,
     }
 }
 

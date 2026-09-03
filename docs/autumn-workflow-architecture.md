@@ -989,7 +989,7 @@ The `harvest_task_queue` table is also partitioned by `queue_name` using list pa
 
 ### 8.3 History Retention
 
-Harvest ships an opt-in retention janitor for completed workflow histories. Operators configure `RetentionConfig` on `HarvestBuilder`; default behavior is disabled (`max_age = None`), so upgrading does not delete any rows until explicitly enabled.
+Harvest ships an opt-in retention janitor for completed workflow histories. Operators configure `RetentionConfig` on `HarvestBuilder`; default behavior for **workflow history** is disabled (`max_age = None`), so upgrading deletes no history until explicitly enabled. Two janitor passes ARE on by default: audit-log purging (`audit_retention_days`, 90 days) and the idle rate-limit-bucket GC (`rate_limit_bucket_retention_secs`, 7 days — issue #1127), the latter collecting only provably inert per-tenant token buckets.
 
 When enabled, each tick selects terminal workflow executions older than `max_age` and deletes them transactionally. Rows in `harvest_events`, `harvest_task_queue`, `harvest_timers`, and `harvest_signals` are removed by `ON DELETE CASCADE`; `harvest_dead_letters` rows are deleted explicitly in the same retention transaction because `workflow_exec_id` is not a foreign key.
 

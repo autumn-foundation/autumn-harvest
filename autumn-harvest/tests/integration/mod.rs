@@ -145,6 +145,7 @@ mod queue_pause_success_metric_tests;
 mod queue_pause_tests;
 mod quota_enforcement_tests;
 mod quota_history_bytes_perf_tests;
+mod rate_limit_bucket_gc_tests;
 mod rate_limit_key_tests;
 mod redrive_tests;
 #[cfg(all(feature = "testing", feature = "db"))]
