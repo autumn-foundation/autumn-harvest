@@ -108,6 +108,16 @@ struct ClaimerOutcome {
     span: (Instant, Instant),
 }
 
+/// Ported verbatim from `claim_bench_support.rs::arrive_at_start_gate`: wait
+/// at the barrier bounded by the scenario deadline (so a claimer that never
+/// gets this far still releases the others), and report the resume instant
+/// as this claimer's own observation of when the gate opened.
+async fn arrive_at_start_gate(gate: &Barrier, deadline: Instant) -> Instant {
+    let _ = tokio::time::timeout(deadline.saturating_duration_since(Instant::now()), gate.wait())
+        .await;
+    Instant::now()
+}
+
 /// One claimer: `per_claimer` claim-only attempts against all `QUEUES` queue
 /// names, no enqueue and no complete/ack during the measured phase (matches
 /// what `docs/performance.md`'s table itself measures: `claim_task` alone).
@@ -135,8 +145,11 @@ async fn run_claimer(
     per_claimer: usize,
     deadline: Instant,
 ) -> ClaimerOutcome {
-    start_gate.wait().await;
-    let my_start = Instant::now();
+    // `arrive_at_start_gate`, not a bare `.wait()`: ported from
+    // `claim_bench_support.rs`, which bounds the barrier wait itself by the
+    // scenario deadline on every claimer's path, not only the failed-connect
+    // one.
+    let my_start = arrive_at_start_gate(&start_gate, deadline).await;
     let mut observed = Vec::with_capacity(per_claimer);
     for _ in 0..per_claimer {
         let now = Instant::now();
@@ -217,24 +230,44 @@ async fn run_cell(backlog: usize, redis_url: &str, scenario_budget: Duration) ->
             key_prefix: prefix.clone(),
             ..RedisTaskQueueConfig::default()
         };
-        // Post-review correction: bound connection establishment by the
-        // remaining scenario deadline too, mirroring the Postgres harness's
-        // `tokio::time::timeout(..., pool.get())` around checkout — an
-        // unbounded connect to an unreachable/stalled Redis would otherwise
-        // hang `run_cell` past `BENCH_SCENARIO_SECS` with no truncated
-        // report to show for it.
-        let queue = tokio::time::timeout(
-            deadline.saturating_duration_since(Instant::now()),
-            RedisTaskQueue::connect(redis_url, cfg),
-        )
-        .await
-        .expect("connect to local redis timed out at the scenario deadline")
-        .expect("connect to local redis");
         let worker_id = format!("matchbench-worker-{c}");
         let queues = Arc::clone(&queues);
         let rotation = Arc::clone(&rotation);
         let start_gate = Arc::clone(&start_gate);
+        let redis_url = redis_url.to_string();
         handles.push(tokio::spawn(async move {
+            // Post-review correction: bound connection establishment by the
+            // remaining scenario deadline too, mirroring the Postgres
+            // harness's `tokio::time::timeout(..., pool.get())` around
+            // checkout — an unbounded connect to an unreachable/stalled
+            // Redis would otherwise hang `run_cell` past
+            // `BENCH_SCENARIO_SECS` with no truncated report to show for it.
+            //
+            // Post-review correction, round 3: a timed-out or failed connect
+            // no longer panics the whole scenario. It still clears the start
+            // gate (so the other CLAIMERS-1 successful claimers aren't stuck
+            // waiting on a Barrier that can never reach its count) and
+            // reports back an explicitly truncated, sample-free outcome —
+            // mirroring `claim_bench_support.rs`'s own checkout-timeout path
+            // (`ClaimerOutcome::from_observed(Vec::new(), true)`), which
+            // makes a stalled connection an explicitly unsound report rather
+            // than an aborted process.
+            let connect_result = tokio::time::timeout(
+                deadline.saturating_duration_since(Instant::now()),
+                RedisTaskQueue::connect(&redis_url, cfg),
+            )
+            .await;
+            let queue = match connect_result {
+                Ok(Ok(queue)) => queue,
+                Ok(Err(_)) | Err(_) => {
+                    // Still worth a real observation of when the gate
+                    // released, mirroring `measured_window`'s fold logic —
+                    // an early-resumed placeholder can only move the shared
+                    // window's start earlier, never later.
+                    let resumed = arrive_at_start_gate(&start_gate, deadline).await;
+                    return ClaimerOutcome { observed: Vec::new(), span: (resumed, resumed) };
+                }
+            };
             run_claimer(queue, worker_id, queues, rotation, start_gate, per_claimer, deadline)
                 .await
         }));

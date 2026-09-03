@@ -237,6 +237,21 @@ warmup call too. `claims_per_sec = total_claimed / wall_secs`.
 > claims/s on one spot-check), so it is not folded into a new set of four
 > repeats.
 >
+> **Post-review correction, round 3 (Codex, on the round-2 fix).** The
+> round-2 fix bounded the connect call by a timeout but still `.expect()`-ed
+> the result, so a timed-out or failed connect would panic the whole
+> process rather than produce the promised truncated report —
+> `claim_bench_support.rs`'s own checkout-timeout path returns an empty,
+> explicitly-truncated `ClaimerOutcome` instead of unwrapping. Fixed the
+> same way: connection establishment moved inside each claimer's spawned
+> task; a timed-out or failed connect now clears the start barrier (via the
+> newly-ported `arrive_at_start_gate`, also now used for every claimer's own
+> barrier wait, not only the failure path — matching
+> `claim_bench_support.rs` exactly) and returns an empty, sample-free
+> `ClaimerOutcome` rather than panicking. Another spot-check of the
+> registered cell after this fix (18,803.91 claims/s) again lands inside the
+> already-reported range.
+>
 > Both fixes changed the *mechanism*, not the *conclusion*: the corrected
 > registered-cell mean (18,933.43 claims/s across four runs, see Assay) is
 > within the pre-fix runs' range (15,319.64-19,140.83) and clears the same
