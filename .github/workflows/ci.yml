@@ -598,7 +598,19 @@ jobs:
             echo "::error::quickstart app never became healthy"; exit 1
           fi
 
-          # 2. Trigger the `greeting` workflow (README step 4) and capture its execution_id.
+          # 2. Run the exact README "Step 3 — Run preflight" command. The
+          # binary must resolve (this is the check-default-run.sh regression
+          # class); the admin route itself may still 401 in the dev profile
+          # with no session (issue #1284, a getting-started auth-flow
+          # question tracked and decided separately, not this job's to fix).
+          cli_out="$(cargo run -p autumn-harvest-cli -- --base-url http://localhost:3000/api/harvest preflight 2>&1)" || true
+          if echo "${cli_out}" | grep -q "could not determine which binary to run"; then
+            echo "${cli_out}"
+            echo "::error::cargo run -p autumn-harvest-cli -- ... is ambiguous (missing default-run)"; exit 1
+          fi
+          echo "cli resolved and ran (see issue #1284 for the known dev-profile 401)"
+
+          # 3. Trigger the `greeting` workflow (README step 4) and capture its execution_id.
           resp="$(curl -sf -X POST \
             http://localhost:3000/api/harvest/workflows/greeting/start \
             -H 'Content-Type: application/json' \
@@ -610,7 +622,7 @@ jobs:
             echo "::error::no execution_id in start response"; exit 1
           fi
 
-          # 3. Poll until COMPLETED. The workflow has a 30s durable timer between
+          # 4. Poll until COMPLETED. The workflow has a 30s durable timer between
           # its two activities, so this needs headroom well past 30s.
           for i in $(seq 1 90); do
             state="$(curl -s "http://localhost:3000/api/harvest/workflows/${eid}" \
