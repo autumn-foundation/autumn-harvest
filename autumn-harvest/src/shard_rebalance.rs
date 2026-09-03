@@ -2824,10 +2824,17 @@ mod db {
         checkout(pool, shard).await
     }
 
-    /// Check out a connection for an execution's **live** residence, tolerating
-    /// a deployment that registers no pool under that shard id. See
+    /// Check out a connection for an execution's **live** residence.
+    ///
+    /// Tolerates a deployment that registers no pool under that shard id. See
     /// [`checkout_entry`] for why the live residence resolves this way and a
     /// prior residence deliberately does not.
+    ///
+    /// # Errors
+    ///
+    /// [`HarvestError::ShardUnavailable`] when the checkout itself fails. Unlike
+    /// [`conn_for_shard`], an unregistered shard is not an error: it falls back
+    /// to the pool's default.
     pub async fn conn_for_live_shard(
         pool: &ShardedDbPool,
         shard: ShardId,
