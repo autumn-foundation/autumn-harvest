@@ -109,6 +109,7 @@ linux        autumn-harvest         integration                      -          
 linux        autumn-harvest         integration                      -                          schedule_runs_tests
 linux        autumn-harvest         integration                      -                          scheduler_overdue_tests
 linux        autumn-harvest         integration                      -                          scheduler_registration_tests
+linux        autumn-harvest         integration                      -                          shard_placement_by_id_tests
 linux        autumn-harvest         integration                      -                          sharded_runtime_tests
 linux        autumn-harvest         integration                      -                          start_idempotency_tests
 linux        autumn-harvest         integration                      -                          start_source_tests

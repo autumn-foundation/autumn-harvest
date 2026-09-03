@@ -2861,10 +2861,20 @@ mod db {
         if pool.len() <= 1 {
             return unforwarded;
         }
-        // Compared as references, never stored as a raw pointer: a `*const`
-        // held across an `.await` would make this future `!Send`.
-        let on_held =
-            |shard: ShardId| std::ptr::eq(pool.pool_for(shard), pool.pool_for(held_shard));
+        // `same_underlying_pool`, NOT `std::ptr::eq` on the two `&DbPool`
+        // (issue #1146): `ShardedDbPool` stores every shard's pool in its own
+        // map slot, so pointer equality of the slots is really *shard-id*
+        // equality and calls two aliases of one database different. Here that
+        // would be worse than cosmetic — an alias judged "not held" sends this
+        // lookup to check out a second connection from the very pool the caller
+        // is holding one from, which is the deadlock this function exists to
+        // avoid.
+        let on_held = |shard: ShardId| {
+            crate::external_target_location::same_underlying_pool(
+                pool.pool_for(shard),
+                pool.pool_for(held_shard),
+            )
+        };
 
         let exec_id = match target {
             crate::types::ExternalTarget::ExecutionId(id) => *id,

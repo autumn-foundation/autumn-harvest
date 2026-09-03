@@ -180,6 +180,20 @@ const fn pick_runtime_pool_source<'a>(
 /// global `GLOBAL_SHARDED_POOL`. Used by `PreparedHarvestRuntime::build` on the
 /// normal startup path, where installing the global is intended.
 ///
+/// The sharded case installs explicitly, and must. `ShardedDbPool::single` and
+/// `from_map` self-install at *construction*, so the global reflects whichever
+/// pool was constructed last — not the one this function's precedence selects.
+/// Build a multi-shard `HarvestRunnerResources::sharded_pool` and then a
+/// single-shard `WorkerConfig::with_sharded_pool`, and the global is left
+/// single-shard while the runtime runs multi-shard. Every consumer of the
+/// global then reads a pool the runtime is not using: the by-id fan-out, the
+/// timeout sweeps, completion triggers, and — the reason this was found —
+/// `external_target_location::deployment_is_multi_shard`, which would answer
+/// "single shard" and re-open issue #1146 on the inline path, recording a
+/// permanent `not_running` against a target that is running on another shard.
+/// Re-installing the selected pool makes the global agree with the effective
+/// topology for all of them (issue #1146 review).
+///
 /// The boot-time orphaned-workflow gate must NOT call this — an aborting gate
 /// must mutate no process global (issue #700 P4). It uses
 /// [`select_runtime_gate_shards`] instead, which shares this function's exact
@@ -195,7 +209,13 @@ pub fn resolve_runtime_storage_pool(
         worker_config_sharded_pool,
         harvest_pool,
     ) {
-        RuntimePoolSource::Sharded(sp) => HarvestDbPool::sharded(sp.clone()),
+        RuntimePoolSource::Sharded(sp) => {
+            // `HarvestDbPool::sharded` is a pure wrap (a `const fn`) — unlike
+            // the single-shard arm below, it installs nothing. Install the
+            // selection so the global matches what the runtime actually runs.
+            autumn_harvest::shard::install_global_sharded_pool(sp.clone());
+            HarvestDbPool::sharded(sp.clone())
+        }
         RuntimePoolSource::Single(pool) => HarvestDbPool::from(pool.clone()),
     }
 }

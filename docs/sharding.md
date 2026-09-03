@@ -252,6 +252,126 @@ So pinning the **root** of a workflow tree confines the whole tree.
 - **Residency keys are an operator-declared, low-cardinality set.** The map is held in memory on every node and validated at boot; it is sized for regions/jurisdictions (single digits to dozens), not per-tenant keys. For per-tenant placement, map the tenant to a region in your own application layer and pass the region as the key.
 - **Out of scope**: migrating a *running* workflow between shards, per-shard worker assignment, geo-replication / cross-region failover, and inferring residency from payload contents. Harvest never reads your payload to decide placement — the caller states it explicitly.
 
+### Business-key addressing finds a pinned run wherever it is (issue #1146)
+
+`ctx.signal_external_workflow_by_id` / `ctx.request_cancel_external_workflow_by_id`
+(issue #751) address a target by `(workflow_name, workflow_id)`. Originally they
+resolved the owning shard by re-deriving `ShardRouter::pick_for_new_workflow` —
+the rendezvous hash a *fresh start* of that key would use. That answers "where
+would new work be placed?", which is not the same question as "where does this
+run live?", and for a pinned workflow it is a different answer: a signal or
+cancel addressed by business key resolved to the hash-derived shard, found
+nothing there, and failed the request `target_unknown` once the grace window
+elapsed, while the target was running the whole time.
+
+The same divergence appears without any pin at all. `pick_writable` re-hashes
+over the *current* `writable_shards` when the readable-set hash falls outside
+it, so **draining a shard moves where a key resolves after a workflow was
+already placed there** — the run stays put and the hash does not.
+
+Delivery now resolves by **observation**: it queries every expected shard for
+the addressed key and merges the answers with the same active-run-first ranking
+the management API's by-id endpoints use (`execution::select_resolved_run`). Two
+rules make that safe rather than merely broader:
+
+- **No first-hit short circuit.** `(workflow_name, workflow_id)` uniqueness is
+  shard-local, so a stale terminal run of the key can sit on one shard while the
+  live run sits on another. Every expected shard is asked before a terminal
+  answer is accepted; otherwise a signal would fail `not_running` against a dead
+  run while its live sibling waited.
+- **"Could not inspect" is never "not there."** A shard this process has no pool
+  for — mid a shard-add rollout — or one it cannot reach leaves the resolution
+  *indeterminate*, and the delivery is retried on the next outbox sweep. Only a
+  fan-out that inspected every expected shard and found nothing may become a
+  permanent `target_unknown`. A shard outage therefore stalls by-id deliveries
+  instead of durably failing them.
+
+Operationally: expect **one to two row reads per shard per by-id delivery
+attempt** (the per-shard resolver probes active-first, then most-recent-terminal
+only when a shard holds no active run), on the outbox scanners rather than the
+hot dispatch path. A **single-shard deployment expects one shard, skips the
+fan-out entirely, and is unchanged**, including keeping its inline
+(same-transaction) fast path. Multi-shard deployments route every by-id delivery
+through the outbox — which is where the hash already sent `(N-1)/N` of them —
+so delivery completes up to one scanner poll interval later than it used to.
+`ExecutionId`-addressed signal/cancel is untouched: the shard is decoded from
+the id and is always authoritative.
+
+Connections, not queries, are the budget here. The sweep calls the fan-out from
+inside a transaction on a connection checked out of its own shard's pool, and
+Harvest configures no deadpool timeouts, so a naive second `pool.get()` on that
+pool would park forever and wedge every scanner resident behind it. The caller's
+own shard is therefore probed on the connection already in hand, and a sweep
+memoizes the shards it has already failed to reach so a backlog of pending rows
+pays an acquisition bound once per shard rather than once per row.
+
+**A by-id resolution is authoritative over what it observed, not over an
+instant.** The shards are read sequentially, on separate connections to separate
+databases, with no shared snapshot — Postgres has no cross-shard transaction and
+Harvest deliberately adds no coordinator. A run of the key that starts on an
+already-read shard while a later shard is being read is therefore invisible to
+that fan-out, and a cancel can report success while it is live. This needs two
+live runs of one business key to be possible at all, which needs a deployment to
+mix pinned and unpinned starts of the same `workflow_id` — exactly the discipline
+the *Caveats* section above asks you to keep, and for exactly this reason. It is
+also strictly better than the pre-#1146 behaviour, which consulted one
+hash-derived shard and missed a second live run unconditionally rather than only
+under a race. Closing it properly means cross-shard key uniqueness, which is an
+architectural addition rather than a fix — see issue #1313 for the options.
+
+**Size each shard pool at one connection per local scanner sharing it, plus
+one.** `Worker` spawns one timeout checker per assigned shard, and each holds
+its own shard pool's connection for the whole scanner pass. So a process with
+`shard_assignments = [0, 1]` and one connection per pool has checker 0 wanting
+pool 1 exactly while checker 1 is holding it, and vice versa.
+
+For the usual topology — one database per logical shard — that rule is just
+"2 or more". It is stated per *physical pool* because of the colocated case:
+`ShardedDbPool::pool_for` returns the same pool for several logical shards
+aliased onto one database, while checkers are spawned per logical *assignment*.
+Shards 0 and 1 aliased onto a pool at `max_size = 2` therefore run two scanners
+against two connections and leave nothing for shard 2's cross-shard read —
+under-provisioned, though every individual shard looks like it meets a flat
+threshold of two. Such a pool needs 3. Peer acquisitions
+in the fan-out and in cross-shard delivery are bounded tightly
+(`external_target_location::FANOUT_ACQUIRE_BOUND`) precisely so neither scanner
+ever *waits* on the other and the circular wait cannot form — a peer whose only
+connection is busy is simply uninspected and the row is retried on the next tick.
+
+What that buys is **bounded return, not progress**. A one-connection pool has
+nothing to spare while its own scanner is mid-pass, so a peer read succeeds only
+if it lands during that scanner's sleep window; likely, since passes are short
+relative to the poll interval and two independent tasks do not stay in phase, but
+a probability rather than a guarantee. The guarantee is capacity: one connection
+per local scanner running against that pool, one for a peer's cross-shard read.
+A multi-shard worker configured below that now logs a warning at startup naming
+the pool's shards, its `max_size` and what it needs, so the degradation is
+visible rather than silent. The warning groups by physical pool, so an aliased
+pool is reported once, for all the shards sharing it, against the total they
+require between them. A deployment that runs one process
+per shard is unaffected either way, since each process holds only its own shard's
+connection.
+
+**A shard you cannot reach stalls by-id delivery rather than failing it, without
+a bound.** That is the deliberate trade: `target_unknown` is written into an
+append-only history and cannot be taken back, so it is only ever recorded from a
+*complete* fan-out. The consequence is that a shard which is permanently
+uninspectable *in this process* — a router whose `readable_shards` names a shard
+no pool was ever configured for, say — leaves every affected by-id request
+pending indefinitely, and a workflow awaiting the outcome waits with it. There is
+no metric for this yet; the signal is the per-row `by-id target resolution
+inconclusive` warning, which names the shard and the reason. The plugin's
+startup `missing_router_shards` check prevents the steady-state form of this
+misconfiguration; a hand-rolled embedder whose `sharded_pool` is narrower than
+its router can still reach it.
+
+`shard::external_target_owning_shard` still exists and is still correct for the
+question it answers — *where would this key be placed?* — which is what the
+cross-type continue-as-new guard and the re-run `workflow_id`-override guard
+need. `ShardedDbPool::exact_pool_for_target` is deprecated: resolving a pool for
+a target is always a "where does it live" question, and the hash cannot answer
+it.
+
 ### Cross-shard global limits — explicit out of scope
 
 Distributed counting across shards requires either a coordination service (Redis, a dedicated Postgres coordinator) or accepting bounded inaccuracy (approximate counts via gossip). Both add operational complexity that conflicts with Harvest's goal of being a Postgres-native engine. Cross-shard global limits are therefore **out of scope** for this feature; the per-shard guarantee is the contract.

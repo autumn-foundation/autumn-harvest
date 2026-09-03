@@ -9,12 +9,13 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
+use autumn_harvest::types::ShardId;
 use autumn_harvest::worker::DbPool;
 use autumn_harvest::workers::WorkerRow;
 use chrono::{DateTime, Utc};
 use serde::Serialize;
 
-use crate::api::HarvestApiState;
+use crate::api::{HarvestApiState, PoolConn, acquire_conn};
 
 /// Outcome of a single-shard query: either a successful row set or an error.
 #[derive(Debug)]
@@ -25,6 +26,41 @@ pub struct ShardObservation<R> {
     pub rows: Vec<R>,
     /// Error description when the shard could not be queried.
     pub error: Option<String>,
+}
+
+/// Resolve `pool` to a live connection for `shard_id`, or the
+/// [`ShardObservation`] error a fan-out read should record for this shard.
+///
+/// Every per-shard fan-out query starts the same way: a shard the router has
+/// no pool for is `"has no configured storage pool"`; a pool that fails to
+/// hand out a connection is `"could not be acquired"`. Centralising that
+/// prelude here means a new fan-out read model implements only its own query
+/// against the returned connection, not this guard by hand — it was
+/// hand-copied into eight read models before this extraction.
+///
+/// # Errors
+///
+/// Returns the [`ShardObservation`] the caller should record for this shard
+/// when no pool is configured for it, or when a connection could not be
+/// acquired from the pool.
+pub async fn acquire_shard_conn<R>(
+    shard_id: i32,
+    pool: Option<DbPool>,
+) -> Result<PoolConn, ShardObservation<R>> {
+    let Some(pool) = pool else {
+        return Err(ShardObservation {
+            shard_id,
+            rows: Vec::new(),
+            error: Some(format!("shard {shard_id} has no configured storage pool")),
+        });
+    };
+    acquire_conn(&pool).await.map_err(|_| ShardObservation {
+        shard_id,
+        rows: Vec::new(),
+        error: Some(format!(
+            "database connection for shard {shard_id} could not be acquired"
+        )),
+    })
 }
 
 /// Collect per-shard connection pools available in `api_state`.
@@ -59,16 +95,23 @@ pub fn expected_shards(
     api_state: &HarvestApiState,
     pools: &BTreeMap<i32, DbPool>,
 ) -> BTreeSet<i32> {
-    let mut shards: BTreeSet<i32> = pools.keys().copied().collect();
-    if let Ok(runtime) = api_state.runtime() {
+    // Delegates to the canonical core rule (issue #1146). The engine's own
+    // by-business-key resolution
+    // (`external_target_location::resolve_location_by_workflow_id`) fans out
+    // over exactly this set, and a management-API read that inspected a
+    // different set of shards than the engine would answer differently about
+    // the same key. Keeping one definition removes that drift by construction,
+    // the way `select_resolved_run` already does for the ranking.
+    let pool_shards: Vec<ShardId> = pools.keys().copied().map(ShardId::new).collect();
+    let runtime = api_state.runtime().ok();
+    let router_parts = runtime.as_ref().map(|runtime| {
         let router = runtime.router();
-        shards.extend(router.readable_shards().iter().map(|s| s.as_i32()));
-        shards.insert(router.default_shard().as_i32());
-    }
-    if shards.is_empty() {
-        shards.insert(0);
-    }
-    shards
+        (router.readable_shards(), router.default_shard())
+    });
+    autumn_harvest::external_target_location::fanout_shards_from_parts(&pool_shards, router_parts)
+        .into_iter()
+        .map(ShardId::as_i32)
+        .collect()
 }
 
 /// Seconds elapsed from `started_at` to `observed_at`, clamped to zero.
@@ -262,6 +305,50 @@ pub fn collect_fanout_rows<R>(observations: Vec<ShardObservation<R>>) -> FanoutR
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── acquire_shard_conn (characterizes the prelude previously hand-copied
+    //    into canary.rs, status_summary.rs, usage.rs, workflow_count.rs,
+    //    workflow_reachability.rs, queue_coverage.rs, version_gate_retirement.rs
+    //    and version_usage.rs) ───────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn acquire_shard_conn_no_pool_reports_shard_id_and_message() {
+        let result: Result<PoolConn, ShardObservation<i64>> = acquire_shard_conn(7, None).await;
+        let Err(observation) = result else {
+            panic!("no pool must be an error observation");
+        };
+        assert_eq!(observation.shard_id, 7);
+        assert!(observation.rows.is_empty());
+        assert_eq!(
+            observation.error.as_deref(),
+            Some("shard 7 has no configured storage pool")
+        );
+    }
+
+    #[tokio::test]
+    async fn acquire_shard_conn_unreachable_pool_reports_shard_id_and_message() {
+        // Nothing listens on this port, so `pool.get()` fails fast (connection
+        // refused) without needing a live database.
+        let manager = diesel_async::pooled_connection::AsyncDieselConnectionManager::<
+            diesel_async::AsyncPgConnection,
+        >::new("postgres://user:pass@127.0.0.1:1/db");
+        let pool: DbPool = deadpool::managed::Pool::builder(manager)
+            .max_size(1)
+            .build()
+            .expect("failed to build unreachable test pool");
+
+        let result: Result<PoolConn, ShardObservation<i64>> =
+            acquire_shard_conn(3, Some(pool)).await;
+        let Err(observation) = result else {
+            panic!("unreachable pool must be an error observation");
+        };
+        assert_eq!(observation.shard_id, 3);
+        assert!(observation.rows.is_empty());
+        assert_eq!(
+            observation.error.as_deref(),
+            Some("database connection for shard 3 could not be acquired")
+        );
+    }
 
     fn obs<R>(shard_id: i32, rows: Vec<R>, error: Option<&str>) -> ShardObservation<R> {
         ShardObservation {
