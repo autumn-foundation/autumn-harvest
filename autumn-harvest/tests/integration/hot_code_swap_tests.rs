@@ -884,10 +884,10 @@ fn normalise(events: &[WorkflowEvent]) -> Vec<Value> {
         .iter()
         .map(|e| {
             let mut v = serde_json::to_value(e).expect("event serialises");
-            if let Some(data) = v.get_mut("data").and_then(Value::as_object_mut) {
-                if data.contains_key("activity_id") {
-                    data.insert("activity_id".to_string(), json!("<normalised>"));
-                }
+            if let Some(data) = v.get_mut("data").and_then(Value::as_object_mut)
+                && data.contains_key("activity_id")
+            {
+                data.insert("activity_id".to_string(), json!("<normalised>"));
             }
             v
         })
@@ -940,10 +940,12 @@ async fn a_statically_linked_history_replays_clean_under_module_hosting() {
     let registry = registry_with(&[("wf-v1", "pipeline", pipeline_v1_bytes())]);
     let native = env().run(native_pipeline_v1, json!({"order": 7})).await;
 
-    let report = with_module_host(
+    // Boxed: the replay future is large enough to trip `clippy::large_futures`
+    // when combined with the host scope.
+    let report = Box::pin(with_module_host(
         host(&registry, "wf-v1"),
         native.replay_check(module_workflow_handler),
-    )
+    ))
     .await;
     assert!(
         matches!(report.status, ReplayStatus::ReplaySucceeded),
@@ -1140,13 +1142,13 @@ async fn a_guest_may_not_pick_the_queue_unless_the_host_allows_it() {
 
 #[test]
 fn a_host_cannot_lift_the_resource_ceilings_only_tighten_them() {
-    use autumn_harvest::wasm_activities::WasmLimits;
     let registry = registry_with(&[("wf-v1", "pipeline", pipeline_v1_bytes())]);
-    let lifted = host(&registry, "wf-v1").with_limits(WasmLimits {
-        memory_bytes: usize::MAX,
-        fuel: u64::MAX,
-        max_wall_clock: Duration::from_secs(3600),
-    });
+    let lifted =
+        host(&registry, "wf-v1").with_limits(autumn_harvest::wasm_activities::WasmLimits {
+            memory_bytes: usize::MAX,
+            fuel: u64::MAX,
+            max_wall_clock: Duration::from_secs(3600),
+        });
     assert_eq!(
         lifted.limits,
         autumn_harvest::hot_swap::default_decide_limits(),
@@ -1536,6 +1538,12 @@ async fn publishing_verifies_the_signature_it_is_asked_to_store() {
 /// v1-assigned in-flight execution still runs v1 code, then roll back by
 /// repointing the policy — all without restarting the host.
 #[tokio::test]
+#[allow(
+    clippy::too_many_lines,
+    reason = "one end-to-end narrative — load v1, hot-load v2, ramp, check the \
+              in-flight run, roll back. Splitting it would hide that all of it \
+              happens without a restart, which is the acceptance criterion."
+)]
 async fn hot_swap_ramp_and_rollback_without_a_restart() {
     let (mut conn, _c) = db().await;
     let registry = Arc::new(ModuleRegistry::new());
@@ -1988,6 +1996,13 @@ mod one_worker_process {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one end-to-end narrative: start a \
+        worker, hot-load v2, ramp, check the in-flight straggler, roll back. \
+        Splitting it would hide the fact that ONE worker process does all of it, \
+        which is the acceptance criterion."
+    )]
     async fn a_running_worker_adopts_v2_under_a_new_build_id_without_restarting() {
         let (url, _container) = setup_db().await;
         let queue = "q-hot-swap";

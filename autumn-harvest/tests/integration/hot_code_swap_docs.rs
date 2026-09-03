@@ -353,7 +353,7 @@ fn the_migration_the_registry_design_names_exists() {
     let migrations = repo_root().join("autumn-harvest/migrations");
     let found: Vec<String> = std::fs::read_dir(&migrations)
         .expect("migrations directory")
-        .filter_map(|e| e.ok())
+        .filter_map(std::result::Result::ok)
         .map(|e| e.file_name().to_string_lossy().into_owned())
         .filter(|n| n.ends_with("_harvest_workflow_modules"))
         .collect();

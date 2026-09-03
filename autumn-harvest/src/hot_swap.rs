@@ -480,7 +480,7 @@ pub fn sign_module_binding(
 
 /// Decode lowercase- or uppercase-hex into bytes; `None` on any non-hex input.
 fn decode_hex(s: &str) -> Option<Vec<u8>> {
-    if s.len() % 2 != 0 {
+    if !s.len().is_multiple_of(2) {
         return None;
     }
     (0..s.len())
@@ -701,7 +701,11 @@ impl std::fmt::Debug for ModuleRegistry {
         f.debug_struct("ModuleRegistry")
             .field("bindings", &self.descriptors())
             .field("compiled_modules_cached", &self.store.cache_len())
-            .finish()
+            .field("generation", &self.generation.load(Ordering::Relaxed))
+            // `store` is deliberately summarised by `compiled_modules_cached`
+            // above rather than printed: it holds a wasmtime `Engine`, which is
+            // neither `Debug` nor useful in a diagnostic.
+            .finish_non_exhaustive()
     }
 }
 
@@ -734,7 +738,7 @@ impl ModuleRegistry {
     /// the worker already runs WASM *activities* on, so a process hosting both
     /// has one engine and one epoch ticker rather than two.
     #[must_use]
-    pub fn with_store(store: Arc<WasmModuleStore>) -> Self {
+    pub const fn with_store(store: Arc<WasmModuleStore>) -> Self {
         Self {
             store,
             bindings: RwLock::new(BTreeMap::new()),
@@ -823,6 +827,15 @@ impl ModuleRegistry {
     /// `generation_at_start` is the value the generation counter held before the
     /// (slow, unlocked) compile step; a change means an `unload_build` ran in
     /// the meantime and this load must not resurrect it.
+    #[allow(
+        clippy::significant_drop_tightening,
+        reason = "holding the write guard across the WHOLE decision is the \
+                  correctness property, not an oversight: the generation check, \
+                  the duplicate re-check and the inserts must be one critical \
+                  section, or a concurrent `unload_build` slots between them and \
+                  a retired build is silently resurrected. Releasing the guard \
+                  earlier is exactly the bug this function exists to avoid."
+    )]
     fn commit(
         &self,
         prepared: Vec<PreparedBinding>,
@@ -1286,6 +1299,80 @@ fn outcome_for_guest(err: &HarvestError) -> Option<DecideOutcome> {
 /// task as a capability miss instead — so in a worker they are defence in depth
 /// rather than the live path. They remain errors here for the test harness and
 /// the replayer, which have no seam.
+/// Resolve the queue an `Await` should schedule onto, applying the host's
+/// policy.
+///
+/// # Errors
+///
+/// A message naming the refusal when the guest asked to override the queue and
+/// the host does not allow it, or when the resolved queue is empty (no worker
+/// polls the empty queue, so the activity would sit until schedule-to-start
+/// expired instead of failing fast).
+fn resolve_activity_queue(
+    host: &ModuleHost,
+    ctx: &WorkflowContext,
+    build_id: &str,
+    activity: &str,
+    requested: Option<String>,
+) -> Result<String, String> {
+    let queue = match requested {
+        Some(_) if !host.allow_queue_override => {
+            return Err(format!(
+                "workflow module for build `{build_id}` asked to override the activity queue, \
+                 which this host does not allow"
+            ));
+        }
+        Some(queue) => queue,
+        None => ctx.queue_name().to_string(),
+    };
+    if queue.is_empty() {
+        return Err(format!(
+            "workflow module for build `{build_id}` resolved an empty activity queue for `{}`; \
+             no worker polls the empty queue, so the activity would never be picked up",
+            bound_guest_text(activity)
+        ));
+    }
+    Ok(queue)
+}
+
+/// Check the host's policy for one `Await` before anything is scheduled.
+///
+/// # Errors
+///
+/// A message naming the refusal when the ceiling would be exceeded or the
+/// activity is not on the host's allowlist.
+fn check_await_allowed(
+    host: &ModuleHost,
+    build_id: &str,
+    step: usize,
+    activity: &str,
+) -> Result<(), String> {
+    // Refuse the await the ceiling could not consume, BEFORE scheduling it.
+    // Otherwise the last permitted step runs a real activity — money moved,
+    // mail sent — and the run is then failed for not terminating, having paid
+    // for a side effect it can never use.
+    if step + 1 >= MAX_DECIDE_STEPS {
+        return Err(format!(
+            "workflow module for build `{build_id}` asked for another activity at step {step}, \
+             which would exceed the {MAX_DECIDE_STEPS}-decision ceiling; refusing to schedule it"
+        ));
+    }
+    if let Some(allowed) = &host.allowed_activities
+        && !allowed.contains(activity)
+    {
+        return Err(format!(
+            "workflow module for build `{build_id}` asked to schedule activity `{}`, which this \
+             host does not allow",
+            bound_guest_text(activity)
+        ));
+    }
+    Ok(())
+}
+
+/// # Panics
+///
+/// Never: the only `expect` converts the loop index to `u32`, and the index is
+/// bounded by [`MAX_DECIDE_STEPS`], far below `u32::MAX`.
 #[must_use]
 pub fn module_workflow_handler(
     ctx: &WorkflowContext,
@@ -1365,45 +1452,8 @@ pub fn module_workflow_handler(
                     input: activity_input,
                     queue,
                 } => {
-                    // Refuse the await the cap could not consume, BEFORE
-                    // scheduling it. Otherwise the last permitted step runs a
-                    // real activity — money moved, mail sent — and the run is
-                    // then failed for not terminating, having already paid for
-                    // a side effect it can never use.
-                    if step + 1 >= MAX_DECIDE_STEPS {
-                        return Err(format!(
-                            "workflow module for build `{build_id}` asked for another activity at \
-                             step {step}, which would exceed the {MAX_DECIDE_STEPS}-decision \
-                             ceiling; refusing to schedule it"
-                        ));
-                    }
-                    if let Some(allowed) = &host.allowed_activities
-                        && !allowed.contains(&activity)
-                    {
-                        return Err(format!(
-                            "workflow module for build `{build_id}` asked to schedule activity \
-                             `{}`, which this host does not allow",
-                            bound_guest_text(&activity)
-                        ));
-                    }
-                    let queue = match queue {
-                        Some(_) if !host.allow_queue_override => {
-                            return Err(format!(
-                                "workflow module for build `{build_id}` asked to override the \
-                                 activity queue, which this host does not allow"
-                            ));
-                        }
-                        Some(queue) => queue,
-                        None => ctx.queue_name().to_string(),
-                    };
-                    if queue.is_empty() {
-                        return Err(format!(
-                            "workflow module for build `{build_id}` resolved an empty activity \
-                             queue for `{}`; no worker polls the empty queue, so the activity \
-                             would never be picked up",
-                            bound_guest_text(&activity)
-                        ));
-                    }
+                    check_await_allowed(&host, &build_id, step, &activity)?;
+                    let queue = resolve_activity_queue(&host, ctx, &build_id, &activity, queue)?;
                     let outcome = ctx
                         .execute_activity_raw(&activity, activity_input, &queue)
                         .await;
@@ -1584,13 +1634,13 @@ mod tests {
 
     #[test]
     fn the_trampoline_is_recognisable_by_the_worker_seam() {
-        assert!(is_module_hosted(module_workflow_handler));
         fn other(
             _ctx: &WorkflowContext,
             _input: Value,
         ) -> Pin<Box<dyn Future<Output = Result<Value, String>> + Send + '_>> {
             Box::pin(async move { Ok(Value::Null) })
         }
+        assert!(is_module_hosted(module_workflow_handler));
         assert!(!is_module_hosted(other));
     }
 
