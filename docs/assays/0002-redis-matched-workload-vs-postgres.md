@@ -252,6 +252,18 @@ warmup call too. `claims_per_sec = total_claimed / wall_secs`.
 > registered cell after this fix (18,803.91 claims/s) again lands inside the
 > already-reported range.
 >
+> **Post-review correction, round 4 (Codex, on the round-3 fix).** With
+> connect failures now surviving instead of panicking, an all-connections-
+> fail run would report zero latency samples — and the CSV printed that as
+> `p50_ms=0.000,p99_ms=0.000`, indistinguishable from a genuinely
+> instantaneous claim. `claim_bench_support.rs` renders a zero-sample
+> consumer as `n/a` rather than `0` for exactly this reason. Fixed by making
+> the percentile fields `Option<f64>` (`None` when `n == 0`), rendered as
+> `n/a` in the printed row. Cosmetic only for every run this assay actually
+> reports (`n = 720`/`184` throughout, never `0`); re-verified with another
+> spot-check of the registered cell (19,083.43 claims/s), again inside the
+> reported range.
+>
 > Both fixes changed the *mechanism*, not the *conclusion*: the corrected
 > registered-cell mean (18,933.43 claims/s across four runs, see Assay) is
 > within the pre-fix runs' range (15,319.64-19,140.83) and clears the same

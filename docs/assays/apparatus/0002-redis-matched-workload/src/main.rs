@@ -196,8 +196,13 @@ struct CellReport {
     wall_secs: f64,
     claims_per_sec: f64,
     truncated: bool,
-    p50_ms: f64,
-    p99_ms: f64,
+    /// `None` (rendered `n/a`) when `n == 0` -- a zero-sample percentile is
+    /// not "0ms", it's "nothing was measured". Mirrors
+    /// `claim_bench_support.rs`'s own `n/a` rendering for a zero-sample
+    /// consumer (`claim_bench.rs:133-136`) rather than printing a
+    /// misleadingly instantaneous-looking `0.000`.
+    p50_ms: Option<f64>,
+    p99_ms: Option<f64>,
 }
 
 fn percentile(mut xs: Vec<f64>, p: f64) -> f64 {
@@ -311,6 +316,7 @@ async fn run_cell(backlog: usize, redis_url: &str, scenario_budget: Duration) ->
     let truncated = total_collected < total_ops;
     let claims_per_sec = if wall_secs <= 0.0 { 0.0 } else { total_claimed as f64 / wall_secs };
 
+    let has_samples = !samples.is_empty();
     CellReport {
         backlog,
         n: samples.len(),
@@ -320,8 +326,15 @@ async fn run_cell(backlog: usize, redis_url: &str, scenario_budget: Duration) ->
         wall_secs,
         claims_per_sec,
         truncated,
-        p50_ms: percentile(samples.clone(), 0.50),
-        p99_ms: percentile(samples, 0.99),
+        p50_ms: has_samples.then(|| percentile(samples.clone(), 0.50)),
+        p99_ms: has_samples.then(|| percentile(samples, 0.99)),
+    }
+}
+
+fn fmt_ms(v: Option<f64>) -> String {
+    match v {
+        Some(ms) => format!("{ms:.3}"),
+        None => "n/a".to_string(),
     }
 }
 
@@ -349,7 +362,7 @@ async fn main() {
     for backlog in backlogs {
         let r = run_cell(backlog, &redis_url, scenario_budget).await;
         println!(
-            "{},{},{},{},{},{:.3},{:.2},{:.3},{:.3},{}",
+            "{},{},{},{},{},{:.3},{:.2},{},{},{}",
             r.backlog,
             r.n,
             r.claimed,
@@ -357,8 +370,8 @@ async fn main() {
             r.total_claimed,
             r.wall_secs,
             r.claims_per_sec,
-            r.p50_ms,
-            r.p99_ms,
+            fmt_ms(r.p50_ms),
+            fmt_ms(r.p99_ms),
             r.truncated
         );
     }
