@@ -2487,8 +2487,13 @@ pub async fn enforce_external_signals_outbox(
                 // history for a workflow that is alive on another shard.
                 let routed_shard = match active_sharded_pool.as_ref() {
                     Some(pool) => {
-                        crate::shard_rebalance::resolve_target_shard(pool, &target, caller_shard)
-                            .await
+                        crate::shard_rebalance::resolve_target_shard_holding(
+                            conn,
+                            pool,
+                            &target,
+                            caller_shard,
+                        )
+                        .await
                     }
                     None => caller_shard,
                 };
@@ -2889,8 +2894,13 @@ pub async fn enforce_external_cancels_outbox(
                 // history for a workflow that is alive on another shard.
                 let routed_shard = match active_sharded_pool.as_ref() {
                     Some(pool) => {
-                        crate::shard_rebalance::resolve_target_shard(pool, &target, caller_shard)
-                            .await
+                        crate::shard_rebalance::resolve_target_shard_holding(
+                            conn,
+                            pool,
+                            &target,
+                            caller_shard,
+                        )
+                        .await
                     }
                     None => caller_shard,
                 };
@@ -3109,11 +3119,32 @@ pub async fn enforce_external_cancels_outbox(
                     // failure degrades to the un-forwarded shard, which is the
                     // pre-#964 behaviour.
                     let residence = match outer_sharded_pool.as_ref() {
-                        Some(pool) => Some(
-                            crate::shard_rebalance::resolve_execution_shard(pool, exec_id)
-                                .await
-                                .unwrap_or_else(|_| pool.routed_shard_for_execution(exec_id)),
-                        ),
+                        Some(pool) => {
+                            let entry = pool.routed_shard_for_execution(exec_id);
+                            // This loop runs while `conn` is STILL CHECKED OUT,
+                            // so the residence lookup must not take a second
+                            // connection from the pool that lent it -- that is
+                            // the size-1 self-deadlock this deferred path was
+                            // restructured to avoid in the first place (issue
+                            // #751), and resolving through `pool` reintroduced
+                            // it by the back door. Read the pointer on `conn`
+                            // whenever the id enters on the held database;
+                            // only a genuinely different one is resolved
+                            // through the pool.
+                            let resolved: crate::types::ShardId = if std::ptr::eq(
+                                pool.pool_for(entry),
+                                pool.pool_for(caller_shard),
+                            ) {
+                                crate::shard_rebalance::forward_of_held_row(conn, exec_id)
+                                    .await
+                                    .unwrap_or(entry)
+                            } else {
+                                crate::shard_rebalance::resolve_execution_shard(pool, exec_id)
+                                    .await
+                                    .unwrap_or(entry)
+                            };
+                            Some(resolved)
+                        }
                         None => None,
                     };
                     let same_pool_as_caller = outer_sharded_pool.as_ref().is_none_or(|pool| {
@@ -3316,10 +3347,11 @@ pub async fn enforce_external_awaits_outbox(
                 // the other shard completes.
                 let routed_shard = match active_sharded_pool.as_ref() {
                     Some(pool) => {
-                        crate::shard_rebalance::resolve_target_shard(
+                        crate::shard_rebalance::resolve_target_shard_holding(
+                            conn,
                             pool,
                             &crate::types::ExternalTarget::ExecutionId(target),
-                            target.shard(),
+                            caller_shard,
                         )
                         .await
                     }

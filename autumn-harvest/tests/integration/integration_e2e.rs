@@ -395,7 +395,14 @@ const LEGACY_INIT_SQL: &str = concat!(
     // issue #946: WorkflowExecution::as_select() (the modern start path's
     // read-back) references the quota_key column even for a fresh (no quota
     // policy configured) execution.
-    "ALTER TABLE harvest_workflow_executions ADD COLUMN IF NOT EXISTS quota_key TEXT NULL;\n"
+    "ALTER TABLE harvest_workflow_executions ADD COLUMN IF NOT EXISTS quota_key TEXT NULL;\n",
+    // issue #964: WorkflowExecution::as_select() (the modern start path's
+    // read-back) references the three rebalancing columns even for an
+    // execution that has never been migrated -- which is every execution in
+    // every deployment that never runs a rebalance.
+    "ALTER TABLE harvest_workflow_executions ADD COLUMN IF NOT EXISTS migrated_to_shard INTEGER NULL;\n",
+    "ALTER TABLE harvest_workflow_executions ADD COLUMN IF NOT EXISTS migrated_at TIMESTAMPTZ NULL;\n",
+    "ALTER TABLE harvest_workflow_executions ADD COLUMN IF NOT EXISTS migrated_from_shards JSONB NULL;\n"
 );
 
 /// Start a Postgres container with the harvest schema applied and return

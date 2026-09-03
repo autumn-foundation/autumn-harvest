@@ -601,10 +601,11 @@ pub fn history_fingerprint(events: &[crate::event::WorkflowEvent]) -> String {
 pub use db::{
     MigrationBatchReport, MigrationOutcome, MigrationRecord, ShardMigrationCandidate,
     abort_migration, activate_target, assert_schema_parity, begin_migration, commit_cutover,
-    conn_for_execution_forwarded, conn_for_live_shard, conn_for_shard, list_migration_candidates,
-    load_migration, migrate_execution, migrate_quiescent_executions, observe_quiescence,
-    residence_chain, resolve_execution_shard, resolve_target_shard, resume_incomplete_migrations,
-    shard_of_held_row, stage_copy, verify_target_copy,
+    conn_for_execution_forwarded, conn_for_live_shard, conn_for_shard, forward_of_held_row,
+    list_migration_candidates, load_migration, migrate_execution, migrate_quiescent_executions,
+    observe_quiescence, residence_chain, resolve_execution_shard, resolve_target_shard,
+    resolve_target_shard_holding, resume_incomplete_migrations, shard_of_held_row, stage_copy,
+    verify_target_copy,
 };
 
 #[cfg(feature = "db")]
@@ -2814,6 +2815,86 @@ mod db {
         shard_id: i32,
     }
 
+    /// Where an execution's row on the **held** database forwards to, or
+    /// `None` when it has not moved.
+    ///
+    /// The connection-based twin of [`resolve_execution_shard`]'s first hop,
+    /// and the reason it exists is a hard constraint rather than a convenience:
+    /// a caller inside a transaction is holding a connection from one of
+    /// `pool`'s databases, and taking a SECOND connection from that same pool
+    /// blocks forever under the documented pool-size-1 configuration (issue
+    /// #751). Any residence lookup performed while such a connection is held
+    /// must therefore read on it, not check out beside it.
+    ///
+    /// One read is the whole answer: `collapse_forward_chain` rewrites an
+    /// origin's pointer straight to the final target, so a pointer read here
+    /// does not need the hop loop that [`resolve_execution_shard`] runs for the
+    /// window in which a chain has not yet been collapsed.
+    pub async fn forward_of_held_row(
+        conn: &mut AsyncPgConnection,
+        exec_id: ExecutionId,
+    ) -> Option<ShardId> {
+        read_forward(conn, exec_id).await.ok().flatten()
+    }
+
+    /// [`resolve_target_shard`], for a caller already holding a connection from
+    /// the pool that serves `held_shard`.
+    ///
+    /// Identical in result. The difference is where the lookups run: every one
+    /// that would land on the held database is issued on `conn`, because
+    /// checking out a second connection from the pool that lent it
+    /// self-deadlocks a size-1 pool (issue #751). Only a genuinely different
+    /// database is reached through `pool`, where a checkout cannot contend with
+    /// the connection the caller is holding.
+    pub async fn resolve_target_shard_holding(
+        conn: &mut AsyncPgConnection,
+        pool: &ShardedDbPool,
+        target: &crate::types::ExternalTarget,
+        held_shard: ShardId,
+    ) -> ShardId {
+        let unforwarded = match target {
+            crate::types::ExternalTarget::ExecutionId(id) => pool.routed_shard_for_execution(*id),
+            crate::types::ExternalTarget::WorkflowId { .. } => {
+                crate::shard::external_target_owning_shard(target).unwrap_or(held_shard)
+            }
+        };
+        if pool.len() <= 1 {
+            return unforwarded;
+        }
+        // Compared as references, never stored as a raw pointer: a `*const`
+        // held across an `.await` would make this future `!Send`.
+        let on_held =
+            |shard: ShardId| std::ptr::eq(pool.pool_for(shard), pool.pool_for(held_shard));
+
+        let exec_id = match target {
+            crate::types::ExternalTarget::ExecutionId(id) => *id,
+            crate::types::ExternalTarget::WorkflowId {
+                workflow_name,
+                workflow_id,
+            } => {
+                let found = if on_held(unforwarded) {
+                    business_key_on(conn, workflow_name, workflow_id).await
+                } else {
+                    resolve_business_key(pool, unforwarded, workflow_name, workflow_id).await
+                };
+                match found {
+                    Some(id) => id,
+                    None => return unforwarded,
+                }
+            }
+        };
+
+        if on_held(pool.routed_shard_for_execution(exec_id)) {
+            forward_of_held_row(conn, exec_id)
+                .await
+                .unwrap_or(unforwarded)
+        } else {
+            resolve_execution_shard(pool, exec_id)
+                .await
+                .unwrap_or(unforwarded)
+        }
+    }
+
     /// Check out a connection to one specific shard, failing closed when this
     /// node has no pool for it.
     ///
@@ -3000,6 +3081,16 @@ mod db {
         workflow_id: &str,
     ) -> Option<ExecutionId> {
         let mut conn = checkout(pool, shard).await.ok()?;
+        business_key_on(&mut conn, workflow_name, workflow_id).await
+    }
+
+    /// [`resolve_business_key`]'s query, against a connection the caller
+    /// already holds.
+    async fn business_key_on(
+        conn: &mut AsyncPgConnection,
+        workflow_name: &str,
+        workflow_id: &str,
+    ) -> Option<ExecutionId> {
         let row: Option<BusinessKeyRow> = diesel::sql_query(
             "SELECT id FROM harvest_workflow_executions \
               WHERE workflow_name = $1 AND workflow_id = $2 \
@@ -3008,7 +3099,7 @@ mod db {
         )
         .bind::<Text, _>(workflow_name)
         .bind::<Text, _>(workflow_id)
-        .get_result(&mut *conn)
+        .get_result(conn)
         .await
         .optional_row()
         .ok()
