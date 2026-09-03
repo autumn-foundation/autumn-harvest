@@ -42,7 +42,7 @@ use autumn_harvest::error::HarvestError;
 use autumn_harvest::event::WorkflowEvent;
 use autumn_harvest::models::NewWorkflowExecution;
 use autumn_harvest::payload_codec::PayloadCodecs;
-use autumn_harvest::shard::ShardedDbPool;
+use autumn_harvest::shard::{ShardRouter, ShardedDbPool, install_global_router};
 use autumn_harvest::shard_rebalance::{
     MigrationOutcome, MigrationPhase, QuiescenceBlocker, abort_migration, activate_target,
     assess_quiescence, begin_migration, commit_cutover, history_fingerprint,
@@ -2352,4 +2352,54 @@ async fn single_pool_resolves_an_execution_whose_id_encodes_another_shard() {
         vec![foreign],
         "a run that never migrated has a one-shard residence chain"
     );
+}
+
+/// A declared retired-shard forward names one specific database, so a missing
+/// successor pool must fail closed rather than fall back to the default.
+///
+/// `routed_shard_for_execution` applies an operator-declared `A -> B` forward
+/// and returns **B**. The single-pool fallback that lets an ordinary id reach
+/// its own row (see `checkout_entry`) must not apply to that B: the operator
+/// has asserted A is gone and its ids now live on B, so answering from the
+/// default shard reads an unrelated database and returns a confident "not
+/// found" for every A-origin execution -- silently, which is the part that
+/// makes it worse than an error.
+///
+/// Pins the distinction the fallback turns on: tolerate a missing pool for an
+/// id resolving to its OWN encoded shard, never for one routing has forwarded.
+#[tokio::test]
+async fn a_declared_retired_forward_requires_its_successor_pool() {
+    let (url, _guard) = setup_isolated_db().await;
+    // One pool, at ShardId(0). Shard 9 -- the declared successor below -- has
+    // no pool on this node.
+    let pool = ShardedDbPool::single(build_pool(&url));
+
+    let retired = ShardId::new(5);
+    let successor = ShardId::new(9);
+    install_global_router(
+        ShardRouter::new(
+            vec![ShardId::new(0), successor],
+            vec![ShardId::new(0)],
+            ShardId::new(0),
+        )
+        .with_shard_forwards([(retired, successor)]),
+    );
+
+    let err = resolve_execution_shard(&pool, ExecutionId::new_for_shard(retired))
+        .await
+        .expect_err("a forwarded id whose successor pool is absent must not resolve");
+
+    // Restore before asserting, so a failure here cannot leak the forward into
+    // whatever test runs next in this binary.
+    install_global_router(ShardRouter::single());
+
+    match err {
+        HarvestError::ShardUnavailable { shard_id, .. } => assert_eq!(
+            shard_id,
+            successor.as_i32(),
+            "the unavailable shard must be reported as the SUCCESSOR the operator declared, \
+             not the retired origin -- that is the database an operator has to go install"
+        ),
+        other => panic!("expected ShardUnavailable for an absent successor pool, got {other:?}"),
+    }
 }

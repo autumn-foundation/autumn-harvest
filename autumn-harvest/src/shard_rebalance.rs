@@ -2638,12 +2638,20 @@ mod db {
         exec_id: ExecutionId,
     ) -> HarvestResult<ShardId> {
         let origin = pool.routed_shard_for_execution(exec_id);
+        // Did routing apply an operator-declared retired-shard forward? If so
+        // `origin` is a SUCCESSOR, which names one specific database exactly as
+        // a `migrated_to_shard` pointer does: the operator has asserted A is
+        // gone and its ids now live on B, so answering from the default shard
+        // instead of B reads the wrong database and returns a confident 404.
+        // Tolerate a missing pool only for an id resolving to its own encoded
+        // shard -- the single-pool case `checkout_entry` exists for.
+        let forwarded = !exec_id.shard().is_unencoded() && origin != exec_id.shard();
         let mut current = origin;
         for hop in 0..MAX_FORWARD_HOPS {
-            // The ORIGIN hop is tolerant (see `checkout_entry`); every hop after
-            // it follows a stored pointer that names one specific database and
-            // must resolve there or fail.
-            let mut conn = if hop == 0 {
+            // The ORIGIN hop is tolerant (see `checkout_entry`) unless routing
+            // already forwarded it; every hop after it follows a stored pointer
+            // that names one specific database and must resolve there or fail.
+            let mut conn = if hop == 0 && !forwarded {
                 checkout_entry(pool, current).await?
             } else {
                 checkout(pool, current).await?
@@ -3059,10 +3067,11 @@ mod db {
     /// that lands on the wrong database finds no row and answers `NotFound`,
     /// never another run's data.
     ///
-    /// Deliberately NOT used for a shard named by a `migrated_to_shard` pointer
-    /// or by a migration record. Those name one specific database, and a silent
-    /// fallback to the default there would resolve the run to the wrong shard --
-    /// or, on the erase path, scrub the wrong copy.
+    /// Deliberately NOT used for a shard named by a `migrated_to_shard` pointer,
+    /// by a migration record, or by an operator-declared retired-shard forward.
+    /// Each of those names one specific database, and a silent fallback to the
+    /// default there would resolve the run to the wrong shard -- or, on the
+    /// erase path, scrub the wrong copy.
     async fn checkout_entry(
         pool: &ShardedDbPool,
         shard: ShardId,
