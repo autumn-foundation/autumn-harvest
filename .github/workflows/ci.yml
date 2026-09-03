@@ -603,12 +603,24 @@ jobs:
           # class); the admin route itself may still 401 in the dev profile
           # with no session (issue #1284, a getting-started auth-flow
           # question tracked and decided separately, not this job's to fix).
-          cli_out="$(cargo run -p autumn-harvest-cli -- --base-url http://localhost:3000/api/harvest preflight 2>&1)" || true
+          # Only that specific, already-diagnosed outcome is tolerated — any
+          # other nonzero exit (wrong default-run binary, a crash, a changed
+          # error shape) fails the step rather than being swallowed by a
+          # blanket `|| true`.
+          cli_out="$(cargo run -p autumn-harvest-cli -- --base-url http://localhost:3000/api/harvest preflight 2>&1)"
+          cli_status=$?
           if echo "${cli_out}" | grep -q "could not determine which binary to run"; then
             echo "${cli_out}"
             echo "::error::cargo run -p autumn-harvest-cli -- ... is ambiguous (missing default-run)"; exit 1
           fi
-          echo "cli resolved and ran (see issue #1284 for the known dev-profile 401)"
+          if [ "${cli_status}" -eq 0 ]; then
+            echo "cli resolved and preflight succeeded"
+          elif [ "${cli_status}" -eq 1 ] && echo "${cli_out}" | grep -q "harvest API returned 401"; then
+            echo "cli resolved and ran (see issue #1284 for the known dev-profile 401)"
+          else
+            echo "${cli_out}"
+            echo "::error::cargo run -p autumn-harvest-cli -- ... preflight failed unexpectedly (exit ${cli_status}), not the known issue #1284 401"; exit 1
+          fi
 
           # 3. Trigger the `greeting` workflow (README step 4) and capture its execution_id.
           resp="$(curl -sf -X POST \
