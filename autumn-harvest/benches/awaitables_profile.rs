@@ -281,7 +281,10 @@ fn env_usize(key: &str, default: usize) -> usize {
 }
 
 fn validate_workload_params(n: usize, reps: usize) {
-    assert!(reps >= 1, "AWAITABLES_PROFILE_REPS must be at least 1, got 0");
+    assert!(
+        reps >= 1,
+        "AWAITABLES_PROFILE_REPS must be at least 1, got 0"
+    );
     assert!(n >= 10, "AWAITABLES_PROFILE_N must be at least 10, got {n}");
 }
 
