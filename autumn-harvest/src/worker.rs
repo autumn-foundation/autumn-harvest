@@ -17052,6 +17052,154 @@ async fn persist_workflow_outcome(
     }
 }
 
+/// This cycle's terminal-metrics facts, captured in
+/// [`process_workflow_task`] before its outcome moves into the persist
+/// transaction, and actually emitted only from that transaction's
+/// `Persisted` arm (issue #1184, Codex review round 2, P2) -- see
+/// `emit_pending_workflow_metrics`'s doc comment for why.
+struct PendingWorkflowMetrics {
+    status: WorkflowStatus,
+    is_canary: bool,
+    canary_shard: u16,
+    /// `Some` only when this cycle is neither a canary nor `Suspended` --
+    /// mirrors the original `!is_canary` / `!matches!(Suspended)` gates.
+    history_size: Option<u64>,
+    is_continued_as_new: bool,
+    terminal: TerminalMetricsKind,
+}
+
+/// Which terminal (or non-terminal) shape this cycle's outcome had, for
+/// [`PendingWorkflowMetrics`].
+enum TerminalMetricsKind {
+    Completed,
+    Failed {
+        had_nd_details: bool,
+    },
+    ContinuedAsNew,
+    /// Not terminal -- carried only so the emitter's `match` stays exhaustive
+    /// and explicit about doing nothing here (issue #519).
+    Suspended,
+}
+
+/// Emit the `harvest.workflow.*`/`harvest.canary.*` terminal metrics
+/// [`process_workflow_task`] computed for this cycle, from `pending`.
+///
+/// Issue #1184 (Codex review round 2, P2): these calls used to run BEFORE
+/// the persist transaction, so a claim-ambiguity rollback (this issue's own
+/// guards, or #1182's `SuspendedClaimAmbiguous`) or an operator pause caught
+/// by `check_paused_and_park` inside that transaction still counted a
+/// decision that was never durably persisted -- and the eventual real
+/// attempt counts it again (worse for a canary: it could report SUCCESS for
+/// a decision that was discarded). Callers must call this ONLY after the
+/// persist transaction has actually committed (the `Persisted` arm), never
+/// speculatively -- mirrors the discipline issue #684 already established
+/// for `harvest.update.completed`/`.failed` and `harvest.signal.unhandled`.
+fn emit_pending_workflow_metrics(
+    telemetry: &crate::telemetry::TelemetryConfig,
+    execution: &WorkflowExecution,
+    queue_name: &str,
+    build_id: &str,
+    started_at: std::time::Instant,
+    pending: &PendingWorkflowMetrics,
+) {
+    if !pending.is_canary {
+        telemetry.metrics.record_workflow_completed(
+            &execution.workflow_name,
+            queue_name,
+            started_at.elapsed().as_secs_f64(),
+            pending.status,
+        );
+        if let Some(history_size) = pending.history_size {
+            telemetry
+                .metrics
+                .record_workflow_history_size(&execution.workflow_name, history_size);
+        }
+        if pending.is_continued_as_new {
+            telemetry
+                .metrics
+                .record_workflow_continue_as_new(&execution.workflow_name);
+        }
+    }
+    // Emit the once-per-terminal-outcome counter (issue #519). Suspended is
+    // not a terminal state -- a workflow that suspends N times and then
+    // completes must produce exactly one `completed` increment.
+    //
+    // The non-canary terminal counter routes through
+    // `crate::telemetry::emit_workflow_terminal`, the single choke point that
+    // skips canary probes (issue #796) -- so the canary-skip for the terminal
+    // counter lives in exactly one place; the canary branches below emit only
+    // the probe's own `harvest.canary.*` signal.
+    match &pending.terminal {
+        TerminalMetricsKind::Completed => {
+            if pending.is_canary {
+                // Round-trip = start-requested → completed wall-clock (AC5).
+                // Clamp a clock-skew negative delta to 0 (`.to_std()` errs on
+                // a negative chrono duration), mirroring the update-duration
+                // clamping precedent.
+                let roundtrip_secs = (chrono::Utc::now() - execution.started_at)
+                    .to_std()
+                    .map_or(0.0, |delta| delta.as_secs_f64());
+                telemetry
+                    .metrics
+                    .record_canary_success(queue_name, pending.canary_shard);
+                telemetry.metrics.record_canary_roundtrip(
+                    queue_name,
+                    pending.canary_shard,
+                    roundtrip_secs,
+                );
+            } else {
+                crate::telemetry::emit_workflow_terminal(
+                    &*telemetry.metrics,
+                    &execution.workflow_name,
+                    queue_name,
+                    WorkflowStatus::Completed,
+                );
+            }
+        }
+        TerminalMetricsKind::Failed { had_nd_details } => {
+            // Defensive (issue #603): an ND-carrying Failed outcome is gated
+            // earlier into `block_workflow_for_non_determinism` (which emits
+            // the detection counter itself) and never reaches this arm.
+            // Asserted so a future regression that lets this happen panics
+            // loudly in debug/test builds instead of silently double-counting
+            // (or, worse, silently NOT counting once the gate is removed).
+            debug_assert!(
+                !had_nd_details,
+                "ND-carrying Failed outcome must be gated earlier in \
+                 process_workflow_task, before terminal metrics are recorded"
+            );
+            if *had_nd_details {
+                telemetry
+                    .metrics
+                    .record_workflow_non_determinism(&execution.workflow_name, build_id);
+            }
+            if pending.is_canary {
+                telemetry
+                    .metrics
+                    .record_canary_failure(queue_name, pending.canary_shard);
+            } else {
+                crate::telemetry::emit_workflow_terminal(
+                    &*telemetry.metrics,
+                    &execution.workflow_name,
+                    queue_name,
+                    WorkflowStatus::Failed,
+                );
+            }
+        }
+        TerminalMetricsKind::ContinuedAsNew => {
+            // A canary never continues-as-new; the choke point skips it anyway
+            // (AC8), so this is effectively unreachable for a canary.
+            crate::telemetry::emit_workflow_terminal(
+                &*telemetry.metrics,
+                &execution.workflow_name,
+                queue_name,
+                WorkflowStatus::ContinuedAsNew,
+            );
+        }
+        TerminalMetricsKind::Suspended => {} // not terminal — no counter
+    }
+}
+
 /// Outcome of the pause-guarded persistence transaction in
 /// [`process_workflow_task`].
 enum WorkflowPersistFlow {
@@ -19409,118 +19557,51 @@ async fn process_workflow_task(
         WorkflowOutcome::Suspended { .. } => WorkflowStatus::Suspended,
         WorkflowOutcome::ContinuedAsNew { .. } => WorkflowStatus::ContinuedAsNew,
     };
-    if !is_canary {
-        telemetry.metrics.record_workflow_completed(
-            &prepared.execution.workflow_name,
-            &task.queue_name,
-            started_at.elapsed().as_secs_f64(),
-            status,
-        );
-        if !matches!(&outcome, WorkflowOutcome::Suspended { .. }) {
-            telemetry.metrics.record_workflow_history_size(
-                &prepared.execution.workflow_name,
-                terminal_history_event_count(
-                    next_event_id,
-                    &pending_cmds,
-                    records_abandoned_dispatches(&outcome),
-                )
-                .saturating_add(terminal_parent_close_cascade_events),
-            );
-        }
-        if matches!(&outcome, WorkflowOutcome::ContinuedAsNew { .. }) {
-            telemetry
-                .metrics
-                .record_workflow_continue_as_new(&prepared.execution.workflow_name);
-        }
-    }
-    // Emit the once-per-terminal-outcome counter (issue #519).
-    // Suspended is not a terminal state — a workflow that suspends N times
-    // and then completes must produce exactly one `completed` increment.
-    //
-    // Issue #684: harvest.signal.unhandled is NOT emitted here. It is collected
-    // below (before the persist transaction moves `outcome`) and emitted
-    // post-commit in the `Persisted` arm — the same discipline as
-    // harvest.update.completed/failed — so it represents DURABLE terminal
-    // outcomes only. This site (`record_workflow_terminal`, #519) keeps its own
-    // pre-persist placement unchanged.
-    //
-    // The non-canary terminal counter routes through
-    // `crate::telemetry::emit_workflow_terminal`, the single choke point that
-    // skips canary probes (issue #796) — so the canary-skip for the terminal
-    // counter lives in exactly one place; the canary branches below emit only
-    // the probe's own `harvest.canary.*` signal.
-    match &outcome {
-        WorkflowOutcome::Completed { .. } => {
-            if is_canary {
-                // Round-trip = start-requested → completed wall-clock (AC5).
-                // Clamp a clock-skew negative delta to 0 (`.to_std()` errs on
-                // a negative chrono duration), mirroring the update-duration
-                // clamping precedent.
-                let roundtrip_secs = (chrono::Utc::now() - prepared.execution.started_at)
-                    .to_std()
-                    .map_or(0.0, |delta| delta.as_secs_f64());
-                telemetry
-                    .metrics
-                    .record_canary_success(&task.queue_name, canary_shard);
-                telemetry.metrics.record_canary_roundtrip(
-                    &task.queue_name,
-                    canary_shard,
-                    roundtrip_secs,
-                );
-            } else {
-                crate::telemetry::emit_workflow_terminal(
-                    &*telemetry.metrics,
-                    &prepared.execution.workflow_name,
-                    &task.queue_name,
-                    WorkflowStatus::Completed,
-                );
-            }
-        }
+    // Issue #1184 (Codex review round 2, P2): these used to be EMITTED right
+    // here, before the persist transaction below. A claim-ambiguity rollback
+    // (this issue's own guards, or #1182's SuspendedClaimAmbiguous) or an
+    // operator pause caught by `check_paused_and_park` inside that
+    // transaction both discard this cycle's decision entirely -- so counting
+    // it here double-counted once the real attempt eventually persists (and,
+    // for a canary, could report SUCCESS for a decision that was discarded).
+    // Only the derived, `Copy`-friendly facts are captured here, while
+    // `outcome` is still borrowable; the actual `telemetry.metrics.*` calls
+    // now live in `emit_pending_workflow_metrics`, called from the
+    // `Persisted` arm below -- the same "capture pre-persist, emit
+    // post-commit" discipline issue #684 already established for
+    // `harvest.update.completed`/`.failed` and `harvest.signal.unhandled`.
+    let history_size = if !is_canary && !matches!(&outcome, WorkflowOutcome::Suspended { .. }) {
+        Some(
+            terminal_history_event_count(
+                next_event_id,
+                &pending_cmds,
+                records_abandoned_dispatches(&outcome),
+            )
+            .saturating_add(terminal_parent_close_cascade_events),
+        )
+    } else {
+        None
+    };
+    let is_continued_as_new = matches!(&outcome, WorkflowOutcome::ContinuedAsNew { .. });
+    let terminal_metrics_kind = match &outcome {
+        WorkflowOutcome::Completed { .. } => TerminalMetricsKind::Completed,
         WorkflowOutcome::Failed {
             non_deterministic_details,
             ..
-        } => {
-            // Defensive (issue #603): an ND-carrying Failed outcome is gated
-            // earlier into `block_workflow_for_non_determinism` (which emits
-            // the detection counter itself) and never reaches this arm.
-            // Asserted so a future regression that lets this happen panics
-            // loudly in debug/test builds instead of silently double-counting
-            // (or, worse, silently NOT counting once the gate is removed).
-            debug_assert!(
-                non_deterministic_details.is_none(),
-                "ND-carrying Failed outcome must be gated earlier in \
-                 process_workflow_task, before terminal metrics are recorded"
-            );
-            if non_deterministic_details.is_some() {
-                telemetry
-                    .metrics
-                    .record_workflow_non_determinism(&prepared.execution.workflow_name, build_id);
-            }
-            if is_canary {
-                telemetry
-                    .metrics
-                    .record_canary_failure(&task.queue_name, canary_shard);
-            } else {
-                crate::telemetry::emit_workflow_terminal(
-                    &*telemetry.metrics,
-                    &prepared.execution.workflow_name,
-                    &task.queue_name,
-                    WorkflowStatus::Failed,
-                );
-            }
-        }
-        WorkflowOutcome::ContinuedAsNew { .. } => {
-            // A canary never continues-as-new; the choke point skips it anyway
-            // (AC8), so this is effectively unreachable for a canary.
-            crate::telemetry::emit_workflow_terminal(
-                &*telemetry.metrics,
-                &prepared.execution.workflow_name,
-                &task.queue_name,
-                WorkflowStatus::ContinuedAsNew,
-            );
-        }
-        WorkflowOutcome::Suspended { .. } => {} // not terminal — no counter
-    }
+        } => TerminalMetricsKind::Failed {
+            had_nd_details: non_deterministic_details.is_some(),
+        },
+        WorkflowOutcome::ContinuedAsNew { .. } => TerminalMetricsKind::ContinuedAsNew,
+        WorkflowOutcome::Suspended { .. } => TerminalMetricsKind::Suspended,
+    };
+    let pending_workflow_metrics = PendingWorkflowMetrics {
+        status,
+        is_canary,
+        canary_shard,
+        history_size,
+        is_continued_as_new,
+        terminal: terminal_metrics_kind,
+    };
 
     // Issue #603 fix: if this execution was previously ND-blocked, this cycle
     // replaying cleanly means the offending build was rolled back or fixed —
@@ -19873,6 +19954,20 @@ async fn process_workflow_task(
                 should_warn_history_bloat,
             )
             .await;
+
+            // Issue #1184 (Codex review round 2, P2): the terminal/canary
+            // metrics this cycle computed above, captured before `outcome`
+            // moved into the transaction -- emitted only now that the
+            // transaction has actually committed. See
+            // `emit_pending_workflow_metrics`'s doc comment.
+            emit_pending_workflow_metrics(
+                &telemetry,
+                &prepared.execution,
+                &task.queue_name,
+                build_id,
+                started_at,
+                &pending_workflow_metrics,
+            );
         }
         Err(error) => {
             // Issue #1182 (Codex review round 3): an ambiguous suspended-

@@ -3097,6 +3097,17 @@ pub async fn claim_still_held_for_update(
 /// unaccounted fleet by one, based on a peer this exact release just proved
 /// wrong.
 ///
+/// Preserves `activity_name` for an activity row (Codex review round 2 of
+/// #1184): this release is now also reached for an activity task's ambiguous
+/// claim (via `release_terminal_workflow_claim`, issue #1184), and
+/// `activity_name` identifies which handler a re-dispatch must invoke --
+/// clearing it unconditionally left a released activity row unclaimable by
+/// any worker (`process_activity_task` treats a missing name as malformed).
+/// Uses the same `CASE WHEN task_type = 'workflow' THEN NULL ELSE
+/// activity_name END` guard `park_workflow_task_query`/`_sticky_query`
+/// already established for exactly this: a no-op for a workflow row (whose
+/// `activity_name` is already `NULL`), and load-bearing for an activity one.
+///
 /// Also resets `crash_strikes = 0` (Codex review round 4 of #1182): the
 /// `WHERE ... AND crash_strikes = $3` guard above still pins the update to
 /// the exact claim-time snapshot (so a concurrent poison-pill reclaim that
@@ -3120,7 +3131,7 @@ const fn release_suspended_workflow_claim_query() -> &'static str {
          scheduled_at = NOW(), \
          created_at = clock_timestamp(), \
          wake_requested = FALSE, \
-         activity_name = NULL, \
+         activity_name = CASE WHEN task_type = 'workflow' THEN NULL ELSE activity_name END, \
          capability_misses = 0, \
          capability_miss_workers = '{}', \
          crash_strikes = 0, \
@@ -6619,6 +6630,16 @@ mod tests {
              release_task_for_capability_miss_query's AfterHandler phase, which \
              resets crash_strikes for the identical 'the body reached a conclusion \
              on this worker' reason (Codex review round 4 of #1182)",
+        );
+        assert!(
+            sql.contains(
+                "activity_name = CASE WHEN task_type = 'workflow' THEN NULL ELSE activity_name END"
+            ),
+            "activity_name must be cleared for a workflow row (already NULL, a no-op) \
+             and preserved for an activity row (issue #1184, Codex review round 2): \
+             this release is now also reached for an activity's ambiguous claim, and \
+             clearing its handler name unconditionally would strand the released row \
+             as unclaimable: {sql}",
         );
     }
 
