@@ -19636,20 +19636,20 @@ async fn process_workflow_task(
     // absorbing that unrelated later latency would inflate them and distort
     // executor-latency SLOs.
     let duration_secs = started_at.elapsed().as_secs_f64();
-    let canary_roundtrip_secs = if is_canary && matches!(&outcome, WorkflowOutcome::Completed { .. })
-    {
-        // Round-trip = start-requested → completed wall-clock (AC5). Clamp a
-        // clock-skew negative delta to 0 (`.to_std()` errs on a negative
-        // chrono duration), mirroring the update-duration clamping
-        // precedent.
-        Some(
-            (chrono::Utc::now() - prepared.execution.started_at)
-                .to_std()
-                .map_or(0.0, |delta| delta.as_secs_f64()),
-        )
-    } else {
-        None
-    };
+    let canary_roundtrip_secs =
+        if is_canary && matches!(&outcome, WorkflowOutcome::Completed { .. }) {
+            // Round-trip = start-requested → completed wall-clock (AC5). Clamp a
+            // clock-skew negative delta to 0 (`.to_std()` errs on a negative
+            // chrono duration), mirroring the update-duration clamping
+            // precedent.
+            Some(
+                (chrono::Utc::now() - prepared.execution.started_at)
+                    .to_std()
+                    .map_or(0.0, |delta| delta.as_secs_f64()),
+            )
+        } else {
+            None
+        };
     let pending_workflow_metrics = PendingWorkflowMetrics {
         status,
         is_canary,
