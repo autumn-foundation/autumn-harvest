@@ -86,8 +86,14 @@ and worker, unaffected by this decision either way). `autumn-harvest-redis`
 stays shipped-but-unintegrated, already correctly caveated in
 `docs/autumn-workflow-architecture.md:1017` ("the adapter is not yet wired
 into the worker... cannot be turned on by an operator today"). No operator
-loses anything that works today; no roadmap commitment currently depends on
-this line closing.
+loses anything that works today. This does leave one of the founding spec's
+own acceptance criteria unmet —
+`docs/plans/vantage-spec-redis-adapter.md:22` requires the adapter to
+"seamlessly integrate with the existing worker runtime" — so this is a
+deferral of a written, if undated, commitment, not a decision with no
+commitment attached; the spec should not be read as complete. What's
+absent, and what keeps this out of tier 4, is a *dated, owned* forcing
+fact — nothing sets a deadline this leaves unmet.
 
 ## Seam kept open
 
