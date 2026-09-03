@@ -37,10 +37,16 @@ boundary refactor be scheduled now? **No — deferred, pending a trigger below.*
   `ORDER BY`, forcing a full sequential scan + sort per claim — "the single
   biggest lever on this page." Two of the ten accreted predicates have
   already been fixed this way (concurrency-key gate: -99.23% buffers;
-  queue-pause anti-join: -98.05% buffers). The sort-key defect itself remains
-  unfixed but is fully diagnosed (EXPLAIN plans, three rejected rewrites, one
-  proposed fix needing a partial index) — cheaper, better-understood, and
-  storage-agnostic compared to standing up a second datastore.
+  queue-pause anti-join: -98.05% buffers) — proof that this class of fix
+  works on this query, not evidence about the sort-key defect specifically.
+  The sort-key defect itself remains unfixed, and no rewrite has been
+  proposed or evaluated for it in the repo; what exists is an `EXPLAIN`
+  plan (`docs/performance.md:434-462`) that names the mechanism precisely
+  (`Sort Key` leads with a non-indexable `CASE` on `sticky_worker_id`/
+  `sticky_until`, defeating `idx_harvest_tq_poll`'s ordering). Diagnosed,
+  not designed — but still a single-file, storage-agnostic query problem
+  with a known root cause, which is a smaller unknown than standing up and
+  maintaining a second datastore's worker integration.
 - **The crate's own throughput claim doesn't settle the case either way.**
   The `Prospect` spike (`docs/assays/0001-...md`) measured the standalone
   adapter honestly: it misses 10k ops/sec at the registered 8-worker
@@ -93,8 +99,10 @@ Either:
    synthetic fixed-depth backlog benchmark.
 
 Independent of this record and not gated by it: the non-indexable `ORDER BY`
-sort-key fix in `queue::claim_task` (`docs/performance.md:454-462`) is a
-two-way door, already fully diagnosed, storage-agnostic, and cheaper than
-either building or not-building the Redis path — it is the implementing
-team's call to pick up whenever, per Keystone's own charter on sub-2-week
-reversible decisions.
+sort key in `queue::claim_task` (`docs/performance.md:454-462`) is a
+diagnosed, unscoped defect — its root cause is known, no rewrite has been
+proposed or evaluated yet. Whatever fix eventually emerges is a two-way
+door (a query/index change, reversible in hours) and storage-agnostic —
+it is the implementing team's call to pick up and design whenever, per
+Keystone's own charter on sub-2-week reversible decisions, not something
+this record resolves.
