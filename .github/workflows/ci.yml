@@ -510,28 +510,13 @@ jobs:
         if: needs.changes.outputs.code == 'true'
         shell: bash
         run: bash .github/ci/run-suites.sh run allos
-      - name: Run Linux Docker-backed manifest suites (serial)
-        if: runner.os == 'Linux' && needs.changes.outputs.code == 'true'
-        shell: bash
-        # Issue #525: `dev_runtime_lifecycle` skips itself when no PostgreSQL
-        # server binaries are discoverable. That skip is invisible to
-        # `ci_run_coverage.rs` (the suite uses no live-DB token), so without
-        # this the suite could silently stop testing anything and still report
-        # green. The Linux runner image ships them, so demanding them here turns
-        # "the image changed" into a red build.
-        env:
-          HARVEST_DEV_REQUIRE_POSTGRES: "1"
-        run: bash .github/ci/run-suites.sh run linux
-
-      # Issue #958, AC2: re-run the store/replay/retention suites against the
-      # opt-in PARTITIONED `harvest_events` layout. Same suites, same
-      # assertions, `HARVEST_TEST_PARTITIONED=1` -- so "per-execution event
-      # semantics are byte-identical between layouts" is asserted by the
-      # existing tests rather than by a separate set that could drift from them.
-      - name: Integration suites (partitioned harvest_events layout)
-        if: runner.os == 'Linux' && needs.changes.outputs.code == 'true'
-        shell: bash
-        run: bash .github/ci/run-suites.sh run linuxpart
+      # The `linux`/`linuxpart` (Docker-backed) manifest rows used to run here,
+      # serially, in this same job -- 119 rows at ~27s median, ~55-58% of this
+      # leg's total wall time (docs/rnd/2026-09-03-ci-health-semaphore.md).
+      # Moved to the `test-db-linux` job below, sharded across parallel runners:
+      # see that job's comment for why a separate job (not a step here) and why
+      # sharding by row ordinal is safe for the suites that need
+      # `--test-threads=1` within their own process.
       # Issue #684's signal/update-metric run targets SPECIFIC test paths across
       # two modules (a multi-token `--` filter), which the single-`filter`-column
       # manifest schema cannot represent; it stays a literal Docker-backed step.
@@ -550,6 +535,93 @@ jobs:
       - name: Run plugin Kafka broker connector tests (issue #944)
         if: runner.os == 'Linux' && needs.changes.outputs.code == 'true'
         run: cargo test -p autumn-harvest-plugin --features kafka --test connector_kafka_broker -- --test-threads=1
+
+  # Split out of `test`'s `ubuntu-latest` leg (docs/rnd/2026-09-03-ci-health-semaphore.md):
+  # the `linux`/`linuxpart` Docker-backed manifest rows used to run there as one
+  # serial step, consistently ~55-58% of that leg's wall time across three
+  # sampled runs. Sharded across parallel jobs here instead, each processing
+  # row_ordinal % SEMAPHORE_SHARD_COUNT == SEMAPHORE_SHARD_INDEX of the
+  # matching manifest rows (see `run-suites.sh`'s header comment). Safe to
+  # shard freely: the few suites needing in-process serialization
+  # (`mutex_tests.rs`, `transactional_start_tests.rs` -- process-global state,
+  # not shared-database state) still get their own `--test-threads=1`
+  # regardless of which shard runs them; sharding only changes which manifest
+  # ROWS a given job processes, never the ordering of tests WITHIN one row's
+  # own `cargo test` invocation.
+  #
+  # A SEPARATE job, not a matrix dimension added to `test`: `test`'s
+  # `ubuntu-latest` leg is a branch-protection required check BY NAME, and
+  # restructuring it would leave that required check permanently unsatisfied
+  # until someone updates branch protection by hand. This job runs alongside
+  # `test` instead, without touching that name or its contents beyond removing
+  # the two steps that moved here.
+  #
+  # IMPORTANT — not yet enforced: this job is NOT a required status check.
+  # Branch protection must be updated by a repo admin (Settings -> Branches)
+  # to require `Test DB (linux, shard N)` for every N below, or a red shard
+  # will not block merging. Changing branch protection is outside what a CI
+  # config change can do on its own.
+  test-db-linux:
+    name: Test DB (linux, shard ${{ matrix.shard }})
+    needs: [lint, changes]
+    # Same draft-skip pattern as `test` (see its comment above): job-level
+    # `if:` only gates draft-PR pushes, so every shard leg still spins up and
+    # reports a conclusion; the step-level `needs.changes.outputs.code` guard
+    # below skips the actual work on docs-only changes without leaving the leg
+    # context un-created (a job-level `if:` on a matrix job that evaluates
+    # false prevents matrix expansion entirely -- see `test`'s comment).
+    if: github.event_name != 'pull_request' || github.event.pull_request.draft == false
+    strategy:
+      fail-fast: false
+      # SEMAPHORE_SHARD_COUNT below MUST equal this list's length -- GitHub
+      # Actions matrix expressions can't derive one from the other, so keep
+      # them in sync by hand when changing the shard count.
+      matrix:
+        shard: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          # One cache shared across all shards (they all build against the
+          # same Cargo.lock) rather than rust-cache's default per-job-name
+          # key, so a shard that needs a binary another shard already built
+          # doesn't start cold.
+          shared-key: test-db-linux
+      - name: Free runner disk before heavy plugin link (Linux)
+        if: needs.changes.outputs.code == 'true'
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+            /usr/local/share/boost /usr/lib/jvm "$AGENT_TOOLSDIRECTORY" || true
+          sudo docker image prune --all --force > /dev/null 2>&1 || true
+          df -h /
+      - name: Run Linux Docker-backed manifest suites (shard)
+        if: needs.changes.outputs.code == 'true'
+        shell: bash
+        # Issue #525: `dev_runtime_lifecycle` skips itself when no PostgreSQL
+        # server binaries are discoverable. That skip is invisible to
+        # `ci_run_coverage.rs` (the suite uses no live-DB token), so without
+        # this the suite could silently stop testing anything and still report
+        # green. The Linux runner image ships them, so demanding them here
+        # turns "the image changed" into a red build. Applies regardless of
+        # which shard `dev_runtime_lifecycle`'s row lands in.
+        env:
+          HARVEST_DEV_REQUIRE_POSTGRES: "1"
+          SEMAPHORE_SHARD_COUNT: "10"
+          SEMAPHORE_SHARD_INDEX: ${{ matrix.shard }}
+        run: bash .github/ci/run-suites.sh run linux
+      # Issue #958, AC2: re-run the store/replay/retention suites against the
+      # opt-in PARTITIONED `harvest_events` layout. Same suites, same
+      # assertions, `HARVEST_TEST_PARTITIONED=1` -- so "per-execution event
+      # semantics are byte-identical between layouts" is asserted by the
+      # existing tests rather than by a separate set that could drift from
+      # them. Only 9 rows (~6 minutes unsharded) -- not worth splitting, so it
+      # runs whole, once, on shard 0 only.
+      - name: Integration suites (partitioned harvest_events layout)
+        if: needs.changes.outputs.code == 'true' && matrix.shard == 0
+        shell: bash
+        run: bash .github/ci/run-suites.sh run linuxpart
 
   quickstart:
     name: Quickstart example builds and runs (clean-room, README steps)
