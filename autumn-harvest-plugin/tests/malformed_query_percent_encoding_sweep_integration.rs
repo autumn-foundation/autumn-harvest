@@ -1,11 +1,12 @@
-//! Sweep regression test for issue #1151: every management API route that
-//! consumes a raw `(key, value)` query-string pair list must reject a
-//! malformed percent-encoded byte sequence with a genuine `400` JSON error,
-//! never axum's built-in `Query<Vec<(String, String)>>` lossy fallback
-//! (silently substituting `U+FFFD` and returning `200` with a
-//! legitimate-looking but wrong filter value — see issue #774's original
-//! finding for `GET /admin/queue-coverage`, and issue #1151 for the sweep
-//! across the other 17 call sites that had the same gap).
+//! Sweep regression test for issue #1151.
+//!
+//! Every management API route that consumes a raw `(key, value)` query-string
+//! pair list must reject a malformed percent-encoded byte sequence with a
+//! genuine `400` JSON error, never axum's built-in `Query<Vec<(String,
+//! String)>>` lossy fallback (silently substituting `U+FFFD` and returning
+//! `200` with a legitimate-looking but wrong filter value — see issue #774's
+//! original finding for `GET /admin/queue-coverage`, and issue #1151 for the
+//! sweep across the other 17 call sites that had the same gap).
 //!
 //! Every route fixed here decodes the raw query string as the very first
 //! statement in its handler body, *before* any path-parameter validation or
@@ -43,13 +44,15 @@ fn build_app() -> HarvestApiApp {
     harvest_api_router(api_state).with_state(autumn_web::AppState::for_test())
 }
 
-/// Every route's `400` body carries [`crate::strict_query::MALFORMED_QUERY_MESSAGE`]
-/// (asserted by substring match, not full-body equality), but not in the same
-/// JSON shape: `GET /admin/queue-coverage` keeps its original, already-shipped
-/// `{"error": "..."}` shape (issue #774), while every other route -- whose
-/// *other* invalid-param `400`s are already `AutumnError`-shaped -- wraps the
-/// same message in `AutumnError`'s RFC-7807-flavored `{"detail": "...", ...}`
-/// body instead, so a route's malformed-query `400` never introduces a SECOND,
+/// Asserts a malformed-query `400` body carries the documented message.
+///
+/// Every route's `400` body carries the same message text (asserted by field
+/// lookup, not full-body equality), but not in the same JSON shape: `GET
+/// /admin/queue-coverage` keeps its original, already-shipped `{"error":
+/// "..."}` shape (issue #774), while every other route -- whose *other*
+/// invalid-param `400`s are already `AutumnError`-shaped -- wraps the same
+/// message in `AutumnError`'s RFC-7807-flavored `{"detail": "...", ...}` body
+/// instead, so a route's malformed-query `400` never introduces a SECOND,
 /// inconsistent error shape alongside its own other `400`s (issue #1151
 /// review). See `strict_query.rs`'s `decode_or_bad_request` vs.
 /// `decode_or_autumn_error_response` doc comments for the full rationale.
