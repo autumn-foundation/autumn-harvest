@@ -73,7 +73,7 @@ the claim yourself.
 |---|---|---|
 | `@workflow.defn` (workflow definition) | `#[workflow]` | Core primitive (Phase 1) |
 | `@activity.defn` (activity definition) | `#[activity]` | Core primitive (Phase 1) |
-| `proxyActivities` / activity options (timeouts, retry) | `#[activity(start_to_close = "30s", retry = RetryPolicy::exponential(3, ...))]` | No name translation needed: Harvest's `#[activity(...)]` timeout fields are the same names as Temporal's `ActivityOptions`, just snake_case — `start_to_close`, `schedule_to_close`, `schedule_to_start`, `heartbeat_timeout` (`autumn-harvest-macros/src/activity.rs`) |
+| `proxyActivities` / activity options (timeouts, retry) | `#[activity(start_to_close = "30s", retry = RetryPolicy::exponential(3, ...))]` | See "Translate each timeout name" in the [Workflow-porting checklist](#workflow-porting-checklist) below |
 
 ### Signals
 

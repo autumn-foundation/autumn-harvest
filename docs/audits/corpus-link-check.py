@@ -4,13 +4,18 @@
 Deterministic, reproducible on any checkout — no network access required.
 Two Tier-1 audits (see docs/audits/README.md):
 
-1. Link check — every relative markdown link (`[text](path#anchor)`) found
-   in docs/**/*.md and the top-level *.md files is resolved against the
-   filesystem. A missing target file, or a `#anchor` that doesn't match any
-   heading in the target (or, for a same-file `#anchor`, in the source), is
-   reported as broken. Anchors are matched using GitHub's heading-slug rule
-   (lowercase, spaces to hyphens, punctuation other than `-`/`_` stripped),
-   which is what every internal link in this corpus was written against.
+1. Link check — every relative markdown link found in docs/**/*.md and the
+   top-level *.md files is resolved against the filesystem. This covers
+   both link forms this corpus actually uses: inline (`[text](path#anchor)`)
+   and reference-style (`[text][ref]`, `[text][]`, or the bare shortcut
+   `[ref]`, resolved against that file's own `[ref]: path#anchor`
+   definitions — e.g. `docs/replay-drift-gate.md`'s `[replay canary]`). A
+   missing target file, an undefined reference, or a `#anchor` that doesn't
+   match any heading in the target (or, for a same-file `#anchor`, in the
+   source), is reported as broken. Anchors are matched using GitHub's
+   heading-slug rule (lowercase, spaces to hyphens, punctuation other than
+   `-`/`_` stripped), which is what every internal link in this corpus was
+   written against.
 
 2. Orphan scan — pages under docs/ with zero inbound links from any other
    page in the corpus (docs/**/*.md or a top-level *.md). An unreachable
@@ -69,6 +74,21 @@ PROCESS_ARTIFACT_PREFIXES = (
 )
 
 LINK_RE = re.compile(r"\[[^\]]*\]\(([^)\s]+)(?:\s+\"[^\"]*\")?\)")
+# Reference-style: `[text][ref]` / collapsed `[text][]` (ref == text).
+REF_USE_RE = re.compile(r"\[([^\]]*)\]\[([^\]]*)\]")
+# Bare shortcut reference `[ref]` — only counts if `ref` matches a real
+# definition (checked against REF_DEF_RE's output below); otherwise a
+# `[bracketed]` phrase is just prose (e.g. `[FAILED]` in a log excerpt),
+# per CommonMark. The lookahead excludes the label half of `[text](url)`
+# and `[text][ref]`/`[text][]`, which are always immediately followed by
+# `(` or `[` — so this never double-matches those.
+SHORTCUT_RE = re.compile(r"\[([^\]]+)\](?!\(|\[)")
+# Reference definition line: `[ref]: target "optional title"`, optionally
+# indented up to 3 spaces, optionally angle-bracketed target.
+REF_DEF_RE = re.compile(
+    r'(?m)^[ \t]{0,3}\[([^\]]+)\]:[ \t]*<?([^\s>]+)>?'
+    r'(?:[ \t]+(?:"[^"]*"|\'[^\']*\'|\([^)]*\)))?[ \t]*$'
+)
 HEADING_RE = re.compile(r"^(#{1,6})\s+(.+?)\s*#*$", re.MULTILINE)
 FENCE_RE = re.compile(r"^```")
 
@@ -122,6 +142,9 @@ def headings_of(path: Path) -> set:
     return slugs
 
 
+CODE_SPAN_RE = re.compile(r"(`+).*?\1")
+
+
 def strip_code_spans_and_fences(text: str) -> str:
     lines = text.splitlines()
     out, in_fence = [], False
@@ -130,7 +153,18 @@ def strip_code_spans_and_fences(text: str) -> str:
             in_fence = not in_fence
             out.append("")
             continue
-        out.append("" if in_fence else line)
+        if in_fence:
+            out.append("")
+            continue
+        # Inline code spans (`` `code` ``) commonly hold regex character
+        # classes, JSON paths, or Rust slice syntax — e.g. `[A-Za-z0-9_-]`
+        # or `["execution"]["id"]` — which look exactly like a markdown
+        # reference-style link (`[a][b]`) to a regex with no concept of
+        # code spans. Strip these BEFORE the link/reference regexes run, or
+        # every such snippet in the corpus reports as an "undefined
+        # reference" false positive (found in review: docs/shipped-work.md
+        # has several).
+        out.append(CODE_SPAN_RE.sub("", line))
     return "\n".join(out)
 
 
@@ -141,6 +175,57 @@ def is_external_or_special(target: str) -> bool:
         or target.startswith("mailto:")
         or target.startswith("data:")
     )
+
+
+def extract_link_targets(text: str):
+    """Return (targets, undefined_refs) for one file's (fence-stripped) text.
+
+    targets: raw link-target strings, from inline links, reference-style
+    links, and shortcut references, each resolved to its actual URL/path.
+    undefined_refs: raw `[text][ref]` / `[ref]` strings whose reference was
+    never defined in this file — a broken link in its own right (rung of
+    "accuracy", same as a dead file path).
+    """
+    defs = {}
+
+    def collect_def(m):
+        defs[m.group(1).strip().lower()] = m.group(2)
+        return ""  # remove the definition line so it can't also match as prose
+
+    text = REF_DEF_RE.sub(collect_def, text)
+
+    targets = []
+    undefined_refs = []
+    consumed = []  # spans already claimed by inline/reference-style matches
+
+    for m in LINK_RE.finditer(text):
+        targets.append(m.group(1))
+        consumed.append(m.span())
+
+    for m in REF_USE_RE.finditer(text):
+        label, ref = m.group(1), m.group(2)
+        key = (ref if ref else label).strip().lower()
+        consumed.append(m.span())
+        if key in defs:
+            targets.append(defs[key])
+        else:
+            undefined_refs.append(m.group(0))
+
+    def overlaps(span):
+        s, e = span
+        return any(cs < e and s < ce for cs, ce in consumed)
+
+    for m in SHORTCUT_RE.finditer(text):
+        if overlaps(m.span()):
+            continue
+        key = m.group(1).strip().lower()
+        if key in defs:
+            targets.append(defs[key])
+            consumed.append(m.span())
+        # else: not a defined reference, so per CommonMark it's plain
+        # bracketed prose, not a link — not reported.
+
+    return targets, undefined_refs
 
 
 def main():
@@ -164,8 +249,12 @@ def main():
         text = strip_code_spans_and_fences(
             src.read_text(encoding="utf-8", errors="replace")
         )
-        for m in LINK_RE.finditer(text):
-            target = m.group(1)
+        link_targets, undefined_refs = extract_link_targets(text)
+
+        for raw_ref in undefined_refs:
+            broken.append((src, raw_ref, "undefined reference"))
+
+        for target in link_targets:
             if is_external_or_special(target):
                 continue
             path_part, _, anchor = target.partition("#")
