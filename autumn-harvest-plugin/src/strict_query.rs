@@ -29,8 +29,7 @@ use axum::response::{IntoResponse, Response};
 /// The message every strict-query route's `400` carries for
 /// [`InvalidQueryEncoding`], shared so the wording can never drift between
 /// the 20 call sites that need it (issue #1151).
-pub const MALFORMED_QUERY_MESSAGE: &str =
-    "malformed query string: invalid percent-encoded UTF-8";
+pub const MALFORMED_QUERY_MESSAGE: &str = "malformed query string: invalid percent-encoded UTF-8";
 
 /// A query string component's percent-decoded bytes are not valid UTF-8, or
 /// contain a syntactically malformed `%` escape.
@@ -81,11 +80,15 @@ pub fn bad_request_response() -> Response {
 /// Returns the same [`AutumnError::bad_request_msg`]-shaped `400` every
 /// other invalid-param case in these routes already returns, carrying
 /// [`MALFORMED_QUERY_MESSAGE`].
-pub fn decode_or_autumn_error(raw_query: Option<&str>) -> Result<Vec<(String, String)>, AutumnError> {
+pub fn decode_or_autumn_error(
+    raw_query: Option<&str>,
+) -> Result<Vec<(String, String)>, AutumnError> {
     match raw_query.map(parse_raw_query_pairs_strict) {
         None => Ok(Vec::new()),
         Some(Ok(pairs)) => Ok(pairs),
-        Some(Err(InvalidQueryEncoding)) => Err(AutumnError::bad_request_msg(MALFORMED_QUERY_MESSAGE)),
+        Some(Err(InvalidQueryEncoding)) => {
+            Err(AutumnError::bad_request_msg(MALFORMED_QUERY_MESSAGE))
+        }
     }
 }
 
@@ -122,7 +125,9 @@ pub fn decode_or_bad_request(raw_query: Option<&str>) -> Result<Vec<(String, Str
 /// Returns a ready-made `400` [`Response`] built from
 /// [`AutumnError::bad_request_msg`] on [`InvalidQueryEncoding`], for the
 /// caller to `return` directly.
-pub fn decode_or_autumn_error_response(raw_query: Option<&str>) -> Result<Vec<(String, String)>, Response> {
+pub fn decode_or_autumn_error_response(
+    raw_query: Option<&str>,
+) -> Result<Vec<(String, String)>, Response> {
     match raw_query.map(parse_raw_query_pairs_strict) {
         None => Ok(Vec::new()),
         Some(Ok(pairs)) => Ok(pairs),

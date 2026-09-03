@@ -111,19 +111,13 @@ const MALFORMED_QUERY_ROUTES: &[(&str, &str)] = &[
         "/workflows/not-a-real-id/children",
     ),
     ("GET /workflows/{id}/tree", "/workflows/not-a-real-id/tree"),
-    (
-        "GET /admin/external-handoffs",
-        "/admin/external-handoffs",
-    ),
+    ("GET /admin/external-handoffs", "/admin/external-handoffs"),
     ("GET /workflows/{id}/logs", "/workflows/not-a-real-id/logs"),
     (
         "GET /admin/schedules/{id}/runs",
         "/admin/schedules/not-a-real-id/runs",
     ),
-    (
-        "GET /dead-letters/aggregate",
-        "/dead-letters/aggregate",
-    ),
+    ("GET /dead-letters/aggregate", "/dead-letters/aggregate"),
     ("GET /workers", "/workers"),
     ("GET /workers/drain-preview", "/workers/drain-preview"),
     ("GET /admin/queue-coverage", "/admin/queue-coverage"),
