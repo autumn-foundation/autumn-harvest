@@ -4331,6 +4331,19 @@ async fn get_workflow_result_by_id(
     headers: axum::http::HeaderMap,
     maybe_session: Option<Extension<Session>>,
 ) -> axum::response::Response {
+    // Issue #1151 review: reject a malformed query string up front, before
+    // the business-id resolution DB lookup below -- otherwise an unknown
+    // workflow_id or an unreachable shard would mask the malformed query
+    // behind a 404/503 instead of the documented 400, and the lookup would
+    // run for a request that was always going to be rejected. The delegate
+    // (`get_workflow_result`) decodes `raw_query` again once resolution
+    // succeeds; this is a cheap, side-effect-free re-parse, not a
+    // functional duplication.
+    if let Err(response) =
+        crate::strict_query::decode_or_autumn_error_response(raw_query.as_deref())
+    {
+        return response;
+    }
     let exec_id =
         match resolve_workflow_by_business_id(&api_state, &workflow_name, &workflow_id).await {
             Ok(id) => id,
@@ -4376,6 +4389,13 @@ async fn list_workflow_children_by_id(
     Path((workflow_name, workflow_id)): Path<(String, String)>,
     axum::extract::RawQuery(raw_query): axum::extract::RawQuery,
 ) -> axum::response::Response {
+    // Issue #1151 review: same early-reject rationale as
+    // `get_workflow_result_by_id` above.
+    if let Err(response) =
+        crate::strict_query::decode_or_autumn_error_response(raw_query.as_deref())
+    {
+        return response;
+    }
     let exec_id =
         match resolve_workflow_by_business_id(&api_state, &workflow_name, &workflow_id).await {
             Ok(id) => id,

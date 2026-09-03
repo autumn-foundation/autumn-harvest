@@ -18,16 +18,19 @@
 //! standalone UTF-8 byte) is the exact repro from the issue #774 review
 //! comment.
 //!
-//! Two of the 19 originally-vulnerable call sites are deliberately absent
-//! from this table: `GET /workflows/by-id/{workflow_name}/{workflow_id}/result`
-//! and `.../children` resolve the business id to an execution id (a real
-//! database lookup) *before* forwarding the raw query string unchanged to
-//! `get_workflow_result` / `list_workflow_children` — the two routes that
-//! *are* in this table. Business-id resolution must happen first there since
-//! the delegate needs a shard-routable execution id, so those two wrappers
-//! cannot be proven with a poolless router; they inherit the fix
-//! transitively (same delegate, same decode call) once the delegate itself
-//! is proven here.
+//! The two "by-id" wrapper routes (`GET
+//! /workflows/by-id/{workflow_name}/{workflow_id}/result` and `.../children`)
+//! resolve the business id to an execution id (a real database lookup)
+//! *before* forwarding the raw query string unchanged to `get_workflow_result`
+//! / `list_workflow_children`. A first pass of this fix left the malformed-
+//! query check inside the delegate only, so a malformed query paired with an
+//! unresolvable business id (unknown workflow, or an unreachable shard) would
+//! surface the resolution failure (404/503) instead of the documented `400`,
+//! and would pay for a lookup on a request that was always going to be
+//! rejected (Codex review on PR #1334). Both wrappers now re-validate the raw
+//! query up front, before `resolve_workflow_by_business_id` runs, so they no
+//! longer need a database to prove the malformed-query `400` either -- both
+//! are included in the table below like every other route.
 
 use autumn_harvest_plugin::api::{HarvestApiState, harvest_api_router};
 use autumn_web::reexports::axum;
@@ -108,6 +111,14 @@ const MALFORMED_QUERY_ROUTES: &[(&str, &str)] = &[
     (
         "GET /workflows/{id}/result",
         "/workflows/not-a-real-id/result",
+    ),
+    (
+        "GET /workflows/by-id/{workflow_name}/{workflow_id}/result",
+        "/workflows/by-id/not-a-real-workflow/not-a-real-id/result",
+    ),
+    (
+        "GET /workflows/by-id/{workflow_name}/{workflow_id}/children",
+        "/workflows/by-id/not-a-real-workflow/not-a-real-id/children",
     ),
     (
         "GET /workflows/{id}/children",
