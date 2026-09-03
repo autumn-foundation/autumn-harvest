@@ -532,8 +532,10 @@ exactly `idx_harvest_tq_poll`'s key — so the cheap plan should return.
 enable_bitmapscan=off` so the planner has no other index to fall back to, that
 adding **any single one** of the query's other residual `WHERE` predicates —
 including several with **zero actual selectivity** (100% of rows pass the
-filter) — collapses the plan straight back to `Seq Scan` + external-merge
-`Sort`. This holds with and without `FOR UPDATE SKIP LOCKED`.
+filter) — collapses the plan back to a full-backlog scan (`Seq Scan` for most
+predicates tested, `Bitmap Heap Scan` for a few) plus a `Sort` that replaces
+the index-order pushdown. This holds with and without `FOR UPDATE SKIP
+LOCKED`.
 
 Ten predicates were tested independently against a 255 020-row fixture
 (119 940 PENDING rows in the `default` queue), each added alone to the base
@@ -543,9 +545,9 @@ OR-chains (#235, #606), the queue-pause anti-join (#619), the
 `required_build_id` `EXISTS` (#171), the PAUSED-workflow `NOT EXISTS` (#383),
 both capability-label predicates (#382), the `rate_limit_key` `EXISTS`
 (#332/#699), the `schedule_to_close_at` check (#378), and the concurrency-key
-correlated `COUNT(*)` (#247). **All ten** independently reproduce the
-collapse — even the ones that are total no-ops in the fixture (`Rows Removed
-by Filter: 0`), which rules out a selectivity-misestimate explanation.
+gate (#247). **All ten** independently reproduce the collapse — even the
+ones that are total no-ops in the fixture (`Rows Removed by Filter: 0`),
+which rules out a selectivity-misestimate explanation.
 
 Two separate, compounding effects are at work, not one:
 
@@ -556,8 +558,11 @@ Two separate, compounding effects are at work, not one:
    before applying `LIMIT 1`. The sort-elision/limit-pushdown candidate plan
    is not generated at all once a residual `Filter` sits on the scan; this is
    not a cost-based choice of a worse plan over a better one the planner
-   considered. This alone makes every claim O(backlog), with or without the
-   `CASE` key.
+   considered. Reproduced this consistently across all ten predicates in this
+   fixture, this alone makes every claim O(backlog), with or without the
+   `CASE` key — the mechanism inside the planner that treats a residual
+   `Filter` as disqualifying an otherwise pathkey-matching scan from
+   sort-elision is not independently derived here, only observed.
 2. **`FOR UPDATE SKIP LOCKED` additionally disables the bounded Top-N sort**
    once (1) has already forced a `Sort` node to exist. Without `FOR UPDATE`,
    the same forced-index plan restores a bounded Top-N heapsort (in-memory, no
@@ -577,7 +582,14 @@ independently re-run for this page. Unlike
 [the concurrency-key gate fix](#the-concurrency-key-gate-fix), it has not
 (yet) been folded into `claim_bench_support.rs`'s scenario harness or given
 a `docs/perf-artifacts/` capture of its own — doing so is future work, not a
-blocker for correcting the attribution here.
+blocker for correcting the attribution here. One predicate needs its own
+caveat: the concurrency-key row above was captured against the correlated
+`COUNT(*)` shape that predated
+[the concurrency-key gate fix](#the-concurrency-key-gate-fix) below, which
+has since replaced it with a CTE-backed lookup. That specific predicate's
+contribution to the collapse has not been independently re-tested against
+the current query; the other nine are unaffected by that fix and remain as
+implemented today.
 
 **What this means for the query as it stands today:** there is no realistic
 deployment shape that gets the cheap index-ordered plan back, because
@@ -585,9 +597,9 @@ deployment shape that gets the cheap index-ordered plan back, because
 check, the sticky/session OR-chains, and the queue-pause anti-join
 unconditionally — dropping just the `CASE` key would not be sufficient, and
 no single index can make the `sticky`/`session`/`schedule_to_close` scalar
-checks, the concurrency-key correlated `COUNT(*)`, four different `EXISTS`
-subqueries against four different tables, and the `jsonb_array_elements`
-capability walk simultaneously sargable against one ordered index.
+checks, the concurrency-key gate, three different `EXISTS` subqueries
+against three different tables, and the `jsonb_array_elements` capability
+walk simultaneously sargable against one ordered index.
 
 **This page does not propose a query change for it.** Per the same
 measure-before-tune discipline issue #786 established, a genuine fix here
