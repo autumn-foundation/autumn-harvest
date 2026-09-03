@@ -610,7 +610,7 @@ claim-fairness/latency guarantees under contention in ways that need
 checking against this hot path's documented advisory-lock-ordering,
 exactly-once-claim, and `SKIP LOCKED`-concurrency-safety invariants by
 someone with full context on `queue.rs`. It is out of scope for this page and
-is not decided here; it is tracked separately.
+is not decided here; it is tracked separately as issue #1340.
 
 This also resolves the [known limitations](#known-limitations) bullet that
 listed `schedule_to_close` (#378), worker sessions (#606) and sticky routing

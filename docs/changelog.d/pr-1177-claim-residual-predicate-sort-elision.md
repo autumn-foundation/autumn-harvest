@@ -52,4 +52,5 @@ is architectural, changes claim-fairness/latency guarantees under
 contention, and needs sign-off from someone with full context on
 `queue.rs`'s documented advisory-lock-ordering, exactly-once-claim and
 `SKIP LOCKED`-concurrency-safety invariants. Issue #1177 explicitly scoped
-that out, and this PR does not attempt it; it is tracked separately.
+that out, and this PR does not attempt it; it is tracked separately as
+issue #1340.
