@@ -287,6 +287,19 @@ name = "replay_profile"
 required-features = ["testing"]
 harness = false
 
+# Deterministic (non-criterion) profiling harness for
+# `ReplayDebugger::trace_snapshot` -- the prefix-replay engine behind the
+# time-travel replay debugger (issue #949). `harness = false` + its own
+# `main()`, same shape as `replay_profile.rs` above, so the compiled
+# artifact is a plain executable meant to be pointed at
+# `valgrind --tool=callgrind` / `valgrind --tool=dhat` directly rather than
+# measured with `cargo bench`'s wall-clock timing loop. See
+# `benches/debugger_trace_profile.rs`.
+[[bench]]
+name = "debugger_trace_profile"
+required-features = ["debugger"]
+harness = false
+
 # Task-claim / enqueue throughput benchmark (issue #786). `harness = false` +
 # its own `main()`: `claim_task` is destructive (PENDING -> RUNNING), so
 # criterion's repeat-the-closure model would drain the seeded backlog and time

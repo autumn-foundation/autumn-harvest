@@ -354,19 +354,35 @@ that *is* compared.
 
 ## Cost
 
-A step is a full prefix replay, so building a complete trace of an `N`-event
-history performs `N` replays and is **O(N²)** in total work. That is fine for the
-interactive histories this tool is for (tens to low hundreds of events) and
-deliberately not how the CI gates work — they replay each history once.
+This describes the **library** arm — `ReplayDebugger::trace_snapshot`, used by
+an embedder that has registered its own compiled `#[workflow]` handler (the
+two-arms table above). **The shipped `harvest debug replay` CLI subcommand
+never reaches it**: with no way to register your handler, it always walks the
+handler-free `ReplayTrace::from_history`/`from_history_capped` projection
+instead, which is O(N) regardless of history length.
 
-Cap it explicitly on a pathological history:
+A step of `trace_snapshot` is a full prefix replay, so building a complete
+trace of an `N`-event history performs `N` replays and is **O(N²)** in total
+work. That is fine for the interactive histories this tool is for (tens to
+low hundreds of events) and deliberately not how the CI gates work — they
+replay each history once. `ReplayDebugger::max_steps` caps it (default
+`DEFAULT_MAX_STEPS`), and the resulting trace reports `truncated: true` so a
+capped view is never mistaken for a complete one.
 
 ```bash
 harvest debug replay huge.json --max-steps 200
 ```
 
-The trace reports `truncated: true` so a capped view is never mistaken for a
-complete one.
+That same `--max-steps` flag also caps the CLI's own handler-free walk above
+— useful for output size on a pathologically long history — but that walk was
+never the O(N²) cost this section describes, since it never calls
+`trace_snapshot` at all.
+
+See `docs/performance-debugger-trace.md` for the measured Ir/allocation
+scaling behind that `O(N²)` cost, a precise allocation-site attribution of
+what dominates it, and why the obvious local fix (reusing one growing prefix
+buffer across steps instead of re-cloning it) is unsafe rather than merely
+unimplemented.
 
 ---
 
