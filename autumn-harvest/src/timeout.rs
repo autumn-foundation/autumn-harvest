@@ -2440,15 +2440,24 @@ async fn resolve_delivery_route(
         }
     };
 
-    // Pointer-equality of the two resolved pools decides inline-vs-cross-pool,
-    // exactly as it did before this change: two logical shards may be backed by
-    // the same physical pool, in which case delivering on the caller's own
-    // connection keeps the work inside its transaction.
+    // Identity of the two resolved pools decides inline-vs-cross-pool: two
+    // logical shards may be backed by the same physical pool, in which case
+    // delivering on the caller's own connection keeps the work inside its
+    // transaction — and, more importantly, avoids re-entering a pool this
+    // transaction already holds a connection from.
+    //
+    // That comparison must be `same_underlying_pool`, NOT `std::ptr::eq` on the
+    // two `&DbPool`s: `ShardedDbPool` stores every shard's pool in its own map
+    // slot, so pointer equality of the slots is really *shard-id* equality and
+    // reports two aliases of one pool as different (issue #1146; the same trap
+    // `external_target_location::same_underlying_pool` was extracted for).
     match (
         pool.exact_pool_for(target_shard),
         pool.exact_pool_for_execution(caller_exec_id),
     ) {
-        (Some(target_pool), Some(caller_pool)) if std::ptr::eq(target_pool, caller_pool) => {
+        (Some(target_pool), Some(caller_pool))
+            if crate::external_target_location::same_underlying_pool(target_pool, caller_pool) =>
+        {
             DeliveryRoute::Caller {
                 expected_live,
                 may_assert_key_state,
@@ -3494,10 +3503,10 @@ pub async fn enforce_external_cancels_outbox(
                 // cancellation, which live only on the target shard) gets a
                 // fresh connection to that shard's own pool.
                 //
-                // "Same shard" here means "resolves to the same *pool*", not
-                // a raw `ShardId` equality check (issue #751 review, round
-                // 5): a legacy/pre-sharding caller execution carries
-                // `ShardId::UNENCODED`, which `exact_pool_for_execution`
+                // "Same shard" here means "resolves to the same *physical
+                // pool*", not a raw `ShardId` equality check (issue #751
+                // review, round 5): a legacy/pre-sharding caller execution
+                // carries `ShardId::UNENCODED`, which `exact_pool_for_execution`
                 // correctly resolves to the default shard's pool via its own
                 // fallback -- but a raw `exec_id.shard() == caller_shard`
                 // comparison would treat that as cross-shard even against an
@@ -3510,10 +3519,30 @@ pub async fn enforce_external_cancels_outbox(
                 // `exact_pool_for_execution(caller_exec_id)` -- both consult
                 // only `.shard()` internally, so the two are provably
                 // equivalent without needing `caller_exec_id` itself here.
+                //
+                // The identity test must be `same_underlying_pool`, NOT
+                // `std::ptr::eq` on the two `&DbPool`s (issue #1146). Each
+                // shard's pool lives in its own `ShardedDbPool` map slot, so
+                // pointer equality of the slots is *shard-id* equality: it
+                // reports two logical shards backed by one cloned `DbPool` as
+                // different pools. That is not hypothetical — it is the
+                // colocated topology `ShardedDbPool::from_map` produces for a
+                // pre-split deployment, and it took exactly the branch this
+                // comment says it exists to avoid. With a caller on shard 1 and
+                // a target on shard 0 aliased onto one `max_size(1)` pool, the
+                // `else` branch below called an UNBOUNDED `pool.get()` on the
+                // very pool whose only connection this sweep is still holding,
+                // and parked forever. Rounds 5 and 6 fixed this trap in the
+                // *resolution* path; it was still live here, on the delivery
+                // side, which is why it survived them both.
                 for (exec_id, workflow_name) in deferred_checks {
                     let same_pool_as_caller = outer_sharded_pool.as_ref().is_none_or(|pool| {
-                        pool.exact_pool_for_execution(exec_id)
-                            .is_some_and(|e_pool| std::ptr::eq(e_pool, pool.pool_for(caller_shard)))
+                        pool.exact_pool_for_execution(exec_id).is_some_and(|e_pool| {
+                            crate::external_target_location::same_underlying_pool(
+                                e_pool,
+                                pool.pool_for(caller_shard),
+                            )
+                        })
                     });
                     if same_pool_as_caller {
                         if let Err(e) = check_and_report_unfinished_handlers(
@@ -3700,7 +3729,7 @@ pub async fn enforce_external_awaits_outbox(
                         pool.exact_pool_for_execution(target),
                         pool.exact_pool_for_execution(caller_exec_id),
                     ) {
-                        std::ptr::eq(t_pool, c_pool)
+                        crate::external_target_location::same_underlying_pool(t_pool, c_pool)
                     } else {
                         false
                     }

@@ -679,7 +679,7 @@ pub async fn resolve_location_by_workflow_id_with(
 /// in its own map slot, so `std::ptr::eq` on `&DbPool` is really shard-id
 /// equality and reports two aliases of one pool as different (issue #1146,
 /// noted in review, load-bearing here).
-fn same_underlying_pool(a: &DbPool, b: &DbPool) -> bool {
+pub(crate) fn same_underlying_pool(a: &DbPool, b: &DbPool) -> bool {
     std::ptr::eq(a.manager(), b.manager())
 }
 
