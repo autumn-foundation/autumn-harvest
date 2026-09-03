@@ -3201,12 +3201,14 @@ pub async fn release_suspended_workflow_claim(
 }
 
 /// [`release_suspended_workflow_claim`] under a name that does not imply
-/// suspension, for issue #1184's broader set of ordinary terminal-write
-/// guards (complete/fail/pause-park). Identical query, identical
-/// "still-ours -> release for a fresh attempt, already-moved -> no-op"
-/// contract: the handler ran to a real conclusion this cycle (a completion,
-/// a failure, or a park) either way, so the same crash-strikes/capability-miss
-/// reset the #1182 release performs is equally warranted here -- see
+/// suspension.
+///
+/// For issue #1184's broader set of ordinary terminal-write guards
+/// (complete/fail/pause-park). Identical query, identical "still-ours ->
+/// release for a fresh attempt, already-moved -> no-op" contract: the
+/// handler ran to a real conclusion this cycle (a completion, a failure, or
+/// a park) either way, so the same crash-strikes/capability-miss reset the
+/// #1182 release performs is equally warranted here -- see
 /// [`release_suspended_workflow_claim_query`]'s doc comment for why that reset
 /// is safe and correct. Mirrors the existing
 /// [`park_workflow_task`]/[`park_workflow_task_preserving_capability_misses`]
