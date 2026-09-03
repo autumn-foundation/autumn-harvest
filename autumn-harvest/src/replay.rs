@@ -12141,11 +12141,43 @@ mod tests {
     // site is caught here instead of only in production (the exact failure
     // class issue #1338 documents from `33595ff5`). ──────────────────────
 
+    /// Builds a fresh `ExternalCancelRequested` + `ExternalCancelDelivered`
+    /// pair for the characterization tests below, returning the id/target a
+    /// test needs for its own follow-up `match_external_cancel` assertion
+    /// alongside the two events to splice into that test's own history.
+    fn external_cancel_triplet() -> (
+        ExternalCancelId,
+        crate::types::ExternalTarget,
+        WorkflowEvent,
+        WorkflowEvent,
+    ) {
+        let cancel_id = ExternalCancelId::new();
+        let target = crate::types::ExternalTarget::ExecutionId(ExecutionId::new());
+        let requested = WorkflowEvent::ExternalCancelRequested {
+            cancel_id,
+            target: target.clone(),
+        };
+        let delivered = WorkflowEvent::ExternalCancelDelivered { cancel_id };
+        (cancel_id, target, requested, delivered)
+    }
+
+    /// Builds a fresh `ExternalAwaitRequested` + `ExternalAwaitResolved` pair,
+    /// mirroring `external_cancel_triplet` for issue #757's event family.
+    fn external_await_triplet() -> (ExternalAwaitId, ExecutionId, WorkflowEvent, WorkflowEvent) {
+        let await_id = ExternalAwaitId::new();
+        let target = ExecutionId::new();
+        let requested = WorkflowEvent::ExternalAwaitRequested { await_id, target };
+        let resolved = WorkflowEvent::ExternalAwaitResolved {
+            await_id,
+            output: serde_json::json!({"done": true}),
+        };
+        (await_id, target, requested, resolved)
+    }
+
     #[test]
     fn scan_activity_terminal_stashes_interleaved_external_cancel_triplet() {
         let activity_id = ActivityExecId::new();
-        let cancel_id = ExternalCancelId::new();
-        let target = crate::types::ExternalTarget::ExecutionId(ExecutionId::new());
+        let (_, target, requested, delivered) = external_cancel_triplet();
         let events = vec![
             WorkflowEvent::ActivityScheduled {
                 activity_id,
@@ -12153,11 +12185,8 @@ mod tests {
                 input: Value::Null,
                 queue: "default".into(),
             },
-            WorkflowEvent::ExternalCancelRequested {
-                cancel_id,
-                target: target.clone(),
-            },
-            WorkflowEvent::ExternalCancelDelivered { cancel_id },
+            requested,
+            delivered,
             WorkflowEvent::ActivityCompleted {
                 activity_id,
                 output: serde_json::json!(7),
@@ -12181,8 +12210,7 @@ mod tests {
     #[test]
     fn scan_local_activity_terminal_stashes_interleaved_external_cancel_triplet() {
         let activity_id = ActivityExecId::new();
-        let cancel_id = ExternalCancelId::new();
-        let target = crate::types::ExternalTarget::ExecutionId(ExecutionId::new());
+        let (_, target, requested, delivered) = external_cancel_triplet();
         let output = serde_json::json!({"ok": true});
         let events = vec![
             WorkflowEvent::LocalActivityScheduled {
@@ -12193,11 +12221,8 @@ mod tests {
                 resolved: false,
                 start_to_close_nanos: None,
             },
-            WorkflowEvent::ExternalCancelRequested {
-                cancel_id,
-                target: target.clone(),
-            },
-            WorkflowEvent::ExternalCancelDelivered { cancel_id },
+            requested,
+            delivered,
             WorkflowEvent::LocalActivityCompleted {
                 activity_id,
                 output: output.clone(),
@@ -12219,8 +12244,7 @@ mod tests {
     #[test]
     fn scan_local_activity_terminal_stashes_interleaved_external_await_triplet() {
         let activity_id = ActivityExecId::new();
-        let await_id = ExternalAwaitId::new();
-        let target = ExecutionId::new();
+        let (_, target, requested, resolved) = external_await_triplet();
         let output = serde_json::json!({"ok": true});
         let events = vec![
             WorkflowEvent::LocalActivityScheduled {
@@ -12231,11 +12255,8 @@ mod tests {
                 resolved: false,
                 start_to_close_nanos: None,
             },
-            WorkflowEvent::ExternalAwaitRequested { await_id, target },
-            WorkflowEvent::ExternalAwaitResolved {
-                await_id,
-                output: serde_json::json!({"done": true}),
-            },
+            requested,
+            resolved,
             WorkflowEvent::LocalActivityCompleted {
                 activity_id,
                 output: output.clone(),
@@ -12261,15 +12282,8 @@ mod tests {
         // scan_cursor) and does an extra `advance_to_next_unconsumed_event()`
         // per arm, so it is pinned directly rather than only through a public
         // wrapper that might resolve the pair via a different site first.
-        let cancel_id = ExternalCancelId::new();
-        let target = crate::types::ExternalTarget::ExecutionId(ExecutionId::new());
-        let events = vec![
-            WorkflowEvent::ExternalCancelRequested {
-                cancel_id,
-                target: target.clone(),
-            },
-            WorkflowEvent::ExternalCancelDelivered { cancel_id },
-        ];
+        let (cancel_id, _, requested, delivered) = external_cancel_triplet();
+        let events = vec![requested, delivered];
         let mut matcher = HistoryMatcher::new(events);
         matcher.drain_early_signals();
         assert_eq!(matcher.cursor, 2);
@@ -12286,15 +12300,8 @@ mod tests {
         // Direct unit test of `drain_early_signals` (Site 3, issue #1338) for
         // the `ExternalAwait` family (issue #757), mirroring the cancel test
         // above.
-        let await_id = ExternalAwaitId::new();
-        let target = ExecutionId::new();
-        let events = vec![
-            WorkflowEvent::ExternalAwaitRequested { await_id, target },
-            WorkflowEvent::ExternalAwaitResolved {
-                await_id,
-                output: serde_json::json!({"done": true}),
-            },
-        ];
+        let (await_id, _, requested, resolved) = external_await_triplet();
+        let events = vec![requested, resolved];
         let mut matcher = HistoryMatcher::new(events);
         matcher.drain_early_signals();
         assert_eq!(matcher.cursor, 2);
@@ -12310,8 +12317,7 @@ mod tests {
     fn match_external_activity_stashes_interleaved_external_cancel_triplet() {
         let activity_id = ActivityExecId::new();
         let token = ExternalActivityToken::new();
-        let cancel_id = ExternalCancelId::new();
-        let target = crate::types::ExternalTarget::ExecutionId(ExecutionId::new());
+        let (_, target, requested, delivered) = external_cancel_triplet();
         let output = serde_json::json!({"accepted": true});
         let events = vec![
             WorkflowEvent::ActivityAwaitingExternal {
@@ -12322,11 +12328,8 @@ mod tests {
                 queue: "fulfillment".into(),
                 schedule_to_close_secs: 60,
             },
-            WorkflowEvent::ExternalCancelRequested {
-                cancel_id,
-                target: target.clone(),
-            },
-            WorkflowEvent::ExternalCancelDelivered { cancel_id },
+            requested,
+            delivered,
             WorkflowEvent::ActivityCompletedExternally {
                 activity_id,
                 token,
@@ -12350,8 +12353,7 @@ mod tests {
     fn match_external_activity_stashes_interleaved_external_await_triplet() {
         let activity_id = ActivityExecId::new();
         let token = ExternalActivityToken::new();
-        let await_id = ExternalAwaitId::new();
-        let target = ExecutionId::new();
+        let (_, target, requested, resolved) = external_await_triplet();
         let output = serde_json::json!({"accepted": true});
         let events = vec![
             WorkflowEvent::ActivityAwaitingExternal {
@@ -12362,11 +12364,8 @@ mod tests {
                 queue: "fulfillment".into(),
                 schedule_to_close_secs: 60,
             },
-            WorkflowEvent::ExternalAwaitRequested { await_id, target },
-            WorkflowEvent::ExternalAwaitResolved {
-                await_id,
-                output: serde_json::json!({"done": true}),
-            },
+            requested,
+            resolved,
             WorkflowEvent::ActivityCompletedExternally {
                 activity_id,
                 token,
@@ -12390,8 +12389,7 @@ mod tests {
     fn match_external_signal_stashes_interleaved_external_cancel_triplet() {
         let signal_id = ExternalSignalId::new();
         let signal_target = ExecutionId::new();
-        let cancel_id = ExternalCancelId::new();
-        let cancel_target = crate::types::ExternalTarget::ExecutionId(ExecutionId::new());
+        let (_, cancel_target, requested, delivered) = external_cancel_triplet();
         let events = vec![
             WorkflowEvent::ExternalSignalRequested {
                 signal_id,
@@ -12400,11 +12398,8 @@ mod tests {
                 payload: serde_json::json!({"n": 1}),
                 idempotency_key: None,
             },
-            WorkflowEvent::ExternalCancelRequested {
-                cancel_id,
-                target: cancel_target.clone(),
-            },
-            WorkflowEvent::ExternalCancelDelivered { cancel_id },
+            requested,
+            delivered,
             WorkflowEvent::ExternalSignalDelivered { signal_id },
         ];
         let mut matcher = HistoryMatcher::new(events);
@@ -12429,8 +12424,7 @@ mod tests {
     fn match_external_signal_stashes_interleaved_external_await_triplet() {
         let signal_id = ExternalSignalId::new();
         let signal_target = ExecutionId::new();
-        let await_id = ExternalAwaitId::new();
-        let await_target = ExecutionId::new();
+        let (_, await_target, requested, resolved) = external_await_triplet();
         let events = vec![
             WorkflowEvent::ExternalSignalRequested {
                 signal_id,
@@ -12439,14 +12433,8 @@ mod tests {
                 payload: serde_json::json!({"n": 1}),
                 idempotency_key: None,
             },
-            WorkflowEvent::ExternalAwaitRequested {
-                await_id,
-                target: await_target,
-            },
-            WorkflowEvent::ExternalAwaitResolved {
-                await_id,
-                output: serde_json::json!({"done": true}),
-            },
+            requested,
+            resolved,
             WorkflowEvent::ExternalSignalDelivered { signal_id },
         ];
         let mut matcher = HistoryMatcher::new(events);
@@ -12470,18 +12458,14 @@ mod tests {
     #[test]
     fn match_timer_strict_stashes_interleaved_external_cancel_triplet() {
         let timer_id = TimerId::new("cooldown");
-        let cancel_id = ExternalCancelId::new();
-        let target = crate::types::ExternalTarget::ExecutionId(ExecutionId::new());
+        let (_, target, requested, delivered) = external_cancel_triplet();
         let events = vec![
             WorkflowEvent::TimerStarted {
                 timer_id: timer_id.clone(),
                 duration_secs: 30,
             },
-            WorkflowEvent::ExternalCancelRequested {
-                cancel_id,
-                target: target.clone(),
-            },
-            WorkflowEvent::ExternalCancelDelivered { cancel_id },
+            requested,
+            delivered,
             WorkflowEvent::TimerFired { timer_id },
         ];
         let mut matcher = HistoryMatcher::new(events);
@@ -12502,18 +12486,14 @@ mod tests {
     #[test]
     fn match_timer_strict_stashes_interleaved_external_await_triplet() {
         let timer_id = TimerId::new("cooldown");
-        let await_id = ExternalAwaitId::new();
-        let target = ExecutionId::new();
+        let (_, target, requested, resolved) = external_await_triplet();
         let events = vec![
             WorkflowEvent::TimerStarted {
                 timer_id: timer_id.clone(),
                 duration_secs: 30,
             },
-            WorkflowEvent::ExternalAwaitRequested { await_id, target },
-            WorkflowEvent::ExternalAwaitResolved {
-                await_id,
-                output: serde_json::json!({"done": true}),
-            },
+            requested,
+            resolved,
             WorkflowEvent::TimerFired { timer_id },
         ];
         let mut matcher = HistoryMatcher::new(events);
@@ -12534,14 +12514,10 @@ mod tests {
     #[test]
     fn timer_scan_cross_or_stop_stashes_interleaved_external_cancel_triplet() {
         let timer_id = TimerId::new("idle");
-        let cancel_id = ExternalCancelId::new();
-        let target = crate::types::ExternalTarget::ExecutionId(ExecutionId::new());
+        let (_, target, requested, delivered) = external_cancel_triplet();
         let events = vec![
-            WorkflowEvent::ExternalCancelRequested {
-                cancel_id,
-                target: target.clone(),
-            },
-            WorkflowEvent::ExternalCancelDelivered { cancel_id },
+            requested,
+            delivered,
             WorkflowEvent::TimerCancelled {
                 timer_id: timer_id.clone(),
             },
@@ -12564,16 +12540,8 @@ mod tests {
     #[test]
     fn timer_scan_cross_or_stop_stashes_interleaved_external_await_triplet() {
         let timer_id = TimerId::new("idle");
-        let await_id = ExternalAwaitId::new();
-        let target = ExecutionId::new();
-        let events = vec![
-            WorkflowEvent::ExternalAwaitRequested { await_id, target },
-            WorkflowEvent::ExternalAwaitResolved {
-                await_id,
-                output: serde_json::json!({"done": true}),
-            },
-            WorkflowEvent::TimerCancelled { timer_id },
-        ];
+        let (_, target, requested, resolved) = external_await_triplet();
+        let events = vec![requested, resolved, WorkflowEvent::TimerCancelled { timer_id }];
         let mut matcher = HistoryMatcher::new(events);
         assert_eq!(
             matcher.match_timer_cancel("idle"),
@@ -12592,19 +12560,13 @@ mod tests {
     #[test]
     fn match_signal_inner_stashes_interleaved_external_cancel_triplet() {
         let timer_id = TimerId::new("distractor");
-        let cancel_id = ExternalCancelId::new();
-        let target = crate::types::ExternalTarget::ExecutionId(ExecutionId::new());
+        let (_, target, requested, delivered) = external_cancel_triplet();
         let events = vec![
             // A non-transparent event first, so drain_early_signals halts here
             // and match_signal_inner's own scan is what crosses the pair below.
-            WorkflowEvent::TimerCancelled {
-                timer_id: timer_id.clone(),
-            },
-            WorkflowEvent::ExternalCancelRequested {
-                cancel_id,
-                target: target.clone(),
-            },
-            WorkflowEvent::ExternalCancelDelivered { cancel_id },
+            WorkflowEvent::TimerCancelled { timer_id },
+            requested,
+            delivered,
             WorkflowEvent::SignalReceived {
                 signal_name: "approved".into(),
                 payload: serde_json::json!({"ok": true}),
@@ -12628,17 +12590,11 @@ mod tests {
     #[test]
     fn match_signal_inner_stashes_interleaved_external_await_triplet() {
         let timer_id = TimerId::new("distractor");
-        let await_id = ExternalAwaitId::new();
-        let target = ExecutionId::new();
+        let (_, target, requested, resolved) = external_await_triplet();
         let events = vec![
-            WorkflowEvent::TimerCancelled {
-                timer_id: timer_id.clone(),
-            },
-            WorkflowEvent::ExternalAwaitRequested { await_id, target },
-            WorkflowEvent::ExternalAwaitResolved {
-                await_id,
-                output: serde_json::json!({"done": true}),
-            },
+            WorkflowEvent::TimerCancelled { timer_id },
+            requested,
+            resolved,
             WorkflowEvent::SignalReceived {
                 signal_name: "approved".into(),
                 payload: serde_json::json!({"ok": true}),
@@ -12662,18 +12618,14 @@ mod tests {
     #[test]
     fn signal_or_timer_stashes_interleaved_external_cancel_triplet() {
         let timer_id = TimerId::new("__signal_timeout:1:approval");
-        let cancel_id = ExternalCancelId::new();
-        let target = crate::types::ExternalTarget::ExecutionId(ExecutionId::new());
+        let (_, target, requested, delivered) = external_cancel_triplet();
         let events = vec![
             WorkflowEvent::TimerStarted {
                 timer_id: timer_id.clone(),
                 duration_secs: 300,
             },
-            WorkflowEvent::ExternalCancelRequested {
-                cancel_id,
-                target: target.clone(),
-            },
-            WorkflowEvent::ExternalCancelDelivered { cancel_id },
+            requested,
+            delivered,
             WorkflowEvent::SignalReceived {
                 signal_name: "approval".into(),
                 payload: serde_json::json!({"approved": true}),
@@ -12697,18 +12649,14 @@ mod tests {
     #[test]
     fn signal_or_timer_stashes_interleaved_external_await_triplet() {
         let timer_id = TimerId::new("__signal_timeout:1:approval");
-        let await_id = ExternalAwaitId::new();
-        let target = ExecutionId::new();
+        let (_, target, requested, resolved) = external_await_triplet();
         let events = vec![
             WorkflowEvent::TimerStarted {
                 timer_id: timer_id.clone(),
                 duration_secs: 300,
             },
-            WorkflowEvent::ExternalAwaitRequested { await_id, target },
-            WorkflowEvent::ExternalAwaitResolved {
-                await_id,
-                output: serde_json::json!({"done": true}),
-            },
+            requested,
+            resolved,
             WorkflowEvent::SignalReceived {
                 signal_name: "approval".into(),
                 payload: serde_json::json!({"approved": true}),
@@ -12733,19 +12681,15 @@ mod tests {
     fn child_or_timer_stashes_interleaved_external_cancel_triplet() {
         let timer_id = child_timer_id();
         let child_id = ExecutionId::new();
-        let cancel_id = ExternalCancelId::new();
-        let target = crate::types::ExternalTarget::ExecutionId(ExecutionId::new());
+        let (_, target, requested, delivered) = external_cancel_triplet();
         let events = vec![
             child_started_event(child_id),
             WorkflowEvent::TimerStarted {
                 timer_id: timer_id.clone(),
                 duration_secs: 300,
             },
-            WorkflowEvent::ExternalCancelRequested {
-                cancel_id,
-                target: target.clone(),
-            },
-            WorkflowEvent::ExternalCancelDelivered { cancel_id },
+            requested,
+            delivered,
             WorkflowEvent::ChildWorkflowCompleted {
                 child_id,
                 output: serde_json::json!({"processed": true}),
@@ -12776,19 +12720,15 @@ mod tests {
     fn child_or_timer_stashes_interleaved_external_await_triplet() {
         let timer_id = child_timer_id();
         let child_id = ExecutionId::new();
-        let await_id = ExternalAwaitId::new();
-        let target = ExecutionId::new();
+        let (_, target, requested, resolved) = external_await_triplet();
         let events = vec![
             child_started_event(child_id),
             WorkflowEvent::TimerStarted {
                 timer_id: timer_id.clone(),
                 duration_secs: 300,
             },
-            WorkflowEvent::ExternalAwaitRequested { await_id, target },
-            WorkflowEvent::ExternalAwaitResolved {
-                await_id,
-                output: serde_json::json!({"done": true}),
-            },
+            requested,
+            resolved,
             WorkflowEvent::ChildWorkflowCompleted {
                 child_id,
                 output: serde_json::json!({"processed": true}),
