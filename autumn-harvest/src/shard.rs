@@ -244,6 +244,15 @@ pub struct ShardRouter {
     ///
     /// Empty by default. Populated via [`ShardRouter::with_residency_map`].
     residency_map: BTreeMap<String, ShardId>,
+    /// Operator-declared retired shard → successor mapping (issue #964).
+    ///
+    /// Empty by default. Populated via [`ShardRouter::with_shard_forwards`]
+    /// once a shard's residents have all been rebalanced off it and the shard
+    /// itself has been removed from `readable_shards`. Without it, an
+    /// `ExecutionId` minted on the retired shard would fall back to the default
+    /// shard and silently resolve to the wrong run — the one failure mode a
+    /// decommission must never produce.
+    shard_forwards: BTreeMap<ShardId, ShardId>,
 }
 
 /// Every placement-affecting field of a [`ShardRouter`], borrowed together.
@@ -261,6 +270,8 @@ pub struct ShardRouterParts<'a> {
     pub default_shard: ShardId,
     /// The declared residency key → shard mapping (issue #697).
     pub residency_map: &'a BTreeMap<String, ShardId>,
+    /// The declared retired-shard → successor mapping (issue #964).
+    pub shard_forwards: &'a BTreeMap<ShardId, ShardId>,
 }
 
 impl ShardRouter {
@@ -294,6 +305,7 @@ impl ShardRouter {
             writable_shards,
             default_shard,
             residency_map: BTreeMap::new(),
+            shard_forwards: BTreeMap::new(),
         }
     }
 
@@ -397,6 +409,85 @@ impl ShardRouter {
         &self.residency_map
     }
 
+    /// Declare where ids minted on a **retired** shard now resolve (issue #964).
+    ///
+    /// Shard rebalancing seals a migrated execution's source row with a
+    /// forwarding pointer, which is enough for as long as the source shard is
+    /// still readable. A fully *decommissioned* shard is not, and its
+    /// `ExecutionId`s would otherwise fall through
+    /// [`ShardRouter::shard_for_execution`]'s unknown-shard branch to the
+    /// default shard — resolving to the wrong database, silently. This map is
+    /// the decommission story: once every resident has been migrated off shard
+    /// A to shard B and A has been removed from `readable_shards`, declare
+    /// `A → B` and every id minted on A keeps resolving.
+    ///
+    /// ```rust
+    /// # use autumn_harvest::shard::ShardRouter;
+    /// # use autumn_harvest::types::ShardId;
+    /// let router = ShardRouter::new(
+    ///     vec![ShardId::new(1)],
+    ///     vec![ShardId::new(1)],
+    ///     ShardId::new(1),
+    /// )
+    /// .with_shard_forwards([(ShardId::new(0), ShardId::new(1))]);
+    /// ```
+    ///
+    /// # Panics
+    ///
+    /// Like [`ShardRouter::with_residency_map`], a misconfigured map fails at
+    /// boot rather than at the first misrouted lookup. Panics when a source
+    /// shard forwards to itself, when a source shard is still in
+    /// `readable_shards` (forwarding a *live* shard would shadow its own rows),
+    /// when a target is not readable, or when one source is declared twice with
+    /// conflicting targets.
+    ///
+    /// Chains and cycles need no separate rule: a forward's source must be
+    /// outside `readable_shards` and its target inside it, so no shard can be
+    /// both, and resolution is therefore a single hop by construction.
+    #[must_use]
+    pub fn with_shard_forwards(
+        mut self,
+        entries: impl IntoIterator<Item = (ShardId, ShardId)>,
+    ) -> Self {
+        let mut map: BTreeMap<ShardId, ShardId> = BTreeMap::new();
+        for (from, to) in entries {
+            if let Some(existing) = map.insert(from, to) {
+                assert_eq!(
+                    existing, to,
+                    "shard {from} is forwarded more than once with conflicting targets \
+                     {existing} and {to}; which one survives would depend on iteration order"
+                );
+            }
+        }
+        for (from, to) in &map {
+            assert_ne!(from, to, "shard {from} cannot be forwarded to itself");
+            assert!(
+                !self.readable_shards.contains(from),
+                "shard {from} is forwarded to {to} but is still in the readable set; \
+                 remove it from `readable_shards` first, or drop the forward"
+            );
+            assert!(
+                self.readable_shards.contains(to),
+                "shard {from} is forwarded to {to}, which is not in the readable set"
+            );
+            // A chain needs no separate check: the two assertions above already
+            // make one impossible. A forward's SOURCE must be outside
+            // `readable_shards` and its TARGET must be inside it, so no shard
+            // can be both, and `shard_for_execution`'s single hop is therefore
+            // exhaustive by construction rather than by a hop counter.
+        }
+        self.shard_forwards = map;
+        self
+    }
+
+    /// The declared retired-shard → successor mapping (issue #964).
+    ///
+    /// Empty unless [`ShardRouter::with_shard_forwards`] was used.
+    #[must_use]
+    pub const fn shard_forwards(&self) -> &BTreeMap<ShardId, ShardId> {
+        &self.shard_forwards
+    }
+
     /// Borrow every placement-affecting field at once, for exhaustive
     /// destructuring by a projection that must not silently miss one.
     ///
@@ -423,12 +514,14 @@ impl ShardRouter {
             writable_shards,
             default_shard,
             residency_map,
+            shard_forwards,
         } = self;
         ShardRouterParts {
             readable_shards,
             writable_shards,
             default_shard: *default_shard,
             residency_map,
+            shard_forwards,
         }
     }
 
@@ -675,10 +768,16 @@ impl ShardRouter {
             return self.default_shard;
         }
         if self.readable_shards.contains(&encoded) {
-            encoded
-        } else {
-            self.default_shard
+            return encoded;
         }
+        // A retired shard's ids resolve to its declared successor (issue #964).
+        // Checked BEFORE the default-shard fallback, which for a decommissioned
+        // shard would silently answer with the wrong database. `with_shard_forwards`
+        // rejects chains at construction, so this single hop is exhaustive.
+        if let Some(successor) = self.shard_forwards.get(&encoded) {
+            return *successor;
+        }
+        self.default_shard
     }
 
     /// Pick a shard for a DAG at catalog-compile time.
@@ -938,24 +1037,111 @@ impl ShardedDbPool {
         self.pools.get(&shard)
     }
 
+    /// The shard an `ExecutionId` routes to, after any router-declared
+    /// retired-shard forward (issue #964).
+    ///
+    /// This is the **entry point** for an id, not necessarily where the run
+    /// currently lives: an execution rebalanced off a still-readable shard is
+    /// found by following the durable forwarding pointer on its sealed source
+    /// row, which needs a database and therefore lives in
+    /// [`crate::shard_rebalance::resolve_execution_shard`]. This function is the
+    /// synchronous part — the one that costs nothing on the hot path and is
+    /// correct for every execution that never moved.
+    #[must_use]
+    pub fn routed_shard_for_execution(&self, exec_id: ExecutionId) -> ShardId {
+        let shard = exec_id.shard();
+        if shard.is_unencoded() {
+            return self.default_shard;
+        }
+        // Consult the router for a declared retired-shard forward ONLY. Nothing
+        // else about the router is applied here: an id whose shard the router
+        // does not forward must keep resolving byte-for-byte as it did before
+        // issue #964, including the cases where the pool map and the router's
+        // readable set legitimately disagree (mid a shard-add rollout, or in a
+        // test that installs a pool without a router).
+        if let Ok(guard) = GLOBAL_SHARD_ROUTER.read()
+            && let Some(successor) = guard.as_ref().and_then(|r| r.shard_forwards.get(&shard))
+        {
+            return *successor;
+        }
+        shard
+    }
+
+    /// Whether `shard` has been declared **retired** — decommissioned, its pool
+    /// removed from every node, and its ids forwarded to a successor.
+    ///
+    /// A retired shard is not "a shard I happen to have no pool for right now".
+    /// The two look identical from the pool map and must not be treated alike:
+    /// a missing pool mid a shard-add rollout is a transient gap where the data
+    /// is very much still there, while a retired shard is one an operator has
+    /// asserted is gone. `ShardRouter::with_shard_forwards` refuses to declare a
+    /// forward for a shard that is still readable, which is what makes the
+    /// declaration mean something.
+    ///
+    /// The distinction matters wherever code must reach data on a shard rather
+    /// than merely route to it — cross-residence payload erasure above all,
+    /// which fails closed on an unreachable residence and would otherwise be
+    /// permanently unable to erase any run that ever lived on a retired shard.
+    #[must_use]
+    pub fn shard_is_retired(shard: ShardId) -> bool {
+        GLOBAL_SHARD_ROUTER
+            .read()
+            .ok()
+            .and_then(|guard| {
+                guard
+                    .as_ref()
+                    .map(|r| r.shard_forwards.contains_key(&shard))
+            })
+            .unwrap_or(false)
+    }
+
+    /// Build a multi-shard pool from `(shard, DSN)` pairs.
+    ///
+    /// The paved path for operator tooling that must reach several shard
+    /// databases directly rather than through the management API — `harvest
+    /// shard rebalance` (issue #964) is the first such command, and a rebalance
+    /// is inherently two-database. Lives here rather than in the CLI so the
+    /// pool's shape (and its `max_size`) stays a property of the engine.
+    ///
+    /// # Errors
+    ///
+    /// [`HarvestError::Config`](crate::error::HarvestError::Config) when a DSN
+    /// is not a usable connection string. Note that a pool is lazy: a DSN that
+    /// parses but cannot connect surfaces at first checkout, as
+    /// [`HarvestError::ShardUnavailable`](crate::error::HarvestError::ShardUnavailable).
+    pub fn from_dsns(
+        entries: impl IntoIterator<Item = (ShardId, String)>,
+        default_shard: ShardId,
+        max_size: usize,
+    ) -> crate::error::HarvestResult<Self> {
+        let mut pools = BTreeMap::new();
+        for (shard, dsn) in entries {
+            let manager = diesel_async::pooled_connection::AsyncDieselConnectionManager::<
+                diesel_async::AsyncPgConnection,
+            >::new(dsn);
+            let pool = deadpool::managed::Pool::builder(manager)
+                .max_size(max_size.max(1))
+                .build()
+                .map_err(|e| {
+                    crate::error::HarvestError::Config(format!(
+                        "shard {shard}: could not build a connection pool: {e}"
+                    ))
+                })?;
+            pools.insert(shard, pool);
+        }
+        Ok(Self::from_map(pools, default_shard))
+    }
+
     /// Resolve the pool that owns a given `ExecutionId`.
     #[must_use]
     pub fn pool_for_execution(&self, exec_id: ExecutionId) -> &DbPool {
-        let shard = exec_id.shard();
-        if shard.is_unencoded() {
-            return self.pool_for(self.default_shard);
-        }
-        self.pool_for(shard)
+        self.pool_for(self.routed_shard_for_execution(exec_id))
     }
 
     /// Resolve the pool that owns a given `ExecutionId` exactly, with no default fallback.
     #[must_use]
     pub fn exact_pool_for_execution(&self, exec_id: ExecutionId) -> Option<&DbPool> {
-        let shard = exec_id.shard();
-        if shard.is_unencoded() {
-            return self.pools.get(&self.default_shard);
-        }
-        self.pools.get(&shard)
+        self.pools.get(&self.routed_shard_for_execution(exec_id))
     }
 
     /// Resolve the pool that owns `target` exactly, with no default fallback

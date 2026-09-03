@@ -2374,6 +2374,47 @@ enum DeliveryRoute {
 ///
 /// With no sharded pool configured at all there is one database by definition,
 /// so the route is always the caller's own connection.
+/// Where the run behind an `ExecutionId` currently lives.
+///
+/// An id names the shard a run ORIGINATED on, which stopped being where it
+/// lives once a rebalance could move it (issue #964). The `WorkflowId` route
+/// resolves residence by observation, fanning out across shards; an id gets the
+/// cheaper equivalent — the durable forwarding pointer the migration left on
+/// the sealed source row. Skipping it delivers to that seal, reads it as
+/// terminal, and records `target_terminal` in the SENDER's history for a
+/// workflow that is alive on another shard.
+///
+/// The pointer is read on the connection the caller already holds whenever the
+/// id enters on that same database. Acquiring a second connection from the pool
+/// that lent the first is the self-deadlock this module's own documentation
+/// warns about, and an unresolvable residence degrades to the entry shard,
+/// which is the pre-#964 behaviour.
+async fn execution_id_residence(
+    conn: &mut AsyncPgConnection,
+    pool: &crate::shard::ShardedDbPool,
+    id: ExecutionId,
+    caller_shard: crate::types::ShardId,
+) -> crate::types::ShardId {
+    let encoded = id.shard();
+    let entry = if encoded.is_unencoded() {
+        pool.default_shard()
+    } else {
+        encoded
+    };
+    if crate::external_target_location::same_underlying_pool(
+        pool.pool_for(entry),
+        pool.pool_for(caller_shard),
+    ) {
+        crate::shard_rebalance::forward_of_held_row(conn, id)
+            .await
+            .unwrap_or(entry)
+    } else {
+        crate::shard_rebalance::resolve_execution_shard(pool, id)
+            .await
+            .unwrap_or(entry)
+    }
+}
+
 async fn resolve_delivery_route(
     conn: &mut AsyncPgConnection,
     sharded_pool: Option<&crate::shard::ShardedDbPool>,
@@ -2388,22 +2429,29 @@ async fn resolve_delivery_route(
         };
     };
 
-    let caller_shard = if caller_exec_id.shard().is_unencoded() {
-        pool.default_shard()
-    } else {
-        caller_exec_id.shard()
+    // The caller's CURRENT residence, read off the connection this transaction
+    // already holds (issue #964). An `ExecutionId` encodes where a run
+    // ORIGINATED, so a caller that has itself been rebalanced would otherwise
+    // be compared against the target's residence below and two connections to
+    // the same database judged "cross-shard" — taking the branch that acquires
+    // a second connection from the pool already driving this transaction. The
+    // held connection is used deliberately: re-entering that pool is the
+    // self-deadlock this module's own doc comment warns about.
+    let caller_shard = match crate::shard_rebalance::shard_of_held_row(conn, caller_exec_id).await {
+        Some(shard) if !shard.is_unencoded() => shard,
+        _ if caller_exec_id.shard().is_unencoded() => pool.default_shard(),
+        _ => caller_exec_id.shard(),
     };
 
     let (target_shard, expected_live, may_assert_key_state) = match target {
         ExternalTarget::ExecutionId(id) => {
-            let encoded = id.shard();
-            let shard = if encoded.is_unencoded() {
-                pool.default_shard()
-            } else {
-                encoded
-            };
-            // Authoritative by construction; nothing was resolved by observation.
-            (shard, false, true)
+            // Authoritative by construction: an id identifies exactly one run,
+            // and the residence below is a durable fact, not a prediction.
+            (
+                execution_id_residence(conn, pool, *id, caller_shard).await,
+                false,
+                true,
+            )
         }
         ExternalTarget::WorkflowId {
             workflow_name,
@@ -3048,6 +3096,21 @@ async fn attempt_cancel_delivery(
                     tracing::error!(error = %e, "cancel outbox sweep: db error");
                     None
                 }
+                // The cancel landed on a shard that is not where the run lives
+                // (issue #964) — a forwarding seal, or a residence this node
+                // cannot reach. `None` leaves the row pending for a later
+                // sweep. Anything else here would record
+                // `ExternalCancelDelivered` in the sender's history for a
+                // workflow that is still running and never retry it, which is
+                // the one failure mode worse than a slow cancel.
+                Err(HarvestError::ShardUnavailable { shard_id, reason }) => {
+                    tracing::warn!(
+                        shard_id,
+                        reason = %reason,
+                        "cancel outbox sweep: target is not on this shard; leaving pending"
+                    );
+                    None
+                }
                 // Other Err (already terminal) = no-op success.
                 Err(_) => Some(WorkflowEvent::ExternalCancelDelivered { cancel_id }),
             }
@@ -3240,7 +3303,17 @@ pub async fn enforce_external_cancels_outbox(
                 // the deferred unfinished-handler-check routing after this
                 // step commits) can tell a same-shard check apart from a
                 // cross-shard one without re-deriving it (issue #751 review).
-                let caller_shard = caller_exec_id.shard();
+                //
+                // The caller's CURRENT residence, not its id's encoded origin
+                // (issue #964): a caller that has itself been rebalanced would
+                // otherwise be compared against the target's residence and
+                // judged cross-pool against its own database, sending the
+                // delivery down the branch that checks out a second connection
+                // from the pool already driving this transaction. Read off the
+                // held connection, so resolving it cannot deadlock in turn.
+                let caller_shard = crate::shard_rebalance::shard_of_held_row(conn, caller_exec_id)
+                    .await
+                    .unwrap_or_else(|| caller_exec_id.shard());
 
                 let (cancel_id, target) = match codecs.decode_event(row.event_data.clone()) {
                     Ok(WorkflowEvent::ExternalCancelRequested { cancel_id, target }) => {
@@ -3579,6 +3652,44 @@ pub async fn enforce_external_cancels_outbox(
                 // *resolution* path; it was still live here, on the delivery
                 // side, which is why it survived them both.
                 for (exec_id, workflow_name) in deferred_checks {
+                    // Forwarding-aware (issue #964). These ids come back from a
+                    // cancel that already ran on the target's CURRENT residence,
+                    // but an id still encodes the shard it originated on. For a
+                    // rebalanced target `exact_pool_for_execution` would hand
+                    // back the origin pool and this check would report on the
+                    // sealed source's frozen history — and append its findings
+                    // to a row nothing reads. Resolve the residence first; a
+                    // failure degrades to the un-forwarded shard, which is the
+                    // pre-#964 behaviour.
+                    let residence = match outer_sharded_pool.as_ref() {
+                        Some(pool) => {
+                            let entry = pool.routed_shard_for_execution(exec_id);
+                            // This loop runs while `conn` is STILL CHECKED OUT,
+                            // so the residence lookup must not take a second
+                            // connection from the pool that lent it -- that is
+                            // the size-1 self-deadlock this deferred path was
+                            // restructured to avoid in the first place (issue
+                            // #751), and resolving through `pool` reintroduced
+                            // it by the back door. Read the pointer on `conn`
+                            // whenever the id enters on the held database;
+                            // only a genuinely different one is resolved
+                            // through the pool.
+                            let resolved: crate::types::ShardId = if std::ptr::eq(
+                                pool.pool_for(entry),
+                                pool.pool_for(caller_shard),
+                            ) {
+                                crate::shard_rebalance::forward_of_held_row(conn, exec_id)
+                                    .await
+                                    .unwrap_or(entry)
+                            } else {
+                                crate::shard_rebalance::resolve_execution_shard(pool, exec_id)
+                                    .await
+                                    .unwrap_or(entry)
+                            };
+                            Some(resolved)
+                        }
+                        None => None,
+                    };
                     let same_pool_as_caller = outer_sharded_pool.as_ref().is_none_or(|pool| {
                         pool.exact_pool_for_execution(exec_id)
                             .is_some_and(|e_pool| {
@@ -3605,7 +3716,8 @@ pub async fn enforce_external_cancels_outbox(
                         }
                     } else if let Some(pool) = outer_sharded_pool
                         .as_ref()
-                        .and_then(|p| p.exact_pool_for_execution(exec_id))
+                        .zip(residence)
+                        .and_then(|(p, shard)| p.exact_pool_for(shard))
                     {
                         match pool.get().await {
                             Ok(mut target_conn) => {
@@ -3741,6 +3853,12 @@ pub async fn enforce_external_awaits_outbox(
                 };
 
                 let caller_exec_id = crate::types::ExecutionId::from_uuid(row.workflow_exec_id);
+                // The caller's CURRENT residence (issue #964), read off the held
+                // connection — see the signal outbox above for why the id's
+                // encoded origin is the wrong thing to compare pools with.
+                let caller_shard = crate::shard_rebalance::shard_of_held_row(conn, caller_exec_id)
+                    .await
+                    .unwrap_or_else(|| caller_exec_id.shard());
 
                 let (await_id, target) = match codecs.decode_event(row.event_data.clone()) {
                     Ok(WorkflowEvent::ExternalAwaitRequested { await_id, target }) => {
@@ -3768,15 +3886,39 @@ pub async fn enforce_external_awaits_outbox(
                             .and_then(|lock| lock.clone())
                     });
 
-                let same_pool = active_sharded_pool.as_ref().is_none_or(|pool| {
-                    if let (Some(t_pool), Some(c_pool)) = (
-                        pool.exact_pool_for_execution(target),
-                        pool.exact_pool_for_execution(caller_exec_id),
-                    ) {
-                        crate::external_target_location::same_underlying_pool(t_pool, c_pool)
-                    } else {
-                        false
+                // Issue #964: compare RESIDENCES, not the shards the two ids
+                // encode. After a rebalance an id names where its run
+                // ORIGINATED, so comparing origins can call two connections to
+                // one database "cross-pool" and take the branch that acquires a
+                // second connection from the pool already driving this
+                // transaction. The lookup reads on the held connection for that
+                // same reason.
+                let target_residence = match active_sharded_pool.as_ref() {
+                    Some(pool) => {
+                        crate::shard_rebalance::resolve_target_shard_holding(
+                            conn,
+                            pool,
+                            &ExternalTarget::ExecutionId(target),
+                            caller_shard,
+                        )
+                        .await
                     }
+                    None => target.shard(),
+                };
+
+                let same_pool = active_sharded_pool.as_ref().is_none_or(|pool| {
+                    // The caller side keeps `pool_for`'s default-shard fallback
+                    // so a legacy caller carrying `ShardId::UNENCODED` resolves
+                    // to the pool that actually serves it rather than to a
+                    // spurious cross-pool verdict. The target side stays exact:
+                    // an unknown shard must fail rather than silently deliver to
+                    // the default database.
+                    pool.exact_pool_for(target_residence).is_some_and(|t_pool| {
+                        crate::external_target_location::same_underlying_pool(
+                            t_pool,
+                            pool.pool_for(caller_shard),
+                        )
+                    })
                 });
 
                 // Map the reader's 3-state result to the awaiter's terminal
@@ -3842,10 +3984,10 @@ pub async fn enforce_external_awaits_outbox(
                 } else {
                     let Some(pool) = active_sharded_pool
                         .as_ref()
-                        .and_then(|p| p.exact_pool_for_execution(target))
+                        .and_then(|p| p.exact_pool_for(target_residence))
                     else {
                         tracing::warn!(
-                            target_shard = %target.shard(),
+                            target_shard = %target_residence,
                             "await outbox sweep: target shard not configured locally; skipping"
                         );
                         return Ok(Some((false, Some(row.id))));

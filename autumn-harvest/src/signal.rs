@@ -117,6 +117,30 @@ pub async fn send_signal_idempotent(
             // delivered on resume. The wake below re-pends the task, which
             // the claim gate defers until the execution is RUNNING.
             "RUNNING" | "PAUSED" => {}
+            // Issue #964. Neither is terminal, and calling them terminal is the
+            // damaging answer: a caller that sees "terminal" reasonably stops
+            // retrying, and the outbox records `target_terminal` in the
+            // sender's history for a workflow that is alive.
+            //
+            // `MIGRATED` — the run was rebalanced onto another shard; this row
+            // is the seal it left behind. The caller reached the wrong database
+            // and should re-resolve through the forwarding pointer.
+            // `MIGRATING` — a staged copy that is not live yet; it becomes
+            // claimable at activation, moments away.
+            //
+            // Both are reported as `ShardUnavailable`, which is the engine's
+            // existing RETRYABLE classification (`HarvestError::is_shard_unavailable`),
+            // so the outbox leaves the row pending and tries again rather than
+            // failing the delivery permanently.
+            state @ ("MIGRATED" | "MIGRATING") => {
+                return Err(HarvestError::ShardUnavailable {
+                    shard_id: exec_id.shard().as_i32(),
+                    reason: format!(
+                        "workflow execution {exec_id} is mid shard-rebalance on this shard \
+                         ({state}); re-resolve it through its forwarding pointer and retry"
+                    ),
+                });
+            }
             "CANCELLED" => {
                 return Err(HarvestError::Cancelled(execution.error.unwrap_or_else(
                     || format!("workflow execution {exec_id} is cancelled"),

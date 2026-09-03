@@ -3179,6 +3179,11 @@ pub(crate) const KNOWN_WORKFLOW_STATES: &[&str] = &[
     "TIMED_OUT",
     "CONTINUED_AS_NEW",
     "TERMINATED",
+    // Issue #964. Both are returned by `GET /workflows`, so both must be
+    // filterable: a state the API emits but rejects as a filter value is a
+    // listing an operator can see and cannot narrow.
+    "MIGRATING",
+    "MIGRATED",
 ];
 
 const DEFAULT_WORKFLOW_LIMIT: i64 = 50;
@@ -7108,6 +7113,8 @@ pub const fn management_api_response_fields()
                 "children",
                 "skipped_children",
                 "failures",
+                "prior_residences",
+                "retired_residences",
             ]),
         ),
         (
@@ -20372,6 +20379,7 @@ pub(crate) async fn signal_with_start_workflow(
     // AllowDuplicate*). Used below to skip start_input schema validation on attach requests
     // where start_input is never written (mirrors the payload-cap deferral from issue #252).
     let mut found_shard: Option<(ShardId, PoolConn, ExecutionId, bool)> = None;
+    let mut seal_only: Option<ShardId> = None;
     for (candidate_shard, shard_pool) in pool.iter_shards() {
         let mut shard_conn = match acquire_conn(shard_pool).await {
             Ok(c) => c,
@@ -20399,6 +20407,21 @@ pub(crate) async fn signal_with_start_workflow(
             }
         };
         if let Some((existing_uuid, existing_state)) = hit {
+            // A rebalanced SEAL is not the run (issue #964). It matches this
+            // query — `MIGRATED` is neither CONTINUED_AS_NEW nor TERMINATED —
+            // and shards iterate in id order, so the seal on the origin shard is
+            // found before the live copy on the target. Selecting it sends the
+            // whole operation to a row that will never run again: the resolver
+            // sees a non-RUNNING prior, upgrades to `TerminateIfRunning`, and
+            // the start path refuses a rebalanced prior, so the request 503s
+            // forever while the live run sits available on the next shard.
+            //
+            // Keep scanning instead, remembering the seal only so a live copy
+            // this node cannot see is refused rather than silently duplicated.
+            if matches!(existing_state.as_str(), "MIGRATED" | "MIGRATING") {
+                seal_only = Some(candidate_shard);
+                continue;
+            }
             // Attach (reuse UUID) only when the prior is live AND the policy
             // expects to attach. Every other path goes through replace_execution
             // and needs a fresh exec_id keyed for the same shard.
@@ -20420,6 +20443,22 @@ pub(crate) async fn signal_with_start_workflow(
             found_shard = Some((candidate_shard, shard_conn, exec_id, will_attach));
             break;
         }
+    }
+
+    // A seal but no live copy anywhere this node can reach: the run is alive on
+    // a shard with no pool here. Falling through would start a FRESH run for a
+    // business key that is already held, which is the duplicate the seal exists
+    // to prevent — so refuse retryably instead.
+    if found_shard.is_none()
+        && let Some(seal_shard) = seal_only
+    {
+        return AutumnError::service_unavailable_msg(format!(
+            "workflow_id '{workflow_id}' is held by an execution that was rebalanced \
+             off shard {}; its live copy is not reachable from this node, so the \
+             signal-with-start is refused rather than starting a duplicate run",
+            seal_shard.as_i32()
+        ))
+        .into_response();
     }
 
     let (shard, mut conn, exec_id, _will_attach) = if let Some(tuple) = found_shard {
@@ -21030,6 +21069,7 @@ async fn update_with_start_workflow(
         (hit_exec_id.shard(), conn, hit_exec_id)
     } else {
         let mut found_shard: Option<(ShardId, PoolConn, ExecutionId)> = None;
+        let mut seal_only: Option<ShardId> = None;
         for (candidate_shard, shard_pool) in pool.iter_shards() {
             let mut shard_conn = match acquire_conn(shard_pool).await {
                 Ok(c) => c,
@@ -21059,6 +21099,13 @@ async fn update_with_start_workflow(
                 }
             };
             if let Some((existing_uuid, existing_state)) = hit {
+                // A rebalanced seal is not the run (issue #964) — see the
+                // matching scan in the signal-with-start handler. Skip it and
+                // keep looking for the live copy.
+                if matches!(existing_state.as_str(), "MIGRATED" | "MIGRATING") {
+                    seal_only = Some(candidate_shard);
+                    continue;
+                }
                 // Reuse the execution UUID only when attaching to a live RUNNING or
                 // SUSPENDED run under a non-rejecting policy. All other paths
                 // (terminal prior, PAUSED, TerminateIfRunning) go through
@@ -21082,6 +21129,16 @@ async fn update_with_start_workflow(
 
         if let Some(tuple) = found_shard {
             tuple
+        } else if let Some(seal_shard) = seal_only {
+            // Held by a run rebalanced onto a shard this node cannot reach.
+            // Starting fresh would duplicate the business key.
+            return AutumnError::service_unavailable_msg(format!(
+                "workflow_id '{workflow_id}' is held by an execution that was rebalanced \
+                 off shard {}; its live copy is not reachable from this node, so the \
+                 update-with-start is refused rather than starting a duplicate run",
+                seal_shard.as_i32()
+            ))
+            .into_response();
         } else {
             let shard = runtime
                 .router
@@ -22909,10 +22966,34 @@ async fn erase_workflow_payloads_handler(
         .unwrap_or_default();
 
     let exec_id = parse_execution_id(&id)?;
-    let mut conn = db_conn_for_execution(&api_state, exec_id).await?;
     let exec_id_str = exec_id.to_string();
 
-    let result = autumn_harvest::erase::erase_workflow_payloads(&mut conn, exec_id, &reason).await;
+    // Cross-residence (issue #964): a rebalanced execution's payloads exist on
+    // the sealed source shard as well as the live target, and an erasure that
+    // scrubbed only the shard the id routes to would leave a complete readable
+    // copy of the subject's data behind on another database.
+    //
+    // NOTE the deliberate absence of a held connection around this call. The
+    // helper checks out its own connection PER RESIDENCE, starting with the
+    // live one — so holding the audit connection across it would have this
+    // request waiting on a pool slot it is itself holding whenever the live
+    // shard's pool is the supported minimum size of one. That would wedge every
+    // erasure, migrated or not, until checkout timed out. The audit connection
+    // is therefore acquired AFTER the erase returns, which is the same
+    // one-connection-at-a-time discipline the cross-shard cancel path keeps for
+    // issue #688's precedent.
+    let result = match api_state.storage_pool() {
+        Ok(pool) => {
+            autumn_harvest::erase::erase_workflow_payloads_all_residences(
+                pool.sharded_pool(),
+                exec_id,
+                &reason,
+            )
+            .await
+        }
+        Err(e) => Err(e),
+    };
+    let mut conn = db_conn_for_execution(&api_state, exec_id).await?;
 
     let (status, error_summary) = match &result {
         Ok(_) => (STATUS_SUCCEEDED, None),
@@ -38127,12 +38208,28 @@ pub(crate) async fn acquire_conn(pool: &DbPool) -> Result<PoolConn, AutumnError>
     pool.get().await.map_err(|error| map_pool_error(&error))
 }
 
+/// Resolve a connection to the shard that currently hosts `exec_id`.
+///
+/// Routes through `shard_rebalance::conn_for_execution_forwarded` (issue #964)
+/// so an execution an operator has rebalanced onto another shard is still found
+/// by the `ExecutionId` a caller captured before the move — the identity
+/// contract that makes shard rebalancing safe is *"any id captured before the
+/// migration continues to resolve after it"*, and this is the chokepoint the
+/// ~40 single-execution management routes reach it through.
+///
+/// A single-shard deployment pays nothing: with one pool there is nowhere to
+/// migrate to, so the forwarding probe is skipped and this is byte-for-byte the
+/// pre-#964 `pool_for_execution` checkout. A multi-shard deployment pays one
+/// primary-key lookup against a partial index that is empty until an operator
+/// rebalances.
 pub(crate) async fn db_conn_for_execution(
     api_state: &HarvestApiState,
     exec_id: ExecutionId,
 ) -> Result<PoolConn, AutumnError> {
     let pool = api_state.storage_pool().map_err(map_error)?;
-    acquire_conn(pool.pool_for_execution(exec_id)).await
+    ::autumn_harvest::shard_rebalance::conn_for_execution_forwarded(pool.sharded_pool(), exec_id)
+        .await
+        .map_err(|error| map_pool_error(&error))
 }
 
 /// Resolve a connection to the shard that *owns* `exec_id`, with **no default
@@ -38165,7 +38262,19 @@ pub(crate) async fn db_conn_for_execution_exact(
 ) -> Result<Option<PoolConn>, AutumnError> {
     let pool = api_state.storage_pool().map_err(map_error)?;
     if let Some(shard_pool) = pool.sharded_pool().exact_pool_for_execution(exec_id) {
-        return acquire_conn(shard_pool).await.map(Some);
+        // Issue #964: the origin shard is reachable, but the run may have been
+        // rebalanced off it. Follow the durable forwarding pointer, preserving
+        // this helper's exact/no-default contract — without it `/tree`, `/logs`
+        // and `PATCH /triage` read (and, for triage, WRITE) the sealed source
+        // instead of the live copy, and report success for doing so.
+        let _ = shard_pool;
+        return ::autumn_harvest::shard_rebalance::conn_for_execution_forwarded(
+            pool.sharded_pool(),
+            exec_id,
+        )
+        .await
+        .map(Some)
+        .map_err(|error| map_pool_error(&error));
     }
     let shard = exec_id.shard().as_i32();
     let pools = crate::shard_fanout::pools_by_shard(api_state);
@@ -38496,7 +38605,24 @@ pub(crate) async fn load_workflows(
         };
     }
 
-    if !filters.states.is_empty() {
+    if filters.states.is_empty() {
+        // Issue #964: a completed migration leaves TWO rows carrying the same
+        // `id` and the same copied `created_at` — `MIGRATED` on the source and
+        // the live `RUNNING` copy on the target — and this listing fans out
+        // across every shard. Returning both would show one logical execution
+        // twice, and worse: the keyset cursor is derived from `(created_at, id)`,
+        // which is byte-identical for the two copies, so a page boundary landing
+        // between them makes the strict next-page predicate skip the other one
+        // permanently — possibly leaving only the stale `MIGRATED` state visible.
+        //
+        // The sealed source is a forwarding tombstone, not a workflow, so the
+        // DEFAULT listing collapses residences to the live row by excluding it.
+        // An explicit `state=MIGRATED` filter still returns it: the diagnostic
+        // view an operator needs mid-decommission is deliberately preserved,
+        // and that branch cannot double-count because it excludes the live copy
+        // by the same predicate.
+        query = query.filter(harvest_workflow_executions::state.ne("MIGRATED"));
+    } else {
         query = query.filter(harvest_workflow_executions::state.eq_any(filters.states.clone()));
     }
     if let Some(name) = &filters.workflow_name {
@@ -43973,11 +44099,18 @@ pub async fn poll_update_result(
         loop {
             let result = {
                 // Scope the connection so it is returned to the pool before sleeping.
-                let mut c = pool
-                    .pool_for_execution(exec_id)
-                    .get()
-                    .await
-                    .map_err(|e| HarvestError::Database(e.to_string()))?;
+                // Forwarding-aware (issue #964): the admit-and-wake half of an
+                // update routes through `db_conn_for_execution`, which follows
+                // the durable pointer to the live copy. If the poll did not, a
+                // rebalanced workflow would have its update run on the target
+                // while this loop read the sealed source's frozen history —
+                // never observing `UpdateCompleted`/`UpdateFailed`, and
+                // answering 504 for an update that in fact completed.
+                let mut c = autumn_harvest::shard_rebalance::conn_for_execution_forwarded(
+                    pool.sharded_pool(),
+                    exec_id,
+                )
+                .await?;
                 let h = store::load_history_with_codecs(&mut c, exec_id, codecs).await?;
                 // c is dropped here, releasing the connection back to the pool.
                 let mut terminal_state = get_terminal_workflow_state(&h.events);
@@ -53539,6 +53672,9 @@ mod tests {
 
     fn stub_workflow_execution() -> WorkflowExecution {
         WorkflowExecution {
+            migrated_to_shard: None,
+            migrated_at: None,
+            migrated_from_shards: None,
             quota_key: None,
             id: uuid::Uuid::new_v4(),
             workflow_name: "decode-wf".to_string(),
