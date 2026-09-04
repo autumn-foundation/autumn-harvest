@@ -206,15 +206,30 @@ A `no-schedule-to-close` row (`schedule_to_close_at IS NULL`) never
 satisfies this predicate and is never a member of this index, before or
 after a claim. A `schedule-to-close` row satisfies it both before
 (`state = 'PENDING'`) and after (`state = 'RUNNING'`) the claim `UPDATE` --
-its logical index membership doesn't change -- but the `UPDATE` still
-creates a brand-new physical tuple (ordinary Postgres MVCC), and every
-index the row is a member of needs an entry pointing at that new tuple.
-`no-schedule-to-close` rows pay this for `idx_harvest_tq_poll` and
-`idx_harvest_tq_running` only (both already keyed on `state`, so already
-non-HOT for every claim regardless of this predicate); `schedule-to-close`
-rows pay it for those two **plus** this partial index -- one genuinely
-extra index write, every claim, that `no-schedule-to-close` rows never
-incur.
+its logical index membership doesn't change.
+
+The claim `UPDATE` changes `state`, and `state` is a key column of
+`idx_harvest_tq_poll` and `idx_harvest_tq_running` (and appears in
+`idx_harvest_tq_activity_pause`'s key too) -- so this `UPDATE` cannot use
+Postgres's HOT (Heap-Only Tuple) optimization, for *every* claim, on *both*
+labels, regardless of `schedule_to_close_at`. HOT eligibility is an
+all-or-nothing property of the update: once any indexed column changes,
+Postgres cannot skip index maintenance selectively for the indexes that
+column doesn't belong to -- the new physical tuple needs a fresh entry in
+*every* index on `harvest_task_queue`, not just the ones keyed on `state`.
+`harvest_task_queue` carries well over a dozen indexes (the primary key,
+`idx_harvest_tq_workflow`, `idx_harvest_tq_activity_id`, and others besides
+`idx_harvest_tq_poll`/`idx_harvest_tq_running`), and both
+`no-schedule-to-close` and `schedule-to-close` rows pay full non-HOT
+maintenance across all of them on every claim -- an earlier revision of
+this page incorrectly described the baseline cost as touching only
+`idx_harvest_tq_poll` and `idx_harvest_tq_running` (Codex review, PR
+#1339). The one-sentence version that *is* accurate:
+`harvest_task_queue_schedule_to_close_idx` is the **one index in that
+already-large set that only `schedule-to-close` rows are ever members
+of** -- every other index gets a new entry on every claim for both
+labels equally, so it cancels out of the comparison; this one does not,
+which is why it is the source of the measured delta.
 
 The `Update on public.harvest_task_queue` node's own `Buffers` line shows
 this directly, and it is depth-independent -- the signature of a per-claim

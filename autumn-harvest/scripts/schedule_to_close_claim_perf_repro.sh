@@ -50,6 +50,24 @@
 # Preconditions: a Rust toolchain that can build this crate, and either Docker
 # (for the harness's own testcontainer fallback) or a reachable Postgres named
 # by `HARVEST_TEST_DATABASE_URL`.
+#
+# If `HARVEST_TEST_DATABASE_URL` points at an external Postgres instance
+# (rather than relying on the testcontainer fallback), that instance must
+# ALSO have `pg_stat_statements` in `shared_preload_libraries` (a
+# server-level setting that requires a restart to change, so it cannot be
+# provisioned by this script or by the harness at connection time) and the
+# role in the URL must have permission to call
+# `pg_stat_statements_reset(...)` (superuser, or an explicit GRANT). Neither
+# is checked up front: a vanilla external Postgres that satisfies every
+# other precondition above will still complete the `EXPLAIN` sweep and then
+# fail partway through, once the capture reaches its `pg_stat_statements`
+# snapshot. The testcontainer fallback (unset `HARVEST_TEST_DATABASE_URL`,
+# Docker reachable) does not have this problem -- see the image/setup this
+# crate's `db::setup_bench_db()` uses, which provisions the extension
+# itself. Codex review on PR #1339 (P2) flagged this gap; the same gap
+# exists in the sibling `capability_labels_claim_perf_repro.sh` and
+# `concurrency_key_claim_perf_repro.sh` and is not fixed there by this
+# change.
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
