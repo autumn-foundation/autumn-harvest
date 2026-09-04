@@ -68,7 +68,7 @@
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 use autumn_harvest::context::WorkflowContext;
 use autumn_harvest::event::WorkflowEvent;
@@ -89,7 +89,8 @@ use axum::http::{Request, StatusCode};
 use chrono::Utc;
 use diesel::sql_types;
 use diesel_async::pooled_connection::AsyncDieselConnectionManager;
-use diesel_async::{AsyncConnection, AsyncPgConnection, RunQueryDsl};
+use diesel_async::{AsyncConnection, AsyncPgConnection, RunQueryDsl, SimpleAsyncConnection};
+use reqwest::Url;
 use serde_json::{Value, json};
 use testcontainers::ContainerAsync;
 use testcontainers::ImageExt;
@@ -184,7 +185,7 @@ fn run_token() -> String {
 }
 
 fn with_db_name(admin_url: &str, db: &str) -> Result<String, String> {
-    let mut url = url::Url::parse(admin_url).map_err(|e| format!("parse admin url: {e}"))?;
+    let mut url = Url::parse(admin_url).map_err(|e| format!("parse admin url: {e}"))?;
     url.set_path(&format!("/{db}"));
     Ok(url.to_string())
 }
@@ -242,7 +243,7 @@ async fn setup_bench_db() -> Result<BenchDb, SkipReason> {
 /// a correctness problem, and this bench (unlike `claim_bench`'s CI-gated
 /// budget test) is not expected to run unattended many times per day.
 async fn drop_bench_db(admin_url: &str, db_url: &str) {
-    let Ok(parsed) = url::Url::parse(db_url) else {
+    let Ok(parsed) = Url::parse(db_url) else {
         return;
     };
     let db = parsed.path().trim_start_matches('/');
