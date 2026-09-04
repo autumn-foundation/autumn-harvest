@@ -812,6 +812,29 @@ pub enum HarvestError {
         /// The task-queue row whose ownership could not be confirmed.
         task_id: Uuid,
     },
+
+    /// An ordinary workflow-task terminal write (complete, fail, or an
+    /// operator-pause park) could not confirm it still owns the task's claim
+    /// under the row lock (issue #1184).
+    ///
+    /// Sibling of [`Self::SuspendedClaimAmbiguous`], not a reuse of it: that
+    /// variant is scoped to issue #1182's narrow empty-command-set escalation
+    /// branch specifically, while this one covers the ordinary completion/
+    /// failure/pause-park paths #1184 closes the same gap for. Same
+    /// blameless-sentinel contract and the same rollback/lock-ordering
+    /// rationale apply verbatim: propagating this with `?` out of the entire
+    /// persistence transaction rolls back every lock and bookkeeping write
+    /// from this cycle *before* any claim-release attempt runs, avoiding the
+    /// ABBA cycle against `poison_pill::quarantine_orphan`'s reversed
+    /// (task-row-first) lock order that a release attempted while still
+    /// holding the execution row would risk. See
+    /// [`Self::SuspendedClaimAmbiguous`]'s doc comment for the full
+    /// explanation.
+    #[error("a workflow-task terminal write could not confirm it still owns the task's claim")]
+    TerminalWriteClaimAmbiguous {
+        /// The task-queue row whose ownership could not be confirmed.
+        task_id: Uuid,
+    },
 }
 
 /// Where in a task's dispatch cycle a capability miss (issue #804) was
@@ -1279,6 +1302,23 @@ impl HarvestError {
     pub const fn suspended_claim_ambiguous(&self) -> Option<Uuid> {
         match self {
             Self::SuspendedClaimAmbiguous { task_id } => Some(*task_id),
+            _ => None,
+        }
+    }
+
+    /// Classify this error as an **ambiguous ordinary terminal-write claim**
+    /// (issue #1184): a complete/fail/pause-park write could not confirm it
+    /// still owns the task, so no terminal decision was made.
+    ///
+    /// Returns `Some(task_id)` for [`Self::TerminalWriteClaimAmbiguous`] and
+    /// `None` for every other variant — the sibling accessor to
+    /// [`Self::suspended_claim_ambiguous`]. The caller uses this to skip the
+    /// ordinary terminal-failure path and instead perform the standalone claim
+    /// release *after* the enclosing transaction has rolled back.
+    #[must_use]
+    pub const fn terminal_write_claim_ambiguous(&self) -> Option<Uuid> {
+        match self {
+            Self::TerminalWriteClaimAmbiguous { task_id } => Some(*task_id),
             _ => None,
         }
     }
