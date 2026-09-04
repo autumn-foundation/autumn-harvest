@@ -13514,20 +13514,26 @@ fn local_circuit_snapshot_is_authoritative(
 /// every eligible worker only when none of them could be running a different
 /// build.
 ///
+/// `worker_build_ids` maps worker id -> advertised build id, built ONCE by
+/// the caller from the same `workers` slice [`eligible_worker_ids`] already
+/// scanned to produce `eligible_ids` (issue #1190 review round 1). Looking a
+/// worker's build up here is therefore an O(1) map hit rather than a second
+/// O(workers) linear scan per eligible id, which would otherwise make a wide
+/// fan-out with many eligible workers quadratic in fleet size.
+///
 /// Vacuously `false` for an empty `eligible_ids`: `activity_no_worker`
 /// outranks the rate-limit verdicts anyway (issue #809), and an empty set
 /// asserting authority would be a claim this function has no evidence for.
 fn every_eligible_worker_is_on_the_local_build(
     eligible_ids: &[&str],
-    workers: &[WorkerRow],
+    worker_build_ids: &std::collections::HashMap<&str, &str>,
     local_build_id: &str,
 ) -> bool {
     !eligible_ids.is_empty()
         && eligible_ids.iter().all(|id| {
-            workers
-                .iter()
-                .find(|w| w.worker.worker_id == *id)
-                .is_some_and(|w| registry_fallback_binds(&w.worker.build_id, local_build_id))
+            worker_build_ids
+                .get(id)
+                .is_some_and(|build_id| registry_fallback_binds(build_id, local_build_id))
         })
 }
 
@@ -13552,14 +13558,23 @@ fn every_eligible_worker_is_on_the_local_build(
 /// `activity_rate_limit_bucket_missing` is reported for it, the same
 /// conservative bias that keeps a genuinely fleet-wide breaker outage from
 /// reporting `activity_circuit_open` off one replica's snapshot.
+///
+/// `locally_tracked` short-circuits the build check entirely: when it is
+/// `true` the answer is always `false` regardless of build agreement, so the
+/// bucket for a locally-tracked activity's key is never queried in the first
+/// place -- see the `rate_limit_keys` filter at this function's call site.
 fn rate_limit_gate_applies(
     locally_tracked: bool,
     eligible_ids: &[&str],
-    workers: &[WorkerRow],
+    worker_build_ids: &std::collections::HashMap<&str, &str>,
     local_build_id: &str,
 ) -> bool {
     !locally_tracked
-        && every_eligible_worker_is_on_the_local_build(eligible_ids, workers, local_build_id)
+        && every_eligible_worker_is_on_the_local_build(
+            eligible_ids,
+            worker_build_ids,
+            local_build_id,
+        )
 }
 
 /// Decode the one activity error this response actually surfaces (issue #608).
@@ -13845,15 +13860,24 @@ pub(crate) async fn build_diagnosis_report(
 
     // Rate-limit saturation. A circuit-breaker-tracked activity enforces its
     // rate limit at DISPATCH rather than at claim (issue #369), so its bucket
-    // is a claim-time impediment only when every worker eligible to claim the
-    // row shares OUR compile-time tracked/untracked fact about the breaker --
-    // see `rate_limit_gate_applies` (issue #1190). Whether that holds is a
-    // PER-TASK question (it depends on that task's own eligible workers, only
-    // known once eligibility is resolved below), so it is deliberately NOT
-    // filtered out of the key set here -- every pending task's key is looked
-    // up, and the per-task gate decides which lookups actually surface.
+    // is never a claim-time impediment for it -- `rate_limit_gate_applies`
+    // (issue #1190) short-circuits to `false` on `locally_tracked` alone,
+    // with no build check at all, so a locally-tracked activity's key can
+    // never surface regardless of what its eligible workers' builds are.
+    // Filtering it out here (issue #1190 review round 1) therefore loses no
+    // coverage and avoids sending a large, unfiltered fan-out of dynamic
+    // bucket keys to Postgres for lookups the per-task gate would discard
+    // unconditionally anyway. Only the OTHER direction -- untracked here but
+    // possibly tracked on an eligible peer's different build -- depends on
+    // that peer's build, which is a per-task question resolved once
+    // eligibility is known below; that activity's key IS still included here.
     let rate_limit_keys: Vec<String> = pending_tasks
         .iter()
+        .filter(|t| {
+            !t.activity_name
+                .as_ref()
+                .is_some_and(|name| cb_tracked.contains(name))
+        })
         .filter_map(|t| t.rate_limit_key.clone())
         // Deduped so a wide fan-out sharing one key binds a 1-element array
         // rather than one entry per task row.
@@ -13938,6 +13962,14 @@ pub(crate) async fn build_diagnosis_report(
     // and `claim_task` asks each worker's own registry instead (see
     // [`registry_fallback_binds`]). `None` for an API-only replica.
     let local_build_id = local_build_id_from_workers(&live_workers, local_worker_id.as_deref());
+    // Worker id -> advertised build id, built ONCE for every task's
+    // `rate_limit_gate_applies` call (issue #1190 review round 1) rather than
+    // re-scanning `live_workers` per eligible id per task -- see
+    // `every_eligible_worker_is_on_the_local_build`.
+    let worker_build_ids: std::collections::HashMap<&str, &str> = live_workers
+        .iter()
+        .map(|w| (w.worker.worker_id.as_str(), w.worker.build_id.as_str()))
+        .collect();
     // The row's OWN recorded shard, not `exec_id.shard()`. A pre-sharding (or
     // `ExecutionId::new()`) id carries the `ShardId::UNENCODED` sentinel
     // (0xFFFF), which the router resolves to the default shard — but a worker
@@ -14014,7 +14046,7 @@ pub(crate) async fn build_diagnosis_report(
             // because eligibility (and therefore build agreement) is itself
             // per task.
             let gate_applies =
-                rate_limit_gate_applies(has_cb, &eligible_ids, &live_workers, &local_build_id);
+                rate_limit_gate_applies(has_cb, &eligible_ids, &worker_build_ids, &local_build_id);
             let concurrency_saturated = match (t.concurrency_key.as_ref(), t.concurrency_cap) {
                 (Some(key), Some(cap)) => {
                     running_by_key
@@ -55583,6 +55615,16 @@ mod tests {
 
     // ── issue #1190: build-scope the rate-limit bypass ──────────────────────
 
+    /// Build the `worker_build_ids` map `rate_limit_gate_applies` and
+    /// `every_eligible_worker_is_on_the_local_build` expect, exactly as
+    /// `build_diagnosis_report` builds it once from `live_workers`.
+    fn build_ids<'a>(workers: &'a [WorkerRow]) -> std::collections::HashMap<&'a str, &'a str> {
+        workers
+            .iter()
+            .map(|w| (w.worker.worker_id.as_str(), w.worker.build_id.as_str()))
+            .collect()
+    }
+
     #[test]
     fn every_eligible_worker_is_on_the_local_build_requires_unanimous_agreement() {
         let workers = vec![
@@ -55590,11 +55632,12 @@ mod tests {
             eligibility_worker("w-peer", &["payments"], "build-new", serde_json::json!({})),
             eligibility_worker("w-old", &["payments"], "build-old", serde_json::json!({})),
         ];
+        let ids = build_ids(&workers);
 
         // Every eligible worker shares the local build.
         assert!(every_eligible_worker_is_on_the_local_build(
             &["w-local", "w-peer"],
-            &workers,
+            &ids,
             "build-new",
         ));
 
@@ -55602,7 +55645,7 @@ mod tests {
         // the local fact cannot be trusted for the whole set.
         assert!(!every_eligible_worker_is_on_the_local_build(
             &["w-local", "w-old"],
-            &workers,
+            &ids,
             "build-new",
         ));
 
@@ -55615,7 +55658,7 @@ mod tests {
         ];
         assert!(every_eligible_worker_is_on_the_local_build(
             &["w-a", "w-b"],
-            &no_build_routing,
+            &build_ids(&no_build_routing),
             "",
         ));
 
@@ -55624,7 +55667,17 @@ mod tests {
         // to assert authority over an empty set.
         assert!(!every_eligible_worker_is_on_the_local_build(
             &[],
-            &workers,
+            &ids,
+            "build-new",
+        ));
+
+        // An eligible id absent from the map (structurally shouldn't happen,
+        // since eligible_ids is always derived from the same worker slice the
+        // map is built from, but the lookup must default safely) is treated
+        // as build-unknown, not build-matching.
+        assert!(!every_eligible_worker_is_on_the_local_build(
+            &["w-ghost"],
+            &ids,
             "build-new",
         ));
     }
@@ -55658,7 +55711,7 @@ mod tests {
         assert!(!rate_limit_gate_applies(
             /* locally_tracked */ true,
             &["w-peer"],
-            &workers,
+            &build_ids(&workers),
             "build-new",
         ));
     }
@@ -55681,7 +55734,7 @@ mod tests {
         assert!(!rate_limit_gate_applies(
             /* locally_tracked */ false,
             &["w-peer"],
-            &workers,
+            &build_ids(&workers),
             "build-new",
         ));
     }
@@ -55696,13 +55749,14 @@ mod tests {
             eligibility_worker("w-local", &["payments"], "build-x", serde_json::json!({})),
             eligibility_worker("w-peer", &["payments"], "build-x", serde_json::json!({})),
         ];
+        let ids = build_ids(&workers);
 
         assert!(
-            rate_limit_gate_applies(false, &["w-local", "w-peer"], &workers, "build-x"),
+            rate_limit_gate_applies(false, &["w-local", "w-peer"], &ids, "build-x"),
             "untracked locally, same build everywhere: the bucket is the accurate impediment"
         );
         assert!(
-            !rate_limit_gate_applies(true, &["w-local", "w-peer"], &workers, "build-x"),
+            !rate_limit_gate_applies(true, &["w-local", "w-peer"], &ids, "build-x"),
             "tracked locally, same build everywhere: the breaker gates it at dispatch"
         );
 
@@ -55713,17 +55767,18 @@ mod tests {
             "",
             serde_json::json!({}),
         )];
+        let no_build_ids = build_ids(&no_build_routing);
         assert!(rate_limit_gate_applies(
             false,
             &["w-peer"],
-            &no_build_routing,
-            "",
+            &no_build_ids,
+            ""
         ));
         assert!(!rate_limit_gate_applies(
             true,
             &["w-peer"],
-            &no_build_routing,
-            "",
+            &no_build_ids,
+            ""
         ));
     }
 }
