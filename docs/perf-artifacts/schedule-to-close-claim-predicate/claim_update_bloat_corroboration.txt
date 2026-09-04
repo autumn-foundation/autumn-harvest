@@ -1,0 +1,40 @@
+Timing is off.
+TRUNCATE TABLE
+INSERT 0 10000
+VACUUM
+        label        | heap_pages | idx_pages 
+---------------------+------------+-----------
+ no-stc-before-claim |        213 |         1
+(1 row)
+
+UPDATE 10000
+       label        | heap_pages | idx_pages 
+--------------------+------------+-----------
+ no-stc-after-claim |        463 |         1
+(1 row)
+
+TRUNCATE TABLE
+INSERT 0 10000
+VACUUM
+      label       | heap_pages | idx_pages 
+------------------+------------+-----------
+ stc-before-claim |        223 |        30
+(1 row)
+
+UPDATE 10000
+      label      | heap_pages | idx_pages 
+-----------------+------------+-----------
+ stc-after-claim |        486 |        57
+(1 row)
+
+ no_stc_heap_delta_pages | stc_heap_delta_pages | extra_heap_pages | extra_heap_pct_more_growth_from_schedule_to_close 
+-------------------------+----------------------+------------------+---------------------------------------------------
+                     250 |                  263 |               13 |                                               5.2
+(1 row)
+
+ no_stc_idx_delta_pages | stc_idx_delta_pages 
+------------------------+---------------------
+                      0 |                  27
+(1 row)
+
+TRUNCATE TABLE

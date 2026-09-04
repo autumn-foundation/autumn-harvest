@@ -1173,11 +1173,50 @@ from the benchmark are directly comparable.
     pauses a queue closed that specific gap and, as a direct result, replaced
     the correlated anti-join with a one-time prefilter — see
     [the queue-pause anti-join fix](#the-queue-pause-anti-join-fix).
-  * **`schedule_to_close` (#378), worker sessions (#606), sticky routing
-    (#235)** — cheap inline column tests, against columns the seed leaves null.
+  * **`schedule_to_close` (#378)** — measured directly:
+    [`docs/performance-schedule-to-close.md`](performance-schedule-to-close.md) seeds `schedule_to_close_at`
+    (rather than leaving it null) and **confirms this page's own suspicion on
+    magnitude, but not on mechanism**: a small, real shared-buffer-hit cost
+    (+2.6% to +7.5% across the three published backlog depths — the
+    100,000-row depth's plan also spills identically to disk on both sides
+    via an external sort, so folding that unrelated temp I/O into the total
+    gives +1.3% at that depth instead; that page reports both and explains
+    why), corroborated by two
+    standalone MVCC-bloat scripts, one bulk and one per-row (+5.2% both) —
+    nowhere near the 20% impact floor, so no fix is proposed. Codex review
+    caught that the predicate text alone (a plain inline column test) is not
+    the whole story: `harvest_task_queue` carries a partial index on this
+    column for the timeout scanner, and the claim `UPDATE` writes a new
+    entry to it for every `schedule-to-close` row — a fixed, depth-independent
+    +1 dirtied/+1 written page at every backlog depth tested, additive with a
+    separate row-width effect on the candidate scan that *does* scale with
+    depth. Review also caught that the harness's first seeded deadline gave
+    every row the byte-identical value, letting B-tree deduplication
+    understate the index's real growth by roughly 3x — fixed by seeding a
+    distinct, per-row deadline instead. See that page's "Plan" and
+    "Write-side cost" sections for the buffer- and storage-level evidence.
+    One thing did **not** reproduce cleanly across this pass's several
+    capture runs: the real 10,001-call `pg_stat_statements` drain's
+    aggregate delta varied run to run, but only the most recent run's
+    artifacts are ever committed -- the repro script overwrites the same
+    canonical filenames each time -- so that page states only the one
+    auditable, committed number (**+15.5%**), without asserting a range, a
+    frequency, or a direction (e.g. "always positive") for runs whose
+    evidence no longer exists in the repository to audit. The committed run
+    also shows a markedly cheaper plan at the 100,000-row depth (a plain
+    `Seq Scan`) than a more expensive one this capture's development runs
+    sometimes hit before the seeding and `ANALYZE` fixes landed; that page's
+    "100,000-row plan choice" section explains why it asserts no frequency,
+    ratio, or before/after count for this, including why an earlier
+    revision's "N of M runs" framing, and later a spelled-out
+    sample-of-two-against-two restating the same statistic in prose, both
+    had to be walked back once those runs' artifacts were no longer
+    available to audit.
+  * **Worker sessions (#606), sticky routing (#235)** — still cheap inline
+    column tests, against columns the seed leaves null; not yet measured.
 
-  Adding these is scenario work, not query work: each needs a seed variant and a
-  report row, on a bench that already runs 15-30 minutes.
+  Adding one of these is scenario work, not query work: each needs a seed
+  variant and a report row, on a bench that already runs 15-30 minutes.
 * **Queue count is a parameter, but it is not swept.** `Scenario.queues`
   parameterizes how many distinct queues the backlog spreads across, and every
   published row holds it at 4. Backlog depth and claimer count *are* varied.
@@ -1211,6 +1250,12 @@ from the benchmark are directly comparable.
 * `docs/perf-artifacts/capability-labels-claim-predicate/` — committed
   `EXPLAIN`/`pg_stat_statements` evidence for that measurement.
 * `autumn-harvest/scripts/capability_labels_claim_perf_repro.sh` — regenerates
+  that evidence from a clean checkout.
+* [`docs/performance-schedule-to-close.md`](performance-schedule-to-close.md) — the `schedule_to_close_at` claim
+  predicate (#378) measurement referenced above.
+* `docs/perf-artifacts/schedule-to-close-claim-predicate/` — committed
+  `EXPLAIN`/`pg_stat_statements`/heap-growth evidence for that measurement.
+* `autumn-harvest/scripts/schedule_to_close_claim_perf_repro.sh` — regenerates
   that evidence from a clean checkout.
 * [`docs/performance-history-ceiling.md`](performance-history-ceiling.md) — a separate scanner, not part of
   `claim_task_query()`: the workflow-history-ceiling check
