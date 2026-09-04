@@ -3145,3 +3145,246 @@ async fn same_build_workers_are_still_gated_by_the_registry_fallback() {
     );
     assert_eq!(body["health"], "stalled", "body: {body}");
 }
+
+// ── issue #1190: build-scope the rate-limit bypass per eligible worker ─────
+//
+// `cb_tracked` (the circuit-breaker-tracked-activity set) is read from THIS
+// replica's in-process registry, exactly like the breaker phase itself. It is
+// a compile-time `#[activity(circuit_breaker = ...)]` declaration, so during a
+// rolling deploy an eligible peer on a DIFFERENT build may declare it
+// differently. Neither direction of that disagreement may be reported: the
+// endpoint's direction-of-safety rule -- an unknown-build worker is assumed
+// capable, never assumed blocked -- applies here exactly as it does to the
+// breaker phase in `local_circuit_snapshot_is_authoritative`.
+//
+// None of these tests seed `LOCAL_WORKER_ID` as a live worker row, so this
+// replica's own build resolves to `""` (unidentified) -- the same "no
+// co-located worker has registered yet" shape `local_build_id_from_workers`
+// already documents, and here it stands in for "the sole eligible worker
+// runs a build we cannot vouch for."
+
+/// AC1: locally tracked (breaker-tracked), but the sole eligible worker is on
+/// a different build. The local tracked fact cannot be applied to that peer,
+/// so the endpoint must not lean on it alone to call this healthy -- and,
+/// per the direction-of-safety rule, it also must not fabricate a rate-limit
+/// block it cannot attribute to the actual dispatcher. Regression-pinned: the
+/// verdict here is `healthy_in_progress`, not `activity_rate_limited`.
+#[tokio::test]
+async fn ac1_locally_tracked_activity_does_not_apply_the_bypass_to_an_off_build_peer() {
+    let (url, _guard) = setup_database().await;
+    let pool = build_pool(&url);
+    let app = build_api_app(build_api_state(&pool));
+
+    let exec_id = seed_execution(
+        &pool,
+        "activity_wf",
+        "RUNNING",
+        vec![started_event(), scheduled_activity_event()],
+    )
+    .await;
+    // A drained bucket: if the rate-limit gate wrongly applied here, this
+    // would surface as `activity_rate_limited`.
+    seed_drained_rate_limit_bucket(&pool, "tenant:acme").await;
+    seed_keyed_activity_task(
+        &pool,
+        exec_id,
+        "charge_card",
+        "payments",
+        Some("tenant:acme"),
+        None,
+        None,
+    )
+    .await;
+    // The ONLY eligible worker, on a build this replica cannot vouch for.
+    seed_live_worker_with(
+        &pool,
+        "w-peer-old-build",
+        "payments",
+        "build-old",
+        json!({}),
+    )
+    .await;
+
+    let body = diagnose(&app, exec_id).await;
+    assert_ne!(
+        kind(&body),
+        "activity_rate_limited",
+        "the off-build peer's real gate is unknown, so it must not be reported as \
+         claim-time rate-limited: {body}"
+    );
+    assert_ne!(
+        kind(&body),
+        "activity_rate_limit_bucket_missing",
+        "body: {body}"
+    );
+    assert_eq!(
+        kind(&body),
+        "healthy_in_progress",
+        "an eligible worker exists and no attributable impediment was found: {body}"
+    );
+    assert_eq!(body["health"], "healthy", "body: {body}");
+}
+
+/// AC2: NOT locally tracked, but the sole eligible worker is on a different
+/// build. That peer's build may declare the breaker, in which case its real
+/// gate is dispatch-time -- consulting the bucket and reporting
+/// `activity_rate_limited` would be a false positive on the flagship stall
+/// verdict, the worse direction per the issue's own analysis.
+#[tokio::test]
+async fn ac2_untracked_activity_does_not_consult_the_bucket_for_an_off_build_peer() {
+    let (url, _guard) = setup_database().await;
+    let pool = build_pool(&url);
+    let app = build_api_app(build_api_state(&pool));
+
+    let exec_id = seed_execution(
+        &pool,
+        "activity_wf",
+        "RUNNING",
+        vec![started_event(), scheduled_activity_event()],
+    )
+    .await;
+    seed_drained_rate_limit_bucket(&pool, "tenant:acme").await;
+    seed_keyed_activity_task(
+        &pool,
+        exec_id,
+        "send_email",
+        "email",
+        Some("tenant:acme"),
+        None,
+        None,
+    )
+    .await;
+    seed_live_worker_with(&pool, "w-peer-old-build", "email", "build-old", json!({})).await;
+
+    let body = diagnose(&app, exec_id).await;
+    assert_ne!(
+        kind(&body),
+        "activity_rate_limited",
+        "the off-build peer's real gate is unknown -- it might be circuit-tracked on \
+         its own build -- so a false rate-limit block must not be reported: {body}"
+    );
+    assert_eq!(kind(&body), "healthy_in_progress", "body: {body}");
+    assert_eq!(body["health"], "healthy", "body: {body}");
+}
+
+/// AC2, the `stalled`-reachable half: a MISSING bucket row for an untracked
+/// activity whose sole eligible worker is off-build. Before this fix this was
+/// "now reachable on a `stalled` verdict" per the issue -- the false positive
+/// this endpoint must never produce.
+#[tokio::test]
+async fn ac2_untracked_activity_does_not_report_a_missing_bucket_for_an_off_build_peer() {
+    let (url, _guard) = setup_database().await;
+    let pool = build_pool(&url);
+    let app = build_api_app(build_api_state(&pool));
+
+    let exec_id = seed_execution(
+        &pool,
+        "activity_wf",
+        "RUNNING",
+        vec![started_event(), scheduled_activity_event()],
+    )
+    .await;
+    // Deliberately NO bucket row at all.
+    seed_keyed_activity_task(
+        &pool,
+        exec_id,
+        "send_email",
+        "email",
+        Some("tenant:ghost"),
+        None,
+        None,
+    )
+    .await;
+    seed_live_worker_with(&pool, "w-peer-old-build", "email", "build-old", json!({})).await;
+
+    let body = diagnose(&app, exec_id).await;
+    assert_ne!(
+        kind(&body),
+        "activity_rate_limit_bucket_missing",
+        "an off-build peer's missing-bucket state must not be escalated to a false \
+         permanent stall: {body}"
+    );
+    assert_ne!(body["health"], "stalled", "body: {body}");
+    assert_eq!(kind(&body), "healthy_in_progress", "body: {body}");
+}
+
+/// AC3: a single-build fleet -- every live worker (including this replica's
+/// own co-located one) shares one real build id -- behaves exactly as before
+/// this fix. A breaker-tracked activity's bucket is still bypassed even
+/// though a build id IS configured, because build agreement, not build
+/// absence, is what the fix actually keys on.
+#[tokio::test]
+async fn ac3_single_build_fleet_still_bypasses_the_bucket_for_a_tracked_activity() {
+    let (url, _guard) = setup_database().await;
+    let pool = build_pool(&url);
+    let app = build_api_app(build_api_state(&pool));
+
+    let exec_id = seed_execution(
+        &pool,
+        "activity_wf",
+        "RUNNING",
+        vec![started_event(), scheduled_activity_event()],
+    )
+    .await;
+    seed_drained_rate_limit_bucket(&pool, "tenant:acme").await;
+    seed_keyed_activity_task(
+        &pool,
+        exec_id,
+        "charge_card",
+        "payments",
+        Some("tenant:acme"),
+        None,
+        None,
+    )
+    .await;
+    seed_live_worker_with(&pool, LOCAL_WORKER_ID, "payments", "build-x", json!({})).await;
+    seed_live_worker_with(&pool, "w-peer-same-build", "payments", "build-x", json!({})).await;
+
+    let body = diagnose(&app, exec_id).await;
+    assert_ne!(
+        kind(&body),
+        "activity_rate_limited",
+        "same-build fleet: the breaker still gates this activity at dispatch, exactly \
+         as before the fix: {body}"
+    );
+    assert_eq!(kind(&body), "healthy_in_progress", "body: {body}");
+}
+
+/// AC3, the other half: a single-build fleet still reports a genuine
+/// rate-limit block for an UNTRACKED activity -- the pre-existing
+/// `ac2_saturated_rate_limit_bucket_reports_activity_rate_limited` and
+/// `ac2_missing_rate_limit_bucket_is_a_stall_not_a_refilling_saturation`
+/// tests already regression-pin the no-build-ids-at-all shape (every worker
+/// advertises `""`); this pins the shape where a build id IS configured and
+/// simply agrees everywhere.
+#[tokio::test]
+async fn ac3_single_build_fleet_still_reports_rate_limit_for_an_untracked_activity() {
+    let (url, _guard) = setup_database().await;
+    let pool = build_pool(&url);
+    let app = build_api_app(build_api_state(&pool));
+
+    let exec_id = seed_execution(
+        &pool,
+        "activity_wf",
+        "RUNNING",
+        vec![started_event(), scheduled_activity_event()],
+    )
+    .await;
+    seed_drained_rate_limit_bucket(&pool, "tenant:acme").await;
+    seed_keyed_activity_task(
+        &pool,
+        exec_id,
+        "send_email",
+        "email",
+        Some("tenant:acme"),
+        None,
+        None,
+    )
+    .await;
+    seed_live_worker_with(&pool, LOCAL_WORKER_ID, "email", "build-x", json!({})).await;
+    seed_live_worker_with(&pool, "w-peer-same-build", "email", "build-x", json!({})).await;
+
+    let body = diagnose(&app, exec_id).await;
+    assert_eq!(kind(&body), "activity_rate_limited", "body: {body}");
+    assert_eq!(body["health"], "healthy", "body: {body}");
+}

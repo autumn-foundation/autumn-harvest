@@ -13504,6 +13504,64 @@ fn local_circuit_snapshot_is_authoritative(
     }
 }
 
+/// Is `local_build_id` shared by every worker in `eligible_ids`?
+///
+/// The circuit-tracked-activity set, like the capability-registry fallback it
+/// reuses [`registry_fallback_binds`] from, is a compile-time
+/// `#[activity(circuit_breaker = ...)]` declaration -- identical across every
+/// worker on the SAME build, but possibly different on another. So a fact
+/// this process's registry holds about an activity (tracked or not) describes
+/// every eligible worker only when none of them could be running a different
+/// build.
+///
+/// Vacuously `false` for an empty `eligible_ids`: `activity_no_worker`
+/// outranks the rate-limit verdicts anyway (issue #809), and an empty set
+/// asserting authority would be a claim this function has no evidence for.
+fn every_eligible_worker_is_on_the_local_build(
+    eligible_ids: &[&str],
+    workers: &[WorkerRow],
+    local_build_id: &str,
+) -> bool {
+    !eligible_ids.is_empty()
+        && eligible_ids.iter().all(|id| {
+            workers
+                .iter()
+                .find(|w| w.worker.worker_id == *id)
+                .is_some_and(|w| registry_fallback_binds(&w.worker.build_id, local_build_id))
+        })
+}
+
+/// May `claim_task`'s rate-limit bucket be consulted as THE answer for this
+/// task (issue #1190)?
+///
+/// A circuit-breaker-tracked activity enforces its rate limit at DISPATCH
+/// rather than at claim (issue #369), so `locally_tracked` -- read from THIS
+/// process's own registry -- decides whether the bucket is even a claim-time
+/// impediment. But that registry is in-process, exactly like the breaker
+/// phase itself ([`local_circuit_snapshot_is_authoritative`]): during a
+/// rolling deploy an eligible peer on a DIFFERENT build may declare the
+/// breaker differently, and there is no cross-process registry to settle
+/// which of them is right (`CircuitBreakerRegistry` has no table backing it).
+///
+/// So the local tracked/untracked fact is trustworthy only when every
+/// eligible worker shares this replica's build
+/// ([`every_eligible_worker_is_on_the_local_build`]). When it does not, the
+/// direction-of-safety rule this endpoint already applies elsewhere -- an
+/// unknown worker is assumed capable, never assumed blocked -- makes the
+/// answer `false`: NEITHER `activity_rate_limited` NOR
+/// `activity_rate_limit_bucket_missing` is reported for it, the same
+/// conservative bias that keeps a genuinely fleet-wide breaker outage from
+/// reporting `activity_circuit_open` off one replica's snapshot.
+fn rate_limit_gate_applies(
+    locally_tracked: bool,
+    eligible_ids: &[&str],
+    workers: &[WorkerRow],
+    local_build_id: &str,
+) -> bool {
+    !locally_tracked
+        && every_eligible_worker_is_on_the_local_build(eligible_ids, workers, local_build_id)
+}
+
 /// Decode the one activity error this response actually surfaces (issue #608).
 ///
 /// `PendingActivityFacts::last_error` is carried RAW on purpose. The classifier
@@ -13786,16 +13844,16 @@ pub(crate) async fn build_diagnosis_report(
         .unwrap_or_default();
 
     // Rate-limit saturation. A circuit-breaker-tracked activity enforces its
-    // rate limit at DISPATCH rather than at claim (issue #369), so its bucket is
-    // never a claim-time impediment and is deliberately not consulted — the
-    // breaker verdict is the accurate one. Matches the eligibility explainer.
+    // rate limit at DISPATCH rather than at claim (issue #369), so its bucket
+    // is a claim-time impediment only when every worker eligible to claim the
+    // row shares OUR compile-time tracked/untracked fact about the breaker --
+    // see `rate_limit_gate_applies` (issue #1190). Whether that holds is a
+    // PER-TASK question (it depends on that task's own eligible workers, only
+    // known once eligibility is resolved below), so it is deliberately NOT
+    // filtered out of the key set here -- every pending task's key is looked
+    // up, and the per-task gate decides which lookups actually surface.
     let rate_limit_keys: Vec<String> = pending_tasks
         .iter()
-        .filter(|t| {
-            !t.activity_name
-                .as_ref()
-                .is_some_and(|name| cb_tracked.contains(name))
-        })
         .filter_map(|t| t.rate_limit_key.clone())
         // Deduped so a wide fan-out sharing one key binds a 1-element array
         // rather than one entry per task row.
@@ -13950,6 +14008,13 @@ pub(crate) async fn build_diagnosis_report(
                 Some("half_open") => (Some(BlockingCircuitPhase::HalfOpen), None),
                 _ => (None, None),
             };
+            // Whether the local tracked/untracked fact about this activity's
+            // breaker is trustworthy for THIS row's own eligible workers (see
+            // `rate_limit_gate_applies`, issue #1190) -- computed per task
+            // because eligibility (and therefore build agreement) is itself
+            // per task.
+            let gate_applies =
+                rate_limit_gate_applies(has_cb, &eligible_ids, &live_workers, &local_build_id);
             let concurrency_saturated = match (t.concurrency_key.as_ref(), t.concurrency_cap) {
                 (Some(key), Some(cap)) => {
                     running_by_key
@@ -13989,13 +14054,13 @@ pub(crate) async fn build_diagnosis_report(
                 ),
                 circuit_phase,
                 circuit_cooldown_until,
-                rate_limit_saturated: !has_cb
+                rate_limit_saturated: gate_applies
                     && t.rate_limit_key
                         .as_ref()
                         .is_some_and(|k| rate_limit_gate.saturated.contains(k)),
                 // A key with NO bucket row is refused by the gate's `EXISTS`
                 // forever, so it is a stall rather than a refilling deferral.
-                rate_limit_bucket_missing: !has_cb
+                rate_limit_bucket_missing: gate_applies
                     && t.rate_limit_key
                         .as_ref()
                         .is_some_and(|k| rate_limit_gate.missing.contains(k)),
@@ -55514,5 +55579,139 @@ mod tests {
             .is_empty(),
             "a snapshotted requirement is row-side and gates every build"
         );
+    }
+
+    // ── issue #1190: build-scope the rate-limit bypass ──────────────────────
+
+    #[test]
+    fn every_eligible_worker_is_on_the_local_build_requires_unanimous_agreement() {
+        let workers = vec![
+            eligibility_worker("w-local", &["payments"], "build-new", serde_json::json!({})),
+            eligibility_worker("w-peer", &["payments"], "build-new", serde_json::json!({})),
+            eligibility_worker("w-old", &["payments"], "build-old", serde_json::json!({})),
+        ];
+
+        // Every eligible worker shares the local build.
+        assert!(every_eligible_worker_is_on_the_local_build(
+            &["w-local", "w-peer"],
+            &workers,
+            "build-new",
+        ));
+
+        // One eligible worker is on a different build -- unanimity breaks, so
+        // the local fact cannot be trusted for the whole set.
+        assert!(!every_eligible_worker_is_on_the_local_build(
+            &["w-local", "w-old"],
+            &workers,
+            "build-new",
+        ));
+
+        // The default, no-build-routing deployment: every worker (and this
+        // process) advertises no build identity, so it behaves exactly like a
+        // single-build fleet -- the AC3 regression pin.
+        let no_build_routing = vec![
+            eligibility_worker("w-a", &["payments"], "", serde_json::json!({})),
+            eligibility_worker("w-b", &["payments"], "", serde_json::json!({})),
+        ];
+        assert!(every_eligible_worker_is_on_the_local_build(
+            &["w-a", "w-b"],
+            &no_build_routing,
+            "",
+        ));
+
+        // Vacuously false for no eligible workers: `activity_no_worker`
+        // outranks the rate-limit verdicts anyway, and there is no evidence
+        // to assert authority over an empty set.
+        assert!(!every_eligible_worker_is_on_the_local_build(
+            &[],
+            &workers,
+            "build-new",
+        ));
+    }
+
+    /// AC1: a task whose activity is breaker-tracked locally but whose only
+    /// eligible worker is on a different build must not have that local fact
+    /// applied to it -- the local tracked/untracked fact is unreliable
+    /// off-build, so the gate does not apply (and, per the endpoint's
+    /// direction-of-safety rule, is not reported as a rate-limit block
+    /// either).
+    #[test]
+    fn rate_limit_gate_does_not_apply_when_tracked_locally_but_eligible_peer_differs_build() {
+        let workers = vec![eligibility_worker(
+            "w-peer",
+            &["payments"],
+            "build-old",
+            serde_json::json!({}),
+        )];
+        assert!(!rate_limit_gate_applies(
+            /* locally_tracked */ true,
+            &["w-peer"],
+            &workers,
+            "build-new",
+        ));
+    }
+
+    /// AC2: a task whose activity is NOT breaker-tracked locally but whose
+    /// only eligible worker is on a different build must not have the bucket
+    /// consulted as the verdict either -- that peer's build may track the
+    /// breaker, in which case its real gate is dispatch-time, not this
+    /// bucket, and reporting `activity_rate_limited` /
+    /// `activity_rate_limit_bucket_missing` for it would be a false positive
+    /// on a `stalled` verdict, the worse direction.
+    #[test]
+    fn rate_limit_gate_does_not_apply_when_untracked_locally_but_eligible_peer_differs_build() {
+        let workers = vec![eligibility_worker(
+            "w-peer",
+            &["payments"],
+            "build-old",
+            serde_json::json!({}),
+        )];
+        assert!(!rate_limit_gate_applies(
+            /* locally_tracked */ false,
+            &["w-peer"],
+            &workers,
+            "build-new",
+        ));
+    }
+
+    /// AC3: a single-build fleet (and any deployment with no build ids, where
+    /// every worker including this process advertises `""`) behaves exactly
+    /// as it did before this fix -- the gate applies iff the activity is not
+    /// locally tracked.
+    #[test]
+    fn rate_limit_gate_applies_exactly_as_before_on_a_single_build_fleet() {
+        let workers = vec![
+            eligibility_worker("w-local", &["payments"], "build-x", serde_json::json!({})),
+            eligibility_worker("w-peer", &["payments"], "build-x", serde_json::json!({})),
+        ];
+
+        assert!(
+            rate_limit_gate_applies(false, &["w-local", "w-peer"], &workers, "build-x"),
+            "untracked locally, same build everywhere: the bucket is the accurate impediment"
+        );
+        assert!(
+            !rate_limit_gate_applies(true, &["w-local", "w-peer"], &workers, "build-x"),
+            "tracked locally, same build everywhere: the breaker gates it at dispatch"
+        );
+
+        // No build routing configured at all (every advertised build is "").
+        let no_build_routing = vec![eligibility_worker(
+            "w-peer",
+            &["payments"],
+            "",
+            serde_json::json!({}),
+        )];
+        assert!(rate_limit_gate_applies(
+            false,
+            &["w-peer"],
+            &no_build_routing,
+            "",
+        ));
+        assert!(!rate_limit_gate_applies(
+            true,
+            &["w-peer"],
+            &no_build_routing,
+            "",
+        ));
     }
 }
