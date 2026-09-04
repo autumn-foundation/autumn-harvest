@@ -32,30 +32,43 @@ findings report; PR #1336 (same day, separate authorization) shipped the
 parallelization anyway; that PR's own description says shard-correctness was
 "verified locally," not from a real run. It now has one:
 
-| run | event | `Test (ubuntu-latest)` | `Test (windows-latest)` | leg gating time-to-green |
+| run | event | `Test (ubuntu-latest)` job span | `Test (windows-latest)` job span | **workflow wall time** (`created_at`→`updated_at`, the actual PR-wait number: queue + `changes` + `lint` + the slowest parallel `test`/`test-db-linux` leg) |
 |---|---|---:|---:|---:|
-| `33712626699` (2026-09-03, pre-fix) | push, trunk-dev | 155.3 min | 103.8 min | **155.3 min** (ubuntu) |
-| `33787332718` (PR #1337, stale branch — pre-fix workflow) | pull_request | 156.8 min | 101.0 min | 156.8 min (ubuntu) |
-| `33783544293` (PR #1334, stale branch — pre-fix workflow) | pull_request | 156.7 min | 107.9 min | 156.7 min (ubuntu) |
-| `33785335533` (PR #1336 itself, post-fix workflow) | pull_request | **65.8 min** | 110.9 min | **110.9 min** (windows, new bottleneck) |
+| `33712626699` (2026-09-03, pre-fix) | push, trunk-dev | 155.3 min | 103.8 min | **177.0 min** |
+| `33787332718` (PR #1337, stale branch — pre-fix workflow) | pull_request | 156.8 min | 101.0 min | 173.7 min |
+| `33783544293` (PR #1334, stale branch — pre-fix workflow) | pull_request | 156.7 min | 107.9 min | 172.5 min |
+| `33785335533` (PR #1336 itself, post-fix workflow) | pull_request | **65.8 min** | 110.9 min | **123.8 min** |
 
-The fix works as diagnosed: `Test (ubuntu-latest)` drops from ~155–157 min to
-65.8 min — a 57.7% cut on that leg, matching the 54–58% the removed step was
-measured to own. The `test-db-linux` shards themselves (10/10, PR #1336 and
-again on PR #1354 below) complete in 16–35 min each, well under the old
+(An earlier version of this table reported only the `Test` job's own elapsed
+time as "time to green" — a Codex review on this PR correctly flagged that
+as wrong, since both `test` and `test-db-linux` wait on `lint`+`changes`
+first, and runner queuing adds more on top; a per-job span isn't the number
+a PR author actually waits on. The **workflow wall time** column above is
+pulled from each run's own `created_at`/`updated_at` via the GitHub API,
+i.e. queue time + `changes` + `lint` + whichever `test`/`test-db-linux` leg
+finishes last — the real end-to-end figure.)
+
+The fix works as diagnosed: `Test (ubuntu-latest)`'s own span drops from
+~155–157 min to 65.8 min — a 57.7% cut, matching the 54–58% the removed step
+was measured to own. The `test-db-linux` shards themselves (10/10, PR #1336
+and again on PR #1354 below) complete in 16–35 min each, well under the old
 serial step's 77–84 min. Net effect on the number that actually matters —
-wall time to a green PR — is **155→111 min, a 28.5% reduction**, clearing
-this role's ≥15% impact floor with a real measured before/after on the same
-critical path. This is one post-fix sample; the mechanism (removing a step
-that owned 54–58% of one leg) predicts the direction and rough magnitude
-reliably, but a second sample would firm up the exact number.
+true end-to-end workflow wall time — is **~174 min → 123.8 min, a ~29%
+reduction** (174.4 min is the 3-sample pre-fix average; the single pre-fix
+push sample alone gives 177.0→123.8, 30.1%), clearing this role's ≥15%
+impact floor with a real measured before/after on the same critical path.
+This is one post-fix sample; the mechanism (removing a step that owned
+54–58% of one leg) predicts the direction and rough magnitude reliably, but
+a second sample would firm up the exact number.
 
 ### New bottleneck: `windows-latest`, unaffected by the fix, now the long pole
 
 Windows was already the second-slowest leg (101–108 min across the three
 pre-fix samples above) and the fix didn't touch it — the sharded step is
-Linux-Docker-only. It's now the leg every PR actually waits on (110.9 min on
-PR #1336's own run). Step-level breakdown of that run's `Test
+Linux-Docker-only. It's now the single longest of the parallel `test`/
+`test-db-linux` legs (110.9 min job span on PR #1336's own run, the leg that
+sets the floor under the 123.8 min end-to-end figure above once `lint`'s own
+~13 min is added back in). Step-level breakdown of that run's `Test
 (windows-latest)` job (steps summing to 6649s against a 6653s job total, so
 this accounts for effectively the whole leg):
 
@@ -117,7 +130,7 @@ checks is something to ask a human for rather than infer or do myself; the
 same applies to confirming the current setting where I lack read access.
 
 **Why this matters, concretely, if it does turn out to still be open:** the
-shard split that just cut 44 minutes off the gating leg would also — as an
+shard split that just cut ~50 minutes off end-to-end PR wall time would also — as an
 unintended side effect of *how* it shipped, not of the split itself — have
 turned 10 real correctness checks into checks that report a verdict nobody's
 merge decision depends on. A red shard would show red in the PR's checks
