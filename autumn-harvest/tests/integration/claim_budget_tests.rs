@@ -2771,7 +2771,45 @@ async fn zz_capture_worker_session_claim_evidence() {
     .execute(&mut proc_conn)
     .await
     .expect("create the per-row worker-session seeding procedure");
-    // `proc_conn` only ever creates the procedure above -- every actual
+    // Companion procedure for a FAIR `no-session` write-cost control (review
+    // finding on PR #1358, round 4): `db::seed()` populates `no-session` via
+    // one bulk `INSERT` of N rows, so comparing its `pg_stat_statements` cost
+    // against `worker-session`'s N separately-committed `INSERT`+`UPDATE`
+    // pairs would measure statement-granularity overhead (index maintenance,
+    // WAL record framing, and round-trip bookkeeping repeated N times) on top
+    // of -- and confounded with -- the actual cost this page is about.
+    // Production sends ordinary (non-session) activities through
+    // `queue::enqueue()` one at a time too (e.g. `persist_scheduled_activities`'s
+    // loop), so the fair control is the SAME per-row-committed lifecycle,
+    // just without the session_id column or the follow-up UPDATE -- isolating
+    // exactly the incremental cost the sticky hard-pin adds, not the cost of
+    // switching seeding strategies.
+    diesel::sql_query(
+        "CREATE OR REPLACE PROCEDURE harvest_bench_seed_plain_rows( \
+             p_prefix text, p_queues int, p_activity text, p_count int \
+         ) \
+         LANGUAGE plpgsql AS $proc$ \
+         DECLARE \
+             i int; \
+         BEGIN \
+             FOR i IN 0..p_count - 1 LOOP \
+                 INSERT INTO harvest_task_queue \
+                     (queue_name, task_type, activity_name, activity_id, input, \
+                      state, priority, max_attempts, scheduled_at) \
+                 VALUES ( \
+                     p_prefix || '-q-' || (i % p_queues), 'activity', p_activity, \
+                     gen_random_uuid(), '{}'::jsonb, 'PENDING', 0, 3, \
+                     NOW() - INTERVAL '1 second' \
+                 ); \
+                 COMMIT; \
+             END LOOP; \
+         END; \
+         $proc$",
+    )
+    .execute(&mut proc_conn)
+    .await
+    .expect("create the per-row plain (no-session) seeding procedure");
+    // `proc_conn` only ever creates the procedures above -- every actual
     // `CALL` happens on a different, later connection (a fresh one per
     // depth in the sweep loop, `stats_conn` in the stat-snapshot loop), each
     // of which sets `synchronous_commit = off` for itself right before its
@@ -2958,42 +2996,41 @@ async fn zz_capture_worker_session_claim_evidence() {
         let seeded = db::seed(&mut stats_conn, headline).await;
         let queues = db::queue_names(headline);
 
+        // Both labels re-seed `harvest_task_queue` via a per-row-committed
+        // procedure for the write-cost measurement below (review finding on
+        // PR #1358, round 4): `db::seed()`'s initial bulk `INSERT` above is
+        // only used to stand up `harvest_workers`/build-routing/etc
+        // scaffolding here, not as either label's write-cost baseline.
+        // Comparing `no-session`'s bulk `INSERT` against `worker-session`'s
+        // per-row `INSERT`+`UPDATE` pairs would measure statement-granularity
+        // overhead (index maintenance, WAL framing, and bookkeeping repeated
+        // N times) confounded with the actual predicate cost this page is
+        // about. Production sends ordinary (non-session) activities through
+        // `queue::enqueue()` one at a time too, so both labels get the same
+        // per-row-committed lifecycle here, differing only in whether the
+        // row carries `session_id` and gets the sticky follow-up `UPDATE`.
+        diesel::sql_query("TRUNCATE harvest_task_queue")
+            .execute(&mut stats_conn)
+            .await
+            .expect("truncate before the per-row re-seed");
+        diesel::sql_query("SET synchronous_commit = off")
+            .execute(&mut stats_conn)
+            .await
+            .expect("relax synchronous_commit for this seeding session only");
+        // Review finding on PR #1358 (round 3): `pg_stat_statements.track`
+        // defaults to `top`, so the `INSERT`/`UPDATE` statements executed
+        // INSIDE either procedure below -- as opposed to the top-level `CALL`
+        // itself -- would never be recorded individually, silently leaving
+        // the write-cost table with no `calls=10000` seed entries to read.
+        // `all` tracks nested statements too, scoped to this session only.
+        diesel::sql_query("SET pg_stat_statements.track = 'all'")
+            .execute(&mut stats_conn)
+            .await
+            .expect(
+                "enable tracking of statements nested inside the seeding \
+                 procedure for this session",
+            );
         if label == "worker-session" {
-            // Same fix as the backlog-sweep loop above (see the procedure's
-            // doc comment near the top of this test for the full history):
-            // reproduce `queue::enqueue()`'s real per-task write -- one
-            // `INSERT` immediately followed by its own committed `UPDATE` --
-            // via the server-side procedure, rather than a bulk `INSERT`
-            // followed by a bulk `UPDATE` (which packs pages full before any
-            // row is widened, forcing every row's `UPDATE` onto a fresh page
-            // -- not what an interleaved, per-task production write pattern
-            // produces). This capture's pg_stat_statements snapshot below
-            // therefore also picks up the seeding `INSERT`/`UPDATE`
-            // statements as `calls`-many, single-row entries rather than one
-            // bulk statement each -- see the write-side section of the doc
-            // for how that's read.
-            diesel::sql_query("TRUNCATE harvest_task_queue")
-                .execute(&mut stats_conn)
-                .await
-                .expect("truncate before the worker-session re-seed");
-            diesel::sql_query("SET synchronous_commit = off")
-                .execute(&mut stats_conn)
-                .await
-                .expect("relax synchronous_commit for this seeding session only");
-            // Review finding on PR #1358 (round 3): `pg_stat_statements.track`
-            // defaults to `top`, so the `INSERT`/`UPDATE` statements executed
-            // INSIDE the procedure below -- as opposed to the top-level `CALL`
-            // itself -- would never be recorded individually, silently
-            // leaving the write-cost table with no `calls=10000` seed entries
-            // to read. `all` tracks nested statements too, scoped to this
-            // session only.
-            diesel::sql_query("SET pg_stat_statements.track = 'all'")
-                .execute(&mut stats_conn)
-                .await
-                .expect(
-                    "enable tracking of statements nested inside the seeding \
-                     procedure for this session",
-                );
             diesel::sql_query(format!(
                 "CALL harvest_bench_seed_worker_session_rows( \
                      '{}', {}, '{}', {worker_literal}, {} \
@@ -3009,11 +3046,25 @@ async fn zz_capture_worker_session_claim_evidence() {
                 "seed the headline worker-session backlog via the per-row \
                  INSERT-then-UPDATE procedure",
             );
-            diesel::sql_query("ANALYZE harvest_task_queue")
-                .execute(&mut stats_conn)
-                .await
-                .expect("re-analyze before the stat-snapshot drain");
+        } else {
+            diesel::sql_query(format!(
+                "CALL harvest_bench_seed_plain_rows('{}', {}, '{}', {})",
+                db::BENCH_PREFIX,
+                headline.queues,
+                db::BENCH_ACTIVITY,
+                headline.backlog,
+            ))
+            .execute(&mut stats_conn)
+            .await
+            .expect(
+                "seed the headline no-session backlog via the per-row \
+                 INSERT-only procedure",
+            );
         }
+        diesel::sql_query("ANALYZE harvest_task_queue")
+            .execute(&mut stats_conn)
+            .await
+            .expect("re-analyze before the stat-snapshot drain");
 
         // Drive the real claim path repeatedly so pg_stat_statements
         // accumulates real, attributed `calls`/buffer counters for the
