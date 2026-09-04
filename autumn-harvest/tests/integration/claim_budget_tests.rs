@@ -2720,6 +2720,66 @@ async fn zz_capture_worker_session_claim_evidence() {
     let raw = autumn_harvest::queue::claim_task_query();
     let worker_literal = format!("'{}-worker-0'", db::BENCH_PREFIX);
 
+    // Server-side per-row seeding procedure for the `worker-session` label
+    // (review finding on PR #1358, round 2): a bulk `INSERT` of N rows
+    // followed by one bulk `UPDATE` covering all of them is NOT the physical
+    // heap layout `queue::enqueue()` produces in production. Postgres's
+    // default heap fillfactor is 100 -- a bulk INSERT packs pages full before
+    // any row is widened, so the following bulk UPDATE finds no room on the
+    // same page for the new (wider) tuple version and is forced onto a fresh
+    // page for every single row, roughly doubling the table's physical size.
+    // Production instead calls `queue::enqueue()` once per task: that INSERT
+    // is immediately followed by its OWN UPDATE (before the next task's
+    // INSERT claims more page space), so the new tuple version far more
+    // often fits in the same, still-mostly-empty page as the row it
+    // supersedes. This procedure reproduces that interleaved,
+    // per-row-committed shape server-side (one `CALL` per depth, not N
+    // network round trips) -- each iteration inserts one row, updates it by
+    // id, and COMMITs before the next iteration begins, exactly like N
+    // sequential `queue::enqueue()` calls would.
+    let mut proc_conn = db::connect(&bench.url).await;
+    diesel::sql_query(
+        "CREATE OR REPLACE PROCEDURE harvest_bench_seed_worker_session_rows( \
+             p_prefix text, p_queues int, p_activity text, \
+             p_sticky_worker text, p_count int \
+         ) \
+         LANGUAGE plpgsql AS $proc$ \
+         DECLARE \
+             i int; \
+             v_id uuid; \
+         BEGIN \
+             FOR i IN 0..p_count - 1 LOOP \
+                 INSERT INTO harvest_task_queue \
+                     (queue_name, task_type, activity_name, activity_id, input, \
+                      state, priority, max_attempts, scheduled_at, session_id) \
+                 VALUES ( \
+                     p_prefix || '-q-' || (i % p_queues), 'activity', p_activity, \
+                     gen_random_uuid(), '{}'::jsonb, 'PENDING', 0, 3, \
+                     NOW() - INTERVAL '1 second', gen_random_uuid() \
+                 ) \
+                 RETURNING id INTO v_id; \
+                 UPDATE harvest_task_queue \
+                    SET sticky_worker_id = p_sticky_worker, \
+                        sticky_until = NOW() + INTERVAL '24 hours', \
+                        sticky_timeout = INTERVAL '24 hours' \
+                  WHERE id = v_id; \
+                 COMMIT; \
+             END LOOP; \
+         END; \
+         $proc$",
+    )
+    .execute(&mut proc_conn)
+    .await
+    .expect("create the per-row worker-session seeding procedure");
+    // Durability is irrelevant to a throwaway benchmark database and this
+    // scopes to one session only -- trades fsync-per-commit latency for
+    // seeding speed across up to 100,000 individual commits. Never a
+    // production recommendation; see the doc comment above.
+    diesel::sql_query("SET synchronous_commit = off")
+        .execute(&mut proc_conn)
+        .await
+        .expect("relax synchronous_commit for the seeding session only");
+
     // One EXPLAIN capture per published backlog depth, at both labels, from a
     // freshly re-seeded backlog each time (see the capability-labels capture's
     // rationale for re-seeding with the column populated FROM BIRTH rather than
@@ -2764,64 +2824,47 @@ async fn zz_capture_worker_session_claim_evidence() {
 
         for label in ["no-session", "worker-session"] {
             if label == "worker-session" {
-                // Re-seed to match `queue::enqueue()`'s REAL two-step write
-                // lifecycle for a worker-session activity (review finding on
-                // PR #1358 caught the first cut of this capture writing all
-                // three sticky columns directly in the seed `INSERT`, which
-                // is not how production writes them -- see the harness note
-                // in docs/performance-worker-sessions.md for the full
-                // correction). `NewTaskQueueItem` hardcodes
-                // `sticky_worker_id`/`sticky_until`/`sticky_timeout` to `NULL`
-                // regardless of `EnqueueParams` (`queue.rs`'s `enqueue()`);
-                // only `session_id` is written at `INSERT` time. The three
-                // sticky columns are set by a SEPARATE `UPDATE` immediately
-                // after, run only when `sticky_worker_id`/`sticky_timeout` are
-                // both set on `EnqueueParams` -- exactly what
-                // `worker.rs`'s session-member dispatch does (`params.session_id
-                // = Some(..); params.sticky_worker_id = Some(host_worker_id);
-                // params.sticky_timeout = Some(SESSION_MEMBER_STICKY_TIMEOUT)`,
-                // 24 hours). Reproduced here as one `INSERT` (session_id only)
-                // followed by one bulk `UPDATE` covering every seeded row --
-                // matching the final column CONTENTS and the two-statement
-                // WRITE SHAPE production uses, though not exactly its
-                // PER-ROW-transaction commit pattern (see the write-side
-                // section of the doc for why the resulting figure is reported
-                // as an upper bound, not an exact production number).
+                // Re-seed to match `queue::enqueue()`'s REAL per-task write
+                // lifecycle for a worker-session activity: one `INSERT`
+                // (session_id only -- `NewTaskQueueItem` hardcodes the three
+                // sticky columns to `NULL` regardless of `EnqueueParams`)
+                // immediately followed by its OWN `UPDATE` setting
+                // `sticky_worker_id`/`sticky_until`/`sticky_timeout`, each
+                // pair its own committed transaction -- exactly what
+                // `worker.rs`'s session-member dispatch produces, and what a
+                // fleet enqueueing N session tasks over time actually writes.
+                // A round-1 review finding (PR #1358) caught this capture
+                // writing all four columns in one seed `INSERT`; a round-2
+                // finding then caught the round-1 fix's own replacement --
+                // one bulk `INSERT` of N rows followed by one bulk `UPDATE`
+                // covering all of them -- as ALSO unrepresentative: Postgres's
+                // default fillfactor (100) packs the bulk `INSERT`'s pages
+                // full, so the bulk `UPDATE` that follows finds no room on
+                // the same page for any row's new tuple version and is
+                // forced onto a fresh page for every single row, which does
+                // not happen when each task's `INSERT` is immediately
+                // followed by its own `UPDATE` while that task's page is
+                // still mostly empty. See the procedure defined above this
+                // loop and docs/performance-worker-sessions.md's harness
+                // notes for the full history.
                 diesel::sql_query("TRUNCATE harvest_task_queue")
                     .execute(&mut conn)
                     .await
                     .expect("truncate before the worker-session re-seed");
                 diesel::sql_query(format!(
-                    "INSERT INTO harvest_task_queue \
-                       (queue_name, task_type, activity_name, activity_id, input, \
-                        state, priority, max_attempts, scheduled_at, \
-                        required_build_id, concurrency_key, concurrency_cap, \
-                        rate_limit_key, session_id) \
-                     SELECT '{}-q-' || (i % {}), 'activity', '{}', \
-                            gen_random_uuid(), '{{}}'::jsonb, 'PENDING', 0, 3, \
-                            NOW() - INTERVAL '1 second', NULL, NULL, NULL, NULL, \
-                            gen_random_uuid() \
-                     FROM generate_series(0, {}) AS s(i)",
+                    "CALL harvest_bench_seed_worker_session_rows( \
+                         '{}', {}, '{}', {worker_literal}, {} \
+                     )",
                     db::BENCH_PREFIX,
                     scenario.queues,
                     db::BENCH_ACTIVITY,
-                    backlog - 1,
-                ))
-                .execute(&mut conn)
-                .await
-                .expect("re-seed rows carrying session_id from birth");
-                diesel::sql_query(format!(
-                    "UPDATE harvest_task_queue \
-                     SET sticky_worker_id = {worker_literal}, \
-                         sticky_until = NOW() + INTERVAL '24 hours', \
-                         sticky_timeout = INTERVAL '24 hours' \
-                     WHERE session_id IS NOT NULL"
+                    backlog,
                 ))
                 .execute(&mut conn)
                 .await
                 .expect(
-                    "hard-pin the freshly-inserted rows via the same follow-up \
-                     UPDATE queue::enqueue() issues in production",
+                    "seed the worker-session backlog via the per-row \
+                     INSERT-then-UPDATE procedure",
                 );
                 diesel::sql_query("ANALYZE harvest_task_queue")
                     .execute(&mut conn)
@@ -2908,46 +2951,41 @@ async fn zz_capture_worker_session_claim_evidence() {
         let queues = db::queue_names(headline);
 
         if label == "worker-session" {
-            // Same fix as the backlog-sweep loop above: reproduce
-            // `queue::enqueue()`'s real two-step write (an `INSERT` carrying
-            // only `session_id`, then a separate `UPDATE` setting
-            // `sticky_worker_id`/`sticky_until`/`sticky_timeout`) rather than
-            // writing all three sticky columns directly in the seed `INSERT`.
+            // Same fix as the backlog-sweep loop above (see the procedure's
+            // doc comment near the top of this test for the full history):
+            // reproduce `queue::enqueue()`'s real per-task write -- one
+            // `INSERT` immediately followed by its own committed `UPDATE` --
+            // via the server-side procedure, rather than a bulk `INSERT`
+            // followed by a bulk `UPDATE` (which packs pages full before any
+            // row is widened, forcing every row's `UPDATE` onto a fresh page
+            // -- not what an interleaved, per-task production write pattern
+            // produces). This capture's pg_stat_statements snapshot below
+            // therefore also picks up the seeding `INSERT`/`UPDATE`
+            // statements as `calls`-many, single-row entries rather than one
+            // bulk statement each -- see the write-side section of the doc
+            // for how that's read.
             diesel::sql_query("TRUNCATE harvest_task_queue")
                 .execute(&mut stats_conn)
                 .await
                 .expect("truncate before the worker-session re-seed");
+            diesel::sql_query("SET synchronous_commit = off")
+                .execute(&mut stats_conn)
+                .await
+                .expect("relax synchronous_commit for this seeding session only");
             diesel::sql_query(format!(
-                "INSERT INTO harvest_task_queue \
-                   (queue_name, task_type, activity_name, activity_id, input, \
-                    state, priority, max_attempts, scheduled_at, \
-                    required_build_id, concurrency_key, concurrency_cap, \
-                    rate_limit_key, session_id) \
-                 SELECT '{}-q-' || (i % {}), 'activity', '{}', \
-                        gen_random_uuid(), '{{}}'::jsonb, 'PENDING', 0, 3, \
-                        NOW() - INTERVAL '1 second', NULL, NULL, NULL, NULL, \
-                        gen_random_uuid() \
-                 FROM generate_series(0, {}) AS s(i)",
+                "CALL harvest_bench_seed_worker_session_rows( \
+                     '{}', {}, '{}', {worker_literal}, {} \
+                 )",
                 db::BENCH_PREFIX,
                 headline.queues,
                 db::BENCH_ACTIVITY,
-                headline.backlog - 1,
-            ))
-            .execute(&mut stats_conn)
-            .await
-            .expect("re-seed headline backlog carrying session_id from birth");
-            diesel::sql_query(format!(
-                "UPDATE harvest_task_queue \
-                 SET sticky_worker_id = {worker_literal}, \
-                     sticky_until = NOW() + INTERVAL '24 hours', \
-                     sticky_timeout = INTERVAL '24 hours' \
-                 WHERE session_id IS NOT NULL"
+                headline.backlog,
             ))
             .execute(&mut stats_conn)
             .await
             .expect(
-                "hard-pin the freshly-inserted headline backlog via the same \
-                 follow-up UPDATE queue::enqueue() issues in production",
+                "seed the headline worker-session backlog via the per-row \
+                 INSERT-then-UPDATE procedure",
             );
             diesel::sql_query("ANALYZE harvest_task_queue")
                 .execute(&mut stats_conn)
