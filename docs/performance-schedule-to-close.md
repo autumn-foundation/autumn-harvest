@@ -1,4 +1,4 @@
-# `schedule_to_close_at` claim predicate: measured, confirmed cheap; the cost is index maintenance and row width, not predicate evaluation
+# `schedule_to_close_at` claim predicate: measured, confirmed cheap; the measured buffer/storage cost is index maintenance and row width
 
 `docs/performance.md`'s "Known limitations" section flagged
 `schedule_to_close_at` (issue #378), alongside worker sessions (#606) and
@@ -30,6 +30,24 @@ the corrected evidence. The measured buffer delta is the **sum of two
 genuinely different mechanisms**: a small, near-constant, per-claim
 index-maintenance cost, plus a row-width effect on the candidate scan that
 scales with backlog depth -- not row width alone.
+
+**This page measures buffer accesses and storage growth, not CPU time --
+and its findings are scoped accordingly.** Every table on this page is
+buffer-based (`EXPLAIN ... BUFFERS`, `pg_stat_statements`'s block
+counters) or storage-based (`pg_relation_size`). Evaluating
+`schedule_to_close_at > NOW()` for every candidate row the scan visits
+consumes CPU without necessarily touching an additional buffer, so nothing
+here rules out a CPU-bound cost from the predicate's own evaluation, and
+this page does not claim to have measured one. Per this repo's evidence
+rules, wall-clock/execution time is admissible only when it clears 2x and
+is corroborated by a buffer or row-count change in the same direction --
+this pass did not collect `total_exec_time` or any other CPU-time metric,
+so there is no such corroboration to report either way. A single
+`timestamptz` comparison is among the cheapest operations a CPU can do,
+which is why the row-level buffer evidence below is treated as the
+practically decisive measurement -- but "index maintenance and row width"
+describes the *measured buffer/storage* cost specifically, not a claim that
+predicate evaluation costs exactly zero.
 
 **One thing this page found alongside is not fully resolved and is reported
 as such:** the real-drain `pg_stat_statements` aggregate and the
