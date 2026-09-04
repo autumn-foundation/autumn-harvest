@@ -3451,6 +3451,15 @@ mod tests {
                 cooldown_until: None,
                 phase: BlockingCircuitPhase::Open,
             },
+            // Issue #1193: the organic-open (`cooldown_until: Some(_)`) shape
+            // has its own summary branch, distinct from the forced-open one
+            // above -- exercise it here too rather than relying on the
+            // dedicated summary-text test to be the only non-emptiness proof.
+            BlockedOn::ActivityCircuitOpen {
+                activity_name: "a".into(),
+                cooldown_until: Some(t(30)),
+                phase: BlockingCircuitPhase::Open,
+            },
             BlockedOn::ActivityRateLimited {
                 key: "k".into(),
                 activity_name: None,
