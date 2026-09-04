@@ -848,7 +848,17 @@ a new supporting partial index (e.g. on
 NULL`) to make each per-candidate-row lookup an indexed probe instead of a
 CTE linear scan. Adding an index is outside what this PR changes
 unilaterally; see the review discussion on this PR for the concrete proposal
-and open question. Until that lands, deployments with concurrency-key
+and open question.
+
+**That proposal was measured and killed:**
+`docs/assays/0003-concurrency-gate-cardinality-index.md` (ledger #3) found
+the partial-index rewrite fixes this exact 5,000-key blowup (48.6x faster
+than control) without regressing the 256-key case, but loses the idle-case
+`ORDER BY … LIMIT` pushdown through `idx_harvest_tq_poll` unconditionally —
+403x over its pre-set idle-cost line, at any key cardinality, including zero
+`RUNNING` rows. Re-assaying this exact formulation without new information
+is a re-dig; see that report for what else remains untested. Until a fix
+clears all three of that assay's lines, deployments with concurrency-key
 cardinality in the low hundreds (the tested, committed range) get the full
 measured win above; deployments with concurrency keys numbering in the
 thousands or more should expect the candidate-side gate's cost to grow with

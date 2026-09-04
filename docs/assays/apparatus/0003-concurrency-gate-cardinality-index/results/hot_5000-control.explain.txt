@@ -1,0 +1,69 @@
+                                                                                                                                                                QUERY PLAN                                                                                                                                                                 
+-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+ Limit  (cost=43394.25..43394.26 rows=1 width=52) (actual rows=1 loops=1)
+   Output: harvest_task_queue.id, harvest_task_queue.task_type, harvest_task_queue.concurrency_key, harvest_task_queue.concurrency_cap, harvest_task_queue.priority, harvest_task_queue.scheduled_at, harvest_task_queue.ctid
+   Buffers: shared hit=882
+   CTE concurrency_pending_keys
+     ->  HashAggregate  (cost=482.00..531.32 rows=4932 width=22) (actual rows=5000 loops=1)
+           Output: harvest_task_queue_1.concurrency_key, harvest_task_queue_1.task_type
+           Group Key: harvest_task_queue_1.concurrency_key, harvest_task_queue_1.task_type
+           Batches: 1  Memory Usage: 721kB
+           Buffers: shared hit=162
+           ->  Seq Scan on public.harvest_task_queue harvest_task_queue_1  (cost=0.00..432.00 rows=10000 width=22) (actual rows=10000 loops=1)
+                 Output: harvest_task_queue_1.id, harvest_task_queue_1.queue_name, harvest_task_queue_1.task_type, harvest_task_queue_1.state, harvest_task_queue_1.priority, harvest_task_queue_1.scheduled_at, harvest_task_queue_1.concurrency_key, harvest_task_queue_1.concurrency_cap, harvest_task_queue_1.worker_id
+                 Filter: ((harvest_task_queue_1.concurrency_key IS NOT NULL) AND (harvest_task_queue_1.concurrency_cap IS NOT NULL) AND (harvest_task_queue_1.state = 'PENDING'::text) AND (harvest_task_queue_1.queue_name = ANY ('{bench-q-0,bench-q-1,bench-q-2,bench-q-3}'::text[])) AND (harvest_task_queue_1.scheduled_at <= now()))
+                 Rows Removed by Filter: 2000
+                 Buffers: shared hit=162
+   CTE concurrency_running_counts
+     ->  HashAggregate  (cost=431.44..433.10 rows=166 width=30) (actual rows=2000 loops=1)
+           Output: t.concurrency_key, t.task_type, count(*)
+           Group Key: t.concurrency_key, t.task_type
+           Batches: 1  Memory Usage: 385kB
+           Buffers: shared hit=324
+           ->  Hash Join  (cost=115.47..430.19 rows=166 width=22) (actual rows=2000 loops=1)
+                 Output: t.concurrency_key, t.task_type
+                 Inner Unique: true
+                 Hash Cond: (t.concurrency_key = concurrency_pending_keys.concurrency_key)
+                 Buffers: shared hit=324
+                 ->  Seq Scan on public.harvest_task_queue t  (cost=0.00..312.00 rows=333 width=22) (actual rows=2000 loops=1)
+                       Output: t.id, t.queue_name, t.task_type, t.state, t.priority, t.scheduled_at, t.concurrency_key, t.concurrency_cap, t.worker_id
+                       Filter: ((t.worker_id IS NOT NULL) AND (t.state = 'RUNNING'::text))
+                       Rows Removed by Filter: 10000
+                       Buffers: shared hit=162
+                 ->  Hash  (cost=112.97..112.97 rows=200 width=32) (actual rows=5000 loops=1)
+                       Output: concurrency_pending_keys.concurrency_key
+                       Buckets: 8192 (originally 1024)  Batches: 1 (originally 1)  Memory Usage: 288kB
+                       Buffers: shared hit=162
+                       ->  HashAggregate  (cost=110.97..112.97 rows=200 width=32) (actual rows=5000 loops=1)
+                             Output: concurrency_pending_keys.concurrency_key
+                             Group Key: concurrency_pending_keys.concurrency_key
+                             Batches: 1  Memory Usage: 481kB
+                             Buffers: shared hit=162
+                             ->  CTE Scan on concurrency_pending_keys  (cost=0.00..98.64 rows=4932 width=32) (actual rows=5000 loops=1)
+                                   Output: concurrency_pending_keys.concurrency_key
+                                   Buffers: shared hit=162
+   ->  LockRows  (cost=42429.83..42471.50 rows=3333 width=52) (actual rows=1 loops=1)
+         Output: harvest_task_queue.id, harvest_task_queue.task_type, harvest_task_queue.concurrency_key, harvest_task_queue.concurrency_cap, harvest_task_queue.priority, harvest_task_queue.scheduled_at, harvest_task_queue.ctid
+         Buffers: shared hit=882
+         ->  Sort  (cost=42429.83..42438.17 rows=3333 width=52) (actual rows=1 loops=1)
+               Output: harvest_task_queue.id, harvest_task_queue.task_type, harvest_task_queue.concurrency_key, harvest_task_queue.concurrency_cap, harvest_task_queue.priority, harvest_task_queue.scheduled_at, harvest_task_queue.ctid
+               Sort Key: harvest_task_queue.priority DESC, harvest_task_queue.scheduled_at
+               Sort Method: quicksort  Memory: 1166kB
+               Buffers: shared hit=881
+               ->  Index Scan using idx_harvest_tq_poll on public.harvest_task_queue  (cost=0.29..42413.17 rows=3333 width=52) (actual rows=10000 loops=1)
+                     Output: harvest_task_queue.id, harvest_task_queue.task_type, harvest_task_queue.concurrency_key, harvest_task_queue.concurrency_cap, harvest_task_queue.priority, harvest_task_queue.scheduled_at, harvest_task_queue.ctid
+                     Index Cond: ((harvest_task_queue.queue_name = ANY ('{bench-q-0,bench-q-1,bench-q-2,bench-q-3}'::text[])) AND (harvest_task_queue.state = 'PENDING'::text) AND (harvest_task_queue.scheduled_at <= now()))
+                     Filter: ((harvest_task_queue.concurrency_key IS NULL) OR (harvest_task_queue.concurrency_cap IS NULL) OR (COALESCE((SubPlan 3), '0'::bigint) < harvest_task_queue.concurrency_cap))
+                     Buffers: shared hit=875
+                     SubPlan 3
+                       ->  CTE Scan on concurrency_running_counts rc  (cost=0.00..4.15 rows=1 width=8) (actual rows=0 loops=10000)
+                             Output: rc.running_count
+                             Filter: ((rc.concurrency_key = harvest_task_queue.concurrency_key) AND (rc.task_type = harvest_task_queue.task_type))
+                             Rows Removed by Filter: 2000
+                             Buffers: shared hit=324
+ Planning:
+   Buffers: shared hit=192
+ Planning Time: 0.758 ms
+ Execution Time: 1184.364 ms
+(65 rows)
+
