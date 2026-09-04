@@ -330,6 +330,16 @@ jobs:
         run: |
           cargo bench -p autumn-harvest --features db,testing --bench e2e_bench --no-run
           cargo bench -p autumn-harvest --features testing --bench replay_bench --no-run
+      # Same bit-rot protection for the diagnose-latency benchmark (issue
+      # #1194, following up on issue #809's unverified `p95 < 500 ms` claim).
+      # `cargo bench` itself is not run per-PR for the same reason as #786:
+      # the measurement is minutes-long against a real Postgres, and the gate
+      # here is that the bench still compiles, not that it runs. No
+      # `--features`: `autumn-harvest-plugin` unconditionally depends on
+      # `autumn-harvest` with `db`/`testing` already enabled.
+      - name: Compile diagnose benchmark (issue #1194)
+        if: runner.os == 'Linux' && needs.changes.outputs.code == 'true'
+        run: cargo bench -p autumn-harvest-plugin --bench diagnose_bench --no-run
       - name: Run all-features lib tests
         if: needs.changes.outputs.code == 'true'
         run: cargo test -p autumn-harvest --all-features --lib

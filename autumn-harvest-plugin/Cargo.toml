@@ -168,6 +168,23 @@ tempfile = "3"
 name = "dag_graph_profile"
 harness = false
 
+# End-to-end wall-clock latency of `GET /workflows/{id}/diagnose` against a
+# real Postgres (issue #1194, following up on issue #809's unverified
+# `p95 < 500 ms` claim). `harness = false` + its own `main()`, matching
+# `claim_bench`/`e2e_bench`/`retention_reclaim_bench` in the `autumn-harvest`
+# crate: the report format (p50/p99/max tables pasted into
+# `docs/performance.md`) is the house convention those establish, even though
+# `/diagnose` is read-only and criterion would be numerically valid here (see
+# the bench's own module doc comment). Drives the real `harvest_api_router`
+# handler over `tower::ServiceExt::oneshot`, not a reimplementation of its
+# query shapes -- the diagnose internals are private to this crate, so a
+# bench in `autumn-harvest/benches/` could only ever measure a proxy. No
+# `required-features`: this crate's `autumn-harvest` dependency already
+# unconditionally enables `db`/`testing` (see `[dependencies]` above).
+[[bench]]
+name = "diagnose_bench"
+harness = false
+
 [lints]
 workspace = true
 
