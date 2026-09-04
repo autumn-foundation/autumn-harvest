@@ -13950,6 +13950,14 @@ pub(crate) async fn build_diagnosis_report(
                 Some("half_open") => (Some(BlockingCircuitPhase::HalfOpen), None),
                 _ => (None, None),
             };
+            // Authoritative, straight from the registry's own flag -- NEVER
+            // inferred from whether `circuit_cooldown_until` could be
+            // computed (issue #1193 Codex round-1 P2): a policy cooldown
+            // outside `chrono`'s representable range ALSO makes
+            // `circuit_cooldown_until` return `None` for a breaker that was
+            // tripped organically, which would otherwise be indistinguishable
+            // from a genuinely operator-forced one.
+            let circuit_forced_open = snapshot.is_some_and(|s| s.forced_open);
             let concurrency_saturated = match (t.concurrency_key.as_ref(), t.concurrency_cap) {
                 (Some(key), Some(cap)) => {
                     running_by_key
@@ -13989,6 +13997,7 @@ pub(crate) async fn build_diagnosis_report(
                 ),
                 circuit_phase,
                 circuit_cooldown_until,
+                circuit_forced_open,
                 rate_limit_saturated: !has_cb
                     && t.rate_limit_key
                         .as_ref()
@@ -55052,6 +55061,7 @@ mod tests {
             has_live_worker: true,
             circuit_phase: None,
             circuit_cooldown_until: None,
+            circuit_forced_open: false,
             rate_limit_saturated: false,
             rate_limit_bucket_missing: false,
             concurrency_saturated: false,
@@ -55092,6 +55102,7 @@ mod tests {
             has_live_worker: true,
             circuit_phase: None,
             circuit_cooldown_until: None,
+            circuit_forced_open: false,
             rate_limit_saturated: false,
             rate_limit_bucket_missing: false,
             concurrency_saturated: false,
@@ -55120,6 +55131,7 @@ mod tests {
             has_live_worker: false,
             circuit_phase: None,
             circuit_cooldown_until: None,
+            circuit_forced_open: false,
             rate_limit_saturated: false,
             rate_limit_bucket_missing: false,
             concurrency_saturated: false,
@@ -55156,6 +55168,7 @@ mod tests {
             has_live_worker: false,
             circuit_phase: None,
             circuit_cooldown_until: None,
+            circuit_forced_open: false,
             rate_limit_saturated: false,
             rate_limit_bucket_missing: false,
             concurrency_saturated: false,
@@ -55190,6 +55203,7 @@ mod tests {
             has_live_worker: true,
             circuit_phase: None,
             circuit_cooldown_until: None,
+            circuit_forced_open: false,
             rate_limit_saturated: false,
             rate_limit_bucket_missing: false,
             concurrency_saturated: false,

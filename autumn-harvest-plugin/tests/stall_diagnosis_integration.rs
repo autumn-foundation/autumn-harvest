@@ -803,6 +803,11 @@ async fn ac5_forced_open_circuit_reports_circuit_open_without_a_cooldown() {
         "a force-opened breaker admits no timed probe, so it must advertise no \
          cooldown: {body}"
     );
+    assert_eq!(
+        body["blocked_on"]["forced_open"], true,
+        "the authoritative origin flag (issue #1193 Codex round-1 P2) must \
+         read true for a genuinely forced-open breaker: {body}"
+    );
 }
 
 /// An ORGANICALLY tripped circuit (three failures inside the window, so
@@ -858,6 +863,12 @@ async fn ac5_organically_tripped_circuit_reports_a_derived_cooldown_until() {
         body["health"], "degraded",
         "an organically-tripped open self-heals with no operator action, but \
          fast-fails every dispatch until then -- neither healthy nor stalled: {body}"
+    );
+    assert_eq!(
+        body["blocked_on"]["forced_open"], false,
+        "the authoritative origin flag (issue #1193 Codex round-1 P2) must \
+         read false for a genuinely organic trip -- this is what `health` is \
+         actually keyed on, not the presence of cooldown_until: {body}"
     );
     let cooldown = body["blocked_on"]["cooldown_until"]
         .as_str()
@@ -3052,6 +3063,11 @@ async fn half_open_circuit_is_not_reported_as_operator_forced() {
     assert_eq!(
         body["blocked_on"]["phase"], "half_open",
         "the observed breaker phase must reach the wire: {body}"
+    );
+    assert_eq!(
+        body["blocked_on"]["forced_open"], false,
+        "a forced-open breaker's phase never leaves Open, so a half-open \
+         verdict must never report forced_open: true: {body}"
     );
     let summary = body["summary"].as_str().unwrap_or_default();
     assert!(
