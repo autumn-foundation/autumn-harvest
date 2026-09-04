@@ -1230,15 +1230,15 @@ fn parse_optional_date_filter(
     let Some(raw) = raw.map(str::trim).filter(|v| !v.is_empty()) else {
         return (None, None);
     };
-    match DateTime::parse_from_rfc3339(raw) {
-        Ok(parsed) => (Some(raw.to_string()), Some(parsed.with_timezone(&Utc))),
-        Err(_) => {
+    DateTime::parse_from_rfc3339(raw).map_or_else(
+        |_| {
             errors.push(format!(
                 "Ignored {field_label} value '{raw}': expected RFC 3339 (e.g. 2026-01-01T00:00:00Z)."
             ));
             (Some(raw.to_string()), None)
-        }
-    }
+        },
+        |parsed| (Some(raw.to_string()), Some(parsed.with_timezone(&Utc))),
+    )
 }
 
 #[allow(clippy::too_many_lines)]
@@ -4165,7 +4165,6 @@ fn layout_workers(title: &str, body: &Markup, refresh: Option<u64>) -> Markup {
     }
 }
 
-#[allow(clippy::too_many_arguments)]
 #[allow(clippy::too_many_arguments)]
 fn render_workflow_list(
     workflows: &[WorkflowExecution],
