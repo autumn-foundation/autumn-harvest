@@ -1,4 +1,4 @@
-# ⛏️ Prospect: does a partial index fix the concurrency gate's high-cardinality cost? (kill: 10,137 vs 50-buffer idle line, ledger #3)
+# ⛏️ Prospect: does a partial index fix the concurrency gate's high-cardinality cost? (kill: 10,131 vs 50-buffer idle line, ledger #3)
 
 > Status: **measured.** The pre-registration
 > (`docs/rnd/2026-09-04-concurrency-gate-cardinality-index-preregistration.md`,
@@ -83,8 +83,10 @@ both ported from `autumn-harvest/migrations/20260409000000_harvest_initial/up.sq
 `claim_budget_tests.rs`'s `HOT_CONTENTION_ROWS` seed (2,000 RUNNING rows
 round-robin across the backlog's own distinct keys), and two query variants
 (`control.sql` — the committed fix's shape; `candidate.sql` — the proposed
-rewrite, gated behind `candidate_index.sql`'s new partial index). Run via
-`run_assay.sh` against a local, non-production Postgres 16 instance.
+rewrite, gated behind `candidate_index.sql`'s new partial index), driven by
+`driver.sql` — one continuous `psql` session that seeds and captures every
+scenario in order — via `run_assay.sh`, against a local, non-production
+Postgres 16 instance.
 
 **Stubs list (what was faked/cut, on purpose):**
 
@@ -108,16 +110,16 @@ same apparatus, same session:
 
 | scenario | keys | running | variant | execution time | top-level buffers |
 |:--|--:|--:|:--|--:|--:|
-| idle_256 | 256 | 0 | control | 7.541 ms | 141 |
-| idle_256 | 256 | 0 | **candidate** | 11.825 ms | **10,137** |
-| hot_256 | 256 | 2,000 | control | 172.716 ms | 736 |
-| hot_256 | 256 | 2,000 | **candidate** | 47.839 ms | 98,668 |
-| hot_5000 | 5,000 | 2,000 | control | 1,212.401 ms | 756 |
-| hot_5000 | 5,000 | 2,000 | **candidate** | 28.409 ms | 24,558 |
-| idle_5000 | 5,000 | 0 | control | 7.476 ms | 145 |
-| idle_5000 | 5,000 | 0 | candidate (not gated) | 12.424 ms | 10,141 |
+| idle_256 | 256 | 0 | control | 6.498 ms | 132 |
+| idle_256 | 256 | 0 | **candidate** | 10.921 ms | **10,131** |
+| hot_256 | 256 | 2,000 | control | 159.457 ms | 730 |
+| hot_256 | 256 | 2,000 | **candidate** | 46.962 ms | 98,659 |
+| hot_5000 | 5,000 | 2,000 | control | 1,177.653 ms | 747 |
+| hot_5000 | 5,000 | 2,000 | **candidate** | 24.159 ms | 24,549 |
+| idle_5000 | 5,000 | 0 | control | 6.494 ms | 136 |
+| idle_5000 | 5,000 | 0 | candidate (not gated) | 10.843 ms | 10,135 |
 
-(Re-run after two rounds of post-review fixes — see "Post-publication
+(Re-run after three rounds of post-review fixes — see "Post-publication
 corrections" below. Numbers moved between rounds; every line-level verdict
 is unchanged throughout.)
 
@@ -146,25 +148,27 @@ a `MATERIALIZED` CTE that is empty in the idle case and stays resident in
 memory, at near-zero marginal buffer cost per call. Candidate's subplan is a
 real B-tree probe, and even returning zero rows it costs ~1 buffer hit per
 call — ×10,000 calls ≈ 10,000 buffer hits, which is on its own nearly all of
-the idle-case regression (10,000 of 10,137 total). Ten thousand empty index
+the idle-case regression (10,000 of 10,131 total). Ten thousand empty index
 probes, not a lost query shape, is the mechanism. (Caught in post-publication
 review; see below.)
 
 **Against the lines:**
 
-- **L1 — FAIL.** Candidate's idle_256 buffer count is **10,137**, against a
-  ≤50 line — 202.7x over. This is not close, and it is not a cardinality
+- **L1 — FAIL.** Candidate's idle_256 buffer count is **10,131**, against a
+  ≤50 line — 202.6x over. This is not close, and it is not a cardinality
   artifact: idle_5000 (5,000 keys, still zero RUNNING rows) shows the nearly
-  identical 10,141 buffers, confirming the cost comes from paying the
+  identical 10,135 buffers, confirming the cost comes from paying the
   per-row index-probe cost 10,000 times regardless of how many keys exist,
-  not from key cardinality itself.
-- **L2 — PASS, decisively.** Candidate's hot_5000 wall-clock is **28.409ms**,
-  against a ≤160ms line — comfortably inside, and a **~42.7x** speedup over
-  this apparatus's own same-run control (1,212.401ms), well past the 10x
+  not from key cardinality itself. See "Post-publication corrections" #6 on
+  what the ≤50 line's own source figure actually measures, and why the
+  verdict doesn't depend on resolving that.
+- **L2 — PASS, decisively.** Candidate's hot_5000 wall-clock is **24.159ms**,
+  against a ≤160ms line — comfortably inside, and a **~48.8x** speedup over
+  this apparatus's own same-run control (1,177.653ms), well past the 10x
   bar. This is the number the doc's open question was actually asking about,
   and the partial index does fix it.
-- **L3 — PASS.** Candidate's hot_256 wall-clock is **47.839ms** against a
-  ≤345.432ms line (2x control's 172.716ms) — not just inside the line, faster
+- **L3 — PASS.** Candidate's hot_256 wall-clock is **46.962ms** against a
+  ≤318.914ms line (2x control's 159.457ms) — not just inside the line, faster
   than control outright.
 
 **Control comparison, always:** every candidate number above is read against
@@ -174,12 +178,11 @@ only as the source of the L1/L2 pre-set lines, per the pre-registration).
 
 **Worst case:** the apparatus's own control run does not reproduce
 `docs/performance.md`'s published "~1-4 buffers" idle-case figure for the
-committed fix either (this apparatus measures 141-145, even with both
-production indexes present) — the full production query's extra
-joins/columns and the doc's own larger backlog sweep (up to 100,000 rows)
-evidently matter to whether Postgres chooses the early-stop plan at all, a
-detail this minimal apparatus does not resolve either way.
-That gap does not change today's verdict — L1's line was set as an absolute
+committed fix either (this apparatus measures 132-136, even with both
+production indexes present) — see "Post-publication corrections" #6: that
+figure turns out to describe a narrower scope than "the whole query's
+buffers" in the first place, which is most of why it doesn't match. That
+does not change today's verdict — L1's line was set as an absolute
 threshold precisely because a same-apparatus recalibration wasn't available
 going in — but it does mean this apparatus cannot independently corroborate
 the doc's own control number, only the relative candidate-vs-line and
@@ -187,13 +190,13 @@ candidate-vs-control comparisons it was built to make.
 
 ## 🏁 Verdict
 
-**Kill**, on L1: 10,137 buffers vs. a 50-buffer line. Per the pre-registered
+**Kill**, on L1: 10,131 buffers vs. a 50-buffer line. Per the pre-registered
 rule, one miss among three is a kill regardless of the other two clearing
 by wide margins.
 
 The partial-index + base-table-correlated-subquery rewrite **does** solve
 the specific problem `docs/performance.md` measured (high-cardinality
-hot-contention: ~42.7x faster than control, well past the 10x bar) and does
+hot-contention: ~48.8x faster than control, well past the 10x bar) and does
 so **without** the 256-key hot-contention regression the doc's three
 previously-rejected `LEFT JOIN`-family rewrites all shared. But it trades
 that fix for a new, more universal one: at zero `RUNNING` rows — the common,
@@ -219,8 +222,10 @@ gate itself) — those remain open, un-re-chartered pits.
 
 ## Post-publication corrections
 
-Codex's automated review on the PR that filed this report caught five real
-issues across two rounds, all fixed in place (verdict unchanged throughout):
+Codex's automated review on the PR that filed this report caught seven real
+issues across three rounds. Five were fixed in place; the two below are
+findings about the pre-registration itself, which — as a committed contract
+— gets clarified here rather than edited (verdict unchanged throughout):
 
 1. **`seed.sql`'s key-deduplication subquery was wrong.** `SELECT DISTINCT
    concurrency_key, row_number() OVER () - 1 AS rn FROM … WHERE state =
@@ -260,6 +265,42 @@ issues across two rounds, all fixed in place (verdict unchanged throughout):
    report success even after a mid-script SQL error, so a broken seed or
    index step could silently archive results from stale or partial data.
    Fixed by passing `-v ON_ERROR_STOP=1` to every `psql` invocation.
+6. **The pre-registration's L1 rationale conflated two different scopes.**
+   Its text justifying the 50-buffer line said "Control/committed fix
+   measures ~1-4" — quoting `docs/performance.md`'s idle-case figure — as if
+   that were a whole-query buffer total comparable to what L1 measures.
+   Reading the actual archived production artifact
+   (`docs/perf-artifacts/concurrency-key-claim-predicate/after-claim-backlog-10000.explain.txt`)
+   shows otherwise: the *full* committed query's idle-case plan totals **305
+   buffers** (and, like every plan in this apparatus, does a plain
+   `actual rows=10000 loops=1` scan — no `LIMIT` early-stop there either);
+   the "~1-4" figure is the concurrency-gate `SubPlan`'s own contribution
+   (`Buffers: shared hit=1` at that node), not the query total. So the
+   50-buffer line's justification was scope-mismatched from the figure it
+   cited, discovered only after this assay ran.
+
+   Per this role's own rule, a pre-set line does not move once data exists —
+   a miscalibrated rationale discovered after the fact is grounds for a
+   sharper *next* assay, never a quiet edit to this one. L1 is graded
+   exactly as committed: candidate's total buffer count against ≤50. That
+   verdict (FAIL) does not depend on resolving the scope question either
+   way: re-scoped to just the gate subplan's own contribution — the
+   apples-to-apples comparison the doc's figure actually supports —
+   control's subplan costs ~1 buffer (matching production) against
+   candidate's ~10,000 (its `SubPlan`'s own cumulative `Buffers: shared
+   hit=10000`, see the mechanism above), which is a *larger* relative gap
+   than the whole-query comparison, not a smaller one. No plausible
+   rescoping flips this verdict.
+7. **The apparatus ran control and candidate as separate `psql` processes**,
+   despite the pre-registration and this report both saying the comparison
+   is same-session. Rewrote the runner as one continuous session
+   (`driver.sql`, driven by `run_assay.sh`) that seeds and captures every
+   scenario — all eight runs — through a single connection via `\i`/`\o`,
+   and re-ran. Postgres's shared-buffer pool and catalog statistics are
+   server-wide, not session-local, so this was not expected to change
+   `EXPLAIN`'s buffer/cost numbers, and it didn't beyond ordinary run-to-run
+   noise (table above); it closes a real gap between what was claimed and
+   what the script actually did.
 
 ## 🔬 Reproduce
 
@@ -270,8 +311,9 @@ PGHOST=/var/run/postgresql PGDATABASE=prospect_assay3 ./run_assay.sh
 grep "Execution Time" results/*.explain.txt
 ```
 
-`schema.sql`, `seed.sql`, `control.sql`, `candidate_index.sql`, and
-`candidate.sql` are archived alongside `run_assay.sh` in this directory,
-along with the full `results/*.explain.txt` output this report's table is
-drawn from. No migration was added to `autumn-harvest/migrations/`; no
-crate code changed. The prototype does not merge.
+`schema.sql`, `seed.sql`, `control.sql`, `candidate_index.sql`,
+`candidate.sql`, and the `driver.sql` session script are archived alongside
+`run_assay.sh` in this directory, along with the full `results/*.explain.txt`
+output this report's table is drawn from. No migration was added to
+`autumn-harvest/migrations/`; no crate code changed. The prototype does not
+merge.

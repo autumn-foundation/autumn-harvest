@@ -852,7 +852,7 @@ and open question.
 
 **That proposal was measured and killed:**
 `docs/assays/0003-concurrency-gate-cardinality-index.md` (ledger #3) found
-the partial-index rewrite fixes this exact 5,000-key blowup (~42.7x faster
+the partial-index rewrite fixes this exact 5,000-key blowup (~48.8x faster
 than control) without regressing the 256-key case, but at zero `RUNNING`
 rows it costs ~10,000 real per-candidate-row index probes where the current
 fix costs ~10,000 near-free probes of a small, resident, empty CTE — 200x+
