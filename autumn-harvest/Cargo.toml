@@ -355,6 +355,16 @@ name = "det_check_profile"
 harness = false
 
 # Deterministic (non-criterion) instruction/allocation-count profiling harness
+# for `critical_path::CriticalPathAnalyzer::analyze` -- the longest-path DP
+# behind the crate's DAG bottleneck-analysis API, re-exported at the crate
+# root and consumed by `dag_export::export_mermaid_with_critical_path`. No
+# feature requirement: `critical_path.rs` and `dag.rs` are unconditional. See
+# `benches/critical_path_profile.rs`.
+[[bench]]
+name = "critical_path_profile"
+harness = false
+
+# Deterministic (non-criterion) instruction/allocation-count profiling harness
 # for `dlq::group_dead_letter_rows` -- the in-memory grouping core behind
 # `GET /admin/dead-letters/aggregate` (issue #385 / #613). `dlq.rs` uses
 # `diesel_async` unconditionally (no per-item `cfg(feature = "db")` gates), so
