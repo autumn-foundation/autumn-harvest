@@ -700,6 +700,9 @@ self-compensating.
 * **A compensated run is not retryable from a failed node.**
   `POST /dags/{name}/runs/{id}/retry` returns `409` — retry carries succeeded
   upstream nodes over, and the unwind just undid them. Start a fresh run.
+  For the retryable case, see
+  [`docs/runbooks/dag-retry-from-failed-node.md`](../runbooks/dag-retry-from-failed-node.md)
+  for the incident-response walkthrough.
 * **An unsolicited signal silences the rollback counters.** A DAG consumes no
   signals of its own, so a stray signal leaves the unwind uncounted (it still
   runs, and still replays deterministically).
@@ -889,7 +892,19 @@ curl -s -X POST \
 
 Pausing a DAG keeps the definition registered but stops the scheduler from
 firing it; manual triggers still work. Resume by patching it back to active
-through the same management route.
+through the same management route — see
+[`docs/operations/schedule-pause-resume.md`](../operations/schedule-pause-resume.md)
+for the operator playbook, including a paused schedule's interaction with
+in-flight runs and the audit trail.
+
+Related runbooks for operating schedules and DAG runs day to day:
+[`docs/runbooks/schedule-preview.md`](../runbooks/schedule-preview.md) (dry-run
+a cron expression before committing it), and
+[`docs/runbooks/schedule-trigger-now.md`](../runbooks/schedule-trigger-now.md)
+(fire one run immediately without disturbing the normal cadence). A schedule's
+`calendar` field skips fires landing on excluded dates (holidays, maintenance
+windows) per a configurable policy — see
+[`docs/calendars.md`](../calendars.md).
 
 ## Incremental scheduled jobs — last-completion-result carryover
 

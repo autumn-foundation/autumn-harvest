@@ -9,3 +9,25 @@ autumn-harvest-plugin = "0.6"
 autumn-web = "0.7"
 serde_json = "1"
 tracing = "0.1"
+
+# tinyvec 1.13.0 shipped a build-breaking regression (`cannot find macro
+# `vec` in this scope` in its own alloc-mode source, tinyvec.rs:710) that a
+# fresh, lockfile-free `cargo build` picks up as a transitive dependency (via
+# the icu4x/zerovec stack). That is exactly this scaffold's own situation --
+# `harvest new` never generates a Cargo.lock -- so every new project built
+# against a broken tinyvec release fails before it ever reaches this crate's
+# own code. Pinned below the known-broken release as a direct, otherwise-unused
+# dependency purely to constrain the transitive resolver; loosen once upstream
+# ships a fix.
+#
+# The lower bound matters as much as the upper one: some crates in this
+# graph also pull an unrelated, SemVer-incompatible pre-1.0 tinyvec line
+# (0.4.x). A bare `<1.13.0` is trivially satisfied by that 0.x line, so the
+# resolver picks a 0.4.x version for *this* edge and leaves the real,
+# transitively-needed 1.x line completely unconstrained at whatever is
+# newest -- silently defeating the pin. `>=1.0.0` rules the 0.x line out, so
+# this edge can only be satisfied within the same 1.x compatibility class
+# the real dependents use, which is what actually forces unification below
+# 1.13.0. Verified against a full `cargo generate-lockfile` including
+# autumn-web's dependency graph, not just in isolation.
+tinyvec = ">=1.0.0, <1.13.0"

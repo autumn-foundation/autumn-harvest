@@ -787,7 +787,7 @@ check.
 
 ### Decommissioning a shard — runbook
 
-See `docs/runbooks/shard-decommission.md` for the full drill.
+See [`docs/runbooks/shard-decommission.md`](runbooks/shard-decommission.md) for the full drill.
 
 ---
 

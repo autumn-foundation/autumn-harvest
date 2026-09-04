@@ -147,4 +147,5 @@ For a 7-day hourly schedule (168 timestamps): dry-run planning should return in 
 
 ## See also
 
-- `docs/runbooks/schedule-run-history.md` — after a backfill, confirm the recovered runs and their outcomes with `harvest schedule runs <schedule-id>`. Backfilled runs appear there under `origin = backfill`, so they stay distinct from the normal `scheduled` cadence.
+- [`docs/runbooks/schedule-run-history.md`](schedule-run-history.md) — after a backfill, confirm the recovered runs and their outcomes with `harvest schedule runs <schedule-id>`. Backfilled runs appear there under `origin = backfill`, so they stay distinct from the normal `scheduled` cadence.
+- [`docs/runbooks/schedule-preview.md`](schedule-preview.md) — dry-run a schedule's next firings before unpausing it, to sanity-check the window you're about to backfill.
