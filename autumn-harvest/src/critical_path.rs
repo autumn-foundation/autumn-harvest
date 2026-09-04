@@ -158,14 +158,21 @@ impl CriticalPathAnalyzer {
         //   optimization is justified by. Sorting by name fixes the scan
         //   order so repeated measurements of the same binary are
         //   comparable.
-        let lookups_needed = tasks
-            .iter()
-            .filter(|task| task.start_to_close.is_none())
-            .count();
-        let duration_lookup: Option<Vec<(&str, Duration)>> = (lookups_needed
-            >= MIN_LOOKUPS_TO_AMORTIZE_TABLE_BUILD
-            && self.activity_durations.len() <= LINEAR_SCAN_CARDINALITY_LIMIT)
+        // Checked in cheapest-first order so a high-cardinality caller (who
+        // can never take the fast path at all, per the limit above) never
+        // pays the O(tasks) `lookups_needed` scan either: `.then()`/
+        // `.filter()` short-circuit, so `activity_durations.len()` (O(1)) is
+        // read before `tasks` is walked, not after.
+        let duration_lookup: Option<Vec<(&str, Duration)>> = (self.activity_durations.len()
+            <= LINEAR_SCAN_CARDINALITY_LIMIT)
             .then(|| {
+                tasks
+                    .iter()
+                    .filter(|task| task.start_to_close.is_none())
+                    .count()
+            })
+            .filter(|&lookups_needed| lookups_needed >= MIN_LOOKUPS_TO_AMORTIZE_TABLE_BUILD)
+            .map(|_| {
                 let mut lookup: Vec<(&str, Duration)> = self
                     .activity_durations
                     .iter()
