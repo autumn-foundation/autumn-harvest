@@ -1,4 +1,4 @@
-# `schedule_to_close_at` claim predicate: measured, confirmed cheap at the row level; a scale-dependent plan risk found alongside
+# `schedule_to_close_at` claim predicate: measured, confirmed cheap; the cost is index maintenance and row width, not predicate evaluation
 
 `docs/performance.md`'s "Known limitations" section flagged
 `schedule_to_close_at` (issue #378), alongside worker sessions (#606) and
@@ -8,14 +8,34 @@ but never measured because `claim_bench_support::db::seed_backlog` never
 populates the column. This page is that measurement, for `schedule_to_close_at`
 only.
 
-The result **confirms the doc's own suspicion at the row level**: at the two
+The result **confirms the doc's own suspicion on magnitude**: at the two
 backlog depths where this environment's measurements reproduced identically
 across four independent capture runs (1,000 and 10,000 rows), populating
 `schedule_to_close_at` adds a small, real, stable buffer cost to the claim
 query -- **+5.7% and +3.6%** respectively -- corroborated by two standalone
 MVCC-bloat scripts, one bulk and one per-row (**+5.2%** both, twice). None of
-this comes close to the 20% impact floor; no fix is proposed or needed for
-the row-level cost.
+this comes close to the 20% impact floor; no fix is proposed or needed.
+
+**The mechanism is not what an earlier revision of this page claimed,
+though.** That revision attributed the whole delta to row width, by analogy
+with `docs/performance-capability-labels.md`'s `required_capabilities`
+finding, without actually reading the plan closely enough to check --
+`claim_task_query()`'s candidate-side `WHERE` clause genuinely is a plain
+inline column test, but the query is not read-only: its `claimed` CTE
+`UPDATE`s the claimed row, and `harvest_task_queue` carries a **partial
+index** on `schedule_to_close_at` (`harvest_task_queue_schedule_to_close_idx`,
+migration `20260606000001`, built for the timeout scanner) that only rows
+with a non-`NULL` deadline are ever members of. Codex review on PR #1339
+caught this. [The Plan section below](#plan) shows the direct evidence: the
+`Update on harvest_task_queue` node's `dirtied`/`written` buffer counts are
+exactly one page higher for `schedule-to-close` than for
+`no-schedule-to-close` at **every** backlog depth tested (1,000/10,000/
+100,000) -- a fixed, depth-independent delta, the signature of one extra
+index-leaf write per claim, not a scan-side effect. The measured buffer
+delta is the **sum of two genuinely different mechanisms**: a small,
+constant, per-claim index-maintenance cost (this section) plus a row-width
+effect on the candidate scan that *does* scale with backlog depth (see
+[Plan](#plan)) -- not row width alone.
 
 **Two things this page found alongside that are not as clean, and are
 reported as such rather than smoothed into a single headline number:**
@@ -71,10 +91,15 @@ AND (
 ```
 
 a plain inline test against a column already on the `harvest_task_queue` row
-the scan has fetched -- no subquery, no join, no correlated cost. In
-production this column is set once at initial enqueue (`NOW() +
-schedule_to_close`, issue #378) when a caller declares a total-attempt
-deadline, and left `NULL` (unbounded) otherwise.
+the scan has fetched -- no subquery, no join, no correlated cost *in this
+predicate's own evaluation*. That is not the same claim as "populating this
+column is free": `claim_task_query()`'s `claimed` CTE `UPDATE`s the row it
+selects, and a partial index on this column exists for the timeout
+scanner's benefit -- see [Plan](#plan) for the real, measured mechanism,
+which an earlier revision of this page got wrong by assuming the predicate
+text was the whole story. In production this column is set once at initial
+enqueue (`NOW() + schedule_to_close`, issue #378) when a caller declares a
+total-attempt deadline, and left `NULL` (unbounded) otherwise.
 
 `autumn-harvest/tests/integration/claim_budget_tests.rs::zz_capture_schedule_to_close_claim_evidence`
 mirrors `zz_capture_capability_labels_claim_evidence` exactly in shape:
@@ -153,6 +178,72 @@ pass, plus one failed attempt that is not counted as a run (see below):
 Where a number reproduced across all four data-bearing runs, this page says
 so and treats it as reliable; where it didn't, all four observed values are
 reported rather than one being silently picked as canonical.
+
+## Plan
+
+`harvest_task_queue` carries a partial index built for the timeout scanner,
+not touched by `claim_task_query()`'s `SELECT`-side logic at all:
+
+```sql
+CREATE INDEX harvest_task_queue_schedule_to_close_idx
+    ON harvest_task_queue (schedule_to_close_at)
+    WHERE schedule_to_close_at IS NOT NULL
+      AND state IN ('RUNNING', 'PENDING');
+```
+(migration `20260606000001_harvest_activity_schedule_to_close`)
+
+A `no-schedule-to-close` row (`schedule_to_close_at IS NULL`) never
+satisfies this predicate and is never a member of this index, before or
+after a claim. A `schedule-to-close` row satisfies it both before
+(`state = 'PENDING'`) and after (`state = 'RUNNING'`) the claim `UPDATE` --
+its logical index membership doesn't change -- but the `UPDATE` still
+creates a brand-new physical tuple (ordinary Postgres MVCC), and every
+index the row is a member of needs an entry pointing at that new tuple.
+`no-schedule-to-close` rows pay this for `idx_harvest_tq_poll` and
+`idx_harvest_tq_running` only (both already keyed on `state`, so already
+non-HOT for every claim regardless of this predicate); `schedule-to-close`
+rows pay it for those two **plus** this partial index -- one genuinely
+extra index write, every claim, that `no-schedule-to-close` rows never
+incur.
+
+The `Update on public.harvest_task_queue` node's own `Buffers` line shows
+this directly, and it is depth-independent -- the signature of a per-claim
+index write, not a scan-side effect (artifacts: the `{no-schedule-to-close,
+schedule-to-close}-claim-backlog-{depth}.explain.txt` files, run 4):
+
+| backlog | no-schedule-to-close `dirtied`/`written` | schedule-to-close `dirtied`/`written` |
+|---:|---:|---:|
+| 1,000 | 4 / 2 | 5 / 3 |
+| 10,000 | 4 / 2 | 5 / 3 |
+| 100,000 | 4 / 2 | 5 / 3 |
+
+**Exactly +1 dirtied, +1 written, every time, at every depth.** If this
+delta were a row-width effect on the `UPDATE` node's own heap write, it
+would not need to be constant -- a wider row still fits in the same 8KB
+page here (page-crossing effects from row width show up on the *scan* side
+below, where row count per page is what changes, not on a single-row
+`UPDATE`'s own write). A fixed one-page write matches a B-tree leaf-page
+insert into `harvest_task_queue_schedule_to_close_idx`, sized commensurate
+with this fixture (10,000-100,000 rows, all sharing the same seeded
+deadline value, is nowhere near large enough to need more than one leaf
+page touched per insert).
+
+The remainder of the total buffer delta -- the part that *does* scale with
+backlog depth (+3 at 1,000, +10 at 10,000, +64 at the stable 100,000-row
+plan) -- sits in the query's candidate-selection scan/sort, upstream of the
+`UPDATE`. That portion is consistent with a row-width effect: a wider
+`schedule_to_close_at`-bearing row leaves less free space per heap page,
+so scanning and sorting the same row count touches more pages, growing
+with the candidate set exactly as `docs/performance-capability-labels.md`'s
+`required_capabilities` finding describes for its own (larger) JSONB
+column. This page's earlier revision was correct that *a* row-width effect
+exists here -- it was wrong to say that was the *only* mechanism.
+
+Neither component is a defect. The index exists because the timeout
+scanner needs it (its own migration comment says so, and no alternative
+was evaluated by this pass, which measures rather than redesigns); the
+scan-side row-width cost is inherent to storing a wider column at all. No
+schema or query change is proposed.
 
 ## Measurement
 
@@ -268,9 +359,17 @@ higher" rather than as a single citable percentage.
 Every `UPDATE` to a claimed row -- including the claim `UPDATE` itself in
 `claim_task_query()`'s `claimed` CTE, which never touches
 `schedule_to_close_at` -- still creates a brand-new MVCC tuple version that
-carries the column's value forward, exactly the mechanism
+carries the column's value forward, the same row-width mechanism
 `docs/performance-capability-labels.md`'s "Write-side cost" section
-documents for `required_capabilities`. Two independent, standalone,
+documents for `required_capabilities` -- **plus**, specific to this column,
+the partial-index write [Plan](#plan) documents: every `UPDATE` to a
+`schedule-to-close` row also writes a new entry to
+`harvest_task_queue_schedule_to_close_idx`, which a `no-schedule-to-close`
+row never touches. The two standalone scripts below reproduce this
+combined effect, not row width in isolation -- they measure heap-page
+growth only, so the index's own page growth is not separately broken out
+here, but it is included in the delta they report. Two independent,
+standalone,
 single-transaction corroborations (which is what makes these two reproduce
 cleanly where the live 10,001-call drain below does not -- neither leaves a
 ~15-minute window for autovacuum to run partway through, since neither

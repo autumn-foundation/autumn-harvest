@@ -1175,12 +1175,19 @@ from the benchmark are directly comparable.
     [the queue-pause anti-join fix](#the-queue-pause-anti-join-fix).
   * **`schedule_to_close` (#378)** — measured directly:
     [`docs/performance-schedule-to-close.md`](performance-schedule-to-close.md) seeds `schedule_to_close_at`
-    (rather than leaving it null) and **confirms this page's own suspicion at
-    the row level**: a small, real buffer cost (+3.6% to +5.7%, reproduced to
-    the exact buffer count across four independent capture runs at the
-    1,000- and 10,000-row depths), corroborated by two standalone MVCC-bloat
-    scripts, one bulk and one per-row (+5.2% both) — nowhere near the 20%
-    impact floor. No fix is proposed or needed for that row-level cost.
+    (rather than leaving it null) and **confirms this page's own suspicion on
+    magnitude, but not on mechanism**: a small, real buffer cost (+3.6% to
+    +5.7%, reproduced to the exact buffer count across four independent
+    capture runs at the 1,000- and 10,000-row depths), corroborated by two
+    standalone MVCC-bloat scripts, one bulk and one per-row (+5.2% both) —
+    nowhere near the 20% impact floor, so no fix is proposed. Codex review
+    caught that the predicate text alone (a plain inline column test) is not
+    the whole story: `harvest_task_queue` carries a partial index on this
+    column for the timeout scanner, and the claim `UPDATE` writes a new
+    entry to it for every `schedule-to-close` row — a fixed, depth-independent
+    +1 dirtied/+1 written page at every backlog depth tested, additive with a
+    separate row-width effect on the candidate scan that *does* scale with
+    depth. See that page's "Plan" section for the buffer-level evidence.
     Two things did **not**
     reproduce cleanly and are reported as open rather than smoothed into one
     number: at the 100,000-row depth the planner chose a markedly more
