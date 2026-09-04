@@ -1192,10 +1192,13 @@ from the benchmark are directly comparable.
     distinct, per-row deadline instead. See that page's "Plan" and
     "Write-side cost" sections for the buffer- and storage-level evidence.
     One thing did **not** reproduce cleanly across this pass's several
-    capture runs and is reported as an open range rather than a single
-    number: the real 10,001-call `pg_stat_statements` drain's aggregate
-    delta, observed anywhere from roughly +2.5% to +22.5% depending on the
-    run, always positive but not converging. A markedly more expensive plan
+    capture runs: the real 10,001-call `pg_stat_statements` drain's
+    aggregate delta varied noticeably run to run (always positive, never
+    converging on one value), but only the most recent run's artifacts are
+    ever committed -- the repro script overwrites the same canonical
+    filenames each time -- so that page states only the one auditable,
+    committed number (**+15.5%**) rather than citing bounds from runs whose
+    evidence no longer exists in the repository to audit. A markedly more expensive plan
     at the 100,000-row depth was also observed on earlier, pre-fix runs of
     this capture (never on the unpopulated side) but not on either
     fully-fixed run; that page's "100,000-row plan choice" section explains

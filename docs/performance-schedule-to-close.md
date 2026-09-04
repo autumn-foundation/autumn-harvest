@@ -374,17 +374,26 @@ sibling capability-labels and concurrency-key captures this one follows:
 | 484.04 | 559.18 | +15.5% |
 
 **This did not reproduce to a stable number across the several runs this
-capture went through over the course of this pass** (uncommitted earlier
-runs measured deltas ranging from roughly +2.5% to +22.5%, always positive
--- `schedule-to-close` never came out cheaper -- but not converging on one
-value). The drain loop does not capture a plan for every one of its 10,001
-calls, only the aggregate `pg_stat_statements` counters, so there is no
-per-call plan trace available to check any hypothesis about the cause
-directly, and this page does not assert one. Read the aggregate delta as
-"positive and real, on the order of several percent to the high teens in
-this environment" rather than as a single citable percentage, and treat the
-committed run's own +15.5% as one data point in that range, not the
-answer.
+capture went through over the course of this pass**, as earlier revisions
+of this page said by citing a specific historical range (roughly +2.5% to
++22.5%, always positive -- `schedule-to-close` never came out cheaper --
+but not converging on one value). Codex review on PR #1339 correctly
+pointed out that those earlier runs are exactly the kind of uncommitted,
+no-longer-reproducible data this page's "On reproducibility" note above
+disclaims: the repro script always overwrites the same canonical
+filenames, so citing specific bounds from them stated an unaudited
+number as though it were evidence. The only auditable data point is the
+committed run in the table above: **+15.5%**. The drain loop does not
+capture a plan for every one of its 10,001 calls, only the aggregate
+`pg_stat_statements` counters, so there is no per-call plan trace available
+to check any hypothesis about the cause of run-to-run variance directly,
+and this page does not assert one. Treat +15.5% as this pass's one
+committed, auditable measurement of the aggregate delta -- positive and
+real, comfortably under the impact floor either way -- not as a value this
+page claims is stable: unaudited historical runs during this same pass
+varied noticeably, so a different environment or run should be expected to
+land on a different, but still small and positive, number rather than
+exactly this one.
 
 ## Write-side cost
 
