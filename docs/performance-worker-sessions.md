@@ -9,14 +9,13 @@ under the impact floor), and narrowed the remaining unmeasured set to worker
 sessions and sticky routing. This page is the worker-sessions measurement.
 
 The result is **not** the same as `schedule_to_close`'s: this predicate has a
-large, real buffer cost -- **+124.8%** at the 10,000-row headline depth on a
-single cold claim, though a real 10,001-call production-shaped drain shows a
-much smaller **+7.2%** aggregate effect (see [Why the two numbers
-diverge](#why-the-two-numbers-diverge) below for the reclaim mechanism this
-page believes explains the gap). The mechanism is the same one
+real, moderate-to-large buffer cost -- **+32.9%** at the 10,000-row headline
+depth on a single cold claim, corroborated by a real 10,001-call
+production-shaped drain at **+22.1%** (same direction, same order of
+magnitude -- see [Measurement](#measurement)). The mechanism is the same one
 `docs/performance-capability-labels.md` documents: row-width growth from
-populating previously-`NULL` columns compounded by MVCC bloat from
-`queue::enqueue()`'s real two-step write (see
+populating previously-`NULL` columns, compounded by the MVCC cost of
+`queue::enqueue()`'s real two-statement write (see
 [Workload](#workload)) -- not a plan inefficiency. There is no query-shape
 fix, because the `WHERE` clause already evaluates the predicate as a plain
 inline test on a row the scan reads regardless. Per the acceptable-outcomes
@@ -24,60 +23,64 @@ rule ("optimization PR, findings issue, negative result -- all are successful
 runs"), this ships as a measured, reproducible finding with no code change to
 `queue.rs`.
 
-## Harness correction (review finding on PR #1358)
+## Harness corrections (four review rounds)
 
-The first cut of this capture seeded the `worker-session` state by writing
-`session_id`, `sticky_worker_id`, and `sticky_until` **directly in the seed
-`INSERT`**, and omitted `sticky_timeout` entirely. A Codex review finding on
-PR #1358 caught that this is not how `queue::enqueue()` writes these columns
-in production: `NewTaskQueueItem` **hardcodes**
-`sticky_worker_id`/`sticky_until`/`sticky_timeout` to `NULL` at `INSERT` time
-regardless of `EnqueueParams` (`queue.rs`, the `enqueue()` function); only
-`session_id` is written at `INSERT` time. The three sticky columns are set by
-a **separate `UPDATE`** immediately after, run only when `sticky_worker_id`
-and `sticky_timeout` are both set:
+This page's numbers moved twice before landing here, each time in response to
+a Codex review finding on PR #1358 that caught a real methodological gap.
+Recorded in full because the corrections themselves are the reproducible
+part of this pass, not just its conclusion:
 
-```sql
-UPDATE harvest_task_queue
-   SET sticky_worker_id = $2, sticky_until = NOW() + $3, sticky_timeout = $3
- WHERE id = $1
-```
+1. **Wrong row shape.** The first cut wrote `session_id`/`sticky_worker_id`/
+   `sticky_until` directly in the seed `INSERT` and omitted `sticky_timeout`
+   entirely. `queue::enqueue()` never writes it that way: `NewTaskQueueItem`
+   hardcodes all three sticky columns to `NULL` at `INSERT` time regardless
+   of `EnqueueParams`; a separate `UPDATE` sets them, only when
+   `sticky_worker_id`/`sticky_timeout` are set on the params -- verified
+   directly against `worker.rs`'s session-member dispatch, which sets
+   `session_id` + `sticky_worker_id` + `sticky_timeout`
+   (`SESSION_MEMBER_STICKY_TIMEOUT`, 24h) together. Fixed by reproducing the
+   real `INSERT`-then-`UPDATE` column shape.
+2. **Wrong transaction granularity.** The round-1 fix still ran that
+   `INSERT`-then-`UPDATE` as one bulk `INSERT` of N rows followed by one bulk
+   `UPDATE` covering all of them. Postgres's default heap fillfactor (100)
+   packs a bulk `INSERT`'s pages full before any row is widened, so the
+   following bulk `UPDATE` finds no room on the same page for any row's new
+   tuple version and is forced onto a fresh page for every single row --
+   roughly doubling the table's physical size, and not what an interleaved,
+   per-task production write produces. Fixed with a server-side PL/pgSQL
+   procedure that loops per row -- `INSERT`, `UPDATE` by id, `COMMIT` --
+   reproducing the real interleaved commit pattern with one network round
+   trip per depth (the loop runs entirely server-side) instead of N.
+3. **Untracked nested statements.** `pg_stat_statements.track` defaults to
+   `top`, so the `INSERT`/`UPDATE` executed *inside* the procedure from fix 2
+   were invisible to `pg_stat_statements` -- only the top-level `CALL` would
+   have been recorded, leaving the write-cost table with nothing to read.
+   Fixed with `SET pg_stat_statements.track = 'all'` for the seeding session.
+4. **Unfair write-cost control.** Fix 2 made `worker-session`'s seed N
+   separately-committed `INSERT`+`UPDATE` pairs while `no-session` stayed a
+   single bulk `INSERT` (`db::seed()`'s convenience for populating a backlog
+   to query against) -- comparing the two would measure statement-granularity
+   overhead, not the predicate's cost. Fixed with a second procedure
+   (`harvest_bench_seed_plain_rows`, `INSERT`-then-`COMMIT` per row, no
+   `UPDATE`) so both labels' write-cost figures come from the same per-row
+   lifecycle, differing only in the sticky/session columns.
 
-Verified directly against the real caller: `worker.rs`'s session-member
-dispatch (the code that actually enqueues a worker-session activity) sets
-`params.session_id = Some(session_id)`, `params.sticky_worker_id =
-Some(host_worker_id)`, and `params.sticky_timeout =
-Some(SESSION_MEMBER_STICKY_TIMEOUT)` (24 hours) together -- exercising exactly
-this INSERT-then-UPDATE path.
+The originally published figures (+21.9% single-call, +19.0% aggregate,
++28.3% write-side, then +124.8%/+7.2%/+171.7% after fix 1 alone) are all
+superseded by this page.
 
-The original capture's shortcut therefore measured a **narrower, less bloated
-row than production ever produces**: it omitted `sticky_timeout` (an
-`INTERVAL`, further widening the row) and, more importantly, skipped the
-MVCC cost of the second write entirely. An `UPDATE` gives a row a brand-new
-tuple version while the old one stays physically resident in the heap until
-vacuumed or opportunistically pruned -- exactly the pitfall
-`docs/performance-capability-labels.md`'s own harness note describes for a
-different predicate, except there it was an artifact to avoid (capability
-labels really are written once, at `INSERT` time, in production) and here
-it is the **real, unavoidable production write shape** (worker sessions
-really are written via `INSERT` then `UPDATE`, every time).
-
-**Fix:** the harness now reproduces the same two-step write `queue::enqueue()`
-performs -- one `INSERT` carrying only `session_id`, then one `UPDATE`
-setting `sticky_worker_id`/`sticky_until`/`sticky_timeout` (24 hours, matching
-`SESSION_MEMBER_STICKY_TIMEOUT`) -- rather than writing all four columns in a
-single `INSERT`. All figures on this page are from the corrected harness. The
-originally published figures (+21.9% single-call, +19.0% aggregate, +28.3%
-write-side) undercounted the real cost and are superseded by this page.
+A fifth review round raised a further, unresolved point about the seeding
+transaction boundary -- see [Known limitations](#known-limitations); it did
+not trigger another harness rewrite.
 
 ## Workload
 
 `claim_task_query()`'s `candidate` CTE gates every row with a plain inline
 test: `session_id IS NULL OR sticky_worker_id = $1` -- no subquery, no join.
-As established above, a real worker-session row always carries `session_id`,
-`sticky_worker_id`, `sticky_until`, and `sticky_timeout` non-`NULL` together,
-written via the two-step lifecycle -- unlike `schedule_to_close_at`, a single
-column set once at `INSERT` time in isolation.
+A real worker-session row always carries `session_id`, `sticky_worker_id`,
+`sticky_until`, and `sticky_timeout` non-`NULL` together, written via the
+two-statement lifecycle established above -- unlike `schedule_to_close_at`, a
+single column set once at `INSERT` time in isolation.
 
 `autumn-harvest/tests/integration/claim_budget_tests.rs::zz_capture_worker_session_claim_evidence`
 seeds `claim_bench_support`'s standard 4-queue backlog at the published
@@ -85,14 +88,18 @@ seeds `claim_bench_support`'s standard 4-queue backlog at the published
 identical in every other column:
 
 - **`no-session`** -- `session_id`, `sticky_worker_id`, `sticky_until`, and
-  `sticky_timeout` all `NULL` (today's default seed shape, and every other
-  `ClaimGate` scenario's shape too). Seeded with one set-based `INSERT`.
-- **`worker-session`** -- seeded via the real two-step lifecycle: one
-  `INSERT` carrying `session_id` only, then one `UPDATE` setting
-  `sticky_worker_id` to the claiming worker's own id, `sticky_until` to
-  `NOW() + 24 hours`, and `sticky_timeout` to `24 hours`. Setting
-  `sticky_worker_id = $1` makes both the session predicate *and* the
-  pre-existing ordinary-sticky predicate directly above it
+  `sticky_timeout` all `NULL`. Seeded per row via
+  `harvest_bench_seed_plain_rows` (`INSERT`, `COMMIT`, repeat) for the
+  write-cost measurement; via `db::seed()`'s single bulk `INSERT` for the
+  `EXPLAIN` sweep (a fair simplification there -- with no follow-up `UPDATE`
+  ever run against these rows, batching the `INSERT` does not create the
+  dead-tuple asymmetry that motivated fix 2 above).
+- **`worker-session`** -- seeded per row via `harvest_bench_seed_worker_session_rows`
+  (`INSERT` carrying `session_id` only, `UPDATE` setting `sticky_worker_id`
+  to the claiming worker's own id / `sticky_until` to `NOW() + 24h` /
+  `sticky_timeout` to `24h`, `COMMIT`, repeat). Setting `sticky_worker_id =
+  $1` makes both the session predicate *and* the pre-existing
+  ordinary-sticky predicate directly above it
   (`sticky_worker_id IS NULL OR sticky_worker_id = $1 OR ...`) evaluate
   `TRUE` for every row, so the claimable row count is **identical** between
   the two labels -- the same match-not-exclude isolation technique the
@@ -114,11 +121,11 @@ in buffer counts. At backlog=10,000:
 
 ```text
 no-session:      Seq Scan on harvest_task_queue  Buffers: shared hit=244  (actual rows=10000 loops=1)
-worker-session:   Seq Scan on harvest_task_queue  Buffers: shared hit=586  (actual rows=10000 loops=1)
+worker-session:   Seq Scan on harvest_task_queue  Buffers: shared hit=334  (actual rows=10000 loops=1)
 ```
 
-The `Seq Scan` node's own delta (244 -> 586, +342) **exactly matches** the
-whole query's total delta at this depth (274 -> 616, +342) -- the entire cost
+The `Seq Scan` node's own delta (244 -> 334, +90) **exactly matches** the
+whole query's total delta at this depth (274 -> 364, +90) -- the entire cost
 is inside the scan reading physically more pages, nothing leaks into any
 other node. This is the same signature
 `docs/performance-capability-labels.md`'s Plan section documents for its own
@@ -126,12 +133,9 @@ predicate, and it rules out a plan-shape explanation the same way:
 `session_id IS NULL OR sticky_worker_id = $1` is a `Filter:` clause evaluated
 row-by-row during the scan itself, not a separate `SubPlan`/`InitPlan` node.
 
-Unlike the first (flawed) capture, **the plan shape is now stable across all
-three depths** -- both states choose a plain `Seq Scan` at 1,000, 10,000, and
-100,000 rows, with no crossover to an `Index Scan` at the largest depth. The
-extra physical bloat from the two-step write pushes both states past whatever
-threshold the planner was flip-flopping around in the original (narrower)
-capture.
+Plan shape is stable across all three depths -- both states choose a plain
+`Seq Scan` at 1,000, 10,000, and 100,000 rows, with no crossover to an
+`Index Scan`.
 
 ## Measurement
 
@@ -143,16 +147,12 @@ capture.
 
 | backlog | no-session buffers | worker-session buffers | delta | delta % |
 |---:|---:|---:|---:|---:|
-| 1,000 | 53 | 89 | +36 | +67.9% |
-| 10,000 (headline) | 274 | 616 | +342 | **+124.8%** |
-| 100,000 | 2,473 | 5,892 | +3,419 | +138.3% |
+| 1,000 | 53 | 63 | +10 | +18.9% |
+| 10,000 (headline) | 274 | 364 | +90 | **+32.9%** |
+| 100,000 | 2,473 | 3,367 | +894 | +36.2% |
 
-The delta percentage grows with backlog size (+67.9% -> +124.8% -> +138.3%),
-consistent with a per-row storage effect that compounds with the number of
-rows touched, not a fixed per-query overhead that would amortize away at
-scale. This clears the impact floor's "≥20% buffer reduction" bar in
-magnitude (as a *cost*, not a reduction -- see [Why no fix is
-proposed](#why-no-fix-is-proposed) for why that does not make it fixable).
+The delta grows with backlog size, consistent with a per-row storage effect
+that compounds with the number of rows touched.
 
 ### Corroboration: `pg_stat_statements` over the real claim-drain
 
@@ -166,68 +166,17 @@ afterward (artifacts:
 
 | state | calls | `shared_blks_hit` | avg per call |
 |---|---:|---:|---:|
-| no-session | 10,001 | 5,288,273 | 528.77 |
-| worker-session | 10,001 | 5,671,354 | 567.08 |
+| no-session | 10,001 | 4,998,048 | 499.75 |
+| worker-session | 10,001 | 6,101,864 | 610.13 |
 
-Aggregate delta: **+7.24%** -- real, same direction as the single-cold-claim
-finding, but a much smaller magnitude (roughly a seventeenth of +124.8%, not
-the "within a few points" agreement the capability-labels and
-`schedule_to_close` pages report for their own single-call/aggregate pairs).
-This page does not treat the two numbers as corroborating each other in the
-"order of magnitude" sense this persona's own rules require for wall-clock
-evidence; they agree only in *direction*. See below for why.
-
-### Why the two numbers diverge
-
-Both `no-session` and `worker-session` grow their **average** per-call cost
-well above their **cold, first-call** `EXPLAIN` figure over the course of the
-drain (no-session: 274 cold vs. 528.77 average, +93%) -- expected, because
-`claim_task()`'s own claiming `UPDATE` (`SET state = 'RUNNING', worker_id =
-..., started_at = ..., attempt = attempt + 1, wake_requested = ...`) gives
-every claimed row a new tuple version, so the physical table only ever grows
-across a drain that claims every row once.
-
-`worker-session`'s average (567.08) is instead **lower** than its own cold
-figure (616) -- the opposite direction. The mechanism this page believes
-explains it: the `worker-session` table starts the drain already carrying,
-for every row, a **dead** tuple version (the first-`INSERT` row, superseded by
-the seed's own hard-pin `UPDATE`) that is eligible for reclaim from the moment
-the seeding transaction commits -- no reader holds a snapshot old enough to
-need it. `no-session` carries no equivalent debt; its rows have exactly one
-tuple version when the drain starts. As each of the 10,000 separately
-committed claim calls writes to a page, Postgres's opportunistic pruning can
-reclaim that pre-existing dead space and let the claiming `UPDATE`'s new
-tuple reuse it rather than extend the table -- a reclaim opportunity
-`no-session` does not have, since it has no comparable backlog of dead
-tuples to draw down. Net effect: `worker-session`'s per-call cost trends
-down across the drain as its seed-time debt gets paid off, `no-session`'s
-trends up as its own claim-induced debt accumulates, and the two curves
-converge far closer than the cold snapshot alone would suggest.
-
-**This mechanism is offered as the most coherent explanation consistent with
-the numbers, not as an independently proven one.** It was not confirmed by an
-interval `pg_stat_user_tables.n_dead_tup`/`pg_relation_size` sampling across
-the drain (the kind of direct instrumentation
-`docs/performance-capability-labels.md`'s write-side section uses to nail
-down a similar claim) -- doing so is future work, not part of this pass. What
-*is* directly evidenced is the same class of effect
-`docs/performance-capability-labels.md`'s write-side section documents for a
-different predicate: a bulk, single-transaction write pattern (the cold
-`EXPLAIN`'s snapshot, taken immediately after the seed's two uncommitted-then-
-rolled-back statements inside the `EXPLAIN ANALYZE` transaction) overstates
-cost relative to a sequence of separately committed writes (the real drain),
-because only the latter gets an opportunistic reclaim window between
-commits. That page's own separate-vs-bulk-transaction figures differ by
-roughly 4.5x in the same direction this page's two figures differ (17x) --
-different queries, different magnitudes, same underlying asymmetry.
-
-**Which number to use depends on the question.** A worker issuing isolated,
-infrequent session claims against an otherwise-idle table experiences
-something closer to the cold, **+124.8%** figure. A fleet running a steady
-stream of session claims, where most reads land on pages other claims have
-already touched and partially reclaimed, experiences something closer to the
-**+7.2%** aggregate figure. Neither is "the" answer; both are reported rather
-than picking one.
+Aggregate delta: **+22.1%** -- the same direction and the same order of
+magnitude as the single-cold-claim finding (+32.9%), the "corroborated by a
+buffer/row-count change in the same direction" bar this persona's rules set.
+Unlike the round-1-fix-only capture (which showed a 17x divergence between
+these two figures, +124.8% vs +7.2%, driven by the bulk-transaction
+seeding artifact fix 2 above removed), the per-row-committed fixture gives
+two numbers that agree with each other the way the capability-labels and
+`schedule_to_close` pages' own single-call/aggregate pairs do.
 
 ## Equivalence
 
@@ -243,44 +192,41 @@ overhead on an otherwise identical result set.
 
 No schema or index change is proposed, so there is no *new* write
 amplification to weigh -- but the same `pg_stat_statements` capture that
-produced the read-side numbers also captured the headline-scenario seed
-writes for each label (artifacts: same `pg_stat_statements.txt` files
-referenced above):
+produced the read-side numbers also captured the per-row seed writes for
+each label, both going through the same `INSERT`-then-`COMMIT` (per row)
+lifecycle (artifacts: same `pg_stat_statements.txt` files referenced above):
 
-| state | statement(s) | rows | `shared_blks_hit` |
+| state | statement(s) | calls | `shared_blks_hit` |
 |---|---|---:|---:|
-| no-session | one `INSERT` | 10,000 | 136,712 |
-| worker-session | `INSERT` + `UPDATE` | 10,000 | 156,493 + 214,918 = 371,411 |
+| no-session | `INSERT` only | 10,000 | 137,976 |
+| worker-session | `INSERT` + `UPDATE` | 10,000 each | 158,259 + 235,626 = 393,885 |
 
-Delta: **+171.7%** to write the identical row count through the real
-two-statement lifecycle -- substantially larger than this page's original
-(incorrect) single-`INSERT` estimate of +28.3%, because it now includes the
-follow-up `UPDATE`'s own cost (rewriting every row into a second tuple
-version) rather than assuming the row arrives fully-formed in one write.
+Delta: **+185.5%** to write the identical row count through the real
+two-statement, per-row-committed lifecycle. This is the largest percentage on
+this page, and the mechanism is direct: `worker-session` issues twice as many
+statements per row (an `INSERT` plus an `UPDATE`, each its own round trip and
+its own WAL record) as `no-session`'s single `INSERT`, and the `UPDATE`
+itself creates a second MVCC tuple version for every row.
 
-This is measured **immediately after the seed**, before any claim has run and
-before any opportunistic reclaim (discussed above) has had a chance to occur
--- it is the *un-reclaimed*, worst-case snapshot of the write cost, the same
-caveat the read-side aggregate section applies in the other direction. Unlike
-capability-labels' finding of write cost recurring on *every* subsequent
-claim/completion/retry `UPDATE`, this two-step cost is paid once per task, at
-enqueue time -- `sticky_worker_id`/`sticky_until`/`sticky_timeout` are not
-columns any later claim, completion, or retry path rewrites.
+This is a one-time cost in production, paid once at enqueue time --
+`sticky_worker_id`/`sticky_until`/`sticky_timeout` are not columns any later
+claim, completion, or retry path rewrites, unlike capability-labels' finding
+of write cost recurring on every subsequent `UPDATE`.
 
 ## Why no fix is proposed
 
 The measured cost is heap-page growth -- both from wider stored columns and
-from the second MVCC tuple version `queue::enqueue()`'s real two-step write
-produces -- evaluated by a `Seq Scan` that already reads every candidate row
-regardless of `session_id`/`sticky_worker_id`. Not a plan inefficiency SQL
-can route around:
+from the second MVCC tuple version `queue::enqueue()`'s real two-statement
+write produces -- evaluated by a `Seq Scan` that already reads every
+candidate row regardless of `session_id`/`sticky_worker_id`. Not a plan
+inefficiency SQL can route around:
 
 - The predicate itself is a plain `Filter:` boolean test with no `SubPlan` or
   `InitPlan` to rewrite -- confirmed directly in the captured `EXPLAIN`
   output, which shows the entire buffer delta landing inside the `Seq Scan`
   node itself at every depth (see [Plan](#plan) above).
-- The two-step write is what issue #606's hard-pin design requires: session
-  membership (`session_id`) and the hard sticky pin
+- The two-statement write is what issue #606's hard-pin design requires:
+  session membership (`session_id`) and the hard sticky pin
   (`sticky_worker_id`/`sticky_until`/`sticky_timeout`) are resolved at
   different points in `worker.rs`'s dispatch flow (a member activity's host
   worker is not known until the session's acquire step resolves it), so a
@@ -302,29 +248,54 @@ only) -- this pass did not separately measure CPU cost.
   sticky routing (#235).** A worker-session row necessarily also sets
   `sticky_worker_id`/`sticky_until`/`sticky_timeout`, which ordinary sticky
   routing (#235, still itself unmeasured on its own) sets independently via
-  the same `with_sticky`-triggered `UPDATE` path. The `worker-session`
-  label's cost therefore includes whatever ordinary sticky routing alone
-  would cost plus whatever `session_id` alone adds on top -- this page
-  cannot and does not decompose the two. A session-tagged row with no sticky
-  pin cannot occur in production (the two are always written together), so
-  this is not resolvable from this capture alone.
-- **The reclaim mechanism in [Why the two numbers
-  diverge](#why-the-two-numbers-diverge) is a plausible explanation, not a
-  directly instrumented one.** See that section's own caveat.
-- **The write-side figure is an un-reclaimed, immediately-post-seed
-  snapshot**, not a steady-state production number -- see
-  [Write-side cost](#write-side-cost).
+  the same mechanism. The `worker-session` label's cost therefore includes
+  whatever ordinary sticky routing alone would cost plus whatever
+  `session_id` alone adds on top -- this page cannot and does not decompose
+  the two. A session-tagged row with no sticky pin cannot occur in
+  production (the two are always written together), so this is not
+  resolvable from this capture alone.
+- **The seeding fixture assumes one activity enqueued per transaction; a
+  real fan-out from one workflow decision does not.** A review finding
+  (round 5) correctly caught that `worker.rs::persist_scheduled_activities`
+  wraps its ENTIRE `for params in &enqueued { queue::enqueue(conn,
+  params).await? }` loop -- every scheduled activity from one decision,
+  worker-session or not -- inside a single `conn.transaction(...)`. This
+  page's per-row-committed procedure instead commits after every individual
+  row, which understates the physical bloat a decision that schedules
+  several session-member activities at once would produce: none of a
+  same-transaction batch's superseded tuple versions can be pruned until the
+  whole batch commits, where this page's fixture opens a reclaim window
+  after every single row.
+  This page does not re-measure with a batched-transaction fixture. The
+  round-1-fix figures (+124.8% single-call, +171.7% write-side, from a
+  bulk `INSERT`-of-N followed by a bulk `UPDATE`-of-N, both auto-committed
+  separately) are **not** a substitute for that measurement either -- a
+  single bulk statement and N individually-executed statements sharing one
+  transaction are two more distinct scenarios, not the same one, and no
+  scenario matching "N individual `INSERT`/`UPDATE` statement pairs sharing
+  one transaction" has been captured. What can be said without a new capture:
+  the true cost for a multi-activity-per-decision fan-out lies **at or above**
+  this page's per-row-committed figures (+32.9% single-call / +22.1%
+  aggregate / +185.5% write-side), since batching can only remove reclaim
+  opportunities this fixture has, never add ones it lacks. How far above
+  depends on typical fan-out size (activities per decision), which this pass
+  does not have data on and did not attempt to estimate. Pinning down a
+  precise number needs a dedicated capture with a batched-transaction seeding
+  procedure at a stated, deliberately-chosen fan-out size -- left as future
+  work rather than chased through a further round of this pass, per this
+  persona's own floor on when to stop iterating.
 
 ## What shipped
 
 - `autumn-harvest/tests/integration/claim_budget_tests.rs::zz_capture_worker_session_claim_evidence`
   -- an `#[ignore]`d evidence-capture test (not a CI-gated assertion) that
-  seeds both data states at all three `BACKLOG_SWEEP` depths via the real
-  `queue::enqueue()`-shaped two-step write, captures
-  `EXPLAIN (ANALYZE, BUFFERS, VERBOSE, SETTINGS, TIMING OFF)` for each,
-  drains the real 10,000-row headline scenario through `queue::claim_task()`
-  at both states while snapshotting `pg_stat_statements`, and asserts
-  claim-count equivalence against ground truth as a correctness check.
+  seeds both data states at all three `BACKLOG_SWEEP` depths via server-side
+  per-row seeding procedures matching `queue::enqueue()`'s real write
+  lifecycle, captures `EXPLAIN (ANALYZE, BUFFERS, VERBOSE, SETTINGS, TIMING
+  OFF)` for each, drains the real 10,000-row headline scenario through
+  `queue::claim_task()` at both states while snapshotting
+  `pg_stat_statements`, and asserts claim-count equivalence against ground
+  truth as a correctness check.
 - `docs/perf-artifacts/worker-session-claim-predicate/` -- the committed
   `EXPLAIN` captures, `pg_stat_statements` snapshots, and a
   `fixture-summary.txt` for both data states at all three depths.
@@ -355,4 +326,7 @@ Both regenerate the `EXPLAIN` captures, `pg_stat_statements` snapshots, and
 shared_preload_libraries = 'pg_stat_statements'` plus a restart, if not
 already configured) -- without it the capture fails loudly with
 `pg_stat_statements must be loaded via shared_preload_libraries` rather than
-silently producing a partial artifact set.
+silently producing a partial artifact set. The write-cost table additionally
+needs `pg_stat_statements.track = 'all'` (the harness sets this itself, for
+its own seeding session only, so no server-level configuration is required
+beyond the extension being loaded).

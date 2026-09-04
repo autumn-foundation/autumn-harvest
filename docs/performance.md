@@ -1164,18 +1164,20 @@ from the benchmark are directly comparable.
     [the queue-pause anti-join fix](#the-queue-pause-anti-join-fix).
   * **Worker sessions (#606)** — measured directly:
     `docs/performance-worker-sessions.md` seeds `session_id` and
-    `sticky_worker_id`/`sticky_until`/`sticky_timeout` via the real two-step
-    `INSERT`-then-`UPDATE` lifecycle `queue::enqueue()` actually performs (as
-    issue #606's hard-pin design always writes them) and finds a large real
-    buffer cost on the claim query — +124.8% on a single cold claim at the
-    10,000-row headline depth, though a real 10,001-call production-shaped
-    drain shows a much smaller +7.2% aggregate effect (the two diverge in
-    magnitude, not direction; see that page for the reclaim mechanism this
-    persona believes explains the gap). Mechanism: row-width growth compounded
-    by MVCC bloat from the second write, not a plan inefficiency — no
-    query-shape fix applies; see that page for the full measurement, including
-    why it does not isolate worker sessions from sticky routing's own
-    unmeasured cost.
+    `sticky_worker_id`/`sticky_until`/`sticky_timeout` via a per-row
+    `INSERT`-then-`UPDATE`-then-`COMMIT` lifecycle matching
+    `queue::enqueue()`'s real per-task write (as issue #606's hard-pin design
+    always writes them) and finds a real, moderate-to-large buffer cost on the
+    claim query — +32.9% on a single cold claim at the 10,000-row headline
+    depth, corroborated by a real 10,001-call production-shaped drain at
+    +22.1% (same order of magnitude, unlike an earlier bulk-transaction
+    capture this page's own history superseded). Mechanism: row-width growth
+    compounded by MVCC bloat from the second write, not a plan inefficiency —
+    no query-shape fix applies; see that page for the full measurement,
+    including why it does not isolate worker sessions from sticky routing's
+    own unmeasured cost, and an open question about seeding transaction
+    granularity for multi-activity decision fan-outs that a review round
+    raised but this pass did not chase down.
   * **`schedule_to_close` (#378)** — cheap inline column test, against a
     column the seed leaves null.
   * **Sticky routing (#235)** — still unmeasured on its own; see the scope
