@@ -296,17 +296,25 @@ only) -- this pass did not separately measure CPU cost.
   single bulk statement and N individually-executed statements sharing one
   transaction are two more distinct scenarios, not the same one, and no
   scenario matching "N individual `INSERT`/`UPDATE` statement pairs sharing
-  one transaction" has been captured. What can be said without a new capture:
-  the true cost for a multi-activity-per-decision fan-out lies **at or above**
-  this page's per-row-committed figures (+32.9% single-call / +22.1%
-  aggregate / +185.5% write-side), since batching can only remove reclaim
-  opportunities this fixture has, never add ones it lacks. How far above
-  depends on typical fan-out size (activities per decision), which this pass
-  does not have data on and did not attempt to estimate. Pinning down a
-  precise number needs a dedicated capture with a batched-transaction seeding
-  procedure at a stated, deliberately-chosen fan-out size -- left as future
-  work rather than chased through a further round of this pass, per this
-  persona's own floor on when to stop iterating.
+  one transaction" has been captured.
+
+  **Correction (review round 7):** an earlier revision of this bullet
+  claimed the batched-transaction cost is "at or above" this page's
+  per-row-committed figures, reasoning that batching only removes reclaim
+  opportunities. A review finding correctly caught that this does not follow:
+  batching also changes commit frequency, buffer reuse timing, relation
+  extension, and the hit-versus-read split the `+185.5%` write-side figure in
+  particular depends on (it counts `shared_blks_hit` only) -- any of which
+  could move the *ratio* between the two labels in either direction even if
+  batching increases *absolute* retained heap space. Retained space and the
+  measured percentage are not the same quantity, and this page conflated
+  them. The correct statement is narrower: **the direction of the
+  batched-transaction figures relative to this page's per-row ones is
+  unknown** without capturing them. Pinning that down needs a dedicated
+  capture with a batched-transaction seeding procedure at a stated,
+  deliberately-chosen fan-out size -- left as future work rather than chased
+  through a further round of this pass, per this persona's own floor on when
+  to stop iterating.
 - **The write-side cost recurs beyond enqueue, and this page only measures
   one instance of that recurrence.** See the correction in
   [Write-side cost](#write-side-cost): the wider row's rewrite cost is paid
@@ -316,6 +324,44 @@ only) -- this pass did not separately measure CPU cost.
   contribution the way `docs/performance-capability-labels.md` does for its
   own predicate, and it does not extend across a session task's full
   lifecycle (further heartbeats, a later completion).
+- **Every seeded row gets its own, unique `session_id`; production sessions
+  can group several member activities under one shared `session_id`.** A
+  review finding (round 7) correctly noted that a session with N member
+  activities has N task-queue rows carrying the *same* `session_id`, not N
+  distinct ones -- affecting both the `INSERT`/`UPDATE` locality this page
+  measures and the partial index on `harvest_task_queue.session_id`
+  (`WHERE state = 'PENDING' AND session_id IS NOT NULL`). This page's
+  fixture is scoped to the one-task-per-session case (each row a session of
+  size one) and does not model a shared-`session_id` cardinality. Left
+  undone for the same reason as the batch-transaction limitation above: a
+  representative group size is a production-usage question this pass has no
+  data to answer, not a bug to fix with an arbitrary guess.
+- **Seeded rows leave `workflow_exec_id` `NULL`; every real activity task
+  carries a real one.** A review finding (round 7, P1) correctly observed
+  that `worker.rs::build_activity_enqueue_plan` always sets
+  `params.workflow_exec_id = Some(exec_id.as_uuid())` for a scheduled
+  activity, and that `harvest_task_queue.workflow_exec_id` is a real,
+  FK-constrained column (`REFERENCES harvest_workflow_executions(id)`), so
+  seeding it would need real `harvest_workflow_executions` rows to reference,
+  not just a random UUID.
+  This is real, but it is **not specific to this page's fixture**: every
+  `ClaimGate` scenario's `seed_backlog()` in `claim_bench_support.rs` --
+  the shared harness underneath every published Ledger claim-path
+  measurement in this repo (`schedule_to_close`, capability labels,
+  concurrency-key, queue pauses, this page) -- omits `workflow_exec_id` for
+  its activity rows the same way. It is a harness-wide simplification, not
+  something this pass introduced, and both labels here omit it identically,
+  so the *delta* between `no-session` and `worker-session` is not biased by
+  it in either direction (the missing ~16 bytes and the resulting effect on
+  `idx_harvest_tq_workflow` maintenance apply equally to both). It could
+  still shift the *absolute* page-packing arithmetic for both labels
+  together (rows-per-page is not linear in row width, so adding the same
+  bytes to both sides is not guaranteed to leave every percentage exactly
+  unchanged). Fixing it properly means changing the shared
+  `seed_backlog()`/`db::seed()` helper, which would also move every other
+  published Ledger page's numbers -- a cross-cutting change out of scope for
+  a single-predicate measurement pass, not something to fix unilaterally
+  here.
 
 ## What shipped
 
