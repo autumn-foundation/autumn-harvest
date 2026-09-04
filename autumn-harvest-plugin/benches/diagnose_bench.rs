@@ -21,8 +21,11 @@
 //!
 //! This bench sweeps N (fan-out), M (fleet), and history length on the
 //! replay path, plus a single-pending-activity baseline as the control, and
-//! prints markdown-ready tables meant to be pasted into
-//! `docs/performance-diagnose-latency.md`.
+//! prints markdown-ready tables -- the source data
+//! `docs/performance-diagnose-latency.md` is built from. Section headings in
+//! the published doc are prose, not a verbatim paste of this bench's
+//! `println!` output; only the tables themselves are meant to transcribe
+//! directly.
 //!
 //! # Why this crate, not `autumn-harvest/benches/`
 //!
@@ -442,10 +445,19 @@ fn stats_from(mut samples_ms: Vec<f64>) -> LatencyStats {
     }
 }
 
-const WARMUP: usize = 10;
-const MEASURED: usize = 60;
-const REPLAY_WARMUP: usize = 5;
-const REPLAY_MEASURED: usize = 20;
+// `MIN_MEANINGFUL_SAMPLES` mirrors `claim_bench_support.rs`'s floor of the
+// same name: below 100 samples, nearest-rank p99 is `ceil(0.99n) == n` for
+// any n < 100 -- i.e. p99 is silently just `max` relabeled, not an
+// independent tail statistic. `MEASURED`/`REPLAY_MEASURED` are kept
+// comfortably above that floor so every published p99 in
+// `docs/performance-diagnose-latency.md` is a real (if still coarse: the
+// second-worst observation, per the same floor's own doc comment)
+// percentile rather than a relabeled max.
+const MIN_MEANINGFUL_SAMPLES: usize = 100;
+const WARMUP: usize = 15;
+const MEASURED: usize = 120;
+const REPLAY_WARMUP: usize = 15;
+const REPLAY_MEASURED: usize = 120;
 
 async fn run_scenario(
     app: &HarvestApiApp,
@@ -468,9 +480,20 @@ async fn run_scenario(
     stats_from(samples_ms)
 }
 
+/// Marks a row whose `n` fell below [`MIN_MEANINGFUL_SAMPLES`] with `‡`
+/// (`claim_bench.rs`'s convention) so a thin sample can never be silently
+/// transcribed into `docs/performance-diagnose-latency.md` and quoted as a
+/// steady-state number. Not expected to fire given [`MEASURED`]/
+/// [`REPLAY_MEASURED`] are both comfortably above the floor -- a defensive
+/// backstop, not the primary fix.
 fn print_row(label: &str, stats: LatencyStats) {
+    let flag = if stats.n < MIN_MEANINGFUL_SAMPLES {
+        " ‡"
+    } else {
+        ""
+    };
     println!(
-        "| {label} | {} | {:.2} | {:.2} | {:.2} | {:.2} |",
+        "| {label}{flag} | {} | {:.2} | {:.2} | {:.2} | {:.2} |",
         stats.n, stats.p50_ms, stats.p95_ms, stats.p99_ms, stats.max_ms
     );
 }
