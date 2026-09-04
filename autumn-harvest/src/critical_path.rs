@@ -18,6 +18,14 @@ pub struct CriticalPathResult {
     pub path_names: Vec<String>,
 }
 
+/// Below this many distinct `activity_durations` entries, [`CriticalPathAnalyzer::analyze`]
+/// resolves each task's duration via a linear scan of a flat slice instead of
+/// a `HashMap` probe; at or above it, scanning is worse (up to `O(tasks *
+/// names)` for a pathologically high-cardinality caller). See the doc
+/// comment at the scan's call site for the measured crossover this was set
+/// below.
+const LINEAR_SCAN_CARDINALITY_LIMIT: usize = 12;
+
 /// Analyzer to determine the critical path of a DAG.
 pub struct CriticalPathAnalyzer {
     dag: DagDefinition,
@@ -77,28 +85,46 @@ impl CriticalPathAnalyzer {
         // the SAME few keys once per task. Hashing a `String` key with
         // `HashMap`'s default SipHash on every one of those repeat lookups
         // measurably dominates `analyze`'s own cost (see
-        // `benches/critical_path_profile.rs`). `activity_durations` is
-        // realistically small (a workflow's distinct activity types,
-        // typically well under a hundred), so resolving it to a flat slice
-        // once per `analyze()` call and linear-scanning it per task trades
-        // one SipHash pass per task for a handful of short string
-        // comparisons — cheaper for this shape, and behaviorally identical
-        // since both `HashMap` and the collected slice hold each name at
-        // most once.
-        let duration_lookup: Vec<(&str, Duration)> = self
-            .activity_durations
-            .iter()
-            .map(|(name, &duration)| (name.as_str(), duration))
-            .collect();
+        // `benches/critical_path_profile.rs`).
+        //
+        // Measured crossover (standalone harness, `HashMap<String, Duration>`
+        // vs `Vec<(&str, Duration)>`, 80,000 lookups over
+        // `activity_shard_NNNN`-shaped keys, callgrind Ir): 8 names, linear
+        // 15.2M vs hash 26.0M; 16 names, roughly at parity (26.2M vs 26.0M);
+        // 24+ names, linear already loses (36.3M vs 26.0M, worsening linearly
+        // with cardinality). `LINEAR_SCAN_CARDINALITY_LIMIT` is set with
+        // margin below that measured parity point, so this optimization only
+        // ever engages where it is a clear win and always falls back to the
+        // original (never-worse-than-baseline) `HashMap` path otherwise.
+        // Behaviorally identical either way: both the `HashMap` and the
+        // collected slice hold each name at most once, so lookup results
+        // never change.
+        let duration_lookup: Option<Vec<(&str, Duration)>> =
+            (self.activity_durations.len() <= LINEAR_SCAN_CARDINALITY_LIMIT).then(|| {
+                self.activity_durations
+                    .iter()
+                    .map(|(name, &duration)| (name.as_str(), duration))
+                    .collect()
+            });
 
         for level in levels {
             for &task_index in level {
                 let task = &tasks[task_index];
                 let duration = task.start_to_close.unwrap_or_else(|| {
-                    duration_lookup
-                        .iter()
-                        .find(|(name, _)| *name == task.activity_name)
-                        .map_or(self.default_duration, |&(_, duration)| duration)
+                    duration_lookup.as_ref().map_or_else(
+                        || {
+                            self.activity_durations
+                                .get(&task.activity_name)
+                                .copied()
+                                .unwrap_or(self.default_duration)
+                        },
+                        |lookup| {
+                            lookup
+                                .iter()
+                                .find(|(name, _)| *name == task.activity_name)
+                                .map_or(self.default_duration, |&(_, duration)| duration)
+                        },
+                    )
                 });
 
                 // Find the maximum distance among upstreams
