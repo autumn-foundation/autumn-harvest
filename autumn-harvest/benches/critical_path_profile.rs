@@ -20,11 +20,15 @@
 //! part under profile, so the workload needs many (task, upstream-edge)
 //! pairs, not just many tasks. Activity durations are set via
 //! `mock_duration` (by name, the same API `dag_export`'s own tests and any
-//! real caller uses), which forces the analyzer's per-task
-//! `HashMap<String, Duration>` lookup path rather than the per-task
+//! real caller uses) for FIVE of the six activity types, which forces the
+//! analyzer's per-task name-keyed lookup path rather than the per-task
 //! `start_to_close` override shortcut — the common case for a caller
 //! comparing named-activity cost estimates rather than per-instance
-//! overrides.
+//! overrides. The sixth type is deliberately left unmocked so ~1/6 of tasks
+//! exercise the `default_duration` fallback (a lookup miss) every call,
+//! alongside the other five (hits) — ordinary usage, and the regime that
+//! bounds how large `CriticalPathAnalyzer::LINEAR_SCAN_CARDINALITY_LIMIT`
+//! can safely be (a miss must scan every candidate; a hit can stop early).
 //!
 //! `CRITICAL_PATH_PROFILE_STAGES` (default `40`) and
 //! `CRITICAL_PATH_PROFILE_WIDTH` (default `40`) size the DAG (`40×40` = 1,600
@@ -141,14 +145,20 @@ fn main() {
         "build_dag(stages={stages}, width={width}) should produce {expected_tasks} tasks"
     );
 
+    // Five of the six activity types are mocked; `checkpoint_shard` is
+    // deliberately left unmocked so ~1/6 of tasks exercise the
+    // `default_duration` fallback (a miss) on every `analyze()` call --
+    // ordinary usage (an operator typically has historical timing data for
+    // some activity types, not all), and the shape `analyze`'s duration
+    // lookup must stay correct and non-regressive under (see
+    // `CriticalPathAnalyzer`'s `LINEAR_SCAN_CARDINALITY_LIMIT` doc comment).
     let analyzer = CriticalPathAnalyzer::new(dag)
         .with_default_duration(Duration::from_millis(100))
         .mock_duration("extract_shard", Duration::from_millis(120))
         .mock_duration("transform_shard", Duration::from_millis(340))
         .mock_duration("validate_shard", Duration::from_millis(80))
         .mock_duration("enrich_shard", Duration::from_millis(210))
-        .mock_duration("load_shard", Duration::from_millis(150))
-        .mock_duration("checkpoint_shard", Duration::from_millis(30));
+        .mock_duration("load_shard", Duration::from_millis(150));
 
     let mut total_path_len = 0usize;
     for _ in 0..reps {

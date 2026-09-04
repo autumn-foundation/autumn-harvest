@@ -23,8 +23,13 @@ pub struct CriticalPathResult {
 /// a `HashMap` probe; at or above it, scanning is worse (up to `O(tasks *
 /// names)` for a pathologically high-cardinality caller). See the doc
 /// comment at the scan's call site for the measured crossover this was set
-/// below.
-const LINEAR_SCAN_CARDINALITY_LIMIT: usize = 12;
+/// below -- **the binding constraint is the miss (`default_duration`
+/// fallback) case, not the hit case**: a miss always scans every entry
+/// (no early exit is possible), while a hit terminates early on average, so
+/// the miss-case crossover is substantially lower and is what this limit
+/// must respect to guarantee "never worse than the `HashMap` baseline" for
+/// every caller, not just one with a 100%-hit-rate mock set.
+const LINEAR_SCAN_CARDINALITY_LIMIT: usize = 5;
 
 /// Analyzer to determine the critical path of a DAG.
 pub struct CriticalPathAnalyzer {
@@ -88,17 +93,30 @@ impl CriticalPathAnalyzer {
         // `benches/critical_path_profile.rs`).
         //
         // Measured crossover (standalone harness, `HashMap<String, Duration>`
-        // vs `Vec<(&str, Duration)>`, 80,000 lookups over
-        // `activity_shard_NNNN`-shaped keys, callgrind Ir): 8 names, linear
-        // 15.2M vs hash 26.0M; 16 names, roughly at parity (26.2M vs 26.0M);
-        // 24+ names, linear already loses (36.3M vs 26.0M, worsening linearly
-        // with cardinality). `LINEAR_SCAN_CARDINALITY_LIMIT` is set with
-        // margin below that measured parity point, so this optimization only
-        // ever engages where it is a clear win and always falls back to the
-        // original (never-worse-than-baseline) `HashMap` path otherwise.
-        // Behaviorally identical either way: both the `HashMap` and the
-        // collected slice hold each name at most once, so lookup results
-        // never change.
+        // vs `Vec<(&str, Duration)>`, 80,000 lookups, callgrind Ir), for BOTH
+        // regimes `activity_durations` traffic can be:
+        //
+        // - All-hit (every task's name is mocked), `activity_shard_NNNN`-shaped
+        //   keys: 8 names, linear 15.2M vs hash 26.0M; 16 names, roughly at
+        //   parity (26.2M vs 26.0M); 24+ names, linear already loses (36.3M vs
+        //   26.0M).
+        // - All-miss (`default_duration` fallback; same-length/shape keys so
+        //   `str` equality cannot short-circuit on length -- the honest worst
+        //   case, since a miss must walk every entry): 5 names, linear 17.8M
+        //   vs hash 23.3M; parity at 7 names (23.40M vs 23.41M); 8+ names,
+        //   linear already loses (26.0M vs 23.5M).
+        //
+        // The miss regime's crossover (~7) is the binding constraint, not the
+        // hit regime's (~16): a miss always scans every entry (no early exit
+        // is possible), so a caller that mocks only some of its activities --
+        // entirely ordinary usage, not a pathological input -- pays the
+        // miss cost on every unmocked task. `LINEAR_SCAN_CARDINALITY_LIMIT`
+        // is set with margin below the miss crossover, so this optimization
+        // only ever engages where it is a clear win under EITHER regime and
+        // always falls back to the original (never-worse-than-baseline)
+        // `HashMap` path otherwise. Behaviorally identical either way: both
+        // the `HashMap` and the collected slice hold each name at most once,
+        // so lookup results never change.
         let duration_lookup: Option<Vec<(&str, Duration)>> =
             (self.activity_durations.len() <= LINEAR_SCAN_CARDINALITY_LIMIT).then(|| {
                 self.activity_durations
