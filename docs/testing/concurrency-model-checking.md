@@ -2,7 +2,7 @@
 
 This note records an honest evaluation of three model-checking / simulation
 tools for harvest, and the resulting adoption decisions. The companion
-`loom.md` documents the loom workstream that this evaluation stands up now.
+[`loom.md`](loom.md) documents the loom workstream that this evaluation stands up now.
 
 The single most important framing fact, repeated throughout: **the large
 majority of harvest's concurrency is coordinated through Postgres** — `SELECT

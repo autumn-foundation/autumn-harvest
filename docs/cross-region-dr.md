@@ -6,7 +6,7 @@ procedure whose order is the safety argument.
 
 Failover is **operator-initiated**. There is no automatic promotion, no
 active-active writing, and no zero-RPO mode. This document is the topology and
-the design; `docs/runbooks/cross-region-failover.md` is the procedure you run
+the design; [`docs/runbooks/cross-region-failover.md`](runbooks/cross-region-failover.md) is the procedure you run
 during an incident.
 
 ---
