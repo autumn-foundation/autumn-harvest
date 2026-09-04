@@ -1139,40 +1139,23 @@ async fn list_workflows_ui(
         .as_ref()
         .map(|key| (key.clone(), search_attr_value.clone()));
 
-    let started_after = match params
-        .started_after
-        .as_deref()
-        .map(str::trim)
-        .filter(|v| !v.is_empty())
-    {
-        None => None,
-        Some(v) => Some(
-            DateTime::parse_from_rfc3339(v)
-                .map(|d| d.with_timezone(&Utc))
-                .map_err(|_| {
-                    AutumnError::bad_request_msg(format!(
-                        "invalid started_after: expected RFC 3339 (e.g. 2026-01-01T00:00:00Z), got '{v}'"
-                    ))
-                })?,
-        ),
-    };
-    let started_before = match params
-        .started_before
-        .as_deref()
-        .map(str::trim)
-        .filter(|v| !v.is_empty())
-    {
-        None => None,
-        Some(v) => Some(
-            DateTime::parse_from_rfc3339(v)
-                .map(|d| d.with_timezone(&Utc))
-                .map_err(|_| {
-                    AutumnError::bad_request_msg(format!(
-                        "invalid started_before: expected RFC 3339 (e.g. 2026-01-01T00:00:00Z), got '{v}'"
-                    ))
-                })?,
-        ),
-    };
+    // Issue: Wayfinder error-path audit. A mistyped date filter used to
+    // `AutumnError::bad_request_msg(...)?` straight past `render_filters`,
+    // stranding the operator on a generic error page that dropped every
+    // other filter (state, workflow_name, search attrs) they had already
+    // set. A bad date filter is now degraded to "ignored, with a banner
+    // naming the field and value" instead of aborting the whole page.
+    let mut date_filter_errors: Vec<String> = Vec::new();
+    let (started_after_raw, started_after) = parse_optional_date_filter(
+        params.started_after.as_deref(),
+        "started_after",
+        &mut date_filter_errors,
+    );
+    let (started_before_raw, started_before) = parse_optional_date_filter(
+        params.started_before.as_deref(),
+        "started_before",
+        &mut date_filter_errors,
+    );
     let exec_id_search = params
         .exec_id_search
         .as_deref()
@@ -1223,12 +1206,39 @@ async fn list_workflows_ui(
         state_filter.as_deref(),
         workflow_name_filter.as_deref(),
         search_attr_pair.as_ref(),
-        started_after,
-        started_before,
+        started_after_raw.as_deref(),
+        started_before_raw.as_deref(),
         exec_id_search.as_deref(),
         active_gate_count,
         &unavailable_shards,
+        &date_filter_errors,
     ))
+}
+
+/// Parse an optional RFC 3339 date-filter query param.
+///
+/// Returns the trimmed raw string (so a caller can redisplay/round-trip
+/// exactly what the operator typed, valid or not) alongside the parsed
+/// value, which is `None` both when the field was empty and when it failed
+/// to parse. A parse failure appends a human-readable message to `errors`
+/// rather than aborting the page — see the call site in `list_workflows_ui`.
+fn parse_optional_date_filter(
+    raw: Option<&str>,
+    field_label: &str,
+    errors: &mut Vec<String>,
+) -> (Option<String>, Option<DateTime<Utc>>) {
+    let Some(raw) = raw.map(str::trim).filter(|v| !v.is_empty()) else {
+        return (None, None);
+    };
+    match DateTime::parse_from_rfc3339(raw) {
+        Ok(parsed) => (Some(raw.to_string()), Some(parsed.with_timezone(&Utc))),
+        Err(_) => {
+            errors.push(format!(
+                "Ignored {field_label} value '{raw}': expected RFC 3339 (e.g. 2026-01-01T00:00:00Z)."
+            ));
+            (Some(raw.to_string()), None)
+        }
+    }
 }
 
 #[allow(clippy::too_many_lines)]
@@ -4156,6 +4166,7 @@ fn layout_workers(title: &str, body: &Markup, refresh: Option<u64>) -> Markup {
 }
 
 #[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments)]
 fn render_workflow_list(
     workflows: &[WorkflowExecution],
     page: i64,
@@ -4164,11 +4175,12 @@ fn render_workflow_list(
     state_filter: Option<&str>,
     workflow_name_filter: Option<&str>,
     search_attr_filter: Option<&(String, String)>,
-    started_after: Option<DateTime<Utc>>,
-    started_before: Option<DateTime<Utc>>,
+    started_after: Option<&str>,
+    started_before: Option<&str>,
     exec_id_search: Option<&str>,
     active_gate_count: usize,
     unavailable_shards: &[UnavailableShard],
+    date_filter_errors: &[String],
 ) -> Markup {
     // Issue #756: name the unreachable shard(s) so a partial list is not read
     // as the authoritative fleet state.
@@ -4202,6 +4214,13 @@ fn render_workflow_list(
                 @if active_gate_count == 1 { " gate is" } @else { " gates are" }
                 " blocking new workflow starts. "
                 a href="../admin/gates" { "Manage gates →" }
+            }
+        }
+
+        @if !date_filter_errors.is_empty() {
+            div class="banner Degraded" {
+                strong { "⚠ Some filters were ignored — " }
+                (date_filter_errors.join(" "))
             }
         }
 
@@ -4250,16 +4269,16 @@ fn render_filters(
     state_filter: Option<&str>,
     workflow_name_filter: Option<&str>,
     search_attr_filter: Option<&(String, String)>,
-    started_after: Option<DateTime<Utc>>,
-    started_before: Option<DateTime<Utc>>,
+    started_after: Option<&str>,
+    started_before: Option<&str>,
     exec_id_search: Option<&str>,
     limit: i64,
 ) -> Markup {
     let (attr_key, attr_value) =
         search_attr_filter.map_or(("", ""), |(k, v)| (k.as_str(), v.as_str()));
     let workflow_name_value = workflow_name_filter.unwrap_or("");
-    let started_after_value = started_after.map(|d| d.to_rfc3339()).unwrap_or_default();
-    let started_before_value = started_before.map(|d| d.to_rfc3339()).unwrap_or_default();
+    let started_after_value = started_after.unwrap_or("");
+    let started_before_value = started_before.unwrap_or("");
     let exec_id_search_value = exec_id_search.unwrap_or("");
 
     html! {
@@ -4320,8 +4339,8 @@ fn render_pagination(
     state_filter: Option<&str>,
     workflow_name_filter: Option<&str>,
     search_attr_filter: Option<&(String, String)>,
-    started_after: Option<DateTime<Utc>>,
-    started_before: Option<DateTime<Utc>>,
+    started_after: Option<&str>,
+    started_before: Option<&str>,
     exec_id_search: Option<&str>,
 ) -> Markup {
     let base_query = build_query_string(
@@ -4363,8 +4382,8 @@ fn build_query_string(
     state_filter: Option<&str>,
     workflow_name_filter: Option<&str>,
     search_attr_filter: Option<&(String, String)>,
-    started_after: Option<DateTime<Utc>>,
-    started_before: Option<DateTime<Utc>>,
+    started_after: Option<&str>,
+    started_before: Option<&str>,
     exec_id_search: Option<&str>,
 ) -> String {
     let mut out = String::new();
@@ -4382,10 +4401,10 @@ fn build_query_string(
         let _ = write!(out, "&search_attr_value={}", url_encode(value));
     }
     if let Some(after) = started_after {
-        let _ = write!(out, "&started_after={}", url_encode(&after.to_rfc3339()));
+        let _ = write!(out, "&started_after={}", url_encode(after));
     }
     if let Some(before) = started_before {
-        let _ = write!(out, "&started_before={}", url_encode(&before.to_rfc3339()));
+        let _ = write!(out, "&started_before={}", url_encode(before));
     }
     if let Some(search) = exec_id_search {
         let _ = write!(out, "&exec_id_search={}", url_encode(search));

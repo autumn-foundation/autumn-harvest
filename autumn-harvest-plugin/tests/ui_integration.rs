@@ -3949,6 +3949,50 @@ async fn list_page_has_time_range_filters() {
     );
 }
 
+/// Wayfinder error-path fix: a mistyped `started_after` on the workflow list
+/// used to `?`-abort straight to a generic error page, discarding every
+/// other filter (here, `workflow_name`) the operator had already set. It now
+/// renders `200 OK` on the *same* list page, applies the still-valid
+/// `workflow_name` filter, redisplays the invalid raw value in its own field
+/// (not silently blanked), and surfaces a banner naming which filter was
+/// ignored and why — so the operator can fix one field without retyping the
+/// rest of the query.
+#[tokio::test]
+async fn list_page_invalid_date_filter_preserves_other_filters_and_warns() {
+    let (database_url, _container) = setup_test_database_url().await;
+    insert_workflow_on_url(&database_url, ShardId::new(0), "onboarding", "keep-me").await;
+    insert_workflow_on_url(&database_url, ShardId::new(0), "other_flow", "drop-me").await;
+
+    let app = build_single_shard_ui_app(&database_url);
+    let (status, html) = fetch_html(
+        &app,
+        "/workflows?workflow_name=onboarding&started_after=not-a-date",
+    )
+    .await;
+
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "an invalid date filter should degrade gracefully, not abort the page: {html}"
+    );
+    assert!(
+        html.contains("onboarding"),
+        "the still-valid workflow_name filter should still be applied: {html}"
+    );
+    assert!(
+        !html.contains("other_flow"),
+        "the workflow_name filter should have excluded the non-matching workflow: {html}"
+    );
+    assert!(
+        html.contains("value=\"not-a-date\""),
+        "the invalid raw value should be redisplayed in the started_after field, not blanked: {html}"
+    );
+    assert!(
+        html.contains("Ignored started_after value 'not-a-date'"),
+        "a banner should name which filter was ignored and why: {html}"
+    );
+}
+
 /// Detail page event timestamps are displayed (not "—" for every row).
 #[tokio::test]
 async fn detail_page_event_timestamps_display() {
