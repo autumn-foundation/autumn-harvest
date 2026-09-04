@@ -207,7 +207,7 @@ Current implementation scope: `ExecutionId`/`ShardId` encoding, `ShardRouter`, `
 | `pool.rs` | 2 | Separate DB pool config: web pool + worker pool with shared ceiling, minimum guarantees |
 | `erase.rs` | 3.30 | Targeted PII erasure (issue #495): `ERASURE_TOMBSTONE_KEY`, `erasure_tombstone()`, `tombstone_payload_fields(event_value)` (pure, no-DB), `is_terminal_state(state)`, `EraseOutcome`/`SkippedChild`/`EraseFailure`; DB-gated `erase_workflow_payloads(conn, exec_id, reason)`. **Sanctioned in-place mutation exception** to the append-only invariant (alongside heartbeat checkpoints): only `data` field contents are mutated, never event structure. Terminal-only, irreversible, idempotent, cascades to terminal children on the same shard. |
 | `payload_store.rs` | 3.37 | Large-payload claim-check offloading (issue #524): `PayloadStore` async trait (embedder-supplied backend, no cloud client in core), `PayloadOffloader` (`offload_event_value`/`inflate_event_value`/`extract_offload_ref`/`refs_in_event_value`), reference-envelope + sha256 checksum helpers. Composes after `PayloadCodec`; no new `WorkflowEvent` variant. Store seam in `store.rs` (`append_events_offloaded`/`load_history_inflated`); GC via `harvest_payload_refs` (migration `20260627000001`). |
-| `completion_callback.rs` | 3.46 | Durable completion callbacks (issue #605): `validate_target_url`/`SsrfPolicy`/`HostAllowlist`/`SsrfRejection` (pure SSRF guard, HTTPS-only + allowlist-required by default), HMAC-SHA256 envelope signing (`build_envelope`/`sign`/`CallbackSecret`), `EventFilter`/`CallbackTarget`/`resolve_all_targets`/`resolve_effective_targets` (pure config resolution), boxed-future `CompletionCallbackDeliverer` trait (no HTTP client in core, mirrors `PayloadStore`/`HistoryArchiver`), `classify_outcome`/`OutcomeAction` (pure retry/backoff/dead-letter decision), `enqueue_completion_deliveries` (folded into `completion_trigger::evaluate_triggers_for_execution`'s existing terminal transaction), `fire_due_completion_deliveries` (two-transaction scanner folded into `timeout::enforce_timeouts_once`), `list_deliveries_for_execution`/`redrive_delivery` (management API), `GLOBAL_CALLBACK_CONFIG` static. New table `harvest_completion_deliveries` (migration `20260705000000`) plus `completion_callbacks jsonb NULL` on `harvest_workflow_executions`. No new `WorkflowEvent` variant, no replay impact. See `docs/completion-callbacks.md`. |
+| `completion_callback.rs` | 3.46 | Durable completion callbacks (issue #605): `validate_target_url`/`SsrfPolicy`/`HostAllowlist`/`SsrfRejection` (pure SSRF guard, HTTPS-only + allowlist-required by default), HMAC-SHA256 envelope signing (`build_envelope`/`sign`/`CallbackSecret`), `EventFilter`/`CallbackTarget`/`resolve_all_targets`/`resolve_effective_targets` (pure config resolution), boxed-future `CompletionCallbackDeliverer` trait (no HTTP client in core, mirrors `PayloadStore`/`HistoryArchiver`), `classify_outcome`/`OutcomeAction` (pure retry/backoff/dead-letter decision), `enqueue_completion_deliveries` (folded into `completion_trigger::evaluate_triggers_for_execution`'s existing terminal transaction), `fire_due_completion_deliveries` (two-transaction scanner folded into `timeout::enforce_timeouts_once`), `list_deliveries_for_execution`/`redrive_delivery` (management API), `GLOBAL_CALLBACK_CONFIG` static. New table `harvest_completion_deliveries` (migration `20260705000000`) plus `completion_callbacks jsonb NULL` on `harvest_workflow_executions`. No new `WorkflowEvent` variant, no replay impact. See [`docs/completion-callbacks.md`](completion-callbacks.md) (and the related [`docs/completion-triggers.md`](completion-triggers.md), which starts a *new* workflow on completion rather than calling out to a webhook). |
 | `update.rs` | 3.6 | Update primitive: `UpdateRegistry` (type-erased validators + async handlers), `BoxUpdateHandler`, `BoxUpdateValidator`. `WorkflowContext` methods: `register_update_handler`, `register_update_handler_no_validator`, `validate_update`, `execute_admitted_update`. `HistoryMatcher` methods: `match_update(update_id)`, `drain_admitted_updates()`. Error variants: `HarvestError::UpdateRejected`, `HarvestError::UpdateHandlerNotFound` |
 | `query.rs` | 3.10 | Query registry: `QueryRegistry`, `QueryHandler`. `WorkflowContext` methods: `register_query` (no-arg), `register_query_handler<Req,Resp>` (typed), `execute_query_with_args`, `list_query_names`. Error variants: `QueryHandlerNotFound`, `WorkflowNotRunning`, `QueryHandlerPanicked`, `QueryTimedOut`. `WorkerConfig::query_timeout` (default 5 s). `telemetry::METRIC_QUERY_DURATION` constant. No `WorkflowEvent` variants — queries leave zero footprint in `harvest_events`. |
 | `signal_handler.rs` | 3.42 | Push-based signal handler registry (issue #546): `SignalHandlerRegistry` (type-erased, synchronous, fire-and-forget, first-registration-wins), `BoxSignalHandler`, `invoke_signal_handler` (panic-safe invocation). `WorkflowContext` methods: `register_signal_handler<Req>` (typed), `register_signal_handler_raw` (untyped, storage-only, no inline dispatch), `list_signal_handler_names`. Dispatch runs through `WorkflowContext::pump_signal_handlers` (triggered by `match_history`'s post-hook, plus an executor-level `flush_pending_signal_handlers` backstop at end of cycle) and `HistoryMatcher::claim_pending_signal(name)`, a cursor-bound claim against `pending_signals` (populated by the same `prepare_match`/`drain_early_signals` sweep every other `match_*` call uses) — never a full-history scan — so a handler cannot fire ahead of an unconsumed activity/timer/etc. in history. Claims across all registered names are collected before any dispatch and sorted by event index, so cross-handler-name ordering always follows history order, not registration order. Marks claimed events consumed so `match_signal`/`wait_for_signal` never double-delivers the same event. No new `WorkflowEvent` variant — `SignalReceived` is reused. |
@@ -221,7 +221,7 @@ Current implementation scope: `ExecutionId`/`ShardId` encoding, `ShardRouter`, `
 | `metrics_rs_adapter.rs` | 4 | `metrics-rs` feature flag adapter: `MetricsRsRecorder` bridges `MetricsRecorder` → `metrics` crate global registry. See `docs/telemetry.md` for recipe. |
 | `poison_pill.rs` | 3.17 | Poison-pill task quarantine (issue #367): pure `quarantine_decision`/`ReclaimAction` (no DB dep), `orphaned_running_tasks_query` (worker-liveness reclaim, independent of per-task timeouts), `reclaim_orphaned_tasks` (increment `crash_strikes`, requeue-or-quarantine), `spawn_poison_pill_reclaimer`. Quarantine → `harvest_dead_letters` with `DeadLetterReason::PoisonPill` + terminal `WorkflowFailed` (no new event variant). `WorkerConfig::poison_pill_threshold` (default 3, 0 disables). Shard-local. |
 | `circuit_breaker.rs` | 3.18 | Per-activity circuit breaker (issue #369): `CircuitBreakerRegistry` (closed/open/half-open, rolling-window failure count, single half-open probe, `on_dispatch`/`on_result`, `force_open`/`force_close`, `snapshot`/`list`), `CircuitPhase`, `DispatchDecision`, `CircuitTransition`, `CircuitSnapshot`. Pure/in-process, per-shard; consulted by the worker before dispatch and shared with the management API via `HandlerRegistry::circuit_breakers()`. No new event variant, no migration. |
-| `slot_tuner.rs` | 3.42 | Adaptive worker dispatch-slot tuner (issue #548): `SlotTuner` trait, `DefaultSlotTuner` (pool-pressure shrink / saturated-and-waiting grow / hold), `SlotTunerConfig { min_slots, max_slots, tuner }` (`::new`/`::with_tuner`), pure helpers `initial_target`/`apply_action`/`validate_band`/`tuned_available`, `TunedSlotRuntime` (owns withheld `OwnedSemaphorePermit`s; `resize_toward`/`release_all_withheld`), `spawn_slot_tuner_loop`. Opt-in via `WorkerConfig::with_slot_tuner`; `None` (default) is byte-identical to the pre-#548 fixed-concurrency semaphore. No new event variant, no migration, no replay surface — purely an in-process semaphore control constructed inside `worker.rs::spawn_monitoring_tasks` (never stored on `Worker` itself, to avoid clippy's significant-drop propagation into every `Worker`-holding test). See `docs/operations/adaptive-slot-tuner.md`. |
+| `slot_tuner.rs` | 3.42 | Adaptive worker dispatch-slot tuner (issue #548): `SlotTuner` trait, `DefaultSlotTuner` (pool-pressure shrink / saturated-and-waiting grow / hold), `SlotTunerConfig { min_slots, max_slots, tuner }` (`::new`/`::with_tuner`), pure helpers `initial_target`/`apply_action`/`validate_band`/`tuned_available`, `TunedSlotRuntime` (owns withheld `OwnedSemaphorePermit`s; `resize_toward`/`release_all_withheld`), `spawn_slot_tuner_loop`. Opt-in via `WorkerConfig::with_slot_tuner`; `None` (default) is byte-identical to the pre-#548 fixed-concurrency semaphore. No new event variant, no migration, no replay surface — purely an in-process semaphore control constructed inside `worker.rs::spawn_monitoring_tasks` (never stored on `Worker` itself, to avoid clippy's significant-drop propagation into every `Worker`-holding test). See [`docs/operations/adaptive-slot-tuner.md`](operations/adaptive-slot-tuner.md). |
 | `migrations/` | 1 | SQL -- run with `diesel migration run` |
 
 ### Macro Modules (`autumn-harvest-macros`)
@@ -1502,7 +1502,12 @@ cargo bench -p autumn-harvest --features testing --no-default-features --bench r
 
 # Macro tests
 cargo test -p autumn-harvest-macros
+
+# Docs corpus audits (link check, orphan scan; wired into CI's lint job)
+python3 docs/audits/corpus-link-check.py
 ```
+
+See [`docs/audits/README.md`](audits/README.md) for what each docs audit script checks.
 
 ### Testing workflow code changes with WorkflowReplayer
 
@@ -1534,6 +1539,23 @@ Key types: `WorkflowReplayer`, `ReplayReport`, `ReplayStatus`, `NonDeterminismKi
 `HistorySnapshot` (the JSON round-trip format).  See `src/testing.rs` and
 `tests/replayer_tests.rs` for examples.
 
+### Deeper test methodology
+
+Beyond `cargo test`/`cargo bench` and `WorkflowReplayer`, four notes cover the
+randomized- and model-checking-based testing layers:
+
+* [`docs/testing/property-and-fuzz.md`](testing/property-and-fuzz.md) —
+  `proptest` property tests and fuzzing, the two complementary randomized-testing
+  layers.
+* [`docs/testing/chaos.md`](testing/chaos.md) — the deterministic,
+  seedable fault-injection harness (issue #940) that kills workers, injects
+  Diesel/connection errors, and drops `LISTEN`/`NOTIFY` wakes at named points
+  in the production code path.
+* [`docs/testing/loom.md`](testing/loom.md) — permutation-testing
+  concurrent Rust with [Loom](https://github.com/tokio-rs/loom).
+* [`docs/testing/concurrency-model-checking.md`](testing/concurrency-model-checking.md)
+  — the evaluation of loom / Shuttle / Turmoil behind the loom adoption above.
+
 ---
 
 ## Design Decisions (Phase 2)
@@ -1548,7 +1570,7 @@ Worker pool and web pool are independently sized but share a total connection ce
 `WorkflowContext::version()` emits a `VersionMarker` event on first live call and replays the recorded version on subsequent runs. This allows workflow code to branch on version (`if ctx.version() >= 2 { ... }`) to handle non-determinism across deploys without breaking replay of in-flight executions.
 
 **DD-4: Basic in-process LRU cache**
-`WorkflowCache` is a bounded LRU cache for workflow state, keyed by `ExecutionId`. It is wired into the worker hot path (Phase 3.11 / issue #235): on a cache hit the worker loads only delta events since the last suspension (`store::load_history_since`) rather than the full history. Sticky cross-worker routing (ensuring follow-up tasks prefer the owning worker) is enabled via `WorkerConfig::with_sticky_routing`. See `docs/sticky-routing.md`.
+`WorkflowCache` is a bounded LRU cache for workflow state, keyed by `ExecutionId`. It is wired into the worker hot path (Phase 3.11 / issue #235): on a cache hit the worker loads only delta events since the last suspension (`store::load_history_since`) rather than the full history. Sticky cross-worker routing (ensuring follow-up tasks prefer the owning worker) is enabled via `WorkerConfig::with_sticky_routing`. See [`docs/sticky-routing.md`](sticky-routing.md).
 
 ---
 

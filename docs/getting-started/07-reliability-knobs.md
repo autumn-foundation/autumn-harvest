@@ -8,7 +8,10 @@ These come up in roughly the order you'll need them.
 
 **Retries that aren't exponential.** Use `RetryPolicy::fixed(attempts, delay)`
 for a flat retry, or build a `RetryPolicy` directly when you need a custom
-shape (max interval, backoff coefficient, non-retryable error filters).
+shape (max interval, backoff coefficient, non-retryable error filters). For
+retry-storm avoidance across many concurrent executions, see
+[`docs/retry-jitter.md`](../retry-jitter.md) — deterministic, opt-in jitter via
+`RetryPolicy::jitter` that replays identically.
 
 **A fleet-wide reliability floor (builder-default retry / `start_to_close`).**
 Instead of repeating the same `retry = …` / `start_to_close = …` on every

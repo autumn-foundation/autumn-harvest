@@ -43,4 +43,4 @@ retirement of an old key is refused until a fail-closed per-shard census proves
 zero remaining rows. The sweep mutates `harvest_events.event_data` in place —
 **sanctioned exception #3**, see `CLAUDE.md` — changing only the ciphertext bytes
 inside payload fields, with a compare-and-swap that makes it lose any race
-against PII erasure. See `docs/operations/codec-key-rotation.md`.
+against PII erasure. See [`docs/operations/codec-key-rotation.md`](../operations/codec-key-rotation.md).
