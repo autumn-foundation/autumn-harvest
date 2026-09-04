@@ -19,18 +19,24 @@ published budget). See issue #1194 for the full argument.
 ## TL;DR
 
 * **`p95 < 500 ms` holds, confirmed with numbers — not replaced with a
-  bound.** Every measured shape below, including the combined worst case,
-  comes in at least an order of magnitude under the published budget.
+  bound.** Every measured shape below clears the budget; margins range from
+  ~8x (the longest replay history) to over 100x (the single-activity
+  baseline).
+* **The replay path produces the largest numbers on this page and the
+  smallest margin.** 10,001 replayed events: p95 61.06 ms, max 65.04 ms —
+  only ~8x under the 500 ms budget, and ~82x under the 5 s `query_timeout`
+  that bounds it. Cost grows **linearly** in event count here (see
+  [known limitations](#known-limitations) for the slope), not
+  super-linearly — an earlier draft of this page mischaracterized the
+  trend by comparing ratios of totals instead of incremental slopes, which
+  hides a large fixed per-request overhead and makes a linear trend look
+  like it's accelerating.
 * **The combined fan-out x fleet worst case (1000 pending activities x 1000
-  live workers) is the single largest number on this page: p95 34.44 ms,
-  p99 34.87 ms.** Still ~14x under budget. Measured directly, not
-  extrapolated from the independent sweeps — see
-  [why that distinction matters](#why-a-combined-scenario).
-* **The replay path is the fastest-growing driver, but nowhere near
-  dominant at these scales.** 10,001 replayed events: p95 61.06 ms — ~8x
-  under budget and ~82x under the 5 s `query_timeout` that bounds it. See
-  [known limitations](#known-limitations) for where this page's numbers stop
-  and where growth trend, not headroom, is the caveat.
+  live workers) is the largest number driven by the O(N x M) eligibility
+  fold specifically: p95 34.44 ms, p99 34.87 ms — ~14x under budget**, and
+  measured directly rather than extrapolated from the independent sweeps —
+  see [why that distinction matters](#why-a-combined-scenario). It is not
+  the largest number on the page overall; the replay path's is.
 * **No tighter per-request deadline than `query_timeout` (5 s default) is
   warranted for this endpoint specifically**, based on the measured range —
   see [the query_timeout question](#does-diagnose-need-a-tighter-deadline-than-query_timeout).
@@ -128,16 +134,19 @@ neither).
 
 **Yes, confirmed with a number.** Every scenario measured on this page —
 including the combined fan-out x fleet worst case and the longest replay
-history tested — reports p95 comfortably under the 500 ms budget, by at
-least an order of magnitude in every case. Issue #809's claim stands as
-measured, not merely as argued.
+history tested — reports p95 under the 500 ms budget. The margin varies by
+shape: over 100x at the baseline control, down to ~8x at the longest
+replay history (10,001 events) — see
+[the query_timeout question](#does-diagnose-need-a-tighter-deadline-than-query_timeout)
+for that shape specifically. Issue #809's claim stands as measured, not
+merely as argued.
 
 ## Does `/diagnose` need a tighter deadline than `query_timeout`?
 
-**No, not based on the measured range.** The replay path is the fastest
-proportional grower of the three drivers, but at the largest tested history
-(10,001 events — the same reference size issue #135 uses for the
-CPU-path replay budget) it costs 61.06 ms p95, roughly **82x** under the 5 s
+**No, not based on the measured range.** The replay path produces the
+largest numbers on this page, but at the largest tested history (10,001
+events — the same reference size issue #135 uses for the CPU-path replay
+budget) it costs 61.06 ms p95, roughly **82x** under the 5 s
 `query_timeout` that already bounds it and roughly **8x** under the 500 ms
 diagnose budget. There is no evidence in this data that the existing
 deadline is too loose for this endpoint specifically. See
@@ -147,13 +156,20 @@ meaningfully past what is measured here.
 
 ## Known limitations
 
-* **Growth on the replay path trends super-linear across the tested
-  range**, not strictly linear in event count: 21→201 events (~10x) costs
-  ~1.3x p95; 201→2001 (~10x) costs ~3.2x; 2001→10,001 (~5x) costs ~4.0x.
-  The tested range stays far under budget throughout, but this page does
-  not claim the trend holds at histories longer than 10,001 events — only
-  that it holds up to that point, which already matches issue #135's own
-  reference scale for replay cost.
+* **Growth on the replay path is linear in event count across the tested
+  range, once fixed per-request overhead is accounted for** — not
+  super-linear. The incremental slope between each pair of adjacent sweep
+  points is nearly constant: 21→201 events costs 0.00572 ms/event,
+  201→2001 costs 0.00577 ms/event, 2001→10,001 costs 0.00574 ms/event.
+  (An earlier draft of this page compared ratios of *total* latency across
+  10x/10x/5x jumps in event count instead of these incremental slopes,
+  which made a linear trend look like it was accelerating — the ratios
+  grow because a roughly constant ~3.6 ms fixed cost per request is a
+  shrinking fraction of the total as event count grows, not because the
+  per-event marginal cost is increasing.) This page does not claim the
+  linear trend holds at histories longer than 10,001 events — only that it
+  holds up to that point, which already matches issue #135's own reference
+  scale for replay cost.
 * **The combined worst-case scenario uses tasks and workers with no
   `required_build_id`, `required_capabilities`, or worker sessions set.**
   `eligible_worker_ids` has additional per-candidate branches for those
