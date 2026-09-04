@@ -70,14 +70,35 @@ impl CriticalPathAnalyzer {
         let mut distances = vec![Duration::ZERO; tasks.len()];
         let mut predecessors = vec![None; tasks.len()];
 
+        // `activity_durations` is keyed by activity NAME, not by task, so a
+        // DAG whose tasks reuse a small set of activity types (a wide
+        // fan-out map stage running the same handful of activities, the
+        // common case `mock_duration`'s own doc example matches) looks up
+        // the SAME few keys once per task. Hashing a `String` key with
+        // `HashMap`'s default SipHash on every one of those repeat lookups
+        // measurably dominates `analyze`'s own cost (see
+        // `benches/critical_path_profile.rs`). `activity_durations` is
+        // realistically small (a workflow's distinct activity types,
+        // typically well under a hundred), so resolving it to a flat slice
+        // once per `analyze()` call and linear-scanning it per task trades
+        // one SipHash pass per task for a handful of short string
+        // comparisons — cheaper for this shape, and behaviorally identical
+        // since both `HashMap` and the collected slice hold each name at
+        // most once.
+        let duration_lookup: Vec<(&str, Duration)> = self
+            .activity_durations
+            .iter()
+            .map(|(name, &duration)| (name.as_str(), duration))
+            .collect();
+
         for level in levels {
             for &task_index in level {
                 let task = &tasks[task_index];
                 let duration = task.start_to_close.unwrap_or_else(|| {
-                    self.activity_durations
-                        .get(&task.activity_name)
-                        .copied()
-                        .unwrap_or(self.default_duration)
+                    duration_lookup
+                        .iter()
+                        .find(|(name, _)| *name == task.activity_name)
+                        .map_or(self.default_duration, |&(_, duration)| duration)
                 });
 
                 // Find the maximum distance among upstreams
