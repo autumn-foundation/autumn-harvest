@@ -1202,13 +1202,16 @@ from the benchmark are directly comparable.
     canonical filenames each time -- so that page states only the one
     auditable, committed number (**+15.5%**), without asserting a range, a
     frequency, or a direction (e.g. "always positive") for runs whose
-    evidence no longer exists in the repository to audit. A markedly more expensive plan
-    at the 100,000-row depth was also observed on earlier, pre-fix runs of
-    this capture (never on the unpopulated side) but not on either
-    fully-fixed run; that page's "100,000-row plan choice" section explains
-    why it does not assert a frequency for this, including why an earlier
-    revision's "N of M runs" framing had to be walked back once those
-    runs' artifacts were no longer available to audit.
+    evidence no longer exists in the repository to audit. The committed run
+    also shows a markedly cheaper plan at the 100,000-row depth (a plain
+    `Seq Scan`) than a more expensive one this capture's development runs
+    sometimes hit before the seeding and `ANALYZE` fixes landed; that page's
+    "100,000-row plan choice" section explains why it asserts no frequency,
+    ratio, or before/after count for this, including why an earlier
+    revision's "N of M runs" framing, and later a spelled-out
+    sample-of-two-against-two restating the same statistic in prose, both
+    had to be walked back once those runs' artifacts were no longer
+    available to audit.
   * **Worker sessions (#606), sticky routing (#235)** — still cheap inline
     column tests, against columns the seed leaves null; not yet measured.
 

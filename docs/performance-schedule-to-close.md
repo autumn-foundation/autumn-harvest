@@ -352,31 +352,32 @@ TL;DR), so the alternative plan is strictly worse here, not a genuine
 optimization the planner found.
 
 This page does **not** assert how often that expensive plan recurs, or
-whether it is more or less likely now that the seeding bug (a single
-byte-identical index key across all 10,000 rows, fixed in
-[Workload](#workload)) is fixed -- Codex review pointed out that an earlier
-revision's "2 of 3 runs" and later "2 of 4 runs" framing asserted exactly
-that kind of statistic from runs whose artifacts are no longer committed to
-the repository and cannot be independently audited. What can be said
-honestly: the two runs that showed the expensive plan both predated *every*
-fix in [Workload](#workload) (the degenerate constant-key seeding included,
-which is exactly the kind of thing that can distort planner statistics into
-unrepresentative territory), and it was not observed in either of the two
-runs that had the seeding fix applied, including this committed one. That
-is consistent with the seeding bug being part or all of the explanation,
-but it is a sample of two against two, confounded with the `ANALYZE` fix
-landing at the same time, and this page does not have the evidence to
-distinguish "the seeding bug caused it" from "it was never that likely to
-begin with." **This remains a risk worth being aware of at large backlog
-depths for deployments that populate `schedule_to_close_at`**, not a
-proposed fix target: there is no schema or query change on offer that
-would pin the planner's choice without the "planner-disabling flags...
-outside a diagnostic session" this repo's rules ban, and extended
-statistics or a planner hint would be a schema/config change outside this
-pass's scope (this repo's "ask before" list). A future pass with the
-budget for many more repeated, fully-fixed runs -- each with its own
-committed artifacts -- could turn this into an actual frequency estimate;
-this one cannot.
+under what conditions. Codex review caught this claim leaking back in
+twice: first as an explicit "2 of 3 runs" / "2 of 4 runs" framing, and
+then again -- after that framing was removed -- as a spelled-out "two
+runs ... predated every fix ... not observed in either of the two runs
+that had the seeding fix applied" sample-of-two-against-two, which is the
+identical statistic in prose instead of a fraction, sourced from the same
+runs whose artifacts this page's "On reproducibility" note above says are
+gone. The only fact this page can support from the repository as it
+stands: the committed run used a plain `Seq Scan` and landed on the cheap
+delta above. During this pass, before the seeding and `ANALYZE` fixes in
+[Workload](#workload) landed, development runs of this same capture
+sometimes hit the more expensive plan described above instead -- which is
+the reason it's documented here, and the reason the seeding bug (a single
+byte-identical index key across all 10,000 rows) is flagged below as a
+plausible contributing factor -- but none of those runs' plan output
+survives to audit, so this page counts none of them and draws no
+frequency, ratio, or before/after conclusion from them. **This remains a
+risk worth being aware of at large backlog depths for deployments that
+populate `schedule_to_close_at`**, not a proposed fix target: there is no
+schema or query change on offer that would pin the planner's choice
+without the "planner-disabling flags... outside a diagnostic session"
+this repo's rules ban, and extended statistics or a planner hint would be
+a schema/config change outside this pass's scope (this repo's "ask
+before" list). A future pass with the budget for many more repeated,
+fully-fixed runs -- each with its own committed artifacts -- could turn
+this into an actual frequency estimate; this one cannot.
 
 ### Corroboration: `pg_stat_statements` over the real claim-drain
 
