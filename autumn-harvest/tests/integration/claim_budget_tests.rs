@@ -2764,10 +2764,29 @@ async fn zz_capture_worker_session_claim_evidence() {
 
         for label in ["no-session", "worker-session"] {
             if label == "worker-session" {
-                // Re-seed FRESH with `session_id`/`sticky_worker_id` populated
-                // at INSERT time -- see the doc comment above for why this
-                // avoids the UPDATE-bloat artifact the capability-labels
-                // capture documented and fixed.
+                // Re-seed to match `queue::enqueue()`'s REAL two-step write
+                // lifecycle for a worker-session activity (review finding on
+                // PR #1358 caught the first cut of this capture writing all
+                // three sticky columns directly in the seed `INSERT`, which
+                // is not how production writes them -- see the harness note
+                // in docs/performance-worker-sessions.md for the full
+                // correction). `NewTaskQueueItem` hardcodes
+                // `sticky_worker_id`/`sticky_until`/`sticky_timeout` to `NULL`
+                // regardless of `EnqueueParams` (`queue.rs`'s `enqueue()`);
+                // only `session_id` is written at `INSERT` time. The three
+                // sticky columns are set by a SEPARATE `UPDATE` immediately
+                // after, run only when `sticky_worker_id`/`sticky_timeout` are
+                // both set on `EnqueueParams` -- exactly what
+                // `worker.rs`'s session-member dispatch does (`params.session_id
+                // = Some(..); params.sticky_worker_id = Some(host_worker_id);
+                // params.sticky_timeout = Some(SESSION_MEMBER_STICKY_TIMEOUT)`,
+                // 24 hours). Reproduced here as one `INSERT` (session_id only)
+                // followed by one bulk `UPDATE` covering every seeded row --
+                // matching the final column CONTENTS and the two-statement
+                // WRITE SHAPE production uses, though not exactly its
+                // PER-ROW-transaction commit pattern (see the write-side
+                // section of the doc for why the resulting figure is reported
+                // as an upper bound, not an exact production number).
                 diesel::sql_query("TRUNCATE harvest_task_queue")
                     .execute(&mut conn)
                     .await
@@ -2777,11 +2796,10 @@ async fn zz_capture_worker_session_claim_evidence() {
                        (queue_name, task_type, activity_name, activity_id, input, \
                         state, priority, max_attempts, scheduled_at, \
                         required_build_id, concurrency_key, concurrency_cap, \
-                        rate_limit_key, sticky_worker_id, sticky_until, session_id) \
+                        rate_limit_key, session_id) \
                      SELECT '{}-q-' || (i % {}), 'activity', '{}', \
                             gen_random_uuid(), '{{}}'::jsonb, 'PENDING', 0, 3, \
                             NOW() - INTERVAL '1 second', NULL, NULL, NULL, NULL, \
-                            {worker_literal}, NOW() + INTERVAL '1 hour', \
                             gen_random_uuid() \
                      FROM generate_series(0, {}) AS s(i)",
                     db::BENCH_PREFIX,
@@ -2791,7 +2809,20 @@ async fn zz_capture_worker_session_claim_evidence() {
                 ))
                 .execute(&mut conn)
                 .await
-                .expect("re-seed rows carrying session_id/sticky_worker_id from birth");
+                .expect("re-seed rows carrying session_id from birth");
+                diesel::sql_query(format!(
+                    "UPDATE harvest_task_queue \
+                     SET sticky_worker_id = {worker_literal}, \
+                         sticky_until = NOW() + INTERVAL '24 hours', \
+                         sticky_timeout = INTERVAL '24 hours' \
+                     WHERE session_id IS NOT NULL"
+                ))
+                .execute(&mut conn)
+                .await
+                .expect(
+                    "hard-pin the freshly-inserted rows via the same follow-up \
+                     UPDATE queue::enqueue() issues in production",
+                );
                 diesel::sql_query("ANALYZE harvest_task_queue")
                     .execute(&mut conn)
                     .await
@@ -2877,9 +2908,11 @@ async fn zz_capture_worker_session_claim_evidence() {
         let queues = db::queue_names(headline);
 
         if label == "worker-session" {
-            // Same fix as the backlog-sweep loop above: re-seed fresh with
-            // `session_id`/`sticky_worker_id` populated at INSERT time instead
-            // of UPDATE-ing the just-seeded rows.
+            // Same fix as the backlog-sweep loop above: reproduce
+            // `queue::enqueue()`'s real two-step write (an `INSERT` carrying
+            // only `session_id`, then a separate `UPDATE` setting
+            // `sticky_worker_id`/`sticky_until`/`sticky_timeout`) rather than
+            // writing all three sticky columns directly in the seed `INSERT`.
             diesel::sql_query("TRUNCATE harvest_task_queue")
                 .execute(&mut stats_conn)
                 .await
@@ -2889,11 +2922,10 @@ async fn zz_capture_worker_session_claim_evidence() {
                    (queue_name, task_type, activity_name, activity_id, input, \
                     state, priority, max_attempts, scheduled_at, \
                     required_build_id, concurrency_key, concurrency_cap, \
-                    rate_limit_key, sticky_worker_id, sticky_until, session_id) \
+                    rate_limit_key, session_id) \
                  SELECT '{}-q-' || (i % {}), 'activity', '{}', \
                         gen_random_uuid(), '{{}}'::jsonb, 'PENDING', 0, 3, \
                         NOW() - INTERVAL '1 second', NULL, NULL, NULL, NULL, \
-                        {worker_literal}, NOW() + INTERVAL '1 hour', \
                         gen_random_uuid() \
                  FROM generate_series(0, {}) AS s(i)",
                 db::BENCH_PREFIX,
@@ -2903,7 +2935,20 @@ async fn zz_capture_worker_session_claim_evidence() {
             ))
             .execute(&mut stats_conn)
             .await
-            .expect("re-seed headline backlog carrying session_id/sticky_worker_id from birth");
+            .expect("re-seed headline backlog carrying session_id from birth");
+            diesel::sql_query(format!(
+                "UPDATE harvest_task_queue \
+                 SET sticky_worker_id = {worker_literal}, \
+                     sticky_until = NOW() + INTERVAL '24 hours', \
+                     sticky_timeout = INTERVAL '24 hours' \
+                 WHERE session_id IS NOT NULL"
+            ))
+            .execute(&mut stats_conn)
+            .await
+            .expect(
+                "hard-pin the freshly-inserted headline backlog via the same \
+                 follow-up UPDATE queue::enqueue() issues in production",
+            );
             diesel::sql_query("ANALYZE harvest_task_queue")
                 .execute(&mut stats_conn)
                 .await
