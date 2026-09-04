@@ -140,10 +140,26 @@ Both states are captured for `EXPLAIN (ANALYZE, BUFFERS, VERBOSE, SETTINGS,
 TIMING OFF)` on `claim_task_query()` at each of the published `BACKLOG_SWEEP`
 depths (1,000 / 10,000 / 100,000), and for a full `pg_stat_statements` drain
 of the real async `queue::claim_task()` function (not literal-substituted
-SQL) against the 10,000-row/4-queue headline scenario, claiming every row one
-call at a time -- plus a `pg_stat_user_tables`/`pg_relation_size` snapshot of
-`harvest_task_queue` immediately before and immediately after that same
-drain, to see whether any aggregate delta is driven by MVCC bloat
+SQL) against the headline scenario's 10,000-row/4-queue backlog shape,
+claiming every row one call at a time through a **single connection,
+serially** -- not the headline scenario's 8 concurrent claimers
+(`headline_scenario().claimers`, unused by this drain). Codex review on PR
+#1339 (P2) correctly flagged an earlier revision's "against the ...
+headline scenario" phrasing as overclaiming a match this drain doesn't
+attempt: concurrent claimers could contend on the same
+`harvest_task_queue_schedule_to_close_idx` leaf pages this predicate's
+extra write touches, in a way a serial drain never exercises. This
+capture's serial-drain shape matches the established convention the
+sibling `zz_capture_capability_labels_claim_evidence` and
+`zz_capture_concurrency_key_claim_evidence` captures already use for their
+own `pg_stat_statements` snapshots -- reusing it here for consistency
+rather than inventing a new shape -- but it means this page's aggregate
+number is a serial per-claim cost accumulated over a full drain, not a
+concurrent-load measurement, and should be read that way.
+
+The drain is also paired with a `pg_stat_user_tables`/`pg_relation_size`
+snapshot of `harvest_task_queue` immediately before and immediately after
+that same drain, to see whether any aggregate delta is driven by MVCC bloat
 accumulating over the drain itself rather than by row width alone (a
 single-call EXPLAIN, seeded fresh and rolled back inside a transaction, can
 never observe that: it never accumulates dead tuples). The drain also
@@ -312,10 +328,13 @@ To check whether the `EXPLAIN` deltas hold under the actual claim workload
 -- repeated `claim_task()` calls draining the backlog one row at a time, as
 production does -- the harness drives the real async
 `queue::claim_task(...)` function 10,001 times (10,000 successful claims plus
-one final empty poll) against the 10,000-row/4-queue headline scenario at
-each data state and snapshots `pg_stat_statements` afterward (artifacts, the
-committed run:
-`docs/perf-artifacts/schedule-to-close-claim-predicate/{no-schedule-to-close,schedule-to-close}-pg_stat_statements.txt`):
+one final empty poll) through a single connection, serially, against the
+headline scenario's 10,000-row/4-queue backlog shape at each data state and
+snapshots `pg_stat_statements` afterward (artifacts, the committed run:
+`docs/perf-artifacts/schedule-to-close-claim-predicate/{no-schedule-to-close,schedule-to-close}-pg_stat_statements.txt`).
+**This does not exercise the headline scenario's 8 concurrent claimers** --
+see [Workload](#workload) for why, and for the same limitation in the
+sibling capability-labels and concurrency-key captures this one follows:
 
 | no-schedule-to-close avg/call | schedule-to-close avg/call | delta % |
 |---:|---:|---:|
