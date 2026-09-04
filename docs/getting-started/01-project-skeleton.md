@@ -45,15 +45,17 @@ A few things worth knowing:
   anything it cannot show to be a local database: a non-loopback host, a DSN
   demanding TLS, or a known hosted-Postgres endpoint are all rejected outright.
   Its banner says it is not for production on every start.
-- **It refuses to run as `root`.** PostgreSQL will not run as root, by
-  design, so `cargo dev` checks for that up front and stops before creating
+- **It refuses to run as `root` — when provisioning its own cluster.**
+  PostgreSQL will not run as root, by design, so `cargo dev`'s default,
+  managed-cluster path checks for that up front and stops before creating
   anything. This is a real situation, not a hypothetical: Docker
   devcontainers, many CI base images, and some cloud sandboxes default to a
-  root shell. If that's you, either run as an ordinary user, or skip the
-  managed cluster entirely and use [the bring-your-own-Postgres
-  path](#bring-your-own-postgres) below (or `cargo run -p quickstart`,
-  [Chapter 1's sibling example](../../examples/quickstart/)) — both run
-  Postgres in its own process or container, so root has no bearing on them.
+  root shell. The check is scoped to provisioning, so it does not apply once
+  there is nothing to provision: point `cargo dev` at a database you already
+  have with `HARVEST_DEV_DATABASE_URL` (below) and it runs fine as root. So
+  does [the bring-your-own-Postgres path](#bring-your-own-postgres) below,
+  and `examples/quickstart`'s own `docker compose` + `cargo run -p
+  quickstart` steps — none of them ask `cargo dev` to provision anything.
 - **It does not need Postgres installed.** `cargo dev` enables the
   `dev-runtime-managed` feature, which downloads a platform-matched PostgreSQL
   build into a per-user cache the first time you run it (about 30 MB, once). If
