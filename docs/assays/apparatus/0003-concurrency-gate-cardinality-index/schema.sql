@@ -10,10 +10,14 @@ CREATE TABLE harvest_task_queue (
     scheduled_at     TIMESTAMPTZ NOT NULL,
     concurrency_key  TEXT,
     concurrency_cap  INT,
-    worker_id        TEXT
+    worker_id        TEXT,
+    last_heartbeat_at TIMESTAMPTZ
 );
 
 -- Mirrors autumn-harvest/migrations/20260409000000_harvest_initial/up.sql
 CREATE INDEX idx_harvest_tq_poll ON harvest_task_queue
     (queue_name, state, priority DESC, scheduled_at)
     WHERE state = 'PENDING';
+CREATE INDEX idx_harvest_tq_running ON harvest_task_queue
+    (state, last_heartbeat_at)
+    WHERE state = 'RUNNING';

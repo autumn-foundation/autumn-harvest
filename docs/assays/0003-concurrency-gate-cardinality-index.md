@@ -1,4 +1,4 @@
-# ⛏️ Prospect: does a partial index fix the concurrency gate's high-cardinality cost? (kill: 20,137 vs 50-buffer idle line, ledger #3)
+# ⛏️ Prospect: does a partial index fix the concurrency gate's high-cardinality cost? (kill: 10,137 vs 50-buffer idle line, ledger #3)
 
 > Status: **measured.** The pre-registration
 > (`docs/rnd/2026-09-04-concurrency-gate-cardinality-index-preregistration.md`,
@@ -74,8 +74,10 @@ CTE currently does not need to.
 ## 🧪 Apparatus
 
 `docs/assays/0003-concurrency-gate-cardinality-index/` (archived): a minimal
-Postgres 16 schema (`schema.sql`) carrying only the columns and the one index
-(`idx_harvest_tq_poll`) that bear on the question, a fixture generator
+Postgres 16 schema (`schema.sql`) carrying only the columns and indexes that
+bear on the question — `idx_harvest_tq_poll` and `idx_harvest_tq_running`,
+both ported from `autumn-harvest/migrations/20260409000000_harvest_initial/up.sql`
+— a fixture generator
 (`seed.sql`) ported by value from `claim_bench_support.rs::seed_backlog`
 (PENDING backlog, key format, `NON_BLOCKING_CAP`) and
 `claim_budget_tests.rs`'s `HOT_CONTENTION_ROWS` seed (2,000 RUNNING rows
@@ -106,57 +108,63 @@ same apparatus, same session:
 
 | scenario | keys | running | variant | execution time | top-level buffers |
 |:--|--:|--:|:--|--:|--:|
-| idle_256 | 256 | 0 | control | 8.324 ms | 270 |
-| idle_256 | 256 | 0 | **candidate** | 15.513 ms | **20,137** |
-| hot_256 | 256 | 2,000 | control | 171.437 ms | 858 |
-| hot_256 | 256 | 2,000 | **candidate** | 48.654 ms | 98,668 |
-| hot_5000 | 5,000 | 2,000 | control | 1,140.255 ms | 883 |
-| hot_5000 | 5,000 | 2,000 | **candidate** | 24.136 ms | 24,558 |
-| idle_5000 | 5,000 | 0 | control | 7.813 ms | 278 |
-| idle_5000 | 5,000 | 0 | candidate (not gated) | 14.847 ms | 20,141 |
+| idle_256 | 256 | 0 | control | 7.541 ms | 141 |
+| idle_256 | 256 | 0 | **candidate** | 11.825 ms | **10,137** |
+| hot_256 | 256 | 2,000 | control | 172.716 ms | 736 |
+| hot_256 | 256 | 2,000 | **candidate** | 47.839 ms | 98,668 |
+| hot_5000 | 5,000 | 2,000 | control | 1,212.401 ms | 756 |
+| hot_5000 | 5,000 | 2,000 | **candidate** | 28.409 ms | 24,558 |
+| idle_5000 | 5,000 | 0 | control | 7.476 ms | 145 |
+| idle_5000 | 5,000 | 0 | candidate (not gated) | 12.424 ms | 10,141 |
 
-(Re-run after a post-review fix to `seed.sql`'s key-deduplication subquery —
-see "Post-publication corrections" below. Numbers moved by run-to-run noise
-only; every line-level verdict below is unchanged.)
+(Re-run after two rounds of post-review fixes — see "Post-publication
+corrections" below. Numbers moved between rounds; every line-level verdict
+is unchanged throughout.)
 
 **Riskiest assumption, checked first:** half confirmed, half refuted, and the
-refuted half is not what it first looked like. (a) The new partial index
-*is* used efficiently per call — every candidate run shows `Index Only Scan
-using idx_harvest_tq_concurrency_running`, cost ~8 per probe, `Heap Fetches:
-0` in the idle case. (b) **Neither** variant gets the `ORDER BY … LIMIT`
-early-stop through `idx_harvest_tq_poll` in this apparatus: control's own
-idle-case plan is also `Limit → LockRows → Sort → Seq Scan`, with the scan's
-`actual rows=10000 loops=1` — a full read of the backlog, not a short-circuit
-— exactly like the candidate's. The pre-registration's framing of the risky
-assumption (does the rewrite *lose* a pushdown the current fix has) was
-wrong on its own terms: there is no pushdown to lose here, in either
-variant, at this backlog depth. What actually drives the idle-case gap is
-the **per-call cost of the correlated subquery**, paid once for every one of
-the 10,000 scanned rows regardless of variant: control's subplan (`CTE Scan
-on concurrency_running_counts`) probes a `MATERIALIZED` CTE that is empty in
-the idle case and stays resident in memory, at near-zero marginal buffer
-cost per call. Candidate's subplan (`Index Only Scan using
-idx_harvest_tq_concurrency_running`) is a real B-tree probe, and even
-returning zero rows it costs ~2 buffer hits per call — ×10,000 calls ≈
-20,000 buffer hits, which is on its own most of the idle-case regression
-(20,000 of 20,137 total). Ten thousand empty index probes, not a lost query
-shape, is the mechanism. (Caught in post-publication review; see below.)
+refuted half is not what it first looked like. (a) A RUNNING-scoped partial
+index *is* used efficiently per call in every scenario. In the idle case the
+planner actually prefers the pre-existing production index
+`idx_harvest_tq_running` (`(state, last_heartbeat_at) WHERE state =
+'RUNNING'`) over the new `idx_harvest_tq_concurrency_running` — both are
+empty when there are zero `RUNNING` rows, and the planner's cost model rates
+the narrower, pre-existing index marginally cheaper to probe; in the hot
+cases (where `idx_harvest_tq_running` isn't selective on `concurrency_key`
+and would need to filter every `RUNNING` row per call) it correctly switches
+to the new index, exactly as intended. (b) **Neither** variant gets the
+`ORDER BY … LIMIT` early-stop through `idx_harvest_tq_poll` in this
+apparatus: control's own idle-case plan is also `Limit → LockRows → Sort →
+Seq Scan`, with the scan's `actual rows=10000 loops=1` — a full read of the
+backlog, not a short-circuit — exactly like the candidate's. The
+pre-registration's framing of the risky assumption (does the rewrite *lose*
+a pushdown the current fix has) was wrong on its own terms: there is no
+pushdown to lose here, in either variant, at this backlog depth. What
+actually drives the idle-case gap is the **per-call cost of the correlated
+subquery**, paid once for every one of the 10,000 scanned rows regardless of
+variant: control's subplan (`CTE Scan on concurrency_running_counts`) probes
+a `MATERIALIZED` CTE that is empty in the idle case and stays resident in
+memory, at near-zero marginal buffer cost per call. Candidate's subplan is a
+real B-tree probe, and even returning zero rows it costs ~1 buffer hit per
+call — ×10,000 calls ≈ 10,000 buffer hits, which is on its own nearly all of
+the idle-case regression (10,000 of 10,137 total). Ten thousand empty index
+probes, not a lost query shape, is the mechanism. (Caught in post-publication
+review; see below.)
 
 **Against the lines:**
 
-- **L1 — FAIL.** Candidate's idle_256 buffer count is **20,137**, against a
-  ≤50 line — 403x over. This is not close, and it is not a cardinality
-  artifact: idle_5000 (5,000 keys, still zero RUNNING rows) shows the
-  identical 20,141 buffers, confirming the cost comes from paying the
+- **L1 — FAIL.** Candidate's idle_256 buffer count is **10,137**, against a
+  ≤50 line — 202.7x over. This is not close, and it is not a cardinality
+  artifact: idle_5000 (5,000 keys, still zero RUNNING rows) shows the nearly
+  identical 10,141 buffers, confirming the cost comes from paying the
   per-row index-probe cost 10,000 times regardless of how many keys exist,
   not from key cardinality itself.
-- **L2 — PASS, decisively.** Candidate's hot_5000 wall-clock is **24.136ms**,
-  against a ≤160ms line — comfortably inside, and a **~47x** speedup over
-  this apparatus's own same-run control (1,140.255ms), well past the 10x
+- **L2 — PASS, decisively.** Candidate's hot_5000 wall-clock is **28.409ms**,
+  against a ≤160ms line — comfortably inside, and a **~42.7x** speedup over
+  this apparatus's own same-run control (1,212.401ms), well past the 10x
   bar. This is the number the doc's open question was actually asking about,
   and the partial index does fix it.
-- **L3 — PASS.** Candidate's hot_256 wall-clock is **48.654ms** against a
-  ≤342.874ms line (2x control's 171.437ms) — not just inside the line, faster
+- **L3 — PASS.** Candidate's hot_256 wall-clock is **47.839ms** against a
+  ≤345.432ms line (2x control's 172.716ms) — not just inside the line, faster
   than control outright.
 
 **Control comparison, always:** every candidate number above is read against
@@ -166,10 +174,11 @@ only as the source of the L1/L2 pre-set lines, per the pre-registration).
 
 **Worst case:** the apparatus's own control run does not reproduce
 `docs/performance.md`'s published "~1-4 buffers" idle-case figure for the
-committed fix either (this apparatus measures 270-278) — the full production
-query's extra joins/columns and the doc's own larger backlog sweep (up to
-100,000 rows) evidently matter to whether Postgres chooses the early-stop
-plan at all, a detail this minimal apparatus does not resolve either way.
+committed fix either (this apparatus measures 141-145, even with both
+production indexes present) — the full production query's extra
+joins/columns and the doc's own larger backlog sweep (up to 100,000 rows)
+evidently matter to whether Postgres chooses the early-stop plan at all, a
+detail this minimal apparatus does not resolve either way.
 That gap does not change today's verdict — L1's line was set as an absolute
 threshold precisely because a same-apparatus recalibration wasn't available
 going in — but it does mean this apparatus cannot independently corroborate
@@ -178,13 +187,13 @@ candidate-vs-control comparisons it was built to make.
 
 ## 🏁 Verdict
 
-**Kill**, on L1: 20,137 buffers vs. a 50-buffer line. Per the pre-registered
+**Kill**, on L1: 10,137 buffers vs. a 50-buffer line. Per the pre-registered
 rule, one miss among three is a kill regardless of the other two clearing
 by wide margins.
 
 The partial-index + base-table-correlated-subquery rewrite **does** solve
 the specific problem `docs/performance.md` measured (high-cardinality
-hot-contention: ~47x faster than control, well past the 10x bar) and does
+hot-contention: ~42.7x faster than control, well past the 10x bar) and does
 so **without** the 256-key hot-contention regression the doc's three
 previously-rejected `LEFT JOIN`-family rewrites all shared. But it trades
 that fix for a new, more universal one: at zero `RUNNING` rows — the common,
@@ -210,8 +219,8 @@ gate itself) — those remain open, un-re-chartered pits.
 
 ## Post-publication corrections
 
-Codex's automated review on the PR that filed this report caught three real
-issues, all fixed in place (verdict unchanged):
+Codex's automated review on the PR that filed this report caught five real
+issues across two rounds, all fixed in place (verdict unchanged throughout):
 
 1. **`seed.sql`'s key-deduplication subquery was wrong.** `SELECT DISTINCT
    concurrency_key, row_number() OVER () - 1 AS rn FROM … WHERE state =
@@ -237,6 +246,20 @@ issues, all fixed in place (verdict unchanged):
    ~10,000 near-free probes of a resident, empty CTE — was folded into the
    Question/Verdict text above; the finding and the kill verdict are
    unchanged, only the causal explanation is corrected.
+4. **`schema.sql` omitted `idx_harvest_tq_running`**, the production index
+   (`(state, last_heartbeat_at) WHERE state = 'RUNNING'`) the committed
+   fix's `concurrency_running_counts` CTE build actually relies on. Without
+   it, that one-time CTE-build step fell back to a `Seq Scan`, inflating
+   control's totals (e.g. idle_256: 270 buffers vs. 141 with the index
+   present) and understating how cheap the committed fix's non-per-row work
+   already is. Added the index (and the `last_heartbeat_at` column it
+   needs) and re-ran the full assay. Numbers in the table above are from
+   this run; all three line verdicts are unchanged, and L1 fails by an even
+   larger relative margin against the now-cheaper control baseline.
+5. **`run_assay.sh` didn't set `ON_ERROR_STOP`.** Without it, `psql -f` can
+   report success even after a mid-script SQL error, so a broken seed or
+   index step could silently archive results from stale or partial data.
+   Fixed by passing `-v ON_ERROR_STOP=1` to every `psql` invocation.
 
 ## 🔬 Reproduce
 

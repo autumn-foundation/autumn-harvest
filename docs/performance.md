@@ -852,14 +852,14 @@ and open question.
 
 **That proposal was measured and killed:**
 `docs/assays/0003-concurrency-gate-cardinality-index.md` (ledger #3) found
-the partial-index rewrite fixes this exact 5,000-key blowup (~47x faster
+the partial-index rewrite fixes this exact 5,000-key blowup (~42.7x faster
 than control) without regressing the 256-key case, but at zero `RUNNING`
-rows it costs ~10,000 real per-candidate-row index probes against the new
-index where the current fix costs ~10,000 near-free probes of a small,
-resident, empty CTE — 400x+ over its pre-set idle-cost line, at any key
-cardinality. Re-assaying this exact formulation without new information is
-a re-dig; see that report for what else remains untested. Until a fix
-clears all three of that assay's lines, deployments with concurrency-key
+rows it costs ~10,000 real per-candidate-row index probes where the current
+fix costs ~10,000 near-free probes of a small, resident, empty CTE — 200x+
+over its pre-set idle-cost line, at any key cardinality. Re-assaying this
+exact formulation without new information is a re-dig; see that report for
+what else remains untested. Until a fix clears all three of that assay's
+lines, deployments with concurrency-key
 cardinality in the low hundreds (the tested, committed range) get the full
 measured win above; deployments with concurrency keys numbering in the
 thousands or more should expect the candidate-side gate's cost to grow with
