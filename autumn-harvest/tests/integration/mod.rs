@@ -97,6 +97,9 @@ mod guardrail_catalog_tests;
 mod havoc_reentrancy;
 mod havoc_tests;
 mod history_ceiling_claim_tests;
+mod hot_code_swap_docs;
+#[cfg(all(feature = "hot-code-swap", feature = "testing"))]
+mod hot_code_swap_tests;
 #[cfg(feature = "testing")]
 mod idempotency_tests;
 mod integration_e2e;

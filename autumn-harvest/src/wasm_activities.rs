@@ -747,11 +747,21 @@ pub fn invoke_wasm_activity_cancellable(
     dispatch_start: Option<Instant>,
     cancel: Option<&CancellationToken>,
 ) -> Result<serde_json::Value, ActivityFailure> {
+    // Serialized here, outside the `catch_unwind`, so a serialization failure
+    // stays the typed error it always was rather than becoming a panic payload.
+    let input_bytes = match serde_json::to_vec(input) {
+        Ok(bytes) => bytes,
+        Err(e) => {
+            return Err(ActivityFailure::wasm_trap(format!(
+                "failed to serialize activity input as JSON: {e}"
+            )));
+        }
+    };
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         invoke_wasm_activity_inner(
             store,
             module,
-            input,
+            &input_bytes,
             caps,
             limits,
             deadline,
@@ -768,11 +778,60 @@ pub fn invoke_wasm_activity_cancellable(
     }
 }
 
+/// Invoke a guest with **pre-serialized** input bytes, contained the same way
+/// [`invoke_wasm_activity_cancellable`] contains a host-glue panic.
+///
+/// The activity path always serializes a [`serde_json::Value`], and a `Value`'s
+/// object is a `BTreeMap`, so its keys reach the guest in *alphabetical* order.
+/// That is invisible to an activity guest (it parses JSON), but issue #967's
+/// workflow-module ABI deliberately pins one field to a fixed byte offset so a
+/// hand-written WAT guest can read its step without a JSON parser — which only
+/// holds if the bytes carry the *struct's* declaration order. This entry point
+/// hands the caller's exact bytes to the guest, unmediated by `Value`.
+///
+/// Identical to the activity path in every other respect: same engine, same
+/// fresh per-invocation store, same fuel / epoch / memory bounding, same
+/// bounds-checked linear-memory ABI, same output ceiling.
+///
+/// # Errors
+///
+/// Returns an [`ActivityFailure`] classifying any sandbox denial, resource
+/// exhaustion, guest trap, ABI violation, or contained host-glue panic.
+#[cfg(feature = "hot-code-swap")]
+pub(crate) fn invoke_wasm_guest_bytes(
+    store: &WasmModuleStore,
+    module: &Module,
+    input_bytes: &[u8],
+    caps: &WasmCapabilities,
+    limits: &WasmLimits,
+    deadline: Option<Duration>,
+) -> Result<serde_json::Value, ActivityFailure> {
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        invoke_wasm_activity_inner(
+            store,
+            module,
+            input_bytes,
+            caps,
+            limits,
+            deadline,
+            None,
+            None,
+        )
+    }));
+    match result {
+        Ok(inner) => inner,
+        Err(payload) => Err(ActivityFailure::wasm_trap(format!(
+            "host glue panicked during wasm invocation: {}",
+            crate::error::panic_message(payload)
+        ))),
+    }
+}
+
 #[allow(clippy::too_many_lines, clippy::too_many_arguments)]
 fn invoke_wasm_activity_inner(
     store: &WasmModuleStore,
     module: &Module,
-    input: &serde_json::Value,
+    input_bytes: &[u8],
     caps: &WasmCapabilities,
     limits: &WasmLimits,
     deadline: Option<Duration>,
@@ -780,10 +839,6 @@ fn invoke_wasm_activity_inner(
     cancel: Option<&CancellationToken>,
 ) -> Result<serde_json::Value, ActivityFailure> {
     let engine = store.engine();
-
-    let input_bytes = serde_json::to_vec(input).map_err(|e| {
-        ActivityFailure::wasm_trap(format!("failed to serialize activity input as JSON: {e}"))
-    })?;
 
     // Per-attempt fresh store with an independent limiter, fuel budget, and
     // wall-clock epoch deadline.
@@ -948,7 +1003,7 @@ fn invoke_wasm_activity_inner(
         .map_err(|_| ActivityFailure::wasm_trap("alloc returned a negative pointer"))?;
     // memory.write is itself bounds-checked against live guest memory.
     memory
-        .write(&mut wasm_store, in_ptr_usize, &input_bytes)
+        .write(&mut wasm_store, in_ptr_usize, input_bytes)
         .map_err(|_| {
             ActivityFailure::wasm_trap("alloc returned an out-of-bounds pointer for the input")
         })?;

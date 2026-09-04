@@ -40,6 +40,23 @@ schema = ["dep:schemars"]
 # --workspace`, default features, never compiles wasmtime). See
 # docs/rnd/wasm-activities-spike.md.
 wasm-activities = ["dep:wasmtime", "dep:wat", "db"]
+# Hot code swap for workflow definitions via runtime modules (issue #967).
+#
+# R&D spike. Hosts `#[workflow]` logic as a runtime-loaded WebAssembly module
+# registered under an explicit `BuildId`, so the shipped build-routing machinery
+# (percent ramp #604, compatibility sets + claim-time filtering #171,
+# reachability #520/#535) governs a hot swap with no new safety machinery and
+# **zero replay-surface change**. Off by default and never in `default`.
+#
+# Implies `wasm-activities` (and through it `db`): the module host reuses that
+# feature's already-embedded wasmtime engine, `WasmModuleStore` compile cache,
+# capability model and resource limits rather than adding a second sandbox, so
+# this feature adds **no new dependency to the workspace**.
+#
+# EFFECTIVE MSRV: inherited from `wasm-activities` (Rust >= 1.94, wasmtime 46's
+# own minimum). The crate's core/default MSRV is 1.88 and is UNAFFECTED.
+# See docs/rnd/hot-code-swap.md.
+hot-code-swap = ["wasm-activities"]
 # Deterministic chaos / fault-injection test harness (issue #940). Off by
 # default and never in `default`: injection points compile to a zero-cost
 # const-check when this feature is off, so a non-chaos build has no hot-path
