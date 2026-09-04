@@ -117,12 +117,36 @@ impl CriticalPathAnalyzer {
         // `HashMap` path otherwise. Behaviorally identical either way: both
         // the `HashMap` and the collected slice hold each name at most once,
         // so lookup results never change.
-        let duration_lookup: Option<Vec<(&str, Duration)>> =
-            (self.activity_durations.len() <= LINEAR_SCAN_CARDINALITY_LIMIT).then(|| {
-                self.activity_durations
+        //
+        // Two more conditions guard the table so it costs nothing when it
+        // would go unused or measured unreliably:
+        //
+        // - A task with its own `start_to_close` never consults
+        //   `activity_durations` at all (`unwrap_or_else`'s closure short
+        //   circuits). The ORIGINAL code paid zero activity-durations cost
+        //   for such a task, so a caller whose tasks are all overridden --
+        //   e.g. `test_start_to_close_override`'s own shape -- must still
+        //   pay zero: build the table only when at least one task actually
+        //   needs a name lookup.
+        // - `HashMap::iter()`'s order is randomized per process
+        //   (`RandomState`), so collecting it directly would make the
+        //   linear scan's hit position -- and therefore instruction counts
+        //   -- vary run to run for reasons having nothing to do with the
+        //   code, undermining the deterministic-counter evidence this
+        //   optimization is justified by. Sorting by name fixes the scan
+        //   order so repeated measurements of the same binary are
+        //   comparable.
+        let any_task_needs_duration_lookup = tasks.iter().any(|task| task.start_to_close.is_none());
+        let duration_lookup: Option<Vec<(&str, Duration)>> = (any_task_needs_duration_lookup
+            && self.activity_durations.len() <= LINEAR_SCAN_CARDINALITY_LIMIT)
+            .then(|| {
+                let mut lookup: Vec<(&str, Duration)> = self
+                    .activity_durations
                     .iter()
                     .map(|(name, &duration)| (name.as_str(), duration))
-                    .collect()
+                    .collect();
+                lookup.sort_unstable_by_key(|&(name, _)| name);
+                lookup
             });
 
         for level in levels {
