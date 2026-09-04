@@ -298,21 +298,44 @@ schema or query change is proposed.
 
 ### Buffer deltas across backlog depth
 
-`EXPLAIN (ANALYZE, BUFFERS, ...)` total buffers for `claim_task_query()`,
-`no-schedule-to-close` vs `schedule-to-close` (artifacts:
+`EXPLAIN (ANALYZE, BUFFERS, ...)` **shared-buffer hits** for
+`claim_task_query()`, `no-schedule-to-close` vs `schedule-to-close`
+(artifacts:
 `docs/perf-artifacts/schedule-to-close-claim-predicate/{no-schedule-to-close,schedule-to-close}-claim-backlog-{depth}.explain.txt`,
 the committed run -- reproduce via the command in
 [Reproduce](#reproduce)):
 
-| backlog | no-schedule-to-close buffers | schedule-to-close buffers | delta | delta % |
+| backlog | no-schedule-to-close shared hit | schedule-to-close shared hit | delta | delta % |
 |---:|---:|---:|---:|---:|
 | 1,000 | 53 | 57 | +4 | +7.5% |
 | 10,000 | 274 | 284 | +10 | +3.6% |
 | 100,000 | 2,473 | 2,537 | +64 | +2.6% |
 
+**These are shared-buffer hits specifically, not the query's complete I/O
+picture** -- Codex review on PR #1339 correctly flagged that an earlier
+revision labeled this column "total buffers" while the 100,000-row plan's
+own root node also reports `temp read=495 written=1914` (the external
+merge sort's disk spill, from `Sort Method: external merge` a few nodes
+down), which the +2.6% figure above excludes entirely. That temp I/O is
+**identical between both labels** at this depth (`grep`-verified against
+both committed 100,000-row artifacts) -- it is a function of sorting
+100,000 candidate rows, orthogonal to whether `schedule_to_close_at` is
+populated -- so it does not change *which* mechanism the delta is
+attributed to. It does change the whole-query percentage, though: folding
+the identical 2,409 temp blocks into both totals (2,473+2,409=4,882 vs.
+2,537+2,409=4,946) gives **+1.3%**, not +2.6%, as the 100,000-row depth's
+share of the *entire* query's I/O, shared-buffer and temp combined. Both
+numbers are real and are not in conflict -- +2.6% answers "how much bigger
+is the shared-buffer-hit cost this predicate adds," the figure the
+[Plan](#plan) section's mechanism breakdown is built on and the one this
+page uses elsewhere; +1.3% answers "how much bigger is the whole query,
+including its unrelated disk-sort cost, at this depth." Neither figure is
+published at the 1,000-/10,000-row depths because neither of those plans'
+artifacts report any `temp` I/O to fold in.
+
 The scan-side and `Update`-exclusive breakdown in [Plan](#plan) above,
-derived from this same committed run, decomposes each of these totals into
-its two component mechanisms.
+derived from this same committed run's shared-buffer-hit counters,
+decomposes each of the table's totals into its two component mechanisms.
 
 ### 100,000-row plan choice
 

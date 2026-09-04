@@ -1176,8 +1176,12 @@ from the benchmark are directly comparable.
   * **`schedule_to_close` (#378)** — measured directly:
     [`docs/performance-schedule-to-close.md`](performance-schedule-to-close.md) seeds `schedule_to_close_at`
     (rather than leaving it null) and **confirms this page's own suspicion on
-    magnitude, but not on mechanism**: a small, real buffer cost (+2.6% to
-    +7.5% across the three published backlog depths), corroborated by two
+    magnitude, but not on mechanism**: a small, real shared-buffer-hit cost
+    (+2.6% to +7.5% across the three published backlog depths — the
+    100,000-row depth's plan also spills identically to disk on both sides
+    via an external sort, so folding that unrelated temp I/O into the total
+    gives +1.3% at that depth instead; that page reports both and explains
+    why), corroborated by two
     standalone MVCC-bloat scripts, one bulk and one per-row (+5.2% both) —
     nowhere near the 20% impact floor, so no fix is proposed. Codex review
     caught that the predicate text alone (a plain inline column test) is not
