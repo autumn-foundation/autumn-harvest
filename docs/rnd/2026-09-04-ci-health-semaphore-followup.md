@@ -80,7 +80,7 @@ cache-correctness finding, not a parallelism one. Flagging as the next
 candidate for the same treatment (timing decomposition → owner decides
 parallelize-or-audit-or-accept), not fixing blind.
 
-## 🔍 Diagnosis — branch protection gap (not yet closed)
+## 🔍 Diagnosis — branch protection gap (status unconfirmed)
 
 PR #1336 shipped with this comment in `ci.yml` (still present, unchanged, at
 `b36f023`):
@@ -94,42 +94,51 @@ That's a **test-vs-verdict-path** finding, not a test bug: I re-checked PR
 #1354 (opened 2026-09-04, base `b36f023` — today's `trunk-dev` tip) and its
 10 `Test DB (linux, shard N)` checks are present and green, confirming the
 job still runs on every current PR. I found no changelog fragment, no commit,
-and no further edit to that `ci.yml` comment block indicating branch
+and no further edit to that `ci.yml` comment block acknowledging branch
 protection was updated in the ~19 hours since PR #1336 merged
 (2026-09-03T14:35 UTC) — `docs/changelog.d/` has no `pr-1336-*` entry, and
 `grep -rn "branch protection" .github/workflows/ci.yml` still only turns up
-that same unresolved comment.
+that same comment, unedited.
 
-I don't have a tool in this session that reads GitHub branch-protection
-settings directly (no `gh` CLI per this repo's connector policy, and the
-GitHub MCP tools available here don't expose the branch-protection API), so
-I can't independently confirm whether admin action happened outside what
-shows up in this repo's commits and check-run history. What I *can* confirm:
-the code-visible evidence trail shows no sign it has, and per this role's
-charter, changing required checks is something I ask a human for rather than
-infer or do myself.
+**That absence of evidence does not confirm the gap is still open.**
+Branch-protection settings are changed in GitHub's Settings → Branches UI
+(or its API), out of band from commits — an admin could have added the 10
+contexts already and nothing in this repository's commit history, check-run
+data, or the `ci.yml` comment itself would change to reflect it (the comment
+is prose someone would have to remember to go back and edit; it isn't
+generated from the live setting). So the evidence above is equally
+consistent with "still open" and "fixed silently via the UI." I don't have a
+tool in this session that reads GitHub branch-protection settings directly
+(no `gh` CLI per this repo's connector policy, and the GitHub MCP tools
+available here don't expose the branch-protection API), so **this report
+cannot distinguish the two — it is flagging an unconfirmed status, not a
+confirmed-still-open gap.** Per this role's charter, changing required
+checks is something to ask a human for rather than infer or do myself; the
+same applies to confirming the current setting where I lack read access.
 
-**Why this matters now, concretely:** if it's still unenforced, the shard
-split that just cut 44 minutes off the gating leg has also — as an
-unintended side effect of *how* it shipped, not of the split itself — turned
-10 real correctness checks into checks that report a verdict nobody's
-merge decision depends on. A red shard today would show red in the PR's
-checks list but would not block the merge button, which is exactly the
-"untrustworthy green" shape this role's first law is about, except here it's
-worse: the checks aren't even green by default, they're just *decorative*
-until someone flips the required-checks switch.
+**Why this matters, concretely, if it does turn out to still be open:** the
+shard split that just cut 44 minutes off the gating leg would also — as an
+unintended side effect of *how* it shipped, not of the split itself — have
+turned 10 real correctness checks into checks that report a verdict nobody's
+merge decision depends on. A red shard would show red in the PR's checks
+list but would not block the merge button, which is exactly the
+"untrustworthy green" shape this role's first law is about, except worse:
+the checks wouldn't even be green by default, they'd be *decorative* until
+someone flips the required-checks switch.
 
 ## 🔧 Treatment — routed, not applied
 
-1. **Branch protection**: needs a repo admin to add the 10
-   `Test DB (linux, shard 0..9)` contexts (and ideally verify whether PR
-   branches are required to be up to date with `trunk-dev` before merge —
-   PRs #1337 and #1334 both merged having run CI against a `ci.yml` predating
-   the shard split entirely, on branches opened before PR #1336 landed; not
-   itself a defect, but it's the same "which pipeline did this green actually
-   mean" question the prior report raised about docs-only skips). Flagging,
-   not doing — this is exactly the "ask before: changing merge requirements,
-   required checks, or branch protection" case.
+1. **Branch protection**: needs a repo admin to check whether the 10
+   `Test DB (linux, shard 0..9)` contexts are already in `trunk-dev`'s
+   required-status-checks list and, if not, add them (and ideally verify
+   whether PR branches are required to be up to date with `trunk-dev` before
+   merge — PRs #1337 and #1334 both merged having run CI against a `ci.yml`
+   predating the shard split entirely, on branches opened before PR #1336
+   landed; not itself a defect, but it's the same "which pipeline did this
+   green actually mean" question the prior report raised about docs-only
+   skips). Flagging, not doing — this is exactly the "ask before: changing
+   merge requirements, required checks, or branch protection" case, and I
+   can't even read the current setting from here to know if it's needed.
 2. **`windows-latest` timing**: not routed as a fix candidate yet — needs the
    ubuntu/macos comparison timings and a cache-hit check before it's even
    clear whether this is a parallelism question or a cache-correctness one.
