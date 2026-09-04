@@ -31,6 +31,16 @@ pub struct CriticalPathResult {
 /// every caller, not just one with a 100%-hit-rate mock set.
 const LINEAR_SCAN_CARDINALITY_LIMIT: usize = 5;
 
+/// Minimum number of tasks that must actually need a name-based duration
+/// lookup before [`CriticalPathAnalyzer::analyze`] builds the flat scan
+/// table at all. Building it -- a `HashMap::iter()` walk, a heap
+/// allocation and a sort -- costs more than just doing a handful of
+/// `HashMap::get` calls directly when there are only a few lookups to
+/// amortize that cost against (a small DAG analyzed repeatedly, not the
+/// wide-fan-out shape this optimization targets). See the doc comment at
+/// the scan's call site for the measured crossover this was set above.
+const MIN_LOOKUPS_TO_AMORTIZE_TABLE_BUILD: usize = 20;
+
 /// Analyzer to determine the critical path of a DAG.
 pub struct CriticalPathAnalyzer {
     dag: DagDefinition,
@@ -118,16 +128,28 @@ impl CriticalPathAnalyzer {
         // the `HashMap` and the collected slice hold each name at most once,
         // so lookup results never change.
         //
-        // Two more conditions guard the table so it costs nothing when it
-        // would go unused or measured unreliably:
+        // Three more conditions guard the table so it costs nothing when it
+        // would go unused, be unamortized, or be measured unreliably:
         //
         // - A task with its own `start_to_close` never consults
         //   `activity_durations` at all (`unwrap_or_else`'s closure short
         //   circuits). The ORIGINAL code paid zero activity-durations cost
         //   for such a task, so a caller whose tasks are all overridden --
         //   e.g. `test_start_to_close_override`'s own shape -- must still
-        //   pay zero: build the table only when at least one task actually
-        //   needs a name lookup.
+        //   pay zero.
+        // - Building the table -- a `HashMap::iter()` walk, a heap
+        //   allocation and a sort -- has its own fixed cost, paid once per
+        //   `analyze()` call regardless of how many tasks it then serves.
+        //   Measured (standalone harness, cardinality 5 -- the maximum this
+        //   optimization allows -- 80,000 total lookups split across
+        //   repeated `analyze()`-shaped calls of varying size): at 5
+        //   lookups needed per call, build+scan costs 23.6M Ir vs the
+        //   direct-`HashMap` baseline's 19.2M (+23%, a REGRESSION); at 8,
+        //   parity (18.6M vs 19.1M); at 10+, a clear win (17.6M vs 19.1M,
+        //   widening). `MIN_LOOKUPS_TO_AMORTIZE_TABLE_BUILD` is set with
+        //   margin above that measured crossover, so a small DAG analyzed
+        //   repeatedly -- not the wide-fan-out shape this optimization
+        //   targets -- still takes the original, always-safe path.
         // - `HashMap::iter()`'s order is randomized per process
         //   (`RandomState`), so collecting it directly would make the
         //   linear scan's hit position -- and therefore instruction counts
@@ -136,8 +158,12 @@ impl CriticalPathAnalyzer {
         //   optimization is justified by. Sorting by name fixes the scan
         //   order so repeated measurements of the same binary are
         //   comparable.
-        let any_task_needs_duration_lookup = tasks.iter().any(|task| task.start_to_close.is_none());
-        let duration_lookup: Option<Vec<(&str, Duration)>> = (any_task_needs_duration_lookup
+        let lookups_needed = tasks
+            .iter()
+            .filter(|task| task.start_to_close.is_none())
+            .count();
+        let duration_lookup: Option<Vec<(&str, Duration)>> = (lookups_needed
+            >= MIN_LOOKUPS_TO_AMORTIZE_TABLE_BUILD
             && self.activity_durations.len() <= LINEAR_SCAN_CARDINALITY_LIMIT)
             .then(|| {
                 let mut lookup: Vec<(&str, Duration)> = self
