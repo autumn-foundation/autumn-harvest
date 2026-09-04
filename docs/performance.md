@@ -1173,8 +1173,27 @@ from the benchmark are directly comparable.
     pauses a queue closed that specific gap and, as a direct result, replaced
     the correlated anti-join with a one-time prefilter — see
     [the queue-pause anti-join fix](#the-queue-pause-anti-join-fix).
-  * **`schedule_to_close` (#378), worker sessions (#606), sticky routing
-    (#235)** — cheap inline column tests, against columns the seed leaves null.
+  * **Worker sessions (#606)** — measured directly:
+    `docs/performance-worker-sessions.md` seeds `session_id` and
+    `sticky_worker_id`/`sticky_until`/`sticky_timeout` via a per-row
+    `INSERT`-then-`UPDATE`-then-`COMMIT` lifecycle matching
+    `queue::enqueue()`'s real per-task write (as issue #606's hard-pin design
+    always writes them) and finds a real, moderate-to-large buffer cost on the
+    claim query — +32.9% on a single first claim against a cache-warm table
+    at the 10,000-row headline depth, corroborated by a real 10,001-call
+    production-shaped drain at
+    +22.1% (same order of magnitude, unlike an earlier bulk-transaction
+    capture this page's own history superseded). Mechanism: row-width growth
+    compounded by MVCC bloat from the second write, not a plan inefficiency —
+    no query-shape fix applies; see that page for the full measurement,
+    including why it does not isolate worker sessions from sticky routing's
+    own unmeasured cost, and an open question about seeding transaction
+    granularity for multi-activity decision fan-outs that a review round
+    raised but this pass did not chase down.
+  * **`schedule_to_close` (#378)** — cheap inline column test, against a
+    column the seed leaves null.
+  * **Sticky routing (#235)** — still unmeasured on its own; see the scope
+    note in `docs/performance-worker-sessions.md`'s known limitations.
 
   Adding these is scenario work, not query work: each needs a seed variant and a
   report row, on a bench that already runs 15-30 minutes.
@@ -1211,6 +1230,12 @@ from the benchmark are directly comparable.
 * `docs/perf-artifacts/capability-labels-claim-predicate/` — committed
   `EXPLAIN`/`pg_stat_statements` evidence for that measurement.
 * `autumn-harvest/scripts/capability_labels_claim_perf_repro.sh` — regenerates
+  that evidence from a clean checkout.
+* [`docs/performance-worker-sessions.md`](performance-worker-sessions.md) — the worker-sessions claim predicate
+  (#606) measurement referenced above.
+* `docs/perf-artifacts/worker-session-claim-predicate/` — committed
+  `EXPLAIN`/`pg_stat_statements` evidence for that measurement.
+* `autumn-harvest/scripts/worker_session_claim_perf_repro.sh` — regenerates
   that evidence from a clean checkout.
 * [`docs/performance-history-ceiling.md`](performance-history-ceiling.md) — a separate scanner, not part of
   `claim_task_query()`: the workflow-history-ceiling check

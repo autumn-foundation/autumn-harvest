@@ -2642,6 +2642,569 @@ async fn zz_capture_capability_labels_claim_evidence() {
     );
 }
 
+/// Generates the committed evidence for the worker-sessions claim-path
+/// predicate (issue #606 / Ledger perf pass), documented in
+/// `docs/performance.md` and `docs/performance-worker-sessions.md`.
+///
+/// `docs/performance.md`'s "Known limitations" section named worker sessions
+/// (#606) as one of two claim-path predicates left unmeasured after the
+/// schedule-to-close pass (PR #1339, the other being sticky routing #235,
+/// itself since covered by #1177/#1341). This closes that gap.
+///
+/// Like [`zz_capture_capability_labels_claim_evidence`] and unlike
+/// [`zz_capture_queue_pause_claim_evidence`], this capture does not toggle a
+/// code fix: `queue::claim_task_query()` is unmodified end to end. It toggles
+/// *data* instead, at two seeded states of `harvest_task_queue`:
+///
+/// * `no-session` — `session_id` and `sticky_worker_id` both `NULL` (today's
+///   default seed shape, and every other `ClaimGate` scenario's shape too).
+/// * `worker-session` — every row carries a non-`NULL` `session_id` AND
+///   `sticky_worker_id` set to the claiming worker's own id. The gate under
+///   test is `session_id IS NULL OR sticky_worker_id = $1`
+///   (`queue::claim_task_query()`'s `candidate` CTE) — setting
+///   `sticky_worker_id = $1` makes that predicate (and the pre-existing
+///   ordinary-sticky-routing predicate immediately above it) evaluate `TRUE`
+///   for every row, so the claimable row count is **identical** between the
+///   two labels. That isolates the predicate's *evaluation* cost from any
+///   change in which rows are eligible, exactly as the capability-labels
+///   capture does for its own predicate.
+///
+/// `#[ignore]`d on purpose: this is a one-shot evidence-capture tool, not a
+/// repeatable CI assertion. See
+/// `autumn-harvest/scripts/worker_session_claim_perf_repro.sh`, which runs
+/// this test once (no git/tree toggling needed, since no code changes) to
+/// produce the `docs/perf-artifacts/worker-session-claim-predicate/` files
+/// the doc cites.
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+#[ignore = "evidence generator, not a CI assertion -- run via \
+            autumn-harvest/scripts/worker_session_claim_perf_repro.sh"]
+#[allow(clippy::too_many_lines)] // one-shot evidence capture, not a CI assertion
+async fn zz_capture_worker_session_claim_evidence() {
+    use diesel::QueryableByName;
+    use diesel_async::RunQueryDsl;
+
+    #[derive(QueryableByName)]
+    struct ExplainRow {
+        #[diesel(sql_type = diesel::sql_types::Text, column_name = "QUERY PLAN")]
+        query_plan: String,
+    }
+
+    #[derive(QueryableByName, Debug)]
+    struct StatRow {
+        #[diesel(sql_type = diesel::sql_types::Text)]
+        query: String,
+        #[diesel(sql_type = diesel::sql_types::BigInt)]
+        calls: i64,
+        #[diesel(sql_type = diesel::sql_types::BigInt)]
+        shared_blks_hit: i64,
+        #[diesel(sql_type = diesel::sql_types::BigInt)]
+        shared_blks_read: i64,
+        #[diesel(sql_type = diesel::sql_types::BigInt)]
+        total_buffers: i64,
+    }
+
+    let Some(bench) = bench_db_or_skip().await else {
+        eprintln!("no database reachable; nothing captured");
+        return;
+    };
+
+    let out_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .expect("autumn-harvest/ has a workspace-root parent")
+        .join("docs")
+        .join("perf-artifacts")
+        .join("worker-session-claim-predicate");
+    std::fs::create_dir_all(&out_dir).expect("create artifact output directory");
+
+    let mut summary_lines: Vec<String> = Vec::new();
+    let raw = autumn_harvest::queue::claim_task_query();
+    let worker_literal = format!("'{}-worker-0'", db::BENCH_PREFIX);
+
+    // Server-side per-row seeding procedure for the `worker-session` label
+    // (review finding on PR #1358, round 2): a bulk `INSERT` of N rows
+    // followed by one bulk `UPDATE` covering all of them is NOT the physical
+    // heap layout `queue::enqueue()` produces in production. Postgres's
+    // default heap fillfactor is 100 -- a bulk INSERT packs pages full before
+    // any row is widened, so the following bulk UPDATE finds no room on the
+    // same page for the new (wider) tuple version and is forced onto a fresh
+    // page for every single row, roughly doubling the table's physical size.
+    // Production instead calls `queue::enqueue()` once per task: that INSERT
+    // is immediately followed by its OWN UPDATE (before the next task's
+    // INSERT claims more page space), so the new tuple version far more
+    // often fits in the same, still-mostly-empty page as the row it
+    // supersedes. This procedure reproduces that interleaved,
+    // per-row-committed shape server-side (one `CALL` per depth, not N
+    // network round trips) -- each iteration inserts one row, updates it by
+    // id, and COMMITs before the next iteration begins, exactly like N
+    // sequential `queue::enqueue()` calls would.
+    let mut proc_conn = db::connect(&bench.url).await;
+    diesel::sql_query(
+        "CREATE OR REPLACE PROCEDURE harvest_bench_seed_worker_session_rows( \
+             p_prefix text, p_queues int, p_activity text, \
+             p_sticky_worker text, p_count int \
+         ) \
+         LANGUAGE plpgsql AS $proc$ \
+         DECLARE \
+             i int; \
+             v_id uuid; \
+         BEGIN \
+             FOR i IN 0..p_count - 1 LOOP \
+                 INSERT INTO harvest_task_queue \
+                     (queue_name, task_type, activity_name, activity_id, input, \
+                      state, priority, max_attempts, scheduled_at, session_id) \
+                 VALUES ( \
+                     p_prefix || '-q-' || (i % p_queues), 'activity', p_activity, \
+                     gen_random_uuid(), '{}'::jsonb, 'PENDING', 0, 3, \
+                     NOW() - INTERVAL '1 second', gen_random_uuid() \
+                 ) \
+                 RETURNING id INTO v_id; \
+                 UPDATE harvest_task_queue \
+                    SET sticky_worker_id = p_sticky_worker, \
+                        sticky_until = NOW() + INTERVAL '24 hours', \
+                        sticky_timeout = INTERVAL '24 hours' \
+                  WHERE id = v_id; \
+                 COMMIT; \
+             END LOOP; \
+         END; \
+         $proc$",
+    )
+    .execute(&mut proc_conn)
+    .await
+    .expect("create the per-row worker-session seeding procedure");
+    // Companion procedure for a FAIR `no-session` write-cost control (review
+    // finding on PR #1358, round 4): `db::seed()` populates `no-session` via
+    // one bulk `INSERT` of N rows, so comparing its `pg_stat_statements` cost
+    // against `worker-session`'s N separately-committed `INSERT`+`UPDATE`
+    // pairs would measure statement-granularity overhead (index maintenance,
+    // WAL record framing, and round-trip bookkeeping repeated N times) on top
+    // of -- and confounded with -- the actual cost this page is about.
+    // Production sends ordinary (non-session) activities through
+    // `queue::enqueue()` one at a time too (e.g. `persist_scheduled_activities`'s
+    // loop), so the fair control is the SAME per-row-committed lifecycle,
+    // just without the session_id column or the follow-up UPDATE -- isolating
+    // exactly the incremental cost the sticky hard-pin adds, not the cost of
+    // switching seeding strategies.
+    diesel::sql_query(
+        "CREATE OR REPLACE PROCEDURE harvest_bench_seed_plain_rows( \
+             p_prefix text, p_queues int, p_activity text, p_count int \
+         ) \
+         LANGUAGE plpgsql AS $proc$ \
+         DECLARE \
+             i int; \
+         BEGIN \
+             FOR i IN 0..p_count - 1 LOOP \
+                 INSERT INTO harvest_task_queue \
+                     (queue_name, task_type, activity_name, activity_id, input, \
+                      state, priority, max_attempts, scheduled_at) \
+                 VALUES ( \
+                     p_prefix || '-q-' || (i % p_queues), 'activity', p_activity, \
+                     gen_random_uuid(), '{}'::jsonb, 'PENDING', 0, 3, \
+                     NOW() - INTERVAL '1 second' \
+                 ); \
+                 COMMIT; \
+             END LOOP; \
+         END; \
+         $proc$",
+    )
+    .execute(&mut proc_conn)
+    .await
+    .expect("create the per-row plain (no-session) seeding procedure");
+    // `proc_conn` only ever creates the procedures above -- every actual
+    // `CALL` happens on a different, later connection (a fresh one per
+    // depth in the sweep loop, `stats_conn` in the stat-snapshot loop), each
+    // of which sets `synchronous_commit = off` for itself right before its
+    // own `CALL`. Durability is irrelevant to a throwaway benchmark
+    // database, scoped to one session at a time -- trades fsync-per-commit
+    // latency for seeding speed across up to 100,000 individual commits.
+    // Never a production recommendation; see the procedure's doc comment
+    // above.
+
+    // One EXPLAIN capture per published backlog depth, at both labels, from a
+    // freshly re-seeded backlog each time (see the capability-labels capture's
+    // rationale for re-seeding with the column populated FROM BIRTH rather than
+    // UPDATE-ing already-seeded rows: an UPDATE leaves dead NULL-session tuple
+    // versions in the heap that inflate the page count with bloat that has
+    // nothing to do with the predicate's real cost, and never happens in
+    // production, where `session_id` is set once at enqueue time).
+    for backlog in super::claim_bench_support::BACKLOG_SWEEP {
+        let scenario = Scenario {
+            backlog,
+            claimers: 1,
+            queues: 4,
+            gate: ClaimGate::Baseline,
+        };
+
+        let mut conn = db::connect(&bench.url).await;
+        let seeded = db::seed(&mut conn, scenario).await;
+
+        let queues = db::queue_names(scenario);
+        let queue_list = queues
+            .iter()
+            .map(|q| format!("'{q}'"))
+            .collect::<Vec<_>>()
+            .join(",");
+        let literals = [
+            worker_literal.clone(),
+            format!("ARRAY[{queue_list}]::text[]"),
+            format!("'{}'", db::worker_build_id(scenario.gate)),
+            "NULL".to_string(),
+            "ARRAY[]::text[]".to_string(),
+            "ARRAY[]::text[]".to_string(),
+        ];
+        assert!(
+            !raw.contains(&format!("${}", literals.len() + 1)),
+            "claim_task_query() grew a seventh bind; extend `literals` before \
+             this capture can be trusted",
+        );
+        let mut sql = raw.to_string();
+        for (i, literal) in literals.iter().enumerate().rev() {
+            sql = sql.replace(&format!("${}", i + 1), literal);
+        }
+
+        for label in ["no-session", "worker-session"] {
+            if label == "worker-session" {
+                // Re-seed to match `queue::enqueue()`'s REAL per-task write
+                // lifecycle for a worker-session activity: one `INSERT`
+                // (session_id only -- `NewTaskQueueItem` hardcodes the three
+                // sticky columns to `NULL` regardless of `EnqueueParams`)
+                // immediately followed by its OWN `UPDATE` setting
+                // `sticky_worker_id`/`sticky_until`/`sticky_timeout`, each
+                // pair its own committed transaction -- exactly what
+                // `worker.rs`'s session-member dispatch produces, and what a
+                // fleet enqueueing N session tasks over time actually writes.
+                // A round-1 review finding (PR #1358) caught this capture
+                // writing all four columns in one seed `INSERT`; a round-2
+                // finding then caught the round-1 fix's own replacement --
+                // one bulk `INSERT` of N rows followed by one bulk `UPDATE`
+                // covering all of them -- as ALSO unrepresentative: Postgres's
+                // default fillfactor (100) packs the bulk `INSERT`'s pages
+                // full, so the bulk `UPDATE` that follows finds no room on
+                // the same page for any row's new tuple version and is
+                // forced onto a fresh page for every single row, which does
+                // not happen when each task's `INSERT` is immediately
+                // followed by its own `UPDATE` while that task's page is
+                // still mostly empty. See the procedure defined above this
+                // loop and docs/performance-worker-sessions.md's harness
+                // notes for the full history.
+                diesel::sql_query("TRUNCATE harvest_task_queue")
+                    .execute(&mut conn)
+                    .await
+                    .expect("truncate before the worker-session re-seed");
+                // Scoped to THIS connection, not `proc_conn` (which only ever
+                // creates the procedure) -- each depth iteration opens a
+                // fresh connection, so this must be set again here.
+                diesel::sql_query("SET synchronous_commit = off")
+                    .execute(&mut conn)
+                    .await
+                    .expect("relax synchronous_commit for this seeding session only");
+                diesel::sql_query(format!(
+                    "CALL harvest_bench_seed_worker_session_rows( \
+                         '{}', {}, '{}', {worker_literal}, {} \
+                     )",
+                    db::BENCH_PREFIX,
+                    scenario.queues,
+                    db::BENCH_ACTIVITY,
+                    backlog,
+                ))
+                .execute(&mut conn)
+                .await
+                .expect(
+                    "seed the worker-session backlog via the per-row \
+                     INSERT-then-UPDATE procedure",
+                );
+                diesel::sql_query("ANALYZE harvest_task_queue")
+                    .execute(&mut conn)
+                    .await
+                    .expect("re-analyze after the worker-session re-seed");
+            }
+
+            // `EXPLAIN ANALYZE` really executes the statement -- including the
+            // UPDATE CTEs -- so it runs inside a transaction that is rolled
+            // back; otherwise producing the plan would itself consume a task
+            // and shrink the backlog the other label measures against.
+            diesel::sql_query("BEGIN")
+                .execute(&mut conn)
+                .await
+                .expect("begin");
+            let loaded: Result<Vec<ExplainRow>, _> = diesel::sql_query(format!(
+                "EXPLAIN (ANALYZE, BUFFERS, VERBOSE, SETTINGS, TIMING OFF) {sql}"
+            ))
+            .load(&mut conn)
+            .await;
+            diesel::sql_query("ROLLBACK")
+                .execute(&mut conn)
+                .await
+                .expect("rollback");
+
+            let plan_text = loaded
+                .unwrap_or_else(|e| {
+                    panic!(
+                        "EXPLAIN (ANALYZE, BUFFERS, VERBOSE, SETTINGS, TIMING OFF) \
+                         failed for label={label} backlog={backlog}: {e} -- the \
+                         literal substitution of claim_task_query() above is \
+                         likely stale against a query shape change; see the \
+                         `literals` array"
+                    )
+                })
+                .into_iter()
+                .map(|r| r.query_plan)
+                .collect::<Vec<_>>()
+                .join("\n");
+
+            let file_name = format!("{label}-claim-backlog-{backlog}.explain.txt");
+            std::fs::write(
+                out_dir.join(&file_name),
+                format!(
+                    "-- {label}: claim_task_query() @ backlog={backlog}, 4 queues --\n{plan_text}\n"
+                ),
+            )
+            .expect("write explain artifact");
+            eprintln!("wrote {file_name}");
+        }
+
+        summary_lines.push(format!(
+            "backlog={backlog} queues={} seeded_rows={} claimable_rows={}",
+            scenario.queues, seeded.seeded_rows, seeded.claimable_rows,
+        ));
+    }
+
+    // A `pg_stat_statements` snapshot from the *real* `claim_task()` production
+    // function (not the literal-substituted EXPLAIN text above), at both
+    // labels, so the committed snapshot reflects exactly the code path a live
+    // worker takes -- and so the drain loop's claimed count is a correctness
+    // sanity check that the worker-session mutation above did not change
+    // *which* rows are eligible, only the cost of deciding so.
+    let mut claimed_by_label: std::collections::HashMap<&str, usize> =
+        std::collections::HashMap::new();
+    for label in ["no-session", "worker-session"] {
+        let mut stats_conn = db::connect(&bench.url).await;
+        let _ = diesel::sql_query("CREATE EXTENSION IF NOT EXISTS pg_stat_statements")
+            .execute(&mut stats_conn)
+            .await;
+        diesel::sql_query(
+            "SELECT pg_stat_statements_reset(0, \
+                    (SELECT oid FROM pg_database WHERE datname = current_database()), 0)",
+        )
+        .execute(&mut stats_conn)
+        .await
+        .expect(
+            "pg_stat_statements_reset(...) failed -- see \
+             zz_capture_queue_pause_claim_evidence for the full rationale",
+        );
+
+        let headline = headline_scenario();
+        let seeded = db::seed(&mut stats_conn, headline).await;
+        let queues = db::queue_names(headline);
+
+        // Both labels re-seed `harvest_task_queue` via a per-row-committed
+        // procedure for the write-cost measurement below (review finding on
+        // PR #1358, round 4): `db::seed()`'s initial bulk `INSERT` above is
+        // only used to stand up `harvest_workers`/build-routing/etc
+        // scaffolding here, not as either label's write-cost baseline.
+        // Comparing `no-session`'s bulk `INSERT` against `worker-session`'s
+        // per-row `INSERT`+`UPDATE` pairs would measure statement-granularity
+        // overhead (index maintenance, WAL framing, and bookkeeping repeated
+        // N times) confounded with the actual predicate cost this page is
+        // about. Production sends ordinary (non-session) activities through
+        // `queue::enqueue()` one at a time too, so both labels get the same
+        // per-row-committed lifecycle here, differing only in whether the
+        // row carries `session_id` and gets the sticky follow-up `UPDATE`.
+        diesel::sql_query("TRUNCATE harvest_task_queue")
+            .execute(&mut stats_conn)
+            .await
+            .expect("truncate before the per-row re-seed");
+        diesel::sql_query("SET synchronous_commit = off")
+            .execute(&mut stats_conn)
+            .await
+            .expect("relax synchronous_commit for this seeding session only");
+        // Review finding on PR #1358 (round 3): `pg_stat_statements.track`
+        // defaults to `top`, so the `INSERT`/`UPDATE` statements executed
+        // INSIDE either procedure below -- as opposed to the top-level `CALL`
+        // itself -- would never be recorded individually, silently leaving
+        // the write-cost table with no `calls=10000` seed entries to read.
+        // `all` tracks nested statements too, scoped to this session only.
+        diesel::sql_query("SET pg_stat_statements.track = 'all'")
+            .execute(&mut stats_conn)
+            .await
+            .expect(
+                "enable tracking of statements nested inside the seeding \
+                 procedure for this session",
+            );
+        if label == "worker-session" {
+            diesel::sql_query(format!(
+                "CALL harvest_bench_seed_worker_session_rows( \
+                     '{}', {}, '{}', {worker_literal}, {} \
+                 )",
+                db::BENCH_PREFIX,
+                headline.queues,
+                db::BENCH_ACTIVITY,
+                headline.backlog,
+            ))
+            .execute(&mut stats_conn)
+            .await
+            .expect(
+                "seed the headline worker-session backlog via the per-row \
+                 INSERT-then-UPDATE procedure",
+            );
+        } else {
+            diesel::sql_query(format!(
+                "CALL harvest_bench_seed_plain_rows('{}', {}, '{}', {})",
+                db::BENCH_PREFIX,
+                headline.queues,
+                db::BENCH_ACTIVITY,
+                headline.backlog,
+            ))
+            .execute(&mut stats_conn)
+            .await
+            .expect(
+                "seed the headline no-session backlog via the per-row \
+                 INSERT-only procedure",
+            );
+        }
+        diesel::sql_query("ANALYZE harvest_task_queue")
+            .execute(&mut stats_conn)
+            .await
+            .expect("re-analyze before the stat-snapshot drain");
+
+        // Drive the real claim path repeatedly so pg_stat_statements
+        // accumulates real, attributed `calls`/buffer counters for the
+        // production query text -- not just the single literal-substituted
+        // EXPLAIN above.
+        let mut claimed = 0usize;
+        let ceiling = seeded.claimable_rows + 10;
+        loop {
+            let result = autumn_harvest::queue::claim_task(
+                &mut stats_conn,
+                &queues,
+                &format!("{}-worker-0", db::BENCH_PREFIX),
+                "",
+                None,
+                &[],
+                &[],
+            )
+            .await
+            .expect("claim_task must not error");
+            match result {
+                Some(_) => {
+                    claimed += 1;
+                    assert!(
+                        claimed <= ceiling,
+                        "claimed more rows than were seeded -- bug in the capture loop"
+                    );
+                }
+                None => break,
+            }
+        }
+        eprintln!(
+            "label={label} stat-snapshot claim loop: claimed={claimed} of {} claimable",
+            seeded.claimable_rows
+        );
+        // Guard against a shared seeding/eligibility regression that makes
+        // BOTH labels claim the same wrong (e.g. partial, or zero) count --
+        // see zz_capture_capability_labels_claim_evidence for why this must
+        // check against ground truth, not just against the other label.
+        assert_eq!(
+            claimed, seeded.claimable_rows,
+            "label={label} claimed {claimed} of {} seeded-claimable rows -- \
+             an incomplete or over-claiming drain invalidates every \
+             pg_stat_statements/pg_relation_size figure derived from this \
+             capture, so this must exactly match the ground-truth seeded \
+             count, not just match the other label",
+            seeded.claimable_rows,
+        );
+        claimed_by_label.insert(label, claimed);
+
+        let stats_rows: Vec<StatRow> = diesel::sql_query(
+            "SELECT query, calls, shared_blks_hit, shared_blks_read, \
+                    (shared_blks_hit + shared_blks_read) AS total_buffers \
+             FROM pg_stat_statements \
+             WHERE query ILIKE '%harvest_task_queue%' \
+               AND dbid = (SELECT oid FROM pg_database WHERE datname = current_database()) \
+             ORDER BY total_buffers DESC LIMIT 10",
+        )
+        .load(&mut stats_conn)
+        .await
+        .expect(
+            "pg_stat_statements query failed -- see \
+             zz_capture_queue_pause_claim_evidence for the full rationale",
+        );
+
+        assert!(
+            !stats_rows.is_empty(),
+            "pg_stat_statements returned zero rows matching '%harvest_task_queue%' \
+             for label={label}, even though {claimed} real claim_task() calls \
+             (plus one terminal None) were just driven above",
+        );
+
+        let expected_calls =
+            i64::try_from(claimed + 1).expect("claimed count fits in i64 at this test's scale");
+        let claim_row = stats_rows
+            .iter()
+            .find(|r| r.query.contains("rate_limit_debit"))
+            .unwrap_or_else(|| {
+                panic!(
+                    "no pg_stat_statements row matched the production \
+                     claim_task_query() shape for label={label}; got: {stats_rows:?}"
+                )
+            });
+        assert_eq!(
+            claim_row.calls, expected_calls,
+            "pg_stat_statements reports {} calls for label={label}, expected \
+             {expected_calls} ({claimed} successful claims + 1 terminal None)",
+            claim_row.calls,
+        );
+
+        let stats_text = stats_rows
+            .iter()
+            .map(|r| {
+                format!(
+                    "calls={} shared_blks_hit={} shared_blks_read={} total_buffers={}\nquery={}\n",
+                    r.calls, r.shared_blks_hit, r.shared_blks_read, r.total_buffers, r.query,
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        std::fs::write(
+            out_dir.join(format!("{label}-pg_stat_statements.txt")),
+            format!(
+                "-- {label}: pg_stat_statements @ headline scenario ({} backlog, real claim_task() calls) --\n{stats_text}\n",
+                headline.backlog
+            ),
+        )
+        .expect("write pg_stat_statements artifact");
+
+        summary_lines.push(format!(
+            "stat_snapshot label={label}: backlog={} claimed={claimed}",
+            headline.backlog,
+        ));
+    }
+
+    // Correctness sanity check: the worker-session mutation was built to
+    // MATCH the claiming worker, not exclude it, so both labels must claim
+    // the identical number of rows -- proving the added predicate cost is
+    // isolated from any change in which rows are eligible.
+    assert_eq!(
+        claimed_by_label.get("no-session"),
+        claimed_by_label.get("worker-session"),
+        "worker-session mutation changed the claimable row count relative to \
+         no-session ({claimed_by_label:?}) -- the sticky_worker_id/session_id \
+         seeded above no longer keep every row claimable by the drain worker, \
+         so this capture would be comparing different populations rather than \
+         isolating predicate cost",
+    );
+
+    std::fs::write(
+        out_dir.join("fixture-summary.txt"),
+        summary_lines.join("\n") + "\n",
+    )
+    .expect("write fixture summary");
+
+    eprintln!(
+        "== capture complete: worker-session evidence, artifacts in {} ==",
+        out_dir.display()
+    );
+}
+
 /// Generates the committed before/after evidence for the per-key concurrency
 /// gate rewrite in `queue::claim_task_query()` (issue #247 / Ledger perf
 /// pass).
