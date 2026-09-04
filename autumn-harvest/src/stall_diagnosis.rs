@@ -64,8 +64,19 @@
 //!   outside the engine: a human signal, an external-handoff callback, or an
 //!   operator's own pause. Expected, not a page.
 //! - [`Stalled`](ExecutionHealth::Stalled) — needs a human now: no worker polls
-//!   the queue, a circuit breaker is open, or a `RUNNING` execution has no
-//!   pending work at all (the executor-loss / lost-task indicator).
+//!   the queue, an operator-forced circuit breaker is open, or a `RUNNING`
+//!   execution has no pending work at all (the executor-loss / lost-task
+//!   indicator).
+//! - [`Degraded`](ExecutionHealth::Degraded) — will move on its own, but not
+//!   toward success: an organically-tripped circuit breaker (issue #1193).
+//!   The cooldown admits a recovery probe with no human involved, but every
+//!   dispatch fast-fails **non-retryably** until then (issue #369), so the
+//!   activity is heading for a terminal failure, not progress. Distinct from
+//!   `Stalled` (which stays reserved for the operator-forced open, where a
+//!   human genuinely must `force-close` it) and from `Healthy` (an operator
+//!   must not be told "healthy" about a run heading for a terminal
+//!   `ActivityFailed`). See [`BlockedOn::health`] for the full three-way
+//!   phase split this decides between.
 //! - [`Terminal`](ExecutionHealth::Terminal) — the run already finished.
 //!
 //! A long sleep is **not** a stall: health is derived purely from the verdict,
@@ -91,6 +102,28 @@ pub enum ExecutionHealth {
     BlockedExternal,
     /// The execution already reached a terminal state.
     Terminal,
+    /// **Will move forward without a human, but not toward success.** Issue
+    /// #1193's third case, distinct from both neighbors on purpose:
+    ///
+    /// - Not [`Self::Healthy`], because dispatch of the blocking activity
+    ///   fast-fails **non-retryably** on every attempt until the condition
+    ///   clears (issue #369's `ActivityFailure::circuit_open`) — the activity
+    ///   is heading for a terminal `ActivityFailed`, not toward progress. An
+    ///   operator reading `healthy` here would not know to expect that.
+    ///   `NonRetryableFailure` is terminal for the *activity*, not the whole
+    ///   run: the workflow itself keeps running and can still catch the
+    ///   failure, retry it at the workflow level, or fail the run — none of
+    ///   that requires an operator.
+    /// - Not [`Self::Stalled`], because no human action clears it faster than
+    ///   the timer already running: an organically-tripped circuit breaker
+    ///   (`cooldown_until: Some(..)`) admits a recovery probe on its own
+    ///   cooldown, unlike an operator-forced one (`cooldown_until: None`),
+    ///   which stays [`Self::Stalled`] and genuinely needs `force-close`.
+    ///
+    /// Currently reached only by [`BlockedOn::ActivityCircuitOpen`] in the
+    /// `Open` phase with a `cooldown_until`. See [`BlockedOn::health`] for the
+    /// full rationale and the three-way phase split.
+    Degraded,
 }
 
 impl ExecutionHealth {
@@ -102,6 +135,7 @@ impl ExecutionHealth {
             Self::Stalled => "stalled",
             Self::BlockedExternal => "blocked_external",
             Self::Terminal => "terminal",
+            Self::Degraded => "degraded",
         }
     }
 }
@@ -404,7 +438,24 @@ impl BlockedOn {
             | Self::ActivityQueuePaused { .. }
             | Self::ActivityPaused { .. }
             | Self::WorkflowQueuePaused { .. } => ExecutionHealth::BlockedExternal,
-            // Nothing will move this forward without a human.
+            // Issue #1193: an ORGANICALLY-TRIPPED open breaker
+            // (`cooldown_until: Some(..)`) admits a recovery probe on its own
+            // cooldown timer -- no human clears it faster. But it is not
+            // `Healthy` either: every dispatch fast-fails NON-RETRYABLY until
+            // then (issue #369's `ActivityFailure::circuit_open`), so the run
+            // is heading for a terminal `ActivityFailed`, not progress. This
+            // arm MUST stay above the `ActivityCircuitOpen { .. }` catch-all
+            // below for the split to bind, and below the HalfOpen arm above
+            // (HalfOpen is the one case that clears with no fast-fail at all).
+            Self::ActivityCircuitOpen {
+                phase: BlockingCircuitPhase::Open,
+                cooldown_until: Some(_),
+                ..
+            } => ExecutionHealth::Degraded,
+            // Nothing will move this forward without a human. The remaining
+            // `ActivityCircuitOpen` shape reaching this catch-all is
+            // `Open { cooldown_until: None }` -- operator-forced, admits no
+            // probe on any timer, and needs an explicit `force-close`.
             Self::ActivityNoWorker { .. }
             | Self::ActivityRateLimitBucketMissing { .. }
             | Self::WorkflowNoWorker { .. }
@@ -1321,8 +1372,11 @@ fn summarize_activity_cause(blocked: &BlockedOn) -> Option<String> {
             },
             |until| {
                 format!(
-                    "the circuit breaker for activity '{activity_name}' is open; a probe is \
-                         admitted at {until}"
+                    "the circuit breaker for activity '{activity_name}' is open and will \
+                         automatically admit a recovery probe at {until} -- no operator action \
+                         needed to clear it faster; but every dispatch of this activity \
+                         fast-fails non-retryably until then (issue #369), so it is heading for \
+                         a terminal failure, not progress"
                 )
             },
         ),
@@ -1702,6 +1756,14 @@ mod tests {
     /// Reporting `stalled` ("needs a human: nothing will move this run forward
     /// on its own") contradicts both that contract and this verdict's own
     /// summary, which explicitly says no operator action is required.
+    ///
+    /// Issue #1193: an OPEN breaker's two shapes diverge. A FORCED open
+    /// (`cooldown_until: None`) genuinely needs a human -- `stalled`. An
+    /// ORGANICALLY-TRIPPED open (`cooldown_until: Some(..)`) admits a recovery
+    /// probe on a timer with no human involved, but every dispatch until then
+    /// fast-fails non-retryably (issue #369's `ActivityFailure::circuit_open`),
+    /// so it is neither a clean `healthy` nor a human-needed `stalled` --
+    /// `degraded`.
     #[test]
     fn half_open_circuit_health_is_healthy_not_stalled() {
         let half_open = BlockedOn::ActivityCircuitOpen {
@@ -1715,8 +1777,8 @@ mod tests {
             "a half-open breaker recovers without a human, so it is not a stall"
         );
 
-        // An OPEN breaker still fast-fails every dispatch, so it stays a stall
-        // -- whether it is operator-forced (no cooldown) or organically tripped.
+        // Operator-forced: no probe is admitted on any timer, so this
+        // genuinely needs a human (`force-close`).
         let forced_open = BlockedOn::ActivityCircuitOpen {
             activity_name: "charge_card".to_string(),
             phase: BlockingCircuitPhase::Open,
@@ -1724,12 +1786,49 @@ mod tests {
         };
         assert_eq!(forced_open.health(), ExecutionHealth::Stalled);
 
+        // Organically tripped: self-heals on a timer, but fast-fails every
+        // dispatch until then -- neither `healthy` nor `stalled`.
         let organic_open = BlockedOn::ActivityCircuitOpen {
             activity_name: "charge_card".to_string(),
             phase: BlockingCircuitPhase::Open,
             cooldown_until: Some(chrono::Utc::now()),
         };
-        assert_eq!(organic_open.health(), ExecutionHealth::Stalled);
+        assert_eq!(organic_open.health(), ExecutionHealth::Degraded);
+    }
+
+    /// AC (issue #1193): pin the timed-vs-forced split across all three
+    /// observable circuit phases in one place, as the definitive reference.
+    #[test]
+    fn circuit_health_pins_the_timed_vs_forced_split_across_all_three_phases() {
+        let cases = [
+            (
+                "operator-forced open has no cooldown and needs a human",
+                BlockingCircuitPhase::Open,
+                None,
+                ExecutionHealth::Stalled,
+            ),
+            (
+                "organically-tripped open self-heals on the cooldown timer, \
+                 but fast-fails every dispatch until then",
+                BlockingCircuitPhase::Open,
+                Some(t(30)),
+                ExecutionHealth::Degraded,
+            ),
+            (
+                "half-open admits a probe right now and closes on success",
+                BlockingCircuitPhase::HalfOpen,
+                None,
+                ExecutionHealth::Healthy,
+            ),
+        ];
+        for (why, phase, cooldown_until, expected) in cases {
+            let verdict = BlockedOn::ActivityCircuitOpen {
+                activity_name: "charge_card".to_string(),
+                phase,
+                cooldown_until,
+            };
+            assert_eq!(verdict.health(), expected, "{why}");
+        }
     }
 
     /// The classifier preserves the observed phase, so the two shapes above are
@@ -1827,6 +1926,10 @@ mod tests {
     }
 
     /// AC5 (first half): an open breaker carries `cooldown_until`.
+    ///
+    /// Issue #1193: a `cooldown_until` present means the trip was organic and
+    /// self-heals on a timer, so the health is `degraded` (fast-fails until
+    /// then, but no human needed) rather than `stalled`.
     #[test]
     fn open_circuit_is_activity_circuit_open_with_cooldown() {
         let mut facts = healthy_activity();
@@ -1841,7 +1944,7 @@ mod tests {
                 phase: BlockingCircuitPhase::Open,
             }
         );
-        assert_eq!(verdict.health(), ExecutionHealth::Stalled);
+        assert_eq!(verdict.health(), ExecutionHealth::Degraded);
     }
 
     #[test]
@@ -3249,17 +3352,62 @@ mod tests {
             "blocked_external"
         );
         assert_eq!(ExecutionHealth::Terminal.as_str(), "terminal");
+        assert_eq!(ExecutionHealth::Degraded.as_str(), "degraded");
         for health in [
             ExecutionHealth::Healthy,
             ExecutionHealth::Stalled,
             ExecutionHealth::BlockedExternal,
             ExecutionHealth::Terminal,
+            ExecutionHealth::Degraded,
         ] {
             assert_eq!(serde_json::to_value(health).unwrap(), health.as_str());
         }
     }
 
     // ── Summaries ──────────────────────────────────────────────────────────
+
+    /// AC (issue #1193): an organically-tripped open breaker's summary must
+    /// state the automatic-recovery deadline (not imply human action) AND
+    /// name the non-retryable fast-fail interaction (issue #369), so an
+    /// operator reading `degraded` never mistakes it for a clean wait. A
+    /// forced-open breaker's summary keeps naming `force-close` as the
+    /// remedy and must not claim an automatic deadline.
+    #[test]
+    fn organic_open_summary_states_deadline_and_fast_fail_not_force_close() {
+        let until = t(30);
+        let organic = BlockedOn::ActivityCircuitOpen {
+            activity_name: "charge_card".to_string(),
+            phase: BlockingCircuitPhase::Open,
+            cooldown_until: Some(until),
+        };
+        let summary = summarize(&organic);
+        assert!(
+            !summary.contains("force-close"),
+            "an organically-tripped breaker self-heals; it must not tell an \
+             operator to force-close it: {summary}"
+        );
+        assert!(
+            summary.contains(&until.to_string()),
+            "the summary must state the automatic-recovery deadline: {summary}"
+        );
+        assert!(
+            summary.contains("fast-fail") || summary.contains("non-retryable"),
+            "the summary must name the non-retryable fast-fail interaction \
+             (issue #369) so a `degraded` verdict is never mistaken for a \
+             clean wait: {summary}"
+        );
+
+        let forced = BlockedOn::ActivityCircuitOpen {
+            activity_name: "charge_card".to_string(),
+            phase: BlockingCircuitPhase::Open,
+            cooldown_until: None,
+        };
+        let forced_summary = summarize(&forced);
+        assert!(
+            forced_summary.contains("force-close"),
+            "a forced-open breaker genuinely needs a human: {forced_summary}"
+        );
+    }
 
     #[test]
     fn summary_names_the_actionable_root_cause() {

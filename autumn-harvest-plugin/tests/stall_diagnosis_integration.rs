@@ -810,6 +810,11 @@ async fn ac5_forced_open_circuit_reports_circuit_open_without_a_cooldown() {
 /// `cooldown_until` — the AC5 clause the forced-open fixture structurally cannot
 /// produce, and the only end-to-end exercise of the
 /// `time_until_probe_secs` -> `DateTime` derivation.
+///
+/// Issue #1193: an organic open self-heals on this cooldown timer with no
+/// operator action, but every dispatch fast-fails non-retryably until then, so
+/// its `health` is `degraded` — neither the operator-forced open's `stalled`
+/// nor a clean `healthy`.
 #[tokio::test]
 async fn ac5_organically_tripped_circuit_reports_a_derived_cooldown_until() {
     let (url, _guard) = setup_database().await;
@@ -849,6 +854,11 @@ async fn ac5_organically_tripped_circuit_reports_a_derived_cooldown_until() {
     let before = Utc::now();
     let body = diagnose(&app, exec_id).await;
     assert_eq!(kind(&body), "activity_circuit_open", "body: {body}");
+    assert_eq!(
+        body["health"], "degraded",
+        "an organically-tripped open self-heals with no operator action, but \
+         fast-fails every dispatch until then -- neither healthy nor stalled: {body}"
+    );
     let cooldown = body["blocked_on"]["cooldown_until"]
         .as_str()
         .unwrap_or_else(|| panic!("an organically tripped breaker must carry a cooldown: {body}"));
