@@ -117,6 +117,17 @@ jobs:
         # the `quickstart`/build-only CI jobs run `cargo build`, which can't
         # itself be ambiguous. See scripts/check-default-run.sh.
         run: ./scripts/check-default-run.sh
+      - name: Check cargo-dev root caveat is documented
+        # Guards a real, reproduced-live defect: `cargo dev` is the flagship
+        # "no database, no Docker, nothing to configure" front door
+        # (README.md's Quick example, Chapter 1's fastest path), and it
+        # deliberately refuses to run as `root` — a real situation for Docker
+        # devcontainers and many CI base images, not a hypothetical, per the
+        # dev runtime's own doc comment (autumn-harvest-plugin/src/dev/postgres.rs,
+        # refuse_to_run_as_root). Neither front-door doc used to say so, so a
+        # newcomer in one of those environments hit an undocumented hard stop
+        # on the very first command. See scripts/check-dev-runtime-root-caveat.sh.
+        run: ./scripts/check-dev-runtime-root-caveat.sh
       - name: Check formatting
         run: cargo fmt --all -- --check
       - name: Clippy autumn-harvest

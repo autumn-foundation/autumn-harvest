@@ -39,11 +39,18 @@ That starts an ephemeral PostgreSQL, applies the migrations, runs a worker, and
 serves the management API and the Vantage dashboard — then prints the dashboard
 URL and one `curl` that starts a durable workflow. `Ctrl-C` reclaims everything
 it created. It is development-only and refuses to point at anything that is not
-a local database; see
+a local database — and, when provisioning its own cluster, it refuses to run as `root`
+too, since PostgreSQL itself won't; a real situation for Docker devcontainers
+and many CI images, not a hypothetical. That check is scoped to provisioning
+though: point it at a database you already have
+(`HARVEST_DEV_DATABASE_URL`) and it runs fine as root. See
 [Chapter 1](docs/getting-started/01-project-skeleton.md).
 
-Prefer to bring your own Postgres? `cargo run -p quickstart` (see
-[`examples/quickstart/`](examples/quickstart/)).
+Running as root with nothing provisioned yet, or would rather bring your own
+Postgres? `docker compose -f examples/quickstart/compose.yaml up -d`, then
+`AUTUMN_MANIFEST_DIR=examples/quickstart AUTUMN_PROFILE=dev cargo run -p
+quickstart` (see [`examples/quickstart/`](examples/quickstart/)) — Postgres
+runs in its own container there, so root has no bearing on it.
 
 For a chapter-by-chapter walkthrough — first workflow, durable timers, signals,
 child workflows, idempotency, and operating the service — read
