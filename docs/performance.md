@@ -1179,8 +1179,9 @@ from the benchmark are directly comparable.
     `INSERT`-then-`UPDATE`-then-`COMMIT` lifecycle matching
     `queue::enqueue()`'s real per-task write (as issue #606's hard-pin design
     always writes them) and finds a real, moderate-to-large buffer cost on the
-    claim query — +32.9% on a single cold claim at the 10,000-row headline
-    depth, corroborated by a real 10,001-call production-shaped drain at
+    claim query — +32.9% on a single first claim against a cache-warm table
+    at the 10,000-row headline depth, corroborated by a real 10,001-call
+    production-shaped drain at
     +22.1% (same order of magnitude, unlike an earlier bulk-transaction
     capture this page's own history superseded). Mechanism: row-width growth
     compounded by MVCC bloat from the second write, not a plan inefficiency —
