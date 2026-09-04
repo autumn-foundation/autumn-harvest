@@ -2656,12 +2656,13 @@ async fn zz_capture_capability_labels_claim_evidence() {
 ///
 /// * `no-schedule-to-close` — every row's column is `NULL` (today's default
 ///   seed shape, and every other `ClaimGate` scenario's shape too).
-/// * `schedule-to-close` — every row carries a deadline one hour in the
-///   future. Deliberately far enough out that it can never elapse during this
-///   capture, so it excludes nothing — that isolates the predicate's
-///   *evaluation* cost from any change in which rows are eligible, and lets
-///   the same-run drain loop assert equal claimed counts as a correctness
-///   sanity check, exactly as the capability-labels capture does.
+/// * `schedule-to-close` — every row carries a deadline 100 years in the
+///   future. Far enough out that it can never elapse during this capture no
+///   matter how long the run takes, so it excludes nothing — that isolates
+///   the predicate's *evaluation* cost from any change in which rows are
+///   eligible, and lets the same-run drain loop assert equal claimed counts
+///   as a correctness sanity check, exactly as the capability-labels capture
+///   does.
 ///
 /// `#[ignore]`d on purpose: this is a one-shot evidence-capture tool, not a
 /// repeatable CI assertion. See
@@ -2733,11 +2734,31 @@ async fn zz_capture_schedule_to_close_claim_evidence() {
         row
     }
 
-    // A far-future deadline: never elapses during this capture, so it excludes
-    // nothing and isolates the predicate's evaluation cost from any change in
-    // which rows are eligible -- the same "made to match, not exclude" design
-    // the capability-labels capture uses for its requirement.
-    const SCHEDULE_TO_CLOSE_SQL: &str = "NOW() + INTERVAL '1 hour'";
+    // A deadline that can never elapse during this capture, however long it
+    // runs, so it excludes nothing and isolates the predicate's evaluation
+    // cost from any change in which rows are eligible -- the same "made to
+    // match, not exclude" design the capability-labels capture uses for its
+    // requirement. `NOW() + INTERVAL '1 hour'` was tried first and is wrong:
+    // Codex review on PR #1339 (P2) pointed out that the drain below has no
+    // overall wall-clock bound and already took ~15 minutes end to end in
+    // this pass's own environment, so a slower machine or a remote database
+    // could plausibly exceed an hour and start excluding later rows mid-drain
+    // -- turning `claimed < seeded.claimable_rows` into a hard failure of the
+    // equivalence assertion instead of a clean capture.
+    //
+    // `'infinity'::timestamptz` was tried next and is ALSO wrong, for a
+    // different reason discovered by actually running this fix: it is a
+    // valid Postgres value that sorts after every finite timestamp, but the
+    // drain loop below calls the real `queue::claim_task()`, whose `claimed`
+    // CTE `RETURNING`s the full claimed row -- including
+    // `schedule_to_close_at` -- for Diesel to deserialize into a
+    // `chrono::DateTime<Utc>`. Chrono has no `infinity` sentinel, so that
+    // deserialization panics: "Tried to deserialize a timestamp that is too
+    // large for Chrono". A hundred years is comfortably inside
+    // `chrono::DateTime<Utc>`'s representable range (whose upper bound is
+    // roughly the year 262,000) while still being far longer than any
+    // realistic drain duration.
+    const SCHEDULE_TO_CLOSE_SQL: &str = "NOW() + INTERVAL '100 years'";
 
     let Some(bench) = bench_db_or_skip().await else {
         eprintln!("no database reachable; nothing captured");
@@ -2911,6 +2932,24 @@ async fn zz_capture_schedule_to_close_claim_evidence() {
         let headline = headline_scenario();
         let seeded = db::seed(&mut stats_conn, headline).await;
         let queues = db::queue_names(headline);
+
+        // `db::seed()` analyzes `harvest_task_queue`/`harvest_workflow_executions`
+        // only -- `harvest_workers` is left with whatever stats survived from
+        // a previous run, or none at all. The `worker_info` CTE's `SELECT
+        // labels FROM harvest_workers WHERE worker_id = $1` lookup is read on
+        // every single claim in the drain below, so stale/absent
+        // `harvest_workers` statistics could make one label's drain pick a
+        // different access path for that lookup than the other's purely from
+        // planner-statistics drift, contaminating the buffer-count comparison
+        // this capture exists to make. Mirrors the same fix in
+        // `zz_capture_capability_labels_claim_evidence` (Codex review, PR
+        // #1339): analyze it here, once per label, before either the
+        // schedule-to-close re-seed or the drain starts, so both labels begin
+        // from identical `harvest_workers` statistics.
+        diesel::sql_query("ANALYZE harvest_workers")
+            .execute(&mut stats_conn)
+            .await
+            .expect("analyze harvest_workers before either label's stat-snapshot drain");
 
         if label == "schedule-to-close" {
             diesel::sql_query("TRUNCATE harvest_task_queue")

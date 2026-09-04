@@ -11,10 +11,10 @@
 # `claim_budget_tests::zz_capture_schedule_to_close_claim_evidence` ONCE. That
 # single test drives the real `claim_task_query()`/`claim_task()` at TWO
 # seeded *data* states of `harvest_task_queue.schedule_to_close_at` -- `NULL`
-# (today's default) vs. every row carrying a deadline one hour in the future
-# (far enough out that it never elapses during the capture, so it excludes
-# nothing) -- and captures both, so there is nothing else for this script to
-# toggle.
+# (today's default) vs. every row carrying a deadline 100 years in the future
+# (far enough out that it never elapses no matter how long the capture takes
+# to run, and excludes nothing) -- and captures both, so there is nothing
+# else for this script to toggle.
 #
 # Usage (works with or without HARVEST_TEST_DATABASE_URL -- see below):
 #   HARVEST_TEST_DATABASE_URL=postgres://postgres:postgres@localhost:5432/postgres \

@@ -1,7 +1,7 @@
 -- schedule-to-close: claim_task_query() @ backlog=100000, 4 queues --
-CTE Scan on claimed  (cost=1564595.02..1564595.04 rows=1 width=817) (actual rows=1 loops=1)
+CTE Scan on claimed  (cost=2274567.98..2274568.00 rows=1 width=817) (actual rows=1 loops=1)
   Output: claimed.id, claimed.queue_name, claimed.task_type, claimed.workflow_exec_id, claimed.activity_name, claimed.input, claimed.state, claimed.priority, claimed.worker_id, claimed.attempt, claimed.max_attempts, claimed.scheduled_at, claimed.started_at, claimed.completed_at, claimed.last_heartbeat_at, claimed.heartbeat_timeout, claimed.start_to_close, claimed.schedule_to_start, claimed.retry_policy, claimed.output, claimed.error, claimed.sticky_worker_id, claimed.sticky_until, claimed.sticky_timeout, claimed.trace_context, claimed.concurrency_key, claimed.concurrency_cap, claimed.heartbeat_details, claimed.required_build_id, claimed.activity_id, claimed.rate_limit_key, claimed.crash_strikes, claimed.schedule_to_close_at, claimed.required_capabilities, claimed.context_headers, claimed.created_at, claimed.wake_requested, claimed.session_id, claimed.capability_misses, claimed.capability_miss_workers, claimed.capability_miss_handler
-  Buffers: shared hit=10125 dirtied=5 written=3, temp read=495 written=1914
+  Buffers: shared hit=2537 dirtied=5 written=3, temp read=495 written=1914
   CTE paused_queues
     ->  Aggregate  (cost=13.11..13.12 rows=1 width=32) (actual rows=1 loops=1)
           Output: COALESCE(array_agg(harvest_queue_pauses.queue_name), '{}'::text[])
@@ -43,35 +43,34 @@ CTE Scan on claimed  (cost=1564595.02..1564595.04 rows=1 width=817) (actual rows
                       ->  CTE Scan on concurrency_pending_keys  (cost=0.00..0.02 rows=1 width=32) (never executed)
                             Output: concurrency_pending_keys.concurrency_key, concurrency_pending_keys.task_type
   CTE candidate
-    ->  Limit  (cost=1559785.62..1559785.63 rows=1 width=250) (actual rows=1 loops=1)
+    ->  Limit  (cost=2269758.58..2269758.59 rows=1 width=250) (actual rows=1 loops=1)
           Output: harvest_task_queue_1.id, harvest_task_queue_1.task_type, harvest_task_queue_1.concurrency_key, harvest_task_queue_1.concurrency_cap, harvest_task_queue_1.rate_limit_key, harvest_task_queue_1.activity_name, (CASE WHEN ((harvest_task_queue_1.sticky_worker_id = 'harvest-bench-worker-0'::text) AND (harvest_task_queue_1.sticky_until > now())) THEN 1 ELSE 0 END), harvest_task_queue_1.priority, harvest_task_queue_1.scheduled_at, harvest_task_queue_1.ctid, paused_queues.*, paused_activities.*
-          Buffers: shared hit=10097, temp read=495 written=1914
-          ->  LockRows  (cost=1559785.62..1560558.61 rows=61839 width=250) (actual rows=1 loops=1)
+          Buffers: shared hit=2509, temp read=495 written=1914
+          ->  LockRows  (cost=2269758.58..2270889.34 rows=90461 width=250) (actual rows=1 loops=1)
                 Output: harvest_task_queue_1.id, harvest_task_queue_1.task_type, harvest_task_queue_1.concurrency_key, harvest_task_queue_1.concurrency_cap, harvest_task_queue_1.rate_limit_key, harvest_task_queue_1.activity_name, (CASE WHEN ((harvest_task_queue_1.sticky_worker_id = 'harvest-bench-worker-0'::text) AND (harvest_task_queue_1.sticky_until > now())) THEN 1 ELSE 0 END), harvest_task_queue_1.priority, harvest_task_queue_1.scheduled_at, harvest_task_queue_1.ctid, paused_queues.*, paused_activities.*
-                Buffers: shared hit=10097, temp read=495 written=1914
-                ->  Sort  (cost=1559785.62..1559940.22 rows=61839 width=250) (actual rows=1 loops=1)
+                Buffers: shared hit=2509, temp read=495 written=1914
+                ->  Sort  (cost=2269758.58..2269984.73 rows=90461 width=250) (actual rows=1 loops=1)
                       Output: harvest_task_queue_1.id, harvest_task_queue_1.task_type, harvest_task_queue_1.concurrency_key, harvest_task_queue_1.concurrency_cap, harvest_task_queue_1.rate_limit_key, harvest_task_queue_1.activity_name, (CASE WHEN ((harvest_task_queue_1.sticky_worker_id = 'harvest-bench-worker-0'::text) AND (harvest_task_queue_1.sticky_until > now())) THEN 1 ELSE 0 END), harvest_task_queue_1.priority, harvest_task_queue_1.scheduled_at, harvest_task_queue_1.ctid, paused_queues.*, paused_activities.*
                       Sort Key: (CASE WHEN ((harvest_task_queue_1.sticky_worker_id = 'harvest-bench-worker-0'::text) AND (harvest_task_queue_1.sticky_until > now())) THEN 1 ELSE 0 END) DESC, harvest_task_queue_1.priority DESC, harvest_task_queue_1.scheduled_at
                       Sort Method: external merge  Disk: 15280kB
-                      Buffers: shared hit=10096, temp read=495 written=1914
-                      ->  Nested Loop  (cost=0.29..1559476.42 rows=61839 width=250) (actual rows=100000 loops=1)
+                      Buffers: shared hit=2508, temp read=495 written=1914
+                      ->  Nested Loop  (cost=0.00..2269306.27 rows=90461 width=250) (actual rows=100000 loops=1)
                             Output: harvest_task_queue_1.id, harvest_task_queue_1.task_type, harvest_task_queue_1.concurrency_key, harvest_task_queue_1.concurrency_cap, harvest_task_queue_1.rate_limit_key, harvest_task_queue_1.activity_name, CASE WHEN ((harvest_task_queue_1.sticky_worker_id = 'harvest-bench-worker-0'::text) AND (harvest_task_queue_1.sticky_until > now())) THEN 1 ELSE 0 END, harvest_task_queue_1.priority, harvest_task_queue_1.scheduled_at, harvest_task_queue_1.ctid, paused_queues.*, paused_activities.*
                             Join Filter: ((harvest_task_queue_1.task_type <> 'activity'::text) OR (harvest_task_queue_1.activity_name IS NULL) OR (harvest_task_queue_1.activity_name <> ALL (paused_activities.names)))
-                            Buffers: shared hit=10096
+                            Buffers: shared hit=2508
                             ->  CTE Scan on paused_activities  (cost=0.00..0.02 rows=1 width=88) (actual rows=1 loops=1)
                                   Output: paused_activities.*, paused_activities.names
-                            ->  Nested Loop  (cost=0.29..1557387.16 rows=65018 width=230) (actual rows=100000 loops=1)
+                            ->  Nested Loop  (cost=0.00..2266250.02 rows=95111 width=230) (actual rows=100000 loops=1)
                                   Output: harvest_task_queue_1.id, harvest_task_queue_1.task_type, harvest_task_queue_1.concurrency_key, harvest_task_queue_1.concurrency_cap, harvest_task_queue_1.rate_limit_key, harvest_task_queue_1.activity_name, harvest_task_queue_1.sticky_worker_id, harvest_task_queue_1.sticky_until, harvest_task_queue_1.priority, harvest_task_queue_1.scheduled_at, harvest_task_queue_1.ctid, paused_queues.*
                                   Join Filter: (harvest_task_queue_1.queue_name <> ALL (paused_queues.names))
-                                  Buffers: shared hit=10096
+                                  Buffers: shared hit=2508
                                   ->  CTE Scan on paused_queues  (cost=0.00..0.02 rows=1 width=88) (actual rows=1 loops=1)
                                         Output: paused_queues.*, paused_queues.names
                                         Buffers: shared hit=8
-                                  ->  Index Scan using idx_harvest_tq_poll on public.harvest_task_queue harvest_task_queue_1  (cost=0.29..1555849.04 rows=68360 width=192) (actual rows=100000 loops=1)
+                                  ->  Seq Scan on public.harvest_task_queue harvest_task_queue_1  (cost=0.00..2264000.00 rows=100000 width=192) (actual rows=100000 loops=1)
                                         Output: harvest_task_queue_1.id, harvest_task_queue_1.task_type, harvest_task_queue_1.concurrency_key, harvest_task_queue_1.concurrency_cap, harvest_task_queue_1.rate_limit_key, harvest_task_queue_1.activity_name, harvest_task_queue_1.sticky_worker_id, harvest_task_queue_1.sticky_until, harvest_task_queue_1.priority, harvest_task_queue_1.scheduled_at, harvest_task_queue_1.ctid, harvest_task_queue_1.queue_name
-                                        Index Cond: ((harvest_task_queue_1.queue_name = ANY ('{harvest-bench-q-0,harvest-bench-q-1,harvest-bench-q-2,harvest-bench-q-3}'::text[])) AND (harvest_task_queue_1.state = 'PENDING'::text) AND (harvest_task_queue_1.scheduled_at <= now()))
-                                        Filter: (((harvest_task_queue_1.session_id IS NULL) OR (harvest_task_queue_1.sticky_worker_id = 'harvest-bench-worker-0'::text)) AND ((harvest_task_queue_1.task_type <> 'workflow'::text) OR (harvest_task_queue_1.workflow_exec_id IS NULL) OR (NOT (SubPlan 6))) AND ((harvest_task_queue_1.schedule_to_close_at IS NULL) OR (harvest_task_queue_1.schedule_to_close_at > now())) AND ((harvest_task_queue_1.sticky_worker_id IS NULL) OR (harvest_task_queue_1.sticky_worker_id = 'harvest-bench-worker-0'::text) OR (harvest_task_queue_1.sticky_until IS NULL) OR (harvest_task_queue_1.sticky_until <= now())) AND ((harvest_task_queue_1.concurrency_key IS NULL) OR (harvest_task_queue_1.concurrency_cap IS NULL) OR (COALESCE((SubPlan 5), '0'::bigint) < harvest_task_queue_1.concurrency_cap)) AND ((harvest_task_queue_1.rate_limit_key IS NULL) OR (harvest_task_queue_1.activity_name = ANY ('{}'::text[])) OR (hashed SubPlan 14)) AND ((harvest_task_queue_1.required_capabilities IS NULL) OR (NOT (SubPlan 12))))
-                                        Buffers: shared hit=10088
+                                        Filter: (((harvest_task_queue_1.session_id IS NULL) OR (harvest_task_queue_1.sticky_worker_id = 'harvest-bench-worker-0'::text)) AND ((harvest_task_queue_1.task_type <> 'workflow'::text) OR (harvest_task_queue_1.workflow_exec_id IS NULL) OR (NOT (SubPlan 6))) AND ((harvest_task_queue_1.task_type <> 'activity'::text) OR (harvest_task_queue_1.activity_name IS NULL) OR (harvest_task_queue_1.required_capabilities IS NOT NULL) OR (harvest_task_queue_1.activity_name <> ALL ('{}'::text[]))) AND (harvest_task_queue_1.state = 'PENDING'::text) AND (harvest_task_queue_1.queue_name = ANY ('{harvest-bench-q-0,harvest-bench-q-1,harvest-bench-q-2,harvest-bench-q-3}'::text[])) AND (harvest_task_queue_1.scheduled_at <= now()) AND ((harvest_task_queue_1.schedule_to_close_at IS NULL) OR (harvest_task_queue_1.schedule_to_close_at > now())) AND ((harvest_task_queue_1.sticky_worker_id IS NULL) OR (harvest_task_queue_1.sticky_worker_id = 'harvest-bench-worker-0'::text) OR (harvest_task_queue_1.sticky_until IS NULL) OR (harvest_task_queue_1.sticky_until <= now())) AND ((harvest_task_queue_1.concurrency_key IS NULL) OR (harvest_task_queue_1.concurrency_cap IS NULL) OR (COALESCE((SubPlan 5), '0'::bigint) < harvest_task_queue_1.concurrency_cap)) AND ((harvest_task_queue_1.rate_limit_key IS NULL) OR (harvest_task_queue_1.activity_name = ANY ('{}'::text[])) OR (hashed SubPlan 14)) AND ((harvest_task_queue_1.required_capabilities IS NULL) OR (NOT (SubPlan 12))))
+                                        Buffers: shared hit=2500
                                         SubPlan 6
                                           ->  Seq Scan on public.harvest_workflow_executions e  (cost=0.00..0.00 rows=1 width=0) (never executed)
                                                 Filter: ((e.id = harvest_task_queue_1.workflow_exec_id) AND (e.state = 'PAUSED'::text))
@@ -119,15 +118,15 @@ CTE Scan on claimed  (cost=1564595.02..1564595.04 rows=1 width=817) (actual rows
   CTE claimed
     ->  Update on public.harvest_task_queue harvest_task_queue_2  (cost=0.42..14.40 rows=1 width=123) (actual rows=1 loops=1)
           Output: harvest_task_queue_2.id, harvest_task_queue_2.queue_name, harvest_task_queue_2.task_type, harvest_task_queue_2.workflow_exec_id, harvest_task_queue_2.activity_name, harvest_task_queue_2.input, harvest_task_queue_2.state, harvest_task_queue_2.priority, harvest_task_queue_2.worker_id, harvest_task_queue_2.attempt, harvest_task_queue_2.max_attempts, harvest_task_queue_2.scheduled_at, harvest_task_queue_2.started_at, harvest_task_queue_2.completed_at, harvest_task_queue_2.last_heartbeat_at, harvest_task_queue_2.heartbeat_timeout, harvest_task_queue_2.start_to_close, harvest_task_queue_2.schedule_to_start, harvest_task_queue_2.retry_policy, harvest_task_queue_2.output, harvest_task_queue_2.error, harvest_task_queue_2.sticky_worker_id, harvest_task_queue_2.sticky_until, harvest_task_queue_2.sticky_timeout, harvest_task_queue_2.trace_context, harvest_task_queue_2.concurrency_key, harvest_task_queue_2.concurrency_cap, harvest_task_queue_2.heartbeat_details, harvest_task_queue_2.required_build_id, harvest_task_queue_2.activity_id, harvest_task_queue_2.rate_limit_key, harvest_task_queue_2.crash_strikes, harvest_task_queue_2.schedule_to_close_at, harvest_task_queue_2.required_capabilities, harvest_task_queue_2.context_headers, harvest_task_queue_2.created_at, harvest_task_queue_2.wake_requested, harvest_task_queue_2.session_id, harvest_task_queue_2.capability_misses, harvest_task_queue_2.capability_miss_workers, harvest_task_queue_2.capability_miss_handler
-          Buffers: shared hit=10125 dirtied=5 written=3, temp read=495 written=1914
+          Buffers: shared hit=2537 dirtied=5 written=3, temp read=495 written=1914
           ->  Nested Loop  (cost=0.42..14.40 rows=1 width=123) (actual rows=1 loops=1)
                 Output: 'RUNNING'::text, 'harvest-bench-worker-0'::text, (harvest_task_queue_2.attempt + 1), now(), false, harvest_task_queue_2.ctid, candidate_1.*
                 Inner Unique: true
-                Buffers: shared hit=10101, temp read=495 written=1914
+                Buffers: shared hit=2513, temp read=495 written=1914
                 ->  CTE Scan on candidate candidate_1  (cost=0.00..5.96 rows=1 width=56) (actual rows=1 loops=1)
                       Output: candidate_1.*, candidate_1.id
                       Filter: (((candidate_1.rate_limit_key IS NULL) OR (candidate_1.activity_name = ANY ('{}'::text[])) OR (hashed SubPlan 19)) AND ((candidate_1.concurrency_key IS NULL) OR (pg_try_advisory_xact_lock((hashtext(candidate_1.concurrency_key))::bigint) AND ((candidate_1.concurrency_cap IS NULL) OR ((SubPlan 17) < candidate_1.concurrency_cap)))))
-                      Buffers: shared hit=10097, temp read=495 written=1914
+                      Buffers: shared hit=2509, temp read=495 written=1914
                       SubPlan 19
                         ->  CTE Scan on rate_limit_debit  (cost=0.00..0.02 rows=1 width=32) (never executed)
                               Output: rate_limit_debit.debited_key
@@ -140,11 +139,11 @@ CTE Scan on claimed  (cost=1564595.02..1564595.04 rows=1 width=817) (actual rows
                       Output: harvest_task_queue_2.attempt, harvest_task_queue_2.ctid, harvest_task_queue_2.id
                       Index Cond: (harvest_task_queue_2.id = candidate_1.id)
                       Buffers: shared hit=4
-Query Identifier: 9171480094554139351
+Query Identifier: -7617082777655599318
 Planning:
-  Buffers: shared hit=276 read=9
-Planning Time: 3.172 ms
+  Buffers: shared hit=278 read=9
+Planning Time: 2.349 ms
 JIT:
-  Functions: 129
+  Functions: 126
   Options: Inlining true, Optimization true, Expressions true, Deforming true
-Execution Time: 1991.849 ms
+Execution Time: 1783.133 ms

@@ -1177,7 +1177,7 @@ from the benchmark are directly comparable.
     [`docs/performance-schedule-to-close.md`](performance-schedule-to-close.md) seeds `schedule_to_close_at`
     (rather than leaving it null) and **confirms this page's own suspicion at
     the row level**: a small, real buffer cost (+3.6% to +5.7%, reproduced to
-    the exact buffer count across three independent capture runs at the
+    the exact buffer count across four independent capture runs at the
     1,000- and 10,000-row depths), corroborated by two standalone MVCC-bloat
     scripts, one bulk and one per-row (+5.2% both) — nowhere near the 20%
     impact floor. No fix is proposed or needed for that row-level cost.
@@ -1185,12 +1185,13 @@ from the benchmark are directly comparable.
     reproduce cleanly and are reported as open rather than smoothed into one
     number: at the 100,000-row depth the planner chose a markedly more
     expensive plan specifically for the `schedule_to_close_at`-populated
-    table in **two of three** capture runs — the more common outcome here,
-    not a rare fluke — and the real 10,001-call `pg_stat_statements` drain's
-    aggregate delta ranged +2.5% to +22.5% across three runs of the identical
-    test. See that page's "100k-depth plan instability" and "Corroboration"
-    sections, neither of which claims a confirmed mechanism for the
-    variance.
+    table in **two of four** capture runs — a coin flip here, never observed
+    on the unpopulated side — and the real 10,001-call `pg_stat_statements`
+    drain's aggregate delta was +2.5% to +5.6% in three of four runs but hit
+    +22.5% in the fourth, with no confirmed mechanism for that outlier (it
+    does not correlate with the 100k-depth plan flip — see the page for why).
+    See that page's "100k-depth plan instability" and "Corroboration"
+    sections for the full detail.
   * **Worker sessions (#606), sticky routing (#235)** — still cheap inline
     column tests, against columns the seed leaves null; not yet measured.
 
