@@ -222,7 +222,11 @@ async fn setup_bench_db() -> Result<BenchDb, SkipReason> {
         .with_tag("16")
         .start()
         .await
-        .map_err(|e| SkipReason(format!("start postgres container (is Docker running?): {e}")))?;
+        .map_err(|e| {
+            SkipReason(format!(
+                "start postgres container (is Docker running?): {e}"
+            ))
+        })?;
     let host = container
         .get_host()
         .await
@@ -251,11 +255,9 @@ async fn drop_bench_db(admin_url: &str, db_url: &str) {
         return;
     }
     if let Ok(mut admin) = AsyncPgConnection::establish(admin_url).await {
-        let _ = diesel::sql_query(format!(
-            "DROP DATABASE IF EXISTS {db} WITH (FORCE)"
-        ))
-        .execute(&mut admin)
-        .await;
+        let _ = diesel::sql_query(format!("DROP DATABASE IF EXISTS {db} WITH (FORCE)"))
+            .execute(&mut admin)
+            .await;
     }
 }
 
@@ -553,7 +555,9 @@ async fn combined_worst_case_section(app: &HarvestApiApp, pool: &DbPool) {
 
 async fn replay_section(app: &HarvestApiApp, pool: &DbPool) {
     println!();
-    println!("## Diagnose latency on the replay path (no pending activities -- forces `build_awaitables_report`)");
+    println!(
+        "## Diagnose latency on the replay path (no pending activities -- forces `build_awaitables_report`)"
+    );
     println!();
     println!("| history events replayed | n | p50 ms | p95 ms | p99 ms | max ms |");
     println!("|--:|--:|--:|--:|--:|--:|");
@@ -580,9 +584,7 @@ async fn main() {
     let db = match setup_bench_db().await {
         Ok(db) => db,
         Err(SkipReason(reason)) => {
-            println!(
-                "diagnose_bench: skipping (no reachable database) -- {reason}"
-            );
+            println!("diagnose_bench: skipping (no reachable database) -- {reason}");
             return;
         }
     };
