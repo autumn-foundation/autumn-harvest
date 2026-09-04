@@ -3949,6 +3949,87 @@ async fn list_page_has_time_range_filters() {
     );
 }
 
+/// Wayfinder error-path fix: a malformed `started_after`/`started_before`
+/// used to `?`-abort `list_workflows_ui` with a bare 400 before the filter
+/// form was ever rendered — discarding every other filter the operator had
+/// typed and giving no way back to the list short of hand-editing the URL.
+///
+/// RED baseline (pre-fix, reproduced by checking out the parent commit and
+/// running this test): `GET /workflows?started_after=yesterday&workflow_name=billing`
+/// returned `400 Bad Request` with a body that did not contain the filters
+/// form, so `workflow_name=billing` (a valid, already-typed filter) was
+/// silently discarded along with the page.
+///
+/// GREEN (this commit): the request still renders the list page (`200`),
+/// preserves the other filter (`workflow_name=billing`, still in its
+/// input's `value=`), preserves the operator's exact invalid text
+/// (`started_after`'s `value="yesterday"`, not blanked out), and surfaces a
+/// `role="alert"` message adjacent to the offending field explaining the
+/// expected format — all four error-path booleans (adjacent to cause,
+/// persists until resolved, says how to recover, entered data preserved)
+/// now hold, where before only "says how to recover" did (in a 400 body the
+/// operator would only see by opening dev tools).
+#[tokio::test]
+async fn invalid_started_after_redisplays_form_instead_of_aborting_page() {
+    let (database_url, _container) = setup_test_database_url().await;
+    let app = build_single_shard_ui_app(&database_url);
+
+    let (status, html) = fetch_html(
+        &app,
+        "/workflows?started_after=yesterday&workflow_name=billing",
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "an invalid started_after must not abort the whole list page: {html}"
+    );
+    assert!(
+        html.contains("name=\"started_after\""),
+        "filter form must still render: {html}"
+    );
+    assert!(
+        html.contains("value=\"yesterday\""),
+        "the operator's exact invalid input must be echoed back for correction: {html}"
+    );
+    assert!(
+        html.contains("value=\"billing\""),
+        "the other filter the operator already typed must not be discarded: {html}"
+    );
+    assert!(
+        html.contains("role=\"alert\""),
+        "an inline, screen-reader-announced error must sit next to the field: {html}"
+    );
+    assert!(
+        html.to_lowercase().contains("rfc 3339"),
+        "the error must say how to recover (expected format): {html}"
+    );
+}
+
+/// Same fix, `started_before` side — a distinct code path in
+/// `list_workflows_ui`, so covered independently rather than assumed
+/// symmetric with `started_after`.
+#[tokio::test]
+async fn invalid_started_before_redisplays_form_instead_of_aborting_page() {
+    let (database_url, _container) = setup_test_database_url().await;
+    let app = build_single_shard_ui_app(&database_url);
+
+    let (status, html) = fetch_html(&app, "/workflows?started_before=not-a-date").await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "an invalid started_before must not abort the whole list page: {html}"
+    );
+    assert!(
+        html.contains("value=\"not-a-date\""),
+        "the operator's exact invalid input must be echoed back for correction: {html}"
+    );
+    assert!(
+        html.contains("role=\"alert\""),
+        "an inline, screen-reader-announced error must sit next to the field: {html}"
+    );
+}
+
 /// Detail page event timestamps are displayed (not "—" for every row).
 #[tokio::test]
 async fn detail_page_event_timestamps_display() {
