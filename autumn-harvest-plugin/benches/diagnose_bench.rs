@@ -517,6 +517,34 @@ async fn fleet_section(app: &HarvestApiApp, pool: &DbPool) {
     }
 }
 
+/// The fan-out and fleet sweeps above vary N and M **independently**, each
+/// holding the other at a small fixed value -- neither alone exercises the
+/// O(N x M) shape the issue actually names ("a wide fan-out ... on a large
+/// fleet"). This scenario combines both sweeps' largest points so the
+/// combined-worst-case number is measured, not extrapolated from the two
+/// independent sweeps.
+async fn combined_worst_case_section(app: &HarvestApiApp, pool: &DbPool) {
+    let n = *FANOUT_SWEEP.last().expect("non-empty");
+    let m = *FLEET_SWEEP.last().expect("non-empty");
+    println!();
+    println!("## Combined worst case: {n} pending activities x {m} live workers");
+    println!();
+    println!("| scenario | n | p50 ms | p99 ms | max ms |");
+    println!("|--:|--:|--:|--:|--:|");
+    let mut conn = pool.get().await.expect("pooled conn");
+    reset(&mut conn).await;
+    let exec_id = seed_execution(&mut conn, 0).await;
+    seed_pending_activities(&mut conn, exec_id, n).await;
+    seed_workers(&mut conn, m).await;
+    diesel::sql_query("ANALYZE")
+        .execute(&mut conn)
+        .await
+        .expect("analyze");
+    drop(conn);
+    let stats = run_scenario(app, exec_id, WARMUP, MEASURED).await;
+    print_row(&format!("{n} x {m}"), stats);
+}
+
 async fn replay_section(app: &HarvestApiApp, pool: &DbPool) {
     println!();
     println!("## Diagnose latency on the replay path (no pending activities -- forces `build_awaitables_report`)");
@@ -562,6 +590,7 @@ async fn main() {
 
     fanout_section(&app, &pool).await;
     fleet_section(&app, &pool).await;
+    combined_worst_case_section(&app, &pool).await;
     replay_section(&app, &pool).await;
 
     drop(pool);
