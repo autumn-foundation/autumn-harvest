@@ -3674,18 +3674,19 @@ pub async fn enforce_external_cancels_outbox(
                             // whenever the id enters on the held database;
                             // only a genuinely different one is resolved
                             // through the pool.
-                            let resolved: crate::types::ShardId = if std::ptr::eq(
-                                pool.pool_for(entry),
-                                pool.pool_for(caller_shard),
-                            ) {
-                                crate::shard_rebalance::forward_of_held_row(conn, exec_id)
-                                    .await
-                                    .unwrap_or(entry)
-                            } else {
-                                crate::shard_rebalance::resolve_execution_shard(pool, exec_id)
-                                    .await
-                                    .unwrap_or(entry)
-                            };
+                            let resolved: crate::types::ShardId =
+                                if crate::external_target_location::same_underlying_pool(
+                                    pool.pool_for(entry),
+                                    pool.pool_for(caller_shard),
+                                ) {
+                                    crate::shard_rebalance::forward_of_held_row(conn, exec_id)
+                                        .await
+                                        .unwrap_or(entry)
+                                } else {
+                                    crate::shard_rebalance::resolve_execution_shard(pool, exec_id)
+                                        .await
+                                        .unwrap_or(entry)
+                                };
                             Some(resolved)
                         }
                         None => None,
