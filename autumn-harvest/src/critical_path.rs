@@ -128,41 +128,52 @@ impl CriticalPathAnalyzer {
         // the `HashMap` and the collected slice hold each name at most once,
         // so lookup results never change.
         //
-        // Two more properties keep the table from costing anything when it
-        // would go unused, be unamortized, or be measured unreliably:
+        // Building the table -- a `HashMap::iter()` walk, a heap allocation
+        // and a sort -- has its own fixed cost, paid once per `analyze()`
+        // call regardless of how many tasks it then serves. Measured
+        // (standalone harness, cardinality 5 -- the maximum this
+        // optimization allows -- 80,000 total lookups split across repeated
+        // `analyze()`-shaped calls where EVERY lookup in the call goes
+        // through the table): at 5 lookups per call, build+scan costs 23.6M
+        // Ir vs the direct-`HashMap` baseline's 19.2M (+23%, a REGRESSION);
+        // at 8, parity (18.6M vs 19.1M); at 10+, a clear win (17.6M vs
+        // 19.1M, widening). `MIN_LOOKUPS_TO_AMORTIZE_TABLE_BUILD` is set
+        // with margin above that measured crossover.
         //
-        // - A task with its own `start_to_close` never consults
-        //   `activity_durations` at all (`unwrap_or_else`'s closure short
-        //   circuits). The ORIGINAL code paid zero activity-durations cost
-        //   for such a task, so a caller whose tasks are all overridden --
-        //   e.g. `test_start_to_close_override`'s own shape -- must still
-        //   pay zero. This falls out of the lazy design below rather than a
-        //   separate check: an overridden task's closure never runs at all,
-        //   so it can never advance `lookups_seen` or trigger a build.
-        // - Building the table -- a `HashMap::iter()` walk, a heap
-        //   allocation and a sort -- has its own fixed cost, paid once per
-        //   `analyze()` call regardless of how many tasks it then serves.
-        //   Measured (standalone harness, cardinality 5 -- the maximum this
-        //   optimization allows -- 80,000 total lookups split across
-        //   repeated `analyze()`-shaped calls of varying size): at 5
-        //   lookups needed per call, build+scan costs 23.6M Ir vs the
-        //   direct-`HashMap` baseline's 19.2M (+23%, a REGRESSION); at 8,
-        //   parity (18.6M vs 19.1M); at 10+, a clear win (17.6M vs 19.1M,
-        //   widening). `MIN_LOOKUPS_TO_AMORTIZE_TABLE_BUILD` is set with
-        //   margin above that measured crossover.
+        // This decision -- whether at least `MIN_LOOKUPS_TO_AMORTIZE_
+        // TABLE_BUILD` tasks actually need a lookup -- is made with an
+        // EXACT count from a pre-pass over `tasks`, not a running counter
+        // inside the main loop below that triggers a build the moment it
+        // crosses the threshold. An earlier draft of this fix tried the
+        // running-counter approach specifically to avoid the pre-pass's
+        // O(tasks) cost, but it cannot be made correct: whatever threshold
+        // triggers the build, a DAG whose lookup count lands just above it
+        // builds the table with almost no lookups left to amortize the
+        // build against (in the worst case, the triggering lookup is the
+        // LAST one, and the table serves exactly one lookup) -- proven by
+        // the same crossover measurement above: build cost is comparable to
+        // ~8 `HashMap` lookups, so triggering at count 20 with only 1-7
+        // lookups remaining after it is a regression no threshold choice
+        // can avoid, only relocate. Deciding with an exact upfront count
+        // avoids this: if the table is built, ALL `lookups_needed` lookups
+        // in the call use it, matching the crossover measurement's own
+        // shape exactly.
         //
-        // An earlier draft of this fix decided both of the above with a
-        // separate `tasks.iter().filter(...).count()` pre-pass BEFORE the
-        // main loop. That pre-pass itself cost real, unconditional O(tasks)
-        // work -- for a large, override-heavy or sparse DAG (few or no
-        // tasks lacking `start_to_close`), the pass would run to completion,
-        // conclude "don't build the table", and have bought nothing: exactly
-        // the callers this whole guard exists to leave untouched. Counting
-        // `lookups_seen` lazily, inside the main loop, as each lookup
-        // already-necessarily happens, means a DAG that never reaches the
-        // threshold pays for precisely as many `is_none()`/counter-increment
-        // checks as it has genuine lookups needing one -- zero pre-pass, zero
-        // work wasted deciding not to build something.
+        // The pre-pass itself is one O(tasks) scan of a cheap
+        // `Option::is_none()` check -- no hashing, no allocation -- and is
+        // gated cheapest-first so it never runs for a DAG that couldn't
+        // possibly reach the threshold: `tasks.len()` (already known, O(1))
+        // upper-bounds `lookups_needed` (a task with `start_to_close` set
+        // only ever LOWERS the count), so `tasks.len() <
+        // MIN_LOOKUPS_TO_AMORTIZE_TABLE_BUILD` rules out the fast path with
+        // no scan at all. For a large DAG that clears that bar but turns
+        // out to be override-heavy (few tasks actually need a lookup), the
+        // pre-pass still runs and still costs O(tasks) -- a real, accepted
+        // cost, but a bounded one: it is one cheap check per task, alongside
+        // work the main DP loop below (upstream-distance comparisons,
+        // `Duration` arithmetic) already pays per task regardless, so it
+        // can never dominate `analyze`'s total cost for any DAG large
+        // enough for the difference to matter.
         //
         // `HashMap::iter()`'s order is randomized per process (`RandomState`),
         // so collecting it directly would make the linear scan's hit
@@ -171,40 +182,30 @@ impl CriticalPathAnalyzer {
         // deterministic-counter evidence this optimization is justified by.
         // Sorting by name fixes the scan order so repeated measurements of
         // the same binary are comparable.
-        // No separate pre-pass over `tasks` decides whether to build this:
-        // an upfront O(tasks) count (an earlier draft of this fix used one)
-        // would itself cost real work for exactly the DAGs it exists to
-        // protect -- override-heavy or sparse ones, where the answer is
-        // "don't build it" and the count was wasted. Instead, `lookups_seen`
-        // counts genuine `activity_durations` lookups AS THEY HAPPEN inside
-        // the main loop below (each already-necessary `unwrap_or_else`
-        // call), and the table is built, once, only the first time that
-        // running count reaches `MIN_LOOKUPS_TO_AMORTIZE_TABLE_BUILD` --
-        // by which point enough lookups remain in this `analyze()` call to
-        // amortize it. A DAG that never reaches the threshold (few or no
-        // unoverridden tasks) never builds the table and never pays more
-        // than the original `HashMap::get` path did, by construction --
-        // not by a separate check that itself costs something.
-        let can_use_linear_scan = self.activity_durations.len() <= LINEAR_SCAN_CARDINALITY_LIMIT;
-        let mut lookups_seen: usize = 0;
-        let mut duration_lookup: Option<Vec<(&str, Duration)>> = None;
+        let duration_lookup: Option<Vec<(&str, Duration)>> = (self.activity_durations.len()
+            <= LINEAR_SCAN_CARDINALITY_LIMIT
+            && tasks.len() >= MIN_LOOKUPS_TO_AMORTIZE_TABLE_BUILD)
+            .then(|| {
+                tasks
+                    .iter()
+                    .filter(|task| task.start_to_close.is_none())
+                    .count()
+            })
+            .filter(|&lookups_needed| lookups_needed >= MIN_LOOKUPS_TO_AMORTIZE_TABLE_BUILD)
+            .map(|_| {
+                let mut lookup: Vec<(&str, Duration)> = self
+                    .activity_durations
+                    .iter()
+                    .map(|(name, &duration)| (name.as_str(), duration))
+                    .collect();
+                lookup.sort_unstable_by_key(|&(name, _)| name);
+                lookup
+            });
 
         for level in levels {
             for &task_index in level {
                 let task = &tasks[task_index];
                 let duration = task.start_to_close.unwrap_or_else(|| {
-                    if can_use_linear_scan && duration_lookup.is_none() {
-                        lookups_seen += 1;
-                        if lookups_seen >= MIN_LOOKUPS_TO_AMORTIZE_TABLE_BUILD {
-                            let mut lookup: Vec<(&str, Duration)> = self
-                                .activity_durations
-                                .iter()
-                                .map(|(name, &duration)| (name.as_str(), duration))
-                                .collect();
-                            lookup.sort_unstable_by_key(|&(name, _)| name);
-                            duration_lookup = Some(lookup);
-                        }
-                    }
                     duration_lookup.as_ref().map_or_else(
                         || {
                             self.activity_durations
