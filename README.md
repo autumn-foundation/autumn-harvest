@@ -48,8 +48,9 @@ though: point it at a database you already have
 
 Running as root with nothing provisioned yet, or would rather bring your own
 Postgres? `docker compose -f examples/quickstart/compose.yaml up -d`, then
-`cargo run -p quickstart` (see [`examples/quickstart/`](examples/quickstart/))
-— Postgres runs in its own container there, so root has no bearing on it.
+`AUTUMN_MANIFEST_DIR=examples/quickstart AUTUMN_PROFILE=dev cargo run -p
+quickstart` (see [`examples/quickstart/`](examples/quickstart/)) — Postgres
+runs in its own container there, so root has no bearing on it.
 
 For a chapter-by-chapter walkthrough — first workflow, durable timers, signals,
 child workflows, idempotency, and operating the service — read
