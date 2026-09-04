@@ -39,11 +39,14 @@ That starts an ephemeral PostgreSQL, applies the migrations, runs a worker, and
 serves the management API and the Vantage dashboard — then prints the dashboard
 URL and one `curl` that starts a durable workflow. `Ctrl-C` reclaims everything
 it created. It is development-only and refuses to point at anything that is not
-a local database; see
+a local database — and it refuses to run as `root`, since PostgreSQL will not
+run as root either; a real situation for Docker devcontainers and many CI
+images, not a hypothetical. See
 [Chapter 1](docs/getting-started/01-project-skeleton.md).
 
-Prefer to bring your own Postgres? `cargo run -p quickstart` (see
-[`examples/quickstart/`](examples/quickstart/)).
+Running as root, or would rather bring your own Postgres? `cargo run -p
+quickstart` (see [`examples/quickstart/`](examples/quickstart/)) runs Postgres
+in its own container, so it is unaffected either way.
 
 For a chapter-by-chapter walkthrough — first workflow, durable timers, signals,
 child workflows, idempotency, and operating the service — read
