@@ -399,6 +399,11 @@ async fn seed_workers(conn: &mut AsyncPgConnection, m: u32) {
 struct LatencyStats {
     n: usize,
     p50_ms: f64,
+    // Issue #809 published a `p95 < 500 ms` claim, so p95 is reported
+    // directly rather than leaving the reader to infer it from p99
+    // (p95 <= p99 always holds, but naming the actual statistic the issue
+    // measures is clearer than relying on that monotonicity).
+    p95_ms: f64,
     p99_ms: f64,
     max_ms: f64,
 }
@@ -418,6 +423,7 @@ fn stats_from(mut samples_ms: Vec<f64>) -> LatencyStats {
     LatencyStats {
         n: samples_ms.len(),
         p50_ms: percentile_ms(&samples_ms, 0.50),
+        p95_ms: percentile_ms(&samples_ms, 0.95),
         p99_ms: percentile_ms(&samples_ms, 0.99),
         max_ms: samples_ms.last().copied().unwrap_or(0.0),
     }
@@ -451,8 +457,8 @@ async fn run_scenario(
 
 fn print_row(label: &str, stats: LatencyStats) {
     println!(
-        "| {label} | {} | {:.2} | {:.2} | {:.2} |",
-        stats.n, stats.p50_ms, stats.p99_ms, stats.max_ms
+        "| {label} | {} | {:.2} | {:.2} | {:.2} | {:.2} |",
+        stats.n, stats.p50_ms, stats.p95_ms, stats.p99_ms, stats.max_ms
     );
 }
 
@@ -470,8 +476,8 @@ async fn fanout_section(app: &HarvestApiApp, pool: &DbPool) {
         "## Diagnose latency vs pending-activity fan-out (fleet fixed at {HEADLINE_FLEET} workers)"
     );
     println!();
-    println!("| pending activities (N) | n | p50 ms | p99 ms | max ms |");
-    println!("|--:|--:|--:|--:|--:|");
+    println!("| pending activities (N) | n | p50 ms | p95 ms | p99 ms | max ms |");
+    println!("|--:|--:|--:|--:|--:|--:|");
     for &n in &FANOUT_SWEEP {
         let mut conn = pool.get().await.expect("pooled conn");
         reset(&mut conn).await;
@@ -499,8 +505,8 @@ async fn fleet_section(app: &HarvestApiApp, pool: &DbPool) {
         "## Diagnose latency vs live-worker fleet size (fan-out fixed at {HEADLINE_FANOUT} pending activities)"
     );
     println!();
-    println!("| live workers (M) | n | p50 ms | p99 ms | max ms |");
-    println!("|--:|--:|--:|--:|--:|");
+    println!("| live workers (M) | n | p50 ms | p95 ms | p99 ms | max ms |");
+    println!("|--:|--:|--:|--:|--:|--:|");
     for &m in &FLEET_SWEEP {
         let mut conn = pool.get().await.expect("pooled conn");
         reset(&mut conn).await;
@@ -529,8 +535,8 @@ async fn combined_worst_case_section(app: &HarvestApiApp, pool: &DbPool) {
     println!();
     println!("## Combined worst case: {n} pending activities x {m} live workers");
     println!();
-    println!("| scenario | n | p50 ms | p99 ms | max ms |");
-    println!("|--:|--:|--:|--:|--:|");
+    println!("| scenario | n | p50 ms | p95 ms | p99 ms | max ms |");
+    println!("|--:|--:|--:|--:|--:|--:|");
     let mut conn = pool.get().await.expect("pooled conn");
     reset(&mut conn).await;
     let exec_id = seed_execution(&mut conn, 0).await;
@@ -549,8 +555,8 @@ async fn replay_section(app: &HarvestApiApp, pool: &DbPool) {
     println!();
     println!("## Diagnose latency on the replay path (no pending activities -- forces `build_awaitables_report`)");
     println!();
-    println!("| history events replayed | n | p50 ms | p99 ms | max ms |");
-    println!("|--:|--:|--:|--:|--:|");
+    println!("| history events replayed | n | p50 ms | p95 ms | p99 ms | max ms |");
+    println!("|--:|--:|--:|--:|--:|--:|");
     for &history_activities in &REPLAY_SWEEP {
         let mut conn = pool.get().await.expect("pooled conn");
         reset(&mut conn).await;
