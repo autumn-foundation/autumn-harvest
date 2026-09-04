@@ -421,6 +421,22 @@ visibility, and whether the admin API has an auth boundary in non-dev profiles.
 The default output is a compact table; `--output json` returns the same response
 shape as the API for CI and release scripts.
 
+**Authenticating the call.** `/admin/preflight` is admin-gated like every other
+`/admin` route, and how you satisfy that gate depends on the profile:
+
+- **`AUTUMN_PROFILE=dev` with no auth boundary** — nothing to do. The management
+  API is served unauthenticated to any caller that can reach the socket, so the
+  command above works as written against a local app (this is what makes the
+  [quickstart](examples/quickstart/README.md)'s preflight step run). The app logs
+  a warning at startup when it is in this state, and preflight's own
+  `admin_auth_boundary` check reports it as `unauthenticated_access: true` —
+  do not expose such a process beyond localhost.
+- **Any other profile** — the gate is fail-closed. Pass a scoped API token with
+  `--token` / `HARVEST_TOKEN` (a `read` scope is enough; see
+  `harvest token --help`), or run the command from a context that carries an
+  admin session for whatever middleware you mounted via
+  `HarvestPlugin::api_with_auth`.
+
 Exit codes are deploy-gate friendly: `0` means `overall_status = pass`, `2`
 means `warn`, and `1` means `fail` or a transport/API error. Use warning exit
 code `2` when your release process allows a separate "promote with caution"

@@ -5385,6 +5385,31 @@ pub(crate) async fn require_harvest_admin(
     }
 }
 
+/// Whether the request established a session principal at all (issue #1284).
+///
+/// Two shapes mean "this caller presented no credential", and they are NOT the
+/// same shape — a fix that handles only the first leaves the reported bug in
+/// place:
+///
+///   1. **No `Session` extension.** No session layer ran, so nothing could ever
+///      have authenticated this caller. This is what a standalone integration
+///      that mounts [`harvest_api_router`] directly produces.
+///   2. **A `Session` that is not cookie-backed.** autumn-web installs its
+///      session layer *unconditionally* and that layer inserts a `Session` on
+///      every request — minting a fresh, empty one when the request carries no
+///      valid session cookie. `HarvestPlugin` mounts through `app.nest(..)`,
+///      i.e. *inside* that layer, so a cookieless CLI call against a real
+///      autumn-web app arrives as `Some(session)`, never `None`.
+///      [`Session::is_cookie_backed`] is autumn-web's own accessor for exactly
+///      this question: did the session id come from a valid request cookie, or
+///      was it generated for this request?
+///
+/// A forged or stale cookie also lands here, correctly: it establishes no
+/// principal either.
+async fn session_principal_established(session: &Session) -> bool {
+    session.is_cookie_backed().await
+}
+
 pub(crate) async fn has_harvest_admin_access(
     api_state: &HarvestApiState,
     session: Option<Session>,
@@ -5393,11 +5418,46 @@ pub(crate) async fn has_harvest_admin_access(
         return true;
     }
 
+    // ── Unauthenticated local management API in the `dev` profile (#1284) ────
+    //
+    // `set_deployment_profile`'s contract has always read "`dev` allows an
+    // unauthenticated local management API", and `check_admin_auth_boundary`
+    // reports the boundary as "optional for the dev profile" — but the code
+    // required a `Session` carrying `admin_auth_session_key` regardless of
+    // profile, so the quickstart's own documented Step 3
+    // (`harvest --base-url … preflight`, a bare cookieless request) answered
+    // 401 for everyone, always. This makes the code match its contract.
+    //
+    // The widening is bounded on three sides, and each bound is a test in
+    // `tests/security.rs`:
+    //   - `dev` only. Every other profile — including the default `unknown`
+    //     that a standalone integration gets for free — falls through to the
+    //     unchanged fail-closed branch below.
+    //   - Callers with no established session only. A cookie-backed session is
+    //     still judged by `admin_auth_session_key`, so an embedder running its
+    //     own auth middleware in `dev` keeps exactly the gate it has today.
+    //     Read this as a compatibility bound, not a security barrier: a caller
+    //     is always free to simply omit its cookie. What keeps the posture safe
+    //     is the `dev`-only bound plus the network boundary, which is why the
+    //     startup warning says "do not expose this process beyond localhost".
+    //   - An embedder-declared boundary still short-circuits above, and the
+    //     scoped-token path (#942) short-circuits earlier still, in
+    //     `require_harvest_admin`.
+    //
+    // A `dev` deployment reaching this arm is announced at startup by
+    // `warn_if_dev_admin_api_is_open` and reported by `harvest preflight`'s
+    // `admin_auth_boundary` check (`unauthenticated_access: true`), so an open
+    // management API is never silent.
+    let is_dev = api_state.deployment_profile() == "dev";
+
     let Some(session) = session else {
-        return false;
+        return is_dev;
     };
 
-    if api_state.deployment_profile() == "dev" {
+    if is_dev {
+        if !session_principal_established(&session).await {
+            return true;
+        }
         let session_key = api_state.admin_auth_session_key();
         session.contains_key(&session_key).await
     } else {
