@@ -1197,11 +1197,11 @@ from the benchmark are directly comparable.
     "Write-side cost" sections for the buffer- and storage-level evidence.
     One thing did **not** reproduce cleanly across this pass's several
     capture runs: the real 10,001-call `pg_stat_statements` drain's
-    aggregate delta varied noticeably run to run (always positive, never
-    converging on one value), but only the most recent run's artifacts are
-    ever committed -- the repro script overwrites the same canonical
-    filenames each time -- so that page states only the one auditable,
-    committed number (**+15.5%**) rather than citing bounds from runs whose
+    aggregate delta varied run to run, but only the most recent run's
+    artifacts are ever committed -- the repro script overwrites the same
+    canonical filenames each time -- so that page states only the one
+    auditable, committed number (**+15.5%**), without asserting a range, a
+    frequency, or a direction (e.g. "always positive") for runs whose
     evidence no longer exists in the repository to audit. A markedly more expensive plan
     at the 100,000-row depth was also observed on earlier, pre-fix runs of
     this capture (never on the unpopulated side) but not on either

@@ -397,26 +397,24 @@ sibling capability-labels and concurrency-key captures this one follows:
 | 484.04 | 559.18 | +15.5% |
 
 **This did not reproduce to a stable number across the several runs this
-capture went through over the course of this pass**, as earlier revisions
-of this page said by citing a specific historical range (roughly +2.5% to
-+22.5%, always positive -- `schedule-to-close` never came out cheaper --
-but not converging on one value). Codex review on PR #1339 correctly
-pointed out that those earlier runs are exactly the kind of uncommitted,
-no-longer-reproducible data this page's "On reproducibility" note above
-disclaims: the repro script always overwrites the same canonical
-filenames, so citing specific bounds from them stated an unaudited
-number as though it were evidence. The only auditable data point is the
-committed run in the table above: **+15.5%**. The drain loop does not
-capture a plan for every one of its 10,001 calls, only the aggregate
-`pg_stat_statements` counters, so there is no per-call plan trace available
-to check any hypothesis about the cause of run-to-run variance directly,
-and this page does not assert one. Treat +15.5% as this pass's one
-committed, auditable measurement of the aggregate delta -- positive and
-real, comfortably under the impact floor either way -- not as a value this
-page claims is stable: unaudited historical runs during this same pass
-varied noticeably, so a different environment or run should be expected to
-land on a different, but still small and positive, number rather than
-exactly this one.
+capture went through over the course of this pass.** Codex review on PR
+#1339 caught this same problem twice: an earlier revision cited specific
+historical bounds from those runs (roughly +2.5% to +22.5%), and even
+after that was flagged, the rewrite still asserted a qualitative pattern
+across them -- "always positive" -- and predicted that a future run would
+land on "a different, but still small and positive, number." Both are the
+same unaudited-evidence problem this page's "On reproducibility" note
+above disclaims for everything else: those runs' artifacts are gone (the
+repro script always overwrites the same canonical filenames), so nothing
+about them -- not a range, not a sign, not a trend -- is something this
+page can support from the repository as it stands. The only auditable
+data point is the committed run in the table above: **+15.5%**, comfortably
+under the impact floor. The drain loop does not capture a plan for every
+one of its 10,001 calls, only the aggregate `pg_stat_statements` counters,
+so there is no per-call plan trace available to check any hypothesis about
+the cause of run-to-run variance, and this page asserts none -- including
+any hypothesis about whether the aggregate stays positive, or how large it
+runs, on a run other than this committed one.
 
 ## Write-side cost
 
