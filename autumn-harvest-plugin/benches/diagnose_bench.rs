@@ -379,7 +379,7 @@ async fn seed_pending_activities(conn: &mut AsyncPgConnection, exec_id: Executio
 
 /// Bulk-insert `m` live workers covering the `default` queue, set-based like
 /// `claim_bench_support.rs::seed_workers`. `queues` deliberately includes
-/// `"default"` (unlike claim_bench's workers, whose `claim_task` predicate
+/// `"default"` (unlike `claim_bench`'s workers, whose `claim_task` predicate
 /// doesn't need it) because `eligible_worker_ids`' queue-coverage check does.
 async fn seed_workers(conn: &mut AsyncPgConnection, m: u32) {
     diesel::sql_query(
@@ -410,14 +410,25 @@ struct LatencyStats {
     max_ms: f64,
 }
 
+/// Nearest-rank percentile: `ceil(pct * n)`, clamped to `[1, n]` -- matching
+/// `claim_bench_support.rs::percentile_ms`. The clamp happens in float space
+/// *before* the cast, so the value cast to `usize` is always an exact
+/// integer in `[1.0, n]`, which is what makes the truncation/sign-loss/
+/// precision-loss lints below provably not apply.
 fn percentile_ms(sorted_ms: &[f64], pct: f64) -> f64 {
     if sorted_ms.is_empty() {
         return 0.0;
     }
-    let rank = ((pct * sorted_ms.len() as f64).ceil() as usize)
-        .saturating_sub(1)
-        .min(sorted_ms.len() - 1);
-    sorted_ms[rank]
+    #[allow(clippy::cast_precision_loss)]
+    let n_as_f64 = sorted_ms.len() as f64;
+    let rank_f = (pct * n_as_f64).ceil().clamp(1.0, n_as_f64);
+    #[allow(
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        reason = "clamped to [1.0, n] above, so the value is an exact integer in usize range"
+    )]
+    let idx = rank_f as usize - 1;
+    sorted_ms[idx]
 }
 
 fn stats_from(mut samples_ms: Vec<f64>) -> LatencyStats {
