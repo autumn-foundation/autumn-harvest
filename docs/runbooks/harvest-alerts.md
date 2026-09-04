@@ -1570,7 +1570,7 @@ window to act *before* that happens.
    guaranteed non-terminal (`RUNNING`/`PAUSED`), sorted by history size
    descending. This is a DIFFERENT query parameter from the unrelated,
    pre-existing general-purpose `min_history_events` filter (issue #493,
-   `docs/runbooks/history-ceiling.md`), which composes with `state=`/
+   [`docs/runbooks/history-ceiling.md`](history-ceiling.md)), which composes with `state=`/
    pagination and does not restrict to live executions or sort by size.
 3. For the largest offender(s), inspect `GET /api/harvest/workflows/{execution_id}/stack`
    and `GET /api/harvest/workflows/{execution_id}/history` to understand what

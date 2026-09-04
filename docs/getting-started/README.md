@@ -43,6 +43,16 @@ Start with [Chapter 1 →](01-project-skeleton.md)
 
 ## Where to go next
 
+- **Activities reference.** [`activities.md`](activities.md) covers
+  heartbeating, cooperative cancellation, and activity interceptors — beyond
+  what Chapter 2 introduces.
+- **Streaming progress.** [`streaming-progress.md`](../streaming-progress.md)
+  — `ctx.publish_progress` for an ephemeral, best-effort live-output side
+  channel (an AI agent streaming tokens, a long import's per-item progress)
+  without standing up an external message bus.
+- **Disaster recovery.** [`cross-region-dr.md`](../cross-region-dr.md) — per-shard
+  cross-region replication, a fencing mechanism, a measured RPO, and the
+  operator-initiated failover runbook.
 - **Upgrading.** [`upgrading/0.6.0.md`](../upgrading/0.6.0.md) is the current
   0.5.0 → 0.6.0 upgrade guide — the `autumn-web` 0.7 bump and the move to
   Autumn-owned plugin migrations. [`upgrading/0.5.0.md`](../upgrading/0.5.0.md)

@@ -25,7 +25,7 @@ ISO 27001 question about where privileged-action logs ship and how you know
 none were lost, turn on audit export (issue #953): Harvest streams every audit
 record to a sink you run with at-least-once delivery, a dense per-shard
 sequence the receiver can check for contiguity, a visible lag metric, and a
-redrive path. See **`docs/audit-export.md`**.
+redrive path. See **[`docs/audit-export.md`](../audit-export.md)**.
 
 The scenarios below query the local trail directly and work either way.
 

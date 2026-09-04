@@ -848,7 +848,18 @@ a new supporting partial index (e.g. on
 NULL`) to make each per-candidate-row lookup an indexed probe instead of a
 CTE linear scan. Adding an index is outside what this PR changes
 unilaterally; see the review discussion on this PR for the concrete proposal
-and open question. Until that lands, deployments with concurrency-key
+and open question.
+
+**That proposal was measured and killed:**
+`docs/assays/0003-concurrency-gate-cardinality-index.md` (ledger #3) found
+the partial-index rewrite fixes this exact 5,000-key blowup (~48.8x faster
+than control) without regressing the 256-key case, but at zero `RUNNING`
+rows it costs ~10,000 real per-candidate-row index probes where the current
+fix costs ~10,000 near-free probes of a small, resident, empty CTE — 200x+
+over its pre-set idle-cost line, at any key cardinality. Re-assaying this
+exact formulation without new information is a re-dig; see that report for
+what else remains untested. Until a fix clears all three of that assay's
+lines, deployments with concurrency-key
 cardinality in the low hundreds (the tested, committed range) get the full
 measured win above; deployments with concurrency keys numbering in the
 thousands or more should expect the candidate-side gate's cost to grow with
@@ -1148,7 +1159,7 @@ from the benchmark are directly comparable.
   run against empty or null input and this page reports nothing about their
   cost. Ranked by how much that omission is likely to matter:
   * **Capability labels (#382)** — measured directly:
-    `docs/performance-capability-labels.md` seeds `required_capabilities`
+    [`docs/performance-capability-labels.md`](performance-capability-labels.md) seeds `required_capabilities`
     (rather than leaving it null) and finds a real, +24–36% buffer cost on the
     claim query across the same backlog-depth sweep used everywhere else on
     this page, corroborated three independent ways (`EXPLAIN` buffers,
@@ -1213,20 +1224,60 @@ from the benchmark are directly comparable.
   [the concurrency-key gate fix](#the-concurrency-key-gate-fix).
 * `autumn-harvest/scripts/concurrency_key_claim_perf_repro.sh` — regenerates
   that evidence from a clean checkout.
-* `docs/performance-capability-labels.md` — the capability-labels claim
+* [`docs/performance-capability-labels.md`](performance-capability-labels.md) — the capability-labels claim
   predicate (#382) measurement referenced above.
 * `docs/perf-artifacts/capability-labels-claim-predicate/` — committed
   `EXPLAIN`/`pg_stat_statements` evidence for that measurement.
 * `autumn-harvest/scripts/capability_labels_claim_perf_repro.sh` — regenerates
   that evidence from a clean checkout.
-* `docs/performance-worker-sessions.md` — the worker-sessions claim predicate
+* [`docs/performance-worker-sessions.md`](performance-worker-sessions.md) — the worker-sessions claim predicate
   (#606) measurement referenced above.
 * `docs/perf-artifacts/worker-session-claim-predicate/` — committed
   `EXPLAIN`/`pg_stat_statements` evidence for that measurement.
 * `autumn-harvest/scripts/worker_session_claim_perf_repro.sh` — regenerates
   that evidence from a clean checkout.
-* `docs/performance-history-ceiling.md` — a separate scanner, not part of
+* [`docs/performance-history-ceiling.md`](performance-history-ceiling.md) — a separate scanner, not part of
   `claim_task_query()`: the workflow-history-ceiling check
   (`timeout::enforce_workflow_history_ceiling`, issue #493) fixed a
   correlated `harvest_events` event-count subquery that was evaluated twice
   per RUNNING execution on every timeout-scanner tick.
+
+### Other profiling notes
+
+Instruction/allocation-count profiling passes over other hot paths, each a
+standalone note rather than part of the claim-path attribution table above:
+
+* [`docs/performance-replay.md`](performance-replay.md) — `WorkflowReplayer`'s
+  in-memory replay path against issue #135's CPU-path budget; shipped fix.
+* [`docs/performance-verify.md`](performance-verify.md) —
+  `ReplayVerifier::verify_dir`'s opaque-payload guard fast-path; shipped under
+  maintainer override after falling short of the autonomous gate.
+* [`docs/performance-schema-validation-lazy-path.md`](performance-schema-validation-lazy-path.md)
+  — lazy JSON-Pointer path construction in schema validation (issue #373).
+* [`docs/performance-det-check.md`](performance-det-check.md) — fusing a
+  redundant per-line comment scan in `harvest det-check` (issue #778).
+* [`docs/performance-dag-graph.md`](performance-dag-graph.md) — hoisting a
+  per-node rebuild out of `GET /dag-run-graph` (issue #690).
+* [`docs/performance-dlq-aggregate.md`](performance-dlq-aggregate.md) — DLQ
+  aggregate grouping (issue #385/#613); a measured fix that was reverted after
+  review found a regressing input shape — a negative result.
+* [`docs/performance-dlq-merge.md`](performance-dlq-merge.md) — the DLQ
+  cross-shard merge stage that runs after the grouping above; redundant key
+  clones removed.
+* [`docs/performance-stall-diagnosis.md`](performance-stall-diagnosis.md) — an
+  allocation-free ranking pass over `GET /api/harvest/workflows/{id}/diagnose`
+  (issue #809).
+* [`docs/performance-workflow-children-traversal.md`](performance-workflow-children-traversal.md)
+  — batching the N+1 in `GET /workflows/{id}/children?depth=N` (issue #786-adjacent).
+* [`docs/performance-schedule-overdue-aux.md`](performance-schedule-overdue-aux.md)
+  — the same N+1 shape in `GET /admin/schedules`'s overdue-aux computation
+  (issue #696).
+* [`docs/performance-quota-history-bytes.md`](performance-quota-history-bytes.md)
+  — measuring the `history_bytes` admission check's cost claim (issue #946
+  AC7); partially inaccurate claim, no fix identified.
+* [`docs/performance-codec-rotation-reencrypt.md`](performance-codec-rotation-reencrypt.md)
+  — skipping a JSON round-trip in the codec-key-rotation re-encryption sweep
+  (issue #948).
+* [`docs/performance-sqlite-runtime-drive.md`](performance-sqlite-runtime-drive.md)
+  — the first profiling harness for `autumn-harvest-sqlite`; findings only, no
+  local fix cleared the floor.

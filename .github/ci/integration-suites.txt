@@ -47,6 +47,7 @@
 # two PRs each appending a line both land with no textual conflict; a
 # union-merge duplicate/reorder is caught (never a conflict) by
 allos        autumn-harvest         integration                      -                          benchmarks_docs
+allos        autumn-harvest         integration                      -                          hot_code_swap_docs
 allos        autumn-harvest         integration                      -                          partitioned_events_docs
 allos        autumn-harvest         integration                      testing                    -
 allos        autumn-harvest         integration                      testing,debugger           debugger_tests
@@ -113,6 +114,7 @@ linux        autumn-harvest         integration                      -          
 linux        autumn-harvest         integration                      -                          sharded_runtime_tests
 linux        autumn-harvest         integration                      -                          start_idempotency_tests
 linux        autumn-harvest         integration                      -                          start_source_tests
+linux        autumn-harvest         integration                      -                          terminal_write_ownership_tests
 linux        autumn-harvest         integration                      -                          transactional_start_tests
 linux        autumn-harvest         integration                      -                          triage_tests
 linux        autumn-harvest         integration                      -                          typed_workflow_failure_tests
@@ -120,6 +122,7 @@ linux        autumn-harvest         integration                      -          
 linux        autumn-harvest         integration                      -                          workflow_logs_tests
 linux        autumn-harvest         integration                      -                          workflow_reachability_samples_tests
 linux        autumn-harvest         integration                      -                          workflow_retry_tests
+linux        autumn-harvest         integration                      hot-code-swap,testing      hot_code_swap_tests
 linux        autumn-harvest         integration                      testing                    backup_verify_tests
 linux        autumn-harvest         integration                      testing                    codec_rotation_db_tests
 linux        autumn-harvest         integration                      testing                    cross_region_dr_tests

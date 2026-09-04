@@ -117,6 +117,17 @@ jobs:
         # the `quickstart`/build-only CI jobs run `cargo build`, which can't
         # itself be ambiguous. See scripts/check-default-run.sh.
         run: ./scripts/check-default-run.sh
+      - name: Check cargo-dev root caveat is documented
+        # Guards a real, reproduced-live defect: `cargo dev` is the flagship
+        # "no database, no Docker, nothing to configure" front door
+        # (README.md's Quick example, Chapter 1's fastest path), and it
+        # deliberately refuses to run as `root` — a real situation for Docker
+        # devcontainers and many CI base images, not a hypothetical, per the
+        # dev runtime's own doc comment (autumn-harvest-plugin/src/dev/postgres.rs,
+        # refuse_to_run_as_root). Neither front-door doc used to say so, so a
+        # newcomer in one of those environments hit an undocumented hard stop
+        # on the very first command. See scripts/check-dev-runtime-root-caveat.sh.
+        run: ./scripts/check-dev-runtime-root-caveat.sh
       - name: Check formatting
         run: cargo fmt --all -- --check
       - name: Clippy autumn-harvest
@@ -685,40 +696,64 @@ jobs:
             echo "::error::quickstart app never became healthy"; exit 1
           fi
 
-          # 2. Run the exact README "Step 3 — Run preflight" command. The
-          # binary must resolve (this is the check-default-run.sh regression
-          # class); the admin route itself may still 401 in the dev profile
-          # with no session (issue #1284, a getting-started auth-flow
-          # question tracked and decided separately, not this job's to fix).
-          # Only that specific, already-diagnosed outcome is tolerated — any
-          # other nonzero exit (wrong default-run binary, a crash, a changed
-          # error shape) fails the step rather than being swallowed by a
-          # blanket `|| true`.
+          # 2. README step 3 — run preflight with the EXACT documented command.
           #
-          # GitHub Actions' default `shell: bash` runs steps as `bash -eo
-          # pipefail {0}` — errexit is already on before this script's own
-          # `set -uo pipefail` ever runs. A plain `cli_out="$(cmd)"` where
-          # `cmd` is expected to exit nonzero (the known 401 case) would abort
-          # the whole step right there, before `cli_status=$?` is even
-          # reached. Wrapping the assignment as an `if` condition is the
-          # standard way to capture a command's real exit status without
-          # tripping errexit — `if`/`elif` conditions are explicitly exempt.
-          if cli_out="$(cargo run -p autumn-harvest-cli -- --base-url http://localhost:3000/api/harvest preflight 2>&1)"; then
+          # Two regression classes meet here, from two issues:
+          #
+          #   * #1319 — the bare `cargo run -p autumn-harvest-cli -- …` form the
+          #     docs use everywhere must resolve to a binary at all. Without
+          #     `default-run` cargo exits 101 ("could not determine which binary
+          #     to run") before the CLI parses a single argument.
+          #   * #1284 — the admin route behind it must actually answer. It 401'd
+          #     for every cookieless caller until the dev profile was taught to
+          #     admit one; only this step pins that against a REAL autumn-web
+          #     app, whose unconditional session layer inserts an empty
+          #     non-cookie-backed `Session` before the harvest router ever sees
+          #     the request — the shape that made the bug survive a plausible
+          #     fix.
+          #
+          # #1284 is FIXED as of this commit, so the 401 tolerance this step
+          # carried while that issue was open is deliberately GONE: a 401 here
+          # is now a regression, not a known outcome. Assert the raw status
+          # first so it reads as "401 came back" rather than as an opaque CLI
+          # exit code.
+          code="$(curl -s -o /dev/null -w '%{http_code}' \
+            http://localhost:3000/api/harvest/admin/preflight)"
+          echo "GET /admin/preflight -> ${code}"
+          if [ "${code}" = "401" ] || [ "${code}" = "403" ]; then
+            echo "::error::regression of issue #1284: the documented dev-profile preflight call is gated (${code}); AUTUMN_PROFILE=dev must serve the management API to an unauthenticated caller"
+            exit 1
+          fi
+          if [ "${code}" != "200" ]; then
+            echo "::error::preflight returned ${code}, expected 200"; exit 1
+          fi
+
+          # Then the documented command itself. Exit codes are deploy-gate
+          # friendly: 0 = pass, 2 = warn, 1 = fail or a transport/API error.
+          # Both 0 and 2 are accepted (a single-worker CI app can legitimately
+          # warn); 1 is not.
+          #
+          # Capturing the status is load-bearing: this step declares no
+          # `shell:`, so GitHub runs it with errexit already on, and the
+          # script's own `set -uo pipefail` adds `-u`/`pipefail` WITHOUT
+          # clearing it. A bare assignment from a command that exits nonzero
+          # would abort the step before the status could be read. An `if`
+          # condition is explicitly exempt from errexit, and capturing combined
+          # output also feeds the #1319 ambiguity check below.
+          if cli_out="$(cargo run -p autumn-harvest-cli -- \
+            --base-url http://localhost:3000/api/harvest preflight 2>&1)"; then
             cli_status=0
           else
             cli_status=$?
           fi
+          echo "${cli_out}"
+          echo "harvest preflight exit=${cli_status}"
           if echo "${cli_out}" | grep -q "could not determine which binary to run"; then
-            echo "${cli_out}"
-            echo "::error::cargo run -p autumn-harvest-cli -- ... is ambiguous (missing default-run)"; exit 1
+            echo "::error::regression of issue #1319: cargo run -p autumn-harvest-cli -- … is ambiguous (missing default-run)"; exit 1
           fi
-          if [ "${cli_status}" -eq 0 ]; then
-            echo "cli resolved and preflight succeeded"
-          elif [ "${cli_status}" -eq 1 ] && echo "${cli_out}" | grep -q "harvest API returned 401"; then
-            echo "cli resolved and ran (see issue #1284 for the known dev-profile 401)"
-          else
-            echo "${cli_out}"
-            echo "::error::cargo run -p autumn-harvest-cli -- ... preflight failed unexpectedly (exit ${cli_status}), not the known issue #1284 401"; exit 1
+          if [ "${cli_status}" != "0" ] && [ "${cli_status}" != "2" ]; then
+            echo "::error::harvest preflight exited ${cli_status}; README step 3 must pass (0) or warn (2), never fail"
+            exit 1
           fi
 
           # 3. Trigger the `greeting` workflow (README step 4) and capture its execution_id.

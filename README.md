@@ -39,11 +39,18 @@ That starts an ephemeral PostgreSQL, applies the migrations, runs a worker, and
 serves the management API and the Vantage dashboard — then prints the dashboard
 URL and one `curl` that starts a durable workflow. `Ctrl-C` reclaims everything
 it created. It is development-only and refuses to point at anything that is not
-a local database; see
+a local database — and, when provisioning its own cluster, it refuses to run as `root`
+too, since PostgreSQL itself won't; a real situation for Docker devcontainers
+and many CI images, not a hypothetical. That check is scoped to provisioning
+though: point it at a database you already have
+(`HARVEST_DEV_DATABASE_URL`) and it runs fine as root. See
 [Chapter 1](docs/getting-started/01-project-skeleton.md).
 
-Prefer to bring your own Postgres? `cargo run -p quickstart` (see
-[`examples/quickstart/`](examples/quickstart/)).
+Running as root with nothing provisioned yet, or would rather bring your own
+Postgres? `docker compose -f examples/quickstart/compose.yaml up -d`, then
+`AUTUMN_MANIFEST_DIR=examples/quickstart AUTUMN_PROFILE=dev cargo run -p
+quickstart` (see [`examples/quickstart/`](examples/quickstart/)) — Postgres
+runs in its own container there, so root has no bearing on it.
 
 For a chapter-by-chapter walkthrough — first workflow, durable timers, signals,
 child workflows, idempotency, and operating the service — read
@@ -420,6 +427,22 @@ resolvability, worker queue coverage and freshness, DLQ read access, retention
 visibility, and whether the admin API has an auth boundary in non-dev profiles.
 The default output is a compact table; `--output json` returns the same response
 shape as the API for CI and release scripts.
+
+**Authenticating the call.** `/admin/preflight` is admin-gated like every other
+`/admin` route, and how you satisfy that gate depends on the profile:
+
+- **`AUTUMN_PROFILE=dev` with no auth boundary** — nothing to do. The management
+  API is served unauthenticated to any caller that can reach the socket, so the
+  command above works as written against a local app (this is what makes the
+  [quickstart](examples/quickstart/README.md)'s preflight step run). The app logs
+  a warning at startup when it is in this state, and preflight's own
+  `admin_auth_boundary` check reports it as `unauthenticated_access: true` —
+  do not expose such a process beyond localhost.
+- **Any other profile** — the gate is fail-closed. Pass a scoped API token with
+  `--token` / `HARVEST_TOKEN` (a `read` scope is enough; see
+  `harvest token --help`), or run the command from a context that carries an
+  admin session for whatever middleware you mounted via
+  `HarvestPlugin::api_with_auth`.
 
 Exit codes are deploy-gate friendly: `0` means `overall_status = pass`, `2`
 means `warn`, and `1` means `fail` or a transport/API error. Use warning exit

@@ -607,6 +607,22 @@ pub struct HandlerRegistry {
     /// resolved and its guest run instead. Empty = no WASM activities.
     #[cfg(feature = "wasm-activities")]
     wasm_activities: HashMap<String, crate::wasm_store::WasmBinding>,
+    /// The module-hosting policy for this worker (issue #967). `None` (the
+    /// default) means no module hosting is configured and the workflow dispatch
+    /// path is byte-for-byte what it was.
+    ///
+    /// A whole [`ModuleHost`](crate::hot_swap::ModuleHost) rather than just the
+    /// registry, because the host carries the guest's *policy* — the activity
+    /// allowlist, the queue-override switch, the capability grant and the
+    /// decide budget — and dispatch has to apply the operator's policy, not a
+    /// default one. Storing only the registry meant the dispatch seam built a
+    /// fresh `ModuleHost::new` per task, silently discarding every restriction
+    /// configured through `allowing_activities` and leaving production guests
+    /// able to schedule any activity the worker knows (Codex review round 1).
+    /// Dispatch clones this prototype and stamps the execution's build id and
+    /// resolved module onto the clone.
+    #[cfg(feature = "hot-code-swap")]
+    module_host: Option<crate::hot_swap::ModuleHost>,
     /// Shared engine + compiled-module cache for WASM activities (issue #965).
     /// One per worker, created lazily by the builder. `None` = no WASM
     /// activities registered.
@@ -787,6 +803,8 @@ impl HandlerRegistry {
             activity_interceptors: Vec::new(),
             #[cfg(feature = "wasm-activities")]
             wasm_activities: HashMap::new(),
+            #[cfg(feature = "hot-code-swap")]
+            module_host: None,
             #[cfg(feature = "wasm-activities")]
             wasm_store: None,
             #[cfg(feature = "wasm-activities")]
@@ -1008,6 +1026,54 @@ impl HandlerRegistry {
         self.wasm_activities.get(activity_name)
     }
 
+    /// Attach the process's loaded workflow-module registry (issue #967), with
+    /// the default guest policy: deny-all capabilities, the default decide
+    /// budget, **no** activity allowlist and no queue override.
+    ///
+    /// Present = this worker hosts module-backed workflows, and the workflow
+    /// dispatch path binds a [`ModuleHost`](crate::hot_swap::ModuleHost) around
+    /// each handler drive. Absent (the default) = the dispatch path is
+    /// byte-for-byte what it was.
+    ///
+    /// Use [`with_module_host`](Self::with_module_host) to restrict what the
+    /// guest may do: "no allowlist" means a guest may schedule **any** activity
+    /// this worker has registered.
+    #[cfg(feature = "hot-code-swap")]
+    #[must_use]
+    pub fn with_module_registry(self, registry: Arc<crate::hot_swap::ModuleRegistry>) -> Self {
+        self.with_module_host(crate::hot_swap::ModuleHost::new(registry))
+    }
+
+    /// Attach a fully configured module-hosting policy (issue #967).
+    ///
+    /// The prototype's activity allowlist, queue-override switch, capability
+    /// grant and decide budget are the ones every module-hosted workflow on this
+    /// worker runs under; dispatch clones it per task and stamps on the
+    /// execution's assigned build id and its pre-resolved module. Its
+    /// `build_id` and `pinned_module` are therefore ignored here — they are
+    /// per-execution facts, not worker configuration.
+    #[cfg(feature = "hot-code-swap")]
+    #[must_use]
+    pub fn with_module_host(mut self, host: crate::hot_swap::ModuleHost) -> Self {
+        self.module_host = Some(host);
+        self
+    }
+
+    /// The loaded workflow-module registry, if module hosting is configured
+    /// (issue #967).
+    #[cfg(feature = "hot-code-swap")]
+    #[must_use]
+    pub fn module_registry(&self) -> Option<&Arc<crate::hot_swap::ModuleRegistry>> {
+        self.module_host.as_ref().map(|host| &host.registry)
+    }
+
+    /// The worker's module-hosting policy prototype, if configured (issue #967).
+    #[cfg(feature = "hot-code-swap")]
+    #[must_use]
+    pub const fn module_host(&self) -> Option<&crate::hot_swap::ModuleHost> {
+        self.module_host.as_ref()
+    }
+
     /// Borrow the shared WASM module store, if any WASM activity is registered
     /// (issue #965).
     #[cfg(feature = "wasm-activities")]
@@ -1191,6 +1257,11 @@ impl std::fmt::Debug for HandlerRegistry {
                 "wasm_module_registration_count",
                 &self.wasm_module_registrations.len(),
             );
+        // Issue #967: print whether module hosting is configured, not the
+        // registry itself — its `Debug` walks every binding and reads the
+        // compiled-module cache, which is far more than a registry dump wants.
+        #[cfg(feature = "hot-code-swap")]
+        d.field("workflow_module_hosting", &self.module_host.is_some());
         d.finish()
     }
 }
@@ -1437,8 +1508,13 @@ struct PreparedWorkflowTask {
     was_cache_hit: bool,
 }
 
+/// `#[doc(hidden)]`: test-support-reachable, not semver-stable surface --
+/// pub only so [`WorkflowTaskPersistence::new_for_test`] can be named from an
+/// integration test that drives [`persist_workflow_continue_as_new`] directly
+/// (issue #1184).
+#[doc(hidden)]
 #[derive(Debug, Clone)]
-struct WorkflowTaskPersistence<'a> {
+pub struct WorkflowTaskPersistence<'a> {
     task: &'a TaskQueueItem,
     worker_id: &'a str,
     exec_id: ExecutionId,
@@ -1460,6 +1536,36 @@ struct WorkflowTaskPersistence<'a> {
 }
 
 impl<'a> WorkflowTaskPersistence<'a> {
+    /// Test-only constructor so an integration test can drive
+    /// [`persist_workflow_continue_as_new`] directly without reconstructing
+    /// this crate's full dispatch cycle. `#[doc(hidden)]`: test-support, not
+    /// semver-stable surface -- same convention as [`preload_failure_history`]
+    /// and the other `#[doc(hidden)] pub` items in this module.
+    #[doc(hidden)]
+    #[must_use]
+    #[allow(clippy::too_many_arguments)]
+    pub const fn new_for_test(
+        task: &'a TaskQueueItem,
+        worker_id: &'a str,
+        exec_id: ExecutionId,
+        next_event_id: i32,
+        sticky_timeout: Duration,
+        carryover_result: Option<serde_json::Value>,
+        carryover_error: Option<String>,
+        carryover_scheduled_time: Option<chrono::DateTime<chrono::Utc>>,
+    ) -> Self {
+        Self {
+            task,
+            worker_id,
+            exec_id,
+            next_event_id,
+            sticky_timeout,
+            carryover_result,
+            carryover_error,
+            carryover_scheduled_time,
+        }
+    }
+
     /// Build a sticky hint bound to this worker, or `None` when sticky routing
     /// is disabled (timeout == 0).
     const fn sticky_hint(&self) -> Option<queue::StickyHint<'a>> {
@@ -7058,11 +7164,13 @@ async fn update_workflow_execution_failed(
 /// safe at both call sites: each shares `pause_workflow_execution`'s `FOR
 /// UPDATE` row lock, so a concurrent resume serialises after this check
 /// commits and issues its own wake.
-async fn check_paused_and_park(
+#[doc(hidden)]
+pub async fn check_paused_and_park(
     conn: &mut AsyncPgConnection,
     exec_uuid: uuid::Uuid,
     task_id: uuid::Uuid,
     worker_id: &str,
+    crash_strikes: i32,
     sticky_timeout: Duration,
 ) -> HarvestResult<bool> {
     use crate::schema::harvest_workflow_executions::dsl as exec_dsl;
@@ -7076,6 +7184,16 @@ async fn check_paused_and_park(
         .map_err(crate::error::database_error)?;
     if locked_state.as_deref() != Some("PAUSED") {
         return Ok(false);
+    }
+    // Issue #1184: the execution row lock above says nothing about who still
+    // holds the TASK row's claim -- a poison-pill reclaim, an operator
+    // requeue, or a concurrent claim race on `harvest_task_queue` can move it
+    // without touching `harvest_workflow_executions` at all. Re-derive that
+    // ownership under its own row lock (the established #804/#1182 guard)
+    // before parking: a stale dispatcher must not misdirect a row a new
+    // owner is now driving by re-parking it under its own now-invalid claim.
+    if !queue::claim_still_held_for_update(conn, task_id, worker_id, crash_strikes).await? {
+        return Err(HarvestError::TerminalWriteClaimAmbiguous { task_id });
     }
     let sticky = if sticky_timeout.is_zero() {
         None
@@ -7110,7 +7228,16 @@ async fn block_workflow_for_non_determinism(
         use crate::schema::harvest_workflow_executions::dsl as exec_dsl;
         let error_owned = error_owned.clone();
         let patch = patch.clone();
-        if check_paused_and_park(conn, exec_uuid, task_id, worker_id, sticky_timeout).await? {
+        if check_paused_and_park(
+            conn,
+            exec_uuid,
+            task_id,
+            worker_id,
+            task.crash_strikes,
+            sticky_timeout,
+        )
+        .await?
+        {
             return Ok(true);
         }
 
@@ -7232,12 +7359,14 @@ fn resolve_workflow_concurrency(
 }
 
 #[allow(clippy::too_many_arguments)]
-async fn persist_workflow_completion(
+#[doc(hidden)]
+pub async fn persist_workflow_completion(
     conn: &mut AsyncPgConnection,
     task_id: uuid::Uuid,
     exec_id: ExecutionId,
     next_event_id: i32,
     worker_id: &str,
+    crash_strikes: i32,
     output: serde_json::Value,
     metrics: Option<&(dyn crate::telemetry::MetricsRecorder + Send + Sync)>,
     offloader: Option<&crate::payload_store::PayloadOffloader>,
@@ -7250,6 +7379,14 @@ async fn persist_workflow_completion(
     };
     let (deferred, closed_children) =
         Box::pin(conn.transaction::<_, HarvestError, _>(async |conn| {
+            // Issue #1184: re-derive the task-row claim under its own lock
+            // before committing this completion. The execution row lock this
+            // transaction holds says nothing about `harvest_task_queue`
+            // ownership -- a stale dispatcher whose claim was reclaimed
+            // elsewhere must make no terminal decision here.
+            if !queue::claim_still_held_for_update(conn, task_id, worker_id, crash_strikes).await? {
+                return Err(HarvestError::TerminalWriteClaimAmbiguous { task_id });
+            }
             store::append_events_offloaded_with_codecs(
                 conn,
                 exec_id,
@@ -7313,12 +7450,14 @@ async fn check_and_report_unfinished_handlers_for_worker(
 }
 
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
-async fn persist_workflow_failure(
+#[doc(hidden)]
+pub async fn persist_workflow_failure(
     conn: &mut AsyncPgConnection,
     task_id: uuid::Uuid,
     exec_id: ExecutionId,
     next_event_id: i32,
     worker_id: &str,
+    crash_strikes: i32,
     error: &str,
     nd_details: Option<&crate::error::NonDeterministicDetails>,
     execution: Option<&WorkflowExecution>,
@@ -7441,6 +7580,12 @@ async fn persist_workflow_failure(
             let decoded = decoded.clone();
             let retry_fire_info = retry_fire_info.clone();
             let exec_ref = execution;
+            // Issue #1184: re-derive the task-row claim under its own lock
+            // before committing this failure -- see the identical guard in
+            // `persist_workflow_completion` for the rationale.
+            if !queue::claim_still_held_for_update(conn, task_id, worker_id, crash_strikes).await? {
+                return Err(HarvestError::TerminalWriteClaimAmbiguous { task_id });
+            }
             store::append_events_with_codecs(
                 conn,
                 exec_id,
@@ -11740,37 +11885,78 @@ pub async fn fail_task_and_execution_with_history(
     // same registry replay decodes with.
     codecs: &crate::payload_codec::PayloadCodecs,
 ) -> HarvestResult<()> {
-    let (exec_id, next_event_id) = match preloaded {
-        PreloadedFailureHistory::NoExecution => {
-            return fail_task_only(conn, task.id, error).await;
+    let task_id = task.id;
+    let crash_strikes = task.crash_strikes;
+    // Issue #1184: guard every branch's write with the same ownership
+    // recheck, and wrap the whole thing in a transaction so the check and
+    // the write(s) it protects commit or roll back together. `conn.transaction`
+    // nests transparently as a SAVEPOINT when this is already called from
+    // inside one (e.g. `commit_terminal_failure_if_still_claimed`'s own
+    // transaction), so this is safe to call unconditionally regardless of
+    // caller context.
+    Box::pin(conn.transaction::<(), HarvestError, _>(async |conn| {
+        // Issue #1184 self-review finding: `Unavailable`/`Loaded` both touch
+        // the execution row (directly here, or via `persist_workflow_failure`
+        // below), and this function is reached from callers -- notably
+        // `fail_task_and_execution`'s session-acquire/session-release paths
+        // (worker.rs `handle_session_acquire`/`handle_session_release`) --
+        // that open no transaction and so hold no prior lock at all. Taking
+        // the task-row claim check FIRST there would lock the task row before
+        // the execution row, inverting the documented `harvest_task_queue`
+        // convention (execution row first, see `lock_workflow_execution_row_only`'s
+        // own doc comment) and opening a real ABBA cycle against
+        // `timeout::force_fail_activity`, which locks the SAME two rows in
+        // the documented order (execution, then the specific task). Lock the
+        // execution row here, before any task-row touch, so every branch
+        // below is safe regardless of what the caller already held.
+        if let Some(exec_id) = preloaded.exec_id() {
+            lock_workflow_execution_row_only(conn, exec_id).await?;
         }
-        PreloadedFailureHistory::Unavailable { exec_id } => {
-            update_workflow_execution_failed(conn, exec_id, worker_id, error, None).await?;
-            return queue::fail_task(conn, task.id, error).await;
-        }
-        PreloadedFailureHistory::Loaded {
+
+        let (exec_id, next_event_id) = match preloaded {
+            PreloadedFailureHistory::NoExecution => {
+                if !queue::claim_still_held_for_update(conn, task_id, worker_id, crash_strikes)
+                    .await?
+                {
+                    return Err(HarvestError::TerminalWriteClaimAmbiguous { task_id });
+                }
+                return fail_task_only(conn, task_id, error).await;
+            }
+            PreloadedFailureHistory::Unavailable { exec_id } => {
+                if !queue::claim_still_held_for_update(conn, task_id, worker_id, crash_strikes)
+                    .await?
+                {
+                    return Err(HarvestError::TerminalWriteClaimAmbiguous { task_id });
+                }
+                update_workflow_execution_failed(conn, exec_id, worker_id, error, None).await?;
+                return queue::fail_task(conn, task_id, error).await;
+            }
+            PreloadedFailureHistory::Loaded {
+                exec_id,
+                next_event_id,
+            } => (exec_id, next_event_id),
+        };
+
+        persist_workflow_failure(
+            conn,
+            task_id,
             exec_id,
             next_event_id,
-        } => (exec_id, next_event_id),
-    };
-
-    persist_workflow_failure(
-        conn,
-        task.id,
-        exec_id,
-        next_event_id,
-        worker_id,
-        error,
-        None,
-        None,
-        None,
-        None,
-        None,
-        crate::types::Priority::default(),
-        codecs,
-    )
+            worker_id,
+            crash_strikes,
+            error,
+            None,
+            None,
+            None,
+            None,
+            None,
+            crate::types::Priority::default(),
+            codecs,
+        )
+        .await
+        .map(|_| ())
+    }))
     .await
-    .map(|_| ())
 }
 
 async fn finalize_activity_completion(
@@ -12150,12 +12336,14 @@ pub async fn wake_parent_for_child_failure(
 }
 
 #[allow(clippy::too_many_arguments)]
-async fn persist_child_workflow_completion(
+#[doc(hidden)]
+pub async fn persist_child_workflow_completion(
     conn: &mut AsyncPgConnection,
     task_id: uuid::Uuid,
     exec_id: ExecutionId,
     next_event_id: i32,
     worker_id: &str,
+    crash_strikes: i32,
     parent_exec_id: ExecutionId,
     output: serde_json::Value,
     metrics: Option<&(dyn crate::telemetry::MetricsRecorder + Send + Sync)>,
@@ -12170,6 +12358,12 @@ async fn persist_child_workflow_completion(
     let (deferred, closed_children) =
         Box::pin(conn.transaction::<_, HarvestError, _>(async |conn| {
             let output = output.clone();
+            // Issue #1184: same task-row ownership recheck as
+            // `persist_workflow_completion` -- see its guard for the
+            // rationale.
+            if !queue::claim_still_held_for_update(conn, task_id, worker_id, crash_strikes).await? {
+                return Err(HarvestError::TerminalWriteClaimAmbiguous { task_id });
+            }
             store::append_events_with_codecs(conn, exec_id, &[event], next_event_id, codecs)
                 .await?;
             update_workflow_execution_completed(conn, exec_id, worker_id, &output).await?;
@@ -12201,12 +12395,14 @@ async fn persist_child_workflow_completion(
 }
 
 #[allow(clippy::too_many_arguments)]
-async fn persist_child_workflow_failure(
+#[doc(hidden)]
+pub async fn persist_child_workflow_failure(
     conn: &mut AsyncPgConnection,
     task_id: uuid::Uuid,
     exec_id: ExecutionId,
     next_event_id: i32,
     worker_id: &str,
+    crash_strikes: i32,
     parent_exec_id: ExecutionId,
     error: &str,
     nd_details: Option<&crate::error::NonDeterministicDetails>,
@@ -12227,6 +12423,11 @@ async fn persist_child_workflow_failure(
         Box::pin(conn.transaction::<_, HarvestError, _>(async |conn| {
             let raw_error = error.to_string();
             let message = decoded.message.clone();
+            // Issue #1184: same task-row ownership recheck as
+            // `persist_workflow_failure` -- see its guard for the rationale.
+            if !queue::claim_still_held_for_update(conn, task_id, worker_id, crash_strikes).await? {
+                return Err(HarvestError::TerminalWriteClaimAmbiguous { task_id });
+            }
             store::append_events_with_codecs(
                 conn,
                 exec_id,
@@ -15162,7 +15363,8 @@ async fn handle_suspended_workflow(
     .await
 }
 
-async fn fail_execution_on_error<T>(
+#[doc(hidden)]
+pub async fn fail_execution_on_error<T>(
     conn: &mut AsyncPgConnection,
     task: &TaskQueueItem,
     worker_id: &str,
@@ -15189,6 +15391,19 @@ async fn fail_execution_on_error<T>(
     // back the enclosing transaction and perform the standalone claim
     // release afterward, rather than terminally failing the run here.
     if error.suspended_claim_ambiguous().is_some() {
+        return Err(error);
+    }
+    // Issue #1184 (Codex review round 1, P1): the identical blameless,
+    // no-decision-made shape as the #1182 case just above -- a guard inside
+    // `persist_workflow_continue_as_new`'s seal transaction (or any other
+    // #1184-guarded write reachable from here) can raise this instead. It
+    // must pass through un-failed for the same reason: if the transient
+    // contention that caused it clears before a second, unguarded
+    // `fail_task_and_execution` call below ran, that second call's OWN
+    // guard would find the claim genuinely still held and actually commit a
+    // `WorkflowFailed` -- turning a blameless "no decision, release and let
+    // the same owner retry" into a real terminal failure.
+    if error.terminal_write_claim_ambiguous().is_some() {
         return Err(error);
     }
     fail_task_and_execution(conn, task, worker_id, &error.to_string(), codecs).await?;
@@ -15694,6 +15909,7 @@ async fn reject_child_continue_as_new(
             persistence.exec_id,
             persistence.next_event_id,
             persistence.worker_id,
+            persistence.task.crash_strikes,
             error,
             None,
             None,
@@ -15711,6 +15927,7 @@ async fn reject_child_continue_as_new(
             persistence.exec_id,
             persistence.next_event_id,
             persistence.worker_id,
+            persistence.task.crash_strikes,
             parent_exec_id,
             error,
             None,
@@ -15824,6 +16041,7 @@ async fn check_continue_as_new_type<'a>(
         persistence.exec_id,
         persistence.next_event_id,
         persistence.worker_id,
+        persistence.task.crash_strikes,
         &error,
         None,
         None,
@@ -16311,7 +16529,8 @@ fn resolve_continue_as_new_successor_defaults<'a>(
 }
 
 #[allow(clippy::too_many_lines)]
-async fn persist_workflow_continue_as_new(
+#[doc(hidden)]
+pub async fn persist_workflow_continue_as_new(
     conn: &mut AsyncPgConnection,
     registry: &HandlerRegistry,
     persistence: WorkflowTaskPersistence<'_>,
@@ -16368,6 +16587,7 @@ async fn persist_workflow_continue_as_new(
     // database as its predecessor.
     let new_exec_id = ExecutionId::new_for_shard(persistence.exec_id.shard());
     let task_id = persistence.task.id;
+    let crash_strikes = persistence.task.crash_strikes;
     let exec_id = persistence.exec_id;
     // Provenance ref for the successor is the predecessor execution id (#740).
     let predecessor_exec_id_str = exec_id.to_string();
@@ -16489,6 +16709,7 @@ async fn persist_workflow_continue_as_new(
             exec_id,
             next_event_id,
             worker_id,
+            persistence.task.crash_strikes,
             &error,
             None,
             None,
@@ -16586,6 +16807,14 @@ async fn persist_workflow_continue_as_new(
     enqueue.rate_limit_key = persistence.task.rate_limit_key.clone();
 
     Box::pin(conn.transaction::<(), HarvestError, _>(async |conn| {
+        // Issue #1184: this transaction seals the predecessor
+        // (CONTINUED_AS_NEW) and completes its task row -- an ordinary
+        // terminal write not enumerated by name in the issue, but the same
+        // shape as `persist_workflow_completion`'s gap, found while auditing
+        // this call chain. Guard it the same way before anything is written.
+        if !queue::claim_still_held_for_update(conn, task_id, worker_id, crash_strikes).await? {
+            return Err(HarvestError::TerminalWriteClaimAmbiguous { task_id });
+        }
         // Append the terminal continued-as-new marker to the old run.
         store::append_events_offloaded_with_codecs(
             conn,
@@ -16715,6 +16944,7 @@ async fn persist_workflow_outcome(
                 persistence.exec_id,
                 persistence.next_event_id,
                 persistence.worker_id,
+                persistence.task.crash_strikes,
                 parent_id,
                 output,
                 Some(registry.telemetry().metrics.as_ref()),
@@ -16731,6 +16961,7 @@ async fn persist_workflow_outcome(
                 persistence.exec_id,
                 persistence.next_event_id,
                 persistence.worker_id,
+                persistence.task.crash_strikes,
                 output,
                 Some(registry.telemetry().metrics.as_ref()),
                 registry.payload_offloader(),
@@ -16763,6 +16994,7 @@ async fn persist_workflow_outcome(
                 persistence.exec_id,
                 persistence.next_event_id,
                 persistence.worker_id,
+                persistence.task.crash_strikes,
                 parent_id,
                 &error,
                 non_deterministic_details.as_ref(),
@@ -16800,6 +17032,7 @@ async fn persist_workflow_outcome(
                 persistence.exec_id,
                 persistence.next_event_id,
                 persistence.worker_id,
+                persistence.task.crash_strikes,
                 &error,
                 non_deterministic_details.as_ref(),
                 Some(execution),
@@ -16887,6 +17120,158 @@ async fn persist_workflow_outcome(
                 .await
                 .map(|()| (false, vec![(exec_id, Some(workflow_name))]))
         }
+    }
+}
+
+/// This cycle's terminal-metrics facts, captured in
+/// [`process_workflow_task`] before its outcome moves into the persist
+/// transaction, and actually emitted only from that transaction's
+/// `Persisted` arm (issue #1184, Codex review round 2, P2) -- see
+/// `emit_pending_workflow_metrics`'s doc comment for why.
+struct PendingWorkflowMetrics {
+    status: WorkflowStatus,
+    is_canary: bool,
+    canary_shard: u16,
+    /// `Some` only when this cycle is neither a canary nor `Suspended` --
+    /// mirrors the original `!is_canary` / `!matches!(Suspended)` gates.
+    history_size: Option<u64>,
+    is_continued_as_new: bool,
+    terminal: TerminalMetricsKind,
+    /// `harvest.workflow.duration`'s value, measured here rather than at
+    /// emission time (Codex review round 4, P2): `record_workflow_completed`
+    /// documents this as HANDLER runtime, so it must stop the clock the
+    /// moment the decision cycle itself finished, not after the emitter's
+    /// post-commit housekeeping (deferred schedule counters, unfinished-
+    /// handler checks, history-bloat reads/retries) has also run -- those are
+    /// unrelated DB latency this metric must not absorb.
+    duration_secs: f64,
+    /// `harvest.canary.roundtrip`'s value (start-requested → completed
+    /// wall-clock, AC5) for the SAME reason as `duration_secs`: `Some` only
+    /// for a canary's `Completed` outcome, `None` otherwise (unused).
+    canary_roundtrip_secs: Option<f64>,
+}
+
+/// Which terminal (or non-terminal) shape this cycle's outcome had, for
+/// [`PendingWorkflowMetrics`].
+enum TerminalMetricsKind {
+    Completed,
+    Failed {
+        had_nd_details: bool,
+    },
+    ContinuedAsNew,
+    /// Not terminal -- carried only so the emitter's `match` stays exhaustive
+    /// and explicit about doing nothing here (issue #519).
+    Suspended,
+}
+
+/// Emit the `harvest.workflow.*`/`harvest.canary.*` terminal metrics
+/// [`process_workflow_task`] computed for this cycle, from `pending`.
+///
+/// Issue #1184 (Codex review round 2, P2): these calls used to run BEFORE
+/// the persist transaction, so a claim-ambiguity rollback (this issue's own
+/// guards, or #1182's `SuspendedClaimAmbiguous`) or an operator pause caught
+/// by `check_paused_and_park` inside that transaction still counted a
+/// decision that was never durably persisted -- and the eventual real
+/// attempt counts it again (worse for a canary: it could report SUCCESS for
+/// a decision that was discarded). Callers must call this ONLY after the
+/// persist transaction has actually committed (the `Persisted` arm), never
+/// speculatively -- mirrors the discipline issue #684 already established
+/// for `harvest.update.completed`/`.failed` and `harvest.signal.unhandled`.
+fn emit_pending_workflow_metrics(
+    telemetry: &crate::telemetry::TelemetryConfig,
+    execution: &WorkflowExecution,
+    queue_name: &str,
+    build_id: &str,
+    pending: &PendingWorkflowMetrics,
+) {
+    if !pending.is_canary {
+        telemetry.metrics.record_workflow_completed(
+            &execution.workflow_name,
+            queue_name,
+            pending.duration_secs,
+            pending.status,
+        );
+        if let Some(history_size) = pending.history_size {
+            telemetry
+                .metrics
+                .record_workflow_history_size(&execution.workflow_name, history_size);
+        }
+        if pending.is_continued_as_new {
+            telemetry
+                .metrics
+                .record_workflow_continue_as_new(&execution.workflow_name);
+        }
+    }
+    // Emit the once-per-terminal-outcome counter (issue #519). Suspended is
+    // not a terminal state -- a workflow that suspends N times and then
+    // completes must produce exactly one `completed` increment.
+    //
+    // The non-canary terminal counter routes through
+    // `crate::telemetry::emit_workflow_terminal`, the single choke point that
+    // skips canary probes (issue #796) -- so the canary-skip for the terminal
+    // counter lives in exactly one place; the canary branches below emit only
+    // the probe's own `harvest.canary.*` signal.
+    match &pending.terminal {
+        TerminalMetricsKind::Completed => {
+            if pending.is_canary {
+                telemetry
+                    .metrics
+                    .record_canary_success(queue_name, pending.canary_shard);
+                telemetry.metrics.record_canary_roundtrip(
+                    queue_name,
+                    pending.canary_shard,
+                    pending.canary_roundtrip_secs.unwrap_or(0.0),
+                );
+            } else {
+                crate::telemetry::emit_workflow_terminal(
+                    &*telemetry.metrics,
+                    &execution.workflow_name,
+                    queue_name,
+                    WorkflowStatus::Completed,
+                );
+            }
+        }
+        TerminalMetricsKind::Failed { had_nd_details } => {
+            // Defensive (issue #603): an ND-carrying Failed outcome is gated
+            // earlier into `block_workflow_for_non_determinism` (which emits
+            // the detection counter itself) and never reaches this arm.
+            // Asserted so a future regression that lets this happen panics
+            // loudly in debug/test builds instead of silently double-counting
+            // (or, worse, silently NOT counting once the gate is removed).
+            debug_assert!(
+                !had_nd_details,
+                "ND-carrying Failed outcome must be gated earlier in \
+                 process_workflow_task, before terminal metrics are recorded"
+            );
+            if *had_nd_details {
+                telemetry
+                    .metrics
+                    .record_workflow_non_determinism(&execution.workflow_name, build_id);
+            }
+            if pending.is_canary {
+                telemetry
+                    .metrics
+                    .record_canary_failure(queue_name, pending.canary_shard);
+            } else {
+                crate::telemetry::emit_workflow_terminal(
+                    &*telemetry.metrics,
+                    &execution.workflow_name,
+                    queue_name,
+                    WorkflowStatus::Failed,
+                );
+            }
+        }
+        TerminalMetricsKind::ContinuedAsNew => {
+            // A canary never continues-as-new; the choke point skips it anyway
+            // (AC8), so this is effectively unreachable for a canary.
+            crate::telemetry::emit_workflow_terminal(
+                &*telemetry.metrics,
+                &execution.workflow_name,
+                queue_name,
+                WorkflowStatus::ContinuedAsNew,
+            );
+        }
+        TerminalMetricsKind::Suspended => {} // not terminal — no counter
     }
 }
 
@@ -17446,7 +17831,8 @@ async fn suspended_command_event_count(
 }
 
 #[allow(clippy::too_many_arguments)]
-async fn move_workflow_to_dlq_for_history_cap(
+#[doc(hidden)]
+pub async fn move_workflow_to_dlq_for_history_cap(
     conn: &mut AsyncPgConnection,
     task: &TaskQueueItem,
     exec_id: ExecutionId,
@@ -17465,6 +17851,22 @@ async fn move_workflow_to_dlq_for_history_cap(
         Box::pin(conn.transaction::<_, HarvestError, _>(async |conn| {
             use crate::schema::harvest_workflow_executions::dsl as exec_dsl;
             let reason = reason.clone();
+            // Issue #1184 (Codex review round 3, P1): this transaction had no
+            // ownership recheck at all -- a stale dispatcher whose claim had
+            // already moved could still DLQ and terminally fail a run its new
+            // owner was actively driving. Lock the execution row FIRST (the
+            // documented `harvest_task_queue` convention -- see
+            // `lock_workflow_execution_row_only`'s doc comment -- and this
+            // function's own subsequent `update_workflow_execution_failed`
+            // write to that same row), before the task-row claim check, so
+            // this can never invert against `timeout::enforce_workflow_timeout`
+            // /`force_fail_activity`'s execution-then-task lock order.
+            lock_workflow_execution_row_only(conn, exec_id).await?;
+            if !queue::claim_still_held_for_update(conn, task.id, worker_id, task.crash_strikes)
+                .await?
+            {
+                return Err(HarvestError::TerminalWriteClaimAmbiguous { task_id: task.id });
+            }
             let (owner, severity) = exec_dsl::harvest_workflow_executions
                 .find(exec_id.as_uuid())
                 .select((exec_dsl::owner, exec_dsl::severity))
@@ -17736,21 +18138,6 @@ async fn fail_workflow_for_history_cap(
     cap: u64,
 ) -> HarvestResult<Vec<crate::completion_trigger::DeferredTriggerStart>> {
     let terminal_count = u64::try_from(next_event_id).unwrap_or(0).saturating_add(1);
-    telemetry.metrics.record_workflow_completed(
-        &execution.workflow_name,
-        &task.queue_name,
-        started_at.elapsed().as_secs_f64(),
-        WorkflowStatus::Failed,
-    );
-    telemetry
-        .metrics
-        .record_workflow_history_size(&execution.workflow_name, terminal_count);
-    crate::telemetry::emit_workflow_terminal(
-        &*telemetry.metrics,
-        &execution.workflow_name,
-        &task.queue_name,
-        WorkflowStatus::Failed,
-    );
 
     // Issue #704 (PR #1139 review, second round): decide the crossing from
     // `terminal_count` -- the DURABLE post-failure event count, computed
@@ -17780,6 +18167,17 @@ async fn fail_workflow_for_history_cap(
             execution.history_bloat_warned_at.is_some(),
         );
 
+    // Issue #1184 (Codex review round 5): captured here, before the DLQ
+    // transaction below, not after it returns. `record_workflow_completed`
+    // defines this value as handler runtime; reading `started_at.elapsed()`
+    // after `move_workflow_to_dlq_for_history_cap` returns would fold in
+    // that call's own persistence latency (row locks, the DLQ/cascade
+    // writes), inflating `harvest.workflow.duration` for hard-cap failures
+    // whenever that transaction is slow. The metric is still only emitted
+    // once the transaction has actually committed (below) -- only the
+    // measurement moves, not the emission.
+    let duration_secs = started_at.elapsed().as_secs_f64();
+
     let reason = DeadLetterReason::HistoryCapExceeded {
         count: event_count,
         cap,
@@ -17797,6 +18195,33 @@ async fn fail_workflow_for_history_cap(
         registry.payload_codecs(),
     )
     .await?;
+
+    // Issue #1184 (Codex review round 3, self-applied): emitted only now
+    // that `move_workflow_to_dlq_for_history_cap`'s transaction has actually
+    // committed -- that transaction gained an ownership guard in this same
+    // change (Codex round 3, P1) and can now roll back for a blameless
+    // claim-ambiguity reason, not just a genuine DB error. Emitting these
+    // before the call (the previous ordering) meant a rolled-back attempt
+    // still counted a decision that was never durably persisted, and the
+    // eventual real attempt counts it again -- the identical class of bug
+    // fixed for the ordinary terminal-outcome path in
+    // `emit_pending_workflow_metrics` (round 2, P2); same fix, applied here
+    // for consistency since this path has the same new failure mode.
+    telemetry.metrics.record_workflow_completed(
+        &execution.workflow_name,
+        &task.queue_name,
+        duration_secs,
+        WorkflowStatus::Failed,
+    );
+    telemetry
+        .metrics
+        .record_workflow_history_size(&execution.workflow_name, terminal_count);
+    crate::telemetry::emit_workflow_terminal(
+        &*telemetry.metrics,
+        &execution.workflow_name,
+        &task.queue_name,
+        WorkflowStatus::Failed,
+    );
 
     // Issue #704 (PR #1139 review, Nth round): emit/stamp the crossing only
     // AFTER `move_workflow_to_dlq_for_history_cap` above has returned `Ok`
@@ -17910,6 +18335,49 @@ async fn process_workflow_task(
             // about whether it still hangs.
             phase: CapabilityMissPhase::BeforeHandler,
         });
+    };
+
+    // Issue #967 (R&D spike, `hot-code-swap` feature): a module-hosted workflow
+    // needs its runtime module resolved BEFORE the handler runs. Resolving it
+    // inside the handler would make a missing module an `Err(String)`, which the
+    // executor turns into a terminal `WorkflowFailed` — so a worker that had not
+    // yet synced a build, or had retired it early, would *destroy* every
+    // execution assigned to that build rather than leave it for a worker that
+    // can serve it.
+    //
+    // Raised as the same typed capability miss the unknown-workflow-type check
+    // above uses (issue #804): the dispatch path releases the claim back to
+    // PENDING for a capable peer and only escalates to terminal failure once the
+    // redelivery budget is exhausted. Which is exactly right — "this worker
+    // cannot run this build" is a property of the worker, not of the execution.
+    //
+    // The resolved `Arc` is KEPT (Codex review round 1), not merely tested for
+    // presence, and handed to the handler as `ModuleHost::pinned_module`. A
+    // second lookup inside the trampoline could miss where this one hit — an
+    // `unload_build` landing between the two — and a miss *there* is an
+    // `Err(String)`, i.e. the terminal failure this check exists to avoid, for
+    // an execution that had already passed it. Holding the binding for the life
+    // of the invocation is also what makes the safety analysis's claim that
+    // unloading is safe for in-flight work true rather than merely likely.
+    #[cfg(feature = "hot-code-swap")]
+    let pinned_module = if crate::hot_swap::is_module_hosted(workflow.handler) {
+        let resolved = registry.module_registry().and_then(|modules| {
+            prepared
+                .execution
+                .assigned_build_id
+                .as_deref()
+                .and_then(|build| modules.get(build, &prepared.execution.workflow_name))
+        });
+        let Some(resolved) = resolved else {
+            return Err(HarvestError::HandlerNotRegistered {
+                kind: CapabilityMissKind::Workflow.as_str(),
+                name: prepared.execution.workflow_name.clone(),
+                phase: CapabilityMissPhase::BeforeHandler,
+            });
+        };
+        Some(resolved)
+    } else {
+        None
     };
 
     let telemetry = registry.telemetry().clone();
@@ -18135,38 +18603,75 @@ async fn process_workflow_task(
             })
             .unwrap_or_default();
 
-        let (run_outcome, pending_cmds, execute_span) =
-            run_workflow_with_state_history_policy_and_caps(
-                prepared.exec_id,
-                history_events.clone(),
-                workflow.handler,
-                task.input.clone(),
-                registry.shared_state(),
-                registry.history_policy(),
-                Some(&span_meta),
-                &dq,
-                &du,
-                wf_name,
-                registry.max_activity_input_bytes,
-                registry.max_signal_payload_bytes,
-                workflow
-                    .max_input_bytes
-                    .map_or(registry.max_workflow_input_bytes, |per| {
-                        per.max(registry.max_workflow_input_bytes)
-                    }),
-                registry.max_current_details_bytes,
-                registry.workflow_log_policy,
-                exec_context_headers.clone(),
-                registry
-                    .payload_offloader()
-                    .map(crate::payload_store::PayloadOffloader::threshold),
-                telemetry.metrics.clone(),
-                // Issue #620: builder-level default activity retry/timeout floor,
-                // consumed by the LOCAL activity path in `execute_local_activity_with_opts`.
-                registry.default_activity_retry_policy(),
-                registry.default_activity_start_to_close(),
-            )
-            .await;
+        // Issue #967 (R&D spike, `hot-code-swap` feature): a module-hosted
+        // workflow's handler is the `hot_swap::module_workflow_handler`
+        // trampoline, which resolves the runtime module to run from a
+        // task-scoped binding. Bind it here, around the handler drive and
+        // nowhere wider, so the value in scope is this execution's own build.
+        //
+        // The build id comes from `prepared.execution.assigned_build_id` -- the
+        // EXECUTION's build, fixed at start time -- and deliberately NOT from
+        // `WorkerConfig::build_id`, which `span_meta.build_id` carries and
+        // `ctx.build_id()` reports. Those are different values on purpose
+        // (issue #798): the worker's build is the candidate identity a replay
+        // gate asks about, while the execution's build is the one that decides
+        // which code this run is allowed to see. Routing modules on the worker's
+        // build would drag a v1-assigned in-flight execution onto v2 code the
+        // moment an operator relabelled the worker.
+        //
+        // Compiled out entirely without the feature: the `let` below binds the
+        // call's future and is awaited identically in both builds.
+        let workflow_drive = run_workflow_with_state_history_policy_and_caps(
+            prepared.exec_id,
+            history_events.clone(),
+            workflow.handler,
+            task.input.clone(),
+            registry.shared_state(),
+            registry.history_policy(),
+            Some(&span_meta),
+            &dq,
+            &du,
+            wf_name,
+            registry.max_activity_input_bytes,
+            registry.max_signal_payload_bytes,
+            workflow
+                .max_input_bytes
+                .map_or(registry.max_workflow_input_bytes, |per| {
+                    per.max(registry.max_workflow_input_bytes)
+                }),
+            registry.max_current_details_bytes,
+            registry.workflow_log_policy,
+            exec_context_headers.clone(),
+            registry
+                .payload_offloader()
+                .map(crate::payload_store::PayloadOffloader::threshold),
+            telemetry.metrics.clone(),
+            // Issue #620: builder-level default activity retry/timeout floor,
+            // consumed by the LOCAL activity path in `execute_local_activity_with_opts`.
+            registry.default_activity_retry_policy(),
+            registry.default_activity_start_to_close(),
+        );
+        // Clone the worker's configured policy — allowlist, queue-override
+        // switch, capability grant, decide budget — and stamp the per-execution
+        // facts onto the clone. Constructing a fresh `ModuleHost::new` here
+        // instead would silently run every production guest under the *default*
+        // (unrestricted) policy (Codex review round 1).
+        #[cfg(feature = "hot-code-swap")]
+        let (run_outcome, pending_cmds, execute_span) = match registry.module_host() {
+            Some(policy) => {
+                crate::hot_swap::with_module_host(
+                    policy
+                        .clone()
+                        .with_optional_build_id(prepared.execution.assigned_build_id.clone())
+                        .with_optional_pinned_module(pinned_module.clone()),
+                    workflow_drive,
+                )
+                .await
+            }
+            None => workflow_drive.await,
+        };
+        #[cfg(not(feature = "hot-code-swap"))]
+        let (run_outcome, pending_cmds, execute_span) = workflow_drive.await;
 
         match run_outcome {
             WorkflowOutcome::Suspended { commands }
@@ -19247,118 +19752,76 @@ async fn process_workflow_task(
         WorkflowOutcome::Suspended { .. } => WorkflowStatus::Suspended,
         WorkflowOutcome::ContinuedAsNew { .. } => WorkflowStatus::ContinuedAsNew,
     };
-    if !is_canary {
-        telemetry.metrics.record_workflow_completed(
-            &prepared.execution.workflow_name,
-            &task.queue_name,
-            started_at.elapsed().as_secs_f64(),
-            status,
-        );
-        if !matches!(&outcome, WorkflowOutcome::Suspended { .. }) {
-            telemetry.metrics.record_workflow_history_size(
-                &prepared.execution.workflow_name,
-                terminal_history_event_count(
-                    next_event_id,
-                    &pending_cmds,
-                    records_abandoned_dispatches(&outcome),
-                )
-                .saturating_add(terminal_parent_close_cascade_events),
-            );
-        }
-        if matches!(&outcome, WorkflowOutcome::ContinuedAsNew { .. }) {
-            telemetry
-                .metrics
-                .record_workflow_continue_as_new(&prepared.execution.workflow_name);
-        }
-    }
-    // Emit the once-per-terminal-outcome counter (issue #519).
-    // Suspended is not a terminal state — a workflow that suspends N times
-    // and then completes must produce exactly one `completed` increment.
-    //
-    // Issue #684: harvest.signal.unhandled is NOT emitted here. It is collected
-    // below (before the persist transaction moves `outcome`) and emitted
-    // post-commit in the `Persisted` arm — the same discipline as
-    // harvest.update.completed/failed — so it represents DURABLE terminal
-    // outcomes only. This site (`record_workflow_terminal`, #519) keeps its own
-    // pre-persist placement unchanged.
-    //
-    // The non-canary terminal counter routes through
-    // `crate::telemetry::emit_workflow_terminal`, the single choke point that
-    // skips canary probes (issue #796) — so the canary-skip for the terminal
-    // counter lives in exactly one place; the canary branches below emit only
-    // the probe's own `harvest.canary.*` signal.
-    match &outcome {
-        WorkflowOutcome::Completed { .. } => {
-            if is_canary {
-                // Round-trip = start-requested → completed wall-clock (AC5).
-                // Clamp a clock-skew negative delta to 0 (`.to_std()` errs on
-                // a negative chrono duration), mirroring the update-duration
-                // clamping precedent.
-                let roundtrip_secs = (chrono::Utc::now() - prepared.execution.started_at)
-                    .to_std()
-                    .map_or(0.0, |delta| delta.as_secs_f64());
-                telemetry
-                    .metrics
-                    .record_canary_success(&task.queue_name, canary_shard);
-                telemetry.metrics.record_canary_roundtrip(
-                    &task.queue_name,
-                    canary_shard,
-                    roundtrip_secs,
-                );
-            } else {
-                crate::telemetry::emit_workflow_terminal(
-                    &*telemetry.metrics,
-                    &prepared.execution.workflow_name,
-                    &task.queue_name,
-                    WorkflowStatus::Completed,
-                );
-            }
-        }
+    // Issue #1184 (Codex review round 2, P2): these used to be EMITTED right
+    // here, before the persist transaction below. A claim-ambiguity rollback
+    // (this issue's own guards, or #1182's SuspendedClaimAmbiguous) or an
+    // operator pause caught by `check_paused_and_park` inside that
+    // transaction both discard this cycle's decision entirely -- so counting
+    // it here double-counted once the real attempt eventually persists (and,
+    // for a canary, could report SUCCESS for a decision that was discarded).
+    // Only the derived, `Copy`-friendly facts are captured here, while
+    // `outcome` is still borrowable; the actual `telemetry.metrics.*` calls
+    // now live in `emit_pending_workflow_metrics`, called from the
+    // `Persisted` arm below -- the same "capture pre-persist, emit
+    // post-commit" discipline issue #684 already established for
+    // `harvest.update.completed`/`.failed` and `harvest.signal.unhandled`.
+    let history_size = if !is_canary && !matches!(&outcome, WorkflowOutcome::Suspended { .. }) {
+        Some(
+            terminal_history_event_count(
+                next_event_id,
+                &pending_cmds,
+                records_abandoned_dispatches(&outcome),
+            )
+            .saturating_add(terminal_parent_close_cascade_events),
+        )
+    } else {
+        None
+    };
+    let is_continued_as_new = matches!(&outcome, WorkflowOutcome::ContinuedAsNew { .. });
+    let terminal_metrics_kind = match &outcome {
+        WorkflowOutcome::Completed { .. } => TerminalMetricsKind::Completed,
         WorkflowOutcome::Failed {
             non_deterministic_details,
             ..
-        } => {
-            // Defensive (issue #603): an ND-carrying Failed outcome is gated
-            // earlier into `block_workflow_for_non_determinism` (which emits
-            // the detection counter itself) and never reaches this arm.
-            // Asserted so a future regression that lets this happen panics
-            // loudly in debug/test builds instead of silently double-counting
-            // (or, worse, silently NOT counting once the gate is removed).
-            debug_assert!(
-                non_deterministic_details.is_none(),
-                "ND-carrying Failed outcome must be gated earlier in \
-                 process_workflow_task, before terminal metrics are recorded"
-            );
-            if non_deterministic_details.is_some() {
-                telemetry
-                    .metrics
-                    .record_workflow_non_determinism(&prepared.execution.workflow_name, build_id);
-            }
-            if is_canary {
-                telemetry
-                    .metrics
-                    .record_canary_failure(&task.queue_name, canary_shard);
-            } else {
-                crate::telemetry::emit_workflow_terminal(
-                    &*telemetry.metrics,
-                    &prepared.execution.workflow_name,
-                    &task.queue_name,
-                    WorkflowStatus::Failed,
-                );
-            }
-        }
-        WorkflowOutcome::ContinuedAsNew { .. } => {
-            // A canary never continues-as-new; the choke point skips it anyway
-            // (AC8), so this is effectively unreachable for a canary.
-            crate::telemetry::emit_workflow_terminal(
-                &*telemetry.metrics,
-                &prepared.execution.workflow_name,
-                &task.queue_name,
-                WorkflowStatus::ContinuedAsNew,
-            );
-        }
-        WorkflowOutcome::Suspended { .. } => {} // not terminal — no counter
-    }
+        } => TerminalMetricsKind::Failed {
+            had_nd_details: non_deterministic_details.is_some(),
+        },
+        WorkflowOutcome::ContinuedAsNew { .. } => TerminalMetricsKind::ContinuedAsNew,
+        WorkflowOutcome::Suspended { .. } => TerminalMetricsKind::Suspended,
+    };
+    // Issue #1184 (Codex review round 4, P2): stop these clocks HERE, at the
+    // moment the decision cycle itself finished -- not at emission time in
+    // the `Persisted` arm below, which runs only after the persist
+    // transaction plus its own post-commit housekeeping (deferred schedule
+    // counters, unfinished-handler checks, history-bloat reads/retries).
+    // Both metrics document themselves as handler/decision-cycle timing, so
+    // absorbing that unrelated later latency would inflate them and distort
+    // executor-latency SLOs.
+    let duration_secs = started_at.elapsed().as_secs_f64();
+    let canary_roundtrip_secs =
+        if is_canary && matches!(&outcome, WorkflowOutcome::Completed { .. }) {
+            // Round-trip = start-requested → completed wall-clock (AC5). Clamp a
+            // clock-skew negative delta to 0 (`.to_std()` errs on a negative
+            // chrono duration), mirroring the update-duration clamping
+            // precedent.
+            Some(
+                (chrono::Utc::now() - prepared.execution.started_at)
+                    .to_std()
+                    .map_or(0.0, |delta| delta.as_secs_f64()),
+            )
+        } else {
+            None
+        };
+    let pending_workflow_metrics = PendingWorkflowMetrics {
+        status,
+        is_canary,
+        canary_shard,
+        history_size,
+        is_continued_as_new,
+        terminal: terminal_metrics_kind,
+        duration_secs,
+        canary_roundtrip_secs,
+    };
 
     // Issue #603 fix: if this execution was previously ND-blocked, this cycle
     // replaying cleanly means the offending build was rolled back or fixed —
@@ -19517,7 +19980,16 @@ async fn process_workflow_task(
 
     let persist_flow = Box::pin(conn.transaction::<WorkflowPersistFlow, HarvestError, _>(
         async |conn| {
-            if check_paused_and_park(conn, exec_uuid, task.id, worker_id, sticky_timeout).await? {
+            if check_paused_and_park(
+                conn,
+                exec_uuid,
+                task.id,
+                worker_id,
+                task.crash_strikes,
+                sticky_timeout,
+            )
+            .await?
+            {
                 return Ok(WorkflowPersistFlow::ParkedPaused);
             }
 
@@ -19702,6 +20174,19 @@ async fn process_workflow_task(
                 should_warn_history_bloat,
             )
             .await;
+
+            // Issue #1184 (Codex review round 2, P2): the terminal/canary
+            // metrics this cycle computed above, captured before `outcome`
+            // moved into the transaction -- emitted only now that the
+            // transaction has actually committed. See
+            // `emit_pending_workflow_metrics`'s doc comment.
+            emit_pending_workflow_metrics(
+                &telemetry,
+                &prepared.execution,
+                &task.queue_name,
+                build_id,
+                &pending_workflow_metrics,
+            );
         }
         Err(error) => {
             // Issue #1182 (Codex review round 3): an ambiguous suspended-
@@ -19905,6 +20390,45 @@ async fn handle_ambiguous_suspended_claim(
     }))
 }
 
+/// Issue #1184: the [`handle_ambiguous_suspended_claim`] counterpart for the
+/// broader set of ordinary terminal-write guards (complete/fail/pause-park)
+/// this issue adds -- performs the release for an ambiguous *terminal-write*
+/// claim if `error` names one, and returns `None` (a no-op) for every other
+/// error. Same call-site placement and the same reason: the release is
+/// intentionally blocking, so it must run after
+/// [`run_under_workflow_body_budget`] has returned rather than inside it.
+async fn handle_ambiguous_terminal_write_claim(
+    conn: &mut AsyncPgConnection,
+    task: &TaskQueueItem,
+    worker_id: &str,
+    error: &HarvestError,
+) -> Option<HarvestResult<TaskDispatchOutcome>> {
+    let task_id = error.terminal_write_claim_ambiguous()?;
+    let released =
+        match queue::release_terminal_workflow_claim(conn, task_id, worker_id, task.crash_strikes)
+            .await
+        {
+            Ok(released) => released,
+            Err(err) => return Some(Err(err)),
+        };
+    tracing::info!(
+        task_id = %task_id,
+        queue = %task.queue_name,
+        released,
+        "an ordinary workflow-task terminal write (complete, fail, or pause-park) could not \
+         confirm ownership (a genuine transfer, or a concurrent, unrelated lock holder), so \
+         the enclosing transaction was rolled back and no terminal decision was made; the \
+         task was released back to the queue if it was still ours"
+    );
+    // The handler ran to a real conclusion this cycle (a completion, a
+    // failure, or a pause-park) and only the final claim recheck found
+    // ambiguity, so -- exactly like the #1182 sibling above -- this is
+    // genuine evidence of health: clear the issue #494 timeout strike.
+    Some(Ok(TaskDispatchOutcome::Released {
+        clears_timeout_strike: true,
+    }))
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn process_task(
     pool: &DbPool,
@@ -19953,7 +20477,11 @@ async fn process_task(
             // decision cycle's state (clippy::large_futures).
             let cycle = Box::pin(async {
                 let mut conn = pool.get().await.map_err(crate::error::database_error)?;
-                let outcome = process_workflow_task(
+                // Boxed for the same reason the enclosing `cycle` is
+                // (clippy::large_futures): `process_workflow_task`'s state is
+                // large enough on its own that inlining it here grows every
+                // future that awaits this one.
+                let outcome = Box::pin(process_workflow_task(
                     &mut conn,
                     registry.as_ref(),
                     &task,
@@ -19967,7 +20495,7 @@ async fn process_task(
                     workflow_panic_max_attempts,
                     workflow_task_deadline,
                     &frontier_reset_committed,
-                )
+                ))
                 .await;
                 Ok::<_, HarvestError>((conn, outcome))
             });
@@ -19997,13 +20525,19 @@ async fn process_task(
                 session_slots_in_use,
             )
             .await;
-            // Acquire only if we actually need to act on a capability miss:
-            // the happy path must not pay for a checkout at all.
-            if result
-                .as_ref()
-                .err()
-                .is_some_and(|e| e.handler_not_registered().is_some())
-            {
+            // Acquire only if we actually need to act on a capability miss or
+            // an ambiguous terminal-write claim (issue #1184, Codex review
+            // round 1, P2): this shared activity dispatch path can reach
+            // `fail_task_and_execution_with_history`'s #1184 guard too (e.g.
+            // via a session-acquire/session-release failure, or
+            // `finalize_activity_failure`), and without this check its
+            // `TerminalWriteClaimAmbiguous` would return immediately below,
+            // never reaching the common interception code that releases the
+            // claim -- wedging the task `RUNNING` under a worker that no
+            // longer owns it instead of releasing it for redispatch.
+            if result.as_ref().err().is_some_and(|e| {
+                e.handler_not_registered().is_some() || e.terminal_write_claim_ambiguous().is_some()
+            }) {
                 let conn = pool.get().await.map_err(crate::error::database_error)?;
                 (conn, result)
             } else {
@@ -20025,6 +20559,15 @@ async fn process_task(
     // has already returned -- rather than inside `process_workflow_task`.
     // See `handle_ambiguous_suspended_claim`'s doc comment for why.
     if let Some(result) = handle_ambiguous_suspended_claim(&mut conn, &task, worker_id, error).await
+    {
+        return result;
+    }
+    // Issue #1184: same interception point and the same reason, for the
+    // broader set of ordinary terminal-write guards (complete/fail/
+    // pause-park) this issue adds. A disjoint error variant from the #1182
+    // check above, so at most one of the two ever matches.
+    if let Some(result) =
+        handle_ambiguous_terminal_write_claim(&mut conn, &task, worker_id, error).await
     {
         return result;
     }
@@ -26245,7 +26788,9 @@ pub async fn chaos_drive_one_workflow_task(
             u32,
         >::new()));
         let frontier_reset_committed = std::sync::atomic::AtomicBool::new(false);
-        process_workflow_task(
+        // Boxed for the same reason as the production call site
+        // (clippy::large_futures).
+        Box::pin(process_workflow_task(
             &mut conn,
             registry.as_ref(),
             &task,
@@ -26259,7 +26804,7 @@ pub async fn chaos_drive_one_workflow_task(
             3,
             None,
             &frontier_reset_committed,
-        )
+        ))
         .await
     })
     .await

@@ -1,0 +1,33 @@
+                                                                                                                   QUERY PLAN                                                                                                                   
+------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+ Limit  (cost=84022.08..84022.09 rows=1 width=51) (actual rows=1 loops=1)
+   Output: harvest_task_queue.id, harvest_task_queue.task_type, harvest_task_queue.concurrency_key, harvest_task_queue.concurrency_cap, harvest_task_queue.priority, harvest_task_queue.scheduled_at, harvest_task_queue.ctid
+   Buffers: shared hit=98659
+   ->  LockRows  (cost=84022.08..84063.74 rows=3333 width=51) (actual rows=1 loops=1)
+         Output: harvest_task_queue.id, harvest_task_queue.task_type, harvest_task_queue.concurrency_key, harvest_task_queue.concurrency_cap, harvest_task_queue.priority, harvest_task_queue.scheduled_at, harvest_task_queue.ctid
+         Buffers: shared hit=98659
+         ->  Sort  (cost=84022.08..84030.41 rows=3333 width=51) (actual rows=1 loops=1)
+               Output: harvest_task_queue.id, harvest_task_queue.task_type, harvest_task_queue.concurrency_key, harvest_task_queue.concurrency_cap, harvest_task_queue.priority, harvest_task_queue.scheduled_at, harvest_task_queue.ctid
+               Sort Key: harvest_task_queue.priority DESC, harvest_task_queue.scheduled_at
+               Sort Method: quicksort  Memory: 1166kB
+               Buffers: shared hit=98658
+               ->  Index Scan using idx_harvest_tq_poll on public.harvest_task_queue  (cost=0.29..84005.41 rows=3333 width=51) (actual rows=10000 loops=1)
+                     Output: harvest_task_queue.id, harvest_task_queue.task_type, harvest_task_queue.concurrency_key, harvest_task_queue.concurrency_cap, harvest_task_queue.priority, harvest_task_queue.scheduled_at, harvest_task_queue.ctid
+                     Index Cond: ((harvest_task_queue.queue_name = ANY ('{bench-q-0,bench-q-1,bench-q-2,bench-q-3}'::text[])) AND (harvest_task_queue.state = 'PENDING'::text) AND (harvest_task_queue.scheduled_at <= now()))
+                     Filter: ((harvest_task_queue.concurrency_key IS NULL) OR (harvest_task_queue.concurrency_cap IS NULL) OR ((SubPlan 1) < harvest_task_queue.concurrency_cap))
+                     Buffers: shared hit=98658
+                     SubPlan 1
+                       ->  Aggregate  (cost=8.30..8.31 rows=1 width=8) (actual rows=1 loops=10000)
+                             Output: count(*)
+                             Buffers: shared hit=98126
+                             ->  Index Only Scan using idx_harvest_tq_concurrency_running on public.harvest_task_queue recheck  (cost=0.28..8.30 rows=1 width=0) (actual rows=8 loops=10000)
+                                   Output: recheck.concurrency_key, recheck.task_type
+                                   Index Cond: ((recheck.concurrency_key = harvest_task_queue.concurrency_key) AND (recheck.task_type = harvest_task_queue.task_type))
+                                   Heap Fetches: 78126
+                                   Buffers: shared hit=98126
+ Planning:
+   Buffers: shared hit=61
+ Planning Time: 0.259 ms
+ Execution Time: 46.962 ms
+(29 rows)
+

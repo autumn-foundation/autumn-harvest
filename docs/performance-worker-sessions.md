@@ -208,10 +208,33 @@ statements per row (an `INSERT` plus an `UPDATE`, each its own round trip and
 its own WAL record) as `no-session`'s single `INSERT`, and the `UPDATE`
 itself creates a second MVCC tuple version for every row.
 
-This is a one-time cost in production, paid once at enqueue time --
-`sticky_worker_id`/`sticky_until`/`sticky_timeout` are not columns any later
-claim, completion, or retry path rewrites, unlike capability-labels' finding
-of write cost recurring on every subsequent `UPDATE`.
+**Correction (review round 6):** an earlier revision of this section called
+this a "one-time cost... unlike capability-labels' finding of write cost
+recurring on every subsequent `UPDATE`" -- a review finding correctly caught
+that framing as incomplete. It is true that
+`sticky_worker_id`/`sticky_until`/`sticky_timeout`/`session_id` are set once
+and never themselves rewritten afterward. It is **not** true that the cost
+stops there: PostgreSQL creates a full new tuple version on every `UPDATE`
+regardless of which columns that `UPDATE`'s `SET` clause touches, so a
+worker-session row's *extra width* is carried forward into every later
+rewrite of that row -- the claiming `UPDATE` inside `claim_task_query()`'s
+own `claimed` CTE, and, for a session task that heartbeats, retries, or later
+completes, each of those `UPDATE`s too. This is exactly the mechanism
+`docs/performance-capability-labels.md`'s write-side section documents for a
+different predicate.
+
+This page's [aggregate drain figure](#corroboration-pg_stat_statements-over-the-real-claim-drain)
+(+22.1%) already **includes** one instance of that recurring cost: each of
+the 10,001 real `queue::claim_task()` calls it drove performs its own
+claiming `UPDATE` as part of the single `claim_task_query()` statement, so
+the wider row's rewrite cost at claim time is folded into that number,
+not separately measured or excluded from it. What this page does **not**
+measure is the cost across *further* rewrites beyond that one claim (a
+heartbeat, a retry, a completion) -- unlike capability-labels' page, which
+isolated and quantified a single claim-time `UPDATE`'s bloat contribution on
+its own. Doing the equivalent isolation here, and extending it across a
+session task's full lifecycle (potentially several heartbeats plus a
+completion, not just one claim), is additional work this pass did not do.
 
 ## Why no fix is proposed
 
@@ -284,6 +307,15 @@ only) -- this pass did not separately measure CPU cost.
   procedure at a stated, deliberately-chosen fan-out size -- left as future
   work rather than chased through a further round of this pass, per this
   persona's own floor on when to stop iterating.
+- **The write-side cost recurs beyond enqueue, and this page only measures
+  one instance of that recurrence.** See the correction in
+  [Write-side cost](#write-side-cost): the wider row's rewrite cost is paid
+  again on every subsequent `UPDATE` (claim, heartbeat, retry, completion),
+  not just once at enqueue. This page's aggregate drain figure folds in one
+  such rewrite (the claiming `UPDATE`); it does not isolate that
+  contribution the way `docs/performance-capability-labels.md` does for its
+  own predicate, and it does not extend across a session task's full
+  lifecycle (further heartbeats, a later completion).
 
 ## What shipped
 

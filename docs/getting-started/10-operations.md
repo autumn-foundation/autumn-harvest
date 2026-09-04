@@ -190,7 +190,8 @@ the target database:
 
 `http://localhost:3000/api/harvest/ui` shows live executions, event histories,
 the DLQ, schedules, and the worker fleet. It's served by the plugin — no
-separate process.
+separate process. See [`docs/vantage-ui.md`](../vantage-ui.md) for a
+page-by-page reference to every tab.
 
 ## CLI
 

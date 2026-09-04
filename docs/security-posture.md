@@ -50,13 +50,37 @@ other routes should be behind your authentication boundary in production.
 
 ### Local / development (no auth)
 
-Mount the API without middleware. All routes are reachable. Suitable for local
-development and CI environments where the network boundary already limits access.
+Mount the API without middleware **and run under `AUTUMN_PROFILE=dev`**. All
+routes — including every `/admin` route and the Vantage dashboard — are then
+reachable by any caller that can open a socket to the process, with no session,
+cookie or token. Suitable for local development and CI environments where the
+network boundary already limits access.
 
 ```rust
 HarvestPlugin::new()
     .api("/api/harvest")
 ```
+
+Both halves are load-bearing (issue #1284). The admin gate
+(`has_harvest_admin_access`) admits an unauthenticated caller **only** when the
+deployment profile is exactly `dev` *and* no auth boundary was declared. Under
+any other profile — including the default `unknown` a standalone integration
+gets when it never sets one — the same mount is fail-closed and every `/admin`
+route answers `401`, which is why `harvest preflight` against a non-dev
+deployment needs a [scoped token](#scoped-api-tokens-built-in-opt-in--issue-942)
+or an admin session.
+
+A process in this posture says so, twice, so it is never a silent surprise:
+
+- a `tracing::warn!` at startup naming the two ways to close it
+  (`HarvestPlugin::api_with_auth(..)`, or a non-dev profile);
+- `unauthenticated_access: true` on the `admin_auth_boundary` check in
+  `GET /admin/preflight`, so a release script can gate on the field rather than
+  parse a message.
+
+A caller that *does* present an established (cookie-backed) session is still
+judged by `admin_auth_session_key` even in `dev` — so an embedder running its
+own auth middleware without going through `api_with_auth` keeps that gate.
 
 ### Read-only operator tier (least-privilege triage)
 
@@ -353,8 +377,14 @@ configures on the server.
 
 Without authentication middleware:
 
-- The CLI token is sent but ignored by the server.
-- Any caller can reach mutating endpoints without credentials.
+- The CLI token is sent but ignored by the server (unless it is a
+  [scoped `hvst_` token](#scoped-api-tokens-built-in-opt-in--issue-942), which
+  the built-in layer validates on its own).
+- Any caller can reach the ungated mutating endpoints without credentials.
+- The **admin-gated** routes additionally depend on the deployment profile: they
+  are reachable without credentials under `AUTUMN_PROFILE=dev` and answer `401`
+  under every other profile (issue #1284). So a bare `harvest preflight` works
+  against a local dev app and fails closed against anything else.
 
 With `RequireAuth` (session guard):
 
