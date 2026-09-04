@@ -2,7 +2,7 @@
 -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
  Limit  (cost=43394.25..43394.26 rows=1 width=52) (actual rows=1 loops=1)
    Output: harvest_task_queue.id, harvest_task_queue.task_type, harvest_task_queue.concurrency_key, harvest_task_queue.concurrency_cap, harvest_task_queue.priority, harvest_task_queue.scheduled_at, harvest_task_queue.ctid
-   Buffers: shared hit=882
+   Buffers: shared hit=883
    CTE concurrency_pending_keys
      ->  HashAggregate  (cost=482.00..531.32 rows=4932 width=22) (actual rows=5000 loops=1)
            Output: harvest_task_queue_1.concurrency_key, harvest_task_queue_1.task_type
@@ -44,7 +44,7 @@
                                    Buffers: shared hit=162
    ->  LockRows  (cost=42429.83..42471.50 rows=3333 width=52) (actual rows=1 loops=1)
          Output: harvest_task_queue.id, harvest_task_queue.task_type, harvest_task_queue.concurrency_key, harvest_task_queue.concurrency_cap, harvest_task_queue.priority, harvest_task_queue.scheduled_at, harvest_task_queue.ctid
-         Buffers: shared hit=882
+         Buffers: shared hit=883
          ->  Sort  (cost=42429.83..42438.17 rows=3333 width=52) (actual rows=1 loops=1)
                Output: harvest_task_queue.id, harvest_task_queue.task_type, harvest_task_queue.concurrency_key, harvest_task_queue.concurrency_cap, harvest_task_queue.priority, harvest_task_queue.scheduled_at, harvest_task_queue.ctid
                Sort Key: harvest_task_queue.priority DESC, harvest_task_queue.scheduled_at
@@ -62,8 +62,8 @@
                              Rows Removed by Filter: 2000
                              Buffers: shared hit=324
  Planning:
-   Buffers: shared hit=192
- Planning Time: 0.758 ms
- Execution Time: 1184.364 ms
+   Buffers: shared hit=194
+ Planning Time: 0.847 ms
+ Execution Time: 1140.255 ms
 (65 rows)
 

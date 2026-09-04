@@ -56,8 +56,8 @@
                              Rows Removed by Filter: 255
                              Buffers: shared hit=316
  Planning:
-   Buffers: shared hit=202
- Planning Time: 0.783 ms
- Execution Time: 162.128 ms
+   Buffers: shared hit=194
+ Planning Time: 2.347 ms
+ Execution Time: 171.437 ms
 (59 rows)
 

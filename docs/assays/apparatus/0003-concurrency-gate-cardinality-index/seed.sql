@@ -30,8 +30,8 @@ SELECT 'bench-q-' || (s.i % :queues),
        k.concurrency_key,
        1000000
 FROM generate_series(0, :running_rows - 1) AS s(i)
-JOIN (SELECT DISTINCT concurrency_key, row_number() OVER () - 1 AS rn
-      FROM harvest_task_queue WHERE state = 'PENDING') k
+JOIN (SELECT concurrency_key, row_number() OVER () - 1 AS rn
+      FROM (SELECT DISTINCT concurrency_key FROM harvest_task_queue WHERE state = 'PENDING') d) k
   ON k.rn = s.i % :keys
 WHERE :running_rows > 0;
 

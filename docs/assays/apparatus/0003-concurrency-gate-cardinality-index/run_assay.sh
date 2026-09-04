@@ -6,7 +6,7 @@
 set -euo pipefail
 cd "$(dirname "$0")"
 
-DB=prospect_assay3
+DB="${PGDATABASE:-prospect_assay3}"
 OUT=results
 mkdir -p "$OUT"
 
