@@ -1,7 +1,7 @@
 -- schedule-to-close: claim_task_query() @ backlog=1000, 4 queues --
 CTE Scan on claimed  (cost=44254.40..44254.42 rows=1 width=817) (actual rows=1 loops=1)
   Output: claimed.id, claimed.queue_name, claimed.task_type, claimed.workflow_exec_id, claimed.activity_name, claimed.input, claimed.state, claimed.priority, claimed.worker_id, claimed.attempt, claimed.max_attempts, claimed.scheduled_at, claimed.started_at, claimed.completed_at, claimed.last_heartbeat_at, claimed.heartbeat_timeout, claimed.start_to_close, claimed.schedule_to_start, claimed.retry_policy, claimed.output, claimed.error, claimed.sticky_worker_id, claimed.sticky_until, claimed.sticky_timeout, claimed.trace_context, claimed.concurrency_key, claimed.concurrency_cap, claimed.heartbeat_details, claimed.required_build_id, claimed.activity_id, claimed.rate_limit_key, claimed.crash_strikes, claimed.schedule_to_close_at, claimed.required_capabilities, claimed.context_headers, claimed.created_at, claimed.wake_requested, claimed.session_id, claimed.capability_misses, claimed.capability_miss_workers, claimed.capability_miss_handler
-  Buffers: shared hit=56 dirtied=5 written=3
+  Buffers: shared hit=57 dirtied=5 written=3
   CTE paused_queues
     ->  Aggregate  (cost=13.11..13.12 rows=1 width=32) (actual rows=1 loops=1)
           Output: COALESCE(array_agg(harvest_queue_pauses.queue_name), '{}'::text[])
@@ -118,7 +118,7 @@ CTE Scan on claimed  (cost=44254.40..44254.42 rows=1 width=817) (actual rows=1 l
   CTE claimed
     ->  Update on public.harvest_task_queue harvest_task_queue_2  (cost=0.28..14.27 rows=1 width=123) (actual rows=1 loops=1)
           Output: harvest_task_queue_2.id, harvest_task_queue_2.queue_name, harvest_task_queue_2.task_type, harvest_task_queue_2.workflow_exec_id, harvest_task_queue_2.activity_name, harvest_task_queue_2.input, harvest_task_queue_2.state, harvest_task_queue_2.priority, harvest_task_queue_2.worker_id, harvest_task_queue_2.attempt, harvest_task_queue_2.max_attempts, harvest_task_queue_2.scheduled_at, harvest_task_queue_2.started_at, harvest_task_queue_2.completed_at, harvest_task_queue_2.last_heartbeat_at, harvest_task_queue_2.heartbeat_timeout, harvest_task_queue_2.start_to_close, harvest_task_queue_2.schedule_to_start, harvest_task_queue_2.retry_policy, harvest_task_queue_2.output, harvest_task_queue_2.error, harvest_task_queue_2.sticky_worker_id, harvest_task_queue_2.sticky_until, harvest_task_queue_2.sticky_timeout, harvest_task_queue_2.trace_context, harvest_task_queue_2.concurrency_key, harvest_task_queue_2.concurrency_cap, harvest_task_queue_2.heartbeat_details, harvest_task_queue_2.required_build_id, harvest_task_queue_2.activity_id, harvest_task_queue_2.rate_limit_key, harvest_task_queue_2.crash_strikes, harvest_task_queue_2.schedule_to_close_at, harvest_task_queue_2.required_capabilities, harvest_task_queue_2.context_headers, harvest_task_queue_2.created_at, harvest_task_queue_2.wake_requested, harvest_task_queue_2.session_id, harvest_task_queue_2.capability_misses, harvest_task_queue_2.capability_miss_workers, harvest_task_queue_2.capability_miss_handler
-          Buffers: shared hit=56 dirtied=5 written=3
+          Buffers: shared hit=57 dirtied=5 written=3
           ->  Nested Loop  (cost=0.28..14.27 rows=1 width=123) (actual rows=1 loops=1)
                 Output: 'RUNNING'::text, 'harvest-bench-worker-0'::text, (harvest_task_queue_2.attempt + 1), now(), false, harvest_task_queue_2.ctid, candidate_1.*
                 Inner Unique: true
@@ -139,8 +139,8 @@ CTE Scan on claimed  (cost=44254.40..44254.42 rows=1 width=817) (actual rows=1 l
                       Output: harvest_task_queue_2.attempt, harvest_task_queue_2.ctid, harvest_task_queue_2.id
                       Index Cond: (harvest_task_queue_2.id = candidate_1.id)
                       Buffers: shared hit=3
-Query Identifier: -7617082777655599318
+Query Identifier: 4492985820371822108
 Planning:
-  Buffers: shared hit=310 read=9
-Planning Time: 2.008 ms
-Execution Time: 1.502 ms
+  Buffers: shared hit=315 read=9
+Planning Time: 2.168 ms
+Execution Time: 1.549 ms

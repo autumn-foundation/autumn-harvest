@@ -2758,7 +2758,24 @@ async fn zz_capture_schedule_to_close_claim_evidence() {
     // `chrono::DateTime<Utc>`'s representable range (whose upper bound is
     // roughly the year 262,000) while still being far longer than any
     // realistic drain duration.
-    const SCHEDULE_TO_CLOSE_SQL: &str = "NOW() + INTERVAL '100 years'";
+    //
+    // A THIRD problem, also caught by review rather than found here first:
+    // `NOW() + INTERVAL '100 years'` alone is evaluated once per SQL
+    // statement (Postgres's `NOW()` is stable within a statement), so every
+    // row in an `INSERT ... SELECT` gets the byte-identical timestamp.
+    // `harvest_task_queue_schedule_to_close_idx` is a B-tree, and Postgres's
+    // B-tree deduplication (PG13+) compresses repeated keys into posting
+    // lists far more efficiently than the genuinely distinct-per-row
+    // deadlines production sees (`NOW() + schedule_to_close` computed once
+    // per enqueue, at different enqueue times with different durations) --
+    // so a constant seeded value understates real index growth and could
+    // skew planner statistics unrepresentatively. `(i::text || ' seconds')::
+    // interval` spreads the seeded deadlines across up to ~28 hours (100,000
+    // seconds, covering the largest `BACKLOG_SWEEP` depth) while the
+    // 100-year base keeps every value far enough in the future to satisfy
+    // the first fix above regardless.
+    const SCHEDULE_TO_CLOSE_SQL: &str =
+        "NOW() + INTERVAL '100 years' + (i::text || ' seconds')::interval";
 
     let Some(bench) = bench_db_or_skip().await else {
         eprintln!("no database reachable; nothing captured");

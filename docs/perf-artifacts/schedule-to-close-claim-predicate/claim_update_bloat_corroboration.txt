@@ -18,13 +18,13 @@ INSERT 0 10000
 VACUUM
       label       | heap_pages | idx_pages 
 ------------------+------------+-----------
- stc-before-claim |        223 |        10
+ stc-before-claim |        223 |        30
 (1 row)
 
 UPDATE 10000
       label      | heap_pages | idx_pages 
 -----------------+------------+-----------
- stc-after-claim |        486 |        19
+ stc-after-claim |        486 |        57
 (1 row)
 
  no_stc_heap_delta_pages | stc_heap_delta_pages | extra_heap_pages | extra_heap_pct_more_growth_from_schedule_to_close 
@@ -34,7 +34,7 @@ UPDATE 10000
 
  no_stc_idx_delta_pages | stc_idx_delta_pages 
 ------------------------+---------------------
-                      0 |                   9
+                      0 |                  27
 (1 row)
 
 TRUNCATE TABLE

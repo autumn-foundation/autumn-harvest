@@ -1176,9 +1176,8 @@ from the benchmark are directly comparable.
   * **`schedule_to_close` (#378)** — measured directly:
     [`docs/performance-schedule-to-close.md`](performance-schedule-to-close.md) seeds `schedule_to_close_at`
     (rather than leaving it null) and **confirms this page's own suspicion on
-    magnitude, but not on mechanism**: a small, real buffer cost (+3.6% to
-    +5.7%, reproduced to the exact buffer count across four independent
-    capture runs at the 1,000- and 10,000-row depths), corroborated by two
+    magnitude, but not on mechanism**: a small, real buffer cost (+2.6% to
+    +7.5% across the three published backlog depths), corroborated by two
     standalone MVCC-bloat scripts, one bulk and one per-row (+5.2% both) —
     nowhere near the 20% impact floor, so no fix is proposed. Codex review
     caught that the predicate text alone (a plain inline column test) is not
@@ -1187,18 +1186,22 @@ from the benchmark are directly comparable.
     entry to it for every `schedule-to-close` row — a fixed, depth-independent
     +1 dirtied/+1 written page at every backlog depth tested, additive with a
     separate row-width effect on the candidate scan that *does* scale with
-    depth. See that page's "Plan" section for the buffer-level evidence.
-    Two things did **not**
-    reproduce cleanly and are reported as open rather than smoothed into one
-    number: at the 100,000-row depth the planner chose a markedly more
-    expensive plan specifically for the `schedule_to_close_at`-populated
-    table in **two of four** capture runs — a coin flip here, never observed
-    on the unpopulated side — and the real 10,001-call `pg_stat_statements`
-    drain's aggregate delta was +2.5% to +5.6% in three of four runs but hit
-    +22.5% in the fourth, with no confirmed mechanism for that outlier (it
-    does not correlate with the 100k-depth plan flip — see the page for why).
-    See that page's "100k-depth plan instability" and "Corroboration"
-    sections for the full detail.
+    depth. Review also caught that the harness's first seeded deadline gave
+    every row the byte-identical value, letting B-tree deduplication
+    understate the index's real growth by roughly 3x — fixed by seeding a
+    distinct, per-row deadline instead. See that page's "Plan" and
+    "Write-side cost" sections for the buffer- and storage-level evidence.
+    One thing did **not** reproduce cleanly across this pass's several
+    capture runs and is reported as an open range rather than a single
+    number: the real 10,001-call `pg_stat_statements` drain's aggregate
+    delta, observed anywhere from roughly +2.5% to +22.5% depending on the
+    run, always positive but not converging. A markedly more expensive plan
+    at the 100,000-row depth was also observed on earlier, pre-fix runs of
+    this capture (never on the unpopulated side) but not on either
+    fully-fixed run; that page's "100,000-row plan choice" section explains
+    why it does not assert a frequency for this, including why an earlier
+    revision's "N of M runs" framing had to be walked back once those
+    runs' artifacts were no longer available to audit.
   * **Worker sessions (#606), sticky routing (#235)** — still cheap inline
     column tests, against columns the seed leaves null; not yet measured.
 

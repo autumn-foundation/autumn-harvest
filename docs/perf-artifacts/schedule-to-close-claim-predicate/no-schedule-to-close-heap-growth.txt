@@ -1,4 +1,4 @@
 -- no-schedule-to-close: harvest_task_queue heap growth over the real 10000 full-drain claim loop (10000 claims) --
 before: heap_pages=244 n_live_tup=10000 n_dead_tup=0
-after:  heap_pages=293 n_live_tup=10000 n_dead_tup=4753
-delta:  heap_pages=49 n_dead_tup=4753
+after:  heap_pages=292 n_live_tup=10000 n_dead_tup=5016
+delta:  heap_pages=48 n_dead_tup=5016

@@ -78,11 +78,15 @@ SELECT pg_relation_size('harvest_task_queue') / 8192 AS heap_pages,
   \gset no_stc_after_
 
 -- State B: schedule-to-close. Fresh INSERT with schedule_to_close_at
--- populated at birth (100 years in the future -- far enough out that it
--- never elapses no matter how long this script takes to run; matches the
--- Rust harness's seeded value exactly -- see the note on
--- `SCHEDULE_TO_CLOSE_SQL` in claim_budget_tests.rs for why 'infinity' was
--- tried and rejected there), then the identical claim-shaped UPDATE --
+-- populated at birth (100 years in the future, offset by i seconds per
+-- row -- far enough out that it never elapses no matter how long this
+-- script takes to run; matches the Rust harness's seeded value exactly --
+-- see the note on `SCHEDULE_TO_CLOSE_SQL` in claim_budget_tests.rs for why
+-- 'infinity' was tried and rejected, and why a per-row offset matters: a
+-- byte-identical value across all rows lets Postgres's B-tree
+-- deduplication compress the index far more than production's genuinely
+-- distinct per-row deadlines would, understating real index growth --
+-- Codex review on PR #1339), then the identical claim-shaped UPDATE --
 -- still never touching schedule_to_close_at, but each new tuple version
 -- must still carry its 8 extra heap bytes AND a new
 -- harvest_task_queue_schedule_to_close_idx entry forward.
@@ -92,7 +96,7 @@ INSERT INTO harvest_task_queue
    priority, max_attempts, scheduled_at, schedule_to_close_at)
 SELECT 'q-' || (i % 4), 'activity', 'bench_activity', gen_random_uuid(),
        '{}'::jsonb, 'PENDING', 0, 3, NOW() - INTERVAL '1 second',
-       NOW() + INTERVAL '100 years'
+       NOW() + INTERVAL '100 years' + (i::text || ' seconds')::interval
 FROM generate_series(0, 9999) AS s(i);
 VACUUM ANALYZE harvest_task_queue;
 SELECT 'stc-before-claim' AS label,
