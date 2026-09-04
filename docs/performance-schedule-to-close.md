@@ -228,16 +228,42 @@ with this fixture (10,000-100,000 rows, all sharing the same seeded
 deadline value, is nowhere near large enough to need more than one leaf
 page touched per insert).
 
-The remainder of the total buffer delta -- the part that *does* scale with
-backlog depth (+3 at 1,000, +10 at 10,000, +64 at the stable 100,000-row
-plan) -- sits in the query's candidate-selection scan/sort, upstream of the
-`UPDATE`. That portion is consistent with a row-width effect: a wider
-`schedule_to_close_at`-bearing row leaves less free space per heap page,
-so scanning and sorting the same row count touches more pages, growing
-with the candidate set exactly as `docs/performance-capability-labels.md`'s
-`required_capabilities` finding describes for its own (larger) JSONB
-column. This page's earlier revision was correct that *a* row-width effect
-exists here -- it was wrong to say that was the *only* mechanism.
+**Separating the scan-side (row-width) contribution from the update-side
+(index-write) contribution requires reading the child node's own buffers,
+not the parent `Update` node's cumulative total -- an earlier revision of
+this page got this wrong** (Codex review, PR #1339), computing the
+scan-side delta as the *total* top-level delta (+3/+10/+64 at
+1,000/10,000/100,000), which double-counts the index-write contribution
+already present in that total. The `Update` node's direct child (the
+`Nested Loop` that selects the candidate row) reports its own, separate
+cumulative `Buffers: shared hit=` line -- reading that instead:
+
+| backlog | child (scan-side) hit: no-stc / stc | scan-side delta | `Update`-exclusive delta (total − child) |
+|---:|---:|---:|---:|
+| 1,000 | 37 / 37 | **0** | +3 |
+| 10,000 | 256 / 262 | +6 | +4 |
+| 100,000 | 2,453 / 2,513 | +60 | +4 |
+
+The `Update`-exclusive column (the index write plus whatever else the
+`Update` node itself touches, beyond its child) is close to constant across
+all three depths (+3, +4, +4) -- consistent with the fixed one-page index
+write the `dirtied`/`written` evidence above already established (a B-tree
+insert typically touches a root and/or a leaf page as `hit`s in addition to
+the one page it dirties, so 3-4 total `hit` buffers for one insert is
+unsurprising). The scan-side column is **not** simply proportional to
+backlog depth: it is exactly zero at 1,000 rows, +6 at 10,000, and +60 at
+100,000. Zero at the smallest depth is consistent with a genuine row-width
+effect that only becomes visible once the table is large enough for the
+extra bytes per row to push the page count itself higher -- at 1,000 rows
+both data states may simply pack into the same number of heap pages by
+coincidence of alignment and fill factor, with the effect only crossing a
+whole-page threshold at larger sizes -- but this page does not have a
+targeted test isolating that specific claim, so it is reported as the most
+plausible explanation for the pattern, not a confirmed one. This is
+consistent with the *general* row-width mechanism
+`docs/performance-capability-labels.md`'s `required_capabilities` finding
+describes for its own (larger) JSONB column, without claiming the same
+smooth, always-positive scaling that page found for its wider effect.
 
 Neither component is a defect. The index exists because the timeout
 scanner needs it (its own migration comment says so, and no alternative
@@ -365,29 +391,46 @@ documents for `required_capabilities` -- **plus**, specific to this column,
 the partial-index write [Plan](#plan) documents: every `UPDATE` to a
 `schedule-to-close` row also writes a new entry to
 `harvest_task_queue_schedule_to_close_idx`, which a `no-schedule-to-close`
-row never touches. The two standalone scripts below reproduce this
-combined effect, not row width in isolation -- they measure heap-page
-growth only, so the index's own page growth is not separately broken out
-here, but it is included in the delta they report. Two independent,
-standalone,
-single-transaction corroborations (which is what makes these two reproduce
-cleanly where the live 10,001-call drain below does not -- neither leaves a
-~15-minute window for autovacuum to run partway through, since neither
-commits until the whole simulated drain finishes): artifacts
+row never touches.
+
+**These are measured as two separate quantities below, not combined into
+one percentage.** An earlier revision of this page reported only
+`pg_relation_size('harvest_task_queue')` -- the heap -- and described the
+result as corroborating a "combined" effect; Codex review on PR #1339 (P2)
+correctly pointed out that `pg_relation_size` on the heap relation excludes
+every index by definition, so a heap-only snapshot cannot support a claim
+about index growth at all. Both scripts now also snapshot
+`pg_relation_size('harvest_task_queue_schedule_to_close_idx')`. Two
+independent, standalone, single-transaction corroborations (which is what
+makes these two reproduce cleanly where the live 10,001-call drain below
+does not -- neither leaves a ~15-minute window for autovacuum to run
+partway through, since neither commits until the whole simulated drain
+finishes): artifacts
 `docs/perf-artifacts/schedule-to-close-claim-predicate/claim_update_bloat_corroboration.{sql,txt}`
 and
 `docs/perf-artifacts/schedule-to-close-claim-predicate/claim_update_bloat_loop_corroboration.{sql,txt}`:
 
-| seeding + update shape | no-schedule-to-close heap-page growth | schedule-to-close heap-page growth | extra growth |
+| seeding + update shape | heap: no-stc / stc growth | heap extra growth | index: no-stc / stc growth |
 |---|---:|---:|---:|
-| one bulk `UPDATE ... WHERE state = 'PENDING'` (10,000 rows, one statement) | 250 | 263 | +5.2% |
-| 10,000 individual `SELECT ... FOR UPDATE SKIP LOCKED` + `UPDATE` pairs, PL/pgSQL loop (still one transaction end to end) | 250 | 263 | +5.2% |
+| one bulk `UPDATE ... WHERE state = 'PENDING'` (10,000 rows, one statement) | 250 / 263 pages | +5.2% | 0 / +9 pages (1→1 vs 10→19) |
+| 10,000 individual `SELECT ... FOR UPDATE SKIP LOCKED` + `UPDATE` pairs, PL/pgSQL loop (still one transaction end to end) | 250 / 263 pages | +5.2% | 0 / +9 pages (1→1 vs 10→19) |
 
-The two access shapes land on the **identical** result: within a single
-transaction (no commit boundaries in between), whether the 10,000 rows are
-touched by one bulk statement or by 10,000 individual per-row statements
-does not change the heap-page-growth outcome. Both are close to the
-`EXPLAIN` band above (2.5-6%).
+The two access shapes land on **identical** results for both quantities:
+within a single transaction (no commit boundaries in between), whether the
+10,000 rows are touched by one bulk statement or by 10,000 individual
+per-row statements changes neither the heap-page-growth nor the
+index-page-growth outcome. The heap figures are close to the `EXPLAIN`
+band above (2.5-6%) -- this is the row-width component. **The index figures
+are the cleanest evidence on this page for the index-write mechanism**:
+`harvest_task_queue_schedule_to_close_idx` never grows at all for
+`no-schedule-to-close` (1 page before, 1 page after -- these rows are never
+members), while for `schedule-to-close` it starts at 10 pages (the 10,000
+initial `INSERT`s, one entry each) and grows to 19 after the claim
+`UPDATE` -- roughly doubling, consistent with every one of the 10,000 rows
+getting a second index entry (the old entry, now dead, is not reclaimed
+without a `VACUUM`, which this script deliberately does not run between
+the before/after snapshots, matching the real window between a claim and
+whenever autovacuum next runs).
 
 The instrumented captures also snapshotted `pg_stat_user_tables` immediately
 before and after the real 10,000-claim headline drain -- a ~15-minute window

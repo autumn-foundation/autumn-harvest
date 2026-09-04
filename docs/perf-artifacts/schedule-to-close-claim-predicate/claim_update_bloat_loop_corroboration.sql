@@ -14,6 +14,13 @@
 -- for the comparison); this script exists so that agreement is reproducible
 -- and auditable, not merely asserted.
 --
+-- Like claim_update_bloat_corroboration.sql, this revision also snapshots
+-- the partial index `harvest_task_queue_schedule_to_close_idx` (migration
+-- 20260606000001) separately from the heap. Codex review on PR #1339 (P2)
+-- correctly flagged that a heap-only snapshot cannot support a claim about
+-- combined heap-plus-index growth: `pg_relation_size('harvest_task_queue')`
+-- excludes every index relation by definition.
+--
 -- Run ONLY against a disposable scratch database with autumn-harvest's
 -- Diesel migrations applied -- NEVER a real development, staging, or
 -- production database. It TRUNCATEs and reseeds harvest_task_queue twice
@@ -45,7 +52,8 @@
 
 -- State A: no-schedule-to-close. Fresh INSERT, then a claim-shaped drain:
 -- 10,000 individual SELECT ... FOR UPDATE SKIP LOCKED + UPDATE pairs, never
--- touching schedule_to_close_at (it is NULL throughout).
+-- touching schedule_to_close_at (it is NULL throughout, so these rows are
+-- never members of harvest_task_queue_schedule_to_close_idx).
 TRUNCATE harvest_task_queue RESTART IDENTITY;
 INSERT INTO harvest_task_queue
   (queue_name, task_type, activity_name, activity_id, input, state,
@@ -55,8 +63,11 @@ SELECT 'q-' || (i % 4), 'activity', 'bench_activity', gen_random_uuid(),
 FROM generate_series(0, 9999) AS s(i);
 VACUUM ANALYZE harvest_task_queue;
 SELECT 'no-stc-before-drain' AS label,
-       pg_relation_size('harvest_task_queue') / 8192 AS heap_pages;
-SELECT pg_relation_size('harvest_task_queue') / 8192 AS heap_pages \gset no_stc_before_
+       pg_relation_size('harvest_task_queue') / 8192 AS heap_pages,
+       pg_relation_size('harvest_task_queue_schedule_to_close_idx') / 8192 AS idx_pages;
+SELECT pg_relation_size('harvest_task_queue') / 8192 AS heap_pages,
+       pg_relation_size('harvest_task_queue_schedule_to_close_idx') / 8192 AS idx_pages
+  \gset no_stc_before_
 
 DO $$
 DECLARE
@@ -72,8 +83,11 @@ BEGIN
   END LOOP;
 END $$;
 SELECT 'no-stc-after-drain' AS label,
-       pg_relation_size('harvest_task_queue') / 8192 AS heap_pages;
-SELECT pg_relation_size('harvest_task_queue') / 8192 AS heap_pages \gset no_stc_after_
+       pg_relation_size('harvest_task_queue') / 8192 AS heap_pages,
+       pg_relation_size('harvest_task_queue_schedule_to_close_idx') / 8192 AS idx_pages;
+SELECT pg_relation_size('harvest_task_queue') / 8192 AS heap_pages,
+       pg_relation_size('harvest_task_queue_schedule_to_close_idx') / 8192 AS idx_pages
+  \gset no_stc_after_
 
 -- State B: schedule-to-close. Fresh INSERT with schedule_to_close_at
 -- populated at birth (100 years in the future -- far enough out that it
@@ -82,7 +96,8 @@ SELECT pg_relation_size('harvest_task_queue') / 8192 AS heap_pages \gset no_stc_
 -- `SCHEDULE_TO_CLOSE_SQL` in claim_budget_tests.rs for why 'infinity' was
 -- tried and rejected there), then the identical claim-shaped per-row drain
 -- -- still never touching schedule_to_close_at, but each new tuple version
--- must still carry its 8 extra bytes forward.
+-- must still carry its 8 extra heap bytes AND a new
+-- harvest_task_queue_schedule_to_close_idx entry forward.
 TRUNCATE harvest_task_queue RESTART IDENTITY;
 INSERT INTO harvest_task_queue
   (queue_name, task_type, activity_name, activity_id, input, state,
@@ -93,8 +108,11 @@ SELECT 'q-' || (i % 4), 'activity', 'bench_activity', gen_random_uuid(),
 FROM generate_series(0, 9999) AS s(i);
 VACUUM ANALYZE harvest_task_queue;
 SELECT 'stc-before-drain' AS label,
-       pg_relation_size('harvest_task_queue') / 8192 AS heap_pages;
-SELECT pg_relation_size('harvest_task_queue') / 8192 AS heap_pages \gset stc_before_
+       pg_relation_size('harvest_task_queue') / 8192 AS heap_pages,
+       pg_relation_size('harvest_task_queue_schedule_to_close_idx') / 8192 AS idx_pages;
+SELECT pg_relation_size('harvest_task_queue') / 8192 AS heap_pages,
+       pg_relation_size('harvest_task_queue_schedule_to_close_idx') / 8192 AS idx_pages
+  \gset stc_before_
 
 DO $$
 DECLARE
@@ -110,23 +128,32 @@ BEGIN
   END LOOP;
 END $$;
 SELECT 'stc-after-drain' AS label,
-       pg_relation_size('harvest_task_queue') / 8192 AS heap_pages;
-SELECT pg_relation_size('harvest_task_queue') / 8192 AS heap_pages \gset stc_after_
+       pg_relation_size('harvest_task_queue') / 8192 AS heap_pages,
+       pg_relation_size('harvest_task_queue_schedule_to_close_idx') / 8192 AS idx_pages;
+SELECT pg_relation_size('harvest_task_queue') / 8192 AS heap_pages,
+       pg_relation_size('harvest_task_queue_schedule_to_close_idx') / 8192 AS idx_pages
+  \gset stc_after_
 
 -- Derived summary -- computed and printed by the script itself, so
 -- redirecting this script's output to the committed .txt artifact captures
--- the analysis, not just the four raw before/after measurements above.
+-- the analysis, not just the eight raw before/after measurements above.
+-- Heap and index growth are reported SEPARATELY, never summed into one
+-- percentage, so neither component's evidence can misrepresent the other's.
 SELECT
-  (:no_stc_after_heap_pages - :no_stc_before_heap_pages) AS no_stc_delta_pages,
-  (:stc_after_heap_pages - :stc_before_heap_pages) AS stc_delta_pages,
+  (:no_stc_after_heap_pages - :no_stc_before_heap_pages) AS no_stc_heap_delta_pages,
+  (:stc_after_heap_pages - :stc_before_heap_pages) AS stc_heap_delta_pages,
   ((:stc_after_heap_pages - :stc_before_heap_pages)
-     - (:no_stc_after_heap_pages - :no_stc_before_heap_pages)) AS extra_pages,
+     - (:no_stc_after_heap_pages - :no_stc_before_heap_pages)) AS extra_heap_pages,
   round(
     100.0 * ((:stc_after_heap_pages - :stc_before_heap_pages)
               - (:no_stc_after_heap_pages - :no_stc_before_heap_pages))
     / (:no_stc_after_heap_pages - :no_stc_before_heap_pages),
     1
-  ) AS extra_pct_more_growth_from_schedule_to_close;
+  ) AS extra_heap_pct_more_growth_from_schedule_to_close;
+
+SELECT
+  (:no_stc_after_idx_pages - :no_stc_before_idx_pages) AS no_stc_idx_delta_pages,
+  (:stc_after_idx_pages - :stc_before_idx_pages) AS stc_idx_delta_pages;
 
 -- cleanup: leave the scratch DB empty again.
 TRUNCATE harvest_task_queue RESTART IDENTITY;

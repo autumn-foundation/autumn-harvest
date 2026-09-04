@@ -1,14 +1,30 @@
 -- Corroboration for docs/performance-schedule-to-close.md's "Write-side
 -- cost" section, mirroring
 -- capability-labels-claim-predicate/claim_update_bloat_corroboration.sql
--- exactly in method. Every UPDATE to a task row -- including the claim
--- UPDATE in claim_task_query()'s `claimed` CTE, which never touches
+-- in method, with one addition: this script snapshots BOTH the heap
+-- (`harvest_task_queue`) AND the partial index
+-- (`harvest_task_queue_schedule_to_close_idx`, migration 20260606000001)
+-- separately, rather than the heap alone. Codex review on PR #1339 (P2)
+-- correctly flagged that an earlier revision of this script (heap-only)
+-- could not support the doc's claim that it corroborates a *combined*
+-- row-width-plus-index-write effect: `pg_relation_size('harvest_task_queue')`
+-- excludes every index relation by definition, so a heap-only snapshot is
+-- evidence for the row-width component alone, never for the index-write
+-- component the doc's "Plan" section separately derives from
+-- EXPLAIN-reported `dirtied`/`written` deltas. This revision measures both
+-- components directly and independently, rather than asserting the index
+-- component from EXPLAIN evidence alone.
+--
+-- Every UPDATE to a task row -- including the claim UPDATE in
+-- claim_task_query()'s `claimed` CTE, which never touches
 -- `schedule_to_close_at` itself -- still creates a brand-new MVCC tuple
--- version that carries the full, unchanged column value forward. This
--- measures that recurring cost directly, by isolating the heap-page growth
--- caused by ONE UPDATE pass simulating a claim (SET state, worker_id,
--- started_at -- never schedule_to_close_at) applied to an otherwise-clean,
--- freshly-INSERTed 10,000-row table in each data state.
+-- version that carries the full, unchanged column value forward, and (for
+-- schedule-to-close rows only, since they are the only ones ever a member
+-- of the partial index) still needs a new index entry pointing at that new
+-- tuple. This measures both costs directly, by isolating the heap-page AND
+-- index-page growth caused by ONE UPDATE pass simulating a claim (SET
+-- state, worker_id, started_at -- never schedule_to_close_at) applied to an
+-- otherwise-clean, freshly-INSERTed 10,000-row table in each data state.
 --
 -- Run ONLY against a disposable scratch database with autumn-harvest's
 -- Diesel migrations applied -- NEVER a real development, staging, or
@@ -32,7 +48,8 @@
 \timing off
 
 -- State A: no-schedule-to-close. Fresh INSERT, then a claim-shaped UPDATE
--- that never touches schedule_to_close_at (it is NULL throughout).
+-- that never touches schedule_to_close_at (it is NULL throughout, so these
+-- rows are never members of harvest_task_queue_schedule_to_close_idx).
 TRUNCATE harvest_task_queue RESTART IDENTITY;
 INSERT INTO harvest_task_queue
   (queue_name, task_type, activity_name, activity_id, input, state,
@@ -42,8 +59,11 @@ SELECT 'q-' || (i % 4), 'activity', 'bench_activity', gen_random_uuid(),
 FROM generate_series(0, 9999) AS s(i);
 VACUUM ANALYZE harvest_task_queue;
 SELECT 'no-stc-before-claim' AS label,
-       pg_relation_size('harvest_task_queue') / 8192 AS heap_pages;
-SELECT pg_relation_size('harvest_task_queue') / 8192 AS heap_pages \gset no_stc_before_
+       pg_relation_size('harvest_task_queue') / 8192 AS heap_pages,
+       pg_relation_size('harvest_task_queue_schedule_to_close_idx') / 8192 AS idx_pages;
+SELECT pg_relation_size('harvest_task_queue') / 8192 AS heap_pages,
+       pg_relation_size('harvest_task_queue_schedule_to_close_idx') / 8192 AS idx_pages
+  \gset no_stc_before_
 
 UPDATE harvest_task_queue
 SET state = 'RUNNING',
@@ -51,8 +71,11 @@ SET state = 'RUNNING',
     started_at = NOW()
 WHERE state = 'PENDING';
 SELECT 'no-stc-after-claim' AS label,
-       pg_relation_size('harvest_task_queue') / 8192 AS heap_pages;
-SELECT pg_relation_size('harvest_task_queue') / 8192 AS heap_pages \gset no_stc_after_
+       pg_relation_size('harvest_task_queue') / 8192 AS heap_pages,
+       pg_relation_size('harvest_task_queue_schedule_to_close_idx') / 8192 AS idx_pages;
+SELECT pg_relation_size('harvest_task_queue') / 8192 AS heap_pages,
+       pg_relation_size('harvest_task_queue_schedule_to_close_idx') / 8192 AS idx_pages
+  \gset no_stc_after_
 
 -- State B: schedule-to-close. Fresh INSERT with schedule_to_close_at
 -- populated at birth (100 years in the future -- far enough out that it
@@ -61,7 +84,8 @@ SELECT pg_relation_size('harvest_task_queue') / 8192 AS heap_pages \gset no_stc_
 -- `SCHEDULE_TO_CLOSE_SQL` in claim_budget_tests.rs for why 'infinity' was
 -- tried and rejected there), then the identical claim-shaped UPDATE --
 -- still never touching schedule_to_close_at, but each new tuple version
--- must still carry its 8 extra bytes forward.
+-- must still carry its 8 extra heap bytes AND a new
+-- harvest_task_queue_schedule_to_close_idx entry forward.
 TRUNCATE harvest_task_queue RESTART IDENTITY;
 INSERT INTO harvest_task_queue
   (queue_name, task_type, activity_name, activity_id, input, state,
@@ -72,8 +96,11 @@ SELECT 'q-' || (i % 4), 'activity', 'bench_activity', gen_random_uuid(),
 FROM generate_series(0, 9999) AS s(i);
 VACUUM ANALYZE harvest_task_queue;
 SELECT 'stc-before-claim' AS label,
-       pg_relation_size('harvest_task_queue') / 8192 AS heap_pages;
-SELECT pg_relation_size('harvest_task_queue') / 8192 AS heap_pages \gset stc_before_
+       pg_relation_size('harvest_task_queue') / 8192 AS heap_pages,
+       pg_relation_size('harvest_task_queue_schedule_to_close_idx') / 8192 AS idx_pages;
+SELECT pg_relation_size('harvest_task_queue') / 8192 AS heap_pages,
+       pg_relation_size('harvest_task_queue_schedule_to_close_idx') / 8192 AS idx_pages
+  \gset stc_before_
 
 UPDATE harvest_task_queue
 SET state = 'RUNNING',
@@ -81,23 +108,32 @@ SET state = 'RUNNING',
     started_at = NOW()
 WHERE state = 'PENDING';
 SELECT 'stc-after-claim' AS label,
-       pg_relation_size('harvest_task_queue') / 8192 AS heap_pages;
-SELECT pg_relation_size('harvest_task_queue') / 8192 AS heap_pages \gset stc_after_
+       pg_relation_size('harvest_task_queue') / 8192 AS heap_pages,
+       pg_relation_size('harvest_task_queue_schedule_to_close_idx') / 8192 AS idx_pages;
+SELECT pg_relation_size('harvest_task_queue') / 8192 AS heap_pages,
+       pg_relation_size('harvest_task_queue_schedule_to_close_idx') / 8192 AS idx_pages
+  \gset stc_after_
 
 -- Derived summary -- computed and printed by the script itself, so
 -- redirecting this script's output to the committed .txt artifact captures
--- the analysis, not just the four raw before/after measurements above.
+-- the analysis, not just the eight raw before/after measurements above.
+-- Heap and index growth are reported SEPARATELY, never summed into one
+-- percentage, so neither component's evidence can misrepresent the other's.
 SELECT
-  (:no_stc_after_heap_pages - :no_stc_before_heap_pages) AS no_stc_delta_pages,
-  (:stc_after_heap_pages - :stc_before_heap_pages) AS stc_delta_pages,
+  (:no_stc_after_heap_pages - :no_stc_before_heap_pages) AS no_stc_heap_delta_pages,
+  (:stc_after_heap_pages - :stc_before_heap_pages) AS stc_heap_delta_pages,
   ((:stc_after_heap_pages - :stc_before_heap_pages)
-     - (:no_stc_after_heap_pages - :no_stc_before_heap_pages)) AS extra_pages,
+     - (:no_stc_after_heap_pages - :no_stc_before_heap_pages)) AS extra_heap_pages,
   round(
     100.0 * ((:stc_after_heap_pages - :stc_before_heap_pages)
               - (:no_stc_after_heap_pages - :no_stc_before_heap_pages))
     / (:no_stc_after_heap_pages - :no_stc_before_heap_pages),
     1
-  ) AS extra_pct_more_growth_from_schedule_to_close;
+  ) AS extra_heap_pct_more_growth_from_schedule_to_close;
+
+SELECT
+  (:no_stc_after_idx_pages - :no_stc_before_idx_pages) AS no_stc_idx_delta_pages,
+  (:stc_after_idx_pages - :stc_before_idx_pages) AS stc_idx_delta_pages;
 
 -- cleanup: leave the scratch DB empty again.
 TRUNCATE harvest_task_queue RESTART IDENTITY;
