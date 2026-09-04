@@ -32,7 +32,7 @@
       "path": "/workflows",
       "category": "workflow",
       "read_only": true,
-      "description": "List workflow executions with optional filters. Supports keyset cursor pagination (issue #498).",
+      "description": "List workflow executions with optional filters. Supports keyset cursor pagination (issue #498). A malformed percent-encoded query-string byte sequence (an invalid UTF-8 byte, or an incomplete/non-hex `%` escape) is rejected with a 400 before any parameter is parsed, rather than silently substituting the Unicode replacement character and proceeding with a wrong-but-plausible value (issue #1151, sweeping the issue #774 `queue-coverage` fix to every other raw-pairs route).",
       "params": [
         {
           "name": "state",
@@ -147,7 +147,12 @@
         {
           "status": 500,
           "description": "Database error."
+        },
+        {
+          "status": 400,
+          "description": "Malformed query string: a percent-encoded byte sequence in the query does not decode to valid UTF-8."
         }
+
       ]
     },
     {
@@ -155,7 +160,7 @@
       "path": "/workflows/count",
       "category": "workflow",
       "read_only": true,
-      "description": "Grouped execution-count fleet snapshot (issue #544): counts harvest_workflow_executions rows grouped by state and/or workflow_name across all shards, computed with a per-shard SQL GROUP BY and summed in-process. Eventually-consistent point-in-time snapshot; no replay or ordering guarantee under concurrent writes. An unreachable shard is named in unavailable_shards rather than failing the call wholesale.",
+      "description": "Grouped execution-count fleet snapshot (issue #544): counts harvest_workflow_executions rows grouped by state and/or workflow_name across all shards, computed with a per-shard SQL GROUP BY and summed in-process. Eventually-consistent point-in-time snapshot; no replay or ordering guarantee under concurrent writes. An unreachable shard is named in unavailable_shards rather than failing the call wholesale. A malformed percent-encoded query-string byte sequence (an invalid UTF-8 byte, or an incomplete/non-hex `%` escape) is rejected with a 400 before any parameter is parsed, rather than silently substituting the Unicode replacement character and proceeding with a wrong-but-plausible value (issue #1151, sweeping the issue #774 `queue-coverage` fix to every other raw-pairs route).",
       "params": [
         {
           "name": "group_by",
@@ -215,7 +220,12 @@
         {
           "status": 500,
           "description": "Database error."
+        },
+        {
+          "status": 400,
+          "description": "Malformed query string: a percent-encoded byte sequence in the query does not decode to valid UTF-8."
         }
+
       ]
     },
     {
@@ -223,7 +233,7 @@
       "path": "/workflows/summaries",
       "category": "workflow",
       "read_only": true,
-      "description": "List tiered/summary-retention execution summaries (issue #752): compact, queryable rows the retention janitor demotes a hard-deleted terminal execution into instead of losing it entirely. Admin-guarded (summaries may carry retained/redacted payloads). Cross-shard fan-out with the same keyset-cursor pagination contract as GET /workflows (issue #498), ordered by (completed_at DESC, execution_id DESC). Each item carries summarized:true and history_available:false so it is unambiguously distinguishable from a live execution. An unreachable shard fails the call (matching GET /workflows).",
+      "description": "List tiered/summary-retention execution summaries (issue #752): compact, queryable rows the retention janitor demotes a hard-deleted terminal execution into instead of losing it entirely. Admin-guarded (summaries may carry retained/redacted payloads). Cross-shard fan-out with the same keyset-cursor pagination contract as GET /workflows (issue #498), ordered by (completed_at DESC, execution_id DESC). Each item carries summarized:true and history_available:false so it is unambiguously distinguishable from a live execution. An unreachable shard fails the call (matching GET /workflows). A malformed percent-encoded query-string byte sequence (an invalid UTF-8 byte, or an incomplete/non-hex `%` escape) is rejected with a 400 before any parameter is parsed, rather than silently substituting the Unicode replacement character and proceeding with a wrong-but-plausible value (issue #1151, sweeping the issue #774 `queue-coverage` fix to every other raw-pairs route).",
       "params": [
         {
           "name": "workflow_name",
@@ -300,7 +310,12 @@
         {
           "status": 500,
           "description": "Database error."
+        },
+        {
+          "status": 400,
+          "description": "Malformed query string: a percent-encoded byte sequence in the query does not decode to valid UTF-8."
         }
+
       ]
     },
     {
@@ -348,7 +363,7 @@
       "path": "/workflows/{id}/history",
       "category": "workflow",
       "read_only": true,
-      "description": "Paginated, filterable event history for a single workflow execution (issue #529). Cursor is the harvest_events.id (BIGSERIAL); absent next_cursor means last page.",
+      "description": "Paginated, filterable event history for a single workflow execution (issue #529). Cursor is the harvest_events.id (BIGSERIAL); absent next_cursor means last page. A malformed percent-encoded query-string byte sequence (an invalid UTF-8 byte, or an incomplete/non-hex `%` escape) is rejected with a 400 before any parameter is parsed, rather than silently substituting the Unicode replacement character and proceeding with a wrong-but-plausible value (issue #1151, sweeping the issue #774 `queue-coverage` fix to every other raw-pairs route).",
       "params": [
         {
           "name": "id",
@@ -397,7 +412,12 @@
         {
           "status": 500,
           "description": "Database error."
+        },
+        {
+          "status": 400,
+          "description": "Malformed query string: a percent-encoded byte sequence in the query does not decode to valid UTF-8."
         }
+
       ],
       "idempotency": "Fully idempotent; read-only."
     },
@@ -406,7 +426,7 @@
       "path": "/workflows/{id}/result",
       "category": "workflow",
       "read_only": true,
-      "description": "Return a compact terminal result for a workflow execution, optionally long-polling without returning event history.",
+      "description": "Return a compact terminal result for a workflow execution, optionally long-polling without returning event history. A malformed percent-encoded query-string byte sequence (an invalid UTF-8 byte, or an incomplete/non-hex `%` escape) is rejected with a 400 before any parameter is parsed, rather than silently substituting the Unicode replacement character and proceeding with a wrong-but-plausible value (issue #1151, sweeping the issue #774 `queue-coverage` fix to every other raw-pairs route).",
       "params": [
         {
           "name": "id",
@@ -444,7 +464,12 @@
         {
           "status": 500,
           "description": "Database or listener error."
+        },
+        {
+          "status": 400,
+          "description": "Malformed query string: a percent-encoded byte sequence in the query does not decode to valid UTF-8."
         }
+
       ]
     },
     {
@@ -452,7 +477,7 @@
       "path": "/workflows/{id}/history/export",
       "category": "workflow",
       "read_only": true,
-      "description": "Export the complete event history for a single execution as a HistoryExportDocument suitable for use as a replay fixture.",
+      "description": "Export the complete event history for a single execution as a HistoryExportDocument suitable for use as a replay fixture. A malformed percent-encoded query-string byte sequence (an invalid UTF-8 byte, or an incomplete/non-hex `%` escape) is rejected with a 400 before any parameter is parsed, rather than silently substituting the Unicode replacement character and proceeding with a wrong-but-plausible value (issue #1151, sweeping the issue #774 `queue-coverage` fix to every other raw-pairs route).",
       "params": [
         {
           "name": "id",
@@ -490,7 +515,12 @@
         {
           "status": 500,
           "description": "Database error."
+        },
+        {
+          "status": 400,
+          "description": "Malformed query string: a percent-encoded byte sequence in the query does not decode to valid UTF-8."
         }
+
       ]
     },
     {
@@ -498,7 +528,7 @@
       "path": "/workflows/{id}/children",
       "category": "workflow",
       "read_only": true,
-      "description": "List child workflow executions spawned by a parent execution. The walk fans out across every readable shard, so a child placed on a different shard than its parent (issue #956 cross-shard child placement) still appears. Cross-shard degradation (issue #756): an unreachable shard is named in unavailable_shards with status `partial`/`unavailable` rather than failing the whole call. BEHAVIOUR CHANGE in 0.5.0: this previously returned 500 when any shard was unreachable; it now returns 200 with the reachable children and a non-`complete` status. The 500 below is retained for a database error on the parent lookup itself, which is not a partial-result case.",
+      "description": "List child workflow executions spawned by a parent execution. The walk fans out across every readable shard, so a child placed on a different shard than its parent (issue #956 cross-shard child placement) still appears. Cross-shard degradation (issue #756): an unreachable shard is named in unavailable_shards with status `partial`/`unavailable` rather than failing the whole call. BEHAVIOUR CHANGE in 0.5.0: this previously returned 500 when any shard was unreachable; it now returns 200 with the reachable children and a non-`complete` status. The 500 below is retained for a database error on the parent lookup itself, which is not a partial-result case. A malformed percent-encoded query-string byte sequence (an invalid UTF-8 byte, or an incomplete/non-hex `%` escape) is rejected with a 400 before any parameter is parsed, rather than silently substituting the Unicode replacement character and proceeding with a wrong-but-plausible value (issue #1151, sweeping the issue #774 `queue-coverage` fix to every other raw-pairs route).",
       "params": [
         {
           "name": "id",
@@ -556,7 +586,12 @@
         {
           "status": 500,
           "description": "Database error."
+        },
+        {
+          "status": 400,
+          "description": "Malformed query string: a percent-encoded byte sequence in the query does not decode to valid UTF-8."
         }
+
       ]
     },
     {
@@ -564,7 +599,7 @@
       "path": "/workflows/{id}/tree",
       "category": "workflow",
       "read_only": true,
-      "description": "Recursive cross-shard execution lineage tree (issue #621): the full descendant tree rooted at {id}, so an operator triaging a DLQ/stuck alert can locate the failed descendant of a multi-level saga in ONE call instead of hand-walking parent_id links level by level and shard by shard. Rooting at a mid-tree node returns just the subtree below it; the chosen root is always depth 0 and still reports its own parent_id. Each node carries execution_id, workflow_name, workflow_id, state, started_at, closed_at, parent_id, depth, shard_id, and the spawn relationship (await_mode `awaited`/`detached` plus parent_close_policy when detached); children is always an array, empty for a leaf (never an error). The walk fans out across every readable shard (the iter_shards() aggregation pattern), so a child placed on a different shard than its parent by rendezvous hashing still appears. Recursion is bounded by max_depth (default 20, ceiling 50) and max_nodes (default 1000, ceiling 10000, counted INCLUDING the root); hitting either sets truncated=true with a machine-readable truncation_reason (`max_depth` | `max_nodes`) and names the dropped subtrees' parents in truncated_parent_ids (bounded, with truncated_parents_capped when it overflowed) — never a silent cap. Only parents that PROVABLY have children are named (via a bounded existence probe), so an operator is never sent chasing a subtree that does not exist. A visited-set guarantees each execution_id appears exactly once and a malformed parent_id loop terminates instead of recursing. `?summary=true` returns the per-state DESCENDANT roll-up (counts keyed by lowercased state, every known state always present even at 0; the root's own state is echoed on `root` and excluded from counts) plus total_descendants, for an at-a-glance health check without transferring the tree. Cross-shard degradation (issue #756): an unreachable shard is named in unavailable_shards with status `partial`/`unavailable` rather than failing the whole call — a triage read must not 500 during the incident it exists to diagnose. NOT admin-gated, matching GET /workflows/{id}/children (which already traverses depth cross-shard over the same rows). SNAPSHOT CONSISTENCY: shards are read independently, so a tree may be marginally time-skewed across shards; acceptable for triage. Adds no WorkflowEvent variant, no migration, appends no events, performs no writes.",
+      "description": "Recursive cross-shard execution lineage tree (issue #621): the full descendant tree rooted at {id}, so an operator triaging a DLQ/stuck alert can locate the failed descendant of a multi-level saga in ONE call instead of hand-walking parent_id links level by level and shard by shard. Rooting at a mid-tree node returns just the subtree below it; the chosen root is always depth 0 and still reports its own parent_id. Each node carries execution_id, workflow_name, workflow_id, state, started_at, closed_at, parent_id, depth, shard_id, and the spawn relationship (await_mode `awaited`/`detached` plus parent_close_policy when detached); children is always an array, empty for a leaf (never an error). The walk fans out across every readable shard (the iter_shards() aggregation pattern), so a child placed on a different shard than its parent by rendezvous hashing still appears. Recursion is bounded by max_depth (default 20, ceiling 50) and max_nodes (default 1000, ceiling 10000, counted INCLUDING the root); hitting either sets truncated=true with a machine-readable truncation_reason (`max_depth` | `max_nodes`) and names the dropped subtrees' parents in truncated_parent_ids (bounded, with truncated_parents_capped when it overflowed) — never a silent cap. Only parents that PROVABLY have children are named (via a bounded existence probe), so an operator is never sent chasing a subtree that does not exist. A visited-set guarantees each execution_id appears exactly once and a malformed parent_id loop terminates instead of recursing. `?summary=true` returns the per-state DESCENDANT roll-up (counts keyed by lowercased state, every known state always present even at 0; the root's own state is echoed on `root` and excluded from counts) plus total_descendants, for an at-a-glance health check without transferring the tree. Cross-shard degradation (issue #756): an unreachable shard is named in unavailable_shards with status `partial`/`unavailable` rather than failing the whole call — a triage read must not 500 during the incident it exists to diagnose. NOT admin-gated, matching GET /workflows/{id}/children (which already traverses depth cross-shard over the same rows). SNAPSHOT CONSISTENCY: shards are read independently, so a tree may be marginally time-skewed across shards; acceptable for triage. Adds no WorkflowEvent variant, no migration, appends no events, performs no writes. A malformed percent-encoded query-string byte sequence (an invalid UTF-8 byte, or an incomplete/non-hex `%` escape) is rejected with a 400 before any parameter is parsed, rather than silently substituting the Unicode replacement character and proceeding with a wrong-but-plausible value (issue #1151, sweeping the issue #774 `queue-coverage` fix to every other raw-pairs route).",
       "params": [
         {
           "name": "id",
@@ -627,7 +662,12 @@
         {
           "status": 500,
           "description": "Database error."
+        },
+        {
+          "status": 400,
+          "description": "Malformed query string: a percent-encoded byte sequence in the query does not decode to valid UTF-8."
         }
+
       ],
       "idempotency": "Fully idempotent; read-only. A point-in-time snapshot assembled per-shard."
     },
@@ -724,7 +764,7 @@
       "path": "/workflows/{id}/logs",
       "category": "workflow",
       "read_only": true,
-      "description": "Durable per-execution author log lines (issue #790): the lines a workflow emitted through ctx.logger()/ctx.log_info/log_warn/log_error, persisted to harvest_workflow_logs when the opt-in durable sink is enabled via HarvestBuilder::workflow_log_persistence. Admin-gated: a log message is free-form author text that routinely carries business detail, so this read takes the stricter posture of the sibling per-execution diagnostics (/awaitables) rather than the plain execution-row one. Lines are returned in EMISSION order (the deterministic seq logical-position key), never occurred_at, which is wall clock and can be non-monotonic across workers; seq is also the pagination cursor. Each element of lines[] carries seq (i64), level (info|warn|error), message (string, capped at write time), occurred_at (RFC 3339), and truncation_marker (bool, present only when true). When an execution exceeds its configured per-execution line cap, the newest lines are dropped and a single synthetic marker row is appended (drop-newest); the response-level truncated flag is filter-independent, so a ?level=error page still reports it. Logs are OBSERVATIONAL ONLY: they are not part of the event history, carry no determinism guarantee, and are never read back into workflow logic. With the sink disabled this endpoint returns an empty lines[] for every execution. Log rows are removed by the same ON DELETE CASCADE that removes the execution, so they can never outlive workflow-history retention, and targeted PII erasure (issue #495) deletes them too. Shard routing fails closed (no default-shard fallback): an empty list is a legitimate answer for a run that never logged, so a mis-routed read would be indistinguishable from \"no logs\" and returns 503 instead.",
+      "description": "Durable per-execution author log lines (issue #790): the lines a workflow emitted through ctx.logger()/ctx.log_info/log_warn/log_error, persisted to harvest_workflow_logs when the opt-in durable sink is enabled via HarvestBuilder::workflow_log_persistence. Admin-gated: a log message is free-form author text that routinely carries business detail, so this read takes the stricter posture of the sibling per-execution diagnostics (/awaitables) rather than the plain execution-row one. Lines are returned in EMISSION order (the deterministic seq logical-position key), never occurred_at, which is wall clock and can be non-monotonic across workers; seq is also the pagination cursor. Each element of lines[] carries seq (i64), level (info|warn|error), message (string, capped at write time), occurred_at (RFC 3339), and truncation_marker (bool, present only when true). When an execution exceeds its configured per-execution line cap, the newest lines are dropped and a single synthetic marker row is appended (drop-newest); the response-level truncated flag is filter-independent, so a ?level=error page still reports it. Logs are OBSERVATIONAL ONLY: they are not part of the event history, carry no determinism guarantee, and are never read back into workflow logic. With the sink disabled this endpoint returns an empty lines[] for every execution. Log rows are removed by the same ON DELETE CASCADE that removes the execution, so they can never outlive workflow-history retention, and targeted PII erasure (issue #495) deletes them too. Shard routing fails closed (no default-shard fallback): an empty list is a legitimate answer for a run that never logged, so a mis-routed read would be indistinguishable from \"no logs\" and returns 503 instead. A malformed percent-encoded query-string byte sequence (an invalid UTF-8 byte, or an incomplete/non-hex `%` escape) is rejected with a 400 before any parameter is parsed, rather than silently substituting the Unicode replacement character and proceeding with a wrong-but-plausible value (issue #1151, sweeping the issue #774 `queue-coverage` fix to every other raw-pairs route).",
       "params": [
         {
           "name": "id",
@@ -788,7 +828,12 @@
         {
           "status": 503,
           "description": "The shard that owns this execution has no configured storage pool on this node, so existence cannot be determined without risking a false 404."
+        },
+        {
+          "status": 400,
+          "description": "Malformed query string: a percent-encoded byte sequence in the query does not decode to valid UTF-8."
         }
+
       ],
       "idempotency": "Fully idempotent; read-only."
     },
@@ -1091,7 +1136,7 @@
           {
             "name": "conflict_policy",
             "required": false,
-            "description": "How to handle a collision with a currently-ACTIVE (RUNNING/PAUSED) prior run (issue #685). Orthogonal to reuse_policy (which governs terminal priors). One of: unspecified (default — each reuse policy's native active behavior, byte-for-byte identical to today), fail (409 AlreadyExists), use_existing (return the existing run, 200, no new WorkflowStarted), terminate_existing (cancel the active prior and start fresh, 201). Sending the field (even 'unspecified') surfaces a started_fresh boolean in the response (true = fresh run created, false = attached to the existing run); omitting it keeps the response byte-for-byte identical to today. terminate_existing requires admin authentication, because it can cancel a live prior; the other values (unspecified, fail, use_existing) do not — except that unspecified inherits the reuse policy's native behavior, so reuse_policy=terminate_if_running with an omitted/unspecified conflict_policy still requires admin. Not supported combined with a throttle/debounce/batch policy — the start is deferred and has no active prior to resolve at request time (400). An unknown value returns 400."
+            "description": "How to handle a collision with a currently-ACTIVE (RUNNING/PAUSED) prior run (issue #685). Orthogonal to reuse_policy (which governs terminal priors). One of: unspecified (default — each reuse policy's native active behavior, byte-for-byte identical to today), fail (409 AlreadyExists), use_existing (return the existing run, 200, no new WorkflowStarted), terminate_existing (cancel the active prior and start fresh, 201). Sending the field (even 'unspecified') surfaces a started_fresh boolean in the response (true = fresh run created, false = attached to the existing run); omitting it keeps the response byte-for-byte identical to today. terminate_existing requires admin authentication, because it can cancel a live prior; the other values (unspecified, fail, use_existing) do not — except that unspecified inherits the reuse policy's native behavior, so reuse_policy=terminate_if_running with an omitted/unspecified conflict_policy still requires admin. Not supported combined with a throttle/debounce/batch policy — the start is deferred and has no active prior to resolve at request time (400). An unknown value returns 400. A prior sealed MIGRATED/MIGRATING by a shard rebalance (issue #964) counts as ACTIVE -- the run is live, just on another shard -- and terminate_existing against one is REFUSED with a retryable 503 naming the live residence rather than replaced: the terminate could not reach the live copy from the prior's shard, and replacing would release the business key while the real run kept executing, producing two live runs for one workflow_id. Cancel or terminate the execution by id (which routes to its live residence), then retry the start."
           },
           {
             "name": "start_at",
@@ -1790,7 +1835,7 @@
       "path": "/workflows/{id}/erase-payloads",
       "category": "workflow",
       "read_only": false,
-      "description": "Tombstone all payload-bearing fields (input, output, payload, details, value, last_completion_result) in every event row, the execution row, and signal rows for a terminal workflow execution. Cascades to terminal child executions on the same shard. Requires the execution to be in a terminal state (COMPLETED, FAILED, CANCELLED, TIMED_OUT, CONTINUED_AS_NEW, or TERMINATED).",
+      "description": "Tombstone all payload-bearing fields (input, output, payload, details, value, last_completion_result) in every event row, the execution row, and signal rows for a terminal workflow execution. Cascades to terminal child executions on the same shard. Requires the execution to be in a terminal state (COMPLETED, FAILED, CANCELLED, TIMED_OUT, CONTINUED_AS_NEW, or TERMINATED). Scrubs EVERY shard that still holds a copy of the execution: a shard rebalance (issue #964) seals rather than deletes the source, so a rebalanced run's payloads live on both the live target and the sealed source until the source shard's retention collects it, and each additional residence that was scrubbed is reported in the response's prior_residences array. The terminal-state and legal-hold gates are evaluated against the LIVE residence only, so a still-running execution can never be erased through its own sealed shadow. A residence whose copy has already been collected contributes nothing and is not an error; a residence this node cannot reach fails the whole call, because an erasure that cannot be shown to be complete must not be reported as complete. The one exception is a RETIRED shard -- decommissioned, its pool removed fleet-wide and its ids forwarded to a successor per docs/runbooks/shard-decommission.md, which requires its payloads to be destroyed or erased before the forward is declared. Those are listed in retired_residences rather than failing the call, since failing closed on them would make every run that ever lived on a retired shard permanently un-erasable.",
       "idempotency": "Idempotent: re-running on an already-erased execution returns fields_tombstoned=0, no error.",
       "params": [
         {
@@ -1825,7 +1870,9 @@
           "dead_letters_scrubbed",
           "children",
           "skipped_children",
-          "failures"
+          "failures",
+          "prior_residences",
+          "retired_residences"
         ]
       },
       "error_responses": [
@@ -2925,7 +2972,7 @@
       "path": "/dead-letters/aggregate",
       "category": "dlq",
       "read_only": true,
-      "description": "Root-cause aggregation for DLQ triage: group dead-letter entries by workflow_name, activity_name, queue_name, task_type, time_bucket, a derived failure_signature, a derived dlq_reason class, and/or a derived error_class, returning per-group counts and representative sample IDs merged across shards.",
+      "description": "Root-cause aggregation for DLQ triage: group dead-letter entries by workflow_name, activity_name, queue_name, task_type, time_bucket, a derived failure_signature, a derived dlq_reason class, and/or a derived error_class, returning per-group counts and representative sample IDs merged across shards. A malformed percent-encoded query-string byte sequence (an invalid UTF-8 byte, or an incomplete/non-hex `%` escape) is rejected with a 400 before any parameter is parsed, rather than silently substituting the Unicode replacement character and proceeding with a wrong-but-plausible value (issue #1151, sweeping the issue #774 `queue-coverage` fix to every other raw-pairs route).",
       "params": [
         {
           "name": "group_by",
@@ -3008,7 +3055,12 @@
         {
           "status": 500,
           "description": "Database error."
+        },
+        {
+          "status": 400,
+          "description": "Malformed query string: a percent-encoded byte sequence in the query does not decode to valid UTF-8."
         }
+
       ]
     },
     {
@@ -3462,7 +3514,7 @@
       "path": "/workers",
       "category": "worker",
       "read_only": true,
-      "description": "List registered worker processes and their current lifecycle status.",
+      "description": "List registered worker processes and their current lifecycle status. A malformed percent-encoded query-string byte sequence (an invalid UTF-8 byte, or an incomplete/non-hex `%` escape) is rejected with a 400 before any parameter is parsed, rather than silently substituting the Unicode replacement character and proceeding with a wrong-but-plausible value (issue #1151, sweeping the issue #774 `queue-coverage` fix to every other raw-pairs route).",
       "params": [
         {
           "name": "queue",
@@ -3505,7 +3557,12 @@
         {
           "status": 500,
           "description": "Database error."
+        },
+        {
+          "status": 400,
+          "description": "Malformed query string: a percent-encoded byte sequence in the query does not decode to valid UTF-8."
         }
+
       ]
     },
     {
@@ -3570,7 +3627,7 @@
       "path": "/workers/drain-preview",
       "category": "worker",
       "read_only": true,
-      "description": "Preview which workers would be targeted by a drain request, without modifying anything.",
+      "description": "Preview which workers would be targeted by a drain request, without modifying anything. A malformed percent-encoded query-string byte sequence (an invalid UTF-8 byte, or an incomplete/non-hex `%` escape) is rejected with a 400 before any parameter is parsed, rather than silently substituting the Unicode replacement character and proceeding with a wrong-but-plausible value (issue #1151, sweeping the issue #774 `queue-coverage` fix to every other raw-pairs route).",
       "params": [
         {
           "name": "queue",
@@ -3606,7 +3663,12 @@
         {
           "status": 500,
           "description": "Database error."
+        },
+        {
+          "status": 400,
+          "description": "Malformed query string: a percent-encoded byte sequence in the query does not decode to valid UTF-8."
         }
+
       ]
     },
     {
@@ -4659,7 +4721,7 @@
       "path": "/admin/config",
       "category": "admin",
       "read_only": true,
-      "description": "Return the resolved effective runtime configuration of the fleet, secret-free. Secret-bearing configuration (LISTEN/NOTIFY database URLs, per-shard notification URLs, and the sharded pool handle) is surfaced only as presence booleans and counts \u2014 never a value \u2014 so a connection string can never appear in the response. Durations are reported as whole milliseconds with a _ms suffix; unset Option ceilings serialize as explicit JSON null. Top-level sections: worker (resolved WorkerConfig), payload_caps (size caps + server-side ceilings), shard_topology (readable/writable/default shards plus the declared residency_key \u2192 shard map, issue #697 \u2014 diff residency_map across replicas to catch a fleet deployed with conflicting maps, which would otherwise place the same residency_key in different jurisdictions while reporting identical topology), features (compiled-in core-crate feature flags), pool (resolved database pool sizing).",
+      "description": "Return the resolved effective runtime configuration of the fleet, secret-free. Secret-bearing configuration (LISTEN/NOTIFY database URLs, per-shard notification URLs, and the sharded pool handle) is surfaced only as presence booleans and counts \u2014 never a value \u2014 so a connection string can never appear in the response. Durations are reported as whole milliseconds with a _ms suffix; unset Option ceilings serialize as explicit JSON null. Top-level sections: worker (resolved WorkerConfig), payload_caps (size caps + server-side ceilings), shard_topology (readable/writable/default shards, the declared residency_key \u2192 shard map, issue #697 \u2014 diff residency_map across replicas to catch a fleet deployed with conflicting maps, which would otherwise place the same residency_key in different jurisdictions while reporting identical topology \u2014 and shard_forwards, the declared retired-shard \u2192 successor map, issue #964: empty until a shard is decommissioned, and diffed across replicas for the same reason, since replicas that disagree would answer the same ExecutionId from different databases), features (compiled-in core-crate feature flags), pool (resolved database pool sizing).",
       "params": [],
       "request_body": null,
       "success_response": {
@@ -4970,7 +5032,7 @@
       "path": "/admin/usage",
       "category": "admin",
       "read_only": true,
-      "description": "Historical per-tenant/per-workflow usage report (issue #596): the historical companion to the point-in-time GET /admin/concurrency endpoint. Aggregates already-durable data (harvest_workflow_executions + harvest_events) over a required [from, to] window, grouped by workflow_name (default) or a search_attr:<key> tenant key, fanned out and summed across every shard. workflow_starts counts by started_at in the window; completed/failed/cancelled/timed_out count by completed_at in the window and matching terminal state; activity_executions counts ActivityStarted events (one per dispatch attempt) in the window; activity_executions_failed counts terminal ActivityFailed/ActivityTimedOut events in the window; activity_compute_seconds sums each activity's final-attempt start-to-terminal wall-clock span for terminal events in the window. Local and externally-completed activities are excluded (no ActivityStarted event). Executions lacking the requested search_attr key are grouped under the literal group \"(unattributed)\" rather than dropped. An unreachable shard is named in unavailable_shards rather than failing the call wholesale.",
+      "description": "Historical per-tenant/per-workflow usage report (issue #596): the historical companion to the point-in-time GET /admin/concurrency endpoint. Aggregates already-durable data (harvest_workflow_executions + harvest_events) over a required [from, to] window, grouped by workflow_name (default) or a search_attr:<key> tenant key, fanned out and summed across every shard. workflow_starts counts by started_at in the window; completed/failed/cancelled/timed_out count by completed_at in the window and matching terminal state; activity_executions counts ActivityStarted events (one per dispatch attempt) in the window; activity_executions_failed counts terminal ActivityFailed/ActivityTimedOut events in the window; activity_compute_seconds sums each activity's final-attempt start-to-terminal wall-clock span for terminal events in the window. Local and externally-completed activities are excluded (no ActivityStarted event). Executions lacking the requested search_attr key are grouped under the literal group \"(unattributed)\" rather than dropped. An unreachable shard is named in unavailable_shards rather than failing the call wholesale. A malformed percent-encoded query-string byte sequence (an invalid UTF-8 byte, or an incomplete/non-hex `%` escape) is rejected with a 400 before any parameter is parsed, rather than silently substituting the Unicode replacement character and proceeding with a wrong-but-plausible value (issue #1151, sweeping the issue #774 `queue-coverage` fix to every other raw-pairs route).",
       "params": [
         {
           "name": "from",
@@ -5015,7 +5077,12 @@
         {
           "status": 500,
           "description": "Database error."
+        },
+        {
+          "status": 400,
+          "description": "Malformed query string: a percent-encoded byte sequence in the query does not decode to valid UTF-8."
         }
+
       ]
     },
     {
@@ -5258,7 +5325,7 @@
       "path": "/admin/history/exports",
       "category": "admin",
       "read_only": true,
-      "description": "Batch-export event histories for multiple executions matching the provided filters.",
+      "description": "Batch-export event histories for multiple executions matching the provided filters. A malformed percent-encoded query-string byte sequence (an invalid UTF-8 byte, or an incomplete/non-hex `%` escape) is rejected with a 400 before any parameter is parsed, rather than silently substituting the Unicode replacement character and proceeding with a wrong-but-plausible value (issue #1151, sweeping the issue #774 `queue-coverage` fix to every other raw-pairs route).",
       "params": [
         {
           "name": "workflow_name",
@@ -5324,7 +5391,12 @@
         {
           "status": 500,
           "description": "Database error."
+        },
+        {
+          "status": 400,
+          "description": "Malformed query string: a percent-encoded byte sequence in the query does not decode to valid UTF-8."
         }
+
       ]
     },
     {
@@ -5332,7 +5404,7 @@
       "path": "/admin/history/export-sample",
       "category": "admin",
       "read_only": true,
-      "description": "Stratified in-flight history sample for the replay-drift gate (issue #798). Returns at most per_workflow non-terminal executions PER registered workflow type, across every shard, alongside a portable manifest reporting how many were sampled versus the in-flight population so truncation is never silent. Admin-only. Read-only: SELECT-only, no state transition and no event appended. An unreachable shard degrades the manifest to partial and names the shard rather than failing the request.",
+      "description": "Stratified in-flight history sample for the replay-drift gate (issue #798). Returns at most per_workflow non-terminal executions PER registered workflow type, across every shard, alongside a portable manifest reporting how many were sampled versus the in-flight population so truncation is never silent. Admin-only. Read-only: SELECT-only, no state transition and no event appended. An unreachable shard degrades the manifest to partial and names the shard rather than failing the request. A malformed percent-encoded query-string byte sequence (an invalid UTF-8 byte, or an incomplete/non-hex `%` escape) is rejected with a 400 before any parameter is parsed, rather than silently substituting the Unicode replacement character and proceeding with a wrong-but-plausible value (issue #1151, sweeping the issue #774 `queue-coverage` fix to every other raw-pairs route).",
       "params": [
         {
           "name": "per_workflow",
@@ -5410,7 +5482,12 @@
         {
           "status": 500,
           "description": "Database error."
+        },
+        {
+          "status": 400,
+          "description": "Malformed query string: a percent-encoded byte sequence in the query does not decode to valid UTF-8."
         }
+
       ]
     },
     {
@@ -5418,7 +5495,7 @@
       "path": "/admin/external-handoffs",
       "category": "external_activity",
       "read_only": true,
-      "description": "List pending external activity handoffs with optional filters.",
+      "description": "List pending external activity handoffs with optional filters. A malformed percent-encoded query-string byte sequence (an invalid UTF-8 byte, or an incomplete/non-hex `%` escape) is rejected with a 400 before any parameter is parsed, rather than silently substituting the Unicode replacement character and proceeding with a wrong-but-plausible value (issue #1151, sweeping the issue #774 `queue-coverage` fix to every other raw-pairs route).",
       "params": [
         {
           "name": "state",
@@ -5488,7 +5565,12 @@
         {
           "status": 500,
           "description": "Database error."
+        },
+        {
+          "status": 400,
+          "description": "Malformed query string: a percent-encoded byte sequence in the query does not decode to valid UTF-8."
         }
+
       ]
     },
     {
@@ -6538,7 +6620,7 @@
       "path": "/admin/schedules/{id}/runs",
       "category": "schedule",
       "read_only": true,
-      "description": "List the workflow executions a schedule launched, newest-slot-first (ordered by scheduled_for, falling back to started_at for slot-less manual fires), each with its terminal state, a collapsed outcome (completed/failed/timed_out/cancelled/terminated/running), the first line of the error for terminally-failed runs, and the dispatch origin (scheduled/backfill/manual_trigger). Echoes the schedule's next_run_at and a per-state cadence summary counting only scheduled-origin runs. Fans out across shards; reports partial results when a shard is unavailable instead of failing. 404s an unknown schedule id.",
+      "description": "List the workflow executions a schedule launched, newest-slot-first (ordered by scheduled_for, falling back to started_at for slot-less manual fires), each with its terminal state, a collapsed outcome (completed/failed/timed_out/cancelled/terminated/running), the first line of the error for terminally-failed runs, and the dispatch origin (scheduled/backfill/manual_trigger). Echoes the schedule's next_run_at and a per-state cadence summary counting only scheduled-origin runs. Fans out across shards; reports partial results when a shard is unavailable instead of failing. 404s an unknown schedule id. A malformed percent-encoded query-string byte sequence (an invalid UTF-8 byte, or an incomplete/non-hex `%` escape) is rejected with a 400 before any parameter is parsed, rather than silently substituting the Unicode replacement character and proceeding with a wrong-but-plausible value (issue #1151, sweeping the issue #774 `queue-coverage` fix to every other raw-pairs route).",
       "params": [
         {
           "name": "state",
@@ -6598,7 +6680,12 @@
         {
           "status": 503,
           "description": "Indeterminate existence (retryable): the schedule id was not found and at least one shard is unreachable, so its absence cannot be confirmed. Retry once shards recover."
+        },
+        {
+          "status": 400,
+          "description": "Malformed query string: a percent-encoded byte sequence in the query does not decode to valid UTF-8."
         }
+
       ]
     },
     {
@@ -8146,7 +8233,7 @@
       "path": "/workflows/by-id/{workflow_name}/{workflow_id}/result",
       "category": "workflow",
       "read_only": true,
-      "description": "Compact terminal result for the current run of a business (workflow_name, workflow_id). Resolves (workflow_name, workflow_id) to the current run: the single active (non-terminal) run if one exists, else the most recent terminal run, else 404 (never 500). Shard-aware. The resolved execution_id is returned on every response in the X-Harvest-Execution-Id header (and in the JSON body where present); acting by business id always reaches the live run even after a continue-as-new/reset fork.",
+      "description": "Compact terminal result for the current run of a business (workflow_name, workflow_id). Resolves (workflow_name, workflow_id) to the current run: the single active (non-terminal) run if one exists, else the most recent terminal run, else 404 (never 500). Shard-aware. The resolved execution_id is returned on every response in the X-Harvest-Execution-Id header (and in the JSON body where present); acting by business id always reaches the live run even after a continue-as-new/reset fork. A malformed percent-encoded query-string byte sequence (an invalid UTF-8 byte, or an incomplete/non-hex `%` escape) is rejected with a 400 before any parameter is parsed, rather than silently substituting the Unicode replacement character and proceeding with a wrong-but-plausible value (issue #1151, sweeping the issue #774 `queue-coverage` fix to every other raw-pairs route).",
       "params": [
         {
           "name": "workflow_name",
@@ -8185,7 +8272,12 @@
         {
           "status": 500,
           "description": "Database or listener error."
+        },
+        {
+          "status": 400,
+          "description": "Malformed query string: a percent-encoded byte sequence in the query does not decode to valid UTF-8."
         }
+
       ]
     },
     {
@@ -8230,7 +8322,7 @@
       "path": "/workflows/by-id/{workflow_name}/{workflow_id}/children",
       "category": "workflow",
       "read_only": true,
-      "description": "List child executions of the current run for a business (workflow_name, workflow_id). Resolves (workflow_name, workflow_id) to the current run: the single active (non-terminal) run if one exists, else the most recent terminal run, else 404 (never 500). Shard-aware. The resolved execution_id is returned on every response in the X-Harvest-Execution-Id header (and in the JSON body where present); acting by business id always reaches the live run even after a continue-as-new/reset fork.",
+      "description": "List child executions of the current run for a business (workflow_name, workflow_id). Resolves (workflow_name, workflow_id) to the current run: the single active (non-terminal) run if one exists, else the most recent terminal run, else 404 (never 500). Shard-aware. The resolved execution_id is returned on every response in the X-Harvest-Execution-Id header (and in the JSON body where present); acting by business id always reaches the live run even after a continue-as-new/reset fork. A malformed percent-encoded query-string byte sequence (an invalid UTF-8 byte, or an incomplete/non-hex `%` escape) is rejected with a 400 before any parameter is parsed, rather than silently substituting the Unicode replacement character and proceeding with a wrong-but-plausible value (issue #1151, sweeping the issue #774 `queue-coverage` fix to every other raw-pairs route).",
       "params": [
         {
           "name": "workflow_name",
@@ -8290,7 +8382,12 @@
         {
           "status": 500,
           "description": "Database error."
+        },
+        {
+          "status": 400,
+          "description": "Malformed query string: a percent-encoded byte sequence in the query does not decode to valid UTF-8."
         }
+
       ]
     },
     {

@@ -120,7 +120,7 @@ endpoint's cost; they are effectively the entire cost.
 ```rust
 for s in schedules {
     let name = s.dag_name.as_deref().or(s.workflow_name.as_deref()).unwrap_or("");
-    let at_capacity = match scheduler::schedule_running_basis(&mut conn, name).await {
+    let at_capacity = match scheduler::schedule_running_basis(&mut conn, name, s.id).await {
         Ok(basis) => basis >= i64::from(s.max_active_runs),
         Err(_) => false,
     };
@@ -148,8 +148,9 @@ per-item version did but for a whole `&[&str]` of names/calendars at once:
 ```rust
 // autumn-harvest/src/scheduler.rs
 pub async fn schedule_running_basis_batch(
-    conn: &mut AsyncPgConnection, names: &[&str],
-) -> HarvestResult<HashMap<String, i64>> { /* one GROUP BY query + one batched throttle call */ }
+    conn: &mut AsyncPgConnection, schedules: &[(Uuid, &str)],
+) -> HarvestResult<HashMap<Uuid, i64>> { /* one GROUP BY query + one batched throttle call;
+                                             keyed by schedule_id since #1160 (see addendum) */ }
 
 pub fn resolve_effective_fire_at_pure(
     excluded: &[NaiveDate], exclude_weekends: bool, skip_policy_db: &str,
@@ -220,13 +221,13 @@ totals).
 
 Two independent checks, both passing:
 
-1. **Function-level, exact.** `schedule_running_basis_batch_matches_per_name_loop`
+1. **Function-level, exact.** `schedule_running_basis_batch_matches_per_schedule_loop`
    and `resolve_effective_fire_at_pure_matches_resolve_effective_fire_at`
    (in the harness file, always-run, not `#[ignore]`d) seed a 60-schedule
    fixture and assert the batched functions' output equals the *original,
    unmodified* per-item functions' output, called in a loop, against the
-   identical fixture and connection — schedule-by-schedule for the calendar
-   check, name-by-name for the running-basis check. The calendar check
+   identical fixture and connection — schedule-by-schedule for both the
+   calendar check and (since #1160) the running-basis check. The calendar check
    additionally asserts at least 5 schedules land in the real rebasing
    branch (`Some(adjusted_fire_at)`), so the comparison isn't vacuously
    passing on an all-`None` fixture.
@@ -261,13 +262,35 @@ existing lookups are batched.
   vs. O(1) call-count result does not depend on the exact ratios — it holds
   for any nonzero population of schedules per shard.
 
+## Addendum (issue #1160): `schedule_id`-scoped counting
+
+`schedule_running_basis`/`schedule_running_basis_batch` gained a `schedule_id`
+parameter after this investigation shipped. A `ctx.continue_as_new_as(...)`
+(#803) successor carries its predecessor's `schedule_id`/`scheduled_for` but
+runs as the target `workflow_name`, so the name-only `COUNT(*)` this doc
+describes could never see it — the schedule's `max_active_runs` cap silently
+stopped covering the rest of a run once it changed type mid-chain. The fix
+adds `OR schedule_id = $schedule_id` to the same single `COUNT(*)` (additive,
+not a replacement: the existing `workflow_name = $name` clause still covers
+every same-type run, manual triggers included, so a same-type schedule's
+behavior is unchanged). This changed both functions' signatures and
+`schedule_running_basis_batch`'s return type from `HashMap<String, i64>`
+(keyed by name) to `HashMap<Uuid, i64>` (keyed by schedule id) — two
+schedules can no longer be assumed to have independent, name-only bases, so
+callers look results up by the schedule they asked about, not by name. Every
+call site in this doc's own code (`load_schedule_overdue_aux_by_shard`,
+`get_schedule`, `upsert_workflow_schedule_and_read_back`) and in
+`overdue_schedule_pass` was updated accordingly; no new query round trip was
+added (the disjunct is one extra `OR` clause on the existing `COUNT(*)`), so
+this addendum does not change the O(1)-per-shard call-count result above.
+
 ## Reproduce
 
 ```bash
 # Equivalence tests (fast, always-run, no pg_stat_statements needed):
 HARVEST_TEST_DATABASE_URL=postgres://postgres:postgres@localhost:5432/postgres \
   cargo test -p autumn-harvest-plugin --test schedule_overdue_aux_perf -- \
-  schedule_running_basis_batch_matches_per_name_loop \
+  schedule_running_basis_batch_matches_per_schedule_loop \
   resolve_effective_fire_at_pure_matches_resolve_effective_fire_at
 
 # Pre-existing end-to-end overdue/capacity/calendar tests, run against the fixed code:

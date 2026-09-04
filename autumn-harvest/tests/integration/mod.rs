@@ -97,6 +97,9 @@ mod guardrail_catalog_tests;
 mod havoc_reentrancy;
 mod havoc_tests;
 mod history_ceiling_claim_tests;
+mod hot_code_swap_docs;
+#[cfg(all(feature = "hot-code-swap", feature = "testing"))]
+mod hot_code_swap_tests;
 #[cfg(feature = "testing")]
 mod idempotency_tests;
 mod integration_e2e;
@@ -188,6 +191,9 @@ mod scheduler_registration_tests;
 mod security;
 #[cfg(feature = "db")]
 mod shard_placement_by_id_tests;
+#[cfg(all(feature = "db", feature = "testing"))]
+mod shard_rebalance_db_tests;
+mod shard_rebalance_unit;
 #[cfg(feature = "db")]
 mod sharded_runtime_tests;
 mod sharding_unit;
@@ -203,6 +209,8 @@ mod start_idempotency_tests;
 mod start_source_tests;
 mod sticky_routing_tests;
 mod telemetry_span_tests;
+#[cfg(feature = "db")]
+mod terminal_write_ownership_tests;
 #[cfg(feature = "db")]
 mod throttle_tests;
 #[cfg(feature = "db")]

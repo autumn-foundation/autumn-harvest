@@ -162,9 +162,17 @@ curl -s .../admin/config | jq -S '.shard_topology'
   "default_shard": 0,
   "readable_shards": [0, 1],
   "residency_map": { "eu": 0, "us": 1 },
+  "shard_forwards": {},
   "writable_shards": [0, 1]
 }
 ```
+
+`shard_forwards` (issue #964) is the same argument applied to a strictly worse
+failure mode. It is empty until a shard has been decommissioned; after one, two
+replicas that disagree about where a **retired** shard's ids resolve will answer
+the *same* `ExecutionId` from *different* databases — one finding the run, the
+other a confident `404` — while reporting identical `readable`/`writable`/
+`default` sets. Diff it as the last step of a decommission.
 
 The projection is `BTreeMap`-ordered, so it is byte-stable and a plain diff across replicas is meaningful:
 
@@ -476,6 +484,312 @@ There is **no dedicated metric** for the relay yet; the queries above and the `T
 > **Behaviour change for existing `/children` callers.** Before this, an unreachable shard produced a `500`. Now it produces a `200` whose `items` array is *incomplete*. A client that treated `200` as "this is the whole child list" must read `status` (or check `unavailable_shards` is empty) before drawing that conclusion. The fields are additive; the status code is the part that changed.
 
 The parent **detail** view (`GET /workflows/{id}`) resolves no children — it returns the execution row's own `parent_id` and nothing else — so there is nothing there to degrade.
+
+## Shard rebalancing — migrating quiescent workflows (issue #964)
+
+Before this, the sharding contract ended at *"cross-shard rebalancing of existing
+workflows is out of scope"*. That had two consequences that compound over time:
+adding a shard only helps **new** starts, so a hot shard stays hot for as long as
+its residents live — forever, for a continue-as-new entity workflow — and a shard
+can never be decommissioned, because there is no way to move its residents off.
+
+`harvest shard rebalance` is the operator-initiated primitive that fixes both.
+It is deliberately narrow: it moves **quiescent** executions only.
+
+```
+copy ──▶ replay-verify ──▶ ONE atomic cutover commit ──▶ sealed source
+```
+
+Restricting to quiescent runs is the move that makes the rest provable. It
+converts a live distributed-migration problem into a copy-verify-cutover of an
+*inert, append-only event log* — exactly the artifact Harvest's replay engine
+exists to verify — which is what removes the catch-up phase every online shard
+move in the literature needs, and with it the dual-write and the 2PC.
+
+The full design note, including the alternatives that were rejected and why, is
+`docs/plans/2026-09-02-shard-rebalancing.md`.
+
+### The identity contract: an `ExecutionId` never changes
+
+**A migrated execution keeps its `ExecutionId`.** This is the load-bearing
+decision and it is worth stating plainly, because it inverts what the first two
+bytes mean:
+
+> An `ExecutionId`'s encoded shard is the shard the run **originated** on — its
+> routing entry point — not necessarily where it lives today.
+
+Nothing that holds an id has to learn anything, because no id changed. A
+parent's recorded `ChildWorkflowStarted.child_id`, a stored `WorkflowHandle`, an
+external signal or cancel target, a webhook's stored reference, a schedule's
+carryover lineage — all keep resolving, structurally rather than by enumeration.
+There is no rewrite pass and no alias table.
+
+Resolution is two-level:
+
+| Level | Mechanism | Used when |
+|---|---|---|
+| 1 | **Origin-shard forwarding.** The sealed source row (`MIGRATED`) carries `migrated_to_shard`; an id-routed lookup lands on the origin shard as it always did and follows the pointer. | The origin shard is still readable — i.e. always, until it is decommissioned. |
+| 2 | **Router-declared shard forwards.** `ShardRouter::with_shard_forwards([(retired, successor)])` maps a *removed* shard's ids straight to its successor. | After a decommission, when there is no origin database left to ask. |
+
+Chains (A→B, then B→C) are followed up to `MAX_FORWARD_HOPS` (4) and then fail
+closed with a typed, retryable error rather than looping. A completed migration
+also best-effort repoints the **origin** shard straight at the new home, so
+chains collapse rather than accumulate; correctness comes from following the
+chain, performance from collapsing it.
+
+### The two new execution states
+
+| State | Where | Meaning |
+|---|---|---|
+| `MIGRATING` | target shard | A staged, inert copy. It holds the target's `(workflow_name, workflow_id)` active-uniqueness slot so nothing else can claim the identity mid-migration, and it has **no workflow task row at all**, so nothing can dispatch it. |
+| `MIGRATED` | source shard | The sealed source after cutover: terminal-shaped, non-claimable, carrying the forwarding pointer. |
+
+> **A deliberate deviation from the reset precedent.** Issue #964 suggests
+> modelling the seal on the reset path's `TERMINATED`, "which already releases
+> the uniqueness index". A migration must **not** do that. A reset forks a
+> successor on the *same* shard, so its source has to release
+> `(workflow_name, workflow_id)` or the successor could not be inserted. A
+> migration puts the copy on a *different database*, whose index is its own — so
+> nothing needs releasing, and releasing would be a correctness bug: a later
+> start of the same business key still hashes back to the source shard, would
+> find no active row, and would create a **second live run** alongside the
+> migrated one. `MIGRATED` therefore stays inside the active-uniqueness index,
+> and such a start fails closed instead.
+
+`MIGRATED` is a **seal, never a delete**. The source keeps its full history, so
+an audit of where a run used to live survives the move — and so does the
+forwarding pointer an id resolves through. Do not purge a `MIGRATED` row while
+any pre-migration id might still be held.
+
+### What "quiescent" means, precisely
+
+An execution is migratable only when every one of these holds. Each has a named
+blocker, so a dry run explains itself completely rather than one reason at a
+time.
+
+| Requirement | Why |
+|---|---|
+| `state = 'RUNNING'` | Terminal runs have nothing to move. |
+| No parent (`parent_id IS NULL`) | A child's terminal appends to its parent's history in a shard-local transaction; moving the child would break that edge. **Root executions only.** |
+| No claimed workflow task | A worker is mid-cycle. |
+| No workflow task dispatchable *now* | A wake is pending delivery. |
+| At most one *parked* workflow task, with `wake_requested = false` | This is the migratable shape — see below. |
+| No non-terminal activity or external tasks | In-flight work is out of scope by design. |
+| No unconsumed signals | An undelivered wake. |
+| No `INFLIGHT` completion deliveries | An outbound delivery must settle first. |
+| No `ACTIVE` worker sessions | Session state lives on exactly one worker. |
+| No live children, same-shard or cross-shard | Same reason as the parent rule. |
+| Not non-determinism-blocked | A re-dispatch backoff is pending. |
+| Holds no durable mutex (`ctx.mutex`, #691) | The lock row is shard-local and keyed by the holder; moving the holder away leaves the key held by an execution that no longer lives here, and every waiter on it blocked forever. |
+| Queued for no durable mutex | The grant is delivered by waking the waiter **on this shard**, so a migrated waiter's grant would be delivered to a sealed row — a lost wake. |
+| No dead-letter rows | Redriving a DLQ entry enqueues a task on this shard, which after a migration would target a sealed row. Redrive or discard it first. |
+| Not schedule-attributed (`schedule_id IS NULL`) | A schedule row does not move with its runs, and its overlap enforcement is **shard-local**: the tick counts `RUNNING`/`PAUSED` executions on its own shard for `max_active_runs`, and `CancelOther`/`TerminateOther` cancel priors with the same shard-local query. After a migration the local row reads `MIGRATED`, so the schedule stops counting the still-running copy and stops cancelling it — silently exceeding its own cap, or starting a run without terminating the prior it was told to replace. Making this safe means teaching schedule overlap enforcement to see forwarded residences, which is a change to the scheduler rather than to this feature. |
+| No live children, **including paused ones** | A paused child still completes eventually, and its terminal appends to the parent's history on the shard the parent used to be on. |
+
+**A run waiting on a timer or a signal IS migratable — that is the point.** Both
+shapes keep a workflow task row: a timer park is `PENDING` with a future
+`scheduled_at`, and a signal park is `RUNNING` with no worker
+(`queue::park_workflow_task`). A predicate of "no task rows" would have refused
+exactly the long-lived population this feature exists to move, so the parked row
+is **copied**, not treated as a blocker.
+
+A **paused** execution is *not* migratable. `PAUSED` is a state, not a column,
+and the predicate admits `RUNNING` only — so a paused root reports `NotRunning`
+and is skipped. Resume it, migrate it, and pause it again; the decommission
+runbook's straggler table says so. (Widening the predicate would mean the copy
+and the cutover carrying the original state through activation, which is real
+work for a case an operator can resolve in one command.)
+
+### The wake contract: never lost, never doubled
+
+| When the wake arrives | What happens |
+|---|---|
+| Before or during the copy | The cutover re-evaluates the **full** quiescence predicate inside its own `UPDATE ... WHERE`, so it matches zero rows. The migration aborts, the source is untouched, and the wake is processed there normally. |
+| After the cutover | The source is sealed, so the write resolves through the forwarding pointer to the target. Activation notices the pending signal and schedules the restored task at `NOW()` rather than leaving it waiting on a timer days out. |
+| A keyed redelivery, after the move | Signals are copied **with** their `idempotency_key`, and the target enforces the same partial unique index, so a retried delivery collides exactly as it would have on the source. |
+
+### Crash safety
+
+The durable record is `harvest_shard_migrations`, on the **source** shard — the
+database that stays authoritative right up to the cutover. Its phase says what is
+outstanding:
+
+| Phase at crash | Resume action | Source authoritative? |
+|---|---|---|
+| `PENDING` | re-stage (the inert target copy is discarded and re-made) | yes |
+| `COPIED` | verify | yes |
+| `VERIFIED` | re-check quiescence **and that the history has not advanced**, then cut over | yes |
+| `COMMITTED` | activate the target (idempotent) | **no** — the target is |
+| `DONE` / `ABORTED` | retire the row | — |
+
+Only `VERIFIED → COMMITTED` changes who is authoritative, and it is a single
+statement on one database. Run `harvest shard rebalance-resume` after any crash.
+
+**Why the cutover re-checks the history and not only quiescence.** Verification
+proves the copy matches the source *as of the copy*. On the end-to-end path the
+cutover follows within milliseconds, but a resume after a crash at `VERIFIED`
+can arrive hours later — and in between the run may legitimately wake, execute a
+whole decision cycle, append events and park again on a fresh timer. It is
+quiescent once more, so every quiescence predicate passes. Sealing then would
+hand authority to a copy that predates that cycle: not a lost *wake* but lost
+*progress*, and invisible afterwards. Verification therefore records the source
+history's high-water mark (`verified_event_count` / `verified_max_event_id`), and
+the cutover seals only while the source still matches it. A stale record declines
+and the resume sweep aborts it, so the run is simply migrated later from its
+current history rather than wedged.
+
+> **The one honest gap.** Between the cutover commit and the target's activation
+> the run is claimable on *neither* shard. That is a **liveness** gap, not a
+> correctness one: the run is authoritative on exactly one shard at every
+> instant, and claimability follows within one resume step. Closing it entirely
+> would need a two-phase commit across two databases, which the sharding design
+> rules out.
+
+### What migrates, and what does not (the dedupe scopes)
+
+| Mechanism | Migrates? | Accepted window |
+|---|---|---|
+| Full event history | ✅ verbatim | none — byte-identical and replay-verified before cutover |
+| Execution row (every column) | ✅ verbatim | none |
+| Durable timers | ✅ verbatim, including `fires_at` | none |
+| Signals, including `idempotency_key` | ✅ verbatim | none |
+| Payload refs (`harvest_payload_refs`) | ✅ | none — the blob store is shard-external |
+| The parked workflow task row | ✅ | none |
+| Terminal task rows (activity history) | ❌ stays on the sealed source | none — the durable record is in `harvest_events` |
+| Workflow logs | ✅ | none — copied for a privacy reason as much as an operational one: they are free text, so a PII sink, and `erase.rs` scrubs them via the execution's own shard. Logs left behind would be out of reach of an erasure issued against the run. |
+| Start idempotency keys | ❌ | none for an existing run: a keyed start still hashes to the same shard |
+| Debounce rows | ❌ | at most one extra debounced start per key immediately after the move |
+| Start-throttle tokens, rate-limit buckets | ❌ | already per-shard; unaffected for an existing run |
+| Concurrency-key accounting | moves implicitly with the parked task row | the run's slot moves from A's cap to B's; the documented `limit × N` scope is unchanged |
+| Completion-trigger fire ledger | ❌ | a trigger whose source run migrated may fire once more; triggers are already at-least-once |
+| Audit log | ❌ | the **source** shard records every attempt in its own `harvest_audit_log`. Note the consequence for a decommission: retiring the shard retires its audit trail, so ship audit off-box (issue #953's export) before step 5 of the runbook. |
+
+### Two copies until retention collects the source
+
+The source is **sealed, not deleted**, so between the cutover and the source
+shard's own retention pass an execution's bytes exist in two databases. That is
+deliberate — the sealed row is the forwarding pointer every pre-migration id
+resolves through — but it makes "which copy did you mean?" a real question for
+anything that acts on an execution by id. The contract:
+
+- **Every id-routed write follows the pointer, not the id.** The external
+  signal, cancel and await outboxes, the management API's per-execution
+  connection resolver, and the batch executor's per-target dispatch all resolve
+  the current residence before choosing a pool. Batch is the sharpest case: its
+  all-shard scan finds the live copy on the target, but the id it hands back
+  still encodes the origin, so an origin-only lookup would send a cancel or a
+  terminate into the sealed source — sealing the wrong copy while the live one
+  kept running.
+- **Erasure goes to *every* residence, not just the live one.**
+  `POST /workflows/{id}/erase-payloads` walks the whole residence chain and
+  scrubs each shard that still holds a copy, listing the extra ones in the
+  response's `prior_residences`. That chain is read from the live row's durable
+  `migrated_from_shards` array, **not** walked backwards along the forwarding
+  pointers — the pointers are deliberately collapsed so hops do not accumulate,
+  which after A → B → C leaves A pointing straight at C and no trace of B, whose
+  sealed copy still holds every payload it had. The terminal-state and legal-hold gates are
+  evaluated against the **live** residence only: a sealed source always reads as
+  terminal, so gating on one would let a still-running execution be erased
+  through its own stale shadow. A source copy retention has already collected
+  contributes nothing and is not an error; a residence this node cannot reach
+  fails the call, because an erasure that cannot be shown to be complete must
+  not be reported as complete.
+- **Business-key targets resolve through the seal, not by hash alone.** The
+  migration deliberately keeps `MIGRATED` inside the active-uniqueness index, so
+  `(workflow_name, workflow_id)` never moves off the shard it hashes to — the
+  seal is what still holds it. An external signal or cancel aimed at a business
+  key therefore resolves the key to its execution id on the hashed shard first,
+  then follows that id's pointer. Stopping at the hash would deliver to the
+  seal, where a cancel reads as already-terminal and reports success for a
+  workflow that keeps running.
+- **A start that would replace a rebalanced prior is refused, not honoured.**
+  `conflict_policy=terminate_existing` (and `reuse_policy=terminate_if_running`)
+  against a `MIGRATED`/`MIGRATING` prior returns a retryable `503` naming the
+  live residence. The terminate cannot reach the live copy from the prior's
+  shard, and replacing would seal the prior `CONTINUED_AS_NEW` — which is
+  excluded from the uniqueness index — releasing the business key while the real
+  run keeps executing. Cancel or terminate the execution *by id*, which routes
+  to its residence, then start again.
+- **A reverse migration keeps the origin's seal alive throughout.** `A → B → A`
+  stages onto a shard the run has lived on before, so the row it replaces is A's
+  own forwarding seal. The staged copy therefore *carries* that pointer until
+  activation clears it: ids routing to A keep resolving to live B for the whole
+  staging window, and an abort restores the seal in place rather than deleting
+  it. Without that, a failed reverse migration would leave the execution with no
+  row on its origin shard at all — an id that resolves nowhere.
+- **Reads may legitimately answer from the live copy alone.** The sealed source
+  is a frozen snapshot as of the cutover, and the live copy is a superset of it
+  by construction, so a history or status read that follows the pointer is
+  complete.
+
+### Zero new event variants; the append-only invariant is untouched
+
+A migration appends **nothing** to `harvest_events` and rewrites **nothing**. The
+copy `INSERT`s new rows on a *different* database; the source's rows are read-only
+throughout. Shard rebalancing is therefore **not** a fourth exception to the
+append-only invariant in `CLAUDE.md` — it is an instance of it. All bookkeeping
+lives in columns and in `harvest_shard_migrations`.
+
+### Using it
+
+Always dry-run first. The dry run walks the same code path up to the first write
+and reports exactly the population a real run would move — it is not a separate
+estimator that could drift.
+
+```bash
+# What would move?
+harvest shard rebalance \
+  --shard 0=postgres://.../harvest_shard0 \
+  --shard 1=postgres://.../harvest_shard1 \
+  --from 0 --to 1 --limit 100 --dry-run
+
+# Do it, with an operator identity for the audit trail.
+harvest shard rebalance \
+  --shard 0=postgres://.../harvest_shard0 \
+  --shard 1=postgres://.../harvest_shard1 \
+  --from 0 --to 1 --limit 100 --actor alice@example.com
+
+# After any crash or interruption.
+harvest shard rebalance-resume \
+  --shard 0=... --shard 1=... --from 0
+```
+
+The command connects to the shard databases **directly** rather than through the
+management API: a rebalance is inherently a two-database operation and the node
+serving the API has no reason to hold a pool for both. Possession of both DSNs is
+the admin gate, and every non-dry-run attempt writes a
+`shard.rebalance.migrate` row to the source shard's `harvest_audit_log` naming
+the actor, the execution, and the outcome.
+
+**Run the migration before deploying the binary.** `db_conn_for_execution` now
+performs a forwarding lookup on multi-shard deployments, so a node running the
+new binary against a database that has not yet gained `migrated_to_shard`
+answers `503` on every single-execution management route. This is the ordinary
+migrate-then-deploy order; it is called out because the pre-#964 code path
+issued no query at all and so had no such requirement.
+
+**A note on payload codecs.** `harvest shard rebalance` verifies with the
+default (identity) codec registry, because the CLI has no key material and
+putting decryption keys on an operator's workstation is not a default worth
+having. That does not weaken the guarantee: the load-bearing half of
+verification is the **raw byte-identity** check over the stored event tuples,
+which is codec-independent. On a deployment using keyed codecs (issue #948) the
+decode-and-replay half will refuse with an unknown-key error, so the migration
+fails closed rather than proceeding unverified. Drive rebalancing from a process
+that has the registry installed if you need both halves.
+
+Both shards must be at the **same migration level**. The copy is deliberately
+column-list-free (`to_jsonb` on the source, `jsonb_populate_record` on the
+target) so a newly-added column is carried automatically rather than silently
+dropped by a hand-maintained list — and the converse hazard, a target that lacks
+a column and would silently discard it, is refused up front with a schema-parity
+check.
+
+### Decommissioning a shard — runbook
+
+See [`docs/runbooks/shard-decommission.md`](runbooks/shard-decommission.md) for the full drill.
+
+---
 
 ## Operational Checklist
 

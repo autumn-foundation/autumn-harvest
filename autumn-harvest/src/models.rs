@@ -219,6 +219,26 @@ pub struct WorkflowExecution {
     /// aggregate queries in `quota.rs`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub quota_key: Option<String>,
+    /// Forwarding pointer for a shard-rebalanced execution (issue #964): the
+    /// shard this run now physically lives on, after an operator migrated it
+    /// off this one. Non-NULL exactly when `state = 'MIGRATED'`, and `None` for
+    /// every execution that never moved. The `ExecutionId` is never re-minted
+    /// by a migration, so an id captured before the move still routes to this
+    /// row and resolves through this column.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub migrated_to_shard: Option<i32>,
+    /// Wall-clock of the cutover commit that sealed this row (issue #964).
+    /// Non-NULL exactly when `state = 'MIGRATED'`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub migrated_at: Option<chrono::DateTime<chrono::Utc>>,
+    /// Every shard that previously hosted this execution (issue #964), oldest
+    /// first, as a JSON array of shard ids. `None` for a run that never moved.
+    /// Together with the shard this row is on, it is the complete set of shards
+    /// still holding a copy of the run's bytes — which is what a cross-residence
+    /// payload erasure traverses, and why it is kept separately from the
+    /// deliberately-collapsed `migrated_to_shard` pointer.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub migrated_from_shards: Option<serde_json::Value>,
 }
 
 /// Serialize a nullable `start_source` column, reporting a `None` (pre-upgrade /
@@ -1599,6 +1619,11 @@ pub struct ExecutionSummary {
     /// cascade.
     pub parent_id: Option<Uuid>,
     pub summarized_at: DateTime<Utc>,
+    /// The residence history carried over from the demoted execution row
+    /// (issue #964), so a cross-residence erasure can still reach the sealed
+    /// source copies after that row is collected. `None` for a run that never
+    /// moved.
+    pub migrated_from_shards: Option<serde_json::Value>,
 }
 
 /// Insert struct for a newly written execution summary (issue #752).
@@ -1621,6 +1646,10 @@ pub struct NewExecutionSummary {
     /// Parent execution UUID when demoting a child workflow, else `None`
     /// (issue #752).
     pub parent_id: Option<Uuid>,
+    /// The demoted execution's residence history (issue #964), carried over so
+    /// a cross-residence erasure can still reach the sealed source copies after
+    /// the execution row is gone. `None` for a run that never moved.
+    pub migrated_from_shards: Option<serde_json::Value>,
 }
 
 // ── WASM activity module storage (issue #965) ───────────────────────────────

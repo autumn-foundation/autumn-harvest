@@ -18,6 +18,29 @@ pub struct CriticalPathResult {
     pub path_names: Vec<String>,
 }
 
+/// Below this many distinct `activity_durations` entries, [`CriticalPathAnalyzer::analyze`]
+/// resolves each task's duration via a linear scan of a flat slice instead of
+/// a `HashMap` probe; at or above it, scanning is worse (up to `O(tasks *
+/// names)` for a pathologically high-cardinality caller). See the doc
+/// comment at the scan's call site for the measured crossover this was set
+/// below -- **the binding constraint is the miss (`default_duration`
+/// fallback) case, not the hit case**: a miss always scans every entry
+/// (no early exit is possible), while a hit terminates early on average, so
+/// the miss-case crossover is substantially lower and is what this limit
+/// must respect to guarantee "never worse than the `HashMap` baseline" for
+/// every caller, not just one with a 100%-hit-rate mock set.
+const LINEAR_SCAN_CARDINALITY_LIMIT: usize = 5;
+
+/// Minimum number of tasks that must actually need a name-based duration
+/// lookup before [`CriticalPathAnalyzer::analyze`] builds the flat scan
+/// table at all. Building it -- a `HashMap::iter()` walk, a heap
+/// allocation and a sort -- costs more than just doing a handful of
+/// `HashMap::get` calls directly when there are only a few lookups to
+/// amortize that cost against (a small DAG analyzed repeatedly, not the
+/// wide-fan-out shape this optimization targets). See the doc comment at
+/// the scan's call site for the measured crossover this was set above.
+const MIN_LOOKUPS_TO_AMORTIZE_TABLE_BUILD: usize = 20;
+
 /// Analyzer to determine the critical path of a DAG.
 pub struct CriticalPathAnalyzer {
     dag: DagDefinition,
@@ -70,14 +93,133 @@ impl CriticalPathAnalyzer {
         let mut distances = vec![Duration::ZERO; tasks.len()];
         let mut predecessors = vec![None; tasks.len()];
 
+        // `activity_durations` is keyed by activity NAME, not by task, so a
+        // DAG whose tasks reuse a small set of activity types (a wide
+        // fan-out map stage running the same handful of activities, the
+        // common case `mock_duration`'s own doc example matches) looks up
+        // the SAME few keys once per task. Hashing a `String` key with
+        // `HashMap`'s default SipHash on every one of those repeat lookups
+        // measurably dominates `analyze`'s own cost (see
+        // `benches/critical_path_profile.rs`).
+        //
+        // Measured crossover (standalone harness, `HashMap<String, Duration>`
+        // vs `Vec<(&str, Duration)>`, 80,000 lookups, callgrind Ir), for BOTH
+        // regimes `activity_durations` traffic can be:
+        //
+        // - All-hit (every task's name is mocked), `activity_shard_NNNN`-shaped
+        //   keys: 8 names, linear 15.2M vs hash 26.0M; 16 names, roughly at
+        //   parity (26.2M vs 26.0M); 24+ names, linear already loses (36.3M vs
+        //   26.0M).
+        // - All-miss (`default_duration` fallback; same-length/shape keys so
+        //   `str` equality cannot short-circuit on length -- the honest worst
+        //   case, since a miss must walk every entry): 5 names, linear 17.8M
+        //   vs hash 23.3M; parity at 7 names (23.40M vs 23.41M); 8+ names,
+        //   linear already loses (26.0M vs 23.5M).
+        //
+        // The miss regime's crossover (~7) is the binding constraint, not the
+        // hit regime's (~16): a miss always scans every entry (no early exit
+        // is possible), so a caller that mocks only some of its activities --
+        // entirely ordinary usage, not a pathological input -- pays the
+        // miss cost on every unmocked task. `LINEAR_SCAN_CARDINALITY_LIMIT`
+        // is set with margin below the miss crossover, so this optimization
+        // only ever engages where it is a clear win under EITHER regime and
+        // always falls back to the original (never-worse-than-baseline)
+        // `HashMap` path otherwise. Behaviorally identical either way: both
+        // the `HashMap` and the collected slice hold each name at most once,
+        // so lookup results never change.
+        //
+        // Building the table -- a `HashMap::iter()` walk, a heap allocation
+        // and a sort -- has its own fixed cost, paid once per `analyze()`
+        // call regardless of how many tasks it then serves. Measured
+        // (standalone harness, cardinality 5 -- the maximum this
+        // optimization allows -- 80,000 total lookups split across repeated
+        // `analyze()`-shaped calls where EVERY lookup in the call goes
+        // through the table): at 5 lookups per call, build+scan costs 23.6M
+        // Ir vs the direct-`HashMap` baseline's 19.2M (+23%, a REGRESSION);
+        // at 8, parity (18.6M vs 19.1M); at 10+, a clear win (17.6M vs
+        // 19.1M, widening). `MIN_LOOKUPS_TO_AMORTIZE_TABLE_BUILD` is set
+        // with margin above that measured crossover.
+        //
+        // This decision -- whether at least `MIN_LOOKUPS_TO_AMORTIZE_
+        // TABLE_BUILD` tasks actually need a lookup -- is made with an
+        // EXACT count from a pre-pass over `tasks`, not a running counter
+        // inside the main loop below that triggers a build the moment it
+        // crosses the threshold. An earlier draft of this fix tried the
+        // running-counter approach specifically to avoid the pre-pass's
+        // O(tasks) cost, but it cannot be made correct: whatever threshold
+        // triggers the build, a DAG whose lookup count lands just above it
+        // builds the table with almost no lookups left to amortize the
+        // build against (in the worst case, the triggering lookup is the
+        // LAST one, and the table serves exactly one lookup) -- proven by
+        // the same crossover measurement above: build cost is comparable to
+        // ~8 `HashMap` lookups, so triggering at count 20 with only 1-7
+        // lookups remaining after it is a regression no threshold choice
+        // can avoid, only relocate. Deciding with an exact upfront count
+        // avoids this: if the table is built, ALL `lookups_needed` lookups
+        // in the call use it, matching the crossover measurement's own
+        // shape exactly.
+        //
+        // The pre-pass itself is one O(tasks) scan of a cheap
+        // `Option::is_none()` check -- no hashing, no allocation -- and is
+        // gated cheapest-first so it never runs for a DAG that couldn't
+        // possibly reach the threshold: `tasks.len()` (already known, O(1))
+        // upper-bounds `lookups_needed` (a task with `start_to_close` set
+        // only ever LOWERS the count), so `tasks.len() <
+        // MIN_LOOKUPS_TO_AMORTIZE_TABLE_BUILD` rules out the fast path with
+        // no scan at all. For a large DAG that clears that bar but turns
+        // out to be override-heavy (few tasks actually need a lookup), the
+        // pre-pass still runs and still costs O(tasks) -- a real, accepted
+        // cost, but a bounded one: it is one cheap check per task, alongside
+        // work the main DP loop below (upstream-distance comparisons,
+        // `Duration` arithmetic) already pays per task regardless, so it
+        // can never dominate `analyze`'s total cost for any DAG large
+        // enough for the difference to matter.
+        //
+        // `HashMap::iter()`'s order is randomized per process (`RandomState`),
+        // so collecting it directly would make the linear scan's hit
+        // position -- and therefore instruction counts -- vary run to run
+        // for reasons having nothing to do with the code, undermining the
+        // deterministic-counter evidence this optimization is justified by.
+        // Sorting by name fixes the scan order so repeated measurements of
+        // the same binary are comparable.
+        let duration_lookup: Option<Vec<(&str, Duration)>> = (self.activity_durations.len()
+            <= LINEAR_SCAN_CARDINALITY_LIMIT
+            && tasks.len() >= MIN_LOOKUPS_TO_AMORTIZE_TABLE_BUILD)
+            .then(|| {
+                tasks
+                    .iter()
+                    .filter(|task| task.start_to_close.is_none())
+                    .count()
+            })
+            .filter(|&lookups_needed| lookups_needed >= MIN_LOOKUPS_TO_AMORTIZE_TABLE_BUILD)
+            .map(|_| {
+                let mut lookup: Vec<(&str, Duration)> = self
+                    .activity_durations
+                    .iter()
+                    .map(|(name, &duration)| (name.as_str(), duration))
+                    .collect();
+                lookup.sort_unstable_by_key(|&(name, _)| name);
+                lookup
+            });
+
         for level in levels {
             for &task_index in level {
                 let task = &tasks[task_index];
                 let duration = task.start_to_close.unwrap_or_else(|| {
-                    self.activity_durations
-                        .get(&task.activity_name)
-                        .copied()
-                        .unwrap_or(self.default_duration)
+                    duration_lookup.as_ref().map_or_else(
+                        || {
+                            self.activity_durations
+                                .get(&task.activity_name)
+                                .copied()
+                                .unwrap_or(self.default_duration)
+                        },
+                        |lookup| {
+                            lookup
+                                .iter()
+                                .find(|(name, _)| *name == task.activity_name)
+                                .map_or(self.default_duration, |&(_, duration)| duration)
+                        },
+                    )
                 });
 
                 // Find the maximum distance among upstreams

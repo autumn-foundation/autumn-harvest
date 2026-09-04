@@ -700,6 +700,9 @@ self-compensating.
 * **A compensated run is not retryable from a failed node.**
   `POST /dags/{name}/runs/{id}/retry` returns `409` — retry carries succeeded
   upstream nodes over, and the unwind just undid them. Start a fresh run.
+  For the retryable case, see
+  [`docs/runbooks/dag-retry-from-failed-node.md`](../runbooks/dag-retry-from-failed-node.md)
+  for the incident-response walkthrough.
 * **An unsolicited signal silences the rollback counters.** A DAG consumes no
   signals of its own, so a stray signal leaves the unwind uncounted (it still
   runs, and still replays deterministically).
@@ -889,7 +892,19 @@ curl -s -X POST \
 
 Pausing a DAG keeps the definition registered but stops the scheduler from
 firing it; manual triggers still work. Resume by patching it back to active
-through the same management route.
+through the same management route — see
+[`docs/operations/schedule-pause-resume.md`](../operations/schedule-pause-resume.md)
+for the operator playbook, including a paused schedule's interaction with
+in-flight runs and the audit trail.
+
+Related runbooks for operating schedules and DAG runs day to day:
+[`docs/runbooks/schedule-preview.md`](../runbooks/schedule-preview.md) (dry-run
+a cron expression before committing it), and
+[`docs/runbooks/schedule-trigger-now.md`](../runbooks/schedule-trigger-now.md)
+(fire one run immediately without disturbing the normal cadence). A schedule's
+`calendar` field skips fires landing on excluded dates (holidays, maintenance
+windows) per a configurable policy — see
+[`docs/calendars.md`](../calendars.md).
 
 ## Incremental scheduled jobs — last-completion-result carryover
 
@@ -952,6 +967,24 @@ See `autumn-harvest/examples/incremental_etl_schedule.rs` for the full pattern.
 - **continue-as-new**: a continuation inherits the predecessor's frozen
   carryover (the continuation is the same logical scheduled run), so cursors and
   recovery state survive the fork.
+- **Cross-type continue-as-new and overlap controls** (issue #1160): `ctx.continue_as_new_as(...)`
+  (#803) continues the same logical scheduled run as a *different* registered
+  workflow type — `schedule_id`/`scheduled_for` carry over unchanged (as above),
+  but the successor's `workflow_name` is now the target type. Both overlap
+  controls account for this:
+  - `OverlapPolicy::CancelOther` / `TerminateOther` select purely on `schedule_id`
+    (no `workflow_name` filter), so they can reach and clean up a cross-type
+    successor of the schedule that fired again.
+  - `max_active_runs` counting (`scheduler::schedule_running_basis`) counts
+    `workflow_name = <this schedule's type>` **OR** `schedule_id = <this schedule>`
+    — one `COUNT(*)`, so a same-type row matching both clauses is never
+    double-counted. This is additive by design: the name clause alone already
+    covers every same-type run (including manual, non-scheduled triggers of that
+    type), and the `schedule_id` clause adds only the cross-type successor rows
+    the name clause would otherwise miss. The alternative of re-scoping the count
+    to `schedule_id` alone was rejected because it would stop counting manual
+    runs of an existing single-type schedule — a behaviour change out of scope
+    for #1160.
 - **Slot ordering**: carryover selects the *previous logical fire* by the
   schedule slot (`scheduled_for`), not by completion time. Overlapping,
   catch-up, or backfilled fires that finish out of order therefore can't hand a

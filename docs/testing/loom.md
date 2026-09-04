@@ -163,7 +163,7 @@ and per-thread operations. Guidance, strongest first:
 
 - **`slot_tuner.rs` withheld-permit accounting** — needs Shuttle (async /
   tokio semaphore), not loom. Top of the fast-follow list; see
-  `concurrency-model-checking.md`.
+  [`concurrency-model-checking.md`](concurrency-model-checking.md).
 - **`heartbeat.rs` mpsc flush ordering** — Shuttle candidate (tokio mpsc).
 - Any future in-process lock-coordinated state machine added to the engine.
 

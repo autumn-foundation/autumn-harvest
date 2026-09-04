@@ -2348,6 +2348,7 @@ async fn delete_candidate_execution(
                     harvest_workflow_executions::error,
                     harvest_workflow_executions::search_attrs,
                     harvest_workflow_executions::parent_id,
+                    harvest_workflow_executions::migrated_from_shards,
                 ))
                 .for_update()
                 .first::<SummarySourceRow>(conn)
@@ -2371,6 +2372,7 @@ async fn delete_candidate_execution(
                 error,
                 search_attrs,
                 parent_id,
+                migrated_from_shards,
             )) = row
             {
                 if legal_hold_active(set_at, until, now) {
@@ -2413,6 +2415,14 @@ async fn delete_candidate_execution(
                     result,
                     error: error_out,
                     parent_id,
+                    // Issue #964: the residence history must outlive the
+                    // execution row. Sealed source copies are NOT collected
+                    // with it -- retention deliberately never purges a
+                    // `MIGRATED` row, since that would destroy the forwarding
+                    // pointer -- so a summary that lost this array would make a
+                    // later erasure read "never migrated" and report success
+                    // over copies it never touched.
+                    migrated_from_shards,
                 };
                 // ON CONFLICT DO NOTHING makes the demotion idempotent
                 // across a retried delete tx.
@@ -2558,6 +2568,7 @@ type SummarySourceRow = (
     Option<String>,            // error
     Option<serde_json::Value>, // search_attrs
     Option<uuid::Uuid>,        // parent_id
+    Option<serde_json::Value>, // migrated_from_shards
 );
 
 /// Garbage-collect execution summaries older than the summary horizon (issue
@@ -2854,7 +2865,7 @@ async fn should_skip_candidate(
            AND workflow_id = $2
            AND id <> $3
            AND (
-                state NOT IN ('COMPLETED','FAILED','CANCELLED','TIMED_OUT','CONTINUED_AS_NEW','TERMINATED')
+                state NOT IN ('COMPLETED','FAILED','CANCELLED','TIMED_OUT','CONTINUED_AS_NEW','TERMINATED','MIGRATED')
                OR completed_at IS NULL
                OR completed_at >= $4
            )",

@@ -20,6 +20,16 @@
 #   run-suites.sh compile       # plugin rows (osclass linux|compileonly) --no-run
 #
 # Set DRY_RUN=1 to print the cargo commands instead of executing them.
+#
+# Sharding: set SEMAPHORE_SHARD_COUNT to an integer N and
+# SEMAPHORE_SHARD_INDEX to 0..N-1 to have `run <linux|linuxpart|allos>` process
+# only every Nth matching manifest row (row_ordinal % N == SHARD_INDEX,
+# row_ordinal counted among rows matching that osclass, in manifest order).
+# `--test-threads=1` WITHIN a row's own `cargo test` invocation is unaffected —
+# sharding only changes which ROWS a given invocation of this script runs, not
+# how a row's own tests are ordered against each other. Unset (the default):
+# no filtering, identical to pre-sharding behavior. A CI job runs this script
+# once per shard, in parallel, each with a different SEMAPHORE_SHARD_INDEX.
 set -euo pipefail
 
 MODE="${1:-}"
@@ -63,11 +73,23 @@ run_cargo() {
 do_run() {
   local want="$1"
   local os crate target feats filter
+  # Row ordinal among rows matching `$want`, for sharding (see header comment).
+  # Incremented for every matching row regardless of whether sharding is
+  # active, so the ordinal a row gets is independent of SEMAPHORE_SHARD_COUNT.
+  local row_ordinal=0
+  local shard_count="${SEMAPHORE_SHARD_COUNT:-}"
+  local shard_index="${SEMAPHORE_SHARD_INDEX:-0}"
   # Process substitution (not a pipe) so `fail`/`failed` mutations persist in
   # this shell.
   while read -r os crate target feats filter || [ -n "$os" ]; do
     [ -n "$os" ] || continue
     [ "$os" = "$want" ] || continue
+
+    if [ -n "$shard_count" ]; then
+      local this_ordinal="$row_ordinal"
+      row_ordinal=$(( row_ordinal + 1 ))
+      [ "$(( this_ordinal % shard_count ))" -eq "$shard_index" ] || continue
+    fi
 
     local a
     a=(test -p "$crate")

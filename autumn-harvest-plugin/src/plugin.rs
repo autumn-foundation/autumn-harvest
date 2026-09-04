@@ -1588,6 +1588,42 @@ fn preferred_app_config(from_state: AutumnConfig, ambient: Option<AutumnConfig>)
     }
 }
 
+/// Announce an unauthenticated management API at startup (issue #1284).
+///
+/// In the `dev` profile with no declared auth boundary, a caller that presents
+/// no session cookie reaches every admin route — that is what makes the
+/// quickstart's documented `harvest preflight` step work without a manual
+/// credential setup, and it is the posture `set_deployment_profile` has always
+/// documented. Deliberate, but never silent: an operator who left a `dev`-profile
+/// process bound to a shared interface should learn it from the log, not from an
+/// incident. The two ways out are named in the message.
+///
+/// Split out as a free function so the exact predicate is unit-testable without
+/// booting an `AppState` — the failure mode that matters is this warning firing
+/// for a profile that is *not* open (noise operators learn to ignore) or staying
+/// quiet for one that is.
+fn warn_if_dev_admin_api_is_open(profile: &str, auth_boundary_present: bool) {
+    if dev_admin_api_is_open(profile, auth_boundary_present) {
+        tracing::warn!(
+            "AUTUMN_PROFILE=dev with no HarvestPlugin::api_with_auth(..) boundary: the Harvest \
+             management API (including every /admin route and the Vantage dashboard) is reachable \
+             UNAUTHENTICATED by any caller that can open a socket to this process. This is the \
+             documented dev-profile posture and is what lets `harvest preflight` run against a \
+             local quickstart app. Do not expose this process beyond localhost. To close it, \
+             configure HarvestPlugin::api_with_auth(path, middleware), or run a non-dev \
+             AUTUMN_PROFILE (where the API is fail-closed regardless)."
+        );
+    }
+}
+
+/// The predicate behind [`warn_if_dev_admin_api_is_open`], and the exact
+/// condition `has_harvest_admin_access` admits an unauthenticated caller under.
+/// Mirrored by `preflight::check_admin_auth_boundary`'s `unauthenticated_access`
+/// detail field.
+fn dev_admin_api_is_open(profile: &str, auth_boundary_present: bool) -> bool {
+    profile == "dev" && !auth_boundary_present
+}
+
 #[allow(clippy::too_many_lines, clippy::unused_async)]
 async fn start_harvest_runtime(
     state: &AppState,
@@ -1596,6 +1632,7 @@ async fn start_harvest_runtime(
 ) -> autumn_web::AutumnResult<()> {
     api_state.set_deployment_profile(state.profile().to_string());
     api_state.set_admin_auth_session_key(state.auth_session_key());
+    warn_if_dev_admin_api_is_open(state.profile(), api_state.admin_auth_boundary());
     let app_config = resolve_app_config(state);
     let harvest_config = HarvestRuntimeConfig::load()
         .map_err(|error| AutumnError::service_unavailable_msg(error.to_string()))?;
@@ -2847,6 +2884,39 @@ mod admission_globals_guard_tests {
 mod tests {
     use super::*;
     use std::any::TypeId;
+
+    /// **Issue #1284.** The startup warning's predicate must be exact: it fires
+    /// for, and only for, the one configuration under which
+    /// `has_harvest_admin_access` admits a caller that presented no credential.
+    /// A warning that fires for closed deployments is noise operators learn to
+    /// scroll past; one that stays quiet for an open deployment is the incident
+    /// it was added to prevent.
+    #[test]
+    fn dev_admin_api_is_open_only_without_a_boundary_in_the_dev_profile() {
+        assert!(
+            dev_admin_api_is_open("dev", false),
+            "dev profile with no declared boundary is the open case"
+        );
+        assert!(
+            !dev_admin_api_is_open("dev", true),
+            "a declared boundary closes the dev profile"
+        );
+        for profile in [
+            "prod",
+            "staging",
+            "test",
+            "unknown",
+            "",
+            "development",
+            "DEV",
+        ] {
+            assert!(
+                !dev_admin_api_is_open(profile, false),
+                "profile {profile:?} is not `dev` and stays fail-closed"
+            );
+            assert!(!dev_admin_api_is_open(profile, true));
+        }
+    }
 
     use crate::config::{
         HarvestDatabaseConfig, HarvestMode, HarvestOutboxConfig, HarvestRuntimeConfig,
