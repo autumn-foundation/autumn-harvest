@@ -10,7 +10,8 @@ sessions and sticky routing. This page is the worker-sessions measurement.
 
 The result is **not** the same as `schedule_to_close`'s: this predicate has a
 real, moderate-to-large buffer cost -- **+32.9%** at the 10,000-row headline
-depth on a single cold claim, corroborated by a real 10,001-call
+depth on a single first claim against a cache-warm table, corroborated by a
+real 10,001-call
 production-shaped drain at **+22.1%** (same direction, same order of
 magnitude -- see [Measurement](#measurement)). The mechanism is the same one
 `docs/performance-capability-labels.md` documents: row-width growth from
@@ -106,8 +107,12 @@ identical in every other column:
   capability-labels capture uses.
 
 Both states are captured for `EXPLAIN (ANALYZE, BUFFERS, VERBOSE, SETTINGS,
-TIMING OFF)` on `claim_task_query()` at each depth (a single **cold** claim,
-against a table nothing has touched since the seed), and for a full
+TIMING OFF)` on `claim_task_query()` at each depth (a single **first claim**
+against a table nothing has *claimed* from since the seed -- not a cold-cache
+measurement: the seed and its `ANALYZE` run moments earlier on the same
+server, so the table's pages are already resident in `shared_buffers`; every
+committed artifact reports `shared hit`, never `read`, confirming this),
+and for a full
 `pg_stat_statements` drain of the real `queue::claim_task()` async function
 against the 10,000-row/4-queue headline scenario, claiming every row one call
 at a time (10,001 calls: 10,000 successful claims plus the terminal empty
@@ -139,7 +144,7 @@ Plan shape is stable across all three depths -- both states choose a plain
 
 ## Measurement
 
-### Buffer deltas across backlog depth (single cold claim)
+### Buffer deltas across backlog depth (single first claim, cache-warm)
 
 `EXPLAIN (ANALYZE, BUFFERS, ...)` total buffers for `claim_task_query()`,
 `no-session` vs `worker-session` (artifacts:
@@ -156,8 +161,13 @@ that compounds with the number of rows touched.
 
 ### Corroboration: `pg_stat_statements` over the real claim-drain
 
-The `EXPLAIN` numbers above are single **cold** snapshots -- one claim against
-a table nothing has touched since the seed committed. To confirm the effect
+The `EXPLAIN` numbers above are single **first-claim** snapshots against a
+cache-warm table -- one claim against a table nothing has *claimed* from
+since the seed committed, but whose pages are already resident in
+`shared_buffers` from that same seed (review round 8 correctly caught an
+earlier revision calling these "cold," which in Postgres usually means
+cold-*cache*; every committed artifact reports `shared hit`, never `read`,
+so that word was wrong). To confirm the effect
 under the actual claim workload, the harness also drives the real async
 `queue::claim_task(...)` function 10,001 times against the 10,000-row/4-queue
 headline scenario at each data state and snapshots `pg_stat_statements`
@@ -170,7 +180,7 @@ afterward (artifacts:
 | worker-session | 10,001 | 6,101,864 | 610.13 |
 
 Aggregate delta: **+22.1%** -- the same direction and the same order of
-magnitude as the single-cold-claim finding (+32.9%), the "corroborated by a
+magnitude as the single-first-claim finding (+32.9%), the "corroborated by a
 buffer/row-count change in the same direction" bar this persona's rules set.
 Unlike the round-1-fix-only capture (which showed a 17x divergence between
 these two figures, +124.8% vs +7.2%, driven by the bulk-transaction
