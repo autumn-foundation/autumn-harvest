@@ -22,13 +22,13 @@ published budget). See issue #1194 for the full argument.
   bound.** Every measured shape below, including the combined worst case,
   comes in at least an order of magnitude under the published budget.
 * **The combined fan-out x fleet worst case (1000 pending activities x 1000
-  live workers) is the single largest number on this page: p95 33.75 ms,
-  p99 49.63 ms.** Still ~10x under budget. Measured directly, not
+  live workers) is the single largest number on this page: p95 34.44 ms,
+  p99 34.87 ms.** Still ~14x under budget. Measured directly, not
   extrapolated from the independent sweeps — see
   [why that distinction matters](#why-a-combined-scenario).
 * **The replay path is the fastest-growing driver, but nowhere near
-  dominant at these scales.** 10,001 replayed events: p95 63.82 ms — ~8x
-  under budget and ~78x under the 5 s `query_timeout` that bounds it. See
+  dominant at these scales.** 10,001 replayed events: p95 61.06 ms — ~8x
+  under budget and ~82x under the 5 s `query_timeout` that bounds it. See
   [known limitations](#known-limitations) for where this page's numbers stop
   and where growth trend, not headroom, is the caveat.
 * **No tighter per-request deadline than `query_timeout` (5 s default) is
@@ -54,10 +54,16 @@ neither, the bench prints a skip notice and exits 0.
 | Harness | `autumn-harvest-plugin/benches/diagnose_bench.rs` |
 
 Every table on this page is from one run, taken together, on that machine.
-60 measured requests per scenario (20 for the replay-path sweep, which is
-individually more expensive), preceded by 10 warmup requests (5 for the
-replay-path sweep) discarded from the reported statistics. Percentiles are
-nearest-rank over the measured samples, never interpolated.
+120 measured requests per scenario, preceded by 15 warmup requests discarded
+from the reported statistics. 120 (not the more typical 60/20) is
+deliberate: nearest-rank p99 is `ceil(0.99n)`, which equals `n` itself —
+i.e. p99 collapses to a relabeled `max` — for any `n < 100`, matching the
+`MIN_MEANINGFUL_SAMPLES` floor `claim_bench_support.rs` establishes for the
+same reason. Every row below is comfortably above that floor, so p99 is a
+real (if still coarse — the closest-to-worst observation, not an
+interpolated statistic) distinct percentile in every table on this page, not
+`max` under a different name. Percentiles are nearest-rank, never
+interpolated.
 
 ## Diagnose latency vs pending-activity fan-out
 
@@ -66,10 +72,10 @@ no fan-out and no fleet-size pressure.
 
 | pending activities (N) | n | p50 ms | p95 ms | p99 ms | max ms |
 |--:|--:|--:|--:|--:|--:|
-| 1 (baseline / control) | 60 | 2.65 | 3.27 | 3.68 | 3.68 |
-| 10 | 60 | 2.81 | 3.16 | 3.55 | 3.55 |
-| 100 | 60 | 3.47 | 4.38 | 4.95 | 4.95 |
-| 1000 | 60 | 8.53 | 9.88 | 11.32 | 11.32 |
+| 1 (baseline / control) | 120 | 2.70 | 3.69 | 5.73 | 7.31 |
+| 10 | 120 | 2.62 | 3.11 | 3.31 | 3.41 |
+| 100 | 120 | 3.05 | 3.64 | 3.95 | 4.32 |
+| 1000 | 120 | 7.65 | 10.30 | 11.78 | 12.07 |
 
 ## Diagnose latency vs live-worker fleet size
 
@@ -77,16 +83,16 @@ Fan-out fixed at 10 pending activities.
 
 | live workers (M) | n | p50 ms | p95 ms | p99 ms | max ms |
 |--:|--:|--:|--:|--:|--:|
-| 1 | 60 | 2.92 | 3.45 | 3.85 | 3.85 |
-| 10 | 60 | 3.48 | 5.04 | 5.34 | 5.34 |
-| 100 | 60 | 3.91 | 4.71 | 5.13 | 5.13 |
-| 1000 | 60 | 6.51 | 7.56 | 8.14 | 8.14 |
+| 1 | 120 | 3.01 | 3.74 | 4.51 | 4.72 |
+| 10 | 120 | 2.93 | 3.63 | 4.66 | 4.88 |
+| 100 | 120 | 3.33 | 3.90 | 4.04 | 4.69 |
+| 1000 | 120 | 6.07 | 6.69 | 7.40 | 7.52 |
 
 ## Combined worst case: 1000 pending activities x 1000 live workers
 
 | scenario | n | p50 ms | p95 ms | p99 ms | max ms |
 |--:|--:|--:|--:|--:|--:|
-| 1000 x 1000 | 60 | 31.40 | 33.75 | 49.63 | 49.63 |
+| 1000 x 1000 | 120 | 31.62 | 34.44 | 34.87 | 34.97 |
 
 ### Why a combined scenario
 
@@ -95,8 +101,8 @@ at a small fixed value. Neither alone exercises the O(N x M) shape issue
 #1194 actually names — "a wide fan-out ... on a large fleet." Taken alone,
 the two sweeps might suggest the combined cost extrapolates to roughly
 their product or sum; measuring it directly instead of extrapolating found
-p99 49.63 ms — higher than either sweep's own N=1000/M=1000 row (11.32 ms
-and 8.14 ms respectively) but not their naive product, and still
+p99 34.87 ms — higher than either sweep's own N=1000 or M=1000 row (11.78 ms
+and 7.40 ms respectively) but far short of their naive product, and still
 comfortably within budget. `required_capabilities` is unset on every
 seeded task/worker in this harness, so `eligible_worker_ids`' per-worker
 JSON-deserialize branch is never exercised here — see
@@ -113,10 +119,10 @@ neither).
 
 | history events replayed | n | p50 ms | p95 ms | p99 ms | max ms |
 |--:|--:|--:|--:|--:|--:|
-| 21 | 20 | 4.23 | 5.12 | 5.17 | 5.17 |
-| 201 | 20 | 5.24 | 5.83 | 6.03 | 6.03 |
-| 2001 | 20 | 13.87 | 15.14 | 15.74 | 15.74 |
-| 10001 | 20 | 58.95 | 63.82 | 64.58 | 64.58 |
+| 21 | 120 | 3.20 | 3.70 | 3.79 | 4.35 |
+| 201 | 120 | 4.25 | 4.73 | 5.05 | 5.56 |
+| 2001 | 120 | 12.49 | 15.12 | 16.76 | 17.14 |
+| 10001 | 120 | 54.75 | 61.06 | 62.49 | 65.04 |
 
 ## Does `p95 < 500 ms` hold?
 
@@ -131,7 +137,7 @@ measured, not merely as argued.
 **No, not based on the measured range.** The replay path is the fastest
 proportional grower of the three drivers, but at the largest tested history
 (10,001 events — the same reference size issue #135 uses for the
-CPU-path replay budget) it costs 63.82 ms p95, roughly **78x** under the 5 s
+CPU-path replay budget) it costs 61.06 ms p95, roughly **82x** under the 5 s
 `query_timeout` that already bounds it and roughly **8x** under the 500 ms
 diagnose budget. There is no evidence in this data that the existing
 deadline is too loose for this endpoint specifically. See
@@ -141,13 +147,13 @@ meaningfully past what is measured here.
 
 ## Known limitations
 
-* **Growth on the replay path trends slightly super-linear across the
-  tested range**, not strictly linear in event count: 21→201 events (~10x)
-  costs ~1.1x p95; 201→2001 (~10x) costs ~2.6x; 2001→10,001 (~5x) costs
-  ~4.2x. The tested range stays far under budget throughout, but this page
-  does not claim the trend holds at histories longer than 10,001 events —
-  only that it holds up to that point, which already matches issue #135's
-  own reference scale for replay cost.
+* **Growth on the replay path trends super-linear across the tested
+  range**, not strictly linear in event count: 21→201 events (~10x) costs
+  ~1.3x p95; 201→2001 (~10x) costs ~3.2x; 2001→10,001 (~5x) costs ~4.0x.
+  The tested range stays far under budget throughout, but this page does
+  not claim the trend holds at histories longer than 10,001 events — only
+  that it holds up to that point, which already matches issue #135's own
+  reference scale for replay cost.
 * **The combined worst-case scenario uses tasks and workers with no
   `required_build_id`, `required_capabilities`, or worker sessions set.**
   `eligible_worker_ids` has additional per-candidate branches for those
@@ -169,7 +175,8 @@ meaningfully past what is measured here.
   numbers come from.
 * [`docs/performance.md`](performance.md) — the `claim_task`/enqueue
   benchmark (issue #786) this bench's harness conventions and report format
-  follow, including `claim_bench_support.rs`'s seeding approach.
+  follow, including `claim_bench_support.rs`'s seeding approach and its
+  `MIN_MEANINGFUL_SAMPLES` floor.
 * [`docs/performance-stall-diagnosis.md`](performance-stall-diagnosis.md) —
   an allocation-free instruction-count profile of the pure
   `stall_diagnosis::classify_execution` classifier this handler calls
