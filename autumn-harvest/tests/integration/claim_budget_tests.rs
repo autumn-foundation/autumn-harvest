@@ -2771,14 +2771,15 @@ async fn zz_capture_worker_session_claim_evidence() {
     .execute(&mut proc_conn)
     .await
     .expect("create the per-row worker-session seeding procedure");
-    // Durability is irrelevant to a throwaway benchmark database and this
-    // scopes to one session only -- trades fsync-per-commit latency for
-    // seeding speed across up to 100,000 individual commits. Never a
-    // production recommendation; see the doc comment above.
-    diesel::sql_query("SET synchronous_commit = off")
-        .execute(&mut proc_conn)
-        .await
-        .expect("relax synchronous_commit for the seeding session only");
+    // `proc_conn` only ever creates the procedure above -- every actual
+    // `CALL` happens on a different, later connection (a fresh one per
+    // depth in the sweep loop, `stats_conn` in the stat-snapshot loop), each
+    // of which sets `synchronous_commit = off` for itself right before its
+    // own `CALL`. Durability is irrelevant to a throwaway benchmark
+    // database, scoped to one session at a time -- trades fsync-per-commit
+    // latency for seeding speed across up to 100,000 individual commits.
+    // Never a production recommendation; see the procedure's doc comment
+    // above.
 
     // One EXPLAIN capture per published backlog depth, at both labels, from a
     // freshly re-seeded backlog each time (see the capability-labels capture's
@@ -2851,6 +2852,13 @@ async fn zz_capture_worker_session_claim_evidence() {
                     .execute(&mut conn)
                     .await
                     .expect("truncate before the worker-session re-seed");
+                // Scoped to THIS connection, not `proc_conn` (which only ever
+                // creates the procedure) -- each depth iteration opens a
+                // fresh connection, so this must be set again here.
+                diesel::sql_query("SET synchronous_commit = off")
+                    .execute(&mut conn)
+                    .await
+                    .expect("relax synchronous_commit for this seeding session only");
                 diesel::sql_query(format!(
                     "CALL harvest_bench_seed_worker_session_rows( \
                          '{}', {}, '{}', {worker_literal}, {} \
@@ -2972,6 +2980,20 @@ async fn zz_capture_worker_session_claim_evidence() {
                 .execute(&mut stats_conn)
                 .await
                 .expect("relax synchronous_commit for this seeding session only");
+            // Review finding on PR #1358 (round 3): `pg_stat_statements.track`
+            // defaults to `top`, so the `INSERT`/`UPDATE` statements executed
+            // INSIDE the procedure below -- as opposed to the top-level `CALL`
+            // itself -- would never be recorded individually, silently
+            // leaving the write-cost table with no `calls=10000` seed entries
+            // to read. `all` tracks nested statements too, scoped to this
+            // session only.
+            diesel::sql_query("SET pg_stat_statements.track = 'all'")
+                .execute(&mut stats_conn)
+                .await
+                .expect(
+                    "enable tracking of statements nested inside the seeding \
+                     procedure for this session",
+                );
             diesel::sql_query(format!(
                 "CALL harvest_bench_seed_worker_session_rows( \
                      '{}', {}, '{}', {worker_literal}, {} \
