@@ -14,8 +14,16 @@ recent PR run against the current `trunk-dev` head at the time of writing,
 
 ## 🎯 Verdict path (unchanged since the prior report)
 
-Still gated by the `test` matrix + the new `test-db-linux` job (both
-`needs: [lint, changes]`), no merge queue, no ambient retry. One change since
+Still gated by the `test` matrix (`Test (ubuntu-latest/windows-latest/macos-latest)`,
+required by name in branch protection since before this report's scope). The
+new `test-db-linux` job (`Test DB (linux, shard N)`, both `needs: [lint,
+changes]`) runs on every PR and reports real pass/fail — but whether it's
+*part of* the verdict path a merge actually waits on depends on the
+branch-protection question this report can't settle (see Diagnosis below):
+if those 10 checks aren't in the required-status-checks list, the true gate
+is still just the pre-existing `test` matrix, and a red shard is currently
+informational only, not gating. No merge queue, no ambient retry either way.
+One change since
 the prior report: `push`-event runs on `trunk-dev` are landing fast enough
 (commit cadence sampled at multiple per hour on 2026-09-03/04) that
 `concurrency.cancel-in-progress` cancels nearly every one before it
@@ -120,14 +128,19 @@ contexts already and nothing in this repository's commit history, check-run
 data, or the `ci.yml` comment itself would change to reflect it (the comment
 is prose someone would have to remember to go back and edit; it isn't
 generated from the live setting). So the evidence above is equally
-consistent with "still open" and "fixed silently via the UI." I don't have a
-tool in this session that reads GitHub branch-protection settings directly
-(no `gh` CLI per this repo's connector policy, and the GitHub MCP tools
-available here don't expose the branch-protection API), so **this report
-cannot distinguish the two — it is flagging an unconfirmed status, not a
-confirmed-still-open gap.** Per this role's charter, changing required
-checks is something to ask a human for rather than infer or do myself; the
-same applies to confirming the current setting where I lack read access.
+consistent with "still open" and "fixed silently via the UI." I couldn't
+read GitHub branch-protection settings directly to settle it either way: this
+session has no `gh` CLI at all (checked — `gh` isn't on `PATH` in this
+environment; that's a tooling gap in this session, not this repository's own
+policy, which only restricts `gh auth status` and routes issue/PR *operations*
+through the connector — a read of repo settings isn't one of those, I simply
+don't have the binary to make it with), and the GitHub MCP server tools
+available here don't expose a branch-protection-read method either. So
+**this report cannot distinguish the two — it is flagging an unconfirmed
+status, not a confirmed-still-open gap.** Per this role's charter, changing
+required checks is something to ask a human for rather than infer or do
+myself; the same applies to confirming the current setting where I lack read
+access.
 
 **Why this matters, concretely, if it does turn out to still be open:** the
 shard split that just cut ~50 minutes off end-to-end PR wall time would also — as an
