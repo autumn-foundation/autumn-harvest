@@ -55635,6 +55635,18 @@ mod tests {
     /// off-build, so the gate does not apply (and, per the endpoint's
     /// direction-of-safety rule, is not reported as a rate-limit block
     /// either).
+    ///
+    /// Note the short-circuit: `rate_limit_gate_applies` returns `false` here
+    /// on `!locally_tracked` alone, without even evaluating build agreement --
+    /// there is no cross-process breaker registry to consult (issue #1190's
+    /// own "why it was not fixed on #1188" section), so a build mismatch on
+    /// this side of the disagreement cannot be turned into a positive
+    /// detection, only prevented from being masked by a build check that
+    /// would otherwise wrongly vouch for it. The bucket is therefore
+    /// consulted here no more (and no less) than it was before this fix; the
+    /// residual false-negative risk this scenario describes is accepted
+    /// exactly like the analogous fleet-wide breaker outage
+    /// `local_circuit_snapshot_is_authoritative` already declines to detect.
     #[test]
     fn rate_limit_gate_does_not_apply_when_tracked_locally_but_eligible_peer_differs_build() {
         let workers = vec![eligibility_worker(

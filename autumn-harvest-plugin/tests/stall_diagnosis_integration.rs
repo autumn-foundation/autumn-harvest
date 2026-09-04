@@ -3164,11 +3164,17 @@ async fn same_build_workers_are_still_gated_by_the_registry_fallback() {
 // runs a build we cannot vouch for."
 
 /// AC1: locally tracked (breaker-tracked), but the sole eligible worker is on
-/// a different build. The local tracked fact cannot be applied to that peer,
-/// so the endpoint must not lean on it alone to call this healthy -- and,
-/// per the direction-of-safety rule, it also must not fabricate a rate-limit
-/// block it cannot attribute to the actual dispatcher. Regression-pinned: the
-/// verdict here is `healthy_in_progress`, not `activity_rate_limited`.
+/// a different build. `rate_limit_gate_applies` short-circuits to `false` on
+/// `locally_tracked` alone -- there is no cross-process breaker registry to
+/// consult, so a build mismatch on this side cannot be turned into a positive
+/// detection of the peer's real rate-limit block, only prevented from being
+/// masked BY a build check that would otherwise wrongly vouch for the local
+/// fact. This test therefore pins that the wire behavior is UNCHANGED from
+/// before the fix (`healthy_in_progress`, never `activity_rate_limited`) --
+/// the accepted false-negative direction, same as a fleet-wide breaker
+/// outage. The real, distinguishing regression coverage for this fix is the
+/// unit test `rate_limit_gate_does_not_apply_when_tracked_locally_but_eligible_peer_differs_build`
+/// plus the AC2 tests below, which DO flip on a revert.
 #[tokio::test]
 async fn ac1_locally_tracked_activity_does_not_apply_the_bypass_to_an_off_build_peer() {
     let (url, _guard) = setup_database().await;
@@ -3305,6 +3311,56 @@ async fn ac2_untracked_activity_does_not_report_a_missing_bucket_for_an_off_buil
          permanent stall: {body}"
     );
     assert_ne!(body["health"], "stalled", "body: {body}");
+    assert_eq!(kind(&body), "healthy_in_progress", "body: {body}");
+}
+
+/// AC2, the partial-agreement half: TWO eligible workers, one on this
+/// replica's own build and one on a different build. Unanimity, not mere
+/// overlap, is what `every_eligible_worker_is_on_the_local_build` requires
+/// (see its unit test), because the local tracked/untracked fact must
+/// describe EVERY worker that might actually claim the row -- a single
+/// off-build peer among several eligible workers is exactly as unaccountable
+/// as being the sole eligible worker. This exercises that end to end, not
+/// just at the pure-function level.
+#[tokio::test]
+async fn ac2_mixed_build_eligible_workers_still_suppress_the_verdict() {
+    let (url, _guard) = setup_database().await;
+    let pool = build_pool(&url);
+    let app = build_api_app(build_api_state(&pool));
+
+    let exec_id = seed_execution(
+        &pool,
+        "activity_wf",
+        "RUNNING",
+        vec![started_event(), scheduled_activity_event()],
+    )
+    .await;
+    seed_drained_rate_limit_bucket(&pool, "tenant:acme").await;
+    seed_keyed_activity_task(
+        &pool,
+        exec_id,
+        "send_email",
+        "email",
+        Some("tenant:acme"),
+        None,
+        None,
+    )
+    .await;
+    // This replica's own co-located worker, on `build-new` -- so
+    // `local_build_id` resolves to a real, non-empty value here, unlike the
+    // other AC1/AC2 tests above.
+    seed_live_worker_with(&pool, LOCAL_WORKER_ID, "email", "build-new", json!({})).await;
+    // A second eligible worker on a DIFFERENT build. Both cover "email", so
+    // both are eligible, but they disagree on build.
+    seed_live_worker_with(&pool, "w-peer-old-build", "email", "build-old", json!({})).await;
+
+    let body = diagnose(&app, exec_id).await;
+    assert_ne!(
+        kind(&body),
+        "activity_rate_limited",
+        "one off-build peer among several eligible workers must still block the \
+         verdict -- unanimity, not majority, is required: {body}"
+    );
     assert_eq!(kind(&body), "healthy_in_progress", "body: {body}");
 }
 
