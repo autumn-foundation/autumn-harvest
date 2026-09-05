@@ -1756,11 +1756,18 @@ const SEALED_STATE: &str = "CONTINUED_AS_NEW";
 /// #1068; Codex #1080 P2), inside the caller's start transaction.
 ///
 /// If the prior is still `RUNNING`, append a `WorkflowCancelled` event recording the
-/// forced cancellation and clean up its PENDING task rows + unfired timers (so no
-/// orphan can be claimed / fire against a run that is never driven again); then seal
-/// it to [`SEALED_STATE`] so it leaves the active set. An already-terminal prior
-/// (`COMPLETED`/`FAILED`) is sealed WITHOUT a cancellation event. Byte-identical to
-/// the pre-#1080 single-prior inline path — extracted so the `TerminateIfRunning`
+/// forced cancellation and clean up its PENDING task rows and unfired timers (so
+/// no orphan can be claimed / fire against a run that is never driven again). An
+/// already-terminal prior (`COMPLETED`/`FAILED`) is sealed WITHOUT a cancellation
+/// event and has no PENDING tasks or unfired timers left to clean up. Every prior
+/// being sealed — RUNNING or already-terminal — also has its undelivered staged
+/// signals deleted (🪝 Snag / Codex review, issue #1374): a signal can be staged
+/// while the prior is RUNNING and then outlive it even if the prior reaches
+/// COMPLETED/FAILED on its own (the workflow never awaited that signal name), so
+/// the row is just as unreachable — and, absent any retention/GC pass on this
+/// backend, would otherwise survive forever — regardless of which state sealed it.
+/// Then seal to [`SEALED_STATE`] so the prior leaves the active set. Byte-identical
+/// to the pre-#1080 single-prior inline path — extracted so the `TerminateIfRunning`
 /// arm can loop it over EVERY active row for the key
 /// ([`store::find_active_executions_by_key`]), reconciling a pre-#1068 database that
 /// already holds multiple RUNNING duplicates.
@@ -1780,6 +1787,12 @@ fn cancel_and_seal_prior(
         queue::delete_pending_tasks_for_execution(conn, prior_exec)?;
         queue::delete_unfired_timers_for_execution(conn, prior_exec)?;
     }
+    // Codex review (PR #1374): a signal can be staged while the prior is RUNNING
+    // and then outlive it even when the prior reaches COMPLETED/FAILED on its own
+    // (the workflow never awaited that signal name) — the row is just as
+    // unreachable once ANY prior is sealed, not only a cancelled RUNNING one, so
+    // this runs unconditionally rather than inside the `if` above.
+    queue::delete_undelivered_signals_for_execution(conn, prior_exec)?;
     store::seal_execution(conn, prior_exec, SEALED_STATE)?;
     Ok(())
 }

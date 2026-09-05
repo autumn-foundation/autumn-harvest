@@ -648,14 +648,68 @@ pub fn delete_unfired_timers_for_execution(
     )?)
 }
 
+/// Delete every undelivered staged signal row for an execution — companion to
+/// [`delete_pending_tasks_for_execution`] / [`delete_unfired_timers_for_execution`]
+/// for the `TerminateIfRunning` seal. A signal staged against a sealed prior can
+/// never be delivered (the prior is never driven again), and unlike an unfired
+/// timer it cannot mis-fire — but this backend has no retention/GC pass at all (a
+/// documented v0.1 non-goal), so leaving the row behind means it survives forever.
+/// Returns the number of rows deleted. Delivered rows are left untouched (inert
+/// audit history).
+pub fn delete_undelivered_signals_for_execution(
+    conn: &Connection,
+    exec_id: ExecutionId,
+) -> SqliteResult<usize> {
+    Ok(conn.execute(
+        "DELETE FROM harvest_signals WHERE exec_id = ?1 AND delivered = 0",
+        params![exec_id.to_string()],
+    )?)
+}
+
 #[cfg(test)]
 mod tests {
     use rusqlite::{Connection, params};
 
     use autumn_harvest::ExecutionId;
 
-    use super::{due_timers, due_timers_before_signal, enqueue_timer};
+    use super::{
+        delete_undelivered_signals_for_execution, due_timers, due_timers_before_signal,
+        enqueue_timer,
+    };
     use crate::schema;
+
+    // 🪝 Snag / Codex review (PR #1374 follow-up): `harvest_signals` has no index
+    // beyond its `signal_seq` PRIMARY KEY, so the exec-scoped
+    // `delete_undelivered_signals_for_execution` query — like the existing
+    // `peek_pending_signal` — did a full table SCAN instead of a SEARCH, unlike
+    // `harvest_timers`, whose `(exec_id, timer_id)` PRIMARY KEY already covers this.
+    // Since delivered rows are kept forever (no retention pass), the table only
+    // grows, so every `TerminateIfRunning` start (and each legacy prior processed
+    // by one) would scan the whole thing. RED without
+    // `idx_harvest_signals_exec_delivered`: `EXPLAIN QUERY PLAN` reports
+    // `SCAN harvest_signals`.
+    #[test]
+    fn signal_cleanup_delete_uses_an_index_not_a_full_scan() {
+        let conn = open();
+        let exec = ExecutionId::new();
+        delete_undelivered_signals_for_execution(&conn, exec).unwrap();
+
+        let plan: String = conn
+            .query_row(
+                "EXPLAIN QUERY PLAN DELETE FROM harvest_signals WHERE exec_id = ?1 AND delivered = 0",
+                params![exec.to_string()],
+                |row| row.get::<_, String>(3),
+            )
+            .unwrap();
+        assert!(
+            plan.contains("USING INDEX idx_harvest_signals_exec_delivered"),
+            "expected an index search, got plan: {plan}"
+        );
+        assert!(
+            !plan.contains("SCAN"),
+            "expected no full-table scan, got plan: {plan}"
+        );
+    }
 
     fn open() -> Connection {
         let conn = Connection::open_in_memory().unwrap();
