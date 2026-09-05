@@ -439,3 +439,25 @@ The last one lands one commit after the CH006 enumeration was added, and is
 the sharper lesson: enumerating the contraction *list* while leaving the
 apostrophe *character* assumed still left a whole class open. The inventory
 now carries both apostrophe forms.
+
+**Applying the pattern instead of just naming it.** Thirteen review rounds
+produced a consistent shape: a rule gets checked on the axis its author was
+thinking about and stays blind to the orthogonal one. The prose sweep closed
+CH001's *wording* axis, the inventory closed CH006's *word-list* axis, and
+neither touched *encoding* — which is exactly how `can’t` walked through a
+rule one commit after it was declared enumerated.
+
+So the other rules were audited on those same axes rather than waiting for
+review to find them. Two live bugs, both fixed here:
+
+- **CH002 was case-sensitive.** `// todo: fix this` and `// fixme: fix`
+  produced no finding at all. Lowercase markers are ordinary in real code, so
+  this was a trivial bypass of a Tier A gate. Measured at 0 new corpus hits
+  before the change.
+- **CH003 matched only the ASCII apostrophe.** `We’ll group stats by queue
+  name` slipped through while `We'll` was caught — the identical defect to
+  CH006's, in a rule nobody had connected to it.
+
+`_APOS` now lives above the Tier A patterns and is shared by both rules that
+need it, and the self-test pins the marker-case and apostrophe axes directly
+rather than only pinning content.

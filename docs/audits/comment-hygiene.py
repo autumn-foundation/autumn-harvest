@@ -193,6 +193,13 @@ RULE_HINTS = {
 
 # --- Tier A patterns ---------------------------------------------------------
 
+# `[\u2019']` wherever an apostrophe appears in a rule: an editor that
+# substitutes a typographic apostrophe must not turn a gated construct into an
+# invisible pass. This bit CH006 (contractions) and CH003 (narrative asides)
+# independently, so it lives here rather than beside either one.
+_APOS = r"[\u2019']"
+
+
 # Commented-out Rust, by line shape. Anchored and terminator-bearing so that
 # ordinary prose ("let the caller decide", "use the LATER definition") cannot
 # match -- prose does not end in `;` or `{`.
@@ -244,7 +251,9 @@ COMMENTED_CODE_RE = re.compile(
 # A marker that OPENS a comment, or one punctuated as a marker (`TODO:`,
 # `FIXME(...)`). Prose that merely refers to a marker elsewhere -- "see the
 # `session_id` TODO above" -- is not itself an untracked commitment.
-TODO_RE = re.compile(r"^(?:TODO|FIXME|XXX|HACK)\b|\b(?:TODO|FIXME|XXX|HACK)\s*[:(]")
+TODO_RE = re.compile(
+    r"^(?:TODO|FIXME|XXX|HACK)\b|\b(?:TODO|FIXME|XXX|HACK)\s*[:(]", re.IGNORECASE
+)
 TODO_REF_RE = re.compile(r"#\d+|https?://")
 
 # First-person deliberation. "Actually" must open a sentence: mid-sentence it is
@@ -253,7 +262,8 @@ TODO_REF_RE = re.compile(r"#\d+|https?://")
 # not necessarily deliberation.
 NARRATIVE_RE = re.compile(
     r"(?:^|(?<=[.!?;]\s))\s*actually[,\s]"
-    r"|\b(?:let's\b|lets just\b|we'll\b|i think\b|i'm not sure\b"
+    r"|\b(?:let" + _APOS + r"s\b|lets just\b|we" + _APOS + r"ll\b|i think\b"
+    r"|i" + _APOS + r"m not sure\b"
     r"|not sure (?:if|why|whether)\b|for now,|hmm\b|oops\b(?![\"'])|note to self\b"
     r"|as you can see\b|todo later\b)",
     re.IGNORECASE,
@@ -277,9 +287,6 @@ ARCHAEOLOGY_RE = re.compile(
 # against correct STE. The stems below are the unambiguous ones: `it's`,
 # `who's`, `there's` and friends have distinct possessive spellings (`its`,
 # `whose`, `theirs`), so a match is always a contraction.
-# `[\u2019']` throughout: an editor that substitutes a typographic apostrophe
-# must not turn a gated contraction into an invisible pass.
-_APOS = r"[\u2019']"
 CONTRACTION_RE = re.compile(
     r"\b(?:ca|is|are|was|were|do|does|did|would|could|should|will|has|have|had"
     r"|must|ai|wo|sha|need|ought|might|dare)n" + _APOS + r"t\b"
@@ -1093,6 +1100,25 @@ RULE_TESTS = [
         "///    ```rust\n///    let x = compute();\n///    ```\n",
         set(),
         "three spaces still opens a fence",
+    ),
+    # Orthogonal-axis fixtures. Two rules were checked for the RIGHT WORDS
+    # while the apostrophe character and the marker's case were left assumed,
+    # which is how `can\u2019t` and `todo:` both slipped a gate that had just been
+    # "enumerated". Each rule is now pinned on those axes, not only on content.
+    (
+        "// todo: fix this\n",
+        {("CH002", 1)},
+        "the TODO marker is case-insensitive",
+    ),
+    (
+        "// fixme: fix this\n",
+        {("CH002", 1)},
+        "so is FIXME",
+    ),
+    (
+        "// We\u2019ll group stats by queue name.\n",
+        {("CH003", 1), ("CH006", 1)},
+        "a narrative aside survives a typographic apostrophe",
     ),
     (
         "/// ```foo`bar TODO: remove this\n",
