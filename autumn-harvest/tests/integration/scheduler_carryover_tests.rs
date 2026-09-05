@@ -243,7 +243,7 @@ async fn two_scheduled_runs_carry_cursor_forward() {
     let registry = make_registry_for(wf_name, incremental_etl_handler);
     let dags = Arc::new(DagCatalog::default());
 
-    // Register a schedule with a 60-second interval; we'll manually advance time.
+    // Register a schedule with a 60-second interval. Time advances manually.
     let sched = WorkflowSchedule::new(wf_name, Schedule::Interval(Duration::from_secs(60)));
     register_workflow_schedules(&mut conn, &[sched])
         .await
@@ -433,7 +433,7 @@ async fn last_error_reflects_prior_failure_and_clears_after_recovery() {
     let wf_name = "carryover_recovery_wf";
     let pool = make_pool(&url);
 
-    // We'll control what each run does via a shared atomic counter.
+    // A shared atomic counter controls what each run does.
     use std::sync::atomic::{AtomicI32, Ordering};
     static COUNTER: AtomicI32 = AtomicI32::new(0);
     COUNTER.store(0, Ordering::SeqCst);

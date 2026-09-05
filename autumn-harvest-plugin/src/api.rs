@@ -38218,7 +38218,7 @@ async fn get_aggregated_scaling_signals(
     let pool = api_state.storage_pool().map_err(map_error)?;
     let stale_threshold = api_state.worker_stale_threshold();
 
-    // We'll group stats by queue name in-memory
+    // Group the stats by queue name in memory.
     let mut task_stats: std::collections::HashMap<
         String,
         ::autumn_harvest::queue::QueueTaskCounts,

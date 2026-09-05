@@ -2,7 +2,6 @@
 //!
 //! Run with: `cargo test --test idempotency_tests --no-default-features --features testing`
 #![cfg(feature = "testing")]
-//!
 //! Covers: `IdempotencyKey` type, `ActivityContext::idempotency_key()`,
 //! `ActivityContext::attempt()`, subkey derivation, HTTP-header safety,
 //! collision resistance, and the duplicate-dispatch / crash-retry scenario

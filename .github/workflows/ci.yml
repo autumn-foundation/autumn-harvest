@@ -292,6 +292,29 @@ jobs:
       - name: Folio config/CLI drift scan (docs/audits/config-cli-drift.py)
         run: python3 docs/audits/config-cli-drift.py
 
+      # Comment hygiene across the Rust sources (see
+      # docs/audits/comment-hygiene.py). Two tiers, and the split is the
+      # point: Tier A (commented-out code, an unreferenced TODO, a narrative
+      # aside, a blank comment line at a block edge) is at zero and must stay
+      # there; Tier B (review-round archaeology, contractions, sentences over
+      # ASD-STE100's 25-word ceiling) is frozen at its legacy count in
+      # docs/audits/comment-hygiene-baseline.json and may only fall.
+      #
+      # This deliberately does NOT cap comment length. The long rationale
+      # blocks in this tree are load-bearing — the ABBA lock-ordering argument
+      # at `materialize_due_child_timeout_deadlines`, the `cohort`-key
+      # argument in `partition.rs`, the codec-rotation scope guarantee
+      # CLAUDE.md cites — and a word budget would reward deleting exactly
+      # those. Tier B is per-SENTENCE, so a long block passes once it is
+      # written as several sentences.
+      #
+      # Runs here, in the ungated `lint` job, for the same reason as the
+      # guards above: it is pure Python stdlib (no deps, no network, a couple
+      # of seconds), and it must not be skipped by the docs-only filter.
+      # Pure filesystem — it never builds the crates, so it stays cheap.
+      - name: Comment hygiene (docs/audits/comment-hygiene.py)
+        run: python3 docs/audits/comment-hygiene.py
+
   test:
     name: Test (${{ matrix.os }})
     needs: [lint, changes]

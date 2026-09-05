@@ -288,7 +288,8 @@ async fn test_queue_and_task_eligibility_scenarios() {
     )
     .await;
 
-    // Task C: concurrency key "tenant-1" with cap 1. We'll also seed a RUNNING task with key "tenant-1" to saturate it.
+    // Task C: concurrency key "tenant-1" with cap 1. A seeded RUNNING task on
+    // the same key saturates that cap.
     seed_task_detailed(
         &pool,
         "test-queue",

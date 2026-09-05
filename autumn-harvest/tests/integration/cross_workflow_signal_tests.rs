@@ -550,7 +550,7 @@ async fn test_same_shard_not_found_retry() {
     let pool = build_test_pool(&database_url);
     let _sharded_pool = autumn_harvest::shard::ShardedDbPool::single(pool.clone());
 
-    // Target workflow ID and ExecutionId (same shard, let's say Shard 0)
+    // Target workflow ID and ExecutionId, both on shard 0.
     let target_exec_id = ExecutionId::new_for_shard(ShardId::new(0));
 
     // Caller workflow ExecutionId
@@ -1098,7 +1098,8 @@ async fn test_grace_window_expiration() {
     .expect("caller should fail after grace window expiration");
     assert_eq!(completed.state, "FAILED");
 
-    // The caller fails because the signal failed. Let's make sure history contains the failure event.
+    // The caller fails because the signal failed. Assert that history records
+    // the failure event.
     let history = autumn_harvest::store::load_history(&mut conn, caller_exec_id)
         .await
         .unwrap();

@@ -10,6 +10,34 @@ to wire into CI as a gate.
 | `corpus-link-check.py` | Internal markdown links (missing file, missing anchor) and orphan pages across `docs/**/*.md` | Yes — `.github/workflows/ci.yml`, `lint` job |
 | `config-cli-drift.py` | Doc-cited `[harvest]` TOML config keys, `AUTUMN_HARVEST*` env vars, and `harvest` CLI `--flags` against the real schema/CLI, extracted mechanically from `autumn-harvest-plugin/src/config.rs` and `autumn-harvest-cli/src/lib.rs` | Yes — `.github/workflows/ci.yml`, `lint` job |
 | `vantage-dashboard-contrast.py` | WCAG 1.4.3 contrast on the Vantage dashboard's inline stylesheet | No — run manually after touching `autumn-harvest-plugin/src/ui.rs`'s `STYLE` constant |
+| `comment-hygiene.py` | Comment defects across every `*.rs`: commented-out code, unreferenced TODOs, narrative asides, blank block edges (all gated at zero), plus review-round archaeology, contractions and over-long sentences (ratcheted against `comment-hygiene-baseline.json`) | Yes — `.github/workflows/ci.yml`, `lint` job |
+
+## Comment hygiene: the two tiers
+
+`comment-hygiene.py` is the one audit here that scans code rather than
+docs, and its tier split is deliberate.
+
+**Tier A is absolute.** CH001–CH004 are defects under any house style,
+they were driven to zero when the harness landed, and a new one fails the
+build. Fix the finding; there is no baseline to absorb it.
+
+**Tier B is a ratchet.** CH005–CH007 have a legacy population too large to
+fix in one change (CH007 alone is ~17.9k sentences), so
+`comment-hygiene-baseline.json` freezes the per-file count. New code is
+held to the rule while old code is merely forbidden from getting worse.
+Counts may fall freely. Regenerate the baseline
+(`python3 docs/audits/comment-hygiene.py --write-baseline`) **only** when
+lowering a count or when a rule's definition changes — never to absorb a
+new violation.
+
+**It does not cap comment length, and must not start.** The long rationale
+blocks in this tree are load-bearing: the ABBA lock-ordering argument at
+`materialize_due_child_timeout_deadlines`, the `cohort`-key argument in
+`partition.rs`, the codec-rotation scope guarantee `CLAUDE.md` cites as
+the proof that engine exception #3 is safe. A word budget over a comment
+block would reward deleting precisely those. CH007 is measured per
+*sentence*, so a thorough rationale passes cleanly once it is written as
+several sentences instead of one.
 
 Add a new audit here when a docs (or docs-adjacent UI/generated-artifact)
 defect class is mechanical to detect — the point is to make a defect class
