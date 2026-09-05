@@ -223,3 +223,22 @@ were.
 Three more fixtures pin these (20 in total): `////` is an ordinary comment,
 prose after an open paren is not a signature, and a wrapped commented-out
 signature is still caught on its opening line.
+
+**Proactive CH001 hardening.** Two review rounds had found CH001 false-
+positiving on prose that opens with a Rust keyword, so rather than wait for a
+third the boundary was swept adversarially: 210 generated prose lines (every
+keyword the rule keys on, crossed with the sentence shapes this corpus
+actually writes) against 23 genuine commented-out shapes.
+
+That found six more false positives before review did — `use the caller
+decide, since the row may be gone;` and `use T: Send is required here;` (the
+`use` alternative allowed bare spaces, so any prose sentence starting with
+"use" and ending in `;` matched), plus `let x = the value the operator
+supplied;` and the `type` equivalent (a right-hand side of bare words read as
+an initializer). It also found one missed true positive: `});` is two closers,
+and the rule allowed only one.
+
+Fixed by requiring a real use-path shape, rejecting a `let`/`type` right-hand
+side of three or more bare words, and allowing a run of closers. The sweep now
+reports 0 false positives and 0 misses, and 26 of those shapes are pinned in
+`--self-test` so the next narrowing of CH001 cannot quietly re-widen it.

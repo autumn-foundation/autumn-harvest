@@ -204,12 +204,14 @@ COMMENTED_CODE_RE = re.compile(
       | (?:pub(?:\([\w:]+\))?\s+)?(?:struct|enum|trait|union)\s+\w+\s*(?:<[^<>]*>)?\s*[{;(]\s*$
       | (?:pub(?:\([\w:]+\))?\s+)?mod\s+\w+\s*[{;]\s*$
       | (?:pub(?:\([\w:]+\))?\s+)?(?:const|static)\s+(?:mut\s+)?\w+\s*:[^;=]+=.*[;{]\s*$
-      | (?:pub(?:\([\w:]+\))?\s+)?type\s+\w+\s*(?:<[^<>]*>)?\s*=.*;\s*$
+      | (?:pub(?:\([\w:]+\))?\s+)?type\s+\w+\s*(?:<[^<>]*>)?\s*=
+            (?!\s*(?:\w+\s+){2,}\w+\s*;\s*$).*;\s*$
       | impl(?:\s*<[^<>]*>)?\s+[\w:<>&'\s]+\{\s*$
-      | let\s+(?:mut\s+)?\w+\s*(?::[^;=]+)?=[^=].*;\s*$
-      | use\s+[\w:{}, *]+;\s*$
+      | let\s+(?:mut\s+)?\w+\s*(?::[^;=]+)?=
+            (?!\s*(?:\w+\s+){2,}\w+\s*;\s*$)[^=].*;\s*$
+      | use\s+(?:\w+::)*(?:\w+|\*|\{[\w:,\s*]+\})(?:\s+as\s+\w+)?;\s*$
       | \#!?\[[\w:()"'=,./\s-]+\]\s*$
-      | \}[,;)]?\s*$
+      | \}[,;)]*\s*$
       | (?:assert|assert_eq|assert_ne|panic|println|dbg|unreachable)!\(.*\)\s*;\s*$
     )""",
     re.VERBOSE,
@@ -941,6 +943,41 @@ RULE_TESTS = [
 ]
 
 
+# CH001's boundary: Rust that was commented out, versus prose that merely
+# opens with a Rust keyword. Two review rounds landed false positives here, so
+# both sides are pinned. A false positive is the worse failure -- it fails CI
+# on ordinary English -- but a rule that catches nothing is not a rule.
+CODE_SHAPE_TESTS = [
+    # (line, is commented-out code)
+    ("fn foo() {", True),
+    ("pub fn bar();", True),
+    ("fn foo(", True),
+    ("fn foo(a: u8,", True),
+    ("struct Foo {", True),
+    ("impl Foo {", True),
+    ("use a::b;", True),
+    ("use a::{b, c};", True),
+    ("use crate::x as y;", True),
+    ("let x = 1;", True),
+    ("let mut v = Vec::new();", True),
+    ("type A = B;", True),
+    ("}", True),
+    ("});", True),
+    ("#[derive(Debug)]", True),
+    ("assert_eq!(a, b);", True),
+    ("fn foo() is called by the wrapper.", False),
+    ("fn resolve_call(the caller name appears in diagnostics", False),
+    ("fn build() constructs the program; see below.", False),
+    ("let the caller decide, since the row may be gone;", False),
+    ("let x = the value the operator supplied;", False),
+    ("type x = whatever the operator decided to configure;", False),
+    ("use the LATER definition on a duplicate name;", False),
+    ("use Foo, which the macro expands to;", False),
+    ("struct directly; a malicious body must not flip it.", False),
+    ("mod bar is documented in docs/architecture.md.", False),
+]
+
+
 def self_test() -> int:
     """Prove the lexer still handles the Rust forms the rules depend on."""
     failures = 0
@@ -960,6 +997,16 @@ def self_test() -> int:
     print(f"  [{'ok  ' if ok else 'FAIL'}] line number survives a continuation")
     if not ok:
         print(f"         expected line 3, got {[(p.line, p.text) for p in pieces]!r}")
+
+    shape_failures = 0
+    for line, want in CODE_SHAPE_TESTS:
+        if bool(COMMENTED_CODE_RE.match(line)) != want:
+            shape_failures += 1
+            kind = "false positive" if not want else "missed"
+            print(f"  [FAIL] CH001 {kind}: {line!r}")
+    failures += shape_failures
+    if not shape_failures:
+        print(f"  [ok  ] CH001 code-vs-prose boundary ({len(CODE_SHAPE_TESTS)} shapes)")
 
     for source, expected, name in RULE_TESTS:
         got = {(f.rule, f.line) for f in findings_for_source("t.rs", source)}
