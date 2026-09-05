@@ -1234,3 +1234,40 @@ the text between them literally, so `20 words /* note */ 10 words` is one
 is not.
 
 Corpus effect: none, for the twentieth round running.
+
+### Round thirty-nine — the container rule, the second loop, and round thirty-two again
+
+Three findings, and none of them is new. Each is a rule already written down
+in this file, applied everywhere except the one place the round found.
+
+**An indented `#` is not a heading.** `HEADING_RE` matched `^\s*#`, with no
+limit on the indent. Four columns into a paragraph that is indented content,
+so reading it as a heading closed a paragraph the rendered document still
+held open, and the `22.` under it then took a container — and its fence an
+allowance — that nothing opened. `heading(text, container)` now measures the
+indent the way `thematic_break`, `setext_underline`, `table_delimiter`,
+`list_content`, `quote_marker` and `fence_delimiter` already do. That is the
+seventh marker pattern here to need the container rule and the seventh
+written without it.
+
+A sweep of the rest follows the same rule, with one deliberate exception now
+stated at the pattern: `SEPARATOR_RE` may match at any indent, because it
+opens no container and closes no paragraph. A section rule is not a word of
+the sentence wherever it sits.
+
+**The table lookahead reads in the container it is in.** `comment_lines`
+called `table_delimiter(strip_quote(next.text), 0)` — container zero, hard
+coded — while `prose_units` passed the real container. A table nested in a
+list item was therefore a table to one loop and prose to the other. Two loops
+walking the same structure need the same arguments, and a literal `0` where
+the other passes a variable is the shape of that defect.
+
+**`in_table` belongs in the nesting snapshot.** Round thirty-two's title was
+"the nesting snapshot has to hold everything", and round thirty-eight added a
+variable to both loops without adding it there. A table inside a nested
+comment left `in_table` true after the comment closed, so the enclosing run
+read ordinary pipe lines as table rows. Both snapshots now carry it, and
+`nesting_shift` says plainly that "everything" is checked by hand and leaks
+silently when it is not.
+
+Corpus effect: none, for the twenty-first round running.

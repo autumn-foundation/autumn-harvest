@@ -359,7 +359,9 @@ def table_delimiter(text: str, container: int) -> bool:
     cells = stripped.strip("|").split("|")
     return bool(cells) and all(DELIM_CELL_RE.fullmatch(cell.strip()) for cell in cells)
 
-HEADING_RE = re.compile(r"^\s*#{1,6}(?:\s|$)")
+# An ATX heading. The indent is a capture group because the indent decides
+# whether this is a heading at all -- see `heading` below.
+HEADING_RE = re.compile(r"^([ \t]*)#{1,6}(?:[ \t]|$)")
 # A thematic break -- one punctuation character repeated. CommonMark spells it
 # "---"; this tree also draws section rules with box-drawing characters. Either
 # way it separates blocks, so a sentence never runs across one.
@@ -372,6 +374,10 @@ SEPARATOR_RE = re.compile(
 # a section rule is not a word of the sentence under it -- but only a real
 # break may change container state, or a decorative line grants the next "22."
 # a container, and its fence an allowance, that the rendered document has not.
+# The indent here is unbounded on purpose, and it is the one pattern in this
+# file that may be. A section rule is not a word of the sentence at any indent,
+# and this pattern only ends a prose unit -- it opens no container and closes
+# no paragraph, so an over-indented match costs a sentence nothing.
 THEMATIC_BREAK_RE = re.compile("^([ \t]*)([-_*])(?:[ \t]*\\2){2,}[ \t]*$")
 # A Setext underline: "=" under a paragraph line makes that paragraph a
 # heading. Whether a run of "=" is a heading or ordinary text is decided by
@@ -790,6 +796,21 @@ def setext_underline(text: str, container: int) -> bool:
     return bool(match) and len(match.group(1).expandtabs(4)) <= container + 3
 
 
+def heading(text: str, container: int) -> bool:
+    """Is `text` an ATX heading its container would accept?
+
+    Three columns past the container, like every marker here. This is the
+    seventh pattern in this file to need that rule and the seventh written
+    without it, so it is worth stating plainly: an unbounded indent in a
+    marker pattern is a defect, and the pattern is wrong until it takes a
+    container. Four columns into a paragraph "# text" is indented content,
+    and reading it as a heading clears a paragraph the rendered document
+    still holds open.
+    """
+    match = HEADING_RE.match(text)
+    return bool(match) and len(match.group(1).expandtabs(4)) <= container + 3
+
+
 def thematic_break(text: str, container: int) -> bool:
     """Is `text` a thematic break its container would accept?
 
@@ -940,7 +961,7 @@ def update_containers(
     # above it to underline.
     prose = bool(body.strip()) and not (
         table
-        or HEADING_RE.match(body)
+        or heading(body, stack[-1][0] if stack else 0)
         or thematic_break(body, stack[-1][0] if stack else 0)
         or (paragraph and setext_underline(body, stack[-1][0] if stack else 0))
     )
@@ -1096,6 +1117,11 @@ def nesting_shift(saved: list, nest: int, state: tuple) -> tuple[list, tuple]:
     fence: a list marker inside a nested comment is ordinary paragraph text
     to Rustdoc, and letting it push a container onto the enclosing run's
     stack gives a later delimiter a fence allowance nothing opened.
+
+    "Every" is checked by hand at each caller, and a variable added to a loop
+    without adding it here leaks silently. `in_table` did exactly that: a
+    table inside a nested comment left the enclosing run reading pipe lines
+    as table rows, so the paragraph they belong to closed early.
     """
     saved = list(saved)
     while len(saved) < nest:
@@ -1125,8 +1151,12 @@ def comment_lines(pieces: list[Piece]):
         nest = run[0].nest
         for index, piece in enumerate(run):
             if piece.nest != nest:
-                saved, (fence, scope, stack, paragraph, quoted) = nesting_shift(
-                    saved, piece.nest, (fence, scope, list(stack), paragraph, quoted)
+                saved, (fence, scope, stack, paragraph, quoted, in_table) = (
+                    nesting_shift(
+                        saved,
+                        piece.nest,
+                        (fence, scope, list(stack), paragraph, quoted, in_table),
+                    )
                 )
                 nest = piece.nest
             text = piece.text
@@ -1136,12 +1166,18 @@ def comment_lines(pieces: list[Piece]):
                 # A CONFIRMED table is a block and ends the paragraph. A bare
                 # pipe line is not, and must not -- round thirty-four's
                 # asymmetry, now with the structure to tell them apart.
-                body = strip_quote(text, stack[-1][0] if stack else 0)
+                enclosing = stack[-1][0] if stack else 0
+                body = strip_quote(text, enclosing)
                 if "|" not in body:
                     in_table = False
                 elif not in_table and index + 1 < len(run):
+                    # The container, here as in `prose_units`. A table nested
+                    # in a list item is indented past column zero, so reading
+                    # the delimiter row at column zero refuses it and the
+                    # header above it stays a paragraph -- one loop calling
+                    # the table a table and the other calling it prose.
                     in_table = table_delimiter(
-                        strip_quote(run[index + 1].text), 0
+                        strip_quote(run[index + 1].text, enclosing), enclosing
                     )
                 stack, paragraph = update_containers(
                     text, stack, paragraph, quoted, in_table and "|" in body
@@ -1285,11 +1321,19 @@ def prose_units(pieces: list[Piece]) -> list[tuple[int, str]]:
                 # is still one sentence in the rendered documentation, since
                 # the delimiters and the text between them are literal. Only
                 # the BLOCK state is isolated by the nesting.
-                saved, (fence, scope, stack, paragraph, quoted, in_list) = (
+                saved, (fence, scope, stack, paragraph, quoted, in_list, in_table) = (
                     nesting_shift(
                         saved,
                         piece.nest,
-                        (fence, scope, list(stack), paragraph, quoted, in_list),
+                        (
+                            fence,
+                            scope,
+                            list(stack),
+                            paragraph,
+                            quoted,
+                            in_list,
+                            in_table,
+                        ),
                     )
                 )
                 nest = piece.nest
@@ -1333,7 +1377,7 @@ def prose_units(pieces: list[Piece]) -> list[tuple[int, str]]:
                 and body.strip()
                 and not LIST_MARKER_RE.match(peeled)
                 and "|" not in peeled
-                and not HEADING_RE.match(peeled)
+                and not heading(peeled, container)
                 and not SEPARATOR_RE.match(peeled)
                 and not FENCE_RE.match(peeled)
             )
@@ -1357,7 +1401,7 @@ def prose_units(pieces: list[Piece]) -> list[tuple[int, str]]:
                 )
             if (
                 (has_pipe and in_table)
-                or HEADING_RE.match(body)
+                or heading(body, container)
                 or SEPARATOR_RE.match(body)
                 or not body.strip()
             ):
@@ -2250,6 +2294,46 @@ RULE_TESTS = [
         "}\n",
         set(),
         "adjacent trailing comments are not merged into one sentence",
+    ),
+    (
+        "/// Paragraph.\n"
+        "///     # indented\n"
+        "/// 22. item\n"
+        "///     ```\n"
+        "///     TODO: issue required\n",
+        {("CH002", 5)},
+        "a '#' four columns into a paragraph is content, not a heading",
+    ),
+    (
+        "/// Paragraph.\n"
+        "///   # heading\n"
+        "/// 22. item\n"
+        "///     ```\n"
+        "///     TODO: issue required\n",
+        set(),
+        "a '#' three columns in is still a heading",
+    ),
+    (
+        "/// -   intro paragraph\n"
+        "///     | h | i |\n"
+        "///     | --- | --- |\n"
+        "///     22. item\n"
+        "///         ```\n"
+        "///         TODO: issue required\n",
+        set(),
+        "a table nested in a list item is read in its own container",
+    ),
+    (
+        "/* intro paragraph\n"
+        "/* | h | i |\n"
+        "| --- | --- | */\n"
+        "| still prose\n"
+        "22. item\n"
+        "     ```\n"
+        "     TODO: issue required\n"
+        "*/\n",
+        {("CH002", 7)},
+        "a table inside a nested comment does not leak out of it",
     ),
 ]
 
