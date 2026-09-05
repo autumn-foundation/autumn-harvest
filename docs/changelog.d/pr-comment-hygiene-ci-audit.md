@@ -482,3 +482,30 @@ Findings are now indexed by fingerprint, so a regression prints its location:
 CH006 autumn-harvest/src/worker.rs: 1 new finding(s), 30 total vs 29 at the merge base
     autumn-harvest/src/worker.rs:36855: This one isn't compliant.
 ```
+
+**Fifteenth Codex round (PR #1380): fence indentation is container-relative.**
+
+CommonMark's "at most three spaces before a fence" is measured against the
+enclosing block container, not the line. Inside a list item the content starts
+past the marker, so an opener indented four spaces there is a perfectly valid
+fence — and the flat `^ {0,3}` from round seven rejected it, scanning the
+example's own sample text and reporting CH002. A false positive on a Tier A
+gate, blocking ordinary Rustdoc.
+
+This one is in direct tension with round seven's fix, which is why the flat
+limit looked right at the time: reject deep indentation and you get this false
+positive; accept it and a four-space line with no container opens a fence that
+never closes and suppresses the rest of the run. Neither is correct without
+tracking the container, so that is now tracked — a list marker opens a
+container at its content indent, a dedent below it closes one, and the
+three-space allowance is applied relative to whichever is open.
+
+Both directions verified together, along with the seven other fence
+behaviours accumulated over rounds six to fourteen, since each has broken a
+neighbour at least once:
+
+```
+/// - Example: + 4-space ```rust        -> exempt   (this fix)
+///     ```rust, no list                -> CH002    (round 7 preserved)
+///    ```rust  (3 spaces)              -> exempt
+```

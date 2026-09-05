@@ -298,7 +298,12 @@ CONTRACTION_RE = re.compile(
 
 MAX_SENTENCE_WORDS = 25
 
-FENCE_RE = re.compile(r"^ {0,3}(`{3,}|~{3,})")
+# Indentation is captured, not bounded here: CommonMark's "at most three
+# spaces" is relative to the enclosing block container, so a fence inside a
+# list item is legitimately indented further. `fence_indent_ok` applies the
+# limit against the container.
+FENCE_RE = re.compile(r"^([ \t]*)(`{3,}|~{3,})")
+LIST_MARKER_RE = re.compile(r"^([ \t]*)((?:[-*+]|\d+[.)])[ \t]+)")
 TABLE_RE = re.compile(r"^\s*\|")
 HEADING_RE = re.compile(r"^\s*#{1,6}\s")
 LIST_ITEM_RE = re.compile(r"^\s*(?:[-*+]|\d+\.)\s+")
@@ -574,6 +579,26 @@ def rust_sources(paths: list[str] | None) -> list[str]:
 INFO_BACKTICK_RE = re.compile(r"`")
 
 
+def container_indent_after(text: str, current: int) -> int:
+    """The content indent of the innermost open list item, after `text`.
+
+    A list marker opens a container whose content starts past the marker, so a
+    fence inside it is indented that far and is still a fence. A non-blank
+    line that dedents below the container closes it.
+    """
+    marker = LIST_MARKER_RE.match(text)
+    if marker:
+        return len(marker.group(1)) + len(marker.group(2))
+    if text.strip() and len(text) - len(text.lstrip()) < current:
+        return 0
+    return current
+
+
+def fence_indent_ok(match: "re.Match[str]", container: int) -> bool:
+    """CommonMark allows up to three spaces before a fence, per container."""
+    return len(match.group(1).expandtabs(4)) <= container + 3
+
+
 def fence_transition(
     fence: tuple[str, int] | None, match: "re.Match[str]", text: str
 ) -> tuple[str, int] | None:
@@ -584,7 +609,7 @@ def fence_transition(
     it. Otherwise a ``` line inside a ````-fenced example closes the fence
     early and the example's own sample text is then read as real comments.
     """
-    delimiter = match.group(1)
+    delimiter = match.group(2)
     char, length = delimiter[0], len(delimiter)
     info = text[match.end():]
     if fence is None:
@@ -641,10 +666,13 @@ def comment_lines(pieces: list[Piece]):
     """
     for run in comment_runs(pieces):
         fence: tuple[str, int] | None = None
+        container = 0
         for piece in run:
             text = piece.text
+            if fence is None:
+                container = container_indent_after(text, container)
             match = FENCE_RE.match(text)
-            if match:
+            if match and (fence is not None or fence_indent_ok(match, container)):
                 before = fence
                 fence = fence_transition(fence, match, text)
                 # Fence SYNTAX only if it opened one, closed one, or sits
@@ -724,6 +752,7 @@ def prose_units(pieces: list[Piece]) -> list[tuple[int, str]]:
         run: list[str] = []
         run_line = 0
         fence: tuple[str, int] | None = None
+        container = 0
 
         def flush():
             nonlocal run
@@ -733,8 +762,10 @@ def prose_units(pieces: list[Piece]) -> list[tuple[int, str]]:
 
         for piece in block:
             body = piece.text
+            if fence is None:
+                container = container_indent_after(body, container)
             match = FENCE_RE.match(body)
-            if match:
+            if match and (fence is not None or fence_indent_ok(match, container)):
                 before = fence
                 fence = fence_transition(fence, match, body)
                 if fence is not None or before is not None:
@@ -1115,6 +1146,11 @@ RULE_TESTS = [
         "/// ````rust\n/// ```\n/// TODO: fixture placeholder\n/// ````\n",
         set(),
         "a short closer does not close a longer fence",
+    ),
+    (
+        "/// - Example:\n///\n///     ```rust\n///     TODO: fixture placeholder\n///     ```\n",
+        set(),
+        "a fence indented inside a list item is still a fence",
     ),
     (
         "///     ```rust\n/// TODO: issue required\n",
