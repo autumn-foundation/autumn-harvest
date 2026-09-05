@@ -1328,12 +1328,47 @@ async fn two_regions(tag: &str) -> Option<Regions> {
 
     let conninfo = server_side_conninfo(&mut a, &admin, &primary_db).await;
     let mut b = connect(&standby_url).await;
-    b.batch_execute(&format!(
+    let create_subscription = format!(
         "CREATE SUBSCRIPTION {sub} CONNECTION '{conninfo}' PUBLICATION harvest_dr \
          WITH (create_slot = false, slot_name = '{slot}', copy_data = true)"
-    ))
+    );
+    // `copy_data = true` blocks until the STANDBY's Postgres *server* process
+    // (not this test client) reaches the primary at `conninfo` and finishes an
+    // initial table sync — reachability that depends on the runner's own
+    // container networking, not on this test's logic, and that Postgres places
+    // no timeout on. A bad or momentarily-unreachable address here therefore
+    // hangs this `.await` forever rather than erroring, which is exactly what
+    // pinned `Test DB (linux, shard 1)` for a full 6-hour CI job on a run whose
+    // diff never touched this file (see the PR discussion this comment was
+    // added from). Bounding it turns that into a fast, clear skip — consistent
+    // with this function's existing "server cannot host it" contract
+    // (`wal_level_is_logical` above already skips for the same class of
+    // reason), not a special case.
+    match tokio::time::timeout(
+        std::time::Duration::from_secs(60),
+        b.batch_execute(&create_subscription),
+    )
     .await
-    .expect("subscription");
+    {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => panic!("subscription: {e}"),
+        Err(_) => {
+            eprintln!(
+                "SKIPPED {tag}: CREATE SUBSCRIPTION did not complete within 60s — the standby's \
+                 Postgres process could not reach the primary at the server-side conninfo in \
+                 this environment. Dropping the orphaned replication slot; this test proved \
+                 NOTHING."
+            );
+            // Best-effort cleanup: an orphaned slot pins WAL on the shared test
+            // server indefinitely (the same concern the disconnected-standby
+            // test below already guards against for its own slot).
+            let _ = diesel::sql_query("SELECT pg_drop_replication_slot($1)")
+                .bind::<diesel::sql_types::Text, _>(slot.clone())
+                .execute(&mut a)
+                .await;
+            return None;
+        }
+    }
 
     Some(Regions {
         primary_url,
