@@ -648,7 +648,15 @@ def interrupts_paragraph(marker: "re.Match[str]") -> bool:
     form, and splitting a paragraph there hides the long sentence it belongs
     to. Only a bullet, or the number one, may interrupt a paragraph; inside a
     list any number continues it.
+
+    An item that is only its marker may not interrupt one at all: CommonMark
+    requires an interrupting item's first line to carry content. It opens a
+    list at the START of a block -- that is what round twenty-three added --
+    but mid-paragraph a lone "-" stays paragraph text, and treating it as a
+    container invents a fence allowance nothing in the document has.
     """
+    if not marker.string[marker.end():].strip():
+        return False
     marker_text = marker.group(2).strip()
     return not marker_text[:1].isdigit() or marker_text[:-1] == "1"
 
@@ -1066,7 +1074,13 @@ def check_line_rules(path: str, pieces: list[Piece]) -> list[Finding]:
         if not stripped:
             continue
 
-        if COMMENTED_CODE_RE.match(stripped):
+        # CH001 is anchored, so it has to see past any container marker: a
+        # list or quote is not a code fence, and the documented exemption is
+        # the fence. "- let stale = compute();" is commented-out code with a
+        # bullet in front of it. Peeled without a container, so only markers
+        # CommonMark would accept at the left margin are removed.
+        code_line = strip_containers(stripped, [], 0)[0].strip() or stripped
+        if COMMENTED_CODE_RE.match(code_line):
             findings.append(Finding("CH001", path, lineno, stripped))
 
         todo = TODO_RE.search(stripped)
@@ -1834,6 +1848,26 @@ RULE_TESTS = [
         "/**\n```rust\n/* TODO: fixture placeholder */\n```\n*/\npub fn a() {}\n",
         set(),
         "a nested comment inside a fenced example is part of the example",
+    ),
+    (
+        "/// - let stale = compute();\n",
+        {("CH001", 1)},
+        "a bullet does not exempt commented-out code",
+    ),
+    (
+        "/// > let stale = compute();\n",
+        {("CH001", 1)},
+        "and neither does a quote",
+    ),
+    (
+        "/// - a bullet of ordinary prose\n/// - the worker parks;\n",
+        set(),
+        "but ordinary bulleted prose stays clean",
+    ),
+    (
+        "/// Intro\n/// -\n///     ~~~rust\n///   TODO: issue required\n",
+        {("CH002", 4)},
+        "a marker with no content cannot interrupt a paragraph",
     ),
     (
         "/// - > word1 word2 word3 word4 word5 word6 word7 word8 word9 word10 word11 word12 word13 word14 word15 word16 word17 word18 word19 word20 word21 word22 word23 word24 word25.\n",

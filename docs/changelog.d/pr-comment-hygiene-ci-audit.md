@@ -981,3 +981,30 @@ immediately caught the first attempt on `let T: Send is required here;`, so it
 carries the same three-bare-words rejection the other `let` branches use.
 
 Corpus effect: none, for the eleventh round running.
+
+### Round thirty — a bullet is not a fence; an empty marker is not an item
+
+Two findings, both verified to reproduce first.
+
+**A container marker exempted commented-out code.** `/// - let stale =
+compute();` produced no CH001, because the rule is anchored to the start of
+the stripped line and saw the bullet rather than the `let`. A list or a quote
+is not a code fence, and the fence is the documented exemption — so the line
+is peeled before CH001 is applied, with no container, so only markers
+CommonMark would accept at the left margin are removed. Ordinary bulleted
+prose stays clean, and the 644-line adversarial sweep and 79 boundary shapes
+pass unchanged.
+
+**An empty marker interrupted a paragraph.** Round twenty-three taught the
+harness that `-` alone opens a list item, which is right at the start of a
+block and wrong in the middle of a paragraph: CommonMark requires an
+interrupting item's first line to carry content. A lone `-` after a prose line
+was inventing a container, and the four-column fence beneath it then measured
+against an allowance the rendered document does not have.
+
+The two round-twenty-three behaviours now stand side by side — a lone marker
+opens a list where a list may start, and stays paragraph text where one may
+not.
+
+Corpus effect: none, for the twelfth round running. CH001 is still zero, so
+the first finding was a latent hole rather than a live miss.
