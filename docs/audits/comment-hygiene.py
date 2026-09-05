@@ -300,7 +300,7 @@ MAX_SENTENCE_WORDS = 25
 
 # Indentation is captured, not bounded here: CommonMark's "at most three
 # spaces" is relative to the enclosing block container, so a fence inside a
-# list item is legitimately indented further. `fence_indent_ok` applies the
+# list item is legitimately indented further. `fence_delimiter` applies the
 # limit against the container.
 FENCE_RE = re.compile(r"^([ \t]*)(`{3,}|~{3,})")
 LIST_MARKER_RE = re.compile(r"^([ \t]*)((?:[-*+]|\d+[.)])[ \t]+)")
@@ -594,13 +594,30 @@ def container_indent_after(text: str, current: int) -> int:
     return current
 
 
-def fence_indent_ok(match: "re.Match[str]", container: int) -> bool:
-    """CommonMark allows up to three spaces before a fence, per container."""
-    return len(match.group(1).expandtabs(4)) <= container + 3
+def fence_delimiter(text: str, container: int) -> tuple["re.Match[str]", str] | None:
+    """The fence delimiter on `text`, or None if the line is not one.
+
+    Two things separate a delimiter from ordinary text. A fence may open on
+    the same line as the list marker that contains it ("- ```rust"), so the
+    marker is skipped before matching. And CommonMark allows at most three
+    spaces of indent *relative to the container*, for closers as much as for
+    openers: past that the line is indented content -- fenced content while a
+    fence is open, an indented code line while one is not. Returns the match
+    and the text it was matched against, which carries the info string.
+    """
+    marker = LIST_MARKER_RE.match(text)
+    base = len(marker.group(0)) if marker else 0
+    tail = text[marker.end():] if marker else text
+    match = FENCE_RE.match(tail)
+    if not match:
+        return None
+    if base + len(match.group(1).expandtabs(4)) > container + 3:
+        return None
+    return match, tail
 
 
 def fence_transition(
-    fence: tuple[str, int] | None, match: "re.Match[str]", text: str
+    fence: tuple[str, int] | None, match: "re.Match[str]", tail: str
 ) -> tuple[str, int] | None:
     """Apply one fence-delimiter line to the fence state.
 
@@ -608,10 +625,13 @@ def fence_transition(
     SAME character as its opener and be at least as long, with nothing after
     it. Otherwise a ``` line inside a ````-fenced example closes the fence
     early and the example's own sample text is then read as real comments.
+
+    `tail` is what `fence_delimiter` matched -- the line past any list
+    marker -- so `match.end()` indexes into it, not into the raw line.
     """
     delimiter = match.group(2)
     char, length = delimiter[0], len(delimiter)
-    info = text[match.end():]
+    info = tail[match.end():]
     if fence is None:
         # Opening. An info string ("```rust") is allowed, but CommonMark
         # forbids a backtick inside a BACKTICK fence's info string -- so
@@ -621,7 +641,7 @@ def fence_transition(
             return None
         return char, length
     open_char, open_length = fence
-    closes = char == open_char and length >= open_length and not text[match.end():].strip()
+    closes = char == open_char and length >= open_length and not tail[match.end():].strip()
     return None if closes else fence
 
 
@@ -671,10 +691,10 @@ def comment_lines(pieces: list[Piece]):
             text = piece.text
             if fence is None:
                 container = container_indent_after(text, container)
-            match = FENCE_RE.match(text)
-            if match and (fence is not None or fence_indent_ok(match, container)):
+            delimiter = fence_delimiter(text, container)
+            if delimiter:
                 before = fence
-                fence = fence_transition(fence, match, text)
+                fence = fence_transition(fence, *delimiter)
                 # Fence SYNTAX only if it opened one, closed one, or sits
                 # inside one. An invalid opener (```foo`bar) is ordinary text
                 # and must still be scanned -- exempting it would hide the
@@ -764,10 +784,10 @@ def prose_units(pieces: list[Piece]) -> list[tuple[int, str]]:
             body = piece.text
             if fence is None:
                 container = container_indent_after(body, container)
-            match = FENCE_RE.match(body)
-            if match and (fence is not None or fence_indent_ok(match, container)):
+            delimiter = fence_delimiter(body, container)
+            if delimiter:
                 before = fence
-                fence = fence_transition(fence, match, body)
+                fence = fence_transition(fence, *delimiter)
                 if fence is not None or before is not None:
                     flush()
                     continue
@@ -1161,6 +1181,21 @@ RULE_TESTS = [
         "///    ```rust\n///    let x = compute();\n///    ```\n",
         set(),
         "three spaces still opens a fence",
+    ),
+    (
+        "/// ```rust\n///     ```\n/// TODO: fixture placeholder\n/// ```\n",
+        set(),
+        "an over-indented ``` inside a fence is content, not a closer",
+    ),
+    (
+        "/// - ```rust\n///   TODO: fixture placeholder\n///   ```\n",
+        set(),
+        "a fence opens on its own list-marker line",
+    ),
+    (
+        "/// - ```rust\n///   let x = compute();\n///   ```\n/// TODO: issue required\n",
+        {("CH002", 4)},
+        "a fence opened on a list-marker line still closes",
     ),
     # Orthogonal-axis fixtures. Two rules were checked for the RIGHT WORDS
     # while the apostrophe character and the marker's case were left assumed,

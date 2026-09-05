@@ -509,3 +509,38 @@ neighbour at least once:
 ///     ```rust, no list                -> CH002    (round 7 preserved)
 ///    ```rust  (3 spaces)              -> exempt
 ```
+
+### Round sixteen — the container fix, applied to closers and to list-marker lines
+
+Review caught two false positives created by round fifteen, both verified to
+reproduce before being fixed.
+
+The container allowance was applied to openers only. A delimiter reached while
+a fence was already open was accepted at any indentation, so an over-indented
+` ``` ` inside a fence closed it early and the example's own sample text was
+read as real comments:
+
+```
+/// ```rust
+///     ```                             -> closed the fence, so
+/// TODO: fixture placeholder           -> CH002 on sample text
+/// ```
+```
+
+Separately, the fence pattern still matched against the raw line, so a fence
+opening on the same line as its list marker was never seen at all:
+
+```
+/// - ```rust
+///   TODO: fixture placeholder         -> CH002 on sample text
+///   ```
+```
+
+`fence_indent_ok` is replaced by `fence_delimiter`, which skips one leading
+list marker before matching, measures the delimiter's indent from the marker's
+end, and applies the three-space allowance to closers as well as openers. An
+over-indented delimiter is now content: fenced content while a fence is open,
+an indented code line while one is not.
+
+All ten fence behaviours re-verified together, the eight from rounds six to
+fifteen plus these two.
