@@ -157,10 +157,20 @@ async fn seed_event(
 ///   at all (external-activity timeout) -- must NOT count toward
 ///   `activity_executions_failed` (module doc's documented exclusion).
 ///
-/// Run twice against the same seeded rows -- once before, once after adding
-/// [`CANDIDATE_INDEX_SQL`] -- and asserts identical results, so a correctness
-/// regression in the index (or in Postgres choosing a different plan) is
-/// caught independently of the buffer-cost evidence capture below.
+/// These are business-logic assertions on the query's RESULT VALUES, which
+/// must hold regardless of which plan Postgres picks -- so this test runs
+/// the query exactly once against whatever index state the ambient database
+/// already has, rather than toggling [`CANDIDATE_INDEX_SQL`] itself. An
+/// earlier version of this test dropped and rebuilt the index in place to
+/// compare before/after, but on the documented `HARVEST_TEST_DATABASE_URL`
+/// path that points at a real (potentially large) shared database, not a
+/// throwaway one -- so doing a full non-concurrent `CREATE INDEX` there on
+/// every run of a test billed as fast and always-on would transiently drop a
+/// real schema index from under any concurrently-running test and hold a
+/// table-wide lock for however long that shared corpus takes to index
+/// (Codex review, PR #1381). That specific before/after equivalence proof
+/// belongs to -- and is already covered by -- the evidence-capture test
+/// below, which runs in its own isolated throwaway database.
 #[tokio::test]
 async fn usage_report_activity_lookback_index_does_not_change_the_result_set() {
     let (database_url, _container) = setup_test_database_url_or_env().await;
@@ -234,35 +244,20 @@ async fn usage_report_activity_lookback_index_does_not_change_the_result_set() {
         to: chrono::Utc::now(),
     };
 
-    // On a database HARVEST_TEST_DATABASE_URL points at post-migration
-    // (setup_test_database_url_or_env treats it as already-migrated), the
-    // candidate index already exists here, making the CREATE INDEX below a
-    // no-op -- both `before` and `after` would then run the SAME (with-index)
-    // plan, defeating the comparison this test claims to make (Codex review,
-    // PR #1381). Drop it unconditionally first, matching the evidence-capture
-    // test's own fix for the identical problem.
-    conn.batch_execute("DROP INDEX IF EXISTS idx_harvest_events_activity_started_lookup")
+    // A high row_limit, not the caller-facing default: `usage_sql()` applies
+    // `ORDER BY 1 LIMIT $5`, and this test's group names sort lexicographically
+    // wherever `u` falls relative to however many OTHER distinct
+    // workflow_name values a shared `HARVEST_TEST_DATABASE_URL` database has
+    // accumulated in the last hour (other suites/runs contribute rows here
+    // too) -- a small limit could silently truncate this test's own groups
+    // out of the result on a busy shared database, failing the `.expect(...)`
+    // lookups below for a reason that has nothing to do with the query's
+    // correctness (Codex review, PR #1381).
+    let rows = load_usage_grouped(&mut conn, SHARD_ID, &query, 1_000_000)
         .await
-        .expect("drop candidate index for a clean before-baseline");
+        .expect("query usage report");
 
-    let before = load_usage_grouped(&mut conn, SHARD_ID, &query, 100)
-        .await
-        .expect("query before index");
-
-    conn.batch_execute(CANDIDATE_INDEX_SQL)
-        .await
-        .expect("create candidate index");
-
-    let after = load_usage_grouped(&mut conn, SHARD_ID, &query, 100)
-        .await
-        .expect("query after index");
-
-    assert_eq!(
-        before, after,
-        "adding the lookback index must not change any reported counter"
-    );
-
-    let retry_row = before
+    let retry_row = rows
         .iter()
         .find(|r| r.group == retry_wf_name)
         .expect("retry workflow group present");
@@ -274,7 +269,7 @@ async fn usage_report_activity_lookback_index_does_not_change_the_result_set() {
         retry_row.activity_compute_seconds
     );
 
-    let external_row = before
+    let external_row = rows
         .iter()
         .find(|r| r.group == external_wf_name)
         .expect("external workflow group present");
