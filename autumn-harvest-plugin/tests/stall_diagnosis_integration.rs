@@ -3364,6 +3364,58 @@ async fn ac2_mixed_build_eligible_workers_still_suppress_the_verdict() {
     assert_eq!(kind(&body), "healthy_in_progress", "body: {body}");
 }
 
+/// Review round 2: a row with NO eligible worker at all is a DIFFERENT
+/// question from a row whose eligible worker is off-build. With no candidate
+/// worker there is no peer to disagree with, so the untracked activity's
+/// rate-limit fact is exactly as reliable as it always was -- and
+/// `contributing_reason_codes` (a union of every impediment, not just the
+/// headline winner) must still carry `rate_limit_exhausted` even though
+/// `activity_no_worker` wins the headline verdict, mirroring how
+/// `concurrency_saturated` already stays represented in the same situation.
+#[tokio::test]
+async fn ac2_missing_worker_does_not_erase_a_co_occurring_rate_limit_reason() {
+    let (url, _guard) = setup_database().await;
+    let pool = build_pool(&url);
+    let app = build_api_app(build_api_state(&pool));
+
+    let exec_id = seed_execution(
+        &pool,
+        "activity_wf",
+        "RUNNING",
+        vec![started_event(), scheduled_activity_event()],
+    )
+    .await;
+    seed_drained_rate_limit_bucket(&pool, "tenant:acme").await;
+    seed_keyed_activity_task(
+        &pool,
+        exec_id,
+        "send_email",
+        "email",
+        Some("tenant:acme"),
+        None,
+        None,
+    )
+    .await;
+    // Deliberately NO live worker at all covers "email".
+
+    let body = diagnose(&app, exec_id).await;
+    assert_eq!(
+        kind(&body),
+        "activity_no_worker",
+        "no eligible worker outranks the rate-limit verdicts for the headline: {body}"
+    );
+    assert!(
+        body["contributing_reason_codes"]
+            .as_array()
+            .expect("reasons")
+            .iter()
+            .any(|r| r == "rate_limit_exhausted"),
+        "the drained bucket is still a real, co-occurring impediment and must \
+         survive in the union even though no worker exists to be refused by \
+         it yet: {body}"
+    );
+}
+
 /// AC3: a single-build fleet -- every live worker (including this replica's
 /// own co-located one) shares one real build id -- behaves exactly as before
 /// this fix. A breaker-tracked activity's bucket is still bypassed even

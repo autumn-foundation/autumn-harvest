@@ -13521,20 +13521,28 @@ fn local_circuit_snapshot_is_authoritative(
 /// O(workers) linear scan per eligible id, which would otherwise make a wide
 /// fan-out with many eligible workers quadratic in fleet size.
 ///
-/// Vacuously `false` for an empty `eligible_ids`: `activity_no_worker`
-/// outranks the rate-limit verdicts anyway (issue #809), and an empty set
-/// asserting authority would be a claim this function has no evidence for.
+/// Vacuously `true` for an empty `eligible_ids` (issue #1190 review round 2):
+/// with no candidate worker there is no OTHER build the local fact could
+/// disagree with, so the "every worker agrees" claim holds trivially, same as
+/// the standard reading of a universally-quantified statement over an empty
+/// set. This matters for a reason distinct from the headline verdict --
+/// `activity_no_worker` outranks the rate-limit verdicts there regardless
+/// (issue #809) -- but `contributing_reason_codes` is a union of every
+/// impediment, not just the winner, and a `rate_limit_exhausted` fact stays
+/// true (the bucket is still what would refuse a worker the moment one
+/// appears) even while no worker exists yet to be refused. Returning `false`
+/// here would silently drop that fact from the union purely because a
+/// worker-liveness check unrelated to build agreement also failed.
 fn every_eligible_worker_is_on_the_local_build(
     eligible_ids: &[&str],
     worker_build_ids: &std::collections::HashMap<&str, &str>,
     local_build_id: &str,
 ) -> bool {
-    !eligible_ids.is_empty()
-        && eligible_ids.iter().all(|id| {
-            worker_build_ids
-                .get(id)
-                .is_some_and(|build_id| registry_fallback_binds(build_id, local_build_id))
-        })
+    eligible_ids.iter().all(|id| {
+        worker_build_ids
+            .get(id)
+            .is_some_and(|build_id| registry_fallback_binds(build_id, local_build_id))
+    })
 }
 
 /// May `claim_task`'s rate-limit bucket be consulted as THE answer for this
@@ -55662,10 +55670,12 @@ mod tests {
             "",
         ));
 
-        // Vacuously false for no eligible workers: `activity_no_worker`
-        // outranks the rate-limit verdicts anyway, and there is no evidence
-        // to assert authority over an empty set.
-        assert!(!every_eligible_worker_is_on_the_local_build(
+        // Vacuously TRUE for no eligible workers (issue #1190 review round
+        // 2): with no candidate worker there is no OTHER build to disagree
+        // with, and `contributing_reason_codes` still needs a genuine
+        // rate-limit fact to survive even when `activity_no_worker` wins the
+        // headline verdict.
+        assert!(every_eligible_worker_is_on_the_local_build(
             &[],
             &ids,
             "build-new",
