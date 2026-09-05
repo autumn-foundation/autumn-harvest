@@ -811,35 +811,71 @@ def update_containers(
     return stack, bool(body.strip())
 
 
+def strip_containers(
+    text: str, stack: list[tuple[int, int]], container: int
+) -> tuple[str, int]:
+    """Peel container markers off `text` until a fence delimiter could show.
+
+    One line can open several containers at once: "- > ```rust" is a list item
+    holding a block quote holding a fence, and "- 1. ```rust" is two lists.
+    Each marker restarts the content column, so they are peeled one at a time
+    and the next is measured in the frame the last one left.
+
+    Which frame that is depends on the marker. A list marker on THIS line
+    opens an item with nothing in it yet, so the next frame starts at zero.
+    Crossing a quote enters a depth the stack may already have a container
+    for -- a quoted list item, say -- and its column is the one recorded
+    there. Returns the remaining text and the container to measure against.
+    """
+    depth = 0
+    while True:
+        quote = quote_marker(text, container)
+        if quote:
+            text = text[quote.end():]
+            depth += 1
+            container = container_at_depth(stack, depth)
+            continue
+        content = list_content(text, container)
+        if content:
+            text = text[content[1]:]
+            container = 0
+            continue
+        return text, container
+
+
 def fence_delimiter(
-    text: str, container: int, in_fence: bool = False, depth: int = 0
+    text: str,
+    container: int,
+    in_fence: bool = False,
+    depth: int = 0,
+    stack: list[tuple[int, int]] | None = None,
 ) -> tuple["re.Match[str]", str] | None:
     """The fence delimiter on `text`, or None if the line is not one.
 
     Two things separate a delimiter from ordinary text. A fence may open on
-    the same line as a container marker -- a list item ("- ```rust") or a
-    block quote ("> ```rust") -- so markers are skipped before matching. And CommonMark allows at most three
-    spaces of indent *relative to the container*, for closers as much as for
-    openers: past that the line is indented content -- fenced content while a
-    fence is open, an indented code line while one is not. Returns the match
-    and the text it was matched against, which carries the info string.
+    the same line as the container markers holding it -- a list item, a block
+    quote, or several nested -- so those are peeled before matching. And
+    CommonMark allows at most three columns of indent *relative to the
+    container*, for closers as much as for openers: past that the line is
+    indented content -- fenced content while a fence is open, an indented code
+    line while one is not. Returns the match and the text it was matched
+    against, which carries the info string.
     """
-    # Container markers are skipped only as far as they are syntax. Inside a
-    # fence the sample text is literal: "- ```" is a hyphen and three
-    # backticks of example content, not an item whose body closes the fence,
-    # and a "> " deeper than the fence's own container is sample text too.
+    # Markers are peeled only as far as they are syntax. Inside a fence the
+    # sample text is literal: "- ```" is a hyphen and three backticks of
+    # example content, not an item whose body closes the fence, and a "> "
+    # deeper than the fence's own container is sample text too.
     if in_fence:
-        text = strip_quote_levels(text, depth, container)
+        tail = strip_quote_levels(text, depth, container)
     else:
-        text = strip_quote(text, container)
-    base, offset = (0, 0) if in_fence else (list_content(text, container) or (0, 0))
-    tail = text[offset:]
+        tail, container = strip_containers(text, stack or [], container)
     match = FENCE_RE.match(tail)
     if not match:
         return None
-    if base + len(match.group(1).expandtabs(4)) > container + 3:
+    if len(match.group(1).expandtabs(4)) > container + 3:
         return None
     return match, tail
+
 
 
 def fence_transition(
@@ -922,7 +958,7 @@ def comment_lines(pieces: list[Piece]):
             if fence is None:
                 stack, paragraph = update_containers(text, stack, paragraph)
             container = stack[-1][0] if stack else 0
-            delimiter = fence_delimiter(text, container, fence is not None, scope[2])
+            delimiter = fence_delimiter(text, container, fence is not None, scope[2], stack)
             if delimiter:
                 before = fence
                 fence = fence_transition(fence, *delimiter)
@@ -1046,7 +1082,7 @@ def prose_units(pieces: list[Piece]) -> list[tuple[int, str]]:
             if fence is None:
                 stack, paragraph = update_containers(body, stack, paragraph)
             container = stack[-1][0] if stack else 0
-            delimiter = fence_delimiter(body, container, fence is not None, scope[2])
+            delimiter = fence_delimiter(body, container, fence is not None, scope[2], stack)
             if delimiter:
                 before = fence
                 fence = fence_transition(fence, *delimiter)
@@ -1676,6 +1712,11 @@ RULE_TESTS = [
         "///     > ```\n///     TODO: issue required\n",
         {("CH002", 5)},
         "a quoted fence inside a list item still sees its own closer",
+    ),
+    (
+        "/// - 1. ```rust\n///      TODO: fixture placeholder\n///      ```\n",
+        set(),
+        "two list markers on one line both open containers for the fence",
     ),
     (
         "/// Intro\n/// > word1 word2 word3 word4 word5 word6 word7 word8 word9 word10 word11 word12 word13 word14 word15 word16 word17 word18 word19 word20 word21 word22 word23 word24 word25.\n",

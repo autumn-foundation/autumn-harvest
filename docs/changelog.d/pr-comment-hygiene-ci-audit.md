@@ -853,3 +853,35 @@ quote is measured after the marker.
 
 Nine accumulated fence behaviours re-verified together. Corpus effect: none;
 the seventh consecutive round with byte-identical output.
+
+### Round twenty-six — nested container markers, and where this stops
+
+One finding: several container markers on one line. `/// - 1. ```rust` and
+`/// - > ```rust` open a list holding a list, and a list holding a quote, but
+only one marker of each kind was consumed, so the fence never opened and the
+example's own `TODO` failed CH002.
+
+`strip_containers` peels markers one at a time now, measuring each in the
+frame the last one left. Which frame that is depends on the marker: a list
+marker on this line opens an item with nothing in it, so the next frame starts
+at zero, while crossing a quote enters a depth the stack may already hold a
+container for. Getting that wrong broke the round-seventeen quoted-list
+fixture on the first attempt.
+
+**Half of this finding is fixed and half is not, deliberately.**
+`- 1. ```rust` works. `- > ```rust` opens the fence but its *body* is still
+scanned, because `update_containers` also consumes one marker per line, so the
+stack never records the quote container the list line opens and the fence's
+saved scope is a frame off. Nothing regressed — that case behaves exactly as
+it did before this commit — but it is not fixed.
+
+Fixing it means giving `update_containers` the same recursive peel, which is
+CommonMark's block-continuation algorithm: walk the line against the open
+container stack, consume each container it continues, then open what is left.
+That is a rewrite of the container layer, it re-frames every existing
+container behaviour, and it is precisely option (a) of the choice raised at
+the end of round twenty-three, which is still unanswered. Landing it
+unprompted on the eighth consecutive round with no corpus effect is a larger
+call than this PR should make on its own.
+
+Corpus effect: none, for the eighth round running.
