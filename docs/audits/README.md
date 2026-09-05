@@ -10,7 +10,7 @@ to wire into CI as a gate.
 | `corpus-link-check.py` | Internal markdown links (missing file, missing anchor) and orphan pages across `docs/**/*.md` | Yes — `.github/workflows/ci.yml`, `lint` job |
 | `config-cli-drift.py` | Doc-cited `[harvest]` TOML config keys, `AUTUMN_HARVEST*` env vars, and `harvest` CLI `--flags` against the real schema/CLI, extracted mechanically from `autumn-harvest-plugin/src/config.rs` and `autumn-harvest-cli/src/lib.rs` | Yes — `.github/workflows/ci.yml`, `lint` job |
 | `vantage-dashboard-contrast.py` | WCAG 1.4.3 contrast on the Vantage dashboard's inline stylesheet | No — run manually after touching `autumn-harvest-plugin/src/ui.rs`'s `STYLE` constant |
-| `comment-hygiene.py` | Comment defects across every `*.rs`: commented-out code, unreferenced TODOs, narrative asides, blank block edges (all gated at zero), plus review-round archaeology, contractions and over-long sentences (ratcheted against `comment-hygiene-baseline.json`) | Yes — `.github/workflows/ci.yml`, `lint` job |
+| `comment-hygiene.py` | Comment defects across every `*.rs`: commented-out code, unreferenced TODOs, narrative asides, blank block edges (all gated at zero), plus review-round archaeology, contractions and over-long sentences (ratcheted against the merge base, so a change may not add one to a file it touches) | Yes — `.github/workflows/ci.yml`, `lint` job |
 
 ## Comment hygiene: the two tiers
 
@@ -21,26 +21,32 @@ docs, and its tier split is deliberate.
 they were driven to zero when the harness landed, and a new one fails the
 build. Fix the finding; there is no baseline to absorb it.
 
-**Tier B is a ratchet, scoped to what you changed.** CH005–CH007 have a
-legacy population too large to fix in one change (CH007 alone is ~17.9k
-sentences), so `comment-hygiene-baseline.json` freezes the per-file count.
-CI passes `--base`, and the gate then judges only the files your change
-touches; everything else is reported but cannot fail your build.
+**Tier B is a ratchet against the merge base.** CH005–CH007 have a legacy
+population too large to fix in one change (CH007 alone is ~17.9k
+sentences), so the rule is simply: your change may not *add* one to a file
+it touches. Existing findings stay until someone chooses to fix them.
 
-That scoping is load-bearing. A whole-corpus count is a shared mutable
-number: one merge that adds a long comment anywhere turns every open PR
-red for a file its author never opened. (This happened on the harness's
-own first CI run — `trunk-dev` gained 4 long sentences in
-`cross_region_dr_tests.rs` while the PR was open, and the gate failed on
-a file the PR never touched.) The predictable response is to regenerate
-the baseline, which defeats the ratchet. Scoping keeps each change
-answerable for its own work and keeps the baseline a stable record rather
-than a contended counter.
+There is no checked-in baseline, deliberately. CI passes `--base`, and the
+harness re-scans each changed file as it stood at the merge base, read out
+of git. A stored baseline goes stale the moment the base branch moves —
+one merge adding a long comment anywhere turns every open PR red for a
+file its author never opened (this happened on the harness's own first CI
+run) — invites being regenerated to launder a new violation, breaks on
+renames, and costs half a megabyte of generated fingerprints in the tree.
 
-Counts may fall freely. Regenerate the baseline
-(`python3 docs/audits/comment-hygiene.py --write-baseline`) **only** when
-lowering a count or when a rule's definition changes — never to absorb a
-new violation.
+Findings are matched by **fingerprint** (rule + normalized text), not
+counted. A count only answers "how many", so removing one legacy violation
+and adding a different one in the same file nets to zero and passes. An
+identity answers "which". A renamed file is compared against its own
+previous path, so a pure rename is not a regression; a file the change
+adds has no merge-base version, so every Tier B finding in it is the
+change's own.
+
+When the diff cannot be computed — no `--base`, an unknown ref, a shallow
+clone — Tier B reports but never fails. Gating the whole corpus at the
+moment the tool cannot tell what changed is the worst option available.
+(This is why the `lint` checkout uses `fetch-depth: 0`: without real
+history there is no merge base, and the step would silently stop gating.)
 
 **It reads every comment, via a lexer.** Leading and trailing `//`,
 `///`, `//!` and `/* */` (nested and doc forms included) all count — a

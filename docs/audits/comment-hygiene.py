@@ -42,23 +42,34 @@ been driven to zero when this harness landed. A new one fails the build.
   CH004 blank-comment-edge    A comment block that opens or closes on an
                               empty `//` line -- an editing artifact.
 
-TIER B -- ratcheted against docs/audits/comment-hygiene-baseline.json
----------------------------------------------------------------------
+TIER B -- ratcheted against the merge base
+------------------------------------------
 Real style defects with a legacy population far too large to fix in one
-change (CH007 alone is ~18k sentences). Freezing them as a per-file,
-per-rule count means new code is held to the rule while old code is
-merely forbidden from getting worse. Counts may fall freely.
+change (CH007 alone is ~17.9k sentences). The rule for these is simply:
+your change may not ADD one to a file it touches. Existing findings stay
+until someone chooses to fix them.
 
-Tier B gates only the files a change actually touches (`--base <ref>`,
-which CI passes). This is load-bearing, not a softening. A whole-corpus
-count is a shared mutable number: one merge that adds a long comment
-anywhere turns every open PR red for a file its author never opened, and
-the predictable response is to regenerate the baseline, which defeats the
-ratchet entirely. Scoping to changed files makes each change answerable
-only for its own work, and leaves the baseline a stable record of legacy
-debt rather than a contended counter. Without `--base` -- or when the diff
-cannot be computed, e.g. a shallow clone -- Tier B reports but never
-fails. Tier A is never scoped; it gates everywhere, always.
+The comparison reads the merge base out of git (`--base <ref>`, which CI
+passes) and re-scans each changed file as it was there. There is no
+checked-in baseline, deliberately -- a stored one goes stale the moment
+the base branch moves (one merge adding a long comment anywhere turns
+every open PR red for a file its author never opened), invites being
+regenerated to launder a new violation, breaks on renames, and costs half
+a megabyte of generated fingerprints in the tree.
+
+Findings are matched by FINGERPRINT (rule + normalized text), not counted.
+A count only answers "how many", so removing one legacy violation and
+adding a different one in the same file nets to zero and passes. An
+identity answers "which", so the new one is caught even though the total
+never moved. A renamed file is compared against its own previous path; a
+file the change adds has no merge-base version, so every Tier B finding in
+it is the change's own.
+
+Without `--base`, or when the diff cannot be computed (no git, an unknown
+ref, a shallow clone with no reachable merge base), Tier B reports but
+never fails: gating the whole corpus at the moment the tool cannot tell
+what changed is the worst option available. Tier A is never scoped; it
+gates everywhere, always.
 
   CH005 review-archaeology    "Codex round 8", "round-5", "P2 fix": the
                               review round that produced a change is
@@ -91,7 +102,6 @@ sample code, and markdown tables and headings are not prose.
 
 Usage:
     python3 docs/audits/comment-hygiene.py [--json] [--tier-a-only]
-    python3 docs/audits/comment-hygiene.py --write-baseline
     python3 docs/audits/comment-hygiene.py --self-test
     python3 docs/audits/comment-hygiene.py --base origin/trunk-dev
     python3 docs/audits/comment-hygiene.py --paths a.rs b.rs
@@ -136,15 +146,15 @@ KNOWN LIMITATIONS:
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import re
 import subprocess
 import sys
-from collections import defaultdict
+from collections import Counter, defaultdict
 
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-BASELINE_PATH = os.path.join(REPO_ROOT, "docs", "audits", "comment-hygiene-baseline.json")
 
 # Directories that hold no first-party source.
 SKIP_DIRS = {".git", "target", "node_modules", ".cargo"}
@@ -185,7 +195,8 @@ RULE_HINTS = {
 COMMENTED_CODE_RE = re.compile(
     r"""^(?:
         (?:pub(?:\([\w:]+\))?\s+)?(?:async\s+|unsafe\s+|const\s+|extern\s+"\w+"\s+)*
-            fn\s+\w+\s*(?:<[^<>]*>)?\s*\(.*$
+            fn\s+\w+\s*(?:<[^<>]*>)?\s*\(
+            (?:.*\)\s*(?:->\s*[^;{]+?)?\s*[{;]|[^)]*)\s*$
       | (?:pub(?:\([\w:]+\))?\s+)?(?:struct|enum|trait|union)\s+\w+\s*(?:<[^<>]*>)?\s*[{;(]\s*$
       | (?:pub(?:\([\w:]+\))?\s+)?mod\s+\w+\s*[{;]\s*$
       | (?:pub(?:\([\w:]+\))?\s+)?(?:const|static)\s+(?:mut\s+)?\w+\s*:[^;=]+=.*[;{]\s*$
@@ -245,13 +256,23 @@ SENTENCE_SPLIT_RE = re.compile(r"(?<=[.!?])\s+")
 
 
 class Finding:
-    __slots__ = ("rule", "path", "line", "text")
+    __slots__ = ("rule", "path", "line", "text", "key")
 
-    def __init__(self, rule: str, path: str, line: int, text: str) -> None:
+    def __init__(
+        self, rule: str, path: str, line: int, text: str, key: str | None = None
+    ) -> None:
         self.rule = rule
         self.path = path
         self.line = line
         self.text = text
+        # What identifies this finding across edits. Deliberately not the line
+        # number, which moves whenever anything above it does.
+        self.key = " ".join((key if key is not None else text).split())
+
+    @property
+    def fingerprint(self) -> str:
+        digest = hashlib.sha256(f"{self.rule}\x00{self.key}".encode()).hexdigest()
+        return digest[:12]
 
     def as_dict(self) -> dict:
         return {"rule": self.rule, "path": self.path, "line": self.line, "text": self.text}
@@ -343,12 +364,17 @@ def extract_comments(source: str) -> list[Piece]:
         # Block comment: nests in Rust, so track depth rather than find("*/").
         if source.startswith("/*", i):
             marker = "/*"
-            for candidate in ("/**", "/*!"):
-                if source.startswith(candidate, i):
-                    marker = candidate
-                    break
+            if source.startswith("/*!", i):
+                marker = "/*!"
+            elif source.startswith("/**", i) and not source.startswith("/**/", i):
+                # `/**/` is an empty comment, not a doc marker. Treating it as
+                # one would eat the closing `*/` and swallow the rest of the
+                # file as comment body.
+                marker = "/**"
             depth = 1
-            i += 2
+            # Past the WHOLE marker: leaving the `!` of `/*!` on the body made
+            # the anchored rules miss `/*! TODO */` and `/*! let x = 1; */`.
+            i += len(marker)
             seg_start = i
             seg_line = line
             first = True
@@ -589,7 +615,9 @@ def check_prose_rules(path: str, pieces: list[Piece]) -> list[Finding]:
             words = sentence.split()
             if len(words) > MAX_SENTENCE_WORDS:
                 findings.append(
-                    Finding("CH007", path, lineno, f"{len(words)} words: {sentence[:90]}")
+                    Finding(
+                        "CH007", path, lineno, f"{len(words)} words: {sentence[:90]}", sentence
+                    )
                 )
     return findings
 
@@ -604,35 +632,89 @@ def scan(paths: list[str] | None) -> list[Finding]:
         except OSError as exc:
             print(f"comment-hygiene: cannot read {rel}: {exc}", file=sys.stderr)
             continue
-        pieces = extract_comments(source)
-        findings.extend(check_line_rules(rel, pieces))
-        findings.extend(check_block_edges(rel, pieces))
-        findings.extend(check_prose_rules(rel, pieces))
+        findings.extend(findings_for_source(rel, source))
     findings.sort(key=lambda f: (f.rule, f.path, f.line))
     return findings
 
 
 def tally(findings: list[Finding]) -> dict:
-    """Per-rule, per-file counts -- the baseline's shape."""
-    counts: dict = defaultdict(lambda: defaultdict(int))
+    """Per-rule, per-file fingerprint lists.
+
+    Fingerprints, not counts. A count only answers "how many", so a change
+    that removes one legacy violation and adds a different one in the same
+    file nets to zero and passes, despite introducing exactly the defect the
+    rule exists to stop. Identities answer "which", so the new one is a
+    regression even though the total never moved.
+    """
+    grouped: dict = defaultdict(lambda: defaultdict(list))
     for f in findings:
-        counts[f.rule][f.path] += 1
-    return {rule: dict(sorted(files.items())) for rule, files in sorted(counts.items())}
+        grouped[f.rule][f.path].append(f.fingerprint)
+    return {
+        rule: {path: sorted(fps) for path, fps in sorted(files.items())}
+        for rule, files in sorted(grouped.items())
+    }
 
 
-def load_baseline() -> dict:
-    if not os.path.exists(BASELINE_PATH):
-        return {}
-    with open(BASELINE_PATH, encoding="utf-8") as handle:
-        return json.load(handle).get("counts", {})
+def findings_for_source(path: str, source: str) -> list[Finding]:
+    pieces = extract_comments(source)
+    return (
+        check_line_rules(path, pieces)
+        + check_block_edges(path, pieces)
+        + check_prose_rules(path, pieces)
+    )
 
 
-def changed_files(base_ref: str) -> set[str] | None:
-    """Files this branch changed relative to its merge base with `base_ref`.
+def baseline_from_merge_base(
+    merge_base: str, scope: set[str], renames: dict[str, str]
+) -> dict:
+    """Tier B findings as they stand at the merge base, for the changed files.
 
+    Read out of git rather than a checked-in baseline file, which removes the
+    whole class of problems a stored baseline has. It cannot go stale when the
+    base branch moves. It needs no regeneration ritual, and so cannot be
+    regenerated to launder a new violation. It is rename-stable, because a
+    moved file is compared against its own previous path. And it keeps half a
+    megabyte of generated fingerprints out of the tree.
+    """
+    grouped: dict = defaultdict(lambda: defaultdict(list))
+    for path in sorted(p for p in scope if p.endswith(".rs")):
+        was_path = renames.get(path, path)
+        try:
+            done = subprocess.run(
+                ("git", "show", f"{merge_base}:{was_path}"),
+                cwd=REPO_ROOT,
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+        except (OSError, ValueError):
+            continue
+        if done.returncode != 0:
+            # Absent at the base: a file this change adds. Nothing is allowed,
+            # so every Tier B finding in it is this change's own.
+            continue
+        for finding in findings_for_source(path, done.stdout):
+            if finding.rule in TIER_B:
+                grouped[finding.rule][path].append(finding.fingerprint)
+    return {
+        rule: {path: sorted(fps) for path, fps in sorted(files.items())}
+        for rule, files in sorted(grouped.items())
+    }
+
+
+def diff_context(base_ref: str) -> tuple[str, set[str], dict[str, str]] | None:
+    """What this branch changed since its merge base with `base_ref`.
+
+    Returns (merge-base sha, changed paths, {new path: old path} for renames).
     None when the answer cannot be trusted -- no git, an unknown ref, or a
     shallow clone whose history does not reach the merge base. Callers treat
-    None as "cannot scope", not as "nothing changed".
+    None as "cannot scope", never as "nothing changed".
+
+    The sha matters: comparing against the branch TIP would blame this change
+    for comments the base branch added after the fork point. Renames are
+    tracked because a moved file is compared against its own previous path;
+    without that, every legacy finding in it looks new and an ordinary module
+    rename fails CI over debt it did not introduce.
     """
     def git(*args: str) -> str | None:
         try:
@@ -650,14 +732,29 @@ def changed_files(base_ref: str) -> set[str] | None:
     merge_base = git("merge-base", base_ref, "HEAD")
     if not merge_base:
         return None
-    listing = git("diff", "--name-only", merge_base, "HEAD")
+    listing = git("diff", "--name-status", "--find-renames", merge_base, "HEAD")
     if listing is None:
         return None
-    return {line for line in listing.split("\n") if line.strip()}
+
+    changed: set[str] = set()
+    renames: dict[str, str] = {}
+    for row in listing.split("\n"):
+        if not row.strip():
+            continue
+        fields = row.split("\t")
+        if fields[0].startswith("R") and len(fields) >= 3:
+            changed.add(fields[2])
+            renames[fields[2]] = fields[1]
+        elif len(fields) >= 2:
+            changed.add(fields[1])
+    return merge_base, changed, renames
 
 
 def compare_tier_b(
-    current: dict, baseline: dict, scope: set[str] | None = None
+    current: dict,
+    baseline: dict,
+    scope: set[str] | None = None,
+    renames: dict[str, str] | None = None,
 ) -> list[str]:
     """Regressions only: a count that rose, or a file newly in violation.
 
@@ -670,6 +767,7 @@ def compare_tier_b(
     for its own work, and leaves the baseline a stable record of legacy debt
     rather than a contended counter.
     """
+    renames = renames or {}
     regressions = []
     for rule in TIER_B:
         now = current.get(rule, {})
@@ -677,32 +775,16 @@ def compare_tier_b(
         for path in sorted(now):
             if scope is not None and path not in scope:
                 continue
-            before = was.get(path, 0)
-            after = now[path]
-            if after > before:
+            allowed = Counter(was.get(path) or was.get(renames.get(path, path), []))
+            added = Counter(now[path]) - allowed
+            total = sum(added.values())
+            if total:
                 regressions.append(
-                    f"{rule} {path}: {before} -> {after} "
-                    f"(+{after - before}) [{RULE_TITLES[rule]}]"
+                    f"{rule} {path}: {total} new finding(s), "
+                    f"{len(now[path])} total vs {sum(allowed.values())} at the merge base "
+                    f"[{RULE_TITLES[rule]}]"
                 )
     return regressions
-
-
-def write_baseline(findings: list[Finding]) -> None:
-    counts = tally(findings)
-    payload = {
-        "_comment": (
-            "Frozen Tier B counts for docs/audits/comment-hygiene.py. Counts may "
-            "fall freely; any increase fails CI. Regenerate with "
-            "`python3 docs/audits/comment-hygiene.py --write-baseline` ONLY when "
-            "lowering a count or when a rule's definition changes."
-        ),
-        "counts": {rule: counts.get(rule, {}) for rule in TIER_B},
-    }
-    with open(BASELINE_PATH, "w", encoding="utf-8") as handle:
-        json.dump(payload, handle, indent=2, sort_keys=False)
-        handle.write("\n")
-    total = sum(sum(f.values()) for f in payload["counts"].values())
-    print(f"Wrote {BASELINE_PATH} ({total} Tier B findings frozen).")
 
 
 def report(
@@ -711,6 +793,7 @@ def report(
     tier_a_only: bool,
     scope: set[str] | None,
     scope_note: str,
+    renames: dict[str, str] | None = None,
 ) -> int:
     by_rule: dict = defaultdict(list)
     for f in findings:
@@ -735,15 +818,21 @@ def report(
         return 1 if failed else 0
 
     current = tally(findings)
-    print(f"\nTier B -- ratcheted against the baseline ({scope_note})")
+    print(f"\nTier B -- ratcheted against the merge base ({scope_note})")
     for rule in TIER_B:
-        now = sum(current.get(rule, {}).values())
-        was = sum(baseline.get(rule, {}).values())
-        delta = now - was
-        arrow = "=" if delta == 0 else (f"+{delta}" if delta > 0 else str(delta))
-        print(f"  {rule} {RULE_TITLES[rule]}: {now} (baseline {was}, {arrow})")
+        corpus = sum(len(v) for v in current.get(rule, {}).values())
+        allowed = sum(len(v) for v in baseline.get(rule, {}).values())
+        in_scope = sum(
+            len(v)
+            for path, v in current.get(rule, {}).items()
+            if scope is None or path in scope
+        )
+        print(
+            f"  {rule} {RULE_TITLES[rule]}: {corpus} in the corpus; "
+            f"{in_scope} in changed files ({allowed} at the merge base)"
+        )
 
-    regressions = compare_tier_b(current, baseline, scope)
+    regressions = compare_tier_b(current, baseline, scope, renames)
     if regressions:
         failed = True
         print(f"\n{len(regressions)} Tier B regression(s) -- these files gained violations:")
@@ -809,9 +898,6 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     parser.add_argument("--json", action="store_true", help="emit findings as JSON")
     parser.add_argument(
-        "--write-baseline", action="store_true", help="freeze current Tier B counts"
-    )
-    parser.add_argument(
         "--tier-a-only", action="store_true", help="check only the absolute gates"
     )
     parser.add_argument(
@@ -835,18 +921,16 @@ def main() -> int:
 
     findings = scan(args.paths)
 
-    if args.write_baseline:
-        if args.paths:
-            print("--write-baseline needs a full scan; drop --paths.", file=sys.stderr)
-            return 2
-        write_baseline(findings)
-        return 0
-
     # Tier B gates only what this change touched. Unscoped, it reports and
     # never fails: the alternative is failing a PR for a file it never opened.
     scope: set[str] | None = None
+    renames: dict[str, str] = {}
+    merge_base = ""
     if args.base:
-        scope = changed_files(args.base)
+        context = diff_context(args.base)
+        scope = None if context is None else context[1]
+        if context is not None:
+            merge_base, _, renames = context
         if scope is None:
             print(
                 f"comment-hygiene: cannot diff against {args.base!r} (unknown ref, "
@@ -861,20 +945,29 @@ def main() -> int:
             scope_note = f"could not diff against {args.base}; report-only"
         else:
             rust = sorted(p for p in scope if p.endswith(".rs"))
-            scope_note = f"gating {len(rust)} changed .rs file(s) vs {args.base}"
+            moved = sum(1 for p in renames if p.endswith(".rs"))
+            scope_note = (
+                f"gating {len(rust)} changed .rs file(s) vs {args.base}"
+                + (f", {moved} renamed" if moved else "")
+            )
     else:
         scope = set()
         scope_note = "no --base given; report-only"
 
+    baseline = {}
+    if args.base and scope:
+        baseline = baseline_from_merge_base(merge_base, scope, renames)
+
     if args.json:
         current = tally(findings)
-        regressions = compare_tier_b(current, load_baseline(), scope)
+        regressions = compare_tier_b(current, baseline, scope, renames)
         print(
             json.dumps(
                 {
                     "findings": [f.as_dict() for f in findings],
                     "counts": current,
                     "scope": sorted(scope) if scope is not None else None,
+                    "merge_base": merge_base,
                     "tier_b_regressions": regressions,
                 },
                 indent=2,
@@ -883,7 +976,7 @@ def main() -> int:
         tier_a = [f for f in findings if f.rule in TIER_A]
         return 1 if tier_a or regressions else 0
 
-    return report(findings, load_baseline(), args.tier_a_only, scope, scope_note)
+    return report(findings, baseline, args.tier_a_only, scope, scope_note, renames)
 
 
 if __name__ == "__main__":

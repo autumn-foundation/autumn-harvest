@@ -43,11 +43,14 @@ Rust source is safe.
 
 Four defects fail the build outright and are at zero — commented-out code,
 a TODO/FIXME with no `#<issue>`, a narrative aside ("actually, let's ..."),
-and a blank `//` line at a block edge. Three more are frozen at their
-legacy counts in `docs/audits/comment-hygiene-baseline.json` and may only
-fall: review-round archaeology ("Codex round 8" — cite the issue instead),
-contractions, and sentences over 25 words. Fix a flagged line rather than
-regenerating the baseline; see `docs/audits/README.md`.
+and a blank `//` line at a block edge.
+
+Three more are ratcheted against the merge base: review-round archaeology
+("Codex round 8" — cite the issue instead), contractions, and sentences
+over 25 words. Your change may not *add* one to a file it touches; the
+legacy population stays until someone chooses to fix it. There is no
+baseline file to regenerate, so fix the flagged line. See
+`docs/audits/README.md`.
 
 ## Database Migrations
 

@@ -303,8 +303,9 @@ jobs:
       # point: Tier A (commented-out code, an unreferenced TODO, a narrative
       # aside, a blank comment line at a block edge) is at zero and must stay
       # there; Tier B (review-round archaeology, contractions, sentences over
-      # ASD-STE100's 25-word ceiling) is frozen at its legacy count in
-      # docs/audits/comment-hygiene-baseline.json and may only fall.
+      # ASD-STE100's 25-word ceiling) is ratcheted against the merge base --
+      # a change may not ADD one to a file it touches, and the legacy
+      # population stays until someone chooses to fix it.
       #
       # This deliberately does NOT cap comment length. The long rationale
       # blocks in this tree are load-bearing — the ABBA lock-ordering argument

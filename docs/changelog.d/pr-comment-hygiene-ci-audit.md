@@ -120,3 +120,42 @@ Verified across all five paths: base drift on an untouched file passes; a
 CH006/CH007 regression in a file the branch does touch exits 1 naming both
 rules; a Tier A defect exits 1 regardless of scope; an unknown ref and a
 missing `--base` both degrade to report-only at exit 0.
+
+**Second Codex round (PR #1380): four more P2 findings, all verified real.**
+
+- *`/*!` evaded the gate.* The lexer recognised the marker but advanced only
+  past `/*`, leaving `!` on the body so the anchored rules missed
+  `/*! TODO */` and `/*! let stale = 1; */`. Now advances past the whole
+  marker, with a guard so `/**/` (an empty comment, not a doc marker) does not
+  eat its own terminator and swallow the rest of the file.
+- *CH001 false-positived on prose.* The `fn` alternative accepted anything
+  after the opening paren, so `// fn foo() is called by the wrapper.` was
+  reported as commented-out code — a false positive that fails CI on ordinary
+  prose, contradicting the terminator-bearing heuristic every other
+  alternative follows. It now requires a real terminator (`{`, `;`, or an
+  open paren at end of line for a wrapped signature).
+- *A count-neutral swap passed.* Removing one legacy violation and adding a
+  different one in the same file left the count unchanged and the gate green.
+  Demonstrated live: a new `// A newly introduced defect: this isn't
+  compliant.` in `event.rs` passed because CH006 stayed at 1.
+- *Renames failed.* A baselined file moved to a new path had no entry, so all
+  its legacy findings read as new — 24 spurious regressions for a pure rename
+  of `history_export.rs`, comments untouched.
+
+The last two share a root cause, so both are fixed by one change rather than
+two patches: **the stored baseline is gone.** The harness now reads the merge
+base out of git (`git show <merge-base>:<path>`) and re-scans each changed
+file as it stood there, matching findings by fingerprint (rule + normalized
+text) instead of counting them. That kills the whole class at once — it cannot
+go stale when the base moves, there is no regeneration ritual to launder a
+violation through, a renamed file is compared against its own previous path,
+and 532 KB of generated fingerprints stay out of the tree. Identities rather
+than counts also mean a swap is caught: the total never moves, but the new
+fingerprint is not in the allowed set.
+
+Verified across eight cases in an isolated worktree: count-neutral swap fails;
+pure rename passes (and reports "1 renamed"); a new Tier B finding in a
+touched file fails; Tier A fails anywhere; `/*! TODO */` fails; `// fn foo()
+is called by the wrapper.` passes; a newly added file is allowed nothing, so
+its findings fail; base drift on an untouched file passes; and both
+degradation paths (no `--base`, unknown ref) report at exit 0.
