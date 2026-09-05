@@ -7373,11 +7373,22 @@ pub async fn persist_workflow_completion(
     // Issue #1243: the configured payload-codec registry, so this write
     // encodes under the same codecs replay decodes with.
     codecs: &crate::payload_codec::PayloadCodecs,
+    // issue #1197, item 1 (Codex round 2, P1): this function's own
+    // `conn.transaction()` below is demoted to a SAVEPOINT when called (as it
+    // always is in production, via `persist_workflow_outcome`) from inside
+    // `process_workflow_task`'s outer persist transaction -- so emitting
+    // right after that inner savepoint releases is NOT actually post-commit;
+    // the outer transaction can still roll it back (e.g. the
+    // `WORKER_PERSIST_BEFORE_COMMIT` chaos point, or any later failure in
+    // that same closure). Collected samples are appended to the CALLER's
+    // vector instead of emitted here; the caller must emit them only after
+    // its own outermost transaction commits.
+    pending_cancel_metrics: &mut Vec<crate::execution::StartCancelledRun>,
 ) -> HarvestResult<(ExecutionId, Option<String>)> {
     let event = WorkflowEvent::WorkflowCompleted {
         output: output.clone(),
     };
-    let (deferred, closed_children, pending_cancel_metrics) =
+    let (deferred, closed_children, tx_cancel_metrics) =
         Box::pin(conn.transaction::<_, HarvestError, _>(async |conn| {
             // Issue #1184: re-derive the task-row claim under its own lock
             // before committing this completion. The execution row lock this
@@ -7399,17 +7410,17 @@ pub async fn persist_workflow_completion(
             update_workflow_execution_completed(conn, exec_id, worker_id, &output).await?;
             queue::complete_task(conn, task_id, output).await?;
             let (mut deferred, closed_children) = apply_parent_close_cascade(conn, exec_id).await?;
-            let mut pending_cancel_metrics = Vec::new();
+            let mut tx_cancel_metrics = Vec::new();
             let triggers = crate::completion_trigger::evaluate_triggers_for_execution_collecting(
                 conn,
                 exec_id,
                 crate::completion_trigger::TerminalState::Completed,
                 metrics,
-                &mut pending_cancel_metrics,
+                &mut tx_cancel_metrics,
             )
             .await?;
             deferred.extend(triggers);
-            Ok((deferred, closed_children, pending_cancel_metrics))
+            Ok((deferred, closed_children, tx_cancel_metrics))
         }))
         .await?;
 
@@ -7417,12 +7428,7 @@ pub async fn persist_workflow_completion(
         start.spawn();
     }
 
-    // issue #1197, item 1: emitted only now that this transaction has
-    // actually committed -- see `evaluate_triggers_for_execution_collecting`'s
-    // doc for why an eager emission inside the closure would be unsound.
-    if let Some(m) = metrics {
-        crate::execution::emit_start_cancel_metrics(m, &pending_cancel_metrics);
-    }
+    pending_cancel_metrics.extend(tx_cancel_metrics);
 
     for (child_id, child_name) in closed_children {
         check_and_report_unfinished_handlers_for_worker(conn, child_id, Some(&child_name), metrics)
@@ -7481,6 +7487,10 @@ pub async fn persist_workflow_failure(
     // Issue #1243: the configured payload-codec registry, so this write
     // encodes under the same codecs replay decodes with.
     codecs: &crate::payload_codec::PayloadCodecs,
+    // issue #1197, item 1 (Codex round 2, P1): see `persist_workflow_completion`'s
+    // identical parameter doc — this function's own transaction is a SAVEPOINT,
+    // not a real commit, when reached via `persist_workflow_outcome`.
+    pending_cancel_metrics: &mut Vec<crate::execution::StartCancelledRun>,
 ) -> HarvestResult<(bool, (ExecutionId, Option<String>))> {
     let error = error.to_string();
     // Decode the typed failure envelope once (issue #767). A legacy `Err(String)`
@@ -7580,7 +7590,7 @@ pub async fn persist_workflow_failure(
         (*rid, policy.clone(), *attempt, fire_at, start_delay)
     });
 
-    let (deferred, retry_scheduled, deferred_checks, pending_cancel_metrics) =
+    let (deferred, retry_scheduled, deferred_checks, tx_cancel_metrics) =
         Box::pin(conn.transaction::<(
             Vec<crate::completion_trigger::DeferredTriggerStart>,
             bool,
@@ -7743,7 +7753,7 @@ pub async fn persist_workflow_failure(
                 }
             }
 
-            let mut pending_cancel_metrics = Vec::new();
+            let mut tx_cancel_metrics = Vec::new();
             if !retry_committed {
                 let (cascade, closed_children) = apply_parent_close_cascade(conn, exec_id).await?;
                 deferred.extend(cascade);
@@ -7754,7 +7764,7 @@ pub async fn persist_workflow_failure(
                         exec_id,
                         crate::completion_trigger::TerminalState::Failed,
                         metrics,
-                        &mut pending_cancel_metrics,
+                        &mut tx_cancel_metrics,
                     )
                     .await?;
                 deferred.extend(triggers);
@@ -7764,16 +7774,16 @@ pub async fn persist_workflow_failure(
                 deferred,
                 retry_committed,
                 deferred_checks,
-                pending_cancel_metrics,
+                tx_cancel_metrics,
             ))
         }))
         .await?;
 
-    // issue #1197, item 1: emitted only now that this transaction has
-    // actually committed.
-    if let Some(m) = metrics {
-        crate::execution::emit_start_cancel_metrics(m, &pending_cancel_metrics);
-    }
+    // issue #1197, item 1 (Codex round 2, P1): NOT necessarily post-commit —
+    // see this function's `pending_cancel_metrics` parameter doc. Append to
+    // the caller's vector instead of emitting; the caller emits only after
+    // its own outermost transaction commits.
+    pending_cancel_metrics.extend(tx_cancel_metrics);
 
     if retry_scheduled
         && let (Some(exec), Some((_, _, attempt, _, _))) = (execution, &retry_fire_info)
@@ -11976,6 +11986,8 @@ pub async fn fail_task_and_execution_with_history(
             None,
             crate::types::Priority::default(),
             codecs,
+            // `metrics: None` above -- nothing can ever be collected here.
+            &mut Vec::new(),
         )
         .await
         .map(|_| ())
@@ -12374,12 +12386,15 @@ pub async fn persist_child_workflow_completion(
     // Issue #1243: the configured payload-codec registry, so this write
     // encodes under the same codecs replay decodes with.
     codecs: &crate::payload_codec::PayloadCodecs,
+    // issue #1197, item 1 (Codex round 2, P1): see `persist_workflow_completion`'s
+    // identical parameter doc.
+    pending_cancel_metrics: &mut Vec<crate::execution::StartCancelledRun>,
 ) -> HarvestResult<(ExecutionId, Option<String>)> {
     let event = WorkflowEvent::WorkflowCompleted {
         output: output.clone(),
     };
 
-    let (deferred, closed_children, pending_cancel_metrics) =
+    let (deferred, closed_children, tx_cancel_metrics) =
         Box::pin(conn.transaction::<_, HarvestError, _>(async |conn| {
             let output = output.clone();
             // Issue #1184: same task-row ownership recheck as
@@ -12393,18 +12408,18 @@ pub async fn persist_child_workflow_completion(
             update_workflow_execution_completed(conn, exec_id, worker_id, &output).await?;
             queue::complete_task(conn, task_id, output.clone()).await?;
             let (mut deferred, closed_children) = apply_parent_close_cascade(conn, exec_id).await?;
-            let mut pending_cancel_metrics = Vec::new();
+            let mut tx_cancel_metrics = Vec::new();
             let triggers = crate::completion_trigger::evaluate_triggers_for_execution_collecting(
                 conn,
                 exec_id,
                 crate::completion_trigger::TerminalState::Completed,
                 metrics,
-                &mut pending_cancel_metrics,
+                &mut tx_cancel_metrics,
             )
             .await?;
             deferred.extend(triggers);
             wake_parent_for_child_completion(conn, parent_exec_id, exec_id, output).await?;
-            Ok((deferred, closed_children, pending_cancel_metrics))
+            Ok((deferred, closed_children, tx_cancel_metrics))
         }))
         .await?;
 
@@ -12412,11 +12427,9 @@ pub async fn persist_child_workflow_completion(
         start.spawn();
     }
 
-    // issue #1197, item 1: emitted only now that this transaction has
-    // actually committed.
-    if let Some(m) = metrics {
-        crate::execution::emit_start_cancel_metrics(m, &pending_cancel_metrics);
-    }
+    // issue #1197, item 1 (Codex round 2, P1): NOT necessarily post-commit —
+    // see this function's `pending_cancel_metrics` parameter doc.
+    pending_cancel_metrics.extend(tx_cancel_metrics);
 
     for (child_id, child_name) in closed_children {
         check_and_report_unfinished_handlers_for_worker(conn, child_id, Some(&child_name), metrics)
@@ -12442,6 +12455,9 @@ pub async fn persist_child_workflow_failure(
     // Issue #1243: the configured payload-codec registry, so this write
     // encodes under the same codecs replay decodes with.
     codecs: &crate::payload_codec::PayloadCodecs,
+    // issue #1197, item 1 (Codex round 2, P1): see `persist_workflow_completion`'s
+    // identical parameter doc.
+    pending_cancel_metrics: &mut Vec<crate::execution::StartCancelledRun>,
 ) -> HarvestResult<(ExecutionId, Option<String>)> {
     // Decode the child's typed failure envelope once (issue #767). The child's own
     // `WorkflowFailed` event carries the full typed fields; its `execution.error`
@@ -12451,7 +12467,7 @@ pub async fn persist_child_workflow_failure(
     let decoded = crate::failure::decode_workflow_failure(error);
     let workflow_failure = WorkflowEvent::workflow_failed_typed(&decoded);
 
-    let (deferred, closed_children, pending_cancel_metrics) =
+    let (deferred, closed_children, tx_cancel_metrics) =
         Box::pin(conn.transaction::<_, HarvestError, _>(async |conn| {
             let raw_error = error.to_string();
             let message = decoded.message.clone();
@@ -12472,18 +12488,18 @@ pub async fn persist_child_workflow_failure(
                 .await?;
             queue::fail_task(conn, task_id, &message).await?;
             let (mut deferred, closed_children) = apply_parent_close_cascade(conn, exec_id).await?;
-            let mut pending_cancel_metrics = Vec::new();
+            let mut tx_cancel_metrics = Vec::new();
             let triggers = crate::completion_trigger::evaluate_triggers_for_execution_collecting(
                 conn,
                 exec_id,
                 crate::completion_trigger::TerminalState::Failed,
                 metrics,
-                &mut pending_cancel_metrics,
+                &mut tx_cancel_metrics,
             )
             .await?;
             deferred.extend(triggers);
             wake_parent_for_child_failure(conn, parent_exec_id, exec_id, &raw_error).await?;
-            Ok((deferred, closed_children, pending_cancel_metrics))
+            Ok((deferred, closed_children, tx_cancel_metrics))
         }))
         .await?;
 
@@ -12491,11 +12507,9 @@ pub async fn persist_child_workflow_failure(
         start.spawn();
     }
 
-    // issue #1197, item 1: emitted only now that this transaction has
-    // actually committed.
-    if let Some(m) = metrics {
-        crate::execution::emit_start_cancel_metrics(m, &pending_cancel_metrics);
-    }
+    // issue #1197, item 1 (Codex round 2, P1): NOT necessarily post-commit —
+    // see this function's `pending_cancel_metrics` parameter doc.
+    pending_cancel_metrics.extend(tx_cancel_metrics);
 
     for (child_id, child_name) in closed_children {
         check_and_report_unfinished_handlers_for_worker(conn, child_id, Some(&child_name), metrics)
@@ -15958,6 +15972,8 @@ async fn reject_child_continue_as_new(
             None,
             crate::types::Priority::default(),
             codecs,
+            // `metrics: None` above -- nothing can ever be collected here.
+            &mut Vec::new(),
         )
         .await?;
     } else {
@@ -15973,6 +15989,8 @@ async fn reject_child_continue_as_new(
             None,
             None,
             codecs,
+            // `metrics: None` above -- nothing can ever be collected here.
+            &mut Vec::new(),
         )
         .await?;
     }
@@ -16090,6 +16108,8 @@ async fn check_continue_as_new_type<'a>(
         None,
         crate::types::Priority::default(),
         registry.payload_codecs(),
+        // `metrics: None` above -- nothing can ever be collected here.
+        &mut Vec::new(),
     )
     .await?;
     Ok(ContinueAsNewTypeCheck::Rejected)
@@ -16758,6 +16778,8 @@ pub async fn persist_workflow_continue_as_new(
             None,
             crate::types::Priority::default(),
             registry.payload_codecs(),
+            // `metrics: None` above -- nothing can ever be collected here.
+            &mut Vec::new(),
         )
         .await?;
         return Ok(());
@@ -16970,6 +16992,12 @@ async fn persist_workflow_outcome(
     // inline), and also threads it into the `SuspendedWorkflowContext`. Empty for
     // every non-suspension outcome and for a pure suspension.
     resolved_inline_external: ResolvedExternalIds,
+    // issue #1197, item 1 (Codex round 2, P1): threaded straight through to
+    // whichever leaf persist function below actually runs, for the CALLER to
+    // emit only after its own outermost transaction commits — see
+    // `persist_workflow_completion`'s identical parameter doc for why this
+    // function's own callers cannot safely emit these themselves.
+    pending_cancel_metrics: &mut Vec<crate::execution::StartCancelledRun>,
 ) -> HarvestResult<(bool, Vec<(ExecutionId, Option<String>)>)> {
     let parent_exec_id = execution.parent_id.map(execution_id_from_uuid);
     // A detached child has parent_close_policy set (non-null). Detached children
@@ -16989,6 +17017,7 @@ async fn persist_workflow_outcome(
                 output,
                 Some(registry.telemetry().metrics.as_ref()),
                 registry.payload_codecs(),
+                pending_cancel_metrics,
             )
             .await?;
             Ok((false, vec![res]))
@@ -17006,6 +17035,7 @@ async fn persist_workflow_outcome(
                 Some(registry.telemetry().metrics.as_ref()),
                 registry.payload_offloader(),
                 registry.payload_codecs(),
+                pending_cancel_metrics,
             )
             .await?;
             if update_schedule_counter {
@@ -17040,6 +17070,7 @@ async fn persist_workflow_outcome(
                 non_deterministic_details.as_ref(),
                 Some(registry.telemetry().metrics.as_ref()),
                 registry.payload_codecs(),
+                pending_cancel_metrics,
             )
             .await?;
             if update_schedule_counter {
@@ -17084,6 +17115,7 @@ async fn persist_workflow_outcome(
                     .and_then(|c| u32::try_from(c).ok()),
                 crate::types::Priority::from_i32(persistence.task.priority).unwrap_or_default(),
                 registry.payload_codecs(),
+                pending_cancel_metrics,
             )
             .await?;
             if update_schedule_counter && !retry_scheduled {
@@ -17338,6 +17370,15 @@ enum WorkflowPersistFlow {
         /// before commit could run against a cancellation that later rolls
         /// back if this transaction fails.
         race_deferred_triggers: Vec<crate::completion_trigger::DeferredTriggerStart>,
+        /// Latest-wins supersede cancellation samples collected while
+        /// persisting this outcome (issue #1197, item 1). This whole
+        /// transaction may itself be a SAVEPOINT nested inside an even
+        /// larger caller transaction (none exists above this function today,
+        /// but the leaf persist functions cannot assume that), so these are
+        /// collected rather than emitted; the caller emits them via
+        /// `execution::emit_start_cancel_metrics` only after confirming this
+        /// match arm was reached, i.e. after the real outer commit.
+        pending_cancel_metrics: Vec<crate::execution::StartCancelledRun>,
     },
 }
 
@@ -17429,6 +17470,9 @@ async fn persist_terminal_outcome_commands(
     // abandoned-dispatch record can never duplicate one.
     recorded_dispatches: &RecordedDispatchIds,
     execute_span: &tracing::Span,
+    // issue #1197, item 1 (Codex round 2, P1): threaded straight through to
+    // `persist_workflow_outcome` — see its identical parameter doc.
+    pending_cancel_metrics: &mut Vec<crate::execution::StartCancelledRun>,
 ) -> HarvestResult<(
     bool,
     Vec<(ExecutionId, Option<String>)>,
@@ -17565,6 +17609,7 @@ async fn persist_terminal_outcome_commands(
         // Terminal-with-commands path never suspends, so no inline external
         // wake is threaded here (issue #678).
         ResolvedExternalIds::default(),
+        pending_cancel_metrics,
     )
     .await?;
     Ok((retry_scheduled, deferred_checks, race_deferred_triggers))
@@ -20059,6 +20104,7 @@ async fn process_workflow_task(
                 clear_nd_block(conn, persistence.exec_id).await?;
             }
 
+            let mut pending_cancel_metrics = Vec::new();
             let (retry_scheduled, deferred_checks, race_deferred_triggers) =
                 if is_terminal_with_commands {
                     persist_terminal_outcome_commands(
@@ -20070,6 +20116,7 @@ async fn process_workflow_task(
                         &pending_cmds,
                         &recorded_dispatches,
                         &execute_span,
+                        &mut pending_cancel_metrics,
                     )
                     .await?
                 } else {
@@ -20085,6 +20132,7 @@ async fn process_workflow_task(
                         // resolved inline this cycle into the Suspended arm
                         // so a mixed timer + external op self-wakes.
                         resolved_inline_external,
+                        &mut pending_cancel_metrics,
                     )
                     .await?;
                     (retry_scheduled, deferred_checks, Vec::new())
@@ -20099,6 +20147,7 @@ async fn process_workflow_task(
                 retry_scheduled,
                 deferred_checks,
                 race_deferred_triggers,
+                pending_cancel_metrics,
             })
         },
     ))
@@ -20113,6 +20162,7 @@ async fn process_workflow_task(
             retry_scheduled,
             deferred_checks,
             race_deferred_triggers,
+            pending_cancel_metrics,
         }) => {
             // Chaos: kill/delay after the outer persist commit but before the
             // deferred-trigger fan-out — committed work whose in-process
@@ -20126,6 +20176,20 @@ async fn process_workflow_task(
             for start in race_deferred_triggers {
                 start.spawn();
             }
+
+            // issue #1197, item 1 (Codex round 2, P1): emitted only now that
+            // the OUTER `persist_flow` transaction above has actually
+            // committed — reaching this match arm at all proves it did.
+            // Emitting inside `persist_workflow_completion`/`_failure` (etc.)
+            // right after their own inner transaction would be unsound here:
+            // that inner transaction is a SAVEPOINT under this one, and the
+            // `WORKER_PERSIST_BEFORE_COMMIT` chaos point above (or any other
+            // later failure in this same closure) can still roll the whole
+            // thing back after it "commits".
+            crate::execution::emit_start_cancel_metrics(
+                registry.telemetry().metrics.as_ref(),
+                &pending_cancel_metrics,
+            );
 
             // Deferred best-effort schedule counters, in autocommit post-commit.
             // When a retry was scheduled the failure-counter increment is
