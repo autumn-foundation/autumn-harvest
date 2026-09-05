@@ -2527,7 +2527,15 @@ async fn list_workers_ui(
     Extension(api_state): Extension<HarvestApiState>,
     Query(params): Query<WorkerListParams>,
 ) -> Result<Markup, AutumnError> {
-    let (status_filter, stale_only) = parse_worker_ui_filters(&params)?;
+    // Issue: an unrecognized status/stale value used to `?`-abort the whole
+    // page (bare 400, no HTML) before the filter form was ever rendered,
+    // discarding the build_id/shard filters the operator had already
+    // entered. `parse_worker_status_filter`/`parse_worker_stale_filter`
+    // instead degrade to "filter not applied" and hand back an error to
+    // redisplay inline, so a bad value costs one field, not the page — same
+    // fix as `parse_started_bound` on the Workflows page (#1333).
+    let (status_filter, status_error) = parse_worker_status_filter(params.status.as_deref());
+    let (stale_only, stale_error) = parse_worker_stale_filter(params.stale.as_deref());
 
     let limit = params
         .limit
@@ -2623,39 +2631,54 @@ async fn list_workers_ui(
         limit,
         has_next,
         status_filter,
+        status_error.as_deref(),
         params.shard,
         stale_only,
+        stale_error.as_deref(),
         build_id_filter,
         params.refresh,
     ))
 }
 
-fn parse_worker_ui_filters(
-    params: &WorkerListParams,
-) -> Result<(Option<&'static str>, bool), AutumnError> {
-    let status_filter = match params.status.as_deref().map(str::trim) {
-        None | Some("") => None,
-        Some(s) => Some(match s.to_lowercase().as_str() {
-            "active" => "Active",
-            "draining" => "Draining",
-            "stopped" => "Stopped",
-            other => {
-                return Err(AutumnError::bad_request_msg(format!(
-                    "unknown status '{other}'; expected one of Active, Draining, Stopped"
-                )));
-            }
-        }),
+/// Parses the Workers page's `status` filter from a raw query-string value.
+/// Returns `(parsed, error)`: on success `error` is `None`; on an
+/// unrecognized value `parsed` is `None` (the filter is not applied) while
+/// `error` carries a message to render next to the field — so a bad value
+/// drops one filter instead of the whole page (see `list_workers_ui`).
+fn parse_worker_status_filter(raw: Option<&str>) -> (Option<&'static str>, Option<String>) {
+    let Some(trimmed) = raw.map(str::trim).filter(|v| !v.is_empty()) else {
+        return (None, None);
     };
-    let stale_only = match params.stale.as_deref().map(str::trim) {
-        None | Some("" | "false") => false,
-        Some("true") => true,
-        Some(other) => {
-            return Err(AutumnError::bad_request_msg(format!(
-                "unknown stale value '{other}'; expected 'true' or 'false'"
-            )));
-        }
+    match trimmed.to_lowercase().as_str() {
+        "active" => (Some("Active"), None),
+        "draining" => (Some("Draining"), None),
+        "stopped" => (Some("Stopped"), None),
+        other => (
+            None,
+            Some(format!(
+                "Unknown status '{other}'; expected Active, Draining, or Stopped. Filter not applied."
+            )),
+        ),
+    }
+}
+
+/// Parses the Workers page's `stale` filter from a raw query-string value.
+/// Returns `(parsed, error)` with the same "filter not applied, error
+/// redisplayed inline" contract as [`parse_worker_status_filter`].
+fn parse_worker_stale_filter(raw: Option<&str>) -> (bool, Option<String>) {
+    let Some(trimmed) = raw.map(str::trim).filter(|v| !v.is_empty()) else {
+        return (false, None);
     };
-    Ok((status_filter, stale_only))
+    match trimmed {
+        "false" => (false, None),
+        "true" => (true, None),
+        other => (
+            false,
+            Some(format!(
+                "Unknown stale value '{other}'; expected 'true' or 'false'. Filter not applied."
+            )),
+        ),
+    }
 }
 
 /// A paused queue as rendered on the Workers page, merged across shards.
@@ -3856,8 +3879,10 @@ fn render_workers_page(
     limit: i64,
     has_next: bool,
     status_filter: Option<&str>,
+    status_error: Option<&str>,
     shard_filter: Option<i32>,
     stale_only: bool,
+    stale_error: Option<&str>,
     build_id_filter: Option<&str>,
     refresh: Option<u64>,
 ) -> Markup {
@@ -3873,7 +3898,7 @@ fn render_workers_page(
         (render_paused_queues_banner(&paused_queues.rows, &paused_queues.unreadable_shards))
 
         // Filters
-        (render_worker_filters(status_filter, shard_filter, stale_only, build_id_filter, limit))
+        (render_worker_filters(status_filter, status_error, shard_filter, stale_only, stale_error, build_id_filter, limit))
 
         // Worker table (grouped by shard if multi-shard)
         @if total_workers == 0 && shard_errors.is_empty() {
@@ -3988,10 +4013,13 @@ fn render_worker_table(rows: &[WorkerRow], shard_id: ShardId) -> Markup {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn render_worker_filters(
     status_filter: Option<&str>,
+    status_error: Option<&str>,
     shard_filter: Option<i32>,
     stale_only: bool,
+    stale_error: Option<&str>,
     build_id_filter: Option<&str>,
     limit: i64,
 ) -> Markup {
@@ -4007,6 +4035,9 @@ fn render_worker_filters(
                         option value=(s) selected[status_filter == Some(s)] { (s) }
                     }
                 }
+                @if let Some(error) = status_error {
+                    span.field-error role="alert" { (error) }
+                }
             }
             label {
                 "Build ID"
@@ -4021,6 +4052,9 @@ fn render_worker_filters(
                 select name="stale" {
                     option value="" selected[!stale_only] { "All" }
                     option value="true" selected[stale_only] { "Stale only" }
+                }
+                @if let Some(error) = stale_error {
+                    span.field-error role="alert" { (error) }
                 }
             }
             label {
@@ -12496,11 +12530,105 @@ mod tests {
 
     #[test]
     fn render_worker_filters_includes_build_id_filter() {
-        let html = render_worker_filters(None, None, false, None, DEFAULT_PAGE_SIZE).into_string();
+        let html = render_worker_filters(None, None, None, false, None, None, DEFAULT_PAGE_SIZE)
+            .into_string();
         assert!(
             html.contains("build_id"),
             "worker filters must include build_id input"
         );
+    }
+
+    #[test]
+    fn render_worker_filters_shows_inline_errors() {
+        let html = render_worker_filters(
+            None,
+            Some("Unknown status 'zombie'; expected Active, Draining, or Stopped. Filter not applied."),
+            None,
+            false,
+            Some("Unknown stale value 'True'; expected 'true' or 'false'. Filter not applied."),
+            None,
+            DEFAULT_PAGE_SIZE,
+        )
+        .into_string();
+        assert!(
+            html.contains("field-error") && html.contains("zombie"),
+            "status error must render inline: {html}"
+        );
+        assert!(
+            html.contains("True"),
+            "stale error must render inline: {html}"
+        );
+    }
+
+    #[test]
+    fn parse_worker_status_filter_accepts_known_values_case_insensitively() {
+        assert_eq!(
+            parse_worker_status_filter(Some("Active")),
+            (Some("Active"), None)
+        );
+        assert_eq!(
+            parse_worker_status_filter(Some("draining")),
+            (Some("Draining"), None)
+        );
+        assert_eq!(
+            parse_worker_status_filter(Some("STOPPED")),
+            (Some("Stopped"), None)
+        );
+    }
+
+    /// GREEN — the fix under test: an unrecognized status no longer aborts
+    /// `list_workers_ui`. It degrades to "filter not applied" (parsed is
+    /// `None`) while carrying a recovery message, so the page can redisplay
+    /// the form inline instead of discarding it — same contract as
+    /// `parse_started_bound` on the Workflows page (#1333). Before this
+    /// change, `parse_worker_ui_filters` `?`-propagated a bare
+    /// `AutumnError::bad_request_msg` here, which aborted the whole
+    /// `/workers` response before the filter form (or the build_id/shard
+    /// filters the operator had already typed) was ever rendered — see the
+    /// RED baseline in
+    /// `tests/ui_integration.rs::ui_workers_unknown_status_value_redisplays_form_instead_of_aborting_page`.
+    #[test]
+    fn parse_worker_status_filter_rejects_unknown_value_without_erroring() {
+        let (parsed, error) = parse_worker_status_filter(Some("zombie"));
+        assert_eq!(parsed, None, "an invalid status must not be applied");
+        let error = error.expect("an invalid status must carry a redisplayable error");
+        assert!(
+            error.contains("zombie") && error.contains("Active"),
+            "error names the bad value and a valid option: {error}"
+        );
+    }
+
+    #[test]
+    fn parse_worker_status_filter_blank_or_missing_is_not_an_error() {
+        assert_eq!(parse_worker_status_filter(None), (None, None));
+        assert_eq!(parse_worker_status_filter(Some("   ")), (None, None));
+    }
+
+    #[test]
+    fn parse_worker_stale_filter_accepts_true_and_false() {
+        assert_eq!(parse_worker_stale_filter(Some("true")), (true, None));
+        assert_eq!(parse_worker_stale_filter(Some("false")), (false, None));
+    }
+
+    /// Same fix, applied to the `stale` field: an unrecognized value (e.g.
+    /// the very plausible `True`, since matching is case-sensitive by
+    /// design — see the field's existing semantics) no longer `?`-aborts the
+    /// page.
+    #[test]
+    fn parse_worker_stale_filter_rejects_unknown_value_without_erroring() {
+        let (parsed, error) = parse_worker_stale_filter(Some("True"));
+        assert!(!parsed, "an invalid stale value must not be applied");
+        let error = error.expect("an invalid stale value must carry a redisplayable error");
+        assert!(
+            error.contains("True") && error.contains("true"),
+            "error names the bad value and the expected values: {error}"
+        );
+    }
+
+    #[test]
+    fn parse_worker_stale_filter_blank_or_missing_is_not_an_error() {
+        assert_eq!(parse_worker_stale_filter(None), (false, None));
+        assert_eq!(parse_worker_stale_filter(Some("   ")), (false, None));
     }
 
     #[test]
