@@ -300,33 +300,153 @@ jobs:
       - name: Run classic (non-unified) DAG tests
         if: needs.changes.outputs.code == 'true'
         run: cargo test -p autumn-harvest --no-default-features --features db --lib
-      - name: Compile db-backed tests
+      # Everything else non-DB used to run here too: ~30 individual crate/example
+      # `cargo test`/`build` steps plus the manifest-driven `compile`/`run allos`
+      # steps, all serial in this one leg. Split into the `test-nodb` job below,
+      # sharded 4-way per OS (docs/rnd/2026-09-04-ci-health-semaphore-followup.md
+      # measured the manifest `compile`+`run allos` pair alone at ~38% of the
+      # `windows-latest` leg) — see that job's comment for the full rationale,
+      # matching the `test-db-linux` split below it for the Docker-backed rows.
+      # `Run no-db tests` and `Run classic (non-unified) DAG tests` above stay
+      # here as this leg's own fast smoke check.
+      # Issue #684's signal/update-metric run targets SPECIFIC test paths across
+      # two modules (a multi-token `--` filter), which the single-`filter`-column
+      # manifest schema cannot represent; it stays a literal Docker-backed step.
+      - name: Run Docker-backed signal/update metric integration tests (issue #684)
+        if: runner.os == 'Linux' && needs.changes.outputs.code == 'true'
+        run: cargo test -p autumn-harvest --test integration -- metrics_integration::update_completed_metric_fires_on_the_suspend_path nd_block_tests::genuine_terminal_with_undrained_signal_emits_signal_unhandled nd_block_tests::nd_blocked_cycle_does_not_emit_signal_unhandled --test-threads=1
+      # Issue #944's Kafka broker suite stays a literal Linux-only step rather
+      # than a manifest row: it needs the apt install below first, and the
+      # manifest's `compile` mode would try to build vendored librdkafka on the
+      # macOS and Windows legs too. Its ALLOWLIST entry in `ci_run_coverage.rs`
+      # points here. (The SQS broker suite IS a manifest row — `aws-sdk-sqs` is
+      # pure Rust and compiles everywhere.)
+      - name: Install librdkafka build deps (Linux)
+        if: runner.os == 'Linux' && needs.changes.outputs.code == 'true'
+        run: sudo apt-get update && sudo apt-get install -y libcurl4-openssl-dev
+      - name: Run plugin Kafka broker connector tests (issue #944)
+        if: runner.os == 'Linux' && needs.changes.outputs.code == 'true'
+        run: cargo test -p autumn-harvest-plugin --features kafka --test connector_kafka_broker -- --test-threads=1
+
+  # Split out of `test`'s three OS legs (docs/rnd/2026-09-04-ci-health-semaphore-followup.md):
+  # with the `linux`/`linuxpart` Docker-backed rows already moved to
+  # `test-db-linux` below, the next-largest cost on the still-serial `test` leg
+  # was the REST of its non-DB work -- ~30 individual crate/example
+  # `cargo test`/`cargo build` steps plus the two manifest-driven
+  # `run-suites.sh compile` / `run-suites.sh run allos` steps -- measured on
+  # `windows-latest` (the leg that split left as the long pole) at ~38% of that
+  # leg's wall time for the manifest pair alone (28.3 + 13.8 of 110.9 minutes),
+  # with `Compile db-backed tests` and `Run all-features lib tests` adding
+  # more. None of it needs a live database, so it shards freely: every shard
+  # gets its own checkout and its own slice of the work, in parallel, on every
+  # OS `test` itself runs on.
+  #
+  # Two sharding mechanisms meet here:
+  #   * The manifest-driven steps (`compile`, `run allos`) use `run-suites.sh`'s
+  #     OWN row-ordinal sharding (SEMAPHORE_SHARD_COUNT/INDEX below) -- every
+  #     shard runs the SAME two steps, each processing a disjoint slice of the
+  #     manifest rows. See run-suites.sh's header comment for why a filtered,
+  #     already-sorted row list still batches correctly.
+  #   * The ~30 individual steps carried over from `test` have no such
+  #     mechanism (each is its own crate/example, not a manifest row), so they
+  #     are round-robin assigned to one shard each via `matrix.shard == N` --
+  #     by COUNT, not by measured per-step time (no such measurement exists for
+  #     macOS/Windows), so the four shards are approximately, not exactly, even.
+  #
+  # A SEPARATE job, not a matrix dimension added to `test`, for the same reason
+  # `test-db-linux` is one: `test`'s three legs are branch-protection required
+  # checks BY NAME, and adding a dimension to that job would change those
+  # checks' identities. This job runs alongside `test` instead.
+  #
+  # IMPORTANT — not yet enforced: like `test-db-linux` below, this job is NOT a
+  # required status check. Branch protection must be updated by a repo admin
+  # (Settings -> Branches) to require `Test (no-db, <os>, shard N)` for every
+  # OS x shard combination below, or a red shard will not block merging -- see
+  # the `test-db-linux` job's comment and
+  # docs/rnd/2026-09-04-ci-health-semaphore-followup.md for the same gap,
+  # already open for that job's 10 shards.
+  test-nodb:
+    name: "Test (no-db, ${{ matrix.os }}, shard ${{ matrix.shard }})"
+    needs: [lint, changes]
+    # Same draft-skip / step-level docs-only gating pattern as `test` and
+    # `test-db-linux` (see their comments): job-level `if:` only gates draft-PR
+    # pushes, so every OS x shard leg still spins up and reports a conclusion;
+    # `needs.changes.outputs.code` gates the actual work per step.
+    if: github.event_name != 'pull_request' || github.event.pull_request.draft == false
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+        # Must stay length 4 to match SEMAPHORE_SHARD_COUNT below (see
+        # `test-db-linux`'s identical caveat -- GitHub Actions matrix
+        # expressions can't derive one count from the other).
+        shard: [0, 1, 2, 3]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          # Shared across a given OS's 4 shards (they build the same
+          # Cargo.lock), so a shard needing a binary another shard already
+          # built doesn't start cold -- same reasoning as `test-db-linux`'s
+          # `shared-key`, but per-OS since these three OSes don't share a cache.
+          shared-key: test-nodb-${{ matrix.os }}
+      # Same disk-pressure guard as the pre-split `test` job carried
+      # immediately before this step; every shard on Linux gets its own runner,
+      # so it's cheap (a few seconds) to run per shard rather than build a
+      # cross-shard skip mechanism for it.
+      - name: Free runner disk before heavy plugin link (Linux)
+        if: runner.os == 'Linux' && needs.changes.outputs.code == 'true'
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+            /usr/local/share/boost /usr/lib/jvm "$AGENT_TOOLSDIRECTORY" || true
+          sudo docker image prune --all --force > /dev/null 2>&1 || true
+          df -h /
+      # ── Manifest-driven, self-sharded (every shard runs both, each on its
+      # own slice of the matching rows) ───────────────────────────────────
+      - name: Compile plugin integration test suites (manifest, all OSes)
         if: needs.changes.outputs.code == 'true'
+        shell: bash
+        env:
+          SEMAPHORE_SHARD_COUNT: "4"
+          SEMAPHORE_SHARD_INDEX: ${{ matrix.shard }}
+        run: bash .github/ci/run-suites.sh compile
+      - name: Run all-OS manifest suites (no live DB)
+        if: needs.changes.outputs.code == 'true'
+        shell: bash
+        env:
+          SEMAPHORE_SHARD_COUNT: "4"
+          SEMAPHORE_SHARD_INDEX: ${{ matrix.shard }}
+        run: bash .github/ci/run-suites.sh run allos
+      # ── Individual crate/example steps carried over from `test`, round-robin
+      # assigned one shard each (see the job comment above) ─────────────────
+      - name: Compile db-backed tests
+        if: needs.changes.outputs.code == 'true' && matrix.shard == 0
         run: cargo test -p autumn-harvest --all-features --tests --no-run
       # Issue #786: the claim/enqueue benchmark shares its harness with the
       # CI-gated budget assertion (`claim_budget_tests`, run Docker-backed via
-      # the manifest below). Compile-checking it here keeps the published
-      # `docs/performance.md` report from bit-rotting; `cargo bench` itself is
-      # deliberately NOT run per-PR, since the measurement is minutes-long and
-      # the *gate* is the test, not the report.
+      # the manifest in `test-db-linux`). Compile-checking it here keeps the
+      # published `docs/performance.md` report from bit-rotting; `cargo bench`
+      # itself is deliberately NOT run per-PR, since the measurement is
+      # minutes-long and the *gate* is the test, not the report.
       #
-      # Linux-only: bit-rot protection needs exactly one OS, and the benchmark is
-      # only ever *run* on Linux (see the manifest). The macOS and Windows legs
-      # already compile the same harness module through the `--all-features
-      # --tests --no-run` step above, so restricting this one costs no coverage
-      # and saves two legs' worth of minutes.
+      # Linux-only: bit-rot protection needs exactly one OS, and the benchmark
+      # is only ever *run* on Linux (see the manifest). `Compile db-backed
+      # tests` above compiles the same harness module on every OS, so
+      # restricting this one costs no coverage.
       - name: Compile claim/enqueue benchmark (issue #786)
-        if: runner.os == 'Linux' && needs.changes.outputs.code == 'true'
+        if: runner.os == 'Linux' && needs.changes.outputs.code == 'true' && matrix.shard == 1
         run: cargo bench -p autumn-harvest --features db --bench claim_bench --no-run
       # Same bit-rot protection for the end-to-end suite (issue #941), and for
-      # the same reason: nothing else compiles a bench TARGET. The `--tests`
-      # steps above cover the shared harness module, but not `e2e_bench.rs`
-      # itself -- and not `replay_bench.rs`, which now pulls that harness in and
-      # so acquired a real build break under default features that no CI step
-      # would have caught. Two invocations because the two benches enable
-      # different feature sets.
+      # the same reason: nothing else compiles a bench TARGET. `--tests` above
+      # covers the shared harness module, but not `e2e_bench.rs` itself -- and
+      # not `replay_bench.rs`, which now pulls that harness in and so acquired
+      # a real build break under default features that no CI step would have
+      # caught. Two invocations because the two benches enable different
+      # feature sets.
       - name: Compile end-to-end benchmark (issue #941)
-        if: runner.os == 'Linux' && needs.changes.outputs.code == 'true'
+        if: runner.os == 'Linux' && needs.changes.outputs.code == 'true' && matrix.shard == 2
         run: |
           cargo bench -p autumn-harvest --features db,testing --bench e2e_bench --no-run
           cargo bench -p autumn-harvest --features testing --bench replay_bench --no-run
@@ -341,107 +461,104 @@ jobs:
         if: runner.os == 'Linux' && needs.changes.outputs.code == 'true'
         run: cargo bench -p autumn-harvest-plugin --bench diagnose_bench --no-run
       - name: Run all-features lib tests
-        if: needs.changes.outputs.code == 'true'
+        if: needs.changes.outputs.code == 'true' && matrix.shard == 3
         run: cargo test -p autumn-harvest --all-features --lib
-      - name: Free disk space
-        if: needs.changes.outputs.code == 'true'
-        run: cargo clean
       - name: Run plugin lib tests
-        if: needs.changes.outputs.code == 'true'
+        if: needs.changes.outputs.code == 'true' && matrix.shard == 0
         run: cargo test -p autumn-harvest-plugin --lib
       - name: Run plugin lib tests (webhooks feature, issue #618 outbound-delegate gating)
-        if: needs.changes.outputs.code == 'true'
+        if: needs.changes.outputs.code == 'true' && matrix.shard == 1
         run: cargo test -p autumn-harvest-plugin --features webhooks --lib
       - name: Run plugin connector tests (issue #944)
-        if: needs.changes.outputs.code == 'true'
+        if: needs.changes.outputs.code == 'true' && matrix.shard == 2
         run: cargo test -p autumn-harvest-plugin --features connectors --lib connector
       # No CI step ran the plugin's doctests, so a broken `///` example landed
       # silently (issue #944 review found exactly that). These are compile-only
       # (`no_run`), so they cost seconds and need no database.
       - name: Run plugin doctests (issue #944 review)
-        if: needs.changes.outputs.code == 'true'
+        if: needs.changes.outputs.code == 'true' && matrix.shard == 3
         run: cargo test --doc -p autumn-harvest-plugin --features connectors
       - name: Run plugin MCP tool tests (issue #597, DAG MCP tools issue #601 follow-up)
-        if: needs.changes.outputs.code == 'true'
+        if: needs.changes.outputs.code == 'true' && matrix.shard == 0
         run: cargo test -p autumn-harvest-plugin --features mcp,unified-dag-execution --lib --test mcp_tools_http_tests
       - name: Run plugin metrics scrape tests (issue #355)
-        if: needs.changes.outputs.code == 'true'
+        if: needs.changes.outputs.code == 'true' && matrix.shard == 1
         run: cargo test -p autumn-harvest-plugin --features metrics --lib --test metrics_scrape_http_tests
       - name: Compile plugin metrics scrape example
-        if: needs.changes.outputs.code == 'true'
+        if: needs.changes.outputs.code == 'true' && matrix.shard == 2
         run: cargo build -p autumn-harvest-plugin --example metrics_scrape_quickstart --features metrics
       # `aws-sdk-sqs` is pure Rust, so the SQS example builds on every OS.
       - name: Compile plugin SQS connector example (issue #944)
-        if: needs.changes.outputs.code == 'true'
+        if: needs.changes.outputs.code == 'true' && matrix.shard == 3
         run: cargo build -p autumn-harvest-plugin --example sqs_connector_quickstart --features sqs
       # issue #944: the Kafka example is the success metric's measured artifact
       # (see tests/connector_example_budget.rs), so it must keep compiling.
       # Linux-only for the same librdkafka reason as the broker suite.
       - name: Compile plugin Kafka connector example (issue #944, Linux)
-        if: runner.os == 'Linux' && needs.changes.outputs.code == 'true'
+        if: runner.os == 'Linux' && needs.changes.outputs.code == 'true' && matrix.shard == 0
         run: |
           sudo apt-get update && sudo apt-get install -y libcurl4-openssl-dev
           cargo build -p autumn-harvest-plugin --example kafka_connector_quickstart --features kafka
       - name: Run macros tests
-        if: needs.changes.outputs.code == 'true'
+        if: needs.changes.outputs.code == 'true' && matrix.shard == 1
         run: cargo test -p autumn-harvest-macros
       - name: Run CLI tests (issue #753)
-        if: needs.changes.outputs.code == 'true'
+        if: needs.changes.outputs.code == 'true' && matrix.shard == 2
         run: cargo test -p autumn-harvest-cli
       - name: Run autumn-harvest-sqlite tests (issue #1068)
-        if: needs.changes.outputs.code == 'true'
+        if: needs.changes.outputs.code == 'true' && matrix.shard == 3
         run: cargo test -p autumn-harvest-sqlite
       - name: Run business_metrics example tests (issue #758)
-        if: needs.changes.outputs.code == 'true'
+        if: needs.changes.outputs.code == 'true' && matrix.shard == 0
         run: cargo test -p autumn-harvest --no-default-features --features testing --example business_metrics
       - name: Run typed_workflow_failure example tests (issue #767)
-        if: needs.changes.outputs.code == 'true'
+        if: needs.changes.outputs.code == 'true' && matrix.shard == 1
         run: cargo test -p autumn-harvest --no-default-features --features testing --example typed_workflow_failure
       - name: Run activity_ctx_info example tests (issue #783)
-        if: needs.changes.outputs.code == 'true'
+        if: needs.changes.outputs.code == 'true' && matrix.shard == 2
         run: cargo test -p autumn-harvest --no-default-features --features testing --example activity_ctx_info
       - name: Run activity_interceptor example tests (issue #680)
-        if: needs.changes.outputs.code == 'true'
+        if: needs.changes.outputs.code == 'true' && matrix.shard == 3
         run: cargo test -p autumn-harvest --no-default-features --features testing --example activity_interceptor
       - name: Run child_with_timeout example tests (issue #779)
-        if: needs.changes.outputs.code == 'true'
+        if: needs.changes.outputs.code == 'true' && matrix.shard == 0
         run: cargo test -p autumn-harvest --no-default-features --features testing --example child_with_timeout
       - name: Run replay_debugger example tests (issue #949)
-        if: needs.changes.outputs.code == 'true'
+        if: needs.changes.outputs.code == 'true' && matrix.shard == 1
         run: cargo test -p autumn-harvest --no-default-features --features debugger --example replay_debugger
       - name: Run long_lived_entity_deadline example tests (issue #772)
-        if: needs.changes.outputs.code == 'true'
+        if: needs.changes.outputs.code == 'true' && matrix.shard == 2
         run: cargo test -p autumn-harvest --no-default-features --features testing --example long_lived_entity_deadline
       # Quoted: an unquoted `#` after whitespace starts a YAML comment, which
       # would silently truncate the step name at "(issue".
       - name: "Run temporal_port_subscription_renewal example tests (issue #947)"
-        if: needs.changes.outputs.code == 'true'
+        if: needs.changes.outputs.code == 'true' && matrix.shard == 3
         run: cargo test -p autumn-harvest --no-default-features --features testing --example temporal_port_subscription_renewal
       - name: Run dag_data_flow example tests (issue #702)
-        if: needs.changes.outputs.code == 'true'
+        if: needs.changes.outputs.code == 'true' && matrix.shard == 0
         run: cargo test -p autumn-harvest --no-default-features --features testing,unified-dag-execution --example dag_data_flow
       # Quoted: an unquoted `#` after whitespace starts a YAML comment, which
       # would silently truncate the step name at "(issue".
       - name: "Run dag_compensation example tests (issue #780)"
-        if: needs.changes.outputs.code == 'true'
+        if: needs.changes.outputs.code == 'true' && matrix.shard == 1
         run: cargo test -p autumn-harvest --no-default-features --features testing,unified-dag-execution --example dag_compensation
       - name: Run interface_schema_workflow example tests (issue #610)
-        if: needs.changes.outputs.code == 'true'
+        if: needs.changes.outputs.code == 'true' && matrix.shard == 2
         run: cargo test -p autumn-harvest --no-default-features --features testing,schema --example interface_schema_workflow
       - name: Run entity_phase_transition example tests (issue #803)
-        if: needs.changes.outputs.code == 'true'
+        if: needs.changes.outputs.code == 'true' && matrix.shard == 3
         run: cargo test -p autumn-harvest --no-default-features --features testing --example entity_phase_transition
       - name: Run mutex_ledger example tests (issue #691)
-        if: needs.changes.outputs.code == 'true'
+        if: needs.changes.outputs.code == 'true' && matrix.shard == 0
         run: cargo test -p autumn-harvest --no-default-features --features testing --example mutex_ledger
       - name: Run workflow_logs example tests (issue #790)
-        if: needs.changes.outputs.code == 'true'
+        if: needs.changes.outputs.code == 'true' && matrix.shard == 1
         run: cargo test -p autumn-harvest --no-default-features --features testing --example workflow_logs
       - name: Run fanout_batch example tests (issue #750)
-        if: needs.changes.outputs.code == 'true'
+        if: needs.changes.outputs.code == 'true' && matrix.shard == 2
         run: cargo test -p autumn-harvest --no-default-features --features testing --example fanout_batch
       - name: Run business_day_escalation example tests (issue #806)
-        if: needs.changes.outputs.code == 'true'
+        if: needs.changes.outputs.code == 'true' && matrix.shard == 3
         run: cargo test -p autumn-harvest --no-default-features --features testing --example business_day_escalation
       # The WASM example is a `main()` that self-asserts the sandbox contract
       # (echo round-trip, a granted capability, and an ungranted import denied as
@@ -450,7 +567,7 @@ jobs:
       # which drags in wasmtime — a multi-minute build not worth paying on three
       # legs, and the macOS/Windows legs never build core examples at all.
       - name: Run wasm_activity example (issue #965)
-        if: runner.os == 'Linux' && needs.changes.outputs.code == 'true'
+        if: runner.os == 'Linux' && needs.changes.outputs.code == 'true' && matrix.shard == 0
         run: cargo run -p autumn-harvest --features wasm-activities --example wasm_activity
       # Issue #794: the schema-contract gate, end to end. Generates the
       # currently-published schemas from the example registry, then diffs them
@@ -461,10 +578,10 @@ jobs:
       # Linux-only, matching the benchmark bit-rot guard above: schema drift is
       # a property of the checked-in artifact, not of the OS, so one leg proves
       # it. The step builds twice (`--features schema` pulls schemars; the CLI
-      # links the whole `harvest` binary), so restricting it saves two legs'
-      # worth of minutes for zero added coverage.
+      # links the whole `harvest` binary), so restricting it saves runner
+      # minutes for zero added coverage.
       - name: "Gate workflow payload-schema changes (issue #794)"
-        if: runner.os == 'Linux' && needs.changes.outputs.code == 'true'
+        if: runner.os == 'Linux' && needs.changes.outputs.code == 'true' && matrix.shard == 1
         shell: bash
         env:
           BASE_SHA: ${{ needs.changes.outputs.base_sha }}
@@ -508,54 +625,6 @@ jobs:
           else
             echo "no artifact at ${BASE_SHA} — first introduction, nothing to compare"
           fi
-      # ── Manifest-driven integration suites ──────────────────────────────
-      # The per-suite `cargo test` steps that used to live here are now data in
-      # `.github/ci/integration-suites.txt`, executed by `.github/ci/run-suites.sh`.
-      # Adding a suite is one sorted manifest line — no edit to this file. See
-      # `autumn-harvest/tests/integration/ci_run_coverage.rs` for the coverage
-      # guard that keeps the manifest honest. Per-step `if:` gating is preserved
-      # exactly (NOT hoisted to a job-level `if:` — see the note on the `test`
-      # job above); `shell: bash` resolves to Git Bash on Windows.
-      - name: Free runner disk before heavy plugin link (Linux)
-        if: runner.os == 'Linux' && needs.changes.outputs.code == 'true'
-        run: |
-          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
-            /usr/local/share/boost /usr/lib/jvm "$AGENT_TOOLSDIRECTORY" || true
-          sudo docker image prune --all --force > /dev/null 2>&1 || true
-          df -h /
-      - name: Compile plugin integration test suites (manifest, all OSes)
-        if: needs.changes.outputs.code == 'true'
-        shell: bash
-        run: bash .github/ci/run-suites.sh compile
-      - name: Run all-OS manifest suites (no live DB)
-        if: needs.changes.outputs.code == 'true'
-        shell: bash
-        run: bash .github/ci/run-suites.sh run allos
-      # The `linux`/`linuxpart` (Docker-backed) manifest rows used to run here,
-      # serially, in this same job -- 119 rows at ~27s median, ~55-58% of this
-      # leg's total wall time (docs/rnd/2026-09-03-ci-health-semaphore.md).
-      # Moved to the `test-db-linux` job below, sharded across parallel runners:
-      # see that job's comment for why a separate job (not a step here) and why
-      # sharding by row ordinal is safe for the suites that need
-      # `--test-threads=1` within their own process.
-      # Issue #684's signal/update-metric run targets SPECIFIC test paths across
-      # two modules (a multi-token `--` filter), which the single-`filter`-column
-      # manifest schema cannot represent; it stays a literal Docker-backed step.
-      - name: Run Docker-backed signal/update metric integration tests (issue #684)
-        if: runner.os == 'Linux' && needs.changes.outputs.code == 'true'
-        run: cargo test -p autumn-harvest --test integration -- metrics_integration::update_completed_metric_fires_on_the_suspend_path nd_block_tests::genuine_terminal_with_undrained_signal_emits_signal_unhandled nd_block_tests::nd_blocked_cycle_does_not_emit_signal_unhandled --test-threads=1
-      # Issue #944's Kafka broker suite stays a literal Linux-only step rather
-      # than a manifest row: it needs the apt install below first, and the
-      # manifest's `compile` mode would try to build vendored librdkafka on the
-      # macOS and Windows legs too. Its ALLOWLIST entry in `ci_run_coverage.rs`
-      # points here. (The SQS broker suite IS a manifest row — `aws-sdk-sqs` is
-      # pure Rust and compiles everywhere.)
-      - name: Install librdkafka build deps (Linux)
-        if: runner.os == 'Linux' && needs.changes.outputs.code == 'true'
-        run: sudo apt-get update && sudo apt-get install -y libcurl4-openssl-dev
-      - name: Run plugin Kafka broker connector tests (issue #944)
-        if: runner.os == 'Linux' && needs.changes.outputs.code == 'true'
-        run: cargo test -p autumn-harvest-plugin --features kafka --test connector_kafka_broker -- --test-threads=1
 
   # Split out of `test`'s `ubuntu-latest` leg (docs/rnd/2026-09-03-ci-health-semaphore.md):
   # the `linux`/`linuxpart` Docker-backed manifest rows used to run there as one
