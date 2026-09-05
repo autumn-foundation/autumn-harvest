@@ -1059,3 +1059,29 @@ about the block state of the comment containing it — which is what "scope"
 meant, and the previous fix only implemented for one field of it.
 
 Corpus effect: none, for the fourteenth round running.
+
+### Round thirty-three — a marker-only heading, and two meanings of "separator"
+
+Two findings, both verified to reproduce first.
+
+**`#` alone is a heading.** The pattern required trailing whitespace, so a
+marker-only ATX heading read as paragraph text and the `22.` after it was
+refused a container. Same shape as round twenty-three's marker-only list item,
+in the neighbouring pattern.
+
+**A decorative rule is not a thematic break.** `SEPARATOR_RE` was widened in
+round seventeen to cover `===` and the box-drawing rules this tree draws
+sections with, because a section rule is not a word of the sentence beneath
+it. That is right for splitting prose and wrong for container state: Rustdoc
+renders `===` as ordinary paragraph text, so letting it clear the paragraph
+flag hands the next `22.` a container, and its fence an allowance, that the
+rendered document does not have.
+
+The two meanings are separate patterns now. `SEPARATOR_RE` keeps the broad
+decorative set and still ends a prose unit; `THEMATIC_BREAK_RE` is the
+CommonMark subset — `-`, `_`, `*` only — and is what container state and the
+break-beats-list-item precedence consult. Codex proposed exactly this split;
+it is the right line, and it is one I had blurred by reusing a pattern written
+for the prose path in the container path two rounds ago.
+
+Corpus effect: none, for the fifteenth round running.

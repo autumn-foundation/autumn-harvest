@@ -336,13 +336,20 @@ LIST_MARKER_RE = re.compile(r"^([ \t]*)((?:[-*+]|\d{1,9}[.)]))([ \t]+|$)")
 BLOCKQUOTE_RE = re.compile(r"^([ \t]*)((?:>(?=[ \t>]|$)[ \t]?)+)")
 ONE_QUOTE_RE = re.compile(r"^([ \t]*)>(?=[ \t>]|$)[ \t]?")
 TABLE_RE = re.compile(r"^\s*\|")
-HEADING_RE = re.compile(r"^\s*#{1,6}\s")
+HEADING_RE = re.compile(r"^\s*#{1,6}(?:\s|$)")
 # A thematic break -- one punctuation character repeated. CommonMark spells it
 # "---"; this tree also draws section rules with box-drawing characters. Either
 # way it separates blocks, so a sentence never runs across one.
 SEPARATOR_RE = re.compile(
     "^[ \t]*([-_*=\u2500\u2501\u2550\u00b7])(?:[ \t]*\\1){2,}[ \t]*$"
 )
+# The CommonMark subset of the above. Only `-`, `_` and `*` make a thematic
+# break; "===" and the box-drawing rules this tree draws sections with are
+# ordinary paragraph text to Rustdoc. The broad set still ends a prose unit --
+# a section rule is not a word of the sentence under it -- but only a real
+# break may change container state, or a decorative line grants the next "22."
+# a container, and its fence an allowance, that the rendered document has not.
+THEMATIC_BREAK_RE = re.compile("^[ \t]*([-_*])(?:[ \t]*\\1){2,}[ \t]*$")
 SENTENCE_SPLIT_RE = re.compile(r"(?<=[.!?])\s+")
 
 
@@ -688,7 +695,7 @@ def list_content(text: str, container: int) -> tuple[int, int] | None:
     # A thematic break wins over a list item in CommonMark, and "* * *" or
     # "- - -" matches both. Reading one as an item opens a container -- and a
     # fence allowance -- where the rendered document has a horizontal rule.
-    if SEPARATOR_RE.match(text):
+    if THEMATIC_BREAK_RE.match(text):
         return None
     marker = LIST_MARKER_RE.match(text)
     if not marker:
@@ -857,7 +864,9 @@ def update_containers(
     # refuses the next "22." a container it is entitled to. A list marker's
     # own text IS a paragraph, so those still count.
     prose = bool(body.strip()) and not (
-        HEADING_RE.match(body) or SEPARATOR_RE.match(body) or TABLE_RE.match(body)
+        HEADING_RE.match(body)
+        or THEMATIC_BREAK_RE.match(body)
+        or TABLE_RE.match(body)
     )
     return stack, prose
 
@@ -1929,6 +1938,17 @@ RULE_TESTS = [
         "/// * * *\n///     ~~~rust\n///   TODO: issue required\n",
         {("CH002", 3)},
         "a spaced thematic break is a break, not a list item",
+    ),
+    (
+        "/// #\n/// 22. item\n///     ~~~rust\n"
+        "///     TODO: fixture placeholder\n///     ~~~\n",
+        set(),
+        "a marker-only heading is still a heading",
+    ),
+    (
+        "/// ===\n/// 22. item\n///     ~~~rust\n///     TODO: issue required\n",
+        {("CH002", 4)},
+        "a decorative rule is paragraph text, not a thematic break",
     ),
     (
         "/// - > word1 word2 word3 word4 word5 word6 word7 word8 word9 word10 word11 word12 word13 word14 word15 word16 word17 word18 word19 word20 word21 word22 word23 word24 word25.\n",
