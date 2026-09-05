@@ -1054,12 +1054,32 @@ rows it costs ~10,000 real per-candidate-row index probes where the current
 fix costs ~10,000 near-free probes of a small, resident, empty CTE — 200x+
 over its pre-set idle-cost line, at any key cardinality. Re-assaying this
 exact formulation without new information is a re-dig; see that report for
-what else remains untested. Until a fix clears all three of that assay's
-lines, deployments with concurrency-key
-cardinality in the low hundreds (the tested, committed range) get the full
-measured win above; deployments with concurrency keys numbering in the
-thousands or more should expect the candidate-side gate's cost to grow with
-that cardinality and are not covered by this fix's evidence.
+what else remains untested.
+
+**The un-re-chartered pit ledger #3 left open was also measured and
+killed, a different way:**
+`docs/assays/0004-concurrency-gate-deferred-recheck.md` (ledger #4) tried
+removing the candidate-side gate entirely — no predicate, no new index —
+and enforcing the cap only in the `claimed` CTE's existing authoritative
+recheck, retrying against the next candidate on a failed recheck. Idle cost,
+the 5,000-key blowup, and the 256-key case all pass decisively (idle ties
+the committed fix; 5,000-key is 218.5x faster than control; 256-key is 30.4x
+faster than control). It still kills, on a line neither #3 nor the committed
+fix needed: a 50-row adversarial fixture where the highest-priority PENDING
+rows are themselves keyed to an already-saturated concurrency key costs
+313.8ms against a 100ms line, because each retry re-runs the full
+candidate-selection scan and nothing bounds how many consecutive
+high-priority rows can share a saturated key — an unbounded,
+workload-dependent worst case neither prior candidate has. (`LEFT JOIN
+LATERAL` + planner hints, the *other* shape #3 named, was never re-tested:
+the three-rewrites section above already closes it.)
+
+Until a fix clears every line of some registered assay, deployments with
+concurrency-key cardinality in the low hundreds (the tested, committed
+range) get the full measured win above; deployments with concurrency keys
+numbering in the thousands or more should expect the candidate-side gate's
+cost to grow with that cardinality and are not covered by this fix's
+evidence.
 
 ## Enqueue throughput
 
