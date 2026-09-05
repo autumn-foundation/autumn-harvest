@@ -441,24 +441,10 @@ async fn terminate_if_running_cleans_up_orphan_timer() {
     );
 }
 
-// 🪝 Snag: `TerminateIfRunning` cleaned up an orphan PENDING task and an orphan
-// unfired timer for the sealed prior (see `terminate_if_running_cleans_up_orphan_timer`
-// above), but had no `harvest_signals` counterpart — `cancel_and_seal_prior` called
-// `delete_pending_tasks_for_execution` and `delete_unfired_timers_for_execution` but
-// nothing for staged signals. Unlike a timer, an orphaned signal row can never fire
-// against anything (the sealed prior is never driven again), so this was not a
-// correctness hazard — but the sqlite backend has no retention/GC pass at all
-// (README `v0.1 non-goals`: "Schedules, the management API, DAGs, worker sessions,
-// retention, sharding"), unlike the Postgres core, which purges old rows via a
-// separate retention subsystem. So on this backend a signal sent to a still-RUNNING
-// execution that the workflow never reaches a matching
-// `wait_for_signal`/`wait_for_signal_timeout` for before being replaced via
-// `TerminateIfRunning` stayed in `harvest_signals` with `delivered = 0` forever, with
-// no code path anywhere in this crate that ever removed it — repeating the
-// send-signal-then-replace cycle against the same `(workflow_name, workflow_id)` grew
-// the table without bound. Fixed by `delete_undelivered_signals_for_execution`,
-// called alongside the existing task/timer cleanup in `cancel_and_seal_prior`. RED
-// against the pre-fix code: `total_orphaned` was 3 (one per cycle), not 0.
+// A signal sent to a still-RUNNING execution that the workflow never reaches a
+// matching `wait_for_signal`/`wait_for_signal_timeout` for, before it's replaced
+// via `TerminateIfRunning`, must not stay in `harvest_signals` forever — this
+// backend has no retention/GC pass, so nothing else will ever reclaim it.
 #[tokio::test]
 async fn terminate_if_running_orphans_an_undelivered_signal_across_repeated_cycles() {
     let (_dir, path) = temp_db();
@@ -512,15 +498,10 @@ async fn terminate_if_running_orphans_an_undelivered_signal_across_repeated_cycl
     );
 }
 
-// 🪝 Snag / Codex review (PR #1374 follow-up): the fix above only deleted staged
-// signals inside `cancel_and_seal_prior`'s `if prior_state == "RUNNING"` branch —
-// but a signal can be staged while the prior is RUNNING and then outlive it even
-// when the prior reaches COMPLETED on its own (the workflow completes without ever
-// awaiting that signal name). That prior is sealed via the SAME function, just
-// through the "already-terminal" path that skips the cancellation branch entirely
-// — so the signal was just as orphaned, by a different trigger than the RUNNING
-// case above. Moving the signal deletion outside the `if` (unconditional for every
-// sealed prior, RUNNING or not) fixes both paths with the same call.
+// A signal staged while the prior is RUNNING can outlive it even when the prior
+// reaches COMPLETED on its own (the workflow completes without ever awaiting that
+// signal name) — that prior is sealed via the same "already-terminal" path, which
+// skips the cancellation branch, so the signal cleanup must not live inside it.
 #[tokio::test]
 async fn terminate_if_running_orphans_an_undelivered_signal_on_an_already_completed_prior() {
     let (_dir, path) = temp_db();
