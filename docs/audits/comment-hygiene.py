@@ -338,6 +338,9 @@ ONE_QUOTE_RE = re.compile(r"^([ \t]*)>(?!=)[ \t]?")
 # A GFM table ROW, not merely a line that opens with a pipe. One pipe is
 # ordinary prose -- "| foo" wraps a sentence like any other word -- and
 # flushing there drops the rest of the sentence out of the unit.
+DELIM_CELL_RE = re.compile(r":?-+:?")
+
+
 def table_delimiter(text: str, container: int) -> bool:
     """Is `text` a GFM table's delimiter row -- "|---|:--:|" and its kin?
 
@@ -348,7 +351,13 @@ def table_delimiter(text: str, container: int) -> bool:
     if leading_columns(text) > container + 3:
         return False
     stripped = text.strip()
-    return "|" in stripped and "-" in stripped and not stripped.strip(" \t|-:")
+    if "|" not in stripped or not stripped.strip(" \t|-:") == "":
+        return False
+    # EVERY cell needs its own hyphen run. "| | --- |" has an empty first
+    # cell, so it is not a delimiter row and the pipe line above it is not a
+    # header -- both are prose, and the sentence they carry must be counted.
+    cells = stripped.strip("|").split("|")
+    return bool(cells) and all(DELIM_CELL_RE.fullmatch(cell.strip()) for cell in cells)
 
 HEADING_RE = re.compile(r"^\s*#{1,6}(?:\s|$)")
 # A thematic break -- one punctuation character repeated. CommonMark spells it
@@ -520,6 +529,7 @@ def extract_comments(source: str) -> list[Piece]:
             seg_line = line
             seg_nest = depth
             first = True
+            line_started = False
             while i < n and depth > 0:
                 if source.startswith("/*", i):
                     # Nested comment. End the segment here so the inner body
@@ -556,6 +566,7 @@ def extract_comments(source: str) -> list[Piece]:
                             Piece(seg_line, marker, source[seg_start:i], code_on_line and first, True, root_group, seg_nest)
                         )
                         first = False
+                        line_started = True
                     depth -= 1
                     i += 2
                     if depth > 0:
@@ -565,10 +576,17 @@ def extract_comments(source: str) -> list[Piece]:
                         seg_line = line
                         seg_nest = depth
                 elif source[i] == "\n":
-                    pieces.append(
-                        Piece(seg_line, marker, source[seg_start:i], code_on_line and first, True, root_group, seg_nest)
-                    )
-                    first = False
+                    # A nested comment that closes at the end of a line leaves
+                    # a zero-length segment behind. That is a blank SEGMENT,
+                    # not a blank LINE, and emitting it ends the paragraph the
+                    # line is still part of. A genuinely blank comment line
+                    # emits nothing before the newline, so it still counts.
+                    if i > seg_start or not line_started:
+                        pieces.append(
+                            Piece(seg_line, marker, source[seg_start:i], code_on_line and first, True, root_group, seg_nest)
+                        )
+                        first = False
+                    line_started = False
                     line += 1
                     i += 1
                     seg_start = i
@@ -858,7 +876,11 @@ def leaves_container(text: str, scope: tuple[int, int]) -> bool:
 
 
 def update_containers(
-    text: str, stack: list[tuple[int, int]], paragraph: bool, quoted: int = 0
+    text: str,
+    stack: list[tuple[int, int]],
+    paragraph: bool,
+    quoted: int = 0,
+    table: bool = False,
 ) -> tuple[list[tuple[int, int]], bool]:
     """The open list containers after `text`, innermost last, and whether a
     paragraph is still open.
@@ -917,7 +939,8 @@ def update_containers(
     # document has not. A Setext underline IS one, but only with a paragraph
     # above it to underline.
     prose = bool(body.strip()) and not (
-        HEADING_RE.match(body)
+        table
+        or HEADING_RE.match(body)
         or thematic_break(body, stack[-1][0] if stack else 0)
         or (paragraph and setext_underline(body, stack[-1][0] if stack else 0))
     )
@@ -1097,19 +1120,32 @@ def comment_lines(pieces: list[Piece]):
         stack: list[tuple[int, int]] = []
         paragraph = False
         quoted = 0
+        in_table = False
         saved: list = []
         nest = run[0].nest
-        for piece in run:
+        for index, piece in enumerate(run):
             if piece.nest != nest:
-                saved, (fence, scope, stack, paragraph) = nesting_shift(
-                    saved, piece.nest, (fence, scope, list(stack), paragraph)
+                saved, (fence, scope, stack, paragraph, quoted) = nesting_shift(
+                    saved, piece.nest, (fence, scope, list(stack), paragraph, quoted)
                 )
                 nest = piece.nest
             text = piece.text
             if fence is not None and leaves_container(text, scope):
                 fence = None
             if fence is None:
-                stack, paragraph = update_containers(text, stack, paragraph, quoted)
+                # A CONFIRMED table is a block and ends the paragraph. A bare
+                # pipe line is not, and must not -- round thirty-four's
+                # asymmetry, now with the structure to tell them apart.
+                body = strip_quote(text, stack[-1][0] if stack else 0)
+                if "|" not in body:
+                    in_table = False
+                elif not in_table and index + 1 < len(run):
+                    in_table = table_delimiter(
+                        strip_quote(run[index + 1].text), 0
+                    )
+                stack, paragraph = update_containers(
+                    text, stack, paragraph, quoted, in_table and "|" in body
+                )
                 quoted = quote_depth(text, stack[-1][0] if stack else 0)
             container = stack[-1][0] if stack else 0
             delimiter = fence_delimiter(text, container, fence is not None, scope[2], stack)
@@ -1245,7 +1281,10 @@ def prose_units(pieces: list[Piece]) -> list[tuple[int, str]]:
         in_table = False
         for index, piece in enumerate(block):
             if piece.nest != nest:
-                flush()
+                # No flush: a sentence that crosses an inline nested comment
+                # is still one sentence in the rendered documentation, since
+                # the delimiters and the text between them are literal. Only
+                # the BLOCK state is isolated by the nesting.
                 saved, (fence, scope, stack, paragraph, quoted, in_list) = (
                     nesting_shift(
                         saved,
@@ -2026,6 +2065,28 @@ RULE_TESTS = [
         "/// word1 word2 word3 word4 word5 word6 word7 word8 word9 word10 word11 word12 word13 word14 word15 word16 word17 word18 word19 word20 word21 word22 word23 word24 word25 | tail\n///     --- | ---\n",
         {("CH007", 1)},
         "an over-indented delimiter row does not make a table",
+    ),
+    (
+        "/// word1 word2 word3 word4 word5 word6 word7 word8 word9 word10 word11 word12 word13 word14 word15 word16 word17 word18 word19 word20 word21 word22 word23 word24 word25 | tail\n/// | | --- |\n",
+        {("CH007", 1)},
+        "nor does one with an empty cell",
+    ),
+    (
+        "/// | Header |\n/// | --- |\n/// 22. item\n///     ~~~rust\n"
+        "///     TODO: fixture placeholder\n///     ~~~\n",
+        set(),
+        "but a confirmed table does end the paragraph above the list",
+    ),
+    (
+        "/**\n * Intro /* > inner */\n * 22. item\n *     ~~~rust\n"
+        " *     TODO: issue required\n */\n",
+        {("CH002", 5)},
+        "a quote inside a nested comment does not escape it",
+    ),
+    (
+        "/** word1 word2 word3 word4 word5 word6 word7 word8 word9 word10 word11 word12 word13 word14 word15 word16 word17 word18 word19 word20 /* inserted note */ w1 w2 w3 w4 w5 w6 w7 w8 w9 w10. */\npub fn a() {}\n",
+        {("CH007", 1)},
+        "a sentence crossing an inline nested comment is one sentence",
     ),
     (
         "/// Intro\n/// -\n///     ~~~rust\n///   TODO: issue required\n",

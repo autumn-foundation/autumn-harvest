@@ -1202,3 +1202,35 @@ table state is now one flag carried across lines rather than a precomputed set
 have been written that way to begin with.
 
 Corpus effect: none, for the nineteenth round running.
+
+### Round thirty-eight — a blank segment is not a blank line
+
+Four findings, all verified to reproduce first.
+
+**The nesting snapshot omitted the quote depth** that round thirty-seven added
+one commit earlier. Adding it to the snapshot was not enough, and chasing why
+found a lexer defect underneath: a nested comment closing at the end of a line
+leaves a **zero-length segment**, which the lexer emitted as a piece. A blank
+segment is not a blank line — but every rule that ends a paragraph at a blank
+line believed it was, so `Intro /* > inner */` ended its own paragraph. The
+lexer now suppresses an empty segment when the line has already produced one,
+and still emits the genuinely blank comment line CH004 depends on.
+
+**A delimiter row needs a hyphen run in every cell.** `| | --- |` has an empty
+first cell and is not a delimiter, so the pipe line above it is not a header.
+
+**A confirmed table ends the paragraph.** Round thirty-four took pipe lines out
+of container state entirely and argued the omission was safe because erring
+open only costs an exemption. That was wrong: a real table before a list left
+the paragraph open, refused the list its container, and reported the fence's
+own sample text. The asymmetry stands — a bare pipe still changes nothing —
+but the structure now exists to tell the two apart, so the container path uses
+it.
+
+**A sentence crossing an inline nested comment is one sentence.** The prose
+path flushed at every nesting transition. Rustdoc renders the delimiters and
+the text between them literally, so `20 words /* note */ 10 words` is one
+30-word sentence. Only the *block* state is isolated by nesting; the sentence
+is not.
+
+Corpus effect: none, for the twentieth round running.
