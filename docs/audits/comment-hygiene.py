@@ -314,7 +314,7 @@ MAX_SENTENCE_WORDS = 25
 # list item is legitimately indented further. `fence_delimiter` applies the
 # limit against the container.
 FENCE_RE = re.compile(r"^([ \t]*)(`{3,}|~{3,})")
-LIST_MARKER_RE = re.compile(r"^([ \t]*)((?:[-*+]|\d+[.)]))([ \t]+)")
+LIST_MARKER_RE = re.compile(r"^([ \t]*)((?:[-*+]|\d+[.)]))([ \t]+|$)")
 # A block quote is a container too, and Rustdoc uses it. Its marker is not
 # indentation -- content inside the quote starts again at column zero -- so it
 # is stripped before any container or fence judgement. Nested and space-less
@@ -325,7 +325,7 @@ LIST_MARKER_RE = re.compile(r"^([ \t]*)((?:[-*+]|\d+[.)]))([ \t]+)")
 # operator, and stripping its ">" silently rewrites the text every rule then
 # judges -- and the text a Tier B failure quotes back. A marker must be
 # followed by space, another marker, or the end of the line.
-BLOCKQUOTE_RE = re.compile(r"^[ \t]{0,3}(?:>(?=[ \t>]|$)[ \t]?)+")
+BLOCKQUOTE_RE = re.compile(r"^([ \t]*)((?:>(?=[ \t>]|$)[ \t]?)+)")
 TABLE_RE = re.compile(r"^\s*\|")
 HEADING_RE = re.compile(r"^\s*#{1,6}\s")
 # A thematic break -- one punctuation character repeated. CommonMark spells it
@@ -655,25 +655,43 @@ def list_content(text: str, container: int) -> tuple[int, int] | None:
     # it sits in, not on how many characters precede it.
     marker_column = indent + len(marker.group(2))
     padding = len(marker.group(0).expandtabs(4)) - marker_column
-    if padding > 4:
+    # An item that is only its marker has no padding to measure. CommonMark
+    # puts its content one column past the marker, same as the over-padded
+    # case -- otherwise "-" alone opens no container and an indented fence
+    # under it is recorded as top-level.
+    if padding > 4 or not padding:
         return marker_column + 1, marker.start(3) + 1
     return marker_column + padding, marker.end()
 
 
 
-def strip_quote(text: str) -> str:
+def quote_marker(text: str, container: int) -> "re.Match[str] | None":
+    """`text`'s block-quote marker, if it has one it is allowed to have.
+
+    Three columns of indent, like every other CommonMark marker -- and like
+    every other one, three columns PAST THE CONTAINER. A quote inside a list
+    item whose content starts at column four is indented four and is still a
+    quote; an absolute limit misses it and then misses the fence inside it.
+    """
+    match = BLOCKQUOTE_RE.match(text)
+    if not match or len(match.group(1).expandtabs(4)) > container + 3:
+        return None
+    return match
+
+
+def strip_quote(text: str, container: int = 0) -> str:
     """`text` past any block-quote marker.
 
     Every container judgement below measures from here, so a quoted fence,
     list or indent reads exactly as the unquoted form does.
     """
-    match = BLOCKQUOTE_RE.match(text)
+    match = quote_marker(text, container)
     return text[match.end():] if match else text
 
 
-def quote_depth(text: str) -> int:
+def quote_depth(text: str, container: int = 0) -> int:
     """How many block-quote levels `text` opens with."""
-    match = BLOCKQUOTE_RE.match(text)
+    match = quote_marker(text, container)
     return match.group(0).count(">") if match else 0
 
 
@@ -697,10 +715,12 @@ def leaves_container(text: str, scope: tuple[int, int]) -> bool:
     container, depth = scope
     # Columns only compare inside one quote depth: a shallower line has left
     # the quote outright, and a deeper one is nested INSIDE the container, so
-    # its post-strip column says nothing about leaving it.
-    if quote_depth(text) != depth:
-        return quote_depth(text) < depth
-    body = strip_quote(text)
+    # its post-strip column says nothing about leaving it. The quote is read
+    # against the fence's own container, since that is the scope it opened in.
+    line_depth = quote_depth(text, container)
+    if line_depth != depth:
+        return line_depth < depth
+    body = strip_quote(text, container)
     if not body.strip():
         return False
     return leading_columns(body) < container
@@ -729,8 +749,11 @@ def update_containers(
     one. Simplified in one way: any non-blank line opens a paragraph, so a
     table or heading does not close one here.
     """
-    depth = quote_depth(text)
-    body = strip_quote(text)
+    # Read against the container in force before this line: a quote's own
+    # indent allowance is relative to whatever list item still holds it.
+    enclosing = stack[-1][0] if stack else 0
+    depth = quote_depth(text, enclosing)
+    body = strip_quote(text, enclosing)
     popped = len(stack)
     stack = [entry for entry in stack if entry[1] <= depth]
     if body.strip():
@@ -750,7 +773,9 @@ def update_containers(
     return stack, bool(body.strip())
 
 
-def fence_delimiter(text: str, container: int) -> tuple["re.Match[str]", str] | None:
+def fence_delimiter(
+    text: str, container: int, in_fence: bool = False
+) -> tuple["re.Match[str]", str] | None:
     """The fence delimiter on `text`, or None if the line is not one.
 
     Two things separate a delimiter from ordinary text. A fence may open on
@@ -761,8 +786,11 @@ def fence_delimiter(text: str, container: int) -> tuple["re.Match[str]", str] | 
     fence is open, an indented code line while one is not. Returns the match
     and the text it was matched against, which carries the info string.
     """
-    text = strip_quote(text)
-    base, offset = list_content(text, container) or (0, 0)
+    text = strip_quote(text, container)
+    # A list marker is skipped only when looking for an OPENER. Inside a fence
+    # the sample text is literal, so "- ```" is a hyphen and three backticks
+    # of example content, not an item whose body closes the fence.
+    base, offset = (0, 0) if in_fence else (list_content(text, container) or (0, 0))
     tail = text[offset:]
     match = FENCE_RE.match(tail)
     if not match:
@@ -852,7 +880,7 @@ def comment_lines(pieces: list[Piece]):
             if fence is None:
                 stack, paragraph = update_containers(text, stack, paragraph)
             container = stack[-1][0] if stack else 0
-            delimiter = fence_delimiter(text, container)
+            delimiter = fence_delimiter(text, container, fence is not None)
             if delimiter:
                 before = fence
                 fence = fence_transition(fence, *delimiter)
@@ -965,7 +993,7 @@ def prose_units(pieces: list[Piece]) -> list[tuple[int, str]]:
             if fence is None:
                 stack, paragraph = update_containers(body, stack, paragraph)
             container = stack[-1][0] if stack else 0
-            delimiter = fence_delimiter(body, container)
+            delimiter = fence_delimiter(body, container, fence is not None)
             if delimiter:
                 before = fence
                 fence = fence_transition(fence, *delimiter)
@@ -1554,6 +1582,22 @@ RULE_TESTS = [
         "/// TODO: issue required\n",
         {("CH002", 5)},
         "a quote nested in a list item does not close the item",
+    ),
+    (
+        "/// ```rust\n/// - ```\n/// TODO: fixture placeholder\n/// ```\n",
+        set(),
+        "a list marker inside a fence is sample text, not a container",
+    ),
+    (
+        "/// -\n///   ~~~rust\n///   let x = 1;\n/// TODO: issue required\n",
+        {("CH002", 4)},
+        "a marker alone on its line still opens a list item",
+    ),
+    (
+        "/// -   outer\n///     > ```rust\n///     > TODO: fixture placeholder\n"
+        "///     > ```\n",
+        set(),
+        "a quote marker is indented relative to its list container",
     ),
     (
         "/// -    ```rust\n///      TODO: fixture placeholder\n///      ```\n",

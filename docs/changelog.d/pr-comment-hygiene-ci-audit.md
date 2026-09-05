@@ -774,3 +774,36 @@ pattern still has to open the line.
 
 Corpus effect: none. All three latent, finding set identical to round
 twenty-one's.
+
+### Round twenty-three — literal markers, empty items, quote indent
+
+Three findings, all verified to reproduce first.
+
+**A list marker inside an open fence was stripped as a container.** Sample
+text beginning `- ``` ` had its marker removed and the backticks read as a
+closing delimiter, so the example's own `TODO` was scanned. List syntax is
+literal inside a fence, so the marker is skipped only when looking for an
+*opener*; `fence_delimiter` takes the fence state now.
+
+**A marker alone on its line opened nothing.** `LIST_MARKER_RE` required
+trailing whitespace, so `/// -` was not an item and an indented fence beneath
+it was recorded as top-level. The pattern accepts end of line, and an empty
+item's content column is one past the marker, as CommonMark specifies.
+
+**A quote marker's indent was absolute.** Three columns, but three columns
+from the line rather than from the container, so a quote inside a list item
+whose content starts at column four was missed — and with it the fence inside
+that quote, reporting the example's sample text. `quote_marker` measures
+against the container in force, as every other marker here now does.
+
+Corpus effect: none. All three latent, finding set identical to round
+twenty-two's.
+
+**On the trajectory.** Rounds seventeen to twenty-three have all been
+CommonMark container modelling, all found by review rather than by the corpus,
+and none has changed a single finding in this tree. They are real defects and
+each was verified before fixing, but they are edge cases of a Markdown parser
+that this harness only needs in order to know what *not* to scan. If they keep
+coming, the better answer than a twenty-fourth round is an issue proposing a
+real CommonMark block parser for the container layer, or a decision that the
+remaining cases are out of scope for a comment linter.
