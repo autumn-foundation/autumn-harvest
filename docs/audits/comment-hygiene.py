@@ -328,13 +328,13 @@ LIST_MARKER_RE = re.compile(r"^([ \t]*)((?:[-*+]|\d{1,9}[.)]))([ \t]+|$)")
 # is stripped before any container or fence judgement. Nested and space-less
 # forms ("> >", ">>") both count.
 #
-# The lookahead is load-bearing. CommonMark would read ">=foo" as a quote of
-# "=foo", but in Rust comments a line wrapping onto a leading ">=" is an
-# operator, and stripping its ">" silently rewrites the text every rule then
-# judges -- and the text a Tier B failure quotes back. A marker must be
-# followed by space, another marker, or the end of the line.
-BLOCKQUOTE_RE = re.compile(r"^([ \t]*)((?:>(?=[ \t>]|$)[ \t]?)+)")
-ONE_QUOTE_RE = re.compile(r"^([ \t]*)>(?=[ \t>]|$)[ \t]?")
+# The lookahead is load-bearing, and only just wide enough. CommonMark needs
+# no space after ">", so ">~~~rust" opens a quoted fence -- but a Rust comment
+# wrapping onto a leading ">=" is an operator, and stripping its ">" silently
+# rewrites the text every rule then judges, and the text a Tier B failure
+# quotes back. So the exception is ">=" and nothing else.
+BLOCKQUOTE_RE = re.compile(r"^([ \t]*)((?:>(?!=)[ \t]?)+)")
+ONE_QUOTE_RE = re.compile(r"^([ \t]*)>(?!=)[ \t]?")
 TABLE_RE = re.compile(r"^\s*\|")
 HEADING_RE = re.compile(r"^\s*#{1,6}(?:\s|$)")
 # A thematic break -- one punctuation character repeated. CommonMark spells it
@@ -349,7 +349,12 @@ SEPARATOR_RE = re.compile(
 # a section rule is not a word of the sentence under it -- but only a real
 # break may change container state, or a decorative line grants the next "22."
 # a container, and its fence an allowance, that the rendered document has not.
-THEMATIC_BREAK_RE = re.compile("^[ \t]*([-_*])(?:[ \t]*\\1){2,}[ \t]*$")
+THEMATIC_BREAK_RE = re.compile("^([ \t]*)([-_*])(?:[ \t]*\\2){2,}[ \t]*$")
+# A Setext underline: "=" under a paragraph line makes that paragraph a
+# heading. Whether a run of "=" is a heading or ordinary text is decided by
+# POSITION, not shape -- with a paragraph open it underlines one, and at the
+# start of a block it is the decorative rule round thirty-three fixed.
+SETEXT_RE = re.compile("^[ \t]{0,3}=+[ \t]*$")
 SENTENCE_SPLIT_RE = re.compile(r"(?<=[.!?])\s+")
 
 
@@ -695,7 +700,7 @@ def list_content(text: str, container: int) -> tuple[int, int] | None:
     # A thematic break wins over a list item in CommonMark, and "* * *" or
     # "- - -" matches both. Reading one as an item opens a container -- and a
     # fence allowance -- where the rendered document has a horizontal rule.
-    if THEMATIC_BREAK_RE.match(text):
+    if thematic_break(text, container):
         return None
     marker = LIST_MARKER_RE.match(text)
     if not marker:
@@ -739,6 +744,17 @@ def strip_quote(text: str, container: int = 0) -> str:
     """
     match = quote_marker(text, container)
     return text[match.end():] if match else text
+
+
+def thematic_break(text: str, container: int) -> bool:
+    """Is `text` a thematic break its container would accept?
+
+    Three columns past the container, like every other CommonMark marker.
+    Past that it is indented content, and treating it as a break clears a
+    paragraph the rendered document still has open.
+    """
+    match = THEMATIC_BREAK_RE.match(text)
+    return bool(match) and len(match.group(1).expandtabs(4)) <= container + 3
 
 
 def strip_quote_levels(text: str, levels: int, container: int) -> str:
@@ -863,10 +879,15 @@ def update_containers(
     # break or a table row is its own block, and treating one as a paragraph
     # refuses the next "22." a container it is entitled to. A list marker's
     # own text IS a paragraph, so those still count.
+    # Only a CommonMark block ends a paragraph. A pipe-prefixed line is not
+    # one -- tables are a GFM extension, and "| not a table" is prose, so
+    # clearing here would hand the next "22." a container the rendered
+    # document has not. A Setext underline IS one, but only with a paragraph
+    # above it to underline.
     prose = bool(body.strip()) and not (
         HEADING_RE.match(body)
-        or THEMATIC_BREAK_RE.match(body)
-        or TABLE_RE.match(body)
+        or thematic_break(body, stack[-1][0] if stack else 0)
+        or (paragraph and SETEXT_RE.match(body))
     )
     return stack, prose
 
@@ -1949,6 +1970,34 @@ RULE_TESTS = [
         "/// ===\n/// 22. item\n///     ~~~rust\n///     TODO: issue required\n",
         {("CH002", 4)},
         "a decorative rule is paragraph text, not a thematic break",
+    ),
+    (
+        "/// Heading\n/// ===\n/// 22. item\n///     ~~~rust\n"
+        "///     TODO: fixture placeholder\n///     ~~~\n",
+        set(),
+        "but the same rule under a paragraph is a Setext heading",
+    ),
+    (
+        "/// >~~~rust\n/// >TODO: fixture placeholder\n/// >~~~\n",
+        set(),
+        "a quote marker needs no space after it",
+    ),
+    (
+        "/// Only defer when it too is\n/// >= end_at and the slot is free.\n",
+        set(),
+        "but \">=\" is still an operator, not a quote",
+    ),
+    (
+        "/// Intro\n///     * * *\n/// 22. item\n///     ~~~rust\n"
+        "///     TODO: issue required\n",
+        {("CH002", 5)},
+        "an over-indented thematic break is indented content",
+    ),
+    (
+        "/// Intro\n/// | not a table\n/// 22. item\n///     ~~~rust\n"
+        "///     TODO: issue required\n",
+        {("CH002", 5)},
+        "a pipe-prefixed line is prose, not a block that ends a paragraph",
     ),
     (
         "/// - > word1 word2 word3 word4 word5 word6 word7 word8 word9 word10 word11 word12 word13 word14 word15 word16 word17 word18 word19 word20 word21 word22 word23 word24 word25.\n",

@@ -1085,3 +1085,36 @@ it is the right line, and it is one I had blurred by reusing a pattern written
 for the prose path in the container path two rounds ago.
 
 Corpus effect: none, for the fifteenth round running.
+
+### Round thirty-four — four block rules, three of them already written elsewhere
+
+Four findings, all verified to reproduce first.
+
+**A quote marker needs no space.** `>~~~rust` opens a quoted fence in
+CommonMark; round twenty-three's lookahead demanded whitespace, another
+marker, or end of line. That lookahead exists only to keep a wrapped `>=`
+operator from being read as a quote, so it is narrowed to exactly that: the
+exception is `>=` and nothing else.
+
+**A thematic break is indented like every other marker** — at most three
+columns past its container. It accepted any indentation, so an indented `* * *`
+inside a paragraph cleared the paragraph state and invented a list below it.
+
+**A pipe-prefixed line is not a block.** Tables are a GFM extension, not
+CommonMark, and `| not a table` is prose. It no longer touches container
+state; `TABLE_RE` still ends a prose unit, which is the job it was written for.
+Same split as round thirty-three's separator, one pattern along.
+
+**A Setext underline ends a paragraph.** `===` under a paragraph line makes
+that paragraph a heading. Round thirty-three established that `===` at the
+start of a block is decorative text, and both readings are correct — this is
+the position-not-shape split again, and the paragraph flag already
+distinguishes them, so no lookahead is needed.
+
+Three of the four are rules this file already applies somewhere else: the
+container-relative indent limit, the CommonMark-only test for container state,
+and the position split. The pattern named in round thirty-three — a rule fixed
+in one place and unexamined in the next — is now the most productive one in
+this review.
+
+Corpus effect: none, for the sixteenth round running.
