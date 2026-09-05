@@ -947,3 +947,37 @@ the sentence. The peel is used only when it actually consumes something, so
 such a line reads exactly as it always has.
 
 Corpus effect: none, for the tenth round running.
+
+### Round twenty-nine — nesting is a scope, not a boundary; uninitialized bindings
+
+Two findings, both verified to reproduce first.
+
+**A nested comment inside a fenced example lost the fence.** A doc comment
+holding a Rust example that itself contains a block comment —
+
+```
+/**
+```rust
+/* TODO: fixture placeholder */
+```
+*/
+```
+
+— had the inner comment split into its own run with fresh fence state, so the
+example's own `TODO` failed CH002.
+
+Round twelve gave a nested comment a new group precisely so its fence could
+not leak outward, and that was half right: nesting is a *scope*, not a
+boundary. A piece now records how deep it sits, its run is the whole outermost
+comment, and the fence state is stacked per level — going deeper inherits the
+enclosing fence, coming back out restores what was saved. Both directions hold
+at once, which the group split could not express.
+
+**Uninitialized bindings bypassed CH001.** `let mut retries: usize;` has no
+`=` for the destructuring or assignment branches to anchor on. The new
+alternative anchors on the type annotation instead, since English does not put
+a colon between two bare words — and the 644-line adversarial prose sweep
+immediately caught the first attempt on `let T: Send is required here;`, so it
+carries the same three-bare-words rejection the other `let` branches use.
+
+Corpus effect: none, for the eleventh round running.

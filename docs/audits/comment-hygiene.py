@@ -234,6 +234,11 @@ COMMENTED_CODE_RE = re.compile(
             =\s*[^=;]+(?:;|\s+else\s*\{)\s*$
       | let\s+(?:[\w]+::)*[A-Z]\w*\s*(?:\([^;]*\)|\{[^;]*\})\s*=\s*[^=;]+
             (?:;|\s+else\s*\{)\s*$
+      # An uninitialized binding. No `=` to anchor on, so it needs a type
+      # annotation to separate "let mut retries: usize;" from "let the reader
+      # decide;" -- English does not put a colon between two bare words.
+      | let\s+(?:mut\s+)?\w+\s*:
+            (?!\s*(?:\w+\s+){2,}\w+\s*;\s*$)\s*[\w:<>&'\[\]\s,()]+;\s*$
       | use\s+(?:\w+::)*(?:\w+|\*|\{[\w:,\s*]+\})(?:\s+as\s+\w+)?;\s*$
       | \#!?\[[\w:()"'=,./\s-]+\]\s*$
       | \}[,;)]*\s*$
@@ -368,21 +373,32 @@ class Piece:
     line number.
     """
 
-    __slots__ = ("line", "marker", "body", "trailing", "block", "group")
+    __slots__ = ("line", "marker", "body", "trailing", "block", "group", "nest")
 
     def __init__(
-        self, line: int, marker: str, body: str, trailing: bool, block: bool, group: int = -1
+        self,
+        line: int,
+        marker: str,
+        body: str,
+        trailing: bool,
+        block: bool,
+        group: int = -1,
+        nest: int = 0,
     ) -> None:
         self.line = line
         self.marker = marker
         self.body = body
         self.trailing = trailing
         self.block = block
-        # Which `/* */` this piece came from. One block comment is one comment
-        # however many lines it spans, so its pieces stay in one run even when
-        # the block opens after code on its first line. -1 for line comments,
+        # Which OUTERMOST `/* */` this piece came from. One block comment is
+        # one comment however many lines it spans and however many comments
+        # nest inside it, so its pieces stay in one run. -1 for line comments,
         # which are grouped by adjacency instead.
         self.group = group
+        # How deep inside that comment the piece sits. A nested comment is
+        # inside the enclosing one's fenced example if there is one, so it
+        # inherits the fence; what it opens itself does not survive the close.
+        self.nest = nest
 
     @property
     def text(self) -> str:
@@ -465,11 +481,13 @@ def extract_comments(source: str) -> list[Piece]:
                 marker = "/**"
             depth = 1
             block_group += 1
+            root_group = block_group
             # Past the WHOLE marker: leaving the `!` of `/*!` on the body made
             # the anchored rules miss `/*! TODO */` and `/*! let x = 1; */`.
             i += len(marker)
             seg_start = i
             seg_line = line
+            seg_nest = depth
             first = True
             while i < n and depth > 0:
                 if source.startswith("/*", i):
@@ -479,14 +497,16 @@ def extract_comments(source: str) -> list[Piece]:
                     # beginning "outer", and the nested code is never anchored.
                     if i > seg_start:
                         pieces.append(
-                            Piece(seg_line, marker, source[seg_start:i], code_on_line and first, True, block_group)
+                            Piece(seg_line, marker, source[seg_start:i], code_on_line and first, True, root_group, seg_nest)
                         )
                         first = False
+                    # A nested comment stays in the enclosing comment's run,
+                    # and `nest` records that it is inside it. The fence state
+                    # is stacked per nesting level rather than reset here: the
+                    # inner text is inside the outer fenced example if there
+                    # is one, while a fence the inner text opens is discarded
+                    # when it closes.
                     depth += 1
-                    # A nested comment is its own comment: give it a fresh
-                    # group so its fence state cannot leak into the text that
-                    # resumes after it closes.
-                    block_group += 1
                     # Past the WHOLE nested marker, for the same reason the
                     # outer one does it: a retained `!` from `/*!` leaves the
                     # anchored rules staring at "! TODO".
@@ -498,35 +518,37 @@ def extract_comments(source: str) -> list[Piece]:
                     i += nested
                     seg_start = i
                     seg_line = line
+                    seg_nest = depth
                 elif source.startswith("*/", i):
                     if depth > 1 and i > seg_start:
                         pieces.append(
-                            Piece(seg_line, marker, source[seg_start:i], code_on_line and first, True, block_group)
+                            Piece(seg_line, marker, source[seg_start:i], code_on_line and first, True, root_group, seg_nest)
                         )
                         first = False
                     depth -= 1
                     i += 2
                     if depth > 0:
-                        # Resuming the enclosing comment. New group again, so
-                        # the text after a nested block is judged on its own.
-                        block_group += 1
+                        # Resuming the enclosing comment, same run and same
+                        # nesting level it had before the nested comment.
                         seg_start = i
                         seg_line = line
+                        seg_nest = depth
                 elif source[i] == "\n":
                     pieces.append(
-                        Piece(seg_line, marker, source[seg_start:i], code_on_line and first, True, block_group)
+                        Piece(seg_line, marker, source[seg_start:i], code_on_line and first, True, root_group, seg_nest)
                     )
                     first = False
                     line += 1
                     i += 1
                     seg_start = i
                     seg_line = line
+                    seg_nest = depth
                 else:
                     i += 1
             tail_end = i - 2 if depth == 0 else i
             if tail_end > seg_start:
                 pieces.append(
-                    Piece(seg_line, marker, source[seg_start:tail_end], code_on_line and first, True, block_group)
+                    Piece(seg_line, marker, source[seg_start:tail_end], code_on_line and first, True, root_group, seg_nest)
                 )
             code_on_line = True
             continue
@@ -955,6 +977,26 @@ def comment_runs(pieces: list[Piece]):
         yield run
 
 
+def nesting_shift(
+    saved: list, nest: int, previous: int, state: tuple
+) -> tuple[list, tuple]:
+    """Carry fence state across a nested comment boundary.
+
+    Going deeper INHERITS the enclosing state -- a nested comment inside a
+    fenced example is part of that example, so its text is sample text.
+    Coming back out RESTORES what was saved, so a fence the nested comment
+    opened cannot leak into the text that resumes after it closes.
+    """
+    saved = list(saved)
+    while len(saved) < nest:
+        saved.append(state)
+    while len(saved) > nest:
+        state = saved.pop()
+    if nest < previous:
+        return saved, state
+    return saved, state
+
+
 def comment_lines(pieces: list[Piece]):
     """Yield (lineno, text, in_fence) per comment piece, tracking ``` fences.
 
@@ -969,7 +1011,14 @@ def comment_lines(pieces: list[Piece]):
         scope = (0, 0, 0)
         stack: list[tuple[int, int]] = []
         paragraph = False
+        saved: list = []
+        nest = run[0].nest
         for piece in run:
+            if piece.nest != nest:
+                saved, (fence, scope) = nesting_shift(
+                    saved, piece.nest, nest, (fence, scope)
+                )
+                nest = piece.nest
             text = piece.text
             if fence is not None and leaves_container(text, scope):
                 fence = None
@@ -1080,6 +1129,8 @@ def prose_units(pieces: list[Piece]) -> list[tuple[int, str]]:
         paragraph = False
         in_list = False
         quoted = 0
+        saved: list = []
+        nest = block[0].nest
 
         def flush():
             nonlocal run, run_lines
@@ -1096,6 +1147,12 @@ def prose_units(pieces: list[Piece]) -> list[tuple[int, str]]:
             run, run_lines = [], []
 
         for piece in block:
+            if piece.nest != nest:
+                flush()
+                saved, (fence, scope) = nesting_shift(
+                    saved, piece.nest, nest, (fence, scope)
+                )
+                nest = piece.nest
             body = piece.text
             if fence is not None and leaves_container(body, scope):
                 fence = None
@@ -1774,6 +1831,11 @@ RULE_TESTS = [
         "a fence inside a nested item is scoped to the inner one",
     ),
     (
+        "/**\n```rust\n/* TODO: fixture placeholder */\n```\n*/\npub fn a() {}\n",
+        set(),
+        "a nested comment inside a fenced example is part of the example",
+    ),
+    (
         "/// - > word1 word2 word3 word4 word5 word6 word7 word8 word9 word10 word11 word12 word13 word14 word15 word16 word17 word18 word19 word20 word21 word22 word23 word24 word25.\n",
         set(),
         "a quote behind a list marker is not a word of the sentence",
@@ -1884,6 +1946,11 @@ CODE_SHAPE_TESTS = [
     ("let Ok(row) = fetch() else {", True),
     ("let (Some(a), Some(b)) = pair else {", True),
     ("let [first, ..] = slice else {", True),
+    ("let mut retries: usize;", True),
+    ("let buf: Vec<u8>;", True),
+    ("let handle: &'a mut Worker;", True),
+    ("let T: Send is required here;", False),
+    ("let this be the rule: the worker parks;", False),
     ("let the caller decide;", False),
     ("let (or rather, allow) the worker retry;", False),
     ("let us assume the queue is paused;", False),
