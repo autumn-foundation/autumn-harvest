@@ -855,6 +855,61 @@ pub fn global_admission_metrics() -> Option<Arc<dyn crate::telemetry::MetricsRec
         .clone()
 }
 
+/// The result of [`resolve_metrics_with_global_fallback`].
+///
+/// Owns the process-global `Arc`, when it was the one resolved, so the
+/// reference [`Self::as_dyn`] hands back stays valid for as long as this
+/// value is kept alive.
+pub enum ResolvedMetrics<'a> {
+    /// The caller supplied a recorder directly.
+    Caller(&'a (dyn crate::telemetry::MetricsRecorder + Send + Sync)),
+    /// The caller supplied none; the process-global recorder was installed.
+    Global(Arc<dyn crate::telemetry::MetricsRecorder>),
+    /// The caller supplied none and no process-global recorder is installed.
+    Absent,
+}
+
+impl ResolvedMetrics<'_> {
+    /// Borrow the resolved recorder, if any.
+    #[must_use]
+    pub fn as_dyn(&self) -> Option<&(dyn crate::telemetry::MetricsRecorder + Send + Sync)> {
+        match self {
+            // A tuple-free `match` still needs the explicit `+ Send + Sync`
+            // coercion at each arm: `dyn MetricsRecorder` alone (without the
+            // trait's own `Send + Sync` supertraits re-asserted at the
+            // reference site) does not unify with the annotated return type,
+            // even though every concrete implementor must already be
+            // `Send + Sync` (the trait declares them as supertraits).
+            Self::Caller(m) => Some(*m),
+            Self::Global(g) => Some(g.as_ref()),
+            Self::Absent => None,
+        }
+    }
+}
+
+/// Resolve an optional caller-supplied metrics recorder, falling back to the
+/// process-global recorder ([`global_admission_metrics`]) when the caller
+/// passed `None`.
+///
+/// Centralizes a fallback needed at every terminal chokepoint that has no
+/// caller-supplied recorder in scope — the cancel / terminate /
+/// parent-close-cascade paths in `execution.rs` all call
+/// `completion_trigger::evaluate_triggers_for_execution_collecting` (and,
+/// transitively, `concurrency::supersede_running_for_key`) with
+/// `metrics: None`. Without this fallback, a signal recorded at one of those
+/// chokepoints (an admission-gate block, issue #618 F-round5; a nested-
+/// admission residual, issue #1197 item 2) would be dropped-and-recorded but
+/// never counted.
+#[must_use]
+pub fn resolve_metrics_with_global_fallback(
+    metrics: Option<&(dyn crate::telemetry::MetricsRecorder + Send + Sync)>,
+) -> ResolvedMetrics<'_> {
+    metrics.map_or_else(
+        || global_admission_metrics().map_or(ResolvedMetrics::Absent, ResolvedMetrics::Global),
+        ResolvedMetrics::Caller,
+    )
+}
+
 // ── DB layer (requires `db` feature) ─────────────────────────────────────────
 
 #[cfg(feature = "db")]

@@ -244,6 +244,7 @@ mod scanner {
         Option<(String, String, Option<uuid::Uuid>, Option<String>)>,
         Vec<DeferredTriggerStart>,
         Vec<(ExecutionId, String)>,
+        Vec<crate::execution::StartCancelledRun>,
     )> {
         use crate::schema::harvest_workflow_executions::dsl as exec_dsl;
 
@@ -282,7 +283,7 @@ mod scanner {
             origin,
         )) = current
         else {
-            return Ok((None, Vec::new(), Vec::new()));
+            return Ok((None, Vec::new(), Vec::new(), Vec::new()));
         };
         // PAUSED is a non-terminal active state (issue #383): an in-flight
         // activity that was admitted before the pause can still be running, so a
@@ -290,7 +291,7 @@ mod scanner {
         // owning workflow rather than leave it parked in PAUSED forever with a
         // dead task. Treat PAUSED like RUNNING here.
         if state != "RUNNING" && state != "PAUSED" {
-            return Ok((None, Vec::new(), Vec::new()));
+            return Ok((None, Vec::new(), Vec::new(), Vec::new()));
         }
 
         let history = crate::store::load_history_with_codecs(conn, exec_id, codecs).await?;
@@ -348,11 +349,13 @@ mod scanner {
         }
 
         let (mut deferred, closed_children) = apply_parent_close_cascade(conn, exec_id).await?;
-        let failed_triggers = crate::completion_trigger::evaluate_triggers_for_execution(
+        let mut pending_cancel_metrics = Vec::new();
+        let failed_triggers = crate::completion_trigger::evaluate_triggers_for_execution_collecting(
             conn,
             exec_id,
             crate::completion_trigger::TerminalState::Failed,
             metrics,
+            &mut pending_cancel_metrics,
         )
         .await?;
         deferred.extend(failed_triggers);
@@ -394,6 +397,7 @@ mod scanner {
             Some((workflow_id, workflow_name, schedule_id, origin)),
             deferred,
             closed_children,
+            pending_cancel_metrics,
         ))
     }
 
@@ -462,15 +466,16 @@ mod scanner {
         // workflow's (id, name, schedule_id, origin) when it was actually failed
         // RUNNING → FAILED so the schedule failure counter can be bumped (with
         // the correct origin) after commit.
-        let (acted, failed_workflow, deferred_starts, closed_children) =
+        let (acted, failed_workflow, deferred_starts, closed_children, pending_cancel_metrics) =
             Box::pin(conn.transaction::<(
                 bool,
                 Option<(String, String, Option<uuid::Uuid>, Option<String>)>,
                 Vec<DeferredTriggerStart>,
                 Vec<(ExecutionId, String)>,
+                Vec<crate::execution::StartCancelledRun>,
             ), HarvestError, _>(async |conn| {
                 let Some(worker_id) = worker else {
-                    return Ok((false, None, Vec::new(), Vec::new()));
+                    return Ok((false, None, Vec::new(), Vec::new(), Vec::new()));
                 };
                 let current: Option<(String, Option<String>, i32)> = dsl::harvest_task_queue
                     .find(task_id)
@@ -483,10 +488,10 @@ mod scanner {
                 match current {
                     Some((state, Some(wid), strikes))
                         if state == "RUNNING" && wid == worker_id && strikes == prior_strikes => {}
-                    _ => return Ok((false, None, Vec::new(), Vec::new())),
+                    _ => return Ok((false, None, Vec::new(), Vec::new(), Vec::new())),
                 }
                 if !worker_still_dead(conn, &worker_id, worker_stale_secs).await? {
-                    return Ok((false, None, Vec::new(), Vec::new()));
+                    return Ok((false, None, Vec::new(), Vec::new(), Vec::new()));
                 }
 
                 dead_letter(conn, &entry).await?;
@@ -503,24 +508,34 @@ mod scanner {
                     .await
                     .map_err(crate::error::database_error)?;
 
-                let (failed_workflow, deferred, closed_children) = match workflow_exec_id {
-                    Some(exec_uuid) => {
-                        fail_owning_workflow(
-                            conn,
-                            execution_id_from_uuid(exec_uuid),
-                            &error,
-                            Some(metrics),
-                            codecs,
-                        )
-                        .await?
-                    }
-                    None => (None, Vec::new(), Vec::new()),
-                };
-                Ok((true, failed_workflow, deferred, closed_children))
+                let (failed_workflow, deferred, closed_children, pending_cancel_metrics) =
+                    match workflow_exec_id {
+                        Some(exec_uuid) => {
+                            fail_owning_workflow(
+                                conn,
+                                execution_id_from_uuid(exec_uuid),
+                                &error,
+                                Some(metrics),
+                                codecs,
+                            )
+                            .await?
+                        }
+                        None => (None, Vec::new(), Vec::new(), Vec::new()),
+                    };
+                Ok((
+                    true,
+                    failed_workflow,
+                    deferred,
+                    closed_children,
+                    pending_cancel_metrics,
+                ))
             }))
             .await?;
 
         if acted {
+            // issue #1197, item 1: emitted only now that this transaction has
+            // actually committed.
+            crate::execution::emit_start_cancel_metrics(metrics, &pending_cancel_metrics);
             metrics.record_task_quarantined(&task.queue_name, QUARANTINE_REASON);
             // Best-effort: count the poison-pill workflow failure toward the
             // schedule auto-pause threshold (issue #360), mirroring the normal

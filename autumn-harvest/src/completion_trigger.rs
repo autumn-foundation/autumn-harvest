@@ -1192,7 +1192,22 @@ impl DeferredTriggerStart {
     }
 }
 
-#[allow(clippy::too_many_lines)]
+/// Evaluate completion triggers for a just-sealed terminal execution,
+/// discarding any latest-wins supersede cancellation metrics the same-shard
+/// inline start path collects.
+///
+/// This is the pre-issue-#1197 entry point, kept byte-for-byte for the 56 test
+/// call sites and any production call site with no convenient post-commit
+/// point of its own. It delegates to
+/// [`evaluate_triggers_for_execution_collecting`] with a throwaway collector,
+/// so a same-shard supersede performed here emits neither
+/// `harvest.concurrency.superseded` nor the incumbent's cancelled terminal —
+/// matching the behaviour before issue #811 gave this path a metrics-emitting
+/// start call at all (an unconditional under-count, not a regression: see
+/// issue #1197). A caller that has its own post-commit hook should call
+/// [`evaluate_triggers_for_execution_collecting`] directly instead and emit
+/// the collected metrics via [`crate::execution::emit_start_cancel_metrics`]
+/// once its enclosing transaction has actually committed.
 #[cfg(feature = "db")]
 pub fn evaluate_triggers_for_execution<'a>(
     conn: &'a mut diesel_async::AsyncPgConnection,
@@ -1202,13 +1217,52 @@ pub fn evaluate_triggers_for_execution<'a>(
 ) -> futures::future::BoxFuture<'a, crate::error::HarvestResult<Vec<DeferredTriggerStart>>> {
     use futures::FutureExt;
     async move {
+        let mut discarded_cancel_metrics = Vec::new();
+        evaluate_triggers_for_execution_collecting(
+            conn,
+            exec_id,
+            state,
+            metrics,
+            &mut discarded_cancel_metrics,
+        )
+        .await
+    }
+    .boxed()
+}
+
+/// Evaluate completion triggers for a just-sealed terminal execution.
+///
+/// Identical to [`evaluate_triggers_for_execution`] except for one thing: a
+/// same-shard inline trigger start that performs a latest-wins supersede
+/// (issue #811) pushes its [`crate::execution::StartCancelledRun`] samples
+/// into `pending` instead of emitting them immediately. The emission side
+/// (`start_or_load_workflow_execution_with_metrics`) fires at return, which is
+/// INSIDE this function's caller's still-open terminal transaction — if that
+/// transaction later rolls back, an eager emission would already have counted
+/// a cancellation that never became durable (issue #1197, item 1).
+///
+/// Callers MUST call [`crate::execution::emit_start_cancel_metrics`] with the
+/// accumulated `pending` list only **after** their enclosing transaction has
+/// committed — the exact same discipline already required of the
+/// `StartCancelledRun`s a fresh workflow start collects.
+#[allow(clippy::too_many_lines)]
+#[cfg(feature = "db")]
+pub fn evaluate_triggers_for_execution_collecting<'a>(
+    conn: &'a mut diesel_async::AsyncPgConnection,
+    exec_id: crate::types::ExecutionId,
+    state: TerminalState,
+    metrics: Option<&'a (dyn crate::telemetry::MetricsRecorder + Send + Sync)>,
+    pending: &'a mut Vec<crate::execution::StartCancelledRun>,
+) -> futures::future::BoxFuture<'a, crate::error::HarvestResult<Vec<DeferredTriggerStart>>> {
+    use futures::FutureExt;
+    async move {
         use diesel::prelude::*;
         use diesel_async::RunQueryDsl;
         use crate::schema::harvest_completion_triggers::dsl as triggers_dsl;
         use crate::schema::harvest_completion_trigger_fires::dsl as fires_dsl;
         use crate::schema::harvest_workflow_executions::dsl as execs_dsl;
         use crate::models::{CompletionTriggerDb, NewCompletionTriggerFireDb, WorkflowExecution, NewCompletionTriggerOutboxDb};
-        use crate::execution::{StartWorkflowParams, start_or_load_workflow_execution_with_metrics};
+        use crate::execution::{StartWorkflowParams, start_or_load_workflow_execution_collect, check_and_report_unfinished_handlers};
         use crate::types::WorkflowIdReusePolicy;
         use crate::types::Priority;
 
@@ -1524,24 +1578,9 @@ pub fn evaluate_triggers_for_execution<'a>(
                     // the fallback a completion-trigger start blocked by a gate on
                     // one of those terminal paths would be dropped-and-recorded but
                     // NEVER counted — a hole in the "zero un-counted blocks" bar.
-                    let fallback_recorder = if metrics.is_none() {
-                        crate::admission_gate::global_admission_metrics()
-                    } else {
-                        None
-                    };
-                    // A tuple `match` (rather than `if let ... else`) so the
-                    // `&dyn MetricsRecorder` -> annotated `+ Send + Sync` coercion
-                    // still applies at the `Some(g.as_ref())` expression site (the
-                    // trait has both supertraits), matching how the worker passes
-                    // `registry.telemetry().metrics.as_ref()`.
-                    let effective_metrics: Option<
-                        &(dyn crate::telemetry::MetricsRecorder + Send + Sync),
-                    > = match (metrics, fallback_recorder.as_ref()) {
-                        (Some(m), _) => Some(m),
-                        (None, Some(g)) => Some(g.as_ref()),
-                        (None, None) => None,
-                    };
-                    if let Some(m) = effective_metrics {
+                    let resolved_metrics =
+                        crate::admission_gate::resolve_metrics_with_global_fallback(metrics);
+                    if let Some(m) = resolved_metrics.as_dyn() {
                         // Only count the FIRST resolution of this (source, trigger)
                         // pair (issue #618, F4): cascade re-entry / multi-terminal-
                         // path re-eval hits ON CONFLICT DO NOTHING (inserted == 0)
@@ -1616,25 +1655,22 @@ pub fn evaluate_triggers_for_execution<'a>(
                 };
 
                 let target_exec_id = crate::types::ExecutionId::new_for_shard(target_shard);
-                // `_with_metrics` (not the metrics-less wrapper) so a latest-wins
-                // supersede performed by this target is counted (issue #811,
-                // Codex round 2): the wrapper discards the collected
-                // cancellations, so `harvest.concurrency.superseded` and the
-                // incumbent's cancelled terminal were both dropped even though a
-                // recorder is in scope here. Emission is inline, matching every
-                // other counter this function already records inside the source's
-                // terminal transaction (`record_completion_trigger_fired`).
-                //
-                // Residual (Codex round 3): emission happens at return, not after
-                // the enclosing terminal transaction commits, so a rollback of that
-                // transaction leaves both counters emitted for a supersede that never
-                // became durable. Bounded to rolled-back terminal transactions, and
-                // strictly better than the pre-fix state (never emitted at all, an
-                // unconditional under-count). Deferring emission needs a post-commit
-                // collector threaded out of `evaluate_triggers_for_execution`, which
-                // changes its return type across 71 call sites; tracked as a
-                // follow-up issue.
-                let start_res = match start_or_load_workflow_execution_with_metrics(
+                // `_collect` (issue #1197, item 1): a latest-wins supersede
+                // performed by this same-shard target must still be counted
+                // (issue #811, Codex round 2's fix), but NOT emitted here —
+                // this call runs INSIDE the source execution's own still-open
+                // terminal transaction, and `_with_metrics` used to emit at
+                // return, so a rollback of that enclosing transaction left
+                // both `harvest.concurrency.superseded` and the incumbent's
+                // cancelled terminal counted for a cancellation that never
+                // became durable. `_collect` performs the identical start
+                // (including the nested supersede) but returns the collected
+                // `StartCancelledRun`s instead of emitting them; they are
+                // pushed onto `pending` below and left for the caller of
+                // `evaluate_triggers_for_execution_collecting` to emit once
+                // ITS OWN enclosing transaction has actually committed.
+                let (start_res, cancel_deferred_starts, cancel_deferred_checks, cancel_metrics) =
+                    match start_or_load_workflow_execution_collect(
                     conn,
                     StartWorkflowParams {
                         workflow_name: &trigger_db.target_workflow_name,
@@ -1684,6 +1720,11 @@ pub fn evaluate_triggers_for_execution<'a>(
                         start_source_ref: Some(source_exec_id_str.as_str()),
                         started_by: None,
                     },
+                    // Not nested inside a caller-managed outer transaction from
+                    // this call's own point of view, and no debounce-reject
+                    // check applies to a completion-trigger target start.
+                    false,
+                    false,
                     metrics,
                     // The inline same-shard completion-trigger start keeps its own
                     // unlocked pre-check gate above (it also performs the fires-row
@@ -1829,6 +1870,24 @@ pub fn evaluate_triggers_for_execution<'a>(
                     }
                     Err(e) => return Err(e),
                 };
+
+                // Mirrors `start_or_load_workflow_execution_with_metrics`'s own
+                // post-`_collect` bookkeeping: spawn this start's own deferred
+                // follow-ups and run its unfinished-handler checks immediately
+                // (unchanged from before this fix — that timing is not the
+                // issue #1197 residual). Only the cancellation SAMPLES are new:
+                // pushed onto `pending` rather than emitted, for the caller of
+                // `evaluate_triggers_for_execution_collecting` to emit after ITS
+                // enclosing transaction commits.
+                for start in cancel_deferred_starts {
+                    start.spawn();
+                }
+                for check in cancel_deferred_checks {
+                    let _ =
+                        check_and_report_unfinished_handlers(conn, check.0, &check.1, metrics)
+                            .await;
+                }
+                pending.extend(cancel_metrics);
 
                 if let Some(m) = metrics {
                     if start_res.created {

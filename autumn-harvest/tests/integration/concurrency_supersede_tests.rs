@@ -36,10 +36,12 @@
 //! Execution: set `HARVEST_TEST_DATABASE_URL` to a migrated Postgres to run
 //! against it, otherwise a fresh testcontainers Postgres 16 is booted.
 
-use std::sync::{Arc, Mutex};
+use std::collections::HashMap;
+use std::sync::{Arc, LazyLock, Mutex};
 
 use autumn_harvest::StartWorkflowParams;
-use autumn_harvest::concurrency::ConcurrencyOnConflict;
+use autumn_harvest::completion_trigger::{GLOBAL_WORKFLOW_METADATA, WorkflowMetadata};
+use autumn_harvest::concurrency::{ConcurrencyOnConflict, ConcurrencyPolicy};
 use autumn_harvest::execution::start_or_load_workflow_execution_with_metrics;
 use autumn_harvest::telemetry::MetricsRecorder;
 use autumn_harvest::types::{
@@ -94,11 +96,18 @@ async fn scrub(conn: &mut AsyncPgConnection) {
 struct CapturingMetrics {
     superseded: Mutex<Vec<String>>,
     cancelled_terminals: Mutex<Vec<String>>,
+    residual_over_limit: Mutex<Vec<(String, u64)>>,
 }
 
 impl MetricsRecorder for CapturingMetrics {
     fn record_concurrency_superseded(&self, workflow: &str) {
         self.superseded.lock().unwrap().push(workflow.to_owned());
+    }
+    fn record_concurrency_residual_over_limit(&self, workflow: &str, gap: u64) {
+        self.residual_over_limit
+            .lock()
+            .unwrap()
+            .push((workflow.to_owned(), gap));
     }
     fn record_workflow_terminal(
         &self,
@@ -114,6 +123,72 @@ impl MetricsRecorder for CapturingMetrics {
                 .lock()
                 .unwrap()
                 .push(workflow_name.to_owned());
+        }
+    }
+}
+
+/// Serializes tests that install `GLOBAL_WORKFLOW_METADATA` against each
+/// other. CI runs this suite with `--test-threads=1` (see
+/// `.github/ci/integration-suites.txt`), so this is primarily a local
+/// `cargo test`-without-that-flag safeguard — mirroring the `TEST_SERIAL`
+/// convention already used by `completion_callback_tests.rs` and
+/// `quota_enforcement_tests.rs`.
+static TEST_SERIAL: LazyLock<tokio::sync::Mutex<()>> =
+    LazyLock::new(|| tokio::sync::Mutex::new(()));
+
+/// RAII installer for [`GLOBAL_WORKFLOW_METADATA`] (ported from
+/// `quota_enforcement_tests.rs`'s identical helper): installs the given map
+/// and restores whatever was there before on drop — including on a mid-test
+/// panic, unlike a bare manual take/restore pair (which would leak a
+/// polluted global into every subsequent test in the process on an assertion
+/// failure).
+struct MetadataGuard {
+    previous: Option<HashMap<String, WorkflowMetadata>>,
+    _permit: tokio::sync::MutexGuard<'static, ()>,
+}
+
+impl MetadataGuard {
+    async fn install(map: HashMap<String, WorkflowMetadata>) -> Self {
+        let permit = TEST_SERIAL.lock().await;
+        let previous = {
+            let mut lock = GLOBAL_WORKFLOW_METADATA.write().expect("metadata lock");
+            lock.take()
+        };
+        {
+            let mut lock = GLOBAL_WORKFLOW_METADATA.write().expect("metadata lock");
+            *lock = Some(map);
+        }
+        Self {
+            previous,
+            _permit: permit,
+        }
+    }
+
+    /// Convenience for the common single-workflow-type case.
+    async fn install_one(workflow_name: &str, concurrency: ConcurrencyPolicy) -> Self {
+        let mut map = HashMap::new();
+        map.insert(
+            workflow_name.to_string(),
+            WorkflowMetadata {
+                concurrency: Some(concurrency),
+                max_input_bytes: None,
+                owner: None,
+                runbook_url: None,
+                severity: None,
+                input_schema: None,
+                sla: None,
+                retry_policy: None,
+                quota: None,
+            },
+        );
+        Self::install(map).await
+    }
+}
+
+impl Drop for MetadataGuard {
+    fn drop(&mut self) {
+        if let Ok(mut lock) = GLOBAL_WORKFLOW_METADATA.write() {
+            *lock = self.previous.take();
         }
     }
 }
@@ -1405,21 +1480,30 @@ async fn defer_replacement_admission_sheds_nothing() {
 
 // ── Completion-trigger supersede metrics (issue #811, Codex round 2, P2) ──
 
-/// A completion-trigger target that supersedes must emit the counters too.
+/// A completion-trigger target that supersedes must emit the counters too —
+/// but ONLY once the caller's enclosing transaction has actually committed
+/// (issue #1197, item 1).
 ///
 /// `evaluate_triggers_for_execution` propagates the target's declared
 /// `on_conflict`, so a same-shard inline trigger start genuinely *does*
-/// supersede an incumbent — but it called the metrics-discarding
-/// `start_or_load_workflow_execution` wrapper, which drops the collected
-/// cancellations. Neither `harvest.concurrency.superseded` nor the incumbent's
-/// cancelled terminal was emitted even though a recorder is in scope, so AC7's
-/// "once per superseded run" did not hold for trigger-created runs.
+/// supersede an incumbent. Originally (issue #811, Codex round 2) that
+/// supersede's counters were dropped entirely by a metrics-discarding
+/// wrapper; Codex round 3 fixed emission but left it EAGER — fired at
+/// return, inside the source execution's still-open terminal transaction, so
+/// a later rollback of that transaction would leave a phantom count for a
+/// cancellation that never became durable. Issue #1197 closes that residual:
+/// `evaluate_triggers_for_execution_collecting` COLLECTS the samples into
+/// `pending` instead of emitting them, and the caller is responsible for
+/// calling `emit_start_cancel_metrics` only after its own transaction
+/// commits — exactly what every real production call site now does (see
+/// `completion_trigger_supersede_rollback_never_emits_metrics` below for the
+/// rollback half of this contract).
 #[tokio::test]
 async fn completion_trigger_supersede_emits_the_counters() {
     use autumn_harvest::completion_trigger::{
-        GLOBAL_WORKFLOW_METADATA, TerminalState, WorkflowMetadata, evaluate_triggers_for_execution,
+        TerminalState, evaluate_triggers_for_execution_collecting,
     };
-    use autumn_harvest::concurrency::ConcurrencyPolicy;
+    use autumn_harvest::execution::emit_start_cancel_metrics;
 
     let (url, _c) = setup_db().await;
     let mut conn = connect(&url).await;
@@ -1437,37 +1521,15 @@ async fn completion_trigger_supersede_emits_the_counters() {
     // The trigger path resolves routing through the process-global router.
     autumn_harvest::shard::install_global_router(autumn_harvest::shard::ShardRouter::single());
 
-    // Publish the target's declared policy the way the worker does at startup,
-    // so `evaluate_triggers_for_execution` resolves `cancel_running`.
-    // Restored below so the process-global does not leak to sibling tests.
-    // `WorkflowMetadata` is not `Clone`, so take the whole map out and put it
-    // back at the end rather than cloning it.
-    let previous = {
-        let mut lock = GLOBAL_WORKFLOW_METADATA.write().expect("metadata lock");
-        lock.take()
-    };
-    {
-        let mut lock = GLOBAL_WORKFLOW_METADATA.write().expect("metadata lock");
-        let mut map = std::collections::HashMap::new();
-        map.insert(
-            target_wf.to_string(),
-            WorkflowMetadata {
-                concurrency: Some(
-                    ConcurrencyPolicy::new("input.doc_id", 1)
-                        .with_on_conflict(ConcurrencyOnConflict::CancelRunning),
-                ),
-                max_input_bytes: None,
-                owner: None,
-                runbook_url: None,
-                severity: None,
-                input_schema: None,
-                sla: None,
-                retry_policy: None,
-                quota: None,
-            },
-        );
-        *lock = Some(map);
-    }
+    // Publish the target's declared policy the way the worker does at
+    // startup, so `evaluate_triggers_for_execution` resolves `cancel_running`.
+    // Restored on drop (including on a mid-test panic) so the process-global
+    // never leaks to sibling tests.
+    let _metadata_guard = MetadataGuard::install_one(
+        target_wf,
+        ConcurrencyPolicy::new("input.doc_id", 1).with_on_conflict(ConcurrencyOnConflict::CancelRunning),
+    )
+    .await;
 
     let trigger_id = uuid::Uuid::new_v4();
     diesel::sql_query(
@@ -1522,17 +1584,36 @@ async fn completion_trigger_supersede_emits_the_counters() {
     metrics.superseded.lock().unwrap().clear();
     metrics.cancelled_terminals.lock().unwrap().clear();
 
-    let deferred = evaluate_triggers_for_execution(
+    let mut pending_cancel_metrics = Vec::new();
+    let deferred = evaluate_triggers_for_execution_collecting(
         &mut conn,
         source,
         TerminalState::Completed,
         Some(&metrics),
+        &mut pending_cancel_metrics,
     )
     .await
     .expect("trigger evaluation must succeed");
     for start in deferred {
         start.spawn();
     }
+
+    // Collecting must not itself emit anything — only the caller's explicit
+    // post-commit `emit_start_cancel_metrics` call below does.
+    assert!(
+        metrics.superseded.lock().unwrap().is_empty(),
+        "evaluate_triggers_for_execution_collecting must never emit eagerly"
+    );
+    assert!(metrics.cancelled_terminals.lock().unwrap().is_empty());
+    assert_eq!(
+        pending_cancel_metrics.len(),
+        1,
+        "the supersede must still be collected for the caller to emit"
+    );
+
+    // Simulates the real call sites: this line only runs once the caller's
+    // own transaction has committed (see e.g. `worker::persist_workflow_completion`).
+    emit_start_cancel_metrics(&metrics, &pending_cancel_metrics);
 
     // The supersede itself must have happened...
     assert_eq!(
@@ -1557,8 +1638,401 @@ async fn completion_trigger_supersede_emits_the_counters() {
         vec![target_wf.to_string()],
         "the superseded run's cancelled terminal must be counted too"
     );
+}
 
-    if let Ok(mut lock) = GLOBAL_WORKFLOW_METADATA.write() {
-        *lock = previous;
+/// RED phase for issue #1197, item 1: a completion-trigger supersede inside a
+/// terminal transaction that is SUBSEQUENTLY ROLLED BACK must emit neither
+/// `harvest.concurrency.superseded` nor the incumbent's cancelled terminal.
+///
+/// This is exactly the residual issue #1197 describes:
+/// `evaluate_triggers_for_execution`'s same-shard inline trigger start used to
+/// call `start_or_load_workflow_execution_with_metrics`, which emits at
+/// return — INSIDE the source workflow's still-uncommitted terminal
+/// transaction. If later processing in that same transaction rolled it back
+/// (simulated here by returning `Err` right after the trigger evaluation),
+/// the incumbent would still be RUNNING (correctly rolled back) while the
+/// metrics recorder would already have counted a cancellation that never
+/// became durable — an over-count. `evaluate_triggers_for_execution_collecting`
+/// closes this by never emitting on its own: only an explicit
+/// `emit_start_cancel_metrics` call, which real production call sites make
+/// exclusively on the `Ok` (post-commit) path, can move the counters.
+#[tokio::test]
+async fn completion_trigger_supersede_rollback_never_emits_metrics() {
+    use autumn_harvest::completion_trigger::{
+        TerminalState, evaluate_triggers_for_execution_collecting,
+    };
+    use autumn_harvest::error::HarvestError;
+
+    let (url, _c) = setup_db().await;
+    let mut conn = connect(&url).await;
+    scrub(&mut conn).await;
+    conn.batch_execute(
+        "DELETE FROM harvest_completion_trigger_fires; DELETE FROM harvest_completion_triggers;",
+    )
+    .await
+    .expect("scrub triggers");
+
+    let source_wf = "trigger_source_rollback";
+    let target_wf = "trigger_target_rollback";
+    let key = "tenant-trigger-rollback";
+
+    autumn_harvest::shard::install_global_router(autumn_harvest::shard::ShardRouter::single());
+
+    let _metadata_guard = MetadataGuard::install_one(
+        target_wf,
+        ConcurrencyPolicy::new("input.doc_id", 1).with_on_conflict(ConcurrencyOnConflict::CancelRunning),
+    )
+    .await;
+
+    let trigger_id = uuid::Uuid::new_v4();
+    diesel::sql_query(
+        "INSERT INTO harvest_completion_triggers \
+         (id, source_workflow_name, terminal_states, target_workflow_name, input_mapping, is_static) \
+         VALUES ($1, $2, '[\"Completed\"]'::jsonb, $3, '{\"type\":\"Passthrough\"}'::jsonb, TRUE)",
+    )
+    .bind::<SqlUuid, _>(trigger_id)
+    .bind::<Text, _>(source_wf)
+    .bind::<Text, _>(target_wf)
+    .execute(&mut conn)
+    .await
+    .expect("insert trigger");
+
+    let metrics = CapturingMetrics::default();
+
+    let incumbent = start_run(
+        &mut conn,
+        &metrics,
+        target_wf,
+        "incumbent-rollback-1",
+        key,
+        1,
+        ConcurrencyOnConflict::CancelRunning,
+    )
+    .await;
+    assert_eq!(state_of(&mut conn, incumbent).await, "RUNNING");
+
+    let source = start_run(
+        &mut conn,
+        &metrics,
+        source_wf,
+        "src-rollback-1",
+        key,
+        1,
+        ConcurrencyOnConflict::Defer,
+    )
+    .await;
+    diesel::sql_query(
+        "UPDATE harvest_workflow_executions \
+         SET state = 'COMPLETED', completed_at = NOW(), output = $1::jsonb WHERE id = $2",
+    )
+    .bind::<Text, _>(serde_json::json!({ "doc_id": key }).to_string())
+    .bind::<SqlUuid, _>(source.as_uuid())
+    .execute(&mut conn)
+    .await
+    .expect("complete source");
+
+    metrics.superseded.lock().unwrap().clear();
+    metrics.cancelled_terminals.lock().unwrap().clear();
+
+    // Simulate "later trigger evaluation or terminal processing rolls that
+    // transaction back" (issue #1197's own framing): the trigger evaluation
+    // itself succeeds (it performs the supersede), but the ENCLOSING
+    // transaction is made to fail right afterward, rolling everything in it
+    // back — including the supersede's cancellation.
+    let result: Result<(), HarvestError> = Box::pin(conn.transaction::<(), HarvestError, _>(
+        async |conn| {
+            let mut pending_cancel_metrics = Vec::new();
+            let deferred = evaluate_triggers_for_execution_collecting(
+                conn,
+                source,
+                TerminalState::Completed,
+                Some(&metrics),
+                &mut pending_cancel_metrics,
+            )
+            .await?;
+            for start in deferred {
+                start.spawn();
+            }
+            assert_eq!(
+                pending_cancel_metrics.len(),
+                1,
+                "the supersede must have been collected before the simulated rollback"
+            );
+            // The real bug this test guards against: NEVER call
+            // `emit_start_cancel_metrics` here — a caller that does would
+            // reintroduce the issue #1197 residual. Production code only
+            // calls it after this closure's `Ok` return, from outside the
+            // transaction.
+            Err(HarvestError::Config(
+                "simulated later-processing rollback (issue #1197 RED phase)".to_string(),
+            ))
+        },
+    ))
+    .await;
+
+    assert!(
+        result.is_err(),
+        "the simulated later-processing failure must roll back the whole transaction"
+    );
+    assert_eq!(
+        state_of(&mut conn, incumbent).await,
+        "RUNNING",
+        "the supersede must have been rolled back along with everything else \
+         in the transaction"
+    );
+    assert_eq!(
+        non_terminal_count(&mut conn, target_wf).await,
+        1,
+        "the trigger-created target's fresh INSERT must have rolled back too, \
+         leaving only the original (still-RUNNING) incumbent"
+    );
+    assert!(
+        metrics.superseded.lock().unwrap().is_empty(),
+        "a rolled-back supersede must never emit harvest.concurrency.superseded"
+    );
+    assert!(
+        metrics.cancelled_terminals.lock().unwrap().is_empty(),
+        "a rolled-back supersede must never emit the cancelled terminal counter"
+    );
+}
+
+/// The legacy `evaluate_triggers_for_execution` wrapper is kept for call sites
+/// with no convenient post-commit hook (the 56 pre-#1197 test call sites, and
+/// any production site not yet migrated) — but that means it must NEVER emit
+/// the latest-wins supersede counters itself, even though the underlying
+/// same-shard trigger start still performs the DB-level supersede correctly.
+/// This documents that trade-off explicitly rather than leaving it implicit.
+#[tokio::test]
+async fn evaluate_triggers_for_execution_plain_wrapper_discards_supersede_metrics() {
+    use autumn_harvest::completion_trigger::{TerminalState, evaluate_triggers_for_execution};
+
+    let (url, _c) = setup_db().await;
+    let mut conn = connect(&url).await;
+    scrub(&mut conn).await;
+    conn.batch_execute(
+        "DELETE FROM harvest_completion_trigger_fires; DELETE FROM harvest_completion_triggers;",
+    )
+    .await
+    .expect("scrub triggers");
+
+    let source_wf = "trigger_source_plain";
+    let target_wf = "trigger_target_plain";
+    let key = "tenant-trigger-plain";
+
+    autumn_harvest::shard::install_global_router(autumn_harvest::shard::ShardRouter::single());
+
+    let _metadata_guard = MetadataGuard::install_one(
+        target_wf,
+        ConcurrencyPolicy::new("input.doc_id", 1).with_on_conflict(ConcurrencyOnConflict::CancelRunning),
+    )
+    .await;
+
+    let trigger_id = uuid::Uuid::new_v4();
+    diesel::sql_query(
+        "INSERT INTO harvest_completion_triggers \
+         (id, source_workflow_name, terminal_states, target_workflow_name, input_mapping, is_static) \
+         VALUES ($1, $2, '[\"Completed\"]'::jsonb, $3, '{\"type\":\"Passthrough\"}'::jsonb, TRUE)",
+    )
+    .bind::<SqlUuid, _>(trigger_id)
+    .bind::<Text, _>(source_wf)
+    .bind::<Text, _>(target_wf)
+    .execute(&mut conn)
+    .await
+    .expect("insert trigger");
+
+    let metrics = CapturingMetrics::default();
+
+    let incumbent = start_run(
+        &mut conn,
+        &metrics,
+        target_wf,
+        "incumbent-plain-1",
+        key,
+        1,
+        ConcurrencyOnConflict::CancelRunning,
+    )
+    .await;
+
+    let source = start_run(
+        &mut conn,
+        &metrics,
+        source_wf,
+        "src-plain-1",
+        key,
+        1,
+        ConcurrencyOnConflict::Defer,
+    )
+    .await;
+    diesel::sql_query(
+        "UPDATE harvest_workflow_executions \
+         SET state = 'COMPLETED', completed_at = NOW(), output = $1::jsonb WHERE id = $2",
+    )
+    .bind::<Text, _>(serde_json::json!({ "doc_id": key }).to_string())
+    .bind::<SqlUuid, _>(source.as_uuid())
+    .execute(&mut conn)
+    .await
+    .expect("complete source");
+
+    metrics.superseded.lock().unwrap().clear();
+    metrics.cancelled_terminals.lock().unwrap().clear();
+
+    let deferred = evaluate_triggers_for_execution(
+        &mut conn,
+        source,
+        TerminalState::Completed,
+        Some(&metrics),
+    )
+    .await
+    .expect("trigger evaluation must succeed");
+    for start in deferred {
+        start.spawn();
     }
+
+    // The DB-level supersede still happens...
+    assert_eq!(
+        state_of(&mut conn, incumbent).await,
+        "CANCELLED",
+        "the plain wrapper must still perform the supersede at the DB level"
+    );
+    // ...but the plain wrapper's throwaway collector means NOTHING is ever
+    // emitted through it, matching pre-issue-#811 behaviour for this path.
+    assert!(
+        metrics.superseded.lock().unwrap().is_empty(),
+        "the legacy wrapper must never emit harvest.concurrency.superseded"
+    );
+    assert!(
+        metrics.cancelled_terminals.lock().unwrap().is_empty(),
+        "the legacy wrapper must never emit the cancelled terminal counter"
+    );
+}
+
+// ── issue #1197, item 2: nested self-referential trigger admission ────────
+
+/// A `cancel_running` workflow whose own completion trigger targets itself on
+/// the same key: cancelling an incumbent can synchronously start a NEW run of
+/// the same workflow, on the same key, which is itself a `cancel_running`
+/// admission (issue #1197, item 2).
+///
+/// With `limit = 1`: admission B supersedes incumbent A. Cancelling A runs
+/// its terminal chokepoint, which (via the self-referential completion
+/// trigger) synchronously starts run C on the SAME key. C's own admission
+/// tries to shed down to `limit = 1` too — but the only other non-terminal
+/// run at that point is B, and B is a PROTECTED in-flight admission (its own
+/// start transaction is still open on this task, via the `ADMITTING`
+/// task-local C inherits into). C can never select a protected run, so it
+/// has nothing it may shed: `target = 1`, `shed = 0`. Both B and C commit,
+/// leaving the key transiently over its declared limit of 1.
+///
+/// This is the exact residual issue #1197 describes as bounded and
+/// self-healing (the next ordinary admission for the key sees both B and C
+/// unprotected and sheds down to the limit) — the issue's chosen resolution
+/// is to make it observable via a counter rather than to change the
+/// convergence behaviour itself (the "obvious" rescan-and-retry alternative
+/// does not converge for a cyclic trigger configuration; see the issue and
+/// `supersede_plan`'s doc comment).
+#[tokio::test]
+async fn nested_self_referential_admission_emits_residual_over_limit_counter() {
+    use autumn_harvest::admission_gate::{global_admission_metrics, set_global_admission_metrics};
+    use std::sync::Arc;
+
+    let (url, _c) = setup_db().await;
+    let mut conn = connect(&url).await;
+    scrub(&mut conn).await;
+    conn.batch_execute(
+        "DELETE FROM harvest_completion_trigger_fires; DELETE FROM harvest_completion_triggers;",
+    )
+    .await
+    .expect("scrub triggers");
+
+    let self_ref_wf = "self_referential_wf";
+    let key = "tenant-self-ref";
+
+    autumn_harvest::shard::install_global_router(autumn_harvest::shard::ShardRouter::single());
+
+    let _metadata_guard = MetadataGuard::install_one(
+        self_ref_wf,
+        ConcurrencyPolicy::new("input.doc_id", 1).with_on_conflict(ConcurrencyOnConflict::CancelRunning),
+    )
+    .await;
+
+    // The nested admission's own trigger evaluation always runs with
+    // `metrics: None` (every cancel/terminate/parent-close-cascade chokepoint
+    // in `execution.rs` does), so the residual counter can only ever reach a
+    // recorder through the process-global fallback — install one here and
+    // restore whatever was there afterward.
+    let previous_global_metrics = global_admission_metrics();
+    let metrics = Arc::new(CapturingMetrics::default());
+    set_global_admission_metrics(Some(metrics.clone() as Arc<dyn MetricsRecorder>));
+
+    // Self-referential: the trigger's source and target are the SAME
+    // workflow type. `Static` input mapping (not `Passthrough`) because a
+    // CANCELLED source has a NULL recorded output — a `Passthrough` mapping
+    // would deliver `Null`, `resolve_concurrency_key` would resolve no key,
+    // and the nested admission would never reach `run_latest_wins_supersede`
+    // at all.
+    let trigger_id = uuid::Uuid::new_v4();
+    diesel::sql_query(
+        "INSERT INTO harvest_completion_triggers \
+         (id, source_workflow_name, terminal_states, target_workflow_name, input_mapping, is_static) \
+         VALUES ($1, $2, '[\"Cancelled\"]'::jsonb, $2, $3::jsonb, TRUE)",
+    )
+    .bind::<SqlUuid, _>(trigger_id)
+    .bind::<Text, _>(self_ref_wf)
+    .bind::<Text, _>(
+        serde_json::json!({ "type": "Static", "data": { "doc_id": key } }).to_string(),
+    )
+    .execute(&mut conn)
+    .await
+    .expect("insert self-referential trigger");
+
+    let dummy_metrics = CapturingMetrics::default();
+
+    // Incumbent A.
+    let incumbent = start_run(
+        &mut conn,
+        &dummy_metrics,
+        self_ref_wf,
+        "self-ref-A",
+        key,
+        1,
+        ConcurrencyOnConflict::CancelRunning,
+    )
+    .await;
+    assert_eq!(state_of(&mut conn, incumbent).await, "RUNNING");
+
+    // Admission B: a fresh, DIFFERENT workflow_id on the same key — supersedes
+    // A, whose cancellation synchronously starts C via the trigger above.
+    let outer = start_run(
+        &mut conn,
+        &dummy_metrics,
+        self_ref_wf,
+        "self-ref-B",
+        key,
+        1,
+        ConcurrencyOnConflict::CancelRunning,
+    )
+    .await;
+
+    assert_eq!(
+        state_of(&mut conn, incumbent).await,
+        "CANCELLED",
+        "the outer admission must still supersede the incumbent normally"
+    );
+    assert_eq!(state_of(&mut conn, outer).await, "RUNNING");
+    assert_eq!(
+        non_terminal_count(&mut conn, self_ref_wf).await,
+        2,
+        "the nested admission cannot shed a protected in-flight run, so the \
+         key is left transiently over its limit of 1 (self-healing on the \
+         next ordinary admission)"
+    );
+
+    let residual_samples = metrics.residual_over_limit.lock().unwrap().clone();
+    assert_eq!(
+        residual_samples,
+        vec![(self_ref_wf.to_string(), 1)],
+        "the nested admission must report exactly the 1-run gap it could not shed"
+    );
+
+    set_global_admission_metrics(previous_global_metrics);
 }

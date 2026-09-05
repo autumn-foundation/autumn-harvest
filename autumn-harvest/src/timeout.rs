@@ -951,11 +951,13 @@ async fn commit_workflow_execution_timeout(
     bool,
     Vec<crate::completion_trigger::DeferredTriggerStart>,
     Vec<(ExecutionId, String)>,
+    Vec<crate::execution::StartCancelledRun>,
 )> {
     Box::pin(conn.transaction::<(
         bool,
         Vec<crate::completion_trigger::DeferredTriggerStart>,
         Vec<(ExecutionId, String)>,
+        Vec<crate::execution::StartCancelledRun>,
     ), HarvestError, _>(async |conn| {
         let timeout_event = timeout_event.clone();
         let error_msg = error_msg.to_owned();
@@ -971,7 +973,7 @@ async fn commit_workflow_execution_timeout(
 
         match current_state.as_deref() {
             Some("RUNNING") => {}
-            _ => return Ok((false, Vec::new(), Vec::new())),
+            _ => return Ok((false, Vec::new(), Vec::new(), Vec::new())),
         }
 
         store::append_single_event(conn, exec_id, timeout_event).await?;
@@ -1006,15 +1008,17 @@ async fn commit_workflow_execution_timeout(
         }
 
         let (mut deferred, closed_children) = apply_parent_close_cascade(conn, exec_id).await?;
-        let triggers = crate::completion_trigger::evaluate_triggers_for_execution(
+        let mut pending_cancel_metrics = Vec::new();
+        let triggers = crate::completion_trigger::evaluate_triggers_for_execution_collecting(
             conn,
             exec_id,
             crate::completion_trigger::TerminalState::TimedOut,
             metrics,
+            &mut pending_cancel_metrics,
         )
         .await?;
         deferred.extend(triggers);
-        Ok((true, deferred, closed_children))
+        Ok((true, deferred, closed_children, pending_cancel_metrics))
     }))
     .await
 }
@@ -1719,11 +1723,13 @@ async fn enforce_workflow_timeout(
         update_workflow_execution_timed_out(conn, exec_id, &error).await?;
         queue::fail_task(conn, task.id, &error).await?;
         let (mut deferred, closed_children) = apply_parent_close_cascade(conn, exec_id).await?;
-        let triggers = crate::completion_trigger::evaluate_triggers_for_execution(
+        let mut pending_cancel_metrics = Vec::new();
+        let triggers = crate::completion_trigger::evaluate_triggers_for_execution_collecting(
             conn,
             exec_id,
             crate::completion_trigger::TerminalState::TimedOut,
             Some(metrics),
+            &mut pending_cancel_metrics,
         )
         .await?;
         deferred.extend(triggers);
@@ -1738,15 +1744,20 @@ async fn enforce_workflow_timeout(
             )
             .await?;
         }
-        Ok(Some((execution, deferred, closed_children)))
+        Ok(Some((execution, deferred, closed_children, pending_cancel_metrics)))
     }))
     .await?;
 
     // Suppressed by a queue pause: nothing was written, so there is nothing to
     // cascade, no handler check to run, and no schedule failure to count.
-    let Some((execution, deferred_starts, closed_children)) = enforced else {
+    let Some((execution, deferred_starts, closed_children, pending_cancel_metrics)) = enforced
+    else {
         return Ok(());
     };
+
+    // issue #1197, item 1: emitted only now that this transaction has
+    // actually committed.
+    crate::execution::emit_start_cancel_metrics(metrics, &pending_cancel_metrics);
 
     for start in deferred_starts {
         start.spawn();
@@ -2068,23 +2079,31 @@ pub async fn enforce_workflow_execution_timeouts(
         )
         .await;
 
-        let (timed_out_applied, deferred_starts, closed_children) = match result {
-            Ok((applied, deferred, closed)) => (applied, deferred, closed),
-            Err(error) => {
-                tracing::error!(
-                    exec_id = %exec_id,
-                    workflow_name = %workflow_name,
-                    error = %error,
-                    "failed to enforce workflow execution timeout"
-                );
-                return Err(error);
-            }
-        };
+        let (timed_out_applied, deferred_starts, closed_children, pending_cancel_metrics) =
+            match result {
+                Ok((applied, deferred, closed, cancel_metrics)) => {
+                    (applied, deferred, closed, cancel_metrics)
+                }
+                Err(error) => {
+                    tracing::error!(
+                        exec_id = %exec_id,
+                        workflow_name = %workflow_name,
+                        error = %error,
+                        "failed to enforce workflow execution timeout"
+                    );
+                    return Err(error);
+                }
+            };
 
         if !timed_out_applied {
             // Row was already non-RUNNING; nothing to do.
             continue;
         }
+
+        // issue #1197, item 1: emitted only now that
+        // `commit_workflow_execution_timeout`'s transaction has actually
+        // committed (`timed_out_applied` is true).
+        crate::execution::emit_start_cancel_metrics(metrics, &pending_cancel_metrics);
 
         for start in deferred_starts {
             start.spawn();
@@ -4581,11 +4600,12 @@ pub async fn enforce_workflow_history_ceiling(
         let workflow_name = row.workflow_name.clone();
         let queue_name = row.queue_name.clone();
 
-        let (applied, deferred_starts, closed_children) =
+        let (applied, deferred_starts, closed_children, pending_cancel_metrics) =
             Box::pin(conn.transaction::<(
                 bool,
                 Vec<crate::completion_trigger::DeferredTriggerStart>,
                 Vec<(ExecutionId, String)>,
+                Vec<crate::execution::StartCancelledRun>,
             ), HarvestError, _>(async |conn| {
                 let fail_event = fail_event.clone();
                 let error_msg = error_msg.clone();
@@ -4601,7 +4621,7 @@ pub async fn enforce_workflow_history_ceiling(
                     .map_err(crate::error::database_error)?;
 
                 if current_state.as_deref() != Some("RUNNING") {
-                    return Ok((false, Vec::new(), Vec::new()));
+                    return Ok((false, Vec::new(), Vec::new(), Vec::new()));
                 }
 
                 store::append_single_event(conn, exec_id, fail_event).await?;
@@ -4649,21 +4669,27 @@ pub async fn enforce_workflow_history_ceiling(
 
                 let (mut deferred, closed_children) =
                     apply_parent_close_cascade(conn, exec_id).await?;
-                let triggers = crate::completion_trigger::evaluate_triggers_for_execution(
+                let mut pending_cancel_metrics = Vec::new();
+                let triggers = crate::completion_trigger::evaluate_triggers_for_execution_collecting(
                     conn,
                     exec_id,
                     crate::completion_trigger::TerminalState::Failed,
                     Some(metrics),
+                    &mut pending_cancel_metrics,
                 )
                 .await?;
                 deferred.extend(triggers);
-                Ok((true, deferred, closed_children))
+                Ok((true, deferred, closed_children, pending_cancel_metrics))
             }))
             .await?;
 
         if !applied {
             continue;
         }
+
+        // issue #1197, item 1: emitted only now that this transaction has
+        // actually committed (`applied` is true).
+        crate::execution::emit_start_cancel_metrics(metrics, &pending_cancel_metrics);
 
         for start in deferred_starts {
             start.spawn();

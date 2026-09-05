@@ -12,7 +12,8 @@ use std::sync::{Arc, Mutex};
 
 use autumn_harvest::telemetry::{
     ActivityPauseAction, ActivityStatus, METRIC_ACTIVITY_DURATION, METRIC_ACTIVITY_PAUSE_ACTIONS,
-    METRIC_CONCURRENCY_SUPERSEDED, METRIC_DLQ_ENTRIES, METRIC_LABEL_SCANNER, METRIC_LABEL_SHARD,
+    METRIC_CONCURRENCY_RESIDUAL_OVER_LIMIT, METRIC_CONCURRENCY_SUPERSEDED, METRIC_DLQ_ENTRIES,
+    METRIC_LABEL_SCANNER, METRIC_LABEL_SHARD,
     METRIC_QUEUE_DEPTH, METRIC_QUEUE_DISPATCHED, METRIC_QUEUE_PAUSED, METRIC_RETENTION_DELETED,
     METRIC_SAGA_COMPENSATED, METRIC_SAGA_COMPENSATION_FAILED, METRIC_SCANNER_TICK,
     METRIC_SCHEDULE_DECISION_WRITE_FAILED, METRIC_SCHEDULE_RUNS, METRIC_SCHEDULE_SKIPPED,
@@ -265,6 +266,16 @@ impl MetricsRecorder for RecordingMetrics {
         self.samples.lock().unwrap().push(MetricSample {
             name: METRIC_CONCURRENCY_SUPERSEDED,
             labels: vec![("workflow", workflow.to_owned())],
+        });
+    }
+
+    fn record_concurrency_residual_over_limit(&self, workflow: &str, gap: u64) {
+        self.samples.lock().unwrap().push(MetricSample {
+            name: METRIC_CONCURRENCY_RESIDUAL_OVER_LIMIT,
+            labels: vec![
+                ("workflow", workflow.to_owned()),
+                ("gap", gap.to_string()),
+            ],
         });
     }
 
@@ -743,6 +754,38 @@ fn concurrency_superseded_counter_reachable_and_never_labeled_by_key() {
         assert!(
             !key.contains("execution") && !key.contains("key"),
             "forbidden high-cardinality label `{key}` on harvest.concurrency.superseded"
+        );
+    }
+}
+
+#[test]
+fn concurrency_residual_over_limit_counter_reachable_and_never_labeled_by_key() {
+    // Issue #1197, item 2: a nested self-referential `cancel_running`
+    // admission that cannot shed a protected in-flight run leaves its key
+    // transiently over its declared limit. This counter is the promotion of
+    // the pre-existing `tracing::warn!` in `concurrency::supersede_inner` to
+    // an alertable signal — same cardinality rule as its `superseded`
+    // sibling: the concurrency key is never a label, only the (bounded)
+    // workflow type name and the (small, `SUPERSEDE_SCAN_LIMIT`-bounded) gap.
+    let rec = RecordingMetrics::default();
+    rec.record_concurrency_residual_over_limit("doc_index", 1);
+
+    let samples = rec.drain();
+    assert_eq!(samples.len(), 1);
+    let sample = &samples[0];
+    assert_eq!(sample.name, METRIC_CONCURRENCY_RESIDUAL_OVER_LIMIT);
+
+    let keys: Vec<&str> = sample.labels.iter().map(|(k, _)| *k).collect();
+    assert_eq!(
+        keys,
+        vec!["workflow", "gap"],
+        "harvest.concurrency.residual_over_limit must carry exactly the \
+         workflow + gap labels; got {sample:?}"
+    );
+    for (key, _) in &sample.labels {
+        assert!(
+            !key.contains("execution") && !key.ends_with("_key"),
+            "forbidden high-cardinality label `{key}` on harvest.concurrency.residual_over_limit"
         );
     }
 }
