@@ -1332,3 +1332,30 @@ and the adversarial prose sweep immediately produced `let a::b is re-exported
 for callers;` — the sweep earning its place again.
 
 Corpus effect: none, for the twenty-third round running.
+
+### Round forty-two — one place decides what a table is
+
+Both findings are the table lookahead, read once from each side.
+
+**A delimiter row must be in the same comment as its header.** The lookahead
+took the next piece without checking its nesting level, so `/* | --- | */`
+under `| h |` was read as the outer header's delimiter. Rustdoc renders a
+nested comment's delimiters literally — it even smart-quotes the `---` into an
+em dash, which is proof enough that the text is inline — so the sequence is
+one paragraph. Reading it as a table cleared that paragraph before the nesting
+snapshot round thirty-nine added could restore anything, and a TODO under the
+invented fence went unreported.
+
+**A pipe does not end a lazy quote continuation.** The lazy test rejected any
+line containing a pipe. Rustdoc renders a quoted sentence carrying on across
+an unmarked `continued | ...` line as one paragraph inside the block quote, so
+flushing there split a 28-word sentence into units of 20 and 8 and CH007 saw
+neither. A newly added long sentence could pass the Tier B ratchet that way.
+
+The fix for both is one function. `table_header` decides whether a pipe row is
+a header — same comment, delimiter row underneath, matching width — and the
+container path, the prose path and the lazy test all ask it. Three call sites
+that each re-derived the answer are why rounds thirty-four to forty-two kept
+finding the same question answered differently in different places.
+
+Corpus effect: none, for the twenty-fourth round running.

@@ -401,6 +401,34 @@ def table_delimiter(text: str, container: int, header: str) -> bool:
 
 # An ATX heading. The indent is a capture group because the indent decides
 # whether this is a heading at all -- see `heading` below.
+def next_row(pieces: list, index: int, nest: int):
+    """The piece after `index`, if it is in the same comment.
+
+    A delimiter row belongs to the header above it only when both are the
+    same comment. Rustdoc renders a nested comment's delimiters literally,
+    so "/* | --- | */" under "| h |" is paragraph text, and reading it as a
+    delimiter turns a paragraph into a table and drops the sentence.
+    """
+    if index + 1 < len(pieces) and pieces[index + 1].nest == nest:
+        return pieces[index + 1]
+    return None
+
+
+def table_header(pieces: list, index: int, nest: int, text: str, container: int) -> bool:
+    """Is `text` a table header -- a pipe row with a delimiter row under it?
+
+    The one place that decides it, for both scanners and for the lazy
+    continuation test. A pipe alone is not a table: "| foo" wraps a sentence
+    like any other word, and only the delimiter row below makes a block.
+    """
+    if "|" not in text:
+        return False
+    row = next_row(pieces, index, nest)
+    return row is not None and table_delimiter(
+        strip_quote(row.text, container), container, text
+    )
+
+
 HEADING_RE = re.compile(r"^([ \t]*)#{1,6}(?:[ \t]|$)")
 # A thematic break -- one punctuation character repeated. CommonMark spells it
 # "---"; this tree also draws section rules with box-drawing characters. Either
@@ -1234,15 +1262,8 @@ def comment_lines(pieces: list[Piece]):
                 body = strip_quote(text, enclosing)
                 if "|" not in body:
                     in_table = False
-                elif not in_table and index + 1 < len(run):
-                    # The container, here as in `prose_units`. A table nested
-                    # in a list item is indented past column zero, so reading
-                    # the delimiter row at column zero refuses it and the
-                    # header above it stays a paragraph -- one loop calling
-                    # the table a table and the other calling it prose.
-                    in_table = table_delimiter(
-                        strip_quote(run[index + 1].text, enclosing), enclosing, body
-                    )
+                elif not in_table:
+                    in_table = table_header(run, index, piece.nest, body, enclosing)
                 stack, paragraph = update_containers(
                     text, stack, paragraph, quoted, in_table and "|" in body
                 )
@@ -1440,7 +1461,11 @@ def prose_units(pieces: list[Piece]) -> list[tuple[int, str]]:
                 and bool(run)
                 and body.strip()
                 and not LIST_MARKER_RE.match(peeled)
-                and "|" not in peeled
+                # A CONFIRMED table, not any pipe. Rustdoc renders a quoted
+                # sentence carrying on across an unmarked "continued | ..."
+                # line as one paragraph, and flushing there splits it into
+                # two short units, so a new 27-word sentence passes CH007.
+                and not table_header(block, index, piece.nest, peeled, container)
                 and not heading(peeled, container)
                 and not SEPARATOR_RE.match(peeled)
                 and not FENCE_RE.match(peeled)
@@ -1459,10 +1484,8 @@ def prose_units(pieces: list[Piece]) -> list[tuple[int, str]]:
             has_pipe = "|" in body
             if not has_pipe:
                 in_table = False
-            elif not in_table and index + 1 < len(block):
-                in_table = table_delimiter(
-                    strip_quote(block[index + 1].text, container), container, body
-                )
+            elif not in_table:
+                in_table = table_header(block, index, piece.nest, body, container)
             if (
                 (has_pipe and in_table)
                 or heading(body, container)
@@ -2480,6 +2503,34 @@ RULE_TESTS = [
         "pub struct A;\n",
         set(),
         "a genuinely blank comment line still ends the paragraph",
+    ),
+    (
+        "/** Intro paragraph\n"
+        " * | h |\n"
+        " * /* | --- | */\n"
+        " * 22. item\n"
+        " *     ```\n"
+        " *     TODO: issue required\n"
+        " */\n"
+        "pub struct A;\n",
+        {("CH002", 6)},
+        "a delimiter row inside a nested comment is not the outer header's",
+    ),
+    (
+        "/// > " + " ".join(f"word{n}" for n in range(1, 21)) + "\n"
+        "/// continued | " + " ".join(f"word{n}" for n in range(21, 27)) + ".\n",
+        {("CH007", 1)},
+        "a pipe does not end a lazy quote continuation",
+    ),
+    (
+        "/// > quoted sentence here\n"
+        "/// | h |\n"
+        "/// | --- |\n"
+        "/// 22. item\n"
+        "///     ```\n"
+        "///     TODO: issue required\n",
+        set(),
+        "a confirmed table still ends a lazy quote continuation",
     ),
 ]
 
