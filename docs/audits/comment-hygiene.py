@@ -475,20 +475,49 @@ def rust_sources(paths: list[str] | None) -> list[str]:
     return sorted(found)
 
 
+def comment_runs(pieces: list[Piece]):
+    """Group pieces into contiguous comment blocks.
+
+    A run is what a reader sees as one comment: consecutive lines, same kind.
+    A trailing comment is always its own run -- it is a note on its line, not
+    a continuation of the note on the line above, even when the two are
+    adjacent.
+    """
+    run: list[Piece] = []
+    prev_line = -2
+    for piece in pieces:
+        if run and (
+            piece.trailing
+            or run[-1].trailing
+            or piece.block != run[-1].block
+            or piece.line != prev_line + 1
+        ):
+            yield run
+            run = []
+        run.append(piece)
+        prev_line = piece.line
+    if run:
+        yield run
+
+
 def comment_lines(pieces: list[Piece]):
     """Yield (lineno, text, in_fence) per comment piece, tracking ``` fences.
 
+    Fence state is per RUN, never file-wide. An unclosed ``` in one doc block
+    would otherwise leave the fence open for every later comment in the file,
+    silently skipping all of them -- a gate that stops gating without failing.
     A fence delimiter is yielded with in_fence True so callers skip it along
     with the fenced body.
     """
-    fence = False
-    for piece in pieces:
-        text = piece.text
-        if FENCE_RE.match(text):
-            fence = not fence
-            yield piece.line, text, True
-            continue
-        yield piece.line, text, fence
+    for run in comment_runs(pieces):
+        fence = False
+        for piece in run:
+            text = piece.text
+            if FENCE_RE.match(text):
+                fence = not fence
+                yield piece.line, text, True
+                continue
+            yield piece.line, text, fence
 
 
 def check_line_rules(path: str, pieces: list[Piece]) -> list[Finding]:
@@ -527,12 +556,9 @@ def check_block_edges(path: str, pieces: list[Piece]) -> list[Finding]:
     formatting rather than the editing artifact this rule is about.
     """
     findings = []
-    run: list[Piece] = []
-    prev_line = -2
-
-    def close():
-        if not run:
-            return
+    for run in comment_runs(pieces):
+        if run[0].block or run[0].trailing:
+            continue
         if not run[0].text.strip():
             findings.append(
                 Finding("CH004", path, run[0].line, "block opens on an empty comment line")
@@ -541,15 +567,6 @@ def check_block_edges(path: str, pieces: list[Piece]) -> list[Finding]:
             findings.append(
                 Finding("CH004", path, run[-1].line, "block closes on an empty comment line")
             )
-
-    for piece in pieces:
-        if piece.block or piece.trailing or piece.line != prev_line + 1:
-            close()
-            run = []
-        prev_line = piece.line
-        if not (piece.block or piece.trailing):
-            run.append(piece)
-    close()
     return findings
 
 
@@ -559,40 +576,46 @@ def prose_units(pieces: list[Piece]) -> list[tuple[int, str]]:
     Fenced blocks, markdown tables and headings are dropped -- they are not
     prose and a word count over them means nothing. A list item starts its own
     unit so that a bulleted rationale is measured per bullet.
+
+    Units never span a comment run, so two adjacent trailing comments stay two
+    units. Joining them on line adjacency alone would report two short notes
+    as one long sentence -- a false CH007 on code neither author wrote as a
+    sentence.
     """
     units: list[tuple[int, str]] = []
-    run: list[str] = []
-    run_line = 0
-    prev_lineno = -2
 
-    def flush():
-        nonlocal run
-        if run:
-            units.append((run_line, " ".join(run)))
-            run = []
+    for block in comment_runs(pieces):
+        run: list[str] = []
+        run_line = 0
+        fence = False
 
-    for lineno, body, in_fence in comment_lines(pieces):
-        # A gap means intervening code: two comment blocks either side of a
-        # statement are unrelated prose, and joining them would both misreport
-        # the line number and manufacture sentences neither author wrote.
-        if lineno != prev_lineno + 1:
-            flush()
-        prev_lineno = lineno
-        if in_fence:
-            flush()
-            continue
-        if TABLE_RE.match(body) or HEADING_RE.match(body) or not body.strip():
-            flush()
-            continue
-        if LIST_ITEM_RE.match(body):
-            flush()
-            run_line = lineno
-            run = [LIST_ITEM_RE.sub("", body).strip()]
-            continue
-        if not run:
-            run_line = lineno
-        run.append(body.strip())
-    flush()
+        def flush():
+            nonlocal run
+            if run:
+                units.append((run_line, " ".join(run)))
+                run = []
+
+        for piece in block:
+            body = piece.text
+            if FENCE_RE.match(body):
+                fence = not fence
+                flush()
+                continue
+            if fence:
+                flush()
+                continue
+            if TABLE_RE.match(body) or HEADING_RE.match(body) or not body.strip():
+                flush()
+                continue
+            if LIST_ITEM_RE.match(body):
+                flush()
+                run_line = piece.line
+                run = [LIST_ITEM_RE.sub("", body).strip()]
+                continue
+            if not run:
+                run_line = piece.line
+            run.append(body.strip())
+        flush()
     return units
 
 
@@ -870,6 +893,32 @@ SELF_TESTS = [
 ]
 
 
+# Rule-level fixtures: (source, expected {(rule, line)}, name). These pin
+# behaviour the lexer alone cannot express -- how comment runs bound fence
+# state and prose units.
+RULE_TESTS = [
+    (
+        "/// Example:\n/// ```rust\n/// let x = 1;\npub fn a() {}\n\n"
+        "// TODO: issue required\n// let stale = compute();\npub fn b() {}\n",
+        {("CH002", 6), ("CH001", 7)},
+        "an unclosed fence does not leak past its own block",
+    ),
+    (
+        "/// Example:\n/// ```rust\n/// let x = compute();\n/// ```\npub fn a() {}\n",
+        set(),
+        "fenced example code stays exempt",
+    ),
+    (
+        "fn f() {\n"
+        "    let a = 1; // the first of two short trailing notes that each stay well under the limit here\n"
+        "    let b = 2; // the second of two short trailing notes that also stays under it comfortably\n"
+        "}\n",
+        set(),
+        "adjacent trailing comments are not merged into one sentence",
+    ),
+]
+
+
 def self_test() -> int:
     """Prove the lexer still handles the Rust forms the rules depend on."""
     failures = 0
@@ -890,7 +939,15 @@ def self_test() -> int:
     if not ok:
         print(f"         expected line 3, got {[(p.line, p.text) for p in pieces]!r}")
 
-    print("\nOK: lexer self-test passed." if not failures else f"\n{failures} self-test failure(s).")
+    for source, expected, name in RULE_TESTS:
+        got = {(f.rule, f.line) for f in findings_for_source("t.rs", source)}
+        ok = got == expected
+        failures += 0 if ok else 1
+        print(f"  [{'ok  ' if ok else 'FAIL'}] {name}")
+        if not ok:
+            print(f"         expected {sorted(expected)!r}\n         got      {sorted(got)!r}")
+
+    print("\nOK: self-test passed." if not failures else f"\n{failures} self-test failure(s).")
     return 1 if failures else 0
 
 

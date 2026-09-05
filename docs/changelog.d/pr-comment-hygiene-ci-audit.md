@@ -177,3 +177,31 @@ dropping the stored baseline. Two were real and outstanding:
   `--base` leaves Tier B report-only — so the documented pre-push command
   checked Tier A and little else. It now prescribes
   `--base origin/trunk-dev` and says plainly why the flag matters.
+
+**Fourth Codex round (PR #1380): two more P2 findings, both real.** Both came
+from state that was scoped to the file when it should have been scoped to the
+comment block.
+
+- *An unclosed fence disabled the whole file.* `fence` was one boolean across
+  every comment in a file, so a `/// ```rust` block that never closed left it
+  set for everything after it. Reproduced: with an unclosed fence above them,
+  `// TODO: issue required` and `// let stale = compute();` produced **no
+  findings at all** — every Tier A rule silently off for the rest of the file.
+  That is the exact failure mode this harness is supposed to avoid: a gate
+  that stops gating without failing.
+- *Adjacent trailing comments merged into one sentence.* Prose units were
+  joined on line adjacency alone, so two short trailing notes on consecutive
+  lines became one long unit and could trip CH007 as a sentence neither author
+  wrote.
+
+Both are fixed by one concept: `comment_runs()`. A run is what a reader sees
+as one comment — consecutive lines, same kind — and a trailing comment is
+always its own run. Fence state resets per run, and prose units never span
+one. CH004 uses the same grouping instead of re-deriving it.
+
+Three rule-level fixtures now pin this alongside the 14 lexer ones, since
+neither behaviour is expressible as a lexer test: an unclosed fence does not
+leak past its block, fenced example code stays exempt, and adjacent trailing
+comments are not merged. Tier A stayed at zero; CH007 fell 17,913 → 17,903 as
+wrongly-merged trailing units split into the separate short notes they always
+were.
