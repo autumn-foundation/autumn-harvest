@@ -22,9 +22,15 @@
 # Set DRY_RUN=1 to print the cargo commands instead of executing them.
 #
 # Sharding: set SEMAPHORE_SHARD_COUNT to an integer N and
-# SEMAPHORE_SHARD_INDEX to 0..N-1 to have `run <linux|linuxpart|allos>` process
-# only every Nth matching manifest row (row_ordinal % N == SHARD_INDEX,
-# row_ordinal counted among rows matching that osclass, in manifest order).
+# SEMAPHORE_SHARD_INDEX to 0..N-1 to have `run <linux|linuxpart|allos>` or
+# `compile` process only every Nth matching row (row_ordinal % N ==
+# SHARD_INDEX). For `run`, row_ordinal is counted among rows matching that
+# osclass, in manifest order. For `compile`, row_ordinal is counted among the
+# (crate, features, target) rows compile draws from (linux|compileonly plugin
+# rows), in the same sorted order `do_compile` batches them by — filtering a
+# sorted list by row ordinal yields a sorted subsequence, so rows sharing a
+# (crate, features) key still land adjacent and batch into one `cargo`
+# invocation exactly as they would unsharded, just with fewer targets in it.
 # `--test-threads=1` WITHIN a row's own `cargo test` invocation is unaffected —
 # sharding only changes which ROWS a given invocation of this script runs, not
 # how a row's own tests are ordered against each other. Unset (the default):
@@ -162,6 +168,16 @@ do_compile() {
       print $2 "\t" $4 "\t" $3
     }' | sort)"
   [ -n "$grouped" ] || return 0
+
+  # Sharding (see header comment): keep every Nth row, by ordinal in the
+  # already-sorted list above. Same row_ordinal % shard_count == shard_index
+  # scheme as do_run's, computed independent of whether sharding is active.
+  local shard_count="${SEMAPHORE_SHARD_COUNT:-}"
+  local shard_index="${SEMAPHORE_SHARD_INDEX:-0}"
+  if [ -n "$shard_count" ]; then
+    grouped="$(printf '%s\n' "$grouped" | awk -v n="$shard_count" -v i="$shard_index" '((NR - 1) % n) == i')"
+    [ -n "$grouped" ] || return 0
+  fi
 
   local prev_key="" cur_crate="" cur_feats="" targets=""
   local c f t
