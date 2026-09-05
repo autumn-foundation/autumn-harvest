@@ -709,3 +709,60 @@ mod same_module_vs_nested_module_parity_tests {
         assert!(same_module_body.contains("update_with_start_workflow_execution"));
     }
 }
+
+// ── Characterization tests: signature-validation error paths ────────────────
+//
+// Sibling of `query.rs`'s test of the same name -- pins `update_macro`'s
+// current rejection messages for `first_param_is_ctx`/`returns_result`/the
+// async check before those checks route through the already-shared
+// `attr_util` helpers.
+#[cfg(test)]
+mod signature_validation_characterization_tests {
+    use super::update_macro;
+    use quote::quote;
+
+    #[test]
+    fn sync_handler_is_rejected() {
+        let attr = quote! { workflow = "MyWorkflow" };
+        let item = quote! {
+            fn my_update(ctx: &WorkflowContext) -> Result<(), String> {
+                Ok(())
+            }
+        };
+        let out = update_macro(attr, item).to_string();
+        assert!(
+            out.contains("must be async"),
+            "expected the async rejection message, got:\n{out}"
+        );
+    }
+
+    #[test]
+    fn wrong_first_param_type_is_rejected() {
+        let attr = quote! { workflow = "MyWorkflow" };
+        let item = quote! {
+            async fn my_update(n: u32) -> Result<u32, String> {
+                Ok(n)
+            }
+        };
+        let out = update_macro(attr, item).to_string();
+        assert!(
+            out.contains("must take") && out.contains("WorkflowContext"),
+            "expected the ctx-param rejection message, got:\n{out}"
+        );
+    }
+
+    #[test]
+    fn non_result_return_type_is_rejected() {
+        let attr = quote! { workflow = "MyWorkflow" };
+        let item = quote! {
+            async fn my_update(ctx: &WorkflowContext) -> u32 {
+                0
+            }
+        };
+        let out = update_macro(attr, item).to_string();
+        assert!(
+            out.contains("return type must be") && out.contains("Result"),
+            "expected the return-type rejection message, got:\n{out}"
+        );
+    }
+}

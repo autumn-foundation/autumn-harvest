@@ -469,3 +469,48 @@ mod same_module_vs_nested_module_parity_tests {
         assert!(same_module_body.contains("execute_query_in_process"));
     }
 }
+
+// ── Characterization tests: signature-validation error paths ────────────────
+//
+// Pins `query_macro`'s current rejection messages for the two structural
+// checks (`first_param_is_ctx`, `returns_result`) before those checks are
+// switched to call the already-shared `attr_util::first_param_is_ctx_type`/
+// `attr_util::returns_result` (see the sibling copies in `update.rs` and
+// `signal.rs`, and the generalized versions in `attr_util.rs` already used by
+// `webhook.rs`). Committed first so the refactor cannot silently change a
+// caller-visible compile error.
+#[cfg(test)]
+mod signature_validation_characterization_tests {
+    use super::query_macro;
+    use quote::quote;
+
+    #[test]
+    fn wrong_first_param_type_is_rejected() {
+        let attr = quote! { workflow = "MyWorkflow" };
+        let item = quote! {
+            fn my_query(n: u32) -> Result<u32, String> {
+                Ok(n)
+            }
+        };
+        let out = query_macro(attr, item).to_string();
+        assert!(
+            out.contains("must take") && out.contains("WorkflowContext"),
+            "expected the ctx-param rejection message, got:\n{out}"
+        );
+    }
+
+    #[test]
+    fn non_result_return_type_is_rejected() {
+        let attr = quote! { workflow = "MyWorkflow" };
+        let item = quote! {
+            fn my_query(ctx: &WorkflowContext) -> u32 {
+                0
+            }
+        };
+        let out = query_macro(attr, item).to_string();
+        assert!(
+            out.contains("return type must be") && out.contains("Result"),
+            "expected the return-type rejection message, got:\n{out}"
+        );
+    }
+}

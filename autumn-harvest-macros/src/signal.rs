@@ -313,3 +313,28 @@ fn first_param_is_ctx(inputs: &syn::punctuated::Punctuated<syn::FnArg, syn::toke
 fn to_pascal_case(s: &str) -> String {
     crate::to_pascal_case(s)
 }
+
+// ── Characterization tests: signature-validation error paths ────────────────
+//
+// Sibling of `query.rs`'s/`update.rs`'s tests of the same name -- pins
+// `signal_macro`'s current rejection message for `first_param_is_ctx` before
+// that check routes through the already-shared
+// `attr_util::first_param_is_ctx_type`.
+#[cfg(test)]
+mod signature_validation_characterization_tests {
+    use super::signal_macro;
+    use quote::quote;
+
+    #[test]
+    fn wrong_first_param_type_is_rejected() {
+        let attr = quote! { workflow = "MyWorkflow" };
+        let item = quote! {
+            fn my_signal(n: u32) {}
+        };
+        let out = signal_macro(attr, item).to_string();
+        assert!(
+            out.contains("must take") && out.contains("WorkflowContext"),
+            "expected the ctx-param rejection message, got:\n{out}"
+        );
+    }
+}
