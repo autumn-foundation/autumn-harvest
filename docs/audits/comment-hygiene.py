@@ -401,6 +401,23 @@ def table_delimiter(text: str, container: int, header: str) -> bool:
 
 # An ATX heading. The indent is a capture group because the indent decides
 # whether this is a heading at all -- see `heading` below.
+def line_tail(pieces: list, index: int) -> str:
+    """The rest of the piece's LINE, past any nested comment on it.
+
+    A fence delimiter is judged by the whole line, and a nested comment
+    splits one line into several pieces. Rustdoc keeps a fence open across
+    "``` /* note */" because a closing fence may be followed only by spaces,
+    and closing it there reports a fenced example's own TODO -- a false
+    positive on a gate that sits at zero.
+    """
+    tail = []
+    for piece in pieces[index + 1:]:
+        if piece.line != pieces[index].line or piece.line_start:
+            break
+        tail.append(piece.text)
+    return "".join(tail)
+
+
 def next_row(pieces: list, index: int, nest: int):
     """The piece after `index`, if it is in the same comment.
 
@@ -491,7 +508,9 @@ class Piece:
     line number.
     """
 
-    __slots__ = ("line", "marker", "body", "trailing", "block", "group", "nest")
+    __slots__ = (
+        "line", "marker", "body", "trailing", "block", "group", "nest", "line_start"
+    )
 
     def __init__(
         self,
@@ -502,6 +521,7 @@ class Piece:
         block: bool,
         group: int = -1,
         nest: int = 0,
+        line_start: bool = True,
     ) -> None:
         self.line = line
         self.marker = marker
@@ -517,6 +537,13 @@ class Piece:
         # inside the enclosing one's fenced example if there is one, so it
         # inherits the fence; what it opens itself does not survive the close.
         self.nest = nest
+        # Does this piece begin its own line? A nested comment splits one
+        # line into several pieces, and only the first of them starts at
+        # column zero. Every Markdown BLOCK marker -- a fence, a list item, a
+        # heading, a quote, a table row -- must start a line, so a piece that
+        # begins after literal "/*" or "*/" text carries none of them. Only
+        # the line rules apply to it, and its text joins the prose around it.
+        self.line_start = line_start
 
     @property
     def text(self) -> str:
@@ -617,6 +644,11 @@ def extract_comments(source: str) -> list[Piece]:
             seg_start = i
             seg_line = line
             seg_nest = depth
+            # The outer marker is not part of the rendered document, so the
+            # text after it is still the first line's start. A nested `/*`
+            # and a nested `*/` ARE rendered, literally, so text after either
+            # of those is mid-line and can open no block.
+            seg_start_of_line = True
             first = True
             line_started = False
             while i < n and depth > 0:
@@ -632,7 +664,7 @@ def extract_comments(source: str) -> list[Piece]:
                     # side, and it ended the paragraph one line earlier.
                     if i > seg_start and not gutter_only(source[seg_start:i]):
                         pieces.append(
-                            Piece(seg_line, marker, source[seg_start:i], code_on_line and first, True, root_group, seg_nest)
+                            Piece(seg_line, marker, source[seg_start:i], code_on_line and first, True, root_group, seg_nest, seg_start_of_line)
                         )
                         first = False
                     # The opener itself is text on this line, whether or not
@@ -657,11 +689,12 @@ def extract_comments(source: str) -> list[Piece]:
                     seg_start = i
                     seg_line = line
                     seg_nest = depth
+                    seg_start_of_line = False
                 elif source.startswith("*/", i):
                     if depth > 1:
                         if i > seg_start and not gutter_only(source[seg_start:i]):
                             pieces.append(
-                                Piece(seg_line, marker, source[seg_start:i], code_on_line and first, True, root_group, seg_nest)
+                                Piece(seg_line, marker, source[seg_start:i], code_on_line and first, True, root_group, seg_nest, seg_start_of_line)
                             )
                             first = False
                         line_started = True
@@ -673,6 +706,7 @@ def extract_comments(source: str) -> list[Piece]:
                         seg_start = i
                         seg_line = line
                         seg_nest = depth
+                        seg_start_of_line = False
                 elif source[i] == "\n":
                     # A nested comment that closes at the end of a line leaves
                     # a zero-length segment behind. That is a blank SEGMENT,
@@ -681,7 +715,7 @@ def extract_comments(source: str) -> list[Piece]:
                     # emits nothing before the newline, so it still counts.
                     if i > seg_start or not line_started:
                         pieces.append(
-                            Piece(seg_line, marker, source[seg_start:i], code_on_line and first, True, root_group, seg_nest)
+                            Piece(seg_line, marker, source[seg_start:i], code_on_line and first, True, root_group, seg_nest, seg_start_of_line)
                         )
                         first = False
                     line_started = False
@@ -690,12 +724,13 @@ def extract_comments(source: str) -> list[Piece]:
                     seg_start = i
                     seg_line = line
                     seg_nest = depth
+                    seg_start_of_line = True
                 else:
                     i += 1
             tail_end = i - 2 if depth == 0 else i
             if tail_end > seg_start and not gutter_only(source[seg_start:tail_end]):
                 pieces.append(
-                    Piece(seg_line, marker, source[seg_start:tail_end], code_on_line and first, True, root_group, seg_nest)
+                    Piece(seg_line, marker, source[seg_start:tail_end], code_on_line and first, True, root_group, seg_nest, seg_start_of_line)
                 )
             code_on_line = True
             continue
@@ -1252,6 +1287,13 @@ def comment_lines(pieces: list[Piece]):
                 )
                 nest = piece.nest
             text = piece.text
+            # A piece that does not begin its own line can open no block.
+            # "Outer /* ```rust" puts the backticks after literal text, and
+            # Rustdoc renders the whole line as a paragraph; opening a fence
+            # there exempts every line until the next delimiter.
+            if not piece.line_start:
+                yield piece.line, text, fence is not None
+                continue
             if fence is not None and leaves_container(text, scope):
                 fence = None
             if fence is None:
@@ -1270,6 +1312,17 @@ def comment_lines(pieces: list[Piece]):
                 quoted = quote_depth(text, stack[-1][0] if stack else 0)
             container = stack[-1][0] if stack else 0
             delimiter = fence_delimiter(text, container, fence is not None, scope[2], stack)
+            # The whole LINE decides a delimiter, not this piece alone. A
+            # closer may be followed only by spaces, and an opener's info
+            # string runs to the end of the line, where a backtick makes it
+            # invalid. Text after a nested comment on the same line is part
+            # of both.
+            if delimiter:
+                tail = line_tail(run, index)
+                if (fence is not None and tail.strip()) or (
+                    fence is None and "`" in tail
+                ):
+                    delimiter = None
             if delimiter:
                 before = fence
                 fence = fence_transition(fence, delimiter[0], delimiter[1])
@@ -1423,12 +1476,34 @@ def prose_units(pieces: list[Piece]) -> list[tuple[int, str]]:
                 )
                 nest = piece.nest
             body = piece.text
+            # Mid-line, so no block marker of its own -- see `comment_lines`.
+            # The text is still part of the line's sentence, so it joins the
+            # run rather than starting one.
+            if not piece.line_start:
+                if fence is not None:
+                    flush()
+                    in_list = False
+                elif body.strip():
+                    run.append(body.strip())
+                    run_lines.append(piece.line)
+                continue
             if fence is not None and leaves_container(body, scope):
                 fence = None
             if fence is None:
                 stack, paragraph = update_containers(body, stack, paragraph, quoted)
             container = stack[-1][0] if stack else 0
             delimiter = fence_delimiter(body, container, fence is not None, scope[2], stack)
+            # The whole LINE decides a delimiter, not this piece alone. A
+            # closer may be followed only by spaces, and an opener's info
+            # string runs to the end of the line, where a backtick makes it
+            # invalid. Text after a nested comment on the same line is part
+            # of both.
+            if delimiter:
+                tail = line_tail(block, index)
+                if (fence is not None and tail.strip()) or (
+                    fence is None and "`" in tail
+                ):
+                    delimiter = None
             if delimiter:
                 before = fence
                 fence = fence_transition(fence, delimiter[0], delimiter[1])
@@ -2531,6 +2606,33 @@ RULE_TESTS = [
         "///     TODO: issue required\n",
         set(),
         "a confirmed table still ends a lazy quote continuation",
+    ),
+    (
+        "/** Outer /* ```rust\n"
+        " * TODO: issue required\n"
+        " * ``` */ tail. */\n"
+        "pub struct A;\n",
+        {("CH002", 2)},
+        "backticks after a nested opener are mid-line, so no fence",
+    ),
+    (
+        "/** Outer /* text\n"
+        " * ```rust\n"
+        " * TODO: issue required\n"
+        " * ``` */ tail. */\n"
+        "pub struct A;\n",
+        set(),
+        "a nested fence that starts its own line still opens",
+    ),
+    (
+        "/** ```rust\n"
+        " * sample();\n"
+        " * ``` /* note */\n"
+        " * TODO: issue required\n"
+        " * ``` */\n"
+        "pub struct A;\n",
+        set(),
+        "a closer followed by a nested comment does not close",
     ),
 ]
 

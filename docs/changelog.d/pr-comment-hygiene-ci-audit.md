@@ -1359,3 +1359,30 @@ that each re-derived the answer are why rounds thirty-four to forty-two kept
 finding the same question answered differently in different places.
 
 Corpus effect: none, for the twenty-fourth round running.
+
+### Round forty-three — a piece is not always a line
+
+One finding, and the general defect under it: a nested comment splits one
+source line into several pieces, and both scanners treated every piece as a
+line of its own. Every Markdown BLOCK marker must start a line, so a piece
+beginning after a literal `/*` or `*/` carries none of them.
+
+`/** Outer /* ```rust` renders as a paragraph — the backticks sit after text,
+so they open nothing — but the audit read the nested piece as a line, opened a
+fence, and exempted the TODO under it. `Piece.line_start` now records whether
+a piece begins its own line, and a piece that does not opens no fence, no
+list, no quote and no table; its text joins the prose around it, which is
+where Rustdoc puts it.
+
+Fixing the reported case exposed the same loss of line context in the other
+direction, and it was the worse of the two. A closing fence may be followed
+only by spaces, so Rustdoc keeps the fence open across `` ``` /* note */ ``
+— while the audit saw a piece reading `` ``` `` with nothing after it, closed
+the fence, and reported a fenced example's own TODO. That is a **false
+positive on a Tier A gate**, which fails CI on a legitimate example, and it is
+the failure this harness must never produce. `line_tail` reassembles the rest
+of the line past any nested comment, and a delimiter is now judged against the
+whole line: no trailing text for a closer, no backtick in an opener's info
+string.
+
+Corpus effect: none, for the twenty-fifth round running.
