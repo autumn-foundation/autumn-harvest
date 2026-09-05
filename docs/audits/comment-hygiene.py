@@ -272,7 +272,8 @@ CONTRACTION_RE = re.compile(
     r"\b(?:ca|is|are|was|were|do|does|did|would|could|should|will|has|have|had"
     r"|must|ai|wo|sha|need|ought|might)n't\b"
     r"|\b(?:it|that|there|here|what|who|let|he|she|we|they|you|i|world)'"
-    r"(?:s|ll|re|ve|d|m)\b",
+    r"(?:s|ll|re|ve|d|m)\b"
+    r"|\b(?:should|could|would|must|might)'ve\b",
     re.IGNORECASE,
 )
 
@@ -432,6 +433,10 @@ def extract_comments(source: str) -> list[Piece]:
                         )
                         first = False
                     depth += 1
+                    # A nested comment is its own comment: give it a fresh
+                    # group so its fence state cannot leak into the text that
+                    # resumes after it closes.
+                    block_group += 1
                     # Past the WHOLE nested marker, for the same reason the
                     # outer one does it: a retained `!` from `/*!` leaves the
                     # anchored rules staring at "! TODO".
@@ -452,6 +457,9 @@ def extract_comments(source: str) -> list[Piece]:
                     depth -= 1
                     i += 2
                     if depth > 0:
+                        # Resuming the enclosing comment. New group again, so
+                        # the text after a nested block is judged on its own.
+                        block_group += 1
                         seg_start = i
                         seg_line = line
                 elif source[i] == "\n":
@@ -1071,6 +1079,11 @@ RULE_TESTS = [
         "let x = 1; /* ```rust\nTODO: fixture placeholder\n``` */\n",
         set(),
         "a multiline block comment starting after code is one run",
+    ),
+    (
+        "/* outer /* ```rust */ TODO: issue required */\n",
+        {("CH002", 1)},
+        "a nested comment's fence does not leak into the enclosing one",
     ),
     (
         "/* outer /*! TODO */ */\n",

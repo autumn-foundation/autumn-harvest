@@ -358,3 +358,21 @@ English, which is worse than missing one commented-out line — so recall is
 added by new narrowly-anchored alternatives measured against the corpus and
 the sweep, never by relaxing an existing anchor, which has produced a false
 positive every time it has been tried.
+
+**Eleventh Codex round (PR #1380): two more P2 findings, both real.**
+
+- *Modal perfect contractions were missed.* CH006's `'ve` alternation listed
+  only pronouns, so `should've`, `could've`, `would've`, `must've` and
+  `might've` went unreported. No corpus instances, so this one is purely
+  preventive.
+- *A nested comment's fence leaked into the enclosing one.*
+  `/* outer /* ```rust */ TODO: issue required */` produced no finding:
+  `block_group` incremented only at the outer `/*`, so every nesting depth
+  shared one group and the inner fence suppressed the outer text after the
+  inner comment had already closed. Each nesting level now gets its own group,
+  on both entry and exit.
+
+Checked against the four neighbouring cases that pull against this, since
+nesting and run-grouping fixes have repeatedly broken each other: nested
+bodies are still inspected, a nested `/*!` is still stripped, one multiline
+block is still one run, and two distinct blocks are still two runs.
