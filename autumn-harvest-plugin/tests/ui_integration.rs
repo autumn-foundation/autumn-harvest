@@ -1216,6 +1216,40 @@ async fn ui_workers_unknown_status_value_redisplays_form_instead_of_aborting_pag
         html.contains("zombie") && html.contains("Active"),
         "the error must name the bad value and a valid option: {html}"
     );
+    assert!(
+        html.contains("option value=\"zombie\" selected"),
+        "the Status select must echo the invalid value back as its selected \
+         option, not silently revert to 'All' (Codex review, #1378 P2): {html}"
+    );
+}
+
+/// Codex review on #1378 (P2): the first version of this fix parsed the
+/// invalid value down to `None` before it ever reached
+/// `render_workers_page`, so the pagination links and a plain form
+/// resubmission were built without it — a Next click (or clicking Apply
+/// with nothing changed) silently dropped the still-unresolved `status`
+/// filter and its error, one click after the operator saw it. Fixed by
+/// carrying the raw text alongside the parsed value all the way to
+/// `build_worker_query_string`.
+#[tokio::test]
+async fn ui_workers_invalid_status_value_persists_across_pagination() {
+    let (database_url, _container) = setup_test_database_url().await;
+    let mut conn = AsyncPgConnection::establish(&database_url).await.unwrap();
+    insert_test_worker(&mut conn, "pg-worker-zombie-a", "Active", 0).await;
+    insert_test_worker(&mut conn, "pg-worker-zombie-b", "Active", 0).await;
+
+    let app = build_single_shard_ui_app(&database_url);
+    let (status, html) = fetch_html(&app, "/workers?status=zombie&limit=1").await;
+    assert_eq!(status, StatusCode::OK, "unexpected status: {html}");
+    assert!(
+        html.contains("Next"),
+        "test setup must produce a Next link to exercise pagination: {html}"
+    );
+    assert!(
+        html.contains("status=zombie"),
+        "the invalid status must be carried into the Next/Previous links \
+         instead of being dropped on the next page view: {html}"
+    );
 }
 
 /// Same fix, `stale` side — a distinct code path in `list_workers_ui`, and
