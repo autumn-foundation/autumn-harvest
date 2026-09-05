@@ -21,10 +21,22 @@ docs, and its tier split is deliberate.
 they were driven to zero when the harness landed, and a new one fails the
 build. Fix the finding; there is no baseline to absorb it.
 
-**Tier B is a ratchet.** CH005–CH007 have a legacy population too large to
-fix in one change (CH007 alone is ~17.9k sentences), so
-`comment-hygiene-baseline.json` freezes the per-file count. New code is
-held to the rule while old code is merely forbidden from getting worse.
+**Tier B is a ratchet, scoped to what you changed.** CH005–CH007 have a
+legacy population too large to fix in one change (CH007 alone is ~17.9k
+sentences), so `comment-hygiene-baseline.json` freezes the per-file count.
+CI passes `--base`, and the gate then judges only the files your change
+touches; everything else is reported but cannot fail your build.
+
+That scoping is load-bearing. A whole-corpus count is a shared mutable
+number: one merge that adds a long comment anywhere turns every open PR
+red for a file its author never opened. (This happened on the harness's
+own first CI run — `trunk-dev` gained 4 long sentences in
+`cross_region_dr_tests.rs` while the PR was open, and the gate failed on
+a file the PR never touched.) The predictable response is to regenerate
+the baseline, which defeats the ratchet. Scoping keeps each change
+answerable for its own work and keeps the baseline a stable record rather
+than a contended counter.
+
 Counts may fall freely. Regenerate the baseline
 (`python3 docs/audits/comment-hygiene.py --write-baseline`) **only** when
 lowering a count or when a rule's definition changes — never to absorb a

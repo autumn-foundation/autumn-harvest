@@ -104,7 +104,13 @@ jobs:
     # below additionally gate on the `changes` guard.
     if: github.event_name != 'pull_request' || github.event.pull_request.draft == false
     steps:
+      # Full history: the comment-hygiene step below diffs against the merge
+      # base with the target branch, and a shallow clone has no merge base to
+      # find. Without it that step silently degrades to report-only and stops
+      # gating. This is the cheap job, so the extra fetch is affordable here.
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
@@ -317,10 +323,24 @@ jobs:
       # finds the comments, and it must keep handling raw strings, nested block
       # comments, lifetime ticks and backslash-newline continuations. A silent
       # regression there would quietly stop gating rather than fail loudly.
+      #
+      # `--base` scopes Tier B to the files this change actually touched.
+      # That is what makes the ratchet usable rather than a softening: a
+      # whole-corpus count is a shared mutable number, so one merge adding a
+      # long comment anywhere turns every open PR red for a file its author
+      # never opened. (Observed on this PR's own first run: trunk-dev gained
+      # 4 long sentences in cross_region_dr_tests.rs and failed the gate.)
+      # The predictable response is to regenerate the baseline, which defeats
+      # the ratchet entirely. Tier A is never scoped -- it gates everywhere.
       - name: Comment hygiene (docs/audits/comment-hygiene.py)
         run: |
           python3 docs/audits/comment-hygiene.py --self-test
-          python3 docs/audits/comment-hygiene.py
+          if [ -n "${{ github.base_ref }}" ]; then
+            git fetch --no-tags origin "${{ github.base_ref }}"
+            python3 docs/audits/comment-hygiene.py --base FETCH_HEAD
+          else
+            python3 docs/audits/comment-hygiene.py --base HEAD~1
+          fi
 
   test:
     name: Test (${{ matrix.os }})

@@ -47,8 +47,18 @@ TIER B -- ratcheted against docs/audits/comment-hygiene-baseline.json
 Real style defects with a legacy population far too large to fix in one
 change (CH007 alone is ~18k sentences). Freezing them as a per-file,
 per-rule count means new code is held to the rule while old code is
-merely forbidden from getting worse. Counts may fall freely; any increase,
-or any file that gains its first violation, fails the build.
+merely forbidden from getting worse. Counts may fall freely.
+
+Tier B gates only the files a change actually touches (`--base <ref>`,
+which CI passes). This is load-bearing, not a softening. A whole-corpus
+count is a shared mutable number: one merge that adds a long comment
+anywhere turns every open PR red for a file its author never opened, and
+the predictable response is to regenerate the baseline, which defeats the
+ratchet entirely. Scoping to changed files makes each change answerable
+only for its own work, and leaves the baseline a stable record of legacy
+debt rather than a contended counter. Without `--base` -- or when the diff
+cannot be computed, e.g. a shallow clone -- Tier B reports but never
+fails. Tier A is never scoped; it gates everywhere, always.
 
   CH005 review-archaeology    "Codex round 8", "round-5", "P2 fix": the
                               review round that produced a change is
@@ -83,6 +93,7 @@ Usage:
     python3 docs/audits/comment-hygiene.py [--json] [--tier-a-only]
     python3 docs/audits/comment-hygiene.py --write-baseline
     python3 docs/audits/comment-hygiene.py --self-test
+    python3 docs/audits/comment-hygiene.py --base origin/trunk-dev
     python3 docs/audits/comment-hygiene.py --paths a.rs b.rs
 
 Exit status is 1 on any Tier A finding or any Tier B regression, 0
@@ -128,6 +139,7 @@ import argparse
 import json
 import os
 import re
+import subprocess
 import sys
 from collections import defaultdict
 
@@ -615,13 +627,56 @@ def load_baseline() -> dict:
         return json.load(handle).get("counts", {})
 
 
-def compare_tier_b(current: dict, baseline: dict) -> list[str]:
-    """Regressions only: a count that rose, or a file newly in violation."""
+def changed_files(base_ref: str) -> set[str] | None:
+    """Files this branch changed relative to its merge base with `base_ref`.
+
+    None when the answer cannot be trusted -- no git, an unknown ref, or a
+    shallow clone whose history does not reach the merge base. Callers treat
+    None as "cannot scope", not as "nothing changed".
+    """
+    def git(*args: str) -> str | None:
+        try:
+            done = subprocess.run(
+                ("git", *args),
+                cwd=REPO_ROOT,
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+        except (OSError, ValueError):
+            return None
+        return done.stdout.strip() if done.returncode == 0 else None
+
+    merge_base = git("merge-base", base_ref, "HEAD")
+    if not merge_base:
+        return None
+    listing = git("diff", "--name-only", merge_base, "HEAD")
+    if listing is None:
+        return None
+    return {line for line in listing.split("\n") if line.strip()}
+
+
+def compare_tier_b(
+    current: dict, baseline: dict, scope: set[str] | None = None
+) -> list[str]:
+    """Regressions only: a count that rose, or a file newly in violation.
+
+    `scope` limits the gate to the files a change actually touches. That is
+    not a softening, it is what makes the ratchet usable: a whole-corpus
+    count is a shared mutable number, so one merge that adds a long comment
+    anywhere turns every open PR red for a file its author never opened. The
+    predictable response is to regenerate the baseline, which defeats the
+    ratchet entirely. Scoping to changed files makes each PR answerable only
+    for its own work, and leaves the baseline a stable record of legacy debt
+    rather than a contended counter.
+    """
     regressions = []
     for rule in TIER_B:
         now = current.get(rule, {})
         was = baseline.get(rule, {})
         for path in sorted(now):
+            if scope is not None and path not in scope:
+                continue
             before = was.get(path, 0)
             after = now[path]
             if after > before:
@@ -650,7 +705,13 @@ def write_baseline(findings: list[Finding]) -> None:
     print(f"Wrote {BASELINE_PATH} ({total} Tier B findings frozen).")
 
 
-def report(findings: list[Finding], baseline: dict, tier_a_only: bool) -> int:
+def report(
+    findings: list[Finding],
+    baseline: dict,
+    tier_a_only: bool,
+    scope: set[str] | None,
+    scope_note: str,
+) -> int:
     by_rule: dict = defaultdict(list)
     for f in findings:
         by_rule[f.rule].append(f)
@@ -674,7 +735,7 @@ def report(findings: list[Finding], baseline: dict, tier_a_only: bool) -> int:
         return 1 if failed else 0
 
     current = tally(findings)
-    print("\nTier B -- ratcheted against the baseline")
+    print(f"\nTier B -- ratcheted against the baseline ({scope_note})")
     for rule in TIER_B:
         now = sum(current.get(rule, {}).values())
         was = sum(baseline.get(rule, {}).values())
@@ -682,7 +743,7 @@ def report(findings: list[Finding], baseline: dict, tier_a_only: bool) -> int:
         arrow = "=" if delta == 0 else (f"+{delta}" if delta > 0 else str(delta))
         print(f"  {rule} {RULE_TITLES[rule]}: {now} (baseline {was}, {arrow})")
 
-    regressions = compare_tier_b(current, baseline)
+    regressions = compare_tier_b(current, baseline, scope)
     if regressions:
         failed = True
         print(f"\n{len(regressions)} Tier B regression(s) -- these files gained violations:")
@@ -756,6 +817,16 @@ def main() -> int:
     parser.add_argument(
         "--self-test", action="store_true", help="check the lexer against its fixtures"
     )
+    parser.add_argument(
+        "--base",
+        metavar="REF",
+        help=(
+            "gate Tier B only on files changed since the merge base with REF "
+            "(e.g. origin/trunk-dev). Without it, Tier B is reported over the "
+            "whole corpus but never fails, because a whole-corpus count is not "
+            "this change's to answer for."
+        ),
+    )
     parser.add_argument("--paths", nargs="*", help="limit the scan to these .rs files")
     args = parser.parse_args()
 
@@ -771,22 +842,48 @@ def main() -> int:
         write_baseline(findings)
         return 0
 
+    # Tier B gates only what this change touched. Unscoped, it reports and
+    # never fails: the alternative is failing a PR for a file it never opened.
+    scope: set[str] | None = None
+    if args.base:
+        scope = changed_files(args.base)
+        if scope is None:
+            print(
+                f"comment-hygiene: cannot diff against {args.base!r} (unknown ref, "
+                "no git, or a shallow clone). Tier B is report-only for this run.",
+                file=sys.stderr,
+            )
+            # An empty scope gates nothing. Falling back to gating the WHOLE
+            # corpus would be the worst option available: it fails the build
+            # over legacy debt the change never touched, precisely when the
+            # tool has already admitted it cannot tell what changed.
+            scope = set()
+            scope_note = f"could not diff against {args.base}; report-only"
+        else:
+            rust = sorted(p for p in scope if p.endswith(".rs"))
+            scope_note = f"gating {len(rust)} changed .rs file(s) vs {args.base}"
+    else:
+        scope = set()
+        scope_note = "no --base given; report-only"
+
     if args.json:
         current = tally(findings)
+        regressions = compare_tier_b(current, load_baseline(), scope)
         print(
             json.dumps(
                 {
                     "findings": [f.as_dict() for f in findings],
                     "counts": current,
-                    "tier_b_regressions": compare_tier_b(current, load_baseline()),
+                    "scope": sorted(scope) if scope is not None else None,
+                    "tier_b_regressions": regressions,
                 },
                 indent=2,
             )
         )
         tier_a = [f for f in findings if f.rule in TIER_A]
-        return 1 if tier_a or compare_tier_b(current, load_baseline()) else 0
+        return 1 if tier_a or regressions else 0
 
-    return report(findings, load_baseline(), args.tier_a_only)
+    return report(findings, load_baseline(), args.tier_a_only, scope, scope_note)
 
 
 if __name__ == "__main__":

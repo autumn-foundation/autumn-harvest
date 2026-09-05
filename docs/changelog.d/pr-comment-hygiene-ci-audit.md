@@ -93,3 +93,30 @@ baseline was regenerated for the rule-definition change (+2 CH006, +10 CH007,
 all in newly visible trailing and block comments). The gate was re-verified
 through the new paths: CH001/CH002 via a trailing comment, CH002/CH003 via a
 block comment, each exit 1, while a raw-string fixture correctly exits 0.
+
+**Tier B is scoped to changed files (PR #1380 CI).** The harness's own first
+CI run failed — correctly, and on a design flaw rather than a bug. While the
+PR was open, `trunk-dev` merged #1377, which added 4 long sentences to
+`cross_region_dr_tests.rs`. CI evaluates the merge of the branch onto the base,
+so those sentences appeared in the scan while the locally-generated baseline
+knew nothing of them, and the gate failed on a file the PR never touched.
+
+That is inherent to a whole-corpus count: it is a shared mutable number, so
+one merge adding a long comment anywhere turns every open PR red, and the
+predictable response is to regenerate the baseline — which defeats the ratchet
+entirely. Fixed by scoping Tier B to the files a change actually touches, via
+`--base <ref>` (merge-base + `git diff --name-only`), which CI passes as the
+PR's target branch. Tier A is never scoped and gates everywhere.
+
+Failing safe matters here as much as failing correctly. When the diff cannot
+be computed — no `--base`, an unknown ref, a shallow clone with no reachable
+merge base — Tier B reports and never fails, because gating the whole corpus
+at exactly the moment the tool cannot tell what changed is the worst available
+option. The `lint` checkout takes `fetch-depth: 0` so the merge base is
+actually reachable; without it the step would silently degrade to report-only
+and quietly stop gating.
+
+Verified across all five paths: base drift on an untouched file passes; a
+CH006/CH007 regression in a file the branch does touch exits 1 naming both
+rules; a Tier A defect exits 1 regardless of scope; an unknown ref and a
+missing `--base` both degrade to report-only at exit 0.
