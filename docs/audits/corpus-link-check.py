@@ -395,6 +395,67 @@ def extract_link_targets(text: str):
     return targets, undefined_refs
 
 
+def compute_corpus_reachable(files) -> set:
+    """Return the subset of `files` a reader can actually reach: every
+    non-process-artifact page, plus any process-artifact page transitively
+    linked from one (docs/rnd/determinism-static-analysis.md and
+    docs/rnd/sqlite-feasibility.md are the current examples — see
+    PROCESS_ARTIFACT_PREFIXES's docstring above for why prefix alone isn't
+    enough). Standalone from main() so other docs/audits/ scripts can share
+    this repo's one definition of "process artifact" instead of
+    re-implementing the prefix-only half of it and drifting from this
+    script's actual (closure) behavior — see config-cli-drift.py, which
+    does exactly that (Codex review, PR #1373)."""
+    file_set = set(files)
+    top_level_sources = {
+        REPO_ROOT / name for name in TOP_LEVEL_SOURCES if (REPO_ROOT / name).exists()
+    }
+    inbound_sources = {p: set() for p in files}
+
+    for src in files:
+        text = strip_code_spans_and_fences(
+            src.read_text(encoding="utf-8", errors="replace")
+        )
+        link_targets, _ = extract_link_targets(text)
+        for target in link_targets:
+            if is_external_or_special(target):
+                continue
+            path_part, _, _ = target.partition("#")
+            if path_part == "":
+                continue
+            resolved = (src.parent / path_part).resolve()
+            if not resolved.is_relative_to(REPO_ROOT):
+                continue
+            if resolved.is_dir():
+                readme = resolved / "README.md"
+                if readme in file_set:
+                    resolved = readme
+            if resolved in file_set:
+                inbound_sources.setdefault(resolved, set()).add(src)
+
+    def rel_posix(p: Path) -> str:
+        return p.relative_to(REPO_ROOT).as_posix()
+
+    def under_process_prefix(p: Path) -> bool:
+        return rel_posix(p).startswith(PROCESS_ARTIFACT_PREFIXES)
+
+    corpus_reachable = {
+        p
+        for p in files
+        if (p.is_relative_to(REPO_ROOT / "docs") or p in top_level_sources)
+        and not under_process_prefix(p)
+    }
+    worklist = list(corpus_reachable)
+    while worklist:
+        cur = worklist.pop()
+        for target, sources in inbound_sources.items():
+            if cur in sources and target not in corpus_reachable:
+                corpus_reachable.add(target)
+                worklist.append(target)
+
+    return corpus_reachable
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--json", action="store_true")
