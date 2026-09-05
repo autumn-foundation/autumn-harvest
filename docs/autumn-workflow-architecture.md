@@ -1420,7 +1420,7 @@ require_shard_readiness = false  # default: false — when true, `/health` retur
 orphaned_workflows = "warn"   # "off" | "warn" | "fail" — default: warn
 ```
 
-**Not part of this schema.** Sharding (`ShardedDbPool`, `HarvestRunnerResources::with_sharded_pool`) and per-worker queue/capability routing (`WorkerConfig::with_shard_assignments`, task-queue labels) are configured through the Rust builder API, not TOML or env vars — see [`docs/sharding.md`](sharding.md) and [`docs/getting-started/09-worker-routing.md`](getting-started/09-worker-routing.md). History retention is configured via `HarvestBuilder::retention(RetentionConfig { .. })`, also Rust-only (§13.4 above). The management API's mount path is chosen by the embedder via `HarvestBuilder::harvest_api`, not a config key.
+**Not part of this schema.** Sharding (`ShardedDbPool`, `HarvestRunnerResources::with_sharded_pool`) and per-worker queue/capability routing (`WorkerConfig::with_shard_assignments`, task-queue labels) are configured through the Rust builder API, not TOML or env vars — see [`docs/sharding.md`](sharding.md) and [`docs/getting-started/09-worker-routing.md`](getting-started/09-worker-routing.md). History retention is configured via `HarvestBuilder::retention(RetentionConfig { .. })`, also Rust-only (§13.4 above). The management API's mount path is chosen by the embedder via `HarvestPlugin::api` (or `api_with_auth`/`api_with_role_auth` for an authenticated mount), not a config key.
 
 Environment variable overrides, one per field:
 

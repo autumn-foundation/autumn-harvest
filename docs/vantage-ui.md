@@ -1,6 +1,6 @@
 # Vantage UI
 
-Vantage is the embedded, server-rendered dashboard bundled with `autumn-harvest-plugin`. It mounts at the path configured by `HarvestBuilder::harvest_api` (e.g. `/api/harvest/ui`) and requires no external assets or CDN — all CSS is inlined.
+Vantage is the embedded, server-rendered dashboard bundled with `autumn-harvest-plugin`. It mounts at the path configured by `HarvestPlugin::api` (e.g. `/api/harvest/ui`) and requires no external assets or CDN — all CSS is inlined.
 
 ## Pages
 
