@@ -1386,3 +1386,37 @@ whole line: no trailing text for a closer, no backtick in an opener's info
 string.
 
 Corpus effect: none, for the twenty-fifth round running.
+
+### Round forty-four — an HTML block, a table, and the two abbreviations
+
+Three findings, and the first corpus movement in twenty-five rounds.
+
+**An HTML block ends the paragraph above it.** Rustdoc renders `Intro.` then
+`<pre>raw</pre>` as a paragraph and a block, so the `22.` under them opens a
+list and the fence inside it is a fence. The audit knew nothing of HTML, kept
+the paragraph open, and reported a 26-word *code sample* inside that valid
+fence as CH007. `html_block` recognizes CommonMark's type 1 and type 6 tag
+names, and deliberately not type 7 (any complete tag alone on a line): type 7
+cannot interrupt a paragraph, and `<T>` in a Rust comment is a type parameter.
+A fixture pins that side too.
+
+**The prose scanner did not pass the table flag.** `comment_lines` has decided
+the table before the containers since round thirty-eight; `prose_units` still
+decided it afterwards, so a `22.` after a real table was refused its container
+and the same false CH007 appeared on the fenced sample. Rule (B) again, in the
+one loop pair this review keeps finding it in. The two loops now read the same
+way, in the same order.
+
+**"e.g." does not end a sentence.** The header called the naive split a known
+limitation and argued the fix would over-report. That argument was against
+*requiring a following capital*, which would merge "... the row. Postgres ...".
+Excluding two named abbreviations does not: neither "e.g." nor "i.e." ever ends
+an English sentence, and this corpus writes both constantly. A 27-word sentence
+carrying `e.g.` produced no finding at all. Only those two are excluded —
+"etc." and "vs." do end sentences, so excluding them would merge two real ones.
+
+Corpus effect: **19690 to 19887**, all CH007, and the first change in
+twenty-five rounds. It is the abbreviation fix, and it is the sentences already
+in the tree being measured at their true length: 274 findings restated as 471
+longer ones. The ratchet recomputes both sides with the same code, so the gate
+stays clean — 5018 in changed files against 5020 at the merge base.

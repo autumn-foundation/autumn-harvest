@@ -111,14 +111,15 @@ otherwise.
 
 KNOWN LIMITATIONS:
 
-- Sentence splitting is regex-level (`[.!?]` + whitespace), so an
-  abbreviation that ends in a period ("e.g. ", "i.e. ", "vs. ") splits a
-  sentence early and can under-report CH007. The corpus writes "e.g."
-  and "i.e." constantly, so a naive fix (require a following capital)
-  would instead MERGE sentences across "... the row. Postgres ..." and
-  over-report. Both directions are wrong; under-reporting is the safe one
-  for a gate, so the split stays naive and CH007's baseline absorbs the
-  difference.
+- Sentence splitting is regex-level (`[.!?]` + whitespace). "e.g." and
+  "i.e." are excluded by name, because neither ever ends a sentence, and
+  this corpus writes both constantly -- splitting there cut sentences in
+  two and let a long one past CH007. Every other abbreviation still
+  splits. That is deliberate: "etc." and "vs." DO end sentences, so
+  excluding them would merge two real ones and over-report. A general fix
+  (require a following capital) merges "... the row. Postgres ..." and is
+  worse than the problem. Both directions are wrong; under-reporting is
+  the safe one for a gate.
 
 - CH001 is deliberately HIGH-PRECISION AND INCOMPLETE, and should stay
   that way. It recognizes commented-out Rust by line shape: item headers,
@@ -473,7 +474,46 @@ SETEXT_RE = re.compile("^([ \t]*)(?:=+|-+)[ \t]*$")
 # text. Exactly "[ ]", "[x]" or "[X]", and a space must follow: rustdoc 1.94
 # renders "[]", "[ ]no space" and "[y]" as literal words.
 TASK_MARKER_RE = re.compile(r"^\[[ xX]\](?=[ \t]|$)")
-SENTENCE_SPLIT_RE = re.compile(r"(?<=[.!?])\s+")
+# CommonMark's HTML-block tag names, types 1 and 6. A line opening with one
+# of these is its own block and ends the paragraph above it -- Rustdoc renders
+# "Intro." then "<pre>raw</pre>" as a paragraph and a block, so the "22." under
+# them starts a list. Type 7 (any other complete tag alone on a line) is
+# deliberately absent: it cannot interrupt a paragraph, and "<T>" in a Rust
+# comment is a type parameter, not markup.
+HTML_BLOCK_TAGS = (
+    "address|article|aside|base|basefont|blockquote|body|caption|center|col|"
+    "colgroup|dd|details|dialog|dir|div|dl|dt|fieldset|figcaption|figure|"
+    "footer|form|frame|frameset|h1|h2|h3|h4|h5|h6|head|header|hr|html|iframe|"
+    "legend|li|link|main|menu|menuitem|nav|noframes|ol|optgroup|option|p|"
+    "param|search|section|summary|table|tbody|td|tfoot|th|thead|title|tr|"
+    "track|ul|script|pre|style|textarea"
+)
+HTML_BLOCK_RE = re.compile(
+    r"^([ \t]*)(?:<[/]?(?:" + HTML_BLOCK_TAGS + r")(?:[ \t/>]|$)"
+    r"|<!--|<\?|<![A-Za-z]|<!\[CDATA\[)",
+    re.IGNORECASE,
+)
+
+
+def html_block(text: str, container: int) -> bool:
+    """Does `text` open a CommonMark HTML block?
+
+    Three columns past the container, like every marker here. An HTML block
+    is a block, so it ends the paragraph above it and the next "22." may
+    open a list the rendered document gives it.
+    """
+    match = HTML_BLOCK_RE.match(text)
+    return bool(match) and len(match.group(1).expandtabs(4)) <= container + 3
+
+
+# A sentence boundary. The two abbreviations this corpus writes constantly
+# are excluded, because neither ever ENDS a sentence in English -- splitting
+# there cuts one sentence in two and a 27-word sentence carrying "e.g." then
+# passes CH007. Only those two: "etc." and "vs." do end sentences, so
+# excluding them would merge two real sentences and over-report instead.
+SENTENCE_SPLIT_RE = re.compile(
+    r"(?<=[.!?])(?<!e\.g\.)(?<!E\.g\.)(?<!i\.e\.)(?<!I\.e\.)\s+"
+)
 
 
 class Finding:
@@ -1089,6 +1129,7 @@ def update_containers(
     prose = bool(body.strip()) and not (
         table
         or heading(body, stack[-1][0] if stack else 0)
+        or html_block(body, stack[-1][0] if stack else 0)
         or thematic_break(body, stack[-1][0] if stack else 0)
         or (paragraph and setext_underline(body, stack[-1][0] if stack else 0))
     )
@@ -1490,7 +1531,20 @@ def prose_units(pieces: list[Piece]) -> list[tuple[int, str]]:
             if fence is not None and leaves_container(body, scope):
                 fence = None
             if fence is None:
-                stack, paragraph = update_containers(body, stack, paragraph, quoted)
+                # The table is decided BEFORE the containers, because a
+                # confirmed table is a block and ends the paragraph above
+                # it. `comment_lines` has done this since round thirty-eight
+                # and this loop did not, so a "22." after a table was
+                # refused its container and the fence under it went unseen.
+                enclosing = stack[-1][0] if stack else 0
+                peek = strip_quote(body, enclosing)
+                if "|" not in peek:
+                    in_table = False
+                elif not in_table:
+                    in_table = table_header(block, index, piece.nest, peek, enclosing)
+                stack, paragraph = update_containers(
+                    body, stack, paragraph, quoted, in_table and "|" in peek
+                )
             container = stack[-1][0] if stack else 0
             delimiter = fence_delimiter(body, container, fence is not None, scope[2], stack)
             # The whole LINE decides a delimiter, not this piece alone. A
@@ -1542,6 +1596,7 @@ def prose_units(pieces: list[Piece]) -> list[tuple[int, str]]:
                 # two short units, so a new 27-word sentence passes CH007.
                 and not table_header(block, index, piece.nest, peeled, container)
                 and not heading(peeled, container)
+                and not html_block(peeled, container)
                 and not SEPARATOR_RE.match(peeled)
                 and not FENCE_RE.match(peeled)
             )
@@ -1556,14 +1611,10 @@ def prose_units(pieces: list[Piece]) -> list[tuple[int, str]]:
             # the rows that follow -- decided here rather than up front,
             # because the delimiter's indent is measured against whatever
             # container is open at that point.
-            has_pipe = "|" in body
-            if not has_pipe:
-                in_table = False
-            elif not in_table:
-                in_table = table_header(block, index, piece.nest, body, container)
             if (
-                (has_pipe and in_table)
+                ("|" in body and in_table)
                 or heading(body, container)
+                or html_block(body, container)
                 or SEPARATOR_RE.match(body)
                 or not body.strip()
             ):
@@ -2633,6 +2684,45 @@ RULE_TESTS = [
         "pub struct A;\n",
         set(),
         "a closer followed by a nested comment does not close",
+    ),
+    (
+        "//! Intro paragraph.\n"
+        "//! <pre>raw</pre>\n"
+        "//! 22. item\n"
+        "//!     ```\n"
+        "//!     word1 word2 word3 word4 word5 word6 word7 word8 word9 word10 word11 word12 word13 word14 word15 word16 word17 word18 word19 word20 word21 word22 word23 word24 word25 word26.\n"
+        "//!     ```\n",
+        set(),
+        "an HTML block ends the paragraph above it",
+    ),
+    (
+        "//! Intro paragraph.\n"
+        "//! <T> is the type parameter.\n"
+        "//! 22. item\n"
+        "//!     ```\n"
+        "//!     TODO: issue required\n",
+        {("CH002", 5)},
+        "'<T>' is a type parameter, not an HTML block",
+    ),
+    (
+        "//! | a | b |\n"
+        "//! | - | - |\n"
+        "//! 22. item\n"
+        "//!     ```\n"
+        "//!     word1 word2 word3 word4 word5 word6 word7 word8 word9 word10 word11 word12 word13 word14 word15 word16 word17 word18 word19 word20 word21 word22 word23 word24 word25 word26.\n"
+        "//!     ```\n",
+        set(),
+        "the prose scanner ends the paragraph at a table too",
+    ),
+    (
+        "// Intro e.g. " + " ".join(f"word{n}" for n in range(1, 25)) + " end.\n",
+        {("CH007", 1)},
+        "'e.g.' does not end a sentence",
+    ),
+    (
+        "// Short one. Short two.\n",
+        set(),
+        "an ordinary period still ends one",
     ),
 ]
 
