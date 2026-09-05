@@ -258,11 +258,14 @@ TODO_REF_RE = re.compile(r"#\d+|https?://")
 
 # First-person deliberation. "Actually" must open a sentence: mid-sentence it is
 # an ordinary adverb ("gated on THIS claimant actually, durably marking the
-# row"). `we'd`/`isn't` and friends are left to CH006 -- they are contractions,
-# not necessarily deliberation.
+# row"). So must "lets just", for the same reason from the other direction --
+# it is here as the misspelling of "let's just", but "the semaphore lets just
+# one claimant proceed" is an ordinary verb and states behaviour, not
+# deliberation. `we'd`/`isn't` and friends are left to CH006 -- they are
+# contractions, not necessarily deliberation.
 NARRATIVE_RE = re.compile(
-    r"(?:^|(?<=[.!?;]\s))\s*actually[,\s]"
-    r"|\b(?:let" + _APOS + r"s\b|lets just\b|we" + _APOS + r"ll\b|i think\b"
+    r"(?:^|(?<=[.!?;]\s))\s*(?:actually[,\s]|lets just\b)"
+    r"|\b(?:let" + _APOS + r"s\b|we" + _APOS + r"ll\b|i think\b"
     r"|i" + _APOS + r"m not sure\b"
     r"|not sure (?:if|why|whether)\b|for now,|hmm\b|oops\b(?![\"'])|note to self\b"
     r"|as you can see\b|todo later\b)",
@@ -303,7 +306,7 @@ MAX_SENTENCE_WORDS = 25
 # list item is legitimately indented further. `fence_delimiter` applies the
 # limit against the container.
 FENCE_RE = re.compile(r"^([ \t]*)(`{3,}|~{3,})")
-LIST_MARKER_RE = re.compile(r"^([ \t]*)((?:[-*+]|\d+[.)])[ \t]+)")
+LIST_MARKER_RE = re.compile(r"^([ \t]*)((?:[-*+]|\d+[.)]))([ \t]+)")
 # A block quote is a container too, and Rustdoc uses it. Its marker is not
 # indentation -- content inside the quote starts again at column zero -- so it
 # is stripped before any container or fence judgement. Nested and space-less
@@ -619,6 +622,23 @@ def interrupts_paragraph(marker: "re.Match[str]") -> bool:
     return not marker_text[:1].isdigit() or marker_text[:-1] == "1"
 
 
+def list_content(text: str) -> tuple[int, int] | None:
+    """Where a list item's content starts on `text`: its column, and its index.
+
+    CommonMark counts one to four spaces after the marker as padding. Five or
+    more means the content starts ONE space after the marker and the rest is
+    an indented code block. Consuming all of it as marker instead puts the
+    content column five or more past the marker, which makes "-     ```rust"
+    a fence opener and silently suppresses every rule over the block it opens.
+    """
+    marker = LIST_MARKER_RE.match(text)
+    if not marker:
+        return None
+    padding = len(marker.group(3))
+    used = 1 if padding > 4 else padding
+    return len(marker.group(1)) + len(marker.group(2)) + used, marker.start(3) + used
+
+
 def strip_quote(text: str) -> str:
     """`text` past any block-quote marker.
 
@@ -637,9 +657,9 @@ def container_indent_after(text: str, current: int) -> int:
     line that dedents below the container closes it.
     """
     text = strip_quote(text)
-    marker = LIST_MARKER_RE.match(text)
-    if marker:
-        return len(marker.group(1)) + len(marker.group(2))
+    content = list_content(text)
+    if content:
+        return content[0]
     if text.strip() and len(text) - len(text.lstrip()) < current:
         return 0
     return current
@@ -657,9 +677,8 @@ def fence_delimiter(text: str, container: int) -> tuple["re.Match[str]", str] | 
     and the text it was matched against, which carries the info string.
     """
     text = strip_quote(text)
-    marker = LIST_MARKER_RE.match(text)
-    base = len(marker.group(0)) if marker else 0
-    tail = text[marker.end():] if marker else text
+    base, offset = list_content(text) or (0, 0)
+    tail = text[offset:]
     match = FENCE_RE.match(tail)
     if not match:
         return None
@@ -818,20 +837,28 @@ def prose_units(pieces: list[Piece]) -> list[tuple[int, str]]:
     as one long sentence -- a false CH007 on code neither author wrote as a
     sentence.
     """
-    units: list[tuple[int, str]] = []
+    units: list[tuple[int, str, list[tuple[int, int]]]] = []
 
     for block in comment_runs(pieces):
         run: list[str] = []
-        run_line = 0
+        run_lines: list[int] = []
         fence: tuple[str, int] | None = None
         container = 0
         in_list = False
 
         def flush():
-            nonlocal run
+            nonlocal run, run_lines
             if run:
-                units.append((run_line, " ".join(run)))
-                run = []
+                # Each fragment's offset in the joined text, paired with the
+                # source line it came from. Joining loses that otherwise, and
+                # every sentence in the unit then reports the unit's FIRST
+                # line -- pointing a contributor at an unrelated comment.
+                spans, position = [], 0
+                for fragment, line in zip(run, run_lines):
+                    spans.append((position, line))
+                    position += len(fragment) + 1
+                units.append((run_lines[0], " ".join(run), spans))
+            run, run_lines = [], []
 
         for piece in block:
             body = piece.text
@@ -871,15 +898,34 @@ def prose_units(pieces: list[Piece]) -> list[tuple[int, str]]:
                 marker = None
             if marker and (not run or in_list or interrupts_paragraph(marker)):
                 flush()
-                run_line = piece.line
                 run = [body[marker.end():].strip()]
+                run_lines = [piece.line]
                 in_list = True
                 continue
-            if not run:
-                run_line = piece.line
             run.append(body.strip())
+            run_lines.append(piece.line)
         flush()
     return units
+
+
+def split_sentences(unit: str):
+    """(offset, sentence) pairs. `re.split` drops the offsets, and the offset
+    is what maps a sentence back to the line it was written on."""
+    start = 0
+    for match in SENTENCE_SPLIT_RE.finditer(unit):
+        yield start, unit[start:match.start()]
+        start = match.end()
+    yield start, unit[start:]
+
+
+def line_of(spans: list[tuple[int, int]], offset: int) -> int:
+    """The source line of the fragment covering `offset` in a joined unit."""
+    line = spans[0][1]
+    for position, candidate in spans:
+        if position > offset:
+            break
+        line = candidate
+    return line
 
 
 def check_prose_rules(path: str, pieces: list[Piece]) -> list[Finding]:
@@ -891,11 +937,12 @@ def check_prose_rules(path: str, pieces: list[Piece]) -> list[Finding]:
     is ordinary prose, not deliberation.
     """
     findings = []
-    for lineno, unit in prose_units(pieces):
-        for sentence in SENTENCE_SPLIT_RE.split(unit):
+    for _, unit, spans in prose_units(pieces):
+        for offset, sentence in split_sentences(unit):
             sentence = sentence.strip()
             if not sentence:
                 continue
+            lineno = line_of(spans, offset)
             if NARRATIVE_RE.search(sentence):
                 findings.append(Finding("CH003", path, lineno, sentence[:100]))
             words = sentence.split()
@@ -1322,6 +1369,31 @@ RULE_TESTS = [
         "// 1) as word1 word2 word3 word4 word5 word6 word7 word8 word9 word10 word11 word12 word13 word14 word15 word16 word17 word18 word19 word20.\n",
         {("CH007", 1)},
         "a wrapped \"1)\" closing a paren does not split the sentence",
+    ),
+    (
+        "/// -     ```rust\n/// TODO: issue required\n",
+        {("CH002", 2)},
+        "five spaces after a list marker is indented code, not a fence",
+    ),
+    (
+        "/// -    ```rust\n/// TODO: fixture placeholder\n/// ```\n",
+        set(),
+        "four spaces after a list marker is still valid padding",
+    ),
+    (
+        "// The semaphore lets just one claimant proceed.\n",
+        set(),
+        "\"lets\" as a verb is behaviour, not deliberation",
+    ),
+    (
+        "// The row is held. Lets just skip it.\n",
+        {("CH003", 1)},
+        "\"Lets just\" opening a sentence is still an aside",
+    ),
+    (
+        "// Short sentence.\n// word1 word2 word3 word4 word5 word6 word7 word8 word9 word10 word11 word12 word13 word14 word15 word16 word17 word18 word19 word20 word21 word22 word23 word24 word25 word26.\n",
+        {("CH007", 2)},
+        "a sentence reports its own line, not the paragraph's first",
     ),
     # Orthogonal-axis fixtures. Two rules were checked for the RIGHT WORDS
     # while the apostrophe character and the marker's case were left assumed,

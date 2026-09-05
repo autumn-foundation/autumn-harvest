@@ -592,3 +592,41 @@ carried a copy, reporting the first occurrence pointed at the legacy line —
 telling a contributor to edit a comment they never wrote. Every candidate is
 named now, with a count of how many are new. The self-test grew its first
 direct check of the ratchet's reporting, not just its arithmetic.
+
+### Round eighteen — list padding, a verb read as deliberation, and per-sentence lines
+
+Three findings, all verified to reproduce first.
+
+**A list marker followed by five spaces opened a fence that suppressed the
+gate.** CommonMark counts one to four spaces after a marker as padding; five
+or more means the content starts one space past the marker and the rest is an
+indented code block. The marker pattern consumed all of it, so:
+
+```
+/// -     ```rust
+/// TODO: issue required        -> silently exempt
+```
+
+That is a Tier A bypass, the failure mode this harness exists to prevent.
+`list_content` now returns the CommonMark content column, and both the
+container logic and the fence detector measure from it.
+
+**`lets` as an ordinary verb was read as deliberation.** `// The semaphore
+lets just one claimant proceed.` failed CH003, an absolute gate, for stating
+behaviour. The alternative is there for the misspelling of `let's just`, so it
+now has to open a sentence — the same constraint `actually` already carries,
+for the same reason from the other direction.
+
+**Every sentence in a paragraph reported the paragraph's first line.** Joining
+wrapped lines into a prose unit lost which line each came from, so a long
+sentence three lines into a doc comment was reported against line one. The
+join now carries each fragment's offset and line, and sentence splitting keeps
+offsets, so a finding points at the sentence that caused it.
+
+This is the round's largest effect and the third output-quality finding in a
+row: **6514 of 19542** findings — a third of the corpus — now name a different,
+correct line. `debug.rs` is typical: the flagged sentence begins on line 7 of a
+paragraph opening on line 6, and was reported at 6.
+
+The set of findings is otherwise byte-identical to round seventeen's — same
+rules, paths and text, only lines moved — and no rule's count rose in any file.
