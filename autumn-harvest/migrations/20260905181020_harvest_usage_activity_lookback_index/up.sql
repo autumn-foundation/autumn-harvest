@@ -1,0 +1,113 @@
+-- Index the LATERAL activity-attempt lookback in `usage::usage_sql()`
+-- (issue #596, `GET /admin/usage`) -- the one CTE the earlier
+-- `20260702000000_harvest_usage_report_indexes` migration did not cover.
+--
+-- `activity_metrics` resolves each activity terminal event's owning
+-- `ActivityStarted` attempt with:
+--
+--   LEFT JOIN LATERAL (
+--       SELECT MAX(e2.timestamp) AS last_started_at
+--       FROM harvest_events e2
+--       WHERE e2.workflow_exec_id = ae.workflow_exec_id
+--         AND e2.event_type = 'ActivityStarted'
+--         AND e2.event_data #>> '{data,activity_id}' = ae.activity_id
+--         AND e2.timestamp <= ae.timestamp
+--   ) s ON true
+--
+-- The only pre-existing index naming `workflow_exec_id` at all is the
+-- initial migration's `idx_harvest_events_exec (workflow_exec_id, event_id)`,
+-- which cannot serve an `event_type` + JSON-path equality lookup. Without a
+-- matching index, this subquery re-scans every OTHER event belonging to the
+-- same execution (all event types, not just its `ActivityStarted` siblings)
+-- once per activity terminal event in the report window -- a cost that scales
+-- with a workflow's own activity fan-out, not with the report's selectivity.
+--
+-- Measured on a 40,000-execution / ~562,000-event production-shaped fixture
+-- (skewed 1%-of-executions "batch" tail with 50-300 activities each --
+-- `tests/integration/usage_report_activity_lookback_tests.rs::zz_capture_usage_report_activity_lookback_evidence`):
+-- `GET /admin/usage`'s total buffers (`pg_stat_statements`,
+-- shared_blks_hit + shared_blks_read) drop from 4,630,147 to 2,108,948 --
+-- -54.5% -- with byte-identical grouped counters before and after. Postgres
+-- rewrites the correlated `MAX(...)` into an `Index Scan Backward` + `LIMIT 1`
+-- against this index (its standard max-via-index-descent transform), replacing
+-- a `Bitmap Heap Scan` that filtered ~2.13M heap blocks' worth of sibling
+-- events out of a 522,374-loop LATERAL invocation. Full plans and the
+-- `pg_stat_statements` snapshots are committed under
+-- `docs/perf-artifacts/usage-report-activity-lookback/`; writeup in
+-- `docs/performance-usage-report-activity-lookback.md`.
+--
+-- Partial (`WHERE event_type = 'ActivityStarted'`) and keyed exactly to the
+-- subquery's own predicates -- equality on `workflow_exec_id` and the
+-- JSON-extracted `activity_id`, then `timestamp` so the `MAX(...) WHERE
+-- timestamp <= $ae.timestamp` bound is answerable by a backward index scan --
+-- so only `ActivityStarted` rows (the only event type this lookup ever
+-- targets) pay for it, and every other event type on this table is unaffected.
+--
+-- Measured write cost on the same fixture: the index build itself took 20 MB
+-- of WAL for ~273,500 indexed rows (one-time, proportional to the
+-- `ActivityStarted` backlog at build time); ongoing, inserting a batch of
+-- 10,000 `ActivityStarted` rows took 10,378,888 bytes of WAL with the index
+-- present vs. 7,737,416 without -- +34.1% WAL specifically on `ActivityStarted`
+-- inserts, no other event type's write path is touched. Index size for the
+-- fixture's ~273,500 `ActivityStarted` rows: 23 MB.
+--
+-- `CREATE INDEX` (not `CONCURRENTLY`) takes `SHARE` on `harvest_events` for
+-- the build's duration, blocking every append, claim and completion touching
+-- this table -- the same trade-off `20260702000000_harvest_usage_report_indexes`
+-- made and documented. `IF NOT EXISTS` makes this migration's own statement a
+-- safe no-op if the index was already built ahead of time; for a live,
+-- already-large deployment, build it out-of-band first (outside any
+-- transaction -- `CONCURRENTLY` cannot run inside Diesel's migration
+-- transaction) and this migration becomes that no-op.
+--
+-- The recipe depends on whether the deployment has opted into the partitioned
+-- `harvest_events` layout (`docs/partitioned-events.md`, `harvest partition
+-- enable`, issue #958), because Postgres does not support `CREATE INDEX
+-- CONCURRENTLY` in a single statement against a partitioned PARENT (Codex
+-- review, PR #1381): "concurrent index builds for indexes on partitioned
+-- tables are currently not supported" -- see
+-- <https://www.postgresql.org/docs/16/sql-createindex.html#SQL-CREATEINDEX-CONCURRENTLY>.
+--
+-- **Unpartitioned** (the default -- `SELECT relkind FROM pg_class WHERE
+-- oid = 'harvest_events'::regclass` reports `'r'`):
+--
+--   CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_harvest_events_activity_started_lookup
+--       ON harvest_events (workflow_exec_id, (event_data #>> '{data,activity_id}'), timestamp)
+--       WHERE event_type = 'ActivityStarted';
+--
+-- **Partitioned** (`relkind` reports `'p'`): build the index `CONCURRENTLY`
+-- on every existing leaf partition first (each is an ordinary table, so this
+-- IS supported per-partition), then create the parent's index without
+-- `CONCURRENTLY` -- Postgres recognizes every partition already carries a
+-- matching index and only writes the parent's catalog entry, a metadata-only
+-- operation that does not rescan data. Generate the per-partition statements
+-- rather than hand-listing them, since partitions are cohort-named and
+-- opened over time (`partition::partition_name`):
+--
+--   SELECT format(
+--       'CREATE INDEX CONCURRENTLY IF NOT EXISTS %I ON %I ' ||
+--       '(workflow_exec_id, (event_data #>> ''{data,activity_id}''), timestamp) ' ||
+--       'WHERE event_type = ''ActivityStarted'';',
+--       'idx_' || child.relname || '_activity_started_lookup',
+--       child.relname
+--   )
+--   FROM pg_inherits
+--   JOIN pg_class parent ON pg_inherits.inhparent = parent.oid
+--   JOIN pg_class child ON pg_inherits.inhrelid = child.oid
+--   WHERE parent.oid = 'harvest_events'::regclass;
+--   -- review and run the generated statements, THEN:
+--   CREATE INDEX IF NOT EXISTS idx_harvest_events_activity_started_lookup
+--       ON harvest_events (workflow_exec_id, (event_data #>> '{data,activity_id}'), timestamp)
+--       WHERE event_type = 'ActivityStarted';
+--
+-- A partition opened by `harvest_event_cohort`'s rollover *after* the leaf
+-- pass but *before* the parent statement above needs its own `CONCURRENTLY`
+-- build (it won't yet carry a matching index); re-run the generator query to
+-- pick up any new leaves before the final parent statement.
+--
+-- (`CONCURRENTLY` can leave an INVALID index behind on failure/cancellation --
+-- check `pg_index.indisvalid` for the index's oid and `DROP INDEX
+-- CONCURRENTLY` + retry if it is false before relying on it, on either path.)
+CREATE INDEX IF NOT EXISTS idx_harvest_events_activity_started_lookup
+    ON harvest_events (workflow_exec_id, (event_data #>> '{data,activity_id}'), timestamp)
+    WHERE event_type = 'ActivityStarted';
