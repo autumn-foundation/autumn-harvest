@@ -196,7 +196,11 @@ COMMENTED_CODE_RE = re.compile(
     r"""^(?:
         (?:pub(?:\([\w:]+\))?\s+)?(?:async\s+|unsafe\s+|const\s+|extern\s+"\w+"\s+)*
             fn\s+\w+\s*(?:<[^<>]*>)?\s*\(
-            (?:.*\)\s*(?:->\s*[^;{]+?)?\s*[{;]|[^)]*)\s*$
+            (?:
+                 .*\)\s*(?:->\s*[^;{]+?)?\s*[{;]   # complete: ends in { or ;
+               | \s*$                                # wrapped: `fn foo(` at EOL
+               | [\w\s:&'<>\[\](),.]*,\s*$          # wrapped: params, trailing comma
+            )\s*$
       | (?:pub(?:\([\w:]+\))?\s+)?(?:struct|enum|trait|union)\s+\w+\s*(?:<[^<>]*>)?\s*[{;(]\s*$
       | (?:pub(?:\([\w:]+\))?\s+)?mod\s+\w+\s*[{;]\s*$
       | (?:pub(?:\([\w:]+\))?\s+)?(?:const|static)\s+(?:mut\s+)?\w+\s*:[^;=]+=.*[;{]\s*$
@@ -352,12 +356,15 @@ def extract_comments(source: str) -> list[Piece]:
             if end == -1:
                 end = n
             raw = source[i:end]
-            marker = "//"
-            for candidate in ("///", "//!"):
-                if raw.startswith(candidate):
-                    marker = candidate
-                    break
-            pieces.append(Piece(line, marker, raw[len(marker):], code_on_line, False))
+            # The marker is the WHOLE leading slash run (plus `!` for `//!`).
+            # `////` is an ordinary comment, not a doc comment, and taking only
+            # three slashes left a stray `/` on the body that made the anchored
+            # rules miss `//// let stale = compute();`.
+            marker_len = len(raw) - len(raw.lstrip("/"))
+            if raw[marker_len:marker_len + 1] == "!" and marker_len == 2:
+                marker_len += 1
+            marker = raw[:marker_len]
+            pieces.append(Piece(line, marker, raw[marker_len:], code_on_line, False))
             i = end
             continue
 
@@ -907,6 +914,21 @@ RULE_TESTS = [
         "/// Example:\n/// ```rust\n/// let x = compute();\n/// ```\npub fn a() {}\n",
         set(),
         "fenced example code stays exempt",
+    ),
+    (
+        "//// let stale = compute();\n",
+        {("CH001", 1)},
+        "//// is an ordinary comment, not a doc comment",
+    ),
+    (
+        "// fn resolve_call(the caller name appears in diagnostics\n",
+        set(),
+        "prose after an open paren is not a signature",
+    ),
+    (
+        "// fn foo(\n//     a: u8,\n// ) {}\n",
+        {("CH001", 1)},
+        "a wrapped commented-out signature is caught on its opening line",
     ),
     (
         "fn f() {\n"

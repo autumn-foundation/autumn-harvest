@@ -205,3 +205,21 @@ leak past its block, fenced example code stays exempt, and adjacent trailing
 comments are not merged. Tier A stayed at zero; CH007 fell 17,913 → 17,903 as
 wrongly-merged trailing units split into the separate short notes they always
 were.
+
+**Fifth Codex round (PR #1380): two more P2 findings, both real.**
+
+- *The wrapped-signature branch accepted prose.* The earlier CH001 fix added
+  an alternative for `fn foo(` at end of line, but wrote it as `[^)]*` — any
+  line with no closing paren. So `// fn resolve_call(the caller name appears
+  in diagnostics` was reported as commented-out code. A narrower fix for the
+  original false positive that reintroduced a smaller one. It now accepts only
+  an open paren at end of line, or parameters ending in a trailing comma.
+- *`////` was misread as `///`.* Four or more slashes is an ordinary comment
+  in Rust, not a doc comment, but the marker match took the first three and
+  left a stray `/` on the body — so `//// let stale = compute();` extracted as
+  `/ let stale = compute();` and CH001 missed it. The marker is now the whole
+  leading slash run, so `////` and `/////` both extract cleanly.
+
+Three more fixtures pin these (20 in total): `////` is an ordinary comment,
+prose after an open paren is not a signature, and a wrapped commented-out
+signature is still caught on its opening line.
