@@ -1756,9 +1756,11 @@ const SEALED_STATE: &str = "CONTINUED_AS_NEW";
 /// #1068; Codex #1080 P2), inside the caller's start transaction.
 ///
 /// If the prior is still `RUNNING`, append a `WorkflowCancelled` event recording the
-/// forced cancellation and clean up its PENDING task rows + unfired timers (so no
-/// orphan can be claimed / fire against a run that is never driven again); then seal
-/// it to [`SEALED_STATE`] so it leaves the active set. An already-terminal prior
+/// forced cancellation and clean up its PENDING task rows, unfired timers, and
+/// undelivered signals (so no orphan can be claimed / fire / linger against a run
+/// that is never driven again — this backend has no retention/GC pass at all, so a
+/// row left behind here would otherwise survive forever); then seal it to
+/// [`SEALED_STATE`] so it leaves the active set. An already-terminal prior
 /// (`COMPLETED`/`FAILED`) is sealed WITHOUT a cancellation event. Byte-identical to
 /// the pre-#1080 single-prior inline path — extracted so the `TerminateIfRunning`
 /// arm can loop it over EVERY active row for the key
@@ -1779,6 +1781,7 @@ fn cancel_and_seal_prior(
         )?;
         queue::delete_pending_tasks_for_execution(conn, prior_exec)?;
         queue::delete_unfired_timers_for_execution(conn, prior_exec)?;
+        queue::delete_undelivered_signals_for_execution(conn, prior_exec)?;
     }
     store::seal_execution(conn, prior_exec, SEALED_STATE)?;
     Ok(())

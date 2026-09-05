@@ -648,6 +648,24 @@ pub fn delete_unfired_timers_for_execution(
     )?)
 }
 
+/// Delete every undelivered staged signal row for an execution — companion to
+/// [`delete_pending_tasks_for_execution`] / [`delete_unfired_timers_for_execution`]
+/// for the `TerminateIfRunning` seal. A signal staged against a sealed prior can
+/// never be delivered (the prior is never driven again), and unlike an unfired
+/// timer it cannot mis-fire — but this backend has no retention/GC pass at all (a
+/// documented v0.1 non-goal), so leaving the row behind means it survives forever.
+/// Returns the number of rows deleted. Delivered rows are left untouched (inert
+/// audit history).
+pub fn delete_undelivered_signals_for_execution(
+    conn: &Connection,
+    exec_id: ExecutionId,
+) -> SqliteResult<usize> {
+    Ok(conn.execute(
+        "DELETE FROM harvest_signals WHERE exec_id = ?1 AND delivered = 0",
+        params![exec_id.to_string()],
+    )?)
+}
+
 #[cfg(test)]
 mod tests {
     use rusqlite::{Connection, params};
