@@ -1655,6 +1655,9 @@ pub const METRIC_LABEL_QUERY: &str = "query.name";
 pub const METRIC_LABEL_OUTCOME: &str = "outcome";
 /// Metric label: reason code for external signal failure.
 pub const METRIC_LABEL_REASON_CODE: &str = "reason_code";
+/// Metric label: how many runs a key is over its declared concurrency limit
+/// (issue #1197, item 2), bounded by `concurrency::SUPERSEDE_SCAN_LIMIT`.
+pub const METRIC_LABEL_GAP: &str = "gap";
 /// Metric label: the completion trigger ID (issue #517).
 pub const METRIC_LABEL_TRIGGER: &str = "trigger";
 /// Metric label: admission gate scope kind (issue #377).

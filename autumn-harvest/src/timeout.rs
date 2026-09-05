@@ -1628,6 +1628,10 @@ pub async fn force_fail_activity(
     .await
 }
 
+// issue #1197, item 1: threading `pending_cancel_metrics` out to the
+// post-commit emission point pushed this just over the 100-line clippy
+// threshold; the function's shape and control flow are otherwise unchanged.
+#[allow(clippy::too_many_lines)]
 async fn enforce_workflow_timeout(
     conn: &mut AsyncPgConnection,
     task: &TaskQueueItem,

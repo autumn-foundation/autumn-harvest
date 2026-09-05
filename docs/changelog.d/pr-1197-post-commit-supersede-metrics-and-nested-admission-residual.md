@@ -22,6 +22,8 @@ Of the three directions the issue sketched (registration-time rejection of self-
 
 **Proven end-to-end against real Postgres:** `nested_self_referential_admission_emits_residual_over_limit_counter` registers a workflow whose own completion trigger targets itself on the same key, drives the exact nested-admission scenario (incumbent A superseded by admission B, whose cancellation of A synchronously starts C on the same key), and asserts both runs commit (the key sits at 2 non-terminal runs against a limit of 1) and the counter fires exactly once with `gap = 1`.
 
+**Post-review fix (Codex round 1, P1).** The documented full-surface `metrics_rs_adapter::MetricsRsRecorder` overrides `record_concurrency_superseded` but had no override for the new `record_concurrency_residual_over_limit`, so it silently resolved to the trait's no-op default — any deployment using this adapter (the one every doc example in the module points at) would never actually export the new counter. Added the missing bridge (`METRIC_LABEL_WORKFLOW` + new `METRIC_LABEL_GAP`), plus a label-content regression test mirroring the existing `bridges_concurrency_superseded_with_workflow_label_only` test exactly.
+
 ### Scope
 
 Metrics/observability only — no new `WorkflowEvent` variant, no migration, no schema change, no behavior change to the `Defer` (default) strategy or to which runs get superseded. `docs/telemetry.md`'s metric catalogue and `tests/integration/metrics_coverage.rs`'s reachability/cardinality coverage were updated for the new counter (workflow + gap labels only — the concurrency key is never a label, per ADR-0001 §7, matching `harvest.concurrency.superseded`'s existing rule).
