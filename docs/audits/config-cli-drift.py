@@ -243,7 +243,13 @@ def mask_fenced(lines):
 # `AUTUMN_HARVEST*` is different: CONFIG_RS's own reserved override
 # namespace, fully enumerated by extract_config_ground_truth(), so a
 # doc-cited `AUTUMN_HARVEST*` var missing from that set is unambiguous.
-ENV_TOKEN_RE = re.compile(r"\b(AUTUMN_HARVEST[A-Z0-9_]*)\b")
+# `+`, not `*`: at least one char must follow `AUTUMN_HARVEST` for this to be
+# a candidate real env var at all (every real one has a `__FIELD` suffix at
+# minimum). Using `*` treated the bare namespace notation `AUTUMN_HARVEST*`
+# — used in this file's own module docstring and in docs/audits/README.md to
+# describe the family, not to cite a specific variable — as itself a drift
+# hit (Codex review, PR #1373: this made the scanner fail on its own repo).
+ENV_TOKEN_RE = re.compile(r"\b(AUTUMN_HARVEST[A-Z0-9_]+)\b")
 SECTION_HEADER_RE = re.compile(r"^\s*\[([\w.]+)\]\s*$")
 TOML_KV_RE = re.compile(r"^\s*([\w.]+)\s*=")
 # `(?!-)` excludes `harvest-verify` (a distinct binary/cargo-subcommand,
@@ -254,6 +260,27 @@ TOML_KV_RE = re.compile(r"^\s*([\w.]+)\s*=")
 # leading substring of its name.
 HARVEST_CMD_LINE_RE = re.compile(r"(?:^|\s|\$)harvest(?!-)\b(.*)$")
 FLAG_TOKEN_RE = re.compile(r"--([a-z][a-z0-9-]*)")
+
+
+def join_shell_continuations(lines):
+    """Collapse trailing-backslash shell line continuations into one logical
+    line each, so a multi-line invocation's flags aren't invisible just
+    because they're not on the line containing `harvest` itself (Codex
+    review, PR #1373: `docs/sharding.md`'s `harvest shard rebalance \\` /
+    `--shard ... \\` examples put every flag on a continuation line)."""
+    logical = []
+    buf = None
+    for line in lines:
+        piece = line if buf is None else buf + " " + line.strip()
+        stripped = piece.rstrip()
+        if stripped.endswith("\\"):
+            buf = stripped[:-1].rstrip()
+            continue
+        logical.append(piece)
+        buf = None
+    if buf is not None:
+        logical.append(buf)
+    return logical
 
 
 def scan_doc(path: Path, real_config_paths, real_env_vars, real_flags):
@@ -296,7 +323,7 @@ def scan_doc(path: Path, real_config_paths, real_env_vars, real_flags):
                     hits.append(("config-key", full))
 
         if lang in ("bash", "sh", "shell", "console", "", "text"):
-            for line in block_lines:
+            for line in join_shell_continuations(block_lines):
                 cm = HARVEST_CMD_LINE_RE.search(line)
                 if not cm or line.strip().startswith("#"):
                     continue

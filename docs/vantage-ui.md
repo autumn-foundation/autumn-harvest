@@ -261,7 +261,7 @@ Event fields are extracted from the inner `data` object of the adjacently-tagged
 
 ## Auto-refresh
 
-Detail and list pages take a `refresh` query parameter (`30` or `60` seconds, or a custom value) that emits a `<meta http-equiv="refresh">` tag — the page reloads itself over plain HTTP at that interval. There is no client-side JavaScript or live-streaming connection anywhere in Vantage; every page, including auto-refresh, is server-rendered HTML. The engine does expose a real SSE execution-event stream (`GET /executions/{exec_id}/events/stream`, documented in [`docs/management-api.md`](management-api.md#sse-execution-event-stream)), but no Vantage page currently consumes it — a browser client wanting real-time events talks to that endpoint directly.
+`/workers`, `/schedules`, `/dlq`, and `/dags/{dag_name}` (DAG detail) take a `refresh` query parameter (`30` or `60` seconds, or a custom value) that emits a `<meta http-equiv="refresh">` tag — the page reloads itself over plain HTTP at that interval. Other pages, including `/workflows`, `/workflows/{exec_id}`, and `/dags` (the DAG list), have no `refresh` parameter and never auto-refresh — `?refresh=30` on one of those is silently ignored. There is no client-side JavaScript or live-streaming connection anywhere in Vantage; every page, including auto-refresh, is server-rendered HTML. The engine does expose a real SSE execution-event stream (`GET /executions/{exec_id}/events/stream`, documented in [`docs/management-api.md`](management-api.md#sse-execution-event-stream)), but no Vantage page currently consumes it — a browser client wanting real-time events talks to that endpoint directly.
 
 ## Accessibility
 
