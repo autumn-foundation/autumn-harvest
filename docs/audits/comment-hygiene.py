@@ -255,7 +255,7 @@ CONTRACTION_RE = re.compile(
 
 MAX_SENTENCE_WORDS = 25
 
-FENCE_RE = re.compile(r"^\s*(`{3,}|~{3,})")
+FENCE_RE = re.compile(r"^ {0,3}(`{3,}|~{3,})")
 TABLE_RE = re.compile(r"^\s*\|")
 HEADING_RE = re.compile(r"^\s*#{1,6}\s")
 LIST_ITEM_RE = re.compile(r"^\s*(?:[-*+]|\d+\.)\s+")
@@ -400,7 +400,15 @@ def extract_comments(source: str) -> list[Piece]:
                         )
                         first = False
                     depth += 1
-                    i += 2
+                    # Past the WHOLE nested marker, for the same reason the
+                    # outer one does it: a retained `!` from `/*!` leaves the
+                    # anchored rules staring at "! TODO".
+                    nested = 2
+                    if source.startswith("/*!", i):
+                        nested = 3
+                    elif source.startswith("/**", i) and not source.startswith("/**/", i):
+                        nested = 3
+                    i += nested
                     seg_start = i
                     seg_line = line
                 elif source.startswith("*/", i):
@@ -504,6 +512,26 @@ def rust_sources(paths: list[str] | None) -> list[str]:
     return sorted(found)
 
 
+def fence_transition(
+    fence: tuple[str, int] | None, match: "re.Match[str]", text: str
+) -> tuple[str, int] | None:
+    """Apply one fence-delimiter line to the fence state.
+
+    CommonMark, not "any three backticks toggle it". A closer must use the
+    SAME character as its opener and be at least as long, with nothing after
+    it. Otherwise a ``` line inside a ````-fenced example closes the fence
+    early and the example's own sample text is then read as real comments.
+    """
+    delimiter = match.group(1)
+    char, length = delimiter[0], len(delimiter)
+    if fence is None:
+        # Opening. An info string ("```rust") is allowed here.
+        return char, length
+    open_char, open_length = fence
+    closes = char == open_char and length >= open_length and not text[match.end():].strip()
+    return None if closes else fence
+
+
 def comment_runs(pieces: list[Piece]):
     """Group pieces into contiguous comment blocks.
 
@@ -540,26 +568,15 @@ def comment_lines(pieces: list[Piece]):
     with the fenced body.
     """
     for run in comment_runs(pieces):
-        fence_char = ""
+        fence: tuple[str, int] | None = None
         for piece in run:
             text = piece.text
             match = FENCE_RE.match(text)
             if match:
-                delimiter = match.group(1)[0]
-                if not fence_char:
-                    fence_char = delimiter
-                    yield piece.line, text, True
-                    continue
-                if delimiter == fence_char:
-                    fence_char = ""
-                    yield piece.line, text, True
-                    continue
-                # A `~~~` line inside a ``` block is literal content under
-                # CommonMark, not a closer. Treating it as one un-exempts the
-                # rest of the example and reports its sample text as comments.
+                fence = fence_transition(fence, match, text)
                 yield piece.line, text, True
                 continue
-            yield piece.line, text, bool(fence_char)
+            yield piece.line, text, fence is not None
 
 
 def check_line_rules(path: str, pieces: list[Piece]) -> list[Finding]:
@@ -629,7 +646,7 @@ def prose_units(pieces: list[Piece]) -> list[tuple[int, str]]:
     for block in comment_runs(pieces):
         run: list[str] = []
         run_line = 0
-        fence_char = ""
+        fence: tuple[str, int] | None = None
 
         def flush():
             nonlocal run
@@ -641,14 +658,10 @@ def prose_units(pieces: list[Piece]) -> list[tuple[int, str]]:
             body = piece.text
             match = FENCE_RE.match(body)
             if match:
-                delimiter = match.group(1)[0]
-                if not fence_char:
-                    fence_char = delimiter
-                elif delimiter == fence_char:
-                    fence_char = ""
+                fence = fence_transition(fence, match, body)
                 flush()
                 continue
-            if fence_char:
+            if fence is not None:
                 flush()
                 continue
             if TABLE_RE.match(body) or HEADING_RE.match(body) or not body.strip():
@@ -988,6 +1001,26 @@ RULE_TESTS = [
         "/// ```rust\n/// ~~~\n/// TODO: fixture placeholder\n/// ```\n",
         set(),
         "a ~~~ line inside a ``` fence is content, not a closer",
+    ),
+    (
+        "/// ````rust\n/// ```\n/// TODO: fixture placeholder\n/// ````\n",
+        set(),
+        "a short closer does not close a longer fence",
+    ),
+    (
+        "///     ```rust\n/// TODO: issue required\n",
+        {("CH002", 2)},
+        "four spaces is an indented code line, not a fence opener",
+    ),
+    (
+        "///    ```rust\n///    let x = compute();\n///    ```\n",
+        set(),
+        "three spaces still opens a fence",
+    ),
+    (
+        "/* outer /*! TODO */ */\n",
+        {("CH002", 1)},
+        "a nested inner-doc marker is stripped too",
     ),
     (
         "fn f() {\n"

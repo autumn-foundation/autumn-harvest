@@ -271,3 +271,22 @@ merging had been hiding: a `///` doc block closing on a blank `///` before a
 The adversarial sweep was extended to 240 prose lines and still reports 0
 false positives, and the self-test now carries 24 lexer/rule fixtures plus 30
 code-vs-prose shapes.
+
+**Seventh Codex round (PR #1380): three more P2 findings, all real, all in
+fence and nested-comment handling.**
+
+- *A nested inner-doc marker kept its `!`.* The nested-body fix advanced two
+  characters at every nested opener, so `/* outer /*! TODO */ */` extracted as
+  `! TODO`. The same whole-marker handling the top level already had now
+  applies to nested openers.
+- *Fence openers accepted any indentation.* CommonMark allows at most three
+  spaces; four is an indented code line. `///     ```rust` therefore opened a
+  fence that never closed and suppressed the rest of the run.
+- *Any closer of the same character closed a fence.* A closer must be at least
+  as long as its opener, so a ` ``` ` line inside a ` ````rust ` example is
+  content — it was ending the fence early and the example's own sample text
+  was then read as real comments.
+
+Fence state is now a (character, length) pair applied through one
+`fence_transition()` helper shared by `comment_lines()` and `prose_units()`,
+rather than a boolean duplicated across both. Five fixtures added.
