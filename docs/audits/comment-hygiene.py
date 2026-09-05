@@ -199,7 +199,8 @@ COMMENTED_CODE_RE = re.compile(
             (?:
                  .*\)\s*(?:->\s*[^;{]+?)?\s*[{;]   # complete: ends in { or ;
                | \s*$                                # wrapped: `fn foo(` at EOL
-               | [\w\s:&'<>\[\](),.]*,\s*$          # wrapped: params, trailing comma
+               | (?=[^)]*(?::|\bself\b))            # wrapped: real params,
+                 [\w\s:&'<>\[\](),.+;=*-]*,\s*$      #   trailing comma
             )\s*$
       | (?:pub(?:\([\w:]+\))?\s+)?(?:struct|enum|trait|union)\s+\w+\s*(?:<[^<>]*>)?\s*[{;(]\s*$
       | (?:pub(?:\([\w:]+\))?\s+)?mod\s+\w+\s*[{;]\s*$
@@ -254,7 +255,7 @@ CONTRACTION_RE = re.compile(
 
 MAX_SENTENCE_WORDS = 25
 
-FENCE_RE = re.compile(r"^\s*(?:```|~~~)")
+FENCE_RE = re.compile(r"^\s*(`{3,}|~{3,})")
 TABLE_RE = re.compile(r"^\s*\|")
 HEADING_RE = re.compile(r"^\s*#{1,6}\s")
 LIST_ITEM_RE = re.compile(r"^\s*(?:[-*+]|\d+\.)\s+")
@@ -389,11 +390,30 @@ def extract_comments(source: str) -> list[Piece]:
             first = True
             while i < n and depth > 0:
                 if source.startswith("/*", i):
+                    # Nested comment. End the segment here so the inner body
+                    # starts a piece of its own; otherwise
+                    # `/* outer /* let x = 1; */ */` hands the rules one string
+                    # beginning "outer", and the nested code is never anchored.
+                    if i > seg_start:
+                        pieces.append(
+                            Piece(seg_line, marker, source[seg_start:i], code_on_line and first, True)
+                        )
+                        first = False
                     depth += 1
                     i += 2
+                    seg_start = i
+                    seg_line = line
                 elif source.startswith("*/", i):
+                    if depth > 1 and i > seg_start:
+                        pieces.append(
+                            Piece(seg_line, marker, source[seg_start:i], code_on_line and first, True)
+                        )
+                        first = False
                     depth -= 1
                     i += 2
+                    if depth > 0:
+                        seg_start = i
+                        seg_line = line
                 elif source[i] == "\n":
                     pieces.append(
                         Piece(seg_line, marker, source[seg_start:i], code_on_line and first, True)
@@ -499,6 +519,7 @@ def comment_runs(pieces: list[Piece]):
             piece.trailing
             or run[-1].trailing
             or piece.block != run[-1].block
+            or piece.marker != run[-1].marker
             or piece.line != prev_line + 1
         ):
             yield run
@@ -519,14 +540,26 @@ def comment_lines(pieces: list[Piece]):
     with the fenced body.
     """
     for run in comment_runs(pieces):
-        fence = False
+        fence_char = ""
         for piece in run:
             text = piece.text
-            if FENCE_RE.match(text):
-                fence = not fence
+            match = FENCE_RE.match(text)
+            if match:
+                delimiter = match.group(1)[0]
+                if not fence_char:
+                    fence_char = delimiter
+                    yield piece.line, text, True
+                    continue
+                if delimiter == fence_char:
+                    fence_char = ""
+                    yield piece.line, text, True
+                    continue
+                # A `~~~` line inside a ``` block is literal content under
+                # CommonMark, not a closer. Treating it as one un-exempts the
+                # rest of the example and reports its sample text as comments.
                 yield piece.line, text, True
                 continue
-            yield piece.line, text, fence
+            yield piece.line, text, bool(fence_char)
 
 
 def check_line_rules(path: str, pieces: list[Piece]) -> list[Finding]:
@@ -596,7 +629,7 @@ def prose_units(pieces: list[Piece]) -> list[tuple[int, str]]:
     for block in comment_runs(pieces):
         run: list[str] = []
         run_line = 0
-        fence = False
+        fence_char = ""
 
         def flush():
             nonlocal run
@@ -606,11 +639,16 @@ def prose_units(pieces: list[Piece]) -> list[tuple[int, str]]:
 
         for piece in block:
             body = piece.text
-            if FENCE_RE.match(body):
-                fence = not fence
+            match = FENCE_RE.match(body)
+            if match:
+                delimiter = match.group(1)[0]
+                if not fence_char:
+                    fence_char = delimiter
+                elif delimiter == fence_char:
+                    fence_char = ""
                 flush()
                 continue
-            if fence:
+            if fence_char:
                 flush()
                 continue
             if TABLE_RE.match(body) or HEADING_RE.match(body) or not body.strip():
@@ -889,7 +927,11 @@ SELF_TESTS = [
     ('let s = r#"\n// TODO: not a comment\n"#;\n', [], "raw string contents"),
     ('let s = "// also not a comment";\n', [], "string contents"),
     ('// real\nlet s = "not // this";\n', ["real"], "comment then string"),
-    ("/* outer /* nested */ still outer */ x();\n", ["outer /* nested */ still outer"], "nested block"),
+    (
+        "/* outer /* nested */ still outer */ x();\n",
+        ["outer", "nested", "still outer"],
+        "nested block yields the inner body as its own piece",
+    ),
     ("let c = '\\''; // after char lit\n", ["after char lit"], "escaped char literal"),
     ("fn f<'a>(x: &'a str) {} // after lifetime\n", ["after lifetime"], "lifetime tick"),
     ('let s = "esc \\" // no"; // yes\n', ["yes"], "escaped quote"),
@@ -933,6 +975,21 @@ RULE_TESTS = [
         "a wrapped commented-out signature is caught on its opening line",
     ),
     (
+        "/// ```rust\n// TODO: issue required\n",
+        {("CH002", 2)},
+        "a change of comment marker ends the run",
+    ),
+    (
+        "/* outer /* let stale = compute(); */ */\n",
+        {("CH001", 1)},
+        "a nested block comment body is inspected",
+    ),
+    (
+        "/// ```rust\n/// ~~~\n/// TODO: fixture placeholder\n/// ```\n",
+        set(),
+        "a ~~~ line inside a ``` fence is content, not a closer",
+    ),
+    (
         "fn f() {\n"
         "    let a = 1; // the first of two short trailing notes that each stay well under the limit here\n"
         "    let b = 2; // the second of two short trailing notes that also stays under it comfortably\n"
@@ -953,6 +1010,10 @@ CODE_SHAPE_TESTS = [
     ("pub fn bar();", True),
     ("fn foo(", True),
     ("fn foo(a: u8,", True),
+    ("fn f(x: impl Send + Sync,", True),
+    ("fn f(x: [u8; 4],", True),
+    ("fn f(&self,", True),
+    ("fn foo(the caller name appears, and so on,", False),
     ("struct Foo {", True),
     ("impl Foo {", True),
     ("use a::b;", True),

@@ -242,3 +242,32 @@ Fixed by requiring a real use-path shape, rejecting a `let`/`type` right-hand
 side of three or more bare words, and allowing a run of closers. The sweep now
 reports 0 false positives and 0 misses, and 26 of those shapes are pinned in
 `--self-test` so the next narrowing of CH001 cannot quietly re-widen it.
+
+**Sixth Codex round (PR #1380): four more P2 findings, all real.**
+
+- *Wrapped parameters excluded valid Rust.* `// fn f(x: impl Send + Sync,` and
+  `// fn f(x: [u8; 4],` evaded CH001 because the parameter character class had
+  no `+`, `;` or `=`. Widened, and gated on a `:` or a `self` receiver so that
+  prose ending in a comma still cannot match.
+- *A change of comment marker did not end a run.* `/// ```rust` immediately
+  followed by `// TODO: issue required` stayed one run, so the doc block's
+  unclosed fence suppressed the ordinary comment below it — the same class as
+  the previous round's fence leak, one level down. The marker is now part of
+  the run boundary.
+- *Nested block comment bodies were buried.* `/* outer /* let stale =
+  compute(); */ */` handed the rules a single string starting "outer", so the
+  nested code was never anchored. A nested opener or closer now ends the
+  segment, and the inner body starts its own piece.
+- *Any fence delimiter closed any fence.* A `~~~` line inside a ` ``` ` block
+  is literal content under CommonMark, but it toggled the fence off — so the
+  example's own sample text was then read as real comments and reported. The
+  opening delimiter is now tracked and only its match closes.
+
+The marker-boundary fix unmasked **three genuine CH004 defects** that run
+merging had been hiding: a `///` doc block closing on a blank `///` before a
+`//` block (`runner.rs`, `scheduler.rs`) and one opening on a blank `///`
+(`worker.rs`). All three removed, so Tier A is back at zero.
+
+The adversarial sweep was extended to 240 prose lines and still reports 0
+false positives, and the self-test now carries 24 lexer/rule fixtures plus 30
+code-vs-prose shapes.
