@@ -33,3 +33,5 @@ Of the three directions the issue sketched (registration-time rejection of self-
 ### Scope
 
 Metrics/observability only — no new `WorkflowEvent` variant, no migration, no schema change, no behavior change to the `Defer` (default) strategy or to which runs get superseded. `docs/telemetry.md`'s metric catalogue and `tests/integration/metrics_coverage.rs`'s reachability/cardinality coverage were updated for the new counter (workflow + gap labels only — the concurrency key is never a label, per ADR-0001 §7, matching `harvest.concurrency.superseded`'s existing rule).
+
+`docs/dashboards/starter-pack-v0.1.0.json` gained a "Nested admission residual over limit" panel (Concurrency & rate limits row) and `tests/integration/dashboard_pack_docs.rs`'s `DASHBOARD_PROMETHEUS_SERIES`/`SERIES_LABELS` ground truth gained matching entries — a second, independent anti-drift gate from `metrics_coverage.rs` that also requires every catalogued metric to have a panel and a label set, caught by CI after the initial push.
