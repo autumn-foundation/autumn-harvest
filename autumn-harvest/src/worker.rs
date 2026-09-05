@@ -3656,6 +3656,7 @@ async fn persist_external_signal_inline(
                                     conn,
                                     *target_id,
                                     "cancelled by external request",
+                                    Some(metrics),
                                 )
                                 .await
                                 {
@@ -7373,11 +7374,22 @@ pub async fn persist_workflow_completion(
     // Issue #1243: the configured payload-codec registry, so this write
     // encodes under the same codecs replay decodes with.
     codecs: &crate::payload_codec::PayloadCodecs,
+    // issue #1197, item 1 (Codex round 2, P1): this function's own
+    // `conn.transaction()` below is demoted to a SAVEPOINT when called (as it
+    // always is in production, via `persist_workflow_outcome`) from inside
+    // `process_workflow_task`'s outer persist transaction -- so emitting
+    // right after that inner savepoint releases is NOT actually post-commit;
+    // the outer transaction can still roll it back (e.g. the
+    // `WORKER_PERSIST_BEFORE_COMMIT` chaos point, or any later failure in
+    // that same closure). Collected samples are appended to the CALLER's
+    // vector instead of emitted here; the caller must emit them only after
+    // its own outermost transaction commits.
+    pending_cancel_metrics: &mut Vec<crate::execution::StartCancelledRun>,
 ) -> HarvestResult<(ExecutionId, Option<String>)> {
     let event = WorkflowEvent::WorkflowCompleted {
         output: output.clone(),
     };
-    let (deferred, closed_children) =
+    let (deferred, closed_children, tx_cancel_metrics) =
         Box::pin(conn.transaction::<_, HarvestError, _>(async |conn| {
             // Issue #1184: re-derive the task-row claim under its own lock
             // before committing this completion. The execution row lock this
@@ -7399,21 +7411,25 @@ pub async fn persist_workflow_completion(
             update_workflow_execution_completed(conn, exec_id, worker_id, &output).await?;
             queue::complete_task(conn, task_id, output).await?;
             let (mut deferred, closed_children) = apply_parent_close_cascade(conn, exec_id).await?;
-            let triggers = crate::completion_trigger::evaluate_triggers_for_execution(
+            let mut tx_cancel_metrics = Vec::new();
+            let triggers = crate::completion_trigger::evaluate_triggers_for_execution_collecting(
                 conn,
                 exec_id,
                 crate::completion_trigger::TerminalState::Completed,
                 metrics,
+                &mut tx_cancel_metrics,
             )
             .await?;
             deferred.extend(triggers);
-            Ok((deferred, closed_children))
+            Ok((deferred, closed_children, tx_cancel_metrics))
         }))
         .await?;
 
     for start in deferred {
         start.spawn();
     }
+
+    pending_cancel_metrics.extend(tx_cancel_metrics);
 
     for (child_id, child_name) in closed_children {
         check_and_report_unfinished_handlers_for_worker(conn, child_id, Some(&child_name), metrics)
@@ -7472,6 +7488,10 @@ pub async fn persist_workflow_failure(
     // Issue #1243: the configured payload-codec registry, so this write
     // encodes under the same codecs replay decodes with.
     codecs: &crate::payload_codec::PayloadCodecs,
+    // issue #1197, item 1 (Codex round 2, P1): see `persist_workflow_completion`'s
+    // identical parameter doc — this function's own transaction is a SAVEPOINT,
+    // not a real commit, when reached via `persist_workflow_outcome`.
+    pending_cancel_metrics: &mut Vec<crate::execution::StartCancelledRun>,
 ) -> HarvestResult<(bool, (ExecutionId, Option<String>))> {
     let error = error.to_string();
     // Decode the typed failure envelope once (issue #767). A legacy `Err(String)`
@@ -7571,11 +7591,12 @@ pub async fn persist_workflow_failure(
         (*rid, policy.clone(), *attempt, fire_at, start_delay)
     });
 
-    let (deferred, retry_scheduled, deferred_checks) =
+    let (deferred, retry_scheduled, deferred_checks, tx_cancel_metrics) =
         Box::pin(conn.transaction::<(
             Vec<crate::completion_trigger::DeferredTriggerStart>,
             bool,
             Vec<(ExecutionId, String)>,
+            Vec<crate::execution::StartCancelledRun>,
         ), HarvestError, _>(async |conn| {
             let decoded = decoded.clone();
             let retry_fire_info = retry_fire_info.clone();
@@ -7733,23 +7754,37 @@ pub async fn persist_workflow_failure(
                 }
             }
 
+            let mut tx_cancel_metrics = Vec::new();
             if !retry_committed {
                 let (cascade, closed_children) = apply_parent_close_cascade(conn, exec_id).await?;
                 deferred.extend(cascade);
                 deferred_checks.extend(closed_children);
-                let triggers = crate::completion_trigger::evaluate_triggers_for_execution(
-                    conn,
-                    exec_id,
-                    crate::completion_trigger::TerminalState::Failed,
-                    metrics,
-                )
-                .await?;
+                let triggers =
+                    crate::completion_trigger::evaluate_triggers_for_execution_collecting(
+                        conn,
+                        exec_id,
+                        crate::completion_trigger::TerminalState::Failed,
+                        metrics,
+                        &mut tx_cancel_metrics,
+                    )
+                    .await?;
                 deferred.extend(triggers);
             }
 
-            Ok((deferred, retry_committed, deferred_checks))
+            Ok((
+                deferred,
+                retry_committed,
+                deferred_checks,
+                tx_cancel_metrics,
+            ))
         }))
         .await?;
+
+    // issue #1197, item 1 (Codex round 2, P1): NOT necessarily post-commit —
+    // see this function's `pending_cancel_metrics` parameter doc. Append to
+    // the caller's vector instead of emitting; the caller emits only after
+    // its own outermost transaction commits.
+    pending_cancel_metrics.extend(tx_cancel_metrics);
 
     if retry_scheduled
         && let (Some(exec), Some((_, _, attempt, _, _))) = (execution, &retry_fire_info)
@@ -11952,6 +11987,8 @@ pub async fn fail_task_and_execution_with_history(
             None,
             crate::types::Priority::default(),
             codecs,
+            // `metrics: None` above -- nothing can ever be collected here.
+            &mut Vec::new(),
         )
         .await
         .map(|_| ())
@@ -12350,12 +12387,15 @@ pub async fn persist_child_workflow_completion(
     // Issue #1243: the configured payload-codec registry, so this write
     // encodes under the same codecs replay decodes with.
     codecs: &crate::payload_codec::PayloadCodecs,
+    // issue #1197, item 1 (Codex round 2, P1): see `persist_workflow_completion`'s
+    // identical parameter doc.
+    pending_cancel_metrics: &mut Vec<crate::execution::StartCancelledRun>,
 ) -> HarvestResult<(ExecutionId, Option<String>)> {
     let event = WorkflowEvent::WorkflowCompleted {
         output: output.clone(),
     };
 
-    let (deferred, closed_children) =
+    let (deferred, closed_children, tx_cancel_metrics) =
         Box::pin(conn.transaction::<_, HarvestError, _>(async |conn| {
             let output = output.clone();
             // Issue #1184: same task-row ownership recheck as
@@ -12369,22 +12409,28 @@ pub async fn persist_child_workflow_completion(
             update_workflow_execution_completed(conn, exec_id, worker_id, &output).await?;
             queue::complete_task(conn, task_id, output.clone()).await?;
             let (mut deferred, closed_children) = apply_parent_close_cascade(conn, exec_id).await?;
-            let triggers = crate::completion_trigger::evaluate_triggers_for_execution(
+            let mut tx_cancel_metrics = Vec::new();
+            let triggers = crate::completion_trigger::evaluate_triggers_for_execution_collecting(
                 conn,
                 exec_id,
                 crate::completion_trigger::TerminalState::Completed,
                 metrics,
+                &mut tx_cancel_metrics,
             )
             .await?;
             deferred.extend(triggers);
             wake_parent_for_child_completion(conn, parent_exec_id, exec_id, output).await?;
-            Ok((deferred, closed_children))
+            Ok((deferred, closed_children, tx_cancel_metrics))
         }))
         .await?;
 
     for start in deferred {
         start.spawn();
     }
+
+    // issue #1197, item 1 (Codex round 2, P1): NOT necessarily post-commit —
+    // see this function's `pending_cancel_metrics` parameter doc.
+    pending_cancel_metrics.extend(tx_cancel_metrics);
 
     for (child_id, child_name) in closed_children {
         check_and_report_unfinished_handlers_for_worker(conn, child_id, Some(&child_name), metrics)
@@ -12410,6 +12456,9 @@ pub async fn persist_child_workflow_failure(
     // Issue #1243: the configured payload-codec registry, so this write
     // encodes under the same codecs replay decodes with.
     codecs: &crate::payload_codec::PayloadCodecs,
+    // issue #1197, item 1 (Codex round 2, P1): see `persist_workflow_completion`'s
+    // identical parameter doc.
+    pending_cancel_metrics: &mut Vec<crate::execution::StartCancelledRun>,
 ) -> HarvestResult<(ExecutionId, Option<String>)> {
     // Decode the child's typed failure envelope once (issue #767). The child's own
     // `WorkflowFailed` event carries the full typed fields; its `execution.error`
@@ -12419,7 +12468,7 @@ pub async fn persist_child_workflow_failure(
     let decoded = crate::failure::decode_workflow_failure(error);
     let workflow_failure = WorkflowEvent::workflow_failed_typed(&decoded);
 
-    let (deferred, closed_children) =
+    let (deferred, closed_children, tx_cancel_metrics) =
         Box::pin(conn.transaction::<_, HarvestError, _>(async |conn| {
             let raw_error = error.to_string();
             let message = decoded.message.clone();
@@ -12440,22 +12489,28 @@ pub async fn persist_child_workflow_failure(
                 .await?;
             queue::fail_task(conn, task_id, &message).await?;
             let (mut deferred, closed_children) = apply_parent_close_cascade(conn, exec_id).await?;
-            let triggers = crate::completion_trigger::evaluate_triggers_for_execution(
+            let mut tx_cancel_metrics = Vec::new();
+            let triggers = crate::completion_trigger::evaluate_triggers_for_execution_collecting(
                 conn,
                 exec_id,
                 crate::completion_trigger::TerminalState::Failed,
                 metrics,
+                &mut tx_cancel_metrics,
             )
             .await?;
             deferred.extend(triggers);
             wake_parent_for_child_failure(conn, parent_exec_id, exec_id, &raw_error).await?;
-            Ok((deferred, closed_children))
+            Ok((deferred, closed_children, tx_cancel_metrics))
         }))
         .await?;
 
     for start in deferred {
         start.spawn();
     }
+
+    // issue #1197, item 1 (Codex round 2, P1): NOT necessarily post-commit —
+    // see this function's `pending_cancel_metrics` parameter doc.
+    pending_cancel_metrics.extend(tx_cancel_metrics);
 
     for (child_id, child_name) in closed_children {
         check_and_report_unfinished_handlers_for_worker(conn, child_id, Some(&child_name), metrics)
@@ -14569,6 +14624,7 @@ pub async fn apply_race_loser_cancellations(
                 conn,
                 *child_id,
                 "lost race to a sibling branch",
+                Some(metrics.as_ref()),
             )
             .await
             {
@@ -15918,6 +15974,8 @@ async fn reject_child_continue_as_new(
             None,
             crate::types::Priority::default(),
             codecs,
+            // `metrics: None` above -- nothing can ever be collected here.
+            &mut Vec::new(),
         )
         .await?;
     } else {
@@ -15933,6 +15991,8 @@ async fn reject_child_continue_as_new(
             None,
             None,
             codecs,
+            // `metrics: None` above -- nothing can ever be collected here.
+            &mut Vec::new(),
         )
         .await?;
     }
@@ -16050,6 +16110,8 @@ async fn check_continue_as_new_type<'a>(
         None,
         crate::types::Priority::default(),
         registry.payload_codecs(),
+        // `metrics: None` above -- nothing can ever be collected here.
+        &mut Vec::new(),
     )
     .await?;
     Ok(ContinueAsNewTypeCheck::Rejected)
@@ -16718,6 +16780,8 @@ pub async fn persist_workflow_continue_as_new(
             None,
             crate::types::Priority::default(),
             registry.payload_codecs(),
+            // `metrics: None` above -- nothing can ever be collected here.
+            &mut Vec::new(),
         )
         .await?;
         return Ok(());
@@ -16930,6 +16994,12 @@ async fn persist_workflow_outcome(
     // inline), and also threads it into the `SuspendedWorkflowContext`. Empty for
     // every non-suspension outcome and for a pure suspension.
     resolved_inline_external: ResolvedExternalIds,
+    // issue #1197, item 1 (Codex round 2, P1): threaded straight through to
+    // whichever leaf persist function below actually runs, for the CALLER to
+    // emit only after its own outermost transaction commits — see
+    // `persist_workflow_completion`'s identical parameter doc for why this
+    // function's own callers cannot safely emit these themselves.
+    pending_cancel_metrics: &mut Vec<crate::execution::StartCancelledRun>,
 ) -> HarvestResult<(bool, Vec<(ExecutionId, Option<String>)>)> {
     let parent_exec_id = execution.parent_id.map(execution_id_from_uuid);
     // A detached child has parent_close_policy set (non-null). Detached children
@@ -16949,6 +17019,7 @@ async fn persist_workflow_outcome(
                 output,
                 Some(registry.telemetry().metrics.as_ref()),
                 registry.payload_codecs(),
+                pending_cancel_metrics,
             )
             .await?;
             Ok((false, vec![res]))
@@ -16966,6 +17037,7 @@ async fn persist_workflow_outcome(
                 Some(registry.telemetry().metrics.as_ref()),
                 registry.payload_offloader(),
                 registry.payload_codecs(),
+                pending_cancel_metrics,
             )
             .await?;
             if update_schedule_counter {
@@ -17000,6 +17072,7 @@ async fn persist_workflow_outcome(
                 non_deterministic_details.as_ref(),
                 Some(registry.telemetry().metrics.as_ref()),
                 registry.payload_codecs(),
+                pending_cancel_metrics,
             )
             .await?;
             if update_schedule_counter {
@@ -17044,6 +17117,7 @@ async fn persist_workflow_outcome(
                     .and_then(|c| u32::try_from(c).ok()),
                 crate::types::Priority::from_i32(persistence.task.priority).unwrap_or_default(),
                 registry.payload_codecs(),
+                pending_cancel_metrics,
             )
             .await?;
             if update_schedule_counter && !retry_scheduled {
@@ -17298,6 +17372,15 @@ enum WorkflowPersistFlow {
         /// before commit could run against a cancellation that later rolls
         /// back if this transaction fails.
         race_deferred_triggers: Vec<crate::completion_trigger::DeferredTriggerStart>,
+        /// Latest-wins supersede cancellation samples collected while
+        /// persisting this outcome (issue #1197, item 1). This whole
+        /// transaction may itself be a SAVEPOINT nested inside an even
+        /// larger caller transaction (none exists above this function today,
+        /// but the leaf persist functions cannot assume that), so these are
+        /// collected rather than emitted; the caller emits them via
+        /// `execution::emit_start_cancel_metrics` only after confirming this
+        /// match arm was reached, i.e. after the real outer commit.
+        pending_cancel_metrics: Vec<crate::execution::StartCancelledRun>,
     },
 }
 
@@ -17389,6 +17472,9 @@ async fn persist_terminal_outcome_commands(
     // abandoned-dispatch record can never duplicate one.
     recorded_dispatches: &RecordedDispatchIds,
     execute_span: &tracing::Span,
+    // issue #1197, item 1 (Codex round 2, P1): threaded straight through to
+    // `persist_workflow_outcome` — see its identical parameter doc.
+    pending_cancel_metrics: &mut Vec<crate::execution::StartCancelledRun>,
 ) -> HarvestResult<(
     bool,
     Vec<(ExecutionId, Option<String>)>,
@@ -17525,6 +17611,7 @@ async fn persist_terminal_outcome_commands(
         // Terminal-with-commands path never suspends, so no inline external
         // wake is threaded here (issue #678).
         ResolvedExternalIds::default(),
+        pending_cancel_metrics,
     )
     .await?;
     Ok((retry_scheduled, deferred_checks, race_deferred_triggers))
@@ -17844,10 +17931,14 @@ pub async fn move_workflow_to_dlq_for_history_cap(
     // Issue #1243: the configured payload-codec registry, so this write
     // encodes under the same codecs replay decodes with.
     codecs: &crate::payload_codec::PayloadCodecs,
-) -> HarvestResult<(Vec<DeferredTriggerStart>, Vec<(ExecutionId, String)>)> {
+) -> HarvestResult<(
+    Vec<DeferredTriggerStart>,
+    Vec<(ExecutionId, String)>,
+    Vec<crate::execution::StartCancelledRun>,
+)> {
     let reason = reason.to_string();
 
-    let (deferred, closed_children) =
+    let (deferred, closed_children, pending_cancel_metrics) =
         Box::pin(conn.transaction::<_, HarvestError, _>(async |conn| {
             use crate::schema::harvest_workflow_executions::dsl as exec_dsl;
             let reason = reason.clone();
@@ -17907,22 +17998,25 @@ pub async fn move_workflow_to_dlq_for_history_cap(
             // workflow-task-timeout seal paths.
             queue::fail_open_tasks_for_execution(conn, exec_id, &reason).await?;
             let (mut deferred, closed_children) = apply_parent_close_cascade(conn, exec_id).await?;
-            let failed_triggers = crate::completion_trigger::evaluate_triggers_for_execution(
-                conn,
-                exec_id,
-                crate::completion_trigger::TerminalState::Failed,
-                metrics,
-            )
-            .await?;
+            let mut pending_cancel_metrics = Vec::new();
+            let failed_triggers =
+                crate::completion_trigger::evaluate_triggers_for_execution_collecting(
+                    conn,
+                    exec_id,
+                    crate::completion_trigger::TerminalState::Failed,
+                    metrics,
+                    &mut pending_cancel_metrics,
+                )
+                .await?;
             deferred.extend(failed_triggers);
             if let Some(parent_exec_id) = parent_exec_id {
                 wake_parent_for_child_failure(conn, parent_exec_id, exec_id, &reason).await?;
             }
-            Ok((deferred, closed_children))
+            Ok((deferred, closed_children, pending_cancel_metrics))
         }))
         .await?;
 
-    Ok((deferred, closed_children))
+    Ok((deferred, closed_children, pending_cancel_metrics))
 }
 
 /// Pure decision for a bounded retry sequence (issue #704, PR #1139
@@ -18183,7 +18277,7 @@ async fn fail_workflow_for_history_cap(
         cap,
         workflow_type: execution.workflow_name.clone(),
     };
-    let (deferred, closed_children) = move_workflow_to_dlq_for_history_cap(
+    let (deferred, closed_children, pending_cancel_metrics) = move_workflow_to_dlq_for_history_cap(
         conn,
         task,
         exec_id,
@@ -18207,6 +18301,11 @@ async fn fail_workflow_for_history_cap(
     // fixed for the ordinary terminal-outcome path in
     // `emit_pending_workflow_metrics` (round 2, P2); same fix, applied here
     // for consistency since this path has the same new failure mode.
+    //
+    // issue #1197, item 1: the same discipline now also covers the
+    // completion-trigger latest-wins supersede counters this call's inline
+    // same-shard trigger start may have collected.
+    crate::execution::emit_start_cancel_metrics(&*telemetry.metrics, &pending_cancel_metrics);
     telemetry.metrics.record_workflow_completed(
         &execution.workflow_name,
         &task.queue_name,
@@ -20007,6 +20106,7 @@ async fn process_workflow_task(
                 clear_nd_block(conn, persistence.exec_id).await?;
             }
 
+            let mut pending_cancel_metrics = Vec::new();
             let (retry_scheduled, deferred_checks, race_deferred_triggers) =
                 if is_terminal_with_commands {
                     persist_terminal_outcome_commands(
@@ -20018,6 +20118,7 @@ async fn process_workflow_task(
                         &pending_cmds,
                         &recorded_dispatches,
                         &execute_span,
+                        &mut pending_cancel_metrics,
                     )
                     .await?
                 } else {
@@ -20033,6 +20134,7 @@ async fn process_workflow_task(
                         // resolved inline this cycle into the Suspended arm
                         // so a mixed timer + external op self-wakes.
                         resolved_inline_external,
+                        &mut pending_cancel_metrics,
                     )
                     .await?;
                     (retry_scheduled, deferred_checks, Vec::new())
@@ -20047,6 +20149,7 @@ async fn process_workflow_task(
                 retry_scheduled,
                 deferred_checks,
                 race_deferred_triggers,
+                pending_cancel_metrics,
             })
         },
     ))
@@ -20061,6 +20164,7 @@ async fn process_workflow_task(
             retry_scheduled,
             deferred_checks,
             race_deferred_triggers,
+            pending_cancel_metrics,
         }) => {
             // Chaos: kill/delay after the outer persist commit but before the
             // deferred-trigger fan-out — committed work whose in-process
@@ -20074,6 +20178,20 @@ async fn process_workflow_task(
             for start in race_deferred_triggers {
                 start.spawn();
             }
+
+            // issue #1197, item 1 (Codex round 2, P1): emitted only now that
+            // the OUTER `persist_flow` transaction above has actually
+            // committed — reaching this match arm at all proves it did.
+            // Emitting inside `persist_workflow_completion`/`_failure` (etc.)
+            // right after their own inner transaction would be unsound here:
+            // that inner transaction is a SAVEPOINT under this one, and the
+            // `WORKER_PERSIST_BEFORE_COMMIT` chaos point above (or any other
+            // later failure in this same closure) can still roll the whole
+            // thing back after it "commits".
+            crate::execution::emit_start_cancel_metrics(
+                registry.telemetry().metrics.as_ref(),
+                &pending_cancel_metrics,
+            );
 
             // Deferred best-effort schedule counters, in autocommit post-commit.
             // When a retry was scheduled the failure-counter increment is
@@ -26409,6 +26527,7 @@ pub async fn quarantine_workflow_task_timeout(
         Vec<crate::completion_trigger::DeferredTriggerStart>,
         Option<String>,
         Vec<(ExecutionId, String)>,
+        Vec<crate::execution::StartCancelledRun>,
     ), HarvestError, _>(async |conn| {
         let error_msg = error_msg.clone();
         let entry = entry.clone();
@@ -26416,145 +26535,162 @@ pub async fn quarantine_workflow_task_timeout(
         dlq::dead_letter(conn, &entry).await?;
         queue::fail_task(conn, task_id, &error_msg).await?;
 
-        let (deferred, queue_used, closed_children) = if let Some(exec_uuid) = exec_id_opt {
-            if exec_exists {
-                // Lock the execution row and re-check its *current* state
-                // before appending any event or mutating it further.
-                //
-                // A legitimate completion (or cancel/terminate/timeout) can
-                // commit in the window between this workflow task's own
-                // timeout firing and this transaction acquiring the lock —
-                // `tokio::time::timeout` racing an already-durable side
-                // effect is a well-known hazard. Proceeding unconditionally
-                // used to append a spurious `WorkflowFailed` event onto a
-                // run that actually finished some other way, and (per issue
-                // #605's completion-callback delivery, which re-reads the
-                // execution row inside `evaluate_triggers_for_execution`)
-                // could deliver a signed callback claiming `state: failed`
-                // while sourcing `output`/`completed_at` from the real,
-                // concurrently-committed terminal row.
-                let current_state: Option<String> = exec_dsl::harvest_workflow_executions
-                    .find(exec_uuid)
-                    .select(exec_dsl::state)
-                    .for_update()
-                    .first(conn)
-                    .await
-                    .optional()
-                    .map_err(crate::error::database_error)?;
+        let (deferred, queue_used, closed_children, pending_cancel_metrics) =
+            if let Some(exec_uuid) = exec_id_opt {
+                if exec_exists {
+                    // Lock the execution row and re-check its *current* state
+                    // before appending any event or mutating it further.
+                    //
+                    // A legitimate completion (or cancel/terminate/timeout) can
+                    // commit in the window between this workflow task's own
+                    // timeout firing and this transaction acquiring the lock —
+                    // `tokio::time::timeout` racing an already-durable side
+                    // effect is a well-known hazard. Proceeding unconditionally
+                    // used to append a spurious `WorkflowFailed` event onto a
+                    // run that actually finished some other way, and (per issue
+                    // #605's completion-callback delivery, which re-reads the
+                    // execution row inside `evaluate_triggers_for_execution`)
+                    // could deliver a signed callback claiming `state: failed`
+                    // while sourcing `output`/`completed_at` from the real,
+                    // concurrently-committed terminal row.
+                    let current_state: Option<String> = exec_dsl::harvest_workflow_executions
+                        .find(exec_uuid)
+                        .select(exec_dsl::state)
+                        .for_update()
+                        .first(conn)
+                        .await
+                        .optional()
+                        .map_err(crate::error::database_error)?;
 
-                if matches!(current_state.as_deref(), Some("RUNNING" | "PAUSED")) {
-                    // Drain sibling tasks (PENDING/RUNNING) so they are not
-                    // claimed and run after the workflow has been terminally
-                    // failed. Mirrors the poison-pill quarantine path.
-                    diesel::update(
-                        task_dsl::harvest_task_queue
-                            .filter(task_dsl::workflow_exec_id.eq(exec_uuid))
-                            .filter(
-                                task_dsl::state
-                                    .eq("PENDING")
-                                    .or(task_dsl::state.eq("RUNNING")),
-                            ),
-                    )
-                    .set((
-                        task_dsl::state.eq("FAILED"),
-                        task_dsl::error.eq(Some(error_msg.clone())),
-                        task_dsl::completed_at.eq(Some(chrono::Utc::now())),
-                    ))
-                    .execute(conn)
-                    .await
-                    .map_err(crate::error::database_error)?;
+                    if matches!(current_state.as_deref(), Some("RUNNING" | "PAUSED")) {
+                        // Drain sibling tasks (PENDING/RUNNING) so they are not
+                        // claimed and run after the workflow has been terminally
+                        // failed. Mirrors the poison-pill quarantine path.
+                        diesel::update(
+                            task_dsl::harvest_task_queue
+                                .filter(task_dsl::workflow_exec_id.eq(exec_uuid))
+                                .filter(
+                                    task_dsl::state
+                                        .eq("PENDING")
+                                        .or(task_dsl::state.eq("RUNNING")),
+                                ),
+                        )
+                        .set((
+                            task_dsl::state.eq("FAILED"),
+                            task_dsl::error.eq(Some(error_msg.clone())),
+                            task_dsl::completed_at.eq(Some(chrono::Utc::now())),
+                        ))
+                        .execute(conn)
+                        .await
+                        .map_err(crate::error::database_error)?;
 
-                    let exec_id = execution_id_from_uuid(exec_uuid);
-                    let history =
-                        crate::store::load_history_with_codecs(conn, exec_id, codecs).await?;
-                    crate::store::append_events_with_codecs(
-                        conn,
-                        exec_id,
-                        &[WorkflowEvent::workflow_failed(error_msg.clone())],
-                        history.next_event_id,
-                        codecs,
-                    )
-                    .await?;
-                    // update_workflow_execution_failed only transitions RUNNING
-                    // rows; ignore errors — the DLQ entry and event append are
-                    // the durable record.
-                    let _ = update_workflow_execution_failed(
-                        conn, exec_id, &worker_id, &error_msg, None,
-                    )
-                    .await;
-                    // Also handle the PAUSED → FAILED transition: an operator
-                    // may have paused the execution between dispatch and quarantine.
-                    let _ = diesel::update(
-                        exec_dsl::harvest_workflow_executions
-                            .find(exec_uuid)
-                            .filter(exec_dsl::state.eq("PAUSED")),
-                    )
-                    .set((
-                        exec_dsl::state.eq("FAILED"),
-                        exec_dsl::output.eq(None::<serde_json::Value>),
-                        exec_dsl::error.eq(Some(error_msg.clone())),
-                        exec_dsl::completed_at.eq(Some(chrono::Utc::now())),
-                    ))
-                    .execute(conn)
-                    .await;
-                    let (mut deferred, closed_children) =
-                        apply_parent_close_cascade(conn, exec_id).await?;
-                    let triggers = crate::completion_trigger::evaluate_triggers_for_execution(
-                        conn,
-                        exec_id,
-                        crate::completion_trigger::TerminalState::Failed,
-                        Some(metrics),
-                    )
-                    .await?;
-                    deferred.extend(triggers);
-                    // Notify the parent only for awaited children (those without
-                    // a parent_close_policy). Detached children are managed by
-                    // apply_parent_close_cascade above, mirroring the poison-pill
-                    // and timeout paths.
-                    if parent_close_policy_opt.is_none()
-                        && let Some(parent_uuid) = parent_id_opt
-                    {
-                        let parent_exec_id = execution_id_from_uuid(parent_uuid);
-                        let _ = wake_parent_for_child_failure(
+                        let exec_id = execution_id_from_uuid(exec_uuid);
+                        let history =
+                            crate::store::load_history_with_codecs(conn, exec_id, codecs).await?;
+                        crate::store::append_events_with_codecs(
                             conn,
-                            parent_exec_id,
                             exec_id,
-                            &error_msg,
+                            &[WorkflowEvent::workflow_failed(error_msg.clone())],
+                            history.next_event_id,
+                            codecs,
+                        )
+                        .await?;
+                        // update_workflow_execution_failed only transitions RUNNING
+                        // rows; ignore errors — the DLQ entry and event append are
+                        // the durable record.
+                        let _ = update_workflow_execution_failed(
+                            conn, exec_id, &worker_id, &error_msg, None,
                         )
                         .await;
+                        // Also handle the PAUSED → FAILED transition: an operator
+                        // may have paused the execution between dispatch and quarantine.
+                        let _ = diesel::update(
+                            exec_dsl::harvest_workflow_executions
+                                .find(exec_uuid)
+                                .filter(exec_dsl::state.eq("PAUSED")),
+                        )
+                        .set((
+                            exec_dsl::state.eq("FAILED"),
+                            exec_dsl::output.eq(None::<serde_json::Value>),
+                            exec_dsl::error.eq(Some(error_msg.clone())),
+                            exec_dsl::completed_at.eq(Some(chrono::Utc::now())),
+                        ))
+                        .execute(conn)
+                        .await;
+                        let (mut deferred, closed_children) =
+                            apply_parent_close_cascade(conn, exec_id).await?;
+                        let mut pending_cancel_metrics = Vec::new();
+                        let triggers =
+                            crate::completion_trigger::evaluate_triggers_for_execution_collecting(
+                                conn,
+                                exec_id,
+                                crate::completion_trigger::TerminalState::Failed,
+                                Some(metrics),
+                                &mut pending_cancel_metrics,
+                            )
+                            .await?;
+                        deferred.extend(triggers);
+                        // Notify the parent only for awaited children (those without
+                        // a parent_close_policy). Detached children are managed by
+                        // apply_parent_close_cascade above, mirroring the poison-pill
+                        // and timeout paths.
+                        if parent_close_policy_opt.is_none()
+                            && let Some(parent_uuid) = parent_id_opt
+                        {
+                            let parent_exec_id = execution_id_from_uuid(parent_uuid);
+                            let _ = wake_parent_for_child_failure(
+                                conn,
+                                parent_exec_id,
+                                exec_id,
+                                &error_msg,
+                            )
+                            .await;
+                        }
+                        (
+                            deferred,
+                            Some(entry.queue_name.clone()),
+                            closed_children,
+                            pending_cancel_metrics,
+                        )
+                    } else {
+                        // The execution already reached a different terminal
+                        // state (or was deleted/archived) before this
+                        // quarantine's lock was acquired: this attempt lost the
+                        // race. The timed-out task row itself is still
+                        // failed/DLQ'd above (that part is about the task, not
+                        // the workflow's own terminal outcome), but the
+                        // execution — and any completion-callback delivery for
+                        // it — must not be touched.
+                        tracing::warn!(
+                            exec_id = %exec_uuid,
+                            current_state = ?current_state,
+                            "workflow task timeout quarantine: execution already \
+                             left RUNNING/PAUSED before the quarantine lock was \
+                             acquired; skipping the WorkflowFailed transition"
+                        );
+                        (Vec::new(), None, Vec::new(), Vec::new())
                     }
-                    (deferred, Some(entry.queue_name.clone()), closed_children)
                 } else {
-                    // The execution already reached a different terminal
-                    // state (or was deleted/archived) before this
-                    // quarantine's lock was acquired: this attempt lost the
-                    // race. The timed-out task row itself is still
-                    // failed/DLQ'd above (that part is about the task, not
-                    // the workflow's own terminal outcome), but the
-                    // execution — and any completion-callback delivery for
-                    // it — must not be touched.
-                    tracing::warn!(
-                        exec_id = %exec_uuid,
-                        current_state = ?current_state,
-                        "workflow task timeout quarantine: execution already \
-                         left RUNNING/PAUSED before the quarantine lock was \
-                         acquired; skipping the WorkflowFailed transition"
-                    );
-                    (Vec::new(), None, Vec::new())
+                    (Vec::new(), None, Vec::new(), Vec::new())
                 }
             } else {
-                (Vec::new(), None, Vec::new())
-            }
-        } else {
-            (Vec::new(), None, Vec::new())
-        };
+                (Vec::new(), None, Vec::new(), Vec::new())
+            };
 
-        Ok((deferred, queue_used, closed_children))
+        Ok((
+            deferred,
+            queue_used,
+            closed_children,
+            pending_cancel_metrics,
+        ))
     }))
     .await;
 
     match result {
-        Ok((deferred_starts, queue_used, closed_children)) => {
+        Ok((deferred_starts, queue_used, closed_children, pending_cancel_metrics)) => {
+            // issue #1197, item 1: emitted only now that this transaction has
+            // actually committed.
+            crate::execution::emit_start_cancel_metrics(metrics, &pending_cancel_metrics);
             if let Some(q) = queue_used {
                 crate::telemetry::emit_workflow_terminal(
                     metrics,

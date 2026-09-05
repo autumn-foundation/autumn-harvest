@@ -88,6 +88,7 @@ const DASHBOARD_PROMETHEUS_SERIES: &[&str] = &[
     "harvest_workflow_debounce_fired_total",
     "harvest_workflow_start_throttled_total",
     "harvest_concurrency_superseded_total",
+    "harvest_concurrency_residual_over_limit_total",
     "harvest_scanner_tick_total",
     "harvest_saga_compensated_total",
     "harvest_saga_compensation_failed_total",
@@ -257,6 +258,10 @@ const SERIES_LABELS: &[(&str, &[&str])] = &[
     ("harvest_workflow_debounce_fired", &["workflow", "queue"]),
     ("harvest_workflow_start_throttled", &["workflow"]),
     ("harvest_concurrency_superseded", &["workflow"]),
+    (
+        "harvest_concurrency_residual_over_limit",
+        &["workflow", "gap"],
+    ),
     ("harvest_workflow_history_oversized", &["workflow"]),
     ("harvest_workflow_active", &["workflow", "state"]),
     ("harvest_saga_compensated", &["workflow", "queue"]),
