@@ -844,19 +844,21 @@ fn activity_precedence_for_facts(facts: &PendingActivityFacts, now: DateTime<Utc
     if facts.rate_limit_bucket_missing && facts.rate_limit_key.is_some() {
         return 8; // ActivityRateLimitBucketMissing
     }
-    // Issue #1193 Codex round-4 P2: mirrors `classify_pending_activity`'s
-    // `organic_cooldown_clears_before_due` guard -- an organic trip whose
-    // cooldown will have already elapsed by the time this row is due is not
-    // a circuit-open verdict at all, so it must fall through to the
-    // not-due-yet ranks below rather than claim one of the circuit ranks.
-    let organic_cooldown_clears_before_due = facts.circuit_phase
+    // Issue #1193 Codex round-4/round-5 P2: mirrors `classify_pending_activity`'s
+    // `organic_cooldown_clears_by_dispatch` guard -- an organic trip whose
+    // cooldown will have already elapsed by the effective dispatch instant
+    // (`max(now, scheduled_at)`, since an already-due row could be attempted
+    // any moment) is not a circuit-open verdict at all, so it must fall
+    // through to the not-due-yet ranks below rather than claim one of the
+    // circuit ranks.
+    let effective_dispatch_instant = facts.scheduled_at.max(now);
+    let organic_cooldown_clears_by_dispatch = facts.circuit_phase
         == Some(BlockingCircuitPhase::Open)
         && !facts.circuit_forced_open
-        && facts.scheduled_at > now
         && facts
             .circuit_cooldown_until
-            .is_some_and(|deadline| facts.scheduled_at >= deadline);
-    if !organic_cooldown_clears_before_due
+            .is_some_and(|deadline| effective_dispatch_instant >= deadline);
+    if !organic_cooldown_clears_by_dispatch
         && facts.circuit_phase.is_some()
         && facts.activity_name.is_some()
     {
@@ -979,29 +981,43 @@ pub fn classify_pending_activity(facts: &PendingActivityFacts, now: DateTime<Utc
     // 5. The breaker fast-fails dispatch. Only an activity the task row actually
     //    names can carry one, so an unnamed row can never reach here.
     //
-    //    EXCEPTION (issue #1193 Codex round-4 P2): an ORGANIC trip whose
-    //    cooldown will have already elapsed by the time this row is even due
-    //    is not "heading for a terminal failure". `CircuitBreakerRegistry::
-    //    on_dispatch` checks the elapsed cooldown at the ACTUAL dispatch
-    //    instant, so if `scheduled_at` lands at or after `cooldown_until`,
-    //    THIS row's own future attempt is what gets admitted as the recovery
-    //    probe (or dispatches normally once closed) -- it does not fast-fail
-    //    at all. Falling through to the not-due-yet branch below reports the
-    //    same `activity_retrying` / `activity_deferred` it would if there
-    //    were no breaker in the way. Scoped narrowly: a forced-open breaker
-    //    has no cooldown to compare against (unconditionally `Stalled`,
-    //    correctly, since only `force-close` clears it), and an organic trip
-    //    with an unrepresentable cooldown (`cooldown_until: None`) has no
-    //    deadline to compare either, so both keep reporting circuit-open
-    //    exactly as before -- there is no evidence here that it will clear.
-    let organic_cooldown_clears_before_due = facts.circuit_phase
+    //    EXCEPTION (issue #1193 Codex round-4/round-5 P2): an ORGANIC trip
+    //    whose cooldown will have already elapsed by the time this row is
+    //    actually attempted is not "heading for a terminal failure".
+    //    `CircuitBreakerRegistry::on_dispatch` checks the elapsed cooldown at
+    //    the ACTUAL dispatch instant, so if the deadline lands at or before
+    //    that instant, THIS row's own future attempt is what gets admitted as
+    //    the recovery probe (or dispatches normally once closed) -- it does
+    //    not fast-fail at all.
+    //
+    //    The instant compared against is `max(now, scheduled_at)`, not
+    //    `scheduled_at` alone: a row that is ALREADY due (`scheduled_at <=
+    //    now`) can attempt at any moment, so `now` is the earliest it could
+    //    be dispatched -- and a read-only snapshot deliberately keeps
+    //    reporting `open` with a *past* `cooldown_until` until some dispatch
+    //    actually admits the probe (round-5 P2 on PR #1365; see
+    //    `circuit_cooldown_until` in `api.rs`), so `scheduled_at > now` alone
+    //    would wrongly exclude an already-due, already-probe-ready row.
+    //    Falling through here reports the same `activity_retrying` /
+    //    `activity_deferred` a not-yet-due row gets, or -- for an
+    //    already-due, otherwise-unimpeded row -- `HealthyInProgress`, exactly
+    //    as if there were no breaker in the way; both are correct, since the
+    //    next claim attempt is what the registry would admit as the probe.
+    //
+    //    Scoped narrowly: a forced-open breaker has no cooldown to compare
+    //    against (unconditionally `Stalled`, correctly, since only
+    //    `force-close` clears it), and an organic trip with an
+    //    unrepresentable cooldown (`cooldown_until: None`) has no deadline to
+    //    compare either, so both keep reporting circuit-open exactly as
+    //    before -- there is no evidence here that it will clear.
+    let effective_dispatch_instant = facts.scheduled_at.max(now);
+    let organic_cooldown_clears_by_dispatch = facts.circuit_phase
         == Some(BlockingCircuitPhase::Open)
         && !facts.circuit_forced_open
-        && facts.scheduled_at > now
         && facts
             .circuit_cooldown_until
-            .is_some_and(|deadline| facts.scheduled_at >= deadline);
-    if !organic_cooldown_clears_before_due
+            .is_some_and(|deadline| effective_dispatch_instant >= deadline);
+    if !organic_cooldown_clears_by_dispatch
         && let (Some(phase), Some(name)) = (facts.circuit_phase, facts.activity_name.as_ref())
     {
         return BlockedOn::ActivityCircuitOpen {
@@ -2271,6 +2287,52 @@ mod tests {
         let verdict = classify_pending_activity(&facts, t(0));
         assert_eq!(verdict.kind(), "activity_circuit_open", "{verdict:?}");
         assert_eq!(verdict.health(), ExecutionHealth::Stalled);
+    }
+
+    /// AC (issue #1193 Codex round-5 P2): the round-4 fix compared only
+    /// `scheduled_at` against `cooldown_until`, so it never applied to a row
+    /// that is ALREADY due. But a read-only breaker snapshot deliberately
+    /// keeps reporting `open` with a *past* `cooldown_until` until some
+    /// dispatch actually admits the probe -- so an already-due row whose
+    /// cooldown has already elapsed is exactly as "probe-ready" as a
+    /// not-yet-due one whose cooldown will clear before it's due. The
+    /// comparison must use the effective dispatch instant
+    /// (`max(now, scheduled_at)`), which for an already-due row is `now`.
+    #[test]
+    fn organic_open_falls_through_when_already_due_and_cooldown_already_cleared() {
+        let mut facts = healthy_activity();
+        facts.circuit_phase = Some(BlockingCircuitPhase::Open);
+        facts.circuit_forced_open = false;
+        facts.circuit_cooldown_until = Some(t(-5)); // elapsed before `now`
+        facts.scheduled_at = t(-10); // already due (healthy_activity()'s default)
+        facts.last_error = Some("gateway 503".to_string());
+
+        let verdict = classify_pending_activity(&facts, t(0));
+        assert_ne!(
+            verdict.kind(),
+            "activity_circuit_open",
+            "an already-due row whose cooldown already cleared is probe-ready, \
+             not fast-failing: {verdict:?}"
+        );
+        // Due, unimpeded otherwise, with no failure evidence blocking a claim:
+        // genuinely progressing, exactly as it would with no breaker at all.
+        assert_eq!(verdict, BlockedOn::HealthyInProgress, "{verdict:?}");
+        assert_eq!(verdict.health(), ExecutionHealth::Healthy);
+    }
+
+    /// The converse: an already-due row whose organic cooldown has NOT yet
+    /// elapsed is still certainly fast-failing right now, so `degraded`
+    /// remains correct.
+    #[test]
+    fn organic_open_still_wins_when_already_due_but_cooldown_has_not_cleared() {
+        let mut facts = healthy_activity();
+        facts.circuit_phase = Some(BlockingCircuitPhase::Open);
+        facts.circuit_forced_open = false;
+        facts.circuit_cooldown_until = Some(t(5)); // still ahead of `now`
+        facts.scheduled_at = t(-10); // already due
+        let verdict = classify_pending_activity(&facts, t(0));
+        assert_eq!(verdict.kind(), "activity_circuit_open", "{verdict:?}");
+        assert_eq!(verdict.health(), ExecutionHealth::Degraded);
     }
 
     #[test]
@@ -4835,13 +4897,21 @@ mod tests {
             ]
         }
 
-        /// `None` (unrepresentable/forced), a deadline BEFORE the "due later"
-        /// `scheduled_at` (`t(10)`), or one AFTER it -- so the round-4 P2
-        /// `organic_cooldown_clears_before_due` guard's boundary is actually
-        /// exercised by the sweep, not left at a single hardcoded `None`.
+        /// `None` (unrepresentable/forced); a deadline already in the past
+        /// relative to `now` (`t(0)`), covering an already-due row whose
+        /// cooldown has already cleared (round-5 P2); one BEFORE the
+        /// "due later" `scheduled_at` (`t(10)`); or one AFTER it -- so the
+        /// `organic_cooldown_clears_by_dispatch` guard's boundary is actually
+        /// exercised by the sweep in every case, not left at a single
+        /// hardcoded `None`.
         fn circuit_cooldown_until() -> impl Strategy<Value = Option<chrono::DateTime<chrono::Utc>>>
         {
-            prop_oneof![Just(None), Just(Some(t(5))), Just(Some(t(15)))]
+            prop_oneof![
+                Just(None),
+                Just(Some(t(-5))),
+                Just(Some(t(5))),
+                Just(Some(t(15))),
+            ]
         }
 
         // proptest implements `Strategy` for tuples only up to a bounded

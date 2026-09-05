@@ -13745,6 +13745,17 @@ pub(crate) async fn build_diagnosis_report(
     // by dispatch), so consulting it here cannot perturb enforcement. A
     // cooled-down breaker therefore still reads "open" until a real probe is
     // admitted — a deliberate, documented read-only conservatism.
+    // Issue #1193 Codex round-5 P2: `time_until_probe_secs` on the snapshot
+    // below is a duration measured from THIS instant, not from `now` (which
+    // was captured well before the DB queries above ran). Combining that
+    // duration with the stale, earlier `now` when deriving `cooldown_until`
+    // would systematically UNDERESTIMATE the true deadline by however long
+    // those queries took -- enough, near the boundary, to make a row that
+    // hasn't actually cleared read as if it had. `snapshot_wall_now` is
+    // captured back-to-back with the monotonic instant so the two are always
+    // consistent with each other, and is what `circuit_cooldown_until` below
+    // is derived from -- never the outer `now`.
+    let snapshot_wall_now = chrono::Utc::now();
     let (cb_phase, cb_tracked): (
         std::collections::HashMap<String, autumn_harvest::circuit_breaker::CircuitSnapshot>,
         Vec<String>,
@@ -13945,7 +13956,10 @@ pub(crate) async fn build_diagnosis_report(
                     Some(BlockingCircuitPhase::Open),
                     snapshot
                         .and_then(|s| s.time_until_probe_secs)
-                        .and_then(|secs| circuit_cooldown_until(now, secs)),
+                        // `snapshot_wall_now`, NOT the outer `now` -- see the
+                        // comment where it's captured (issue #1193 Codex
+                        // round-5 P2).
+                        .and_then(|secs| circuit_cooldown_until(snapshot_wall_now, secs)),
                 ),
                 Some("half_open") => (Some(BlockingCircuitPhase::HalfOpen), None),
                 _ => (None, None),

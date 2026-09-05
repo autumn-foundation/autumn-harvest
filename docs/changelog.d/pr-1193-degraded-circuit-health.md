@@ -129,6 +129,37 @@ nuance in the same organic-open branch:
   hardcoded `None`, so it could never have caught a bug in this exact
   branch).
 
+**Codex round-5 findings on PR #1365, both confirmed and fixed.** Two
+refinements of the round-4 fix, in the same spirit:
+
+- **P2 — the round-4 comparison only covered not-yet-due rows.** It gated on
+  `scheduled_at > now`, so it never applied to a row that is ALREADY due. But
+  a read-only breaker snapshot deliberately keeps reporting `open` with a
+  *past* `cooldown_until` until some dispatch actually admits the probe (a
+  pre-existing, documented conservatism) — so an already-due row whose
+  cooldown has already elapsed is exactly as probe-ready as a not-yet-due one
+  whose cooldown will clear before it's due, and reporting `degraded` for it
+  is the same overclaim. Fixed by comparing against the *effective dispatch
+  instant* — `max(now, scheduled_at)`, which is simply `now` for an
+  already-due row — instead of `scheduled_at` alone. An already-due,
+  otherwise-unimpeded row now correctly falls all the way through to
+  `healthy_in_progress`, exactly as it would with no breaker in the way.
+- **P2 — the deadline itself could be computed from inconsistent clocks.**
+  `build_diagnosis_report` captured its wall-clock `now` before running the
+  gathering queries, then derived `cooldown_until` from that stale `now` plus
+  a remaining-duration read from a *fresh* monotonic snapshot taken after
+  those queries — silently combining two different instants. That
+  systematically UNDERESTIMATES the true deadline by however long the
+  queries took, which is exactly the direction that makes the round-4/5
+  comparison wrongly conclude a row is safe when it is not. Fixed by
+  capturing a wall-clock timestamp back-to-back with the breaker snapshot
+  read itself and deriving `cooldown_until` from that, never from the
+  earlier `now`.
+
+Both are pure refinements of the same organic-cooldown reasoning introduced in
+round 4; neither changes the forced-open or half-open paths, which have no
+cooldown to compare against in the first place.
+
 No new `WorkflowEvent` variant, no migration, no change to
 `CircuitBreakerRegistry`'s own logic (only what the plugin reads off its
 existing `CircuitSnapshot`) — read-path label semantics only, exactly as
@@ -163,4 +194,12 @@ override is scoped to `Degraded` alone and does not touch the pre-existing
 (the `>=` boundary), `organic_open_still_wins_when_cooldown_has_not_cleared_by_due_time`
 (the converse — still `degraded` when the fast-fail is real), and
 `forced_open_circuit_wins_regardless_of_how_far_in_the_future_the_task_is`
-(proving forced-open is untouched).
+(proving forced-open is untouched). The round-5 effective-dispatch-instant
+fix is pinned by `organic_open_falls_through_when_already_due_and_cooldown_already_cleared`
+and its converse `organic_open_still_wins_when_already_due_but_cooldown_has_not_cleared`;
+the property-test generator was extended with a past-relative-to-`now`
+cooldown option so the drift-detection sweep actually exercises this shape
+too. The clock-consistency fix has no pure-function surface to unit-test (the
+skew lived entirely in `api.rs`'s two separate `now` captures), so it is
+covered by reasoning plus the existing integration suite continuing to pass
+against a real registry and database.
