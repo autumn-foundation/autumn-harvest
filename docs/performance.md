@@ -45,10 +45,16 @@ this page says nothing about what they cost; see
   cost is a function of how deep your queue is, not how much work you dispatch.
   **This is the single biggest lever on this page** — bigger than any individual
   predicate, and it dominates the per-gate table below.
-* **The cause is structural, not incidental.** The claim query's `ORDER BY`
-  leads with a non-indexable `CASE` expression, so `idx_harvest_tq_poll` cannot
-  serve the ordering. Postgres sequentially scans and sorts every eligible
-  pending row on every single claim. See [the plan](#the-plan) below.
+* **The cause is structural, not incidental — and it is not only the `CASE`
+  key.** The claim query's `ORDER BY` leads with a non-indexable `CASE`
+  expression, so `idx_harvest_tq_poll` cannot serve the ordering, and Postgres
+  sequentially scans and sorts every eligible pending row on every single
+  claim. See [the plan](#the-plan) below.
+  **Fixing that key would not be sufficient on its own**: issue #1177 shows
+  any single one of the query's other residual `WHERE` predicates
+  independently defeats sort-elision and `LIMIT` pushdown too, even at zero
+  selectivity. See
+  [any residual predicate defeats sort-elision](#any-residual-predicate-defeats-sort-elision-issue-1177).
 * **Only one predicate is genuinely expensive: per-key concurrency (+644% p50).**
   Build-id routing (+13%), the rate-limit gate (+2%) and the circuit-breaker
   tracked set (+4%) are cheap or free.
@@ -460,6 +466,17 @@ Three things to read here:
    scheduled_at` cannot rescue it. So every claim reads and sorts all eligible
    pending rows to return one. That is the superlinear scaling in the table
    above.
+
+   > **Follow-up (issue #1177):** the `CASE` key is *sufficient* to force this
+   > plan shape, but it is not *necessary* — removing it would not restore
+   > sort-elision, because any one of the query's other residual `WHERE`
+   > predicates independently forces the same collapsed shape (a full-backlog
+   > scan plus `Sort`), including several that are total no-ops at 100%
+   > selectivity. See
+   > [any residual predicate defeats sort-elision](#any-residual-predicate-defeats-sort-elision-issue-1177)
+   > below. Point 1 above remains accurate as far as it goes; it is incomplete
+   > as an explanation of the superlinear scaling, since dropping the `CASE`
+   > alone would not fix it.
 2. **`actual rows=10000` feeding a `Limit 1`.** The plan materialises and sorts
    ten thousand rows in order to return a single task. That ratio — not the
    absolute time — is the shape of the problem, and it is why doubling the
@@ -502,6 +519,185 @@ actually use the feature.
 is left byte-for-byte unchanged; measuring it and tuning it are separate pieces
 of work, and tuning without a published baseline is how you get an unfalsifiable
 "optimisation". This page is the baseline.
+
+## Any residual predicate defeats sort-elision (issue #1177)
+
+[The plan](#the-plan) above shows the sticky-routing `CASE` expression
+defeating `idx_harvest_tq_poll`'s ability to serve the `ORDER BY`. Read on its
+own, that finding invites a natural next step: drop the `CASE` (or index the
+sticky columns) and the ordering falls back to `priority DESC, scheduled_at` —
+exactly `idx_harvest_tq_poll`'s key — so the cheap plan should return.
+
+**It does not.** Issue #1177 reproduces that, with the `CASE` removed entirely
+from `ORDER BY` (leaving only `priority DESC, scheduled_at` — an exact match
+for `idx_harvest_tq_poll`'s key) and **no planner hints in play**, adding
+**any single one** of the query's other residual `WHERE` predicates —
+including several with **zero actual selectivity** (100% of rows pass the
+filter) — is already enough on its own for the planner to choose a
+full-backlog scan (`Seq Scan` for most predicates tested, `Bitmap Heap Scan`
+for a few) plus a `Sort`, instead of the ordered index scan. This holds with
+and without `FOR UPDATE SKIP LOCKED`.
+
+Ten predicates were tested independently against a 255 020-row fixture
+(119 940 PENDING rows in the `default` queue), each added alone to the base
+`queue_name = ANY($1) AND state = 'PENDING' AND scheduled_at <= NOW()` query
+with `ORDER BY priority DESC, scheduled_at ASC LIMIT 1`: the sticky/session
+OR-chains (#235, #606), the queue-pause anti-join (#619), the
+`required_build_id` `EXISTS` (#171), the PAUSED-workflow `NOT EXISTS` (#383),
+both capability-label predicates (#382), the `rate_limit_key` `EXISTS`
+(#332/#699), the `schedule_to_close_at` check (#378), and the concurrency-key
+gate (#247). **All ten** independently reproduce the collapse — even the
+ones that are total no-ops in the fixture (`Rows Removed by Filter: 0`).
+That figure is the *actual*, execution-time row count, not the planner's
+pre-execution selectivity *estimate*; by itself it doesn't prove the
+estimate was accurate, so it doesn't on its own rule out a selectivity
+misestimate. What does rule that out is the separate diagnostic below: it
+shows the sort-elision candidate isn't rejected on a cost comparison at all
+— it is never generated as a candidate in the first place, regardless of
+what any selectivity estimate says.
+
+**A separate, narrower diagnostic goes further, for the sticky-routing
+predicate specifically, under `FOR UPDATE SKIP LOCKED`.** With the competing
+`idx_harvest_tq_coverage_sample` index hidden and `enable_seqscan=off;
+enable_bitmapscan=off` set (session-local, inside a rolled-back transaction)
+to bias the planner away from those plan types — these are cost penalties,
+not a hard directive, which is exactly why the natural, unhinted
+ten-predicate results above still show `Seq Scan`/`Bitmap Heap Scan` for most
+rows rather than being universally overridden — Postgres does walk a
+**serial** `Index Scan` on `idx_harvest_tq_poll` for the sticky predicate
+(not a parallel one here, so there is no `Gather`/`Gather Merge` question to
+resolve for this specific plan), already producing rows in the required
+order. But it still inserts a `Sort` node on top and materialises every
+matching row before applying `LIMIT 1` — genuinely redundant, since a serial
+scan over an index whose key already matches the `ORDER BY` needs no further
+sorting.
+
+Two separate, compounding effects are at work, not one:
+
+1. **In this reproduction, every residual `Filter` tested defeats
+   sort-elision and `LIMIT` pushdown**, independent of `FOR UPDATE` — shown
+   directly by the forced-index diagnostic above for the sticky predicate,
+   and consistent with (though not independently re-run as the same
+   diagnostic for) the other nine predicates' natural-planner results. For
+   the sticky predicate, the sort-elision/limit-pushdown candidate plan is
+   not generated at all once its residual `Filter` sits on the scan; this is
+   not a cost-based choice of a worse plan over a better one the planner
+   considered.
+
+   **This is not a general Postgres rule, and this page does not claim it is
+   one.** `idx_harvest_tq_coverage_sample`'s own migration
+   (`20260718000000_harvest_queue_coverage_sample_index/up.sql`) documents
+   the opposite case in this same codebase: `sample_execution_ids`'s
+   `workflow_exec_id IS NOT NULL` filter is not itself index-satisfied, is
+   evaluated per candidate row during the same ordered walk, and the scan
+   *does* still stop early at `LIMIT 5` without a `Sort` node — for every
+   queue except a pathological one. Whatever distinguishes
+   `claim_task_query()`'s tested predicates from that case — `SubPlan`-bearing
+   filters (`EXISTS`, `jsonb_array_elements`) versus a plain scalar NULL
+   check, or something else — is not established here. What issue #1177
+   establishes is narrower and still load-bearing: for the specific query and
+   predicates tested, sort-elision does not survive adding any one of them;
+   that is demonstrably not a `CASE`-key-specific problem, but it is not
+   shown to be a universal one either. With or without the `CASE` key, this
+   alone makes every claim O(backlog) in this fixture.
+2. **`FOR UPDATE SKIP LOCKED` additionally disables the bounded Top-N sort**
+   once (1) has already forced a `Sort` node to exist for the locked variant.
+   Without `FOR UPDATE`, the same sticky-predicate diagnostic restores a
+   bounded Top-N heapsort (in-memory, no disk spill) — it still scans the
+   full eligible set to get there, but stays in memory, whereas the locked
+   variant's sort is unbounded and spills to disk past a few hundred
+   thousand rows (`Sort Method: external merge Disk: 5640-7057kB` in the
+   #1177 fixture). This unlocked comparison uses a **parallel**
+   `Parallel Index Scan using idx_harvest_tq_poll`, per the issue's own
+   excerpt, rather than the serial scan in (1); the excerpt doesn't show
+   whether a `Gather` or `Gather Merge` sits above it, so — unlike the locked
+   case — this page does not claim that unlocked sort is redundant, only that
+   it stays bounded and in-memory rather than spilling to disk. The
+   bounded-versus-unbounded/disk-spill contrast holds regardless of that
+   ambiguity, since both figures come from the same measured `EXPLAIN`
+   output.
+
+A semantically-identical rewrite — the ordered scan wrapped in a subquery,
+with the residual filter applied as an outer `WHERE` — does not help either,
+for the same sticky-predicate case; the planner flattens it back into the
+identical collapsed shape. This is not a syntax-sensitivity quirk with a
+free rewrite.
+
+**This reproduction is issue #1177's own**, cited here rather than
+independently re-run for this page. Unlike
+[the queue-pause anti-join fix](#the-queue-pause-anti-join-fix) and
+[the concurrency-key gate fix](#the-concurrency-key-gate-fix), it has not
+(yet) been folded into `claim_bench_support.rs`'s scenario harness or given
+a `docs/perf-artifacts/` capture of its own — doing so is future work, not a
+blocker for correcting the attribution here. One predicate needs its own
+caveat: the concurrency-key row above was captured against the correlated
+`COUNT(*)` shape that predated
+[the concurrency-key gate fix](#the-concurrency-key-gate-fix) below, which
+has since replaced it with a CTE-backed lookup. That specific predicate's
+contribution to the collapse has not been independently re-tested against
+the current query; the other nine are unaffected by that fix and remain as
+implemented today.
+
+**Multiple queues: partially controlled for, not fully.**
+`idx_harvest_tq_poll` leads with `queue_name`; for `queue_name = ANY($1)`
+over several values, its output is grouped by queue rather than necessarily
+a single global `priority`/`scheduled_at` order, and merging those groups
+can itself require a `Sort` — independent of any residual predicate. Issue
+#1177's own baseline (the identical `queue_name = ANY($1)` binding, no added
+predicate — "each added alone to the base query") already functions as a
+same-array no-residual control: it shows `Index Scan using
+idx_harvest_tq_poll`, **no `Sort` node at all**, whatever `$1` held in that
+reproduction. That rules out multi-queue ordering as the explanation for the
+ten-predicate collapse *in that fixture specifically* — the `Sort` those ten
+scenarios needed is absent from the zero-predicate baseline run against the
+identical binding. What remains unconfirmed: issue #1177's own text does not
+say how many queue names `$1` actually held (its fixture description
+mentions rows seeded into a single `default` queue, which would make this a
+non-issue for that reproduction specifically), and this page's own
+attribution-table scenarios default `Scenario.queues` to 4 (see
+[known limitations](#known-limitations)) — a separate harness this
+reproduction was not run against. Whether the ten-predicate finding
+transfers to a genuinely multi-queue bind has not been checked here.
+
+**What this means for the query as it stands today:** there is no realistic
+deployment shape that gets the cheap index-ordered plan back, because
+`claim_task_query()` always carries at least the `schedule_to_close_at`
+check, the sticky/session OR-chains, and the queue-pause anti-join
+unconditionally — dropping just the `CASE` key would not be sufficient, and
+no single index can make the `sticky`/`session`/`schedule_to_close` scalar
+checks, the concurrency-key gate, three different `EXISTS` subqueries
+against three different tables, and the `jsonb_array_elements` capability
+walk simultaneously sargable against one ordered index.
+
+**This page does not propose a query change for it.** Per the same
+measure-before-tune discipline issue #786 established, a genuine fix here
+looks architectural — e.g. a seek-and-refine restructuring (claim an ordered
+batch of candidate ids, apply the residual filters and `FOR UPDATE SKIP
+LOCKED` to the small batch, retry on an empty batch) — and that changes
+claim-fairness/latency guarantees under contention in ways that need
+checking against this hot path's documented advisory-lock-ordering,
+exactly-once-claim, and `SKIP LOCKED`-concurrency-safety invariants by
+someone with full context on `queue.rs`. It is out of scope for this page and
+is not decided here; it is tracked separately as issue #1340.
+
+This also corrects, without fully resolving, the
+[known limitations](#known-limitations) bullet that called `schedule_to_close`
+(#378), worker sessions (#606) and sticky routing (#235) "cheap inline column
+tests": reproduced here, each independently defeats sort-elision regardless
+of the value it is tested against, so "cheap" was never an established
+finding — it was this page's own retracted reading of their *plan-eligibility*
+effect. Their marginal *cost* on the attribution table above is a different
+question and remains unmeasured: in the full production query the `CASE` key
+and the always-present queue-pause/`schedule_to_close`-adjacent predicates
+already force the same collapsed plan shape regardless of these three, so
+their own incremental contribution can't be isolated this way — that would
+still need the seed-variant scenario work [known limitations](#known-limitations)
+already calls for.
+
+**Zero engine impact.** Like issue #786 and every fix on this page, this
+finding changes nothing about `claim_task_query()`: no new `WorkflowEvent`
+variant, no migration, no schema change, no public API change, and the claim
+query is byte-for-byte unchanged. This page is the measurement, not the fix.
 
 ## The queue-pause anti-join fix
 
@@ -1174,7 +1370,19 @@ from the benchmark are directly comparable.
     the correlated anti-join with a one-time prefilter — see
     [the queue-pause anti-join fix](#the-queue-pause-anti-join-fix).
   * **`schedule_to_close` (#378), worker sessions (#606), sticky routing
-    (#235)** — cheap inline column tests, against columns the seed leaves null.
+    (#235)** — their cost on the attribution table above is still unmeasured;
+    that remains scenario work, same as before. What issue #1177 adds is a
+    different kind of evidence, not a cost figure: in isolation, each
+    independently defeats sort-elision and `LIMIT` pushdown regardless of the
+    value it is tested against, reproducing the same collapsed plan shape
+    this page's own headline finding describes. See
+    [any residual predicate defeats sort-elision](#any-residual-predicate-defeats-sort-elision-issue-1177).
+    In the full production query the `CASE` key and the always-present
+    predicates already force that same collapse regardless of these three, so
+    their own marginal cost still can't be isolated this way. "cheap inline
+    column tests" was this page's own now-retracted reading of their
+    *plan-eligibility* effect, not a corrected *cost* measurement — replacing
+    one unsupported cost claim with another would be no improvement.
 
   Adding these is scenario work, not query work: each needs a seed variant and a
   report row, on a bench that already runs 15-30 minutes.
@@ -1217,6 +1425,8 @@ from the benchmark are directly comparable.
   (`timeout::enforce_workflow_history_ceiling`, issue #493) fixed a
   correlated `harvest_events` event-count subquery that was evaluated twice
   per RUNNING execution on every timeout-scanner tick.
+* Issue #1177 — reproduction and full `EXPLAIN` captures for
+  [any residual predicate defeats sort-elision](#any-residual-predicate-defeats-sort-elision-issue-1177).
 
 ### Other profiling notes
 
