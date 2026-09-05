@@ -316,3 +316,19 @@ The first draft of the rule then failed the project's own adversarial sweep:
 lines such as `break this module owns the sweep;`. Narrowed to a single-token
 operand (`return Err(error);` yes, `return the caller decide, since ...;` no).
 The sweep is now 399 prose lines with 0 false positives.
+
+**Ninth Codex round (PR #1380): two more P2 findings, both oversights of mine.**
+
+- *`can't` was never matched.* CH006's stem list built `can` + `n't` =
+  "cann't". The most common English contraction went unreported in **93
+  corpus comments**. Fixed to the `ca` stem; the corpus count moves 333 → 426.
+- *Distinct block comments merged into one run.* The previous round's `group`
+  id was only used to *prevent* a split, never to cause one, so
+  `/* ```rust */` followed by `/* TODO: issue required */` stayed one run and
+  the first comment's unclosed fence suppressed the second.
+
+Worth recording what the `can't` fix demonstrated about the baseline design:
+correcting a rule mid-review widened it by 93 findings across the corpus and
+produced **zero** Tier B regressions, because the merge base is re-scanned
+with the same corrected code. A stored baseline would have reported all 93 as
+newly introduced and blocked the fix that found them.

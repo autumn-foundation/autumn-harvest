@@ -253,7 +253,7 @@ ARCHAEOLOGY_RE = re.compile(
 # Real contractions only. Excludes the possessive/abbreviation apostrophe this
 # corpus uses ("TTL'd overrides", "the row's bytes"), which STE permits.
 CONTRACTION_RE = re.compile(
-    r"\b(?:can|is|are|was|were|do|does|did|would|could|should|will|has|have|had"
+    r"\b(?:ca|is|are|was|were|do|does|did|would|could|should|will|has|have|had"
     r"|must|ai|wo|sha|need|ought|might)n't\b"
     r"|\b(?:it|that|there|here|what|who|let|he|she|we|they|you|i|world)'"
     r"(?:s|ll|re|ve|d|m)\b",
@@ -566,6 +566,7 @@ def comment_runs(pieces: list[Piece]):
             piece.trailing
             or run[-1].trailing
             or piece.block != run[-1].block
+            or piece.group != run[-1].group
             or piece.marker != run[-1].marker
             or piece.line != prev_line + 1
         ):
@@ -1035,6 +1036,11 @@ RULE_TESTS = [
         "///    ```rust\n///    let x = compute();\n///    ```\n",
         set(),
         "three spaces still opens a fence",
+    ),
+    (
+        "/* ```rust */\n/* TODO: issue required */\n",
+        {("CH002", 2)},
+        "two distinct block comments are two runs",
     ),
     (
         "let x = 1; /* ```rust\nTODO: fixture placeholder\n``` */\n",
