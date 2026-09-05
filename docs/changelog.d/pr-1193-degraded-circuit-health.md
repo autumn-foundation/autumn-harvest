@@ -58,11 +58,25 @@ implementation discriminated forced-vs-organic purely on whether
   organic-open row over a genuinely-stuck forced-open row elsewhere in the
   same fan-out, purely by which happened to come first in the list — masking
   the actionable stall behind a self-healing one. Fixed by giving a
-  forced-open breaker its own precedence tier (6) strictly above the
-  organic/half-open tier (5, unchanged), with every rank above it shifted up
-  by one; `activity_precedence` and its allocation-free mirror
+  forced-open breaker its own precedence tier strictly above the
+  organic/half-open tier, with every rank above it shifted up accordingly;
+  `activity_precedence` and its allocation-free mirror
   `activity_precedence_for_facts` were both updated and re-verified against
   each other by the existing drift-detection property test.
+
+**Codex round-2 finding on PR #1365, also confirmed and fixed.** The round-1
+fix isolated forced-open but left organic-open and half-open sharing a tier —
+the identical failure mode one level down:
+
+- **P1 — organic-open and half-open still tied, and now differently
+  healthed.** Both used to be considered together at the shared precedence
+  tier; once `Degraded` (organic) diverged from `Healthy` (half-open), a
+  half-open row ordered first in a fan-out could win the fold and report the
+  whole execution `healthy` while a *different* activity's organically
+  tripped breaker was heading toward a terminal, non-retryable failure —
+  exactly the false-`healthy` scenario the whole feature exists to prevent.
+  Fixed by giving organic-open its own tier strictly between forced-open and
+  half-open (forced > organic > half-open), renumbering the ladder once more.
 
 No new `WorkflowEvent` variant, no migration, no change to
 `CircuitBreakerRegistry`'s own logic (only what the plugin reads off its
@@ -75,11 +89,15 @@ now including the organic-with-unrepresentable-cooldown case), adds
 `organic_open_with_unrepresentable_cooldown_is_still_degraded` and
 `half_open_forced_open_fact_is_ignored_for_half_open_phase` as direct P2
 regression pins, adds `forced_open_circuit_outranks_an_organic_one_in_the_same_fan_out`
-(asserted in both row orders) as the direct P1 regression pin, adds wire-string
-coverage for `ExecutionHealth::Degraded`, and pins the summary text (deadline
-stated, fast-fail named, no `force-close` for the organic case — including the
+and `organic_circuit_outranks_a_half_open_one_in_the_same_fan_out` (each
+asserted in both row orders) as the direct P1 regression pins for both
+rounds, extends `activity_precedence_ladder_is_strictly_ordered` to cover all
+three circuit shapes explicitly, adds wire-string coverage for
+`ExecutionHealth::Degraded`, and pins the summary text (deadline stated,
+fast-fail named, no `force-close` for the organic case — including the
 unrepresentable-cooldown shape — `force-close` kept for the forced case). The
-end-to-end `ac5_organically_tripped_circuit_reports_a_derived_cooldown_until`
-and `ac5_forced_open_circuit_reports_circuit_open_without_a_cooldown`
-integration tests now also assert the wire-level `forced_open` field against a
-real breaker registry and database.
+end-to-end `ac5_organically_tripped_circuit_reports_a_derived_cooldown_until`,
+`ac5_forced_open_circuit_reports_circuit_open_without_a_cooldown`, and
+`half_open_circuit_is_not_reported_as_operator_forced` integration tests now
+also assert the wire-level `forced_open` field against a real breaker
+registry and database.

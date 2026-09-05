@@ -46,15 +46,18 @@
 //!
 //! `queue_paused` > `activity_paused` > `no_worker` >
 //! `rate_limit_bucket_missing` > `circuit_open` (forced-open) >
-//! `circuit_open` (organic or half-open) > `concurrency_deferred` >
-//! `rate_limited` > `retrying` > healthy.
+//! `circuit_open` (organic) > `circuit_open` (half-open) >
+//! `concurrency_deferred` > `rate_limited` > `retrying` > healthy.
 //!
-//! A forced-open breaker deliberately outranks an organically-tripped one
-//! (issue #1193 Codex round-1 P1): the two used to share one health
-//! (`Stalled`), so a tie between them was inconsequential, but now that they
-//! diverge (`Stalled` vs `Degraded`) a tie could let the fold silently pick
-//! the self-healing one over a genuinely actionable stall elsewhere in the
-//! same fan-out purely by row order.
+//! The three circuit-open shapes are deliberately ranked by health severity
+//! rather than sharing one tier (issue #1193): a forced-open breaker
+//! outranks an organically-tripped one (Codex round-1 P1), which in turn
+//! outranks a half-open one (Codex round-2 P1). Each pair used to share a
+//! tier while also sharing a health value, so a tie was inconsequential —
+//! but once `Degraded` split `Stalled` from `Healthy` down the middle, a
+//! same-rank tie between two now-differently-healthed shapes could let the
+//! fold silently pick the milder one over a genuinely worse condition
+//! elsewhere in the same fan-out, purely by row order.
 //!
 //! In particular `no_worker` deliberately outranks `retrying`: a task in retry
 //! backoff on a queue with no live poller will **never** run, so reporting
@@ -736,29 +739,48 @@ pub struct DiagnosisInputs {
 #[must_use]
 pub const fn activity_precedence(blocked: &BlockedOn) -> u8 {
     match blocked {
-        BlockedOn::ActivityQueuePaused { .. } => 10,
+        BlockedOn::ActivityQueuePaused { .. } => 11,
         // The narrower operator hold. Ranked just under the queue pause because
         // that is the broader lever -- lifting this one alone still leaves a
         // queue-held row blocked -- and above everything below because an
         // operator's deliberate hold is what a triaging operator must see first.
-        BlockedOn::ActivityPaused { .. } => 9,
-        BlockedOn::ActivityNoWorker { .. } => 8,
+        BlockedOn::ActivityPaused { .. } => 10,
+        BlockedOn::ActivityNoWorker { .. } => 9,
         // Permanent, like the two above it: a bucket row that does not exist
         // never refills, so this outranks every self-healing gate below.
-        BlockedOn::ActivityRateLimitBucketMissing { .. } => 7,
-        // Issue #1193 Codex round-1 P1: a FORCED-open breaker must outrank an
-        // ORGANICALLY-tripped one in the same fan-out. Both used to map to the
-        // same `Stalled` health, so a tie here was inconsequential; now they
-        // diverge (`Stalled` vs `Degraded`), so `classify_execution`'s
-        // keep-the-first-max fold could otherwise pick an organic-open row
-        // over a genuinely-stuck forced-open row elsewhere in the same
-        // execution purely by which happened to come first, masking the
-        // actionable stall behind a self-healing one. `HalfOpen` shares the
-        // lower tier with the organic-open shape: it is even less severe
-        // (already `Healthy`), so it must never outrank a genuine stall either.
+        BlockedOn::ActivityRateLimitBucketMissing { .. } => 8,
+        // Issue #1193: the three observable circuit shapes are ranked by
+        // health severity, not lumped into one tier, because a same-rank tie
+        // between two DIFFERENT healths lets `classify_execution`'s
+        // keep-the-first-max fold silently pick the milder one purely by row
+        // order, masking a genuinely worse condition elsewhere in the fan-out.
+        //
+        // - FORCED-open (`Stalled`): a Codex round-1 P1 finding. It used to
+        //   share a tier with organic-open (both were `Stalled`), so the tie
+        //   was inconsequential; once they diverged (`Stalled` vs
+        //   `Degraded`) a tie could mask the genuine stall behind the
+        //   self-healing one.
+        // - ORGANIC-open (`Degraded`): a Codex round-2 P1 finding. It used to
+        //   share a tier with `HalfOpen` (both were, at the time, considered
+        //   together), and once `HalfOpen` stayed `Healthy` while organic-open
+        //   became `Degraded`, the same masking risk applied in the opposite
+        //   direction -- a `HalfOpen` row ordered first could report the
+        //   execution `healthy` while a DIFFERENT activity's organically
+        //   tripped breaker was heading toward a terminal, non-retryable
+        //   failure.
+        // - HALF-OPEN (`Healthy`): admits a probe right now and closes on
+        //   success, so it is the least severe of the three -- but still
+        //   ranked above the plainly-healthy self-healing gates below it,
+        //   preserving the pre-#1193 relative order between them (a purely
+        //   cosmetic tie, since every rank below this one is also `Healthy`).
         BlockedOn::ActivityCircuitOpen {
             phase: BlockingCircuitPhase::Open,
             forced_open: true,
+            ..
+        } => 7,
+        BlockedOn::ActivityCircuitOpen {
+            phase: BlockingCircuitPhase::Open,
+            forced_open: false,
             ..
         } => 6,
         BlockedOn::ActivityCircuitOpen { .. } => 5,
@@ -801,30 +823,36 @@ fn activity_precedence_for_facts(facts: &PendingActivityFacts, now: DateTime<Utc
         return if facts.claimant_is_live.unwrap_or(facts.has_live_worker) {
             0 // HealthyInProgress
         } else {
-            8 // ActivityNoWorker
+            9 // ActivityNoWorker
         };
     }
     if facts.queue_paused {
-        return 10; // ActivityQueuePaused
+        return 11; // ActivityQueuePaused
     }
     if facts.activity_paused && facts.activity_name.is_some() {
-        return 9; // ActivityPaused
+        return 10; // ActivityPaused
     }
     if !facts.has_live_worker {
-        return 8; // ActivityNoWorker
+        return 9; // ActivityNoWorker
     }
     if facts.rate_limit_bucket_missing && facts.rate_limit_key.is_some() {
-        return 7; // ActivityRateLimitBucketMissing
+        return 8; // ActivityRateLimitBucketMissing
     }
     if facts.circuit_phase.is_some() && facts.activity_name.is_some() {
-        // Issue #1193 Codex round-1 P1: a forced-open breaker must outrank an
-        // organically-tripped one, mirroring the split in `activity_precedence`.
-        return if facts.circuit_phase == Some(BlockingCircuitPhase::Open)
-            && facts.circuit_forced_open
-        {
-            6 // ActivityCircuitOpen (forced)
+        // Issue #1193: the three circuit shapes are ranked by health severity
+        // (forced > organic > half-open), mirroring `activity_precedence`, so
+        // a same-rank tie between two DIFFERENTLY-healthed shapes can never
+        // let the fold pick the milder one over a worse condition elsewhere
+        // in the fan-out (round-1 P1: forced vs organic; round-2 P1: organic
+        // vs half-open).
+        return if facts.circuit_phase == Some(BlockingCircuitPhase::Open) {
+            if facts.circuit_forced_open {
+                7 // ActivityCircuitOpen (forced)
+            } else {
+                6 // ActivityCircuitOpen (organic)
+            }
         } else {
-            5 // ActivityCircuitOpen (organic or half-open)
+            5 // ActivityCircuitOpen (half-open)
         };
     }
     if facts.scheduled_at > now {
@@ -3136,8 +3164,10 @@ mod tests {
                 queue: "q".into(),
                 activity_name: None,
             },
-            // Issue #1193 Codex round-1 P1: forced-open must outrank an
-            // organically-tripped (or half-open) breaker in the same tier.
+            // Issue #1193: the three circuit-open shapes are ranked by health
+            // severity (Codex round-1 P1: forced > organic; round-2 P1:
+            // organic > half-open), so no two differently-healthed shapes
+            // ever share a tier.
             BlockedOn::ActivityCircuitOpen {
                 activity_name: "a".into(),
                 cooldown_until: None,
@@ -3148,6 +3178,12 @@ mod tests {
                 activity_name: "a".into(),
                 cooldown_until: Some(t(30)),
                 phase: BlockingCircuitPhase::Open,
+                forced_open: false,
+            },
+            BlockedOn::ActivityCircuitOpen {
+                activity_name: "a".into(),
+                cooldown_until: None,
+                phase: BlockingCircuitPhase::HalfOpen,
                 forced_open: false,
             },
             BlockedOn::ActivityConcurrencyDeferred {
@@ -3452,6 +3488,57 @@ mod tests {
             "and must win when listed first too -- the ladder decides, not row order"
         );
         assert_eq!(forced_first.health(), ExecutionHealth::Stalled);
+    }
+
+    /// AC (issue #1193 Codex round-2 P1): the same masking risk, one tier
+    /// down. An organically-tripped breaker elsewhere in the same fan-out
+    /// must never be masked by a half-open one. Before this fix both shared
+    /// precedence 5, so a half-open row ordered first would win the fold and
+    /// report the execution `healthy` while a DIFFERENT activity's
+    /// organically-tripped breaker was heading toward a terminal,
+    /// non-retryable failure. Pinned in BOTH row orders.
+    #[test]
+    fn organic_circuit_outranks_a_half_open_one_in_the_same_fan_out() {
+        let mut half_open = healthy_activity();
+        half_open.activity_name = Some("half_open_activity".to_string());
+        half_open.circuit_phase = Some(BlockingCircuitPhase::HalfOpen);
+        half_open.circuit_cooldown_until = None;
+        half_open.circuit_forced_open = false;
+
+        let mut organic = healthy_activity();
+        organic.activity_name = Some("organic_activity".to_string());
+        organic.circuit_phase = Some(BlockingCircuitPhase::Open);
+        organic.circuit_cooldown_until = Some(t(30));
+        organic.circuit_forced_open = false;
+
+        let half_open_first =
+            classify_execution(&inputs_with(vec![half_open.clone(), organic.clone()]), t(0))
+                .expect("non-terminal");
+        assert_eq!(
+            half_open_first,
+            BlockedOn::ActivityCircuitOpen {
+                activity_name: "organic_activity".to_string(),
+                phase: BlockingCircuitPhase::Open,
+                forced_open: false,
+                cooldown_until: Some(t(30)),
+            },
+            "the organic-open row must win even when the half-open row is listed first"
+        );
+        assert_eq!(half_open_first.health(), ExecutionHealth::Degraded);
+
+        let organic_first =
+            classify_execution(&inputs_with(vec![organic, half_open]), t(0)).expect("non-terminal");
+        assert_eq!(
+            organic_first,
+            BlockedOn::ActivityCircuitOpen {
+                activity_name: "organic_activity".to_string(),
+                phase: BlockingCircuitPhase::Open,
+                forced_open: false,
+                cooldown_until: Some(t(30)),
+            },
+            "and must win when listed first too -- the ladder decides, not row order"
+        );
+        assert_eq!(organic_first.health(), ExecutionHealth::Degraded);
     }
 
     #[test]
