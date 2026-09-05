@@ -120,11 +120,20 @@ KNOWN LIMITATIONS:
   for a gate, so the split stays naive and CH007's baseline absorbs the
   difference.
 
-- CH001 recognizes commented-out Rust by line shape (a `let` binding, an
-  item header, a `use`, an attribute, a lone closing brace). A single
-  commented-out expression with no terminator -- `// foo(bar)` -- is not
-  matched, because that shape is indistinguishable from prose naming a
-  call, which this corpus does on thousands of lines.
+- CH001 is deliberately HIGH-PRECISION AND INCOMPLETE, and should stay
+  that way. It recognizes commented-out Rust by line shape: item headers,
+  `let`/`use`/assignment, attributes, closing braces, macro and call
+  statements, and block-opening control flow. It does not recognize an
+  expression with no terminator (`// foo(bar)`), because that shape is
+  indistinguishable from prose naming a call, which this corpus does on
+  thousands of lines.
+
+  The asymmetry is intentional. A false positive fails CI on ordinary
+  English, which is worse than missing one commented-out line, so every
+  branch is anchored and terminator-bearing and every widening is measured
+  against the corpus and the `--self-test` prose sweep first. Adding recall
+  by relaxing an anchor has produced a false positive every time it has
+  been tried here; add a new narrowly-anchored alternative instead.
 
 - CH005/CH006 match inside inline code spans (`` `like this` ``), so a
   literal that happens to contain "round-3" or an apostrophe-s would be
@@ -207,13 +216,20 @@ COMMENTED_CODE_RE = re.compile(
       | (?:pub(?:\([\w:]+\))?\s+)?(?:const|static)\s+(?:mut\s+)?\w+\s*:[^;=]+=.*[;{]\s*$
       | (?:pub(?:\([\w:]+\))?\s+)?type\s+\w+\s*(?:<[^<>]*>)?\s*=
             (?!\s*(?:\w+\s+){2,}\w+\s*;\s*$).*;\s*$
-      | impl(?:\s*<[^<>]*>)?\s+[\w:<>&'\s]+\{\s*$
+      | impl(?:\s*<[^<>]*>)?\s+
+            (?![^;{]*\b[a-z]+\s+[a-z]+\s+[a-z]+\s+[a-z]+\b)[\w:<>&'\s]+\{\s*$
       | let\s+(?:mut\s+)?\w+\s*(?::[^;=]+)?=
             (?!\s*(?:\w+\s+){2,}\w+\s*;\s*$)[^=].*;\s*$
       | use\s+(?:\w+::)*(?:\w+|\*|\{[\w:,\s*]+\})(?:\s+as\s+\w+)?;\s*$
       | \#!?\[[\w:()"'=,./\s-]+\]\s*$
       | \}[,;)]*\s*$
-      | (?:assert|assert_eq|assert_ne|panic|println|dbg|unreachable)!\(.*\)\s*;\s*$
+      | [\w:]+!\(.*\)\s*;\s*$                       # any macro statement
+      # Control flow opening a block. The lookahead rejects a condition made
+      # of four or more consecutive plain words, which is a sentence, not an
+      # expression: "if the queue is paused, the worker parks {".
+      | (?:if|while|for|match|loop|unsafe)\b
+            (?![^;{]*\b[a-z]+\s+[a-z]+\s+[a-z]+\s+[a-z]+\b)[^;]*\{\s*$
+      | [\w.\[\]:]+\s*=\s*[^\s;]+\s*;\s*$             # assignment, single-token RHS
       # A commented-out statement. Anchored hard: the call must open at the
       # very start, so prose that merely names a function ("call cleanup()
       # first") cannot reach it, and the line must end at the `;`. Measured
@@ -528,6 +544,9 @@ def rust_sources(paths: list[str] | None) -> list[str]:
     return sorted(found)
 
 
+INFO_BACKTICK_RE = re.compile(r"`")
+
+
 def fence_transition(
     fence: tuple[str, int] | None, match: "re.Match[str]", text: str
 ) -> tuple[str, int] | None:
@@ -540,8 +559,14 @@ def fence_transition(
     """
     delimiter = match.group(1)
     char, length = delimiter[0], len(delimiter)
+    info = text[match.end():]
     if fence is None:
-        # Opening. An info string ("```rust") is allowed here.
+        # Opening. An info string ("```rust") is allowed, but CommonMark
+        # forbids a backtick inside a BACKTICK fence's info string -- so
+        # "```foo`bar" is not a fence at all, and treating it as one opens a
+        # fence that never closes and suppresses the rest of the run.
+        if char == "`" and INFO_BACKTICK_RE.search(info):
+            return None
         return char, length
     open_char, open_length = fence
     closes = char == open_char and length >= open_length and not text[match.end():].strip()
@@ -1089,6 +1114,17 @@ CODE_SHAPE_TESTS = [
     ("});", True),
     ("#[derive(Debug)]", True),
     ("assert_eq!(a, b);", True),
+    ('anyhow::bail!("oops");', True),
+    ("if ready {", True),
+    ("for item in items {", True),
+    ("while let Some(x) = it.next() {", True),
+    ("match state {", True),
+    ("impl Foo {", True),
+    ("impl<T> Trait for Foo {", True),
+    ("value = compute();", True),
+    ("self.count = 0;", True),
+    ("if the queue is paused, the worker parks {", False),
+    ("impl the row has already been deleted by retention {", False),
     ("cleanup();", True),
     ("client.send(value).await?;", True),
     ("self.flush()?;", True),
@@ -1107,6 +1143,57 @@ CODE_SHAPE_TESTS = [
     ("struct directly; a malicious body must not flip it.", False),
     ("mod bar is documented in docs/architecture.md.", False),
 ]
+
+
+# The adversarial prose sweep. Every Rust keyword CH001 keys on, crossed with
+# the sentence shapes this corpus actually writes. None of these is code, so a
+# match is a false positive -- and a false positive on a Tier A rule fails CI
+# on ordinary English, which is worse than missing a defect.
+#
+# This exists because hand-editing CH001 produced a false positive in three
+# separate review rounds. Generating the cross-product catches them before a
+# reviewer does: it found six on one pass and four on another, each time in a
+# branch that looked correct in isolation.
+SWEEP_KEYWORDS = [
+    "fn", "struct", "enum", "trait", "union", "mod", "const", "static", "type",
+    "impl", "let", "use", "pub fn", "async fn", "if", "while", "for", "match",
+    "loop", "unsafe", "return", "break", "continue", "self", "ctx", "cleanup",
+    "value", "count",
+]
+SWEEP_TAILS = [
+    "{n} handles the retry path.",
+    "{n} is called by the wrapper.",
+    "{n} resolve_call(the caller name appears in diagnostics",
+    "{n} foo() returns a Resolution; see below.",
+    "{n} Foo {{ .. }} is the shape we persist.",
+    "{n} the caller decide, since the row may be gone;",
+    "{n} bar is documented in docs/architecture.md.",
+    "{n} Foo, which the macro expands to;",
+    "{n} x = the value the operator supplied;",
+    "{n} T: Send is required here;",
+    "{n} this module owns the sweep;",
+    "{n} `Foo` implements Display for the CLI.",
+    "{n} x = whatever the operator decided to configure;",
+    "{n} a::b is re-exported for callers;",
+    "{n} foo(the caller name appears, and so on,",
+    "{n} the row, the timer, and the task,",
+    "{n} cleanup() first, then retry;",
+    "{n} runs before the sweep completes;",
+    "{n} early, before the lock is taken;",
+    "{n} the queue is paused, the worker parks {{",
+    "{n} = the number of rows the sweep deleted;",
+    "{n} the row has already been deleted by retention {{",
+    "{n} we only ever see this on a cold start {{",
+]
+
+
+def prose_sweep() -> list[str]:
+    """Generated prose lines CH001 must never match."""
+    return [
+        tail.format(n=keyword)
+        for keyword in SWEEP_KEYWORDS
+        for tail in SWEEP_TAILS
+    ]
 
 
 def self_test() -> int:
@@ -1128,6 +1215,16 @@ def self_test() -> int:
     print(f"  [{'ok  ' if ok else 'FAIL'}] line number survives a continuation")
     if not ok:
         print(f"         expected line 3, got {[(p.line, p.text) for p in pieces]!r}")
+
+    sweep = prose_sweep()
+    sweep_fps = [line for line in sweep if COMMENTED_CODE_RE.match(line)]
+    failures += len(sweep_fps)
+    if sweep_fps:
+        print(f"  [FAIL] CH001 adversarial prose sweep: {len(sweep_fps)} false positive(s)")
+        for line in sweep_fps[:10]:
+            print(f"         {line!r}")
+    else:
+        print(f"  [ok  ] CH001 adversarial prose sweep ({len(sweep)} generated prose lines)")
 
     shape_failures = 0
     for line, want in CODE_SHAPE_TESTS:

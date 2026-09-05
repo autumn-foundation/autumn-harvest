@@ -332,3 +332,29 @@ correcting a rule mid-review widened it by 93 findings across the corpus and
 produced **zero** Tier B regressions, because the merge base is re-scanned
 with the same corrected code. A stored baseline would have reported all 93 as
 newly introduced and blocked the fix that found them.
+
+**Tenth Codex round (PR #1380): two P2 findings, plus the structural fix that
+should end this class.**
+
+- *More commented-out statements missed* — `// value = compute();`,
+  `// if ready {`, `// anyhow::bail!("oops");`. Three new alternatives (any
+  macro statement, block-opening control flow, single-token assignment), each
+  measured at **0 corpus hits** before being added.
+- *A backtick in a backtick fence's info string.* CommonMark forbids it, so
+  ` ```foo`bar ` is not a fence — but it opened one that never closed and
+  suppressed the rest of the run.
+
+**The adversarial prose sweep is now part of `--self-test`, so CI runs it.**
+Hand-editing CH001 produced a false positive in three separate review rounds;
+generating the keyword × sentence-shape cross-product catches them first. It
+did so again here: the first draft of the control-flow branch matched `if the
+queue is paused, the worker parks {`, and tightening that exposed the same
+latent flaw in the pre-existing `impl` branch. Both were fixed before pushing.
+644 generated prose lines, 0 false positives, checked on every CI run.
+
+CH001's contract is now written down in KNOWN LIMITATIONS: **deliberately
+high-precision and incomplete.** A false positive fails CI on ordinary
+English, which is worse than missing one commented-out line — so recall is
+added by new narrowly-anchored alternatives measured against the corpus and
+the sweep, never by relaxing an existing anchor, which has produced a false
+positive every time it has been tried.
