@@ -1390,7 +1390,7 @@ For long-running deployments, the event history table will be the largest table.
 
 ## 14. Configuration Schema
 
-Harvest configuration lives under the `[harvest]` section of `autumn.toml`, deserialized by `HarvestRuntimeConfig::load` (`autumn-harvest-plugin/src/config.rs`) in three layers, later layers overriding earlier ones: `autumn.toml`'s `[harvest]` table, then `autumn-{profile}.toml`'s `[harvest]` table (profile from `AUTUMN_PROFILE`), then environment-variable overrides (listed below). Every field is optional and falls back to a built-in default when omitted at every layer:
+Harvest configuration lives under the `[harvest]` section of `autumn.toml`, deserialized by `HarvestRuntimeConfig::load` (`autumn-harvest-plugin/src/config.rs`) in three layers, later layers overriding earlier ones: `autumn.toml`'s `[harvest]` table, then `autumn-{profile}.toml`'s `[harvest]` table, then environment-variable overrides (listed below). The profile itself is resolved in order: the `AUTUMN_PROFILE` env var, then a `--profile <NAME>`/`--profile=<NAME>` process argument, then `AUTUMN_IS_DEBUG` (`1` → `dev`, `0` → `prod`) — the first of those that's set wins; with none set, no profile file is loaded. Every field is optional and falls back to a built-in default when omitted at every layer:
 
 ```toml
 [harvest]

@@ -65,6 +65,7 @@ PROCESS_ARTIFACT_PREFIXES there). A hit inside a process-artifact subtree is
 reported but does not fail the run.
 """
 import argparse
+import importlib.util
 import json
 import re
 import sys
@@ -74,15 +75,21 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 CONFIG_RS = REPO_ROOT / "autumn-harvest-plugin/src/config.rs"
 CLI_RS = REPO_ROOT / "autumn-harvest-cli/src/lib.rs"
 
-# Same split as corpus-link-check.py — kept in sync by hand since the two
-# scripts have no shared module to import from without a packaging change.
-PROCESS_ARTIFACT_PREFIXES = (
-    "docs/plans/",
-    "docs/changelog.d/",
-    "docs/rnd/",
-    "docs/assays/",
-    "docs/perf-artifacts/",
+# `corpus-link-check.py` can't be `import`ed by its literal (hyphenated) name;
+# loaded by path instead so this script shares that one's process-artifact
+# reachability closure rather than re-implementing the prefix-only half of it
+# (Codex review, PR #1373: a prefix-only check disagrees with
+# corpus-link-check.py's convention for a reader-reachable page like
+# docs/rnd/determinism-static-analysis.md, which that script promotes into
+# the gated corpus and a prefix-only check would not).
+_link_check_spec = importlib.util.spec_from_file_location(
+    "corpus_link_check", Path(__file__).with_name("corpus-link-check.py")
 )
+_link_check = importlib.util.module_from_spec(_link_check_spec)
+_link_check_spec.loader.exec_module(_link_check)
+PROCESS_ARTIFACT_PREFIXES = _link_check.PROCESS_ARTIFACT_PREFIXES
+compute_corpus_reachable = _link_check.compute_corpus_reachable
+
 
 # CLI-level env vars declared directly on `Cli`/subcommand `#[arg(env = ...)]`
 # fields use a bare `HARVEST_*` prefix (no `AUTUMN_` — they're read by the
@@ -193,6 +200,18 @@ def extract_cli_ground_truth():
         env_m = ENV_NAME_RE.search(attr_body)
         if env_m:
             env_vars.add(env_m.group(1))
+
+    # clap's derive `Parser`/`Subcommand` adds `--help` and `--version` to
+    # every level of the command tree automatically — they're never
+    # `#[arg(...)]` fields, so the loop above can't see them. Real unless
+    # explicitly suppressed (`disable_help_flag`/`disable_version_flag` on a
+    # `#[command(...)]`, absent anywhere in this file — checked), and a
+    # fenced `$ harvest --help` example is exactly the kind of doc snippet
+    # this scanner should not flag (Codex review, PR #1373:
+    # `docs/shipped-work.md` already cites `harvest --help` in prose, and
+    # the CLI's own `the_real_binary_*` integration tests invoke it for real).
+    flags.add("help")
+    flags.add("version")
 
     return flags, env_vars
 
@@ -367,11 +386,15 @@ def main():
 
     files = sorted(REPO_ROOT.glob("docs/**/*.md"))
 
-    def rel(p: Path) -> str:
-        return p.relative_to(REPO_ROOT).as_posix()
+    # Same corpus/process-artifact split corpus-link-check.py uses (a
+    # process-artifact page IS still graded corpus if a real corpus page
+    # actually links to it) — computed over that script's full file set
+    # (docs/**/*.md plus top-level sources like README.md, which participate
+    # as link SOURCES even though this script never scans them for drift).
+    reachable = compute_corpus_reachable(_link_check.corpus_files())
 
     def is_process_artifact(p: Path) -> bool:
-        return rel(p).startswith(PROCESS_ARTIFACT_PREFIXES)
+        return p not in reachable
 
     corpus_hits = []
     process_hits = []
