@@ -675,3 +675,38 @@ identical to round eighteen's.
 One round-eighteen fixture was wrong and is corrected here. It asserted that
 an unindented line after a list-item fence stays fenced; it does not, and the
 container fix above is what exposed it.
+
+### Round twenty — columns everywhere, a container stack, and tuple let-else
+
+Three findings, all verified to reproduce first. Two are follow-ons to the
+previous round's fixes, in the two places the fix did not reach.
+
+**Indentation was compared in characters again.** `list_content` learned to
+count columns last round; `leaves_container` did not, so a tab-indented fence
+body read as one column against a four-column container and the fence was
+judged to have ended. That reports an example's own sample `TODO` as CH002 —
+a false positive on an absolute gate, the opposite failure from the one the
+container fix was for. `leading_columns` is now the single place indentation
+becomes a number, and both callers use it.
+
+**A dedent out of a nested list item reset the container to zero.** After
+`- outer` and `  - inner`, a line back at the outer item's content column
+dropped the container from 4 to 0, so a fence opened there was recorded as
+top-level and outlived the list entirely. The container is a stack now, popped
+to the nearest surviving item rather than emptied:
+
+```
+- outer               -> [2]
+  - inner             -> [2, 4]
+  ~~~rust             -> [2]      (was 0)
+TODO: issue required  -> []
+```
+
+**Tuple and slice let-else still bypassed CH001.** The destructuring branch
+added last round required a terminating semicolon, so `let (Some(a), Some(b))
+= pair else {` and `let [first, ..] = slice else {` were missed while the
+capitalised-pattern branch beside it already accepted `else {`. Both branches
+take the same terminator now.
+
+Corpus effect: none. All three were latent, and the finding set is identical
+to round nineteen's.

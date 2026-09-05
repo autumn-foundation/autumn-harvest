@@ -231,7 +231,7 @@ COMMENTED_CODE_RE = re.compile(
       # pattern behind a Capitalised path -- all terminated, and none of them
       # a shape English produces. The plain `\w+` form above misses every one.
       | let\s+(?:mut\s+)?[(\[][\w\s,.:&*'()\[\]{}]*[)\]]\s*(?::[^;=]+)?
-            =\s*[^=;]+;\s*$
+            =\s*[^=;]+(?:;|\s+else\s*\{)\s*$
       | let\s+(?:[\w]+::)*[A-Z]\w*\s*(?:\([^;]*\)|\{[^;]*\})\s*=\s*[^=;]+
             (?:;|\s+else\s*\{)\s*$
       | use\s+(?:\w+::)*(?:\w+|\*|\{[\w:,\s*]+\})(?:\s+as\s+\w+)?;\s*$
@@ -676,6 +676,15 @@ def quote_depth(text: str) -> int:
     return match.group(0).count(">") if match else 0
 
 
+def leading_columns(text: str) -> int:
+    """The visual column `text`'s content starts at.
+
+    Columns, not characters: a tab is up to four columns, so every
+    indentation comparison here has to expand before comparing.
+    """
+    return len(text[: len(text) - len(text.lstrip())].expandtabs(4))
+
+
 def leaves_container(text: str, scope: tuple[int, int]) -> bool:
     """Has `text` dedented out of the container an open fence started in?
 
@@ -690,23 +699,28 @@ def leaves_container(text: str, scope: tuple[int, int]) -> bool:
     body = strip_quote(text)
     if not body.strip():
         return False
-    return len(body) - len(body.lstrip()) < container
+    return leading_columns(body) < container
 
 
-def container_indent_after(text: str, current: int) -> int:
-    """The content indent of the innermost open list item, after `text`.
+def update_containers(text: str, stack: list[int]) -> list[int]:
+    """The open list-container columns after `text`, innermost last.
 
-    A list marker opens a container whose content starts past the marker, so a
-    fence inside it is indented that far and is still a fence. A non-blank
-    line that dedents below the container closes it.
+    A stack, not one column. A line that dedents out of a nested item lands
+    back in its PARENT, and collapsing to zero there records any fence opened
+    on it as top-level -- so the fence outlives the list and swallows every
+    later comment. Popping to the nearest surviving container keeps the
+    nesting the document actually has.
     """
-    text = strip_quote(text)
-    content = list_content(text, current)
+    body = strip_quote(text)
+    stack = list(stack)
+    if body.strip():
+        indent = leading_columns(body)
+        while stack and stack[-1] > indent:
+            stack.pop()
+    content = list_content(body, stack[-1] if stack else 0)
     if content:
-        return content[0]
-    if text.strip() and len(text) - len(text.lstrip()) < current:
-        return 0
-    return current
+        stack.append(content[0])
+    return stack
 
 
 def fence_delimiter(text: str, container: int) -> tuple["re.Match[str]", str] | None:
@@ -802,13 +816,14 @@ def comment_lines(pieces: list[Piece]):
     for run in comment_runs(pieces):
         fence: tuple[str, int] | None = None
         scope = (0, 0)
-        container = 0
+        stack: list[int] = []
         for piece in run:
             text = piece.text
             if fence is not None and leaves_container(text, scope):
                 fence = None
             if fence is None:
-                container = container_indent_after(text, container)
+                stack = update_containers(text, stack)
+            container = stack[-1] if stack else 0
             delimiter = fence_delimiter(text, container)
             if delimiter:
                 before = fence
@@ -893,7 +908,7 @@ def prose_units(pieces: list[Piece]) -> list[tuple[int, str]]:
         run_lines: list[int] = []
         fence: tuple[str, int] | None = None
         scope = (0, 0)
-        container = 0
+        stack: list[int] = []
         in_list = False
 
         def flush():
@@ -915,7 +930,8 @@ def prose_units(pieces: list[Piece]) -> list[tuple[int, str]]:
             if fence is not None and leaves_container(body, scope):
                 fence = None
             if fence is None:
-                container = container_indent_after(body, container)
+                stack = update_containers(body, stack)
+            container = stack[-1] if stack else 0
             delimiter = fence_delimiter(body, container)
             if delimiter:
                 before = fence
@@ -1460,6 +1476,23 @@ RULE_TESTS = [
         "a blank line does not end the list item a fence sits in",
     ),
     (
+        "/// -   ~~~rust\n/// \tTODO: fixture placeholder\n/// \t~~~\n",
+        set(),
+        "a tab indenting a fence body is measured in columns, not characters",
+    ),
+    (
+        "/// - outer\n///   - inner\n///   ~~~rust\n///   let x = 1;\n"
+        "/// TODO: issue required\n",
+        {("CH002", 5)},
+        "leaving a nested list item lands in its parent, not at top level",
+    ),
+    (
+        "/// - outer\n///   - inner\n///     ~~~rust\n///     TODO: fixture\n"
+        "///     ~~~\n",
+        set(),
+        "a fence inside a nested list item is still a fence",
+    ),
+    (
         "/// -    ```rust\n///      TODO: fixture placeholder\n///      ```\n",
         set(),
         "four spaces after a list marker is still valid padding",
@@ -1548,6 +1581,8 @@ CODE_SHAPE_TESTS = [
     ("let crate::Foo { x } = v;", True),
     ("let Some(v) = opt else {", True),
     ("let Ok(row) = fetch() else {", True),
+    ("let (Some(a), Some(b)) = pair else {", True),
+    ("let [first, ..] = slice else {", True),
     ("let the caller decide;", False),
     ("let (or rather, allow) the worker retry;", False),
     ("let us assume the queue is paused;", False),
