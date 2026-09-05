@@ -710,3 +710,37 @@ take the same terminator now.
 
 Corpus effect: none. All three were latent, and the finding set is identical
 to round nineteen's.
+
+### Round twenty-one — the container stack learns quote depth and paragraphs
+
+Two findings, both in the stack added last round, both verified to reproduce
+first.
+
+**A list container outlived the block quote it opened in.** A stack entry was
+a bare column, so `/// > - quoted item` left a container at column 2 standing
+after the quote ended. A later four-space top-level line then measured as a
+fence against a list that is no longer open, and suppressed the `TODO` below
+it. Entries now carry their quote depth and are dropped when the line's depth
+falls below it.
+
+**A marker that cannot interrupt a paragraph still opened a container.**
+`interrupts_paragraph` was applied to sentence splitting and not to the
+container stack, so `2.` partway through a list item's paragraph pushed a
+synthetic nested container. A valid fence then recorded against the fake
+column, and the example's own body appeared to dedent out of it — CH002 on
+fenced sample text.
+
+The rule needs paragraph state, and the subtle part is when to clear it: any
+pop clears it, because dedenting out of an item ends the paragraph inside it.
+That is what keeps `2.` on the line after `1.` opening its own item while `2.`
+inside an item's paragraph does not:
+
+```
+1. first                     -> [(3, 0)]   pops, so "2." may interrupt
+2. second                    -> [(3, 0)]
+- outer paragraph            -> [(2, 0)]
+  2. still the same          -> [(2, 0)]   no pop, so "2." may not
+```
+
+Corpus effect: none. Both were latent, and the finding set is identical to
+round twenty's.

@@ -702,25 +702,45 @@ def leaves_container(text: str, scope: tuple[int, int]) -> bool:
     return leading_columns(body) < container
 
 
-def update_containers(text: str, stack: list[int]) -> list[int]:
-    """The open list-container columns after `text`, innermost last.
+def update_containers(
+    text: str, stack: list[tuple[int, int]], paragraph: bool
+) -> tuple[list[tuple[int, int]], bool]:
+    """The open list containers after `text`, innermost last, and whether a
+    paragraph is still open.
 
-    A stack, not one column. A line that dedents out of a nested item lands
-    back in its PARENT, and collapsing to zero there records any fence opened
-    on it as top-level -- so the fence outlives the list and swallows every
-    later comment. Popping to the nearest surviving container keeps the
-    nesting the document actually has.
+    Each entry is (content column, quote depth). A stack, not one column: a
+    line that dedents out of a nested item lands back in its PARENT, and
+    collapsing to zero there records any fence opened on it as top-level, so
+    the fence outlives the list and swallows every later comment.
+
+    The depth is what ends a quoted list. A list opened inside "> " does not
+    survive the quote, and a stale container makes an over-indented top-level
+    line look like a fence relative to a list that is no longer open.
+
+    `paragraph` applies CommonMark's interruption rule to the marker itself,
+    not just to sentence splitting: "2." partway through an item's paragraph
+    continues that paragraph and does not open a nested list. Any pop clears
+    it -- dedenting out of an item ends the paragraph inside it, which is why
+    "2." on the line after "1." still starts an item rather than continuing
+    one. Simplified in one way: any non-blank line opens a paragraph, so a
+    table or heading does not close one here.
     """
+    depth = quote_depth(text)
     body = strip_quote(text)
-    stack = list(stack)
+    popped = len(stack)
+    stack = [entry for entry in stack if entry[1] <= depth]
     if body.strip():
         indent = leading_columns(body)
-        while stack and stack[-1] > indent:
+        while stack and stack[-1][0] > indent:
             stack.pop()
-    content = list_content(body, stack[-1] if stack else 0)
-    if content:
-        stack.append(content[0])
-    return stack
+    if len(stack) < popped:
+        paragraph = False
+
+    marker = LIST_MARKER_RE.match(body)
+    content = list_content(body, stack[-1][0] if stack else 0)
+    if content and (not paragraph or interrupts_paragraph(marker)):
+        stack.append((content[0], depth))
+    return stack, bool(body.strip())
 
 
 def fence_delimiter(text: str, container: int) -> tuple["re.Match[str]", str] | None:
@@ -816,14 +836,15 @@ def comment_lines(pieces: list[Piece]):
     for run in comment_runs(pieces):
         fence: tuple[str, int] | None = None
         scope = (0, 0)
-        stack: list[int] = []
+        stack: list[tuple[int, int]] = []
+        paragraph = False
         for piece in run:
             text = piece.text
             if fence is not None and leaves_container(text, scope):
                 fence = None
             if fence is None:
-                stack = update_containers(text, stack)
-            container = stack[-1] if stack else 0
+                stack, paragraph = update_containers(text, stack, paragraph)
+            container = stack[-1][0] if stack else 0
             delimiter = fence_delimiter(text, container)
             if delimiter:
                 before = fence
@@ -908,7 +929,8 @@ def prose_units(pieces: list[Piece]) -> list[tuple[int, str]]:
         run_lines: list[int] = []
         fence: tuple[str, int] | None = None
         scope = (0, 0)
-        stack: list[int] = []
+        stack: list[tuple[int, int]] = []
+        paragraph = False
         in_list = False
 
         def flush():
@@ -930,8 +952,8 @@ def prose_units(pieces: list[Piece]) -> list[tuple[int, str]]:
             if fence is not None and leaves_container(body, scope):
                 fence = None
             if fence is None:
-                stack = update_containers(body, stack)
-            container = stack[-1] if stack else 0
+                stack, paragraph = update_containers(body, stack, paragraph)
+            container = stack[-1][0] if stack else 0
             delimiter = fence_delimiter(body, container)
             if delimiter:
                 before = fence
@@ -1491,6 +1513,23 @@ RULE_TESTS = [
         "///     ~~~\n",
         set(),
         "a fence inside a nested list item is still a fence",
+    ),
+    (
+        "/// > - quoted item\n///\n///     ~~~rust\n/// TODO: issue required\n",
+        {("CH002", 4)},
+        "a list container does not outlive the block quote it opened in",
+    ),
+    (
+        "/// - outer paragraph\n///   2. still the same paragraph\n"
+        "///      ~~~rust\n///   TODO: fixture placeholder\n///      ~~~\n",
+        set(),
+        "a mid-paragraph \"2.\" does not open a nested container",
+    ),
+    (
+        "/// 1. first item\n/// 2. second item\n///    ~~~rust\n"
+        "///    TODO: fixture placeholder\n///    ~~~\n",
+        set(),
+        "but \"2.\" after \"1.\" still opens its own item",
     ),
     (
         "/// -    ```rust\n///      TODO: fixture placeholder\n///      ```\n",
