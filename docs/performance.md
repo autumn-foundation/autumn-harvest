@@ -1453,6 +1453,11 @@ standalone note rather than part of the claim-path attribution table above:
 * [`docs/performance-stall-diagnosis.md`](performance-stall-diagnosis.md) — an
   allocation-free ranking pass over `GET /api/harvest/workflows/{id}/diagnose`
   (issue #809).
+* [`docs/performance-diagnose-latency.md`](performance-diagnose-latency.md) —
+  end-to-end wall-clock latency of that same endpoint against a real
+  Postgres, confirming issue #809's published `p95 < 500 ms` claim with a
+  measured number across fan-out width, fleet size, and the replay path
+  (issue #1194).
 * [`docs/performance-workflow-children-traversal.md`](performance-workflow-children-traversal.md)
   — batching the N+1 in `GET /workflows/{id}/children?depth=N` (issue #786-adjacent).
 * [`docs/performance-schedule-overdue-aux.md`](performance-schedule-overdue-aux.md)

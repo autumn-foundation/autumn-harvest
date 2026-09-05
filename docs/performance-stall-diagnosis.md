@@ -1,5 +1,11 @@
 # Stall diagnosis: allocation-free ranking pass over pending activities
 
+> **Looking for end-to-end latency numbers?** This page measures CPU
+> instructions/allocations for the pure `classify_execution` classifier in
+> isolation. [`docs/performance-diagnose-latency.md`](performance-diagnose-latency.md)
+> measures whole-handler wall-clock latency against a real Postgres,
+> confirming issue #809's published `p95 < 500 ms` claim (issue #1194).
+
 This note documents a profiling pass over
 `stall_diagnosis::classify_execution` — the pure root-cause classifier
 behind `GET /api/harvest/workflows/{id}/diagnose` (issue #809) — and a
