@@ -62,3 +62,34 @@ headings are excluded (a naive scan mistook ~670 doc-example lines for
 commented-out code), `CH003` and `CH007` are evaluated per sentence rather
 than per wrapped line, and non-contiguous comment blocks separated by code
 are no longer merged into one prose unit.
+
+**Codex review follow-up (PR #1380).** Two P2 findings, both verified real
+against the corpus and both fixed by replacing the line-regex comment matcher
+with a real Rust lexer (`extract_comments`):
+
+- *Exclude string contents.* A `//` line inside a raw string was being read as
+  a comment. Confirmed on 10 live sites — `det_check_tests.rs` fixtures embed
+  `// harvest-suppress: DET001 ...`, and `chaos_catalogue_drift.rs:200` carries
+  a literal commented-out call as test data. None trip a rule today, but Tier A
+  gates at zero, so one new fixture of that shape would have blocked an
+  innocent PR.
+- *Inspect trailing and block comments.* The old matcher was anchored to the
+  start of a line, so `let n = 1; // TODO: fix` and `/* TODO: fix */` were
+  invisible — every gated defect class could be introduced through either form
+  with CI green. 897 comment pieces were out of scope; they are now covered.
+
+The lexer handles nested block comments, raw strings of any hash count,
+byte/C-string prefixes, escapes, and the lifetime-vs-char-literal ambiguity.
+Writing it surfaced a third defect of my own: a backslash-newline continuation
+inside a string (used throughout the long SQL and `#[error(...)]` strings) was
+consuming the newline without counting it, drifting every subsequent line
+number — `error.rs` was off by 11 by line 700. Fixed and pinned; all 175,892
+comment pieces now report a line number that really contains them.
+
+`--self-test` pins 14 lexer fixtures and CI runs it before the scan, so a
+silent regression in comment-finding fails loudly instead of quietly ceasing
+to gate. Tier A remained at zero under the widened coverage. The Tier B
+baseline was regenerated for the rule-definition change (+2 CH006, +10 CH007,
+all in newly visible trailing and block comments). The gate was re-verified
+through the new paths: CH001/CH002 via a trailing comment, CH002/CH003 via a
+block comment, each exit 1, while a raw-string fixture correctly exits 0.

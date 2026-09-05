@@ -30,6 +30,17 @@ Counts may fall freely. Regenerate the baseline
 lowering a count or when a rule's definition changes — never to absorb a
 new violation.
 
+**It reads every comment, via a lexer.** Leading and trailing `//`,
+`///`, `//!` and `/* */` (nested and doc forms included) all count — a
+defect introduced as `let n = 1; // TODO: fix` is gated exactly like one
+on its own line. Text inside a string is not a comment, which matters in
+both directions: this corpus embeds Rust and SQL snippets in raw strings
+(`det_check_tests.rs` fixtures carry `// harvest-suppress:` lines,
+`chaos_catalogue_drift.rs` carries a literal commented-out call as test
+data), and flagging one would fail CI on an innocent fixture. Run
+`python3 docs/audits/comment-hygiene.py --self-test` to check the lexer
+against the forms it must get right; CI runs it before the scan.
+
 **It does not cap comment length, and must not start.** The long rationale
 blocks in this tree are load-bearing: the ABBA lock-ordering argument at
 `materialize_due_child_timeout_deadlines`, the `cohort`-key argument in

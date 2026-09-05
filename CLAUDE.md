@@ -36,6 +36,11 @@ several sentences; do not delete the argument to hit a word count. The
 harness enforces exactly that distinction: it measures per sentence and
 has no cap on block length.
 
+Every comment is checked, leading or trailing, `//` or `/* */`. A defect
+written as `let n = 1; // TODO: fix` is gated exactly like one on its own
+line. Text inside a string is not a comment, so a fixture that embeds
+Rust source is safe.
+
 Four defects fail the build outright and are at zero — commented-out code,
 a TODO/FIXME with no `#<issue>`, a narrative aside ("actually, let's ..."),
 and a blank `//` line at a block edge. Three more are frozen at their
