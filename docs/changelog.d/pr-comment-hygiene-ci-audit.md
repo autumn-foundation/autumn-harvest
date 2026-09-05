@@ -1118,3 +1118,34 @@ in one place and unexamined in the next — is now the most productive one in
 this review.
 
 Corpus effect: none, for the sixteenth round running.
+
+### Round thirty-five — the same three fixes, one pattern to the left
+
+Three findings, all verified to reproduce first, and each is the neighbour of
+something fixed in the previous two rounds.
+
+**A container marker exempted an unreferenced TODO.** Round thirty peeled
+containers before CH001 for exactly this reason and stopped there; CH002's
+unpunctuated form is anchored the same way, four lines down, and saw the
+bullet instead of the `TODO`. It uses the same peel now. A TODO carrying an
+issue reference is still clean, and a fenced one is still exempt — the fence
+remains the only exemption.
+
+**A single pipe is not a table row.** Round thirty-four took pipe lines out of
+*container* state and left them ending a prose unit, on the reasoning that a
+table row is not a sentence. True of a row; `| foo` mid-paragraph is just a
+word. `TABLE_RE` requires a second pipe now, so a sentence carries on across
+it and a long one is reported.
+
+**A Setext underline may be hyphens.** Round thirty-four's fix accepted only
+`=`. `---` happened to work because it is also a thematic break, but `--` is
+neither three characters nor recognised, so a hyphen-underlined heading left
+its paragraph open.
+
+All three are shape (iv) from the running list — a rule fixed in one place and
+unexamined in the adjacent one — and two of the three are neighbours of my own
+fix from the round before. The list of shapes is in the check-in notes; this
+round is the clearest evidence yet that it is worth consulting before pushing
+rather than after being told.
+
+Corpus effect: none, for the seventeenth round running.

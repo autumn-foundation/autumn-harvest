@@ -335,7 +335,10 @@ LIST_MARKER_RE = re.compile(r"^([ \t]*)((?:[-*+]|\d{1,9}[.)]))([ \t]+|$)")
 # quotes back. So the exception is ">=" and nothing else.
 BLOCKQUOTE_RE = re.compile(r"^([ \t]*)((?:>(?!=)[ \t]?)+)")
 ONE_QUOTE_RE = re.compile(r"^([ \t]*)>(?!=)[ \t]?")
-TABLE_RE = re.compile(r"^\s*\|")
+# A GFM table ROW, not merely a line that opens with a pipe. One pipe is
+# ordinary prose -- "| foo" wraps a sentence like any other word -- and
+# flushing there drops the rest of the sentence out of the unit.
+TABLE_RE = re.compile(r"^\s*\|.*\|")
 HEADING_RE = re.compile(r"^\s*#{1,6}(?:\s|$)")
 # A thematic break -- one punctuation character repeated. CommonMark spells it
 # "---"; this tree also draws section rules with box-drawing characters. Either
@@ -354,7 +357,7 @@ THEMATIC_BREAK_RE = re.compile("^([ \t]*)([-_*])(?:[ \t]*\\2){2,}[ \t]*$")
 # heading. Whether a run of "=" is a heading or ordinary text is decided by
 # POSITION, not shape -- with a paragraph open it underlines one, and at the
 # start of a block it is the decorative rule round thirty-three fixed.
-SETEXT_RE = re.compile("^[ \t]{0,3}=+[ \t]*$")
+SETEXT_RE = re.compile("^[ \t]{0,3}(?:=+|-+)[ \t]*$")
 SENTENCE_SPLIT_RE = re.compile(r"(?<=[.!?])\s+")
 
 
@@ -1128,7 +1131,10 @@ def check_line_rules(path: str, pieces: list[Piece]) -> list[Finding]:
         if COMMENTED_CODE_RE.match(code_line):
             findings.append(Finding("CH001", path, lineno, stripped))
 
-        todo = TODO_RE.search(stripped)
+        # CH002 is anchored at the start of the line for its unpunctuated
+        # form, so it needs the same peel CH001 does: "- TODO fix this" is a
+        # commitment with a bullet in front of it, and only a FENCE exempts.
+        todo = TODO_RE.search(code_line)
         if todo and not TODO_REF_RE.search(stripped):
             findings.append(Finding("CH002", path, lineno, stripped))
 
@@ -1932,6 +1938,27 @@ RULE_TESTS = [
         "/// - a bullet of ordinary prose\n/// - the worker parks;\n",
         set(),
         "but ordinary bulleted prose stays clean",
+    ),
+    (
+        "/// - TODO fix this\n",
+        {("CH002", 1)},
+        "nor does a bullet exempt an unreferenced TODO",
+    ),
+    (
+        "/// > TODO fix this\n",
+        {("CH002", 1)},
+        "nor a quote",
+    ),
+    (
+        "/// word1 word2 word3 word4 word5 word6 word7 word8 word9 word10 word11 word12 word13 word14 word15 word16 word17 word18 word19 word20\n/// | w1 w2 w3 w4 w5 w6 w7 w8 w9 w10.\n",
+        {("CH007", 1)},
+        "one pipe is prose, so the sentence carries on across it",
+    ),
+    (
+        "/// Heading\n/// --\n/// 22. item\n///     ~~~rust\n"
+        "///     TODO: fixture placeholder\n///     ~~~\n",
+        set(),
+        "a Setext underline may be hyphens",
     ),
     (
         "/// Intro\n/// -\n///     ~~~rust\n///   TODO: issue required\n",
