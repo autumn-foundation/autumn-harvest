@@ -461,3 +461,24 @@ review to find them. Two live bugs, both fixed here:
 `_APOS` now lives above the Tier A patterns and is shared by both rules that
 need it, and the self-test pins the marker-case and apostrophe axes directly
 rather than only pinning content.
+
+**Fourteenth Codex round (PR #1380): two P2 findings.**
+
+- *Macros take any delimiter.* The macro-statement branch hard-coded `(...)`,
+  so `// vec![1, 2];` and `// my_macro!{ a: 1 };` were missed. Now matches
+  bracket and brace forms too, while `see vec![1, 2] for the shape;` stays
+  clean because the anchor still requires the macro to open the line.
+- *A Tier B failure did not say what to fix.* This one is a usability defect
+  rather than a correctness one, and it mattered more than its severity
+  suggests. The output named the rule, the file and the totals —
+  `worker.rs: 1 new finding(s), 30 total vs 29 at the merge base` — and never
+  the line. In a file carrying 30 legacy findings a contributor had to bisect
+  by hand to discover which comment they had added. A gate that fails without
+  telling you what to fix is one people learn to route around.
+
+Findings are now indexed by fingerprint, so a regression prints its location:
+
+```
+CH006 autumn-harvest/src/worker.rs: 1 new finding(s), 30 total vs 29 at the merge base
+    autumn-harvest/src/worker.rs:36855: This one isn't compliant.
+```

@@ -230,7 +230,7 @@ COMMENTED_CODE_RE = re.compile(
       | use\s+(?:\w+::)*(?:\w+|\*|\{[\w:,\s*]+\})(?:\s+as\s+\w+)?;\s*$
       | \#!?\[[\w:()"'=,./\s-]+\]\s*$
       | \}[,;)]*\s*$
-      | [\w:]+!\(.*\)\s*;\s*$                       # any macro statement
+      | [\w:]+!(?:\(.*\)|\[.*\]|\{.*\})\s*;\s*$        # macro stmt, any delimiter
       # Control flow opening a block. The lookahead rejects a condition made
       # of four or more consecutive plain words, which is a sentence, not an
       # expression: "if the queue is paused, the worker parks {".
@@ -917,11 +917,26 @@ def diff_context(base_ref: str) -> tuple[str, set[str], dict[str, str]] | None:
     return merge_base, changed, renames
 
 
+def index_findings(findings: list[Finding]) -> dict:
+    """(rule, path) -> {fingerprint: [Finding]}, so a regression can be located.
+
+    A count tells a contributor that something moved; it does not tell them
+    what to fix. In a file carrying 30 legacy findings, "30 total vs 29" means
+    bisecting by hand. Keeping the Finding objects lets the failure name the
+    line.
+    """
+    index: dict = defaultdict(lambda: defaultdict(list))
+    for f in findings:
+        index[(f.rule, f.path)][f.fingerprint].append(f)
+    return index
+
+
 def compare_tier_b(
     current: dict,
     baseline: dict,
     scope: set[str] | None = None,
     renames: dict[str, str] | None = None,
+    index: dict | None = None,
 ) -> list[str]:
     """Regressions only: a count that rose, or a file newly in violation.
 
@@ -945,12 +960,19 @@ def compare_tier_b(
             allowed = Counter(was.get(path) or was.get(renames.get(path, path), []))
             added = Counter(now[path]) - allowed
             total = sum(added.values())
-            if total:
-                regressions.append(
-                    f"{rule} {path}: {total} new finding(s), "
-                    f"{len(now[path])} total vs {sum(allowed.values())} at the merge base "
-                    f"[{RULE_TITLES[rule]}]"
-                )
+            if not total:
+                continue
+            regressions.append(
+                f"{rule} {path}: {total} new finding(s), "
+                f"{len(now[path])} total vs {sum(allowed.values())} at the merge base "
+                f"[{RULE_TITLES[rule]}]"
+            )
+            # Name the actual lines. Without this the contributor is told a
+            # count moved and left to find which comment did it.
+            located = (index or {}).get((rule, path), {})
+            for fingerprint, count in sorted(added.items()):
+                for finding in located.get(fingerprint, [])[:count]:
+                    regressions.append(f"    {path}:{finding.line}: {finding.text[:100]}")
     return regressions
 
 
@@ -999,14 +1021,17 @@ def report(
             f"{in_scope} in changed files ({allowed} at the merge base)"
         )
 
-    regressions = compare_tier_b(current, baseline, scope, renames)
+    regressions = compare_tier_b(current, baseline, scope, renames, index_findings(findings))
     if regressions:
         failed = True
-        print(f"\n{len(regressions)} Tier B regression(s) -- these files gained violations:")
+        # Indented entries are located lines under a summary, not extra
+        # regressions.
+        count = sum(1 for line in regressions if not line.startswith(" "))
+        print(f"\n{count} Tier B regression(s) -- these files gained violations:")
         for line in regressions[:40]:
             print(f"    {line}")
         if len(regressions) > 40:
-            print(f"    ... and {len(regressions) - 40} more")
+            print(f"    ... and {len(regressions) - 40} more line(s)")
         print(
             "\n  New and edited comments must satisfy the rule. Fix the flagged\n"
             "  lines rather than regenerating the baseline -- the baseline exists\n"
@@ -1195,6 +1220,9 @@ CODE_SHAPE_TESTS = [
     ("retries -= 1;", True),
     ("flags |= READY;", True),
     ("bits <<= 2;", True),
+    ("vec![1, 2];", True),
+    ("my_macro!{ a: 1 };", True),
+    ("see vec![1, 2] for the shape;", False),
     ("if the queue is paused, the worker parks {", False),
     ("impl the row has already been deleted by retention {", False),
     ("cleanup();", True),
@@ -1430,7 +1458,7 @@ def main() -> int:
 
     if args.json:
         current = tally(findings)
-        regressions = compare_tier_b(current, baseline, scope, renames)
+        regressions = compare_tier_b(current, baseline, scope, renames, index_findings(findings))
         print(
             json.dumps(
                 {
