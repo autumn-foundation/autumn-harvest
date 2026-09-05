@@ -234,6 +234,17 @@ async fn usage_report_activity_lookback_index_does_not_change_the_result_set() {
         to: chrono::Utc::now(),
     };
 
+    // On a database HARVEST_TEST_DATABASE_URL points at post-migration
+    // (setup_test_database_url_or_env treats it as already-migrated), the
+    // candidate index already exists here, making the CREATE INDEX below a
+    // no-op -- both `before` and `after` would then run the SAME (with-index)
+    // plan, defeating the comparison this test claims to make (Codex review,
+    // PR #1381). Drop it unconditionally first, matching the evidence-capture
+    // test's own fix for the identical problem.
+    conn.batch_execute("DROP INDEX IF EXISTS idx_harvest_events_activity_started_lookup")
+        .await
+        .expect("drop candidate index for a clean before-baseline");
+
     let before = load_usage_grouped(&mut conn, SHARD_ID, &query, 100)
         .await
         .expect("query before index");
