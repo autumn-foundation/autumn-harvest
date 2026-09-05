@@ -1178,3 +1178,27 @@ the rule down did not make it operate. It is a helper now, next to
 `thematic_break`, which is the form the other four eventually took.
 
 Corpus effect: none, for the eighteenth round running.
+
+### Round thirty-seven — the same two lessons, applied where they had not been
+
+Two findings, both verified to reproduce first, and both instances of patterns
+this file already had names for.
+
+**A block quote did not end the paragraph for container state.** Round
+twenty-four taught the *prose* path that a quote is its own block and flushes
+the unit; the container path never learned it, so a `22.` after a quoted line
+was refused a container and the fence beneath it reported its own sample text.
+Shape (iv) — fixed in one path, unexamined in the other.
+
+**A table delimiter row is a marker.** Round thirty-six added `table_delimiter`
+and stripped the line before judging it, so an over-indented delimiter made a
+table out of the paragraph above and dropped its sentence. Sixth instance of
+the container-relative rule, in the helper added one round earlier.
+
+The delimiter check also moved out of the up-front `table_rows` pass and into
+the loop, because that is the only place the container in force is known. The
+table state is now one flag carried across lines rather than a precomputed set
+— which is also how every other block in this file is tracked, so it should
+have been written that way to begin with.
+
+Corpus effect: none, for the nineteenth round running.

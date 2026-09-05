@@ -338,31 +338,17 @@ ONE_QUOTE_RE = re.compile(r"^([ \t]*)>(?!=)[ \t]?")
 # A GFM table ROW, not merely a line that opens with a pipe. One pipe is
 # ordinary prose -- "| foo" wraps a sentence like any other word -- and
 # flushing there drops the rest of the sentence out of the unit.
-def table_delimiter(text: str) -> bool:
-    """Is `text` a GFM table's delimiter row -- "|---|:--:|" and its kin?"""
+def table_delimiter(text: str, container: int) -> bool:
+    """Is `text` a GFM table's delimiter row -- "|---|:--:|" and its kin?
+
+    Three columns past the container, like every marker here. Stripping the
+    line before judging it loses that, and an over-indented delimiter then
+    turns the paragraph above it into a table and drops the sentence.
+    """
+    if leading_columns(text) > container + 3:
+        return False
     stripped = text.strip()
     return "|" in stripped and "-" in stripped and not stripped.strip(" \t|-:")
-
-
-def table_rows(block: list) -> set:
-    """Indexes of the pieces in `block` that belong to a GFM table.
-
-    A pipe is not a table, however many of them a line has. A table is a
-    header row with a DELIMITER row under it, and only then the rows that
-    follow. Guessing from pipe count drops a wrapped sentence that happens to
-    contain one out of the prose it belongs to, and the long sentence it is
-    part of then goes unreported.
-    """
-    rows: set = set()
-    texts = [strip_quote(piece.text).strip() for piece in block]
-    for index, text in enumerate(texts):
-        if not table_delimiter(text) or index == 0 or "|" not in texts[index - 1]:
-            continue
-        rows.add(index - 1)
-        while index < len(texts) and "|" in texts[index]:
-            rows.add(index)
-            index += 1
-    return rows
 
 HEADING_RE = re.compile(r"^\s*#{1,6}(?:\s|$)")
 # A thematic break -- one punctuation character repeated. CommonMark spells it
@@ -872,7 +858,7 @@ def leaves_container(text: str, scope: tuple[int, int]) -> bool:
 
 
 def update_containers(
-    text: str, stack: list[tuple[int, int]], paragraph: bool
+    text: str, stack: list[tuple[int, int]], paragraph: bool, quoted: int = 0
 ) -> tuple[list[tuple[int, int]], bool]:
     """The open list containers after `text`, innermost last, and whether a
     paragraph is still open.
@@ -899,6 +885,12 @@ def update_containers(
     enclosing = stack[-1][0] if stack else 0
     depth = quote_depth(text, enclosing)
     body = strip_quote(text, enclosing)
+    # A block quote is its own block, so crossing into or out of one ends the
+    # paragraph -- the prose path has done this since round twenty-four and
+    # the container path never did, so a "22." after a quote was refused the
+    # container the rendered document gives it.
+    if depth != quoted:
+        paragraph = False
     popped = len(stack)
     stack = [entry for entry in stack if entry[1] <= depth]
     if body.strip():
@@ -1104,6 +1096,7 @@ def comment_lines(pieces: list[Piece]):
         scope = (0, 0, 0)
         stack: list[tuple[int, int]] = []
         paragraph = False
+        quoted = 0
         saved: list = []
         nest = run[0].nest
         for piece in run:
@@ -1116,7 +1109,8 @@ def comment_lines(pieces: list[Piece]):
             if fence is not None and leaves_container(text, scope):
                 fence = None
             if fence is None:
-                stack, paragraph = update_containers(text, stack, paragraph)
+                stack, paragraph = update_containers(text, stack, paragraph, quoted)
+                quoted = quote_depth(text, stack[-1][0] if stack else 0)
             container = stack[-1][0] if stack else 0
             delimiter = fence_delimiter(text, container, fence is not None, scope[2], stack)
             if delimiter:
@@ -1248,7 +1242,7 @@ def prose_units(pieces: list[Piece]) -> list[tuple[int, str]]:
                 units.append((run_lines[0], " ".join(run), spans))
             run, run_lines = [], []
 
-        tables = table_rows(block)
+        in_table = False
         for index, piece in enumerate(block):
             if piece.nest != nest:
                 flush()
@@ -1264,7 +1258,7 @@ def prose_units(pieces: list[Piece]) -> list[tuple[int, str]]:
             if fence is not None and leaves_container(body, scope):
                 fence = None
             if fence is None:
-                stack, paragraph = update_containers(body, stack, paragraph)
+                stack, paragraph = update_containers(body, stack, paragraph, quoted)
             container = stack[-1][0] if stack else 0
             delimiter = fence_delimiter(body, container, fence is not None, scope[2], stack)
             if delimiter:
@@ -1299,7 +1293,7 @@ def prose_units(pieces: list[Piece]) -> list[tuple[int, str]]:
                 and bool(run)
                 and body.strip()
                 and not LIST_MARKER_RE.match(peeled)
-                and index not in tables
+                and "|" not in peeled
                 and not HEADING_RE.match(peeled)
                 and not SEPARATOR_RE.match(peeled)
                 and not FENCE_RE.match(peeled)
@@ -1311,8 +1305,19 @@ def prose_units(pieces: list[Piece]) -> list[tuple[int, str]]:
             # Structure is read past the container markers, and so is the
             # prose: a container marker is not a word of the sentence.
             body = strip_quote(body, container)
+            # A table is a header row with a DELIMITER row under it, and then
+            # the rows that follow -- decided here rather than up front,
+            # because the delimiter's indent is measured against whatever
+            # container is open at that point.
+            has_pipe = "|" in body
+            if not has_pipe:
+                in_table = False
+            elif not in_table and index + 1 < len(block):
+                in_table = table_delimiter(
+                    strip_quote(block[index + 1].text, container), container
+                )
             if (
-                index in tables
+                (has_pipe and in_table)
                 or HEADING_RE.match(body)
                 or SEPARATOR_RE.match(body)
                 or not body.strip()
@@ -2010,6 +2015,17 @@ RULE_TESTS = [
         "///         ~~~\n",
         set(),
         "a Setext underline is measured against its list container",
+    ),
+    (
+        "/// Intro\n/// > Quote\n/// 22. item\n///     ~~~rust\n"
+        "///     TODO: fixture placeholder\n///     ~~~\n",
+        set(),
+        "a block quote ends the paragraph for containers, not only for prose",
+    ),
+    (
+        "/// word1 word2 word3 word4 word5 word6 word7 word8 word9 word10 word11 word12 word13 word14 word15 word16 word17 word18 word19 word20 word21 word22 word23 word24 word25 | tail\n///     --- | ---\n",
+        {("CH007", 1)},
+        "an over-indented delimiter row does not make a table",
     ),
     (
         "/// Intro\n/// -\n///     ~~~rust\n///   TODO: issue required\n",
