@@ -1463,6 +1463,9 @@ standalone note rather than part of the claim-path attribution table above:
 * [`docs/performance-schedule-overdue-aux.md`](performance-schedule-overdue-aux.md)
   — the same N+1 shape in `GET /admin/schedules`'s overdue-aux computation
   (issue #696).
+* [`docs/performance-usage-report-activity-lookback.md`](performance-usage-report-activity-lookback.md)
+  — indexing the activity-attempt lookback LATERAL join in `GET /admin/usage`
+  (issue #596), the one CTE the 2026-07 usage-report-indexes migration missed.
 * [`docs/performance-quota-history-bytes.md`](performance-quota-history-bytes.md)
   — measuring the `history_bytes` admission check's cost claim (issue #946
   AC7); partially inaccurate claim, no fix identified.
