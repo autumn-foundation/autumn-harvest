@@ -196,6 +196,17 @@ CREATE TABLE IF NOT EXISTS harvest_signals (
     received_at  INTEGER NOT NULL DEFAULT 0   -- absolute epoch-millisecond the signal arrived
 );
 
+-- Codex review (PR #1374): every exec-scoped query against this table
+-- (`peek_pending_signal`, and `delete_undelivered_signals_for_execution`'s
+-- `TerminateIfRunning` cleanup) filtered on `exec_id`/`delivered` with no index
+-- but the `signal_seq` primary key, so each one scanned the whole table —
+-- unlike `harvest_timers`, whose `(exec_id, timer_id)` PRIMARY KEY already
+-- covers this. Delivered rows are kept forever (no retention pass), so the
+-- table only grows; `CREATE INDEX IF NOT EXISTS` is idempotent and applied on
+-- every open (including a pre-existing file), needing no separate migration.
+CREATE INDEX IF NOT EXISTS idx_harvest_signals_exec_delivered
+    ON harvest_signals (exec_id, delivered);
+
 CREATE TABLE IF NOT EXISTS harvest_activity_attempts (
     attempt_seq INTEGER PRIMARY KEY AUTOINCREMENT,
     exec_id     TEXT NOT NULL,

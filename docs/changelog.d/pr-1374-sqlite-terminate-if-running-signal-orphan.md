@@ -37,3 +37,16 @@ deletion outside the `if` so it runs for every prior being sealed, not only
 a cancelled RUNNING one. Regression test:
 `reuse_policy::terminate_if_running_orphans_an_undelivered_signal_on_an_already_completed_prior`
 — RED against the first pass, GREEN after.
+
+**Second review follow-up (same PR):** `harvest_signals` has no index beyond
+its `signal_seq` PRIMARY KEY, so both the pre-existing `peek_pending_signal`
+and the new cleanup query filtered on `exec_id`/`delivered` with a full table
+SCAN — unlike `harvest_timers`, whose `(exec_id, timer_id)` PRIMARY KEY
+already covers this. Since delivered rows are kept forever, the table only
+grows, so a `TerminateIfRunning` start (and each legacy prior it processes)
+would scan the whole thing. Adds `idx_harvest_signals_exec_delivered ON
+harvest_signals (exec_id, delivered)`, applied idempotently on every open
+like the existing indices — no migration needed. Regression test:
+`queue::tests::signal_cleanup_delete_uses_an_index_not_a_full_scan` asserts
+`EXPLAIN QUERY PLAN` reports a `SEARCH ... USING INDEX`, not a `SCAN` — RED
+without the index, GREEN with it.
