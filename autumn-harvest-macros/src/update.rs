@@ -91,7 +91,7 @@ pub fn update_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
     }
 
     // First parameter must be ctx: &WorkflowContext.
-    if !first_param_is_ctx(&func.sig.inputs) {
+    if !crate::attr_util::first_param_is_ctx_type(&func.sig.inputs, "WorkflowContext") {
         return syn::Error::new_spanned(
             &func.sig,
             "#[update] handlers must take `ctx: &WorkflowContext` as the first argument",
@@ -100,7 +100,7 @@ pub fn update_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
     }
 
     // Return type must be Result<T, E>.
-    if !returns_result(&func.sig.output) {
+    if !crate::attr_util::returns_result(&func.sig.output) {
         return syn::Error::new_spanned(
             &func.sig.output,
             "#[update] return type must be `Result<T, E>`",
@@ -135,7 +135,7 @@ pub fn update_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         .collect();
 
     let input_type_hint = build_input_type_hint(&params);
-    let output_type_hint = extract_ok_type_hint(&func.sig.output);
+    let output_type_hint = crate::extract_ok_type_hint(&func.sig.output);
 
     let dispatch = build_update_dispatch(fn_name, &param_names);
 
@@ -160,11 +160,11 @@ pub fn update_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         Err(e) => return e.to_compile_error(),
     };
     let workflow_simple_name = parsed_path.workflow_simple_name;
-    let camel_wf = to_pascal_case(&workflow_simple_name);
+    let camel_wf = crate::to_pascal_case(&workflow_simple_name);
     let stub_ident = format_ident!("{camel_wf}Stub");
     let method_name = format_ident!("update_{fn_name}");
     let method_name_uws = format_ident!("update_with_start_{fn_name}");
-    let ok_type = extract_ok_type(&func.sig.output);
+    let ok_type = crate::extract_ok_type(&func.sig.output);
 
     let serialize_payload = if param_names.is_empty() {
         quote! { ::autumn_harvest::serde_json::Value::Null }
@@ -476,40 +476,6 @@ pub fn update_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
-/// Returns `true` when the first parameter matches `ctx: &WorkflowContext`.
-fn first_param_is_ctx(inputs: &syn::punctuated::Punctuated<syn::FnArg, syn::token::Comma>) -> bool {
-    let Some(first) = inputs.first() else {
-        return false;
-    };
-    let syn::FnArg::Typed(pt) = first else {
-        return false;
-    };
-    let syn::Type::Reference(r) = &*pt.ty else {
-        return false;
-    };
-    let syn::Type::Path(tp) = &*r.elem else {
-        return false;
-    };
-    tp.path
-        .segments
-        .last()
-        .is_some_and(|s| s.ident == "WorkflowContext")
-}
-
-fn returns_result(output: &syn::ReturnType) -> bool {
-    let syn::ReturnType::Type(_, ty) = output else {
-        return false;
-    };
-    let syn::Type::Path(type_path) = &**ty else {
-        return false;
-    };
-    type_path
-        .path
-        .segments
-        .last()
-        .is_some_and(|s| s.ident == "Result")
-}
-
 fn build_update_dispatch(fn_name: &syn::Ident, param_names: &[&syn::Ident]) -> TokenStream {
     if param_names.is_empty() {
         quote! {
@@ -555,35 +521,19 @@ fn build_input_type_hint(params: &[&syn::FnArg]) -> String {
     if params.len() == 1
         && let syn::FnArg::Typed(pt) = params[0]
     {
-        return type_name_hint(&pt.ty);
+        return crate::type_name_hint(&pt.ty);
     }
     let parts: Vec<_> = params
         .iter()
         .filter_map(|arg| {
             if let syn::FnArg::Typed(pt) = arg {
-                Some(type_name_hint(&pt.ty))
+                Some(crate::type_name_hint(&pt.ty))
             } else {
                 None
             }
         })
         .collect();
     format!("({})", parts.join(", "))
-}
-
-fn extract_ok_type_hint(output: &syn::ReturnType) -> String {
-    crate::extract_ok_type_hint(output)
-}
-
-fn type_name_hint(ty: &syn::Type) -> String {
-    crate::type_name_hint(ty)
-}
-
-fn to_pascal_case(s: &str) -> String {
-    crate::to_pascal_case(s)
-}
-
-fn extract_ok_type(output: &syn::ReturnType) -> syn::Type {
-    crate::extract_ok_type(output)
 }
 
 // ── Characterization tests ──────────────────────────────────────────────────

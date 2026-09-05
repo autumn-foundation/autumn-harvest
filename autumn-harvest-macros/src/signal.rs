@@ -59,7 +59,7 @@ pub fn signal_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
     };
 
     // First parameter must be ctx: &WorkflowContext.
-    if !first_param_is_ctx(&func.sig.inputs) {
+    if !crate::attr_util::first_param_is_ctx_type(&func.sig.inputs, "WorkflowContext") {
         return syn::Error::new_spanned(
             &func.sig,
             "#[signal] handlers must take `ctx: &WorkflowContext` as the first argument",
@@ -90,7 +90,7 @@ pub fn signal_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         Err(e) => return e.to_compile_error(),
     };
     let workflow_simple_name = parsed_path.workflow_simple_name;
-    let camel_wf = to_pascal_case(&workflow_simple_name);
+    let camel_wf = crate::to_pascal_case(&workflow_simple_name);
     let stub_ident = format_ident!("{camel_wf}Stub");
 
     // Skip the leading ctx param when building signal args.
@@ -289,29 +289,6 @@ fn build_arg_type_hint(params: &[&syn::FnArg]) -> String {
         })
         .collect();
     format!("({})", parts.join(", "))
-}
-
-fn first_param_is_ctx(inputs: &syn::punctuated::Punctuated<syn::FnArg, syn::token::Comma>) -> bool {
-    let Some(first) = inputs.first() else {
-        return false;
-    };
-    let syn::FnArg::Typed(pt) = first else {
-        return false;
-    };
-    let syn::Type::Reference(r) = &*pt.ty else {
-        return false;
-    };
-    let syn::Type::Path(tp) = &*r.elem else {
-        return false;
-    };
-    tp.path
-        .segments
-        .last()
-        .is_some_and(|s| s.ident == "WorkflowContext")
-}
-
-fn to_pascal_case(s: &str) -> String {
-    crate::to_pascal_case(s)
 }
 
 // ── Characterization tests: signature-validation error paths ────────────────
