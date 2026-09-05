@@ -34,7 +34,13 @@
 //! 1. terminal execution — nothing to diagnose
 //! 2. [`BlockedOn::Paused`] — an operator deliberately parked this run
 //! 3. the **worst** verdict across every pending activity (see
-//!    [`activity_precedence`])
+//!    [`activity_precedence`]) — with one narrow exception (issue #1193
+//!    Codex round-3 P1): a [`Degraded`](ExecutionHealth::Degraded) activity
+//!    verdict yields to the run's OWN workflow task if THAT is hard-blocked
+//!    (an operator-paused queue or no live poller), because a frozen
+//!    decision cycle is worse than one activity self-resolving into
+//!    failure. Every other activity health keeps the established,
+//!    deliberately-activity-first behavior.
 //! 4. an external handoff, then a pending child, then an awaited signal, then a
 //!    sleeping timer — mirroring issue #486's own `StallReason` ordering so the
 //!    two surfaces agree about which category "wins"
@@ -1251,7 +1257,32 @@ pub fn classify_execution(inputs: &DiagnosisInputs, now: DateTime<Utc>) -> Optio
         },
     );
     if let Some((idx, _)) = worst_activity_index {
-        return Some(classify_pending_activity(&inputs.activities[idx], now));
+        let verdict = classify_pending_activity(&inputs.activities[idx], now);
+        // Issue #1193 Codex round-3 P1: a `Degraded` activity verdict
+        // promises "no human needed, this clears on its own (even if only
+        // into a terminal failure)". But if the run's OWN workflow task
+        // cannot be claimed AT ALL -- an operator-paused queue or no live
+        // poller, `workflow_task_hard_impediment`'s two shapes -- the
+        // decision cycle itself is frozen, which is strictly worse: even
+        // the activities that DO complete can never be processed into
+        // follow-up work or a terminal outcome. That is worth surfacing
+        // instead of the milder, already-heading-nowhere activity cause.
+        //
+        // Scoped to ONLY the `Degraded` verdict on purpose: every other
+        // activity health (`Stalled`, `BlockedExternal`, `Healthy`) keeps
+        // the established, deliberately-activity-first behavior pinned by
+        // `wedged_activity_still_outranks_a_workflow_queue_impediment` --
+        // widening this further is a separate, pre-existing question this
+        // issue does not touch.
+        if verdict.health() == ExecutionHealth::Degraded
+            && let Some(hard) = inputs
+                .workflow_task
+                .as_ref()
+                .and_then(workflow_task_hard_impediment)
+        {
+            return Some(hard);
+        }
+        return Some(verdict);
     }
 
     // Category ladder below the activity bucket. Mirrors issue #486's own
@@ -2900,6 +2931,98 @@ mod tests {
         let verdict =
             classify_execution(&inputs, t(0)).expect("non-terminal execution must yield a verdict");
         assert_eq!(verdict.kind(), "activity_no_worker", "{verdict:?}");
+    }
+
+    /// AC (issue #1193 Codex round-3 P1): the one exception to
+    /// `wedged_activity_still_outranks_a_workflow_queue_impediment` above.
+    /// A `Degraded` activity verdict promises "no human needed", but if the
+    /// run's own workflow task can never be claimed at all, the decision
+    /// cycle itself is frozen -- even activities that DO complete can never
+    /// be turned into follow-up work. That must win over the milder,
+    /// already-doomed activity cause.
+    #[test]
+    fn degraded_organic_circuit_yields_to_a_frozen_workflow_task_no_worker() {
+        let inputs = DiagnosisInputs {
+            activities: vec![PendingActivityFacts {
+                circuit_phase: Some(BlockingCircuitPhase::Open),
+                circuit_cooldown_until: Some(t(30)),
+                circuit_forced_open: false,
+                ..healthy_activity()
+            }],
+            workflow_task: Some(WorkflowTaskFacts {
+                has_live_worker: false,
+                ..wf_task()
+            }),
+            ..Default::default()
+        };
+        // The activity alone would be `degraded` (organic circuit open).
+        assert_eq!(
+            classify_pending_activity(&inputs.activities[0], t(0)).health(),
+            ExecutionHealth::Degraded
+        );
+        let verdict =
+            classify_execution(&inputs, t(0)).expect("non-terminal execution must yield a verdict");
+        assert_eq!(
+            verdict.kind(),
+            "workflow_no_worker",
+            "a frozen decision cycle must win over a self-healing-but-doomed \
+             activity: {verdict:?}"
+        );
+        assert_eq!(verdict.health(), ExecutionHealth::Stalled);
+    }
+
+    /// The other `workflow_task_hard_impediment` shape: an operator-paused
+    /// workflow queue. Same override, different remedy (`blocked_external`,
+    /// resume the queue, not a code fix).
+    #[test]
+    fn degraded_organic_circuit_yields_to_a_paused_workflow_queue() {
+        let inputs = DiagnosisInputs {
+            activities: vec![PendingActivityFacts {
+                circuit_phase: Some(BlockingCircuitPhase::Open),
+                circuit_cooldown_until: Some(t(30)),
+                circuit_forced_open: false,
+                ..healthy_activity()
+            }],
+            workflow_task: Some(WorkflowTaskFacts {
+                queue_paused: true,
+                has_live_worker: false,
+                ..wf_task()
+            }),
+            ..Default::default()
+        };
+        let verdict =
+            classify_execution(&inputs, t(0)).expect("non-terminal execution must yield a verdict");
+        assert_eq!(verdict.kind(), "workflow_queue_paused", "{verdict:?}");
+        assert_eq!(verdict.health(), ExecutionHealth::BlockedExternal);
+    }
+
+    /// The override is scoped to `Degraded` only. A forced-open (`Stalled`)
+    /// activity verdict keeps winning over a frozen workflow task exactly as
+    /// `wedged_activity_still_outranks_a_workflow_queue_impediment` pins --
+    /// this just adds the circuit-specific case to that same guarantee.
+    #[test]
+    fn forced_open_circuit_still_outranks_a_frozen_workflow_task() {
+        let inputs = DiagnosisInputs {
+            activities: vec![PendingActivityFacts {
+                circuit_phase: Some(BlockingCircuitPhase::Open),
+                circuit_cooldown_until: None,
+                circuit_forced_open: true,
+                ..healthy_activity()
+            }],
+            workflow_task: Some(WorkflowTaskFacts {
+                has_live_worker: false,
+                ..wf_task()
+            }),
+            ..Default::default()
+        };
+        let verdict =
+            classify_execution(&inputs, t(0)).expect("non-terminal execution must yield a verdict");
+        assert_eq!(
+            verdict.kind(),
+            "activity_circuit_open",
+            "a Stalled activity verdict is unaffected by this override: {verdict:?}"
+        );
+        assert_eq!(verdict.health(), ExecutionHealth::Stalled);
     }
 
     #[test]

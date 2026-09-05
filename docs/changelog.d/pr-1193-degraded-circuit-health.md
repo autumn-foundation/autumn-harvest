@@ -78,6 +78,30 @@ the identical failure mode one level down:
   Fixed by giving organic-open its own tier strictly between forced-open and
   half-open (forced > organic > half-open), renumbering the ladder once more.
 
+**Codex round-3 finding on PR #1365, also confirmed and fixed.** A different
+class of masking, one level up the ladder:
+
+- **P1 — a `degraded` activity verdict unconditionally suppressed a frozen
+  workflow task.** `classify_execution`'s activity bucket returns
+  unconditionally whenever any activity row exists, structurally never
+  reaching `workflow_task_hard_impediment` (the run's own workflow-task-level
+  `workflow_no_worker` / `workflow_queue_paused` checks) below it. That
+  ordering is deliberate and pre-existing (pinned since before this issue by
+  `wedged_activity_still_outranks_a_workflow_queue_impediment`) for every
+  activity health it was ever exercised against, because those all happened
+  to be at least as severe as anything the workflow task alone could report.
+  `Degraded` breaks that assumption: it is milder than the `Stalled` a frozen
+  workflow task (`workflow_no_worker`) represents, so an activity's
+  organically-tripped breaker could report `degraded` — "no human needed" —
+  while the execution's own decision cycle could never advance at all, unable
+  to process even the completions of activities that DO finish. Fixed by
+  checking `workflow_task_hard_impediment` whenever (and ONLY whenever) the
+  winning activity verdict resolves to `Degraded`, preferring it when present.
+  Every other activity health (`Stalled`, `BlockedExternal`, `Healthy`) is
+  untouched — this does not touch the broader, unrelated question of whether
+  a `Healthy` activity verdict should ever yield to a workflow-level stall
+  (out of scope for this issue).
+
 No new `WorkflowEvent` variant, no migration, no change to
 `CircuitBreakerRegistry`'s own logic (only what the plugin reads off its
 existing `CircuitSnapshot`) — read-path label semantics only, exactly as
@@ -100,4 +124,9 @@ end-to-end `ac5_organically_tripped_circuit_reports_a_derived_cooldown_until`,
 `ac5_forced_open_circuit_reports_circuit_open_without_a_cooldown`, and
 `half_open_circuit_is_not_reported_as_operator_forced` integration tests now
 also assert the wire-level `forced_open` field against a real breaker
-registry and database.
+registry and database. The round-3 fix is pinned by
+`degraded_organic_circuit_yields_to_a_frozen_workflow_task_no_worker`,
+`degraded_organic_circuit_yields_to_a_paused_workflow_queue`, and
+`forced_open_circuit_still_outranks_a_frozen_workflow_task` (proving the
+override is scoped to `Degraded` alone and does not touch the pre-existing
+`Stalled` behavior).
