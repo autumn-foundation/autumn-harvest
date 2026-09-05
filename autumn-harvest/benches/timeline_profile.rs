@@ -1,11 +1,21 @@
-//! Deterministic (non-criterion) instruction/allocation-count profiling
-//! harness for `autumn_harvest::timeline::derive_timeline` — the pure,
-//! read-only projection behind `GET /workflows/{id}/timeline` (issue #739).
-//! Wall-clock timing is not admissible evidence on this (shared-vCPU)
-//! machine — every number this harness produces evidence for is a
-//! deterministic instruction count (`valgrind --tool=callgrind`) or
-//! allocation count/bytes (`valgrind --tool=dhat`), both reproducible
-//! bit-for-bit on any machine.
+//! Non-criterion instruction/allocation-count profiling harness for
+//! `autumn_harvest::timeline::derive_timeline` — the pure, read-only
+//! projection behind `GET /workflows/{id}/timeline` (issue #739). Wall-clock
+//! timing is not admissible evidence on this (shared-vCPU) machine, so this
+//! binary is not measured with `cargo bench` / criterion timing. It is
+//! driven directly under `valgrind --tool=callgrind` (instruction counts)
+//! and `valgrind --tool=dhat` (allocation counts/bytes) instead -- a direct
+//! single-process measurement, but **not** bit-for-bit reproducible
+//! run-to-run: this harness generates fresh random activity/child UUIDs on
+//! every run, and both this file's own `AccKey`-keyed lookup map (mirroring
+//! `derive_timeline`'s internal one) and `derive_timeline` itself use
+//! `std::collections::HashMap`'s randomly-seeded `RandomState`, so hash
+//! values and probe patterns vary between runs. Measured spread: two
+//! callgrind runs each of the pre-fix and post-fix binaries (see #1372's
+//! commits) varied by ~0.1-0.2% run-to-run, over two orders of magnitude
+//! below the delta this harness was built to detect. dhat's allocation
+//! counts/bytes are unaffected (allocation *count* doesn't depend on hash
+//! values) and were confirmed byte-identical across repeated runs.
 //!
 //! # Workload
 //!
@@ -76,7 +86,14 @@ fn row(timestamp: DateTime<Utc>, event: WorkflowEvent) -> TimelineEventRow {
 /// ratio — a long-running fan-out workflow near completion with a genuine
 /// handful of things still open, exactly the shape an operator's timeline
 /// request targets.
-fn build_workload(n: usize, start: DateTime<Utc>) -> Vec<TimelineEventRow> {
+///
+/// Returns the rows alongside the timestamp of the last generated event:
+/// callers must derive the profiling clock (`now`) from it rather than a
+/// fixed offset from `start`, or a large enough `TIMELINE_PROFILE_N` makes
+/// the fixed history outlast a hardcoded horizon and produces "future"
+/// events relative to the clock the timeline is derived against (Codex
+/// review on #1372).
+fn build_workload(n: usize, start: DateTime<Utc>) -> (Vec<TimelineEventRow>, DateTime<Utc>) {
     let mut rows: Vec<TimelineEventRow> = Vec::new();
     let mut t = start;
     let mut tick = || {
@@ -235,7 +252,7 @@ fn build_workload(n: usize, start: DateTime<Utc>) -> Vec<TimelineEventRow> {
         }
     }
 
-    rows
+    (rows, t)
 }
 
 fn env_usize(key: &str, default: usize) -> usize {
@@ -271,7 +288,10 @@ fn main() {
     validate_workload_params(n, reps);
     let start = now();
 
-    let rows = build_workload(n, start);
+    let (rows, last_event_ts) = build_workload(n, start);
+    // Always after every generated event, however large TIMELINE_PROFILE_N
+    // gets -- see build_workload's doc comment.
+    let now_ts = last_event_ts + chrono::Duration::hours(1);
 
     // Sanity-check the fixture once, unmeasured: the timeline must actually
     // contain both open and closed steps in every category, or this harness
@@ -280,7 +300,7 @@ fn main() {
     let sanity = derive_timeline(
         &rows,
         start,
-        now() + chrono::Duration::hours(1),
+        now_ts,
         None,
         "exec-sanity".to_string(),
         "wf-sanity".to_string(),
@@ -320,16 +340,16 @@ fn main() {
     // BTreeMap, not HashMap: this tally is read inside the measured loop
     // below, and HashMap's default RandomState hasher is seeded per-process
     // -- its instructions would leak into the profiled instruction count and
-    // make two "identical" runs diverge. BTreeMap is Ord-keyed (no hashing
-    // at all), so it costs nothing extra and keeps the profile reproducible
-    // bit-for-bit.
+    // add MORE run-to-run variance on top of what derive_timeline's own
+    // internal hashing already contributes (see this file's header).
+    // BTreeMap is Ord-keyed (no hashing at all), so it costs nothing extra
+    // and doesn't make that existing variance any worse.
     let mut kind_tally: std::collections::BTreeMap<&'static str, u64> =
         std::collections::BTreeMap::new();
     let mut total_steps: u64 = 0;
     let mut total_busy_ms: i64 = 0;
     let mut total_wait_ms: i64 = 0;
 
-    let now_ts = now() + chrono::Duration::hours(1);
     for _ in 0..reps {
         // Mirrors the real handler: one `derive_timeline` call per served
         // request, over the SAME loaded history.
