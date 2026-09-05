@@ -271,8 +271,8 @@ ARCHAEOLOGY_RE = re.compile(
 CONTRACTION_RE = re.compile(
     r"\b(?:ca|is|are|was|were|do|does|did|would|could|should|will|has|have|had"
     r"|must|ai|wo|sha|need|ought|might)n't\b"
-    r"|\b(?:it|that|there|here|what|who|let|he|she|we|they|you|i|world)'"
-    r"(?:s|ll|re|ve|d|m)\b"
+    r"|\b(?:it|that|there|here|what|who|how|where|when|why|let|he|she|we|they"
+    r"|you|i|world)'(?:s|ll|re|ve|d|m)\b"
     r"|\b(?:should|could|would|must|might)'ve\b",
     re.IGNORECASE,
 )
@@ -815,6 +815,10 @@ def baseline_from_merge_base(
     grouped: dict = defaultdict(lambda: defaultdict(list))
     for path in sorted(p for p in scope if p.endswith(".rs")):
         was_path = renames.get(path, path)
+        if not was_path.endswith(".rs"):
+            # Renamed INTO the Rust corpus. It has no audited history, so it
+            # gets no allowance and every finding in it belongs to this change.
+            continue
         try:
             done = subprocess.run(
                 ("git", "show", f"{merge_base}:{was_path}"),

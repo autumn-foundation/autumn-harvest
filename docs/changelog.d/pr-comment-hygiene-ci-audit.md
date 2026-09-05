@@ -376,3 +376,22 @@ Checked against the four neighbouring cases that pull against this, since
 nesting and run-grouping fixes have repeatedly broken each other: nested
 bodies are still inspected, a nested `/*!` is still stripped, one multiline
 block is still one run, and two distinct blocks are still two runs.
+
+**Twelfth Codex round (PR #1380): two more P2 findings, both real.**
+
+- *A non-Rust → Rust rename inherited an allowance it never earned.* The
+  rename lookup did not check the OLD path's extension, so renaming a fixture
+  from `.txt` to `.rs` scanned the text file at the merge base and granted its
+  comments as legacy debt — smuggling contractions and long sentences into the
+  audited corpus with the gate green. A rename now inherits only when the old
+  path was also `.rs`; renamed *into* the corpus means no allowance, so every
+  finding belongs to the change.
+- *Interrogative contractions were missed.* `how's`, `where's`, `when's` and
+  `why's` were absent from the apostrophe-s stems (`who's` and `what's` were
+  already there, which is what made the gap easy to miss).
+
+The rename fix was verified against a real git rename in both directions,
+because the two cases are one line apart and pull opposite ways: `.txt` → `.rs`
+now exits 1 with both findings attributed to the change (`0 at the merge
+base`), while a pure `.rs` → `.rs` rename still exits 0 with its allowance
+intact.
