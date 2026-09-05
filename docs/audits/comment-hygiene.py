@@ -808,12 +808,19 @@ def update_containers(
     content = list_content(body, stack[-1][0] if stack else 0)
     if content and (not paragraph or interrupts_paragraph(marker)):
         stack.append((content[0], depth))
-    return stack, bool(body.strip())
+    # Only paragraph content leaves a paragraph open. A heading, a thematic
+    # break or a table row is its own block, and treating one as a paragraph
+    # refuses the next "22." a container it is entitled to. A list marker's
+    # own text IS a paragraph, so those still count.
+    prose = bool(body.strip()) and not (
+        HEADING_RE.match(body) or SEPARATOR_RE.match(body) or TABLE_RE.match(body)
+    )
+    return stack, prose
 
 
 def strip_containers(
     text: str, stack: list[tuple[int, int]], container: int
-) -> tuple[str, int]:
+) -> tuple[str, int, int]:
     """Peel container markers off `text` until a fence delimiter could show.
 
     One line can open several containers at once: "- > ```rust" is a list item
@@ -825,7 +832,9 @@ def strip_containers(
     opens an item with nothing in it yet, so the next frame starts at zero.
     Crossing a quote enters a depth the stack may already have a container
     for -- a quoted list item, say -- and its column is the one recorded
-    there. Returns the remaining text and the container to measure against.
+    there. Returns the remaining text, the container to measure against, and
+    the quote depth reached -- which is the fence's depth, and is not what
+    reading the unpeeled line reports once a quote follows a list marker.
     """
     depth = 0
     while True:
@@ -840,7 +849,7 @@ def strip_containers(
             text = text[content[1]:]
             container = 0
             continue
-        return text, container
+        return text, container, depth
 
 
 def fence_delimiter(
@@ -849,7 +858,7 @@ def fence_delimiter(
     in_fence: bool = False,
     depth: int = 0,
     stack: list[tuple[int, int]] | None = None,
-) -> tuple["re.Match[str]", str] | None:
+) -> tuple["re.Match[str]", str, int] | None:
     """The fence delimiter on `text`, or None if the line is not one.
 
     Two things separate a delimiter from ordinary text. A fence may open on
@@ -866,15 +875,15 @@ def fence_delimiter(
     # example content, not an item whose body closes the fence, and a "> "
     # deeper than the fence's own container is sample text too.
     if in_fence:
-        tail = strip_quote_levels(text, depth, container)
+        tail, reached = strip_quote_levels(text, depth, container), depth
     else:
-        tail, container = strip_containers(text, stack or [], container)
+        tail, container, reached = strip_containers(text, stack or [], container)
     match = FENCE_RE.match(tail)
     if not match:
         return None
     if len(match.group(1).expandtabs(4)) > container + 3:
         return None
-    return match, tail
+    return match, tail, reached
 
 
 
@@ -961,7 +970,7 @@ def comment_lines(pieces: list[Piece]):
             delimiter = fence_delimiter(text, container, fence is not None, scope[2], stack)
             if delimiter:
                 before = fence
-                fence = fence_transition(fence, *delimiter)
+                fence = fence_transition(fence, delimiter[0], delimiter[1])
                 # A fence is a block, so it ends the paragraph before it.
                 # Otherwise the opener leaves `paragraph` set and the next
                 # "22." is refused a container it is entitled to.
@@ -972,7 +981,11 @@ def comment_lines(pieces: list[Piece]):
                     # depth without the container saves zero and the fence
                     # then never sees its own closing delimiter. The saved
                     # column has to come from the same frame as that depth.
-                    line_depth = quote_depth(text, container)
+                    # The depth comes from the PEEL, not from reading the
+                    # raw line: once a quote follows a list marker on the
+                    # same line, the unpeeled line reports depth zero and the
+                    # fence never recognises its own quoted closer.
+                    line_depth = delimiter[2]
                     scope = (
                         container,
                         container_at_depth(stack, line_depth),
@@ -1085,10 +1098,10 @@ def prose_units(pieces: list[Piece]) -> list[tuple[int, str]]:
             delimiter = fence_delimiter(body, container, fence is not None, scope[2], stack)
             if delimiter:
                 before = fence
-                fence = fence_transition(fence, *delimiter)
+                fence = fence_transition(fence, delimiter[0], delimiter[1])
                 paragraph = False
                 if before is None and fence is not None:
-                    line_depth = quote_depth(body, container)
+                    line_depth = delimiter[2]
                     scope = (
                         container,
                         container_at_depth(stack, line_depth),
@@ -1717,6 +1730,24 @@ RULE_TESTS = [
         "/// - 1. ```rust\n///      TODO: fixture placeholder\n///      ```\n",
         set(),
         "two list markers on one line both open containers for the fence",
+    ),
+    (
+        "/// - > ~~~rust\n///   > let x = 1;\n///   > ~~~\n"
+        "///   TODO: issue required\n",
+        {("CH002", 4)},
+        "a fence opened behind a list and a quote knows its own depth",
+    ),
+    (
+        "/// # Heading\n/// 22. item\n///     ~~~rust\n"
+        "///     TODO: fixture placeholder\n///     ~~~\n",
+        set(),
+        "a heading is not a paragraph, so \"22.\" may open an item after it",
+    ),
+    (
+        "/// -----\n/// 22. item\n///     ~~~rust\n"
+        "///     TODO: fixture placeholder\n///     ~~~\n",
+        set(),
+        "nor is a thematic break",
     ),
     (
         "/// Intro\n/// > word1 word2 word3 word4 word5 word6 word7 word8 word9 word10 word11 word12 word13 word14 word15 word16 word17 word18 word19 word20 word21 word22 word23 word24 word25.\n",

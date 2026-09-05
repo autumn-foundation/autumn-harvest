@@ -885,3 +885,35 @@ unprompted on the eighth consecutive round with no corpus effect is a larger
 call than this PR should make on its own.
 
 Corpus effect: none, for the eighth round running.
+
+### Round twenty-seven — the fence's depth comes from the peel; headings are not paragraphs
+
+Two findings, both verified to reproduce first. One of them answers a question
+this PR asked two rounds ago.
+
+**A fence behind a list and a quote recorded depth zero.** `/// - > ~~~rust`
+opens after round twenty-six's peel, but the saved scope still read the depth
+off the *unpeeled* line, where the quote follows a list marker and so is not
+seen at all. The quoted closer then read as literal content and the fence never
+closed. `strip_containers` returns the depth it reached, and the scope takes it
+from there.
+
+That is most of the half left unfixed last round, without the rewrite. What
+remains is the artificial form where every line repeats both markers
+(`- > ...` on the body as well as the opener), which is not how a list
+continuation is written; the indented form Codex used here is, and it works.
+
+**A heading left a paragraph open.** Round twenty-two clears paragraph state at
+a fence, and I declined the broader "and other block-level structural lines"
+because I could not construct a case — and asked for one on the thread. Here
+it is: `# Heading` then `22. item` refuses the list its container, and a fence
+under that item then measures against the wrong column and reports its own
+sample text. Headings, thematic breaks and table rows no longer count as
+paragraph content. A list marker's own text still does.
+
+Worth recording that the question was the right thing to ask rather than
+guessing at the class: the answer names three block types, and two of them
+(`SEPARATOR_RE`, `TABLE_RE`) already existed in the file for the prose path and
+simply were not consulted here.
+
+Corpus effect: none, for the ninth round running.
