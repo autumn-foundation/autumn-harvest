@@ -104,6 +104,13 @@ fn build_workload(n: usize, start: DateTime<Utc>) -> (Vec<TimelineEventRow>, Dat
 
     // Regular activities: 9 of every 10 close out (1 of every 5 of those
     // retries once first); the rest stay open (scheduled, never started).
+    // The retry selector counts CLOSED activities, not `i` -- picking on `i
+    // % 5` directly would make every retry candidate (i % 5 == 4) land on an
+    // index that's ALSO open (i % 10 == 9, since 9 % 5 == 4 and the period-10
+    // open cycle never shifts that residue), so retries would fire on 1 in 10
+    // regular activities instead of the documented 1 in 5 of the CLOSED ones
+    // (Codex review on #1372).
+    let mut closed_count: usize = 0;
     for i in 0..n {
         let activity_id = ActivityExecId::new();
         let name = ACTIVITY_NAMES[i % ACTIVITY_NAMES.len()].to_string();
@@ -118,7 +125,9 @@ fn build_workload(n: usize, start: DateTime<Utc>) -> (Vec<TimelineEventRow>, Dat
             },
         ));
         if i % 10 != 9 {
-            if i % 5 == 4 {
+            let retries = closed_count % 5 == 4;
+            closed_count += 1;
+            if retries {
                 // Retried once: started, failed, restarted, then completed.
                 rows.push(row(
                     tick(),
