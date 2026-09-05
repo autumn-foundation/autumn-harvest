@@ -227,6 +227,13 @@ COMMENTED_CODE_RE = re.compile(
             (?![^;{]*\b[a-z]+\s+[a-z]+\s+[a-z]+\s+[a-z]+\b)[\w:<>&'\s]+\{\s*$
       | let\s+(?:mut\s+)?\w+\s*(?::[^;=]+)?=
             (?!\s*(?:\w+\s+){2,}\w+\s*;\s*$)[^=].*;\s*$
+      # Destructuring bindings. A tuple or slice pattern, or a struct/enum
+      # pattern behind a Capitalised path -- all terminated, and none of them
+      # a shape English produces. The plain `\w+` form above misses every one.
+      | let\s+(?:mut\s+)?[(\[][\w\s,.:&*'()\[\]{}]*[)\]]\s*(?::[^;=]+)?
+            =\s*[^=;]+;\s*$
+      | let\s+(?:[\w]+::)*[A-Z]\w*\s*(?:\([^;]*\)|\{[^;]*\})\s*=\s*[^=;]+
+            (?:;|\s+else\s*\{)\s*$
       | use\s+(?:\w+::)*(?:\w+|\*|\{[\w:,\s*]+\})(?:\s+as\s+\w+)?;\s*$
       | \#!?\[[\w:()"'=,./\s-]+\]\s*$
       | \}[,;)]*\s*$
@@ -622,21 +629,35 @@ def interrupts_paragraph(marker: "re.Match[str]") -> bool:
     return not marker_text[:1].isdigit() or marker_text[:-1] == "1"
 
 
-def list_content(text: str) -> tuple[int, int] | None:
+def list_content(text: str, container: int) -> tuple[int, int] | None:
     """Where a list item's content starts on `text`: its column, and its index.
 
-    CommonMark counts one to four spaces after the marker as padding. Five or
-    more means the content starts ONE space after the marker and the rest is
-    an indented code block. Consuming all of it as marker instead puts the
-    content column five or more past the marker, which makes "-     ```rust"
-    a fence opener and silently suppresses every rule over the block it opens.
+    Three CommonMark rules, each of which was a way to open a fence that is
+    not there and silently exempt every comment after it:
+
+    * The marker itself may be indented at most three columns past its
+      container. Past that "    - ~~~rust" is an indented code line.
+    * One to four columns after the marker are padding. Five or more means
+      the content starts ONE column after the marker and the rest is
+      indented code, so "-     ```rust" does not open a fence.
+    * Padding is counted in COLUMNS, not characters. A tab is up to four
+      columns wide, so a space and two tabs is three characters of padding
+      and seven columns of it.
     """
     marker = LIST_MARKER_RE.match(text)
     if not marker:
         return None
-    padding = len(marker.group(3))
-    used = 1 if padding > 4 else padding
-    return len(marker.group(1)) + len(marker.group(2)) + used, marker.start(3) + used
+    indent = len(marker.group(1).expandtabs(4))
+    if indent > container + 3:
+        return None
+    # Expanded from the start of the line: a tab's width depends on the column
+    # it sits in, not on how many characters precede it.
+    marker_column = indent + len(marker.group(2))
+    padding = len(marker.group(0).expandtabs(4)) - marker_column
+    if padding > 4:
+        return marker_column + 1, marker.start(3) + 1
+    return marker_column + padding, marker.end()
+
 
 
 def strip_quote(text: str) -> str:
@@ -649,6 +670,29 @@ def strip_quote(text: str) -> str:
     return text[match.end():] if match else text
 
 
+def quote_depth(text: str) -> int:
+    """How many block-quote levels `text` opens with."""
+    match = BLOCKQUOTE_RE.match(text)
+    return match.group(0).count(">") if match else 0
+
+
+def leaves_container(text: str, scope: tuple[int, int]) -> bool:
+    """Has `text` dedented out of the container an open fence started in?
+
+    CommonMark ends a fenced block with its container, closing delimiter or
+    not. Without this an unclosed fence in one list item stays open over every
+    later comment in the run -- a gate that silently stops gating, which is
+    the failure this harness exists to prevent.
+    """
+    container, depth = scope
+    if quote_depth(text) < depth:
+        return True
+    body = strip_quote(text)
+    if not body.strip():
+        return False
+    return len(body) - len(body.lstrip()) < container
+
+
 def container_indent_after(text: str, current: int) -> int:
     """The content indent of the innermost open list item, after `text`.
 
@@ -657,7 +701,7 @@ def container_indent_after(text: str, current: int) -> int:
     line that dedents below the container closes it.
     """
     text = strip_quote(text)
-    content = list_content(text)
+    content = list_content(text, current)
     if content:
         return content[0]
     if text.strip() and len(text) - len(text.lstrip()) < current:
@@ -677,7 +721,7 @@ def fence_delimiter(text: str, container: int) -> tuple["re.Match[str]", str] | 
     and the text it was matched against, which carries the info string.
     """
     text = strip_quote(text)
-    base, offset = list_content(text) or (0, 0)
+    base, offset = list_content(text, container) or (0, 0)
     tail = text[offset:]
     match = FENCE_RE.match(tail)
     if not match:
@@ -757,15 +801,20 @@ def comment_lines(pieces: list[Piece]):
     """
     for run in comment_runs(pieces):
         fence: tuple[str, int] | None = None
+        scope = (0, 0)
         container = 0
         for piece in run:
             text = piece.text
+            if fence is not None and leaves_container(text, scope):
+                fence = None
             if fence is None:
                 container = container_indent_after(text, container)
             delimiter = fence_delimiter(text, container)
             if delimiter:
                 before = fence
                 fence = fence_transition(fence, *delimiter)
+                if before is None and fence is not None:
+                    scope = (container, quote_depth(text))
                 # Fence SYNTAX only if it opened one, closed one, or sits
                 # inside one. An invalid opener (```foo`bar) is ordinary text
                 # and must still be scanned -- exempting it would hide the
@@ -843,6 +892,7 @@ def prose_units(pieces: list[Piece]) -> list[tuple[int, str]]:
         run: list[str] = []
         run_lines: list[int] = []
         fence: tuple[str, int] | None = None
+        scope = (0, 0)
         container = 0
         in_list = False
 
@@ -862,12 +912,16 @@ def prose_units(pieces: list[Piece]) -> list[tuple[int, str]]:
 
         for piece in block:
             body = piece.text
+            if fence is not None and leaves_container(body, scope):
+                fence = None
             if fence is None:
                 container = container_indent_after(body, container)
             delimiter = fence_delimiter(body, container)
             if delimiter:
                 before = fence
                 fence = fence_transition(fence, *delimiter)
+                if before is None and fence is not None:
+                    scope = (container, quote_depth(body))
                 if fence is not None or before is not None:
                     flush()
                     in_list = False
@@ -1376,7 +1430,37 @@ RULE_TESTS = [
         "five spaces after a list marker is indented code, not a fence",
     ),
     (
-        "/// -    ```rust\n/// TODO: fixture placeholder\n/// ```\n",
+        "/// - \t\t~~~rust\n/// TODO: issue required\n",
+        {("CH002", 2)},
+        "list padding is counted in columns, so tabs cannot smuggle a fence",
+    ),
+    (
+        "///     - ~~~rust\n/// TODO: issue required\n",
+        {("CH002", 2)},
+        "four spaces before a top-level marker is indented code, not a list",
+    ),
+    (
+        "///    - ~~~rust\n///      TODO: fixture placeholder\n///      ~~~\n",
+        set(),
+        "three spaces before a marker is still a list",
+    ),
+    (
+        "/// - ~~~rust\n///   let x = 1;\n/// TODO: issue required\n",
+        {("CH002", 3)},
+        "an unclosed fence ends when its list item does",
+    ),
+    (
+        "/// > ~~~rust\n/// > let x = 1;\n/// TODO: issue required\n",
+        {("CH002", 3)},
+        "an unclosed fence ends when its block quote does",
+    ),
+    (
+        "/// - ~~~rust\n///\n///   TODO: fixture placeholder\n///   ~~~\n",
+        set(),
+        "a blank line does not end the list item a fence sits in",
+    ),
+    (
+        "/// -    ```rust\n///      TODO: fixture placeholder\n///      ```\n",
         set(),
         "four spaces after a list marker is still valid padding",
     ),
@@ -1456,6 +1540,19 @@ RULE_TESTS = [
 # on ordinary English -- but a rule that catches nothing is not a rule.
 CODE_SHAPE_TESTS = [
     # (line, is commented-out code)
+    ("let (left, right) = split();", True),
+    ("let [a, b] = arr;", True),
+    ("let mut (a, b) = t;", True),
+    ("let (a, b): (u8, u8) = t;", True),
+    ("let Foo { x, y } = value;", True),
+    ("let crate::Foo { x } = v;", True),
+    ("let Some(v) = opt else {", True),
+    ("let Ok(row) = fetch() else {", True),
+    ("let the caller decide;", False),
+    ("let (or rather, allow) the worker retry;", False),
+    ("let us assume the queue is paused;", False),
+    ("let Some values be missing here;", False),
+    ("let the reader see (a) the claim and (b) the release;", False),
     ("fn foo() {", True),
     ("pub fn bar();", True),
     ("fn foo(", True),

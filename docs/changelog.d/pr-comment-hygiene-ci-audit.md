@@ -630,3 +630,48 @@ paragraph opening on line 6, and was reported at 6.
 
 The set of findings is otherwise byte-identical to round seventeen's — same
 rules, paths and text, only lines moved — and no rule's count rose in any file.
+
+### Round nineteen — three more synthetic fences, and destructuring `let`
+
+Four findings, all verified to reproduce first. Three are the same failure
+class: a line that is not a fence opener was read as one, and everything after
+it was silently exempt from the absolute gates.
+
+**A fence did not end when its container did.** CommonMark closes a fenced
+block with the list item or block quote holding it, closing delimiter or not.
+The container was only recomputed while no fence was open, so:
+
+```
+/// - ~~~rust
+///   let x = 1;
+/// TODO: issue required        -> silently exempt
+```
+
+An open fence now records the container column and quote depth it started in,
+and any later line that dedents below either ends it.
+
+**Padding was measured in characters, not columns.** A tab is up to four
+columns wide, so `- \t\t~~~rust` is three characters of padding and seven
+columns of it — past the four-column limit round eighteen added, and through
+it. Columns are expanded from the start of the line, because a tab's width
+depends on the column it sits in.
+
+**A marker's own indentation was unbounded.** `///     - ~~~rust` is an
+indented code line, not a list item, but any amount of leading whitespace was
+accepted. It is now limited to three columns past the container, like every
+other CommonMark indent here.
+
+All three live in `list_content`, which now applies the three rules together.
+
+**Destructuring `let` bypassed CH001.** The binding had to be a single `\w+`,
+so `let (left, right) = split();`, `let [a, b] = arr;`, `let Foo { x, y } =
+value;` and the let-else forms were all missed. Two anchored alternatives
+added, and thirteen shapes added to the code-vs-prose boundary test — eight
+code, five prose, including `let (or rather, allow) the worker retry;`.
+
+Corpus effect: none at all. All four were latent, and the finding set is
+identical to round eighteen's.
+
+One round-eighteen fixture was wrong and is corrected here. It asserted that
+an unindented line after a list-item fence stays fenced; it does not, and the
+container fix above is what exposed it.
