@@ -1744,7 +1744,12 @@ async fn enforce_workflow_timeout(
             )
             .await?;
         }
-        Ok(Some((execution, deferred, closed_children, pending_cancel_metrics)))
+        Ok(Some((
+            execution,
+            deferred,
+            closed_children,
+            pending_cancel_metrics,
+        )))
     }))
     .await?;
 
@@ -4670,14 +4675,15 @@ pub async fn enforce_workflow_history_ceiling(
                 let (mut deferred, closed_children) =
                     apply_parent_close_cascade(conn, exec_id).await?;
                 let mut pending_cancel_metrics = Vec::new();
-                let triggers = crate::completion_trigger::evaluate_triggers_for_execution_collecting(
-                    conn,
-                    exec_id,
-                    crate::completion_trigger::TerminalState::Failed,
-                    Some(metrics),
-                    &mut pending_cancel_metrics,
-                )
-                .await?;
+                let triggers =
+                    crate::completion_trigger::evaluate_triggers_for_execution_collecting(
+                        conn,
+                        exec_id,
+                        crate::completion_trigger::TerminalState::Failed,
+                        Some(metrics),
+                        &mut pending_cancel_metrics,
+                    )
+                    .await?;
                 deferred.extend(triggers);
                 Ok((true, deferred, closed_children, pending_cancel_metrics))
             }))

@@ -1527,7 +1527,8 @@ async fn completion_trigger_supersede_emits_the_counters() {
     // never leaks to sibling tests.
     let _metadata_guard = MetadataGuard::install_one(
         target_wf,
-        ConcurrencyPolicy::new("input.doc_id", 1).with_on_conflict(ConcurrencyOnConflict::CancelRunning),
+        ConcurrencyPolicy::new("input.doc_id", 1)
+            .with_on_conflict(ConcurrencyOnConflict::CancelRunning),
     )
     .await;
 
@@ -1680,7 +1681,8 @@ async fn completion_trigger_supersede_rollback_never_emits_metrics() {
 
     let _metadata_guard = MetadataGuard::install_one(
         target_wf,
-        ConcurrencyPolicy::new("input.doc_id", 1).with_on_conflict(ConcurrencyOnConflict::CancelRunning),
+        ConcurrencyPolicy::new("input.doc_id", 1)
+            .with_on_conflict(ConcurrencyOnConflict::CancelRunning),
     )
     .await;
 
@@ -1739,8 +1741,8 @@ async fn completion_trigger_supersede_rollback_never_emits_metrics() {
     // itself succeeds (it performs the supersede), but the ENCLOSING
     // transaction is made to fail right afterward, rolling everything in it
     // back — including the supersede's cancellation.
-    let result: Result<(), HarvestError> = Box::pin(conn.transaction::<(), HarvestError, _>(
-        async |conn| {
+    let result: Result<(), HarvestError> =
+        Box::pin(conn.transaction::<(), HarvestError, _>(async |conn| {
             let mut pending_cancel_metrics = Vec::new();
             let deferred = evaluate_triggers_for_execution_collecting(
                 conn,
@@ -1766,9 +1768,8 @@ async fn completion_trigger_supersede_rollback_never_emits_metrics() {
             Err(HarvestError::Config(
                 "simulated later-processing rollback (issue #1197 RED phase)".to_string(),
             ))
-        },
-    ))
-    .await;
+        }))
+        .await;
 
     assert!(
         result.is_err(),
@@ -1823,7 +1824,8 @@ async fn evaluate_triggers_for_execution_plain_wrapper_discards_supersede_metric
 
     let _metadata_guard = MetadataGuard::install_one(
         target_wf,
-        ConcurrencyPolicy::new("input.doc_id", 1).with_on_conflict(ConcurrencyOnConflict::CancelRunning),
+        ConcurrencyPolicy::new("input.doc_id", 1)
+            .with_on_conflict(ConcurrencyOnConflict::CancelRunning),
     )
     .await;
 
@@ -1951,7 +1953,8 @@ async fn nested_self_referential_admission_emits_residual_over_limit_counter() {
 
     let _metadata_guard = MetadataGuard::install_one(
         self_ref_wf,
-        ConcurrencyPolicy::new("input.doc_id", 1).with_on_conflict(ConcurrencyOnConflict::CancelRunning),
+        ConcurrencyPolicy::new("input.doc_id", 1)
+            .with_on_conflict(ConcurrencyOnConflict::CancelRunning),
     )
     .await;
 

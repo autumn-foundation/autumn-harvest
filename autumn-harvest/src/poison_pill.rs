@@ -350,14 +350,15 @@ mod scanner {
 
         let (mut deferred, closed_children) = apply_parent_close_cascade(conn, exec_id).await?;
         let mut pending_cancel_metrics = Vec::new();
-        let failed_triggers = crate::completion_trigger::evaluate_triggers_for_execution_collecting(
-            conn,
-            exec_id,
-            crate::completion_trigger::TerminalState::Failed,
-            metrics,
-            &mut pending_cancel_metrics,
-        )
-        .await?;
+        let failed_triggers =
+            crate::completion_trigger::evaluate_triggers_for_execution_collecting(
+                conn,
+                exec_id,
+                crate::completion_trigger::TerminalState::Failed,
+                metrics,
+                &mut pending_cancel_metrics,
+            )
+            .await?;
         deferred.extend(failed_triggers);
 
         // Wake a parent that is blocked on this child. When a parent-close

@@ -1102,9 +1102,14 @@ pub async fn start_or_load_workflow_execution_collect(
             // "later-admitted run wins" a function of admission order rather than
             // wall-clock.
             let started = StartedWorkflowExecution::from_row(execution, true);
-            let (tx_cancel_metrics, supersede_deferred) =
-                run_latest_wins_supersede(conn, &request, exec_id, &mut tx_deferred_checks, metrics)
-                    .await?;
+            let (tx_cancel_metrics, supersede_deferred) = run_latest_wins_supersede(
+                conn,
+                &request,
+                exec_id,
+                &mut tx_deferred_checks,
+                metrics,
+            )
+            .await?;
 
             return Ok((
                 started,
