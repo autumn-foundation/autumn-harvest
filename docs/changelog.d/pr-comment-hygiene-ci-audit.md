@@ -1039,3 +1039,23 @@ the bug. It is replaced by two that assert what actually holds: leaving onto
 prose continues, leaving onto a block start flushes.
 
 Corpus effect: none, for the thirteenth round running.
+
+### Round thirty-two — the nesting snapshot has to hold everything
+
+One finding, verified to reproduce first, in the fix from round twenty-nine.
+
+That round made comment nesting a *scope*: going deeper inherits the enclosing
+state, coming back out restores it. The snapshot held the fence and its scope,
+and nothing else. So a list marker inside a nested comment — ordinary
+paragraph text as far as Rustdoc is concerned, since the `/* */` delimiters
+survive into the rendered documentation — pushed a container onto the
+enclosing run's stack and left it there. The next delimiter measured against
+that phantom container, opened a fence, and swallowed the `TODO` below it.
+
+The snapshot now carries every piece of block state the loop holds: fence,
+scope, container stack and paragraph flag, plus the quote depth and list flag
+in the prose path. The rule is that a nested comment cannot change *anything*
+about the block state of the comment containing it — which is what "scope"
+meant, and the previous fix only implemented for one field of it.
+
+Corpus effect: none, for the fourteenth round running.

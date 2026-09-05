@@ -999,23 +999,24 @@ def comment_runs(pieces: list[Piece]):
         yield run
 
 
-def nesting_shift(
-    saved: list, nest: int, previous: int, state: tuple
-) -> tuple[list, tuple]:
-    """Carry fence state across a nested comment boundary.
+def nesting_shift(saved: list, nest: int, state: tuple) -> tuple[list, tuple]:
+    """Carry block state across a nested comment boundary.
 
     Going deeper INHERITS the enclosing state -- a nested comment inside a
     fenced example is part of that example, so its text is sample text.
-    Coming back out RESTORES what was saved, so a fence the nested comment
-    opened cannot leak into the text that resumes after it closes.
+    Coming back out RESTORES what was saved, so nothing the nested comment
+    opened leaks into the text that resumes after it closes.
+
+    `state` is EVERY piece of block state the caller carries, not just the
+    fence: a list marker inside a nested comment is ordinary paragraph text
+    to Rustdoc, and letting it push a container onto the enclosing run's
+    stack gives a later delimiter a fence allowance nothing opened.
     """
     saved = list(saved)
     while len(saved) < nest:
         saved.append(state)
     while len(saved) > nest:
         state = saved.pop()
-    if nest < previous:
-        return saved, state
     return saved, state
 
 
@@ -1037,8 +1038,8 @@ def comment_lines(pieces: list[Piece]):
         nest = run[0].nest
         for piece in run:
             if piece.nest != nest:
-                saved, (fence, scope) = nesting_shift(
-                    saved, piece.nest, nest, (fence, scope)
+                saved, (fence, scope, stack, paragraph) = nesting_shift(
+                    saved, piece.nest, (fence, scope, list(stack), paragraph)
                 )
                 nest = piece.nest
             text = piece.text
@@ -1177,8 +1178,12 @@ def prose_units(pieces: list[Piece]) -> list[tuple[int, str]]:
         for piece in block:
             if piece.nest != nest:
                 flush()
-                saved, (fence, scope) = nesting_shift(
-                    saved, piece.nest, nest, (fence, scope)
+                saved, (fence, scope, stack, paragraph, quoted, in_list) = (
+                    nesting_shift(
+                        saved,
+                        piece.nest,
+                        (fence, scope, list(stack), paragraph, quoted, in_list),
+                    )
                 )
                 nest = piece.nest
             body = piece.text
@@ -1876,6 +1881,12 @@ RULE_TESTS = [
         "/**\n```rust\n/* TODO: fixture placeholder */\n```\n*/\npub fn a() {}\n",
         set(),
         "a nested comment inside a fenced example is part of the example",
+    ),
+    (
+        "/**\n * Intro\n * /* - inner */\n *     ~~~rust\n"
+        " *   TODO: issue required\n */\n",
+        {("CH002", 5)},
+        "a list marker inside a nested comment does not escape it",
     ),
     (
         "/// - let stale = compute();\n",
