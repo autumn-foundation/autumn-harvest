@@ -512,6 +512,66 @@ async fn terminate_if_running_orphans_an_undelivered_signal_across_repeated_cycl
     );
 }
 
+// 🪝 Snag / Codex review (PR #1374 follow-up): the fix above only deleted staged
+// signals inside `cancel_and_seal_prior`'s `if prior_state == "RUNNING"` branch —
+// but a signal can be staged while the prior is RUNNING and then outlive it even
+// when the prior reaches COMPLETED on its own (the workflow completes without ever
+// awaiting that signal name). That prior is sealed via the SAME function, just
+// through the "already-terminal" path that skips the cancellation branch entirely
+// — so the signal was just as orphaned, by a different trigger than the RUNNING
+// case above. Moving the signal deletion outside the `if` (unconditional for every
+// sealed prior, RUNNING or not) fixes both paths with the same call.
+#[tokio::test]
+async fn terminate_if_running_orphans_an_undelivered_signal_on_an_already_completed_prior() {
+    let (_dir, path) = temp_db();
+    let mut rt = runtime_at(&path);
+
+    // Stage a signal while the prior is still RUNNING (pre-drive)...
+    let prior = rt
+        .start_workflow_with_id("echo_wf", "sig-2", json!({"seed": true}))
+        .unwrap();
+    rt.send_signal(prior, "never_consumed", json!({})).unwrap();
+    assert_eq!(
+        undelivered_signal_count(&path, prior),
+        1,
+        "prior has one staged, undelivered signal"
+    );
+
+    // ...then let it run to completion WITHOUT ever consuming that signal.
+    let state = rt.run_until_blocked(prior).await.unwrap();
+    assert!(
+        matches!(state, RunState::Completed(_)),
+        "echo_wf completes immediately, got {state:?}"
+    );
+    assert_eq!(raw_state(&path, prior), "COMPLETED");
+    assert_eq!(
+        undelivered_signal_count(&path, prior),
+        1,
+        "the signal is still undelivered after the prior completed on its own"
+    );
+
+    let out = rt
+        .start_workflow_with_reuse_policy(
+            "echo_wf",
+            "sig-2",
+            json!({}),
+            WorkflowIdReusePolicy::TerminateIfRunning,
+        )
+        .unwrap();
+    assert!(out.created);
+    assert_eq!(raw_state(&path, prior), "CONTINUED_AS_NEW");
+    assert!(
+        !has_cancelled_event(&rt, prior),
+        "an already-COMPLETED prior is sealed without a cancellation event"
+    );
+    assert_eq!(
+        undelivered_signal_count(&path, prior),
+        0,
+        "the already-completed prior's undelivered signal must be cleaned up too, \
+         not just a RUNNING prior's"
+    );
+}
+
 // ── FINDING (Codex #1080 P2): TerminateIfRunning seals ALL legacy active rows ─────
 //
 // A database written by the PRE-#1068 always-fresh `start_workflow_with_id` can
