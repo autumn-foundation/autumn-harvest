@@ -269,6 +269,19 @@ jobs:
       - name: Folio corpus link check (docs/audits/corpus-link-check.py)
         run: python3 docs/audits/corpus-link-check.py
 
+      # Folio corpus harness: config-key / env-var / CLI-flag drift scan (see
+      # docs/audits/config-cli-drift.py). Ground truth is extracted
+      # mechanically from autumn-harvest-plugin/src/config.rs and
+      # autumn-harvest-cli/src/lib.rs, so this stays accurate as the config
+      # schema and CLI evolve without hand-maintaining a list here. Pure
+      # Python stdlib, no deps, no network. Exits 1 only on a drift hit
+      # inside the reader corpus; a hit inside docs/plans/,
+      # docs/changelog.d/, docs/rnd/, docs/assays/, or docs/perf-artifacts/
+      # is reported but does not fail the build, matching the link-check
+      # convention above.
+      - name: Folio config/CLI drift scan (docs/audits/config-cli-drift.py)
+        run: python3 docs/audits/config-cli-drift.py
+
   test:
     name: Test (${{ matrix.os }})
     needs: [lint, changes]

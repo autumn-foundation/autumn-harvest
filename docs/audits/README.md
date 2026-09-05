@@ -8,6 +8,7 @@ to wire into CI as a gate.
 | Script | Checks | Wired into CI |
 |---|---|---|
 | `corpus-link-check.py` | Internal markdown links (missing file, missing anchor) and orphan pages across `docs/**/*.md` | Yes — `.github/workflows/ci.yml`, `lint` job |
+| `config-cli-drift.py` | Doc-cited `[harvest]` TOML config keys, `AUTUMN_HARVEST*` env vars, and `harvest` CLI `--flags` against the real schema/CLI, extracted mechanically from `autumn-harvest-plugin/src/config.rs` and `autumn-harvest-cli/src/lib.rs` | Yes — `.github/workflows/ci.yml`, `lint` job |
 | `vantage-dashboard-contrast.py` | WCAG 1.4.3 contrast on the Vantage dashboard's inline stylesheet | No — run manually after touching `autumn-harvest-plugin/src/ui.rs`'s `STYLE` constant |
 
 Add a new audit here when a docs (or docs-adjacent UI/generated-artifact)

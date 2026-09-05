@@ -1336,13 +1336,7 @@ impl From<HarvestError> for AutumnError {
 
 ### 13.1 Sharding Strategy
 
-Workflow executions are sharded by hashing the `workflow_id` to a shard number. The shard count is configured at deployment time and is immutable after initial migration (matching Temporal's model):
-
-```rust
-// In autumn.toml
-[harvest]
-num_shards = 16  # must be power of 2, default 16
-```
+Workflow executions are sharded by hashing the `workflow_id` to a shard number, and the shard count is immutable after initial migration. Shard topology is configured through the Rust builder API (`ShardedDbPool`, `HarvestRunnerResources::with_sharded_pool`), not a `[harvest]` TOML key — see [`docs/sharding.md`](sharding.md) for the real configuration surface and per-shard database wiring.
 
 Sharding provides two benefits:
 
@@ -1382,20 +1376,7 @@ Every node runs the full stack (scheduler + worker + web). The scheduler loop on
 
 ### 13.3 Connection Pool Management
 
-The shared deadpool is configured per-instance:
-
-```toml
-[database]
-max_connections = 20  # shared across web + harvest
-
-[harvest.pool]
-# Harvest reserves a portion of the shared pool
-max_scheduler_connections = 2    # for scheduler loop
-max_worker_connections = 8       # for task execution
-# Remaining connections available for web requests
-```
-
-Activities that need their own connections use `ctx.db()` which draws from the shared pool. This means a burst of concurrent activities can temporarily starve web requests. To mitigate this, the worker's `max_concurrent_activities` should be tuned relative to the pool size.
+Harvest does not reserve its own named slice of the connection pool via a `[harvest.pool]` config key — there is no such key. Activities that need their own connections use `ctx.db()`, which draws from the same pool the embedder configured for the rest of the application, so a burst of concurrent activities can temporarily starve unrelated requests against that pool. See [`docs/sharding.md`](sharding.md) for how pool sizing interacts with per-shard `ShardedDbPool` configuration.
 
 ### 13.4 Archival and Retention
 
@@ -1409,67 +1390,66 @@ For long-running deployments, the event history table will be the largest table.
 
 ## 14. Configuration Schema
 
-Harvest configuration lives under the `[harvest]` section of `autumn.toml` and follows Autumn's 5-layer config system:
+Harvest configuration lives under the `[harvest]` section of `autumn.toml`, deserialized by `HarvestRuntimeConfig::load` (`autumn-harvest-plugin/src/config.rs`) in three layers, later layers overriding earlier ones: `autumn.toml`'s `[harvest]` table, then `autumn-{profile}.toml`'s `[harvest]` table (profile from `AUTUMN_PROFILE`), then environment-variable overrides (listed below). Every field is optional and falls back to a built-in default when omitted at every layer:
 
 ```toml
 [harvest]
-# Sharding — immutable after first migration
-num_shards = 16
+mode = "embedded"            # "embedded" | "split" | "external" — default: embedded
+worker_enabled = true        # default: true
+scheduler_enabled = true     # default: true
 
-# Scheduler
-scheduler_tick_interval = "30s"
-dag_default_timeout = "24h"
+[harvest.database]
+url = "postgres://..."       # required when mode is "split" or "external"; unused for "embedded"
 
-# Worker
-worker_enabled = true
-worker_queues = ["default"]
-max_concurrent_workflows = 20
-max_concurrent_activities = 50
-shutdown_timeout = "30s"
+[harvest.outbox]
+enabled = true                # default: true
+batch_size = 32                # default: 32
+poll_interval_ms = 1000        # default: 1000
+claim_ttl_ms = 30000            # default: 30000
+base_retry_delay_ms = 1000      # default: 1000
+max_retry_delay_ms = 60000      # default: 60000
 
-# Sticky execution
-sticky_timeout = "5s"
-workflow_cache_size = 1000
+[harvest.batch]
+concurrency = 32              # default: 32 — also accepts the key `batch_concurrency` (issue #102's original name); either sets the same field, and `batch_concurrency` wins if both are present
+tick_interval_ms = 500        # default: 500
 
-# Task defaults
-default_start_to_close = "5m"
-default_retry_policy.max_attempts = 3
-default_retry_policy.initial_interval = "1s"
-default_retry_policy.backoff_coefficient = 2.0
-default_retry_policy.max_interval = "5m"
+[harvest.readiness]
+require_shard_readiness = false  # default: false — when true, `/health` returns 503 unless writable/candidate shards are ready
 
-# History management
-# configured via `HarvestBuilder::retention(RetentionConfig { ... })`
-
-# Management API
-api_enabled = true
-api_path = "/api/harvest"
-
-# Polling (fallback when LISTEN/NOTIFY misses)
-poll_interval = "5s"
-
-# Connection pool allocation
-pool.max_scheduler_connections = 2
-pool.max_worker_connections = 8
+[harvest.startup]
+orphaned_workflows = "warn"   # "off" | "warn" | "fail" — default: warn
 ```
 
-Environment variable overrides follow Autumn's pattern:
+**Not part of this schema.** Sharding (`ShardedDbPool`, `HarvestRunnerResources::with_sharded_pool`) and per-worker queue/capability routing (`WorkerConfig::with_shard_assignments`, task-queue labels) are configured through the Rust builder API, not TOML or env vars — see [`docs/sharding.md`](sharding.md) and [`docs/getting-started/09-worker-routing.md`](getting-started/09-worker-routing.md). History retention is configured via `HarvestBuilder::retention(RetentionConfig { .. })`, also Rust-only (§13.4 above). The management API's mount path is chosen by the embedder via `HarvestBuilder::harvest_api`, not a config key.
+
+Environment variable overrides, one per field:
 
 ```bash
-AUTUMN_HARVEST__NUM_SHARDS=32
-AUTUMN_HARVEST__WORKER_QUEUES=default,email-workers
-AUTUMN_HARVEST__MAX_CONCURRENT_ACTIVITIES=100
+AUTUMN_HARVEST__MODE=split
+AUTUMN_HARVEST__WORKER_ENABLED=false
+AUTUMN_HARVEST__SCHEDULER_ENABLED=false
+AUTUMN_HARVEST_DATABASE__URL=postgres://...
+AUTUMN_HARVEST_OUTBOX__ENABLED=true
+AUTUMN_HARVEST_OUTBOX__BATCH_SIZE=64
+AUTUMN_HARVEST_OUTBOX__POLL_INTERVAL_MS=500
+AUTUMN_HARVEST_OUTBOX__CLAIM_TTL_MS=30000
+AUTUMN_HARVEST_OUTBOX__BASE_RETRY_DELAY_MS=1000
+AUTUMN_HARVEST_OUTBOX__MAX_RETRY_DELAY_MS=60000
+AUTUMN_HARVEST_BATCH__CONCURRENCY=32
+AUTUMN_HARVEST_BATCH__TICK_INTERVAL_MS=500
+AUTUMN_HARVEST_READINESS__REQUIRE_SHARD_READINESS=true
+AUTUMN_HARVEST_STARTUP__ORPHANED_WORKFLOWS=fail
 ```
 
-Profile-specific overrides:
+Profile-specific overrides work the same way, in a profile-named file:
 
 ```toml
 # autumn-production.toml
 [harvest]
-num_shards = 64
-max_concurrent_activities = 200
-history_retention = "90d"
-archive_enabled = true
+mode = "split"
+
+[harvest.readiness]
+require_shard_readiness = true
 ```
 
 ---
