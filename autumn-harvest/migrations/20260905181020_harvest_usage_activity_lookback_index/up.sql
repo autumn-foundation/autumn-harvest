@@ -58,15 +58,56 @@
 -- safe no-op if the index was already built ahead of time; for a live,
 -- already-large deployment, build it out-of-band first (outside any
 -- transaction -- `CONCURRENTLY` cannot run inside Diesel's migration
--- transaction) and this migration becomes that no-op:
+-- transaction) and this migration becomes that no-op.
+--
+-- The recipe depends on whether the deployment has opted into the partitioned
+-- `harvest_events` layout (`docs/partitioned-events.md`, `harvest partition
+-- enable`, issue #958), because Postgres does not support `CREATE INDEX
+-- CONCURRENTLY` in a single statement against a partitioned PARENT (Codex
+-- review, PR #1381): "concurrent index builds for indexes on partitioned
+-- tables are currently not supported" -- see
+-- <https://www.postgresql.org/docs/16/sql-createindex.html#SQL-CREATEINDEX-CONCURRENTLY>.
+--
+-- **Unpartitioned** (the default -- `SELECT relkind FROM pg_class WHERE
+-- oid = 'harvest_events'::regclass` reports `'r'`):
 --
 --   CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_harvest_events_activity_started_lookup
 --       ON harvest_events (workflow_exec_id, (event_data #>> '{data,activity_id}'), timestamp)
 --       WHERE event_type = 'ActivityStarted';
 --
+-- **Partitioned** (`relkind` reports `'p'`): build the index `CONCURRENTLY`
+-- on every existing leaf partition first (each is an ordinary table, so this
+-- IS supported per-partition), then create the parent's index without
+-- `CONCURRENTLY` -- Postgres recognizes every partition already carries a
+-- matching index and only writes the parent's catalog entry, a metadata-only
+-- operation that does not rescan data. Generate the per-partition statements
+-- rather than hand-listing them, since partitions are cohort-named and
+-- opened over time (`partition::partition_name`):
+--
+--   SELECT format(
+--       'CREATE INDEX CONCURRENTLY IF NOT EXISTS %I ON %I ' ||
+--       '(workflow_exec_id, (event_data #>> ''{data,activity_id}''), timestamp) ' ||
+--       'WHERE event_type = ''ActivityStarted'';',
+--       'idx_' || child.relname || '_activity_started_lookup',
+--       child.relname
+--   )
+--   FROM pg_inherits
+--   JOIN pg_class parent ON pg_inherits.inhparent = parent.oid
+--   JOIN pg_class child ON pg_inherits.inhrelid = child.oid
+--   WHERE parent.oid = 'harvest_events'::regclass;
+--   -- review and run the generated statements, THEN:
+--   CREATE INDEX IF NOT EXISTS idx_harvest_events_activity_started_lookup
+--       ON harvest_events (workflow_exec_id, (event_data #>> '{data,activity_id}'), timestamp)
+--       WHERE event_type = 'ActivityStarted';
+--
+-- A partition opened by `harvest_event_cohort`'s rollover *after* the leaf
+-- pass but *before* the parent statement above needs its own `CONCURRENTLY`
+-- build (it won't yet carry a matching index); re-run the generator query to
+-- pick up any new leaves before the final parent statement.
+--
 -- (`CONCURRENTLY` can leave an INVALID index behind on failure/cancellation --
--- check `pg_index.indisvalid` for this index's oid and `DROP INDEX
--- CONCURRENTLY` + retry if it is false before relying on it.)
+-- check `pg_index.indisvalid` for the index's oid and `DROP INDEX
+-- CONCURRENTLY` + retry if it is false before relying on it, on either path.)
 CREATE INDEX IF NOT EXISTS idx_harvest_events_activity_started_lookup
     ON harvest_events (workflow_exec_id, (event_data #>> '{data,activity_id}'), timestamp)
     WHERE event_type = 'ActivityStarted';
