@@ -55626,7 +55626,7 @@ mod tests {
     /// Build the `worker_build_ids` map `rate_limit_gate_applies` and
     /// `every_eligible_worker_is_on_the_local_build` expect, exactly as
     /// `build_diagnosis_report` builds it once from `live_workers`.
-    fn build_ids<'a>(workers: &'a [WorkerRow]) -> std::collections::HashMap<&'a str, &'a str> {
+    fn build_ids(workers: &[WorkerRow]) -> std::collections::HashMap<&str, &str> {
         workers
             .iter()
             .map(|w| (w.worker.worker_id.as_str(), w.worker.build_id.as_str()))
