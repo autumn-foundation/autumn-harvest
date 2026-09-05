@@ -744,3 +744,33 @@ inside an item's paragraph does not:
 
 Corpus effect: none. Both were latent, and the finding set is identical to
 round twenty's.
+
+### Round twenty-two — quote depth in the pop rule, fences end paragraphs, turbofish
+
+Three findings, all verified to reproduce first.
+
+**A block quote nested inside a list item closed the item.** `/// - outer`
+then `///   > quoted`: stripping the quote marker puts the body at column
+zero, which read as a dedent out of the item, so a fence opened afterwards was
+recorded as top-level and outlived the list.
+
+The rule is that columns only compare within one quote depth. A shallower line
+has left the quote outright; a deeper one is *inside* the container, so its
+stripped column says nothing about leaving it. Both the pop loop and
+`leaves_container` now require equal depth before comparing columns.
+
+**A fence did not end the paragraph before it.** The opener line set
+`paragraph`, and nothing cleared it, so an ordered list starting at a number
+other than one was refused a container immediately after a fenced block — and
+the fence nested under that list then measured against the wrong column, so
+its own sample text failed CH002. A fence delimiter now clears the paragraph,
+in both loops.
+
+**Turbofish calls bypassed CH001.** `Type::method::<T>(value);` and
+`iter.collect::<Vec<_>>();` stopped the call pattern at `<`. A constrained
+turbofish segment is allowed before the call parenthesis, on the receiver and
+on each method. `see collect::<Vec<_>>() for the shape;` stays clean — the
+pattern still has to open the line.
+
+Corpus effect: none. All three latent, finding set identical to round
+twenty-one's.

@@ -250,7 +250,8 @@ COMMENTED_CODE_RE = re.compile(
       # against all 176k corpus comments before adding: one hit, and it was
       # real commented-out code.
       | (?:return|break|continue)\b(?:\s+[^\s;{}]+)?\s*;\s*$
-      | [\w:]+(?:\.[\w:]+)*\(.*\)(?:\s*\?|\s*\.await\s*\??)*\s*;\s*$
+      | [\w:]+(?:::<[^;()]*>)?(?:\.[\w:]+(?:::<[^;()]*>)?)*
+            \(.*\)(?:\s*\?|\s*\.await\s*\??)*\s*;\s*$
     )""",
     re.VERBOSE,
 )
@@ -694,8 +695,11 @@ def leaves_container(text: str, scope: tuple[int, int]) -> bool:
     the failure this harness exists to prevent.
     """
     container, depth = scope
-    if quote_depth(text) < depth:
-        return True
+    # Columns only compare inside one quote depth: a shallower line has left
+    # the quote outright, and a deeper one is nested INSIDE the container, so
+    # its post-strip column says nothing about leaving it.
+    if quote_depth(text) != depth:
+        return quote_depth(text) < depth
     body = strip_quote(text)
     if not body.strip():
         return False
@@ -731,7 +735,10 @@ def update_containers(
     stack = [entry for entry in stack if entry[1] <= depth]
     if body.strip():
         indent = leading_columns(body)
-        while stack and stack[-1][0] > indent:
+        # Same-depth only, for the same reason. A block quote nested in a list
+        # item sits INSIDE it, and its stripped body starts at column zero --
+        # popping on that closes the item that contains the quote.
+        while stack and stack[-1][1] == depth and stack[-1][0] > indent:
             stack.pop()
     if len(stack) < popped:
         paragraph = False
@@ -849,6 +856,10 @@ def comment_lines(pieces: list[Piece]):
             if delimiter:
                 before = fence
                 fence = fence_transition(fence, *delimiter)
+                # A fence is a block, so it ends the paragraph before it.
+                # Otherwise the opener leaves `paragraph` set and the next
+                # "22." is refused a container it is entitled to.
+                paragraph = False
                 if before is None and fence is not None:
                     scope = (container, quote_depth(text))
                 # Fence SYNTAX only if it opened one, closed one, or sits
@@ -958,6 +969,7 @@ def prose_units(pieces: list[Piece]) -> list[tuple[int, str]]:
             if delimiter:
                 before = fence
                 fence = fence_transition(fence, *delimiter)
+                paragraph = False
                 if before is None and fence is not None:
                     scope = (container, quote_depth(body))
                 if fence is not None or before is not None:
@@ -1532,6 +1544,18 @@ RULE_TESTS = [
         "but \"2.\" after \"1.\" still opens its own item",
     ),
     (
+        "/// ~~~rust\n/// let x = 1;\n/// ~~~\n/// 22. item\n"
+        "///      ~~~rust\n///      TODO: fixture placeholder\n///      ~~~\n",
+        set(),
+        "a fence ends the paragraph before it, so \"22.\" may open an item",
+    ),
+    (
+        "/// - outer\n///   > quoted\n///   ~~~rust\n///   let x = 1;\n"
+        "/// TODO: issue required\n",
+        {("CH002", 5)},
+        "a quote nested in a list item does not close the item",
+    ),
+    (
         "/// -    ```rust\n///      TODO: fixture placeholder\n///      ```\n",
         set(),
         "four spaces after a list marker is still valid padding",
@@ -1667,6 +1691,10 @@ CODE_SHAPE_TESTS = [
     ("impl the row has already been deleted by retention {", False),
     ("cleanup();", True),
     ("client.send(value).await?;", True),
+    ("Type::method::<T>(value);", True),
+    ("iter.collect::<Vec<_>>();", True),
+    ("foo::<u8>(1)?;", True),
+    ("see collect::<Vec<_>>() for the shape;", False),
     ("self.flush()?;", True),
     ("return Err(error);", True),
     ("break;", True),
