@@ -395,3 +395,21 @@ because the two cases are one line apart and pull opposite ways: `.txt` → `.rs
 now exits 1 with both findings attributed to the change (`0 at the merge
 base`), while a pure `.rs` → `.rs` rename still exits 0 with its allowance
 intact.
+
+**CH006 enumerated, before a thirteenth round found more.** CH006 produced a
+finding in three consecutive review rounds — `can't`, the modal perfects, the
+interrogatives — each because the rule was spot-checked rather than
+enumerated. Applying the lesson from the CH001 sweep, its coverage is now
+generated rather than sampled: 61 English contractions it must match and 10
+possessive or abbreviation forms it must not, checked by `--self-test` on
+every CI run.
+
+That audit found one further genuine miss (`daren't`) and, more usefully,
+settled a question it would otherwise have hit later. The noun + `'s` forms
+(`one's`, `someone's`, `everything's`) are ambiguous: "someone's waiting" is a
+contraction, "someone's row" is a possessive, which STE permits. Measured over
+the corpus, **all 21 occurrences are possessives** — "the previous one's
+outcome", "the worst one's" — so matching those stems would report 21 false
+positives against correct prose. They are now excluded deliberately, with that
+measurement written down as the reason, rather than left to look like an
+oversight.

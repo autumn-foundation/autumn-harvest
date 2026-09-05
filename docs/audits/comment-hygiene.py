@@ -268,9 +268,18 @@ ARCHAEOLOGY_RE = re.compile(
 
 # Real contractions only. Excludes the possessive/abbreviation apostrophe this
 # corpus uses ("TTL'd overrides", "the row's bytes"), which STE permits.
+#
+# Deliberately NOT matched: the noun + `'s` forms (`one's`, `someone's`,
+# `everything's`, ...). They are ambiguous -- "someone's waiting" is a
+# contraction but "someone's row" is a possessive -- and measured over this
+# corpus all 21 occurrences are possessives ("the previous one's outcome",
+# "the worst one's"). Adding those stems would report 21 false positives
+# against correct STE. The stems below are the unambiguous ones: `it's`,
+# `who's`, `there's` and friends have distinct possessive spellings (`its`,
+# `whose`, `theirs`), so a match is always a contraction.
 CONTRACTION_RE = re.compile(
     r"\b(?:ca|is|are|was|were|do|does|did|would|could|should|will|has|have|had"
-    r"|must|ai|wo|sha|need|ought|might)n't\b"
+    r"|must|ai|wo|sha|need|ought|might|dare)n't\b"
     r"|\b(?:it|that|there|here|what|who|how|where|when|why|let|he|she|we|they"
     r"|you|i|world)'(?:s|ll|re|ve|d|m)\b"
     r"|\b(?:should|could|would|must|might)'ve\b",
@@ -1171,6 +1180,29 @@ CODE_SHAPE_TESTS = [
 # separate review rounds. Generating the cross-product catches them before a
 # reviewer does: it found six on one pass and four on another, each time in a
 # branch that looked correct in isolation.
+# Every English contraction CH006 is expected to catch, and the possessive
+# forms it must not. CH006 produced three findings in three review rounds --
+# `can't`, the modal perfects, the interrogatives -- each because the rule was
+# spot-checked rather than enumerated. This is the enumeration.
+CONTRACTIONS_EXPECTED = [
+    "can't", "won't", "don't", "doesn't", "didn't", "isn't", "aren't", "wasn't",
+    "weren't", "hasn't", "haven't", "hadn't", "wouldn't", "couldn't",
+    "shouldn't", "mustn't", "needn't", "oughtn't", "mightn't", "shan't",
+    "ain't", "daren't",
+    "it's", "that's", "there's", "here's", "what's", "who's", "how's",
+    "where's", "when's", "why's", "he's", "she's", "let's",
+    "we're", "they're", "you're",
+    "we've", "they've", "you've", "i've", "should've", "could've", "would've",
+    "must've", "might've",
+    "we'll", "they'll", "you'll", "i'll", "it'll", "he'll", "she'll",
+    "we'd", "they'd", "you'd", "i'd", "he'd", "she'd", "i'm",
+]
+# Possessives and abbreviations STE permits. A match here is a false positive.
+CONTRACTIONS_EXCLUDED = [
+    "one's", "someone's", "everyone's", "nobody's", "everything's",
+    "something's", "nothing's", "the row's", "the queue's", "TTL'd",
+]
+
 SWEEP_KEYWORDS = [
     "fn", "struct", "enum", "trait", "union", "mod", "const", "static", "type",
     "impl", "let", "use", "pub fn", "async fn", "if", "while", "for", "match",
@@ -1232,6 +1264,21 @@ def self_test() -> int:
     print(f"  [{'ok  ' if ok else 'FAIL'}] line number survives a continuation")
     if not ok:
         print(f"         expected line 3, got {[(p.line, p.text) for p in pieces]!r}")
+
+    missed = [c for c in CONTRACTIONS_EXPECTED if not CONTRACTION_RE.search(f"The row {c} ready.")]
+    wrong = [c for c in CONTRACTIONS_EXCLUDED if CONTRACTION_RE.search(f"The row {c} ready.")]
+    failures += len(missed) + len(wrong)
+    if missed or wrong:
+        print(f"  [FAIL] CH006 contraction inventory: {len(missed)} missed, {len(wrong)} false")
+        for c in missed:
+            print(f"         missed: {c!r}")
+        for c in wrong:
+            print(f"         false positive on possessive: {c!r}")
+    else:
+        print(
+            f"  [ok  ] CH006 contraction inventory "
+            f"({len(CONTRACTIONS_EXPECTED)} matched, {len(CONTRACTIONS_EXCLUDED)} correctly ignored)"
+        )
 
     sweep = prose_sweep()
     sweep_fps = [line for line in sweep if COMMENTED_CODE_RE.match(line)]
