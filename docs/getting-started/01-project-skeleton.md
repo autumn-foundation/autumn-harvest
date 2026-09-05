@@ -31,6 +31,14 @@ runtime at a database of your own, which it will never delete:
 HARVEST_DEV_DATABASE_URL=postgres://me@localhost:5432/harvest_dev cargo dev
 ```
 
+`me` is a placeholder, not a literal role — this DSN doesn't work copied
+verbatim. Point it at a role that can actually authenticate for your server's
+auth method (peer, trust, or a password in the DSN itself); copied as-is
+against an ordinary password-authenticated Postgres it fails immediately with
+Postgres's own `fe_sendauth: no password supplied`, which names neither
+`HARVEST_DEV_DATABASE_URL` nor this doc. For a fresh install using the default
+`postgres` role: `postgres://postgres:<password>@localhost:5432/harvest_dev`.
+
 Start the sample, kill the process while the timer is counting down, and start
 it again: the engine replays the first activity from history rather than
 re-running it.
@@ -72,8 +80,9 @@ A few things worth knowing:
   HARVEST_DEV_DATABASE_URL=postgres://me@localhost:5432/harvest_dev cargo dev
   ```
 
-  It still goes through the same safety gate, and it is left exactly as it is on
-  exit — the dev runtime only ever deletes storage it created itself.
+  (`me` is a placeholder for your own role — see the caveat above.) It still
+  goes through the same safety gate, and it is left exactly as it is on exit —
+  the dev runtime only ever deletes storage it created itself.
 - **On Windows** the whole path is pure Rust (no libpq, no OpenSSL). Provisioning
   finds a standard EnterpriseDB install under
   `C:\Program Files\PostgreSQL\<version>\bin`, and the managed tier downloads
