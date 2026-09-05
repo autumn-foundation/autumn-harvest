@@ -419,6 +419,27 @@ def line_tail(pieces: list, index: int) -> str:
     return "".join(tail)
 
 
+def starts_block(text: str, container: int) -> bool:
+    """Does `text` begin a CommonMark block other than a paragraph?
+
+    This is what ENDS a GFM table. A body row needs no pipe -- Rustdoc
+    renders "ordinary row" under a table as a cell and fills the rest of
+    them -- so the table runs to a blank line or the next block, and
+    requiring a pipe in every row ended it one line early.
+    """
+    if not text.strip():
+        return True
+    fence = FENCE_RE.match(text)
+    return (
+        (bool(fence) and len(fence.group(1).expandtabs(4)) <= container + 3)
+        or heading(text, container)
+        or html_block(text, container)
+        or thematic_break(text, container)
+        or bool(list_content(text, container))
+        or bool(quote_marker(text, container))
+    )
+
+
 def next_row(pieces: list, index: int, nest: int):
     """The piece after `index`, if it is in the same comment.
 
@@ -495,6 +516,19 @@ HTML_BLOCK_RE = re.compile(
 )
 
 
+# What ends each kind of HTML block. Types 1 to 5 end ON the line carrying
+# the closer, which may be the opening line itself ("<pre>raw</pre>"); type 6
+# ends at a blank line, which is not part of it.
+HTML_VERBATIM_RE = re.compile(r"^[ \t]*<(?:script|pre|style|textarea)(?:[ \t/>]|$)", re.I)
+HTML_CLOSERS = {
+    "verbatim": ("</script>", "</pre>", "</style>", "</textarea>"),
+    "comment": ("-->",),
+    "instruction": ("?>",),
+    "declaration": (">",),
+    "cdata": ("]]>",),
+}
+
+
 def html_block(text: str, container: int) -> bool:
     """Does `text` open a CommonMark HTML block?
 
@@ -504,6 +538,34 @@ def html_block(text: str, container: int) -> bool:
     """
     match = HTML_BLOCK_RE.match(text)
     return bool(match) and len(match.group(1).expandtabs(4)) <= container + 3
+
+
+def html_kind(text: str) -> str:
+    """Which sort of HTML block `text` opens, which decides what closes it."""
+    stripped = text.lstrip()
+    if HTML_VERBATIM_RE.match(text):
+        return "verbatim"
+    if stripped.startswith("<!--"):
+        return "comment"
+    if stripped.startswith("<?"):
+        return "instruction"
+    if stripped.startswith("<![CDATA["):
+        return "cdata"
+    if stripped.startswith("<!"):
+        return "declaration"
+    return "tag"
+
+
+def html_closes(text: str, kind: str) -> bool:
+    """Does `text` end an open HTML block of `kind`?
+
+    Its CONTENT is raw HTML, not Markdown -- Rustdoc renders a 26-word line
+    between "<pre>" and "</pre>" preformatted, so counting it as a sentence
+    reports a CH007 on something that is not prose.
+    """
+    if kind == "tag":
+        return not text.strip()
+    return any(closer in text.lower() for closer in HTML_CLOSERS[kind])
 
 
 # A sentence boundary. The two abbreviations this corpus writes constantly
@@ -1315,15 +1377,16 @@ def comment_lines(pieces: list[Piece]):
         paragraph = False
         quoted = 0
         in_table = False
+        html: str | None = None
         saved: list = []
         nest = run[0].nest
         for index, piece in enumerate(run):
             if piece.nest != nest:
-                saved, (fence, scope, stack, paragraph, quoted, in_table) = (
+                saved, (fence, scope, stack, paragraph, quoted, in_table, html) = (
                     nesting_shift(
                         saved,
                         piece.nest,
-                        (fence, scope, list(stack), paragraph, quoted, in_table),
+                        (fence, scope, list(stack), paragraph, quoted, in_table, html),
                     )
                 )
                 nest = piece.nest
@@ -1333,8 +1396,21 @@ def comment_lines(pieces: list[Piece]):
             # Rustdoc renders the whole line as a paragraph; opening a fence
             # there exempts every line until the next delimiter.
             if not piece.line_start:
-                yield piece.line, text, fence is not None
+                yield piece.line, text, fence is not None or html is not None
                 continue
+            # Inside a raw HTML block nothing is Markdown, so no fence, list
+            # or table opens here and the text is not prose. A type-6 block
+            # ends AT a blank line, which is a block boundary in its own
+            # right and must still be seen; the others end on the line that
+            # carries their closer.
+            if html is not None:
+                if html == "tag" and html_closes(text, html):
+                    html = None
+                else:
+                    if html_closes(text, html):
+                        html = None
+                    yield piece.line, text, True
+                    continue
             if fence is not None and leaves_container(text, scope):
                 fence = None
             if fence is None:
@@ -1343,12 +1419,12 @@ def comment_lines(pieces: list[Piece]):
                 # asymmetry, now with the structure to tell them apart.
                 enclosing = stack[-1][0] if stack else 0
                 body = strip_quote(text, enclosing)
-                if "|" not in body:
-                    in_table = False
-                elif not in_table:
+                if in_table:
+                    in_table = not starts_block(body, enclosing)
+                else:
                     in_table = table_header(run, index, piece.nest, body, enclosing)
                 stack, paragraph = update_containers(
-                    text, stack, paragraph, quoted, in_table and "|" in body
+                    text, stack, paragraph, quoted, in_table
                 )
                 quoted = quote_depth(text, stack[-1][0] if stack else 0)
             container = stack[-1][0] if stack else 0
@@ -1391,6 +1467,13 @@ def comment_lines(pieces: list[Piece]):
                 # defect that rejecting it exists to expose.
                 yield piece.line, text, fence is not None or before is not None
                 continue
+            # An HTML block opens here, outside any fence. Its own line is
+            # ordinary text -- "<pre>" carries no defect -- but everything
+            # until its closer is raw HTML.
+            if fence is None and html_block(text, container):
+                html = html_kind(text)
+                if html != "tag" and html_closes(text, html):
+                    html = None
             yield piece.line, text, fence is not None
 
 
@@ -1494,26 +1577,35 @@ def prose_units(pieces: list[Piece]) -> list[tuple[int, str]]:
             run, run_lines = [], []
 
         in_table = False
+        html: str | None = None
         for index, piece in enumerate(block):
             if piece.nest != nest:
                 # No flush: a sentence that crosses an inline nested comment
                 # is still one sentence in the rendered documentation, since
                 # the delimiters and the text between them are literal. Only
                 # the BLOCK state is isolated by the nesting.
-                saved, (fence, scope, stack, paragraph, quoted, in_list, in_table) = (
-                    nesting_shift(
-                        saved,
-                        piece.nest,
-                        (
-                            fence,
-                            scope,
-                            list(stack),
-                            paragraph,
-                            quoted,
-                            in_list,
-                            in_table,
-                        ),
-                    )
+                saved, (
+                    fence,
+                    scope,
+                    stack,
+                    paragraph,
+                    quoted,
+                    in_list,
+                    in_table,
+                    html,
+                ) = nesting_shift(
+                    saved,
+                    piece.nest,
+                    (
+                        fence,
+                        scope,
+                        list(stack),
+                        paragraph,
+                        quoted,
+                        in_list,
+                        in_table,
+                        html,
+                    ),
                 )
                 nest = piece.nest
             body = piece.text
@@ -1521,13 +1613,24 @@ def prose_units(pieces: list[Piece]) -> list[tuple[int, str]]:
             # The text is still part of the line's sentence, so it joins the
             # run rather than starting one.
             if not piece.line_start:
-                if fence is not None:
+                if fence is not None or html is not None:
                     flush()
                     in_list = False
                 elif body.strip():
                     run.append(body.strip())
                     run_lines.append(piece.line)
                 continue
+            # Raw HTML is not Markdown and not prose -- see `comment_lines`,
+            # which carries this state the same way.
+            if html is not None:
+                if html == "tag" and html_closes(body, html):
+                    html = None
+                else:
+                    if html_closes(body, html):
+                        html = None
+                    flush()
+                    in_list = False
+                    continue
             if fence is not None and leaves_container(body, scope):
                 fence = None
             if fence is None:
@@ -1538,12 +1641,12 @@ def prose_units(pieces: list[Piece]) -> list[tuple[int, str]]:
                 # refused its container and the fence under it went unseen.
                 enclosing = stack[-1][0] if stack else 0
                 peek = strip_quote(body, enclosing)
-                if "|" not in peek:
-                    in_table = False
-                elif not in_table:
+                if in_table:
+                    in_table = not starts_block(peek, enclosing)
+                else:
                     in_table = table_header(block, index, piece.nest, peek, enclosing)
                 stack, paragraph = update_containers(
-                    body, stack, paragraph, quoted, in_table and "|" in peek
+                    body, stack, paragraph, quoted, in_table
                 )
             container = stack[-1][0] if stack else 0
             delimiter = fence_delimiter(body, container, fence is not None, scope[2], stack)
@@ -1611,10 +1714,19 @@ def prose_units(pieces: list[Piece]) -> list[tuple[int, str]]:
             # the rows that follow -- decided here rather than up front,
             # because the delimiter's indent is measured against whatever
             # container is open at that point.
+            if html_block(body, container):
+                # The opener's own line is a block, and everything to its
+                # closer is raw HTML. `comment_lines` opens the block at the
+                # same point and by the same test.
+                html = html_kind(body)
+                if html != "tag" and html_closes(body, html):
+                    html = None
+                flush()
+                in_list = False
+                continue
             if (
-                ("|" in body and in_table)
+                in_table
                 or heading(body, container)
-                or html_block(body, container)
                 or SEPARATOR_RE.match(body)
                 or not body.strip()
             ):
@@ -2723,6 +2835,39 @@ RULE_TESTS = [
         "// Short one. Short two.\n",
         set(),
         "an ordinary period still ends one",
+    ),
+    (
+        "//! | a | b |\n"
+        "//! | - | - |\n"
+        "//! ordinary row with no separator\n"
+        "//! 22. item\n"
+        "//!     ```\n"
+        "//!     word1 word2 word3 word4 word5 word6 word7 word8 word9 word10 word11 word12 word13 word14 word15 word16 word17 word18 word19 word20 word21 word22 word23 word24 word25 word26.\n"
+        "//!     ```\n",
+        set(),
+        "a table body row needs no pipe",
+    ),
+    (
+        "//! <pre>\n"
+        "//! word1 word2 word3 word4 word5 word6 word7 word8 word9 word10 word11 word12 word13 word14 word15 word16 word17 word18 word19 word20 word21 word22 word23 word24 word25 word26.\n"
+        "//! </pre>\n",
+        set(),
+        "an HTML block runs to its closer",
+    ),
+    (
+        "//! Intro.\n"
+        "//! <pre>raw</pre>\n"
+        "//! word1 word2 word3 word4 word5 word6 word7 word8 word9 word10 word11 word12 word13 word14 word15 word16 word17 word18 word19 word20 word21 word22 word23 word24 word25 word26.\n",
+        {("CH007", 3)},
+        "an HTML block closed on its own line ends there",
+    ),
+    (
+        "//! <div>\n"
+        "//! word1 word2 word3 word4 word5 word6 word7 word8 word9 word10 word11 word12 word13 word14 word15 word16 word17 word18 word19 word20 word21 word22 word23 word24 word25 word26.\n"
+        "//!\n"
+        "//! word1 word2 word3 word4 word5 word6 word7 word8 word9 word10 word11 word12 word13 word14 word15 word16 word17 word18 word19 word20 word21 word22 word23 word24 word25 word26.\n",
+        {("CH007", 4)},
+        "a tag-name HTML block ends at a blank line",
     ),
 ]
 

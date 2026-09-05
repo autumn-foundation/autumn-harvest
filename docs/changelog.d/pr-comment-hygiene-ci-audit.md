@@ -1420,3 +1420,33 @@ twenty-five rounds. It is the abbreviation fix, and it is the sentences already
 in the tree being measured at their true length: 274 findings restated as 471
 longer ones. The ratchet recomputes both sides with the same code, so the gate
 stays clean — 5018 in changed files against 5020 at the merge base.
+
+### Round forty-five — a table row without a pipe, and how far an HTML block reaches
+
+Both findings are the same mistake in two features added the round before:
+recognizing where a block STARTS and never asking where it ends.
+
+**A table body row needs no pipe.** Rustdoc renders `ordinary row with no
+separator` under a table as a cell and fills the missing ones. The scanners
+cleared the table state on any pipe-less line, so the table ended a line early,
+the `22.` after it was refused its container, and a 26-word code sample inside
+the fence below reported CH007. A GFM table runs to a blank line or the next
+block, which is what `starts_block` now decides — and a fixture pins that a
+blank line still ends one.
+
+**An HTML block runs to its closer.** Round forty-four taught the audit that
+`<pre>` opens a block and stopped there, so the preformatted line under it was
+still counted as prose and reported. Both loops now carry the block: types 1
+to 5 end on the line holding their closer, which may be the opening line
+itself (`<pre>raw</pre>`), and a type-6 tag-name block ends at a blank line,
+which remains a block boundary in its own right. Inside one, nothing is
+Markdown and nothing is prose.
+
+Three of the four shapes here are CH007 or CH002 reported on content that is
+not prose. That is the false-positive direction, on a gate meant to run in CI,
+and it is worth noting that both defects were introduced by the fixes for the
+two rounds before them. Recognizing a block opener without its extent is a
+half-implemented block, and a half-implemented block reports the inside of it.
+
+Corpus effect: none. The tree writes no tables in `*.rs` comments and no raw
+HTML in them, which is also why nothing caught these until they were rendered.
