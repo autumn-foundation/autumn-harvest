@@ -3656,6 +3656,7 @@ async fn persist_external_signal_inline(
                                     conn,
                                     *target_id,
                                     "cancelled by external request",
+                                    Some(metrics),
                                 )
                                 .await
                                 {
@@ -14623,6 +14624,7 @@ pub async fn apply_race_loser_cancellations(
                 conn,
                 *child_id,
                 "lost race to a sibling branch",
+                Some(metrics.as_ref()),
             )
             .await
             {

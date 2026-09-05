@@ -817,6 +817,7 @@ pub async fn start_or_load_workflow_execution_collect(
             conn,
             existing_exec_id,
             "terminated to start new execution",
+            metrics,
         )
         .await
         {
@@ -2562,6 +2563,12 @@ pub async fn cancel_workflow_execution_collect(
     conn: &mut AsyncPgConnection,
     exec_id: ExecutionId,
     reason: &str,
+    // issue #1197, item 2 (Codex round 3, P2): threaded into this cancellation's
+    // own completion-trigger evaluation below so a nested self-referential
+    // admission recursing off of THIS cancel sees the real caller-supplied
+    // recorder instead of unconditionally falling back to the process-global
+    // one. `None` at every call site that never had a recorder in scope.
+    metrics: Option<&(dyn crate::telemetry::MetricsRecorder + Send + Sync)>,
 ) -> HarvestResult<(
     CancelledWorkflowExecution,
     Vec<DeferredTriggerStart>,
@@ -2715,14 +2722,21 @@ pub async fn cancel_workflow_execution_collect(
             )
             .await?;
             let (mut deferred, closed_children) = apply_parent_close_cascade(conn, exec_id).await?;
-            // issue #1197, item 1: this path never threads a metrics recorder,
-            // so the plain wrapper's own throwaway collector is already
-            // correct here.
+            // issue #1197, item 1: this evaluation's own supersede/cancel
+            // metrics are still discarded by the plain wrapper's throwaway
+            // collector (this transaction is a nested SAVEPOINT from the
+            // caller's perspective in the common case, so nothing here could
+            // safely emit post-commit anyway) -- but `metrics`, when the
+            // caller has one, is now passed through rather than hardcoded to
+            // `None` (issue #1197, item 2, Codex round 3 P2), so a nested
+            // self-referential admission this cancellation's own trigger
+            // evaluation recurses into sees the real recorder instead of
+            // unconditionally falling back to the process-global one.
             let triggers = crate::completion_trigger::evaluate_triggers_for_execution(
                 conn,
                 exec_id,
                 crate::completion_trigger::TerminalState::Cancelled,
-                None,
+                metrics,
             )
             .await?;
             deferred.extend(triggers);
@@ -2786,7 +2800,7 @@ pub async fn cancel_workflow_execution(
     metrics: &(dyn crate::telemetry::MetricsRecorder + Send + Sync),
 ) -> HarvestResult<CancelledWorkflowExecution> {
     let (cancel_result, deferred_starts, deferred_checks, deferred_terminal) =
-        cancel_workflow_execution_collect(conn, exec_id, reason).await?;
+        cancel_workflow_execution_collect(conn, exec_id, reason, Some(metrics)).await?;
 
     for check in deferred_checks {
         let _ = check_and_report_unfinished_handlers(conn, check.0, &check.1, Some(metrics)).await;
@@ -4851,7 +4865,7 @@ pub async fn resolve_and_cancel_by_workflow_id(
     if crate::erase::is_terminal_state(&run.state) {
         return Ok(ByIdCancelOutcome::AlreadyTerminal);
     }
-    match cancel_workflow_execution_collect(conn, run.exec_id, reason).await {
+    match cancel_workflow_execution_collect(conn, run.exec_id, reason, None).await {
         Ok((cancelled, deferred, closed_children, metrics)) => Ok(ByIdCancelOutcome::Cancelled {
             cancelled: Box::new(cancelled),
             deferred,
@@ -5189,6 +5203,7 @@ pub async fn signal_with_start_workflow_execution_with_metrics(
                     conn,
                     prior_exec_id,
                     "terminated by signal-with-start",
+                    metrics,
                 )
                 .await
                 {

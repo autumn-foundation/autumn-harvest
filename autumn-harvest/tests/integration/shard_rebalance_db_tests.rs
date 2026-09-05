@@ -2280,6 +2280,7 @@ async fn cancelling_a_sealed_source_is_left_pending_not_reported_delivered() {
         &mut source,
         exec_id,
         "external cancel",
+        None,
     )
     .await
     .expect_err("cancelling a forwarding seal must not succeed");

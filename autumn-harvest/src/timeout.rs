@@ -3099,6 +3099,13 @@ struct CancelDeliveryAccumulators {
 /// on the next sweep") rather than propagated — matching
 /// `attempt_signal_delivery`'s "one row's transient failure must not abort
 /// the scan" contract.
+// issue #1197, item 2 (Codex round 3, P2): `metrics` is threaded through to
+// `cancel_workflow_execution_collect` so a nested self-referential admission
+// this delivery's own trigger evaluation recurses into sees the real
+// recorder. That pushes this function's argument count one over clippy's
+// default ceiling; bundling it into `CancelDeliveryAccumulators` would be
+// wrong (that struct is a per-call OUTPUT accumulator, not shared input).
+#[allow(clippy::too_many_arguments)]
 async fn attempt_cancel_delivery(
     conn: &mut AsyncPgConnection,
     target: &ExternalTarget,
@@ -3107,10 +3114,11 @@ async fn attempt_cancel_delivery(
     not_found_terminal: impl Fn() -> Option<WorkflowEvent>,
     acc: &mut CancelDeliveryAccumulators,
     expected_live: bool,
+    metrics: &(dyn MetricsRecorder + Send + Sync),
 ) -> Option<WorkflowEvent> {
     match target {
         ExternalTarget::ExecutionId(target_id) => {
-            match cancel_workflow_execution_collect(conn, *target_id, reason).await {
+            match cancel_workflow_execution_collect(conn, *target_id, reason, Some(metrics)).await {
                 Ok((_cancelled, deferred, checks, metrics_opt)) => {
                     acc.deferred_starts.extend(deferred);
                     acc.deferred_checks.extend(checks);
@@ -3426,6 +3434,7 @@ pub async fn enforce_external_cancels_outbox(
                         not_found_terminal,
                         &mut acc,
                         expected_live,
+                        metrics,
                     )
                     .await
                     }
@@ -3488,6 +3497,7 @@ pub async fn enforce_external_cancels_outbox(
                         not_found_terminal,
                         &mut acc,
                         expected_live,
+                        metrics,
                     )
                     .await;
                     // Keep the target connection open past this branch: for

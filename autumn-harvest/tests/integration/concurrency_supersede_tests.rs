@@ -1958,14 +1958,20 @@ async fn nested_self_referential_admission_emits_residual_over_limit_counter() {
     )
     .await;
 
-    // The nested admission's own trigger evaluation always runs with
-    // `metrics: None` (every cancel/terminate/parent-close-cascade chokepoint
-    // in `execution.rs` does), so the residual counter can only ever reach a
-    // recorder through the process-global fallback — install one here and
-    // restore whatever was there afterward.
+    // Codex round 3 (P2, issue #1197 item 2): `cancel_workflow_execution_collect`
+    // used to hardcode `metrics: None` for its own completion-trigger
+    // evaluation, so a nested admission recursing off of it could only ever
+    // reach a recorder through the process-global fallback, dropping the
+    // sample entirely for any caller that supplies its own recorder without
+    // also installing a global one. Fixed by threading the real caller
+    // recorder through instead. Install a *poisoned* global recorder here —
+    // if the fix regresses, the residual sample would land here instead of on
+    // `dummy_metrics` below, and the negative assertion at the end catches it.
     let previous_global_metrics = global_admission_metrics();
-    let metrics = Arc::new(CapturingMetrics::default());
-    set_global_admission_metrics(Some(metrics.clone() as Arc<dyn MetricsRecorder>));
+    let poisoned_global_metrics = Arc::new(CapturingMetrics::default());
+    set_global_admission_metrics(Some(
+        poisoned_global_metrics.clone() as Arc<dyn MetricsRecorder>
+    ));
 
     // Self-referential: the trigger's source and target are the SAME
     // workflow type. `Static` input mapping (not `Passthrough`) because a
@@ -2030,11 +2036,23 @@ async fn nested_self_referential_admission_emits_residual_over_limit_counter() {
          next ordinary admission)"
     );
 
-    let residual_samples = metrics.residual_over_limit.lock().unwrap().clone();
+    let residual_samples = dummy_metrics.residual_over_limit.lock().unwrap().clone();
     assert_eq!(
         residual_samples,
         vec![(self_ref_wf.to_string(), 1)],
-        "the nested admission must report exactly the 1-run gap it could not shed"
+        "the nested admission must report exactly the 1-run gap it could not \
+         shed, on the real recorder admission B supplied -- not merely a \
+         process-global fallback"
+    );
+    assert!(
+        poisoned_global_metrics
+            .residual_over_limit
+            .lock()
+            .unwrap()
+            .is_empty(),
+        "a caller-supplied recorder must be used in preference to the \
+         process-global fallback: the sample must not also (or instead) land \
+         on the global recorder"
     );
 
     set_global_admission_metrics(previous_global_metrics);

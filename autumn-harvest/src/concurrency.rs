@@ -607,6 +607,7 @@ async fn supersede_inner(
                 conn,
                 candidate.exec_id,
                 SUPERSEDE_CANCEL_REASON,
+                metrics,
             )
             .await
             {
