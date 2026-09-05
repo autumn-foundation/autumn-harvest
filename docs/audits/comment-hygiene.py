@@ -214,6 +214,13 @@ COMMENTED_CODE_RE = re.compile(
       | \#!?\[[\w:()"'=,./\s-]+\]\s*$
       | \}[,;)]*\s*$
       | (?:assert|assert_eq|assert_ne|panic|println|dbg|unreachable)!\(.*\)\s*;\s*$
+      # A commented-out statement. Anchored hard: the call must open at the
+      # very start, so prose that merely names a function ("call cleanup()
+      # first") cannot reach it, and the line must end at the `;`. Measured
+      # against all 176k corpus comments before adding: one hit, and it was
+      # real commented-out code.
+      | (?:return|break|continue)\b(?:\s+[^\s;{}]+)?\s*;\s*$
+      | [\w:]+(?:\.[\w:]+)*\(.*\)(?:\s*\?|\s*\.await\s*\??)*\s*;\s*$
     )""",
     re.VERBOSE,
 )
@@ -294,14 +301,21 @@ class Piece:
     line number.
     """
 
-    __slots__ = ("line", "marker", "body", "trailing", "block")
+    __slots__ = ("line", "marker", "body", "trailing", "block", "group")
 
-    def __init__(self, line: int, marker: str, body: str, trailing: bool, block: bool) -> None:
+    def __init__(
+        self, line: int, marker: str, body: str, trailing: bool, block: bool, group: int = -1
+    ) -> None:
         self.line = line
         self.marker = marker
         self.body = body
         self.trailing = trailing
         self.block = block
+        # Which `/* */` this piece came from. One block comment is one comment
+        # however many lines it spans, so its pieces stay in one run even when
+        # the block opens after code on its first line. -1 for line comments,
+        # which are grouped by adjacency instead.
+        self.group = group
 
     @property
     def text(self) -> str:
@@ -343,6 +357,7 @@ def extract_comments(source: str) -> list[Piece]:
     n = len(source)
     line = 1
     code_on_line = False
+    block_group = 0
 
     while i < n:
         ch = source[i]
@@ -382,6 +397,7 @@ def extract_comments(source: str) -> list[Piece]:
                 # file as comment body.
                 marker = "/**"
             depth = 1
+            block_group += 1
             # Past the WHOLE marker: leaving the `!` of `/*!` on the body made
             # the anchored rules miss `/*! TODO */` and `/*! let x = 1; */`.
             i += len(marker)
@@ -396,7 +412,7 @@ def extract_comments(source: str) -> list[Piece]:
                     # beginning "outer", and the nested code is never anchored.
                     if i > seg_start:
                         pieces.append(
-                            Piece(seg_line, marker, source[seg_start:i], code_on_line and first, True)
+                            Piece(seg_line, marker, source[seg_start:i], code_on_line and first, True, block_group)
                         )
                         first = False
                     depth += 1
@@ -414,7 +430,7 @@ def extract_comments(source: str) -> list[Piece]:
                 elif source.startswith("*/", i):
                     if depth > 1 and i > seg_start:
                         pieces.append(
-                            Piece(seg_line, marker, source[seg_start:i], code_on_line and first, True)
+                            Piece(seg_line, marker, source[seg_start:i], code_on_line and first, True, block_group)
                         )
                         first = False
                     depth -= 1
@@ -424,7 +440,7 @@ def extract_comments(source: str) -> list[Piece]:
                         seg_line = line
                 elif source[i] == "\n":
                     pieces.append(
-                        Piece(seg_line, marker, source[seg_start:i], code_on_line and first, True)
+                        Piece(seg_line, marker, source[seg_start:i], code_on_line and first, True, block_group)
                     )
                     first = False
                     line += 1
@@ -436,7 +452,7 @@ def extract_comments(source: str) -> list[Piece]:
             tail_end = i - 2 if depth == 0 else i
             if tail_end > seg_start:
                 pieces.append(
-                    Piece(seg_line, marker, source[seg_start:tail_end], code_on_line and first, True)
+                    Piece(seg_line, marker, source[seg_start:tail_end], code_on_line and first, True, block_group)
                 )
             code_on_line = True
             continue
@@ -543,7 +559,10 @@ def comment_runs(pieces: list[Piece]):
     run: list[Piece] = []
     prev_line = -2
     for piece in pieces:
-        if run and (
+        same_block = (
+            bool(run) and piece.block and run[-1].block and piece.group == run[-1].group
+        )
+        if run and not same_block and (
             piece.trailing
             or run[-1].trailing
             or piece.block != run[-1].block
@@ -1018,6 +1037,11 @@ RULE_TESTS = [
         "three spaces still opens a fence",
     ),
     (
+        "let x = 1; /* ```rust\nTODO: fixture placeholder\n``` */\n",
+        set(),
+        "a multiline block comment starting after code is one run",
+    ),
+    (
         "/* outer /*! TODO */ */\n",
         {("CH002", 1)},
         "a nested inner-doc marker is stripped too",
@@ -1059,6 +1083,13 @@ CODE_SHAPE_TESTS = [
     ("});", True),
     ("#[derive(Debug)]", True),
     ("assert_eq!(a, b);", True),
+    ("cleanup();", True),
+    ("client.send(value).await?;", True),
+    ("self.flush()?;", True),
+    ("return Err(error);", True),
+    ("break;", True),
+    ("call cleanup() first, then retry;", False),
+    ("see compute() for the details;", False),
     ("fn foo() is called by the wrapper.", False),
     ("fn resolve_call(the caller name appears in diagnostics", False),
     ("fn build() constructs the program; see below.", False),

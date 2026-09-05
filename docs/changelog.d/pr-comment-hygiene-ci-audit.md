@@ -290,3 +290,29 @@ fence and nested-comment handling.**
 Fence state is now a (character, length) pair applied through one
 `fence_transition()` helper shared by `comment_lines()` and `prose_units()`,
 rather than a boolean duplicated across both. Five fixtures added.
+
+**Eighth Codex round (PR #1380): two more P2 findings.**
+
+- *A multiline trailing block comment was split across runs.* When
+  `/* ... */` opens after code and continues onto later lines, the
+  `run[-1].trailing` test separated its first physical line from the rest of
+  the same comment, resetting fence state mid-block. Each block comment now
+  carries a group id, and one block is one run however many lines it spans and
+  wherever it starts.
+- *CH001 missed commented-out statements* — `// cleanup();`,
+  `// client.send(value).await?;`, `// return Err(error);`. This was a
+  documented limitation, but the documentation was written for the
+  *unterminated* form (`// foo(bar)`); these end in `;` and are unambiguous.
+
+The statement rule was measured before being added rather than reasoned
+about: applied to all 176k corpus comments it produced exactly **one** hit,
+`examples/progress_query.rs:76`, and that was genuine — an illustrative
+`// ctx.execute_activity_raw("process_batch_chunk", ...).await?;` sketch
+(with `...`, so not even valid Rust). Reworded as prose with an inline code
+span, which is what it always was.
+
+The first draft of the rule then failed the project's own adversarial sweep:
+`return|break|continue` followed by anything up to a `;` matched 18 prose
+lines such as `break this module owns the sweep;`. Narrowed to a single-token
+operand (`return Err(error);` yes, `return the caller decide, since ...;` no).
+The sweep is now 399 prose lines with 0 false positives.
