@@ -832,24 +832,33 @@ def strip_containers(
     opens an item with nothing in it yet, so the next frame starts at zero.
     Crossing a quote enters a depth the stack may already have a container
     for -- a quoted list item, say -- and its column is the one recorded
-    there. Returns the remaining text, the container to measure against, and
-    the quote depth reached -- which is the fence's depth, and is not what
-    reading the unpeeled line reports once a quote follows a list marker.
+    there.
+
+    Returns the remaining text, the container to measure the delimiter
+    against, the quote depth reached, and the column the content sits at.
+    The last two are the fence's scope, and neither can be recovered from the
+    raw line: a quote behind a list marker is invisible there, and a fence
+    inside "- 1. " belongs to the INNER item, not the outer one.
     """
     depth = 0
+    column = container
+    origin = 0
     while True:
         quote = quote_marker(text, container)
         if quote:
             text = text[quote.end():]
-            depth += 1
-            container = container_at_depth(stack, depth)
+            # One match can carry several markers (">>", "> >").
+            depth += quote.group(2).count(">")
+            container = column = container_at_depth(stack, depth)
+            origin = 0
             continue
         content = list_content(text, container)
         if content:
             text = text[content[1]:]
+            column = origin = origin + content[0]
             container = 0
             continue
-        return text, container, depth
+        return text, container, depth, column
 
 
 def fence_delimiter(
@@ -858,7 +867,7 @@ def fence_delimiter(
     in_fence: bool = False,
     depth: int = 0,
     stack: list[tuple[int, int]] | None = None,
-) -> tuple["re.Match[str]", str, int] | None:
+) -> tuple["re.Match[str]", str, int, int] | None:
     """The fence delimiter on `text`, or None if the line is not one.
 
     Two things separate a delimiter from ordinary text. A fence may open on
@@ -875,15 +884,15 @@ def fence_delimiter(
     # example content, not an item whose body closes the fence, and a "> "
     # deeper than the fence's own container is sample text too.
     if in_fence:
-        tail, reached = strip_quote_levels(text, depth, container), depth
+        tail, reached, column = strip_quote_levels(text, depth, container), depth, container
     else:
-        tail, container, reached = strip_containers(text, stack or [], container)
+        tail, container, reached, column = strip_containers(text, stack or [], container)
     match = FENCE_RE.match(tail)
     if not match:
         return None
     if len(match.group(1).expandtabs(4)) > container + 3:
         return None
-    return match, tail, reached
+    return match, tail, reached, column
 
 
 
@@ -985,12 +994,10 @@ def comment_lines(pieces: list[Piece]):
                     # raw line: once a quote follows a list marker on the
                     # same line, the unpeeled line reports depth zero and the
                     # fence never recognises its own quoted closer.
-                    line_depth = delimiter[2]
-                    scope = (
-                        container,
-                        container_at_depth(stack, line_depth),
-                        line_depth,
-                    )
+                    # Both from the PEEL, not from reading the raw line: a
+                    # quote behind a list marker is invisible there, and a
+                    # fence inside "- 1. " belongs to the inner item.
+                    scope = (container, delimiter[3], delimiter[2])
                 # Fence SYNTAX only if it opened one, closed one, or sits
                 # inside one. An invalid opener (```foo`bar) is ordinary text
                 # and must still be scanned -- exempting it would hide the
@@ -1101,12 +1108,7 @@ def prose_units(pieces: list[Piece]) -> list[tuple[int, str]]:
                 fence = fence_transition(fence, delimiter[0], delimiter[1])
                 paragraph = False
                 if before is None and fence is not None:
-                    line_depth = delimiter[2]
-                    scope = (
-                        container,
-                        container_at_depth(stack, line_depth),
-                        line_depth,
-                    )
+                    scope = (container, delimiter[3], delimiter[2])
                 if fence is not None or before is not None:
                     flush()
                     in_list = False
@@ -1120,13 +1122,16 @@ def prose_units(pieces: list[Piece]) -> list[tuple[int, str]]:
             # out of one ends the paragraph. Without this an intro line and
             # the quote below it join into one sentence that neither author
             # wrote, and a 25-word quoted sentence reports as 26.
-            depth = quote_depth(body, container)
+            # Peeled the same way the fence path peels, and for the same
+            # reason: "- > text" carries two markers, and stripping only the
+            # one that comes first leaves the other as a word of the sentence.
+            peeled, _, depth, _ = strip_containers(body, stack, container)
             if depth != quoted:
                 flush()
                 in_list = False
                 quoted = depth
             # Structure is read past the container markers, and so is the
-            # prose: a quote marker is not a word of the sentence it carries.
+            # prose: a container marker is not a word of the sentence.
             body = strip_quote(body, container)
             if (
                 TABLE_RE.match(body)
@@ -1146,7 +1151,14 @@ def prose_units(pieces: list[Piece]) -> list[tuple[int, str]]:
                 marker = None
             if marker and (not run or in_list or interrupts_paragraph(marker)):
                 flush()
-                run = [body[marker.end():].strip()]
+                # `peeled` rather than the text after this one marker: the
+                # item may carry a quote, or a second list, on the same line.
+                # The peel applies CommonMark's indent limit and this match
+                # does not, so a marker indented past a container it has not
+                # got is a list HERE and indented code THERE. Falling back
+                # keeps such a line reading as it always has, rather than
+                # keeping its bullet as a word of the sentence.
+                run = [(peeled if len(peeled) < len(body) else body[marker.end():]).strip()]
                 run_lines = [piece.line]
                 in_list = True
                 continue
@@ -1748,6 +1760,28 @@ RULE_TESTS = [
         "///     TODO: fixture placeholder\n///     ~~~\n",
         set(),
         "nor is a thematic break",
+    ),
+    (
+        "/// > > ~~~rust\n/// > > let x = 1;\n/// > > ~~~\n"
+        "/// > TODO: issue required\n",
+        {("CH002", 4)},
+        "two quote markers in one match count as two levels",
+    ),
+    (
+        "/// - 1. ~~~rust\n///      let x = 1;\n///      ~~~\n"
+        "///   TODO: issue required\n",
+        {("CH002", 4)},
+        "a fence inside a nested item is scoped to the inner one",
+    ),
+    (
+        "/// - > word1 word2 word3 word4 word5 word6 word7 word8 word9 word10 word11 word12 word13 word14 word15 word16 word17 word18 word19 word20 word21 word22 word23 word24 word25.\n",
+        set(),
+        "a quote behind a list marker is not a word of the sentence",
+    ),
+    (
+        "/// - 1. word1 word2 word3 word4 word5 word6 word7 word8 word9 word10 word11 word12 word13 word14 word15 word16 word17 word18 word19 word20 word21 word22 word23 word24 word25.\n",
+        set(),
+        "nor is a second list marker",
     ),
     (
         "/// Intro\n/// > word1 word2 word3 word4 word5 word6 word7 word8 word9 word10 word11 word12 word13 word14 word15 word16 word17 word18 word19 word20 word21 word22 word23 word24 word25.\n",

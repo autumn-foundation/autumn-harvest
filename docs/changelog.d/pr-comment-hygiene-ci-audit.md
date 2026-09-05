@@ -917,3 +917,33 @@ guessing at the class: the answer names three block types, and two of them
 simply were not consulted here.
 
 Corpus effect: none, for the ninth round running.
+
+### Round twenty-eight — counting quote levels, scoping to the inner item, peeling prose
+
+Three findings, all verified to reproduce first, all in code written in the
+previous two rounds.
+
+**A multi-level quote counted as one.** `quote_marker` matches `> >` in a
+single match; the peel added one to the depth per match rather than per
+marker, so a two-deep fence stripped one level from its closer and never
+closed. The depth advances by the number of markers consumed.
+
+**A fence inside `- 1. ` was scoped to the outer item.** The peel reset the
+container to zero per list marker without recording where the content actually
+landed, so a body line that dedents out of the inner item but not the outer
+one kept the fence open. `strip_containers` returns the column it reached, and
+the fence's scope takes both column and depth from the peel — neither is
+recoverable from the raw line.
+
+**Prose kept the second marker as a word.** `- > <25 words>` stripped whichever
+marker came first and left the other in the sentence, reporting 26 words. The
+prose path peels the same way the fence path does now.
+
+That last one regressed three `context.rs` findings on the first attempt, and
+the corpus diff caught it: the peel applies CommonMark's indent limit while
+`LIST_MARKER_RE` does not, so a bullet indented six columns with no container
+open is a list item to one and indented code to the other. Its `*` stayed in
+the sentence. The peel is used only when it actually consumes something, so
+such a line reads exactly as it always has.
+
+Corpus effect: none, for the tenth round running.
