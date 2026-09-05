@@ -844,7 +844,22 @@ fn activity_precedence_for_facts(facts: &PendingActivityFacts, now: DateTime<Utc
     if facts.rate_limit_bucket_missing && facts.rate_limit_key.is_some() {
         return 8; // ActivityRateLimitBucketMissing
     }
-    if facts.circuit_phase.is_some() && facts.activity_name.is_some() {
+    // Issue #1193 Codex round-4 P2: mirrors `classify_pending_activity`'s
+    // `organic_cooldown_clears_before_due` guard -- an organic trip whose
+    // cooldown will have already elapsed by the time this row is due is not
+    // a circuit-open verdict at all, so it must fall through to the
+    // not-due-yet ranks below rather than claim one of the circuit ranks.
+    let organic_cooldown_clears_before_due = facts.circuit_phase
+        == Some(BlockingCircuitPhase::Open)
+        && !facts.circuit_forced_open
+        && facts.scheduled_at > now
+        && facts
+            .circuit_cooldown_until
+            .is_some_and(|deadline| facts.scheduled_at >= deadline);
+    if !organic_cooldown_clears_before_due
+        && facts.circuit_phase.is_some()
+        && facts.activity_name.is_some()
+    {
         // Issue #1193: the three circuit shapes are ranked by health severity
         // (forced > organic > half-open), mirroring `activity_precedence`, so
         // a same-rank tie between two DIFFERENTLY-healthed shapes can never
@@ -963,7 +978,32 @@ pub fn classify_pending_activity(facts: &PendingActivityFacts, now: DateTime<Utc
 
     // 5. The breaker fast-fails dispatch. Only an activity the task row actually
     //    names can carry one, so an unnamed row can never reach here.
-    if let (Some(phase), Some(name)) = (facts.circuit_phase, facts.activity_name.as_ref()) {
+    //
+    //    EXCEPTION (issue #1193 Codex round-4 P2): an ORGANIC trip whose
+    //    cooldown will have already elapsed by the time this row is even due
+    //    is not "heading for a terminal failure". `CircuitBreakerRegistry::
+    //    on_dispatch` checks the elapsed cooldown at the ACTUAL dispatch
+    //    instant, so if `scheduled_at` lands at or after `cooldown_until`,
+    //    THIS row's own future attempt is what gets admitted as the recovery
+    //    probe (or dispatches normally once closed) -- it does not fast-fail
+    //    at all. Falling through to the not-due-yet branch below reports the
+    //    same `activity_retrying` / `activity_deferred` it would if there
+    //    were no breaker in the way. Scoped narrowly: a forced-open breaker
+    //    has no cooldown to compare against (unconditionally `Stalled`,
+    //    correctly, since only `force-close` clears it), and an organic trip
+    //    with an unrepresentable cooldown (`cooldown_until: None`) has no
+    //    deadline to compare either, so both keep reporting circuit-open
+    //    exactly as before -- there is no evidence here that it will clear.
+    let organic_cooldown_clears_before_due = facts.circuit_phase
+        == Some(BlockingCircuitPhase::Open)
+        && !facts.circuit_forced_open
+        && facts.scheduled_at > now
+        && facts
+            .circuit_cooldown_until
+            .is_some_and(|deadline| facts.scheduled_at >= deadline);
+    if !organic_cooldown_clears_before_due
+        && let (Some(phase), Some(name)) = (facts.circuit_phase, facts.activity_name.as_ref())
+    {
         return BlockedOn::ActivityCircuitOpen {
             activity_name: name.clone(),
             // Preserved so a half-open breaker (recovering on its own) is
@@ -2141,6 +2181,96 @@ mod tests {
             }
         );
         assert_eq!(verdict.health(), ExecutionHealth::Degraded);
+    }
+
+    /// AC (issue #1193 Codex round-4 P2): an organic trip whose cooldown will
+    /// have already elapsed by the time this row is even due is not "heading
+    /// for a terminal failure" -- `CircuitBreakerRegistry::on_dispatch`
+    /// checks the elapsed cooldown at the ACTUAL dispatch instant, so this
+    /// row's own future attempt is what gets admitted as the probe (or
+    /// dispatches normally once closed), not fast-failed. Falls through to
+    /// the ordinary retry/deferral verdict instead.
+    #[test]
+    fn organic_open_falls_through_to_retrying_when_cooldown_clears_before_due() {
+        let mut facts = healthy_activity();
+        facts.circuit_phase = Some(BlockingCircuitPhase::Open);
+        facts.circuit_forced_open = false;
+        facts.circuit_cooldown_until = Some(t(30));
+        facts.scheduled_at = t(45); // due AFTER the cooldown elapses
+        facts.attempt = 3;
+        facts.last_error = Some("gateway 503".to_string());
+
+        let verdict = classify_pending_activity(&facts, t(0));
+        assert_eq!(
+            verdict,
+            BlockedOn::ActivityRetrying {
+                activity_name: Some("send_email".to_string()),
+                attempt: 3,
+                last_error: Some("gateway 503".to_string()),
+                next_attempt_at: Some(t(45)),
+            },
+            "must fall through to the ordinary retry verdict, not \
+             activity_circuit_open: {verdict:?}"
+        );
+        assert_eq!(verdict.health(), ExecutionHealth::Healthy);
+
+        // Without failure evidence it is a clean deferral instead.
+        facts.last_error = None;
+        assert_eq!(
+            classify_pending_activity(&facts, t(0)),
+            BlockedOn::ActivityDeferred {
+                activity_name: Some("send_email".to_string()),
+                next_attempt_at: t(45),
+            }
+        );
+    }
+
+    /// The boundary: `scheduled_at == cooldown_until` counts as "clears
+    /// before due" (the cooldown has fully elapsed by the instant this row
+    /// is attempted), consistent with `CircuitBreakerRegistry::on_dispatch`'s
+    /// own `elapsed >= policy.cooldown` check.
+    #[test]
+    fn organic_cooldown_clearing_exactly_at_the_due_instant_still_falls_through() {
+        let mut facts = healthy_activity();
+        facts.circuit_phase = Some(BlockingCircuitPhase::Open);
+        facts.circuit_forced_open = false;
+        facts.circuit_cooldown_until = Some(t(30));
+        facts.scheduled_at = t(30);
+        assert_eq!(
+            classify_pending_activity(&facts, t(0)).kind(),
+            "activity_deferred",
+            "scheduled_at == cooldown_until must still fall through"
+        );
+    }
+
+    /// The converse of the round-4 P2 fix: when the row is due WHILE the
+    /// breaker is still certainly open (cooldown ahead of `scheduled_at`),
+    /// the fast-fail is real and `degraded` is the correct, unchanged verdict.
+    #[test]
+    fn organic_open_still_wins_when_cooldown_has_not_cleared_by_due_time() {
+        let mut facts = healthy_activity();
+        facts.circuit_phase = Some(BlockingCircuitPhase::Open);
+        facts.circuit_forced_open = false;
+        facts.circuit_cooldown_until = Some(t(30));
+        facts.scheduled_at = t(20); // due BEFORE the cooldown elapses
+        let verdict = classify_pending_activity(&facts, t(0));
+        assert_eq!(verdict.kind(), "activity_circuit_open", "{verdict:?}");
+        assert_eq!(verdict.health(), ExecutionHealth::Degraded);
+    }
+
+    /// Forced-open has no cooldown to compare against at all, so the round-4
+    /// P2 exception can never apply to it: it stays `stalled` however far in
+    /// the future `scheduled_at` is.
+    #[test]
+    fn forced_open_circuit_wins_regardless_of_how_far_in_the_future_the_task_is() {
+        let mut facts = healthy_activity();
+        facts.circuit_phase = Some(BlockingCircuitPhase::Open);
+        facts.circuit_forced_open = true;
+        facts.circuit_cooldown_until = None;
+        facts.scheduled_at = t(999_999);
+        let verdict = classify_pending_activity(&facts, t(0));
+        assert_eq!(verdict.kind(), "activity_circuit_open", "{verdict:?}");
+        assert_eq!(verdict.health(), ExecutionHealth::Stalled);
     }
 
     #[test]
@@ -4705,9 +4835,18 @@ mod tests {
             ]
         }
 
+        /// `None` (unrepresentable/forced), a deadline BEFORE the "due later"
+        /// `scheduled_at` (`t(10)`), or one AFTER it -- so the round-4 P2
+        /// `organic_cooldown_clears_before_due` guard's boundary is actually
+        /// exercised by the sweep, not left at a single hardcoded `None`.
+        fn circuit_cooldown_until() -> impl Strategy<Value = Option<chrono::DateTime<chrono::Utc>>>
+        {
+            prop_oneof![Just(None), Just(Some(t(5))), Just(Some(t(15)))]
+        }
+
         // proptest implements `Strategy` for tuples only up to a bounded
-        // arity, well under the 15 fields swept here -- grouped into two
-        // 7-tuples plus a 1-tuple (each safely under that limit) composed as
+        // arity, well under the 16 fields swept here -- grouped into two
+        // 7-tuples plus a 2-tuple (each safely under that limit) composed as
         // one 3-tuple.
         #[allow(clippy::type_complexity)]
         fn facts() -> impl Strategy<Value = PendingActivityFacts> {
@@ -4736,7 +4875,7 @@ mod tests {
             // guard in both `activity_precedence_for_facts` and
             // `classify_pending_activity` must handle it being `true`
             // regardless of phase without desyncing from each other.
-            let group_c = any::<bool>(); // circuit_forced_open
+            let group_c = (any::<bool>(), circuit_cooldown_until()); // circuit_forced_open, circuit_cooldown_until
             (group_a, group_b, group_c).prop_map(
                 |(
                     (
@@ -4757,7 +4896,7 @@ mod tests {
                         concurrency_key,
                         rate_limit_saturated,
                     ),
-                    circuit_forced_open,
+                    (circuit_forced_open, circuit_cooldown_until),
                 )| PendingActivityFacts {
                     activity_name,
                     queue: "q".to_string(),
@@ -4772,7 +4911,7 @@ mod tests {
                     has_live_worker,
                     claimant_is_live,
                     circuit_phase,
-                    circuit_cooldown_until: None,
+                    circuit_cooldown_until,
                     circuit_forced_open,
                     rate_limit_saturated,
                     rate_limit_bucket_missing,

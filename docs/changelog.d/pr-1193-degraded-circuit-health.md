@@ -102,6 +102,33 @@ class of masking, one level up the ladder:
   a `Healthy` activity verdict should ever yield to a workflow-level stall
   (out of scope for this issue).
 
+**Codex round-4 finding on PR #1365, also confirmed and fixed.** A timing
+nuance in the same organic-open branch:
+
+- **P2 — a not-yet-due row can be `degraded` when it will never fast-fail.**
+  The circuit-open check outranks the not-due-yet check unconditionally
+  (pre-existing, correct for `no_worker`/`rate_limit_bucket_missing`/forced-open,
+  all permanent-until-manual-action). For an organic trip specifically, that
+  is only right if this row would actually be *attempted* while the breaker
+  is still open. `CircuitBreakerRegistry::on_dispatch` checks the elapsed
+  cooldown at the actual dispatch instant, so a row whose own
+  `scheduled_at` lands at or after `cooldown_until` is what the breaker
+  would admit as its recovery probe (or dispatch normally once closed) —
+  it would never fast-fail, so `degraded`'s "heading for a terminal
+  failure" framing overclaims. Fixed by comparing the two timestamps and
+  falling through to the ordinary `activity_retrying` / `activity_deferred`
+  verdict when the cooldown will have already cleared by the time the row
+  is due. Scoped to organic trips with a known `cooldown_until` only: a
+  forced-open breaker has no cooldown to compare against (unconditionally
+  `Stalled`, correctly, since only `force-close` clears it) and an organic
+  trip with an unrepresentable cooldown has no deadline either, so both are
+  unaffected. The allocation-free precedence mirror
+  (`activity_precedence_for_facts`) was updated identically, and the
+  property-test generator that guards the two functions from drifting apart
+  was extended to actually vary `circuit_cooldown_until` (it previously
+  hardcoded `None`, so it could never have caught a bug in this exact
+  branch).
+
 No new `WorkflowEvent` variant, no migration, no change to
 `CircuitBreakerRegistry`'s own logic (only what the plugin reads off its
 existing `CircuitSnapshot`) — read-path label semantics only, exactly as
@@ -129,4 +156,11 @@ registry and database. The round-3 fix is pinned by
 `degraded_organic_circuit_yields_to_a_paused_workflow_queue`, and
 `forced_open_circuit_still_outranks_a_frozen_workflow_task` (proving the
 override is scoped to `Degraded` alone and does not touch the pre-existing
-`Stalled` behavior).
+`Stalled` behavior). The round-4 fix is pinned by
+`organic_open_falls_through_to_retrying_when_cooldown_clears_before_due`
+(both with and without failure evidence),
+`organic_cooldown_clearing_exactly_at_the_due_instant_still_falls_through`
+(the `>=` boundary), `organic_open_still_wins_when_cooldown_has_not_cleared_by_due_time`
+(the converse — still `degraded` when the fast-fail is real), and
+`forced_open_circuit_wins_regardless_of_how_far_in_the_future_the_task_is`
+(proving forced-open is untouched).
