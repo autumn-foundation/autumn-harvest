@@ -159,3 +159,21 @@ touched file fails; Tier A fails anywhere; `/*! TODO */` fails; `// fn foo()
 is called by the wrapper.` passes; a newly added file is allowed nothing, so
 its findings fail; base drift on an untouched file passes; and both
 degradation paths (no `--base`, unknown ref) report at exit 0.
+
+**Third Codex round (PR #1380): three more P2 findings.** One
+("regenerating the baseline launders a violation") was already answered by
+dropping the stored baseline. Two were real and outstanding:
+
+- *Push runs scoped from the wrong boundary.* The push branch diffed
+  `HEAD~1`, so on a multi-commit push to `trunk-dev` a violation introduced by
+  an earlier commit slipped through in any file the final commit did not also
+  touch. Now uses `github.event.before`, the boundary the workflow's own
+  `changes` job already uses, with a fallback to report-only on a branch's
+  first push (no before-SHA exists). Proven: with the violation in commit 1
+  and an unrelated commit 2, `--base HEAD~1` exits 0 while
+  `--base $BEFORE` exits 1 and names the file.
+- *The prescribed local check gated almost nothing.* `CLAUDE.md` told
+  contributors to run `python3 docs/audits/comment-hygiene.py`, which without
+  `--base` leaves Tier B report-only — so the documented pre-push command
+  checked Tier A and little else. It now prescribes
+  `--base origin/trunk-dev` and says plainly why the flag matters.

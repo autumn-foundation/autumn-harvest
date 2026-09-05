@@ -336,11 +336,20 @@ jobs:
       - name: Comment hygiene (docs/audits/comment-hygiene.py)
         run: |
           python3 docs/audits/comment-hygiene.py --self-test
+          BEFORE="${{ github.event.before }}"
           if [ -n "${{ github.base_ref }}" ]; then
             git fetch --no-tags origin "${{ github.base_ref }}"
             python3 docs/audits/comment-hygiene.py --base FETCH_HEAD
+          elif [ -n "$BEFORE" ] \
+            && [ "$BEFORE" != "0000000000000000000000000000000000000000" ]; then
+            # The whole push, not just its last commit. `HEAD~1` would let a
+            # violation introduced by an earlier commit of a multi-commit push
+            # through, in any file the final commit did not also touch.
+            python3 docs/audits/comment-hygiene.py --base "$BEFORE"
           else
-            python3 docs/audits/comment-hygiene.py --base HEAD~1
+            # A branch's first push has no before-SHA to diff against. Tier A
+            # still gates; Tier B reports.
+            python3 docs/audits/comment-hygiene.py
           fi
 
   test:

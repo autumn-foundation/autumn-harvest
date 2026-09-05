@@ -21,7 +21,14 @@
 ## Comment Hygiene
 
 `docs/audits/comment-hygiene.py` gates every `*.rs` comment in CI's `lint`
-job. Run it before you push: `python3 docs/audits/comment-hygiene.py`.
+job. Run it before you push:
+
+```sh
+python3 docs/audits/comment-hygiene.py --base origin/trunk-dev
+```
+
+The `--base` matters. Without it the Tier B rules below are report-only, so
+a bare run checks Tier A and little else.
 
 Write comments short, concise, and in ASD-STE100 style where the subject
 allows it: one idea per sentence, 25 words or fewer, active voice, present
