@@ -292,7 +292,7 @@ async fn seed_production_shaped_fixture(conn: &mut AsyncPgConnection) {
                  WHEN random() < 0.99 THEN 5 + floor(random()*20)::int
                  ELSE 50 + floor(random()*251)::int
              END
-         FROM generate_series(1, {n_exec});
+         FROM generate_series(1, {FIXTURE_EXECUTIONS});
 
          INSERT INTO harvest_workflow_executions
              (id, workflow_name, workflow_id, run_id, shard_id, state, input, queue_name,
@@ -347,9 +347,7 @@ async fn seed_production_shaped_fixture(conn: &mut AsyncPgConnection) {
          FROM tmp_usage_activity;
 
          ANALYZE harvest_workflow_executions;
-         ANALYZE harvest_events;",
-        n_exec = FIXTURE_EXECUTIONS,
-        SHARD_ID = SHARD_ID,
+         ANALYZE harvest_events;"
     ))
     .await
     .expect("seed production-shaped usage-report fixture");

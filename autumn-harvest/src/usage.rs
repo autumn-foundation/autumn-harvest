@@ -241,9 +241,11 @@ fn group_key_expr() -> String {
     )
 }
 
-/// The full grouped usage query text (issue #596), exposed so evidence-capture
-/// tests can `EXPLAIN` exactly what [`load_usage_grouped`] executes — the same
-/// precedent [`crate::timeout::workflow_history_ceiling_query`] set.
+/// The full grouped usage query text (issue #596).
+///
+/// Exposed so evidence-capture tests can `EXPLAIN` exactly what
+/// [`load_usage_grouped`] executes — the same precedent
+/// [`crate::timeout::workflow_history_ceiling_query`] set.
 #[cfg(feature = "db")]
 #[must_use]
 #[allow(clippy::too_many_lines)]
