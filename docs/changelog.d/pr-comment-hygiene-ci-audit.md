@@ -807,3 +807,24 @@ that this harness only needs in order to know what *not* to scan. If they keep
 coming, the better answer than a twenty-fourth round is an issue proposing a
 real CommonMark block parser for the container layer, or a decision that the
 remaining cases are out of scope for a comment linter.
+
+### Round twenty-four — quote markers inside fences, quotes as prose blocks
+
+Two findings, both verified to reproduce first.
+
+**A quoted delimiter inside a fence closed it.** Round twenty-three stopped
+stripping *list* markers inside an open fence but kept stripping every quote
+marker, so a top-level fenced example containing a literal `> ``` ` had that
+sample line read as a closer. Only the quote levels belonging to the fence's
+own container are continuation syntax; anything deeper is sample text.
+`strip_quote_levels` removes exactly the fence's depth and no more.
+
+**A block quote merged into the paragraph above it.** `prose_units` stripped
+the marker and appended the text, so an intro line plus a quoted 25-word
+sentence counted as one 26-word sentence — a CH007 the author never wrote.
+A quote is its own CommonMark block, so crossing into or out of one flushes
+the unit, in both directions.
+
+Corpus effect: none. Both latent, finding set identical to round
+twenty-three's — the sixth consecutive round with byte-identical output. The
+note at the end of round twenty-three still stands.

@@ -326,6 +326,7 @@ LIST_MARKER_RE = re.compile(r"^([ \t]*)((?:[-*+]|\d+[.)]))([ \t]+|$)")
 # judges -- and the text a Tier B failure quotes back. A marker must be
 # followed by space, another marker, or the end of the line.
 BLOCKQUOTE_RE = re.compile(r"^([ \t]*)((?:>(?=[ \t>]|$)[ \t]?)+)")
+ONE_QUOTE_RE = re.compile(r"^([ \t]*)>(?=[ \t>]|$)[ \t]?")
 TABLE_RE = re.compile(r"^\s*\|")
 HEADING_RE = re.compile(r"^\s*#{1,6}\s")
 # A thematic break -- one punctuation character repeated. CommonMark spells it
@@ -689,6 +690,23 @@ def strip_quote(text: str, container: int = 0) -> str:
     return text[match.end():] if match else text
 
 
+def strip_quote_levels(text: str, levels: int, container: int) -> str:
+    """`text` past exactly `levels` block-quote markers, and no more.
+
+    Inside a fence only the markers belonging to the fence's own container
+    are continuation syntax. A deeper "> " is literal sample text, and
+    stripping it turns an example's own quoted delimiter into a closer.
+    """
+    for _ in range(levels):
+        match = ONE_QUOTE_RE.match(text)
+        if not match or len(match.group(1).expandtabs(4)) > container + 3:
+            break
+        text = text[match.end():]
+        # Inside the quote the content restarts at column zero.
+        container = 0
+    return text
+
+
 def quote_depth(text: str, container: int = 0) -> int:
     """How many block-quote levels `text` opens with."""
     match = quote_marker(text, container)
@@ -774,7 +792,7 @@ def update_containers(
 
 
 def fence_delimiter(
-    text: str, container: int, in_fence: bool = False
+    text: str, container: int, in_fence: bool = False, depth: int = 0
 ) -> tuple["re.Match[str]", str] | None:
     """The fence delimiter on `text`, or None if the line is not one.
 
@@ -786,10 +804,14 @@ def fence_delimiter(
     fence is open, an indented code line while one is not. Returns the match
     and the text it was matched against, which carries the info string.
     """
-    text = strip_quote(text, container)
-    # A list marker is skipped only when looking for an OPENER. Inside a fence
-    # the sample text is literal, so "- ```" is a hyphen and three backticks
-    # of example content, not an item whose body closes the fence.
+    # Container markers are skipped only as far as they are syntax. Inside a
+    # fence the sample text is literal: "- ```" is a hyphen and three
+    # backticks of example content, not an item whose body closes the fence,
+    # and a "> " deeper than the fence's own container is sample text too.
+    if in_fence:
+        text = strip_quote_levels(text, depth, container)
+    else:
+        text = strip_quote(text, container)
     base, offset = (0, 0) if in_fence else (list_content(text, container) or (0, 0))
     tail = text[offset:]
     match = FENCE_RE.match(tail)
@@ -880,7 +902,7 @@ def comment_lines(pieces: list[Piece]):
             if fence is None:
                 stack, paragraph = update_containers(text, stack, paragraph)
             container = stack[-1][0] if stack else 0
-            delimiter = fence_delimiter(text, container, fence is not None)
+            delimiter = fence_delimiter(text, container, fence is not None, scope[1])
             if delimiter:
                 before = fence
                 fence = fence_transition(fence, *delimiter)
@@ -971,6 +993,7 @@ def prose_units(pieces: list[Piece]) -> list[tuple[int, str]]:
         stack: list[tuple[int, int]] = []
         paragraph = False
         in_list = False
+        quoted = 0
 
         def flush():
             nonlocal run, run_lines
@@ -993,7 +1016,7 @@ def prose_units(pieces: list[Piece]) -> list[tuple[int, str]]:
             if fence is None:
                 stack, paragraph = update_containers(body, stack, paragraph)
             container = stack[-1][0] if stack else 0
-            delimiter = fence_delimiter(body, container, fence is not None)
+            delimiter = fence_delimiter(body, container, fence is not None, scope[1])
             if delimiter:
                 before = fence
                 fence = fence_transition(fence, *delimiter)
@@ -1009,9 +1032,18 @@ def prose_units(pieces: list[Piece]) -> list[tuple[int, str]]:
                 flush()
                 in_list = False
                 continue
+            # A block quote is its own CommonMark block, so crossing into or
+            # out of one ends the paragraph. Without this an intro line and
+            # the quote below it join into one sentence that neither author
+            # wrote, and a 25-word quoted sentence reports as 26.
+            depth = quote_depth(body, container)
+            if depth != quoted:
+                flush()
+                in_list = False
+                quoted = depth
             # Structure is read past the container markers, and so is the
             # prose: a quote marker is not a word of the sentence it carries.
-            body = strip_quote(body)
+            body = strip_quote(body, container)
             if (
                 TABLE_RE.match(body)
                 or HEADING_RE.match(body)
@@ -1598,6 +1630,21 @@ RULE_TESTS = [
         "///     > ```\n",
         set(),
         "a quote marker is indented relative to its list container",
+    ),
+    (
+        "/// ```rust\n/// > ```\n/// TODO: fixture placeholder\n/// ```\n",
+        set(),
+        "a quoted delimiter deeper than the fence is sample text",
+    ),
+    (
+        "/// Intro\n/// > word1 word2 word3 word4 word5 word6 word7 word8 word9 word10 word11 word12 word13 word14 word15 word16 word17 word18 word19 word20 word21 word22 word23 word24 word25.\n",
+        set(),
+        "entering a block quote ends the paragraph before it",
+    ),
+    (
+        "/// > word1 word2 word3 word4 word5 word6 word7 word8 word9 word10 word11 word12 word13 word14 word15 word16 word17 word18 word19 word20 word21 word22 word23 word24 word25\n/// and more words here.\n",
+        set(),
+        "and so does leaving one",
     ),
     (
         "/// -    ```rust\n///      TODO: fixture placeholder\n///      ```\n",
