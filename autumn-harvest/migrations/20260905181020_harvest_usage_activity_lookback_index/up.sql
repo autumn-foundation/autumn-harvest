@@ -22,16 +22,16 @@
 -- once per activity terminal event in the report window -- a cost that scales
 -- with a workflow's own activity fan-out, not with the report's selectivity.
 --
--- Measured on a 40,000-execution / ~562,000-event production-shaped fixture
+-- Measured on a 40,000-execution / ~570,000-event production-shaped fixture
 -- (skewed 1%-of-executions "batch" tail with 50-300 activities each --
 -- `tests/integration/usage_report_activity_lookback_tests.rs::zz_capture_usage_report_activity_lookback_evidence`):
 -- `GET /admin/usage`'s total buffers (`pg_stat_statements`,
--- shared_blks_hit + shared_blks_read) drop from 4,630,147 to 2,108,948 --
--- -54.5% -- with byte-identical grouped counters before and after. Postgres
+-- shared_blks_hit + shared_blks_read) drop from 4,771,832 to 2,139,119 --
+-- -55.2% -- with byte-identical grouped counters before and after. Postgres
 -- rewrites the correlated `MAX(...)` into an `Index Scan Backward` + `LIMIT 1`
 -- against this index (its standard max-via-index-descent transform), replacing
--- a `Bitmap Heap Scan` that filtered ~2.13M heap blocks' worth of sibling
--- events out of a 522,374-loop LATERAL invocation. Full plans and the
+-- a `Bitmap Heap Scan` that filtered ~2.22M heap blocks' worth of sibling
+-- events out of a 529,869-loop LATERAL invocation. Full plans and the
 -- `pg_stat_statements` snapshots are committed under
 -- `docs/perf-artifacts/usage-report-activity-lookback/`; writeup in
 -- `docs/performance-usage-report-activity-lookback.md`.

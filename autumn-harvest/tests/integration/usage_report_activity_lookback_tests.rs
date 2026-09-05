@@ -456,13 +456,24 @@ async fn capture(
     // into the "after" capture and Postgres would aggregate the two,
     // publishing a contaminated comparison that still reports success
     // (Codex review, PR #1381).
-    diesel::sql_query("SELECT pg_stat_statements_reset()")
-        .execute(conn)
-        .await
-        .expect(
-            "pg_stat_statements_reset() failed -- proceeding would let stale counts from \
-             the other capture leak into this one and silently contaminate the comparison",
-        );
+    //
+    // Scoped to THIS database's dbid (`pg_stat_statements_reset(0, dbid, 0)`),
+    // not the bare zero-argument form: `setup_bench_db` provisions its own
+    // throwaway database, but `pg_stat_statements` is a per-CLUSTER view, and
+    // the zero-argument reset wipes statistics for every database, user and
+    // query on the whole server -- if `HARVEST_TEST_DATABASE_URL` names a
+    // Postgres shared with other tenants' monitoring, this would destroy
+    // their data on every capture (Codex review, PR #1381).
+    diesel::sql_query(
+        "SELECT pg_stat_statements_reset(0, \
+         (SELECT oid FROM pg_database WHERE datname = current_database()), 0)",
+    )
+    .execute(conn)
+    .await
+    .expect(
+        "pg_stat_statements_reset() failed -- proceeding would let stale counts from \
+         the other capture leak into this one and silently contaminate the comparison",
+    );
 
     let (plan_text, rows) = explain_and_result_set(conn, 100).await;
 
@@ -472,11 +483,23 @@ async fn capture(
     )
     .expect("write explain artifact");
 
+    // `pg_stat_statements` is a per-CLUSTER view: on a `HARVEST_TEST_DATABASE_URL`
+    // server shared with other databases (the same scenario the scoped reset
+    // above guards against), an unscoped SELECT here ranks THIS database's
+    // freshly-reset entries alongside every OTHER database's un-reset,
+    // possibly larger ones matching the same LIKE pattern -- discovered
+    // directly while verifying the reset fix: querying this bench db's own
+    // dbid showed only 3 rows, but the unscoped query returned 5, the extra
+    // two pulled from other databases on this same Postgres instance (one of
+    // them this very verification's own `postgres` database). Scoped to
+    // `current_database()`'s dbid so the "top 5" ranking can only ever
+    // reflect this run's own statements.
     let stats: Vec<StatRow> = diesel::sql_query(
         "SELECT query, calls, shared_blks_hit, shared_blks_read, \
          (shared_blks_hit + shared_blks_read) AS total_buffers, temp_blks_written \
          FROM pg_stat_statements \
          WHERE query LIKE '%harvest_workflow_executions%harvest_events%' \
+           AND dbid = (SELECT oid FROM pg_database WHERE datname = current_database()) \
          ORDER BY total_buffers DESC LIMIT 5",
     )
     .load(conn)
