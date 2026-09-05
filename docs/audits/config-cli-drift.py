@@ -216,37 +216,54 @@ def extract_cli_ground_truth():
     return flags, env_vars
 
 
+BLOCKQUOTE_PREFIX_RE = re.compile(r"^(>[ \t]*)")
+
+
 def mask_fenced(lines):
     """Return (masked_lines, list_of_(lang, block_lines)) — masked_lines has
     every fenced block blanked (for the inline-code-span scan), block list
     carries each fenced block's language tag and raw lines (for the
-    TOML/CLI-invocation scans, which need fence content)."""
+    TOML/CLI-invocation scans, which need fence content).
+
+    Recognizes one level of `>` blockquote prefix on every line of the fence
+    (open, body, close) — the shape docs/runbooks/triage-pending-tasks-idle
+    -workers.md uses for its `harvest workflow diagnose ... --json` example
+    (Codex review, PR #1373). Nested/multi-level blockquotes, or a body line
+    that omits the prefix (CommonMark's "lazy continuation"), aren't handled
+    — real scope beyond what this corpus's one instance needs, same call
+    corpus-link-check.py's docstring makes for the identical shape."""
     out = []
     blocks = []
     fence_char = None
     fence_len = 0
     cur_lang = None
     cur_lines = None
+    bq_prefix = ""
     for line in lines:
         if fence_char is None:
-            m = re.match(r"^[ \t]{0,3}(`{3,}|~{3,})\s*([\w+-]*)", line)
+            bq_m = BLOCKQUOTE_PREFIX_RE.match(line)
+            candidate = line[bq_m.end() :] if bq_m else line
+            m = re.match(r"^[ \t]{0,3}(`{3,}|~{3,})\s*([\w+-]*)", candidate)
             if m:
                 fence_char, fence_len = m.group(1)[0], len(m.group(1))
                 cur_lang = m.group(2).lower()
                 cur_lines = []
+                bq_prefix = bq_m.group(1) if bq_m else ""
                 out.append("")
                 continue
             out.append(line)
             continue
+        body = line[len(bq_prefix) :] if bq_prefix and line.startswith(bq_prefix) else line
         if re.match(
-            rf"^[ \t]{{0,3}}{re.escape(fence_char)}{{{fence_len},}}[ \t]*$", line
+            rf"^[ \t]{{0,3}}{re.escape(fence_char)}{{{fence_len},}}[ \t]*$", body
         ):
             fence_char, fence_len = None, 0
             blocks.append((cur_lang, cur_lines))
             cur_lines = None
+            bq_prefix = ""
             out.append("")
             continue
-        cur_lines.append(line)
+        cur_lines.append(body)
         out.append("")
     return out, blocks
 
