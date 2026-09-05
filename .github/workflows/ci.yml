@@ -128,6 +128,16 @@ jobs:
         # newcomer in one of those environments hit an undocumented hard stop
         # on the very first command. See scripts/check-dev-runtime-root-caveat.sh.
         run: ./scripts/check-dev-runtime-root-caveat.sh
+      - name: Check HARVEST_DEV_DATABASE_URL placeholder caveat is documented
+        # Guards a real, reproduced-live defect: Chapter 1 gives
+        # `HARVEST_DEV_DATABASE_URL=postgres://me@localhost:5432/harvest_dev
+        # cargo dev` as a directly-runnable command, twice, with nothing
+        # marking `me` as a placeholder. Copied verbatim against an ordinary
+        # password-authenticated Postgres it fails with Postgres's own
+        # "fe_sendauth: no password supplied", which names neither the env
+        # var nor the doc. See
+        # scripts/check-dev-database-url-placeholder-caveat.sh.
+        run: ./scripts/check-dev-database-url-placeholder-caveat.sh
       - name: Check formatting
         run: cargo fmt --all -- --check
       - name: Clippy autumn-harvest
