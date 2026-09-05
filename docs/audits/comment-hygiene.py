@@ -722,6 +722,21 @@ def leading_columns(text: str) -> int:
     return len(text[: len(text) - len(text.lstrip())].expandtabs(4))
 
 
+def container_at_depth(stack: list[tuple[int, int]], depth: int) -> int:
+    """The innermost container column recorded at `depth`, else zero.
+
+    Columns are only meaningful within one quote depth: an entry pushed while
+    unquoted is a raw column, one pushed inside a quote is measured after the
+    marker. A fence must remember the container of ITS OWN frame, or its body
+    reads as dedented out of a list it was never in.
+    """
+    inner = 0
+    for column, entry_depth in stack:
+        if entry_depth == depth:
+            inner = column
+    return inner
+
+
 def leaves_container(text: str, scope: tuple[int, int]) -> bool:
     """Has `text` dedented out of the container an open fence started in?
 
@@ -730,15 +745,20 @@ def leaves_container(text: str, scope: tuple[int, int]) -> bool:
     later comment in the run -- a gate that silently stops gating, which is
     the failure this harness exists to prevent.
     """
-    container, depth = scope
+    outer, container, depth = scope
+    # Two frames, because a quote marker and the content behind it are not
+    # measured the same way. `outer` is the container the MARKER sits in --
+    # a quote inside a list item is indented to the item. `container` is the
+    # fence's own container once that marker is stripped. Reading either in
+    # the other's frame ends the fence on its own body.
+    #
     # Columns only compare inside one quote depth: a shallower line has left
     # the quote outright, and a deeper one is nested INSIDE the container, so
-    # its post-strip column says nothing about leaving it. The quote is read
-    # against the fence's own container, since that is the scope it opened in.
-    line_depth = quote_depth(text, container)
+    # its post-strip column says nothing about leaving it.
+    line_depth = quote_depth(text, outer)
     if line_depth != depth:
         return line_depth < depth
-    body = strip_quote(text, container)
+    body = strip_quote(text, outer)
     if not body.strip():
         return False
     return leading_columns(body) < container
@@ -892,7 +912,7 @@ def comment_lines(pieces: list[Piece]):
     """
     for run in comment_runs(pieces):
         fence: tuple[str, int] | None = None
-        scope = (0, 0)
+        scope = (0, 0, 0)
         stack: list[tuple[int, int]] = []
         paragraph = False
         for piece in run:
@@ -902,7 +922,7 @@ def comment_lines(pieces: list[Piece]):
             if fence is None:
                 stack, paragraph = update_containers(text, stack, paragraph)
             container = stack[-1][0] if stack else 0
-            delimiter = fence_delimiter(text, container, fence is not None, scope[1])
+            delimiter = fence_delimiter(text, container, fence is not None, scope[2])
             if delimiter:
                 before = fence
                 fence = fence_transition(fence, *delimiter)
@@ -911,7 +931,17 @@ def comment_lines(pieces: list[Piece]):
                 # "22." is refused a container it is entitled to.
                 paragraph = False
                 if before is None and fence is not None:
-                    scope = (container, quote_depth(text))
+                    # The container matters here too: a quote nested in a
+                    # list item is indented past column zero, so reading its
+                    # depth without the container saves zero and the fence
+                    # then never sees its own closing delimiter. The saved
+                    # column has to come from the same frame as that depth.
+                    line_depth = quote_depth(text, container)
+                    scope = (
+                        container,
+                        container_at_depth(stack, line_depth),
+                        line_depth,
+                    )
                 # Fence SYNTAX only if it opened one, closed one, or sits
                 # inside one. An invalid opener (```foo`bar) is ordinary text
                 # and must still be scanned -- exempting it would hide the
@@ -989,7 +1019,7 @@ def prose_units(pieces: list[Piece]) -> list[tuple[int, str]]:
         run: list[str] = []
         run_lines: list[int] = []
         fence: tuple[str, int] | None = None
-        scope = (0, 0)
+        scope = (0, 0, 0)
         stack: list[tuple[int, int]] = []
         paragraph = False
         in_list = False
@@ -1016,13 +1046,18 @@ def prose_units(pieces: list[Piece]) -> list[tuple[int, str]]:
             if fence is None:
                 stack, paragraph = update_containers(body, stack, paragraph)
             container = stack[-1][0] if stack else 0
-            delimiter = fence_delimiter(body, container, fence is not None, scope[1])
+            delimiter = fence_delimiter(body, container, fence is not None, scope[2])
             if delimiter:
                 before = fence
                 fence = fence_transition(fence, *delimiter)
                 paragraph = False
                 if before is None and fence is not None:
-                    scope = (container, quote_depth(body))
+                    line_depth = quote_depth(body, container)
+                    scope = (
+                        container,
+                        container_at_depth(stack, line_depth),
+                        line_depth,
+                    )
                 if fence is not None or before is not None:
                     flush()
                     in_list = False
@@ -1635,6 +1670,12 @@ RULE_TESTS = [
         "/// ```rust\n/// > ```\n/// TODO: fixture placeholder\n/// ```\n",
         set(),
         "a quoted delimiter deeper than the fence is sample text",
+    ),
+    (
+        "/// -   outer\n///     > ```rust\n///     > let x = 1;\n"
+        "///     > ```\n///     TODO: issue required\n",
+        {("CH002", 5)},
+        "a quoted fence inside a list item still sees its own closer",
     ),
     (
         "/// Intro\n/// > word1 word2 word3 word4 word5 word6 word7 word8 word9 word10 word11 word12 word13 word14 word15 word16 word17 word18 word19 word20 word21 word22 word23 word24 word25.\n",

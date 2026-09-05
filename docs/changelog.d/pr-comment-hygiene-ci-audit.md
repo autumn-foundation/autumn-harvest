@@ -828,3 +828,28 @@ the unit, in both directions.
 Corpus effect: none. Both latent, finding set identical to round
 twenty-three's — the sixth consecutive round with byte-identical output. The
 note at the end of round twenty-three still stands.
+
+### Round twenty-five — the fence scope needs two frames, not one
+
+One finding, verified to reproduce first, and its fix exposed a second defect
+that the fixtures caught before it shipped.
+
+A quoted fence inside a list item recorded quote depth zero, because the
+`quote_depth` call that saves the fence's scope omitted the container the
+marker is indented to. Its own closing delimiter then read as literal content
+and the fence never closed.
+
+Passing the container alone was not enough, and the round-twenty-three fixture
+failed immediately: the saved *column* came from a different frame than the
+saved depth. A quote marker is measured against the container it sits in (a
+list item, at column four), while the content behind it starts again at column
+zero. One number cannot be both.
+
+The scope carries both now — `(outer, container, depth)` — with `outer` for
+reading the marker and `container` for comparing columns once it is stripped.
+`container_at_depth` picks the column recorded at the fence's own depth, since
+a stack entry pushed while unquoted is a raw column and one pushed inside a
+quote is measured after the marker.
+
+Nine accumulated fence behaviours re-verified together. Corpus effect: none;
+the seventh consecutive round with byte-identical output.
