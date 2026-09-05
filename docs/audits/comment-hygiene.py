@@ -304,9 +304,23 @@ MAX_SENTENCE_WORDS = 25
 # limit against the container.
 FENCE_RE = re.compile(r"^([ \t]*)(`{3,}|~{3,})")
 LIST_MARKER_RE = re.compile(r"^([ \t]*)((?:[-*+]|\d+[.)])[ \t]+)")
+# A block quote is a container too, and Rustdoc uses it. Its marker is not
+# indentation -- content inside the quote starts again at column zero -- so it
+# is stripped before any container or fence judgement. Nested and space-less
+# forms ("> >", ">>") both count.
+#
+# The lookahead is load-bearing. CommonMark would read ">=foo" as a quote of
+# "=foo", but in Rust comments a line wrapping onto a leading ">=" is an
+# operator, and stripping its ">" silently rewrites the text every rule then
+# judges -- and the text a Tier B failure quotes back. A marker must be
+# followed by space, another marker, or the end of the line.
+BLOCKQUOTE_RE = re.compile(r"^[ \t]{0,3}(?:>(?=[ \t>]|$)[ \t]?)+")
 TABLE_RE = re.compile(r"^\s*\|")
 HEADING_RE = re.compile(r"^\s*#{1,6}\s")
-LIST_ITEM_RE = re.compile(r"^\s*(?:[-*+]|\d+\.)\s+")
+# A thematic break -- one punctuation character repeated. CommonMark spells it
+# "---"; this tree also draws section rules with box-drawing characters. Either
+# way it separates blocks, so a sentence never runs across one.
+SEPARATOR_RE = re.compile("^[ \t]*([-_*=\u2500\u2501\u2550\u00b7])\\1{2,}[ \t]*$")
 SENTENCE_SPLIT_RE = re.compile(r"(?<=[.!?])\s+")
 
 
@@ -579,6 +593,42 @@ def rust_sources(paths: list[str] | None) -> list[str]:
 INFO_BACKTICK_RE = re.compile(r"`")
 
 
+def closes_an_open_paren(marker: "re.Match[str]", run: list[str]) -> bool:
+    """Is this "N)" the tail of a wrapped parenthesis rather than a marker?
+
+    Accepting the "1)" ordered form makes every wrapped "(202)" and "(index
+    1)" look like a list item on the line its digits land on. The paragraph so
+    far says which: an unmatched "(" before it means the ")" closes that, and
+    a sentence split there reports prose the author never wrote as two.
+    """
+    if marker.group(2).strip()[-1:] != ")":
+        return False
+    text = " ".join(run)
+    return text.count("(") > text.count(")")
+
+
+def interrupts_paragraph(marker: "re.Match[str]") -> bool:
+    """May this list marker start an item in the middle of a paragraph?
+
+    CommonMark's own rule. A wrapped "202)" or "503)" matches the ordered
+    form, and splitting a paragraph there hides the long sentence it belongs
+    to. Only a bullet, or the number one, may interrupt a paragraph; inside a
+    list any number continues it.
+    """
+    marker_text = marker.group(2).strip()
+    return not marker_text[:1].isdigit() or marker_text[:-1] == "1"
+
+
+def strip_quote(text: str) -> str:
+    """`text` past any block-quote marker.
+
+    Every container judgement below measures from here, so a quoted fence,
+    list or indent reads exactly as the unquoted form does.
+    """
+    match = BLOCKQUOTE_RE.match(text)
+    return text[match.end():] if match else text
+
+
 def container_indent_after(text: str, current: int) -> int:
     """The content indent of the innermost open list item, after `text`.
 
@@ -586,6 +636,7 @@ def container_indent_after(text: str, current: int) -> int:
     fence inside it is indented that far and is still a fence. A non-blank
     line that dedents below the container closes it.
     """
+    text = strip_quote(text)
     marker = LIST_MARKER_RE.match(text)
     if marker:
         return len(marker.group(1)) + len(marker.group(2))
@@ -598,13 +649,14 @@ def fence_delimiter(text: str, container: int) -> tuple["re.Match[str]", str] | 
     """The fence delimiter on `text`, or None if the line is not one.
 
     Two things separate a delimiter from ordinary text. A fence may open on
-    the same line as the list marker that contains it ("- ```rust"), so the
-    marker is skipped before matching. And CommonMark allows at most three
+    the same line as a container marker -- a list item ("- ```rust") or a
+    block quote ("> ```rust") -- so markers are skipped before matching. And CommonMark allows at most three
     spaces of indent *relative to the container*, for closers as much as for
     openers: past that the line is indented content -- fenced content while a
     fence is open, an indented code line while one is not. Returns the match
     and the text it was matched against, which carries the info string.
     """
+    text = strip_quote(text)
     marker = LIST_MARKER_RE.match(text)
     base = len(marker.group(0)) if marker else 0
     tail = text[marker.end():] if marker else text
@@ -773,6 +825,7 @@ def prose_units(pieces: list[Piece]) -> list[tuple[int, str]]:
         run_line = 0
         fence: tuple[str, int] | None = None
         container = 0
+        in_list = False
 
         def flush():
             nonlocal run
@@ -790,18 +843,37 @@ def prose_units(pieces: list[Piece]) -> list[tuple[int, str]]:
                 fence = fence_transition(fence, *delimiter)
                 if fence is not None or before is not None:
                     flush()
+                    in_list = False
                     continue
                 # Not a valid fence: fall through and treat it as prose.
             if fence is not None:
                 flush()
+                in_list = False
                 continue
-            if TABLE_RE.match(body) or HEADING_RE.match(body) or not body.strip():
+            # Structure is read past the container markers, and so is the
+            # prose: a quote marker is not a word of the sentence it carries.
+            body = strip_quote(body)
+            if (
+                TABLE_RE.match(body)
+                or HEADING_RE.match(body)
+                or SEPARATOR_RE.match(body)
+                or not body.strip()
+            ):
                 flush()
+                in_list = False
                 continue
-            if LIST_ITEM_RE.match(body):
+            # LIST_MARKER_RE, not a second list pattern of its own. Two
+            # patterns for one concept drift: the previous one here missed the
+            # "1)" ordered form, so two short items merged into one sentence
+            # long enough to report a CH007 neither author wrote.
+            marker = LIST_MARKER_RE.match(body)
+            if marker and closes_an_open_paren(marker, run):
+                marker = None
+            if marker and (not run or in_list or interrupts_paragraph(marker)):
                 flush()
                 run_line = piece.line
-                run = [LIST_ITEM_RE.sub("", body).strip()]
+                run = [body[marker.end():].strip()]
+                in_list = True
                 continue
             if not run:
                 run_line = piece.line
@@ -1022,7 +1094,18 @@ def compare_tier_b(
             # count moved and left to find which comment did it.
             located = (index or {}).get((rule, path), {})
             for fingerprint, count in sorted(added.items()):
-                for finding in located.get(fingerprint, [])[:count]:
+                sites = located.get(fingerprint, [])
+                # When the merge base already carried this exact text, the
+                # occurrences are indistinguishable -- the fingerprint IS the
+                # text. Naming the first one names the legacy line and sends
+                # the contributor to edit a comment they never wrote, so name
+                # every candidate and say how many of them are new.
+                if len(sites) > count:
+                    regressions.append(
+                        f"    {count} of these {len(sites)} identical comments "
+                        f"{'is' if count == 1 else 'are'} new:"
+                    )
+                for finding in sites:
                     regressions.append(f"    {path}:{finding.line}: {finding.text[:100]}")
     return regressions
 
@@ -1196,6 +1279,49 @@ RULE_TESTS = [
         "/// - ```rust\n///   let x = compute();\n///   ```\n/// TODO: issue required\n",
         {("CH002", 4)},
         "a fence opened on a list-marker line still closes",
+    ),
+    (
+        "/// > ~~~rust\n/// > TODO: fixture placeholder\n/// > ~~~\n",
+        set(),
+        "a fence inside a block quote is a fence",
+    ),
+    (
+        "/// > > ```rust\n/// > > TODO: fixture placeholder\n/// > > ```\n",
+        set(),
+        "so is one inside a nested block quote",
+    ),
+    (
+        "/// > - Example:\n/// >\n/// >     ```rust\n/// >     TODO: fixture placeholder\n/// >     ```\n",
+        set(),
+        "a quoted list item still opens a container for its fence",
+    ),
+    (
+        "/// > ```rust\n/// > let x = compute();\n/// > ```\n/// > TODO: issue required\n",
+        {("CH002", 4)},
+        "a quoted fence closes, and quoted prose after it is scanned",
+    ),
+    (
+        "/// > TODO: fix this\n",
+        {("CH002", 1)},
+        "a quote marker does not exempt the line it carries",
+    ),
+    (
+        "/// 1) alpha beta gamma delta epsilon zeta eta theta iota kappa lambda mu nu\n"
+        "/// 2) xi omicron pi rho sigma tau upsilon phi chi psi omega alpha beta\n",
+        set(),
+        "parenthesized ordered-list items are separate sentences",
+    ),
+    (
+        "// --------------------\n"
+        "// word1 word2 word3 word4 word5 word6 word7 word8 word9 word10 word11 word12 word13 word14 word15 word16 word17 word18 word19 word20 word21 word22 word23 word24 word25.\n",
+        set(),
+        "a thematic break is not a word of the sentence below it",
+    ),
+    (
+        "// It pins branch B (index\n"
+        "// 1) as word1 word2 word3 word4 word5 word6 word7 word8 word9 word10 word11 word12 word13 word14 word15 word16 word17 word18 word19 word20.\n",
+        {("CH007", 1)},
+        "a wrapped \"1)\" closing a paren does not split the sentence",
     ),
     # Orthogonal-axis fixtures. Two rules were checked for the RIGHT WORDS
     # while the apostrophe character and the marker's case were left assumed,
@@ -1396,6 +1522,41 @@ def prose_sweep() -> list[str]:
     ]
 
 
+def ratchet_reporting_test() -> int:
+    """A Tier B failure must name the line the contributor has to fix.
+
+    The hard case is a duplicate: the fingerprint IS the comment text, so two
+    identical comments are one fingerprint with a count. Reporting the first
+    occurrence then points at the legacy line whenever the merge base already
+    carried a copy -- a gate telling someone to edit a comment they never
+    wrote. Every candidate is named instead, with a count of how many are new.
+    """
+    legacy = "// It doesn\u2019t matter here.\n"
+    base_source = "// filler one\n" + legacy + "// filler\n" * 12
+    head_source = base_source + "// tail filler\n" + legacy
+
+    def tier_b(source: str) -> list[Finding]:
+        return [f for f in findings_for_source("f.rs", source) if f.rule in TIER_B]
+
+    def grouped(items: list[Finding]) -> dict:
+        out: dict = defaultdict(lambda: defaultdict(list))
+        for f in items:
+            out[f.rule][f.path].append(f.fingerprint)
+        return out
+
+    head = tier_b(head_source)
+    lines = compare_tier_b(
+        grouped(head), grouped(tier_b(base_source)), {"f.rs"}, {}, index_findings(head)
+    )
+    named = {int(line.split(":")[1]) for line in lines if line.startswith("    f.rs:")}
+    ok = named == {2, 16} and any("1 of these 2" in line for line in lines)
+    print(f"  [{'ok  ' if ok else 'FAIL'}] a duplicated Tier B finding names every candidate line")
+    if not ok:
+        for line in lines:
+            print(f"         {line}")
+    return 0 if ok else 1
+
+
 def self_test() -> int:
     """Prove the lexer still handles the Rust forms the rules depend on."""
     failures = 0
@@ -1458,6 +1619,8 @@ def self_test() -> int:
         print(f"  [{'ok  ' if ok else 'FAIL'}] {name}")
         if not ok:
             print(f"         expected {sorted(expected)!r}\n         got      {sorted(got)!r}")
+
+    failures += ratchet_reporting_test()
 
     print("\nOK: self-test passed." if not failures else f"\n{failures} self-test failure(s).")
     return 1 if failures else 0

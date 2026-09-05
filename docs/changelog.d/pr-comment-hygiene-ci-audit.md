@@ -544,3 +544,51 @@ an indented code line while one is not.
 
 All ten fence behaviours re-verified together, the eight from rounds six to
 fifteen plus these two.
+
+### Round seventeen — block quotes, ordered-list markers, duplicate locations
+
+Three review findings, all verified to reproduce first.
+
+**A fence inside a block quote was not a fence.** Rustdoc writes quoted
+examples, and the fence pattern ran against a body still carrying its `>`:
+
+```
+/// > ~~~rust
+/// > TODO: fixture placeholder         -> CH002 on sample text
+/// > ~~~
+```
+
+A block quote is a container like a list item, so it is stripped before any
+container or fence judgement. Its marker must be followed by a space, another
+marker, or the end of the line — CommonMark would read `>=foo` as a quote of
+`=foo`, but in a Rust comment a line wrapping onto a leading `>=` is an
+operator, and stripping that `>` rewrites the text every rule then judges. The
+corpus contains exactly that in `scheduler.rs` and `start_idempotency.rs`.
+
+**Prose kept a second list pattern of its own**, and it had drifted: it knew
+`1.` but not `1)`, so two short items merged into one sentence long enough to
+report a CH007 neither author wrote. It now uses `LIST_MARKER_RE`, the one the
+container logic already uses, which structurally prevents the drift.
+
+Accepting `1)` has a cost the finding did not mention, and the corpus proved
+it: `202)` and `503)` also match, and both occur here as the tail of a wrapped
+parenthesis. Two guards, verified against the whole corpus:
+
+- A `N)` marker with an unmatched `(` earlier in the paragraph closes that
+  paren; it is not a marker.
+- CommonMark's own rule — only a bullet, or the number one, may interrupt a
+  paragraph. Inside a list any number continues it.
+
+That second guard exposed a third defect: a `// ─────` section rule was being
+joined into the sentence below it. A thematic break now ends the block. This
+is the round's largest effect — 63 findings lose a leading rule from their
+quoted text and point at the prose line instead of the rule line, and four
+sentences that were only over the limit because the rule counted as a word
+drop out. No rule's count rose in any file.
+
+**A Tier B failure could name the wrong line.** The fingerprint *is* the
+comment text, so identical comments share one. When the merge base already
+carried a copy, reporting the first occurrence pointed at the legacy line —
+telling a contributor to edit a comment they never wrote. Every candidate is
+named now, with a count of how many are new. The self-test grew its first
+direct check of the ratchet's reporting, not just its arithmetic.
