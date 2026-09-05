@@ -413,3 +413,29 @@ outcome", "the worst one's" — so matching those stems would report 21 false
 positives against correct prose. They are now excluded deliberately, with that
 measurement written down as the reason, rather than left to look like an
 oversight.
+
+**Thirteenth Codex round (PR #1380): four P2 findings.** Two are gaps, one is
+a false positive I introduced, and one is a fix from round ten I only did half
+of.
+
+- *Compound assignment missed.* `count += 1;`, `retries -= 1;`,
+  `flags |= READY;`, `bits <<= 2;` — the assignment branch accepted only a
+  bare `=`.
+- *`world's` was reported as a contraction.* `world` was in the pronoun stem
+  list, so an ordinary possessive tripped CH006 — directly contradicting the
+  rationale written two lines above it about possessives being permitted. A
+  false positive of my own making; removed.
+- *An invalid fence opener was still exempted.* Round ten taught
+  `fence_transition()` to reject ` ```foo`bar `, but `comment_lines()` still
+  yielded the line as fenced, so the TODO embedded in it was skipped anyway.
+  Rejecting an opener now means the line is ordinary text and gets scanned —
+  otherwise the rejection hides the very defect it exists to expose.
+- *Typographic apostrophes bypassed CH006 entirely.* `can’t`, `isn’t`, `we’re`
+  matched nothing, because every branch required an ASCII `'`. Editors
+  substitute these automatically, so this was a bypass anyone could trip
+  without meaning to.
+
+The last one lands one commit after the CH006 enumeration was added, and is
+the sharper lesson: enumerating the contraction *list* while leaving the
+apostrophe *character* assumed still left a whole class open. The inventory
+now carries both apostrophe forms.

@@ -229,7 +229,7 @@ COMMENTED_CODE_RE = re.compile(
       # expression: "if the queue is paused, the worker parks {".
       | (?:if|while|for|match|loop|unsafe)\b
             (?![^;{]*\b[a-z]+\s+[a-z]+\s+[a-z]+\s+[a-z]+\b)[^;]*\{\s*$
-      | [\w.\[\]:]+\s*=\s*[^\s;]+\s*;\s*$             # assignment, single-token RHS
+      | [\w.\[\]:]+\s*(?:[-+*/%&|^]|<<|>>)?=\s*[^\s;]+\s*;\s*$  # (compound) assignment
       # A commented-out statement. Anchored hard: the call must open at the
       # very start, so prose that merely names a function ("call cleanup()
       # first") cannot reach it, and the line must end at the `;`. Measured
@@ -277,12 +277,15 @@ ARCHAEOLOGY_RE = re.compile(
 # against correct STE. The stems below are the unambiguous ones: `it's`,
 # `who's`, `there's` and friends have distinct possessive spellings (`its`,
 # `whose`, `theirs`), so a match is always a contraction.
+# `[\u2019']` throughout: an editor that substitutes a typographic apostrophe
+# must not turn a gated contraction into an invisible pass.
+_APOS = r"[\u2019']"
 CONTRACTION_RE = re.compile(
     r"\b(?:ca|is|are|was|were|do|does|did|would|could|should|will|has|have|had"
-    r"|must|ai|wo|sha|need|ought|might|dare)n't\b"
+    r"|must|ai|wo|sha|need|ought|might|dare)n" + _APOS + r"t\b"
     r"|\b(?:it|that|there|here|what|who|how|where|when|why|let|he|she|we|they"
-    r"|you|i|world)'(?:s|ll|re|ve|d|m)\b"
-    r"|\b(?:should|could|would|must|might)'ve\b",
+    r"|you|i)" + _APOS + r"(?:s|ll|re|ve|d|m)\b"
+    r"|\b(?:should|could|would|must|might)" + _APOS + r"ve\b",
     re.IGNORECASE,
 )
 
@@ -635,8 +638,13 @@ def comment_lines(pieces: list[Piece]):
             text = piece.text
             match = FENCE_RE.match(text)
             if match:
+                before = fence
                 fence = fence_transition(fence, match, text)
-                yield piece.line, text, True
+                # Fence SYNTAX only if it opened one, closed one, or sits
+                # inside one. An invalid opener (```foo`bar) is ordinary text
+                # and must still be scanned -- exempting it would hide the
+                # defect that rejecting it exists to expose.
+                yield piece.line, text, fence is not None or before is not None
                 continue
             yield piece.line, text, fence is not None
 
@@ -720,9 +728,12 @@ def prose_units(pieces: list[Piece]) -> list[tuple[int, str]]:
             body = piece.text
             match = FENCE_RE.match(body)
             if match:
+                before = fence
                 fence = fence_transition(fence, match, body)
-                flush()
-                continue
+                if fence is not None or before is not None:
+                    flush()
+                    continue
+                # Not a valid fence: fall through and treat it as prose.
             if fence is not None:
                 flush()
                 continue
@@ -1084,6 +1095,11 @@ RULE_TESTS = [
         "three spaces still opens a fence",
     ),
     (
+        "/// ```foo`bar TODO: remove this\n",
+        {("CH002", 1)},
+        "an invalid fence opener is scanned, not exempted",
+    ),
+    (
         "/* ```rust */\n/* TODO: issue required */\n",
         {("CH002", 2)},
         "two distinct block comments are two runs",
@@ -1149,6 +1165,10 @@ CODE_SHAPE_TESTS = [
     ("impl<T> Trait for Foo {", True),
     ("value = compute();", True),
     ("self.count = 0;", True),
+    ("count += 1;", True),
+    ("retries -= 1;", True),
+    ("flags |= READY;", True),
+    ("bits <<= 2;", True),
     ("if the queue is paused, the worker parks {", False),
     ("impl the row has already been deleted by retention {", False),
     ("cleanup();", True),
@@ -1196,11 +1216,17 @@ CONTRACTIONS_EXPECTED = [
     "must've", "might've",
     "we'll", "they'll", "you'll", "i'll", "it'll", "he'll", "she'll",
     "we'd", "they'd", "you'd", "i'd", "he'd", "she'd", "i'm",
+    # Typographic apostrophes. An editor that substitutes these must not turn
+    # a gated contraction into an invisible pass.
+    "can\u2019t", "isn\u2019t", "we\u2019re", "it\u2019s", "should\u2019ve", "won\u2019t",
 ]
 # Possessives and abbreviations STE permits. A match here is a false positive.
 CONTRACTIONS_EXCLUDED = [
     "one's", "someone's", "everyone's", "nobody's", "everything's",
     "something's", "nothing's", "the row's", "the queue's", "TTL'd",
+    # `world` was in the stem list and produced a false positive on this
+    # ordinary possessive, contradicting the rule's own rationale.
+    "the world's",
 ]
 
 SWEEP_KEYWORDS = [
