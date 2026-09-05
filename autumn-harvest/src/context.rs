@@ -20887,11 +20887,9 @@ mod tests {
         // Yield to let it emit the command.
         tokio::task::yield_now().await;
 
-        // Drop the handle -- the oneshot sender will be dropped when
-        // the JoinHandle's task is aborted. But we actually need to
-        // explicitly drop the sender. Let's approach differently:
-        // The task holds the context, so we can't drain commands from here.
-        // Instead, just abort the spawned task and verify the handle errors.
+        // The spawned task owns the context, so this test cannot drain its
+        // commands directly. Abort the task instead and verify the handle
+        // reports the cancellation.
         handle.abort();
         let result = handle.await;
         assert!(result.is_err()); // JoinError from abort

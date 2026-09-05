@@ -493,7 +493,6 @@ pub enum HarvestError {
     /// The cap is enforced **only on new writes**. Payloads already stored in
     /// history replay correctly even if they exceed the current cap — the replay
     /// engine never re-checks sizes on existing events.
-    ///
     #[error(
         "payload too large: {kind} for workflow '{workflow_type}' exceeded cap of \
          {cap_bytes} bytes (observed {observed_bytes} bytes)"

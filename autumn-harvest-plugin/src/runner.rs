@@ -546,7 +546,6 @@ struct PreparedHarvestRuntime {
 ///
 /// Extracted from `PreparedHarvestRuntime::build` so it sits alongside its
 /// audit-export sibling below; the reasoning is unchanged.
-///
 // Install the process-global completion-callback runtime config
 // (issue #605): the deliverer/secret/allowlist/defaults/retry policy
 // the core scanner (`fire_due_completion_deliveries`) and enqueue

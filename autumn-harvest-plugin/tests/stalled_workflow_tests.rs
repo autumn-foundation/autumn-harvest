@@ -428,7 +428,7 @@ async fn test_no_pending_work_always_returned_regardless_of_include_sleeping() {
     let exec_id = seed_stalled_workflow(&database_url, "wf-always-no-pending", 2).await;
     complete_workflow_tasks(&database_url, exec_id).await;
 
-    // include_sleeping=false is the DEFAULT, but let's be explicit.
+    // include_sleeping=false is the DEFAULT. Set it explicitly for clarity.
     let (status, body) = get_json(
         &app,
         "/workflows?no_progress_minutes=30&include_sleeping=false",

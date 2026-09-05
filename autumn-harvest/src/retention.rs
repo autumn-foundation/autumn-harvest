@@ -1865,7 +1865,6 @@ async fn run_shard_tick(
                 .await?;
                 continue;
             }
-            //
             // NB (PR #990 review): the candidate SELECT now pushes each row's
             // exact per-type cutoff into SQL, so the two skip branches below
             // (`effective_max_age == None` and `completed_at >= resolved_cutoff`)
