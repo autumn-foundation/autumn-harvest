@@ -12667,7 +12667,7 @@ mod tests {
     /// contract as `parse_started_bound` on the Workflows page (#1333).
     /// Before this change, `parse_worker_ui_filters` `?`-propagated a bare
     /// `AutumnError::bad_request_msg` here, which aborted the whole
-    /// `/workers` response before the filter form (or the build_id/shard
+    /// `/workers` response before the filter form (or the `build_id`/`shard`
     /// filters the operator had already typed) was ever rendered — see the
     /// RED baseline in
     /// `tests/ui_integration.rs::ui_workers_unknown_status_value_redisplays_form_instead_of_aborting_page`.
