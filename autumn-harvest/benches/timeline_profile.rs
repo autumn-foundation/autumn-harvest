@@ -44,8 +44,11 @@
 //!
 //! `TIMELINE_PROFILE_N` (default `400`) sets the number of regular activities
 //! scheduled per simulated execution (the other categories scale off it).
-//! `TIMELINE_PROFILE_REPS` (default `1_500`) sets how many times the (fixed)
-//! history is derived into a timeline.
+//! `TIMELINE_PROFILE_REPS` (default `1_500`, minimum `100`) sets how many
+//! times the (fixed) history is derived into a timeline. The floor keeps the
+//! one-time sanity-check derivation below `main` (also captured by
+//! Callgrind's default `--collect-atstart=yes`) under ~1% of the total
+//! collected instruction count.
 
 use autumn_harvest::event::WorkflowEvent;
 use autumn_harvest::types::{ActivityExecId, ExecutionId, TimerId, WorkerId};
@@ -277,7 +280,24 @@ fn env_usize(key: &str, default: usize) -> usize {
 }
 
 fn validate_workload_params(n: usize, reps: usize) {
-    assert!(reps >= 1, "TIMELINE_PROFILE_REPS must be at least 1, got 0");
+    // Callgrind's `--collect-atstart` defaults to `yes` (see the Running
+    // section above), so the one-time, unmeasured-in-INTENT sanity
+    // `derive_timeline` call in `main` below IS captured in the collected
+    // instruction count -- there is no in-process way to exclude it without
+    // a client-request crate this repo hasn't taken a dependency on. At
+    // reps=1 that one call is roughly HALF of the counted work, silently
+    // diluting the measured delta (Codex review on #1372). Requiring at
+    // least 100 reps keeps the sanity call's fixed one-call cost under ~1%
+    // of the total -- an order of magnitude below both the impact floor
+    // (>=5% Ir) and this harness's own measured run-to-run noise
+    // (~0.1-0.2%, see the header) -- so it can never be mistaken for signal.
+    assert!(
+        reps >= 100,
+        "TIMELINE_PROFILE_REPS must be at least 100 (so the one-time, \
+         always-collected sanity-check derive_timeline call before the \
+         measured loop stays under ~1% of the total instruction count), \
+         got {reps}"
+    );
     // The smallest category is children at n/20. Below n=200, child_n < 10,
     // so its 9:1 ratio (i % 10 == 9) can never land on an open item -- the
     // fixture would silently measure a workload with an all-closed category
