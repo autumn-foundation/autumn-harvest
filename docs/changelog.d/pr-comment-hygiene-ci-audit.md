@@ -1302,3 +1302,33 @@ agree with the renderer, and it should have been the first check in this seam
 rather than the fortieth round's.
 
 Corpus effect: none, for the twenty-second round running.
+
+### Round forty-one — the other side of the nested comment, and compound types
+
+**A gutter before a nested opener is not a blank line.** Round thirty-eight
+suppressed the empty segment a nested comment leaves when it CLOSES at the end
+of a line. The opening side had the same defect: `* /* note */` emitted the
+` * ` in front of the opener as a piece, whose normalized text is empty, so
+both scanners read a blank line and ended the paragraph one line early. The
+`22.` under it then took a container and its fence an allowance, and a TODO
+inside the invented fence went unreported. Rustdoc renders the whole sequence
+as one paragraph, delimiters and all — checked, not assumed.
+
+`gutter_only` asks the question `Piece.text` answers, and all four segment
+emitters use it: before a nested opener, after a nested close, at the closing
+line, and — unchanged from round thirty-eight — at a newline, where a
+genuinely blank line must still count. A nested opener now also marks the line
+as started, so a line holding only `/*` is not blank either.
+
+**CH001 missed every compound type.** The uninitialized-binding rule needed a
+type annotation to tell `let mut retries: usize;` from `let the reader
+decide;`, and its character class admitted only scalar-shaped ones. An array
+length needs `;`, a trait object `+`, a function pointer `->`, a raw pointer
+`*`, so `let bytes: [u8; 32];` and its kin passed an absolute gate. The class
+now carries them, with two constraints: the inner `;` is allowed only where a
+`]` closes before the next one, so the statement's own terminator still ends
+it; and a hyphen is admitted only as `->`. The first cut allowed a bare hyphen
+and the adversarial prose sweep immediately produced `let a::b is re-exported
+for callers;` — the sweep earning its place again.
+
+Corpus effect: none, for the twenty-third round running.

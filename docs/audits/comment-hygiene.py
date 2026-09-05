@@ -238,7 +238,17 @@ COMMENTED_CODE_RE = re.compile(
       # annotation to separate "let mut retries: usize;" from "let the reader
       # decide;" -- English does not put a colon between two bare words.
       | let\s+(?:mut\s+)?\w+\s*:
-            (?!\s*(?:\w+\s+){2,}\w+\s*;\s*$)\s*[\w:<>&'\[\]\s,()]+;\s*$
+            (?!\s*(?:\w+\s+){2,}\w+\s*;\s*$)\s*
+            # A Rust type, not a scalar name. An array length needs `;`, a
+            # trait object needs `+`, a function pointer needs `->`, and a
+            # raw pointer needs `*`; without them "let bytes: [u8; 32];" is
+            # commented-out code that the absolute gate lets through. The
+            # inner `;` is allowed only where a `]` closes before the next
+            # one, so the terminator itself stays the end of the statement.
+            # A hyphen is admitted only as `->`. A bare one let the prose
+            # sweep through "let a::b is re-exported for callers;", and a
+            # type has no other use for it.
+            (?:[\w:<>&'\[\]\s,()+*!?]|->|;(?=[^;]*\]))+;\s*$
       | use\s+(?:\w+::)*(?:\w+|\*|\{[\w:,\s*]+\})(?:\s+as\s+\w+)?;\s*$
       | \#!?\[[\w:()"'=,./\s-]+\]\s*$
       | \}[,;)]*\s*$
@@ -489,6 +499,17 @@ class Piece:
         return body[1:] if body.startswith(" ") else body
 
 
+def gutter_only(body: str) -> bool:
+    """Is `body` only a `*` gutter and whitespace?
+
+    The same normalization `Piece.text` applies, asked as a question. A
+    segment that reduces to nothing is not a blank LINE -- Rustdoc renders
+    "* /* note */" as paragraph text, delimiters and all -- so emitting it
+    ends a paragraph the document still holds open.
+    """
+    return not re.sub(r"^\s*\*(?!\*)", "", body).strip()
+
+
 # A raw-string opener: r"", r#""#, br##""##, and the c"" / cr#""# forms.
 RAW_OPEN_RE = re.compile(r"(?:b|c|br|cr|rb)?r(#*)\"")
 IDENT_CHAR_RE = re.compile(r"[A-Za-z0-9_]")
@@ -576,11 +597,19 @@ def extract_comments(source: str) -> list[Piece]:
                     # starts a piece of its own; otherwise
                     # `/* outer /* let x = 1; */ */` hands the rules one string
                     # beginning "outer", and the nested code is never anchored.
-                    if i > seg_start:
+                    # Only the gutter before the opener, on a line whose
+                    # text carries on inside the nested comment. Round
+                    # thirty-eight suppressed the empty segment a nested
+                    # CLOSE leaves; this is the same defect on the opening
+                    # side, and it ended the paragraph one line earlier.
+                    if i > seg_start and not gutter_only(source[seg_start:i]):
                         pieces.append(
                             Piece(seg_line, marker, source[seg_start:i], code_on_line and first, True, root_group, seg_nest)
                         )
                         first = False
+                    # The opener itself is text on this line, whether or not
+                    # anything preceded it, so the line is no longer blank.
+                    line_started = True
                     # A nested comment stays in the enclosing comment's run,
                     # and `nest` records that it is inside it. The fence state
                     # is stacked per nesting level rather than reset here: the
@@ -601,11 +630,12 @@ def extract_comments(source: str) -> list[Piece]:
                     seg_line = line
                     seg_nest = depth
                 elif source.startswith("*/", i):
-                    if depth > 1 and i > seg_start:
-                        pieces.append(
-                            Piece(seg_line, marker, source[seg_start:i], code_on_line and first, True, root_group, seg_nest)
-                        )
-                        first = False
+                    if depth > 1:
+                        if i > seg_start and not gutter_only(source[seg_start:i]):
+                            pieces.append(
+                                Piece(seg_line, marker, source[seg_start:i], code_on_line and first, True, root_group, seg_nest)
+                            )
+                            first = False
                         line_started = True
                     depth -= 1
                     i += 2
@@ -635,7 +665,7 @@ def extract_comments(source: str) -> list[Piece]:
                 else:
                     i += 1
             tail_end = i - 2 if depth == 0 else i
-            if tail_end > seg_start:
+            if tail_end > seg_start and not gutter_only(source[seg_start:tail_end]):
                 pieces.append(
                     Piece(seg_line, marker, source[seg_start:tail_end], code_on_line and first, True, root_group, seg_nest)
                 )
@@ -2429,6 +2459,28 @@ RULE_TESTS = [
         {("CH007", 1)},
         "'[y]' is not a task marker, so it stays two words",
     ),
+    (
+        "/** Intro paragraph\n"
+        " * /* inserted note */\n"
+        " * 22. item\n"
+        " *     ```\n"
+        " *     TODO: issue required\n"
+        " */\n"
+        "pub struct A;\n",
+        {("CH002", 5)},
+        "a gutter before a nested opener is not a blank line",
+    ),
+    (
+        "/** Intro paragraph\n"
+        " *\n"
+        " * 22. item\n"
+        " *     ```\n"
+        " *     TODO: issue required\n"
+        " */\n"
+        "pub struct A;\n",
+        set(),
+        "a genuinely blank comment line still ends the paragraph",
+    ),
 ]
 
 
@@ -2517,6 +2569,17 @@ CODE_SHAPE_TESTS = [
     ("use Foo, which the macro expands to;", False),
     ("struct directly; a malicious body must not flip it.", False),
     ("mod bar is documented in docs/architecture.md.", False),
+    # Compound types in an uninitialized binding. Each needs a character the
+    # scalar form does not: an array length needs `;`, a trait object `+`, a
+    # function pointer `->`, a raw pointer `*`.
+    ("let bytes: [u8; 32];", True),
+    ("let callback: Box<dyn Fn() + Send>;", True),
+    ("let function: fn(u8) -> u8;", True),
+    ("let ptr: *const u8;", True),
+    ("let v: Vec<Box<dyn Error + Send + Sync>>;", True),
+    ("let s: &'a [u8];", True),
+    # The hyphen those admit is `->` and nothing else.
+    ("let a::b is re-exported for callers;", False),
 ]
 
 
