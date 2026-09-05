@@ -252,7 +252,17 @@ fn env_usize(key: &str, default: usize) -> usize {
 
 fn validate_workload_params(n: usize, reps: usize) {
     assert!(reps >= 1, "TIMELINE_PROFILE_REPS must be at least 1, got 0");
-    assert!(n >= 10, "TIMELINE_PROFILE_N must be at least 10, got {n}");
+    // The smallest category is children at n/20. Below n=200, child_n < 10,
+    // so its 9:1 ratio (i % 10 == 9) can never land on an open item -- the
+    // fixture would silently measure a workload with an all-closed category
+    // rather than the documented 9:1 closed:open mix in every category (Codex
+    // review on #1372).
+    assert!(
+        n >= 200,
+        "TIMELINE_PROFILE_N must be at least 200 (so even n/20 reaches the \
+         10 items needed for every category's 9:1 closed:open ratio to \
+         include an open item), got {n}"
+    );
 }
 
 fn main() {
@@ -282,15 +292,30 @@ fn main() {
         "fixture bug: fewer timeline steps ({}) than regular activities ({n})",
         sanity.steps.len()
     );
-    let open_steps = sanity
-        .steps
-        .iter()
-        .filter(|s| s.outcome == autumn_harvest::StepOutcome::Pending)
-        .count();
-    assert!(
-        open_steps > 0,
-        "fixture bug: no open (Pending) steps in the derived timeline"
-    );
+    for kind in [
+        autumn_harvest::StepKind::Activity,
+        autumn_harvest::StepKind::LocalActivity,
+        autumn_harvest::StepKind::Timer,
+        autumn_harvest::StepKind::ChildWorkflow,
+    ] {
+        let (open, closed) = sanity.steps.iter().filter(|s| s.step_kind == kind).fold(
+            (0u32, 0u32),
+            |(open, closed), s| {
+                if s.outcome == autumn_harvest::StepOutcome::Pending {
+                    (open + 1, closed)
+                } else {
+                    (open, closed + 1)
+                }
+            },
+        );
+        assert!(
+            open > 0 && closed > 0,
+            "fixture bug: {kind:?} has no {} steps (open={open}, closed={closed}) -- \
+             TIMELINE_PROFILE_N is too small for every category's 9:1 closed:open \
+             ratio to include both",
+            if open == 0 { "open" } else { "closed" }
+        );
+    }
 
     // BTreeMap, not HashMap: this tally is read inside the measured loop
     // below, and HashMap's default RandomState hasher is seeded per-process
