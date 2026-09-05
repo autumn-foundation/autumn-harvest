@@ -32,10 +32,12 @@ HARVEST_DEV_DATABASE_URL=postgres://me@localhost:5432/harvest_dev cargo dev
 ```
 
 `me` is a placeholder, not a literal role — this DSN doesn't work copied
-verbatim. Point it at a role that can actually authenticate for your server's
-auth method (peer, trust, or a password in the DSN itself); copied as-is
-against an ordinary password-authenticated Postgres it fails immediately with
-Postgres's own `fe_sendauth: no password supplied`, which names neither
+verbatim. This URI connects over TCP (not a Unix socket), so `peer`
+authentication never applies here regardless of your `pg_hba.conf`; point it
+at a role that's allowed to connect over TCP on this address (`trust`, or a
+password in the DSN itself). Copied as-is against an ordinary
+password-authenticated Postgres it fails immediately with Postgres's own
+`fe_sendauth: no password supplied`, which names neither
 `HARVEST_DEV_DATABASE_URL` nor this doc. For a fresh install using the default
 `postgres` role: `postgres://postgres:<password>@localhost:5432/harvest_dev`.
 
