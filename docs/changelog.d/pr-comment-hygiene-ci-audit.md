@@ -1008,3 +1008,34 @@ not.
 
 Corpus effect: none, for the twelfth round running. CH001 is still zero, so
 the first finding was a latent hole rather than a live miss.
+
+### Round thirty-one — marker limits, marker values, spaced breaks, lazy quotes
+
+Four findings, all verified to reproduce first. The first three are the same
+mistake in three places: reading a marker's *spelling* instead of what
+CommonMark says it means.
+
+- **Ten digits is not an ordered marker.** The cap is nine; `\d+` accepted any
+  run, so `1234567890.` opened a list and a fence allowance the rendered
+  document has neither of.
+- **`01.` may interrupt a paragraph.** CommonMark reads the marker's value,
+  and the rule compared its spelling against the string `"1"`.
+- **A thematic break may be spaced.** `* * *` is a horizontal rule, and it was
+  read as a bullet — twice over, since the break pattern required contiguous
+  characters *and* `list_content` did not give a break precedence over an item.
+  CommonMark does.
+
+**A quoted paragraph continues lazily.** A line with no `>` of its own carries
+on the quoted paragraph above it, provided it is ordinary paragraph text.
+Flushing there split one 30-word quoted sentence into two short units, and a
+long sentence slipped past CH007.
+
+That one exposed a fixture this PR added in round twenty-four, on its own
+initiative rather than from a finding. Round twenty-four's finding was about
+*entering* a quote; the reply claimed the rule held "in both directions" and
+added a fixture asserting that leaving one flushes too. It does not — leaving a
+quote onto paragraph text is exactly a lazy continuation. The fixture asserted
+the bug. It is replaced by two that assert what actually holds: leaving onto
+prose continues, leaving onto a block start flushes.
+
+Corpus effect: none, for the thirteenth round running.

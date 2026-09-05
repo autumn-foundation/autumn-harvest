@@ -319,7 +319,10 @@ MAX_SENTENCE_WORDS = 25
 # list item is legitimately indented further. `fence_delimiter` applies the
 # limit against the container.
 FENCE_RE = re.compile(r"^([ \t]*)(`{3,}|~{3,})")
-LIST_MARKER_RE = re.compile(r"^([ \t]*)((?:[-*+]|\d+[.)]))([ \t]+|$)")
+# CommonMark caps an ordered marker at nine digits, and the cap is load-bearing
+# here: a longer run of digits is ordinary text, and accepting it opens a list
+# -- and a fence allowance -- where the rendered document has neither.
+LIST_MARKER_RE = re.compile(r"^([ \t]*)((?:[-*+]|\d{1,9}[.)]))([ \t]+|$)")
 # A block quote is a container too, and Rustdoc uses it. Its marker is not
 # indentation -- content inside the quote starts again at column zero -- so it
 # is stripped before any container or fence judgement. Nested and space-less
@@ -337,7 +340,9 @@ HEADING_RE = re.compile(r"^\s*#{1,6}\s")
 # A thematic break -- one punctuation character repeated. CommonMark spells it
 # "---"; this tree also draws section rules with box-drawing characters. Either
 # way it separates blocks, so a sentence never runs across one.
-SEPARATOR_RE = re.compile("^[ \t]*([-_*=\u2500\u2501\u2550\u00b7])\\1{2,}[ \t]*$")
+SEPARATOR_RE = re.compile(
+    "^[ \t]*([-_*=\u2500\u2501\u2550\u00b7])(?:[ \t]*\\1){2,}[ \t]*$"
+)
 SENTENCE_SPLIT_RE = re.compile(r"(?<=[.!?])\s+")
 
 
@@ -658,7 +663,11 @@ def interrupts_paragraph(marker: "re.Match[str]") -> bool:
     if not marker.string[marker.end():].strip():
         return False
     marker_text = marker.group(2).strip()
-    return not marker_text[:1].isdigit() or marker_text[:-1] == "1"
+    if not marker_text[:1].isdigit():
+        return True
+    # The NUMBER, not its spelling: CommonMark reads the marker's value, so
+    # "01." starts at one and may interrupt exactly as "1." does.
+    return int(marker_text[:-1]) == 1
 
 
 def list_content(text: str, container: int) -> tuple[int, int] | None:
@@ -676,6 +685,11 @@ def list_content(text: str, container: int) -> tuple[int, int] | None:
       columns wide, so a space and two tabs is three characters of padding
       and seven columns of it.
     """
+    # A thematic break wins over a list item in CommonMark, and "* * *" or
+    # "- - -" matches both. Reading one as an item opens a container -- and a
+    # fence allowance -- where the rendered document has a horizontal rule.
+    if SEPARATOR_RE.match(text):
+        return None
     marker = LIST_MARKER_RE.match(text)
     if not marker:
         return None
@@ -1197,7 +1211,21 @@ def prose_units(pieces: list[Piece]) -> list[tuple[int, str]]:
             # reason: "- > text" carries two markers, and stripping only the
             # one that comes first leaves the other as a word of the sentence.
             peeled, _, depth, _ = strip_containers(body, stack, container)
-            if depth != quoted:
+            # Lazy continuation: a quoted paragraph may carry on across a line
+            # that has no marker of its own, so long as that line is ordinary
+            # paragraph text. Flushing there splits one quoted sentence into
+            # two short ones and a long sentence slips past CH007.
+            lazy = (
+                depth < quoted
+                and bool(run)
+                and body.strip()
+                and not LIST_MARKER_RE.match(peeled)
+                and not TABLE_RE.match(peeled)
+                and not HEADING_RE.match(peeled)
+                and not SEPARATOR_RE.match(peeled)
+                and not FENCE_RE.match(peeled)
+            )
+            if depth != quoted and not lazy:
                 flush()
                 in_list = False
                 quoted = depth
@@ -1870,6 +1898,28 @@ RULE_TESTS = [
         "a marker with no content cannot interrupt a paragraph",
     ),
     (
+        "/// 1234567890. ~~~rust\n///             TODO: issue required\n",
+        {("CH002", 2)},
+        "ten digits is too many for an ordered marker",
+    ),
+    (
+        "/// 123456789. ~~~rust\n///            TODO: fixture placeholder\n"
+        "///            ~~~\n",
+        set(),
+        "nine is not",
+    ),
+    (
+        "/// Intro paragraph\n/// 01. item\n///     ~~~rust\n"
+        "///     TODO: fixture placeholder\n///     ~~~\n",
+        set(),
+        "a marker's value decides interruption, so \"01.\" starts at one",
+    ),
+    (
+        "/// * * *\n///     ~~~rust\n///   TODO: issue required\n",
+        {("CH002", 3)},
+        "a spaced thematic break is a break, not a list item",
+    ),
+    (
         "/// - > word1 word2 word3 word4 word5 word6 word7 word8 word9 word10 word11 word12 word13 word14 word15 word16 word17 word18 word19 word20 word21 word22 word23 word24 word25.\n",
         set(),
         "a quote behind a list marker is not a word of the sentence",
@@ -1885,9 +1935,14 @@ RULE_TESTS = [
         "entering a block quote ends the paragraph before it",
     ),
     (
-        "/// > word1 word2 word3 word4 word5 word6 word7 word8 word9 word10 word11 word12 word13 word14 word15 word16 word17 word18 word19 word20 word21 word22 word23 word24 word25\n/// and more words here.\n",
+        "/// > word1 word2 word3 word4 word5 word6 word7 word8 word9 word10 word11 word12 word13 word14 word15 word16 word17 word18 word19 word20\n/// w1 w2 w3 w4 w5 w6 w7 w8 w9 w10.\n",
+        {("CH007", 1)},
+        "but a quoted paragraph continues lazily onto an unmarked line",
+    ),
+    (
+        "/// > word1 word2 word3 word4 word5 word6 word7 word8 word9 word10 word11 word12 word13 word14 word15 word16 word17 word18 word19 word20 word21 word22 word23 word24 word25\n/// - and a list item here.\n",
         set(),
-        "and so does leaving one",
+        "leaving a quote onto a block start does flush",
     ),
     (
         "/// -    ```rust\n///      TODO: fixture placeholder\n///      ```\n",
