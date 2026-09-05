@@ -1271,3 +1271,34 @@ read ordinary pipe lines as table rows. Both snapshots now carry it, and
 silently when it is not.
 
 Corpus effect: none, for the twenty-first round running.
+
+### Round forty — what rustdoc actually renders
+
+Two findings. One prescribed the wrong fix for a real defect, and the check
+that settled it was rendering the shape with the compiler in the tree rather
+than reasoning about the specification.
+
+**A delimiter row must match its header's width.** The report asked for three
+hyphens per cell. Rustdoc 1.94 disagrees: `| a |` over `| - |` renders as a
+table, so one hyphen is valid and requiring three would make the harness miss
+real tables. The reported *shape* is still a defect, for a different reason —
+`Intro | header |` has two cells and `| - |` has one, and a delimiter row is
+only a delimiter row for a header of the same width. `table_delimiter` now
+takes the header and compares cell counts. Cells are split on unescaped pipes
+only, and one list marker is peeled first, because rustdoc renders
+`- | a | b |` as an item holding a two-column table.
+
+**A checkbox is not two words.** Rustdoc renders `- [ ] text` with an
+`<input>`, so the brackets are not prose. Counting them added two words to
+every task item and reported a complying 24-word sentence as 26 — a CH007
+regression that would fail CI on a correct comment. A valid marker is exactly
+`[ ]`, `[x]` or `[X]` with a space after it; `[]`, `[y]` and `[ ]no-space`
+stay literal, which is again what rustdoc does. A quote following the list
+marker suppresses the strip, since `[ ]` in quoted prose is two real words.
+
+Every claim above was checked by compiling a doc comment and reading the
+generated HTML. That is the primary source for a tool whose whole job is to
+agree with the renderer, and it should have been the first check in this seam
+rather than the fortieth round's.
+
+Corpus effect: none, for the twenty-second round running.

@@ -339,14 +339,42 @@ ONE_QUOTE_RE = re.compile(r"^([ \t]*)>(?!=)[ \t]?")
 # ordinary prose -- "| foo" wraps a sentence like any other word -- and
 # flushing there drops the rest of the sentence out of the unit.
 DELIM_CELL_RE = re.compile(r":?-+:?")
+# A cell boundary. An escaped pipe is content: Rustdoc renders
+# "| a \\| b | c |" as two columns, the first of which contains a pipe.
+CELL_SPLIT_RE = re.compile(r"(?<!\\)\|")
 
 
-def table_delimiter(text: str, container: int) -> bool:
-    """Is `text` a GFM table's delimiter row -- "|---|:--:|" and its kin?
+def row_cells(text: str, container: int) -> list[str]:
+    """The cells of a GFM table row.
+
+    A row may open a list item, so one list marker is peeled first. Rustdoc
+    renders "- | a | b |" as an item holding a two-column table, so the
+    marker is not a cell. The leading and trailing pipes are optional.
+    """
+    content = list_content(text, container)
+    if content:
+        text = text[content[1]:]
+    text = text.strip()
+    if text.startswith("|"):
+        text = text[1:]
+    if text.endswith("|") and not text.endswith("\\|"):
+        text = text[:-1]
+    return CELL_SPLIT_RE.split(text)
+
+
+def table_delimiter(text: str, container: int, header: str) -> bool:
+    """Is `text` a delimiter row for the row `header` above it?
 
     Three columns past the container, like every marker here. Stripping the
     line before judging it loses that, and an over-indented delimiter then
     turns the paragraph above it into a table and drops the sentence.
+
+    A delimiter row is only a delimiter row for a header of the SAME width.
+    Rustdoc renders "Intro | header |" over "| - |" as one paragraph, because
+    two cells do not match one; reading it as a table there closes a paragraph
+    the document still holds open. One hyphen in a cell is valid, and a
+    single-cell "| - |" under a single-cell "| a |" IS a table -- checked
+    against rustdoc 1.94, whose renderer is the one these comments target.
     """
     if leading_columns(text) > container + 3:
         return False
@@ -356,8 +384,10 @@ def table_delimiter(text: str, container: int) -> bool:
     # EVERY cell needs its own hyphen run. "| | --- |" has an empty first
     # cell, so it is not a delimiter row and the pipe line above it is not a
     # header -- both are prose, and the sentence they carry must be counted.
-    cells = stripped.strip("|").split("|")
-    return bool(cells) and all(DELIM_CELL_RE.fullmatch(cell.strip()) for cell in cells)
+    cells = row_cells(text, container)
+    if not cells or not all(DELIM_CELL_RE.fullmatch(cell.strip()) for cell in cells):
+        return False
+    return len(cells) == len(row_cells(header, container))
 
 # An ATX heading. The indent is a capture group because the indent decides
 # whether this is a heading at all -- see `heading` below.
@@ -384,6 +414,10 @@ THEMATIC_BREAK_RE = re.compile("^([ \t]*)([-_*])(?:[ \t]*\\2){2,}[ \t]*$")
 # POSITION, not shape -- with a paragraph open it underlines one, and at the
 # start of a block it is the decorative rule round thirty-three fixed.
 SETEXT_RE = re.compile("^([ \t]*)(?:=+|-+)[ \t]*$")
+# A GFM task-list marker, which Rustdoc renders as a checkbox rather than as
+# text. Exactly "[ ]", "[x]" or "[X]", and a space must follow: rustdoc 1.94
+# renders "[]", "[ ]no space" and "[y]" as literal words.
+TASK_MARKER_RE = re.compile(r"^\[[ xX]\](?=[ \t]|$)")
 SENTENCE_SPLIT_RE = re.compile(r"(?<=[.!?])\s+")
 
 
@@ -1177,7 +1211,7 @@ def comment_lines(pieces: list[Piece]):
                     # header above it stays a paragraph -- one loop calling
                     # the table a table and the other calling it prose.
                     in_table = table_delimiter(
-                        strip_quote(run[index + 1].text, enclosing), enclosing
+                        strip_quote(run[index + 1].text, enclosing), enclosing, body
                     )
                 stack, paragraph = update_containers(
                     text, stack, paragraph, quoted, in_table and "|" in body
@@ -1397,7 +1431,7 @@ def prose_units(pieces: list[Piece]) -> list[tuple[int, str]]:
                 in_table = False
             elif not in_table and index + 1 < len(block):
                 in_table = table_delimiter(
-                    strip_quote(block[index + 1].text, container), container
+                    strip_quote(block[index + 1].text, container), container, body
                 )
             if (
                 (has_pipe and in_table)
@@ -1424,7 +1458,21 @@ def prose_units(pieces: list[Piece]) -> list[tuple[int, str]]:
                 # got is a list HERE and indented code THERE. Falling back
                 # keeps such a line reading as it always has, rather than
                 # keeping its bullet as a word of the sentence.
-                run = [(peeled if len(peeled) < len(body) else body[marker.end():]).strip()]
+                content = (
+                    peeled if len(peeled) < len(body) else body[marker.end():]
+                ).strip()
+                # A checkbox is not two words. Rustdoc renders "- [ ] text"
+                # with an <input>, so keeping the brackets adds two words to
+                # every task item and reports a 24-word sentence as 26 --
+                # a CH007 regression on a comment that complies.
+                # The marker binds to the list item it opens. A quote after
+                # the list marker means the peel went through it, and "[ ]"
+                # in quoted prose is two literal words.
+                if not ONE_QUOTE_RE.match(body[marker.end():]):
+                    task = TASK_MARKER_RE.match(content)
+                    if task:
+                        content = content[task.end():].strip()
+                run = [content]
                 run_lines = [piece.line]
                 in_list = True
                 continue
@@ -2334,6 +2382,52 @@ RULE_TESTS = [
         "*/\n",
         {("CH002", 7)},
         "a table inside a nested comment does not leak out of it",
+    ),
+    (
+        "/// Intro | header |\n"
+        "/// | - |\n"
+        "/// 22. item\n"
+        "///     ```\n"
+        "///     TODO: issue required\n",
+        {("CH002", 5)},
+        "a one-cell delimiter under a two-cell header is not a table",
+    ),
+    (
+        "/// | a |\n"
+        "/// | - |\n"
+        "/// 22. item\n"
+        "///     ```\n"
+        "///     TODO: issue required\n",
+        set(),
+        "one hyphen in a cell is a valid delimiter row",
+    ),
+    (
+        "/// - | a | b |\n"
+        "///   | - | - |\n"
+        "///   22. item\n"
+        "///       ```\n"
+        "///       TODO: issue required\n",
+        set(),
+        "a list marker on the header row is not a cell",
+    ),
+    (
+        "/// | a \\| b | c |\n"
+        "/// | - | - |\n"
+        "/// 22. item\n"
+        "///     ```\n"
+        "///     TODO: issue required\n",
+        set(),
+        "an escaped pipe is content, not a cell boundary",
+    ),
+    (
+        "/// - [ ] " + " ".join(f"word{n}" for n in range(1, 26)) + ".\n",
+        set(),
+        "a task-list checkbox is not two words",
+    ),
+    (
+        "/// - [y] " + " ".join(f"word{n}" for n in range(1, 26)) + ".\n",
+        {("CH007", 1)},
+        "'[y]' is not a task marker, so it stays two words",
     ),
 ]
 
