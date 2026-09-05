@@ -21,13 +21,28 @@ across 30 workflow names spread over the last 80 days, with a **skewed**
 per-execution activity count -- 85% get 1-5 activities (the overwhelming
 majority of real workflows), 14% get 5-25, and a 1% "batch/DAG-run" tail gets
 50-300 -- plus a 10% chance per activity of a second (retry) `ActivityStarted`
-attempt. This produced ~452,000-464,000 `harvest_events` rows across observed
-runs (workflow-terminal events, and 2-3 events per activity). Reproduce with:
+attempt. This produced ~562,000 `harvest_events` rows in the committed run
+(workflow-terminal events, and 2-3 events per activity). Reproduce with:
 
 ```bash
 HARVEST_TEST_DATABASE_URL=postgres://postgres:postgres@localhost:5432/postgres \
   ./autumn-harvest/scripts/usage_report_activity_lookback_perf_repro.sh
 ```
+
+Two review-round corrections to the fixture generator, both real and both
+fixed before the numbers below were captured: the fan-out and
+activity-outcome `CASE` expressions each originally called `random()`
+independently per `WHEN` branch, so an execution/activity that missed the
+first threshold reached the tail bucket only on a SECOND independent draw
+clearing the second threshold too -- silently shrinking the intended 1%
+"batch" tail to ~0.15% (Codex review, PR #1381). The fix draws one `random()`
+value per row from the same flat `SELECT` list as the row source and reuses
+it for every threshold in the `CASE`; the initial fix attempt used `CROSS
+JOIN LATERAL (SELECT random() AS r)` instead, which -- being uncorrelated --
+Postgres hoists and evaluates exactly once for the entire statement rather
+than once per row (verified directly: every row landed in the same bucket).
+Both were caught before publication; the measurements below reflect the
+correct, verified 85%/14%/1% and 90%/8%/2% distributions.
 
 ## 📈 Profile
 
@@ -37,10 +52,10 @@ statements by share of a larger workload -- the query under test **is** 100%
 of this endpoint's database cost. Read directly from `EXPLAIN (ANALYZE,
 BUFFERS)`: within that one statement, the `activity_metrics` CTE's `LEFT JOIN
 LATERAL` accounts for the large majority of total buffers (before the fix:
-~2.40M of ~3.02M total, ~79%), because it runs once per row of
+~3.90M of ~4.63M total, ~84%), because it runs once per row of
 `activity_events` -- every `ActivityStarted`/`ActivityCompleted`/
 `ActivityFailed`/`ActivityTimedOut` event in the report window,
-`loops=412,808` in this run -- while every other CTE (`execution_starts`,
+`loops=522,374` in this run -- while every other CTE (`execution_starts`,
 `terminal_counts`, `reset_terminated_execs`) is a single indexed scan over
 `harvest_workflow_executions`/`harvest_events` already covered by the 2026-07
 migration.
@@ -51,17 +66,17 @@ Before (full plan in
 [`docs/perf-artifacts/usage-report-activity-lookback/before.explain.txt`](perf-artifacts/usage-report-activity-lookback/before.explain.txt)):
 
 ```text
-->  Aggregate  (actual rows=1 loops=412808)
+->  Aggregate  (actual rows=1 loops=522374)
       Output: max(e2."timestamp")
-      Buffers: shared hit=2396819 read=5345 dirtied=5760 written=4283
-      ->  Bitmap Heap Scan on public.harvest_events e2  (actual rows=1 loops=412808)
+      Buffers: shared hit=3896701 read=4525 written=2319
+      ->  Bitmap Heap Scan on public.harvest_events e2  (actual rows=1 loops=522374)
             Output: e2."timestamp"
             Recheck Cond: ((e2.workflow_exec_id = e.workflow_exec_id) AND (e2."timestamp" <= e."timestamp"))
             Filter: ((e2.event_type = 'ActivityStarted'::text) AND ((e2.event_data #>> '{data,activity_id}'::text[]) = (e.event_data #>> '{data,activity_id}'::text[])))
-            Rows Removed by Filter: 22
-            Heap Blocks: exact=1131966
-            Buffers: shared hit=2396819 read=5345 dirtied=5760 written=4283
-            ->  Bitmap Index Scan on idx_harvest_events_exec_last  (actual rows=23 loops=412808)
+            Rows Removed by Filter: 63
+            Heap Blocks: exact=2130234
+            Buffers: shared hit=3896701 read=4525 written=2319
+            ->  Bitmap Index Scan on idx_harvest_events_exec_last  (actual rows=64 loops=522374)
                   Index Cond: ((e2.workflow_exec_id = e.workflow_exec_id) AND (e2."timestamp" <= e."timestamp"))
 ```
 
@@ -69,13 +84,13 @@ After (full plan in
 [`docs/perf-artifacts/usage-report-activity-lookback/after.explain.txt`](perf-artifacts/usage-report-activity-lookback/after.explain.txt)):
 
 ```text
-->  Result  (actual rows=1 loops=412808)
+->  Result  (actual rows=1 loops=522374)
       Output: $3
-      Buffers: shared hit=1693152 read=3064 written=1048
+      Buffers: shared hit=2084271 read=5225 written=30
       InitPlan 1 (returns $3)
-        ->  Limit  (actual rows=1 loops=412808)
+        ->  Limit  (actual rows=1 loops=522374)
               Output: e2."timestamp"
-              ->  Index Scan Backward using idx_harvest_events_activity_started_lookup on public.harvest_events e2  (actual rows=1 loops=412808)
+              ->  Index Scan Backward using idx_harvest_events_activity_started_lookup on public.harvest_events e2  (actual rows=1 loops=522374)
                     Output: e2."timestamp"
                     Index Cond: ((e2.workflow_exec_id = e_2.workflow_exec_id) AND ((e2.event_data #>> '{data,activity_id}'::text[]) = (e_2.event_data #>> '{data,activity_id}'::text[])) AND (e2."timestamp" IS NOT NULL) AND (e2."timestamp" <= e_2."timestamp"))
 ```
@@ -83,8 +98,8 @@ After (full plan in
 The changed node: Postgres's own `MAX()`-via-index-descent transform replaces
 a `Bitmap Heap Scan` (recheck on `workflow_exec_id` + `timestamp` alone,
 `event_type`/`activity_id` resolved by a post-scan `Filter` that discarded an
-average of 22 sibling rows per loop -- `Rows Removed by Filter: 22`,
-`Heap Blocks: exact=1,131,966` total) with an `Index Scan Backward` + `Limit 1`
+average of 63 sibling rows per loop -- `Rows Removed by Filter: 63`,
+`Heap Blocks: exact=2,130,234` total) with an `Index Scan Backward` + `Limit 1`
 against the new index, whose leading columns already pin
 `workflow_exec_id`/`activity_id` exactly and whose trailing `timestamp` column
 makes `MAX(...) WHERE timestamp <= $bound` answerable by walking the index
@@ -140,17 +155,19 @@ before and after, only the schema gains a supporting index.
 `CREATE INDEX` (not `CONCURRENTLY`) takes `SHARE` on `harvest_events` for the
 build's duration, blocking every append, claim and completion touching this
 table -- the same trade-off `20260702000000_harvest_usage_report_indexes`
-made and documented. Measured build time on this fixture's ~235,000
-`ActivityStarted` rows (out of ~452,000 total `harvest_events` rows):
-**211-212 ms**. For a live, already-large deployment, build it out-of-band
-first with `CREATE INDEX CONCURRENTLY IF NOT EXISTS` (cannot run inside
-Diesel's migration transaction) and this migration's own statement becomes a
-safe no-op via `IF NOT EXISTS`; `CONCURRENTLY` can leave an `INVALID` index
-behind on failure, so check `pg_index.indisvalid` for this index's oid before
+made and documented. Measured build time on this fixture's ~273,500
+`ActivityStarted` rows (out of ~562,000 total `harvest_events` rows):
+**~329 ms**. For a live, already-large deployment (including one that has
+opted into the partitioned `harvest_events` layout -- see the migration's own
+comment for the partition-aware recipe), build it out-of-band first with
+`CREATE INDEX CONCURRENTLY IF NOT EXISTS` (cannot run inside Diesel's
+migration transaction) and this migration's own statement becomes a safe
+no-op via `IF NOT EXISTS`; `CONCURRENTLY` can leave an `INVALID` index behind
+on failure, so check `pg_index.indisvalid` for this index's oid before
 relying on it if you take that path.
 
 Rollback (`DROP INDEX IF EXISTS idx_harvest_events_activity_started_lookup;`)
-measured at **3-5 ms** on the same fixture.
+measured at **~3 ms** on the same fixture.
 
 ## 📊 Measurement
 
@@ -169,9 +186,9 @@ overhead:
 
 | | `shared_blks_hit` | `shared_blks_read` | **Total buffers** | `temp_blks_written` |
 |:--|--:|--:|--:|--:|
-| Before | 3,020,473 | 331 | **3,020,804** | 0 |
-| After | 1,667,735 | 290 | **1,668,025** | 0 |
-| **Δ** | | | **-1,352,779 (-44.78%)** | 0 |
+| Before | 4,594,831 | 35,316 | **4,630,147** | 0 |
+| After | 2,098,162 | 10,786 | **2,108,948** | 0 |
+| **Δ** | | | **-2,521,199 (-54.45%)** | 0 |
 
 (The `hit`/`read` split above is the plain execution's row, taken right after
 the `EXPLAIN`-wrapped run of the same query already warmed the cache -- it
@@ -188,13 +205,13 @@ EXTENSION IF NOT EXISTS pg_stat_statements` against the **bench** database --
 extension (unlike the underlying preloaded module) must be created in each
 database that wants to query its own view into it.
 
-**-44.78% clears the impact floor** (`>=20%` reduction in total buffers) with
-nearly 2.2x margin. No temp blocks in either form -- no spill.
+**-54.45% clears the impact floor** (`>=20%` reduction in total buffers) with
+nearly 2.7x margin. No temp blocks in either form -- no spill.
 
-Rows read: `Heap Blocks: exact=1,131,966` before (the LATERAL's Bitmap Heap
+Rows read: `Heap Blocks: exact=2,130,234` before (the LATERAL's Bitmap Heap
 Scan alone), replaced by a `Limit 1` per loop after -- one heap fetch per
-activity terminal event instead of an average of 23 candidate rows
-(`Rows Removed by Filter: 22`, plus the one that matched) examined per loop.
+activity terminal event instead of an average of 64 candidate rows
+(`Rows Removed by Filter: 63`, plus the one that matched) examined per loop.
 
 Statement count: unaffected -- this was never an N+1 across requests, one
 statement per shard before and after.
@@ -242,15 +259,15 @@ in `load_usage_grouped` is affected.
 
 ## 💸 Write cost
 
-Measured on the same fixture (~452,000 `harvest_events` rows, ~235,000 of
+Measured on the same fixture (~562,000 `harvest_events` rows, ~273,500 of
 them `ActivityStarted`):
 
-* **Index size:** 18 MB.
-* **Build WAL (one-time):** 17,450,704 bytes (~17 MB), proportional to the
+* **Index size:** 23 MB.
+* **Build WAL (one-time):** 21,481,472 bytes (~20 MB), proportional to the
   `ActivityStarted` backlog at build time.
 * **Ongoing insert WAL:** inserting a batch of 10,000 `ActivityStarted` rows
-  produced 9,512,512 bytes of WAL with the index present vs. 7,724,592 bytes
-  without it -- **+23.1% WAL** on `ActivityStarted` inserts specifically. No
+  produced 10,378,888 bytes of WAL with the index present vs. 7,737,416 bytes
+  without it -- **+34.1% WAL** on `ActivityStarted` inserts specifically. No
   other event type's insert path is touched (the index is partial on
   `event_type = 'ActivityStarted'`), and `ActivityStarted` is one of four
   event types written per activity attempt, not the majority of
@@ -269,7 +286,7 @@ present-but-unused.
 cargo test -p autumn-harvest --features db,testing --test integration -- \
   usage_report_activity_lookback_tests::usage_report_activity_lookback_index_does_not_change_the_result_set
 
-# Full evidence capture (seeds ~450K+ rows; roughly 20-30 seconds):
+# Full evidence capture (seeds ~560K+ rows; roughly 20-30 seconds):
 HARVEST_TEST_DATABASE_URL=postgres://postgres:postgres@localhost:5432/postgres \
   ./autumn-harvest/scripts/usage_report_activity_lookback_perf_repro.sh
 ```

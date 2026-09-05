@@ -170,8 +170,19 @@ async fn usage_report_activity_lookback_index_does_not_change_the_result_set() {
 
     let base = chrono::Utc::now() - chrono::Duration::hours(1);
 
+    // Unique per invocation: `usage_sql()` groups by workflow_name over a
+    // window wide enough to span this whole test, so a fixed name would
+    // double-count against leftover rows from an earlier run of this same
+    // test against a shared, uncleaned `HARVEST_TEST_DATABASE_URL` database
+    // (caught by a real, reproducible failure in this environment: repeated
+    // runs within the same hour accumulated retry_row.activity_executions
+    // beyond the expected 2).
+    let run_id = uuid::Uuid::new_v4().simple().to_string();
+    let retry_wf_name = format!("usage_lookback_retry_wf_{run_id}");
+    let external_wf_name = format!("usage_lookback_external_wf_{run_id}");
+
     // wf_retry: ActivityStarted(t0), ActivityStarted(t0+10s, retry), ActivityCompleted(t0+20s).
-    let retry_wf = seed_workflow(&mut conn, "usage_lookback_retry_wf", base).await;
+    let retry_wf = seed_workflow(&mut conn, &retry_wf_name, base).await;
     let retry_activity = uuid::Uuid::new_v4();
     seed_event(
         &mut conn,
@@ -202,7 +213,7 @@ async fn usage_report_activity_lookback_index_does_not_change_the_result_set() {
     .await;
 
     // wf_external: ActivityTimedOut with no matching ActivityStarted.
-    let external_wf = seed_workflow(&mut conn, "usage_lookback_external_wf", base).await;
+    let external_wf = seed_workflow(&mut conn, &external_wf_name, base).await;
     seed_event(
         &mut conn,
         external_wf,
@@ -242,7 +253,7 @@ async fn usage_report_activity_lookback_index_does_not_change_the_result_set() {
 
     let retry_row = before
         .iter()
-        .find(|r| r.group == "usage_lookback_retry_wf")
+        .find(|r| r.group == retry_wf_name)
         .expect("retry workflow group present");
     assert_eq!(retry_row.activity_executions, 2, "both attempts counted");
     assert!(
@@ -254,7 +265,7 @@ async fn usage_report_activity_lookback_index_does_not_change_the_result_set() {
 
     let external_row = before
         .iter()
-        .find(|r| r.group == "usage_lookback_external_wf")
+        .find(|r| r.group == external_wf_name)
         .expect("external workflow group present");
     assert_eq!(
         external_row.activity_executions_failed, 0,
@@ -282,17 +293,30 @@ async fn seed_production_shaped_fixture(conn: &mut AsyncPgConnection) {
     conn.batch_execute(&format!(
         "CREATE TEMP TABLE tmp_usage_exec (id UUID, workflow_name TEXT, started_at TIMESTAMPTZ, n_activities INT);
 
+         -- One random draw per execution (`r`), reused for both thresholds
+         -- below -- `WHEN random() < 0.85 ... WHEN random() < 0.99` would
+         -- each call `random()` independently, so an execution that misses
+         -- the first 85% test would only reach the heavy bucket when a
+         -- SECOND draw lands above 0.99: 15% * 1% = 0.15% heavy, not the
+         -- intended 1% (Codex review, PR #1381). `r` must come from the SAME
+         -- flat SELECT list as the set-returning FROM item, not a separate
+         -- `CROSS JOIN LATERAL (SELECT random() ...)`: an uncorrelated
+         -- LATERAL subquery like that is not tied to the outer row and
+         -- Postgres hoists it, evaluating `random()` exactly ONCE for the
+         -- whole statement instead of once per row (verified: every row
+         -- landed in the same bucket) -- a second review-round regression in
+         -- the first attempt at this same fix.
          INSERT INTO tmp_usage_exec (id, workflow_name, started_at, n_activities)
          SELECT
              gen_random_uuid(),
              'usage_bench_wf_' || (1 + floor(random()*30))::text,
              NOW() - (random() * interval '80 days'),
              CASE
-                 WHEN random() < 0.85 THEN 1 + floor(random()*5)::int
-                 WHEN random() < 0.99 THEN 5 + floor(random()*20)::int
+                 WHEN r < 0.85 THEN 1 + floor(random()*5)::int
+                 WHEN r < 0.99 THEN 5 + floor(random()*20)::int
                  ELSE 50 + floor(random()*251)::int
              END
-         FROM generate_series(1, {FIXTURE_EXECUTIONS});
+         FROM (SELECT random() AS r FROM generate_series(1, {FIXTURE_EXECUTIONS})) AS fanout;
 
          INSERT INTO harvest_workflow_executions
              (id, workflow_name, workflow_id, run_id, shard_id, state, input, queue_name,
@@ -309,20 +333,30 @@ async fn seed_production_shaped_fixture(conn: &mut AsyncPgConnection) {
                 started_at + interval '5 minutes'
          FROM tmp_usage_exec;
 
+         -- Same one-draw-per-row requirement as the fan-out CASE above, but
+         -- `r` here must come from the SAME SELECT list as the CORRELATED
+         -- `generate_series(1, e.n_activities)` lateral join (referencing
+         -- `e.n_activities` is what keeps that one un-hoistable and genuinely
+         -- per-outer-row); a separate, uncorrelated
+         -- `CROSS JOIN LATERAL (SELECT random() AS r)` alongside it would
+         -- still collapse to one draw for the entire statement.
          CREATE TEMP TABLE tmp_usage_activity AS
          SELECT
-             e.id AS exec_id,
-             e.started_at,
-             gs.n AS activity_seq,
+             exec_id,
+             started_at,
+             activity_seq,
              gen_random_uuid() AS activity_id,
              CASE
-                 WHEN random() < 0.90 THEN 'ActivityCompleted'
-                 WHEN random() < 0.98 THEN 'ActivityFailed'
+                 WHEN r < 0.90 THEN 'ActivityCompleted'
+                 WHEN r < 0.98 THEN 'ActivityFailed'
                  ELSE 'ActivityTimedOut'
              END AS terminal_type,
              (random() < 0.10) AS has_retry
-         FROM tmp_usage_exec e
-         CROSS JOIN LATERAL generate_series(1, e.n_activities) AS gs(n);
+         FROM (
+             SELECT e.id AS exec_id, e.started_at, gs.n AS activity_seq, random() AS r
+             FROM tmp_usage_exec e
+             CROSS JOIN LATERAL generate_series(1, e.n_activities) AS gs(n)
+         ) AS activity_rows;
 
          INSERT INTO harvest_events (workflow_exec_id, event_id, event_type, event_data, timestamp)
          SELECT exec_id, activity_seq * 4, 'ActivityStarted',
@@ -406,10 +440,23 @@ async fn capture(
     out_dir: &std::path::Path,
     label: &str,
 ) -> Vec<UsageRow> {
+    // Unlike CREATE EXTENSION above (best-effort: a genuinely absent
+    // extension just means no evidence, handled by the stats query's own
+    // unwrap_or_else below), a reset failure here must not be swallowed: the
+    // extension already exists by this point, so a failure means something
+    // else is wrong (e.g. the connecting role lacks EXECUTE on
+    // pg_stat_statements_reset()) and both forms' normalized query text is
+    // identical, so silently proceeding would let the "before" counts leak
+    // into the "after" capture and Postgres would aggregate the two,
+    // publishing a contaminated comparison that still reports success
+    // (Codex review, PR #1381).
     diesel::sql_query("SELECT pg_stat_statements_reset()")
         .execute(conn)
         .await
-        .ok();
+        .expect(
+            "pg_stat_statements_reset() failed -- proceeding would let stale counts from \
+             the other capture leak into this one and silently contaminate the comparison",
+        );
 
     let (plan_text, rows) = explain_and_result_set(conn, 100).await;
 

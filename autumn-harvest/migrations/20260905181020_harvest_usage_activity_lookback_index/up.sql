@@ -22,16 +22,16 @@
 -- once per activity terminal event in the report window -- a cost that scales
 -- with a workflow's own activity fan-out, not with the report's selectivity.
 --
--- Measured on a 40,000-execution / ~460,000-event production-shaped fixture
+-- Measured on a 40,000-execution / ~562,000-event production-shaped fixture
 -- (skewed 1%-of-executions "batch" tail with 50-300 activities each --
 -- `tests/integration/usage_report_activity_lookback_tests.rs::zz_capture_usage_report_activity_lookback_evidence`):
 -- `GET /admin/usage`'s total buffers (`pg_stat_statements`,
--- shared_blks_hit + shared_blks_read) drop from 3,020,804 to 1,668,025 --
--- -44.8% -- with byte-identical grouped counters before and after. Postgres
+-- shared_blks_hit + shared_blks_read) drop from 4,630,147 to 2,108,948 --
+-- -54.5% -- with byte-identical grouped counters before and after. Postgres
 -- rewrites the correlated `MAX(...)` into an `Index Scan Backward` + `LIMIT 1`
 -- against this index (its standard max-via-index-descent transform), replacing
--- a `Bitmap Heap Scan` that filtered ~1.13M heap blocks' worth of sibling
--- events out of a 412,808-loop LATERAL invocation. Full plans and the
+-- a `Bitmap Heap Scan` that filtered ~2.13M heap blocks' worth of sibling
+-- events out of a 522,374-loop LATERAL invocation. Full plans and the
 -- `pg_stat_statements` snapshots are committed under
 -- `docs/perf-artifacts/usage-report-activity-lookback/`; writeup in
 -- `docs/performance-usage-report-activity-lookback.md`.
@@ -43,13 +43,13 @@
 -- so only `ActivityStarted` rows (the only event type this lookup ever
 -- targets) pay for it, and every other event type on this table is unaffected.
 --
--- Measured write cost on the same fixture: the index build itself took 17 MB
--- of WAL for ~235,000 indexed rows (one-time, proportional to the
+-- Measured write cost on the same fixture: the index build itself took 20 MB
+-- of WAL for ~273,500 indexed rows (one-time, proportional to the
 -- `ActivityStarted` backlog at build time); ongoing, inserting a batch of
--- 10,000 `ActivityStarted` rows took 9,512,512 bytes of WAL with the index
--- present vs. 7,724,592 without -- +23.1% WAL specifically on `ActivityStarted`
+-- 10,000 `ActivityStarted` rows took 10,378,888 bytes of WAL with the index
+-- present vs. 7,737,416 without -- +34.1% WAL specifically on `ActivityStarted`
 -- inserts, no other event type's write path is touched. Index size for the
--- fixture's ~235,000 `ActivityStarted` rows: 18 MB.
+-- fixture's ~273,500 `ActivityStarted` rows: 23 MB.
 --
 -- `CREATE INDEX` (not `CONCURRENTLY`) takes `SHARE` on `harvest_events` for
 -- the build's duration, blocking every append, claim and completion touching

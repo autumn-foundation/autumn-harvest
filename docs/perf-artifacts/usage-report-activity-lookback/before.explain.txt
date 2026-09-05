@@ -1,72 +1,72 @@
 -- before: usage_sql() @ 40000 executions --
-Limit  (cost=10184383.34..10184383.41 rows=30 width=96) (actual rows=30 loops=1)
+Limit  (cost=19041245.08..19041245.15 rows=30 width=96) (actual rows=30 loops=1)
   Output: (COALESCE(w_3.workflow_name, w_1.workflow_name, w.workflow_name)), (COALESCE((count(*)), '0'::bigint)), (COALESCE((count(*) FILTER (WHERE (e_1.event_type = 'WorkflowCompleted'::text))), '0'::bigint)), (COALESCE((count(*) FILTER (WHERE (e_1.event_type = 'WorkflowFailed'::text))), '0'::bigint)), (COALESCE((count(*) FILTER (WHERE ((e_1.event_type = 'WorkflowCancelled'::text) AND ((w_1.state <> 'TERMINATED'::text) OR (e_2.workflow_exec_id IS NOT NULL))))), '0'::bigint)), (COALESCE((count(*) FILTER (WHERE (e_1.event_type = 'WorkflowExecutionTimedOut'::text))), '0'::bigint)), (COALESCE((count(*) FILTER (WHERE (e.event_type = 'ActivityStarted'::text))), '0'::bigint)), (COALESCE((count(*) FILTER (WHERE ((e.event_type = ANY ('{ActivityFailed,ActivityTimedOut}'::text[])) AND ((max(e2."timestamp")) IS NOT NULL)))), '0'::bigint)), (COALESCE(((COALESCE(sum(EXTRACT(epoch FROM (e."timestamp" - (max(e2."timestamp"))))) FILTER (WHERE (e.event_type = ANY ('{ActivityCompleted,ActivityFailed,ActivityTimedOut}'::text[]))), '0'::numeric))::double precision), '0'::double precision))
-  Buffers: shared hit=3012285 read=8519 dirtied=11172 written=6605
-  ->  Sort  (cost=10184383.34..10184383.41 rows=30 width=96) (actual rows=30 loops=1)
+  Buffers: shared hit=4594831 read=35316 dirtied=22616 written=15793
+  ->  Sort  (cost=19041245.08..19041245.15 rows=30 width=96) (actual rows=30 loops=1)
         Output: (COALESCE(w_3.workflow_name, w_1.workflow_name, w.workflow_name)), (COALESCE((count(*)), '0'::bigint)), (COALESCE((count(*) FILTER (WHERE (e_1.event_type = 'WorkflowCompleted'::text))), '0'::bigint)), (COALESCE((count(*) FILTER (WHERE (e_1.event_type = 'WorkflowFailed'::text))), '0'::bigint)), (COALESCE((count(*) FILTER (WHERE ((e_1.event_type = 'WorkflowCancelled'::text) AND ((w_1.state <> 'TERMINATED'::text) OR (e_2.workflow_exec_id IS NOT NULL))))), '0'::bigint)), (COALESCE((count(*) FILTER (WHERE (e_1.event_type = 'WorkflowExecutionTimedOut'::text))), '0'::bigint)), (COALESCE((count(*) FILTER (WHERE (e.event_type = 'ActivityStarted'::text))), '0'::bigint)), (COALESCE((count(*) FILTER (WHERE ((e.event_type = ANY ('{ActivityFailed,ActivityTimedOut}'::text[])) AND ((max(e2."timestamp")) IS NOT NULL)))), '0'::bigint)), (COALESCE(((COALESCE(sum(EXTRACT(epoch FROM (e."timestamp" - (max(e2."timestamp"))))) FILTER (WHERE (e.event_type = ANY ('{ActivityCompleted,ActivityFailed,ActivityTimedOut}'::text[]))), '0'::numeric))::double precision), '0'::double precision))
         Sort Key: (COALESCE(w_3.workflow_name, w_1.workflow_name, w.workflow_name))
         Sort Method: quicksort  Memory: 28kB
-        Buffers: shared hit=3012285 read=8519 dirtied=11172 written=6605
-        ->  Hash Full Join  (cost=18181.06..10184382.60 rows=30 width=96) (actual rows=30 loops=1)
+        Buffers: shared hit=4594831 read=35316 dirtied=22616 written=15793
+        ->  Hash Full Join  (cost=20842.22..19041244.34 rows=30 width=96) (actual rows=30 loops=1)
               Output: COALESCE(w_3.workflow_name, w_1.workflow_name, w.workflow_name), COALESCE((count(*)), '0'::bigint), COALESCE((count(*) FILTER (WHERE (e_1.event_type = 'WorkflowCompleted'::text))), '0'::bigint), COALESCE((count(*) FILTER (WHERE (e_1.event_type = 'WorkflowFailed'::text))), '0'::bigint), COALESCE((count(*) FILTER (WHERE ((e_1.event_type = 'WorkflowCancelled'::text) AND ((w_1.state <> 'TERMINATED'::text) OR (e_2.workflow_exec_id IS NOT NULL))))), '0'::bigint), COALESCE((count(*) FILTER (WHERE (e_1.event_type = 'WorkflowExecutionTimedOut'::text))), '0'::bigint), COALESCE((count(*) FILTER (WHERE (e.event_type = 'ActivityStarted'::text))), '0'::bigint), COALESCE((count(*) FILTER (WHERE ((e.event_type = ANY ('{ActivityFailed,ActivityTimedOut}'::text[])) AND ((max(e2."timestamp")) IS NOT NULL)))), '0'::bigint), COALESCE(((COALESCE(sum(EXTRACT(epoch FROM (e."timestamp" - (max(e2."timestamp"))))) FILTER (WHERE (e.event_type = ANY ('{ActivityCompleted,ActivityFailed,ActivityTimedOut}'::text[]))), '0'::numeric))::double precision), '0'::double precision)
               Hash Cond: (w.workflow_name = COALESCE(w_3.workflow_name, w_1.workflow_name))
-              Buffers: shared hit=3012285 read=8519 dirtied=11172 written=6605
-              ->  GroupAggregate  (cost=25.11..10166226.43 rows=30 width=41) (actual rows=30 loops=1)
+              Buffers: shared hit=4594831 read=35316 dirtied=22616 written=15793
+              ->  GroupAggregate  (cost=36.96..19020438.85 rows=30 width=41) (actual rows=30 loops=1)
                     Output: w.workflow_name, count(*) FILTER (WHERE (e.event_type = 'ActivityStarted'::text)), count(*) FILTER (WHERE ((e.event_type = ANY ('{ActivityFailed,ActivityTimedOut}'::text[])) AND ((max(e2."timestamp")) IS NOT NULL))), (COALESCE(sum(EXTRACT(epoch FROM (e."timestamp" - (max(e2."timestamp"))))) FILTER (WHERE (e.event_type = ANY ('{ActivityCompleted,ActivityFailed,ActivityTimedOut}'::text[]))), '0'::numeric))::double precision
                     Group Key: w.workflow_name
-                    Buffers: shared hit=3008251 read=7519 dirtied=9485 written=5804
-                    ->  Nested Loop Left Join  (cost=25.11..10156398.25 rows=413799 width=49) (actual rows=412808 loops=1)
+                    Buffers: shared hit=4590797 read=34329 dirtied=20929 written=15005
+                    ->  Nested Loop Left Join  (cost=36.96..19008031.92 rows=522378 width=49) (actual rows=522374 loops=1)
                           Output: w.workflow_name, e.event_type, (max(e2."timestamp")), e."timestamp"
-                          Buffers: shared hit=3008251 read=7519 dirtied=9485 written=5804
-                          ->  Nested Loop  (cost=0.84..102370.70 rows=413799 width=156) (actual rows=412808 loops=1)
+                          Buffers: shared hit=4590797 read=34329 dirtied=20929 written=15005
+                          ->  Nested Loop  (cost=0.84..128239.03 rows=522378 width=157) (actual rows=522374 loops=1)
                                 Output: e.event_type, e."timestamp", e.workflow_exec_id, e.event_data, w.workflow_name
-                                Buffers: shared hit=611432 read=2174 dirtied=3725 written=1521
-                                ->  Index Scan using idx_harvest_wfx_workflow_identity on public.harvest_workflow_executions w  (cost=0.41..7142.70 rows=40000 width=33) (actual rows=40000 loops=1)
+                                Buffers: shared hit=694096 read=29804 dirtied=20929 written=12686
+                                ->  Index Scan using idx_harvest_wfx_workflow_identity on public.harvest_workflow_executions w  (cost=0.41..7159.03 rows=40000 width=33) (actual rows=40000 loops=1)
                                       Output: w.workflow_name, w.id
                                       Index Cond: (w.shard_id = 0)
-                                      Buffers: shared hit=39956 read=602 written=196
-                                ->  Index Scan using idx_harvest_events_exec_last on public.harvest_events e  (cost=0.42..2.23 rows=15 width=139) (actual rows=10 loops=40000)
+                                      Buffers: shared hit=39960 read=612 written=243
+                                ->  Index Scan using idx_harvest_events_exec on public.harvest_events e  (cost=0.42..2.80 rows=23 width=140) (actual rows=13 loops=40000)
                                       Output: e.event_type, e."timestamp", e.workflow_exec_id, e.event_data
-                                      Index Cond: ((e.workflow_exec_id = w.id) AND (e."timestamp" >= '1970-01-01 00:00:00+00'::timestamp with time zone) AND (e."timestamp" <= '2026-09-06 18:11:02.974323+00'::timestamp with time zone))
-                                      Filter: (e.event_type = ANY ('{ActivityStarted,ActivityCompleted,ActivityFailed,ActivityTimedOut}'::text[]))
+                                      Index Cond: (e.workflow_exec_id = w.id)
+                                      Filter: ((e."timestamp" >= '1970-01-01 00:00:00+00'::timestamp with time zone) AND (e."timestamp" <= '2026-09-06 19:01:41.930363+00'::timestamp with time zone) AND (e.event_type = ANY ('{ActivityStarted,ActivityCompleted,ActivityFailed,ActivityTimedOut}'::text[])))
                                       Rows Removed by Filter: 1
-                                      Buffers: shared hit=571476 read=1572 dirtied=3725 written=1325
-                          ->  Aggregate  (cost=24.28..24.29 rows=1 width=8) (actual rows=1 loops=412808)
+                                      Buffers: shared hit=654136 read=29192 dirtied=20929 written=12443
+                          ->  Aggregate  (cost=36.12..36.13 rows=1 width=8) (actual rows=1 loops=522374)
                                 Output: max(e2."timestamp")
-                                Buffers: shared hit=2396819 read=5345 dirtied=5760 written=4283
-                                ->  Bitmap Heap Scan on public.harvest_events e2  (cost=4.47..24.27 rows=1 width=8) (actual rows=1 loops=412808)
+                                Buffers: shared hit=3896701 read=4525 written=2319
+                                ->  Bitmap Heap Scan on public.harvest_events e2  (cost=4.51..36.12 rows=1 width=8) (actual rows=1 loops=522374)
                                       Output: e2."timestamp"
                                       Recheck Cond: ((e2.workflow_exec_id = e.workflow_exec_id) AND (e2."timestamp" <= e."timestamp"))
                                       Filter: ((e2.event_type = 'ActivityStarted'::text) AND ((e2.event_data #>> '{data,activity_id}'::text[]) = (e.event_data #>> '{data,activity_id}'::text[])))
-                                      Rows Removed by Filter: 19
-                                      Heap Blocks: exact=1131966
-                                      Buffers: shared hit=2396819 read=5345 dirtied=5760 written=4283
-                                      ->  Bitmap Index Scan on idx_harvest_events_exec_last  (cost=0.00..4.47 rows=5 width=0) (actual rows=20 loops=412808)
+                                      Rows Removed by Filter: 63
+                                      Heap Blocks: exact=2130234
+                                      Buffers: shared hit=3896701 read=4525 written=2319
+                                      ->  Bitmap Index Scan on idx_harvest_events_exec_last  (cost=0.00..4.50 rows=8 width=0) (actual rows=64 loops=522374)
                                             Index Cond: ((e2.workflow_exec_id = e.workflow_exec_id) AND (e2."timestamp" <= e."timestamp"))
-                                            Buffers: shared hit=1270114 read=84 written=34
-              ->  Hash  (cost=18155.58..18155.58 rows=30 width=74) (actual rows=30 loops=1)
+                                            Buffers: shared hit=1766467 read=4525 written=2319
+              ->  Hash  (cost=20804.89..20804.89 rows=30 width=74) (actual rows=30 loops=1)
                     Output: w_3.workflow_name, (count(*)), w_1.workflow_name, (count(*) FILTER (WHERE (e_1.event_type = 'WorkflowCompleted'::text))), (count(*) FILTER (WHERE (e_1.event_type = 'WorkflowFailed'::text))), (count(*) FILTER (WHERE ((e_1.event_type = 'WorkflowCancelled'::text) AND ((w_1.state <> 'TERMINATED'::text) OR (e_2.workflow_exec_id IS NOT NULL))))), (count(*) FILTER (WHERE (e_1.event_type = 'WorkflowExecutionTimedOut'::text)))
                     Buckets: 1024  Batches: 1  Memory Usage: 12kB
-                    Buffers: shared hit=4034 read=1000 dirtied=1687 written=801
-                    ->  Hash Full Join  (cost=18147.44..18155.58 rows=30 width=74) (actual rows=30 loops=1)
+                    Buffers: shared hit=4034 read=987 dirtied=1687 written=788
+                    ->  Hash Full Join  (cost=20796.75..20804.89 rows=30 width=74) (actual rows=30 loops=1)
                           Output: w_3.workflow_name, (count(*)), w_1.workflow_name, (count(*) FILTER (WHERE (e_1.event_type = 'WorkflowCompleted'::text))), (count(*) FILTER (WHERE (e_1.event_type = 'WorkflowFailed'::text))), (count(*) FILTER (WHERE ((e_1.event_type = 'WorkflowCancelled'::text) AND ((w_1.state <> 'TERMINATED'::text) OR (e_2.workflow_exec_id IS NOT NULL))))), (count(*) FILTER (WHERE (e_1.event_type = 'WorkflowExecutionTimedOut'::text)))
                           Inner Unique: true
                           Hash Cond: (w_1.workflow_name = w_3.workflow_name)
-                          Buffers: shared hit=4034 read=1000 dirtied=1687 written=801
-                          ->  Finalize GroupAggregate  (cost=16246.80..16254.85 rows=30 width=49) (actual rows=30 loops=1)
+                          Buffers: shared hit=4034 read=987 dirtied=1687 written=788
+                          ->  Finalize GroupAggregate  (cost=18896.11..18904.16 rows=30 width=49) (actual rows=30 loops=1)
                                 Output: w_1.workflow_name, count(*) FILTER (WHERE (e_1.event_type = 'WorkflowCompleted'::text)), count(*) FILTER (WHERE (e_1.event_type = 'WorkflowFailed'::text)), count(*) FILTER (WHERE ((e_1.event_type = 'WorkflowCancelled'::text) AND ((w_1.state <> 'TERMINATED'::text) OR (e_2.workflow_exec_id IS NOT NULL)))), count(*) FILTER (WHERE (e_1.event_type = 'WorkflowExecutionTimedOut'::text))
                                 Group Key: w_1.workflow_name
-                                Buffers: shared hit=3034 read=1000 dirtied=689 written=801
-                                ->  Gather Merge  (cost=16246.80..16253.80 rows=60 width=49) (actual rows=30 loops=1)
+                                Buffers: shared hit=3034 read=987 dirtied=689 written=788
+                                ->  Gather Merge  (cost=18896.11..18903.11 rows=60 width=49) (actual rows=30 loops=1)
                                       Output: w_1.workflow_name, (PARTIAL count(*) FILTER (WHERE (e_1.event_type = 'WorkflowCompleted'::text))), (PARTIAL count(*) FILTER (WHERE (e_1.event_type = 'WorkflowFailed'::text))), (PARTIAL count(*) FILTER (WHERE ((e_1.event_type = 'WorkflowCancelled'::text) AND ((w_1.state <> 'TERMINATED'::text) OR (e_2.workflow_exec_id IS NOT NULL))))), (PARTIAL count(*) FILTER (WHERE (e_1.event_type = 'WorkflowExecutionTimedOut'::text)))
                                       Workers Planned: 2
                                       Workers Launched: 2
-                                      Buffers: shared hit=3034 read=1000 dirtied=689 written=801
-                                      ->  Sort  (cost=15246.78..15246.85 rows=30 width=49) (actual rows=10 loops=3)
+                                      Buffers: shared hit=3034 read=987 dirtied=689 written=788
+                                      ->  Sort  (cost=17896.09..17896.16 rows=30 width=49) (actual rows=10 loops=3)
                                             Output: w_1.workflow_name, (PARTIAL count(*) FILTER (WHERE (e_1.event_type = 'WorkflowCompleted'::text))), (PARTIAL count(*) FILTER (WHERE (e_1.event_type = 'WorkflowFailed'::text))), (PARTIAL count(*) FILTER (WHERE ((e_1.event_type = 'WorkflowCancelled'::text) AND ((w_1.state <> 'TERMINATED'::text) OR (e_2.workflow_exec_id IS NOT NULL))))), (PARTIAL count(*) FILTER (WHERE (e_1.event_type = 'WorkflowExecutionTimedOut'::text)))
                                             Sort Key: w_1.workflow_name
                                             Sort Method: quicksort  Memory: 27kB
-                                            Buffers: shared hit=3034 read=1000 dirtied=689 written=801
+                                            Buffers: shared hit=3034 read=987 dirtied=689 written=788
                                             Worker 0:  actual rows=0 loops=1
                                               Sort Method: quicksort  Memory: 25kB
                                               JIT:
@@ -79,48 +79,48 @@ Limit  (cost=10184383.34..10184383.41 rows=30 width=96) (actual rows=30 loops=1)
                                                 Functions: 34
                                                 Options: Inlining true, Optimization true, Expressions true, Deforming true
                                               Buffers: shared hit=1016
-                                            ->  Partial HashAggregate  (cost=15245.74..15246.04 rows=30 width=49) (actual rows=10 loops=3)
+                                            ->  Partial HashAggregate  (cost=17895.05..17895.35 rows=30 width=49) (actual rows=10 loops=3)
                                                   Output: w_1.workflow_name, PARTIAL count(*) FILTER (WHERE (e_1.event_type = 'WorkflowCompleted'::text)), PARTIAL count(*) FILTER (WHERE (e_1.event_type = 'WorkflowFailed'::text)), PARTIAL count(*) FILTER (WHERE ((e_1.event_type = 'WorkflowCancelled'::text) AND ((w_1.state <> 'TERMINATED'::text) OR (e_2.workflow_exec_id IS NOT NULL)))), PARTIAL count(*) FILTER (WHERE (e_1.event_type = 'WorkflowExecutionTimedOut'::text))
                                                   Group Key: w_1.workflow_name
                                                   Batches: 1  Memory Usage: 24kB
-                                                  Buffers: shared hit=3018 read=1000 dirtied=689 written=801
+                                                  Buffers: shared hit=3018 read=987 dirtied=689 written=788
                                                   Worker 0:  actual rows=0 loops=1
                                                     Batches: 1  Memory Usage: 24kB
                                                     Buffers: shared hit=1008
                                                   Worker 1:  actual rows=0 loops=1
                                                     Batches: 1  Memory Usage: 24kB
                                                     Buffers: shared hit=1008
-                                                  ->  Hash Left Join  (cost=3671.87..14840.34 rows=16216 width=59) (actual rows=13333 loops=3)
+                                                  ->  Hash Left Join  (cost=3628.99..17479.60 rows=16618 width=59) (actual rows=13333 loops=3)
                                                         Output: w_1.workflow_name, e_1.event_type, w_1.state, e_2.workflow_exec_id
                                                         Inner Unique: true
                                                         Hash Cond: (e_1.workflow_exec_id = e_2.workflow_exec_id)
-                                                        Buffers: shared hit=3018 read=1000 dirtied=689 written=801
+                                                        Buffers: shared hit=3018 read=987 dirtied=689 written=788
                                                         Worker 0:  actual rows=0 loops=1
                                                           Buffers: shared hit=1008
                                                         Worker 1:  actual rows=0 loops=1
                                                           Buffers: shared hit=1008
-                                                        ->  Hash Join  (cost=3655.40..14781.30 rows=16216 width=59) (actual rows=13333 loops=3)
+                                                        ->  Hash Join  (cost=3613.30..17420.28 rows=16618 width=59) (actual rows=13333 loops=3)
                                                               Output: e_1.event_type, e_1.workflow_exec_id, w_1.workflow_name, w_1.state
                                                               Inner Unique: true
                                                               Hash Cond: (e_1.workflow_exec_id = w_1.id)
-                                                              Buffers: shared hit=3017 read=1000 dirtied=689 written=801
+                                                              Buffers: shared hit=3017 read=987 dirtied=689 written=788
                                                               Worker 0:  actual rows=0 loops=1
                                                                 Buffers: shared hit=1008
                                                               Worker 1:  actual rows=0 loops=1
                                                                 Buffers: shared hit=1008
-                                                              ->  Parallel Bitmap Heap Scan on public.harvest_events e_1  (cost=1655.40..12738.73 rows=16216 width=32) (actual rows=13333 loops=3)
+                                                              ->  Parallel Bitmap Heap Scan on public.harvest_events e_1  (cost=1613.30..15376.65 rows=16618 width=32) (actual rows=13333 loops=3)
                                                                     Output: e_1.event_type, e_1.workflow_exec_id
-                                                                    Recheck Cond: ((e_1."timestamp" >= '1970-01-01 00:00:00+00'::timestamp with time zone) AND (e_1."timestamp" <= '2026-09-06 18:11:02.974323+00'::timestamp with time zone) AND (e_1.event_type = ANY ('{WorkflowCompleted,WorkflowFailed,WorkflowCancelled,WorkflowExecutionTimedOut}'::text[])))
+                                                                    Recheck Cond: ((e_1."timestamp" >= '1970-01-01 00:00:00+00'::timestamp with time zone) AND (e_1."timestamp" <= '2026-09-06 19:01:41.930363+00'::timestamp with time zone) AND (e_1.event_type = ANY ('{WorkflowCompleted,WorkflowFailed,WorkflowCancelled,WorkflowExecutionTimedOut}'::text[])))
                                                                     Heap Blocks: exact=690
-                                                                    Buffers: shared hit=1 read=1000 dirtied=689 written=801
+                                                                    Buffers: shared hit=1 read=987 dirtied=689 written=788
                                                                     Worker 0:  actual rows=0 loops=1
                                                                     Worker 1:  actual rows=0 loops=1
-                                                                    ->  Bitmap Index Scan on idx_harvest_events_workflow_terminal_type_ts  (cost=0.00..1645.67 rows=38919 width=0) (actual rows=40000 loops=1)
-                                                                          Index Cond: ((e_1."timestamp" >= '1970-01-01 00:00:00+00'::timestamp with time zone) AND (e_1."timestamp" <= '2026-09-06 18:11:02.974323+00'::timestamp with time zone))
-                                                                          Buffers: shared read=311 written=129
+                                                                    ->  Bitmap Index Scan on idx_harvest_events_workflow_terminal_type_ts  (cost=0.00..1603.33 rows=39883 width=0) (actual rows=40000 loops=1)
+                                                                          Index Cond: ((e_1."timestamp" >= '1970-01-01 00:00:00+00'::timestamp with time zone) AND (e_1."timestamp" <= '2026-09-06 19:01:41.930363+00'::timestamp with time zone))
+                                                                          Buffers: shared read=298 written=116
                                                               ->  Hash  (cost=1500.00..1500.00 rows=40000 width=43) (actual rows=40000 loops=3)
                                                                     Output: w_1.workflow_name, w_1.state, w_1.id
-                                                                    Buckets: 65536  Batches: 1  Memory Usage: 3469kB
+                                                                    Buckets: 65536  Batches: 1  Memory Usage: 3470kB
                                                                     Buffers: shared hit=3000
                                                                     Worker 0:  actual rows=40000 loops=1
                                                                       Buffers: shared hit=1000
@@ -134,18 +134,18 @@ Limit  (cost=10184383.34..10184383.41 rows=30 width=96) (actual rows=30 loops=1)
                                                                             Buffers: shared hit=1000
                                                                           Worker 1:  actual rows=40000 loops=1
                                                                             Buffers: shared hit=1000
-                                                        ->  Hash  (cost=16.45..16.45 rows=1 width=16) (actual rows=0 loops=1)
+                                                        ->  Hash  (cost=15.68..15.68 rows=1 width=16) (actual rows=0 loops=1)
                                                               Output: e_2.workflow_exec_id
                                                               Buckets: 1024  Batches: 1  Memory Usage: 8kB
                                                               Buffers: shared hit=1
-                                                              ->  Unique  (cost=0.41..16.45 rows=1 width=16) (actual rows=0 loops=1)
+                                                              ->  Unique  (cost=0.41..15.68 rows=1 width=16) (actual rows=0 loops=1)
                                                                     Output: e_2.workflow_exec_id
                                                                     Buffers: shared hit=1
-                                                                    ->  Nested Loop  (cost=0.41..16.45 rows=1 width=16) (actual rows=0 loops=1)
+                                                                    ->  Nested Loop  (cost=0.41..15.68 rows=1 width=16) (actual rows=0 loops=1)
                                                                           Output: e_2.workflow_exec_id
                                                                           Inner Unique: true
                                                                           Buffers: shared hit=1
-                                                                          ->  Index Only Scan using idx_harvest_events_reset_terminated on public.harvest_events e_2  (cost=0.12..8.14 rows=1 width=16) (actual rows=0 loops=1)
+                                                                          ->  Index Only Scan using idx_harvest_events_reset_terminated on public.harvest_events e_2  (cost=0.12..7.37 rows=1 width=16) (actual rows=0 loops=1)
                                                                                 Output: e_2.event_type, e_2.workflow_exec_id
                                                                                 Heap Fetches: 0
                                                                                 Buffers: shared hit=1
@@ -164,13 +164,13 @@ Limit  (cost=10184383.34..10184383.41 rows=30 width=96) (actual rows=30 loops=1)
                                       Buffers: shared hit=1000 dirtied=998
                                       ->  Seq Scan on public.harvest_workflow_executions w_3  (cost=0.00..1700.00 rows=39992 width=17) (actual rows=40000 loops=1)
                                             Output: w_3.workflow_name
-                                            Filter: ((w_3.started_at >= '1970-01-01 00:00:00+00'::timestamp with time zone) AND (w_3.started_at <= '2026-09-06 18:11:02.974323+00'::timestamp with time zone) AND (w_3.shard_id = 0))
+                                            Filter: ((w_3.started_at >= '1970-01-01 00:00:00+00'::timestamp with time zone) AND (w_3.started_at <= '2026-09-06 19:01:41.930363+00'::timestamp with time zone) AND (w_3.shard_id = 0))
                                             Buffers: shared hit=1000 dirtied=998
-Query Identifier: 6347992493733764260
+Query Identifier: -1916622420734109429
 Planning:
-  Buffers: shared hit=382 read=62 dirtied=4 written=10
-Planning Time: 1.981 ms
+  Buffers: shared hit=386 read=60 dirtied=5 written=9
+Planning Time: 2.411 ms
 JIT:
   Functions: 152
   Options: Inlining true, Optimization true, Expressions true, Deforming true
-Execution Time: 3774.647 ms
+Execution Time: 9340.816 ms
