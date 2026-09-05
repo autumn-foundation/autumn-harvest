@@ -1149,3 +1149,32 @@ round is the clearest evidence yet that it is worth consulting before pushing
 rather than after being told.
 
 Corpus effect: none, for the seventeenth round running.
+
+### Round thirty-six — a table is a structure, and Setext is a marker like any other
+
+Two findings, both verified to reproduce first.
+
+**Two pipes are not a table.** Round thirty-five narrowed `TABLE_RE` from one
+pipe to two, which is a better guess and still a guess: a wrapped sentence
+carrying `| ... |` was classified as a table row, dropped from its paragraph,
+and the long sentence it belonged to went unreported.
+
+Guessing is now replaced with the actual GFM rule. `table_rows` finds each
+delimiter row (`|---|:--:|`), takes the header line above it, and extends
+through the rows that follow. A pipe with no delimiter row anywhere is prose,
+however many pipes it has. This is the structural check declined in round
+thirty-four — correctly, for *container* state, where ignoring pipes entirely
+is both safe and CommonMark-accurate; the prose path needs the real answer
+because both of its wrong answers lose text.
+
+**A Setext underline is measured against its container.** Absolute three
+columns, so an underline inside a list item whose content starts past column
+three was missed.
+
+This is the fifth marker pattern in this file to need the container-relative
+limit, and the fifth added without it — including, this time, one added in the
+same commit whose review reply stated the property as a general rule. Writing
+the rule down did not make it operate. It is a helper now, next to
+`thematic_break`, which is the form the other four eventually took.
+
+Corpus effect: none, for the eighteenth round running.

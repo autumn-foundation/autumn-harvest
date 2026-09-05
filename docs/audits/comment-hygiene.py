@@ -338,7 +338,32 @@ ONE_QUOTE_RE = re.compile(r"^([ \t]*)>(?!=)[ \t]?")
 # A GFM table ROW, not merely a line that opens with a pipe. One pipe is
 # ordinary prose -- "| foo" wraps a sentence like any other word -- and
 # flushing there drops the rest of the sentence out of the unit.
-TABLE_RE = re.compile(r"^\s*\|.*\|")
+def table_delimiter(text: str) -> bool:
+    """Is `text` a GFM table's delimiter row -- "|---|:--:|" and its kin?"""
+    stripped = text.strip()
+    return "|" in stripped and "-" in stripped and not stripped.strip(" \t|-:")
+
+
+def table_rows(block: list) -> set:
+    """Indexes of the pieces in `block` that belong to a GFM table.
+
+    A pipe is not a table, however many of them a line has. A table is a
+    header row with a DELIMITER row under it, and only then the rows that
+    follow. Guessing from pipe count drops a wrapped sentence that happens to
+    contain one out of the prose it belongs to, and the long sentence it is
+    part of then goes unreported.
+    """
+    rows: set = set()
+    texts = [strip_quote(piece.text).strip() for piece in block]
+    for index, text in enumerate(texts):
+        if not table_delimiter(text) or index == 0 or "|" not in texts[index - 1]:
+            continue
+        rows.add(index - 1)
+        while index < len(texts) and "|" in texts[index]:
+            rows.add(index)
+            index += 1
+    return rows
+
 HEADING_RE = re.compile(r"^\s*#{1,6}(?:\s|$)")
 # A thematic break -- one punctuation character repeated. CommonMark spells it
 # "---"; this tree also draws section rules with box-drawing characters. Either
@@ -357,7 +382,7 @@ THEMATIC_BREAK_RE = re.compile("^([ \t]*)([-_*])(?:[ \t]*\\2){2,}[ \t]*$")
 # heading. Whether a run of "=" is a heading or ordinary text is decided by
 # POSITION, not shape -- with a paragraph open it underlines one, and at the
 # start of a block it is the decorative rule round thirty-three fixed.
-SETEXT_RE = re.compile("^[ \t]{0,3}(?:=+|-+)[ \t]*$")
+SETEXT_RE = re.compile("^([ \t]*)(?:=+|-+)[ \t]*$")
 SENTENCE_SPLIT_RE = re.compile(r"(?<=[.!?])\s+")
 
 
@@ -749,6 +774,18 @@ def strip_quote(text: str, container: int = 0) -> str:
     return text[match.end():] if match else text
 
 
+def setext_underline(text: str, container: int) -> bool:
+    """Is `text` a Setext underline its container would accept?
+
+    Three columns past the container, like every marker here. This is the
+    fifth pattern in this file to need that rule and the fifth added without
+    it, so: a marker pattern here is wrong by default until it measures
+    against the container.
+    """
+    match = SETEXT_RE.match(text)
+    return bool(match) and len(match.group(1).expandtabs(4)) <= container + 3
+
+
 def thematic_break(text: str, container: int) -> bool:
     """Is `text` a thematic break its container would accept?
 
@@ -890,7 +927,7 @@ def update_containers(
     prose = bool(body.strip()) and not (
         HEADING_RE.match(body)
         or thematic_break(body, stack[-1][0] if stack else 0)
-        or (paragraph and SETEXT_RE.match(body))
+        or (paragraph and setext_underline(body, stack[-1][0] if stack else 0))
     )
     return stack, prose
 
@@ -1211,7 +1248,8 @@ def prose_units(pieces: list[Piece]) -> list[tuple[int, str]]:
                 units.append((run_lines[0], " ".join(run), spans))
             run, run_lines = [], []
 
-        for piece in block:
+        tables = table_rows(block)
+        for index, piece in enumerate(block):
             if piece.nest != nest:
                 flush()
                 saved, (fence, scope, stack, paragraph, quoted, in_list) = (
@@ -1261,7 +1299,7 @@ def prose_units(pieces: list[Piece]) -> list[tuple[int, str]]:
                 and bool(run)
                 and body.strip()
                 and not LIST_MARKER_RE.match(peeled)
-                and not TABLE_RE.match(peeled)
+                and index not in tables
                 and not HEADING_RE.match(peeled)
                 and not SEPARATOR_RE.match(peeled)
                 and not FENCE_RE.match(peeled)
@@ -1274,7 +1312,7 @@ def prose_units(pieces: list[Piece]) -> list[tuple[int, str]]:
             # prose: a container marker is not a word of the sentence.
             body = strip_quote(body, container)
             if (
-                TABLE_RE.match(body)
+                index in tables
                 or HEADING_RE.match(body)
                 or SEPARATOR_RE.match(body)
                 or not body.strip()
@@ -1959,6 +1997,19 @@ RULE_TESTS = [
         "///     TODO: fixture placeholder\n///     ~~~\n",
         set(),
         "a Setext underline may be hyphens",
+    ),
+    (
+        "/// word1 word2 word3 word4 word5 word6 word7 word8 word9 word10 word11 word12 word13 word14 word15 word16 word17 word18 word19 word20 word21\n"
+        "/// | while this second pipe-delimited fragment adds another ten words |\n",
+        {("CH007", 1)},
+        "two pipes are not a table either, without a delimiter row",
+    ),
+    (
+        "/// -   Heading\n///     --\n///     22. item\n"
+        "///         ~~~rust\n///         TODO: fixture placeholder\n"
+        "///         ~~~\n",
+        set(),
+        "a Setext underline is measured against its list container",
     ),
     (
         "/// Intro\n/// -\n///     ~~~rust\n///   TODO: issue required\n",
