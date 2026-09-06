@@ -1485,9 +1485,15 @@ from the benchmark are directly comparable.
     aggregate delta varied run to run, but only the most recent run's
     artifacts are ever committed -- the repro script overwrites the same
     canonical filenames each time -- so that page states only the one
-    auditable, committed number (**+15.5%**), without asserting a range, a
-    frequency, or a direction (e.g. "always positive") for runs whose
-    evidence no longer exists in the repository to audit. The committed run
+    auditable, committed number for driving the real `claim_task()`
+    function (**+17.1%**, combining `claim_task_query()`'s own SQL with the
+    two post-claim queue-/activity-pause rechecks it also issues on every
+    successful claim — an earlier revision counted only the first and
+    under-reported this as +15.5%, which Codex review caught and that page
+    now reports separately as the `claim_task_query()`-only figure), without
+    asserting a range, a frequency, or a direction (e.g. "always positive")
+    for runs whose evidence no longer exists in the repository to audit. The
+    committed run
     also shows a markedly cheaper plan at the 100,000-row depth (a plain
     `Seq Scan`) than a more expensive one this capture's development runs
     sometimes hit before the seeding and `ANALYZE` fixes landed; that page's

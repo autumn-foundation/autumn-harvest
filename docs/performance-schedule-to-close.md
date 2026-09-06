@@ -391,13 +391,56 @@ snapshots `pg_stat_statements` afterward (artifacts, the committed run:
 `docs/perf-artifacts/schedule-to-close-claim-predicate/{no-schedule-to-close,schedule-to-close}-pg_stat_statements.txt`).
 **This does not exercise the headline scenario's 8 concurrent claimers** --
 see [Workload](#workload) for why, and for the same limitation in the
-sibling capability-labels and concurrency-key captures this one follows:
+sibling capability-labels and concurrency-key captures this one follows.
 
-| no-schedule-to-close avg/call | schedule-to-close avg/call | delta % |
-|---:|---:|---:|
-| 484.04 | 559.18 | +15.5% |
+**A successful `claim_task()` call issues more than just
+`claim_task_query()`'s own SQL text.** After a claim succeeds, `claim_task()`
+also runs two authoritative post-claim rechecks against the just-claimed
+row -- one against `harvest_queue_pauses`, one against
+`harvest_activity_pauses` -- each shaped as its own `UPDATE ... WHERE id =
+$1 ... AND EXISTS (...)` statement, so each is its own row in
+`pg_stat_statements`. An earlier revision of this section aggregated only
+the row matching `claim_task_query()`'s own shape (found via a
+`query.contains("rate_limit_debit")` match in the capture code) and called
+that "the real claim-drain" cost -- Codex review on PR #1339 correctly
+pointed out that this leaves out two statements the real production
+operation genuinely issues on every one of its 10,000 successful claims
+(the terminal empty poll issues neither, since nothing was claimed to
+recheck), understating what driving `claim_task()` actually costs and
+making its margin under the impact floor look larger than it is. All three
+statements are already present in the committed artifacts (the capture
+takes the top 10 `pg_stat_statements` rows, not just the one it asserts
+on), so this is a reporting fix, not a re-run:
 
-**This did not reproduce to a stable number across the several runs this
+| statement | no-schedule-to-close total shared-buffer hits (10,000-10,001 calls) | schedule-to-close total shared-buffer hits | delta % |
+|---|---:|---:|---:|
+| `claim_task_query()` itself (10,001 calls) | 4,840,867 | 5,592,358 | +15.5% |
+| queue-pause post-claim recheck (10,000 calls) | 69,004 | 118,850 | +72.2% |
+| activity-pause post-claim recheck (10,000 calls) | 69,004 | 118,726 | +72.1% |
+| **combined (all three, full drain)** | **4,978,875** | **5,829,934** | **+17.1%** |
+
+**+17.1% is this page's one auditable figure for "the cost of driving the
+real `claim_task()` function over this drain,"** superseding the
+`claim_task_query()`-only +15.5% this section previously reported as if it
+were that same thing -- +15.5% is still correct as a description of
+`claim_task_query()`'s own SQL text alone (and is what the `EXPLAIN`-based
+[Plan](#plan) section above is built on, since `EXPLAIN` was only run
+against that one query), so both figures are kept, each labeled for what it
+actually measures. The two rechecks' own relative increase (+72%) is
+markedly larger than the main query's, which this page cannot explain with
+confidence: no `EXPLAIN` was captured for either recheck statement, only
+the aggregate `pg_stat_statements` counters above, so there is no plan-level
+evidence to confirm whether it is the same non-HOT/index-write and
+row-width mechanisms [Plan](#plan) establishes for the main claim `UPDATE`
+recurring here, or something else about how these two statements touch the
+row. What can be said: both rechecks target the same, already-claimed row
+`claim_task_query()` just wrote, so the same wider-row and non-HOT
+index-maintenance effects are a plausible contributor, consistent with the
+direction (both labels' recheck costs move the same way the main query's
+did) -- but this page does not assert that as confirmed, since it never
+directly measured either recheck statement's own plan.
+
+**Neither number reproduced to a stable value across the several runs this
 capture went through over the course of this pass.** Codex review on PR
 #1339 caught this same problem twice: an earlier revision cited specific
 historical bounds from those runs (roughly +2.5% to +22.5%), and even
@@ -408,14 +451,15 @@ same unaudited-evidence problem this page's "On reproducibility" note
 above disclaims for everything else: those runs' artifacts are gone (the
 repro script always overwrites the same canonical filenames), so nothing
 about them -- not a range, not a sign, not a trend -- is something this
-page can support from the repository as it stands. The only auditable
-data point is the committed run in the table above: **+15.5%**, comfortably
-under the impact floor. The drain loop does not capture a plan for every
-one of its 10,001 calls, only the aggregate `pg_stat_statements` counters,
-so there is no per-call plan trace available to check any hypothesis about
-the cause of run-to-run variance, and this page asserts none -- including
-any hypothesis about whether the aggregate stays positive, or how large it
-runs, on a run other than this committed one.
+page can support from the repository as it stands. The only auditable data
+points are the committed run in the table above: **+17.1%** combined
+(**+15.5%** for `claim_task_query()` alone), comfortably under the impact
+floor either way. The drain loop does not capture a plan for any of its
+calls, only the aggregate `pg_stat_statements` counters, so there is no
+per-call plan trace available to check any hypothesis about the cause of
+run-to-run variance, and this page asserts none -- including any hypothesis
+about whether the aggregate stays positive, or how large it runs, on a run
+other than this committed one.
 
 ## Write-side cost
 
