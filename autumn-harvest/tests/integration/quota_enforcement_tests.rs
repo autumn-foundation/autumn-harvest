@@ -3474,3 +3474,47 @@ async fn quota_blocked_outbox_retry_row_is_not_starved_by_a_flood_of_fresh_rows(
          reverse (issue #1227 Finding 4, Codex round-2 P2)"
     );
 }
+
+/// Issue #1227 Finding 4, Codex round-3 P2 (PR #1386): the round-2 fix's
+/// reservation is a FLOOR for retries, not a fixed carve-out. When the retry
+/// backlog is smaller than `OUTBOX_RETRY_RESERVED_SLOTS` -- the common case,
+/// since most scans have no quota-blocked backlog at all -- the unused
+/// reservation must go back to fresh work instead of silently capping every
+/// scan at 40 of the configured 50, permanently cutting outbox throughput by
+/// up to 20%. This proves 45 fresh rows (no retry-eligible rows at all) are
+/// ALL delivered in a single scan, not just the first 40.
+#[tokio::test]
+async fn quota_blocked_outbox_backfills_unused_retry_capacity_with_fresh_rows() {
+    let (url, _c) = setup_test_database_url_or_env().await;
+    let mut conn = connect(&url).await;
+
+    install_global_router(ShardRouter::single());
+    let sharded_pool = Some(ShardedDbPool::single(build_test_pool(&url)));
+
+    let fresh_wf = leaked("outbox_backfill_fresh");
+
+    // More than the 40-slot fresh reservation, but fewer than the full
+    // 50-row batch limit -- with no retry-eligible rows at all, all 45 must
+    // still be reachable in one scan if the unused retry reservation is
+    // correctly backfilled.
+    const FRESH_ROW_COUNT: usize = 45;
+    let mut fresh_ids = Vec::with_capacity(FRESH_ROW_COUNT);
+    for _ in 0..FRESH_ROW_COUNT {
+        fresh_ids.push(insert_outbox_row(&mut conn, fresh_wf, serde_json::json!({})).await);
+    }
+
+    enforce_completion_triggers_outbox(&mut conn, &NoOpMetrics, &sharded_pool, &[ShardId::new(0)])
+        .await
+        .expect("single outbox scan");
+
+    for id in &fresh_ids {
+        assert!(
+            !outbox_row_exists(&mut conn, *id).await,
+            "with no retry-eligible rows competing for the batch, all 45 \
+             fresh rows must be delivered in a single scan -- capping at the \
+             40-slot fresh reservation would silently waste the other 10 \
+             slots the empty retry tier never needed (issue #1227 Finding 4, \
+             Codex round-3 P2)"
+        );
+    }
+}

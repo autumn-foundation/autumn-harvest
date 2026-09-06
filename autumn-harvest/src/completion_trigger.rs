@@ -2067,14 +2067,18 @@ pub async fn enforce_completion_triggers_outbox(
     // reclaimed again even after its target's quota frees up (round-2 P2).
     //
     // Reserving `OUTBOX_RETRY_RESERVED_SLOTS` of the batch for retry-eligible
-    // rows -- two independently-limited queries, combined -- gives each tier
-    // a floor neither backlog can starve: fresh rows always get at least
+    // rows -- independently-limited queries, combined -- gives each tier a
+    // floor neither backlog can starve: fresh rows always get at least
     // `OUTBOX_CLAIM_BATCH_LIMIT - OUTBOX_RETRY_RESERVED_SLOTS` slots
     // regardless of how large the retry backlog is, and retries always get
     // at least `OUTBOX_RETRY_RESERVED_SLOTS` regardless of how fast fresh
-    // rows arrive. Either query filling short of its own limit gives the
-    // other tier the difference, so no capacity is wasted when one backlog
-    // is smaller than its reservation.
+    // rows arrive. The fresh query filling short of its own limit already
+    // gives the retry tier the difference (its own `retry_limit` grows to
+    // match); the retry tier filling short of ITS limit -- the common case,
+    // since most scans have no quota-blocked backlog at all -- backfills a
+    // third query of more fresh rows, so a reservation the retry backlog
+    // never needed doesn't silently cap every scan at 40 of the configured
+    // 50 (round-3 P2 on PR #1386).
     let now = chrono::Utc::now();
     let mut pending_tasks = outbox_dsl::harvest_completion_trigger_outbox
         .filter(outbox_dsl::target_shard.eq_any(&shards))
@@ -2084,6 +2088,7 @@ pub async fn enforce_completion_triggers_outbox(
         .load::<CompletionTriggerOutboxDb>(conn)
         .await
         .map_err(crate::error::database_error)?;
+    let fresh_ids: Vec<Uuid> = pending_tasks.iter().map(|t| t.id).collect();
 
     let retry_limit = OUTBOX_CLAIM_BATCH_LIMIT
         - i64::try_from(pending_tasks.len()).unwrap_or(OUTBOX_CLAIM_BATCH_LIMIT);
@@ -2098,7 +2103,28 @@ pub async fn enforce_completion_triggers_outbox(
         .load::<CompletionTriggerOutboxDb>(conn)
         .await
         .map_err(crate::error::database_error)?;
+
+    // Codex round-3 P2 on PR #1386: the reservation above is a FLOOR for
+    // retries, not a fixed carve-out -- when the retry backlog is smaller
+    // than `OUTBOX_RETRY_RESERVED_SLOTS` (the common case: most scans have no
+    // quota-blocked backlog at all), the unused reservation must go back to
+    // fresh work instead of silently capping every scan at 40 of the
+    // configured 50, permanently cutting outbox throughput by up to 20%.
+    let unused_retry_capacity =
+        retry_limit - i64::try_from(retry_rows.len()).unwrap_or(retry_limit);
     pending_tasks.extend(retry_rows);
+    if unused_retry_capacity > 0 {
+        let backfill = outbox_dsl::harvest_completion_trigger_outbox
+            .filter(outbox_dsl::target_shard.eq_any(&shards))
+            .filter(outbox_dsl::next_attempt_at.is_null())
+            .filter(outbox_dsl::id.ne_all(&fresh_ids))
+            .order(outbox_dsl::created_at.asc())
+            .limit(unused_retry_capacity)
+            .load::<CompletionTriggerOutboxDb>(conn)
+            .await
+            .map_err(crate::error::database_error)?;
+        pending_tasks.extend(backfill);
+    }
 
     if pending_tasks.is_empty() {
         return Ok(0);

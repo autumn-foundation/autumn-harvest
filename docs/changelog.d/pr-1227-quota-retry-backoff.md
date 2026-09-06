@@ -73,17 +73,21 @@ never-attempted rows (`next_attempt_at IS NULL`) strictly ahead of any
 previously-blocked one fixed that, but traded one starvation direction for
 the other: a sustained arrival of ≥50 fresh rows between ticks can now fill
 every batch and strand a previously-blocked row even after its target's
-quota frees up (**round-2 P2**). The batch is now built from two
-independently-capped queries instead of one combined query + `ORDER BY`:
-fresh rows get up to `OUTBOX_CLAIM_BATCH_LIMIT - OUTBOX_RETRY_RESERVED_SLOTS`
-(40) slots, retry-eligible rows get the remaining slots with a floor of
-`OUTBOX_RETRY_RESERVED_SLOTS` (10) — each tier's own query result short of
-its cap donates the difference to the other, so no capacity is wasted when
-one backlog is smaller than its reservation. Also fixed alongside round-1: the
-row-level `FOR UPDATE SKIP LOCKED` claim inside `relay_gate_checked_start`
-now re-checks the same eligibility predicate, closing a race where a
-concurrent scanner replica's unlocked batch read could claim and retry a row
-a peer had just re-armed (**round-1 P2**).
+quota frees up (**round-2 P2**). The batch is now built from independently-
+capped queries instead of one combined query + `ORDER BY`: fresh rows get up
+to `OUTBOX_CLAIM_BATCH_LIMIT - OUTBOX_RETRY_RESERVED_SLOTS` (40) slots,
+retry-eligible rows get the remaining slots with a floor of
+`OUTBOX_RETRY_RESERVED_SLOTS` (10) — the fresh query filling short of its own
+limit already gives the retry tier the difference (its `retry_limit` grows to
+match). The retry tier filling short of ITS limit needed a third query,
+added a round later: the common case is no quota-blocked backlog at all, so
+without backfilling the leftover reservation with more fresh rows, every
+scan was silently capped at 40 of the configured 50 — a permanent 20%
+throughput cut for the normal, no-backlog case (**round-3 P2**). Also fixed
+alongside round-1: the row-level `FOR UPDATE SKIP LOCKED` claim inside
+`relay_gate_checked_start` now re-checks the same eligibility predicate,
+closing a race where a concurrent scanner replica's unlocked batch read
+could claim and retry a row a peer had just re-armed (**round-1 P2**).
 
 **Tests, red → green → refactor.** Confirmed each fix's test fails without it
 (production code reverted, rebuilt, test observed to fail) and passes with it
@@ -122,6 +126,10 @@ restored:
   `quota_blocked_outbox_retry_row_is_not_starved_by_a_flood_of_fresh_rows`
   (round-2 P2) — a single retry-eligible row (quota freed, backoff elapsed)
   is still reclaimed in one scan despite 55 competing never-attempted rows,
-  proving the reserved retry floor holds under a fresh-row flood.
+  proving the reserved retry floor holds under a fresh-row flood — and
+  `quota_blocked_outbox_backfills_unused_retry_capacity_with_fresh_rows`
+  (round-3 P2) — 45 fresh rows with zero retry-eligible rows competing are
+  ALL delivered in one scan, not just the first 40, proving an unneeded
+  retry reservation doesn't silently cap normal-case throughput.
 
 No `WorkflowEvent` variant, no data migration, no replay impact.
