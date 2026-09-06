@@ -1,4 +1,4 @@
-## Fix — Shard-rebalance seal integrity, legal-hold cutover race, and successor minting (issue #1317)
+## Fix — Shard-rebalance seal integrity, legal-hold cutover race, and successor minting (issue #1317, PR #1406)
 
 Follow-up to #964 and PR #1305, addressing the highest-severity findings
 from that PR's round 6-12 review: several ways the shard-rebalance feature
