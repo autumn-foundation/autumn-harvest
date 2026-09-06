@@ -3398,3 +3398,32 @@ the CI log did the moment CI was allowed to finish.
 `--self-test` compiles the source under `warnings.catch_warnings` and
 fails on any escape-sequence warning. Compiling does not execute, and the
 check is proved by reverting the docstring: the self-test exits 1.
+
+Round 112 -- a label in front of a block, and a declaration with no body.
+
+`// 'outer: loop {` produced no CH001. Matching started at the label,
+which none of the alternatives read.
+
+rustc 1.94.1 enumerates what may follow a label rather than leaving it to
+guesswork: "expected `while`, `for`, `loop` or `{` after a label". So a
+label attaches to three of the six control-flow keywords and to a bare
+block, and not to `if`, `match` or `unsafe`. It is its own alternative
+for that reason -- hanging an optional label on the control-flow rule
+would have accepted `'a: if x > 1 {`, which the compiler rejects, and a
+bound that admits what the grammar refuses does no work.
+
+`// const LIMIT: usize;` and `// static FOREIGN: u8;` produced nothing
+either. The const rule requires an `=`, and rustc takes the first in a
+trait and the second in an extern block. The new alternative reads the
+type from `DECL_TYPE`, the same fragment the uninitialized binding now
+reads, rather than a second copy of it.
+
+Two residuals, both stated rather than papered over. `// 'note: {` is
+accepted; a line that opens a quote, gives one word, a colon and a brace
+and then stops is a labeled block by construction, and a guard against it
+would do no work. And `// 'outer: loop {}` is still missed, because the
+control-flow rule ends its line at the opening brace -- which is equally
+true of `// if x > 1 {}` and is one gap for all six keywords, not a new
+one.
+
+Corpus effect: none. Eight fixtures, four of them refusals.

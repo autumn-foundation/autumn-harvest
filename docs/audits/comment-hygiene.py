@@ -295,6 +295,22 @@ GENERICS = r"<(?:[^;]|;(?=[^;]*\]))*>"
 # rules read a path at all, which is the same question the array guard needed
 # in round one hundred and six.
 ROOT = r"(?:::\s*)?"
+# The type of a declaration that has no initializer, and the terminator
+# that ends it. Two rules read one: an uninitialized `let`, and a `const`
+# or `static` declared without a body.
+#
+# Without an `=` to anchor on, a type annotation is all that separates
+# "let mut retries: usize;" from "let the reader decide;", so the lookahead
+# refuses three bare words before the `;`. A Rust type needs `;` for an
+# array length, `+` for a trait object, `->` for a function pointer and `*`
+# for a raw pointer; the inner `;` is allowed only where a `]` closes
+# before the next one, so the terminator stays the end of the statement. A
+# hyphen is admitted only as `->`, because a bare one swept through "let
+# a::b is re-exported for callers;".
+DECL_TYPE = (
+    r"(?!\s*(?:\w+\s+){2,}\w+\s*;\s*$)\s*"
+    r"(?:[\w:<>&'\[\]\s,()+*!?\#]|->|;(?=[^;]*\]))+;\s*$"
+)
 
 
 def abi(tag: str) -> str:
@@ -402,6 +418,14 @@ COMMENTED_CODE_RE = re.compile(
       # An uninitialized binding. No `=` to anchor on, so it needs a type
       # annotation to separate "let mut retries: usize;" from "let the reader
       # decide;" -- English does not put a colon between two bare words.
+      | let\s+(?:mut\s+)?(?:r\#)?\w+\s*:{DECL_TYPE}
+      # A `const` or `static` with no initializer. rustc 1.94.1 takes
+      # `const LIMIT: usize;` in a trait and `static FOREIGN: u8;` in an
+      # extern block, and the rule above needs an `=`, so neither reached
+      # the gate. It reads the same type as the binding above it, from the
+      # same fragment, because writing a construct twice is how two of them
+      # came to disagree in rounds one hundred and eight and nine.
+      | {VIS}(?:const|static)\s+(?:mut\s+)?(?:r\#)?\w+\s*:{DECL_TYPE}
       | let\s+(?:mut\s+)?(?:r\#)?\w+\s*:
             (?!\s*(?:\w+\s+){2,}\w+\s*;\s*$)\s*
             # A Rust type, not a scalar name. An array length needs `;`, a
@@ -520,6 +544,19 @@ COMMENTED_CODE_RE = re.compile(
       # The prose lookahead is the same one the keywords above carry, so
       # "else the worker parks until the queue drains {" is still a
       # sentence.
+      # A LABEL. rustc 1.94.1 enumerates what may follow one rather than
+      # leaving it to guesswork: "expected `while`, `for`, `loop` or `{`
+      # after a label". So it attaches to three of the six keywords above
+      # and to a bare block, and NOT to `if`, `match` or `unsafe`.
+      #
+      # Its own alternative for exactly that reason. Hanging an optional
+      # label on the rule above would accept `'a: if x > 1 {`, which the
+      # compiler rejects, and a bound that admits what the grammar refuses
+      # does no work.
+      | '(?:r\#)?\w+\s*:\s*
+            (?:(?:while|for|loop)\b
+                (?![^;{]*\b[a-z]+\s+[a-z]+\s+[a-z]+\s+[a-z]+\b)[^;]*)?
+            \{\s*$
       | (?:\}\s*)?else\b
             (?![^;{]*\b[a-z]+\s+[a-z]+\s+[a-z]+\s+[a-z]+\b)
             (?:\s+if\b[^;]*)?\s*\{\s*$
@@ -541,6 +578,8 @@ COMMENTED_CODE_RE = re.compile(
     )""".replace("{VIS}", VISIBILITY).replace("{WHERE}", WHERE).replace(
         "{BODY}", BODY
     ).replace("{GEN}", GENERICS).replace("{ROOT}", ROOT).replace(
+        "{DECL_TYPE}", DECL_TYPE
+    ).replace(
         "{ABI_FN}", abi("abifn")
     ).replace("{ABI_BLOCK}", abi("abiblock")),
     re.VERBOSE,
@@ -5483,6 +5522,46 @@ RULE_TESTS = [
         "// } else the reader may skip the rest {\n",
         set(),
         "and a sentence after else is still a sentence",
+    ),
+    (
+        "// 'outer: loop {\n",
+        {("CH001", 1)},
+        "a label may sit in front of a loop",
+    ),
+    (
+        "// 'a: {\n",
+        {("CH001", 1)},
+        "and in front of a bare block",
+    ),
+    (
+        "// 'a: if x > 1 {\n",
+        set(),
+        "but rustc names what may follow a label, and if is not in the set",
+    ),
+    (
+        "// 'a: the worker parks until the queue drains {\n",
+        set(),
+        "nor is a sentence",
+    ),
+    (
+        "// const LIMIT: usize;\n",
+        {("CH001", 1)},
+        "a const may be declared with no initializer, as in a trait",
+    ),
+    (
+        "// static mut FOREIGN: u8;\n",
+        {("CH001", 1)},
+        "and a static, as in an extern block",
+    ),
+    (
+        "// const LIMIT: [u8; 32];\n",
+        {("CH001", 1)},
+        "reading the same type the uninitialized binding reads",
+    ),
+    (
+        "// static analysis: the queue drains before the worker parks;\n",
+        set(),
+        "so three bare words are prose there too",
     ),
     (
         '// #[doc = include_str!("../README.md")]\n',
