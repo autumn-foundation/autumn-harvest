@@ -12,3 +12,10 @@
 # fail to parse).
 .github/ci/run-suites.sh          text eol=lf
 *.sh                              text eol=lf
+
+# The generated OpenAPI document is compiled into the plugin with `include_str!`
+# and served verbatim, so its bytes must not depend on the platform that built
+# the binary. A CRLF checkout on Windows would serve CRLF to every client and
+# break the byte-exact artifact comparison in `openapi_spec`. JSON is always
+# text, so pin the whole class rather than the two files that bite today.
+*.json                            text eol=lf

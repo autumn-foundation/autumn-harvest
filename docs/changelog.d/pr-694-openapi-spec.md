@@ -125,6 +125,12 @@ against routes reverse-engineered from prose.
   therefore invisible to every existing guard, to the CLI coverage test, and to
   the published document. Found by the new router guard below.
 
+**Portability.** `.gitattributes` pins `*.json` to LF. The generated document is
+compiled into the plugin with `include_str!` and served verbatim, so a CRLF
+checkout on Windows would make a Windows-built binary serve different bytes than
+a Linux-built one. The Windows CI leg caught it through the byte-exact artifact
+comparison.
+
 **Invariants.** No new `WorkflowEvent` variant, no migration, no shard-semantics
 change, no `harvest_events` write path. One additive read-only route.
 
