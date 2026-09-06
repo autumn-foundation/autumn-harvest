@@ -537,10 +537,28 @@ def inline_code_ranges(text: str) -> list[tuple[int, int]]:
         opener = unescaped(CODE_OPEN_RE, index)
         if not opener:
             return ranges
-        closer = unescaped(CODE_CLOSE_RE, opener.end())
-        end = closer.end() if closer else len(text)
+        # NESTED, because HTML nests. Rustdoc renders
+        # "<code>outer <code>inner</code> TODO: x</code>" with the marker
+        # still inside the OUTER element, and pairing the outer opener with
+        # the inner closer exposed it and failed the build. The element ends
+        # at the closer that returns the depth to zero.
+        depth, cursor, end = 1, opener.end(), len(text)
+        while True:
+            closer = unescaped(CODE_CLOSE_RE, cursor)
+            nested = unescaped(CODE_OPEN_RE, cursor)
+            if nested and (closer is None or nested.start() < closer.start()):
+                depth += 1
+                cursor = nested.end()
+                continue
+            if closer is None:
+                break
+            depth -= 1
+            cursor = closer.end()
+            if not depth:
+                end = closer.end()
+                break
         ranges.append((opener.start(), end))
-        if not closer:
+        if end == len(text):
             return ranges
         index = end
 
@@ -4149,6 +4167,12 @@ RULE_TESTS = [
         "// pub use inner::{r#type};\n",
         {("CH001", 1)},
         "a raw identifier inside a grouped use tree",
+    ),
+    (
+        "/// <code>outer <code>inner</code> TODO: add retry</code>\n"
+        "/// TODO: add retry\n",
+        {("CH002", 2)},
+        "an inner closer ends the inner element, not the outer one",
     ),
 ]
 

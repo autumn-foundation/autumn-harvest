@@ -2228,3 +2228,27 @@ across the whole pattern -- every place a name can be spelled -- rather
 than by the shape of the syntax that spells it.
 
 Corpus effect: none. Two fixtures, one for each.
+
+### Round seventy-three — HTML nests, and the scanner did not
+
+One finding, a Tier A false positive, in code from round sixty-six.
+
+`<code>` is phrasing content and may contain another `<code>`. Rustdoc
+renders `<code>outer <code>inner</code> TODO: x</code>` with the marker
+still inside the OUTER element, and the scanner paired the outer opener
+with the inner closer, exposed the marker, and failed the build on it.
+The element now ends at the closer that returns the depth to zero.
+
+The fixture discriminates rather than merely passing: the marker inside
+the element and a second marker on the line below it. Before, both
+reported; now only the one outside does. A single-line version would
+have reported one finding either way and asserted nothing -- which is
+the fixture rule this PR adopted in round thirty-nine, and it earned its
+keep again here.
+
+Round sixty-six wrote the scanner to replace a regex that could not
+express escaping. Depth is the second thing a regex cannot express, and
+it was the next finding in the same function -- the scan should have
+been written for both at once.
+
+Corpus effect: none.
