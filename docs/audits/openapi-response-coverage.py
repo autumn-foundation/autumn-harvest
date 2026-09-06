@@ -16,12 +16,16 @@ check 2 it resolves each `Json<T>` extractor to its struct and treats a field as
 mandatory when it is neither an `Option` nor carries a serde default: axum
 rejects a request that omits one, whatever the contract says.
 
-A `StatusCode::` used in a comparison rather than a response is ignored.
+A `StatusCode::` used in a comparison rather than a response is ignored, and so
+is one inside a helper on GENERIC_HELPERS: `map_error` translates a runtime
+error variant, so its statuses belong to the error, not to every route that
+calls it.
 
-Known limit: only the handler's own body is read. A status returned from a
-helper the handler calls, such as `reset_error_response`, is invisible here, so
-this audit is a floor rather than a proof. The finding text names the source
-line, since a status can also reach a route through a helper it shares.
+Each handler is followed one level into the helpers it calls, since a status is
+often selected in a helper such as `queue_pause_partial_status`. A helper called
+by a helper is not followed, so this audit is a floor rather than a proof. The
+finding text names the source line, since a status can reach a route through a
+helper it shares.
 
 Exit code 1 on any finding. Run standalone:
 
@@ -64,6 +68,11 @@ NAMED = {
 }
 
 VERBS = ("get", "post", "put", "patch", "delete")
+
+# Helpers whose status depends on the runtime error they are handed rather than
+# on the calling route. Following them would put every status they can produce
+# on every route that calls them, which is noise, not coverage.
+GENERIC_HELPERS = frozenset({"map_error"})
 
 # The parser must keep finding the whole router. A large drop means it drifted
 # from the source and is no longer checking anything.
@@ -108,6 +117,33 @@ def handler_body(source: str, name: str) -> str | None:
         return None
     brace = source.index("{", source.index(")", at))
     return balanced(source[brace:], "{", "}")
+
+
+def function_body(source: str, name: str) -> str | None:
+    """The block of a free function, async or not, generic or not."""
+    found = re.search(r"\b(?:async )?fn %s\s*[(<]" % re.escape(name), source)
+    if found is None:
+        return None
+    opener = source.find("(", found.start())
+    brace = source.find("{", balanced_end(source, opener))
+    if brace < 0:
+        return None
+    return balanced(source[brace:], "{", "}")
+
+
+def balanced_end(source: str, opener: int) -> int:
+    """The index just past the balanced `(..)` starting at `opener`."""
+    return opener + len(balanced(source[opener:]))
+
+
+def called_helpers(source: str, body: str) -> list[str]:
+    """Functions defined in this file that the given body calls."""
+    names = {name for name in re.findall(r"\b([a-z_][a-z_0-9]{3,})\s*\(", body)}
+    return sorted(
+        name
+        for name in names - GENERIC_HELPERS
+        if re.search(r"\b(?:async )?fn %s\s*[(<]" % re.escape(name), source)
+    )
 
 
 def handler_parameters(source: str, name: str) -> str | None:
@@ -181,18 +217,26 @@ def main() -> int:
         if body is None or route is None:
             continue
         declared = declared_statuses(route)
-        offset = source.index(body)
-        for hit in re.finditer(r"(.{0,30})StatusCode::([A-Z_]+)", body):
-            status = NAMED.get(hit.group(2))
-            if status is None or status in declared:
-                continue
-            if "==" in hit.group(1) or "!=" in hit.group(1):
-                continue
-            line = source[: offset + hit.start()].count("\n") + 1
-            findings.append(
-                "  %s %s returns %d, undeclared\n    api.rs:%d  %s"
-                % (method, path, status, line, lines[line - 1].strip()[:88])
-            )
+
+        bodies = [body]
+        for helper in called_helpers(source, body):
+            reached = function_body(source, helper)
+            if reached is not None:
+                bodies.append(reached)
+
+        for reached in bodies:
+            offset = source.index(reached)
+            for hit in re.finditer(r"(.{0,30})StatusCode::([A-Z_]+)", reached):
+                status = NAMED.get(hit.group(2))
+                if status is None or status in declared:
+                    continue
+                if "==" in hit.group(1) or "!=" in hit.group(1):
+                    continue
+                line = source[: offset + hit.start()].count("\n") + 1
+                findings.append(
+                    "  %s %s returns %d, undeclared\n    api.rs:%d  %s"
+                    % (method, path, status, line, lines[line - 1].strip()[:88])
+                )
 
     body_findings: list[str] = []
     for method, path, handler in routes:

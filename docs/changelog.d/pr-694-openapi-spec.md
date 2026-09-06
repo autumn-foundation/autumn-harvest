@@ -113,6 +113,13 @@ against routes reverse-engineered from prose.
 - Five alternate success responses said "same fields as the primary" in prose.
   They now carry the field list itself, so a generated client keeps
   `execution_id` on a reused start.
+- Nine more statuses were selected in a helper rather than in the handler, so
+  the first pass of the audit could not see them: the `207` all four pause and
+  resume routes return on a partial fan-out, the `409` a paused execution
+  returns to triage, legal-hold and resume, the `409` an exhausted schedule
+  returns to backfill, the `400` and `413` of signal validation and the signal
+  payload cap, the `413` of an oversized workflow input, and the `504` of an
+  update-with-start wait window.
 - `PATCH /tasks/{id}` has been mounted and audited since issue #249, but was
   missing from `management_api_routes()` and from the contract. It was
   therefore invisible to every existing guard, to the CLI coverage test, and to
@@ -147,8 +154,11 @@ sorted line in `.github/ci/integration-suites.txt`. They assert:
 `docs/audits/openapi-response-coverage.py` reads the handlers and the contract,
 and runs in the ungated `lint` job. It fails when a handler returns a status the
 contract does not declare, and when a request-body field that is mandatory on
-the wire is not marked required. It found the nineteen statuses above; both
-checks were confirmed to fail on a seeded gap before being wired in.
+the wire is not marked required. Each handler is followed one level into the
+helpers it calls, since a status is often chosen in a helper such as
+`queue_pause_partial_status`. `map_error` is excluded: it translates a runtime
+error variant, so its statuses belong to the error rather than to every route
+that calls it. Both checks were confirmed to fail on a seeded gap.
 
 Two new guards in `contract_regression.rs` read `src/api.rs` itself.
 `every_registered_route_is_in_the_canonical_list` parses the router and fails

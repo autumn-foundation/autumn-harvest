@@ -368,6 +368,33 @@
             },
             "description": "A hold applied to only SOME shards returns 207 Multi-Status with `ok: false` and `status: \"partial\"`, plus a `partial_failures` string naming the shards that were not reached (including a shard the router knows about but this process has no pool for). The hold is NOT in effect fleet-wide in that case -- the missed shards keep dispatching -- so re-issue the request (it is idempotent). A fully applied request returns 200 with `ok: true` and `status: \"complete\"`, and omits `partial_failures`. Cross-shard provenance: `held_task_count` is the fleet-wide sum, while the top-level `reason`/`paused_by`/`paused_at`/`scope_shard_id` describe the EARLIEST hold (tie-broken by shard id -- the same rule the read endpoints use). Because an idempotent re-pause preserves each shard's ORIGINAL provenance, a request landing over a pre-existing hold leaves the shards disagreeing: `shards` then carries every shard's own `{shard_id, newly_paused, reason, paused_by, paused_at, scope_shard_id, held_task_count}` and `provenance_uniform` is false. `provenance_uniform` compares `(reason, paused_by, scope_shard_id)` and deliberately NOT `paused_at`, since each shard stamps its own NOW(). `scope_shard_id` is always null for a hold placed by this route (fleet-wide); it is reported because the underlying column records the INTENT of whichever surface wrote each row."
           },
+          "207": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "properties": {
+                    "activity_name": {},
+                    "held_task_count": {},
+                    "newly_paused": {},
+                    "ok": {},
+                    "partial_failures": {
+                      "description": "Summary of the shards the hold could not be applied to. Present only on this status.",
+                      "type": "string"
+                    },
+                    "paused_at": {},
+                    "paused_by": {},
+                    "provenance_uniform": {},
+                    "reason": {},
+                    "scope_shard_id": {},
+                    "shards": {},
+                    "status": {}
+                  },
+                  "type": "object"
+                }
+              }
+            },
+            "description": "The hold reached only SOME shards. The body is the 200 body plus partial_failures naming the shards that did not apply it, so an operator can see the hold is not fleet-wide."
+          },
           "400": {
             "description": "Blank, whitespace-padded, or oversized activity name; or a malformed request body (unknown fields are rejected, so a typo cannot become a silently-ignored setting)."
           },
@@ -428,6 +455,32 @@
               }
             },
             "description": "A resume applied to only SOME shards returns 207 Multi-Status with `ok: false`, `status: \"partial\"` and a `partial_failures` string. Work remains held on the shards that were not reached -- the safe direction, but not a completed thaw -- so re-issue the request (it is idempotent). A fully applied request returns 200 with `ok: true` and `status: \"complete\"`. Cross-shard provenance: the resume DELETES the pause rows, so this response and the audit row are the ONLY surviving record of what was released. `released_task_count` is the fleet-wide sum and `paused_duration_secs` the longest hold; the top-level `released_reason`/`released_paused_by` describe THAT same longest-held shard (tie-broken by lowest shard id), so the duration and the story it is paired with always come from one shard. `shards` carries every shard's own `{shard_id, newly_resumed, released_task_count, paused_duration_secs, released_reason, released_paused_by}`, and `provenance_uniform` is false when the released shards disagree on `(released_reason, released_paused_by)`. A shard that was not paused contributes null provenance and is ignored by the summary."
+          },
+          "207": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "properties": {
+                    "activity_name": {},
+                    "newly_resumed": {},
+                    "ok": {},
+                    "partial_failures": {
+                      "description": "Summary of the shards the hold could not be applied to. Present only on this status.",
+                      "type": "string"
+                    },
+                    "paused_duration_secs": {},
+                    "provenance_uniform": {},
+                    "released_paused_by": {},
+                    "released_reason": {},
+                    "released_task_count": {},
+                    "shards": {},
+                    "status": {}
+                  },
+                  "type": "object"
+                }
+              }
+            },
+            "description": "The hold reached only SOME shards. The body is the 200 body plus partial_failures naming the shards that did not apply it, so an operator can see the hold is not fleet-wide."
           },
           "400": {
             "description": "Blank, whitespace-padded, or oversized activity name; or a request body that is not empty or `{}` (the route accepts no fields, so anything else is a typo)."
@@ -2454,6 +2507,33 @@
             },
             "description": "A hold applied to only SOME target shards returns 207 Multi-Status with `ok: false` and `status: \"partial\"`, plus a `partial_failures` string naming the shards that were not reached (including a shard the router knows about but this process has no pool for). The hold is NOT in effect fleet-wide in that case — the missed shards keep dispatching — so re-issue the request (it is idempotent). A fully applied request returns 200 with `ok: true` and `status: \"complete\"`, and omits `partial_failures`. Cross-shard provenance: `held_task_count` is the fleet-wide sum, while the top-level `reason`/`paused_by`/`paused_at`/`scope_shard_id` describe the EARLIEST hold (tie-broken by shard id — the same rule `GET /admin/queues/paused` and the Vantage banner use, so the three surfaces never disagree). Because an idempotent re-pause preserves each shard's ORIGINAL provenance, a fleet-wide request landing over pre-existing scoped holds leaves the shards disagreeing: `shards` then carries every shard's own `{shard_id, newly_paused, reason, paused_by, paused_at, scope_shard_id, held_task_count}` and `provenance_uniform` is false. `provenance_uniform` compares `(reason, paused_by, scope_shard_id)` and deliberately NOT `paused_at`, since each shard stamps its own NOW()."
           },
+          "207": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "properties": {
+                    "held_task_count": {},
+                    "newly_paused": {},
+                    "ok": {},
+                    "partial_failures": {
+                      "description": "Summary of the shards the hold could not be applied to. Present only on this status.",
+                      "type": "string"
+                    },
+                    "paused_at": {},
+                    "paused_by": {},
+                    "provenance_uniform": {},
+                    "queue_name": {},
+                    "reason": {},
+                    "scope_shard_id": {},
+                    "shards": {},
+                    "status": {}
+                  },
+                  "type": "object"
+                }
+              }
+            },
+            "description": "The hold reached only SOME shards. The body is the 200 body plus partial_failures naming the shards that did not apply it, so an operator can see the hold is not fleet-wide."
+          },
           "400": {
             "description": "Blank or oversized queue name, blank reason, malformed body, or an unknown shard_id."
           },
@@ -2529,6 +2609,32 @@
               }
             },
             "description": "A resume applied to only SOME target shards returns 207 Multi-Status with `ok: false`, `status: \"partial\"` and a `partial_failures` string. Work remains held on the shards that were not reached — the safe direction, but not a completed thaw — so re-issue the request (it is idempotent). A fully applied request returns 200 with `ok: true` and `status: \"complete\"`. Cross-shard provenance: the resume DELETES the pause rows, so this response is the ONLY surviving record of what was released. `released_task_count` is the fleet-wide sum and `paused_duration_secs` the longest hold; the top-level `released_reason`/`released_paused_by` describe THAT same longest-held shard (tie-broken by lowest shard id), so the duration and the story it is paired with always come from one shard. `shards` carries every shard's own `{shard_id, newly_resumed, released_task_count, paused_duration_secs, released_reason, released_paused_by}` so independently-paused shards lose nothing, and `provenance_uniform` is false when the released shards disagree on `(released_reason, released_paused_by)`. A shard that was not paused contributes null provenance and is ignored by the summary."
+          },
+          "207": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "properties": {
+                    "newly_resumed": {},
+                    "ok": {},
+                    "partial_failures": {
+                      "description": "Summary of the shards the hold could not be applied to. Present only on this status.",
+                      "type": "string"
+                    },
+                    "paused_duration_secs": {},
+                    "provenance_uniform": {},
+                    "queue_name": {},
+                    "released_paused_by": {},
+                    "released_reason": {},
+                    "released_task_count": {},
+                    "shards": {},
+                    "status": {}
+                  },
+                  "type": "object"
+                }
+              }
+            },
+            "description": "The hold reached only SOME shards. The body is the 200 body plus partial_failures naming the shards that did not apply it, so an operator can see the hold is not fleet-wide."
           },
           "400": {
             "description": "Blank or oversized queue name, malformed body, or an unknown shard_id."
@@ -3596,6 +3702,9 @@
           },
           "404": {
             "description": "Schedule not found."
+          },
+          "409": {
+            "description": "The schedule is exhausted: end_at has passed, max_runs is spent, or exhausted_at is set. Extend the limits before backfilling."
           },
           "500": {
             "description": "Database error or partial shard failure."
@@ -8318,8 +8427,30 @@
               }
             }
           },
+          "400": {
+            "description": "The idempotency key is empty, not UTF-8, or reserved, or the payload failed schema validation for this signal.",
+            "headers": {
+              "X-Harvest-Execution-Id": {
+                "description": "The execution id this call resolved to. Stamped on every response the delegate returns, success or error. Absent when resolution itself failed, so a 404 for an unknown (workflow_name, workflow_id) does not carry it.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
           "404": {
             "description": "No run for (workflow_name, workflow_id).",
+            "headers": {
+              "X-Harvest-Execution-Id": {
+                "description": "The execution id this call resolved to. Stamped on every response the delegate returns, success or error. Absent when resolution itself failed, so a 404 for an unknown (workflow_name, workflow_id) does not carry it.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "413": {
+            "description": "The signal payload exceeds max_signal_payload_bytes. The cap is enforced at submission, before the signal is persisted.",
             "headers": {
               "X-Harvest-Execution-Id": {
                 "description": "The execution id this call resolved to. Stamped on every response the delegate returns, success or error. Absent when resolution itself failed, so a 404 for an unknown (workflow_name, workflow_id) does not carry it.",
@@ -9728,6 +9859,9 @@
           "404": {
             "description": "Execution not found."
           },
+          "409": {
+            "description": "The execution is paused, so the mutation was rejected. Resume it first, or wait for the hold to clear."
+          },
           "500": {
             "description": "Database error."
           }
@@ -9782,6 +9916,9 @@
           },
           "404": {
             "description": "Execution not found."
+          },
+          "409": {
+            "description": "The execution is paused, so the mutation was rejected. Resume it first, or wait for the hold to clear."
           },
           "500": {
             "description": "Database error."
@@ -10540,6 +10677,9 @@
           "404": {
             "description": "Execution not found."
           },
+          "409": {
+            "description": "The execution is paused, so the mutation was rejected. Resume it first, or wait for the hold to clear."
+          },
           "500": {
             "description": "Database error."
           }
@@ -10671,8 +10811,14 @@
             },
             "description": "routed_execution_id (issue #843) is present only when the addressed execution id differed from the live workflow-level-retry attempt the signal actually landed on; it is omitted when the signal landed on the addressed execution itself."
           },
+          "400": {
+            "description": "The idempotency key is empty, not UTF-8, or reserved, or the payload failed schema validation for this signal."
+          },
           "404": {
             "description": "Execution not found."
+          },
+          "413": {
+            "description": "The signal payload exceeds max_signal_payload_bytes. The cap is enforced at submission, before the signal is persisted."
           },
           "500": {
             "description": "Database error."
@@ -11061,6 +11207,9 @@
           },
           "404": {
             "description": "Execution not found. Also returned when the id encodes a shard neither this node's pools nor the router know about (nothing here could host it)."
+          },
+          "409": {
+            "description": "The execution is paused, so the mutation was rejected. Resume it first, or wait for the hold to clear."
           },
           "500": {
             "description": "Database error."
@@ -11695,6 +11844,9 @@
           "409": {
             "description": "Duplicate workflow_id with conflicting reuse policy, or conflict_policy=fail over an ACTIVE (RUNNING/PAUSED) prior (issue #685)."
           },
+          "413": {
+            "description": "The serialized workflow input exceeds max_workflow_input_bytes."
+          },
           "422": {
             "content": {
               "application/json": {
@@ -11884,6 +12036,9 @@
               }
             },
             "description": "An admission gate blocked the start. Retry once the gate clears."
+          },
+          "504": {
+            "description": "The update did not complete within the wait window. The execution was started and the update was admitted; poll the update result."
           }
         },
         "summary": "Atomically start a workflow if no live run for (workflow_name, workflow_id) exists, or attach to the existing run otherwise, and admit exactly one update in ...",
