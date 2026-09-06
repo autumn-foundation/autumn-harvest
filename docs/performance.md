@@ -1509,11 +1509,17 @@ from the benchmark are directly comparable.
     confound instead — see that page's "Workload" section for the fix. The
     committed run now shows the two labels landing on *different* plans at
     the 100,000-row depth, with the expensive one on `no-schedule-to-close`
-    -- the label without this predicate populated, the opposite of what a
-    `schedule_to_close_at`-caused theory would predict (an earlier,
-    since-superseded committed run had neither label on the expensive
-    plan, so this is the only committed data point for which label it
-    lands on); that page's "100,000-row plan choice" section explains why it asserts
+    this time (an earlier, since-superseded committed run had neither
+    label on the expensive plan, so this is the only committed data point
+    for which label it lands on). That page's "100,000-row plan choice"
+    section is explicit that this does **not** show the instability is
+    unrelated to `schedule_to_close_at` — populating that column changes
+    the planner's actual row-count estimate for the shared candidate scan
+    (68,360 vs. 99,990 in this run's own committed plans, both against a
+    real 100,000 rows), so a plan flip either way is equally consistent
+    with that predicate's effect on planner inputs and with unrelated
+    `ANALYZE`-sample noise; the page does not have the evidence to tell
+    those apart. That same section also explains why it asserts
     no frequency, ratio, or before/after count for this, including why an
     earlier revision's "N of M runs" framing, and later a spelled-out
     sample-of-two-against-two restating the same statistic in prose, both

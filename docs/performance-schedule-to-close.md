@@ -451,9 +451,8 @@ mechanisms, and explains why 100,000 does not get the same treatment.
 
 ### 100,000-row plan choice
 
-**The committed run's two labels land on different plans at this depth --
-first direct, fully-auditable evidence that this instability is not tied
-to `schedule_to_close_at` specifically.** `no-schedule-to-close` uses an
+**The committed run's two labels land on different plans at this depth.**
+`no-schedule-to-close` uses an
 `Index Scan using idx_harvest_tq_poll` for the candidate-row source (9,878
 total buffers on the `Update` node); `schedule-to-close` uses a plain `Seq
 Scan` (2,537 total buffers, identical to the previous committed run --
@@ -477,19 +476,30 @@ as if it put the expensive plan on `schedule-to-close`, then cited that
 alongside this run to claim two committed runs showing the phenomenon on
 both labels. Still-earlier, uncommitted development runs (see below) did
 show the expensive plan on `schedule-to-close` specifically, but those
-artifacts no longer exist to audit. What this one committed run *does*
-support directly: the expensive plan lands on the label with
-`schedule_to_close_at` left `NULL`, the opposite of what a
-`schedule_to_close_at`-caused theory would predict. That is still real
-evidence against attributing the instability to this predicate, just not
-the "flips between both labels, committed either way" claim the earlier
-revision made. This page cannot say what does cause the instability: this
-run and the previous one used the same query, the same backlog shape, and
-(after the seeding fix) the same seeded index-key distribution between
-labels, so whatever tips the planner between these two plans at 100,000
-rows is sensitive to something this page hasn't isolated -- most likely
-ordinary statistical noise in `ANALYZE`'s sample at this table size, but
-that is not confirmed here.
+artifacts no longer exist to audit.
+
+**This page does not treat landing on `no-schedule-to-close` as evidence
+that the instability is unrelated to `schedule_to_close_at`, and an
+earlier revision was wrong to.** That revision read the expensive plan
+landing on the `NULL` label as "the opposite of what a
+`schedule_to_close_at`-caused theory would predict," and called that
+evidence against attribution. Codex review on PR #1339 caught the flaw:
+populating `schedule_to_close_at` is not a side effect-free toggle on an
+otherwise-identical query. It changes the planner's actual inputs for
+the SAME candidate-row source both labels scan -- the row-count estimate
+this run's own committed plans report is 68,360 for
+`no-schedule-to-close` versus 99,990 for `schedule-to-close` (both
+execute against the real 100,000), a large estimate gap driven by
+`schedule_to_close_at`'s own column statistics, the wider row's effect on
+page-count-based estimates, and that column's partial index existing at
+all for one label and not the other. Any of those could independently
+tip a cost comparison this close between an `Index Scan` and a `Seq
+Scan`. So this run landing on `no-schedule-to-close` is neither evidence
+for nor against a causal link to `schedule_to_close_at` -- it is
+consistent with the predicate changing the planner's inputs enough to
+flip the choice, and equally consistent with pure `ANALYZE`-sample noise
+unrelated to it. This page cannot tell those apart from what it has
+measured, and does not claim to.
 
 This page does **not** assert how often the expensive plan recurs, or
 under what conditions, for either label. Codex review caught this claim
@@ -499,10 +509,13 @@ removed -- as a spelled-out sample-of-two-against-two restating the same
 statistic in prose, both sourced from uncommitted development runs (before
 this pass's seeding fixes) whose artifacts no longer exist to audit. This
 page continues to count none of those uncommitted runs and draws no
-frequency, ratio, or before/after conclusion from them -- the only new
-claim this revision adds is the one both of this pass's two *committed*
-100,000-row runs directly support: the expensive plan is not confined to
-one label. **This remains a risk worth being aware of at large backlog
+frequency, ratio, or before/after conclusion from them. This revision
+adds only what the single committed occurrence directly shows: the
+expensive plan can land on `no-schedule-to-close`, not only on
+`schedule-to-close` as the uncommitted history suggested -- without
+concluding anything about how often either happens, or whether
+`schedule_to_close_at` is what tips it (see above). **This remains a
+risk worth being aware of at large backlog
 depths, for deployments that populate `schedule_to_close_at` and those
 that don't equally**, not a proposed fix target: there is no schema or
 query change on offer that would pin the planner's choice without the
