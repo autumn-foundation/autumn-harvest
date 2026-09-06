@@ -62,7 +62,11 @@ DIV_OPEN = re.compile(r"\bdiv\b[^{]*\{")
 # because the character after "flash" there is `.`, not a word character
 # or hyphen.
 CHAINED_FLASH_CLASS = re.compile(r'\.flash(?![\w-])|\."flash"')
-CLASS_ATTR = re.compile(r'class="([^"]*)"')
+# Maud reads a Rust token stream, not raw text, so whitespace around `=` in
+# any attribute (`class = "flash"`, `role = "status"`) is as valid as the
+# tight form and `cargo fmt` does not normalize it away inside a macro body
+# -- `\s*=\s*` here and in ROLE/FOCUS_ON_LOAD tolerates both.
+CLASS_ATTR = re.compile(r'class\s*=\s*"([^"]*)"')
 
 
 def is_flash_div(tag_text: str) -> bool:
@@ -77,8 +81,10 @@ def is_flash_div(tag_text: str) -> bool:
 # inside `data-role="status"` does not (the `e` of "role" would otherwise
 # still start a substring match right after the hyphen). `aria-live` only
 # counts with an active value — `aria-live="off"` is explicitly not live.
-ROLE = re.compile(r'(?<![\w-])role="(?:status|alert)"|(?<![\w-])aria-live="(?:polite|assertive)"')
-FOCUS_ON_LOAD = re.compile(r'(?<![\w-])tabindex="-1"')
+ROLE = re.compile(
+    r'(?<![\w-])role\s*=\s*"(?:status|alert)"|(?<![\w-])aria-live\s*=\s*"(?:polite|assertive)"'
+)
+FOCUS_ON_LOAD = re.compile(r'(?<![\w-])tabindex\s*=\s*"-1"')
 AUTOFOCUS = re.compile(r'(?<![\w-])autofocus\b')
 
 
