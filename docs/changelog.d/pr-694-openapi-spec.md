@@ -92,6 +92,15 @@ against routes reverse-engineered from prose.
   documented no body, though the handler returns one for both. The transform
   now refuses an alternate response that declares neither a body nor a bodiless
   status.
+- `POST /workflows/{name}/start` returns `202` when a debounce, event-batch or
+  start-throttle policy defers admission, with a body that carries no
+  `execution_id`. The status was undeclared, and `throttled`, `throttle_key`
+  and `deferred_at` appeared nowhere in the contract.
+- `POST /workflows/{id}/update/{update_name}` declared only its `202`. The
+  default `wait=completed` path returns `200` with the handler output, and a
+  failed or orphaned update returns `409` with a body. Both are now declared.
+- The batch-operations dry run omitted `sample_cap`, which bounds the sample it
+  returns beside it.
 - Five alternate success responses said "same fields as the primary" in prose.
   They now carry the field list itself, so a generated client keeps
   `execution_id` on a reused start.

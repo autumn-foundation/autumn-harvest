@@ -1242,6 +1242,82 @@
             "deduplicated",
             "shard_id"
           ]
+        },
+        {
+          "status": 202,
+          "description": "The start was DEFERRED by a debounce, event-batch or start-throttle policy, so no execution exists yet and the body carries no execution_id. Exactly one of debounced, batched or throttled is true, and the remaining fields are the ones that policy reports. A batch admission that flushed immediately returns 201 with execution_id instead.",
+          "fields": [
+            {
+              "name": "debounced",
+              "type": "boolean",
+              "description": "Present and true when a debounce policy deferred the start."
+            },
+            {
+              "name": "batched",
+              "type": "boolean",
+              "description": "Present and true when an event-batch policy folded the start into a pending batch."
+            },
+            {
+              "name": "flushed",
+              "type": "boolean",
+              "description": "Batch only. False on this response; a flush returns 201."
+            },
+            {
+              "name": "throttled",
+              "type": "boolean",
+              "description": "Present and true when a start-throttle policy deferred the start."
+            },
+            {
+              "name": "workflow_name",
+              "type": "string",
+              "description": "The workflow type the deferred start names."
+            },
+            {
+              "name": "workflow_id",
+              "type": "string",
+              "description": "The business id the deferred start reserved."
+            },
+            {
+              "name": "debounce_key",
+              "type": "string",
+              "description": "Debounce only. The resolved debounce key."
+            },
+            {
+              "name": "batch_key",
+              "type": "string",
+              "description": "Batch only. The resolved batch key."
+            },
+            {
+              "name": "throttle_key",
+              "type": "string",
+              "description": "Throttle only. The resolved throttle bucket key."
+            },
+            {
+              "name": "fire_at",
+              "type": "string",
+              "description": "Debounce and batch only. When the deferred start is due, RFC 3339."
+            },
+            {
+              "name": "deferred_at",
+              "type": "string",
+              "description": "Throttle only. When the start was deferred, RFC 3339."
+            },
+            {
+              "name": "pending_count",
+              "type": "integer",
+              "description": "Debounce and batch only. How many starts are folded into this pending admission."
+            },
+            {
+              "name": "max_size",
+              "type": "integer",
+              "description": "Batch only. The batch size that triggers a flush."
+            },
+            {
+              "name": "shard_id",
+              "type": "integer",
+              "description": "Throttle only, and only for a pinned start. The shard the deferred start is placed on (issue #697)."
+            }
+          ]
         }
       ],
       "error_responses": [
@@ -2649,6 +2725,49 @@
         "note": "Returns 202 Accepted when wait=admitted (update durably recorded); returns 200 OK with outcome when wait=completed (default).",
         "free_form": true
       },
+      "additional_responses": [
+        {
+          "status": 200,
+          "description": "wait=completed (the default): the update ran to completion and its handler output is returned.",
+          "fields": [
+            {
+              "name": "update_id",
+              "type": "string",
+              "description": "The update id."
+            },
+            {
+              "name": "output",
+              "description": "The update handler's return value, any JSON."
+            }
+          ]
+        },
+        {
+          "status": 409,
+          "description": "wait=completed: the update failed, was rejected by the handler, or was orphaned by a workflow that reached a terminal state first. A failure carries error; an orphan carries error_type and workflow_state.",
+          "fields": [
+            {
+              "name": "update_id",
+              "type": "string",
+              "description": "The update id."
+            },
+            {
+              "name": "error",
+              "type": "string",
+              "description": "Handler failure or rejection message. Absent on an orphaned update."
+            },
+            {
+              "name": "error_type",
+              "type": "string",
+              "description": "Orphan classification. Present only when the workflow went terminal first."
+            },
+            {
+              "name": "workflow_state",
+              "type": "string",
+              "description": "The terminal workflow state that orphaned the update."
+            }
+          ]
+        }
+      ],
       "error_responses": [
         {
           "status": 400,
@@ -4034,6 +4153,11 @@
             {
               "name": "sample",
               "description": "A sample of the matched executions."
+            },
+            {
+              "name": "sample_cap",
+              "type": "integer",
+              "description": "The global sample cap the sample was bounded by."
             },
             {
               "name": "sample_truncated",
