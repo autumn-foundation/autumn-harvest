@@ -344,7 +344,12 @@ TODO_RE = re.compile(
 )
 # A tracking reference: an issue number, or a URL with somewhere to go.
 # `https?://` alone identifies nothing, and CH002 accepted it as tracking.
-TODO_REF_RE = re.compile(r"#\d+|https?://\S")
+# An issue number is POSITIVE and unpadded, the way the tracker writes it.
+# `#0` routes nowhere -- numbering starts at one -- so it is a placeholder,
+# which is the state CH002 exists to refuse. All three reference patterns
+# say the same thing, because a marker may carry its reference forward, in
+# a citation, or on its left.
+TODO_REF_RE = re.compile(r"#[1-9]\d*|https?://\S")
 # A sentence boundary, with every clause `SENTENCE_SPLIT_RE` carries and no
 # others: terminal punctuation, then any emphasis markers, then a SPACE or
 # the end of the text. Both other clauses are load-bearing. The abbreviation
@@ -373,14 +378,14 @@ SENTENCE_END_RE = re.compile(
 # retries. (#123)". A citation is part of the sentence it cites, so that
 # sentence ends after the citation, not at the period in front of it.
 TRAILING_REF_RE = re.compile(
-    r"[ \t]*[(\[][^)\]]*(?:#\d+|https?://[^)\]\s]+)[^)\]]*[)\]]"
+    r"[ \t]*[(\[][^)\]]*(?:#[1-9]\d*|https?://[^)\]\s]+)[^)\]]*[)\]]"
 )
 # A reference that ABUTS the marker on its left. Anchored at the end, and
 # opened either at the bound or at a clause separator, so "See #123 for the
 # parser. TODO: x" is still untracked while "#123 - TODO: x" is not.
 ADJACENT_REF_RE = re.compile(
     r"(?:^|[;.,(\[])[\s\-\u2010-\u2015:]*"
-    r"(#\d+|https?://\S+)"
+    r"(#[1-9]\d*|https?://\S+)"
     r"[\s\-\u2010-\u2015:;,]*$"
 )
 
@@ -4442,6 +4447,26 @@ RULE_TESTS = [
         "// TODO: see https://x.test/i/9\n",
         set(),
         "but a URL with a destination does",
+    ),
+    (
+        "// TODO: add retries #0\n",
+        {("CH002", 1)},
+        "and neither does issue zero, which numbering never reaches",
+    ),
+    (
+        "// TODO: add retries. (#000)\n",
+        {("CH002", 1)},
+        "in a citation as well as in the text",
+    ),
+    (
+        "// #0 - TODO: add retries\n",
+        {("CH002", 1)},
+        "and on the marker's left, where the third pattern reads it",
+    ),
+    (
+        "// TODO: add retries #10\n",
+        set(),
+        "but a zero inside a real number is a digit",
     ),
     (
         "//! One.\n//!\n//! Two.\n#![allow(dead_code)]\n//!\n//! Three.\n",

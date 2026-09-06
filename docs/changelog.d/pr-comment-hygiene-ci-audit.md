@@ -2751,3 +2751,18 @@ kept version splices the spans, and the run is 23.1 s against 22.9 s
 before.
 
 Corpus effect: none. Six fixtures.
+
+### Round eighty-nine — a reference that routes nowhere
+
+One finding. `// TODO: add retries #0` passed the absolute gate. Issue
+numbering starts at one, so `#0` is a placeholder rather than a
+reference, and a placeholder is the state CH002 exists to refuse.
+
+Three patterns recognise a reference, because a marker may carry one
+forward, inside a citation, or on its left, and all three read `#\d+`.
+The finding named one; all three are fixed, and each has its own
+fixture. An issue number is `#[1-9]\d*` now -- positive and unpadded,
+the way the tracker writes it, so `#000` and `#012` are refused with
+`#0` while `#10` and `#100` are untouched.
+
+Corpus effect: none. Four fixtures.
