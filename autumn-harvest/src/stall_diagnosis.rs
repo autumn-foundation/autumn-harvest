@@ -1212,20 +1212,21 @@ pub fn classify_workflow_task(facts: &WorkflowTaskFacts) -> Option<BlockedOn> {
 /// `persist_activity_wait_park`, `persist_scheduled_activities`,
 /// `persist_all_started_child_workflows` and `persist_scheduled_external_activity`
 /// — discards the armed deadline (`_min_fires_at`) and parks the task on the
-/// thing being awaited. Only `persist_started_timer` calls
-/// [`crate::queue::reschedule_task`] with the deadline, handing the timer
-/// ownership of the wake. A timer armed alongside any of those other waits
-/// therefore goes overdue *as a matter of course* while the wait runs, and fires
-/// on that wait's completion wake — a healthy run, not a stall.
+/// thing being awaited. Only a call to [`crate::queue::reschedule_task`]
+/// hands a timer ownership of the wake — `persist_started_timer` and its
+/// mixed-signal/child-race siblings, never a plain park. A timer armed
+/// alongside any of the park paths above therefore goes overdue *as a
+/// matter of course* while the wait runs. It fires on that wait's
+/// completion wake instead — a healthy run, not a stall.
 ///
 /// The distinguishing fact is the workflow task row itself:
 ///   * **claimed** — the handler is executing right now, so nothing was missed.
 ///   * **parked** (`RUNNING`, NULL worker) — some other wake owns this run; the
 ///     timer is a passenger and its overdue row is expected.
 ///   * **`PENDING`** — the row is due to be claimed at `scheduled_at`. Only
-///     `persist_started_timer` sets that to a deadline, so a `PENDING` row whose
-///     own `scheduled_at` is past the grace window is USUALLY a genuinely
-///     missed wake.
+///     [`crate::queue::reschedule_task`] sets that to a deadline, so a
+///     `PENDING` row whose own `scheduled_at` is past the grace window is
+///     USUALLY a genuinely missed wake.
 ///
 /// That last case is necessary but not sufficient (issue #1191).
 /// `wake_workflow_task` also re-pends a PARKED row to this same `PENDING`
@@ -1257,23 +1258,28 @@ pub fn workflow_wake_was_missed(task: Option<&WorkflowTaskFacts>, now: DateTime<
 /// Tolerance for matching the workflow task's `scheduled_at` against a
 /// timer's `fires_at` (issue #1191).
 ///
-/// `persist_started_timer` sets `scheduled_at` to the timer's own deadline via
-/// `queue::reschedule_task`, with no skew applied. Every other re-pend source
-/// backdates `scheduled_at` from the wake instant instead
+/// `queue::reschedule_task` sets `scheduled_at` to the exact deadline it is
+/// given, with no skew applied. `wake_workflow_task`'s re-pend backdates
+/// `scheduled_at` from the wake instant instead
 /// (`queue::IMMEDIATE_SCHEDULE_SKEW_ALLOWANCE`, 5 seconds) — an unrelated
-/// timestamp. This tolerance stays well under that skew, so a genuine
-/// timer-owned match and an unrelated wake-instant repend cannot be confused.
-const TIMER_OWNERSHIP_TOLERANCE_SECONDS: i64 = 5;
+/// timestamp. That skew is also 5 seconds. So this tolerance is kept
+/// strictly smaller than it, not merely equal to it. An exact match still
+/// passes. A wake-instant repend needs an armed timer within roughly a
+/// `2 * TIMER_OWNERSHIP_TOLERANCE_SECONDS` window of the true wake instant
+/// to be confused for one. That is an implausible coincidence, not a
+/// structural one.
+const TIMER_OWNERSHIP_TOLERANCE_SECONDS: i64 = 2;
 
 /// Does the timer at `fires_at` own the workflow task's current wake?
 ///
 /// The proof [`workflow_wake_was_missed`] cannot give on its own. Task
 /// state and `scheduled_at` are identical whether a timer or an unrelated
-/// wake source re-pended the row. Only `persist_started_timer` sets
-/// `scheduled_at` to a timer's own deadline. A close match is therefore
-/// direct evidence this timer set it. An unrelated wake source backdates
-/// `scheduled_at` from a different, unrelated instant. It therefore matches
-/// no armed timer's `fires_at`, except by implausible coincidence.
+/// wake source re-pended the row. Only [`crate::queue::reschedule_task`]
+/// sets `scheduled_at` to a timer's own deadline. A close match is
+/// therefore direct evidence this timer set it. An unrelated wake source
+/// backdates `scheduled_at` from a different, unrelated instant. It
+/// therefore matches no armed timer's `fires_at`, except by implausible
+/// coincidence.
 #[must_use]
 fn timer_owns_the_wake(scheduled_at: DateTime<Utc>, fires_at: DateTime<Utc>) -> bool {
     (scheduled_at - fires_at).num_seconds().abs() <= TIMER_OWNERSHIP_TOLERANCE_SECONDS
@@ -1403,14 +1409,14 @@ pub fn classify_execution(inputs: &DiagnosisInputs, now: DateTime<Utc>) -> Optio
     // an unfired timer past its deadline is only a wedge when that timer is what
     // the workflow task is actually scheduled to wake for.
     //
-    // Only `persist_started_timer` hands a timer that ownership, by calling
-    // `queue::reschedule_task(task_id, fires_at)`. Every other persist path —
-    // `persist_signal_wait_park`, `persist_mutex_acquire_park`,
-    // `persist_activity_wait_park`, `persist_scheduled_activities`,
-    // `persist_all_started_child_workflows`, `persist_scheduled_external_activity`
-    // — discards the armed deadline (`_min_fires_at`) and parks the task on the
-    // thing being awaited, so a timer armed alongside that wait goes overdue as a
-    // matter of course and fires on the wait's completion wake. Reporting such a
+    // Only a call to `queue::reschedule_task(task_id, fires_at)` hands a
+    // timer that ownership. Six paths never call it: `persist_signal_wait_park`,
+    // `persist_mutex_acquire_park`, `persist_activity_wait_park`,
+    // `persist_scheduled_activities`, `persist_all_started_child_workflows`,
+    // `persist_scheduled_external_activity`. Each discards the armed deadline
+    // (`_min_fires_at`) instead, and parks the task on the thing being
+    // awaited. So a timer armed alongside that wait goes overdue as a matter
+    // of course. It fires on the wait's completion wake. Reporting such a
     // healthy run as `timer_overdue`/`stalled` would be a false positive, the one
     // failure mode this endpoint must never have: it sends an operator chasing a
     // non-problem.
@@ -3467,6 +3473,82 @@ mod tests {
         assert_eq!(verdict.health(), ExecutionHealth::Healthy, "{verdict:?}");
     }
 
+    /// Wiring-level pin: `classify_execution` must use the real
+    /// `TIMER_OWNERSHIP_TOLERANCE_SECONDS` constant, not some looser
+    /// threshold, and must accept a match exactly at its boundary.
+    #[test]
+    fn overdue_timer_correlates_at_exactly_the_tolerance_boundary() {
+        let inputs = DiagnosisInputs {
+            timers: vec![PendingTimerFacts {
+                fires_at: t(-600 - TIMER_OWNERSHIP_TOLERANCE_SECONDS),
+            }],
+            workflow_task: Some(WorkflowTaskFacts {
+                scheduled_at: t(-600),
+                ..wf_task()
+            }),
+            ..Default::default()
+        };
+        let verdict =
+            classify_execution(&inputs, t(0)).expect("non-terminal execution must yield a verdict");
+        assert_eq!(verdict.kind(), "timer_overdue", "{verdict:?}");
+        assert_eq!(verdict.health(), ExecutionHealth::Stalled, "{verdict:?}");
+    }
+
+    /// The complement: one second past the tolerance, wired end to end, not
+    /// only in [`timer_owns_the_wake_truth_table`]'s isolated check.
+    #[test]
+    fn overdue_timer_does_not_correlate_one_second_past_the_tolerance() {
+        let inputs = DiagnosisInputs {
+            timers: vec![PendingTimerFacts {
+                fires_at: t(-600 - TIMER_OWNERSHIP_TOLERANCE_SECONDS - 1),
+            }],
+            workflow_task: Some(WorkflowTaskFacts {
+                scheduled_at: t(-600),
+                ..wf_task()
+            }),
+            ..Default::default()
+        };
+        let verdict =
+            classify_execution(&inputs, t(0)).expect("non-terminal execution must yield a verdict");
+        assert_ne!(verdict.kind(), "timer_overdue", "{verdict:?}");
+    }
+
+    /// Two armed timers: an EARLIER one that does not own the wake, and a
+    /// LATER one that does. `classify_execution` must filter by ownership
+    /// before picking the earliest overdue candidate. Otherwise the earlier,
+    /// non-owning timer would win by `min_by_key(fires_at)` alone, and
+    /// reintroduce the issue #1191 false positive.
+    #[test]
+    fn overdue_timer_correlation_wins_over_an_earlier_non_owning_timer() {
+        let inputs = DiagnosisInputs {
+            timers: vec![
+                // Earlier, and overdue, but unrelated to this wake.
+                PendingTimerFacts {
+                    fires_at: t(-1_200),
+                },
+                // Later, but the one that actually owns the wake.
+                PendingTimerFacts { fires_at: t(-600) },
+            ],
+            workflow_task: Some(WorkflowTaskFacts {
+                scheduled_at: t(-600),
+                ..wf_task()
+            }),
+            ..Default::default()
+        };
+        let verdict =
+            classify_execution(&inputs, t(0)).expect("non-terminal execution must yield a verdict");
+        match verdict {
+            BlockedOn::TimerOverdue { fires_at, .. } => {
+                assert_eq!(
+                    fires_at,
+                    t(-600),
+                    "must report the OWNING timer: {fires_at:?}"
+                );
+            }
+            other => panic!("expected timer_overdue naming the owning timer, got {other:?}"),
+        }
+    }
+
     #[test]
     fn overdue_timer_suppressed_while_a_worker_holds_the_claim() {
         // A worker is on the decision cycle right now; it ingests due timers
@@ -3558,7 +3640,7 @@ mod tests {
     /// Issue #1191's new discriminator, in isolation from the ladder it feeds.
     #[test]
     fn timer_owns_the_wake_truth_table() {
-        // Exact match: `persist_started_timer` sets scheduled_at = fires_at.
+        // Exact match: `queue::reschedule_task` sets scheduled_at = fires_at.
         assert!(timer_owns_the_wake(t(-600), t(-600)));
         // Within tolerance either side -- DB round-trip precision, not a
         // different wake source.
