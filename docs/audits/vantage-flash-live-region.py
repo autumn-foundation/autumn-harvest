@@ -56,21 +56,32 @@ UI_RS = Path(__file__).resolve().parents[2] / "autumn-harvest-plugin" / "src" / 
 # "flash" as a token, in either form, at any position, catches all of them.
 DIV_OPEN = re.compile(r"\bdiv\b[^{]*\{")
 
-# A whole class token, not a prefix of a longer name: `.flash` matches in
-# `div.flash` and `div.notice.flash`, but `(?![\w-])` stops it from also
-# matching the unrelated `div.flashback`. Chained classes still match
-# because the character after "flash" there is `.`, not a word character
-# or hyphen.
-CHAINED_FLASH_CLASS = re.compile(r'\.flash(?![\w-])|\."flash"')
-# Maud reads a Rust token stream, not raw text, so whitespace around `=` in
-# any attribute (`class = "flash"`, `role = "status"`) is as valid as the
-# tight form and `cargo fmt` does not normalize it away inside a macro body
-# -- `\s*=\s*` here and in ROLE/FOCUS_ON_LOAD tolerates both.
-CLASS_ATTR = re.compile(r'class\s*=\s*"([^"]*)"')
+# Maud's chained-class shorthand (`div.notice.flash`, `."quoted-name"`) can
+# only appear contiguously right after `div`, before any space-separated
+# attribute begins -- so anchoring at `^div` and consuming only that run
+# means a `.flash`-shaped substring sitting inside some *other* attribute's
+# quoted value (e.g. `div title=".flash"`) is never reached at all, with no
+# need to reason about quoting.
+CHAINED_PREFIX = re.compile(r'^div((?:\.[\w-]+|\."[^"]*")*)')
+CHAINED_SEGMENT = re.compile(r'\.([\w-]+)|\."([^"]*)"')
+# `(?<![\w-])` requires a real attribute boundary before "class", so
+# `data-class="flash"` (an unrelated attribute) doesn't match. Maud reads a
+# Rust token stream, not raw text, so whitespace around `=` (`class =
+# "flash"`) is as valid as the tight form and `cargo fmt` does not
+# normalize it away inside a macro body -- `\s*=\s*` here and in
+# ROLE/FOCUS_ON_LOAD tolerates both.
+CLASS_ATTR = re.compile(r'(?<![\w-])class\s*=\s*"([^"]*)"')
+
+
+def chained_class_tokens(tag_text: str) -> list[str]:
+    m = CHAINED_PREFIX.match(tag_text)
+    if not m:
+        return []
+    return [seg.group(1) or seg.group(2) for seg in CHAINED_SEGMENT.finditer(m.group(1))]
 
 
 def is_flash_div(tag_text: str) -> bool:
-    if CHAINED_FLASH_CLASS.search(tag_text):
+    if "flash" in chained_class_tokens(tag_text):
         return True
     m = CLASS_ATTR.search(tag_text)
     return bool(m) and "flash" in m.group(1).split()
