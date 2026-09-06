@@ -1507,18 +1507,17 @@ from the benchmark are directly comparable.
     on), without asserting a range, a frequency, or a direction (e.g.
     "always positive") for runs whose evidence no longer exists in the
     repository to audit. An earlier revision of this page's real-drain
-    figures and buffer deltas used a seeding confound instead: the two
-    labels had been seeded with independently-random `id`/`activity_id`
-    values, and since every claim's non-HOT `UPDATE`
+    figures and buffer deltas used a confounded seeding methodology
+    instead: the two labels had been seeded with independently-random
+    `id`/`activity_id` values, and since every claim's non-HOT `UPDATE`
     touches every applicable index on the table, not just the one this
-    predicate adds, some of what had looked like a `schedule_to_close_at` effect on the
-    main query and the 100,000-row plan choice turned out to be that
-    confound instead — see that page's "Workload" section for the fix. That
-    earlier revision's own artifacts are no longer committed (the repro
-    script overwrites the same canonical filenames every run), so this page
-    does not cite its pre-fix percentages; the still-auditable evidence that
-    the confound mattered is the plan flip described next. The
-    committed run now shows the two labels landing on *different* plans at
+    predicate adds, some of what had looked like a `schedule_to_close_at`
+    effect on the main query may have been that confound instead — see
+    that page's "Workload" section for the fix. That earlier revision's
+    own artifacts are no longer committed (the repro script overwrites
+    the same canonical filenames every run), so this page does not cite
+    its pre-fix percentages or draw a magnitude conclusion from the
+    comparison. The committed run now shows the two labels landing on *different* plans at
     the 100,000-row depth, with the expensive one on `no-schedule-to-close`
     this time (an earlier, since-superseded committed run had neither
     label on the expensive plan, so this is the only committed data point

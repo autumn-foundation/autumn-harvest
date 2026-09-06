@@ -273,9 +273,17 @@ real-drain aggregate itself -- its own artifacts are not committed (see
 for why). The 100,000-row `EXPLAIN` comparison, which happened to land on the
 same (`Seq Scan`) plan for both labels in the pre-fix committed run, landed
 on *different* plans for the two labels once re-run with this fix (see
-[100,000-row plan choice](#100000-row-plan-choice)) -- direct evidence that
-at least part of what this page previously reported as the
-`schedule_to_close_at` effect was really this seeding confound. The
+[100,000-row plan choice](#100000-row-plan-choice)). Codex review on PR
+#1339 caught that an earlier revision of this sentence treated that plan
+change as direct evidence the seeding confound caused the earlier result --
+this page does not claim that: as
+[100,000-row plan choice](#100000-row-plan-choice) explains, populating
+`schedule_to_close_at` itself changes the planner's row-count estimate for
+this same candidate scan, and `ANALYZE` sampling can independently flip a
+planner choice this close between any two runs, seeding fix or not. This
+recapture establishes only that a different plan was chosen after the fix,
+not which input -- the seeding confound, the predicate's own effect on
+planner inputs, or sampling noise -- caused that choice. The
 1,000-/10,000-row `EXPLAIN` deltas, by contrast, reproduced byte-identical
 before and after this fix.
 
@@ -354,6 +362,23 @@ page here (page-crossing effects from row width show up on the *scan* side
 below, where row count per page is what changes, not on a single-row
 `UPDATE`'s own write). A fixed one-page write matches a B-tree leaf-page
 insert into `harvest_task_queue_schedule_to_close_idx`.
+
+Codex review on PR #1339 raised a fair concern here: the `Update` node's
+own `Buffers` line is one aggregate across every relation it touches, so
+it cannot, by itself, prove the +1 dirtied/+1 written delta is the index
+rather than some heap-width contribution -- `schedule-to-close`'s row
+genuinely is 8 bytes wider, and the [Write-side
+cost](#write-side-cost) corroboration confirms a real heap-width effect
+elsewhere (250 vs. 263 pages after the same 10,000-row batch). That same
+corroboration rules out heap width as *this* delta's mechanism, though:
+13 extra heap pages across 10,000 claims is roughly one extra heap page
+needed every ~770 claims, not every claim -- a rare, occasional effect,
+not the deterministic +1 dirtied/+1 written this page measures at every
+depth on every run. A per-claim index insert, by contrast, dirties its
+target leaf page unconditionally on every single claim, whether or not
+that page needs to grow -- the mechanism that actually predicts a
+constant +1/+1, which is why this page attributes the delta to the index
+rather than to row width.
 
 **This table's own percentages (+25% dirtied, +50% written) are real, but
 this page does not apply the 20% impact floor to them, and says so
