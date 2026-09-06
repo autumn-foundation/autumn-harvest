@@ -406,10 +406,15 @@ TRAILING_REF_RE = re.compile(
 # A reference that ABUTS the marker on its left. Anchored at the end, and
 # opened either at the bound or at a clause separator, so "See #123 for the
 # parser. TODO: x" is still untracked while "#123 - TODO: x" is not.
+#
+# A citation is BRACKETED as often as it is bare, and the opener was
+# admitted while the closer was not, so "(#123)" above a marker failed the
+# build. The two ends are one notation: a `)` or `]` after the reference is
+# punctuation around it, exactly as the `(` or `[` before it is.
 ADJACENT_REF_RE = re.compile(
     r"(?:^|[;.,(\[])[\s\-\u2010-\u2015:]*"
     r"(#[1-9]\d*|https?://" + URL_HOST + r"\S*)"
-    r"[\s\-\u2010-\u2015:;,]*$"
+    r"[\s\-\u2010-\u2015:;,)\]]*$"
 )
 
 
@@ -4587,6 +4592,21 @@ RULE_TESTS = [
         "// #123\n// TODO: remove the fallback\n",
         set(),
         "a reference on the line ABOVE tracks the marker below it",
+    ),
+    (
+        "// (#123)\n// TODO: remove the fallback\n",
+        set(),
+        "bracketed there as readily as bare",
+    ),
+    (
+        "// (#123) TODO: remove the fallback\n",
+        set(),
+        "and on the same line, which is the same notation",
+    ),
+    (
+        "// See (#123) for the parser.\n// TODO: remove the fallback\n",
+        {("CH002", 2)},
+        "but a bracketed reference inside prose still does not abut",
     ),
     (
         "// https://x.test/i/9\n// TODO: remove the fallback\n",

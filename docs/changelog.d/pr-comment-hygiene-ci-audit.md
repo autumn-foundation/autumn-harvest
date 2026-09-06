@@ -2909,3 +2909,26 @@ Corpus effect: none, which for a widened absolute gate is the number that
 matters -- no comment in this tree newly reads as code.
 
 Six fixtures, two of them counter-cases.
+
+### Round ninety-five — one notation, read from both ends
+
+One finding, a Tier A false positive. `// (#123)` over
+`// TODO: remove the fallback` failed the build, and so did the same
+association on one line.
+
+`ADJACENT_REF_RE` admitted `(` or `[` before the reference and neither
+closer after it. The two ends are one notation: a `)` or `]` following a
+reference is punctuation around it, exactly as the bracket in front is.
+The closers join the trailing separator class.
+
+Round 90 saw this while carrying a wrapped reference backwards, judged it
+symmetric with the same-line behaviour, and left it. It was symmetric --
+both forms were wrong. The rule this round confirms is the one round 91
+already wrote down: a known edge on an absolute gate is a finding waiting
+to be filed.
+
+Counter-cases hold: prose above the marker still does not abut it, issue
+zero and a bare scheme are still not references, and the trailing
+citation pattern is untouched.
+
+Corpus effect: none. Three fixtures.
