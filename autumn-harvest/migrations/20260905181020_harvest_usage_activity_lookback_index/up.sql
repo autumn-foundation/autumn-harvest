@@ -83,10 +83,36 @@
 -- operation that does not rescan data. One query generates the per-partition
 -- statements throughout, rather than hand-listing them (partitions are
 -- cohort-named and opened over time -- `partition::partition_name`) --
--- filtered to leaves that don't already have the index (verified: it returns
--- only the missing ones), so the SAME query serves both the initial pass and
--- the convergence loop below:
+-- filtered to leaves that don't already have a VALID matching index
+-- (verified: it returns only the missing/invalid ones), so the SAME query
+-- serves both the initial pass and the convergence loop below.
 --
+-- Checking `indisvalid`, not just presence, matters (Codex review, PR #1381,
+-- round 6): `partition.rs`'s own conversion plan documents this exact trap --
+-- a cancelled or failed `CREATE INDEX CONCURRENTLY` leaves the index behind,
+-- INVALID, and `IF NOT EXISTS` alone reports success on a re-run without
+-- looking at `indisvalid`, so the invalid index survives to the parent step,
+-- which cannot reuse it and builds a replacement non-concurrently. Matching
+-- by EXACT generated name, not a `LIKE` substring against the index
+-- definition, also matters: a `LIKE` match cannot tell this index apart from
+-- an unrelated one whose definition text happens to contain the same
+-- substring. Run the cleanup pass first, so a lingering invalid index (which
+-- `CREATE INDEX ... IF NOT EXISTS` would otherwise treat as already
+-- satisfied, by the same name-collision trap) is gone before the build pass
+-- tries to replace it:
+--
+--   -- cleanup: drop any invalid leftover under this index's own name pattern.
+--   -- A plain (non-CONCURRENTLY) DROP on an invalid index is a catalog-only
+--   -- change with no readers to wait for (see partition.rs's own precedent).
+--   SELECT format('DROP INDEX CONCURRENTLY IF EXISTS %I;', ic.relname)
+--   FROM pg_index i
+--   JOIN pg_class ic ON ic.oid = i.indexrelid
+--   JOIN pg_class child ON child.oid = i.indrelid
+--   JOIN pg_inherits ON pg_inherits.inhrelid = child.oid
+--   WHERE pg_inherits.inhparent = 'harvest_events'::regclass
+--     AND ic.relname LIKE 'idx_%_activity_started_lookup'
+--     AND NOT i.indisvalid;
+--   -- review and run the generated statements, THEN generate the builds:
 --   SELECT format(
 --       'CREATE INDEX CONCURRENTLY IF NOT EXISTS %I ON %I ' ||
 --       '(workflow_exec_id, (event_data #>> ''{data,activity_id}''), timestamp) ' ||
@@ -100,8 +126,10 @@
 --   WHERE parent.oid = 'harvest_events'::regclass
 --     AND NOT EXISTS (
 --         SELECT 1 FROM pg_index i
+--         JOIN pg_class ic ON ic.oid = i.indexrelid
 --          WHERE i.indrelid = child.oid
---            AND pg_get_indexdef(i.indexrelid) LIKE '%activity_started_lookup%'
+--            AND ic.relname = 'idx_' || child.relname || '_activity_started_lookup'
+--            AND i.indisvalid
 --     );
 --   -- review and run the generated statements, THEN:
 --   CREATE INDEX IF NOT EXISTS idx_harvest_events_activity_started_lookup
@@ -109,11 +137,13 @@
 --       WHERE event_type = 'ActivityStarted';
 --
 -- **Partition-maintenance race (Codex review, PR #1381, rounds 2-3):** a
--- single pass through the generator above narrows the window a new partition
--- can slip through but does not close it. Re-run the SAME generator query in
--- a LOOP immediately before the parent statement, with no operator delay in
--- between, until it returns zero rows, THEN run the parent statement right
--- away -- but a partition appearing in that window is NOT guaranteed to be
+-- single pass through the cleanup and build generators above narrows the
+-- window a new partition can slip through but does not close it. Re-run
+-- BOTH generator queries, in that order (cleanup, then build), in a LOOP
+-- immediately before the parent statement, with no operator delay in
+-- between, until the build generator returns zero rows, THEN run the parent
+-- statement right away -- but a partition appearing in that window is NOT
+-- guaranteed to be
 -- empty, and an earlier draft of this comment claimed it was; that claim was
 -- wrong and is retracted here. Two things can create a partition:
 --
