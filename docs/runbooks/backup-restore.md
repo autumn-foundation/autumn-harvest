@@ -271,6 +271,21 @@ ack, it refuses; with the ack, it still only reads.
     is absent counts as ordinary retention (the predecessor's seal and the
     successor's insert are one transaction, so an absent successor was
     terminal); a successor that is still `RUNNING` is a genuine rollback.
+  - A recorded child terminal, or a delivered external effect, whose target
+    execution row is gone entirely has two possible causes: ordinary
+    retention, or the target shard restored to a point BEFORE the target ever
+    existed (a genuine break). A `harvest_execution_summaries` row for the
+    target is durable proof of the first; without one, the reference is
+    reported as `retention_unproven` (`undetermined`, exit 2) rather than
+    assumed benign. Summaries are opt-in (issue #752): a fleet that does not
+    write them sees this on any restore where such a reference exists, which
+    is the honest answer, not a false `clean`.
+  - A `*Requested`/`ChildWorkflowStarted` event naming a **pre-sharding**
+    (unencoded) target id is checked on the fleet's configured
+    `--default-shard` (default `0`), matching every runtime routing path
+    (`ShardRouter`, `ShardedDbPool`) — never on whichever `--shard` happens to
+    observe the reference. Pass `--default-shard` explicitly whenever your
+    fleet's default shard is not `0`.
 
   This scan **pages** through complete owner groups rather than truncating at
   `--probe-limit`, so a fleet larger than one page still gets a definitive
@@ -332,6 +347,14 @@ A workflow type with no registered handler is still skipped, never called a
 divergence — so a partially-registered replayer degrades honestly too. Check the
 `replay:` line before treating any `clean` verdict as covering workflow code.
 
+`replay_verified` is `true` only when at least one history actually replayed
+**and none of the sampled histories were unreadable**. A history selected for
+replay but never read back (`history_unreadable`, advisory-severity — it does
+not fail the drill) is a coverage gap, not a declared skip, so it must not
+read as "check (a) ran clean". A report with some clean replays and some
+unreadable histories prints `replay: PARTIALLY VERIFIED`, distinct from both
+the fully-verified and the not-verified-at-all cases.
+
 ---
 
 ## 5. Reading the report
@@ -352,7 +375,7 @@ Four verdicts map onto those:
 | `clean` | 0 | Start workers. |
 | `resumable_with_reclaim` | 0 | Start workers. Expect the listed reclaim on the first scanner tick. |
 | `incoherent` | 1 | Do not start workers. Restore from a different point and re-verify. |
-| `unavailable` | 2 | Fix the cause (unreachable shard, or `probe_failed` — usually a restore that produced an **unmigrated or empty** database) and re-run. |
+| `unavailable` | 2 | Fix the cause (unreachable shard, `probe_failed` — usually a restore that produced an **unmigrated or empty** database — or `retention_unproven`, see §4.2(c)) and re-run. |
 
 **Why `undetermined` outranks everything, including `incoherent`:** a probe that
 could not run found nothing *because it did not look*. The canonical case is a

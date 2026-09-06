@@ -662,6 +662,102 @@ async fn detects_cross_shard_child_execution_missing() {
     assert_eq!(report.status, VerifyStatus::Incoherent);
 }
 
+/// Issue #1205 finding 2. An `ExecutionId::new()` (pre-sharding, UNENCODED)
+/// target must be checked on the fleet's configured DEFAULT shard. This
+/// matches every runtime routing path (`ShardRouter::shard_for_execution`,
+/// `ShardedDbPool::pool_for_execution`), not whichever shard happens to be
+/// observing the reference. The child here lives on shard 0. The parent is
+/// observed on shard 1. Only routing the sentinel to the default shard (0)
+/// finds it.
+#[tokio::test]
+async fn an_unencoded_child_target_is_checked_on_the_default_shard() {
+    let (url0, _c0) = setup().await;
+    let (url1, _c1) = setup().await;
+
+    let parent = ExecutionId::new_for_shard(ShardId::new(1));
+    let child = ExecutionId::new();
+
+    let mut b = connect(&url1).await;
+    seed_execution(&mut b, parent, "parent_flow", "pf-unenc-1", "RUNNING", 1).await;
+    append_event(&mut b, parent, 1, "WorkflowStarted", json!({ "input": {} })).await;
+    append_event(
+        &mut b,
+        parent,
+        2,
+        "ChildWorkflowStarted",
+        json!({ "child_id": child.to_string(), "workflow_name": "child_flow", "input": {} }),
+    )
+    .await;
+
+    let mut a = connect(&url0).await;
+    seed_execution(&mut a, child, "child_flow", "cf-unenc-1", "RUNNING", 0).await;
+
+    let targets = vec![ShardTarget::new(0, &url0), ShardTarget::new(1, &url1)];
+    let report = verify_restore(
+        &targets,
+        &opts().with_default_shard(0),
+        &WorkflowReplayer::new(),
+    )
+    .await;
+
+    assert!(
+        !report.detected(FindingClass::ChildExecutionMissing),
+        "an unencoded id must resolve to the fleet's default shard, not the observer: {report:#?}"
+    );
+}
+
+/// The option must actually be consulted, not merely happen to match because
+/// the default shard is `0`. With `default_shard` pointed at the WRONG shard
+/// the same fixture reproduces the original false positive, proving the value
+/// is live rather than ignored.
+#[tokio::test]
+async fn default_shard_option_changes_which_shard_is_checked() {
+    let (url0, _c0) = setup().await;
+    let (url1, _c1) = setup().await;
+
+    let parent = ExecutionId::new_for_shard(ShardId::new(0));
+    let child = ExecutionId::new();
+
+    let mut a = connect(&url0).await;
+    seed_execution(&mut a, parent, "parent_flow", "pf-unenc-2", "RUNNING", 0).await;
+    append_event(&mut a, parent, 1, "WorkflowStarted", json!({ "input": {} })).await;
+    append_event(
+        &mut a,
+        parent,
+        2,
+        "ChildWorkflowStarted",
+        json!({ "child_id": child.to_string(), "workflow_name": "child_flow", "input": {} }),
+    )
+    .await;
+
+    let mut b = connect(&url1).await;
+    seed_execution(&mut b, child, "child_flow", "cf-unenc-2", "RUNNING", 1).await;
+
+    let targets = vec![ShardTarget::new(0, &url0), ShardTarget::new(1, &url1)];
+
+    let right = verify_restore(
+        &targets,
+        &opts().with_default_shard(1),
+        &WorkflowReplayer::new(),
+    )
+    .await;
+    assert!(
+        !right.detected(FindingClass::ChildExecutionMissing),
+        "default_shard=1 must route the unencoded child to shard 1: {right:#?}"
+    );
+
+    let wrong = verify_restore(
+        &targets,
+        &opts().with_default_shard(0),
+        &WorkflowReplayer::new(),
+    )
+    .await;
+    assert!(
+        wrong.detected(FindingClass::ChildExecutionMissing),
+        "a default_shard that does not match the fleet must reproduce the original bug: {wrong:#?}"
+    );
+}
+
 /// A torn claim pair (`fire_claim_token` set, `fire_claimed_until` NULL) is
 /// PERMANENTLY wedged, not merely expired: the scheduler's claim predicate is
 /// `fire_claim_token IS NULL OR fire_claimed_until < NOW()`, which such a row
@@ -1181,6 +1277,156 @@ async fn a_delivered_external_signal_with_a_queued_row_is_clean() {
         !report.detected(FindingClass::ExternalEffectRolledBack),
         "a queued signal row is the trace the delivery asserts: {report:#?}"
     );
+}
+
+/// Issue #1205 finding 3. An absent target for a recorded child terminal has
+/// two causes the verifier could not tell apart. One is ordinary retention.
+/// The other is a genuine pre-creation rollback: the target shard was
+/// restored to a point before the child ever existed. Folding both into a
+/// silent pass hides the second, real case. With no
+/// `harvest_execution_summaries` row to prove retention, the honest verdict
+/// is `Undetermined`, not a pass.
+#[tokio::test]
+async fn an_absent_child_terminal_target_without_a_summary_is_undetermined() {
+    let (url_a, _ca) = setup().await;
+    let (url_b, _cb) = setup().await;
+    let mut a = connect(&url_a).await;
+
+    let parent = ExecutionId::new_for_shard(ShardId::new(0));
+    let child = ExecutionId::new_for_shard(ShardId::new(1));
+
+    seed_execution(&mut a, parent, "parent_flow", "pf-sum-1", "RUNNING", 0).await;
+    append_event(&mut a, parent, 1, "WorkflowStarted", json!({ "input": {} })).await;
+    append_event(
+        &mut a,
+        parent,
+        2,
+        "ChildWorkflowStarted",
+        json!({ "child_id": child.to_string(), "workflow_name": "child_flow", "input": {} }),
+    )
+    .await;
+    append_event(
+        &mut a,
+        parent,
+        3,
+        "ChildWorkflowCompleted",
+        json!({ "child_id": child.to_string(), "output": {} }),
+    )
+    .await;
+    // Shard 1 has no row AND no retention summary for the child: nothing
+    // proves this is retention rather than a rollback to before creation.
+
+    let targets = vec![ShardTarget::new(0, &url_a), ShardTarget::new(1, &url_b)];
+    let report = verify_restore(&targets, &opts(), &WorkflowReplayer::new()).await;
+
+    assert!(
+        report.detected(FindingClass::RetentionUnproven),
+        "an unprovable absence must be flagged, not silently passed: {report:#?}"
+    );
+    assert_eq!(report.status, VerifyStatus::Unavailable, "{report:#?}");
+}
+
+/// The control for the above. A `harvest_execution_summaries` row for the
+/// child is durable proof retention collected it. The same absence then
+/// stays silent, exactly as before this fix.
+#[tokio::test]
+async fn an_absent_child_terminal_target_with_a_summary_stays_silent() {
+    let (url_a, _ca) = setup().await;
+    let (url_b, _cb) = setup().await;
+    let mut a = connect(&url_a).await;
+    let mut b = connect(&url_b).await;
+
+    let parent = ExecutionId::new_for_shard(ShardId::new(0));
+    let child = ExecutionId::new_for_shard(ShardId::new(1));
+
+    seed_execution(&mut a, parent, "parent_flow", "pf-sum-2", "RUNNING", 0).await;
+    append_event(&mut a, parent, 1, "WorkflowStarted", json!({ "input": {} })).await;
+    append_event(
+        &mut a,
+        parent,
+        2,
+        "ChildWorkflowStarted",
+        json!({ "child_id": child.to_string(), "workflow_name": "child_flow", "input": {} }),
+    )
+    .await;
+    append_event(
+        &mut a,
+        parent,
+        3,
+        "ChildWorkflowCompleted",
+        json!({ "child_id": child.to_string(), "output": {} }),
+    )
+    .await;
+    exec_sql(
+        &mut b,
+        &format!(
+            "INSERT INTO harvest_execution_summaries \
+             (execution_id, workflow_name, workflow_id, state, started_at, completed_at, shard_id) \
+             VALUES ('{child}', 'child_flow', 'cf-sum-2', 'COMPLETED', NOW(), NOW(), 1)"
+        ),
+    )
+    .await;
+
+    let targets = vec![ShardTarget::new(0, &url_a), ShardTarget::new(1, &url_b)];
+    let report = verify_restore(&targets, &opts(), &WorkflowReplayer::new()).await;
+
+    assert!(
+        !report.detected(FindingClass::RetentionUnproven),
+        "a proven-retained child must stay silent: {report:#?}"
+    );
+    assert!(
+        !report.detected(FindingClass::ChildExecutionMissing),
+        "a recorded terminal is not a live dependency: {report:#?}"
+    );
+}
+
+/// The same ambiguity for a delivered external effect. The target row is
+/// completely absent, not merely rolled back to a non-terminal state. With
+/// no summary to prove retention, this must not read as clean.
+#[tokio::test]
+async fn an_absent_external_effect_target_without_a_summary_is_undetermined() {
+    let (url_a, _ca) = setup().await;
+    let (url_b, _cb) = setup().await;
+    let mut a = connect(&url_a).await;
+
+    let caller = ExecutionId::new_for_shard(ShardId::new(0));
+    let target = ExecutionId::new_for_shard(ShardId::new(1));
+    let signal_id = uuid::Uuid::new_v4();
+
+    seed_execution(&mut a, caller, "supervisor", "sup-sum-1", "RUNNING", 0).await;
+    append_event(&mut a, caller, 1, "WorkflowStarted", json!({ "input": {} })).await;
+    append_event(
+        &mut a,
+        caller,
+        2,
+        "ExternalSignalRequested",
+        json!({
+            "signal_id": signal_id.to_string(),
+            "target": target.to_string(),
+            "signal_name": "approve",
+            "payload": {}
+        }),
+    )
+    .await;
+    append_event(
+        &mut a,
+        caller,
+        3,
+        "ExternalSignalDelivered",
+        json!({ "signal_id": signal_id.to_string() }),
+    )
+    .await;
+    // Shard 1 has no row at all for the target -- not "restored to an earlier
+    // state", genuinely absent -- and no retention summary either.
+
+    let targets = vec![ShardTarget::new(0, &url_a), ShardTarget::new(1, &url_b)];
+    let report = verify_restore(&targets, &opts(), &WorkflowReplayer::new()).await;
+
+    assert!(
+        report.detected(FindingClass::RetentionUnproven),
+        "an unprovable absent target must be flagged, not silently passed: {report:#?}"
+    );
+    assert_eq!(report.status, VerifyStatus::Unavailable, "{report:#?}");
 }
 
 /// Codex round 1, P2. An undecodable child/external `event_data` row may be the

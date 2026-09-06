@@ -365,6 +365,47 @@ fn text_output_reports_replay_coverage_honestly() {
 }
 
 #[test]
+fn text_output_does_not_claim_partial_coverage_when_nothing_replayed_at_all() {
+    // A run where every sampled history was unreadable replayed NOTHING. It
+    // must print the plain "NOT VERIFIED" message, not "PARTIALLY VERIFIED",
+    // which claims some coverage actually happened.
+    let mut s = shard(Vec::new());
+    s.replay = ReplaySummary {
+        sampled: 2,
+        clean: 0,
+        divergent: 0,
+        failed: 0,
+        skipped_no_handler: 0,
+        unreadable: 2,
+    };
+    let r = RestoreVerifyReport::assemble(chrono::Utc::now(), vec![s], Vec::new());
+    let text = format_backup_verify_text(&r);
+    assert!(
+        text.contains("NOT VERIFIED") && !text.contains("PARTIALLY VERIFIED"),
+        "zero coverage must not be reported as partial coverage: {text}"
+    );
+}
+
+#[test]
+fn text_output_reports_partial_coverage_when_some_unreadable_but_others_replayed() {
+    let mut s = shard(Vec::new());
+    s.replay = ReplaySummary {
+        sampled: 3,
+        clean: 2,
+        divergent: 0,
+        failed: 0,
+        skipped_no_handler: 0,
+        unreadable: 1,
+    };
+    let r = RestoreVerifyReport::assemble(chrono::Utc::now(), vec![s], Vec::new());
+    let text = format_backup_verify_text(&r);
+    assert!(
+        text.contains("PARTIALLY VERIFIED"),
+        "some replayed plus some unreadable is a coverage gap, not zero coverage: {text}"
+    );
+}
+
+#[test]
 fn text_output_does_not_claim_not_verified_when_replay_really_ran() {
     let mut s = shard(Vec::new());
     s.replay = ReplaySummary {

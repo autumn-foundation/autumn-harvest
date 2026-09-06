@@ -432,6 +432,18 @@ pub enum BackupCommand {
         /// execution carries more reference events than one page.
         #[arg(long, default_value_t = 1000)]
         probe_limit: i64,
+
+        /// The shard a pre-sharding (unencoded) target id resolves to.
+        ///
+        /// Must match the fleet's configured default shard (`ShardRouter`'s
+        /// `default_shard`), not whichever `--shard` happens to observe the
+        /// reference. Every runtime routing path falls back to the fleet
+        /// default for an unencoded id. This check must agree with them, or
+        /// it reports a false `child_execution_missing` /
+        /// `external_target_missing` on a fleet migrated from pre-sharding
+        /// ids. Defaults to `0`, the overwhelmingly common configuration.
+        #[arg(long, default_value_t = 0)]
+        default_shard: i32,
     },
 }
 
@@ -3532,6 +3544,7 @@ pub async fn run_cli(cli: Cli) -> Result<(), CliError> {
                 replay_sample,
                 worker_stale_secs,
                 probe_limit,
+                default_shard,
             },
     } = &cli.command
     {
@@ -3543,6 +3556,7 @@ pub async fn run_cli(cli: Cli) -> Result<(), CliError> {
             *replay_sample,
             *worker_stale_secs,
             *probe_limit,
+            *default_shard,
         )
         .await;
     }
@@ -4609,6 +4623,27 @@ pub fn format_backup_verify_text(report: &RestoreVerifyReport) -> String {
             replay.skipped_no_handler,
             replay.unreadable
         );
+    } else if replay.unreadable > 0 && (replay.clean > 0 || replay.divergent > 0 || replay.failed > 0)
+    {
+        // Distinct from the "nothing replayed" branch below. Some histories
+        // DID replay here, but at least one selected for replay was never
+        // read at all, so the coverage this run reports is incomplete. The
+        // "register handlers" advice below does not apply. Handlers ARE
+        // registered, since something replayed.
+        let _ = writeln!(
+            out,
+            "  replay: PARTIALLY VERIFIED — {} sampled, {} clean, {} divergent, \
+             {} workflow-failed, {} skipped (no handler), {} unreadable. \
+             Coverage is incomplete: {} history/histories were never read, so a \
+             clean verdict here does not cover them.",
+            replay.sampled,
+            replay.clean,
+            replay.divergent,
+            replay.failed,
+            replay.skipped_no_handler,
+            replay.unreadable,
+            replay.unreadable
+        );
     } else {
         let _ = writeln!(
             out,
@@ -4726,6 +4761,7 @@ pub fn backup_verify_gate(report: &RestoreVerifyReport) -> Option<CliError> {
 /// [`CliError::InvalidInput`] on bad arguments or a refused live DSN;
 /// [`CliError::RestoreIncoherent`] / [`CliError::RestoreUndetermined`] when the
 /// report fails the gate. The report itself is always printed first.
+#[allow(clippy::too_many_arguments)]
 pub async fn run_backup_verify(
     shards: &[String],
     live_dsn: &[String],
@@ -4734,6 +4770,7 @@ pub async fn run_backup_verify(
     replay_sample: usize,
     worker_stale_secs: i64,
     probe_limit: i64,
+    default_shard: i32,
 ) -> Result<(), CliError> {
     scratch_guard(shards, live_dsn, ack)?;
     // Say out loud when the guard could not protect anything -- an operator
@@ -4748,6 +4785,7 @@ pub async fn run_backup_verify(
         .with_replay_sample(replay_sample)
         .with_worker_stale_secs(worker_stale_secs)
         .with_probe_limit(probe_limit)
+        .with_default_shard(default_shard)
         .with_scratch_ack(ack);
 
     // The CLI ships no application workflow handlers, so replay coverage is
@@ -16041,6 +16079,32 @@ mod det_check_cli_tests {
                     "the CLI default must track the library default"
                 );
             }
+            other => panic!("expected Backup::Verify, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn backup_verify_default_shard_defaults_to_zero_and_is_overridable() {
+        let cli = parse(&["backup", "verify", "--shard", "postgres://scratch/a"]);
+        match cli.command {
+            Commands::Backup {
+                command: BackupCommand::Verify { default_shard, .. },
+            } => assert_eq!(default_shard, 0, "0 is the overwhelmingly common default"),
+            other => panic!("expected Backup::Verify, got {other:?}"),
+        }
+
+        let cli = parse(&[
+            "backup",
+            "verify",
+            "--shard",
+            "postgres://scratch/a",
+            "--default-shard",
+            "3",
+        ]);
+        match cli.command {
+            Commands::Backup {
+                command: BackupCommand::Verify { default_shard, .. },
+            } => assert_eq!(default_shard, 3),
             other => panic!("expected Backup::Verify, got {other:?}"),
         }
     }
