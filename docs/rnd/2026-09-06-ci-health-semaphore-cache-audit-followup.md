@@ -38,7 +38,7 @@ yesterday's report and one didn't:
   later PR runs all restored against — and still wasn't there 9-14 hours on
   (§4).
 
-**Correction record for this PR (`#1395`):** thirteen separate Codex review
+**Correction record for this PR (`#1395`):** fourteen separate Codex review
 comments caught real problems in earlier drafts of this report:
 
 1–2. Two methodology errors in §4's cache-eviction comparison (a same-run
@@ -75,6 +75,12 @@ own closing paragraph, both outrunning what an unconfirmed, possibly-silent
 commit failure can rule out.
 12. One `save-if: false` remedy claim that overstated what it does — it
 stops new saves but doesn't reclaim an already-stored entry.
+13. One claim that cache-usage API access would settle whether this
+report's one already-past save finalized before being evicted — the API
+exposes current entries, not eviction history, so a query today can't
+retroactively distinguish that from a silent finalize failure; settling it
+needs checking a *future* save immediately after it runs and polling
+forward, not a single query against this one.
 
 All are fixed below, in place, with the retractions left visible rather
 than edited away.
@@ -248,8 +254,18 @@ branch-scoping or key-configuration mistake is ruled out, but **a silently
 failed commit/finalize step remains an alternative this report cannot
 rule out** (see Diagnosis) — if that's what happened, no entry ever existed
 to go missing, and these three misses would look identical either way.
-Which of the two is true is exactly the fact the cache-usage API this
-report keeps flagging would settle.
+
+**This particular ambiguity, for this particular save, is now unresolvable
+— a Codex review comment on this PR correctly caught that querying the
+cache-usage API today wouldn't settle it.** GitHub's cache endpoints expose
+current active entries, not an eviction history; an absent record now is
+equally consistent with "never finalized" and "finalized, then evicted
+since." Settling this distinction needs checking the API immediately after
+a *future* save (to confirm finalization) and polling it forward until
+either eviction or a downstream restore — not a single query against
+this already-past event. Flagging that as the actual next step, correcting
+the report's earlier, looser claim that cache-API access alone would
+resolve it.
 
 ## 🔍 Diagnosis
 
