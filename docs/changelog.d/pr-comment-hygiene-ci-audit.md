@@ -3138,3 +3138,37 @@ does not begin with `#[`. **A counter-case has to be written in the SHAPE
 of the widened form**, not merely in the neighbourhood of it.
 
 Corpus effect: none. Five fixtures, three of them counter-cases.
+
+### Round one hundred and three — ask the compiler what the grammar is
+
+One finding, on the attribute alternative for the third round running,
+and wrong in both directions at once. `#[Note, this section is
+intentionally blank]` was reported although rustc rejects it, and
+`#[foo [bar]]` and `#[foo {bar}]` were missed although rustc accepts
+them.
+
+Round one hundred and two wrote the post-path set from memory, reasoning
+from `#[cfg_attr(test, derive(Debug))]` that a comma may follow a path.
+It may not: that comma is INSIDE the parentheses. The set was invented
+where it could have been read.
+
+rustc prints it. Feed it the malformed attribute and the error is the
+grammar:
+
+```
+error: expected one of `(`, `::`, `=`, `[`, `]`, or `{`, found `,`
+```
+
+The `::` belongs to the path and the rest is the input, so the
+alternative is now that list and nothing else. `#[allow[dead_code]]` and
+`#[allow{dead_code}]` parse -- rustc's complaint about them is "wrong
+meta list delimiters", a later check, not a syntax error -- so they are
+commented-out code and are fixtures.
+
+Three rounds on one alternative, each from a set written by hand: too
+narrow in round one hundred, too wide in one hundred and one's absence of
+a shape, wrong in both directions in one hundred and two. **The standing
+rule this adds: when a compiler will enumerate a grammar, ask it, and
+paste what it says.**
+
+Corpus effect: none. Three fixtures, one of them a counter-case.

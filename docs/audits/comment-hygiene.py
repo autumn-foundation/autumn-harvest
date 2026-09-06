@@ -350,9 +350,15 @@ COMMENTED_CODE_RE = re.compile(
       # Bounding the END is not enough on its own, and round one hundred
       # shipped it that way: `#[This section is intentionally blank]` is a
       # sentence in brackets, and `#[]` is nothing at all. An attribute
-      # opens with a PATH, and what may follow the path is `(`, `=`, `,`,
-      # `::` or the closing bracket -- never another bare word.
-      | \#!?\[\s*(?:r\#)?\w+\s*(?:(?:::|[(=,]).*)?\]\s*$
+      # opens with a PATH, and the grammar says what may follow one.
+      #
+      # Taken from rustc 1.94.1 rather than from memory, which is how round
+      # one hundred and two admitted a comma that no attribute may hold and
+      # refused two delimiters that every attribute may. Feed it
+      # `#[Note, this section is intentionally blank]` and it prints the
+      # set: "expected one of `(`, `::`, `=`, `[`, `]`, or `{`". The `::`
+      # belongs to the path, and the rest is the input.
+      | \#!?\[\s*(?:r\#)?\w+(?:\s*::\s*(?:r\#)?\w+)*\s*(?:[(\[{=].*)?\]\s*$
       | \}[,;)]*\s*$
       | (?:(?:r\#)?\w+::)*(?:r\#)?\w+!(?:\(.*\)|\[.*\]|\{.*\})\s*;\s*$  # macro stmt
       # A macro DEFINITION, which ends at its brace rather than a `;`.
@@ -5068,6 +5074,21 @@ RULE_TESTS = [
         "// #[]\n",
         set(),
         "and neither is nothing at all",
+    ),
+    (
+        "// #[Note, this section is intentionally blank]\n",
+        set(),
+        "nor a comma, which no attribute input may open with",
+    ),
+    (
+        "// #[allow[dead_code]]\n",
+        {("CH001", 1)},
+        "but a bracket delimiter is one",
+    ),
+    (
+        "// #[allow{dead_code}]\n",
+        {("CH001", 1)},
+        "and so is a brace",
     ),
     (
         "// #[non_exhaustive]\n",
