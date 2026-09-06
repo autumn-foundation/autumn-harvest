@@ -12385,7 +12385,7 @@ mod tests {
             render_dead_letters_page(&filters, &[], &[], false, 2, 50, false, 0, Some(30), None)
                 .into_string();
         assert!(
-            html.contains(r#"url=../ui/dead-letters?page=2"#),
+            html.contains(r"url=../ui/dead-letters?page=2"),
             "refresh target must preserve page=2: {html}"
         );
     }
