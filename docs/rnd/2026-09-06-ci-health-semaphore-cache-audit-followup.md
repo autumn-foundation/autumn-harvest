@@ -45,7 +45,7 @@ yesterday's report and one didn't:
   later PR runs all restored against — and still couldn't be restored 9-14
   hours on (§4).
 
-**Correction record for this PR (`#1395`):** twenty-one separate Codex review
+**Correction record for this PR (`#1395`):** twenty-two separate Codex review
 comments caught real problems in earlier drafts of this report:
 
 1–2. Two methodology errors in §4's cache-eviction comparison (a same-run
@@ -118,6 +118,13 @@ relabeled "direction unknown" to match.
 20. A fifth recurrence, in the Diagnosis section's own evidence sentence
 ("gone within 9-14 hours") — restated as "unrestorable," describing the
 observed restore failure without asserting the entry existed and was lost.
+21. One factual error in the remedy comparison: `test-nodb`'s 4 shards were
+called "near-identical" `target/` builds, when `ci.yml:363-377`'s own
+comment says the opposite — the manifest rows and the ~30 individual steps
+are both split into disjoint per-shard slices, not run redundantly. Only
+third-party dependency compilation genuinely overlaps across shards; each
+shard's own workspace-specific artifacts don't. Corrected the canonical-
+writer and cross-family comparisons to reflect that more qualified picture.
 
 All are fixed below, in place, with the retractions left visible rather
 than edited away.
@@ -414,25 +421,40 @@ exposes this endpoint, updated:
    unsound:
 
    - **Not a designated canonical shard *within* one family** (e.g. always
-     `test-nodb` shard 0) — `ci.yml:411-417`'s shared shard-key already
-     limits each family to one persisted entry per OS per run via the
-     reserve-race this report observed directly; a canonical writer would
-     stop the other three shards from wastefully attempting a save that was
-     always going to fail, which is worth doing for its own sake, but it
-     doesn't reduce stored bytes or relieve capacity pressure, so it isn't a
-     capacity remedy on its own.
+     `test-nodb` shard 0), and the reasoning needs a correction a Codex
+     review comment on this PR caught: an earlier draft justified the
+     existing shared-key mitigation by calling `test-nodb`'s 4 shards'
+     `target/` trees "near-identical," which `ci.yml:363-377`'s own comment
+     contradicts — the manifest-driven rows are self-sharded into disjoint
+     slices via `SEMAPHORE_SHARD_INDEX`, and the ~30 individual crate/example
+     steps are round-robin assigned one-per-shard, so each shard compiles
+     and tests a *different* slice of the work, not a redundant copy of the
+     same slice. What genuinely overlaps across shards is third-party
+     dependency compilation (all 4 build against the identical `Cargo.lock`,
+     so a restored cache's warm dependency crates help any shard); what
+     doesn't overlap is the workspace-specific compiled artifacts for each
+     shard's own disjoint slice, which a different shard's saved `target/`
+     doesn't contain. So a canonical writer would still stop the other three
+     shards' wasted reservation attempts (worth doing), and would still warm
+     dependency compilation for whichever shard restores it (a real,
+     partial win) — but would not make that shard's *own* workspace
+     artifacts warm, so it's a smaller, more qualified win than "worth doing
+     for its own sake" implied, not a full capacity-or-effectiveness fix.
    - **Not one shared cache key across `test-nodb`, `test-db-linux`, `test`,
      and `lint` for a given OS**, either. Those jobs run in *parallel*, not
      sequentially, so the same reserve-race mechanism §4 documented directly
      (whichever job reaches `Saving cache` first wins the key; every other
-     job's save silently fails) would apply here too — except unlike
-     `test-nodb`'s own shards, which build near-identical `target/` trees so
-     any winner's output is useful to the others, `lint`/`test`/`test-nodb`/
-     `test-db-linux` build genuinely different artifacts. Whichever job wins
-     the shared key would save its own (irrelevant to the other three)
-     `target/`, and the other three would spend their next run's restore
-     step downloading a cache that doesn't match what they need — worse
-     than the current cold-every-time baseline, not better. Retracted.
+     job's save silently fails) would apply here too, and unlike
+     `test-nodb`'s own shards — which at least share dependency-compilation
+     content even though their workspace-specific artifacts differ —
+     `lint`/`test`/`test-nodb`/`test-db-linux` may not even share that much:
+     different jobs, different feature flags, different subsets of the
+     workspace built. Whichever job wins the shared key would save output
+     with materially less overlap with what the other three need than even
+     the within-family case has, and the other three would spend their next
+     run's restore step downloading a cache poorly matched to what they
+     need — worse than the current cold-every-time baseline, not better, and
+     more so than the within-family case above. Retracted.
 
    The remedies that don't have this flaw: (a) stop caching lower-value job
    families entirely — **not just `save-if: false`**, which a Codex review
