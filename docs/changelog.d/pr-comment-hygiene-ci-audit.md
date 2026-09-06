@@ -2667,3 +2667,45 @@ matched rather than where the finding pointed: the path of a call, the
 path of a macro statement, and the left side of an assignment.
 
 Corpus effect: none. Eight fixtures.
+
+### Round eighty-seven — a rule that damaged the tree it audits
+
+Three findings. The third is the serious one, because the gate was not
+merely wrong about a hypothetical line: it made the audit delete a
+comment that was doing work.
+
+Rustdoc joins every `#[doc]` attribute an item carries, and a doc comment
+IS a `#[doc]`, so an attribute between two doc lines sits INSIDE the
+document rather than ending it. CH004 read a comment run as consecutive
+source lines, so the blank `//!` beside `#![cfg(feature = "testing")]` in
+`idempotency_tests.rs` looked like a block edge. It is a paragraph break.
+Deleting it merged `Run with:` and `Covers:` into one paragraph, which
+rustdoc 1.94.1 confirms directly. The line is restored, and a run now
+survives an intervening attribute -- for `//!` over `#![...]` and for
+`///` over `#[...]`, both checked by rendering, and over an attribute
+that wraps across lines.
+
+The fact lives on the piece rather than in the rule: `mark_bridges` sets
+`Piece.bridged`, so `comment_runs` answers "what does a reader see as one
+comment" in the one place that question was already asked.
+
+Three counter-cases hold the widening down. A blank doc line with no doc
+after it still renders nothing, so it is still an edge. A commented-out
+attribute is code, not a bridge. A plain `//` run does not join across
+code, because nothing renders it.
+
+The other two findings are the sentence boundary again, in both
+directions this time. `// TODO: print "ready." See #123 for parser.`
+found no boundary at all, so the marker borrowed a reference from the
+next sentence. A closing delimiter is genuinely ambiguous -- `"ready."`
+ends a sentence and `"Ready?"` does not, and both are punctuation, quote,
+space -- so it is now its own alternative, decided by whether a CAPITAL
+follows. The known limitations reject that test for the prose splitter,
+which must not merge two sentences; here it decides only what the plain
+rule cannot read, and guessing wrong merely lets a sentence run on.
+
+And `TODO: http://` counted as a tracking reference. `TODO_REF_RE` was
+the one reference pattern of three that did not require a destination.
+
+Corpus effect: none. Two CH007 findings move down one line, because a
+line was restored above them. Eleven fixtures.

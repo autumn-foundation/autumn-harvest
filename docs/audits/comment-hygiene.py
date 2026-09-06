@@ -342,15 +342,27 @@ COMMENTED_CODE_RE = re.compile(
 TODO_RE = re.compile(
     r"^(?:TODO|FIXME|XXX|HACK)\b|\b(?:TODO|FIXME|XXX|HACK)\s*[:(]", re.IGNORECASE
 )
-TODO_REF_RE = re.compile(r"#\d+|https?://")
+# A tracking reference: an issue number, or a URL with somewhere to go.
+# `https?://` alone identifies nothing, and CH002 accepted it as tracking.
+TODO_REF_RE = re.compile(r"#\d+|https?://\S")
 # A sentence boundary, with every clause `SENTENCE_SPLIT_RE` carries and no
 # others: terminal punctuation, then any emphasis markers, then a SPACE or
 # the end of the text. Both other clauses are load-bearing. The abbreviation
 # guards keep "e.g." inside its sentence. The space keeps "foo.rs" and
 # "v1.2" inside a word, and keeps a QUOTED question inside its sentence --
 # the `?` of `the "Ready?" prompt` is followed by a quote, not a boundary.
+# A closing delimiter is the ambiguous case, so it is its own alternative.
+# `print "ready." See #123` ends a sentence at the quote; `the "Ready?"
+# prompt under #123` does not, and both are punctuation, quote, space. What
+# separates them is what comes NEXT: a capital opens a new sentence, a
+# lower-case word continues this one. The file's known limitations reject
+# that test for the prose SPLITTER, which must not merge two sentences when
+# the second opens with a lower-case identifier. Here it decides only the
+# case the plain rule cannot read at all, and the un-ended sentence merely
+# reaches further.
 SENTENCE_END_RE = re.compile(
-    r"(?<!e\.g)(?<!E\.g)(?<!i\.e)(?<!I\.e)[.!?][*_]*(?=\s|$)"
+    r"(?<!e\.g)(?<!E\.g)(?<!i\.e)(?<!I\.e)[.!?]"
+    r"(?:[*_]*(?=\s|$)|[\"')\]]+(?=\s+[A-Z]))"
 )
 # A bracketed citation attached to the end of a sentence, as in "TODO: add
 # retries. (#123)". A citation is part of the sentence it cites, so that
@@ -1166,7 +1178,7 @@ class Piece:
 
     __slots__ = (
         "line", "marker", "body", "trailing", "block", "group", "nest",
-        "line_start", "line_end",
+        "line_start", "line_end", "bridged",
     )
 
     def __init__(
@@ -1207,6 +1219,12 @@ class Piece:
         # begins after literal "/*" or "*/" text carries none of them. Only
         # the line rules apply to it, and its text joins the prose around it.
         self.line_start = line_start
+        # Is the gap above this piece nothing but ATTRIBUTES? A doc comment
+        # is a `#[doc]` attribute, and Rustdoc joins every one an item
+        # carries, so `#[cfg(...)]` between two doc lines sits inside the
+        # document rather than ending it. Set by `extract_comments`, which
+        # is the only place that still has the source to read.
+        self.bridged = False
 
     @property
     def text(self) -> str:
@@ -1460,7 +1478,45 @@ def extract_comments(source: str) -> list[Piece]:
             code_on_line = True
         i += 1
 
+    mark_bridges(source, pieces)
     return pieces
+
+
+def mark_bridges(source: str, pieces: list[Piece]) -> None:
+    """Record which pieces are separated from the one above by attributes only.
+
+    Rustdoc joins every `#[doc]` an item carries, and a doc comment IS a
+    `#[doc]`, so an attribute between two doc lines does not end the
+    document -- it sits inside it. Confirmed against rustdoc 1.94.1 for
+    `//!` across `#![cfg(...)]` and for `///` across `#[allow(...)]`: both
+    render two paragraphs, and deleting the blank doc line beside the
+    attribute merges them into one. CH004 read that blank line as a block
+    edge and failed the build on it, and the audit deleted one in
+    `idempotency_tests.rs` before this was understood.
+
+    An attribute may WRAP, so the scan follows its brackets rather than its
+    first line. A line that carries a comment is never an attribute line
+    whatever it says, because `// #[derive(Debug)]` is prose ABOUT one.
+    """
+    occupied = {piece.line for piece in pieces}
+    attributes: set[int] = set()
+    depth = 0
+    for index, raw in enumerate(source.splitlines(), start=1):
+        if index in occupied:
+            depth = 0
+            continue
+        text = raw.strip()
+        if depth == 0 and not text.startswith("#[") and not text.startswith("#!["):
+            continue
+        attributes.add(index)
+        depth = max(0, depth + text.count("[") - text.count("]"))
+
+    previous = -1
+    for piece in pieces:
+        piece.bridged = previous >= 0 and piece.line > previous + 1 and all(
+            gap in attributes for gap in range(previous + 1, piece.line)
+        )
+        previous = piece.line
 
 
 def rust_sources(paths: list[str] | None) -> list[str]:
@@ -1949,6 +2005,11 @@ def comment_runs(pieces: list[Piece]):
     A trailing comment is always its own run -- it is a note on its line, not
     a continuation of the note on the line above, even when the two are
     adjacent.
+
+    "Consecutive" is what a READER sees, not what the file holds. A doc run
+    survives an intervening attribute, because Rustdoc joins the `#[doc]`
+    attributes on either side of it into one document -- see `mark_bridges`.
+    A plain `//` run does not: nothing renders it, so nothing joins it.
     """
     run: list[Piece] = []
     prev_line = -2
@@ -1962,7 +2023,10 @@ def comment_runs(pieces: list[Piece]):
             or piece.block != run[-1].block
             or piece.group != run[-1].group
             or piece.marker != run[-1].marker
-            or piece.line != prev_line + 1
+            or (
+                piece.line != prev_line + 1
+                and not (piece.bridged and piece.marker in DOC_MARKERS)
+            )
         ):
             yield run
             run = []
@@ -4309,6 +4373,51 @@ RULE_TESTS = [
         "// TODO: *add retries.* See #123 for the parser.\n",
         {("CH002", 1)},
         "but an emphasis marker does not hide the end of one",
+    ),
+    (
+        "/// TODO: print \"ready.\" See #123 for the parser.\n",
+        {("CH002", 1)},
+        "a closing quote ends a sentence where a capital follows it",
+    ),
+    (
+        "// TODO: see http://\n",
+        {("CH002", 1)},
+        "a bare scheme tracks nothing",
+    ),
+    (
+        "// TODO: see https://x.test/i/9\n",
+        set(),
+        "but a URL with a destination does",
+    ),
+    (
+        "//! One.\n//!\n//! Two.\n#![allow(dead_code)]\n//!\n//! Three.\n",
+        set(),
+        "an inner doc run survives an inner attribute",
+    ),
+    (
+        "/// One.\n///\n#[allow(dead_code)]\n/// Two.\npub struct S;\n",
+        set(),
+        "and an outer doc run survives an outer one",
+    ),
+    (
+        "/// One.\n///\n#[allow(\n    dead_code\n)]\n/// Two.\npub struct S;\n",
+        set(),
+        "which may wrap over several lines",
+    ),
+    (
+        "/// One.\n///\n#[allow(dead_code)]\npub struct S;\n",
+        {("CH004", 2)},
+        "but a blank doc line with no doc after it still renders nothing",
+    ),
+    (
+        "/// One.\n///\n// #[allow(dead_code)]\n/// Two.\npub struct S;\n",
+        {("CH004", 2), ("CH001", 3)},
+        "and a commented-out attribute is code, not a bridge",
+    ),
+    (
+        "// One.\n//\nlet x = 1;\n// Two.\n",
+        {("CH004", 2)},
+        "nor does a plain run join across code, which nothing renders",
     ),
     (
         "// TODO(#1): a; TODO(#2): b\n",
