@@ -42,7 +42,7 @@ use autumn_harvest::execution::{
 };
 use autumn_harvest::info::WorkflowHandlerFn;
 use autumn_harvest::models::WorkflowExecution;
-use autumn_harvest::schema::{harvest_signals, harvest_workflow_executions};
+use autumn_harvest::schema::{harvest_schedules, harvest_signals, harvest_workflow_executions};
 use autumn_harvest::types::{
     ExecutionId, Priority, StartSource, WorkflowIdConflictPolicy, WorkflowIdReusePolicy,
 };
@@ -662,6 +662,90 @@ async fn a_tightened_target_cap_rejects_an_oversized_transition() {
     assert_eq!(
         rows, 1,
         "no successor may be created when the target's cap rejects the input"
+    );
+}
+
+/// A cap-rejected transition on a SCHEDULED run must increment the
+/// schedule's consecutive-failure counter (Codex P2 on PR #1399). The
+/// predecessor's real outcome is a terminal failure, not a continuation.
+/// Leaving the counter untouched would let a schedule whose target
+/// deterministically rejects every fire evade failure-based auto-pausing.
+#[tokio::test]
+async fn a_cap_rejected_transition_increments_the_schedules_failure_counter() {
+    let (url, _c) = setup_test_database_url_or_env().await;
+    let mut conn = connect(&url).await;
+
+    let phase1 = leaked("trial_subscription");
+    let phase2 = leaked("paid_subscription");
+    let workflow_id = format!("sub-{}", Uuid::new_v4().simple());
+    let big_payload = serde_json::json!({"blob": "x".repeat(300)});
+
+    let predecessor = start_root(
+        &mut conn,
+        phase1,
+        &workflow_id,
+        serde_json::json!({"next_type": phase2, "payload": big_payload}),
+    )
+    .await;
+
+    // This predecessor is a scheduled run: stamp `schedule_id`/`origin` onto
+    // it and insert a schedule row with a failure limit, exactly like a real
+    // scheduler-fired execution.
+    let schedule_id = Uuid::new_v4();
+    diesel::insert_into(harvest_schedules::table)
+        .values((
+            harvest_schedules::dsl::id.eq(schedule_id),
+            harvest_schedules::dsl::workflow_name.eq(phase1),
+            harvest_schedules::dsl::schedule_expr.eq("interval:60"),
+            harvest_schedules::dsl::timezone.eq("UTC"),
+            harvest_schedules::dsl::catchup.eq(false),
+            harvest_schedules::dsl::max_active_runs.eq(10),
+            harvest_schedules::dsl::is_paused.eq(false),
+            harvest_schedules::dsl::next_run_at.eq(Utc::now() - ChronoDuration::seconds(5)),
+            harvest_schedules::dsl::jitter_secs.eq(0_i64),
+            harvest_schedules::dsl::overlap_policy.eq("skip"),
+            harvest_schedules::dsl::buffered_runs.eq(serde_json::json!([])),
+            harvest_schedules::dsl::buffer_all_max.eq(100),
+            harvest_schedules::dsl::skip_policy.eq("skip"),
+            harvest_schedules::dsl::consecutive_failure_limit.eq(3),
+        ))
+        .execute(&mut conn)
+        .await
+        .expect("insert schedule");
+    diesel::update(harvest_workflow_executions::table.find(predecessor.as_uuid()))
+        .set((
+            harvest_workflow_executions::schedule_id.eq(Some(schedule_id)),
+            harvest_workflow_executions::origin.eq(Some("scheduled")),
+        ))
+        .execute(&mut conn)
+        .await
+        .expect("stamp schedule lineage");
+
+    // Phase 2 declares no override, so it falls back to the small fleet-wide
+    // floor — the same tightened-cap shape as the sibling test above.
+    let source = wf(phase1, phase_one_forwarding);
+    let target = wf(phase2, phase_two);
+    let reg = Arc::new(
+        HandlerRegistry::new(vec![source, target], vec![])
+            .with_payload_caps(10_000, 100, 10_000, 10_000),
+    );
+
+    let worker = build_runtime_worker("w-1161-schedule-counter", 2, 1, reg);
+    let handle = spawn_test_worker(Arc::clone(&worker), build_test_pool(&url));
+    wait_for_execution_state(&url, predecessor, "FAILED").await;
+    worker.shutdown();
+    handle.await.expect("worker join");
+
+    let consecutive_failure_count: i32 = harvest_schedules::table
+        .find(schedule_id)
+        .select(harvest_schedules::dsl::consecutive_failure_count)
+        .first(&mut conn)
+        .await
+        .expect("load schedule");
+    assert_eq!(
+        consecutive_failure_count, 1,
+        "a cap-rejected transition on a scheduled run must count as a schedule failure, \
+         not be silently left uncounted as a successful continuation"
     );
 }
 
