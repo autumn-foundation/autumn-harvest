@@ -1879,8 +1879,8 @@ mod db {
     /// A generic "the execution woke up" reason was accurate for the guard's
     /// original two conditions, quiescence and history. It is wrong for the
     /// third: a hold placed or released after verification. Reporting a wake
-    /// that never happened sends an operator toward the wrong diagnosis for
-    /// exactly the kind of change a compliance audit trail must get right.
+    /// that never happened sends an operator toward the wrong diagnosis. It
+    /// is exactly the kind of change a compliance audit trail must get right.
     ///
     /// Best-effort and read after the fact, so a fast-moving second race
     /// between the decline and this read can still fall through to the
@@ -1918,8 +1918,8 @@ mod db {
         let Some(row) = row else {
             return Ok(WOKE);
         };
-        let hold_drifted = !row.legal_hold_verified
-            || row.verified_legal_hold_set_at != row.legal_hold_set_at;
+        let hold_drifted =
+            !row.legal_hold_verified || row.verified_legal_hold_set_at != row.legal_hold_set_at;
         Ok(if hold_drifted { HOLD_DRIFTED } else { WOKE })
     }
 

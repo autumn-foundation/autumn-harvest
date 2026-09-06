@@ -2944,11 +2944,11 @@ async fn the_reset_trigger_clears_the_stale_hold_marker_even_when_the_caller_doe
 
 #[tokio::test]
 async fn a_declined_cutover_reports_legal_hold_drift_not_a_wake() {
-    // Codex round 5 on PR #1406: `commit_cutover` returning `false` also
-    // covers a hold change since verification, but both drivers reported
-    // every decline as "the execution woke up". That conceals the actual
-    // compliance-relevant change from the operator and the audit log. A
-    // decline caused by hold drift must say so.
+    // Issue #1317: `commit_cutover` returning `false` also covers a hold
+    // change since verification. Both drivers reported every decline as
+    // "the execution woke up". That conceals the actual compliance-relevant
+    // change from the operator and the audit log. A decline caused by hold
+    // drift must say so.
     let shards = setup_two_shards().await;
     let exec_id = quiescent_fixture(&shards, "decline-reports-hold-drift").await;
     let (mut source, mut target) = (shards.source().await, shards.target().await);
