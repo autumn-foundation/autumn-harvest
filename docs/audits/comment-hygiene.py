@@ -1089,6 +1089,16 @@ def blank_spans_across(lines: list[str]) -> list[str]:
     """
     return blank_code_spans("\n".join(lines)).split("\n")
 
+# A PROPER NAME that spells itself with an apostrophe. "Let's Encrypt" is a
+# certificate authority, so a comment naming it is neither deliberation nor a
+# contraction, and "Let us Encrypt" would be a wrong expansion. CH003 is
+# absolute, so the name failed the build outright.
+#
+# Keyed on the capitalised second word, and case-SENSITIVELY, inside two
+# patterns that are otherwise case-insensitive. "let's encrypt the payload"
+# is still deliberation and still a contraction; only the name is exempt.
+PROPER_NAME = r"(?!\s+(?-i:Encrypt)\b)"
+
 # First-person deliberation. "Actually" must open a sentence: mid-sentence it is
 # an ordinary adverb ("gated on THIS claimant actually, durably marking the
 # row"). So must "lets just", for the same reason from the other direction --
@@ -1098,7 +1108,7 @@ def blank_spans_across(lines: list[str]) -> list[str]:
 # contractions, not necessarily deliberation.
 NARRATIVE_RE = re.compile(
     r"(?:^|(?<=[.!?;]\s))\s*(?:actually[,\s]|lets just\b)"
-    r"|\b(?:let" + _APOS + r"s\b|we" + _APOS + r"ll\b|i think\b"
+    r"|\b(?:let" + _APOS + r"s\b" + PROPER_NAME + r"|we" + _APOS + r"ll\b|i think\b"
     r"|i" + _APOS + r"m not sure\b"
     r"|not sure (?:if|why|whether)\b|for now,|hmm\b|oops\b(?![\"'])|note to self\b"
     r"|as you can see\b|todo later\b)",
@@ -1127,8 +1137,8 @@ CONTRACTION_RE = re.compile(
     r"\b(?:ca|is|are|was|were|do|does|did|would|could|should|will|has|have|had"
     r"|must|ai|wo|sha|need|ought|might|dare)n" + _APOS + r"t\b"
     r"|\b(?:it|that|there|here|what|who|how|where|when|why|let|he|she|we|they"
-    r"|you|i)" + _APOS + r"(?:s|ll|re|ve|d|m)\b"
-    r"|\b(?:should|could|would|must|might)" + _APOS + r"ve\b",
+    r"|you|i)" + _APOS + r"(?:s|ll|re|ve|d|m)\b" + PROPER_NAME
+    + r"|\b(?:should|could|would|must|might)" + _APOS + r"ve\b",
     re.IGNORECASE,
 )
 
@@ -1299,7 +1309,28 @@ DOC_MARKERS = ("///", "//!", "/**", "/*!")
 # and `\#![doc = "Two."]` render a paragraph; `\#[doc(hidden)]` and
 # `\#[doc(alias = "zz")]` render nothing. Group 1 tells the two forms
 # apart.
-DOC_VALUE_RE = re.compile(r"^\#(!?)\[\s*(?:r\#)?doc\s*=")
+DOC_VALUE_RE = re.compile(r"^\#(!?)\[")
+# The `doc = ...` itself, anywhere inside that attribute. It is the whole
+# attribute that is searched, not its first line, because an attribute may
+# WRAP and put its payload three lines down.
+#
+# `cfg_attr` carries one: rustdoc 1.94.1 renders two paragraphs for
+# `\#[cfg_attr(all(), doc = "Two.")]` after a blank doc line, and it nests,
+# so `cfg_attr(all(), cfg_attr(all(), doc = "Six."))` renders them too.
+# Searching the attribute finds every depth without counting any.
+#
+# The PREDICATE is not read, and that is deliberate. `\#[cfg_attr(any(),
+# doc = "Four.")]` renders nothing, so treating it as content is an
+# under-report -- but `\#[cfg_attr(feature = "x", doc = "...")]` cannot be
+# decided from the source at all, and the two errors are not equal: a
+# missed blank line is untidy, a Tier A false positive fails the build on
+# correct documentation.
+#
+# A `doc =` inside a string cannot reach this. The scan reads the
+# `blank_non_code` copy, where string bodies are already blank.
+# The `[` matters: the plain `\#[doc = "Two."]` opens with one, and leaving
+# it out of this class broke every fixture from the round that added them.
+DOC_PAYLOAD_RE = re.compile(r"(?:^|[(\[,\s])(?:r\#)?doc\s*=")
 
 
 def indented_code(
@@ -1967,6 +1998,9 @@ def mark_bridges(source: str, pieces: list[Piece]) -> None:
     # in front of either is a real block edge.
     doc_value: dict[int, str] = {}
     depth = 0
+    kind = ""
+    opened_at = 0
+    carried = ""
     for index, raw in enumerate(source.splitlines(), start=1):
         text = raw.strip()
         opened = depth > 0
@@ -1984,10 +2018,20 @@ def mark_bridges(source: str, pieces: list[Piece]) -> None:
             if not text.startswith("#[") and not text.startswith("#!["):
                 continue
             doc = DOC_VALUE_RE.match(text)
+            opened_at = index
+            carried = ""
             if doc:
-                doc_value[index] = "inner" if doc.group(1) else "outer"
+                kind = "inner" if doc.group(1) else "outer"
         attributes.add(index)
+        carried += " " + text
         depth = max(0, depth + text.count("[") - text.count("]"))
+        # The attribute has closed, so its whole text is known and can be
+        # asked whether it carries document content.
+        if depth == 0 and kind and DOC_PAYLOAD_RE.search(carried):
+            doc_value[opened_at] = kind
+        if depth == 0:
+            kind = ""
+            carried = ""
         # A comment on this line is INSIDE the attribute unless the line
         # neither began within one nor leaves one open. Both ends are read,
         # because either alone gets a real case wrong:
@@ -4689,6 +4733,21 @@ RULE_TESTS = [
         "a narrative phrase inside a code span is a literal",
     ),
     (
+        "// Renew the Let's Encrypt certificate.\n",
+        set(),
+        "a proper name that spells itself with an apostrophe",
+    ),
+    (
+        "// Renew the Let\u2019s Encrypt certificate.\n",
+        set(),
+        "in the typographic spelling as well",
+    ),
+    (
+        "// Actually, let's encrypt the payload first.\n",
+        {("CH003", 1), ("CH006", 1)},
+        "but lower-case encrypt is still deliberation, and a contraction",
+    ),
+    (
         "// Actually, let's just skip the retry here.\n",
         {("CH003", 1), ("CH006", 1)},
         "and outside one it is still deliberation",
@@ -5243,6 +5302,26 @@ RULE_TESTS = [
         '/// One.\n///\n#[doc = "Two."]\n#[allow(dead_code)]\npub struct S;\n',
         set(),
         "reached across an attribute that carries no content of its own",
+    ),
+    (
+        '/// One.\n///\n#[cfg_attr(all(), doc = "Two.")]\npub struct S;\n',
+        set(),
+        "a cfg_attr may carry the doc value",
+    ),
+    (
+        '/// One.\n///\n#[cfg_attr(all(), cfg_attr(all(), doc = "Two."))]\npub struct S;\n',
+        set(),
+        "at any nesting, because the attribute is searched and not counted",
+    ),
+    (
+        '/// One.\n///\n#[cfg_attr(\n    all(),\n    doc = "Two."\n)]\npub struct S;\n',
+        set(),
+        "and on a later line, because a wrapped attribute is read whole",
+    ),
+    (
+        "/// One.\n///\n#[cfg_attr(all(), allow(dead_code))]\npub struct S;\n",
+        {("CH004", 2)},
+        "but a cfg_attr with no doc payload carries nothing",
     ),
     (
         "// TODO(#1): a; TODO(#2): b\n",

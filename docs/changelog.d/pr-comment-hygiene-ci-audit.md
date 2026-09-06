@@ -3486,3 +3486,37 @@ admitting spaces would swallow "return the row to the pool;". The array
 needs a space, so the two cannot both be had here.
 
 Corpus effect: none. Nine fixtures.
+
+Round 115 -- two Tier A false positives on correct comments.
+
+`// Renew the Let's Encrypt certificate` failed the build. CH003 read the
+apostrophe as deliberation and CH006 read it as a contraction, but the
+name is a certificate authority and "Let us Encrypt" is a wrong
+expansion. Both patterns now carry one shared exemption, keyed on the
+capitalised second word and read case-SENSITIVELY inside two otherwise
+case-insensitive patterns. "let's encrypt the payload" is still
+deliberation and still a contraction; only the name is exempt. Both
+apostrophe spellings are covered.
+
+`#[cfg_attr(all(), doc = "Two.")]` after a blank doc line failed CH004.
+Round 110 taught this rule to read `#[doc = ...]`; a `cfg_attr` carries
+the same payload, and rustdoc 1.94.1 renders two paragraphs for it.
+
+The attribute is now searched as a WHOLE rather than by its first line,
+which finds the payload at any nesting -- `cfg_attr(all(), cfg_attr(all(),
+doc = "Six."))` renders two paragraphs too -- and finds it when the
+attribute WRAPS and puts it three lines down, which the first-line
+version missed and nobody had reported.
+
+The predicate is not read, deliberately. `#[cfg_attr(any(), doc = ...)]`
+renders nothing, so treating it as content is an under-report; but
+`#[cfg_attr(feature = "x", doc = ...)]` cannot be decided from the source
+at all, and the two errors are not equal. A missed blank line is untidy.
+A Tier A false positive fails the build on correct documentation.
+
+The self-test caught a regression in the first version: the payload
+pattern omitted `[` from the characters that may precede `doc`, so the
+plain `#[doc = ...]` form stopped matching and every fixture from round
+110 failed. The fixtures were the only thing that noticed.
+
+Corpus effect: none. Seven fixtures, three of them refusals.
