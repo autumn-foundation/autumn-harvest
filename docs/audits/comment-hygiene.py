@@ -379,10 +379,13 @@ TODO_RE = re.compile(
 # A scheme is CASE-INSENSITIVE, by RFC 3986 and by every browser. An issue
 # number ends where the number ends: `#123abc` and `#1_000` are not issue
 # numbers with something after them, they are not issue numbers.
+# An IPv6 literal is a host only when its bracket CLOSES. `https://[` is an
+# opening bracket, and the tail cannot close it because a `]` ends the
+# citation form. So the two host shapes are spelled apart.
 REFERENCE = (
     r"(?:"
     r"#[1-9]\d*(?!\w)"
-    r"|(?i:https?)://[\w\[][^)\]\s]*"
+    r"|(?i:https?)://(?:\[[0-9A-Fa-f:.]+\]|\w)[^)\]\s]*"
     r")"
 )
 TODO_REF_RE = re.compile(REFERENCE)
@@ -1618,10 +1621,6 @@ def mark_bridges(source: str, pieces: list[Piece]) -> None:
     depth = 0
     for index, raw in enumerate(source.splitlines(), start=1):
         text = raw.strip()
-        # Does the line BEGIN inside an attribute? That is what puts a
-        # comment on it inside the attribute. A comment after a complete one
-        # -- `#[allow(dead_code)] // why` -- is beside the attribute, not in
-        # it, and is an ordinary trailing comment.
         opened = depth > 0
         if not opened:
             # An EMPTY source line renders nothing either, so it does not
@@ -1637,9 +1636,16 @@ def mark_bridges(source: str, pieces: list[Piece]) -> None:
             if not text.startswith("#[") and not text.startswith("#!["):
                 continue
         attributes.add(index)
-        if opened and index in occupied:
-            inside.add(index)
         depth = max(0, depth + text.count("[") - text.count("]"))
+        # A comment on this line is INSIDE the attribute when the attribute
+        # is still open at the end of the line. That reads both ends at
+        # once. `#[allow(dead_code)] // why` closes on its own line, so the
+        # comment is beside the attribute and is an ordinary trailing one;
+        # `#[cfg(all(/* note */` does not close, so the comment is within
+        # it, even though the line BEGAN outside. Reading only the depth at
+        # the line's start missed that second case.
+        if index in occupied and depth > 0:
+            inside.add(index)
 
     previous = -1
     for piece in pieces:
@@ -4667,6 +4673,16 @@ RULE_TESTS = [
         "but a scheme is case-insensitive, as RFC 3986 has it",
     ),
     (
+        "// TODO: fix under https://[\n",
+        {("CH002", 1)},
+        "an IPv6 host needs the bracket that closes it",
+    ),
+    (
+        "// https://[::1]/p - TODO: fix\n",
+        set(),
+        "and a closed one is a host in every position",
+    ),
+    (
         "// HTTPS://x.test/i/9 - TODO: fix\n",
         set(),
         "in every position a reference may sit",
@@ -4718,6 +4734,12 @@ RULE_TESTS = [
         "    dead_code\n)]\n/// Two.\npub struct S;\n",
         set(),
         "and a comment written inside it, which belongs to the attribute",
+    ),
+    (
+        "/// One.\n///\n#[cfg(all(/* note */\n    unix\n))]\n"
+        "/// Two.\npub struct S;\n",
+        set(),
+        "on the line that OPENS it as well as a line within it",
     ),
     (
         "/// One.\n///\n#[allow(\n    /* keep this off */\n"

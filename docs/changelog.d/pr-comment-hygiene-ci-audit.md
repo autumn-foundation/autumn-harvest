@@ -2960,3 +2960,29 @@ this round's pair.
 
 Corpus effect: none. Four fixtures, covering both defects in more than
 one position.
+
+### Round ninety-seven — the end of a line, and the end of a host
+
+Two findings.
+
+A comment on the line that OPENS a multiline attribute still broke the
+doc run. Round 91 asked whether the line BEGAN inside an attribute, which
+`#[cfg(all(/* note */` does not. The right question reads both ends at
+once: a comment on the line is inside the attribute when the attribute is
+still open at the END of the line. `#[allow(dead_code)] // why` closes on
+its own line, so that comment is beside the attribute; `#[cfg(all(` does
+not close, so a comment after it is within. One test, both cases.
+
+That is the second round in which line granularity has been the wrong
+grain for this question. A comment written before the CLOSER on a closing
+line -- `/* why */ )]` -- is still misread, and is recorded in #1383
+rather than left unwritten. A third finding here means giving `Piece` its
+source offset and asking the question by position.
+
+`https://[` counted as a URL. An IPv6 literal is a host only when its
+bracket closes, and the tail could not close it because a `]` ends the
+citation form. The two host shapes are spelled apart now. The same edit
+fixes the other half of the report: `https://[::1]/p` on a marker's LEFT
+was rejected, because that pattern's tail excluded the `]` as well.
+
+Corpus effect: none. Three fixtures.
