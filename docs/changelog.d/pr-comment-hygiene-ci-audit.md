@@ -3109,3 +3109,32 @@ is what makes the fix reach all three.
 
 Corpus effect: none. Two fixtures, one of them a counter-case for a
 hyphen that is a separator rather than a scheme character.
+
+### Round one hundred and two — a shape after all, and a widening that went too far
+
+Two findings. The second is one I caused two rounds ago.
+
+`// TODO: deploy to the U.S. East region under #123` failed the build.
+Round one hundred kept a list for abbreviations followed by a capital, on
+the ground that abbreviations are a lexical set. That is true of `Dr.` and
+`vs.`; it is NOT true of an INITIALISM, which is a shape -- single letters
+separated by periods -- and reads itself. `U.S.`, `a.m.` and `Ph.D.` are
+all guarded now by one lookbehind, and no list grew.
+
+So the lexical-versus-structural distinction round one hundred drew was
+right about the tool and wrong about the boundary between the two sets. A
+list is still correct for `Dr.`; it was never correct for the initialisms
+inside it.
+
+`// #[This section is intentionally blank]` reported CH001, and so did
+`// #[]`. Round one hundred bounded an attribute by the `]` that closes
+it and stopped there, which admits any sentence written in brackets. An
+attribute opens with a PATH, and what may follow a path is `(`, `=`, `,`,
+`::` or the closing bracket -- never another bare word. Bounding the end
+of a construct is not the same as recognising it.
+
+The counter-cases that round ran were ordinary prose, and ordinary prose
+does not begin with `#[`. **A counter-case has to be written in the SHAPE
+of the widened form**, not merely in the neighbourhood of it.
+
+Corpus effect: none. Five fixtures, three of them counter-cases.

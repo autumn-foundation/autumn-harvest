@@ -346,7 +346,13 @@ COMMENTED_CODE_RE = re.compile(
       # line rather than by a class of what may sit inside. A class refused
       # `#[doc = include_str!("../README.md")]` for want of a `!`, and the
       # next nested form would have wanted something else.
-      | \#!?\[.*\]\s*$
+      #
+      # Bounding the END is not enough on its own, and round one hundred
+      # shipped it that way: `#[This section is intentionally blank]` is a
+      # sentence in brackets, and `#[]` is nothing at all. An attribute
+      # opens with a PATH, and what may follow the path is `(`, `=`, `,`,
+      # `::` or the closing bracket -- never another bare word.
+      | \#!?\[\s*(?:r\#)?\w+\s*(?:(?:::|[(=,]).*)?\]\s*$
       | \}[,;)]*\s*$
       | (?:(?:r\#)?\w+::)*(?:r\#)?\w+!(?:\(.*\)|\[.*\]|\{.*\})\s*;\s*$  # macro stmt
       # A macro DEFINITION, which ends at its brace rather than a `;`.
@@ -463,8 +469,16 @@ ABBREVIATIONS = (
 ABBREVIATION_GUARD = "".join(
     rf"(?<!\b{re.escape(name)})" for name in ABBREVIATIONS
 )
+# An INITIALISM is a shape rather than a list entry, so it is read and not
+# enumerated: single letters separated by periods, as in `U.S.`, `a.m.`
+# and `Ph.D.`. Any of them may be followed by a capital, which is what the
+# next-token test cannot see. This also covers `e.g.` and `i.e.`, whose
+# own entries are kept only because they are what the file has always
+# named.
+INITIALISM_GUARD = r"(?<![A-Za-z]\.[A-Za-z])"
 SENTENCE_END_RE = re.compile(
     ABBREVIATION_GUARD
+    + INITIALISM_GUARD
     + r"[.!?]"
     r"[*_\"')\]\u2019\u201d\u00bb]*"
     r"(?=\s+[A-Z\"'(\[\u201c\u2018]|\s*$)"
@@ -5046,6 +5060,21 @@ RULE_TESTS = [
         "and an attribute may hold a macro call",
     ),
     (
+        "// #[This section is intentionally blank]\n",
+        set(),
+        "but a sentence in brackets is not an attribute",
+    ),
+    (
+        "// #[]\n",
+        set(),
+        "and neither is nothing at all",
+    ),
+    (
+        "// #[non_exhaustive]\n",
+        {("CH001", 1)},
+        "while a bare path still is",
+    ),
+    (
         "// impl<T: Into<Vec<u8>>> Tr<T> for R {\n",
         {("CH001", 1)},
         "on an impl as well as a function",
@@ -5392,6 +5421,16 @@ RULE_TESTS = [
         "// TODO: compare vs. Baseline under #123\n",
         set(),
         "and so is any listed abbreviation before a capital",
+    ),
+    (
+        "// TODO: deploy to the U.S. East region under #123\n",
+        set(),
+        "an initialism is read by its shape, not from the list",
+    ),
+    (
+        "// TODO: run at 9 a.m. Then check #123\n",
+        set(),
+        "in lower case as well as capitals",
     ),
 ]
 
