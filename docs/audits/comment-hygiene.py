@@ -245,25 +245,36 @@ LITF = r"(?=[.?+*/%&|^<>=,-]|\])"
 # class already reads it, and `let ref (a, b) = t;` is not Rust.
 BIND = r"(?:ref\s+)?(?:mut\s+)?"
 
-# Is the tail of this declaration an EXPRESSION, or is it English? With no
-# operator to anchor on, a run of bare words separated by spaces is the only
-# thing the two share, so that run is what the guard reads.
+# Is the tail of this declaration an EXPRESSION, or is it English?
 #
-# Two words, not three. Round one hundred and sixteen widened the assignment
-# rule and left the old three-word threshold in place, which let
-# `mode = legacy default;` through an absolute gate -- rustc answers
-# "expected one of `!`, `.`, `::`, `;`, `?`, `{`, `}`, or an operator, found
-# `default`", so it is not an expression and never was.
+# It reads the LAST TWO ATOMS, not a run of bare words. Counting words was
+# wrong twice over: three was too many, so `mode = legacy default;` slipped
+# past in round one hundred and eighteen, and a bare-word run cannot see
+# punctuation, so `timeout = 30-second default;` slipped past in one hundred
+# and twenty-three -- the hyphen ends the run before two words are counted.
 #
-# `as` is the exception, and it is the ONLY one. `retries = count as usize;`
-# is a bare three-word run and valid Rust, and the old threshold refused it,
-# so this fragment fixes an under-report in the same stroke. `dyn`, `impl`
-# and `move` were checked and are not exceptions: they never appear in a
-# BARE word run, because `Box<dyn Send>`, `&dyn T` and `move || 1` all carry
-# a character that ends the run.
+# What actually separates the two is that an EXPRESSION never puts two atoms
+# side by side. `a - b;` has an operator between them; `legacy default;` and
+# `30-second default;` do not. So the test is whether the tail ends with a
+# word whose preceding character is neither an operator nor a delimiter.
+#
+# Five keywords DO put two atoms together, and each is checked against
+# rustc 1.94.1 rather than assumed. `as` in an expression --
+# `retries = count as usize;`. And in a TYPE, where the guard also runs:
+# `mut` in `&'a mut Worker`, `const` in `*const u8`, `dyn` in `&dyn Tr`,
+# `impl` beside them. The self-test caught the first two of those the
+# moment this guard became positional, because two shape fixtures hold
+# exactly those types.
+#
+# `move` is NOT among them: `move || 1` has the closure pipe between the
+# atoms, so it never reaches this test.
 #
 # One definition, spliced into the six rules that had written it out.
-PROSE = r"(?!\s*(?:(?!as\b)\w+\s+)+\w+\s*;\s*$)"
+PROSE = (
+    r"(?!.*[^\s\-+*/%&|^<>=!,(\[{:.?]"
+    r"(?<!\bas)(?<!\bmut)(?<!\bconst)(?<!\bdyn)(?<!\bimpl)"
+    r"\s+\w+\s*;\s*$)"
+)
 
 # The `;` that ENDS a declaration and the `;` inside an ARRAY are the same
 # character to a regex and different things to a reader. `[u8; 32]` is one
@@ -824,7 +835,12 @@ REFERENCE = (
     # So the prefix is spelled out instead of tolerated. Either the hash
     # opens a token, or a COMPLETE `owner/repo` sits against it. `x/#123`
     # has the slash and no repository, and is refused.
-    r"(?<![A-Za-z0-9_./\-])(?:[A-Za-z0-9_.\-]+/[A-Za-z0-9_.\-]+)?"
+    # An owner and a repository BEGIN with an alphanumeric. Round one
+    # hundred and seventeen spelled the prefix out and then let it be any
+    # run of punctuation, so `-/-#1` counted as a cross-repository
+    # reference and routes nowhere.
+    r"(?<![A-Za-z0-9_./\-])"
+    r"(?:[A-Za-z0-9][A-Za-z0-9_.\-]*/[A-Za-z0-9][A-Za-z0-9_.\-]*)?"
     r"#[1-9][0-9]*(?!\w)"
     r"|(?<![A-Za-z0-9+.\-])(?i:https?)://"
     r"(?:\[(?=[0-9A-Fa-f:.]*:)(?=[0-9A-Fa-f:.]*[0-9A-Fa-f])[0-9A-Fa-f:.]+\]|\w)"
@@ -6154,6 +6170,26 @@ RULE_TESTS = [
         "// const {the shard map is stale};\n",
         set(),
         "and a braced sentence is still a sentence",
+    ),
+    (
+        "// timeout = 30-second default;\n",
+        set(),
+        "a hyphen ends no atom pair, so this is still two adjacent words",
+    ),
+    (
+        "// x = a - b;\n",
+        {("CH001", 1)},
+        "but an operator between them makes an expression",
+    ),
+    (
+        "// TODO: fix -/-#1\n",
+        {("CH002", 1)},
+        "a repository coordinate begins with an alphanumeric",
+    ),
+    (
+        "// TODO: fix -owner/repo#1\n",
+        {("CH002", 1)},
+        "on the owner side as well",
     ),
     (
         '// #[doc = include_str!("../README.md")]\n',

@@ -3709,3 +3709,33 @@ The four-lowercase-word lookahead comes along, so
 `// const {the shard map is stale};` stays prose.
 
 Corpus effect: none, at 19311. Five fixtures, two of them refusals.
+
+Round 123 -- the prose guard reads atoms now, not words.
+
+`// timeout = 30-second default;` failed the build. The guard counted
+runs of bare words, and the hyphen in `30-second` ends a run before two
+words are there to count.
+
+Counting words was wrong twice over: three was too many, which let
+`mode = legacy default;` past in round one hundred and eighteen, and a
+word run cannot see punctuation, which let this one past.
+
+What actually separates the two is that an EXPRESSION never puts two
+atoms side by side. `a - b;` has an operator between them; `legacy
+default;` and `30-second default;` do not. The test is now whether the
+tail ends with a word whose preceding character is neither an operator
+nor a delimiter.
+
+Five keywords do legally put two atoms together, and each is checked
+against rustc rather than assumed: `as` in an expression, and `mut`,
+`const`, `dyn` and `impl` in a type, where this guard also runs. The
+self-test caught the first two the moment the guard became positional --
+`let handle: &'a mut Worker;` and `let ptr: *const u8;` are shape
+fixtures, and both went missing.
+
+`// TODO: fix -/-#1` counted as tracked. Round one hundred and seventeen
+spelled the cross-repository prefix out and then let it be any run of
+punctuation. An owner and a repository begin with an alphanumeric.
+
+Corpus effect: none, at 19311. Four fixtures. The new guard is also
+faster than the old one on a prose tail, 0.02 ms against 0.3 ms.
