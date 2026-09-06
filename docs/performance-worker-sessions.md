@@ -218,13 +218,13 @@ delta across them individually.
 
 First, `worker-session` issues twice as many statements per row: an
 `INSERT` plus an `UPDATE`, against `no-session`'s single `INSERT`. Each
-statement generates its own buffer touches and its own WAL record. This
-harness measures that nested-statement cost through
-`pg_stat_statements.shared_blks_hit` inside one server-side `CALL`, not
-through client/server round trips -- the extra round trip production pays
-for the separate `INSERT` and `UPDATE` (`queue::enqueue()` issues them as
-two client calls) is a real production cost this page does not measure or
-attribute to (review round 12).
+statement generates its own buffer touches. This harness measures that
+nested-statement cost through `pg_stat_statements.shared_blks_hit` inside
+one server-side `CALL` -- a buffer-only metric, with no WAL accounting --
+and not through client/server round trips. The extra round trip production
+pays for the separate `INSERT` and `UPDATE` (`queue::enqueue()` issues
+them as two client calls) is a real production cost this page does not
+measure or attribute to.
 
 Second, the `UPDATE` itself creates a second MVCC tuple version for every
 row.
@@ -377,11 +377,18 @@ only) -- this pass did not separately measure CPU cost.
   round trip production pays for the separate `INSERT` and `UPDATE`.** A
   review finding (round 12) correctly noted that the seeding harness runs
   both statements inside one server-side `CALL`, so
-  `pg_stat_statements.shared_blks_hit` captures their nested buffer and WAL
-  cost but not client/server round-trip latency. `queue::enqueue()` issues
-  the `INSERT` and `UPDATE` as two separate client calls in production, so
+  `pg_stat_statements.shared_blks_hit` captures their nested buffer cost
+  but not client/server round-trip latency. `queue::enqueue()` issues the
+  `INSERT` and `UPDATE` as two separate client calls in production, so
   that round trip is a real cost this page does not measure or attribute
   to.
+  **Correction (review round 13):** the revision above also said this
+  captured the nested statements' "buffer and WAL cost." A review finding
+  correctly caught that as overstated: the capture selects only
+  `shared_blks_hit`/`shared_blks_read`, and `pg_stat_statements` reports
+  WAL activity separately (`wal_records`, `wal_bytes`), neither of which
+  this page captures. The `+185.5%` figure is a buffer-only measurement;
+  it says nothing about WAL volume.
 - **Every seeded row gets its own, unique `session_id`; production sessions
   can group several member activities under one shared `session_id`.** A
   review finding (round 7) correctly noted that a session with N member
