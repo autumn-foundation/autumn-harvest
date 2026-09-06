@@ -20,6 +20,18 @@ The crate carries its own copy because a published crate can package no file
 from outside its own directory. `scripts/regenerate-openapi.sh` writes both
 copies from one transform, and a test fails when either drifts.
 
+## If your app already serves `/openapi.json`
+
+It keeps it. The route is nest-relative, so `HarvestPlugin::api("/api/harvest")`
+puts this document at `/api/harvest/openapi.json`, and `autumn-web`'s own
+generated document stays at the root. The two describe different surfaces:
+`autumn-web`'s covers the routes your app declares with its route macros, and
+this one covers the management API. `openapi_spec::the_route_does_not_take_the_application_root_path`
+pins that.
+
+Mounting the management router at the application root is the one case that
+collides. Axum then rejects the duplicate `GET /openapi.json` at startup.
+
 ## Generate a typed client in under ten minutes
 
 The worked example lives in

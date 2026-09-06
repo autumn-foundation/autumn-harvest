@@ -361,9 +361,8 @@ pub const CLASSIFIED_ROUTES: &[(&str, RouteClass)] = &[
     // Kubernetes liveness/readiness probes and load-balancer health checks
     // require /health to be reachable without credentials.
     ("GET /health", RouteClass::PublicSafe),
-    // Issue #694: the published OpenAPI 3.1 document. It describes the route
-    // surface only, carries no execution state, and a client generator must
-    // reach it before it holds a credential.
+    // The published OpenAPI document. Route surface only, no execution state,
+    // and a client generator must reach it before it holds a credential.
     ("GET /openapi.json", RouteClass::PublicSafe),
     // ── ReadOnly ── reads state, does not modify workflow execution ───────────
     // Audit-export status (issue #953): read-only, admin-gated. Reports cursor

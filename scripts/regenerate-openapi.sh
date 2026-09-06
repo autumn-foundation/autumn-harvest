@@ -1,15 +1,10 @@
 #!/usr/bin/env bash
-# Regenerate both checked-in copies of the OpenAPI 3.1 document (issue #694).
+# Write both copies of the OpenAPI document from docs/api-contract.json.
 #
-# Source: docs/api-contract.json.
+#   autumn-harvest-plugin/openapi.json  compact, compiled in and served.
+#   docs/openapi.json                   pretty-printed, for reading.
 #
-#   autumn-harvest-plugin/openapi.json  compact, compiled into the crate and
-#                                       served verbatim by GET /openapi.json.
-#   docs/openapi.json                   pretty-printed, for reading and for
-#                                       review diffs.
-#
-# Both hold the same document. `cargo test -p autumn-harvest-plugin --test
-# openapi_spec` fails when either drifts from the contract.
+# `cargo test -p autumn-harvest-plugin --test openapi_spec` fails on drift.
 set -euo pipefail
 
 root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -20,7 +15,7 @@ pretty="docs/openapi.json"
 compact="autumn-harvest-plugin/openapi.json"
 
 # The crate compiles in ${compact}, so the example cannot build without it.
-# Seed an empty object on a first run; the real content lands below.
+# Seed it on a first run; the real content lands below.
 [ -f "${compact}" ] || echo '{}' > "${compact}"
 
 cargo build --quiet -p autumn-harvest-plugin --example emit_openapi

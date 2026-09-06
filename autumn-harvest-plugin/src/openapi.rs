@@ -3,44 +3,36 @@
 // every mention in backticks, matching `autumn_web::openapi`.
 #![allow(clippy::doc_markdown)]
 
-//! OpenAPI 3.1 document for the Harvest management API (issue #694).
+//! OpenAPI 3.1 document for the Harvest management API.
 //!
 //! # One source
 //!
-//! `docs/api-contract.json` is the single source of truth for the management
-//! route surface. [`document_from_contract`] transforms it into an OpenAPI 3.1
-//! document. Two checked-in files hold that document, and one command writes
-//! both:
+//! `docs/api-contract.json` is the single source. [`document_from_contract`]
+//! transforms it. Two checked-in files hold the result, and
+//! `scripts/regenerate-openapi.sh` writes both:
 //!
 //! * `autumn-harvest-plugin/openapi.json` — compact, compiled in below, and
-//!   served verbatim by `GET /openapi.json`. It lives inside the crate because
-//!   a published crate can carry no file from outside its own directory.
-//! * `docs/openapi.json` — the same document, pretty-printed for reading and
-//!   for review diffs.
+//!   served verbatim. It lives inside the crate because a published crate can
+//!   carry no file from outside its own directory.
+//! * `docs/openapi.json` — the same document, pretty-printed for reading.
 //!
-//! `tests/openapi_spec.rs` fails when either file drifts from the transform, or
-//! from the other. Regenerate both with `scripts/regenerate-openapi.sh`.
-//!
-//! `tests/contract_regression.rs` pins the contract to `management_api_routes`,
-//! the canonical route list for `harvest_api_router`. It fails when a route is
-//! in one and not the other. A route on that list therefore cannot exist
-//! without reaching the published spec.
+//! `tests/openapi_spec.rs` fails when either file drifts. The contract is in
+//! turn pinned to `management_api_routes` by `tests/contract_regression.rs`, so
+//! a route on that list cannot exist without reaching the published spec.
 //!
 //! # Why a transform, not a macro
 //!
-//! `autumn-web` derives an OpenAPI document from routes declared with its own
-//! route macros, which carry `ApiDoc` metadata. `harvest_api_router` is a plain
-//! `axum::Router`, so no such metadata exists for these routes. The contract
-//! already records what the macros would infer, plus per-parameter `required`
-//! flags and per-route read-only classification, so the contract is the richer
-//! input. See `docs/openapi.md`.
+//! `autumn-web` derives its document from routes declared with its own route
+//! macros, which carry `ApiDoc` metadata. `harvest_api_router` is a plain
+//! `axum::Router` and carries none. The contract also records more than the
+//! macros infer: per-parameter `required` flags, and the read-only class.
+//! See `docs/openapi.md`.
 //!
 //! # Failure posture
 //!
-//! The served endpoint returns compiled-in bytes. It runs no transform, parses
-//! nothing, and allocates nothing, so a contract defect can never surface as a
-//! failed or panicking request. The transform runs in the generator and in
-//! tests, where a defect names the offending route and fails the build.
+//! The endpoint returns compiled-in bytes. It runs no transform and parses
+//! nothing, so a contract defect cannot reach a served request. The transform
+//! runs in the generator and in tests, where a defect names the route.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::LazyLock;

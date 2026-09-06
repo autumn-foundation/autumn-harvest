@@ -20,7 +20,9 @@ use autumn_harvest_plugin::api::{HarvestApiState, harvest_api_router};
 use autumn_harvest_plugin::management_api_routes;
 use autumn_harvest_plugin::openapi::{openapi_document, openapi_json};
 use autumn_web::AppState;
+use autumn_web::reexports::axum::Router;
 use autumn_web::reexports::axum::body::Body;
+use autumn_web::reexports::axum::routing::get;
 use autumn_web::reexports::http::{Method, Request, StatusCode};
 use serde_json::Value;
 use tower::ServiceExt;
@@ -335,7 +337,7 @@ fn read_only_classification_is_published() {
     );
 }
 
-/// Pin the classification of four routes by hand (issue #694 review).
+/// Pin the classification of four routes by hand.
 ///
 /// The sweep above compares the document against `CLASSIFIED_ROUTES`, which is
 /// also what the transform reads. These four are written out, so a wrong entry
@@ -368,8 +370,8 @@ fn known_routes_carry_their_expected_class() {
 }
 
 /// A documented response header reaches the document, so a generated client
-/// can read it (issue #694 review). The by-id family resolves a business id,
-/// and returns that resolution in `X-Harvest-Execution-Id`.
+/// can read it. The by-id family resolves a business id, and returns that
+/// resolution in `X-Harvest-Execution-Id`.
 #[test]
 fn documented_response_headers_are_published() {
     let doc = document();
@@ -545,6 +547,52 @@ fn checked_in_artifacts_match_the_generated_document() {
         "docs/openapi.json is stale. Regenerate both copies with:\n  \
          scripts/regenerate-openapi.sh"
     );
+}
+
+/// The route is nest-relative, so an app that already serves `/openapi.json`
+/// keeps it.
+///
+/// `HarvestPlugin` mounts `harvest_api_router` with `nest(api_path, ..)`, so
+/// the document lands at `{api_path}/openapi.json`. An embedding app that
+/// enables `autumn-web`'s own OpenAPI generation serves that document at the
+/// root, and the two never meet.
+#[tokio::test]
+async fn the_route_does_not_take_the_application_root_path() {
+    async fn app_document() -> &'static str {
+        "{\"openapi\":\"3.1.0\",\"info\":{\"title\":\"the embedding app\"}}"
+    }
+
+    let app = Router::new()
+        .route("/openapi.json", get(app_document))
+        .nest("/api/harvest", harvest_api_router(HarvestApiState::new()))
+        .with_state(AppState::for_test());
+
+    let harvest = body_of(app.clone(), "/api/harvest/openapi.json").await;
+    assert_eq!(
+        harvest["info"]["title"], "Harvest management API",
+        "the plugin serves its document under its own mount point"
+    );
+
+    let embedder = body_of(app, "/openapi.json").await;
+    assert_eq!(
+        embedder["info"]["title"], "the embedding app",
+        "the embedding application keeps the root path"
+    );
+}
+
+/// Fetch a path and parse the body as JSON.
+async fn body_of(app: Router<()>, uri: &str) -> Value {
+    let request = Request::builder()
+        .method(Method::GET)
+        .uri(uri)
+        .body(Body::empty())
+        .unwrap();
+    let response = app.oneshot(request).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK, "GET {uri}");
+    let body = autumn_web::reexports::axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    serde_json::from_slice(&body).expect("body must be JSON")
 }
 
 /// AC1 and AC7: the served endpoint answers 200 with exactly the artifact.

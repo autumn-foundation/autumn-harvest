@@ -4971,10 +4971,8 @@ pub fn harvest_api_router(api_state: HarvestApiState) -> Router<AppState> {
             post(redrive_dead_letters_handler).route_layer(require_admin.clone()),
         )
         .route("/health", get(health))
-        // Issue #694: the OpenAPI 3.1 document for this router. Read-only, and
-        // behind no admin gate, because a client generator must fetch it before
-        // it holds any credential. It reads no state. An embedder that wraps
-        // the whole router in its own auth middleware still gates it.
+        // No admin gate: a client generator fetches this before it holds any
+        // credential. An embedder's own auth middleware still gates it.
         .route("/openapi.json", get(crate::openapi::get_openapi_document))
         .route(
             "/admin/preflight",
@@ -6278,7 +6276,7 @@ pub const fn management_api_routes() -> &'static [(&'static str, &'static str)] 
         ("GET", "/batch-operations/{id}"),
         // ── health & admin ────────────────────────────────────────────────────
         ("GET", "/health"),
-        // Issue #694: the published OpenAPI 3.1 document for this router.
+        // The published OpenAPI 3.1 document for this router.
         ("GET", "/openapi.json"),
         ("GET", "/admin/preflight"),
         ("GET", "/admin/shards/health"),
@@ -7591,7 +7589,7 @@ pub const fn management_api_response_fields()
                 "shard_readiness",
             ]),
         ),
-        // Issue #694: the OpenAPI document itself, a free-form JSON object.
+        // The OpenAPI document itself, a free-form JSON object.
         ("GET", "/openapi.json", None),
         (
             "GET",

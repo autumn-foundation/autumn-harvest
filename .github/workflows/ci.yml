@@ -87,11 +87,9 @@ jobs:
           # still run the matrix — otherwise a hand-edited, stale, or malformed
           # baseline merges with no comparison at all, defeating the gate.
           #
-          # Same carve-out, same reason, for the management API contract and its
-          # generated OpenAPI document (issue #694). `docs/api-contract.json` is
-          # the source the router is pinned against, and `docs/openapi.json` is
-          # generated from it; both live under `docs/`, so without this a
-          # contract-only PR would skip every test that compares them.
+          # Same carve-out for the API contract and the OpenAPI document
+          # generated from it. Both live under `docs/`, so without this a
+          # contract-only PR skips the tests that compare them.
           if echo "$changed" | grep -qvE '^(docs/|.*\.md$)' \
             || echo "$changed" | grep -qxE 'docs/(workflow-schema-contract|api-contract|openapi)\.json'; then
             echo "code=true" >> "$GITHUB_OUTPUT"
@@ -339,28 +337,16 @@ jobs:
       # 4 long sentences in cross_region_dr_tests.rs and failed the gate.)
       # The predictable response is to regenerate the baseline, which defeats
       # the ratchet entirely. Tier A is never scoped -- it gates everywhere.
-      # Issue #694, AC2: the published OpenAPI document must validate under a
-      # standard validator with zero errors. Both checked-in copies are
-      # validated: the crate copy is what the endpoint serves, the docs copy is
-      # what an integrator reads. `openapi-spec-validator` is a pure Python
-      # package and reads the files, so this step never builds the crates and
-      # stays in the ungated `lint` job.
+      # Both copies: the crate one is served, the docs one is read. Runs here
+      # because a hand-edit of either is a docs-only change, which skips the
+      # test matrix. Freshness is checked there, by `openapi_spec`.
       #
-      # Ungated is the point: `docs/openapi.json` matches the docs-only filter,
-      # and a hand-edit of it is exactly the change class that would otherwise
-      # reach trunk with nothing checking it. The no-drift half of the gate is
-      # `openapi_spec::checked_in_artifacts_match_the_generated_document`,
-      # which regenerates from `docs/api-contract.json` and compares both
-      # copies; the `changes` job carves the contract and the docs copy out of
-      # the docs-only skip so that test runs on a contract-only PR.
-      # `actions/setup-python` puts a tool-cache interpreter first on PATH. The
-      # image's system Python is externally managed (PEP 668), which refuses a
-      # plain `pip install`. The version is pinned so a validator release cannot
-      # redden this job on its own.
+      # `setup-python` because the image's system Python refuses `pip install`
+      # (PEP 668). The validator is pinned so its releases cannot redden lint.
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-      - name: Validate the OpenAPI document (issue #694)
+      - name: Validate the OpenAPI document
         run: |
           python3 -m pip install --quiet --disable-pip-version-check \
             "openapi-spec-validator==0.9.0"
@@ -982,14 +968,12 @@ jobs:
           echo "::error::workflow did not reach COMPLETED within the timeout"; exit 1
 
   openapi-client-smoke:
-    name: Generated TypeScript client drives a running plugin (issue #694)
+    name: Generated TypeScript client drives a running plugin
     # IMPORTANT -- not yet enforced. Branch protection matches required checks
     # by name, so this job blocks nothing until a repository admin adds it to
     # the required set. Same caveat as `test-nodb` and `test-db-linux` above.
     needs: changes
-    # Draft-skip (see lint) + docs-only skip via the `changes` guard. The
-    # `changes` job carves docs/api-contract.json and docs/openapi.json out of
-    # the docs-only filter, so a contract-only PR still runs this job.
+    # Draft-skip (see lint) + docs-only skip via the `changes` guard.
     if: >-
       (github.event_name != 'pull_request' || github.event.pull_request.draft == false) &&
       needs.changes.outputs.code == 'true'
@@ -1018,11 +1002,8 @@ jobs:
           node-version: "22"
       - name: Build quickstart
         run: cargo build -p quickstart
-      # Issue #694 success metric: from a running HarvestPlugin to a generated
-      # client that starts a workflow and reads its status, with zero
-      # hand-written HTTP. The client is generated from the SERVED document, so
-      # this also proves the endpoint answers a real generator over real HTTP —
-      # something the in-process `oneshot` test cannot show.
+      # Generated from the SERVED document, so this also proves the endpoint
+      # answers a real generator over real HTTP.
       - name: Generate a typed client from the served document and drive it
         env:
           AUTUMN_PROFILE: dev
@@ -1049,10 +1030,8 @@ jobs:
             echo "::error::quickstart app never became healthy"; exit 1
           fi
 
-          # AC7, live half: the served document must equal the checked-in
-          # artifact. `openapi_spec::checked_in_artifacts_match_the_generated_document`
-          # proves it in process; this proves it over the wire, against the
-          # router an embedder actually mounts.
+          # Served document must equal the checked-in artifact. `openapi_spec`
+          # proves it in process; this proves it over the wire.
           curl -sf "${HARVEST_OPENAPI_URL}" | jq -S . > "${RUNNER_TEMP}/served.json"
           jq -S . docs/openapi.json > "${RUNNER_TEMP}/artifact.json"
           if ! diff -u "${RUNNER_TEMP}/artifact.json" "${RUNNER_TEMP}/served.json"; then
@@ -1061,8 +1040,8 @@ jobs:
           fi
 
           cd examples/typescript-client
-          # The registry is the one dependency here that fails for reasons
-          # unrelated to the change. Two tries, then it is a real failure.
+          # The registry is the one thing here that fails for unrelated
+          # reasons. Two tries, then it is real.
           npm ci --no-audit --no-fund || (sleep 10 && npm ci --no-audit --no-fund)
           npm run generate
           npm run typecheck
