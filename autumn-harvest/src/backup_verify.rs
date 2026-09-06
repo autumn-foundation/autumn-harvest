@@ -1160,8 +1160,9 @@ mod probes {
         VerifyOptions, compute_skew, redact_dsn,
     };
     use crate::event::WorkflowEvent;
+    use crate::shard::is_encodable_shard;
     use crate::testing::WorkflowReplayer;
-    use crate::types::{ExecutionId, ExternalTarget};
+    use crate::types::{ExecutionId, ExternalTarget, ShardId};
 
     /// One row of a bounded probe: a sample identifier plus the exact total
     /// (computed by a window function *before* `LIMIT`, so the count is never
@@ -2884,6 +2885,26 @@ mod probes {
         }
 
         let mut cross_shard = resolve_refs(&refs, targets).await;
+
+        // Guard the library entry point too, not only the CLI. `VerifyOptions`
+        // is public and `default_shard` a plain field. A caller of
+        // `verify_restore` directly (`with_default_shard`, or a struct
+        // literal) can supply a value `owning_shard` can never match against
+        // any real target. Every unencoded reference would then read as the
+        // advisory `UninspectedShardReference`, letting a torn reference pass
+        // at exit 0. This makes that outcome `Undetermined` (exit 2) instead,
+        // whatever else the run found (issue #1205).
+        if !is_encodable_shard(ShardId::new(options.default_shard)) {
+            cross_shard.push(
+                Finding::new(FindingClass::ProbeFailed, None, 1, Vec::new()).with_detail(format!(
+                    "VerifyOptions::default_shard `{}` cannot be encoded into an execution \
+                     id (valid range is 0..={}); unencoded target resolution cannot be \
+                     trusted for this run",
+                    options.default_shard,
+                    crate::shard::MAX_ENCODABLE_SHARD
+                )),
+            );
+        }
 
         let skew = compute_skew(shards.iter().map(|s| s.latest_event_at));
         if let Some(secs) = skew

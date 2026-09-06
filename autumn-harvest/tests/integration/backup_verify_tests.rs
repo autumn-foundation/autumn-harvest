@@ -758,6 +758,32 @@ async fn default_shard_option_changes_which_shard_is_checked() {
     );
 }
 
+/// Issue #1205's `--default-shard` fix, extended. The CLI validates its
+/// flag. But `VerifyOptions` is a public struct with a public
+/// `default_shard` field. A library embedder can still hand `verify_restore`
+/// an unencodable value directly. `owning_shard` would then never match any
+/// real target. Every unencoded reference would read as the advisory
+/// `UninspectedShardReference`, exit 0 on a run that could not actually
+/// check them. `verify_restore` itself must refuse to claim success.
+///
+/// No database needed: an empty target list never opens a connection, and
+/// the guard runs before any per-shard probing.
+#[tokio::test]
+async fn an_unencodable_default_shard_makes_the_library_entry_point_undetermined() {
+    let report = verify_restore(
+        &[],
+        &opts().with_default_shard(65_535),
+        &WorkflowReplayer::new(),
+    )
+    .await;
+    assert_eq!(
+        report.status,
+        VerifyStatus::Unavailable,
+        "an unencodable default_shard must never read as a pass: {report:#?}"
+    );
+    assert_eq!(report.exit_code(), 2);
+}
+
 /// A torn claim pair (`fire_claim_token` set, `fire_claimed_until` NULL) is
 /// PERMANENTLY wedged, not merely expired: the scheduler's claim predicate is
 /// `fire_claim_token IS NULL OR fire_claimed_until < NOW()`, which such a row
