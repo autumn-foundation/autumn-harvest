@@ -2704,6 +2704,18 @@ async fn zz_capture_worker_session_claim_evidence() {
         total_buffers: i64,
     }
 
+    // Unlike every other capture in this file, this predicate's own subject
+    // is `sticky_worker_id`. Its width directly composes the row-width
+    // mechanism this page measures (PR #1358). This file's usual short
+    // worker literal (`{BENCH_PREFIX}-worker-0`, 22 bytes) understates that
+    // width. Real `Worker::new` generates `worker_id:
+    // uuid::Uuid::new_v4().to_string()` (`worker.rs:409`), 36 bytes every
+    // time. `WORKER_ID` below matches that width instead of the shared
+    // short form. It must stay in sync with `worker_literal`'s quoted SQL
+    // form. It must also stay in sync with the real `claim_task()` drain
+    // further down, which binds it as a plain parameter, not SQL text.
+    const WORKER_ID: &str = "deadbeef-dead-4bee-8bee-deadbeefcafe";
+
     let Some(bench) = bench_db_or_skip().await else {
         eprintln!("no database reachable; nothing captured");
         return;
@@ -2719,17 +2731,6 @@ async fn zz_capture_worker_session_claim_evidence() {
 
     let mut summary_lines: Vec<String> = Vec::new();
     let raw = autumn_harvest::queue::claim_task_query();
-    // Unlike every other capture in this file, this predicate's own subject
-    // is `sticky_worker_id`. Its width directly composes the row-width
-    // mechanism this page measures (PR #1358). This file's usual short
-    // worker literal (`{BENCH_PREFIX}-worker-0`, 22 bytes) understates that
-    // width. Real `Worker::new` generates `worker_id:
-    // uuid::Uuid::new_v4().to_string()` (`worker.rs:409`), 36 bytes every
-    // time. `WORKER_ID` below matches that width instead of the shared
-    // short form. It must stay in sync with `worker_literal`'s quoted SQL
-    // form. It must also stay in sync with the real `claim_task()` drain
-    // further down, which binds it as a plain parameter, not SQL text.
-    const WORKER_ID: &str = "deadbeef-dead-4bee-8bee-deadbeefcafe";
     let worker_literal = format!("'{WORKER_ID}'");
 
     // Server-side per-row seeding procedure for the `worker-session` label.
