@@ -29,7 +29,7 @@ against routes reverse-engineered from prose.
 
 - **Derived, not annotated.** `autumn-web` generates OpenAPI from routes
   declared with its route macros, which attach `ApiDoc` metadata to a handler.
-  `harvest_api_router` is a plain `axum::Router`, so its 168 routes carry none.
+  `harvest_api_router` is a plain `axum::Router`, so its 169 routes carry none.
   The contract already records more than the macros could infer — per-parameter
   `required` flags, read-only class, idempotency rules, error responses — so the
   contract is the input and the module is a pure transform.
@@ -82,13 +82,23 @@ against routes reverse-engineered from prose.
   with its `204`. Both are now declared response headers instead of prose.
 - The two SSE routes declare `content_type: text/event-stream` explicitly
   rather than hiding it in prose.
+- Seven routes whose handler extracts a bare `Json<T>` declared an optional
+  request body. Axum rejects a bodiless request there, so a client honouring
+  the contract was rejected before the handler ran.
+- `X-Harvest-Execution-Id` is stamped by `finalize_by_id` on delegated errors
+  as well as successes, so it moved to a route-level `response_headers` list
+  and now appears on every documented response of the by-id family.
+- `PATCH /tasks/{id}` has been mounted and audited since issue #249, but was
+  missing from `management_api_routes()` and from the contract. It was
+  therefore invisible to every existing guard, to the CLI coverage test, and to
+  the published document. Found by the new router guard below.
 
 **Invariants.** No new `WorkflowEvent` variant, no migration, no shard-semantics
 change, no `harvest_events` write path. One additive read-only route.
 
 **Test evidence.**
 
-`autumn-harvest-plugin/tests/openapi_spec.rs` holds 12 tests, wired by one
+`autumn-harvest-plugin/tests/openapi_spec.rs` holds 13 tests, wired by one
 sorted line in `.github/ci/integration-suites.txt`. They assert:
 
 - Exact route coverage against `management_api_routes()`, in both directions.
@@ -106,6 +116,15 @@ sorted line in `.github/ci/integration-suites.txt`. They assert:
   version are pinned, `operationId`s are unique, and every `$ref` resolves.
 - Both checked-in copies equal the generated document byte for byte, and the
   served endpoint returns exactly those bytes.
+- The route is nest-relative, so an embedding app that serves its own
+  `/openapi.json` keeps it.
+
+Two new guards in `contract_regression.rs` read `src/api.rs` itself.
+`every_registered_route_is_in_the_canonical_list` parses the router and fails
+on a route missing from `management_api_routes()`; nothing checked that before,
+and it found `PATCH /tasks/{id}`.
+`contract_marks_a_mandatory_json_body_required` fails when a handler extracts a
+bare `Json<T>` and the contract calls its body optional.
 
 `openapi.rs` holds 18 unit tests for the transform edges. A missing `required`
 flag on a parameter or a body is rejected. A read method with a body is

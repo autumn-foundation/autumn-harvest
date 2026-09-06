@@ -507,6 +507,8 @@ fn responses(route: &Value) -> Result<Value, OpenApiError> {
     let mut descriptions: BTreeMap<u64, Vec<String>> = BTreeMap::new();
     let mut bodies: BTreeMap<u64, Value> = BTreeMap::new();
     let mut headers: BTreeMap<u64, Value> = BTreeMap::new();
+    // Headers the route stamps on every response it sends, whatever the status.
+    let every_response = header_map(&route["response_headers"]);
 
     descriptions
         .entry(status)
@@ -563,8 +565,12 @@ fn responses(route: &Value) -> Result<Value, OpenApiError> {
         if let Some(content) = bodies.remove(&code) {
             response.insert("content".to_owned(), content);
         }
-        if let Some(declared) = headers.remove(&code) {
-            response.insert("headers".to_owned(), declared);
+        let mut declared = every_response.clone();
+        if let Some(Value::Object(status_specific)) = headers.remove(&code) {
+            declared.extend(status_specific);
+        }
+        if !declared.is_empty() {
+            response.insert("headers".to_owned(), Value::Object(declared));
         }
         out.insert(code.to_string(), Value::Object(response));
     }
@@ -573,9 +579,18 @@ fn responses(route: &Value) -> Result<Value, OpenApiError> {
 
 /// Response headers a caller can read, from `headers` on a response entry.
 fn response_headers(response: &Value) -> Option<Value> {
-    let declared = response["headers"].as_array()?;
+    let declared = header_map(&response["headers"]);
+    if declared.is_empty() {
+        None
+    } else {
+        Some(Value::Object(declared))
+    }
+}
+
+/// Turn a contract header list into an OpenAPI headers object.
+fn header_map(declared: &Value) -> Map<String, Value> {
     let mut out = Map::new();
-    for header in declared {
+    for header in declared.as_array().into_iter().flatten() {
         let Some(name) = header["name"].as_str() else {
             continue;
         };
@@ -589,11 +604,7 @@ fn response_headers(response: &Value) -> Option<Value> {
         );
         out.insert(name.to_owned(), Value::Object(entry));
     }
-    if out.is_empty() {
-        None
-    } else {
-        Some(Value::Object(out))
-    }
+    out
 }
 
 /// Merge the contract's several description keys into one response description.

@@ -90,7 +90,7 @@
               }
             }
           },
-          "required": false
+          "required": true
         },
         "responses": {
           "200": {
@@ -222,7 +222,7 @@
               }
             }
           },
-          "required": false
+          "required": true
         },
         "responses": {
           "200": {
@@ -5628,7 +5628,7 @@
               }
             }
           },
-          "required": false
+          "required": true
         },
         "responses": {
           "201": {
@@ -6251,6 +6251,80 @@
         "x-harvest-route-class": "public_safe"
       }
     },
+    "/tasks/{id}": {
+      "patch": {
+        "description": "Re-prioritize a pending task without restarting its workflow (issue #249). An already-running task ignores the change; the next retry attempt uses the new priority. Admin only, and audited as task.reprioritize.",
+        "operationId": "patch_tasks_by_id",
+        "parameters": [
+          {
+            "description": "Task UUID.",
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "properties": {
+                  "priority": {
+                    "description": "New task priority.",
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "priority"
+                ],
+                "type": "object"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "properties": {
+                    "priority": {},
+                    "task_id": {},
+                    "updated": {
+                      "description": "true when the task row was re-prioritized; false when the task is terminal, so the row still exists but is no longer claimable."
+                    }
+                  },
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Success."
+          },
+          "400": {
+            "description": "Task id is not a UUID, or the priority value is unknown."
+          },
+          "401": {
+            "description": "Authentication required."
+          },
+          "404": {
+            "description": "No task with that id on any shard."
+          },
+          "500": {
+            "description": "Database error."
+          }
+        },
+        "summary": "Re-prioritize a pending task without restarting its workflow (issue #249).",
+        "tags": [
+          "queue"
+        ],
+        "x-harvest-idempotency": "Idempotent: setting the same priority twice leaves the row unchanged and returns the same body.",
+        "x-harvest-read-only": false,
+        "x-harvest-route-class": "mutating"
+      }
+    },
     "/workers": {
       "get": {
         "description": "List registered worker processes and their current lifecycle status. A malformed percent-encoded query-string byte sequence (an invalid UTF-8 byte, or an incomplete/non-hex `%` escape) is rejected with a 400 before any parameter is parsed, rather than silently substituting the Unicode replacement character and proceeding with a wrong-but-plausible value (issue #1151, sweeping the issue #774 `queue-coverage` fix to every other raw-pairs route).",
@@ -6501,7 +6575,7 @@
               }
             }
           },
-          "required": false
+          "required": true
         },
         "responses": {
           "200": {
@@ -7025,7 +7099,7 @@
             "description": "Same body as GET /workflows/{id}; resolved execution_id also in the X-Harvest-Execution-Id header.",
             "headers": {
               "X-Harvest-Execution-Id": {
-                "description": "The execution id GET /workflows/by-id/{workflow_name}/{workflow_id} resolved to. Present on every by-id response, including bodiless ones.",
+                "description": "The execution id this call resolved to. Stamped on every response the delegate returns, success or error. Absent when resolution itself failed, so a 404 for an unknown (workflow_name, workflow_id) does not carry it.",
                 "schema": {
                   "type": "string"
                 }
@@ -7033,10 +7107,26 @@
             }
           },
           "404": {
-            "description": "No run for (workflow_name, workflow_id)."
+            "description": "No run for (workflow_name, workflow_id).",
+            "headers": {
+              "X-Harvest-Execution-Id": {
+                "description": "The execution id this call resolved to. Stamped on every response the delegate returns, success or error. Absent when resolution itself failed, so a 404 for an unknown (workflow_name, workflow_id) does not carry it.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
           },
           "500": {
-            "description": "Database error."
+            "description": "Database error.",
+            "headers": {
+              "X-Harvest-Execution-Id": {
+                "description": "The execution id this call resolved to. Stamped on every response the delegate returns, success or error. Absent when resolution itself failed, so a 404 for an unknown (workflow_name, workflow_id) does not carry it.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
           }
         },
         "summary": "Describe the current run for a business (workflow_name, workflow_id).",
@@ -7084,7 +7174,7 @@
               }
             }
           },
-          "required": false
+          "required": true
         },
         "responses": {
           "202": {
@@ -7106,7 +7196,7 @@
             "description": "Success.",
             "headers": {
               "X-Harvest-Execution-Id": {
-                "description": "The execution id POST /workflows/by-id/{workflow_name}/{workflow_id}/cancel resolved to. Present on every by-id response, including bodiless ones.",
+                "description": "The execution id this call resolved to. Stamped on every response the delegate returns, success or error. Absent when resolution itself failed, so a 404 for an unknown (workflow_name, workflow_id) does not carry it.",
                 "schema": {
                   "type": "string"
                 }
@@ -7114,16 +7204,48 @@
             }
           },
           "401": {
-            "description": "Admin authentication required."
+            "description": "Admin authentication required.",
+            "headers": {
+              "X-Harvest-Execution-Id": {
+                "description": "The execution id this call resolved to. Stamped on every response the delegate returns, success or error. Absent when resolution itself failed, so a 404 for an unknown (workflow_name, workflow_id) does not carry it.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
           },
           "404": {
-            "description": "No run for (workflow_name, workflow_id)."
+            "description": "No run for (workflow_name, workflow_id).",
+            "headers": {
+              "X-Harvest-Execution-Id": {
+                "description": "The execution id this call resolved to. Stamped on every response the delegate returns, success or error. Absent when resolution itself failed, so a 404 for an unknown (workflow_name, workflow_id) does not carry it.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
           },
           "409": {
-            "description": "Execution is already in a terminal state."
+            "description": "Execution is already in a terminal state.",
+            "headers": {
+              "X-Harvest-Execution-Id": {
+                "description": "The execution id this call resolved to. Stamped on every response the delegate returns, success or error. Absent when resolution itself failed, so a 404 for an unknown (workflow_name, workflow_id) does not carry it.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
           },
           "500": {
-            "description": "Database error."
+            "description": "Database error.",
+            "headers": {
+              "X-Harvest-Execution-Id": {
+                "description": "The execution id this call resolved to. Stamped on every response the delegate returns, success or error. Absent when resolution itself failed, so a 404 for an unknown (workflow_name, workflow_id) does not carry it.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
           }
         },
         "summary": "Cancel the current run of a business (workflow_name, workflow_id).",
@@ -7221,7 +7343,7 @@
             "description": "Same body as GET /workflows/{id}/children ({items, next_cursor}); resolved execution_id in the X-Harvest-Execution-Id header.",
             "headers": {
               "X-Harvest-Execution-Id": {
-                "description": "The execution id GET /workflows/by-id/{workflow_name}/{workflow_id}/children resolved to. Present on every by-id response, including bodiless ones.",
+                "description": "The execution id this call resolved to. Stamped on every response the delegate returns, success or error. Absent when resolution itself failed, so a 404 for an unknown (workflow_name, workflow_id) does not carry it.",
                 "schema": {
                   "type": "string"
                 }
@@ -7229,13 +7351,37 @@
             }
           },
           "400": {
-            "description": "Malformed query string: a percent-encoded byte sequence in the query does not decode to valid UTF-8."
+            "description": "Malformed query string: a percent-encoded byte sequence in the query does not decode to valid UTF-8.",
+            "headers": {
+              "X-Harvest-Execution-Id": {
+                "description": "The execution id this call resolved to. Stamped on every response the delegate returns, success or error. Absent when resolution itself failed, so a 404 for an unknown (workflow_name, workflow_id) does not carry it.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
           },
           "404": {
-            "description": "No run for (workflow_name, workflow_id)."
+            "description": "No run for (workflow_name, workflow_id).",
+            "headers": {
+              "X-Harvest-Execution-Id": {
+                "description": "The execution id this call resolved to. Stamped on every response the delegate returns, success or error. Absent when resolution itself failed, so a 404 for an unknown (workflow_name, workflow_id) does not carry it.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
           },
           "500": {
-            "description": "Database error."
+            "description": "Database error.",
+            "headers": {
+              "X-Harvest-Execution-Id": {
+                "description": "The execution id this call resolved to. Stamped on every response the delegate returns, success or error. Absent when resolution itself failed, so a 404 for an unknown (workflow_name, workflow_id) does not carry it.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
           }
         },
         "summary": "List child executions of the current run for a business (workflow_name, workflow_id).",
@@ -7306,7 +7452,7 @@
             "description": "Success.",
             "headers": {
               "X-Harvest-Execution-Id": {
-                "description": "The execution id POST /workflows/by-id/{workflow_name}/{workflow_id}/pause resolved to. Present on every by-id response, including bodiless ones.",
+                "description": "The execution id this call resolved to. Stamped on every response the delegate returns, success or error. Absent when resolution itself failed, so a 404 for an unknown (workflow_name, workflow_id) does not carry it.",
                 "schema": {
                   "type": "string"
                 }
@@ -7314,19 +7460,59 @@
             }
           },
           "400": {
-            "description": "Pause reason exceeds the length cap."
+            "description": "Pause reason exceeds the length cap.",
+            "headers": {
+              "X-Harvest-Execution-Id": {
+                "description": "The execution id this call resolved to. Stamped on every response the delegate returns, success or error. Absent when resolution itself failed, so a 404 for an unknown (workflow_name, workflow_id) does not carry it.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
           },
           "401": {
-            "description": "Admin authentication required."
+            "description": "Admin authentication required.",
+            "headers": {
+              "X-Harvest-Execution-Id": {
+                "description": "The execution id this call resolved to. Stamped on every response the delegate returns, success or error. Absent when resolution itself failed, so a 404 for an unknown (workflow_name, workflow_id) does not carry it.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
           },
           "404": {
-            "description": "No run for (workflow_name, workflow_id)."
+            "description": "No run for (workflow_name, workflow_id).",
+            "headers": {
+              "X-Harvest-Execution-Id": {
+                "description": "The execution id this call resolved to. Stamped on every response the delegate returns, success or error. Absent when resolution itself failed, so a 404 for an unknown (workflow_name, workflow_id) does not carry it.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
           },
           "409": {
-            "description": "Execution is in a terminal state and cannot be paused."
+            "description": "Execution is in a terminal state and cannot be paused.",
+            "headers": {
+              "X-Harvest-Execution-Id": {
+                "description": "The execution id this call resolved to. Stamped on every response the delegate returns, success or error. Absent when resolution itself failed, so a 404 for an unknown (workflow_name, workflow_id) does not carry it.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
           },
           "500": {
-            "description": "Database error."
+            "description": "Database error.",
+            "headers": {
+              "X-Harvest-Execution-Id": {
+                "description": "The execution id this call resolved to. Stamped on every response the delegate returns, success or error. Absent when resolution itself failed, so a 404 for an unknown (workflow_name, workflow_id) does not carry it.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
           }
         },
         "summary": "Pause the current run of a business (workflow_name, workflow_id).",
@@ -7387,7 +7573,7 @@
             "description": "Success.",
             "headers": {
               "X-Harvest-Execution-Id": {
-                "description": "The execution id GET /workflows/by-id/{workflow_name}/{workflow_id}/query/{query_name} resolved to. Present on every by-id response, including bodiless ones.",
+                "description": "The execution id this call resolved to. Stamped on every response the delegate returns, success or error. Absent when resolution itself failed, so a 404 for an unknown (workflow_name, workflow_id) does not carry it.",
                 "schema": {
                   "type": "string"
                 }
@@ -7395,16 +7581,48 @@
             }
           },
           "404": {
-            "description": "No run for (workflow_name, workflow_id), or query handler not registered."
+            "description": "No run for (workflow_name, workflow_id), or query handler not registered.",
+            "headers": {
+              "X-Harvest-Execution-Id": {
+                "description": "The execution id this call resolved to. Stamped on every response the delegate returns, success or error. Absent when resolution itself failed, so a 404 for an unknown (workflow_name, workflow_id) does not carry it.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
           },
           "408": {
-            "description": "Query timed out."
+            "description": "Query timed out.",
+            "headers": {
+              "X-Harvest-Execution-Id": {
+                "description": "The execution id this call resolved to. Stamped on every response the delegate returns, success or error. Absent when resolution itself failed, so a 404 for an unknown (workflow_name, workflow_id) does not carry it.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
           },
           "409": {
-            "description": "Workflow is not in a running state."
+            "description": "Workflow is not in a running state.",
+            "headers": {
+              "X-Harvest-Execution-Id": {
+                "description": "The execution id this call resolved to. Stamped on every response the delegate returns, success or error. Absent when resolution itself failed, so a 404 for an unknown (workflow_name, workflow_id) does not carry it.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
           },
           "503": {
-            "description": "Query handler panicked."
+            "description": "Query handler panicked.",
+            "headers": {
+              "X-Harvest-Execution-Id": {
+                "description": "The execution id this call resolved to. Stamped on every response the delegate returns, success or error. Absent when resolution itself failed, so a 404 for an unknown (workflow_name, workflow_id) does not carry it.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
           }
         },
         "summary": "Invoke a registered no-arg query handler on the current run of a business (workflow_name, workflow_id).",
@@ -7477,7 +7695,7 @@
             "description": "Success.",
             "headers": {
               "X-Harvest-Execution-Id": {
-                "description": "The execution id POST /workflows/by-id/{workflow_name}/{workflow_id}/query/{query_name} resolved to. Present on every by-id response, including bodiless ones.",
+                "description": "The execution id this call resolved to. Stamped on every response the delegate returns, success or error. Absent when resolution itself failed, so a 404 for an unknown (workflow_name, workflow_id) does not carry it.",
                 "schema": {
                   "type": "string"
                 }
@@ -7485,19 +7703,59 @@
             }
           },
           "400": {
-            "description": "Args failed to deserialize into the handler's request type."
+            "description": "Args failed to deserialize into the handler's request type.",
+            "headers": {
+              "X-Harvest-Execution-Id": {
+                "description": "The execution id this call resolved to. Stamped on every response the delegate returns, success or error. Absent when resolution itself failed, so a 404 for an unknown (workflow_name, workflow_id) does not carry it.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
           },
           "404": {
-            "description": "No run for (workflow_name, workflow_id), or query handler not registered."
+            "description": "No run for (workflow_name, workflow_id), or query handler not registered.",
+            "headers": {
+              "X-Harvest-Execution-Id": {
+                "description": "The execution id this call resolved to. Stamped on every response the delegate returns, success or error. Absent when resolution itself failed, so a 404 for an unknown (workflow_name, workflow_id) does not carry it.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
           },
           "408": {
-            "description": "Query timed out."
+            "description": "Query timed out.",
+            "headers": {
+              "X-Harvest-Execution-Id": {
+                "description": "The execution id this call resolved to. Stamped on every response the delegate returns, success or error. Absent when resolution itself failed, so a 404 for an unknown (workflow_name, workflow_id) does not carry it.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
           },
           "409": {
-            "description": "Workflow is not in a running state."
+            "description": "Workflow is not in a running state.",
+            "headers": {
+              "X-Harvest-Execution-Id": {
+                "description": "The execution id this call resolved to. Stamped on every response the delegate returns, success or error. Absent when resolution itself failed, so a 404 for an unknown (workflow_name, workflow_id) does not carry it.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
           },
           "503": {
-            "description": "Query handler panicked."
+            "description": "Query handler panicked.",
+            "headers": {
+              "X-Harvest-Execution-Id": {
+                "description": "The execution id this call resolved to. Stamped on every response the delegate returns, success or error. Absent when resolution itself failed, so a 404 for an unknown (workflow_name, workflow_id) does not carry it.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
           }
         },
         "summary": "Invoke a registered query handler with typed JSON args on the current run of a business (workflow_name, workflow_id).",
@@ -7554,7 +7812,7 @@
             "description": "Same body as GET /workflows/{id}/result (204 No Content with Retry-After when still running). Resolved execution_id in the X-Harvest-Execution-Id header on every response.",
             "headers": {
               "X-Harvest-Execution-Id": {
-                "description": "The execution id GET /workflows/by-id/{workflow_name}/{workflow_id}/result resolved to. Present on every by-id response, including bodiless ones.",
+                "description": "The execution id this call resolved to. Stamped on every response the delegate returns, success or error. Absent when resolution itself failed, so a 404 for an unknown (workflow_name, workflow_id) does not carry it.",
                 "schema": {
                   "type": "string"
                 }
@@ -7569,17 +7827,47 @@
                 "schema": {
                   "type": "integer"
                 }
+              },
+              "X-Harvest-Execution-Id": {
+                "description": "The execution id this call resolved to. Stamped on every response the delegate returns, success or error. Absent when resolution itself failed, so a 404 for an unknown (workflow_name, workflow_id) does not carry it.",
+                "schema": {
+                  "type": "string"
+                }
               }
             }
           },
           "400": {
-            "description": "Invalid wait duration. Malformed query string: a percent-encoded byte sequence in the query does not decode to valid UTF-8."
+            "description": "Invalid wait duration. Malformed query string: a percent-encoded byte sequence in the query does not decode to valid UTF-8.",
+            "headers": {
+              "X-Harvest-Execution-Id": {
+                "description": "The execution id this call resolved to. Stamped on every response the delegate returns, success or error. Absent when resolution itself failed, so a 404 for an unknown (workflow_name, workflow_id) does not carry it.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
           },
           "404": {
-            "description": "No run for (workflow_name, workflow_id)."
+            "description": "No run for (workflow_name, workflow_id).",
+            "headers": {
+              "X-Harvest-Execution-Id": {
+                "description": "The execution id this call resolved to. Stamped on every response the delegate returns, success or error. Absent when resolution itself failed, so a 404 for an unknown (workflow_name, workflow_id) does not carry it.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
           },
           "500": {
-            "description": "Database or listener error."
+            "description": "Database or listener error.",
+            "headers": {
+              "X-Harvest-Execution-Id": {
+                "description": "The execution id this call resolved to. Stamped on every response the delegate returns, success or error. Absent when resolution itself failed, so a 404 for an unknown (workflow_name, workflow_id) does not carry it.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
           }
         },
         "summary": "Compact terminal result for the current run of a business (workflow_name, workflow_id).",
@@ -7634,7 +7922,7 @@
             "description": "Success.",
             "headers": {
               "X-Harvest-Execution-Id": {
-                "description": "The execution id POST /workflows/by-id/{workflow_name}/{workflow_id}/resume resolved to. Present on every by-id response, including bodiless ones.",
+                "description": "The execution id this call resolved to. Stamped on every response the delegate returns, success or error. Absent when resolution itself failed, so a 404 for an unknown (workflow_name, workflow_id) does not carry it.",
                 "schema": {
                   "type": "string"
                 }
@@ -7642,13 +7930,37 @@
             }
           },
           "401": {
-            "description": "Admin authentication required."
+            "description": "Admin authentication required.",
+            "headers": {
+              "X-Harvest-Execution-Id": {
+                "description": "The execution id this call resolved to. Stamped on every response the delegate returns, success or error. Absent when resolution itself failed, so a 404 for an unknown (workflow_name, workflow_id) does not carry it.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
           },
           "404": {
-            "description": "No run for (workflow_name, workflow_id)."
+            "description": "No run for (workflow_name, workflow_id).",
+            "headers": {
+              "X-Harvest-Execution-Id": {
+                "description": "The execution id this call resolved to. Stamped on every response the delegate returns, success or error. Absent when resolution itself failed, so a 404 for an unknown (workflow_name, workflow_id) does not carry it.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
           },
           "500": {
-            "description": "Database error."
+            "description": "Database error.",
+            "headers": {
+              "X-Harvest-Execution-Id": {
+                "description": "The execution id this call resolved to. Stamped on every response the delegate returns, success or error. Absent when resolution itself failed, so a 404 for an unknown (workflow_name, workflow_id) does not carry it.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
           }
         },
         "summary": "Resume the current (paused) run of a business (workflow_name, workflow_id).",
@@ -7719,7 +8031,7 @@
               }
             }
           },
-          "required": false
+          "required": true
         },
         "responses": {
           "202": {
@@ -7739,7 +8051,7 @@
             "description": "routed_execution_id (issue #843) is present only when the resolved execution id differed from the live workflow-level-retry attempt the signal actually landed on; it is omitted otherwise.",
             "headers": {
               "X-Harvest-Execution-Id": {
-                "description": "The execution id POST /workflows/by-id/{workflow_name}/{workflow_id}/signal/{signal_name} resolved to. Present on every by-id response, including bodiless ones.",
+                "description": "The execution id this call resolved to. Stamped on every response the delegate returns, success or error. Absent when resolution itself failed, so a 404 for an unknown (workflow_name, workflow_id) does not carry it.",
                 "schema": {
                   "type": "string"
                 }
@@ -7747,10 +8059,26 @@
             }
           },
           "404": {
-            "description": "No run for (workflow_name, workflow_id)."
+            "description": "No run for (workflow_name, workflow_id).",
+            "headers": {
+              "X-Harvest-Execution-Id": {
+                "description": "The execution id this call resolved to. Stamped on every response the delegate returns, success or error. Absent when resolution itself failed, so a 404 for an unknown (workflow_name, workflow_id) does not carry it.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
           },
           "500": {
-            "description": "Database error."
+            "description": "Database error.",
+            "headers": {
+              "X-Harvest-Execution-Id": {
+                "description": "The execution id this call resolved to. Stamped on every response the delegate returns, success or error. Absent when resolution itself failed, so a 404 for an unknown (workflow_name, workflow_id) does not carry it.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
           }
         },
         "summary": "Send a named signal to the current run of a business (workflow_name, workflow_id).",
@@ -7798,7 +8126,7 @@
             "description": "Same body as GET /workflows/{id}/stack; resolved execution_id in the X-Harvest-Execution-Id header.",
             "headers": {
               "X-Harvest-Execution-Id": {
-                "description": "The execution id GET /workflows/by-id/{workflow_name}/{workflow_id}/stack resolved to. Present on every by-id response, including bodiless ones.",
+                "description": "The execution id this call resolved to. Stamped on every response the delegate returns, success or error. Absent when resolution itself failed, so a 404 for an unknown (workflow_name, workflow_id) does not carry it.",
                 "schema": {
                   "type": "string"
                 }
@@ -7806,10 +8134,26 @@
             }
           },
           "404": {
-            "description": "No run for (workflow_name, workflow_id)."
+            "description": "No run for (workflow_name, workflow_id).",
+            "headers": {
+              "X-Harvest-Execution-Id": {
+                "description": "The execution id this call resolved to. Stamped on every response the delegate returns, success or error. Absent when resolution itself failed, so a 404 for an unknown (workflow_name, workflow_id) does not carry it.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
           },
           "500": {
-            "description": "Database error."
+            "description": "Database error.",
+            "headers": {
+              "X-Harvest-Execution-Id": {
+                "description": "The execution id this call resolved to. Stamped on every response the delegate returns, success or error. Absent when resolution itself failed, so a 404 for an unknown (workflow_name, workflow_id) does not carry it.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
           }
         },
         "summary": "Current wait state (what it is blocked on) for the current run of a business (workflow_name, workflow_id).",
@@ -8482,7 +8826,7 @@
               }
             }
           },
-          "required": false
+          "required": true
         },
         "responses": {
           "200": {
@@ -9972,7 +10316,7 @@
               }
             }
           },
-          "required": false
+          "required": true
         },
         "responses": {
           "202": {
@@ -10511,7 +10855,7 @@
               }
             }
           },
-          "required": false
+          "required": true
         },
         "responses": {
           "202": {

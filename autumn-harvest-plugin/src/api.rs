@@ -6274,6 +6274,8 @@ pub const fn management_api_routes() -> &'static [(&'static str, &'static str)] 
         ("GET", "/batch-operations"),
         ("POST", "/batch-operations"),
         ("GET", "/batch-operations/{id}"),
+        // ── task priority (issue #249) ────────────────────────────────────────
+        ("PATCH", "/tasks/{id}"),
         // ── health & admin ────────────────────────────────────────────────────
         ("GET", "/health"),
         // The published OpenAPI 3.1 document for this router.
@@ -6635,6 +6637,7 @@ pub const fn management_api_request_fields()
         // ── workers ───────────────────────────────────────────────────────────
         ("POST", "/workers/{worker_id}/drain", Some(&["deadline_at"])),
         // ── batch operations ──────────────────────────────────────────────────
+        ("PATCH", "/tasks/{id}", Some(&["priority"])),
         (
             "POST",
             "/batch-operations",
@@ -7575,6 +7578,11 @@ pub const fn management_api_response_fields()
             ]),
         ),
         ("GET", "/batch-operations/{id}", None), // BatchJobView (external model)
+        (
+            "PATCH",
+            "/tasks/{id}",
+            Some(&["task_id", "priority", "updated"]),
+        ),
         // ── health & admin ────────────────────────────────────────────────────
         (
             "GET",

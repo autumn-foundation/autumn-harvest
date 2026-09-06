@@ -1398,6 +1398,157 @@ fn contract_declares_every_path_parameter() {
     );
 }
 
+/// Every route `harvest_api_router` registers must be in `management_api_routes`.
+///
+/// The other guards compare the canonical list against the contract, the class
+/// table and the audit manifests. None of them reads the router. A route left
+/// off the list was therefore invisible to all of them, and to the published
+/// document. This one reads the router source. It found `PATCH /tasks/{id}`,
+/// mounted and audited but absent from the list and the contract.
+#[test]
+fn every_registered_route_is_in_the_canonical_list() {
+    const API_SOURCE: &str = include_str!("../src/api.rs");
+
+    let canonical: HashSet<(String, String)> = management_api_routes()
+        .iter()
+        .map(|(method, path)| ((*method).to_owned(), (*path).to_owned()))
+        .collect();
+
+    let mut unlisted: Vec<String> = router_handlers(API_SOURCE)
+        .into_iter()
+        .filter(|(method, path, _)| !canonical.contains(&(method.clone(), path.clone())))
+        .map(|(method, path, handler)| format!("{method} {path} ({handler})"))
+        .collect();
+    unlisted.sort();
+    unlisted.dedup();
+
+    assert!(
+        unlisted.is_empty(),
+        "routes registered in harvest_api_router but missing from \
+         management_api_routes():\n{unlisted:#?}"
+    );
+}
+
+/// A handler that extracts `Json<T>` must have `request_body.required: true`.
+///
+/// Axum's `Json` extractor rejects a request with no body, so a client that
+/// honours `required: false` is rejected before the handler runs. The reverse
+/// direction is not checked. A handler taking `Bytes`, `Option<Json<T>>` or
+/// `Result<Json<T>, _>` decides for itself, and several do require a body.
+#[test]
+fn contract_marks_a_mandatory_json_body_required() {
+    const API_SOURCE: &str = include_str!("../src/api.rs");
+
+    let contract = load_contract();
+    let bodies: HashMap<(String, String), Option<bool>> = contract["routes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|route| {
+            (
+                (
+                    route["method"].as_str().unwrap_or_default().to_owned(),
+                    route["path"].as_str().unwrap_or_default().to_owned(),
+                ),
+                route["request_body"]["required"].as_bool(),
+            )
+        })
+        .collect();
+
+    let mut offenders = Vec::new();
+    for (method, path, handler) in router_handlers(API_SOURCE) {
+        let Some(params) = handler_parameters(API_SOURCE, &handler) else {
+            continue;
+        };
+        let extracts_json = params.contains("Json(")
+            && !params.contains("Option<Json<")
+            && !params.contains("Result<Json<");
+        if !extracts_json {
+            continue;
+        }
+        if bodies.get(&(method.clone(), path.clone())) != Some(&Some(true)) {
+            offenders.push(format!("{method} {path} ({handler})"));
+        }
+    }
+
+    assert!(
+        offenders.is_empty(),
+        "these handlers extract `Json<T>`, so their contract entry needs \
+         `request_body.required: true`:\n{offenders:#?}"
+    );
+}
+
+/// Every `(METHOD, path, handler)` registered in `harvest_api_router`.
+fn router_handlers(source: &str) -> Vec<(String, String, String)> {
+    let start = source
+        .find("pub fn harvest_api_router(")
+        .expect("harvest_api_router must exist");
+    // Stop at the next item, so a `.route(` call in a later function or test
+    // is never mistaken for a mounted route.
+    let end = source[start..]
+        .find("\n}\n")
+        .map_or(source.len(), |at| start + at);
+    let body = &source[start..end];
+    let mut out = Vec::new();
+    let mut rest = body;
+    while let Some(at) = rest.find(".route(") {
+        let args = balanced(&rest[at + ".route(".len() - 1..]);
+        if let Some(path) = args.split('"').nth(1) {
+            for verb in ["get(", "post(", "put(", "patch(", "delete("] {
+                let mut from = args;
+                while let Some(at) = from.find(verb) {
+                    let tail = &from[at + verb.len()..];
+                    let handler: String = tail
+                        .trim_start()
+                        .chars()
+                        .take_while(|c| c.is_alphanumeric() || *c == '_')
+                        .collect();
+                    if !handler.is_empty() {
+                        out.push((
+                            verb.trim_end_matches('(').to_uppercase(),
+                            path.to_owned(),
+                            handler,
+                        ));
+                    }
+                    from = &from[at + verb.len()..];
+                }
+            }
+        }
+        rest = &rest[at + ".route(".len()..];
+    }
+    assert!(
+        out.len() > 100,
+        "the router parser found only {} routes; it has drifted from the source",
+        out.len()
+    );
+    out
+}
+
+/// The parameter list of `async fn <name>(..)`, or `None` when it is elsewhere.
+fn handler_parameters(source: &str, name: &str) -> Option<String> {
+    let at = source.find(&format!("async fn {name}("))?;
+    let open = source[at..].find('(')? + at;
+    Some(balanced(&source[open..]).to_owned())
+}
+
+/// The balanced `(..)` group starting at the first character.
+fn balanced(text: &str) -> &str {
+    let mut depth = 0usize;
+    for (index, c) in text.char_indices() {
+        match c {
+            '(' => depth += 1,
+            ')' => {
+                depth -= 1;
+                if depth == 0 {
+                    return &text[..=index];
+                }
+            }
+            _ => {}
+        }
+    }
+    text
+}
+
 // ── Read-only operator role (issue #776) ──────────────────────────────────────
 
 /// AC4 coverage sweep: EVERY route registered in `management_api_routes()` (the

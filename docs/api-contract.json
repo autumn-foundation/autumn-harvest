@@ -1530,7 +1530,7 @@
         }
       ],
       "request_body": {
-        "required": false,
+        "required": true,
         "free_form": false,
         "fields": [
           {
@@ -2383,7 +2383,7 @@
         }
       ],
       "request_body": {
-        "required": false,
+        "required": true,
         "free_form": true,
         "description": "Optional signal payload \u2014 the entire body is passed verbatim to the signal handler.",
         "fields": []
@@ -2583,7 +2583,7 @@
         }
       ],
       "request_body": {
-        "required": false,
+        "required": true,
         "free_form": false,
         "fields": [
           {
@@ -2914,7 +2914,7 @@
         }
       ],
       "request_body": {
-        "required": false,
+        "required": true,
         "free_form": false,
         "fields": [
           {
@@ -3432,7 +3432,7 @@
         }
       ],
       "request_body": {
-        "required": false,
+        "required": true,
         "free_form": false,
         "fields": [
           {
@@ -3529,7 +3529,7 @@
         }
       ],
       "request_body": {
-        "required": false,
+        "required": true,
         "free_form": false,
         "fields": [
           {
@@ -3737,7 +3737,7 @@
         }
       ],
       "request_body": {
-        "required": false,
+        "required": true,
         "free_form": false,
         "fields": [
           {
@@ -3951,6 +3951,63 @@
         {
           "status": 400,
           "description": "Invalid action or missing required fields."
+        },
+        {
+          "status": 500,
+          "description": "Database error."
+        }
+      ]
+    },
+    {
+      "method": "PATCH",
+      "path": "/tasks/{id}",
+      "category": "queue",
+      "read_only": false,
+      "description": "Re-prioritize a pending task without restarting its workflow (issue #249). An already-running task ignores the change; the next retry attempt uses the new priority. Admin only, and audited as task.reprioritize.",
+      "idempotency": "Idempotent: setting the same priority twice leaves the row unchanged and returns the same body.",
+      "params": [
+        {
+          "name": "id",
+          "in": "path",
+          "required": true,
+          "description": "Task UUID."
+        }
+      ],
+      "request_body": {
+        "required": true,
+        "free_form": false,
+        "fields": [
+          {
+            "name": "priority",
+            "type": "string",
+            "required": true,
+            "description": "New task priority."
+          }
+        ]
+      },
+      "success_response": {
+        "status": 200,
+        "fields": [
+          "task_id",
+          "priority",
+          "updated"
+        ],
+        "field_notes": {
+          "updated": "true when the task row was re-prioritized; false when the task is terminal, so the row still exists but is no longer claimable."
+        }
+      },
+      "error_responses": [
+        {
+          "status": 400,
+          "description": "Task id is not a UUID, or the priority value is unknown."
+        },
+        {
+          "status": 401,
+          "description": "Authentication required."
+        },
+        {
+          "status": 404,
+          "description": "No task with that id on any shard."
         },
         {
           "status": 500,
@@ -8361,13 +8418,13 @@
         }
       ],
       "request_body": null,
+      "response_headers": [
+        {
+          "name": "X-Harvest-Execution-Id",
+          "description": "The execution id this call resolved to. Stamped on every response the delegate returns, success or error. Absent when resolution itself failed, so a 404 for an unknown (workflow_name, workflow_id) does not carry it."
+        }
+      ],
       "success_response": {
-        "headers": [
-          {
-            "name": "X-Harvest-Execution-Id",
-            "description": "The execution id GET /workflows/by-id/{workflow_name}/{workflow_id} resolved to. Present on every by-id response, including bodiless ones."
-          }
-        ],
         "status": 200,
         "free_form": true,
         "note": "Same body as GET /workflows/{id}; resolved execution_id also in the X-Harvest-Execution-Id header."
@@ -8410,13 +8467,13 @@
         }
       ],
       "request_body": null,
+      "response_headers": [
+        {
+          "name": "X-Harvest-Execution-Id",
+          "description": "The execution id this call resolved to. Stamped on every response the delegate returns, success or error. Absent when resolution itself failed, so a 404 for an unknown (workflow_name, workflow_id) does not carry it."
+        }
+      ],
       "success_response": {
-        "headers": [
-          {
-            "name": "X-Harvest-Execution-Id",
-            "description": "The execution id GET /workflows/by-id/{workflow_name}/{workflow_id}/result resolved to. Present on every by-id response, including bodiless ones."
-          }
-        ],
         "status": 200,
         "free_form": true,
         "note": "Same body as GET /workflows/{id}/result (204 No Content with Retry-After when still running). Resolved execution_id in the X-Harvest-Execution-Id header on every response."
@@ -8475,13 +8532,13 @@
         }
       ],
       "request_body": null,
+      "response_headers": [
+        {
+          "name": "X-Harvest-Execution-Id",
+          "description": "The execution id this call resolved to. Stamped on every response the delegate returns, success or error. Absent when resolution itself failed, so a 404 for an unknown (workflow_name, workflow_id) does not carry it."
+        }
+      ],
       "success_response": {
-        "headers": [
-          {
-            "name": "X-Harvest-Execution-Id",
-            "description": "The execution id GET /workflows/by-id/{workflow_name}/{workflow_id}/stack resolved to. Present on every by-id response, including bodiless ones."
-          }
-        ],
         "status": 200,
         "free_form": true,
         "note": "Same body as GET /workflows/{id}/stack; resolved execution_id in the X-Harvest-Execution-Id header."
@@ -8549,13 +8606,13 @@
         }
       ],
       "request_body": null,
+      "response_headers": [
+        {
+          "name": "X-Harvest-Execution-Id",
+          "description": "The execution id this call resolved to. Stamped on every response the delegate returns, success or error. Absent when resolution itself failed, so a 404 for an unknown (workflow_name, workflow_id) does not carry it."
+        }
+      ],
       "success_response": {
-        "headers": [
-          {
-            "name": "X-Harvest-Execution-Id",
-            "description": "The execution id GET /workflows/by-id/{workflow_name}/{workflow_id}/children resolved to. Present on every by-id response, including bodiless ones."
-          }
-        ],
         "status": 200,
         "free_form": true,
         "note": "Same body as GET /workflows/{id}/children ({items, next_cursor}); resolved execution_id in the X-Harvest-Execution-Id header."
@@ -8616,18 +8673,18 @@
         }
       ],
       "request_body": {
-        "required": false,
+        "required": true,
         "free_form": true,
         "description": "Optional signal payload passed verbatim to the handler.",
         "fields": []
       },
+      "response_headers": [
+        {
+          "name": "X-Harvest-Execution-Id",
+          "description": "The execution id this call resolved to. Stamped on every response the delegate returns, success or error. Absent when resolution itself failed, so a 404 for an unknown (workflow_name, workflow_id) does not carry it."
+        }
+      ],
       "success_response": {
-        "headers": [
-          {
-            "name": "X-Harvest-Execution-Id",
-            "description": "The execution id POST /workflows/by-id/{workflow_name}/{workflow_id}/signal/{signal_name} resolved to. Present on every by-id response, including bodiless ones."
-          }
-        ],
         "status": 202,
         "fields": [
           "execution_id",
@@ -8675,13 +8732,13 @@
         }
       ],
       "request_body": null,
+      "response_headers": [
+        {
+          "name": "X-Harvest-Execution-Id",
+          "description": "The execution id this call resolved to. Stamped on every response the delegate returns, success or error. Absent when resolution itself failed, so a 404 for an unknown (workflow_name, workflow_id) does not carry it."
+        }
+      ],
       "success_response": {
-        "headers": [
-          {
-            "name": "X-Harvest-Execution-Id",
-            "description": "The execution id GET /workflows/by-id/{workflow_name}/{workflow_id}/query/{query_name} resolved to. Present on every by-id response, including bodiless ones."
-          }
-        ],
         "status": 200,
         "fields": [
           "execution_id",
@@ -8746,13 +8803,13 @@
           }
         ]
       },
+      "response_headers": [
+        {
+          "name": "X-Harvest-Execution-Id",
+          "description": "The execution id this call resolved to. Stamped on every response the delegate returns, success or error. Absent when resolution itself failed, so a 404 for an unknown (workflow_name, workflow_id) does not carry it."
+        }
+      ],
       "success_response": {
-        "headers": [
-          {
-            "name": "X-Harvest-Execution-Id",
-            "description": "The execution id POST /workflows/by-id/{workflow_name}/{workflow_id}/query/{query_name} resolved to. Present on every by-id response, including bodiless ones."
-          }
-        ],
         "status": 200,
         "fields": [
           "execution_id",
@@ -8804,7 +8861,7 @@
         }
       ],
       "request_body": {
-        "required": false,
+        "required": true,
         "free_form": false,
         "fields": [
           {
@@ -8814,13 +8871,13 @@
           }
         ]
       },
+      "response_headers": [
+        {
+          "name": "X-Harvest-Execution-Id",
+          "description": "The execution id this call resolved to. Stamped on every response the delegate returns, success or error. Absent when resolution itself failed, so a 404 for an unknown (workflow_name, workflow_id) does not carry it."
+        }
+      ],
       "success_response": {
-        "headers": [
-          {
-            "name": "X-Harvest-Execution-Id",
-            "description": "The execution id POST /workflows/by-id/{workflow_name}/{workflow_id}/cancel resolved to. Present on every by-id response, including bodiless ones."
-          }
-        ],
         "status": 202,
         "fields": [
           "ok",
@@ -8882,13 +8939,13 @@
           }
         ]
       },
+      "response_headers": [
+        {
+          "name": "X-Harvest-Execution-Id",
+          "description": "The execution id this call resolved to. Stamped on every response the delegate returns, success or error. Absent when resolution itself failed, so a 404 for an unknown (workflow_name, workflow_id) does not carry it."
+        }
+      ],
       "success_response": {
-        "headers": [
-          {
-            "name": "X-Harvest-Execution-Id",
-            "description": "The execution id POST /workflows/by-id/{workflow_name}/{workflow_id}/pause resolved to. Present on every by-id response, including bodiless ones."
-          }
-        ],
         "status": 200,
         "fields": [
           "ok",
@@ -8949,13 +9006,13 @@
         "free_form": false,
         "fields": []
       },
+      "response_headers": [
+        {
+          "name": "X-Harvest-Execution-Id",
+          "description": "The execution id this call resolved to. Stamped on every response the delegate returns, success or error. Absent when resolution itself failed, so a 404 for an unknown (workflow_name, workflow_id) does not carry it."
+        }
+      ],
       "success_response": {
-        "headers": [
-          {
-            "name": "X-Harvest-Execution-Id",
-            "description": "The execution id POST /workflows/by-id/{workflow_name}/{workflow_id}/resume resolved to. Present on every by-id response, including bodiless ones."
-          }
-        ],
         "status": 200,
         "fields": [
           "ok",
