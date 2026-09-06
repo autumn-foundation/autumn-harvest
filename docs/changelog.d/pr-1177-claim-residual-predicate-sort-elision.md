@@ -10,25 +10,32 @@ columns, and the cheap index-ordered plan should return.
 Issue #1177 reproduces that this does not happen. With the `CASE` removed
 entirely from `ORDER BY` (leaving only `priority DESC, scheduled_at`, an
 exact match for `idx_harvest_tq_poll`'s key) and no planner hints in play,
-adding any single one of the query's other residual `WHERE` predicates —
+adding any single one of ten other residual `WHERE` predicates it tested —
 including several with zero actual selectivity (100% of rows pass) — is
 already enough on its own for the planner to fall back to a full-backlog
 scan (`Seq Scan` for most predicates tested, `Bitmap Heap Scan` for a few)
 plus a `Sort`, instead of the ordered index scan. This holds with and
-without `FOR UPDATE SKIP LOCKED`. Ten predicates were tested independently
+without `FOR UPDATE SKIP LOCKED`. The query carries an eleventh residual
+predicate untested by this issue (issue #807; see docs/performance.md for
+the follow-up). Ten predicates were tested independently
 against a 255 020-row fixture; all ten reproduce the collapse. A separate,
 narrower diagnostic — for the sticky-routing predicate specifically, with
 the competing index hidden and `enable_seqscan`/`enable_bitmapscan` set to
 bias (not force) the planner away from those plan shapes — shows Postgres
 still inserts a redundant `Sort` even while walking `idx_harvest_tq_poll`
-itself: the sort-elision candidate isn't losing a cost comparison, it's
-never generated as a candidate at all. Two separate, compounding effects are
-documented: (1) any residual `Filter` on an otherwise index-order-matching
-scan defeats sort-elision and `LIMIT` pushdown regardless of `FOR UPDATE`,
-and (2) `FOR UPDATE SKIP LOCKED` additionally disables the bounded Top-N
-sort once (1) has already forced a `Sort` node — the unlocked variant stays
-a bounded in-memory heapsort; only the locked variant spills to an unbounded
-external-merge sort on disk at scale.
+itself: for that predicate, the sort-elision candidate isn't losing a cost
+comparison, it's never generated as a candidate at all. Two separate,
+compounding effects are documented: (1) in this reproduction, every residual
+`Filter` tested defeats sort-elision and `LIMIT` pushdown regardless of `FOR
+UPDATE` — shown directly, via the stronger "candidate never generated"
+diagnostic, only for the sticky predicate, and consistent with (though not
+independently re-run as that same diagnostic for) the other nine predicates'
+natural-planner results, which show which plan won rather than that an
+ordered candidate was unavailable; and (2) `FOR UPDATE SKIP LOCKED`
+additionally disables the bounded Top-N sort once (1) has already forced a
+`Sort` node — the unlocked variant stays a bounded in-memory heapsort; only
+the locked variant spills to an unbounded external-merge sort on disk at
+scale.
 
 This also corrects, without fully resolving, the "Known limitations" bullet
 that called `schedule_to_close` (#378), worker sessions (#606) and sticky
