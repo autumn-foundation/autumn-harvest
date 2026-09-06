@@ -1739,7 +1739,14 @@ def lazy_continuation(
         and not table_header(pieces, index, nest, peeled, container)
         and not heading(peeled, container)
         and not html_block(peeled, container)
-        and not SEPARATOR_RE.match(peeled)
+        # The COMMONMARK break, not the broad decorative rule. `SEPARATOR_RE`
+        # answers "is this a section rule?" -- unbounded on purpose, because
+        # a rule is not a word of a sentence at any indent, which is the
+        # question `prose_units` asks. This asks whether a BLOCK begins, and
+        # there the answers differ twice over: "===" is ordinary text to
+        # CommonMark, and an over-indented "---" is indented content. Rustdoc
+        # keeps both inside the quoted paragraph.
+        and not thematic_break(peeled, container)
         and not opens_fence(peeled, container)
     )
 
@@ -2014,9 +2021,9 @@ def comment_lines(pieces: list[Piece]):
                 # From the paragraph state BEFORE `update_containers` clears
                 # it: an underline with no paragraph above it is a thematic
                 # break or ordinary text, not a heading.
-                setext = paragraph and setext_underline(body, enclosing)
-                # `update_containers` reassigns `paragraph` below, and the
-                # lazy test needs the state this line ARRIVED in.
+                # `update_containers` reassigns `paragraph` below, and both
+                # the lazy test and the Setext test need the state this line
+                # ARRIVED in.
                 open_paragraph = paragraph
                 # Both are blocks, so neither leaves a paragraph open.
                 stack, paragraph = update_containers(
@@ -2058,6 +2065,16 @@ def comment_lines(pieces: list[Piece]):
                 # Setext and round fifty-two for HTML. Rustdoc renders no
                 # `//` comment, so a pipe row there is text and a rule of
                 # "=" is a banner this tree draws under a plain heading.
+                # A Setext underline underlines the paragraph ABOVE IT, and
+                # only one in its own container. A line that leaves a quote
+                # is not underlining the quoted paragraph it follows:
+                # Rustdoc keeps "===" under a lazily continued quote as
+                # ordinary text, in the paragraph, not as a heading rule.
+                setext = (
+                    open_paragraph
+                    and setext_underline(body, enclosing)
+                    and quoted == before_quoted
+                )
                 # A LEAF block that is exactly one line long. Rustdoc
                 # renders "# Explain the `literal" as a heading and the line
                 # under it as its own paragraph, so a span cannot pair across
@@ -4377,6 +4394,34 @@ RULE_TESTS = [
         "/// TODO: issue required\n",
         set(),
         "including an unclosed one, which runs to the end of the run",
+    ),
+    (
+        "/// > Explain the `literal\n"
+        "///     ===\n"
+        "/// TODO: issue required` suffix.\n",
+        set(),
+        "an over-indented rule is content, so the quote carries on",
+    ),
+    (
+        "/// > Explain the `literal\n"
+        "/// ===\n"
+        "/// TODO: issue required` suffix.\n",
+        set(),
+        "and \"===\" underlines no paragraph it does not share a container with",
+    ),
+    (
+        "/// > Explain the `literal\n"
+        "/// ---\n"
+        "/// TODO: issue required` suffix.\n",
+        {("CH002", 3)},
+        "but a thematic break really does end the quote",
+    ),
+    (
+        "/// > Explain the `literal\n"
+        "///     ---\n"
+        "/// TODO: issue required` suffix.\n",
+        set(),
+        "unless it is indented past its container",
     ),
 ]
 

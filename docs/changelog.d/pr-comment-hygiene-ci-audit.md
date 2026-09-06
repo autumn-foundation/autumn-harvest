@@ -2386,3 +2386,40 @@ yet. Three call sites asked "does a fence open here?" and each answered
 it differently, and none of the checks in this harness can see that --
 they compare behaviour, and two wrong answers that agree on the corpus
 look exactly like one right answer.
+
+### Round seventy-eight — the same shape twice more
+
+One finding reported, a Tier A false positive, and the same seam
+underneath it as last round: a test asking the wrong question, and a
+second test making the same mistake one clause away.
+
+**The separator branch was unbounded.** `lazy_continuation` asked
+`SEPARATOR_RE.match(peeled)`. That pattern is unbounded ON PURPOSE, and
+its own comment says so -- a decorative rule is not a word of a sentence
+at any indent, which is the question `prose_units` asks it. This asks
+whether a BLOCK begins, and the two answers differ twice over: `===` is
+ordinary text to CommonMark, and an over-indented `---` is indented
+content. The CommonMark `thematic_break`, bounded by the container,
+answers the question actually being asked.
+
+**And the Setext test had no container either.** Fixing the separator
+alone left `===` still reporting, because `setext` asked only whether a
+paragraph was open -- not whether it was open in THIS container. A line
+that leaves a quote underlines nothing: Rustdoc keeps `===` under a
+lazily continued quote inside the paragraph, as text. It is gated on
+`quoted == before_quoted` now, which also required moving the
+computation after the quote depth is known.
+
+Four fixtures, one per rendering: indented `===`, bare `===`, bare
+`---` which really does end the quote, and indented `---` which does
+not.
+
+Corpus effect: none.
+
+Rounds seventy-seven and seventy-eight are the same lesson twice: a
+predicate borrowed from a neighbour that answers a NEARBY question. The
+fence test borrowed a pattern whose indent bound belongs to the caller;
+the separator test borrowed one that is deliberately unbounded. Both
+were reasonable at a glance and both were wrong, and no check here can
+see it -- the harness compares behaviour, and a rule that is wrong only
+in shapes the corpus lacks behaves identically to a right one.
