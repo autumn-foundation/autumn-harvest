@@ -1887,3 +1887,43 @@ uses — round fifty-six (spans, boundaries), round sixty (`<code>`, matching),
 round sixty-one (`<code>`, boundaries). The two operations sit next to each
 other in the file and are named for what they do; the failure is not knowing
 about them but not asking "and the other one?".
+
+### Round sixty-two — two blocks with no name, and a tag that is not one
+
+Two findings, both bypassing the absolute CH002 gate from opposite sides.
+
+**A table and a Setext heading are blocks.** `starts_block` decides a block
+boundary from one line, and neither of these is a fact about one line: a
+table needs the delimiter row under its header to confirm it, and a Setext
+underline needs the paragraph above it to underline. Both were already
+detected elsewhere in `comment_lines` -- `in_table` for the table rule,
+`setext_underline` for the container state -- and neither reached `opens`,
+so a code span paired straight across them and blanked the marker on the
+far side. Rustdoc renders paragraph/table/paragraph and heading/paragraph,
+with the backticks literal in each.
+
+Every table ROW is a boundary too, not merely the table. Rustdoc renders
+each cell as its own inline context, so `| x `open |` and `| close` y |`
+keep their backticks literal; within one cell a span still pairs, and a
+fixture pins that side.
+
+Doc comments only, by the rule round forty-eight set for Setext and round
+fifty-two for HTML.
+
+**An escaped `<code>` tag is not a tag.** `\<code>TODO: add retry\</code>`
+renders as literal characters, so the marker inside it is a real commitment,
+and the pattern matched straight through both escaped tags and erased it.
+Fixed by the parity scanner the backticks already had: `escaped_backticks`
+is now a filter over a character-blind `escaped_offsets`, because giving
+each construct its own escape scanner is how the two drift apart.
+
+Two over-reports came out of the same rewrite, in the opposite direction.
+An unclosed `<code>` runs to the END OF THE BLOCK -- this is the one place
+an element differs from a backtick span, where an unmatched delimiter opens
+nothing at all. So `<code>a\</code> TODO: x` and a `<code>` opened on the
+line above a marker both render that marker as code, and the line-by-line
+pattern failed the build on each. `blank_inline_code` now runs over the
+joined block, as the spans beside it already did.
+
+Corpus effect: none. Eleven fixtures, seven of which fail on the parent
+commit.

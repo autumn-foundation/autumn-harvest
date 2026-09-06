@@ -343,13 +343,17 @@ BACKTICK_RUN_RE = re.compile(r"`+")
 BLANK_LINE_RE = re.compile(r"\n[ \t]*\n")
 
 
-def escaped_backticks(text: str) -> set[int]:
-    """Offsets of the backticks an ODD run of backslashes escapes.
+def escaped_offsets(text: str) -> set[int]:
+    """Offsets of the characters an ODD run of backslashes escapes.
 
     Parity, counted left to right, because a lookbehind cannot: one backslash
-    escapes the backtick after it, two escape each other and leave the
-    backtick to open a span as usual. Rustdoc renders "\\\\`marker`" with the
+    escapes the character after it, two escape each other and leave that
+    character to do its job as usual. Rustdoc renders "\\\\`marker`" with the
     marker as code, and a single-character lookbehind refused that opener.
+
+    Character-blind on purpose. A backtick and an inline "<code>" tag obey
+    the same parity, and giving each its own scanner is how the two drifted
+    apart.
     """
     escaped, index = set(), 0
     while index < len(text):
@@ -359,10 +363,15 @@ def escaped_backticks(text: str) -> set[int]:
         run = index
         while index < len(text) and text[index] == "\\":
             index += 1
-        if (index - run) % 2 and index < len(text) and text[index] == "`":
+        if (index - run) % 2 and index < len(text):
             escaped.add(index)
             index += 1
     return escaped
+
+
+def escaped_backticks(text: str) -> set[int]:
+    """Offsets of the backticks an odd run of backslashes escapes."""
+    return {index for index in escaped_offsets(text) if text[index] == "`"}
 
 
 def code_span_ranges(text: str) -> list[tuple[int, int]]:
@@ -412,12 +421,62 @@ def replace_spans(text: str, filler: str) -> str:
 # in a <code> element exactly as it does a backtick span, so the absolute
 # rules must not read a narrative phrase or a marker inside one. Doc comments
 # only: nothing renders a `//` comment, where this is literal text.
-INLINE_CODE_RE = re.compile(r"<code\b[^>]*>.*?</code\s*>", re.I | re.S)
+CODE_OPEN_RE = re.compile(r"<code\b[^>]*>", re.I)
+CODE_CLOSE_RE = re.compile(r"</code\s*>", re.I)
+
+
+def inline_code_ranges(text: str) -> list[tuple[int, int]]:
+    """Where `text`'s inline <code> elements are.
+
+    Scanned rather than matched, for two reasons one pattern could not hold
+    at once. An ESCAPED tag is not a tag: Rustdoc renders "\\<code>TODO: x"
+    as literal characters, so the marker inside it is a real commitment.
+
+    And an unclosed element runs to the END OF THE BLOCK, which is the one
+    place this differs from a backtick span. An unmatched backtick opens
+    nothing; an unmatched "<code>" opens an element the paragraph's own
+    close tag ends, so "<code>a" leaves every later word on that paragraph
+    rendered as code. Callers pass one block, so the end of `text` is the
+    end of the block.
+    """
+    escaped = escaped_offsets(text)
+
+    def unescaped(pattern, start):
+        match = pattern.search(text, start)
+        while match and match.start() in escaped:
+            match = pattern.search(text, match.start() + 1)
+        return match
+
+    ranges: list[tuple[int, int]] = []
+    index = 0
+    while True:
+        opener = unescaped(CODE_OPEN_RE, index)
+        if not opener:
+            return ranges
+        closer = unescaped(CODE_CLOSE_RE, opener.end())
+        end = closer.end() if closer else len(text)
+        ranges.append((opener.start(), end))
+        if not closer:
+            return ranges
+        index = end
+
+
+def replace_inline_code(text: str, filler: str) -> str:
+    """`text` with each inline <code> element's characters set to `filler`.
+
+    Newlines survive, so a multi-line text splits back into the same lines.
+    """
+    out = list(text)
+    for start, end in inline_code_ranges(text):
+        for index in range(start, end):
+            if out[index] != "\n":
+                out[index] = filler
+    return "".join(out)
 
 
 def blank_inline_code(text: str) -> str:
     """`text` with each inline <code> element replaced by spaces."""
-    return INLINE_CODE_RE.sub(lambda m: re.sub(r"[^\n]", " ", m.group(0)), text)
+    return replace_inline_code(text, " ")
 
 
 def mask_inline_code(text: str) -> str:
@@ -428,7 +487,7 @@ def mask_inline_code(text: str) -> str:
     why</code>" is not a sentence end, and splitting there left a fragment
     the narrative rule read as deliberation.
     """
-    return INLINE_CODE_RE.sub(lambda m: re.sub(r"[^\n]", "x", m.group(0)), text)
+    return replace_inline_code(text, "x")
 
 
 def blank_code_spans(text: str) -> str:
@@ -1718,6 +1777,10 @@ def comment_lines(pieces: list[Piece]):
                 # is what says so, and it says it for the line that LEAVES
                 # one as well, which no marker on the line could.
                 before_quoted = quoted
+                # From the paragraph state BEFORE `update_containers` clears
+                # it: an underline with no paragraph above it is a thematic
+                # break or ordinary text, not a heading.
+                setext = paragraph and setext_underline(body, enclosing)
                 # Both are blocks, so neither leaves a paragraph open.
                 stack, paragraph = update_containers(
                     text, stack, paragraph, quoted, in_table or indented
@@ -1727,7 +1790,27 @@ def comment_lines(pieces: list[Piece]):
                 # depth zero because the marker comes first -- one loop then
                 # believes the line left the quote and the other does not.
                 quoted = strip_containers(text, stack, stack[-1][0] if stack else 0)[2]
-                opens = starts_block(body, enclosing) or quoted != before_quoted
+                # A confirmed table and a Setext heading are blocks that
+                # `starts_block` cannot name. A table needs the piece after
+                # this one to confirm it, and a Setext underline needs the
+                # paragraph above it, so neither is a fact about one line.
+                # Rustdoc renders a span's two halves literally across
+                # either, and every ROW is its own boundary: "| x `open |"
+                # and "| close` y |" are separate cells, and the backticks
+                # stay literal in both.
+                #
+                # DOC COMMENTS ONLY, by the rule round forty-eight set for
+                # Setext and round fifty-two for HTML. Rustdoc renders no
+                # `//` comment, so a pipe row there is text and a rule of
+                # "=" is a banner this tree draws under a plain heading.
+                opens = (
+                    starts_block(body, enclosing)
+                    or quoted != before_quoted
+                    or (
+                        piece.marker in DOC_MARKERS
+                        and (in_table or setext)
+                    )
+                )
             container = stack[-1][0] if stack else 0
             delimiter = fence_delimiter(text, container, fence is not None, scope[2], stack)
             # The whole LINE decides a delimiter, not this piece alone. A
@@ -1826,8 +1909,14 @@ def check_line_rules(path: str, pieces: list[Piece]) -> list[Finding]:
         block: list[str] = []
 
         def flush_block(lines: list[str]) -> list[str]:
+            # ACROSS the block, like the spans beside it. An unclosed
+            # "<code>" runs to the paragraph's end, so a marker on the line
+            # under it is rendered as code too, and blanking line by line
+            # left that marker exposed and failed the build on it.
             blanked = blank_spans_across(lines)
-            return [blank_inline_code(line) for line in blanked] if doc else blanked
+            if not doc:
+                return blanked
+            return blank_inline_code("\n".join(blanked)).split("\n")
 
         for _, text, in_fence, opens in run_lines:
             if opens and block:
@@ -3611,6 +3700,73 @@ RULE_TESTS = [
         "// Parse the <code>foo. not sure why</code> token literally.\n",
         {("CH003", 1)},
         "and in a // comment it still does",
+    ),
+    (
+        "/// Explain the `literal\n"
+        "/// | h |\n"
+        "/// | - |\n"
+        "/// TODO: issue required` suffix.\n",
+        {("CH002", 4)},
+        "a confirmed table ends the paragraph above it, so a span stops",
+    ),
+    (
+        "/// Explain the `literal\n"
+        "/// Heading\n"
+        "/// ===\n"
+        "/// TODO: issue required` suffix.\n",
+        {("CH002", 4)},
+        "and a Setext underline ends the heading it makes",
+    ),
+    (
+        "/// | a | b |\n"
+        "/// | - | - |\n"
+        "/// | x `open | y |\n"
+        "/// | z TODO: issue required` w |\n",
+        {("CH002", 4)},
+        "each table row is its own boundary as well",
+    ),
+    (
+        "/// | a |\n"
+        "/// | - |\n"
+        "/// | x `open TODO: marker` y |\n",
+        set(),
+        "but within one cell a span still pairs",
+    ),
+    (
+        "// Explain the `literal\n"
+        "// | h |\n"
+        "// | - |\n"
+        "// TODO: issue required` suffix.\n",
+        set(),
+        "neither boundary applies in a // comment, which renders nothing",
+    ),
+    (
+        "/// \\<code>TODO: add retry\\</code>\n",
+        {("CH002", 1)},
+        "an escaped <code> tag is literal text, not an element",
+    ),
+    (
+        "/// \\\\<code>TODO: add retry</code>\n",
+        set(),
+        "two backslashes escape each other, so the element opens",
+    ),
+    (
+        "/// <code>a\\</code> TODO: add retry\n",
+        set(),
+        "an escaped closer leaves the element open to the block end",
+    ),
+    (
+        "/// <code>a\n"
+        "/// TODO: add retry\n",
+        set(),
+        "and an unclosed element covers the line under it",
+    ),
+    (
+        "/// <code>a\n"
+        "///\n"
+        "/// TODO: issue required\n",
+        {("CH002", 3)},
+        "though the paragraph's own end closes it",
     ),
 ]
 
