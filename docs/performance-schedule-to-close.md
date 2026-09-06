@@ -390,14 +390,16 @@ across all three depths (+4 every time), including 100,000** --
 consistent with the fixed one-page index write the `dirtied`/`written`
 evidence above already established (a B-tree insert typically touches a
 root and/or a leaf page as `hit`s in addition to the one page it dirties,
-so a handful of total `hit` buffers for one insert is unsurprising). This
-column held constant across the seeding fix in [Workload](#workload) too
-(it read +3/+4/+4 under an earlier, degenerate-seed run; +4/+4/+4 with a
-genuinely distinct key per row; and +4/+4/+4 again, unaffected, once both
-labels' *other* indexes stopped varying independently) -- three
-independent pieces of evidence for the same fixed per-claim index-write
-signature, none of which moved when the seeding methodology changed
-underneath them.
+so a handful of total `hit` buffers for one insert is unsurprising).
+Codex review on PR #1339 caught that an earlier revision of this
+paragraph cited this column's value under prior, now-uncommitted
+revisions of this capture (including a +3/+4/+4 reading from a
+degenerate-seed run) as independent corroborating evidence -- those
+runs' own artifacts are no longer committed (the repro script overwrites
+the same canonical filenames every run), so this page does not draw a
+conclusion from how many times the signature reproduced across
+non-auditable runs. Only this run's own signature is auditable from the
+repository: **+4/+4/+4**, exactly constant across all three depths.
 
 **The 100,000-row scan-side delta is not a row-width measurement in this
 committed run, and this page does not report it as one.** At 1,000 and
