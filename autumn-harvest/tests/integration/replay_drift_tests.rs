@@ -411,6 +411,65 @@ async fn unparseable_fixture_blocks_the_gate() {
     assert_eq!(report.exit_code(), 2);
 }
 
+/// Issue #1174. A manifest-less bundle organised into per-workflow
+/// subdirectories has no independent fixture count to check coverage
+/// against. If one subdirectory cannot be read, the walk must not silently
+/// drop it — that certifies a promotion against coverage it never checked.
+///
+/// `#[cfg(unix)]`: permission bits are not portable, and the CI matrix runs
+/// `windows-latest`.
+///
+/// This exercises one of three swallow points the fix closed: a nested
+/// `read_dir` failure. `collect_json_files` gives the other two (a
+/// `next_entry` error mid-iteration, a `file_type` error on one entry) the
+/// same `?` treatment. Each needs OS-level fault injection to trigger on
+/// its own, so neither is independently covered here.
+#[cfg(unix)]
+#[tokio::test]
+async fn unreadable_nested_subdirectory_is_a_harness_error_not_a_silent_pass() {
+    use std::os::unix::fs::PermissionsExt;
+
+    // `root` ignores directory permission bits, so this check would be a false
+    // pass under a root-run CI. This repo's CI uses hosted `ubuntu-latest`
+    // runners (non-root); this guard only protects a root-run local sandbox.
+    let euid_is_root = std::process::Command::new("id")
+        .arg("-u")
+        .output()
+        .ok()
+        .and_then(|o| String::from_utf8(o.stdout).ok())
+        .is_some_and(|s| s.trim() == "0");
+    if euid_is_root {
+        eprintln!("skipping: running as root, which ignores permission bits");
+        return;
+    }
+
+    let dir = tempfile::tempdir().unwrap();
+    write(dir.path(), "a.json", &in_flight_snapshot_json("wf"));
+
+    let locked = dir.path().join("locked");
+    std::fs::create_dir(&locked).unwrap();
+    write(&locked, "b.json", &in_flight_snapshot_json("wf"));
+    std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).unwrap();
+
+    let report = ReplayVerifier::new()
+        .register_fn("wf", canonical_workflow)
+        .replay_bundle(dir.path())
+        .await;
+
+    // Restore permissions so the tempdir can be cleaned up.
+    std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    assert!(
+        !report.is_clean(),
+        "an unread subtree must not report clean: {report}"
+    );
+    assert_eq!(
+        report.exit_code(),
+        2,
+        "an unreadable subtree is a harness error, not a clean pass: {report}"
+    );
+}
+
 // ===========================================================================
 // AC4 — the issue-named entry point on `WorkflowReplayer`
 // ===========================================================================
