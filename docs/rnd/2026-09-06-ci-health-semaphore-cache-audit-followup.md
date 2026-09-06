@@ -12,27 +12,29 @@ yesterday's report and one didn't:
   down from the 123–177 minutes measured in the 2026-09-03/09-04 reports — a
   real, large win, credited to the `test-nodb` split, not to anything in this
   report. (Not necessarily *gating* time — see §1's caveat.)
-- **Changed, for the worse:** the `test-nodb` split added 3 more distinct
-  persisted cache entries (one per OS — the job already uses a **shared cache
-  key across its 4 shards**, `ci.yml:411-417`, so this is 3 entries, not 12)
-  on top of roughly **10**, not the 09-05 report's "~19" (a Codex review
-  comment on this PR caught that the same job-count-vs-distinct-key
-  conflation applies to that inherited figure too: `test-db-linux`'s 10
-  shards already collapse to 1 entry via their own shared key, so ~10 distinct
-  key *names* pre-`test-nodb`, ~13 after, **per branch** — a second Codex
-  comment then caught that this is still not the repository-wide total: the
-  10GB cap is shared across every branch, and each of this repo's many
-  concurrently open PR branches can persist its own copy of these same ~13
-  names, so the true total is unknown and plausibly a multiple of 13 — see
-  Diagnosis). **Whether this is actually the wrong direction for total bytes
-  is itself unmeasured** — a Codex review comment on this PR correctly
-  pointed out that `9ce7ce8` also moved substantial compiled output *out
-  of* the pre-existing `test` job's own 3 cache entries into the 3 new
-  ones, so those existing entries may have shrunk by roughly as much as the
-  new ones grew; entry *count* went up, but the net effect on total
-  *bytes* — the thing the 10GB cap actually measures — is unknown without
-  comparing compressed sizes before and after, which this report hasn't
-  done (see Diagnosis).
+- **Changed, direction unknown:** the `test-nodb` split added 3 more
+  distinct persisted cache entries (one per OS — the job already uses a
+  **shared cache key across its 4 shards**, `ci.yml:411-417`, so this is 3
+  entries, not 12) on top of roughly **10**, not the 09-05 report's "~19"
+  (a Codex review comment on this PR caught that the same
+  job-count-vs-distinct-key conflation applies to that inherited figure
+  too: `test-db-linux`'s 10 shards already collapse to 1 entry via their
+  own shared key, so ~10 distinct key *names* pre-`test-nodb`, ~13 after,
+  **per branch** — a second Codex comment then caught that this is still
+  not the repository-wide total: the 10GB cap is shared across every
+  branch, and each of this repo's many concurrently open PR branches can
+  persist its own copy of these same ~13 names, so the true total is
+  unknown and plausibly a multiple of 13 — see Diagnosis). **Whether more
+  entries means more bytes is itself unmeasured, not "for the worse" as an
+  earlier draft of this bullet's own label claimed** — a Codex review
+  comment on this PR caught the label still asserting a direction the body
+  text next to it had already retracted. `9ce7ce8` also moved substantial
+  compiled output *out of* the pre-existing `test` job's own 3 cache
+  entries into the 3 new ones, so those existing entries may have shrunk
+  by roughly as much as the new ones grew; entry *count* went up, but the
+  net effect on total *bytes* — the thing the 10GB cap actually measures —
+  is unknown without comparing compressed sizes before and after, which
+  this report hasn't done (see Diagnosis).
 - **Unchanged:** no sample in this report — 5/5 fresh legs today, plus 3/3
   downstream restores in §4 — found any cache at all, exact or fallback (a
   Codex review comment on this PR caught an earlier draft overgeneralizing
@@ -43,7 +45,7 @@ yesterday's report and one didn't:
   later PR runs all restored against — and still couldn't be restored 9-14
   hours on (§4).
 
-**Correction record for this PR (`#1395`):** nineteen separate Codex review
+**Correction record for this PR (`#1395`):** twenty-one separate Codex review
 comments caught real problems in earlier drafts of this report:
 
 1–2. Two methodology errors in §4's cache-eviction comparison (a same-run
@@ -109,6 +111,13 @@ endpoint (`GET .../actions/caches`) would give total current bytes — that
 endpoint returns per-entry sizes across pages, so a total needs summing
 every page. Pointed at the dedicated `GET .../actions/cache/usage` endpoint
 instead, which returns the aggregate directly in one call.
+19. A fourth recurrence of definitive eviction language (per items 11 and
+14), this time in the top summary bullet's own label ("Changed, for the
+worse") standing next to body text that had already retracted the claim —
+relabeled "direction unknown" to match.
+20. A fifth recurrence, in the Diagnosis section's own evidence sentence
+("gone within 9-14 hours") — restated as "unrestorable," describing the
+observed restore failure without asserting the entry existed and was lost.
 
 All are fixed below, in place, with the retractions left visible rather
 than edited away.
@@ -339,8 +348,9 @@ and the capacity-direction claim should be read as unconfirmed rather than
 established until someone with cache-usage API access compares actual
 compressed sizes. §4's
 cross-run evidence — an apparently error-free save on the shared base
-branch, gone within 9-14 hours under the exact key three separate downstream
-PR runs restored against — remains this report's best available evidence
+branch, unrestorable 9-14 hours later under the exact key three separate
+downstream PR runs restored against — remains this report's best available
+evidence
 for that hypothesis (a Codex review comment on this PR correctly pushed
 back on calling it "direct support": §4 already concedes there's no
 positive confirmation the commit/finalize step actually succeeded, only
