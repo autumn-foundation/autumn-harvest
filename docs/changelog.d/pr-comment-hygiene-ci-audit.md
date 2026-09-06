@@ -3172,3 +3172,40 @@ rule this adds: when a compiler will enumerate a grammar, ask it, and
 paste what it says.**
 
 Corpus effect: none. Three fixtures, one of them a counter-case.
+
+### Round one hundred and four — the value is an expression, and an alias has a where clause
+
+Two findings, and both premises came from rustc rather than from
+reasoning, which is the rule round one hundred and three added.
+
+`// #[Note = this section is intentionally blank]` reported CH001. The
+`=` branch accepted anything up to the closing bracket, and the value of
+a name-value attribute is an EXPRESSION. rustc names what may follow the
+value's first atom:
+
+```
+error: expected one of `!`, `.`, `::`, `?`, `]`, `{`, or an operator,
+       found `section`
+```
+
+So a literal opens a value outright, and a path opens one only when what
+follows is from that set. Two bare words in a row are prose in brackets.
+`#[doc = "this section is intentionally blank"]` is still commented-out
+code, because the same words inside a string ARE a value -- that is the
+counter-case, written in the shape of the widened form as round one
+hundred and two requires.
+
+`// type Foo<T> where T: Copy = Vec<T>;` produced no finding. Round
+ninety-three gave `WHERE` to a function, a struct, an enum, a trait, a
+union, a tuple struct and an impl, and missed the one item form that
+takes the clause BEFORE its `=`. rustc accepts it and warns that the
+clause is not enforced, which is a lint about meaning rather than a
+syntax error.
+
+This is the fourth round on the attribute alternative. The tripwire said
+that a fourth means checking the whole alternative against rustc rather
+than editing the reported part, and that is what produced the `=` branch
+above: every malformed variant was fed to the compiler and its answer
+pasted in.
+
+Corpus effect: none. Three fixtures, one of them a counter-case.

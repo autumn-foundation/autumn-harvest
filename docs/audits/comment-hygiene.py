@@ -303,7 +303,11 @@ COMMENTED_CODE_RE = re.compile(
             \s*\((?:[^;{]|;(?=[^;]*\]))*\)\s*{WHERE};\s*$
       | {VIS}mod\s+(?:r\#)?\w+\s*(?:;|{BODY})\s*$
       | {VIS}(?:const|static)\s+(?:mut\s+)?(?:r\#)?\w+\s*:[^;=]+=.*[;{]\s*$
-      | {VIS}type\s+(?:r\#)?\w+\s*(?:{GEN})?\s*=
+      # A type alias takes a `where` clause BEFORE its `=`, which is the
+      # one item form round ninety-three did not reach. rustc 1.94.1
+      # accepts it and warns that the clause is not enforced, which is a
+      # lint about meaning rather than a syntax error.
+      | {VIS}type\s+(?:r\#)?\w+\s*(?:{GEN})?\s*{WHERE}=
             (?!\s*(?:\w+\s+){2,}\w+\s*;\s*$).*;\s*$
       | impl(?:\s*{GEN})?\s+
             (?![^;{]*\b[a-z]+\s+[a-z]+\s+[a-z]+\s+[a-z]+\b)[\w:<>&'\s\#,]+{BODY}\s*$
@@ -358,7 +362,24 @@ COMMENTED_CODE_RE = re.compile(
       # `#[Note, this section is intentionally blank]` and it prints the
       # set: "expected one of `(`, `::`, `=`, `[`, `]`, or `{`". The `::`
       # belongs to the path, and the rest is the input.
-      | \#!?\[\s*(?:r\#)?\w+(?:\s*::\s*(?:r\#)?\w+)*\s*(?:[(\[{=].*)?\]\s*$
+      # The `=` form takes an EXPRESSION, and prose is not one. rustc
+      # names what may follow the value's first atom -- feed it
+      # `#[Note = this section is intentionally blank]` and it prints
+      # "expected one of `!`, `.`, `::`, `?`, `]`, `{`, or an operator,
+      # found `section`". So a literal opens a value outright, and a path
+      # opens one only when what follows is from that set. Two bare words
+      # in a row are prose in brackets.
+      | \#!?\[\s*(?:r\#)?\w+(?:\s*::\s*(?:r\#)?\w+)*\s*
+            (?:
+                [(\[{].*
+              | =\s*(?:
+                      (?:b|r|br|c)?["']
+                    | \d
+                    | (?:r\#)?\w+(?:::(?:r\#)?\w+)*\s*
+                      (?=[!.?(\[{:+*/%&|^<>=,-]|\])
+                  ).*
+            )?
+            \]\s*$
       | \}[,;)]*\s*$
       | (?:(?:r\#)?\w+::)*(?:r\#)?\w+!(?:\(.*\)|\[.*\]|\{.*\})\s*;\s*$  # macro stmt
       # A macro DEFINITION, which ends at its brace rather than a `;`.
@@ -5079,6 +5100,21 @@ RULE_TESTS = [
         "// #[Note, this section is intentionally blank]\n",
         set(),
         "nor a comma, which no attribute input may open with",
+    ),
+    (
+        "// #[Note = this section is intentionally blank]\n",
+        set(),
+        "and prose after an = is not an expression",
+    ),
+    (
+        '// #[doc = "this section is intentionally blank"]\n',
+        {("CH001", 1)},
+        "though the same words inside a string are a value",
+    ),
+    (
+        "// type Foo<T> where T: Copy = Vec<T>;\n",
+        {("CH001", 1)},
+        "and a type alias takes a where clause before its =",
     ),
     (
         "// #[allow[dead_code]]\n",
