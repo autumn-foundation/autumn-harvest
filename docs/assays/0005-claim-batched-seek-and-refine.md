@@ -76,6 +76,7 @@ same non-adversarial fixture generator). New for this assay:
 - `forced_index_diagnostic.sql` — added post-review; see below.
 - `forced_index_no_tiebreak_diagnostic.sql` — added post-review (round 2);
   see below.
+- `recheck_cost_diagnostic.sql` — added post-review (round 3); see below.
 - `results/run.log`, `results/*.txt`, `results/*.explain.txt` — every run
   this report's numbers are drawn from.
 
@@ -237,20 +238,20 @@ half of the reviewer's own proposed remedy, not a re-registration.
    already-locked rows procedurally — for each candidate with a
    concurrency key, `pg_try_advisory_xact_lock` plus a fresh `COUNT`
    against `harvest_task_queue` directly (the identical mechanism, and the
-   identical isolated query shape, ledger #4 already measured at ~1 buffer
-   regardless of key cardinality), moving to the next already-fetched
-   candidate on a failed lock or a failed count — no new backlog-wide
-   query either way. Re-run after the fix reproduces identical claimed
-   rows and batch counts (L4 still 2, L5 still 5) — the snapshot-vs-
-   authoritative distinction is invisible in a single-session apparatus by
-   construction (nothing else is racing), which is exactly why it took a
-   second review pass, not this apparatus's own testing, to catch.
-   `batch_claim.sql`'s isolated `EXPLAIN` no longer models the recheck at
-   all (it was modeling the now-removed, incorrect snapshot mechanism) —
-   it measures only the fetch step; the recheck's per-candidate cost is
-   ledger #4's own already-measured number, and its contribution to
-   end-to-end cost is visible directly in this section's `claim_batched()`
-   wall-clock figures below.
+   identical isolated query shape ledger #4 already measured — see item 8
+   below for the corrected cost, which is *not* uniformly ~1 buffer),
+   moving to the next already-fetched candidate on a failed lock or a
+   failed count — no new backlog-wide query either way. Re-run after the
+   fix reproduces identical claimed rows and batch counts (L4 still 2, L5
+   still 5) — the snapshot-vs-authoritative distinction is invisible in a
+   single-session apparatus by construction (nothing else is racing),
+   which is exactly why it took a second review pass, not this apparatus's
+   own testing, to catch. `batch_claim.sql`'s isolated `EXPLAIN` no longer
+   models the recheck at all (it was modeling the now-removed, incorrect
+   snapshot mechanism) — it measures only the fetch step; the recheck's
+   per-candidate cost is addressed separately in item 8, and its
+   contribution to end-to-end cost is visible directly in this section's
+   `claim_batched()` wall-clock figures below.
 
 6. **Rebuttal (P2, not accepted): the `id` tiebreak was proposed as the
    actual explanation for the `Sort` node, not backlog depth or the
@@ -272,11 +273,84 @@ half of the reviewer's own proposed remedy, not a re-registration.
    explanation for it, which a future depth-varying or binding-varying
    re-charter would otherwise have had to rule out itself.
 
+**Round 3 (same PR, third review pass, on the round-2 correctness fix):**
+
+7. **Process objection (P1, addressed, not re-chartered): does grading the
+   round-2 correctness fix against the original pre-registered lines break
+   this role's own pre-registration discipline?** The pre-registration's
+   prose specifically describes the candidate's recheck as "a small
+   `MATERIALIZED` CTE" computed once per batch — item 5's fix replaced that
+   with a per-candidate procedural `pg_try_advisory_xact_lock` + `COUNT`
+   loop, a different implementation shape than the one named in the
+   committed text, and a reviewer argued that re-grading the corrected
+   numbers against the *original* L1-L5 lines, rather than treating this as
+   a new, re-chartered experiment, risks exactly the goalpost-moving this
+   role's charter bans.
+
+   **This was not dismissed; here is why it wasn't treated as a
+   re-charter.** The pre-registered *lines* (buffer counts, wall-clock
+   thresholds, batch counts) never changed — only the candidate's
+   *implementation* of the concurrency-gate check changed, and it changed
+   because the original implementation was unsound (item 5), not because a
+   sound implementation gave an inconvenient number. Testing a candidate
+   that violates the production path's own safety invariant was never a
+   valid instance of "batched seek-and-refine" to begin with; fixing that
+   is closer to ledger #2's own precedent (`docs/assays/README.md`, #2:
+   "Post-review (Codex) caught the first apparatus silently reading only
+   one of the four queues, fixed by rotating queue order per call and
+   directly verified") than to moving a kill line after seeing a result.
+   That said, the concern about *cost* changing was not just asserted away:
+   this apparatus's own L4/L5 adversarial fixtures already exercise
+   multiple in-batch rejections under the corrected mechanism (2 and 5
+   batches respectively, each batch walking up to 50 candidates
+   procedurally), and their wall-clock numbers did not change materially
+   across the pre-fix and post-fix runs (round 1: 35.7ms/72.8ms; round 2:
+   34.9ms/71.7ms; round 3 re-run: 36.2ms/74.4ms — all within this box's own
+   run-to-run noise band). So the specific risk named — that switching
+   mechanisms could hide a cost regression behind an unchanged verdict —
+   was checked, not just argued past.
+
+   **What this does not cover, flagged honestly rather than claimed
+   solved:** L4/L5's adversarial fixtures use a small `RUNNING` population
+   (20 rows, `running_rows=20`) precisely because they are testing retry
+   *count*, not per-recheck cost. Item 8 below shows the per-candidate
+   recheck itself costs 34 buffers (not ~1) once the `RUNNING` population
+   is 2,000 rows. No scenario in this assay exercises *both* many in-batch
+   rejections *and* a large `RUNNING` population at once — that combination
+   (a batch with several concurrency-blocked candidates, each triggering a
+   34-buffer-class recheck) is untested, and would be the right target for
+   a re-charter that specifically wants to stress the corrected mechanism's
+   cost rather than its correctness.
+
+8. **Factual correction (P2): the recheck's per-candidate cost was
+   understated by 34x for the hot scenarios.** The report and
+   `batch_claim.sql`'s comment cited ledger #4's own recheck cost as "~1
+   buffer... regardless of key cardinality" — true only for the *idle* (0
+   `RUNNING`) case. Ledger #4's own archived
+   `hot_256-recheck.explain.txt`/`hot_5000-recheck.explain.txt` both show
+   **34 buffers**, and `recheck_cost_diagnostic.sql` (added this round)
+   re-measures the identical query directly against this apparatus's own
+   schema/seed rather than only re-citing: 34 buffers at both 256 and 5,000
+   distinct keys, 2,000 `RUNNING` rows each (`results/recheck_cost.explain.txt`).
+   **This sharpens, rather than overturns, the cardinality-independence
+   claim (L2):** the `EXPLAIN` shows why — the query is a `Bitmap Heap Scan`
+   via `idx_harvest_tq_running` (`state = 'RUNNING'`, the only indexed
+   predicate) reading all 2,000 `RUNNING` rows and filtering by
+   `concurrency_key` in the heap (`concurrency_key` is not indexed at all
+   in this schema), so cost tracks the size of the `RUNNING` **population**
+   (identical at 256 and 5,000 keys, since both fixtures seed exactly 2,000
+   `RUNNING` rows), not the **distinct key count** — the property L2 was
+   actually testing. The two happened to be conflated in this report's
+   prose because every fixture that varies key count in this apparatus
+   holds `running_rows` fixed; a fixture that varied `RUNNING` population
+   size independently of key count would be a cleaner test of the same
+   claim, and is not this assay's own contribution to run.
+
 ## 📊 Assay
 
 All measurements from `docs/assays/apparatus/0005-claim-batched-seek-and-refine/results/`
-(`run.log`, `*.txt`, `*.explain.txt`), from the apparatus's third run (post
-both rounds of corrections above), one continuous psql session.
+(`run.log`, `*.txt`, `*.explain.txt`), from the apparatus's fourth run (post
+all three rounds of corrections above), one continuous psql session.
 
 **Buffers (L1, idle: 10,000 backlog, 4 queues, 256 keys, 0 RUNNING):**
 
@@ -286,21 +360,24 @@ both rounds of corrections above), one continuous psql session.
 | candidate fetch step (`batch_claim.sql`, B=50) | 180 |
 | candidate fetch, index forced (`forced_index_diagnostic.sql`) | 585 |
 | candidate fetch, index forced, no `id` tiebreak (rebuttal check) | 582 |
+| per-candidate recheck, idle key (0 `RUNNING`) | 1 |
+| per-candidate recheck, 256 or 5,000 keys, 2,000 `RUNNING` (`recheck_cost_diagnostic.sql`) | 34 (both) |
 
 **Wall-clock, raw `\timing` (no `EXPLAIN` instrumentation on either side, matching #4's methodology):**
 
 | scenario | keys | running | control (`control_raw.sql`) | candidate (`claim_batched()`) | batches |
 |:--|--:|--:|--:|--:|--:|
-| idle_256 | 256 | 0 | 6.999 ms | 8.876 ms | 1 |
-| hot_256 | 256 | 2,000 | 150.153 ms | 8.370 ms | 1 |
-| hot_5000 | 5,000 | 2,000 | 1,049.894 ms | 5.716 ms | 1 |
-| **l4_adversarial (50 poison)** | 256 | 20 | — (n/a) | **34.876 ms** | **2** |
-| **l5_adversarial (200 poison)** | 256 | 20 | — (n/a) | **71.653 ms** | **5** |
+| idle_256 | 256 | 0 | 5.883 ms | 8.640 ms | 1 |
+| hot_256 | 256 | 2,000 | 139.331 ms | 9.143 ms | 1 |
+| hot_5000 | 5,000 | 2,000 | 970.673 ms | 6.200 ms | 1 |
+| **l4_adversarial (50 poison)** | 256 | 20 | — (n/a) | **36.204 ms** | **2** |
+| **l5_adversarial (200 poison)** | 256 | 20 | — (n/a) | **74.420 ms** | **5** |
 
 (Wall-clock figures carry run-to-run noise on this box, same as every prior
-ledger entry — e.g. `hot_256` control ranged 144-222ms across this assay's
-three runs. Read them for order of magnitude relative to the same run's own
-control, not as exactly reproducible absolutes.)
+ledger entry — e.g. `hot_256` control ranged 139-222ms and L4 ranged
+34.9-36.2ms across this assay's four runs. Read them for order of magnitude
+relative to the same run's own control, not as exactly reproducible
+absolutes.)
 
 Equivalence check: candidate claimed the identical row id to control in
 every non-adversarial scenario (`results/equivalence_idle_256.txt`:
@@ -316,19 +393,22 @@ runs of this apparatus.
   inside the line and two orders of magnitude below ledger #3's 10,130-buffer
   kill. (See "Post-review corrections" above for what this number does and
   does not establish about *why* it's cheap.)
-- **L2 — PASS, decisively.** 5.716ms vs. ≤160ms — **28.0x** inside the line,
-  **183.7x** faster than this run's own control (1,049.894ms). The
-  per-candidate authoritative recheck's cost stays independent of global
-  key cardinality (5,000 here vs. 256 at L1/L3) because each recheck only
-  ever counts one specific key's own `RUNNING` rows — the same query shape
-  and the same near-zero cost ledger #4 already measured directly — the one
-  causal claim both correction rounds left intact, since it concerns the
-  recheck, not the candidate fetch.
-- **L3 — PASS, decisively.** 8.370ms vs. ≤300.31ms (2x control's
-  150.153ms) — **17.9x faster than control outright**, not just inside the
+- **L2 — PASS, decisively.** 6.200ms vs. ≤160ms — **25.8x** inside the line,
+  **156.6x** faster than this run's own control (970.673ms). The
+  per-candidate authoritative recheck's cost stays independent of **distinct
+  key count** (5,000 here vs. 256 at L1/L3) — confirmed directly at 34
+  buffers in both cases (`recheck_cost_diagnostic.sql`, item 8) — because
+  each recheck counts one specific key's own `RUNNING` rows via a scan
+  scoped by `state = 'RUNNING'` (the only indexed predicate), not by
+  `concurrency_key` (not indexed at all in this schema). That cost tracks
+  the size of the `RUNNING` **population** (2,000 in both L2 and L3's
+  fixtures) instead — a real property, but narrower than "cheap regardless
+  of scale" until that population size is itself varied.
+- **L3 — PASS, decisively.** 9.143ms vs. ≤278.66ms (2x control's
+  139.331ms) — **15.2x faster than control outright**, not just inside the
   line.
 - **L4 — FAIL on the batch-count sub-criterion.** Wall-clock passes cleanly
-  (34.876ms vs. ≤100ms, **2.9x** inside the line) — but the shape resolved
+  (36.204ms vs. ≤100ms, **2.8x** inside the line) — but the shape resolved
   in **2 batches, not the registered 1**. This is a fencepost error in the
   pre-registration itself, not a mechanism finding: with `B=50` and exactly
   50 poisoned rows ranked ahead of the one claimable row, batch 1 fetches
@@ -339,16 +419,16 @@ runs of this apparatus.
   registered "1" undercounted by exactly the one slot the claimable row
   itself occupies.
 - **L5 — FAIL on the same sub-criterion, same root cause.** Wall-clock
-  passes cleanly (71.653ms vs. ≤400ms, **5.6x** inside the line) — but the
+  passes cleanly (74.420ms vs. ≤400ms, **5.4x** inside the line) — but the
   shape resolved in **5 batches, not the registered 4**. Same fencepost:
   `ceil((200 + 1) / 50) = 5`, not `ceil(200/50) = 4`.
 
 **Riskiest assumption, checked first:** the risk this shape's own mechanism
 introduces (per the pre-registration) was whether cost degrades linearly in
 *batch count* rather than catastrophically, the way ledger #4's shape
-degraded catastrophically in *attempt count*. That holds: 34.876ms at 2
-batches, 71.653ms at 5 batches — a 2.5x batch-count increase producing a
-2.05x wall-clock increase, consistent with cost scaling as `batches ×
+degraded catastrophically in *attempt count*. That holds: 36.204ms at 2
+batches, 74.420ms at 5 batches — a 2.5x batch-count increase producing a
+2.06x wall-clock increase, consistent with cost scaling as `batches ×
 (cost of one batch)`. This is a real, substantive answer, but per the
 post-review correction above it is a narrower one than originally framed:
 it confirms batching degrades gracefully in *batch count* at this backlog
@@ -363,16 +443,19 @@ regardless of how the other three lines perform or why the miss happened.
 
 **This kill is on the pre-registration's own arithmetic, not on the
 candidate mechanism's batch-count scaling** — every wall-clock line clears
-by 2.9x-184x, and the batch-count scaling itself is linear as designed. But
-two rounds of post-review correction narrow what this assay can claim even
-if the batch-count lines had been written correctly: this apparatus never
-established that batching bounds cost independent of backlog depth, only
-that it doesn't cost meaningfully more than the (already `O(backlog)` at
-this fixture depth) current committed fix, at one fixed depth. The claim
-that survives fully intact is the per-candidate authoritative recheck's
-cardinality independence (L2) — a real, narrower, still-useful property,
-using the same mechanism and cost ledger #4 already established, not the
-full "seek and refine" story issue #1340 was named for.
+by 2.8x-157x, and the batch-count scaling itself is linear as designed.
+Three rounds of post-review correction narrow what this assay can claim
+even if the batch-count lines had been written correctly: this apparatus
+never established that batching bounds cost independent of backlog depth,
+only that it doesn't cost meaningfully more than the (already `O(backlog)`
+at this fixture depth) current committed fix, at one fixed depth. The claim
+that survives, sharpened rather than intact, is the per-candidate
+authoritative recheck's independence from **distinct key count** (L2) — a
+real, narrower property than "cardinality-independent" first suggested,
+since the same recheck's cost does scale with the size of the `RUNNING`
+population (34 buffers at 2,000 rows, confirmed directly), a variable this
+apparatus never varied independently of key count. Not the full "seek and
+refine" story issue #1340 was named for.
 
 **What this assay establishes, and does not:**
 
@@ -398,6 +481,11 @@ full "seek and refine" story issue #1340 was named for.
   contending for the same rows/keys — the single-session apparatus can
   exercise correct behavior for one caller at a time (which is what round
   2's fix restored) but not lock contention or throughput across several.
+- Does **not** establish: cost when a batch has *both* many in-batch
+  rejections (L4/L5's own territory) *and* a large `RUNNING` population
+  (L2/L3's own territory) at once — no scenario here combines them, and
+  item 8 shows the per-candidate recheck alone costs 34x more than this
+  report first claimed once `RUNNING` reaches 2,000 rows.
 
 **Explicitly not this assay's finding, and an explicit re-charter, not an
 edit:** a corrected pre-registration (`ceil((poison_depth+1)/B)` batches as
@@ -421,12 +509,13 @@ cat results/run.log
 grep "Buffers: shared hit=180" results/idle_256-batch_claim.explain.txt
 grep "Index Scan using idx_harvest_tq_poll" results/idle_256-forced_index.explain.txt
 grep "Sort Key" results/idle_256-forced_index_no_tiebreak.explain.txt
+grep "Buffers: shared hit=34" results/recheck_cost.explain.txt
 ```
 
 `schema.sql`, `seed.sql`, `seed_adversarial_50.sql`, `seed_adversarial_200.sql`,
 `control.sql`, `control_raw.sql`, `batch_claim.sql`, `claim_batched.sql`,
 `forced_index_diagnostic.sql`, `forced_index_no_tiebreak_diagnostic.sql`,
-and `driver.sql` are archived alongside
+`recheck_cost_diagnostic.sql`, and `driver.sql` are archived alongside
 `run_assay.sh` in this directory, along with the full `results/*.txt` /
 `results/*.explain.txt` output and `results/run.log` (regenerated by
 `run_assay.sh` itself, per the tooling fix above) this report's tables are

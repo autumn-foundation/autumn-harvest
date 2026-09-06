@@ -125,6 +125,13 @@ SELECT * FROM claim_batched(ARRAY['bench-q-0','bench-q-1','bench-q-2','bench-q-3
 \o
 \timing off
 
+-- ===== Post-review recheck-cost correction: re-measure the per-candidate
+-- authoritative recheck at 256- and 5,000-key cardinality, 2,000 RUNNING
+-- rows each (see recheck_cost_diagnostic.sql's own header). =====
+\o results/recheck_cost.explain.txt
+\i recheck_cost_diagnostic.sql
+\o
+
 -- ===== Equivalence check: candidate claims the same row control would,
 -- in every non-adversarial scenario. Re-seed each and compare in the same
 -- transaction (rolled back, so it doesn't consume the row). =====

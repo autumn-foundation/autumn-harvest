@@ -60,7 +60,7 @@
                              Buffers: shared hit=194
  Planning:
    Buffers: shared hit=57
- Planning Time: 0.272 ms
- Execution Time: 149.067 ms
+ Planning Time: 0.452 ms
+ Execution Time: 139.378 ms
 (62 rows)
 

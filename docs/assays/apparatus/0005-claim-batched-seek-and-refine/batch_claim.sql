@@ -13,10 +13,14 @@
 -- query, the same reason ledger #4 kept its own recheck cost in a separate
 -- isolated file (`recheck.sql`) rather than folding it into
 -- `candidate_select.sql`. This file therefore measures only the fetch
--- step's own cost; the recheck's per-candidate cost is the same query
--- shape ledger #4 already measured in isolation (~1 buffer at both 256 and
--- 5,000 key cardinality), and its actual contribution to end-to-end cost
--- is visible in this assay's own `claim_batched()` wall-clock numbers.
+-- step's own cost; the recheck's own cost is `recheck_cost_diagnostic.sql`
+-- (added post-review, round 3, after an earlier version of this comment
+-- understated it as "~1 buffer at both 256 and 5,000 key cardinality" --
+-- true only at 0 `RUNNING` rows; it is 34 buffers at 2,000 `RUNNING` rows,
+-- identically at both key cardinalities, since the query is a scan of the
+-- `RUNNING` population, not of distinct keys), and its actual contribution
+-- to end-to-end cost is visible in this assay's own `claim_batched()`
+-- wall-clock numbers.
 --
 -- NOTE (post-review, Codex, round 2, second finding): the archived
 -- `EXPLAIN` output for this query shows a `Seq Scan` (or, forced, an

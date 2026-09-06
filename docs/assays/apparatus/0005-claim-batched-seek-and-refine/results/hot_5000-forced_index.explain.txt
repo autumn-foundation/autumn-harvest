@@ -16,7 +16,7 @@
                      Index Cond: ((harvest_task_queue.queue_name = ANY ('{bench-q-0,bench-q-1,bench-q-2,bench-q-3}'::text[])) AND (harvest_task_queue.state = 'PENDING'::text) AND (harvest_task_queue.scheduled_at <= now()))
                      Buffers: shared hit=548
  Settings: enable_seqscan = 'off', enable_bitmapscan = 'off'
- Planning Time: 0.064 ms
- Execution Time: 11.138 ms
+ Planning Time: 0.107 ms
+ Execution Time: 11.302 ms
 (18 rows)
 

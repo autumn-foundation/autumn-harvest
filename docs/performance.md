@@ -1079,14 +1079,15 @@ per-batch fetch, the specific rewrite issue #1340 was deferred pending —
 was measured and also killed, on its pre-registration's arithmetic and on a
 narrower mechanism than first reported:**
 `docs/assays/0005-claim-batched-seek-and-refine.md` (ledger #5) fetches the
-top 50 ordered candidates per round trip and scopes the recheck CTE to only
-that batch's own distinct keys, not the backlog's global cardinality. Idle
-cost, the 5,000-key blowup, the 256-key case, and both adversarial
-fixtures' wall-clock all pass decisively; batch-count scaling under
-adversarial depth is linear, not catastrophic. It still kills: both
-adversarial fixtures resolved in one more batch than their pre-registered
-"exactly N" line allowed, because that line's own formula undercounted by
-the one slot the claimable row itself occupies. Two rounds of post-review (Codex) further
+top 50 ordered candidates per round trip, then walks them procedurally
+applying the production path's own per-candidate advisory-lock-and-recheck
+(`queue.rs:750-770`) rather than a batch-wide snapshot. Idle cost, the
+5,000-key blowup, the 256-key case, and both adversarial fixtures'
+wall-clock all pass decisively; batch-count scaling under adversarial depth
+is linear, not catastrophic. It still kills: both adversarial fixtures
+resolved in one more batch than their pre-registered "exactly N" line
+allowed, because that line's own formula undercounted by the one slot the
+claimable row itself occupies. Three rounds of post-review (Codex) further
 found: the report had mischaracterized the candidate fetch as an
 index-ordered seek through `idx_harvest_tq_poll`; the archived `EXPLAIN`
 output shows a `Seq Scan` of the whole matching backlog instead (the same
@@ -1095,20 +1096,28 @@ shape the committed fix's own control query plans as, at this apparatus's
 doesn't recover a bounded scan either — still reads every matching row,
 costs more, no `LIMIT` pushdown (a proposed alternative explanation, that
 the assay's own added tiebreak column caused this, was checked directly
-and did not hold up). Separately, the first fix's winner-pick used a
-stale batch-wide snapshot instead of the production path's per-candidate
-advisory-lock recheck (`queue.rs:750-770`) — a real concurrency-correctness
-gap a single-session apparatus can't surface on its own, fixed to match the
-mechanism ledger #4 already had right. So the assay's surviving claim is
-narrower than first reported: the per-candidate recheck's cost is
-cardinality-independent, and batching doesn't cost more than the current
-(already `O(backlog)` at this depth) fix — not that batching bounds cost as
-backlog depth grows, which remains untested. That gap also surfaces an
-unresolved discrepancy against this page's own #1177 baseline (reported
-there as a clean index scan with no `Sort` node, at a much larger fixture);
-a corrected-arithmetic re-charter, a depth-varying re-charter, that
-discrepancy, and real concurrent-claimer throughput (still unmeasured by
-any concurrency-gate assay so far) all remain open, un-run pits.
+and did not hold up). Separately, the first fix's winner-pick used a stale
+batch-wide snapshot with no serialization at all instead of the advisory
+lock above — a real concurrency-correctness gap a single-session apparatus
+can't surface on its own, fixed to match the mechanism ledger #4 already
+had right (grading the fix against the original lines rather than
+re-chartering was itself reviewed and defended: the lines never changed,
+only an unsound implementation was corrected, and the fixture's own
+adversarial scenarios already exercise the corrected mechanism's cost
+without regressing). And the recheck's own cost, cited as "~1 buffer," is
+34 buffers once the `RUNNING` population reaches 2,000 rows — cardinality
+independence holds for distinct key count, not for `RUNNING` population
+size, a distinction this apparatus's fixtures didn't separate. So the
+assay's surviving claim is narrower than first reported: the per-candidate
+recheck's cost is independent of distinct key count, and batching doesn't
+cost more than the current (already `O(backlog)` at this depth) fix — not
+that batching bounds cost as backlog depth grows, which remains untested.
+That gap also surfaces an unresolved discrepancy against this page's own
+#1177 baseline (reported there as a clean index scan with no `Sort` node,
+at a much larger fixture); a corrected-arithmetic re-charter, a
+depth-varying re-charter, that discrepancy, real concurrent-claimer
+throughput, and cost when many in-batch rejections coincide with a large
+`RUNNING` population all remain open, un-run pits.
 
 Until a fix clears every line of some registered assay, deployments with
 concurrency-key cardinality in the low hundreds (the tested, committed
