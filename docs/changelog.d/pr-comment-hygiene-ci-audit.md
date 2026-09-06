@@ -1569,3 +1569,32 @@ already recorded there, it under-reports, and no `*.rs` comment in this tree
 contains a table at all. KNOWN LIMITATIONS now names all three.
 
 Corpus effect: none.
+
+### Round fifty — `/***` is not a doc comment
+
+Two findings, sorted by direction as before, but the fixed one is not in the
+block layer at all.
+
+**Fixed: the lexer called `/***` a doc comment.** Rustdoc documents nothing
+for `/*** ... */` — compiled and checked, the item's page carries no docblock
+— but the lexer recorded its marker as `/**`. Round forty-eight's indented
+code exemption keys on that marker, so an indented `let x = compute();` and an
+unreferenced TODO inside an ordinary `/***` block were treated as a rendered
+example and Tier A came off the whole comment. It is a marker-classification
+defect in the lexer rather than a Markdown one, and it silently disables the
+absolute gate, so it is fixed rather than deferred. `/**/` was already
+excluded for its own reason; `/***` now joins it, in the nested marker too.
+
+That is the shape of the risk in keying anything on `marker`: round
+forty-eight limited indented code to the markers Rustdoc renders, which was
+right, and inherited a lexer bug that had been harmless until something
+depended on it.
+
+**Deferred to the follow-up issue:** an empty nested comment leaves the
+fragments around it adjacent at the same nesting level, so `| h | /**/ | - |`
+lets `next_row` take the resumed fragment on the *same physical line* as the
+header's delimiter row. A delimiter row must be line-leading and on a later
+line. It under-reports, and the shape is a table with an inline empty comment
+in it.
+
+Corpus effect: none.

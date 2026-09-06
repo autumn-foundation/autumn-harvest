@@ -796,10 +796,16 @@ def extract_comments(source: str) -> list[Piece]:
             marker = "/*"
             if source.startswith("/*!", i):
                 marker = "/*!"
-            elif source.startswith("/**", i) and not source.startswith("/**/", i):
+            elif source.startswith("/**", i) and not (
+                source.startswith("/**/", i) or source.startswith("/***", i)
+            ):
                 # `/**/` is an empty comment, not a doc marker. Treating it as
                 # one would eat the closing `*/` and swallow the rest of the
                 # file as comment body.
+                # `/***` is not one either: Rustdoc documents nothing for it,
+                # checked by compiling one and finding the item's page empty.
+                # Calling it a doc comment exempts its indented content as
+                # rendered code and takes Tier A off a whole comment.
                 marker = "/**"
             depth = 1
             block_group += 1
@@ -852,7 +858,9 @@ def extract_comments(source: str) -> list[Piece]:
                     nested = 2
                     if source.startswith("/*!", i):
                         nested = 3
-                    elif source.startswith("/**", i) and not source.startswith("/**/", i):
+                    elif source.startswith("/**", i) and not (
+                        source.startswith("/**/", i) or source.startswith("/***", i)
+                    ):
                         nested = 3
                     i += nested
                     seg_start = i
@@ -3089,6 +3097,26 @@ RULE_TESTS = [
         "/// - TODO: issue required\n",
         {("CH002", 2)},
         "an ordinary bullet is not indented code",
+    ),
+    (
+        "/*** not a doc comment\n"
+        " *\n"
+        " *     let x = compute();\n"
+        " *     TODO: issue required\n"
+        " */\n"
+        "pub struct A;\n",
+        {("CH001", 3), ("CH002", 4)},
+        "'/***' is an ordinary comment, so its indent is not code",
+    ),
+    (
+        "/** a real doc comment\n"
+        " *\n"
+        " *     let x = compute();\n"
+        " *     TODO: fixture placeholder\n"
+        " */\n"
+        "pub struct B;\n",
+        set(),
+        "and '/**' is still a doc comment",
     ),
 ]
 
