@@ -8680,10 +8680,10 @@ async fn schedule_bulk_pause_ui(
         .await
         .unwrap_or_default();
         acted_on += updated_ids.len();
-        // One multi-row insert per shard instead of one round trip per
-        // updated schedule (issue #1399): every record shares the same
-        // actor/operation/route/status/shard, so only the target id varies,
-        // and `insert_audit_batch` preserves that shape exactly.
+        // One multi-row insert per shard, not one round trip per updated
+        // schedule (issue #1399). Every record shares the same
+        // actor/operation/route/status/shard, so only the target id varies.
+        // `insert_audit_batch` preserves that shape exactly.
         let id_strs: Vec<String> = updated_ids.iter().map(ToString::to_string).collect();
         let records: Vec<NewAuditRecord<'_>> = id_strs
             .iter()

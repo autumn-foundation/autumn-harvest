@@ -23,8 +23,8 @@ large.
 * Against a 500-schedule fixture (300 matching a `target=` filter, 200
   non-matching noise schedules on the same shard), one
   `POST /ui/schedules/bulk-pause` request issued **300 audit-insert
-  statements** — **98.4% of the whole request's SQL calls** (300 of 305).
-  Buffers were a smaller share (43.3%, 2 590 of 5 980) — the N+1 shows up in
+  statements** — **98.7% of the whole request's SQL calls** (300 of 304).
+  Buffers were a smaller share (43.4%, 2 590 of 5 966) — the N+1 shows up in
   the `calls` ranking, not the buffers ranking, exactly the pattern this
   repo's own performance playbook calls out.
 * **The fix collects the per-row `NewAuditRecord`s into a `Vec` and issues
@@ -35,6 +35,14 @@ large.
   not bytes.
 * **`bulk-resume` shows the identical pattern and the identical fix** — it
   shares the same per-row audit loop, batched the same way.
+* **`insert_audit_batch` chunks at 4 999 rows per statement** (Codex review,
+  PR #1407): PostgreSQL's wire protocol caps one statement at 65 535 bound
+  parameters, and `NewAuditRecord` has 11 columns, so an unchunked batch of
+  8 192+ matching schedules on one shard would have overflowed that limit —
+  silently dropping every audit row for the shard, since both UI handlers
+  discard this function's error. A regression test
+  (`insert_audit_batch_spans_multiple_chunks_without_error`) proves a
+  10 001-row batch, spanning three chunks, still inserts every row.
 * **No new index, no schema change, no migration.** `insert_audit` itself is
   untouched and still used by every single-row mutation (pause one
   schedule, delete one schedule, trigger one schedule). Only the two bulk
@@ -71,14 +79,17 @@ variable unset the harness falls back to a `postgres:16` testcontainer.
 
 One `POST /ui/schedules/bulk-pause target=bulk_perf_target` request, 300
 matching + 200 non-matching schedules on one shard, `pg_stat_statements`
-reset immediately before the request:
+reset immediately before the request and snapshotted immediately after it
+(before any follow-up verification query the harness itself issues, so
+harness bookkeeping never counts toward "the whole request" — Codex
+review, PR #1407):
 
 | statement shape | calls | buffers | share of request calls | share of request buffers |
 |:--|--:|--:|--:|--:|
-| `INSERT INTO harvest_audit_log ...` (per-row, before) | 300 | 2 590 | 98.4% | 43.3% |
-| whole request (before) | 305 | 5 980 | 100% | 100% |
+| `INSERT INTO harvest_audit_log ...` (per-row, before) | 300 | 2 590 | 98.7% | 43.4% |
+| whole request (before) | 304 | 5 966 | 100% | 100% |
 
-98.4% of calls is nowhere near the "under 5% of both calls and buffers,
+98.7% of calls is nowhere near the "under 5% of both calls and buffers,
 stop" floor — this is squarely the class of N+1 the profiling step exists
 to catch.
 
@@ -101,17 +112,27 @@ let _ = insert_audit_batch(&mut conn, &records).await;
 
 `audit::insert_audit_batch` (`autumn-harvest/src/audit.rs`) is a thin
 addition alongside the existing `insert_audit`: a multi-row
-`insert_into(harvest_audit_log::table).values(records)`, returning the
-generated ids in the same order. An empty slice never sends a statement —
-an empty `VALUES` list has no `Insertable` representation — so a bulk
-action that matched zero rows still does zero audit inserts, exactly as
-before.
+`insert_into(harvest_audit_log::table).values(records)` per chunk of at
+most 4 999 records, returning the generated ids in the same order. An
+empty slice never sends a statement — an empty `VALUES` list has no
+`Insertable` representation — so a bulk action that matched zero rows
+still does zero audit inserts, exactly as before.
 
 Every record in one bulk action's batch shares the same
 actor/operation/route/status/shard; only `target_id` varies row to row, so
 the batched statement is a straightforward
 `INSERT ... VALUES ($1,...), ($9,...), ...` with the identical column
 values the per-row loop would have written.
+
+The 4 999-row chunk size is not arbitrary: PostgreSQL's wire protocol caps
+one statement at 65 535 bound parameters, and `NewAuditRecord` has 11
+columns, so 4 999 × 11 = 54 989 stays comfortably under the limit even
+when every column binds a value rather than falling back to `DEFAULT`.
+Without chunking, a shard with 8 192 or more matching schedules in one
+bulk action would have overflowed the limit outright — and both UI
+handlers discard `insert_audit_batch`'s error (`let _ = ...`), so the
+schedules would still get paused or resumed while every audit row for
+that shard silently vanished.
 
 ## Measurement
 
@@ -120,14 +141,14 @@ Same fixture, same request, after the fix:
 | statement shape | calls | buffers |
 |:--|--:|--:|
 | `INSERT INTO harvest_audit_log ...` (batched, after) | 1 | 2 503 |
-| whole request (after) | 6 | 5 899 |
+| whole request (after) | 5 | 5 879 |
 
 | | before | after | Δ |
 |:--|--:|--:|--:|
 | audit-insert calls | 300 | 1 | **-99.67%** (300x fewer) |
 | audit-insert buffers | 2 590 | 2 503 | -3.4% |
-| whole-request calls | 305 | 6 | **-98.03%** |
-| whole-request buffers | 5 980 | 5 899 | -1.35% |
+| whole-request calls | 304 | 5 | **-98.36%** |
+| whole-request buffers | 5 966 | 5 879 | -1.46% |
 
 `bulk-resume` (300 already-paused matching schedules, same 200 noise rows):
 
@@ -135,8 +156,8 @@ Same fixture, same request, after the fix:
 |:--|--:|--:|--:|
 | audit-insert calls | 300 | 1 | **-99.67%** |
 | audit-insert buffers | 2 590 | 2 503 | -3.4% |
-| whole-request calls | 305 | 6 | **-98.03%** |
-| whole-request buffers | 6 578 | 6 491 | -1.3% |
+| whole-request calls | 304 | 5 | **-98.36%** |
+| whole-request buffers | 6 552 | 6 465 | -1.33% |
 
 The call-count elimination alone clears the impact floor ("statement count
 per request drops from O(n) to O(1)" needs no other justification). The
@@ -173,6 +194,10 @@ from the same click.
 `insert_audit_batch_on_empty_slice_is_a_no_op` covers the zero-match edge
 case: an empty slice sends no statement and returns `Ok(vec![])`.
 
+`insert_audit_batch_spans_multiple_chunks_without_error` covers the large-N
+edge case the chunk size exists for: a 10 001-row batch, spanning three
+4 999-row chunks, inserts every row and returns one id per record.
+
 The pre-existing end-to-end regression tests in `ui_integration.rs` —
 `ui_schedules_bulk_pause_pauses_matching_rows`,
 `ui_schedules_bulk_pause_respects_the_health_filter`,
@@ -199,7 +224,8 @@ round trips and parse/plan cycles Postgres spends getting those rows in.
 HARVEST_TEST_DATABASE_URL=postgres://postgres:postgres@localhost:5432/postgres \
   cargo test -p autumn-harvest-plugin --test schedule_bulk_audit_perf -- \
   insert_audit_batch_matches_per_row_insert_audit_loop \
-  insert_audit_batch_on_empty_slice_is_a_no_op
+  insert_audit_batch_on_empty_slice_is_a_no_op \
+  insert_audit_batch_spans_multiple_chunks_without_error
 
 # Full evidence capture (seeds 500 schedules; a couple of seconds):
 HARVEST_TEST_DATABASE_URL=postgres://postgres:postgres@localhost:5432/postgres \

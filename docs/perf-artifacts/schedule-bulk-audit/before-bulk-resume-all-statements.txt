@@ -1,15 +1,12 @@
 -- before bulk-resume: every statement pg_stat_statements recorded for this database during one real POST /ui/schedules/bulk-resume request, 300 matching schedules --
-REQUEST TOTAL: calls=305 buffers=6578
-audit-insert shape's share: calls=300/305 (98.4%), buffers=2590/6578 (39.4%)
+REQUEST TOTAL: calls=304 buffers=6552
+audit-insert shape's share: calls=300/304 (98.7%), buffers=2590/6552 (39.5%)
 
 calls=1 shared_blks_hit=3943 shared_blks_read=0 total_buffers=3943
 query=UPDATE "harvest_schedules" SET "is_paused" = $1, "paused_at" = $2, "paused_by" = $3, "pause_reason" = $4, "auto_paused_at" = $5, "consecutive_failure_count" = $6, "updated_at" = $7 WHERE (("harvest_schedules"."id" = ANY($8)) AND (("harvest_schedules"."is_paused" = $9) OR ("harvest_schedules"."auto_paused_at" IS NOT NULL))) RETURNING "harvest_schedules"."id"
 
 calls=300 shared_blks_hit=2584 shared_blks_read=6 total_buffers=2590
 query=INSERT INTO "harvest_audit_log" ("actor", "operation", "target_type", "target_id", "route_or_command", "request_id", "idempotency_key", "status", "error_summary", "shard_id", "source") VALUES ($1, $2, $3, $4, $5, DEFAULT, DEFAULT, $6, DEFAULT, $7, $8) RETURNING "harvest_audit_log"."id"
-
-calls=1 shared_blks_hit=26 shared_blks_read=0 total_buffers=26
-query=SELECT COUNT(*) AS value FROM harvest_schedules WHERE workflow_name LIKE $1 AND is_paused = $2
 
 calls=1 shared_blks_hit=19 shared_blks_read=0 total_buffers=19
 query=SELECT "harvest_schedules"."id", "harvest_schedules"."dag_name", "harvest_schedules"."schedule_expr", "harvest_schedules"."timezone", "harvest_schedules"."catchup", "harvest_schedules"."max_active_runs", "harvest_schedules"."is_paused", "harvest_schedules"."last_run_at", "harvest_schedules"."next_run_at", "harvest_schedules"."created_at", "harvest_schedules"."updated_at", "harvest_schedules"."workflow_name", "harvest_schedules"."workflow_input", "harvest_schedules"."queue_name", "harvest_schedules"."paused_at", "harvest_schedules"."paused_by", "harvest_schedules"."pause_reason", "harvest_schedules"."jitter_secs", "harvest_schedules"."overlap_policy", "harvest_schedules"."buffered_runs", "harvest_schedules"."buffer_all_max", "harvest_schedules"."calendar_name", "harvest_schedules"."skip_policy", "harvest_schedules"."fire_claim_token", "harvest_schedules"."fire_claimed_until", "harvest_schedules"."consecutive_failure_limit", "harvest_schedules"."consecutive_failure_count", "harvest_schedules"."auto_paused_at", "harvest_schedules"."end_at", "harvest_schedules"."max_runs", "harvest_schedules"."runs_started", "harvest_schedules"."exhausted_at", "harvest_schedules"."exhausted_reason", "harvest_schedules"."catchup_policy", "harvest_schedules"."catchup_window_secs", "harvest_schedules"."last_catchup_dropped", "harvest_schedules"."last_catchup_at", "harvest_schedules"."retry_policy" FROM "harvest_schedules" WHERE (("harvest_schedules"."is_paused" = $1) OR ("harvest_schedules"."auto_paused_at" IS NOT NULL))

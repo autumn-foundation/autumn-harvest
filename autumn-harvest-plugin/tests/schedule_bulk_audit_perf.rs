@@ -305,6 +305,14 @@ async fn capture_bulk_action_evidence(action: &str, label_prefix: &str) {
         "bulk action must redirect (got {status})"
     );
 
+    // ONE snapshot query for both views below -- see `snapshot_statements`'s
+    // doc comment for why a second query against `pg_stat_statements` would
+    // pollute the total. This must also run before the acted-on count check
+    // just below. That check is itself a SQL statement. Running it first
+    // would fold harness bookkeeping into "the whole request"'s totals
+    // (Codex review, PR #1407).
+    let all_rows = snapshot_statements(&mut stats_conn, &db_name).await;
+
     let acted_on: i64 = diesel::sql_query(if action == "bulk-resume" {
         "SELECT COUNT(*) AS value FROM harvest_schedules \
          WHERE workflow_name LIKE 'bulk_perf_target_%' AND is_paused = false"
@@ -320,10 +328,6 @@ async fn capture_bulk_action_evidence(action: &str, label_prefix: &str) {
         acted_on, MATCHING,
         "every matching schedule must have been acted on"
     );
-
-    // ONE snapshot query for both views below -- see `snapshot_statements`'s
-    // doc comment for why a second query here would pollute the total.
-    let all_rows = snapshot_statements(&mut stats_conn, &db_name).await;
     let stats_rows: Vec<&StatRow> = all_rows
         .iter()
         .filter(|r| is_audit_insert_statement(r))
@@ -568,4 +572,60 @@ async fn insert_audit_batch_on_empty_slice_is_a_no_op() {
         .await
         .expect("empty batch must succeed");
     assert!(returned.is_empty());
+}
+
+/// A batch spanning more than one chunk boundary must still insert every
+/// record and return one id per record. It must raise no `PostgreSQL`
+/// bind-parameter limit error. Issue #1407 review: 8,192+ matching
+/// schedules on one shard used to overflow the 65,535-parameter protocol
+/// limit in a single statement. That silently dropped every audit row for
+/// the shard, because callers discard this function's error. 10,001
+/// records spans three chunks at the 4,999-row chunk size, without needing
+/// a slow, huge fixture.
+#[tokio::test]
+async fn insert_audit_batch_spans_multiple_chunks_without_error() {
+    use autumn_harvest::audit::insert_audit_batch;
+    use autumn_harvest::models::NewAuditRecord;
+    use autumn_harvest::schema::harvest_audit_log;
+
+    const N: usize = 10_001;
+
+    let (admin, _guard) = setup_server().await;
+    let url = create_fresh_db(&admin, &unique("audit_batch_chunking")).await;
+    let mut conn = AsyncPgConnection::establish(&url).await.expect("connect");
+
+    let ids: Vec<String> = (0..N).map(|i| format!("chunked-{i}")).collect();
+    let records: Vec<NewAuditRecord<'_>> = ids
+        .iter()
+        .map(|id| NewAuditRecord {
+            actor: "ui",
+            operation: "schedule.pause",
+            target_type: "schedule",
+            target_id: Some(id.as_str()),
+            route_or_command: "POST /ui/schedules/bulk-pause",
+            request_id: None,
+            idempotency_key: None,
+            status: "succeeded",
+            error_summary: None,
+            shard_id: Some(0),
+            source: "ui",
+        })
+        .collect();
+
+    let returned = insert_audit_batch(&mut conn, &records)
+        .await
+        .expect("a multi-chunk batch must not hit the parameter limit");
+    assert_eq!(returned.len(), N, "every record must get a generated id");
+
+    let inserted: i64 = harvest_audit_log::table
+        .filter(harvest_audit_log::target_id.eq_any(&ids))
+        .count()
+        .get_result(&mut conn)
+        .await
+        .expect("count inserted rows");
+    assert_eq!(
+        inserted,
+        i64::try_from(N).unwrap(),
+        "every record across every chunk must have actually landed"
+    );
 }

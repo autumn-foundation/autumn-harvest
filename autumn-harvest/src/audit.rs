@@ -1426,8 +1426,18 @@ pub async fn insert_audit(
         .map_err(database_error)
 }
 
-/// Insert several audit records in one round trip. Returns the generated ids
-/// in the same order as `records`.
+/// `PostgreSQL`'s wire protocol caps a single statement at 65 535 bound
+/// parameters. `NewAuditRecord` has 11 columns, so a chunk of this many
+/// rows binds at most 54 989 parameters. That stays comfortably under the
+/// limit, even when every column binds a value rather than falling back to
+/// its SQL `DEFAULT`. Issue #1407 review: a batch at or beyond the raw
+/// limit used to silently drop every audit row for its shard. Callers
+/// discard this function's error, so nothing surfaced the drop.
+const MAX_AUDIT_BATCH_ROWS: usize = 4999;
+
+/// Insert several audit records in one round trip per chunk of at most
+/// [`MAX_AUDIT_BATCH_ROWS`] records. Returns the generated ids in the same
+/// order as `records`.
 ///
 /// An empty slice never sends a statement. An empty `VALUES` list has no
 /// `Insertable` representation. This returns `Ok(vec![])` without touching
@@ -1438,20 +1448,25 @@ pub async fn insert_audit(
 ///
 /// # Errors
 ///
-/// Returns [`crate::error::HarvestError::Database`] if the insert fails.
+/// Returns [`crate::error::HarvestError::Database`] if any chunk's insert
+/// fails. A failure partway through leaves earlier chunks committed. Each
+/// chunk is its own statement, matching the per-row loop this replaces,
+/// which offered no cross-row atomicity either.
 pub async fn insert_audit_batch(
     conn: &mut AsyncPgConnection,
     records: &[NewAuditRecord<'_>],
 ) -> HarvestResult<Vec<Uuid>> {
-    if records.is_empty() {
-        return Ok(Vec::new());
+    let mut ids = Vec::with_capacity(records.len());
+    for chunk in records.chunks(MAX_AUDIT_BATCH_ROWS) {
+        let chunk_ids = diesel::insert_into(harvest_audit_log::table)
+            .values(chunk)
+            .returning(harvest_audit_log::id)
+            .get_results::<Uuid>(conn)
+            .await
+            .map_err(database_error)?;
+        ids.extend(chunk_ids);
     }
-    diesel::insert_into(harvest_audit_log::table)
-        .values(records)
-        .returning(harvest_audit_log::id)
-        .get_results::<Uuid>(conn)
-        .await
-        .map_err(database_error)
+    Ok(ids)
 }
 
 /// List audit records matching the given filters, ordered by `occurred_at DESC`.

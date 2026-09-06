@@ -6,5 +6,5 @@ acted_on=300
 audit_statement_shapes=1
 total_calls=300
 total_buffers=2590
-request_total_calls=305
-request_total_buffers=5980
+request_total_calls=304
+request_total_buffers=5966

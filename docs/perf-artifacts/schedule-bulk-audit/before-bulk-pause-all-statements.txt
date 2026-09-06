@@ -1,22 +1,19 @@
 -- before bulk-pause: every statement pg_stat_statements recorded for this database during one real POST /ui/schedules/bulk-pause request, 300 matching schedules --
-REQUEST TOTAL: calls=305 buffers=5980
-audit-insert shape's share: calls=300/305 (98.4%), buffers=2590/5980 (43.3%)
+REQUEST TOTAL: calls=304 buffers=5966
+audit-insert shape's share: calls=300/304 (98.7%), buffers=2590/5966 (43.4%)
 
-calls=1 shared_blks_hit=3358 shared_blks_read=0 total_buffers=3358
+calls=1 shared_blks_hit=3364 shared_blks_read=0 total_buffers=3364
 query=UPDATE "harvest_schedules" SET "is_paused" = $1, "paused_at" = $2, "paused_by" = $3, "updated_at" = $4 WHERE (("harvest_schedules"."id" = ANY($5)) AND ("harvest_schedules"."is_paused" != $6)) RETURNING "harvest_schedules"."id"
 
 calls=300 shared_blks_hit=2584 shared_blks_read=6 total_buffers=2590
 query=INSERT INTO "harvest_audit_log" ("actor", "operation", "target_type", "target_id", "route_or_command", "request_id", "idempotency_key", "status", "error_summary", "shard_id", "source") VALUES ($1, $2, $3, $4, $5, DEFAULT, DEFAULT, $6, DEFAULT, $7, $8) RETURNING "harvest_audit_log"."id"
 
-calls=1 shared_blks_hit=20 shared_blks_read=0 total_buffers=20
-query=SELECT COUNT(*) AS value FROM harvest_schedules WHERE workflow_name LIKE $1 AND is_paused = $2
-
 calls=1 shared_blks_hit=12 shared_blks_read=0 total_buffers=12
 query=SELECT "harvest_schedules"."id", "harvest_schedules"."dag_name", "harvest_schedules"."schedule_expr", "harvest_schedules"."timezone", "harvest_schedules"."catchup", "harvest_schedules"."max_active_runs", "harvest_schedules"."is_paused", "harvest_schedules"."last_run_at", "harvest_schedules"."next_run_at", "harvest_schedules"."created_at", "harvest_schedules"."updated_at", "harvest_schedules"."workflow_name", "harvest_schedules"."workflow_input", "harvest_schedules"."queue_name", "harvest_schedules"."paused_at", "harvest_schedules"."paused_by", "harvest_schedules"."pause_reason", "harvest_schedules"."jitter_secs", "harvest_schedules"."overlap_policy", "harvest_schedules"."buffered_runs", "harvest_schedules"."buffer_all_max", "harvest_schedules"."calendar_name", "harvest_schedules"."skip_policy", "harvest_schedules"."fire_claim_token", "harvest_schedules"."fire_claimed_until", "harvest_schedules"."consecutive_failure_limit", "harvest_schedules"."consecutive_failure_count", "harvest_schedules"."auto_paused_at", "harvest_schedules"."end_at", "harvest_schedules"."max_runs", "harvest_schedules"."runs_started", "harvest_schedules"."exhausted_at", "harvest_schedules"."exhausted_reason", "harvest_schedules"."catchup_policy", "harvest_schedules"."catchup_window_secs", "harvest_schedules"."last_catchup_dropped", "harvest_schedules"."last_catchup_at", "harvest_schedules"."retry_policy" FROM "harvest_schedules" WHERE ("harvest_schedules"."is_paused" != $1)
 
 calls=1 shared_blks_hit=0 shared_blks_read=0 total_buffers=0
-query=SET CLIENT_ENCODING TO 'UTF8'
+query=SET TIME ZONE 'UTC'
 
 calls=1 shared_blks_hit=0 shared_blks_read=0 total_buffers=0
-query=SET TIME ZONE 'UTC'
+query=SET CLIENT_ENCODING TO 'UTF8'
 
