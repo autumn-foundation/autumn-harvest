@@ -3052,7 +3052,8 @@ fn render_dead_letters_page(
         (render_dead_letter_pagination(page, limit, has_next, filters, refresh))
     };
 
-    layout_dead_letters("Dead Letters · Vantage", &body, refresh)
+    let refresh_target = dead_letter_return_to_path(filters, limit, refresh);
+    layout_dead_letters("Dead Letters · Vantage", &body, refresh, &refresh_target)
 }
 
 // ---------------------------------------------------------------------------
@@ -3124,10 +3125,20 @@ async fn render_dead_letters_summary_view(
         }
     };
 
+    let group_by_query = if group_by_value.is_empty() {
+        String::new()
+    } else {
+        format!("&group_by={}", url_encode(&group_by_value))
+    };
+    let refresh_target = format!(
+        "../ui/dead-letters?view=summary{}{group_by_query}",
+        build_dead_letter_query_string(limit, filters, refresh)
+    );
     Ok(layout_dead_letters(
         "Dead Letters · Summary · Vantage",
         &body,
         refresh,
+        &refresh_target,
     ))
 }
 
@@ -3810,7 +3821,25 @@ fn truncate_error(error: &str) -> String {
     }
 }
 
-fn layout_dead_letters(title: &str, body: &Markup, refresh: Option<u64>) -> Markup {
+/// `refresh_target` is the current filtered view's URL with no `flash`
+/// param. The caller builds it from the same filters, limit, and refresh
+/// already in its own scope.
+///
+/// A dead-letter action redirects here with `flash` appended to
+/// `return_to`. `return_to` itself preserves `refresh`. An operator with
+/// auto-refresh on would otherwise see this page's targetless `meta
+/// refresh` reload that same URL, flash included, on every interval. Each
+/// reload would re-announce and re-focus a stale message.
+///
+/// An explicit `url=` on the tag breaks that loop. The flash still shows
+/// and takes focus on the load right after the action. Every reload after
+/// that lands on the flash-free URL instead (found in review, PR #1396).
+fn layout_dead_letters(
+    title: &str,
+    body: &Markup,
+    refresh: Option<u64>,
+    refresh_target: &str,
+) -> Markup {
     html! {
         (PreEscaped("<!DOCTYPE html>"))
         html lang="en" {
@@ -3818,7 +3847,7 @@ fn layout_dead_letters(title: &str, body: &Markup, refresh: Option<u64>) -> Mark
                 meta charset="utf-8";
                 meta name="viewport" content="width=device-width,initial-scale=1";
                 @if let Some(secs) = refresh {
-                    meta http-equiv="refresh" content=(secs);
+                    meta http-equiv="refresh" content={ (secs) "; url=" (refresh_target) };
                 }
                 title { (title) }
                 style { (PreEscaped(STYLE)) }
@@ -12313,10 +12342,31 @@ mod tests {
     #[test]
     fn layout_dead_letters_includes_build_routing_nav_link() {
         let body = html! { p { "test" } };
-        let html = layout_dead_letters("Test", &body, None).into_string();
+        let html = layout_dead_letters("Test", &body, None, "").into_string();
         assert!(
             html.contains("build-routing"),
             "layout_dead_letters must include a Build Routing nav link"
+        );
+    }
+
+    #[test]
+    fn layout_dead_letters_refresh_tag_targets_flash_free_url() {
+        // A targetless `meta refresh` would reload this page's own URL.
+        // If that URL still carries `flash=...`, every auto-refresh
+        // interval re-announces and re-focuses the same stale message.
+        // The tag must instead point `url=` at the flash-free target the
+        // caller supplies.
+        let body = html! { p { "test" } };
+        let html = layout_dead_letters(
+            "Test",
+            &body,
+            Some(30),
+            "../ui/dead-letters?limit=50",
+        )
+        .into_string();
+        assert!(
+            html.contains(r#"content="30; url=../ui/dead-letters?limit=50""#),
+            "refresh tag must target the flash-free URL: {html}"
         );
     }
 
