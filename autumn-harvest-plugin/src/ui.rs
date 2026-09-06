@@ -3020,7 +3020,7 @@ fn render_dead_letters_page(
     let body = html! {
         h2 { "Dead Letters" }
         @if let Some(message) = flash {
-            div.flash { (message) }
+            div.flash role="status" { (message) }
         }
         (render_dead_letter_view_toggle(filters, limit, refresh, None, false))
         (render_dead_letter_filters(filters, limit, refresh))
@@ -3096,7 +3096,7 @@ async fn render_dead_letters_summary_view(
     let body = html! {
         h2 { "Dead Letters" }
         @if let Some(message) = flash {
-            div.flash { (message) }
+            div.flash role="status" { (message) }
         }
         (render_dead_letter_view_toggle(filters, limit, refresh, Some(&group_by_value), true))
         (render_dead_letter_filters(filters, limit, refresh))
@@ -4682,7 +4682,7 @@ fn render_workflow_detail(
         }
 
         @if let Some(message) = flash {
-            div.flash { (message) }
+            div.flash role="status" { (message) }
         }
 
         @if let Some(error) = execution.error.as_deref() {
@@ -6603,7 +6603,7 @@ fn render_dag_detail(
 ) -> Markup {
     let body = html! {
         @if let Some(message) = flash {
-            div class="flash" { (message) }
+            div class="flash" role="status" { (message) }
         }
         h2 { "DAG " code { (dag_name) } " runs" }
         @if let Some(run_id) = selected_run {
@@ -7395,7 +7395,7 @@ fn render_build_routing_page(
         }
 
         @if let Some(msg) = flash {
-            div.flash { (msg) }
+            div.flash role="status" { (msg) }
         }
 
         @if !diverged_queues.is_empty() {
@@ -8864,7 +8864,7 @@ fn render_schedules_page(
         h2 { "Schedules" }
 
         @if let Some(message) = flash {
-            div.flash { (message) }
+            div.flash role="status" { (message) }
         }
 
         @if !unhealthy_summary.is_empty() {
