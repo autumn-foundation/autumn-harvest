@@ -317,7 +317,13 @@ COMMENTED_CODE_RE = re.compile(
       # first") cannot reach it, and the line must end at the `;`. Measured
       # against all 176k corpus comments before adding: one hit, and it was
       # real commented-out code.
-      | (?:return|break|continue)\b(?:\s+[^\s;{}]+)?\s*;\s*$
+      # `return` and `break` take an expression, so any single token after
+      # them is a value. `continue` takes only a LIFETIME LABEL -- rustc
+      # answers "expected a label, found an identifier" -- so sharing the
+      # unrestricted form with them reported prose: "If the row is absent,"
+      # wrapping onto "continue normally;" is a sentence, not a statement.
+      | (?:return|break)\b(?:\s+[^\s;{}]+)?\s*;\s*$
+      | continue\b(?:\s+'\w+)?\s*;\s*$
       | [\w:]+(?:::<[^;()]*>)?(?:\.[\w:]+(?:::<[^;()]*>)?)*
             \(.*\)(?:\s*\?|\s*\.await\s*\??)*\s*;\s*$
     )""",
@@ -337,6 +343,11 @@ TODO_REF_RE = re.compile(r"#\d+|https?://")
 # "See #123 for parser." on the line below became one tracked commitment,
 # which is the borrowing round sixty-three exists to refuse.
 ENDS_SENTENCE_RE = re.compile(r"(?<!e\.g)(?<!E\.g)(?<!i\.e)(?<!I\.e)[.!?][\"')\]]*$")
+# The same boundary, found anywhere rather than at the end. A marker owns
+# its own SENTENCE, so a reference in the next one is no more its own than a
+# reference in the previous one -- which is the bound round sixty-three put
+# on the left and round eighty-two put on the wrapped carry.
+SENTENCE_END_RE = re.compile(r"(?<!e\.g)(?<!E\.g)(?<!i\.e)(?<!I\.e)[.!?]")
 # A reference that ABUTS the marker on its left. Anchored at the end, and
 # opened either at the bound or at a clause separator, so "See #123 for the
 # parser. TODO: x" is still untracked while "#123 - TODO: x" is not.
@@ -366,6 +377,9 @@ def untracked_marker(text: str) -> bool:
     for index, mark in enumerate(marks):
         start = mark.start()
         end = marks[index + 1].start() if index + 1 < len(marks) else len(text)
+        stop = SENTENCE_END_RE.search(text, mark.end(), end)
+        if stop:
+            end = stop.end()
         forward = TODO_REF_RE.search(text, start, end)
         if forward:
             # What this marker consumes, so the next one cannot reuse it.
@@ -4569,6 +4583,27 @@ RULE_TESTS = [
         "// let x: r#Type;\n",
         {("CH001", 1)},
         "and in the type of an uninitialized binding",
+    ),
+    (
+        "// If the row is absent,\n"
+        "// continue normally;\n",
+        set(),
+        "continue takes a label, so a word after it is prose",
+    ),
+    (
+        "// continue 'outer;\n",
+        {("CH001", 1)},
+        "but a label after it is the statement",
+    ),
+    (
+        "// break normally;\n",
+        {("CH001", 1)},
+        "and break really does take a value",
+    ),
+    (
+        "// TODO: add retries. See #123 for parser.\n",
+        {("CH002", 1)},
+        "a reference in the next sentence is not the marker's own",
     ),
 ]
 

@@ -2543,3 +2543,36 @@ Four fixtures for the four that are reachable, and the pattern was
 checked directly against each shape as well as through the scan.
 
 Corpus effect: none.
+
+### Round eighty-three — one keyword out of three, one bound out of two
+
+Two findings.
+
+**`continue` does not take an expression.** The control-flow alternative
+grouped `return`, `break` and `continue` and allowed any single token
+after each. That is right for two of them -- `break normally;` really is
+a value returned from a loop, and rustc compiles it -- and wrong for the
+third: `continue` takes only a lifetime label, and rustc answers
+"expected a label, found an identifier". So a sentence wrapping onto
+`continue normally;` failed an absolute gate. `continue` has its own
+alternative now, taking `'label` or nothing.
+
+Three keywords with two grammars, sharing one pattern because they share
+a position. That is the same mistake as the borrowed predicates of
+rounds seventy-seven and seventy-eight, one level down: convenience of
+form standing in for identity of meaning.
+
+**The forward search had no sentence bound.** Round eighty-two put one
+on the wrapped carry and not on the same-line search beside it, so
+`TODO: add retries. See #123 for parser.` was tracked by a reference in
+the following sentence -- the same borrowing, on one line instead of
+two. Both searches take the bound now.
+
+Round eighty-two's own lesson was that widening a rule means re-checking
+every bound it already had. This round is the reverse and equally
+avoidable: ADDING a bound means applying it to every search the rule
+already had. A bound and a reach are the same edge from two sides.
+
+Corpus effect: none. Four fixtures -- the prose that must not report,
+`continue 'outer;` and `break normally;` which must, and the
+same-line borrowed reference.
