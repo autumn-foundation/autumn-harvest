@@ -2932,3 +2932,31 @@ zero and a bare scheme are still not references, and the trailing
 citation pattern is untouched.
 
 Corpus effect: none. Three fixtures.
+
+### Round ninety-six — one definition of a reference
+
+Two findings, both on the reference patterns, which is the fifth round
+running that one of the three has been out of step with the others. The
+standing tripwire said that a fifth means merging them, so it is merged.
+
+`#123abc` and `#1_000` were read as `#123` and `#1` with something after
+them. An issue number ends where the number ends: `#[1-9]\d*(?!\w)`.
+`owner/repo#123` still counts, because the boundary is only needed after
+the digits -- a cross-repository reference is a real one.
+
+`HTTPS://github.com/...` found no reference at all, so a tracked marker
+failed the build. A scheme is case-insensitive by RFC 3986 and by every
+browser that has ever shipped.
+
+Both defects were in all three patterns, and the three had already
+disagreed about `#123abc`: the adjacent form rejected it, the other two
+accepted it. So WHAT a reference is now has one definition, `REFERENCE`,
+and the three keep only their own answer to WHERE a reference may sit --
+which genuinely differs, and is the reason there are three.
+
+The five disagreements, for the record: a URL destination (round 87), a
+zero issue (89), a punctuation host (92), a bracketed citation (95), and
+this round's pair.
+
+Corpus effect: none. Four fixtures, covering both defects in more than
+one position.

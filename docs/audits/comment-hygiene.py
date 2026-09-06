@@ -363,16 +363,29 @@ TODO_RE = re.compile(
 # `https?://` alone identifies nothing, and CH002 accepted it as tracking.
 # An issue number is POSITIVE and unpadded, the way the tracker writes it.
 # `#0` routes nowhere -- numbering starts at one -- so it is a placeholder,
-# which is the state CH002 exists to refuse. All three reference patterns
-# say the same thing, because a marker may carry its reference forward, in
-# a citation, or on its left.
+# which is the state CH002 exists to refuse.
 #
 # A URL needs a HOST, not just a character after the scheme. `https://).`
-# is punctuation, and every one of the three patterns took it as a
-# destination. A host starts with a letter, a digit, an underscore or the
-# `[` of an IPv6 literal, and never with punctuation.
-URL_HOST = r"[\w\[]"
-TODO_REF_RE = re.compile(r"#[1-9]\d*|https?://" + URL_HOST)
+# is punctuation. A host starts with a letter, a digit, an underscore or
+# the `[` of an IPv6 literal, and never with punctuation.
+#
+# WHAT a reference is, in one place. Three patterns read one -- forward from
+# a marker, inside a citation after it, and abutting it on the left -- and
+# five rounds of review found five ways for those three to disagree: a URL
+# destination, a zero issue, a punctuation host, a bracketed citation, and
+# now a token boundary and a scheme's case. Only WHERE a reference may sit
+# differs between them now, which it genuinely does.
+#
+# A scheme is CASE-INSENSITIVE, by RFC 3986 and by every browser. An issue
+# number ends where the number ends: `#123abc` and `#1_000` are not issue
+# numbers with something after them, they are not issue numbers.
+REFERENCE = (
+    r"(?:"
+    r"#[1-9]\d*(?!\w)"
+    r"|(?i:https?)://[\w\[][^)\]\s]*"
+    r")"
+)
+TODO_REF_RE = re.compile(REFERENCE)
 # A sentence boundary, with every clause `SENTENCE_SPLIT_RE` carries and no
 # others: terminal punctuation, then any emphasis markers, then a SPACE or
 # the end of the text. Both other clauses are load-bearing. The abbreviation
@@ -401,7 +414,7 @@ SENTENCE_END_RE = re.compile(
 # retries. (#123)". A citation is part of the sentence it cites, so that
 # sentence ends after the citation, not at the period in front of it.
 TRAILING_REF_RE = re.compile(
-    r"[ \t]*[(\[][^)\]]*(?:#[1-9]\d*|https?://" + URL_HOST + r"[^)\]\s]*)[^)\]]*[)\]]"
+    r"[ \t]*[(\[][^)\]]*" + REFERENCE + r"[^)\]]*[)\]]"
 )
 # A reference that ABUTS the marker on its left. Anchored at the end, and
 # opened either at the bound or at a clause separator, so "See #123 for the
@@ -413,7 +426,7 @@ TRAILING_REF_RE = re.compile(
 # punctuation around it, exactly as the `(` or `[` before it is.
 ADJACENT_REF_RE = re.compile(
     r"(?:^|[;.,(\[])[\s\-\u2010-\u2015:]*"
-    r"(#[1-9]\d*|https?://" + URL_HOST + r"\S*)"
+    r"(" + REFERENCE + r")"
     r"[\s\-\u2010-\u2015:;,)\]]*$"
 )
 
@@ -4637,6 +4650,26 @@ RULE_TESTS = [
         "// TODO: add retries #10\n",
         set(),
         "but a zero inside a real number is a digit",
+    ),
+    (
+        "// TODO: replace fallback #123abc\n",
+        {("CH002", 1)},
+        "an issue number ends where the number ends",
+    ),
+    (
+        "// TODO: replace fallback (#1_000)\n",
+        {("CH002", 1)},
+        "and an underscore is part of a word, not a separator",
+    ),
+    (
+        "// TODO: see HTTPS://x.test/i/9\n",
+        set(),
+        "but a scheme is case-insensitive, as RFC 3986 has it",
+    ),
+    (
+        "// HTTPS://x.test/i/9 - TODO: fix\n",
+        set(),
+        "in every position a reference may sit",
     ),
     (
         "// TODO: see https://).\n",
