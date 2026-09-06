@@ -3382,3 +3382,19 @@ grammar -- rustc takes a block or another `if` and answers "expected
 `{`, found keyword `while`" for anything else.
 
 Corpus effect: none. Ten fixtures, five of them refusals.
+
+Round 111 -- a warning this file printed in CI on every clean checkout.
+
+`abi()`, added in round 108, held `[\w-]+` in a non-raw docstring. Python
+answers `SyntaxWarning: invalid escape sequence '\w'`, and the CI log
+printed it above the harness output on a pull request whose whole subject
+is a lint gate. The docstring is raw now.
+
+Every local run hid it. Python raises the warning once per BYTECODE
+compile, so a warm `__pycache__` is silent and only a clean checkout says
+anything. Three rounds of local verification could not have found it, and
+the CI log did the moment CI was allowed to finish.
+
+`--self-test` compiles the source under `warnings.catch_warnings` and
+fails on any escape-sequence warning. Compiling does not execute, and the
+check is proved by reverting the docstring: the self-test exits 1.

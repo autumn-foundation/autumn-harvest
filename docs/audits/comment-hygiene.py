@@ -185,6 +185,7 @@ import os
 import re
 import subprocess
 import sys
+import warnings
 from collections import Counter, defaultdict
 
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -297,7 +298,7 @@ ROOT = r"(?:::\s*)?"
 
 
 def abi(tag: str) -> str:
-    """The ABI of an `extern` item, in one place for the two rules that read one.
+    r"""The ABI of an `extern` item, in one place for the two rules that read one.
 
     A plain string literal is not the only spelling. rustc 1.94.1 accepts
     `extern r"C" {}` and `extern r##"C"## {}`, and it accepts the same raw
@@ -6164,6 +6165,24 @@ def self_test() -> int:
     print(f"  [{'ok  ' if ok else 'FAIL'}] line number survives a continuation")
     if not ok:
         print(f"         expected line 3, got {[(p.line, p.text) for p in pieces]!r}")
+
+    # The source must COMPILE clean. An escape sequence in a non-raw
+    # docstring is a DeprecationWarning, and Python raises it once per
+    # BYTECODE compile -- so a warm __pycache__ hides it on every local run
+    # and CI prints it on every clean checkout. Round one hundred and eight
+    # shipped one in `abi()` for exactly that reason, and the CI log found
+    # it rather than any check here. Compiling does not execute.
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        compile(open(__file__, encoding="utf-8").read(), __file__, "exec")
+    escapes = [w for w in caught if "escape sequence" in str(w.message)]
+    failures += len(escapes)
+    if escapes:
+        print(f"  [FAIL] the source compiles with {len(escapes)} escape warning(s)")
+        for w in escapes:
+            print(f"         line {w.lineno}: {w.message}")
+    else:
+        print("  [ok  ] the source compiles with no escape-sequence warning")
 
     missed = [c for c in CONTRACTIONS_EXPECTED if not CONTRACTION_RE.search(f"The row {c} ready.")]
     wrong = [c for c in CONTRACTIONS_EXCLUDED if CONTRACTION_RE.search(f"The row {c} ready.")]
