@@ -61,9 +61,11 @@ DIV_OPEN = re.compile(r"\bdiv\b[^{]*\{")
 # attribute begins -- so anchoring at `^div` and consuming only that run
 # means a `.flash`-shaped substring sitting inside some *other* attribute's
 # quoted value (e.g. `div title=".flash"`) is never reached at all, with no
-# need to reason about quoting.
-CHAINED_PREFIX = re.compile(r'^div((?:\.[\w-]+|\."[^"]*")*)')
-CHAINED_SEGMENT = re.compile(r'\.([\w-]+)|\."([^"]*)"')
+# need to reason about quoting. Maud reads a token stream, so whitespace
+# around the `.` (`div .flash`, `div. flash`) is as insignificant there as
+# it is around `=` elsewhere -- `\s*` tolerates it on both sides.
+CHAINED_PREFIX = re.compile(r'^div((?:\s*\.\s*(?:[\w-]+|"[^"]*"))*)')
+CHAINED_SEGMENT = re.compile(r'\.\s*([\w-]+)|\.\s*"([^"]*)"')
 # `(?<![\w-])` requires a real attribute boundary before "class", so
 # `data-class="flash"` (an unrelated attribute) doesn't match. Maud reads a
 # Rust token stream, not raw text, so whitespace around `=` (`class =
