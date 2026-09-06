@@ -43,7 +43,7 @@ yesterday's report and one didn't:
   later PR runs all restored against — and still couldn't be restored 9-14
   hours on (§4).
 
-**Correction record for this PR (`#1395`):** eighteen separate Codex review
+**Correction record for this PR (`#1395`):** nineteen separate Codex review
 comments caught real problems in earlier drafts of this report:
 
 1–2. Two methodology errors in §4's cache-eviction comparison (a same-run
@@ -104,6 +104,11 @@ total cache bytes, based only on entry *count* — `9ce7ce8` also moved
 compiled output out of `test`'s own entries into the new ones, so those
 may have shrunk by about what the new ones grew, leaving the net byte
 effect genuinely unmeasured.
+18. One claim that a single query against the paginated cache-*listing*
+endpoint (`GET .../actions/caches`) would give total current bytes — that
+endpoint returns per-entry sizes across pages, so a total needs summing
+every page. Pointed at the dedicated `GET .../actions/cache/usage` endpoint
+instead, which returns the aggregate directly in one call.
 
 All are fixed below, in place, with the retractions left visible rather
 than edited away.
@@ -361,13 +366,20 @@ already corrected to avoid — restated here to match: the save raised no
 error, and three later restores against its exact key found nothing; that a
 cache entry existed and was subsequently lost is the reading consistent
 with this, not a settled fact). What's left still needs the same thing the
-09-05 report couldn't get: **actual cache-usage bytes**, which a single
-`GET /repos/{owner}/{repo}/actions/caches` query can provide — and, per
-GitHub's own docs, needs only read-level `Actions` permission, not admin
-access (a Codex review comment on this PR caught an earlier draft
-overstating this as "admin-scoped auth," which both misdescribes GitHub's
-actual permission model and is exactly the "diagnose a tooling gap as an
-auth/token problem" mistake `AGENTS.md:5-8` says not to make in this repo).
+09-05 report couldn't get: **actual cache-usage bytes**, which GitHub's
+dedicated `GET /repos/{owner}/{repo}/actions/cache/usage` endpoint returns
+directly as `active_caches_size_in_bytes` — a single call, no pagination
+(a Codex review comment on this PR caught an earlier draft pointing at the
+*listing* endpoint, `GET /repos/{owner}/{repo}/actions/caches`, instead;
+that one paginates and returns per-entry `size_in_bytes`, so getting a
+total from it means summing every page, not one query — plausible under
+this report's own estimate of many entries across many branches. The usage
+endpoint avoids that entirely). Either endpoint needs, per GitHub's own
+docs, only read-level `Actions` permission, not admin access (a Codex
+review comment on this PR caught an earlier draft overstating this as
+"admin-scoped auth," which both misdescribes GitHub's actual permission
+model and is exactly the "diagnose a tooling gap as an auth/token problem"
+mistake `AGENTS.md:5-8` says not to make in this repo).
 **Eviction frequency is a different measurement, and a Codex review comment
 on this PR correctly caught this section still conflating the two after §4
 established the distinction**: the endpoint exposes only currently-live
@@ -381,8 +393,10 @@ session have no cache-usage or cache-listing method at all — a tool-surface
 gap, not a permissions one. Candidate remedies for whoever has a tool that
 exposes this endpoint, updated:
 
-1. **Confirm total current bytes first** (a single query suffices for
-   this); separately, **start the prospective polling** described above if
+1. **Confirm total current bytes first** (the dedicated usage endpoint
+   returns this in one call; the listing endpoint would need summing every
+   paginated entry instead); separately, **start the prospective polling**
+   described above if
    eviction frequency is also wanted (unchanged ask, split into its two
    actual measurements).
 2. If confirmed capacity-bound, two earlier drafts of this remedy each
@@ -480,10 +494,13 @@ grep -n "Restore Key:\|Cache Key:\|Restoring cache\|No cache found\|Saving cache
 
 Cache-usage confirmation: still not run in this session — the GitHub MCP
 tools available here have no cache-usage or cache-listing method (a tool-
-surface gap, not a permissions one: `GET /repos/{owner}/{repo}/actions/caches`
-needs only read-level `Actions` permission per GitHub's docs, not admin
-access, per a Codex review comment on this PR correcting an earlier draft's
-"admin-scoped auth" claim). Anyone with a tool exposing it, or Settings →
-Actions → Caches in the UI, or `gh api
-repos/autumn-foundation/autumn-harvest/actions/caches --paginate` with a
-token carrying that scope, can confirm.
+surface gap, not a permissions one: both `GET /repos/{owner}/{repo}/actions/
+cache/usage` and `.../actions/caches` need only read-level `Actions`
+permission per GitHub's docs, not admin access, per a Codex review comment
+on this PR correcting an earlier draft's "admin-scoped auth" claim). Anyone
+with a tool exposing it, or Settings → Actions → Caches in the UI, or
+`gh api repos/autumn-foundation/autumn-harvest/actions/cache/usage` for the
+total (a single call, per a Codex review comment on this PR correcting an
+earlier draft that pointed at the paginated listing endpoint instead), or
+`gh api repos/autumn-foundation/autumn-harvest/actions/caches --paginate`
+for the per-entry breakdown, with a token carrying that scope, can confirm.
