@@ -48,17 +48,29 @@ from pathlib import Path
 
 UI_RS = Path(__file__).resolve().parents[2] / "autumn-harvest-plugin" / "src" / "ui.rs"
 
-# `div.flash { ... }`, `div."flash" { ... }` (the quoted-class shorthand,
-# used elsewhere in this file for classes like `."error-banner"`), or
-# `div class="flash" { ... }` — all three are maud spellings that render
-# the same markup. `(?![\w-])` after the unquoted `.flash` form requires a
-# class-token boundary, so `div.flashback` (an unrelated class that merely
-# starts with "flash") doesn't match while chained classes like
-# `div.flash.extra` still do (the next character is `.`, not a word
-# character or hyphen). Capture whatever attributes sit between the class
-# and the opening `{` of the block so we can check them for a live-region
-# role without also matching unrelated `div`s.
-FLASH_DIV = re.compile(r'div(?:\.flash(?![\w-])|\."flash"|\s+class="flash")([^{]*)\{')
+# Every `div`'s full opening tag, from `div` to the block's `{`. Maud lets
+# "flash" appear as any chained shorthand class (`div.notice.flash`, not
+# just the first) or as one token in a space-separated `class="..."` value
+# (`class="flash notice"`), so matching only `div.flash` or an exact
+# `class="flash"` missed those. Scanning the whole tag and checking for
+# "flash" as a token, in either form, at any position, catches all of them.
+DIV_OPEN = re.compile(r"\bdiv\b[^{]*\{")
+
+# A whole class token, not a prefix of a longer name: `.flash` matches in
+# `div.flash` and `div.notice.flash`, but `(?![\w-])` stops it from also
+# matching the unrelated `div.flashback`. Chained classes still match
+# because the character after "flash" there is `.`, not a word character
+# or hyphen.
+CHAINED_FLASH_CLASS = re.compile(r'\.flash(?![\w-])|\."flash"')
+CLASS_ATTR = re.compile(r'class="([^"]*)"')
+
+
+def is_flash_div(tag_text: str) -> bool:
+    if CHAINED_FLASH_CLASS.search(tag_text):
+        return True
+    m = CLASS_ATTR.search(tag_text)
+    return bool(m) and "flash" in m.group(1).split()
+
 
 # `(?<![\w-])` requires the match not be preceded by a word character or a
 # hyphen, so `role="status"` matches as a real attribute but the same text
@@ -78,10 +90,12 @@ def main():
     src = UI_RS.read_text()
 
     sites = []
-    for m in FLASH_DIV.finditer(src):
-        attrs = m.group(1)
-        has_role = bool(ROLE.search(attrs))
-        has_focus = bool(FOCUS_ON_LOAD.search(attrs)) and bool(AUTOFOCUS.search(attrs))
+    for m in DIV_OPEN.finditer(src):
+        tag_text = m.group(0)
+        if not is_flash_div(tag_text):
+            continue
+        has_role = bool(ROLE.search(tag_text))
+        has_focus = bool(FOCUS_ON_LOAD.search(tag_text)) and bool(AUTOFOCUS.search(tag_text))
         sites.append((line_of(src, m.start()), has_role, has_focus))
 
     sites.sort()
@@ -90,10 +104,11 @@ def main():
     print(f"{len(sites)} `div.flash` render sites checked.\n")
 
     if not sites:
-        print("ERROR: found no `div.flash` render sites at all — FLASH_DIV no")
-        print("longer matches anything in ui.rs. Either the flash markup was")
-        print("rewritten in a spelling this audit doesn't recognize (a silent")
-        print("pass would hide that), or flash messages were removed outright.")
+        print("ERROR: found no `div.flash` render sites at all — no `div` in")
+        print("ui.rs carries a \"flash\" class this audit recognizes. Either the")
+        print("flash markup was rewritten in a spelling this audit doesn't")
+        print("recognize (a silent pass would hide that), or flash messages")
+        print("were removed outright.")
         return 1
 
     missing = [(line, role, focus) for line, role, focus in sites if not (role and focus)]
