@@ -340,21 +340,24 @@ jobs:
       # The predictable response is to regenerate the baseline, which defeats
       # the ratchet entirely. Tier A is never scoped -- it gates everywhere.
       # Issue #694, AC2: the published OpenAPI document must validate under a
-      # standard validator with zero errors. `openapi-spec-validator` is a pure
-      # Python package and reads the checked-in artifact, so this step never
-      # builds the crates and stays in the ungated `lint` job.
+      # standard validator with zero errors. Both checked-in copies are
+      # validated: the crate copy is what the endpoint serves, the docs copy is
+      # what an integrator reads. `openapi-spec-validator` is a pure Python
+      # package and reads the files, so this step never builds the crates and
+      # stays in the ungated `lint` job.
       #
       # Ungated is the point: `docs/openapi.json` matches the docs-only filter,
       # and a hand-edit of it is exactly the change class that would otherwise
       # reach trunk with nothing checking it. The no-drift half of the gate is
-      # `openapi_spec::checked_in_artifact_matches_the_generated_document`,
-      # which regenerates from `docs/api-contract.json` and compares; the
-      # `changes` job carves both files out of the docs-only skip so that test
-      # runs on a contract-only PR.
-      - name: Validate docs/openapi.json (issue #694)
+      # `openapi_spec::checked_in_artifacts_match_the_generated_document`,
+      # which regenerates from `docs/api-contract.json` and compares both
+      # copies; the `changes` job carves the contract and the docs copy out of
+      # the docs-only skip so that test runs on a contract-only PR.
+      - name: Validate the OpenAPI document (issue #694)
         run: |
           python3 -m pip install --quiet --disable-pip-version-check openapi-spec-validator
           python3 -m openapi_spec_validator docs/openapi.json
+          python3 -m openapi_spec_validator autumn-harvest-plugin/openapi.json
 
       - name: Comment hygiene (docs/audits/comment-hygiene.py)
         run: |

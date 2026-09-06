@@ -4,21 +4,28 @@ Harvest publishes an [OpenAPI 3.1](https://spec.openapis.org/oas/v3.1.0)
 document for the whole management API, so any language with an OpenAPI
 generator gets a typed client with no hand-written HTTP (issue #694).
 
-Two copies, one source:
+One source, three places it appears:
 
 | Where | What |
 | --- | --- |
 | `GET {api_path}/openapi.json` | Served by `harvest_api_router`. Read-only, never admin-gated. |
-| [`docs/openapi.json`](openapi.json) | The same document, checked in, for offline codegen and diff review. |
+| `autumn-harvest-plugin/openapi.json` | Compact. Compiled into the crate and served verbatim, so the endpoint runs no transform and can never fail. |
+| [`docs/openapi.json`](openapi.json) | The same document, pretty-printed, for offline codegen and review diffs. |
 
-Both are generated from [`docs/api-contract.json`](api-contract.json), the
-contract the router itself is pinned against. A route cannot reach the router
-without reaching the document. See [Guarantees](#guarantees).
+All three come from [`docs/api-contract.json`](api-contract.json), the contract
+the router itself is pinned against. A route cannot reach the router without
+reaching the document. See [Guarantees](#guarantees).
+
+The crate carries its own copy because a published crate can package no file
+from outside its own directory. `scripts/regenerate-openapi.sh` writes both
+copies from one transform, and a test fails when either drifts.
 
 ## Generate a typed client in under ten minutes
 
-The worked example lives in [`examples/typescript-client`](../examples/typescript-client).
-With a plugin running at `http://localhost:3000/api/harvest`:
+The worked example lives in
+[`examples/typescript-client`](../examples/typescript-client/README.md), which
+also says how to get a plugin running. With one serving
+`http://localhost:3000/api/harvest`:
 
 ```sh
 cd examples/typescript-client
@@ -55,15 +62,23 @@ openapi-generator generate -i docs/openapi.json -g go -o ./harvest-client
 - **A request-body schema** for every route that takes a body. A route that
   takes none declares none, so a generated client does not send an empty
   object.
-- **`x-harvest-read-only`** on every operation. It mirrors
-  `autumn_harvest::audit::CLASSIFIED_ROUTES`, so tooling can separate reads
-  from control-plane writes. The route category is also the operation tag.
+- **`x-harvest-read-only`** and **`x-harvest-route-class`** on every
+  operation. Both mirror `autumn_harvest::audit::CLASSIFIED_ROUTES`, so tooling
+  can separate reads from control-plane writes, and can see which routes are
+  safe without any credential. The route category is also the operation tag.
 - **`x-harvest-idempotency`**, where the contract records an idempotency rule.
+- **`x-harvest-stream`** on the two `text/event-stream` routes. A blocking
+  client that buffers a whole response would hang on those.
+- **Response headers** where the contract records them: `X-Harvest-Execution-Id`
+  on the by-id family, `Retry-After` on the `204` a still-running `/result`
+  returns.
 - **Security schemes** for the two credentials the management API accepts:
   `HarvestBearerToken` (scoped API tokens, issue #942) and
   `HarvestSessionCookie` (the embedding application session). The top-level
   `security` list also carries an empty requirement, because enforcement is
-  the embedder's choice (issue #174). See
+  the embedder's choice (issue #174). The two `public_safe` routes
+  (`GET /health`, `GET /openapi.json`) override it with `security: []`, which
+  says positively that they need no credential. See
   [`security-posture.md`](security-posture.md).
 
 ### Limits worth knowing
@@ -76,11 +91,22 @@ openapi-generator generate -i docs/openapi.json -g go -o ./harvest-client
   frame grammar is in the response description.
 - **Conditional shapes** (the partial-availability envelopes of issue #756)
   are described in prose on the response, not as a `oneOf`.
+- **Error responses carry no schema.** The contract records a description per
+  error status, not a body shape.
+- **Most query parameters are typed `string`**, because the contract records a
+  type for only a few. A generated client sends the value as text, which is
+  what the handler parses.
+- **Inline schemas, no `$ref`.** Nothing is shared between operations, so
+  `openapi-generator` names response models positionally.
+- `GET /workflows/by-id/{workflow_name}/{workflow_id}/children` declares
+  `workflow_name` twice: once as the parent path parameter, once as a query
+  filter on the child type. It is legal OpenAPI, but a generator that flattens
+  parameters into one argument list may emit two arguments with one name.
 
-## Regenerate the artifact
+## Regenerate the artifacts
 
 ```sh
-cargo run -p autumn-harvest-plugin --example emit_openapi > docs/openapi.json
+scripts/regenerate-openapi.sh
 ```
 
 Run it whenever `docs/api-contract.json` changes. CI fails otherwise.
@@ -93,8 +119,10 @@ Four checks hold the chain together:
    router and the contract disagree.
 2. `openapi_spec::document_covers_every_management_route_exactly` fails when
    the document misses a mounted route, or invents one.
-3. `openapi_spec::checked_in_artifact_matches_the_generated_document` fails
-   when `docs/openapi.json` is stale.
+3. `openapi_spec::checked_in_artifacts_match_the_generated_document` fails
+   when either checked-in copy is stale, and
+   `openapi_spec::served_endpoint_returns_the_document` fails when the endpoint
+   serves anything else.
 4. The `lint` job validates `docs/openapi.json` with
    `openapi-spec-validator`, and it runs on documentation-only pull requests
    too.
@@ -104,7 +132,7 @@ Four checks hold the chain together:
 `autumn-web` builds an OpenAPI document from routes declared with its route
 macros, which attach `ApiDoc` metadata to each handler.
 `harvest_api_router` is a plain `axum::Router`, so its routes carry no such
-metadata. Annotating 168 handlers would also record less than the contract
+metadata. Annotating the handlers would also record less than the contract
 already holds: per-parameter `required` flags, per-route read-only class,
 idempotency rules, and error responses. The contract is therefore the input,
 and `autumn-harvest-plugin/src/openapi.rs` is the transform.

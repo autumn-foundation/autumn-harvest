@@ -15,7 +15,7 @@
     }
   },
   "info": {
-    "description": "Generated from `docs/api-contract.json` (contract version 2). Do not edit by hand. Regenerate with `cargo run -p autumn-harvest-plugin --example emit_openapi > docs/openapi.json`.\n\nEvery path is relative to the prefix the embedder passes to `HarvestPlugin::api`, `/api/harvest` by convention.\n\nAuth: Route authorization posture is classified in issue #174. This contract records the route surface and category; auth enforcement is separate.",
+    "description": "Generated from `docs/api-contract.json` (contract version 2). Do not edit by hand. Regenerate with `scripts/regenerate-openapi.sh`.\n\nEvery path is relative to the prefix the embedder passes to `HarvestPlugin::api`, `/api/harvest` by convention.\n\nAuth: Route authorization posture is classified in issue #174. This contract records the route surface and category; auth enforcement is separate.",
     "summary": "Control-plane HTTP API for autumn-harvest durable workflows.",
     "title": "Harvest management API",
     "version": "0.6.0",
@@ -58,7 +58,8 @@
           "admin"
         ],
         "x-harvest-idempotency": "Read-only; always idempotent.",
-        "x-harvest-read-only": true
+        "x-harvest-read-only": true,
+        "x-harvest-route-class": "read_only"
       }
     },
     "/activities/external/{token}/complete": {
@@ -120,7 +121,8 @@
           "external_activity"
         ],
         "x-harvest-idempotency": "Not idempotent: completing an already-resolved token returns 404.",
-        "x-harvest-read-only": false
+        "x-harvest-read-only": false,
+        "x-harvest-route-class": "mutating"
       }
     },
     "/activities/external/{token}/fail": {
@@ -188,7 +190,8 @@
           "external_activity"
         ],
         "x-harvest-idempotency": "Not idempotent: failing an already-resolved token returns 404.",
-        "x-harvest-read-only": false
+        "x-harvest-read-only": false,
+        "x-harvest-route-class": "mutating"
       }
     },
     "/activities/external/{token}/heartbeat": {
@@ -250,7 +253,8 @@
           "external_activity"
         ],
         "x-harvest-idempotency": "Idempotent: repeated heartbeats extend or maintain the deadline.",
-        "x-harvest-read-only": false
+        "x-harvest-read-only": false,
+        "x-harvest-route-class": "mutating"
       }
     },
     "/activities/{activity_name}": {
@@ -302,7 +306,8 @@
           "admin"
         ],
         "x-harvest-idempotency": "Read-only; always idempotent.",
-        "x-harvest-read-only": true
+        "x-harvest-read-only": true,
+        "x-harvest-route-class": "read_only"
       }
     },
     "/activities/{activity_name}/pause": {
@@ -381,7 +386,8 @@
           "admin"
         ],
         "x-harvest-idempotency": "Re-pausing an already-paused activity returns 200 with `newly_paused: false` and preserves the original reason, operator, `paused_at` AND `scope_shard_id`. The response always describes the hold that is actually in effect, never the request.",
-        "x-harvest-read-only": false
+        "x-harvest-read-only": false,
+        "x-harvest-route-class": "mutating"
       }
     },
     "/activities/{activity_name}/resume": {
@@ -441,7 +447,8 @@
           "admin"
         ],
         "x-harvest-idempotency": "Resuming an activity that is not paused returns 200 with `newly_resumed: false`.",
-        "x-harvest-read-only": false
+        "x-harvest-read-only": false,
+        "x-harvest-route-class": "mutating"
       }
     },
     "/admin/audit": {
@@ -541,7 +548,8 @@
         "tags": [
           "audit"
         ],
-        "x-harvest-read-only": true
+        "x-harvest-read-only": true,
+        "x-harvest-route-class": "read_only"
       }
     },
     "/admin/audit-export": {
@@ -574,7 +582,8 @@
           "admin"
         ],
         "x-harvest-idempotency": "Read-only; always idempotent.",
-        "x-harvest-read-only": true
+        "x-harvest-read-only": true,
+        "x-harvest-route-class": "read_only"
       }
     },
     "/admin/audit-export/redrive": {
@@ -637,7 +646,8 @@
           "admin"
         ],
         "x-harvest-idempotency": "Idempotent in effect: the cursor ends up at the requested position. A repeat of the same request is refused with 400 rather than applied a second time, because a request that would not move the cursor BACKWARDS (at or above the current position) is never applied. Each accepted call writes its own audit record.",
-        "x-harvest-read-only": false
+        "x-harvest-read-only": false,
+        "x-harvest-route-class": "mutating"
       }
     },
     "/admin/build-routing": {
@@ -669,7 +679,8 @@
         "tags": [
           "build_routing"
         ],
-        "x-harvest-read-only": true
+        "x-harvest-read-only": true,
+        "x-harvest-route-class": "read_only"
       }
     },
     "/admin/build-routing/compat": {
@@ -700,7 +711,8 @@
         "tags": [
           "build_routing"
         ],
-        "x-harvest-read-only": true
+        "x-harvest-read-only": true,
+        "x-harvest-route-class": "read_only"
       },
       "post": {
         "description": "Declare that workers running build_id can safely replay histories assigned to compatible_with.",
@@ -756,7 +768,8 @@
           "build_routing"
         ],
         "x-harvest-idempotency": "Idempotent by (build_id, compatible_with): re-declaring the same pair is a no-op.",
-        "x-harvest-read-only": false
+        "x-harvest-read-only": false,
+        "x-harvest-route-class": "mutating"
       }
     },
     "/admin/build-routing/compat/{build_id}/{compat_with}": {
@@ -809,7 +822,8 @@
           "build_routing"
         ],
         "x-harvest-idempotency": "Idempotent: revoking a non-existent pair returns revoked=false without error.",
-        "x-harvest-read-only": false
+        "x-harvest-read-only": false,
+        "x-harvest-route-class": "mutating"
       }
     },
     "/admin/build-routing/policies": {
@@ -874,7 +888,8 @@
           "build_routing"
         ],
         "x-harvest-idempotency": "Idempotent by queue_name: re-posting the same queue_name updates the policy in place.",
-        "x-harvest-read-only": false
+        "x-harvest-read-only": false,
+        "x-harvest-route-class": "mutating"
       }
     },
     "/admin/build-routing/ramp": {
@@ -946,7 +961,8 @@
           "build_routing"
         ],
         "x-harvest-idempotency": "Idempotent by queue_name: re-posting the same queue_name updates the ramp in place.",
-        "x-harvest-read-only": false
+        "x-harvest-read-only": false,
+        "x-harvest-route-class": "mutating"
       }
     },
     "/admin/build-routing/ramp/{queue_name}": {
@@ -1000,7 +1016,8 @@
           "build_routing"
         ],
         "x-harvest-idempotency": "Idempotent: clearing an already-unramped policy is a no-op that still returns 200.",
-        "x-harvest-read-only": false
+        "x-harvest-read-only": false,
+        "x-harvest-route-class": "mutating"
       }
     },
     "/admin/build-routing/retire": {
@@ -1057,7 +1074,8 @@
           "build_routing"
         ],
         "x-harvest-idempotency": "Idempotent: repeated calls reflect current reachability state and do not mutate data.",
-        "x-harvest-read-only": true
+        "x-harvest-read-only": true,
+        "x-harvest-route-class": "read_only"
       }
     },
     "/admin/canary": {
@@ -1087,7 +1105,8 @@
         "tags": [
           "admin"
         ],
-        "x-harvest-read-only": true
+        "x-harvest-read-only": true,
+        "x-harvest-route-class": "read_only"
       }
     },
     "/admin/circuits": {
@@ -1113,7 +1132,8 @@
         "tags": [
           "admin"
         ],
-        "x-harvest-read-only": true
+        "x-harvest-read-only": true,
+        "x-harvest-route-class": "read_only"
       }
     },
     "/admin/circuits/{activity_name}": {
@@ -1161,7 +1181,8 @@
         "tags": [
           "admin"
         ],
-        "x-harvest-read-only": true
+        "x-harvest-read-only": true,
+        "x-harvest-route-class": "read_only"
       }
     },
     "/admin/circuits/{activity_name}/force-close": {
@@ -1220,7 +1241,8 @@
           "admin"
         ],
         "x-harvest-idempotency": "Idempotent; repeated calls leave the breaker closed with normal tracking resumed.",
-        "x-harvest-read-only": false
+        "x-harvest-read-only": false,
+        "x-harvest-route-class": "mutating"
       }
     },
     "/admin/circuits/{activity_name}/force-open": {
@@ -1279,7 +1301,8 @@
           "admin"
         ],
         "x-harvest-idempotency": "Idempotent; repeated calls leave the breaker pinned open with the same observable state.",
-        "x-harvest-read-only": false
+        "x-harvest-read-only": false,
+        "x-harvest-route-class": "mutating"
       }
     },
     "/admin/codec/rotation": {
@@ -1314,7 +1337,8 @@
           "admin"
         ],
         "x-harvest-idempotency": "Read-only; always idempotent. It runs the per-key census and reads the cursor -- it never rewrites a row and never advances the sweep.",
-        "x-harvest-read-only": true
+        "x-harvest-read-only": true,
+        "x-harvest-route-class": "read_only"
       }
     },
     "/admin/completion-triggers": {
@@ -1340,7 +1364,8 @@
         "tags": [
           "completion-trigger"
         ],
-        "x-harvest-read-only": true
+        "x-harvest-read-only": true,
+        "x-harvest-route-class": "read_only"
       },
       "post": {
         "description": "Register or create a completion trigger.",
@@ -1416,7 +1441,8 @@
           "completion-trigger"
         ],
         "x-harvest-idempotency": "Idempotent on completion trigger ID (upserts the completion trigger).",
-        "x-harvest-read-only": false
+        "x-harvest-read-only": false,
+        "x-harvest-route-class": "mutating"
       }
     },
     "/admin/concurrency": {
@@ -1442,7 +1468,8 @@
         "tags": [
           "admin"
         ],
-        "x-harvest-read-only": true
+        "x-harvest-read-only": true,
+        "x-harvest-route-class": "read_only"
       }
     },
     "/admin/config": {
@@ -1475,7 +1502,8 @@
         "tags": [
           "admin"
         ],
-        "x-harvest-read-only": true
+        "x-harvest-read-only": true,
+        "x-harvest-route-class": "read_only"
       }
     },
     "/admin/debounce": {
@@ -1501,7 +1529,8 @@
         "tags": [
           "admin"
         ],
-        "x-harvest-read-only": true
+        "x-harvest-read-only": true,
+        "x-harvest-route-class": "read_only"
       }
     },
     "/admin/external-handoffs": {
@@ -1618,7 +1647,8 @@
         "tags": [
           "external_activity"
         ],
-        "x-harvest-read-only": true
+        "x-harvest-read-only": true,
+        "x-harvest-route-class": "read_only"
       }
     },
     "/admin/external-handoffs/{token}": {
@@ -1663,23 +1693,14 @@
         "tags": [
           "external_activity"
         ],
-        "x-harvest-read-only": true
+        "x-harvest-read-only": true,
+        "x-harvest-route-class": "read_only"
       }
     },
     "/admin/gates": {
       "get": {
         "description": "List all active (non-lifted) admission gates. The response also carries a `producers` block enumerating every in-process workflow-start producer and whether it is `gated`, `gated_at_admission` (deferred-fire producers gated at HTTP admission whose scanner fire is exempt-with-bypass-counter), `gated_at_relay` (gated authoritatively at relay/fire time on the target/real queue: the cross-shard completion-trigger relay blocks + drops a matching gate, and — since issue #1053 — the throttle scanner blocks + re-defers a matching gate; else both count the bypass), or `exempt_by_design` (with a rationale), so the admission-gate contract is discoverable without reading source (issue #618).",
         "operationId": "get_admin_gates",
-        "requestBody": {
-          "content": {
-            "application/json": {
-              "schema": {
-                "description": "Opaque JSON body. See the operation description for its shape."
-              }
-            }
-          },
-          "required": false
-        },
         "responses": {
           "200": {
             "content": {
@@ -1700,7 +1721,8 @@
           "admission_gates"
         ],
         "x-harvest-idempotency": "Read-only; always idempotent.",
-        "x-harvest-read-only": true
+        "x-harvest-read-only": true,
+        "x-harvest-route-class": "read_only"
       },
       "post": {
         "description": "Create an admission gate to halt new workflow starts for the specified scope.",
@@ -1773,7 +1795,8 @@
           "admission_gates"
         ],
         "x-harvest-idempotency": "Not idempotent: each call creates a new gate row with a fresh UUID.",
-        "x-harvest-read-only": false
+        "x-harvest-read-only": false,
+        "x-harvest-route-class": "mutating"
       }
     },
     "/admin/gates/{id}": {
@@ -1817,7 +1840,8 @@
           "admission_gates"
         ],
         "x-harvest-idempotency": "Idempotent: lifting a gate that does not exist or is already lifted returns lifted=false without error.",
-        "x-harvest-read-only": false
+        "x-harvest-read-only": false,
+        "x-harvest-route-class": "mutating"
       }
     },
     "/admin/history/export-sample": {
@@ -1933,7 +1957,8 @@
         "tags": [
           "admin"
         ],
-        "x-harvest-read-only": true
+        "x-harvest-read-only": true,
+        "x-harvest-route-class": "read_only"
       }
     },
     "/admin/history/exports": {
@@ -2036,7 +2061,8 @@
         "tags": [
           "admin"
         ],
-        "x-harvest-read-only": true
+        "x-harvest-read-only": true,
+        "x-harvest-route-class": "read_only"
       }
     },
     "/admin/metrics": {
@@ -2062,7 +2088,8 @@
         "tags": [
           "admin"
         ],
-        "x-harvest-read-only": true
+        "x-harvest-read-only": true,
+        "x-harvest-route-class": "read_only"
       }
     },
     "/admin/preflight": {
@@ -2094,7 +2121,8 @@
         "tags": [
           "admin"
         ],
-        "x-harvest-read-only": true
+        "x-harvest-read-only": true,
+        "x-harvest-route-class": "read_only"
       }
     },
     "/admin/queue-coverage": {
@@ -2141,7 +2169,8 @@
         "tags": [
           "admin"
         ],
-        "x-harvest-read-only": true
+        "x-harvest-read-only": true,
+        "x-harvest-route-class": "read_only"
       }
     },
     "/admin/queues/paused": {
@@ -2173,7 +2202,8 @@
           "admin"
         ],
         "x-harvest-idempotency": "Read-only; always idempotent.",
-        "x-harvest-read-only": true
+        "x-harvest-read-only": true,
+        "x-harvest-route-class": "read_only"
       }
     },
     "/admin/queues/scaling": {
@@ -2210,7 +2240,8 @@
         "tags": [
           "admin"
         ],
-        "x-harvest-read-only": true
+        "x-harvest-read-only": true,
+        "x-harvest-route-class": "read_only"
       }
     },
     "/admin/queues/{queue_name}/eligibility": {
@@ -2262,7 +2293,8 @@
           "queue"
         ],
         "x-harvest-idempotency": "Read-only; always idempotent.",
-        "x-harvest-read-only": true
+        "x-harvest-read-only": true,
+        "x-harvest-route-class": "read_only"
       }
     },
     "/admin/queues/{queue_name}/pause": {
@@ -2344,7 +2376,8 @@
           "admin"
         ],
         "x-harvest-idempotency": "Re-pausing an already-paused queue returns 200 with `newly_paused: false` and preserves the original reason, operator, `paused_at` AND `scope_shard_id`. The response always describes the hold that is actually in effect, not the request: re-pausing a shard-scoped hold with a fleet-wide request reports the preserved `scope_shard_id`, never `null`.",
-        "x-harvest-read-only": false
+        "x-harvest-read-only": false,
+        "x-harvest-route-class": "mutating"
       }
     },
     "/admin/queues/{queue_name}/resume": {
@@ -2419,7 +2452,8 @@
           "admin"
         ],
         "x-harvest-idempotency": "Resuming a queue that is not paused returns 200 with `newly_resumed: false`.",
-        "x-harvest-read-only": false
+        "x-harvest-read-only": false,
+        "x-harvest-route-class": "mutating"
       }
     },
     "/admin/quotas": {
@@ -2451,7 +2485,8 @@
           "admin"
         ],
         "x-harvest-idempotency": "Read-only; always idempotent.",
-        "x-harvest-read-only": true
+        "x-harvest-read-only": true,
+        "x-harvest-route-class": "read_only"
       }
     },
     "/admin/rate-limits": {
@@ -2477,7 +2512,8 @@
         "tags": [
           "admin"
         ],
-        "x-harvest-read-only": true
+        "x-harvest-read-only": true,
+        "x-harvest-route-class": "read_only"
       }
     },
     "/admin/rate-limits/{activity_name}/override": {
@@ -2535,7 +2571,8 @@
           "admin"
         ],
         "x-harvest-idempotency": "Idempotent: clearing an activity with no active override still returns 200 reporting the declared baseline (override_active: false).",
-        "x-harvest-read-only": false
+        "x-harvest-read-only": false,
+        "x-harvest-route-class": "mutating"
       },
       "post": {
         "description": "Set (or replace) a TTL'd runtime pacing override on top of a declared per-activity rate limit (issue #945). Takes effect on the existing token-consumption path immediately, with no worker restart; self-expires and reverts to the declared baseline at expires_at with no further operator action. The write is fanned out to the bucket row on EVERY readable shard (rate-limit buckets are shard-local); a write reaching only SOME shards is reported as 207, not 200 -- see the success-response notes.",
@@ -2618,7 +2655,8 @@
           "admin"
         ],
         "x-harvest-idempotency": "Idempotent: each call fully replaces the whole override (a field omitted from a later call reverts that field to the declared baseline rather than being merged forward with an earlier call).",
-        "x-harvest-read-only": false
+        "x-harvest-read-only": false,
+        "x-harvest-route-class": "mutating"
       }
     },
     "/admin/rate-limits/{key}": {
@@ -2684,7 +2722,8 @@
           "admin"
         ],
         "x-harvest-idempotency": "Idempotent; multiple identical calls yield the same rate limit value and overwrite tokens to at most the new burst value.",
-        "x-harvest-read-only": false
+        "x-harvest-read-only": false,
+        "x-harvest-route-class": "mutating"
       }
     },
     "/admin/retention": {
@@ -2707,7 +2746,8 @@
         "tags": [
           "admin"
         ],
-        "x-harvest-read-only": true
+        "x-harvest-read-only": true,
+        "x-harvest-route-class": "read_only"
       }
     },
     "/admin/retention/run-now": {
@@ -2737,7 +2777,8 @@
           "admin"
         ],
         "x-harvest-idempotency": "Idempotent: triggering an already-running retention janitor is a no-op.",
-        "x-harvest-read-only": false
+        "x-harvest-read-only": false,
+        "x-harvest-route-class": "mutating"
       }
     },
     "/admin/schedules": {
@@ -2763,7 +2804,8 @@
         "tags": [
           "schedule"
         ],
-        "x-harvest-read-only": true
+        "x-harvest-read-only": true,
+        "x-harvest-route-class": "read_only"
       }
     },
     "/admin/schedules/decisions": {
@@ -2830,7 +2872,8 @@
         "tags": [
           "schedule"
         ],
-        "x-harvest-read-only": true
+        "x-harvest-read-only": true,
+        "x-harvest-route-class": "read_only"
       }
     },
     "/admin/schedules/preview": {
@@ -2891,11 +2934,14 @@
                     "type": "string"
                   }
                 },
+                "required": [
+                  "schedule_expr"
+                ],
                 "type": "object"
               }
             }
           },
-          "required": false
+          "required": true
         },
         "responses": {
           "200": {
@@ -2942,7 +2988,8 @@
           "schedule"
         ],
         "x-harvest-idempotency": "Fully idempotent read-only operation; no state is written.",
-        "x-harvest-read-only": true
+        "x-harvest-read-only": true,
+        "x-harvest-route-class": "read_only"
       }
     },
     "/admin/schedules/workflow": {
@@ -3045,7 +3092,8 @@
           "schedule"
         ],
         "x-harvest-idempotency": "Upsert keyed by workflow_name: if a schedule already exists for that name the expression, input, and queue are updated; is_paused is preserved. Safe to retry.",
-        "x-harvest-read-only": false
+        "x-harvest-read-only": false,
+        "x-harvest-route-class": "mutating"
       }
     },
     "/admin/schedules/{id}": {
@@ -3089,7 +3137,8 @@
           "schedule"
         ],
         "x-harvest-idempotency": "Not idempotent: a second call after successful deletion returns 404.",
-        "x-harvest-read-only": false
+        "x-harvest-read-only": false,
+        "x-harvest-route-class": "mutating"
       },
       "get": {
         "description": "Get a single schedule by UUID. Returns the same ScheduleEntry shape as the list endpoint, including pause metadata (paused_at, paused_by, pause_reason).",
@@ -3151,7 +3200,8 @@
         "tags": [
           "schedule"
         ],
-        "x-harvest-read-only": true
+        "x-harvest-read-only": true,
+        "x-harvest-route-class": "read_only"
       },
       "patch": {
         "description": "Partially update an existing workflow schedule in place (issue #771). Only provided fields change; the schedule_id is never changed, so #488 carryover lineage, the sched:{schedule_id}: workflow-id namespace, and run history are preserved. The workflow type is NOT editable (400). DAG schedules are owned by PATCH /dags/{dag_name} (400). Nullable fields (calendar, consecutive_failure_limit, end_at, max_runs, catchup_policy, retry_policy) are tri-state: omitting the field leaves it unchanged, an explicit JSON null clears it. The merged spec is validated before any write, so a 400 writes nothing. Changing the schedule expression recomputes next_run_at anchored at now (elapsed slots are never retroactively fired); other edits preserve the pending next_run_at. Anti-race with the scheduler tick: an edit is rejected 409 while a fire claim is live, an expired claim is fenced (token nulled) so a straggler fire cannot finalize over the edit, and a tick that wins its claim re-reads the row before firing, so a fire that lands concurrently with the edit always dispatches the committed new input/queue/policies.",
@@ -3283,7 +3333,8 @@
           "schedule"
         ],
         "x-harvest-idempotency": "Idempotent for identical bodies: re-applying the same partial update converges on the same row state. Returns 409 while a scheduler replica holds a live fire claim on the row (the claim lease is bounded at ~30 s); retry shortly.",
-        "x-harvest-read-only": false
+        "x-harvest-read-only": false,
+        "x-harvest-route-class": "mutating"
       }
     },
     "/admin/schedules/{id}/backfill": {
@@ -3421,7 +3472,8 @@
           "schedule"
         ],
         "x-harvest-idempotency": "Idempotent per timestamp: retrying the same backfill window never creates duplicate workflow executions or DAG runs for already-dispatched timestamps.",
-        "x-harvest-read-only": false
+        "x-harvest-read-only": false,
+        "x-harvest-route-class": "mutating"
       }
     },
     "/admin/schedules/{id}/decisions": {
@@ -3488,7 +3540,8 @@
         "tags": [
           "schedule"
         ],
-        "x-harvest-read-only": true
+        "x-harvest-read-only": true,
+        "x-harvest-route-class": "read_only"
       }
     },
     "/admin/schedules/{id}/pause": {
@@ -3547,7 +3600,8 @@
           "schedule"
         ],
         "x-harvest-idempotency": "Idempotent: pausing an already-paused schedule is a no-op.",
-        "x-harvest-read-only": false
+        "x-harvest-read-only": false,
+        "x-harvest-route-class": "mutating"
       }
     },
     "/admin/schedules/{id}/preview": {
@@ -3630,7 +3684,8 @@
         "tags": [
           "schedule"
         ],
-        "x-harvest-read-only": true
+        "x-harvest-read-only": true,
+        "x-harvest-route-class": "read_only"
       }
     },
     "/admin/schedules/{id}/resume": {
@@ -3674,7 +3729,8 @@
           "schedule"
         ],
         "x-harvest-idempotency": "Idempotent: resuming an already-active schedule is a no-op.",
-        "x-harvest-read-only": false
+        "x-harvest-read-only": false,
+        "x-harvest-route-class": "mutating"
       }
     },
     "/admin/schedules/{id}/runs": {
@@ -3781,7 +3837,8 @@
         "tags": [
           "schedule"
         ],
-        "x-harvest-read-only": true
+        "x-harvest-read-only": true,
+        "x-harvest-route-class": "read_only"
       }
     },
     "/admin/schedules/{id}/trigger": {
@@ -3875,7 +3932,8 @@
           "schedule"
         ],
         "x-harvest-idempotency": "Not strictly idempotent: each call that succeeds starts a new execution with a unique workflow_id derived from the current timestamp.",
-        "x-harvest-read-only": false
+        "x-harvest-read-only": false,
+        "x-harvest-route-class": "mutating"
       }
     },
     "/admin/shards/health": {
@@ -3919,7 +3977,8 @@
         "tags": [
           "admin"
         ],
-        "x-harvest-read-only": true
+        "x-harvest-read-only": true,
+        "x-harvest-route-class": "read_only"
       }
     },
     "/admin/start-throttle": {
@@ -3945,7 +4004,8 @@
         "tags": [
           "admin"
         ],
-        "x-harvest-read-only": true
+        "x-harvest-read-only": true,
+        "x-harvest-route-class": "read_only"
       }
     },
     "/admin/start-throttle/{workflow_name}/override": {
@@ -4003,7 +4063,8 @@
           "admin"
         ],
         "x-harvest-idempotency": "Idempotent: clearing a workflow with no active override still returns 200 reporting the declared baseline (override_active: false).",
-        "x-harvest-read-only": false
+        "x-harvest-read-only": false,
+        "x-harvest-route-class": "mutating"
       },
       "get": {
         "description": "Read-only companion to the SET/DELETE routes above (issue #945): resolves and reports a workflow's TTL'd pacing-override state directly against the bucket the token-consumption path actually reads, independent of whether the workflow currently has any deferred-start backlog. GET /admin/start-throttle only surfaces override state for a workflow while it has pending backlog rows; this route answers reliably even when the backlog has fully drained but the override is still running for the rest of its TTL, or before any pressure has occurred at all. Buckets are shard-local (issue #607/#247); the top-level 200/207 body reports whichever reachable shard has a LIVE override whenever any shard does -- never the mere fewest-remaining-tokens row, since raw token count says nothing about whether an operator override is active (issue #945 review, round 4, P2). A read reaching only SOME shards, OR one where reachable shards genuinely disagree on override state, is reported as 207, not 200 -- see the success-response notes.",
@@ -4058,7 +4119,8 @@
         "tags": [
           "admin"
         ],
-        "x-harvest-read-only": true
+        "x-harvest-read-only": true,
+        "x-harvest-route-class": "read_only"
       },
       "post": {
         "description": "Set (or replace) a TTL'd runtime pacing override on top of a declared workflow-start throttle (issue #945, extends issue #607). Takes effect on the existing token-consumption path immediately, with no worker restart; self-expires and reverts to the declared baseline at expires_at with no further operator action. The write is fanned out to the bucket row on EVERY readable shard (start-throttle buckets are shard-local, like activity rate-limit buckets); a write reaching only SOME shards is reported as 207, not 200 -- see the success-response notes.",
@@ -4141,7 +4203,8 @@
           "admin"
         ],
         "x-harvest-idempotency": "Idempotent: each call fully replaces the whole override (a field omitted from a later call reverts that field to the declared baseline rather than being merged forward with an earlier call).",
-        "x-harvest-read-only": false
+        "x-harvest-read-only": false,
+        "x-harvest-route-class": "mutating"
       }
     },
     "/admin/status": {
@@ -4173,7 +4236,8 @@
         "tags": [
           "admin"
         ],
-        "x-harvest-read-only": true
+        "x-harvest-read-only": true,
+        "x-harvest-route-class": "read_only"
       }
     },
     "/admin/tasks/{id}/eligibility": {
@@ -4229,23 +4293,14 @@
           "queue"
         ],
         "x-harvest-idempotency": "Read-only; always idempotent.",
-        "x-harvest-read-only": true
+        "x-harvest-read-only": true,
+        "x-harvest-route-class": "read_only"
       }
     },
     "/admin/tokens": {
       "get": {
         "description": "List all scoped API tokens as metadata only (issue #942). The plaintext secret and its hash are never returned — only id, name, scope, created_at, expires_at, last_used_at, revoked_at.",
         "operationId": "get_admin_tokens",
-        "requestBody": {
-          "content": {
-            "application/json": {
-              "schema": {
-                "description": "Opaque JSON body. See the operation description for its shape."
-              }
-            }
-          },
-          "required": false
-        },
         "responses": {
           "200": {
             "content": {
@@ -4269,7 +4324,8 @@
           "api_tokens"
         ],
         "x-harvest-idempotency": "Read-only; always idempotent.",
-        "x-harvest-read-only": true
+        "x-harvest-read-only": true,
+        "x-harvest-route-class": "read_only"
       },
       "post": {
         "description": "Mint a scoped API token (issue #942). The plaintext secret is returned exactly once in this response; only its SHA-256 hash is stored at rest. Scope is drawn from the route classification: 'read' reaches every read-only route and is denied 403 on mutations; 'mutate' reaches everything.",
@@ -4334,7 +4390,8 @@
           "api_tokens"
         ],
         "x-harvest-idempotency": "Not idempotent: each call mints a new token row with a fresh UUID and secret.",
-        "x-harvest-read-only": false
+        "x-harvest-read-only": false,
+        "x-harvest-route-class": "mutating"
       }
     },
     "/admin/tokens/{id}": {
@@ -4378,7 +4435,8 @@
           "api_tokens"
         ],
         "x-harvest-idempotency": "Idempotent: revoking an unknown or already-revoked token returns revoked=false without error.",
-        "x-harvest-read-only": false
+        "x-harvest-read-only": false,
+        "x-harvest-route-class": "mutating"
       }
     },
     "/admin/usage": {
@@ -4447,7 +4505,8 @@
         "tags": [
           "admin"
         ],
-        "x-harvest-read-only": true
+        "x-harvest-read-only": true,
+        "x-harvest-route-class": "read_only"
       }
     },
     "/admin/version-gates/retirement-check": {
@@ -4531,7 +4590,8 @@
         "tags": [
           "admin"
         ],
-        "x-harvest-read-only": true
+        "x-harvest-read-only": true,
+        "x-harvest-route-class": "read_only"
       }
     },
     "/admin/version-gates/usage": {
@@ -4611,7 +4671,8 @@
         "tags": [
           "admin"
         ],
-        "x-harvest-read-only": true
+        "x-harvest-read-only": true,
+        "x-harvest-route-class": "read_only"
       }
     },
     "/admin/workflow-types/reachability": {
@@ -4657,7 +4718,8 @@
         "tags": [
           "admin"
         ],
-        "x-harvest-read-only": true
+        "x-harvest-read-only": true,
+        "x-harvest-route-class": "read_only"
       }
     },
     "/admin/workflows/replay-canary": {
@@ -4723,7 +4785,8 @@
           "admin"
         ],
         "x-harvest-idempotency": "Idempotent: running the canary does not mutate any workflow or system state.",
-        "x-harvest-read-only": false
+        "x-harvest-read-only": false,
+        "x-harvest-route-class": "mutating"
       }
     },
     "/batch-operations": {
@@ -4760,7 +4823,8 @@
         "tags": [
           "batch"
         ],
-        "x-harvest-read-only": true
+        "x-harvest-read-only": true,
+        "x-harvest-route-class": "read_only"
       },
       "post": {
         "description": "Submit a fleet-wide batch operation (Cancel, Terminate, or Signal) targeting workflows matching a filter.",
@@ -4803,6 +4867,50 @@
           "required": true
         },
         "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "properties": {
+                    "action": {
+                      "description": "The action the batch would apply.",
+                      "type": "string"
+                    },
+                    "dry_run": {
+                      "description": "Always true on this response.",
+                      "type": "boolean"
+                    },
+                    "filter": {
+                      "description": "The filter the plan was computed for."
+                    },
+                    "matched_count": {
+                      "description": "How many executions the filter matched.",
+                      "type": "integer"
+                    },
+                    "per_shard": {
+                      "description": "Matched counts per shard."
+                    },
+                    "sample": {
+                      "description": "A sample of the matched executions."
+                    },
+                    "sample_truncated": {
+                      "description": "Whether the sample was cut short.",
+                      "type": "boolean"
+                    },
+                    "status": {
+                      "description": "complete, partial, or unavailable.",
+                      "type": "string"
+                    },
+                    "unavailable_shards": {
+                      "description": "Shards that could not be reached."
+                    }
+                  },
+                  "type": "object"
+                }
+              }
+            },
+            "description": "dry_run was true. No batch was submitted; the response is the plan envelope instead of { batch_job_id }."
+          },
           "202": {
             "content": {
               "application/json": {
@@ -4838,7 +4946,8 @@
           "batch"
         ],
         "x-harvest-idempotency": "Idempotent by idempotency_key when provided: re-submitting with the same key returns the existing batch_job_id.",
-        "x-harvest-read-only": false
+        "x-harvest-read-only": false,
+        "x-harvest-route-class": "mutating"
       }
     },
     "/batch-operations/{id}": {
@@ -4878,7 +4987,8 @@
         "tags": [
           "batch"
         ],
-        "x-harvest-read-only": true
+        "x-harvest-read-only": true,
+        "x-harvest-route-class": "read_only"
       }
     },
     "/batches/pending": {
@@ -4904,7 +5014,8 @@
         "tags": [
           "workflow"
         ],
-        "x-harvest-read-only": true
+        "x-harvest-read-only": true,
+        "x-harvest-route-class": "read_only"
       }
     },
     "/calendars": {
@@ -4930,7 +5041,8 @@
         "tags": [
           "calendar"
         ],
-        "x-harvest-read-only": true
+        "x-harvest-read-only": true,
+        "x-harvest-route-class": "read_only"
       },
       "post": {
         "description": "Create a new named calendar.",
@@ -5003,7 +5115,8 @@
           "calendar"
         ],
         "x-harvest-idempotency": "Not idempotent: attempting to create an already-existing calendar returns 409.",
-        "x-harvest-read-only": false
+        "x-harvest-read-only": false,
+        "x-harvest-route-class": "mutating"
       }
     },
     "/calendars/{name}": {
@@ -5037,7 +5150,8 @@
           "calendar"
         ],
         "x-harvest-idempotency": "Not idempotent: a second call after successful deletion returns 404.",
-        "x-harvest-read-only": false
+        "x-harvest-read-only": false,
+        "x-harvest-route-class": "mutating"
       },
       "get": {
         "description": "Get a named calendar including its exclusion date list.",
@@ -5101,7 +5215,8 @@
         "tags": [
           "calendar"
         ],
-        "x-harvest-read-only": true
+        "x-harvest-read-only": true,
+        "x-harvest-route-class": "read_only"
       },
       "put": {
         "description": "Replace the exclusion date list for a calendar.",
@@ -5152,7 +5267,8 @@
           "calendar"
         ],
         "x-harvest-idempotency": "Idempotent: replacing the exclusion dates list with the same values is a no-op.",
-        "x-harvest-read-only": false
+        "x-harvest-read-only": false,
+        "x-harvest-route-class": "mutating"
       }
     },
     "/dags": {
@@ -5178,7 +5294,8 @@
         "tags": [
           "dag"
         ],
-        "x-harvest-read-only": true
+        "x-harvest-read-only": true,
+        "x-harvest-route-class": "read_only"
       }
     },
     "/dags/{dag_name}": {
@@ -5237,7 +5354,8 @@
           "dag"
         ],
         "x-harvest-idempotency": "Idempotent: applying the same pause state twice is a no-op.",
-        "x-harvest-read-only": false
+        "x-harvest-read-only": false,
+        "x-harvest-route-class": "mutating"
       }
     },
     "/dags/{dag_name}/runs": {
@@ -5286,7 +5404,8 @@
         "tags": [
           "dag"
         ],
-        "x-harvest-read-only": true
+        "x-harvest-read-only": true,
+        "x-harvest-route-class": "read_only"
       }
     },
     "/dags/{dag_name}/runs/{run_exec_id}": {
@@ -5358,7 +5477,8 @@
         "tags": [
           "dag"
         ],
-        "x-harvest-read-only": true
+        "x-harvest-read-only": true,
+        "x-harvest-route-class": "read_only"
       }
     },
     "/dags/{dag_name}/runs/{run_exec_id}/retry": {
@@ -5415,6 +5535,16 @@
           "required": true
         },
         "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "description": "Shape is documented in the response description, not as a schema."
+                }
+              }
+            },
+            "description": "dry_run was true. The plan is returned and nothing is written; new_run_exec_id and events_carried_over are omitted."
+          },
           "201": {
             "content": {
               "application/json": {
@@ -5466,7 +5596,8 @@
           "dag"
         ],
         "x-harvest-idempotency": "Not idempotent: a committed retry forks a new DAG run.",
-        "x-harvest-read-only": false
+        "x-harvest-read-only": false,
+        "x-harvest-route-class": "mutating"
       }
     },
     "/dags/{dag_name}/trigger": {
@@ -5525,7 +5656,8 @@
           "dag"
         ],
         "x-harvest-idempotency": "Not idempotent: each call starts a new DAG run.",
-        "x-harvest-read-only": false
+        "x-harvest-read-only": false,
+        "x-harvest-route-class": "mutating"
       }
     },
     "/dead-letters": {
@@ -5571,7 +5703,8 @@
         "tags": [
           "dlq"
         ],
-        "x-harvest-read-only": true
+        "x-harvest-read-only": true,
+        "x-harvest-route-class": "read_only"
       }
     },
     "/dead-letters/aggregate": {
@@ -5700,7 +5833,8 @@
         "tags": [
           "dlq"
         ],
-        "x-harvest-read-only": true
+        "x-harvest-read-only": true,
+        "x-harvest-route-class": "read_only"
       }
     },
     "/dead-letters/discard": {
@@ -5783,7 +5917,8 @@
           "dlq"
         ],
         "x-harvest-idempotency": "Idempotent by filter: already-discarded entries are skipped.",
-        "x-harvest-read-only": false
+        "x-harvest-read-only": false,
+        "x-harvest-route-class": "mutating"
       }
     },
     "/dead-letters/replay": {
@@ -5866,7 +6001,8 @@
           "dlq"
         ],
         "x-harvest-idempotency": "Idempotent by filter: already-replayed or already-pending entries are skipped.",
-        "x-harvest-read-only": false
+        "x-harvest-read-only": false,
+        "x-harvest-route-class": "mutating"
       }
     },
     "/dead-letters/{id}/replay": {
@@ -5912,7 +6048,8 @@
           "dlq"
         ],
         "x-harvest-idempotency": "Idempotent: replaying an already-replayed entry is a no-op.",
-        "x-harvest-read-only": false
+        "x-harvest-read-only": false,
+        "x-harvest-route-class": "mutating"
       }
     },
     "/dlq/redrive": {
@@ -5990,7 +6127,8 @@
           "dlq"
         ],
         "x-harvest-idempotency": "Idempotent: redriving an already-redriven entry (or one whose execution has progressed) is a no-op reported as skipped, never a duplicate enqueue.",
-        "x-harvest-read-only": false
+        "x-harvest-read-only": false,
+        "x-harvest-route-class": "mutating"
       }
     },
     "/executions/{exec_id}/events/stream": {
@@ -6049,7 +6187,9 @@
         "tags": [
           "workflow"
         ],
-        "x-harvest-read-only": true
+        "x-harvest-read-only": true,
+        "x-harvest-route-class": "read_only",
+        "x-harvest-stream": true
       }
     },
     "/health": {
@@ -6077,11 +6217,13 @@
             "description": "Success."
           }
         },
+        "security": [],
         "summary": "Liveness health check.",
         "tags": [
           "health"
         ],
-        "x-harvest-read-only": true
+        "x-harvest-read-only": true,
+        "x-harvest-route-class": "public_safe"
       }
     },
     "/openapi.json": {
@@ -6100,11 +6242,13 @@
             "description": "The OpenAPI 3.1 document as a JSON object, with keys openapi, info, servers, security, tags, paths and components."
           }
         },
+        "security": [],
         "summary": "Serve the OpenAPI 3.1 document for this management API (issue #694).",
         "tags": [
           "discovery"
         ],
-        "x-harvest-read-only": true
+        "x-harvest-read-only": true,
+        "x-harvest-route-class": "public_safe"
       }
     },
     "/workers": {
@@ -6180,7 +6324,8 @@
         "tags": [
           "worker"
         ],
-        "x-harvest-read-only": true
+        "x-harvest-read-only": true,
+        "x-harvest-route-class": "read_only"
       }
     },
     "/workers/drain-preview": {
@@ -6247,7 +6392,8 @@
         "tags": [
           "worker"
         ],
-        "x-harvest-read-only": true
+        "x-harvest-read-only": true,
+        "x-harvest-route-class": "read_only"
       }
     },
     "/workers/health": {
@@ -6282,7 +6428,8 @@
         "tags": [
           "worker"
         ],
-        "x-harvest-read-only": true
+        "x-harvest-read-only": true,
+        "x-harvest-route-class": "read_only"
       }
     },
     "/workers/{worker_id}": {
@@ -6322,7 +6469,8 @@
         "tags": [
           "worker"
         ],
-        "x-harvest-read-only": true
+        "x-harvest-read-only": true,
+        "x-harvest-route-class": "read_only"
       }
     },
     "/workers/{worker_id}/drain": {
@@ -6389,7 +6537,8 @@
           "worker"
         ],
         "x-harvest-idempotency": "Idempotent: re-draining an already-draining worker extends the deadline if the new one is later.",
-        "x-harvest-read-only": false
+        "x-harvest-read-only": false,
+        "x-harvest-route-class": "mutating"
       }
     },
     "/workers/{worker_id}/pinned": {
@@ -6435,7 +6584,8 @@
         "tags": [
           "worker"
         ],
-        "x-harvest-read-only": true
+        "x-harvest-read-only": true,
+        "x-harvest-route-class": "read_only"
       }
     },
     "/workflows": {
@@ -6620,7 +6770,8 @@
         "tags": [
           "workflow"
         ],
-        "x-harvest-read-only": true
+        "x-harvest-read-only": true,
+        "x-harvest-route-class": "read_only"
       }
     },
     "/workflows/batch_reset": {
@@ -6698,7 +6849,8 @@
           "batch"
         ],
         "x-harvest-idempotency": "Not idempotent. Each call forks the matched cohort. Use preview=true to plan first.",
-        "x-harvest-read-only": false
+        "x-harvest-read-only": false,
+        "x-harvest-route-class": "mutating"
       }
     },
     "/workflows/batch_start": {
@@ -6753,7 +6905,8 @@
           "batch"
         ],
         "x-harvest-idempotency": "Idempotent by workflow_id per item according to the individual reuse policy. Additionally, each item may carry a specific idempotency_key (issue #357); a retried batch carrying the same keys does not start duplicate executions. The batch envelope itself is not idempotent without per-item keys.",
-        "x-harvest-read-only": false
+        "x-harvest-read-only": false,
+        "x-harvest-route-class": "mutating"
       }
     },
     "/workflows/by-id/{workflow_name}": {
@@ -6788,7 +6941,8 @@
           "workflow"
         ],
         "x-harvest-idempotency": "Safe",
-        "x-harvest-read-only": true
+        "x-harvest-read-only": true,
+        "x-harvest-route-class": "read_only"
       },
       "post": {
         "description": "Missing-workflow_id guard for the business-id route family (POST variant): always returns 400. Shares the GET handler; never reads or writes state. Classified read-only despite the POST verb (issue #776).",
@@ -6831,7 +6985,8 @@
           "workflow"
         ],
         "x-harvest-idempotency": "Safe",
-        "x-harvest-read-only": true
+        "x-harvest-read-only": true,
+        "x-harvest-route-class": "read_only"
       }
     },
     "/workflows/by-id/{workflow_name}/{workflow_id}": {
@@ -6867,7 +7022,15 @@
                 }
               }
             },
-            "description": "Same body as GET /workflows/{id}; resolved execution_id also in the X-Harvest-Execution-Id header."
+            "description": "Same body as GET /workflows/{id}; resolved execution_id also in the X-Harvest-Execution-Id header.",
+            "headers": {
+              "X-Harvest-Execution-Id": {
+                "description": "The execution id GET /workflows/by-id/{workflow_name}/{workflow_id} resolved to. Present on every by-id response, including bodiless ones.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
           },
           "404": {
             "description": "No run for (workflow_name, workflow_id)."
@@ -6880,7 +7043,8 @@
         "tags": [
           "workflow"
         ],
-        "x-harvest-read-only": true
+        "x-harvest-read-only": true,
+        "x-harvest-route-class": "read_only"
       }
     },
     "/workflows/by-id/{workflow_name}/{workflow_id}/cancel": {
@@ -6939,7 +7103,15 @@
                 }
               }
             },
-            "description": "Success."
+            "description": "Success.",
+            "headers": {
+              "X-Harvest-Execution-Id": {
+                "description": "The execution id POST /workflows/by-id/{workflow_name}/{workflow_id}/cancel resolved to. Present on every by-id response, including bodiless ones.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
           },
           "401": {
             "description": "Admin authentication required."
@@ -6959,7 +7131,8 @@
           "workflow"
         ],
         "x-harvest-idempotency": "Idempotent: cancelling an already-cancelled or terminal execution is a no-op.",
-        "x-harvest-read-only": false
+        "x-harvest-read-only": false,
+        "x-harvest-route-class": "mutating"
       }
     },
     "/workflows/by-id/{workflow_name}/{workflow_id}/children": {
@@ -7045,7 +7218,15 @@
                 }
               }
             },
-            "description": "Same body as GET /workflows/{id}/children ({items, next_cursor}); resolved execution_id in the X-Harvest-Execution-Id header."
+            "description": "Same body as GET /workflows/{id}/children ({items, next_cursor}); resolved execution_id in the X-Harvest-Execution-Id header.",
+            "headers": {
+              "X-Harvest-Execution-Id": {
+                "description": "The execution id GET /workflows/by-id/{workflow_name}/{workflow_id}/children resolved to. Present on every by-id response, including bodiless ones.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
           },
           "400": {
             "description": "Malformed query string: a percent-encoded byte sequence in the query does not decode to valid UTF-8."
@@ -7061,7 +7242,8 @@
         "tags": [
           "workflow"
         ],
-        "x-harvest-read-only": true
+        "x-harvest-read-only": true,
+        "x-harvest-route-class": "read_only"
       }
     },
     "/workflows/by-id/{workflow_name}/{workflow_id}/pause": {
@@ -7121,7 +7303,15 @@
                 }
               }
             },
-            "description": "Success."
+            "description": "Success.",
+            "headers": {
+              "X-Harvest-Execution-Id": {
+                "description": "The execution id POST /workflows/by-id/{workflow_name}/{workflow_id}/pause resolved to. Present on every by-id response, including bodiless ones.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
           },
           "400": {
             "description": "Pause reason exceeds the length cap."
@@ -7144,7 +7334,8 @@
           "workflow"
         ],
         "x-harvest-idempotency": "Idempotent: pausing an already-paused execution is a no-op (newly_paused=false).",
-        "x-harvest-read-only": false
+        "x-harvest-read-only": false,
+        "x-harvest-route-class": "mutating"
       }
     },
     "/workflows/by-id/{workflow_name}/{workflow_id}/query/{query_name}": {
@@ -7193,7 +7384,15 @@
                 }
               }
             },
-            "description": "Success."
+            "description": "Success.",
+            "headers": {
+              "X-Harvest-Execution-Id": {
+                "description": "The execution id GET /workflows/by-id/{workflow_name}/{workflow_id}/query/{query_name} resolved to. Present on every by-id response, including bodiless ones.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
           },
           "404": {
             "description": "No run for (workflow_name, workflow_id), or query handler not registered."
@@ -7212,7 +7411,8 @@
         "tags": [
           "workflow"
         ],
-        "x-harvest-read-only": true
+        "x-harvest-read-only": true,
+        "x-harvest-route-class": "read_only"
       },
       "post": {
         "description": "Invoke a registered query handler with typed JSON args on the current run of a business (workflow_name, workflow_id). Returns {\"execution_id\": ..., \"result\": <value>}. POST is used solely to allow a structured body; never writes workflow events. Resolves (workflow_name, workflow_id) to the current run: the single active (non-terminal) run if one exists, else the most recent terminal run, else 404 (never 500). Shard-aware. The resolved execution_id is returned on every response in the X-Harvest-Execution-Id header (and in the JSON body where present); acting by business id always reaches the live run even after a continue-as-new/reset fork.",
@@ -7274,7 +7474,15 @@
                 }
               }
             },
-            "description": "Success."
+            "description": "Success.",
+            "headers": {
+              "X-Harvest-Execution-Id": {
+                "description": "The execution id POST /workflows/by-id/{workflow_name}/{workflow_id}/query/{query_name} resolved to. Present on every by-id response, including bodiless ones.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
           },
           "400": {
             "description": "Args failed to deserialize into the handler's request type."
@@ -7297,7 +7505,8 @@
           "workflow"
         ],
         "x-harvest-idempotency": "Read-only at the workflow level (no events written).",
-        "x-harvest-read-only": true
+        "x-harvest-read-only": true,
+        "x-harvest-route-class": "read_only"
       }
     },
     "/workflows/by-id/{workflow_name}/{workflow_id}/result": {
@@ -7342,7 +7551,26 @@
                 }
               }
             },
-            "description": "Same body as GET /workflows/{id}/result (204 No Content with Retry-After when still running). Resolved execution_id in the X-Harvest-Execution-Id header on every response."
+            "description": "Same body as GET /workflows/{id}/result (204 No Content with Retry-After when still running). Resolved execution_id in the X-Harvest-Execution-Id header on every response.",
+            "headers": {
+              "X-Harvest-Execution-Id": {
+                "description": "The execution id GET /workflows/by-id/{workflow_name}/{workflow_id}/result resolved to. Present on every by-id response, including bodiless ones.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "204": {
+            "description": "The execution is still running after the wait window. The body is empty and Retry-After is 1; poll again.",
+            "headers": {
+              "Retry-After": {
+                "description": "Seconds to wait before polling again. Always 1.",
+                "schema": {
+                  "type": "integer"
+                }
+              }
+            }
           },
           "400": {
             "description": "Invalid wait duration. Malformed query string: a percent-encoded byte sequence in the query does not decode to valid UTF-8."
@@ -7358,7 +7586,8 @@
         "tags": [
           "workflow"
         ],
-        "x-harvest-read-only": true
+        "x-harvest-read-only": true,
+        "x-harvest-route-class": "read_only"
       }
     },
     "/workflows/by-id/{workflow_name}/{workflow_id}/resume": {
@@ -7402,7 +7631,15 @@
                 }
               }
             },
-            "description": "Success."
+            "description": "Success.",
+            "headers": {
+              "X-Harvest-Execution-Id": {
+                "description": "The execution id POST /workflows/by-id/{workflow_name}/{workflow_id}/resume resolved to. Present on every by-id response, including bodiless ones.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
           },
           "401": {
             "description": "Admin authentication required."
@@ -7419,7 +7656,8 @@
           "workflow"
         ],
         "x-harvest-idempotency": "Idempotent: resuming a non-paused execution is a 200 no-op (newly_resumed=false).",
-        "x-harvest-read-only": false
+        "x-harvest-read-only": false,
+        "x-harvest-route-class": "mutating"
       }
     },
     "/workflows/by-id/{workflow_name}/{workflow_id}/signal/{signal_name}": {
@@ -7498,7 +7736,15 @@
                 }
               }
             },
-            "description": "routed_execution_id (issue #843) is present only when the resolved execution id differed from the live workflow-level-retry attempt the signal actually landed on; it is omitted otherwise."
+            "description": "routed_execution_id (issue #843) is present only when the resolved execution id differed from the live workflow-level-retry attempt the signal actually landed on; it is omitted otherwise.",
+            "headers": {
+              "X-Harvest-Execution-Id": {
+                "description": "The execution id POST /workflows/by-id/{workflow_name}/{workflow_id}/signal/{signal_name} resolved to. Present on every by-id response, including bodiless ones.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
           },
           "404": {
             "description": "No run for (workflow_name, workflow_id)."
@@ -7512,7 +7758,8 @@
           "workflow"
         ],
         "x-harvest-idempotency": "Same exactly-once semantics as POST /workflows/{id}/signal/{signal_name} (Idempotency-Key header or idempotency_key query param).",
-        "x-harvest-read-only": false
+        "x-harvest-read-only": false,
+        "x-harvest-route-class": "mutating"
       }
     },
     "/workflows/by-id/{workflow_name}/{workflow_id}/stack": {
@@ -7548,7 +7795,15 @@
                 }
               }
             },
-            "description": "Same body as GET /workflows/{id}/stack; resolved execution_id in the X-Harvest-Execution-Id header."
+            "description": "Same body as GET /workflows/{id}/stack; resolved execution_id in the X-Harvest-Execution-Id header.",
+            "headers": {
+              "X-Harvest-Execution-Id": {
+                "description": "The execution id GET /workflows/by-id/{workflow_name}/{workflow_id}/stack resolved to. Present on every by-id response, including bodiless ones.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
           },
           "404": {
             "description": "No run for (workflow_name, workflow_id)."
@@ -7561,7 +7816,8 @@
         "tags": [
           "workflow"
         ],
-        "x-harvest-read-only": true
+        "x-harvest-read-only": true,
+        "x-harvest-route-class": "read_only"
       }
     },
     "/workflows/count": {
@@ -7659,7 +7915,8 @@
         "tags": [
           "workflow"
         ],
-        "x-harvest-read-only": true
+        "x-harvest-read-only": true,
+        "x-harvest-route-class": "read_only"
       }
     },
     "/workflows/registered": {
@@ -7683,7 +7940,8 @@
           "discovery"
         ],
         "x-harvest-idempotency": "Safe",
-        "x-harvest-read-only": true
+        "x-harvest-read-only": true,
+        "x-harvest-route-class": "read_only"
       }
     },
     "/workflows/registered/{name}/interface": {
@@ -7721,7 +7979,8 @@
           "discovery"
         ],
         "x-harvest-idempotency": "Safe",
-        "x-harvest-read-only": true
+        "x-harvest-read-only": true,
+        "x-harvest-route-class": "read_only"
       }
     },
     "/workflows/registered/{name}/schema": {
@@ -7759,7 +8018,8 @@
           "discovery"
         ],
         "x-harvest-idempotency": "Safe",
-        "x-harvest-read-only": true
+        "x-harvest-read-only": true,
+        "x-harvest-route-class": "read_only"
       }
     },
     "/workflows/summaries": {
@@ -7884,7 +8144,8 @@
         "tags": [
           "workflow"
         ],
-        "x-harvest-read-only": true
+        "x-harvest-read-only": true,
+        "x-harvest-route-class": "read_only"
       }
     },
     "/workflows/types/{workflow_name}/handlers": {
@@ -7919,7 +8180,8 @@
           "workflow"
         ],
         "x-harvest-idempotency": "Safe",
-        "x-harvest-read-only": true
+        "x-harvest-read-only": true,
+        "x-harvest-route-class": "read_only"
       }
     },
     "/workflows/{id}": {
@@ -7970,7 +8232,8 @@
         "tags": [
           "workflow"
         ],
-        "x-harvest-read-only": true
+        "x-harvest-read-only": true,
+        "x-harvest-route-class": "read_only"
       }
     },
     "/workflows/{id}/activities/{activity_exec_id}/fail-now": {
@@ -8057,7 +8320,8 @@
           "workflow"
         ],
         "x-harvest-idempotency": "Idempotent: re-issuing the call on an already-forced task (FAILED with the OperatorForceFailed envelope) is a no-op success returning forced=false, already_forced=true, with zero writes and no second terminal event. Idempotency wins over the terminal-execution guard: a retry issued after the woken workflow has consumed the forced failure and sealed its own run (the expected aftermath of a successful force-fail) still returns the no-op success rather than the terminal 409.",
-        "x-harvest-read-only": false
+        "x-harvest-read-only": false,
+        "x-harvest-route-class": "mutating"
       }
     },
     "/workflows/{id}/activities/{activity_exec_id}/retry-now": {
@@ -8125,7 +8389,8 @@
           "workflow"
         ],
         "x-harvest-idempotency": "Idempotent: calling on an already-eligible task (scheduled_at <= now) returns advanced=false and performs no update. Calling twice after advancing also returns advanced=false on the second call.",
-        "x-harvest-read-only": false
+        "x-harvest-read-only": false,
+        "x-harvest-route-class": "mutating"
       }
     },
     "/workflows/{id}/awaitables": {
@@ -8185,7 +8450,8 @@
           "workflow"
         ],
         "x-harvest-idempotency": "Fully idempotent; read-only.",
-        "x-harvest-read-only": true
+        "x-harvest-read-only": true,
+        "x-harvest-route-class": "read_only"
       }
     },
     "/workflows/{id}/cancel": {
@@ -8252,7 +8518,8 @@
           "workflow"
         ],
         "x-harvest-idempotency": "Idempotent: cancelling an already-cancelled or terminal execution is a no-op.",
-        "x-harvest-read-only": false
+        "x-harvest-read-only": false,
+        "x-harvest-route-class": "mutating"
       }
     },
     "/workflows/{id}/children": {
@@ -8351,7 +8618,8 @@
         "tags": [
           "workflow"
         ],
-        "x-harvest-read-only": true
+        "x-harvest-read-only": true,
+        "x-harvest-route-class": "read_only"
       }
     },
     "/workflows/{id}/completion-deliveries": {
@@ -8413,7 +8681,8 @@
         "tags": [
           "workflow"
         ],
-        "x-harvest-read-only": true
+        "x-harvest-read-only": true,
+        "x-harvest-route-class": "read_only"
       }
     },
     "/workflows/{id}/completion-deliveries/{delivery_id}/redrive": {
@@ -8441,6 +8710,16 @@
           }
         ],
         "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "description": "Shape is documented in the response description, not as a schema."
+                }
+              }
+            },
+            "description": "outcome is not_failed: the delivery was not in a failed state, so nothing was redriven. Same fields as the 202."
+          },
           "202": {
             "content": {
               "application/json": {
@@ -8474,7 +8753,8 @@
           "workflow"
         ],
         "x-harvest-idempotency": "Idempotent-shaped: redriving a delivery that is not currently FAILED returns 200 with outcome=\"not_failed\" instead of erroring. A delivery already reset to PENDING will not be re-redriven by a repeat call.",
-        "x-harvest-read-only": false
+        "x-harvest-read-only": false,
+        "x-harvest-route-class": "mutating"
       }
     },
     "/workflows/{id}/diagnose": {
@@ -8536,7 +8816,8 @@
           "workflow"
         ],
         "x-harvest-idempotency": "Fully idempotent; read-only.",
-        "x-harvest-read-only": true
+        "x-harvest-read-only": true,
+        "x-harvest-route-class": "read_only"
       }
     },
     "/workflows/{id}/erase-payloads": {
@@ -8611,7 +8892,8 @@
           "workflow"
         ],
         "x-harvest-idempotency": "Idempotent: re-running on an already-erased execution returns fields_tombstoned=0, no error.",
-        "x-harvest-read-only": false
+        "x-harvest-read-only": false,
+        "x-harvest-route-class": "mutating"
       }
     },
     "/workflows/{id}/history": {
@@ -8688,7 +8970,8 @@
           "workflow"
         ],
         "x-harvest-idempotency": "Fully idempotent; read-only.",
-        "x-harvest-read-only": true
+        "x-harvest-read-only": true,
+        "x-harvest-route-class": "read_only"
       }
     },
     "/workflows/{id}/history/export": {
@@ -8752,7 +9035,8 @@
         "tags": [
           "workflow"
         ],
-        "x-harvest-read-only": true
+        "x-harvest-read-only": true,
+        "x-harvest-route-class": "read_only"
       }
     },
     "/workflows/{id}/legal-hold": {
@@ -8824,7 +9108,8 @@
           "workflow"
         ],
         "x-harvest-idempotency": "Idempotent: if an active hold already exists, its provenance is left unchanged and newly_held=false is returned (no write). A previously-set-but-expired hold is refreshed.",
-        "x-harvest-read-only": false
+        "x-harvest-read-only": false,
+        "x-harvest-route-class": "mutating"
       }
     },
     "/workflows/{id}/legal-hold/release": {
@@ -8878,7 +9163,8 @@
           "workflow"
         ],
         "x-harvest-idempotency": "Idempotent: releasing an execution with no hold set returns released=false (200 no-op).",
-        "x-harvest-read-only": false
+        "x-harvest-read-only": false,
+        "x-harvest-route-class": "mutating"
       }
     },
     "/workflows/{id}/logs": {
@@ -8971,7 +9257,8 @@
           "workflow"
         ],
         "x-harvest-idempotency": "Fully idempotent; read-only.",
-        "x-harvest-read-only": true
+        "x-harvest-read-only": true,
+        "x-harvest-route-class": "read_only"
       }
     },
     "/workflows/{id}/pause": {
@@ -9042,7 +9329,8 @@
           "workflow"
         ],
         "x-harvest-idempotency": "Idempotent: pausing an already-paused execution is a no-op (newly_paused=false).",
-        "x-harvest-read-only": false
+        "x-harvest-read-only": false,
+        "x-harvest-route-class": "mutating"
       }
     },
     "/workflows/{id}/queries": {
@@ -9085,7 +9373,8 @@
         "tags": [
           "workflow"
         ],
-        "x-harvest-read-only": true
+        "x-harvest-read-only": true,
+        "x-harvest-route-class": "read_only"
       }
     },
     "/workflows/{id}/query/{query_name}": {
@@ -9140,7 +9429,8 @@
         "tags": [
           "workflow"
         ],
-        "x-harvest-read-only": true
+        "x-harvest-read-only": true,
+        "x-harvest-route-class": "read_only"
       },
       "post": {
         "description": "Query the current state of a running workflow, passing typed JSON args to the handler. Returns {\"result\": <value>}. POST is used instead of GET solely to allow a structured JSON request body; this route never writes workflow events.",
@@ -9215,7 +9505,8 @@
           "workflow"
         ],
         "x-harvest-idempotency": "Read-only at the workflow level (no events written); safe to retry if the caller can tolerate duplicate handler invocations.",
-        "x-harvest-read-only": true
+        "x-harvest-read-only": true,
+        "x-harvest-route-class": "read_only"
       }
     },
     "/workflows/{id}/replay-diagnosis": {
@@ -9276,7 +9567,8 @@
           "workflow"
         ],
         "x-harvest-idempotency": "Read-only (no events written, no state recomputed); safe to retry.",
-        "x-harvest-read-only": true
+        "x-harvest-read-only": true,
+        "x-harvest-route-class": "read_only"
       }
     },
     "/workflows/{id}/rerun": {
@@ -9362,7 +9654,8 @@
           "workflow"
         ],
         "x-harvest-idempotency": "NOT idempotent. A second identical re-run returns 409: the first re-run sealed the source to CONTINUED_AS_NEW, which is no longer a re-runnable state — re-run the new run instead. (A re-run under an explicit workflow_id override does not seal the source, so the source stays re-runnable under a different key.)",
-        "x-harvest-read-only": false
+        "x-harvest-read-only": false,
+        "x-harvest-route-class": "mutating"
       }
     },
     "/workflows/{id}/reset": {
@@ -9455,7 +9748,8 @@
           "workflow"
         ],
         "x-harvest-idempotency": "Not idempotent: each call forks the execution and creates a distinct new execution ID.",
-        "x-harvest-read-only": false
+        "x-harvest-read-only": false,
+        "x-harvest-route-class": "mutating"
       }
     },
     "/workflows/{id}/result": {
@@ -9499,6 +9793,17 @@
             },
             "description": "Returns 204 No Content with Retry-After: 1 when the execution is still running after the wait window. A CONTINUED_AS_NEW predecessor transparently resolves to the final successor's output rather than returning the sentinel state."
           },
+          "204": {
+            "description": "The execution is still running after the wait window. The body is empty and Retry-After is 1; poll again.",
+            "headers": {
+              "Retry-After": {
+                "description": "Seconds to wait before polling again. Always 1.",
+                "schema": {
+                  "type": "integer"
+                }
+              }
+            }
+          },
           "400": {
             "description": "Invalid execution ID or wait duration. Malformed query string: a percent-encoded byte sequence in the query does not decode to valid UTF-8."
           },
@@ -9513,7 +9818,8 @@
         "tags": [
           "workflow"
         ],
-        "x-harvest-read-only": true
+        "x-harvest-read-only": true,
+        "x-harvest-route-class": "read_only"
       }
     },
     "/workflows/{id}/resume": {
@@ -9562,7 +9868,8 @@
           "workflow"
         ],
         "x-harvest-idempotency": "Idempotent: resuming a non-paused execution is a 200 no-op (newly_resumed=false); nothing is mutated.",
-        "x-harvest-read-only": false
+        "x-harvest-read-only": false,
+        "x-harvest-route-class": "mutating"
       }
     },
     "/workflows/{id}/run-chain": {
@@ -9611,7 +9918,8 @@
           "workflow"
         ],
         "x-harvest-idempotency": "Fully idempotent; read-only.",
-        "x-harvest-read-only": true
+        "x-harvest-read-only": true,
+        "x-harvest-route-class": "read_only"
       }
     },
     "/workflows/{id}/signal/{signal_name}": {
@@ -9694,7 +10002,8 @@
           "workflow"
         ],
         "x-harvest-idempotency": "Optional exactly-once delivery: when an Idempotency-Key header (or idempotency_key query param) is supplied, repeated deliveries with the same key for the same execution land exactly one SignalReceived event — the response reports signal_delivered=false for the deduped retries. Dedupe scope is shard-local, keyed on (execution_id, idempotency_key). Omitting the key reproduces the legacy at-least-once behavior (every call delivers a distinct signal event).",
-        "x-harvest-read-only": false
+        "x-harvest-read-only": false,
+        "x-harvest-route-class": "mutating"
       }
     },
     "/workflows/{id}/stack": {
@@ -9750,7 +10059,8 @@
         "tags": [
           "workflow"
         ],
-        "x-harvest-read-only": true
+        "x-harvest-read-only": true,
+        "x-harvest-route-class": "read_only"
       }
     },
     "/workflows/{id}/stream": {
@@ -9795,7 +10105,9 @@
           "workflow"
         ],
         "x-harvest-idempotency": "Fully idempotent; read-only.",
-        "x-harvest-read-only": true
+        "x-harvest-read-only": true,
+        "x-harvest-route-class": "read_only",
+        "x-harvest-stream": true
       }
     },
     "/workflows/{id}/terminate": {
@@ -9859,7 +10171,8 @@
           "workflow"
         ],
         "x-harvest-idempotency": "Idempotent: terminating an already-terminal execution (COMPLETED/FAILED/CANCELLED/TIMED_OUT/TERMINATED/CONTINUED_AS_NEW) is a non-mutating no-op that appends no second terminal transition and returns newly_terminated=false.",
-        "x-harvest-read-only": false
+        "x-harvest-read-only": false,
+        "x-harvest-route-class": "mutating"
       }
     },
     "/workflows/{id}/timeline": {
@@ -9911,7 +10224,8 @@
           "workflow"
         ],
         "x-harvest-idempotency": "Fully idempotent; read-only.",
-        "x-harvest-read-only": true
+        "x-harvest-read-only": true,
+        "x-harvest-route-class": "read_only"
       }
     },
     "/workflows/{id}/tree": {
@@ -10000,7 +10314,8 @@
           "workflow"
         ],
         "x-harvest-idempotency": "Fully idempotent; read-only. A point-in-time snapshot assembled per-shard.",
-        "x-harvest-read-only": true
+        "x-harvest-read-only": true,
+        "x-harvest-route-class": "read_only"
       }
     },
     "/workflows/{id}/triage": {
@@ -10078,7 +10393,8 @@
           "workflow"
         ],
         "x-harvest-idempotency": "Idempotent: applying the same patch twice yields the same final row (changed_fields is empty on the second call). An empty patch (every field omitted) performs no write and reports no changed fields.",
-        "x-harvest-read-only": false
+        "x-harvest-read-only": false,
+        "x-harvest-route-class": "mutating"
       }
     },
     "/workflows/{id}/update/{update_id}/result": {
@@ -10136,7 +10452,8 @@
         "tags": [
           "workflow"
         ],
-        "x-harvest-read-only": true
+        "x-harvest-read-only": true,
+        "x-harvest-route-class": "read_only"
       }
     },
     "/workflows/{id}/update/{update_name}": {
@@ -10225,7 +10542,8 @@
           "workflow"
         ],
         "x-harvest-idempotency": "Not idempotent: each call appends a distinct UpdateAdmitted event with a new update_id.",
-        "x-harvest-read-only": false
+        "x-harvest-read-only": false,
+        "x-harvest-route-class": "mutating"
       }
     },
     "/workflows/{workflow_name}/signal-with-start": {
@@ -10290,6 +10608,16 @@
           "required": true
         },
         "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "description": "Shape is documented in the response description, not as a schema."
+                }
+              }
+            },
+            "description": "An existing live execution was signaled instead of a fresh one being started. Same fields as the 201."
+          },
           "201": {
             "content": {
               "application/json": {
@@ -10332,7 +10660,8 @@
           "workflow"
         ],
         "x-harvest-idempotency": "Idempotent on (workflow_name, workflow_id) per id_reuse_policy. When idempotency_key is supplied, repeated calls with the same (execution_id, idempotency_key) deliver the signal exactly once.",
-        "x-harvest-read-only": false
+        "x-harvest-read-only": false,
+        "x-harvest-route-class": "mutating"
       }
     },
     "/workflows/{workflow_name}/start": {
@@ -10417,6 +10746,16 @@
           "required": false
         },
         "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "description": "Shape is documented in the response description, not as a schema."
+                }
+              }
+            },
+            "description": "An existing execution was returned instead of a new one being created (reuse_policy, or conflict_policy use_existing). Same fields as the 201."
+          },
           "201": {
             "content": {
               "application/json": {
@@ -10468,7 +10807,8 @@
           "workflow"
         ],
         "x-harvest-idempotency": "Idempotent by workflow_id when reuse_policy is reject_duplicate or allow_duplicate_failed_only.",
-        "x-harvest-read-only": false
+        "x-harvest-read-only": false,
+        "x-harvest-route-class": "mutating"
       }
     },
     "/workflows/{workflow_name}/update-with-start": {
@@ -10539,6 +10879,16 @@
           "required": true
         },
         "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "description": "Shape is documented in the response description, not as a schema."
+                }
+              }
+            },
+            "description": "An existing live execution was attached instead of a fresh one being started. Same fields as the 201."
+          },
           "201": {
             "content": {
               "application/json": {
@@ -10582,7 +10932,8 @@
           "workflow"
         ],
         "x-harvest-idempotency": "Idempotent on (workflow_name, workflow_id) per id_reuse_policy. When idempotency_key is supplied the update_id is derived deterministically via UUIDv5; a second call with the same key returns the cached outcome without re-admitting the update.",
-        "x-harvest-read-only": false
+        "x-harvest-read-only": false,
+        "x-harvest-route-class": "mutating"
       }
     }
   },

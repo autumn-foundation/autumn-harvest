@@ -453,6 +453,19 @@
           "completed_at"
         ]
       },
+      "additional_responses": [
+        {
+          "status": 204,
+          "description": "The execution is still running after the wait window. The body is empty and Retry-After is 1; poll again.",
+          "headers": [
+            {
+              "name": "Retry-After",
+              "type": "integer",
+              "description": "Seconds to wait before polling again. Always 1."
+            }
+          ]
+        }
+      ],
       "error_responses": [
         {
           "status": 400,
@@ -1208,6 +1221,13 @@
           "shard_id"
         ]
       },
+      "additional_responses": [
+        {
+          "status": 200,
+          "description": "An existing execution was returned instead of a new one being created (reuse_policy, or conflict_policy use_existing). Same fields as the 201.",
+          "free_form": true
+        }
+      ],
       "error_responses": [
         {
           "status": 400,
@@ -1318,6 +1338,13 @@
           "signal_delivered"
         ]
       },
+      "additional_responses": [
+        {
+          "status": 200,
+          "description": "An existing live execution was signaled instead of a fresh one being started. Same fields as the 201.",
+          "free_form": true
+        }
+      ],
       "error_responses": [
         {
           "status": 400,
@@ -1453,6 +1480,13 @@
           }
         ]
       },
+      "additional_responses": [
+        {
+          "status": 200,
+          "description": "An existing live execution was attached instead of a fresh one being started. Same fields as the 201.",
+          "free_form": true
+        }
+      ],
       "error_responses": [
         {
           "status": 400,
@@ -2217,6 +2251,13 @@
         },
         "note": "Status is 202 when outcome=\"redriven\" and 200 when outcome=\"not_failed\"; the field set is identical either way."
       },
+      "additional_responses": [
+        {
+          "status": 200,
+          "description": "outcome is not_failed: the delivery was not in a failed state, so nothing was redriven. Same fields as the 202.",
+          "free_form": true
+        }
+      ],
       "error_responses": [
         {
           "status": 404,
@@ -2835,6 +2876,13 @@
           }
         ]
       },
+      "additional_responses": [
+        {
+          "status": 200,
+          "description": "dry_run was true. The plan is returned and nothing is written; new_run_exec_id and events_carried_over are omitted.",
+          "free_form": true
+        }
+      ],
       "error_responses": [
         {
           "status": 400,
@@ -3850,6 +3898,55 @@
         ],
         "notes": "Polymorphic response. A real submit (dry_run false/omitted) returns 202 Accepted with {batch_job_id}. When dry_run is true, returns 200 with a read-only preview: {dry_run:true, action, filter (the normalized filter echoed back), matched_count, per_shard (array of {shard_id, matched_count} summing to matched_count), sample (array of up to sample_cap {execution_id, workflow_name, state} rows ordered by id ascending, global across all shards), sample_cap (100), sample_truncated (matched_count > sample.len()), status ('complete'|'partial'), unavailable_shards (array of {shard_id, reason}, omitted when empty)}. Partial-shard degradation (mirrors POST /workflows/batch_reset): when a shard is unreachable the preview returns 200 with status='partial' naming the unavailable shard instead of failing with a 500 — and matched_count is then a LOWER BOUND over reachable shards only. A dry_run is admin-only (this route is Mutating) and does NOT validate signal_name/payload — the real submit may still 400. An empty/criteria-less filter is rejected 400 with the same guard as a real submit."
       },
+      "additional_responses": [
+        {
+          "status": 200,
+          "description": "dry_run was true. No batch was submitted; the response is the plan envelope instead of { batch_job_id }.",
+          "fields": [
+            {
+              "name": "dry_run",
+              "type": "boolean",
+              "description": "Always true on this response."
+            },
+            {
+              "name": "action",
+              "type": "string",
+              "description": "The action the batch would apply."
+            },
+            {
+              "name": "filter",
+              "description": "The filter the plan was computed for."
+            },
+            {
+              "name": "matched_count",
+              "type": "integer",
+              "description": "How many executions the filter matched."
+            },
+            {
+              "name": "per_shard",
+              "description": "Matched counts per shard."
+            },
+            {
+              "name": "sample",
+              "description": "A sample of the matched executions."
+            },
+            {
+              "name": "sample_truncated",
+              "type": "boolean",
+              "description": "Whether the sample was cut short."
+            },
+            {
+              "name": "status",
+              "type": "string",
+              "description": "complete, partial, or unavailable."
+            },
+            {
+              "name": "unavailable_shards",
+              "description": "Shards that could not be reached."
+            }
+          ]
+        }
+      ],
       "error_responses": [
         {
           "status": 400,
@@ -6481,10 +6578,12 @@
       "idempotency": "Fully idempotent read-only operation; no state is written.",
       "params": [],
       "request_body": {
+        "required": true,
         "free_form": false,
         "fields": [
           {
             "name": "schedule_expr",
+          "required": true,
             "type": "string",
             "description": "Cron, interval, or manual expression (same format as POST /admin/schedules/workflow)."
           },
@@ -7478,10 +7577,7 @@
       "description": "List all active (non-lifted) admission gates. The response also carries a `producers` block enumerating every in-process workflow-start producer and whether it is `gated`, `gated_at_admission` (deferred-fire producers gated at HTTP admission whose scanner fire is exempt-with-bypass-counter), `gated_at_relay` (gated authoritatively at relay/fire time on the target/real queue: the cross-shard completion-trigger relay blocks + drops a matching gate, and — since issue #1053 — the throttle scanner blocks + re-defers a matching gate; else both count the bypass), or `exempt_by_design` (with a rationale), so the admission-gate contract is discoverable without reading source (issue #618).",
       "idempotency": "Read-only; always idempotent.",
       "params": [],
-      "request_body": {
-        "required": false,
-        "free_form": true
-      },
+      "request_body": null,
       "success_response": {
         "status": 200,
         "free_form": true
@@ -7607,10 +7703,7 @@
       "description": "List all scoped API tokens as metadata only (issue #942). The plaintext secret and its hash are never returned — only id, name, scope, created_at, expires_at, last_used_at, revoked_at.",
       "idempotency": "Read-only; always idempotent.",
       "params": [],
-      "request_body": {
-        "required": false,
-        "free_form": true
-      },
+      "request_body": null,
       "success_response": {
         "status": 200,
         "free_form": true
@@ -8269,6 +8362,12 @@
       ],
       "request_body": null,
       "success_response": {
+        "headers": [
+          {
+            "name": "X-Harvest-Execution-Id",
+            "description": "The execution id GET /workflows/by-id/{workflow_name}/{workflow_id} resolved to. Present on every by-id response, including bodiless ones."
+          }
+        ],
         "status": 200,
         "free_form": true,
         "note": "Same body as GET /workflows/{id}; resolved execution_id also in the X-Harvest-Execution-Id header."
@@ -8312,10 +8411,29 @@
       ],
       "request_body": null,
       "success_response": {
+        "headers": [
+          {
+            "name": "X-Harvest-Execution-Id",
+            "description": "The execution id GET /workflows/by-id/{workflow_name}/{workflow_id}/result resolved to. Present on every by-id response, including bodiless ones."
+          }
+        ],
         "status": 200,
         "free_form": true,
         "note": "Same body as GET /workflows/{id}/result (204 No Content with Retry-After when still running). Resolved execution_id in the X-Harvest-Execution-Id header on every response."
       },
+      "additional_responses": [
+        {
+          "status": 204,
+          "description": "The execution is still running after the wait window. The body is empty and Retry-After is 1; poll again.",
+          "headers": [
+            {
+              "name": "Retry-After",
+              "type": "integer",
+              "description": "Seconds to wait before polling again. Always 1."
+            }
+          ]
+        }
+      ],
       "error_responses": [
         {
           "status": 400,
@@ -8358,6 +8476,12 @@
       ],
       "request_body": null,
       "success_response": {
+        "headers": [
+          {
+            "name": "X-Harvest-Execution-Id",
+            "description": "The execution id GET /workflows/by-id/{workflow_name}/{workflow_id}/stack resolved to. Present on every by-id response, including bodiless ones."
+          }
+        ],
         "status": 200,
         "free_form": true,
         "note": "Same body as GET /workflows/{id}/stack; resolved execution_id in the X-Harvest-Execution-Id header."
@@ -8426,6 +8550,12 @@
       ],
       "request_body": null,
       "success_response": {
+        "headers": [
+          {
+            "name": "X-Harvest-Execution-Id",
+            "description": "The execution id GET /workflows/by-id/{workflow_name}/{workflow_id}/children resolved to. Present on every by-id response, including bodiless ones."
+          }
+        ],
         "status": 200,
         "free_form": true,
         "note": "Same body as GET /workflows/{id}/children ({items, next_cursor}); resolved execution_id in the X-Harvest-Execution-Id header."
@@ -8492,6 +8622,12 @@
         "fields": []
       },
       "success_response": {
+        "headers": [
+          {
+            "name": "X-Harvest-Execution-Id",
+            "description": "The execution id POST /workflows/by-id/{workflow_name}/{workflow_id}/signal/{signal_name} resolved to. Present on every by-id response, including bodiless ones."
+          }
+        ],
         "status": 202,
         "fields": [
           "execution_id",
@@ -8540,6 +8676,12 @@
       ],
       "request_body": null,
       "success_response": {
+        "headers": [
+          {
+            "name": "X-Harvest-Execution-Id",
+            "description": "The execution id GET /workflows/by-id/{workflow_name}/{workflow_id}/query/{query_name} resolved to. Present on every by-id response, including bodiless ones."
+          }
+        ],
         "status": 200,
         "fields": [
           "execution_id",
@@ -8605,6 +8747,12 @@
         ]
       },
       "success_response": {
+        "headers": [
+          {
+            "name": "X-Harvest-Execution-Id",
+            "description": "The execution id POST /workflows/by-id/{workflow_name}/{workflow_id}/query/{query_name} resolved to. Present on every by-id response, including bodiless ones."
+          }
+        ],
         "status": 200,
         "fields": [
           "execution_id",
@@ -8667,6 +8815,12 @@
         ]
       },
       "success_response": {
+        "headers": [
+          {
+            "name": "X-Harvest-Execution-Id",
+            "description": "The execution id POST /workflows/by-id/{workflow_name}/{workflow_id}/cancel resolved to. Present on every by-id response, including bodiless ones."
+          }
+        ],
         "status": 202,
         "fields": [
           "ok",
@@ -8729,6 +8883,12 @@
         ]
       },
       "success_response": {
+        "headers": [
+          {
+            "name": "X-Harvest-Execution-Id",
+            "description": "The execution id POST /workflows/by-id/{workflow_name}/{workflow_id}/pause resolved to. Present on every by-id response, including bodiless ones."
+          }
+        ],
         "status": 200,
         "fields": [
           "ok",
@@ -8790,6 +8950,12 @@
         "fields": []
       },
       "success_response": {
+        "headers": [
+          {
+            "name": "X-Harvest-Execution-Id",
+            "description": "The execution id POST /workflows/by-id/{workflow_name}/{workflow_id}/resume resolved to. Present on every by-id response, including bodiless ones."
+          }
+        ],
         "status": 200,
         "fields": [
           "ok",

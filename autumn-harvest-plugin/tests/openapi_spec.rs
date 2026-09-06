@@ -11,8 +11,8 @@
 //! without appearing in the published spec.
 //!
 //! No database is required. The document is a pure transform of the contract,
-//! and the served endpoint reads no state, so the router runs against
-//! `AppState::for_test()` through `tower`, mirroring `effective_config_http_tests`.
+//! and the served endpoint reads no state. The router therefore runs against
+//! `AppState::for_test()` through `tower`, as `effective_config_http_tests` does.
 
 use std::collections::{BTreeSet, HashMap, HashSet};
 
@@ -25,9 +25,9 @@ use autumn_web::reexports::http::{Method, Request, StatusCode};
 use serde_json::Value;
 use tower::ServiceExt;
 
-/// The checked-in artifact, resolved from this crate rather than the caller
-/// working directory.
-const OPENAPI_ARTIFACT_PATH: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../docs/openapi.json");
+/// The pretty-printed copy, resolved from this crate rather than the caller
+/// working directory. The compact copy is compiled into the crate.
+const PRETTY_ARTIFACT_PATH: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../docs/openapi.json");
 
 /// The contract the document is derived from, read for cross-checks.
 const API_CONTRACT_JSON: &str = include_str!("../../docs/api-contract.json");
@@ -249,6 +249,19 @@ fn read_only_classification_is_published() {
             )
         })
         .collect();
+    let class_name: HashMap<&str, &str> = CLASSIFIED_ROUTES
+        .iter()
+        .map(|(template, class)| {
+            (
+                *template,
+                match class {
+                    RouteClass::PublicSafe => "public_safe",
+                    RouteClass::ReadOnly => "read_only",
+                    RouteClass::Mutating => "mutating",
+                },
+            )
+        })
+        .collect();
 
     let doc = document();
     let mut mismatches = Vec::new();
@@ -269,11 +282,65 @@ fn read_only_classification_is_published() {
                     "{key}: document read-only={read_only}, CLASSIFIED_ROUTES read={is_read}"
                 ));
             }
+            let published_class = operation["x-harvest-route-class"].as_str().unwrap_or("");
+            let expected = class_name.get(key.as_str()).copied().unwrap_or("unknown");
+            if published_class != expected {
+                mismatches.push(format!(
+                    "{key}: document class={published_class}, CLASSIFIED_ROUTES class={expected}"
+                ));
+            }
+            // A PublicSafe route needs no credential, and only an
+            // operation-level empty list can say that (issue #174).
+            let waives_auth = operation["security"].as_array().is_some_and(Vec::is_empty);
+            if (expected == "public_safe") != waives_auth {
+                mismatches.push(format!(
+                    "{key}: class={expected} but security waiver={waives_auth}"
+                ));
+            }
         }
     }
     assert!(
         mismatches.is_empty(),
         "x-harvest-read-only must match autumn_harvest::audit::CLASSIFIED_ROUTES:\n{mismatches:#?}"
+    );
+}
+
+/// A documented response header reaches the document, so a generated client
+/// can read it (issue #694 review). The by-id family resolves a business id,
+/// and returns that resolution in `X-Harvest-Execution-Id`.
+#[test]
+fn documented_response_headers_are_published() {
+    let doc = document();
+    let by_id = &doc["paths"]["/workflows/by-id/{workflow_name}/{workflow_id}"]["get"];
+    assert_eq!(
+        by_id["responses"]["200"]["headers"]["X-Harvest-Execution-Id"]["schema"]["type"], "string",
+        "the resolved execution id must be readable from the response"
+    );
+
+    let result = &doc["paths"]["/workflows/{id}/result"]["get"];
+    assert!(
+        result["responses"]["204"].is_object(),
+        "the 204 a still-running execution returns must be declared"
+    );
+    assert_eq!(
+        result["responses"]["204"]["headers"]["Retry-After"]["schema"]["type"],
+        "integer"
+    );
+    assert!(
+        result["responses"]["204"]["content"].is_null(),
+        "a 204 carries no body"
+    );
+}
+
+/// A streaming route says so, and does not pretend to return JSON.
+#[test]
+fn streaming_operations_are_marked() {
+    let doc = document();
+    let stream = &doc["paths"]["/workflows/{id}/stream"]["get"];
+    assert_eq!(stream["x-harvest-stream"], Value::Bool(true));
+    assert_eq!(
+        stream["responses"]["200"]["content"]["text/event-stream"]["schema"]["type"],
+        "string"
     );
 }
 
@@ -371,27 +438,43 @@ fn collect_unresolved_refs(
     }
 }
 
-/// AC7: the checked-in artifact is the serialization of the served document.
+/// AC7: both checked-in copies are the transform's output, and nothing else.
+///
+/// `autumn-harvest-plugin/openapi.json` is compiled in and served verbatim;
+/// `docs/openapi.json` is the same document, pretty-printed for review. The
+/// transform runs here against the contract, so a stale copy fails the build.
 #[test]
-fn checked_in_artifact_matches_the_generated_document() {
-    let artifact = std::fs::read_to_string(OPENAPI_ARTIFACT_PATH)
-        .unwrap_or_else(|error| panic!("docs/openapi.json must exist and be readable: {error}"));
-    let parsed: Value = serde_json::from_str(&artifact)
-        .unwrap_or_else(|error| panic!("docs/openapi.json must be valid JSON: {error}"));
+fn checked_in_artifacts_match_the_generated_document() {
+    let contract: Value = serde_json::from_str(API_CONTRACT_JSON).expect("contract must parse");
+    let generated = autumn_harvest_plugin::openapi::document_from_contract(&contract)
+        .expect("the contract must transform into OpenAPI 3.1");
+
+    let served = openapi_json();
+    let compiled_in: Value = serde_json::from_str(served).expect("the crate copy must be JSON");
     assert_eq!(
-        &parsed,
-        document(),
-        "docs/openapi.json is stale. Regenerate it with:\n  \
-         cargo run -p autumn-harvest-plugin --example emit_openapi > docs/openapi.json"
+        compiled_in, generated,
+        "autumn-harvest-plugin/openapi.json is stale. Regenerate both copies with:\n  \
+         scripts/regenerate-openapi.sh"
+    );
+    assert_eq!(
+        served,
+        format!(
+            "{}\n",
+            serde_json::to_string(&generated).expect("must serialize")
+        ),
+        "the crate copy must be the compact document with a trailing newline"
     );
 
-    let expected = format!(
-        "{}\n",
-        serde_json::to_string_pretty(document()).expect("document must serialize")
-    );
+    let pretty = std::fs::read_to_string(PRETTY_ARTIFACT_PATH)
+        .unwrap_or_else(|error| panic!("docs/openapi.json must be readable: {error}"));
     assert_eq!(
-        artifact, expected,
-        "docs/openapi.json must be the pretty-printed document with a trailing newline"
+        pretty,
+        format!(
+            "{}\n",
+            serde_json::to_string_pretty(&generated).expect("must serialize")
+        ),
+        "docs/openapi.json is stale. Regenerate both copies with:\n  \
+         scripts/regenerate-openapi.sh"
     );
 }
 
@@ -424,6 +507,6 @@ async fn served_endpoint_returns_the_document() {
     assert_eq!(
         String::from_utf8(body.to_vec()).unwrap(),
         openapi_json(),
-        "the endpoint serves the cached serialization"
+        "the endpoint serves the compiled-in bytes, unchanged"
     );
 }

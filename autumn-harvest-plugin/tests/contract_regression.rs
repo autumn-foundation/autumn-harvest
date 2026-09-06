@@ -1362,8 +1362,8 @@ fn contract_params_declare_location_and_required() {
     );
 }
 
-/// Every `{placeholder}` in a path must be a declared path parameter, and no
-/// path parameter may name a segment the path does not carry (issue #694).
+/// Every `{placeholder}` in a path must be a declared path parameter
+/// (issue #694). No path parameter may name a segment the path omits.
 ///
 /// A generated client builds its URL from the declared path parameters. An
 /// undeclared placeholder therefore produces a client that cannot address the
