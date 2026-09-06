@@ -3739,3 +3739,23 @@ punctuation. An owner and a repository begin with an alphanumeric.
 
 Corpus effect: none, at 19311. Four fixtures. The new guard is also
 faster than the old one on a prose tail, 0.02 ms against 0.3 ms.
+
+Round 124 -- a follow-set is not a validation.
+
+`// #[Retry = 3 + attempts remaining]` failed the build. Round one hundred
+and twenty-one gave the attribute's FIRST atom a follow-set from rustc and
+left `.*` to take everything after it, so the `+` satisfied the set and
+the prose rode in behind it. Checking where a value STARTS is not the same
+as checking what it is.
+
+The attribute now carries the same two-atoms test the assignment does,
+anchored on the `]` that ends it rather than the `;`. It guards the whole
+alternative, so the delimiter branch is covered as well -- `// #[Note (see
+below) and more]` reports nothing either, and that form was not reported.
+
+`// Foo::<u8>::bar();` produced no CH001. A turbofish was allowed once and
+only at the end of a path, and this one sits BETWEEN segments: the type is
+instantiated and then an associated function is named. rustc accepts it.
+
+Corpus effect: none, at 19311. Four fixtures, two of them refusals. Both
+new scans are linear, measured at 2000, 4000 and 8000.

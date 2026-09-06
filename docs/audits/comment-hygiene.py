@@ -231,6 +231,16 @@ _APOS = r"[\u2019']"
 # not a macro name, a path segment or a struct literal.
 LITF = r"(?=[.?+*/%&|^<>=,-]|\])"
 
+# The same two-atoms test as PROSE, for a value that ends at a `]` rather
+# than a `;`. Round one hundred and twenty-one gave the attribute's FIRST
+# atom a follow-set and left `.*` to take the rest, so
+# `\#[Retry = 3 + attempts remaining]` passed: the `+` satisfied the
+# follow-set and the prose rode in behind it.
+#
+# It guards the whole alternative, so the delimiter branch is covered too
+# and not only the `=` one.
+PROSEB = r"(?!.*[^\s\-+*/%&|^<>=!,(\[{:.?](?<!\bas)\s+\w+\s*\]\s*$)"
+
 # The BINDING MODE in front of an identifier. rustc 1.94.1 takes
 # `let ref stale = ...;` and `let ref mut stale = ...;`, and it takes `ref`
 # on an uninitialized binding too -- `let ref x: String;` -- which is the
@@ -589,7 +599,7 @@ COMMENTED_CODE_RE = re.compile(
       # found `section`". So a literal opens a value outright, and a path
       # opens one only when what follows is from that set. Two bare words
       # in a row are prose in brackets.
-      | \#!?\[\s*{ROOT}(?:r\#)?\w+(?:\s*::\s*(?:r\#)?\w+)*\s*
+      | \#!?\[{PROSEB}\s*{ROOT}(?:r\#)?\w+(?:\s*::\s*(?:r\#)?\w+)*\s*
             (?:
                 [(\[{].*
               | =\s*(?:
@@ -771,13 +781,17 @@ COMMENTED_CODE_RE = re.compile(
       # the restatement: this is the shape of guard that does not transfer.
       | (?:return|break)\b(?:\s+[^\s;{}]+)?\s*;\s*$
       | continue\b(?:\s+'\w+)?\s*;\s*$
-      | [\w:\#]+(?:::<{NOSP}*>)?(?:\.[\w:\#]+(?:::<{NOSP}*>)?)*
+      # A turbofish may sit BETWEEN segments, not only before the call:
+      # `Foo::<u8>::bar()` instantiates the type and then names an
+      # associated function. The old shape allowed one turbofish and only
+      # at the end of the path, so the whole form was outside the gate.
+      | [\w\#]+(?:::[\w\#]+|::<{NOSP}*>)*(?:\.[\w\#]+(?:::<{NOSP}*>)?)*
             \(.*\)(?:\s*\?|\s*\.await\s*\??)*\s*;\s*$
     )""".replace("{VIS}", VISIBILITY).replace("{WHERE}", WHERE).replace(
         "{BODY}", BODY
     ).replace("{GEN}", GENERICS).replace("{ROOT}", ROOT).replace(
         "{DECL_TYPE}", DECL_TYPE
-    ).replace("{PROSE}", PROSE).replace("{BIND}", BIND).replace("{LITF}", LITF).replace("{NOS}", NO_SEMI).replace("{NOSB}", NO_SEMI_BRACE).replace(
+    ).replace("{PROSE}", PROSE).replace("{PROSEB}", PROSEB).replace("{BIND}", BIND).replace("{LITF}", LITF).replace("{NOS}", NO_SEMI).replace("{NOSB}", NO_SEMI_BRACE).replace(
         "{NOSE}", NO_SEMI_EQ
     ).replace("{NOSP}", NO_SEMI_PAREN).replace(
         "{ABI_FN}", abi("abifn")
@@ -6190,6 +6204,26 @@ RULE_TESTS = [
         "// TODO: fix -owner/repo#1\n",
         {("CH002", 1)},
         "on the owner side as well",
+    ),
+    (
+        "// #[Retry = 3 + attempts remaining]\n",
+        set(),
+        "an operator satisfies the first atom, not the whole value",
+    ),
+    (
+        "// #[Note (see below) and more]\n",
+        set(),
+        "and the delimiter branch is guarded too",
+    ),
+    (
+        "// Foo::<u8>::bar();\n",
+        {("CH001", 1)},
+        "a turbofish may sit between path segments",
+    ),
+    (
+        "// self.foo::<u8>();\n",
+        {("CH001", 1)},
+        "as well as after a method segment",
     ),
     (
         '// #[doc = include_str!("../README.md")]\n',
