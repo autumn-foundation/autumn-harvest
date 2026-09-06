@@ -396,6 +396,33 @@ COMMENTED_CODE_RE = re.compile(
       # one item form round ninety-three did not reach. rustc 1.94.1
       # accepts it and warns that the clause is not enforced, which is a
       # lint about meaning rather than a syntax error.
+      # An associated type DECLARED rather than defined. rustc 1.94.1 takes
+      # `type Item;`, `type Item<X>;`, `type Item where Self: Sized;` and
+      # `type Iter: Iterator<Item = Self::Item>;` in a trait; the alias rule
+      # below needs an `=` and could reach none of them.
+      #
+      # No visibility, and that is the compiler's answer rather than a
+      # guess: `pub type Item;` is E0449, "visibility qualifiers are not
+      # permitted here". Admitting one would accept what Rust refuses.
+      #
+      # A bound is a TRAIT, so `type Item: [u8; 32];` is "expected a trait,
+      # found type" -- but a bound may HOLD an array, as `Into<[u8; 32]>`
+      # does, so the run carries the same array guard the generic list and
+      # the where clause carry.
+      #
+      # The bound also takes the three-bare-words lookahead, because with no
+      # `=` in the line a colon is all that separates `type Item: Clone;`
+      # from "type Item: the reader may skip this;".
+      | type\s+(?:r\#)?\w+\s*(?:{GEN})?\s*
+            # ONE colon. The adversarial prose sweep found the second:
+            # "type a::b is re-exported for callers;" put a `:` where a
+            # bound's colon goes, and the word lookahead below could not
+            # see past it. A bound is introduced by a single colon, and a
+            # path separator is two. `type I: ::std::fmt::Debug;` still
+            # reports, because its bound colon is followed by a space.
+            (?::(?!:)(?!\s*(?:\w+\s+){2,}\w+\s*;\s*$)
+                (?:[^;{]|;(?=[^;]*\]))+)?
+            \s*{WHERE};\s*$
       | {VIS}type\s+(?:r\#)?\w+\s*(?:{GEN})?\s*{WHERE}=
             (?!\s*(?:\w+\s+){2,}\w+\s*;\s*$).*;\s*$
       # The header of an impl -- a trait reference, a type, and a `where`
@@ -5562,6 +5589,51 @@ RULE_TESTS = [
         "// static analysis: the queue drains before the worker parks;\n",
         set(),
         "so three bare words are prose there too",
+    ),
+    (
+        "// type Item;\n",
+        {("CH001", 1)},
+        "an associated type may be declared with no definition",
+    ),
+    (
+        "// type Iter: Iterator<Item = Self::Item>;\n",
+        {("CH001", 1)},
+        "with a bound that holds an equals sign of its own",
+    ),
+    (
+        "// type I: Into<[u8; 32]>;\n",
+        {("CH001", 1)},
+        "and one that holds an array, which ends no declaration",
+    ),
+    (
+        "// type Item where Self: Sized;\n",
+        {("CH001", 1)},
+        "and a where clause with no bound at all",
+    ),
+    (
+        "// pub type Item;\n",
+        set(),
+        "but E0449 refuses a visibility there, so this rule does too",
+    ),
+    (
+        "// type Item: the reader may skip this;\n",
+        set(),
+        "and three bare words after the colon are a sentence",
+    ),
+    (
+        "// type erasure is documented above;\n",
+        set(),
+        "as is a sentence that merely opens with the keyword",
+    ),
+    (
+        "// type a::b is re-exported for callers;\n",
+        set(),
+        "and a path separator is not a bound, which the prose sweep found",
+    ),
+    (
+        "// type I: ::std::fmt::Debug;\n",
+        {("CH001", 1)},
+        "though a bound may still start at the crate root",
     ),
     (
         '// #[doc = include_str!("../README.md")]\n',

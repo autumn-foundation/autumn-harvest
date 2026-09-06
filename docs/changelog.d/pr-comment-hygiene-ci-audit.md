@@ -3427,3 +3427,28 @@ true of `// if x > 1 {}` and is one gap for all six keywords, not a new
 one.
 
 Corpus effect: none. Eight fixtures, four of them refusals.
+
+Round 113 -- an associated type declared rather than defined.
+
+`// type Item;` and `// type Iter: Iterator<Item = Self::Item>;` produced
+no CH001. The alias rule needs an `=`, and a trait's associated type has
+none.
+
+Three things the compiler settled. `pub type Item;` is E0449, "visibility
+qualifiers are not permitted here", so this alternative carries no
+visibility -- admitting one accepts what Rust refuses. A bound is a
+trait, so `type Item: [u8; 32];` is "expected a trait, found type", but a
+bound may HOLD an array as `Into<[u8; 32]>` does, so the run keeps the
+array guard. And `type Item where Self: Sized;` is a where clause with no
+bound at all.
+
+The adversarial prose sweep earned its place. The first version matched
+"type a::b is re-exported for callers;" -- the `::` puts a non-word
+character exactly where a bound's colon goes, and the three-bare-words
+lookahead could not see past it. The same sentence defeated the
+uninitialized binding in round forty-one, in the same way. A bound is
+introduced by ONE colon; a path separator is two, and the rule says so.
+`type I: ::std::fmt::Debug;` still reports, because its bound colon is
+followed by a space.
+
+Corpus effect: none. Nine fixtures, four of them refusals.
