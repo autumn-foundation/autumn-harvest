@@ -3633,3 +3633,125 @@ async fn quota_blocked_outbox_backs_off_rows_targeting_an_unconfigured_shard() {
          newer row on a healthy shard indefinitely"
     );
 }
+
+/// Issue #1227 Finding 4, Codex round-5 P2 (PR #1386): the round-4 backoff
+/// stamp for a row this scan could not even attempt (missing target-shard
+/// pool, connection-acquisition failure) used a plain `UPDATE ... WHERE id =
+/// $1`. The batch `SELECT` that loads a scan's candidate rows takes no lock
+/// (round-1 P2's own rationale), so the SAME row can simultaneously be the
+/// one a PEER replica's `relay_gate_checked_start` is holding under `FOR
+/// UPDATE SKIP LOCKED` for the entire relay (issue #618 F-round19) -- a
+/// bounded operation, but one that spans a cross-shard target start and so
+/// is not instantaneous. A plain `UPDATE` has no "skip" option: it simply
+/// blocks until the peer's claim transaction commits or rolls back, stalling
+/// this replica's ENTIRE scan (and every scanner duty behind it) on someone
+/// else's in-flight relay -- defeating the exact non-blocking guarantee
+/// `SKIP LOCKED` exists to provide.
+///
+/// This reproduces the row-lock contention directly (rather than trying to
+/// land a real peer inside `relay_gate_checked_start` mid-relay, which needs
+/// its own cross-shard target start to be paused at a precise instant): a
+/// second connection takes the identical `FOR UPDATE` lock
+/// `relay_gate_checked_start` would hold, and a scan that must back the same
+/// row off (via the missing-pool branch) runs concurrently under a timeout.
+/// Pre-fix, the plain `UPDATE` blocks on that lock and the scan never
+/// returns within the timeout; fixed, the `SKIP LOCKED` stamp is skipped
+/// (0 rows affected) and the scan returns immediately, leaving the row's
+/// `next_attempt_at` exactly as the lock holder will decide it, not
+/// clobbered by a stale reader waiting behind it.
+#[tokio::test]
+async fn quota_blocked_outbox_relay_backoff_stamp_skips_a_concurrently_claimed_row() {
+    let (url, _c) = setup_test_database_url_or_env().await;
+    let mut conn = connect(&url).await;
+    let mut locker_conn = connect(&url).await;
+
+    install_global_router(ShardRouter::single());
+    // No pool configured for shard 1 -- the row targets it, so the scan hits
+    // the missing-pool `continue` branch that calls the backoff stamp.
+    let sharded_pool = Some(ShardedDbPool::single(build_test_pool(&url)));
+
+    const UNREACHABLE_SHARD: i32 = 1;
+    let unreachable_wf = leaked("outbox_backoff_lock_contention");
+    let id = diesel::insert_into(harvest_completion_trigger_outbox::table)
+        .values(&NewCompletionTriggerOutboxDb {
+            source_exec_id: Uuid::new_v4(),
+            trigger_id: Uuid::new_v4(),
+            target_shard: UNREACHABLE_SHARD,
+            target_workflow_name: unreachable_wf.to_string(),
+            target_workflow_id: format!("target-{}", Uuid::new_v4().simple()),
+            target_input: serde_json::json!({}),
+            queue_name: None,
+            concurrency_key: None,
+            concurrency_limit: None,
+            priority: serde_json::to_value(Priority::default()).unwrap(),
+            max_workflow_input_bytes: 1_000_000,
+        })
+        .get_result::<CompletionTriggerOutboxDb>(&mut conn)
+        .await
+        .expect("insert outbox row")
+        .id;
+
+    let shards = [ShardId::new(UNREACHABLE_SHARD)];
+
+    // Hold the same row-level lock `relay_gate_checked_start` would hold for
+    // an entire in-flight relay, simulating a peer replica mid-relay on this
+    // row when this scan reaches its missing-pool branch.
+    diesel::sql_query("BEGIN")
+        .execute(&mut locker_conn)
+        .await
+        .expect("begin locker transaction");
+    #[derive(diesel::QueryableByName)]
+    struct LockedId {
+        #[diesel(sql_type = diesel::sql_types::Uuid)]
+        #[allow(dead_code)]
+        id: Uuid,
+    }
+    diesel::sql_query("SELECT id FROM harvest_completion_trigger_outbox WHERE id = $1 FOR UPDATE")
+        .bind::<diesel::sql_types::Uuid, _>(id)
+        .get_result::<LockedId>(&mut locker_conn)
+        .await
+        .expect("locker holds the row");
+
+    let scan = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        enforce_completion_triggers_outbox(&mut conn, &NoOpMetrics, &sharded_pool, &shards),
+    )
+    .await;
+
+    // Release the lock before asserting -- a failing assertion must not leave
+    // the locker's transaction open across the rest of the test binary.
+    diesel::sql_query("ROLLBACK")
+        .execute(&mut locker_conn)
+        .await
+        .expect("rollback locker transaction");
+
+    scan.expect(
+        "the scan must not block waiting on a row a peer replica's relay \
+         holds under FOR UPDATE -- a plain (non-SKIP-LOCKED) backoff stamp \
+         would stall this entire scan, and every scanner duty behind it, on \
+         someone else's in-flight relay (issue #1227 Finding 4, Codex \
+         round-5 P2)",
+    )
+    .expect("outbox scan");
+
+    assert_eq!(
+        outbox_next_attempt_at(&mut conn, id).await,
+        None,
+        "the scan's SKIP LOCKED stamp must be skipped while a peer holds the \
+         row's lock, not silently overwrite whatever next_attempt_at the \
+         lock holder is about to decide"
+    );
+
+    // With the lock released, a fresh scan can now claim and back the row
+    // off normally.
+    enforce_completion_triggers_outbox(&mut conn, &NoOpMetrics, &sharded_pool, &shards)
+        .await
+        .expect("outbox scan after lock release");
+    assert!(
+        outbox_next_attempt_at(&mut conn, id)
+            .await
+            .is_some_and(|t| t > chrono::Utc::now()),
+        "once the lock is released, the row must still receive its backoff \
+         stamp normally"
+    );
+}

@@ -107,6 +107,23 @@ mirroring `QUOTA_REDEFER_BACKOFF`) called at all three sites so every
 non-success outcome — quota-blocked or not — leaves the row with a future
 `next_attempt_at` and a chance for other rows to be claimed in between.
 
+**Round-4's stamp had its own lock-contention gap, Codex round-5 P2.** The
+new `stamp_outbox_relay_backoff` used a plain `UPDATE ... WHERE id = $1`. The
+batch `SELECT` that loads a scan's candidate rows takes no lock (round-1
+P2's own rationale), so the same row it names can simultaneously be one a
+PEER replica's `relay_gate_checked_start` is holding under `FOR UPDATE SKIP
+LOCKED` for the entire relay (issue #618 F-round19) — bounded, but not
+instantaneous, since it spans a cross-shard target start. A plain `UPDATE`
+has no "skip" option: it blocks until the peer's claim transaction commits
+or rolls back, stalling this replica's ENTIRE scan — and every scanner duty
+behind it — on someone else's in-flight relay, defeating the very
+non-blocking guarantee `SKIP LOCKED` exists to provide. Fixed by wrapping
+the same claim pattern already used elsewhere in this file: `UPDATE ...
+WHERE id IN (SELECT id FROM ... WHERE id = $1 FOR UPDATE SKIP LOCKED)`, so a
+row a peer is actively relaying is simply skipped (0 rows affected) rather
+than waited on — the peer owns that row's outcome and will leave it
+consistent itself.
+
 **Tests, red → green → refactor.** Confirmed each fix's test fails without it
 (production code reverted, rebuilt, test observed to fail) and passes with it
 restored:
@@ -154,6 +171,15 @@ restored:
   healthy row on a different shard sorted to lose the first `LIMIT 50` batch,
   proves the unreachable-shard rows get a future `next_attempt_at` after the
   first scan (rather than staying `NULL` forever) and that the healthy row is
-  delivered on the very next scan once they stop dominating every batch.
+  delivered on the very next scan once they stop dominating every batch —
+  and `quota_blocked_outbox_relay_backoff_stamp_skips_a_concurrently_claimed_row`
+  (round-5 P2) — a second connection takes the identical `FOR UPDATE` lock
+  `relay_gate_checked_start` would hold on a row, and a scan that must back
+  that same row off (via the missing-pool branch) runs concurrently under a
+  5s timeout: pre-fix the plain `UPDATE` blocks on the lock and the scan
+  never returns within the timeout (confirmed by reverting the fix and
+  observing the exact `Elapsed` panic); fixed, the `SKIP LOCKED` stamp is
+  skipped immediately, the scan returns, and `next_attempt_at` is left
+  untouched for the lock holder to decide.
 
 No `WorkflowEvent` variant, no data migration, no replay impact.

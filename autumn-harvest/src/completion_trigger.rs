@@ -2041,20 +2041,39 @@ const OUTBOX_RELAY_FAILURE_BACKOFF: chrono::Duration = chrono::Duration::seconds
 /// propagated -- it must never fail the whole scanner tick over a
 /// diagnostics-only write, and the row is simply retried sooner than
 /// intended rather than lost.
+///
+/// Claims the row `FOR UPDATE SKIP LOCKED` before writing (Codex round-5 P2
+/// on PR #1386): the caller's batch `SELECT` above takes no lock, so this
+/// row can also be the one [`relay_gate_checked_start`] is holding under ITS
+/// own claim for the entire relay -- a peer replica reached the same row via
+/// a missing-pool or connection-acquisition failure and calls this function
+/// concurrently. A plain `UPDATE ... WHERE id = $1` has no "skip" option and
+/// would simply block until the relay's claim transaction commits or rolls
+/// back, stalling this replica's whole scan (and every later scanner duty
+/// behind it) on a possibly-slow cross-shard relay -- defeating the very
+/// non-blocking design `SKIP LOCKED` exists for. Losing the race (row
+/// already claimed elsewhere) is not an error: the relay owns the row's
+/// outcome right now and will leave it in a consistent state itself.
 #[cfg(feature = "db")]
 async fn stamp_outbox_relay_backoff(conn: &mut diesel_async::AsyncPgConnection, task_id: Uuid) {
-    use crate::schema::harvest_completion_trigger_outbox::dsl as outbox_dsl;
-    use diesel::prelude::*;
     use diesel_async::RunQueryDsl;
 
     let next_attempt_at = chrono::Utc::now() + OUTBOX_RELAY_FAILURE_BACKOFF;
-    if let Err(e) = diesel::update(
-        outbox_dsl::harvest_completion_trigger_outbox.filter(outbox_dsl::id.eq(task_id)),
+    let result = diesel::sql_query(
+        "UPDATE harvest_completion_trigger_outbox \
+         SET next_attempt_at = $2 \
+         WHERE id IN ( \
+             SELECT id FROM harvest_completion_trigger_outbox \
+             WHERE id = $1 \
+             FOR UPDATE SKIP LOCKED \
+         )",
     )
-    .set(outbox_dsl::next_attempt_at.eq(Some(next_attempt_at)))
+    .bind::<diesel::sql_types::Uuid, _>(task_id)
+    .bind::<diesel::sql_types::Timestamptz, _>(next_attempt_at)
     .execute(conn)
-    .await
-    {
+    .await;
+
+    if let Err(e) = result {
         tracing::warn!(
             outbox_id = %task_id,
             error = %e,
