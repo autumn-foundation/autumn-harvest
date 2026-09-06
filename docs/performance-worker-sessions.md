@@ -12,7 +12,7 @@ The result is **not** the same as `schedule_to_close`'s: this predicate has a
 real, moderate-to-large buffer cost -- **+40.9%** at the 10,000-row headline
 depth on a single first claim against a cache-warm table, corroborated by a
 real 10,001-call
-production-shaped drain at **+24.9%** (same direction, same order of
+production-shaped drain at **+29.0%** (same direction, same order of
 magnitude -- see [Measurement](#measurement)). The mechanism is the same one
 `docs/performance-capability-labels.md` documents: row-width growth from
 populating previously-`NULL` columns, compounded by the MVCC cost of
@@ -193,12 +193,23 @@ headline scenario at each data state and snapshots `pg_stat_statements`
 afterward (artifacts:
 `docs/perf-artifacts/worker-session-claim-predicate/{no-session,worker-session}-pg_stat_statements.txt`):
 
-| state | calls | `shared_blks_hit` | avg per call |
-|---|---:|---:|---:|
-| no-session | 10,001 | 4,963,521 | 496.30 |
-| worker-session | 10,001 | 6,201,178 | 620.06 |
+`queue::claim_task()` is not only the main `claim_task_query()` statement.
+Every successful claim also runs the authoritative queue-pause recheck
+(`queue_pause::release_claim_if_queue_paused`), and, for an activity task,
+the authoritative activity-pause recheck
+(`activity_pause::release_claim_if_activity_paused`) too -- both separate
+statements, each taking its own fresh snapshot (`queue.rs:1150-1193`). A
+review finding (round 19) correctly caught that an earlier revision of this
+table counted only the main statement, undercounting the real per-call cost.
+Both rechecks run on every claim in this fixture (every seeded row is an
+activity task), so the real aggregate includes all three:
 
-Aggregate delta: **+24.9%** -- the same direction and the same order of
+| state | calls | main query hit | queue-pause recheck hit | activity-pause recheck hit | total hit | avg per call |
+|---|---:|---:|---:|---:|---:|---:|
+| no-session | 10,001 | 4,963,521 | 82,662 | 82,660 | 5,128,843 | 512.83 |
+| worker-session | 10,001 | 6,201,178 | 206,541 | 206,541 | 6,614,260 | 661.36 |
+
+Aggregate delta: **+29.0%** -- the same direction and the same order of
 magnitude as the single-first-claim finding (+40.9%), the "corroborated by a
 buffer/row-count change in the same direction" bar this persona's rules set.
 Unlike the round-1-fix-only capture (which showed a 17x divergence between
@@ -274,7 +285,7 @@ completes, each of those `UPDATE`s too. This is exactly the mechanism
 different predicate.
 
 This page's [aggregate drain figure](#corroboration-pg_stat_statements-over-the-real-claim-drain)
-(+24.9%) already **includes** one instance of that recurring cost: each of
+(+29.0%) already **includes** one instance of that recurring cost: each of
 the 10,001 real `queue::claim_task()` calls it drove performs its own
 claiming `UPDATE` as part of the single `claim_task_query()` statement, so
 the wider row's rewrite cost at claim time is folded into that number,
