@@ -213,10 +213,25 @@ lifecycle (artifacts: same `pg_stat_statements.txt` files referenced above):
 
 Delta: **+185.5%** to write the identical row count through the real
 two-statement, per-row-committed lifecycle. This is the largest percentage on
-this page, and the mechanism is direct: `worker-session` issues twice as many
-statements per row (an `INSERT` plus an `UPDATE`, each its own round trip and
-its own WAL record) as `no-session`'s single `INSERT`, and the `UPDATE`
-itself creates a second MVCC tuple version for every row.
+this page. Three mechanisms compose it, and this pass does not attribute the
+delta across them individually.
+
+First, `worker-session` issues twice as many statements per row: an
+`INSERT` plus an `UPDATE`. Each is its own round trip and its own WAL
+record, against `no-session`'s single `INSERT`.
+
+Second, the `UPDATE` itself creates a second MVCC tuple version for every
+row.
+
+Third, that same `UPDATE` sets `sticky_worker_id`, so it adds an entry to
+the partial index `idx_harvest_tq_sticky_poll` (`WHERE state = 'PENDING'
+AND sticky_worker_id IS NOT NULL`). The `no-session` control never performs
+that insert, because its `sticky_worker_id` stays `NULL`. The preceding
+`INSERT` carries a smaller instance of the same mechanism: setting
+`session_id` at insert time enters the row into
+`harvest_task_queue_session_id_pending` (`WHERE state = 'PENDING' AND
+session_id IS NOT NULL`), a second partial index the `no-session` control
+also never touches.
 
 **Correction (review round 6):** an earlier revision of this section called
 this a "one-time cost... unlike capability-labels' finding of write cost
@@ -248,11 +263,14 @@ completion, not just one claim), is additional work this pass did not do.
 
 ## Why no fix is proposed
 
-The measured cost is heap-page growth -- both from wider stored columns and
-from the second MVCC tuple version `queue::enqueue()`'s real two-statement
-write produces -- evaluated by a `Seq Scan` that already reads every
-candidate row regardless of `session_id`/`sticky_worker_id`. Not a plan
-inefficiency SQL can route around:
+The measured cost is heap-page and index-page growth -- from wider stored
+columns, from the second MVCC tuple version `queue::enqueue()`'s real
+two-statement write produces, and from the two partial-index entries
+(`harvest_task_queue_session_id_pending`, `idx_harvest_tq_sticky_poll`)
+that same write adds and `no-session` rows never touch -- evaluated by a
+`Seq Scan` that already reads every candidate row regardless of
+`session_id`/`sticky_worker_id`. Not a plan inefficiency SQL can route
+around:
 
 - The predicate itself is a plain `Filter:` boolean test with no `SubPlan` or
   `InitPlan` to rewrite -- confirmed directly in the captured `EXPLAIN`
@@ -334,6 +352,21 @@ only) -- this pass did not separately measure CPU cost.
   contribution the way `docs/performance-capability-labels.md` does for its
   own predicate, and it does not extend across a session task's full
   lifecycle (further heartbeats, a later completion).
+- **The `+185.5%` write-side figure is not decomposed across its three
+  contributing mechanisms.** A review finding (round 11) correctly noted
+  that the sticky `UPDATE` and its preceding `INSERT` do not only add a
+  second statement and a second MVCC tuple version (see the correction in
+  [Write-side cost](#write-side-cost)) -- they also add entries to two
+  partial indexes, `harvest_task_queue_session_id_pending` and
+  `idx_harvest_tq_sticky_poll`, that the `no-session` control never
+  populates. The total `shared_blks_hit` delta already includes that
+  index-maintenance cost, because it is a real cost the real write path
+  pays; the total is not overstated. What this page does not do is split
+  the delta into a statement-count share, an MVCC-tuple-version share, and
+  an index-maintenance share. Isolating each share would need a capture
+  that varies one mechanism at a time (for example, an `UPDATE` that
+  touches `sticky_worker_id` against one that does not), which this pass
+  did not run.
 - **Every seeded row gets its own, unique `session_id`; production sessions
   can group several member activities under one shared `session_id`.** A
   review finding (round 7) correctly noted that a session with N member
