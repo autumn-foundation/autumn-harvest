@@ -2452,3 +2452,27 @@ count before editing. Round seventy-eight added a condition to one of
 two sites and did not run that check, and this is the finding.
 
 Corpus effect: none. Two fixtures.
+
+### Round eighty — the third caller, and the last one
+
+One finding, a Tier A false positive, and the same scope missing from a
+third place: `update_containers` called `html_block` without knowing the
+comment kind, so a `//` comment's `<pre>` cleared the paragraph, the
+following `2.` opened a list it is not entitled to, and the span was cut.
+
+Round seventy-nine fixed two callers of that question and this is the
+third. So the fix this round is not a third gate. **`html_block` takes
+`doc` itself, with no default**, and every one of its five callers must
+now answer. A future caller cannot forget, because the code will not run
+until it decides.
+
+That is the difference between a rule and a type. "Remember to gate the
+HTML test" survived rounds fifty-two, seventy-nine and eighty. "This
+function needs to know" survives whatever comes next.
+
+Corpus effect: none, which also confirms the centralisation changed
+nothing beyond the one defect -- the two callers that already gated it
+kept their answers, and the two that guarded it with a marker test now
+pass the same marker test as an argument.
+
+One fixture.

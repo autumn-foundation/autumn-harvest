@@ -890,7 +890,7 @@ def starts_block(
         # the same one round fifty-two gave the HTML exemption. Nothing
         # renders a `//` comment, so "<pre>" there opens no block. Defaulted
         # on, so the table-end callers keep the question they always asked.
-        or (doc and html_block(text, container))
+        or html_block(text, container, doc)
         or thematic_break(text, container)
         or (
             bool(list_content(text, container))
@@ -992,13 +992,21 @@ HTML_CLOSERS = {
 }
 
 
-def html_block(text: str, container: int) -> bool:
-    """Does `text` open a CommonMark HTML block?
+def html_block(text: str, container: int, doc: bool) -> bool:
+    """DOC COMMENTS ONLY, and `doc` has no default so no caller can forget.
+
+    Round fifty-two established the scope: nothing renders a `//` comment,
+    so "<pre>" there is five literal characters and no block at all. Round
+    seventy-nine applied it to two of the five callers and round eighty
+    found the third, which is what turned a rule each caller had to
+    remember into an argument each caller must supply.
 
     Three columns past the container, like every marker here. An HTML block
     is a block, so it ends the paragraph above it and the next "22." may
     open a list the rendered document gives it.
     """
+    if not doc:
+        return False
     match = HTML_BLOCK_RE.match(text)
     return bool(match) and len(match.group(1).expandtabs(4)) <= container + 3
 
@@ -1639,6 +1647,7 @@ def update_containers(
     paragraph: bool,
     quoted: int = 0,
     table: bool = False,
+    doc: bool = True,
 ) -> tuple[list[tuple[int, int]], bool]:
     """The open list containers after `text`, innermost last, and whether a
     paragraph is still open.
@@ -1699,7 +1708,11 @@ def update_containers(
     prose = bool(body.strip()) and not (
         table
         or heading(body, stack[-1][0] if stack else 0)
-        or html_block(body, stack[-1][0] if stack else 0)
+        # DOC COMMENTS ONLY, the third and last site of this question after
+        # `starts_block` and `lazy_continuation`. Clearing the paragraph on
+        # a `//` comment's "<pre>" let the next "2." open a list it is not
+        # entitled to, and the span cut there failed the build.
+        or html_block(body, stack[-1][0] if stack else 0, doc)
         or thematic_break(body, stack[-1][0] if stack else 0)
         or (paragraph and setext_underline(body, stack[-1][0] if stack else 0))
     )
@@ -1750,7 +1763,7 @@ def lazy_continuation(
         # block at all. Every OTHER test here holds in both -- a heading, a
         # rule and a list marker are block syntax this tree writes in plain
         # comments too -- so HTML is the one that takes the marker.
-        and not (doc and html_block(peeled, container))
+        and not html_block(peeled, container, doc)
         # The COMMONMARK break, not the broad decorative rule. `SEPARATOR_RE`
         # answers "is this a section rule?" -- unbounded on purpose, because
         # a rule is not a word of a sentence at any indent, which is the
@@ -2039,7 +2052,12 @@ def comment_lines(pieces: list[Piece]):
                 open_paragraph = paragraph
                 # Both are blocks, so neither leaves a paragraph open.
                 stack, paragraph = update_containers(
-                    text, stack, paragraph, quoted, in_table or indented
+                    text,
+                    stack,
+                    paragraph,
+                    quoted,
+                    in_table or indented,
+                    piece.marker in DOC_MARKERS,
                 )
                 # From the PEEL, as `prose_units` reads it. "- > text" is a
                 # quote inside a list item, and reading the raw line reports
@@ -2174,8 +2192,7 @@ def comment_lines(pieces: list[Piece]):
             # unrendered comment is not.
             if (
                 fence is None
-                and piece.marker in DOC_MARKERS
-                and html_block(peeled, container)
+                and html_block(peeled, container, piece.marker in DOC_MARKERS)
             ):
                 html = html_kind(peeled)
                 if html != "tag" and html_closes(peeled, html):
@@ -2443,7 +2460,12 @@ def prose_units(pieces: list[Piece]) -> list[tuple[int, str]]:
                 )
                 # Both are blocks, so neither leaves a paragraph open.
                 stack, paragraph = update_containers(
-                    body, stack, paragraph, quoted, in_table or indented
+                    body,
+                    stack,
+                    paragraph,
+                    quoted,
+                    in_table or indented,
+                    piece.marker in DOC_MARKERS,
                 )
             container = stack[-1][0] if stack else 0
             delimiter = fence_delimiter(body, container, fence is not None, scope[2], stack)
@@ -2525,7 +2547,7 @@ def prose_units(pieces: list[Piece]) -> list[tuple[int, str]]:
                 flush()
                 in_list = False
                 continue
-            if piece.marker in DOC_MARKERS and html_block(peeled, container):
+            if html_block(peeled, container, piece.marker in DOC_MARKERS):
                 # The opener's own line is a block, and everything to its
                 # closer is raw HTML. `comment_lines` opens the block at the
                 # same point and by the same test, on the same full peel.
@@ -4464,6 +4486,13 @@ RULE_TESTS = [
         "/// ===\n",
         {("CH003", 1)},
         "and an underline across a quote edge titles nothing",
+    ),
+    (
+        "// Intro `literal\n"
+        "// <pre>\n"
+        "// 2. TODO: issue required` suffix.\n",
+        set(),
+        "a tag in a // comment ends no paragraph, so the marker opens no list",
     ),
 ]
 
