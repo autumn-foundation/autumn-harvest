@@ -9,10 +9,10 @@ under the impact floor), and narrowed the remaining unmeasured set to worker
 sessions and sticky routing. This page is the worker-sessions measurement.
 
 The result is **not** the same as `schedule_to_close`'s: this predicate has a
-real, moderate-to-large buffer cost -- **+32.9%** at the 10,000-row headline
+real, moderate-to-large buffer cost -- **+40.9%** at the 10,000-row headline
 depth on a single first claim against a cache-warm table, corroborated by a
 real 10,001-call
-production-shaped drain at **+22.1%** (same direction, same order of
+production-shaped drain at **+24.9%** (same direction, same order of
 magnitude -- see [Measurement](#measurement)). The mechanism is the same one
 `docs/performance-capability-labels.md` documents: row-width growth from
 populating previously-`NULL` columns, compounded by the MVCC cost of
@@ -126,13 +126,16 @@ in buffer counts. At backlog=10,000:
 
 ```text
 no-session:      Seq Scan on harvest_task_queue  Buffers: shared hit=244  (actual rows=10000 loops=1)
-worker-session:   Seq Scan on harvest_task_queue  Buffers: shared hit=334  (actual rows=10000 loops=1)
+worker-session:   Seq Scan on harvest_task_queue  Buffers: shared hit=358  (actual rows=10000 loops=1)
 ```
 
-The `Seq Scan` node's own delta (244 -> 334, +90) **exactly matches** the
-whole query's total delta at this depth (274 -> 364, +90) -- the entire cost
-is inside the scan reading physically more pages, nothing leaks into any
-other node. This is the same signature
+The `Seq Scan` node's own delta (244 -> 358, +114) closely tracks the whole
+query's total delta at this depth (274 -> 386, +112) -- almost the entire
+cost is inside the scan reading physically more pages. The two-buffer gap
+between +114 and +112 is smaller than the row-to-row noise this harness
+already documents elsewhere (a single claimed row's exact heap page varies
+slightly run to run); it does not indicate cost leaking into another node
+in any systematic way. This is the same signature
 `docs/performance-capability-labels.md`'s Plan section documents for its own
 predicate, and it rules out a plan-shape explanation the same way:
 `session_id IS NULL OR sticky_worker_id = $1` is a `Filter:` clause evaluated
@@ -153,9 +156,9 @@ Plan shape is stable across all three depths -- both states choose a plain
 
 | backlog | no-session shared buffers | worker-session shared buffers | delta | delta % |
 |---:|---:|---:|---:|---:|
-| 1,000 | 53 | 63 | +10 | +18.9% |
-| 10,000 (headline) | 274 | 364 | +90 | **+32.9%** |
-| 100,000 | 2,473 | 3,367 | +894 | +36.2% |
+| 1,000 | 53 | 64 | +11 | +20.8% |
+| 10,000 (headline) | 274 | 386 | +112 | **+40.9%** |
+| 100,000 | 2,473 | 3,607 | +1,134 | +45.9% |
 
 The delta grows with backlog size, consistent with a per-row storage effect
 that compounds with the number of rows touched.
@@ -168,12 +171,12 @@ written=1914` in both artifacts) from a sort operation spilling past
 table above to isolate the predicate's own effect, and the table is
 labeled `shared buffers`, not total buffers. Folding the identical temp
 blocks into both sides changes the ratio: 100,000-row whole-query I/O
-(shared + temp) is 4,882 vs. 5,776, an **+18.3%** delta, not +36.2%. The
-10,000-row headline figure this page cites elsewhere (+32.9%) is unaffected
+(shared + temp) is 4,882 vs. 6,016, an **+23.2%** delta, not +45.9%. The
+10,000-row headline figure this page cites elsewhere (+40.9%) is unaffected
 -- neither artifact at that depth reports any temp-block traffic. A reader
 who wants the 100,000-row whole-query I/O ratio specifically, rather than
-the shared-buffer figure this table reports, should use +18.3% instead of
-+36.2%.
+the shared-buffer figure this table reports, should use +23.2% instead of
++45.9%.
 
 ### Corroboration: `pg_stat_statements` over the real claim-drain
 
@@ -192,11 +195,11 @@ afterward (artifacts:
 
 | state | calls | `shared_blks_hit` | avg per call |
 |---|---:|---:|---:|
-| no-session | 10,001 | 4,998,048 | 499.75 |
-| worker-session | 10,001 | 6,101,864 | 610.13 |
+| no-session | 10,001 | 4,963,521 | 496.30 |
+| worker-session | 10,001 | 6,201,178 | 620.06 |
 
-Aggregate delta: **+22.1%** -- the same direction and the same order of
-magnitude as the single-first-claim finding (+32.9%), the "corroborated by a
+Aggregate delta: **+24.9%** -- the same direction and the same order of
+magnitude as the single-first-claim finding (+40.9%), the "corroborated by a
 buffer/row-count change in the same direction" bar this persona's rules set.
 Unlike the round-1-fix-only capture (which showed a 17x divergence between
 these two figures, +124.8% vs +7.2%, driven by the bulk-transaction
@@ -225,9 +228,9 @@ lifecycle (artifacts: same `pg_stat_statements.txt` files referenced above):
 | state | statement(s) | calls | `shared_blks_hit` |
 |---|---|---:|---:|
 | no-session | `INSERT` only | 10,000 | 137,976 |
-| worker-session | `INSERT` + `UPDATE` | 10,000 each | 158,259 + 235,626 = 393,885 |
+| worker-session | `INSERT` + `UPDATE` | 10,000 each | 158,365 + 239,335 = 397,700 |
 
-Delta: **+185.5%** to write the identical row count through the real
+Delta: **+188.2%** to write the identical row count through the real
 two-statement, per-row-committed lifecycle. This is the largest percentage on
 this page. Three mechanisms compose it, and this pass does not attribute the
 delta across them individually.
@@ -271,7 +274,7 @@ completes, each of those `UPDATE`s too. This is exactly the mechanism
 different predicate.
 
 This page's [aggregate drain figure](#corroboration-pg_stat_statements-over-the-real-claim-drain)
-(+22.1%) already **includes** one instance of that recurring cost: each of
+(+24.9%) already **includes** one instance of that recurring cost: each of
 the 10,001 real `queue::claim_task()` calls it drove performs its own
 claiming `UPDATE` as part of the single `claim_task_query()` statement, so
 the wider row's rewrite cost at claim time is folded into that number,
@@ -365,7 +368,7 @@ only) -- this pass did not separately measure CPU cost.
   per-row-committed figures, reasoning that batching only removes reclaim
   opportunities. A review finding correctly caught that this does not follow:
   batching also changes commit frequency, buffer reuse timing, relation
-  extension, and the hit-versus-read split the `+185.5%` write-side figure in
+  extension, and the hit-versus-read split the `+188.2%` write-side figure in
   particular depends on (it counts `shared_blks_hit` only) -- any of which
   could move the *ratio* between the two labels in either direction even if
   batching increases *absolute* retained heap space. Retained space and the
@@ -386,7 +389,7 @@ only) -- this pass did not separately measure CPU cost.
   contribution the way `docs/performance-capability-labels.md` does for its
   own predicate, and it does not extend across a session task's full
   lifecycle (further heartbeats, a later completion).
-- **The `+185.5%` write-side figure is not decomposed across its three
+- **The `+188.2%` write-side figure is not decomposed across its three
   contributing mechanisms.** A review finding (round 11) correctly noted
   that the sticky `UPDATE` and its preceding `INSERT` do not only add a
   second statement and a second MVCC tuple version (see the correction in
@@ -401,7 +404,7 @@ only) -- this pass did not separately measure CPU cost.
   that varies one mechanism at a time (for example, an `UPDATE` that
   touches `sticky_worker_id` against one that does not), which this pass
   did not run.
-- **The `+185.5%` figure measures buffer touches, not the extra network
+- **The `+188.2%` figure measures buffer touches, not the extra network
   round trip production pays for the separate `INSERT` and `UPDATE`.** A
   review finding (round 12) correctly noted that the seeding harness runs
   both statements inside one server-side `CALL`, so
@@ -415,7 +418,7 @@ only) -- this pass did not separately measure CPU cost.
   correctly caught that as overstated: the capture selects only
   `shared_blks_hit`/`shared_blks_read`, and `pg_stat_statements` reports
   WAL activity separately (`wal_records`, `wal_bytes`), neither of which
-  this page captures. The `+185.5%` figure is a buffer-only measurement;
+  this page captures. The `+188.2%` figure is a buffer-only measurement;
   it says nothing about WAL volume.
 - **Every seeded row gets its own, unique `session_id`; production sessions
   can group several member activities under one shared `session_id`.** A
