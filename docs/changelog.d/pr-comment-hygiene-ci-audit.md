@@ -2315,3 +2315,36 @@ behaviour, and a test that never fires changes no behaviour. Nothing
 here can find one. The review did.
 
 Corpus effect: none. Two fixtures, the ordered marker and the bullet.
+
+### Round seventy-six — the deferral was wrong on its facts
+
+One finding, and it was already on issue #1383 as the fifth deferred
+item. It is fixed here instead, because checking the premise of the
+deferral showed the premise was false.
+
+#1383 says the deferred gaps are safe to leave because "no `*.rs`
+comment in this repository contains raw HTML or a GFM table". The HTML
+half is true. **The table half is not**: 410 comment lines in tracked
+sources are table rows, across at least ten files, and their cells
+routinely hold code spans -- `` `harvest debug diff` ``, `` `initdb` ``,
+`` `PostgreSQL` ``. A single unmatched backtick in one of those cells
+would take CH001 and CH002 off the rest of the row.
+
+Rustdoc parses each cell as its own inline context, so a backtick in one
+cannot pair with a backtick in the next. `row_cell_spans` gives the span
+pass those boundaries as offsets, and a table row's block is blanked one
+cell at a time. This is the one block boundary that falls INSIDE a line,
+which is why the block layer could not express it and why the entry said
+"the span pass has nowhere to put that yet". It has one now.
+
+Doc comments only, and the `//` counter-case is pinned: nothing renders
+a `//` comment, so there is no table there and the span does reach
+across.
+
+Corpus effect: none, so no comment in this tree relies on the old
+behaviour today. That is what makes the change safe; it is not what
+makes it unnecessary.
+
+The deferral rule stands, and this is what it needs to be useful: the
+reasons have to be re-checked, not repeated. #1383 is corrected --
+item 5 removed, and the false claim about tables with it.

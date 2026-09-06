@@ -720,6 +720,48 @@ def row_cells(text: str, container: int) -> list[str]:
     return CELL_SPLIT_RE.split(text)
 
 
+def row_cell_spans(text: str, container: int) -> list[tuple[int, int]]:
+    """Where the cells of a GFM table row are, as offsets into `text`.
+
+    The same peeling as `row_cells`, kept as offsets because the span pass
+    has to blank in place: every column after a blanked span still has to
+    line up with the source line the finding reports.
+
+    Rustdoc parses each cell as its own inline context, so a backtick in one
+    cell cannot pair with a backtick in the next. This is what tells the
+    span pass where one context ends -- a boundary INSIDE a line, which is
+    the one kind the block layer cannot express.
+    """
+    start = 0
+    content = list_content(text, container)
+    if content:
+        start = content[1]
+    while start < len(text) and text[start] in " \t":
+        start += 1
+    end = len(text)
+    while end > start and text[end - 1] in " \t":
+        end -= 1
+    if start < end and text[start] == "|":
+        start += 1
+    if end - 1 > start and text[end - 1] == "|" and text[end - 2] != "\\":
+        end -= 1
+    spans, cursor = [], start
+    for match in CELL_SPLIT_RE.finditer(text, start, end):
+        spans.append((cursor, match.start()))
+        cursor = match.end()
+    spans.append((cursor, end))
+    return spans
+
+
+def blank_cells(text: str, spans: list[tuple[int, int]]) -> str:
+    """`text` with code spans blanked INSIDE each cell, never across two."""
+    out = list(text)
+    for start, end in spans:
+        blanked = blank_code_spans(text[start:end])
+        out[start:end] = list(blanked)
+    return "".join(out)
+
+
 def table_delimiter(text: str, container: int, header: str) -> bool:
     """Is `text` a delimiter row for the row `header` above it?
 
@@ -1901,7 +1943,7 @@ def comment_lines(pieces: list[Piece]):
             # Rustdoc renders the whole line as a paragraph; opening a fence
             # there exempts every line until the next delimiter.
             if not piece.line_start:
-                yield piece.line, text, fence is not None or html is not None, False
+                yield piece.line, text, fence is not None or html is not None, False, None
                 continue
             # Carried from the previous LINE, and cleared here so it applies
             # exactly once. A piece that does not begin its own line is the
@@ -1919,7 +1961,7 @@ def comment_lines(pieces: list[Piece]):
                 else:
                     if html_closes(inside, html):
                         html = None
-                    yield piece.line, text, True, False
+                    yield piece.line, text, True, False, None
                     continue
             if fence is not None and leaves_container(text, scope):
                 fence = None
@@ -2058,7 +2100,7 @@ def comment_lines(pieces: list[Piece]):
                 # inside one. An invalid opener (```foo`bar) is ordinary text
                 # and must still be scanned -- exempting it would hide the
                 # defect that rejecting it exists to expose.
-                yield piece.line, text, fence is not None or before is not None, True
+                yield piece.line, text, fence is not None or before is not None, True, None
                 continue
             # An HTML block opens here, outside any fence. Its own line is
             # ordinary text -- "<pre>" carries no defect -- but everything
@@ -2085,9 +2127,17 @@ def comment_lines(pieces: list[Piece]):
                 # The opener's line is inside the block it opens. Rustdoc
                 # renders "<pre>TODO: x</pre>" preformatted, so the line
                 # rules must not read that TODO as a defect.
-                yield piece.line, text, True, True
+                yield piece.line, text, True, True, None
                 continue
-            yield piece.line, text, fence is not None or indented, opens
+            # A confirmed table row carries its cell boundaries with it.
+            # They are the one block boundary that falls INSIDE a line, so
+            # the span pass cannot derive them from `opens` alone.
+            cells = (
+                row_cell_spans(text, enclosing)
+                if in_table and piece.marker in DOC_MARKERS and fence is None
+                else None
+            )
+            yield piece.line, text, fence is not None or indented, opens, cells
 
 
 def check_line_rules(path: str, pieces: list[Piece]) -> list[Finding]:
@@ -2113,23 +2163,33 @@ def check_line_rules(path: str, pieces: list[Piece]) -> list[Finding]:
         doc = run[0].marker in DOC_MARKERS
         block: list[str] = []
 
-        def flush_block(lines: list[str]) -> list[str]:
+        def flush_block(lines: list[str], cells: list) -> list[str]:
             # ACROSS the block, like the spans beside it. An unclosed
             # "<code>" runs to the paragraph's end, so a marker on the line
             # under it is rendered as code too, and blanking line by line
             # left that marker exposed and failed the build on it.
-            blanked = blank_spans_across(lines)
+            #
+            # A TABLE ROW is the exception, and the only one: its cells are
+            # separate inline contexts, so a backtick in one cannot pair
+            # with a backtick in the next. Every row is its own block, so
+            # such a block is one line.
+            if len(lines) == 1 and cells and cells[0]:
+                blanked = [blank_cells(lines[0], cells[0])]
+            else:
+                blanked = blank_spans_across(lines)
             if not doc:
                 return blanked
             return blank_inline_code("\n".join(blanked)).split("\n")
 
-        for _, text, in_fence, opens in run_lines:
+        block_cells: list = []
+        for _, text, in_fence, opens, cells in run_lines:
             if opens and block:
-                spanless.extend(flush_block(block))
-                block = []
+                spanless.extend(flush_block(block, block_cells))
+                block, block_cells = [], []
             block.append("" if in_fence else text)
-        spanless.extend(flush_block(block))
-    for index, (lineno, body, in_fence, _) in enumerate(lines):
+            block_cells.append(None if in_fence else cells)
+        spanless.extend(flush_block(block, block_cells))
+    for index, (lineno, body, in_fence, _, _) in enumerate(lines):
         if in_fence:
             continue
         stripped = body.strip()
@@ -4235,6 +4295,32 @@ RULE_TESTS = [
         "/// - TODO: issue required` suffix.\n",
         {("CH002", 2)},
         "a bullet does the same",
+    ),
+    (
+        "/// | `literal | TODO: issue required` |\n"
+        "/// | - | - |\n",
+        {("CH002", 1)},
+        "a code span cannot pair across two cells of a header row",
+    ),
+    (
+        "/// | a | b |\n"
+        "/// | - | - |\n"
+        "/// | `literal | TODO: issue required` |\n",
+        {("CH002", 3)},
+        "nor across two cells of a body row",
+    ),
+    (
+        "/// | a |\n"
+        "/// | - |\n"
+        "/// | `code TODO: marker` here |\n",
+        set(),
+        "but within one cell it still pairs",
+    ),
+    (
+        "// | `literal | TODO: issue required` |\n"
+        "// | - | - |\n",
+        set(),
+        "and a // comment has no table, so the span reaches across",
     ),
 ]
 
