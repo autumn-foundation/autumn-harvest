@@ -2941,3 +2941,60 @@ async fn the_reset_trigger_clears_the_stale_hold_marker_even_when_the_caller_doe
          reopening UPDATE never names it"
     );
 }
+
+#[tokio::test]
+async fn a_declined_cutover_reports_legal_hold_drift_not_a_wake() {
+    // Codex round 5 on PR #1406: `commit_cutover` returning `false` also
+    // covers a hold change since verification, but both drivers reported
+    // every decline as "the execution woke up". That conceals the actual
+    // compliance-relevant change from the operator and the audit log. A
+    // decline caused by hold drift must say so.
+    let shards = setup_two_shards().await;
+    let exec_id = quiescent_fixture(&shards, "decline-reports-hold-drift").await;
+    let (mut source, mut target) = (shards.source().await, shards.target().await);
+
+    begin_migration(&mut source, exec_id, SOURCE, TARGET)
+        .await
+        .expect("begin");
+    stage_copy(&mut source, &mut target, exec_id, TARGET)
+        .await
+        .expect("stage");
+    verify_target_copy(&mut source, &mut target, exec_id, &codecs())
+        .await
+        .expect("verify");
+
+    autumn_harvest::set_legal_hold(
+        &mut source,
+        exec_id,
+        "placed after verification",
+        None,
+        "compliance-bot",
+        Utc::now(),
+    )
+    .await
+    .expect("place a hold after the copy was verified");
+
+    let outcomes = resume_incomplete_migrations(&shards.pool, SOURCE, 10, "tester", &codecs())
+        .await
+        .expect("resume");
+
+    let reason = outcomes
+        .iter()
+        .find_map(|o| match o {
+            MigrationOutcome::Aborted {
+                execution_id,
+                reason,
+            } if *execution_id == exec_id => Some(reason.as_str()),
+            _ => None,
+        })
+        .unwrap_or_else(|| panic!("expected an Aborted outcome for {exec_id}, got {outcomes:?}"));
+
+    assert!(
+        reason.contains("legal hold"),
+        "a hold-drift decline must name the hold, not a wake; got: {reason}"
+    );
+    assert!(
+        !reason.contains("woke") && !reason.contains("quiescent"),
+        "a hold-drift decline must not also claim a wake happened; got: {reason}"
+    );
+}

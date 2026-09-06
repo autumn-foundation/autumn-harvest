@@ -68,3 +68,17 @@ CREATE TRIGGER harvest_shard_migrations_reset_hold_verification_trigger
     BEFORE UPDATE ON harvest_shard_migrations
     FOR EACH ROW
     EXECUTE FUNCTION harvest_shard_migrations_reset_hold_verification();
+
+-- `resume_incomplete_migrations` now orders its unsettled-record scan by
+-- `attempts ASC, created_at ASC` (issue #1317), so a record whose checkout
+-- or step keeps failing sinks behind less-tried ones. The original
+-- `idx_harvest_shard_migrations_unsettled (created_at)` index, added by the
+-- #964 migration, cannot serve that ordering: Postgres would sort the whole
+-- unsettled set before applying `LIMIT`, which is most expensive exactly
+-- when a shard has accumulated the large unsettled backlog the resume sweep
+-- exists to drain. Replace it with an index matching the actual ordering.
+-- No other query in this codebase orders this table by `created_at` alone.
+DROP INDEX IF EXISTS idx_harvest_shard_migrations_unsettled;
+CREATE INDEX IF NOT EXISTS idx_harvest_shard_migrations_unsettled
+    ON harvest_shard_migrations (attempts, created_at)
+    WHERE phase NOT IN ('DONE', 'ABORTED');

@@ -1874,6 +1874,55 @@ mod db {
         Ok(row.sealed_rows > 0)
     }
 
+    /// The reason to report for a declined `commit_cutover` (issue #1317).
+    ///
+    /// A generic "the execution woke up" reason was accurate for the guard's
+    /// original two conditions, quiescence and history. It is wrong for the
+    /// third: a hold placed or released after verification. Reporting a wake
+    /// that never happened sends an operator toward the wrong diagnosis for
+    /// exactly the kind of change a compliance audit trail must get right.
+    ///
+    /// Best-effort and read after the fact, so a fast-moving second race
+    /// between the decline and this read can still fall through to the
+    /// generic reason. That is the safe direction: it never blames a hold
+    /// change that is not there anymore.
+    async fn cutover_decline_reason(
+        source: &mut AsyncPgConnection,
+        exec_id: ExecutionId,
+    ) -> HarvestResult<&'static str> {
+        const WOKE: &str = "the execution was no longer quiescent at cutover time \
+                             (a wake arrived mid-migration); the source is untouched";
+        const HOLD_DRIFTED: &str = "a legal hold was placed or released after \
+                                     verification; the source is untouched";
+
+        #[derive(diesel::QueryableByName)]
+        struct DeclineRow {
+            #[diesel(sql_type = Nullable<Timestamptz>)]
+            verified_legal_hold_set_at: Option<DateTime<Utc>>,
+            #[diesel(sql_type = Bool)]
+            legal_hold_verified: bool,
+            #[diesel(sql_type = Nullable<Timestamptz>)]
+            legal_hold_set_at: Option<DateTime<Utc>>,
+        }
+        let row: Option<DeclineRow> = diesel::sql_query(
+            "SELECT m.verified_legal_hold_set_at, m.legal_hold_verified, \
+                    e.legal_hold_set_at \
+               FROM harvest_shard_migrations m \
+               JOIN harvest_workflow_executions e ON e.id = m.execution_id \
+              WHERE m.execution_id = $1",
+        )
+        .bind::<SqlUuid, _>(exec_id.as_uuid())
+        .get_result(&mut *source)
+        .await
+        .optional_row()?;
+        let Some(row) = row else {
+            return Ok(WOKE);
+        };
+        let hold_drifted = !row.legal_hold_verified
+            || row.verified_legal_hold_set_at != row.legal_hold_set_at;
+        Ok(if hold_drifted { HOLD_DRIFTED } else { WOKE })
+    }
+
     // ── Phase 4: activate the target ─────────────────────────────────────────
 
     /// Make the target copy claimable. Idempotent, and safe to re-run after any
@@ -2357,8 +2406,8 @@ mod db {
         let reason = match cutover {
             Ok(true) => None,
             Ok(false) => Some(
-                "the execution was no longer quiescent at cutover time \
-                 (a wake arrived mid-migration); the source is untouched"
+                cutover_decline_reason(&mut source, exec_id)
+                    .await?
                     .to_string(),
             ),
             Err(error) => Some(format!("the cutover failed: {error}")),
@@ -2707,8 +2756,8 @@ mod db {
                                 // so the command says "aborted" while nothing was
                                 // undone, and a second resume is needed to
                                 // actually finish the job.
-                                let reason = "the execution woke up before the \
-                                              cutover; the source is untouched"
+                                let reason = cutover_decline_reason(&mut source, exec_id)
+                                    .await?
                                     .to_string();
                                 abort_migration(&mut source, &mut target, exec_id, &reason).await?;
                                 Ok(Some(MigrationOutcome::Aborted {
