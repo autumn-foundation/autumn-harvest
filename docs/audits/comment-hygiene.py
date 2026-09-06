@@ -2609,6 +2609,27 @@ def compare_tier_b(
     return regressions
 
 
+def tier_b_gate(
+    current: dict,
+    baseline: dict,
+    scope: set[str] | None,
+    renames: dict[str, str] | None,
+    findings: list[Finding],
+    tier_a_only: bool,
+) -> list[str]:
+    """The Tier B regressions, or none when only the absolute gates apply.
+
+    `--tier-a-only` promises to check ONLY the absolute gates. The text
+    report has kept that promise since it was written, by returning before
+    it reaches Tier B. The JSON path ran the comparison anyway and put a
+    Tier B regression into its exit status, so the same two flags gave two
+    answers, and the machine-readable one was the wrong answer.
+    """
+    if tier_a_only:
+        return []
+    return compare_tier_b(current, baseline, scope, renames, index_findings(findings))
+
+
 def report(
     findings: list[Finding],
     baseline: dict,
@@ -4156,6 +4177,36 @@ def ratchet_reporting_test() -> int:
     return 0 if ok else 1
 
 
+def tier_a_only_test() -> int:
+    """`--tier-a-only` must mean the same thing with and without `--json`.
+
+    The two flags together asked for the absolute gates in machine-readable
+    form and got a Tier B regression in the exit status. This is not a
+    lexer question, so it cannot be a fixture: it is the flag pair, checked
+    on the one function that now answers for both paths.
+    """
+    legacy = "// It doesn\u2019t matter here.\n"
+
+    def tier_b(source: str) -> list[Finding]:
+        return [f for f in findings_for_source("f.rs", source) if f.rule in TIER_B]
+
+    def grouped(items: list[Finding]) -> dict:
+        out: dict = defaultdict(lambda: defaultdict(list))
+        for f in items:
+            out[f.rule][f.path].append(f.fingerprint)
+        return out
+
+    head = tier_b("// filler\n" + legacy)
+    current, baseline = grouped(head), grouped(tier_b("// filler\n"))
+    gated = tier_b_gate(current, baseline, {"f.rs"}, {}, head, False)
+    skipped = tier_b_gate(current, baseline, {"f.rs"}, {}, head, True)
+    ok = bool(gated) and skipped == []
+    print(f"  [{'ok  ' if ok else 'FAIL'}] --tier-a-only skips the Tier B ratchet")
+    if not ok:
+        print(f"         gated {gated!r}\n         skipped {skipped!r}")
+    return 0 if ok else 1
+
+
 def self_test() -> int:
     """Prove the lexer still handles the Rust forms the rules depend on."""
     failures = 0
@@ -4220,6 +4271,7 @@ def self_test() -> int:
             print(f"         expected {sorted(expected)!r}\n         got      {sorted(got)!r}")
 
     failures += ratchet_reporting_test()
+    failures += tier_a_only_test()
 
     print("\nOK: self-test passed." if not failures else f"\n{failures} self-test failure(s).")
     return 1 if failures else 0
@@ -4286,12 +4338,17 @@ def main() -> int:
         scope_note = "no --base given; report-only"
 
     baseline = {}
-    if args.base and scope:
+    # Not computed when only the absolute gates apply: nothing reads it on
+    # that path, and building it walks the merge base for every file in
+    # scope.
+    if args.base and scope and not args.tier_a_only:
         baseline = baseline_from_merge_base(merge_base, scope, renames)
 
     if args.json:
         current = tally(findings)
-        regressions = compare_tier_b(current, baseline, scope, renames, index_findings(findings))
+        regressions = tier_b_gate(
+            current, baseline, scope, renames, findings, args.tier_a_only
+        )
         print(
             json.dumps(
                 {

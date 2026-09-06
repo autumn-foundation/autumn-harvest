@@ -2038,3 +2038,32 @@ and the fence path's `scope` is the model it needs. It stays deferred.
 
 Corpus effect: none. Four fixtures, one for the malformed opener and
 three for the attribute forms that must keep working.
+
+### Round sixty-seven — the same two flags, two different answers
+
+One finding, and the first in this PR that is not about what Rustdoc
+renders. `--tier-a-only` promises to check only the absolute gates. The
+text report has kept that promise since it was written, by returning
+before it reaches Tier B. The JSON path ran the ratchet comparison
+anyway and put a Tier B regression into its exit status, so
+`--tier-a-only --base` exited 0 and `--json --tier-a-only --base` exited
+1 on the same tree.
+
+Measured before the fix, with one contraction added to a changed file:
+`--base` exits 1, `--tier-a-only --base` exits 0, and
+`--json --tier-a-only --base` exits 1 with a populated
+`tier_b_regressions`. After: 1, 0, 0 with an empty list, and plain
+`--json --base` still exits 1, which is the half that must not move.
+
+Both paths now ask one function, `tier_b_gate`. A promise kept in two
+places is a promise kept in one of them eventually.
+
+The baseline is no longer built at all under `--tier-a-only`. Nothing
+reads it on that path, and constructing it walks the merge base for
+every file in scope.
+
+This defect is not expressible as a lexer fixture, so it is a self-test
+beside `ratchet_reporting_test`: the same current and baseline, gated
+both ways, one non-empty and one empty.
+
+Corpus effect: none.
