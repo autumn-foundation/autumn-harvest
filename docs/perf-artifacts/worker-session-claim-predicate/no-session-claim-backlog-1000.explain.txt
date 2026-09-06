@@ -44,18 +44,18 @@ CTE Scan on claimed  (cost=44254.40..44254.42 rows=1 width=817) (actual rows=1 l
                             Output: concurrency_pending_keys.concurrency_key, concurrency_pending_keys.task_type
   CTE candidate
     ->  Limit  (cost=44147.63..44147.64 rows=1 width=250) (actual rows=1 loops=1)
-          Output: harvest_task_queue_1.id, harvest_task_queue_1.task_type, harvest_task_queue_1.concurrency_key, harvest_task_queue_1.concurrency_cap, harvest_task_queue_1.rate_limit_key, harvest_task_queue_1.activity_name, (CASE WHEN ((harvest_task_queue_1.sticky_worker_id = 'harvest-bench-worker-0'::text) AND (harvest_task_queue_1.sticky_until > now())) THEN 1 ELSE 0 END), harvest_task_queue_1.priority, harvest_task_queue_1.scheduled_at, harvest_task_queue_1.ctid, paused_queues.*, paused_activities.*
+          Output: harvest_task_queue_1.id, harvest_task_queue_1.task_type, harvest_task_queue_1.concurrency_key, harvest_task_queue_1.concurrency_cap, harvest_task_queue_1.rate_limit_key, harvest_task_queue_1.activity_name, (CASE WHEN ((harvest_task_queue_1.sticky_worker_id = 'deadbeef-dead-4bee-8bee-deadbeefcafe'::text) AND (harvest_task_queue_1.sticky_until > now())) THEN 1 ELSE 0 END), harvest_task_queue_1.priority, harvest_task_queue_1.scheduled_at, harvest_task_queue_1.ctid, paused_queues.*, paused_activities.*
           Buffers: shared hit=34
           ->  LockRows  (cost=44147.63..44158.94 rows=905 width=250) (actual rows=1 loops=1)
-                Output: harvest_task_queue_1.id, harvest_task_queue_1.task_type, harvest_task_queue_1.concurrency_key, harvest_task_queue_1.concurrency_cap, harvest_task_queue_1.rate_limit_key, harvest_task_queue_1.activity_name, (CASE WHEN ((harvest_task_queue_1.sticky_worker_id = 'harvest-bench-worker-0'::text) AND (harvest_task_queue_1.sticky_until > now())) THEN 1 ELSE 0 END), harvest_task_queue_1.priority, harvest_task_queue_1.scheduled_at, harvest_task_queue_1.ctid, paused_queues.*, paused_activities.*
+                Output: harvest_task_queue_1.id, harvest_task_queue_1.task_type, harvest_task_queue_1.concurrency_key, harvest_task_queue_1.concurrency_cap, harvest_task_queue_1.rate_limit_key, harvest_task_queue_1.activity_name, (CASE WHEN ((harvest_task_queue_1.sticky_worker_id = 'deadbeef-dead-4bee-8bee-deadbeefcafe'::text) AND (harvest_task_queue_1.sticky_until > now())) THEN 1 ELSE 0 END), harvest_task_queue_1.priority, harvest_task_queue_1.scheduled_at, harvest_task_queue_1.ctid, paused_queues.*, paused_activities.*
                 Buffers: shared hit=34
                 ->  Sort  (cost=44147.63..44149.89 rows=905 width=250) (actual rows=1 loops=1)
-                      Output: harvest_task_queue_1.id, harvest_task_queue_1.task_type, harvest_task_queue_1.concurrency_key, harvest_task_queue_1.concurrency_cap, harvest_task_queue_1.rate_limit_key, harvest_task_queue_1.activity_name, (CASE WHEN ((harvest_task_queue_1.sticky_worker_id = 'harvest-bench-worker-0'::text) AND (harvest_task_queue_1.sticky_until > now())) THEN 1 ELSE 0 END), harvest_task_queue_1.priority, harvest_task_queue_1.scheduled_at, harvest_task_queue_1.ctid, paused_queues.*, paused_activities.*
-                      Sort Key: (CASE WHEN ((harvest_task_queue_1.sticky_worker_id = 'harvest-bench-worker-0'::text) AND (harvest_task_queue_1.sticky_until > now())) THEN 1 ELSE 0 END) DESC, harvest_task_queue_1.priority DESC, harvest_task_queue_1.scheduled_at
+                      Output: harvest_task_queue_1.id, harvest_task_queue_1.task_type, harvest_task_queue_1.concurrency_key, harvest_task_queue_1.concurrency_cap, harvest_task_queue_1.rate_limit_key, harvest_task_queue_1.activity_name, (CASE WHEN ((harvest_task_queue_1.sticky_worker_id = 'deadbeef-dead-4bee-8bee-deadbeefcafe'::text) AND (harvest_task_queue_1.sticky_until > now())) THEN 1 ELSE 0 END), harvest_task_queue_1.priority, harvest_task_queue_1.scheduled_at, harvest_task_queue_1.ctid, paused_queues.*, paused_activities.*
+                      Sort Key: (CASE WHEN ((harvest_task_queue_1.sticky_worker_id = 'deadbeef-dead-4bee-8bee-deadbeefcafe'::text) AND (harvest_task_queue_1.sticky_until > now())) THEN 1 ELSE 0 END) DESC, harvest_task_queue_1.priority DESC, harvest_task_queue_1.scheduled_at
                       Sort Method: quicksort  Memory: 196kB
                       Buffers: shared hit=33
                       ->  Nested Loop  (cost=0.00..44143.10 rows=905 width=250) (actual rows=1000 loops=1)
-                            Output: harvest_task_queue_1.id, harvest_task_queue_1.task_type, harvest_task_queue_1.concurrency_key, harvest_task_queue_1.concurrency_cap, harvest_task_queue_1.rate_limit_key, harvest_task_queue_1.activity_name, CASE WHEN ((harvest_task_queue_1.sticky_worker_id = 'harvest-bench-worker-0'::text) AND (harvest_task_queue_1.sticky_until > now())) THEN 1 ELSE 0 END, harvest_task_queue_1.priority, harvest_task_queue_1.scheduled_at, harvest_task_queue_1.ctid, paused_queues.*, paused_activities.*
+                            Output: harvest_task_queue_1.id, harvest_task_queue_1.task_type, harvest_task_queue_1.concurrency_key, harvest_task_queue_1.concurrency_cap, harvest_task_queue_1.rate_limit_key, harvest_task_queue_1.activity_name, CASE WHEN ((harvest_task_queue_1.sticky_worker_id = 'deadbeef-dead-4bee-8bee-deadbeefcafe'::text) AND (harvest_task_queue_1.sticky_until > now())) THEN 1 ELSE 0 END, harvest_task_queue_1.priority, harvest_task_queue_1.scheduled_at, harvest_task_queue_1.ctid, paused_queues.*, paused_activities.*
                             Join Filter: ((harvest_task_queue_1.task_type <> 'activity'::text) OR (harvest_task_queue_1.activity_name IS NULL) OR (harvest_task_queue_1.activity_name <> ALL (paused_activities.names)))
                             Buffers: shared hit=33
                             ->  CTE Scan on paused_activities  (cost=0.00..0.02 rows=1 width=88) (actual rows=1 loops=1)
@@ -69,7 +69,7 @@ CTE Scan on claimed  (cost=44254.40..44254.42 rows=1 width=817) (actual rows=1 l
                                         Buffers: shared hit=8
                                   ->  Seq Scan on public.harvest_task_queue harvest_task_queue_1  (cost=0.00..44090.00 rows=1000 width=192) (actual rows=1000 loops=1)
                                         Output: harvest_task_queue_1.id, harvest_task_queue_1.task_type, harvest_task_queue_1.concurrency_key, harvest_task_queue_1.concurrency_cap, harvest_task_queue_1.rate_limit_key, harvest_task_queue_1.activity_name, harvest_task_queue_1.sticky_worker_id, harvest_task_queue_1.sticky_until, harvest_task_queue_1.priority, harvest_task_queue_1.scheduled_at, harvest_task_queue_1.ctid, harvest_task_queue_1.queue_name
-                                        Filter: (((harvest_task_queue_1.session_id IS NULL) OR (harvest_task_queue_1.sticky_worker_id = 'harvest-bench-worker-0'::text)) AND ((harvest_task_queue_1.task_type <> 'workflow'::text) OR (harvest_task_queue_1.workflow_exec_id IS NULL) OR (NOT (SubPlan 6))) AND ((harvest_task_queue_1.task_type <> 'activity'::text) OR (harvest_task_queue_1.activity_name IS NULL) OR (harvest_task_queue_1.required_capabilities IS NOT NULL) OR (harvest_task_queue_1.activity_name <> ALL ('{}'::text[]))) AND (harvest_task_queue_1.state = 'PENDING'::text) AND (harvest_task_queue_1.queue_name = ANY ('{harvest-bench-q-0,harvest-bench-q-1,harvest-bench-q-2,harvest-bench-q-3}'::text[])) AND (harvest_task_queue_1.scheduled_at <= now()) AND ((harvest_task_queue_1.schedule_to_close_at IS NULL) OR (harvest_task_queue_1.schedule_to_close_at > now())) AND ((harvest_task_queue_1.sticky_worker_id IS NULL) OR (harvest_task_queue_1.sticky_worker_id = 'harvest-bench-worker-0'::text) OR (harvest_task_queue_1.sticky_until IS NULL) OR (harvest_task_queue_1.sticky_until <= now())) AND ((harvest_task_queue_1.concurrency_key IS NULL) OR (harvest_task_queue_1.concurrency_cap IS NULL) OR (COALESCE((SubPlan 5), '0'::bigint) < harvest_task_queue_1.concurrency_cap)) AND ((harvest_task_queue_1.rate_limit_key IS NULL) OR (harvest_task_queue_1.activity_name = ANY ('{}'::text[])) OR (hashed SubPlan 14)) AND ((harvest_task_queue_1.required_capabilities IS NULL) OR (NOT (SubPlan 12))))
+                                        Filter: (((harvest_task_queue_1.session_id IS NULL) OR (harvest_task_queue_1.sticky_worker_id = 'deadbeef-dead-4bee-8bee-deadbeefcafe'::text)) AND ((harvest_task_queue_1.task_type <> 'workflow'::text) OR (harvest_task_queue_1.workflow_exec_id IS NULL) OR (NOT (SubPlan 6))) AND ((harvest_task_queue_1.task_type <> 'activity'::text) OR (harvest_task_queue_1.activity_name IS NULL) OR (harvest_task_queue_1.required_capabilities IS NOT NULL) OR (harvest_task_queue_1.activity_name <> ALL ('{}'::text[]))) AND (harvest_task_queue_1.state = 'PENDING'::text) AND (harvest_task_queue_1.queue_name = ANY ('{harvest-bench-q-0,harvest-bench-q-1,harvest-bench-q-2,harvest-bench-q-3}'::text[])) AND (harvest_task_queue_1.scheduled_at <= now()) AND ((harvest_task_queue_1.schedule_to_close_at IS NULL) OR (harvest_task_queue_1.schedule_to_close_at > now())) AND ((harvest_task_queue_1.sticky_worker_id IS NULL) OR (harvest_task_queue_1.sticky_worker_id = 'deadbeef-dead-4bee-8bee-deadbeefcafe'::text) OR (harvest_task_queue_1.sticky_until IS NULL) OR (harvest_task_queue_1.sticky_until <= now())) AND ((harvest_task_queue_1.concurrency_key IS NULL) OR (harvest_task_queue_1.concurrency_cap IS NULL) OR (COALESCE((SubPlan 5), '0'::bigint) < harvest_task_queue_1.concurrency_cap)) AND ((harvest_task_queue_1.rate_limit_key IS NULL) OR (harvest_task_queue_1.activity_name = ANY ('{}'::text[])) OR (hashed SubPlan 14)) AND ((harvest_task_queue_1.required_capabilities IS NULL) OR (NOT (SubPlan 12))))
                                         Buffers: shared hit=25
                                         SubPlan 6
                                           ->  Seq Scan on public.harvest_workflow_executions e  (cost=0.00..0.00 rows=1 width=0) (never executed)
@@ -89,19 +89,19 @@ CTE Scan on claimed  (cost=44254.40..44254.42 rows=1 width=817) (actual rows=1 l
                                                 InitPlan 8 (returns $8)
                                                   ->  Index Scan using harvest_workers_pkey on public.harvest_workers  (cost=0.14..8.16 rows=1 width=32) (never executed)
                                                         Output: harvest_workers.labels
-                                                        Index Cond: (harvest_workers.worker_id = 'harvest-bench-worker-0'::text)
+                                                        Index Cond: (harvest_workers.worker_id = 'deadbeef-dead-4bee-8bee-deadbeefcafe'::text)
                                                 InitPlan 9 (returns $9)
                                                   ->  Index Scan using harvest_workers_pkey on public.harvest_workers harvest_workers_1  (cost=0.14..8.16 rows=1 width=32) (never executed)
                                                         Output: harvest_workers_1.labels
-                                                        Index Cond: (harvest_workers_1.worker_id = 'harvest-bench-worker-0'::text)
+                                                        Index Cond: (harvest_workers_1.worker_id = 'deadbeef-dead-4bee-8bee-deadbeefcafe'::text)
                                                 InitPlan 10 (returns $10)
                                                   ->  Index Scan using harvest_workers_pkey on public.harvest_workers harvest_workers_2  (cost=0.14..8.16 rows=1 width=32) (never executed)
                                                         Output: harvest_workers_2.labels
-                                                        Index Cond: (harvest_workers_2.worker_id = 'harvest-bench-worker-0'::text)
+                                                        Index Cond: (harvest_workers_2.worker_id = 'deadbeef-dead-4bee-8bee-deadbeefcafe'::text)
                                                 InitPlan 11 (returns $11)
                                                   ->  Index Scan using harvest_workers_pkey on public.harvest_workers harvest_workers_3  (cost=0.14..8.16 rows=1 width=32) (never executed)
                                                         Output: harvest_workers_3.labels
-                                                        Index Cond: (harvest_workers_3.worker_id = 'harvest-bench-worker-0'::text)
+                                                        Index Cond: (harvest_workers_3.worker_id = 'deadbeef-dead-4bee-8bee-deadbeefcafe'::text)
   CTE rate_limit_debit
     ->  Update on public.harvest_rate_limit_buckets b_1  (cost=0.15..8.38 rows=1 width=78) (actual rows=0 loops=1)
           Output: b_1.key
@@ -120,7 +120,7 @@ CTE Scan on claimed  (cost=44254.40..44254.42 rows=1 width=817) (actual rows=1 l
           Output: harvest_task_queue_2.id, harvest_task_queue_2.queue_name, harvest_task_queue_2.task_type, harvest_task_queue_2.workflow_exec_id, harvest_task_queue_2.activity_name, harvest_task_queue_2.input, harvest_task_queue_2.state, harvest_task_queue_2.priority, harvest_task_queue_2.worker_id, harvest_task_queue_2.attempt, harvest_task_queue_2.max_attempts, harvest_task_queue_2.scheduled_at, harvest_task_queue_2.started_at, harvest_task_queue_2.completed_at, harvest_task_queue_2.last_heartbeat_at, harvest_task_queue_2.heartbeat_timeout, harvest_task_queue_2.start_to_close, harvest_task_queue_2.schedule_to_start, harvest_task_queue_2.retry_policy, harvest_task_queue_2.output, harvest_task_queue_2.error, harvest_task_queue_2.sticky_worker_id, harvest_task_queue_2.sticky_until, harvest_task_queue_2.sticky_timeout, harvest_task_queue_2.trace_context, harvest_task_queue_2.concurrency_key, harvest_task_queue_2.concurrency_cap, harvest_task_queue_2.heartbeat_details, harvest_task_queue_2.required_build_id, harvest_task_queue_2.activity_id, harvest_task_queue_2.rate_limit_key, harvest_task_queue_2.crash_strikes, harvest_task_queue_2.schedule_to_close_at, harvest_task_queue_2.required_capabilities, harvest_task_queue_2.context_headers, harvest_task_queue_2.created_at, harvest_task_queue_2.wake_requested, harvest_task_queue_2.session_id, harvest_task_queue_2.capability_misses, harvest_task_queue_2.capability_miss_workers, harvest_task_queue_2.capability_miss_handler
           Buffers: shared hit=53 dirtied=4 written=2
           ->  Nested Loop  (cost=0.28..14.27 rows=1 width=123) (actual rows=1 loops=1)
-                Output: 'RUNNING'::text, 'harvest-bench-worker-0'::text, (harvest_task_queue_2.attempt + 1), now(), false, harvest_task_queue_2.ctid, candidate_1.*
+                Output: 'RUNNING'::text, 'deadbeef-dead-4bee-8bee-deadbeefcafe'::text, (harvest_task_queue_2.attempt + 1), now(), false, harvest_task_queue_2.ctid, candidate_1.*
                 Inner Unique: true
                 Buffers: shared hit=37
                 ->  CTE Scan on candidate candidate_1  (cost=0.00..5.96 rows=1 width=56) (actual rows=1 loops=1)
@@ -139,8 +139,8 @@ CTE Scan on claimed  (cost=44254.40..44254.42 rows=1 width=817) (actual rows=1 l
                       Output: harvest_task_queue_2.attempt, harvest_task_queue_2.ctid, harvest_task_queue_2.id
                       Index Cond: (harvest_task_queue_2.id = candidate_1.id)
                       Buffers: shared hit=3
-Query Identifier: -4591047397908406721
+Query Identifier: -2311135913867904170
 Planning:
   Buffers: shared hit=706 read=43
-Planning Time: 4.832 ms
-Execution Time: 2.517 ms
+Planning Time: 5.260 ms
+Execution Time: 3.180 ms

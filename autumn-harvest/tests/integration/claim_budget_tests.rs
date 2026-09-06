@@ -2725,9 +2725,12 @@ async fn zz_capture_worker_session_claim_evidence() {
     // worker literal (`{BENCH_PREFIX}-worker-0`, 22 bytes) understates that
     // width. Real `Worker::new` generates `worker_id:
     // uuid::Uuid::new_v4().to_string()` (`worker.rs:409`), 36 bytes every
-    // time. This literal matches that width instead of the shared short
-    // form.
-    let worker_literal = "'deadbeef-dead-4bee-8bee-deadbeefcafe'".to_string();
+    // time. `WORKER_ID` below matches that width instead of the shared
+    // short form. It must stay in sync with `worker_literal`'s quoted SQL
+    // form. It must also stay in sync with the real `claim_task()` drain
+    // further down, which binds it as a plain parameter, not SQL text.
+    const WORKER_ID: &str = "deadbeef-dead-4bee-8bee-deadbeefcafe";
+    let worker_literal = format!("'{WORKER_ID}'");
 
     // Server-side per-row seeding procedure for the `worker-session` label.
     // A review finding on PR #1358 identified a problem with an earlier
@@ -3102,14 +3105,17 @@ async fn zz_capture_worker_session_claim_evidence() {
         // Drive the real claim path repeatedly. This makes pg_stat_statements
         // accumulate real, attributed `calls`/buffer counters for the
         // production query text, not just the single literal-substituted
-        // EXPLAIN above.
+        // EXPLAIN above. Must claim with `WORKER_ID`, not this file's usual
+        // short literal. `worker-session` rows are seeded with
+        // `sticky_worker_id = WORKER_ID` above. `claim_task_query()`'s
+        // `sticky_worker_id = $1` arm only matches an exact bind.
         let mut claimed = 0usize;
         let ceiling = seeded.claimable_rows + 10;
         loop {
             let result = autumn_harvest::queue::claim_task(
                 &mut stats_conn,
                 &queues,
-                &format!("{}-worker-0", db::BENCH_PREFIX),
+                WORKER_ID,
                 "",
                 None,
                 &[],
