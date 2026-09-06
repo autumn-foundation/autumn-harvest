@@ -210,6 +210,34 @@ async fn shard_id_filter_still_includes_an_empty_assignment_worker_from_its_own_
     );
 }
 
+#[tokio::test]
+async fn shard_id_filter_keeps_a_genuinely_multi_shard_auto_worker_visible_on_each_of_its_shards() {
+    // A worker with no sharded pool per process, deployed with one process per
+    // shard, registers the SAME worker_id with the empty (auto) shape in
+    // EVERY shard's own database -- distinct from the single-shard `auto`
+    // case above. The per-shard source-aware retain runs before
+    // `dedup_workers_by_freshest`, so each shard's own copy of the row must
+    // survive that shard's own request rather than being dropped as a
+    // same-worker-id "duplicate" from the wrong source.
+    let ((url0, url1), _guard) = setup_two_shards().await;
+    seed_worker(&url0, "auto-multi", "[]").await;
+    seed_worker(&url1, "auto-multi", "[]").await;
+    let app = build_app(&url0, &url1);
+
+    for (query, shard_label) in [("shard_id=0", "0"), ("shard_id=1", "1")] {
+        let (status, body) = get_json(&app, &format!("/workers?{query}")).await;
+        assert_eq!(status, StatusCode::OK, "got {body}");
+        let workers = body.as_array().expect("bare array response");
+        let ids = worker_ids(workers);
+        assert_eq!(
+            ids,
+            vec!["auto-multi"],
+            "the auto-registered worker's own copy on shard {shard_label} must \
+             survive that shard's request: {body}"
+        );
+    }
+}
+
 // ── GET /workers/drain-preview?shard_id= ──────────────────────────────────
 
 #[tokio::test]
