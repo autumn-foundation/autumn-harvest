@@ -19,30 +19,32 @@
 //! `20260702000000_harvest_usage_report_indexes`) already indexed every other
 //! CTE in this query (`execution_starts`, `terminal_counts`,
 //! `reset_terminated_execs`, and the outer `activity_events` scan that feeds
-//! this CTE). It did not index the LATERAL subquery above: the only index
+//! this CTE). It did not index the LATERAL subquery above. The only index
 //! that names `workflow_exec_id` at all is the initial migration's
-//! `idx_harvest_events_exec (workflow_exec_id, event_id)`, which cannot serve
-//! an `event_type` + JSON-path equality lookup -- so for every activity
-//! terminal event in the report window, this subquery re-scans (and
-//! re-evaluates the JSON extraction against) every OTHER event belonging to
-//! that same execution, not just its `ActivityStarted` siblings. A workflow
-//! with a heavy activity fan-out (a batch/DAG run -- exactly the "real
-//! cardinality skew" this fixture seeds a 1% tail of) pays for this on every
-//! one of its activities.
+//! `idx_harvest_events_exec (workflow_exec_id, event_id)`. That index cannot
+//! serve an `event_type` + JSON-path equality lookup. So for every activity
+//! terminal event in the report window, this subquery re-scans every OTHER
+//! event belonging to that same execution. It also re-evaluates the JSON
+//! extraction against each of those events, not just its `ActivityStarted`
+//! siblings. A workflow with a heavy activity fan-out pays for this on every
+//! one of its activities. That fan-out is a batch/DAG run -- exactly the
+//! "real cardinality skew" this fixture seeds a 1% tail of.
 //!
 //! Two tests:
 //! - [`usage_report_activity_lookback_index_does_not_change_the_result_set`]
-//!   -- fast, always-run correctness check: the query returns the same
-//!   grouped counters with and without the new index, on a small hand-built
-//!   fixture that exercises retries (multiple `ActivityStarted` attempts per
-//!   `activity_id`) and an activity with no `ActivityStarted` at all
-//!   (external-activity `ActivityTimedOut`, which must NOT count as
-//!   `activity_executions_failed` -- see `usage.rs`'s module doc).
+//!   -- fast, always-run correctness check. It runs the query once, against a
+//!   small hand-built fixture. That fixture exercises retries -- multiple
+//!   `ActivityStarted` attempts per `activity_id` -- and an activity with no
+//!   `ActivityStarted` at all. That second case is an external-activity
+//!   `ActivityTimedOut`, which must NOT count as `activity_executions_failed`
+//!   -- see `usage.rs`'s module doc. These checks hold regardless of the
+//!   index, so this test does not toggle it.
 //! - [`zz_capture_usage_report_activity_lookback_evidence`] -- `#[ignore]`d.
-//!   Seeds a production-shaped fixture into a throwaway database, captures
+//!   Seeds a production-shaped fixture into a throwaway database. It captures
 //!   `EXPLAIN (ANALYZE, BUFFERS, VERBOSE, SETTINGS)` and a `pg_stat_statements`
-//!   snapshot for the identical query text before and after adding the
-//!   candidate index, and asserts the two produce byte-identical result sets.
+//!   snapshot for the identical query text, before and after adding the
+//!   candidate index. It then asserts the two produce byte-identical result
+//!   sets.
 
 use diesel::QueryableByName;
 use diesel::sql_types::{BigInt, Double, Integer, Nullable, Text, Timestamptz};
@@ -54,12 +56,12 @@ use crate::integration_e2e::setup_test_database_url_or_env;
 
 const SHARD_ID: i32 = 0;
 
-/// The candidate index this evidence file is deciding on. Partial (only
-/// `ActivityStarted` rows -- the only event type the LATERAL subquery ever
-/// looks for) and keyed exactly to the subquery's own predicates: equality on
-/// `workflow_exec_id` and the JSON-extracted `activity_id`, then `timestamp`
-/// so `MAX(timestamp) WHERE timestamp <= $ae.timestamp` is answerable by a
-/// backward index scan instead of a per-candidate-row sort.
+/// The candidate index this evidence file is deciding on. Partial: only
+/// `ActivityStarted` rows, the only event type the LATERAL subquery ever
+/// looks for. Keyed exactly to the subquery's own predicates: equality on
+/// `workflow_exec_id` and the JSON-extracted `activity_id`, then `timestamp`.
+/// That ordering makes `MAX(timestamp) WHERE timestamp <= $ae.timestamp`
+/// answerable by a backward index scan, instead of a per-candidate-row sort.
 const CANDIDATE_INDEX_SQL: &str = "CREATE INDEX IF NOT EXISTS idx_harvest_events_activity_started_lookup \
      ON harvest_events (workflow_exec_id, (event_data #>> '{data,activity_id}'), timestamp) \
      WHERE event_type = 'ActivityStarted'";
@@ -148,29 +150,30 @@ async fn seed_event(
 /// Exercises the real `load_usage_grouped` against a small, hand-built
 /// fixture covering the cases the LATERAL subquery must get right:
 ///
-/// - `wf_retry`: two `ActivityStarted` attempts sharing one `activity_id`,
-///   terminal event after the SECOND attempt -- `activity_compute_seconds`
-///   must be measured from the second (later) start, not the first, and
+/// - `wf_retry`: two `ActivityStarted` attempts share one `activity_id`, with
+///   the terminal event after the SECOND attempt. `activity_compute_seconds`
+///   must be measured from the second, later start, not the first.
 ///   `MAX(timestamp) WHERE timestamp <= terminal.timestamp` is exactly the
 ///   predicate that picks it out.
 /// - `wf_external`: an `ActivityTimedOut` with NO matching `ActivityStarted`
 ///   at all (external-activity timeout) -- must NOT count toward
 ///   `activity_executions_failed` (module doc's documented exclusion).
 ///
-/// These are business-logic assertions on the query's RESULT VALUES, which
-/// must hold regardless of which plan Postgres picks -- so this test runs
-/// the query exactly once against whatever index state the ambient database
-/// already has, rather than toggling [`CANDIDATE_INDEX_SQL`] itself. An
-/// earlier version of this test dropped and rebuilt the index in place to
-/// compare before/after, but on the documented `HARVEST_TEST_DATABASE_URL`
-/// path that points at a real (potentially large) shared database, not a
-/// throwaway one -- so doing a full non-concurrent `CREATE INDEX` there on
-/// every run of a test billed as fast and always-on would transiently drop a
-/// real schema index from under any concurrently-running test and hold a
-/// table-wide lock for however long that shared corpus takes to index
-/// (Codex review, PR #1381). That specific before/after equivalence proof
-/// belongs to -- and is already covered by -- the evidence-capture test
-/// below, which runs in its own isolated throwaway database.
+/// These are business-logic assertions on the query's RESULT VALUES. They
+/// must hold regardless of which plan Postgres picks. So this test runs the
+/// query exactly once, against whatever index state the ambient database
+/// already has, rather than toggling [`CANDIDATE_INDEX_SQL`] itself.
+///
+/// An earlier version of this test dropped and rebuilt the index in place, to
+/// compare before and after. But the documented `HARVEST_TEST_DATABASE_URL`
+/// path points at a real, potentially large, shared database, not a
+/// throwaway one. Doing a full non-concurrent `CREATE INDEX` there, on every
+/// run of a test billed as fast and always-on, has real costs. It would
+/// transiently drop a real schema index from under any concurrently-running
+/// test. It would also hold a table-wide lock for however long that shared
+/// corpus takes to index. That specific before/after equivalence proof
+/// belongs to the evidence-capture test below. That test already covers it,
+/// running in its own isolated throwaway database.
 #[tokio::test]
 async fn usage_report_activity_lookback_index_does_not_change_the_result_set() {
     let (database_url, _container) = setup_test_database_url_or_env().await;
@@ -180,13 +183,13 @@ async fn usage_report_activity_lookback_index_does_not_change_the_result_set() {
 
     let base = chrono::Utc::now() - chrono::Duration::hours(1);
 
-    // Unique per invocation: `usage_sql()` groups by workflow_name over a
-    // window wide enough to span this whole test, so a fixed name would
+    // Unique per invocation. `usage_sql()` groups by workflow_name over a
+    // window wide enough to span this whole test. So a fixed name would
     // double-count against leftover rows from an earlier run of this same
-    // test against a shared, uncleaned `HARVEST_TEST_DATABASE_URL` database
-    // (caught by a real, reproducible failure in this environment: repeated
-    // runs within the same hour accumulated retry_row.activity_executions
-    // beyond the expected 2).
+    // test, against a shared, uncleaned `HARVEST_TEST_DATABASE_URL` database.
+    // This was caught by a real, reproducible failure in this environment.
+    // Repeated runs within the same hour accumulated
+    // retry_row.activity_executions beyond the expected 2.
     let run_id = uuid::Uuid::new_v4().simple().to_string();
     let retry_wf_name = format!("usage_lookback_retry_wf_{run_id}");
     let external_wf_name = format!("usage_lookback_external_wf_{run_id}");
@@ -244,15 +247,15 @@ async fn usage_report_activity_lookback_index_does_not_change_the_result_set() {
         to: chrono::Utc::now(),
     };
 
-    // A high row_limit, not the caller-facing default: `usage_sql()` applies
-    // `ORDER BY 1 LIMIT $5`, and this test's group names sort lexicographically
-    // wherever `u` falls relative to however many OTHER distinct
+    // A high row_limit, not the caller-facing default. `usage_sql()` applies
+    // `ORDER BY 1 LIMIT $5`. This test's group names sort lexicographically
+    // wherever `u` falls. That depends on however many OTHER distinct
     // workflow_name values a shared `HARVEST_TEST_DATABASE_URL` database has
-    // accumulated in the last hour (other suites/runs contribute rows here
-    // too) -- a small limit could silently truncate this test's own groups
-    // out of the result on a busy shared database, failing the `.expect(...)`
-    // lookups below for a reason that has nothing to do with the query's
-    // correctness (Codex review, PR #1381).
+    // accumulated in the last hour. Other suites and runs contribute rows
+    // here too. A small limit could silently truncate this test's own groups
+    // out of the result, on a busy shared database. That would fail the
+    // `.expect(...)` lookups below, for a reason that has nothing to do with
+    // the query's correctness.
     let rows = load_usage_grouped(&mut conn, SHARD_ID, &query, 1_000_000)
         .await
         .expect("query usage report");
@@ -285,14 +288,15 @@ async fn usage_report_activity_lookback_index_does_not_change_the_result_set() {
 // ---------------------------------------------------------------------------
 
 /// 40,000 workflow executions across 30 workflow names, spread over the last
-/// 80 days. Activity fan-out per execution is deliberately skewed: 85% get a
-/// small 1-5 count (the overwhelming majority of real workflows), 14% get a
-/// medium 5-25 count, and 1% get a heavy 50-300 count -- the batch/DAG-run
-/// tail this LATERAL subquery's cost scales with, since it re-pays its cost
-/// once per activity in that workflow. 10% of activities get a second
-/// (retry) `ActivityStarted` attempt, exercising the same "which attempt
-/// owns this terminal event" resolution the correctness test above checks
-/// directly, at production scale.
+/// 80 days. Activity fan-out per execution is deliberately skewed. 85% get a
+/// small 1-5 count, the overwhelming majority of real workflows. 14% get a
+/// medium 5-25 count, and 1% get a heavy 50-300 count. That heavy tail is the
+/// batch/DAG-run population this LATERAL subquery's cost scales with. It
+/// re-pays its cost once per activity in that workflow.
+///
+/// 10% of activities get a second, retry, `ActivityStarted` attempt. That
+/// exercises the same "which attempt owns this terminal event" resolution
+/// the correctness test above checks directly, at production scale.
 const FIXTURE_EXECUTIONS: i64 = 40_000;
 
 async fn seed_production_shaped_fixture(conn: &mut AsyncPgConnection) {
@@ -446,24 +450,24 @@ async fn capture(
     out_dir: &std::path::Path,
     label: &str,
 ) -> Vec<UsageRow> {
-    // Unlike CREATE EXTENSION above (best-effort: a genuinely absent
-    // extension just means no evidence, handled by the stats query's own
-    // unwrap_or_else below), a reset failure here must not be swallowed: the
-    // extension already exists by this point, so a failure means something
-    // else is wrong (e.g. the connecting role lacks EXECUTE on
-    // pg_stat_statements_reset()) and both forms' normalized query text is
-    // identical, so silently proceeding would let the "before" counts leak
-    // into the "after" capture and Postgres would aggregate the two,
-    // publishing a contaminated comparison that still reports success
-    // (Codex review, PR #1381).
+    // Unlike CREATE EXTENSION above, this reset failure must not be
+    // swallowed. That call is best-effort: a genuinely absent extension just
+    // means no evidence, handled by the stats query's own unwrap_or_else
+    // below. But the extension already exists by this point. So a reset
+    // failure means something else is wrong -- for example, the connecting
+    // role lacks EXECUTE on pg_stat_statements_reset(). Both forms'
+    // normalized query text is identical. So silently proceeding would let
+    // the "before" counts leak into the "after" capture. Postgres would then
+    // aggregate the two, publishing a contaminated comparison that still
+    // reports success.
     //
     // Scoped to THIS database's dbid (`pg_stat_statements_reset(0, dbid, 0)`),
-    // not the bare zero-argument form: `setup_bench_db` provisions its own
-    // throwaway database, but `pg_stat_statements` is a per-CLUSTER view, and
-    // the zero-argument reset wipes statistics for every database, user and
-    // query on the whole server -- if `HARVEST_TEST_DATABASE_URL` names a
-    // Postgres shared with other tenants' monitoring, this would destroy
-    // their data on every capture (Codex review, PR #1381).
+    // not the bare zero-argument form. `setup_bench_db` provisions its own
+    // throwaway database. But `pg_stat_statements` is a per-CLUSTER view. The
+    // zero-argument reset wipes statistics for every database, user and query
+    // on the whole server. If `HARVEST_TEST_DATABASE_URL` names a Postgres
+    // shared with other tenants' monitoring, this would destroy their data on
+    // every capture.
     diesel::sql_query(
         "SELECT pg_stat_statements_reset(0, \
          (SELECT oid FROM pg_database WHERE datname = current_database()), 0)",
@@ -483,17 +487,18 @@ async fn capture(
     )
     .expect("write explain artifact");
 
-    // `pg_stat_statements` is a per-CLUSTER view: on a `HARVEST_TEST_DATABASE_URL`
-    // server shared with other databases (the same scenario the scoped reset
-    // above guards against), an unscoped SELECT here ranks THIS database's
-    // freshly-reset entries alongside every OTHER database's un-reset,
-    // possibly larger ones matching the same LIKE pattern -- discovered
-    // directly while verifying the reset fix: querying this bench db's own
-    // dbid showed only 3 rows, but the unscoped query returned 5, the extra
-    // two pulled from other databases on this same Postgres instance (one of
-    // them this very verification's own `postgres` database). Scoped to
-    // `current_database()`'s dbid so the "top 5" ranking can only ever
-    // reflect this run's own statements.
+    // `pg_stat_statements` is a per-CLUSTER view. On a
+    // `HARVEST_TEST_DATABASE_URL` server shared with other databases, an
+    // unscoped SELECT here ranks THIS database's freshly-reset entries
+    // alongside every OTHER database's un-reset entries. That sharing is the
+    // same scenario the scoped reset above guards against. Those foreign
+    // entries can match the same LIKE pattern and have larger buffer counts.
+    // This was discovered directly while verifying the reset fix. Querying
+    // this bench db's own dbid showed only 3 rows, but the unscoped query
+    // returned 5. The extra two came from other databases on this same
+    // Postgres instance, one of them this very verification's own `postgres`
+    // database. Scoped to `current_database()`'s dbid so the "top 5" ranking
+    // can only ever reflect this run's own statements.
     let stats: Vec<StatRow> = diesel::sql_query(
         "SELECT query, calls, shared_blks_hit, shared_blks_read, \
          (shared_blks_hit + shared_blks_read) AS total_buffers, temp_blks_written \
@@ -531,12 +536,12 @@ async fn capture(
     rows
 }
 
-/// Regenerates `docs/perf-artifacts/usage-report-activity-lookback/`:
-/// before/after `EXPLAIN`, a `pg_stat_statements` snapshot for each, and a
-/// result-set equivalence check -- same query text both times, only the
-/// schema changes (the candidate index is created between captures).
-/// `#[ignore]`d -- seeds a quarter million+ event rows and takes well over a
-/// minute.
+/// Regenerates `docs/perf-artifacts/usage-report-activity-lookback/`. It
+/// captures before/after `EXPLAIN`, a `pg_stat_statements` snapshot for each,
+/// and a result-set equivalence check. The query text is the same both
+/// times; only the schema changes, since the candidate index is created
+/// between captures. `#[ignore]`d -- seeds a quarter million+ event rows and
+/// takes well over a minute.
 ///
 /// Needs `HARVEST_TEST_DATABASE_URL` (an admin connection string) or a
 /// reachable Docker daemon for `claim_bench_support::db::setup_bench_db`'s
@@ -563,9 +568,10 @@ async fn zz_capture_usage_report_activity_lookback_evidence() {
     std::fs::create_dir_all(&out_dir).expect("create artifact output directory");
 
     let mut conn = db::connect(&bench.url).await;
-    // `setup_bench_db` provisions a fresh throwaway database; `pg_stat_statements`
-    // (preloaded cluster-wide) still needs its view created IN this database
-    // before it will report anything for queries run against it.
+    // `setup_bench_db` provisions a fresh throwaway database.
+    // `pg_stat_statements` is preloaded cluster-wide, but it still needs its
+    // view created IN this database. Only then will it report anything for
+    // queries run against it.
     diesel::sql_query("CREATE EXTENSION IF NOT EXISTS pg_stat_statements")
         .execute(&mut conn)
         .await
@@ -573,8 +579,8 @@ async fn zz_capture_usage_report_activity_lookback_evidence() {
     seed_production_shaped_fixture(&mut conn).await;
 
     // `setup_bench_db` runs every migration, including
-    // `20260905181020_harvest_usage_activity_lookback_index` once it ships --
-    // so on a checkout at or after that migration, the candidate index
+    // `20260905181020_harvest_usage_activity_lookback_index` once it ships.
+    // So on a checkout at or after that migration, the candidate index
     // already exists by the time we get here. Drop it unconditionally before
     // the "before" capture so this test keeps reproducing the pre-fix
     // baseline regardless of which side of the migration HEAD sits on.

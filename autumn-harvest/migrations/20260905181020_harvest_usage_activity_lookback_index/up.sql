@@ -134,14 +134,21 @@
 -- race, and the convergence loop's "the gap is an instant, so what could
 -- possibly land in it" reasoning does not make the drain case safe to ignore.
 --
--- The actual mitigation is to close the window at the source: set
--- `RetentionConfig.partitions.enabled = false`
--- (`PartitionMaintenanceConfig::enabled`) and roll it out to every worker on
--- the target shard *before* starting the convergence loop; run the loop and
--- the parent statement, then restore `enabled = true`. With maintenance
--- paused, neither `ensure_partitions` nor `drain_default` can create a
--- partition during the window, and the convergence loop's zero-row check is
--- then exact, not merely probabilistic.
+-- The actual mitigation has two parts, because there are two independent
+-- callers. Setting `RetentionConfig.partitions.enabled = false`
+-- (`PartitionMaintenanceConfig::enabled`), rolled out to every worker on the
+-- target shard, closes only the AUTOMATIC path -- `retention.rs`'s
+-- background janitor. It does NOT close the `harvest partition maintain` CLI
+-- path: `autumn-harvest-cli::run_partition_maintain` calls
+-- `partition::maintain` directly, with no reference to `RetentionConfig` at
+-- all, so a person or a cron running that command is unaffected by the
+-- config flag. Both must be true for the whole window, from before the
+-- convergence loop starts through the parent statement finishing: `enabled =
+-- false` on every worker, AND an operational freeze -- no one runs `harvest
+-- partition maintain`, nor calls `partition::maintain`, `ensure_partitions`,
+-- or `drain_default` directly, against this shard by any other means. Only
+-- with both does the convergence loop's zero-row check become exact rather
+-- than probabilistic.
 --
 -- For an operator who cannot take that config-and-restart round trip: the
 -- residual, unmitigated risk is that the parent statement performs a
