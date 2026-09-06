@@ -485,18 +485,34 @@ Both regenerate the `EXPLAIN` captures, `pg_stat_statements` snapshots, and
 shared_preload_libraries = 'pg_stat_statements'` plus a restart, if not
 already configured) -- without it the capture fails loudly with
 `pg_stat_statements must be loaded via shared_preload_libraries` rather than
-silently producing a partial artifact set. The write-cost table additionally
-needs `pg_stat_statements.track = 'all'`, which the harness sets itself for
-its own seeding session only -- no server-level configuration is required
-beyond the extension being loaded, but the `HARVEST_TEST_DATABASE_URL` role
-itself must be able to run that `SET`. Unlike every other step this harness
-performs (creating/dropping databases, migrating, seeding, `TRUNCATE`),
-setting `pg_stat_statements.track` is a superuser-context parameter: it needs
-either a superuser role, or one explicitly granted `SET` on this specific
-parameter (`GRANT SET ON PARAMETER pg_stat_statements.track TO <role>`,
-PG15+). A plain `CREATEDB`-only admin role -- sufficient for every other
-capture script in this repo -- is not enough on its own for this one. The
-Docker fallback's testcontainer connects as `postgres` and never hits this;
-an external `HARVEST_TEST_DATABASE_URL` might. If the `SET` fails, the
-capture fails loudly naming the exact requirement, rather than with a bare
-permission-denied error.
+silently producing a partial artifact set.
+
+An external `HARVEST_TEST_DATABASE_URL` role needs two further privileges
+beyond `CREATEDB`, both superuser-context and both required before this
+page's write-cost table can be produced:
+
+- **`EXECUTE` on `pg_stat_statements_reset(...)`.** Every capture in this
+  repo's shared claim-budget harness resets statement statistics before
+  seeding, to keep a stale entry from a prior run out of the fresh
+  capture's ranking (see the rationale at
+  `zz_capture_queue_pause_claim_evidence` in
+  `claim_budget_tests.rs`). This function's `EXECUTE` privilege is
+  superuser-only by default on every PostgreSQL version this repo
+  supports, so a plain `CREATEDB`-only admin role has never been
+  sufficient for *any* capture script here, this one included -- fixing
+  only the next privilege below would still leave the reset call failing
+  first.
+- **`SET` on `pg_stat_statements.track`.** The write-cost table additionally
+  needs `pg_stat_statements.track = 'all'`, which the harness sets itself
+  for its own seeding session only -- no server-level configuration is
+  required beyond the extension being loaded, but the
+  `HARVEST_TEST_DATABASE_URL` role itself must be able to run that `SET`.
+  Setting this parameter is superuser-context, so it needs either a
+  superuser role, or one explicitly granted `SET` on this specific
+  parameter (`GRANT SET ON PARAMETER pg_stat_statements.track TO <role>`,
+  PG15+).
+
+The Docker fallback's testcontainer connects as `postgres` and never hits
+either requirement; an external `HARVEST_TEST_DATABASE_URL` might hit both.
+If either call fails, the capture fails loudly naming the exact
+requirement, rather than with a bare permission-denied error.
