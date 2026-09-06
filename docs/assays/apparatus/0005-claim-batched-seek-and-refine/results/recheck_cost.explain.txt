@@ -13,8 +13,8 @@
                Buffers: shared hit=3
  Planning:
    Buffers: shared hit=40
- Planning Time: 0.235 ms
- Execution Time: 0.470 ms
+ Planning Time: 0.203 ms
+ Execution Time: 0.248 ms
 (15 rows)
 
                                                                    QUERY PLAN                                                                    
@@ -32,7 +32,7 @@
                Buffers: shared hit=3
  Planning:
    Buffers: shared hit=38
- Planning Time: 0.190 ms
- Execution Time: 0.238 ms
+ Planning Time: 0.173 ms
+ Execution Time: 0.217 ms
 (15 rows)
 

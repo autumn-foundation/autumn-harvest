@@ -1,13 +1,16 @@
 # ⛏️ Prospect: does a batched seek-and-refine rewrite fix issue #1340? (kill: 2 vs 1 batch on L4's own line, ledger #5)
 
-> Status: **measured, then corrected post-review.** The pre-registration
+> Status: **measured, then corrected across four rounds of post-review.**
+> The pre-registration
 > (`docs/rnd/2026-09-06-claim-batched-seek-and-refine-preregistration.md`,
 > commit `ee3bc19`) was committed before the apparatus was built or run;
 > nothing in it has been edited since. This report's numbers are from the
-> apparatus's second run, after fixing a correctness bug and a
-> mischaracterized mechanism that Codex's automated review of the PR caught
-> in the first run (see "Post-review corrections" below) — the
-> pre-registered lines themselves are unchanged.
+> apparatus's sixth run, after Codex's automated review of the PR caught
+> (in order): a mischaracterized fetch mechanism, a keyset-cursor
+> correctness bug, a missing concurrency-safety recheck, a stale cost
+> citation, and a non-idempotent apparatus schema (see "Post-review
+> corrections" below for all ten items) — the pre-registered lines
+> themselves are unchanged throughout.
 
 ## 🎯 Question
 
@@ -346,11 +349,43 @@ half of the reviewer's own proposed remedy, not a re-registration.
    size independently of key count would be a cleaner test of the same
    claim, and is not this assay's own contribution to run.
 
+**Round 4 (same PR, fourth review pass):**
+
+9. **Reproducibility bug (P2): `schema.sql` isn't idempotent, and the new
+   `tee`-based logging (item 4) made a failed rerun destructive.**
+   `schema.sql`'s `CREATE TABLE` has no guard, unchanged from ledger #3/#4's
+   own copy; a second `./run_assay.sh` invocation against the same database
+   (exactly what the archived "Reproduce" command does if run twice without
+   an intervening `dropdb`) fails immediately under `ON_ERROR_STOP` with
+   `relation "harvest_task_queue" already exists` — confirmed directly by
+   running it twice in a row. Combined with item 4's fix, `tee` opens
+   `results/run.log` in truncate mode before `psql` produces any output, so
+   the failed rerun would also have erased the previously archived log
+   without producing new measurements. **Fixed:** `schema.sql` now leads
+   with `DROP TABLE IF EXISTS harvest_task_queue;` (only in this assay's
+   own copy — not backported to #3/#4's archived, closed copies). Verified
+   directly: ran `./run_assay.sh` twice in a row against the same database
+   with no intervening `dropdb`; the second run completed cleanly.
+
+10. **Stale citation (P2): the report's equivalence-check ids no longer
+    matched the archived files.** An earlier round's re-seeding for
+    `recheck_cost_diagnostic.sql` (item 8) advances the shared `BIGSERIAL`
+    sequence before the equivalence checks run later in the same session
+    (`TRUNCATE` doesn't reset it), so the ids these checks produce shift
+    between runs — the report still quoted an earlier round's `54293`/
+    `64293` after a later round's archived files had moved to `78293`/
+    `88293`. **Fixed:** updated to the current archived values, with a note
+    that the specific ids are expected to shift between runs and only the
+    control/candidate match on each line is the actual claim.
+
 ## 📊 Assay
 
 All measurements from `docs/assays/apparatus/0005-claim-batched-seek-and-refine/results/`
-(`run.log`, `*.txt`, `*.explain.txt`), from the apparatus's fourth run (post
-all three rounds of corrections above), one continuous psql session.
+(`run.log`, `*.txt`, `*.explain.txt`), from the apparatus's sixth run (post
+all four rounds of corrections above — the fifth run, immediately prior,
+verified item 9's idempotency fix by re-running against the same database
+with no intervening `dropdb`; its numbers are the ones archived and used
+here), one continuous psql session.
 
 **Buffers (L1, idle: 10,000 backlog, 4 queues, 256 keys, 0 RUNNING):**
 
@@ -367,25 +402,31 @@ all three rounds of corrections above), one continuous psql session.
 
 | scenario | keys | running | control (`control_raw.sql`) | candidate (`claim_batched()`) | batches |
 |:--|--:|--:|--:|--:|--:|
-| idle_256 | 256 | 0 | 5.883 ms | 8.640 ms | 1 |
-| hot_256 | 256 | 2,000 | 139.331 ms | 9.143 ms | 1 |
-| hot_5000 | 5,000 | 2,000 | 970.673 ms | 6.200 ms | 1 |
-| **l4_adversarial (50 poison)** | 256 | 20 | — (n/a) | **36.204 ms** | **2** |
-| **l5_adversarial (200 poison)** | 256 | 20 | — (n/a) | **74.420 ms** | **5** |
+| idle_256 | 256 | 0 | 6.195 ms | 8.381 ms | 1 |
+| hot_256 | 256 | 2,000 | 139.996 ms | 8.550 ms | 1 |
+| hot_5000 | 5,000 | 2,000 | 971.669 ms | 5.123 ms | 1 |
+| **l4_adversarial (50 poison)** | 256 | 20 | — (n/a) | **34.734 ms** | **2** |
+| **l5_adversarial (200 poison)** | 256 | 20 | — (n/a) | **73.636 ms** | **5** |
 
 (Wall-clock figures carry run-to-run noise on this box, same as every prior
 ledger entry — e.g. `hot_256` control ranged 139-222ms and L4 ranged
-34.9-36.2ms across this assay's four runs. Read them for order of magnitude
+34.7-47.4ms across this assay's six runs. Read them for order of magnitude
 relative to the same run's own control, not as exactly reproducible
 absolutes.)
 
 Equivalence check: candidate claimed the identical row id to control in
 every non-adversarial scenario (`results/equivalence_idle_256.txt`:
-`54293`/`54293`; `equivalence_hot_256.txt`: `64293`/`64293`; hot_5000's two
-raw outputs both read `22001`). Correctness in both adversarial scenarios
-was re-confirmed after both the tiebreaker fix and the authoritative-recheck
-fix: same claimed row, same batch counts (L4: 2, L5: 5), across all three
-runs of this apparatus.
+`78293`/`78293`; `equivalence_hot_256.txt`: `88293`/`88293`; hot_5000's two
+raw outputs both read `22001`). The specific id values shift between runs
+(round 3's re-seeding for `recheck_cost_diagnostic.sql` advances the shared
+`BIGSERIAL` sequence before these two checks run later in the same
+session — `TRUNCATE` does not reset it), which is why these numbers moved
+from an earlier round's `54293`/`64293`; only the match between `control`
+and `candidate` on each line is the actual claim. Correctness in both
+adversarial scenarios was re-confirmed after the tiebreaker fix, the
+authoritative-recheck fix, and the schema-idempotency fix (item 9, below):
+same claimed row, same batch counts (L4: 2, L5: 5), across all four runs of
+this apparatus.
 
 **Against the lines:**
 
@@ -393,8 +434,8 @@ runs of this apparatus.
   inside the line and two orders of magnitude below ledger #3's 10,130-buffer
   kill. (See "Post-review corrections" above for what this number does and
   does not establish about *why* it's cheap.)
-- **L2 — PASS, decisively.** 6.200ms vs. ≤160ms — **25.8x** inside the line,
-  **156.6x** faster than this run's own control (970.673ms). The
+- **L2 — PASS, decisively.** 5.123ms vs. ≤160ms — **31.2x** inside the line,
+  **189.6x** faster than this run's own control (971.669ms). The
   per-candidate authoritative recheck's cost stays independent of **distinct
   key count** (5,000 here vs. 256 at L1/L3) — confirmed directly at 34
   buffers in both cases (`recheck_cost_diagnostic.sql`, item 8) — because
@@ -404,11 +445,11 @@ runs of this apparatus.
   the size of the `RUNNING` **population** (2,000 in both L2 and L3's
   fixtures) instead — a real property, but narrower than "cheap regardless
   of scale" until that population size is itself varied.
-- **L3 — PASS, decisively.** 9.143ms vs. ≤278.66ms (2x control's
-  139.331ms) — **15.2x faster than control outright**, not just inside the
+- **L3 — PASS, decisively.** 8.550ms vs. ≤279.99ms (2x control's
+  139.996ms) — **16.4x faster than control outright**, not just inside the
   line.
 - **L4 — FAIL on the batch-count sub-criterion.** Wall-clock passes cleanly
-  (36.204ms vs. ≤100ms, **2.8x** inside the line) — but the shape resolved
+  (34.734ms vs. ≤100ms, **2.9x** inside the line) — but the shape resolved
   in **2 batches, not the registered 1**. This is a fencepost error in the
   pre-registration itself, not a mechanism finding: with `B=50` and exactly
   50 poisoned rows ranked ahead of the one claimable row, batch 1 fetches
@@ -419,16 +460,16 @@ runs of this apparatus.
   registered "1" undercounted by exactly the one slot the claimable row
   itself occupies.
 - **L5 — FAIL on the same sub-criterion, same root cause.** Wall-clock
-  passes cleanly (74.420ms vs. ≤400ms, **5.4x** inside the line) — but the
+  passes cleanly (73.636ms vs. ≤400ms, **5.4x** inside the line) — but the
   shape resolved in **5 batches, not the registered 4**. Same fencepost:
   `ceil((200 + 1) / 50) = 5`, not `ceil(200/50) = 4`.
 
 **Riskiest assumption, checked first:** the risk this shape's own mechanism
 introduces (per the pre-registration) was whether cost degrades linearly in
 *batch count* rather than catastrophically, the way ledger #4's shape
-degraded catastrophically in *attempt count*. That holds: 36.204ms at 2
-batches, 74.420ms at 5 batches — a 2.5x batch-count increase producing a
-2.06x wall-clock increase, consistent with cost scaling as `batches ×
+degraded catastrophically in *attempt count*. That holds: 34.734ms at 2
+batches, 73.636ms at 5 batches — a 2.5x batch-count increase producing a
+2.12x wall-clock increase, consistent with cost scaling as `batches ×
 (cost of one batch)`. This is a real, substantive answer, but per the
 post-review correction above it is a narrower one than originally framed:
 it confirms batching degrades gracefully in *batch count* at this backlog
@@ -443,8 +484,8 @@ regardless of how the other three lines perform or why the miss happened.
 
 **This kill is on the pre-registration's own arithmetic, not on the
 candidate mechanism's batch-count scaling** — every wall-clock line clears
-by 2.8x-157x, and the batch-count scaling itself is linear as designed.
-Three rounds of post-review correction narrow what this assay can claim
+by 2.9x-190x, and the batch-count scaling itself is linear as designed.
+Four rounds of post-review correction narrow what this assay can claim
 even if the batch-count lines had been written correctly: this apparatus
 never established that batching bounds cost independent of backlog depth,
 only that it doesn't cost meaningfully more than the (already `O(backlog)`
@@ -504,6 +545,9 @@ corrected arithmetic.
 ```
 sudo -u postgres createdb prospect_assay5   # or any local, non-production Postgres 16
 cd docs/assays/apparatus/0005-claim-batched-seek-and-refine
+PGDATABASE=prospect_assay5 ./run_assay.sh
+# schema.sql is idempotent (item 9): rerunning against the same database
+# without dropping it first is safe and expected to work.
 PGDATABASE=prospect_assay5 ./run_assay.sh
 cat results/run.log
 grep "Buffers: shared hit=180" results/idle_256-batch_claim.explain.txt

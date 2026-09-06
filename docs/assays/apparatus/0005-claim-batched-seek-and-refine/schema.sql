@@ -1,6 +1,16 @@
 -- Minimal stand-in for harvest_task_queue, columns/indexes limited to what
 -- the concurrency gate + ORDER BY/LIMIT pushdown question needs. See the
 -- pre-registration's "Conditions" section for what was cut and why.
+--
+-- NOTE (post-review, Codex, round 4): ledger #3/#4's own copy of this file
+-- (unmodified here otherwise) has no DROP, so `run_assay.sh` documented as
+-- "createdb, then run" fails outright with `psql`'s `ON_ERROR_STOP` on any
+-- second invocation against the same database -- and since `run_assay.sh`
+-- now `tee`s to `results/run.log` (a separate post-review fix), that
+-- failed rerun would also truncate the previously archived log before
+-- erroring. Added here so this apparatus's own reproduce instructions are
+-- actually idempotent; not backported to #3/#4's archived copies.
+DROP TABLE IF EXISTS harvest_task_queue;
 CREATE TABLE harvest_task_queue (
     id               BIGSERIAL PRIMARY KEY,
     queue_name       TEXT NOT NULL,
