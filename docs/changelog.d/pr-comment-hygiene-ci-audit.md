@@ -3688,3 +3688,24 @@ On timing: the two new scans are linear, measured at 1000/2000/4000/8000
 words. A whole-corpus run is 32.8 seconds against 33.0 for the previous
 head, measured back to back -- the "23 seconds" quoted in earlier rounds
 was taken on a differently loaded machine and is not a baseline.
+
+Round 122 -- a block expression used as a statement.
+
+`// async move {};` and `// const { let value = 1; };` produced no CH001.
+The control-flow rule ends its line at the opening brace; these end at a
+`;`, and nothing read them.
+
+rustc 1.94.1 gives the set, and it is not the two reported. `unsafe {};`
+is the third and was not named. `move {}` is NOT one -- "expected one of
+`async`, `|`, or `||`" -- and `try` and `gen` blocks are E0658,
+experimental, so all three stay out rather than being admitted for
+symmetry.
+
+A bare `{ let x = 1; };` is valid too and is deliberately NOT admitted.
+Without a keyword there is nothing to anchor on, and a braced aside in
+prose would reach it. Stated as an under-report rather than taken.
+
+The four-lowercase-word lookahead comes along, so
+`// const {the shard map is stale};` stays prose.
+
+Corpus effect: none, at 19311. Five fixtures, two of them refusals.

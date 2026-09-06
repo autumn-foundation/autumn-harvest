@@ -677,6 +677,25 @@ COMMENTED_CODE_RE = re.compile(
             (?:(?:while|for|loop)\b
                 (?![^;{]*\b[a-z]+\s+[a-z]+\s+[a-z]+\s+[a-z]+\b){NOS}*)?
             \{\s*$
+      # A BLOCK EXPRESSION used as a statement. The control-flow rule
+      # above ends its line at the opening brace; these end at a `;`, and
+      # nothing read them.
+      #
+      # rustc 1.94.1 gives the set. `async {}`, `async move {}`, `const {}`
+      # and `unsafe {}` all compile as statements -- `unsafe` was not
+      # reported and is here for the same reason as the other two. `move
+      # {}` is not one ("expected one of `async`, `|`, or `||`"), and `try`
+      # and `gen` blocks are E0658, experimental, so all three stay out.
+      #
+      # A BARE `{ let x = 1; };` is also valid and is NOT admitted: without
+      # a keyword in front there is nothing to anchor on, and a braced
+      # aside in prose would reach it. That is a stated under-report.
+      #
+      # The four-lowercase-word lookahead comes along, so
+      # `// const {the shard map is stale};` stays prose.
+      | (?:async(?:\s+move)?|const|unsafe)\s*
+            (?![^;]*\b[a-z]+\s+[a-z]+\s+[a-z]+\s+[a-z]+\b)
+            \{.*\}\s*;\s*$
       | (?:\}\s*)?else\b
             (?![^;{]*\b[a-z]+\s+[a-z]+\s+[a-z]+\s+[a-z]+\b)
             (?:\s+if\b{NOS}*)?\s*\{\s*$
@@ -6110,6 +6129,31 @@ RULE_TESTS = [
         '// #[doc = "text with ] bracket"]\n',
         {("CH001", 1)},
         "and a bracket inside a string closes nothing",
+    ),
+    (
+        "// async move {};\n",
+        {("CH001", 1)},
+        "a block expression may be a statement",
+    ),
+    (
+        "// const { let value = 1; };\n",
+        {("CH001", 1)},
+        "a const block among them",
+    ),
+    (
+        "// unsafe {};\n",
+        {("CH001", 1)},
+        "and an unsafe block, which the report did not name",
+    ),
+    (
+        "// move {};\n",
+        set(),
+        "but move opens no block, which rustc says outright",
+    ),
+    (
+        "// const {the shard map is stale};\n",
+        set(),
+        "and a braced sentence is still a sentence",
     ),
     (
         '// #[doc = include_str!("../README.md")]\n',
