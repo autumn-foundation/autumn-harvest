@@ -2221,9 +2221,10 @@
         "responses": {
           "200": {
             "content": {
-              "application/json": {
+              "text/plain; version=0.0.4; charset=utf-8": {
                 "schema": {
-                  "description": "Shape is documented in the response description, not as a schema."
+                  "description": "Text body in the declared format. See the response description.",
+                  "type": "string"
                 }
               }
             },
@@ -2376,6 +2377,12 @@
               "application/json": {
                 "schema": {
                   "description": "Shape is documented in the response description, not as a schema."
+                }
+              },
+              "text/plain; version=0.0.4; charset=utf-8": {
+                "schema": {
+                  "description": "Text body in the declared format. See the response description.",
+                  "type": "string"
                 }
               }
             },
@@ -3054,15 +3061,6 @@
         "operationId": "get_admin_schedules_decisions",
         "parameters": [
           {
-            "description": "Filter by schedule UUID.",
-            "in": "query",
-            "name": "schedule_id",
-            "required": false,
-            "schema": {
-              "type": "string"
-            }
-          },
-          {
             "description": "Filter by decision kind (e.g. fired, skipped, overlap_skipped).",
             "in": "query",
             "name": "decision",
@@ -3087,6 +3085,24 @@
             "required": false,
             "schema": {
               "type": "integer"
+            }
+          },
+          {
+            "description": "Filter to one schedule by name. This is the filter the handler applies; there is no id filter on this route.",
+            "in": "query",
+            "name": "schedule_name",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "RFC 3339 lower bound on occurred_at.",
+            "in": "query",
+            "name": "since",
+            "required": false,
+            "schema": {
+              "type": "string"
             }
           }
         ],
@@ -3793,6 +3809,15 @@
             "required": false,
             "schema": {
               "type": "integer"
+            }
+          },
+          {
+            "description": "RFC 3339 lower bound on occurred_at.",
+            "in": "query",
+            "name": "since",
+            "required": false,
+            "schema": {
+              "type": "string"
             }
           }
         ],
@@ -5148,6 +5173,24 @@
             "schema": {
               "type": "string"
             }
+          },
+          {
+            "description": "Filter by batch job status.",
+            "in": "query",
+            "name": "status",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Filter by the action the batch applies: cancel, terminate, or signal.",
+            "in": "query",
+            "name": "action",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
           }
         ],
         "responses": {
@@ -6045,9 +6088,9 @@
             }
           },
           {
-            "description": "Pagination cursor.",
+            "description": "Filter to dead letters owned by one workflow or activity.",
             "in": "query",
-            "name": "cursor",
+            "name": "owner",
             "required": false,
             "schema": {
               "type": "string"

@@ -396,6 +396,31 @@ fn documented_response_headers_are_published() {
     );
 }
 
+/// A route that answers in more than one representation declares both.
+///
+/// `GET /admin/queues/scaling` returns Prometheus text for `format=prometheus`
+/// and JSON otherwise, and `GET /admin/metrics` is Prometheus text only. A
+/// generated client that assumed JSON would fail to decode either.
+#[test]
+fn multi_format_responses_declare_every_media_type() {
+    let doc = document();
+    const PROMETHEUS: &str = "text/plain; version=0.0.4; charset=utf-8";
+
+    let metrics = &doc["paths"]["/admin/metrics"]["get"]["responses"]["200"]["content"];
+    assert!(metrics[PROMETHEUS].is_object(), "{metrics}");
+    assert!(
+        metrics["application/json"].is_null(),
+        "the metrics scrape is never JSON"
+    );
+
+    let scaling = &doc["paths"]["/admin/queues/scaling"]["get"]["responses"]["200"]["content"];
+    assert!(scaling["application/json"].is_object(), "{scaling}");
+    assert!(scaling[PROMETHEUS].is_object(), "{scaling}");
+
+    // Only an event stream is unbounded, so only it carries the marker.
+    assert!(doc["paths"]["/admin/metrics"]["get"]["x-harvest-stream"].is_null());
+}
+
 /// A streaming route says so, and does not pretend to return JSON.
 #[test]
 fn streaming_operations_are_marked() {

@@ -246,7 +246,7 @@ fn operation(route: &Value) -> Result<Value, OpenApiError> {
     // document says so where a generator can read it.
     if route["success_response"]["content_type"]
         .as_str()
-        .is_some_and(|media_type| media_type != DEFAULT_MEDIA_TYPE)
+        .is_some_and(|media_type| media_type.starts_with("text/event-stream"))
     {
         operation.insert("x-harvest-stream".to_owned(), json!(true));
     }
@@ -514,14 +514,8 @@ fn responses(route: &Value) -> Result<Value, OpenApiError> {
         .entry(status)
         .or_default()
         .push(description_of(success, method, path)?);
-    let media_type = success["content_type"]
-        .as_str()
-        .unwrap_or(DEFAULT_MEDIA_TYPE);
     if !is_bodiless(status) {
-        bodies.insert(
-            status,
-            json!({ media_type: { "schema": success_schema(success, media_type) } }),
-        );
+        bodies.insert(status, content_for(success));
     }
     if let Some(declared) = response_headers(success) {
         headers.insert(status, declared);
@@ -553,13 +547,7 @@ fn responses(route: &Value) -> Result<Value, OpenApiError> {
                 )));
             }
             if documents_a_body && !is_bodiless(code) && !bodies.contains_key(&code) {
-                let media_type = response["content_type"]
-                    .as_str()
-                    .unwrap_or(DEFAULT_MEDIA_TYPE);
-                bodies.insert(
-                    code,
-                    json!({ media_type: { "schema": success_schema(response, media_type) } }),
-                );
+                bodies.insert(code, content_for(response));
             }
             if let Some(declared) = response_headers(response) {
                 headers.entry(code).or_insert(declared);
@@ -667,15 +655,43 @@ fn join_unique(parts: Vec<String>) -> String {
         .join(" ")
 }
 
+/// The `content` map for one response entry, one key per media type.
+///
+/// `content_type` is a string, or a list when a route serves the same status in
+/// more than one representation. `GET /admin/queues/scaling-signal` returns
+/// Prometheus text for `format=prometheus` and JSON otherwise.
+fn content_for(response: &Value) -> Value {
+    let declared = &response["content_type"];
+    let media_types: Vec<&str> = match declared {
+        Value::String(one) => vec![one.as_str()],
+        Value::Array(many) => many.iter().filter_map(Value::as_str).collect(),
+        _ => vec![DEFAULT_MEDIA_TYPE],
+    };
+    let mut out = Map::new();
+    for media_type in media_types {
+        out.insert(
+            media_type.to_owned(),
+            json!({ "schema": success_schema(response, media_type) }),
+        );
+    }
+    Value::Object(out)
+}
+
 /// The body schema for one response entry.
 ///
 /// A stream response is a sequence of `text/event-stream` frames, not a JSON
 /// document, so it is typed as a string.
 fn success_schema(success: &Value, media_type: &str) -> Value {
-    if media_type != DEFAULT_MEDIA_TYPE {
+    if media_type.starts_with("text/event-stream") {
         return json!({
             "type": "string",
             "description": "Server-sent event frames. See the response description.",
+        });
+    }
+    if media_type != DEFAULT_MEDIA_TYPE {
+        return json!({
+            "type": "string",
+            "description": "Text body in the declared format. See the response description.",
         });
     }
     // `free_form` with fields is a documented shape plus room to grow. The

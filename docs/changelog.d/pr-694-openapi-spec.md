@@ -131,6 +131,19 @@ against routes reverse-engineered from prose.
 - The whole by-id family resolves a business id before delegating, and the
   resolver fails closed with `503` when an expected shard has no pool or cannot
   be reached. Ten routes never declared it.
+- Two documented query parameters did nothing. `schedule_id` on
+  `GET /admin/schedules/decisions` is absent from `FleetDecisionsQuery`, so
+  serde dropped it and a caller filtering to one schedule received the whole
+  fleet; the real filters, `schedule_name` and `since`, were undocumented.
+  `cursor` on `GET /dead-letters` is likewise absent from
+  `DeadLetterListQuery`, so the advertised pagination returned the same first
+  page forever, and the supported `owner` filter was undocumented. Six more
+  accepted filters were missing: `since` on the per-schedule decisions, and
+  `status` and `action` on the batch-operations list.
+- `GET /admin/metrics` publishes Prometheus text, never JSON, and
+  `GET /admin/queues/scaling` publishes either depending on `format`. Both
+  declared `application/json` only. `content_type` now accepts a list, and the
+  stream marker is limited to `text/event-stream` rather than any non-JSON type.
 - `PATCH /tasks/{id}` has been mounted and audited since issue #249, but was
   missing from `management_api_routes()` and from the contract. It was
   therefore invisible to every existing guard, to the CLI coverage test, and to
