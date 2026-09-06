@@ -263,17 +263,23 @@ BODY = r"(?:\{(?:.*\})?)"
 # and counting levels only moves the gap one level out, which is how this
 # review has generated its own findings before.
 #
-# So the list is bounded by what CANNOT appear inside one instead: a `{`
-# ends the declaration, and so does a `;` -- unless it is the `;` of an
-# array type, which is the guard the tuple-struct and uninitialized-binding
-# alternatives have carried since round forty-one. `<T: Into<[u8; 32]>>` is
-# one list, not a declaration that ended in the middle of it.
+# So the list is bounded by what CANNOT appear inside one instead. That is
+# a `;`, unless it is the `;` of an array type -- the guard the tuple-struct
+# and uninitialized-binding alternatives have carried since round forty-one.
+# `<T: Into<[u8; 32]>>` is one list, not a declaration that ended in the
+# middle of it.
+#
+# A `{` is NOT such a character, though it was excluded as one until round
+# one hundred and five: `<const N: usize = { 1 + 2 }>` is a const-block
+# default, which rustc 1.94.1 accepts. Excluding it was a guess about what
+# a generic list may hold, and the greedy run needs no help -- it
+# backtracks to the `>` the surrounding anchor asks for either way.
 #
 # The greedy run then backtracks to the `>` that the surrounding anchor
 # needs -- the `(` of a signature, the `=` of an alias, the `{` of a body
 # -- so `Fn(u8) -> u8` is admitted while the form stays anchored on a
 # keyword and a name.
-GENERICS = r"<(?:[^;{]|;(?=[^;]*\]))*>"
+GENERICS = r"<(?:[^;]|;(?=[^;]*\]))*>"
 COMMENTED_CODE_RE = re.compile(
     r"""^(?:
         # The ABI name may carry a hyphen -- "C-unwind" and its siblings are
@@ -374,7 +380,7 @@ COMMENTED_CODE_RE = re.compile(
                 [(\[{].*
               | =\s*(?:
                       (?:b|r|br|c)?["']
-                    | \d
+                    | [0-9]
                     | (?:r\#)?\w+(?:::(?:r\#)?\w+)*\s*
                       (?=[!.?(\[{:+*/%&|^<>=,-]|\])
                   ).*
@@ -442,6 +448,8 @@ TODO_RE = re.compile(
 #
 # An issue number ends where the number ends: `#123abc` and `#1_000` are
 # not issue numbers with something after them, they are not issue numbers.
+# Its digits are ASCII, because the tracker's are. Python's `\d` also
+# matches U+0662 and U+FF14, and `#1` followed by either routes nowhere.
 # It needs no guard in FRONT, because `owner/repo#123` is a real
 # cross-repository reference and the tracker renders it as one.
 # An IPv6 literal is a host only when its bracket CLOSES. `https://[` is an
@@ -449,7 +457,7 @@ TODO_RE = re.compile(
 # citation form. So the two host shapes are spelled apart.
 REFERENCE = (
     r"(?:"
-    r"#[1-9]\d*(?!\w)"
+    r"#[1-9][0-9]*(?!\w)"
     r"|(?<![A-Za-z0-9+.\-])(?i:https?)://(?:\[[0-9A-Fa-f:.]+\]|\w)[^)\]\s]*"
     r")"
 )
@@ -913,7 +921,9 @@ FENCE_RE = re.compile(r"^([ \t]*)(`{3,}|~{3,})")
 # CommonMark caps an ordered marker at nine digits, and the cap is load-bearing
 # here: a longer run of digits is ordinary text, and accepting it opens a list
 # -- and a fence allowance -- where the rendered document has neither.
-LIST_MARKER_RE = re.compile(r"^([ \t]*)((?:[-*+]|\d{1,9}[.)]))([ \t]+|$)")
+# A marker's digits are ASCII: CommonMark says "1-9 arabic digits", so a
+# Unicode decimal digit opens no list, though Python's `\d` matches one.
+LIST_MARKER_RE = re.compile(r"^([ \t]*)((?:[-*+]|[0-9]{1,9}[.)]))([ \t]+|$)")
 # A block quote is a container too, and Rustdoc uses it. Its marker is not
 # indentation -- content inside the quote starts again at column zero -- so it
 # is stripped before any container or fence judgement. Nested and space-less
@@ -4772,6 +4782,16 @@ RULE_TESTS = [
         "but a zero inside a real number is a digit",
     ),
     (
+        "// TODO: fix #1\u0662\n",
+        {("CH002", 1)},
+        "an issue number is written in ASCII digits",
+    ),
+    (
+        "// TODO: fix #1\uff14\n",
+        {("CH002", 1)},
+        "in a fullwidth form as well as an Arabic-Indic one",
+    ),
+    (
         "// TODO: replace fallback #123abc\n",
         {("CH002", 1)},
         "an issue number ends where the number ends",
@@ -5075,6 +5095,11 @@ RULE_TESTS = [
         "// fn stale<T: Into<[u8; 32]>>() {}\n",
         {("CH001", 1)},
         "and the semicolon of an array type, which ends no declaration",
+    ),
+    (
+        "// struct Stale<const N: usize = { 1 + 2 }>;\n",
+        {("CH001", 1)},
+        "and a const block, which ends none either",
     ),
     (
         "// use foo::{bar::{Baz, Qux}, Quux};\n",

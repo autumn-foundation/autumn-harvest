@@ -3209,3 +3209,28 @@ above: every malformed variant was fed to the compiler and its answer
 pasted in.
 
 Corpus effect: none. Three fixtures, one of them a counter-case.
+
+### Round one hundred and five — a brace that ends nothing, and digits that are ASCII
+
+Two bypasses.
+
+`// struct Stale<const N: usize = { 1 + 2 }>;` produced no CH001. Round
+ninety-eight bounded a generic list by the `;` and `{` that end a
+declaration. The `;` half was right and needed the array-type guard round
+ninety-nine added; the `{` half was a guess, and rustc 1.94.1 accepts a
+const-block default. A `{` may appear inside a generic list, so it is not
+a bound at all -- and it never needed to be, because the greedy run
+backtracks to the `>` the surrounding anchor asks for.
+
+`// TODO: fix #1٢` passed the gate. Python's `\d` matches every Unicode
+decimal digit, and `#1` followed by U+0662 or U+FF14 routes nowhere. The
+tracker's digits are ASCII, so the pattern's are.
+
+The sibling sweep for that one found two more `\d` and left one alone.
+The attribute name-value branch now reads `[0-9]`, since a Rust literal is
+ASCII. `LIST_MARKER_RE` does too, because CommonMark says "1-9 arabic
+digits" and a Unicode digit opens no list. `ARCHAEOLOGY_RE` keeps `\d`
+deliberately: it is a ratcheted rule where matching MORE is the safe
+direction, and narrowing it would move a counted baseline for no gain.
+
+Corpus effect: none. Three fixtures.
