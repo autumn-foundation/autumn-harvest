@@ -314,7 +314,14 @@ CODE_SPAN_RE = re.compile(r"(`+)(?:.*?)\1")
 # marker`" on consecutive lines as ONE code span, so a line-at-a-time blank
 # never sees the opener and CH002 fails the build on the marker inside it. A
 # blank line still ends a paragraph, and a span cannot cross one.
-WRAPPED_SPAN_RE = re.compile(r"(`+)(?:(?!\n[ \t]*\n).)*?\1", re.S)
+# Both runs must be EXACTLY as long as each other, so the backreference is
+# fenced on both sides. A bare `\1` let a one-backtick opener close against a
+# "``" pair -- against its first tick, and once that was guarded, against its
+# second -- blanking text CommonMark leaves literal and taking an absolute
+# rule off it. A run is only a delimiter when no backtick abuts it.
+WRAPPED_SPAN_RE = re.compile(
+    r"(?<!`)(`+)(?:(?!\n[ \t]*\n).)*?(?<!`)\1(?!`)", re.S
+)
 
 
 def blank_code_spans(text: str) -> str:
@@ -1663,12 +1670,23 @@ def comment_lines(pieces: list[Piece]):
 def check_line_rules(path: str, pieces: list[Piece]) -> list[Finding]:
     """CH001/CH002/CH003/CH005/CH006 -- all single-line judgements."""
     findings = []
-    lines = list(comment_lines(pieces))
-    # Fenced lines are emptied rather than dropped, so their backticks cannot
-    # open a span over the prose after them and every index still lines up.
-    spanless = blank_spans_across(
-        ["" if in_fence else text for _, text, in_fence in lines]
-    )
+    lines = []
+    spanless = []
+    # PER RUN. A code span belongs to one comment, so joining the whole file
+    # let an unmatched backtick in one comment pair with a backtick in an
+    # unrelated one further down and blank everything between -- including
+    # the intervening code's own comments, and an absolute rule with them.
+    for run in comment_runs(pieces):
+        run_lines = list(comment_lines(run))
+        lines.extend(run_lines)
+        # Fenced lines are emptied rather than dropped, so their backticks
+        # cannot open a span over the prose after them and every index still
+        # lines up.
+        spanless.extend(
+            blank_spans_across(
+                ["" if in_fence else text for _, text, in_fence in run_lines]
+            )
+        )
     for index, (lineno, body, in_fence) in enumerate(lines):
         if in_fence:
             continue
@@ -3319,6 +3337,26 @@ RULE_TESTS = [
         "/// TODO: fix the parser\n",
         {("CH002", 3)},
         "and a blank line ends a paragraph, so it ends a span",
+    ),
+    (
+        "/// Explain `literal TODO: issue required`` suffix.\n"
+        "pub struct A;\n",
+        {("CH002", 1)},
+        "a one-backtick opener does not close on a two-backtick run",
+    ),
+    (
+        "/// Explain ``TODO: marker`` here.\n",
+        set(),
+        "and a two-backtick span still closes on its own run",
+    ),
+    (
+        "/// Explain the `literal\n"
+        "pub struct B;\n"
+        "\n"
+        "/// TODO: issue required` suffix.\n"
+        "pub struct C;\n",
+        {("CH002", 4)},
+        "a span cannot reach out of its own comment",
     ),
 ]
 

@@ -1715,3 +1715,29 @@ forty-one — admit a `;` where a `]` closes before the next one — and the new
 alternative was written without it. One round, one sibling, again.
 
 Corpus effect: none.
+
+### Round fifty-five — both halves of last round's fix were wrong
+
+Two findings, and both are defects in the code round fifty-four added. Both
+weaken an absolute rule by blanking text that is not a code span, so both are
+fixed.
+
+**A delimiter run has to match exactly.** The backreference let a one-backtick
+opener close against a `` `` `` pair. Guarding the closer against a following
+backtick only moved the problem to the pair's second tick; a run is a
+delimiter only when no backtick abuts it on either side, so both ends are
+fenced now. Rustdoc renders `` `literal TODO: issue required`` suffix`` as
+ordinary text, backticks and all, and the audit was blanking the marker inside
+it.
+
+**A code span belongs to one comment.** The blanking joined every comment in
+the file, so an unmatched backtick in one could pair with a backtick in an
+unrelated one further down and blank everything between — including the
+comments of the intervening code. It runs per `comment_runs` group now.
+
+I flagged that second risk when writing the fix last round and shipped it
+anyway as "rare". It was not rare; it was one review round away. The rule
+that follows is not "think harder" but "if a bound is obvious enough to note
+in a comment, it is obvious enough to implement".
+
+Corpus effect: none.
