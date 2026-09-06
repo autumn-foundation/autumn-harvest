@@ -312,6 +312,28 @@ TODO_RE = re.compile(
     r"^(?:TODO|FIXME|XXX|HACK)\b|\b(?:TODO|FIXME|XXX|HACK)\s*[:(]", re.IGNORECASE
 )
 TODO_REF_RE = re.compile(r"#\d+|https?://")
+
+
+def untracked_marker(text: str) -> bool:
+    """Does `text` carry a marker with no reference of its OWN?
+
+    Per marker, not per line. A line-wide search let one reference cover
+    every marker beside it, in two shapes: an unrelated reference already
+    on the line ("See #123 for the parser. TODO: add retries"), and a
+    second, untracked marker after a tracked one ("TODO(#123): parser;
+    TODO: add retries"). Both are untracked commitments the gate passed.
+
+    A marker owns the text from itself to the next marker, or to the end
+    of the line. That admits every form this tree writes -- "TODO(#123):",
+    "TODO: ... (#123)", a bare URL -- and refuses only a reference that
+    belongs to something else.
+    """
+    starts = [match.start() for match in TODO_RE.finditer(text)]
+    for index, start in enumerate(starts):
+        end = starts[index + 1] if index + 1 < len(starts) else len(text)
+        if not TODO_REF_RE.search(text, start, end):
+            return True
+    return False
 # An inline code span. CH002 is absolute and at zero, so a comment that
 # DOCUMENTS the marker syntax -- "Parse the `TODO:` prefix" -- must not fail
 # the build. The span is blanked rather than deleted, so every offset after
@@ -1936,7 +1958,12 @@ def check_line_rules(path: str, pieces: list[Piece]) -> list[Finding]:
         # the fence. "- let stale = compute();" is commented-out code with a
         # bullet in front of it. Peeled without a container, so only markers
         # CommonMark would accept at the left margin are removed.
-        code_line = strip_containers(stripped, [], 0)[0].strip() or stripped
+        # BLANKED first, as CH002 beside it is. A code span may wrap, so
+        # "Demonstrates `" over "let x = compute();" renders the statement
+        # as <code> -- an example of Rust, not Rust that was commented out,
+        # and failing the build on it stops the example being written.
+        spanless_body = spanless[index].strip()
+        code_line = strip_containers(spanless_body, [], 0)[0].strip() or spanless_body
         if COMMENTED_CODE_RE.match(code_line):
             findings.append(Finding("CH001", path, lineno, stripped))
 
@@ -1948,8 +1975,11 @@ def check_line_rules(path: str, pieces: list[Piece]) -> list[Finding]:
         # the raw text on purpose -- see KNOWN LIMITATIONS -- but those are
         # ratcheted, and this one fails the build outright.
         spanless_line = strip_containers(spanless[index].strip(), [], 0)[0].strip()
-        todo = TODO_RE.search(spanless_line or spanless[index].strip())
-        if todo and not TODO_REF_RE.search(stripped):
+        # The reference is read from the BLANKED text too, not the raw
+        # line. "The `#123` syntax" documents a marker's shape; it does not
+        # track the commitment beside it, and reading the raw line let it
+        # stand in for one.
+        if untracked_marker(spanless_line or spanless[index].strip()):
             findings.append(Finding("CH002", path, lineno, stripped))
 
         archaeology = ARCHAEOLOGY_RE.search(stripped)
@@ -3767,6 +3797,44 @@ RULE_TESTS = [
         "/// TODO: issue required\n",
         {("CH002", 3)},
         "though the paragraph's own end closes it",
+    ),
+    (
+        "/// Demonstrates `\n"
+        "/// let x = compute();\n"
+        "/// ` inline.\n",
+        set(),
+        "a wrapped code span is an example, not commented-out code",
+    ),
+    (
+        "/// Demonstrates it.\n"
+        "/// let x = compute();\n",
+        {("CH001", 2)},
+        "but the same statement outside one still is",
+    ),
+    (
+        "// See #123 for the parser. TODO: add retries\n",
+        {("CH002", 1)},
+        "a reference belongs to the marker it sits with, not to the line",
+    ),
+    (
+        "// TODO(#123): parser; TODO: add retries\n",
+        {("CH002", 1)},
+        "so a tracked marker does not cover an untracked one after it",
+    ),
+    (
+        "/// The `#123` syntax. TODO: add retries\n",
+        {("CH002", 1)},
+        "and a reference inside a code span is syntax, not a reference",
+    ),
+    (
+        "// TODO: add retries (#123)\n",
+        set(),
+        "a marker's own reference may follow it",
+    ),
+    (
+        "// TODO(#1): a; TODO(#2): b\n",
+        set(),
+        "and two markers each carrying one are both tracked",
     ),
 ]
 

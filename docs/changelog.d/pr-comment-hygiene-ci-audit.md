@@ -1927,3 +1927,30 @@ joined block, as the spans beside it already did.
 
 Corpus effect: none. Eleven fixtures, seven of which fail on the parent
 commit.
+
+### Round sixty-three — both absolute rules read the wrong text
+
+Two findings, one in each direction, and the same sentence fixes both:
+an absolute rule must read the text rustdoc renders, not the raw line.
+
+**CH001 read the raw line.** A code span may wrap, so `Demonstrates ` `
+over `let x = compute();` renders the statement as `<code>` -- an example
+of Rust, not Rust that was commented out. CH002 has been blanking spans
+since it was written and CH001 never did, so the gate failed the build on
+a legitimate example. It reads `spanless` now, by the same peel.
+
+**CH002 read the whole line for a reference.** One `#123` anywhere
+satisfied every marker beside it, which passed two untracked commitments:
+an unrelated reference already on the line (`See #123 for the parser.
+TODO: add retries`) and a second marker after a tracked one
+(`TODO(#123): parser; TODO: add retries`). A marker now owns the text
+from itself to the next marker, or to the end of the line. That admits
+every form this tree writes and refuses only a reference that belongs to
+something else.
+
+The reference is read from the blanked text too, which is the third
+defect and was not reported: `The `#123` syntax` documents a marker's
+shape and does not track the commitment beside it.
+
+Corpus effect: none. Seven fixtures, three of which fail on the parent
+commit, and four counter-cases pinning the forms that must stay silent.
