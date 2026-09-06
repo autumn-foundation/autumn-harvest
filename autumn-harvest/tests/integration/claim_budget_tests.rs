@@ -3023,12 +3023,27 @@ async fn zz_capture_worker_session_claim_evidence() {
         // itself -- would never be recorded individually, silently leaving
         // the write-cost table with no `calls=10000` seed entries to read.
         // `all` tracks nested statements too, scoped to this session only.
+        //
+        // This `SET` requires a superuser role, or a role explicitly granted
+        // `SET` on this specific parameter (`GRANT SET ON PARAMETER
+        // pg_stat_statements.track TO <role>`, PG15+) -- a plain `CREATEDB`
+        // role, sufficient for every other step this harness performs
+        // against `HARVEST_TEST_DATABASE_URL`, is NOT sufficient here
+        // (review finding, round 10). The Docker fallback's testcontainer
+        // connects as `postgres` (superuser) and never hits this; an
+        // external admin URL might not. Fail loudly with the exact
+        // requirement named, rather than a bare permission-denied error,
+        // if it doesn't.
         diesel::sql_query("SET pg_stat_statements.track = 'all'")
             .execute(&mut stats_conn)
             .await
             .expect(
-                "enable tracking of statements nested inside the seeding \
-                 procedure for this session",
+                "SET pg_stat_statements.track = 'all' failed -- this requires \
+                 superuser, or SET granted on this specific parameter \
+                 (GRANT SET ON PARAMETER pg_stat_statements.track TO <role>, \
+                 PG15+). A CREATEDB-only HARVEST_TEST_DATABASE_URL role is \
+                 not enough on its own: either point it at a superuser role, \
+                 or grant SET on this parameter to the role it names",
             );
         if label == "worker-session" {
             diesel::sql_query(format!(

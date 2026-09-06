@@ -415,6 +415,17 @@ shared_preload_libraries = 'pg_stat_statements'` plus a restart, if not
 already configured) -- without it the capture fails loudly with
 `pg_stat_statements must be loaded via shared_preload_libraries` rather than
 silently producing a partial artifact set. The write-cost table additionally
-needs `pg_stat_statements.track = 'all'` (the harness sets this itself, for
-its own seeding session only, so no server-level configuration is required
-beyond the extension being loaded).
+needs `pg_stat_statements.track = 'all'`, which the harness sets itself for
+its own seeding session only -- no server-level configuration is required
+beyond the extension being loaded, but the `HARVEST_TEST_DATABASE_URL` role
+itself must be able to run that `SET`. Unlike every other step this harness
+performs (creating/dropping databases, migrating, seeding, `TRUNCATE`),
+setting `pg_stat_statements.track` is a superuser-context parameter: it needs
+either a superuser role, or one explicitly granted `SET` on this specific
+parameter (`GRANT SET ON PARAMETER pg_stat_statements.track TO <role>`,
+PG15+). A plain `CREATEDB`-only admin role -- sufficient for every other
+capture script in this repo -- is not enough on its own for this one. The
+Docker fallback's testcontainer connects as `postgres` and never hits this;
+an external `HARVEST_TEST_DATABASE_URL` might. If the `SET` fails, the
+capture fails loudly naming the exact requirement, rather than with a bare
+permission-denied error.
