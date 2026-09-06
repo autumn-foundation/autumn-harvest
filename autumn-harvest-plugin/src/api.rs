@@ -13164,6 +13164,11 @@ type WorkflowTaskRow = (
     Option<serde_json::Value>,     // required_capabilities
     Option<uuid::Uuid>,            // session_id
     Option<String>,                // sticky_worker_id
+    // `harvest_task_queue.created_at` is `Nullable<Timestamptz>` (issue
+    // #501: pre-upgrade rows have none). This stays `Option` for that
+    // reason, even though every row this endpoint's own writes produce
+    // sets it.
+    Option<chrono::DateTime<chrono::Utc>>, // created_at
 );
 
 /// The narrow task-queue projection [`build_diagnosis_report`] reads.
@@ -13812,6 +13817,10 @@ pub(crate) async fn build_diagnosis_report(
             harvest_task_queue::required_capabilities,
             harvest_task_queue::session_id,
             harvest_task_queue::sticky_worker_id,
+            // Issue #1191: the provenance fingerprint
+            // `wake_source_repended_this_row` reads to settle what a
+            // coincidental timer-`fires_at` match cannot.
+            harvest_task_queue::created_at,
         ))
         .first::<WorkflowTaskRow>(&mut conn)
         .await
@@ -14206,6 +14215,7 @@ pub(crate) async fn build_diagnosis_report(
             required_capabilities,
             session_id,
             sticky_worker_id,
+            created_at,
         )| {
             WorkflowTaskFacts {
                 has_worker: worker_id.is_some(),
@@ -14238,6 +14248,7 @@ pub(crate) async fn build_diagnosis_report(
                 state,
                 queue_name,
                 scheduled_at,
+                created_at,
             }
         },
     );

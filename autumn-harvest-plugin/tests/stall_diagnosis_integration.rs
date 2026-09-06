@@ -1734,11 +1734,139 @@ async fn overdue_timer_still_wins_when_the_task_own_wake_was_missed() {
         "NOW() - INTERVAL '2 hours'",
     )
     .await;
+    // `reschedule_task` never touches `created_at`, so a genuinely
+    // timer-owned row's `created_at` is its ORIGINAL creation time --
+    // here, older than the timer's own deadline. `seed_workflow_task`
+    // defaults it to insert time (now), which would falsely look like a
+    // `wake_workflow_task` re-pend to `wake_source_repended_this_row`
+    // (issue #1191 review); backdate it explicitly.
+    {
+        let mut conn = pool.get().await.expect("pooled conn");
+        diesel::sql_query(
+            "UPDATE harvest_task_queue SET created_at = NOW() - INTERVAL '3 hours' \
+             WHERE workflow_exec_id = $1 AND task_type = 'workflow'",
+        )
+        .bind::<diesel::sql_types::Uuid, _>(exec_id.as_uuid())
+        .execute(&mut conn)
+        .await
+        .expect("backdate created_at");
+    }
     seed_live_worker(&pool, "w-live", "default").await;
 
     let body = diagnose(&app, exec_id).await;
     assert_eq!(kind(&body), "timer_overdue", "body: {body}");
     assert_eq!(body["health"], "stalled", "body: {body}");
+}
+
+/// Issue #1191. `wake_workflow_task` re-pends a parked row to PENDING. It
+/// sets `scheduled_at` to the wake instant. That is the identical row shape
+/// `persist_started_timer` leaves behind. But it happens for an unrelated
+/// reason: some other wait completed instead, a signal, a child, or an
+/// external handoff, not the armed timer. Under saturated workflow
+/// dispatch slots, the row ages past the grace window before a worker
+/// claims it. So `scheduled_at` alone cannot tell this apart from the
+/// genuinely-missed-wake case pinned above. Only a `fires_at`/`scheduled_at`
+/// match proves the timer owns the wake. Here, deliberately, it does not.
+#[tokio::test]
+async fn overdue_timer_is_not_a_stall_when_a_different_wake_source_re_pended_the_task() {
+    let (url, _guard) = setup_database().await;
+    let pool = build_pool(&url);
+    let app = build_api_app(build_api_state(&pool));
+
+    let exec_id = seed_execution(&pool, "timer_wf", "RUNNING", vec![started_event()]).await;
+    {
+        let mut conn = pool.get().await.expect("pooled conn");
+        // Armed long before the wake, unrelated to it.
+        diesel::sql_query(
+            "INSERT INTO harvest_timers (id, workflow_exec_id, timer_id, fires_at, fired) \
+             VALUES ($1, $2, 'partner_deadline', NOW() - INTERVAL '20 minutes', false)",
+        )
+        .bind::<diesel::sql_types::Uuid, _>(Uuid::new_v4())
+        .bind::<diesel::sql_types::Uuid, _>(exec_id.as_uuid())
+        .execute(&mut conn)
+        .await
+        .expect("seed overdue timer");
+    }
+    // `wake_workflow_task`'s re-pend: PENDING, `scheduled_at` = the wake
+    // instant, aged past the grace window by saturated dispatch slots — NOT
+    // the timer's deadline above.
+    seed_workflow_task(
+        &pool,
+        exec_id,
+        "default",
+        "PENDING",
+        None,
+        "NOW() - INTERVAL '90 seconds'",
+    )
+    .await;
+    seed_live_worker(&pool, "w-live", "default").await;
+
+    let body = diagnose(&app, exec_id).await;
+    // Nothing else is pending, so the run falls to the plain sleeping-timer
+    // bucket. That is healthy, and correctly so: the timer fires whenever
+    // the task is next claimed.
+    assert_eq!(
+        kind(&body),
+        "sleeping_timer",
+        "the timer did not own this wake: {body}"
+    );
+    assert_eq!(body["health"], "healthy", "body: {body}");
+}
+
+/// `timer_owns_the_wake`'s timestamp proximity alone can be
+/// coincidentally satisfied by an unrelated armed timer landing near
+/// the wake instant. That reintroduces the issue #1191 false positive
+/// in a narrower window. `wake_source_repended_this_row`'s `created_at`
+/// fingerprint, loaded from the real row here (not just a pure-function
+/// fixture), must veto it even when the coincidence lands.
+#[tokio::test]
+async fn overdue_timer_does_not_correlate_via_coincidental_proximity_alone() {
+    let (url, _guard) = setup_database().await;
+    let pool = build_pool(&url);
+    let app = build_api_app(build_api_state(&pool));
+
+    let exec_id = seed_execution(&pool, "timer_wf", "RUNNING", vec![started_event()]).await;
+    {
+        let mut conn = pool.get().await.expect("pooled conn");
+        // Within `timer_owns_the_wake`'s tolerance of scheduled_at below,
+        // purely by coincidence -- an unrelated, separately armed timer,
+        // not the one that woke this run.
+        diesel::sql_query(
+            "INSERT INTO harvest_timers (id, workflow_exec_id, timer_id, fires_at, fired) \
+             VALUES ($1, $2, 'unrelated_deadline', NOW() - INTERVAL '99 seconds', false)",
+        )
+        .bind::<diesel::sql_types::Uuid, _>(Uuid::new_v4())
+        .bind::<diesel::sql_types::Uuid, _>(exec_id.as_uuid())
+        .execute(&mut conn)
+        .await
+        .expect("seed unrelated overdue timer");
+        // `wake_workflow_task`'s re-pend: scheduled_at = wake instant - 5s,
+        // created_at = the wake instant itself. Both come from the same
+        // statement's `NOW()`, so the gap is exactly 5 seconds. Set
+        // explicitly, not through `seed_workflow_task`'s default
+        // `clock_timestamp()`, to pin the fingerprint against the timer above.
+        diesel::sql_query(
+            "INSERT INTO harvest_task_queue \
+             (id, queue_name, task_type, workflow_exec_id, input, state, priority, attempt, \
+              max_attempts, scheduled_at, created_at, worker_id) \
+             VALUES ($1, 'default', 'workflow', $2, '{}'::jsonb, 'PENDING', 0, 1, 3, \
+                     NOW() - INTERVAL '98 seconds', NOW() - INTERVAL '93 seconds', NULL)",
+        )
+        .bind::<diesel::sql_types::Uuid, _>(Uuid::new_v4())
+        .bind::<diesel::sql_types::Uuid, _>(exec_id.as_uuid())
+        .execute(&mut conn)
+        .await
+        .expect("seed re-pended workflow task");
+    }
+    seed_live_worker(&pool, "w-live", "default").await;
+
+    let body = diagnose(&app, exec_id).await;
+    assert_eq!(
+        kind(&body),
+        "sleeping_timer",
+        "created_at proves a different wake source re-pended this row: {body}"
+    );
+    assert_eq!(body["health"], "healthy", "body: {body}");
 }
 
 /// A durable timer fires only when a worker claims the owning workflow task, so
