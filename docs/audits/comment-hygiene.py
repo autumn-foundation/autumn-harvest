@@ -1199,7 +1199,7 @@ class Piece:
 
     __slots__ = (
         "line", "marker", "body", "trailing", "block", "group", "nest",
-        "line_start", "line_end", "bridged",
+        "line_start", "line_end", "bridged", "in_attribute",
     )
 
     def __init__(
@@ -1246,6 +1246,10 @@ class Piece:
         # document rather than ending it. Set by `extract_comments`, which
         # is the only place that still has the source to read.
         self.bridged = False
+        # Does this piece sit INSIDE an attribute? A comment written between
+        # an attribute's brackets belongs to the attribute, not to the
+        # document around it, so it neither joins the doc run nor breaks it.
+        self.in_attribute = False
 
     @property
     def text(self) -> str:
@@ -1294,11 +1298,12 @@ def extract_comments(source: str) -> list[Piece]:
     ambiguity.
     """
     pieces: list[Piece] = []
-    # Where every string and char literal sits. `mark_bridges` counts an
-    # attribute's brackets, and a `]` inside a string is text, not a
-    # bracket. The lexer is the only thing here that knows the difference,
-    # so it records the spans while it already has them.
-    literals: list[tuple[int, int]] = []
+    # Where everything that is NOT code sits -- every string, char literal
+    # and comment. `mark_bridges` counts an attribute's brackets, and a `]`
+    # inside a string or a comment is text rather than a bracket. The lexer
+    # is the only thing here that knows the difference, so it records the
+    # spans while it already has them.
+    not_code: list[tuple[int, int]] = []
     i = 0
     n = len(source)
     line = 1
@@ -1329,6 +1334,7 @@ def extract_comments(source: str) -> list[Piece]:
                 marker_len += 1
             marker = raw[:marker_len]
             pieces.append(Piece(line, marker, raw[marker_len:], code_on_line, False))
+            not_code.append((i, end))
             i = end
             continue
 
@@ -1349,6 +1355,7 @@ def extract_comments(source: str) -> list[Piece]:
                 # rendered code and takes Tier A off a whole comment.
                 marker = "/**"
             depth = 1
+            comment_start = i
             block_group += 1
             root_group = block_group
             # Past the WHOLE marker: leaving the `!` of `/*!` on the body made
@@ -1448,6 +1455,7 @@ def extract_comments(source: str) -> list[Piece]:
                     seg_start_of_line = True
                 else:
                     i += 1
+            not_code.append((comment_start, i))
             tail_end = i - 2 if depth == 0 else i
             if tail_end > seg_start and not gutter_only(source[seg_start:tail_end]):
                 pieces.append(
@@ -1463,7 +1471,7 @@ def extract_comments(source: str) -> list[Piece]:
             end = source.find(closer, raw_match.end())
             end = n if end == -1 else end + len(closer)
             line += source.count("\n", i, end)
-            literals.append((i, end))
+            not_code.append((i, end))
             i = end
             code_on_line = True
             continue
@@ -1488,7 +1496,7 @@ def extract_comments(source: str) -> list[Piece]:
                 if source[i] == "\n":
                     line += 1
                 i += 1
-            literals.append((literal_start, i))
+            not_code.append((literal_start, i))
             code_on_line = True
             continue
 
@@ -1498,7 +1506,7 @@ def extract_comments(source: str) -> list[Piece]:
             lit = CHAR_LIT_RE.match(source, i)
             if lit:
                 # `']'` is a char literal holding a bracket, which is text.
-                literals.append((i, lit.end()))
+                not_code.append((i, lit.end()))
                 i = lit.end()
             else:
                 i += 1
@@ -1509,15 +1517,15 @@ def extract_comments(source: str) -> list[Piece]:
             code_on_line = True
         i += 1
 
-    mark_bridges(blank_literals(source, literals), pieces)
+    mark_bridges(blank_non_code(source, not_code), pieces)
     return pieces
 
 
 NON_NEWLINE_RE = re.compile(r"[^\n]")
 
 
-def blank_literals(source: str, spans: list[tuple[int, int]]) -> str:
-    """`source` with every literal's characters replaced by spaces.
+def blank_non_code(source: str, spans: list[tuple[int, int]]) -> str:
+    """`source` with everything that is not code replaced by spaces.
 
     Newlines survive, so every line keeps its number and its length. Only
     the bracket counter reads this copy; the comment text itself always
@@ -1552,27 +1560,43 @@ def mark_bridges(source: str, pieces: list[Piece]) -> None:
     `idempotency_tests.rs` before this was understood.
 
     An attribute may WRAP, so the scan follows its brackets rather than its
-    first line, and it reads them from `blank_literals` output: a `]` inside
-    a string is text, and counting it closed a wrapped attribute early and
-    failed the build on the doc line after it. A line that carries a comment
-    is never an attribute line whatever it says, because `// #[derive(Debug)]`
-    is prose ABOUT one.
+    first line, and it reads them from `blank_non_code` output: a `]` inside
+    a string or a comment is text, and counting it closed a wrapped attribute
+    early and failed the build on the doc line after it.
+
+    Reading the blanked copy answers the other question too. A comment-only
+    line blanks to nothing, so it cannot OPEN an attribute -- which is why
+    `// #[derive(Debug)]` is still prose ABOUT one rather than a bridge --
+    but a comment WRITTEN INSIDE an open attribute is part of it, and is
+    recorded as such. `comment_runs` reads that to keep it from breaking the
+    document either side of the attribute.
     """
     occupied = {piece.line for piece in pieces}
     attributes: set[int] = set()
+    inside: set[int] = set()
     depth = 0
     for index, raw in enumerate(source.splitlines(), start=1):
-        if index in occupied:
-            depth = 0
-            continue
         text = raw.strip()
-        if depth == 0 and not text.startswith("#[") and not text.startswith("#!["):
+        # Does the line BEGIN inside an attribute? That is what puts a
+        # comment on it inside the attribute. A comment after a complete one
+        # -- `#[allow(dead_code)] // why` -- is beside the attribute, not in
+        # it, and is an ordinary trailing comment.
+        opened = depth > 0
+        if not opened and not text.startswith("#[") and not text.startswith("#!["):
             continue
         attributes.add(index)
+        if opened and index in occupied:
+            inside.add(index)
         depth = max(0, depth + text.count("[") - text.count("]"))
 
     previous = -1
     for piece in pieces:
+        piece.in_attribute = piece.line in inside
+        if piece.in_attribute:
+            # Its own line is part of the attribute, and it is not part of
+            # the document, so it neither carries a gap nor closes one.
+            piece.bridged = False
+            continue
         piece.bridged = previous >= 0 and piece.line > previous + 1 and all(
             gap in attributes for gap in range(previous + 1, piece.line)
         )
@@ -2069,11 +2093,34 @@ def comment_runs(pieces: list[Piece]):
     "Consecutive" is what a READER sees, not what the file holds. A doc run
     survives an intervening attribute, because Rustdoc joins the `#[doc]`
     attributes on either side of it into one document -- see `mark_bridges`.
-    A plain `//` run does not: nothing renders it, so nothing joins it.
+    It survives a comment written inside that attribute for the same reason:
+    such a comment is part of the attribute, so it is set aside as its own
+    run rather than allowed to cut the document in two. A plain `//` run
+    survives neither: nothing renders it, so nothing joins it.
     """
     run: list[Piece] = []
+    held: list[Piece] = []
     prev_line = -2
     for piece in pieces:
+        # A comment INSIDE an attribute belongs to the attribute. It is still
+        # judged -- as a run of its own -- but the document on either side of
+        # the attribute is one document, so it must not break the run.
+        if piece.in_attribute:
+            # Held pieces group by the same rules as any other run, so two
+            # comments in two different attributes stay two comments.
+            if held and (
+                piece.trailing
+                or held[-1].trailing
+                or piece.marker != held[-1].marker
+                or piece.line != held[-1].line + 1
+            ):
+                yield held
+                held = []
+            held.append(piece)
+            continue
+        if held:
+            yield held
+            held = []
         same_block = (
             bool(run) and piece.block and run[-1].block and piece.group == run[-1].group
         )
@@ -2092,6 +2139,8 @@ def comment_runs(pieces: list[Piece]):
             run = []
         run.append(piece)
         prev_line = piece.line
+    if held:
+        yield held
     if run:
         yield run
 
@@ -4561,6 +4610,30 @@ RULE_TESTS = [
         "/// Two.\npub struct S;\n",
         set(),
         "in a raw string too",
+    ),
+    (
+        "/// One.\n///\n#[allow(\n    // keep this lint off for now\n"
+        "    dead_code\n)]\n/// Two.\npub struct S;\n",
+        set(),
+        "and a comment written inside it, which belongs to the attribute",
+    ),
+    (
+        "/// One.\n///\n#[allow(\n    /* keep this off */\n"
+        "    dead_code\n)]\n/// Two.\npub struct S;\n",
+        set(),
+        "a block comment there as well as a line comment",
+    ),
+    (
+        "/// One.\n///\n#[allow(\n    // a ] bracket in the comment\n"
+        "    dead_code\n)]\n/// Two.\npub struct S;\n",
+        set(),
+        "whose own brackets are text, like a string's",
+    ),
+    (
+        "struct S {\n    #[allow(dead_code)] // why one\n    a: u8,\n"
+        "    #[allow(dead_code)] // why two\n    b: u8,\n}\n",
+        set(),
+        "but a comment BESIDE a finished attribute is an ordinary trailing one",
     ),
     (
         "/// One.\n///\n#[allow(dead_code)]\npub struct S;\n",

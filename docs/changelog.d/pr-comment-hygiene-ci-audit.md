@@ -2796,3 +2796,44 @@ the first marker's adjacency search, where the text to a marker's left
 belongs. Both forms are fixtures.
 
 Corpus effect: none. Six fixtures.
+
+### Round ninety-one — a comment inside an attribute belongs to it
+
+One finding, on the round-87 bridge. A comment written between an
+attribute's brackets stopped the bridge, so:
+
+```rust
+/// One.
+///
+#[allow(
+    // keep this lint off for now
+    dead_code
+)]
+/// Two.
+```
+
+reported CH004 on the blank line, while rustdoc 1.94.1 renders "One."
+and "Two." as two paragraphs of one document. Round 87 knew about that
+`depth = 0` reset and left it, which is the third time this round a
+known-and-left edge has come back as a finding.
+
+Two things were wrong, and both are the same idea. The bracket counter
+gave up at a comment because it could not read one; and `comment_runs`
+let that comment cut the document in two. A comment inside an attribute
+is part of the ATTRIBUTE. So the lexer records comment spans beside
+literal spans -- `blank_literals` becomes `blank_non_code` -- and the
+counter reads a copy with both blanked. A comment-only line then blanks
+to nothing and cannot OPEN an attribute, which is what kept
+`// #[derive(Debug)]` prose about one; but a comment on a line that
+BEGINS inside an open attribute is recorded as part of it, and
+`comment_runs` sets it aside as its own run instead of breaking the
+document.
+
+"Begins inside" is the exact test, and the first version got it wrong.
+Marking every occupied attribute line made `#[allow(dead_code)] // why`
+into an inside-comment, and two of those in `api.rs` joined into one
+thirty-word sentence -- a CH007 finding that had never existed. The
+corpus diff caught it. A comment after a finished attribute is beside
+it, not in it.
+
+Corpus effect: none. Four fixtures, three of them counter-cases.
