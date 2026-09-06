@@ -1,19 +1,27 @@
 -- Corroboration for docs/performance-schedule-to-close.md's "Write-side
 -- cost" section, mirroring
 -- capability-labels-claim-predicate/claim_update_bloat_corroboration.sql
--- in method, with one addition: this script snapshots BOTH the heap
--- (`harvest_task_queue`) AND the partial index
--- (`harvest_task_queue_schedule_to_close_idx`, migration 20260606000001)
--- separately, rather than the heap alone. Codex review on PR #1339 (P2)
--- correctly flagged that an earlier revision of this script (heap-only)
--- could not support the doc's claim that it corroborates a *combined*
--- row-width-plus-index-write effect: `pg_relation_size('harvest_task_queue')`
--- excludes every index relation by definition, so a heap-only snapshot is
--- evidence for the row-width component alone, never for the index-write
--- component the doc's "Plan" section separately derives from
--- EXPLAIN-reported `dirtied`/`written` deltas. This revision measures both
--- components directly and independently, rather than asserting the index
--- component from EXPLAIN evidence alone.
+-- in method, with two additions: this script snapshots the heap
+-- (`harvest_task_queue`), the partial index
+-- (`harvest_task_queue_schedule_to_close_idx`, migration 20260606000001),
+-- AND the table's full on-disk footprint (`pg_total_relation_size`: heap,
+-- every index, and TOAST combined) separately, rather than the heap alone.
+-- Codex review on PR #1339 (P2) correctly flagged that an earlier revision
+-- of this script (heap-only) could not support the doc's claim that it
+-- corroborates a *combined* row-width-plus-index-write effect:
+-- `pg_relation_size('harvest_task_queue')` excludes every index relation
+-- by definition, so a heap-only snapshot is evidence for the row-width
+-- component alone, never for the index-write component the doc's "Plan"
+-- section separately derives from EXPLAIN-reported `dirtied`/`written`
+-- deltas. A later revision measured heap and this one partial index
+-- directly, but Codex review caught that summing only those two into a
+-- "combined" or "total" figure still excludes `harvest_task_queue`'s
+-- other applicable indexes (the primary key and others -- see the "Plan"
+-- section), which also grow under the claim `UPDATE` for both labels.
+-- `pg_total_relation_size` closes that gap by measuring every relation the
+-- table owns at once, so a genuine total-footprint percentage no longer
+-- needs to assume the other indexes' growth cancels between labels -- it
+-- is included in both sides of the comparison either way.
 --
 -- `id` and `activity_id` are seeded with `md5(...)::uuid` -- deterministic
 -- per row-index `i`, but still varied/unsorted like a real random UUID --
@@ -72,9 +80,11 @@ FROM generate_series(0, 9999) AS s(i);
 VACUUM ANALYZE harvest_task_queue;
 SELECT 'no-stc-before-claim' AS label,
        pg_relation_size('harvest_task_queue') / 8192 AS heap_pages,
-       pg_relation_size('harvest_task_queue_schedule_to_close_idx') / 8192 AS idx_pages;
+       pg_relation_size('harvest_task_queue_schedule_to_close_idx') / 8192 AS idx_pages,
+       pg_total_relation_size('harvest_task_queue') / 8192 AS total_pages;
 SELECT pg_relation_size('harvest_task_queue') / 8192 AS heap_pages,
-       pg_relation_size('harvest_task_queue_schedule_to_close_idx') / 8192 AS idx_pages
+       pg_relation_size('harvest_task_queue_schedule_to_close_idx') / 8192 AS idx_pages,
+       pg_total_relation_size('harvest_task_queue') / 8192 AS total_pages
   \gset no_stc_before_
 
 UPDATE harvest_task_queue
@@ -84,9 +94,11 @@ SET state = 'RUNNING',
 WHERE state = 'PENDING';
 SELECT 'no-stc-after-claim' AS label,
        pg_relation_size('harvest_task_queue') / 8192 AS heap_pages,
-       pg_relation_size('harvest_task_queue_schedule_to_close_idx') / 8192 AS idx_pages;
+       pg_relation_size('harvest_task_queue_schedule_to_close_idx') / 8192 AS idx_pages,
+       pg_total_relation_size('harvest_task_queue') / 8192 AS total_pages;
 SELECT pg_relation_size('harvest_task_queue') / 8192 AS heap_pages,
-       pg_relation_size('harvest_task_queue_schedule_to_close_idx') / 8192 AS idx_pages
+       pg_relation_size('harvest_task_queue_schedule_to_close_idx') / 8192 AS idx_pages,
+       pg_total_relation_size('harvest_task_queue') / 8192 AS total_pages
   \gset no_stc_after_
 
 -- State B: schedule-to-close. Fresh INSERT with schedule_to_close_at
@@ -114,9 +126,11 @@ FROM generate_series(0, 9999) AS s(i);
 VACUUM ANALYZE harvest_task_queue;
 SELECT 'stc-before-claim' AS label,
        pg_relation_size('harvest_task_queue') / 8192 AS heap_pages,
-       pg_relation_size('harvest_task_queue_schedule_to_close_idx') / 8192 AS idx_pages;
+       pg_relation_size('harvest_task_queue_schedule_to_close_idx') / 8192 AS idx_pages,
+       pg_total_relation_size('harvest_task_queue') / 8192 AS total_pages;
 SELECT pg_relation_size('harvest_task_queue') / 8192 AS heap_pages,
-       pg_relation_size('harvest_task_queue_schedule_to_close_idx') / 8192 AS idx_pages
+       pg_relation_size('harvest_task_queue_schedule_to_close_idx') / 8192 AS idx_pages,
+       pg_total_relation_size('harvest_task_queue') / 8192 AS total_pages
   \gset stc_before_
 
 UPDATE harvest_task_queue
@@ -126,9 +140,11 @@ SET state = 'RUNNING',
 WHERE state = 'PENDING';
 SELECT 'stc-after-claim' AS label,
        pg_relation_size('harvest_task_queue') / 8192 AS heap_pages,
-       pg_relation_size('harvest_task_queue_schedule_to_close_idx') / 8192 AS idx_pages;
+       pg_relation_size('harvest_task_queue_schedule_to_close_idx') / 8192 AS idx_pages,
+       pg_total_relation_size('harvest_task_queue') / 8192 AS total_pages;
 SELECT pg_relation_size('harvest_task_queue') / 8192 AS heap_pages,
-       pg_relation_size('harvest_task_queue_schedule_to_close_idx') / 8192 AS idx_pages
+       pg_relation_size('harvest_task_queue_schedule_to_close_idx') / 8192 AS idx_pages,
+       pg_total_relation_size('harvest_task_queue') / 8192 AS total_pages
   \gset stc_after_
 
 -- Derived summary -- computed and printed by the script itself, so
@@ -151,6 +167,25 @@ SELECT
 SELECT
   (:no_stc_after_idx_pages - :no_stc_before_idx_pages) AS no_stc_idx_delta_pages,
   (:stc_after_idx_pages - :stc_before_idx_pages) AS stc_idx_delta_pages;
+
+-- Total-footprint growth (heap + every index + TOAST, via
+-- pg_total_relation_size) -- the genuine "does this predicate matter as a
+-- fraction of the claim's total storage cost" comparison, since it no
+-- longer has to assume the other applicable indexes' growth cancels
+-- between labels: it is measured directly, in both labels' totals, either
+-- way. Codex review on PR #1339 caught that summing only the heap and this
+-- one partial index (below) understated the true denominator.
+SELECT
+  (:no_stc_after_total_pages - :no_stc_before_total_pages) AS no_stc_total_delta_pages,
+  (:stc_after_total_pages - :stc_before_total_pages) AS stc_total_delta_pages,
+  ((:stc_after_total_pages - :stc_before_total_pages)
+     - (:no_stc_after_total_pages - :no_stc_before_total_pages)) AS extra_total_pages,
+  round(
+    100.0 * ((:stc_after_total_pages - :stc_before_total_pages)
+              - (:no_stc_after_total_pages - :no_stc_before_total_pages))
+    / (:no_stc_after_total_pages - :no_stc_before_total_pages),
+    1
+  ) AS extra_total_pct_more_growth_from_schedule_to_close;
 
 -- cleanup: leave the scratch DB empty again.
 TRUNCATE harvest_task_queue RESTART IDENTITY;

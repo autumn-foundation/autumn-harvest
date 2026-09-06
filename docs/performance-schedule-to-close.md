@@ -15,24 +15,28 @@ percentage in the committed run -- see [100,000-row plan
 choice](#100000-row-plan-choice) for why) -- corroborated by two standalone
 MVCC-bloat scripts. None of this comes close to the 20% impact floor,
 measured where a percentage is stable -- against shared-buffer-hit
-totals and the combined heap-plus-index storage growth (+16%, the extra
-growth `schedule-to-close` causes relative to `no-schedule-to-close`'s own
-growth), not against the `dirtied`/`written` EXPLAIN counters' own small base, or
+totals and `harvest_task_queue`'s total on-disk footprint growth (+12.3%,
+heap plus every index plus TOAST, measured directly with
+`pg_total_relation_size`), not against the `dirtied`/`written` EXPLAIN counters' own small base, or
 the partial index's own page count on its own (see [Plan](#plan) and
 [Write-side cost](#write-side-cost) for why each of those specifically
 is reported as an absolute count instead of a floor-compared
 percentage). No fix is proposed or needed.
 
 **A late-round methodology fix changed several of this page's headline
-numbers substantially, including the real-drain aggregate below (from
-+15.5% to +1.9% for `claim_task_query()` alone).** Every capture on this
+numbers substantially, including the real-drain aggregate below.** The
+fix's own before/after artifacts are no longer committed (this repro
+script overwrites the same canonical filenames every run), so this page
+does not cite the pre-fix numbers -- see
+[Corroboration](#corroboration-pg_stat_statements-over-the-real-claim-drain)
+for what is auditable instead. Every capture on this
 page seeds two data states side by side and compares them, so any
 difference *other* than `schedule_to_close_at` between how the two states
 were seeded is itself a source of measurement error. Through several
 review rounds, the `schedule-to-close` state was re-seeded with its own
 fresh, independently-random `id`/`activity_id` UUIDs rather than reusing
 the `no-schedule-to-close` state's exact values -- and since every claim is
-a non-HOT `UPDATE` that touches *every* index on `harvest_task_queue`, not
+a non-HOT `UPDATE` that touches *every applicable* index on `harvest_task_queue`, not
 just `harvest_task_queue_schedule_to_close_idx` (see [Plan](#plan)),
 independently-random keys in those OTHER indexes' B-trees could add
 page-split/traversal noise of a similar size to the effect this page
@@ -263,11 +267,10 @@ this, and caught two further problems in fixing it:
 Both fixes are in `claim_budget_tests.rs`'s
 `snapshot_seed_for_schedule_to_close`/`reseed_from_schedule_to_close_snapshot`
 helpers; see their doc comments for the full detail. **The impact was
-large, not cosmetic**: the real-drain aggregate dropped from +15.5% to
-+1.9% for `claim_task_query()` alone once both labels shared identical
-indexed values (see
-[Corroboration](#corroboration-pg_stat_statements-over-the-real-claim-drain)),
-and the 100,000-row `EXPLAIN` comparison, which happened to land on the
+large, not cosmetic**, though this page no longer cites the pre-fix
+real-drain aggregate itself -- its own artifacts are not committed (see
+[Corroboration](#corroboration-pg_stat_statements-over-the-real-claim-drain)
+for why). The 100,000-row `EXPLAIN` comparison, which happened to land on the
 same (`Seq Scan`) plan for both labels in the pre-fix committed run, landed
 on *different* plans for the two labels once re-run with this fix (see
 [100,000-row plan choice](#100000-row-plan-choice)) -- direct evidence that
@@ -602,16 +605,20 @@ on), so this is a reporting fix, not a re-run:
 real `claim_task()` function over this drain,"** with `claim_task_query()`
 alone (+1.9%) kept as a separate figure since it's what the `EXPLAIN`-based
 [Plan](#plan) section above is built on ( `EXPLAIN` was only run against
-that one query). **Both numbers dropped sharply from an earlier revision
-of this table (+17.1% combined, +15.5% for `claim_task_query()` alone)**
-once the seeding fix [Workload](#workload) describes landed: that earlier
-revision let the two labels seed independently-random `id`/`activity_id`
-values, and once both labels shared the exact same values, most of what
-had looked like a `schedule_to_close_at` effect on the main query turned
-out to be that seeding confound instead. The two rechecks' own relative
-increase (+113%) is markedly larger than the main query's, and *also*
-changed a lot under the same fix (from +72%) -- this page cannot explain
-either number with confidence: no `EXPLAIN` was captured for either recheck
+that one query). **An earlier revision of this table used a confounded
+seeding methodology** -- the two labels seeded independently-random
+`id`/`activity_id` values instead of sharing them, before the seeding fix
+[Workload](#workload) describes landed -- **and reported noticeably
+larger percentages for both figures.** That earlier revision's own
+artifacts are no longer committed (this repro script overwrites the same
+canonical filenames every run), so this page does not cite the pre-fix
+numbers or draw a magnitude conclusion from the comparison: the only
+still-auditable evidence that the confound mattered is the
+[100,000-row plan choice](#100000-row-plan-choice) section's plan flip,
+which is structural (which plan each label chose), not a percentage drawn
+from overwritten artifacts. The two rechecks' own relative
+increase (+113%) is markedly larger than the main query's. This page
+cannot explain either number with confidence: no `EXPLAIN` was captured for either recheck
 statement, only the aggregate `pg_stat_statements` counters above, so there
 is no plan-level evidence to confirm the mechanism. **It is not the same
 non-HOT index-write mechanism [Plan](#plan) establishes for the main claim
@@ -629,12 +636,11 @@ index -- Codex review on PR #1339 caught this. What both rechecks
 genuinely do on every call is a primary-key point lookup on the
 already-claimed row plus the `EXISTS` subquery scan against the (empty)
 pause table, and this page has no confirmed explanation for why that
-combination costs +113% more on the `schedule-to-close` label, or why that
-figure itself moved so much once the seeding confound was fixed (a
+combination costs +113% more on the `schedule-to-close` label (a
 plausible guess: an unrelated index the primary-key lookup touches was
-itself part of the confound, though this page has not verified that); it
-is left as an open question rather than attributed to a mechanism the
-measured statements cannot exercise.
+itself affected by the seeding confound described above, though this page
+has not verified that); it is left as an open question rather than
+attributed to a mechanism the measured statements cannot exercise.
 
 **Neither number reproduced to a stable value across the several runs this
 capture went through over the course of this pass.** Codex review on PR
@@ -691,16 +697,22 @@ commits until the whole simulated drain finishes): artifacts
 and
 `docs/perf-artifacts/schedule-to-close-claim-predicate/claim_update_bloat_loop_corroboration.{sql,txt}`:
 
-| seeding + update shape | heap: no-stc / stc growth | heap extra growth | index: no-stc / stc growth |
-|---|---:|---:|---:|
-| one bulk `UPDATE ... WHERE state = 'PENDING'` (10,000 rows, one statement) | 250 / 263 pages | +5.2% | 0 / +27 pages (1→1 vs 30→57) |
-| 10,000 individual `SELECT ... FOR UPDATE SKIP LOCKED` + `UPDATE` pairs, PL/pgSQL loop (still one transaction end to end) | 250 / 263 pages | +5.2% | 0 / +27 pages (1→1 vs 30→57) |
+| seeding + update shape | heap: no-stc / stc growth | heap extra growth | index: no-stc / stc growth | total footprint: no-stc / stc growth | total extra growth |
+|---|---:|---:|---:|---:|---:|
+| one bulk `UPDATE ... WHERE state = 'PENDING'` (10,000 rows, one statement) | 250 / 263 pages | +5.2% | 0 / +27 pages (1→1 vs 30→57) | 324 / 364 pages | +12.3% |
+| 10,000 individual `SELECT ... FOR UPDATE SKIP LOCKED` + `UPDATE` pairs, PL/pgSQL loop (still one transaction end to end) | 250 / 263 pages | +5.2% | 0 / +27 pages (1→1 vs 30→57) | 324 / 364 pages | +12.3% |
 
-The two access shapes land on **identical** results for both quantities:
-within a single transaction (no commit boundaries in between), whether the
-10,000 rows are touched by one bulk statement or by 10,000 individual
-per-row statements changes neither the heap-page-growth nor the
-index-page-growth outcome. The heap figures are close to the `EXPLAIN` band
+The total-footprint columns are `pg_total_relation_size('harvest_task_queue')`
+-- heap, every index, and TOAST combined -- and include 74 pages of growth
+from the table's other applicable indexes (identical between labels: 241
+pages before either drain, 315 after, for both `no-schedule-to-close` and
+`schedule-to-close`), which the heap-plus-one-index columns above omit.
+
+The two access shapes land on **identical** results for every quantity
+measured: within a single transaction (no commit boundaries in between),
+whether the 10,000 rows are touched by one bulk statement or by 10,000
+individual per-row statements changes neither the heap-page-growth, the
+index-page-growth, nor the total-footprint outcome. The heap figures are close to the `EXPLAIN` band
 above (2.6-7.5%) -- this is the row-width component, and it is unaffected by
 whether the seeded deadline values are distinct or constant (heap-page
 count depends on total row *width*, not on how compressible the *index*
@@ -726,11 +738,19 @@ small-base instability the `dirtied`/`written` EXPLAIN counters have (see
 tiny percentage against a large index, or an infinite one against an
 empty index, without the real per-claim cost changing at all. The
 meaningful, stable denominator for a storage-growth floor comparison is
-the combined heap-plus-index growth the claim `UPDATE` causes, computed
-consistently from growth deltas rather than mixing a delta with an
-absolute page count: `no-schedule-to-close` grows by 250 pages total (250
-heap + 0 index), `schedule-to-close` grows by 290 pages total (263 heap +
-27 index) -- 40 pages more, **+16%** relative to the
+`harvest_task_queue`'s genuine total on-disk footprint -- heap, every
+index, and TOAST combined, measured directly with
+`pg_total_relation_size` rather than summed from a chosen subset of
+relations. Codex review on PR #1339 caught that an earlier revision of
+this paragraph summed only the heap and this one partial index and called
+that "combined... growth," which excludes the table's dozen-plus other
+applicable indexes (see [Plan](#plan)) and overstates the percentage: this
+revision's corroboration scripts now snapshot
+`pg_total_relation_size('harvest_task_queue')` directly, so the other
+indexes' growth is included in both labels' totals rather than assumed to
+cancel. `no-schedule-to-close` grows by 324 pages total (455 before, 779
+after), `schedule-to-close` grows by 364 pages total (494 before, 858
+after) -- 40 pages more, **+12.3%** relative to the
 `no-schedule-to-close` baseline growth -- comfortably under the floor,
 and the number this page's opening summary and Measurement sections
 cite. The heap-only figure (+5.2%) and

@@ -16,10 +16,16 @@
 --
 -- Like claim_update_bloat_corroboration.sql, this revision also snapshots
 -- the partial index `harvest_task_queue_schedule_to_close_idx` (migration
--- 20260606000001) separately from the heap. Codex review on PR #1339 (P2)
--- correctly flagged that a heap-only snapshot cannot support a claim about
--- combined heap-plus-index growth: `pg_relation_size('harvest_task_queue')`
--- excludes every index relation by definition.
+-- 20260606000001) AND the table's full on-disk footprint
+-- (`pg_total_relation_size`: heap, every index, and TOAST combined)
+-- separately from the heap. Codex review on PR #1339 (P2) correctly
+-- flagged that a heap-only snapshot cannot support a claim about combined
+-- heap-plus-index growth: `pg_relation_size('harvest_task_queue')`
+-- excludes every index relation by definition. A later review round
+-- caught that summing only the heap and this one partial index still
+-- excludes the table's other applicable indexes, which also grow under
+-- the claim `UPDATE` for both labels -- `pg_total_relation_size` closes
+-- that gap.
 --
 -- `id` and `activity_id` are seeded with `md5(...)::uuid` -- deterministic
 -- per row-index `i`, but still varied/unsorted like a real random UUID --
@@ -76,9 +82,11 @@ FROM generate_series(0, 9999) AS s(i);
 VACUUM ANALYZE harvest_task_queue;
 SELECT 'no-stc-before-drain' AS label,
        pg_relation_size('harvest_task_queue') / 8192 AS heap_pages,
-       pg_relation_size('harvest_task_queue_schedule_to_close_idx') / 8192 AS idx_pages;
+       pg_relation_size('harvest_task_queue_schedule_to_close_idx') / 8192 AS idx_pages,
+       pg_total_relation_size('harvest_task_queue') / 8192 AS total_pages;
 SELECT pg_relation_size('harvest_task_queue') / 8192 AS heap_pages,
-       pg_relation_size('harvest_task_queue_schedule_to_close_idx') / 8192 AS idx_pages
+       pg_relation_size('harvest_task_queue_schedule_to_close_idx') / 8192 AS idx_pages,
+       pg_total_relation_size('harvest_task_queue') / 8192 AS total_pages
   \gset no_stc_before_
 
 DO $$
@@ -96,9 +104,11 @@ BEGIN
 END $$;
 SELECT 'no-stc-after-drain' AS label,
        pg_relation_size('harvest_task_queue') / 8192 AS heap_pages,
-       pg_relation_size('harvest_task_queue_schedule_to_close_idx') / 8192 AS idx_pages;
+       pg_relation_size('harvest_task_queue_schedule_to_close_idx') / 8192 AS idx_pages,
+       pg_total_relation_size('harvest_task_queue') / 8192 AS total_pages;
 SELECT pg_relation_size('harvest_task_queue') / 8192 AS heap_pages,
-       pg_relation_size('harvest_task_queue_schedule_to_close_idx') / 8192 AS idx_pages
+       pg_relation_size('harvest_task_queue_schedule_to_close_idx') / 8192 AS idx_pages,
+       pg_total_relation_size('harvest_task_queue') / 8192 AS total_pages
   \gset no_stc_after_
 
 -- State B: schedule-to-close. Fresh INSERT with schedule_to_close_at
@@ -126,9 +136,11 @@ FROM generate_series(0, 9999) AS s(i);
 VACUUM ANALYZE harvest_task_queue;
 SELECT 'stc-before-drain' AS label,
        pg_relation_size('harvest_task_queue') / 8192 AS heap_pages,
-       pg_relation_size('harvest_task_queue_schedule_to_close_idx') / 8192 AS idx_pages;
+       pg_relation_size('harvest_task_queue_schedule_to_close_idx') / 8192 AS idx_pages,
+       pg_total_relation_size('harvest_task_queue') / 8192 AS total_pages;
 SELECT pg_relation_size('harvest_task_queue') / 8192 AS heap_pages,
-       pg_relation_size('harvest_task_queue_schedule_to_close_idx') / 8192 AS idx_pages
+       pg_relation_size('harvest_task_queue_schedule_to_close_idx') / 8192 AS idx_pages,
+       pg_total_relation_size('harvest_task_queue') / 8192 AS total_pages
   \gset stc_before_
 
 DO $$
@@ -146,9 +158,11 @@ BEGIN
 END $$;
 SELECT 'stc-after-drain' AS label,
        pg_relation_size('harvest_task_queue') / 8192 AS heap_pages,
-       pg_relation_size('harvest_task_queue_schedule_to_close_idx') / 8192 AS idx_pages;
+       pg_relation_size('harvest_task_queue_schedule_to_close_idx') / 8192 AS idx_pages,
+       pg_total_relation_size('harvest_task_queue') / 8192 AS total_pages;
 SELECT pg_relation_size('harvest_task_queue') / 8192 AS heap_pages,
-       pg_relation_size('harvest_task_queue_schedule_to_close_idx') / 8192 AS idx_pages
+       pg_relation_size('harvest_task_queue_schedule_to_close_idx') / 8192 AS idx_pages,
+       pg_total_relation_size('harvest_task_queue') / 8192 AS total_pages
   \gset stc_after_
 
 -- Derived summary -- computed and printed by the script itself, so
@@ -171,6 +185,21 @@ SELECT
 SELECT
   (:no_stc_after_idx_pages - :no_stc_before_idx_pages) AS no_stc_idx_delta_pages,
   (:stc_after_idx_pages - :stc_before_idx_pages) AS stc_idx_delta_pages;
+
+-- Total-footprint growth (heap + every index + TOAST, via
+-- pg_total_relation_size) -- see claim_update_bloat_corroboration.sql for
+-- why this is the genuine total-storage-cost denominator.
+SELECT
+  (:no_stc_after_total_pages - :no_stc_before_total_pages) AS no_stc_total_delta_pages,
+  (:stc_after_total_pages - :stc_before_total_pages) AS stc_total_delta_pages,
+  ((:stc_after_total_pages - :stc_before_total_pages)
+     - (:no_stc_after_total_pages - :no_stc_before_total_pages)) AS extra_total_pages,
+  round(
+    100.0 * ((:stc_after_total_pages - :stc_before_total_pages)
+              - (:no_stc_after_total_pages - :no_stc_before_total_pages))
+    / (:no_stc_after_total_pages - :no_stc_before_total_pages),
+    1
+  ) AS extra_total_pct_more_growth_from_schedule_to_close;
 
 -- cleanup: leave the scratch DB empty again.
 TRUNCATE harvest_task_queue RESTART IDENTITY;

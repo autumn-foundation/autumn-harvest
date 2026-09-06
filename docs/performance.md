@@ -1472,11 +1472,11 @@ from the benchmark are directly comparable.
     reads as a large percentage for the same reason the `dirtied`/`written`
     EXPLAIN counters do below) —
     nowhere near the 20% impact floor, measured where a percentage is
-    stable: shared-buffer-hit totals, and the combined heap-plus-index
-    storage growth (+16%: `no-schedule-to-close` grows 250 pages total,
-    `schedule-to-close` grows 290, both computed consistently as growth
-    deltas rather than mixing a delta with an absolute page count), not
-    against the
+    stable: shared-buffer-hit totals, and `harvest_task_queue`'s total
+    on-disk footprint growth (+12.3%: heap plus every index plus TOAST,
+    measured directly with `pg_total_relation_size` rather than summed
+    from a chosen subset of relations — `no-schedule-to-close` grows 324
+    pages total, `schedule-to-close` grows 364), not against the
     `dirtied`/`written` EXPLAIN counters' own small base (4→5, 2→3) or the
     index's own page count on its own, which that page reports as absolute
     counts instead of floor-compared percentages — Codex review flagged
@@ -1506,15 +1506,18 @@ from the benchmark are directly comparable.
     separately since it's what the `EXPLAIN`-based evidence above is built
     on), without asserting a range, a frequency, or a direction (e.g.
     "always positive") for runs whose evidence no longer exists in the
-    repository to audit. Both figures, and the buffer deltas above, dropped
-    sharply from an earlier revision of this page (+17.1%/+15.5% real-drain,
-    +2.6%-+7.5% including a clean 100,000-row figure) once a seeding
-    confound was fixed: the two labels had been seeded with independently-random
-    `id`/`activity_id` values, and since every claim's non-HOT `UPDATE`
+    repository to audit. An earlier revision of this page's real-drain
+    figures and buffer deltas used a seeding confound instead: the two
+    labels had been seeded with independently-random `id`/`activity_id`
+    values, and since every claim's non-HOT `UPDATE`
     touches every applicable index on the table, not just the one this
-    predicate adds, most of what had looked like a `schedule_to_close_at` effect on the
+    predicate adds, some of what had looked like a `schedule_to_close_at` effect on the
     main query and the 100,000-row plan choice turned out to be that
-    confound instead — see that page's "Workload" section for the fix. The
+    confound instead — see that page's "Workload" section for the fix. That
+    earlier revision's own artifacts are no longer committed (the repro
+    script overwrites the same canonical filenames every run), so this page
+    does not cite its pre-fix percentages; the still-auditable evidence that
+    the confound mattered is the plan flip described next. The
     committed run now shows the two labels landing on *different* plans at
     the 100,000-row depth, with the expensive one on `no-schedule-to-close`
     this time (an earlier, since-superseded committed run had neither
