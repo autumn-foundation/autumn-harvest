@@ -1666,7 +1666,15 @@ def lazy_continuation(
         depth < quoted
         and paragraph
         and bool(text.strip())
-        and not LIST_MARKER_RE.match(peeled)
+        # On the RAW line, not the peel: `strip_containers` has already
+        # taken the marker off `peeled`, so this test could never fire and
+        # a list leaving a quote was read as a continuation of it.
+        #
+        # Not paragraph-gated, unlike `starts_block`. The quote's paragraph
+        # is not open at the level this line lands on -- Rustdoc closes the
+        # quote and opens "<ol start=\"2\">" -- so even a marker that could
+        # not interrupt a paragraph starts a block here.
+        and not list_content(text, container)
         and not table_header(pieces, index, nest, peeled, container)
         and not heading(peeled, container)
         and not html_block(peeled, container)
@@ -4215,6 +4223,18 @@ RULE_TESTS = [
         "// The macro_rules! form is described in the guide below.\n",
         {("CH001", 1)},
         "a macro definition ends at its brace, and prose naming one does not",
+    ),
+    (
+        "/// > Explain the `literal\n"
+        "/// 2. TODO: issue required` suffix.\n",
+        {("CH002", 2)},
+        "a list leaving a quote is no lazy continuation of it",
+    ),
+    (
+        "/// > Explain the `literal\n"
+        "/// - TODO: issue required` suffix.\n",
+        {("CH002", 2)},
+        "a bullet does the same",
     ),
 ]
 

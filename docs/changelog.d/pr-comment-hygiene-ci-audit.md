@@ -2285,3 +2285,33 @@ anchored on the keyword, so prose that merely names `macro_rules!`
 cannot reach it -- and a fixture pins both lines together.
 
 Corpus effect: none. Four fixtures.
+
+### Round seventy-five — a test that could never fire
+
+One finding. `lazy_continuation` refuses to treat a line as a quote
+continuation when that line begins a block, and one of its six tests was
+`LIST_MARKER_RE.match(peeled)` -- against text `strip_containers` had
+already taken the marker off. The test could not fire, in either caller,
+and had not since round forty-one.
+
+It is live now, on the raw line and through `list_content`, so it is
+bounded by the container like every other marker test in this file.
+
+Two things this exposed:
+
+**The test is not paragraph-gated, and must not be.** Round seventy-four
+taught `starts_block` that `2.` cannot interrupt an open paragraph. That
+is the right rule inside one block and the wrong one here: the quote's
+paragraph is not open at the level an unquoted line lands on. Rustdoc
+closes the quote and opens `<ol start="2">`, so a marker that could not
+interrupt a paragraph still starts a block. A bullet already reported,
+because a bullet CAN interrupt one -- so round seventy-four's fix is what
+made the ordered case reachable, and the two rules had to be told apart
+rather than shared.
+
+**Dead code in a predicate is invisible to the corpus.** Every check this
+PR runs -- the self-test, the corpus diff, the ratchet -- confirms
+behaviour, and a test that never fires changes no behaviour. Nothing
+here can find one. The review did.
+
+Corpus effect: none. Two fixtures, the ordered marker and the bullet.
