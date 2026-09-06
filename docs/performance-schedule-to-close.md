@@ -307,41 +307,75 @@ after a claim. A `schedule-to-close` row satisfies it both before
 its logical index membership doesn't change.
 
 The claim `UPDATE` changes `state`, and `state` is a key column of
-`idx_harvest_tq_poll` and `idx_harvest_tq_running` (and appears in
-`idx_harvest_tq_activity_pause`'s key too) -- so this `UPDATE` cannot use
-Postgres's HOT (Heap-Only Tuple) optimization, for *every* claim, on *both*
-labels, regardless of `schedule_to_close_at`. HOT eligibility is an
-all-or-nothing property of the update: once any indexed column changes,
-Postgres cannot skip index maintenance selectively for the indexes that
-column doesn't belong to -- the new physical tuple needs a fresh entry in
-every index the row is actually a member of, not just the ones keyed on
-`state`. This is *every applicable* index, not literally every index on
-the table: a non-HOT update still can't add an entry to a partial index
-whose own predicate the row doesn't satisfy, HOT or not. Codex review on
-PR #1339 caught an earlier revision of this paragraph overcorrecting to
-"every index" -- in this baseline fixture (`ClaimGate::Baseline`, with
-`required_build_id`/`session_id`/`sticky_worker_id`/`concurrency_key`/
-`rate_limit_key` all `NULL`), three partial indexes are skipped entirely
-because their own predicate is never satisfied:
-`harvest_task_queue_required_build_id_pending`
-(`WHERE state = 'PENDING' AND required_build_id IS NOT NULL`),
-`harvest_task_queue_session_id_pending` (same shape for `session_id`),
-and `idx_harvest_tq_sticky_poll` (`WHERE state = 'PENDING' AND
-sticky_worker_id IS NOT NULL`). The applicable set -- the primary key,
-`idx_harvest_tq_poll`, `idx_harvest_tq_running`, `idx_harvest_tq_workflow`,
-`idx_harvest_tq_activity_id`, and others besides -- is still well over a
-dozen indexes, and both `no-schedule-to-close` and `schedule-to-close`
-rows pay full non-HOT maintenance across all of them on every claim, since
-none of those OTHER indexes' predicates (where they have one) depend on
-`schedule_to_close_at`, so membership in them is identical between labels.
-An earlier revision of this page also incorrectly described the baseline
-cost as touching only `idx_harvest_tq_poll` and `idx_harvest_tq_running`
-(Codex review, PR #1339, an earlier round). The one-sentence version that
-*is* accurate: `harvest_task_queue_schedule_to_close_idx` is the **one
-applicable index that only `schedule-to-close` rows are ever members
-of** -- every other applicable index gets a new entry on every claim for
-both labels equally, so it cancels out of the comparison; this one does
-not, which is why it is the source of the measured delta.
+`idx_harvest_tq_poll`, `idx_harvest_tq_running`, and
+`idx_harvest_tq_activity_pause` -- so this `UPDATE` cannot use Postgres's
+HOT (Heap-Only Tuple) optimization, for *every* claim, on *both* labels,
+regardless of `schedule_to_close_at`. HOT eligibility is an all-or-nothing
+property of the update: once any indexed column changes, Postgres cannot
+skip index maintenance selectively for the indexes that column doesn't
+belong to. What "maintenance" means, though, depends on each index's own
+predicate and the row's membership before and after the claim -- Codex
+review on PR #1339 caught an earlier revision of this paragraph both
+undercounting how many indexes the fixture never touches at all, and
+oversimplifying "maintenance" as uniformly "gets a fresh entry" for every
+one it does touch. `harvest_task_queue` carries 16 relations total (15
+indexes plus the primary key). Verified against this baseline fixture
+(`ClaimGate::Baseline`, with `required_build_id`/`session_id`/
+`sticky_worker_id`/`concurrency_key`/`rate_limit_key` all `NULL` and
+`capability_miss_workers` at its `'{}'` default) directly, by counting
+before/after membership rather than reasoning from the predicates alone:
+
+- **Never a member, before or after, for either label (7 indexes) --
+  skipped entirely:** `harvest_task_queue_required_build_id_pending`
+  (`WHERE state = 'PENDING' AND required_build_id IS NOT NULL`),
+  `harvest_task_queue_session_id_pending` (same shape for `session_id`),
+  `idx_harvest_tq_sticky_poll` (`WHERE state = 'PENDING' AND
+  sticky_worker_id IS NOT NULL`), `harvest_task_queue_concurrency_key_running`
+  (`WHERE state = 'RUNNING' AND concurrency_key IS NOT NULL`),
+  `idx_harvest_task_queue_rate_limit_key` (`WHERE state = 'PENDING' AND
+  rate_limit_key IS NOT NULL`), `idx_harvest_task_queue_rate_limit_key_live`
+  (`WHERE rate_limit_key IS NOT NULL AND state NOT IN ('COMPLETED',
+  'FAILED', 'CANCELLED')`), and `idx_harvest_tq_capability_miss_workers`
+  (`WHERE state IN ('PENDING', 'RUNNING') AND capability_miss_workers <>
+  '{}'`).
+- **A member before the claim, not after (2 indexes) -- the row leaves,
+  and gets no new entry there:** `idx_harvest_tq_poll` and
+  `idx_harvest_tq_coverage_sample`, both `WHERE state = 'PENDING'` --
+  `state = 'RUNNING'` after the claim no longer satisfies either
+  predicate, so the stale `PENDING`-keyed entry is simply left dead for
+  autovacuum, not replaced.
+- **Not a member before, a member after (2 indexes) -- the row enters,
+  genuinely gaining a new entry:** `idx_harvest_tq_running` (`WHERE state
+  = 'RUNNING'`) and `harvest_task_queue_running_worker_idx` (`WHERE state
+  = 'RUNNING' AND worker_id IS NOT NULL` -- `worker_id` is also set by
+  this same claim `UPDATE`).
+- **A member both before and after (4 indexes) -- HOT still forces a
+  fresh entry even though the index's own key or predicate never
+  changes:** the primary key, `idx_harvest_tq_workflow` (unconditional,
+  `workflow_exec_id` indexed as `NULL`), `idx_harvest_tq_activity_id`
+  (`WHERE activity_id IS NOT NULL`, unconditionally true here), and
+  `idx_harvest_tq_activity_pause` (`WHERE task_type = 'activity' AND
+  activity_name IS NOT NULL`, also unconditionally true here -- though
+  `state` is one of its key columns, so the entry itself moves from a
+  `PENDING`-keyed position to a `RUNNING`-keyed one).
+
+Whichever of these four categories an index falls into, none of them
+depends on `schedule_to_close_at`, and every seeded column that does
+decide membership (`required_build_id`, `session_id`,
+`sticky_worker_id`, `concurrency_key`, `rate_limit_key`,
+`capability_miss_workers`, `activity_id`, `task_type`, `activity_name`,
+`worker_id`) is identical between `no-schedule-to-close` and
+`schedule-to-close` rows -- so every one of these 15 relations behaves
+identically for both labels, and cancels out of the label-vs-label
+comparison. An earlier revision of this page also incorrectly described
+the baseline cost as touching only `idx_harvest_tq_poll` and
+`idx_harvest_tq_running` (Codex review, PR #1339, an earlier round). The
+one-sentence version that *is* accurate: `harvest_task_queue_schedule_to_close_idx` is the **one
+relation whose membership depends on `schedule_to_close_at`** -- every
+other relation the row touches (member, non-member, entering, or
+leaving) behaves identically for both labels on every claim, so it
+cancels out of the comparison; this one does not, which is why it is the
+source of the measured delta.
 
 The `Update on public.harvest_task_queue` node's own `Buffers` line shows
 this directly, and it is depth-independent -- the signature of a per-claim
