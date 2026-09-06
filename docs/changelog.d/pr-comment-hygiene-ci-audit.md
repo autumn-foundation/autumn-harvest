@@ -3655,3 +3655,36 @@ than assuming. `ref` binds an IDENTIFIER, so it sits inside the pattern
 is not Rust.
 
 Corpus effect: none, at 19311. Five fixtures, two of them refusals.
+
+Round 121 -- a literal value, matched instead of merely opened.
+
+`// #[Retry = 3 attempts remaining]` failed the build. The numeric branch
+opened on a digit and let `.*` take the rest, so prose after a number was
+an attribute value.
+
+Asking rustc 1.94.1 for the follow-set gives it verbatim: "expected one
+of `.`, `?`, `]`, or an operator". That set is NARROWER than the one a
+path gets -- no `!`, no `::`, no `{`, because a number is not a macro
+name, a path segment or a struct literal -- so it is its own fragment
+rather than a reuse of the path's.
+
+The same probe found the string branch has the identical hole, which was
+not reported: `// #[deprecated = "use foo" instead]` draws the same error
+from rustc and was passing the gate.
+
+Both are fixed by MATCHING the literal rather than opening it -- a
+non-raw string with its escapes, a raw string with balanced hashes, a
+number, a character -- because a follow-set is only possible once the
+literal has an end. That also retires an under-report nobody had filed:
+`// #[doc = r#"raw "inner" text"#]` is valid and the old opener could not
+read `r#` at all.
+
+`// #[doc = "text with ] bracket"]` still reports, which is the case a
+looser string match would have broken.
+
+Corpus effect: none, at 19311. Six fixtures, two of them refusals.
+
+On timing: the two new scans are linear, measured at 1000/2000/4000/8000
+words. A whole-corpus run is 32.8 seconds against 33.0 for the previous
+head, measured back to back -- the "23 seconds" quoted in earlier rounds
+was taken on a differently loaded machine and is not a baseline.

@@ -225,6 +225,12 @@ RULE_HINTS = {
 _APOS = r"[\u2019']"
 
 
+# What may FOLLOW a literal inside an attribute value. Narrower than the
+# set a path gets, and rustc 1.94.1 gives it verbatim: "expected one of
+# `.`, `?`, `]`, or an operator". No `!`, no `::`, no `{` -- a number is
+# not a macro name, a path segment or a struct literal.
+LITF = r"(?=[.?+*/%&|^<>=,-]|\])"
+
 # The BINDING MODE in front of an identifier. rustc 1.94.1 takes
 # `let ref stale = ...;` and `let ref mut stale = ...;`, and it takes `ref`
 # on an uninitialized binding too -- `let ref x: String;` -- which is the
@@ -576,11 +582,30 @@ COMMENTED_CODE_RE = re.compile(
             (?:
                 [(\[{].*
               | =\s*(?:
-                      (?:b|r|br|c)?["']
-                    | [0-9]
+                      # A LITERAL value, and what may follow it. rustc
+                      # 1.94.1 names the set for both spellings, and it is
+                      # narrower than the one a path gets: feed it
+                      # `\#[Retry = 3 attempts remaining]` or
+                      # `\#[deprecated = "use foo" instead]` and it answers
+                      # "expected one of `.`, `?`, `]`, or an operator".
+                      # A `.*` tail admitted the prose in both.
+                      #
+                      # So the literal is MATCHED rather than opened: a
+                      # non-raw string with its escapes, a raw string with
+                      # balanced hashes, or a number. Matching it is what
+                      # makes a follow-set possible at all, and it fixes an
+                      # under-report on the way -- `\#[doc = r\#"x"\#]` is
+                      # valid and the opener could not read `r\#`.
+                      (?:
+                          (?:b|br|c)?"(?:[^"\\]|\\.)*"
+                        | (?:b|c)?r(?P<attrh>\#*)"(?:(?!"(?P=attrh)).)*"(?P=attrh)
+                        | [0-9][0-9_]*(?:\.[0-9][0-9_]*)?
+                        | '(?:[^'\\]|\\.)'
+                      )\s*{LITF}.*
                     | (?:r\#)?\w+(?:::(?:r\#)?\w+)*\s*
                       (?=[!.?(\[{:+*/%&|^<>=,-]|\])
-                  ).*
+                      .*
+                  )
             )?
             \]\s*$
       | \}[,;)]*\s*$
@@ -722,7 +747,7 @@ COMMENTED_CODE_RE = re.compile(
         "{BODY}", BODY
     ).replace("{GEN}", GENERICS).replace("{ROOT}", ROOT).replace(
         "{DECL_TYPE}", DECL_TYPE
-    ).replace("{PROSE}", PROSE).replace("{BIND}", BIND).replace("{NOS}", NO_SEMI).replace("{NOSB}", NO_SEMI_BRACE).replace(
+    ).replace("{PROSE}", PROSE).replace("{BIND}", BIND).replace("{LITF}", LITF).replace("{NOS}", NO_SEMI).replace("{NOSB}", NO_SEMI_BRACE).replace(
         "{NOSE}", NO_SEMI_EQ
     ).replace("{NOSP}", NO_SEMI_PAREN).replace(
         "{ABI_FN}", abi("abifn")
@@ -6055,6 +6080,36 @@ RULE_TESTS = [
         "// let ref counter = the number of rows;\n",
         set(),
         "and the prose guard still reads the initializer",
+    ),
+    (
+        "// #[Retry = 3 attempts remaining]\n",
+        set(),
+        "prose after a number is not an attribute value",
+    ),
+    (
+        '// #[deprecated = "use foo" instead]\n',
+        set(),
+        "nor after a string, which rustc refuses the same way",
+    ),
+    (
+        "// #[Retry = 3]\n",
+        {("CH001", 1)},
+        "though a bare number is one",
+    ),
+    (
+        "// #[Retry = 3 + 1]\n",
+        {("CH001", 1)},
+        "and an operator may follow it",
+    ),
+    (
+        '// #[doc = r#"raw "inner" text"#]\n',
+        {("CH001", 1)},
+        "a raw string is a value too, which the opener could not read",
+    ),
+    (
+        '// #[doc = "text with ] bracket"]\n',
+        {("CH001", 1)},
+        "and a bracket inside a string closes nothing",
     ),
     (
         '// #[doc = include_str!("../README.md")]\n',
