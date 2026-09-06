@@ -225,6 +225,26 @@ RULE_HINTS = {
 _APOS = r"[\u2019']"
 
 
+# Is the tail of this declaration an EXPRESSION, or is it English? With no
+# operator to anchor on, a run of bare words separated by spaces is the only
+# thing the two share, so that run is what the guard reads.
+#
+# Two words, not three. Round one hundred and sixteen widened the assignment
+# rule and left the old three-word threshold in place, which let
+# `mode = legacy default;` through an absolute gate -- rustc answers
+# "expected one of `!`, `.`, `::`, `;`, `?`, `{`, `}`, or an operator, found
+# `default`", so it is not an expression and never was.
+#
+# `as` is the exception, and it is the ONLY one. `retries = count as usize;`
+# is a bare three-word run and valid Rust, and the old threshold refused it,
+# so this fragment fixes an under-report in the same stroke. `dyn`, `impl`
+# and `move` were checked and are not exceptions: they never appear in a
+# BARE word run, because `Box<dyn Send>`, `&dyn T` and `move || 1` all carry
+# a character that ends the run.
+#
+# One definition, spliced into the six rules that had written it out.
+PROSE = r"(?!\s*(?:(?!as\b)\w+\s+)+\w+\s*;\s*$)"
+
 # The `;` that ENDS a declaration and the `;` inside an ARRAY are the same
 # character to a regex and different things to a reader. `[u8; 32]` is one
 # type; the run that reads it must not stop in the middle of it.
@@ -328,7 +348,7 @@ ROOT = r"(?:::\s*)?"
 # hyphen is admitted only as `->`, because a bare one swept through "let
 # a::b is re-exported for callers;".
 DECL_TYPE = (
-    r"(?!\s*(?:\w+\s+){2,}\w+\s*;\s*$)\s*"
+    PROSE + r"\s*"
     r"(?:[\w:<>&'\[\]\s,()+*!?\#]|->|;(?=[^;]*\]))+;\s*$"
 )
 
@@ -440,11 +460,11 @@ COMMENTED_CODE_RE = re.compile(
             # see past it. A bound is introduced by a single colon, and a
             # path separator is two. `type I: ::std::fmt::Debug;` still
             # reports, because its bound colon is followed by a space.
-            (?::(?!:)(?!\s*(?:\w+\s+){2,}\w+\s*;\s*$)
+            (?::(?!:){PROSE}
                 {NOSB}+)?
             \s*{WHERE};\s*$
       | {VIS}type\s+(?:r\#)?\w+\s*(?:{GEN})?\s*{WHERE}=
-            (?!\s*(?:\w+\s+){2,}\w+\s*;\s*$).*;\s*$
+            {PROSE}.*;\s*$
       # The header of an impl -- a trait reference, a type, and a `where`
       # clause -- was a class of what may appear in one, which could not
       # hold the `[u8; 32]` of an array bound. Bounded by what may NOT:
@@ -454,7 +474,7 @@ COMMENTED_CODE_RE = re.compile(
             (?![^;{]*\b[a-z]+\s+[a-z]+\s+[a-z]+\s+[a-z]+\b)
             {NOSB}+{BODY}\s*$
       | let\s+(?:mut\s+)?(?:r\#)?\w+\s*(?::{NOSE}+)?=
-            (?!\s*(?:\w+\s+){2,}\w+\s*;\s*$)[^=].*;\s*$
+            {PROSE}[^=].*;\s*$
       # Destructuring bindings. A tuple or slice pattern, or a struct/enum
       # pattern behind a Capitalised path -- all terminated, and none of them
       # a shape English produces. The plain `\w+` form above misses every one.
@@ -474,7 +494,7 @@ COMMENTED_CODE_RE = re.compile(
       # came to disagree in rounds one hundred and eight and nine.
       | {VIS}(?:const|static)\s+(?:mut\s+)?(?:r\#)?\w+\s*:{DECL_TYPE}
       | let\s+(?:mut\s+)?(?:r\#)?\w+\s*:
-            (?!\s*(?:\w+\s+){2,}\w+\s*;\s*$)\s*
+            {PROSE}\s*
             # A Rust type, not a scalar name. An array length needs `;`, a
             # trait object needs `+`, a function pointer needs `->`, and a
             # raw pointer needs `*`; without them "let bytes: [u8; 32];" is
@@ -616,7 +636,7 @@ COMMENTED_CODE_RE = re.compile(
       # bare words before the terminator are a sentence, which is the same
       # test the uninitialized binding and the declaration type carry.
       | [\w.\[\]:\#]+\s*(?:[-+*/%&|^]|<<|>>)?=
-            (?!\s*(?:\w+\s+){2,}\w+\s*;\s*$)\s*{NOS}+;\s*$
+            {PROSE}\s*{NOS}+;\s*$
       # A commented-out statement. Anchored hard: the call must open at the
       # very start, so prose that merely names a function ("call cleanup()
       # first") cannot reach it, and the line must end at the `;`. Measured
@@ -651,7 +671,7 @@ COMMENTED_CODE_RE = re.compile(
         "{BODY}", BODY
     ).replace("{GEN}", GENERICS).replace("{ROOT}", ROOT).replace(
         "{DECL_TYPE}", DECL_TYPE
-    ).replace("{NOS}", NO_SEMI).replace("{NOSB}", NO_SEMI_BRACE).replace(
+    ).replace("{PROSE}", PROSE).replace("{NOS}", NO_SEMI).replace("{NOSB}", NO_SEMI_BRACE).replace(
         "{NOSE}", NO_SEMI_EQ
     ).replace("{NOSP}", NO_SEMI_PAREN).replace(
         "{ABI_FN}", abi("abifn")
@@ -701,6 +721,15 @@ TODO_RE = re.compile(
 # cheapest test that refuses both without pretending to parse IPv6.
 REFERENCE = (
     r"(?:"
+    # An issue number, and what may sit in FRONT of the hash. The file said
+    # this needed no guard there, "because `owner/repo#123` is a real
+    # cross-repository reference" -- true of that form, and it let every
+    # other one through: `abc#123` routes nowhere and counted as tracking.
+    #
+    # So the prefix is spelled out instead of tolerated. Either the hash
+    # opens a token, or a COMPLETE `owner/repo` sits against it. `x/#123`
+    # has the slash and no repository, and is refused.
+    r"(?<![A-Za-z0-9_./\-])(?:[A-Za-z0-9_.\-]+/[A-Za-z0-9_.\-]+)?"
     r"#[1-9][0-9]*(?!\w)"
     r"|(?<![A-Za-z0-9+.\-])(?i:https?)://"
     r"(?:\[(?=[0-9A-Fa-f:.]*:)(?=[0-9A-Fa-f:.]*[0-9A-Fa-f])[0-9A-Fa-f:.]+\]|\w)"
@@ -3493,7 +3522,22 @@ def check_prose_rules(path: str, pieces: list[Piece]) -> list[Finding]:
                 spanless = blank_inline_code(spanless)
             if NARRATIVE_RE.search(spanless):
                 findings.append(Finding("CH003", path, lineno, sentence[:100]))
-            words = sentence.split()
+            # Counted over the MASKED copy, so a code span is one token
+            # rather than however many spaces its content happens to hold.
+            # `/// Use `<a 26-token command>` here.` is a two-word sentence
+            # with a literal in it, and counting the literal's tokens
+            # reported it as twenty-eight and failed the Tier B ratchet on
+            # documentation that says almost nothing.
+            #
+            # The mask is the same one that finds sentence boundaries, and
+            # it fills a span to its own width, so the span survives as a
+            # single unbroken token instead of vanishing the way the
+            # blanked copy would leave it.
+            words = (
+                mask_inline_code(mask_code_spans(sentence))
+                if doc
+                else mask_code_spans(sentence)
+            ).split()
             if len(words) > MAX_SENTENCE_WORDS:
                 findings.append(
                     Finding(
@@ -5349,6 +5393,26 @@ RULE_TESTS = [
         "but a cfg_attr with no doc payload carries nothing",
     ),
     (
+        "/// Use `--flag0 --flag1 --flag2 --flag3 --flag4 --flag5 --flag6 --flag7 --flag8 --flag9 --flag10 --flag11 --flag12 --flag13 --flag14 --flag15 --flag16 --flag17 --flag18 --flag19 --flag20 --flag21 --flag22 --flag23 --flag24 --flag25` here.\n",
+        set(),
+        "a code span is one token, however many spaces its content holds",
+    ),
+    (
+        "// TODO: fix token abc#123\n",
+        {("CH002", 1)},
+        "a hash inside a token routes nowhere and tracks nothing",
+    ),
+    (
+        "// TODO: fix x/#123\n",
+        {("CH002", 1)},
+        "and a slash with no repository behind it is not the cross-repo form",
+    ),
+    (
+        "// TODO: fix owner/repo#123\n",
+        set(),
+        "though the complete cross-repository form still tracks",
+    ),
+    (
         "// TODO(#1): a; TODO(#2): b\n",
         set(),
         "and two markers each carrying one are both tracked",
@@ -5830,6 +5894,21 @@ RULE_TESTS = [
         "// return early, before the lock is taken;\n",
         set(),
         "and return keeps one token, because that guard does not transfer",
+    ),
+    (
+        "// mode = legacy default;\n",
+        set(),
+        "two bare words after the equals are prose, not an expression",
+    ),
+    (
+        "// retries = count as usize;\n",
+        {("CH001", 1)},
+        "but a cast is bare words that rustc accepts",
+    ),
+    (
+        "// let retries = count as usize;\n",
+        {("CH001", 1)},
+        "in a binding as well, from the same fragment",
     ),
     (
         '// #[doc = include_str!("../README.md")]\n',

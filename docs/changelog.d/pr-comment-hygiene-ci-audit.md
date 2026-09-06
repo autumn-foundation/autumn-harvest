@@ -3544,3 +3544,44 @@ So `// return [0u8; 32];` stays missed, as that round said, and the file
 now records the failed attempt rather than the bare restatement.
 
 Corpus effect: none. Five fixtures, two of them refusals.
+
+Round 117 -- a false positive of my own making, a reference that routes
+nowhere, and the first corpus movement in fifty-five rounds.
+
+`// mode = legacy default;` failed the build. Round one hundred and
+sixteen widened the assignment rule and left the old three-word threshold
+beside it, so a TWO-word tail slipped through. rustc answers "expected
+one of `!`, `.`, `::`, `;`, `?`, `{`, `}`, or an operator, found
+`default`", so it is not an expression.
+
+The threshold is two words now, with one exception: `as`.
+`// retries = count as usize;` is a bare three-word run and valid Rust,
+and the old guard refused it, so the same change retires an under-report.
+`dyn`, `impl` and `move` were checked and are NOT exceptions -- they
+never appear in a bare word run, because `Box<dyn Send>`, `&dyn T` and
+`move || 1` each carry a character that ends one.
+
+The guard was written out six times. It is one fragment now, so the
+binding rules gained the `as` fix without being named in the report.
+
+`// TODO: fix token abc#123` counted as tracked. The file said the issue
+number needed no guard in front "because `owner/repo#123` is a real
+cross-repository reference" -- true of that form, and it admitted every
+other. The prefix is spelled out instead of tolerated: either the hash
+opens a token, or a complete `owner/repo` sits against it. `x/#123` has
+the slash and no repository, and is refused.
+
+CH007 counted every token inside an inline code span. `/// Use ` plus a
+twenty-six-token command plus `here.` is a two-word sentence, and the
+rule called it twenty-eight and failed the Tier B ratchet on
+documentation that says almost nothing. The count now reads the masked
+copy, where a span is one unbroken token -- the same mask that finds
+sentence boundaries.
+
+That last one MOVES THE CORPUS, for the first time since round sixty:
+CH007 falls from 18064 to 17661, exactly 403 sentences that were never
+over the limit. Tier A stays at zero, CH005 and CH006 do not move, and
+the ratchet still passes -- 4889 in changed files against 4891 at the
+merge base.
+
+Eight fixtures.
