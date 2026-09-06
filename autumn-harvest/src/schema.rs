@@ -1147,6 +1147,11 @@ diesel::table! {
         last_attempt_at -> Nullable<Timestamptz>,
         created_at -> Timestamptz,
         updated_at -> Timestamptz,
+        /// The source's `legal_hold_set_at` as re-read at verify time. The
+        /// cutover requires the live value to still match this one, so a hold
+        /// placed or released after verification aborts the cutover instead of
+        /// sealing a source whose target copy has the wrong hold state.
+        verified_legal_hold_set_at -> Nullable<Timestamptz>,
     }
 }
 

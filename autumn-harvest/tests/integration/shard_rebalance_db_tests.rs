@@ -2404,3 +2404,280 @@ async fn a_declared_retired_forward_requires_its_successor_pool() {
         other => panic!("expected ShardUnavailable for an absent successor pool, got {other:?}"),
     }
 }
+
+// ── Issue #1317: seal-predicate and abort-restore hardening ─────────────────
+//
+// Round 6-12 review of PR #1305 found that `existing_seal` (read before a
+// reverse-migration restage) and the abort-restore fallback both key off
+// `state` rather than the forwarding pointer, unlike `read_forward`. Both
+// windows can destroy the one seal every A-origin id resolves through.
+
+#[tokio::test]
+async fn a_repeated_stage_after_an_interrupted_resume_keeps_the_carried_seal() {
+    // A -> B, then B -> A begins and stages successfully: A is now MIGRATING
+    // and carries A's own prior seal (pointing at B) so ids keep resolving
+    // during staging. Model a crash between that target commit and the
+    // source-side phase advance by resetting the record back to PENDING --
+    // exactly what a resume sweep observes and re-drives with a second
+    // `stage_copy` call.
+    let shards = setup_two_shards().await;
+    let exec_id = quiescent_fixture(&shards, "resume-carries-seal").await;
+
+    migrate_execution(&shards.pool, exec_id, SOURCE, TARGET, &codecs())
+        .await
+        .expect("A -> B");
+
+    let (mut source, mut target) = (shards.target().await, shards.source().await);
+    begin_migration(&mut source, exec_id, TARGET, SOURCE)
+        .await
+        .expect("begin B -> A");
+    stage_copy(&mut source, &mut target, exec_id, SOURCE)
+        .await
+        .expect("first stage onto A");
+
+    diesel::sql_query(
+        "UPDATE harvest_shard_migrations SET phase = 'PENDING' WHERE execution_id = $1",
+    )
+    .bind::<diesel::sql_types::Uuid, _>(exec_id.as_uuid())
+    .execute(&mut source)
+    .await
+    .expect("simulate a crash before the phase advanced past PENDING");
+
+    stage_copy(&mut source, &mut target, exec_id, SOURCE)
+        .await
+        .expect("resume re-stages the still-PENDING record");
+
+    let mut a = shards.source().await;
+    assert_eq!(
+        forward_of(&mut a, exec_id).await,
+        Some(TARGET.as_i32()),
+        "re-staging a PENDING record must not drop A's own carried seal"
+    );
+    assert_eq!(
+        resolve_execution_shard(&shards.pool, exec_id)
+            .await
+            .expect("resolve"),
+        TARGET,
+        "the run is still live on B while the reverse migration is only staged"
+    );
+}
+
+#[tokio::test]
+async fn aborting_before_staging_ever_touched_the_target_leaves_its_seal_untouched() {
+    // A -> B seals A. A B -> A reverse migration is opened but `stage_copy`
+    // never ran against A (the equivalent of it failing before its target
+    // transaction committed) -- A's row is exactly the untouched original
+    // seal. Abort must recognize "nothing to discard" and leave it alone
+    // rather than falling through to a DELETE that matches on `state` alone.
+    let shards = setup_two_shards().await;
+    let exec_id = quiescent_fixture(&shards, "abort-never-staged").await;
+
+    migrate_execution(&shards.pool, exec_id, SOURCE, TARGET, &codecs())
+        .await
+        .expect("A -> B");
+
+    let (mut source, mut target) = (shards.target().await, shards.source().await);
+    begin_migration(&mut source, exec_id, TARGET, SOURCE)
+        .await
+        .expect("begin B -> A");
+
+    abort_migration(&mut source, &mut target, exec_id, "never staged")
+        .await
+        .expect("abort a PENDING migration whose target was never touched");
+
+    let mut a = shards.source().await;
+    assert_eq!(
+        state_of(&mut a, exec_id).await.as_deref(),
+        Some("MIGRATED"),
+        "A's pre-existing seal must survive an abort that never staged over it"
+    );
+    assert_eq!(
+        forward_of(&mut a, exec_id).await,
+        Some(TARGET.as_i32()),
+        "the untouched seal must keep its pointer, not be deleted"
+    );
+    assert_eq!(
+        resolve_execution_shard(&shards.pool, exec_id)
+            .await
+            .expect("resolve after abort"),
+        TARGET
+    );
+    assert!(
+        count(
+            &mut a,
+            "SELECT count(*)::BIGINT AS value FROM harvest_events WHERE workflow_exec_id = $1",
+            exec_id
+        )
+        .await
+            > 0,
+        "A's own pre-migration history must survive an abort that never staged over it"
+    );
+}
+
+// ── Issue #1317: a hold placed during staging must not be cut over past ─────
+
+#[tokio::test]
+async fn a_hold_placed_after_verification_refuses_the_cutover() {
+    // Round 6 finding #5: `stage_copy` snapshots the row with no lock, so a
+    // hold placed afterwards lands only on the source. The cutover must not
+    // seal a source whose hold state has moved since the copy it is about to
+    // authorize was verified.
+    let shards = setup_two_shards().await;
+    let exec_id = quiescent_fixture(&shards, "hold-during-staging").await;
+    let (mut source, mut target) = (shards.source().await, shards.target().await);
+
+    begin_migration(&mut source, exec_id, SOURCE, TARGET)
+        .await
+        .expect("begin");
+    stage_copy(&mut source, &mut target, exec_id, TARGET)
+        .await
+        .expect("stage");
+    verify_target_copy(&mut source, &mut target, exec_id, &codecs())
+        .await
+        .expect("verify");
+
+    autumn_harvest::set_legal_hold(
+        &mut source,
+        exec_id,
+        "litigation hold",
+        None,
+        "compliance-bot",
+        Utc::now(),
+    )
+    .await
+    .expect("place a hold after the copy was verified");
+
+    let cut_over = commit_cutover(&mut source, exec_id, TARGET)
+        .await
+        .expect("cutover call must not error");
+    assert!(
+        !cut_over,
+        "a hold placed after verification must refuse the cutover, not seal past it"
+    );
+    assert_eq!(
+        state_of(&mut source, exec_id).await.as_deref(),
+        Some("RUNNING"),
+        "a refused cutover must leave the source exactly as it was"
+    );
+
+    // The runbook answer is what a declined cutover always requires: abort and
+    // restart the migration. A fresh `stage_copy` snapshots the row with the
+    // hold already on it, so the second attempt verifies and cuts over clean.
+    abort_migration(&mut source, &mut target, exec_id, "hold placed mid-staging")
+        .await
+        .expect("abort the stale attempt");
+    begin_migration(&mut source, exec_id, SOURCE, TARGET)
+        .await
+        .expect("begin again");
+    stage_copy(&mut source, &mut target, exec_id, TARGET)
+        .await
+        .expect("restage with the hold already in place");
+    verify_target_copy(&mut source, &mut target, exec_id, &codecs())
+        .await
+        .expect("verify");
+    assert!(
+        commit_cutover(&mut source, exec_id, TARGET)
+            .await
+            .expect("cutover"),
+        "a cutover verified against the current hold state must succeed"
+    );
+}
+
+#[tokio::test]
+async fn a_hold_released_after_verification_also_refuses_the_cutover() {
+    // The symmetric direction: a hold active at verification time but
+    // released before cutover must equally block sealing on the stale state.
+    let shards = setup_two_shards().await;
+    let exec_id = quiescent_fixture(&shards, "hold-released-during-staging").await;
+    let (mut source, mut target) = (shards.source().await, shards.target().await);
+
+    autumn_harvest::set_legal_hold(
+        &mut source,
+        exec_id,
+        "under review",
+        None,
+        "compliance-bot",
+        Utc::now(),
+    )
+    .await
+    .expect("place a hold before staging begins");
+
+    begin_migration(&mut source, exec_id, SOURCE, TARGET)
+        .await
+        .expect("begin");
+    stage_copy(&mut source, &mut target, exec_id, TARGET)
+        .await
+        .expect("stage");
+    verify_target_copy(&mut source, &mut target, exec_id, &codecs())
+        .await
+        .expect("verify");
+
+    autumn_harvest::release_legal_hold(&mut source, exec_id, Utc::now())
+        .await
+        .expect("release the hold after verification");
+
+    let cut_over = commit_cutover(&mut source, exec_id, TARGET)
+        .await
+        .expect("cutover call must not error");
+    assert!(
+        !cut_over,
+        "a hold released after verification must also refuse the stale cutover"
+    );
+}
+
+// ── Issue #1317: one bad target must not starve the whole resume sweep ──────
+
+#[tokio::test]
+async fn a_resume_sweep_finishes_healthy_records_past_one_unreachable_target() {
+    // Round 8 finding: `resume_incomplete_migrations` checked out its per-record
+    // source/target connections with `?`, so one record naming an unavailable
+    // or unconfigured target shard aborted the whole sweep -- including a
+    // record whose own target is perfectly healthy and sits right behind it.
+    let shards = setup_two_shards().await;
+
+    // A record naming a shard this pool has no connection for at all. It is
+    // the oldest by `created_at`, so it is the one an unfixed sweep dies on
+    // before ever reaching the healthy record below.
+    let unreachable_target = ShardId::new(99);
+    diesel::sql_query(
+        "INSERT INTO harvest_shard_migrations \
+             (execution_id, source_shard, target_shard, phase, created_at, updated_at) \
+         VALUES ($1, $2, $3, 'PENDING', NOW() - INTERVAL '1 minute', NOW())",
+    )
+    .bind::<diesel::sql_types::Uuid, _>(Uuid::new_v4())
+    .bind::<diesel::sql_types::Integer, _>(SOURCE.as_i32())
+    .bind::<diesel::sql_types::Integer, _>(unreachable_target.as_i32())
+    .execute(&mut shards.source().await)
+    .await
+    .expect("seed an unresumable record naming an unreachable target");
+
+    // A real, healthy migration staged and ready to finish.
+    let exec_id = quiescent_fixture(&shards, "resume-past-bad-target").await;
+    let (mut source, mut target) = (shards.source().await, shards.target().await);
+    begin_migration(&mut source, exec_id, SOURCE, TARGET)
+        .await
+        .expect("begin");
+    stage_copy(&mut source, &mut target, exec_id, TARGET)
+        .await
+        .expect("stage");
+    verify_target_copy(&mut source, &mut target, exec_id, &codecs())
+        .await
+        .expect("verify");
+    assert!(
+        commit_cutover(&mut source, exec_id, TARGET)
+            .await
+            .expect("cutover")
+    );
+
+    let outcomes = resume_incomplete_migrations(&shards.pool, SOURCE, 100, "tester", &codecs())
+        .await
+        .expect("the sweep must not fail wholesale on the other record's bad target");
+
+    assert!(
+        outcomes
+            .iter()
+            .any(|o| matches!(o, MigrationOutcome::Migrated { execution_id, .. } if *execution_id == exec_id)),
+        "the healthy record must still be finished, got {outcomes:?}"
+    );
+    assert_eq!(authoritative_shards(&shards, exec_id).await, vec![TARGET]);
+}

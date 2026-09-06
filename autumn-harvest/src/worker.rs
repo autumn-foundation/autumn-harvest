@@ -57,8 +57,8 @@ use crate::telemetry::{
     ATTR_WORKFLOW_ID, ActivityStatus, SlotType, TraceContextCarrier, WorkflowStatus,
 };
 use crate::types::{
-    ActivityExecId, ExecutionId, ExternalActivityToken, IdempotencyKey, ParentClosePolicy, TimerId,
-    WorkerId,
+    ActivityExecId, ExecutionId, ExternalActivityToken, IdempotencyKey, ParentClosePolicy, ShardId,
+    TimerId, WorkerId,
 };
 
 /// Type alias for the deadpool-managed async Diesel connection pool.
@@ -7502,6 +7502,17 @@ pub async fn persist_workflow_failure(
     // `WorkflowFailed` event carries the full typed fields.
     let decoded = crate::failure::decode_workflow_failure(&error);
 
+    // The shard the retry successor must be minted on (issue #1317). `exec_id`
+    // carries its ORIGIN shard bits, which go stale the moment this row is
+    // rebalanced. `conn` is already connected to wherever the row actually
+    // lives, so its own `shard_id` column is the answer -- no cross-shard
+    // resolver call needed. Minting on the origin instead would insert the
+    // successor there with no forwarding row for its new id, making it
+    // unreachable by every id-routed handle and API.
+    let current_shard = crate::shard_rebalance::shard_of_held_row(conn, exec_id)
+        .await
+        .unwrap_or_else(|| exec_id.shard());
+
     // Pre-compute the retry plan (pure, no DB) before entering the transaction.
     let retry_plan: Option<(ExecutionId, RetryPolicy, u32, std::time::Duration)> =
         // Issue #782: a contained handler-panic terminal must NOT also spawn a
@@ -7563,7 +7574,7 @@ pub async fn persist_workflow_failure(
                         .unwrap_or([0u8; 8]),
                 );
                 let delay = crate::policy::compute_retry_delay_with_seed(&policy, attempt, seed);
-                let retry_exec_id = ExecutionId::new_for_shard(exec_id.shard());
+                let retry_exec_id = ExecutionId::new_for_shard(current_shard);
                 Some((retry_exec_id, policy, attempt, delay))
             })
         } else {
@@ -16609,7 +16620,15 @@ pub async fn persist_workflow_continue_as_new(
     // The new execution stays on the same shard so all of its event log,
     // queue rows, timers, and signals continue to live in the same Postgres
     // database as its predecessor.
-    let new_exec_id = ExecutionId::new_for_shard(persistence.exec_id.shard());
+    //
+    // Read off `execution.shard_id`, not `persistence.exec_id.shard()`
+    // (issue #1317): the id carries the predecessor's ORIGIN shard bits, which
+    // go stale once it is rebalanced. `execution` is the row already loaded
+    // from wherever it actually lives, so its own column is the current
+    // residence. Minting on the origin instead would insert the successor
+    // there with no forwarding row for its new id -- unreachable by every
+    // id-routed handle and API.
+    let new_exec_id = ExecutionId::new_for_shard(ShardId::new(execution.shard_id));
     let task_id = persistence.task.id;
     let crash_strikes = persistence.task.crash_strikes;
     let exec_id = persistence.exec_id;
