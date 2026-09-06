@@ -710,9 +710,16 @@ mod db {
     /// `legal_hold_set_at` moves from NULL to a timestamp, or back. Requiring
     /// the live value to still match here closes the window, the same way
     /// `HISTORY_UNCHANGED_SQL` closes it for appended events.
+    ///
+    /// `legal_hold_verified` must also be true. NULL is a valid, common
+    /// `verified_legal_hold_set_at` value -- "verified, no hold" -- so it
+    /// cannot double as "never verified by code that knows this column
+    /// exists". A rolling deploy can leave a record verified by an old
+    /// worker with the column at its default; the flag fails that record's
+    /// cutover closed instead of matching it by coincidence.
     const LEGAL_HOLD_UNCHANGED_SQL: &str = "\
         EXISTS (SELECT 1 FROM harvest_shard_migrations m \
-                 WHERE m.execution_id = e.id \
+                 WHERE m.execution_id = e.id AND m.legal_hold_verified \
                    AND m.verified_legal_hold_set_at IS NOT DISTINCT FROM e.legal_hold_set_at)";
 
     #[derive(diesel::QueryableByName)]
@@ -1430,7 +1437,9 @@ mod db {
             // not a restored seal. Deleting it is safe. The guard above
             // already confirmed the row is `MIGRATING`, so this cannot match
             // a pre-existing `MIGRATED` seal (issue #1317).
-            diesel::sql_query("DELETE FROM harvest_workflow_executions WHERE id = $1 AND state = 'MIGRATING'")
+            diesel::sql_query(
+                "DELETE FROM harvest_workflow_executions WHERE id = $1 AND state = 'MIGRATING'",
+            )
             .bind::<SqlUuid, _>(exec_id.as_uuid())
             .execute(&mut *conn)
             .await
@@ -1636,23 +1645,38 @@ mod db {
         // NOW, right before the stamp. A hold placed or released between
         // `stage_copy`'s snapshot and this read is the window the cutover
         // guard cannot close on its own. This read shrinks it to nothing.
-        let legal_hold_set_at: Option<DateTime<Utc>> = {
-            let row: LegalHoldRow = diesel::sql_query(
-                "SELECT legal_hold_set_at AS value FROM harvest_workflow_executions \
-                  WHERE id = $1",
-            )
-            .bind::<SqlUuid, _>(exec_id.as_uuid())
-            .get_result(&mut *source)
-            .await
-            .map_err(database_error)?;
-            row.value
-        };
+        let legal_hold_set_at = read_legal_hold_set_at(source, exec_id).await?;
+
+        // The window this read alone cannot close: a hold placed or released
+        // between `stage_copy`'s snapshot and THIS read is invisible here,
+        // because the staged target still carries whatever `stage_copy` saw.
+        // Comparing the live source value against the STAGED target's own
+        // copy of the same column catches exactly that drift: they must
+        // still agree, or the staged copy is stale and verification must
+        // fail rather than authorize a cutover onto it.
+        let staged_legal_hold_set_at = read_legal_hold_set_at(target, exec_id).await?;
+        if staged_legal_hold_set_at != legal_hold_set_at {
+            return Err(HarvestError::NonDeterministic {
+                reason: format!(
+                    "shard migration of {exec_id} cannot verify: the source's legal-hold \
+                     state changed after staging (staged {staged_legal_hold_set_at:?}, now \
+                     {legal_hold_set_at:?}); abort and restage to pick up the current hold"
+                ),
+                details: Box::new(crate::error::NonDeterministicDetails {
+                    event_index: None,
+                    expected: None,
+                    actual: None,
+                    workflow_type: None,
+                    build_id: None,
+                }),
+            });
+        }
 
         diesel::sql_query(
             "UPDATE harvest_shard_migrations m \
                 SET phase = 'VERIFIED', verified_fingerprint = $2, updated_at = NOW(), \
                     verified_event_count = $3, verified_max_event_id = $4, \
-                    verified_legal_hold_set_at = $5 \
+                    verified_legal_hold_set_at = $5, legal_hold_verified = TRUE \
               WHERE m.execution_id = $1 AND m.phase = 'COPIED'",
         )
         .bind::<SqlUuid, _>(exec_id.as_uuid())
@@ -1665,6 +1689,22 @@ mod db {
         .map_err(database_error)?;
 
         Ok(source_fingerprint)
+    }
+
+    /// The current `legal_hold_set_at` for `exec_id` on whatever shard `conn`
+    /// is connected to.
+    async fn read_legal_hold_set_at(
+        conn: &mut AsyncPgConnection,
+        exec_id: ExecutionId,
+    ) -> HarvestResult<Option<DateTime<Utc>>> {
+        let row: LegalHoldRow = diesel::sql_query(
+            "SELECT legal_hold_set_at AS value FROM harvest_workflow_executions WHERE id = $1",
+        )
+        .bind::<SqlUuid, _>(exec_id.as_uuid())
+        .get_result(conn)
+        .await
+        .map_err(database_error)?;
+        Ok(row.value)
     }
 
     #[derive(diesel::QueryableByName)]
@@ -2413,7 +2453,7 @@ mod db {
             // raised AFTER the cutover already sealed the source -- exactly
             // the record an operator most needs. Turn the error into an
             // auditable outcome instead of propagating it.
-            let outcome = match migrate_execution(
+            let (outcome, unexpected_error) = match migrate_execution(
                 pool,
                 candidate.execution_id,
                 source_shard,
@@ -2422,18 +2462,25 @@ mod db {
             )
             .await
             {
-                Ok(outcome) => outcome,
-                Err(error) => MigrationOutcome::Aborted {
-                    execution_id: candidate.execution_id,
-                    reason: format!(
-                        "migrate_execution returned an unexpected error, which can happen \
-                         after the cutover already sealed the source: {error}. Check \
-                         `harvest_shard_migrations` for this execution and run the resume \
-                         sweep if its phase is COMMITTED"
-                    ),
-                },
+                Ok(outcome) => (outcome, false),
+                Err(error) => (
+                    MigrationOutcome::Aborted {
+                        execution_id: candidate.execution_id,
+                        reason: format!(
+                            "migrate_execution returned an unexpected error, which can \
+                             happen after the cutover already sealed the source: {error}. \
+                             Check `harvest_shard_migrations` for this execution and run \
+                             the resume sweep if its phase is COMMITTED"
+                        ),
+                    },
+                    true,
+                ),
             };
-            if matches!(outcome, MigrationOutcome::Migrated { .. }) {
+            // An `unexpected_error` can mean the source is already sealed
+            // (issue #1317): `moved` must count it, or a persistently failing
+            // target lets the batch keep drawing fresh candidates past
+            // `limit`, sealing far more than the operator asked for.
+            if matches!(outcome, MigrationOutcome::Migrated { .. }) || unexpected_error {
                 moved += 1;
             }
             // Audited HERE, per outcome, not after the loop: a later error
@@ -2549,10 +2596,16 @@ mod db {
     ) -> HarvestResult<Vec<MigrationOutcome>> {
         let unsettled: Vec<MigrationRecord> = {
             let mut source = checkout(pool, source_shard).await?;
+            // `attempts ASC` first (issue #1317): a record whose checkout or
+            // step keeps failing accumulates attempts (below, and in the step
+            // failure path further down) and sinks behind less-tried records
+            // on the NEXT sweep, instead of permanently occupying the front
+            // of a `created_at`-only queue and starving every healthy record
+            // behind it when `limit` is small.
             let rows: Vec<MigrationRow> = diesel::sql_query(format!(
                 "SELECT {MIGRATION_COLUMNS} FROM harvest_shard_migrations \
                   WHERE phase NOT IN ('DONE', 'ABORTED') \
-                  ORDER BY created_at ASC LIMIT $1"
+                  ORDER BY attempts ASC, created_at ASC LIMIT $1"
             ))
             .bind::<BigInt, _>(limit)
             .load(&mut *source)
@@ -2580,11 +2633,23 @@ mod db {
             let (mut source, mut target) = match checked_out {
                 Ok(pair) => pair,
                 Err(error) => {
+                    let reason = format!(
+                        "could not check out a connection to resume this migration: {error}"
+                    );
+                    // Best-effort: bumps `attempts` so the ORDER BY above sinks
+                    // this record behind less-tried ones on the next sweep.
+                    // `record.source_shard` is usually the same pool already
+                    // used to read this record's own table, so a fresh
+                    // checkout of it typically succeeds even when the
+                    // record's TARGET is what is actually unavailable. If
+                    // this checkout also fails, there is nothing to record
+                    // to, and the record is left for the next sweep as-is.
+                    if let Ok(mut source) = checkout(pool, record.source_shard).await {
+                        let _ = record_attempt(&mut source, exec_id, &reason).await;
+                    }
                     outcomes.push(MigrationOutcome::Aborted {
                         execution_id: exec_id,
-                        reason: format!(
-                            "could not check out a connection to resume this migration: {error}"
-                        ),
+                        reason,
                     });
                     continue;
                 }

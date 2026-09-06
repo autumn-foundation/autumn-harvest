@@ -938,13 +938,21 @@ async fn the_sql_cutover_predicate_agrees_with_the_pure_predicate() {
         // the source history to still match the high-water mark verification
         // recorded. Stamp it from the live history so this test exercises the
         // quiescence half in isolation, which is what it is here to pin.
+        // `legal_hold_verified` must also be stamped, exactly as
+        // `verify_target_copy` would for an execution with no hold, or the
+        // cutover's `LEGAL_HOLD_UNCHANGED_SQL` guard fails closed regardless
+        // of quiescence -- this test pins the quiescence half in isolation.
         diesel::sql_query(
             "UPDATE harvest_shard_migrations m SET phase = 'VERIFIED', \
                  verified_event_count = (SELECT count(*) FROM harvest_events ev \
                                           WHERE ev.workflow_exec_id = m.execution_id), \
                  verified_max_event_id = \
                      COALESCE((SELECT max(ev.event_id) FROM harvest_events ev \
-                                WHERE ev.workflow_exec_id = m.execution_id), -1) \
+                                WHERE ev.workflow_exec_id = m.execution_id), -1), \
+                 legal_hold_verified = TRUE, \
+                 verified_legal_hold_set_at = \
+                     (SELECT legal_hold_set_at FROM harvest_workflow_executions \
+                       WHERE id = m.execution_id) \
                WHERE m.execution_id = $1",
         )
         .bind::<diesel::sql_types::Uuid, _>(exec_id.as_uuid())
@@ -2622,6 +2630,119 @@ async fn a_hold_released_after_verification_also_refuses_the_cutover() {
     assert!(
         !cut_over,
         "a hold released after verification must also refuse the stale cutover"
+    );
+}
+
+#[tokio::test]
+async fn a_hold_placed_between_staging_and_verification_fails_verification() {
+    // Codex round 1 on PR #1406: a hold placed after `stage_copy`'s snapshot
+    // but BEFORE `verify_target_copy` runs is a narrower window than the two
+    // tests above, and the stamp-only fix does not close it -- verification
+    // would read the NEW hold value, stamp it, and the cutover guard would
+    // then compare the live value to that same stamp and match, sealing a
+    // source whose target copy still holds the pre-hold columns. Verification
+    // must compare the source's current value against what was actually
+    // staged on the target, not merely record whatever the source shows now.
+    let shards = setup_two_shards().await;
+    let exec_id = quiescent_fixture(&shards, "hold-between-stage-and-verify").await;
+    let (mut source, mut target) = (shards.source().await, shards.target().await);
+
+    begin_migration(&mut source, exec_id, SOURCE, TARGET)
+        .await
+        .expect("begin");
+    stage_copy(&mut source, &mut target, exec_id, TARGET)
+        .await
+        .expect("stage before any hold exists");
+
+    autumn_harvest::set_legal_hold(
+        &mut source,
+        exec_id,
+        "hold arrived mid-staging",
+        None,
+        "compliance-bot",
+        Utc::now(),
+    )
+    .await
+    .expect("place a hold after staging but before verification");
+
+    let verify_result = verify_target_copy(&mut source, &mut target, exec_id, &codecs()).await;
+    assert!(
+        verify_result.is_err(),
+        "verification must refuse to authorize a cutover onto a target staged \
+         before the hold existed, got {verify_result:?}"
+    );
+
+    let record = load_migration(&mut source, exec_id)
+        .await
+        .expect("load")
+        .expect("row");
+    assert_eq!(
+        record.phase,
+        MigrationPhase::Copied,
+        "a failed verification must not advance the phase"
+    );
+
+    // The recovery path: abort and restage, which snapshots the row WITH the
+    // hold this time, so the second attempt verifies and cuts over clean.
+    abort_migration(&mut source, &mut target, exec_id, "hold arrived mid-staging")
+        .await
+        .expect("abort");
+    begin_migration(&mut source, exec_id, SOURCE, TARGET)
+        .await
+        .expect("begin again");
+    stage_copy(&mut source, &mut target, exec_id, TARGET)
+        .await
+        .expect("restage with the hold already in place");
+    verify_target_copy(&mut source, &mut target, exec_id, &codecs())
+        .await
+        .expect("verify");
+    assert!(
+        commit_cutover(&mut source, exec_id, TARGET)
+            .await
+            .expect("cutover"),
+        "a cutover verified against a target staged under the current hold must succeed"
+    );
+}
+
+#[tokio::test]
+async fn a_legacy_verified_record_with_no_hold_snapshot_refuses_the_cutover() {
+    // Codex round 1 on PR #1406: `verified_legal_hold_set_at IS NOT DISTINCT
+    // FROM` alone treats a NULL stamp (never checked) the same as a NULL
+    // stamp meaning "checked, no hold" -- indistinguishable by value once a
+    // rolling deploy leaves a record verified by code that predates this
+    // column. `legal_hold_verified` must be required too, so such a record
+    // fails the cutover guard closed rather than matching by coincidence.
+    let shards = setup_two_shards().await;
+    let exec_id = quiescent_fixture(&shards, "legacy-verified-no-hold-snapshot").await;
+    let (mut source, mut target) = (shards.source().await, shards.target().await);
+
+    begin_migration(&mut source, exec_id, SOURCE, TARGET)
+        .await
+        .expect("begin");
+    stage_copy(&mut source, &mut target, exec_id, TARGET)
+        .await
+        .expect("stage");
+    verify_target_copy(&mut source, &mut target, exec_id, &codecs())
+        .await
+        .expect("verify");
+
+    // Simulate a record verified by code that predates `legal_hold_verified`:
+    // the flag reverts to its column default even though the record is
+    // otherwise VERIFIED with a matching (NULL) hold stamp.
+    diesel::sql_query(
+        "UPDATE harvest_shard_migrations SET legal_hold_verified = FALSE WHERE execution_id = $1",
+    )
+    .bind::<diesel::sql_types::Uuid, _>(exec_id.as_uuid())
+    .execute(&mut source)
+    .await
+    .expect("simulate a legacy-verified record");
+
+    let cut_over = commit_cutover(&mut source, exec_id, TARGET)
+        .await
+        .expect("cutover call must not error");
+    assert!(
+        !cut_over,
+        "a record never checked for a hold by this code must not authorize a cutover"
     );
 }
 

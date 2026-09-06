@@ -15,3 +15,17 @@
 -- operator re-runs the migration -- which restages under the fresh hold state.
 ALTER TABLE harvest_shard_migrations
     ADD COLUMN IF NOT EXISTS verified_legal_hold_set_at TIMESTAMPTZ NULL;
+
+-- `verified_legal_hold_set_at` is NULL both for "verified, no hold" and for
+-- "never verified by code that knows this column exists" -- a rolling
+-- deployment can have an old worker run `verify_target_copy` against a
+-- database that already carries this migration, leaving the column at its
+-- default. A cutover guard comparing NULL to NULL would then authorize a
+-- target staged under a hold that was released before an OLD worker verified
+-- it, treating an unverified row as verified. `legal_hold_verified` marks
+-- that the check actually ran, independent of what it found, so a legacy or
+-- foreign-verified record fails the cutover guard closed rather than by
+-- coincidence -- the same shape `verified_event_count IS NOT NULL` already
+-- gives the history guard.
+ALTER TABLE harvest_shard_migrations
+    ADD COLUMN IF NOT EXISTS legal_hold_verified BOOLEAN NOT NULL DEFAULT FALSE;
