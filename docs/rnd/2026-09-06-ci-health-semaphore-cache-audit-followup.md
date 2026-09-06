@@ -15,15 +15,16 @@ yesterday's report and one didn't:
 - **Changed, for the worse:** the `test-nodb` split added 3 more distinct
   persisted cache entries (one per OS — the job already uses a **shared cache
   key across its 4 shards**, `ci.yml:411-417`, so this is 3 entries, not 12;
-  see §4, corrected from an earlier draft of this section after a Codex review
-  comment on this PR caught a methodology error) on top of the ~19 already
-  in `ci.yml`. Still the wrong direction for the fixed-10GB-cache-budget
-  hypothesis the prior report raised, just a smaller wrong direction than
-  this report originally claimed.
+  see §4, corrected twice from earlier drafts of this section after two
+  separate Codex review comments on this PR each caught a methodology error)
+  on top of the ~19 already in `ci.yml`. Still the wrong direction for the
+  fixed-10GB-cache-budget hypothesis the prior report raised, just a smaller
+  wrong direction than this report originally claimed.
 - **Unchanged:** `Swatinem/rust-cache` still finds nothing to restore on every
-  sampled leg on every sampled run, including a leg this report can now show
-  *did* complete a real, verified-uploaded save under a stable key — and
-  still couldn't be restored 2.5–4 hours later (§4).
+  sampled leg on every sampled run, including a cache this report can now show
+  *did* complete a real, verified-uploaded save on the shared base branch,
+  under a stable key three later PR runs all restored against — and still
+  wasn't there 9-14 hours on (§4).
 
 ## 🎯 Verdict path (unchanged)
 
@@ -98,58 +99,66 @@ independent days finding no cache at all**, now spanning every job family this
 role has checked directly (`lint`, `test`, `test-db-linux`, and the new
 `test-nodb`).
 
-### 4. The shared-key mitigation, checked correctly this time — and a confirmed save that still didn't survive
+### 4. The shared-key mitigation, checked correctly this time — and a confirmed base-branch save that still didn't survive
 
-**Correction:** an earlier draft of this section compared shard 0 and shard 3
-of `test-nodb`'s `windows-latest` group *within the same run* and both showed
-`No cache found.`, and argued that ruled out per-shard key multiplicity as
-the explanation. A Codex review comment on this PR (`#1395`,
-`docs/rnd/2026-09-06-...md#discussion_r3943642464`) correctly flagged that as
-invalid: every shard in a matrix restores near its own job's start, seconds
-apart, before any sibling shard can possibly have finished and saved — so
-*of course* two same-run restores both miss regardless of whether the shared
-key works. That comparison couldn't have shown anything else, and the
-conclusion drawn from it didn't follow. Retracted; verified properly below.
+**Two corrections, both from Codex review comments on this PR (`#1395`),
+both correct, kept here rather than silently folded away:**
 
-The correct test is cross-run: does a *later* run's restore, under the exact
-same key, hit an *earlier* run's completed save? Three chronologically
-ordered same-day runs share the identical `Restore Key` prefix
-`v0-rust-test-nodb-windows-latest-Windows_NT-x64-8918a2f9` (same `Cargo.lock`
-hash), and two of them — `34007199800` (created 02:43 UTC) and `34018870064`
-(created 07:20 UTC), ~4h14m apart — share the **exact, full** `Cache Key`
-(`...-78f0168d`, not just the prefix):
+1. An earlier draft compared shard 0 and shard 3 of `test-nodb`'s
+   `windows-latest` group *within the same run*, both showing
+   `No cache found.`, and argued that ruled out per-shard key multiplicity.
+   Invalid: every shard in a matrix restores near its own job's start,
+   seconds apart, before any sibling can possibly have finished and saved —
+   two same-run misses are guaranteed regardless of whether the shared key
+   works. Retracted.
+2. The next draft replaced it with a cross-run comparison between
+   `34007199800` and `34018870064` — but those are two **different PR head
+   branches** (`claude/issue-1213-tdd-b76wjx` and `claude/cool-noether-mqc5qx`
+   respectively). GitHub Actions scopes a cache to the branch that created
+   it, plus (for a `pull_request`-triggered run) that PR's base branch —
+   **not** to other PRs' branches. A cache saved on one PR's branch is
+   structurally invisible to a different PR's branch regardless of
+   capacity, so that comparison couldn't have shown eviction either. Also
+   retracted, per the reviewer's own suggested fix: "use a later run/rerun
+   of the same PR or a cache saved on the default branch."
 
-- In `34007199800`, `test-nodb`'s four `windows-latest` shards all finish and
-  attempt to save under that exact key. Three fail with `Failed to save:
-  Unable to reserve cache with key ...-78f0168d, another job may be creating
-  this cache` (expected: a shared key means only the first sibling to reserve
-  wins). The fourth (`shard 1`, the first to finish, at 03:22 UTC) **does
-  not** hit that error — its log shows the actual upload completing:
-  `Sent 893589217 of 893589217 (100.0%)` (853 MB, 201 MB/s), followed by
-  normal post-job cleanup. One real, confirmed-complete save, under the
-  exact key `34018870064` later restores against.
-- `34018870064`'s `test-nodb`/`windows-latest` shards restore at 07:38:28-32
-  UTC — **4 hours 14 minutes after that confirmed save** — and every one
-  reports `No cache found.`, not even a prefix-fallback hit against the
-  matching restore-key prefix.
-- The middle run, `34014276155` (created 05:33 UTC, ~2h11m after the save),
-  also reports `No cache found.` on all four shards — its own `Cache Key`
-  suffix (`...-798b4d07`) differs from the saved one (a `Cargo.lock` or
-  toolchain change between those two commits), so an exact-match miss there
-  is expected; what's notable is it *also* gets no prefix-fallback hit
-  against the same `v0-rust-test-nodb-windows-latest-Windows_NT-x64-8918a2f9`
-  prefix the confirmed save shares.
+**The valid version, using exactly that suggested fix:** trunk-dev is the
+base branch both retracted PRs (and every PR sampled in this report) target
+— confirmed for `34007199800`'s branch via its PR, #1385, which lists
+`trunk-dev` as base. The most recent *completed* (non-cancelled) `push`-event
+`ci.yml` run on `trunk-dev` before any of today's three samples is
+`33981875800` (commit `6133540`, the 09-05 cache-audit report's own docs
+commit — completed 2026-09-05T18:05:34Z). Its `test-nodb`/`windows-latest`
+shard 0 restores under `Restore Key`
+`v0-rust-test-nodb-windows-latest-Windows_NT-x64-8918a2f9` /
+**exact** `Cache Key: ...-78f0168d` — the identical exact key all three of
+today's PR runs restored against (§ table above) — gets `No cache found.` on
+restore, then **completes a real save**: `Sent 149848672 of 149848672
+(100.0%)` at 2026-09-05T18:04:43Z. A cache genuinely exists, at that moment,
+on the shared base branch, under the exact key.
 
-This is a real cross-run, stable-exact-key, confirmed-upload comparison, not
-the invalid same-run one from the earlier draft — and it reproduces the same
-conclusion by a sounder route: **a cache that genuinely saved under a key
-matching a later run's restore attempt was gone within 2-4 hours.** That is
-consistent with the 09-05 report's shared-10GB-repository-wide-budget
-hypothesis (a fast enough turnover of other saves evicting this one before
-its next chance to be restored) and not with a key-configuration mistake —
-the shared-key mechanism itself works exactly as designed (one shard wins
-the save race per run, the other three fail-soft and don't error the job);
-the entry it produces just doesn't live long enough to be useful.
+Every one of today's three PR runs restores against that same exact key,
+later, from a different branch that has trunk-dev as its base (so trunk-dev's
+cache is in scope per GitHub's documented fallback) — and all three still
+report `No cache found.`:
+
+| PR run | branch | restore time | elapsed since the `trunk-dev` save |
+|---|---|---|---:|
+| `34007199800` | `claude/issue-1213-tdd-b76wjx` | 2026-09-06T02:55:39Z | 8h51m |
+| `34014276155` | `claude/pensive-brahmagupta-knhvu2` | 2026-09-06T05:48:29Z | 11h44m |
+| `34018870064` | `claude/cool-noether-mqc5qx` | 2026-09-06T07:38:28Z | 13h34m |
+
+This is the comparison the reviewer asked for — a cache saved on the default
+branch, checked against later runs — and it reproduces the same conclusion a
+third time, this time on solid ground: **a cache that genuinely, verifiably
+saved on the shared base branch, under the exact key three separate PR runs
+later restored against, was unavailable to all three within 9-14 hours.**
+That's consistent with the 09-05 report's shared-10GB-repository-wide-budget
+hypothesis (fast enough turnover elsewhere evicting this entry before any PR
+got to use it) and not with a branch-scoping or key-configuration mistake —
+the shared-key mechanism and the base-branch fallback both work as designed;
+the entry just doesn't live long enough to be useful to anyone downstream of
+`trunk-dev`.
 
 ## 🔍 Diagnosis
 
@@ -160,12 +169,14 @@ a cache hit, not nondeterminism) and not a product bug (nothing about the
 execution engine is implicated; this is CI configuration). The `test-nodb`
 split — itself a good, already-landed, measured win — mechanically made the
 capacity problem this report is tracking somewhat bigger: it added 3 more
-distinct persisted cache entries (one per OS, each several hundred MB to
-~1GB going by the one confirmed upload size in §4) contending for the same
-fixed cap, on the same day the 09-05 report's hypothesis named that general
-mechanism as the likely cause. §4's cross-run evidence — a confirmed-complete
-853MB save, gone within 2-4 hours under a still-matching key — is direct
-support for that hypothesis, not just consistent with it. Windows paying the
+distinct persisted cache entries (one per OS; the confirmed upload sizes seen
+in §4 range from 150MB on a docs-only trunk-dev push to 853MB on a full
+compile) contending for the same fixed cap, on the same day the 09-05
+report's hypothesis named that general mechanism as the likely cause. §4's
+cross-run evidence — a confirmed-complete save on the shared base branch,
+gone within 9-14 hours under the exact key three separate downstream PR runs
+restored against — is direct support for that hypothesis, not just
+consistent with it. Windows paying the
 largest share of the miss's cost (longest per-family compile times to begin
 with, per every prior report in this series, now cache-cold on top of that)
 is consistent with, not independent of, this finding.
@@ -208,12 +219,13 @@ method). Candidate remedies for whoever has that access, updated:
   `9ce7ce8` and PR #1336's `test-db-linux` split.
 - **Cache hit rate, cumulative across two independent report-days:** 0/9 sampled
   leg-runs found an exact-match cache; 1/10 total found a prefix-fallback hit
-  (09-05 report, `windows-latest`, not reproduced today). Additionally: 1
-  cross-run pair with a *confirmed-complete* save (853MB uploaded, §4) under
-  an exact key a later restore attempt matched exactly, 4h14m apart — still a
-  miss. No revert check applies here — this is a report, not a fix, so there
-  is nothing to verify went red-then-green; the "after" measurement above is
-  the sharding win's, not this report's own.
+  (09-05 report, `windows-latest`, not reproduced today). Additionally: 3
+  downstream PR runs (§4), on 3 different branches all based on `trunk-dev`,
+  each restoring against the exact key a confirmed-complete `trunk-dev`
+  base-branch save produced 9-14 hours earlier — 0/3 got a hit, exact or
+  prefix-fallback. No revert check applies here — this is a report, not a
+  fix, so there is nothing to verify went red-then-green; the "after"
+  measurement above is the sharding win's, not this report's own.
 - **Rerun-button census (same protocol as prior reports):** 0/100 sampled
   `pull_request`-event `ci.yml` runs show `run_attempt > 1`. Unchanged from
   the 09-03 report's finding — still no reflexive-rerun culture.
