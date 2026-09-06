@@ -1074,6 +1074,23 @@ workload-dependent worst case neither prior candidate has. (`LEFT JOIN
 LATERAL` + planner hints, the *other* shape #3 named, was never re-tested:
 the three-rewrites section above already closes it.)
 
+**A third shape — batching #4's per-row retry into a single-round-trip
+per-batch fetch, the specific rewrite issue #1340 was deferred pending —
+was measured and also killed, but on its own pre-registration's arithmetic,
+not on the mechanism:**
+`docs/assays/0005-claim-batched-seek-and-refine.md` (ledger #5) fetches the
+top 50 ordered candidates per round trip and scopes the recheck CTE to only
+that batch's own distinct keys, not the backlog's global cardinality. Idle
+cost, the 5,000-key blowup (now demonstrated cardinality-independent, not
+just faster), the 256-key case, and both adversarial fixtures' wall-clock
+all pass decisively. It still kills: both adversarial fixtures resolved in
+one more batch than their pre-registered "exactly N" line allowed, because
+that line's own formula undercounted by the one slot the claimable row
+itself occupies. The batching mechanism's actual scaling (linear in batch
+count) is confirmed by the same data that kills the assay; a corrected
+re-charter, and the concurrent-claimer lock-contention question every
+concurrency-gate assay so far has left unmeasured, remain open, un-run pits.
+
 Until a fix clears every line of some registered assay, deployments with
 concurrency-key cardinality in the low hundreds (the tested, committed
 range) get the full measured win above; deployments with concurrency keys

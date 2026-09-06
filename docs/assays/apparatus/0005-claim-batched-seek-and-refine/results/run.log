@@ -1,0 +1,22 @@
+Session: run_assay.sh, one continuous psql session, prospect_assay5, 2026-09-06.
+\timing on output, in driver.sql order (each pair is control_raw then
+claim_batched for the three non-adversarial scenarios, then the two
+adversarial claim_batched calls):
+
+Time: 10.228 ms    -- idle_256  control_raw
+Time: 8.338 ms     -- idle_256  claim_batched  (claimed_id=1, batches=1)
+Time: 221.588 ms   -- hot_256   control_raw
+Time: 8.592 ms     -- hot_256   claim_batched  (claimed_id=10001, batches=1)
+Time: 1465.765 ms (00:01.466)  -- hot_5000 control_raw
+Time: 8.158 ms     -- hot_5000  claim_batched  (claimed_id=22001, batches=1)
+Time: 14.728 ms    -- L4  claim_batched (50-poison adversarial, claimed_id=44071, batches=2)
+Time: 33.944 ms    -- L5  claim_batched (200-poison adversarial, claimed_id=54292, batches=5)
+
+Independent re-run of L4 alone (verify_l4.sql, not archived -- ad hoc,
+superseded by driver.sql's own L4 section) directly inspected the claimed
+row: id=86363, priority=99, concurrency_key IS NULL, state after claim =
+RUNNING, worker_id='bench-worker-0' -- confirms the batch mechanism reaches
+the correct unpoisoned row and never claims a saturated-key row, independent
+of the row-id values (which depend on the BIGSERIAL sequence's position at
+seed time, itself a function of how many rows earlier scenarios in the same
+session inserted -- TRUNCATE does not reset identity by default).

@@ -1,0 +1,10 @@
+  side   |  id   
+---------+-------
+ control | 64293
+(1 row)
+
+   side    | claimed_id 
+-----------+------------
+ candidate |      64293
+(1 row)
+
