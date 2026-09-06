@@ -80,9 +80,12 @@
 -- IS supported per-partition), then create the parent's index without
 -- `CONCURRENTLY` -- Postgres recognizes every partition already carries a
 -- matching index and only writes the parent's catalog entry, a metadata-only
--- operation that does not rescan data. Generate the per-partition statements
--- rather than hand-listing them, since partitions are cohort-named and
--- opened over time (`partition::partition_name`):
+-- operation that does not rescan data. One query generates the per-partition
+-- statements throughout, rather than hand-listing them (partitions are
+-- cohort-named and opened over time -- `partition::partition_name`) --
+-- filtered to leaves that don't already have the index (verified: it returns
+-- only the missing ones), so the SAME query serves both the initial pass and
+-- the convergence loop below:
 --
 --   SELECT format(
 --       'CREATE INDEX CONCURRENTLY IF NOT EXISTS %I ON %I ' ||
@@ -94,16 +97,36 @@
 --   FROM pg_inherits
 --   JOIN pg_class parent ON pg_inherits.inhparent = parent.oid
 --   JOIN pg_class child ON pg_inherits.inhrelid = child.oid
---   WHERE parent.oid = 'harvest_events'::regclass;
+--   WHERE parent.oid = 'harvest_events'::regclass
+--     AND NOT EXISTS (
+--         SELECT 1 FROM pg_index i
+--          WHERE i.indrelid = child.oid
+--            AND pg_get_indexdef(i.indexrelid) LIKE '%activity_started_lookup%'
+--     );
 --   -- review and run the generated statements, THEN:
 --   CREATE INDEX IF NOT EXISTS idx_harvest_events_activity_started_lookup
 --       ON harvest_events (workflow_exec_id, (event_data #>> '{data,activity_id}'), timestamp)
 --       WHERE event_type = 'ActivityStarted';
 --
--- A partition opened by `harvest_event_cohort`'s rollover *after* the leaf
--- pass but *before* the parent statement above needs its own `CONCURRENTLY`
--- build (it won't yet carry a matching index); re-run the generator query to
--- pick up any new leaves before the final parent statement.
+-- **Rollover race (Codex review, PR #1381, round 2):** a single pass through
+-- the generator above narrows the window a new partition can slip through
+-- but does not close it -- `harvest_event_cohort`'s rollover can still open
+-- one between that pass and the parent statement. Re-run the SAME generator
+-- query in a LOOP immediately before the parent statement, with no operator
+-- delay in between, until it returns zero rows, THEN run the parent
+-- statement right away. This bounds, but by construction cannot fully
+-- eliminate, a race against a rollover landing in the instant between the
+-- last "zero rows" check and the parent statement itself -- no client-side
+-- loop can synchronize with a server-side event with zero gap. That residual
+-- case is bounded and safe rather than eliminated: the only partition that
+-- could still be missing at that point is one `harvest_event_cohort` just
+-- opened, which by definition holds ~0 rows, so Postgres building its index
+-- non-concurrently as part of the parent statement is near-instant and
+-- blocks nothing of substance -- unlike the original problem this whole
+-- partitioned recipe exists to avoid (non-concurrently indexing the FULL
+-- historical dataset). A loop that verifies zero missing leaves immediately
+-- before proceeding is the standard shape for this kind of narrowing; treat
+-- the remaining instant-of-rollover case as accepted, not overlooked.
 --
 -- (`CONCURRENTLY` can leave an INVALID index behind on failure/cancellation --
 -- check `pg_index.indisvalid` for the index's oid and `DROP INDEX
