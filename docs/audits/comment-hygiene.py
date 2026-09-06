@@ -408,6 +408,20 @@ def replace_spans(text: str, filler: str) -> str:
     return "".join(out)
 
 
+# Inline HTML that renders as code. Rustdoc puts "<code>not sure why</code>"
+# in a <code> element exactly as it does a backtick span, so the absolute
+# rules must not read a narrative phrase or a marker inside one. Doc comments
+# only: nothing renders a `//` comment, where this is literal text.
+INLINE_CODE_RE = re.compile(r"<code\b[^>]*>.*?</code\s*>", re.I | re.S)
+
+
+def blank_inline_code(text: str) -> str:
+    """`text` with each inline <code> element replaced by spaces."""
+    return INLINE_CODE_RE.sub(
+        lambda m: re.sub(r"[^\n]", " ", m.group(0)), text
+    )
+
+
 def blank_code_spans(text: str) -> str:
     """`text` with each inline code span replaced by spaces of equal width."""
     return replace_spans(text, " ")
@@ -1690,7 +1704,11 @@ def comment_lines(pieces: list[Piece]):
                     indented,
                     piece.marker in DOC_MARKERS,
                 )
-                opens = starts_block(body, enclosing)
+                # `body` has had its quote marker peeled, so `starts_block`
+                # can no longer see one -- and a quote is a block. The DEPTH
+                # is what says so, and it says it for the line that LEAVES
+                # one as well, which no marker on the line could.
+                before_quoted = quoted
                 # Both are blocks, so neither leaves a paragraph open.
                 stack, paragraph = update_containers(
                     text, stack, paragraph, quoted, in_table or indented
@@ -1700,6 +1718,7 @@ def comment_lines(pieces: list[Piece]):
                 # depth zero because the marker comes first -- one loop then
                 # believes the line left the quote and the other does not.
                 quoted = strip_containers(text, stack, stack[-1][0] if stack else 0)[2]
+                opens = starts_block(body, enclosing) or quoted != before_quoted
             container = stack[-1][0] if stack else 0
             delimiter = fence_delimiter(text, container, fence is not None, scope[2], stack)
             # The whole LINE decides a delimiter, not this piece alone. A
@@ -1794,13 +1813,19 @@ def check_line_rules(path: str, pieces: list[Piece]) -> list[Finding]:
         # block, not merely to one comment: two list items are two blocks,
         # and pairing a backtick across them blanked a marker Rustdoc leaves
         # as ordinary text.
+        doc = run[0].marker in DOC_MARKERS
         block: list[str] = []
+
+        def flush_block(lines: list[str]) -> list[str]:
+            blanked = blank_spans_across(lines)
+            return [blank_inline_code(line) for line in blanked] if doc else blanked
+
         for _, text, in_fence, opens in run_lines:
             if opens and block:
-                spanless.extend(blank_spans_across(block))
+                spanless.extend(flush_block(block))
                 block = []
             block.append("" if in_fence else text)
-        spanless.extend(blank_spans_across(block))
+        spanless.extend(flush_block(block))
     for index, (lineno, body, in_fence, _) in enumerate(lines):
         if in_fence:
             continue
@@ -1899,12 +1924,18 @@ def prose_units(pieces: list[Piece]) -> list[tuple[int, str]]:
                 for fragment, line in zip(run, run_lines):
                     spans.append((position, line))
                     position += len(fragment) + 1
-                units.append((run_lines[0], " ".join(run), spans))
+                units.append(
+                    (run_lines[0], " ".join(run), spans, run_marker in DOC_MARKERS)
+                )
             run, run_lines = [], []
 
         in_table = False
         indented = False
         html: str | None = None
+        # One run carries one marker -- `comment_runs` splits where it
+        # changes -- and the absolute rules need it to know whether inline
+        # HTML in this text is markup or just characters.
+        run_marker = block[0].marker
         for index, piece in enumerate(block):
             if piece.nest != nest:
                 # No flush: a sentence that crosses an inline nested comment
@@ -2181,7 +2212,7 @@ def check_prose_rules(path: str, pieces: list[Piece]) -> list[Finding]:
     is ordinary prose, not deliberation.
     """
     findings = []
-    for _, unit, spans in prose_units(pieces):
+    for _, unit, spans, doc in prose_units(pieces):
         for offset, sentence in split_sentences(unit, mask_code_spans(unit)):
             sentence = sentence.strip()
             if not sentence:
@@ -2192,7 +2223,10 @@ def check_prose_rules(path: str, pieces: list[Piece]) -> list[Finding]:
             # a literal, and failing the build on it stops the literal being
             # documented. CH006 still reads the raw text -- it is ratcheted,
             # and KNOWN LIMITATIONS records that choice.
-            if NARRATIVE_RE.search(blank_code_spans(sentence)):
+            spanless = blank_code_spans(sentence)
+            if doc:
+                spanless = blank_inline_code(spanless)
+            if NARRATIVE_RE.search(spanless):
                 findings.append(Finding("CH003", path, lineno, sentence[:100]))
             words = sentence.split()
             if len(words) > MAX_SENTENCE_WORDS:
@@ -3533,6 +3567,28 @@ RULE_TESTS = [
         "///   TODO: marker` syntax.\n",
         set(),
         "but it does reach across one item's own lines",
+    ),
+    (
+        "/// Explain the `literal\n"
+        "/// > TODO: issue required` suffix.\n",
+        {("CH002", 2)},
+        "nor across the edge of a block quote",
+    ),
+    (
+        "/// > Explain the `literal\n"
+        "/// > TODO: marker` syntax.\n",
+        set(),
+        "though it does reach within one",
+    ),
+    (
+        "/// Parse the <code>not sure why</code> token literally.\n",
+        set(),
+        "an inline <code> element is code in a doc comment",
+    ),
+    (
+        "// Parse the <code>not sure why</code> token literally.\n",
+        {("CH003", 1)},
+        "and characters in a // comment",
     ),
 ]
 

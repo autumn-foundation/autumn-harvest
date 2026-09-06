@@ -1845,3 +1845,27 @@ Two fixtures: across two items, where the span must not pair, and across one
 item's own wrapped lines, where it must.
 
 Corpus effect: none.
+
+### Round sixty — the quote edge, and inline HTML that renders as code
+
+Two findings, both fixed.
+
+**Entering or leaving a block quote is a block boundary.** Round fifty-nine cut
+code spans at block starts, but asked `starts_block` about text whose `>` had
+already been peeled — so it could never see a quote. The depth is what knows,
+and it knows about the line that LEAVES a quote too, which no marker on the
+line could. Both edges are boundaries now, and a span still reaches across the
+lines inside one quote.
+
+**An inline `<code>` element is code.** Rustdoc renders
+`<code>not sure why</code>` exactly as it renders a backtick span, so the
+absolute rules must not read a narrative phrase or a marker inside one. CH002
+and CH003 both mask it, which keeps the two rules that fail the build agreeing
+on what counts as code.
+
+Doc comments only, by the rule this file has needed four times now: nothing
+renders a `//` comment, so `<code>` there is six literal characters and the
+phrase inside it is prose. `prose_units` carries the marker for that decision;
+one run has one marker, because `comment_runs` splits where it changes.
+
+Corpus effect: none.
