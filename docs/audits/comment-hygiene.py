@@ -239,7 +239,11 @@ COMMENTED_CODE_RE = re.compile(
       # what this file's guidance asks for: the name is still anchored hard
       # against `struct`, and the line must end at the `;`.
       | (?:pub(?:\((?:in\s+)?[\w:]+\))?\s+)?(?:struct|union)\s+\w+\s*(?:<[^<>]*>)?
-            \s*\([^;{]*\)\s*;\s*$
+            # The `;` of "[u8; 32]" is part of an array type, not the end of
+            # the statement -- the same guard the uninitialized-binding rule
+            # has carried since round forty-one, which this alternative was
+            # written without.
+            \s*\((?:[^;{]|;(?=[^;]*\]))*\)\s*;\s*$
       | (?:pub(?:\((?:in\s+)?[\w:]+\))?\s+)?mod\s+\w+\s*[{;]\s*$
       | (?:pub(?:\((?:in\s+)?[\w:]+\))?\s+)?(?:const|static)\s+(?:mut\s+)?\w+\s*:[^;=]+=.*[;{]\s*$
       | (?:pub(?:\((?:in\s+)?[\w:]+\))?\s+)?type\s+\w+\s*(?:<[^<>]*>)?\s*=
@@ -306,9 +310,31 @@ TODO_REF_RE = re.compile(r"#\d+|https?://")
 CODE_SPAN_RE = re.compile(r"(`+)(?:.*?)\1")
 
 
+# The same span, allowed to wrap. Rustdoc renders "`literal" and "TODO:
+# marker`" on consecutive lines as ONE code span, so a line-at-a-time blank
+# never sees the opener and CH002 fails the build on the marker inside it. A
+# blank line still ends a paragraph, and a span cannot cross one.
+WRAPPED_SPAN_RE = re.compile(r"(`+)(?:(?!\n[ \t]*\n).)*?\1", re.S)
+
+
 def blank_code_spans(text: str) -> str:
     """`text` with each inline code span replaced by spaces of equal width."""
     return CODE_SPAN_RE.sub(lambda m: " " * len(m.group(0)), text)
+
+
+def blank_spans_across(lines: list[str]) -> list[str]:
+    """`lines` with code spans blanked, including ones that wrap.
+
+    Judged over the joined text so a span opened on one line closes on the
+    next, and blanked to spaces so every column still lines up. Newlines
+    survive, so the result splits back into the same lines. An UNMATCHED
+    backtick blanks nothing, which is also what CommonMark does with it.
+    """
+    joined = "\n".join(lines)
+    blanked = WRAPPED_SPAN_RE.sub(
+        lambda m: re.sub(r"[^\n]", " ", m.group(0)), joined
+    )
+    return blanked.split("\n")
 
 # First-person deliberation. "Actually" must open a sentence: mid-sentence it is
 # an ordinary adverb ("gated on THIS claimant actually, durably marking the
@@ -1637,7 +1663,13 @@ def comment_lines(pieces: list[Piece]):
 def check_line_rules(path: str, pieces: list[Piece]) -> list[Finding]:
     """CH001/CH002/CH003/CH005/CH006 -- all single-line judgements."""
     findings = []
-    for lineno, body, in_fence in comment_lines(pieces):
+    lines = list(comment_lines(pieces))
+    # Fenced lines are emptied rather than dropped, so their backticks cannot
+    # open a span over the prose after them and every index still lines up.
+    spanless = blank_spans_across(
+        ["" if in_fence else text for _, text, in_fence in lines]
+    )
+    for index, (lineno, body, in_fence) in enumerate(lines):
         if in_fence:
             continue
         stripped = body.strip()
@@ -1660,7 +1692,8 @@ def check_line_rules(path: str, pieces: list[Piece]) -> list[Finding]:
         # being described, not a commitment being made. CH005 and CH006 read
         # the raw text on purpose -- see KNOWN LIMITATIONS -- but those are
         # ratcheted, and this one fails the build outright.
-        todo = TODO_RE.search(blank_code_spans(code_line))
+        spanless_line = strip_containers(spanless[index].strip(), [], 0)[0].strip()
+        todo = TODO_RE.search(spanless_line or spanless[index].strip())
         if todo and not TODO_REF_RE.search(stripped):
             findings.append(Finding("CH002", path, lineno, stripped))
 
@@ -3268,6 +3301,25 @@ RULE_TESTS = [
         {("CH003", 1), ("CH006", 1)},
         "and outside one it is still deliberation",
     ),
+    (
+        "/// Explain the `literal\n"
+        "/// TODO: marker` syntax.\n",
+        set(),
+        "a code span may wrap onto the next line",
+    ),
+    (
+        "// A stray ` here\n"
+        "// TODO: fix the parser\n",
+        {("CH002", 2)},
+        "an unmatched backtick opens no span",
+    ),
+    (
+        "/// A stray ` here\n"
+        "///\n"
+        "/// TODO: fix the parser\n",
+        {("CH002", 3)},
+        "and a blank line ends a paragraph, so it ends a span",
+    ),
 ]
 
 
@@ -3373,6 +3425,7 @@ CODE_SHAPE_TESTS = [
     ("pub struct Foo<T>(T, T);", True),
     ("struct fields are described below;", False),
     ("struct (or enum) definitions live here;", False),
+    ("struct Packet([u8; 32]);", True),
 ]
 
 

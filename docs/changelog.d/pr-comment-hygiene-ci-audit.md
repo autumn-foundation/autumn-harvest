@@ -1693,3 +1693,25 @@ and the KNOWN LIMITATIONS entry already records that split. `// Actually,
 let's just skip the retry here.` still reports.
 
 Corpus effect: none.
+
+### Round fifty-four — a code span may wrap, and an array field carries a semicolon
+
+Two findings, both fixed.
+
+**A code span may wrap onto the next line.** Rustdoc renders ``` `literal ```
+and ``` TODO: marker` ``` on consecutive lines as one `<code>` span, but the
+blanking round fifty-one added ran a line at a time and never saw the opener,
+so CH002 failed the build on a marker inside a literal. The blanking now
+happens over the joined lines and splits back, so a span that opens on one
+line closes on the next. Two properties are kept and pinned: an unmatched
+backtick blanks nothing, which is what CommonMark does with it, and a blank
+line ends the paragraph and so ends any span. Fenced lines are emptied before
+joining, so a fence's backticks cannot open a span over the prose after it.
+
+**An array field carries a semicolon.** Last round's tuple-struct alternative
+excluded every `;` from the field list, so `struct Packet([u8; 32]);` passed
+the gate. The uninitialized-binding rule has had the answer since round
+forty-one — admit a `;` where a `]` closes before the next one — and the new
+alternative was written without it. One round, one sibling, again.
+
+Corpus effect: none.
