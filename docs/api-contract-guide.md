@@ -6,6 +6,17 @@ validate your client against it, and understand what counts as a breaking change
 
 ---
 
+## Prefer a generated client?
+
+`docs/openapi.json` is an OpenAPI 3.1 document generated from this contract, and
+`GET {api_path}/openapi.json` serves the same document. Point an OpenAPI
+generator at either one and skip hand-written HTTP entirely. See
+[`openapi.md`](openapi.md). Read on when you want the contract itself: its
+compatibility rules, its categories, and how to validate a hand-written client
+against it.
+
+---
+
 ## Where to find the contract
 
 `docs/api-contract.json` is the single source of truth.  It is checked into the

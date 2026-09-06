@@ -26,6 +26,7 @@
   },
   "auth_note": "Route authorization posture is classified in issue #174. This contract records the route surface and category; auth enforcement is separate.",
   "audit_note": "Mutating routes (read_only: false) are covered by the audit trail (issue #158). The audit endpoint itself is read-only.",
+  "openapi_note": "docs/openapi.json is generated from this file (issue #694). Regenerate it with `cargo run -p autumn-harvest-plugin --example emit_openapi > docs/openapi.json` whenever a route, parameter, request field or response field changes here. Every parameter must declare `in` and `required`; the transform rejects one that does not.",
   "routes": [
     {
       "method": "GET",
@@ -1054,6 +1055,7 @@
       ],
       "request_body": null,
       "success_response": {
+        "content_type": "text/event-stream",
         "status": 200,
         "note": "Content-Type: text/event-stream. Frames: event:progress (data = the published chunk JSON, id = monotonic seq), a terminal event:end, or event:error. If the execution is already terminal at connect, a single event:end frame is sent and the stream closes. SEQ CLIENT CONTRACT: id is a monotonic per-execution LOGICAL-POSITION identity (not a per-chunk counter). Subscribers should dedupe by seq (keep-first) for at-most-once-per-position display, and use forward seq JUMPS to detect gaps after reconnect. A re-driven workflow position re-emits the SAME seq (best-effort); a re-emitted chunk MAY carry different content for non-deterministic chunks — the first-delivered is canonical. seq is per exec_id; a continue-as-new successor is a new exec_id on a new stream whose seq restarts. Chunks may be DROPPED best-effort under back-pressure (slow client) — the monotonic seq lets the client detect the resulting gap.",
         "free_form": true
@@ -4096,6 +4098,21 @@
     },
     {
       "method": "GET",
+      "path": "/openapi.json",
+      "category": "discovery",
+      "read_only": true,
+      "description": "Serve the OpenAPI 3.1 document for this management API (issue #694). The document is derived from this contract, so it covers every route listed here and nothing else. Read-only, never admin-gated: a client generator must reach it before it holds a credential. The identical document is checked in at docs/openapi.json.",
+      "params": [],
+      "request_body": null,
+      "success_response": {
+        "status": 200,
+        "free_form": true,
+        "note": "The OpenAPI 3.1 document as a JSON object, with keys openapi, info, servers, security, tags, paths and components."
+      },
+      "error_responses": []
+    },
+    {
+      "method": "GET",
       "path": "/admin/preflight",
       "category": "admin",
       "read_only": true,
@@ -6579,21 +6596,29 @@
       "params": [
         {
           "name": "schedule_id",
+          "in": "query",
+          "required": false,
           "type": "string",
           "description": "Filter by schedule UUID."
         },
         {
           "name": "decision",
+          "in": "query",
+          "required": false,
           "type": "string",
           "description": "Filter by decision kind (e.g. fired, skipped, overlap_skipped)."
         },
         {
           "name": "reason",
+          "in": "query",
+          "required": false,
           "type": "string",
           "description": "Filter by reason label."
         },
         {
           "name": "limit",
+          "in": "query",
+          "required": false,
           "type": "integer",
           "description": "Maximum number of records to return. Defaults to 50."
         }
@@ -6623,32 +6648,50 @@
       "description": "List the workflow executions a schedule launched, newest-slot-first (ordered by scheduled_for, falling back to started_at for slot-less manual fires), each with its terminal state, a collapsed outcome (completed/failed/timed_out/cancelled/terminated/running), the first line of the error for terminally-failed runs, and the dispatch origin (scheduled/backfill/manual_trigger). Echoes the schedule's next_run_at and a per-state cadence summary counting only scheduled-origin runs. Fans out across shards; reports partial results when a shard is unavailable instead of failing. 404s an unknown schedule id. A malformed percent-encoded query-string byte sequence (an invalid UTF-8 byte, or an incomplete/non-hex `%` escape) is rejected with a 400 before any parameter is parsed, rather than silently substituting the Unicode replacement character and proceeding with a wrong-but-plausible value (issue #1151, sweeping the issue #774 `queue-coverage` fix to every other raw-pairs route).",
       "params": [
         {
+          "name": "id",
+          "in": "path",
+          "required": true,
+          "description": "Schedule UUID."
+        },
+        {
           "name": "state",
+          "in": "query",
+          "required": false,
           "type": "string",
           "description": "Filter by execution state (repeatable, or comma-separated), e.g. FAILED,TIMED_OUT."
         },
         {
           "name": "origin",
+          "in": "query",
+          "required": false,
           "type": "string",
           "description": "Filter by dispatch origin: scheduled, backfill, or manual_trigger (repeatable)."
         },
         {
           "name": "since",
+          "in": "query",
+          "required": false,
           "type": "string",
           "description": "Inclusive lower bound on started_at: RFC 3339 timestamp or relative duration like 24h."
         },
         {
           "name": "until",
+          "in": "query",
+          "required": false,
           "type": "string",
           "description": "Exclusive upper bound on started_at: RFC 3339 timestamp or relative duration."
         },
         {
           "name": "limit",
+          "in": "query",
+          "required": false,
           "type": "integer",
           "description": "Maximum runs to return (default 20, clamped 1-200). A value above 200 is clamped and reported via the echoed limit and next_cursor; a limit below 1 or non-integer is a 400."
         },
         {
           "name": "cursor",
+          "in": "query",
+          "required": false,
           "type": "string",
           "description": "Opaque keyset cursor from a prior response's next_cursor for the next page."
         }
@@ -6696,17 +6739,29 @@
       "description": "List schedule-decision records for a specific schedule.",
       "params": [
         {
+          "name": "id",
+          "in": "path",
+          "required": true,
+          "description": "Schedule UUID."
+        },
+        {
           "name": "decision",
+          "in": "query",
+          "required": false,
           "type": "string",
           "description": "Filter by decision kind."
         },
         {
           "name": "reason",
+          "in": "query",
+          "required": false,
           "type": "string",
           "description": "Filter by reason label."
         },
         {
           "name": "limit",
+          "in": "query",
+          "required": false,
           "type": "integer",
           "description": "Maximum number of records to return. Defaults to 50."
         }
@@ -7045,6 +7100,7 @@
       ],
       "request_body": null,
       "success_response": {
+        "content_type": "text/event-stream",
         "status": 200,
         "note": "Content-Type: text/event-stream. Each SSE message carries id (BIGSERIAL), event (WorkflowEvent type name), and data (JSON event value). A final event:stream-end message signals terminal execution state. Returns 409 Conflict with {error:slow_consumer, drop_after_event_id} when the client is too far behind.",
         "free_form": true

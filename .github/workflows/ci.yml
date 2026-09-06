@@ -86,8 +86,14 @@ jobs:
           # against the freshly generated contract, so a baseline-only PR must
           # still run the matrix — otherwise a hand-edited, stale, or malformed
           # baseline merges with no comparison at all, defeating the gate.
+          #
+          # Same carve-out, same reason, for the management API contract and its
+          # generated OpenAPI document (issue #694). `docs/api-contract.json` is
+          # the source the router is pinned against, and `docs/openapi.json` is
+          # generated from it; both live under `docs/`, so without this a
+          # contract-only PR would skip every test that compares them.
           if echo "$changed" | grep -qvE '^(docs/|.*\.md$)' \
-            || echo "$changed" | grep -qxF 'docs/workflow-schema-contract.json'; then
+            || echo "$changed" | grep -qxE 'docs/(workflow-schema-contract|api-contract|openapi)\.json'; then
             echo "code=true" >> "$GITHUB_OUTPUT"
           else
             echo "code=false" >> "$GITHUB_OUTPUT"
@@ -333,6 +339,23 @@ jobs:
       # 4 long sentences in cross_region_dr_tests.rs and failed the gate.)
       # The predictable response is to regenerate the baseline, which defeats
       # the ratchet entirely. Tier A is never scoped -- it gates everywhere.
+      # Issue #694, AC2: the published OpenAPI document must validate under a
+      # standard validator with zero errors. `openapi-spec-validator` is a pure
+      # Python package and reads the checked-in artifact, so this step never
+      # builds the crates and stays in the ungated `lint` job.
+      #
+      # Ungated is the point: `docs/openapi.json` matches the docs-only filter,
+      # and a hand-edit of it is exactly the change class that would otherwise
+      # reach trunk with nothing checking it. The no-drift half of the gate is
+      # `openapi_spec::checked_in_artifact_matches_the_generated_document`,
+      # which regenerates from `docs/api-contract.json` and compares; the
+      # `changes` job carves both files out of the docs-only skip so that test
+      # runs on a contract-only PR.
+      - name: Validate docs/openapi.json (issue #694)
+        run: |
+          python3 -m pip install --quiet --disable-pip-version-check openapi-spec-validator
+          python3 -m openapi_spec_validator docs/openapi.json
+
       - name: Comment hygiene (docs/audits/comment-hygiene.py)
         run: |
           python3 docs/audits/comment-hygiene.py --self-test
@@ -946,6 +969,88 @@ jobs:
             sleep 1
           done
           echo "::error::workflow did not reach COMPLETED within the timeout"; exit 1
+
+  openapi-client-smoke:
+    name: Generated TypeScript client drives a running plugin (issue #694)
+    needs: changes
+    # Draft-skip (see lint) + docs-only skip via the `changes` guard. The
+    # `changes` job carves docs/api-contract.json and docs/openapi.json out of
+    # the docs-only filter, so a contract-only PR still runs this job.
+    if: >-
+      (github.event_name != 'pull_request' || github.event.pull_request.draft == false) &&
+      needs.changes.outputs.code == 'true'
+    runs-on: ubuntu-latest
+    # Matches examples/quickstart/autumn.toml, same as the `quickstart` job.
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: quickstart
+          POSTGRES_PASSWORD: quickstart
+          POSTGRES_DB: quickstart
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U quickstart"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - name: Build quickstart
+        run: cargo build -p quickstart
+      # Issue #694 success metric: from a running HarvestPlugin to a generated
+      # client that starts a workflow and reads its status, with zero
+      # hand-written HTTP. The client is generated from the SERVED document, so
+      # this also proves the endpoint answers a real generator over real HTTP —
+      # something the in-process `oneshot` test cannot show.
+      - name: Generate a typed client from the served document and drive it
+        env:
+          AUTUMN_PROFILE: dev
+          AUTUMN_MANIFEST_DIR: examples/quickstart
+          HARVEST_OPENAPI_URL: http://localhost:3000/api/harvest/openapi.json
+          HARVEST_BASE_URL: http://localhost:3000/api/harvest
+        run: |
+          set -uo pipefail
+          cargo run -p quickstart &
+          APP_PID=$!
+          trap 'kill "${APP_PID}" 2>/dev/null || true' EXIT
+
+          healthy=false
+          for i in $(seq 1 60); do
+            if curl -sf -o /dev/null http://localhost:3000/api/harvest/health; then
+              echo "app healthy after ${i}s"; healthy=true; break
+            fi
+            if ! kill -0 "${APP_PID}" 2>/dev/null; then
+              echo "::error::quickstart app exited before becoming healthy"; exit 1
+            fi
+            sleep 1
+          done
+          if [ "${healthy}" != "true" ]; then
+            echo "::error::quickstart app never became healthy"; exit 1
+          fi
+
+          # AC7, live half: the served document must equal the checked-in
+          # artifact. `openapi_spec::checked_in_artifact_matches_the_generated_document`
+          # proves it in process; this proves it over the wire, against the
+          # router an embedder actually mounts.
+          curl -sf "${HARVEST_OPENAPI_URL}" | jq -S . > "${RUNNER_TEMP}/served.json"
+          jq -S . docs/openapi.json > "${RUNNER_TEMP}/artifact.json"
+          if ! diff -u "${RUNNER_TEMP}/artifact.json" "${RUNNER_TEMP}/served.json"; then
+            echo "::error::the served OpenAPI document differs from docs/openapi.json"
+            exit 1
+          fi
+
+          cd examples/typescript-client
+          npm ci --no-audit --no-fund
+          npm run generate
+          npm run typecheck
+          npm start
 
   scaffold-smoke:
     name: Scaffold builds and runs (harvest new)

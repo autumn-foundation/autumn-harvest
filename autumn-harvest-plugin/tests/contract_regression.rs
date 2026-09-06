@@ -1336,6 +1336,68 @@ fn contract_routes_have_params_array() {
     }
 }
 
+/// Every parameter must declare `in` and `required` (issue #694).
+///
+/// The `OpenAPI` transform needs both on every parameter: `in` places the
+/// parameter, and `required` is what a generated client enforces. The
+/// transform rejects a parameter that omits either, so this test names the
+/// offending route rather than letting the spec build fail.
+#[test]
+fn contract_params_declare_location_and_required() {
+    let contract = load_contract();
+    let mut offenders = Vec::new();
+    for route in contract["routes"].as_array().unwrap() {
+        let method = route["method"].as_str().unwrap_or("?");
+        let path = route["path"].as_str().unwrap_or("?");
+        for param in route["params"].as_array().into_iter().flatten() {
+            let name = param["name"].as_str().unwrap_or("?");
+            if !param["in"].is_string() || !param["required"].is_boolean() {
+                offenders.push(format!("{method} {path}: parameter {name}"));
+            }
+        }
+    }
+    assert!(
+        offenders.is_empty(),
+        "every contract parameter needs a string `in` and a boolean `required`:\n{offenders:#?}"
+    );
+}
+
+/// Every `{placeholder}` in a path must be a declared path parameter, and no
+/// path parameter may name a segment the path does not carry (issue #694).
+///
+/// A generated client builds its URL from the declared path parameters. An
+/// undeclared placeholder therefore produces a client that cannot address the
+/// route at all.
+#[test]
+fn contract_declares_every_path_parameter() {
+    let contract = load_contract();
+    let mut offenders = Vec::new();
+    for route in contract["routes"].as_array().unwrap() {
+        let method = route["method"].as_str().unwrap_or("?");
+        let path = route["path"].as_str().unwrap_or("?");
+        let template: HashSet<&str> = path
+            .split('/')
+            .filter_map(|segment| segment.strip_prefix('{')?.strip_suffix('}'))
+            .collect();
+        let declared: HashSet<&str> = route["params"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter(|param| param["in"] == "path")
+            .filter_map(|param| param["name"].as_str())
+            .collect();
+        if template != declared {
+            offenders.push(format!(
+                "{method} {path}: template {template:?} but declared {declared:?}"
+            ));
+        }
+    }
+    assert!(
+        offenders.is_empty(),
+        "path templates and declared path parameters must agree:\n{offenders:#?}"
+    );
+}
+
 // ── Read-only operator role (issue #776) ──────────────────────────────────────
 
 /// AC4 coverage sweep: EVERY route registered in `management_api_routes()` (the
