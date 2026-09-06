@@ -1486,3 +1486,35 @@ positive that no review round had found.
 
 Corpus effect: none. Every fix here is in a shape this tree does not write,
 which is exactly why only the renderer finds them.
+
+### Round forty-seven — one fix, and a line drawn
+
+Three findings, all in the HTML block layer. One is fixed; two are recorded
+and left.
+
+**Fixed: a list marker is peeled before the HTML opener.** Round forty-six
+taught `html_block` to peel a quote marker and stopped there, so `- <pre>`
+opened nothing and the indented TODO under it reported CH002. Rustdoc renders
+that content preformatted inside the item. Both scanners now peel through
+every container, as the fence test already did. This is a false positive on a
+Tier A gate, which is why it is fixed rather than deferred.
+
+**Recorded, not fixed:** an HTML block is not scoped to the container that
+opened it, so `> <pre>` followed by an unquoted line keeps the block open;
+and an HTML closer inside an inline nested comment is not seen, because a
+mid-line piece carries no block syntax. Both UNDER-report, which is the safe
+direction for a gate, and both are recorded in KNOWN LIMITATIONS and in the
+follow-up issue.
+
+**Why stop here.** Rounds seventeen to forty-seven have all been in this
+hand-rolled block layer, and rounds forty-four to forty-seven were largely
+self-inflicted: each round's fix produced the next round's findings. The
+corpus has not moved for any of them except round forty-four's sentence
+splitter, and the reason is plain — no `*.rs` comment in this tree contains a
+table or raw HTML. The gate does its job today: Tier A is at zero, the ratchet
+is clean, and CH005 to CH007 measure the real corpus. What remains is a
+Markdown parser being reimplemented one review comment at a time, in shapes
+the repository does not contain. Either the block layer is replaced with a
+real CommonMark parser -- which costs `docs/audits/` its deliberate
+no-dependency property and is not a decision this PR should make -- or the
+remainder is out of scope. This PR takes the second.

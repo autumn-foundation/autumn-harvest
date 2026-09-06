@@ -121,6 +121,15 @@ KNOWN LIMITATIONS:
   worse than the problem. Both directions are wrong; under-reporting is
   the safe one for a gate.
 
+- The Markdown block layer is hand-rolled and deliberately partial. Two
+  known gaps are recorded in the follow-up issue rather than fixed here,
+  and both UNDER-report, which is the safe direction for a gate: an HTML
+  block is not scoped to the container that opened it, so leaving a quote
+  does not end one; and an HTML closer inside an inline nested comment is
+  not seen, because a mid-line piece carries no block syntax. Neither
+  shape occurs in this tree -- no `*.rs` comment here holds raw HTML --
+  and every fix in this seam has cost more than it returned.
+
 - CH001 is deliberately HIGH-PRECISION AND INCOMPLETE, and should stay
   that way. It recognizes commented-out Rust by line shape: item headers,
   `let`/`use`/assignment, attributes, closing braces, macro and call
@@ -1497,10 +1506,11 @@ def comment_lines(pieces: list[Piece]):
             # An HTML block opens here, outside any fence. Its own line is
             # ordinary text -- "<pre>" carries no defect -- but everything
             # until its closer is raw HTML.
-            # Peeled, like every other block test: a quoted "> <pre>" opens
-            # the block its container holds, and asking with the marker still
-            # on the line never recognizes one.
-            peeled = strip_quote(text, container)
+            # Peeled through EVERY container, like the fence test: "- <pre>"
+            # and "> <pre>" both open the block their container holds, and a
+            # peel that takes only quote markers leaves the list marker in
+            # front of the tag and recognizes neither.
+            peeled = strip_containers(text, stack, container)[0]
             if fence is None and html_block(peeled, container):
                 html = html_kind(peeled)
                 if html != "tag" and html_closes(peeled, html):
@@ -1751,12 +1761,12 @@ def prose_units(pieces: list[Piece]) -> list[tuple[int, str]]:
             # the rows that follow -- decided here rather than up front,
             # because the delimiter's indent is measured against whatever
             # container is open at that point.
-            if html_block(body, container):
+            if html_block(peeled, container):
                 # The opener's own line is a block, and everything to its
                 # closer is raw HTML. `comment_lines` opens the block at the
-                # same point and by the same test.
-                html = html_kind(body)
-                if html != "tag" and html_closes(body, html):
+                # same point and by the same test, on the same full peel.
+                html = html_kind(peeled)
+                if html != "tag" and html_closes(peeled, html):
                     html = None
                 flush()
                 in_list = False
@@ -2951,6 +2961,12 @@ RULE_TESTS = [
         "///       TODO: issue required\n",
         set(),
         "quote depth comes from the peel in both scanners",
+    ),
+    (
+        "/// - <pre>\n"
+        "///   TODO: issue required\n",
+        set(),
+        "a list marker is peeled before the HTML opener too",
     ),
 ]
 
