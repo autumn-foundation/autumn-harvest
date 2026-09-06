@@ -2252,3 +2252,36 @@ it was the next finding in the same function -- the scan should have
 been written for both at once.
 
 Corpus effect: none.
+
+### Round seventy-four — two false positives and a definition
+
+Three findings. Two fail the build on correct documentation, so both
+shipped this round; the third is an ordinary gap.
+
+**An escape takes one backtick, not the run.** Rustdoc renders
+`` \``TODO: issue required` suffix. `` with the first tick literal and
+the second opening a one-tick span, so the marker is code. The scanner
+discarded the whole run when its first character was escaped. It now
+shrinks the run by one and keeps the remainder as a delimiter.
+
+**A marker that cannot interrupt a paragraph opens no block.** `2.`
+after an open paragraph is paragraph text, so `Intro `literal` and
+`2. TODO: issue required` suffix.` are one paragraph with the marker
+inside a code span. `starts_block` cut the span there and failed the
+build. It takes an optional `paragraph` now, defaulted off so the two
+table-end callers keep asking the question they always asked.
+
+This is the OVER-REPORTING twin of #1383's sixth item, which was
+deferred last round as an under-report. The two are not the same fix:
+this one is a paragraph flag at a single call site, where the deferred
+one threads state through a helper with eight callers and into fence
+parsing behind it. Fixing the reachable half does not close the issue,
+and #1383 keeps the entry.
+
+**A macro definition ends at its brace.** `macro_rules! stale { () =>
+{}; }` needs no trailing `;`, and the macro alternative required one.
+Nine tracked files define macros in this form. The new alternative is
+anchored on the keyword, so prose that merely names `macro_rules!`
+cannot reach it -- and a fixture pins both lines together.
+
+Corpus effect: none. Four fixtures.

@@ -303,6 +303,9 @@ COMMENTED_CODE_RE = re.compile(
       | \#!?\[[\w:()"'=,./\s-]+\]\s*$
       | \}[,;)]*\s*$
       | [\w:]+!(?:\(.*\)|\[.*\]|\{.*\})\s*;\s*$        # macro stmt, any delimiter
+      # A macro DEFINITION, which ends at its brace rather than a `;`.
+      # Anchored on the keyword, so no prose can reach it.
+      | macro_rules!\s+(?:r\#)?\w+\s*\{.*\}\s*;?\s*$
       # Control flow opening a block. The lookahead rejects a condition made
       # of four or more consecutive plain words, which is a sentence, not an
       # expression: "if the queue is paused, the worker parks {".
@@ -456,7 +459,13 @@ def code_span_ranges(text: str) -> list[tuple[int, int]]:
     index = 0
     while index < len(runs):
         start, end = runs[index]
-        if start not in escaped:
+        # An escape consumes exactly ONE backtick, not the run it opens.
+        # Rustdoc renders "\\``TODO: x` suffix." with the first tick literal
+        # and the second opening a one-tick span, so discarding the whole run
+        # left the marker inside that span exposed to an absolute rule.
+        if start in escaped:
+            start += 1
+        if start < end:
             for probe in range(index + 1, len(runs)):
                 closer = runs[probe]
                 if closer[1] - closer[0] != end - start:
@@ -794,8 +803,14 @@ def indented_code(
     )
 
 
-def starts_block(text: str, container: int) -> bool:
+def starts_block(text: str, container: int, paragraph: bool = False) -> bool:
     """Does `text` begin a CommonMark block other than a paragraph?
+
+    `paragraph` says one is already open, which only an INTERRUPTING list
+    marker may end. "2." cannot: Rustdoc renders "Intro `literal" and
+    "2. TODO: x` suffix." as one paragraph with the marker inside a code
+    span, and cutting the span there failed the build on it. Defaulted off,
+    so the table-end callers keep asking the question they always asked.
 
     This is what ENDS a GFM table. A body row needs no pipe -- Rustdoc
     renders "ordinary row" under a table as a cell and fills the rest of
@@ -810,7 +825,10 @@ def starts_block(text: str, container: int) -> bool:
         or heading(text, container)
         or html_block(text, container)
         or thematic_break(text, container)
-        or bool(list_content(text, container))
+        or (
+            bool(list_content(text, container))
+            and (not paragraph or interrupts_paragraph(LIST_MARKER_RE.match(text)))
+        )
         or bool(quote_marker(text, container))
     )
 
@@ -1983,7 +2001,7 @@ def comment_lines(pieces: list[Piece]):
                 )
                 opens = (
                     opens
-                    or starts_block(body, enclosing)
+                    or starts_block(body, enclosing, open_paragraph)
                     or (quoted != before_quoted and not lazy)
                     or (
                         piece.marker in DOC_MARKERS
@@ -4173,6 +4191,30 @@ RULE_TESTS = [
         "/// TODO: add retry\n",
         {("CH002", 2)},
         "an inner closer ends the inner element, not the outer one",
+    ),
+    (
+        "/// Explain \\``TODO: issue required` suffix.\n",
+        set(),
+        "an escape takes one backtick, leaving the rest of the run",
+    ),
+    (
+        "/// Intro `literal\n"
+        "/// 2. TODO: issue required` suffix.\n",
+        set(),
+        "a marker that cannot interrupt a paragraph opens no block",
+    ),
+    (
+        "/// Intro `literal\n"
+        "///\n"
+        "/// 2. TODO: issue required` suffix.\n",
+        {("CH002", 3)},
+        "but after a blank line the same marker does",
+    ),
+    (
+        "// macro_rules! stale { () => {}; }\n"
+        "// The macro_rules! form is described in the guide below.\n",
+        {("CH001", 1)},
+        "a macro definition ends at its brace, and prose naming one does not",
     ),
 ]
 
