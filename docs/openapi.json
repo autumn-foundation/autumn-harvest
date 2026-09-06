@@ -3241,6 +3241,10 @@
             "application/json": {
               "schema": {
                 "properties": {
+                  "buffer_all_max": {
+                    "description": "Cap on the buffered backlog when overlap_policy is buffer_all.",
+                    "type": "integer"
+                  },
                   "calendar": {
                     "description": "Optional named calendar for business-day / holiday filtering (issue #337)."
                   },
@@ -3253,11 +3257,31 @@
                   "catchup_window_secs": {
                     "description": "Window length in seconds when catchup_policy = window; ignored otherwise (issue #484)."
                   },
+                  "consecutive_failure_limit": {
+                    "description": "Pause the schedule after this many consecutive failed runs. Null disables the limit.",
+                    "type": "integer"
+                  },
+                  "end_at": {
+                    "description": "RFC 3339 instant after which the schedule stops firing.",
+                    "type": "string"
+                  },
                   "input": {
                     "description": "Workflow input payload (any JSON value)."
                   },
+                  "jitter_secs": {
+                    "description": "Random delay added to each fire, in seconds, to spread a thundering herd.",
+                    "type": "integer"
+                  },
                   "max_active_runs": {
                     "description": "Maximum concurrent scheduled runs."
+                  },
+                  "max_runs": {
+                    "description": "Total number of runs this schedule may produce before it is exhausted.",
+                    "type": "integer"
+                  },
+                  "overlap_policy": {
+                    "description": "What to do when a fire lands while the previous run is still going: skip, buffer_one, buffer_all, or allow_all.",
+                    "type": "string"
                   },
                   "paused": {
                     "description": "Create the schedule in paused state."
@@ -3265,11 +3289,18 @@
                   "queue_name": {
                     "description": "Task queue name for scheduled runs (default: 'default')."
                   },
+                  "retry_policy": {
+                    "description": "Retry policy applied to each run this schedule starts. Defaults to the workflow's own policy."
+                  },
                   "schedule_expr": {
                     "description": "Cron expression (e.g. '0 * * * *')."
                   },
                   "skip_policy": {
                     "description": "What to do when the fire date is calendar-excluded (issue #337)."
+                  },
+                  "timezone": {
+                    "description": "IANA timezone the cron expression is evaluated in. Defaults to UTC.",
+                    "type": "string"
                   },
                   "workflow_name": {
                     "description": "Registered workflow name."
@@ -3512,6 +3543,10 @@
                   },
                   "timezone": {
                     "description": "New IANA timezone for the cron expression. Provided without schedule_expr it re-anchors the stored cron expression; ignored for interval/manual schedules."
+                  },
+                  "workflow_name": {
+                    "description": "Retarget the schedule at a different registered workflow.",
+                    "type": "string"
                   }
                 },
                 "type": "object"
@@ -11644,6 +11679,15 @@
             "schema": {
               "type": "string"
             }
+          },
+          {
+            "description": "Request-scoped idempotency key (issue #808). It wins over the body idempotency_key field, and it is the only way to recover an already-committed start when the body itself is malformed. A present-but-empty key is a 400, never a silent non-idempotent start.",
+            "in": "header",
+            "name": "Idempotency-Key",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
           }
         ],
         "requestBody": {
@@ -11666,6 +11710,10 @@
                   "conflict_policy": {
                     "description": "How to handle a collision with a currently-ACTIVE (RUNNING/PAUSED) prior run (issue #685). Orthogonal to reuse_policy (which governs terminal priors). One of: unspecified (default — each reuse policy's native active behavior, byte-for-byte identical to today), fail (409 AlreadyExists), use_existing (return the existing run, 200, no new WorkflowStarted), terminate_existing (cancel the active prior and start fresh, 201). Sending the field (even 'unspecified') surfaces a started_fresh boolean in the response (true = fresh run created, false = attached to the existing run); omitting it keeps the response byte-for-byte identical to today. terminate_existing requires admin authentication, because it can cancel a live prior; the other values (unspecified, fail, use_existing) do not — except that unspecified inherits the reuse policy's native behavior, so reuse_policy=terminate_if_running with an omitted/unspecified conflict_policy still requires admin. Not supported combined with a throttle/debounce/batch policy — the start is deferred and has no active prior to resolve at request time (400). An unknown value returns 400. A prior sealed MIGRATED/MIGRATING by a shard rebalance (issue #964) counts as ACTIVE -- the run is live, just on another shard -- and terminate_existing against one is REFUSED with a retryable 503 naming the live residence rather than replaced: the terminate could not reach the live copy from the prior's shard, and replacing would release the business key while the real run kept executing, producing two live runs for one workflow_id. Cancel or terminate the execution by id (which routes to its live residence), then retry the start."
                   },
+                  "context_headers": {
+                    "description": "Caller-supplied trace or correlation headers, threaded onto the execution row and carried through the run.",
+                    "type": "object"
+                  },
                   "delay": {
                     "description": "Delay duration before starting the workflow (e.g. \"10s\", \"5m\")."
                   },
@@ -11680,6 +11728,10 @@
                   },
                   "memo": {
                     "description": "Non-indexed metadata (JSON object)."
+                  },
+                  "priority": {
+                    "description": "Dispatch priority for this execution's tasks. Defaults to Normal when omitted.",
+                    "type": "string"
                   },
                   "queue": {
                     "description": "Task queue name."

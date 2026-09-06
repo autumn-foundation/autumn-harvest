@@ -1,20 +1,22 @@
 #!/usr/bin/env python3
 """Check the API contract against the handlers it describes.
 
-Two checks, both mechanical:
+Three checks, all mechanical:
 
 1. Every HTTP status a handler can return is declared for that route.
 2. Every request-body field that is mandatory on the wire is marked required.
+3. Every request-body field the handler accepts is documented at all.
 
 The published OpenAPI document is generated from `docs/api-contract.json`, so
 anything missing there is missing from every generated client. This audit reads
 the router and the handlers in `autumn-harvest-plugin/src/api.rs` and compares
 them against the contract.
 
-For check 1 it collects the `StatusCode::` values each handler can return. For
-check 2 it resolves each `Json<T>` extractor to its struct and treats a field as
-mandatory when it is neither an `Option` nor carries a serde default: axum
-rejects a request that omits one, whatever the contract says.
+For check 1 it collects the `StatusCode::` values each handler can return.
+Checks 2 and 3 resolve each `Json<T>` extractor to its struct. A field is
+mandatory when it is neither an `Option` nor carries a serde default, since axum
+rejects a request that omits one. A field serde accepts but the contract omits
+is missing from the generated client, so an ordinary request cannot be typed.
 
 A `StatusCode::` used in a comparison rather than a response is ignored, and so
 is one inside a helper on GENERIC_HELPERS: `map_error` translates a runtime
@@ -165,6 +167,29 @@ def struct_body(name: str) -> str | None:
     return None
 
 
+def accepted_fields(struct: str) -> list[str]:
+    """Field names serde will accept from the wire."""
+    accepted: list[str] = []
+    attributes: list[str] = []
+    for line in struct.split("\n"):
+        text = line.strip()
+        if text.startswith("#["):
+            attributes.append(text)
+            continue
+        if not text or text.startswith("//") or text in ("{", "}"):
+            continue
+        field = re.match(r"(?:pub\s+)?([a-z_0-9]+)\s*:\s*(.+?),?$", text)
+        if not field:
+            attributes = []
+            continue
+        joined = " ".join(attributes)
+        skipped = re.search(r"serde\([^)]*\bskip\b", joined) and "skip_serializing_if" not in joined
+        if not skipped:
+            accepted.append(field.group(1))
+        attributes = []
+    return accepted
+
+
 def mandatory_fields(struct: str) -> list[str]:
     """Field names a caller must send, given serde's rules."""
     mandatory: list[str] = []
@@ -239,12 +264,21 @@ def main() -> int:
                 )
 
     body_findings: list[str] = []
+    undocumented: list[str] = []
     for method, path, handler in routes:
         params = handler_parameters(source, handler)
         route = by_route.get((method, path))
         if params is None or route is None:
             continue
-        extractor = re.search(r"Json\(\s*[a-z_0-9]+\s*\)\s*:\s*Json<([A-Za-z0-9_]+)>", params)
+        # A bare `Json<T>` means the body is mandatory; `Result<Json<T>, _>` and
+        # `Option<Json<T>>` leave that to the handler. All three still name the
+        # struct whose fields serde accepts, which is what check 3 needs.
+        bare = re.search(r"Json\(\s*[a-z_0-9]+\s*\)\s*:\s*Json<([A-Za-z0-9_]+)>", params)
+        extractor = (
+            bare
+            or re.search(r"Result<Json<([A-Za-z0-9_]+)>", params)
+            or re.search(r"Option<Json<([A-Za-z0-9_]+)>>", params)
+        )
         if extractor is None or extractor.group(1) == "Value":
             continue
         struct = struct_body(extractor.group(1))
@@ -254,17 +288,26 @@ def main() -> int:
             field["name"]: field.get("required", False)
             for field in (route.get("request_body") or {}).get("fields", []) or []
         }
-        for name in mandatory_fields(struct):
+        for name in (mandatory_fields(struct) if bare else []):
             if declared.get(name) is not True:
                 body_findings.append(
                     "  %s %s: `%s` is mandatory in %s but the contract does not "
                     "mark it required" % (method, path, name, extractor.group(1))
                 )
+        # An empty field list is a free-form body, documented by prose.
+        if declared:
+            for name in accepted_fields(struct):
+                if name not in declared:
+                    undocumented.append(
+                        "  %s %s: `%s` is accepted by %s but the contract does "
+                        "not document it" % (method, path, name, extractor.group(1))
+                    )
 
     print("OpenAPI contract coverage — %d routes scanned" % len(routes))
     print("Undeclared statuses: %d" % len(findings))
     print("Unmarked mandatory body fields: %d" % len(body_findings))
-    if not findings and not body_findings:
+    print("Undocumented body fields: %d" % len(undocumented))
+    if not findings and not body_findings and not undocumented:
         return 0
 
     if findings:
@@ -276,6 +319,8 @@ def main() -> int:
         )
     if body_findings:
         print("\nUnmarked mandatory body fields:\n" + "\n".join(sorted(set(body_findings))))
+    if undocumented:
+        print("\nUndocumented body fields:\n" + "\n".join(sorted(set(undocumented))))
     print("\nThen run scripts/regenerate-openapi.sh.")
     return 1
 

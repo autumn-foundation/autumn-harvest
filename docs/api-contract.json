@@ -1104,6 +1104,15 @@
           "description": "Registered workflow function name."
         }
       ],
+      "headers": [
+        {
+          "name": "Idempotency-Key",
+          "in": "header",
+          "required": false,
+          "type": "string",
+          "description": "Request-scoped idempotency key (issue #808). It wins over the body idempotency_key field, and it is the only way to recover an already-committed start when the body itself is malformed. A present-but-empty key is a 400, never a silent non-idempotent start."
+        }
+      ],
       "request_body": {
         "required": false,
         "free_form": false,
@@ -1197,6 +1206,18 @@
             "name": "residency_key",
             "required": false,
             "description": "Pin this workflow via an operator-declared residency key, e.g. 'eu' (issue #697). Mutually exclusive with shard_id. Resolved through the router's declared residency map (ShardRouter::with_residency_map), which is stable across process restarts and across any widening of the readable/writable shard sets. An undeclared or blank key returns 400 rather than falling back to the rendezvous hash."
+          },
+          {
+  "name": "context_headers",
+  "type": "object",
+  "required": false,
+  "description": "Caller-supplied trace or correlation headers, threaded onto the execution row and carried through the run."
+          },
+          {
+  "name": "priority",
+  "type": "string",
+  "required": false,
+  "description": "Dispatch priority for this execution's tasks. Defaults to Normal when omitted."
           }
         ]
       },
@@ -6541,6 +6562,53 @@
             "name": "catchup_window_secs",
             "required": false,
             "description": "Window length in seconds when catchup_policy = window; ignored otherwise (issue #484)."
+          },
+          {
+  "name": "timezone",
+  "type": "string",
+  "required": false,
+  "description": "IANA timezone the cron expression is evaluated in. Defaults to UTC."
+          },
+          {
+  "name": "jitter_secs",
+  "type": "integer",
+  "required": false,
+  "description": "Random delay added to each fire, in seconds, to spread a thundering herd."
+          },
+          {
+  "name": "overlap_policy",
+  "type": "string",
+  "required": false,
+  "description": "What to do when a fire lands while the previous run is still going: skip, buffer_one, buffer_all, or allow_all."
+          },
+          {
+  "name": "buffer_all_max",
+  "type": "integer",
+  "required": false,
+  "description": "Cap on the buffered backlog when overlap_policy is buffer_all."
+          },
+          {
+  "name": "consecutive_failure_limit",
+  "type": "integer",
+  "required": false,
+  "description": "Pause the schedule after this many consecutive failed runs. Null disables the limit."
+          },
+          {
+  "name": "end_at",
+  "type": "string",
+  "required": false,
+  "description": "RFC 3339 instant after which the schedule stops firing."
+          },
+          {
+  "name": "max_runs",
+  "type": "integer",
+  "required": false,
+  "description": "Total number of runs this schedule may produce before it is exhausted."
+          },
+          {
+  "name": "retry_policy",
+  "required": false,
+  "description": "Retry policy applied to each run this schedule starts. Defaults to the workflow's own policy."
           }
         ]
       },
@@ -6685,6 +6753,12 @@
             "name": "retry_policy",
             "required": false,
             "description": "New schedule-level workflow retry policy (issue #523). Tri-state: omit = unchanged, explicit null = clear."
+          },
+          {
+  "name": "workflow_name",
+  "type": "string",
+  "required": false,
+  "description": "Retarget the schedule at a different registered workflow."
           }
         ]
       },

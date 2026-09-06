@@ -120,6 +120,14 @@ against routes reverse-engineered from prose.
   returns to backfill, the `400` and `413` of signal validation and the signal
   payload cap, the `413` of an oversized workflow input, and the `504` of an
   update-with-start wait window.
+- Eleven request-body fields the API accepts were documented nowhere, so a
+  typed client could not express them: `context_headers` and `priority` on
+  start, `workflow_name` on the schedule patch, and eight on schedule creation
+  including `timezone`, `end_at`, `max_runs` and `retry_policy`. The code-side
+  `management_api_request_fields()` registry was missing them too.
+- `POST /workflows/{name}/start` reads an `Idempotency-Key` request header that
+  wins over the body field, and is the only way to recover an already-committed
+  start when the body is malformed. It was undeclared.
 - `PATCH /tasks/{id}` has been mounted and audited since issue #249, but was
   missing from `management_api_routes()` and from the contract. It was
   therefore invisible to every existing guard, to the CLI coverage test, and to
@@ -158,9 +166,10 @@ sorted line in `.github/ci/integration-suites.txt`. They assert:
   `/openapi.json` keeps it.
 
 `docs/audits/openapi-response-coverage.py` reads the handlers and the contract,
-and runs in the ungated `lint` job. It fails when a handler returns a status the
-contract does not declare, and when a request-body field that is mandatory on
-the wire is not marked required. Each handler is followed one level into the
+and runs in the ungated `lint` job. It fails on three things: a status the
+handler returns that the contract does not declare, a request-body field that is
+mandatory on the wire but not marked required, and a field serde accepts that
+the contract documents nowhere. Each handler is followed one level into the
 helpers it calls, since a status is often chosen in a helper such as
 `queue_pause_partial_status`. `map_error` is excluded: it translates a runtime
 error variant, so its statuses belong to the error rather than to every route
