@@ -2846,13 +2846,6 @@ async fn reopening_a_settled_migration_clears_the_stale_hold_marker() {
         .await
         .expect("reopen the settled record");
 
-    #[derive(diesel::QueryableByName)]
-    struct HoldMarkerRow {
-        #[diesel(sql_type = diesel::sql_types::Bool)]
-        legal_hold_verified: bool,
-        #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Timestamptz>)]
-        verified_legal_hold_set_at: Option<chrono::DateTime<Utc>>,
-    }
     let row: HoldMarkerRow = diesel::sql_query(
         "SELECT legal_hold_verified, verified_legal_hold_set_at \
            FROM harvest_shard_migrations WHERE execution_id = $1",
@@ -2870,4 +2863,12 @@ async fn reopening_a_settled_migration_clears_the_stale_hold_marker() {
         row.verified_legal_hold_set_at, None,
         "reopening a settled migration must clear the stale hold stamp"
     );
+}
+
+#[derive(diesel::QueryableByName)]
+struct HoldMarkerRow {
+    #[diesel(sql_type = diesel::sql_types::Bool)]
+    legal_hold_verified: bool,
+    #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Timestamptz>)]
+    verified_legal_hold_set_at: Option<chrono::DateTime<Utc>>,
 }
