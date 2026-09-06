@@ -3615,3 +3615,22 @@ The self-test caught a regression on the way: making the star required
 rather than optional broke every plain assignment, six fixtures at once.
 
 Corpus effect: none, at 19311.
+
+Round 119 -- a bound that described a form the rule then refused.
+
+`// *(counter) = counter + 1;` and `// *(ptr.add(1)) = value;` produced
+no CH001. The previous round's lookahead reads `\*+(?=[\w(])` -- it
+admits an opening parenthesis -- and the class behind it could consume
+only word characters. So the bound named a shape the rule went on to
+reject, which is the failure this file has a rule against.
+
+The parenthesized target is allowed only BEHIND a star. A bare
+`(x) = 1;` is valid Rust as well, and admitting it at the start of a
+comment would open the rule to "(see below) = ..." for nothing.
+
+The target carries the prose guard too. The right-hand side had one
+already, but it reads only the right, and `*(the queue drains) = x;`
+puts the sentence on the left. Found while timing the first fix rather
+than by a reviewer, and cheap enough to close instead of record.
+
+Corpus effect: none, at 19311. Four fixtures, two of them refusals.

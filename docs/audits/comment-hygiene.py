@@ -656,7 +656,23 @@ COMMENTED_CODE_RE = re.compile(
       # space, and `strip_containers` has already taken a real bullet off
       # this line, so requiring no space is belt and braces rather than the
       # only guard -- but it costs nothing and it keeps emphasis out.
-      | (?:\*+(?=[\w(]))?[\w.\[\]:\#]+\s*(?:[-+*/%&|^]|<<|>>)?=
+      # The target may be PARENTHESIZED: `*(counter) = 1;` and
+      # `*(ptr.add(1)) = value;` both compile. The previous round's
+      # lookahead admitted `(` and the class behind it could not consume
+      # one, so the bound described a form the rule then refused -- a bound
+      # that does no work, which this file has a rule against.
+      #
+      # The parenthesized shape is allowed only BEHIND a star, which is
+      # where it was reported and where the star already anchors the line.
+      # A bare `(x) = 1;` is valid Rust too, and admitting it at the start
+      # of a comment would open the rule to "(see below) = ..." for no gain.
+      # The parenthesized target reads the prose guard too. The
+      # right-hand side carries one already, but it only sees the right,
+      # and `*(the queue drains) = x;` puts the sentence on the left.
+      | (?:\*+(?=[\w(])
+            (?:\((?![^)]*\b[a-z]+\s+[a-z]+\s+[a-z]+\b)[^;=]*\)|[\w.\[\]:\#]+)
+          |[\w.\[\]:\#]+)
+            \s*(?:[-+*/%&|^]|<<|>>)?=
             {PROSE}\s*{NOS}+;\s*$
       # A commented-out statement. Anchored hard: the call must open at the
       # very start, so prose that merely names a function ("call cleanup()
@@ -5980,6 +5996,26 @@ RULE_TESTS = [
         "// * the queue drains = the worker parks;\n",
         set(),
         "but a bullet is not a dereference, because the star must abut",
+    ),
+    (
+        "// *(counter) = counter + 1;\n",
+        {("CH001", 1)},
+        "a dereference target may be parenthesized",
+    ),
+    (
+        "// *(ptr.add(1)) = value;\n",
+        {("CH001", 1)},
+        "holding a call of its own",
+    ),
+    (
+        "// *(the queue drains) = the worker parks;\n",
+        set(),
+        "though the prose guard still reads the right-hand side",
+    ),
+    (
+        "// *(the queue drains) = x;\n",
+        set(),
+        "and the target, which is where that sentence actually sits",
     ),
     (
         '// #[doc = include_str!("../README.md")]\n',
