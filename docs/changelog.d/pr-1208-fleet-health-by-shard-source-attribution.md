@@ -48,9 +48,11 @@ previously dropping.
   empty-assignment worker under the shard it was actually read from and an
   explicit-assignment worker under its literal claim, with no phantom count
   on the shard it happened to be read from; a malformed assignment
-  populates no `by_shard` bucket at all.
+  populates no `by_shard` bucket at all; a worker seeded with the same
+  `worker_id` and an explicit `[0, 1]` claim in both shard databases dedups
+  to one healthy worker with `by_shard[0] == by_shard[1] == 1`, not `2`.
 
 `cargo test -p autumn-harvest-plugin --lib`, `cargo clippy --all-targets --
--D warnings`, and `cargo fmt --check` are clean. The two new integration
+-D warnings`, and `cargo fmt --check` are clean. The three new integration
 tests are compile-checked in this sandbox (no Docker) and run Docker-backed
 in CI, matching repo convention.
