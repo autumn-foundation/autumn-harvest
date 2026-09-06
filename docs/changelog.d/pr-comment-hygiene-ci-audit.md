@@ -1598,3 +1598,38 @@ line. It under-reports, and the shape is a table with an inline empty comment
 in it.
 
 Corpus effect: none.
+
+### Round fifty-one — three rule defects, and three exclusions the corpus chose
+
+Three findings, none of them in the Markdown block layer, and all three fixed.
+
+**A sentence may end inside emphasis.** `**strong emphasis.** This second ...`
+puts two asterisks between the full stop and the space, so the splitter merged
+two compliant sentences and reported one long one — a CH007 that could fail
+the ratchet on correct prose.
+
+The interesting part is what is *not* in the fix. Three other closing
+delimiters look equally reasonable and each produced false splits, found by
+measuring rather than by argument: a backtick cut three hundred sentences,
+because a code span carries punctuation constantly (`` `?` ``, `` `.` ``); a
+closing paren cut the tree's own `(first is `0`, second is `1`, ...) -- so
+prefix explicitly`, where the ellipsis is mid-sentence; and a quote cut
+`answer "is `charge_card` held?" during an incident`, which is one sentence.
+Only `*` and `_` survive, and the reasoning for each exclusion is recorded at
+the pattern.
+
+**A marker inside a code span is documentation.** ``Parse the `TODO:` prefix``
+failed CH002, so the syntax of the marker could not be documented without an
+issue reference. CH002 now blanks inline code spans before matching. CH005 and
+CH006 deliberately do not, and the KNOWN LIMITATIONS entry that says so now
+records why CH002 differs: it is absolute, and a false positive there fails the
+build outright.
+
+**`pub(in crate::foo)` is a visibility.** The prefix shared by five CH001
+alternatives allowed word characters and colons but not the space in
+`pub(in path)`, so an unambiguous commented-out declaration passed an absolute
+gate.
+
+Corpus effect: 19887 to 19825, all CH007 — 275 merged sentences restated as
+213 correctly split ones. The ratchet recomputes both sides, so the gate stays
+clean.

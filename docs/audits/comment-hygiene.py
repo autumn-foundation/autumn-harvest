@@ -150,7 +150,10 @@ KNOWN LIMITATIONS:
 - CH005/CH006 match inside inline code spans (`` `like this` ``), so a
   literal that happens to contain "round-3" or an apostrophe-s would be
   flagged. No current occurrence does; stripping code spans first would
-  also hide genuine prose violations that merely sit next to one.
+  also hide genuine prose violations that merely sit next to one. CH002
+  is the exception and blanks them, because it is absolute: a comment
+  documenting the marker syntax ("Parse the `TODO:` prefix") must not
+  fail the build, and that risk outweighs the one above.
 
 - CH004 judges only runs of leading `//`. A trailing comment has no block
   to have edges, and a blank first line inside `/* */` is conventional
@@ -222,7 +225,7 @@ _APOS = r"[\u2019']"
 # space, never the `(` a real signature requires.
 COMMENTED_CODE_RE = re.compile(
     r"""^(?:
-        (?:pub(?:\([\w:]+\))?\s+)?(?:async\s+|unsafe\s+|const\s+|extern\s+"\w+"\s+)*
+        (?:pub(?:\((?:in\s+)?[\w:]+\))?\s+)?(?:async\s+|unsafe\s+|const\s+|extern\s+"\w+"\s+)*
             fn\s+\w+\s*(?:<[^<>]*>)?\s*\(
             (?:
                  .*\)\s*(?:->\s*[^;{]+?)?\s*[{;]   # complete: ends in { or ;
@@ -230,10 +233,10 @@ COMMENTED_CODE_RE = re.compile(
                | (?=[^)]*(?::|\bself\b))            # wrapped: real params,
                  [\w\s:&'<>\[\](),.+;=*-]*,\s*$      #   trailing comma
             )\s*$
-      | (?:pub(?:\([\w:]+\))?\s+)?(?:struct|enum|trait|union)\s+\w+\s*(?:<[^<>]*>)?\s*[{;(]\s*$
-      | (?:pub(?:\([\w:]+\))?\s+)?mod\s+\w+\s*[{;]\s*$
-      | (?:pub(?:\([\w:]+\))?\s+)?(?:const|static)\s+(?:mut\s+)?\w+\s*:[^;=]+=.*[;{]\s*$
-      | (?:pub(?:\([\w:]+\))?\s+)?type\s+\w+\s*(?:<[^<>]*>)?\s*=
+      | (?:pub(?:\((?:in\s+)?[\w:]+\))?\s+)?(?:struct|enum|trait|union)\s+\w+\s*(?:<[^<>]*>)?\s*[{;(]\s*$
+      | (?:pub(?:\((?:in\s+)?[\w:]+\))?\s+)?mod\s+\w+\s*[{;]\s*$
+      | (?:pub(?:\((?:in\s+)?[\w:]+\))?\s+)?(?:const|static)\s+(?:mut\s+)?\w+\s*:[^;=]+=.*[;{]\s*$
+      | (?:pub(?:\((?:in\s+)?[\w:]+\))?\s+)?type\s+\w+\s*(?:<[^<>]*>)?\s*=
             (?!\s*(?:\w+\s+){2,}\w+\s*;\s*$).*;\s*$
       | impl(?:\s*<[^<>]*>)?\s+
             (?![^;{]*\b[a-z]+\s+[a-z]+\s+[a-z]+\s+[a-z]+\b)[\w:<>&'\s]+\{\s*$
@@ -290,6 +293,16 @@ TODO_RE = re.compile(
     r"^(?:TODO|FIXME|XXX|HACK)\b|\b(?:TODO|FIXME|XXX|HACK)\s*[:(]", re.IGNORECASE
 )
 TODO_REF_RE = re.compile(r"#\d+|https?://")
+# An inline code span. CH002 is absolute and at zero, so a comment that
+# DOCUMENTS the marker syntax -- "Parse the `TODO:` prefix" -- must not fail
+# the build. The span is blanked rather than deleted, so every offset after
+# it still points at the same column.
+CODE_SPAN_RE = re.compile(r"(`+)(?:.*?)\1")
+
+
+def blank_code_spans(text: str) -> str:
+    """`text` with each inline code span replaced by spaces of equal width."""
+    return CODE_SPAN_RE.sub(lambda m: " " * len(m.group(0)), text)
 
 # First-person deliberation. "Actually" must open a sentence: mid-sentence it is
 # an ordinary adverb ("gated on THIS claimant actually, durably marking the
@@ -630,8 +643,26 @@ def html_closes(text: str, kind: str) -> bool:
 # there cuts one sentence in two and a 27-word sentence carrying "e.g." then
 # passes CH007. Only those two: "etc." and "vs." do end sentences, so
 # excluding them would merge two real sentences and over-report instead.
+# A closing delimiter may sit between the full stop and the space: a sentence
+# ending in "**strong emphasis.**" puts two asterisks there, and requiring
+# whitespace immediately after the stop merged it with the sentence that
+# follows, reporting two compliant sentences as one long one.
+#
+# EMPHASIS ONLY, and every exclusion below was measured against the corpus
+# rather than reasoned about. Each of the other closing delimiters produced
+# false splits in this tree:
+#
+#   * A backtick: a code span carries punctuation constantly -- "`?`", "`.`",
+#     "`foo.bar()`" -- so admitting it cut three hundred sentences at the
+#     closing backtick.
+#   * A closing paren: this tree writes "(first is `0`, second is `1`, ...)
+#     -- so prefix explicitly", where the ellipsis is mid-sentence.
+#   * A quote: "answer \"is `charge_card` held?\" during an incident" is one
+#     sentence, and the question mark inside the quotation is not its end.
+#
+# A closing "**" after a full stop has no such second reading.
 SENTENCE_SPLIT_RE = re.compile(
-    r"(?<=[.!?])(?<!e\.g\.)(?<!E\.g\.)(?<!i\.e\.)(?<!I\.e\.)\s+"
+    r"(?<=[.!?])(?<!e\.g\.)(?<!E\.g\.)(?<!i\.e\.)(?<!I\.e\.)[*_]*\s+"
 )
 
 
@@ -1615,7 +1646,11 @@ def check_line_rules(path: str, pieces: list[Piece]) -> list[Finding]:
         # CH002 is anchored at the start of the line for its unpunctuated
         # form, so it needs the same peel CH001 does: "- TODO fix this" is a
         # commitment with a bullet in front of it, and only a FENCE exempts.
-        todo = TODO_RE.search(code_line)
+        # Blanked first: a marker inside an inline code span is the syntax
+        # being described, not a commitment being made. CH005 and CH006 read
+        # the raw text on purpose -- see KNOWN LIMITATIONS -- but those are
+        # ratcheted, and this one fails the build outright.
+        todo = TODO_RE.search(blank_code_spans(code_line))
         if todo and not TODO_REF_RE.search(stripped):
             findings.append(Finding("CH002", path, lineno, stripped))
 
@@ -3117,6 +3152,38 @@ RULE_TESTS = [
         "pub struct B;\n",
         set(),
         "and '/**' is still a doc comment",
+    ),
+    (
+        "// This first sentence ends with **word1 word2 word3 word4 word5 word6 word7 word8 word9 word10 emphasis.**"
+        " This second sentence has word11 word12 word13 word14 word15 word16 word17 word18 word19 word20 word21 word22 here.\n",
+        set(),
+        "a sentence may end inside emphasis",
+    ),
+    (
+        "// A `?` straight out of any of these returns early from the caller here.\n",
+        set(),
+        "a code span's punctuation is not a sentence end",
+    ),
+    (
+        "// Used to answer \"is `charge_card` held?\" during an incident"
+        " and word1 word2 word3 word4 word5 word6 word7 word8 word9 word10 word11 word12 word13 word14 word15 word16 word17 word18.\n",
+        {("CH007", 1)},
+        "nor is a question mark inside a quotation",
+    ),
+    (
+        "// pub(in crate::foo) fn bar() {\n",
+        {("CH001", 1)},
+        "pub(in path) is a visibility",
+    ),
+    (
+        "// Parse the `TODO:` prefix from input.\n",
+        set(),
+        "a marker inside a code span is documentation",
+    ),
+    (
+        "// TODO: fix the parser\n",
+        {("CH002", 1)},
+        "and a bare one is still a commitment",
     ),
 ]
 
