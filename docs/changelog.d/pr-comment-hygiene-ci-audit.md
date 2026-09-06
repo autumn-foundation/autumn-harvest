@@ -2709,3 +2709,45 @@ the one reference pattern of three that did not require a destination.
 
 Corpus effect: none. Two CH007 findings move down one line, because a
 line was restored above them. Eleven fixtures.
+
+### Round eighty-eight — both fixes of round eighty-seven, one edge further
+
+Two findings, one on each of the previous round's changes.
+
+A closing quote may be TYPOGRAPHIC. `// TODO: print “ready.” See #123 for
+parser.` found no sentence boundary, so the marker borrowed the reference
+from the next sentence. An editor that curls a quote changes nothing a
+reader sees and everything an ASCII class matches, and this corpus
+already carries curly quotes and em dashes. The closer set now holds
+`’`, `”` and `»` beside the ASCII three, and the following-capital test
+is unchanged, so `“Ready?” prompt` still continues its sentence.
+
+`mark_bridges` counted an attribute's brackets character by character, so
+a `]` inside a string closed a wrapped attribute early:
+
+```rust
+/// One.
+///
+#[doc = concat!(
+    "Inserted ] text."
+)]
+/// Two.
+```
+
+Rustdoc 1.94.1 renders two paragraphs there; the audit reported CH004 on
+the blank line and would have had it deleted. The reported example was a
+single-line attribute, which already balanced and already passed -- the
+defect needs the attribute to wrap.
+
+The counter is lexical now. `extract_comments` already distinguishes a
+string from code, so it records every string and char literal span while
+it has them, and `blank_literals` hands `mark_bridges` a copy with the
+literal text spaced out and every line number intact. Raw strings and
+`']'` are covered by the same record.
+
+Cost measured, because the first version copied every file
+character-by-character and added forty per cent to the corpus run. The
+kept version splices the spans, and the run is 23.1 s against 22.9 s
+before.
+
+Corpus effect: none. Six fixtures.

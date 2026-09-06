@@ -360,9 +360,14 @@ TODO_REF_RE = re.compile(r"#\d+|https?://\S")
 # the second opens with a lower-case identifier. Here it decides only the
 # case the plain rule cannot read at all, and the un-ended sentence merely
 # reaches further.
+#
+# A closer may be TYPOGRAPHIC. An editor that turns "ready." into
+# \u201cready.\u201d changes nothing a reader sees and everything an ASCII
+# class matches, and this corpus already carries curly quotes and em
+# dashes.
 SENTENCE_END_RE = re.compile(
     r"(?<!e\.g)(?<!E\.g)(?<!i\.e)(?<!I\.e)[.!?]"
-    r"(?:[*_]*(?=\s|$)|[\"')\]]+(?=\s+[A-Z]))"
+    r"(?:[*_]*(?=\s|$)|[\"')\]\u2019\u201d\u00bb]+(?=\s+[A-Z]))"
 )
 # A bracketed citation attached to the end of a sentence, as in "TODO: add
 # retries. (#123)". A citation is part of the sentence it cites, so that
@@ -1273,6 +1278,11 @@ def extract_comments(source: str) -> list[Piece]:
     ambiguity.
     """
     pieces: list[Piece] = []
+    # Where every string and char literal sits. `mark_bridges` counts an
+    # attribute's brackets, and a `]` inside a string is text, not a
+    # bracket. The lexer is the only thing here that knows the difference,
+    # so it records the spans while it already has them.
+    literals: list[tuple[int, int]] = []
     i = 0
     n = len(source)
     line = 1
@@ -1437,12 +1447,14 @@ def extract_comments(source: str) -> list[Piece]:
             end = source.find(closer, raw_match.end())
             end = n if end == -1 else end + len(closer)
             line += source.count("\n", i, end)
+            literals.append((i, end))
             i = end
             code_on_line = True
             continue
 
         # Ordinary string (and its b"" / c"" prefixed forms): honour escapes.
         if ch == '"':
+            literal_start = i
             i += 1
             while i < n:
                 if source[i] == "\\":
@@ -1460,6 +1472,7 @@ def extract_comments(source: str) -> list[Piece]:
                 if source[i] == "\n":
                     line += 1
                 i += 1
+            literals.append((literal_start, i))
             code_on_line = True
             continue
 
@@ -1468,6 +1481,8 @@ def extract_comments(source: str) -> list[Piece]:
         if ch == "'":
             lit = CHAR_LIT_RE.match(source, i)
             if lit:
+                # `']'` is a char literal holding a bracket, which is text.
+                literals.append((i, lit.end()))
                 i = lit.end()
             else:
                 i += 1
@@ -1478,8 +1493,34 @@ def extract_comments(source: str) -> list[Piece]:
             code_on_line = True
         i += 1
 
-    mark_bridges(source, pieces)
+    mark_bridges(blank_literals(source, literals), pieces)
     return pieces
+
+
+NON_NEWLINE_RE = re.compile(r"[^\n]")
+
+
+def blank_literals(source: str, spans: list[tuple[int, int]]) -> str:
+    """`source` with every literal's characters replaced by spaces.
+
+    Newlines survive, so every line keeps its number and its length. Only
+    the bracket counter reads this copy; the comment text itself always
+    comes from the real source.
+    """
+    if not spans:
+        return source
+    out: list[str] = []
+    last = 0
+    for start, end in spans:
+        out.append(source[last:start])
+        body = source[start:end]
+        # A one-line literal is the overwhelming case, so spend nothing on it.
+        out.append(
+            " " * len(body) if "\n" not in body else NON_NEWLINE_RE.sub(" ", body)
+        )
+        last = end
+    out.append(source[last:])
+    return "".join(out)
 
 
 def mark_bridges(source: str, pieces: list[Piece]) -> None:
@@ -1495,8 +1536,11 @@ def mark_bridges(source: str, pieces: list[Piece]) -> None:
     `idempotency_tests.rs` before this was understood.
 
     An attribute may WRAP, so the scan follows its brackets rather than its
-    first line. A line that carries a comment is never an attribute line
-    whatever it says, because `// #[derive(Debug)]` is prose ABOUT one.
+    first line, and it reads them from `blank_literals` output: a `]` inside
+    a string is text, and counting it closed a wrapped attribute early and
+    failed the build on the doc line after it. A line that carries a comment
+    is never an attribute line whatever it says, because `// #[derive(Debug)]`
+    is prose ABOUT one.
     """
     occupied = {piece.line for piece in pieces}
     attributes: set[int] = set()
@@ -4380,6 +4424,16 @@ RULE_TESTS = [
         "a closing quote ends a sentence where a capital follows it",
     ),
     (
+        "// TODO: print \u201cready.\u201d See #123 for the parser.\n",
+        {("CH002", 1)},
+        "a typographic quote closes one as well as an ASCII quote",
+    ),
+    (
+        "// TODO: preserve the \u201cReady?\u201d prompt under #123\n",
+        set(),
+        "and reads the following word the same way",
+    ),
+    (
         "// TODO: see http://\n",
         {("CH002", 1)},
         "a bare scheme tracks nothing",
@@ -4403,6 +4457,18 @@ RULE_TESTS = [
         "/// One.\n///\n#[allow(\n    dead_code\n)]\n/// Two.\npub struct S;\n",
         set(),
         "which may wrap over several lines",
+    ),
+    (
+        '/// One.\n///\n#[doc = concat!(\n    "Inserted ] text."\n)]\n'
+        "/// Two.\npub struct S;\n",
+        set(),
+        "and may carry a bracket inside a string, which is text",
+    ),
+    (
+        '/// One.\n///\n#[doc = concat!(\n    r#"raw ] text"#\n)]\n'
+        "/// Two.\npub struct S;\n",
+        set(),
+        "in a raw string too",
     ),
     (
         "/// One.\n///\n#[allow(dead_code)]\npub struct S;\n",
