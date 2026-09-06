@@ -108,25 +108,49 @@
 --       ON harvest_events (workflow_exec_id, (event_data #>> '{data,activity_id}'), timestamp)
 --       WHERE event_type = 'ActivityStarted';
 --
--- **Rollover race (Codex review, PR #1381, round 2):** a single pass through
--- the generator above narrows the window a new partition can slip through
--- but does not close it -- `harvest_event_cohort`'s rollover can still open
--- one between that pass and the parent statement. Re-run the SAME generator
--- query in a LOOP immediately before the parent statement, with no operator
--- delay in between, until it returns zero rows, THEN run the parent
--- statement right away. This bounds, but by construction cannot fully
--- eliminate, a race against a rollover landing in the instant between the
--- last "zero rows" check and the parent statement itself -- no client-side
--- loop can synchronize with a server-side event with zero gap. That residual
--- case is bounded and safe rather than eliminated: the only partition that
--- could still be missing at that point is one `harvest_event_cohort` just
--- opened, which by definition holds ~0 rows, so Postgres building its index
--- non-concurrently as part of the parent statement is near-instant and
--- blocks nothing of substance -- unlike the original problem this whole
--- partitioned recipe exists to avoid (non-concurrently indexing the FULL
--- historical dataset). A loop that verifies zero missing leaves immediately
--- before proceeding is the standard shape for this kind of narrowing; treat
--- the remaining instant-of-rollover case as accepted, not overlooked.
+-- **Partition-maintenance race (Codex review, PR #1381, rounds 2-3):** a
+-- single pass through the generator above narrows the window a new partition
+-- can slip through but does not close it. Re-run the SAME generator query in
+-- a LOOP immediately before the parent statement, with no operator delay in
+-- between, until it returns zero rows, THEN run the parent statement right
+-- away -- but a partition appearing in that window is NOT guaranteed to be
+-- empty, and an earlier draft of this comment claimed it was; that claim was
+-- wrong and is retracted here. Two things can create a partition:
+--
+--   * `partition::ensure_partitions` opens a forward lookahead cohort --
+--     genuinely empty.
+--   * `partition::drain_default` (round 3's finding) creates a cohort
+--     partition and moves rows out of `DEFAULT` into it, up to
+--     `DRAIN_MAX_ROWS` (50,000) per pass -- a FLOOR, not a ceiling: "one
+--     oversized cohort is irreducible and moves in a single pass" (see that
+--     constant's own doc comment), so a newly-created partition can carry
+--     50,000+ rows the very moment it appears.
+--
+-- Both run inside `partition::maintain`, and `maintain` is not merely a CLI
+-- action an operator can simply avoid scheduling: `retention.rs` calls it
+-- automatically from the background retention janitor whenever
+-- `RetentionConfig`'s `PartitionMaintenanceConfig::enabled` is true, which it
+-- is **by default**. So on a live deployment this is a real, not theoretical,
+-- race, and the convergence loop's "the gap is an instant, so what could
+-- possibly land in it" reasoning does not make the drain case safe to ignore.
+--
+-- The actual mitigation is to close the window at the source: set
+-- `RetentionConfig.partitions.enabled = false`
+-- (`PartitionMaintenanceConfig::enabled`) and roll it out to every worker on
+-- the target shard *before* starting the convergence loop; run the loop and
+-- the parent statement, then restore `enabled = true`. With maintenance
+-- paused, neither `ensure_partitions` nor `drain_default` can create a
+-- partition during the window, and the convergence loop's zero-row check is
+-- then exact, not merely probabilistic.
+--
+-- For an operator who cannot take that config-and-restart round trip: the
+-- residual, unmitigated risk is that the parent statement performs a
+-- non-concurrent build over at most one drain batch (bounded by
+-- `DRAIN_MAX_ROWS`, 50,000 rows) or, in the oversized-cohort edge case, that
+-- whole cohort -- smaller than indexing the entire historical dataset (the
+-- problem this partitioned recipe exists to avoid), but neither instant nor
+-- risk-free. State that trade-off to whoever approves the change; do not
+-- assume it away.
 --
 -- (`CONCURRENTLY` can leave an INVALID index behind on failure/cancellation --
 -- check `pg_index.indisvalid` for the index's oid and `DROP INDEX
