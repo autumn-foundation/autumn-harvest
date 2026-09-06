@@ -257,33 +257,35 @@ BIND = r"(?:ref\s+)?(?:mut\s+)?"
 
 # Is the tail of this declaration an EXPRESSION, or is it English?
 #
-# It reads the LAST TWO ATOMS, not a run of bare words. Counting words was
-# wrong twice over: three was too many, so `mode = legacy default;` slipped
-# past in round one hundred and eighteen, and a bare-word run cannot see
-# punctuation, so `timeout = 30-second default;` slipped past in one hundred
-# and twenty-three -- the hyphen ends the run before two words are counted.
+# Two questions, and the tail is prose only when both answer yes.
 #
-# What actually separates the two is that an EXPRESSION never puts two atoms
-# side by side. `a - b;` has an operator between them; `legacy default;` and
-# `30-second default;` do not. So the test is whether the tail ends with a
-# word whose preceding character is neither an operator nor a delimiter.
+# 1. Does it carry a CODE SIGNAL -- a quote, a `!`, a `(`, a `[` or a `::`?
+#    Prose in this tree does not, and an expression holding one is an
+#    expression however its words fall. That is what keeps
+#    `msg = format!("the queue is paused");` reported.
 #
-# Five keywords DO put two atoms together, and each is checked against
-# rustc 1.94.1 rather than assumed. `as` in an expression --
-# `retries = count as usize;`. And in a TYPE, where the guard also runs:
-# `mut` in `&'a mut Worker`, `const` in `*const u8`, `dyn` in `&dyn Tr`,
-# `impl` beside them. The self-test caught the first two of those the
-# moment this guard became positional, because two shape fixtures hold
-# exactly those types.
+# 2. Are two word-atoms ADJACENT, separated by nothing but space? An
+#    expression never does that: `a - b` has an operator between them and
+#    `legacy default` has nothing. Keywords are the exception on either
+#    side -- `count as`, `as usize`, `mut Worker`, `} else` -- so the test
+#    skips a pair when either half is one.
 #
-# `move` is NOT among them: `move || 1` has the closure pipe between the
-# atoms, so it never reaches this test.
+# Three earlier shapes of this guard each read too little. A three-word
+# threshold missed `mode = legacy default;` (round 118). A bare-word run
+# could not see the hyphen in `30-second default;` (123). Reading only the
+# atom before the `;` missed `legacy default + jitter;` (126), where the
+# tail ENDS well and goes wrong in the middle. Reading the whole tail is
+# what the three have in common.
 #
 # One definition, spliced into the six rules that had written it out.
+PROSE_KEYWORD = (
+    r"(?:as|mut|const|dyn|impl|move|if|else|match|in|ref|return|break"
+    r"|continue|unsafe|async|await|where|for|while|loop|let|true|false"
+    r"|crate|self|Self|super)"
+)
 PROSE = (
-    r"(?!.*[^\s\-+*/%&|^<>=!,(\[{:.?]"
-    r"(?<!\bas)(?<!\bmut)(?<!\bconst)(?<!\bdyn)(?<!\bimpl)"
-    r"\s+\w+\s*;\s*$)"
+    r"(?!(?![^;]*[\"!(\[]|[^;]*::)[^;]*"
+    r"\b(?!" + PROSE_KEYWORD + r"\b)\w+\s+(?!" + PROSE_KEYWORD + r"\b)\w+)"
 )
 
 # The `;` that ENDS a declaration and the `;` inside an ARRAY are the same
@@ -793,7 +795,11 @@ COMMENTED_CODE_RE = re.compile(
       # survived because the form had no fixture. Round one hundred and nine
       # verified it BY HAND in a review reply and never wrote one. A shape
       # proved in prose is a shape the next rewrite may break.
-      | (?:{ROOT}|<[^<>;]*>::)
+      # The qualified path may itself be GENERIC: `<Vec<u8> as Bar>::baz()`
+      # compiles, and excluding every inner angle bracket covered only the
+      # plain `<Foo as Bar>` I added last round. Bounded by the `;` that
+      # would end the statement instead, so the brackets may nest freely.
+      | (?:{ROOT}|<{NOS}*>::)
             [\w\#]+(?:::[\w\#]+|::<{NOSP}*>)*(?:\.[\w\#]+(?:::<{NOSP}*>)?)*
             \(.*\)(?:\s*\?|\s*\.await\s*\??)*\s*;\s*$
     )""".replace("{VIS}", VISIBILITY).replace("{WHERE}", WHERE).replace(
@@ -6248,6 +6254,21 @@ RULE_TESTS = [
         "// <b>bold</b> text here;\n",
         set(),
         "but a tag is not a qualified path",
+    ),
+    (
+        "// <Vec<u8> as Bar>::baz();\n",
+        {("CH001", 1)},
+        "and a qualified path may itself be generic",
+    ),
+    (
+        "// timeout = legacy default + jitter;\n",
+        set(),
+        "adjacent atoms are prose wherever they sit, not only at the end",
+    ),
+    (
+        '// msg = format!("the queue is paused");\n',
+        {("CH001", 1)},
+        "though a code signal makes an expression of any words it holds",
     ),
     (
         '// #[doc = include_str!("../README.md")]\n',

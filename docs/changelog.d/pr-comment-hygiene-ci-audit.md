@@ -3784,3 +3784,42 @@ and rustc accepts it. Added, with `// <b>bold</b> text here;` as the
 refusal that keeps a tag from reading as one.
 
 Corpus effect: none, at 19311. Three fixtures.
+
+Round 126 -- the prose guard reads the whole tail.
+
+`// timeout = legacy default + jitter;` failed the build. The guard read
+the atom immediately before the `;`, where `+ jitter` looks like an
+expression, and the adjacent `legacy default` in the middle went unseen.
+
+This is the fourth shape of that guard, and the first three each read too
+little: a three-word threshold missed `mode = legacy default;` in round
+one hundred and eighteen, a bare-word run could not see the hyphen in
+`30-second default;` in one hundred and twenty-three, and reading only
+the last atom missed this one. Reading the WHOLE tail is what they have
+in common.
+
+It asks two questions now, and calls the tail prose only when both
+answer yes. Does it carry no CODE SIGNAL -- no quote, `!`, `(`, `[` or
+`::`? And are two word-atoms ADJACENT with nothing but space between
+them? An expression never does the second, and the keyword pairs that
+appear to (`count as`, `as usize`, `mut Worker`, `} else`) are exempt on
+either side.
+
+The code signal is what keeps `msg = format!("the queue is paused");`
+reported. Without it, the words inside a string literal would read as
+prose and a real commented-out statement would go missing -- an
+under-report traded for the false positive, which is the wrong way round.
+
+Verified against 56 hand-built cases, 42 valid Rust and 14 prose, before
+the file was touched.
+
+`// <Vec<u8> as Bar>::baz();` produced no CH001. The qualified path added
+last round excluded every inner angle bracket, so it covered only the
+non-generic form. Bounded by the `;` that would end the statement now, so
+the brackets nest freely.
+
+Corpus effect: none, at 19311. Three fixtures.
+
+On timing: both scans are linear, measured at five sizes with the best of
+three runs each. A single sample at 40000 characters read 4.1 ms and
+looked superlinear; it was noise.
