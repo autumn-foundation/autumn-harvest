@@ -225,6 +225,20 @@ RULE_HINTS = {
 _APOS = r"[\u2019']"
 
 
+# The BINDING MODE in front of an identifier. rustc 1.94.1 takes
+# `let ref stale = ...;` and `let ref mut stale = ...;`, and it takes `ref`
+# on an uninitialized binding too -- `let ref x: String;` -- which is the
+# rule the report did not name.
+#
+# The order is fixed: `ref mut`, never `mut ref`. rustc answers E0658,
+# "mutable by-reference binding", for the second, so admitting it would
+# accept what the language refuses.
+#
+# The destructuring rules need nothing. `ref` binds an IDENTIFIER, so it
+# sits inside the pattern -- `let (ref a, ref b) = t;` -- where the pattern
+# class already reads it, and `let ref (a, b) = t;` is not Rust.
+BIND = r"(?:ref\s+)?(?:mut\s+)?"
+
 # Is the tail of this declaration an EXPRESSION, or is it English? With no
 # operator to anchor on, a run of bare words separated by spaces is the only
 # thing the two share, so that run is what the guard reads.
@@ -487,7 +501,7 @@ COMMENTED_CODE_RE = re.compile(
       | (?:unsafe\s+)?impl(?:\s*{GEN})?\s+
             (?![^;{]*\b[a-z]+\s+[a-z]+\s+[a-z]+\s+[a-z]+\b)
             {NOSB}+{BODY}\s*$
-      | let\s+(?:mut\s+)?(?:r\#)?\w+\s*(?::{NOSE}+)?=
+      | let\s+{BIND}(?:r\#)?\w+\s*(?::{NOSE}+)?=
             {PROSE}[^=].*;\s*$
       # Destructuring bindings. A tuple or slice pattern, or a struct/enum
       # pattern behind a Capitalised path -- all terminated, and none of them
@@ -507,7 +521,7 @@ COMMENTED_CODE_RE = re.compile(
       # same fragment, because writing a construct twice is how two of them
       # came to disagree in rounds one hundred and eight and nine.
       | {VIS}(?:const|static)\s+(?:mut\s+)?(?:r\#)?\w+\s*:{DECL_TYPE}
-      | let\s+(?:mut\s+)?(?:r\#)?\w+\s*:
+      | let\s+{BIND}(?:r\#)?\w+\s*:
             {PROSE}\s*
             # A Rust type, not a scalar name. An array length needs `;`, a
             # trait object needs `+`, a function pointer needs `->`, and a
@@ -708,7 +722,7 @@ COMMENTED_CODE_RE = re.compile(
         "{BODY}", BODY
     ).replace("{GEN}", GENERICS).replace("{ROOT}", ROOT).replace(
         "{DECL_TYPE}", DECL_TYPE
-    ).replace("{PROSE}", PROSE).replace("{NOS}", NO_SEMI).replace("{NOSB}", NO_SEMI_BRACE).replace(
+    ).replace("{PROSE}", PROSE).replace("{BIND}", BIND).replace("{NOS}", NO_SEMI).replace("{NOSB}", NO_SEMI_BRACE).replace(
         "{NOSE}", NO_SEMI_EQ
     ).replace("{NOSP}", NO_SEMI_PAREN).replace(
         "{ABI_FN}", abi("abifn")
@@ -6016,6 +6030,31 @@ RULE_TESTS = [
         "// *(the queue drains) = x;\n",
         set(),
         "and the target, which is where that sentence actually sits",
+    ),
+    (
+        "// let ref stale = String::new();\n",
+        {("CH001", 1)},
+        "a binding mode may sit in front of the name",
+    ),
+    (
+        "// let ref mut stale = String::new();\n",
+        {("CH001", 1)},
+        "in that order, which is the only one rustc takes",
+    ),
+    (
+        "// let ref x: String;\n",
+        {("CH001", 1)},
+        "and on an uninitialized binding, which the report did not name",
+    ),
+    (
+        "// let mut ref x = 1;\n",
+        set(),
+        "but not reversed, because E0658 refuses it",
+    ),
+    (
+        "// let ref counter = the number of rows;\n",
+        set(),
+        "and the prose guard still reads the initializer",
     ),
     (
         '// #[doc = include_str!("../README.md")]\n',

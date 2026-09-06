@@ -3634,3 +3634,24 @@ puts the sentence on the left. Found while timing the first fix rather
 than by a reviewer, and cheap enough to close instead of record.
 
 Corpus effect: none, at 19311. Four fixtures, two of them refusals.
+
+Round 120 -- the binding mode in front of a name.
+
+`// let ref stale = String::new();` and the `ref mut` form produced no
+CH001. The rule read an optional `mut` and nothing else.
+
+Asking which OTHER rules read a binding found the third form the report
+did not name: `// let ref x: String;` is valid Rust, and the
+uninitialized rule was missing it for the same reason. Both read one
+`BIND` fragment now.
+
+The order is fixed, from rustc rather than from symmetry: `ref mut` is
+accepted and `mut ref` is E0658, "mutable by-reference binding", so the
+reverse stays out.
+
+The destructuring rules needed nothing, which was worth checking rather
+than assuming. `ref` binds an IDENTIFIER, so it sits inside the pattern
+-- `let (ref a, ref b) = t;` already reported -- and `let ref (a, b) = t;`
+is not Rust.
+
+Corpus effect: none, at 19311. Five fixtures, two of them refusals.
