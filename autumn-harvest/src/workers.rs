@@ -532,13 +532,46 @@ async fn transition_active_to_draining(
 /// it is corrupt.
 ///
 /// [`ShardRouter`]: crate::shard::ShardRouter
+///
+/// This is the single-shard convenience form: it assumes the row was read
+/// from the exact shard being asked about, which holds for every consumer
+/// that queries one shard's own connection (fleet health's `by_shard`, queue
+/// coverage, preflight). A cross-shard fan-out that reads a row from one
+/// shard while evaluating coverage for a *different* requested shard must
+/// use [`shard_assignments_cover_from_source`] instead — issue #1213 was a
+/// call site (`GET /workers?shard_id=`) that used this form across a fan-out
+/// and let an empty-array row registered on shard A falsely cover a request
+/// for shard B.
 #[must_use]
 pub fn shard_assignments_cover(assignments: &serde_json::Value, shard_id: i32) -> bool {
+    shard_assignments_cover_from_source(assignments, shard_id, shard_id)
+}
+
+/// Does a worker advertising `assignments`, read from `source_shard_id`,
+/// cover a caller's `requested_shard_id`?
+///
+/// The empty-array auto/legacy shape (see [`shard_assignments_cover`]) means
+/// "covers whatever shard the row was read from", so it covers the request
+/// only when `source_shard_id == requested_shard_id`. A non-empty list is the
+/// worker's own explicit claim and is evaluated by membership against
+/// `requested_shard_id` regardless of `source_shard_id` — a multi-shard
+/// worker's row is replicated identically into every shard it is assigned to,
+/// so which one it happened to be read from doesn't change what it claims
+/// (issue #1213).
+#[must_use]
+pub fn shard_assignments_cover_from_source(
+    assignments: &serde_json::Value,
+    source_shard_id: i32,
+    requested_shard_id: i32,
+) -> bool {
     assignments.as_array().is_some_and(|shards| {
-        shards.is_empty()
-            || shards
+        if shards.is_empty() {
+            source_shard_id == requested_shard_id
+        } else {
+            shards
                 .iter()
-                .any(|value| value.as_i64() == Some(i64::from(shard_id)))
+                .any(|value| value.as_i64() == Some(i64::from(requested_shard_id)))
+        }
     })
 }
 
@@ -2090,6 +2123,75 @@ mod tests {
         // A non-array is corrupt, not a legacy shape, so it covers nothing.
         assert!(!shard_assignments_cover(&serde_json::json!("0"), 0));
         assert!(!shard_assignments_cover(&serde_json::Value::Null, 0));
+    }
+
+    #[test]
+    fn shard_assignments_cover_from_source_treats_empty_as_source_relative() {
+        // Issue #1213: the auto/legacy empty shape covers "whatever shard the
+        // row was read from" -- when a cross-shard fan-out reads the row from
+        // a shard OTHER than the one the caller asked about, it must not
+        // claim to cover the request. Only a request for the row's own
+        // source shard is covered.
+        assert!(shard_assignments_cover_from_source(
+            &serde_json::json!([]),
+            0,
+            0
+        ));
+        assert!(!shard_assignments_cover_from_source(
+            &serde_json::json!([]),
+            0,
+            1
+        ));
+    }
+
+    #[test]
+    fn shard_assignments_cover_from_source_ignores_source_when_narrowed() {
+        // A non-empty list is the worker's own explicit claim and is
+        // evaluated by membership alone, regardless of which shard's table
+        // this particular row happened to be read from.
+        assert!(shard_assignments_cover_from_source(
+            &serde_json::json!([1, 2]),
+            0,
+            2
+        ));
+        assert!(!shard_assignments_cover_from_source(
+            &serde_json::json!([1, 2]),
+            0,
+            3
+        ));
+    }
+
+    #[test]
+    fn shard_assignments_cover_from_source_rejects_a_malformed_non_array_value() {
+        assert!(!shard_assignments_cover_from_source(
+            &serde_json::json!("0"),
+            0,
+            0
+        ));
+        assert!(!shard_assignments_cover_from_source(
+            &serde_json::Value::Null,
+            0,
+            0
+        ));
+    }
+
+    #[test]
+    fn shard_assignments_cover_matches_the_source_aware_predicate_at_matching_source() {
+        // `shard_assignments_cover` is the single-shard convenience form used
+        // by every consumer that already reads the row from the exact shard
+        // being asked about (fleet_health.by_shard, queue coverage,
+        // preflight): the row's source IS the request.
+        for assignments in [
+            serde_json::json!([]),
+            serde_json::json!([5]),
+            serde_json::json!([1, 2]),
+        ] {
+            assert_eq!(
+                shard_assignments_cover(&assignments, 5),
+                shard_assignments_cover_from_source(&assignments, 5, 5),
+                "diverged for {assignments:?}"
+            );
+        }
     }
 
     #[test]
