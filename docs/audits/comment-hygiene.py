@@ -1637,14 +1637,21 @@ def mark_bridges(source: str, pieces: list[Piece]) -> None:
                 continue
         attributes.add(index)
         depth = max(0, depth + text.count("[") - text.count("]"))
-        # A comment on this line is INSIDE the attribute when the attribute
-        # is still open at the end of the line. That reads both ends at
-        # once. `#[allow(dead_code)] // why` closes on its own line, so the
+        # A comment on this line is INSIDE the attribute unless the line
+        # neither began within one nor leaves one open. Both ends are read,
+        # because either alone gets a real case wrong:
+        # `#[allow(dead_code)] // why` is open at neither end, so the
         # comment is beside the attribute and is an ordinary trailing one;
-        # `#[cfg(all(/* note */` does not close, so the comment is within
-        # it, even though the line BEGAN outside. Reading only the depth at
-        # the line's start missed that second case.
-        if index in occupied and depth > 0:
+        # `#[cfg(all(/* note */` is open only at the end; `/* why */ )]` is
+        # open only at the start.
+        #
+        # This is line granularity standing in for a question about
+        # POSITION, so one case is decided the safe way rather than the
+        # right way: `)] // done` reads as inside, though the comment
+        # follows the attribute. The cost is a CH004 that goes unreported;
+        # the alternative costs a CH004 reported on correct documentation,
+        # and a Tier A false positive fails the build.
+        if index in occupied and (opened or depth > 0):
             inside.add(index)
 
     previous = -1

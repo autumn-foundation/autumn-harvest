@@ -2973,11 +2973,18 @@ still open at the END of the line. `#[allow(dead_code)] // why` closes on
 its own line, so that comment is beside the attribute; `#[cfg(all(` does
 not close, so a comment after it is within. One test, both cases.
 
-That is the second round in which line granularity has been the wrong
-grain for this question. A comment written before the CLOSER on a closing
-line -- `/* why */ )]` -- is still misread, and is recorded in #1383
-rather than left unwritten. A third finding here means giving `Piece` its
-source offset and asking the question by position.
+The first version of that read only the END, and re-testing caught it:
+`/* why */ ))]` on a CLOSING line was already handled correctly by the
+old test and would have broken. Either end alone gets a real case wrong,
+so both are read.
+
+Line granularity remains a stand-in for a question about POSITION, and
+one case is now decided the safe way rather than the right way. In
+`)] // done` the comment follows the attribute but reads as inside it,
+which costs a CH004 that goes unreported. The alternative costs a CH004
+reported on correct documentation, and a Tier A false positive fails the
+build. The trade is written where the code makes it. A third finding here
+means giving `Piece` its source offset and asking by position.
 
 `https://[` counted as a URL. An IPv6 literal is a host only when its
 bracket closes, and the tail could not close it because a `]` ends the
