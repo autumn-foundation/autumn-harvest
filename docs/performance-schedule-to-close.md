@@ -14,11 +14,13 @@ The result **confirms the doc's own suspicion on magnitude**: populating
 percentage in the committed run -- see [100,000-row plan
 choice](#100000-row-plan-choice) for why) -- corroborated by two standalone
 MVCC-bloat scripts. None of this comes close to the 20% impact floor,
-measured where a percentage is stable -- against shared-buffer-hit totals
-and heap/index page-growth, not against the `dirtied`/`written` EXPLAIN
-counters' own small base (see [Plan](#plan) for why those specifically
-are reported as absolute counts, not a floor-compared percentage). No fix
-is proposed or needed.
+measured where a percentage is stable -- against shared-buffer-hit
+totals and the combined heap-plus-index total-storage growth (+14.3%),
+not against the `dirtied`/`written` EXPLAIN counters' own small base, or
+the partial index's own page count on its own (see [Plan](#plan) and
+[Write-side cost](#write-side-cost) for why each of those specifically
+is reported as an absolute count instead of a floor-compared
+percentage). No fix is proposed or needed.
 
 **A late-round methodology fix changed several of this page's headline
 numbers substantially, including the real-drain aggregate below (from
@@ -697,6 +699,27 @@ getting a second index entry (the old entry, now dead, is not reclaimed
 without a `VACUUM`, which this script deliberately does not run between the
 before/after snapshots, matching the real window between a claim and
 whenever autovacuum next runs).
+
+**This page does not apply the 20% impact floor to the index's own
+30-to-57-page growth (+90%), and Codex review on PR #1339 caught an
+earlier revision implying it had.** A doubling reads as a large
+percentage precisely because the partial index starts small -- the same
+small-base instability the `dirtied`/`written` EXPLAIN counters have (see
+[Plan](#plan)): the identical +27-page absolute growth would read as a
+tiny percentage against a large index, or an infinite one against an
+empty index, without the real per-claim cost changing at all. The
+meaningful, stable denominator for a storage-growth floor comparison is
+the table's total on-disk footprint, heap and index combined: 280 pages
+before (250 heap + 30 index) to 320 after (263 heap + 57 index), **+14.3%**
+-- comfortably under the floor, and the number this page's opening
+summary and Measurement sections cite. The heap-only figure (+5.2%) and
+the index-only figure (+90%) are both still reported above, each labeled
+for what it measures, but neither is individually floor-compared: the
+heap figure is too small a share of the total change to be misleading on
+its own, but the index figure is exactly the kind of small-base
+percentage this page treats as informative about the mechanism (a
+doubling is a strong signal that something is being added to a small
+structure) without treating it as a cost verdict.
 
 The instrumented captures also snapshotted `pg_stat_user_tables` immediately
 before and after the real 10,000-claim headline drain -- a ~15-30-minute

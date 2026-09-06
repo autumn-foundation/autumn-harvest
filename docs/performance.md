@@ -1467,14 +1467,19 @@ from the benchmark are directly comparable.
     labels land on *different* plans for the candidate scan, so it does not
     get a clean percentage; see that page's "100,000-row plan choice"
     section), corroborated by two
-    standalone MVCC-bloat scripts, one bulk and one per-row (+5.2% both) —
+    standalone MVCC-bloat scripts, one bulk and one per-row — heap +5.2%
+    both, the partial index itself +90% (30→57 pages, a small base that
+    reads as a large percentage for the same reason the `dirtied`/`written`
+    EXPLAIN counters do below) —
     nowhere near the 20% impact floor, measured where a percentage is
-    stable (shared-buffer-hit totals and heap/index page-growth), not
-    against the `dirtied`/`written` EXPLAIN counters' own small base
-    (4→5, 2→3), which that page reports as absolute one-page-per-claim
-    counts instead of a floor-compared percentage — Codex review flagged
-    that a percentage on a base that small (+25%/+50%) is unstable and
-    would not track the real per-claim cost. Codex review
+    stable: shared-buffer-hit totals, and the combined heap-plus-index
+    total-storage growth (+14.3%, 280→320 pages), not against the
+    `dirtied`/`written` EXPLAIN counters' own small base (4→5, 2→3) or the
+    index's own page count on its own, which that page reports as absolute
+    counts instead of floor-compared percentages — Codex review flagged
+    that a percentage on a base that small (+25%/+50% dirtied/written;
+    +90% for the index alone) is unstable and would not track the real
+    per-claim cost. Codex review
     caught that the predicate text alone (a plain inline column test) is not
     the whole story: `harvest_task_queue` carries a partial index on this
     column for the timeout scanner, and the claim `UPDATE` writes a new
