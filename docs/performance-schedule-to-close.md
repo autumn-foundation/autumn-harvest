@@ -13,8 +13,12 @@ The result **confirms the doc's own suspicion on magnitude**: populating
 **+7.5% at 1,000 rows, +3.6% at 10,000** (100,000 does not get a clean
 percentage in the committed run -- see [100,000-row plan
 choice](#100000-row-plan-choice) for why) -- corroborated by two standalone
-MVCC-bloat scripts. None of this comes close to the 20% impact floor; no
-fix is proposed or needed.
+MVCC-bloat scripts. None of this comes close to the 20% impact floor,
+measured where a percentage is stable -- against shared-buffer-hit totals
+and heap/index page-growth, not against the `dirtied`/`written` EXPLAIN
+counters' own small base (see [Plan](#plan) for why those specifically
+are reported as absolute counts, not a floor-compared percentage). No fix
+is proposed or needed.
 
 **A late-round methodology fix changed several of this page's headline
 numbers substantially, including the real-drain aggregate below (from
@@ -329,6 +333,23 @@ below, where row count per page is what changes, not on a single-row
 `UPDATE`'s own write). A fixed one-page write matches a B-tree leaf-page
 insert into `harvest_task_queue_schedule_to_close_idx`.
 
+**This table's own percentages (+25% dirtied, +50% written) are real, but
+this page does not apply the 20% impact floor to them, and says so
+explicitly.** Codex review on PR #1339 flagged that computing a
+floor-comparison percentage on a base this small -- 4 dirtied buffers
+becoming 5, 2 written becoming 3 -- produces an unstable ratio that a
+change in the underlying cost would not actually explain: the identical
+absolute +1/+1 delta would read as +100% against a base of 1, or +2%
+against a base of 50, without the real per-claim cost changing at all.
+The floor this page does apply -- to the shared-buffer-hit totals in
+[Measurement](#measurement) below and to the direct heap/index
+page-growth percentages in [Write-side cost](#write-side-cost) -- is
+computed against totals large enough (tens to thousands of buffers, tens
+to hundreds of pages) for a percentage to mean something stable. The
+dirtied/written counts are reported for what they directly are -- a
+fixed one-page write per claim -- rather than converted into a
+percentage this page would then have to defend.
+
 **Separating the scan-side (row-width) contribution from the update-side
 (index-write) contribution requires reading the child node's own buffers,
 not the parent `Update` node's cumulative total.** The `Update` node's
@@ -505,6 +526,19 @@ snapshots `pg_stat_statements` afterward (artifacts, the committed run:
 **This does not exercise the headline scenario's 8 concurrent claimers** --
 see [Workload](#workload) for why, and for the same limitation in the
 sibling capability-labels and concurrency-key captures this one follows.
+
+**This snapshot's query selects only `shared_blks_hit`/`shared_blks_read`,
+not `shared_blks_dirtied`/`shared_blks_written`** -- so it is a read-side
+aggregate, even though the mechanism [Plan](#plan) establishes is a
+write (a per-claim partial-index insert). Codex review on PR #1339
+flagged this: the aggregate below cannot speak to the write-side cost
+across the whole drain, only to the read-side cost, and this page does
+not claim otherwise. The write-side conclusion instead rests on two other
+pieces of evidence that do not have this gap: the `EXPLAIN` `dirtied`/
+`written` signature above (a fixed +1/+1 per claim, confirmed at every
+depth) and the direct `pg_relation_size` index-page growth in
+[Write-side cost](#write-side-cost) below, which measures the write's
+actual storage footprint rather than a buffer-pool count of it.
 
 **A successful `claim_task()` call issues more than just
 `claim_task_query()`'s own SQL text.** After a claim succeeds, `claim_task()`
