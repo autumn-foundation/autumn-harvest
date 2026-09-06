@@ -2134,7 +2134,14 @@ mod db {
             /// Why it may not move.
             blockers: Vec<QuiescenceBlocker>,
         },
-        /// A pre-cutover step failed; the source was left untouched.
+        /// Almost always a pre-cutover step failed, leaving the source
+        /// untouched. There is one exception (issue #1317). A batch or
+        /// resume-sweep caller can also report this for an error raised
+        /// strictly AFTER the cutover already sealed the source. The record
+        /// is still resumable then, and reporting nothing would discard the
+        /// one audit trail an operator needs. `reason` says which happened.
+        /// A record in that state finishes through
+        /// `resume_incomplete_migrations`, never a retry of the batch.
         Aborted {
             /// The execution that was examined.
             execution_id: ExecutionId,
@@ -2418,7 +2425,12 @@ mod db {
                 Ok(outcome) => outcome,
                 Err(error) => MigrationOutcome::Aborted {
                     execution_id: candidate.execution_id,
-                    reason: error.to_string(),
+                    reason: format!(
+                        "migrate_execution returned an unexpected error, which can happen \
+                         after the cutover already sealed the source: {error}. Check \
+                         `harvest_shard_migrations` for this execution and run the resume \
+                         sweep if its phase is COMMITTED"
+                    ),
                 },
             };
             if matches!(outcome, MigrationOutcome::Migrated { .. }) {

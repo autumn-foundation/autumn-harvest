@@ -7504,14 +7504,18 @@ pub async fn persist_workflow_failure(
 
     // The shard the retry successor must be minted on (issue #1317). `exec_id`
     // carries its ORIGIN shard bits, which go stale the moment this row is
-    // rebalanced. `conn` is already connected to wherever the row actually
-    // lives, so its own `shard_id` column is the answer. No cross-shard
-    // resolver call is needed. Minting on the origin instead would insert the
-    // successor there with no forwarding row for its new id. It would be
-    // unreachable by every id-routed handle and API.
-    let current_shard = crate::shard_rebalance::shard_of_held_row(conn, exec_id)
-        .await
-        .unwrap_or_else(|| exec_id.shard());
+    // rebalanced. The row's own `shard_id` column is the current residence
+    // instead. Minting on the origin would insert the successor with no
+    // forwarding row for its new id, unreachable by every id-routed handle
+    // and API. When the caller already loaded `execution`, it carries the
+    // column for free. Otherwise read it off `conn`, already connected to
+    // wherever the row lives.
+    let current_shard = match execution {
+        Some(exec) => ShardId::new(exec.shard_id),
+        None => crate::shard_rebalance::shard_of_held_row(conn, exec_id)
+            .await
+            .unwrap_or_else(|| exec_id.shard()),
+    };
 
     // Pre-compute the retry plan (pure, no DB) before entering the transaction.
     let retry_plan: Option<(ExecutionId, RetryPolicy, u32, std::time::Duration)> =
