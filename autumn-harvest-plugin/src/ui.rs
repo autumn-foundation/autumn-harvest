@@ -41,7 +41,7 @@ use autumn_harvest::audit::{
     OP_WORKFLOW_CANCEL, OP_WORKFLOW_PAUSE, OP_WORKFLOW_RESET, OP_WORKFLOW_RESUME,
     OP_WORKFLOW_SIGNAL, OP_WORKFLOW_TERMINATE, SOURCE_UI, STATUS_FAILED, STATUS_SUCCEEDED,
     TARGET_BUILD_ROUTING, TARGET_DEAD_LETTER, TARGET_GATE, TARGET_SCHEDULE, TARGET_WORKFLOW,
-    insert_audit,
+    insert_audit, insert_audit_batch,
 };
 use autumn_harvest::build_routing::{
     BuildCompatEntry, BuildPolicy, BuildReachability, all_build_reachability, declare_compat,
@@ -8784,9 +8784,14 @@ async fn schedule_bulk_pause_ui(
         .await
         .unwrap_or_default();
         acted_on += updated_ids.len();
-        for id in &updated_ids {
-            let id_str = id.to_string();
-            let ar = NewAuditRecord {
+        // One multi-row insert per shard, not one round trip per updated
+        // schedule (issue #1399). Every record shares the same
+        // actor/operation/route/status/shard, so only the target id varies.
+        // `insert_audit_batch` preserves that shape exactly.
+        let id_strs: Vec<String> = updated_ids.iter().map(ToString::to_string).collect();
+        let records: Vec<NewAuditRecord<'_>> = id_strs
+            .iter()
+            .map(|id_str| NewAuditRecord {
                 actor: "ui",
                 operation: OP_SCHEDULE_PAUSE,
                 target_type: TARGET_SCHEDULE,
@@ -8798,9 +8803,9 @@ async fn schedule_bulk_pause_ui(
                 error_summary: None,
                 shard_id: Some(shard_id.as_i32()),
                 source: SOURCE_UI,
-            };
-            let _ = insert_audit(&mut conn, &ar).await;
-        }
+            })
+            .collect();
+        let _ = insert_audit_batch(&mut conn, &records).await;
     }
 
     schedule_bulk_redirect(&format!("Paused {acted_on} schedule(s)"))
@@ -8876,9 +8881,12 @@ async fn schedule_bulk_resume_ui(
         .await
         .unwrap_or_default();
         acted_on += updated_ids.len();
-        for id in &updated_ids {
-            let id_str = id.to_string();
-            let ar = NewAuditRecord {
+        // Same batching rationale as `schedule_bulk_pause_ui` above (issue
+        // #1399): one multi-row insert per shard, not one per resumed row.
+        let id_strs: Vec<String> = updated_ids.iter().map(ToString::to_string).collect();
+        let records: Vec<NewAuditRecord<'_>> = id_strs
+            .iter()
+            .map(|id_str| NewAuditRecord {
                 actor: "ui",
                 operation: OP_SCHEDULE_RESUME,
                 target_type: TARGET_SCHEDULE,
@@ -8890,9 +8898,9 @@ async fn schedule_bulk_resume_ui(
                 error_summary: None,
                 shard_id: Some(shard_id.as_i32()),
                 source: SOURCE_UI,
-            };
-            let _ = insert_audit(&mut conn, &ar).await;
-        }
+            })
+            .collect();
+        let _ = insert_audit_batch(&mut conn, &records).await;
     }
 
     schedule_bulk_redirect(&format!("Resumed {acted_on} schedule(s)"))
