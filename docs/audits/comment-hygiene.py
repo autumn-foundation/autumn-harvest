@@ -234,6 +234,12 @@ COMMENTED_CODE_RE = re.compile(
                  [\w\s:&'<>\[\](),.+;=*-]*,\s*$      #   trailing comma
             )\s*$
       | (?:pub(?:\((?:in\s+)?[\w:]+\))?\s+)?(?:struct|enum|trait|union)\s+\w+\s*(?:<[^<>]*>)?\s*[{;(]\s*$
+      # A tuple struct, whose field list is on the line and terminated. Its
+      # own alternative rather than a relaxation of the one above, which is
+      # what this file's guidance asks for: the name is still anchored hard
+      # against `struct`, and the line must end at the `;`.
+      | (?:pub(?:\((?:in\s+)?[\w:]+\))?\s+)?(?:struct|union)\s+\w+\s*(?:<[^<>]*>)?
+            \s*\([^;{]*\)\s*;\s*$
       | (?:pub(?:\((?:in\s+)?[\w:]+\))?\s+)?mod\s+\w+\s*[{;]\s*$
       | (?:pub(?:\((?:in\s+)?[\w:]+\))?\s+)?(?:const|static)\s+(?:mut\s+)?\w+\s*:[^;=]+=.*[;{]\s*$
       | (?:pub(?:\((?:in\s+)?[\w:]+\))?\s+)?type\s+\w+\s*(?:<[^<>]*>)?\s*=
@@ -2007,7 +2013,12 @@ def check_prose_rules(path: str, pieces: list[Piece]) -> list[Finding]:
             if not sentence:
                 continue
             lineno = line_of(spans, offset)
-            if NARRATIVE_RE.search(sentence):
+            # Blanked for CH003, as CH002 blanks them, and for the same
+            # reason: both are absolute. "Parse the `let's` token" documents
+            # a literal, and failing the build on it stops the literal being
+            # documented. CH006 still reads the raw text -- it is ratcheted,
+            # and KNOWN LIMITATIONS records that choice.
+            if NARRATIVE_RE.search(blank_code_spans(sentence)):
                 findings.append(Finding("CH003", path, lineno, sentence[:100]))
             words = sentence.split()
             if len(words) > MAX_SENTENCE_WORDS:
@@ -3247,6 +3258,16 @@ RULE_TESTS = [
         {("CH007", 1)},
         "but a banner rule in a // comment underlines nothing",
     ),
+    (
+        "/// Parse the `let's` token from the input.\n",
+        {("CH006", 1)},
+        "a narrative phrase inside a code span is a literal",
+    ),
+    (
+        "// Actually, let's just skip the retry here.\n",
+        {("CH003", 1), ("CH006", 1)},
+        "and outside one it is still deliberation",
+    ),
 ]
 
 
@@ -3346,6 +3367,12 @@ CODE_SHAPE_TESTS = [
     ("let s: &'a [u8];", True),
     # The hyphen those admit is `->` and nothing else.
     ("let a::b is re-exported for callers;", False),
+    # Tuple structs, whose field list sits on the line.
+    ("struct CountingLayer(Arc<Mutex<u64>>);", True),
+    ("struct Wrapper(u8);", True),
+    ("pub struct Foo<T>(T, T);", True),
+    ("struct fields are described below;", False),
+    ("struct (or enum) definitions live here;", False),
 ]
 
 

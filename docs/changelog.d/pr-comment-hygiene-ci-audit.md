@@ -1670,3 +1670,26 @@ quietly stopped the tool measuring real prose — and twice the corpus diff was
 the only thing that noticed.
 
 Corpus effect: none, once limited.
+
+### Round fifty-three — a tuple struct, and the second absolute rule to blank code spans
+
+Two findings, neither in the Markdown block layer, both fixed.
+
+**A tuple struct is a declaration.** The item-header alternative accepted `(`
+only where it ended the line, so `struct CountingLayer(Arc<Mutex<u64>>);` — an
+ordinary form, and one this repository writes throughout — passed the absolute
+gate. It gets its own narrowly-anchored alternative rather than a relaxation of
+the existing one, which is what this file's own guidance asks for: the name
+stays anchored against `struct`, the field list may not contain a brace or a
+semicolon, and the line must end at the terminator. `struct fields are
+described below;` and `struct (or enum) definitions live here;` still read as
+prose.
+
+**CH003 blanks inline code spans, as CH002 does.** ``Parse the `let's` token``
+failed the narrative-aside rule, so a literal containing a narrative phrase
+could not be documented. The two rules that fail the build outright now agree
+on this; CH005 and CH006 still read the raw text, because they are ratcheted,
+and the KNOWN LIMITATIONS entry already records that split. `// Actually,
+let's just skip the retry here.` still reports.
+
+Corpus effect: none.
