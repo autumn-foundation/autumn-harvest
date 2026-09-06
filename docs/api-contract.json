@@ -9234,6 +9234,10 @@
         {
           "status": 500,
           "description": "Database error."
+        },
+        {
+          "status": 503,
+          "description": "The business id could not be resolved: an expected shard has no pool in this process, or its connection could not be acquired. The resolver fails closed with 503 rather than reporting a false 404, so retry once the shard is reachable."
         }
       ]
     },
@@ -9294,6 +9298,10 @@
           "description": "Invalid wait duration."
         },
         {
+          "status": 400,
+          "description": "Malformed query string: a percent-encoded byte sequence in the query does not decode to valid UTF-8."
+        },
+        {
           "status": 404,
           "description": "No run for (workflow_name, workflow_id)."
         },
@@ -9302,10 +9310,9 @@
           "description": "Database or listener error."
         },
         {
-          "status": 400,
-          "description": "Malformed query string: a percent-encoded byte sequence in the query does not decode to valid UTF-8."
+          "status": 503,
+          "description": "The business id could not be resolved: an expected shard has no pool in this process, or its connection could not be acquired. The resolver fails closed with 503 rather than reporting a false 404, so retry once the shard is reachable."
         }
-
       ]
     },
     {
@@ -9348,6 +9355,10 @@
         {
           "status": 500,
           "description": "Database error."
+        },
+        {
+          "status": 503,
+          "description": "The business id could not be resolved: an expected shard has no pool in this process, or its connection could not be acquired. The resolver fails closed with 503 rather than reporting a false 404, so retry once the shard is reachable."
         }
       ]
     },
@@ -9416,6 +9427,10 @@
       },
       "error_responses": [
         {
+          "status": 400,
+          "description": "Malformed query string: a percent-encoded byte sequence in the query does not decode to valid UTF-8."
+        },
+        {
           "status": 404,
           "description": "No run for (workflow_name, workflow_id)."
         },
@@ -9424,10 +9439,9 @@
           "description": "Database error."
         },
         {
-          "status": 400,
-          "description": "Malformed query string: a percent-encoded byte sequence in the query does not decode to valid UTF-8."
+          "status": 503,
+          "description": "The business id could not be resolved: an expected shard has no pool in this process, or its connection could not be acquired. The resolver fails closed with 503 rather than reporting a false 404, so retry once the shard is reachable."
         }
-
       ]
     },
     {
@@ -9507,6 +9521,10 @@
         {
           "status": 500,
           "description": "Database error."
+        },
+        {
+          "status": 503,
+          "description": "The business id could not be resolved: an expected shard has no pool in this process, or its connection could not be acquired. The resolver fails closed with 503 rather than reporting a false 404, so retry once the shard is reachable."
         }
       ]
     },
@@ -9709,6 +9727,10 @@
         {
           "status": 500,
           "description": "Database error."
+        },
+        {
+          "status": 503,
+          "description": "The business id could not be resolved: an expected shard has no pool in this process, or its connection could not be acquired. The resolver fails closed with 503 rather than reporting a false 404, so retry once the shard is reachable."
         }
       ]
     },
@@ -9782,6 +9804,10 @@
         {
           "status": 500,
           "description": "Database error."
+        },
+        {
+          "status": 503,
+          "description": "The business id could not be resolved: an expected shard has no pool in this process, or its connection could not be acquired. The resolver fails closed with 503 rather than reporting a false 404, so retry once the shard is reachable."
         }
       ]
     },
@@ -9840,6 +9866,10 @@
         {
           "status": 500,
           "description": "Database error."
+        },
+        {
+          "status": 503,
+          "description": "The business id could not be resolved: an expected shard has no pool in this process, or its connection could not be acquired. The resolver fails closed with 503 rather than reporting a false 404, so retry once the shard is reachable."
         }
       ]
     }

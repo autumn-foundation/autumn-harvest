@@ -29,6 +29,11 @@ by a helper is not followed, so this audit is a floor rather than a proof. The
 finding text names the source line, since a status can reach a route through a
 helper it shares.
 
+Second known limit: only a literal `StatusCode::` is read. An `AutumnError`
+constructor carries an implied status with no such token, so
+`service_unavailable_msg` and its siblings are invisible here. Issue #1411
+tracks extending this check to them.
+
 Exit code 1 on any finding. Run standalone:
 
     python3 docs/audits/openapi-response-coverage.py

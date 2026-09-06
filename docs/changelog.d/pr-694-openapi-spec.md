@@ -128,6 +128,9 @@ against routes reverse-engineered from prose.
 - `POST /workflows/{name}/start` reads an `Idempotency-Key` request header that
   wins over the body field, and is the only way to recover an already-committed
   start when the body is malformed. It was undeclared.
+- The whole by-id family resolves a business id before delegating, and the
+  resolver fails closed with `503` when an expected shard has no pool or cannot
+  be reached. Ten routes never declared it.
 - `PATCH /tasks/{id}` has been mounted and audited since issue #249, but was
   missing from `management_api_routes()` and from the contract. It was
   therefore invisible to every existing guard, to the CLI coverage test, and to

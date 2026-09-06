@@ -7531,6 +7531,17 @@
                 }
               }
             }
+          },
+          "503": {
+            "description": "The business id could not be resolved: an expected shard has no pool in this process, or its connection could not be acquired. The resolver fails closed with 503 rather than reporting a false 404, so retry once the shard is reachable.",
+            "headers": {
+              "X-Harvest-Execution-Id": {
+                "description": "The execution id this call resolved to. Stamped on every response the delegate returns, success or error. Absent when resolution itself failed, so a 404 for an unknown (workflow_name, workflow_id) does not carry it.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
           }
         },
         "summary": "Describe the current run for a business (workflow_name, workflow_id).",
@@ -7642,6 +7653,17 @@
           },
           "500": {
             "description": "Database error.",
+            "headers": {
+              "X-Harvest-Execution-Id": {
+                "description": "The execution id this call resolved to. Stamped on every response the delegate returns, success or error. Absent when resolution itself failed, so a 404 for an unknown (workflow_name, workflow_id) does not carry it.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "The business id could not be resolved: an expected shard has no pool in this process, or its connection could not be acquired. The resolver fails closed with 503 rather than reporting a false 404, so retry once the shard is reachable.",
             "headers": {
               "X-Harvest-Execution-Id": {
                 "description": "The execution id this call resolved to. Stamped on every response the delegate returns, success or error. Absent when resolution itself failed, so a 404 for an unknown (workflow_name, workflow_id) does not carry it.",
@@ -7786,6 +7808,17 @@
                 }
               }
             }
+          },
+          "503": {
+            "description": "The business id could not be resolved: an expected shard has no pool in this process, or its connection could not be acquired. The resolver fails closed with 503 rather than reporting a false 404, so retry once the shard is reachable.",
+            "headers": {
+              "X-Harvest-Execution-Id": {
+                "description": "The execution id this call resolved to. Stamped on every response the delegate returns, success or error. Absent when resolution itself failed, so a 404 for an unknown (workflow_name, workflow_id) does not carry it.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
           }
         },
         "summary": "List child executions of the current run for a business (workflow_name, workflow_id).",
@@ -7909,6 +7942,17 @@
           },
           "500": {
             "description": "Database error.",
+            "headers": {
+              "X-Harvest-Execution-Id": {
+                "description": "The execution id this call resolved to. Stamped on every response the delegate returns, success or error. Absent when resolution itself failed, so a 404 for an unknown (workflow_name, workflow_id) does not carry it.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "The business id could not be resolved: an expected shard has no pool in this process, or its connection could not be acquired. The resolver fails closed with 503 rather than reporting a false 404, so retry once the shard is reachable.",
             "headers": {
               "X-Harvest-Execution-Id": {
                 "description": "The execution id this call resolved to. Stamped on every response the delegate returns, success or error. Absent when resolution itself failed, so a 404 for an unknown (workflow_name, workflow_id) does not carry it.",
@@ -8272,6 +8316,17 @@
                 }
               }
             }
+          },
+          "503": {
+            "description": "The business id could not be resolved: an expected shard has no pool in this process, or its connection could not be acquired. The resolver fails closed with 503 rather than reporting a false 404, so retry once the shard is reachable.",
+            "headers": {
+              "X-Harvest-Execution-Id": {
+                "description": "The execution id this call resolved to. Stamped on every response the delegate returns, success or error. Absent when resolution itself failed, so a 404 for an unknown (workflow_name, workflow_id) does not carry it.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
           }
         },
         "summary": "Compact terminal result for the current run of a business (workflow_name, workflow_id).",
@@ -8357,6 +8412,17 @@
           },
           "500": {
             "description": "Database error.",
+            "headers": {
+              "X-Harvest-Execution-Id": {
+                "description": "The execution id this call resolved to. Stamped on every response the delegate returns, success or error. Absent when resolution itself failed, so a 404 for an unknown (workflow_name, workflow_id) does not carry it.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "The business id could not be resolved: an expected shard has no pool in this process, or its connection could not be acquired. The resolver fails closed with 503 rather than reporting a false 404, so retry once the shard is reachable.",
             "headers": {
               "X-Harvest-Execution-Id": {
                 "description": "The execution id this call resolved to. Stamped on every response the delegate returns, success or error. Absent when resolution itself failed, so a 404 for an unknown (workflow_name, workflow_id) does not carry it.",
@@ -8505,6 +8571,17 @@
                 }
               }
             }
+          },
+          "503": {
+            "description": "The business id could not be resolved: an expected shard has no pool in this process, or its connection could not be acquired. The resolver fails closed with 503 rather than reporting a false 404, so retry once the shard is reachable.",
+            "headers": {
+              "X-Harvest-Execution-Id": {
+                "description": "The execution id this call resolved to. Stamped on every response the delegate returns, success or error. Absent when resolution itself failed, so a 404 for an unknown (workflow_name, workflow_id) does not carry it.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
           }
         },
         "summary": "Send a named signal to the current run of a business (workflow_name, workflow_id).",
@@ -8572,6 +8649,17 @@
           },
           "500": {
             "description": "Database error.",
+            "headers": {
+              "X-Harvest-Execution-Id": {
+                "description": "The execution id this call resolved to. Stamped on every response the delegate returns, success or error. Absent when resolution itself failed, so a 404 for an unknown (workflow_name, workflow_id) does not carry it.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "The business id could not be resolved: an expected shard has no pool in this process, or its connection could not be acquired. The resolver fails closed with 503 rather than reporting a false 404, so retry once the shard is reachable.",
             "headers": {
               "X-Harvest-Execution-Id": {
                 "description": "The execution id this call resolved to. Stamped on every response the delegate returns, success or error. Absent when resolution itself failed, so a 404 for an unknown (workflow_name, workflow_id) does not carry it.",
