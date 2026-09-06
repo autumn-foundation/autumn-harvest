@@ -263,12 +263,17 @@ BODY = r"(?:\{(?:.*\})?)"
 # and counting levels only moves the gap one level out, which is how this
 # review has generated its own findings before.
 #
-# So the list is bounded by what CANNOT appear inside one instead: a `;` or
-# a `{` ends the declaration. The greedy run then backtracks to the `>`
-# that the surrounding anchor needs -- the `(` of a signature, the `=` of
-# an alias, the `{` of a body -- so `Fn(u8) -> u8` is admitted while the
-# form stays anchored on a keyword and a name.
-GENERICS = r"<[^;{]*>"
+# So the list is bounded by what CANNOT appear inside one instead: a `{`
+# ends the declaration, and so does a `;` -- unless it is the `;` of an
+# array type, which is the guard the tuple-struct and uninitialized-binding
+# alternatives have carried since round forty-one. `<T: Into<[u8; 32]>>` is
+# one list, not a declaration that ended in the middle of it.
+#
+# The greedy run then backtracks to the `>` that the surrounding anchor
+# needs -- the `(` of a signature, the `=` of an alias, the `{` of a body
+# -- so `Fn(u8) -> u8` is admitted while the form stays anchored on a
+# keyword and a name.
+GENERICS = r"<(?:[^;{]|;(?=[^;]*\]))*>"
 COMMENTED_CODE_RE = re.compile(
     r"""^(?:
         # The ABI name may carry a hyphen -- "C-unwind" and its siblings are
@@ -407,23 +412,31 @@ TODO_REF_RE = re.compile(REFERENCE)
 # guards keep "e.g." inside its sentence. The space keeps "foo.rs" and
 # "v1.2" inside a word, and keeps a QUOTED question inside its sentence --
 # the `?` of `the "Ready?" prompt` is followed by a quote, not a boundary.
-# A closing delimiter is the ambiguous case, so it is its own alternative.
-# `print "ready." See #123` ends a sentence at the quote; `the "Ready?"
-# prompt under #123` does not, and both are punctuation, quote, space. What
-# separates them is what comes NEXT: a capital opens a new sentence, a
-# lower-case word continues this one. The file's known limitations reject
-# that test for the prose SPLITTER, which must not merge two sentences when
-# the second opens with a lower-case identifier. Here it decides only the
-# case the plain rule cannot read at all, and the un-ended sentence merely
-# reaches further.
+# A sentence ends where the NEXT one STARTS, which is one rule rather than
+# a list of abbreviations. `add retries. See #123` ends at the period;
+# `retain approx. 5 retries under #123` does not, and neither does `the
+# "Ready?" prompt under #123`. What separates them is the token after the
+# space: a capital or an opening delimiter begins a sentence, and a
+# lower-case word or a digit continues this one.
 #
-# A closer may be TYPOGRAPHIC. An editor that turns "ready." into
-# \u201cready.\u201d changes nothing a reader sees and everything an ASCII
-# class matches, and this corpus already carries curly quotes and em
-# dashes.
+# The file's known limitations reject that test for the prose SPLITTER,
+# which must not merge two sentences when the second opens with a
+# lower-case identifier. Here the failure is one-sided: an un-ended
+# sentence merely reaches further, so a reference is read that might not
+# be the marker's. A cut one fails the build.
+#
+# A closer between the two -- emphasis, a quote, a bracket -- belongs to
+# the sentence it ends, and may be TYPOGRAPHIC: an editor that turns
+# "ready." into \u201cready.\u201d changes nothing a reader sees and
+# everything an ASCII class matches.
+#
+# The abbreviation guards still earn their place, for the abbreviation
+# followed by a capital that the next-token test cannot read: "use e.g.
+# Postgres for the shard" is one sentence.
 SENTENCE_END_RE = re.compile(
     r"(?<!e\.g)(?<!E\.g)(?<!i\.e)(?<!I\.e)[.!?]"
-    r"(?:[*_]*(?=\s|$)|[\"')\]\u2019\u201d\u00bb]+(?=\s+[A-Z]))"
+    r"[*_\"')\]\u2019\u201d\u00bb]*"
+    r"(?=\s+[A-Z\"'(\[\u201c\u2018]|\s*$)"
 )
 # A bracketed citation attached to the end of a sentence, as in "TODO: add
 # retries. (#123)". A citation is part of the sentence it cites, so that
@@ -4977,6 +4990,11 @@ RULE_TESTS = [
         "and may hold the parentheses of a function bound",
     ),
     (
+        "// fn stale<T: Into<[u8; 32]>>() {}\n",
+        {("CH001", 1)},
+        "and the semicolon of an array type, which ends no declaration",
+    ),
+    (
         "// impl<T: Into<Vec<u8>>> Tr<T> for R {\n",
         {("CH001", 1)},
         "on an impl as well as a function",
@@ -5298,6 +5316,21 @@ RULE_TESTS = [
         "// TODO: fix this e.g. per #123\n",
         set(),
         "nor one closing an abbreviation",
+    ),
+    (
+        "// TODO: retain approx. 5 retries under #123\n",
+        set(),
+        "nor any other abbreviation, because a digit begins no sentence",
+    ),
+    (
+        "// TODO: use e.g. Postgres for #123\n",
+        set(),
+        "and the guarded ones hold even before a capital",
+    ),
+    (
+        "// TODO: retain approx. 5 retries. See #123 for the parser.\n",
+        {("CH002", 1)},
+        "but a real next sentence still ends the marker's",
     ),
 ]
 

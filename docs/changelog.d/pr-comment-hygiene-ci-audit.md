@@ -3019,3 +3019,39 @@ and the control-flow guards are untouched. Pathological inputs were timed
 rather than assumed -- sixty unbalanced `<` return in under a millisecond.
 
 Corpus effect: none. Five fixtures, one of them a counter-case.
+
+### Round ninety-nine — a semicolon that ends nothing, a period that ends nothing
+
+Two findings, each the previous round's rule one step out.
+
+`// fn stale<T: Into<[u8; 32]>>() {}` produced no CH001. Round ninety-eight
+bounded a generic list by the `;` and `{` that end a declaration, and an
+array type carries a semicolon. The tree already had the answer: the
+tuple-struct and uninitialized-binding alternatives have used
+`;(?=[^;]*\])` since round forty-one, and the generic list uses it now.
+The sibling was in the same file, one screen away.
+
+`// TODO: retain approx. 5 retries under #123` failed the build.
+`SENTENCE_END_RE` ended the marker's sentence at `approx.`, and the
+reference sat past the cut. The guarded abbreviations were a list, and a
+list is the counted bound this review keeps punishing.
+
+So the rule is the other end instead: a sentence ends where the NEXT one
+STARTS. A capital or an opening delimiter after the space begins a
+sentence; a lower-case word or a digit continues this one. That reads
+`approx. 5`, `Fig. 3` and `v1.2` without naming any of them, and the two
+alternatives round eighty-seven and round eighty-eight added collapse into
+one.
+
+The abbreviation guards stay, for the case the next token cannot read:
+"use e.g. Postgres for the shard" is one sentence and its next token is a
+capital.
+
+The failure is one-sided, which is why the test is acceptable here and
+rejected for the prose splitter. An un-ended sentence reaches further and
+may read a reference that is not the marker's; a wrongly cut one fails
+the build.
+
+Corpus effect: none. Every CH002 fixture from rounds sixty-three to
+ninety-eight was re-run: twenty-five cases, all unchanged. Four new
+fixtures.
