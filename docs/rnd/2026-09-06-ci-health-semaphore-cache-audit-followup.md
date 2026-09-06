@@ -24,10 +24,15 @@ yesterday's report and one didn't:
   10GB cap is shared across every branch, and each of this repo's many
   concurrently open PR branches can persist its own copy of these same ~13
   names, so the true total is unknown and plausibly a multiple of 13 — see
-  Diagnosis). Still the wrong direction for the fixed-10GB-cache-budget
-  hypothesis the prior report raised, just a smaller wrong direction than
-  either report claimed, and likely an understatement in the other direction
-  too.
+  Diagnosis). **Whether this is actually the wrong direction for total bytes
+  is itself unmeasured** — a Codex review comment on this PR correctly
+  pointed out that `9ce7ce8` also moved substantial compiled output *out
+  of* the pre-existing `test` job's own 3 cache entries into the 3 new
+  ones, so those existing entries may have shrunk by roughly as much as the
+  new ones grew; entry *count* went up, but the net effect on total
+  *bytes* — the thing the 10GB cap actually measures — is unknown without
+  comparing compressed sizes before and after, which this report hasn't
+  done (see Diagnosis).
 - **Unchanged:** no sample in this report — 5/5 fresh legs today, plus 3/3
   downstream restores in §4 — found any cache at all, exact or fallback (a
   Codex review comment on this PR caught an earlier draft overgeneralizing
@@ -38,7 +43,7 @@ yesterday's report and one didn't:
   later PR runs all restored against — and still couldn't be restored 9-14
   hours on (§4).
 
-**Correction record for this PR (`#1395`):** sixteen separate Codex review
+**Correction record for this PR (`#1395`):** eighteen separate Codex review
 comments caught real problems in earlier drafts of this report:
 
 1–2. Two methodology errors in §4's cache-eviction comparison (a same-run
@@ -90,6 +95,15 @@ permission per GitHub's docs, not admin access. This also violated this
 repo's own `AGENTS.md:5-8`, which says not to diagnose a connector/tooling
 gap as an auth problem — the actual limitation is that the GitHub MCP tools
 available to this session simply have no method exposing this endpoint.
+16. One remaining conflation, in the same Treatment passage, of "cache-usage
+bytes" (a single query can give current totals) with "eviction frequency"
+(which a single query can't — the endpoint has no history, only the
+prospective-polling method §4 already established can measure it).
+17. One claim that the `test-nodb` split was "the wrong direction" for
+total cache bytes, based only on entry *count* — `9ce7ce8` also moved
+compiled output out of `test`'s own entries into the new ones, so those
+may have shrunk by about what the new ones grew, leaving the net byte
+effect genuinely unmeasured.
 
 All are fixed below, in place, with the retractions left visible rather
 than edited away.
@@ -283,11 +297,10 @@ not a new finding, but now confirmed with a sounder method.** Not a flake
 (every sampled run is green; this is deterministic, reproducible absence of
 a cache hit, not nondeterminism) and not a product bug (nothing about the
 execution engine is implicated; this is CI configuration). The `test-nodb`
-split — itself a good, already-landed, measured win — mechanically made the
-capacity problem this report is tracking somewhat bigger: it added 3 more
-distinct persisted cache entries (one per OS; the error-free upload sizes
-seen in §4 range from 150MB on a docs-only trunk-dev push to 853MB on a full
-compile) on top of roughly 10 pre-existing distinct entries (not the 09-05
+split — itself a good, already-landed, measured win — added 3 more distinct
+persisted cache entries (one per OS; the error-free upload sizes seen in §4
+range from 150MB on a docs-only trunk-dev push to 853MB on a full compile)
+on top of roughly 10 pre-existing distinct entries (not the 09-05
 report's ~19, which counted matrix legs rather than distinct keys — that
 report's own text already noted `test-db-linux`'s 10 shards share one key,
 but summed as if they didn't; a Codex review comment on this PR caught the
@@ -305,7 +318,21 @@ unknown — this report still has no cache-listing API access to measure it
 — and is very plausibly a multiple of 13, not 13 itself, which if anything
 makes the capacity hypothesis this section is arguing for *more*, not less,
 plausible. Corrected to avoid overstating a number this report can't
-actually measure. §4's
+actually measure.
+
+**Entry count isn't the same as byte count, and a Codex review comment on
+this PR correctly caught this report conflating them when calling the
+`test-nodb` split "the wrong direction."** The 10GB cap is a byte quota, not
+an entry-count quota. `9ce7ce8` didn't just add 3 entries — it also moved
+most of the compilation work `test`'s own 3 entries used to cache out into
+`test-nodb`'s new ones, so `test`'s entries plausibly shrank by something
+like what `test-nodb`'s grew by. The net effect on total stored bytes is
+genuinely unmeasured: this report has upload sizes for individual
+`test-nodb` saves (§4) but never pulled a comparable before/after size for
+`test`'s own entries, so "more entries" here does not license "more bytes,"
+and the capacity-direction claim should be read as unconfirmed rather than
+established until someone with cache-usage API access compares actual
+compressed sizes. §4's
 cross-run evidence — an apparently error-free save on the shared base
 branch, gone within 9-14 hours under the exact key three separate downstream
 PR runs restored against — remains this report's best available evidence
@@ -334,20 +361,30 @@ already corrected to avoid — restated here to match: the save raised no
 error, and three later restores against its exact key found nothing; that a
 cache entry existed and was subsequently lost is the reading consistent
 with this, not a settled fact). What's left still needs the same thing the
-09-05 report couldn't get: **actual cache-usage bytes and eviction
-frequency**, which the `GET /repos/{owner}/{repo}/actions/caches` endpoint
-can provide — and, per GitHub's own docs, needs only read-level `Actions`
-permission, not admin access (a Codex review comment on this PR caught an
-earlier draft overstating this as "admin-scoped auth," which both
-misdescribes GitHub's actual permission model and is exactly the "diagnose
-a tooling gap as an auth/token problem" mistake `AGENTS.md:5-8` says not to
-make in this repo). The real limitation is narrower and more accurate: the
-GitHub MCP tools exposed to this session have no cache-usage or
-cache-listing method at all — a tool-surface gap, not a permissions one.
-Candidate remedies for whoever has a tool that exposes this endpoint,
-updated:
+09-05 report couldn't get: **actual cache-usage bytes**, which a single
+`GET /repos/{owner}/{repo}/actions/caches` query can provide — and, per
+GitHub's own docs, needs only read-level `Actions` permission, not admin
+access (a Codex review comment on this PR caught an earlier draft
+overstating this as "admin-scoped auth," which both misdescribes GitHub's
+actual permission model and is exactly the "diagnose a tooling gap as an
+auth/token problem" mistake `AGENTS.md:5-8` says not to make in this repo).
+**Eviction frequency is a different measurement, and a Codex review comment
+on this PR correctly caught this section still conflating the two after §4
+established the distinction**: the endpoint exposes only currently-live
+entries, not an eviction history, so no single query — however well
+permissioned — can produce a frequency; that needs the same prospective
+method §4's own correction already prescribed (confirm a save immediately
+after it runs, then poll successive snapshots over time to see how long it
+survives). The real limitation on either measurement is narrower and more
+accurate than an auth problem, though: the GitHub MCP tools exposed to this
+session have no cache-usage or cache-listing method at all — a tool-surface
+gap, not a permissions one. Candidate remedies for whoever has a tool that
+exposes this endpoint, updated:
 
-1. **Confirm total bytes and eviction frequency first** (unchanged ask).
+1. **Confirm total current bytes first** (a single query suffices for
+   this); separately, **start the prospective polling** described above if
+   eviction frequency is also wanted (unchanged ask, split into its two
+   actual measurements).
 2. If confirmed capacity-bound, two earlier drafts of this remedy each
    proposed a shape Codex review comments on this PR correctly caught as
    unsound:
