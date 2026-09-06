@@ -471,7 +471,10 @@ fn forwarded_extractor_rejections_declare_their_representation() {
     let start = &doc["paths"]["/workflows/{workflow_name}/start"]["post"];
     let content = &start["responses"]["422"]["content"];
     assert!(content["application/json"].is_object(), "{content}");
-    assert_eq!(content["text/plain"]["schema"]["type"], "string", "{content}");
+    assert_eq!(
+        content["text/plain"]["schema"]["type"], "string",
+        "{content}"
+    );
 }
 
 /// A streaming route says so, and does not pretend to return JSON.
