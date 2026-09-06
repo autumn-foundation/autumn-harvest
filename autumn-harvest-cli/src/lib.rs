@@ -4669,6 +4669,21 @@ pub fn format_backup_verify_text(report: &RestoreVerifyReport) -> String {
             replay.unreadable,
             replay.unreadable
         );
+    } else if replay.unreadable > 0 {
+        // Every sample that reached this check was unreadable, and none
+        // replayed at all. This is distinct from the branch below, where
+        // nothing replayed because no handler was registered. Handlers may
+        // well BE registered here. The "register handlers" advice would
+        // send an operator chasing the wrong cause. The `history_unreadable`
+        // finding above names the actual one (a malformed, legacy, or
+        // newer-version payload; a missing row).
+        let _ = writeln!(
+            out,
+            "  replay: NOT VERIFIED — {} sampled, {} unreadable, 0 replayed. Every sampled \
+             history failed to read; see the history_unreadable finding above for the cause. \
+             Registering workflow handlers will not fix this.",
+            replay.sampled, replay.unreadable
+        );
     } else {
         let _ = writeln!(
             out,

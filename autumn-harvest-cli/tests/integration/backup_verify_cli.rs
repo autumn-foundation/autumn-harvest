@@ -410,6 +410,33 @@ fn text_output_does_not_claim_partial_coverage_when_nothing_replayed_at_all() {
     );
 }
 
+/// Issue #1205's replay-messaging fix, completed. An all-unreadable run is
+/// a distinct cause from an all-skipped one. Handlers ARE registered here;
+/// something WOULD have replayed had the histories been readable. Telling
+/// the operator to register handlers sends them chasing the wrong fix.
+#[test]
+fn text_output_does_not_blame_handlers_when_every_history_is_unreadable() {
+    let mut s = shard(Vec::new());
+    s.replay = ReplaySummary {
+        sampled: 2,
+        clean: 0,
+        divergent: 0,
+        failed: 0,
+        skipped_no_handler: 0,
+        unreadable: 2,
+    };
+    let r = RestoreVerifyReport::assemble(chrono::Utc::now(), vec![s], Vec::new());
+    let text = format_backup_verify_text(&r);
+    assert!(
+        !text.contains("Register the workflow handlers"),
+        "handlers are not the cause when nothing was skipped for lack of one: {text}"
+    );
+    assert!(
+        text.contains("unreadable"),
+        "the message must name the actual cause: {text}"
+    );
+}
+
 #[test]
 fn text_output_reports_partial_coverage_when_some_unreadable_but_others_replayed() {
     let mut s = shard(Vec::new());
