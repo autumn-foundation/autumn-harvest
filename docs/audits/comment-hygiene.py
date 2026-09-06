@@ -720,6 +720,26 @@ def row_cells(text: str, container: int) -> list[str]:
     return CELL_SPLIT_RE.split(text)
 
 
+def opens_fence(text: str, container: int) -> bool:
+    """Is `text` a valid fence OPENER that its container would accept?
+
+    Two rules, both of which `fence_delimiter` and its caller already apply
+    and neither of which the lazy-continuation test applied. A delimiter
+    sits within three columns of its container: `FENCE_RE` captures the
+    indent rather than bounding it, exactly so each caller can measure it,
+    and a caller that forgets asks an unbounded question. And a BACKTICK
+    fence's info string may hold no backtick, so "``` TODO: x` suffix." is
+    not an opener at all.
+
+    Both matter to a lazy continuation, because a line that opens no fence
+    opens no block, and Rustdoc keeps it inside the quoted paragraph.
+    """
+    match = FENCE_RE.match(text)
+    if not match or len(match.group(1).expandtabs(4)) > container + 3:
+        return False
+    return not (match.group(2).startswith("`") and "`" in text[match.end():])
+
+
 def row_cell_spans(text: str, container: int) -> list[tuple[int, int]]:
     """Where the cells of a GFM table row are, as offsets into `text`.
 
@@ -861,9 +881,8 @@ def starts_block(text: str, container: int, paragraph: bool = False) -> bool:
     """
     if not text.strip():
         return True
-    fence = FENCE_RE.match(text)
     return (
-        (bool(fence) and len(fence.group(1).expandtabs(4)) <= container + 3)
+        opens_fence(text, container)
         or heading(text, container)
         or html_block(text, container)
         or thematic_break(text, container)
@@ -1721,7 +1740,7 @@ def lazy_continuation(
         and not heading(peeled, container)
         and not html_block(peeled, container)
         and not SEPARATOR_RE.match(peeled)
-        and not FENCE_RE.match(peeled)
+        and not opens_fence(peeled, container)
     )
 
 
@@ -2071,9 +2090,14 @@ def comment_lines(pieces: list[Piece]):
                 # and nowhere else: "~~~rust `info`" is a valid opener, and
                 # rejecting it discarded the fence and reported its content.
                 backtick = delimiter[0].group(2).startswith("`")
+                # The info string is the rest of THIS piece past the
+                # delimiter, plus whatever follows a nested comment on the
+                # same line. Reading only the cross-piece tail missed the
+                # ordinary one-piece form, "```rust `info`", entirely.
+                info = delimiter[1][delimiter[0].end():] + tail
                 if (
                     fence is not None and (tail.strip() or not piece.line_end)
-                ) or (fence is None and backtick and "`" in tail):
+                ) or (fence is None and backtick and "`" in info):
                     delimiter = None
             if delimiter:
                 before = fence
@@ -2402,9 +2426,14 @@ def prose_units(pieces: list[Piece]) -> list[tuple[int, str]]:
                 # and nowhere else: "~~~rust `info`" is a valid opener, and
                 # rejecting it discarded the fence and reported its content.
                 backtick = delimiter[0].group(2).startswith("`")
+                # The info string is the rest of THIS piece past the
+                # delimiter, plus whatever follows a nested comment on the
+                # same line. Reading only the cross-piece tail missed the
+                # ordinary one-piece form, "```rust `info`", entirely.
+                info = delimiter[1][delimiter[0].end():] + tail
                 if (
                     fence is not None and (tail.strip() or not piece.line_end)
-                ) or (fence is None and backtick and "`" in tail):
+                ) or (fence is None and backtick and "`" in info):
                     delimiter = None
             if delimiter:
                 before = fence
@@ -4321,6 +4350,33 @@ RULE_TESTS = [
         "// | - | - |\n",
         set(),
         "and a // comment has no table, so the span reaches across",
+    ),
+    (
+        "/// > Explain the `literal\n"
+        "///     ``` TODO: issue required` suffix.\n",
+        set(),
+        "an over-indented delimiter opens no fence, so the quote carries on",
+    ),
+    (
+        "/// > Explain the `literal\n"
+        "/// ``` TODO: issue required` suffix.\n",
+        set(),
+        "nor does one whose info string holds a backtick",
+    ),
+    (
+        "/// > Explain the text\n"
+        "/// ```\n"
+        "/// let x = 1;\n"
+        "/// ```\n",
+        set(),
+        "but a real fence does, and exempts its own content",
+    ),
+    (
+        "/// > Explain the text\n"
+        "/// ```\n"
+        "/// TODO: issue required\n",
+        set(),
+        "including an unclosed one, which runs to the end of the run",
     ),
 ]
 

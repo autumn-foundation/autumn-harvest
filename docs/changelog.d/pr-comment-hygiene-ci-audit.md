@@ -2348,3 +2348,41 @@ makes it unnecessary.
 The deferral rule stands, and this is what it needs to be useful: the
 reasons have to be re-checked, not repeated. #1383 is corrected --
 item 5 removed, and the false claim about tables with it.
+
+### Round seventy-seven — one question asked in three places
+
+One finding reported, a Tier A false positive, and pulling on it found
+the same defect in two more places and a second defect underneath.
+
+**The reported half.** `lazy_continuation` asked `FENCE_RE.match(peeled)`
+with no container. `FENCE_RE` captures the indent rather than bounding
+it -- deliberately, so each caller measures against its own container --
+and a caller that forgets asks an unbounded question. An over-indented
+delimiter opens no fence, so Rustdoc keeps the line inside the quoted
+paragraph and the marker inside a code span. The audit cut the span and
+failed the build.
+
+**`starts_block` asked the same question and got it half right.** It
+bounded the indent and never checked the info string, so a fix to the
+lazy test alone changed nothing: the block was still cut, one clause
+further along. Both call `opens_fence` now.
+
+**And the info-string rule was reading the wrong text.** A backtick
+fence's info string may hold no backtick. The check looked only at
+`line_tail` -- the part of the line past a NESTED COMMENT -- so it caught
+"``` /* note */ `info`" and missed the ordinary one-piece form
+"```rust `info`" completely. It reads the delimiter's own remainder now,
+plus the tail. That check exists twice, in `comment_lines` and in
+`prose_units`, and the first attempt at this edit asserted a single
+match and refused to apply -- which is the only reason both got fixed.
+
+Four fixtures: the two shapes that open no fence, a real fence that does
+and exempts its content, and an unclosed one.
+
+Corpus effect: none.
+
+The lesson is the one this PR keeps relearning, in its sharpest form
+yet. Three call sites asked "does a fence open here?" and each answered
+it differently, and none of the checks in this harness can see that --
+they compare behaviour, and two wrong answers that agree on the corpus
+look exactly like one right answer.
