@@ -1,0 +1,10 @@
+label=after
+action=bulk-pause
+fixture: 300 matching schedules (workflow_name LIKE 'bulk_perf_target_%'), 200 non-matching noise schedules on the same shard
+request: POST /ui/schedules/bulk-pause target=bulk_perf_target
+acted_on=300
+audit_statement_shapes=1
+total_calls=1
+total_buffers=2503
+request_total_calls=6
+request_total_buffers=5898

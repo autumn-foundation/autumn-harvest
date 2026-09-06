@@ -3,21 +3,22 @@
 //!
 //! `schedule_bulk_pause_ui` and `schedule_bulk_resume_ui` (in
 //! `autumn-harvest-plugin/src/ui.rs`) each batch their own row selection and
-//! `UPDATE ... RETURNING id` per shard, but then audit the outcome **one row
-//! at a time**: a `for id in &updated_ids` loop calling `insert_audit` once
-//! per updated schedule. Bulk-pausing or bulk-resuming N schedules on one
-//! shard issues 1 read query + 1 batched update + N single-row audit inserts
-//! -- exactly the class of bug this repo's own performance playbook calls
-//! out: "workflow/activity bookkeeping queries that are individually trivial
-//! but collectively dominant... they will never show up in a buffer ranking,
-//! only in a `calls` ranking."
+//! `UPDATE ... RETURNING id` per shard. Then each audits the outcome **one
+//! row at a time**: a `for id in &updated_ids` loop calls `insert_audit`
+//! once per updated schedule. Bulk-pausing or bulk-resuming N schedules on
+//! one shard issues 1 read query, 1 batched update, and N single-row audit
+//! inserts. This is exactly the class of bug this repo's own performance
+//! playbook calls out: "workflow/activity bookkeeping queries that are
+//! individually trivial but collectively dominant... they will never show
+//! up in a buffer ranking, only in a `calls` ranking."
 //!
-//! The fix collects the per-row `NewAuditRecord`s into a `Vec` and issues one
-//! multi-row insert per shard via the new `audit::insert_audit_batch`. Every
-//! record in the batch shares the same actor/operation/route/status/shard;
-//! only `target_id` varies, so the batched statement is a straightforward
-//! `INSERT ... VALUES (...), (...), ...` with the identical column values
-//! `insert_audit` would have written one row at a time.
+//! The fix collects the per-row `NewAuditRecord`s into a `Vec` and issues
+//! one multi-row insert per shard via the new `audit::insert_audit_batch`.
+//! Every record in the batch shares the same actor, operation, route,
+//! status, and shard. Only `target_id` varies. So the batched statement is
+//! a straightforward `INSERT ... VALUES (...), (...), ...` with the
+//! identical column values `insert_audit` would have written one row at a
+//! time.
 //!
 //! This file is the harness + evidence generator for that investigation.
 
@@ -66,9 +67,10 @@ async fn setup_server() -> (String, DbGuard) {
     (url, Some(container))
 }
 
-/// Creates a fresh, uniquely-named, fully-migrated database off `admin_url`
-/// so this harness's fixture and `pg_stat_statements` capture cannot collide
-/// with, or be polluted by, any other test/run sharing the same server.
+/// Creates a fresh, uniquely-named, fully-migrated database off `admin_url`.
+/// This harness's fixture and `pg_stat_statements` capture then cannot
+/// collide with, or be polluted by, any other test or run on the same
+/// server.
 async fn create_fresh_db(admin_url: &str, name: &str) -> String {
     let mut admin = AsyncPgConnection::establish(admin_url)
         .await
@@ -140,12 +142,12 @@ async fn post_form(app: &HarvestUiApp, uri: &str, body: &str) -> StatusCode {
 // ── Fixture generation ──────────────────────────────────────────────────────
 
 /// Seeds `matching` schedules whose `workflow_name` contains
-/// `bulk_perf_target` (so the bulk action's `target=bulk_perf_target` filter
-/// selects exactly this set) plus `noise` unrelated, non-matching schedules
-/// on the same shard -- realistic "pause every schedule for this workflow
-/// family" operator action against a fleet that also has other schedules on
-/// it, not a database containing only the rows under test. Pure set-based
-/// SQL, not a per-row Rust loop.
+/// `bulk_perf_target`, so the bulk action's `target=bulk_perf_target`
+/// filter selects exactly this set. Also seeds `noise` unrelated,
+/// non-matching schedules on the same shard. This models a realistic
+/// "pause every schedule for this workflow family" operator action. The
+/// fleet also has other schedules on it, not just the rows under test.
+/// Pure set-based SQL, not a per-row Rust loop.
 async fn seed_fixture(conn: &mut AsyncPgConnection, matching: i64, noise: i64) {
     conn.batch_execute(&format!(
         "INSERT INTO harvest_schedules (
@@ -218,9 +220,9 @@ async fn reset_stats_for_db(conn: &mut AsyncPgConnection, db_name: &str) {
 }
 
 /// Every statement recorded for this database since the last reset, in ONE
-/// query -- see `schedule_overdue_aux_perf.rs`'s identical helper for why a
+/// query. See `schedule_overdue_aux_perf.rs`'s identical helper for why a
 /// second query against `pg_stat_statements` here would self-pollute
-/// whatever total is later computed from it (Codex review, PR #1314).
+/// whatever total this later computes from it (Codex review, PR #1314).
 async fn snapshot_statements(conn: &mut AsyncPgConnection, db_name: &str) -> Vec<StatRow> {
     diesel::sql_query(format!(
         "SELECT query, calls, shared_blks_hit, shared_blks_read, \
@@ -262,9 +264,9 @@ async fn capture_bulk_action_evidence(action: &str, label_prefix: &str) {
         .expect("seed connection");
     ensure_pg_stat_statements(&mut seed_conn).await;
 
+    seed_fixture(&mut seed_conn, MATCHING, NOISE).await;
     if action == "bulk-resume" {
         // Seed already-paused rows so bulk-resume has something to flip.
-        seed_fixture(&mut seed_conn, MATCHING, NOISE).await;
         diesel::sql_query(
             "UPDATE harvest_schedules SET is_paused = true, paused_at = NOW() \
              WHERE workflow_name LIKE 'bulk_perf_target_%'",
@@ -272,8 +274,6 @@ async fn capture_bulk_action_evidence(action: &str, label_prefix: &str) {
         .execute(&mut seed_conn)
         .await
         .expect("pre-pause matching rows for the bulk-resume scenario");
-    } else {
-        seed_fixture(&mut seed_conn, MATCHING, NOISE).await;
     }
 
     let out_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -437,10 +437,10 @@ async fn zz_capture_schedule_bulk_resume_audit_perf_evidence() {
 // ── Equivalence: batched audit insert vs. the original per-row loop ────────
 
 /// Proves `audit::insert_audit_batch` writes exactly the rows the original
-/// per-row `insert_audit` loop would have written: same columns, same values,
-/// for every id -- just in one statement instead of N. Compares against a
-/// fresh, disjoint set of target ids per call so the two code paths' rows
-/// never collide in the same table.
+/// per-row `insert_audit` loop would have written. Same columns, same
+/// values, for every id, just in one statement instead of N. Uses a fresh,
+/// disjoint set of target ids per call, so the two code paths' rows never
+/// collide in the same table.
 #[tokio::test]
 async fn insert_audit_batch_matches_per_row_insert_audit_loop() {
     use autumn_harvest::audit::{insert_audit, insert_audit_batch};
@@ -507,16 +507,25 @@ async fn insert_audit_batch_matches_per_row_insert_audit_loop() {
         .load(&mut conn)
         .await
         .expect("load batched rows");
-    assert_eq!(looped_rows.len(), 25, "every looped insert must have landed");
-    assert_eq!(batched_rows.len(), 25, "every batched insert must have landed");
+    assert_eq!(
+        looped_rows.len(),
+        25,
+        "every looped insert must have landed"
+    );
+    assert_eq!(
+        batched_rows.len(),
+        25,
+        "every batched insert must have landed"
+    );
 
-    // Compare content field-by-field (excluding `id`/`occurred_at`, which
-    // legitimately differ: `id` is a fresh UUID per row either way, and a
-    // single-statement batch insert shares one `NOW()` across its rows where
-    // N separate statements each get their own -- a disclosed, intentional
-    // side effect of batching, not a correctness gap), sorted by target_id so
-    // row order (arbitrary either way, since neither path assumes an order)
-    // doesn't cause a spurious mismatch.
+    // Compare content field-by-field, excluding `id` and `occurred_at`.
+    // Those two legitimately differ. `id` is a fresh UUID per row either
+    // way. A single-statement batch insert shares one `NOW()` across its
+    // rows, where N separate statements each get their own. That is a
+    // disclosed, intentional side effect of batching, not a correctness
+    // gap. Sort by target_id first, so row order (arbitrary either way,
+    // since neither path assumes an order) does not cause a spurious
+    // mismatch.
     looped_rows.sort_by(|a, b| a.target_id.cmp(&b.target_id));
     batched_rows.sort_by(|a, b| a.target_id.cmp(&b.target_id));
     for (looped, batched) in looped_rows.iter().zip(batched_rows.iter()) {
@@ -532,9 +541,9 @@ async fn insert_audit_batch_matches_per_row_insert_audit_loop() {
         assert_eq!(looped.source, batched.source);
     }
 
-    // Every batched row shares exactly one `occurred_at` (single-statement
-    // insert, single transaction, single `NOW()`) -- proving the batch really
-    // did land as one statement, not N autocommitted ones.
+    // Every batched row shares exactly one `occurred_at`: single-statement
+    // insert, single transaction, single `NOW()`. This proves the batch
+    // really landed as one statement, not N autocommitted ones.
     let distinct_batched_times: std::collections::BTreeSet<_> =
         batched_rows.iter().map(|r| r.occurred_at).collect();
     assert_eq!(
@@ -544,9 +553,9 @@ async fn insert_audit_batch_matches_per_row_insert_audit_loop() {
     );
 }
 
-/// `insert_audit_batch` on an empty slice must not touch the connection (an
-/// empty `VALUES` list has no `Insertable` representation) and must return an
-/// empty `Vec` rather than erroring.
+/// `insert_audit_batch` on an empty slice must not touch the connection.
+/// An empty `VALUES` list has no `Insertable` representation. It must
+/// return an empty `Vec` rather than erroring.
 #[tokio::test]
 async fn insert_audit_batch_on_empty_slice_is_a_no_op() {
     use autumn_harvest::audit::insert_audit_batch;

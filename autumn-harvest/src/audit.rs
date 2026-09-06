@@ -1429,9 +1429,9 @@ pub async fn insert_audit(
 /// Insert several audit records in one round trip. Returns the generated ids
 /// in the same order as `records`.
 ///
-/// A no-op statement is never sent for an empty slice — an empty `VALUES`
-/// list has no `Insertable` representation, so this returns `Ok(vec![])`
-/// without touching the connection.
+/// An empty slice never sends a statement. An empty `VALUES` list has no
+/// `Insertable` representation. This returns `Ok(vec![])` without touching
+/// the connection.
 ///
 /// Same durability contract as [`insert_audit`]: the caller must ensure this
 /// returns `Ok` before reporting success for every mutation it covers.
