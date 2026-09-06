@@ -3520,3 +3520,27 @@ plain `#[doc = ...]` form stopped matching and every fixture from round
 110 failed. The fixtures were the only thing that noticed.
 
 Corpus effect: none. Seven fixtures, three of them refusals.
+
+Round 116 -- an assignment's right-hand side, and a guard that does not
+transfer.
+
+`// retries = retries + 1;` produced no CH001. The rule refused all
+whitespace after the `=`, which was doing the prose guarding by refusing
+most of the language. The guard now sits where every other rule puts it,
+on the words: three bare words before the terminator are a sentence.
+
+The same widening was TRIED on `return` and `break`, to retire the
+residual round one hundred and fourteen recorded. The adversarial sweep
+refused it, with eighteen generated sentences -- "return early, before
+the lock is taken;", "break cleanup() first, then retry;".
+
+The reason is worth keeping. The three-bare-words lookahead is ANCHORED:
+it fires only when the whole tail is bare words and a `;`, so any comma,
+colon or equals walks past it. An assignment survives the widening
+because `NAME =` anchors it before the prose starts. `return` is an
+English verb with no anchor at all.
+
+So `// return [0u8; 32];` stays missed, as that round said, and the file
+now records the failed attempt rather than the bare restatement.
+
+Corpus effect: none. Five fixtures, two of them refusals.

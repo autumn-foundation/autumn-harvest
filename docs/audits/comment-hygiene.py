@@ -607,7 +607,16 @@ COMMENTED_CODE_RE = re.compile(
       | (?:\}\s*)?else\b
             (?![^;{]*\b[a-z]+\s+[a-z]+\s+[a-z]+\s+[a-z]+\b)
             (?:\s+if\b{NOS}*)?\s*\{\s*$
-      | [\w.\[\]:\#]+\s*(?:[-+*/%&|^]|<<|>>)?=\s*(?:[^\s;]|;(?=[^;]*\]))+\s*;\s*$
+      # A (compound) assignment. Its right-hand side is an EXPRESSION, and
+      # an expression has spaces in it: `retries = retries + 1;` is what
+      # people write. Refusing whitespace was doing the prose guarding, and
+      # doing it by refusing most of the language.
+      #
+      # The guard belongs where the other rules put it, on the WORDS. Three
+      # bare words before the terminator are a sentence, which is the same
+      # test the uninitialized binding and the declaration type carry.
+      | [\w.\[\]:\#]+\s*(?:[-+*/%&|^]|<<|>>)?=
+            (?!\s*(?:\w+\s+){2,}\w+\s*;\s*$)\s*{NOS}+;\s*$
       # A commented-out statement. Anchored hard: the call must open at the
       # very start, so prose that merely names a function ("call cleanup()
       # first") cannot reach it, and the line must end at the `;`. Measured
@@ -618,6 +627,22 @@ COMMENTED_CODE_RE = re.compile(
       # answers "expected a label, found an identifier" -- so sharing the
       # unrestricted form with them reported prose: "If the row is absent,"
       # wrapping onto "continue normally;" is a sentence, not a statement.
+      # `return` and `break` keep the single-token form, and round one
+      # hundred and sixteen TRIED to widen them the way the assignment
+      # above was widened. The adversarial sweep refused it: eighteen
+      # generated sentences matched, among them "return early, before the
+      # lock is taken;" and "break cleanup() first, then retry;".
+      #
+      # The three-bare-words lookahead cannot save these. It is anchored --
+      # it fires only when the whole tail is bare words and a `;` -- so any
+      # comma, colon or equals in the sentence walks straight past it. The
+      # assignment survives the same widening because `NAME =` anchors it
+      # before the prose starts; `return` is an English verb with no anchor
+      # at all.
+      #
+      # So `// return [0u8; 32];` stays missed, as round one hundred and
+      # fourteen said. Recorded here because the attempt is worth more than
+      # the restatement: this is the shape of guard that does not transfer.
       | (?:return|break)\b(?:\s+[^\s;{}]+)?\s*;\s*$
       | continue\b(?:\s+'\w+)?\s*;\s*$
       | [\w:\#]+(?:::<{NOSP}*>)?(?:\.[\w:\#]+(?:::<{NOSP}*>)?)*
@@ -5780,6 +5805,31 @@ RULE_TESTS = [
         "// if the queue is paused the worker parks {\n",
         set(),
         "but the prose lookahead is untouched by any of it",
+    ),
+    (
+        "// retries = retries + 1;\n",
+        {("CH001", 1)},
+        "an assignment's right-hand side is an expression, with spaces",
+    ),
+    (
+        "// self.count = self.count + 1;\n",
+        {("CH001", 1)},
+        "through a field as well",
+    ),
+    (
+        "// retries += retries + 1;\n",
+        {("CH001", 1)},
+        "and compounded",
+    ),
+    (
+        "// count = the number of rows;\n",
+        set(),
+        "but three bare words after the equals are a sentence",
+    ),
+    (
+        "// return early, before the lock is taken;\n",
+        set(),
+        "and return keeps one token, because that guard does not transfer",
     ),
     (
         '// #[doc = include_str!("../README.md")]\n',
