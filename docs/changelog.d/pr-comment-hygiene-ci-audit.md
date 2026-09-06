@@ -6,7 +6,7 @@ alongside the other Folio corpus harnesses, and fixes every Tier A defect it
 found across the 785 `*.rs` files (822k lines, 175k comment lines).
 
 **The design decision that shaped it.** A blanket "comments must be short"
-gate was rejected. Measured over the corpus, 17,899 comment sentences exceed
+gate was rejected. Measured over the corpus, 18,064 comment sentences exceed
 ASD-STE100's 25-word ceiling, and the longest blocks are the ones carrying
 the engine's correctness arguments — the ABBA lock-ordering proof for
 `materialize_due_child_timeout_deadlines`, the `cohort` partition-key
@@ -21,11 +21,16 @@ passes once it is written as several sentences.
 - **Tier A — absolute, at zero, a new one fails the build.** `CH001`
   commented-out code, `CH002` a TODO/FIXME/XXX/HACK with no `#<issue>` or
   URL, `CH003` a narrative aside, `CH004` a blank `//` line at a block edge.
-- **Tier B — ratcheted** against `docs/audits/comment-hygiene-baseline.json`
-  (per-file, per-rule counts; may fall freely, never rise). `CH005`
-  review-round archaeology (1,370 — "Codex round 8" is process trivia a
-  future reader cannot look up; the issue number is the durable handle),
-  `CH006` contractions (331), `CH007` sentences over 25 words (17,899).
+- **Tier B — ratcheted against the merge base**, per file and per rule, by
+  a fingerprint of the rule and the comment's normalised text. A change may
+  not ADD one to a file it touches; the legacy population stays until
+  someone chooses to fix it. There is no checked-in baseline, deliberately:
+  a stored file goes stale the moment the base branch moves, and the
+  predictable response to a spurious failure is to regenerate it, which
+  defeats the ratchet. `CH005` review-round archaeology (1,370 — "Codex
+  round 8" is process trivia a future reader cannot look up; the issue
+  number is the durable handle), `CH006` contractions (426), `CH007`
+  sentences over 25 words (18,064).
 
 **What the audit fixed** (24 Tier A sites, all comment-only):
 
