@@ -712,11 +712,11 @@ mod db {
     /// `HISTORY_UNCHANGED_SQL` closes it for appended events.
     ///
     /// `legal_hold_verified` must also be true. NULL is a valid, common
-    /// `verified_legal_hold_set_at` value -- "verified, no hold" -- so it
-    /// cannot double as "never verified by code that knows this column
-    /// exists". A rolling deploy can leave a record verified by an old
-    /// worker with the column at its default; the flag fails that record's
-    /// cutover closed instead of matching it by coincidence.
+    /// `verified_legal_hold_set_at` value: "verified, no hold". So it cannot
+    /// double as "never verified by code that knows this column exists". A
+    /// rolling deploy can leave a record verified by an old worker with the
+    /// column at its default. The flag fails that record's cutover closed
+    /// instead of matching it by coincidence.
     const LEGAL_HOLD_UNCHANGED_SQL: &str = "\
         EXISTS (SELECT 1 FROM harvest_shard_migrations m \
                  WHERE m.execution_id = e.id AND m.legal_hold_verified \
@@ -1648,11 +1648,11 @@ mod db {
         let legal_hold_set_at = read_legal_hold_set_at(source, exec_id).await?;
 
         // The window this read alone cannot close: a hold placed or released
-        // between `stage_copy`'s snapshot and THIS read is invisible here,
-        // because the staged target still carries whatever `stage_copy` saw.
+        // between `stage_copy`'s snapshot and THIS read is invisible here.
+        // The staged target still carries whatever `stage_copy` saw.
         // Comparing the live source value against the STAGED target's own
-        // copy of the same column catches exactly that drift: they must
-        // still agree, or the staged copy is stale and verification must
+        // copy of the same column catches exactly that drift. They must
+        // still agree, or the staged copy is stale. Verification must then
         // fail rather than authorize a cutover onto it.
         let staged_legal_hold_set_at = read_legal_hold_set_at(target, exec_id).await?;
         if staged_legal_hold_set_at != legal_hold_set_at {
@@ -2477,9 +2477,9 @@ mod db {
                 ),
             };
             // An `unexpected_error` can mean the source is already sealed
-            // (issue #1317): `moved` must count it, or a persistently failing
-            // target lets the batch keep drawing fresh candidates past
-            // `limit`, sealing far more than the operator asked for.
+            // (issue #1317). `moved` must count it. Otherwise a persistently
+            // failing target lets the batch keep drawing fresh candidates
+            // past `limit`, sealing far more than the operator asked for.
             if matches!(outcome, MigrationOutcome::Migrated { .. }) || unexpected_error {
                 moved += 1;
             }
@@ -2596,12 +2596,12 @@ mod db {
     ) -> HarvestResult<Vec<MigrationOutcome>> {
         let unsettled: Vec<MigrationRecord> = {
             let mut source = checkout(pool, source_shard).await?;
-            // `attempts ASC` first (issue #1317): a record whose checkout or
-            // step keeps failing accumulates attempts (below, and in the step
-            // failure path further down) and sinks behind less-tried records
-            // on the NEXT sweep, instead of permanently occupying the front
-            // of a `created_at`-only queue and starving every healthy record
-            // behind it when `limit` is small.
+            // `attempts ASC` first (issue #1317). A record whose checkout or
+            // step keeps failing accumulates attempts, below and in the step
+            // failure path further down. It then sinks behind less-tried
+            // records on the NEXT sweep. Without this, it would permanently
+            // occupy the front of a `created_at`-only queue, starving every
+            // healthy record behind it when `limit` is small.
             let rows: Vec<MigrationRow> = diesel::sql_query(format!(
                 "SELECT {MIGRATION_COLUMNS} FROM harvest_shard_migrations \
                   WHERE phase NOT IN ('DONE', 'ABORTED') \
@@ -2639,11 +2639,11 @@ mod db {
                     // Best-effort: bumps `attempts` so the ORDER BY above sinks
                     // this record behind less-tried ones on the next sweep.
                     // `record.source_shard` is usually the same pool already
-                    // used to read this record's own table, so a fresh
-                    // checkout of it typically succeeds even when the
-                    // record's TARGET is what is actually unavailable. If
-                    // this checkout also fails, there is nothing to record
-                    // to, and the record is left for the next sweep as-is.
+                    // used to read this record's own table. A fresh checkout
+                    // of it typically succeeds even when the record's TARGET
+                    // is what is actually unavailable. If this checkout also
+                    // fails, there is nothing to record to. The record is
+                    // left for the next sweep as-is.
                     if let Ok(mut source) = checkout(pool, record.source_shard).await {
                         let _ = record_attempt(&mut source, exec_id, &reason).await;
                     }

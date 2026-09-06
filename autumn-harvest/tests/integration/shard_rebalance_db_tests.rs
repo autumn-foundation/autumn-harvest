@@ -939,9 +939,9 @@ async fn the_sql_cutover_predicate_agrees_with_the_pure_predicate() {
         // recorded. Stamp it from the live history so this test exercises the
         // quiescence half in isolation, which is what it is here to pin.
         // `legal_hold_verified` must also be stamped, exactly as
-        // `verify_target_copy` would for an execution with no hold, or the
-        // cutover's `LEGAL_HOLD_UNCHANGED_SQL` guard fails closed regardless
-        // of quiescence -- this test pins the quiescence half in isolation.
+        // `verify_target_copy` would for an execution with no hold. Otherwise
+        // the cutover's `LEGAL_HOLD_UNCHANGED_SQL` guard fails closed
+        // regardless of quiescence, the half this test is here to pin.
         diesel::sql_query(
             "UPDATE harvest_shard_migrations m SET phase = 'VERIFIED', \
                  verified_event_count = (SELECT count(*) FROM harvest_events ev \
@@ -2635,14 +2635,14 @@ async fn a_hold_released_after_verification_also_refuses_the_cutover() {
 
 #[tokio::test]
 async fn a_hold_placed_between_staging_and_verification_fails_verification() {
-    // Codex round 1 on PR #1406: a hold placed after `stage_copy`'s snapshot
-    // but BEFORE `verify_target_copy` runs is a narrower window than the two
-    // tests above, and the stamp-only fix does not close it -- verification
-    // would read the NEW hold value, stamp it, and the cutover guard would
-    // then compare the live value to that same stamp and match, sealing a
-    // source whose target copy still holds the pre-hold columns. Verification
-    // must compare the source's current value against what was actually
-    // staged on the target, not merely record whatever the source shows now.
+    // Issue #1317: a hold placed after `stage_copy`'s snapshot but BEFORE
+    // `verify_target_copy` runs is a narrower window than the two tests
+    // above. A stamp-only fix does not close it. Verification would read the
+    // NEW hold value and stamp it. The cutover guard would then compare the
+    // live value to that same stamp and match. That seals a source whose
+    // target copy still holds the pre-hold columns. Verification must
+    // compare the source's current value against what was actually staged on
+    // the target, not merely record whatever the source shows now.
     let shards = setup_two_shards().await;
     let exec_id = quiescent_fixture(&shards, "hold-between-stage-and-verify").await;
     let (mut source, mut target) = (shards.source().await, shards.target().await);
@@ -2684,9 +2684,14 @@ async fn a_hold_placed_between_staging_and_verification_fails_verification() {
 
     // The recovery path: abort and restage, which snapshots the row WITH the
     // hold this time, so the second attempt verifies and cuts over clean.
-    abort_migration(&mut source, &mut target, exec_id, "hold arrived mid-staging")
-        .await
-        .expect("abort");
+    abort_migration(
+        &mut source,
+        &mut target,
+        exec_id,
+        "hold arrived mid-staging",
+    )
+    .await
+    .expect("abort");
     begin_migration(&mut source, exec_id, SOURCE, TARGET)
         .await
         .expect("begin again");
@@ -2706,9 +2711,9 @@ async fn a_hold_placed_between_staging_and_verification_fails_verification() {
 
 #[tokio::test]
 async fn a_legacy_verified_record_with_no_hold_snapshot_refuses_the_cutover() {
-    // Codex round 1 on PR #1406: `verified_legal_hold_set_at IS NOT DISTINCT
-    // FROM` alone treats a NULL stamp (never checked) the same as a NULL
-    // stamp meaning "checked, no hold" -- indistinguishable by value once a
+    // Issue #1317: `verified_legal_hold_set_at IS NOT DISTINCT FROM` alone
+    // treats a NULL stamp (never checked) the same as a NULL stamp meaning
+    // "checked, no hold". The two are indistinguishable by value once a
     // rolling deploy leaves a record verified by code that predates this
     // column. `legal_hold_verified` must be required too, so such a record
     // fails the cutover guard closed rather than matching by coincidence.
@@ -2726,8 +2731,8 @@ async fn a_legacy_verified_record_with_no_hold_snapshot_refuses_the_cutover() {
         .await
         .expect("verify");
 
-    // Simulate a record verified by code that predates `legal_hold_verified`:
-    // the flag reverts to its column default even though the record is
+    // Simulate a record verified by code that predates `legal_hold_verified`.
+    // The flag reverts to its column default even though the record is
     // otherwise VERIFIED with a matching (NULL) hold stamp.
     diesel::sql_query(
         "UPDATE harvest_shard_migrations SET legal_hold_verified = FALSE WHERE execution_id = $1",
