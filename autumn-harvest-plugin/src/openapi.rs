@@ -517,8 +517,7 @@ fn responses(route: &Value) -> Result<Value, OpenApiError> {
     let media_type = success["content_type"]
         .as_str()
         .unwrap_or(DEFAULT_MEDIA_TYPE);
-    // A 204 carries no body at all.
-    if status != 204 {
+    if !is_bodiless(status) {
         bodies.insert(
             status,
             json!({ media_type: { "schema": success_schema(success, media_type) } }),
@@ -543,7 +542,17 @@ fn responses(route: &Value) -> Result<Value, OpenApiError> {
                 || response["fields"]
                     .as_array()
                     .is_some_and(|fields| !fields.is_empty());
-            if documents_a_body && code != 204 && !bodies.contains_key(&code) {
+            // An `additional_responses` entry is an alternate outcome the route
+            // really returns, so it must say what its body is. A bodiless
+            // status is the one exception. `error_responses` stay
+            // description-only.
+            if key == "additional_responses" && !documents_a_body && !is_bodiless(code) {
+                return Err(OpenApiError(format!(
+                    "{method} {path}: the {code} response declares no body. Add `fields`, \
+                     or `free_form` when the shape is polymorphic"
+                )));
+            }
+            if documents_a_body && !is_bodiless(code) && !bodies.contains_key(&code) {
                 let media_type = response["content_type"]
                     .as_str()
                     .unwrap_or(DEFAULT_MEDIA_TYPE);
@@ -575,6 +584,11 @@ fn responses(route: &Value) -> Result<Value, OpenApiError> {
         out.insert(code.to_string(), Value::Object(response));
     }
     Ok(Value::Object(out))
+}
+
+/// Statuses that carry no body, whatever the route does.
+const fn is_bodiless(status: u64) -> bool {
+    matches!(status, 204 | 205 | 304)
 }
 
 /// Response headers a caller can read, from `headers` on a response entry.
@@ -892,6 +906,32 @@ mod tests {
                 .is_object(),
             "{responses}"
         );
+    }
+
+    #[test]
+    fn an_additional_response_with_no_body_is_rejected() {
+        let route = json!({
+            "method": "GET",
+            "path": "/x",
+            "success_response": { "status": 200, "free_form": true },
+            "additional_responses": [{ "status": 409, "description": "Failed." }],
+            "error_responses": [],
+        });
+        let error = responses(&route).expect_err("a bodiless alternate must fail");
+        assert!(error.to_string().contains("declares no body"), "{error}");
+    }
+
+    #[test]
+    fn an_additional_204_needs_no_body() {
+        let route = json!({
+            "method": "GET",
+            "path": "/x",
+            "success_response": { "status": 200, "free_form": true },
+            "additional_responses": [{ "status": 204, "description": "Still running." }],
+            "error_responses": [],
+        });
+        let responses = responses(&route).expect("a 204 alternate is fine");
+        assert!(responses["204"]["content"].is_null());
     }
 
     #[test]

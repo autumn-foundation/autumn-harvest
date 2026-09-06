@@ -88,6 +88,13 @@ against routes reverse-engineered from prose.
 - `X-Harvest-Execution-Id` is stamped by `finalize_by_id` on delegated errors
   as well as successes, so it moved to a route-level `response_headers` list
   and now appears on every documented response of the by-id family.
+- The `202` and `409` of `GET /workflows/{id}/update/{update_id}/result`
+  documented no body, though the handler returns one for both. The transform
+  now refuses an alternate response that declares neither a body nor a bodiless
+  status.
+- Five alternate success responses said "same fields as the primary" in prose.
+  They now carry the field list itself, so a generated client keeps
+  `execution_id` on a reused start.
 - `PATCH /tasks/{id}` has been mounted and audited since issue #249, but was
   missing from `management_api_routes()` and from the contract. It was
   therefore invisible to every existing guard, to the CLI coverage test, and to
@@ -126,7 +133,7 @@ and it found `PATCH /tasks/{id}`.
 `contract_marks_a_mandatory_json_body_required` fails when a handler extracts a
 bare `Json<T>` and the contract calls its body optional.
 
-`openapi.rs` holds 18 unit tests for the transform edges. A missing `required`
+`openapi.rs` holds 20 unit tests for the transform edges. A missing `required`
 flag on a parameter or a body is rejected. A read method with a body is
 rejected. A colliding `operationId` is rejected. A non-string note is rejected.
 An empty body list publishes no request body. A free-form body keeps its

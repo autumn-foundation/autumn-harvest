@@ -1224,8 +1224,24 @@
       "additional_responses": [
         {
           "status": 200,
-          "description": "An existing execution was returned instead of a new one being created (reuse_policy, or conflict_policy use_existing). Same fields as the 201.",
-          "free_form": true
+          "description": "An existing execution was returned instead of a new one being created (reuse_policy, or conflict_policy use_existing).",
+          "fields": [
+            "execution_id",
+            "workflow_name",
+            "workflow_id",
+            "state",
+            "debounced",
+            "debounce_key",
+            "fire_at",
+            "pending_count",
+            "batched",
+            "flushed",
+            "batch_key",
+            "max_size",
+            "started_fresh",
+            "deduplicated",
+            "shard_id"
+          ]
         }
       ],
       "error_responses": [
@@ -1341,8 +1357,15 @@
       "additional_responses": [
         {
           "status": 200,
-          "description": "An existing live execution was signaled instead of a fresh one being started. Same fields as the 201.",
-          "free_form": true
+          "description": "An existing live execution was signaled instead of a fresh one being started.",
+          "fields": [
+            "execution_id",
+            "workflow_name",
+            "workflow_id",
+            "state",
+            "started_fresh",
+            "signal_delivered"
+          ]
         }
       ],
       "error_responses": [
@@ -1483,8 +1506,30 @@
       "additional_responses": [
         {
           "status": 200,
-          "description": "An existing live execution was attached instead of a fresh one being started. Same fields as the 201.",
-          "free_form": true
+          "description": "An existing live execution was attached instead of a fresh one being started.",
+          "fields": [
+            {
+              "name": "execution_id"
+            },
+            {
+              "name": "workflow_name"
+            },
+            {
+              "name": "workflow_id"
+            },
+            {
+              "name": "state"
+            },
+            {
+              "name": "started_fresh"
+            },
+            {
+              "name": "update_id"
+            },
+            {
+              "name": "result"
+            }
+          ]
         }
       ],
       "error_responses": [
@@ -2254,8 +2299,14 @@
       "additional_responses": [
         {
           "status": 200,
-          "description": "outcome is not_failed: the delivery was not in a failed state, so nothing was redriven. Same fields as the 202.",
-          "free_form": true
+          "description": "outcome is not_failed: the delivery was not in a failed state, so nothing was redriven.",
+          "fields": [
+            "ok",
+            "execution_id",
+            "delivery_id",
+            "outcome",
+            "current_state"
+          ]
         }
       ],
       "error_responses": [
@@ -2646,11 +2697,40 @@
       "additional_responses": [
         {
           "status": 202,
-          "description": "Update admitted but not yet completed (still in-flight)."
+          "description": "Update admitted but not yet completed (still in-flight).",
+          "fields": [
+            {
+              "name": "update_id",
+              "type": "string",
+              "description": "The admitted update id."
+            }
+          ]
         },
         {
           "status": 409,
-          "description": "Update failed or was rejected by the handler."
+          "description": "Update failed, was rejected by the handler, or was orphaned by a terminal workflow. A rejected update carries error; an orphaned one carries error_type and workflow_state instead.",
+          "fields": [
+            {
+              "name": "update_id",
+              "type": "string",
+              "description": "The update id."
+            },
+            {
+              "name": "error",
+              "type": "string",
+              "description": "Handler failure or rejection message. Absent on an orphaned update."
+            },
+            {
+              "name": "error_type",
+              "type": "string",
+              "description": "Orphan classification. Present only when the workflow reached a terminal state first."
+            },
+            {
+              "name": "workflow_state",
+              "type": "string",
+              "description": "The terminal workflow state that orphaned the update."
+            }
+          ]
         }
       ],
       "error_responses": [
@@ -2880,7 +2960,32 @@
         {
           "status": 200,
           "description": "dry_run was true. The plan is returned and nothing is written; new_run_exec_id and events_carried_over are omitted.",
-          "free_form": true
+          "fields": [
+            {
+              "name": "dry_run",
+              "description": "True for a dry-run preview."
+            },
+            {
+              "name": "dag_name",
+              "description": "The DAG name."
+            },
+            {
+              "name": "source_run_exec_id",
+              "description": "The source DAG run execution id."
+            },
+            {
+              "name": "reset_to_event_id",
+              "description": "Resolved 0-based reset event id passed to the #148 reset."
+            },
+            {
+              "name": "nodes_to_re_execute",
+              "description": "Nodes that will re-execute on the new run."
+            },
+            {
+              "name": "nodes_carried_over",
+              "description": "Nodes whose recorded results are carried over."
+            }
+          ]
         }
       ],
       "error_responses": [

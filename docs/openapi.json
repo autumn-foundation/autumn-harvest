@@ -5539,7 +5539,27 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "description": "Shape is documented in the response description, not as a schema."
+                  "properties": {
+                    "dag_name": {
+                      "description": "The DAG name."
+                    },
+                    "dry_run": {
+                      "description": "True for a dry-run preview."
+                    },
+                    "nodes_carried_over": {
+                      "description": "Nodes whose recorded results are carried over."
+                    },
+                    "nodes_to_re_execute": {
+                      "description": "Nodes that will re-execute on the new run."
+                    },
+                    "reset_to_event_id": {
+                      "description": "Resolved 0-based reset event id passed to the #148 reset."
+                    },
+                    "source_run_exec_id": {
+                      "description": "The source DAG run execution id."
+                    }
+                  },
+                  "type": "object"
                 }
               }
             },
@@ -9058,11 +9078,18 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "description": "Shape is documented in the response description, not as a schema."
+                  "properties": {
+                    "current_state": {},
+                    "delivery_id": {},
+                    "execution_id": {},
+                    "ok": {},
+                    "outcome": {}
+                  },
+                  "type": "object"
                 }
               }
             },
-            "description": "outcome is not_failed: the delivery was not in a failed state, so nothing was redriven. Same fields as the 202."
+            "description": "outcome is not_failed: the delivery was not in a failed state, so nothing was redriven."
           },
           "202": {
             "content": {
@@ -10777,6 +10804,19 @@
             "description": "Issue #843: the addressed id names the logical run, so this operation is routed to the live attempt of the workflow-level retry chain (#523) -- the deepest execution reachable by following retry_of_exec_id successors from FAILED rows. For a workflow with no retry policy this resolves to the addressed id and is a strict no-op. This read resolves the chain the same way admit_update does, so the update_id returned by a wait=admitted 202 (which carries no execution id) keeps working against the addressed id."
           },
           "202": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "properties": {
+                    "update_id": {
+                      "description": "The admitted update id.",
+                      "type": "string"
+                    }
+                  },
+                  "type": "object"
+                }
+              }
+            },
             "description": "Update admitted but not yet completed (still in-flight)."
           },
           "400": {
@@ -10786,7 +10826,32 @@
             "description": "Update not found."
           },
           "409": {
-            "description": "Update failed or was rejected by the handler."
+            "content": {
+              "application/json": {
+                "schema": {
+                  "properties": {
+                    "error": {
+                      "description": "Handler failure or rejection message. Absent on an orphaned update.",
+                      "type": "string"
+                    },
+                    "error_type": {
+                      "description": "Orphan classification. Present only when the workflow reached a terminal state first.",
+                      "type": "string"
+                    },
+                    "update_id": {
+                      "description": "The update id.",
+                      "type": "string"
+                    },
+                    "workflow_state": {
+                      "description": "The terminal workflow state that orphaned the update.",
+                      "type": "string"
+                    }
+                  },
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Update failed, was rejected by the handler, or was orphaned by a terminal workflow. A rejected update carries error; an orphaned one carries error_type and workflow_state instead."
           },
           "500": {
             "description": "Database error."
@@ -10956,11 +11021,19 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "description": "Shape is documented in the response description, not as a schema."
+                  "properties": {
+                    "execution_id": {},
+                    "signal_delivered": {},
+                    "started_fresh": {},
+                    "state": {},
+                    "workflow_id": {},
+                    "workflow_name": {}
+                  },
+                  "type": "object"
                 }
               }
             },
-            "description": "An existing live execution was signaled instead of a fresh one being started. Same fields as the 201."
+            "description": "An existing live execution was signaled instead of a fresh one being started."
           },
           "201": {
             "content": {
@@ -11094,11 +11167,28 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "description": "Shape is documented in the response description, not as a schema."
+                  "properties": {
+                    "batch_key": {},
+                    "batched": {},
+                    "debounce_key": {},
+                    "debounced": {},
+                    "deduplicated": {},
+                    "execution_id": {},
+                    "fire_at": {},
+                    "flushed": {},
+                    "max_size": {},
+                    "pending_count": {},
+                    "shard_id": {},
+                    "started_fresh": {},
+                    "state": {},
+                    "workflow_id": {},
+                    "workflow_name": {}
+                  },
+                  "type": "object"
                 }
               }
             },
-            "description": "An existing execution was returned instead of a new one being created (reuse_policy, or conflict_policy use_existing). Same fields as the 201."
+            "description": "An existing execution was returned instead of a new one being created (reuse_policy, or conflict_policy use_existing)."
           },
           "201": {
             "content": {
@@ -11227,11 +11317,20 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "description": "Shape is documented in the response description, not as a schema."
+                  "properties": {
+                    "execution_id": {},
+                    "result": {},
+                    "started_fresh": {},
+                    "state": {},
+                    "update_id": {},
+                    "workflow_id": {},
+                    "workflow_name": {}
+                  },
+                  "type": "object"
                 }
               }
             },
-            "description": "An existing live execution was attached instead of a fresh one being started. Same fields as the 201."
+            "description": "An existing live execution was attached instead of a fresh one being started."
           },
           "201": {
             "content": {
