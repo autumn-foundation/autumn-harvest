@@ -59,7 +59,7 @@ pub fn signal_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
     };
 
     // First parameter must be ctx: &WorkflowContext.
-    if !first_param_is_ctx(&func.sig.inputs) {
+    if !crate::attr_util::first_param_is_ctx_type(&func.sig.inputs, "WorkflowContext") {
         return syn::Error::new_spanned(
             &func.sig,
             "#[signal] handlers must take `ctx: &WorkflowContext` as the first argument",
@@ -90,7 +90,7 @@ pub fn signal_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         Err(e) => return e.to_compile_error(),
     };
     let workflow_simple_name = parsed_path.workflow_simple_name;
-    let camel_wf = to_pascal_case(&workflow_simple_name);
+    let camel_wf = crate::to_pascal_case(&workflow_simple_name);
     let stub_ident = format_ident!("{camel_wf}Stub");
 
     // Skip the leading ctx param when building signal args.
@@ -291,25 +291,27 @@ fn build_arg_type_hint(params: &[&syn::FnArg]) -> String {
     format!("({})", parts.join(", "))
 }
 
-fn first_param_is_ctx(inputs: &syn::punctuated::Punctuated<syn::FnArg, syn::token::Comma>) -> bool {
-    let Some(first) = inputs.first() else {
-        return false;
-    };
-    let syn::FnArg::Typed(pt) = first else {
-        return false;
-    };
-    let syn::Type::Reference(r) = &*pt.ty else {
-        return false;
-    };
-    let syn::Type::Path(tp) = &*r.elem else {
-        return false;
-    };
-    tp.path
-        .segments
-        .last()
-        .is_some_and(|s| s.ident == "WorkflowContext")
-}
+// ── Characterization tests: signature-validation error paths ────────────────
+//
+// Sibling of `query.rs`'s/`update.rs`'s tests of the same name -- pins
+// `signal_macro`'s current rejection message for `first_param_is_ctx` before
+// that check routes through the already-shared
+// `attr_util::first_param_is_ctx_type`.
+#[cfg(test)]
+mod signature_validation_characterization_tests {
+    use super::signal_macro;
+    use quote::quote;
 
-fn to_pascal_case(s: &str) -> String {
-    crate::to_pascal_case(s)
+    #[test]
+    fn wrong_first_param_type_is_rejected() {
+        let attr = quote! { workflow = "MyWorkflow" };
+        let item = quote! {
+            fn my_signal(n: u32) {}
+        };
+        let out = signal_macro(attr, item).to_string();
+        assert!(
+            out.contains("must take") && out.contains("WorkflowContext"),
+            "expected the ctx-param rejection message, got:\n{out}"
+        );
+    }
 }

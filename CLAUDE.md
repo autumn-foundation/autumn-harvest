@@ -18,6 +18,47 @@
 - Open pull requests as ready for review by default.
 - Create a draft PR only when the user explicitly asks for a draft.
 - Never change an existing PR between draft and ready-for-review unless the user explicitly requests that state change.
+## Comment Hygiene
+
+`docs/audits/comment-hygiene.py` gates every `*.rs` comment in CI's `lint`
+job. Run it before you push:
+
+```sh
+python3 docs/audits/comment-hygiene.py --base origin/trunk-dev
+```
+
+The `--base` matters. Without it the Tier B rules below are report-only, so
+a bare run checks Tier A and little else.
+
+Write comments short, concise, and in ASD-STE100 style where the subject
+allows it: one idea per sentence, 25 words or fewer, active voice, present
+tense, no contractions, no first person.
+
+**Never shorten a comment by deleting the reason it exists.** The long
+rationale blocks in this tree are load-bearing — the ABBA lock-ordering
+argument in `docs/architecture.md`, the `cohort`-key argument in
+`partition.rs`, the codec-rotation scope guarantee above. STE asks for
+short *sentences*, not short *explanations*. Split a dense paragraph into
+several sentences; do not delete the argument to hit a word count. The
+harness enforces exactly that distinction: it measures per sentence and
+has no cap on block length.
+
+Every comment is checked, leading or trailing, `//` or `/* */`. A defect
+written as `let n = 1; // TODO: fix` is gated exactly like one on its own
+line. Text inside a string is not a comment, so a fixture that embeds
+Rust source is safe.
+
+Four defects fail the build outright and are at zero — commented-out code,
+a TODO/FIXME with no `#<issue>`, a narrative aside ("actually, let's ..."),
+and a blank `//` line at a block edge.
+
+Three more are ratcheted against the merge base: review-round archaeology
+("Codex round 8" — cite the issue instead), contractions, and sentences
+over 25 words. Your change may not *add* one to a file it touches; the
+legacy population stays until someone chooses to fix it. There is no
+baseline file to regenerate, so fix the flagged line. See
+`docs/audits/README.md`.
+
 ## Database Migrations
 
 ### Name every migration with a second-precision UTC timestamp

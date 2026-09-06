@@ -36,28 +36,15 @@ ignore = [
     # Revisit: next scheduled batch.
     { id = "RUSTSEC-2026-0253", reason = "unreachable: LruCache::pop() is called (cache.rs), but our key (Uuid) and value (CachedWorkflowState) types have no custom Drop, so the panic-during-drop precondition can't occur. Candidate for next scheduled batch (0.16->0.18 manifest bump). Revisit: next scheduled batch." },
 
-    # RUSTSEC-2026-0258 — h2, unbounded empty DATA frames (low severity DoS
-    # if a peer floods empty frames and streams aren't drained). This
-    # advisory matched TWO distinct h2 instances in the graph; a review
-    # comment on this PR correctly caught that the first one below does not
-    # need an ignore at all:
-    #   - h2 0.4.13, via hyper 1.x -> axum -> autumn-web (our production HTTP
-    #     server path): FIXED in the sibling commit, `cargo update -p
-    #     h2@0.4.13` -> 0.4.19, no manifest change, `cargo check
-    #     --workspace --all-features` green.
-    #   - h2 0.3.27, via the old hyper 0.14 line pulled by
-    #     aws-smithy-http-client/aws-config/aws-sdk-sqs (the `sqs` feature,
-    #     optional, off by default): `cargo update -p h2@0.3.27` resolves 0
-    #     packages — 0.3.27 is already the newest release its hyper-0.14
-    #     constraint allows, and the advisory's fix ("Patched in v0.4.16")
-    #     never landed on the 0.3.x branch. Same cluster and same fix path
-    #     as the rustls-webpki findings below: needs an aws-config/
-    #     aws-sdk-sqs manifest bump onto a release built on a newer
-    #     hyper/h2 line, not a lockfile update. This ignore entry now covers
-    #     only that surviving 0.3.27 instance.
-    # Revisit: next scheduled batch evaluates whether a current aws-config/
-    # aws-sdk-sqs release has moved off hyper 0.14/h2 0.3.
-    { id = "RUSTSEC-2026-0258", reason = "the hyper-1.x/axum/autumn-web instance is fixed (see sibling commit); the surviving h2@0.3.27 instance is reachable only via the optional `sqs` feature's AWS SDK cluster (old hyper 0.14 line) and has no patched 0.3.x release to update to — needs an aws-config/aws-sdk-sqs manifest bump. Revisit: next scheduled batch." },
+    # RUSTSEC-2026-0258 — h2, unbounded empty DATA frames. The hyper-1.x/
+    # axum/autumn-web instance (h2 0.4.13) was fixed in the harness PR
+    # (`cargo update -p h2@0.4.13` -> 0.4.19). The second instance, h2
+    # 0.3.27 via the old hyper-0.14 line, is now GONE from the graph: see
+    # the `sqs`-feature fix below (RUSTSEC-2026-0098 comment) — it removed
+    # the entire legacy hyper-0.14/h2-0.3.x cluster, not just the
+    # rustls-webpki finding. No ignore entry needed for this advisory
+    # anymore; `cargo tree --workspace --all-features` has zero h2 0.3.x
+    # or 0.4.x-below-0.4.16 instances.
 
     # RUSTSEC-2026-0173 — proc-macro-error2 2.0.1 is unmaintained (not a
     # vulnerability). Pulled by validator_derive -> validator -> autumn-web;
@@ -89,19 +76,53 @@ ignore = [
     # its parking_lot 0.11 dependency, or instant gains a maintained fork.
     { id = "RUSTSEC-2024-0384", reason = "unmaintained, no safe upgrade exists; reached only through dev-runtime-managed (local `cargo dev` tooling), off by default and never shipped. Revisit: postgresql_archive moves off parking_lot 0.11, or instant is forked/revived." },
 
-    # RUSTSEC-2026-0098 / -0099 / -0104 — rustls-webpki 0.101.7, three
-    # certificate-parsing bugs (name-constraint acceptance x2, a reachable
-    # panic in CRL parsing). Pulled via an old rustls 0.21 line
-    # (hyper-rustls 0.24.2 / tokio-rustls 0.24.1 / aws-smithy-http-client),
-    # itself behind autumn-harvest-plugin's `sqs` feature (AWS SQS broker
-    # connector), optional and off by default. Fixing requires bumping
-    # aws-config/aws-sdk-sqs to a release built on rustls 0.23 (a manifest
-    # change, not a lockfile-only update) — an Upgrade-class change, not a
-    # harness-scope fix. Revisit: next scheduled batch evaluates whether a
-    # current aws-config/aws-sdk-sqs release has moved off rustls 0.21.
-    { id = "RUSTSEC-2026-0098", reason = "reachable only via the optional `sqs` feature's AWS SDK crates (old rustls 0.21 line); fix needs an aws-config/aws-sdk-sqs manifest bump, not a lockfile update. Revisit: next scheduled batch." },
-    { id = "RUSTSEC-2026-0099", reason = "reachable only via the optional `sqs` feature's AWS SDK crates (old rustls 0.21 line); fix needs an aws-config/aws-sdk-sqs manifest bump, not a lockfile update. Revisit: next scheduled batch." },
-    { id = "RUSTSEC-2026-0104", reason = "reachable only via the optional `sqs` feature's AWS SDK crates (old rustls 0.21 line); fix needs an aws-config/aws-sdk-sqs manifest bump, not a lockfile update. Revisit: next scheduled batch." },
+    # RUSTSEC-2026-0098 / -0099 / -0104 (rustls-webpki 0.101.7) and the
+    # h2@0.3.27 half of RUSTSEC-2026-0258 — FIXED, not deferred. All four
+    # traced to the same root cause, previously mis-scoped in this file as
+    # "needs an aws-config/aws-sdk-sqs manifest bump": it isn't a version
+    # problem at all. `aws-sdk-sqs`'s own `rustls` feature (which
+    # autumn-harvest-plugin's `sqs` feature requested) is defined upstream
+    # as `rustls = ["aws-smithy-runtime/tls-rustls"]`, and
+    # `aws-smithy-runtime`'s `tls-rustls` unconditionally pulls
+    # `connector-hyper-0-14-x` — the legacy hyper 0.14 / h2 0.3.x / rustls
+    # 0.21 / rustls-webpki 0.101.7 connector — *in addition to*, not instead
+    # of, the modern stack. `aws-sdk-sqs` ships both HTTP-client stacks
+    # side by side; `default-https-client` (`aws-smithy-runtime/
+    # default-https-client` -> `aws-smithy-http-client/rustls-aws-lc`,
+    # hyper 1.x + aws-lc-rs) is the independent, sufficient-on-its-own
+    # feature that actually selects the client used, and was already a
+    # no-op alongside `rustls` here (both were on). Traced with `cargo
+    # tree --workspace --all-features -e features -i
+    # aws-smithy-runtime@1.10.0`, confirmed at the manifest-source level
+    # (docs.rs source view of aws-config/aws-sdk-sqs/aws-smithy-runtime
+    # Cargo.toml `[features]`), and re-checked against aws-sdk-sqs's
+    # newest release (1.109.0) — the mapping is unchanged there too, so
+    # this was never going to be closed by a version bump at any MSRV.
+    # (Separately: aws-sdk-sqs 1.93.0, already in this lockfile, is in
+    # fact the newest release compatible with this workspace's `rust-
+    # version = "1.88.0"` — 1.94.0+ requires rustc 1.91 — so a manifest
+    # bump wasn't even available as an option before this fix.)
+    #
+    # Fix: autumn-harvest-plugin/Cargo.toml's `aws-sdk-sqs` dependency now
+    # requests `default-https-client` instead of `rustls`. This is a
+    # feature-flag change only — no version bump, no MSRV change.
+    # `aws-config`'s own `rustls` feature was left as-is; it already
+    # aliases to `client-hyper` -> `aws-smithy-runtime/default-https-
+    # client`, the same modern target, so it was never part of the legacy
+    # path.
+    #
+    # Rehearsal: `cargo tree --workspace --all-features` now has zero
+    # instances of hyper 0.14, h2 0.3.x, rustls 0.21.x, rustls-webpki
+    # 0.101.7, hyper-rustls 0.24.x or tokio-rustls 0.24.x (all four
+    # advisories' entire vulnerable cluster gone, not just the specific
+    # flagged versions) — 759 -> 747 unique (name, version) entries under
+    # `-e normal`. `cargo check -p autumn-harvest-plugin --no-default-
+    # features --features sqs` and `cargo test -p autumn-harvest-plugin
+    # --no-default-features --features sqs --lib` both green; the sqs
+    # connector only uses the high-level `aws_config::load_defaults` /
+    # `Client::new`/`Client::from_conf` API, never a connector type
+    # directly, so the swap is behavior-invisible to it. No new packages
+    # added to Cargo.lock, only the legacy cluster removed.
 ]
 
 # ---------------------------------------------------------------------------

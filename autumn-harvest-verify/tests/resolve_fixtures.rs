@@ -78,58 +78,6 @@ fn build_over_the_real_example_dump_succeeds() {
     assert!(program.docs[0].parse_failures.is_empty());
 }
 
-// ── API GAP ─────────────────────────────────────────────────────────────────
-//
-// Everything below is written against an API the GREEN agent must add. The
-// exact proposed signatures come first; the tests follow, verbatim, ready to be
-// uncommented.
-//
-// ```rust
-// // autumn-harvest-verify/src/resolve/mod.rs
-//
-// /// Where a call goes.
-// #[derive(Debug, Clone, PartialEq, Eq)]
-// pub enum Resolution {
-//     /// A body present in the analyzed doc set, by its MIR path.
-//     Body(String),
-//     /// An honest analysis boundary (D7/D9); the `String` is the `Boundary::detail`.
-//     Boundary(crate::BoundaryKind, String),
-//     /// A body outside the analyzed MIR (std/core/alloc or a `[trusted]` crate),
-//     /// by its callee path. Taint propagates through it; it never shadows a source.
-//     External(String),
-// }
-//
-// /// A generic substitution: type-parameter name -> concrete type text.
-// #[derive(Debug, Clone, Default, PartialEq, Eq)]
-// pub struct Substitution(pub std::collections::BTreeMap<String, String>);
-//
-// impl Substitution {
-//     #[must_use] pub fn new() -> Self;
-//     pub fn bind(&mut self, param: &str, ty: &str);
-//     #[must_use] pub fn get(&self, param: &str) -> Option<&str>;
-//     /// Rewrite a callee path's type parameters under this substitution.
-//     #[must_use] pub fn apply(&self, path: &str) -> String;
-// }
-//
-// impl Program {
-//     /// One body by MIR path (the first, when rustc printed duplicates).
-//     #[must_use] pub fn body(&self, path: &str) -> Option<&crate::mir::Body>;
-//     /// Every body path in the doc set, in doc then file order.
-//     #[must_use] pub fn body_paths(&self) -> Vec<&str>;
-//     /// Resolve a printed callee path as seen from `caller_body`.
-//     #[must_use] pub fn resolve_call(&self, caller_body: &str, callee: &str) -> Resolution;
-//     /// Resolve the Call terminator of `block` in `caller_body`, including the
-//     /// indirect form (`_8 = copy _5()`), which has no callee path to pass to
-//     /// `resolve_call`. `None` when the block does not end in a Call.
-//     #[must_use] pub fn resolve_terminator(&self, caller_body: &str, block: &str) -> Option<Resolution>;
-//     /// The substitution a call from `caller_body` to `callee` induces on the
-//     /// callee's body (turbofish by elimination + header/arg-type unification, D6).
-//     #[must_use] pub fn call_substitution(&self, caller_body: &str, callee: &str) -> Substitution;
-//     /// `body`'s callee paths with `subst` applied to each.
-//     #[must_use] pub fn substituted_callees(&self, body: &str, subst: &Substitution) -> Vec<String>;
-// }
-// ```
-//
 #[test]
 fn inherent_method_resolves_to_its_impl_body() {
     let program = Program::build(vec![parse_fixture("spike.mir")], &fixture_roots()).unwrap();

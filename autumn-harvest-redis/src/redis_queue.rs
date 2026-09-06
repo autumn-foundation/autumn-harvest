@@ -414,9 +414,12 @@ impl RedisTaskQueue {
         worker_id: &str,
     ) -> RedisAdapterResult<Option<ClaimedTask>> {
         for queue in queues {
-            // Make sure the consumer group exists *and* any due delayed tasks
-            // are on the stream before we ask for them.
-            self.ensure_group(queue).await?;
+            // Make sure any due delayed tasks are on the stream before we ask
+            // for them. `promote_due` itself calls `ensure_group` first (it
+            // must, so the group exists before its Lua script's XADDs land),
+            // so a second `ensure_group` call here would be a redundant
+            // round trip to Redis on every single claim attempt -- the
+            // consumer group is idempotently ensured exactly once below.
             let _ = self.promote_due(queue).await?;
 
             let mut conn = self.conn.clone();

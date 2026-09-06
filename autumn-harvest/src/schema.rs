@@ -731,6 +731,11 @@ diesel::table! {
         priority -> Jsonb,
         max_workflow_input_bytes -> BigInt,
         created_at -> Timestamptz,
+        /// NULL = never quota-blocked; eligible immediately. Set to
+        /// `now() + backoff` when a relay attempt hits `QuotaExceeded` (issue
+        /// #1227, Finding 4) so the claim query can exclude the row until its
+        /// backoff elapses instead of leaving it to dominate every batch.
+        next_attempt_at -> Nullable<Timestamptz>,
     }
 }
 

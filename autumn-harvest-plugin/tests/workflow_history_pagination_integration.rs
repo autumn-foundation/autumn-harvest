@@ -268,10 +268,9 @@ async fn history_page_boundaries_no_drops_or_duplicates() {
     let mut conn = AsyncPgConnection::establish(&url).await.unwrap();
 
     let exec_id = seed_execution(&mut conn, "page-bounds-wf").await;
-    // Append 15 extra events (on top of the initial WorkflowStarted) = 16 total.
-    append_mixed_events(&mut conn, exec_id, 7).await; // 7 TimerStarted + 7 TimerFired = 14
-    // Also append 2 more so total is 1 + 14 + 1 = 16; actually let's just use 15 total extra.
-    // WorkflowStarted is event 0 → +14 = 15 events total.
+    // 7 TimerStarted + 7 TimerFired = 14 events, on top of the initial
+    // WorkflowStarted, for 15 in total.
+    append_mixed_events(&mut conn, exec_id, 7).await;
 
     let limit = 5;
     let mut collected_ids: Vec<i64> = Vec::new();
