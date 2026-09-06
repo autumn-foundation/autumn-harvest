@@ -428,6 +428,43 @@ def line_tail(pieces: list, index: int) -> str:
     return "".join(tail)
 
 
+# The markers Rustdoc renders as Markdown. `//` and `////` are ordinary code
+# comments that no renderer ever sees, and `/*` is their block form.
+DOC_MARKERS = ("///", "//!", "/**", "/*!")
+
+
+def indented_code(
+    text: str, container: int, paragraph: bool, inside: bool, doc: bool
+) -> bool:
+    """Is `text` a line of a CommonMark indented code block?
+
+    Four columns past the container, and only where no paragraph is open --
+    indented code cannot interrupt one, so a wrapped line indented under its
+    own paragraph stays prose. Rustdoc renders the block form as a Rust
+    example, so its content is an example and not commentary: without this,
+    "///     let x = compute();" after a blank line fails CH001 and no
+    unfenced rustdoc example can be added to this tree.
+
+    A blank line stays inside an open block; only a line indented less than
+    four columns ends one.
+
+    DOC COMMENTS ONLY, and that limit is the point of the rule rather than a
+    shortcut. Indented code is a fact about what Rustdoc renders, and Rustdoc
+    renders no `//` comment at all: there, indentation is how this tree lays
+    out a long argument, and exempting it would stop measuring nineteen real
+    sentences. A ``` fence is different -- an author writes one to say "this
+    is an example" whatever the marker -- so fences stay exempt everywhere.
+    """
+    if not doc:
+        return False
+    if inside:
+        return not text.strip() or leading_columns(text) >= container + 4
+    return (
+        not paragraph and bool(text.strip())
+        and leading_columns(text) >= container + 4
+    )
+
+
 def starts_block(text: str, container: int) -> bool:
     """Does `text` begin a CommonMark block other than a paragraph?
 
@@ -1408,17 +1445,27 @@ def comment_lines(pieces: list[Piece]):
         paragraph = False
         quoted = 0
         in_table = False
+        indented = False
         html: str | None = None
         saved: list = []
         nest = run[0].nest
         for index, piece in enumerate(run):
             if piece.nest != nest:
-                saved, (fence, scope, stack, paragraph, quoted, in_table, html) = (
-                    nesting_shift(
-                        saved,
-                        piece.nest,
-                        (fence, scope, list(stack), paragraph, quoted, in_table, html),
-                    )
+                saved, (
+                    fence, scope, stack, paragraph, quoted, in_table, indented, html
+                ) = nesting_shift(
+                    saved,
+                    piece.nest,
+                    (
+                        fence,
+                        scope,
+                        list(stack),
+                        paragraph,
+                        quoted,
+                        in_table,
+                        indented,
+                        html,
+                    ),
                 )
                 nest = piece.nest
             text = piece.text
@@ -1455,8 +1502,12 @@ def comment_lines(pieces: list[Piece]):
                     in_table = not starts_block(body, enclosing)
                 else:
                     in_table = table_header(run, index, piece.nest, body, enclosing)
+                indented = indented_code(
+                    body, enclosing, paragraph, indented, piece.marker in DOC_MARKERS
+                )
+                # Both are blocks, so neither leaves a paragraph open.
                 stack, paragraph = update_containers(
-                    text, stack, paragraph, quoted, in_table
+                    text, stack, paragraph, quoted, in_table or indented
                 )
                 # From the PEEL, as `prose_units` reads it. "- > text" is a
                 # quote inside a list item, and reading the raw line reports
@@ -1520,7 +1571,7 @@ def comment_lines(pieces: list[Piece]):
                 # rules must not read that TODO as a defect.
                 yield piece.line, text, True
                 continue
-            yield piece.line, text, fence is not None
+            yield piece.line, text, fence is not None or indented
 
 
 def check_line_rules(path: str, pieces: list[Piece]) -> list[Finding]:
@@ -1623,6 +1674,7 @@ def prose_units(pieces: list[Piece]) -> list[tuple[int, str]]:
             run, run_lines = [], []
 
         in_table = False
+        indented = False
         html: str | None = None
         for index, piece in enumerate(block):
             if piece.nest != nest:
@@ -1638,6 +1690,7 @@ def prose_units(pieces: list[Piece]) -> list[tuple[int, str]]:
                     quoted,
                     in_list,
                     in_table,
+                    indented,
                     html,
                 ) = nesting_shift(
                     saved,
@@ -1650,6 +1703,7 @@ def prose_units(pieces: list[Piece]) -> list[tuple[int, str]]:
                         quoted,
                         in_list,
                         in_table,
+                        indented,
                         html,
                     ),
                 )
@@ -1692,8 +1746,12 @@ def prose_units(pieces: list[Piece]) -> list[tuple[int, str]]:
                     in_table = not starts_block(peek, enclosing)
                 else:
                     in_table = table_header(block, index, piece.nest, peek, enclosing)
+                indented = indented_code(
+                    peek, enclosing, paragraph, indented, piece.marker in DOC_MARKERS
+                )
+                # Both are blocks, so neither leaves a paragraph open.
                 stack, paragraph = update_containers(
-                    body, stack, paragraph, quoted, in_table
+                    body, stack, paragraph, quoted, in_table or indented
                 )
             container = stack[-1][0] if stack else 0
             delimiter = fence_delimiter(body, container, fence is not None, scope[2], stack)
@@ -1761,6 +1819,11 @@ def prose_units(pieces: list[Piece]) -> list[tuple[int, str]]:
             # the rows that follow -- decided here rather than up front,
             # because the delimiter's indent is measured against whatever
             # container is open at that point.
+            # Indented code is a block and an example, not a sentence.
+            if indented:
+                flush()
+                in_list = False
+                continue
             if html_block(peeled, container):
                 # The opener's own line is a block, and everything to its
                 # closer is raw HTML. `comment_lines` opens the block at the
@@ -2967,6 +3030,37 @@ RULE_TESTS = [
         "///   TODO: issue required\n",
         set(),
         "a list marker is peeled before the HTML opener too",
+    ),
+    (
+        "/// Intro.\n"
+        "///\n"
+        "///     let x = compute();\n"
+        "///     TODO: fixture placeholder\n",
+        set(),
+        "an indented code block in a doc comment is an example",
+    ),
+    (
+        "// Intro.\n"
+        "//\n"
+        "//     let x = compute();\n"
+        "//     TODO: issue required\n",
+        {("CH001", 3), ("CH002", 4)},
+        "a plain // comment renders nowhere, so indentation is not code",
+    ),
+    (
+        "/// wrapped line one\n"
+        "///     word1 word2 word3 word4 word5 word6 word7 word8 word9 word10 word11 word12 word13 word14 word15 word16 word17 word18 word19 word20 word21 word22 word23 word24 word25 word26.\n",
+        {("CH007", 1)},
+        "indented code cannot interrupt a paragraph",
+    ),
+    (
+        "/// Intro.\n"
+        "///\n"
+        "///     let x = compute();\n"
+        "///\n"
+        "/// TODO: issue required\n",
+        {("CH002", 5)},
+        "and it ends where the indent does",
     ),
 ]
 

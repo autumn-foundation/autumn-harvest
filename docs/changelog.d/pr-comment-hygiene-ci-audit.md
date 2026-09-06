@@ -1518,3 +1518,30 @@ the repository does not contain. Either the block layer is replaced with a
 real CommonMark parser -- which costs `docs/audits/` its deliberate
 no-dependency property and is not a decision this PR should make -- or the
 remainder is out of scope. This PR takes the second.
+
+### Round forty-eight — indented code, and which comments are Markdown at all
+
+One finding, and it is a false positive on a Tier A gate, so it is fixed under
+the line drawn last round rather than deferred with the rest.
+
+Markdown's other code block is four spaces of indent after a blank line, and
+the audit did not know it. `///     let x = compute();` renders as a Rust
+example and failed CH001; an indented TODO failed CH002. No unfenced rustdoc
+example could be added to this tree. `indented_code` follows CommonMark: four
+columns past the container, only where no paragraph is open — a block cannot
+interrupt one, so a wrapped line indented under its own paragraph stays prose
+— and a blank line stays inside the block until the indent ends.
+
+**The first cut removed nineteen real findings, and that is the interesting
+part.** Applied to every comment, the rule exempted indented passages in plain
+`//` comments — `chaos.rs` and `context.rs` lay out long arguments that way —
+and eighteen CH007 sentences and one CH005 stopped being measured. Those are
+prose. Rustdoc renders no `//` comment at all, so nothing there is Markdown
+and indentation is just how the argument is laid out. The rule is therefore
+limited to the markers Rustdoc renders: `///`, `//!`, `/**`, `/*!`.
+
+A ``` fence stays exempt in every comment, and the difference is not an
+inconsistency. An author writes a fence to say "this is an example", whatever
+the marker. Nobody indents a paragraph to say it.
+
+Corpus effect: none, once the rule is limited to doc comments.
