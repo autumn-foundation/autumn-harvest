@@ -3234,3 +3234,34 @@ deliberately: it is a ratcheted rule where matching MORE is the safe
 direction, and narrowing it would move a counted baseline for no gain.
 
 Corpus effect: none. Three fixtures.
+
+### Round one hundred and six — the same guard, one fragment away
+
+Three bypasses, and two of them are the same question asked in places
+round ninety-nine did not look.
+
+`// fn stale<T>() where T: Into<[u8; 32]> {` produced no CH001. Round
+ninety-nine gave the array-type guard to `GENERICS` and stopped there;
+`WHERE` bounds itself by a `;` for the same reason and needed the same
+guard. That is the guard sibling rule -- introduced in round one hundred
+and still not applied widely enough when the guard itself moves.
+
+Asking where else the file bounds by `;` found the impl header, which
+did not use `WHERE` at all: it was a class of what may appear in an impl
+header, and a class cannot hold `[u8; 32]`. It is bounded by what may not
+now -- the `{` that opens the body, and a `;` outside an array type --
+with the prose lookahead unchanged.
+
+`// pub unsafe trait Stale {}` produced nothing either. `unsafe`
+qualifies a trait and an impl, and on `pub unsafe trait` it sits between
+the visibility and the keyword where no alternative could reach it. The
+function alternative has carried the qualifier since the beginning; the
+other two never did. rustc 1.94.1 takes it on exactly those three.
+
+`https://[:]` and `https://[....]` counted as URLs. A bracketed host is
+an IP literal, and an address has at least one colon AND at least one hex
+digit. That is the cheapest test that refuses both without pretending to
+parse IPv6, which this file has no business doing.
+
+Corpus effect: none. Seven fixtures, one of them a counter-case in the
+shape of the widened impl form.

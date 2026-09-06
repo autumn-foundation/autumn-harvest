@@ -243,10 +243,15 @@ _APOS = r"[\u2019']"
 # raw, exactly as an item's own name may be.
 VISIBILITY = r"(?:pub(?:\((?:in\s+)?(?:r\#)?\w+(?:::(?:r\#)?\w+)*\))?\s+)?"
 # A `where` clause, which may sit on the signature line of anything
-# generic: a function, a struct, an enum, a trait, a union or an impl.
-# Bounded by the `{` or `;` that ends the declaration, so it can never run
-# past the item it belongs to. rustc 1.94.1 compiles every form below.
-WHERE = r"(?:where\s+[^;{]+?\s*)?"
+# generic: a function, a struct, an enum, a trait, a union or an impl, and
+# on a type alias before its `=`. Bounded by the `{` or `;` that ends the
+# declaration, so it can never run past the item it belongs to.
+#
+# With the SAME array-type guard `GENERICS` carries, because a bound may
+# hold an array type: `where T: Into<[u8; 32]>` is one clause. Round
+# ninety-nine gave that guard to the generic list and not to this, which
+# asks the identical question one fragment away.
+WHERE = r"(?:where\s+(?:[^;{]|;(?=[^;]*\]))+?\s*)?"
 # What follows an item's signature: the `{` that opens its block, or a
 # COMPLETE one-line block. `fn stale() {}` is commented-out code as surely
 # as `fn stale() {` is, and anchoring at the brace let every one-line body
@@ -296,7 +301,12 @@ COMMENTED_CODE_RE = re.compile(
                | (?=[^)]*(?::|\bself\b))            # wrapped: real params,
                  [\w\s:&'<>\[\](),.+;=*#-]*,\s*$     #   trailing comma
             )\s*$
-      | {VIS}(?:struct|enum|trait|union)\s+(?:r\#)?\w+\s*(?:{GEN})?\s*{WHERE}(?:[;(]|{BODY})\s*$
+      # `unsafe` qualifies a TRAIT, and `pub unsafe trait` puts it between
+      # the visibility and the keyword where nothing could reach it. It
+      # qualifies an impl too, below. rustc 1.94.1 takes it on those two
+      # and on `fn`, which the function alternative already carries.
+      | {VIS}(?:unsafe\s+)?trait\s+(?:r\#)?\w+\s*(?:{GEN})?\s*{WHERE}(?:[;(]|{BODY})\s*$
+      | {VIS}(?:struct|enum|union)\s+(?:r\#)?\w+\s*(?:{GEN})?\s*{WHERE}(?:[;(]|{BODY})\s*$
       # A tuple struct, whose field list is on the line and terminated. Its
       # own alternative rather than a relaxation of the one above, which is
       # what this file's guidance asks for: the name is still anchored hard
@@ -315,8 +325,14 @@ COMMENTED_CODE_RE = re.compile(
       # lint about meaning rather than a syntax error.
       | {VIS}type\s+(?:r\#)?\w+\s*(?:{GEN})?\s*{WHERE}=
             (?!\s*(?:\w+\s+){2,}\w+\s*;\s*$).*;\s*$
-      | impl(?:\s*{GEN})?\s+
-            (?![^;{]*\b[a-z]+\s+[a-z]+\s+[a-z]+\s+[a-z]+\b)[\w:<>&'\s\#,]+{BODY}\s*$
+      # The header of an impl -- a trait reference, a type, and a `where`
+      # clause -- was a class of what may appear in one, which could not
+      # hold the `[u8; 32]` of an array bound. Bounded by what may NOT:
+      # the `{` that opens the body, and a `;` outside an array type. The
+      # prose guard is the lookahead, as it always was.
+      | (?:unsafe\s+)?impl(?:\s*{GEN})?\s+
+            (?![^;{]*\b[a-z]+\s+[a-z]+\s+[a-z]+\s+[a-z]+\b)
+            (?:[^;{]|;(?=[^;]*\]))+{BODY}\s*$
       | let\s+(?:mut\s+)?(?:r\#)?\w+\s*(?::[^;=]+)?=
             (?!\s*(?:\w+\s+){2,}\w+\s*;\s*$)[^=].*;\s*$
       # Destructuring bindings. A tuple or slice pattern, or a struct/enum
@@ -452,13 +468,17 @@ TODO_RE = re.compile(
 # matches U+0662 and U+FF14, and `#1` followed by either routes nowhere.
 # It needs no guard in FRONT, because `owner/repo#123` is a real
 # cross-repository reference and the tracker renders it as one.
-# An IPv6 literal is a host only when its bracket CLOSES. `https://[` is an
-# opening bracket, and the tail cannot close it because a `]` ends the
-# citation form. So the two host shapes are spelled apart.
+# An IPv6 literal is a host only when its bracket CLOSES, and only when
+# what it holds could be an address. `https://[` is an opening bracket;
+# `https://[:]` and `https://[....]` are punctuation in brackets. An
+# address has at least one colon AND at least one hex digit, which is the
+# cheapest test that refuses both without pretending to parse IPv6.
 REFERENCE = (
     r"(?:"
     r"#[1-9][0-9]*(?!\w)"
-    r"|(?<![A-Za-z0-9+.\-])(?i:https?)://(?:\[[0-9A-Fa-f:.]+\]|\w)[^)\]\s]*"
+    r"|(?<![A-Za-z0-9+.\-])(?i:https?)://"
+    r"(?:\[(?=[0-9A-Fa-f:.]*:)(?=[0-9A-Fa-f:.]*[0-9A-Fa-f])[0-9A-Fa-f:.]+\]|\w)"
+    r"[^)\]\s]*"
     r")"
 )
 TODO_REF_RE = re.compile(REFERENCE)
@@ -4812,6 +4832,16 @@ RULE_TESTS = [
         "an IPv6 host needs the bracket that closes it",
     ),
     (
+        "// TODO: fix under https://[:]\n",
+        {("CH002", 1)},
+        "and an address inside it, not only a colon",
+    ),
+    (
+        "// TODO: fix under https://[....]\n",
+        {("CH002", 1)},
+        "nor only periods",
+    ),
+    (
         "// https://[::1]/p - TODO: fix\n",
         set(),
         "and a closed one is a host in every position",
@@ -5100,6 +5130,31 @@ RULE_TESTS = [
         "// struct Stale<const N: usize = { 1 + 2 }>;\n",
         {("CH001", 1)},
         "and a const block, which ends none either",
+    ),
+    (
+        "// fn stale<T>() where T: Into<[u8; 32]> {\n",
+        {("CH001", 1)},
+        "a where clause holds an array type as a generic list does",
+    ),
+    (
+        "// impl<T> Q<T> where T: Into<[u8; 32]> {\n",
+        {("CH001", 1)},
+        "on an impl header too",
+    ),
+    (
+        "// pub unsafe trait Stale {}\n",
+        {("CH001", 1)},
+        "and unsafe qualifies a trait, between the visibility and the keyword",
+    ),
+    (
+        "// unsafe impl Send for X {}\n",
+        {("CH001", 1)},
+        "as it qualifies an impl",
+    ),
+    (
+        "// impl details are described in the module docs {\n",
+        set(),
+        "but an impl-shaped sentence is still prose",
     ),
     (
         "// use foo::{bar::{Baz, Qux}, Quux};\n",
