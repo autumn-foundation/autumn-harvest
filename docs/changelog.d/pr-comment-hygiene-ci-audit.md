@@ -2993,3 +2993,29 @@ fixes the other half of the report: `https://[::1]/p` on a marker's LEFT
 was rejected, because that pattern's tail excluded the `]` as well.
 
 Corpus effect: none. Three fixtures.
+
+### Round ninety-eight — a generic list nests to any depth
+
+One finding, a bypass. `// fn stale<T: Into<Vec<u8>>>() {}` produced no
+CH001, because every generic list was matched by a class of "anything but
+angle brackets" -- which reads `<T>` and refuses anything inside it. The
+sibling sweep found the same class at five sites: a function, a struct or
+enum or trait or union, a tuple struct, a type alias and an impl. Six
+shapes were outside an absolute gate, all compiled with rustc 1.94.1
+before being accepted.
+
+The first fix counted levels, and three levels handled the report. A
+four-level case then failed -- which is this review's own recurring shape,
+a fix that moves the gap one step out and files next round's finding. So
+the list is bounded by what CANNOT appear inside one instead: a `;` or a
+`{` ends the declaration. The greedy run backtracks to the `>` the
+surrounding anchor needs -- the `(` of a signature, the `=` of an alias,
+the `{` of a body -- which admits any depth and admits `Fn(u8) -> u8`
+with it.
+
+Prose is unaffected because these forms are anchored on a keyword and a
+name: `// Compare a < b and c > d in the queue` is a counter-case fixture,
+and the control-flow guards are untouched. Pathological inputs were timed
+rather than assumed -- sixty unbalanced `<` return in under a millisecond.
+
+Corpus effect: none. Five fixtures, one of them a counter-case.

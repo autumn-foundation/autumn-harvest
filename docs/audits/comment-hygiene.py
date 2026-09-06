@@ -257,6 +257,18 @@ WHERE = r"(?:where\s+[^;{]+?\s*)?"
 # guard is a lookahead over the words before the brace, and "match the shard
 # {0}" is prose that ends in a closing brace.
 BODY = r"(?:\{(?:.*\})?)"
+# A generic parameter list, which NESTS to any depth. A class of "anything
+# but angle brackets" reads `<T>` and refuses `<T: Into<Vec<u8>>>`, so a
+# whole shape of commented-out signature sat outside an absolute gate --
+# and counting levels only moves the gap one level out, which is how this
+# review has generated its own findings before.
+#
+# So the list is bounded by what CANNOT appear inside one instead: a `;` or
+# a `{` ends the declaration. The greedy run then backtracks to the `>`
+# that the surrounding anchor needs -- the `(` of a signature, the `=` of
+# an alias, the `{` of a body -- so `Fn(u8) -> u8` is admitted while the
+# form stays anchored on a keyword and a name.
+GENERICS = r"<[^;{]*>"
 COMMENTED_CODE_RE = re.compile(
     r"""^(?:
         # The ABI name may carry a hyphen -- "C-unwind" and its siblings are
@@ -266,19 +278,19 @@ COMMENTED_CODE_RE = re.compile(
         # gate.
         {VIS}
         (?:async\s+|unsafe\s+|const\s+|extern\s+(?:"[\w-]+"\s+)?)*
-            fn\s+(?:r\#)?\w+\s*(?:<[^<>]*>)?\s*\(
+            fn\s+(?:r\#)?\w+\s*(?:{GEN})?\s*\(
             (?:
                  .*\)\s*(?:->\s*[^;{]+?)?\s*{WHERE}(?:;|{BODY})  # complete
                | \s*$                                # wrapped: `fn foo(` at EOL
                | (?=[^)]*(?::|\bself\b))            # wrapped: real params,
                  [\w\s:&'<>\[\](),.+;=*#-]*,\s*$     #   trailing comma
             )\s*$
-      | {VIS}(?:struct|enum|trait|union)\s+(?:r\#)?\w+\s*(?:<[^<>]*>)?\s*{WHERE}(?:[;(]|{BODY})\s*$
+      | {VIS}(?:struct|enum|trait|union)\s+(?:r\#)?\w+\s*(?:{GEN})?\s*{WHERE}(?:[;(]|{BODY})\s*$
       # A tuple struct, whose field list is on the line and terminated. Its
       # own alternative rather than a relaxation of the one above, which is
       # what this file's guidance asks for: the name is still anchored hard
       # against `struct`, and the line must end at the `;`.
-      | {VIS}(?:struct|union)\s+(?:r\#)?\w+\s*(?:<[^<>]*>)?
+      | {VIS}(?:struct|union)\s+(?:r\#)?\w+\s*(?:{GEN})?
             # The `;` of "[u8; 32]" is part of an array type, not the end of
             # the statement -- the same guard the uninitialized-binding rule
             # has carried since round forty-one, which this alternative was
@@ -286,9 +298,9 @@ COMMENTED_CODE_RE = re.compile(
             \s*\((?:[^;{]|;(?=[^;]*\]))*\)\s*{WHERE};\s*$
       | {VIS}mod\s+(?:r\#)?\w+\s*(?:;|{BODY})\s*$
       | {VIS}(?:const|static)\s+(?:mut\s+)?(?:r\#)?\w+\s*:[^;=]+=.*[;{]\s*$
-      | {VIS}type\s+(?:r\#)?\w+\s*(?:<[^<>]*>)?\s*=
+      | {VIS}type\s+(?:r\#)?\w+\s*(?:{GEN})?\s*=
             (?!\s*(?:\w+\s+){2,}\w+\s*;\s*$).*;\s*$
-      | impl(?:\s*<[^<>]*>)?\s+
+      | impl(?:\s*{GEN})?\s+
             (?![^;{]*\b[a-z]+\s+[a-z]+\s+[a-z]+\s+[a-z]+\b)[\w:<>&'\s\#,]+{BODY}\s*$
       | let\s+(?:mut\s+)?(?:r\#)?\w+\s*(?::[^;=]+)?=
             (?!\s*(?:\w+\s+){2,}\w+\s*;\s*$)[^=].*;\s*$
@@ -349,7 +361,7 @@ COMMENTED_CODE_RE = re.compile(
             \(.*\)(?:\s*\?|\s*\.await\s*\??)*\s*;\s*$
     )""".replace("{VIS}", VISIBILITY).replace("{WHERE}", WHERE).replace(
         "{BODY}", BODY
-    ),
+    ).replace("{GEN}", GENERICS),
     re.VERBOSE,
 )
 
@@ -4948,6 +4960,31 @@ RULE_TESTS = [
         "// fn stale() {}\n",
         {("CH001", 1)},
         "a body that opens and closes on one line is still a body",
+    ),
+    (
+        "// fn stale<T: Into<Vec<u8>>>() {}\n",
+        {("CH001", 1)},
+        "a generic parameter list nests",
+    ),
+    (
+        "// fn deep<T: Into<Vec<Box<Option<u8>>>>>() {}\n",
+        {("CH001", 1)},
+        "to any depth, not to a counted one",
+    ),
+    (
+        "// fn ptr<F: Fn(u8) -> u8>(f: F) -> u8 {\n",
+        {("CH001", 1)},
+        "and may hold the parentheses of a function bound",
+    ),
+    (
+        "// impl<T: Into<Vec<u8>>> Tr<T> for R {\n",
+        {("CH001", 1)},
+        "on an impl as well as a function",
+    ),
+    (
+        "// Compare a < b and c > d in the queue\n",
+        set(),
+        "but prose that compares two things is prose",
     ),
     (
         "// pub fn one() -> u8 { 1 }\n",
