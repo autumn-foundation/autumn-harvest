@@ -3055,3 +3055,32 @@ the build.
 Corpus effect: none. Every CH002 fixture from rounds sixty-three to
 ninety-eight was re-run: twenty-five cases, all unchanged. Four new
 fixtures.
+
+### Round one hundred — the same two shapes, one round on
+
+Two findings, and both had a sibling the report did not name.
+
+`// use foo::{bar::{Baz, Qux}, Quux};` produced no CH001: a grouped use
+tree nests, and its group was matched by a class of what may sit inside
+one. That is round ninety-eight's lesson in a second place, so it takes
+round ninety-eight's answer -- the group is bounded by the `;` that ends
+the declaration. Asking where else the file bounds a nested construct by
+its contents found one more, unreported: an attribute's class had no `!`,
+so `#[doc = include_str!("../README.md")]` was outside the gate. It is
+bounded by the `]` that closes it at the end of the line now.
+
+`// TODO: compare vs. the baseline under #123` was already fixed by round
+ninety-nine, which reads the token after the period rather than a list of
+abbreviations. But `Dr.`, which the report also named, was not: a title is
+followed by a CAPITAL, and that is the one case the next-token test cannot
+read.
+
+So a list is kept for those -- and a list is the right tool here, which is
+worth distinguishing from round ninety-eight. Nesting is structural and
+unbounded, so counting levels always leaves a next level. Abbreviations
+are a LEXICAL set: finite, and enumerable in the language rather than in
+the grammar. Entries are only needed for forms a capital may follow, so
+`approx. 5` and `etc. and` are still read without one.
+
+Corpus effect: none. Every CH001 and CH002 fixture from rounds sixty-three
+to ninety-nine was re-run unchanged. Four new fixtures.

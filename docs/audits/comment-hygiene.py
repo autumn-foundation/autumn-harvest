@@ -336,9 +336,17 @@ COMMENTED_CODE_RE = re.compile(
       # and `pub(crate) use crate::x;` are the forms this tree actually
       # writes, and neither could reach the rule.
       | {VIS}
-            use\s+(?:(?:r\#)?\w+::)*(?:(?:r\#)?\w+|\*|\{[\w:,\s*\#]+\})
+            # A grouped use tree NESTS -- `use foo::{bar::{Baz}, Qux};`
+            # -- so the group is bounded by the `;` that ends the
+            # declaration rather than by a class of what may sit in it,
+            # for the reason `GENERICS` is.
+            use\s+(?:(?:r\#)?\w+::)*(?:(?:r\#)?\w+|\*|\{[^;]*\})
             (?:\s+as\s+(?:r\#)?\w+)?;\s*$
-      | \#!?\[[\w:()"'=,./\s-]+\]\s*$
+      # An attribute, bounded by the `]` that closes it at the end of the
+      # line rather than by a class of what may sit inside. A class refused
+      # `#[doc = include_str!("../README.md")]` for want of a `!`, and the
+      # next nested form would have wanted something else.
+      | \#!?\[.*\]\s*$
       | \}[,;)]*\s*$
       | (?:(?:r\#)?\w+::)*(?:r\#)?\w+!(?:\(.*\)|\[.*\]|\{.*\})\s*;\s*$  # macro stmt
       # A macro DEFINITION, which ends at its brace rather than a `;`.
@@ -430,11 +438,27 @@ TODO_REF_RE = re.compile(REFERENCE)
 # "ready." into \u201cready.\u201d changes nothing a reader sees and
 # everything an ASCII class matches.
 #
-# The abbreviation guards still earn their place, for the abbreviation
-# followed by a capital that the next-token test cannot read: "use e.g.
-# Postgres for the shard" is one sentence.
+# An abbreviation followed by a CAPITAL is the one case the next-token test
+# cannot read: "ask Dr. Smith" and "add retries. See" look identical to it.
+# So a list is kept -- and a list is the right tool here, unlike the
+# counted nesting depth of round ninety-eight, because abbreviations are a
+# LEXICAL set and nesting is not. Entries are only needed for forms a
+# capital may follow; `approx. 5` and `etc. and` are read without one.
+#
+# Each guard is a fixed-width lookbehind, which is all Python allows, so
+# they are generated rather than written out.
+ABBREVIATIONS = (
+    "e.g", "E.g", "i.e", "I.e", "cf", "Cf", "vs", "Vs", "viz", "al",
+    "etc", "Etc", "resp", "approx", "ca", "Dr", "Mr", "Mrs", "Ms",
+    "Prof", "Sr", "Jr", "St", "Fig", "No", "Ref", "Eq", "Sec", "Ch",
+    "Vol",
+)
+ABBREVIATION_GUARD = "".join(
+    rf"(?<!\b{re.escape(name)})" for name in ABBREVIATIONS
+)
 SENTENCE_END_RE = re.compile(
-    r"(?<!e\.g)(?<!E\.g)(?<!i\.e)(?<!I\.e)[.!?]"
+    ABBREVIATION_GUARD
+    + r"[.!?]"
     r"[*_\"')\]\u2019\u201d\u00bb]*"
     r"(?=\s+[A-Z\"'(\[\u201c\u2018]|\s*$)"
 )
@@ -4995,6 +5019,16 @@ RULE_TESTS = [
         "and the semicolon of an array type, which ends no declaration",
     ),
     (
+        "// use foo::{bar::{Baz, Qux}, Quux};\n",
+        {("CH001", 1)},
+        "a use tree nests as a generic list does",
+    ),
+    (
+        '// #[doc = include_str!("../README.md")]\n',
+        {("CH001", 1)},
+        "and an attribute may hold a macro call",
+    ),
+    (
         "// impl<T: Into<Vec<u8>>> Tr<T> for R {\n",
         {("CH001", 1)},
         "on an impl as well as a function",
@@ -5331,6 +5365,16 @@ RULE_TESTS = [
         "// TODO: retain approx. 5 retries. See #123 for the parser.\n",
         {("CH002", 1)},
         "but a real next sentence still ends the marker's",
+    ),
+    (
+        "// TODO: ask Dr. Smith about #123\n",
+        set(),
+        "a title before a name is the case the next token cannot read",
+    ),
+    (
+        "// TODO: compare vs. Baseline under #123\n",
+        set(),
+        "and so is any listed abbreviation before a capital",
     ),
 ]
 
