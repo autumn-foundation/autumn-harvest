@@ -865,7 +865,9 @@ def indented_code(
     )
 
 
-def starts_block(text: str, container: int, paragraph: bool = False) -> bool:
+def starts_block(
+    text: str, container: int, paragraph: bool = False, doc: bool = True
+) -> bool:
     """Does `text` begin a CommonMark block other than a paragraph?
 
     `paragraph` says one is already open, which only an INTERRUPTING list
@@ -884,7 +886,11 @@ def starts_block(text: str, container: int, paragraph: bool = False) -> bool:
     return (
         opens_fence(text, container)
         or heading(text, container)
-        or html_block(text, container)
+        # DOC COMMENTS ONLY, the same scope `lazy_continuation` gives it and
+        # the same one round fifty-two gave the HTML exemption. Nothing
+        # renders a `//` comment, so "<pre>" there opens no block. Defaulted
+        # on, so the table-end callers keep the question they always asked.
+        or (doc and html_block(text, container))
         or thematic_break(text, container)
         or (
             bool(list_content(text, container))
@@ -1710,6 +1716,7 @@ def lazy_continuation(
     pieces: list,
     index: int,
     nest: int,
+    doc: bool,
 ) -> bool:
     """Does this line carry a quoted paragraph on without a marker of its own?
 
@@ -1738,7 +1745,12 @@ def lazy_continuation(
         and not list_content(text, container)
         and not table_header(pieces, index, nest, peeled, container)
         and not heading(peeled, container)
-        and not html_block(peeled, container)
+        # DOC COMMENTS ONLY, by the rule round fifty-two set: nothing renders
+        # a `//` comment, so "<pre>" there is five literal characters and no
+        # block at all. Every OTHER test here holds in both -- a heading, a
+        # rule and a list marker are block syntax this tree writes in plain
+        # comments too -- so HTML is the one that takes the marker.
+        and not (doc and html_block(peeled, container))
         # The COMMONMARK break, not the broad decorative rule. `SEPARATOR_RE`
         # answers "is this a section rule?" -- unbounded on purpose, because
         # a rule is not a word of a sentence at any indent, which is the
@@ -2051,6 +2063,7 @@ def comment_lines(pieces: list[Piece]):
                     run,
                     index,
                     piece.nest,
+                    piece.marker in DOC_MARKERS,
                 )
                 # A confirmed table and a Setext heading are blocks that
                 # `starts_block` cannot name. A table needs the piece after
@@ -2087,7 +2100,9 @@ def comment_lines(pieces: list[Piece]):
                 )
                 opens = (
                     opens
-                    or starts_block(body, enclosing, open_paragraph)
+                    or starts_block(
+                        body, enclosing, open_paragraph, piece.marker in DOC_MARKERS
+                    )
                     or (quoted != before_quoted and not lazy)
                     or (
                         piece.marker in DOC_MARKERS
@@ -2483,7 +2498,16 @@ def prose_units(pieces: list[Piece]) -> list[tuple[int, str]]:
             # here and only here, and the span pass then reported a boundary
             # on a line this loop knew was no boundary at all.
             lazy = lazy_continuation(
-                body, peeled, container, depth, quoted, bool(run), block, index, piece.nest
+                body,
+                peeled,
+                container,
+                depth,
+                quoted,
+                bool(run),
+                block,
+                index,
+                piece.nest,
+                piece.marker in DOC_MARKERS,
             )
             if depth != quoted and not lazy:
                 flush()
@@ -2521,10 +2545,16 @@ def prose_units(pieces: list[Piece]) -> list[tuple[int, str]]:
             # closes a plain banner with a rule of hyphens. Sixty-six real
             # sentences sat above one, and discarding them as heading titles
             # stopped measuring prose that no renderer ever sees as a title.
+            # And only a paragraph in its OWN container. `comment_lines`
+            # gained this test in round seventy-eight and this loop did not:
+            # a line that leaves a quote underlines nothing, so discarding
+            # the run there threw away a quoted sentence and the narrative
+            # aside inside it.
             if (
                 run
                 and piece.marker in DOC_MARKERS
                 and setext_underline(peeled, container)
+                and depth == quoted
             ):
                 run, run_lines = [], []
                 in_list = False
@@ -4422,6 +4452,18 @@ RULE_TESTS = [
         "/// TODO: issue required` suffix.\n",
         set(),
         "unless it is indented past its container",
+    ),
+    (
+        "// > Explain the `literal\n"
+        "// <pre> TODO: issue required` suffix.\n",
+        set(),
+        "a tag opens no block in a // comment, so the quote carries on",
+    ),
+    (
+        "/// > Actually, explain this behavior\n"
+        "/// ===\n",
+        {("CH003", 1)},
+        "and an underline across a quote edge titles nothing",
     ),
 ]
 

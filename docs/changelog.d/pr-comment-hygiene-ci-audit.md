@@ -2423,3 +2423,32 @@ the separator test borrowed one that is deliberately unbounded. Both
 were reasonable at a glance and both were wrong, and no check here can
 see it -- the harness compares behaviour, and a rule that is wrong only
 in shapes the corpus lacks behaves identically to a right one.
+
+### Round seventy-nine — both halves of a rule I applied to one half
+
+Two findings, both in code this review produced, and both the same
+mistake: a scope applied in one of the two places that needed it.
+
+**HTML is doc-only, in one predicate out of two.** Round fifty-two
+established that nothing renders a `//` comment, so a tag there is
+literal characters. `lazy_continuation` tested `html_block` without that
+scope, and so did `starts_block` one clause away -- so fixing the first
+alone changed nothing, exactly as in round seventy-seven. Both take the
+marker now. Every other test in those predicates holds in both comment
+kinds: a heading, a rule and a list marker are block syntax this tree
+writes in plain comments too, which is why HTML is the only one that
+needed the flag.
+
+**The Setext container gate, in one loop out of two.** Round
+seventy-eight taught `comment_lines` that an underline titles only a
+paragraph in its own container. `prose_units` has the same branch and
+did not learn it, so `> Actually, explain this behavior` followed by an
+unquoted `===` discarded the whole run as a heading title -- and the
+narrative aside inside it with the run.
+
+That second one is the sharper of the two. Round seventy-seven's lesson
+was to grep for every site asking the same question and assert the match
+count before editing. Round seventy-eight added a condition to one of
+two sites and did not run that check, and this is the finding.
+
+Corpus effect: none. Two fixtures.
