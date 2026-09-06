@@ -705,11 +705,11 @@ mod db {
     /// The cutover guard for issue #1317's legal-hold race.
     ///
     /// `verify_target_copy` stamps the source's `legal_hold_set_at` as it
-    /// stood at verification time. A hold placed or released after that, and
-    /// before the cutover, is exactly the drift `set_legal_hold`/release leave
-    /// behind: `legal_hold_set_at` moves from NULL to a timestamp, or back.
-    /// Requiring the live value to still match here closes the window the
-    /// same way `HISTORY_UNCHANGED_SQL` closes it for appended events.
+    /// stood at verification time. A hold placed or released before the
+    /// cutover is exactly the drift `set_legal_hold`/release leave behind:
+    /// `legal_hold_set_at` moves from NULL to a timestamp, or back. Requiring
+    /// the live value to still match here closes the window, the same way
+    /// `HISTORY_UNCHANGED_SQL` closes it for appended events.
     const LEGAL_HOLD_UNCHANGED_SQL: &str = "\
         EXISTS (SELECT 1 FROM harvest_shard_migrations m \
                  WHERE m.execution_id = e.id \
@@ -1393,10 +1393,9 @@ mod db {
     ) -> HarvestResult<()> {
         // Nothing to discard unless staging actually replaced this row
         // (issue #1317). A target that still holds its own pre-existing
-        // `MIGRATED` seal, untouched, is not a staged copy. Deleting its
-        // history and the row below would destroy a real seal that
-        // `stage_copy` never reached — e.g. because it failed before its
-        // target transaction committed.
+        // `MIGRATED` seal, untouched, is not a staged copy. `stage_copy` can
+        // fail before its target transaction commits. Deleting the history
+        // and the row below would then destroy a real, untouched seal.
         let row: Option<TextRow> = diesel::sql_query(
             "SELECT state AS value FROM harvest_workflow_executions WHERE id = $1",
         )
@@ -1634,9 +1633,9 @@ mod db {
         let (verified_count, verified_max) = history_high_water_mark(&source_raw);
 
         // The same fail-closed shape for legal holds (issue #1317). Re-read
-        // NOW, right before the stamp, so the window the cutover guard cannot
-        // close on its own -- a hold placed or released between `stage_copy`'s
-        // snapshot and this read -- shrinks to nothing.
+        // NOW, right before the stamp. A hold placed or released between
+        // `stage_copy`'s snapshot and this read is the window the cutover
+        // guard cannot close on its own. This read shrinks it to nothing.
         let legal_hold_set_at: Option<DateTime<Utc>> = {
             let row: LegalHoldRow = diesel::sql_query(
                 "SELECT legal_hold_set_at AS value FROM harvest_workflow_executions \
@@ -2403,8 +2402,8 @@ mod db {
                 continue;
             }
             // A `?` here would skip the audit write below on any error from
-            // `migrate_execution` itself (issue #1317) -- including one raised
-            // AFTER the cutover already sealed the source, which is exactly
+            // `migrate_execution` itself (issue #1317). That includes one
+            // raised AFTER the cutover already sealed the source -- exactly
             // the record an operator most needs. Turn the error into an
             // auditable outcome instead of propagating it.
             let outcome = match migrate_execution(
@@ -2556,10 +2555,10 @@ mod db {
         for record in unsettled {
             let exec_id = record.execution_id;
             // A `?` here would exit the whole sweep on one record naming an
-            // unavailable or unconfigured shard (issue #1317), starving every
-            // later record behind it -- including a settled one whose own
-            // target is perfectly healthy. Record the failure and move on, the
-            // same way an error from a migration STEP is already handled below.
+            // unavailable or unconfigured shard (issue #1317). That starves
+            // every later record behind it, including a settled one whose own
+            // target is healthy. Record the failure and move on, the same way
+            // an error from a migration STEP is already handled below.
             let checked_out = async {
                 let source = checkout(pool, record.source_shard).await?;
                 let target = checkout(pool, record.target_shard).await?;

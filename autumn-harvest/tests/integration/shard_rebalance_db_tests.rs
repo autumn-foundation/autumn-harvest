@@ -2407,18 +2407,18 @@ async fn a_declared_retired_forward_requires_its_successor_pool() {
 
 // ── Issue #1317: seal-predicate and abort-restore hardening ─────────────────
 //
-// Round 6-12 review of PR #1305 found that `existing_seal` (read before a
-// reverse-migration restage) and the abort-restore fallback both key off
-// `state` rather than the forwarding pointer, unlike `read_forward`. Both
-// windows can destroy the one seal every A-origin id resolves through.
+// Issue #1317 found that `existing_seal` (read before a reverse-migration
+// restage) and the abort-restore fallback both key off `state` rather than
+// the forwarding pointer, unlike `read_forward`. Both windows can destroy the
+// one seal every A-origin id resolves through.
 
 #[tokio::test]
 async fn a_repeated_stage_after_an_interrupted_resume_keeps_the_carried_seal() {
-    // A -> B, then B -> A begins and stages successfully: A is now MIGRATING
-    // and carries A's own prior seal (pointing at B) so ids keep resolving
+    // A -> B, then B -> A begins and stages successfully. A is now MIGRATING.
+    // It carries A's own prior seal, pointing at B, so ids keep resolving
     // during staging. Model a crash between that target commit and the
-    // source-side phase advance by resetting the record back to PENDING --
-    // exactly what a resume sweep observes and re-drives with a second
+    // source-side phase advance. Reset the record back to PENDING. A resume
+    // sweep observes exactly this state and re-drives it with a second
     // `stage_copy` call.
     let shards = setup_two_shards().await;
     let exec_id = quiescent_fixture(&shards, "resume-carries-seal").await;
@@ -2464,11 +2464,11 @@ async fn a_repeated_stage_after_an_interrupted_resume_keeps_the_carried_seal() {
 
 #[tokio::test]
 async fn aborting_before_staging_ever_touched_the_target_leaves_its_seal_untouched() {
-    // A -> B seals A. A B -> A reverse migration is opened but `stage_copy`
-    // never ran against A (the equivalent of it failing before its target
-    // transaction committed) -- A's row is exactly the untouched original
-    // seal. Abort must recognize "nothing to discard" and leave it alone
-    // rather than falling through to a DELETE that matches on `state` alone.
+    // A -> B seals A. A B -> A reverse migration is opened. `stage_copy` never
+    // ran against A, the equivalent of it failing before its target
+    // transaction committed. A's row is exactly the untouched original seal.
+    // Abort must recognize "nothing to discard" and leave it alone, rather
+    // than falling through to a DELETE that matches on `state` alone.
     let shards = setup_two_shards().await;
     let exec_id = quiescent_fixture(&shards, "abort-never-staged").await;
 
@@ -2518,9 +2518,9 @@ async fn aborting_before_staging_ever_touched_the_target_leaves_its_seal_untouch
 
 #[tokio::test]
 async fn a_hold_placed_after_verification_refuses_the_cutover() {
-    // Round 6 finding #5: `stage_copy` snapshots the row with no lock, so a
-    // hold placed afterwards lands only on the source. The cutover must not
-    // seal a source whose hold state has moved since the copy it is about to
+    // Issue #1317: `stage_copy` snapshots the row with no lock, so a hold
+    // placed afterwards lands only on the source. The cutover must not seal a
+    // source whose hold state has moved since the copy it is about to
     // authorize was verified.
     let shards = setup_two_shards().await;
     let exec_id = quiescent_fixture(&shards, "hold-during-staging").await;
@@ -2629,9 +2629,9 @@ async fn a_hold_released_after_verification_also_refuses_the_cutover() {
 
 #[tokio::test]
 async fn a_resume_sweep_finishes_healthy_records_past_one_unreachable_target() {
-    // Round 8 finding: `resume_incomplete_migrations` checked out its per-record
-    // source/target connections with `?`, so one record naming an unavailable
-    // or unconfigured target shard aborted the whole sweep -- including a
+    // Issue #1317: `resume_incomplete_migrations` checked out its per-record
+    // source/target connections with `?`. One record naming an unavailable or
+    // unconfigured target shard aborted the whole sweep. That starved a
     // record whose own target is perfectly healthy and sits right behind it.
     let shards = setup_two_shards().await;
 

@@ -7505,9 +7505,9 @@ pub async fn persist_workflow_failure(
     // The shard the retry successor must be minted on (issue #1317). `exec_id`
     // carries its ORIGIN shard bits, which go stale the moment this row is
     // rebalanced. `conn` is already connected to wherever the row actually
-    // lives, so its own `shard_id` column is the answer -- no cross-shard
-    // resolver call needed. Minting on the origin instead would insert the
-    // successor there with no forwarding row for its new id, making it
+    // lives, so its own `shard_id` column is the answer. No cross-shard
+    // resolver call is needed. Minting on the origin instead would insert the
+    // successor there with no forwarding row for its new id. It would be
     // unreachable by every id-routed handle and API.
     let current_shard = crate::shard_rebalance::shard_of_held_row(conn, exec_id)
         .await
@@ -16622,12 +16622,12 @@ pub async fn persist_workflow_continue_as_new(
     // database as its predecessor.
     //
     // Read off `execution.shard_id`, not `persistence.exec_id.shard()`
-    // (issue #1317): the id carries the predecessor's ORIGIN shard bits, which
-    // go stale once it is rebalanced. `execution` is the row already loaded
-    // from wherever it actually lives, so its own column is the current
-    // residence. Minting on the origin instead would insert the successor
-    // there with no forwarding row for its new id -- unreachable by every
-    // id-routed handle and API.
+    // (issue #1317). The id carries the predecessor's ORIGIN shard bits,
+    // which go stale once it is rebalanced. `execution` is the row already
+    // loaded from wherever it actually lives, so its own column is the
+    // current residence. Minting on the origin instead would insert the
+    // successor with no forwarding row for its new id. It would be
+    // unreachable by every id-routed handle and API.
     let new_exec_id = ExecutionId::new_for_shard(ShardId::new(execution.shard_id));
     let task_id = persistence.task.id;
     let crash_strikes = persistence.task.crash_strikes;
