@@ -3060,6 +3060,84 @@ async fn completion_trigger_defers_to_outbox_when_target_quota_exceeded() {
     );
 }
 
+// ── Outbox backoff/starvation test helpers (issue #1227 Finding 4) ─────────
+
+async fn insert_outbox_row(
+    conn: &mut AsyncPgConnection,
+    workflow_name: &str,
+    input: serde_json::Value,
+) -> Uuid {
+    diesel::insert_into(harvest_completion_trigger_outbox::table)
+        .values(&NewCompletionTriggerOutboxDb {
+            source_exec_id: Uuid::new_v4(),
+            trigger_id: Uuid::new_v4(),
+            target_shard: 0,
+            target_workflow_name: workflow_name.to_string(),
+            target_workflow_id: format!("target-{}", Uuid::new_v4().simple()),
+            target_input: input,
+            queue_name: None,
+            concurrency_key: None,
+            concurrency_limit: None,
+            priority: serde_json::to_value(Priority::default()).unwrap(),
+            max_workflow_input_bytes: 1_000_000,
+        })
+        .get_result::<CompletionTriggerOutboxDb>(conn)
+        .await
+        .expect("insert outbox row")
+        .id
+}
+
+async fn outbox_next_attempt_at(
+    conn: &mut AsyncPgConnection,
+    id: Uuid,
+) -> Option<chrono::DateTime<chrono::Utc>> {
+    #[derive(diesel::QueryableByName)]
+    struct Row {
+        #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Timestamptz>)]
+        next_attempt_at: Option<chrono::DateTime<chrono::Utc>>,
+    }
+    diesel::sql_query("SELECT next_attempt_at FROM harvest_completion_trigger_outbox WHERE id = $1")
+        .bind::<diesel::sql_types::Uuid, _>(id)
+        .get_result::<Row>(conn)
+        .await
+        .expect("row must still exist")
+        .next_attempt_at
+}
+
+async fn outbox_row_exists(conn: &mut AsyncPgConnection, id: Uuid) -> bool {
+    #[derive(diesel::QueryableByName)]
+    struct IdRow {
+        #[diesel(sql_type = diesel::sql_types::Uuid)]
+        #[allow(dead_code)]
+        id: Uuid,
+    }
+    diesel::sql_query("SELECT id FROM harvest_completion_trigger_outbox WHERE id = $1")
+        .bind::<diesel::sql_types::Uuid, _>(id)
+        .get_result::<IdRow>(conn)
+        .await
+        .is_ok()
+}
+
+// `created_at` defaults to `now()` at insertion, which is NOT a reliable
+// ordering signal for these tests: several inserts issued back-to-back on the
+// same connection can land in the same microsecond (more likely still under a
+// loaded CI host running the rest of this suite concurrently), and a
+// `created_at` tie makes `ORDER BY created_at ASC` pick an unspecified order
+// among the tied rows -- silently breaking a test's ordering assumption.
+// Stamp `created_at` explicitly instead.
+async fn set_outbox_created_at(
+    conn: &mut AsyncPgConnection,
+    id: Uuid,
+    created_at: chrono::DateTime<chrono::Utc>,
+) {
+    diesel::sql_query("UPDATE harvest_completion_trigger_outbox SET created_at = $2 WHERE id = $1")
+        .bind::<diesel::sql_types::Uuid, _>(id)
+        .bind::<diesel::sql_types::Timestamptz, _>(created_at)
+        .execute(conn)
+        .await
+        .expect("stamp created_at");
+}
+
 /// Issue #1227 Finding 4: pre-fix, `enforce_completion_triggers_outbox`'s
 /// claim query had no `ORDER BY` and no per-row backoff tracking at all -- a
 /// `QuotaBlocked` outcome left the outbox row completely untouched (neither
@@ -3107,64 +3185,6 @@ async fn quota_blocked_outbox_row_gets_backoff_and_does_not_starve_a_sibling_row
     )
     .await;
 
-    async fn insert_outbox_row(
-        conn: &mut AsyncPgConnection,
-        workflow_name: &str,
-        input: serde_json::Value,
-    ) -> Uuid {
-        diesel::insert_into(harvest_completion_trigger_outbox::table)
-            .values(&NewCompletionTriggerOutboxDb {
-                source_exec_id: Uuid::new_v4(),
-                trigger_id: Uuid::new_v4(),
-                target_shard: 0,
-                target_workflow_name: workflow_name.to_string(),
-                target_workflow_id: format!("target-{}", Uuid::new_v4().simple()),
-                target_input: input,
-                queue_name: None,
-                concurrency_key: None,
-                concurrency_limit: None,
-                priority: serde_json::to_value(Priority::default()).unwrap(),
-                max_workflow_input_bytes: 1_000_000,
-            })
-            .get_result::<CompletionTriggerOutboxDb>(conn)
-            .await
-            .expect("insert outbox row")
-            .id
-    }
-
-    async fn outbox_next_attempt_at(
-        conn: &mut AsyncPgConnection,
-        id: Uuid,
-    ) -> Option<chrono::DateTime<chrono::Utc>> {
-        #[derive(diesel::QueryableByName)]
-        struct Row {
-            #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Timestamptz>)]
-            next_attempt_at: Option<chrono::DateTime<chrono::Utc>>,
-        }
-        diesel::sql_query(
-            "SELECT next_attempt_at FROM harvest_completion_trigger_outbox WHERE id = $1",
-        )
-        .bind::<diesel::sql_types::Uuid, _>(id)
-        .get_result::<Row>(conn)
-        .await
-        .expect("blocked row must still exist")
-        .next_attempt_at
-    }
-
-    async fn outbox_row_exists(conn: &mut AsyncPgConnection, id: Uuid) -> bool {
-        #[derive(diesel::QueryableByName)]
-        struct IdRow {
-            #[diesel(sql_type = diesel::sql_types::Uuid)]
-            #[allow(dead_code)]
-            id: Uuid,
-        }
-        diesel::sql_query("SELECT id FROM harvest_completion_trigger_outbox WHERE id = $1")
-            .bind::<diesel::sql_types::Uuid, _>(id)
-            .get_result::<IdRow>(conn)
-            .await
-            .is_ok()
-    }
-
     // The claim query's `LIMIT`, kept in lockstep with
     // `enforce_completion_triggers_outbox`'s hardcoded `.limit(50)` so this
     // test fails loudly (not silently under-provisions the batch) if that
@@ -3182,20 +3202,6 @@ async fn quota_blocked_outbox_row_gets_backoff_and_does_not_starve_a_sibling_row
     // strictly increasing by a whole second per row, so the intended order is
     // exact regardless of real wall-clock resolution.
     let base_created_at = chrono::Utc::now() - chrono::Duration::hours(1);
-    async fn set_created_at(
-        conn: &mut AsyncPgConnection,
-        id: Uuid,
-        created_at: chrono::DateTime<chrono::Utc>,
-    ) {
-        diesel::sql_query(
-            "UPDATE harvest_completion_trigger_outbox SET created_at = $2 WHERE id = $1",
-        )
-        .bind::<diesel::sql_types::Uuid, _>(id)
-        .bind::<diesel::sql_types::Timestamptz, _>(created_at)
-        .execute(conn)
-        .await
-        .expect("stamp created_at");
-    }
 
     let mut blocked_outbox_ids = Vec::with_capacity(BLOCKED_ROW_COUNT);
     for i in 0..BLOCKED_ROW_COUNT {
@@ -3205,7 +3211,7 @@ async fn quota_blocked_outbox_row_gets_backoff_and_does_not_starve_a_sibling_row
             serde_json::json!({"tenant_id": "acme"}),
         )
         .await;
-        set_created_at(
+        set_outbox_created_at(
             &mut conn,
             id,
             base_created_at + chrono::Duration::seconds(i64::try_from(i).expect("small index")),
@@ -3215,7 +3221,7 @@ async fn quota_blocked_outbox_row_gets_backoff_and_does_not_starve_a_sibling_row
     }
     let oldest_blocked_outbox_id = blocked_outbox_ids[0];
     let free_outbox_id = insert_outbox_row(&mut conn, free_wf, serde_json::json!({})).await;
-    set_created_at(
+    set_outbox_created_at(
         &mut conn,
         free_outbox_id,
         base_created_at
@@ -3298,4 +3304,114 @@ async fn quota_blocked_outbox_row_gets_backoff_and_does_not_starve_a_sibling_row
     );
 
     drop(guard);
+}
+
+/// Issue #1227 Finding 4, Codex round-1 P1 (PR #1386): ordering the claim
+/// batch by `created_at` ALONE (the initial fix above) is not enough. Once
+/// `WorkerRuntimeConfig::poll_interval` is at or above `QUOTA_REDEFER_BACKOFF`
+/// (5s), a persistently-blocked row's stamped backoff has always re-elapsed
+/// by the NEXT scan -- so it goes right back to being one of the 50 OLDEST
+/// eligible rows, the exact same batch reloads forever, and a newer, healthy
+/// row still never gets a turn. This reproduces exactly that: a large batch
+/// of blocked rows whose backoff has ALREADY expired (simulating "the next
+/// scan after a slow poll interval"), all older by `created_at` than one
+/// never-before-attempted fresh row -- proving the fresh row is still
+/// reached on the very next scan rather than waiting behind the re-eligible
+/// backlog.
+#[tokio::test]
+async fn quota_blocked_outbox_never_attempted_rows_outrank_expired_quota_retries() {
+    let (url, _c) = setup_test_database_url_or_env().await;
+    let mut conn = connect(&url).await;
+
+    install_global_router(ShardRouter::single());
+    let sharded_pool = Some(ShardedDbPool::single(build_test_pool(&url)));
+
+    let blocked_wf = leaked("outbox_fairness_blocked");
+    let free_wf = leaked("outbox_fairness_free");
+
+    // A live blocker still occupies the ONE `max_active_executions` slot for
+    // tenant "acme" throughout this test, so every one of the 60 rows below
+    // is a GENUINE re-attempt against a still-exhausted quota once reclaimed
+    // -- simulating a batch that already had one failed attempt and is now
+    // due for another (a slow poll interval's steady state), not a
+    // one-off block that clears on its own.
+    let quota_policy = QuotaPolicy::new("tenant_id").with_max_active_executions(1);
+    let _guard = MetadataGuard::install_one(blocked_wf, quota_policy).await;
+    start_root(
+        &mut conn,
+        blocked_wf,
+        &format!("blocker-{}", Uuid::new_v4().simple()),
+        serde_json::json!({"tenant_id": "acme"}),
+    )
+    .await;
+
+    const CLAIM_BATCH_LIMIT: usize = 50;
+    const EXPIRED_RETRY_ROW_COUNT: usize = CLAIM_BATCH_LIMIT + 10;
+
+    let base_created_at = chrono::Utc::now() - chrono::Duration::hours(1);
+    let expired_next_attempt_at = chrono::Utc::now() - chrono::Duration::seconds(1);
+
+    let mut expired_retry_ids = Vec::with_capacity(EXPIRED_RETRY_ROW_COUNT);
+    for i in 0..EXPIRED_RETRY_ROW_COUNT {
+        let id = insert_outbox_row(
+            &mut conn,
+            blocked_wf,
+            serde_json::json!({"tenant_id": "acme"}),
+        )
+        .await;
+        set_outbox_created_at(
+            &mut conn,
+            id,
+            base_created_at + chrono::Duration::seconds(i64::try_from(i).expect("small index")),
+        )
+        .await;
+        diesel::sql_query(
+            "UPDATE harvest_completion_trigger_outbox SET next_attempt_at = $2 WHERE id = $1",
+        )
+        .bind::<diesel::sql_types::Uuid, _>(id)
+        .bind::<diesel::sql_types::Timestamptz, _>(expired_next_attempt_at)
+        .execute(&mut conn)
+        .await
+        .expect("stamp an already-expired backoff");
+        expired_retry_ids.push(id);
+    }
+
+    // Older than every expired-retry row by `created_at`, but NEVER
+    // attempted (`next_attempt_at IS NULL`) -- under `created_at`-only
+    // ordering this would still lose to all 60 of them; under the fixed
+    // `next_attempt_at NULLS FIRST` ordering it must win regardless.
+    let fresh_outbox_id = insert_outbox_row(&mut conn, free_wf, serde_json::json!({})).await;
+    set_outbox_created_at(
+        &mut conn,
+        fresh_outbox_id,
+        base_created_at - chrono::Duration::hours(1),
+    )
+    .await;
+
+    enforce_completion_triggers_outbox(&mut conn, &NoOpMetrics, &sharded_pool, &[ShardId::new(0)])
+        .await
+        .expect("single outbox scan");
+
+    assert!(
+        !outbox_row_exists(&mut conn, fresh_outbox_id).await,
+        "a never-before-attempted row must outrank a backlog of \
+         already-expired quota retries in the claim batch, even when it is \
+         younger by created_at -- otherwise a persistently re-eligible \
+         backlog starves every healthy row behind it forever once the poll \
+         interval is at or above the quota backoff (issue #1227 Finding 4, \
+         Codex round-1 P1)"
+    );
+
+    // A representative sample of the expired-retry rows must still have been
+    // reclaimed (re-stamped with a fresh backoff) despite losing the race for
+    // the fresh row's slot -- the fairness fix must not starve them either.
+    for id in expired_retry_ids.iter().take(5) {
+        let next = outbox_next_attempt_at(&mut conn, *id).await;
+        assert!(
+            next.is_some_and(|t| t > expired_next_attempt_at),
+            "an expired-retry row filling the rest of the batch must still \
+             be reclaimed and re-stamped, not starved by the fresh row's \
+             new priority"
+        );
+    }
 }

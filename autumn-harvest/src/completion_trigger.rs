@@ -863,19 +863,34 @@ async fn relay_gate_checked_start(
     // Claim the source outbox row `FOR UPDATE SKIP LOCKED` and hold the claim across
     // the whole relay (F-round19). `source_tx` is the claim transaction; `target_conn`
     // is a separate connection whose own transaction commits independently.
+    //
+    // The claim's `WHERE` re-checks the SAME backoff eligibility predicate the
+    // caller's batch `SELECT` already filtered on (Codex round-1 P2 on PR
+    // #1386): with multiple scanner replicas, that outer `SELECT` takes no
+    // lock, so a row loaded into replica A's batch can be claimed and
+    // QuotaBlocked-restamped by replica B in between -- without this
+    // re-check, A's `id`-only claim would still succeed once B's transaction
+    // commits and releases the row, driving an extra admission attempt on a
+    // row whose backoff a peer just (re)armed, one bypass per stale reader.
+    let now = chrono::Utc::now();
     let outcome = Box::pin(source_conn
         .transaction::<RelayOutcome, crate::error::HarvestError, _>(async |source_tx| {
             let claimed: Option<ClaimedId> = diesel::sql_query(
                 "SELECT id FROM harvest_completion_trigger_outbox \
-                 WHERE id = $1 FOR UPDATE SKIP LOCKED",
+                 WHERE id = $1 AND (next_attempt_at IS NULL OR next_attempt_at <= $2) \
+                 FOR UPDATE SKIP LOCKED",
             )
             .bind::<diesel::sql_types::Uuid, _>(outbox_id)
+            .bind::<diesel::sql_types::Timestamptz, _>(now)
             .get_result::<ClaimedId>(source_tx)
             .await
             .optional()
             .map_err(crate::error::database_error)?;
             if claimed.is_none() {
-                // A sibling relay path / peer replica owns this row right now.
+                // Either a sibling relay path / peer replica owns this row
+                // right now, or its backoff has not elapsed (including one a
+                // concurrent replica just armed after this row was loaded
+                // into the caller's batch).
                 return Ok(RelayOutcome::Skipped);
             }
 
@@ -2015,11 +2030,24 @@ pub async fn enforce_completion_triggers_outbox(
     //
     // Issue #1227, Finding 4: excludes a row whose `next_attempt_at` backoff
     // (stamped by a prior `QuotaBlocked` relay outcome, see `RelayOutcome`)
-    // has not yet elapsed, and orders by `created_at` so an eligible batch is
-    // claimed FIFO. Pre-#1227 this had neither the filter nor an `ORDER BY`:
-    // a row blocked against a durably exhausted quota could dominate every
+    // has not yet elapsed. Pre-#1227 this had no such filter at all: a row
+    // blocked against a durably exhausted quota could dominate every
     // unordered `LIMIT 50` batch on every tick, starving any OTHER,
     // unrelated relay that happened to sort after it.
+    //
+    // Ordering by `created_at` ALONE (the initial #1227 fix) was still not
+    // enough (Codex round-1 P1 on PR #1386): once `WorkerRuntimeConfig::
+    // poll_interval` is at or above `QUOTA_REDEFER_BACKOFF` (5s), a
+    // persistently-blocked row's backoff has always re-elapsed by the next
+    // tick, so it goes straight back to being one of the 50 OLDEST eligible
+    // rows -- the exact same batch reloads forever and a newer, healthy row
+    // still never gets a turn. Ordering never-attempted rows
+    // (`next_attempt_at IS NULL`) ahead of ANY previously-blocked one (`.asc()
+    // .nulls_first()`, mirroring `cross_shard_child.rs`'s identical
+    // never-attempted-first pattern) fixes this: a fresh row is never stuck
+    // behind a cycling backlog of rows that have already had -- and failed --
+    // an attempt. `created_at` only breaks ties within each of those two
+    // tiers.
     let now = chrono::Utc::now();
     let pending_tasks = outbox_dsl::harvest_completion_trigger_outbox
         .filter(outbox_dsl::target_shard.eq_any(&shards))
@@ -2028,7 +2056,10 @@ pub async fn enforce_completion_triggers_outbox(
                 .is_null()
                 .or(outbox_dsl::next_attempt_at.le(now)),
         )
-        .order(outbox_dsl::created_at.asc())
+        .order((
+            outbox_dsl::next_attempt_at.asc().nulls_first(),
+            outbox_dsl::created_at.asc(),
+        ))
         .limit(50)
         .load::<CompletionTriggerOutboxDb>(conn)
         .await
