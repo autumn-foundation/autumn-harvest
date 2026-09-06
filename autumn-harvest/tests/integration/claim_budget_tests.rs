@@ -2646,21 +2646,21 @@ async fn zz_capture_capability_labels_claim_evidence() {
 /// predicate (issue #378 / Ledger perf pass), documented in
 /// `docs/performance-schedule-to-close.md`.
 ///
-/// Mirrors [`zz_capture_capability_labels_claim_evidence`] exactly in shape:
-/// `queue::claim_task_query()` is unmodified end to end (this predicate is a
+/// Mirrors [`zz_capture_capability_labels_claim_evidence`] exactly in shape.
+/// `queue::claim_task_query()` is unmodified end to end. This predicate is a
 /// plain inline column test —
 /// `schedule_to_close_at IS NULL OR schedule_to_close_at > NOW()` — not a
-/// subquery, so there is no query-shape fix to try). Every EXPLAIN /
+/// subquery, so there is no query-shape fix to try. Every EXPLAIN /
 /// `pg_stat_statements` pair below is captured from the exact same query text
 /// at two seeded states of `harvest_task_queue.schedule_to_close_at`:
 ///
 /// * `no-schedule-to-close` — every row's column is `NULL` (today's default
 ///   seed shape, and every other `ClaimGate` scenario's shape too).
 /// * `schedule-to-close` — every row carries a deadline 100 years in the
-///   future. Far enough out that it can never elapse during this capture no
-///   matter how long the run takes, so it excludes nothing — that isolates
+///   future. Far enough out that it can never elapse during this capture,
+///   no matter how long the run takes. It excludes nothing, which isolates
 ///   the predicate's *evaluation* cost from any change in which rows are
-///   eligible, and lets the same-run drain loop assert equal claimed counts
+///   eligible. The same-run drain loop then asserts equal claimed counts
 ///   as a correctness sanity check, exactly as the capability-labels capture
 ///   does.
 ///
@@ -2699,12 +2699,12 @@ async fn zz_capture_schedule_to_close_claim_evidence() {
     }
 
     // Heap-growth snapshot helper, used immediately before and after the real
-    // drain loop below: isolates how much of the aggregate pg_stat_statements
-    // buffer delta is attributable to MVCC bloat accumulating over the drain
-    // itself (10,000 individual claim UPDATEs with no VACUUM in between, the
-    // real production shape) rather than to the wider row alone -- a
-    // single-call EXPLAIN snapshot, seeded fresh and rolled back inside a
-    // transaction, can never see this: it never accumulates dead tuples.
+    // drain loop below. It isolates how much of the buffer delta comes from
+    // MVCC bloat during the drain itself, not from the wider row alone. The
+    // drain issues 10,000 individual claim UPDATEs with no VACUUM in
+    // between -- the real production shape. A single-call EXPLAIN snapshot,
+    // seeded fresh and rolled back inside a transaction, can never see
+    // this: it never accumulates dead tuples.
     #[derive(QueryableByName, Debug, Clone, Copy)]
     struct HeapStatRow {
         #[diesel(sql_type = diesel::sql_types::BigInt)]
@@ -2735,37 +2735,39 @@ async fn zz_capture_schedule_to_close_claim_evidence() {
     }
 
     // Captures the currently-seeded `no-schedule-to-close` fixture's
-    // `id`/`activity_id` values (and every other seeded column) so the
-    // `schedule-to-close` label can reuse them EXACTLY, rather than
-    // generating a fresh, independent set of random UUIDs for that label.
+    // `id`/`activity_id` values (and every other seeded column). The
+    // `schedule-to-close` label reuses them EXACTLY, instead of generating a
+    // fresh, independent set of random UUIDs for itself.
+    //
     // Every claim is a non-HOT `UPDATE` that touches every index on
     // `harvest_task_queue` (see Plan), not just
-    // `harvest_task_queue_schedule_to_close_idx` -- so if the two labels'
+    // `harvest_task_queue_schedule_to_close_idx`. Suppose the two labels'
     // primary-key and `activity_id` B-trees were seeded with independently
-    // random keys, page-split/traversal noise from those OTHER indexes could
-    // be comparable in size to the effect this capture attributes to
-    // `schedule_to_close_at` itself. Codex review on PR #1339 caught this:
-    // reuse identical indexed values across labels so `schedule_to_close_at`
-    // is the only input that actually varies between them.
+    // random keys instead. Page-split/traversal noise from those OTHER
+    // indexes could then rival the effect this capture attributes to
+    // `schedule_to_close_at` itself. Codex review on PR #1339 caught this.
+    // Reusing identical indexed values across labels makes
+    // `schedule_to_close_at` the only input that actually varies between
+    // them.
     //
-    // A PLAIN table, not a `TEMP` one: the per-depth `EXPLAIN` loop below
-    // calls this and its counterpart back to back on the same connection
-    // (`db::seed()` seeds once per depth, shared by both labels via a
-    // rolled-back `EXPLAIN` transaction for the first), where a `TEMP` table
-    // would have worked -- but the real-drain loop further down seeds and
-    // drains each label on its OWN freshly-`db::connect()`ed connection, and
-    // a `TEMP` table is connection-session-scoped, so it would not survive
-    // from the `no-schedule-to-close` label's connection to the
-    // `schedule-to-close` label's. Codex review on PR #1339 caught this too,
-    // on this same finding: a plain table is visible to any connection
-    // against the same database, which is what a snapshot meant to outlive
-    // the connection that took it actually needs.
+    // This snapshot is a PLAIN table, not a `TEMP` one. The per-depth
+    // `EXPLAIN` loop below calls this and its counterpart back to back, on
+    // the same connection. `db::seed()` seeds once per depth there. Both
+    // labels share it, via a rolled-back `EXPLAIN` transaction for the
+    // first -- a `TEMP` table would have worked there. But the real-drain loop
+    // further down seeds and drains each label on its OWN
+    // freshly-`db::connect()`ed connection. A `TEMP` table is
+    // connection-session-scoped, so it would not survive from the
+    // `no-schedule-to-close` label's connection to the `schedule-to-close`
+    // label's. Codex review on PR #1339 caught this too, on this same
+    // finding. A plain table is visible to any connection against the same
+    // database, which is what a cross-connection snapshot needs.
     //
-    // Numbered by `ROW_NUMBER() OVER (ORDER BY ctid)`, not `id`: `ctid`
-    // (physical tuple location) preserves original insertion order for a
+    // Numbered by `ROW_NUMBER() OVER (ORDER BY ctid)`, not `id`. `ctid`
+    // (physical tuple location) preserves original insertion order, for a
     // table that has only ever been bulk-loaded once with no intervening
-    // updates or deletes, whereas ordering by the random primary key would
-    // scramble it -- Codex review on PR #1339 caught that too, on this same
+    // updates or deletes. Ordering by the random primary key would scramble
+    // it instead. Codex review on PR #1339 caught that too, on this same
     // finding, before the connection-scoping problem above.
     async fn snapshot_seed_for_schedule_to_close(conn: &mut AsyncPgConnection) {
         diesel::sql_query("DROP TABLE IF EXISTS zz_stc_seed_snapshot")
@@ -2788,11 +2790,11 @@ async fn zz_capture_schedule_to_close_claim_evidence() {
 
     // Re-seeds `harvest_task_queue` for the `schedule-to-close` label from
     // the snapshot `snapshot_seed_for_schedule_to_close` took of the
-    // `no-schedule-to-close` label's own seed -- reusing its exact
-    // `id`/`activity_id` values in their original physical insertion order,
-    // rather than generating a fresh, independent random set (see that
-    // function's doc comment for why both matter). Drops the snapshot table
-    // once consumed.
+    // `no-schedule-to-close` label's own seed. Reuses its exact
+    // `id`/`activity_id` values, in their original physical insertion
+    // order, instead of generating a fresh, independent random set. See
+    // that function's doc comment for why both matter. Drops the snapshot
+    // table once consumed.
     async fn reseed_from_schedule_to_close_snapshot(
         conn: &mut AsyncPgConnection,
         schedule_to_close_sql: &str,
@@ -2834,45 +2836,47 @@ async fn zz_capture_schedule_to_close_claim_evidence() {
     }
 
     // A deadline that can never elapse during this capture, however long it
-    // runs, so it excludes nothing and isolates the predicate's evaluation
-    // cost from any change in which rows are eligible -- the same "made to
+    // runs. It excludes nothing, isolating the predicate's evaluation cost
+    // from any change in which rows are eligible. This is the same "made to
     // match, not exclude" design the capability-labels capture uses for its
-    // requirement. `NOW() + INTERVAL '1 hour'` was tried first and is wrong:
-    // Codex review on PR #1339 (P2) pointed out that the drain below has no
-    // overall wall-clock bound and already took ~15 minutes end to end in
-    // this pass's own environment, so a slower machine or a remote database
-    // could plausibly exceed an hour and start excluding later rows mid-drain
-    // -- turning `claimed < seeded.claimable_rows` into a hard failure of the
-    // equivalence assertion instead of a clean capture.
+    // requirement.
     //
-    // `'infinity'::timestamptz` was tried next and is ALSO wrong, for a
-    // different reason discovered by actually running this fix: it is a
-    // valid Postgres value that sorts after every finite timestamp, but the
-    // drain loop below calls the real `queue::claim_task()`, whose `claimed`
-    // CTE `RETURNING`s the full claimed row -- including
-    // `schedule_to_close_at` -- for Diesel to deserialize into a
-    // `chrono::DateTime<Utc>`. Chrono has no `infinity` sentinel, so that
-    // deserialization panics: "Tried to deserialize a timestamp that is too
-    // large for Chrono". A hundred years is comfortably inside
-    // `chrono::DateTime<Utc>`'s representable range (whose upper bound is
-    // roughly the year 262,000) while still being far longer than any
-    // realistic drain duration.
+    // `NOW() + INTERVAL '1 hour'` was tried first, and is wrong. Codex
+    // review on PR #1339 (P2) pointed out that the drain below has no
+    // overall wall-clock bound. It already took ~15 minutes end to end in
+    // this pass's own environment. A slower machine or a remote database
+    // could plausibly exceed an hour and start excluding later rows
+    // mid-drain. That would turn `claimed < seeded.claimable_rows` into a
+    // hard failure of the equivalence assertion, instead of a clean
+    // capture.
     //
-    // A THIRD problem, also caught by review rather than found here first:
-    // `NOW() + INTERVAL '100 years'` alone is evaluated once per SQL
-    // statement (Postgres's `NOW()` is stable within a statement), so every
-    // row in an `INSERT ... SELECT` gets the byte-identical timestamp.
-    // `harvest_task_queue_schedule_to_close_idx` is a B-tree, and Postgres's
-    // B-tree deduplication (PG13+) compresses repeated keys into posting
-    // lists far more efficiently than the genuinely distinct-per-row
-    // deadlines production sees (`NOW() + schedule_to_close` computed once
-    // per enqueue, at different enqueue times with different durations) --
-    // so a constant seeded value understates real index growth and could
-    // skew planner statistics unrepresentatively. `(i::text || ' seconds')::
-    // interval` spreads the seeded deadlines across up to ~28 hours (100,000
-    // seconds, covering the largest `BACKLOG_SWEEP` depth) while the
-    // 100-year base keeps every value far enough in the future to satisfy
-    // the first fix above regardless.
+    // `'infinity'::timestamptz` was tried next, and is ALSO wrong -- for a
+    // different reason, discovered by actually running this fix. It is a
+    // valid Postgres value that sorts after every finite timestamp. But the
+    // drain loop below calls the real `queue::claim_task()`. Its `claimed`
+    // CTE `RETURNING`s the claimed row, including `schedule_to_close_at`,
+    // for Diesel to deserialize into a `chrono::DateTime<Utc>`. Chrono has
+    // no `infinity` sentinel, so that deserialization panics: "Tried to
+    // deserialize a timestamp that is too large for Chrono". A hundred
+    // years is comfortably inside `chrono::DateTime<Utc>`'s representable
+    // range -- roughly to the year 262,000. That is still far longer than
+    // any realistic drain duration.
+    //
+    // A THIRD problem was also caught by review, rather than found here
+    // first. `NOW() + INTERVAL '100 years'` alone is evaluated once per SQL
+    // statement -- Postgres's `NOW()` is stable within a statement. So
+    // every row in an `INSERT ... SELECT` gets the byte-identical
+    // timestamp. `harvest_task_queue_schedule_to_close_idx` is a B-tree.
+    // Postgres's B-tree deduplication (PG13+) compresses repeated keys into
+    // posting lists, far more efficiently than production's genuinely
+    // distinct-per-row deadlines. Production computes
+    // `NOW() + schedule_to_close` once per enqueue, at different times with
+    // different durations. So a constant seeded value understates real
+    // index growth, and could skew planner statistics unrepresentatively.
+    // `(i::text || ' seconds')::interval` spreads the seeded deadlines
+    // across up to ~28 hours -- 100,000 seconds, covering the largest
+    // `BACKLOG_SWEEP` depth. The 100-year base keeps every value far enough
+    // in the future to satisfy the first fix above regardless.
     const SCHEDULE_TO_CLOSE_SQL: &str =
         "NOW() + INTERVAL '100 years' + (i::text || ' seconds')::interval";
 
@@ -2893,11 +2897,11 @@ async fn zz_capture_schedule_to_close_claim_evidence() {
     let raw = autumn_harvest::queue::claim_task_query();
 
     // One EXPLAIN capture per published backlog depth, at both labels, from
-    // the SAME seeded backlog (the no-schedule-to-close capture's EXPLAIN
+    // the SAME seeded backlog. The no-schedule-to-close capture's EXPLAIN
     // ANALYZE runs inside a rolled-back transaction, so the seeded rows
-    // survive unclaimed for the schedule-to-close mutation that follows) --
-    // shows whether the added cost is a fixed per-call overhead or scales
-    // with candidate rows scanned.
+    // survive unclaimed for the schedule-to-close mutation that follows.
+    // This shows whether the added cost is a fixed per-call overhead, or
+    // scales with candidate rows scanned.
     for backlog in super::claim_bench_support::BACKLOG_SWEEP {
         let scenario = Scenario {
             backlog,
@@ -2938,10 +2942,10 @@ async fn zz_capture_schedule_to_close_claim_evidence() {
             if label == "schedule-to-close" {
                 // Re-seed FRESH with `schedule_to_close_at` populated at
                 // INSERT time, rather than UPDATE-ing the already-seeded
-                // rows in place -- avoids the same UPDATE-bloat artifact the
-                // capability-labels capture documents (a fresh INSERT never
-                // leaves dead NULL-column tuple versions resident in the
-                // heap alongside the mutated ones) -- while reusing the
+                // rows in place. This avoids the same UPDATE-bloat artifact
+                // the capability-labels capture documents. A fresh INSERT
+                // never leaves dead NULL-column tuple versions resident in
+                // the heap alongside the mutated ones. It also reuses the
                 // no-schedule-to-close seed's exact `id`/`activity_id`
                 // values (see `snapshot_seed_for_schedule_to_close`). The
                 // no-schedule-to-close label's `EXPLAIN ANALYZE` above ran
@@ -2951,10 +2955,11 @@ async fn zz_capture_schedule_to_close_claim_evidence() {
                 reseed_from_schedule_to_close_snapshot(&mut conn, SCHEDULE_TO_CLOSE_SQL).await;
             }
 
-            // `EXPLAIN ANALYZE` really executes the statement -- including
-            // the UPDATE CTEs -- so it runs inside a transaction that is
-            // rolled back; otherwise producing the plan would itself consume
-            // a task and shrink the backlog the other label measures against.
+            // `EXPLAIN ANALYZE` really executes the statement, including
+            // the UPDATE CTEs. So it runs inside a transaction that is
+            // rolled back. Otherwise, producing the plan would itself
+            // consume a task, shrinking the backlog the other label
+            // measures against.
             diesel::sql_query("BEGIN")
                 .execute(&mut conn)
                 .await
@@ -3001,12 +3006,13 @@ async fn zz_capture_schedule_to_close_claim_evidence() {
         ));
     }
 
-    // A `pg_stat_statements` snapshot from the *real* `claim_task()` production
-    // function (not the literal-substituted EXPLAIN text above), at both
-    // labels, so the committed snapshot reflects exactly the code path a live
-    // worker takes -- and so the drain loop's claimed count is a correctness
-    // sanity check that the schedule-to-close mutation above did not change
-    // *which* rows are eligible, only the cost of deciding so.
+    // A `pg_stat_statements` snapshot from the *real* `claim_task()`
+    // production function -- not the literal-substituted EXPLAIN text
+    // above -- at both labels. The committed snapshot then reflects
+    // exactly the code path a live worker takes. The drain loop's claimed
+    // count is also a correctness sanity check. It confirms the
+    // schedule-to-close mutation above did not change *which* rows are
+    // eligible -- only the cost of deciding so.
     let mut claimed_by_label: std::collections::HashMap<&str, usize> =
         std::collections::HashMap::new();
     for label in ["no-schedule-to-close", "schedule-to-close"] {
@@ -3030,39 +3036,45 @@ async fn zz_capture_schedule_to_close_claim_evidence() {
         let queues = db::queue_names(headline);
 
         // `db::seed()` analyzes `harvest_task_queue`/`harvest_workflow_executions`
-        // only -- `harvest_workers` is left with whatever stats survived from
+        // only. `harvest_workers` is left with whatever stats survived from
         // a previous run, or none at all. The `worker_info` CTE's `SELECT
-        // labels FROM harvest_workers WHERE worker_id = $1` lookup is read on
-        // every single claim in the drain below, so stale/absent
-        // `harvest_workers` statistics could make one label's drain pick a
-        // different access path for that lookup than the other's purely from
-        // planner-statistics drift, contaminating the buffer-count comparison
-        // this capture exists to make. Mirrors the same fix in
+        // labels FROM harvest_workers WHERE worker_id = $1` lookup is read
+        // on every single claim in the drain below. Stale or absent
+        // `harvest_workers` statistics could therefore make one label's
+        // drain pick a different access path than the other's. That would
+        // be purely from planner-statistics drift, contaminating the
+        // buffer-count comparison this capture exists to make.
+        //
+        // This mirrors the same fix in
         // `zz_capture_capability_labels_claim_evidence` (Codex review, PR
-        // #1339): analyze it here, once per label, before either the
-        // schedule-to-close re-seed or the drain starts, so both labels begin
-        // from identical `harvest_workers` statistics.
+        // #1339). It analyzes `harvest_workers` here, once per label,
+        // before either the schedule-to-close re-seed or the drain starts.
+        // Both labels then begin from identical `harvest_workers`
+        // statistics.
         diesel::sql_query("ANALYZE harvest_workers")
             .execute(&mut stats_conn)
             .await
             .expect("analyze harvest_workers before either label's stat-snapshot drain");
 
         // Each label iteration opens its OWN connection via a fresh
-        // `db::connect()` call above, and `db::seed()` just re-seeded this
+        // `db::connect()` call above. `db::seed()` just re-seeded this
         // connection's `harvest_task_queue` with its own independent
-        // `gen_random_uuid()` values -- unlike the per-depth `EXPLAIN` loop
+        // `gen_random_uuid()` values. Unlike the per-depth `EXPLAIN` loop
         // above, there is no single shared seed both labels read from here.
+        //
         // An earlier revision of this capture called
         // `reseed_with_schedule_to_close()` (this function's predecessor)
-        // for the `schedule-to-close` label anyway, which only snapshotted
-        // and reused THIS iteration's own already-independently-random seed
-        // -- a no-op for cross-label matching. Codex review on PR #1339
-        // caught this: snapshot the `no-schedule-to-close` label's seed
-        // into a table that outlives its connection (see
+        // for the `schedule-to-close` label anyway. That only snapshotted
+        // and reused THIS iteration's own already-independently-random
+        // seed -- a no-op for cross-label matching. Codex review on PR
+        // #1339 caught this.
+        //
+        // The fix: snapshot the `no-schedule-to-close` label's seed into a
+        // table that outlives its connection. See
         // `snapshot_seed_for_schedule_to_close`'s doc comment for why it
-        // must be a plain table, not `TEMP`), then have the
-        // `schedule-to-close` label consume that same snapshot instead of
-        // its own fresh, independent seed.
+        // must be a plain table, not `TEMP`. The `schedule-to-close` label
+        // then consumes that same snapshot, instead of its own fresh,
+        // independent seed.
         if label == "no-schedule-to-close" {
             snapshot_seed_for_schedule_to_close(&mut stats_conn).await;
         } else {
@@ -3073,7 +3085,7 @@ async fn zz_capture_schedule_to_close_claim_evidence() {
         // heap_stats()'s doc comment above for why this matters.
         let heap_before = heap_stats(label, "before-drain", &mut stats_conn).await;
 
-        // Drive the real claim path repeatedly so pg_stat_statements
+        // Drive the real claim path repeatedly. `pg_stat_statements` then
         // accumulates real, attributed `calls`/buffer counters for the
         // production query text -- not just the single literal-substituted
         // EXPLAIN above.
@@ -3118,9 +3130,9 @@ async fn zz_capture_schedule_to_close_claim_evidence() {
         claimed_by_label.insert(label, claimed);
 
         // `ANALYZE` refreshes the planner's row-count estimate, not the
-        // autovacuum-collector's n_live_tup/n_dead_tup counters -- those come
+        // autovacuum-collector's n_live_tup/n_dead_tup counters. Those come
         // from `pg_stat_user_tables`, updated by each UPDATE's own stats
-        // message, so no extra call is needed here to make the "after"
+        // message. So no extra call is needed here to make the "after"
         // snapshot accurate.
         let heap_after = heap_stats(label, "after-drain", &mut stats_conn).await;
         std::fs::write(
@@ -3210,8 +3222,8 @@ async fn zz_capture_schedule_to_close_claim_evidence() {
     }
 
     // Correctness sanity check: the schedule-to-close mutation was built to
-    // never elapse, not to exclude, so both labels must claim the identical
-    // number of rows -- proving the added predicate cost is isolated from any
+    // never elapse, not to exclude. Both labels must claim the identical
+    // number of rows, proving the added predicate cost is isolated from any
     // change in which rows are eligible.
     assert_eq!(
         claimed_by_label.get("no-schedule-to-close"),
