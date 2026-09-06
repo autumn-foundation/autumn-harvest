@@ -1036,11 +1036,11 @@ mod db {
     /// retried without operator surgery.
     ///
     /// Every field a fresh `verify_target_copy` will re-stamp must be reset
-    /// here alongside the phase (issue #1317, Codex round 2). A reopened row
-    /// that kept a stale `legal_hold_verified = TRUE` from a PRIOR settled
-    /// attempt could let an old-code verify on the reopened attempt leave the
-    /// flag true without re-checking anything, and a later cutover would
-    /// then trust a check that never happened for THIS attempt.
+    /// here alongside the phase (issue #1317). A reopened row that kept a
+    /// stale `legal_hold_verified = TRUE` from a PRIOR settled attempt is a
+    /// risk. An old-code verify on the reopened attempt could leave the flag
+    /// true without re-checking anything. A later cutover would then trust a
+    /// check that never happened for THIS attempt.
     ///
     /// # Errors
     ///
