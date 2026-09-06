@@ -16552,6 +16552,32 @@ fn resolve_continue_as_new_successor_defaults<'a>(
     }
 }
 
+/// Resolve the effective workflow-input cap for a cross-type continuation
+/// target (issue #1161).
+///
+/// The target's own `max_input_bytes` override applies. The override raises
+/// the fleet-wide floor. The override never lowers the floor. This matches
+/// every start route's own resolution (issue #252). A same-type continuation
+/// never calls this: `WorkflowContext`'s own in-process check already
+/// enforces the correct, unchanged cap before the command is pushed.
+fn resolve_cross_type_max_input_bytes(
+    target: &crate::info::WorkflowInfo,
+    global_floor: u64,
+) -> u64 {
+    target
+        .max_input_bytes
+        .map_or(global_floor, |per_type| per_type.max(global_floor))
+}
+
+/// Returns `Ok(true)` when this cycle's continue-as-new attempt was
+/// internally redirected to a terminal failure instead of continuing. A
+/// blank/unregistered/DAG target, a live occupant of the successor slot, an
+/// oversized quota key, or an over-cap input (#1161) all redirect this way.
+/// `Ok(false)` means the successor was actually created. The caller
+/// (`persist_workflow_outcome`) uses this to correct the metrics and
+/// schedule-failure-counter accounting it already pre-computed for a plain
+/// `ContinuedAsNew` outcome. That accounting is wrong once this redirect
+/// fires (Codex P2 on PR #1399).
 #[allow(clippy::too_many_lines)]
 #[doc(hidden)]
 pub async fn persist_workflow_continue_as_new(
@@ -16561,7 +16587,7 @@ pub async fn persist_workflow_continue_as_new(
     execution: &WorkflowExecution,
     input: serde_json::Value,
     new_workflow_type: Option<String>,
-) -> HarvestResult<()> {
+) -> HarvestResult<bool> {
     use crate::schema::{harvest_signals, harvest_workflow_executions};
 
     let offloader = registry.payload_offloader();
@@ -16569,7 +16595,7 @@ pub async fn persist_workflow_continue_as_new(
     if reject_child_continue_as_new(conn, &persistence, execution, registry.payload_codecs())
         .await?
     {
-        return Ok(());
+        return Ok(true);
     }
 
     // Issue #803: validate a cross-type target before anything is written, so
@@ -16590,11 +16616,61 @@ pub async fn persist_workflow_continue_as_new(
     .await?
     {
         ContinueAsNewTypeCheck::Rejected => {
-            return Ok(());
+            return Ok(true);
         }
         ContinueAsNewTypeCheck::SameType => None,
         ContinueAsNewTypeCheck::CrossType(info) => Some(info),
     };
+
+    // Cross-type input cap (issue #1161). A same-type continuation needs no
+    // check here: `WorkflowContext`'s own in-process check already enforced
+    // the correct cap before the command was pushed. A cross-type target's
+    // cap can only be resolved HERE, where the registry is reachable. The
+    // in-process context cannot see another type's `max_input_bytes`.
+    // Reject before any write, exactly like the quota-key check further
+    // below (see its comment for why a bare `Err` here is wrong). Checked
+    // BEFORE the `input.clone()` calls further down, so a rejected input
+    // never pays for two full clones it will never need (Codex-style review
+    // finding).
+    if let Some(info) = target_info {
+        let cap = resolve_cross_type_max_input_bytes(info, registry.max_workflow_input_bytes);
+        let observed = serde_json::to_string(&input).map_or(0, |s| s.len() as u64);
+        let offload_applies = registry
+            .payload_offloader()
+            .is_some_and(|o| observed > o.threshold());
+        if cap > 0 && observed > cap && !offload_applies {
+            let successor_workflow_name = new_workflow_type
+                .as_deref()
+                .unwrap_or(execution.workflow_name.as_str());
+            let error = HarvestError::PayloadTooLarge {
+                kind: crate::error::PayloadKind::WorkflowInput,
+                observed_bytes: observed,
+                cap_bytes: cap,
+                workflow_type: successor_workflow_name.to_string(),
+                activity_name: None,
+            }
+            .to_string();
+            persist_workflow_failure(
+                conn,
+                persistence.task.id,
+                persistence.exec_id,
+                persistence.next_event_id,
+                persistence.worker_id,
+                persistence.task.crash_strikes,
+                &error,
+                None,
+                None,
+                None,
+                None,
+                None,
+                crate::types::Priority::default(),
+                registry.payload_codecs(),
+                &mut Vec::new(),
+            )
+            .await?;
+            return Ok(true);
+        }
+    }
 
     // Carry the predecessor's `last_completion_result` forward by its *stored*
     // representation (issue #524 / #488). If it was offloaded, copy the
@@ -16746,7 +16822,7 @@ pub async fn persist_workflow_continue_as_new(
             &mut Vec::new(),
         )
         .await?;
-        return Ok(());
+        return Ok(true);
     }
 
     let new_row = NewWorkflowExecution {
@@ -16832,7 +16908,7 @@ pub async fn persist_workflow_continue_as_new(
     enqueue.max_concurrent = successor_concurrency_cap;
     enqueue.rate_limit_key = persistence.task.rate_limit_key.clone();
 
-    Box::pin(conn.transaction::<(), HarvestError, _>(async |conn| {
+    Box::pin(conn.transaction::<bool, HarvestError, _>(async |conn| {
         // Issue #1184: this transaction seals the predecessor
         // (CONTINUED_AS_NEW) and completes its task row -- an ordinary
         // terminal write not enumerated by name in the issue, but the same
@@ -16932,7 +17008,7 @@ pub async fn persist_workflow_continue_as_new(
 
         queue::enqueue(conn, &enqueue).await?;
         queue::complete_task(conn, task_id, serde_json::Value::Null).await?;
-        Ok(())
+        Ok(false)
     }))
     .await
 }
@@ -16962,6 +17038,13 @@ async fn persist_workflow_outcome(
     // `persist_workflow_completion`'s identical parameter doc for why this
     // function's own callers cannot safely emit these themselves.
     pending_cancel_metrics: &mut Vec<crate::execution::StartCancelledRun>,
+    // Issue #1161 (Codex P2 on PR #1399): `false` unless the `ContinuedAsNew`
+    // arm below redirects to a terminal failure instead of continuing. The
+    // caller pre-computes this cycle's metrics and schedule-failure-counter
+    // action from the ORIGINAL `outcome` variant, before this function runs.
+    // A redirect makes that precomputed `ContinuedAsNew` accounting wrong.
+    // The caller must correct it using this flag once this call returns.
+    continue_as_new_redirected_to_failure: &mut bool,
 ) -> HarvestResult<(bool, Vec<(ExecutionId, Option<String>)>)> {
     let parent_exec_id = execution.parent_id.map(execution_id_from_uuid);
     // A detached child has parent_close_policy set (non-null). Detached children
@@ -17154,7 +17237,10 @@ async fn persist_workflow_outcome(
             .await;
             fail_execution_on_error(conn, task, worker_id, result, registry.payload_codecs())
                 .await
-                .map(|()| (false, vec![(exec_id, Some(workflow_name))]))
+                .map(|redirected| {
+                    *continue_as_new_redirected_to_failure = redirected;
+                    (false, vec![(exec_id, Some(workflow_name))])
+                })
         }
     }
 }
@@ -17343,6 +17429,12 @@ enum WorkflowPersistFlow {
         /// `execution::emit_start_cancel_metrics` only after confirming this
         /// match arm was reached, i.e. after the real outer commit.
         pending_cancel_metrics: Vec<crate::execution::StartCancelledRun>,
+        /// `true` when this cycle's outcome was `ContinuedAsNew` but got
+        /// internally redirected to a terminal failure (issue #1161). The
+        /// caller must then correct the metrics and schedule-failure-counter
+        /// action it pre-computed for a plain `ContinuedAsNew`, using this
+        /// flag, once this arm is reached.
+        continue_as_new_redirected_to_failure: bool,
     },
 }
 
@@ -17437,6 +17529,9 @@ async fn persist_terminal_outcome_commands(
     // issue #1197, item 1 (Codex round 2, P1): threaded straight through to
     // `persist_workflow_outcome` — see its identical parameter doc.
     pending_cancel_metrics: &mut Vec<crate::execution::StartCancelledRun>,
+    // Issue #1161: threaded straight through to `persist_workflow_outcome` —
+    // see its identical parameter doc.
+    continue_as_new_redirected_to_failure: &mut bool,
 ) -> HarvestResult<(
     bool,
     Vec<(ExecutionId, Option<String>)>,
@@ -17574,6 +17669,7 @@ async fn persist_terminal_outcome_commands(
         // wake is threaded here (issue #678).
         ResolvedExternalIds::default(),
         pending_cancel_metrics,
+        continue_as_new_redirected_to_failure,
     )
     .await?;
     Ok((retry_scheduled, deferred_checks, race_deferred_triggers))
@@ -19873,7 +19969,7 @@ async fn process_workflow_task(
         } else {
             None
         };
-    let pending_workflow_metrics = PendingWorkflowMetrics {
+    let mut pending_workflow_metrics = PendingWorkflowMetrics {
         status,
         is_canary,
         canary_shard,
@@ -20069,6 +20165,10 @@ async fn process_workflow_task(
             }
 
             let mut pending_cancel_metrics = Vec::new();
+            // Issue #1161: `false` unless the ContinuedAsNew outcome below
+            // (reached via either branch) redirects to a terminal failure —
+            // see `persist_workflow_outcome`'s parameter doc.
+            let mut continue_as_new_redirected_to_failure = false;
             let (retry_scheduled, deferred_checks, race_deferred_triggers) =
                 if is_terminal_with_commands {
                     persist_terminal_outcome_commands(
@@ -20081,6 +20181,7 @@ async fn process_workflow_task(
                         &recorded_dispatches,
                         &execute_span,
                         &mut pending_cancel_metrics,
+                        &mut continue_as_new_redirected_to_failure,
                     )
                     .await?
                 } else {
@@ -20097,6 +20198,7 @@ async fn process_workflow_task(
                         // so a mixed timer + external op self-wakes.
                         resolved_inline_external,
                         &mut pending_cancel_metrics,
+                        &mut continue_as_new_redirected_to_failure,
                     )
                     .await?;
                     (retry_scheduled, deferred_checks, Vec::new())
@@ -20112,6 +20214,7 @@ async fn process_workflow_task(
                 deferred_checks,
                 race_deferred_triggers,
                 pending_cancel_metrics,
+                continue_as_new_redirected_to_failure,
             })
         },
     ))
@@ -20127,7 +20230,20 @@ async fn process_workflow_task(
             deferred_checks,
             race_deferred_triggers,
             pending_cancel_metrics,
+            continue_as_new_redirected_to_failure,
         }) => {
+            // Issue #1161 (Codex P2 on PR #1399): a ContinuedAsNew outcome
+            // redirected internally to a terminal failure. Correct the
+            // metrics and schedule-failure-counter action this cycle
+            // pre-computed for a plain `ContinuedAsNew` — both are wrong
+            // once the actual persisted result was `WorkflowFailed`.
+            if continue_as_new_redirected_to_failure {
+                pending_workflow_metrics.status = WorkflowStatus::Failed;
+                pending_workflow_metrics.is_continued_as_new = false;
+                pending_workflow_metrics.terminal = TerminalMetricsKind::Failed {
+                    had_nd_details: false,
+                };
+            }
             // Chaos: kill/delay after the outer persist commit but before the
             // deferred-trigger fan-out — committed work whose in-process
             // follow-up side effects have not fired yet. Convergence must still
@@ -20158,8 +20274,14 @@ async fn process_workflow_task(
             // Deferred best-effort schedule counters, in autocommit post-commit.
             // When a retry was scheduled the failure-counter increment is
             // suppressed: one failure chain counts as one failure (issue #523).
+            // A redirected continue-as-new (issue #1161) forces an increment.
+            // `counter_action` was pre-computed as `None` for the ORIGINAL
+            // `ContinuedAsNew` outcome. That is wrong once this cycle's real
+            // persisted result was a terminal failure.
             let effective_counter = if retry_scheduled {
                 None
+            } else if continue_as_new_redirected_to_failure {
+                Some(true)
             } else {
                 counter_action
             };
@@ -35644,6 +35766,32 @@ mod tests {
             Some(serde_json::json!({"max_attempts": 50})),
             "the same-type arm must carry the stored policy verbatim"
         );
+    }
+
+    /// AC — a cross-type target's own `max_input_bytes` override governs the
+    /// successor's input cap, exactly like every start route (issue #252).
+    #[test]
+    fn can1161_cross_type_max_input_bytes_uses_the_targets_own_override() {
+        let mut target = can803_wf_info("paid_subscription");
+        target.max_input_bytes = Some(10_000);
+        assert_eq!(resolve_cross_type_max_input_bytes(&target, 100), 10_000);
+    }
+
+    /// AC — the override raises the fleet-wide floor. It never lowers the
+    /// floor (issue #252's "raise, never lower" rule).
+    #[test]
+    fn can1161_cross_type_max_input_bytes_never_lowers_the_global_floor() {
+        let mut target = can803_wf_info("paid_subscription");
+        target.max_input_bytes = Some(10);
+        assert_eq!(resolve_cross_type_max_input_bytes(&target, 100), 100);
+    }
+
+    /// AC — a target declaring no override falls back to the fleet-wide
+    /// floor, matching an undeclared `max_input_bytes` on the start path.
+    #[test]
+    fn can1161_cross_type_max_input_bytes_falls_back_to_the_global_floor_when_undeclared() {
+        let target = can803_wf_info("paid_subscription");
+        assert_eq!(resolve_cross_type_max_input_bytes(&target, 100), 100);
     }
 
     /// Naming the run's OWN type must never trip the cross-shard guard, even on
