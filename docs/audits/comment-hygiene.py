@@ -242,6 +242,11 @@ _APOS = r"[\u2019']"
 # is a legal module name, so EVERY segment of `pub(in crate::r#type)` may be
 # raw, exactly as an item's own name may be.
 VISIBILITY = r"(?:pub(?:\((?:in\s+)?(?:r\#)?\w+(?:::(?:r\#)?\w+)*\))?\s+)?"
+# A `where` clause, which may sit on the signature line of anything
+# generic: a function, a struct, an enum, a trait, a union or an impl.
+# Bounded by the `{` or `;` that ends the declaration, so it can never run
+# past the item it belongs to. rustc 1.94.1 compiles every form below.
+WHERE = r"(?:where\s+[^;{]+?\s*)?"
 COMMENTED_CODE_RE = re.compile(
     r"""^(?:
         # The ABI name may carry a hyphen -- "C-unwind" and its siblings are
@@ -253,12 +258,12 @@ COMMENTED_CODE_RE = re.compile(
         (?:async\s+|unsafe\s+|const\s+|extern\s+(?:"[\w-]+"\s+)?)*
             fn\s+(?:r\#)?\w+\s*(?:<[^<>]*>)?\s*\(
             (?:
-                 .*\)\s*(?:->\s*[^;{]+?)?\s*[{;]   # complete: ends in { or ;
+                 .*\)\s*(?:->\s*[^;{]+?)?\s*{WHERE}[{;]  # complete: { or ;
                | \s*$                                # wrapped: `fn foo(` at EOL
                | (?=[^)]*(?::|\bself\b))            # wrapped: real params,
                  [\w\s:&'<>\[\](),.+;=*#-]*,\s*$     #   trailing comma
             )\s*$
-      | {VIS}(?:struct|enum|trait|union)\s+(?:r\#)?\w+\s*(?:<[^<>]*>)?\s*[{;(]\s*$
+      | {VIS}(?:struct|enum|trait|union)\s+(?:r\#)?\w+\s*(?:<[^<>]*>)?\s*{WHERE}[{;(]\s*$
       # A tuple struct, whose field list is on the line and terminated. Its
       # own alternative rather than a relaxation of the one above, which is
       # what this file's guidance asks for: the name is still anchored hard
@@ -268,13 +273,13 @@ COMMENTED_CODE_RE = re.compile(
             # the statement -- the same guard the uninitialized-binding rule
             # has carried since round forty-one, which this alternative was
             # written without.
-            \s*\((?:[^;{]|;(?=[^;]*\]))*\)\s*;\s*$
+            \s*\((?:[^;{]|;(?=[^;]*\]))*\)\s*{WHERE};\s*$
       | {VIS}mod\s+(?:r\#)?\w+\s*[{;]\s*$
       | {VIS}(?:const|static)\s+(?:mut\s+)?(?:r\#)?\w+\s*:[^;=]+=.*[;{]\s*$
       | {VIS}type\s+(?:r\#)?\w+\s*(?:<[^<>]*>)?\s*=
             (?!\s*(?:\w+\s+){2,}\w+\s*;\s*$).*;\s*$
       | impl(?:\s*<[^<>]*>)?\s+
-            (?![^;{]*\b[a-z]+\s+[a-z]+\s+[a-z]+\s+[a-z]+\b)[\w:<>&'\s\#]+\{\s*$
+            (?![^;{]*\b[a-z]+\s+[a-z]+\s+[a-z]+\s+[a-z]+\b)[\w:<>&'\s\#,]+\{\s*$
       | let\s+(?:mut\s+)?(?:r\#)?\w+\s*(?::[^;=]+)?=
             (?!\s*(?:\w+\s+){2,}\w+\s*;\s*$)[^=].*;\s*$
       # Destructuring bindings. A tuple or slice pattern, or a struct/enum
@@ -332,7 +337,7 @@ COMMENTED_CODE_RE = re.compile(
       | continue\b(?:\s+'\w+)?\s*;\s*$
       | [\w:\#]+(?:::<[^;()]*>)?(?:\.[\w:\#]+(?:::<[^;()]*>)?)*
             \(.*\)(?:\s*\?|\s*\.await\s*\??)*\s*;\s*$
-    )""".replace("{VIS}", VISIBILITY),
+    )""".replace("{VIS}", VISIBILITY).replace("{WHERE}", WHERE),
     re.VERBOSE,
 )
 
@@ -1588,8 +1593,19 @@ def mark_bridges(source: str, pieces: list[Piece]) -> None:
         # -- `#[allow(dead_code)] // why` -- is beside the attribute, not in
         # it, and is an ordinary trailing comment.
         opened = depth > 0
-        if not opened and not text.startswith("#[") and not text.startswith("#!["):
-            continue
+        if not opened:
+            # An EMPTY source line renders nothing either, so it does not
+            # end the document any more than an attribute does. A blank line
+            # between two doc runs leaves rustdoc 1.94.1 rendering one
+            # document of two paragraphs, and the blank DOC line beside it
+            # is the separator that makes them two. Judged on the real
+            # source: a comment-only line blanks to nothing in this copy,
+            # and it is not empty.
+            if not text and index not in occupied:
+                attributes.add(index)
+                continue
+            if not text.startswith("#[") and not text.startswith("#!["):
+                continue
         attributes.add(index)
         if opened and index in occupied:
             inside.add(index)
@@ -4657,6 +4673,26 @@ RULE_TESTS = [
         "but a comment BESIDE a finished attribute is an ordinary trailing one",
     ),
     (
+        "/// One.\n///\n\n/// Two.\npub struct S;\n",
+        set(),
+        "an empty source line renders nothing, so it is not a break either",
+    ),
+    (
+        "/// One.\n///\n\n#[allow(dead_code)]\n\n/// Two.\npub struct S;\n",
+        set(),
+        "mixed with attributes in the same gap",
+    ),
+    (
+        "/// One.\n///\n\npub struct S;\n",
+        {("CH004", 2)},
+        "but with no doc after it the blank line still renders nothing",
+    ),
+    (
+        "// One.\n//\n\n// Two.\n",
+        {("CH004", 2)},
+        "and a plain // run is joined by nothing at all",
+    ),
+    (
         "/// One.\n///\n#[allow(dead_code)]\npub struct S;\n",
         {("CH004", 2)},
         "but a blank doc line with no doc after it still renders nothing",
@@ -4793,6 +4829,26 @@ RULE_TESTS = [
         "// pub(in crate::r#type) fn stale() {\n",
         {("CH001", 1)},
         "and in a visibility path, whose segments are names too",
+    ),
+    (
+        "// fn foo<T>() where T: Copy {\n",
+        {("CH001", 1)},
+        "a where clause may sit on the signature line",
+    ),
+    (
+        "// pub struct S<T>(T) where T: Copy;\n",
+        {("CH001", 1)},
+        "on a tuple struct as well as a function",
+    ),
+    (
+        "// impl<T> Q<T> where T: Copy, T: Default {\n",
+        {("CH001", 1)},
+        "and may carry more than one bound",
+    ),
+    (
+        "// The queue drains where the worker parks\n",
+        set(),
+        "but the word alone is prose",
     ),
     (
         "// r#type::init();\n",

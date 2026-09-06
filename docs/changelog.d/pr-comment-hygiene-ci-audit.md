@@ -2859,3 +2859,31 @@ Accepted, and fixtured: a name, `localhost:8080`, an IPv4 literal and
 `https://[::1]/p`.
 
 Corpus effect: none. Three fixtures.
+
+### Round ninety-three — a where clause, and an empty line
+
+Two findings, one bypass and one false positive.
+
+`// fn foo<T>() where T: Copy {` produced no CH001. The complete-signature
+form allowed a return type between the `)` and the `{`, and nothing else.
+The sibling sweep found five more places a `where` clause may sit, all
+compiled with rustc 1.94.1 first: a function with and without a return
+type, a struct, an enum, a trait, a tuple struct after its parens, and an
+impl with more than one bound, whose comma the shared class did not hold.
+One `WHERE` fragment now, spliced in beside `VISIBILITY`, bounded by the
+`{` or `;` that ends the declaration so it can never run past its item.
+`// The queue drains where the worker parks` is the counter-case.
+
+The second is the round-91 bridge one gap further. An EMPTY source line
+between two doc runs renders nothing, exactly as an attribute does, so it
+does not end the document either -- rustdoc 1.94.1 renders "One." and
+"Two." as two paragraphs across one, and the blank `///` beside it is
+what separates them. CH004 reported that separator.
+
+The emptiness is judged on the real source rather than the blanked copy,
+because a comment-only line blanks to nothing and is not empty. That is
+what keeps `// #[derive(Debug)]` from bridging, and it is a fixture. Two
+more hold the widening down: with no doc after it a blank doc line still
+renders nothing, and a plain `//` run is joined by nothing at all.
+
+Corpus effect: none. Eight fixtures, four of them counter-cases.
