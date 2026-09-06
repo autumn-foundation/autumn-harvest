@@ -353,9 +353,17 @@ jobs:
       # which regenerates from `docs/api-contract.json` and compares both
       # copies; the `changes` job carves the contract and the docs copy out of
       # the docs-only skip so that test runs on a contract-only PR.
+      # `actions/setup-python` puts a tool-cache interpreter first on PATH. The
+      # image's system Python is externally managed (PEP 668), which refuses a
+      # plain `pip install`. The version is pinned so a validator release cannot
+      # redden this job on its own.
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
       - name: Validate the OpenAPI document (issue #694)
         run: |
-          python3 -m pip install --quiet --disable-pip-version-check openapi-spec-validator
+          python3 -m pip install --quiet --disable-pip-version-check \
+            "openapi-spec-validator==0.9.0"
           python3 -m openapi_spec_validator docs/openapi.json
           python3 -m openapi_spec_validator autumn-harvest-plugin/openapi.json
 
@@ -975,6 +983,9 @@ jobs:
 
   openapi-client-smoke:
     name: Generated TypeScript client drives a running plugin (issue #694)
+    # IMPORTANT -- not yet enforced. Branch protection matches required checks
+    # by name, so this job blocks nothing until a repository admin adds it to
+    # the required set. Same caveat as `test-nodb` and `test-db-linux` above.
     needs: changes
     # Draft-skip (see lint) + docs-only skip via the `changes` guard. The
     # `changes` job carves docs/api-contract.json and docs/openapi.json out of
@@ -1039,7 +1050,7 @@ jobs:
           fi
 
           # AC7, live half: the served document must equal the checked-in
-          # artifact. `openapi_spec::checked_in_artifact_matches_the_generated_document`
+          # artifact. `openapi_spec::checked_in_artifacts_match_the_generated_document`
           # proves it in process; this proves it over the wire, against the
           # router an embedder actually mounts.
           curl -sf "${HARVEST_OPENAPI_URL}" | jq -S . > "${RUNNER_TEMP}/served.json"
@@ -1050,7 +1061,9 @@ jobs:
           fi
 
           cd examples/typescript-client
-          npm ci --no-audit --no-fund
+          # The registry is the one dependency here that fails for reasons
+          # unrelated to the change. Two tries, then it is a real failure.
+          npm ci --no-audit --no-fund || (sleep 10 && npm ci --no-audit --no-fund)
           npm run generate
           npm run typecheck
           npm start

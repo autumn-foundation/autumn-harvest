@@ -6228,7 +6228,7 @@
     },
     "/openapi.json": {
       "get": {
-        "description": "Serve the OpenAPI 3.1 document for this management API (issue #694). The document is derived from this contract, so it covers every route listed here and nothing else. Read-only, never admin-gated: a client generator must reach it before it holds a credential. The identical document is checked in at docs/openapi.json.",
+        "description": "Serve the OpenAPI 3.1 document for this management API (issue #694). The document is derived from this contract, so it covers every route listed here and nothing else. Read-only, and never behind the built-in admin guard: a client generator must reach it before it holds a credential. An embedder that wraps the whole router in its own auth middleware (api_with_auth) gates this route too. The identical document is checked in at docs/openapi.json.",
         "operationId": "get_openapi_json",
         "responses": {
           "200": {

@@ -26,7 +26,7 @@
   },
   "auth_note": "Route authorization posture is classified in issue #174. This contract records the route surface and category; auth enforcement is separate.",
   "audit_note": "Mutating routes (read_only: false) are covered by the audit trail (issue #158). The audit endpoint itself is read-only.",
-  "openapi_note": "docs/openapi.json is generated from this file (issue #694). Regenerate it with `cargo run -p autumn-harvest-plugin --example emit_openapi > docs/openapi.json` whenever a route, parameter, request field or response field changes here. Every parameter must declare `in` and `required`; the transform rejects one that does not.",
+  "openapi_note": "Two OpenAPI 3.1 documents are generated from this file (issue #694): autumn-harvest-plugin/openapi.json, which the crate compiles in and serves, and docs/openapi.json, the pretty-printed copy. Run `scripts/regenerate-openapi.sh` whenever a route, parameter, request field or response field changes here; it writes both. Every parameter must declare `in` and `required`, and every request body must declare `required`. The transform rejects an entry that does not, and refuses a request body on a read method. See docs/openapi.md.",
   "routes": [
     {
       "method": "GET",
@@ -4198,7 +4198,7 @@
       "path": "/openapi.json",
       "category": "discovery",
       "read_only": true,
-      "description": "Serve the OpenAPI 3.1 document for this management API (issue #694). The document is derived from this contract, so it covers every route listed here and nothing else. Read-only, never admin-gated: a client generator must reach it before it holds a credential. The identical document is checked in at docs/openapi.json.",
+      "description": "Serve the OpenAPI 3.1 document for this management API (issue #694). The document is derived from this contract, so it covers every route listed here and nothing else. Read-only, and never behind the built-in admin guard: a client generator must reach it before it holds a credential. An embedder that wraps the whole router in its own auth middleware (api_with_auth) gates this route too. The identical document is checked in at docs/openapi.json.",
       "params": [],
       "request_body": null,
       "success_response": {

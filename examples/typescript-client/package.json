@@ -3,6 +3,9 @@
   "private": true,
   "type": "module",
   "description": "Generated TypeScript client for the Harvest management API (issue #694).",
+  "engines": {
+    "node": ">=20"
+  },
   "scripts": {
     "generate": "openapi-typescript ${HARVEST_OPENAPI_URL:-http://localhost:3000/api/harvest/openapi.json} -o src/harvest-api.ts",
     "typecheck": "tsc --noEmit",

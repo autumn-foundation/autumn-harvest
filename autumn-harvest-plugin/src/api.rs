@@ -4971,9 +4971,10 @@ pub fn harvest_api_router(api_state: HarvestApiState) -> Router<AppState> {
             post(redrive_dead_letters_handler).route_layer(require_admin.clone()),
         )
         .route("/health", get(health))
-        // Issue #694: the OpenAPI 3.1 document for this router. Read-only, no
-        // admin gate, and it reads no state -- a client generator must be able
-        // to fetch it before it holds any credential.
+        // Issue #694: the OpenAPI 3.1 document for this router. Read-only, and
+        // behind no admin gate, because a client generator must fetch it before
+        // it holds any credential. It reads no state. An embedder that wraps
+        // the whole router in its own auth middleware still gates it.
         .route("/openapi.json", get(crate::openapi::get_openapi_document))
         .route(
             "/admin/preflight",

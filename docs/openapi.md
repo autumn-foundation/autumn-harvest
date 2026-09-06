@@ -8,13 +8,13 @@ One source, three places it appears:
 
 | Where | What |
 | --- | --- |
-| `GET {api_path}/openapi.json` | Served by `harvest_api_router`. Read-only, never admin-gated. |
+| `GET {api_path}/openapi.json` | Served by `harvest_api_router`. Read-only, and behind no admin gate. |
 | `autumn-harvest-plugin/openapi.json` | Compact. Compiled into the crate and served verbatim, so the endpoint runs no transform and can never fail. |
 | [`docs/openapi.json`](openapi.json) | The same document, pretty-printed, for offline codegen and review diffs. |
 
-All three come from [`docs/api-contract.json`](api-contract.json), the contract
-the router itself is pinned against. A route cannot reach the router without
-reaching the document. See [Guarantees](#guarantees).
+All three come from [`docs/api-contract.json`](api-contract.json). The chain is
+contract to canonical route list to document, and a test pins every link. See
+[Guarantees](#guarantees).
 
 The crate carries its own copy because a published crate can package no file
 from outside its own directory. `scripts/regenerate-openapi.sh` writes both
@@ -29,7 +29,7 @@ also says how to get a plugin running. With one serving
 
 ```sh
 cd examples/typescript-client
-npm install
+npm ci
 npm run generate    # openapi-typescript reads the served document
 npm run typecheck
 npm start           # starts a workflow and polls its status
@@ -45,9 +45,13 @@ Other generators read the same document:
 # Python
 openapi-python-client generate --url http://localhost:3000/api/harvest/openapi.json
 
-# Go, Java, and 50 other targets
+# Go, Java, and 50 other targets. Use 7.x or newer: earlier versions reject
+# OpenAPI 3.1 outright.
 openapi-generator generate -i docs/openapi.json -g go -o ./harvest-client
 ```
+
+Node 20 or newer for the TypeScript path. The first `cargo run -p quickstart`
+compiles the workspace, which is the slow part; the client steps take seconds.
 
 ## What the document carries
 
@@ -78,7 +82,9 @@ openapi-generator generate -i docs/openapi.json -g go -o ./harvest-client
   `security` list also carries an empty requirement, because enforcement is
   the embedder's choice (issue #174). The two `public_safe` routes
   (`GET /health`, `GET /openapi.json`) override it with `security: []`, which
-  says positively that they need no credential. See
+  says positively that Harvest itself asks for no credential there. An embedder
+  that wraps the router with `HarvestPlugin::api_with_auth` gates every route,
+  the document included, so a generator then needs a credential to read it. See
   [`security-posture.md`](security-posture.md).
 
 ### Limits worth knowing
@@ -115,8 +121,9 @@ Run it whenever `docs/api-contract.json` changes. CI fails otherwise.
 
 Four checks hold the chain together:
 
-1. `contract_regression::management_routes_match_contract` fails when the
-   router and the contract disagree.
+1. `contract_regression::management_routes_match_contract` fails when
+   `management_api_routes()` and the contract disagree. That function is the
+   canonical route list every registration surface is checked against.
 2. `openapi_spec::document_covers_every_management_route_exactly` fails when
    the document misses a mounted route, or invents one.
 3. `openapi_spec::checked_in_artifacts_match_the_generated_document` fails

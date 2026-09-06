@@ -17,7 +17,7 @@ AUTUMN_PROFILE=dev AUTUMN_MANIFEST_DIR=examples/quickstart cargo run -p quicksta
 ```
 
 ```sh
-# Terminal 2 — the client.
+# Terminal 2 — the client. Node 20 or newer.
 cd examples/typescript-client
 npm ci
 npm run generate     # openapi-typescript reads GET /api/harvest/openapi.json
@@ -25,7 +25,9 @@ npm run typecheck    # tsc proves the calls match the document
 npm start            # POST /workflows/greeting/start, then poll GET /workflows/{id}
 ```
 
-Expected last line:
+`npm start` prints `state=RUNNING` for about 35 seconds. The `greeting`
+workflow sleeps on a durable timer between its two activities. Expected last
+line:
 
 ```
 generated client started a workflow and read its status
@@ -49,5 +51,22 @@ so a wrong path, method, parameter or body fails `npm run typecheck`.
 
 Response property types are `unknown` because the contract records field names,
 not full JSON Schemas. See [`docs/openapi.md`](../../docs/openapi.md).
+
+## Against an authenticated deployment
+
+`HarvestPlugin::api_with_auth` puts the embedder's middleware in front of every
+route, including the document. Give the client a credential the same way for
+both steps:
+
+```sh
+npm run generate -- --header "Authorization: Bearer $HARVEST_TOKEN"
+```
+
+```ts
+const client = createClient<paths>({
+  baseUrl,
+  headers: { Authorization: `Bearer ${process.env.HARVEST_TOKEN}` },
+});
+```
 
 CI runs these exact steps in the `openapi-client-smoke` job.

@@ -143,6 +143,24 @@ fn every_operation_declares_its_parameters() {
 #[test]
 fn every_operation_declares_a_response_with_a_schema() {
     let doc = document();
+    let contract: Value = serde_json::from_str(API_CONTRACT_JSON).expect("contract must parse");
+    // The success status of each route. The check then lands on the response
+    // that carries the body, not on whichever response happens to have one.
+    let success: HashMap<(String, String), u64> = contract["routes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|route| {
+            (
+                (
+                    route["method"].as_str().unwrap().to_lowercase(),
+                    route["path"].as_str().unwrap().to_owned(),
+                ),
+                route["success_response"]["status"].as_u64().unwrap(),
+            )
+        })
+        .collect();
+
     for (path, item) in doc["paths"].as_object().unwrap() {
         for (method, operation) in item.as_object().unwrap() {
             let responses = operation["responses"]
@@ -172,11 +190,23 @@ fn every_operation_declares_a_response_with_a_schema() {
                     schemas += 1;
                 }
             }
-            let bodiless = responses.contains_key("204");
-            assert!(
-                schemas > 0 || bodiless,
-                "{method} {path}: no response declares a schema"
-            );
+            let success_status = success[&(method.clone(), path.clone())];
+            let success_response = &responses[&success_status.to_string()];
+            if success_status == 204 {
+                assert!(
+                    success_response["content"].is_null(),
+                    "{method} {path}: a 204 carries no body"
+                );
+            } else {
+                assert!(
+                    success_response["content"].is_object(),
+                    "{method} {path}: the {success_status} response declares no body schema"
+                );
+                assert!(
+                    schemas > 0,
+                    "{method} {path}: no response declares a schema"
+                );
+            }
         }
     }
 }
@@ -305,6 +335,38 @@ fn read_only_classification_is_published() {
     );
 }
 
+/// Pin the classification of four routes by hand (issue #694 review).
+///
+/// The sweep above compares the document against `CLASSIFIED_ROUTES`, which is
+/// also what the transform reads. These four are written out, so a wrong entry
+/// in that table shows up as a failure here rather than as agreement.
+#[test]
+fn known_routes_carry_their_expected_class() {
+    let doc = document();
+    for (method, path, class, waives_auth) in [
+        ("get", "/openapi.json", "public_safe", true),
+        ("get", "/health", "public_safe", true),
+        ("get", "/workflows", "read_only", false),
+        ("post", "/workflows/{id}/cancel", "mutating", false),
+    ] {
+        let operation = &doc["paths"][path][method];
+        assert_eq!(
+            operation["x-harvest-route-class"], class,
+            "{method} {path} must be classified {class}"
+        );
+        assert_eq!(
+            operation["security"].as_array().is_some_and(Vec::is_empty),
+            waives_auth,
+            "{method} {path}: unexpected security waiver"
+        );
+        assert_eq!(
+            operation["x-harvest-read-only"],
+            Value::Bool(class != "mutating"),
+            "{method} {path}: read-only flag disagrees with the class"
+        );
+    }
+}
+
 /// A documented response header reaches the document, so a generated client
 /// can read it (issue #694 review). The by-id family resolves a business id,
 /// and returns that resolution in `X-Harvest-Execution-Id`.
@@ -381,9 +443,16 @@ fn document_is_structurally_valid_openapi_3_1() {
     assert_eq!(doc["openapi"], "3.1.0");
     assert!(doc["info"]["title"].is_string());
     assert!(doc["info"]["version"].is_string());
-    assert!(
-        doc["servers"][0]["url"].is_string(),
-        "a server entry names the conventional mount point"
+    assert_eq!(
+        doc["servers"][0]["url"], "/api/harvest",
+        "the server entry names the conventional mount point, which every doc \
+         and the quickstart use"
+    );
+    assert_eq!(
+        doc["info"]["version"],
+        env!("CARGO_PKG_VERSION"),
+        "the document version tracks the crate version. Update `version` in \
+         docs/api-contract.json, then run scripts/regenerate-openapi.sh"
     );
 
     let mut ids = HashSet::new();

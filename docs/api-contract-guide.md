@@ -89,8 +89,11 @@ CHANGELOG entry before release):**
 
 ## Generating or validating a client
 
-Because the contract is plain JSON, any JSON-aware toolchain can consume it.
-A 10-minute workflow to generate a typed Rust client:
+An OpenAPI generator is the shortest path: see
+[`openapi.md`](openapi.md). The recipes below are for the cases a generator
+does not cover, such as scaffolding a client in a language with no OpenAPI
+tooling. Because the contract is plain JSON, any JSON-aware toolchain can read
+it:
 
 ```bash
 # 1. Extract routes into a simple TSV for code generation scaffolding
@@ -103,10 +106,10 @@ contract_paths=$(jq -r '.routes[].path' docs/api-contract.json | sort)
 # compare against your method list ...
 ```
 
-For languages with OpenAPI tooling: the contract is not OpenAPI, but its shape
-is straightforward to translate.  Each route entry maps 1-to-1 to an OpenAPI
-path item; `params` maps to OpenAPI parameters; `request_body.schema` maps to a
-`requestBody`.
+For languages with OpenAPI tooling, do not translate this file by hand. The
+translation already ships: `docs/openapi.json` is an OpenAPI 3.1 document
+generated from this contract, and `GET {api_path}/openapi.json` serves the same
+document. Point a generator at either. See [`openapi.md`](openapi.md).
 
 ---
 
@@ -154,9 +157,11 @@ live route set registered in `harvest_api_router` against `docs/api-contract.jso
 2. Update `management_api_routes()` in the same file (keeps the canonical list
    in sync with the router).
 3. Update `docs/api-contract.json` to reflect the new route or schema change.
-4. Add a CHANGELOG entry under the current version marking the change as
+4. Run `scripts/regenerate-openapi.sh`. It rewrites both generated OpenAPI
+   copies from the contract (issue #694). Skipping it fails CI.
+5. Add a CHANGELOG entry under the current version marking the change as
    breaking or non-breaking per the compatibility rules above.
-5. Run `cargo test -p autumn-harvest-plugin --test contract_regression` to
-   confirm the regression test passes.
+6. Run `cargo test -p autumn-harvest-plugin --test contract_regression --test openapi_spec`
+   to confirm the regression tests pass.
 
-The CI job will catch any drift between these three artefacts.
+The CI job will catch any drift between these artefacts.

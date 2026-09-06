@@ -21,9 +21,9 @@
 //! `tests/openapi_spec.rs` fails when either file drifts from the transform, or
 //! from the other. Regenerate both with `scripts/regenerate-openapi.sh`.
 //!
-//! `tests/contract_regression.rs` pins the contract to the live router. It
-//! fails when a route exists in `harvest_api_router` but not in the contract.
-//! It fails the other way too. A route therefore cannot reach the router
+//! `tests/contract_regression.rs` pins the contract to `management_api_routes`,
+//! the canonical route list for `harvest_api_router`. It fails when a route is
+//! in one and not the other. A route on that list therefore cannot exist
 //! without reaching the published spec.
 //!
 //! # Why a transform, not a macro
@@ -281,9 +281,9 @@ fn operation(route: &Value) -> Result<Value, OpenApiError> {
 ///
 /// Read from [`autumn_harvest::audit::CLASSIFIED_ROUTES`], the table the
 /// read-only operator role enforces against, so the published class cannot
-/// drift from the enforced one. An unclassified route reports `unknown`;
+/// drift from the enforced one. An unclassified route reports `unknown`.
 /// `contract_regression::every_management_route_is_classified` makes that
-/// impossible for a mounted route.
+/// impossible for a route on the canonical `management_api_routes` list.
 fn route_class(method: &str, path: &str) -> &'static str {
     use autumn_harvest::audit::{CLASSIFIED_ROUTES, RouteClass};
 
