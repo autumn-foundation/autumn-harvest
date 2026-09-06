@@ -3052,7 +3052,18 @@ fn render_dead_letters_page(
         (render_dead_letter_pagination(page, limit, has_next, filters, refresh))
     };
 
-    let refresh_target = dead_letter_return_to_path(filters, limit, refresh);
+    // `dead_letter_return_to_path` deliberately excludes `page`. It names
+    // the one-time redirect target after an action, and landing back on
+    // page 0 there is fine.
+    //
+    // Auto-refresh is different: it must keep the operator on the page
+    // they were reading. So it builds its own target here, matching
+    // `render_dead_letter_pagination`'s own link construction, instead of
+    // reusing that path (found in review, PR #1396).
+    let refresh_target = format!(
+        "../ui/dead-letters?page={page}{}",
+        build_dead_letter_query_string(limit, filters, refresh)
+    );
     layout_dead_letters("Dead Letters · Vantage", &body, refresh, &refresh_target)
 }
 
@@ -12362,6 +12373,20 @@ mod tests {
         assert!(
             html.contains(r#"content="30; url=../ui/dead-letters?limit=50""#),
             "refresh tag must target the flash-free URL: {html}"
+        );
+    }
+
+    #[test]
+    fn dead_letters_page_refresh_target_preserves_current_page() {
+        // PR #1396 review: the auto-refresh target must keep the operator
+        // on the page they were reading, not bounce them to page 0.
+        let filters = DeadLetterUiFilters::default();
+        let html =
+            render_dead_letters_page(&filters, &[], &[], false, 2, 50, false, 0, Some(30), None)
+                .into_string();
+        assert!(
+            html.contains(r#"url=../ui/dead-letters?page=2"#),
+            "refresh target must preserve page=2: {html}"
         );
     }
 
