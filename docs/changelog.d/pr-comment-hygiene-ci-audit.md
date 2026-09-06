@@ -2476,3 +2476,34 @@ kept their answers, and the two that guarded it with a marker test now
 pass the same marker test as an argument.
 
 One fixture.
+
+### Round eighty-one — a sentence is not a line
+
+One finding, a Tier A false positive, and it is the plainest authoring
+shape yet: a marker whose reference wraps.
+
+    // TODO: implement the retry described in
+    // #123
+
+CH002 read one line, found no reference, and failed the build on a
+commitment that is tracked. Rustdoc renders the two lines as one
+paragraph, and so does any reader.
+
+The marker's text now carries onto following lines of the same block.
+Where it STOPS is the whole of the design, and each bound is one of this
+review's earlier rules seen from the other end:
+
+- a block boundary or a fenced line, because a sentence does not cross
+  one -- rounds sixty-two to sixty-five;
+- a blank line, for the same reason;
+- **another marker**, because everything past it belongs to that one --
+  round seventy-two's "one reference tracks one marker", read forwards
+  instead of backwards.
+
+Three fixtures, one per bound, and the wrapped case itself.
+
+Corpus effect: none, which is worth a note of its own: 1,370 CH005 and
+426 CH006 findings exist in this tree, and not one comment in it wraps a
+marker's reference. The shape the harness got wrong is ordinary in
+prose and simply absent here -- which is why every fixture for it had to
+be written rather than found.

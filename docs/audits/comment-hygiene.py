@@ -2218,6 +2218,7 @@ def check_line_rules(path: str, pieces: list[Piece]) -> list[Finding]:
     findings = []
     lines = []
     spanless = []
+    follow: list[str] = []
     # PER RUN. A code span belongs to one comment, so joining the whole file
     # let an unmatched backtick in one comment pair with a backtick in an
     # unrelated one further down and blank everything between -- including
@@ -2262,6 +2263,25 @@ def check_line_rules(path: str, pieces: list[Piece]) -> list[Finding]:
             block.append("" if in_fence else text)
             block_cells.append(None if in_fence else cells)
         spanless.extend(flush_block(block, block_cells))
+        # A marker's own text may WRAP. "TODO: implement the retry described
+        # in" over "#123" is one tracked commitment, and reading the first
+        # line alone failed the build on it. The continuation stops at the
+        # first line that is not more of the same sentence: a block boundary,
+        # a fenced line, a blank line, or another marker -- that last one
+        # because the reference past it belongs to THAT marker, which is
+        # round seventy-two's rule seen from the other end.
+        base = len(follow)
+        for offset, (_, _, in_fence, opens, _) in enumerate(run_lines):
+            carried: list[str] = []
+            for probe in range(offset + 1, len(run_lines)):
+                _, _, probe_fence, probe_opens, _ = run_lines[probe]
+                if probe_fence or probe_opens:
+                    break
+                text = spanless[base + probe].strip()
+                if not text or TODO_RE.search(text):
+                    break
+                carried.append(text)
+            follow.append(" " + " ".join(carried) if carried else "")
     for index, (lineno, body, in_fence, _, _) in enumerate(lines):
         if in_fence:
             continue
@@ -2295,7 +2315,9 @@ def check_line_rules(path: str, pieces: list[Piece]) -> list[Finding]:
         # line. "The `#123` syntax" documents a marker's shape; it does not
         # track the commitment beside it, and reading the raw line let it
         # stand in for one.
-        if untracked_marker(spanless_line or spanless[index].strip()):
+        if untracked_marker(
+            (spanless_line or spanless[index].strip()) + follow[index]
+        ):
             findings.append(Finding("CH002", path, lineno, stripped))
 
         archaeology = ARCHAEOLOGY_RE.search(stripped)
@@ -4493,6 +4515,25 @@ RULE_TESTS = [
         "// 2. TODO: issue required` suffix.\n",
         set(),
         "a tag in a // comment ends no paragraph, so the marker opens no list",
+    ),
+    (
+        "// TODO: implement the retry described in\n"
+        "// #123\n",
+        set(),
+        "a marker's reference may wrap onto the next line",
+    ),
+    (
+        "// TODO: add retries\n"
+        "//\n"
+        "// #123\n",
+        {("CH002", 1)},
+        "but a blank line ends the sentence, and the reference with it",
+    ),
+    (
+        "// TODO: add retries\n"
+        "// TODO(#123): other work\n",
+        {("CH002", 1)},
+        "and the next marker owns everything past itself",
     ),
 ]
 
