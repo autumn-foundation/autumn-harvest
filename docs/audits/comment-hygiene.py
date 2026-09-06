@@ -247,6 +247,16 @@ VISIBILITY = r"(?:pub(?:\((?:in\s+)?(?:r\#)?\w+(?:::(?:r\#)?\w+)*\))?\s+)?"
 # Bounded by the `{` or `;` that ends the declaration, so it can never run
 # past the item it belongs to. rustc 1.94.1 compiles every form below.
 WHERE = r"(?:where\s+[^;{]+?\s*)?"
+# What follows an item's signature: the `{` that opens its block, or a
+# COMPLETE one-line block. `fn stale() {}` is commented-out code as surely
+# as `fn stale() {` is, and anchoring at the brace let every one-line body
+# through an absolute gate. Anchored at the end of the line, so the closing
+# brace has to be the last thing there.
+#
+# Only the strongly anchored item forms take it. Control flow does not: its
+# guard is a lookahead over the words before the brace, and "match the shard
+# {0}" is prose that ends in a closing brace.
+BODY = r"(?:\{(?:.*\})?)"
 COMMENTED_CODE_RE = re.compile(
     r"""^(?:
         # The ABI name may carry a hyphen -- "C-unwind" and its siblings are
@@ -258,12 +268,12 @@ COMMENTED_CODE_RE = re.compile(
         (?:async\s+|unsafe\s+|const\s+|extern\s+(?:"[\w-]+"\s+)?)*
             fn\s+(?:r\#)?\w+\s*(?:<[^<>]*>)?\s*\(
             (?:
-                 .*\)\s*(?:->\s*[^;{]+?)?\s*{WHERE}[{;]  # complete: { or ;
+                 .*\)\s*(?:->\s*[^;{]+?)?\s*{WHERE}(?:;|{BODY})  # complete
                | \s*$                                # wrapped: `fn foo(` at EOL
                | (?=[^)]*(?::|\bself\b))            # wrapped: real params,
                  [\w\s:&'<>\[\](),.+;=*#-]*,\s*$     #   trailing comma
             )\s*$
-      | {VIS}(?:struct|enum|trait|union)\s+(?:r\#)?\w+\s*(?:<[^<>]*>)?\s*{WHERE}[{;(]\s*$
+      | {VIS}(?:struct|enum|trait|union)\s+(?:r\#)?\w+\s*(?:<[^<>]*>)?\s*{WHERE}(?:[;(]|{BODY})\s*$
       # A tuple struct, whose field list is on the line and terminated. Its
       # own alternative rather than a relaxation of the one above, which is
       # what this file's guidance asks for: the name is still anchored hard
@@ -274,12 +284,12 @@ COMMENTED_CODE_RE = re.compile(
             # has carried since round forty-one, which this alternative was
             # written without.
             \s*\((?:[^;{]|;(?=[^;]*\]))*\)\s*{WHERE};\s*$
-      | {VIS}mod\s+(?:r\#)?\w+\s*[{;]\s*$
+      | {VIS}mod\s+(?:r\#)?\w+\s*(?:;|{BODY})\s*$
       | {VIS}(?:const|static)\s+(?:mut\s+)?(?:r\#)?\w+\s*:[^;=]+=.*[;{]\s*$
       | {VIS}type\s+(?:r\#)?\w+\s*(?:<[^<>]*>)?\s*=
             (?!\s*(?:\w+\s+){2,}\w+\s*;\s*$).*;\s*$
       | impl(?:\s*<[^<>]*>)?\s+
-            (?![^;{]*\b[a-z]+\s+[a-z]+\s+[a-z]+\s+[a-z]+\b)[\w:<>&'\s\#,]+\{\s*$
+            (?![^;{]*\b[a-z]+\s+[a-z]+\s+[a-z]+\s+[a-z]+\b)[\w:<>&'\s\#,]+{BODY}\s*$
       | let\s+(?:mut\s+)?(?:r\#)?\w+\s*(?::[^;=]+)?=
             (?!\s*(?:\w+\s+){2,}\w+\s*;\s*$)[^=].*;\s*$
       # Destructuring bindings. A tuple or slice pattern, or a struct/enum
@@ -337,7 +347,9 @@ COMMENTED_CODE_RE = re.compile(
       | continue\b(?:\s+'\w+)?\s*;\s*$
       | [\w:\#]+(?:::<[^;()]*>)?(?:\.[\w:\#]+(?:::<[^;()]*>)?)*
             \(.*\)(?:\s*\?|\s*\.await\s*\??)*\s*;\s*$
-    )""".replace("{VIS}", VISIBILITY).replace("{WHERE}", WHERE),
+    )""".replace("{VIS}", VISIBILITY).replace("{WHERE}", WHERE).replace(
+        "{BODY}", BODY
+    ),
     re.VERBOSE,
 )
 
@@ -4849,6 +4861,36 @@ RULE_TESTS = [
         "// The queue drains where the worker parks\n",
         set(),
         "but the word alone is prose",
+    ),
+    (
+        "// fn stale() {}\n",
+        {("CH001", 1)},
+        "a body that opens and closes on one line is still a body",
+    ),
+    (
+        "// pub fn one() -> u8 { 1 }\n",
+        {("CH001", 1)},
+        "with a value in it as well as empty",
+    ),
+    (
+        "// pub struct S {}\n",
+        {("CH001", 1)},
+        "on a struct as well as a function",
+    ),
+    (
+        "// impl Default for Q { fn default() -> Self { Q } }\n",
+        {("CH001", 1)},
+        "and however deep the braces go, so long as the line ends at one",
+    ),
+    (
+        "// Returns the shard {0}\n",
+        set(),
+        "but prose ending in a brace is prose",
+    ),
+    (
+        "// match the shard {0}\n",
+        set(),
+        "which is why control flow keeps its opening brace",
     ),
     (
         "// r#type::init();\n",

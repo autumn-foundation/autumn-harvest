@@ -2887,3 +2887,25 @@ more hold the widening down: with no doc after it a blank doc line still
 renders nothing, and a plain `//` run is joined by nothing at all.
 
 Corpus effect: none. Eight fixtures, four of them counter-cases.
+
+### Round ninety-four — a body that closes on its own line
+
+One finding, a bypass. `// fn stale() {}` produced no CH001, because
+every item form anchored on the `{` that OPENS a block and then required
+the end of the line. A body that opens and closes on one line is a body.
+
+The sibling sweep turned one into nine, all compiled with rustc 1.94.1
+first: a function empty and with a value, a function with a where
+clause, a struct, an enum, a trait, a module, an impl, and an impl whose
+one-line body nests another. One `BODY` fragment now, beside `VISIBILITY`
+and `WHERE`, spliced into each of them.
+
+Control flow does NOT take it, deliberately. Its guard is a lookahead
+over the words before the brace, so it never had a name to anchor on, and
+`// match the shard {0}` is prose that ends in a closing brace. That is a
+counter-case fixture, as is `// Returns the shard {0}`.
+
+Corpus effect: none, which for a widened absolute gate is the number that
+matters -- no comment in this tree newly reads as code.
+
+Six fixtures, two of them counter-cases.
