@@ -41,6 +41,13 @@ testcontainers-modules = { workspace = true }
 [[bench]]
 name = "claim_roundtrip_profile"
 harness = false
+# Requires a real, reachable Redis instance (see the harness's module doc) --
+# `test = false` keeps `cargo test --all-targets` / `cargo test --workspace
+# --all-targets` from building-and-running this binary (which `harness =
+# false` would otherwise do unconditionally, panicking wherever
+# HARVEST_REDIS_TEST_URL isn't set). `cargo bench --bench
+# claim_roundtrip_profile` is unaffected: `test` only gates `cargo test`.
+test = false
 
 [lints]
 workspace = true

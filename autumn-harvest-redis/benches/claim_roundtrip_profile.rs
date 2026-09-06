@@ -66,14 +66,23 @@ fn env_usize(key: &str, default: usize) -> usize {
 
 #[tokio::main]
 async fn main() {
-    let url = std::env::var("HARVEST_REDIS_TEST_URL").unwrap_or_else(|_| {
-        panic!(
-            "claim_roundtrip_profile requires a real Redis instance -- set \
-             HARVEST_REDIS_TEST_URL (e.g. redis://127.0.0.1:6379) before running. \
-             This profiling harness does not fall back to a testcontainers-managed \
-             instance; see this file's module doc for why."
-        )
-    });
+    // `harness = false` means `cargo test --benches` / `--all-targets` builds
+    // and *runs* this binary as-is (the `test = false` bench-target setting
+    // in Cargo.toml only stops a bare, target-less `cargo test` from doing
+    // that; an explicit `--benches`/`--all-targets` overrides it) -- so a
+    // workspace-wide `cargo test --workspace --all-targets` run on a machine
+    // with no Redis configured must not fail here. Skip cleanly (matching
+    // `tests/integration_redis.rs::try_start_redis`'s convention for the
+    // identical "no Redis available" case) rather than panicking.
+    let Ok(url) = std::env::var("HARVEST_REDIS_TEST_URL") else {
+        eprintln!(
+            "claim_roundtrip_profile: skipping -- set HARVEST_REDIS_TEST_URL \
+             (e.g. redis://127.0.0.1:6379) to a real Redis instance to run this \
+             profiling harness. This is not a profile result: no measurement was \
+             taken."
+        );
+        return;
+    };
     let n = env_usize("CLAIM_PROFILE_N", 300);
     assert!(n > 0, "CLAIM_PROFILE_N must be at least 1, got 0");
 
