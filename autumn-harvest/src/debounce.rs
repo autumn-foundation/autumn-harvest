@@ -749,7 +749,12 @@ const QUOTA_REDEFER_BACKOFF: Duration = Duration::from_secs(5);
 /// has already been blown by the quota block, so there is no deadline left
 /// to honor, and the alternative — dropping the row — would silently
 /// discard a debounced start the caller is still waiting on.
-#[cfg(feature = "db")]
+///
+/// Deliberately NOT gated behind `#[cfg(feature = "db")]` like its caller
+/// (`redefer_debounce_row`): this function is pure `DateTime` arithmetic with
+/// no database dependency, and the ungated unit tests below need to call it
+/// regardless of which features are enabled (mirrors `compute_fire_deadline`
+/// above).
 fn redefer_target(
     now: DateTime<Utc>,
     max_fire_at: DateTime<Utc>,
