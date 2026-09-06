@@ -10,9 +10,34 @@ only.
 
 The result **confirms the doc's own suspicion on magnitude**: populating
 `schedule_to_close_at` adds a small, real buffer cost to the claim query --
-**+7.5% at 1,000 rows, +3.6% at 10,000, +2.6% at 100,000** -- corroborated by
-two standalone MVCC-bloat scripts. None of this comes close to the 20%
-impact floor; no fix is proposed or needed.
+**+7.5% at 1,000 rows, +3.6% at 10,000** (100,000 does not get a clean
+percentage in the committed run -- see [100,000-row plan
+choice](#100000-row-plan-choice) for why) -- corroborated by two standalone
+MVCC-bloat scripts. None of this comes close to the 20% impact floor; no
+fix is proposed or needed.
+
+**A late-round methodology fix changed several of this page's headline
+numbers substantially, including the real-drain aggregate below (from
++15.5% to +1.9% for `claim_task_query()` alone).** Every capture on this
+page seeds two data states side by side and compares them, so any
+difference *other* than `schedule_to_close_at` between how the two states
+were seeded is itself a source of measurement error. Through several
+review rounds, the `schedule-to-close` state was re-seeded with its own
+fresh, independently-random `id`/`activity_id` UUIDs rather than reusing
+the `no-schedule-to-close` state's exact values -- and since every claim is
+a non-HOT `UPDATE` that touches *every* index on `harvest_task_queue`, not
+just `harvest_task_queue_schedule_to_close_idx` (see [Plan](#plan)),
+independently-random keys in those OTHER indexes' B-trees could add
+page-split/traversal noise of a similar size to the effect this page
+attributes to `schedule_to_close_at`. Codex review on PR #1339 caught this,
+and caught two further bugs in the first two attempts to fix it (wrong
+snapshot ordering, then a snapshot that didn't survive across the
+real-drain loop's per-label connections) -- see
+[Workload](#workload) for the full sequence. The 1,000-/10,000-row
+`EXPLAIN` deltas above reproduced identically before and after this fix;
+the real-drain aggregate and the 100,000-row plan choice did not -- see
+[Corroboration](#corroboration-pg_stat_statements-over-the-real-claim-drain)
+and [100,000-row plan choice](#100000-row-plan-choice).
 
 **The mechanism is not what an earlier revision of this page claimed,
 though.** That revision attributed the whole delta to row width, by analogy
@@ -189,6 +214,59 @@ different, unrelated access paths for that lookup -- independently of
 exists to make. This was missing in the first several runs of this capture
 and was added in response to Codex review.
 
+**Both labels seed `id`/`activity_id` from the exact same set of values,
+not independently.** Every claim is a non-HOT `UPDATE` (see [Plan](#plan))
+that touches every index on `harvest_task_queue`, including the primary
+key and any index on `activity_id` -- not just
+`harvest_task_queue_schedule_to_close_idx`. An earlier revision of this
+capture let `db::seed()`'s own `gen_random_uuid()` calls seed each label
+independently, so the two labels' primary-key and `activity_id` B-trees
+held genuinely different random keys -- page-split/traversal noise from
+those OTHER indexes could be comparable in size to the effect this page
+attributes to `schedule_to_close_at`. Codex review on PR #1339 caught
+this, and caught two further problems in fixing it:
+
+1. **Reuse the values, correctly ordered.** The first fix snapshotted the
+   `no-schedule-to-close` seed's `id`/`activity_id` values and reused them
+   for the `schedule-to-close` re-seed, but numbered the snapshot by
+   `ROW_NUMBER() OVER (ORDER BY id)` -- sorting by the random primary key
+   rather than original insertion order -- so the re-insert built its heap
+   and every index in a different physical order than `db::seed()`'s
+   `generate_series`-ordered bulk `INSERT` did for the baseline, which
+   could reintroduce the same kind of noise. Fixed by numbering with
+   `ROW_NUMBER() OVER (ORDER BY ctid)` instead (`ctid`, physical tuple
+   location, preserves insertion order for a table that has only ever been
+   bulk-loaded once) and explicitly re-inserting in that same order.
+2. **Share the snapshot across connections, not just within one.** The
+   per-depth `EXPLAIN` loop seeds once per depth and shares that seed
+   between both labels on one connection (the `no-schedule-to-close`
+   label's `EXPLAIN ANALYZE` runs inside a rolled-back transaction, so its
+   seeded rows survive for the `schedule-to-close` re-seed that follows) --
+   a `TEMP TABLE` snapshot works fine there. But the real-drain loop opens
+   a **fresh** connection per label and re-seeds independently on each, so
+   a `TEMP TABLE` (connection-session-scoped) snapshotted and reused only
+   the `schedule-to-close` label's own already-independently-random seed
+   -- a no-op for cross-label matching. Fixed by using a plain table,
+   snapshotted during the `no-schedule-to-close` label's iteration and
+   consumed during the `schedule-to-close` label's, on its own separate
+   connection.
+
+Both fixes are in `claim_budget_tests.rs`'s
+`snapshot_seed_for_schedule_to_close`/`reseed_from_schedule_to_close_snapshot`
+helpers; see their doc comments for the full detail. **The impact was
+large, not cosmetic**: the real-drain aggregate dropped from +15.5% to
++1.9% for `claim_task_query()` alone once both labels shared identical
+indexed values (see
+[Corroboration](#corroboration-pg_stat_statements-over-the-real-claim-drain)),
+and the 100,000-row `EXPLAIN` comparison, which happened to land on the
+same (`Seq Scan`) plan for both labels in the pre-fix committed run, landed
+on *different* plans for the two labels once re-run with this fix (see
+[100,000-row plan choice](#100000-row-plan-choice)) -- direct evidence that
+at least part of what this page previously reported as the
+`schedule_to_close_at` effect was really this seeding confound. The
+1,000-/10,000-row `EXPLAIN` deltas, by contrast, reproduced byte-identical
+before and after this fix.
+
 ## Plan
 
 `harvest_task_queue` carries a partial index built for the timeout scanner,
@@ -261,32 +339,45 @@ own, separate cumulative `Buffers: shared hit=` line:
 |---:|---:|---:|---:|
 | 1,000 | 37 / 37 | **0** | +4 |
 | 10,000 | 256 / 262 | +6 | +4 |
-| 100,000 | 2,453 / 2,513 | +60 | +4 |
+| 100,000 | 9,858 / 2,513 | not meaningful -- see below | +4 |
 
 The `Update`-exclusive column (the index write plus whatever else the
-`Update` node itself touches, beyond its child) is **exactly constant across
-all three depths (+4 every time)** -- consistent with the fixed one-page
-index write the `dirtied`/`written` evidence above already established (a
-B-tree insert typically touches a root and/or a leaf page as `hit`s in
-addition to the one page it dirties, so a handful of total `hit` buffers
-for one insert is unsurprising; a genuinely distinct key per row, per the
-seeding fix in [Workload](#workload), needs a real tree descent rather than
-landing in an already-cached duplicate-key leaf, which plausibly explains
-why this settled at a clean +4 rather than the +3/+4/+4 an earlier,
-degenerate-seed run measured). The scan-side column is **not** simply
-proportional to backlog depth: it is exactly zero at 1,000 rows, +6 at
-10,000, and +60 at 100,000. Zero at the smallest depth is consistent with a
-genuine row-width effect that only becomes visible once the table is large
-enough for the extra bytes per row to push the page count itself higher --
-at 1,000 rows both data states may simply pack into the same number of heap
-pages by coincidence of alignment and fill factor, with the effect only
-crossing a whole-page threshold at larger sizes -- but this page does not
-have a targeted test isolating that specific claim, so it is reported as
-the most plausible explanation for the pattern, not a confirmed one. This
-is consistent with the *general* row-width mechanism
+`Update` node itself touches, beyond its child) is **exactly constant
+across all three depths (+4 every time), including 100,000** --
+consistent with the fixed one-page index write the `dirtied`/`written`
+evidence above already established (a B-tree insert typically touches a
+root and/or a leaf page as `hit`s in addition to the one page it dirties,
+so a handful of total `hit` buffers for one insert is unsurprising). This
+column held constant across the seeding fix in [Workload](#workload) too
+(it read +3/+4/+4 under an earlier, degenerate-seed run; +4/+4/+4 with a
+genuinely distinct key per row; and +4/+4/+4 again, unaffected, once both
+labels' *other* indexes stopped varying independently) -- three
+independent pieces of evidence for the same fixed per-claim index-write
+signature, none of which moved when the seeding methodology changed
+underneath them.
+
+**The 100,000-row scan-side delta is not a row-width measurement in this
+committed run, and this page does not report it as one.** At 1,000 and
+10,000 rows both labels use the identical plan shape (a `Nested Loop`
+feeding the same downstream `Sort`), so subtracting their child-node hits
+isolates a row-width effect cleanly: zero at 1,000 rows, +6 at 10,000,
+consistent with a genuine row-width effect that only becomes visible once
+the table is large enough for the extra bytes per row to push the page
+count itself higher (at 1,000 rows both states may simply pack into the
+same number of heap pages by coincidence of alignment and fill factor).
+This is consistent with the *general* row-width mechanism
 `docs/performance-capability-labels.md`'s `required_capabilities` finding
 describes for its own (larger) JSONB column, without claiming the same
-smooth, always-positive scaling that page found for its wider effect.
+smooth, always-positive scaling that page found for its wider effect. At
+100,000 rows, though, the committed run's two labels land on **different
+plans** for the candidate scan (see [100,000-row plan
+choice](#100000-row-plan-choice)): `no-schedule-to-close` uses an `Index
+Scan using idx_harvest_tq_poll` (9,858 child-node hits), `schedule-to-close`
+a plain `Seq Scan` (2,513 hits, identical to the previously committed run).
+Subtracting those two would compare the cost of two different scan
+strategies, not the row-width cost of one strategy under two data states
+-- so this page reports both raw numbers and explicitly declines to derive
+a "scan-side delta" from them.
 
 Neither component is a defect. The index exists because the timeout
 scanner needs it (its own migration comment says so, and no alternative
@@ -309,75 +400,88 @@ the committed run -- reproduce via the command in
 |---:|---:|---:|---:|---:|
 | 1,000 | 53 | 57 | +4 | +7.5% |
 | 10,000 | 274 | 284 | +10 | +3.6% |
-| 100,000 | 2,473 | 2,537 | +64 | +2.6% |
+| 100,000 | 9,878 | 2,537 | -7,341 | not meaningful -- see below |
 
-**These are shared-buffer hits specifically, not the query's complete I/O
-picture** -- Codex review on PR #1339 correctly flagged that an earlier
-revision labeled this column "total buffers" while the 100,000-row plan's
-own root node also reports `temp read=495 written=1914` (the external
-merge sort's disk spill, from `Sort Method: external merge` a few nodes
-down), which the +2.6% figure above excludes entirely. That temp I/O is
-**identical between both labels** at this depth (`grep`-verified against
-both committed 100,000-row artifacts) -- it is a function of sorting
-100,000 candidate rows, orthogonal to whether `schedule_to_close_at` is
-populated -- so it does not change *which* mechanism the delta is
-attributed to. It does change the whole-query percentage, though: folding
-the identical 2,409 temp blocks into both totals (2,473+2,409=4,882 vs.
-2,537+2,409=4,946) gives **+1.3%**, not +2.6%, as the 100,000-row depth's
-share of the *entire* query's I/O, shared-buffer and temp combined. Both
-numbers are real and are not in conflict -- +2.6% answers "how much bigger
-is the shared-buffer-hit cost this predicate adds," the figure the
-[Plan](#plan) section's mechanism breakdown is built on and the one this
-page uses elsewhere; +1.3% answers "how much bigger is the whole query,
-including its unrelated disk-sort cost, at this depth." Neither figure is
-published at the 1,000-/10,000-row depths because neither of those plans'
-artifacts report any `temp` I/O to fold in.
+**The 1,000-/10,000-row deltas are shared-buffer hits specifically, not
+the query's complete I/O picture, but that distinction doesn't change
+their sign or size** -- both plans at those depths report no `temp` I/O to
+fold in either way. **The 100,000-row row is not a predicate-cost
+comparison at all in this committed run.** The two labels land on
+different plans for the candidate scan -- `no-schedule-to-close` an
+`Index Scan using idx_harvest_tq_poll`, `schedule-to-close` a plain `Seq
+Scan` -- so the raw totals above measure the cost of two different scan
+strategies, not the marginal cost of populating `schedule_to_close_at`
+under one strategy; see [100,000-row plan
+choice](#100000-row-plan-choice) for the full picture, including why both
+plans still pay the same identical `temp read=495 written=1914` external-merge-sort
+cost regardless. An earlier revision of this page (before the seeding fix
+[Workload](#workload) documents) happened to see both labels choose `Seq
+Scan` at this depth and reported a clean +2.6%/+1.3% pair of percentages
+(shared-hit-only and whole-query, respectively) for that run -- those
+numbers were real for the run that produced them, but this page no longer
+publishes a 100,000-row percentage, because the committed run backing it
+changed which plan each label chose and a percentage across two different
+plan shapes would misrepresent what it measures.
 
 The scan-side and `Update`-exclusive breakdown in [Plan](#plan) above,
 derived from this same committed run's shared-buffer-hit counters,
-decomposes each of the table's totals into its two component mechanisms.
+decomposes the 1,000-/10,000-row totals into their two component
+mechanisms, and explains why 100,000 does not get the same treatment.
 
 ### 100,000-row plan choice
 
-The 100,000-row depth's candidate-row source used a plain `Seq Scan` on
-both sides in the committed run, landing on the cheap +2.6% delta shown
-above. Earlier, now-uncommitted runs of this capture (before the seeding
-and `ANALYZE` fixes in [Workload](#workload)) sometimes measured a far more
-expensive plan at this same depth specifically for `schedule-to-close` --
-`Index Scan using idx_harvest_tq_poll` instead of `Seq Scan`, still
-followed by the same external-merge sort, pushing the total well past
-10,000 buffers. That index cannot serve the query's `ORDER BY` (the
-non-indexable leading `CASE` expression -- see `docs/performance.md`'s
-TL;DR), so the alternative plan is strictly worse here, not a genuine
-optimization the planner found.
+**The committed run's two labels land on different plans at this depth --
+first direct, fully-auditable evidence that this instability is not tied
+to `schedule_to_close_at` specifically.** `no-schedule-to-close` uses an
+`Index Scan using idx_harvest_tq_poll` for the candidate-row source (9,878
+total buffers on the `Update` node); `schedule-to-close` uses a plain `Seq
+Scan` (2,537 total buffers, identical to the previous committed run --
+see [Workload](#workload) for why that specific number reproduced exactly
+across the seeding fix). Both plans still pay the identical
+`temp read=495 written=1914` external-merge-sort cost regardless of which
+scan feeds it (`grep`-verified against both artifacts): that index cannot
+serve the query's `ORDER BY` (the non-indexable leading `CASE` expression
+-- see `docs/performance.md`'s TL;DR), so choosing it does not avoid the
+sort and is strictly worse here, not a genuine optimization the planner
+found.
 
-This page does **not** assert how often that expensive plan recurs, or
-under what conditions. Codex review caught this claim leaking back in
-twice: first as an explicit "2 of 3 runs" / "2 of 4 runs" framing, and
-then again -- after that framing was removed -- as a spelled-out "two
-runs ... predated every fix ... not observed in either of the two runs
-that had the seeding fix applied" sample-of-two-against-two, which is the
-identical statistic in prose instead of a fraction, sourced from the same
-runs whose artifacts this page's "On reproducibility" note above says are
-gone. The only fact this page can support from the repository as it
-stands: the committed run used a plain `Seq Scan` and landed on the cheap
-delta above. During this pass, before the seeding and `ANALYZE` fixes in
-[Workload](#workload) landed, development runs of this same capture
-sometimes hit the more expensive plan described above instead -- which is
-the reason it's documented here, and the reason the seeding bug (a single
-byte-identical index key across all 10,000 rows) is flagged below as a
-plausible contributing factor -- but none of those runs' plan output
-survives to audit, so this page counts none of them and draws no
-frequency, ratio, or before/after conclusion from them. **This remains a
-risk worth being aware of at large backlog depths for deployments that
-populate `schedule_to_close_at`**, not a proposed fix target: there is no
-schema or query change on offer that would pin the planner's choice
-without the "planner-disabling flags... outside a diagnostic session"
-this repo's rules ban, and extended statistics or a planner hint would be
-a schema/config change outside this pass's scope (this repo's "ask
-before" list). A future pass with the budget for many more repeated,
-fully-fixed runs -- each with its own committed artifacts -- could turn
-this into an actual frequency estimate; this one cannot.
+This reverses which label the earlier, pre-fix committed run showed the
+expensive plan on: that run had `schedule-to-close` on the (identically
+random, but shared-shape) `Seq Scan` and `no-schedule-to-close` also on
+`Seq Scan`; still-earlier, uncommitted development runs (see below) had
+shown the expensive plan on `schedule-to-close` specifically. This run --
+fully committed and auditable, unlike those -- shows it on
+`no-schedule-to-close` instead. A phenomenon that lands on either label
+depending on the run is strong direct evidence that it is not caused by
+populating `schedule_to_close_at`, though this page still cannot say what
+does cause it: both runs used the same query, the same backlog shape, and
+(after the seeding fix) the same seeded index-key distribution between
+labels, so whatever tips the planner between these two plans at 100,000
+rows is sensitive to something this page hasn't isolated -- most likely
+ordinary statistical noise in `ANALYZE`'s sample at this table size, but
+that is not confirmed here.
+
+This page does **not** assert how often the expensive plan recurs, or
+under what conditions, for either label. Codex review caught this claim
+leaking back in twice on earlier revisions: first as an explicit "2 of 3
+runs" / "2 of 4 runs" framing, and then again -- after that framing was
+removed -- as a spelled-out sample-of-two-against-two restating the same
+statistic in prose, both sourced from uncommitted development runs (before
+this pass's seeding fixes) whose artifacts no longer exist to audit. This
+page continues to count none of those uncommitted runs and draws no
+frequency, ratio, or before/after conclusion from them -- the only new
+claim this revision adds is the one both of this pass's two *committed*
+100,000-row runs directly support: the expensive plan is not confined to
+one label. **This remains a risk worth being aware of at large backlog
+depths, for deployments that populate `schedule_to_close_at` and those
+that don't equally**, not a proposed fix target: there is no schema or
+query change on offer that would pin the planner's choice without the
+"planner-disabling flags... outside a diagnostic session" this repo's
+rules ban, and extended statistics or a planner hint would be a
+schema/config change outside this pass's scope (this repo's "ask before"
+list). A future pass with the budget for many more repeated, fully-fixed
+runs -- each with its own committed artifacts -- could turn this into an
+actual frequency estimate; this one cannot.
 
 ### Corroboration: `pg_stat_statements` over the real claim-drain
 
@@ -414,62 +518,69 @@ on), so this is a reporting fix, not a re-run:
 
 | statement | no-schedule-to-close total shared-buffer hits (10,000-10,001 calls) | schedule-to-close total shared-buffer hits | delta % |
 |---|---:|---:|---:|
-| `claim_task_query()` itself (10,001 calls) | 4,840,867 | 5,592,358 | +15.5% |
-| queue-pause post-claim recheck (10,000 calls) | 69,004 | 118,850 | +72.2% |
-| activity-pause post-claim recheck (10,000 calls) | 69,004 | 118,726 | +72.1% |
-| **combined (all three, full drain)** | **4,978,875** | **5,829,934** | **+17.1%** |
+| `claim_task_query()` itself (10,001 calls) | 5,264,349 | 5,363,879 | +1.9% |
+| queue-pause post-claim recheck (10,000 calls) | 55,154 | 117,755 | +113.5% |
+| activity-pause post-claim recheck (10,000 calls) | 55,154 | 117,632 | +113.3% |
+| **combined (all three, full drain)** | **5,374,657** | **5,599,266** | **+4.2%** |
 
-**+17.1% is this page's one auditable figure for "the cost of driving the
-real `claim_task()` function over this drain,"** superseding the
-`claim_task_query()`-only +15.5% this section previously reported as if it
-were that same thing -- +15.5% is still correct as a description of
-`claim_task_query()`'s own SQL text alone (and is what the `EXPLAIN`-based
-[Plan](#plan) section above is built on, since `EXPLAIN` was only run
-against that one query), so both figures are kept, each labeled for what it
-actually measures. The two rechecks' own relative increase (+72%) is
-markedly larger than the main query's, which this page cannot explain with
-confidence: no `EXPLAIN` was captured for either recheck statement, only
-the aggregate `pg_stat_statements` counters above, so there is no plan-level
-evidence to confirm the mechanism. **It is not the same non-HOT index-write
-mechanism [Plan](#plan) establishes for the main claim `UPDATE`, though** --
-an earlier revision of this section speculated that it might be, but this
-capture's fixture never populates `harvest_queue_pauses` or
-`harvest_activity_pauses` -- `db::seed()` only seeds paused rows for
-`ClaimGate::PausedRows`/`AllGates` (see `claim_bench_support.rs`'s
-`wants_paused_rows`), and this capture uses `ClaimGate::Baseline`
-throughout -- so `EXISTS (SELECT ... FROM harvest_queue_pauses ...)` and
-its activity-pause counterpart are always false, and each
-recheck's `WHERE id = $1 AND state = ... AND worker_id = ... AND
-EXISTS (...)` therefore never matches a row to update. A statement that
-never actually writes cannot perform a non-HOT update or maintain any
+**+4.2% is this page's one auditable figure for "the cost of driving the
+real `claim_task()` function over this drain,"** with `claim_task_query()`
+alone (+1.9%) kept as a separate figure since it's what the `EXPLAIN`-based
+[Plan](#plan) section above is built on ( `EXPLAIN` was only run against
+that one query). **Both numbers dropped sharply from an earlier revision
+of this table (+17.1% combined, +15.5% for `claim_task_query()` alone)**
+once the seeding fix [Workload](#workload) describes landed: that earlier
+revision let the two labels seed independently-random `id`/`activity_id`
+values, and once both labels shared the exact same values, most of what
+had looked like a `schedule_to_close_at` effect on the main query turned
+out to be that seeding confound instead. The two rechecks' own relative
+increase (+113%) is markedly larger than the main query's, and *also*
+changed a lot under the same fix (from +72%) -- this page cannot explain
+either number with confidence: no `EXPLAIN` was captured for either recheck
+statement, only the aggregate `pg_stat_statements` counters above, so there
+is no plan-level evidence to confirm the mechanism. **It is not the same
+non-HOT index-write mechanism [Plan](#plan) establishes for the main claim
+`UPDATE`, though** -- an earlier revision of this section speculated that
+it might be, but this capture's fixture never populates
+`harvest_queue_pauses` or `harvest_activity_pauses` -- `db::seed()` only
+seeds paused rows for `ClaimGate::PausedRows`/`AllGates` (see
+`claim_bench_support.rs`'s `wants_paused_rows`), and this capture uses
+`ClaimGate::Baseline` throughout -- so `EXISTS (SELECT ... FROM
+harvest_queue_pauses ...)` and its activity-pause counterpart are always
+false, and each recheck's `WHERE id = $1 AND state = ... AND worker_id =
+... AND EXISTS (...)` therefore never matches a row to update. A statement
+that never actually writes cannot perform a non-HOT update or maintain any
 index -- Codex review on PR #1339 caught this. What both rechecks
 genuinely do on every call is a primary-key point lookup on the
 already-claimed row plus the `EXISTS` subquery scan against the (empty)
 pause table, and this page has no confirmed explanation for why that
-combination costs +72% more on the `schedule-to-close` label; it is left
-as an open question rather than attributed to a mechanism the measured
-statements cannot exercise.
+combination costs +113% more on the `schedule-to-close` label, or why that
+figure itself moved so much once the seeding confound was fixed (a
+plausible guess: an unrelated index the primary-key lookup touches was
+itself part of the confound, though this page has not verified that); it
+is left as an open question rather than attributed to a mechanism the
+measured statements cannot exercise.
 
 **Neither number reproduced to a stable value across the several runs this
 capture went through over the course of this pass.** Codex review on PR
-#1339 caught this same problem twice: an earlier revision cited specific
-historical bounds from those runs (roughly +2.5% to +22.5%), and even
-after that was flagged, the rewrite still asserted a qualitative pattern
-across them -- "always positive" -- and predicted that a future run would
-land on "a different, but still small and positive, number." Both are the
-same unaudited-evidence problem this page's "On reproducibility" note
-above disclaims for everything else: those runs' artifacts are gone (the
-repro script always overwrites the same canonical filenames), so nothing
-about them -- not a range, not a sign, not a trend -- is something this
-page can support from the repository as it stands. The only auditable data
-points are the committed run in the table above: **+17.1%** combined
-(**+15.5%** for `claim_task_query()` alone), comfortably under the impact
-floor either way. The drain loop does not capture a plan for any of its
-calls, only the aggregate `pg_stat_statements` counters, so there is no
-per-call plan trace available to check any hypothesis about the cause of
-run-to-run variance, and this page asserts none -- including any hypothesis
-about whether the aggregate stays positive, or how large it runs, on a run
-other than this committed one.
+#1339 caught this same problem twice on an earlier revision, which cited
+specific historical bounds from those runs (roughly +2.5%
+to +22.5%), and even after that was flagged, the rewrite still asserted a
+qualitative pattern across them -- "always positive" -- and predicted that
+a future run would land on "a different, but still small and positive,
+number." Both are the same unaudited-evidence problem this page's "On
+reproducibility" note above disclaims for everything else: those runs'
+artifacts are gone (the repro script always overwrites the same canonical
+filenames), so nothing about them -- not a range, not a sign, not a trend
+-- is something this page can support from the repository as it stands.
+The only auditable data points are the committed run in the table above:
+**+4.2%** combined (**+1.9%** for `claim_task_query()` alone), comfortably
+under the impact floor either way. The drain loop does not capture a plan
+for any of its calls, only the aggregate `pg_stat_statements` counters, so
+there is no per-call plan trace available to check any hypothesis about
+the cause of run-to-run variance, and this page asserts none -- including
+any hypothesis about whether the aggregate stays positive, or how large it
+runs, on a run other than this committed one.
 
 ## Write-side cost
 
@@ -538,18 +649,25 @@ unpredictably partway through (artifacts, the committed run):
 
 | no-schedule-to-close `n_dead_tup` | schedule-to-close `n_dead_tup` | heap-page growth (no-stc / stc) |
 |---:|---:|---:|
-| 5,016 | 2,184 | +48 / +45 |
+| 4,903 | 5,052 | +49 / +52 |
 
 **This does not support a pinned dead-tuple ratio, or even a consistent
 sign.** Earlier, now-uncommitted runs of this capture measured
 `no-schedule-to-close` dead-tuple counts ranging from roughly 800 to
 5,000+, and `schedule-to-close` counts in a similar range, with the
-relative ordering between the two labels flipping between runs (this
-committed run's `no-schedule-to-close` figure is actually *higher* than its
-`schedule-to-close` figure, the reverse of the pattern earlier runs showed).
-Heap-page growth was comparatively closer between the two labels in this
-run (+48 vs +45) than in some earlier ones, but not by a fixed, reproducible
-margin either. The most plausible explanation, consistent across every run
+relative ordering between the two labels flipping between runs -- an
+earlier committed run of this capture (superseded by the seeding fix
+[Workload](#workload) describes) happened to show `no-schedule-to-close`
+*higher* than `schedule-to-close`, the reverse of this run's ordering and
+of the "expected" direction (the extra write both this row's `UPDATE` and
+its `harvest_task_queue_schedule_to_close_idx` entry perform). This run's
+own ordering matches that "expected" direction, but this page treats that
+as coincidence rather than confirmation, given how much the previous
+committed run's ordering (and this section's own historical range) already
+demonstrate the instability. Heap-page growth was comparatively closer
+between the two labels in this run (+49 vs +52) than in some earlier ones,
+but not by a fixed, reproducible margin either. The most plausible
+explanation, consistent across every run
 of this capture, is that autovacuum's exact timing relative to the
 ~15-30-minute drain -- entirely outside this harness's control, since
 nothing in the test triggers or waits for it -- dominates whatever these two
@@ -593,7 +711,12 @@ a correctness difference.
   `pg_stat_statements`, and asserts claim-count equivalence between the two
   states as a correctness check. Seeds `schedule_to_close_at` with a
   per-row-varied, far-future expression (see [Workload](#workload) for why
-  three earlier choices were each wrong).
+  three earlier choices were each wrong), and seeds `id`/`activity_id`
+  identically between the two labels via
+  `snapshot_seed_for_schedule_to_close`/`reseed_from_schedule_to_close_snapshot`
+  (see [Workload](#workload) for why independently-random values there
+  would confound the comparison, and why this took three attempts to get
+  right).
 - `docs/perf-artifacts/schedule-to-close-claim-predicate/` -- the committed
   `EXPLAIN` captures, `pg_stat_statements` snapshots, heap-growth snapshots,
   and the two standalone bloat-corroboration scripts (bulk `UPDATE` and

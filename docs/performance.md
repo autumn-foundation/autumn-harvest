@@ -1462,11 +1462,11 @@ from the benchmark are directly comparable.
     [`docs/performance-schedule-to-close.md`](performance-schedule-to-close.md) seeds `schedule_to_close_at`
     (rather than leaving it null) and **confirms this page's own suspicion on
     magnitude, but not on mechanism**: a small, real shared-buffer-hit cost
-    (+2.6% to +7.5% across the three published backlog depths — the
-    100,000-row depth's plan also spills identically to disk on both sides
-    via an external sort, so folding that unrelated temp I/O into the total
-    gives +1.3% at that depth instead; that page reports both and explains
-    why), corroborated by two
+    (+3.6% to +7.5% across the two backlog depths where both labels land on
+    the same plan — the 100,000-row depth's committed run has the two
+    labels land on *different* plans for the candidate scan, so it does not
+    get a clean percentage; see that page's "100,000-row plan choice"
+    section), corroborated by two
     standalone MVCC-bloat scripts, one bulk and one per-row (+5.2% both) —
     nowhere near the 20% impact floor, so no fix is proposed. Codex review
     caught that the predicate text alone (a plain inline column test) is not
@@ -1486,20 +1486,27 @@ from the benchmark are directly comparable.
     artifacts are ever committed -- the repro script overwrites the same
     canonical filenames each time -- so that page states only the one
     auditable, committed number for driving the real `claim_task()`
-    function (**+17.1%**, combining `claim_task_query()`'s own SQL with the
+    function (**+4.2%**, combining `claim_task_query()`'s own SQL with the
     two post-claim queue-/activity-pause rechecks it also issues on every
-    successful claim — an earlier revision counted only the first and
-    under-reported this as +15.5%, which Codex review caught and that page
-    now reports separately as the `claim_task_query()`-only figure), without
-    asserting a range, a frequency, or a direction (e.g. "always positive")
-    for runs whose evidence no longer exists in the repository to audit. The
-    committed run
-    also shows a markedly cheaper plan at the 100,000-row depth (a plain
-    `Seq Scan`) than a more expensive one this capture's development runs
-    sometimes hit before the seeding and `ANALYZE` fixes landed; that page's
-    "100,000-row plan choice" section explains why it asserts no frequency,
-    ratio, or before/after count for this, including why an earlier
-    revision's "N of M runs" framing, and later a spelled-out
+    successful claim — `claim_task_query()` alone is +1.9%, reported
+    separately since it's what the `EXPLAIN`-based evidence above is built
+    on), without asserting a range, a frequency, or a direction (e.g.
+    "always positive") for runs whose evidence no longer exists in the
+    repository to audit. Both figures, and the buffer deltas above, dropped
+    sharply from an earlier revision of this page (+17.1%/+15.5% real-drain,
+    +2.6%-+7.5% including a clean 100,000-row figure) once a seeding
+    confound was fixed: the two labels had been seeded with independently-random
+    `id`/`activity_id` values, and since every claim's non-HOT `UPDATE`
+    touches every index on the table, not just the one this predicate adds,
+    most of what had looked like a `schedule_to_close_at` effect on the
+    main query and the 100,000-row plan choice turned out to be that
+    confound instead — see that page's "Workload" section for the fix. The
+    committed run now shows the two labels landing on *different* plans at
+    the 100,000-row depth (reversed from which label an earlier, also
+    since-superseded committed run showed the more expensive plan on);
+    that page's "100,000-row plan choice" section explains why it asserts
+    no frequency, ratio, or before/after count for this, including why an
+    earlier revision's "N of M runs" framing, and later a spelled-out
     sample-of-two-against-two restating the same statistic in prose, both
     had to be walked back once those runs' artifacts were no longer
     available to audit. **This is a different question from issue #1177's
@@ -1511,8 +1518,10 @@ from the benchmark are directly comparable.
     against `claim_task_query()` exactly as it stands today, where the
     `CASE` key and the other always-present residual predicates already
     force the collapsed plan shape in both the seeded and unseeded state
-    (both labels' committed plans show the same `Seq Scan` + external-merge
-    `Sort` shape) — so the two findings don't conflict: #1177 explains why
+    (every committed plan needs the same external-merge `Sort` regardless
+    of which scan feeds it, including the 100,000-row depth's committed
+    run, where the two labels land on different scans but the identical
+    sort either way) — so the two findings don't conflict: #1177 explains why
     dropping this predicate alone would not recover the cheap plan, while
     this page measures what it costs to keep it, holding the already-collapsed
     plan shape fixed.
