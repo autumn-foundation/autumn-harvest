@@ -1,8 +1,17 @@
 -- Candidate's single-round-trip batch query, isolated for EXPLAIN at the
--- non-adversarial scenarios (first batch only, no keyset cursor needed).
--- The recheck CTE is scoped to the batch's own distinct concurrency keys,
--- not the backlog's global key cardinality -- the specific mechanism this
--- assay is testing against ledger #3's failure mode.
+-- non-adversarial scenarios (first batch only, no keyset cursor needed --
+-- see claim_batched.sql for the multi-batch cursor and why `id` breaks
+-- ties `priority`/`scheduled_at` alone cannot). The recheck CTE is scoped
+-- to the batch's own distinct concurrency keys, not the backlog's global
+-- key cardinality -- the specific mechanism this assay is testing against
+-- ledger #3's failure mode.
+--
+-- NOTE (post-review, Codex): the `candidates` CTE below is a `Seq Scan` +
+-- top-N `Sort` at this apparatus's 10,000-row backlog depth, not an
+-- index-ordered seek through `idx_harvest_tq_poll` -- see
+-- `forced_index_diagnostic.sql` for whether an index-driven plan is even
+-- reachable for this query shape, and the report's Assay section for what
+-- the natural-planner numbers below do and do not establish as a result.
 EXPLAIN (ANALYZE, BUFFERS, VERBOSE, SETTINGS, TIMING OFF)
 WITH candidates AS (
     SELECT id, task_type, concurrency_key, concurrency_cap, priority, scheduled_at
@@ -10,7 +19,7 @@ WITH candidates AS (
     WHERE queue_name = ANY(ARRAY['bench-q-0','bench-q-1','bench-q-2','bench-q-3'])
       AND state = 'PENDING'
       AND scheduled_at <= NOW()
-    ORDER BY priority DESC, scheduled_at ASC
+    ORDER BY priority DESC, scheduled_at ASC, id ASC
     LIMIT :batch_size
     FOR UPDATE SKIP LOCKED
 ),
@@ -35,5 +44,5 @@ WHERE c.concurrency_key IS NULL
         SELECT rc.running_count FROM running_counts rc
         WHERE rc.concurrency_key = c.concurrency_key AND rc.task_type = c.task_type
       ), 0) < c.concurrency_cap
-ORDER BY c.priority DESC, c.scheduled_at ASC
+ORDER BY c.priority DESC, c.scheduled_at ASC, c.id ASC
 LIMIT 1;

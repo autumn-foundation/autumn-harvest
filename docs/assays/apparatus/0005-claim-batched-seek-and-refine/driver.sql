@@ -2,6 +2,10 @@
 -- every control/candidate measurement -- in one continuous psql session,
 -- so control and candidate genuinely share backend-local state and the
 -- shared-buffer pool. Invoke via run_assay.sh, not directly.
+--
+-- \echo lines below label results/run.log's \timing output (run_assay.sh
+-- captures this session's stdout to that file; \o does not redirect
+-- \timing or \echo, only query results -- see run_assay.sh's own note).
 \set ON_ERROR_STOP 1
 
 \i schema.sql
@@ -24,10 +28,16 @@
 \i batch_claim.sql
 \o
 
+\o results/idle_256-forced_index.explain.txt
+\i forced_index_diagnostic.sql
+\o
+
+\echo -- idle_256 control_raw --
 \timing on
 \o results/idle_256-control_raw.txt
 \i control_raw.sql
 \o
+\echo -- idle_256 claim_batched --
 \o results/idle_256-claim_batched.txt
 SELECT * FROM claim_batched(ARRAY['bench-q-0','bench-q-1','bench-q-2','bench-q-3'], :batch_size);
 \o
@@ -46,10 +56,12 @@ SELECT * FROM claim_batched(ARRAY['bench-q-0','bench-q-1','bench-q-2','bench-q-3
 \i batch_claim.sql
 \o
 
+\echo -- hot_256 control_raw --
 \timing on
 \o results/hot_256-control_raw.txt
 \i control_raw.sql
 \o
+\echo -- hot_256 claim_batched --
 \o results/hot_256-claim_batched.txt
 SELECT * FROM claim_batched(ARRAY['bench-q-0','bench-q-1','bench-q-2','bench-q-3'], :batch_size);
 \o
@@ -68,10 +80,16 @@ SELECT * FROM claim_batched(ARRAY['bench-q-0','bench-q-1','bench-q-2','bench-q-3
 \i batch_claim.sql
 \o
 
+\o results/hot_5000-forced_index.explain.txt
+\i forced_index_diagnostic.sql
+\o
+
+\echo -- hot_5000 control_raw --
 \timing on
 \o results/hot_5000-control_raw.txt
 \i control_raw.sql
 \o
+\echo -- hot_5000 claim_batched --
 \o results/hot_5000-claim_batched.txt
 SELECT * FROM claim_batched(ARRAY['bench-q-0','bench-q-1','bench-q-2','bench-q-3'], :batch_size);
 \o
@@ -83,6 +101,7 @@ SELECT * FROM claim_batched(ARRAY['bench-q-0','bench-q-1','bench-q-2','bench-q-3
 \set keys 256
 \i seed_adversarial_50.sql
 
+\echo -- l4_adversarial_50 claim_batched --
 \timing on
 \o results/l4_adversarial_50-claim_batched.txt
 SELECT * FROM claim_batched(ARRAY['bench-q-0','bench-q-1','bench-q-2','bench-q-3'], :batch_size);
@@ -95,6 +114,7 @@ SELECT * FROM claim_batched(ARRAY['bench-q-0','bench-q-1','bench-q-2','bench-q-3
 \set keys 256
 \i seed_adversarial_200.sql
 
+\echo -- l5_adversarial_200 claim_batched --
 \timing on
 \o results/l5_adversarial_200-claim_batched.txt
 SELECT * FROM claim_batched(ARRAY['bench-q-0','bench-q-1','bench-q-2','bench-q-3'], :batch_size);

@@ -1076,20 +1076,33 @@ the three-rewrites section above already closes it.)
 
 **A third shape — batching #4's per-row retry into a single-round-trip
 per-batch fetch, the specific rewrite issue #1340 was deferred pending —
-was measured and also killed, but on its own pre-registration's arithmetic,
-not on the mechanism:**
+was measured and also killed, on its pre-registration's arithmetic and on a
+narrower mechanism than first reported:**
 `docs/assays/0005-claim-batched-seek-and-refine.md` (ledger #5) fetches the
 top 50 ordered candidates per round trip and scopes the recheck CTE to only
 that batch's own distinct keys, not the backlog's global cardinality. Idle
-cost, the 5,000-key blowup (now demonstrated cardinality-independent, not
-just faster), the 256-key case, and both adversarial fixtures' wall-clock
-all pass decisively. It still kills: both adversarial fixtures resolved in
-one more batch than their pre-registered "exactly N" line allowed, because
-that line's own formula undercounted by the one slot the claimable row
-itself occupies. The batching mechanism's actual scaling (linear in batch
-count) is confirmed by the same data that kills the assay; a corrected
-re-charter, and the concurrent-claimer lock-contention question every
-concurrency-gate assay so far has left unmeasured, remain open, un-run pits.
+cost, the 5,000-key blowup, the 256-key case, and both adversarial
+fixtures' wall-clock all pass decisively; batch-count scaling under
+adversarial depth is linear, not catastrophic. It still kills: both
+adversarial fixtures resolved in one more batch than their pre-registered
+"exactly N" line allowed, because that line's own formula undercounted by
+the one slot the claimable row itself occupies. Post-review (Codex) further
+found the report had mischaracterized the candidate fetch as an
+index-ordered seek through `idx_harvest_tq_poll`; the archived `EXPLAIN`
+output shows a `Seq Scan` of the whole matching backlog instead (the same
+shape the committed fix's own control query plans as, at this apparatus's
+10,000-row depth), and a forced-index diagnostic shows forcing the index
+doesn't recover a bounded scan either — still reads every matching row,
+costs more, no `LIMIT` pushdown. So the assay's surviving claim is narrower
+than first reported: the recheck CTE's cost is cardinality-independent, and
+batching doesn't cost more than the current (already `O(backlog)` at this
+depth) fix — not that batching bounds cost as backlog depth grows, which
+remains untested. That gap also surfaces an unresolved discrepancy against
+this page's own #1177 baseline (reported there as a clean index scan with
+no `Sort` node, at a much larger fixture); a corrected-arithmetic
+re-charter, a depth-varying re-charter, that discrepancy, and the
+concurrent-claimer lock-contention question every concurrency-gate assay so
+far has left unmeasured all remain open, un-run pits.
 
 Until a fix clears every line of some registered assay, deployments with
 concurrency-key cardinality in the low hundreds (the tested, committed

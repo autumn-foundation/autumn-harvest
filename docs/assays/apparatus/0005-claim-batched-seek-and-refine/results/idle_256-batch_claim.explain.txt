@@ -12,7 +12,7 @@
                  Buffers: shared hit=180
                  ->  Sort  (cost=687.19..712.19 rows=10000 width=51) (actual rows=50 loops=1)
                        Output: harvest_task_queue.id, harvest_task_queue.task_type, harvest_task_queue.concurrency_key, harvest_task_queue.concurrency_cap, harvest_task_queue.priority, harvest_task_queue.scheduled_at, harvest_task_queue.ctid
-                       Sort Key: harvest_task_queue.priority DESC, harvest_task_queue.scheduled_at
+                       Sort Key: harvest_task_queue.priority DESC, harvest_task_queue.scheduled_at, harvest_task_queue.id
                        Sort Method: quicksort  Memory: 1166kB
                        Buffers: shared hit=130
                        ->  Seq Scan on public.harvest_task_queue  (cost=0.00..355.00 rows=10000 width=51) (actual rows=10000 loops=1)
@@ -48,7 +48,7 @@
                              Output: batch_keys.concurrency_key, batch_keys.task_type
    ->  Sort  (cost=2.46..2.50 rows=17 width=20) (actual rows=1 loops=1)
          Output: c.id, c.priority, c.scheduled_at
-         Sort Key: c.priority DESC, c.scheduled_at
+         Sort Key: c.priority DESC, c.scheduled_at, c.id
          Sort Method: top-N heapsort  Memory: 25kB
          Buffers: shared hit=181
          ->  CTE Scan on candidates c  (cost=0.00..2.38 rows=17 width=20) (actual rows=50 loops=1)
@@ -62,7 +62,7 @@
                        Buffers: shared hit=1
  Planning:
    Buffers: shared hit=4
- Planning Time: 0.254 ms
- Execution Time: 6.206 ms
+ Planning Time: 0.208 ms
+ Execution Time: 7.560 ms
 (64 rows)
 
