@@ -2507,3 +2507,39 @@ Corpus effect: none, which is worth a note of its own: 1,370 CH005 and
 marker's reference. The shape the harness got wrong is ordinary in
 prose and simply absent here -- which is why every fixture for it had to
 be written rather than found.
+
+### Round eighty-two — the carry, and the last identifier positions
+
+Two findings.
+
+**The wrapped reference carried too far.** Round eighty-one let a
+marker's reference wrap onto the next line and bounded that carry at a
+block edge, a blank line and the next marker. It did not bound it at the
+end of the marker's own SENTENCE, so `TODO: add retries.` and
+`See #123 for parser.` below it became one tracked commitment -- exactly
+the borrowing round sixty-three exists to refuse, reintroduced one line
+lower. The carry now stops at terminal punctuation, with the same
+abbreviation guards `SENTENCE_SPLIT_RE` already carries, so `e.g.` does
+not end it.
+
+That is worth naming: a fix that widens a rule's reach has to re-check
+every bound the rule already had. Round eighty-one added a dimension and
+carried three of the four bounds into it.
+
+**Raw identifiers, the fifth and final round of them.** Rounds seventy
+and seventy-one gave the optional `r#` to eleven positions, round
+seventy-two to a grouped `use` tree, and the destructuring classes were
+still left. Rather than fix the one reported, every remaining identifier
+position in `COMMENTED_CODE_RE` was enumerated and fixed together:
+
+- a wrapped parameter list,
+- an `impl` type path,
+- tuple and slice destructuring,
+- the path of a struct pattern,
+- the type of an uninitialized binding,
+- a macro statement's name.
+
+Four fixtures for the four that are reachable, and the pattern was
+checked directly against each shape as well as through the scan.
+
+Corpus effect: none.

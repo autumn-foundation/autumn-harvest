@@ -250,7 +250,7 @@ COMMENTED_CODE_RE = re.compile(
                  .*\)\s*(?:->\s*[^;{]+?)?\s*[{;]   # complete: ends in { or ;
                | \s*$                                # wrapped: `fn foo(` at EOL
                | (?=[^)]*(?::|\bself\b))            # wrapped: real params,
-                 [\w\s:&'<>\[\](),.+;=*-]*,\s*$      #   trailing comma
+                 [\w\s:&'<>\[\](),.+;=*#-]*,\s*$     #   trailing comma
             )\s*$
       | (?:pub(?:\((?:in\s+)?[\w:]+\))?\s+)?(?:struct|enum|trait|union)\s+(?:r\#)?\w+\s*(?:<[^<>]*>)?\s*[{;(]\s*$
       # A tuple struct, whose field list is on the line and terminated. Its
@@ -268,15 +268,15 @@ COMMENTED_CODE_RE = re.compile(
       | (?:pub(?:\((?:in\s+)?[\w:]+\))?\s+)?type\s+(?:r\#)?\w+\s*(?:<[^<>]*>)?\s*=
             (?!\s*(?:\w+\s+){2,}\w+\s*;\s*$).*;\s*$
       | impl(?:\s*<[^<>]*>)?\s+
-            (?![^;{]*\b[a-z]+\s+[a-z]+\s+[a-z]+\s+[a-z]+\b)[\w:<>&'\s]+\{\s*$
+            (?![^;{]*\b[a-z]+\s+[a-z]+\s+[a-z]+\s+[a-z]+\b)[\w:<>&'\s\#]+\{\s*$
       | let\s+(?:mut\s+)?(?:r\#)?\w+\s*(?::[^;=]+)?=
             (?!\s*(?:\w+\s+){2,}\w+\s*;\s*$)[^=].*;\s*$
       # Destructuring bindings. A tuple or slice pattern, or a struct/enum
       # pattern behind a Capitalised path -- all terminated, and none of them
       # a shape English produces. The plain `\w+` form above misses every one.
-      | let\s+(?:mut\s+)?[(\[][\w\s,.:&*'()\[\]{}]*[)\]]\s*(?::[^;=]+)?
+      | let\s+(?:mut\s+)?[(\[][\w\s,.:&*'()\[\]{}\#]*[)\]]\s*(?::[^;=]+)?
             =\s*[^=;]+(?:;|\s+else\s*\{)\s*$
-      | let\s+(?:[\w]+::)*[A-Z]\w*\s*(?:\([^;]*\)|\{[^;]*\})\s*=\s*[^=;]+
+      | let\s+(?:(?:r\#)?[\w]+::)*(?:r\#)?[A-Z]\w*\s*(?:\([^;]*\)|\{[^;]*\})\s*=\s*[^=;]+
             (?:;|\s+else\s*\{)\s*$
       # An uninitialized binding. No `=` to anchor on, so it needs a type
       # annotation to separate "let mut retries: usize;" from "let the reader
@@ -292,7 +292,7 @@ COMMENTED_CODE_RE = re.compile(
             # A hyphen is admitted only as `->`. A bare one let the prose
             # sweep through "let a::b is re-exported for callers;", and a
             # type has no other use for it.
-            (?:[\w:<>&'\[\]\s,()+*!?]|->|;(?=[^;]*\]))+;\s*$
+            (?:[\w:<>&'\[\]\s,()+*!?\#]|->|;(?=[^;]*\]))+;\s*$
       # A re-export carries a visibility like any other item, and this
       # alternative was the one written without it -- `pub use crate::x;`
       # and `pub(crate) use crate::x;` are the forms this tree actually
@@ -302,7 +302,7 @@ COMMENTED_CODE_RE = re.compile(
             (?:\s+as\s+(?:r\#)?\w+)?;\s*$
       | \#!?\[[\w:()"'=,./\s-]+\]\s*$
       | \}[,;)]*\s*$
-      | [\w:]+!(?:\(.*\)|\[.*\]|\{.*\})\s*;\s*$        # macro stmt, any delimiter
+      | (?:r\#)?[\w:]+!(?:\(.*\)|\[.*\]|\{.*\})\s*;\s*$   # macro stmt
       # A macro DEFINITION, which ends at its brace rather than a `;`.
       # Anchored on the keyword, so no prose can reach it.
       | macro_rules!\s+(?:r\#)?\w+\s*\{.*\}\s*;?\s*$
@@ -331,6 +331,12 @@ TODO_RE = re.compile(
     r"^(?:TODO|FIXME|XXX|HACK)\b|\b(?:TODO|FIXME|XXX|HACK)\s*[:(]", re.IGNORECASE
 )
 TODO_REF_RE = re.compile(r"#\d+|https?://")
+# Terminal punctuation, with the abbreviation guards `SENTENCE_SPLIT_RE`
+# carries. A wrapped reference belongs to the marker's own sentence, so the
+# carry stops where that sentence does -- otherwise "TODO: add retries." and
+# "See #123 for parser." on the line below became one tracked commitment,
+# which is the borrowing round sixty-three exists to refuse.
+ENDS_SENTENCE_RE = re.compile(r"(?<!e\.g)(?<!E\.g)(?<!i\.e)(?<!I\.e)[.!?][\"')\]]*$")
 # A reference that ABUTS the marker on its left. Anchored at the end, and
 # opened either at the bound or at a clause separator, so "See #123 for the
 # parser. TODO: x" is still untracked while "#123 - TODO: x" is not.
@@ -2273,14 +2279,17 @@ def check_line_rules(path: str, pieces: list[Piece]) -> list[Finding]:
         base = len(follow)
         for offset, (_, _, in_fence, opens, _) in enumerate(run_lines):
             carried: list[str] = []
-            for probe in range(offset + 1, len(run_lines)):
-                _, _, probe_fence, probe_opens, _ = run_lines[probe]
-                if probe_fence or probe_opens:
-                    break
-                text = spanless[base + probe].strip()
-                if not text or TODO_RE.search(text):
-                    break
-                carried.append(text)
+            if not ENDS_SENTENCE_RE.search(spanless[base + offset].strip()):
+                for probe in range(offset + 1, len(run_lines)):
+                    _, _, probe_fence, probe_opens, _ = run_lines[probe]
+                    if probe_fence or probe_opens:
+                        break
+                    text = spanless[base + probe].strip()
+                    if not text or TODO_RE.search(text):
+                        break
+                    carried.append(text)
+                    if ENDS_SENTENCE_RE.search(text):
+                        break
             follow.append(" " + " ".join(carried) if carried else "")
     for index, (lineno, body, in_fence, _, _) in enumerate(lines):
         if in_fence:
@@ -4534,6 +4543,32 @@ RULE_TESTS = [
         "// TODO(#123): other work\n",
         {("CH002", 1)},
         "and the next marker owns everything past itself",
+    ),
+    (
+        "// TODO: add retries.\n"
+        "// See #123 for parser.\n",
+        {("CH002", 1)},
+        "a finished sentence carries nothing from the line below it",
+    ),
+    (
+        "// let (r#match, value) = parse();\n",
+        {("CH001", 1)},
+        "a raw name destructures like any other",
+    ),
+    (
+        "// let [r#match, value] = parse();\n",
+        {("CH001", 1)},
+        "in a slice pattern as well as a tuple",
+    ),
+    (
+        "// let r#Wrapper(inner) = parse();\n",
+        {("CH001", 1)},
+        "and in the path of a struct pattern",
+    ),
+    (
+        "// let x: r#Type;\n",
+        {("CH001", 1)},
+        "and in the type of an uninitialized binding",
     ),
 ]
 
