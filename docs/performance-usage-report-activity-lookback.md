@@ -172,14 +172,32 @@ build's duration, blocking every append, claim and completion touching this
 table -- the same trade-off `20260702000000_harvest_usage_report_indexes`
 made and documented. Measured build time on this fixture's ~273,500
 `ActivityStarted` rows (out of ~562,000 total `harvest_events` rows):
-**~329 ms**. For a live, already-large deployment (including one that has
-opted into the partitioned `harvest_events` layout -- see the migration's own
-comment for the partition-aware recipe), build it out-of-band first with
-`CREATE INDEX CONCURRENTLY IF NOT EXISTS` (cannot run inside Diesel's
-migration transaction) and this migration's own statement becomes a safe
-no-op via `IF NOT EXISTS`; `CONCURRENTLY` can leave an `INVALID` index behind
-on failure, so check `pg_index.indisvalid` for this index's oid before
-relying on it if you take that path.
+**~329 ms**. For a live, already-large deployment, build it out-of-band first
+(cannot run inside Diesel's migration transaction) and this migration's own
+statement becomes a safe no-op via `IF NOT EXISTS`. The out-of-band build
+splits on layout (Codex review, PR #1381, round 10: an unpartitioned-only
+instruction here would fail outright on a partitioned deployment, since
+PostgreSQL 16 rejects `CREATE INDEX CONCURRENTLY` against a partitioned
+PARENT in one statement):
+
+* **Unpartitioned** -- run `CREATE INDEX CONCURRENTLY IF NOT EXISTS
+  idx_harvest_events_activity_started_lookup ON harvest_events (...)
+  WHERE event_type = 'ActivityStarted';` directly, as shown above.
+* **Partitioned** (`harvest partition enable` already run) -- build the same
+  index `CONCURRENTLY` on every existing leaf partition first (each leaf is
+  an ordinary table, so `CONCURRENTLY` is supported there), THEN run the
+  unpartitioned statement above against the parent without `CONCURRENTLY`.
+  Postgres recognizes every leaf already carries a matching index and only
+  writes the parent's catalog entry, a metadata-only operation. The
+  migration's own comment carries the exact generator queries, the
+  convergence loop for partitions opened mid-build, and the operational
+  freeze required against concurrent partition maintenance -- copy the
+  recipe from there rather than this summary.
+
+`CONCURRENTLY` can leave an `INVALID` index behind on failure or
+cancellation, on either path -- check `pg_index.indisvalid` for the index's
+oid and `DROP INDEX CONCURRENTLY` plus retry if it is false before relying
+on it.
 
 Rollback (`DROP INDEX IF EXISTS idx_harvest_events_activity_started_lookup;`)
 measured at **~3 ms** on the same fixture.
