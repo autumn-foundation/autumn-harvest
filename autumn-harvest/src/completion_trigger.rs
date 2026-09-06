@@ -2017,6 +2017,53 @@ pub fn evaluate_triggers_for_execution_collecting<'a>(
     .boxed()
 }
 
+/// Backoff stamped on an outbox row that could not even be ATTEMPTED this
+/// scan (issue #1227, Finding 4, Codex round-4 P1 on PR #1386): a missing
+/// target-shard pool, a connection-acquisition failure, or any other
+/// unexpected error surfacing from `relay_gate_checked_start` outside its own
+/// `QuotaExceeded` handling. Same value as `QUOTA_REDEFER_BACKOFF`, kept as a
+/// separate constant because the two recover for unrelated reasons (a quota
+/// clears on tenant capacity change; a transport/pool failure clears on
+/// infra recovery) -- nothing depends on them staying numerically equal.
+#[cfg(feature = "db")]
+const OUTBOX_RELAY_FAILURE_BACKOFF: chrono::Duration = chrono::Duration::seconds(5);
+
+/// Stamp `next_attempt_at` on an outbox row this scan could not even attempt
+/// to relay. Without this, a row whose target shard is durably unreachable
+/// (pool never configured, or persistently refusing connections) would sit
+/// with `next_attempt_at IS NULL` forever -- the "fresh" tier's own priority
+/// (rounds 1-3 above) would then let it dominate every claim batch exactly
+/// the way a persistently-blocked quota row did before Finding 4, this time
+/// for a failure class the quota-specific stamp inside
+/// `relay_gate_checked_start` never covers.
+///
+/// Best-effort: a failure writing this bookkeeping column is logged, not
+/// propagated -- it must never fail the whole scanner tick over a
+/// diagnostics-only write, and the row is simply retried sooner than
+/// intended rather than lost.
+#[cfg(feature = "db")]
+async fn stamp_outbox_relay_backoff(conn: &mut diesel_async::AsyncPgConnection, task_id: Uuid) {
+    use crate::schema::harvest_completion_trigger_outbox::dsl as outbox_dsl;
+    use diesel::prelude::*;
+    use diesel_async::RunQueryDsl;
+
+    let next_attempt_at = chrono::Utc::now() + OUTBOX_RELAY_FAILURE_BACKOFF;
+    if let Err(e) = diesel::update(
+        outbox_dsl::harvest_completion_trigger_outbox.filter(outbox_dsl::id.eq(task_id)),
+    )
+    .set(outbox_dsl::next_attempt_at.eq(Some(next_attempt_at)))
+    .execute(conn)
+    .await
+    {
+        tracing::warn!(
+            outbox_id = %task_id,
+            error = %e,
+            "[completion_trigger outbox] failed to stamp relay-failure backoff; \
+             row may be retried sooner than intended next scan",
+        );
+    }
+}
+
 /// Enforces pending completion triggers outbox tasks.
 ///
 /// # Errors
@@ -2137,6 +2184,12 @@ pub async fn enforce_completion_triggers_outbox(
             .as_ref()
             .and_then(|sp| sp.exact_pool_for(target_shard).cloned())
         else {
+            // Issue #1227 Finding 4, Codex round-4 P1: a missing pool never
+            // resolves itself between scans (this node's own topology, not a
+            // transient race), so without a backoff this row would sit fresh
+            // forever and dominate the fresh tier ahead of a newer row
+            // targeting a healthy shard.
+            stamp_outbox_relay_backoff(conn, task.id).await;
             continue;
         };
 
@@ -2148,6 +2201,7 @@ pub async fn enforce_completion_triggers_outbox(
                     target_shard,
                     e
                 );
+                stamp_outbox_relay_backoff(conn, task.id).await;
                 continue;
             }
         };
@@ -2294,6 +2348,14 @@ pub async fn enforce_completion_triggers_outbox(
                     "[completion_trigger outbox] Failed to start workflow execution cross-shard: {:?}",
                     e
                 );
+                // Issue #1227 Finding 4, Codex round-4 P1: any OTHER error
+                // reaching here (genuinely unexpected -- QuotaExceeded is
+                // handled inside relay_gate_checked_start, and
+                // PayloadTooLarge is a permanent error handled above) still
+                // gets a backoff rather than being retried at full poll
+                // cadence, same rationale as the pool/connection failures
+                // above.
+                stamp_outbox_relay_backoff(conn, task.id).await;
             }
         }
     }

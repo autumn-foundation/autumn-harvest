@@ -89,6 +89,24 @@ alongside round-1: the row-level `FOR UPDATE SKIP LOCKED` claim inside
 closing a race where a concurrent scanner replica's unlocked batch read
 could claim and retry a row a peer had just re-armed (**round-1 P2**).
 
+**Round-4 P1 — a transport/pool failure never got a backoff at all.** All
+three rounds above only ever stamped `next_attempt_at` from inside
+`relay_gate_checked_start`'s `QuotaExceeded` arm. Three other per-row outcomes
+in `enforce_completion_triggers_outbox`'s loop — no pool configured for the
+row's `target_shard`, a connection-acquisition failure against that pool, and
+any other `Err` surfaced by `relay_gate_checked_start` itself (a relay
+transport failure) — left the row's `next_attempt_at` untouched. Untouched
+means it stays `NULL`, i.e. permanently "never attempted", which is the tier
+the claim query has always favored over retry-eligible rows. A backlog stuck
+on any of these three outcomes (e.g. rows targeting a shard with no
+configured pool) therefore wins every claim batch forever, on top of never
+succeeding — starving healthy rows on other shards exactly like the
+already-fixed quota case, just via a different trigger. Fixed with a new
+`stamp_outbox_relay_backoff` helper (`OUTBOX_RELAY_FAILURE_BACKOFF`, 5s,
+mirroring `QUOTA_REDEFER_BACKOFF`) called at all three sites so every
+non-success outcome — quota-blocked or not — leaves the row with a future
+`next_attempt_at` and a chance for other rows to be claimed in between.
+
 **Tests, red → green → refactor.** Confirmed each fix's test fails without it
 (production code reverted, rebuilt, test observed to fail) and passes with it
 restored:
@@ -130,6 +148,12 @@ restored:
   `quota_blocked_outbox_backfills_unused_retry_capacity_with_fresh_rows`
   (round-3 P2) — 45 fresh rows with zero retry-eligible rows competing are
   ALL delivered in one scan, not just the first 40, proving an unneeded
-  retry reservation doesn't silently cap normal-case throughput.
+  retry reservation doesn't silently cap normal-case throughput — and
+  `quota_blocked_outbox_backs_off_rows_targeting_an_unconfigured_shard`
+  (round-4 P1) — 55 rows targeting a shard with no configured pool, plus one
+  healthy row on a different shard sorted to lose the first `LIMIT 50` batch,
+  proves the unreachable-shard rows get a future `next_attempt_at` after the
+  first scan (rather than staying `NULL` forever) and that the healthy row is
+  delivered on the very next scan once they stop dominating every batch.
 
 No `WorkflowEvent` variant, no data migration, no replay impact.

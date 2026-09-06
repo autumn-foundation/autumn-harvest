@@ -3518,3 +3518,118 @@ async fn quota_blocked_outbox_backfills_unused_retry_capacity_with_fresh_rows() 
         );
     }
 }
+
+/// Issue #1227 Finding 4, Codex round-4 P1 (PR #1386): the `QuotaExceeded`
+/// backoff stamp lives inside `relay_gate_checked_start`, so it never covers
+/// a row that fails BEFORE that point -- a target shard with no configured
+/// pool, or a connection-acquisition failure. Pre-fix, those `continue`
+/// branches left the row untouched (`next_attempt_at` still `NULL`), so it
+/// stayed in the "fresh" tier forever and, being older, would keep winning
+/// the deterministic `created_at` ordering every single scan -- permanently
+/// starving a newer row targeting a healthy shard, the exact same failure
+/// mode Finding 4 fixes for quota, just for a different failure class.
+///
+/// This reproduces it: 55 rows targeting a shard with NO configured pool
+/// (more than the claim batch limit) followed by one healthy row on a
+/// reachable shard. Without a backoff stamp on the unreachable rows, EVERY
+/// scan would reselect the identical oldest 50 unreachable rows forever and
+/// the healthy row would never be reached.
+#[tokio::test]
+async fn quota_blocked_outbox_backs_off_rows_targeting_an_unconfigured_shard() {
+    let (url, _c) = setup_test_database_url_or_env().await;
+    let mut conn = connect(&url).await;
+
+    install_global_router(ShardRouter::single());
+    // Deliberately configures ONLY shard 0's pool -- shard 1 is a valid
+    // claim-eligible target (included in `shard_assignments` below) but has
+    // no pool to relay through, reproducing "target shard unreachable".
+    let sharded_pool = Some(ShardedDbPool::single(build_test_pool(&url)));
+
+    let unreachable_wf = leaked("outbox_backoff_unreachable_shard");
+    let healthy_wf = leaked("outbox_backoff_healthy_shard");
+
+    const UNREACHABLE_SHARD: i32 = 1;
+    const UNREACHABLE_ROW_COUNT: usize = 55;
+
+    let base_created_at = chrono::Utc::now() - chrono::Duration::hours(1);
+    let mut unreachable_ids = Vec::with_capacity(UNREACHABLE_ROW_COUNT);
+    for i in 0..UNREACHABLE_ROW_COUNT {
+        let id = diesel::insert_into(harvest_completion_trigger_outbox::table)
+            .values(&NewCompletionTriggerOutboxDb {
+                source_exec_id: Uuid::new_v4(),
+                trigger_id: Uuid::new_v4(),
+                target_shard: UNREACHABLE_SHARD,
+                target_workflow_name: unreachable_wf.to_string(),
+                target_workflow_id: format!("target-{}", Uuid::new_v4().simple()),
+                target_input: serde_json::json!({}),
+                queue_name: None,
+                concurrency_key: None,
+                concurrency_limit: None,
+                priority: serde_json::to_value(Priority::default()).unwrap(),
+                max_workflow_input_bytes: 1_000_000,
+            })
+            .get_result::<CompletionTriggerOutboxDb>(&mut conn)
+            .await
+            .expect("insert unreachable-shard outbox row")
+            .id;
+        set_outbox_created_at(
+            &mut conn,
+            id,
+            base_created_at + chrono::Duration::seconds(i64::try_from(i).expect("small index")),
+        )
+        .await;
+        unreachable_ids.push(id);
+    }
+
+    let healthy_id = insert_outbox_row(&mut conn, healthy_wf, serde_json::json!({})).await;
+    set_outbox_created_at(
+        &mut conn,
+        healthy_id,
+        base_created_at
+            + chrono::Duration::seconds(i64::try_from(UNREACHABLE_ROW_COUNT).expect("small count")),
+    )
+    .await;
+
+    let shards = [ShardId::new(0), ShardId::new(UNREACHABLE_SHARD)];
+
+    // First scan: the batch is entirely the 50 oldest unreachable-shard rows;
+    // none can be relayed (no pool), and each must be backed off rather than
+    // left fresh.
+    enforce_completion_triggers_outbox(&mut conn, &NoOpMetrics, &sharded_pool, &shards)
+        .await
+        .expect("first outbox scan");
+
+    assert!(
+        outbox_row_exists(&mut conn, healthy_id).await,
+        "the healthy row sorts after 55 unreachable-shard rows, so a \
+         LIMIT-50 batch cannot reach it on the first scan -- confirms the \
+         batch really is dominated, the precondition for the starvation \
+         this test proves is fixed"
+    );
+    let backed_off = outbox_next_attempt_at(&mut conn, unreachable_ids[0]).await;
+    assert!(
+        backed_off.is_some_and(|t| t > chrono::Utc::now()),
+        "a row that could not even be attempted (no pool for its target \
+         shard) must still be stamped with a future next_attempt_at -- \
+         otherwise it stays 'fresh' forever and keeps winning the \
+         deterministic claim-batch ordering on every scan (issue #1227 \
+         Finding 4, Codex round-4 P1)"
+    );
+
+    // Second scan: the 50 rows backed off above are now excluded, so the
+    // batch is the remaining 5 unreachable rows plus the healthy row --
+    // well under the limit, so the healthy row is finally reached and
+    // delivered despite its target being on an entirely different shard
+    // from the still-stuck backlog.
+    enforce_completion_triggers_outbox(&mut conn, &NoOpMetrics, &sharded_pool, &shards)
+        .await
+        .expect("second outbox scan");
+
+    assert!(
+        !outbox_row_exists(&mut conn, healthy_id).await,
+        "once the backoff excludes the first batch's unreachable-shard rows, \
+         the healthy row on a DIFFERENT shard must be delivered on the very \
+         next scan -- proving an unreachable-shard backlog cannot starve a \
+         newer row on a healthy shard indefinitely"
+    );
+}
