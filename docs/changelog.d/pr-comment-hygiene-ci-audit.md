@@ -2837,3 +2837,25 @@ corpus diff caught it. A comment after a finished attribute is beside
 it, not in it.
 
 Corpus effect: none. Four fixtures, three of them counter-cases.
+
+### Round ninety-two — a scheme is not a destination
+
+One new finding, and one restatement of round ninety-one's, which the
+same commit had already fixed.
+
+Round eighty-seven made a URL reference require something after the
+scheme, and wrote that as `\S` -- any non-whitespace character. So
+`// TODO: see https://).` passed the absolute gate on a closing bracket.
+A host starts with a letter, a digit, an underscore, or the `[` of an
+IPv6 literal, and never with punctuation.
+
+One `URL_HOST` now, shared by all three reference patterns rather than
+spelled three ways -- `\S`, `\S+` and `[^)\]\s]+` were three different
+answers to one question, and only the first was reported. The patterns
+keep their own tails, which differ for a real reason: a citation's
+destination stops at the bracket that closes it.
+
+Accepted, and fixtured: a name, `localhost:8080`, an IPv4 literal and
+`https://[::1]/p`.
+
+Corpus effect: none. Three fixtures.

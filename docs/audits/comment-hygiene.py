@@ -349,7 +349,13 @@ TODO_RE = re.compile(
 # which is the state CH002 exists to refuse. All three reference patterns
 # say the same thing, because a marker may carry its reference forward, in
 # a citation, or on its left.
-TODO_REF_RE = re.compile(r"#[1-9]\d*|https?://\S")
+#
+# A URL needs a HOST, not just a character after the scheme. `https://).`
+# is punctuation, and every one of the three patterns took it as a
+# destination. A host starts with a letter, a digit, an underscore or the
+# `[` of an IPv6 literal, and never with punctuation.
+URL_HOST = r"[\w\[]"
+TODO_REF_RE = re.compile(r"#[1-9]\d*|https?://" + URL_HOST)
 # A sentence boundary, with every clause `SENTENCE_SPLIT_RE` carries and no
 # others: terminal punctuation, then any emphasis markers, then a SPACE or
 # the end of the text. Both other clauses are load-bearing. The abbreviation
@@ -378,14 +384,14 @@ SENTENCE_END_RE = re.compile(
 # retries. (#123)". A citation is part of the sentence it cites, so that
 # sentence ends after the citation, not at the period in front of it.
 TRAILING_REF_RE = re.compile(
-    r"[ \t]*[(\[][^)\]]*(?:#[1-9]\d*|https?://[^)\]\s]+)[^)\]]*[)\]]"
+    r"[ \t]*[(\[][^)\]]*(?:#[1-9]\d*|https?://" + URL_HOST + r"[^)\]\s]*)[^)\]]*[)\]]"
 )
 # A reference that ABUTS the marker on its left. Anchored at the end, and
 # opened either at the bound or at a clause separator, so "See #123 for the
 # parser. TODO: x" is still untracked while "#123 - TODO: x" is not.
 ADJACENT_REF_RE = re.compile(
     r"(?:^|[;.,(\[])[\s\-\u2010-\u2015:]*"
-    r"(#[1-9]\d*|https?://\S+)"
+    r"(#[1-9]\d*|https?://" + URL_HOST + r"\S*)"
     r"[\s\-\u2010-\u2015:;,]*$"
 )
 
@@ -4583,6 +4589,21 @@ RULE_TESTS = [
         "// TODO: add retries #10\n",
         set(),
         "but a zero inside a real number is a digit",
+    ),
+    (
+        "// TODO: see https://).\n",
+        {("CH002", 1)},
+        "a scheme followed by punctuation is not a destination",
+    ),
+    (
+        "// https://) - TODO: x\n",
+        {("CH002", 1)},
+        "on the marker's left either",
+    ),
+    (
+        "// TODO: see https://[::1]/p\n",
+        set(),
+        "but an IPv6 literal is a host, as a name or an address is",
     ),
     (
         "//! One.\n//!\n//! Two.\n#![allow(dead_code)]\n//!\n//! Three.\n",
