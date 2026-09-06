@@ -423,7 +423,7 @@ def marker_span(text: str, marks: list[re.Match], index: int) -> tuple[int, int]
     return start, limit if end < 0 else end
 
 
-def untracked_marker(text: str) -> bool:
+def untracked_marker(text: str, before: str = "") -> bool:
     """Does `text` carry a marker with no reference of its OWN?
 
     Per marker, not per line. A line-wide search let one reference cover
@@ -451,7 +451,18 @@ def untracked_marker(text: str) -> bool:
         # only forwards failed the build on it. The reference must ABUT the
         # marker: separators between the two and nothing else, so a
         # reference from an earlier clause still does not stand in for one.
-        lower = marks[index - 1].end() if index else 0
+        if not index:
+            # `before` is what the comment says on the lines ABOVE, which is
+            # to the FIRST marker's left as surely as its own line is. It
+            # arrives separately rather than joined to `text`, because
+            # joining it moves the marker off the start of the string and
+            # `TODO_RE` reads an unpunctuated "TODO fix this" only there.
+            # No earlier marker can have claimed anything yet, so there is
+            # nothing to compare against.
+            if ADJACENT_REF_RE.search(before + text[:start]):
+                continue
+            return True
+        lower = marks[index - 1].end()
         adjacent = ADJACENT_REF_RE.search(text[lower:start])
         # ONE reference tracks ONE marker. The previous marker's forward
         # search reaches into this same text, so "TODO: #123; TODO: x" let
@@ -2391,6 +2402,7 @@ def check_line_rules(path: str, pieces: list[Piece]) -> list[Finding]:
     lines = []
     spanless = []
     follow: list[str] = []
+    lead: list[str] = []
     # PER RUN. A code span belongs to one comment, so joining the whole file
     # let an unmatched backtick in one comment pair with a backtick in an
     # unrelated one further down and blank everything between -- including
@@ -2435,17 +2447,26 @@ def check_line_rules(path: str, pieces: list[Piece]) -> list[Finding]:
             block.append("" if in_fence else text)
             block_cells.append(None if in_fence else cells)
         spanless.extend(flush_block(block, block_cells))
-        # A marker's own text may WRAP. "TODO: implement the retry described
-        # in" over "#123" is one tracked commitment, and reading the first
-        # line alone failed the build on it. The carry supplies the rest of
-        # the comment and decides nothing: `marker_span` cuts that text back
-        # to the sentence the marker owns, so the sentence is measured in
-        # one place whether it wraps or not.
+        # A marker's own text may WRAP, in EITHER direction. "TODO:
+        # implement the retry described in" over "#123" is one tracked
+        # commitment, and so is "#123" over "TODO: remove the fallback" --
+        # the same association the tree writes as "#123 - TODO: remove the
+        # fallback" on one line. Reading the marker's line alone failed the
+        # build on both.
         #
-        # The carry stops where the text stops being the same comment: a
+        # Neither carry decides anything. They supply the rest of the
+        # comment, and the patterns that already read a line decide: forward
+        # `marker_span` cuts the text back to the marker's own sentence, and
+        # backward `ADJACENT_REF_RE` still requires the reference to ABUT
+        # the marker. That is why a preceding line of prose is safe to
+        # carry: "See #123 for the parser." over a marker leaves "for the
+        # parser." between the two, and the reference is still not the
+        # marker's.
+        #
+        # Each carry stops where the text stops being the same comment: a
         # block boundary, a fenced line, a blank line, or another marker.
-        # That last bound is not about sentences either. A marker on a later
-        # line is reported on ITS line, so carrying past one reports it
+        # That last bound is not about sentences either. Every marker is
+        # reported on ITS own line, so carrying past one would report it
         # twice.
         base = len(follow)
         for offset in range(len(run_lines)):
@@ -2459,6 +2480,21 @@ def check_line_rules(path: str, pieces: list[Piece]) -> list[Finding]:
                     break
                 carried.append(text)
             follow.append(" " + " ".join(carried) if carried else "")
+
+        # The backward carry, accumulated in ONE pass rather than re-walked
+        # per line. The bounds are the same ones the forward carry stops at,
+        # read from the other side: a line that OPENS a block has nothing
+        # above it in that block, and a fenced line, a blank line or a
+        # marker ends what came before it.
+        carry = ""
+        for offset in range(len(run_lines)):
+            _, _, in_fence, opens, _ = run_lines[offset]
+            if opens:
+                carry = ""
+            lead.append(carry)
+            text = spanless[base + offset].strip()
+            carry = "" if in_fence or not text or TODO_RE.search(text) else carry + text + " "
+
     for index, (lineno, body, in_fence, _, _) in enumerate(lines):
         if in_fence:
             continue
@@ -2493,7 +2529,8 @@ def check_line_rules(path: str, pieces: list[Piece]) -> list[Finding]:
         # track the commitment beside it, and reading the raw line let it
         # stand in for one.
         if untracked_marker(
-            (spanless_line or spanless[index].strip()) + follow[index]
+            (spanless_line or spanless[index].strip()) + follow[index],
+            lead[index],
         ):
             findings.append(Finding("CH002", path, lineno, stripped))
 
@@ -4462,6 +4499,36 @@ RULE_TESTS = [
         "// #0 - TODO: add retries\n",
         {("CH002", 1)},
         "and on the marker's left, where the third pattern reads it",
+    ),
+    (
+        "// #123\n// TODO: remove the fallback\n",
+        set(),
+        "a reference on the line ABOVE tracks the marker below it",
+    ),
+    (
+        "// https://x.test/i/9\n// TODO: remove the fallback\n",
+        set(),
+        "a URL there as well as an issue number",
+    ),
+    (
+        "// #123\n// TODO remove the fallback\n",
+        set(),
+        "and the unpunctuated marker, which only reads at a line start",
+    ),
+    (
+        "// See #123 for the parser.\n// TODO: remove the fallback\n",
+        {("CH002", 2)},
+        "but prose above it still does not abut the marker",
+    ),
+    (
+        "// #123\n//\n// TODO: remove the fallback\n",
+        {("CH002", 3)},
+        "a blank line ends the carry from above",
+    ),
+    (
+        "// #123\n// TODO: a\n// TODO: b\n",
+        {("CH002", 3)},
+        "and one marker keeps the reference from the next",
     ),
     (
         "// TODO: add retries #10\n",

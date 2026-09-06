@@ -2766,3 +2766,33 @@ the way the tracker writes it, so `#000` and `#012` are refused with
 `#0` while `#10` and `#100` are untouched.
 
 Corpus effect: none. Four fixtures.
+
+### Round ninety — the carry, read from the other side
+
+One finding. `// #123` over `// TODO: remove the fallback` failed the
+build, although the same association written on one line -- `#123 -
+TODO: remove the fallback` -- has passed since round sixty-three. The
+carry only ever reached forward.
+
+It reaches both ways now, and neither direction decides anything. The
+carries supply the rest of the comment and the patterns that already
+read a line judge it: forward, `marker_span` cuts the text back to the
+marker's own sentence; backward, `ADJACENT_REF_RE` still requires the
+reference to ABUT the marker. That is why carrying a whole preceding
+line of prose is safe rather than dangerous: "See #123 for the parser."
+above a marker leaves "for the parser." between the two.
+
+The backward carry accumulates in ONE pass rather than re-walking the
+run per line, which is the difference between 25.8 s and 23.9 s on a
+23 s baseline.
+
+**The first attempt was wrong, and the harness caught it.** Prefixing
+the lead onto the line moved the marker off the start of the string, and
+`TODO_RE` reads an unpunctuated "TODO fix this" only there -- so
+`// #123` over `// TODO remove the fallback` stopped being seen at all,
+and an existing fixture for a nested inner-doc comment failed. The lead
+is passed to `untracked_marker` as its own argument now, used only for
+the first marker's adjacency search, where the text to a marker's left
+belongs. Both forms are fixtures.
+
+Corpus effect: none. Six fixtures.
