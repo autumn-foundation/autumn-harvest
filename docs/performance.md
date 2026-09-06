@@ -1451,16 +1451,38 @@ from the benchmark are directly comparable.
     pauses a queue closed that specific gap and, as a direct result, replaced
     the correlated anti-join with a one-time prefilter — see
     [the queue-pause anti-join fix](#the-queue-pause-anti-join-fix).
-  * **`schedule_to_close` (#378), worker sessions (#606), sticky routing
-    (#235)** — their cost on the attribution table above is still unmeasured;
-    that remains scenario work, same as before. What issue #1177 adds is a
-    different kind of evidence, not a cost figure: in isolation, each
-    independently defeats sort-elision and `LIMIT` pushdown regardless of the
-    value it is tested against, reproducing the same collapsed plan shape
-    this page's own headline finding describes. See
+  * **Worker sessions (#606)** — measured directly, on a genuinely different
+    axis from issue #1177 just below: `docs/performance-worker-sessions.md`
+    seeds `session_id` and `sticky_worker_id`/`sticky_until`/`sticky_timeout`
+    via a per-row `INSERT`-then-`UPDATE`-then-`COMMIT` lifecycle matching
+    `queue::enqueue()`'s real per-task write (as issue #606's hard-pin design
+    always writes them) and finds a real, moderate-to-large buffer cost on the
+    claim query — +40.9% on a single first claim against a cache-warm table
+    at the 10,000-row headline depth, corroborated by a real 10,001-call
+    production-shaped drain at +29.0% (same order of magnitude, unlike an
+    earlier bulk-transaction capture this page's own history superseded).
+    Mechanism: row-width growth compounded by MVCC bloat from the second
+    write, not a plan inefficiency — no query-shape fix applies; see that
+    page for the full measurement, including why it does not isolate worker
+    sessions from sticky routing's own unmeasured cost, and an open question
+    about seeding transaction granularity for multi-activity decision
+    fan-outs that a review round raised but this pass did not chase down.
+    This is a buffer-cost measurement, not a plan-eligibility one — it does
+    not supersede or overlap with issue #1177's finding that worker
+    sessions' predicate, like `schedule_to_close`'s and sticky routing's,
+    independently defeats sort-elision (see immediately below); the two are
+    answers to different questions about the same predicate.
+  * **`schedule_to_close` (#378), sticky routing (#235)** — their cost on the
+    attribution table above is still unmeasured; that remains scenario work,
+    same as before. What issue #1177 adds is a different kind of evidence,
+    not a cost figure: in isolation, each — together with worker sessions'
+    predicate, covered above — independently defeats sort-elision and
+    `LIMIT` pushdown regardless of the value it is tested against,
+    reproducing the same collapsed plan shape this page's own headline
+    finding describes. See
     [any residual predicate defeats sort-elision](#any-residual-predicate-defeats-sort-elision-issue-1177).
     In the full production query the `CASE` key and the always-present
-    predicates already force that same collapse regardless of these three, so
+    predicates already force that same collapse regardless of these two, so
     their own marginal cost still can't be isolated this way. "cheap inline
     column tests" was this page's own now-retracted reading of their
     *plan-eligibility* effect, not a corrected *cost* measurement — replacing
@@ -1501,6 +1523,12 @@ from the benchmark are directly comparable.
 * `docs/perf-artifacts/capability-labels-claim-predicate/` — committed
   `EXPLAIN`/`pg_stat_statements` evidence for that measurement.
 * `autumn-harvest/scripts/capability_labels_claim_perf_repro.sh` — regenerates
+  that evidence from a clean checkout.
+* [`docs/performance-worker-sessions.md`](performance-worker-sessions.md) — the worker-sessions claim predicate
+  (#606) measurement referenced above.
+* `docs/perf-artifacts/worker-session-claim-predicate/` — committed
+  `EXPLAIN`/`pg_stat_statements` evidence for that measurement.
+* `autumn-harvest/scripts/worker_session_claim_perf_repro.sh` — regenerates
   that evidence from a clean checkout.
 * [`docs/performance-history-ceiling.md`](performance-history-ceiling.md) — a separate scanner, not part of
   `claim_task_query()`: the workflow-history-ceiling check
