@@ -536,7 +536,7 @@ impl MermaidExporter {
         writeln!(self.out, "    autonumber")?;
         writeln!(self.out, "    participant WF as Workflow")?;
 
-        // We'll keep track of dynamic participants to avoid re-declaring them.
+        // Track dynamic participants to avoid re-declaring them.
         self.participants.insert("WF".to_string());
 
         for event in events {
@@ -733,16 +733,17 @@ impl MermaidExporter {
                 activity_id,
                 ..
             } => {
-                // Without mapping activity_id to name, we use a generic Worker.
-                // In a perfect world, we'd track activity_id -> name, but let's keep it simple.
+                // No activity_id -> name mapping exists here, so the diagram
+                // names a generic Worker.
                 writeln!(
                     self.out,
                     "    Note right of WF: Activity Started (ID: {activity_id}) on {worker_id}"
                 )?;
             }
             WorkflowEvent::ActivityCompleted { activity_id, .. } => {
-                // Note: since we lack the activity name here, we'll draw it back to WF generally
-                // or just use a note. To do an arrow, we would need to map activity_id -> participant.
+                // The activity name is unavailable here, so the diagram emits a
+                // note against WF. An arrow would need an activity_id ->
+                // participant mapping.
                 writeln!(
                     self.out,
                     "    Note right of WF: Activity Completed (ID: {activity_id})"

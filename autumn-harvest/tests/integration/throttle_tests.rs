@@ -516,14 +516,11 @@ async fn reject_duplicate_bypasses_throttle_when_execution_already_active() {
     );
 }
 
-/// `allow_duplicate_failed_only` does NOT bypass when the existing execution
-/// is still non-terminal (e.g. RUNNING) relative to that policy's own
-/// "only replace a FAILED/CANCELLED prior" semantics... actually it DOES
-/// bypass (any non-terminal-per-`try_load_by_key` state under this policy
-/// resolves to "return existing unchanged" except FAILED/CANCELLED, which is
-/// a genuine fresh start). This test locks in that FAILED/CANCELLED does NOT
-/// bypass -- it's the one state pair where a fresh admission is genuinely
-/// needed and throttle pacing must still apply.
+/// Under `allow_duplicate_failed_only`, every prior state except
+/// FAILED/CANCELLED resolves to "return the existing execution unchanged" and
+/// so bypasses the throttle. FAILED and CANCELLED are the exception: they are
+/// a genuine fresh start. This test locks in that they do NOT bypass, because
+/// a fresh admission must still obey throttle pacing.
 #[tokio::test]
 async fn allow_duplicate_failed_only_does_not_bypass_a_failed_prior() {
     let (mut conn, _url, _c) = setup_db().await;

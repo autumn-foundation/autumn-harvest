@@ -1491,7 +1491,6 @@ pub(crate) async fn task_state_for_update(
         .map_err(crate::error::database_error)
 }
 
-///
 /// Returns [`crate::error::HarvestError::Database`] on update failure.
 pub async fn complete_task(
     conn: &mut AsyncPgConnection,

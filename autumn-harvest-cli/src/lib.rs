@@ -11297,11 +11297,9 @@ fn schedule_request(command: &ScheduleCommand) -> Result<ApiRequest, CliError> {
             None,
         )),
         ScheduleCommand::Delete { id } => {
-            // DELETE — use a dedicated ApiMethod variant or reuse Post with a
-            // special path. Since ApiMethod only has Get/Patch/Post and adding
-            // Delete would require more changes, we'll represent it as a Post
-            // to a /delete path.
-            // Actually, let's add Delete to ApiMethod.
+            // DELETE uses its own `ApiMethod::Delete` variant rather than a
+            // POST to a `/delete` path, so the request carries the verb the
+            // admin API actually expects.
             Ok(ApiRequest {
                 method: ApiMethod::Delete,
                 path: format!("/admin/schedules/{}", path_segment(id)),

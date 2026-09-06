@@ -25242,7 +25242,6 @@ impl Worker {
     // that value at any time. Untuned workers pass an atomic fixed at the
     // configured max, so `compute_in_flight`'s accounting is byte-identical
     // to before this field existed.
-    ///
     /// `registration_pending` is this **pool's own** flag, returned by
     /// `register_in_fleet` for this same pool. It is deliberately not a field
     /// on `Worker`: `run_multi_shard` spawns one heartbeat per shard, and a

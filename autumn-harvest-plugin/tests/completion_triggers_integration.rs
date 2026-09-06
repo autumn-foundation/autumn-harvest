@@ -2155,7 +2155,8 @@ async fn test_trigger_compensating_rollback() {
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     let ((shard0_url, _shard1_url), _container) = setup_sharded_databases().await;
     let pool0 = build_pool(&shard0_url);
-    // shard 1 pool: we'll create a bad pool pointing to a non-existent port/host to trigger connection failure
+    // Shard 1 pool: point it at a non-existent host to force a connection
+    // failure.
     let bad_pool1 = build_pool("postgres://postgres:postgres@localhost:12345/non_existent");
 
     let mut pools = BTreeMap::new();
