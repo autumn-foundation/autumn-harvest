@@ -121,6 +121,15 @@ KNOWN LIMITATIONS:
   worse than the problem. Both directions are wrong; under-reporting is
   the safe one for a gate.
 
+- A rule about what Rustdoc RENDERS applies to `///`, `//!`, `/**` and
+  `/*!` only, because Rustdoc renders nothing else. Indented code, a
+  Setext underline and an HTML block are all limited that way. A ```
+  fence is not: an author writes one to mean "this is an example",
+  whatever the marker, and every comment in this tree that carries an
+  example carries a fence. Getting this wrong is silent -- it removes
+  findings rather than adding them -- and the corpus diff, not the
+  self-test, is what catches it.
+
 - The Markdown block layer is hand-rolled and deliberately partial. Two
   known gaps are recorded in the follow-up issue rather than fixed here,
   and both UNDER-report, which is the safe direction for a gate: an HTML
@@ -1737,7 +1746,17 @@ def comment_lines(pieces: list[Piece]):
             # peel that takes only quote markers leaves the list marker in
             # front of the tag and recognizes neither.
             peeled = strip_containers(text, stack, container)[0]
-            if fence is None and html_block(peeled, container):
+            # DOC COMMENTS ONLY, as indented code and Setext are. Rustdoc
+            # renders no `//` comment, so "<pre>" in one is text rather than
+            # markup -- and exempting the run took CH001 and CH002 off every
+            # line inside it. A ``` fence stays exempt in any comment: that
+            # is an author saying "this is an example", which a tag in an
+            # unrendered comment is not.
+            if (
+                fence is None
+                and piece.marker in DOC_MARKERS
+                and html_block(peeled, container)
+            ):
                 html = html_kind(peeled)
                 if html != "tag" and html_closes(peeled, html):
                     html = None
@@ -2030,7 +2049,7 @@ def prose_units(pieces: list[Piece]) -> list[tuple[int, str]]:
                 flush()
                 in_list = False
                 continue
-            if html_block(peeled, container):
+            if piece.marker in DOC_MARKERS and html_block(peeled, container):
                 # The opener's own line is a block, and everything to its
                 # closer is raw HTML. `comment_lines` opens the block at the
                 # same point and by the same test, on the same full peel.
@@ -3474,6 +3493,21 @@ RULE_TESTS = [
         "/// Explain the \\\\`TODO: marker` syntax.\n",
         set(),
         "two backslashes escape each other, so the span opens",
+    ),
+    (
+        "// <pre>\n"
+        "// TODO: issue required\n"
+        "// let stale = compute();\n"
+        "// </pre>\n",
+        {("CH001", 3), ("CH002", 2)},
+        "'<pre>' in a // comment is text, and exempts nothing",
+    ),
+    (
+        "// ```rust\n"
+        "// TODO: issue required\n"
+        "// ```\n",
+        set(),
+        "but a fence is an example in any comment",
     ),
 ]
 

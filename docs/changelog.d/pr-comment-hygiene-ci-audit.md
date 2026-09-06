@@ -1803,3 +1803,26 @@ genuinely is not worth implementing it belongs in the follow-up issue, not in
 a comment beside the code that has it.
 
 Corpus effect: none.
+
+### Round fifty-eight — the third rendering rule that had to be scoped
+
+One finding: an HTML block opened in a plain `//` comment, and everything
+until its closer was exempt — so `// <pre>`, `// TODO: issue required`,
+`// let stale = compute();` produced no CH002 and no CH001. Rustdoc renders no
+`//` comment, so `<pre>` in one is text and exempts nothing.
+
+This is the same scoping mistake as round forty-eight's indented code and
+round fifty-two's Setext underline, in the third of the three rules that
+depend on rendering. It is now in KNOWN LIMITATIONS as a rule rather than as
+three separate observations: **a rule about what Rustdoc renders applies to
+the four doc markers only.** A ``` fence stays exempt in every comment, and
+the reason is the distinction the whole family turns on — a fence is an author
+saying "this is an example", which a tag in an unrendered comment is not.
+
+The two earlier instances were caught by the corpus diff removing real
+findings. This one removed nothing, because the tree contains no HTML block in
+any comment, which is exactly why it needed the review to find it: a scoping
+error that suppresses findings is invisible unless something in the corpus
+happens to hit it.
+
+Corpus effect: none.
