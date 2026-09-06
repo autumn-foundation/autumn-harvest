@@ -432,6 +432,18 @@ pub enum BackupCommand {
         /// execution carries more reference events than one page.
         #[arg(long, default_value_t = 1000)]
         probe_limit: i64,
+
+        /// The shard a pre-sharding (unencoded) target id resolves to.
+        ///
+        /// Must match the fleet's configured default shard (`ShardRouter`'s
+        /// `default_shard`), not whichever `--shard` happens to observe the
+        /// reference. Every runtime routing path falls back to the fleet
+        /// default for an unencoded id. This check must agree with them, or
+        /// it reports a false `child_execution_missing` /
+        /// `external_target_missing` on a fleet migrated from pre-sharding
+        /// ids. Defaults to `0`, the overwhelmingly common configuration.
+        #[arg(long, default_value_t = 0)]
+        default_shard: i32,
     },
 }
 
@@ -3532,6 +3544,7 @@ pub async fn run_cli(cli: Cli) -> Result<(), CliError> {
                 replay_sample,
                 worker_stale_secs,
                 probe_limit,
+                default_shard,
             },
     } = &cli.command
     {
@@ -3543,6 +3556,7 @@ pub async fn run_cli(cli: Cli) -> Result<(), CliError> {
             *replay_sample,
             *worker_stale_secs,
             *probe_limit,
+            *default_shard,
         )
         .await;
     }
@@ -4505,6 +4519,30 @@ pub fn parse_shard_targets(raw: &[String]) -> Result<Vec<ShardTarget>, CliError>
     Ok(out)
 }
 
+/// Validate `--default-shard` with the same rule [`parse_shard_targets`] uses
+/// for `--shard`.
+///
+/// An out-of-range value can never match a `--shard` target. Every unencoded
+/// reference would then fall to the advisory `uninspected_shard_reference`
+/// path, instead of the coherence check this flag exists to enable (issue
+/// #1205).
+///
+/// # Errors
+///
+/// [`CliError::InvalidInput`] when `default_shard` cannot be encoded into an
+/// execution id.
+pub fn validate_default_shard(default_shard: i32) -> Result<(), CliError> {
+    if autumn_harvest::shard::is_encodable_shard(autumn_harvest::ShardId::new(default_shard)) {
+        Ok(())
+    } else {
+        Err(CliError::InvalidInput(format!(
+            "--default-shard: shard id `{default_shard}` cannot be encoded into an \
+             execution id (valid range is 0..={})",
+            autumn_harvest::shard::MAX_ENCODABLE_SHARD
+        )))
+    }
+}
+
 /// AC4: refuse to run against a DSN that resolves to the same database as the
 /// live configuration, unless the operator explicitly acknowledges otherwise.
 ///
@@ -4608,6 +4646,43 @@ pub fn format_backup_verify_text(report: &RestoreVerifyReport) -> String {
             replay.failed,
             replay.skipped_no_handler,
             replay.unreadable
+        );
+    } else if replay.unreadable > 0
+        && (replay.clean > 0 || replay.divergent > 0 || replay.failed > 0)
+    {
+        // Distinct from the "nothing replayed" branch below. Some histories
+        // DID replay here, but at least one selected for replay was never
+        // read at all, so the coverage this run reports is incomplete. The
+        // "register handlers" advice below does not apply. Handlers ARE
+        // registered, since something replayed.
+        let _ = writeln!(
+            out,
+            "  replay: PARTIALLY VERIFIED — {} sampled, {} clean, {} divergent, \
+             {} workflow-failed, {} skipped (no handler), {} unreadable. \
+             Coverage is incomplete: {} history/histories were never read, so a \
+             clean verdict here does not cover them.",
+            replay.sampled,
+            replay.clean,
+            replay.divergent,
+            replay.failed,
+            replay.skipped_no_handler,
+            replay.unreadable,
+            replay.unreadable
+        );
+    } else if replay.unreadable > 0 {
+        // Every sample that reached this check was unreadable, and none
+        // replayed at all. This is distinct from the branch below, where
+        // nothing replayed because no handler was registered. Handlers may
+        // well BE registered here. The "register handlers" advice would
+        // send an operator chasing the wrong cause. The `history_unreadable`
+        // finding above names the actual one (a malformed, legacy, or
+        // newer-version payload; a missing row).
+        let _ = writeln!(
+            out,
+            "  replay: NOT VERIFIED — {} sampled, {} unreadable, 0 replayed. Every sampled \
+             history failed to read; see the history_unreadable finding above for the cause. \
+             Registering workflow handlers will not fix this.",
+            replay.sampled, replay.unreadable
         );
     } else {
         let _ = writeln!(
@@ -4726,6 +4801,7 @@ pub fn backup_verify_gate(report: &RestoreVerifyReport) -> Option<CliError> {
 /// [`CliError::InvalidInput`] on bad arguments or a refused live DSN;
 /// [`CliError::RestoreIncoherent`] / [`CliError::RestoreUndetermined`] when the
 /// report fails the gate. The report itself is always printed first.
+#[allow(clippy::too_many_arguments)]
 pub async fn run_backup_verify(
     shards: &[String],
     live_dsn: &[String],
@@ -4734,6 +4810,7 @@ pub async fn run_backup_verify(
     replay_sample: usize,
     worker_stale_secs: i64,
     probe_limit: i64,
+    default_shard: i32,
 ) -> Result<(), CliError> {
     scratch_guard(shards, live_dsn, ack)?;
     // Say out loud when the guard could not protect anything -- an operator
@@ -4743,11 +4820,13 @@ pub async fn run_backup_verify(
         eprintln!("{w}");
     }
     let targets = parse_shard_targets(shards)?;
+    validate_default_shard(default_shard)?;
 
     let options = VerifyOptions::default()
         .with_replay_sample(replay_sample)
         .with_worker_stale_secs(worker_stale_secs)
         .with_probe_limit(probe_limit)
+        .with_default_shard(default_shard)
         .with_scratch_ack(ack);
 
     // The CLI ships no application workflow handlers, so replay coverage is
@@ -16041,6 +16120,32 @@ mod det_check_cli_tests {
                     "the CLI default must track the library default"
                 );
             }
+            other => panic!("expected Backup::Verify, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn backup_verify_default_shard_defaults_to_zero_and_is_overridable() {
+        let cli = parse(&["backup", "verify", "--shard", "postgres://scratch/a"]);
+        match cli.command {
+            Commands::Backup {
+                command: BackupCommand::Verify { default_shard, .. },
+            } => assert_eq!(default_shard, 0, "0 is the overwhelmingly common default"),
+            other => panic!("expected Backup::Verify, got {other:?}"),
+        }
+
+        let cli = parse(&[
+            "backup",
+            "verify",
+            "--shard",
+            "postgres://scratch/a",
+            "--default-shard",
+            "3",
+        ]);
+        match cli.command {
+            Commands::Backup {
+                command: BackupCommand::Verify { default_shard, .. },
+            } => assert_eq!(default_shard, 3),
             other => panic!("expected Backup::Verify, got {other:?}"),
         }
     }
