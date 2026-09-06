@@ -21,6 +21,17 @@
 -- combined heap-plus-index growth: `pg_relation_size('harvest_task_queue')`
 -- excludes every index relation by definition.
 --
+-- `id` and `activity_id` are seeded with `md5(...)::uuid` -- deterministic
+-- per row-index `i`, but still varied/unsorted like a real random UUID --
+-- rather than `gen_random_uuid()`, and are identical between State A and
+-- State B for the same `i`. Every claim is a non-HOT UPDATE that touches
+-- every index on the table (the primary key and any `activity_id` index
+-- included, not just `harvest_task_queue_schedule_to_close_idx`), so two
+-- independently-random UUID seedings could add their own page-split noise
+-- of a similar size to the effect attributed to `schedule_to_close_at` --
+-- Codex review on PR #1339 caught this; making these values identical
+-- between states isolates `schedule_to_close_at` as the only varying input.
+--
 -- Run ONLY against a disposable scratch database with autumn-harvest's
 -- Diesel migrations applied -- NEVER a real development, staging, or
 -- production database. It TRUNCATEs and reseeds harvest_task_queue twice
@@ -56,9 +67,10 @@
 -- never members of harvest_task_queue_schedule_to_close_idx).
 TRUNCATE harvest_task_queue RESTART IDENTITY;
 INSERT INTO harvest_task_queue
-  (queue_name, task_type, activity_name, activity_id, input, state,
+  (id, queue_name, task_type, activity_name, activity_id, input, state,
    priority, max_attempts, scheduled_at)
-SELECT 'q-' || (i % 4), 'activity', 'bench_activity', gen_random_uuid(),
+SELECT md5('task-id-' || i::text)::uuid, 'q-' || (i % 4), 'activity',
+       'bench_activity', md5('activity-id-' || i::text)::uuid,
        '{}'::jsonb, 'PENDING', 0, 3, NOW() - INTERVAL '1 second'
 FROM generate_series(0, 9999) AS s(i);
 VACUUM ANALYZE harvest_task_queue;
@@ -104,9 +116,10 @@ SELECT pg_relation_size('harvest_task_queue') / 8192 AS heap_pages,
 -- new harvest_task_queue_schedule_to_close_idx entry forward.
 TRUNCATE harvest_task_queue RESTART IDENTITY;
 INSERT INTO harvest_task_queue
-  (queue_name, task_type, activity_name, activity_id, input, state,
+  (id, queue_name, task_type, activity_name, activity_id, input, state,
    priority, max_attempts, scheduled_at, schedule_to_close_at)
-SELECT 'q-' || (i % 4), 'activity', 'bench_activity', gen_random_uuid(),
+SELECT md5('task-id-' || i::text)::uuid, 'q-' || (i % 4), 'activity',
+       'bench_activity', md5('activity-id-' || i::text)::uuid,
        '{}'::jsonb, 'PENDING', 0, 3, NOW() - INTERVAL '1 second',
        NOW() + INTERVAL '100 years' + (i::text || ' seconds')::interval
 FROM generate_series(0, 9999) AS s(i);

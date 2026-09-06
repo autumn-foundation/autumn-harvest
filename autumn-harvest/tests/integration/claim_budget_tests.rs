@@ -2734,6 +2734,69 @@ async fn zz_capture_schedule_to_close_claim_evidence() {
         row
     }
 
+    // Re-seeds `harvest_task_queue` for the `schedule-to-close` label by
+    // reusing the EXACT `id`/`activity_id` values the already-seeded
+    // `no-schedule-to-close` fixture just got from `db::seed()`'s own
+    // `gen_random_uuid()` calls, rather than generating a fresh, independent
+    // set of random UUIDs for this label. Every claim is a non-HOT `UPDATE`
+    // that touches every index on `harvest_task_queue` (see Plan), not just
+    // `harvest_task_queue_schedule_to_close_idx` -- so if the two labels'
+    // primary-key and `activity_id` B-trees were seeded with independently
+    // random keys, page-split/traversal noise from those OTHER indexes could
+    // be comparable in size to the effect this capture attributes to
+    // `schedule_to_close_at` itself. Codex review on PR #1339 caught this:
+    // reuse identical indexed values across labels so `schedule_to_close_at`
+    // is the only input that actually varies between them.
+    async fn reseed_with_schedule_to_close(
+        conn: &mut AsyncPgConnection,
+        schedule_to_close_sql: &str,
+    ) {
+        diesel::sql_query(
+            "CREATE TEMP TABLE stc_seed_snapshot AS \
+               SELECT id, queue_name, task_type, activity_name, activity_id, input, \
+                      state, priority, max_attempts, scheduled_at, required_build_id, \
+                      concurrency_key, concurrency_cap, rate_limit_key, \
+                      ROW_NUMBER() OVER (ORDER BY id) - 1 AS i \
+               FROM harvest_task_queue",
+        )
+        .execute(conn)
+        .await
+        .expect("snapshot the no-schedule-to-close seed before re-seeding");
+
+        diesel::sql_query("TRUNCATE harvest_task_queue")
+            .execute(conn)
+            .await
+            .expect("truncate before the schedule-to-close re-seed");
+
+        diesel::sql_query(format!(
+            "INSERT INTO harvest_task_queue \
+               (id, queue_name, task_type, activity_name, activity_id, input, \
+                state, priority, max_attempts, scheduled_at, required_build_id, \
+                concurrency_key, concurrency_cap, rate_limit_key, schedule_to_close_at) \
+             SELECT id, queue_name, task_type, activity_name, activity_id, input, \
+                    state, priority, max_attempts, scheduled_at, required_build_id, \
+                    concurrency_key, concurrency_cap, rate_limit_key, \
+                    {schedule_to_close_sql} \
+             FROM stc_seed_snapshot",
+        ))
+        .execute(conn)
+        .await
+        .expect(
+            "re-seed rows carrying schedule_to_close_at from birth, reusing the \
+             no-schedule-to-close seed's exact id/activity_id values",
+        );
+
+        diesel::sql_query("DROP TABLE stc_seed_snapshot")
+            .execute(conn)
+            .await
+            .expect("drop the temporary seed snapshot");
+
+        diesel::sql_query("ANALYZE harvest_task_queue")
+            .execute(conn)
+            .await
+            .expect("re-analyze after the schedule-to-close re-seed");
+    }
+
     // A deadline that can never elapse during this capture, however long it
     // runs, so it excludes nothing and isolates the predicate's evaluation
     // cost from any change in which rows are eligible -- the same "made to
@@ -2842,34 +2905,10 @@ async fn zz_capture_schedule_to_close_claim_evidence() {
                 // rows in place -- avoids the same UPDATE-bloat artifact the
                 // capability-labels capture documents (a fresh INSERT never
                 // leaves dead NULL-column tuple versions resident in the
-                // heap alongside the mutated ones).
-                diesel::sql_query("TRUNCATE harvest_task_queue")
-                    .execute(&mut conn)
-                    .await
-                    .expect("truncate before the schedule-to-close re-seed");
-                diesel::sql_query(format!(
-                    "INSERT INTO harvest_task_queue \
-                       (queue_name, task_type, activity_name, activity_id, input, \
-                        state, priority, max_attempts, scheduled_at, \
-                        required_build_id, concurrency_key, concurrency_cap, \
-                        rate_limit_key, schedule_to_close_at) \
-                     SELECT '{}-q-' || (i % {}), 'activity', '{}', \
-                            gen_random_uuid(), '{{}}'::jsonb, 'PENDING', 0, 3, \
-                            NOW() - INTERVAL '1 second', NULL, NULL, NULL, NULL, \
-                            {SCHEDULE_TO_CLOSE_SQL} \
-                     FROM generate_series(0, {}) AS s(i)",
-                    db::BENCH_PREFIX,
-                    scenario.queues,
-                    db::BENCH_ACTIVITY,
-                    backlog - 1,
-                ))
-                .execute(&mut conn)
-                .await
-                .expect("re-seed rows carrying schedule_to_close_at from birth");
-                diesel::sql_query("ANALYZE harvest_task_queue")
-                    .execute(&mut conn)
-                    .await
-                    .expect("re-analyze after the schedule-to-close re-seed");
+                // heap alongside the mutated ones) -- while reusing the
+                // no-schedule-to-close seed's exact `id`/`activity_id`
+                // values (see `reseed_with_schedule_to_close`).
+                reseed_with_schedule_to_close(&mut conn, SCHEDULE_TO_CLOSE_SQL).await;
             }
 
             // `EXPLAIN ANALYZE` really executes the statement -- including
@@ -2969,33 +3008,9 @@ async fn zz_capture_schedule_to_close_claim_evidence() {
             .expect("analyze harvest_workers before either label's stat-snapshot drain");
 
         if label == "schedule-to-close" {
-            diesel::sql_query("TRUNCATE harvest_task_queue")
-                .execute(&mut stats_conn)
-                .await
-                .expect("truncate before the schedule-to-close re-seed");
-            diesel::sql_query(format!(
-                "INSERT INTO harvest_task_queue \
-                   (queue_name, task_type, activity_name, activity_id, input, \
-                    state, priority, max_attempts, scheduled_at, \
-                    required_build_id, concurrency_key, concurrency_cap, \
-                    rate_limit_key, schedule_to_close_at) \
-                 SELECT '{}-q-' || (i % {}), 'activity', '{}', \
-                        gen_random_uuid(), '{{}}'::jsonb, 'PENDING', 0, 3, \
-                        NOW() - INTERVAL '1 second', NULL, NULL, NULL, NULL, \
-                        {SCHEDULE_TO_CLOSE_SQL} \
-                 FROM generate_series(0, {}) AS s(i)",
-                db::BENCH_PREFIX,
-                headline.queues,
-                db::BENCH_ACTIVITY,
-                headline.backlog - 1,
-            ))
-            .execute(&mut stats_conn)
-            .await
-            .expect("re-seed headline backlog carrying schedule_to_close_at from birth");
-            diesel::sql_query("ANALYZE harvest_task_queue")
-                .execute(&mut stats_conn)
-                .await
-                .expect("re-analyze before the stat-snapshot drain");
+            // Reuses the no-schedule-to-close seed's exact `id`/`activity_id`
+            // values -- see `reseed_with_schedule_to_close`.
+            reseed_with_schedule_to_close(&mut stats_conn, SCHEDULE_TO_CLOSE_SQL).await;
         }
 
         // Heap-growth snapshot immediately before the drain starts -- see
