@@ -450,16 +450,17 @@ async fn capture(
     out_dir: &std::path::Path,
     label: &str,
 ) -> Vec<UsageRow> {
-    // Unlike CREATE EXTENSION above, this reset failure must not be
-    // swallowed. That call is best-effort: a genuinely absent extension just
-    // means no evidence, handled by the stats query's own unwrap_or_else
-    // below. But the extension already exists by this point. So a reset
-    // failure means something else is wrong -- for example, the connecting
-    // role lacks EXECUTE on pg_stat_statements_reset(). Both forms'
-    // normalized query text is identical. So silently proceeding would let
-    // the "before" counts leak into the "after" capture. Postgres would then
-    // aggregate the two, publishing a contaminated comparison that still
-    // reports success.
+    // This reset failure must not be swallowed, and neither may the stats
+    // query below it.
+    // CREATE EXTENSION above stays best-effort. A genuinely absent
+    // extension fails here first: pg_stat_statements_reset() does not
+    // exist without it.
+    // A reset failure past that point means something else is wrong. For
+    // example, the connecting role lacks EXECUTE on
+    // pg_stat_statements_reset(). Both forms' normalized query text is
+    // identical. Silently proceeding would let the "before" counts leak
+    // into the "after" capture. Postgres would then aggregate the two,
+    // publishing a contaminated comparison that still reports success.
     //
     // Scoped to THIS database's dbid (`pg_stat_statements_reset(0, dbid, 0)`),
     // not the bare zero-argument form. `setup_bench_db` provisions its own
@@ -509,10 +510,20 @@ async fn capture(
     )
     .load(conn)
     .await
-    .unwrap_or_else(|e| {
-        eprintln!("pg_stat_statements query failed: {e}");
-        Vec::new()
-    });
+    .expect(
+        "pg_stat_statements query failed -- degrading to an empty snapshot \
+         here would let this evidence-capture test report \"equivalence \
+         confirmed\" while publishing no buffer evidence at all",
+    );
+    // The reproduction script checks only the equivalence marker below, not
+    // this file's content. An empty match set here is not a query error, so
+    // the expect() above cannot catch it. Assert it explicitly, or a silent
+    // zero-row snapshot would report success with no buffer evidence.
+    assert!(
+        !stats.is_empty(),
+        "pg_stat_statements returned no rows matching this query for \
+         label {label}"
+    );
     std::fs::write(
         out_dir.join(format!("{label}.pg_stat_statements.txt")),
         format!("{stats:#?}\n"),
