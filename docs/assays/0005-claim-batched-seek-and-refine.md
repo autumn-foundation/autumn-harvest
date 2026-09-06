@@ -418,7 +418,7 @@ half of the reviewer's own proposed remedy, not a re-registration.
 
 All measurements from `docs/assays/apparatus/0005-claim-batched-seek-and-refine/results/`
 (`run.log`, `*.txt`, `*.explain.txt`), from the apparatus's sixth run (post
-all four rounds of corrections above), one continuous psql session. The
+all five rounds of corrections above), one continuous psql session. The
 fifth run, immediately prior in the same verification pass, existed only
 to prove item 9's idempotency fix (a fresh `dropdb`/`createdb`, then
 `./run_assay.sh` twice in a row with no `dropdb` in between); it produced
@@ -524,7 +524,7 @@ regardless of how the other three lines perform or why the miss happened.
 **This kill is on the pre-registration's own arithmetic, not on the
 candidate mechanism's batch-count scaling** — every wall-clock line clears
 by 2.9x-190x, and the batch-count scaling itself is linear as designed.
-Four rounds of post-review correction narrow what this assay can claim
+Five rounds of post-review correction narrow what this assay can claim
 even if the batch-count lines had been written correctly: this apparatus
 never established that batching bounds cost independent of backlog depth,
 only that it doesn't cost meaningfully more than the (already `O(backlog)`
