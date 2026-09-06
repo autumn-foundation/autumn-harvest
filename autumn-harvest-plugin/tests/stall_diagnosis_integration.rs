@@ -1796,6 +1796,62 @@ async fn overdue_timer_is_not_a_stall_when_a_different_wake_source_re_pended_the
     assert_eq!(body["health"], "healthy", "body: {body}");
 }
 
+/// `timer_owns_the_wake`'s timestamp proximity alone can be
+/// coincidentally satisfied by an unrelated armed timer landing near
+/// the wake instant. That reintroduces the issue #1191 false positive
+/// in a narrower window. `wake_source_repended_this_row`'s `created_at`
+/// fingerprint, loaded from the real row here (not just a pure-function
+/// fixture), must veto it even when the coincidence lands.
+#[tokio::test]
+async fn overdue_timer_does_not_correlate_via_coincidental_proximity_alone() {
+    let (url, _guard) = setup_database().await;
+    let pool = build_pool(&url);
+    let app = build_api_app(build_api_state(&pool));
+
+    let exec_id = seed_execution(&pool, "timer_wf", "RUNNING", vec![started_event()]).await;
+    {
+        let mut conn = pool.get().await.expect("pooled conn");
+        // Within `timer_owns_the_wake`'s tolerance of scheduled_at below,
+        // purely by coincidence -- an unrelated, separately armed timer,
+        // not the one that woke this run.
+        diesel::sql_query(
+            "INSERT INTO harvest_timers (id, workflow_exec_id, timer_id, fires_at, fired) \
+             VALUES ($1, $2, 'unrelated_deadline', NOW() - INTERVAL '99 seconds', false)",
+        )
+        .bind::<diesel::sql_types::Uuid, _>(Uuid::new_v4())
+        .bind::<diesel::sql_types::Uuid, _>(exec_id.as_uuid())
+        .execute(&mut conn)
+        .await
+        .expect("seed unrelated overdue timer");
+        // `wake_workflow_task`'s re-pend: scheduled_at = wake instant - 5s,
+        // created_at = the wake instant itself. Both come from the same
+        // statement's `NOW()`, so the gap is exactly 5 seconds. Set
+        // explicitly, not through `seed_workflow_task`'s default
+        // `clock_timestamp()`, to pin the fingerprint against the timer above.
+        diesel::sql_query(
+            "INSERT INTO harvest_task_queue \
+             (id, queue_name, task_type, workflow_exec_id, input, state, priority, attempt, \
+              max_attempts, scheduled_at, created_at, worker_id) \
+             VALUES ($1, 'default', 'workflow', $2, '{}'::jsonb, 'PENDING', 0, 1, 3, \
+                     NOW() - INTERVAL '98 seconds', NOW() - INTERVAL '93 seconds', NULL)",
+        )
+        .bind::<diesel::sql_types::Uuid, _>(Uuid::new_v4())
+        .bind::<diesel::sql_types::Uuid, _>(exec_id.as_uuid())
+        .execute(&mut conn)
+        .await
+        .expect("seed re-pended workflow task");
+    }
+    seed_live_worker(&pool, "w-live", "default").await;
+
+    let body = diagnose(&app, exec_id).await;
+    assert_eq!(
+        kind(&body),
+        "sleeping_timer",
+        "created_at proves a different wake source re-pended this row: {body}"
+    );
+    assert_eq!(body["health"], "healthy", "body: {body}");
+}
+
 /// A durable timer fires only when a worker claims the owning workflow task, so
 /// a run "sleeping" on a timer whose workflow queue nobody polls is not
 /// sleeping — it can never wake. The queue is the actionable cause, not the
