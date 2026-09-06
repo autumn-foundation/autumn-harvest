@@ -1954,3 +1954,29 @@ shape and does not track the commitment beside it.
 
 Corpus effect: none. Seven fixtures, three of which fail on the parent
 commit, and four counter-cases pinning the forms that must stay silent.
+
+### Round sixty-four — a word boundary is not the end of a tag name
+
+One finding, in code round sixty-two added. `<code\b[^>]*>` treats
+`<code@example.com>` as an opener: `\b` sits happily before punctuation,
+and the element then has no closer, so the masking ran to the end of the
+paragraph and took CH002 off everything in it. Rustdoc renders that input
+as a mail link, and the marker beside it as prose.
+
+A tag name ends at whitespace, `/` or `>`. That also settles a sibling
+the report did not name: `<code-block>` is a different element, and a
+word boundary accepted it as this one. `<codex>` was always safe, because
+two word characters have no boundary between them -- the guard was only
+ever half present.
+
+The pattern is `<code(?=[\s/>])[^<>]*>` now, and the inner class refuses
+`<` as well, since raw HTML does not nest a tag inside a tag.
+
+The direction is the same as round sixty-two's own over-reports and the
+opposite of what a wider pattern suggests: every character this matcher
+accepts loosely is an absolute rule switched OFF for the rest of a block,
+so the matcher has to be exact in the strict direction.
+
+Corpus effect: none. Four fixtures -- the autolink, the longer tag name,
+a closed element that still ends at its closer, and `<code/>`, which HTML
+does open.

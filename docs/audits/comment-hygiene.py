@@ -443,7 +443,12 @@ def replace_spans(text: str, filler: str) -> str:
 # in a <code> element exactly as it does a backtick span, so the absolute
 # rules must not read a narrative phrase or a marker inside one. Doc comments
 # only: nothing renders a `//` comment, where this is literal text.
-CODE_OPEN_RE = re.compile(r"<code\b[^>]*>", re.I)
+# The tag NAME must end here, and a word boundary does not say that: "\\b"
+# sits happily before punctuation, so "<code@example.com>" -- an e-mail
+# autolink Rustdoc renders as a mail link -- opened an element that masked
+# the rest of the paragraph. A tag name ends at whitespace, "/" or ">", and
+# "<code-block>" is a different element, not this one.
+CODE_OPEN_RE = re.compile(r"<code(?=[\s/>])[^<>]*>", re.I)
 CODE_CLOSE_RE = re.compile(r"</code\s*>", re.I)
 
 
@@ -3835,6 +3840,26 @@ RULE_TESTS = [
         "// TODO(#1): a; TODO(#2): b\n",
         set(),
         "and two markers each carrying one are both tracked",
+    ),
+    (
+        "/// Contact <code@example.com>. TODO: add retry\n",
+        {("CH002", 1)},
+        "an e-mail autolink is not a <code> opener",
+    ),
+    (
+        "/// A <code-block> element. TODO: add retry\n",
+        {("CH002", 1)},
+        "nor is a tag whose name merely starts with code",
+    ),
+    (
+        "/// Spaced <code > here</code>. TODO: add retry\n",
+        {("CH002", 1)},
+        "a closed element still ends where its closer does",
+    ),
+    (
+        "/// Empty <code/> here. TODO: add retry\n",
+        set(),
+        "but a self-closing tag opens the element HTML gives it",
     ),
 ]
 
