@@ -13,8 +13,10 @@ a deterministic count of the socket syscalls (`writev`/`recvfrom`) `claim`
 issues, per this agent's "strace -c / ltrace -- syscall counts, for I/O and
 lock-related work" admissible-evidence category.
 
-**This commit is baseline only** -- it adds the harness and records the
-numbers below. No production code changes here.
+The baseline was committed separately, before this fix, in
+`bce44dd` ("🔴 Bolt: claim_roundtrip_profile harness + baseline
+(RedisTaskQueue::claim)"). This revision adds the "Change"/"Measurement"
+sections below.
 
 ## Workload
 
@@ -108,6 +110,86 @@ connect time, outside the measured loop). Removing the redundant outer call
 should therefore drop both `writev` and `recvfrom` by exactly `n` -- a
 prediction sharp enough to be falsified by the after-measurement, not just a
 directional guess.
+
+## Change
+
+`autumn-harvest-redis/src/redis_queue.rs`, `claim_inner`: drop the outer,
+now-redundant `self.ensure_group(queue).await?` call. `promote_due` already
+guarantees the group exists (it is called unconditionally, immediately
+after, on the very next line) before `claim_inner` ever reaches the
+`xread_options` call that actually needs the group to exist. `promote_due`
+itself -- and its own doc comment's guarantee for callers who invoke it
+directly, outside `claim` -- is untouched.
+
+```diff
+-            // Make sure the consumer group exists *and* any due delayed tasks
+-            // are on the stream before we ask for them.
+-            self.ensure_group(queue).await?;
+-            let _ = self.promote_due(queue).await?;
++            // Make sure any due delayed tasks are on the stream before we ask
++            // for them. `promote_due` itself calls `ensure_group` first (it
++            // must, so the group exists before its Lua script's XADDs land),
++            // so a second `ensure_group` call here would be a redundant
++            // round trip to Redis on every single claim attempt -- the
++            // consumer group is idempotently ensured exactly once below.
++            let _ = self.promote_due(queue).await?;
+```
+
+No behavior change: `claim_inner` still guarantees the group exists (via
+`promote_due`'s own call) before reading, exactly as before -- it just no
+longer pays for the guarantee twice. `promote_due`'s own public contract
+(callers who invoke it directly, outside `claim`, still get the same
+ensure-then-promote guarantee) is unaffected: only its caller in
+`claim_inner` changed.
+
+## Measurement
+
+Both binaries built from the identical harness/`Cargo.toml` bench
+declaration, differing only by the one-line diff above, same `strace -f -c`
+invocation, same local `redis-server`, same session, `N=1,000`.
+
+| | `writev` | `recvfrom` |
+|---|---:|---:|
+| Before | 6,001 | 6,100 |
+| After  | 5,001 | 5,096 |
+| **Reduction** | **1,000 (16.66%)** | **1,004 (16.46%)** |
+
+Exactly `n` (1,000) fewer `writev` calls -- the predicted one-round-trip-
+per-claim removal, to the syscall (`recvfrom`'s reduction is 1,004, a few
+reply-fragmentation-dependent reads off the round-trip-count prediction, not
+a discrepancy in the mechanism). Both clear this agent's "measurable
+reduction in syscall count" impact floor by a wide margin; reproduced
+identically on two independent runs of each binary (6,001/6,100 twice for
+"before", 5,001/5,096 twice for "after").
+
+### Correctness
+
+* `cargo fmt -p autumn-harvest-redis -- --check` -- clean.
+* `cargo clippy -p autumn-harvest-redis --all-targets` -- clean for every
+  line this change touches; a pre-existing, unrelated `clippy::pedantic`/
+  `clippy::nursery` warning set inside `autumn-harvest`'s own `context.rs`
+  (a dependency, not touched by this change) surfaces only when `-D
+  warnings` is added on the command line, and reproduces identically on an
+  unmodified checkout with `cargo clippy -p autumn-harvest --lib -- -D
+  warnings` -- confirmed via `git stash` before writing this change, so it
+  is an environment/toolchain condition on this sandbox (the workspace's
+  `clippy::pedantic`/`clippy::nursery` are `warn`-level; `-D warnings`
+  escalates all warnings, including this pre-existing dependency one, to a
+  hard error), not something this PR introduces or could fix by touching
+  `redis_queue.rs`. The warning count (10) is identical before and after
+  this change.
+* `cargo test -p autumn-harvest-redis --lib` -- **13 passed, 0 failed**,
+  both before and after this change.
+* `HARVEST_REDIS_TEST_URL=redis://127.0.0.1:6390 cargo test -p
+  autumn-harvest-redis --test integration_redis` -- **6 passed, 0 failed**,
+  both before and after this change, against a local `redis-server` (not a
+  `testcontainers` Docker instance -- this sandbox has no Docker daemon;
+  `try_start_redis`'s `HARVEST_REDIS_TEST_URL` path already exists in the
+  test file for exactly this case).
+
+No test's expected value needed to change: `claim`'s behavior (which task,
+if any, gets returned) is identical -- only the number of times the
+already-idempotent `ensure_group` call is issued changed.
 
 ## Reproduce
 
