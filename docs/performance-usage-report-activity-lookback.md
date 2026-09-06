@@ -201,9 +201,22 @@ overhead:
 
 | | `shared_blks_hit` | `shared_blks_read` | **Total buffers** | `temp_blks_written` |
 |:--|--:|--:|--:|--:|
-| Before | 4,757,960 | 13,872 | **4,771,832** | 0 |
-| After | 2,129,011 | 10,108 | **2,139,119** | 0 |
+| Before | 4,764,562 | 7,270 | **4,771,832** | 0 |
+| After | 2,135,890 | 3,229 | **2,139,119** | 0 |
 | **Δ** | | | **-2,632,713 (-55.17%)** | 0 |
+
+(Codex review, PR #1381, round 9: an earlier draft of this table read the
+`hit`/`read` split from the wrong row. Each snapshot file holds three rows,
+not two -- `pg_stat_statements.track = all` on this cluster tracks the
+`EXPLAIN`-wrapped query's own nested-level execution as a second row
+alongside its top-level entry, both under the same `EXPLAIN (...)`-prefixed
+text. The earlier draft read one of those two `EXPLAIN` rows. Their total
+happens to equal the real plain row's total exactly, which is why the
+headline **-55.17%** figure was never wrong, but the `hit`/`read` split
+attributed to "the plain execution" was actually `EXPLAIN`'s own. Fixed by
+reading the one row whose `query` text has no `EXPLAIN` prefix -- there is
+exactly one such row per snapshot file, unambiguously the direct
+`run_usage_query` call.)
 
 (The `hit`/`read` split above is the plain execution's row, taken right after
 the `EXPLAIN`-wrapped run of the same query already warmed the cache -- it
