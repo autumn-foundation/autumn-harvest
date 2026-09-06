@@ -624,6 +624,28 @@ async fn workers_health_by_shard_ignores_a_malformed_assignment() {
     assert_eq!(body["healthy"], 1);
 }
 
+/// A worker that legitimately covers two shards registers a replicated row
+/// in each shard's own database (same `worker_id`, same explicit claim).
+/// Dedup must collapse those replicas to one before the literal tally runs,
+/// so the worker is not double-counted in either shard's bucket.
+#[tokio::test]
+async fn workers_health_by_shard_does_not_double_count_a_multi_shard_worker() {
+    let ((url0, url1), _guard) = setup_two_shards().await;
+    seed_worker_with_assignments(&url0, "multi", "[0, 1]").await;
+    seed_worker_with_assignments(&url1, "multi", "[0, 1]").await;
+    let app = build_app(&url0, &url1, false);
+
+    let (status, body) = get_json(&app, "/workers/health").await;
+    assert_eq!(status, StatusCode::OK, "got {body}");
+    assert_eq!(
+        body["healthy"], 1,
+        "the two replicas must dedup to one worker: {body}"
+    );
+    let by_shard = &body["by_shard"];
+    assert_eq!(by_shard["0"], 1, "got {body}");
+    assert_eq!(by_shard["1"], 1, "got {body}");
+}
+
 // ── AC4: writes still fail hard on a down shard ──────────────────────────────
 
 #[tokio::test]
