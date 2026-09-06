@@ -1340,15 +1340,14 @@ const WAKE_REPEND_MIN_GAP_SECONDS: i64 = -2;
 /// [`timer_owns_the_wake`] cannot: a coincidental timestamp match
 /// between an armed timer's `fires_at` and an unrelated repend instant.
 ///
-/// A very short-lived genuine timer (a few seconds or less) is the one
-/// residual gap this cannot rule out on its own. Its `created_at`-to-
-/// `scheduled_at` gap can land inside this same small negative slack.
-/// But [`timer_owns_the_wake`]'s own timestamp match still has to hold
-/// too. So [`is_the_missed_timer_wake`] mistakes such a timer for a
-/// re-pend only when an unrelated armed timer ALSO happens to sit
-/// within that tolerance. That is narrower still, and accepted here as
-/// a documented, low-impact edge case rather than a false
-/// `timer_overdue`.
+/// A very short-lived genuine timer's own `created_at`-to-`scheduled_at`
+/// gap CAN land inside this small negative slack (issue #1191 review).
+/// This function alone cannot rule that out. It does not have to.
+/// [`is_the_missed_timer_wake`] never calls it for an EXACT
+/// `scheduled_at == fires_at` match. That is what a genuine
+/// `queue::reschedule_task` write always produces, whatever the timer's
+/// duration. This function only ever gets to veto a merely CLOSE match,
+/// which an exact one is not.
 ///
 /// A pre-`#501` legacy row has no `created_at` at all. `None` answers
 /// `false` here -- no evidence either way. So [`is_the_missed_timer_wake`]
@@ -1367,10 +1366,23 @@ fn wake_source_repended_this_row(task: &WorkflowTaskFacts) -> bool {
 ///
 /// Split out of [`classify_execution`] to name the conditions together:
 /// grace-window overdue and, when a workflow task is known, timer-owned.
-/// "Timer-owned" is itself two checks, not one (issue #1191).
-/// [`timer_owns_the_wake`]'s timestamp match is necessary but not
-/// sufficient. [`wake_source_repended_this_row`] must also say no
-/// before this predicate can report a genuine miss.
+///
+/// "Timer-owned" is an EXACT match on `scheduled_at == fires_at`, or a
+/// close match cleared by [`wake_source_repended_this_row`] -- never a
+/// close match alone (issue #1191 review). `queue::reschedule_task`
+/// writes `scheduled_at` from the identical value already stored in
+/// `harvest_timers.fires_at`. So a genuine timer-owned row matches
+/// EXACTLY, regardless of the timer's own duration. That exact match is
+/// stronger evidence than [`wake_source_repended_this_row`]'s
+/// `created_at` heuristic can ever contradict, so it is trusted
+/// outright. A genuinely SHORT timer needs exactly this: its own
+/// `created_at`-to-`scheduled_at` gap can otherwise land inside that
+/// heuristic's small negative slack. Without this exact-match fast
+/// path it would be vetoed as a false re-pend, rather than reported as
+/// the missed wake it is. A merely CLOSE match, never exact, is what
+/// [`timer_owns_the_wake`]'s tolerance exists for at all: an unrelated
+/// timer landing near a wake instant. Only there does
+/// [`wake_source_repended_this_row`] still have to say no.
 #[must_use]
 fn is_the_missed_timer_wake(
     timer: &PendingTimerFacts,
@@ -1379,8 +1391,9 @@ fn is_the_missed_timer_wake(
 ) -> bool {
     (now - timer.fires_at).num_seconds() >= TIMER_OVERDUE_GRACE_SECONDS
         && task.is_none_or(|task| {
-            timer_owns_the_wake(task.scheduled_at, timer.fires_at)
-                && !wake_source_repended_this_row(task)
+            task.scheduled_at == timer.fires_at
+                || (timer_owns_the_wake(task.scheduled_at, timer.fires_at)
+                    && !wake_source_repended_this_row(task))
         })
 }
 
@@ -3734,6 +3747,33 @@ mod tests {
             "a claim-release re-pend must be recognized too: {verdict:?}"
         );
         assert_eq!(verdict.health(), ExecutionHealth::Healthy, "{verdict:?}");
+    }
+
+    /// Issue #1191 review. A genuinely SHORT timer's own
+    /// `created_at`-to-`scheduled_at` gap can land inside
+    /// `wake_source_repended_this_row`'s small negative slack. That is
+    /// because `created_at` (the row's original creation) sat only
+    /// moments before the timer's own near-immediate deadline. An EXACT
+    /// `scheduled_at == fires_at` match must still win regardless.
+    /// `queue::reschedule_task` produces that exact match for any timer
+    /// duration, short or long.
+    #[test]
+    fn overdue_timer_wins_for_a_genuinely_short_timer_despite_a_small_created_at_gap() {
+        let inputs = DiagnosisInputs {
+            timers: vec![PendingTimerFacts { fires_at: t(-65) }],
+            workflow_task: Some(WorkflowTaskFacts {
+                // A 1-second timer: created_at sits 1 second before its
+                // own deadline, inside the small negative slack.
+                scheduled_at: t(-65),
+                created_at: Some(t(-66)),
+                ..wf_task()
+            }),
+            ..Default::default()
+        };
+        let verdict =
+            classify_execution(&inputs, t(0)).expect("non-terminal execution must yield a verdict");
+        assert_eq!(verdict.kind(), "timer_overdue", "{verdict:?}");
+        assert_eq!(verdict.health(), ExecutionHealth::Stalled, "{verdict:?}");
     }
 
     #[test]
