@@ -6,7 +6,7 @@
 //! `apply_worker_filters`'s `shard_assignments_cover` treats an empty array as
 //! "covers whatever shard the row was read from" (issue #1150). Both
 //! cross-shard read endpoints fan out to every shard's database and, before
-//! this fix, applied that predicate using the *caller's requested* shard_id
+//! this fix, applied that predicate using the *caller's requested* `shard_id`
 //! for every shard's rows -- including shards other than the one each row was
 //! read from. A worker registered with `shard_assignments: []` in shard 0
 //! then leaked into `?shard_id=1` (and vice versa).
@@ -161,7 +161,9 @@ async fn seed_worker(url: &str, worker_id: &str, shard_assignments_json: &str) {
 }
 
 fn worker_ids(rows: &[Value]) -> Vec<&str> {
-    rows.iter().filter_map(|w| w["worker_id"].as_str()).collect()
+    rows.iter()
+        .filter_map(|w| w["worker_id"].as_str())
+        .collect()
 }
 
 // ── GET /workers?shard_id= ────────────────────────────────────────────────
@@ -177,7 +179,10 @@ async fn shard_id_filter_excludes_an_empty_assignment_worker_from_a_different_sh
 
     let (status, body) = get_json(&app, "/workers?shard_id=1").await;
     assert_eq!(status, StatusCode::OK, "got {body}");
-    let workers = body["workers"].as_array().expect("workers array");
+    // Both shards are reachable, so the fan-out is Complete and /workers
+    // returns a bare array (issue #756, AC3), not a `{"workers": [...]}`
+    // envelope -- that shape is reserved for a degraded (partial) read.
+    let workers = body.as_array().expect("bare array response");
     let ids = worker_ids(workers);
     assert_eq!(
         ids,
@@ -196,7 +201,7 @@ async fn shard_id_filter_still_includes_an_empty_assignment_worker_from_its_own_
 
     let (status, body) = get_json(&app, "/workers?shard_id=0").await;
     assert_eq!(status, StatusCode::OK, "got {body}");
-    let workers = body["workers"].as_array().expect("workers array");
+    let workers = body.as_array().expect("bare array response");
     let ids = worker_ids(workers);
     assert_eq!(
         ids,
