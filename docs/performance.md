@@ -51,9 +51,9 @@ this page says nothing about what they cost; see
   sequentially scans and sorts every eligible pending row on every single
   claim. See [the plan](#the-plan) below.
   **Fixing that key would not be sufficient on its own**: issue #1177 shows
-  any single one of the query's other residual `WHERE` predicates
+  any single one of ten other residual `WHERE` predicates it tested
   independently defeats sort-elision and `LIMIT` pushdown too, even at zero
-  selectivity. See
+  selectivity — the query carries an eleventh, untested by that issue. See
   [any residual predicate defeats sort-elision](#any-residual-predicate-defeats-sort-elision-issue-1177).
 * **Only one predicate is genuinely expensive: per-key concurrency (+644% p50).**
   Build-id routing (+13%), the rate-limit gate (+2%) and the circuit-breaker
@@ -469,10 +469,11 @@ Three things to read here:
 
    > **Follow-up (issue #1177):** the `CASE` key is *sufficient* to force this
    > plan shape, but it is not *necessary* — removing it would not restore
-   > sort-elision, because any one of the query's other residual `WHERE`
-   > predicates independently forces the same collapsed shape (a full-backlog
-   > scan plus `Sort`), including several that are total no-ops at 100%
-   > selectivity. See
+   > sort-elision, because any one of ten other residual `WHERE` predicates
+   > issue #1177 tested independently forces the same collapsed shape (a
+   > full-backlog scan plus `Sort`), including several that are total no-ops
+   > at 100% selectivity; the query carries an eleventh, untested by that
+   > issue. See
    > [any residual predicate defeats sort-elision](#any-residual-predicate-defeats-sort-elision-issue-1177)
    > below. Point 1 above remains accurate as far as it goes; it is incomplete
    > as an explanation of the superlinear scaling, since dropping the `CASE`
@@ -531,12 +532,13 @@ exactly `idx_harvest_tq_poll`'s key — so the cheap plan should return.
 **It does not.** Issue #1177 reproduces that, with the `CASE` removed entirely
 from `ORDER BY` (leaving only `priority DESC, scheduled_at` — an exact match
 for `idx_harvest_tq_poll`'s key) and **no planner hints in play**, adding
-**any single one** of the query's other residual `WHERE` predicates —
+**any single one** of ten other residual `WHERE` predicates it tested —
 including several with **zero actual selectivity** (100% of rows pass the
 filter) — is already enough on its own for the planner to choose a
 full-backlog scan (`Seq Scan` for most predicates tested, `Bitmap Heap Scan`
 for a few) plus a `Sort`, instead of the ordered index scan. This holds with
-and without `FOR UPDATE SKIP LOCKED`.
+and without `FOR UPDATE SKIP LOCKED`. (The query carries an eleventh
+residual predicate this reproduction did not test — see below.)
 
 Ten predicates were tested independently against a 255 020-row fixture
 (119 940 PENDING rows in the `default` queue), each added alone to the base

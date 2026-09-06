@@ -10,12 +10,14 @@ columns, and the cheap index-ordered plan should return.
 Issue #1177 reproduces that this does not happen. With the `CASE` removed
 entirely from `ORDER BY` (leaving only `priority DESC, scheduled_at`, an
 exact match for `idx_harvest_tq_poll`'s key) and no planner hints in play,
-adding any single one of the query's other residual `WHERE` predicates —
+adding any single one of ten other residual `WHERE` predicates it tested —
 including several with zero actual selectivity (100% of rows pass) — is
 already enough on its own for the planner to fall back to a full-backlog
 scan (`Seq Scan` for most predicates tested, `Bitmap Heap Scan` for a few)
 plus a `Sort`, instead of the ordered index scan. This holds with and
-without `FOR UPDATE SKIP LOCKED`. Ten predicates were tested independently
+without `FOR UPDATE SKIP LOCKED`. The query carries an eleventh residual
+predicate untested by this issue (issue #807; see docs/performance.md for
+the follow-up). Ten predicates were tested independently
 against a 255 020-row fixture; all ten reproduce the collapse. A separate,
 narrower diagnostic — for the sticky-routing predicate specifically, with
 the competing index hidden and `enable_seqscan`/`enable_bitmapscan` set to
