@@ -1565,6 +1565,42 @@ def update_containers(
     return stack, prose
 
 
+def lazy_continuation(
+    text: str,
+    peeled: str,
+    container: int,
+    depth: int,
+    quoted: int,
+    paragraph: bool,
+    pieces: list,
+    index: int,
+    nest: int,
+) -> bool:
+    """Does this line carry a quoted paragraph on without a marker of its own?
+
+    CommonMark lets a paragraph inside a block quote continue on a line that
+    has no ">" at all, so leaving the quote by depth is not always leaving
+    the block. Rustdoc renders "> Explain the `literal" and an unmarked
+    "TODO: issue required` suffix." as ONE quoted paragraph with the marker
+    inside a code span.
+
+    Anything that BEGINS a block ends the continuation instead -- a list
+    marker, a confirmed table, a heading, an HTML block, a rule, a fence --
+    which is the whole of the difference between this and "no marker here".
+    """
+    return (
+        depth < quoted
+        and paragraph
+        and bool(text.strip())
+        and not LIST_MARKER_RE.match(peeled)
+        and not table_header(pieces, index, nest, peeled, container)
+        and not heading(peeled, container)
+        and not html_block(peeled, container)
+        and not SEPARATOR_RE.match(peeled)
+        and not FENCE_RE.match(peeled)
+    )
+
+
 def strip_containers(
     text: str, stack: list[tuple[int, int]], container: int
 ) -> tuple[str, int, int]:
@@ -1836,6 +1872,9 @@ def comment_lines(pieces: list[Piece]):
                 # it: an underline with no paragraph above it is a thematic
                 # break or ordinary text, not a heading.
                 setext = paragraph and setext_underline(body, enclosing)
+                # `update_containers` reassigns `paragraph` below, and the
+                # lazy test needs the state this line ARRIVED in.
+                open_paragraph = paragraph
                 # Both are blocks, so neither leaves a paragraph open.
                 stack, paragraph = update_containers(
                     text, stack, paragraph, quoted, in_table or indented
@@ -1844,7 +1883,25 @@ def comment_lines(pieces: list[Piece]):
                 # quote inside a list item, and reading the raw line reports
                 # depth zero because the marker comes first -- one loop then
                 # believes the line left the quote and the other does not.
-                quoted = strip_containers(text, stack, stack[-1][0] if stack else 0)[2]
+                peeled_now, _, quoted, _ = strip_containers(
+                    text, stack, stack[-1][0] if stack else 0
+                )
+                # A quoted paragraph may carry on across a line with no ">"
+                # of its own, and that line LEAVES the quote by depth while
+                # staying inside the block. Cutting the span there split one
+                # quoted sentence in half and failed the build on a marker
+                # Rustdoc renders inside a code span.
+                lazy = lazy_continuation(
+                    text,
+                    peeled_now,
+                    enclosing,
+                    quoted,
+                    before_quoted,
+                    open_paragraph,
+                    run,
+                    index,
+                    piece.nest,
+                )
                 # A confirmed table and a Setext heading are blocks that
                 # `starts_block` cannot name. A table needs the piece after
                 # this one to confirm it, and a Setext underline needs the
@@ -1871,7 +1928,7 @@ def comment_lines(pieces: list[Piece]):
                 opens = (
                     opens
                     or starts_block(body, enclosing)
-                    or quoted != before_quoted
+                    or (quoted != before_quoted and not lazy)
                     or (
                         piece.marker in DOC_MARKERS
                         and (in_table or setext)
@@ -2234,20 +2291,11 @@ def prose_units(pieces: list[Piece]) -> list[tuple[int, str]]:
             # that has no marker of its own, so long as that line is ordinary
             # paragraph text. Flushing there splits one quoted sentence into
             # two short ones and a long sentence slips past CH007.
-            lazy = (
-                depth < quoted
-                and bool(run)
-                and body.strip()
-                and not LIST_MARKER_RE.match(peeled)
-                # A CONFIRMED table, not any pipe. Rustdoc renders a quoted
-                # sentence carrying on across an unmarked "continued | ..."
-                # line as one paragraph, and flushing there splits it into
-                # two short units, so a new 27-word sentence passes CH007.
-                and not table_header(block, index, piece.nest, peeled, container)
-                and not heading(peeled, container)
-                and not html_block(peeled, container)
-                and not SEPARATOR_RE.match(peeled)
-                and not FENCE_RE.match(peeled)
+            # One predicate, shared with `comment_lines`. It was written
+            # here and only here, and the span pass then reported a boundary
+            # on a line this loop knew was no boundary at all.
+            lazy = lazy_continuation(
+                body, peeled, container, depth, quoted, bool(run), block, index, piece.nest
             )
             if depth != quoted and not lazy:
                 flush()
@@ -3973,6 +4021,26 @@ RULE_TESTS = [
         "// Use the extern \"C-unwind\" convention for the callback here.\n",
         set(),
         "but prose that names an ABI is prose",
+    ),
+    (
+        "/// > Explain the `literal\n"
+        "/// TODO: issue required` suffix.\n",
+        set(),
+        "a lazy continuation stays inside the quote, so the span pairs",
+    ),
+    (
+        "/// > Explain the `literal\n"
+        "///\n"
+        "/// TODO: issue required` suffix.\n",
+        {("CH002", 3)},
+        "but a blank line really does leave it",
+    ),
+    (
+        "/// > Explain the `literal\n"
+        "/// # Heading\n"
+        "/// TODO: issue required` suffix.\n",
+        {("CH002", 3)},
+        "and a line that begins a block is no continuation",
     ),
 ]
 

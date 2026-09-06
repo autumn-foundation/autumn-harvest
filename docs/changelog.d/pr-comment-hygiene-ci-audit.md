@@ -2089,3 +2089,44 @@ fixture pins that.
 
 Corpus effect: none, which is the expected answer -- no comment in this
 tree contains a commented-out FFI signature of any ABI.
+
+### Round sixty-nine — leaving a quote is not always leaving the block
+
+Two findings. One is a Tier A FALSE POSITIVE and is fixed; one
+under-reports and joins issue #1383.
+
+**A lazy continuation is not a block boundary.** CommonMark lets a
+paragraph inside a block quote carry on across a line with no `>` at
+all. Round fifty-nine cut the span at a change of quote DEPTH, which is
+right for the line that opens a quote and wrong for the line that
+continues one lazily: Rustdoc renders
+
+    /// > Explain the `literal
+    /// TODO: issue required` suffix.
+
+as one quoted paragraph with the marker inside a code span, and the
+audit split the span and failed the build on it.
+
+`prose_units` has known this since round forty-one -- it carries a
+`lazy` predicate with six exceptions worked out over several rounds --
+and `comment_lines` did not. The predicate is one shared
+`lazy_continuation` now, used by both. Extracting it changed no finding
+in the corpus, which is the evidence that the move was a move and not a
+rewrite.
+
+This is round sixty-seven's lesson in the other half of the file: a rule
+kept in two places is kept in one of them eventually. Two rounds running,
+the defect was a second implementation of something the file already
+knew.
+
+**A rejected list marker is still peeled** -- `2.` after an open
+paragraph opens no list, `update_containers` says so, and
+`strip_containers` peels it anyway and finds a fence behind it. That is
+#1383's sixth item. It under-reports; the shape occurs nowhere in this
+tree; and the fix threads paragraph state through a helper with eight
+call sites whose semantics after crossing a quote are exactly the
+question rounds forty-four to fifty kept getting wrong.
+
+Corpus effect: none. Three fixtures -- the lazy continuation, the blank
+line that really does leave the quote, and a heading that ends the
+continuation because it begins a block.
