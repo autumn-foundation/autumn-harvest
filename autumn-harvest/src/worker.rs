@@ -16552,6 +16552,23 @@ fn resolve_continue_as_new_successor_defaults<'a>(
     }
 }
 
+/// Resolve the effective workflow-input cap for a cross-type continuation
+/// target (issue #1161).
+///
+/// The target's own `max_input_bytes` override applies. The override raises
+/// the fleet-wide floor. The override never lowers the floor. This matches
+/// every start route's own resolution (issue #252). A same-type continuation
+/// never calls this: `WorkflowContext`'s own in-process check already
+/// enforces the correct, unchanged cap before the command is pushed.
+fn resolve_cross_type_max_input_bytes(
+    target: &crate::info::WorkflowInfo,
+    global_floor: u64,
+) -> u64 {
+    target
+        .max_input_bytes
+        .map_or(global_floor, |per_type| per_type.max(global_floor))
+}
+
 #[allow(clippy::too_many_lines)]
 #[doc(hidden)]
 pub async fn persist_workflow_continue_as_new(
@@ -16595,6 +16612,56 @@ pub async fn persist_workflow_continue_as_new(
         ContinueAsNewTypeCheck::SameType => None,
         ContinueAsNewTypeCheck::CrossType(info) => Some(info),
     };
+
+    // Cross-type input cap (issue #1161). A same-type continuation needs no
+    // check here: `WorkflowContext`'s own in-process check already enforced
+    // the correct cap before the command was pushed. A cross-type target's
+    // cap can only be resolved HERE, where the registry is reachable. The
+    // in-process context cannot see another type's `max_input_bytes`.
+    // Reject before any write, exactly like the quota-key check further
+    // below (see its comment for why a bare `Err` here is wrong). Checked
+    // BEFORE the `input.clone()` calls further down, so a rejected input
+    // never pays for two full clones it will never need (Codex-style review
+    // finding).
+    if let Some(info) = target_info {
+        let cap = resolve_cross_type_max_input_bytes(info, registry.max_workflow_input_bytes);
+        let observed = serde_json::to_string(&input).map_or(0, |s| s.len() as u64);
+        let offload_applies = registry
+            .payload_offloader()
+            .is_some_and(|o| observed > o.threshold());
+        if cap > 0 && observed > cap && !offload_applies {
+            let successor_workflow_name = new_workflow_type
+                .as_deref()
+                .unwrap_or(execution.workflow_name.as_str());
+            let error = HarvestError::PayloadTooLarge {
+                kind: crate::error::PayloadKind::WorkflowInput,
+                observed_bytes: observed,
+                cap_bytes: cap,
+                workflow_type: successor_workflow_name.to_string(),
+                activity_name: None,
+            }
+            .to_string();
+            persist_workflow_failure(
+                conn,
+                persistence.task.id,
+                persistence.exec_id,
+                persistence.next_event_id,
+                persistence.worker_id,
+                persistence.task.crash_strikes,
+                &error,
+                None,
+                None,
+                None,
+                None,
+                None,
+                crate::types::Priority::default(),
+                registry.payload_codecs(),
+                &mut Vec::new(),
+            )
+            .await?;
+            return Ok(());
+        }
+    }
 
     // Carry the predecessor's `last_completion_result` forward by its *stored*
     // representation (issue #524 / #488). If it was offloaded, copy the
@@ -35644,6 +35711,32 @@ mod tests {
             Some(serde_json::json!({"max_attempts": 50})),
             "the same-type arm must carry the stored policy verbatim"
         );
+    }
+
+    /// AC — a cross-type target's own `max_input_bytes` override governs the
+    /// successor's input cap, exactly like every start route (issue #252).
+    #[test]
+    fn can1161_cross_type_max_input_bytes_uses_the_targets_own_override() {
+        let mut target = can803_wf_info("paid_subscription");
+        target.max_input_bytes = Some(10_000);
+        assert_eq!(resolve_cross_type_max_input_bytes(&target, 100), 10_000);
+    }
+
+    /// AC — the override raises the fleet-wide floor. It never lowers the
+    /// floor (issue #252's "raise, never lower" rule).
+    #[test]
+    fn can1161_cross_type_max_input_bytes_never_lowers_the_global_floor() {
+        let mut target = can803_wf_info("paid_subscription");
+        target.max_input_bytes = Some(10);
+        assert_eq!(resolve_cross_type_max_input_bytes(&target, 100), 100);
+    }
+
+    /// AC — a target declaring no override falls back to the fleet-wide
+    /// floor, matching an undeclared `max_input_bytes` on the start path.
+    #[test]
+    fn can1161_cross_type_max_input_bytes_falls_back_to_the_global_floor_when_undeclared() {
+        let target = can803_wf_info("paid_subscription");
+        assert_eq!(resolve_cross_type_max_input_bytes(&target, 100), 100);
     }
 
     /// Naming the run's OWN type must never trip the cross-shard guard, even on

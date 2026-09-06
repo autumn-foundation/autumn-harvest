@@ -12197,33 +12197,60 @@ impl WorkflowContext {
     ///
     /// The successor's **lifecycle defaults are resolved from
     /// `workflow_type`'s own [`WorkflowInfo`]** — not the predecessor's:
-    /// `execution_timeout` (#243), `sla` (#487, clamped to at most the
-    /// execution timeout exactly as at start), the `concurrency` key/limit
-    /// (#247), the workflow-level `retry_policy` (#523), and the
-    /// `owner`/`runbook_url`/`severity` ops metadata (#372). This mirrors how
-    /// a spawned child resolves its own type's defaults, and means an alert
-    /// on the new phase pages the team that owns *that* phase.
+    ///
+    /// - `execution_timeout` (#243).
+    /// - `sla` (#487), clamped to at most the execution timeout, exactly as
+    ///   at start.
+    /// - The `concurrency` key/limit (#247).
+    /// - The `quota` key (#946).
+    /// - The `max_input_bytes` payload cap (#1161).
+    /// - The workflow-level `retry_policy` (#523).
+    /// - The `owner`/`runbook_url`/`severity` ops metadata (#372).
+    ///
+    /// This mirrors how a spawned child resolves its own type's defaults. An
+    /// alert on the new phase pages the team that owns *that* phase.
+    ///
+    /// `max_input_bytes` re-resolves at the **worker**, not here. This
+    /// in-process context has no registry, so it cannot look up another
+    /// type's declared cap. An over-cap transition input is therefore not
+    /// rejected synchronously from this call. The command is still pushed;
+    /// the worker fails the predecessor terminally at persist time (see
+    /// *Errors*) if the TARGET type's cap rejects it.
     ///
     /// Carried forward verbatim (identical to a same-type continuation):
     /// `workflow_id`, shard, `queue_name`, `memo`, search attributes, context
     /// headers, build id, schedule lineage (#488/#534), completion callbacks
     /// (#605), the run-chain back-links (#701), and — deliberately — the
     /// chain-scoped lifetime cap `chain_execution_timeout`/`chain_deadline_at`
-    /// (#617). The chain cap is anchored at the *first* run of the chain, so
-    /// changing type must not reset it: cross-type continuation is not an
+    /// (#617). The chain cap is anchored at the *first* run of the chain.
+    /// Changing type must not reset it: cross-type continuation is not an
     /// escape hatch from a runaway-loop budget.
     ///
     /// The fleet-wide `max_workflow_execution_timeout` ceiling is applied to
-    /// the target's declared timeout exactly as at every other registry-aware
-    /// start path, so a type change is not an escape hatch from that either.
+    /// the target's declared timeout, exactly as at every other
+    /// registry-aware start path. A type change is not an escape hatch from
+    /// that either.
     ///
     /// **Not consulted on this path**: the target type's `throttle` (#607),
-    /// `debounce` (#499), `batch` (#518) and `max_input_bytes` (#252). Those
-    /// are *admission* policies, and continue-as-new is in-flight continuation
-    /// rather than a start — so a cross-type transition does not pass through
-    /// the target type's admission gates, and the payload cap enforced is the
-    /// predecessor's. If a phase must be paced or rate-limited on entry, gate
-    /// it at the caller instead.
+    /// `debounce` (#499) and `batch` (#518). These are *admission* policies
+    /// that defer or collapse a *start*. Continue-as-new is in-flight
+    /// continuation, not a start, so a target declaring one of these gets no
+    /// pacing when entered via continue-as-new. If a phase must be paced or
+    /// rate-limited on entry, gate it at the caller instead.
+    ///
+    /// Every other `WorkflowInfo` field falls into one of two remaining
+    /// tiers:
+    ///
+    /// - Declarative metadata this path never reads: `description`,
+    ///   `input_schema`, `output_schema`, `error_schema`, `mcp`,
+    ///   `declared_activities`, `declared_children`.
+    /// - Identifies the target itself rather than governing successor
+    ///   behavior: `name`, `module`, `handler`.
+    ///
+    /// This partition is exhaustive. A newly added `WorkflowInfo` field must
+    /// be placed in one of the tiers above. Update this rustdoc and the
+    /// table in `docs/architecture.md`'s "Cross-type continue-as-new"
+    /// section together.
     ///
     /// # Addressing consequence (read this)
     ///
@@ -12261,7 +12288,7 @@ impl WorkflowContext {
     ///
     /// Same as [`continue_as_new`](Self::continue_as_new). Additionally, the
     /// worker fails the execution terminally (a `WorkflowFailed` event, no
-    /// successor created, no retry offered) in four cases:
+    /// successor created, no retry offered) in five cases:
     ///
     /// 1. `workflow_type` is empty or blank.
     /// 2. `workflow_type` is not registered on the worker running the
@@ -12274,6 +12301,9 @@ impl WorkflowContext {
     ///    `(workflow_type, workflow_id)`. Harvest admits exactly one active
     ///    run per pair, and this path never displaces a bystander. Recovery is
     ///    to resolve that run, then restart or reset (#148) the entity.
+    /// 5. The input exceeds the target type's own `max_input_bytes` cap
+    ///    (#1161), resolved at the worker rather than returned synchronously
+    ///    from this call (see *Successor defaults*).
     ///
     /// Naming the *current* type is **not** an error — it is a supported
     /// request for that type's declared defaults (which plain
@@ -12398,25 +12428,30 @@ impl WorkflowContext {
             }
             HistoryMatch::NoMatch => {
                 self.check_strict_replay_no_match("ContinueAsNew")?;
-                let observed = serde_json::to_string(&input).map_or(0, |s| s.len() as u64);
-                if self.payload_max_workflow_input > 0
-                    && observed > self.payload_max_workflow_input
-                    && !self.offload_will_apply(observed)
-                {
-                    return Err(HarvestError::PayloadTooLarge {
-                        kind: crate::error::PayloadKind::WorkflowInput,
-                        observed_bytes: observed,
-                        cap_bytes: self.payload_max_workflow_input,
-                        // Name the run this input is destined for: the target
-                        // type for a cross-type continuation (#803), else our
-                        // own. The cap value itself is still the *current*
-                        // type's — the context cannot see the target's
-                        // `max_input_bytes` override.
-                        workflow_type: new_workflow_type
-                            .clone()
-                            .unwrap_or_else(|| self.workflow_name.clone()),
-                        activity_name: None,
-                    });
+                // Issue #1161: check the cap only for a SAME-type
+                // continuation. `self.payload_max_workflow_input` is
+                // resolved for the CURRENT type, which is also the successor
+                // type here, so the value is correct. A cross-type target's
+                // cap can differ in either direction. This in-process
+                // context has no registry to look the target up in. So a
+                // cross-type transition skips this check. It relies instead
+                // on the worker's own authoritative re-check at persist time
+                // (`persist_workflow_continue_as_new`), which resolves the
+                // TARGET type's `max_input_bytes` correctly.
+                if new_workflow_type.is_none() {
+                    let observed = serde_json::to_string(&input).map_or(0, |s| s.len() as u64);
+                    if self.payload_max_workflow_input > 0
+                        && observed > self.payload_max_workflow_input
+                        && !self.offload_will_apply(observed)
+                    {
+                        return Err(HarvestError::PayloadTooLarge {
+                            kind: crate::error::PayloadKind::WorkflowInput,
+                            observed_bytes: observed,
+                            cap_bytes: self.payload_max_workflow_input,
+                            workflow_type: self.workflow_name.clone(),
+                            activity_name: None,
+                        });
+                    }
                 }
                 self.push_command(WorkflowCommand::ContinueAsNew {
                     input,
@@ -17357,22 +17392,47 @@ mod tests {
         );
     }
 
-    /// The payload-cap rejection names the run the input is destined for —
-    /// the *target* type on a cross-type continuation.
+    /// A SAME-type continuation's payload-cap check names the run's own
+    /// type and uses its own resolved cap — unchanged by issue #1161.
     #[tokio::test]
-    async fn continue_as_new_as_type_payload_cap_names_the_target_type() {
+    async fn continue_as_new_payload_cap_names_the_current_type() {
         let ctx = WorkflowContext::new_test().with_payload_caps(1, 1, 1, 1);
+        let own = ctx.workflow_type().to_string();
         let big = serde_json::json!({"blob": "x".repeat(256)});
 
         let err = ctx
-            .continue_as_new_as_type("paid_subscription", big)
+            .continue_as_new(big)
             .await
             .expect_err("an oversized input must be rejected");
         match err {
             HarvestError::PayloadTooLarge { workflow_type, .. } => {
-                assert_eq!(workflow_type, "paid_subscription");
+                assert_eq!(workflow_type, own);
             }
             other => panic!("expected PayloadTooLarge, got {other:?}"),
+        }
+    }
+
+    /// Issue #1161: a cross-type continuation's payload cap can only be the
+    /// TARGET type's, which this in-process context cannot resolve. An input
+    /// over the *current* type's cap is therefore no longer rejected here.
+    /// The command is still pushed, deferring the real check to the
+    /// worker's authoritative re-check at persist time
+    /// (`persist_workflow_continue_as_new`).
+    #[tokio::test]
+    async fn continue_as_new_as_type_defers_the_payload_cap_to_the_worker() {
+        let ctx = WorkflowContext::new_test().with_payload_caps(1, 1, 1, 1);
+        let big = serde_json::json!({"blob": "x".repeat(256)});
+
+        let drained = drain_parked_continue_as_new(
+            &ctx,
+            ctx.continue_as_new_as_type("paid_subscription", big.clone()),
+        )
+        .await;
+
+        assert_eq!(drained.len(), 1);
+        match &drained[0] {
+            WorkflowCommand::ContinueAsNew { input, .. } => assert_eq!(input, &big),
+            other => panic!("expected ContinueAsNew, got {other:?}"),
         }
     }
 
