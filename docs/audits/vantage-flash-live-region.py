@@ -48,11 +48,13 @@ from pathlib import Path
 
 UI_RS = Path(__file__).resolve().parents[2] / "autumn-harvest-plugin" / "src" / "ui.rs"
 
-# `div.flash { ... }` or `div class="flash" { ... }` (both maud spellings
-# appear in the file), capturing whatever attributes sit between the class
-# and the opening `{` of the block so we can check them for a live-region
-# role without also matching unrelated `div`s.
-FLASH_DIV = re.compile(r'div(?:\.flash|\s+class="flash")([^{]*)\{')
+# `div.flash { ... }`, `div."flash" { ... }` (the quoted-class shorthand,
+# used elsewhere in this file for classes like `."error-banner"`), or
+# `div class="flash" { ... }` — all three are maud spellings that render
+# the same markup. Capture whatever attributes sit between the class and
+# the opening `{` of the block so we can check them for a live-region role
+# without also matching unrelated `div`s.
+FLASH_DIV = re.compile(r'div(?:\.flash|\."flash"|\s+class="flash")([^{]*)\{')
 
 # `(?<![\w-])` requires the match not be preceded by a word character or a
 # hyphen, so `role="status"` matches as a real attribute but the same text
@@ -82,6 +84,13 @@ def main():
 
     print(f"Full-page-load status-message announcement audit — {UI_RS}")
     print(f"{len(sites)} `div.flash` render sites checked.\n")
+
+    if not sites:
+        print("ERROR: found no `div.flash` render sites at all — FLASH_DIV no")
+        print("longer matches anything in ui.rs. Either the flash markup was")
+        print("rewritten in a spelling this audit doesn't recognize (a silent")
+        print("pass would hide that), or flash messages were removed outright.")
+        return 1
 
     missing = [(line, role, focus) for line, role, focus in sites if not (role and focus)]
     ok_count = len(sites) - len(missing)
