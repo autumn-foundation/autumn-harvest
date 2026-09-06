@@ -321,16 +321,22 @@ async fn task_queue_state(conn: &mut AsyncPgConnection, exec_id: ExecutionId) ->
 /// actual retry cycle produced. Sampling only while `PENDING` additionally
 /// avoids a read landing mid-cycle, between a backoff elapsing and the retry's
 /// own `QuotaExceeded` catch re-stamping a fresh one.
+///
+/// Returns `(scheduled_at, observed_now)`: `observed_now` is captured
+/// immediately after the qualifying read, in the same call, so the caller's
+/// "is this in the future" comparison isn't stretched by whatever happens
+/// between this function returning and the caller's own `Utc::now()` call --
+/// immaterial given the backoff's 500ms floor, but free to close out.
 async fn task_scheduled_at_after_a_retry_cycle(
     conn: &mut AsyncPgConnection,
     exec_id: ExecutionId,
     since: chrono::DateTime<chrono::Utc>,
-) -> chrono::DateTime<chrono::Utc> {
+) -> (chrono::DateTime<chrono::Utc>, chrono::DateTime<chrono::Utc>) {
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
     loop {
         let row = task_queue_state(conn, exec_id).await;
         if row.state == "PENDING" && row.scheduled_at != since {
-            return row.scheduled_at;
+            return (row.scheduled_at, chrono::Utc::now());
         }
         assert!(
             std::time::Instant::now() < deadline,
@@ -1519,10 +1525,11 @@ async fn awaited_child_spawn_honors_target_quota_parks_parent_then_succeeds() {
     // `recover_from_child_quota_exceeded`'s bounded jittered backoff, so
     // while the blocker still holds the slot, a completed retry cycle's
     // `scheduled_at` must sit in the future, not be immediately claimable.
-    assert!(
+    let (retried_scheduled_at, observed_now) =
         task_scheduled_at_after_a_retry_cycle(&mut conn, parent, parent_pre_worker_scheduled_at)
-            .await
-            > chrono::Utc::now(),
+            .await;
+    assert!(
+        retried_scheduled_at > observed_now,
         "a QuotaExceeded catch that hot-spins (park + immediate wake) never \
          advances scheduled_at into the future; the bounded-backoff requeue \
          must"
@@ -1743,10 +1750,11 @@ async fn child_timeout_race_spawn_honors_target_quota_parks_parent_then_succeeds
     // through the same bounded-backoff helper, so a completed retry cycle's
     // `scheduled_at` must sit in the future while the blocker still holds the
     // slot.
-    assert!(
+    let (retried_scheduled_at, observed_now) =
         task_scheduled_at_after_a_retry_cycle(&mut conn, parent, parent_pre_worker_scheduled_at)
-            .await
-            > chrono::Utc::now(),
+            .await;
+    assert!(
+        retried_scheduled_at > observed_now,
         "a QuotaExceeded catch that hot-spins (park + immediate wake) never \
          advances scheduled_at into the future; the bounded-backoff requeue \
          must"
@@ -2879,12 +2887,22 @@ async fn completion_trigger_defers_to_outbox_when_target_quota_exceeded() {
 /// could then dominate every unordered `LIMIT 50` claim batch on every
 /// scanner tick, starving any OTHER, unrelated relay sharing the batch.
 ///
-/// This inserts two outbox rows directly (bypassing
+/// This inserts outbox rows directly (bypassing
 /// `evaluate_triggers_for_execution`, whose own quota-block-to-outbox path is
 /// covered by `completion_trigger_defers_to_outbox_when_target_quota_exceeded`
 /// above) so it isolates `enforce_completion_triggers_outbox`'s own
-/// claim/backoff mechanics: one row's target is at quota cap, the other's is
-/// free.
+/// claim/backoff mechanics.
+///
+/// Proving "does not starve a sibling row" needs genuine batch pressure: the
+/// claim query is `LIMIT 50`, and even the PRE-fix code moved on to the next
+/// row in an already-loaded batch on a `QuotaBlocked` outcome (nothing
+/// aborted the loop) -- so two rows sharing one small batch would pass
+/// identically before and after this fix. This inserts 60 quota-blocked rows
+/// (all against the SAME durably-exhausted target/tenant, exceeding the
+/// LIMIT-50 window) followed by one free-target row, so the first scan's
+/// batch is entirely blocked rows and the free row is provably NOT reached --
+/// then shows the backoff filter is what lets it surface on a LATER scan
+/// instead of being starved forever.
 #[tokio::test]
 async fn quota_blocked_outbox_row_gets_backoff_and_does_not_starve_a_sibling_row() {
     let (url, _c) = setup_test_database_url_or_env().await;
@@ -2967,28 +2985,82 @@ async fn quota_blocked_outbox_row_gets_backoff_and_does_not_starve_a_sibling_row
             .is_ok()
     }
 
-    let blocked_outbox_id = insert_outbox_row(
+    // The claim query's `LIMIT`, kept in lockstep with
+    // `enforce_completion_triggers_outbox`'s hardcoded `.limit(50)` so this
+    // test fails loudly (not silently under-provisions the batch) if that
+    // constant ever changes.
+    const CLAIM_BATCH_LIMIT: usize = 50;
+    const BLOCKED_ROW_COUNT: usize = CLAIM_BATCH_LIMIT + 10;
+
+    // `created_at` defaults to `now()` at insertion, which is NOT a reliable
+    // ordering signal here: several inserts issued back-to-back on the same
+    // connection can land in the same microsecond (more likely still under a
+    // loaded CI host running the rest of this suite concurrently), and a
+    // `created_at` tie makes `ORDER BY created_at ASC` pick an unspecified
+    // order among the tied rows -- silently breaking the "free row sorts
+    // last" assumption this test depends on. Stamp `created_at` explicitly,
+    // strictly increasing by a whole second per row, so the intended order is
+    // exact regardless of real wall-clock resolution.
+    let base_created_at = chrono::Utc::now() - chrono::Duration::hours(1);
+    async fn set_created_at(
+        conn: &mut AsyncPgConnection,
+        id: Uuid,
+        created_at: chrono::DateTime<chrono::Utc>,
+    ) {
+        diesel::sql_query(
+            "UPDATE harvest_completion_trigger_outbox SET created_at = $2 WHERE id = $1",
+        )
+        .bind::<diesel::sql_types::Uuid, _>(id)
+        .bind::<diesel::sql_types::Timestamptz, _>(created_at)
+        .execute(conn)
+        .await
+        .expect("stamp created_at");
+    }
+
+    let mut blocked_outbox_ids = Vec::with_capacity(BLOCKED_ROW_COUNT);
+    for i in 0..BLOCKED_ROW_COUNT {
+        let id = insert_outbox_row(
+            &mut conn,
+            blocked_wf,
+            serde_json::json!({"tenant_id": "acme"}),
+        )
+        .await;
+        set_created_at(
+            &mut conn,
+            id,
+            base_created_at + chrono::Duration::seconds(i64::try_from(i).expect("small index")),
+        )
+        .await;
+        blocked_outbox_ids.push(id);
+    }
+    let oldest_blocked_outbox_id = blocked_outbox_ids[0];
+    let free_outbox_id = insert_outbox_row(&mut conn, free_wf, serde_json::json!({})).await;
+    set_created_at(
         &mut conn,
-        blocked_wf,
-        serde_json::json!({"tenant_id": "acme"}),
+        free_outbox_id,
+        base_created_at
+            + chrono::Duration::seconds(i64::try_from(BLOCKED_ROW_COUNT).expect("small count")),
     )
     .await;
-    let free_outbox_id = insert_outbox_row(&mut conn, free_wf, serde_json::json!({})).await;
 
-    // First scan: the free row's target has no quota, so it is delivered
-    // (started + outbox row deleted); the blocked row's target is at cap, so
-    // it is left claimable but must now carry a future `next_attempt_at`.
+    // First scan: the batch (`ORDER BY created_at ASC LIMIT 50`) is entirely
+    // the 50 OLDEST blocked rows -- the free row (youngest of all 61) is
+    // provably NOT in it. This is the starvation this fix addresses: without
+    // it, every future scan would reload this exact same dominant batch
+    // forever.
     enforce_completion_triggers_outbox(&mut conn, &NoOpMetrics, &sharded_pool, &[ShardId::new(0)])
         .await
         .expect("first outbox scan");
 
     assert!(
-        !outbox_row_exists(&mut conn, free_outbox_id).await,
-        "the free row's target has no quota and must be delivered on the \
-         first scan, regardless of the blocked row sharing the batch"
+        outbox_row_exists(&mut conn, free_outbox_id).await,
+        "the free row sorts after 60 blocked rows, so a LIMIT-50 batch \
+         cannot reach it on the first scan -- confirms the batch really is \
+         dominated, the precondition for the starvation this test proves is \
+         fixed"
     );
 
-    let first_backoff = outbox_next_attempt_at(&mut conn, blocked_outbox_id)
+    let first_backoff = outbox_next_attempt_at(&mut conn, oldest_blocked_outbox_id)
         .await
         .expect(
             "a QuotaBlocked outcome must stamp next_attempt_at into the future, \
@@ -2999,14 +3071,23 @@ async fn quota_blocked_outbox_row_gets_backoff_and_does_not_starve_a_sibling_row
         "next_attempt_at must be in the future immediately after a quota block"
     );
 
-    // Second scan, immediately after the first: the blocked row's backoff has
-    // not elapsed, so the claim query must exclude it entirely -- if it were
-    // reclaimed, relay_gate_checked_start would recompute a new backoff and
-    // next_attempt_at would move.
+    // Second scan: the 50 rows stamped above are now excluded (their backoff
+    // hasn't elapsed), so the batch is the remaining 10 blocked rows plus the
+    // free row -- well under the limit, so the free row is finally reached
+    // and delivered. This is the actual non-starvation proof: the backoff
+    // filter is what lets a sibling row surface on a LATER scan instead of
+    // being crowded out forever by the same dominant batch.
     enforce_completion_triggers_outbox(&mut conn, &NoOpMetrics, &sharded_pool, &[ShardId::new(0)])
         .await
         .expect("second outbox scan");
-    let second_backoff = outbox_next_attempt_at(&mut conn, blocked_outbox_id)
+
+    assert!(
+        !outbox_row_exists(&mut conn, free_outbox_id).await,
+        "once the backoff filter excludes the first batch's blocked rows, \
+         the free row must be delivered on the very next scan -- proving the \
+         fix stops the blocked rows from starving it indefinitely"
+    );
+    let second_backoff = outbox_next_attempt_at(&mut conn, oldest_blocked_outbox_id)
         .await
         .expect("still blocked, still stamped");
     assert_eq!(
@@ -3021,7 +3102,7 @@ async fn quota_blocked_outbox_row_gets_backoff_and_does_not_starve_a_sibling_row
     diesel::sql_query(
         "UPDATE harvest_completion_trigger_outbox SET next_attempt_at = $2 WHERE id = $1",
     )
-    .bind::<diesel::sql_types::Uuid, _>(blocked_outbox_id)
+    .bind::<diesel::sql_types::Uuid, _>(oldest_blocked_outbox_id)
     .bind::<diesel::sql_types::Timestamptz, _>(chrono::Utc::now() - chrono::Duration::seconds(1))
     .execute(&mut conn)
     .await
@@ -3031,7 +3112,7 @@ async fn quota_blocked_outbox_row_gets_backoff_and_does_not_starve_a_sibling_row
         .await
         .expect("third outbox scan");
     assert!(
-        !outbox_row_exists(&mut conn, blocked_outbox_id).await,
+        !outbox_row_exists(&mut conn, oldest_blocked_outbox_id).await,
         "once the backoff has elapsed and the quota has freed up, the row \
          must be reclaimed and delivered"
     );
