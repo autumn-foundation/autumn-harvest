@@ -44,9 +44,14 @@ attributes to `schedule_to_close_at`. Codex review on PR #1339 caught this,
 and caught two further bugs in the first two attempts to fix it (wrong
 snapshot ordering, then a snapshot that didn't survive across the
 real-drain loop's per-label connections) -- see
-[Workload](#workload) for the full sequence. The 1,000-/10,000-row
-`EXPLAIN` deltas above reproduced identically before and after this fix;
-the real-drain aggregate and the 100,000-row plan choice did not -- see
+[Workload](#workload) for the full sequence. Codex review on PR #1339
+caught that an earlier revision here claimed the 1,000-/10,000-row
+`EXPLAIN` deltas reproduced identically before and after this fix -- the
+pre-fix artifacts backing that comparison are no longer committed (the
+repro script overwrites the same canonical filenames every run), so this
+page does not draw that comparison. What is auditable from the current
+committed run is in [Measurement](#measurement) below; the real-drain
+aggregate and the 100,000-row plan choice have their own caveats -- see
 [Corroboration](#corroboration-pg_stat_statements-over-the-real-claim-drain)
 and [100,000-row plan choice](#100000-row-plan-choice).
 
@@ -283,9 +288,10 @@ this same candidate scan, and `ANALYZE` sampling can independently flip a
 planner choice this close between any two runs, seeding fix or not. This
 recapture establishes only that a different plan was chosen after the fix,
 not which input -- the seeding confound, the predicate's own effect on
-planner inputs, or sampling noise -- caused that choice. The
-1,000-/10,000-row `EXPLAIN` deltas, by contrast, reproduced byte-identical
-before and after this fix.
+planner inputs, or sampling noise -- caused that choice. This page does
+not compare the 1,000-/10,000-row `EXPLAIN` deltas before and after this
+fix either, for the same reason: the pre-fix artifacts are no longer
+committed.
 
 ## Plan
 
@@ -538,9 +544,7 @@ mechanisms, and explains why 100,000 does not get the same treatment.
 `no-schedule-to-close` uses an
 `Index Scan using idx_harvest_tq_poll` for the candidate-row source (9,878
 total buffers on the `Update` node); `schedule-to-close` uses a plain `Seq
-Scan` (2,537 total buffers, identical to the previous committed run --
-see [Workload](#workload) for why that specific number reproduced exactly
-across the seeding fix). Both plans still pay the identical
+Scan` (2,537 total buffers). Both plans still pay the identical
 `temp read=495 written=1914` external-merge-sort cost regardless of which
 scan feeds it (`grep`-verified against both artifacts): that index cannot
 serve the query's `ORDER BY` (the non-indexable leading `CASE` expression
