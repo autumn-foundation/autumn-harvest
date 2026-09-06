@@ -2747,6 +2747,20 @@ async fn zz_capture_schedule_to_close_claim_evidence() {
     // `schedule_to_close_at` itself. Codex review on PR #1339 caught this:
     // reuse identical indexed values across labels so `schedule_to_close_at`
     // is the only input that actually varies between them.
+    //
+    // Reusing the VALUES is not enough on its own: an earlier revision of
+    // this helper numbered the snapshot by `ROW_NUMBER() OVER (ORDER BY
+    // id)`, which sorts by the random primary key rather than by original
+    // insertion order, so the schedule-to-close re-insert built its heap and
+    // every index in a different physical order than `db::seed()`'s
+    // `generate_series`-ordered bulk `INSERT` did for the baseline -- Codex
+    // review caught this too, on the same finding. `ctid` (physical tuple
+    // location) preserves that original insertion order for a table that
+    // has only ever been bulk-loaded once with no intervening updates or
+    // deletes, so the snapshot is numbered by `ctid`, and the re-insert
+    // below explicitly `ORDER BY`s on that same number -- into a table that
+    // was just `TRUNCATE`d, so this insertion order becomes the new table's
+    // physical order too, matching the baseline's.
     async fn reseed_with_schedule_to_close(
         conn: &mut AsyncPgConnection,
         schedule_to_close_sql: &str,
@@ -2756,7 +2770,7 @@ async fn zz_capture_schedule_to_close_claim_evidence() {
                SELECT id, queue_name, task_type, activity_name, activity_id, input, \
                       state, priority, max_attempts, scheduled_at, required_build_id, \
                       concurrency_key, concurrency_cap, rate_limit_key, \
-                      ROW_NUMBER() OVER (ORDER BY id) - 1 AS i \
+                      ROW_NUMBER() OVER (ORDER BY ctid) - 1 AS i \
                FROM harvest_task_queue",
         )
         .execute(conn)
@@ -2777,13 +2791,15 @@ async fn zz_capture_schedule_to_close_claim_evidence() {
                     state, priority, max_attempts, scheduled_at, required_build_id, \
                     concurrency_key, concurrency_cap, rate_limit_key, \
                     {schedule_to_close_sql} \
-             FROM stc_seed_snapshot",
+             FROM stc_seed_snapshot \
+             ORDER BY i",
         ))
         .execute(conn)
         .await
         .expect(
             "re-seed rows carrying schedule_to_close_at from birth, reusing the \
-             no-schedule-to-close seed's exact id/activity_id values",
+             no-schedule-to-close seed's exact id/activity_id values in the \
+             same physical insertion order",
         );
 
         diesel::sql_query("DROP TABLE stc_seed_snapshot")
