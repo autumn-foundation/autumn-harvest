@@ -146,11 +146,12 @@ Plan shape is stable across all three depths -- both states choose a plain
 
 ### Buffer deltas across backlog depth (single first claim, cache-warm)
 
-`EXPLAIN (ANALYZE, BUFFERS, ...)` total buffers for `claim_task_query()`,
+`EXPLAIN (ANALYZE, BUFFERS, ...)` **shared** buffers (`shared hit` +
+`shared read`) for `claim_task_query()`'s whole-query root node,
 `no-session` vs `worker-session` (artifacts:
 `docs/perf-artifacts/worker-session-claim-predicate/{no-session,worker-session}-claim-backlog-{depth}.explain.txt`):
 
-| backlog | no-session buffers | worker-session buffers | delta | delta % |
+| backlog | no-session shared buffers | worker-session shared buffers | delta | delta % |
 |---:|---:|---:|---:|---:|
 | 1,000 | 53 | 63 | +10 | +18.9% |
 | 10,000 (headline) | 274 | 364 | +90 | **+32.9%** |
@@ -158,6 +159,21 @@ Plan shape is stable across all three depths -- both states choose a plain
 
 The delta grows with backlog size, consistent with a per-row storage effect
 that compounds with the number of rows touched.
+
+**Note on the 100,000-row depth (review round 14):** at this depth only,
+both roots also report identical temp-block traffic (`temp read=495
+written=1914` in both artifacts) from a sort operation spilling past
+`work_mem`. That traffic does not depend on `session_id`/`sticky_worker_id`
+-- it is exactly the same in both labels -- so it is excluded from the
+table above to isolate the predicate's own effect, and the table is
+labeled `shared buffers`, not total buffers. Folding the identical temp
+blocks into both sides changes the ratio: 100,000-row whole-query I/O
+(shared + temp) is 4,882 vs. 5,776, an **+18.3%** delta, not +36.2%. The
+10,000-row headline figure this page cites elsewhere (+32.9%) is unaffected
+-- neither artifact at that depth reports any temp-block traffic. A reader
+who wants the 100,000-row whole-query I/O ratio specifically, rather than
+the shared-buffer figure this table reports, should use +18.3% instead of
++36.2%.
 
 ### Corroboration: `pg_stat_statements` over the real claim-drain
 
