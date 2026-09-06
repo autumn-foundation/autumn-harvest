@@ -1640,12 +1640,17 @@ def comment_lines(pieces: list[Piece]):
                 )
                 nest = piece.nest
             text = piece.text
+            # Does this line BEGIN a block? A code span cannot reach across
+            # one: Rustdoc renders "- a `literal" and "- TODO: x` suffix" as
+            # two list items with literal backticks between them, and pairing
+            # the two blanked a marker that is ordinary text.
+            opens = False
             # A piece that does not begin its own line can open no block.
             # "Outer /* ```rust" puts the backticks after literal text, and
             # Rustdoc renders the whole line as a paragraph; opening a fence
             # there exempts every line until the next delimiter.
             if not piece.line_start:
-                yield piece.line, text, fence is not None or html is not None
+                yield piece.line, text, fence is not None or html is not None, False
                 continue
             # Inside a raw HTML block nothing is Markdown, so no fence, list
             # or table opens here and the text is not prose. A type-6 block
@@ -1659,7 +1664,7 @@ def comment_lines(pieces: list[Piece]):
                 else:
                     if html_closes(inside, html):
                         html = None
-                    yield piece.line, text, True
+                    yield piece.line, text, True, False
                     continue
             if fence is not None and leaves_container(text, scope):
                 fence = None
@@ -1685,6 +1690,7 @@ def comment_lines(pieces: list[Piece]):
                     indented,
                     piece.marker in DOC_MARKERS,
                 )
+                opens = starts_block(body, enclosing)
                 # Both are blocks, so neither leaves a paragraph open.
                 stack, paragraph = update_containers(
                     text, stack, paragraph, quoted, in_table or indented
@@ -1736,7 +1742,7 @@ def comment_lines(pieces: list[Piece]):
                 # inside one. An invalid opener (```foo`bar) is ordinary text
                 # and must still be scanned -- exempting it would hide the
                 # defect that rejecting it exists to expose.
-                yield piece.line, text, fence is not None or before is not None
+                yield piece.line, text, fence is not None or before is not None, True
                 continue
             # An HTML block opens here, outside any fence. Its own line is
             # ordinary text -- "<pre>" carries no defect -- but everything
@@ -1763,9 +1769,9 @@ def comment_lines(pieces: list[Piece]):
                 # The opener's line is inside the block it opens. Rustdoc
                 # renders "<pre>TODO: x</pre>" preformatted, so the line
                 # rules must not read that TODO as a defect.
-                yield piece.line, text, True
+                yield piece.line, text, True, True
                 continue
-            yield piece.line, text, fence is not None or indented
+            yield piece.line, text, fence is not None or indented, opens
 
 
 def check_line_rules(path: str, pieces: list[Piece]) -> list[Finding]:
@@ -1783,12 +1789,19 @@ def check_line_rules(path: str, pieces: list[Piece]) -> list[Finding]:
         # Fenced lines are emptied rather than dropped, so their backticks
         # cannot open a span over the prose after them and every index still
         # lines up.
-        spanless.extend(
-            blank_spans_across(
-                ["" if in_fence else text for _, text, in_fence in run_lines]
-            )
-        )
-    for index, (lineno, body, in_fence) in enumerate(lines):
+        #
+        # And the run is cut where a BLOCK begins. A span belongs to one
+        # block, not merely to one comment: two list items are two blocks,
+        # and pairing a backtick across them blanked a marker Rustdoc leaves
+        # as ordinary text.
+        block: list[str] = []
+        for _, text, in_fence, opens in run_lines:
+            if opens and block:
+                spanless.extend(blank_spans_across(block))
+                block = []
+            block.append("" if in_fence else text)
+        spanless.extend(blank_spans_across(block))
+    for index, (lineno, body, in_fence, _) in enumerate(lines):
         if in_fence:
             continue
         stripped = body.strip()
@@ -3508,6 +3521,18 @@ RULE_TESTS = [
         "// ```\n",
         set(),
         "but a fence is an example in any comment",
+    ),
+    (
+        "/// - Explain the `literal\n"
+        "/// - TODO: issue required` suffix.\n",
+        {("CH002", 2)},
+        "a code span does not reach across two list items",
+    ),
+    (
+        "/// - Explain the `literal\n"
+        "///   TODO: marker` syntax.\n",
+        set(),
+        "but it does reach across one item's own lines",
     ),
 ]
 

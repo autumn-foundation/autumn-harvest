@@ -1826,3 +1826,22 @@ error that suppresses findings is invisible unless something in the corpus
 happens to hit it.
 
 Corpus effect: none.
+
+### Round fifty-nine — a span belongs to a block, not to a comment
+
+One finding: round fifty-five stopped code spans reaching across comment runs,
+but two list items in ONE comment are still two blocks. Rustdoc renders
+`- Explain the ` + backtick + `literal` and `- TODO: issue required` + backtick
+as two `<li>` elements with literal backticks, so the marker is prose; the
+audit paired the backticks and blanked it.
+
+`comment_lines` already knew where blocks begin — `starts_block` has decided
+that since round forty-five — but it did not say so. It yields that now as a
+fourth element, and the span pass cuts the run at each block start rather than
+at each comment. Round fifty-five's fix was the right idea one level too
+coarse: the bound is a block, and a comment run is merely the outermost one.
+
+Two fixtures: across two items, where the span must not pair, and across one
+item's own wrapped lines, where it must.
+
+Corpus effect: none.
