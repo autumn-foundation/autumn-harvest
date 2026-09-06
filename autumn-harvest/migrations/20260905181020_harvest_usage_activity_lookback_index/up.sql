@@ -138,17 +138,30 @@
 -- callers. Setting `RetentionConfig.partitions.enabled = false`
 -- (`PartitionMaintenanceConfig::enabled`), rolled out to every worker on the
 -- target shard, closes only the AUTOMATIC path -- `retention.rs`'s
--- background janitor. It does NOT close the `harvest partition maintain` CLI
--- path: `autumn-harvest-cli::run_partition_maintain` calls
--- `partition::maintain` directly, with no reference to `RetentionConfig` at
--- all, so a person or a cron running that command is unaffected by the
--- config flag. Both must be true for the whole window, from before the
--- convergence loop starts through the parent statement finishing: `enabled =
--- false` on every worker, AND an operational freeze -- no one runs `harvest
--- partition maintain`, nor calls `partition::maintain`, `ensure_partitions`,
--- or `drain_default` directly, against this shard by any other means. Only
--- with both does the convergence loop's zero-row check become exact rather
--- than probabilistic.
+-- background janitor. It does NOT close any `harvest partition` CLI
+-- subcommand that mutates `harvest_events`: `enable`, `maintain`, and
+-- `disable` each dispatch straight to their own `partition::*` function
+-- (`run_partition_enable` / `run_partition_maintain` / `run_partition_disable`
+-- in `autumn-harvest-cli`), none of them consulting `RetentionConfig`. A
+-- person or a cron running any of those three during the window is
+-- unaffected by the config flag -- `disable` is the most destructive
+-- instance: it reverts `harvest_events` to a plain table, which would leave
+-- the per-leaf `CONCURRENTLY` indexes orphaned on tables the parent no longer
+-- has, and make the parent statement a full non-concurrent build over the
+-- whole rewritten table, exactly the outage this recipe exists to avoid.
+--
+-- Both parts must hold for the whole window, from before the convergence
+-- loop starts through the parent statement finishing: `enabled = false` on
+-- every worker, AND an operational freeze covering every mutating `harvest
+-- partition` subcommand (`enable`, `maintain`, `disable` today; any later
+-- addition to that enum belongs in this freeze too) and every direct call to
+-- `partition::maintain`, `ensure_partitions`, `drain_default`, or
+-- `disable_partitioning` against this shard by any other means. The
+-- read-only `status` and `plan` subcommands are exempt -- neither touches
+-- `harvest_events`. Only with both parts held does the convergence loop's
+-- zero-row check become exact rather than probabilistic, and only with both
+-- held does the table stay partitioned at all for the parent statement to be
+-- meaningful against.
 --
 -- For an operator who cannot take that config-and-restart round trip: the
 -- residual, unmitigated risk is that the parent statement performs a
