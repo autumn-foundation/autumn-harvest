@@ -785,7 +785,16 @@ COMMENTED_CODE_RE = re.compile(
       # `Foo::<u8>::bar()` instantiates the type and then names an
       # associated function. The old shape allowed one turbofish and only
       # at the end of the path, so the whole form was outside the gate.
-      | [\w\#]+(?:::[\w\#]+|::<{NOSP}*>)*(?:\.[\w\#]+(?:::<{NOSP}*>)?)*
+      # {ROOT} because a call may start at the crate root, and a QUALIFIED
+      # path because `<Foo as Bar>::baz()` names a trait method through the
+      # type. The root prefix was here until round one hundred and
+      # twenty-four rebuilt this path for turbofish segments and dropped the
+      # `:` the old leading class carried -- a regression of my own, and it
+      # survived because the form had no fixture. Round one hundred and nine
+      # verified it BY HAND in a review reply and never wrote one. A shape
+      # proved in prose is a shape the next rewrite may break.
+      | (?:{ROOT}|<[^<>;]*>::)
+            [\w\#]+(?:::[\w\#]+|::<{NOSP}*>)*(?:\.[\w\#]+(?:::<{NOSP}*>)?)*
             \(.*\)(?:\s*\?|\s*\.await\s*\??)*\s*;\s*$
     )""".replace("{VIS}", VISIBILITY).replace("{WHERE}", WHERE).replace(
         "{BODY}", BODY
@@ -6224,6 +6233,21 @@ RULE_TESTS = [
         "// self.foo::<u8>();\n",
         {("CH001", 1)},
         "as well as after a method segment",
+    ),
+    (
+        "// ::std::mem::drop(value);\n",
+        {("CH001", 1)},
+        "a call may start at the crate root, and had no fixture until now",
+    ),
+    (
+        "// <Foo as Bar>::baz();\n",
+        {("CH001", 1)},
+        "and may name a trait method through a qualified path",
+    ),
+    (
+        "// <b>bold</b> text here;\n",
+        set(),
+        "but a tag is not a qualified path",
     ),
     (
         '// #[doc = include_str!("../README.md")]\n',

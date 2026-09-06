@@ -3759,3 +3759,28 @@ instantiated and then an associated function is named. rustc accepts it.
 
 Corpus effect: none, at 19311. Four fixtures, two of them refusals. Both
 new scans are linear, measured at 2000, 4000 and 8000.
+
+Round 125 -- a regression of my own, and the reason nothing caught it.
+
+`// ::std::mem::drop(value);` produced no CH001. It reported on 285bb93
+and stopped on 94bfcbb: round one hundred and twenty-four rebuilt this
+path to admit turbofish segments and dropped the `:` that the old leading
+class had carried.
+
+The useful part is why it survived. Round one hundred and nine checked
+this exact form BY HAND, found it already reported, put it in a table in
+a review reply as evidence, and wrote no fixture for it. A shape proved
+in prose is a shape the next rewrite may break silently -- the corpus
+diff cannot see it, because the corpus holds no commented-out root-
+qualified call. It has a fixture now.
+
+Every other call shape was checked against both heads rather than
+assumed: fifteen forms, one regressed, one gained (the turbofish that
+round intended), thirteen unchanged.
+
+That sweep also turned up a form missed by BOTH heads and never reported:
+`// <Foo as Bar>::baz();` names a trait method through a qualified path,
+and rustc accepts it. Added, with `// <b>bold</b> text here;` as the
+refusal that keeps a tag from reading as one.
+
+Corpus effect: none, at 19311. Three fixtures.
