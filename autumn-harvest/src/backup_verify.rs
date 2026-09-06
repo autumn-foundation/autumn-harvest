@@ -492,10 +492,15 @@ impl Finding {
     /// The replay sampler caps each class's sample vector as it accumulates,
     /// independently of this constructor, while `count` keeps growing past
     /// that cap. Comparing pre-clip length alone would miss exactly that
-    /// case and report `false` on a genuinely partial enumeration. A caller
-    /// with even more information -- a `LIMIT`ed query whose truncation this
-    /// constructor cannot see at all -- still overrides via
-    /// [`Self::with_truncated`].
+    /// case and report `false` on a genuinely partial enumeration.
+    ///
+    /// A finding with NO samples at all is never inferred as truncated. A
+    /// detail-only finding such as [`FindingClass::RestorePointSkew`] uses
+    /// `count: 1` and `samples: vec![]`. It names one condition by `detail`,
+    /// not an unlisted population, so `count` there is not a row total to
+    /// truncate against. A caller with even more information -- a
+    /// `LIMIT`ed query whose truncation this constructor cannot see at all
+    /// -- still overrides via [`Self::with_truncated`].
     #[must_use]
     pub fn new(
         class: FindingClass,
@@ -505,7 +510,7 @@ impl Finding {
     ) -> Self {
         let mut samples = samples;
         samples.truncate(MAX_FINDING_SAMPLES);
-        let truncated = count > samples.len() as u64;
+        let truncated = !samples.is_empty() && count > samples.len() as u64;
         Self {
             class,
             severity: class.severity(),
@@ -3472,6 +3477,23 @@ mod tests {
         assert!(
             f.truncated,
             "count (21) exceeding even a pre-clipped sample vector must still read truncated"
+        );
+    }
+
+    #[test]
+    fn a_detail_only_finding_with_no_samples_is_never_truncated() {
+        // Issue #1205's truncation fix, extended again. `RestorePointSkew`
+        // and similar findings name ONE condition via `detail`. They use
+        // `count: 1` and an empty `samples` vec by convention. `count` there
+        // is not a row total to compare against `samples.len()`.
+        // `count > samples.len()` alone reads that as `1 > 0`, wrongly
+        // truncated. `with_truncated(false)` cannot undo it, since the
+        // override now only ORs in.
+        let f = Finding::new(FindingClass::RestorePointSkew, None, 1, Vec::new())
+            .with_detail("newest-event timestamps differ by 90s across shards");
+        assert!(
+            !f.truncated,
+            "a detail-only finding names one condition, not an unlisted population: {f:#?}"
         );
     }
 
