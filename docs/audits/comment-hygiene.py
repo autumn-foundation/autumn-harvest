@@ -400,13 +400,23 @@ COMMENTED_CODE_RE = re.compile(
       # the visibility and the keyword where nothing could reach it. It
       # qualifies an impl too, below. rustc 1.94.1 takes it on those two
       # and on `fn`, which the function alternative already carries.
-      | {VIS}(?:unsafe\s+)?trait\s+(?:r\#)?\w+\s*(?:{GEN})?\s*{WHERE}(?:[;(]|{BODY})\s*$
-      | {VIS}(?:struct|enum|union)\s+(?:r\#)?\w+\s*(?:{GEN})?\s*{WHERE}(?:[;(]|{BODY})\s*$
+      # WHICH TERMINATOR each kind takes, from rustc 1.94.1 rather than
+      # from one shared set. Only a struct may end at `;` or `(`:
+      #
+      #   struct Foo;    OK          enum E;   expected `{}`, found `;`
+      #   struct Foo();  OK          trait T;  expected `{}`, found `;`
+      #                              union U;  expected `where` or `{`
+      #
+      # Sharing one set let `// trait object;` and `// enum value;` fail an
+      # absolute gate on two ordinary English words.
+      | {VIS}(?:unsafe\s+)?trait\s+(?:r\#)?\w+\s*(?:{GEN})?\s*{WHERE}{BODY}\s*$
+      | {VIS}struct\s+(?:r\#)?\w+\s*(?:{GEN})?\s*{WHERE}(?:[;(]|{BODY})\s*$
+      | {VIS}(?:enum|union)\s+(?:r\#)?\w+\s*(?:{GEN})?\s*{WHERE}{BODY}\s*$
       # A tuple struct, whose field list is on the line and terminated. Its
       # own alternative rather than a relaxation of the one above, which is
       # what this file's guidance asks for: the name is still anchored hard
       # against `struct`, and the line must end at the `;`.
-      | {VIS}(?:struct|union)\s+(?:r\#)?\w+\s*(?:{GEN})?
+      | {VIS}struct\s+(?:r\#)?\w+\s*(?:{GEN})?
             # The `;` of "[u8; 32]" is part of an array type, not the end of
             # the statement -- the same guard the uninitialized-binding rule
             # has carried since round forty-one, which this alternative was
@@ -431,7 +441,11 @@ COMMENTED_CODE_RE = re.compile(
       # `unsafe` for its own reasons. The complete `unsafe extern "C" {}`
       # did not match, because control flow ends its line at the brace.
       | (?:unsafe\s+)?extern(?:\s+{ABI_BLOCK})?\s*{BODY}\s*$
-      | {VIS}(?:const|static)\s+(?:mut\s+)?(?:r\#)?\w+\s*:{NOSE}+=.*[;{]\s*$
+      # The initializer takes the same prose guard the assignment and the
+      # bindings carry. Round one hundred and seventeen put it on those and
+      # not on this one, so `const timeout: duration = legacy default;`
+      # stayed inside an absolute gate.
+      | {VIS}(?:const|static)\s+(?:mut\s+)?(?:r\#)?\w+\s*:{NOSE}+={PROSE}.*[;{]\s*$
       # A type alias takes a `where` clause BEFORE its `=`, which is the
       # one item form round ninety-three did not reach. rustc 1.94.1
       # accepts it and warns that the clause is not enforced, which is a
@@ -635,7 +649,14 @@ COMMENTED_CODE_RE = re.compile(
       # The guard belongs where the other rules put it, on the WORDS. Three
       # bare words before the terminator are a sentence, which is the same
       # test the uninitialized binding and the declaration type carry.
-      | [\w.\[\]:\#]+\s*(?:[-+*/%&|^]|<<|>>)?=
+      # A dereferenced target. `*counter = counter + 1;` is an ordinary
+      # mutation and the class could not open on the star.
+      #
+      # The star must ABUT its target. A markdown bullet is `* ` with a
+      # space, and `strip_containers` has already taken a real bullet off
+      # this line, so requiring no space is belt and braces rather than the
+      # only guard -- but it costs nothing and it keeps emphasis out.
+      | (?:\*+(?=[\w(]))?[\w.\[\]:\#]+\s*(?:[-+*/%&|^]|<<|>>)?=
             {PROSE}\s*{NOS}+;\s*$
       # A commented-out statement. Anchored hard: the call must open at the
       # very start, so prose that merely names a function ("call cleanup()
@@ -5909,6 +5930,56 @@ RULE_TESTS = [
         "// let retries = count as usize;\n",
         {("CH001", 1)},
         "in a binding as well, from the same fragment",
+    ),
+    (
+        "// const timeout: duration = legacy default;\n",
+        set(),
+        "an initializer is an expression, and two bare words are not one",
+    ),
+    (
+        "// const TIMEOUT: Duration = Duration::from_secs(5);\n",
+        {("CH001", 1)},
+        "though a real initializer still reports",
+    ),
+    (
+        "// trait object;\n",
+        set(),
+        "rustc answers \"expected {}\" for a trait that ends at a semicolon",
+    ),
+    (
+        "// enum value;\n",
+        set(),
+        "and for an enum",
+    ),
+    (
+        "// union type;\n",
+        set(),
+        "and a union wants where or a brace",
+    ),
+    (
+        "// struct Foo;\n",
+        {("CH001", 1)},
+        "but a unit struct really does end at one",
+    ),
+    (
+        "// struct Foo(u8, u8);\n",
+        {("CH001", 1)},
+        "as does a tuple struct, which only a struct may be",
+    ),
+    (
+        "// *counter = counter + 1;\n",
+        {("CH001", 1)},
+        "an assignment may go through a dereference",
+    ),
+    (
+        "// *self.count += 1;\n",
+        {("CH001", 1)},
+        "compounded, and through a field",
+    ),
+    (
+        "// * the queue drains = the worker parks;\n",
+        set(),
+        "but a bullet is not a dereference, because the star must abut",
     ),
     (
         '// #[doc = include_str!("../README.md")]\n',

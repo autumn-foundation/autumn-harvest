@@ -3585,3 +3585,33 @@ the ratchet still passes -- 4889 in changed files against 4891 at the
 merge base.
 
 Eight fixtures.
+
+Round 118 -- two more Tier A false positives, one of them the other half
+of last round's fix.
+
+`// const timeout: duration = legacy default;` failed the build. Round
+one hundred and seventeen gave the prose guard to the assignment and the
+bindings and not to the initialized const, which is the same shape with a
+keyword in front. It carries the fragment now.
+
+`// trait object;` and `// enum value;` failed it too. One terminator set
+was shared by four item kinds, and rustc 1.94.1 gives each a different
+answer:
+
+    struct Foo;    OK          enum E;   expected `{}`, found `;`
+    struct Foo();  OK          trait T;  expected `{}`, found `;`
+                               union U;  expected `where` or `{`
+
+Only a struct ends at `;` or `(`. The kinds are separate alternatives
+now, and the tuple form is a struct alone, because `union U(u8);` is not
+Rust either. Two ordinary English words were failing an absolute gate.
+
+`// *counter = counter + 1;` produced no CH001. The target class could
+not open on a star. The star must ABUT its target, so a markdown bullet
+does not reach the rule -- `strip_containers` has already removed a real
+bullet by then, and this is the cheaper second line.
+
+The self-test caught a regression on the way: making the star required
+rather than optional broke every plain assignment, six fixtures at once.
+
+Corpus effect: none, at 19311.
