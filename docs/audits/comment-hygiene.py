@@ -347,7 +347,13 @@ ENDS_SENTENCE_RE = re.compile(r"(?<!e\.g)(?<!E\.g)(?<!i\.e)(?<!I\.e)[.!?][\"')\]
 # its own SENTENCE, so a reference in the next one is no more its own than a
 # reference in the previous one -- which is the bound round sixty-three put
 # on the left and round eighty-two put on the wrapped carry.
-SENTENCE_END_RE = re.compile(r"(?<!e\.g)(?<!E\.g)(?<!i\.e)(?<!I\.e)[.!?]")
+# A sentence end is punctuation followed by SPACE or the end of the text,
+# which is what `SENTENCE_SPLIT_RE` requires and this pattern was derived
+# from it without: "foo.rs" and "v1.2" carry a period inside a token, and
+# cutting there truncated the search before a reference that follows.
+SENTENCE_END_RE = re.compile(
+    r"(?<!e\.g)(?<!E\.g)(?<!i\.e)(?<!I\.e)[.!?](?=[\s\"')\]]|$)"
+)
 # A reference that ABUTS the marker on its left. Anchored at the end, and
 # opened either at the bound or at a clause separator, so "See #123 for the
 # parser. TODO: x" is still untracked while "#123 - TODO: x" is not.
@@ -4604,6 +4610,21 @@ RULE_TESTS = [
         "// TODO: add retries. See #123 for parser.\n",
         {("CH002", 1)},
         "a reference in the next sentence is not the marker's own",
+    ),
+    (
+        "// TODO: update foo.rs per #123\n",
+        set(),
+        "but a period inside a token ends no sentence",
+    ),
+    (
+        "// TODO: support v1.2 under #123\n",
+        set(),
+        "nor one inside a version",
+    ),
+    (
+        "// TODO: fix this e.g. per #123\n",
+        set(),
+        "nor one closing an abbreviation",
     ),
 ]
 

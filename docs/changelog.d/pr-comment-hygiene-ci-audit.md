@@ -2576,3 +2576,34 @@ already had. A bound and a reach are the same edge from two sides.
 Corpus effect: none. Four fixtures -- the prose that must not report,
 `continue 'outer;` and `break normally;` which must, and the
 same-line borrowed reference.
+
+### Round eighty-four — derived from a pattern, minus the part that mattered
+
+One finding, a Tier A false positive, in the bound round eighty-three
+added. `SENTENCE_END_RE` matched any `.`, so `TODO: update foo.rs per
+#123` ended its sentence inside a filename and the search stopped before
+the reference. `v1.2` does the same.
+
+A sentence end is punctuation followed by SPACE or the end of the text.
+`SENTENCE_SPLIT_RE` has always required that -- the new pattern was
+derived from it and dropped exactly the clause that distinguishes a
+sentence end from a period. The abbreviation lookbehinds came across;
+the separator did not.
+
+Four rounds running the finding has been in the previous round's fix,
+and all four are one function's notion of what a marker owns:
+
+- 81 gave it a new dimension and dropped a bound;
+- 82 added the bound to one of two searches;
+- 83 applied it to both, with a pattern missing a clause;
+- 84 restores the clause.
+
+The pattern to watch is not carelessness in any one step. It is that
+each fix was written from the FINDING rather than from the rule, so each
+one repaired the reported symptom and left the neighbouring case for the
+next round. Writing down what a marker owns -- its own sentence, from
+its own start, wherever that sentence runs -- would have produced all
+four at once.
+
+Corpus effect: none. Three fixtures: a filename, a version, and an
+abbreviation.
