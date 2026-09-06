@@ -238,13 +238,20 @@ the GitHub MCP tools exposed here still have no cache-usage or cache-listing
 method). Candidate remedies for whoever has that access, updated:
 
 1. **Confirm total bytes and eviction frequency first** (unchanged ask).
-2. If confirmed capacity-bound: **concentrate saves rather than spreading
-   them** — e.g. designate one canonical job per OS per job-family (or even
-   per OS across families, if `target/` layouts overlap enough) as the only
-   `save-if: true` writer, with the rest restore-only. This is a different,
-   more targeted shape than "narrow scope," which this report now has
-   evidence against. Still new CI-config policy, still routed rather than
-   shipped, for the same "ask before: caching services" reason as yesterday.
+2. If confirmed capacity-bound: **consolidate entries across job families**
+   — e.g. one shared cache key across `test-nodb`, `test-db-linux`, `test`,
+   and `lint` for a given OS, if their `target/` layouts overlap enough,
+   reducing the number of distinct persisted entries below the current ~19
+   (a Codex review comment on this PR correctly flagged that doing this
+   *within* a family — e.g. a designated canonical shard for `test-nodb` —
+   is not this fix: `ci.yml:411-417`'s shared shard-key already limits each
+   family to one persisted entry per OS per run via the reserve-race this
+   report observed directly; a canonical writer would stop the other three
+   shards from wastefully attempting a save that was always going to fail,
+   which is worth doing for its own sake, but it doesn't reduce stored bytes
+   or relieve capacity pressure, so it isn't a capacity remedy on its own).
+   Still new CI-config policy, still routed rather than shipped, for the
+   same "ask before: caching services" reason as yesterday.
 3. Or accept the cost and pay for GitHub's larger cache tier (explicit new
    spend — ask before, as always).
 4. Branch protection: same unresolved ask as the 09-04/09-05 reports, now
