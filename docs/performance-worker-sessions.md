@@ -217,8 +217,14 @@ this page. Three mechanisms compose it, and this pass does not attribute the
 delta across them individually.
 
 First, `worker-session` issues twice as many statements per row: an
-`INSERT` plus an `UPDATE`. Each is its own round trip and its own WAL
-record, against `no-session`'s single `INSERT`.
+`INSERT` plus an `UPDATE`, against `no-session`'s single `INSERT`. Each
+statement generates its own buffer touches and its own WAL record. This
+harness measures that nested-statement cost through
+`pg_stat_statements.shared_blks_hit` inside one server-side `CALL`, not
+through client/server round trips -- the extra round trip production pays
+for the separate `INSERT` and `UPDATE` (`queue::enqueue()` issues them as
+two client calls) is a real production cost this page does not measure or
+attribute to (review round 12).
 
 Second, the `UPDATE` itself creates a second MVCC tuple version for every
 row.
@@ -367,6 +373,15 @@ only) -- this pass did not separately measure CPU cost.
   that varies one mechanism at a time (for example, an `UPDATE` that
   touches `sticky_worker_id` against one that does not), which this pass
   did not run.
+- **The `+185.5%` figure measures buffer touches, not the extra network
+  round trip production pays for the separate `INSERT` and `UPDATE`.** A
+  review finding (round 12) correctly noted that the seeding harness runs
+  both statements inside one server-side `CALL`, so
+  `pg_stat_statements.shared_blks_hit` captures their nested buffer and WAL
+  cost but not client/server round-trip latency. `queue::enqueue()` issues
+  the `INSERT` and `UPDATE` as two separate client calls in production, so
+  that round trip is a real cost this page does not measure or attribute
+  to.
 - **Every seeded row gets its own, unique `session_id`; production sessions
   can group several member activities under one shared `session_id`.** A
   review finding (round 7) correctly noted that a session with N member
