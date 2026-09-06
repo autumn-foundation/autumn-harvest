@@ -4623,7 +4623,8 @@ pub fn format_backup_verify_text(report: &RestoreVerifyReport) -> String {
             replay.skipped_no_handler,
             replay.unreadable
         );
-    } else if replay.unreadable > 0 && (replay.clean > 0 || replay.divergent > 0 || replay.failed > 0)
+    } else if replay.unreadable > 0
+        && (replay.clean > 0 || replay.divergent > 0 || replay.failed > 0)
     {
         // Distinct from the "nothing replayed" branch below. Some histories
         // DID replay here, but at least one selected for replay was never

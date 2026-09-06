@@ -3439,8 +3439,8 @@ mod tests {
         // the returned rows. It passes that via `with_truncated`. The
         // override must never turn an already-derived `true` back to `false`.
         let many: Vec<String> = (0..30).map(|i| i.to_string()).collect();
-        let f = Finding::new(FindingClass::ChildExecutionMissing, None, 30, many)
-            .with_truncated(false);
+        let f =
+            Finding::new(FindingClass::ChildExecutionMissing, None, 30, many).with_truncated(false);
         assert!(
             f.truncated,
             "with_truncated(false) must not clear a derived truncation"
