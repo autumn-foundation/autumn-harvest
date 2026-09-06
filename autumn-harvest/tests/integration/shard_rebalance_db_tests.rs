@@ -2807,3 +2807,67 @@ async fn a_resume_sweep_finishes_healthy_records_past_one_unreachable_target() {
     );
     assert_eq!(authoritative_shards(&shards, exec_id).await, vec![TARGET]);
 }
+
+// ── Issue #1317, Codex round 2: reopening a migration must not inherit a
+// stale hold-verification marker from a prior settled attempt ─────────────
+
+#[tokio::test]
+async fn reopening_a_settled_migration_clears_the_stale_hold_marker() {
+    // A settled (DONE or ABORTED) row can be reused by a later migration for
+    // the same execution_id -- e.g. after A -> B -> A, a second A -> B. If
+    // `begin_migration`'s reset left `legal_hold_verified` at whatever a
+    // PRIOR attempt last set it to, an old-code `verify_target_copy` on the
+    // NEW attempt (one that predates this column and never touches it) could
+    // leave a stale `TRUE` in place without having checked anything for this
+    // attempt, and the cutover guard would trust a check that never
+    // happened. `begin_migration` must clear both hold-verification columns
+    // whenever it reopens a row, exactly as it already clears
+    // `verified_fingerprint`.
+    let shards = setup_two_shards().await;
+    let exec_id = quiescent_fixture(&shards, "reopen-clears-hold-marker").await;
+    let mut source = shards.source().await;
+
+    // Simulate a settled row left over from a prior attempt that DID verify a
+    // hold, standing in for the general case of any stale prior verification.
+    diesel::sql_query(
+        "INSERT INTO harvest_shard_migrations \
+             (execution_id, source_shard, target_shard, phase, \
+              legal_hold_verified, verified_legal_hold_set_at) \
+         VALUES ($1, $2, $3, 'DONE', TRUE, NULL)",
+    )
+    .bind::<diesel::sql_types::Uuid, _>(exec_id.as_uuid())
+    .bind::<diesel::sql_types::Integer, _>(SOURCE.as_i32())
+    .bind::<diesel::sql_types::Integer, _>(TARGET.as_i32())
+    .execute(&mut source)
+    .await
+    .expect("seed a settled record with a stale hold marker");
+
+    begin_migration(&mut source, exec_id, SOURCE, TARGET)
+        .await
+        .expect("reopen the settled record");
+
+    #[derive(diesel::QueryableByName)]
+    struct HoldMarkerRow {
+        #[diesel(sql_type = diesel::sql_types::Bool)]
+        legal_hold_verified: bool,
+        #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Timestamptz>)]
+        verified_legal_hold_set_at: Option<chrono::DateTime<Utc>>,
+    }
+    let row: HoldMarkerRow = diesel::sql_query(
+        "SELECT legal_hold_verified, verified_legal_hold_set_at \
+           FROM harvest_shard_migrations WHERE execution_id = $1",
+    )
+    .bind::<diesel::sql_types::Uuid, _>(exec_id.as_uuid())
+    .get_result(&mut source)
+    .await
+    .expect("load the reopened record");
+
+    assert!(
+        !row.legal_hold_verified,
+        "reopening a settled migration must clear the stale verification flag"
+    );
+    assert_eq!(
+        row.verified_legal_hold_set_at, None,
+        "reopening a settled migration must clear the stale hold stamp"
+    );
+}

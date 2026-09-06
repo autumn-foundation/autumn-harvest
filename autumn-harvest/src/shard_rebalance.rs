@@ -1035,6 +1035,13 @@ mod db {
     /// is reset to `PENDING`, so a run that failed verification once can be
     /// retried without operator surgery.
     ///
+    /// Every field a fresh `verify_target_copy` will re-stamp must be reset
+    /// here alongside the phase (issue #1317, Codex round 2). A reopened row
+    /// that kept a stale `legal_hold_verified = TRUE` from a PRIOR settled
+    /// attempt could let an old-code verify on the reopened attempt leave the
+    /// flag true without re-checking anything, and a later cutover would
+    /// then trust a check that never happened for THIS attempt.
+    ///
     /// # Errors
     ///
     /// [`HarvestError::AlreadyExists`] when a migration for this execution is
@@ -1053,6 +1060,7 @@ mod db {
                  SET phase = 'PENDING', target_shard = EXCLUDED.target_shard, \
                      source_shard = EXCLUDED.source_shard, verified_fingerprint = NULL, \
                      abort_reason = NULL, attempts = 0, last_error = NULL, \
+                     verified_legal_hold_set_at = NULL, legal_hold_verified = FALSE, \
                      updated_at = NOW() \
                  WHERE harvest_shard_migrations.phase IN ('DONE', 'ABORTED') \
              RETURNING {MIGRATION_COLUMNS}"
