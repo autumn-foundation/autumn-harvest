@@ -12357,13 +12357,8 @@ mod tests {
         // The tag must instead point `url=` at the flash-free target the
         // caller supplies.
         let body = html! { p { "test" } };
-        let html = layout_dead_letters(
-            "Test",
-            &body,
-            Some(30),
-            "../ui/dead-letters?limit=50",
-        )
-        .into_string();
+        let html = layout_dead_letters("Test", &body, Some(30), "../ui/dead-letters?limit=50")
+            .into_string();
         assert!(
             html.contains(r#"content="30; url=../ui/dead-letters?limit=50""#),
             "refresh tag must target the flash-free URL: {html}"
