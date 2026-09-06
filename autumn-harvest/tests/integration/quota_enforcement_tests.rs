@@ -73,7 +73,7 @@ use autumn_harvest::dlq::{NewDeadLetterEntry, dead_letter};
 use autumn_harvest::error::{HarvestError, HarvestResult, PayloadKind};
 use autumn_harvest::event::WorkflowEvent;
 use autumn_harvest::execution::{StartWorkflowParams, start_or_load_workflow_execution};
-use autumn_harvest::info::WorkflowHandlerFn;
+use autumn_harvest::info::{ActivityHandlerFn, ActivityInfo, WorkflowHandlerFn};
 use autumn_harvest::models::{
     CompletionTriggerOutboxDb, NewCompletionTriggerOutboxDb, WorkflowExecution,
 };
@@ -86,7 +86,7 @@ use autumn_harvest::types::{
     WorkflowIdReusePolicy,
 };
 use autumn_harvest::worker::HandlerRegistry;
-use autumn_harvest::{WorkflowContext, WorkflowInfo};
+use autumn_harvest::{ActivityContext, WorkflowContext, WorkflowInfo};
 use diesel::prelude::*;
 use diesel_async::{AsyncConnection, AsyncPgConnection, RunQueryDsl};
 use uuid::Uuid;
@@ -837,6 +837,31 @@ fn wf_info(name: &'static str, handler: WorkflowHandlerFn) -> WorkflowInfo {
         output_schema: None,
         error_schema: None,
         retry_policy: None,
+    }
+}
+
+fn act_info(name: &'static str, handler: ActivityHandlerFn) -> ActivityInfo {
+    ActivityInfo {
+        name,
+        module: "quota_enforcement_tests",
+        default_retry_policy: None,
+        default_start_to_close: None,
+        default_heartbeat_timeout: None,
+        default_schedule_to_start: None,
+        default_schedule_to_close: None,
+        default_queue: Some("default"),
+        max_concurrent: None,
+        concurrency_key: None,
+        rate_limit_rps: None,
+        rate_limit_burst: None,
+        rate_limit_key: None,
+        rate_limit_key_expr: None,
+        circuit_breaker: None,
+        is_local: false,
+        max_input_bytes: None,
+        max_result_bytes: None,
+        requires: None,
+        handler,
     }
 }
 
@@ -1857,6 +1882,161 @@ async fn child_timeout_race_spawn_quota_check_excludes_its_own_just_appended_his
         "the race child must be created on the first attempt despite \
          max_history_bytes(1) -- its own start events must not count \
          against the admission deciding whether to allow it"
+    );
+}
+
+fn mixed_batch_quota_noop_activity(
+    _ctx: &ActivityContext,
+    _input: serde_json::Value,
+) -> Pin<Box<dyn std::future::Future<Output = Result<serde_json::Value, String>> + Send>> {
+    Box::pin(async move { Ok(serde_json::json!({"noop": true})) })
+}
+
+fn mixed_batch_quota_parent<'a>(
+    ctx: &'a WorkflowContext,
+    input: serde_json::Value,
+) -> Pin<Box<dyn std::future::Future<Output = Result<serde_json::Value, String>> + Send + 'a>> {
+    Box::pin(async move {
+        let child_type = input["child_type"]
+            .as_str()
+            .expect("input.child_type must be present")
+            .to_string();
+        // "activity x child" -- neither `extract_child_timeout_race` (child +
+        // TIMER only) nor `extract_all_started_child_workflows` (every
+        // command must be a child start) matches this shape, so it falls
+        // through to `extract_mixed_suspension_batch` ->
+        // `persist_mixed_suspension_batch` (issue #950), the third
+        // `QuotaExceeded` catch site issue #1227's initial fix missed.
+        let winner = ctx
+            .race()
+            .activity_raw(
+                "mixed_batch_quota_noop_activity",
+                serde_json::json!({}),
+                "default",
+            )
+            .label("work")
+            .child_workflow_raw(&child_type, serde_json::json!({"tenant_id": "acme"}))
+            .label("child")
+            .run()
+            .await
+            .map_err(|e| e.to_string())?;
+        Ok(serde_json::json!({"label": winner.label}))
+    })
+}
+
+fn mixed_batch_quota_child<'a>(
+    _ctx: &'a WorkflowContext,
+    _input: serde_json::Value,
+) -> Pin<Box<dyn std::future::Future<Output = Result<serde_json::Value, String>> + Send + 'a>> {
+    Box::pin(async move { Ok(serde_json::json!("mixed_child_done")) })
+}
+
+/// Issue #1227 follow-up sweep: a THIRD `worker.rs` `QuotaExceeded` catch
+/// site (`persist_mixed_suspension_batch`, reached for a heterogeneous
+/// "activity x child" suspension batch -- issue #950) had the identical
+/// park-then-immediately-wake hot-spin bug as the two sites the issue itself
+/// named, but was missed by the initial fix because its own comment called it
+/// a "mirror" of those two without anyone checking it was actually routed
+/// through the shared backoff helper.
+#[tokio::test]
+async fn mixed_batch_child_spawn_honors_target_quota_parks_parent_then_succeeds() {
+    let (url, _c) = setup_test_database_url_or_env().await;
+    let mut conn = connect(&url).await;
+
+    let parent_wf_name = leaked("quota_mixed_batch_parent");
+    let child_wf_name = leaked("quota_mixed_batch_child");
+
+    let child_quota_policy = QuotaPolicy::new("tenant_id").with_max_active_executions(1);
+    let mut child_info = wf_info(child_wf_name, mixed_batch_quota_child);
+    child_info.quota = Some(child_quota_policy);
+
+    // Occupy the ONE `max_active_executions` slot for key "acme" -- see the
+    // detached-spawn test above for why the `MetadataGuard` install and the
+    // task-row deletion are both required for a correct blocker.
+    let blocker_guard = MetadataGuard::install_one(child_wf_name, child_quota_policy).await;
+    let blocker = start_root(
+        &mut conn,
+        child_wf_name,
+        &format!("blocker-{}", Uuid::new_v4().simple()),
+        serde_json::json!({"tenant_id": "acme"}),
+    )
+    .await;
+    drop(blocker_guard);
+    diesel::sql_query("DELETE FROM harvest_task_queue WHERE workflow_exec_id = $1")
+        .bind::<diesel::sql_types::Uuid, _>(blocker.as_uuid())
+        .execute(&mut conn)
+        .await
+        .expect("delete blocker task row");
+
+    let parent = start_root(
+        &mut conn,
+        parent_wf_name,
+        &format!("parent-{}", Uuid::new_v4().simple()),
+        serde_json::json!({"child_type": child_wf_name}),
+    )
+    .await;
+    let parent_pre_worker_scheduled_at = task_queue_state(&mut conn, parent).await.scheduled_at;
+
+    let reg = Arc::new(HandlerRegistry::new(
+        vec![
+            wf_info(parent_wf_name, mixed_batch_quota_parent),
+            child_info,
+        ],
+        vec![act_info(
+            "mixed_batch_quota_noop_activity",
+            mixed_batch_quota_noop_activity,
+        )],
+    ));
+    let worker = build_runtime_worker("w-1227-mixed-batch-quota", 2, 1, reg);
+    let handle = spawn_test_worker(Arc::clone(&worker), build_test_pool(&url));
+
+    // While the blocker still holds the quota slot, `persist_mixed_suspension_batch`'s
+    // attempt to start the child is rejected with `QuotaExceeded`, and the
+    // WHOLE transaction (including the co-batched activity dispatch) rolls
+    // back -- so the parent never even reaches a parked-on-branch-completion
+    // state; it stays exactly where it started, with the decision cycle
+    // retried on every subsequent poll.
+    tokio::time::sleep(std::time::Duration::from_millis(600)).await;
+
+    let child_row_count_sql =
+        "SELECT COUNT(*)::BIGINT AS n FROM harvest_workflow_executions WHERE workflow_name = $1";
+
+    assert_eq!(
+        load_execution(&mut conn, parent).await.state,
+        "RUNNING",
+        "parent must stay RUNNING (parked/retrying) rather than terminally \
+         failing over the child target's quota"
+    );
+    assert_eq!(
+        count_rows(&mut conn, child_row_count_sql, &[child_wf_name]).await,
+        1, // only the blocker
+        "no child row should exist while the target quota is at cap"
+    );
+
+    // The regression check: a completed retry cycle's `scheduled_at` must sit
+    // in the future, not be immediately claimable -- the hot-spin bug's exact
+    // opposite.
+    let (retried_scheduled_at, observed_now) =
+        task_scheduled_at_after_a_retry_cycle(&mut conn, parent, parent_pre_worker_scheduled_at)
+            .await;
+    assert!(
+        retried_scheduled_at > observed_now,
+        "a QuotaExceeded catch that hot-spins (park + immediate wake) never \
+         advances scheduled_at into the future; the bounded-backoff requeue \
+         must"
+    );
+
+    // Free the quota slot.
+    mark_terminal(&mut conn, blocker, "CANCELLED").await;
+
+    wait_for_execution_state(&url, parent, "COMPLETED").await;
+    worker.shutdown();
+    handle.await.expect("worker join");
+
+    assert_eq!(
+        count_rows(&mut conn, child_row_count_sql, &[child_wf_name]).await,
+        2, // the (now-cancelled) blocker + the newly-created child
+        "exactly one child should exist once quota capacity freed up"
     );
 }
 

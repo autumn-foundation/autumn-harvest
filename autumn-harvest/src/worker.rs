@@ -11452,31 +11452,17 @@ async fn persist_mixed_suspension_batch(
         Ok(v) => v,
         // A target tenant's quota is an ADMISSION constraint on an unrelated
         // key, never a genuine failure of THIS parent. The whole transaction
-        // above rolled back (no child rows, no timer rows, no events), so park
-        // and immediately wake the parent: a later poll re-drives the identical
-        // decision cycle from the unchanged recorded history and retries once
-        // the target tenant has capacity. Mirrors the two child persist paths
-        // (issue #946).
-        Err(HarvestError::QuotaExceeded {
-            workflow_name,
-            key,
-            resource,
-            limit,
-            current,
-        }) => {
-            tracing::warn!(
-                parent_execution_id = %exec_id,
-                workflow_name = %workflow_name,
-                quota_key = %key,
-                resource = %resource,
-                limit,
-                current,
-                "quota exceeded spawning a child workflow from a mixed suspension \
-                 batch; parking the parent task to retry once capacity frees up \
-                 rather than failing the parent over an unrelated tenant's quota",
-            );
-            queue::park_workflow_task(conn, task_id, sticky).await?;
-            queue::wake_workflow_task(conn, exec_id).await?;
+        // above rolled back (no child rows, no timer rows, no events).
+        //
+        // Issue #1227 (follow-up sweep after the original fix, which named
+        // only the two OTHER child-persist paths as "mirrored" here): a park
+        // immediately followed by an unconditional wake is the same
+        // zero-delay retry loop those two paths were rewritten to avoid, so
+        // this third site gets the identical fix -- route through
+        // `recover_from_child_quota_exceeded`'s bounded jittered backoff
+        // rather than re-implementing the anti-pattern.
+        Err(error @ HarvestError::QuotaExceeded { .. }) => {
+            recover_from_child_quota_exceeded(conn, task_id, exec_id, &error).await?;
             return Ok(());
         }
         Err(e) => return Err(e),

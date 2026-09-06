@@ -18,9 +18,16 @@ local-child fan-out path) and `persist_child_timeout_race` (the
 `recover_from_child_quota_exceeded`'s own doc comment already names and was
 built to prevent, but these two sites weren't routed through it. Both now call
 that shared helper, which uses `queue::requeue_for_retry` with a bounded
-jittered backoff (`QUOTA_RETRY_BACKOFF_MIN`/`MAX`, 500ms-3s) instead. This
-brings the file's four `QuotaExceeded`-on-child-spawn catch sites to a single
-shared recovery path.
+jittered backoff (`QUOTA_RETRY_BACKOFF_MIN`/`MAX`, 500ms-3s) instead.
+
+**A third worker.rs site, found by a post-fix sweep.** A code-review pass
+after the initial fix re-audited every `QuotaExceeded` catch in the crate and
+found `persist_mixed_suspension_batch` (the heterogeneous "activity × child",
+"child × signal", etc. suspension-batch path, issue #950) had the identical
+park-then-immediately-wake defect — its own comment called it a "mirror" of
+Findings 1 & 2 without that mirroring ever having been implemented. Fixed the
+same way. This brings the file's five `QuotaExceeded`-on-child-spawn catch
+sites to a single shared recovery path.
 
 **Finding 3 (P2) — `autumn-harvest/src/debounce.rs`.** The quota-blocked fire
 retry wrote `effective_fire_at = LEAST(now() + 5s, max_fire_at)`. Once
@@ -67,19 +74,23 @@ restored:
   `max_fire_at == now` boundary).
 - `autumn-harvest/tests/integration/quota_enforcement_tests.rs`: new
   assertions on the two existing
-  `..._honors_target_quota_parks_parent_then_succeeds` tests (Findings 1 & 2)
-  proving a completed retry cycle's `harvest_task_queue.scheduled_at` lands in
-  the future rather than at/before the pre-worker value — the zero-delay
-  hot-spin's exact opposite, sampled only once the row settles `PENDING` after
-  moving off its pre-worker `scheduled_at` to rule out a read landing mid-claim
-  or before the worker's first poll. New test
+  `..._honors_target_quota_parks_parent_then_succeeds` tests (Findings 1 & 2),
+  plus a new `mixed_batch_child_spawn_honors_target_quota_parks_parent_then_succeeds`
+  test for the third `persist_mixed_suspension_batch` site (an "activity ×
+  child" `ctx.race()` composition), proving a completed retry cycle's
+  `harvest_task_queue.scheduled_at` lands in the future rather than at/before
+  the pre-worker value — the zero-delay hot-spin's exact opposite, sampled
+  only once the row settles `PENDING` after moving off its pre-worker
+  `scheduled_at` to rule out a read landing mid-claim or before the worker's
+  first poll. New test
   `quota_blocked_outbox_row_gets_backoff_and_does_not_starve_a_sibling_row`
-  (Finding 4): a quota-blocked row and an unrelated free-target row inserted
-  into the outbox together — the free row is delivered on the very first scan
-  regardless of the blocked row sharing the batch; the blocked row is left
-  claimable with `next_attempt_at` stamped into the future; an immediate
-  second scan leaves that timestamp unchanged (excluded from the claim, not
-  reprocessed); forcing the backoff into the past and freeing the quota then
-  delivers it on the next scan.
+  (Finding 4): 60 quota-blocked rows (exceeding the claim query's `LIMIT 50`)
+  plus one unrelated free-target row inserted into the outbox — the free row
+  is unreachable in the first batch (proving the batch really is dominated),
+  then delivered once the backoff filter excludes the blocked rows from a
+  later scan; an immediate rescan of a still-backed-off row leaves its
+  `next_attempt_at` unchanged (excluded, not reprocessed); forcing the
+  backoff into the past and freeing the quota then delivers it on the next
+  scan.
 
 No `WorkflowEvent` variant, no data migration, no replay impact.
