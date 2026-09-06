@@ -401,16 +401,23 @@ TODO_RE = re.compile(
 # now a token boundary and a scheme's case. Only WHERE a reference may sit
 # differs between them now, which it genuinely does.
 #
-# A scheme is CASE-INSENSITIVE, by RFC 3986 and by every browser. An issue
-# number ends where the number ends: `#123abc` and `#1_000` are not issue
-# numbers with something after them, they are not issue numbers.
+# A scheme is CASE-INSENSITIVE, by RFC 3986 and by every browser. It also
+# STARTS where a scheme may start: `nothttps://example.com` holds the
+# letters of one without being one, and RFC 3986 gives the character set a
+# scheme is written in, so a scheme character in front of it means the
+# token is something else.
+#
+# An issue number ends where the number ends: `#123abc` and `#1_000` are
+# not issue numbers with something after them, they are not issue numbers.
+# It needs no guard in FRONT, because `owner/repo#123` is a real
+# cross-repository reference and the tracker renders it as one.
 # An IPv6 literal is a host only when its bracket CLOSES. `https://[` is an
 # opening bracket, and the tail cannot close it because a `]` ends the
 # citation form. So the two host shapes are spelled apart.
 REFERENCE = (
     r"(?:"
     r"#[1-9]\d*(?!\w)"
-    r"|(?i:https?)://(?:\[[0-9A-Fa-f:.]+\]|\w)[^)\]\s]*"
+    r"|(?<![A-Za-z0-9+.\-])(?i:https?)://(?:\[[0-9A-Fa-f:.]+\]|\w)[^)\]\s]*"
     r")"
 )
 TODO_REF_RE = re.compile(REFERENCE)
@@ -4647,6 +4654,16 @@ RULE_TESTS = [
         "// TODO: see https://x.test/i/9\n",
         set(),
         "but a URL with a destination does",
+    ),
+    (
+        "// TODO: remove fallback under nothttps://example.com/123\n",
+        {("CH002", 1)},
+        "and a scheme starts where a scheme may start",
+    ),
+    (
+        "// TODO: see - https://x.test/i/9\n",
+        set(),
+        "which a separator before it does not prevent",
     ),
     (
         "// TODO: add retries #0\n",

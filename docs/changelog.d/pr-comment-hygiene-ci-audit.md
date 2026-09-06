@@ -3084,3 +3084,28 @@ the grammar. Entries are only needed for forms a capital may follow, so
 
 Corpus effect: none. Every CH001 and CH002 fixture from rounds sixty-three
 to ninety-nine was re-run unchanged. Four new fixtures.
+
+### Round one hundred and one — a scheme starts where a scheme may start
+
+One finding. `// TODO: remove fallback under nothttps://example.com/123`
+passed the absolute gate: `https://` sat inside a larger token, and
+`REFERENCE` bounded the scheme's end but not its beginning.
+
+RFC 3986 gives the character set a scheme is written in, so a scheme
+character in front of `https` means the token is a different scheme, not
+this one. That is the same shape as round ninety-six's boundary after an
+issue number, read from the other side -- and the edge rule again: a
+token has two ends and a bound on one is not a bound on the other.
+
+The issue-number half needs no guard in front, and that asymmetry is
+deliberate rather than an oversight: `owner/repo#123` is a real
+cross-repository reference and the tracker renders it as one.
+
+The adjacent form already rejected the malformed token, because its
+left-hand anchor requires a clause separator before the reference. That
+is the third time a disagreement between the three positions has surfaced
+only when a finding named one of them, and the definition they now share
+is what makes the fix reach all three.
+
+Corpus effect: none. Two fixtures, one of them a counter-case for a
+hyphen that is a separator rather than a scheme character.
