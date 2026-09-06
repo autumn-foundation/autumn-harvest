@@ -38,7 +38,7 @@ yesterday's report and one didn't:
   later PR runs all restored against — and still wasn't there 9-14 hours on
   (§4).
 
-**Correction record for this PR (`#1395`):** fourteen separate Codex review
+**Correction record for this PR (`#1395`):** sixteen separate Codex review
 comments caught real problems in earlier drafts of this report:
 
 1–2. Two methodology errors in §4's cache-eviction comparison (a same-run
@@ -81,6 +81,15 @@ exposes current entries, not eviction history, so a query today can't
 retroactively distinguish that from a silent finalize failure; settling it
 needs checking a *future* save immediately after it runs and polling
 forward, not a single query against this one.
+14. A third recurrence of the same definitive "survived"/"didn't survive"
+framing (per item 11), this time in the Treatment section's own opening
+sentence — fixed to match the conditional wording used everywhere else.
+15. One claim that the cache-usage API "requires admin-scoped auth" —
+`GET /repos/{owner}/{repo}/actions/caches` needs only read-level `Actions`
+permission per GitHub's docs, not admin access. This also violated this
+repo's own `AGENTS.md:5-8`, which says not to diagnose a connector/tooling
+gap as an auth problem — the actual limitation is that the GitHub MCP tools
+available to this session simply have no method exposing this endpoint.
 
 All are fixed below, in place, with the retractions left visible rather
 than edited away.
@@ -318,14 +327,25 @@ is consistent with, not independent of, this finding.
 Same reasoning as the 09-05 report, sharpened by the §4 cross-run evidence:
 **"narrow the cache scope per job" (already done for `test-nodb`/
 `test-db-linux` via shared shard keys) demonstrably isn't sufficient on its
-own** — a correctly-keyed, error-free save still didn't survive to the next
-run. What's left still needs the same thing the 09-05 report
-couldn't get: **actual cache-usage bytes and eviction frequency**, which
-requires either the Settings → Actions →
-Caches UI or `gh api repos/autumn-foundation/autumn-harvest/actions/caches`
-with admin-scoped auth — neither available to this session (checked again;
-the GitHub MCP tools exposed here still have no cache-usage or cache-listing
-method). Candidate remedies for whoever has that access, updated:
+own** — a correctly-keyed, error-free save's later restores all missed (a
+Codex review comment on this PR caught this sentence reintroducing the
+"survived"/"didn't survive" framing the Diagnosis and §4 sections were
+already corrected to avoid — restated here to match: the save raised no
+error, and three later restores against its exact key found nothing; that a
+cache entry existed and was subsequently lost is the reading consistent
+with this, not a settled fact). What's left still needs the same thing the
+09-05 report couldn't get: **actual cache-usage bytes and eviction
+frequency**, which the `GET /repos/{owner}/{repo}/actions/caches` endpoint
+can provide — and, per GitHub's own docs, needs only read-level `Actions`
+permission, not admin access (a Codex review comment on this PR caught an
+earlier draft overstating this as "admin-scoped auth," which both
+misdescribes GitHub's actual permission model and is exactly the "diagnose
+a tooling gap as an auth/token problem" mistake `AGENTS.md:5-8` says not to
+make in this repo). The real limitation is narrower and more accurate: the
+GitHub MCP tools exposed to this session have no cache-usage or
+cache-listing method at all — a tool-surface gap, not a permissions one.
+Candidate remedies for whoever has a tool that exposes this endpoint,
+updated:
 
 1. **Confirm total bytes and eviction frequency first** (unchanged ask).
 2. If confirmed capacity-bound, two earlier drafts of this remedy each
@@ -421,7 +441,12 @@ grep -n "Restore Key:\|Cache Key:\|Restoring cache\|No cache found\|Saving cache
   logs/*"no-db, windows"*.txt
 ```
 
-Cache-usage confirmation: still not run in this session, still no tool access
-(checked again today — same gap as the 09-05 report). A repo admin can confirm
-via Settings → Actions → Caches, or
-`gh api repos/autumn-foundation/autumn-harvest/actions/caches --paginate`.
+Cache-usage confirmation: still not run in this session — the GitHub MCP
+tools available here have no cache-usage or cache-listing method (a tool-
+surface gap, not a permissions one: `GET /repos/{owner}/{repo}/actions/caches`
+needs only read-level `Actions` permission per GitHub's docs, not admin
+access, per a Codex review comment on this PR correcting an earlier draft's
+"admin-scoped auth" claim). Anyone with a tool exposing it, or Settings →
+Actions → Caches in the UI, or `gh api
+repos/autumn-foundation/autumn-harvest/actions/caches --paginate` with a
+token carrying that scope, can confirm.
