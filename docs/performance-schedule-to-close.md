@@ -673,11 +673,14 @@ seeding methodology** -- the two labels seeded independently-random
 larger percentages for both figures.** That earlier revision's own
 artifacts are no longer committed (this repro script overwrites the same
 canonical filenames every run), so this page does not cite the pre-fix
-numbers or draw a magnitude conclusion from the comparison: the only
-still-auditable evidence that the confound mattered is the
-[100,000-row plan choice](#100000-row-plan-choice) section's plan flip,
-which is structural (which plan each label chose), not a percentage drawn
-from overwritten artifacts. The two rechecks' own relative
+numbers or draw a magnitude conclusion from the comparison. The
+[100,000-row plan choice](#100000-row-plan-choice) section's plan flip is
+the one still-auditable, structural fact from the recapture (which plan
+each label chose), but -- as that section explains -- it does not, by
+itself, establish that the seeding fix caused it: populating
+`schedule_to_close_at` changes the planner's own row-count estimate for
+the same candidate scan, and `ANALYZE` sampling can independently flip a
+planner choice this close between any two runs. The two rechecks' own relative
 increase (+113%) is markedly larger than the main query's. This page
 cannot explain either number with confidence: no `EXPLAIN` was captured for either recheck
 statement, only the aggregate `pg_stat_statements` counters above, so there
