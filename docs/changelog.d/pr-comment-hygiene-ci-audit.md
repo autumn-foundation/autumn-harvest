@@ -2197,3 +2197,34 @@ the same pattern family produced the same class of gap.
 Corpus effect: none. Six fixtures: three tracked forms that must stay
 silent, one earlier-clause reference that must still report, and the two
 raw bindings.
+
+### Round seventy-two — the third round running on the previous round's fix
+
+Two findings, both defects in round seventy-one, which was itself two
+defects in rounds sixty-three and seventy.
+
+**One reference tracks one marker.** Round seventy-one let a marker
+claim a reference abutting it on the left, and bounded that lookbehind
+at the previous marker's END -- which is inside the region the previous
+marker's own FORWARD search already covers. So in
+`TODO: #123; TODO: add retries` the second marker borrowed the first
+one's reference and passed. Each marker now records the reference it
+consumes, and a borrowed one is refused. A DIFFERENT reference in the
+same span still counts, so `TODO(#1): a; #2 - TODO: b` keeps both
+markers tracked.
+
+**A raw identifier inside a grouped use tree.** Rounds seventy and
+seventy-one gave the optional `r#` to eleven identifier positions and
+left the brace group's character class, which does not admit `#` at all.
+`pub use inner::{r#type};` compiles and was outside the gate.
+
+Three rounds running the finding has been in the previous round's fix,
+and the second one here is the fourth instance of the same enumeration
+gap. "Grep for the position" was the right instruction and was applied
+to the positions that look like identifiers; a character class holding
+identifier characters is that position too, written in a different
+notation. The reliable form of the rule is to enumerate by CONSTRUCT
+across the whole pattern -- every place a name can be spelled -- rather
+than by the shape of the syntax that spells it.
+
+Corpus effect: none. Two fixtures, one for each.

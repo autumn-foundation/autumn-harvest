@@ -298,7 +298,7 @@ COMMENTED_CODE_RE = re.compile(
       # and `pub(crate) use crate::x;` are the forms this tree actually
       # writes, and neither could reach the rule.
       | (?:pub(?:\((?:in\s+)?[\w:]+\))?\s+)?
-            use\s+(?:(?:r\#)?\w+::)*(?:(?:r\#)?\w+|\*|\{[\w:,\s*]+\})
+            use\s+(?:(?:r\#)?\w+::)*(?:(?:r\#)?\w+|\*|\{[\w:,\s*\#]+\})
             (?:\s+as\s+(?:r\#)?\w+)?;\s*$
       | \#!?\[[\w:()"'=,./\s-]+\]\s*$
       | \}[,;)]*\s*$
@@ -333,7 +333,7 @@ TODO_REF_RE = re.compile(r"#\d+|https?://")
 # parser. TODO: x" is still untracked while "#123 - TODO: x" is not.
 ADJACENT_REF_RE = re.compile(
     r"(?:^|[;.,(\[])[\s\-\u2010-\u2015:]*"
-    r"(?:#\d+|https?://\S+)"
+    r"(#\d+|https?://\S+)"
     r"[\s\-\u2010-\u2015:;,]*$"
 )
 
@@ -353,10 +353,14 @@ def untracked_marker(text: str) -> bool:
     belongs to something else.
     """
     marks = list(TODO_RE.finditer(text))
+    claimed = -1
     for index, mark in enumerate(marks):
         start = mark.start()
         end = marks[index + 1].start() if index + 1 < len(marks) else len(text)
-        if TODO_REF_RE.search(text, start, end):
+        forward = TODO_REF_RE.search(text, start, end)
+        if forward:
+            # What this marker consumes, so the next one cannot reuse it.
+            claimed = forward.start()
             continue
         # Backwards as well as forwards. "#123 - TODO: remove the fallback"
         # is a tracked commitment written the other way round, and reading
@@ -364,7 +368,13 @@ def untracked_marker(text: str) -> bool:
         # marker: separators between the two and nothing else, so a
         # reference from an earlier clause still does not stand in for one.
         lower = marks[index - 1].end() if index else 0
-        if ADJACENT_REF_RE.search(text[lower:start]):
+        adjacent = ADJACENT_REF_RE.search(text[lower:start])
+        # ONE reference tracks ONE marker. The previous marker's forward
+        # search reaches into this same text, so "TODO: #123; TODO: x" let
+        # the second marker borrow the first one's reference and pass an
+        # absolute gate. Refuse the borrowed one; a DIFFERENT reference in
+        # the same span -- "TODO(#1): a; #2 - TODO: b" -- still counts.
+        if adjacent and lower + adjacent.start(1) != claimed:
             continue
         return True
     return False
@@ -4129,6 +4139,16 @@ RULE_TESTS = [
         "// let r#match: usize;\n",
         {("CH001", 1)},
         "with or without an initializer",
+    ),
+    (
+        "// TODO: #123; TODO: add retries\n",
+        {("CH002", 1)},
+        "one reference tracks one marker, never the next one too",
+    ),
+    (
+        "// pub use inner::{r#type};\n",
+        {("CH001", 1)},
+        "a raw identifier inside a grouped use tree",
     ),
 ]
 
