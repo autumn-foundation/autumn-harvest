@@ -2607,3 +2607,34 @@ four at once.
 
 Corpus effect: none. Three fixtures: a filename, a version, and an
 abbreviation.
+
+### Round eighty-five — the fifth finding, so the rule instead of the edge
+
+`// TODO: add retries. (#123)` failed the build. The sentence bound cut
+the marker's range at the period, and the reference sits after it.
+
+That is the fifth consecutive finding in one notion, so this round
+writes the notion down instead of the edge. Two functions now hold it:
+
+- `sentence_end` answers where one sentence ends, and a bracketed
+  citation attached to that end is part of it;
+- `marker_span` answers what one marker owns, from its own start to its
+  own sentence end or the next marker, whichever comes first.
+
+`untracked_marker` reads that one span. The wrapped-line carry no longer
+decides anything: it supplies the rest of the comment, and `marker_span`
+cuts it back. `ENDS_SENTENCE_RE` is gone -- it was a second answer to
+the question `SENTENCE_END_RE` already answers, and the round eighty-two
+and eighty-three findings were both that duplication.
+
+The carry keeps its other bounds, which are not about sentences: a block
+edge, a fence, a blank line, and the next marker. That last one stops a
+marker on a later line being reported twice, once on its own line and
+once through the carry.
+
+A wrapped citation now works as well, so a period at the end of one line
+and `(#123)` on the next is one tracked commitment.
+
+Corpus effect: none. Five fixtures: a citation in round brackets, one in
+square brackets, one on the line below, a following sentence that is not
+a citation, and a citation cut off by the next marker.

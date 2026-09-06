@@ -337,22 +337,18 @@ TODO_RE = re.compile(
     r"^(?:TODO|FIXME|XXX|HACK)\b|\b(?:TODO|FIXME|XXX|HACK)\s*[:(]", re.IGNORECASE
 )
 TODO_REF_RE = re.compile(r"#\d+|https?://")
-# Terminal punctuation, with the abbreviation guards `SENTENCE_SPLIT_RE`
-# carries. A wrapped reference belongs to the marker's own sentence, so the
-# carry stops where that sentence does -- otherwise "TODO: add retries." and
-# "See #123 for parser." on the line below became one tracked commitment,
-# which is the borrowing round sixty-three exists to refuse.
-ENDS_SENTENCE_RE = re.compile(r"(?<!e\.g)(?<!E\.g)(?<!i\.e)(?<!I\.e)[.!?][\"')\]]*$")
-# The same boundary, found anywhere rather than at the end. A marker owns
-# its own SENTENCE, so a reference in the next one is no more its own than a
-# reference in the previous one -- which is the bound round sixty-three put
-# on the left and round eighty-two put on the wrapped carry.
-# A sentence end is punctuation followed by SPACE or the end of the text,
-# which is what `SENTENCE_SPLIT_RE` requires and this pattern was derived
-# from it without: "foo.rs" and "v1.2" carry a period inside a token, and
-# cutting there truncated the search before a reference that follows.
+# A sentence boundary: terminal punctuation followed by a space or the end
+# of the text, with the abbreviation guards `SENTENCE_SPLIT_RE` carries. The
+# space matters -- "foo.rs" and "v1.2" carry a period inside a token, and
+# cutting there ends a sentence in the middle of a word.
 SENTENCE_END_RE = re.compile(
     r"(?<!e\.g)(?<!E\.g)(?<!i\.e)(?<!I\.e)[.!?](?=[\s\"')\]]|$)"
+)
+# A bracketed citation attached to the end of a sentence, as in "TODO: add
+# retries. (#123)". A citation is part of the sentence it cites, so that
+# sentence ends after the citation, not at the period in front of it.
+TRAILING_REF_RE = re.compile(
+    r"[ \t]*[(\[][^)\]]*(?:#\d+|https?://[^)\]\s]+)[^)\]]*[)\]]"
 )
 # A reference that ABUTS the marker on its left. Anchored at the end, and
 # opened either at the bound or at a clause separator, so "See #123 for the
@@ -362,6 +358,39 @@ ADJACENT_REF_RE = re.compile(
     r"(#\d+|https?://\S+)"
     r"[\s\-\u2010-\u2015:;,]*$"
 )
+
+
+def sentence_end(text: str, lower: int, limit: int) -> int:
+    """Where the sentence that starts at `lower` ends, or -1 if it does not.
+
+    A sentence ends at terminal punctuation, and then at a bracketed
+    citation attached to it: "add retries. (#123)" is one sentence with a
+    reference, not a sentence and then a fragment. `limit` bounds the
+    answer, so a sentence never reaches past what the caller owns.
+    """
+    stop = SENTENCE_END_RE.search(text, lower, limit)
+    if not stop:
+        return -1
+    end = stop.end()
+    citation = TRAILING_REF_RE.match(text, end, limit)
+    if citation:
+        end = citation.end()
+    return min(end, limit)
+
+
+def marker_span(text: str, marks: list[re.Match], index: int) -> tuple[int, int]:
+    """The text one marker OWNS: its own start, through its own sentence.
+
+    One rule, in one place, because four rounds of review found four edges
+    of it separately. A marker owns from its own start to the end of its
+    own sentence, or to the next marker, whichever comes first. Where the
+    sentence ends is `sentence_end`; where the claim stops regardless is
+    the next marker, whose own reference is its own.
+    """
+    start = marks[index].start()
+    limit = marks[index + 1].start() if index + 1 < len(marks) else len(text)
+    end = sentence_end(text, marks[index].end(), limit)
+    return start, limit if end < 0 else end
 
 
 def untracked_marker(text: str) -> bool:
@@ -380,12 +409,8 @@ def untracked_marker(text: str) -> bool:
     """
     marks = list(TODO_RE.finditer(text))
     claimed = -1
-    for index, mark in enumerate(marks):
-        start = mark.start()
-        end = marks[index + 1].start() if index + 1 < len(marks) else len(text)
-        stop = SENTENCE_END_RE.search(text, mark.end(), end)
-        if stop:
-            end = stop.end()
+    for index in range(len(marks)):
+        start, end = marker_span(text, marks, index)
         forward = TODO_REF_RE.search(text, start, end)
         if forward:
             # What this marker consumes, so the next one cannot reuse it.
@@ -2291,25 +2316,27 @@ def check_line_rules(path: str, pieces: list[Piece]) -> list[Finding]:
         spanless.extend(flush_block(block, block_cells))
         # A marker's own text may WRAP. "TODO: implement the retry described
         # in" over "#123" is one tracked commitment, and reading the first
-        # line alone failed the build on it. The continuation stops at the
-        # first line that is not more of the same sentence: a block boundary,
-        # a fenced line, a blank line, or another marker -- that last one
-        # because the reference past it belongs to THAT marker, which is
-        # round seventy-two's rule seen from the other end.
+        # line alone failed the build on it. The carry supplies the rest of
+        # the comment and decides nothing: `marker_span` cuts that text back
+        # to the sentence the marker owns, so the sentence is measured in
+        # one place whether it wraps or not.
+        #
+        # The carry stops where the text stops being the same comment: a
+        # block boundary, a fenced line, a blank line, or another marker.
+        # That last bound is not about sentences either. A marker on a later
+        # line is reported on ITS line, so carrying past one reports it
+        # twice.
         base = len(follow)
-        for offset, (_, _, in_fence, opens, _) in enumerate(run_lines):
+        for offset in range(len(run_lines)):
             carried: list[str] = []
-            if not ENDS_SENTENCE_RE.search(spanless[base + offset].strip()):
-                for probe in range(offset + 1, len(run_lines)):
-                    _, _, probe_fence, probe_opens, _ = run_lines[probe]
-                    if probe_fence or probe_opens:
-                        break
-                    text = spanless[base + probe].strip()
-                    if not text or TODO_RE.search(text):
-                        break
-                    carried.append(text)
-                    if ENDS_SENTENCE_RE.search(text):
-                        break
+            for probe in range(offset + 1, len(run_lines)):
+                _, _, probe_fence, probe_opens, _ = run_lines[probe]
+                if probe_fence or probe_opens:
+                    break
+                text = spanless[base + probe].strip()
+                if not text or TODO_RE.search(text):
+                    break
+                carried.append(text)
             follow.append(" " + " ".join(carried) if carried else "")
     for index, (lineno, body, in_fence, _, _) in enumerate(lines):
         if in_fence:
@@ -4234,6 +4261,31 @@ RULE_TESTS = [
         "// TODO: add retries (#123)\n",
         set(),
         "a marker's own reference may follow it",
+    ),
+    (
+        "// TODO: add retries. (#123)\n",
+        set(),
+        "a citation after the period belongs to the sentence it cites",
+    ),
+    (
+        "// TODO: add retries. [#123]\n",
+        set(),
+        "in square brackets as well as round",
+    ),
+    (
+        "// TODO: add retries.\n// (#123)\n",
+        set(),
+        "and on the line below, because a sentence may wrap",
+    ),
+    (
+        "// TODO: add retries. See #123 for the parser.\n",
+        {("CH002", 1)},
+        "but a following SENTENCE is not a citation",
+    ),
+    (
+        "// TODO: add retries. (#123) TODO: use them\n",
+        {("CH002", 1)},
+        "and a citation stops where the next marker starts",
     ),
     (
         "// TODO(#1): a; TODO(#2): b\n",
