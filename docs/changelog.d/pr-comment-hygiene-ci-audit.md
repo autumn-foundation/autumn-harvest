@@ -2067,3 +2067,25 @@ beside `ratchet_reporting_test`: the same current and baseline, gated
 both ways, one non-empty and one empty.
 
 Corpus effect: none.
+
+### Round sixty-eight — an ABI name is not a word
+
+One finding. CH001's signature pattern spelled the ABI string as `"\w+"`,
+so `extern "C-unwind" fn stale() {` was outside the absolute gate.
+`C-unwind` and its siblings are stable Rust, and rustc 1.94.1 in this
+container compiles them, so this is an ordinary form of commented-out
+FFI that the gate simply did not see.
+
+The sibling in the same matcher, not reported: the ABI string may be
+absent altogether. A bare `extern fn` means `extern "C" fn`, compiles
+today (with a deprecation warning), and was missed for the same reason.
+The quantifier is optional now as well as hyphen-bearing.
+
+The counter-case is the one that matters, because CH001 is absolute and
+a false positive fails the build on a legitimate comment: prose that
+merely NAMES an ABI is prose. The pattern is anchored, so
+`Use the extern "C-unwind" convention here.` cannot reach it, and a
+fixture pins that.
+
+Corpus effect: none, which is the expected answer -- no comment in this
+tree contains a commented-out FFI signature of any ABI.

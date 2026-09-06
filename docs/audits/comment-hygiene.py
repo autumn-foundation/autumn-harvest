@@ -234,7 +234,13 @@ _APOS = r"[\u2019']"
 # space, never the `(` a real signature requires.
 COMMENTED_CODE_RE = re.compile(
     r"""^(?:
-        (?:pub(?:\((?:in\s+)?[\w:]+\))?\s+)?(?:async\s+|unsafe\s+|const\s+|extern\s+"\w+"\s+)*
+        # The ABI name may carry a hyphen -- "C-unwind" and its siblings are
+        # stable, and rustc 1.94.1 compiles them -- and it may be absent
+        # altogether, since a bare `extern fn` means `extern "C" fn`. Both
+        # are ordinary FFI, and `\w+` alone left both outside an absolute
+        # gate.
+        (?:pub(?:\((?:in\s+)?[\w:]+\))?\s+)?
+        (?:async\s+|unsafe\s+|const\s+|extern\s+(?:"[\w-]+"\s+)?)*
             fn\s+\w+\s*(?:<[^<>]*>)?\s*\(
             (?:
                  .*\)\s*(?:->\s*[^;{]+?)?\s*[{;]   # complete: ends in { or ;
@@ -3952,6 +3958,21 @@ RULE_TESTS = [
         "/// Explain <code title=\"a>b\">TODO: add retry</code> here.\n",
         set(),
         "a quoted value may hold the bracket that would end the tag",
+    ),
+    (
+        "// extern \"C-unwind\" fn stale() {\n",
+        {("CH001", 1)},
+        "a hyphenated ABI is still a commented-out signature",
+    ),
+    (
+        "// extern fn stale() {\n",
+        {("CH001", 1)},
+        "and so is one with no ABI string at all",
+    ),
+    (
+        "// Use the extern \"C-unwind\" convention for the callback here.\n",
+        set(),
+        "but prose that names an ABI is prose",
     ),
 ]
 
