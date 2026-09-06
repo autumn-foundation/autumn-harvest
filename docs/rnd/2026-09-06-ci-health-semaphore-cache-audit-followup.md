@@ -8,23 +8,31 @@ data one day later, after two more CI-shaping merges landed in the interim
 and the cache-audit report's own commit `6133540`). Two things changed since
 yesterday's report and one didn't:
 
-- **Changed, for the better:** end-to-end PR wall time is now ~59–66 minutes,
+- **Changed, for the better:** full-workflow wall time is now ~59–66 minutes,
   down from the 123–177 minutes measured in the 2026-09-03/09-04 reports — a
   real, large win, credited to the `test-nodb` split, not to anything in this
-  report.
+  report. (Not necessarily *gating* time — see §1's caveat.)
 - **Changed, for the worse:** the `test-nodb` split added 3 more distinct
   persisted cache entries (one per OS — the job already uses a **shared cache
-  key across its 4 shards**, `ci.yml:411-417`, so this is 3 entries, not 12;
-  see §4, corrected twice from earlier drafts of this section after two
-  separate Codex review comments on this PR each caught a methodology error)
+  key across its 4 shards**, `ci.yml:411-417`, so this is 3 entries, not 12)
   on top of the ~19 already in `ci.yml`. Still the wrong direction for the
   fixed-10GB-cache-budget hypothesis the prior report raised, just a smaller
   wrong direction than this report originally claimed.
 - **Unchanged:** `Swatinem/rust-cache` still finds nothing to restore on every
-  sampled leg on every sampled run, including a cache this report can now show
-  *did* complete a real, verified-uploaded save on the shared base branch,
-  under a stable key three later PR runs all restored against — and still
-  wasn't there 9-14 hours on (§4).
+  sampled leg on every sampled run, including a save this report can show
+  raised no error anywhere in its path on the shared base branch, under a
+  stable key three later PR runs all restored against — and still wasn't
+  there 9-14 hours on (§4).
+
+**Correction record for this PR (`#1395`):** three separate Codex review
+comments caught real problems in earlier drafts of this report — two
+methodology errors in §4's cache-eviction comparison (a same-run comparison
+that couldn't show what was claimed, then a cross-PR-branch comparison
+GitHub's cache scoping rules make invalid), and one overclaim in §1 (calling
+full-workflow wall time "the number that actually gates a PR" while this
+report's own Verdict-path section leaves that unconfirmed). All three are
+fixed below, in place, with the retraction left visible rather than edited
+away.
 
 ## 🎯 Verdict path (unchanged)
 
@@ -49,10 +57,25 @@ report has no more access to that setting than the 09-04 report did.
 
 All three are full-matrix runs (`needs.changes.outputs.code == 'true'`), 34 jobs
 each. Compare against the pre-`test-nodb`-split baseline this role measured
-09-03/09-04: 123.8–177.0 min. That's a **~47–67% cut** on the number that
-actually gates a PR, comfortably clearing the ≥15% impact floor — via a fix
+09-03/09-04: 123.8–177.0 min. That's a **~47–67% cut** in full-workflow wall
+time — the same `created_at`→`updated_at` proxy the 09-04 report used for
+"time to green" — clearing the ≥15% impact floor on that measure, via a fix
 this role didn't ship (crediting `9ce7ce8` and the earlier `test-db-linux`
 split, `ba3abe1`/PR #1336).
+
+**Caveat, raised by a Codex review comment on this PR:** calling this "the
+number that actually gates a PR" (an earlier draft's wording) overclaims
+given the Verdict-path section's own unconfirmed branch-protection status —
+`test-nodb`'s 12 checks, including the very long-pole legs this table cites,
+are explicitly *not* required status checks per `ci.yml:384-390` unless a
+repo admin has since added them (still unconfirmed, same gap as the 09-04/
+09-05 reports). If they're not required, a PR could become mergeable before
+the full workflow — including the long-pole `test-nodb` shard — finishes,
+and the true gating-time reduction could be smaller than the full-workflow
+number above (though `test-db-linux`'s status is equally unconfirmed in the
+other direction, so this can't be resolved without the same branch-protection
+read this report already can't get). Retracted the stronger claim; reporting
+this as full-workflow completion time, not confirmed gating time.
 
 ### 2. New long pole: `Test (no-db, windows-latest, shard N)`, consistently, all three samples
 
@@ -133,9 +156,27 @@ shard 0 restores under `Restore Key`
 `v0-rust-test-nodb-windows-latest-Windows_NT-x64-8918a2f9` /
 **exact** `Cache Key: ...-78f0168d` — the identical exact key all three of
 today's PR runs restored against (§ table above) — gets `No cache found.` on
-restore, then **completes a real save**: `Sent 149848672 of 149848672
-(100.0%)` at 2026-09-05T18:04:43Z. A cache genuinely exists, at that moment,
-on the shared base branch, under the exact key.
+restore, then attempts a save: `Sent 149848672 of 149848672 (100.0%)` at
+2026-09-05T18:04:43Z, immediately followed by normal job cleanup with no
+error.
+
+**A third Codex review comment on this PR correctly notes** that `Sent ...
+(100.0%)` only confirms the archive *upload* completed, not that the cache
+service's separate commit/finalize step succeeded — that step can still fail
+after a 100%-complete transfer, especially under shared-key contention. This
+report can't inspect the cache-usage API to see the finalized entry directly
+(the same access gap noted throughout). What it can point to: the exact same
+job step, for the three sibling shards under this identical key, explicitly
+logs `Failed to save: Unable to reserve cache with key ...-78f0168d, another
+job may be creating this cache` the moment ANY part of the save fails — this
+run's winning shard shows no such message, or any other error, anywhere
+after `Saving cache ...`. That's evidence the whole save path (reserve,
+upload, and whatever commit step follows) raised nothing this tool's error
+path would have caught and logged, which is short of a positive "cache saved
+successfully" confirmation (this rust-cache/toolkit version doesn't appear
+to log one, checked in both this log and the 09-06 samples) but is stronger
+than upload-progress alone. Treating this as best-available, not certain,
+evidence that a cache existed under this key at this time.
 
 Every one of today's three PR runs restores against that same exact key,
 later, from a different branch that has trunk-dev as its base (so trunk-dev's
@@ -150,9 +191,10 @@ report `No cache found.`:
 
 This is the comparison the reviewer asked for — a cache saved on the default
 branch, checked against later runs — and it reproduces the same conclusion a
-third time, this time on solid ground: **a cache that genuinely, verifiably
-saved on the shared base branch, under the exact key three separate PR runs
-later restored against, was unavailable to all three within 9-14 hours.**
+third time, on markedly firmer ground than the two retracted drafts: **a
+cache save that raised no error anywhere in its path, on the shared base
+branch, under the exact key three separate PR runs later restored against,
+was unavailable to all three within 9-14 hours.**
 That's consistent with the 09-05 report's shared-10GB-repository-wide-budget
 hypothesis (fast enough turnover elsewhere evicting this entry before any PR
 got to use it) and not with a branch-scoping or key-configuration mistake —
@@ -169,13 +211,13 @@ a cache hit, not nondeterminism) and not a product bug (nothing about the
 execution engine is implicated; this is CI configuration). The `test-nodb`
 split — itself a good, already-landed, measured win — mechanically made the
 capacity problem this report is tracking somewhat bigger: it added 3 more
-distinct persisted cache entries (one per OS; the confirmed upload sizes seen
-in §4 range from 150MB on a docs-only trunk-dev push to 853MB on a full
+distinct persisted cache entries (one per OS; the error-free upload sizes
+seen in §4 range from 150MB on a docs-only trunk-dev push to 853MB on a full
 compile) contending for the same fixed cap, on the same day the 09-05
 report's hypothesis named that general mechanism as the likely cause. §4's
-cross-run evidence — a confirmed-complete save on the shared base branch,
-gone within 9-14 hours under the exact key three separate downstream PR runs
-restored against — is direct support for that hypothesis, not just
+cross-run evidence — an apparently error-free save on the shared base
+branch, gone within 9-14 hours under the exact key three separate downstream
+PR runs restored against — is direct support for that hypothesis, not just
 consistent with it. Windows paying the
 largest share of the miss's cost (longest per-family compile times to begin
 with, per every prior report in this series, now cache-cold on top of that)
@@ -186,8 +228,8 @@ is consistent with, not independent of, this finding.
 Same reasoning as the 09-05 report, sharpened by the §4 cross-run evidence:
 **"narrow the cache scope per job" (already done for `test-nodb`/
 `test-db-linux` via shared shard keys) demonstrably isn't sufficient on its
-own** — a confirmed, complete, correctly-keyed save still didn't survive to
-the next run. What's left still needs the same thing the 09-05 report
+own** — a correctly-keyed, error-free save still didn't survive to the next
+run. What's left still needs the same thing the 09-05 report
 couldn't get: **actual cache-usage bytes and eviction frequency**, which
 requires either the Settings → Actions →
 Caches UI or `gh api repos/autumn-foundation/autumn-harvest/actions/caches`
@@ -214,14 +256,15 @@ method). Candidate remedies for whoever has that access, updated:
 
 - **Before (09-03/09-04 reports' baseline):** 123.8–177.0 min end-to-end PR
   wall time, pre-`test-nodb`-split.
-- **After (this report, 3 fresh samples):** 58.9–66.5 min. **~47–67% reduction**,
-  clearing the ≥15% floor by a wide margin. Not this report's fix — crediting
-  `9ce7ce8` and PR #1336's `test-db-linux` split.
+- **After (this report, 3 fresh samples):** 58.9–66.5 min full-workflow wall
+  time (not confirmed gating time — see §1's caveat). **~47–67% reduction**,
+  clearing the ≥15% floor on that measure by a wide margin. Not this report's
+  fix — crediting `9ce7ce8` and PR #1336's `test-db-linux` split.
 - **Cache hit rate, cumulative across two independent report-days:** 0/9 sampled
   leg-runs found an exact-match cache; 1/10 total found a prefix-fallback hit
   (09-05 report, `windows-latest`, not reproduced today). Additionally: 3
   downstream PR runs (§4), on 3 different branches all based on `trunk-dev`,
-  each restoring against the exact key a confirmed-complete `trunk-dev`
+  each restoring against the exact key an apparently error-free `trunk-dev`
   base-branch save produced 9-14 hours earlier — 0/3 got a hit, exact or
   prefix-fallback. No revert check applies here — this is a report, not a
   fix, so there is nothing to verify went red-then-green; the "after"
