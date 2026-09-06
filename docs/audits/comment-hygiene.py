@@ -417,9 +417,18 @@ INLINE_CODE_RE = re.compile(r"<code\b[^>]*>.*?</code\s*>", re.I | re.S)
 
 def blank_inline_code(text: str) -> str:
     """`text` with each inline <code> element replaced by spaces."""
-    return INLINE_CODE_RE.sub(
-        lambda m: re.sub(r"[^\n]", " ", m.group(0)), text
-    )
+    return INLINE_CODE_RE.sub(lambda m: re.sub(r"[^\n]", " ", m.group(0)), text)
+
+
+def mask_inline_code(text: str) -> str:
+    """`text` with each inline <code> element replaced by filler.
+
+    Filler for finding sentence boundaries, spaces for matching, exactly as
+    the backtick spans beside it. A full stop inside "<code>foo. not sure
+    why</code>" is not a sentence end, and splitting there left a fragment
+    the narrative rule read as deliberation.
+    """
+    return INLINE_CODE_RE.sub(lambda m: re.sub(r"[^\n]", "x", m.group(0)), text)
 
 
 def blank_code_spans(text: str) -> str:
@@ -2213,7 +2222,10 @@ def check_prose_rules(path: str, pieces: list[Piece]) -> list[Finding]:
     """
     findings = []
     for _, unit, spans, doc in prose_units(pieces):
-        for offset, sentence in split_sentences(unit, mask_code_spans(unit)):
+        boundaries = mask_code_spans(unit)
+        if doc:
+            boundaries = mask_inline_code(boundaries)
+        for offset, sentence in split_sentences(unit, boundaries):
             sentence = sentence.strip()
             if not sentence:
                 continue
@@ -3589,6 +3601,16 @@ RULE_TESTS = [
         "// Parse the <code>not sure why</code> token literally.\n",
         {("CH003", 1)},
         "and characters in a // comment",
+    ),
+    (
+        "/// Parse the <code>foo. not sure why</code> token literally.\n",
+        set(),
+        "a period inside an inline <code> element ends no sentence",
+    ),
+    (
+        "// Parse the <code>foo. not sure why</code> token literally.\n",
+        {("CH003", 1)},
+        "and in a // comment it still does",
     ),
 ]
 

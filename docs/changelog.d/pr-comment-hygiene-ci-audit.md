@@ -1869,3 +1869,21 @@ phrase inside it is prose. `prose_units` carries the marker for that decision;
 one run has one marker, because `comment_runs` splits where it changes.
 
 Corpus effect: none.
+
+### Round sixty-one — the same fix, one function further along
+
+One finding, and it is round fifty-six's fix applied to round sixty's feature:
+sentence boundaries are found on a masked copy, and last round taught the
+*matching* pass about inline `<code>` without teaching the *boundary* pass.
+A full stop inside `<code>foo. not sure why</code>` split the sentence, and
+the fragment reached CH003 as deliberation.
+
+The pair now moves together, as the backtick spans beside them already do:
+mask to filler for finding boundaries, blank to spaces for matching. Two
+fixtures, and the `//` counter-case, where the phrase is genuine prose.
+
+Three rounds have now added a masking concept and forgotten one of its two
+uses — round fifty-six (spans, boundaries), round sixty (`<code>`, matching),
+round sixty-one (`<code>`, boundaries). The two operations sit next to each
+other in the file and are named for what they do; the failure is not knowing
+about them but not asking "and the other one?".
