@@ -526,7 +526,7 @@ mod ssrf_tests {
         }
     }
 
-    // 🪝 Snag: `is_ipv6_non_routable` only unwraps the IPv4-*mapped* form
+    // `is_ipv6_non_routable` only unwraps the IPv4-*mapped* form
     // (`::ffff:a.b.c.d`, RFC 4291 `::ffff:0:0/96`) via `to_ipv4_mapped()` before
     // checking `is_ipv4_non_routable`. The older IPv4-*compatible* form
     // (`::a.b.c.d`, the bare `::/96` prefix) encodes the exact same embedded
