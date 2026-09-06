@@ -1573,9 +1573,13 @@ def comment_lines(pieces: list[Piece]):
             # of both.
             if delimiter:
                 tail = line_tail(run, index)
+                # A backtick is forbidden in a BACKTICK fence's info string
+                # and nowhere else: "~~~rust `info`" is a valid opener, and
+                # rejecting it discarded the fence and reported its content.
+                backtick = delimiter[0].group(2).startswith("`")
                 if (
                     fence is not None and (tail.strip() or not piece.line_end)
-                ) or (fence is None and "`" in tail):
+                ) or (fence is None and backtick and "`" in tail):
                     delimiter = None
             if delimiter:
                 before = fence
@@ -1821,9 +1825,13 @@ def prose_units(pieces: list[Piece]) -> list[tuple[int, str]]:
             # of both.
             if delimiter:
                 tail = line_tail(block, index)
+                # A backtick is forbidden in a BACKTICK fence's info string
+                # and nowhere else: "~~~rust `info`" is a valid opener, and
+                # rejecting it discarded the fence and reported its content.
+                backtick = delimiter[0].group(2).startswith("`")
                 if (
                     fence is not None and (tail.strip() or not piece.line_end)
-                ) or (fence is None and "`" in tail):
+                ) or (fence is None and backtick and "`" in tail):
                     delimiter = None
             if delimiter:
                 before = fence
@@ -1893,10 +1901,32 @@ def prose_units(pieces: list[Piece]) -> list[tuple[int, str]]:
                 flush()
                 in_list = False
                 continue
+            # A Setext underline makes the run above it a heading's TITLE,
+            # not a sentence, so it is discarded rather than flushed. An ATX
+            # heading never reaches the run at all, and a 26-word title
+            # reported CH007 in one form and not the other.
+            #
+            # DOC COMMENTS ONLY, for the reason round forty-eight limited
+            # indented code: Rustdoc renders no `//` comment, and this tree
+            # closes a plain banner with a rule of hyphens. Sixty-six real
+            # sentences sat above one, and discarding them as heading titles
+            # stopped measuring prose that no renderer ever sees as a title.
+            if (
+                run
+                and piece.marker in DOC_MARKERS
+                and setext_underline(peeled, container)
+            ):
+                run, run_lines = [], []
+                in_list = False
+                continue
+            # Classified on the PEELED content, like the HTML test beside it.
+            # Rustdoc renders "- # text" as a heading inside the item, and
+            # reading the unpeeled line here let the list branch add the
+            # heading to the prose run as though it were a sentence.
             if (
                 in_table
-                or heading(body, container)
-                or SEPARATOR_RE.match(body)
+                or heading(peeled, container)
+                or SEPARATOR_RE.match(peeled)
                 or not body.strip()
             ):
                 flush()
@@ -3184,6 +3214,38 @@ RULE_TESTS = [
         "// TODO: fix the parser\n",
         {("CH002", 1)},
         "and a bare one is still a commitment",
+    ),
+    (
+        "/** ~~~rust /* note */ `info`\n"
+        " * TODO: fixture placeholder\n"
+        " * ~~~\n"
+        " */\n"
+        "pub struct C;\n",
+        set(),
+        "only a backtick fence forbids a backtick in its info string",
+    ),
+    (
+        "/** ```rust /* note */ `info`\n"
+        " * TODO: issue required\n"
+        " */\n"
+        "pub struct D;\n",
+        {("CH002", 2)},
+        "and a backtick fence still does",
+    ),
+    (
+        "/// - # word1 word2 word3 word4 word5 word6 word7 word8 word9 word10 word11 word12 word13 word14 word15 word16 word17 word18 word19 word20 word21 word22 word23 word24 word25 word26\n",
+        set(),
+        "a heading on a list-marker line is a heading",
+    ),
+    (
+        "/// word1 word2 word3 word4 word5 word6 word7 word8 word9 word10 word11 word12 word13 word14 word15 word16 word17 word18 word19 word20 word21 word22 word23 word24 word25 word26\n/// ===\n",
+        set(),
+        "a Setext title is a heading, not a sentence",
+    ),
+    (
+        "// word1 word2 word3 word4 word5 word6 word7 word8 word9 word10 word11 word12 word13 word14 word15 word16 word17 word18 word19 word20 word21 word22 word23 word24 word25 word26\n// ---------------------------\n",
+        {("CH007", 1)},
+        "but a banner rule in a // comment underlines nothing",
     ),
 ]
 

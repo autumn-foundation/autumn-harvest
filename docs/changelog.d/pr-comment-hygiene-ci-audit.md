@@ -1633,3 +1633,40 @@ gate.
 Corpus effect: 19887 to 19825, all CH007 — 275 merged sentences restated as
 213 correctly split ones. The ratchet recomputes both sides, so the gate stays
 clean.
+
+### Round fifty-two — three false positives, and the doc-marker limit again
+
+Three findings, all of them the audit reporting a defect on correct code, and
+all three fixed.
+
+**Only a backtick fence forbids a backtick in its info string.** Round
+forty-three's whole-line delimiter check applied that rule to every fence, so
+`~~~rust /* note */ `info`` was discarded as an invalid opener and the TODO
+inside the example reported CH002. CommonMark restricts the info string only
+for backtick fences, because a backtick there would be ambiguous with the
+delimiter itself; a tilde fence has no such problem.
+
+**A heading on a list-marker line is a heading.** Rustdoc renders `- # text`
+as an `<h2>` inside the item. The flush test read the unpeeled line, so the
+heading fell through to the list branch and its title was added to the prose
+run — a 26-word heading reported CH007. The test now classifies the peeled
+content, like the HTML test beside it.
+
+**A Setext title is a heading, not a sentence.** A long line followed by `===`
+renders as a heading, but the underline reached the separator branch, which
+*flushes* — emitting the accumulated title as a prose unit. An ATX heading
+never reaches the run at all, so the same title reported CH007 in one form and
+not the other. The run is now discarded rather than flushed.
+
+**And the same limit as round forty-eight, for the same reason.** The first
+cut of the Setext fix removed sixty-six real findings: this tree closes plain
+`//` banner comments with a rule of hyphens, and every paragraph above one was
+discarded as a heading title. Rustdoc renders no `//` comment, so nothing
+there underlines anything. The discard is limited to `///`, `//!`, `/**` and
+`/*!`, and a fixture pins the banner case.
+
+That is twice now that a correct Markdown rule, applied to every comment, has
+quietly stopped the tool measuring real prose — and twice the corpus diff was
+the only thing that noticed.
+
+Corpus effect: none, once limited.
