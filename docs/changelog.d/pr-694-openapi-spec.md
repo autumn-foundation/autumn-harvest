@@ -101,6 +101,15 @@ against routes reverse-engineered from prose.
   failed or orphaned update returns `409` with a body. Both are now declared.
 - The batch-operations dry run omitted `sample_cap`, which bounds the sample it
   returns beside it.
+- Nineteen statuses that handlers really return were declared nowhere: the ten
+  `207 Multi-Status` partial fan-outs (described in prose, never as a status),
+  the reset dry-run `200` and conflict `409`, the `503` a health check returns
+  when shard readiness is enforced, the `202` on cancel and DLQ replay, the
+  `422` rejections on start and update, and the `503` an admission gate
+  returns on the two with-start routes.
+- `operator_id` is a non-`Option` field with no serde default on
+  `POST /workflows/{id}/reset`, so axum rejects a body without it. The contract
+  called it optional.
 - Five alternate success responses said "same fields as the primary" in prose.
   They now carry the field list itself, so a generated client keeps
   `execution_id` on a reused start.
@@ -134,6 +143,12 @@ sorted line in `.github/ci/integration-suites.txt`. They assert:
   served endpoint returns exactly those bytes.
 - The route is nest-relative, so an embedding app that serves its own
   `/openapi.json` keeps it.
+
+`docs/audits/openapi-response-coverage.py` reads the handlers and the contract,
+and runs in the ungated `lint` job. It fails when a handler returns a status the
+contract does not declare, and when a request-body field that is mandatory on
+the wire is not marked required. It found the nineteen statuses above; both
+checks were confirmed to fail on a seeded gap before being wired in.
 
 Two new guards in `contract_regression.rs` read `src/api.rs` itself.
 `every_registered_route_is_in_the_canonical_list` parses the router and fails

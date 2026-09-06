@@ -131,7 +131,7 @@ Run it whenever `docs/api-contract.json` changes. CI fails otherwise.
 
 ## Guarantees
 
-Four checks hold the chain together:
+Five checks hold the chain together:
 
 1. `contract_regression::management_routes_match_contract` fails when
    `management_api_routes()` and the contract disagree. That function is the
@@ -142,9 +142,11 @@ Four checks hold the chain together:
    when either checked-in copy is stale, and
    `openapi_spec::served_endpoint_returns_the_document` fails when the endpoint
    serves anything else.
-4. The `lint` job validates `docs/openapi.json` with
-   `openapi-spec-validator`, and it runs on documentation-only pull requests
-   too.
+4. The `lint` job validates both copies with `openapi-spec-validator`, and it
+   runs on documentation-only pull requests too.
+5. `docs/audits/openapi-response-coverage.py`, also in `lint`, reads the
+   handlers: every status a handler returns must be declared, and every
+   request-body field that is mandatory on the wire must be marked required.
 
 ## Why the document is derived, not annotated
 

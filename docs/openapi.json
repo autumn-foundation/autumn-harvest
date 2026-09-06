@@ -756,6 +756,25 @@
             },
             "description": "Success."
           },
+          "207": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "properties": {
+                    "entry": {
+                      "description": "The declaration as written to the shards that answered."
+                    },
+                    "shard_errors": {
+                      "description": "One entry per shard the write or read could not reach, naming the shard and the reason.",
+                      "type": "array"
+                    }
+                  },
+                  "type": "object"
+                }
+              }
+            },
+            "description": "The fan-out reached only SOME shards. The body carries the result computed from the shards that answered, plus shard_errors naming the ones that did not, so the caller can retry or reconcile."
+          },
           "401": {
             "description": "Unauthenticated request."
           },
@@ -809,6 +828,26 @@
               }
             },
             "description": "Success."
+          },
+          "207": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "properties": {
+                    "revoked": {
+                      "description": "True when at least one answering shard held the row.",
+                      "type": "boolean"
+                    },
+                    "shard_errors": {
+                      "description": "One entry per shard the write or read could not reach, naming the shard and the reason.",
+                      "type": "array"
+                    }
+                  },
+                  "type": "object"
+                }
+              }
+            },
+            "description": "The fan-out reached only SOME shards. The body carries the result computed from the shards that answered, plus shard_errors naming the ones that did not, so the caller can retry or reconcile."
           },
           "401": {
             "description": "Unauthenticated request."
@@ -875,6 +914,25 @@
               }
             },
             "description": "Success."
+          },
+          "207": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "properties": {
+                    "policy": {
+                      "description": "The policy as written to the shards that answered."
+                    },
+                    "shard_errors": {
+                      "description": "One entry per shard the write or read could not reach, naming the shard and the reason.",
+                      "type": "array"
+                    }
+                  },
+                  "type": "object"
+                }
+              }
+            },
+            "description": "The fan-out reached only SOME shards. The body carries the result computed from the shards that answered, plus shard_errors naming the ones that did not, so the caller can retry or reconcile."
           },
           "401": {
             "description": "Unauthenticated request."
@@ -943,6 +1001,25 @@
             },
             "description": "Success."
           },
+          "207": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "properties": {
+                    "policy": {
+                      "description": "The ramp as written to the shards that answered."
+                    },
+                    "shard_errors": {
+                      "description": "One entry per shard the write or read could not reach, naming the shard and the reason.",
+                      "type": "array"
+                    }
+                  },
+                  "type": "object"
+                }
+              }
+            },
+            "description": "The fan-out reached only SOME shards. The body carries the result computed from the shards that answered, plus shard_errors naming the ones that did not, so the caller can retry or reconcile."
+          },
           "400": {
             "description": "queue_name/target_build_id empty, or ramp_percent outside 0..=100."
           },
@@ -1000,6 +1077,25 @@
               }
             },
             "description": "Success."
+          },
+          "207": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "properties": {
+                    "policy": {
+                      "description": "The last policy seen before the clear."
+                    },
+                    "shard_errors": {
+                      "description": "One entry per shard the write or read could not reach, naming the shard and the reason.",
+                      "type": "array"
+                    }
+                  },
+                  "type": "object"
+                }
+              }
+            },
+            "description": "The fan-out reached only SOME shards. The body carries the result computed from the shards that answered, plus shard_errors naming the ones that did not, so the caller can retry or reconcile."
           },
           "401": {
             "description": "Unauthenticated request."
@@ -2553,6 +2649,25 @@
             },
             "description": "A clear reaching only SOME readable shards returns 207 Multi-Status with body { \"override\": <the same fields as the 200 body>, \"shard_errors\": [\"shard {id}: {error}\", ...] }. The override REMAINS ACTIVE (unless independently expired) on the shards named in shard_errors -- the clear did not reach them -- so a subsequent read/dispatch there can still observe the overridden rate; re-issue the request (it is idempotent). A fully applied clear returns plain 200 and omits shard_errors, with override_active: false."
           },
+          "207": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "properties": {
+                    "override": {
+                      "description": "The pacing as it stands on the shards that answered."
+                    },
+                    "shard_errors": {
+                      "description": "One entry per shard the write or read could not reach, naming the shard and the reason.",
+                      "type": "array"
+                    }
+                  },
+                  "type": "object"
+                }
+              }
+            },
+            "description": "The fan-out reached only SOME shards. The body carries the result computed from the shards that answered, plus shard_errors naming the ones that did not, so the caller can retry or reconcile."
+          },
           "401": {
             "description": "Unauthenticated request."
           },
@@ -2633,6 +2748,25 @@
               }
             },
             "description": "A write reaching only SOME readable shards returns 207 Multi-Status with body { \"override\": <the same fields as the 200 body>, \"shard_errors\": [\"shard {id}: {error}\", ...] } -- the override is NOT in effect on the shards named in shard_errors, so a subsequent read/dispatch there still sees the prior state (or the declared baseline if none was ever set); re-issue the request (it is idempotent). The reported override/effective values reflect the PERSISTED row from whichever shard's write is used to build the response, not the request body verbatim -- the separate, permanent POST /admin/rate-limits/{key} route (issue #332) can independently change a bucket's declared refill_rate/burst per shard, so the two may already disagree across shards even before this call. A fully applied request returns plain 200 and omits shard_errors."
+          },
+          "207": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "properties": {
+                    "override": {
+                      "description": "The override as it stands on the shards that answered."
+                    },
+                    "shard_errors": {
+                      "description": "One entry per shard the write or read could not reach, naming the shard and the reason.",
+                      "type": "array"
+                    }
+                  },
+                  "type": "object"
+                }
+              }
+            },
+            "description": "The fan-out reached only SOME shards. The body carries the result computed from the shards that answered, plus shard_errors naming the ones that did not, so the caller can retry or reconcile."
           },
           "400": {
             "description": "Non-finite/non-positive refill_rate or burst, both fields omitted, or ttl_secs is zero or exceeds the server cap."
@@ -4045,6 +4179,25 @@
             },
             "description": "A clear reaching only SOME readable shards returns 207 Multi-Status with body { \"override\": <the same fields as the 200 body>, \"shard_errors\": [\"shard {id}: {error}\", ...] }. The override REMAINS ACTIVE (unless independently expired) on the shards named in shard_errors -- the clear did not reach them -- so a deferred-start row already queued there can still observe the overridden rate; re-issue the request (it is idempotent). A fully applied clear returns plain 200 and omits shard_errors, with override_active: false."
           },
+          "207": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "properties": {
+                    "override": {
+                      "description": "The pacing as it stands on the shards that answered."
+                    },
+                    "shard_errors": {
+                      "description": "One entry per shard the write or read could not reach, naming the shard and the reason.",
+                      "type": "array"
+                    }
+                  },
+                  "type": "object"
+                }
+              }
+            },
+            "description": "The fan-out reached only SOME shards. The body carries the result computed from the shards that answered, plus shard_errors naming the ones that did not, so the caller can retry or reconcile."
+          },
           "401": {
             "description": "Unauthenticated request."
           },
@@ -4101,6 +4254,33 @@
               }
             },
             "description": "A read reaching only SOME readable shards, OR a read of shards that disagree on override state, returns 207 Multi-Status with body { \"override\": <the same fields as the 200 body>, \"shard_errors\": [\"shard {id}: {error}\", ...], \"shard_disagreement\": <bool>, \"shards\": { \"<shard_id>\": <per-shard body, same fields as the 200 body>, ... } }. `override` (the flattened top-level view) prefers a LIVE override on ANY reachable shard -- it never silently reports override_active:false merely because a different (inactive) shard happens to have fewer raw tokens. `shard_disagreement` compares each shard's RESOLVED EFFECTIVE (refill_rate, burst) -- not the raw override_refill_rate/override_burst columns -- so it is true both when reachable shards disagree on the active/inactive boolean, and when byte-identical override columns nonetheless resolve to different effective values because a partial legacy POST /admin/rate-limits/{key} (issue #332) left the shards with divergent persisted BASELINES and an omitted override field falls back to each shard's own (diverged) baseline (issue #945 review, round 5, P2). Millisecond clock skew on override_expires_at alone across a normal successful multi-shard SET does not count as disagreement. `shards` is present whenever the response is 207 (both the shard-outage and the disagreement case) and lists every REACHABLE shard's own view (shard IDs named only in shard_errors are omitted, since their row could not be read). A fully reachable, fully agreeing read returns plain 200 and omits shard_errors/shard_disagreement/shards."
+          },
+          "207": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "properties": {
+                    "override": {
+                      "description": "The override read from the shards that answered."
+                    },
+                    "shard_disagreement": {
+                      "description": "True when the answering shards do not agree on the override.",
+                      "type": "boolean"
+                    },
+                    "shard_errors": {
+                      "description": "One entry per shard the write or read could not reach, naming the shard and the reason.",
+                      "type": "array"
+                    },
+                    "shards": {
+                      "description": "The per-shard view behind the disagreement.",
+                      "type": "array"
+                    }
+                  },
+                  "type": "object"
+                }
+              }
+            },
+            "description": "The fan-out reached only SOME shards. The body carries the result computed from the shards that answered, plus shard_errors naming the ones that did not, so the caller can retry or reconcile."
           },
           "401": {
             "description": "Unauthenticated request."
@@ -4181,6 +4361,25 @@
               }
             },
             "description": "A write reaching only SOME readable shards returns 207 Multi-Status with body { \"override\": <the same fields as the 200 body>, \"shard_errors\": [\"shard {id}: {error}\", ...] } -- the override is NOT in effect on the shards named in shard_errors, so a deferred-start row already queued there still sees the prior state (or the declared baseline if none was ever set); re-issue the request (it is idempotent). The reported override/effective values reflect the PERSISTED row from whichever shard's write is used to build the response, not the request body verbatim. A fully applied request returns plain 200 and omits shard_errors."
+          },
+          "207": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "properties": {
+                    "override": {
+                      "description": "The override as it stands on the shards that answered."
+                    },
+                    "shard_errors": {
+                      "description": "One entry per shard the write or read could not reach, naming the shard and the reason.",
+                      "type": "array"
+                    }
+                  },
+                  "type": "object"
+                }
+              }
+            },
+            "description": "The fan-out reached only SOME shards. The body carries the result computed from the shards that answered, plus shard_errors naming the ones that did not, so the caller can retry or reconcile."
           },
           "400": {
             "description": "Non-finite/non-positive refill_per_sec or burst, both fields omitted, or ttl_secs is zero or exceeds the server cap."
@@ -4380,6 +4579,9 @@
           },
           "401": {
             "description": "Unauthenticated request."
+          },
+          "500": {
+            "description": "The token row could not be written. The response carries a generic message; the detail is in the audit record."
           },
           "503": {
             "description": "Database unavailable."
@@ -6060,6 +6262,21 @@
             },
             "description": "Success."
           },
+          "202": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "properties": {
+                    "dead_letter_id": {},
+                    "ok": {},
+                    "task_id": {}
+                  },
+                  "type": "object"
+                }
+              }
+            },
+            "description": "The replay was accepted and the workflow was re-enqueued. Same fields as the 200."
+          },
           "404": {
             "description": "Dead letter not found."
           },
@@ -6239,6 +6456,25 @@
               }
             },
             "description": "Success."
+          },
+          "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "properties": {
+                    "dag_count": {},
+                    "queues": {},
+                    "runtime_ready": {},
+                    "scheduler": {},
+                    "shard_readiness": {},
+                    "shard_readiness_enforced": {},
+                    "worker_id": {}
+                  },
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Shard readiness is enforced and at least one shard is not ready. Same body as the 200; read shard_readiness for the detail."
           }
         },
         "security": [],
@@ -8871,6 +9107,24 @@
             },
             "description": "Issue #843: the addressed id names the logical run, so this operation is routed to the live attempt of the workflow-level retry chain (#523) -- the deepest execution reachable by following retry_of_exec_id successors from FAILED rows. For a workflow with no retry policy this resolves to the addressed id and is a strict no-op. The returned execution_id reports the attempt actually cancelled, which may differ from the addressed id."
           },
+          "202": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "properties": {
+                    "execution_id": {},
+                    "failed_task_count": {},
+                    "newly_cancelled": {},
+                    "ok": {},
+                    "reason": {},
+                    "state": {}
+                  },
+                  "type": "object"
+                }
+              }
+            },
+            "description": "The cancellation was recorded and the workflow will observe it at its next yield. Same fields as the 200."
+          },
           "404": {
             "description": "Execution not found."
           },
@@ -10079,7 +10333,8 @@
                   }
                 },
                 "required": [
-                  "reason"
+                  "reason",
+                  "operator_id"
                 ],
                 "type": "object"
               }
@@ -10088,6 +10343,54 @@
           "required": true
         },
         "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "properties": {
+                    "events_carried_over": {
+                      "description": "How many events the new run would inherit.",
+                      "type": "integer"
+                    },
+                    "nearest_valid_after": {
+                      "description": "The closest valid reset point after the requested one.",
+                      "type": "integer"
+                    },
+                    "nearest_valid_before": {
+                      "description": "The closest valid reset point before the requested one, when it is invalid.",
+                      "type": "integer"
+                    },
+                    "reset_to_event_id": {
+                      "description": "The event id the fork would happen at.",
+                      "type": "integer"
+                    },
+                    "source_signals_to_buffer": {
+                      "description": "Signals the reset would buffer for the new run.",
+                      "type": "integer"
+                    },
+                    "source_signals_to_drop": {
+                      "description": "Signals the reset would drop.",
+                      "type": "integer"
+                    },
+                    "source_tasks_to_cancel": {
+                      "description": "Pending tasks the reset would cancel on the source run.",
+                      "type": "integer"
+                    },
+                    "source_timers_to_remove": {
+                      "description": "Timers the reset would remove.",
+                      "type": "integer"
+                    },
+                    "unresolved_side_effects": {
+                      "description": "Side effects the plan cannot replay safely.",
+                      "type": "array"
+                    }
+                  },
+                  "type": "object"
+                }
+              }
+            },
+            "description": "dry_run=true: the reset plan is computed and returned, and nothing is written. Read unresolved_side_effects and the nearest_valid_* anchors before committing."
+          },
           "201": {
             "content": {
               "application/json": {
@@ -10113,6 +10416,9 @@
           },
           "404": {
             "description": "Execution not found."
+          },
+          "409": {
+            "description": "The source execution is terminal, or it holds a durable mutex that the reset cannot take."
           },
           "500": {
             "description": "Database error."
@@ -10990,6 +11296,26 @@
             },
             "description": "wait=completed: the update failed, was rejected by the handler, or was orphaned by a workflow that reached a terminal state first. A failure carries error; an orphan carries error_type and workflow_state."
           },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "properties": {
+                    "error": {
+                      "description": "Always 'update rejected by validator'.",
+                      "type": "string"
+                    },
+                    "reason": {
+                      "description": "The validator's rejection reason.",
+                      "type": "string"
+                    }
+                  },
+                  "type": "object"
+                }
+              }
+            },
+            "description": "The update's validator rejected it, so no UpdateAdmitted event was written."
+          },
           "500": {
             "description": "Internal error."
           },
@@ -11121,6 +11447,30 @@
           },
           "500": {
             "description": "Database or scheduling error."
+          },
+          "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "properties": {
+                    "error": {
+                      "description": "Always 'admission blocked'.",
+                      "type": "string"
+                    },
+                    "gate_id": {
+                      "description": "The gate that blocked the start.",
+                      "type": "string"
+                    },
+                    "reason": {
+                      "description": "The gate's stated reason.",
+                      "type": "string"
+                    }
+                  },
+                  "type": "object"
+                }
+              }
+            },
+            "description": "An admission gate blocked the start. Retry once the gate clears."
           }
         },
         "summary": "Atomically start a workflow if no live run for (workflow_name, workflow_id) exists, or signal the existing run otherwise (issue #244).",
@@ -11345,6 +11695,26 @@
           "409": {
             "description": "Duplicate workflow_id with conflicting reuse policy, or conflict_policy=fail over an ACTIVE (RUNNING/PAUSED) prior (issue #685)."
           },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "properties": {
+                    "error": {
+                      "description": "Always 'completion callback target rejected'.",
+                      "type": "string"
+                    },
+                    "url": {
+                      "description": "The callback target that rejected it.",
+                      "type": "string"
+                    }
+                  },
+                  "type": "object"
+                }
+              }
+            },
+            "description": "A completion callback target rejected the start. No execution was created."
+          },
           "429": {
             "description": "The workflow's declared per-tenant resource quota (issue #946, QuotaPolicy) is exhausted for the resolved key on a FRESH admission only (an attach to an existing run never re-checks the quota). Body is {\"error\": \"quota exceeded\", \"workflow_name\", \"key\", \"resource\", \"limit\", \"current\"} naming which of max_active_executions / max_history_bytes / max_dead_letters was hit and the usage observed immediately before this admission (current excludes the would-be admission itself). No execution row, event, or task queue row is created for a rejected start. Never returned for a workflow with no declared QuotaPolicy."
           },
@@ -11487,6 +11857,30 @@
           },
           "500": {
             "description": "Database or scheduling error."
+          },
+          "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "properties": {
+                    "error": {
+                      "description": "Always 'admission blocked'.",
+                      "type": "string"
+                    },
+                    "gate_id": {
+                      "description": "The gate that blocked the start.",
+                      "type": "string"
+                    },
+                    "reason": {
+                      "description": "The gate's stated reason.",
+                      "type": "string"
+                    }
+                  },
+                  "type": "object"
+                }
+              }
+            },
+            "description": "An admission gate blocked the start. Retry once the gate clears."
           }
         },
         "summary": "Atomically start a workflow if no live run for (workflow_name, workflow_id) exists, or attach to the existing run otherwise, and admit exactly one update in ...",

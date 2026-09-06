@@ -353,6 +353,12 @@ jobs:
           python3 -m openapi_spec_validator docs/openapi.json
           python3 -m openapi_spec_validator autumn-harvest-plugin/openapi.json
 
+      # The contract is what the OpenAPI document is generated from, so a
+      # status or a mandatory field missing there is missing from every
+      # generated client. Reads api.rs and the contract, builds nothing.
+      - name: OpenAPI contract coverage (docs/audits/openapi-response-coverage.py)
+        run: python3 docs/audits/openapi-response-coverage.py
+
       - name: Comment hygiene (docs/audits/comment-hygiene.py)
         run: |
           python3 docs/audits/comment-hygiene.py --self-test
