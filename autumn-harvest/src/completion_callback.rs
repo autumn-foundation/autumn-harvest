@@ -542,7 +542,12 @@ mod ssrf_tests {
     #[test]
     fn rejects_ipv4_compatible_ipv6_embedding_a_loopback_or_private_address() {
         let policy = SsrfPolicy::default().with_allow_ip_literals(true);
-        for addr in ["::127.0.0.1", "::10.0.0.5", "::192.168.1.1", "::169.254.1.1"] {
+        for addr in [
+            "::127.0.0.1",
+            "::10.0.0.5",
+            "::192.168.1.1",
+            "::169.254.1.1",
+        ] {
             let err = validate_target_url(&format!("https://[{addr}]/hook"), &policy).unwrap_err();
             assert!(
                 matches!(err, SsrfRejection::IpNotRoutable { .. }),
