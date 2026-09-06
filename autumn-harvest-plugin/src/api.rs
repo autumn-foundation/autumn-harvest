@@ -43515,26 +43515,46 @@ async fn list_workers_handler(
     // (issue #522 review). A multi-shard worker's shard rows can disagree on
     // status/health, so filtering per-shard could let a stale Active copy on one
     // shard survive while the freshest Draining row on another is dropped before
-    // dedup — returning the obsolete snapshot. The shard-invariant queue/shard
-    // filters (read from the worker's advertised JSON, identical across rows) are
-    // kept here. Use i64::MAX as the per-shard limit so list_workers performs no
-    // truncation before the global sort+truncate below.
+    // dedup — returning the obsolete snapshot. The queue filter (read from the
+    // worker's advertised JSON, identical across rows) is kept here. `shard_id`
+    // is deliberately dropped from the per-shard query below and reapplied
+    // after, source-aware (issue #1213) — it is NOT shard-invariant: an
+    // empty-array (auto/legacy) row means "covers whatever shard it was read
+    // from", so evaluating it against the caller's requested shard while
+    // reading from every OTHER shard in the fan-out would falsely match. Use
+    // i64::MAX as the per-shard limit so list_workers performs no truncation
+    // before the global sort+truncate below.
+    let requested_shard_id = filters.shard_id;
     let per_shard_filters = WorkerFilters {
         limit: i64::MAX,
         status: None,
         health: None,
         build_id: None,
         deployment_name: None,
+        shard_id: None,
         ..filters.clone()
     };
     // Issue #756: collect-and-continue so an unreachable shard degrades to a
     // `200 partial` naming `unavailable_shards` rather than a `500`.
-    let observations = observe_shards(&api_state, |_shard_id, mut conn| {
+    let observations = observe_shards(&api_state, |source_shard_id, mut conn| {
         let per_shard_filters = per_shard_filters.clone();
         async move {
-            list_workers(&mut conn, &per_shard_filters, stale_threshold)
+            let mut rows = list_workers(&mut conn, &per_shard_filters, stale_threshold)
                 .await
-                .map_err(|e| e.to_string())
+                .map_err(|e| e.to_string())?;
+            // Issue #1213: evaluate shard coverage against the shard this row
+            // was actually read from, not blindly against the caller's
+            // requested shard — see the source-aware predicate doc above.
+            if let Some(requested) = requested_shard_id {
+                rows.retain(|r| {
+                    autumn_harvest::workers::shard_assignments_cover_from_source(
+                        &r.worker.shard_assignments,
+                        source_shard_id,
+                        requested,
+                    )
+                });
+            }
+            Ok(rows)
         }
     })
     .await?;
@@ -44023,20 +44043,33 @@ async fn drain_preview_handler(
     // shard is filtered out before dedup (issue #522 review). The preview's own
     // filters (default-Active status plus any requested status/health/build/
     // deployment) and the limit are applied globally against the freshest row.
+    // `shard_id` is dropped here and reapplied source-aware below, exactly as
+    // `/workers` does (issue #1213) — see the comment in `list_workers_handler`.
+    let requested_shard_id = filters.shard_id;
     let per_shard_filters = WorkerFilters {
         limit: i64::MAX,
         status: None,
         health: None,
         build_id: None,
         deployment_name: None,
+        shard_id: None,
         ..filters.clone()
     };
     let mut rows: Vec<WorkerRow> = Vec::new();
-    for (_shard, shard_pool) in pool.iter_shards() {
+    for (source_shard_id, shard_pool) in pool.iter_shards() {
         let mut conn = acquire_conn(shard_pool).await?;
         let mut shard_rows = list_workers(&mut conn, &per_shard_filters, stale_threshold)
             .await
             .map_err(map_error)?;
+        if let Some(requested) = requested_shard_id {
+            shard_rows.retain(|r| {
+                autumn_harvest::workers::shard_assignments_cover_from_source(
+                    &r.worker.shard_assignments,
+                    source_shard_id.as_i32(),
+                    requested,
+                )
+            });
+        }
         rows.append(&mut shard_rows);
     }
     let mut rows = dedup_workers_by_freshest(rows);
