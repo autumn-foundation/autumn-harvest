@@ -18,17 +18,23 @@ yesterday's report and one didn't:
   on top of roughly **10**, not the 09-05 report's "~19" (a Codex review
   comment on this PR caught that the same job-count-vs-distinct-key
   conflation applies to that inherited figure too: `test-db-linux`'s 10
-  shards already collapse to 1 entry via their own shared key, so ~10
-  distinct entries pre-`test-nodb`, ~13 after — corrected below). Still the
-  wrong direction for the fixed-10GB-cache-budget hypothesis the prior
-  report raised, just a smaller wrong direction than either report claimed.
+  shards already collapse to 1 entry via their own shared key, so ~10 distinct
+  key *names* pre-`test-nodb`, ~13 after, **per branch** — a second Codex
+  comment then caught that this is still not the repository-wide total: the
+  10GB cap is shared across every branch, and each of this repo's many
+  concurrently open PR branches can persist its own copy of these same ~13
+  names, so the true total is unknown and plausibly a multiple of 13 — see
+  Diagnosis). Still the wrong direction for the fixed-10GB-cache-budget
+  hypothesis the prior report raised, just a smaller wrong direction than
+  either report claimed, and likely an understatement in the other direction
+  too.
 - **Unchanged:** `Swatinem/rust-cache` still finds nothing to restore on every
   sampled leg on every sampled run, including a save this report can show
   raised no error anywhere in its path on the shared base branch, under a
   stable key three later PR runs all restored against — and still wasn't
   there 9-14 hours on (§4).
 
-**Correction record for this PR (`#1395`):** five separate Codex review
+**Correction record for this PR (`#1395`):** seven separate Codex review
 comments caught real problems in earlier drafts of this report — two
 methodology errors in §4's cache-eviction comparison (a same-run comparison
 that couldn't show what was claimed, then a cross-PR-branch comparison
@@ -36,11 +42,14 @@ GitHub's cache scoping rules make invalid), one overclaim in §1 (calling
 full-workflow wall time "the number that actually gates a PR" while this
 report's own Verdict-path section leaves that unconfirmed), one overstated
 certainty in §4 (treating an upload-progress line as proof of a finalized
-cache save), and one miscounted baseline (the inherited "~19" job-count
-figure conflated with distinct persisted keys the same way this report's own
+cache save), one miscounted baseline (the inherited "~19" job-count figure
+conflated with distinct persisted keys the same way this report's own
 "12 vs 3" fix already corrected for `test-nodb`, just not carried back to
-the older number). All five are fixed below, in place, with the retractions
-left visible rather than edited away.
+the older number), one further scoping gap in that same count (~13 is a
+per-branch figure, not the unknown repository-wide total the shared 10GB cap
+actually contends over), and one internally-inconsistent denominator in the
+Measurement section's cache-hit tally. All seven are fixed below, in place,
+with the retractions left visible rather than edited away.
 
 ## 🎯 Verdict path (unchanged)
 
@@ -226,8 +235,20 @@ report's ~19, which counted matrix legs rather than distinct keys — that
 report's own text already noted `test-db-linux`'s 10 shards share one key,
 but summed as if they didn't; a Codex review comment on this PR caught the
 inconsistency with this report's own corrected `test-nodb` count), so ~13
-total contending for the same fixed cap, on the same day the 09-05 report's
-hypothesis named that general mechanism as the likely cause. §4's
+distinct key *names* this workflow uses **per branch, per current
+`Cargo.lock` hash** — not the repository-wide total contending for the
+shared cap. A Codex review comment on this PR correctly flagged that gap:
+GitHub's cache access is scoped per branch/ref, but its 10GB capacity limit
+is shared across the *whole repository* — so every one of the dozens of
+concurrently open PR branches this report has seen in this repo's history
+(§4 alone samples three) can independently persist its own copy of these
+same ~13 key names, and any not-yet-evicted older `Cargo.lock`-hash
+generation adds more on top. The true repository-wide entry count is
+unknown — this report still has no cache-listing API access to measure it
+— and is very plausibly a multiple of 13, not 13 itself, which if anything
+makes the capacity hypothesis this section is arguing for *more*, not less,
+plausible. Corrected to avoid overstating a number this report can't
+actually measure. §4's
 cross-run evidence — an apparently error-free save on the shared base
 branch, gone within 9-14 hours under the exact key three separate downstream
 PR runs restored against — is direct support for that hypothesis, not just
@@ -254,7 +275,11 @@ method). Candidate remedies for whoever has that access, updated:
 2. If confirmed capacity-bound: **consolidate entries across job families**
    — e.g. one shared cache key across `test-nodb`, `test-db-linux`, `test`,
    and `lint` for a given OS, if their `target/` layouts overlap enough,
-   reducing the number of distinct persisted entries below the current ~13
+   reducing the number of distinct key *names* below the current ~13 per
+   branch (multiplied by however many branches actually hold a copy — the
+   unknown repository-wide total from the Diagnosis section above; this
+   remedy shrinks that multiplier's per-branch factor, which helps regardless
+   of the unknown total)
    (a Codex review comment on this PR correctly flagged that doing this
    *within* a family — e.g. a designated canonical shard for `test-nodb` —
    is not this fix: `ci.yml:411-417`'s shared shard-key already limits each
@@ -280,9 +305,13 @@ method). Candidate remedies for whoever has that access, updated:
   time (not confirmed gating time — see §1's caveat). **~47–67% reduction**,
   clearing the ≥15% floor on that measure by a wide margin. Not this report's
   fix — crediting `9ce7ce8` and PR #1336's `test-db-linux` split.
-- **Cache hit rate, cumulative across two independent report-days:** 0/9 sampled
-  leg-runs found an exact-match cache; 1/10 total found a prefix-fallback hit
-  (09-05 report, `windows-latest`, not reproduced today). Additionally: 3
+- **Cache hit rate, cumulative across two independent report-days:** 0/10
+  sampled leg-runs found an exact-match cache (a Codex review comment on this
+  PR caught an earlier draft's `0/9` as inconsistent with its own `1/10` —
+  both figures need the same 10-sample denominator); within those same 10,
+  1 found a prefix-fallback hit, still not exact (09-05 report,
+  `windows-latest`, not reproduced today), so 9/10 found no cache at all.
+  Additionally: 3
   downstream PR runs (§4), on 3 different branches all based on `trunk-dev`,
   each restoring against the exact key an apparently error-free `trunk-dev`
   base-branch save produced 9-14 hours earlier — 0/3 got a hit, exact or
