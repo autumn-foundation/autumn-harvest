@@ -1545,3 +1545,27 @@ inconsistency. An author writes a fence to say "this is an example", whatever
 the marker. Nobody indents a paragraph to say it.
 
 Corpus effect: none, once the rule is limited to doc comments.
+
+### Round forty-nine — the marker line, and the third scoping gap
+
+Two findings, sorted by direction as the line drawn in round forty-seven says.
+
+**Fixed: a code block may begin on the list marker's own line.**
+`-     let x = compute();` is an item holding four columns of indented code —
+CommonMark puts the item's content one column past the marker when the padding
+exceeds four, and everything past that is code. Round forty-eight measured the
+indent on the unpeeled line, so the bullet counted as content and the example
+failed CH001 and CH002. The measurement is now taken in the frame the peel
+leaves: `strip_containers` returns both the text and the container it ends in,
+and the four columns are counted from there. That is the same peel-then-measure
+shape rounds forty-six and forty-seven applied to the HTML opener, arriving one
+round later at the feature added in between.
+
+**Deferred to the follow-up issue: a table is not scoped to its container.** A
+quoted table survives the line that leaves the quote, so a `22.` after it takes
+a container the rendered document does not give it and a TODO under the
+invented fence goes unreported. It is the exact sibling of the HTML scoping gap
+already recorded there, it under-reports, and no `*.rs` comment in this tree
+contains a table at all. KNOWN LIMITATIONS now names all three.
+
+Corpus effect: none.

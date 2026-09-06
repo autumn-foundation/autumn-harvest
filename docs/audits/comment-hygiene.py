@@ -125,10 +125,12 @@ KNOWN LIMITATIONS:
   known gaps are recorded in the follow-up issue rather than fixed here,
   and both UNDER-report, which is the safe direction for a gate: an HTML
   block is not scoped to the container that opened it, so leaving a quote
-  does not end one; and an HTML closer inside an inline nested comment is
-  not seen, because a mid-line piece carries no block syntax. Neither
-  shape occurs in this tree -- no `*.rs` comment here holds raw HTML --
-  and every fix in this seam has cost more than it returned.
+  does not end one; an HTML closer inside an inline nested comment is not
+  seen, because a mid-line piece carries no block syntax; and a table is
+  not scoped to its container either, so a quoted table survives the line
+  that leaves the quote. None of those shapes occurs in this tree -- no
+  `*.rs` comment here holds raw HTML or a table -- and every fix in this
+  seam has cost more than it returned.
 
 - CH001 is deliberately HIGH-PRECISION AND INCOMPLETE, and should stay
   that way. It recognizes commented-out Rust by line shape: item headers,
@@ -1502,8 +1504,17 @@ def comment_lines(pieces: list[Piece]):
                     in_table = not starts_block(body, enclosing)
                 else:
                     in_table = table_header(run, index, piece.nest, body, enclosing)
+                # Peeled, and measured in the frame the peel leaves: a code
+                # block may begin on the marker line itself, and
+                # "-     let x = compute();" is an item holding four columns
+                # of indented code, not a bullet with a defect in it.
+                code_text, code_container = strip_containers(text, stack, enclosing)[:2]
                 indented = indented_code(
-                    body, enclosing, paragraph, indented, piece.marker in DOC_MARKERS
+                    code_text,
+                    code_container,
+                    paragraph,
+                    indented,
+                    piece.marker in DOC_MARKERS,
                 )
                 # Both are blocks, so neither leaves a paragraph open.
                 stack, paragraph = update_containers(
@@ -1746,8 +1757,13 @@ def prose_units(pieces: list[Piece]) -> list[tuple[int, str]]:
                     in_table = not starts_block(peek, enclosing)
                 else:
                     in_table = table_header(block, index, piece.nest, peek, enclosing)
+                code_text, code_container = strip_containers(body, stack, enclosing)[:2]
                 indented = indented_code(
-                    peek, enclosing, paragraph, indented, piece.marker in DOC_MARKERS
+                    code_text,
+                    code_container,
+                    paragraph,
+                    indented,
+                    piece.marker in DOC_MARKERS,
                 )
                 # Both are blocks, so neither leaves a paragraph open.
                 stack, paragraph = update_containers(
@@ -3061,6 +3077,18 @@ RULE_TESTS = [
         "/// TODO: issue required\n",
         {("CH002", 5)},
         "and it ends where the indent does",
+    ),
+    (
+        "/// -     let x = compute();\n"
+        "///       TODO: fixture placeholder\n",
+        set(),
+        "a code block may begin on the list marker's own line",
+    ),
+    (
+        "/// - item\n"
+        "/// - TODO: issue required\n",
+        {("CH002", 2)},
+        "an ordinary bullet is not indented code",
     ),
 ]
 
