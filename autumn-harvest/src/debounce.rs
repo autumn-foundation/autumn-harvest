@@ -753,8 +753,12 @@ const QUOTA_REDEFER_BACKOFF: Duration = Duration::from_secs(5);
 /// Deliberately NOT gated behind `#[cfg(feature = "db")]` like its caller
 /// (`redefer_debounce_row`): this function is pure `DateTime` arithmetic with
 /// no database dependency, and the ungated unit tests below need to call it
-/// regardless of which features are enabled (mirrors `compute_fire_deadline`
-/// above).
+/// regardless of which features are enabled. Its only PRODUCTION caller is
+/// still `db`-gated, though, so it would be flagged dead code by a
+/// downstream crate's non-test build with `db` off (as `autumn-harvest-sqlite`
+/// does) -- the standard `#[cfg_attr(not(feature = "db"), allow(dead_code))]`
+/// used throughout this crate for exactly that shape.
+#[cfg_attr(not(feature = "db"), allow(dead_code))]
 fn redefer_target(
     now: DateTime<Utc>,
     max_fire_at: DateTime<Utc>,
