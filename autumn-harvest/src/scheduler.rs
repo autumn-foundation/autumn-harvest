@@ -4915,7 +4915,6 @@ async fn tick_one_workflow_schedule(
 ///
 /// Returns `Err` if the schedule is a `Cron` variant whose expression cannot be
 /// parsed by `croner`. `Interval` and `Manual` schedules are always valid.
-///
 // Re-exported so callers can reach it via the `scheduler` module path, which
 // is where it lived before being moved to `policy` for feature-gate reasons.
 pub use crate::policy::validate_schedule;

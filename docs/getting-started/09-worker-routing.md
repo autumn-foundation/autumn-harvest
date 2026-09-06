@@ -91,17 +91,13 @@ To keep database queries fast and scalable, activity requirements are stored in 
 
 ## Monitoring and Triage
 
-When tasks seem stuck, you can inspect the fleet capability state using the dashboard, CLI, or HTTP endpoints.
+When tasks seem stuck, you can inspect the fleet capability state using the dashboard or HTTP endpoints.
 
 ### Query Capable Workers
-To find out which workers can run a specific activity, use the `capable_of` parameter:
+To find out which workers can run a specific activity, use the `capable_of` query parameter (the `harvest worker list` CLI command filters by queue, shard, status, and health, but has no capability filter of its own):
 
 ```bash
-# HTTP API
 curl -s "http://localhost:3000/api/harvest/workers?capable_of=transcode_video" | jq .
-
-# CLI
-harvest worker list --capable-of transcode_video
 ```
 
 ### Eligibility Triage

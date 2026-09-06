@@ -839,6 +839,31 @@ pub const METRIC_WORKFLOW_START_THROTTLED: &str = "harvest.workflow.start_thrott
 /// must never appear here.
 pub const METRIC_CONCURRENCY_SUPERSEDED: &str = "harvest.concurrency.superseded";
 
+/// Counter: a latest-wins admission left a key transiently over its limit
+/// (issue #1197, item 2).
+///
+/// Incremented once per admission that could not shed its full computed
+/// overflow because every remaining over-limit run was a protected in-flight
+/// (nested) admission. This is the nested self-referential-trigger residual
+/// described in issue #1197: cancelling an incumbent can synchronously start
+/// a completion-trigger target that also declares `cancel_running` on the
+/// same key, and that
+/// nested admission is protected from being shed by the very outer admission
+/// it is nested inside (see [`crate::concurrency::supersede_plan`]'s
+/// `protected` parameter). The key is left transiently over its declared
+/// limit; the population self-heals on the next ordinary admission for the
+/// key, which sees every run unprotected. This counter is the promotion of
+/// the pre-existing `tracing::warn!` in
+/// [`crate::concurrency::supersede_running_for_key`] to an alertable signal —
+/// the issue's chosen resolution for a key that stays over limit, rather than
+/// the (more invasive, higher-lock-contention) alternatives of registration-time
+/// rejection or a post-commit reconcile sweep.
+///
+/// Labeled by `workflow` (workflow type name) only, matching
+/// [`METRIC_CONCURRENCY_SUPERSEDED`]'s cardinality rule — the concurrency key
+/// is never a label (ADR-0001 §7). `execution.id` must never appear here.
+pub const METRIC_CONCURRENCY_RESIDUAL_OVER_LIMIT: &str = "harvest.concurrency.residual_over_limit";
+
 /// Counter: incremented exactly once per real saga compensation sequence
 /// (issue #801).
 ///
@@ -1630,6 +1655,9 @@ pub const METRIC_LABEL_QUERY: &str = "query.name";
 pub const METRIC_LABEL_OUTCOME: &str = "outcome";
 /// Metric label: reason code for external signal failure.
 pub const METRIC_LABEL_REASON_CODE: &str = "reason_code";
+/// Metric label: how many runs a key is over its declared concurrency limit
+/// (issue #1197, item 2), bounded by `concurrency::SUPERSEDE_SCAN_LIMIT`.
+pub const METRIC_LABEL_GAP: &str = "gap";
 /// Metric label: the completion trigger ID (issue #517).
 pub const METRIC_LABEL_TRIGGER: &str = "trigger";
 /// Metric label: admission gate scope kind (issue #377).
@@ -2550,6 +2578,19 @@ pub trait MetricsRecorder: Send + Sync {
         let _ = workflow;
     }
 
+    /// A latest-wins supersede pass left `gap` runs over the key's declared
+    /// limit because they were all protected in-flight (nested) admissions it
+    /// may never shed (issue #1197, item 2).
+    ///
+    /// Maps to the counter [`METRIC_CONCURRENCY_RESIDUAL_OVER_LIMIT`]. The key
+    /// is transiently over its limit and self-heals on the next ordinary
+    /// admission; this counter is the alertable signal for operators who want
+    /// to know when that happens. Additive with a no-op default: implementing
+    /// it is optional and no existing implementor breaks.
+    fn record_concurrency_residual_over_limit(&self, workflow: &str, gap: u64) {
+        let _ = (workflow, gap);
+    }
+
     /// Record the current available tokens for a rate limit bucket key.
     ///
     /// Maps to the gauge `harvest.rate_limit.tokens_available{key}`.
@@ -3444,6 +3485,33 @@ pub fn emit_concurrency_superseded<M: MetricsRecorder + ?Sized>(
         }
         metrics.record_concurrency_superseded(workflow_name);
     }
+}
+
+/// Emit [`METRIC_CONCURRENCY_RESIDUAL_OVER_LIMIT`] for a latest-wins pass that
+/// could not shed its full computed overflow (issue #1197, item 2).
+///
+/// Unlike [`emit_concurrency_superseded`], this is called INLINE from
+/// [`crate::concurrency::supersede_running_for_key`] rather than deferred to a
+/// post-commit point: it is a brand-new counter with no pre-existing
+/// post-commit convention to violate (unlike the `StartCancelledRun` samples
+/// [`crate::execution::emit_start_cancel_metrics`] emits), and the condition
+/// it reports — a key transiently over its declared limit — is itself already
+/// a rare, self-healing edge case (a nested self-referential
+/// `cancel_running` trigger admission), so an occasional phantom sample from a
+/// rolled-back terminal transaction is an accepted, documented simplification
+/// rather than the residual issue #1197 exists to close.
+///
+/// Canary probe workflows (issue #796) are excluded, mirroring
+/// [`emit_workflow_terminal`].
+pub fn emit_concurrency_residual_over_limit<M: MetricsRecorder + ?Sized>(
+    metrics: &M,
+    workflow_name: &str,
+    gap: u64,
+) {
+    if crate::canary::is_canary_workflow(workflow_name) {
+        return;
+    }
+    metrics.record_concurrency_residual_over_limit(workflow_name, gap);
 }
 
 /// Default metrics recorder that discards every sample.

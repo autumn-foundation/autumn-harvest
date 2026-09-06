@@ -489,6 +489,7 @@ pub async fn supersede_running_for_key(
     concurrency_key: &str,
     limit: u32,
     self_exec_id: crate::types::ExecutionId,
+    metrics: Option<&(dyn crate::telemetry::MetricsRecorder + Send + Sync)>,
 ) -> crate::error::HarvestResult<SupersedeOutcome> {
     let inherited: Vec<crate::types::ExecutionId> =
         ADMITTING.try_with(Clone::clone).unwrap_or_default();
@@ -505,6 +506,7 @@ pub async fn supersede_running_for_key(
                 limit,
                 self_exec_id,
                 inherited,
+                metrics,
             ),
         )
         .await
@@ -518,6 +520,7 @@ async fn supersede_inner(
     limit: u32,
     self_exec_id: crate::types::ExecutionId,
     inherited: Vec<crate::types::ExecutionId>,
+    metrics: Option<&(dyn crate::telemetry::MetricsRecorder + Send + Sync)>,
 ) -> crate::error::HarvestResult<SupersedeOutcome> {
     lock_concurrency_key(conn, concurrency_key).await?;
 
@@ -569,6 +572,29 @@ async fn supersede_inner(
              remaining runs are protected in-flight admissions; the key stays over its \
              declared limit until the next admission",
         );
+        // issue #1197, item 2: promote the warn above to an alertable counter
+        // so operators can monitor keys that stay transiently over their
+        // declared limit, rather than relying on log scraping.
+        //
+        // The ONLY reachable path to this branch is a NESTED admission (a
+        // non-empty `inherited`, i.e. this call is running inside another
+        // admission's `ADMITTING` scope) — see this function's `inherited`
+        // parameter doc. Every such nesting is reached through this module's
+        // own shed loop below calling `cancel_workflow_execution_collect`,
+        // which -- like every other cancel/terminate/parent-close-cascade
+        // path in `execution.rs` -- evaluates completion triggers with
+        // `metrics: None` (no caller-supplied recorder in scope at that
+        // chokepoint). Falling back to the process-global recorder here
+        // mirrors the identical, already-established fallback
+        // `completion_trigger::evaluate_triggers_for_execution_collecting`'s
+        // admission-gate-block branch uses for the same reason: without it,
+        // this counter would be wired up but structurally unreachable with a
+        // real recorder, silently never firing in production.
+        let resolved_metrics = crate::admission_gate::resolve_metrics_with_global_fallback(metrics);
+        if let Some(m) = resolved_metrics.as_dyn() {
+            let gap = u64::try_from(shed_target - shed).unwrap_or(u64::MAX);
+            crate::telemetry::emit_concurrency_residual_over_limit(m, workflow_name, gap);
+        }
     }
     if shed == 0 {
         return Ok(SupersedeOutcome::default());
@@ -581,6 +607,7 @@ async fn supersede_inner(
                 conn,
                 candidate.exec_id,
                 SUPERSEDE_CANCEL_REASON,
+                metrics,
             )
             .await
             {

@@ -283,6 +283,7 @@ async fn persist_workflow_completion_makes_no_terminal_decision_when_the_claim_m
         None,
         None,
         &autumn_harvest::payload_codec::PayloadCodecs::default(),
+        &mut Vec::new(),
     )
     .await;
 
@@ -330,6 +331,7 @@ async fn persist_workflow_failure_makes_no_terminal_decision_when_the_claim_move
         None,
         autumn_harvest::types::Priority::default(),
         &autumn_harvest::payload_codec::PayloadCodecs::default(),
+        &mut Vec::new(),
     )
     .await;
 
@@ -384,6 +386,7 @@ async fn persist_child_workflow_completion_makes_no_terminal_decision_when_the_c
         serde_json::json!({"ok": true}),
         None,
         &autumn_harvest::payload_codec::PayloadCodecs::default(),
+        &mut Vec::new(),
     )
     .await;
 
@@ -434,6 +437,7 @@ async fn persist_child_workflow_failure_makes_no_terminal_decision_when_the_clai
         None,
         None,
         &autumn_harvest::payload_codec::PayloadCodecs::default(),
+        &mut Vec::new(),
     )
     .await;
 
@@ -712,6 +716,7 @@ async fn a_dispatcher_that_still_owns_the_claim_is_released_when_skip_locked_is_
                 None,
                 autumn_harvest::types::Priority::default(),
                 &autumn_harvest::payload_codec::PayloadCodecs::default(),
+                &mut Vec::new(),
             )
             .await
             .expect_err("SKIP LOCKED never waits, so the row reads as contended immediately")

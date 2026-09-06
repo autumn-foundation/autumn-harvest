@@ -1075,9 +1075,9 @@ pub fn workflow_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         |expr| quote! { ::std::option::Option::Some(#expr) },
     );
 
-    let camel_name = to_pascal_case(&fn_name_str);
+    let camel_name = crate::to_pascal_case(&fn_name_str);
     let stub_name = format_ident!("{}Stub", camel_name);
-    let ok_type = extract_ok_type(&input_fn.sig.output);
+    let ok_type = crate::extract_ok_type(&input_fn.sig.output);
 
     let serialize_args = if param_names.is_empty() {
         quote! { ::autumn_harvest::serde_json::Value::Null }
@@ -1568,14 +1568,6 @@ pub fn workflow_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
             }
         }
     }
-}
-
-fn to_pascal_case(s: &str) -> String {
-    crate::to_pascal_case(s)
-}
-
-fn extract_ok_type(output: &syn::ReturnType) -> syn::Type {
-    crate::extract_ok_type(output)
 }
 
 #[cfg(test)]
