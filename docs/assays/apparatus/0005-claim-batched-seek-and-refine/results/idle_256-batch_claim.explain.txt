@@ -1,0 +1,23 @@
+                                                                                                        QUERY PLAN                                                                                                         
+---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+ Limit  (cost=687.19..687.82 rows=50 width=51) (actual rows=50 loops=1)
+   Output: id, task_type, concurrency_key, concurrency_cap, priority, scheduled_at, ctid
+   Buffers: shared hit=180
+   ->  LockRows  (cost=687.19..812.19 rows=10000 width=51) (actual rows=50 loops=1)
+         Output: id, task_type, concurrency_key, concurrency_cap, priority, scheduled_at, ctid
+         Buffers: shared hit=180
+         ->  Sort  (cost=687.19..712.19 rows=10000 width=51) (actual rows=50 loops=1)
+               Output: id, task_type, concurrency_key, concurrency_cap, priority, scheduled_at, ctid
+               Sort Key: harvest_task_queue.priority DESC, harvest_task_queue.scheduled_at, harvest_task_queue.id
+               Sort Method: quicksort  Memory: 1166kB
+               Buffers: shared hit=130
+               ->  Seq Scan on public.harvest_task_queue  (cost=0.00..355.00 rows=10000 width=51) (actual rows=10000 loops=1)
+                     Output: id, task_type, concurrency_key, concurrency_cap, priority, scheduled_at, ctid
+                     Filter: ((harvest_task_queue.state = 'PENDING'::text) AND (harvest_task_queue.queue_name = ANY ('{bench-q-0,bench-q-1,bench-q-2,bench-q-3}'::text[])) AND (harvest_task_queue.scheduled_at <= now()))
+                     Buffers: shared hit=130
+ Planning:
+   Buffers: shared hit=1
+ Planning Time: 0.088 ms
+ Execution Time: 6.955 ms
+(19 rows)
+

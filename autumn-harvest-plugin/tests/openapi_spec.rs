@@ -403,8 +403,9 @@ fn documented_response_headers_are_published() {
 /// generated client that assumed JSON would fail to decode either.
 #[test]
 fn multi_format_responses_declare_every_media_type() {
-    let doc = document();
     const PROMETHEUS: &str = "text/plain; version=0.0.4; charset=utf-8";
+
+    let doc = document();
 
     let metrics = &doc["paths"]["/admin/metrics"]["get"]["responses"]["200"]["content"];
     assert!(metrics[PROMETHEUS].is_object(), "{metrics}");

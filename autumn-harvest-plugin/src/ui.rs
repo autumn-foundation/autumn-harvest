@@ -41,7 +41,7 @@ use autumn_harvest::audit::{
     OP_WORKFLOW_CANCEL, OP_WORKFLOW_PAUSE, OP_WORKFLOW_RESET, OP_WORKFLOW_RESUME,
     OP_WORKFLOW_SIGNAL, OP_WORKFLOW_TERMINATE, SOURCE_UI, STATUS_FAILED, STATUS_SUCCEEDED,
     TARGET_BUILD_ROUTING, TARGET_DEAD_LETTER, TARGET_GATE, TARGET_SCHEDULE, TARGET_WORKFLOW,
-    insert_audit,
+    insert_audit, insert_audit_batch,
 };
 use autumn_harvest::build_routing::{
     BuildCompatEntry, BuildPolicy, BuildReachability, all_build_reachability, declare_compat,
@@ -2527,7 +2527,18 @@ async fn list_workers_ui(
     Extension(api_state): Extension<HarvestApiState>,
     Query(params): Query<WorkerListParams>,
 ) -> Result<Markup, AutumnError> {
-    let (status_filter, stale_only) = parse_worker_ui_filters(&params)?;
+    // Issue: an unrecognized status/stale value used to `?`-abort the whole
+    // page (bare 400, no HTML) before the filter form was ever rendered,
+    // discarding the build_id/shard filters the operator had already
+    // entered. `parse_worker_status_filter`/`parse_worker_stale_filter`
+    // instead degrade to "filter not applied" and hand back an error to
+    // redisplay inline, so a bad value costs one field, not the page — same
+    // fix as `parse_started_bound` on the Workflows page (#1333). The raw
+    // text is carried alongside the parsed value so pagination and form
+    // resubmission don't silently drop it (Codex review, #1378 P2).
+    let (status_filter, status_raw, status_error) =
+        parse_worker_status_filter(params.status.as_deref());
+    let (stale_only, stale_raw, stale_error) = parse_worker_stale_filter(params.stale.as_deref());
 
     let limit = params
         .limit
@@ -2623,39 +2634,67 @@ async fn list_workers_ui(
         limit,
         has_next,
         status_filter,
+        &status_raw,
+        status_error.as_deref(),
         params.shard,
         stale_only,
+        &stale_raw,
+        stale_error.as_deref(),
         build_id_filter,
         params.refresh,
     ))
 }
 
-fn parse_worker_ui_filters(
-    params: &WorkerListParams,
-) -> Result<(Option<&'static str>, bool), AutumnError> {
-    let status_filter = match params.status.as_deref().map(str::trim) {
-        None | Some("") => None,
-        Some(s) => Some(match s.to_lowercase().as_str() {
-            "active" => "Active",
-            "draining" => "Draining",
-            "stopped" => "Stopped",
-            other => {
-                return Err(AutumnError::bad_request_msg(format!(
-                    "unknown status '{other}'; expected one of Active, Draining, Stopped"
-                )));
-            }
-        }),
+/// Parses the Workers page's `status` filter from a raw query-string value.
+/// Returns `(parsed, raw_display, error)`: on success `error` is `None`; on
+/// an unrecognized value `parsed` is `None` (the filter is not applied)
+/// while `error` carries a message to render next to the field — so a bad
+/// value drops one filter instead of the whole page (see `list_workers_ui`).
+/// `raw_display` echoes the operator's exact trimmed input in both cases (a
+/// no-op on success, since the only valid inputs are the canonical labels
+/// modulo case) so the caller can carry it through pagination and
+/// resubmission — Codex review on #1378 P2: without this, a bad value's
+/// error vanished on the next Next/Previous click or Apply resubmit,
+/// because the `<select>` and the pagination query string were both built
+/// from the already-`None`d parsed value, silently discarding the operator's
+/// input rather than persisting the error "until resolved" as intended.
+fn parse_worker_status_filter(raw: Option<&str>) -> (Option<&'static str>, String, Option<String>) {
+    let Some(trimmed) = raw.map(str::trim).filter(|v| !v.is_empty()) else {
+        return (None, String::new(), None);
     };
-    let stale_only = match params.stale.as_deref().map(str::trim) {
-        None | Some("" | "false") => false,
-        Some("true") => true,
-        Some(other) => {
-            return Err(AutumnError::bad_request_msg(format!(
-                "unknown stale value '{other}'; expected 'true' or 'false'"
-            )));
-        }
+    match trimmed.to_lowercase().as_str() {
+        "active" => (Some("Active"), trimmed.to_string(), None),
+        "draining" => (Some("Draining"), trimmed.to_string(), None),
+        "stopped" => (Some("Stopped"), trimmed.to_string(), None),
+        other => (
+            None,
+            trimmed.to_string(),
+            Some(format!(
+                "Unknown status '{other}'; expected Active, Draining, or Stopped. Filter not applied."
+            )),
+        ),
+    }
+}
+
+/// Parses the Workers page's `stale` filter from a raw query-string value.
+/// Returns `(parsed, raw_display, error)` with the same "filter not
+/// applied, raw input carried through, error redisplayed inline" contract
+/// as [`parse_worker_status_filter`].
+fn parse_worker_stale_filter(raw: Option<&str>) -> (bool, String, Option<String>) {
+    let Some(trimmed) = raw.map(str::trim).filter(|v| !v.is_empty()) else {
+        return (false, String::new(), None);
     };
-    Ok((status_filter, stale_only))
+    match trimmed {
+        "false" => (false, trimmed.to_string(), None),
+        "true" => (true, trimmed.to_string(), None),
+        other => (
+            false,
+            trimmed.to_string(),
+            Some(format!(
+                "Unknown stale value '{other}'; expected 'true' or 'false'. Filter not applied."
+            )),
+        ),
+    }
 }
 
 /// A paused queue as rendered on the Workers page, merged across shards.
@@ -3020,7 +3059,7 @@ fn render_dead_letters_page(
     let body = html! {
         h2 { "Dead Letters" }
         @if let Some(message) = flash {
-            div.flash { (message) }
+            div.flash role="status" tabindex="-1" autofocus { (message) }
         }
         (render_dead_letter_view_toggle(filters, limit, refresh, None, false))
         (render_dead_letter_filters(filters, limit, refresh))
@@ -3052,7 +3091,19 @@ fn render_dead_letters_page(
         (render_dead_letter_pagination(page, limit, has_next, filters, refresh))
     };
 
-    layout_dead_letters("Dead Letters · Vantage", &body, refresh)
+    // `dead_letter_return_to_path` deliberately excludes `page`. It names
+    // the one-time redirect target after an action, and landing back on
+    // page 0 there is fine.
+    //
+    // Auto-refresh is different: it must keep the operator on the page
+    // they were reading. So it builds its own target here, matching
+    // `render_dead_letter_pagination`'s own link construction, instead of
+    // reusing that path (found in review, PR #1396).
+    let refresh_target = format!(
+        "../ui/dead-letters?page={page}{}",
+        build_dead_letter_query_string(limit, filters, refresh)
+    );
+    layout_dead_letters("Dead Letters · Vantage", &body, refresh, &refresh_target)
 }
 
 // ---------------------------------------------------------------------------
@@ -3096,7 +3147,7 @@ async fn render_dead_letters_summary_view(
     let body = html! {
         h2 { "Dead Letters" }
         @if let Some(message) = flash {
-            div.flash { (message) }
+            div.flash role="status" tabindex="-1" autofocus { (message) }
         }
         (render_dead_letter_view_toggle(filters, limit, refresh, Some(&group_by_value), true))
         (render_dead_letter_filters(filters, limit, refresh))
@@ -3124,10 +3175,20 @@ async fn render_dead_letters_summary_view(
         }
     };
 
+    let group_by_query = if group_by_value.is_empty() {
+        String::new()
+    } else {
+        format!("&group_by={}", url_encode(&group_by_value))
+    };
+    let refresh_target = format!(
+        "../ui/dead-letters?view=summary{}{group_by_query}",
+        build_dead_letter_query_string(limit, filters, refresh)
+    );
     Ok(layout_dead_letters(
         "Dead Letters · Summary · Vantage",
         &body,
         refresh,
+        &refresh_target,
     ))
 }
 
@@ -3810,7 +3871,25 @@ fn truncate_error(error: &str) -> String {
     }
 }
 
-fn layout_dead_letters(title: &str, body: &Markup, refresh: Option<u64>) -> Markup {
+/// `refresh_target` is the current filtered view's URL with no `flash`
+/// param. The caller builds it from the same filters, limit, and refresh
+/// already in its own scope.
+///
+/// A dead-letter action redirects here with `flash` appended to
+/// `return_to`. `return_to` itself preserves `refresh`. An operator with
+/// auto-refresh on would otherwise see this page's targetless `meta
+/// refresh` reload that same URL, flash included, on every interval. Each
+/// reload would re-announce and re-focus a stale message.
+///
+/// An explicit `url=` on the tag breaks that loop. The flash still shows
+/// and takes focus on the load right after the action. Every reload after
+/// that lands on the flash-free URL instead (found in review, PR #1396).
+fn layout_dead_letters(
+    title: &str,
+    body: &Markup,
+    refresh: Option<u64>,
+    refresh_target: &str,
+) -> Markup {
     html! {
         (PreEscaped("<!DOCTYPE html>"))
         html lang="en" {
@@ -3818,7 +3897,7 @@ fn layout_dead_letters(title: &str, body: &Markup, refresh: Option<u64>) -> Mark
                 meta charset="utf-8";
                 meta name="viewport" content="width=device-width,initial-scale=1";
                 @if let Some(secs) = refresh {
-                    meta http-equiv="refresh" content=(secs);
+                    meta http-equiv="refresh" content={ (secs) "; url=" (refresh_target) };
                 }
                 title { (title) }
                 style { (PreEscaped(STYLE)) }
@@ -3856,8 +3935,12 @@ fn render_workers_page(
     limit: i64,
     has_next: bool,
     status_filter: Option<&str>,
+    status_raw: &str,
+    status_error: Option<&str>,
     shard_filter: Option<i32>,
     stale_only: bool,
+    stale_raw: &str,
+    stale_error: Option<&str>,
     build_id_filter: Option<&str>,
     refresh: Option<u64>,
 ) -> Markup {
@@ -3873,7 +3956,7 @@ fn render_workers_page(
         (render_paused_queues_banner(&paused_queues.rows, &paused_queues.unreadable_shards))
 
         // Filters
-        (render_worker_filters(status_filter, shard_filter, stale_only, build_id_filter, limit))
+        (render_worker_filters(status_filter, status_raw, status_error, shard_filter, stale_only, stale_raw, stale_error, build_id_filter, limit))
 
         // Worker table (grouped by shard if multi-shard)
         @if total_workers == 0 && shard_errors.is_empty() {
@@ -3906,7 +3989,7 @@ fn render_workers_page(
             }
         }
 
-        (render_worker_pagination(page, limit, has_next, status_filter, shard_filter, stale_only, build_id_filter))
+        (render_worker_pagination(page, limit, has_next, status_raw, shard_filter, stale_raw, build_id_filter))
     };
 
     layout_workers("Workers · Vantage", &body, refresh)
@@ -3988,10 +4071,15 @@ fn render_worker_table(rows: &[WorkerRow], shard_id: ShardId) -> Markup {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn render_worker_filters(
     status_filter: Option<&str>,
+    status_raw: &str,
+    status_error: Option<&str>,
     shard_filter: Option<i32>,
     stale_only: bool,
+    stale_raw: &str,
+    stale_error: Option<&str>,
     build_id_filter: Option<&str>,
     limit: i64,
 ) -> Markup {
@@ -4002,10 +4090,21 @@ fn render_worker_filters(
             label {
                 "Status"
                 select name="status" {
-                    option value="" selected[status_filter.is_none()] { "All" }
+                    option value="" selected[status_filter.is_none() && status_error.is_none()] { "All" }
                     @for s in ["Active", "Draining", "Stopped"] {
                         option value=(s) selected[status_filter == Some(s)] { (s) }
                     }
+                    // An unrecognized value is rendered as its own option so
+                    // the select echoes it back (rather than silently
+                    // reverting to "All") until the operator picks a valid
+                    // one — the `<select>` equivalent of a text input's
+                    // `value=` (Codex review, #1378 P2).
+                    @if status_error.is_some() {
+                        option value=(status_raw) selected { (status_raw) }
+                    }
+                }
+                @if let Some(error) = status_error {
+                    span.field-error role="alert" { (error) }
                 }
             }
             label {
@@ -4019,8 +4118,14 @@ fn render_worker_filters(
             label {
                 "Stale only"
                 select name="stale" {
-                    option value="" selected[!stale_only] { "All" }
+                    option value="" selected[!stale_only && stale_error.is_none()] { "All" }
                     option value="true" selected[stale_only] { "Stale only" }
+                    @if stale_error.is_some() {
+                        option value=(stale_raw) selected { (stale_raw) }
+                    }
+                }
+                @if let Some(error) = stale_error {
+                    span.field-error role="alert" { (error) }
                 }
             }
             label {
@@ -4037,18 +4142,13 @@ fn render_worker_pagination(
     page: i64,
     limit: i64,
     has_next: bool,
-    status_filter: Option<&str>,
+    status_raw: &str,
     shard_filter: Option<i32>,
-    stale_only: bool,
+    stale_raw: &str,
     build_id_filter: Option<&str>,
 ) -> Markup {
-    let base = build_worker_query_string(
-        limit,
-        status_filter,
-        shard_filter,
-        stale_only,
-        build_id_filter,
-    );
+    let base =
+        build_worker_query_string(limit, status_raw, shard_filter, stale_raw, build_id_filter);
     html! {
         div.pagination {
             @if page > 0 {
@@ -4074,17 +4174,21 @@ fn render_worker_pagination(
 
 fn build_worker_query_string(
     limit: i64,
-    status_filter: Option<&str>,
+    status_raw: &str,
     shard_filter: Option<i32>,
-    stale_only: bool,
+    stale_raw: &str,
     build_id_filter: Option<&str>,
 ) -> String {
     let mut out = String::new();
     if limit != DEFAULT_PAGE_SIZE {
         let _ = write!(out, "&limit={limit}");
     }
-    if let Some(status) = status_filter {
-        let _ = write!(out, "&status={}", url_encode(status));
+    // Carry the raw text (not the parsed value) so an invalid value's inline
+    // error persists across pagination instead of being silently dropped —
+    // same reasoning as `build_query_string`'s started_after/started_before
+    // handling on the Workflows page (Codex review, #1378 P2).
+    if !status_raw.is_empty() {
+        let _ = write!(out, "&status={}", url_encode(status_raw));
     }
     if let Some(build_id) = build_id_filter {
         let _ = write!(out, "&build_id={}", url_encode(build_id));
@@ -4092,8 +4196,8 @@ fn build_worker_query_string(
     if let Some(shard) = shard_filter {
         let _ = write!(out, "&shard={shard}");
     }
-    if stale_only {
-        let _ = write!(out, "&stale=true");
+    if !stale_raw.is_empty() {
+        let _ = write!(out, "&stale={}", url_encode(stale_raw));
     }
     out
 }
@@ -4682,7 +4786,7 @@ fn render_workflow_detail(
         }
 
         @if let Some(message) = flash {
-            div.flash { (message) }
+            div.flash role="status" tabindex="-1" autofocus { (message) }
         }
 
         @if let Some(error) = execution.error.as_deref() {
@@ -6603,7 +6707,7 @@ fn render_dag_detail(
 ) -> Markup {
     let body = html! {
         @if let Some(message) = flash {
-            div class="flash" { (message) }
+            div class="flash" role="status" tabindex="-1" autofocus { (message) }
         }
         h2 { "DAG " code { (dag_name) } " runs" }
         @if let Some(run_id) = selected_run {
@@ -7395,7 +7499,7 @@ fn render_build_routing_page(
         }
 
         @if let Some(msg) = flash {
-            div.flash { (msg) }
+            div.flash role="status" tabindex="-1" autofocus { (msg) }
         }
 
         @if !diverged_queues.is_empty() {
@@ -8680,9 +8784,14 @@ async fn schedule_bulk_pause_ui(
         .await
         .unwrap_or_default();
         acted_on += updated_ids.len();
-        for id in &updated_ids {
-            let id_str = id.to_string();
-            let ar = NewAuditRecord {
+        // One multi-row insert per shard, not one round trip per updated
+        // schedule (issue #1399). Every record shares the same
+        // actor/operation/route/status/shard, so only the target id varies.
+        // `insert_audit_batch` preserves that shape exactly.
+        let id_strs: Vec<String> = updated_ids.iter().map(ToString::to_string).collect();
+        let records: Vec<NewAuditRecord<'_>> = id_strs
+            .iter()
+            .map(|id_str| NewAuditRecord {
                 actor: "ui",
                 operation: OP_SCHEDULE_PAUSE,
                 target_type: TARGET_SCHEDULE,
@@ -8694,9 +8803,9 @@ async fn schedule_bulk_pause_ui(
                 error_summary: None,
                 shard_id: Some(shard_id.as_i32()),
                 source: SOURCE_UI,
-            };
-            let _ = insert_audit(&mut conn, &ar).await;
-        }
+            })
+            .collect();
+        let _ = insert_audit_batch(&mut conn, &records).await;
     }
 
     schedule_bulk_redirect(&format!("Paused {acted_on} schedule(s)"))
@@ -8772,9 +8881,12 @@ async fn schedule_bulk_resume_ui(
         .await
         .unwrap_or_default();
         acted_on += updated_ids.len();
-        for id in &updated_ids {
-            let id_str = id.to_string();
-            let ar = NewAuditRecord {
+        // Same batching rationale as `schedule_bulk_pause_ui` above (issue
+        // #1399): one multi-row insert per shard, not one per resumed row.
+        let id_strs: Vec<String> = updated_ids.iter().map(ToString::to_string).collect();
+        let records: Vec<NewAuditRecord<'_>> = id_strs
+            .iter()
+            .map(|id_str| NewAuditRecord {
                 actor: "ui",
                 operation: OP_SCHEDULE_RESUME,
                 target_type: TARGET_SCHEDULE,
@@ -8786,9 +8898,9 @@ async fn schedule_bulk_resume_ui(
                 error_summary: None,
                 shard_id: Some(shard_id.as_i32()),
                 source: SOURCE_UI,
-            };
-            let _ = insert_audit(&mut conn, &ar).await;
-        }
+            })
+            .collect();
+        let _ = insert_audit_batch(&mut conn, &records).await;
     }
 
     schedule_bulk_redirect(&format!("Resumed {acted_on} schedule(s)"))
@@ -8864,7 +8976,7 @@ fn render_schedules_page(
         h2 { "Schedules" }
 
         @if let Some(message) = flash {
-            div.flash { (message) }
+            div.flash role="status" tabindex="-1" autofocus { (message) }
         }
 
         @if !unhealthy_summary.is_empty() {
@@ -9763,7 +9875,7 @@ fn render_schedule_runs_page(
         // "failed" count is the only place the operator is told about a partial
         // dispatch, so the message must not be dropped.
         @if let Some(message) = flash {
-            div.flash role="status" { (message) }
+            div.flash role="status" tabindex="-1" autofocus { (message) }
         }
 
         (render_schedule_drilldown_header(row, shard_id, "runs"))
@@ -11368,18 +11480,35 @@ mod tests {
     #[test]
     fn build_worker_query_string_empty_defaults() {
         assert_eq!(
-            build_worker_query_string(DEFAULT_PAGE_SIZE, None, None, false, None),
+            build_worker_query_string(DEFAULT_PAGE_SIZE, "", None, "", None),
             ""
         );
     }
 
     #[test]
     fn build_worker_query_string_includes_all_params() {
-        let q = build_worker_query_string(10, Some("Active"), Some(1), true, None);
+        let q = build_worker_query_string(10, "Active", Some(1), "true", None);
         assert!(q.contains("limit=10"));
         assert!(q.contains("status=Active"));
         assert!(q.contains("shard=1"));
         assert!(q.contains("stale=true"));
+    }
+
+    /// GREEN — the fix under test: an invalid raw value (which a caller would
+    /// otherwise have parsed to `None`/`false` and lost) is carried through
+    /// verbatim, so a Next/Previous click doesn't drop the still-unresolved
+    /// filter and its inline error (Codex review, #1378 P2).
+    #[test]
+    fn build_worker_query_string_carries_invalid_raw_values() {
+        let q = build_worker_query_string(DEFAULT_PAGE_SIZE, "zombie", None, "True", None);
+        assert!(
+            q.contains("status=zombie"),
+            "an invalid status must still round-trip through pagination: {q}"
+        );
+        assert!(
+            q.contains("stale=True"),
+            "an invalid stale value must still round-trip through pagination: {q}"
+        );
     }
 
     #[test]
@@ -12313,10 +12442,40 @@ mod tests {
     #[test]
     fn layout_dead_letters_includes_build_routing_nav_link() {
         let body = html! { p { "test" } };
-        let html = layout_dead_letters("Test", &body, None).into_string();
+        let html = layout_dead_letters("Test", &body, None, "").into_string();
         assert!(
             html.contains("build-routing"),
             "layout_dead_letters must include a Build Routing nav link"
+        );
+    }
+
+    #[test]
+    fn layout_dead_letters_refresh_tag_targets_flash_free_url() {
+        // A targetless `meta refresh` would reload this page's own URL.
+        // If that URL still carries `flash=...`, every auto-refresh
+        // interval re-announces and re-focuses the same stale message.
+        // The tag must instead point `url=` at the flash-free target the
+        // caller supplies.
+        let body = html! { p { "test" } };
+        let html = layout_dead_letters("Test", &body, Some(30), "../ui/dead-letters?limit=50")
+            .into_string();
+        assert!(
+            html.contains(r#"content="30; url=../ui/dead-letters?limit=50""#),
+            "refresh tag must target the flash-free URL: {html}"
+        );
+    }
+
+    #[test]
+    fn dead_letters_page_refresh_target_preserves_current_page() {
+        // PR #1396 review: the auto-refresh target must keep the operator
+        // on the page they were reading, not bounce them to page 0.
+        let filters = DeadLetterUiFilters::default();
+        let html =
+            render_dead_letters_page(&filters, &[], &[], false, 2, 50, false, 0, Some(30), None)
+                .into_string();
+        assert!(
+            html.contains(r"url=../ui/dead-letters?page=2"),
+            "refresh target must preserve page=2: {html}"
         );
     }
 
@@ -12496,7 +12655,18 @@ mod tests {
 
     #[test]
     fn render_worker_filters_includes_build_id_filter() {
-        let html = render_worker_filters(None, None, false, None, DEFAULT_PAGE_SIZE).into_string();
+        let html = render_worker_filters(
+            None,
+            "",
+            None,
+            None,
+            false,
+            "",
+            None,
+            None,
+            DEFAULT_PAGE_SIZE,
+        )
+        .into_string();
         assert!(
             html.contains("build_id"),
             "worker filters must include build_id input"
@@ -12504,8 +12674,151 @@ mod tests {
     }
 
     #[test]
+    fn render_worker_filters_shows_inline_errors() {
+        let html = render_worker_filters(
+            None,
+            "zombie",
+            Some("Unknown status 'zombie'; expected Active, Draining, or Stopped. Filter not applied."),
+            None,
+            false,
+            "True",
+            Some("Unknown stale value 'True'; expected 'true' or 'false'. Filter not applied."),
+            None,
+            DEFAULT_PAGE_SIZE,
+        )
+        .into_string();
+        assert!(
+            html.contains("field-error") && html.contains("zombie"),
+            "status error must render inline: {html}"
+        );
+        assert!(
+            html.contains("True"),
+            "stale error must render inline: {html}"
+        );
+    }
+
+    /// GREEN — the fix under test: the invalid raw value is echoed back as
+    /// the `<select>`'s selected option (not silently reverted to "All"), so
+    /// resubmitting the form unchanged resends the same bad value and the
+    /// operator sees the same error again rather than it vanishing (Codex
+    /// review, #1378 P2).
+    #[test]
+    fn render_worker_filters_echoes_invalid_raw_value_as_selected_option() {
+        let html = render_worker_filters(
+            None,
+            "zombie",
+            Some("Unknown status 'zombie'; expected Active, Draining, or Stopped. Filter not applied."),
+            None,
+            false,
+            "",
+            None,
+            None,
+            DEFAULT_PAGE_SIZE,
+        )
+        .into_string();
+        assert!(
+            html.contains("option value=\"zombie\" selected"),
+            "the invalid status must be echoed back as the selected option: {html}"
+        );
+    }
+
+    #[test]
+    fn parse_worker_status_filter_accepts_known_values_case_insensitively() {
+        assert_eq!(
+            parse_worker_status_filter(Some("Active")),
+            (Some("Active"), "Active".to_string(), None)
+        );
+        assert_eq!(
+            parse_worker_status_filter(Some("draining")),
+            (Some("Draining"), "draining".to_string(), None)
+        );
+        assert_eq!(
+            parse_worker_status_filter(Some("STOPPED")),
+            (Some("Stopped"), "STOPPED".to_string(), None)
+        );
+    }
+
+    /// GREEN — the fix under test: an unrecognized status no longer aborts
+    /// `list_workers_ui`. It degrades to "filter not applied" (parsed is
+    /// `None`) while carrying the raw text and a recovery message, so the
+    /// page can redisplay the form inline instead of discarding it — same
+    /// contract as `parse_started_bound` on the Workflows page (#1333).
+    /// Before this change, `parse_worker_ui_filters` `?`-propagated a bare
+    /// `AutumnError::bad_request_msg` here, which aborted the whole
+    /// `/workers` response before the filter form (or the `build_id`/`shard`
+    /// filters the operator had already typed) was ever rendered — see the
+    /// RED baseline in
+    /// `tests/ui_integration.rs::ui_workers_unknown_status_value_redisplays_form_instead_of_aborting_page`.
+    #[test]
+    fn parse_worker_status_filter_rejects_unknown_value_without_erroring() {
+        let (parsed, raw, error) = parse_worker_status_filter(Some("zombie"));
+        assert_eq!(parsed, None, "an invalid status must not be applied");
+        assert_eq!(
+            raw, "zombie",
+            "the operator's exact raw input is echoed back"
+        );
+        let error = error.expect("an invalid status must carry a redisplayable error");
+        assert!(
+            error.contains("zombie") && error.contains("Active"),
+            "error names the bad value and a valid option: {error}"
+        );
+    }
+
+    #[test]
+    fn parse_worker_status_filter_blank_or_missing_is_not_an_error() {
+        assert_eq!(
+            parse_worker_status_filter(None),
+            (None, String::new(), None)
+        );
+        assert_eq!(
+            parse_worker_status_filter(Some("   ")),
+            (None, String::new(), None)
+        );
+    }
+
+    #[test]
+    fn parse_worker_stale_filter_accepts_true_and_false() {
+        assert_eq!(
+            parse_worker_stale_filter(Some("true")),
+            (true, "true".to_string(), None)
+        );
+        assert_eq!(
+            parse_worker_stale_filter(Some("false")),
+            (false, "false".to_string(), None)
+        );
+    }
+
+    /// Same fix, applied to the `stale` field: an unrecognized value (e.g.
+    /// the very plausible `True`, since matching is case-sensitive by
+    /// design — see the field's existing semantics) no longer `?`-aborts the
+    /// page.
+    #[test]
+    fn parse_worker_stale_filter_rejects_unknown_value_without_erroring() {
+        let (parsed, raw, error) = parse_worker_stale_filter(Some("True"));
+        assert!(!parsed, "an invalid stale value must not be applied");
+        assert_eq!(raw, "True", "the operator's exact raw input is echoed back");
+        let error = error.expect("an invalid stale value must carry a redisplayable error");
+        assert!(
+            error.contains("True") && error.contains("true"),
+            "error names the bad value and the expected values: {error}"
+        );
+    }
+
+    #[test]
+    fn parse_worker_stale_filter_blank_or_missing_is_not_an_error() {
+        assert_eq!(
+            parse_worker_stale_filter(None),
+            (false, String::new(), None)
+        );
+        assert_eq!(
+            parse_worker_stale_filter(Some("   ")),
+            (false, String::new(), None)
+        );
+    }
+
+    #[test]
     fn build_worker_query_string_includes_build_id() {
-        let q = build_worker_query_string(DEFAULT_PAGE_SIZE, None, None, false, Some("abc123"));
+        let q = build_worker_query_string(DEFAULT_PAGE_SIZE, "", None, "", Some("abc123"));
         assert!(
             q.contains("build_id=abc123"),
             "query string must include build_id"

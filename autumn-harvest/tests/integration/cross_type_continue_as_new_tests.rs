@@ -24,6 +24,10 @@
 //!   continue either.
 //! - **Success metric** — after a transition, `signal_with_start` naming the
 //!   *new* type attaches to the live successor rather than starting a duplicate.
+//! - **Issue #1161** — the transition's payload cap is the TARGET type's own
+//!   `max_input_bytes`. A target declaring no override falls back to a
+//!   tightened fleet-wide floor. A target declaring its own larger override
+//!   admits a payload the floor alone would reject.
 //!
 //! Execution: set `HARVEST_TEST_DATABASE_URL` to a migrated Postgres to run
 //! against it, otherwise a testcontainers instance is booted.
@@ -38,7 +42,7 @@ use autumn_harvest::execution::{
 };
 use autumn_harvest::info::WorkflowHandlerFn;
 use autumn_harvest::models::WorkflowExecution;
-use autumn_harvest::schema::{harvest_signals, harvest_workflow_executions};
+use autumn_harvest::schema::{harvest_schedules, harvest_signals, harvest_workflow_executions};
 use autumn_harvest::types::{
     ExecutionId, Priority, StartSource, WorkflowIdConflictPolicy, WorkflowIdReusePolicy,
 };
@@ -111,6 +115,31 @@ fn phase_two_awaits_signal<'a>(
             .await
             .map_err(|e| e.to_string())?;
         Ok(serde_json::json!({"ran": "phase_two", "signal": payload}))
+    })
+}
+
+/// Phase 1 variant that forwards `input["payload"]` verbatim as the
+/// transition's own input. A test can then control the transition
+/// payload's size, independently of the fixed `{"phase": "two"}` `phase_one`
+/// sends.
+fn phase_one_forwarding<'a>(
+    ctx: &'a WorkflowContext,
+    input: serde_json::Value,
+) -> Pin<Box<dyn std::future::Future<Output = Result<serde_json::Value, String>> + Send + 'a>> {
+    Box::pin(async move {
+        let target = input
+            .get("next_type")
+            .and_then(serde_json::Value::as_str)
+            .expect("phase_one_forwarding input must carry next_type")
+            .to_string();
+        let payload = input
+            .get("payload")
+            .cloned()
+            .unwrap_or_else(|| serde_json::json!({}));
+        ctx.continue_as_new_as_type(&target, payload)
+            .await
+            .map_err(|e| e.to_string())?;
+        unreachable!("continue_as_new_as_type must not resolve");
     })
 }
 
@@ -563,6 +592,204 @@ async fn successor_without_declared_defaults_does_not_inherit_the_predecessors()
     assert!(
         after.owner.is_none(),
         "a target declaring no owner must not inherit the predecessor's"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Issue #1161 — a cross-type transition's payload cap is the TARGET's own
+// ---------------------------------------------------------------------------
+
+/// A target type declaring NO `max_input_bytes` override falls back to a
+/// small fleet-wide floor, even though the PREDECESSOR ran under its own
+/// larger declared cap. A type change is not an escape hatch from a phase's
+/// tightened cap.
+#[tokio::test]
+async fn a_tightened_target_cap_rejects_an_oversized_transition() {
+    let (url, _c) = setup_test_database_url_or_env().await;
+    let mut conn = connect(&url).await;
+
+    let phase1 = leaked("trial_subscription");
+    let phase2 = leaked("paid_subscription");
+    let workflow_id = format!("sub-{}", Uuid::new_v4().simple());
+    let big_payload = serde_json::json!({"blob": "x".repeat(300)});
+
+    let predecessor = start_root(
+        &mut conn,
+        phase1,
+        &workflow_id,
+        serde_json::json!({"next_type": phase2, "payload": big_payload}),
+    )
+    .await;
+
+    // Phase 1 declares its OWN large override; phase 2 declares none, so it
+    // falls back to the small fleet-wide floor set below.
+    let mut source = wf(phase1, phase_one_forwarding);
+    source.max_input_bytes = Some(10_000);
+    let target = wf(phase2, phase_two);
+    let reg = Arc::new(
+        HandlerRegistry::new(vec![source, target], vec![])
+            .with_payload_caps(10_000, 100, 10_000, 10_000),
+    );
+
+    let worker = build_runtime_worker("w-1161-tightened", 2, 1, reg);
+    let handle = spawn_test_worker(Arc::clone(&worker), build_test_pool(&url));
+    let failed = wait_for_execution_state(&url, predecessor, "FAILED").await;
+    worker.shutdown();
+    handle.await.expect("worker join");
+
+    let error = failed
+        .error
+        .expect("a terminal failure must carry an error");
+    assert!(
+        error.contains(phase2),
+        "the operator message must name the target type, got: {error}"
+    );
+
+    let history = load_history_from_url(&url, predecessor).await;
+    assert!(
+        !history
+            .events
+            .iter()
+            .any(|e| matches!(e, WorkflowEvent::WorkflowContinuedAsNew { .. })),
+        "a cap-rejected transition may not record a continue-as-new"
+    );
+    let rows: i64 = harvest_workflow_executions::table
+        .filter(harvest_workflow_executions::workflow_id.eq(&workflow_id))
+        .count()
+        .get_result(&mut conn)
+        .await
+        .expect("count rows");
+    assert_eq!(
+        rows, 1,
+        "no successor may be created when the target's cap rejects the input"
+    );
+}
+
+/// A cap-rejected transition on a SCHEDULED run must increment the
+/// schedule's consecutive-failure counter (Codex P2 on PR #1399). The
+/// predecessor's real outcome is a terminal failure, not a continuation.
+/// Leaving the counter untouched would let a schedule whose target
+/// deterministically rejects every fire evade failure-based auto-pausing.
+#[tokio::test]
+async fn a_cap_rejected_transition_increments_the_schedules_failure_counter() {
+    let (url, _c) = setup_test_database_url_or_env().await;
+    let mut conn = connect(&url).await;
+
+    let phase1 = leaked("trial_subscription");
+    let phase2 = leaked("paid_subscription");
+    let workflow_id = format!("sub-{}", Uuid::new_v4().simple());
+    let big_payload = serde_json::json!({"blob": "x".repeat(300)});
+
+    let predecessor = start_root(
+        &mut conn,
+        phase1,
+        &workflow_id,
+        serde_json::json!({"next_type": phase2, "payload": big_payload}),
+    )
+    .await;
+
+    // This predecessor is a scheduled run: stamp `schedule_id`/`origin` onto
+    // it and insert a schedule row with a failure limit, exactly like a real
+    // scheduler-fired execution.
+    let schedule_id = Uuid::new_v4();
+    diesel::insert_into(harvest_schedules::table)
+        .values((
+            harvest_schedules::dsl::id.eq(schedule_id),
+            harvest_schedules::dsl::workflow_name.eq(phase1),
+            harvest_schedules::dsl::schedule_expr.eq("interval:60"),
+            harvest_schedules::dsl::timezone.eq("UTC"),
+            harvest_schedules::dsl::catchup.eq(false),
+            harvest_schedules::dsl::max_active_runs.eq(10),
+            harvest_schedules::dsl::is_paused.eq(false),
+            harvest_schedules::dsl::next_run_at.eq(Utc::now() - ChronoDuration::seconds(5)),
+            harvest_schedules::dsl::jitter_secs.eq(0_i64),
+            harvest_schedules::dsl::overlap_policy.eq("skip"),
+            harvest_schedules::dsl::buffered_runs.eq(serde_json::json!([])),
+            harvest_schedules::dsl::buffer_all_max.eq(100),
+            harvest_schedules::dsl::skip_policy.eq("skip"),
+            harvest_schedules::dsl::consecutive_failure_limit.eq(3),
+        ))
+        .execute(&mut conn)
+        .await
+        .expect("insert schedule");
+    diesel::update(harvest_workflow_executions::table.find(predecessor.as_uuid()))
+        .set((
+            harvest_workflow_executions::schedule_id.eq(Some(schedule_id)),
+            harvest_workflow_executions::origin.eq(Some("scheduled")),
+        ))
+        .execute(&mut conn)
+        .await
+        .expect("stamp schedule lineage");
+
+    // Phase 2 declares no override, so it falls back to the small fleet-wide
+    // floor — the same tightened-cap shape as the sibling test above.
+    let source = wf(phase1, phase_one_forwarding);
+    let target = wf(phase2, phase_two);
+    let reg = Arc::new(
+        HandlerRegistry::new(vec![source, target], vec![])
+            .with_payload_caps(10_000, 100, 10_000, 10_000),
+    );
+
+    let worker = build_runtime_worker("w-1161-schedule-counter", 2, 1, reg);
+    let handle = spawn_test_worker(Arc::clone(&worker), build_test_pool(&url));
+    wait_for_execution_state(&url, predecessor, "FAILED").await;
+    worker.shutdown();
+    handle.await.expect("worker join");
+
+    let consecutive_failure_count: i32 = harvest_schedules::table
+        .find(schedule_id)
+        .select(harvest_schedules::dsl::consecutive_failure_count)
+        .first(&mut conn)
+        .await
+        .expect("load schedule");
+    assert_eq!(
+        consecutive_failure_count, 1,
+        "a cap-rejected transition on a scheduled run must count as a schedule failure, \
+         not be silently left uncounted as a successful continuation"
+    );
+}
+
+/// A target type declaring a LARGER `max_input_bytes` than the fleet-wide
+/// floor must honour that widened cap. A transition the floor alone would
+/// reject must succeed when the target's own declared cap covers it.
+#[tokio::test]
+async fn a_widened_target_cap_admits_a_transition_the_floor_alone_would_reject() {
+    let (url, _c) = setup_test_database_url_or_env().await;
+    let mut conn = connect(&url).await;
+
+    let phase1 = leaked("trial_subscription");
+    let phase2 = leaked("paid_subscription");
+    let workflow_id = format!("sub-{}", Uuid::new_v4().simple());
+    let big_payload = serde_json::json!({"blob": "x".repeat(300)});
+
+    let predecessor = start_root(
+        &mut conn,
+        phase1,
+        &workflow_id,
+        serde_json::json!({"next_type": phase2, "payload": big_payload.clone()}),
+    )
+    .await;
+
+    let mut target = wf(phase2, phase_two);
+    target.max_input_bytes = Some(10_000);
+    let reg = Arc::new(
+        HandlerRegistry::new(vec![wf(phase1, phase_one_forwarding), target], vec![])
+            .with_payload_caps(100, 100, 100, 100),
+    );
+    // `with_payload_caps`'s 2nd argument is the fleet-wide workflow-input
+    // floor. 100 bytes is comfortably below the 300-byte transition payload.
+    // Only the target's own 10,000-byte override can admit it.
+
+    let (successor, _) = drive_transition(&url, predecessor, reg, "w-1161-widened").await;
+    let after = load_execution(&mut conn, successor).await;
+
+    assert_eq!(
+        after.workflow_name, phase2,
+        "the widened-cap transition must succeed and land on the target type"
+    );
+    assert_eq!(
+        after.input, big_payload,
+        "the successor's input must be the full, uncapped-by-the-floor payload"
     );
 }
 

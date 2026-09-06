@@ -51,9 +51,9 @@ this page says nothing about what they cost; see
   sequentially scans and sorts every eligible pending row on every single
   claim. See [the plan](#the-plan) below.
   **Fixing that key would not be sufficient on its own**: issue #1177 shows
-  any single one of the query's other residual `WHERE` predicates
+  any single one of ten other residual `WHERE` predicates it tested
   independently defeats sort-elision and `LIMIT` pushdown too, even at zero
-  selectivity. See
+  selectivity — the query carries an eleventh, untested by that issue. See
   [any residual predicate defeats sort-elision](#any-residual-predicate-defeats-sort-elision-issue-1177).
 * **Only one predicate is genuinely expensive: per-key concurrency (+644% p50).**
   Build-id routing (+13%), the rate-limit gate (+2%) and the circuit-breaker
@@ -469,10 +469,11 @@ Three things to read here:
 
    > **Follow-up (issue #1177):** the `CASE` key is *sufficient* to force this
    > plan shape, but it is not *necessary* — removing it would not restore
-   > sort-elision, because any one of the query's other residual `WHERE`
-   > predicates independently forces the same collapsed shape (a full-backlog
-   > scan plus `Sort`), including several that are total no-ops at 100%
-   > selectivity. See
+   > sort-elision, because any one of ten other residual `WHERE` predicates
+   > issue #1177 tested independently forces the same collapsed shape (a
+   > full-backlog scan plus `Sort`), including several that are total no-ops
+   > at 100% selectivity; the query carries an eleventh, untested by that
+   > issue. See
    > [any residual predicate defeats sort-elision](#any-residual-predicate-defeats-sort-elision-issue-1177)
    > below. Point 1 above remains accurate as far as it goes; it is incomplete
    > as an explanation of the superlinear scaling, since dropping the `CASE`
@@ -531,12 +532,13 @@ exactly `idx_harvest_tq_poll`'s key — so the cheap plan should return.
 **It does not.** Issue #1177 reproduces that, with the `CASE` removed entirely
 from `ORDER BY` (leaving only `priority DESC, scheduled_at` — an exact match
 for `idx_harvest_tq_poll`'s key) and **no planner hints in play**, adding
-**any single one** of the query's other residual `WHERE` predicates —
+**any single one** of ten other residual `WHERE` predicates it tested —
 including several with **zero actual selectivity** (100% of rows pass the
 filter) — is already enough on its own for the planner to choose a
 full-backlog scan (`Seq Scan` for most predicates tested, `Bitmap Heap Scan`
 for a few) plus a `Sort`, instead of the ordered index scan. This holds with
-and without `FOR UPDATE SKIP LOCKED`.
+and without `FOR UPDATE SKIP LOCKED`. (The query carries an eleventh
+residual predicate this reproduction did not test — see below.)
 
 Ten predicates were tested independently against a 255 020-row fixture
 (119 940 PENDING rows in the `default` queue), each added alone to the base
@@ -555,6 +557,19 @@ misestimate. What does rule that out is the separate diagnostic below: it
 shows the sort-elision candidate isn't rejected on a cost comparison at all
 — it is never generated as a candidate in the first place, regardless of
 what any selectivity estimate says.
+
+**These ten are not the query's complete set of residual predicates.**
+`claim_task_query()` also carries an eleventh: the activity-pause exclusion,
+`NOT (activity_name = ANY(paused_activities.names))` (issue #807) —
+structurally the same array-membership anti-join shape as the queue-pause
+predicate above (#619). Issue #1177's reproduction did not test it; nothing
+above should be read as covering it. Issue #1215 tested it separately, with
+`harvest_activity_pauses` actually populated (every predicate above was
+tested against an empty pause table) rather than as a structural no-op, and
+found it triggers the claim sort's disk spill at roughly 10x lower backlog
+depth than this issue's own no-op-predicate threshold — a materially
+different, and independently interesting, cost profile from the one
+established here.
 
 **A separate, narrower diagnostic goes further, for the sticky-routing
 predicate specifically, under `FOR UPDATE SKIP LOCKED`.** With the competing
@@ -662,12 +677,14 @@ transfers to a genuinely multi-queue bind has not been checked here.
 **What this means for the query as it stands today:** there is no realistic
 deployment shape that gets the cheap index-ordered plan back, because
 `claim_task_query()` always carries at least the `schedule_to_close_at`
-check, the sticky/session OR-chains, and the queue-pause anti-join
-unconditionally — dropping just the `CASE` key would not be sufficient, and
-no single index can make the `sticky`/`session`/`schedule_to_close` scalar
-checks, the concurrency-key gate, three different `EXISTS` subqueries
-against three different tables, and the `jsonb_array_elements` capability
-walk simultaneously sargable against one ordered index.
+check, the sticky/session OR-chains, and the queue-pause and activity-pause
+anti-joins unconditionally — dropping just the `CASE` key would not be
+sufficient, and no single index can make the `sticky`/`session`/
+`schedule_to_close` scalar checks, the concurrency-key gate, three different
+`EXISTS` subqueries against three different tables, and the
+`jsonb_array_elements` capability walk simultaneously sargable against one
+ordered index — eleven residual predicates in total, not the ten this
+section's own reproduction tested (see above).
 
 **This page does not propose a query change for it.** Per the same
 measure-before-tune discipline issue #786 established, a genuine fix here
@@ -1073,6 +1090,51 @@ high-priority rows can share a saturated key — an unbounded,
 workload-dependent worst case neither prior candidate has. (`LEFT JOIN
 LATERAL` + planner hints, the *other* shape #3 named, was never re-tested:
 the three-rewrites section above already closes it.)
+
+**A third shape — batching #4's per-row retry into a single-round-trip
+per-batch fetch, the specific rewrite issue #1340 was deferred pending —
+was measured and also killed, on its pre-registration's arithmetic and on a
+narrower mechanism than first reported:**
+`docs/assays/0005-claim-batched-seek-and-refine.md` (ledger #5) fetches the
+top 50 ordered candidates per round trip, then walks them procedurally
+applying the production path's own per-candidate advisory-lock-and-recheck
+(`queue.rs:750-770`) rather than a batch-wide snapshot. Idle cost, the
+5,000-key blowup, the 256-key case, and both adversarial fixtures'
+wall-clock all pass decisively; batch-count scaling under adversarial depth
+is linear, not catastrophic. It still kills: both adversarial fixtures
+resolved in one more batch than their pre-registered "exactly N" line
+allowed, because that line's own formula undercounted by the one slot the
+claimable row itself occupies. Five rounds of post-review (Codex) further
+found: the report had mischaracterized the candidate fetch as an
+index-ordered seek through `idx_harvest_tq_poll`; the archived `EXPLAIN`
+output shows a `Seq Scan` of the whole matching backlog instead (the same
+shape the committed fix's own control query plans as, at this apparatus's
+10,000-row depth), and a forced-index diagnostic shows forcing the index
+doesn't recover a bounded scan either — still reads every matching row,
+costs more, no `LIMIT` pushdown (a proposed alternative explanation, that
+the assay's own added tiebreak column caused this, was checked directly
+and did not hold up). Separately, the first fix's winner-pick used a stale
+batch-wide snapshot with no serialization at all instead of the advisory
+lock above — a real concurrency-correctness gap a single-session apparatus
+can't surface on its own, fixed to match the mechanism ledger #4 already
+had right (grading the fix against the original lines rather than
+re-chartering was itself reviewed and defended: the lines never changed,
+only an unsound implementation was corrected, and the fixture's own
+adversarial scenarios already exercise the corrected mechanism's cost
+without regressing). And the recheck's own cost, cited as "~1 buffer," is
+34 buffers once the `RUNNING` population reaches 2,000 rows — cardinality
+independence holds for distinct key count, not for `RUNNING` population
+size, a distinction this apparatus's fixtures didn't separate. So the
+assay's surviving claim is narrower than first reported: the per-candidate
+recheck's cost is independent of distinct key count, and batching doesn't
+cost more than the current (already `O(backlog)` at this depth) fix — not
+that batching bounds cost as backlog depth grows, which remains untested.
+That gap also surfaces an unresolved discrepancy against this page's own
+#1177 baseline (reported there as a clean index scan with no `Sort` node,
+at a much larger fixture); a corrected-arithmetic re-charter, a
+depth-varying re-charter, that discrepancy, real concurrent-claimer
+throughput, and cost when many in-batch rejections coincide with a large
+`RUNNING` population all remain open, un-run pits.
 
 Until a fix clears every line of some registered assay, deployments with
 concurrency-key cardinality in the low hundreds (the tested, committed

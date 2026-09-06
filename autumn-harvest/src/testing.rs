@@ -4331,36 +4331,34 @@ async fn read_bundle_manifest(dir: &std::path::Path) -> BundleManifest {
 
 /// Recursively collect `*.json` files under `dir`.
 ///
-/// Returns `Err` if the top-level `dir` cannot be read so the caller can
-/// surface it as a harness error rather than silently returning zero fixtures.
+/// Returns `Err` on the first unreadable directory, entry, or file type, at
+/// any depth (issue #1174). The caller then reports a harness error instead
+/// of a silently short list.
 async fn collect_json_files(
     dir: &std::path::Path,
 ) -> Result<Vec<std::path::PathBuf>, std::io::Error> {
     let mut files = Vec::new();
     let mut dirs_to_visit = vec![dir.to_path_buf()];
 
-    // Probe the top-level directory explicitly so a missing/unreadable path
-    // is distinguishable from a legitimately empty directory.
-    let _ = tokio::fs::read_dir(dir).await?;
-
     while let Some(current_dir) = dirs_to_visit.pop() {
-        if let Ok(mut entries) = tokio::fs::read_dir(&current_dir).await {
-            while let Ok(Some(entry)) = entries.next_entry().await {
-                let path = entry.path();
-                if let Ok(file_type) = entry.file_type().await {
-                    if file_type.is_dir() {
-                        dirs_to_visit.push(path);
-                    } else if path.extension().and_then(|s| s.to_str()) == Some("json")
-                        // A replay-drift bundle (issue #798) carries its coverage
-                        // manifest alongside the fixtures. It is not a history, so
-                        // replaying it would produce a spurious harness error and
-                        // fail the gate for a well-formed bundle.
-                        && path.file_name().and_then(|s| s.to_str())
-                            != Some(crate::replay_sample::SampleManifest::FILE_NAME)
-                    {
-                        files.push(path);
-                    }
-                }
+        let mut entries = tokio::fs::read_dir(&current_dir).await?;
+        // `next_entry` returns `Ok(None)` at end of stream and `Err` on a
+        // read failure mid-iteration. `?` propagates only the latter, so a
+        // failure does not read like a clean end of stream.
+        while let Some(entry) = entries.next_entry().await? {
+            let path = entry.path();
+            let file_type = entry.file_type().await?;
+            if file_type.is_dir() {
+                dirs_to_visit.push(path);
+            } else if path.extension().and_then(|s| s.to_str()) == Some("json")
+                // A replay-drift bundle (issue #798) carries its coverage
+                // manifest alongside the fixtures. It is not a history, so
+                // replaying it would produce a spurious harness error and
+                // fail the gate for a well-formed bundle.
+                && path.file_name().and_then(|s| s.to_str())
+                    != Some(crate::replay_sample::SampleManifest::FILE_NAME)
+            {
+                files.push(path);
             }
         }
     }

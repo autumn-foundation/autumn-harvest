@@ -244,11 +244,21 @@ pub enum FindingClass {
     /// *because it did not look*, and reporting that as a pass is the single
     /// most dangerous false-clean a restore drill can emit.
     ProbeFailed,
+    /// A recorded child terminal or delivered external effect targets an
+    /// execution absent from its own shard, and no `harvest_execution_summaries`
+    /// row proves retention collected it.
+    ///
+    /// Absence has two causes this tool cannot otherwise tell apart. One is
+    /// ordinary retention, which is benign. The other is the target shard
+    /// restored to a point BEFORE the target ever existed, a genuine
+    /// cross-shard break. A retention summary is durable proof of the first.
+    /// Without one, a silent pass would hide the second (issue #1205).
+    RetentionUnproven,
 }
 
 impl FindingClass {
     /// Every class, in a stable order. Used by tests and by the runbook table.
-    pub const ALL: [Self; 24] = [
+    pub const ALL: [Self; 25] = [
         Self::DeadWorkerRunningTask,
         Self::TimedOutTask,
         Self::WorkflowDeadlineExpired,
@@ -273,6 +283,7 @@ impl FindingClass {
         Self::UninspectedShardReference,
         Self::WorkflowIdTargetUnchecked,
         Self::ProbeFailed,
+        Self::RetentionUnproven,
     ];
 
     /// The fixed severity of this class.
@@ -309,7 +320,7 @@ impl FindingClass {
             | Self::UninspectedShardReference
             | Self::WorkflowIdTargetUnchecked => FindingSeverity::Advisory,
 
-            Self::ProbeFailed => FindingSeverity::Undetermined,
+            Self::ProbeFailed | Self::RetentionUnproven => FindingSeverity::Undetermined,
         }
     }
 
@@ -341,6 +352,7 @@ impl FindingClass {
             Self::UninspectedShardReference => "uninspected_shard_reference",
             Self::WorkflowIdTargetUnchecked => "workflow_id_target_unchecked",
             Self::ProbeFailed => "probe_failed",
+            Self::RetentionUnproven => "retention_unproven",
         }
     }
 
@@ -425,6 +437,11 @@ impl FindingClass {
                 "the check could not run (a missing table usually means the restore \
                  produced an unmigrated or empty database)"
             }
+            Self::RetentionUnproven => {
+                "a recorded child terminal or delivered effect targets an absent \
+                 execution with no retention summary on record; retention and a \
+                 pre-creation rollback cannot be told apart from here"
+            }
         }
     }
 }
@@ -469,6 +486,21 @@ pub struct Finding {
 impl Finding {
     /// Builds a finding, deriving `severity`/`explanation` from `class` and
     /// clipping `samples` to [`MAX_FINDING_SAMPLES`].
+    ///
+    /// `truncated` is derived from `count` against the CLIPPED length, not
+    /// the pre-clip one. A caller may already have bounded `samples` itself.
+    /// The replay sampler caps each class's sample vector as it accumulates,
+    /// independently of this constructor, while `count` keeps growing past
+    /// that cap. Comparing pre-clip length alone would miss exactly that
+    /// case and report `false` on a genuinely partial enumeration.
+    ///
+    /// A finding with NO samples at all is never inferred as truncated. A
+    /// detail-only finding such as [`FindingClass::RestorePointSkew`] uses
+    /// `count: 1` and `samples: vec![]`. It names one condition by `detail`,
+    /// not an unlisted population, so `count` there is not a row total to
+    /// truncate against. A caller with even more information -- a
+    /// `LIMIT`ed query whose truncation this constructor cannot see at all
+    /// -- still overrides via [`Self::with_truncated`].
     #[must_use]
     pub fn new(
         class: FindingClass,
@@ -476,9 +508,9 @@ impl Finding {
         count: u64,
         samples: Vec<String>,
     ) -> Self {
-        let truncated = false;
         let mut samples = samples;
         samples.truncate(MAX_FINDING_SAMPLES);
+        let truncated = !samples.is_empty() && count > samples.len() as u64;
         Self {
             class,
             severity: class.severity(),
@@ -499,9 +531,13 @@ impl Finding {
     }
 
     /// Marks `samples` as a partial enumeration (`count` stays exact).
+    ///
+    /// ORs into the constructor-derived value rather than replacing it. A
+    /// caller can only ADD truncation information this way. It can never
+    /// retract the true state `new` already computed from `samples.len()`.
     #[must_use]
     pub const fn with_truncated(mut self, truncated: bool) -> Self {
-        self.truncated = truncated;
+        self.truncated = self.truncated || truncated;
         self
     }
 }
@@ -536,13 +572,21 @@ pub struct ReplaySummary {
 }
 
 impl ReplaySummary {
-    /// True when at least one history was actually replayed.
+    /// True when at least one history was actually replayed, AND every
+    /// sampled history that reached this check was actually read.
     ///
     /// A run whose samples were all skipped has verified *nothing* about
     /// replay-safety, and the report says so rather than implying a pass.
+    /// `unreadable > 0` is the same failure in a different shape. Those
+    /// histories were selected for replay and never read at all. A report
+    /// that still said `true` here would overstate coverage in exactly the
+    /// field an operator reads as "check (a) actually ran" (issue #1205).
+    /// `HistoryUnreadable` stays advisory-severity — one unreadable history
+    /// among many replayed must not fail the drill — but it must not read as
+    /// full coverage either.
     #[must_use]
     pub const fn verified(&self) -> bool {
-        self.clean > 0 || self.divergent > 0 || self.failed > 0
+        self.unreadable == 0 && (self.clean > 0 || self.divergent > 0 || self.failed > 0)
     }
 
     /// Folds another summary into this one.
@@ -1033,6 +1077,14 @@ pub struct VerifyOptions {
     /// Cross-shard restore-point skew above which a `RestorePointSkew`
     /// advisory is raised.
     pub max_skew_secs: i64,
+    /// The shard a pre-sharding (`ShardId::UNENCODED`) target id resolves to.
+    ///
+    /// Mirrors `ShardRouter::shard_for_execution` and
+    /// `ShardedDbPool::pool_for_execution`. Both fall back to the fleet's
+    /// configured default shard for the sentinel, never to whichever shard
+    /// happens to be observing the reference. Defaults to `0`, the
+    /// overwhelmingly common configuration.
+    pub default_shard: i32,
     /// The operator has confirmed every DSN points at a scratch database.
     ///
     /// Required by the CLI's live-DSN guard (AC4); the library itself does not
@@ -1048,6 +1100,7 @@ impl Default for VerifyOptions {
             probe_limit: DEFAULT_PROBE_LIMIT,
             worker_stale_secs: DEFAULT_WORKER_STALE_SECS,
             max_skew_secs: DEFAULT_MAX_SKEW_SECS,
+            default_shard: 0,
             scratch_ack: false,
         }
     }
@@ -1091,6 +1144,14 @@ impl VerifyOptions {
         self.probe_limit = limit;
         self
     }
+
+    /// Set the shard a pre-sharding (`ShardId::UNENCODED`) target id resolves
+    /// to, matching the fleet's configured default shard.
+    #[must_use]
+    pub const fn with_default_shard(mut self, shard_id: i32) -> Self {
+        self.default_shard = shard_id;
+        self
+    }
 }
 
 #[cfg(all(feature = "db", feature = "testing"))]
@@ -1109,8 +1170,9 @@ mod probes {
         VerifyOptions, compute_skew, redact_dsn,
     };
     use crate::event::WorkflowEvent;
+    use crate::shard::is_encodable_shard;
     use crate::testing::WorkflowReplayer;
-    use crate::types::{ExecutionId, ExternalTarget};
+    use crate::types::{ExecutionId, ExternalTarget, ShardId};
 
     /// One row of a bounded probe: a sample identifier plus the exact total
     /// (computed by a window function *before* `LIMIT`, so the count is never
@@ -1576,7 +1638,7 @@ mod probes {
 
         // ── Cross-shard references asserted by this shard's history ─────────
         let mut refs = Vec::new();
-        match collect_refs(&mut conn, shard_id, limit).await {
+        match collect_refs(&mut conn, shard_id, options.default_shard, limit).await {
             Ok(scan) => {
                 refs = scan.refs;
                 // A truncated scan did not adjudicate the remainder, so it is
@@ -1640,6 +1702,7 @@ mod probes {
     async fn collect_refs(
         conn: &mut AsyncPgConnection,
         shard_id: i32,
+        default_shard: i32,
         limit: i64,
     ) -> Result<CollectedRefs, String> {
         let (scan, truncation) = scan_reference_events(conn, limit).await?;
@@ -1652,7 +1715,7 @@ mod probes {
             )
         });
         Ok(CollectedRefs {
-            refs: build_refs(scan, shard_id),
+            refs: build_refs(scan, shard_id, default_shard),
             truncation,
             workflow_id_targets,
             undecodable,
@@ -2140,7 +2203,7 @@ mod probes {
     /// Turn a shard-local [`RefScan`] into the cross-shard references that still
     /// need adjudication (a started child with no recorded terminal, a recorded
     /// child terminal, or an unresolved external request).
-    fn build_refs(scan: RefScan, shard_id: i32) -> Vec<PendingRef> {
+    fn build_refs(scan: RefScan, shard_id: i32, default_shard: i32) -> Vec<PendingRef> {
         let RefScan {
             awaited,
             child_terminal,
@@ -2164,7 +2227,7 @@ mod probes {
                 };
                 out.push(PendingRef {
                     kind,
-                    owner_shard: owning_shard(*child, shard_id),
+                    owner_shard: owning_shard(*child, default_shard),
                     target: *child,
                     source_exec: *owner,
                     source_shard: shard_id,
@@ -2199,7 +2262,7 @@ mod probes {
                 };
                 out.push(PendingRef {
                     kind,
-                    owner_shard: owning_shard(*target, shard_id),
+                    owner_shard: owning_shard(*target, default_shard),
                     target: *target,
                     source_exec: *owner,
                     source_shard: shard_id,
@@ -2209,12 +2272,18 @@ mod probes {
         out
     }
 
-    /// Decode the owning shard from an execution id, falling back to the
-    /// observing shard for the `UNENCODED` (pre-sharding) sentinel.
-    fn owning_shard(id: Uuid, observing: i32) -> i32 {
+    /// Decode the owning shard from an execution id, falling back to
+    /// `default_shard` for the `UNENCODED` (pre-sharding) sentinel.
+    ///
+    /// Mirrors `ShardRouter::shard_for_execution` and
+    /// `ShardedDbPool::pool_for_execution`. Both resolve the sentinel to the
+    /// fleet's configured default shard, not to the OBSERVING shard (as this
+    /// used to). Those two differ whenever the reference is a legacy id and
+    /// the observing shard is not the default (issue #1205).
+    fn owning_shard(id: Uuid, default_shard: i32) -> i32 {
         let shard = ExecutionId::from_uuid(id).shard();
         if shard.is_unencoded() {
-            observing
+            default_shard
         } else {
             shard.as_i32()
         }
@@ -2397,6 +2466,26 @@ mod probes {
         lookup_errors: Vec<String>,
         lost_effect: Vec<String>,
         unverifiable_effect: Vec<String>,
+        retention_unproven: Vec<String>,
+    }
+
+    /// Does a `harvest_execution_summaries` row prove retention collected
+    /// `target`? `Ok(false)` means the absence is unexplained: it could still
+    /// be retention (summaries are opt-in, issue #752), but nothing here
+    /// proves it.
+    async fn retention_summary_exists(
+        conn: &mut AsyncPgConnection,
+        target: Uuid,
+    ) -> Result<bool, diesel::result::Error> {
+        let row: ExistsRow = diesel::sql_query(
+            "SELECT EXISTS ( \
+                 SELECT 1 FROM harvest_execution_summaries WHERE execution_id = $1 \
+               ) AS present",
+        )
+        .bind::<diesel::sql_types::Uuid, _>(target)
+        .get_result(conn)
+        .await?;
+        Ok(row.present)
     }
 
     /// Look up each reference's target on its owning shard and bucket the
@@ -2443,12 +2532,30 @@ mod probes {
                         r.target, r.owner_shard, r.source_exec, r.source_shard
                     ));
                 }
-                // A recorded child terminal (or a delivered external effect)
-                // whose execution row is gone is ordinary retention, not
-                // incoherence.
-                (RefKind::ChildTerminalRecorded, _)
-                | (RefKind::AwaitedChild, Some(_))
-                | (RefKind::ExternalEffectDelivered(_), None) => {}
+                // A recorded child terminal whose execution row exists AND is
+                // itself terminal matches what the owner recorded -- clean.
+                (RefKind::ChildTerminalRecorded | RefKind::AwaitedChild, Some(_)) => {}
+                // The execution row is gone entirely. Ordinary retention is
+                // ONE explanation. A target shard restored to before the
+                // execution ever existed is another. This tool cannot tell
+                // them apart without a durable marker. A retention summary is
+                // that marker. Present, it proves retention and the
+                // reference stays silent exactly as before. Absent, the
+                // absence is reported rather than assumed benign (issue
+                // #1205).
+                (RefKind::ChildTerminalRecorded | RefKind::ExternalEffectDelivered(_), None) => {
+                    match retention_summary_exists(conn, r.target).await {
+                        Ok(true) => {}
+                        Ok(false) => out.retention_unproven.push(format!(
+                            "{} (referenced by {} on shard {}; absent with no \
+                             retention summary on shard {})",
+                            r.target, r.source_exec, r.source_shard, r.owner_shard
+                        )),
+                        Err(e) => out
+                            .lookup_errors
+                            .push(format!("{} retention-summary lookup failed: {e}", r.target)),
+                    }
+                }
                 (RefKind::ExternalTarget, None) => {
                     out.missing_external.push(format!(
                         "{} (requested by {} on shard {})",
@@ -2741,6 +2848,7 @@ mod probes {
                 lookup_errors,
                 lost_effect,
                 unverifiable_effect,
+                retention_unproven,
             } = buckets;
 
             for (class, samples) in [
@@ -2753,6 +2861,7 @@ mod probes {
                     FindingClass::ExternalEffectUnverifiable,
                     unverifiable_effect,
                 ),
+                (FindingClass::RetentionUnproven, retention_unproven),
                 // A reference we could not adjudicate is Undetermined, never a
                 // pass: the row may be missing, or the query may simply have
                 // failed, and we must not guess which.
@@ -2786,6 +2895,26 @@ mod probes {
         }
 
         let mut cross_shard = resolve_refs(&refs, targets).await;
+
+        // Guard the library entry point too, not only the CLI. `VerifyOptions`
+        // is public and `default_shard` a plain field. A caller of
+        // `verify_restore` directly (`with_default_shard`, or a struct
+        // literal) can supply a value `owning_shard` can never match against
+        // any real target. Every unencoded reference would then read as the
+        // advisory `UninspectedShardReference`, letting a torn reference pass
+        // at exit 0. This makes that outcome `Undetermined` (exit 2) instead,
+        // whatever else the run found (issue #1205).
+        if !is_encodable_shard(ShardId::new(options.default_shard)) {
+            cross_shard.push(
+                Finding::new(FindingClass::ProbeFailed, None, 1, Vec::new()).with_detail(format!(
+                    "VerifyOptions::default_shard `{}` cannot be encoded into an execution \
+                     id (valid range is 0..={}); unencoded target resolution cannot be \
+                     trusted for this run",
+                    options.default_shard,
+                    crate::shard::MAX_ENCODABLE_SHARD
+                )),
+            );
+        }
 
         let skew = compute_skew(shards.iter().map(|s| s.latest_event_at));
         if let Some(secs) = skew
@@ -3022,6 +3151,7 @@ mod tests {
             (FindingClass::WorkflowIdTargetUnchecked, Advisory),
             // Looked at nothing -- never a pass.
             (FindingClass::ProbeFailed, Undetermined),
+            (FindingClass::RetentionUnproven, Undetermined),
         ];
         assert_eq!(
             expected.len(),
@@ -3248,6 +3378,24 @@ mod tests {
     }
 
     #[test]
+    fn replay_summary_is_not_verified_while_a_history_went_unread() {
+        // The bug: a run that replayed some histories clean but never even
+        // READ others must not report `verified() == true`. That field is
+        // read as "check (a) actually ran" (runbook 4.3). An unreadable
+        // history is a failure to look, not a declared, honest skip.
+        let partial = ReplaySummary {
+            sampled: 3,
+            clean: 2,
+            unreadable: 1,
+            ..ReplaySummary::default()
+        };
+        assert!(
+            !partial.verified(),
+            "a history that was never read must not be reported as covered: {partial:?}"
+        );
+    }
+
+    #[test]
     fn replay_summary_merge_is_additive() {
         let mut a = ReplaySummary {
             sampled: 2,
@@ -3294,6 +3442,74 @@ mod tests {
         let f = Finding::new(FindingClass::TimedOutTask, Some(0), 100, many);
         assert_eq!(f.samples.len(), MAX_FINDING_SAMPLES);
         assert_eq!(f.count, 100, "count must report the true population");
+    }
+
+    #[test]
+    fn truncated_is_derived_not_hardcoded() {
+        // Every cross-shard/replay call site builds a `Finding` straight from
+        // `Finding::new`, with no `with_truncated` call. Before the fix,
+        // `truncated` was hard-coded `false` there, so a report with more than
+        // `MAX_FINDING_SAMPLES` matches asserted its enumeration was complete
+        // when it was not.
+        let many: Vec<String> = (0..30).map(|i| i.to_string()).collect();
+        let f = Finding::new(FindingClass::ChildExecutionMissing, None, 30, many);
+        assert!(
+            f.truncated,
+            "more matches than samples must be reported truncated"
+        );
+
+        let few = vec!["only-one".to_string()];
+        let g = Finding::new(FindingClass::ChildExecutionMissing, None, 1, few);
+        assert!(!g.truncated, "a complete enumeration is not truncated");
+    }
+
+    #[test]
+    fn truncated_is_derived_from_count_even_when_samples_arrive_pre_clipped() {
+        // Issue #1205's truncation fix, extended. `replay_sample` caps each
+        // class's sample vector at `MAX_FINDING_SAMPLES` as it accumulates,
+        // independently of this constructor. `ReplaySummary`'s count keeps
+        // growing past that cap. Comparing pre-clip length alone (the first
+        // version of this fix) never sees a vector already at exactly the
+        // cap. It reports `false` on a genuinely partial enumeration.
+        let exactly_capped: Vec<String> = (0..MAX_FINDING_SAMPLES).map(|i| i.to_string()).collect();
+        let f = Finding::new(FindingClass::HistoryUnreadable, Some(0), 21, exactly_capped);
+        assert_eq!(f.samples.len(), MAX_FINDING_SAMPLES);
+        assert!(
+            f.truncated,
+            "count (21) exceeding even a pre-clipped sample vector must still read truncated"
+        );
+    }
+
+    #[test]
+    fn a_detail_only_finding_with_no_samples_is_never_truncated() {
+        // Issue #1205's truncation fix, extended again. `RestorePointSkew`
+        // and similar findings name ONE condition via `detail`. They use
+        // `count: 1` and an empty `samples` vec by convention. `count` there
+        // is not a row total to compare against `samples.len()`.
+        // `count > samples.len()` alone reads that as `1 > 0`, wrongly
+        // truncated. `with_truncated(false)` cannot undo it, since the
+        // override now only ORs in.
+        let f = Finding::new(FindingClass::RestorePointSkew, None, 1, Vec::new())
+            .with_detail("newest-event timestamps differ by 90s across shards");
+        assert!(
+            !f.truncated,
+            "a detail-only finding names one condition, not an unlisted population: {f:#?}"
+        );
+    }
+
+    #[test]
+    fn with_truncated_ors_in_rather_than_overwrites() {
+        // The bounded per-class probe path knows about a truncation the
+        // constructor cannot see: a `LIMIT`ed query whose `total` exceeds
+        // the returned rows. It passes that via `with_truncated`. The
+        // override must never turn an already-derived `true` back to `false`.
+        let many: Vec<String> = (0..30).map(|i| i.to_string()).collect();
+        let f =
+            Finding::new(FindingClass::ChildExecutionMissing, None, 30, many).with_truncated(false);
+        assert!(
+            f.truncated,
+            "with_truncated(false) must not clear a derived truncation"
+        );
     }
 
     #[test]
