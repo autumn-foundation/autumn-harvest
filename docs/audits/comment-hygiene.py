@@ -264,12 +264,12 @@ COMMENTED_CODE_RE = re.compile(
             # written without.
             \s*\((?:[^;{]|;(?=[^;]*\]))*\)\s*;\s*$
       | (?:pub(?:\((?:in\s+)?[\w:]+\))?\s+)?mod\s+(?:r\#)?\w+\s*[{;]\s*$
-      | (?:pub(?:\((?:in\s+)?[\w:]+\))?\s+)?(?:const|static)\s+(?:mut\s+)?\w+\s*:[^;=]+=.*[;{]\s*$
-      | (?:pub(?:\((?:in\s+)?[\w:]+\))?\s+)?type\s+\w+\s*(?:<[^<>]*>)?\s*=
+      | (?:pub(?:\((?:in\s+)?[\w:]+\))?\s+)?(?:const|static)\s+(?:mut\s+)?(?:r\#)?\w+\s*:[^;=]+=.*[;{]\s*$
+      | (?:pub(?:\((?:in\s+)?[\w:]+\))?\s+)?type\s+(?:r\#)?\w+\s*(?:<[^<>]*>)?\s*=
             (?!\s*(?:\w+\s+){2,}\w+\s*;\s*$).*;\s*$
       | impl(?:\s*<[^<>]*>)?\s+
             (?![^;{]*\b[a-z]+\s+[a-z]+\s+[a-z]+\s+[a-z]+\b)[\w:<>&'\s]+\{\s*$
-      | let\s+(?:mut\s+)?\w+\s*(?::[^;=]+)?=
+      | let\s+(?:mut\s+)?(?:r\#)?\w+\s*(?::[^;=]+)?=
             (?!\s*(?:\w+\s+){2,}\w+\s*;\s*$)[^=].*;\s*$
       # Destructuring bindings. A tuple or slice pattern, or a struct/enum
       # pattern behind a Capitalised path -- all terminated, and none of them
@@ -281,7 +281,7 @@ COMMENTED_CODE_RE = re.compile(
       # An uninitialized binding. No `=` to anchor on, so it needs a type
       # annotation to separate "let mut retries: usize;" from "let the reader
       # decide;" -- English does not put a colon between two bare words.
-      | let\s+(?:mut\s+)?\w+\s*:
+      | let\s+(?:mut\s+)?(?:r\#)?\w+\s*:
             (?!\s*(?:\w+\s+){2,}\w+\s*;\s*$)\s*
             # A Rust type, not a scalar name. An array length needs `;`, a
             # trait object needs `+`, a function pointer needs `->`, and a
@@ -328,6 +328,14 @@ TODO_RE = re.compile(
     r"^(?:TODO|FIXME|XXX|HACK)\b|\b(?:TODO|FIXME|XXX|HACK)\s*[:(]", re.IGNORECASE
 )
 TODO_REF_RE = re.compile(r"#\d+|https?://")
+# A reference that ABUTS the marker on its left. Anchored at the end, and
+# opened either at the bound or at a clause separator, so "See #123 for the
+# parser. TODO: x" is still untracked while "#123 - TODO: x" is not.
+ADJACENT_REF_RE = re.compile(
+    r"(?:^|[;.,(\[])[\s\-\u2010-\u2015:]*"
+    r"(?:#\d+|https?://\S+)"
+    r"[\s\-\u2010-\u2015:;,]*$"
+)
 
 
 def untracked_marker(text: str) -> bool:
@@ -344,11 +352,21 @@ def untracked_marker(text: str) -> bool:
     "TODO: ... (#123)", a bare URL -- and refuses only a reference that
     belongs to something else.
     """
-    starts = [match.start() for match in TODO_RE.finditer(text)]
-    for index, start in enumerate(starts):
-        end = starts[index + 1] if index + 1 < len(starts) else len(text)
-        if not TODO_REF_RE.search(text, start, end):
-            return True
+    marks = list(TODO_RE.finditer(text))
+    for index, mark in enumerate(marks):
+        start = mark.start()
+        end = marks[index + 1].start() if index + 1 < len(marks) else len(text)
+        if TODO_REF_RE.search(text, start, end):
+            continue
+        # Backwards as well as forwards. "#123 - TODO: remove the fallback"
+        # is a tracked commitment written the other way round, and reading
+        # only forwards failed the build on it. The reference must ABUT the
+        # marker: separators between the two and nothing else, so a
+        # reference from an earlier clause still does not stand in for one.
+        lower = marks[index - 1].end() if index else 0
+        if ADJACENT_REF_RE.search(text[lower:start]):
+            continue
+        return True
     return False
 # An inline code span. CH002 is absolute and at zero, so a comment that
 # DOCUMENTS the marker syntax -- "Parse the `TODO:` prefix" -- must not fail
@@ -4081,6 +4099,36 @@ RULE_TESTS = [
         "// pub use the cached resolver when the shard map is warm.\n",
         set(),
         "and a path is one word, never a sentence",
+    ),
+    (
+        "// #123 - TODO: remove the legacy fallback\n",
+        set(),
+        "a reference abutting a marker on its left still tracks it",
+    ),
+    (
+        "// https://example.com/x - TODO: remove the legacy fallback\n",
+        set(),
+        "a URL does the same",
+    ),
+    (
+        "// TODO(#1): a; #2 - TODO: b\n",
+        set(),
+        "and a clause separator opens the run, so both markers are tracked",
+    ),
+    (
+        "// Fixes #123. TODO: add retries\n",
+        {("CH002", 1)},
+        "but a reference in an earlier clause is not adjacent",
+    ),
+    (
+        "// let r#match = parse();\n",
+        {("CH001", 1)},
+        "a raw identifier binds like any other",
+    ),
+    (
+        "// let r#match: usize;\n",
+        {("CH001", 1)},
+        "with or without an initializer",
     ),
 ]
 

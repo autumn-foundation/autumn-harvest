@@ -2165,3 +2165,35 @@ Corpus effect: none. Six fixtures, four for the defects and two for the
 counter-cases that keep prose out of an absolute rule -- a line opening
 with "Use the LATER definition", and `pub use the cached resolver ...`,
 which is a sentence and not a path.
+
+### Round seventy-one — both findings are defects in the last two rounds
+
+Two findings, and both are regressions this review introduced. That is
+worth stating rather than glossing: round sixty-three narrowed CH002 to
+per-marker references and made an absolute rule reject a tracked
+commitment, and round seventy taught six alternatives about raw
+identifiers and left four beside them.
+
+**A reference may abut the marker on its LEFT.** Round sixty-three read
+the text from each marker forward, so `#123 - TODO: remove the legacy
+fallback` reported CH002 — an absolute gate failing the build on a
+commitment that is tracked, just written the other way round. The
+reference must ABUT the marker: separators between the two and nothing
+else, opened either at the previous marker or at a clause separator. So
+`TODO(#1): a; #2 - TODO: b` has both markers tracked, while `See #123
+for the parser. TODO: x` and `Fixes #123. TODO: x` stay untracked, which
+is the property round sixty-three added and this round must not undo.
+
+**Four more identifier positions.** Round seventy covered `fn`,
+`struct`, `enum`, `trait`, `union`, `mod` and the `use` path, and left
+`let`, the uninitialized `let`, `const`/`static` and `type`. A raw name
+is legal in all of them.
+
+The lesson from round seventy was to grep for the construct before
+adding it to a pattern. The correct instruction was to grep for the
+POSITION — every place an identifier can appear — and one round later
+the same pattern family produced the same class of gap.
+
+Corpus effect: none. Six fixtures: three tracked forms that must stay
+silent, one earlier-clause reference that must still report, and the two
+raw bindings.
