@@ -752,23 +752,21 @@ unpredictably partway through (artifacts, the committed run):
 | 4,903 | 5,052 | +49 / +52 |
 
 **This does not support a pinned dead-tuple ratio, or even a consistent
-sign.** Earlier, now-uncommitted runs of this capture measured
-`no-schedule-to-close` dead-tuple counts ranging from roughly 800 to
-5,000+, and `schedule-to-close` counts in a similar range, with the
-relative ordering between the two labels flipping between runs -- an
-earlier committed run of this capture (superseded by the seeding fix
-[Workload](#workload) describes) happened to show `no-schedule-to-close`
-*higher* than `schedule-to-close`, the reverse of this run's ordering and
-of the "expected" direction (the extra write both this row's `UPDATE` and
-its `harvest_task_queue_schedule_to_close_idx` entry perform). This run's
-own ordering matches that "expected" direction, but this page treats that
-as coincidence rather than confirmation, given how much the previous
-committed run's ordering (and this section's own historical range) already
-demonstrate the instability. Heap-page growth was comparatively closer
-between the two labels in this run (+49 vs +52) than in some earlier ones,
-but not by a fixed, reproducible margin either. The most plausible
-explanation, consistent across every run
-of this capture, is that autovacuum's exact timing relative to the
+sign.** `no-schedule-to-close` lands slightly lower than `schedule-to-close`
+in this committed run (4,903 vs. 5,052 dead tuples; +49 vs. +52 heap
+pages), in the "expected" direction (the extra write both this row's
+`UPDATE` and its `harvest_task_queue_schedule_to_close_idx` entry
+perform), but this page treats that as coincidence rather than
+confirmation: Codex review on PR #1339 caught an earlier revision citing
+specific historical dead-tuple counts and a reversed ordering from
+prior runs of this capture, none of which survive as committed artifacts
+-- the repro script overwrites the same canonical filenames every run, so
+only this run's numbers can be audited from the repository. This page's
+own opening note on reproducibility already commits to scoping every
+number on this page to what's currently committed, so those unaudited
+historical figures are removed rather than repeated. The most plausible
+explanation for this table's numbers, based
+on this run alone, is that autovacuum's exact timing relative to the
 ~15-30-minute drain -- entirely outside this harness's control, since
 nothing in the test triggers or waits for it -- dominates whatever these two
 numbers happen to read at the moment the after-drain snapshot runs, for
