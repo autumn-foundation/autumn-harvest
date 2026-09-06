@@ -445,16 +445,25 @@ serve the query's `ORDER BY` (the non-indexable leading `CASE` expression
 sort and is strictly worse here, not a genuine optimization the planner
 found.
 
-This reverses which label the earlier, pre-fix committed run showed the
-expensive plan on: that run had `schedule-to-close` on the (identically
-random, but shared-shape) `Seq Scan` and `no-schedule-to-close` also on
-`Seq Scan`; still-earlier, uncommitted development runs (see below) had
-shown the expensive plan on `schedule-to-close` specifically. This run --
-fully committed and auditable, unlike those -- shows it on
-`no-schedule-to-close` instead. A phenomenon that lands on either label
-depending on the run is strong direct evidence that it is not caused by
-populating `schedule_to_close_at`, though this page still cannot say what
-does cause it: both runs used the same query, the same backlog shape, and
+**This is the only committed run in this page's history where either
+label actually hit the expensive plan.** The earlier, pre-fix committed
+run had *both* labels on `Seq Scan` -- no expensive plan on either side --
+so it is not a second committed data point for which label the expensive
+plan lands on; only this run's `no-schedule-to-close` result is. Codex
+review on PR #1339 caught an earlier revision of this paragraph
+overstating that: it read the pre-fix run's absence of the expensive plan
+as if it put the expensive plan on `schedule-to-close`, then cited that
+alongside this run to claim two committed runs showing the phenomenon on
+both labels. Still-earlier, uncommitted development runs (see below) did
+show the expensive plan on `schedule-to-close` specifically, but those
+artifacts no longer exist to audit. What this one committed run *does*
+support directly: the expensive plan lands on the label with
+`schedule_to_close_at` left `NULL`, the opposite of what a
+`schedule_to_close_at`-caused theory would predict. That is still real
+evidence against attributing the instability to this predicate, just not
+the "flips between both labels, committed either way" claim the earlier
+revision made. This page cannot say what does cause the instability: this
+run and the previous one used the same query, the same backlog shape, and
 (after the seeding fix) the same seeded index-key distribution between
 labels, so whatever tips the planner between these two plans at 100,000
 rows is sensitive to something this page hasn't isolated -- most likely

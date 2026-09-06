@@ -1502,9 +1502,12 @@ from the benchmark are directly comparable.
     main query and the 100,000-row plan choice turned out to be that
     confound instead — see that page's "Workload" section for the fix. The
     committed run now shows the two labels landing on *different* plans at
-    the 100,000-row depth (reversed from which label an earlier, also
-    since-superseded committed run showed the more expensive plan on);
-    that page's "100,000-row plan choice" section explains why it asserts
+    the 100,000-row depth, with the expensive one on `no-schedule-to-close`
+    -- the label without this predicate populated, the opposite of what a
+    `schedule_to_close_at`-caused theory would predict (an earlier,
+    since-superseded committed run had neither label on the expensive
+    plan, so this is the only committed data point for which label it
+    lands on); that page's "100,000-row plan choice" section explains why it asserts
     no frequency, ratio, or before/after count for this, including why an
     earlier revision's "N of M runs" framing, and later a spelled-out
     sample-of-two-against-two restating the same statistic in prose, both
