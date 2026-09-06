@@ -2719,7 +2719,15 @@ async fn zz_capture_worker_session_claim_evidence() {
 
     let mut summary_lines: Vec<String> = Vec::new();
     let raw = autumn_harvest::queue::claim_task_query();
-    let worker_literal = format!("'{}-worker-0'", db::BENCH_PREFIX);
+    // Unlike every other capture in this file, this predicate's own subject
+    // is `sticky_worker_id`. Its width directly composes the row-width
+    // mechanism this page measures (PR #1358). This file's usual short
+    // worker literal (`{BENCH_PREFIX}-worker-0`, 22 bytes) understates that
+    // width. Real `Worker::new` generates `worker_id:
+    // uuid::Uuid::new_v4().to_string()` (`worker.rs:409`), 36 bytes every
+    // time. This literal matches that width instead of the shared short
+    // form.
+    let worker_literal = "'deadbeef-dead-4bee-8bee-deadbeefcafe'".to_string();
 
     // Server-side per-row seeding procedure for the `worker-session` label.
     // A review finding on PR #1358 identified a problem with an earlier

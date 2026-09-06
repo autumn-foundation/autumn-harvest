@@ -298,14 +298,26 @@ around:
   `InitPlan` to rewrite -- confirmed directly in the captured `EXPLAIN`
   output, which shows the entire buffer delta landing inside the `Seq Scan`
   node itself at every depth (see [Plan](#plan) above).
-- The two-statement write is what issue #606's hard-pin design requires:
-  session membership (`session_id`) and the hard sticky pin
-  (`sticky_worker_id`/`sticky_until`/`sticky_timeout`) are resolved at
-  different points in `worker.rs`'s dispatch flow (a member activity's host
-  worker is not known until the session's acquire step resolves it), so a
-  single combined `INSERT` is not how the feature's control flow produces
-  this row. Changing that write path is a feature-level design question, not
-  a query-shape fix, and is out of scope for a measurement pass.
+- **Correction (review round 16):** an earlier revision of this bullet
+  claimed the two-statement write is forced by `worker.rs`'s dispatch flow,
+  reasoning that a member activity's host worker is not known until the
+  session's acquire step resolves it. A review finding correctly caught
+  that this does not hold for `queue::enqueue()`'s actual caller:
+  `build_activity_enqueue_plan` (`worker.rs:9247-9252`) already has
+  `session_id`, `sticky_worker_id`, and `sticky_timeout` all resolved
+  *before* it calls `enqueue()`. The two-statement split is
+  `queue::enqueue()`'s own choice -- `NewTaskQueueItem` hardcodes the three
+  sticky columns to `NULL` at `INSERT` time unconditionally
+  (`queue.rs:457-459`), regardless of what `EnqueueParams` already carries
+  -- not something the caller's control flow forces. A single `INSERT` that
+  computes `sticky_until` as `NOW() + $timeout` inline, rather than through
+  the follow-up `UPDATE`, looks possible in principle. This page does not
+  implement or validate that change: `queue::enqueue()` is shared by every
+  caller that sets a sticky pin, ordinary sticky routing (#235) included, so
+  altering its write path is a change to shared write plumbing with its own
+  testing and rollout, not a query-shape fix scoped to this measurement
+  pass. It is a real optimization candidate this page surfaces rather than
+  rules out.
 - There is no `MATERIALIZED`/index/rewrite angle on the *read* side: the
   columns are read directly off the already-scanned row, the same as the
   pre-existing ordinary-sticky-routing predicate immediately above this one
