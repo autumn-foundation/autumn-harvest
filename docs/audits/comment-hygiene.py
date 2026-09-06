@@ -500,6 +500,28 @@ COMMENTED_CODE_RE = re.compile(
       # expression: "if the queue is paused, the worker parks {".
       | (?:if|while|for|match|loop|unsafe)\b
             (?![^;{]*\b[a-z]+\s+[a-z]+\s+[a-z]+\s+[a-z]+\b)[^;]*\{\s*$
+      # The other half of a conditional. `else` opens a block like the
+      # keywords above, but it may also FOLLOW the brace that closes the
+      # previous arm, and the standalone-brace alternative stops at that
+      # brace. Neither reached `// } else {`, which is as common in
+      # commented-out code as the `if` above it.
+      #
+      # `}` is admitted only in front of `else`, and that is a choice about
+      # what people WRITE, not about the grammar. `} if x > 1 {` parses --
+      # rustc 1.94.1 reads it as two statements -- but nobody closes one
+      # block and opens an unrelated `if` on the same line, and `else` is
+      # the only keyword that CONTINUES the item above it.
+      #
+      # What follows `else` is the grammar, though: rustc takes a block or
+      # another `if`, and answers "expected `{`, found keyword `while`" for
+      # anything else. So the tail is not a run of any characters.
+      #
+      # The prose lookahead is the same one the keywords above carry, so
+      # "else the worker parks until the queue drains {" is still a
+      # sentence.
+      | (?:\}\s*)?else\b
+            (?![^;{]*\b[a-z]+\s+[a-z]+\s+[a-z]+\s+[a-z]+\b)
+            (?:\s+if\b[^;]*)?\s*\{\s*$
       | [\w.\[\]:\#]+\s*(?:[-+*/%&|^]|<<|>>)?=\s*[^\s;]+\s*;\s*$  # (compound) assignment
       # A commented-out statement. Anchored hard: the call must open at the
       # very start, so prose that merely names a function ("call cleanup()
@@ -1184,6 +1206,11 @@ def line_tail(pieces: list, index: int) -> str:
 # The markers Rustdoc renders as Markdown. `//` and `////` are ordinary code
 # comments that no renderer ever sees, and `/*` is their block form.
 DOC_MARKERS = ("///", "//!", "/**", "/*!")
+# An explicit doc attribute that carries CONTENT. `\#[doc = "Two."]`
+# and `\#![doc = "Two."]` render a paragraph; `\#[doc(hidden)]` and
+# `\#[doc(alias = "zz")]` render nothing. Group 1 tells the two forms
+# apart.
+DOC_VALUE_RE = re.compile(r"^\#(!?)\[\s*(?:r\#)?doc\s*=")
 
 
 def indented_code(
@@ -1461,6 +1488,7 @@ class Piece:
     __slots__ = (
         "line", "marker", "body", "trailing", "block", "group", "nest",
         "line_start", "line_end", "bridged", "in_attribute",
+        "doc_above", "doc_below",
     )
 
     def __init__(
@@ -1511,6 +1539,15 @@ class Piece:
         # an attribute's brackets belongs to the attribute, not to the
         # document around it, so it neither joins the doc run nor breaks it.
         self.in_attribute = False
+        # Does the DOCUMENT continue past this piece in an explicit
+        # `#[doc = ...]`? Rustdoc joins every `#[doc]` an item carries, and
+        # the value form carries content, so a doc run that ends beside one
+        # has not ended. "outer" for `\#[doc = ...]`, "inner" for
+        # `\#![doc = ...]`, "" for neither. The two forms document
+        # different things, so the marker has to agree: `//!` continues into
+        # `\#![doc]` and `///` into `\#[doc]`, never across.
+        self.doc_above = ""
+        self.doc_below = ""
 
     @property
     def text(self) -> str:
@@ -1835,6 +1872,11 @@ def mark_bridges(source: str, pieces: list[Piece]) -> None:
     occupied = {piece.line for piece in pieces}
     attributes: set[int] = set()
     inside: set[int] = set()
+    # Which attribute lines carry document CONTENT, and of which kind. Only
+    # the value form does. `\#[doc(hidden)]` and `\#[doc(alias = "zz")]`
+    # render nothing, confirmed against rustdoc 1.94.1, so a blank doc line
+    # in front of either is a real block edge.
+    doc_value: dict[int, str] = {}
     depth = 0
     for index, raw in enumerate(source.splitlines(), start=1):
         text = raw.strip()
@@ -1852,6 +1894,9 @@ def mark_bridges(source: str, pieces: list[Piece]) -> None:
                 continue
             if not text.startswith("#[") and not text.startswith("#!["):
                 continue
+            doc = DOC_VALUE_RE.match(text)
+            if doc:
+                doc_value[index] = "inner" if doc.group(1) else "outer"
         attributes.add(index)
         depth = max(0, depth + text.count("[") - text.count("]"))
         # A comment on this line is INSIDE the attribute unless the line
@@ -1871,6 +1916,21 @@ def mark_bridges(source: str, pieces: list[Piece]) -> None:
         if index in occupied and (opened or depth > 0):
             inside.add(index)
 
+    last = len(source.splitlines())
+
+    def reach(start: int, step: int) -> str:
+        """The kind of doc-value attribute the document continues into.
+
+        Walks only over attribute lines, so it stops at the first line that
+        renders something of its own -- an item, or another comment.
+        """
+        line = start
+        while 1 <= line <= last and line in attributes:
+            if line in doc_value:
+                return doc_value[line]
+            line += step
+        return ""
+
     previous = -1
     for piece in pieces:
         piece.in_attribute = piece.line in inside
@@ -1882,6 +1942,8 @@ def mark_bridges(source: str, pieces: list[Piece]) -> None:
         piece.bridged = previous >= 0 and piece.line > previous + 1 and all(
             gap in attributes for gap in range(previous + 1, piece.line)
         )
+        piece.doc_above = reach(piece.line - 1, -1)
+        piece.doc_below = reach(piece.line + 1, 1)
         previous = piece.line
 
 
@@ -2887,11 +2949,26 @@ def check_block_edges(path: str, pieces: list[Piece]) -> list[Finding]:
     for run in comment_runs(pieces):
         if run[0].block or run[0].trailing:
             continue
-        if not run[0].text.strip():
+        # An explicit `#[doc = ...]` is part of the same document, so a run
+        # that meets one has not reached its edge -- the blank doc line
+        # beside it is the paragraph break BETWEEN the two, and deleting it
+        # merges them. Verified by rendering with rustdoc 1.94.1, both ways
+        # round.
+        #
+        # The kinds have to agree. `//! One.` over a blank `//!` over
+        # `#[doc = "Two."]` renders the module document as "One." alone,
+        # because the outer attribute documents the NEXT item; that blank
+        # really is a trailing edge and stays reported.
+        kind = "inner" if run[0].marker == "//!" else "outer"
+        if not run[0].text.strip() and run[0].doc_above != kind:
             findings.append(
                 Finding("CH004", path, run[0].line, "block opens on an empty comment line")
             )
-        if len(run) > 1 and not run[-1].text.strip():
+        if (
+            len(run) > 1
+            and not run[-1].text.strip()
+            and run[-1].doc_below != kind
+        ):
             findings.append(
                 Finding("CH004", path, run[-1].line, "block closes on an empty comment line")
             )
@@ -5049,6 +5126,36 @@ RULE_TESTS = [
         "nor does a plain run join across code, which nothing renders",
     ),
     (
+        '/// One.\n///\n#[doc = "Two."]\npub struct S;\n',
+        set(),
+        "an explicit doc attribute continues the document past the run",
+    ),
+    (
+        '#[doc = "Zero."]\n///\n/// One.\npub struct S;\n',
+        set(),
+        "and in front of it as well as after it",
+    ),
+    (
+        '//! One.\n//!\n#![doc = "Two."]\n',
+        set(),
+        "the inner form joining an inner run",
+    ),
+    (
+        '//! One.\n//!\n#[doc = "Two."]\npub struct S;\n',
+        {("CH004", 2)},
+        "but an outer attribute documents the next item, not this module",
+    ),
+    (
+        '/// One.\n///\n#[doc(alias = "zz")]\npub struct S;\n',
+        {("CH004", 2)},
+        "and doc(alias) renders nothing, so the blank line is a real edge",
+    ),
+    (
+        '/// One.\n///\n#[doc = "Two."]\n#[allow(dead_code)]\npub struct S;\n',
+        set(),
+        "reached across an attribute that carries no content of its own",
+    ),
+    (
         "// TODO(#1): a; TODO(#2): b\n",
         set(),
         "and two markers each carrying one are both tracked",
@@ -5355,6 +5462,26 @@ RULE_TESTS = [
         "// use ::the reader may skip this;\n",
         set(),
         "though a root separator does not make a sentence an import",
+    ),
+    (
+        "// } else {\n",
+        {("CH001", 1)},
+        "a closing brace may carry the other half of a conditional",
+    ),
+    (
+        "// else if let Some(row) = fetch() {\n",
+        {("CH001", 1)},
+        "and else takes another if",
+    ),
+    (
+        "// else while retries > 0 {\n",
+        set(),
+        "but nothing else, which rustc says outright",
+    ),
+    (
+        "// } else the reader may skip the rest {\n",
+        set(),
+        "and a sentence after else is still a sentence",
     ),
     (
         '// #[doc = include_str!("../README.md")]\n',

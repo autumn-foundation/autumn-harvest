@@ -3344,3 +3344,41 @@ path of a destructuring pattern and the path of an attribute, each of
 which rustc accepts with a leading `::`.
 
 Corpus effect: none. Nine fixtures, three of them refusals.
+
+Round 110 -- a Tier A false positive on valid documentation, and the
+other half of a conditional.
+
+CH004 failed the build on this, which is correct Rust and correct
+rustdoc:
+
+    /// One.
+    ///
+    #[doc = "Two."]
+
+An explicit `#[doc = ...]` carries document content, so the run has not
+reached its edge: the blank doc line is the paragraph break between the
+two halves. Rendered with rustdoc 1.94.1 both ways -- with the blank
+line, two paragraphs; without it, one. The rule's own fix instruction,
+"drop the empty line", would have silently merged them.
+
+The reverse order was not reported and is the same defect:
+`#[doc = "Zero."]` above a blank `///` above `/// One.` renders two
+paragraphs too. Both edges consult the attribute now.
+
+The kinds have to agree, which the rendering also settles. `//! One.`
+over a blank `//!` over `#[doc = "Two."]` renders the module document as
+"One." alone, because the outer attribute documents the next item. That
+blank is a real edge and stays reported. So does the blank in front of
+`#[doc(hidden)]` or `#[doc(alias = "zz")]`, which render nothing.
+
+`// } else {` and `// else {` produced no CH001. The control-flow rule
+knows six keywords and `else` was not among them, and the
+standalone-brace rule stops at the brace.
+
+`}` is admitted only in front of `else`, and that is a choice about what
+people write rather than about the grammar: `} if x > 1 {` parses as two
+statements, but nobody writes it on one line. What follows `else` IS the
+grammar -- rustc takes a block or another `if` and answers "expected
+`{`, found keyword `while`" for anything else.
+
+Corpus effect: none. Ten fixtures, five of them refusals.
