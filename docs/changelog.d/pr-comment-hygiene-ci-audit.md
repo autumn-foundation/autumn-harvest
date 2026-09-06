@@ -3293,3 +3293,25 @@ trait` finding turned up one round earlier.
 
 Corpus effect: none. Seven fixtures, two of them counter-cases in the
 shape of the widened forms.
+
+Round 108 -- the ABI is a string literal, and a string literal has more
+than one spelling.
+
+`// extern r"C" {` and `// extern r"C" fn stale() {}` produced no CH001.
+Both rules read `"[\w-]+"`, and rustc 1.94.1 accepts a raw literal in
+either position, hashes and all.
+
+The ABI now lives in one place, `abi()`, which the two rules splice. Its
+raw delimiter takes any number of hashes and requires the closing run to
+match the opening one, which a backreference states exactly. The group
+name is per call site, because one pattern holds two of these.
+
+rustc names the rest of the set rather than leaving it to memory: `b"C"`,
+`c"C"` and `br"C"` each answer "non-string ABI literal", so a byte
+string, a C string and a raw byte string stay out.
+
+The ABI name stays `[\w-]+`, wider than the set rustc knows. `extern "Q"
+{}` is E0703 and this pattern reports it, which is an over-report no
+prose can reach: `extern` is not an English word.
+
+Corpus effect: none. Five fixtures, two of them refusals.

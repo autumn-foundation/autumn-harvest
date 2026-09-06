@@ -285,6 +285,35 @@ BODY = r"(?:\{(?:.*\})?)"
 # -- so `Fn(u8) -> u8` is admitted while the form stays anchored on a
 # keyword and a name.
 GENERICS = r"<(?:[^;]|;(?=[^;]*\]))*>"
+
+
+def abi(tag: str) -> str:
+    """The ABI of an `extern` item, in one place for the two rules that read one.
+
+    A plain string literal is not the only spelling. rustc 1.94.1 accepts
+    `extern r"C" {}` and `extern r##"C"## {}`, and it accepts the same raw
+    forms on a function. Only ordinary quotes reached the gate before, so a
+    commented-out FFI item written with a raw literal bypassed it.
+
+    The raw delimiter takes ANY number of hashes, and the closing run must
+    match the opening one. A backreference says that exactly. It needs a
+    distinct group name per call site, because one pattern holds two of
+    these and a repeated name is an error.
+
+    rustc names the set rather than leaving it to memory. Feed it `b"C"`,
+    `c"C"` or `br"C"` and it answers "non-string ABI literal", so a byte
+    string, a C string and a raw byte string are all out.
+
+    The ABI NAME stays `[\w-]+`, which is wider than the set rustc knows:
+    `extern "Q" {}` is E0703, not valid Rust, and this pattern reports it.
+    That over-report is unreachable. `extern` is not an English word, and
+    no prose puts a quoted word between it and a brace.
+    """
+    return r'(?:"[\w-]+"|r(?P<{tag}>\#*)"[\w-]+"(?P={tag}))'.replace(
+        "{tag}", tag
+    )
+
+
 COMMENTED_CODE_RE = re.compile(
     r"""^(?:
         # The ABI name may carry a hyphen -- "C-unwind" and its siblings are
@@ -293,7 +322,7 @@ COMMENTED_CODE_RE = re.compile(
         # are ordinary FFI, and `\w+` alone left both outside an absolute
         # gate.
         {VIS}
-        (?:async\s+|unsafe\s+|const\s+|extern\s+(?:"[\w-]+"\s+)?)*
+        (?:async\s+|unsafe\s+|const\s+|extern\s+(?:{ABI_FN}\s+)?)*
             fn\s+(?:r\#)?\w+\s*(?:{GEN})?\s*\(
             (?:
                  .*\)\s*(?:->\s*[^;{]+?)?\s*{WHERE}(?:;|{BODY})  # complete
@@ -335,7 +364,7 @@ COMMENTED_CODE_RE = re.compile(
       # existed. It matched through the control-flow form, which carries
       # `unsafe` for its own reasons. The complete `unsafe extern "C" {}`
       # did not match, because control flow ends its line at the brace.
-      | (?:unsafe\s+)?extern(?:\s+"[\w-]+")?\s*{BODY}\s*$
+      | (?:unsafe\s+)?extern(?:\s+{ABI_BLOCK})?\s*{BODY}\s*$
       | {VIS}(?:const|static)\s+(?:mut\s+)?(?:r\#)?\w+\s*:[^;=]+=.*[;{]\s*$
       # A type alias takes a `where` clause BEFORE its `=`, which is the
       # one item form round ninety-three did not reach. rustc 1.94.1
@@ -452,7 +481,9 @@ COMMENTED_CODE_RE = re.compile(
             \(.*\)(?:\s*\?|\s*\.await\s*\??)*\s*;\s*$
     )""".replace("{VIS}", VISIBILITY).replace("{WHERE}", WHERE).replace(
         "{BODY}", BODY
-    ).replace("{GEN}", GENERICS),
+    ).replace("{GEN}", GENERICS).replace("{ABI_FN}", abi("abifn")).replace(
+        "{ABI_BLOCK}", abi("abiblock")
+    ),
     re.VERBOSE,
 )
 
@@ -5218,6 +5249,31 @@ RULE_TESTS = [
         "// extern symbols resolve at link time {\n",
         set(),
         "though no prose reaches the brace, because nothing may precede it",
+    ),
+    (
+        '// extern r"C" {\n',
+        {("CH001", 1)},
+        "an ABI may be a raw string literal",
+    ),
+    (
+        '// unsafe extern r##"C-unwind"## {}\n',
+        {("CH001", 1)},
+        "with any number of hashes",
+    ),
+    (
+        '// extern r#"C" {\n',
+        set(),
+        "though the closing run must match the opening one",
+    ),
+    (
+        '// unsafe extern b"C" {}\n',
+        set(),
+        "and a byte string is not a string, which rustc says outright",
+    ),
+    (
+        '// pub extern r#"C"# fn stale() {}\n',
+        {("CH001", 1)},
+        "a function ABI reads the same spellings as a block ABI",
     ),
     (
         '// #[doc = include_str!("../README.md")]\n',
