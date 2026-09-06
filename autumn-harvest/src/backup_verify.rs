@@ -487,10 +487,15 @@ impl Finding {
     /// Builds a finding, deriving `severity`/`explanation` from `class` and
     /// clipping `samples` to [`MAX_FINDING_SAMPLES`].
     ///
-    /// `truncated` is derived here, before clipping: `true` whenever `samples`
-    /// arrived longer than the clip. A caller with extra knowledge of a
-    /// partial result (a `LIMIT`ed query whose true `count` exceeds even the
-    /// unclipped `samples`) still overrides via [`Self::with_truncated`].
+    /// `truncated` is derived from `count` against the CLIPPED length, not
+    /// the pre-clip one. A caller may already have bounded `samples` itself.
+    /// The replay sampler caps each class's sample vector as it accumulates,
+    /// independently of this constructor, while `count` keeps growing past
+    /// that cap. Comparing pre-clip length alone would miss exactly that
+    /// case and report `false` on a genuinely partial enumeration. A caller
+    /// with even more information -- a `LIMIT`ed query whose truncation this
+    /// constructor cannot see at all -- still overrides via
+    /// [`Self::with_truncated`].
     #[must_use]
     pub fn new(
         class: FindingClass,
@@ -499,8 +504,8 @@ impl Finding {
         samples: Vec<String>,
     ) -> Self {
         let mut samples = samples;
-        let truncated = samples.len() > MAX_FINDING_SAMPLES;
         samples.truncate(MAX_FINDING_SAMPLES);
+        let truncated = count > samples.len() as u64;
         Self {
             class,
             severity: class.severity(),
@@ -3451,6 +3456,23 @@ mod tests {
         let few = vec!["only-one".to_string()];
         let g = Finding::new(FindingClass::ChildExecutionMissing, None, 1, few);
         assert!(!g.truncated, "a complete enumeration is not truncated");
+    }
+
+    #[test]
+    fn truncated_is_derived_from_count_even_when_samples_arrive_pre_clipped() {
+        // Issue #1205's truncation fix, extended. `replay_sample` caps each
+        // class's sample vector at `MAX_FINDING_SAMPLES` as it accumulates,
+        // independently of this constructor. `ReplaySummary`'s count keeps
+        // growing past that cap. Comparing pre-clip length alone (the first
+        // version of this fix) never sees a vector already at exactly the
+        // cap. It reports `false` on a genuinely partial enumeration.
+        let exactly_capped: Vec<String> = (0..MAX_FINDING_SAMPLES).map(|i| i.to_string()).collect();
+        let f = Finding::new(FindingClass::HistoryUnreadable, Some(0), 21, exactly_capped);
+        assert_eq!(f.samples.len(), MAX_FINDING_SAMPLES);
+        assert!(
+            f.truncated,
+            "count (21) exceeding even a pre-clipped sample vector must still read truncated"
+        );
     }
 
     #[test]
