@@ -2734,12 +2734,12 @@ async fn zz_capture_schedule_to_close_claim_evidence() {
         row
     }
 
-    // Re-seeds `harvest_task_queue` for the `schedule-to-close` label by
-    // reusing the EXACT `id`/`activity_id` values the already-seeded
-    // `no-schedule-to-close` fixture just got from `db::seed()`'s own
-    // `gen_random_uuid()` calls, rather than generating a fresh, independent
-    // set of random UUIDs for this label. Every claim is a non-HOT `UPDATE`
-    // that touches every index on `harvest_task_queue` (see Plan), not just
+    // Captures the currently-seeded `no-schedule-to-close` fixture's
+    // `id`/`activity_id` values (and every other seeded column) so the
+    // `schedule-to-close` label can reuse them EXACTLY, rather than
+    // generating a fresh, independent set of random UUIDs for that label.
+    // Every claim is a non-HOT `UPDATE` that touches every index on
+    // `harvest_task_queue` (see Plan), not just
     // `harvest_task_queue_schedule_to_close_idx` -- so if the two labels'
     // primary-key and `activity_id` B-trees were seeded with independently
     // random keys, page-split/traversal noise from those OTHER indexes could
@@ -2748,25 +2748,33 @@ async fn zz_capture_schedule_to_close_claim_evidence() {
     // reuse identical indexed values across labels so `schedule_to_close_at`
     // is the only input that actually varies between them.
     //
-    // Reusing the VALUES is not enough on its own: an earlier revision of
-    // this helper numbered the snapshot by `ROW_NUMBER() OVER (ORDER BY
-    // id)`, which sorts by the random primary key rather than by original
-    // insertion order, so the schedule-to-close re-insert built its heap and
-    // every index in a different physical order than `db::seed()`'s
-    // `generate_series`-ordered bulk `INSERT` did for the baseline -- Codex
-    // review caught this too, on the same finding. `ctid` (physical tuple
-    // location) preserves that original insertion order for a table that
-    // has only ever been bulk-loaded once with no intervening updates or
-    // deletes, so the snapshot is numbered by `ctid`, and the re-insert
-    // below explicitly `ORDER BY`s on that same number -- into a table that
-    // was just `TRUNCATE`d, so this insertion order becomes the new table's
-    // physical order too, matching the baseline's.
-    async fn reseed_with_schedule_to_close(
-        conn: &mut AsyncPgConnection,
-        schedule_to_close_sql: &str,
-    ) {
+    // A PLAIN table, not a `TEMP` one: the per-depth `EXPLAIN` loop below
+    // calls this and its counterpart back to back on the same connection
+    // (`db::seed()` seeds once per depth, shared by both labels via a
+    // rolled-back `EXPLAIN` transaction for the first), where a `TEMP` table
+    // would have worked -- but the real-drain loop further down seeds and
+    // drains each label on its OWN freshly-`db::connect()`ed connection, and
+    // a `TEMP` table is connection-session-scoped, so it would not survive
+    // from the `no-schedule-to-close` label's connection to the
+    // `schedule-to-close` label's. Codex review on PR #1339 caught this too,
+    // on this same finding: a plain table is visible to any connection
+    // against the same database, which is what a snapshot meant to outlive
+    // the connection that took it actually needs.
+    //
+    // Numbered by `ROW_NUMBER() OVER (ORDER BY ctid)`, not `id`: `ctid`
+    // (physical tuple location) preserves original insertion order for a
+    // table that has only ever been bulk-loaded once with no intervening
+    // updates or deletes, whereas ordering by the random primary key would
+    // scramble it -- Codex review on PR #1339 caught that too, on this same
+    // finding, before the connection-scoping problem above.
+    async fn snapshot_seed_for_schedule_to_close(conn: &mut AsyncPgConnection) {
+        diesel::sql_query("DROP TABLE IF EXISTS zz_stc_seed_snapshot")
+            .execute(conn)
+            .await
+            .expect("drop any leftover seed snapshot from a previous run");
+
         diesel::sql_query(
-            "CREATE TEMP TABLE stc_seed_snapshot AS \
+            "CREATE TABLE zz_stc_seed_snapshot AS \
                SELECT id, queue_name, task_type, activity_name, activity_id, input, \
                       state, priority, max_attempts, scheduled_at, required_build_id, \
                       concurrency_key, concurrency_cap, rate_limit_key, \
@@ -2776,7 +2784,19 @@ async fn zz_capture_schedule_to_close_claim_evidence() {
         .execute(conn)
         .await
         .expect("snapshot the no-schedule-to-close seed before re-seeding");
+    }
 
+    // Re-seeds `harvest_task_queue` for the `schedule-to-close` label from
+    // the snapshot `snapshot_seed_for_schedule_to_close` took of the
+    // `no-schedule-to-close` label's own seed -- reusing its exact
+    // `id`/`activity_id` values in their original physical insertion order,
+    // rather than generating a fresh, independent random set (see that
+    // function's doc comment for why both matter). Drops the snapshot table
+    // once consumed.
+    async fn reseed_from_schedule_to_close_snapshot(
+        conn: &mut AsyncPgConnection,
+        schedule_to_close_sql: &str,
+    ) {
         diesel::sql_query("TRUNCATE harvest_task_queue")
             .execute(conn)
             .await
@@ -2791,7 +2811,7 @@ async fn zz_capture_schedule_to_close_claim_evidence() {
                     state, priority, max_attempts, scheduled_at, required_build_id, \
                     concurrency_key, concurrency_cap, rate_limit_key, \
                     {schedule_to_close_sql} \
-             FROM stc_seed_snapshot \
+             FROM zz_stc_seed_snapshot \
              ORDER BY i",
         ))
         .execute(conn)
@@ -2802,10 +2822,10 @@ async fn zz_capture_schedule_to_close_claim_evidence() {
              same physical insertion order",
         );
 
-        diesel::sql_query("DROP TABLE stc_seed_snapshot")
+        diesel::sql_query("DROP TABLE zz_stc_seed_snapshot")
             .execute(conn)
             .await
-            .expect("drop the temporary seed snapshot");
+            .expect("drop the seed snapshot now that it has been consumed");
 
         diesel::sql_query("ANALYZE harvest_task_queue")
             .execute(conn)
@@ -2923,8 +2943,12 @@ async fn zz_capture_schedule_to_close_claim_evidence() {
                 // leaves dead NULL-column tuple versions resident in the
                 // heap alongside the mutated ones) -- while reusing the
                 // no-schedule-to-close seed's exact `id`/`activity_id`
-                // values (see `reseed_with_schedule_to_close`).
-                reseed_with_schedule_to_close(&mut conn, SCHEDULE_TO_CLOSE_SQL).await;
+                // values (see `snapshot_seed_for_schedule_to_close`). The
+                // no-schedule-to-close label's `EXPLAIN ANALYZE` above ran
+                // inside a rolled-back transaction, so its seeded rows are
+                // still exactly as `db::seed()` left them here.
+                snapshot_seed_for_schedule_to_close(&mut conn).await;
+                reseed_from_schedule_to_close_snapshot(&mut conn, SCHEDULE_TO_CLOSE_SQL).await;
             }
 
             // `EXPLAIN ANALYZE` really executes the statement -- including
@@ -3023,10 +3047,26 @@ async fn zz_capture_schedule_to_close_claim_evidence() {
             .await
             .expect("analyze harvest_workers before either label's stat-snapshot drain");
 
-        if label == "schedule-to-close" {
-            // Reuses the no-schedule-to-close seed's exact `id`/`activity_id`
-            // values -- see `reseed_with_schedule_to_close`.
-            reseed_with_schedule_to_close(&mut stats_conn, SCHEDULE_TO_CLOSE_SQL).await;
+        // Each label iteration opens its OWN connection via a fresh
+        // `db::connect()` call above, and `db::seed()` just re-seeded this
+        // connection's `harvest_task_queue` with its own independent
+        // `gen_random_uuid()` values -- unlike the per-depth `EXPLAIN` loop
+        // above, there is no single shared seed both labels read from here.
+        // An earlier revision of this capture called
+        // `reseed_with_schedule_to_close()` (this function's predecessor)
+        // for the `schedule-to-close` label anyway, which only snapshotted
+        // and reused THIS iteration's own already-independently-random seed
+        // -- a no-op for cross-label matching. Codex review on PR #1339
+        // caught this: snapshot the `no-schedule-to-close` label's seed
+        // into a table that outlives its connection (see
+        // `snapshot_seed_for_schedule_to_close`'s doc comment for why it
+        // must be a plain table, not `TEMP`), then have the
+        // `schedule-to-close` label consume that same snapshot instead of
+        // its own fresh, independent seed.
+        if label == "no-schedule-to-close" {
+            snapshot_seed_for_schedule_to_close(&mut stats_conn).await;
+        } else {
+            reseed_from_schedule_to_close_snapshot(&mut stats_conn, SCHEDULE_TO_CLOSE_SQL).await;
         }
 
         // Heap-growth snapshot immediately before the drain starts -- see
