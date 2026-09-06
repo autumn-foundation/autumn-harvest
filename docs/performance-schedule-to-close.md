@@ -15,8 +15,9 @@ percentage in the committed run -- see [100,000-row plan
 choice](#100000-row-plan-choice) for why) -- corroborated by two standalone
 MVCC-bloat scripts. None of this comes close to the 20% impact floor,
 measured where a percentage is stable -- against shared-buffer-hit
-totals and the combined heap-plus-index total-storage growth (+14.3%),
-not against the `dirtied`/`written` EXPLAIN counters' own small base, or
+totals and the combined heap-plus-index storage growth (+16%, the extra
+growth `schedule-to-close` causes relative to `no-schedule-to-close`'s own
+growth), not against the `dirtied`/`written` EXPLAIN counters' own small base, or
 the partial index's own page count on its own (see [Plan](#plan) and
 [Write-side cost](#write-side-cost) for why each of those specifically
 is reported as an absolute count instead of a floor-compared
@@ -222,8 +223,10 @@ and was added in response to Codex review.
 
 **Both labels seed `id`/`activity_id` from the exact same set of values,
 not independently.** Every claim is a non-HOT `UPDATE` (see [Plan](#plan))
-that touches every index on `harvest_task_queue`, including the primary
-key and any index on `activity_id` -- not just
+that touches every applicable index on `harvest_task_queue`, including
+the primary key and `idx_harvest_tq_activity_id` (both apply
+unconditionally here: the primary key has no predicate, and every seeded
+row's `activity_id` is non-`NULL`) -- not just
 `harvest_task_queue_schedule_to_close_idx`. An earlier revision of this
 capture let `db::seed()`'s own `gen_random_uuid()` calls seed each label
 independently, so the two labels' primary-key and `activity_id` B-trees
@@ -300,20 +303,34 @@ labels, regardless of `schedule_to_close_at`. HOT eligibility is an
 all-or-nothing property of the update: once any indexed column changes,
 Postgres cannot skip index maintenance selectively for the indexes that
 column doesn't belong to -- the new physical tuple needs a fresh entry in
-*every* index on `harvest_task_queue`, not just the ones keyed on `state`.
-`harvest_task_queue` carries well over a dozen indexes (the primary key,
-`idx_harvest_tq_workflow`, `idx_harvest_tq_activity_id`, and others besides
-`idx_harvest_tq_poll`/`idx_harvest_tq_running`), and both
-`no-schedule-to-close` and `schedule-to-close` rows pay full non-HOT
-maintenance across all of them on every claim -- an earlier revision of
-this page incorrectly described the baseline cost as touching only
-`idx_harvest_tq_poll` and `idx_harvest_tq_running` (Codex review, PR
-#1339). The one-sentence version that *is* accurate:
-`harvest_task_queue_schedule_to_close_idx` is the **one index in that
-already-large set that only `schedule-to-close` rows are ever members
-of** -- every other index gets a new entry on every claim for both
-labels equally, so it cancels out of the comparison; this one does not,
-which is why it is the source of the measured delta.
+every index the row is actually a member of, not just the ones keyed on
+`state`. This is *every applicable* index, not literally every index on
+the table: a non-HOT update still can't add an entry to a partial index
+whose own predicate the row doesn't satisfy, HOT or not. Codex review on
+PR #1339 caught an earlier revision of this paragraph overcorrecting to
+"every index" -- in this baseline fixture (`ClaimGate::Baseline`, with
+`required_build_id`/`session_id`/`sticky_worker_id`/`concurrency_key`/
+`rate_limit_key` all `NULL`), three partial indexes are skipped entirely
+because their own predicate is never satisfied:
+`harvest_task_queue_required_build_id_pending`
+(`WHERE state = 'PENDING' AND required_build_id IS NOT NULL`),
+`harvest_task_queue_session_id_pending` (same shape for `session_id`),
+and `idx_harvest_tq_sticky_poll` (`WHERE state = 'PENDING' AND
+sticky_worker_id IS NOT NULL`). The applicable set -- the primary key,
+`idx_harvest_tq_poll`, `idx_harvest_tq_running`, `idx_harvest_tq_workflow`,
+`idx_harvest_tq_activity_id`, and others besides -- is still well over a
+dozen indexes, and both `no-schedule-to-close` and `schedule-to-close`
+rows pay full non-HOT maintenance across all of them on every claim, since
+none of those OTHER indexes' predicates (where they have one) depend on
+`schedule_to_close_at`, so membership in them is identical between labels.
+An earlier revision of this page also incorrectly described the baseline
+cost as touching only `idx_harvest_tq_poll` and `idx_harvest_tq_running`
+(Codex review, PR #1339, an earlier round). The one-sentence version that
+*is* accurate: `harvest_task_queue_schedule_to_close_idx` is the **one
+applicable index that only `schedule-to-close` rows are ever members
+of** -- every other applicable index gets a new entry on every claim for
+both labels equally, so it cancels out of the comparison; this one does
+not, which is why it is the source of the measured delta.
 
 The `Update on public.harvest_task_queue` node's own `Buffers` line shows
 this directly, and it is depth-independent -- the signature of a per-claim
@@ -709,10 +726,14 @@ small-base instability the `dirtied`/`written` EXPLAIN counters have (see
 tiny percentage against a large index, or an infinite one against an
 empty index, without the real per-claim cost changing at all. The
 meaningful, stable denominator for a storage-growth floor comparison is
-the table's total on-disk footprint, heap and index combined: 280 pages
-before (250 heap + 30 index) to 320 after (263 heap + 57 index), **+14.3%**
--- comfortably under the floor, and the number this page's opening
-summary and Measurement sections cite. The heap-only figure (+5.2%) and
+the combined heap-plus-index growth the claim `UPDATE` causes, computed
+consistently from growth deltas rather than mixing a delta with an
+absolute page count: `no-schedule-to-close` grows by 250 pages total (250
+heap + 0 index), `schedule-to-close` grows by 290 pages total (263 heap +
+27 index) -- 40 pages more, **+16%** relative to the
+`no-schedule-to-close` baseline growth -- comfortably under the floor,
+and the number this page's opening summary and Measurement sections
+cite. The heap-only figure (+5.2%) and
 the index-only figure (+90%) are both still reported above, each labeled
 for what it measures, but neither is individually floor-compared: the
 heap figure is too small a share of the total change to be misleading on

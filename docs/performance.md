@@ -1473,7 +1473,10 @@ from the benchmark are directly comparable.
     EXPLAIN counters do below) —
     nowhere near the 20% impact floor, measured where a percentage is
     stable: shared-buffer-hit totals, and the combined heap-plus-index
-    total-storage growth (+14.3%, 280→320 pages), not against the
+    storage growth (+16%: `no-schedule-to-close` grows 250 pages total,
+    `schedule-to-close` grows 290, both computed consistently as growth
+    deltas rather than mixing a delta with an absolute page count), not
+    against the
     `dirtied`/`written` EXPLAIN counters' own small base (4→5, 2→3) or the
     index's own page count on its own, which that page reports as absolute
     counts instead of floor-compared percentages — Codex review flagged
@@ -1508,8 +1511,8 @@ from the benchmark are directly comparable.
     +2.6%-+7.5% including a clean 100,000-row figure) once a seeding
     confound was fixed: the two labels had been seeded with independently-random
     `id`/`activity_id` values, and since every claim's non-HOT `UPDATE`
-    touches every index on the table, not just the one this predicate adds,
-    most of what had looked like a `schedule_to_close_at` effect on the
+    touches every applicable index on the table, not just the one this
+    predicate adds, most of what had looked like a `schedule_to_close_at` effect on the
     main query and the 100,000-row plan choice turned out to be that
     confound instead — see that page's "Workload" section for the fix. The
     committed run now shows the two labels landing on *different* plans at
