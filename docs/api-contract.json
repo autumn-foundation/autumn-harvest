@@ -1332,6 +1332,10 @@
               "name": "url",
               "type": "string",
               "description": "The callback target that rejected it."
+            },
+            {
+              "name": "rejection",
+              "description": "Machine-readable rejection detail, naming the rule that refused the target (allowlist, scheme, or IP literal)."
             }
           ]
         }
@@ -5131,8 +5135,8 @@
             },
             {
               "name": "shards",
-              "type": "array",
-              "description": "The per-shard view behind the disagreement."
+              "type": "object",
+              "description": "The per-shard view behind the disagreement, keyed by shard id."
             }
           ]
         }

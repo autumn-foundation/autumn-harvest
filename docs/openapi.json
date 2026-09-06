@@ -4272,8 +4272,8 @@
                       "type": "array"
                     },
                     "shards": {
-                      "description": "The per-shard view behind the disagreement.",
-                      "type": "array"
+                      "description": "The per-shard view behind the disagreement, keyed by shard id.",
+                      "type": "object"
                     }
                   },
                   "type": "object"
@@ -11703,6 +11703,9 @@
                     "error": {
                       "description": "Always 'completion callback target rejected'.",
                       "type": "string"
+                    },
+                    "rejection": {
+                      "description": "Machine-readable rejection detail, naming the rule that refused the target (allowlist, scheme, or IP literal)."
                     },
                     "url": {
                       "description": "The callback target that rejected it.",

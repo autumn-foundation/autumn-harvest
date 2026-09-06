@@ -16,10 +16,12 @@ check 2 it resolves each `Json<T>` extractor to its struct and treats a field as
 mandatory when it is neither an `Option` nor carries a serde default: axum
 rejects a request that omits one, whatever the contract says.
 
-A `StatusCode::` used in a comparison rather than a response is ignored. A
-handler that builds its response through a shared helper is still attributed to
-the routes that call it, which is why the finding text names the source line:
-check it before editing the contract.
+A `StatusCode::` used in a comparison rather than a response is ignored.
+
+Known limit: only the handler's own body is read. A status returned from a
+helper the handler calls, such as `reset_error_response`, is invisible here, so
+this audit is a floor rather than a proof. The finding text names the source
+line, since a status can also reach a route through a helper it shares.
 
 Exit code 1 on any finding. Run standalone:
 
