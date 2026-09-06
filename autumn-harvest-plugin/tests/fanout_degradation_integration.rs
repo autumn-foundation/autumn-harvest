@@ -576,9 +576,9 @@ async fn workers_health_partial_carries_status() {
     assert!(body["by_queue"].is_object());
 }
 
-/// Issue #1208: a worker advertising the empty (auto/legacy) `shard_assignments`
-/// shape must be counted in `by_shard[N]` under the shard its row was actually
-/// read from, not dropped for naming no bucket.
+/// Issue #1208: a worker advertising the empty (auto/legacy)
+/// `shard_assignments` shape must be counted in `by_shard[N]`. N is the shard
+/// its row was actually read from, not dropped for naming no bucket.
 #[tokio::test]
 async fn workers_health_by_shard_counts_an_empty_assignment_worker_under_its_source_shard() {
     let ((url0, url1), _guard) = setup_two_shards().await;

@@ -43497,12 +43497,12 @@ pub(crate) fn dedup_workers_by_freshest(rows: Vec<WorkerRow>) -> Vec<WorkerRow> 
 /// Deduplicate worker rows fanned out across shards, keeping the freshest
 /// snapshot per `worker_id` **and** the shard id that snapshot was read from.
 ///
-/// [`dedup_workers_by_freshest`] discards the source shard because its
-/// callers don't need it. Fleet health's `by_shard` tally does: an
-/// empty-array (auto/legacy) `shard_assignments` row means "covers whatever
-/// shard it was read from" (issue #1150), so after dedup collapses a
-/// multi-shard fan-out to one row per worker, that row must still say which
-/// shard it came from (issue #1208).
+/// [`dedup_workers_by_freshest`] discards the source shard. Its callers do
+/// not need it. Fleet health's `by_shard` tally does. An empty-array
+/// (auto/legacy) `shard_assignments` row covers whatever shard it was read
+/// from (issue #1150). Dedup collapses a multi-shard fan-out to one row per
+/// worker, so that row must still say which shard it came from (issue
+/// #1208).
 pub(crate) fn dedup_worker_sources_by_freshest(
     rows: Vec<(i32, WorkerRow)>,
 ) -> Vec<(i32, WorkerRow)> {
@@ -43525,8 +43525,8 @@ pub(crate) fn dedup_worker_sources_by_freshest(
 ///
 /// An empty `shard_assignments` array covers whatever shard the row was read
 /// from, so it is attributed to `source_shard_id`. A non-empty array is the
-/// worker's own explicit claim and is attributed to every shard it names,
-/// regardless of source — unchanged from before issue #1208. A malformed
+/// worker's own explicit claim. It is attributed to every shard it names,
+/// regardless of source — unchanged since before issue #1208. A malformed
 /// (non-array) value is corrupt, not legacy, and is attributed to nothing.
 fn tally_by_shard(rows: &[(i32, WorkerRow)]) -> std::collections::HashMap<i32, usize> {
     let mut by_shard: std::collections::HashMap<i32, usize> = std::collections::HashMap::new();
@@ -43766,11 +43766,11 @@ async fn workers_health(
     };
 
     // Collect all worker rows from every shard, tagged with the shard each row
-    // was read from, then dedup by worker_id so a multi-shard worker (which
-    // registers a row in each of its shard DBs) is counted exactly once in the
-    // healthy/stale/draining/by_shard totals. The source tag survives dedup
-    // (issue #1208): `by_shard` needs it below to attribute an empty-array
-    // (auto/legacy) row to the shard it actually came from, not to nothing.
+    // was read from. Dedup by worker_id so a multi-shard worker (which
+    // registers a row in each of its shard DBs) is counted exactly once in
+    // the healthy/stale/draining/by_shard totals. The source tag survives
+    // dedup (issue #1208): `by_shard` needs it below, to attribute an
+    // empty-array (auto/legacy) row to the shard it actually came from.
     //
     // Issue #756: collect-and-continue — an unreachable shard is named in
     // `unavailable_shards` and the totals reflect the reachable shards rather
