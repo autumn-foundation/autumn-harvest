@@ -3265,3 +3265,31 @@ parse IPv6, which this file has no business doing.
 
 Corpus effect: none. Seven fixtures, one of them a counter-case in the
 shape of the widened impl form.
+
+Round 107 -- `extern`, which had no item alternative at all.
+
+`// extern crate serde;` and `// pub extern crate alloc;` produced no
+CH001. The import alternative read only `use`, and `extern crate` is an
+import item beside it. It now carries the same visibility prefix and the
+same `as` rename that the `use` form does; rustc 1.94.1 accepts both,
+including `as _`.
+
+`// extern "C" {` and `// unsafe extern "C" {}` produced none either.
+Round 106 noticed the gap and left it, on the grounds that the file had
+no extern-block alternative to qualify. That was a reason to write one.
+
+`unsafe` is optional on an extern block before edition 2024 and required
+from it. This tree is edition 2024, so a bare `extern {` is the older
+spelling of the same construct, and a comment carries no edition, so
+both spellings are gated. The ABI string needs whitespace in front of
+it, because `extern"C"` is a reserved prefix that rustc rejects. No
+visibility: `pub extern "C" {}` is not Rust in any edition.
+
+The opener `unsafe extern "C" {` did match before this round, but through
+the control-flow alternative, which carries `unsafe` for its own reasons.
+The complete `unsafe extern "C" {}` did not, because control flow ends
+its line at the opening brace. That is the same accident the `unsafe
+trait` finding turned up one round earlier.
+
+Corpus effect: none. Seven fixtures, two of them counter-cases in the
+shape of the widened forms.

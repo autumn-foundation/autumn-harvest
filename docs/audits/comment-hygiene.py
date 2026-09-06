@@ -318,6 +318,24 @@ COMMENTED_CODE_RE = re.compile(
             # written without.
             \s*\((?:[^;{]|;(?=[^;]*\]))*\)\s*{WHERE};\s*$
       | {VIS}mod\s+(?:r\#)?\w+\s*(?:;|{BODY})\s*$
+      # An extern block. `unsafe` is optional before edition 2024 and
+      # required from it. This tree is edition 2024, so a bare `extern {`
+      # is the older spelling of the same construct. A comment carries no
+      # edition, so both spellings are commented-out FFI, and both belong
+      # in an absolute gate.
+      #
+      # The ABI string needs whitespace in front of it. `extern"C"` is a
+      # reserved prefix, and rustc 1.94.1 answers "prefix `extern` is
+      # unknown". A bare `extern {` only warns, and a warning means the
+      # line parses.
+      #
+      # No visibility here. `pub extern "C" {}` is not Rust in any edition.
+      #
+      # The opener `unsafe extern "C" {` did match before this alternative
+      # existed. It matched through the control-flow form, which carries
+      # `unsafe` for its own reasons. The complete `unsafe extern "C" {}`
+      # did not match, because control flow ends its line at the brace.
+      | (?:unsafe\s+)?extern(?:\s+"[\w-]+")?\s*{BODY}\s*$
       | {VIS}(?:const|static)\s+(?:mut\s+)?(?:r\#)?\w+\s*:[^;=]+=.*[;{]\s*$
       # A type alias takes a `where` clause BEFORE its `=`, which is the
       # one item form round ninety-three did not reach. rustc 1.94.1
@@ -368,6 +386,11 @@ COMMENTED_CODE_RE = re.compile(
             # for the reason `GENERICS` is.
             use\s+(?:(?:r\#)?\w+::)*(?:(?:r\#)?\w+|\*|\{[^;]*\})
             (?:\s+as\s+(?:r\#)?\w+)?;\s*$
+      # `extern crate` is an import item too, and this rule read only `use`.
+      # It carries a visibility, and rustc 1.94.1 accepts `pub extern crate
+      # alloc;` and `pub(crate) extern crate core;`. It takes an `as` rename
+      # as well, `as _` among them, which `\w+` already covers.
+      | {VIS}extern\s+crate\s+(?:r\#)?\w+(?:\s+as\s+(?:r\#)?\w+)?;\s*$
       # An attribute, bounded by the `]` that closes it at the end of the
       # line rather than by a class of what may sit inside. A class refused
       # `#[doc = include_str!("../README.md")]` for want of a `!`, and the
@@ -5160,6 +5183,41 @@ RULE_TESTS = [
         "// use foo::{bar::{Baz, Qux}, Quux};\n",
         {("CH001", 1)},
         "a use tree nests as a generic list does",
+    ),
+    (
+        "// extern crate serde;\n",
+        {("CH001", 1)},
+        "an extern crate is an import item as a use is",
+    ),
+    (
+        "// pub extern crate alloc as alloc2;\n",
+        {("CH001", 1)},
+        "and carries a visibility and a rename",
+    ),
+    (
+        "// extern crate versions are pinned in the lockfile;\n",
+        set(),
+        "but a sentence that opens with the words is prose",
+    ),
+    (
+        '// extern "C" {\n',
+        {("CH001", 1)},
+        "an extern block opens a body",
+    ),
+    (
+        "// unsafe extern \"C\" {}\n",
+        {("CH001", 1)},
+        "and closes one, with the qualifier edition 2024 asks for",
+    ),
+    (
+        "// extern {\n",
+        {("CH001", 1)},
+        "and the ABI string is optional",
+    ),
+    (
+        "// extern symbols resolve at link time {\n",
+        set(),
+        "though no prose reaches the brace, because nothing may precede it",
     ),
     (
         '// #[doc = include_str!("../README.md")]\n',
