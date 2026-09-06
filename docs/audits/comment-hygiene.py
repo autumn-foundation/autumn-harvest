@@ -225,6 +225,26 @@ RULE_HINTS = {
 _APOS = r"[\u2019']"
 
 
+# The `;` that ENDS a declaration and the `;` inside an ARRAY are the same
+# character to a regex and different things to a reader. `[u8; 32]` is one
+# type; the run that reads it must not stop in the middle of it.
+#
+# Three rounds of this review found the same guard missing from a different
+# rule each time -- the generic list in ninety-nine, the where clause and
+# the impl header in one hundred and six, the return type and the const in
+# one hundred and fourteen. Writing it inline is what let that happen, so it
+# is written ONCE here and spliced everywhere a type or an expression may
+# sit. The variants differ only in what else they refuse.
+#
+# The prose lookaheads keep their bare `[^;{]*`. A wider run there would let
+# a lookahead see MORE text and so refuse more often, which is the
+# under-reporting direction, and prose holding an array type is not a thing
+# anyone writes.
+NO_SEMI = r"(?:[^;]|;(?=[^;]*\]))"
+NO_SEMI_BRACE = r"(?:[^;{]|;(?=[^;]*\]))"
+NO_SEMI_EQ = r"(?:[^;=]|;(?=[^;]*\]))"
+NO_SEMI_PAREN = r"(?:[^;()]|;(?=[^;]*\]))"
+
 # Commented-out Rust, by line shape. Anchored and terminator-bearing so that
 # ordinary prose ("let the caller decide", "use the LATER definition") cannot
 # match -- prose does not end in `;` or `{`.
@@ -252,7 +272,7 @@ VISIBILITY = r"(?:pub(?:\((?:in\s+)?(?:r\#)?\w+(?:::(?:r\#)?\w+)*\))?\s+)?"
 # hold an array type: `where T: Into<[u8; 32]>` is one clause. Round
 # ninety-nine gave that guard to the generic list and not to this, which
 # asks the identical question one fragment away.
-WHERE = r"(?:where\s+(?:[^;{]|;(?=[^;]*\]))+?\s*)?"
+WHERE = r"(?:where\s+" + NO_SEMI_BRACE + r"+?\s*)?"
 # What follows an item's signature: the `{` that opens its block, or a
 # COMPLETE one-line block. `fn stale() {}` is commented-out code as surely
 # as `fn stale() {` is, and anchoring at the brace let every one-line body
@@ -285,7 +305,7 @@ BODY = r"(?:\{(?:.*\})?)"
 # needs -- the `(` of a signature, the `=` of an alias, the `{` of a body
 # -- so `Fn(u8) -> u8` is admitted while the form stays anchored on a
 # keyword and a name.
-GENERICS = r"<(?:[^;]|;(?=[^;]*\]))*>"
+GENERICS = "<" + NO_SEMI + "*>"
 # A path may start at the crate ROOT. rustc 1.94.1 accepts `use ::std::fmt;`,
 # `::std::println!("x")`, `let ::std::option::Option::Some(x) = ...` and
 # `\#[::core::prelude::v1::derive(Debug)]`, and every rule here that reads a
@@ -351,7 +371,7 @@ COMMENTED_CODE_RE = re.compile(
         (?:async\s+|unsafe\s+|const\s+|extern\s+(?:{ABI_FN}\s+)?)*
             fn\s+(?:r\#)?\w+\s*(?:{GEN})?\s*\(
             (?:
-                 .*\)\s*(?:->\s*[^;{]+?)?\s*{WHERE}(?:;|{BODY})  # complete
+                 .*\)\s*(?:->\s*{NOSB}+?)?\s*{WHERE}(?:;|{BODY})  # complete
                | \s*$                                # wrapped: `fn foo(` at EOL
                | (?=[^)]*(?::|\bself\b))            # wrapped: real params,
                  [\w\s:&'<>\[\](),.+;=*#-]*,\s*$     #   trailing comma
@@ -371,7 +391,7 @@ COMMENTED_CODE_RE = re.compile(
             # the statement -- the same guard the uninitialized-binding rule
             # has carried since round forty-one, which this alternative was
             # written without.
-            \s*\((?:[^;{]|;(?=[^;]*\]))*\)\s*{WHERE};\s*$
+            \s*\({NOSB}*\)\s*{WHERE};\s*$
       | {VIS}mod\s+(?:r\#)?\w+\s*(?:;|{BODY})\s*$
       # An extern block. `unsafe` is optional before edition 2024 and
       # required from it. This tree is edition 2024, so a bare `extern {`
@@ -391,7 +411,7 @@ COMMENTED_CODE_RE = re.compile(
       # `unsafe` for its own reasons. The complete `unsafe extern "C" {}`
       # did not match, because control flow ends its line at the brace.
       | (?:unsafe\s+)?extern(?:\s+{ABI_BLOCK})?\s*{BODY}\s*$
-      | {VIS}(?:const|static)\s+(?:mut\s+)?(?:r\#)?\w+\s*:[^;=]+=.*[;{]\s*$
+      | {VIS}(?:const|static)\s+(?:mut\s+)?(?:r\#)?\w+\s*:{NOSE}+=.*[;{]\s*$
       # A type alias takes a `where` clause BEFORE its `=`, which is the
       # one item form round ninety-three did not reach. rustc 1.94.1
       # accepts it and warns that the clause is not enforced, which is a
@@ -421,7 +441,7 @@ COMMENTED_CODE_RE = re.compile(
             # path separator is two. `type I: ::std::fmt::Debug;` still
             # reports, because its bound colon is followed by a space.
             (?::(?!:)(?!\s*(?:\w+\s+){2,}\w+\s*;\s*$)
-                (?:[^;{]|;(?=[^;]*\]))+)?
+                {NOSB}+)?
             \s*{WHERE};\s*$
       | {VIS}type\s+(?:r\#)?\w+\s*(?:{GEN})?\s*{WHERE}=
             (?!\s*(?:\w+\s+){2,}\w+\s*;\s*$).*;\s*$
@@ -432,15 +452,15 @@ COMMENTED_CODE_RE = re.compile(
       # prose guard is the lookahead, as it always was.
       | (?:unsafe\s+)?impl(?:\s*{GEN})?\s+
             (?![^;{]*\b[a-z]+\s+[a-z]+\s+[a-z]+\s+[a-z]+\b)
-            (?:[^;{]|;(?=[^;]*\]))+{BODY}\s*$
-      | let\s+(?:mut\s+)?(?:r\#)?\w+\s*(?::[^;=]+)?=
+            {NOSB}+{BODY}\s*$
+      | let\s+(?:mut\s+)?(?:r\#)?\w+\s*(?::{NOSE}+)?=
             (?!\s*(?:\w+\s+){2,}\w+\s*;\s*$)[^=].*;\s*$
       # Destructuring bindings. A tuple or slice pattern, or a struct/enum
       # pattern behind a Capitalised path -- all terminated, and none of them
       # a shape English produces. The plain `\w+` form above misses every one.
-      | let\s+(?:mut\s+)?[(\[][\w\s,.:&*'()\[\]{}\#]*[)\]]\s*(?::[^;=]+)?
-            =\s*[^=;]+(?:;|\s+else\s*\{)\s*$
-      | let\s+{ROOT}(?:(?:r\#)?[\w]+::)*(?:r\#)?[A-Z]\w*\s*(?:\([^;]*\)|\{[^;]*\})\s*=\s*[^=;]+
+      | let\s+(?:mut\s+)?[(\[][\w\s,.:&*'()\[\]{}\#]*[)\]]\s*(?::{NOSE}+)?
+            =\s*(?:[^=;]|;(?=[^;]*\]))+(?:;|\s+else\s*\{)\s*$
+      | let\s+{ROOT}(?:(?:r\#)?[\w]+::)*(?:r\#)?[A-Z]\w*\s*(?:\({NOS}*\)|\{{NOS}*\})\s*=\s*(?:[^=;]|;(?=[^;]*\]))+
             (?:;|\s+else\s*\{)\s*$
       # An uninitialized binding. No `=` to anchor on, so it needs a type
       # annotation to separate "let mut retries: usize;" from "let the reader
@@ -551,7 +571,7 @@ COMMENTED_CODE_RE = re.compile(
       # of four or more consecutive plain words, which is a sentence, not an
       # expression: "if the queue is paused, the worker parks {".
       | (?:if|while|for|match|loop|unsafe)\b
-            (?![^;{]*\b[a-z]+\s+[a-z]+\s+[a-z]+\s+[a-z]+\b)[^;]*\{\s*$
+            (?![^;{]*\b[a-z]+\s+[a-z]+\s+[a-z]+\s+[a-z]+\b){NOS}*\{\s*$
       # The other half of a conditional. `else` opens a block like the
       # keywords above, but it may also FOLLOW the brace that closes the
       # previous arm, and the standalone-brace alternative stops at that
@@ -582,12 +602,12 @@ COMMENTED_CODE_RE = re.compile(
       # does no work.
       | '(?:r\#)?\w+\s*:\s*
             (?:(?:while|for|loop)\b
-                (?![^;{]*\b[a-z]+\s+[a-z]+\s+[a-z]+\s+[a-z]+\b)[^;]*)?
+                (?![^;{]*\b[a-z]+\s+[a-z]+\s+[a-z]+\s+[a-z]+\b){NOS}*)?
             \{\s*$
       | (?:\}\s*)?else\b
             (?![^;{]*\b[a-z]+\s+[a-z]+\s+[a-z]+\s+[a-z]+\b)
-            (?:\s+if\b[^;]*)?\s*\{\s*$
-      | [\w.\[\]:\#]+\s*(?:[-+*/%&|^]|<<|>>)?=\s*[^\s;]+\s*;\s*$  # (compound) assignment
+            (?:\s+if\b{NOS}*)?\s*\{\s*$
+      | [\w.\[\]:\#]+\s*(?:[-+*/%&|^]|<<|>>)?=\s*(?:[^\s;]|;(?=[^;]*\]))+\s*;\s*$
       # A commented-out statement. Anchored hard: the call must open at the
       # very start, so prose that merely names a function ("call cleanup()
       # first") cannot reach it, and the line must end at the `;`. Measured
@@ -600,13 +620,15 @@ COMMENTED_CODE_RE = re.compile(
       # wrapping onto "continue normally;" is a sentence, not a statement.
       | (?:return|break)\b(?:\s+[^\s;{}]+)?\s*;\s*$
       | continue\b(?:\s+'\w+)?\s*;\s*$
-      | [\w:\#]+(?:::<[^;()]*>)?(?:\.[\w:\#]+(?:::<[^;()]*>)?)*
+      | [\w:\#]+(?:::<{NOSP}*>)?(?:\.[\w:\#]+(?:::<{NOSP}*>)?)*
             \(.*\)(?:\s*\?|\s*\.await\s*\??)*\s*;\s*$
     )""".replace("{VIS}", VISIBILITY).replace("{WHERE}", WHERE).replace(
         "{BODY}", BODY
     ).replace("{GEN}", GENERICS).replace("{ROOT}", ROOT).replace(
         "{DECL_TYPE}", DECL_TYPE
-    ).replace(
+    ).replace("{NOS}", NO_SEMI).replace("{NOSB}", NO_SEMI_BRACE).replace(
+        "{NOSE}", NO_SEMI_EQ
+    ).replace("{NOSP}", NO_SEMI_PAREN).replace(
         "{ABI_FN}", abi("abifn")
     ).replace("{ABI_BLOCK}", abi("abiblock")),
     re.VERBOSE,
@@ -5634,6 +5656,51 @@ RULE_TESTS = [
         "// type I: ::std::fmt::Debug;\n",
         {("CH001", 1)},
         "though a bound may still start at the crate root",
+    ),
+    (
+        "// fn stale() -> [u8; 32] {\n",
+        {("CH001", 1)},
+        "an array may be a return type",
+    ),
+    (
+        "// const STALE: [u8; 32] = [0; 32];\n",
+        {("CH001", 1)},
+        "and the type of an initialized const",
+    ),
+    (
+        "// static mut STALE: [u8; 32] = [0; 32];\n",
+        {("CH001", 1)},
+        "and of a static",
+    ),
+    (
+        "// let buf: [u8; 32] = [0; 32];\n",
+        {("CH001", 1)},
+        "and of a binding that has an initializer",
+    ),
+    (
+        "// let (a, b): ([u8; 4], u8) = t;\n",
+        {("CH001", 1)},
+        "and of one destructured",
+    ),
+    (
+        "// if buf == [0u8; 32] {\n",
+        {("CH001", 1)},
+        "an array repeat may sit in a condition",
+    ),
+    (
+        "// } else if buf == [0u8; 32] {\n",
+        {("CH001", 1)},
+        "in the tail of an else as well",
+    ),
+    (
+        "// foo::<[u8; 32]>();\n",
+        {("CH001", 1)},
+        "and in a turbofish, which is a type position",
+    ),
+    (
+        "// if the queue is paused the worker parks {\n",
+        set(),
+        "but the prose lookahead is untouched by any of it",
     ),
     (
         '// #[doc = include_str!("../README.md")]\n',

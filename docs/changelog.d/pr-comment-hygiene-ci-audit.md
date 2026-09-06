@@ -3452,3 +3452,37 @@ introduced by ONE colon; a path separator is two, and the rule says so.
 followed by a space.
 
 Corpus effect: none. Nine fixtures, four of them refusals.
+
+Round 114 -- the array guard, written once instead of a fourth time.
+
+`// fn stale() -> [u8; 32] {` and `// const STALE: [u8; 32] = [0; 32];`
+produced no CH001. The `;` of an array length ended the run that was
+reading a type.
+
+This is the THIRD round to report that same guard missing from a
+different rule: the generic list in ninety-nine, the where clause and the
+impl header in one hundred and six, these two now. Patching the two
+reported sites would have earned a fourth round, so the question asked
+instead was which runs in the pattern bound themselves by `;` at all.
+
+Fifteen forms were outside the gate. Two were reported; the other twelve
+are the same defect in the type of an initialized binding, the type of a
+destructured one and its initializer, a control-flow condition, the tail
+of an `else if`, a turbofish, and the right-hand side of an assignment.
+
+The guard now has ONE definition -- `NO_SEMI` and its three variants,
+which differ only in what else they refuse -- and every type or
+expression position splices it. Writing it inline is what let three
+rounds find three copies of the same hole.
+
+The prose lookaheads keep their bare `[^;{]*` on purpose. A wider run
+there lets a lookahead see more text and refuse more often, which is the
+under-reporting direction, and prose holding an array type is not a thing
+anyone writes.
+
+One residual: `// return [0u8; 32];` is still missed. That rule takes a
+single whitespace-free token after the keyword, deliberately, because
+admitting spaces would swallow "return the row to the pool;". The array
+needs a space, so the two cannot both be had here.
+
+Corpus effect: none. Nine fixtures.
