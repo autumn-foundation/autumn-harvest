@@ -2875,17 +2875,19 @@ struct HoldMarkerRow {
 
 #[tokio::test]
 async fn the_reset_trigger_clears_the_stale_hold_marker_even_when_the_caller_does_not() {
-    // Codex round 4 on PR #1406: `begin_migration`'s explicit reset only
-    // fires when the CODE PERFORMING THE REOPEN knows these columns exist. A
-    // parent-version process is schema-compatible and can still reopen a row
-    // through its OWN, older `ON CONFLICT` update, one that never mentions
+    // Issue #1317: `begin_migration`'s explicit reset only fires when the
+    // CODE PERFORMING THE REOPEN knows these columns exist. A parent-version
+    // process is schema-compatible and can still reopen a row through its
+    // OWN, older `ON CONFLICT` update, one that never mentions
     // `legal_hold_verified`/`verified_legal_hold_set_at` at all. The
     // application-level reset in `begin_migration` cannot protect against a
     // caller that predates it. Only a trigger on the phase transition itself
-    // is independent of which binary performed the reopen. Prove that
-    // independence directly: reopen the row with a raw UPDATE shaped exactly
-    // like the OLD `begin_migration` (the phase transition alone, no mention
-    // of either hold column), and require the columns to clear anyway.
+    // is independent of which binary performed the reopen.
+    //
+    // Prove that independence directly. Reopen the row with a raw UPDATE
+    // shaped exactly like the OLD `begin_migration`: the phase transition
+    // alone, with no mention of either hold column. Require the columns to
+    // clear anyway.
     let shards = setup_two_shards().await;
     let exec_id = quiescent_fixture(&shards, "old-code-reopen-clears-hold-marker").await;
     let mut source = shards.source().await;
