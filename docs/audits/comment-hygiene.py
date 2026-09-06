@@ -285,6 +285,15 @@ BODY = r"(?:\{(?:.*\})?)"
 # -- so `Fn(u8) -> u8` is admitted while the form stays anchored on a
 # keyword and a name.
 GENERICS = r"<(?:[^;]|;(?=[^;]*\]))*>"
+# A path may start at the crate ROOT. rustc 1.94.1 accepts `use ::std::fmt;`,
+# `::std::println!("x")`, `let ::std::option::Option::Some(x) = ...` and
+# `\#[::core::prelude::v1::derive(Debug)]`, and every rule here that reads a
+# path required an identifier before the first `::`.
+#
+# Only two of those four were reported. The other two came from asking which
+# rules read a path at all, which is the same question the array guard needed
+# in round one hundred and six.
+ROOT = r"(?:::\s*)?"
 
 
 def abi(tag: str) -> str:
@@ -387,7 +396,7 @@ COMMENTED_CODE_RE = re.compile(
       # a shape English produces. The plain `\w+` form above misses every one.
       | let\s+(?:mut\s+)?[(\[][\w\s,.:&*'()\[\]{}\#]*[)\]]\s*(?::[^;=]+)?
             =\s*[^=;]+(?:;|\s+else\s*\{)\s*$
-      | let\s+(?:(?:r\#)?[\w]+::)*(?:r\#)?[A-Z]\w*\s*(?:\([^;]*\)|\{[^;]*\})\s*=\s*[^=;]+
+      | let\s+{ROOT}(?:(?:r\#)?[\w]+::)*(?:r\#)?[A-Z]\w*\s*(?:\([^;]*\)|\{[^;]*\})\s*=\s*[^=;]+
             (?:;|\s+else\s*\{)\s*$
       # An uninitialized binding. No `=` to anchor on, so it needs a type
       # annotation to separate "let mut retries: usize;" from "let the reader
@@ -413,7 +422,7 @@ COMMENTED_CODE_RE = re.compile(
             # -- so the group is bounded by the `;` that ends the
             # declaration rather than by a class of what may sit in it,
             # for the reason `GENERICS` is.
-            use\s+(?:(?:r\#)?\w+::)*(?:(?:r\#)?\w+|\*|\{[^;]*\})
+            use\s+{ROOT}(?:(?:r\#)?\w+::)*(?:(?:r\#)?\w+|\*|\{[^;]*\})
             (?:\s+as\s+(?:r\#)?\w+)?;\s*$
       # `extern crate` is an import item too, and this rule read only `use`.
       # It carries a visibility, and rustc 1.94.1 accepts `pub extern crate
@@ -443,7 +452,7 @@ COMMENTED_CODE_RE = re.compile(
       # found `section`". So a literal opens a value outright, and a path
       # opens one only when what follows is from that set. Two bare words
       # in a row are prose in brackets.
-      | \#!?\[\s*(?:r\#)?\w+(?:\s*::\s*(?:r\#)?\w+)*\s*
+      | \#!?\[\s*{ROOT}(?:r\#)?\w+(?:\s*::\s*(?:r\#)?\w+)*\s*
             (?:
                 [(\[{].*
               | =\s*(?:
@@ -455,7 +464,34 @@ COMMENTED_CODE_RE = re.compile(
             )?
             \]\s*$
       | \}[,;)]*\s*$
-      | (?:(?:r\#)?\w+::)*(?:r\#)?\w+!(?:\(.*\)|\[.*\]|\{.*\})\s*;\s*$  # macro stmt
+      # A macro invocation. rustc 1.94.1 states the terminator rule itself:
+      # "macros that expand to items must be delimited with braces or
+      # followed by a semicolon". So a brace-delimited call needs no `;`,
+      # and requiring one left `// stale! {}` outside an absolute gate. The
+      # `;` stays mandatory for `(` and `[`, which is what rustc asks for,
+      # and optional after `}`, which is legal in both positions.
+      | {ROOT}(?:(?:r\#)?\w+::)*(?:r\#)?\w+!\s*(?:\(.*\)|\[.*\]|\{.*\})\s*;\s*$
+      # The semicolon-free form, its own alternative because it needs two
+      # guards the terminated form does not. It is the one prose reaches:
+      # an exclamation in front of a brace is a shape English writes, and
+      # the `;` was what kept it out.
+      #
+      # The first guard is the four-lowercase-word lookahead the control-flow
+      # rule carries, which refuses "Important! {see the note below}".
+      #
+      # The second is about ENGLISH, not Rust. rustc 1.94.1 accepts
+      # `macro_rules! Stale` and `Stale! {}` with no warning at all, so a
+      # capitalised macro name is legal; but a capitalised word before a `!`
+      # is how English writes an exclamation, and a macro in this tree is
+      # snake_case. So this branch alone asks for a snake_case name, which
+      # refuses "Note! {a, b}" and "Stop! {}" -- two words and none are
+      # short enough for the first guard to see.
+      #
+      # An upper-case macro name loses the semicolon-free form by that
+      # choice. That is an under-report, and the terminated alternative
+      # above still reads `Stale!(x);`.
+      | {ROOT}(?:(?:r\#)?\w+::)*(?:r\#)?[a-z_][a-z0-9_]*!\s*
+            (?!.*\b[a-z]+\s+[a-z]+\s+[a-z]+\s+[a-z]+\b)\{.*\}\s*$
       # A macro DEFINITION, which ends at its brace rather than a `;`.
       # Anchored on the keyword, so no prose can reach it.
       | macro_rules!\s+(?:r\#)?\w+\s*\{.*\}\s*;?\s*$
@@ -481,9 +517,9 @@ COMMENTED_CODE_RE = re.compile(
             \(.*\)(?:\s*\?|\s*\.await\s*\??)*\s*;\s*$
     )""".replace("{VIS}", VISIBILITY).replace("{WHERE}", WHERE).replace(
         "{BODY}", BODY
-    ).replace("{GEN}", GENERICS).replace("{ABI_FN}", abi("abifn")).replace(
-        "{ABI_BLOCK}", abi("abiblock")
-    ),
+    ).replace("{GEN}", GENERICS).replace("{ROOT}", ROOT).replace(
+        "{ABI_FN}", abi("abifn")
+    ).replace("{ABI_BLOCK}", abi("abiblock")),
     re.VERBOSE,
 )
 
@@ -5274,6 +5310,51 @@ RULE_TESTS = [
         '// pub extern r#"C"# fn stale() {}\n',
         {("CH001", 1)},
         "a function ABI reads the same spellings as a block ABI",
+    ),
+    (
+        "// stale! {}\n",
+        {("CH001", 1)},
+        "a brace-delimited macro call needs no semicolon",
+    ),
+    (
+        '// ::std::compile_error! {"gone"}\n',
+        {("CH001", 1)},
+        "and may start at the crate root",
+    ),
+    (
+        "// Important! {see the note below}\n",
+        set(),
+        "but an exclamation before a brace is English",
+    ),
+    (
+        "// Note! {a, b}\n",
+        set(),
+        "even when it is too short for the four-word guard to see",
+    ),
+    (
+        "// use ::std::fmt;\n",
+        {("CH001", 1)},
+        "a use tree may start at the crate root",
+    ),
+    (
+        "// use ::{std, core};\n",
+        {("CH001", 1)},
+        "with a group directly behind it",
+    ),
+    (
+        "// let ::std::option::Option::Some(row) = fetch() else {\n",
+        {("CH001", 1)},
+        "as may the path of a destructuring pattern",
+    ),
+    (
+        "// #[::core::prelude::v1::derive(Debug)]\n",
+        {("CH001", 1)},
+        "and the path of an attribute",
+    ),
+    (
+        "// use ::the reader may skip this;\n",
+        set(),
+        "though a root separator does not make a sentence an import",
     ),
     (
         '// #[doc = include_str!("../README.md")]\n',

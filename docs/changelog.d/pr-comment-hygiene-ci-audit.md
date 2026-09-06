@@ -3315,3 +3315,32 @@ The ABI name stays `[\w-]+`, wider than the set rustc knows. `extern "Q"
 prose can reach: `extern` is not an English word.
 
 Corpus effect: none. Five fixtures, two of them refusals.
+
+Round 109 -- a path may start at the crate root, and a brace-delimited
+macro call needs no semicolon.
+
+`// stale! {}` produced no CH001. rustc 1.94.1 states the rule in its own
+error: "macros that expand to items must be delimited with braces or
+followed by a semicolon". The `;` is now mandatory after `(` and `[` and
+optional after `}`, and a space is allowed before the delimiter, which
+`// stale! {}` needs and no form had.
+
+The semicolon-free branch is separate, because it needs two guards the
+terminated one does not. Dropping the `;` opens the rule to English:
+"Important! {see the note below}" is the shape of an exclamation. The
+four-lowercase-word lookahead from the control-flow rule refuses that
+one, and a snake_case name refuses "Note! {a, b}" and "Stop! {}", which
+are too short for it to see.
+
+That second guard is about English, not Rust: rustc accepts
+`macro_rules! Stale` and `Stale! {}` without a warning. An upper-case
+macro name therefore loses the semicolon-free form, an under-report, and
+the terminated alternative still reads `Stale!(x);`.
+
+`// use ::std::fmt;` produced nothing either. Two of the four rules that
+read a path were reported; asking which rules read one at all found the
+other two. `ROOT` is now spliced into the use tree, the macro path, the
+path of a destructuring pattern and the path of an attribute, each of
+which rustc accepts with a leading `::`.
+
+Corpus effect: none. Nine fixtures, three of them refusals.
