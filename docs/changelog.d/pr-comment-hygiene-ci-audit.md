@@ -2135,3 +2135,33 @@ question rounds forty-four to fifty kept getting wrong.
 Corpus effect: none. Three fixtures -- the lazy continuation, the blank
 line that really does leave the quote, and a heading that ends the
 continuation because it begins a block.
+
+### Round seventy — two identifiers CH001 could not spell
+
+Two findings, both in the signature pattern and both leaving ordinary
+Rust outside an absolute gate.
+
+**A re-export carries a visibility.** The `use` alternative required
+`use` at the start of the line, so `pub use crate::foo;` and
+`pub(crate) use crate::foo;` could not match -- and those are the forms
+this tree writes, not the bare one. Every other item alternative already
+took the visibility prefix; this was the one written without it.
+
+**An identifier may be raw.** `r#match` is a name, `\w+` stops at the
+`#`, and a commented-out `fn r#match() {` was outside the gate. The same
+applies to a raw type or module name, so `fn`, `struct`, `enum`,
+`trait`, `union`, `mod` and the `use` path all take the optional `r#`
+now. Not hypothetical here: `det_check.rs` discusses `r#gen` at length.
+
+Both premises were checked against rustc 1.94.1 rather than assumed --
+`pub fn r#match()`, `pub struct r#type;` and `pub use inner::X;` compile,
+with only a naming-convention warning on the second.
+
+The `#` is escaped in the pattern. It is a VERBOSE regex, where an
+unescaped `#` opens a comment and would have silently discarded the rest
+of the alternative.
+
+Corpus effect: none. Six fixtures, four for the defects and two for the
+counter-cases that keep prose out of an absolute rule -- a line opening
+with "Use the LATER definition", and `pub use the cached resolver ...`,
+which is a sentence and not a path.

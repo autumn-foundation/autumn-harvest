@@ -232,6 +232,10 @@ _APOS = r"[\u2019']"
 # prose line that merely happens to end in `;` cannot match. `fn item and is
 # therefore typo-proof ...;` is prose: after `fn` comes a name and then a
 # space, never the `(` a real signature requires.
+#
+# An identifier may be RAW. `r#match` is a name, and `\w+` stops at the `#`,
+# so a commented-out `fn r#match() {` was outside an absolute gate. This tree
+# discusses `r#gen` in `det_check.rs`, so the form is not hypothetical here.
 COMMENTED_CODE_RE = re.compile(
     r"""^(?:
         # The ABI name may carry a hyphen -- "C-unwind" and its siblings are
@@ -241,25 +245,25 @@ COMMENTED_CODE_RE = re.compile(
         # gate.
         (?:pub(?:\((?:in\s+)?[\w:]+\))?\s+)?
         (?:async\s+|unsafe\s+|const\s+|extern\s+(?:"[\w-]+"\s+)?)*
-            fn\s+\w+\s*(?:<[^<>]*>)?\s*\(
+            fn\s+(?:r\#)?\w+\s*(?:<[^<>]*>)?\s*\(
             (?:
                  .*\)\s*(?:->\s*[^;{]+?)?\s*[{;]   # complete: ends in { or ;
                | \s*$                                # wrapped: `fn foo(` at EOL
                | (?=[^)]*(?::|\bself\b))            # wrapped: real params,
                  [\w\s:&'<>\[\](),.+;=*-]*,\s*$      #   trailing comma
             )\s*$
-      | (?:pub(?:\((?:in\s+)?[\w:]+\))?\s+)?(?:struct|enum|trait|union)\s+\w+\s*(?:<[^<>]*>)?\s*[{;(]\s*$
+      | (?:pub(?:\((?:in\s+)?[\w:]+\))?\s+)?(?:struct|enum|trait|union)\s+(?:r\#)?\w+\s*(?:<[^<>]*>)?\s*[{;(]\s*$
       # A tuple struct, whose field list is on the line and terminated. Its
       # own alternative rather than a relaxation of the one above, which is
       # what this file's guidance asks for: the name is still anchored hard
       # against `struct`, and the line must end at the `;`.
-      | (?:pub(?:\((?:in\s+)?[\w:]+\))?\s+)?(?:struct|union)\s+\w+\s*(?:<[^<>]*>)?
+      | (?:pub(?:\((?:in\s+)?[\w:]+\))?\s+)?(?:struct|union)\s+(?:r\#)?\w+\s*(?:<[^<>]*>)?
             # The `;` of "[u8; 32]" is part of an array type, not the end of
             # the statement -- the same guard the uninitialized-binding rule
             # has carried since round forty-one, which this alternative was
             # written without.
             \s*\((?:[^;{]|;(?=[^;]*\]))*\)\s*;\s*$
-      | (?:pub(?:\((?:in\s+)?[\w:]+\))?\s+)?mod\s+\w+\s*[{;]\s*$
+      | (?:pub(?:\((?:in\s+)?[\w:]+\))?\s+)?mod\s+(?:r\#)?\w+\s*[{;]\s*$
       | (?:pub(?:\((?:in\s+)?[\w:]+\))?\s+)?(?:const|static)\s+(?:mut\s+)?\w+\s*:[^;=]+=.*[;{]\s*$
       | (?:pub(?:\((?:in\s+)?[\w:]+\))?\s+)?type\s+\w+\s*(?:<[^<>]*>)?\s*=
             (?!\s*(?:\w+\s+){2,}\w+\s*;\s*$).*;\s*$
@@ -289,7 +293,13 @@ COMMENTED_CODE_RE = re.compile(
             # sweep through "let a::b is re-exported for callers;", and a
             # type has no other use for it.
             (?:[\w:<>&'\[\]\s,()+*!?]|->|;(?=[^;]*\]))+;\s*$
-      | use\s+(?:\w+::)*(?:\w+|\*|\{[\w:,\s*]+\})(?:\s+as\s+\w+)?;\s*$
+      # A re-export carries a visibility like any other item, and this
+      # alternative was the one written without it -- `pub use crate::x;`
+      # and `pub(crate) use crate::x;` are the forms this tree actually
+      # writes, and neither could reach the rule.
+      | (?:pub(?:\((?:in\s+)?[\w:]+\))?\s+)?
+            use\s+(?:(?:r\#)?\w+::)*(?:(?:r\#)?\w+|\*|\{[\w:,\s*]+\})
+            (?:\s+as\s+(?:r\#)?\w+)?;\s*$
       | \#!?\[[\w:()"'=,./\s-]+\]\s*$
       | \}[,;)]*\s*$
       | [\w:]+!(?:\(.*\)|\[.*\]|\{.*\})\s*;\s*$        # macro stmt, any delimiter
@@ -4041,6 +4051,36 @@ RULE_TESTS = [
         "/// TODO: issue required` suffix.\n",
         {("CH002", 3)},
         "and a line that begins a block is no continuation",
+    ),
+    (
+        "// pub use crate::foo;\n",
+        {("CH001", 1)},
+        "a re-export carries a visibility like any other item",
+    ),
+    (
+        "// pub(crate) use crate::foo;\n",
+        {("CH001", 1)},
+        "including a restricted one",
+    ),
+    (
+        "// fn r#match() {\n",
+        {("CH001", 1)},
+        "a raw identifier is an identifier",
+    ),
+    (
+        "// pub struct r#type;\n",
+        {("CH001", 1)},
+        "in a type name as well as a function name",
+    ),
+    (
+        "// Use the LATER definition of the shard map here.\n",
+        set(),
+        "but prose that opens with the word is prose",
+    ),
+    (
+        "// pub use the cached resolver when the shard map is warm.\n",
+        set(),
+        "and a path is one word, never a sentence",
     ),
 ]
 
