@@ -499,6 +499,11 @@ struct FireDueRow {
     start_options: serde_json::Value,
     #[diesel(sql_type = diesel::sql_types::Integer)]
     shard_id: i32,
+    /// Needed to compute [`redefer_target`] if this row's fire is blocked by
+    /// a quota (issue #1227, Finding 3) — fetched here, under the same
+    /// `FOR UPDATE` claim, rather than a second round trip.
+    #[diesel(sql_type = diesel::sql_types::Timestamptz)]
+    max_fire_at: DateTime<Utc>,
 }
 
 /// Fire all pending debounce records whose `effective_fire_at` has elapsed.
@@ -581,7 +586,7 @@ async fn fire_due_on_conn(
             let now = Utc::now();
             let due_sql = "
                 SELECT id, workflow_name, debounce_key, workflow_id, queue_name,
-                       last_input, start_options, shard_id
+                       last_input, start_options, shard_id, max_fire_at
                 FROM harvest_debounce
                 WHERE effective_fire_at <= $1
                 ORDER BY effective_fire_at ASC
@@ -728,18 +733,40 @@ async fn delete_debounce_row(
 #[cfg(feature = "db")]
 const QUOTA_REDEFER_BACKOFF: Duration = Duration::from_secs(5);
 
-/// Push a quota-blocked debounce row's `effective_fire_at` forward by
-/// [`QUOTA_REDEFER_BACKOFF`] (issue #946, Task #7 hardening) so it is
-/// re-attempted less often instead of thrashing the claim batch every
-/// scanner tick.
+/// Compute the new `effective_fire_at` for a debounce row blocked by an
+/// exhausted per-tenant quota at fire time (issue #946, hardened by #1227
+/// Finding 3).
 ///
-/// Clamped to never exceed the row's own `max_fire_at` (`LEAST($2,
-/// max_fire_at)`), preserving the pre-existing debounce `max_wait` contract:
-/// a quota block can delay a fire past its trailing-edge deadline, but never
-/// past the absolute cap the caller configured at admission. Runs inside the
-/// caller's fire transaction so the row-level `FOR UPDATE` lock is held
-/// through the update. Mirrors [`delete_debounce_row`]'s parameterized
-/// `sql_query` style.
+/// Clamps `proposed` to the row's own `max_fire_at`, preserving the
+/// pre-existing `max_wait` contract, **unless `max_fire_at` has already
+/// passed**. Once the deadline itself is in the past, `LEAST(proposed,
+/// max_fire_at)` would always evaluate to that past `max_fire_at` — writing
+/// an already-expired `effective_fire_at` back to the row, which
+/// re-qualifies it as due on the very next scanner tick and defeats the
+/// backoff entirely for exactly the case where it matters most (a row stuck
+/// past its deadline on a persistently exhausted quota). Past that point the
+/// row instead gets the bounded backoff **unclamped**: the `max_wait` cap
+/// has already been blown by the quota block, so there is no deadline left
+/// to honor, and the alternative — dropping the row — would silently
+/// discard a debounced start the caller is still waiting on.
+#[cfg(feature = "db")]
+fn redefer_target(
+    now: DateTime<Utc>,
+    max_fire_at: DateTime<Utc>,
+    proposed: DateTime<Utc>,
+) -> DateTime<Utc> {
+    if max_fire_at < now {
+        proposed
+    } else {
+        proposed.min(max_fire_at)
+    }
+}
+
+/// Push a quota-blocked debounce row's `effective_fire_at` forward to
+/// `new_effective_fire_at` — the caller has already applied
+/// [`redefer_target`]'s `max_fire_at` clamp. Runs inside the caller's fire
+/// transaction so the row-level `FOR UPDATE` lock is held through the
+/// update. Mirrors [`delete_debounce_row`]'s parameterized `sql_query` style.
 #[cfg(feature = "db")]
 async fn redefer_debounce_row(
     conn: &mut diesel_async::AsyncPgConnection,
@@ -747,14 +774,12 @@ async fn redefer_debounce_row(
     new_effective_fire_at: DateTime<Utc>,
 ) -> crate::error::HarvestResult<()> {
     use diesel_async::RunQueryDsl;
-    diesel::sql_query(
-        "UPDATE harvest_debounce SET effective_fire_at = LEAST($2, max_fire_at) WHERE id = $1",
-    )
-    .bind::<diesel::sql_types::Uuid, _>(row_id)
-    .bind::<diesel::sql_types::Timestamptz, _>(new_effective_fire_at)
-    .execute(conn)
-    .await
-    .map_err(crate::error::database_error)?;
+    diesel::sql_query("UPDATE harvest_debounce SET effective_fire_at = $2 WHERE id = $1")
+        .bind::<diesel::sql_types::Uuid, _>(row_id)
+        .bind::<diesel::sql_types::Timestamptz, _>(new_effective_fire_at)
+        .execute(conn)
+        .await
+        .map_err(crate::error::database_error)?;
     Ok(())
 }
 
@@ -810,6 +835,7 @@ async fn fire_claimed_debounce_row(
     let queue_name = row.queue_name;
     let debounce_key = row.debounce_key;
     let row_id = row.id;
+    let max_fire_at = row.max_fire_at;
     let owner = opts.owner;
     let runbook_url = opts.runbook_url;
     let severity = opts.severity;
@@ -933,7 +959,9 @@ async fn fire_claimed_debounce_row(
             current,
         }) => {
             let now = Utc::now();
-            redefer_debounce_row(conn, row_id, now + QUOTA_REDEFER_BACKOFF).await?;
+            let new_effective_fire_at =
+                redefer_target(now, max_fire_at, now + QUOTA_REDEFER_BACKOFF);
+            redefer_debounce_row(conn, row_id, new_effective_fire_at).await?;
             tracing::debug!(
                 workflow_name = %workflow_name,
                 debounce_key = %debounce_key,
@@ -1208,4 +1236,51 @@ mod tests {
         let deadline = compute_fire_deadline(t0, Duration::ZERO, t0, Duration::from_secs(300));
         assert_eq!(deadline, t0, "zero window should produce fire_at = now");
     }
+
+    // ── redefer_target (issue #1227, Finding 3) ─────────────────────────────
+
+    #[test]
+    fn redefer_target_clamps_to_max_fire_at_when_deadline_still_ahead() {
+        let now = ts(2026, 6, 18, 10, 0, 0);
+        let max_fire_at = now + chrono::Duration::seconds(3); // deadline in 3s
+        let proposed = now + QUOTA_REDEFER_BACKOFF_FOR_TEST; // backoff of 5s overshoots it
+        let target = redefer_target(now, max_fire_at, proposed);
+        assert_eq!(
+            target, max_fire_at,
+            "a still-future max_fire_at must keep clamping the backoff, \
+             preserving the pre-existing max_wait contract"
+        );
+    }
+
+    #[test]
+    fn redefer_target_does_not_clamp_when_max_fire_at_already_passed() {
+        let now = ts(2026, 6, 18, 10, 0, 0);
+        let max_fire_at = now - chrono::Duration::seconds(30); // deadline already blown
+        let proposed = now + QUOTA_REDEFER_BACKOFF_FOR_TEST;
+        let target = redefer_target(now, max_fire_at, proposed);
+        assert_eq!(
+            target, proposed,
+            "once max_fire_at has passed, the clamp must not apply -- clamping \
+             would write an already-expired effective_fire_at"
+        );
+        assert!(
+            target > now,
+            "the redeferred target must be in the future, not a past timestamp \
+             (issue #1227 Finding 3: LEAST(now + backoff, an already-past \
+             max_fire_at) evaluates to the past max_fire_at, defeating the \
+             backoff and re-qualifying the row as due on the very next tick)"
+        );
+    }
+
+    #[test]
+    fn redefer_target_at_exact_deadline_still_clamps() {
+        // max_fire_at == now is the boundary: not yet "passed", so the
+        // pre-existing clamp behavior applies unchanged.
+        let now = ts(2026, 6, 18, 10, 0, 0);
+        let proposed = now + QUOTA_REDEFER_BACKOFF_FOR_TEST;
+        let target = redefer_target(now, now, proposed);
+        assert_eq!(target, now);
+    }
+
+    const QUOTA_REDEFER_BACKOFF_FOR_TEST: chrono::Duration = chrono::Duration::seconds(5);
 }

@@ -10239,26 +10239,18 @@ async fn persist_all_started_child_workflows(
         // capability-miss pre-check and handler resolution already
         // succeeded, so capability is proven -- only the quota-governed
         // key's admission is blocked (Codex round-3 review).
-        Err(HarvestError::QuotaExceeded {
-            workflow_name,
-            key,
-            resource,
-            limit,
-            current,
-        }) => {
-            tracing::warn!(
-                parent_execution_id = %parent_exec_id,
-                workflow_name = %workflow_name,
-                quota_key = %key,
-                resource = %resource,
-                limit,
-                current,
-                "quota exceeded spawning a child workflow; parking the parent \
-                 task to retry once capacity frees up rather than failing the \
-                 parent over an unrelated tenant's quota",
-            );
-            queue::park_workflow_task(conn, task_id, sticky).await?;
-            queue::wake_workflow_task(conn, parent_exec_id).await?;
+        // Issue #1227 (follow-up to #946/#1221's Codex round-6 review):
+        // a park immediately followed by an unconditional wake degenerates
+        // into a zero-delay retry loop against a durably exhausted quota
+        // (e.g. `max_dead_letters`, which only clears via manual operator
+        // action) -- hot-spinning this parent's decision cycle on every
+        // poll with no backoff at all. Route through the same bounded
+        // jittered backoff `recover_from_child_quota_exceeded` already
+        // gives the three other `QuotaExceeded` catch sites in this file
+        // instead of re-implementing the park+wake pattern its own doc
+        // comment warns against.
+        Err(error @ HarvestError::QuotaExceeded { .. }) => {
+            recover_from_child_quota_exceeded(conn, task_id, parent_exec_id, &error).await?;
             return Ok(());
         }
         // A cross-shard child's target shard is unreachable from this node
@@ -10931,36 +10923,20 @@ async fn persist_child_timeout_race(
         .await
         {
             Ok(pair) => pair,
-            Err(HarvestError::QuotaExceeded {
-                workflow_name,
-                key,
-                resource,
-                limit,
-                current,
-            }) => {
-                // Same rationale as the fan-out awaited-child path: a quota-full
-                // TARGET tenant must never terminally fail the PARENT (which may
-                // belong to an entirely unrelated tenant) over a transient
-                // capacity condition. The whole transaction above rolled back
-                // (no child row, no timer row, no parent events persisted), so
-                // park the parent's still-RUNNING task row back to PENDING and
-                // wake it -- the next poll re-drives this exact decision cycle
-                // from the unchanged recorded history and retries the child
-                // spawn once the target tenant's quota has capacity again
-                // (issue #946, Codex round-3 review).
-                tracing::warn!(
-                    parent_execution_id = %parent_exec_id,
-                    workflow_name = %workflow_name,
-                    quota_key = %key,
-                    resource = %resource,
-                    limit,
-                    current,
-                    "quota exceeded spawning a child-timeout-race child; parking \
-                     the parent task to retry once capacity frees up rather than \
-                     failing the parent over an unrelated tenant's quota",
-                );
-                queue::park_workflow_task(conn, task_id, sticky).await?;
-                queue::wake_workflow_task(conn, parent_exec_id).await?;
+            // Same rationale as the fan-out awaited-child path: a quota-full
+            // TARGET tenant must never terminally fail the PARENT (which may
+            // belong to an entirely unrelated tenant) over a transient
+            // capacity condition. The whole transaction above rolled back
+            // (no child row, no timer row, no parent events persisted).
+            //
+            // Issue #1227 (follow-up to #946/#1221's Codex round-6 review):
+            // park immediately followed by an unconditional wake is a
+            // zero-delay retry loop against a durably exhausted quota, so
+            // route through `recover_from_child_quota_exceeded`'s bounded
+            // jittered backoff rather than re-implementing the anti-pattern
+            // its own doc comment warns against.
+            Err(error @ HarvestError::QuotaExceeded { .. }) => {
+                recover_from_child_quota_exceeded(conn, task_id, parent_exec_id, &error).await?;
                 return Ok(());
             }
             Err(e) => return Err(e),

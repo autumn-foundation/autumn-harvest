@@ -1330,6 +1330,7 @@ pub struct CompletionTriggerOutboxDb {
     pub priority: serde_json::Value,
     pub max_workflow_input_bytes: i64,
     pub created_at: DateTime<Utc>,
+    pub next_attempt_at: Option<DateTime<Utc>>,
 }
 
 /// Insertable model for registering a deferred completion trigger outbox task.

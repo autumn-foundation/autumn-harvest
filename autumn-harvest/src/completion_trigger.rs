@@ -732,6 +732,14 @@ pub async fn resolve_cross_shard_target_queue(
     default_workflow_queue()
 }
 
+/// Backoff stamped on an outbox row's `next_attempt_at` when a relay attempt
+/// hits `QuotaExceeded` (issue #1227, Finding 4; follow-up to #946/#1221's
+/// Codex round-6 review). Mirrors `throttle.rs`/`debounce.rs`'s
+/// identically-named, identically-valued constant, kept separate per file
+/// purely for log/intent clarity.
+#[cfg(feature = "db")]
+const QUOTA_REDEFER_BACKOFF: chrono::Duration = chrono::Duration::seconds(5);
+
 /// Outcome of a claimed cross-shard completion-trigger relay attempt, decided
 /// under the source-row `FOR UPDATE SKIP LOCKED` claim (issue #618, F-round19).
 ///
@@ -758,12 +766,20 @@ enum RelayOutcome {
     /// admission gate, with no natural "retry later" cadence, so the row is
     /// dropped) this is TEMPORARY -- the tenant's usage frees up as an
     /// existing execution completes or is deleted -- so the outbox row is
-    /// left claimable (neither deleted nor the fires row touched) rather than
+    /// left claimable (never deleted, the fires row never touched) rather than
     /// dropped or propagated as an error. `enforce_completion_triggers_outbox`
-    /// naturally re-attempts an unclaimed row on its next scan; the core
-    /// start primitive already recorded `harvest.quota.rejected` inside
+    /// naturally re-attempts the row on a later scan; the core start
+    /// primitive already recorded `harvest.quota.rejected` inside
     /// `start_or_load_workflow_execution_collect`, so the relay does NOT
     /// re-record it here.
+    ///
+    /// The row's `next_attempt_at` is stamped to `now() + QUOTA_REDEFER_BACKOFF`
+    /// (issue #1227, Finding 4) so the claim query excludes it until the
+    /// backoff elapses. Pre-#1227 the row was left with no cadence tracking
+    /// at all, so a target durably at quota cap (e.g. a `max_dead_letters`
+    /// cap, which only clears via manual operator action) could dominate
+    /// every unordered `LIMIT 50` claim batch on every scanner tick, starving
+    /// any OTHER, unrelated relay sharing the batch.
     QuotaBlocked {
         key: String,
         resource: crate::quota::QuotaResource,
@@ -942,12 +958,23 @@ async fn relay_gate_checked_start(
                     limit,
                     current,
                     ..
-                }) => Ok(RelayOutcome::QuotaBlocked {
-                    key,
-                    resource,
-                    limit,
-                    current,
-                }),
+                }) => {
+                    let next_attempt_at = chrono::Utc::now() + QUOTA_REDEFER_BACKOFF;
+                    diesel::update(
+                        outbox_dsl::harvest_completion_trigger_outbox
+                            .filter(outbox_dsl::id.eq(outbox_id)),
+                    )
+                    .set(outbox_dsl::next_attempt_at.eq(Some(next_attempt_at)))
+                    .execute(source_tx)
+                    .await
+                    .map_err(crate::error::database_error)?;
+                    Ok(RelayOutcome::QuotaBlocked {
+                        key,
+                        resource,
+                        limit,
+                        current,
+                    })
+                }
                 Err(e) => Err(e),
                 Ok(_started) => {
                     // Fresh start OR an idempotent attach to a still-active run:
@@ -1985,8 +2012,23 @@ pub async fn enforce_completion_triggers_outbox(
     };
 
     // Load up to 50 pending outbox tasks for shards assigned to this worker.
+    //
+    // Issue #1227, Finding 4: excludes a row whose `next_attempt_at` backoff
+    // (stamped by a prior `QuotaBlocked` relay outcome, see `RelayOutcome`)
+    // has not yet elapsed, and orders by `created_at` so an eligible batch is
+    // claimed FIFO. Pre-#1227 this had neither the filter nor an `ORDER BY`:
+    // a row blocked against a durably exhausted quota could dominate every
+    // unordered `LIMIT 50` batch on every tick, starving any OTHER,
+    // unrelated relay that happened to sort after it.
+    let now = chrono::Utc::now();
     let pending_tasks = outbox_dsl::harvest_completion_trigger_outbox
         .filter(outbox_dsl::target_shard.eq_any(&shards))
+        .filter(
+            outbox_dsl::next_attempt_at
+                .is_null()
+                .or(outbox_dsl::next_attempt_at.le(now)),
+        )
+        .order(outbox_dsl::created_at.asc())
         .limit(50)
         .load::<CompletionTriggerOutboxDb>(conn)
         .await
