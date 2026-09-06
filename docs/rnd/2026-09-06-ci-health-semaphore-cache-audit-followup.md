@@ -28,13 +28,17 @@ yesterday's report and one didn't:
   hypothesis the prior report raised, just a smaller wrong direction than
   either report claimed, and likely an understatement in the other direction
   too.
-- **Unchanged:** `Swatinem/rust-cache` still finds nothing to restore on every
-  sampled leg on every sampled run, including a save this report can show
-  raised no error anywhere in its path on the shared base branch, under a
-  stable key three later PR runs all restored against — and still wasn't
-  there 9-14 hours on (§4).
+- **Unchanged:** no sample in this report — 5/5 fresh legs today, plus 3/3
+  downstream restores in §4 — found any cache at all, exact or fallback (a
+  Codex review comment on this PR caught an earlier draft overgeneralizing
+  this to "every sampled run," which contradicts the one prefix-fallback hit
+  the 09-05 report found and this report's own cumulative 9/10 tally
+  includes). That includes a save this report can show raised no error
+  anywhere in its path on the shared base branch, under a stable key three
+  later PR runs all restored against — and still wasn't there 9-14 hours on
+  (§4).
 
-**Correction record for this PR (`#1395`):** seven separate Codex review
+**Correction record for this PR (`#1395`):** eight separate Codex review
 comments caught real problems in earlier drafts of this report — two
 methodology errors in §4's cache-eviction comparison (a same-run comparison
 that couldn't show what was claimed, then a cross-PR-branch comparison
@@ -47,9 +51,12 @@ conflated with distinct persisted keys the same way this report's own
 "12 vs 3" fix already corrected for `test-nodb`, just not carried back to
 the older number), one further scoping gap in that same count (~13 is a
 per-branch figure, not the unknown repository-wide total the shared 10GB cap
-actually contends over), and one internally-inconsistent denominator in the
-Measurement section's cache-hit tally. All seven are fixed below, in place,
-with the retractions left visible rather than edited away.
+actually contends over), one internally-inconsistent denominator in the
+Measurement section's cache-hit tally, and one overgeneralized summary claim
+(the top bullets said no cache was found "on every sampled run," which
+contradicts the one prefix-fallback hit this report's own cumulative tally
+already counts). All eight are fixed below, in place, with the retractions
+left visible rather than edited away.
 
 ## 🎯 Verdict path (unchanged)
 
