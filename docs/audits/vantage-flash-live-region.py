@@ -51,10 +51,14 @@ UI_RS = Path(__file__).resolve().parents[2] / "autumn-harvest-plugin" / "src" / 
 # `div.flash { ... }`, `div."flash" { ... }` (the quoted-class shorthand,
 # used elsewhere in this file for classes like `."error-banner"`), or
 # `div class="flash" { ... }` — all three are maud spellings that render
-# the same markup. Capture whatever attributes sit between the class and
-# the opening `{` of the block so we can check them for a live-region role
-# without also matching unrelated `div`s.
-FLASH_DIV = re.compile(r'div(?:\.flash|\."flash"|\s+class="flash")([^{]*)\{')
+# the same markup. `(?![\w-])` after the unquoted `.flash` form requires a
+# class-token boundary, so `div.flashback` (an unrelated class that merely
+# starts with "flash") doesn't match while chained classes like
+# `div.flash.extra` still do (the next character is `.`, not a word
+# character or hyphen). Capture whatever attributes sit between the class
+# and the opening `{` of the block so we can check them for a live-region
+# role without also matching unrelated `div`s.
+FLASH_DIV = re.compile(r'div(?:\.flash(?![\w-])|\."flash"|\s+class="flash")([^{]*)\{')
 
 # `(?<![\w-])` requires the match not be preceded by a word character or a
 # hyphen, so `role="status"` matches as a real attribute but the same text
