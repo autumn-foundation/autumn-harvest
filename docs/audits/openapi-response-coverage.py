@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
 """Check the API contract against the handlers it describes.
 
-Three checks, all mechanical:
+Four checks, all mechanical:
 
 1. Every HTTP status a handler can return is declared for that route.
 2. Every request-body field that is mandatory on the wire is marked required.
 3. Every request-body field the handler accepts is documented at all.
+4. Every query key a hand-rolled parser accepts is documented at all.
 
 The published OpenAPI document is generated from `docs/api-contract.json`, so
 anything missing there is missing from every generated client. This audit reads
@@ -18,6 +19,13 @@ mandatory when it is neither an `Option` nor carries a serde default, since axum
 rejects a request that omits one. A field serde accepts but the contract omits
 is missing from the generated client, so an ordinary request cannot be typed.
 
+Check 4 reads the routes that take a `RawQuery` and parse the pairs by hand. A
+key those parsers match is a parameter the route accepts, so a key the contract
+omits cannot be expressed by a generated client. Only a literal match arm at the
+top of a `pairs` loop is read, so a key computed at runtime is invisible. An arm
+naming several spellings passes when the contract documents any one of them,
+since an alias needs no second entry in the document.
+
 A `StatusCode::` used in a comparison rather than a response is ignored, and so
 is one inside a helper on GENERIC_HELPERS: `map_error` translates a runtime
 error variant, so its statuses belong to the error, not to every route that
@@ -28,6 +36,9 @@ often selected in a helper such as `queue_pause_partial_status`. A helper called
 by a helper is not followed, so this audit is a floor rather than a proof. The
 finding text names the source line, since a status can reach a route through a
 helper it shares.
+
+A route that parses its query with a typed `Query<T>` extractor is outside check
+4, which reads match arms rather than struct fields.
 
 Second known limit: only a literal `StatusCode::` is read. An `AutumnError`
 constructor carries an implied status with no such token, so
@@ -80,6 +91,9 @@ VERBS = ("get", "post", "put", "patch", "delete")
 # on the calling route. Following them would put every status they can produce
 # on every route that calls them, which is noise, not coverage.
 GENERIC_HELPERS = frozenset({"map_error"})
+
+# A query-key match arm, naming one key or several spellings of one.
+KEY_ARM = re.compile(r'^\s*("[a-z_0-9-]+"(?:\s*\|\s*"[a-z_0-9-]+")*)\s*=>')
 
 # The parser must keep finding the whole router. A large drop means it drifted
 # from the source and is no longer checking anything.
@@ -219,6 +233,27 @@ def mandatory_fields(struct: str) -> list[str]:
     return mandatory
 
 
+def key_arms(body: str) -> list[tuple[str, ...]]:
+    """Query-key literals matched at the top of a `pairs` loop."""
+    arms: list[tuple[str, ...]] = []
+    bindings = set(
+        re.findall(r"for\s*\(\s*([a-z_0-9]+)\s*,\s*[a-z_0-9]+\s*\)\s*in[^\n{]*pairs", body)
+    )
+    for binding in sorted(bindings):
+        for found in re.finditer(r"match\s+%s\.as_str\(\)\s*\{" % re.escape(binding), body):
+            block = balanced(body[found.end() - 1 :], "{", "}")
+            # Depth 1 is the arm list itself. A nested match sits deeper, so a
+            # value arm such as `"asc" => Order::Asc` is not read as a key.
+            depth = 0
+            for line in block.split("\n"):
+                if depth == 1:
+                    hit = KEY_ARM.match(line)
+                    if hit:
+                        arms.append(tuple(re.findall(r'"([a-z_0-9-]+)"', hit.group(1))))
+                depth += line.count("{") - line.count("}")
+    return arms
+
+
 def declared_statuses(route: dict) -> set[int]:
     statuses = {route["success_response"]["status"]}
     statuses |= {entry["status"] for entry in route.get("additional_responses", [])}
@@ -241,6 +276,7 @@ def main() -> int:
         return 1
 
     findings: list[str] = []
+    query_findings: list[str] = []
     for method, path, handler in routes:
         body = handler_body(source, handler)
         route = by_route.get((method, path))
@@ -253,6 +289,18 @@ def main() -> int:
             reached = function_body(source, helper)
             if reached is not None:
                 bodies.append(reached)
+
+        params = handler_parameters(source, handler)
+        if params is not None and "RawQuery" in params:
+            documented = {entry["name"] for entry in route.get("params", [])}
+            for reached in bodies:
+                for arm in key_arms(reached):
+                    if set(arm) & documented:
+                        continue
+                    query_findings.append(
+                        "  %s %s: `%s` is accepted by the query parser but the "
+                        "contract does not document it" % (method, path, "` / `".join(arm))
+                    )
 
         for reached in bodies:
             offset = source.index(reached)
@@ -312,7 +360,8 @@ def main() -> int:
     print("Undeclared statuses: %d" % len(findings))
     print("Unmarked mandatory body fields: %d" % len(body_findings))
     print("Undocumented body fields: %d" % len(undocumented))
-    if not findings and not body_findings and not undocumented:
+    print("Undocumented query keys: %d" % len(query_findings))
+    if not findings and not body_findings and not undocumented and not query_findings:
         return 0
 
     if findings:
@@ -326,6 +375,12 @@ def main() -> int:
         print("\nUnmarked mandatory body fields:\n" + "\n".join(sorted(set(body_findings))))
     if undocumented:
         print("\nUndocumented body fields:\n" + "\n".join(sorted(set(undocumented))))
+    if query_findings:
+        print("\nUndocumented query keys:\n" + "\n".join(sorted(set(query_findings))))
+        print(
+            "\nAdd each to the route's `params` in docs/api-contract.json. An "
+            "alias of a documented key needs no entry of its own."
+        )
     print("\nThen run scripts/regenerate-openapi.sh.")
     return 1
 

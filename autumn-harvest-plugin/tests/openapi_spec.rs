@@ -422,6 +422,58 @@ fn multi_format_responses_declare_every_media_type() {
     assert!(doc["paths"]["/admin/metrics"]["get"]["x-harvest-stream"].is_null());
 }
 
+/// A filter the query parser accepts reaches the document as a parameter.
+///
+/// These routes take a `RawQuery` and parse the pairs by hand, so no struct
+/// field names them. `docs/audits/openapi-response-coverage.py` gates the whole
+/// set; this test pins the ones a client needs most.
+#[test]
+fn hand_parsed_query_filters_are_published() {
+    let doc = document();
+
+    let listing = parameter_names(&doc["paths"]["/workflows"]["get"]);
+    for name in [
+        "owner",
+        "severity",
+        "failure_cause",
+        "no_progress_minutes",
+        "include_sleeping",
+        "min_history_events",
+    ] {
+        assert!(listing.contains(name), "GET /workflows omits {name}");
+    }
+
+    let exports = parameter_names(&doc["paths"]["/admin/history/exports"]["get"]);
+    for name in ["state", "max_bytes"] {
+        assert!(
+            exports.contains(name),
+            "GET /admin/history/exports omits {name}"
+        );
+    }
+}
+
+/// The query parameter names one operation publishes.
+fn parameter_names(operation: &Value) -> BTreeSet<String> {
+    operation["parameters"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|parameter| parameter["in"] == "query")
+        .filter_map(|parameter| parameter["name"].as_str())
+        .map(str::to_owned)
+        .collect()
+}
+
+/// A rejection the handler forwards unchanged keeps its own media type.
+#[test]
+fn forwarded_extractor_rejections_declare_their_representation() {
+    let doc = document();
+    let start = &doc["paths"]["/workflows/{workflow_name}/start"]["post"];
+    let content = &start["responses"]["422"]["content"];
+    assert!(content["application/json"].is_object(), "{content}");
+    assert_eq!(content["text/plain"]["schema"]["type"], "string", "{content}");
+}
+
 /// A streaming route says so, and does not pretend to return JSON.
 #[test]
 fn streaming_operations_are_marked() {

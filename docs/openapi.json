@@ -2134,6 +2134,15 @@
             }
           },
           {
+            "description": "Comma-separated execution states, as an alternative to the state_group shorthand. An unknown state returns 400.",
+            "in": "query",
+            "name": "state",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
             "description": "RFC 3339 timestamp — include executions updated after this time.",
             "in": "query",
             "name": "updated_after",
@@ -2173,6 +2182,15 @@
             "description": "Payload inclusion: full, redacted, or omit.",
             "in": "query",
             "name": "payload_policy",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Cap on the decoded payload bytes an entry may contribute. An entry over the cap is reported with its size instead of its payload.",
+            "in": "query",
+            "name": "max_bytes",
             "required": false,
             "schema": {
               "type": "string"
@@ -7133,6 +7151,24 @@
             }
           },
           {
+            "description": "Filter by the execution owner, matched exactly. A blank value is ignored.",
+            "in": "query",
+            "name": "owner",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Filter by the execution severity label, matched exactly. A blank value is ignored.",
+            "in": "query",
+            "name": "severity",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
             "description": "Search attribute filter in key:value form (exact-match string equality). May be repeated.",
             "explode": true,
             "in": "query",
@@ -7254,6 +7290,42 @@
             "description": "Filter by workflow-start provenance (issue #740). One of the bounded StartSource set: api, schedule, backfill, signal_with_start, update_with_start, completion_trigger, webhook, child, batch, continue_as_new, reset, outbox, or 'unknown' (matches NULL / pre-upgrade rows). Any other value returns 400.",
             "in": "query",
             "name": "start_source",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Filter to executions whose search_attrs carry this failure_cause value.",
+            "in": "query",
+            "name": "failure_cause",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Stalled-workflow discovery (issue #486). A positive integer N. Returns RUNNING and SUSPENDED executions with no recorded progress for N minutes, sorted by staleness. PAUSED executions are excluded unless state=PAUSED is given, because a pause blocks progress by design. Keyset pagination does not apply on this path. A value below 1, or a non-numeric value, returns 400. Cannot be combined with history_bloat_min_events, which returns 400.",
+            "in": "query",
+            "name": "no_progress_minutes",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "When 'true', keep correctly-sleeping executions in the no_progress_minutes result. An execution is correctly sleeping when a future-dated timer is its only pending item and no timer is overdue. Such an execution is excluded by default, because it has nothing to progress on.",
+            "in": "query",
+            "name": "include_sleeping",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "General-purpose history-size filter (issue #493). A non-negative integer N. Restricts the response to executions whose recorded harvest_events count is >= N. Composes freely with state, order and pagination, unlike history_bloat_min_events.",
+            "in": "query",
+            "name": "min_history_events",
             "required": false,
             "schema": {
               "type": "string"
@@ -12049,9 +12121,15 @@
                   },
                   "type": "object"
                 }
+              },
+              "text/plain": {
+                "schema": {
+                  "description": "Text body in the declared format. See the response description.",
+                  "type": "string"
+                }
               }
             },
-            "description": "A completion callback target rejected the start. No execution was created."
+            "description": "A completion callback target rejected the start, as the JSON body below. No execution was created. The same status is returned as plain text when the request body is syntactically valid JSON that does not deserialize into the start request. The handler forwards that extractor rejection unchanged, so the body is the extractor message rather than this object."
           },
           "429": {
             "description": "The workflow's declared per-tenant resource quota (issue #946, QuotaPolicy) is exhausted for the resolved key on a FRESH admission only (an attach to an existing run never re-checks the quota). Body is {\"error\": \"quota exceeded\", \"workflow_name\", \"key\", \"resource\", \"limit\", \"current\"} naming which of max_active_executions / max_history_bytes / max_dead_letters was hit and the usage observed immediately before this admission (current excludes the would-be admission itself). No execution row, event, or task queue row is created for a rejected start. Never returned for a workflow with no declared QuotaPolicy."

@@ -145,8 +145,9 @@ Five checks hold the chain together:
 4. The `lint` job validates both copies with `openapi-spec-validator`, and it
    runs on documentation-only pull requests too.
 5. `docs/audits/openapi-response-coverage.py`, also in `lint`, reads the
-   handlers: every status a handler returns must be declared, and every
-   request-body field that is mandatory on the wire must be marked required.
+   handlers: every status a handler returns must be declared, every
+   request-body field that is mandatory on the wire must be marked required,
+   and every query key a hand-rolled parser matches must be documented.
 
 ## Why the document is derived, not annotated
 

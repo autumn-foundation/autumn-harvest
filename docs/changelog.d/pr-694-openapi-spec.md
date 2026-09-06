@@ -140,6 +140,20 @@ against routes reverse-engineered from prose.
   page forever, and the supported `owner` filter was undocumented. Six more
   accepted filters were missing: `since` on the per-schedule decisions, and
   `status` and `action` on the batch-operations list.
+- Eight query parameters the API accepts were documented nowhere, so a typed
+  client could not express them. `GET /workflows` accepts `owner`, `severity`,
+  `failure_cause`, `no_progress_minutes`, `include_sleeping` and
+  `min_history_events`; the first three filter the listing and the last three
+  select or size the stalled-workflow discovery path.
+  `GET /admin/history/exports` accepts `state`, the explicit form of the
+  documented `state_group` shorthand, and `max_bytes`, which caps the decoded
+  payload bytes an entry contributes. Its sibling
+  `GET /admin/history/export-sample` already documented both.
+- `POST /workflows/{workflow_name}/start` declared its `422` as the JSON
+  callback-rejection object only. The handler forwards the axum extractor
+  rejection unchanged when the body does not deserialize, and axum renders that
+  as plain text, so the status carries two representations. Both are now
+  declared.
 - `GET /admin/metrics` publishes Prometheus text, never JSON, and
   `GET /admin/queues/scaling` publishes either depending on `format`. Both
   declared `application/json` only. `content_type` now accepts a list, and the
@@ -160,7 +174,7 @@ change, no `harvest_events` write path. One additive read-only route.
 
 **Test evidence.**
 
-`autumn-harvest-plugin/tests/openapi_spec.rs` holds 13 tests, wired by one
+`autumn-harvest-plugin/tests/openapi_spec.rs` holds 16 tests, wired by one
 sorted line in `.github/ci/integration-suites.txt`. They assert:
 
 - Exact route coverage against `management_api_routes()`, in both directions.
@@ -180,16 +194,25 @@ sorted line in `.github/ci/integration-suites.txt`. They assert:
   served endpoint returns exactly those bytes.
 - The route is nest-relative, so an embedding app that serves its own
   `/openapi.json` keeps it.
+- A filter parsed by hand from a `RawQuery` reaches the document as a
+  parameter, and a forwarded extractor rejection keeps its own media type.
 
 `docs/audits/openapi-response-coverage.py` reads the handlers and the contract,
-and runs in the ungated `lint` job. It fails on three things: a status the
+and runs in the ungated `lint` job. It fails on four things: a status the
 handler returns that the contract does not declare, a request-body field that is
-mandatory on the wire but not marked required, and a field serde accepts that
-the contract documents nowhere. Each handler is followed one level into the
+mandatory on the wire but not marked required, a field serde accepts that
+the contract documents nowhere, and a query key a hand-rolled parser matches
+that the contract documents nowhere. The last check reads the routes that take
+a `RawQuery` and parse the pairs themselves, which the parameter guards in
+`openapi_spec` cannot see: a key never reaches a struct field there. Only a
+literal match arm at the top of a `pairs` loop is read, and an arm naming
+several spellings passes when any one of them is documented, since an alias
+needs no second entry in the document. Each handler is followed one level into the
 helpers it calls, since a status is often chosen in a helper such as
 `queue_pause_partial_status`. `map_error` is excluded: it translates a runtime
 error variant, so its statuses belong to the error rather than to every route
-that calls it. Both checks were confirmed to fail on a seeded gap.
+that calls it. Every check was confirmed to fail on a seeded gap; the query-key
+check found the eight parameters above and reports none once they are declared.
 
 Two new guards in `contract_regression.rs` read `src/api.rs` itself.
 `every_registered_route_is_in_the_canonical_list` parses the router and fails

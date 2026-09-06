@@ -48,6 +48,18 @@
           "description": "Filter by registered workflow name."
         },
         {
+          "name": "owner",
+          "in": "query",
+          "required": false,
+          "description": "Filter by the execution owner, matched exactly. A blank value is ignored."
+        },
+        {
+          "name": "severity",
+          "in": "query",
+          "required": false,
+          "description": "Filter by the execution severity label, matched exactly. A blank value is ignored."
+        },
+        {
           "name": "search_attr",
           "in": "query",
           "required": false,
@@ -126,6 +138,30 @@
           "in": "query",
           "required": false,
           "description": "Filter by workflow-start provenance (issue #740). One of the bounded StartSource set: api, schedule, backfill, signal_with_start, update_with_start, completion_trigger, webhook, child, batch, continue_as_new, reset, outbox, or 'unknown' (matches NULL / pre-upgrade rows). Any other value returns 400."
+        },
+        {
+          "name": "failure_cause",
+          "in": "query",
+          "required": false,
+          "description": "Filter to executions whose search_attrs carry this failure_cause value."
+        },
+        {
+          "name": "no_progress_minutes",
+          "in": "query",
+          "required": false,
+          "description": "Stalled-workflow discovery (issue #486). A positive integer N. Returns RUNNING and SUSPENDED executions with no recorded progress for N minutes, sorted by staleness. PAUSED executions are excluded unless state=PAUSED is given, because a pause blocks progress by design. Keyset pagination does not apply on this path. A value below 1, or a non-numeric value, returns 400. Cannot be combined with history_bloat_min_events, which returns 400."
+        },
+        {
+          "name": "include_sleeping",
+          "in": "query",
+          "required": false,
+          "description": "When 'true', keep correctly-sleeping executions in the no_progress_minutes result. An execution is correctly sleeping when a future-dated timer is its only pending item and no timer is overdue. Such an execution is excluded by default, because it has nothing to progress on."
+        },
+        {
+          "name": "min_history_events",
+          "in": "query",
+          "required": false,
+          "description": "General-purpose history-size filter (issue #493). A non-negative integer N. Restricts the response to executions whose recorded harvest_events count is >= N. Composes freely with state, order and pagination, unlike history_bloat_min_events."
         },
         {
           "name": "history_bloat_min_events",
@@ -1342,7 +1378,11 @@
         },
         {
           "status": 422,
-          "description": "A completion callback target rejected the start. No execution was created.",
+          "content_type": [
+            "application/json",
+            "text/plain"
+          ],
+          "description": "A completion callback target rejected the start, as the JSON body below. No execution was created. The same status is returned as plain text when the request body is syntactically valid JSON that does not deserialize into the start request. The handler forwards that extractor rejection unchanged, so the body is the extractor message rather than this object.",
           "fields": [
             {
               "name": "error",
@@ -6083,6 +6123,12 @@
           "description": "Execution state group: active or terminal."
         },
         {
+          "name": "state",
+          "in": "query",
+          "required": false,
+          "description": "Comma-separated execution states, as an alternative to the state_group shorthand. An unknown state returns 400."
+        },
+        {
           "name": "updated_after",
           "in": "query",
           "required": false,
@@ -6111,6 +6157,12 @@
           "in": "query",
           "required": false,
           "description": "Payload inclusion: full, redacted, or omit."
+        },
+        {
+          "name": "max_bytes",
+          "in": "query",
+          "required": false,
+          "description": "Cap on the decoded payload bytes an entry may contribute. An entry over the cap is reported with its size instead of its payload."
         }
       ],
       "request_body": null,
