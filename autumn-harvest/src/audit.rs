@@ -1426,6 +1426,34 @@ pub async fn insert_audit(
         .map_err(database_error)
 }
 
+/// Insert several audit records in one round trip. Returns the generated ids
+/// in the same order as `records`.
+///
+/// A no-op statement is never sent for an empty slice — an empty `VALUES`
+/// list has no `Insertable` representation, so this returns `Ok(vec![])`
+/// without touching the connection.
+///
+/// Same durability contract as [`insert_audit`]: the caller must ensure this
+/// returns `Ok` before reporting success for every mutation it covers.
+///
+/// # Errors
+///
+/// Returns [`crate::error::HarvestError::Database`] if the insert fails.
+pub async fn insert_audit_batch(
+    conn: &mut AsyncPgConnection,
+    records: &[NewAuditRecord<'_>],
+) -> HarvestResult<Vec<Uuid>> {
+    if records.is_empty() {
+        return Ok(Vec::new());
+    }
+    diesel::insert_into(harvest_audit_log::table)
+        .values(records)
+        .returning(harvest_audit_log::id)
+        .get_results::<Uuid>(conn)
+        .await
+        .map_err(database_error)
+}
+
 /// List audit records matching the given filters, ordered by `occurred_at DESC`.
 ///
 /// The `limit` in `filters` is clamped to [1, 500]. The caller is responsible
