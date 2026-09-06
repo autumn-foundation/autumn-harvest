@@ -519,9 +519,12 @@ HTML_BLOCK_RE = re.compile(
 # What ends each kind of HTML block. Types 1 to 5 end ON the line carrying
 # the closer, which may be the opening line itself ("<pre>raw</pre>"); type 6
 # ends at a blank line, which is not part of it.
-HTML_VERBATIM_RE = re.compile(r"^[ \t]*<(?:script|pre|style|textarea)(?:[ \t/>]|$)", re.I)
+HTML_VERBATIM_RE = re.compile(r"^[ \t]*<(script|pre|style|textarea)(?:[ \t/>]|$)", re.I)
 HTML_CLOSERS = {
-    "verbatim": ("</script>", "</pre>", "</style>", "</textarea>"),
+    "script": ("</script>",),
+    "pre": ("</pre>",),
+    "style": ("</style>",),
+    "textarea": ("</textarea>",),
     "comment": ("-->",),
     "instruction": ("?>",),
     "declaration": (">",),
@@ -541,10 +544,16 @@ def html_block(text: str, container: int) -> bool:
 
 
 def html_kind(text: str) -> str:
-    """Which sort of HTML block `text` opens, which decides what closes it."""
+    """Which sort of HTML block `text` opens, which decides what closes it.
+
+    A verbatim block is named by its OWN tag. Rustdoc keeps a "<pre>" block
+    open across a literal "</style>" line, so accepting any of the four
+    closing tags ended the block early and reported its content.
+    """
     stripped = text.lstrip()
-    if HTML_VERBATIM_RE.match(text):
-        return "verbatim"
+    verbatim = HTML_VERBATIM_RE.match(text)
+    if verbatim:
+        return verbatim.group(1).lower()
     if stripped.startswith("<!--"):
         return "comment"
     if stripped.startswith("<?"):
@@ -611,7 +620,8 @@ class Piece:
     """
 
     __slots__ = (
-        "line", "marker", "body", "trailing", "block", "group", "nest", "line_start"
+        "line", "marker", "body", "trailing", "block", "group", "nest",
+        "line_start", "line_end",
     )
 
     def __init__(
@@ -639,6 +649,12 @@ class Piece:
         # inside the enclosing one's fenced example if there is one, so it
         # inherits the fence; what it opens itself does not survive the close.
         self.nest = nest
+        # Is this piece the end of its line? A nested comment's delimiters
+        # are literal text in the rendered document, so anything after this
+        # piece on the line -- even an EMPTY "/**/", which yields no piece at
+        # all -- means the line does not end here. A closing fence may be
+        # followed only by spaces, so this decides one.
+        self.line_end = True
         # Does this piece begin its own line? A nested comment splits one
         # line into several pieces, and only the first of them starts at
         # column zero. Every Markdown BLOCK marker -- a fence, a list item, a
@@ -770,8 +786,11 @@ def extract_comments(source: str) -> list[Piece]:
                         )
                         first = False
                     # The opener itself is text on this line, whether or not
-                    # anything preceded it, so the line is no longer blank.
+                    # anything preceded it, so the line is no longer blank --
+                    # and whatever came before it no longer ends the line.
                     line_started = True
+                    if pieces and pieces[-1].line == line:
+                        pieces[-1].line_end = False
                     # A nested comment stays in the enclosing comment's run,
                     # and `nest` records that it is inside it. The fence state
                     # is stacked per nesting level rather than reset here: the
@@ -800,6 +819,9 @@ def extract_comments(source: str) -> list[Piece]:
                             )
                             first = False
                         line_started = True
+                        # The nested "*/" is literal text too.
+                        if pieces and pieces[-1].line == line:
+                            pieces[-1].line_end = False
                     depth -= 1
                     i += 2
                     if depth > 0:
@@ -1404,10 +1426,11 @@ def comment_lines(pieces: list[Piece]):
             # right and must still be seen; the others end on the line that
             # carries their closer.
             if html is not None:
-                if html == "tag" and html_closes(text, html):
+                inside = strip_quote(text, stack[-1][0] if stack else 0)
+                if html == "tag" and html_closes(inside, html):
                     html = None
                 else:
-                    if html_closes(text, html):
+                    if html_closes(inside, html):
                         html = None
                     yield piece.line, text, True
                     continue
@@ -1426,7 +1449,11 @@ def comment_lines(pieces: list[Piece]):
                 stack, paragraph = update_containers(
                     text, stack, paragraph, quoted, in_table
                 )
-                quoted = quote_depth(text, stack[-1][0] if stack else 0)
+                # From the PEEL, as `prose_units` reads it. "- > text" is a
+                # quote inside a list item, and reading the raw line reports
+                # depth zero because the marker comes first -- one loop then
+                # believes the line left the quote and the other does not.
+                quoted = strip_containers(text, stack, stack[-1][0] if stack else 0)[2]
             container = stack[-1][0] if stack else 0
             delimiter = fence_delimiter(text, container, fence is not None, scope[2], stack)
             # The whole LINE decides a delimiter, not this piece alone. A
@@ -1436,9 +1463,9 @@ def comment_lines(pieces: list[Piece]):
             # of both.
             if delimiter:
                 tail = line_tail(run, index)
-                if (fence is not None and tail.strip()) or (
-                    fence is None and "`" in tail
-                ):
+                if (
+                    fence is not None and (tail.strip() or not piece.line_end)
+                ) or (fence is None and "`" in tail):
                     delimiter = None
             if delimiter:
                 before = fence
@@ -1470,10 +1497,19 @@ def comment_lines(pieces: list[Piece]):
             # An HTML block opens here, outside any fence. Its own line is
             # ordinary text -- "<pre>" carries no defect -- but everything
             # until its closer is raw HTML.
-            if fence is None and html_block(text, container):
-                html = html_kind(text)
-                if html != "tag" and html_closes(text, html):
+            # Peeled, like every other block test: a quoted "> <pre>" opens
+            # the block its container holds, and asking with the marker still
+            # on the line never recognizes one.
+            peeled = strip_quote(text, container)
+            if fence is None and html_block(peeled, container):
+                html = html_kind(peeled)
+                if html != "tag" and html_closes(peeled, html):
                     html = None
+                # The opener's line is inside the block it opens. Rustdoc
+                # renders "<pre>TODO: x</pre>" preformatted, so the line
+                # rules must not read that TODO as a defect.
+                yield piece.line, text, True
+                continue
             yield piece.line, text, fence is not None
 
 
@@ -1623,10 +1659,11 @@ def prose_units(pieces: list[Piece]) -> list[tuple[int, str]]:
             # Raw HTML is not Markdown and not prose -- see `comment_lines`,
             # which carries this state the same way.
             if html is not None:
-                if html == "tag" and html_closes(body, html):
+                inside = strip_quote(body, stack[-1][0] if stack else 0)
+                if html == "tag" and html_closes(inside, html):
                     html = None
                 else:
-                    if html_closes(body, html):
+                    if html_closes(inside, html):
                         html = None
                     flush()
                     in_list = False
@@ -1657,9 +1694,9 @@ def prose_units(pieces: list[Piece]) -> list[tuple[int, str]]:
             # of both.
             if delimiter:
                 tail = line_tail(block, index)
-                if (fence is not None and tail.strip()) or (
-                    fence is None and "`" in tail
-                ):
+                if (
+                    fence is not None and (tail.strip() or not piece.line_end)
+                ) or (fence is None and "`" in tail):
                     delimiter = None
             if delimiter:
                 before = fence
@@ -2868,6 +2905,52 @@ RULE_TESTS = [
         "//! word1 word2 word3 word4 word5 word6 word7 word8 word9 word10 word11 word12 word13 word14 word15 word16 word17 word18 word19 word20 word21 word22 word23 word24 word25 word26.\n",
         {("CH007", 4)},
         "a tag-name HTML block ends at a blank line",
+    ),
+    (
+        "/// > <pre>\n"
+        "/// > TODO: fixture placeholder\n"
+        "/// > </pre>\n",
+        set(),
+        "a quoted HTML block is peeled before it is recognized",
+    ),
+    (
+        "/// <pre>\n"
+        "/// </style>\n"
+        "/// TODO: fixture placeholder\n"
+        "/// </pre>\n",
+        set(),
+        "a verbatim block closes on its own tag and no other",
+    ),
+    (
+        "/// <pre>TODO: fixture placeholder</pre>\n",
+        set(),
+        "a raw block complete on one line exempts that line",
+    ),
+    (
+        "/// <pre>\n"
+        "/// TODO: one\n"
+        "/// </pre>\n"
+        "/// TODO: two\n",
+        {("CH002", 4)},
+        "and the line after its closer is prose again",
+    ),
+    (
+        "/** ```rust\n"
+        " * sample();\n"
+        " * ``` /**/\n"
+        " * TODO: fixture placeholder\n"
+        " * ``` */\n"
+        "pub struct A;\n",
+        set(),
+        "an empty nested comment still follows a closing fence",
+    ),
+    (
+        "/// - > intro\n"
+        "///   22. item\n"
+        "///       ```\n"
+        "///       TODO: issue required\n",
+        set(),
+        "quote depth comes from the peel in both scanners",
     ),
 ]
 

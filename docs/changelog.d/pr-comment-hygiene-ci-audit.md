@@ -1450,3 +1450,39 @@ half-implemented block, and a half-implemented block reports the inside of it.
 
 Corpus effect: none. The tree writes no tables in `*.rs` comments and no raw
 HTML in them, which is also why nothing caught these until they were rendered.
+
+### Round forty-six — four false positives in one round, and the loop diff
+
+Four findings, every one of them CH002 reported on preformatted content, and
+three of the four are defects in the code round forty-five added.
+
+- **A quoted HTML block was never recognized.** `comment_lines` asked
+  `html_block` with the quote marker still on the line, while `prose_units`
+  asked with it peeled. `/// > <pre>` opened nothing, so the TODO inside was
+  read as prose.
+- **A verbatim block closed on any tag.** Rustdoc keeps a `<pre>` block open
+  across a literal `</style>` line. The kind is now the tag itself, and only
+  its own closer ends it.
+- **A block complete on one line still scanned that line.**
+  `<pre>TODO: x</pre>` renders preformatted, and the opener's own line is
+  inside the block it opens.
+- **An empty nested comment left no trace.** `/**/` produces no piece, so
+  `` ``` /**/ `` looked like a clean closing fence. Rustdoc keeps the fence
+  open, because a closer may be followed only by spaces. `Piece.line_end`
+  now records that a nested delimiter follows, whether or not it wrapped any
+  text.
+
+**The loop diff.** Round forty-four's reply said that if the
+`comment_lines`/`prose_units` divergence recurred, the loops would be
+reconciled wholesale rather than patched again. It recurred, so the two were
+listed side by side and compared operation by operation. One divergence was
+left beyond the reported one: `comment_lines` derived `quoted` from the raw
+line while `prose_units` derived it from the container peel. In `- > text`
+the marker comes first, so the raw line reports depth zero and one loop
+believed the line had left the quote. Both now read the peel. Rustdoc renders
+the shape that exposes it — `- > intro`, then `22.` and a fence in the item —
+with the TODO inside `<code>`, so the audit was reporting a fourth false
+positive that no review round had found.
+
+Corpus effect: none. Every fix here is in a shape this tree does not write,
+which is exactly why only the renderer finds them.
