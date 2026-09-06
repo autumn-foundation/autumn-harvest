@@ -556,6 +556,19 @@ shows the sort-elision candidate isn't rejected on a cost comparison at all
 — it is never generated as a candidate in the first place, regardless of
 what any selectivity estimate says.
 
+**These ten are not the query's complete set of residual predicates.**
+`claim_task_query()` also carries an eleventh: the activity-pause exclusion,
+`NOT (activity_name = ANY(paused_activities.names))` (issue #807) —
+structurally the same array-membership anti-join shape as the queue-pause
+predicate above (#619). Issue #1177's reproduction did not test it; nothing
+above should be read as covering it. Issue #1215 tested it separately, with
+`harvest_activity_pauses` actually populated (every predicate above was
+tested against an empty pause table) rather than as a structural no-op, and
+found it triggers the claim sort's disk spill at roughly 10x lower backlog
+depth than this issue's own no-op-predicate threshold — a materially
+different, and independently interesting, cost profile from the one
+established here.
+
 **A separate, narrower diagnostic goes further, for the sticky-routing
 predicate specifically, under `FOR UPDATE SKIP LOCKED`.** With the competing
 `idx_harvest_tq_coverage_sample` index hidden and `enable_seqscan=off;
@@ -662,12 +675,14 @@ transfers to a genuinely multi-queue bind has not been checked here.
 **What this means for the query as it stands today:** there is no realistic
 deployment shape that gets the cheap index-ordered plan back, because
 `claim_task_query()` always carries at least the `schedule_to_close_at`
-check, the sticky/session OR-chains, and the queue-pause anti-join
-unconditionally — dropping just the `CASE` key would not be sufficient, and
-no single index can make the `sticky`/`session`/`schedule_to_close` scalar
-checks, the concurrency-key gate, three different `EXISTS` subqueries
-against three different tables, and the `jsonb_array_elements` capability
-walk simultaneously sargable against one ordered index.
+check, the sticky/session OR-chains, and the queue-pause and activity-pause
+anti-joins unconditionally — dropping just the `CASE` key would not be
+sufficient, and no single index can make the `sticky`/`session`/
+`schedule_to_close` scalar checks, the concurrency-key gate, three different
+`EXISTS` subqueries against three different tables, and the
+`jsonb_array_elements` capability walk simultaneously sargable against one
+ordered index — eleven residual predicates in total, not the ten this
+section's own reproduction tested (see above).
 
 **This page does not propose a query change for it.** Per the same
 measure-before-tune discipline issue #786 established, a genuine fix here
