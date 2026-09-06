@@ -1305,29 +1305,40 @@ fn timer_owns_the_wake(scheduled_at: DateTime<Utc>, fires_at: DateTime<Utc>) -> 
 /// `created_at = clock_timestamp()`, and `scheduled_at` to a value bound
 /// moments earlier in Rust as `Utc::now() -
 /// queue::IMMEDIATE_SCHEDULE_SKEW_ALLOWANCE` (5 seconds). A row this path
-/// touched has `created_at` roughly this many seconds AHEAD of
-/// `scheduled_at`. No other write to this column pair produces that
-/// fingerprint.
+/// touched has `created_at` at least roughly this many seconds AHEAD of
+/// `scheduled_at`. See [`wake_source_repended_this_row`] for why no other
+/// write to this column pair can land in that direction at all.
 const WAKE_REPEND_SKEW_SECONDS: i64 = 5;
 
-/// Tolerance for matching [`WAKE_REPEND_SKEW_SECONDS`], mirroring
-/// [`TIMER_OWNERSHIP_TOLERANCE_SECONDS`]'s reasoning. It is generous
-/// enough to absorb the network latency between the Rust-side bind and
-/// the server's `clock_timestamp()`. It stays tight enough that an
-/// unrelated row's `created_at` cannot match by chance.
-const WAKE_REPEND_TOLERANCE_SECONDS: i64 = 2;
+/// Tolerance below [`WAKE_REPEND_SKEW_SECONDS`], for ordinary clock skew
+/// between the Rust host and the Postgres server.
+const WAKE_REPEND_LOWER_TOLERANCE_SECONDS: i64 = 2;
+
+/// Tolerance above [`WAKE_REPEND_SKEW_SECONDS`] (issue #1191 review).
+/// `scheduled_at` is bound in Rust before the `UPDATE` runs; `created_at`'s
+/// `clock_timestamp()` fires only once the server actually executes it.
+/// Under database or network saturation that gap can grow well past a
+/// couple of seconds. A generous upper bound absorbs it without deriving
+/// both timestamps from one server call.
+const WAKE_REPEND_UPPER_TOLERANCE_SECONDS: i64 = 30;
 
 /// Did `wake_workflow_task`'s re-pend, not an armed timer, set this row's
 /// current `scheduled_at` (issue #1191)?
 ///
 /// `queue::reschedule_task` never touches `created_at`. Only
-/// `primary_repend_workflow_task_query` does, and it sets `created_at` and
-/// `scheduled_at` from one instant in one statement. So `created_at`
-/// landing [`WAKE_REPEND_SKEW_SECONDS`] after `scheduled_at` is direct
-/// provenance evidence, not a coincidence, that this path produced the
-/// row's current `PENDING` shape. It settles the case
-/// [`timer_owns_the_wake`] cannot: a coincidental timestamp match between
-/// an armed timer's `fires_at` and an unrelated wake instant.
+/// `primary_repend_workflow_task_query` does. A genuinely timer-owned
+/// row's `created_at` is the row's ORIGINAL, untouched creation time.
+/// That time always precedes `scheduled_at`: a timer's own `fires_at` is
+/// always some positive duration after the row existed to arm it. So a
+/// genuinely timer-owned row's gap is never positive. A
+/// `wake_workflow_task` re-pend does the opposite by construction. It
+/// resets `created_at` to the wake instant, strictly AFTER the backdated
+/// `scheduled_at` it sets in the same statement. So `created_at`
+/// meaningfully past `scheduled_at` is direct provenance evidence, not a
+/// coincidence, that this path produced the row's current `PENDING`
+/// shape. It settles the case [`timer_owns_the_wake`] cannot: a
+/// coincidental timestamp match between an armed timer's `fires_at` and
+/// an unrelated wake instant.
 ///
 /// A pre-`#501` legacy row has no `created_at` at all. `None` answers
 /// `false` here -- no evidence either way. So [`is_the_missed_timer_wake`]
@@ -1339,7 +1350,9 @@ fn wake_source_repended_this_row(task: &WorkflowTaskFacts) -> bool {
         return false;
     };
     let gap_seconds = (created_at - task.scheduled_at).num_seconds();
-    (gap_seconds - WAKE_REPEND_SKEW_SECONDS).abs() <= WAKE_REPEND_TOLERANCE_SECONDS
+    let acceptable_range = (WAKE_REPEND_SKEW_SECONDS - WAKE_REPEND_LOWER_TOLERANCE_SECONDS)
+        ..=(WAKE_REPEND_SKEW_SECONDS + WAKE_REPEND_UPPER_TOLERANCE_SECONDS);
+    acceptable_range.contains(&gap_seconds)
 }
 
 /// Is this timer both overdue and the run's own missed wake (issue #1191)?
@@ -3646,6 +3659,40 @@ mod tests {
         assert_eq!(verdict.health(), ExecutionHealth::Healthy, "{verdict:?}");
     }
 
+    /// Issue #1191 review. A wake-source re-pend can be delayed well
+    /// past `WAKE_REPEND_SKEW_SECONDS` by database or network saturation
+    /// between the Rust bind and the server executing the `UPDATE`. It
+    /// must still be recognized, even while an unrelated armed timer
+    /// coincidentally sits within `timer_owns_the_wake`'s tolerance of
+    /// `scheduled_at`.
+    #[test]
+    fn overdue_timer_does_not_correlate_when_the_wake_repend_was_delayed() {
+        let inputs = DiagnosisInputs {
+            timers: vec![PendingTimerFacts {
+                // Still within `timer_owns_the_wake`'s tolerance of
+                // scheduled_at below, by coincidence.
+                fires_at: t(-99),
+            }],
+            workflow_task: Some(WorkflowTaskFacts {
+                scheduled_at: t(-98),
+                // A 20-second bind-to-execute delay: `created_at` lands
+                // well past the ordinary 5-second skew, but still inside
+                // the generous upper tolerance.
+                created_at: Some(t(-98 + 20)),
+                ..wf_task()
+            }),
+            ..Default::default()
+        };
+        let verdict =
+            classify_execution(&inputs, t(0)).expect("non-terminal execution must yield a verdict");
+        assert_eq!(
+            verdict.kind(),
+            "sleeping_timer",
+            "a delayed wake re-pend must still be recognized: {verdict:?}"
+        );
+        assert_eq!(verdict.health(), ExecutionHealth::Healthy, "{verdict:?}");
+    }
+
     #[test]
     fn overdue_timer_suppressed_while_a_worker_holds_the_claim() {
         // A worker is on the decision cycle right now; it ingests due timers
@@ -3763,33 +3810,48 @@ mod tests {
     #[test]
     fn wake_source_repended_this_row_truth_table() {
         // Exact fingerprint: created_at lands WAKE_REPEND_SKEW_SECONDS after
-        // scheduled_at, as `primary_repend_workflow_task_query` produces.
+        // scheduled_at, as `primary_repend_workflow_task_query` produces
+        // when the Rust bind and the server's `clock_timestamp()` land at
+        // essentially the same instant.
         assert!(wake_source_repended_this_row(&WorkflowTaskFacts {
             scheduled_at: t(-98),
             created_at: Some(t(-98 + WAKE_REPEND_SKEW_SECONDS)),
             ..wf_task()
         }));
-        // Within tolerance either side.
+        // At the lower bound: ordinary clock skew between the Rust host
+        // and the Postgres server.
+        assert!(wake_source_repended_this_row(&WorkflowTaskFacts {
+            scheduled_at: t(-98),
+            created_at: Some(t(
+                -98 + WAKE_REPEND_SKEW_SECONDS - WAKE_REPEND_LOWER_TOLERANCE_SECONDS
+            )),
+            ..wf_task()
+        }));
+        // Just below the lower bound.
+        assert!(!wake_source_repended_this_row(&WorkflowTaskFacts {
+            scheduled_at: t(-98),
+            created_at: Some(t(-98 + WAKE_REPEND_SKEW_SECONDS
+                - WAKE_REPEND_LOWER_TOLERANCE_SECONDS
+                - 1)),
+            ..wf_task()
+        }));
+        // At the upper bound: the delay between the Rust bind and the
+        // server executing the `UPDATE` under saturation (issue #1191
+        // review). This is the same saturated-dispatch condition this
+        // whole diagnosis exists to classify correctly.
         assert!(wake_source_repended_this_row(&WorkflowTaskFacts {
             scheduled_at: t(-98),
             created_at: Some(t(-98
                 + WAKE_REPEND_SKEW_SECONDS
-                + WAKE_REPEND_TOLERANCE_SECONDS)),
+                + WAKE_REPEND_UPPER_TOLERANCE_SECONDS)),
             ..wf_task()
         }));
-        assert!(wake_source_repended_this_row(&WorkflowTaskFacts {
-            scheduled_at: t(-98),
-            created_at: Some(t(
-                -98 + WAKE_REPEND_SKEW_SECONDS - WAKE_REPEND_TOLERANCE_SECONDS
-            )),
-            ..wf_task()
-        }));
-        // Just outside tolerance.
+        // Just above the upper bound.
         assert!(!wake_source_repended_this_row(&WorkflowTaskFacts {
             scheduled_at: t(-98),
             created_at: Some(t(-98
                 + WAKE_REPEND_SKEW_SECONDS
-                + WAKE_REPEND_TOLERANCE_SECONDS
+                + WAKE_REPEND_UPPER_TOLERANCE_SECONDS
                 + 1)),
             ..wf_task()
         }));
