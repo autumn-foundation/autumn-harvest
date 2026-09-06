@@ -276,7 +276,22 @@ const INIT_SQL: &str = concat!(
     // transaction as every dynamic-per-key activity enqueue, so without these
     // columns that decision transaction rolls back and the workflow never
     // progresses (a silent timeout, not an obvious error).
-    include_str!("../../migrations/20260902133132_harvest_rate_limit_bucket_gc/up.sql")
+    include_str!("../../migrations/20260902133132_harvest_rate_limit_bucket_gc/up.sql"),
+    "\n",
+    // issue #1227: next_attempt_at column on harvest_completion_trigger_outbox.
+    // REQUIRED for the same reason as the #945/#964/#1127 columns above --
+    // `enforce_completion_triggers_outbox`'s claim queries and
+    // `stamp_outbox_relay_backoff` reference `next_attempt_at` unconditionally,
+    // so without this column every outbox-relay test in this suite (and in
+    // every suite that borrows `setup_test_database_url_or_env` from here)
+    // fails with `column harvest_completion_trigger_outbox.next_attempt_at
+    // does not exist`, even for a row with no quota block or relay failure at
+    // all. A local run with `HARVEST_TEST_DATABASE_URL` set does not catch
+    // this gap -- that path migrates from the full `migrations/` directory,
+    // not from this deliberately partial bundle.
+    include_str!(
+        "../../migrations/20260906014820_harvest_completion_trigger_outbox_backoff/up.sql"
+    )
 );
 
 /// The minimal "legacy" migration set used by the upgrade-path regression
