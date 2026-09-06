@@ -1734,6 +1734,23 @@ async fn overdue_timer_still_wins_when_the_task_own_wake_was_missed() {
         "NOW() - INTERVAL '2 hours'",
     )
     .await;
+    // `reschedule_task` never touches `created_at`, so a genuinely
+    // timer-owned row's `created_at` is its ORIGINAL creation time --
+    // here, older than the timer's own deadline. `seed_workflow_task`
+    // defaults it to insert time (now), which would falsely look like a
+    // `wake_workflow_task` re-pend to `wake_source_repended_this_row`
+    // (issue #1191 review); backdate it explicitly.
+    {
+        let mut conn = pool.get().await.expect("pooled conn");
+        diesel::sql_query(
+            "UPDATE harvest_task_queue SET created_at = NOW() - INTERVAL '3 hours' \
+             WHERE workflow_exec_id = $1 AND task_type = 'workflow'",
+        )
+        .bind::<diesel::sql_types::Uuid, _>(exec_id.as_uuid())
+        .execute(&mut conn)
+        .await
+        .expect("backdate created_at");
+    }
     seed_live_worker(&pool, "w-live", "default").await;
 
     let body = diagnose(&app, exec_id).await;
