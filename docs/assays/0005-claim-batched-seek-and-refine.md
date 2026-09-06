@@ -1,16 +1,18 @@
 # ⛏️ Prospect: does a batched seek-and-refine rewrite fix issue #1340? (kill: 2 vs 1 batch on L4's own line, ledger #5)
 
-> Status: **measured, then corrected across four rounds of post-review.**
+> Status: **measured, then corrected across five rounds of post-review.**
 > The pre-registration
 > (`docs/rnd/2026-09-06-claim-batched-seek-and-refine-preregistration.md`,
 > commit `ee3bc19`) was committed before the apparatus was built or run;
 > nothing in it has been edited since. This report's numbers are from the
-> apparatus's sixth run, after Codex's automated review of the PR caught
-> (in order): a mischaracterized fetch mechanism, a keyset-cursor
-> correctness bug, a missing concurrency-safety recheck, a stale cost
-> citation, and a non-idempotent apparatus schema (see "Post-review
-> corrections" below for all ten items) — the pre-registered lines
-> themselves are unchanged throughout.
+> apparatus's sixth run (the second of two back-to-back invocations that
+> together verified item 9's idempotency fix), after Codex's automated
+> review of the PR caught (in order): a mischaracterized fetch mechanism, a
+> keyset-cursor correctness bug, a missing concurrency-safety recheck, a
+> stale cost citation, a non-idempotent apparatus schema, and two places
+> where the report's own prose fell out of sync with those fixes (see
+> "Post-review corrections" below for all twelve items) — the
+> pre-registered lines themselves are unchanged throughout.
 
 ## 🎯 Question
 
@@ -72,10 +74,15 @@ same non-adversarial fixture generator). New for this assay:
 - `batch_claim.sql` — the candidate's single-batch query in isolation, for
   `EXPLAIN (ANALYZE, BUFFERS)` at the three non-adversarial scenarios.
 - `claim_batched.sql` — a `plpgsql` function implementing the full
-  multi-batch shape: each batch is one query (`candidates` CTE forced
-  `MATERIALIZED` so it is computed once and reused for both the winner pick
-  and the next batch's keyset cursor, not rescanned per reference), a
-  second batch fetched only when the first returns no eligible row.
+  multi-batch shape: each batch is one `FOR cand IN SELECT ...` fetch (`FOR
+  UPDATE SKIP LOCKED`, keyset-cursor `WHERE`), walked procedurally in
+  priority order — for each candidate with a concurrency key,
+  `pg_try_advisory_xact_lock` plus a fresh `COUNT` against
+  `harvest_task_queue` directly (the production path's own mechanism, not
+  a batch-wide snapshot CTE — see "Post-review corrections," item 5, which
+  replaced an earlier, unsafe CTE-based version this bullet described
+  before that fix). A second batch is fetched only when the first is
+  exhausted with no eligible row.
 - `forced_index_diagnostic.sql` — added post-review; see below.
 - `forced_index_no_tiebreak_diagnostic.sql` — added post-review (round 2);
   see below.
@@ -378,14 +385,46 @@ half of the reviewer's own proposed remedy, not a re-registration.
     that the specific ids are expected to shift between runs and only the
     control/candidate match on each line is the actual claim.
 
+**Round 5 (same PR, fifth review pass):**
+
+11. **Stale description (P2): the Apparatus section still described the
+    removed snapshot-CTE mechanism.** Item 5 (round 2) replaced
+    `claim_batched.sql`'s batch-wide `MATERIALIZED` CTE with a per-candidate
+    procedural loop, and item 7 (round 3) defended grading that fix against
+    the original lines — but this section's own bullet for `claim_batched.sql`
+    kept describing "each batch is one query (`candidates` CTE forced
+    `MATERIALIZED`...)" as if that were still the mechanism, contradicting
+    the correction two sections later and making the apparatus harder to
+    audit against its own description. **Fixed:** rewritten to describe the
+    actual current implementation (a `FOR cand IN SELECT` fetch walked
+    procedurally with the per-candidate advisory-lock recheck), with a
+    pointer to item 5 for why it changed.
+
+12. **Self-contradictory provenance (P2): "sixth run" and "the fifth run...
+    its numbers are archived" can't both be true.** An earlier version of
+    the Assay section's opening line said the archived numbers came from
+    the apparatus's sixth run, then in the same sentence attributed them to
+    the fifth run (the one that proved item 9's idempotency fix by running
+    without an intervening `dropdb`) — but the sixth run is the second half
+    of that same idempotency check, executed *after* the fifth against the
+    database the fifth left behind, so its output — not the fifth's — is
+    what overwrote `results/` and is what the report quotes. **Fixed:**
+    reworded to state plainly which run produced the archived files (the
+    sixth, i.e. the second of the two idempotency-check invocations) and
+    why a fifth run exists at all (proving item 9, not contributing
+    numbers).
+
 ## 📊 Assay
 
 All measurements from `docs/assays/apparatus/0005-claim-batched-seek-and-refine/results/`
 (`run.log`, `*.txt`, `*.explain.txt`), from the apparatus's sixth run (post
-all four rounds of corrections above — the fifth run, immediately prior,
-verified item 9's idempotency fix by re-running against the same database
-with no intervening `dropdb`; its numbers are the ones archived and used
-here), one continuous psql session.
+all four rounds of corrections above), one continuous psql session. The
+fifth run, immediately prior in the same verification pass, existed only
+to prove item 9's idempotency fix (a fresh `dropdb`/`createdb`, then
+`./run_assay.sh` twice in a row with no `dropdb` in between); it produced
+its own numbers, since overwritten. The sixth run — the second of that
+pair, run against the already-populated database left by the fifth with no
+reset — is the one whose output is on disk and quoted below.
 
 **Buffers (L1, idle: 10,000 backlog, 4 queues, 256 keys, 0 RUNNING):**
 

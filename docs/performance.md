@@ -1087,7 +1087,7 @@ wall-clock all pass decisively; batch-count scaling under adversarial depth
 is linear, not catastrophic. It still kills: both adversarial fixtures
 resolved in one more batch than their pre-registered "exactly N" line
 allowed, because that line's own formula undercounted by the one slot the
-claimable row itself occupies. Four rounds of post-review (Codex) further
+claimable row itself occupies. Five rounds of post-review (Codex) further
 found: the report had mischaracterized the candidate fetch as an
 index-ordered seek through `idx_harvest_tq_poll`; the archived `EXPLAIN`
 output shows a `Seq Scan` of the whole matching backlog instead (the same
