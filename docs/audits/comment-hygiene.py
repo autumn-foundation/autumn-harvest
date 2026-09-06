@@ -236,6 +236,12 @@ _APOS = r"[\u2019']"
 # An identifier may be RAW. `r#match` is a name, and `\w+` stops at the `#`,
 # so a commented-out `fn r#match() {` was outside an absolute gate. This tree
 # discusses `r#gen` in `det_check.rs`, so the form is not hypothetical here.
+# A restricted visibility, which prefixes seven of the item alternatives
+# below. One definition for all seven: it is one question asked seven times,
+# and a raw path segment was missing from every one of them at once. `r#type`
+# is a legal module name, so EVERY segment of `pub(in crate::r#type)` may be
+# raw, exactly as an item's own name may be.
+VISIBILITY = r"(?:pub(?:\((?:in\s+)?(?:r\#)?\w+(?:::(?:r\#)?\w+)*\))?\s+)?"
 COMMENTED_CODE_RE = re.compile(
     r"""^(?:
         # The ABI name may carry a hyphen -- "C-unwind" and its siblings are
@@ -243,7 +249,7 @@ COMMENTED_CODE_RE = re.compile(
         # altogether, since a bare `extern fn` means `extern "C" fn`. Both
         # are ordinary FFI, and `\w+` alone left both outside an absolute
         # gate.
-        (?:pub(?:\((?:in\s+)?[\w:]+\))?\s+)?
+        {VIS}
         (?:async\s+|unsafe\s+|const\s+|extern\s+(?:"[\w-]+"\s+)?)*
             fn\s+(?:r\#)?\w+\s*(?:<[^<>]*>)?\s*\(
             (?:
@@ -252,20 +258,20 @@ COMMENTED_CODE_RE = re.compile(
                | (?=[^)]*(?::|\bself\b))            # wrapped: real params,
                  [\w\s:&'<>\[\](),.+;=*#-]*,\s*$     #   trailing comma
             )\s*$
-      | (?:pub(?:\((?:in\s+)?[\w:]+\))?\s+)?(?:struct|enum|trait|union)\s+(?:r\#)?\w+\s*(?:<[^<>]*>)?\s*[{;(]\s*$
+      | {VIS}(?:struct|enum|trait|union)\s+(?:r\#)?\w+\s*(?:<[^<>]*>)?\s*[{;(]\s*$
       # A tuple struct, whose field list is on the line and terminated. Its
       # own alternative rather than a relaxation of the one above, which is
       # what this file's guidance asks for: the name is still anchored hard
       # against `struct`, and the line must end at the `;`.
-      | (?:pub(?:\((?:in\s+)?[\w:]+\))?\s+)?(?:struct|union)\s+(?:r\#)?\w+\s*(?:<[^<>]*>)?
+      | {VIS}(?:struct|union)\s+(?:r\#)?\w+\s*(?:<[^<>]*>)?
             # The `;` of "[u8; 32]" is part of an array type, not the end of
             # the statement -- the same guard the uninitialized-binding rule
             # has carried since round forty-one, which this alternative was
             # written without.
             \s*\((?:[^;{]|;(?=[^;]*\]))*\)\s*;\s*$
-      | (?:pub(?:\((?:in\s+)?[\w:]+\))?\s+)?mod\s+(?:r\#)?\w+\s*[{;]\s*$
-      | (?:pub(?:\((?:in\s+)?[\w:]+\))?\s+)?(?:const|static)\s+(?:mut\s+)?(?:r\#)?\w+\s*:[^;=]+=.*[;{]\s*$
-      | (?:pub(?:\((?:in\s+)?[\w:]+\))?\s+)?type\s+(?:r\#)?\w+\s*(?:<[^<>]*>)?\s*=
+      | {VIS}mod\s+(?:r\#)?\w+\s*[{;]\s*$
+      | {VIS}(?:const|static)\s+(?:mut\s+)?(?:r\#)?\w+\s*:[^;=]+=.*[;{]\s*$
+      | {VIS}type\s+(?:r\#)?\w+\s*(?:<[^<>]*>)?\s*=
             (?!\s*(?:\w+\s+){2,}\w+\s*;\s*$).*;\s*$
       | impl(?:\s*<[^<>]*>)?\s+
             (?![^;{]*\b[a-z]+\s+[a-z]+\s+[a-z]+\s+[a-z]+\b)[\w:<>&'\s\#]+\{\s*$
@@ -297,12 +303,12 @@ COMMENTED_CODE_RE = re.compile(
       # alternative was the one written without it -- `pub use crate::x;`
       # and `pub(crate) use crate::x;` are the forms this tree actually
       # writes, and neither could reach the rule.
-      | (?:pub(?:\((?:in\s+)?[\w:]+\))?\s+)?
+      | {VIS}
             use\s+(?:(?:r\#)?\w+::)*(?:(?:r\#)?\w+|\*|\{[\w:,\s*\#]+\})
             (?:\s+as\s+(?:r\#)?\w+)?;\s*$
       | \#!?\[[\w:()"'=,./\s-]+\]\s*$
       | \}[,;)]*\s*$
-      | (?:r\#)?[\w:]+!(?:\(.*\)|\[.*\]|\{.*\})\s*;\s*$   # macro stmt
+      | (?:(?:r\#)?\w+::)*(?:r\#)?\w+!(?:\(.*\)|\[.*\]|\{.*\})\s*;\s*$  # macro stmt
       # A macro DEFINITION, which ends at its brace rather than a `;`.
       # Anchored on the keyword, so no prose can reach it.
       | macro_rules!\s+(?:r\#)?\w+\s*\{.*\}\s*;?\s*$
@@ -311,7 +317,7 @@ COMMENTED_CODE_RE = re.compile(
       # expression: "if the queue is paused, the worker parks {".
       | (?:if|while|for|match|loop|unsafe)\b
             (?![^;{]*\b[a-z]+\s+[a-z]+\s+[a-z]+\s+[a-z]+\b)[^;]*\{\s*$
-      | [\w.\[\]:]+\s*(?:[-+*/%&|^]|<<|>>)?=\s*[^\s;]+\s*;\s*$  # (compound) assignment
+      | [\w.\[\]:\#]+\s*(?:[-+*/%&|^]|<<|>>)?=\s*[^\s;]+\s*;\s*$  # (compound) assignment
       # A commented-out statement. Anchored hard: the call must open at the
       # very start, so prose that merely names a function ("call cleanup()
       # first") cannot reach it, and the line must end at the `;`. Measured
@@ -324,9 +330,9 @@ COMMENTED_CODE_RE = re.compile(
       # wrapping onto "continue normally;" is a sentence, not a statement.
       | (?:return|break)\b(?:\s+[^\s;{}]+)?\s*;\s*$
       | continue\b(?:\s+'\w+)?\s*;\s*$
-      | [\w:]+(?:::<[^;()]*>)?(?:\.[\w:]+(?:::<[^;()]*>)?)*
+      | [\w:\#]+(?:::<[^;()]*>)?(?:\.[\w:\#]+(?:::<[^;()]*>)?)*
             \(.*\)(?:\s*\?|\s*\.await\s*\??)*\s*;\s*$
-    )""",
+    )""".replace("{VIS}", VISIBILITY),
     re.VERBOSE,
 )
 
@@ -337,12 +343,14 @@ TODO_RE = re.compile(
     r"^(?:TODO|FIXME|XXX|HACK)\b|\b(?:TODO|FIXME|XXX|HACK)\s*[:(]", re.IGNORECASE
 )
 TODO_REF_RE = re.compile(r"#\d+|https?://")
-# A sentence boundary: terminal punctuation followed by a space or the end
-# of the text, with the abbreviation guards `SENTENCE_SPLIT_RE` carries. The
-# space matters -- "foo.rs" and "v1.2" carry a period inside a token, and
-# cutting there ends a sentence in the middle of a word.
+# A sentence boundary, with every clause `SENTENCE_SPLIT_RE` carries and no
+# others: terminal punctuation, then any emphasis markers, then a SPACE or
+# the end of the text. Both other clauses are load-bearing. The abbreviation
+# guards keep "e.g." inside its sentence. The space keeps "foo.rs" and
+# "v1.2" inside a word, and keeps a QUOTED question inside its sentence --
+# the `?` of `the "Ready?" prompt` is followed by a quote, not a boundary.
 SENTENCE_END_RE = re.compile(
-    r"(?<!e\.g)(?<!E\.g)(?<!i\.e)(?<!I\.e)[.!?](?=[\s\"')\]]|$)"
+    r"(?<!e\.g)(?<!E\.g)(?<!i\.e)(?<!I\.e)[.!?][*_]*(?=\s|$)"
 )
 # A bracketed citation attached to the end of a sentence, as in "TODO: add
 # retries. (#123)". A citation is part of the sentence it cites, so that
@@ -4288,6 +4296,21 @@ RULE_TESTS = [
         "and a citation stops where the next marker starts",
     ),
     (
+        "/// TODO: preserve the \"Ready?\" prompt under #123\n",
+        set(),
+        "a quoted question does not end the marker's sentence",
+    ),
+    (
+        "// TODO: fix the (Ready.) prompt under #123\n",
+        set(),
+        "nor does a parenthesised one",
+    ),
+    (
+        "// TODO: *add retries.* See #123 for the parser.\n",
+        {("CH002", 1)},
+        "but an emphasis marker does not hide the end of one",
+    ),
+    (
         "// TODO(#1): a; TODO(#2): b\n",
         set(),
         "and two markers each carrying one are both tracked",
@@ -4404,6 +4427,26 @@ RULE_TESTS = [
         "// pub struct r#type;\n",
         {("CH001", 1)},
         "in a type name as well as a function name",
+    ),
+    (
+        "// pub(in crate::r#type) fn stale() {\n",
+        {("CH001", 1)},
+        "and in a visibility path, whose segments are names too",
+    ),
+    (
+        "// r#type::init();\n",
+        {("CH001", 1)},
+        "and in the path of a call",
+    ),
+    (
+        "// crate::r#mod::log!(x);\n",
+        {("CH001", 1)},
+        "and in the path of a macro",
+    ),
+    (
+        "// r#type.field = 1;\n",
+        {("CH001", 1)},
+        "and on the left of an assignment",
     ),
     (
         "// Use the LATER definition of the shard map here.\n",

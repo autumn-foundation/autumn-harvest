@@ -2638,3 +2638,32 @@ and `(#123)` on the next is one tracked commitment.
 Corpus effect: none. Five fixtures: a citation in round brackets, one in
 square brackets, one on the line below, a following sentence that is not
 a citation, and a citation cut off by the next marker.
+
+### Round eighty-six — two absolute-gate defects, in opposite directions
+
+A Tier A false positive and a Tier A bypass, both about a pattern that
+was derived from another and lost a clause on the way.
+
+`// TODO: preserve the "Ready?" prompt under #123` failed the build.
+`SENTENCE_END_RE` accepted a closing quote or bracket as the boundary
+after terminal punctuation, so the `?` inside the quoted word ended the
+marker's sentence before its reference. `SENTENCE_SPLIT_RE` has always
+required real whitespace and has always allowed emphasis markers first.
+The new pattern carries both clauses and nothing else, which is the
+round eighty-four lesson applied to the same pair of patterns again.
+
+`// pub(in crate::r#type) fn stale() {` produced no CH001. The
+restricted-visibility prefix matched its path with `[\w:]+`, which stops
+at the `#` of a raw segment, and `r#type` is a legal module name.
+`rustc 1.94.1` compiles the declaration.
+
+The prefix appeared seven times, identically, which is why one round
+could add raw identifiers to every item NAME and leave every item
+VISIBILITY behind. It is now one `VISIBILITY` fragment spliced into all
+seven alternatives, so the next answer to that question is one answer.
+
+Three siblings went with it, found by asking where else a path is
+matched rather than where the finding pointed: the path of a call, the
+path of a macro statement, and the left side of an assignment.
+
+Corpus effect: none. Eight fixtures.
