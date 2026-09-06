@@ -248,6 +248,22 @@
 -- builds fresh; a matching, valid one is silently accepted, unchanged; a
 -- mismatched or an invalid one aborts the migration with a clear error
 -- instead of completing over it.
+--
+-- Two more gaps in that first version (Codex review, PR #1381, rounds
+-- 12-13), both verified directly and fixed together below. First,
+-- `pg_get_indexdef()` on a PARTITIONED parent index renders `ON ONLY
+-- schema.table`, not `ON schema.table` -- the prescribed partitioned
+-- recipe pre-builds exactly that shape, so the original regexp treated a
+-- correctly pre-built partitioned parent as a mismatch and aborted the
+-- migration it was meant to no-op for. Second, index names are scoped per
+-- SCHEMA in Postgres, not per table, so matching on `relname` alone can
+-- find an unrelated index on a different table entirely; a non-`STRICT`
+-- lookup then silently picks an arbitrary one of any such matches.
+-- Filtering on `pg_index.indrelid = 'harvest_events'::regclass` -- the
+-- same table this statement itself targets -- fixes both: it is the
+-- correct scope, and it makes the pg_class `relkind` check redundant
+-- (only actual index relations join through pg_index in the first
+-- place), so that check is dropped too.
 DO $$
 DECLARE
     existing_index_oid oid;
@@ -259,13 +275,13 @@ BEGIN
     FROM pg_class
     JOIN pg_index ON pg_index.indexrelid = pg_class.oid
     WHERE pg_class.relname = 'idx_harvest_events_activity_started_lookup'
-      AND pg_class.relkind IN ('i', 'I');
+      AND pg_index.indrelid = 'harvest_events'::regclass;
 
     IF existing_index_oid IS NULL THEN
         CREATE INDEX idx_harvest_events_activity_started_lookup
             ON harvest_events (workflow_exec_id, (event_data #>> '{data,activity_id}'), timestamp)
             WHERE event_type = 'ActivityStarted';
-    ELSIF regexp_replace(existing_def, '^CREATE INDEX \S+ ON \S+ ', '') <>
+    ELSIF regexp_replace(existing_def, '^CREATE INDEX \S+ ON (ONLY )?\S+ ', '') <>
           'USING btree (workflow_exec_id, ((event_data #>> ''{data,activity_id}''::text[])), "timestamp") WHERE (event_type = ''ActivityStarted''::text)'
     THEN
         RAISE EXCEPTION
