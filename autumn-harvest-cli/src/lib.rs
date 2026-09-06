@@ -4519,6 +4519,30 @@ pub fn parse_shard_targets(raw: &[String]) -> Result<Vec<ShardTarget>, CliError>
     Ok(out)
 }
 
+/// Validate `--default-shard` with the same rule [`parse_shard_targets`] uses
+/// for `--shard`.
+///
+/// An out-of-range value can never match a `--shard` target. Every unencoded
+/// reference would then fall to the advisory `uninspected_shard_reference`
+/// path, instead of the coherence check this flag exists to enable (issue
+/// #1205).
+///
+/// # Errors
+///
+/// [`CliError::InvalidInput`] when `default_shard` cannot be encoded into an
+/// execution id.
+pub fn validate_default_shard(default_shard: i32) -> Result<(), CliError> {
+    if autumn_harvest::shard::is_encodable_shard(autumn_harvest::ShardId::new(default_shard)) {
+        Ok(())
+    } else {
+        Err(CliError::InvalidInput(format!(
+            "--default-shard: shard id `{default_shard}` cannot be encoded into an \
+             execution id (valid range is 0..={})",
+            autumn_harvest::shard::MAX_ENCODABLE_SHARD
+        )))
+    }
+}
+
 /// AC4: refuse to run against a DSN that resolves to the same database as the
 /// live configuration, unless the operator explicitly acknowledges otherwise.
 ///
@@ -4781,6 +4805,7 @@ pub async fn run_backup_verify(
         eprintln!("{w}");
     }
     let targets = parse_shard_targets(shards)?;
+    validate_default_shard(default_shard)?;
 
     let options = VerifyOptions::default()
         .with_replay_sample(replay_sample)

@@ -14,6 +14,7 @@ use autumn_harvest::backup_verify::{
 use autumn_harvest_cli::{
     BackupVerifyFormat, CliError, backup_verify_gate, backup_verify_json,
     format_backup_verify_text, parse_shard_targets, scratch_guard, scratch_guard_warning,
+    validate_default_shard,
 };
 
 fn shard(findings: Vec<Finding>) -> ShardVerifyReport {
@@ -206,6 +207,29 @@ fn the_largest_encodable_shard_id_is_accepted() {
     let targets = parse_shard_targets(&["65534=postgres://h/a".to_string()])
         .expect("0xFFFE is the largest encodable shard and must parse");
     assert_eq!(targets[0].shard_id, 65534);
+}
+
+/// Issue #1205. An out-of-range `--default-shard` can never match a `--shard`
+/// target; that range is enforced there too. Every unencoded reference would
+/// then silently fall to the advisory `uninspected_shard_reference` path.
+/// That reads exit 0 on a value that was never valid.
+#[test]
+fn an_unencodable_default_shard_is_rejected() {
+    for bad in [-1, 65535, 65536, 70000] {
+        match validate_default_shard(bad) {
+            Ok(()) => panic!("default shard {bad} must be rejected: it cannot encode"),
+            Err(e) => assert!(
+                e.to_string().contains(&bad.to_string()),
+                "the error must name the offending id: {e}"
+            ),
+        }
+    }
+}
+
+#[test]
+fn the_largest_encodable_default_shard_is_accepted() {
+    validate_default_shard(65534).expect("0xFFFE is the largest encodable shard");
+    validate_default_shard(0).expect("0 is the default configuration");
 }
 
 // ── AC2(d): exit-code mapping ──────────────────────────────────────────────
