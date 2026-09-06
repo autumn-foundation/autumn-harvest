@@ -258,8 +258,16 @@ plausible. Corrected to avoid overstating a number this report can't
 actually measure. §4's
 cross-run evidence — an apparently error-free save on the shared base
 branch, gone within 9-14 hours under the exact key three separate downstream
-PR runs restored against — is direct support for that hypothesis, not just
-consistent with it. Windows paying the
+PR runs restored against — remains this report's best available evidence
+for that hypothesis (a Codex review comment on this PR correctly pushed
+back on calling it "direct support": §4 already concedes there's no
+positive confirmation the commit/finalize step actually succeeded, only
+that no error was logged where the same code path reliably logs one; if
+that step silently failed — a possibility this report cannot rule out
+without cache-API access — no entry ever existed to be evicted, and the
+three downstream misses would be equally expected with zero capacity
+pressure at all). Reworded to "consistent with," not proof of, the capacity
+hypothesis. Windows paying the
 largest share of the miss's cost (longest per-family compile times to begin
 with, per every prior report in this series, now cache-cold on top of that)
 is consistent with, not independent of, this finding.
@@ -279,24 +287,39 @@ the GitHub MCP tools exposed here still have no cache-usage or cache-listing
 method). Candidate remedies for whoever has that access, updated:
 
 1. **Confirm total bytes and eviction frequency first** (unchanged ask).
-2. If confirmed capacity-bound: **consolidate entries across job families**
-   — e.g. one shared cache key across `test-nodb`, `test-db-linux`, `test`,
-   and `lint` for a given OS, if their `target/` layouts overlap enough,
-   reducing the number of distinct key *names* below the current ~13 per
-   branch (multiplied by however many branches actually hold a copy — the
-   unknown repository-wide total from the Diagnosis section above; this
-   remedy shrinks that multiplier's per-branch factor, which helps regardless
-   of the unknown total)
-   (a Codex review comment on this PR correctly flagged that doing this
-   *within* a family — e.g. a designated canonical shard for `test-nodb` —
-   is not this fix: `ci.yml:411-417`'s shared shard-key already limits each
-   family to one persisted entry per OS per run via the reserve-race this
-   report observed directly; a canonical writer would stop the other three
-   shards from wastefully attempting a save that was always going to fail,
-   which is worth doing for its own sake, but it doesn't reduce stored bytes
-   or relieve capacity pressure, so it isn't a capacity remedy on its own).
-   Still new CI-config policy, still routed rather than shipped, for the
-   same "ask before: caching services" reason as yesterday.
+2. If confirmed capacity-bound, two earlier drafts of this remedy each
+   proposed a shape Codex review comments on this PR correctly caught as
+   unsound:
+
+   - **Not a designated canonical shard *within* one family** (e.g. always
+     `test-nodb` shard 0) — `ci.yml:411-417`'s shared shard-key already
+     limits each family to one persisted entry per OS per run via the
+     reserve-race this report observed directly; a canonical writer would
+     stop the other three shards from wastefully attempting a save that was
+     always going to fail, which is worth doing for its own sake, but it
+     doesn't reduce stored bytes or relieve capacity pressure, so it isn't a
+     capacity remedy on its own.
+   - **Not one shared cache key across `test-nodb`, `test-db-linux`, `test`,
+     and `lint` for a given OS**, either. Those jobs run in *parallel*, not
+     sequentially, so the same reserve-race mechanism §4 documented directly
+     (whichever job reaches `Saving cache` first wins the key; every other
+     job's save silently fails) would apply here too — except unlike
+     `test-nodb`'s own shards, which build near-identical `target/` trees so
+     any winner's output is useful to the others, `lint`/`test`/`test-nodb`/
+     `test-db-linux` build genuinely different artifacts. Whichever job wins
+     the shared key would save its own (irrelevant to the other three)
+     `target/`, and the other three would spend their next run's restore
+     step downloading a cache that doesn't match what they need — worse
+     than the current cold-every-time baseline, not better. Retracted.
+
+   The remedies that don't have this flaw: (a) stop caching lower-value job
+   families entirely (`save-if: false` removes an entry outright, no
+   collision risk, unlike merging keys), or (b) narrow
+   `cache-directories`/`cache-targets` per job so each surviving entry is
+   smaller, leaving more of the fixed budget for the rest — both still new
+   CI-config policy, still routed
+   rather than shipped, for the same "ask before: caching services" reason
+   as yesterday.
 3. Or accept the cost and pay for GitHub's larger cache tier (explicit new
    spend — ask before, as always).
 4. Branch protection: same unresolved ask as the 09-04/09-05 reports, now
