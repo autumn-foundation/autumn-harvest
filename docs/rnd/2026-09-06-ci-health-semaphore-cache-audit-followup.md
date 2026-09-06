@@ -35,8 +35,8 @@ yesterday's report and one didn't:
   the 09-05 report found and this report's own cumulative 9/10 tally
   includes). That includes a save this report can show raised no error
   anywhere in its path on the shared base branch, under a stable key three
-  later PR runs all restored against — and still wasn't there 9-14 hours on
-  (§4).
+  later PR runs all restored against — and still couldn't be restored 9-14
+  hours on (§4).
 
 **Correction record for this PR (`#1395`):** sixteen separate Codex review
 comments caught real problems in earlier drafts of this report:
@@ -182,7 +182,7 @@ independent days finding no cache at all**, now spanning every job family this
 role has checked directly (`lint`, `test`, `test-db-linux`, and the new
 `test-nodb`).
 
-### 4. The shared-key mitigation, checked correctly this time — and a confirmed base-branch save that still didn't survive
+### 4. The shared-key mitigation, checked correctly this time — and a base-branch save later restores couldn't find
 
 **Two corrections, both from Codex review comments on this PR (`#1395`),
 both correct, kept here rather than silently folded away:**
