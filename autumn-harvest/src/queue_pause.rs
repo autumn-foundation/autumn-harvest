@@ -857,7 +857,6 @@ pub const fn queue_pause_suppresses_timeout(
 /// needs a handoff covered by the grants the migration already issues (a real
 /// table keyed by a per-resume token), not a privilege the deployment may not
 /// have.
-///
 #[must_use]
 pub const fn resume_shift_scheduled_at_query() -> &'static str {
     "UPDATE harvest_task_queue \

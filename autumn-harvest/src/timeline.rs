@@ -95,6 +95,7 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
 use crate::event::WorkflowEvent;
+use crate::types::{ActivityExecId, ExecutionId};
 
 /// One recorded history event paired with its `harvest_events` row timestamp.
 ///
@@ -303,6 +304,20 @@ pub fn derive_timeline(
     }
 }
 
+/// Stable key for the `keyed` map in [`build_accs`]: one variant per
+/// namespace ([`WorkflowEvent`]'s `activity_id`/`child_id` fields are reused
+/// across regular activities, local activities, and child workflows, so the
+/// namespace tag must be part of the key, not just the id). `Copy`+`Hash`
+/// over a `Uuid` newtype rather than a formatted `String` — hashing a
+/// 16-byte value needs no allocation and no `SipHash` pass over a variable-
+/// length buffer, unlike the `format!("act:{id}")`-style key this replaces.
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+enum AccKey {
+    Activity(ActivityExecId),
+    LocalActivity(ActivityExecId),
+    Child(ExecutionId),
+}
+
 /// Scan the ordered history into one [`Acc`] per orchestration unit.
 ///
 /// This is a wide dispatch match over the event variants that map to timeline
@@ -312,7 +327,7 @@ fn build_accs(rows: &[TimelineEventRow], started_at: DateTime<Utc>) -> Vec<Acc> 
     // `keyed` maps a stable key → index into `accs`; `accs` preserves first
     // appearance so the final ordering can break `scheduled_at` ties stably.
     let mut accs: Vec<Acc> = Vec::new();
-    let mut keyed: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+    let mut keyed: std::collections::HashMap<AccKey, usize> = std::collections::HashMap::new();
 
     // Timestamp of the previous recorded row, for signal-wait measurement.
     let mut prev_ts: Option<DateTime<Utc>> = None;
@@ -332,18 +347,23 @@ fn build_accs(rows: &[TimelineEventRow], started_at: DateTime<Utc>) -> Vec<Acc> 
             // ── regular activity ─────────────────────────────────────
             WorkflowEvent::ActivityScheduled {
                 activity_id, name, ..
-            } => ensure_scheduled(&mut accs, &mut keyed, format!("act:{activity_id}"), || {
-                Acc::scheduled(
-                    StepKind::Activity,
-                    Some(name.clone()),
-                    ts,
-                    index,
-                    true,
-                    true,
-                )
-            }),
+            } => ensure_scheduled(
+                &mut accs,
+                &mut keyed,
+                AccKey::Activity(*activity_id),
+                || {
+                    Acc::scheduled(
+                        StepKind::Activity,
+                        Some(name.clone()),
+                        ts,
+                        index,
+                        true,
+                        true,
+                    )
+                },
+            ),
             WorkflowEvent::ActivityStarted { activity_id, .. } => {
-                if let Some(acc) = lookup_mut(&keyed, &mut accs, &format!("act:{activity_id}")) {
+                if let Some(acc) = lookup_mut(&keyed, &mut accs, AccKey::Activity(*activity_id)) {
                     // A (re)start reopens the step: the last attempt's start ts
                     // wins and any prior failure's terminal marking is cleared.
                     acc.start_ts = Some(ts);
@@ -352,11 +372,11 @@ fn build_accs(rows: &[TimelineEventRow], started_at: DateTime<Utc>) -> Vec<Acc> 
                 }
             }
             // Regular and external completions close the step identically; an
-            // external activity shares the `act:{activity_id}` key (see the
+            // external activity shares the `Activity` key (see the
             // external-activity block below).
             WorkflowEvent::ActivityCompleted { activity_id, .. }
             | WorkflowEvent::ActivityCompletedExternally { activity_id, .. } => {
-                if let Some(acc) = lookup_mut(&keyed, &mut accs, &format!("act:{activity_id}")) {
+                if let Some(acc) = lookup_mut(&keyed, &mut accs, AccKey::Activity(*activity_id)) {
                     acc.close(ts, StepOutcome::Completed);
                 }
             }
@@ -365,13 +385,13 @@ fn build_accs(rows: &[TimelineEventRow], started_at: DateTime<Utc>) -> Vec<Acc> 
                 attempt,
                 ..
             } => {
-                if let Some(acc) = lookup_mut(&keyed, &mut accs, &format!("act:{activity_id}")) {
+                if let Some(acc) = lookup_mut(&keyed, &mut accs, AccKey::Activity(*activity_id)) {
                     acc.record_attempt(*attempt);
                     acc.close(ts, StepOutcome::Failed);
                 }
             }
             WorkflowEvent::ActivityTimedOut { activity_id, .. } => {
-                if let Some(acc) = lookup_mut(&keyed, &mut accs, &format!("act:{activity_id}")) {
+                if let Some(acc) = lookup_mut(&keyed, &mut accs, AccKey::Activity(*activity_id)) {
                     acc.close(ts, StepOutcome::TimedOut);
                 }
             }
@@ -385,25 +405,30 @@ fn build_accs(rows: &[TimelineEventRow], started_at: DateTime<Utc>) -> Vec<Acc> 
             // wait/exec split is never available (`split_applicable = false`);
             // only `total_ms` is reported. Represented AS `StepKind::Activity`
             // (the step-kind set is bounded; external activities are activities).
-            // It shares the `act:{activity_id}` key with the regular-activity
+            // It shares the `Activity` key with the regular-activity
             // terminal handlers above, so `ActivityCompletedExternally` (folded
             // into the `ActivityCompleted` arm), `ActivityTimedOut` (a shared
             // terminal), and the `ActivityFailedExternally` arm below all close it
             // correctly.
             WorkflowEvent::ActivityAwaitingExternal {
                 activity_id, name, ..
-            } => ensure_scheduled(&mut accs, &mut keyed, format!("act:{activity_id}"), || {
-                Acc::scheduled(
-                    StepKind::Activity,
-                    Some(name.clone()),
-                    ts,
-                    index,
-                    false,
-                    false,
-                )
-            }),
+            } => ensure_scheduled(
+                &mut accs,
+                &mut keyed,
+                AccKey::Activity(*activity_id),
+                || {
+                    Acc::scheduled(
+                        StepKind::Activity,
+                        Some(name.clone()),
+                        ts,
+                        index,
+                        false,
+                        false,
+                    )
+                },
+            ),
             WorkflowEvent::ActivityFailedExternally { activity_id, .. } => {
-                if let Some(acc) = lookup_mut(&keyed, &mut accs, &format!("act:{activity_id}")) {
+                if let Some(acc) = lookup_mut(&keyed, &mut accs, AccKey::Activity(*activity_id)) {
                     acc.close(ts, StepOutcome::Failed);
                 }
             }
@@ -411,18 +436,25 @@ fn build_accs(rows: &[TimelineEventRow], started_at: DateTime<Utc>) -> Vec<Acc> 
             // ── local activity ───────────────────────────────────────
             WorkflowEvent::LocalActivityScheduled {
                 activity_id, name, ..
-            } => ensure_scheduled(&mut accs, &mut keyed, format!("la:{activity_id}"), || {
-                Acc::scheduled(
-                    StepKind::LocalActivity,
-                    Some(name.clone()),
-                    ts,
-                    index,
-                    false,
-                    true,
-                )
-            }),
+            } => ensure_scheduled(
+                &mut accs,
+                &mut keyed,
+                AccKey::LocalActivity(*activity_id),
+                || {
+                    Acc::scheduled(
+                        StepKind::LocalActivity,
+                        Some(name.clone()),
+                        ts,
+                        index,
+                        false,
+                        true,
+                    )
+                },
+            ),
             WorkflowEvent::LocalActivityCompleted { activity_id, .. } => {
-                if let Some(acc) = lookup_mut(&keyed, &mut accs, &format!("la:{activity_id}")) {
+                if let Some(acc) =
+                    lookup_mut(&keyed, &mut accs, AccKey::LocalActivity(*activity_id))
+                {
                     acc.close(ts, StepOutcome::Completed);
                 }
             }
@@ -437,7 +469,9 @@ fn build_accs(rows: &[TimelineEventRow], started_at: DateTime<Utc>) -> Vec<Acc> 
                 attempt,
                 ..
             } => {
-                if let Some(acc) = lookup_mut(&keyed, &mut accs, &format!("la:{activity_id}")) {
+                if let Some(acc) =
+                    lookup_mut(&keyed, &mut accs, AccKey::LocalActivity(*activity_id))
+                {
                     acc.record_attempt(*attempt);
                 }
             }
@@ -448,7 +482,9 @@ fn build_accs(rows: &[TimelineEventRow], started_at: DateTime<Utc>) -> Vec<Acc> 
                 attempt,
                 ..
             } => {
-                if let Some(acc) = lookup_mut(&keyed, &mut accs, &format!("la:{activity_id}")) {
+                if let Some(acc) =
+                    lookup_mut(&keyed, &mut accs, AccKey::LocalActivity(*activity_id))
+                {
                     acc.record_attempt(*attempt);
                     acc.close(ts, StepOutcome::Failed);
                 }
@@ -495,7 +531,7 @@ fn build_accs(rows: &[TimelineEventRow], started_at: DateTime<Utc>) -> Vec<Acc> 
                 child_id,
                 workflow_name,
                 ..
-            } => ensure_scheduled(&mut accs, &mut keyed, format!("child:{child_id}"), || {
+            } => ensure_scheduled(&mut accs, &mut keyed, AccKey::Child(*child_id), || {
                 Acc::scheduled(
                     StepKind::ChildWorkflow,
                     Some(workflow_name.clone()),
@@ -506,12 +542,12 @@ fn build_accs(rows: &[TimelineEventRow], started_at: DateTime<Utc>) -> Vec<Acc> 
                 )
             }),
             WorkflowEvent::ChildWorkflowCompleted { child_id, .. } => {
-                if let Some(acc) = lookup_mut(&keyed, &mut accs, &format!("child:{child_id}")) {
+                if let Some(acc) = lookup_mut(&keyed, &mut accs, AccKey::Child(*child_id)) {
                     acc.close(ts, StepOutcome::Completed);
                 }
             }
             WorkflowEvent::ChildWorkflowFailed { child_id, .. } => {
-                if let Some(acc) = lookup_mut(&keyed, &mut accs, &format!("child:{child_id}")) {
+                if let Some(acc) = lookup_mut(&keyed, &mut accs, AccKey::Child(*child_id)) {
                     acc.close(ts, StepOutcome::Failed);
                 }
             }
@@ -622,8 +658,8 @@ fn ms_between(a: DateTime<Utc>, b: DateTime<Utc>) -> i64 {
 /// recording its index so terminal events can pair back to it.
 fn ensure_scheduled(
     accs: &mut Vec<Acc>,
-    keyed: &mut std::collections::HashMap<String, usize>,
-    key: String,
+    keyed: &mut std::collections::HashMap<AccKey, usize>,
+    key: AccKey,
     make: impl FnOnce() -> Acc,
 ) {
     if let std::collections::hash_map::Entry::Vacant(entry) = keyed.entry(key) {
@@ -634,11 +670,11 @@ fn ensure_scheduled(
 
 /// Look up a mutable accumulator by key, if present.
 fn lookup_mut<'a>(
-    keyed: &std::collections::HashMap<String, usize>,
+    keyed: &std::collections::HashMap<AccKey, usize>,
     accs: &'a mut [Acc],
-    key: &str,
+    key: AccKey,
 ) -> Option<&'a mut Acc> {
-    keyed.get(key).map(|&i| &mut accs[i])
+    keyed.get(&key).map(|&i| &mut accs[i])
 }
 
 /// Internal per-unit accumulator built while scanning history.

@@ -1469,7 +1469,6 @@ pub async fn export_lag_seconds(
 ///
 /// # Errors
 /// Returns `HarvestError` on a database failure.
-///
 #[cfg(feature = "db")]
 #[allow(clippy::cast_precision_loss)] // millisecond lag never approaches 2^53
 pub async fn pending_and_lag(

@@ -418,5 +418,14 @@ harness = false
 name = "awaitables_profile"
 harness = false
 
+# Deterministic (non-criterion) instruction/allocation-count profiling harness
+# for `timeline::derive_timeline` -- the pure, read-only per-execution
+# timeline read model behind `GET /workflows/{id}/timeline` (issue #739). No
+# feature requirement: `derive_timeline` is pure and unconditional (no DB
+# access). See `benches/timeline_profile.rs`.
+[[bench]]
+name = "timeline_profile"
+harness = false
+
 [lints]
 workspace = true

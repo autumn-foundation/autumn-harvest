@@ -182,6 +182,7 @@ linux        autumn-harvest-plugin  token_auth_integration           -          
 linux        autumn-harvest-plugin  triage_integration               -                          -
 linux        autumn-harvest-plugin  ui_integration                   -                          -
 linux        autumn-harvest-plugin  webhook_receiver_integration     webhooks                   -
+linux        autumn-harvest-plugin  worker_shard_filter_integration  -                          -
 linux        autumn-harvest-plugin  workflow_children_traversal_perf -                          -
 linux        autumn-harvest-plugin  workflow_logs_integration        -                          -
 linux        autumn-harvest-plugin  workflow_reachability_integration  -                          -

@@ -1174,17 +1174,112 @@ async fn ui_workers_filter_stale_true() {
     );
 }
 
-/// Unknown status value returns 400.
+/// RED (was): `?status=zombie` used to `?`-abort `list_workers_ui` with a
+/// bare 400 before the filter form was ever rendered, discarding the
+/// `build_id` filter the operator had already typed alongside it — the same
+/// discard-the-page-on-bad-filter pattern fixed for the Workflows page's
+/// `started_after`/`started_before` in #1333 (that PR's commit message
+/// names this exact test, `ui_workers_unknown_status_value_returns_400`, as
+/// evidence the pattern was systemic, not a one-off).
+///
+/// GREEN (this commit): the request still renders the Workers page (`200`),
+/// preserves the other filter (`build_id=abc123`, still in its input's
+/// `value=`), and surfaces a `role="alert"` message naming the bad value and
+/// the valid options next to the Status field — the same four error-path
+/// booleans (adjacent to cause, persists until resolved, says how to
+/// recover, entered data preserved) the Workflows-page fix established now
+/// hold here too.
 #[tokio::test]
-async fn ui_workers_unknown_status_value_returns_400() {
+async fn ui_workers_unknown_status_value_redisplays_form_instead_of_aborting_page() {
     let (database_url, _container) = setup_test_database_url().await;
     let app = build_single_shard_ui_app(&database_url);
 
-    let (status, html) = fetch_html(&app, "/workers?status=zombie").await;
+    let (status, html) = fetch_html(&app, "/workers?status=zombie&build_id=abc123").await;
     assert_eq!(
         status,
-        StatusCode::BAD_REQUEST,
-        "unknown status value should return 400: {html}"
+        StatusCode::OK,
+        "an unknown status value must not abort the whole Workers page: {html}"
+    );
+    assert!(
+        html.contains("name=\"status\""),
+        "filter form must still render: {html}"
+    );
+    assert!(
+        html.contains("value=\"abc123\""),
+        "the other filter the operator already typed must not be discarded: {html}"
+    );
+    assert!(
+        html.contains("role=\"alert\""),
+        "an inline, screen-reader-announced error must sit next to the field: {html}"
+    );
+    assert!(
+        html.contains("zombie") && html.contains("Active"),
+        "the error must name the bad value and a valid option: {html}"
+    );
+    assert!(
+        html.contains("option value=\"zombie\" selected"),
+        "the Status select must echo the invalid value back as its selected \
+         option, not silently revert to 'All' (Codex review, #1378 P2): {html}"
+    );
+}
+
+/// Codex review on #1378 (P2): the first version of this fix parsed the
+/// invalid value down to `None` before it ever reached
+/// `render_workers_page`, so the pagination links and a plain form
+/// resubmission were built without it — a Next click (or clicking Apply
+/// with nothing changed) silently dropped the still-unresolved `status`
+/// filter and its error, one click after the operator saw it. Fixed by
+/// carrying the raw text alongside the parsed value all the way to
+/// `build_worker_query_string`.
+#[tokio::test]
+async fn ui_workers_invalid_status_value_persists_across_pagination() {
+    let (database_url, _container) = setup_test_database_url().await;
+    let mut conn = AsyncPgConnection::establish(&database_url).await.unwrap();
+    insert_test_worker(&mut conn, "pg-worker-zombie-a", "Active", 0).await;
+    insert_test_worker(&mut conn, "pg-worker-zombie-b", "Active", 0).await;
+
+    let app = build_single_shard_ui_app(&database_url);
+    let (status, html) = fetch_html(&app, "/workers?status=zombie&limit=1").await;
+    assert_eq!(status, StatusCode::OK, "unexpected status: {html}");
+    assert!(
+        html.contains("Next"),
+        "test setup must produce a Next link to exercise pagination: {html}"
+    );
+    assert!(
+        html.contains("status=zombie"),
+        "the invalid status must be carried into the Next/Previous links \
+         instead of being dropped on the next page view: {html}"
+    );
+}
+
+/// Same fix, `stale` side — a distinct code path in `list_workers_ui`, and
+/// the one most likely to be hit organically rather than only by hand-edited
+/// URLs: matching is case-sensitive by design (only the literal `true`
+/// applies the filter), so a capitalized `True` — plausible from a
+/// runbook example, a shell variable, or a JSON boolean serialized
+/// upstream — used to `?`-abort the page the same way `status=zombie` did.
+#[tokio::test]
+async fn ui_workers_unknown_stale_value_redisplays_form_instead_of_aborting_page() {
+    let (database_url, _container) = setup_test_database_url().await;
+    let app = build_single_shard_ui_app(&database_url);
+
+    let (status, html) = fetch_html(&app, "/workers?stale=True&build_id=abc123").await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "an unknown stale value must not abort the whole Workers page: {html}"
+    );
+    assert!(
+        html.contains("value=\"abc123\""),
+        "the other filter the operator already typed must not be discarded: {html}"
+    );
+    assert!(
+        html.contains("role=\"alert\""),
+        "an inline, screen-reader-announced error must sit next to the field: {html}"
+    );
+    assert!(
+        html.contains("True"),
+        "the error must name the exact bad value the operator sent: {html}"
     );
 }
 

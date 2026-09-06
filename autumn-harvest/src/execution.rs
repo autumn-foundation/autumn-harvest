@@ -817,6 +817,7 @@ pub async fn start_or_load_workflow_execution_collect(
             conn,
             existing_exec_id,
             "terminated to start new execution",
+            metrics,
         )
         .await
         {
@@ -1102,8 +1103,14 @@ pub async fn start_or_load_workflow_execution_collect(
             // "later-admitted run wins" a function of admission order rather than
             // wall-clock.
             let started = StartedWorkflowExecution::from_row(execution, true);
-            let (tx_cancel_metrics, supersede_deferred) =
-                run_latest_wins_supersede(conn, &request, exec_id, &mut tx_deferred_checks).await?;
+            let (tx_cancel_metrics, supersede_deferred) = run_latest_wins_supersede(
+                conn,
+                &request,
+                exec_id,
+                &mut tx_deferred_checks,
+                metrics,
+            )
+            .await?;
 
             return Ok((
                 started,
@@ -1297,9 +1304,14 @@ pub async fn start_or_load_workflow_execution_collect(
                     deferred.append(&mut extra_deferred);
                     // A replacement is a fresh admission too (issue #811, Codex
                     // round 2): shed other runs on the key, not just our own prior.
-                    let (mut sup_metrics, mut sup_deferred) =
-                        run_latest_wins_supersede(conn, &request, exec_id, &mut tx_deferred_checks)
-                            .await?;
+                    let (mut sup_metrics, mut sup_deferred) = run_latest_wins_supersede(
+                        conn,
+                        &request,
+                        exec_id,
+                        &mut tx_deferred_checks,
+                        metrics,
+                    )
+                    .await?;
                     tx_cancel_metrics.append(&mut sup_metrics);
                     deferred.append(&mut sup_deferred);
                     Ok((started_wf, deferred, tx_deferred_checks, tx_cancel_metrics))
@@ -1354,6 +1366,7 @@ pub async fn start_or_load_workflow_execution_collect(
                                 &request,
                                 exec_id,
                                 &mut tx_deferred_checks,
+                                metrics,
                             )
                             .await?;
                             deferred.append(&mut sup_deferred);
@@ -1400,9 +1413,14 @@ pub async fn start_or_load_workflow_execution_collect(
                     .await?;
                     // Same as the two arms above: a replacement admits a new run
                     // (issue #811, Codex round 2).
-                    let (sup_metrics, mut sup_deferred) =
-                        run_latest_wins_supersede(conn, &request, exec_id, &mut tx_deferred_checks)
-                            .await?;
+                    let (sup_metrics, mut sup_deferred) = run_latest_wins_supersede(
+                        conn,
+                        &request,
+                        exec_id,
+                        &mut tx_deferred_checks,
+                        metrics,
+                    )
+                    .await?;
                     extra_deferred.append(&mut sup_deferred);
                     Ok((started_wf, extra_deferred, tx_deferred_checks, sup_metrics))
                 }
@@ -2229,6 +2247,11 @@ async fn run_latest_wins_supersede(
     request: &StartWorkflowParams<'_>,
     exec_id: ExecutionId,
     tx_deferred_checks: &mut Vec<(ExecutionId, String)>,
+    // issue #1197, item 2: threaded through to `supersede_running_for_key` so
+    // a nested-admission residual (a key left transiently over its limit
+    // because the only over-limit runs were protected in-flight admissions)
+    // can be counted, not just logged.
+    metrics: Option<&(dyn crate::telemetry::MetricsRecorder + Send + Sync)>,
 ) -> HarvestResult<(Vec<StartCancelledRun>, Vec<DeferredTriggerStart>)> {
     if !request.concurrency_on_conflict.is_cancel_running() {
         return Ok((Vec::new(), Vec::new()));
@@ -2243,10 +2266,11 @@ async fn run_latest_wins_supersede(
         key,
         request.concurrency_limit.unwrap_or(1),
         exec_id,
+        metrics,
     )
     .await?;
 
-    let metrics = outcome
+    let cancel_metrics = outcome
         .superseded
         .iter()
         .map(|run| StartCancelledRun {
@@ -2256,7 +2280,7 @@ async fn run_latest_wins_supersede(
         })
         .collect();
     tx_deferred_checks.extend(outcome.deferred_checks);
-    Ok((metrics, outcome.deferred_starts))
+    Ok((cancel_metrics, outcome.deferred_starts))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2400,6 +2424,9 @@ async fn inline_cancel(
         .await?;
     let (mut deferred, closed_children) =
         Box::pin(apply_parent_close_cascade(conn, exec_id)).await?;
+    // issue #1197, item 1: this path never threads a metrics recorder, so the
+    // plain wrapper's own throwaway collector is already correct here — no
+    // collecting variant needed (there is nothing to collect).
     let triggers = crate::completion_trigger::evaluate_triggers_for_execution(
         conn,
         exec_id,
@@ -2536,6 +2563,12 @@ pub async fn cancel_workflow_execution_collect(
     conn: &mut AsyncPgConnection,
     exec_id: ExecutionId,
     reason: &str,
+    // issue #1197, item 2 (Codex round 3, P2): threaded into this cancellation's
+    // own completion-trigger evaluation below so a nested self-referential
+    // admission recursing off of THIS cancel sees the real caller-supplied
+    // recorder instead of unconditionally falling back to the process-global
+    // one. `None` at every call site that never had a recorder in scope.
+    metrics: Option<&(dyn crate::telemetry::MetricsRecorder + Send + Sync)>,
 ) -> HarvestResult<(
     CancelledWorkflowExecution,
     Vec<DeferredTriggerStart>,
@@ -2689,11 +2722,21 @@ pub async fn cancel_workflow_execution_collect(
             )
             .await?;
             let (mut deferred, closed_children) = apply_parent_close_cascade(conn, exec_id).await?;
+            // issue #1197, item 1: this evaluation's own supersede/cancel
+            // metrics are still discarded by the plain wrapper's throwaway
+            // collector (this transaction is a nested SAVEPOINT from the
+            // caller's perspective in the common case, so nothing here could
+            // safely emit post-commit anyway) -- but `metrics`, when the
+            // caller has one, is now passed through rather than hardcoded to
+            // `None` (issue #1197, item 2, Codex round 3 P2), so a nested
+            // self-referential admission this cancellation's own trigger
+            // evaluation recurses into sees the real recorder instead of
+            // unconditionally falling back to the process-global one.
             let triggers = crate::completion_trigger::evaluate_triggers_for_execution(
                 conn,
                 exec_id,
                 crate::completion_trigger::TerminalState::Cancelled,
-                None,
+                metrics,
             )
             .await?;
             deferred.extend(triggers);
@@ -2757,7 +2800,7 @@ pub async fn cancel_workflow_execution(
     metrics: &(dyn crate::telemetry::MetricsRecorder + Send + Sync),
 ) -> HarvestResult<CancelledWorkflowExecution> {
     let (cancel_result, deferred_starts, deferred_checks, deferred_terminal) =
-        cancel_workflow_execution_collect(conn, exec_id, reason).await?;
+        cancel_workflow_execution_collect(conn, exec_id, reason, Some(metrics)).await?;
 
     for check in deferred_checks {
         let _ = check_and_report_unfinished_handlers(conn, check.0, &check.1, Some(metrics)).await;
@@ -4238,6 +4281,8 @@ async fn cascade_cancel_detached_child(
     deferred_starts.append(&mut child_deferred);
     closed_executions.append(&mut child_closed);
 
+    // issue #1197, item 1: this cascade never threads a metrics recorder, so
+    // the plain wrapper's own throwaway collector is already correct here.
     let triggers = crate::completion_trigger::evaluate_triggers_for_execution(
         conn,
         exec_id,
@@ -4295,6 +4340,8 @@ async fn cascade_terminate_detached_child(
     deferred_starts.append(&mut child_deferred);
     closed_executions.append(&mut child_closed);
 
+    // issue #1197, item 1: this cascade never threads a metrics recorder, so
+    // the plain wrapper's own throwaway collector is already correct here.
     let triggers = crate::completion_trigger::evaluate_triggers_for_execution(
         conn,
         exec_id,
@@ -4446,6 +4493,9 @@ pub async fn terminate_workflow_execution_collect(
             // cancellation downstream (issue #504). Operators opt into
             // terminate cascades by registering `terminal_states:
             // ["Terminated"]`.
+            // issue #1197, item 1: this path never threads a metrics recorder,
+            // so the plain wrapper's own throwaway collector is already
+            // correct here.
             let triggers = crate::completion_trigger::evaluate_triggers_for_execution(
                 conn,
                 exec_id,
@@ -4815,7 +4865,7 @@ pub async fn resolve_and_cancel_by_workflow_id(
     if crate::erase::is_terminal_state(&run.state) {
         return Ok(ByIdCancelOutcome::AlreadyTerminal);
     }
-    match cancel_workflow_execution_collect(conn, run.exec_id, reason).await {
+    match cancel_workflow_execution_collect(conn, run.exec_id, reason, None).await {
         Ok((cancelled, deferred, closed_children, metrics)) => Ok(ByIdCancelOutcome::Cancelled {
             cancelled: Box::new(cancelled),
             deferred,
@@ -5153,6 +5203,7 @@ pub async fn signal_with_start_workflow_execution_with_metrics(
                     conn,
                     prior_exec_id,
                     "terminated by signal-with-start",
+                    metrics,
                 )
                 .await
                 {

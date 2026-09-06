@@ -128,8 +128,8 @@ async fn test_typed_workflow_client_stubs() {
         .await
         .unwrap();
 
-    // Since we don't have a worker executing, let's manually write the workflow completed event to database
-    // to simulate the worker completing it, so we can await result().
+    // No worker is running, so write the workflow-completed event directly.
+    // This simulates the worker finishing and lets result() resolve.
     use autumn_harvest::WorkflowEvent;
     use autumn_harvest::schema::harvest_workflow_executions::dsl;
 

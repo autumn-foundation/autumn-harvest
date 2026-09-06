@@ -50,11 +50,12 @@ use crate::telemetry::{
     METRIC_ADMISSION_BYPASSED, METRIC_ADMISSION_GATES_ACTIVE, METRIC_CANARY_FAILURE,
     METRIC_CANARY_ROUNDTRIP, METRIC_CANARY_SUCCESS, METRIC_CIRCUIT_CLOSED, METRIC_CIRCUIT_TRIPPED,
     METRIC_COMPLETION_TRIGGER_FIRED, METRIC_COMPLETION_TRIGGER_SKIPPED,
-    METRIC_CONCURRENCY_SUPERSEDED, METRIC_CONNECTOR_DISPATCHED, METRIC_CONNECTOR_LAG,
-    METRIC_CONNECTOR_POISONED, METRIC_CONNECTOR_RECEIVED, METRIC_DEBOUNCE_FIRED,
-    METRIC_DLQ_ENTRIES, METRIC_DLQ_REDRIVEN, METRIC_EXTERNAL_SIGNAL_SENT, METRIC_LABEL_ACTION,
-    METRIC_LABEL_ACTIVITY, METRIC_LABEL_ACTIVITY_NAME, METRIC_LABEL_BUILD_ID,
-    METRIC_LABEL_DECISION, METRIC_LABEL_ERROR_TYPE, METRIC_LABEL_KEY, METRIC_LABEL_KIND,
+    METRIC_CONCURRENCY_RESIDUAL_OVER_LIMIT, METRIC_CONCURRENCY_SUPERSEDED,
+    METRIC_CONNECTOR_DISPATCHED, METRIC_CONNECTOR_LAG, METRIC_CONNECTOR_POISONED,
+    METRIC_CONNECTOR_RECEIVED, METRIC_DEBOUNCE_FIRED, METRIC_DLQ_ENTRIES, METRIC_DLQ_REDRIVEN,
+    METRIC_EXTERNAL_SIGNAL_SENT, METRIC_LABEL_ACTION, METRIC_LABEL_ACTIVITY,
+    METRIC_LABEL_ACTIVITY_NAME, METRIC_LABEL_BUILD_ID, METRIC_LABEL_DECISION,
+    METRIC_LABEL_ERROR_TYPE, METRIC_LABEL_GAP, METRIC_LABEL_KEY, METRIC_LABEL_KIND,
     METRIC_LABEL_NAME, METRIC_LABEL_NON_RETRYABLE, METRIC_LABEL_OUTCOME, METRIC_LABEL_PATH,
     METRIC_LABEL_PRODUCER, METRIC_LABEL_QUERY, METRIC_LABEL_QUEUE, METRIC_LABEL_RATE_LIMIT_FAMILY,
     METRIC_LABEL_REASON, METRIC_LABEL_REASON_CODE, METRIC_LABEL_RESOURCE, METRIC_LABEL_SCANNER,
@@ -638,6 +639,15 @@ impl MetricsRecorder for MetricsRsRecorder {
         counter!(
             METRIC_CONCURRENCY_SUPERSEDED,
             METRIC_LABEL_WORKFLOW => workflow.to_owned(),
+        )
+        .increment(1);
+    }
+
+    fn record_concurrency_residual_over_limit(&self, workflow: &str, gap: u64) {
+        counter!(
+            METRIC_CONCURRENCY_RESIDUAL_OVER_LIMIT,
+            METRIC_LABEL_WORKFLOW => workflow.to_owned(),
+            METRIC_LABEL_GAP => gap.to_string(),
         )
         .increment(1);
     }
@@ -1873,6 +1883,99 @@ mod tests {
                 vec![(METRIC_LABEL_WORKFLOW.to_owned(), "doc_index".to_owned())],
             )],
             "the bridge must register exactly the workflow label constant, \
+             with no concurrency-key label and no value swap"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Nested-admission residual-over-limit bridge (issue #1197, item 2)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn bridges_concurrency_residual_over_limit_with_workflow_and_gap_labels() {
+        // Codex review (PR #1367, P1): the documented full-surface
+        // `MetricsRsRecorder` did not override `record_concurrency_residual_over_limit`
+        // at all, so it silently resolved to the trait's no-op default —
+        // the new counter would never be exported for any deployment using
+        // this adapter. Mirrors `bridges_concurrency_superseded_with_workflow_label_only`
+        // exactly: a real `metrics::Recorder` captures the registered counter
+        // key so a dropped/swapped label (or an accidentally-added
+        // concurrency-key label — forbidden by ADR-0001 §7) is caught here.
+        type CounterKey = (String, Vec<(String, String)>);
+
+        #[derive(Default)]
+        struct CapturingRecorder {
+            counters: std::sync::Mutex<Vec<CounterKey>>,
+        }
+
+        impl metrics::Recorder for &CapturingRecorder {
+            fn describe_counter(
+                &self,
+                _: metrics::KeyName,
+                _: Option<metrics::Unit>,
+                _: metrics::SharedString,
+            ) {
+            }
+            fn describe_gauge(
+                &self,
+                _: metrics::KeyName,
+                _: Option<metrics::Unit>,
+                _: metrics::SharedString,
+            ) {
+            }
+            fn describe_histogram(
+                &self,
+                _: metrics::KeyName,
+                _: Option<metrics::Unit>,
+                _: metrics::SharedString,
+            ) {
+            }
+            fn register_counter(
+                &self,
+                key: &metrics::Key,
+                _: &metrics::Metadata<'_>,
+            ) -> metrics::Counter {
+                self.counters.lock().unwrap().push((
+                    key.name().to_owned(),
+                    key.labels()
+                        .map(|l| (l.key().to_owned(), l.value().to_owned()))
+                        .collect(),
+                ));
+                metrics::Counter::noop()
+            }
+            fn register_gauge(
+                &self,
+                _: &metrics::Key,
+                _: &metrics::Metadata<'_>,
+            ) -> metrics::Gauge {
+                metrics::Gauge::noop()
+            }
+            fn register_histogram(
+                &self,
+                _: &metrics::Key,
+                _: &metrics::Metadata<'_>,
+            ) -> metrics::Histogram {
+                metrics::Histogram::noop()
+            }
+        }
+
+        let capture = CapturingRecorder::default();
+        metrics::with_local_recorder(&&capture, || {
+            let rec = MetricsRsRecorder;
+            rec.record_concurrency_residual_over_limit("doc_index", 1);
+        });
+
+        let counters = capture.counters.lock().unwrap().clone();
+        assert_eq!(
+            counters.as_slice(),
+            &[(
+                METRIC_CONCURRENCY_RESIDUAL_OVER_LIMIT.to_owned(),
+                vec![
+                    (METRIC_LABEL_WORKFLOW.to_owned(), "doc_index".to_owned()),
+                    (METRIC_LABEL_GAP.to_owned(), "1".to_owned()),
+                ],
+            )],
+            "the bridge must register exactly the workflow + gap label constants, \
              with no concurrency-key label and no value swap"
         );
     }
