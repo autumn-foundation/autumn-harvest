@@ -430,15 +430,25 @@ actually measures. The two rechecks' own relative increase (+72%) is
 markedly larger than the main query's, which this page cannot explain with
 confidence: no `EXPLAIN` was captured for either recheck statement, only
 the aggregate `pg_stat_statements` counters above, so there is no plan-level
-evidence to confirm whether it is the same non-HOT/index-write and
-row-width mechanisms [Plan](#plan) establishes for the main claim `UPDATE`
-recurring here, or something else about how these two statements touch the
-row. What can be said: both rechecks target the same, already-claimed row
-`claim_task_query()` just wrote, so the same wider-row and non-HOT
-index-maintenance effects are a plausible contributor, consistent with the
-direction (both labels' recheck costs move the same way the main query's
-did) -- but this page does not assert that as confirmed, since it never
-directly measured either recheck statement's own plan.
+evidence to confirm the mechanism. **It is not the same non-HOT index-write
+mechanism [Plan](#plan) establishes for the main claim `UPDATE`, though** --
+an earlier revision of this section speculated that it might be, but this
+capture's fixture never populates `harvest_queue_pauses` or
+`harvest_activity_pauses` -- `db::seed()` only seeds paused rows for
+`ClaimGate::PausedRows`/`AllGates` (see `claim_bench_support.rs`'s
+`wants_paused_rows`), and this capture uses `ClaimGate::Baseline`
+throughout -- so `EXISTS (SELECT ... FROM harvest_queue_pauses ...)` and
+its activity-pause counterpart are always false, and each
+recheck's `WHERE id = $1 AND state = ... AND worker_id = ... AND
+EXISTS (...)` therefore never matches a row to update. A statement that
+never actually writes cannot perform a non-HOT update or maintain any
+index -- Codex review on PR #1339 caught this. What both rechecks
+genuinely do on every call is a primary-key point lookup on the
+already-claimed row plus the `EXISTS` subquery scan against the (empty)
+pause table, and this page has no confirmed explanation for why that
+combination costs +72% more on the `schedule-to-close` label; it is left
+as an open question rather than attributed to a mechanism the measured
+statements cannot exercise.
 
 **Neither number reproduced to a stable value across the several runs this
 capture went through over the course of this pass.** Codex review on PR
