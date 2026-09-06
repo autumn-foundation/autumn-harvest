@@ -60,9 +60,30 @@ work, not just the blocked execution's own retry. Fixed with a new nullable
 `(target_shard, next_attempt_at, created_at)` index): a `QuotaExceeded` catch
 inside `relay_gate_checked_start`'s existing claim transaction stamps it to
 `now() + 5s`, and the claim query now filters out a row whose backoff hasn't
-elapsed and orders the eligible batch by `created_at` (FIFO). `NULL` (the
-default, and every pre-existing row) means "never blocked; eligible
-immediately", so this is purely additive.
+elapsed. `NULL` (the default, and every pre-existing row) means "never
+blocked; eligible immediately", so this is purely additive.
+
+**Finding 4's claim-batch ordering, refined across two more Codex rounds on
+PR #1386.** Ordering the eligible batch by `created_at` alone (the fix as it
+first shipped) was not enough: once the scanner's `poll_interval` is at or
+above the 5s backoff, a persistently-blocked row's backoff has always
+re-elapsed by the next tick, so it stays among the 50 oldest eligible rows
+forever and a newer, healthy row never gets a turn (**round-1 P1**). Ordering
+never-attempted rows (`next_attempt_at IS NULL`) strictly ahead of any
+previously-blocked one fixed that, but traded one starvation direction for
+the other: a sustained arrival of ≥50 fresh rows between ticks can now fill
+every batch and strand a previously-blocked row even after its target's
+quota frees up (**round-2 P2**). The batch is now built from two
+independently-capped queries instead of one combined query + `ORDER BY`:
+fresh rows get up to `OUTBOX_CLAIM_BATCH_LIMIT - OUTBOX_RETRY_RESERVED_SLOTS`
+(40) slots, retry-eligible rows get the remaining slots with a floor of
+`OUTBOX_RETRY_RESERVED_SLOTS` (10) — each tier's own query result short of
+its cap donates the difference to the other, so no capacity is wasted when
+one backlog is smaller than its reservation. Also fixed alongside round-1: the
+row-level `FOR UPDATE SKIP LOCKED` claim inside `relay_gate_checked_start`
+now re-checks the same eligibility predicate, closing a race where a
+concurrent scanner replica's unlocked batch read could claim and retry a row
+a peer had just re-armed (**round-1 P2**).
 
 **Tests, red → green → refactor.** Confirmed each fix's test fails without it
 (production code reverted, rebuilt, test observed to fail) and passes with it
@@ -91,6 +112,16 @@ restored:
   later scan; an immediate rescan of a still-backed-off row leaves its
   `next_attempt_at` unchanged (excluded, not reprocessed); forcing the
   backoff into the past and freeing the quota then delivers it on the next
-  scan.
+  scan. Two more new tests pin the round-1/round-2 ordering trade-off from
+  both directions:
+  `quota_blocked_outbox_never_attempted_rows_outrank_expired_quota_retries`
+  (round-1 P1) — 60 rows with an already-expired backoff (simulating the next
+  scan after a slow poll interval) plus one never-attempted row that is
+  OLDER by `created_at` still loses the claim-batch race, proving fresh rows
+  outrank expired retries regardless of insertion order — and
+  `quota_blocked_outbox_retry_row_is_not_starved_by_a_flood_of_fresh_rows`
+  (round-2 P2) — a single retry-eligible row (quota freed, backoff elapsed)
+  is still reclaimed in one scan despite 55 competing never-attempted rows,
+  proving the reserved retry floor holds under a fresh-row flood.
 
 No `WorkflowEvent` variant, no data migration, no replay impact.

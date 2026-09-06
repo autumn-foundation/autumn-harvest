@@ -740,6 +740,22 @@ pub async fn resolve_cross_shard_target_queue(
 #[cfg(feature = "db")]
 const QUOTA_REDEFER_BACKOFF: chrono::Duration = chrono::Duration::seconds(5);
 
+/// Cap on the number of outbox rows `enforce_completion_triggers_outbox`
+/// claims per scan.
+#[cfg(feature = "db")]
+const OUTBOX_CLAIM_BATCH_LIMIT: i64 = 50;
+
+/// Slots of `OUTBOX_CLAIM_BATCH_LIMIT` reserved for retry-eligible rows
+/// (issue #1227, Finding 4, Codex round-2 P2 on PR #1386) so a sustained
+/// arrival of fresh (never-attempted) rows can never fill every batch and
+/// strand a previously-blocked row even after its target's quota frees up.
+/// 20% of the batch -- large enough that a retry backlog visibly drains
+/// across a handful of ticks rather than one row at a time, small enough
+/// that a genuine flood of fresh work still gets the large majority of each
+/// batch.
+#[cfg(feature = "db")]
+const OUTBOX_RETRY_RESERVED_SLOTS: i64 = 10;
+
 /// Outcome of a claimed cross-shard completion-trigger relay attempt, decided
 /// under the source-row `FOR UPDATE SKIP LOCKED` claim (issue #618, F-round19).
 ///
@@ -2026,44 +2042,63 @@ pub async fn enforce_completion_triggers_outbox(
         shard_assignments.iter().map(|s| s.as_i32()).collect()
     };
 
-    // Load up to 50 pending outbox tasks for shards assigned to this worker.
+    // Load up to `OUTBOX_CLAIM_BATCH_LIMIT` pending outbox tasks for shards
+    // assigned to this worker, as two separately-capped tiers rather than one
+    // combined query (issue #1227 Finding 4 and its two Codex follow-up
+    // rounds on PR #1386):
     //
-    // Issue #1227, Finding 4: excludes a row whose `next_attempt_at` backoff
-    // (stamped by a prior `QuotaBlocked` relay outcome, see `RelayOutcome`)
-    // has not yet elapsed. Pre-#1227 this had no such filter at all: a row
-    // blocked against a durably exhausted quota could dominate every
-    // unordered `LIMIT 50` batch on every tick, starving any OTHER,
-    // unrelated relay that happened to sort after it.
+    // Pre-#1227 there was no `next_attempt_at` filter at all: a row blocked
+    // against a durably exhausted quota was left completely untouched on a
+    // `QuotaBlocked` outcome, so it could dominate every unordered
+    // `LIMIT 50` batch on every tick, starving any OTHER, unrelated relay
+    // that happened to sort after it.
     //
-    // Ordering by `created_at` ALONE (the initial #1227 fix) was still not
-    // enough (Codex round-1 P1 on PR #1386): once `WorkerRuntimeConfig::
-    // poll_interval` is at or above `QUOTA_REDEFER_BACKOFF` (5s), a
-    // persistently-blocked row's backoff has always re-elapsed by the next
-    // tick, so it goes straight back to being one of the 50 OLDEST eligible
-    // rows -- the exact same batch reloads forever and a newer, healthy row
-    // still never gets a turn. Ordering never-attempted rows
-    // (`next_attempt_at IS NULL`) ahead of ANY previously-blocked one (`.asc()
-    // .nulls_first()`, mirroring `cross_shard_child.rs`'s identical
-    // never-attempted-first pattern) fixes this: a fresh row is never stuck
-    // behind a cycling backlog of rows that have already had -- and failed --
-    // an attempt. `created_at` only breaks ties within each of those two
-    // tiers.
+    // Ordering by `created_at` ALONE (round-1's first attempt) was not
+    // enough: once `WorkerRuntimeConfig::poll_interval` is at or above
+    // `QUOTA_REDEFER_BACKOFF` (5s), a persistently-blocked row's backoff has
+    // always re-elapsed by the next tick, so it goes straight back to being
+    // one of the 50 OLDEST eligible rows -- the exact same batch reloads
+    // forever and a newer, healthy row never gets a turn (round-1 P1).
+    //
+    // Switching to a single `next_attempt_at IS NULL` ("fresh") -vs- retry
+    // ordering (round-1's fix) traded one starvation direction for the
+    // other: a *sustained* arrival of ≥50 fresh rows between ticks fills
+    // every batch with fresh rows and a previously-blocked row can never be
+    // reclaimed again even after its target's quota frees up (round-2 P2).
+    //
+    // Reserving `OUTBOX_RETRY_RESERVED_SLOTS` of the batch for retry-eligible
+    // rows -- two independently-limited queries, combined -- gives each tier
+    // a floor neither backlog can starve: fresh rows always get at least
+    // `OUTBOX_CLAIM_BATCH_LIMIT - OUTBOX_RETRY_RESERVED_SLOTS` slots
+    // regardless of how large the retry backlog is, and retries always get
+    // at least `OUTBOX_RETRY_RESERVED_SLOTS` regardless of how fast fresh
+    // rows arrive. Either query filling short of its own limit gives the
+    // other tier the difference, so no capacity is wasted when one backlog
+    // is smaller than its reservation.
     let now = chrono::Utc::now();
-    let pending_tasks = outbox_dsl::harvest_completion_trigger_outbox
+    let mut pending_tasks = outbox_dsl::harvest_completion_trigger_outbox
         .filter(outbox_dsl::target_shard.eq_any(&shards))
-        .filter(
-            outbox_dsl::next_attempt_at
-                .is_null()
-                .or(outbox_dsl::next_attempt_at.le(now)),
-        )
-        .order((
-            outbox_dsl::next_attempt_at.asc().nulls_first(),
-            outbox_dsl::created_at.asc(),
-        ))
-        .limit(50)
+        .filter(outbox_dsl::next_attempt_at.is_null())
+        .order(outbox_dsl::created_at.asc())
+        .limit(OUTBOX_CLAIM_BATCH_LIMIT - OUTBOX_RETRY_RESERVED_SLOTS)
         .load::<CompletionTriggerOutboxDb>(conn)
         .await
         .map_err(crate::error::database_error)?;
+
+    let retry_limit = OUTBOX_CLAIM_BATCH_LIMIT
+        - i64::try_from(pending_tasks.len()).unwrap_or(OUTBOX_CLAIM_BATCH_LIMIT);
+    let retry_rows = outbox_dsl::harvest_completion_trigger_outbox
+        .filter(outbox_dsl::target_shard.eq_any(&shards))
+        .filter(outbox_dsl::next_attempt_at.le(now))
+        .order((
+            outbox_dsl::next_attempt_at.asc(),
+            outbox_dsl::created_at.asc(),
+        ))
+        .limit(retry_limit)
+        .load::<CompletionTriggerOutboxDb>(conn)
+        .await
+        .map_err(crate::error::database_error)?;
+    pending_tasks.extend(retry_rows);
 
     if pending_tasks.is_empty() {
         return Ok(0);

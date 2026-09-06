@@ -3415,3 +3415,62 @@ async fn quota_blocked_outbox_never_attempted_rows_outrank_expired_quota_retries
         );
     }
 }
+
+/// Issue #1227 Finding 4, Codex round-2 P2 (PR #1386): the round-1 fix
+/// (order never-attempted rows strictly ahead of every retry) traded one
+/// starvation direction for the other. With no reserved floor for retries, a
+/// batch full of fresh rows (`next_attempt_at IS NULL`) can fill every one of
+/// the 50 slots, and a previously-blocked row is never reclaimed again even
+/// after its target's quota frees up -- indefinitely, for as long as fresh
+/// work keeps arriving. This proves the fix (a reserved minimum of retry
+/// slots per batch): a single scan with far more fresh rows than the batch
+/// limit must still reclaim a lone retry-eligible row rather than letting the
+/// fresh flood claim the whole batch.
+#[tokio::test]
+async fn quota_blocked_outbox_retry_row_is_not_starved_by_a_flood_of_fresh_rows() {
+    let (url, _c) = setup_test_database_url_or_env().await;
+    let mut conn = connect(&url).await;
+
+    install_global_router(ShardRouter::single());
+    let sharded_pool = Some(ShardedDbPool::single(build_test_pool(&url)));
+
+    let flood_wf = leaked("outbox_fairness_flood");
+    let retry_wf = leaked("outbox_fairness_retry");
+
+    // 55 never-attempted rows, no quota policy on `flood_wf` at all -- each
+    // succeeds (Delivered) the instant it is claimed, but there are enough of
+    // them to fill the ENTIRE 50-row batch limit on their own, let alone the
+    // 40 non-reserved slots.
+    const FLOOD_ROW_COUNT: usize = 55;
+    for _ in 0..FLOOD_ROW_COUNT {
+        insert_outbox_row(&mut conn, flood_wf, serde_json::json!({})).await;
+    }
+
+    // One row whose quota WAS blocking it, but has since freed up -- an
+    // already-past `next_attempt_at` and no live blocker. Under round-1's
+    // NULLS-FIRST-only ordering, 55 fresh rows would fill every one of the
+    // 50 slots and this row would never be reached, no matter how long its
+    // quota has been free.
+    let retry_outbox_id = insert_outbox_row(&mut conn, retry_wf, serde_json::json!({})).await;
+    diesel::sql_query(
+        "UPDATE harvest_completion_trigger_outbox SET next_attempt_at = $2 WHERE id = $1",
+    )
+    .bind::<diesel::sql_types::Uuid, _>(retry_outbox_id)
+    .bind::<diesel::sql_types::Timestamptz, _>(chrono::Utc::now() - chrono::Duration::seconds(1))
+    .execute(&mut conn)
+    .await
+    .expect("stamp an already-expired, now-eligible backoff");
+
+    enforce_completion_triggers_outbox(&mut conn, &NoOpMetrics, &sharded_pool, &[ShardId::new(0)])
+        .await
+        .expect("single outbox scan");
+
+    assert!(
+        !outbox_row_exists(&mut conn, retry_outbox_id).await,
+        "a retry-eligible row whose quota has freed up must be reclaimed \
+         within a bounded number of scans even when it is vastly \
+         outnumbered by never-attempted rows in the same batch -- a floor \
+         reserved for retries must survive a fresh-row flood, not just the \
+         reverse (issue #1227 Finding 4, Codex round-2 P2)"
+    );
+}
