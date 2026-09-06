@@ -38,25 +38,46 @@ yesterday's report and one didn't:
   later PR runs all restored against — and still wasn't there 9-14 hours on
   (§4).
 
-**Correction record for this PR (`#1395`):** eight separate Codex review
-comments caught real problems in earlier drafts of this report — two
-methodology errors in §4's cache-eviction comparison (a same-run comparison
-that couldn't show what was claimed, then a cross-PR-branch comparison
-GitHub's cache scoping rules make invalid), one overclaim in §1 (calling
-full-workflow wall time "the number that actually gates a PR" while this
-report's own Verdict-path section leaves that unconfirmed), one overstated
-certainty in §4 (treating an upload-progress line as proof of a finalized
-cache save), one miscounted baseline (the inherited "~19" job-count figure
-conflated with distinct persisted keys the same way this report's own
-"12 vs 3" fix already corrected for `test-nodb`, just not carried back to
-the older number), one further scoping gap in that same count (~13 is a
-per-branch figure, not the unknown repository-wide total the shared 10GB cap
-actually contends over), one internally-inconsistent denominator in the
-Measurement section's cache-hit tally, and one overgeneralized summary claim
-(the top bullets said no cache was found "on every sampled run," which
-contradicts the one prefix-fallback hit this report's own cumulative tally
-already counts). All eight are fixed below, in place, with the retractions
-left visible rather than edited away.
+**Correction record for this PR (`#1395`):** thirteen separate Codex review
+comments caught real problems in earlier drafts of this report:
+
+1–2. Two methodology errors in §4's cache-eviction comparison (a same-run
+comparison that couldn't show what was claimed, then a cross-PR-branch
+comparison GitHub's cache scoping rules make invalid).
+3. One overclaim in §1 (calling full-workflow wall time "the number that
+actually gates a PR" while this report's own Verdict-path section leaves
+that unconfirmed).
+4. One overstated certainty in §4 (treating an upload-progress line as proof
+of a finalized cache save).
+5. One miscounted baseline (the inherited "~19" job-count figure conflated
+with distinct persisted keys the same way this report's own "12 vs 3" fix
+already corrected for `test-nodb`, just not carried back to the older
+number).
+6. One further scoping gap in that same count (~13 is a per-branch figure,
+not the unknown repository-wide total the shared 10GB cap actually contends
+over).
+7. One internally-inconsistent denominator in the Measurement section's
+cache-hit tally.
+8. One overgeneralized summary claim (the top bullets said no cache was
+found "on every sampled run," which contradicts the one prefix-fallback hit
+this report's own cumulative tally already counts).
+9. One remedy that presented a within-family canonical shard writer (e.g.
+always `test-nodb` shard 0) as a capacity fix, when the shared shard-key
+already limits that family to one persisted entry via the reserve-race —
+worth doing to stop wasted attempts, not a capacity remedy on its own.
+10. One further proposed remedy (a single shared cache key across parallel,
+dissimilar job families) that the same reserve-race mechanism this report
+documented would have made things worse, not better — the job that wins
+the key would save irrelevant artifacts for the rest.
+11. Two further rounds of the same "direct support"/"was gone" overconfident
+framing of §4's evidence, in the Diagnosis section and then again in §4's
+own closing paragraph, both outrunning what an unconfirmed, possibly-silent
+commit failure can rule out.
+12. One `save-if: false` remedy claim that overstated what it does — it
+stops new saves but doesn't reclaim an already-stored entry.
+
+All are fixed below, in place, with the retractions left visible rather
+than edited away.
 
 ## 🎯 Verdict path (unchanged)
 
@@ -218,13 +239,17 @@ branch, checked against later runs — and it reproduces the same conclusion a
 third time, on markedly firmer ground than the two retracted drafts: **a
 cache save that raised no error anywhere in its path, on the shared base
 branch, under the exact key three separate PR runs later restored against,
-was unavailable to all three within 9-14 hours.**
-That's consistent with the 09-05 report's shared-10GB-repository-wide-budget
-hypothesis (fast enough turnover elsewhere evicting this entry before any PR
-got to use it) and not with a branch-scoping or key-configuration mistake —
-the shared-key mechanism and the base-branch fallback both work as designed;
-the entry just doesn't live long enough to be useful to anyone downstream of
-`trunk-dev`.
+could not be restored by any of them within 9-14 hours.**
+That's consistent with — not proof of — the 09-05 report's
+shared-10GB-repository-wide-budget hypothesis (fast enough turnover
+elsewhere evicting this entry before any PR got to use it): the shared-key
+mechanism and the base-branch fallback both work as designed, and a
+branch-scoping or key-configuration mistake is ruled out, but **a silently
+failed commit/finalize step remains an alternative this report cannot
+rule out** (see Diagnosis) — if that's what happened, no entry ever existed
+to go missing, and these three misses would look identical either way.
+Which of the two is true is exactly the fact the cache-usage API this
+report keeps flagging would settle.
 
 ## 🔍 Diagnosis
 
@@ -313,8 +338,14 @@ method). Candidate remedies for whoever has that access, updated:
      than the current cold-every-time baseline, not better. Retracted.
 
    The remedies that don't have this flaw: (a) stop caching lower-value job
-   families entirely (`save-if: false` removes an entry outright, no
-   collision risk, unlike merging keys), or (b) narrow
+   families entirely — **not just `save-if: false`**, which a Codex review
+   comment on this PR correctly pointed out only stops *new* saves; the
+   `uses: Swatinem/rust-cache@v2` step still restores from whatever's
+   already stored under that key, and the existing entry keeps consuming
+   the shared budget until it ages out (GitHub's default 7-day unused-cache
+   expiry) or is evicted — reclaiming the space immediately needs removing
+   the cache step entirely for that job *and* deleting its existing key via
+   the cache-management API/UI, or (b) narrow
    `cache-directories`/`cache-targets` per job so each surviving entry is
    smaller, leaving more of the fixed budget for the rest — both still new
    CI-config policy, still routed
