@@ -15,24 +15,32 @@ yesterday's report and one didn't:
 - **Changed, for the worse:** the `test-nodb` split added 3 more distinct
   persisted cache entries (one per OS — the job already uses a **shared cache
   key across its 4 shards**, `ci.yml:411-417`, so this is 3 entries, not 12)
-  on top of the ~19 already in `ci.yml`. Still the wrong direction for the
-  fixed-10GB-cache-budget hypothesis the prior report raised, just a smaller
-  wrong direction than this report originally claimed.
+  on top of roughly **10**, not the 09-05 report's "~19" (a Codex review
+  comment on this PR caught that the same job-count-vs-distinct-key
+  conflation applies to that inherited figure too: `test-db-linux`'s 10
+  shards already collapse to 1 entry via their own shared key, so ~10
+  distinct entries pre-`test-nodb`, ~13 after — corrected below). Still the
+  wrong direction for the fixed-10GB-cache-budget hypothesis the prior
+  report raised, just a smaller wrong direction than either report claimed.
 - **Unchanged:** `Swatinem/rust-cache` still finds nothing to restore on every
   sampled leg on every sampled run, including a save this report can show
   raised no error anywhere in its path on the shared base branch, under a
   stable key three later PR runs all restored against — and still wasn't
   there 9-14 hours on (§4).
 
-**Correction record for this PR (`#1395`):** three separate Codex review
+**Correction record for this PR (`#1395`):** five separate Codex review
 comments caught real problems in earlier drafts of this report — two
 methodology errors in §4's cache-eviction comparison (a same-run comparison
 that couldn't show what was claimed, then a cross-PR-branch comparison
-GitHub's cache scoping rules make invalid), and one overclaim in §1 (calling
+GitHub's cache scoping rules make invalid), one overclaim in §1 (calling
 full-workflow wall time "the number that actually gates a PR" while this
-report's own Verdict-path section leaves that unconfirmed). All three are
-fixed below, in place, with the retraction left visible rather than edited
-away.
+report's own Verdict-path section leaves that unconfirmed), one overstated
+certainty in §4 (treating an upload-progress line as proof of a finalized
+cache save), and one miscounted baseline (the inherited "~19" job-count
+figure conflated with distinct persisted keys the same way this report's own
+"12 vs 3" fix already corrected for `test-nodb`, just not carried back to
+the older number). All five are fixed below, in place, with the retractions
+left visible rather than edited away.
 
 ## 🎯 Verdict path (unchanged)
 
@@ -213,8 +221,13 @@ split — itself a good, already-landed, measured win — mechanically made the
 capacity problem this report is tracking somewhat bigger: it added 3 more
 distinct persisted cache entries (one per OS; the error-free upload sizes
 seen in §4 range from 150MB on a docs-only trunk-dev push to 853MB on a full
-compile) contending for the same fixed cap, on the same day the 09-05
-report's hypothesis named that general mechanism as the likely cause. §4's
+compile) on top of roughly 10 pre-existing distinct entries (not the 09-05
+report's ~19, which counted matrix legs rather than distinct keys — that
+report's own text already noted `test-db-linux`'s 10 shards share one key,
+but summed as if they didn't; a Codex review comment on this PR caught the
+inconsistency with this report's own corrected `test-nodb` count), so ~13
+total contending for the same fixed cap, on the same day the 09-05 report's
+hypothesis named that general mechanism as the likely cause. §4's
 cross-run evidence — an apparently error-free save on the shared base
 branch, gone within 9-14 hours under the exact key three separate downstream
 PR runs restored against — is direct support for that hypothesis, not just
@@ -241,7 +254,7 @@ method). Candidate remedies for whoever has that access, updated:
 2. If confirmed capacity-bound: **consolidate entries across job families**
    — e.g. one shared cache key across `test-nodb`, `test-db-linux`, `test`,
    and `lint` for a given OS, if their `target/` layouts overlap enough,
-   reducing the number of distinct persisted entries below the current ~19
+   reducing the number of distinct persisted entries below the current ~13
    (a Codex review comment on this PR correctly flagged that doing this
    *within* a family — e.g. a designated canonical shard for `test-nodb` —
    is not this fix: `ci.yml:411-417`'s shared shard-key already limits each
