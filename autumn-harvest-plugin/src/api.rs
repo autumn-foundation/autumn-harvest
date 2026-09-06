@@ -43488,18 +43488,63 @@ where
 /// for `?shard_id=` queries (issue #522 review). The freshest snapshot reflects
 /// the worker's true liveness regardless of which shard it was read from.
 pub(crate) fn dedup_workers_by_freshest(rows: Vec<WorkerRow>) -> Vec<WorkerRow> {
-    let mut by_id: std::collections::HashMap<String, WorkerRow> = std::collections::HashMap::new();
-    for row in rows {
+    dedup_worker_sources_by_freshest(rows.into_iter().map(|row| (0, row)).collect())
+        .into_iter()
+        .map(|(_, row)| row)
+        .collect()
+}
+
+/// Deduplicate worker rows fanned out across shards, keeping the freshest
+/// snapshot per `worker_id` **and** the shard id that snapshot was read from.
+///
+/// [`dedup_workers_by_freshest`] discards the source shard. Its callers do
+/// not need it. Fleet health's `by_shard` tally does. An empty-array
+/// (auto/legacy) `shard_assignments` row covers whatever shard it was read
+/// from (issue #1150). Dedup collapses a multi-shard fan-out to one row per
+/// worker, so that row must still say which shard it came from (issue
+/// #1208).
+pub(crate) fn dedup_worker_sources_by_freshest(
+    rows: Vec<(i32, WorkerRow)>,
+) -> Vec<(i32, WorkerRow)> {
+    let mut by_id: std::collections::HashMap<String, (i32, WorkerRow)> =
+        std::collections::HashMap::new();
+    for (source_shard_id, row) in rows {
         match by_id.get(&row.worker.worker_id) {
-            // Keep the existing row only if it is at least as fresh.
-            Some(existing) if existing.worker.last_heartbeat_at >= row.worker.last_heartbeat_at => {
-            }
+            // Keep the existing entry only if it is at least as fresh.
+            Some((_, existing))
+                if existing.worker.last_heartbeat_at >= row.worker.last_heartbeat_at => {}
             _ => {
-                by_id.insert(row.worker.worker_id.clone(), row);
+                by_id.insert(row.worker.worker_id.clone(), (source_shard_id, row));
             }
         }
     }
     by_id.into_values().collect()
+}
+
+/// Tally worker counts per shard from a deduped, source-tagged worker list.
+///
+/// An empty `shard_assignments` array covers whatever shard the row was read
+/// from, so it is attributed to `source_shard_id`. A non-empty array is the
+/// worker's own explicit claim. It is attributed to every shard it names,
+/// regardless of source — unchanged since before issue #1208. A malformed
+/// (non-array) value is corrupt, not legacy, and is attributed to nothing.
+fn tally_by_shard(rows: &[(i32, WorkerRow)]) -> std::collections::HashMap<i32, usize> {
+    let mut by_shard: std::collections::HashMap<i32, usize> = std::collections::HashMap::new();
+    for (source_shard_id, row) in rows {
+        let Some(shards) = row.worker.shard_assignments.as_array() else {
+            continue;
+        };
+        if shards.is_empty() {
+            *by_shard.entry(*source_shard_id).or_default() += 1;
+        } else {
+            for s in shards {
+                if let Some(id) = s.as_i64().and_then(|v| i32::try_from(v).ok()) {
+                    *by_shard.entry(id).or_default() += 1;
+                }
+            }
+        }
+    }
+    by_shard
 }
 
 async fn list_workers_handler(
@@ -43720,19 +43765,23 @@ async fn workers_health(
         ..WorkerFilters::default()
     };
 
-    // Collect all worker rows from every shard, then dedup by worker_id so a
-    // multi-shard worker (which registers a row in each of its shard DBs) is
-    // counted exactly once in the healthy/stale/draining totals.
+    // Collect all worker rows from every shard, tagged with the shard each row
+    // was read from. Dedup by worker_id so a multi-shard worker (which
+    // registers a row in each of its shard DBs) is counted exactly once in
+    // the healthy/stale/draining/by_shard totals. The source tag survives
+    // dedup (issue #1208): `by_shard` needs it below, to attribute an
+    // empty-array (auto/legacy) row to the shard it actually came from.
     //
     // Issue #756: collect-and-continue — an unreachable shard is named in
     // `unavailable_shards` and the totals reflect the reachable shards rather
     // than failing the whole health check with a `500`.
-    let observations = observe_shards(&api_state, |_shard_id, mut conn| {
+    let observations = observe_shards(&api_state, |source_shard_id, mut conn| {
         let per_shard_filters = per_shard_filters.clone();
         async move {
-            list_workers(&mut conn, &per_shard_filters, stale_threshold)
+            let rows = list_workers(&mut conn, &per_shard_filters, stale_threshold)
                 .await
-                .map_err(|e| e.to_string())
+                .map_err(|e| e.to_string())?;
+            Ok(rows.into_iter().map(|row| (source_shard_id, row)).collect())
         }
     })
     .await?;
@@ -43745,17 +43794,17 @@ async fn workers_health(
     // Dedup by worker_id, keeping the freshest per-shard snapshot so a stale
     // copy on one shard never masks a healthy heartbeat on another in the
     // healthy/stale/draining totals (issue #522 review).
-    let all_workers = dedup_workers_by_freshest(all_workers);
+    let all_workers = dedup_worker_sources_by_freshest(all_workers);
 
     let mut combined = FleetHealth {
         healthy: 0,
         stale: 0,
         draining: 0,
         by_queue: std::collections::HashMap::new(),
-        by_shard: std::collections::HashMap::new(),
+        by_shard: tally_by_shard(&all_workers),
     };
 
-    for row in &all_workers {
+    for (_source_shard_id, row) in &all_workers {
         match row.health {
             autumn_harvest::workers::WorkerHealth::Healthy => combined.healthy += 1,
             autumn_harvest::workers::WorkerHealth::Stale => combined.stale += 1,
@@ -43767,16 +43816,6 @@ async fn workers_health(
             for q in queues {
                 if let Some(name) = q.as_str() {
                     *combined.by_queue.entry(name.to_string()).or_default() += 1;
-                }
-            }
-        }
-        // by_shard stays additive across shard assignments on the deduped
-        // worker, correctly reflecting how many distinct workers cover each
-        // shard.
-        if let Some(shards) = row.worker.shard_assignments.as_array() {
-            for s in shards {
-                if let Some(id) = s.as_i64().and_then(|v| i32::try_from(v).ok()) {
-                    *combined.by_shard.entry(id).or_default() += 1;
                 }
             }
         }
@@ -48744,6 +48783,148 @@ mod tests {
         let deduped_rev = dedup_workers_by_freshest(vec![fresh2, stale2]);
         assert_eq!(deduped_rev.len(), 1);
         assert_eq!(deduped_rev[0].health, WorkerHealth::Healthy);
+    }
+
+    // ── issue #1208: `by_shard` must count an empty-assignment worker under
+    // the shard its row was read from ─────────────────────────────────────
+
+    /// Build a minimal `WorkerRow` for `by_shard` merge-layer tests.
+    fn worker_row_for_shard_test(
+        worker_id: &str,
+        hb: chrono::DateTime<chrono::Utc>,
+        shard_assignments: serde_json::Value,
+    ) -> WorkerRow {
+        use autumn_harvest::models::HarvestWorker;
+        use autumn_harvest::workers::WorkerHealth;
+
+        WorkerRow {
+            worker: HarvestWorker {
+                worker_id: worker_id.to_string(),
+                started_at: hb,
+                last_heartbeat_at: hb,
+                queues: serde_json::json!(["default"]),
+                shard_assignments,
+                max_concurrency: 10,
+                in_flight_count: 0,
+                host: "localhost".to_string(),
+                version: None,
+                status: "Active".to_string(),
+                drain_deadline_at: None,
+                build_id: String::new(),
+                deployment_name: None,
+                labels: serde_json::json!({}),
+                max_concurrent_sessions: 0,
+                in_use_sessions: 0,
+            },
+            health: WorkerHealth::Healthy,
+            active_task_ids: vec![],
+        }
+    }
+
+    #[test]
+    fn dedup_worker_sources_by_freshest_keeps_the_freshest_rows_source_shard() {
+        let now = chrono::Utc::now();
+        let stale_on_shard_0 = (
+            0,
+            worker_row_for_shard_test(
+                "w1",
+                now - chrono::Duration::hours(1),
+                serde_json::json!([]),
+            ),
+        );
+        let fresh_on_shard_1 = (
+            1,
+            worker_row_for_shard_test("w1", now, serde_json::json!([])),
+        );
+
+        let deduped =
+            dedup_worker_sources_by_freshest(vec![stale_on_shard_0, fresh_on_shard_1.clone()]);
+        assert_eq!(deduped.len(), 1);
+        assert_eq!(deduped[0].0, 1, "must keep the freshest row's source shard");
+
+        // Order-independent.
+        let stale_on_shard_0 = (
+            0,
+            worker_row_for_shard_test(
+                "w1",
+                now - chrono::Duration::hours(1),
+                serde_json::json!([]),
+            ),
+        );
+        let deduped_rev =
+            dedup_worker_sources_by_freshest(vec![fresh_on_shard_1, stale_on_shard_0]);
+        assert_eq!(deduped_rev.len(), 1);
+        assert_eq!(deduped_rev[0].0, 1);
+    }
+
+    #[test]
+    fn tally_by_shard_attributes_an_empty_assignment_worker_to_its_source_shard() {
+        let now = chrono::Utc::now();
+        let rows = vec![(
+            7,
+            worker_row_for_shard_test("auto", now, serde_json::json!([])),
+        )];
+        let by_shard = tally_by_shard(&rows);
+        assert_eq!(by_shard.get(&7), Some(&1));
+        assert_eq!(by_shard.len(), 1, "must not fabricate any other bucket");
+    }
+
+    #[test]
+    fn tally_by_shard_attributes_a_non_empty_assignment_worker_literally() {
+        let now = chrono::Utc::now();
+        // Source shard (3) is irrelevant once the list is non-empty: the
+        // worker's explicit claim wins, exactly as before this fix.
+        let rows = vec![(
+            3,
+            worker_row_for_shard_test("narrow", now, serde_json::json!([1, 5])),
+        )];
+        let by_shard = tally_by_shard(&rows);
+        assert_eq!(by_shard.get(&1), Some(&1));
+        assert_eq!(by_shard.get(&5), Some(&1));
+        assert_eq!(
+            by_shard.get(&3),
+            None,
+            "the source shard itself must not gain a phantom count"
+        );
+        assert_eq!(by_shard.len(), 2);
+    }
+
+    #[test]
+    fn tally_by_shard_attributes_a_malformed_assignment_to_nothing() {
+        let now = chrono::Utc::now();
+        let rows = vec![(
+            2,
+            worker_row_for_shard_test("corrupt", now, serde_json::json!("not-an-array")),
+        )];
+        let by_shard = tally_by_shard(&rows);
+        assert!(
+            by_shard.is_empty(),
+            "a malformed shard_assignments value must not be attributed anywhere: {by_shard:?}"
+        );
+    }
+
+    #[test]
+    fn tally_by_shard_does_not_double_count_a_multi_shard_worker_across_the_fanout() {
+        let now = chrono::Utc::now();
+        // The same worker_id shows up once per assigned shard (replicated row),
+        // as it would after the fan-out but before dedup collapses it to one.
+        // Dedup must run first so the literal `[1, 3]` claim is counted once
+        // per shard, not once per replica.
+        let replicas = vec![
+            (
+                1,
+                worker_row_for_shard_test("multi", now, serde_json::json!([1, 3])),
+            ),
+            (
+                3,
+                worker_row_for_shard_test("multi", now, serde_json::json!([1, 3])),
+            ),
+        ];
+        let deduped = dedup_worker_sources_by_freshest(replicas);
+        let by_shard = tally_by_shard(&deduped);
+        assert_eq!(by_shard.get(&1), Some(&1));
+        assert_eq!(by_shard.get(&3), Some(&1));
+        assert_eq!(by_shard.len(), 2);
     }
 
     #[test]
