@@ -12,14 +12,18 @@ yesterday's report and one didn't:
   down from the 123–177 minutes measured in the 2026-09-03/09-04 reports — a
   real, large win, credited to the `test-nodb` split, not to anything in this
   report.
-- **Changed, for the worse:** the `test-nodb` split added 12 more independently
-  cache-saving job legs (4 shards × 3 OSes) on top of the ~19 already in `ci.yml`,
-  which is the wrong direction for the fixed-10GB-cache-budget hypothesis the
-  prior report raised — and even though `test-nodb` and `test-db-linux` already
-  use a **shared cache key across their own shards** (a mitigation already in
-  the code, not something this report is proposing), the miss rate is unchanged.
-- **Unchanged:** `Swatinem/rust-cache` still finds nothing to restore, on every
-  sampled leg, on every sampled run, including the ones added since yesterday.
+- **Changed, for the worse:** the `test-nodb` split added 3 more distinct
+  persisted cache entries (one per OS — the job already uses a **shared cache
+  key across its 4 shards**, `ci.yml:411-417`, so this is 3 entries, not 12;
+  see §4, corrected from an earlier draft of this section after a Codex review
+  comment on this PR caught a methodology error) on top of the ~19 already
+  in `ci.yml`. Still the wrong direction for the fixed-10GB-cache-budget
+  hypothesis the prior report raised, just a smaller wrong direction than
+  this report originally claimed.
+- **Unchanged:** `Swatinem/rust-cache` still finds nothing to restore on every
+  sampled leg on every sampled run, including a leg this report can now show
+  *did* complete a real, verified-uploaded save under a stable key — and
+  still couldn't be restored 2.5–4 hours later (§4).
 
 ## 🎯 Verdict path (unchanged)
 
@@ -94,47 +98,87 @@ independent days finding no cache at all**, now spanning every job family this
 role has checked directly (`lint`, `test`, `test-db-linux`, and the new
 `test-nodb`).
 
-### 4. The shared-key mitigation is already in place and hasn't moved the needle
+### 4. The shared-key mitigation, checked correctly this time — and a confirmed save that still didn't survive
 
-`ci.yml:411-417` (`test-nodb`) and the equivalent block in `test-db-linux` both
-set `shared-key: test-nodb-${{ matrix.os }}` / a shared key across all shards,
-specifically so a shard needing a binary another shard already built doesn't
-start cold — i.e., the "narrow the number of independently-cached legs"
-remedy the 09-05 report listed as candidate #2 is **already implemented** for
-these two job families, pre-dating or concurrent with that report. It hasn't
-helped: shard 0 and shard 3 of the same OS, in the same run, sharing the same
-cache key, both report `No cache found.` This rules out per-shard key
-multiplicity as a sufficient explanation for the miss rate on its own — the
-09-05 report's "shared 10GB repository-wide budget across ~19 (now ~34)
-independently-saving job legs" hypothesis is the one this new data is
-consistent with; a per-family key-sharing fix alone doesn't reach it because
-the contention is across families and across concurrent runs, not within one
-family's own shards.
+**Correction:** an earlier draft of this section compared shard 0 and shard 3
+of `test-nodb`'s `windows-latest` group *within the same run* and both showed
+`No cache found.`, and argued that ruled out per-shard key multiplicity as
+the explanation. A Codex review comment on this PR (`#1395`,
+`docs/rnd/2026-09-06-...md#discussion_r3943642464`) correctly flagged that as
+invalid: every shard in a matrix restores near its own job's start, seconds
+apart, before any sibling shard can possibly have finished and saved — so
+*of course* two same-run restores both miss regardless of whether the shared
+key works. That comparison couldn't have shown anything else, and the
+conclusion drawn from it didn't follow. Retracted; verified properly below.
+
+The correct test is cross-run: does a *later* run's restore, under the exact
+same key, hit an *earlier* run's completed save? Three chronologically
+ordered same-day runs share the identical `Restore Key` prefix
+`v0-rust-test-nodb-windows-latest-Windows_NT-x64-8918a2f9` (same `Cargo.lock`
+hash), and two of them — `34007199800` (created 02:43 UTC) and `34018870064`
+(created 07:20 UTC), ~4h14m apart — share the **exact, full** `Cache Key`
+(`...-78f0168d`, not just the prefix):
+
+- In `34007199800`, `test-nodb`'s four `windows-latest` shards all finish and
+  attempt to save under that exact key. Three fail with `Failed to save:
+  Unable to reserve cache with key ...-78f0168d, another job may be creating
+  this cache` (expected: a shared key means only the first sibling to reserve
+  wins). The fourth (`shard 1`, the first to finish, at 03:22 UTC) **does
+  not** hit that error — its log shows the actual upload completing:
+  `Sent 893589217 of 893589217 (100.0%)` (853 MB, 201 MB/s), followed by
+  normal post-job cleanup. One real, confirmed-complete save, under the
+  exact key `34018870064` later restores against.
+- `34018870064`'s `test-nodb`/`windows-latest` shards restore at 07:38:28-32
+  UTC — **4 hours 14 minutes after that confirmed save** — and every one
+  reports `No cache found.`, not even a prefix-fallback hit against the
+  matching restore-key prefix.
+- The middle run, `34014276155` (created 05:33 UTC, ~2h11m after the save),
+  also reports `No cache found.` on all four shards — its own `Cache Key`
+  suffix (`...-798b4d07`) differs from the saved one (a `Cargo.lock` or
+  toolchain change between those two commits), so an exact-match miss there
+  is expected; what's notable is it *also* gets no prefix-fallback hit
+  against the same `v0-rust-test-nodb-windows-latest-Windows_NT-x64-8918a2f9`
+  prefix the confirmed save shares.
+
+This is a real cross-run, stable-exact-key, confirmed-upload comparison, not
+the invalid same-run one from the earlier draft — and it reproduces the same
+conclusion by a sounder route: **a cache that genuinely saved under a key
+matching a later run's restore attempt was gone within 2-4 hours.** That is
+consistent with the 09-05 report's shared-10GB-repository-wide-budget
+hypothesis (a fast enough turnover of other saves evicting this one before
+its next chance to be restored) and not with a key-configuration mistake —
+the shared-key mechanism itself works exactly as designed (one shard wins
+the save race per run, the other three fail-soft and don't error the job);
+the entry it produces just doesn't live long enough to be useful.
 
 ## 🔍 Diagnosis
 
 **Category: cache correctness/capacity — same category as the 09-05 report,
-not a new finding, but a wider and more resistant-to-the-obvious-fix one.**
-Not a flake (every sampled run is green; this is deterministic, reproducible
-absence of a cache hit, not nondeterminism) and not a product bug (nothing
-about the execution engine is implicated; this is CI configuration). The
-`test-nodb` split — itself a good, already-landed, measured win — mechanically
-made the capacity problem this report is tracking bigger: it added 12 more
-`save-if: true` legs contending for the same fixed cap, on the same day the
-09-05 report's hypothesis named that exact mechanism as the likely cause.
-Windows paying the largest share of the miss's cost (longest per-family
-compile times to begin with, per every prior report in this series, now
-cache-cold on top of that) is consistent with, not independent of, this
-finding.
+not a new finding, but now confirmed with a sounder method.** Not a flake
+(every sampled run is green; this is deterministic, reproducible absence of
+a cache hit, not nondeterminism) and not a product bug (nothing about the
+execution engine is implicated; this is CI configuration). The `test-nodb`
+split — itself a good, already-landed, measured win — mechanically made the
+capacity problem this report is tracking somewhat bigger: it added 3 more
+distinct persisted cache entries (one per OS, each several hundred MB to
+~1GB going by the one confirmed upload size in §4) contending for the same
+fixed cap, on the same day the 09-05 report's hypothesis named that general
+mechanism as the likely cause. §4's cross-run evidence — a confirmed-complete
+853MB save, gone within 2-4 hours under a still-matching key — is direct
+support for that hypothesis, not just consistent with it. Windows paying the
+largest share of the miss's cost (longest per-family compile times to begin
+with, per every prior report in this series, now cache-cold on top of that)
+is consistent with, not independent of, this finding.
 
 ## 🔧 Treatment — still routed, not applied
 
-Same reasoning as the 09-05 report, sharpened by one new data point: **do not
-propose "narrow the cache scope per job" as a standalone remedy any more** —
-it's already done for the two job families that could most easily do it, and
-it didn't help, so it isn't a free fix waiting to be picked up. What's left
-still needs the same thing the 09-05 report couldn't get: **actual cache-usage
-bytes and eviction frequency**, which requires either the Settings → Actions →
+Same reasoning as the 09-05 report, sharpened by the §4 cross-run evidence:
+**"narrow the cache scope per job" (already done for `test-nodb`/
+`test-db-linux` via shared shard keys) demonstrably isn't sufficient on its
+own** — a confirmed, complete, correctly-keyed save still didn't survive to
+the next run. What's left still needs the same thing the 09-05 report
+couldn't get: **actual cache-usage bytes and eviction frequency**, which
+requires either the Settings → Actions →
 Caches UI or `gh api repos/autumn-foundation/autumn-harvest/actions/caches`
 with admin-scoped auth — neither available to this session (checked again;
 the GitHub MCP tools exposed here still have no cache-usage or cache-listing
@@ -164,10 +208,12 @@ method). Candidate remedies for whoever has that access, updated:
   `9ce7ce8` and PR #1336's `test-db-linux` split.
 - **Cache hit rate, cumulative across two independent report-days:** 0/9 sampled
   leg-runs found an exact-match cache; 1/10 total found a prefix-fallback hit
-  (09-05 report, `windows-latest`, not reproduced today). No revert check
-  applies here — this is a report, not a fix, so there is nothing to verify
-  went red-then-green; the "after" measurement above is the sharding win's,
-  not this report's own.
+  (09-05 report, `windows-latest`, not reproduced today). Additionally: 1
+  cross-run pair with a *confirmed-complete* save (853MB uploaded, §4) under
+  an exact key a later restore attempt matched exactly, 4h14m apart — still a
+  miss. No revert check applies here — this is a report, not a fix, so there
+  is nothing to verify went red-then-green; the "after" measurement above is
+  the sharding win's, not this report's own.
 - **Rerun-button census (same protocol as prior reports):** 0/100 sampled
   `pull_request`-event `ci.yml` runs show `run_attempt > 1`. Unchanged from
   the 09-03 report's finding — still no reflexive-rerun culture.
@@ -188,6 +234,10 @@ grep -n "Restoring cache\|Cache hit\|No cache found\|Cache Key:" logs/*.txt
 
 # Per-job wall time for a run:
 # via actions_list(method="list_workflow_jobs", resource_id=<run_id>, perPage=100)
+
+# Cross-run save/restore check for one shared key (the §4 comparison):
+grep -n "Restore Key:\|Cache Key:\|Restoring cache\|No cache found\|Saving cache\|Failed to save\|Sent .* (100.0%)" \
+  logs/*"no-db, windows"*.txt
 ```
 
 Cache-usage confirmation: still not run in this session, still no tool access
