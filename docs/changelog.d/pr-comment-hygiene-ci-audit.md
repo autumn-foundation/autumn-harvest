@@ -1980,3 +1980,29 @@ so the matcher has to be exact in the strict direction.
 Corpus effect: none. Four fixtures -- the autolink, the longer tag name,
 a closed element that still ends at its closer, and `<code/>`, which HTML
 does open.
+
+### Round sixty-five — the question `starts_block` cannot answer
+
+One finding, and it exposes the limit of the signal round sixty-two
+extended. `starts_block` answers "does a block BEGIN on this line". Every
+multi-line block answers that on its own first line, so the signal was
+enough — until a block that is exactly ONE line long. Rustdoc renders
+`# Explain the `literal` as a heading and the line under it as its own
+paragraph, and nothing on that paragraph's line says a block began,
+because none did. The one above it ended.
+
+So the loop now carries `after_block`: a leaf block one line long ends
+after itself, and the next line opens whatever follows. Three qualify --
+an ATX heading, a thematic break, and a Setext underline. Only the
+heading was reachable, because it is the only one of the three that
+holds inline content: a break and an underline have no backtick to pair
+with anything, which is why round sixty-two's cut at the underline was
+sufficient by luck rather than by construction. It is by construction
+now.
+
+The carry is consumed exactly once and only by a line-starting piece, so
+a nested comment in the middle of a line cannot spend it.
+
+Corpus effect: none. Three fixtures -- the heading, a span within one
+heading, which must still pair, and the thematic break that was already
+correct and is now pinned.

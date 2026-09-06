@@ -1727,6 +1727,11 @@ def comment_lines(pieces: list[Piece]):
         in_table = False
         indented = False
         html: str | None = None
+        # A one-line block ENDED on the previous line, so this line begins a
+        # new one. `starts_block` answers "does a block begin here", which
+        # every multi-line block also answers on its own first line -- but a
+        # heading is one line, and the paragraph under it says nothing.
+        after_block = False
         saved: list = []
         nest = run[0].nest
         for index, piece in enumerate(run):
@@ -1761,6 +1766,10 @@ def comment_lines(pieces: list[Piece]):
             if not piece.line_start:
                 yield piece.line, text, fence is not None or html is not None, False
                 continue
+            # Carried from the previous LINE, and cleared here so it applies
+            # exactly once. A piece that does not begin its own line is the
+            # same line, so it must not consume the carry.
+            opens, after_block = after_block, False
             # Inside a raw HTML block nothing is Markdown, so no fence, list
             # or table opens here and the text is not prose. A type-6 block
             # ends AT a blank line, which is a block boundary in its own
@@ -1830,8 +1839,19 @@ def comment_lines(pieces: list[Piece]):
                 # Setext and round fifty-two for HTML. Rustdoc renders no
                 # `//` comment, so a pipe row there is text and a rule of
                 # "=" is a banner this tree draws under a plain heading.
+                # A LEAF block that is exactly one line long. Rustdoc
+                # renders "# Explain the `literal" as a heading and the line
+                # under it as its own paragraph, so a span cannot pair across
+                # the two -- and nothing on the paragraph's own line says a
+                # block began, because none did. It ended.
+                after_block = (
+                    heading(body, enclosing)
+                    or thematic_break(body, enclosing)
+                    or (piece.marker in DOC_MARKERS and setext)
+                )
                 opens = (
-                    starts_block(body, enclosing)
+                    opens
+                    or starts_block(body, enclosing)
                     or quoted != before_quoted
                     or (
                         piece.marker in DOC_MARKERS
@@ -3860,6 +3880,24 @@ RULE_TESTS = [
         "/// Empty <code/> here. TODO: add retry\n",
         set(),
         "but a self-closing tag opens the element HTML gives it",
+    ),
+    (
+        "/// # Explain the `literal\n"
+        "/// TODO: issue required` suffix.\n",
+        {("CH002", 2)},
+        "a heading is one line, so the line under it is a new block",
+    ),
+    (
+        "/// # A `literal TODO: marker` heading\n",
+        set(),
+        "but a span within one heading still pairs",
+    ),
+    (
+        "/// Explain the `literal\n"
+        "/// ***\n"
+        "/// TODO: issue required` suffix.\n",
+        {("CH002", 3)},
+        "and a thematic break ends the paragraph on each side of it",
     ),
 ]
 
