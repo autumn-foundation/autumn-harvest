@@ -1741,3 +1741,34 @@ that follows is not "think harder" but "if a bound is obvious enough to note
 in a comment, it is obvious enough to implement".
 
 Corpus effect: none.
+
+### Round fifty-six — the boundary and the mask, and where an escape applies
+
+Two findings, both in the code-span machinery, both fixed. Two of my own first
+cuts were wrong before the round landed, and the corpus diff caught both.
+
+**A period inside a code span is not a sentence end.** Rustdoc renders
+``` `foo. not sure why` ``` as one span, but sentences were split before spans
+were blanked, so the fragment after the period reached CH003 as deliberation
+and failed an absolute rule. `split_sentences` now takes the text to find
+boundaries IN, separately from the text it slices sentences FROM, so the
+reported text and the word count remain exactly what the author wrote.
+
+The first cut masked spans to spaces, and the separator's own `\s+` then
+swallowed a span that OPENED a sentence — every such sentence lost its first
+word and reported one short. The mask is filler characters now, not
+whitespace. Blanking to spaces is still right for *matching*, where a rule
+must not read across the span; masking to filler is right for *splitting*,
+where only the boundaries matter.
+
+**An escape applies to the opener, not the closer.** A backslash-escaped
+backtick opens no span, so ``` \`literal ``` and a later backtick are literal
+text and the marker between them must be reported. Guarding the closing run
+the same way was wrong and the corpus said so within a minute: ``` `\` ``` is
+a code span holding one backslash — rustdoc renders `<code>\</code>` — and
+refusing that closer left the span open and merged the sentences after it.
+Backslash escapes do not apply inside a code span.
+
+Corpus effect: 19825 to 19860, all CH007. Sentences that used to be cut at a
+period inside a span are now measured whole, so several fragments become one
+longer sentence. The ratchet recomputes both sides and stays clean.

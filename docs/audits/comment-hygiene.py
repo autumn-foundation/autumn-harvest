@@ -307,7 +307,19 @@ TODO_REF_RE = re.compile(r"#\d+|https?://")
 # DOCUMENTS the marker syntax -- "Parse the `TODO:` prefix" -- must not fail
 # the build. The span is blanked rather than deleted, so every offset after
 # it still points at the same column.
-CODE_SPAN_RE = re.compile(r"(`+)(?:.*?)\1")
+# One pattern for both blankers. It was two, and the exact-run guard reached
+# only the wrapped one until this round.
+#
+# A BACKSLASH-ESCAPED backtick is not an OPENER: Rustdoc renders "\\`literal"
+# and a later "`" as literal text, and treating the escaped tick as an opener
+# blanked the marker between them. The lookbehind is single-character, so an
+# escaped BACKSLASH before a real opener ("\\\\`") is refused as well; that
+# costs a blank this tree never needs, and errs toward reporting.
+#
+# The CLOSER carries no such guard, and must not. Backslash escapes do not
+# apply inside a code span, so "`\\`" is a span holding one backslash --
+# checked against rustdoc, which renders it as <code>\\</code>. Guarding the
+# closer left that span open and merged the sentences after it.
 
 
 # The same span, allowed to wrap. Rustdoc renders "`literal" and "TODO:
@@ -319,14 +331,25 @@ CODE_SPAN_RE = re.compile(r"(`+)(?:.*?)\1")
 # "``" pair -- against its first tick, and once that was guarded, against its
 # second -- blanking text CommonMark leaves literal and taking an absolute
 # rule off it. A run is only a delimiter when no backtick abuts it.
-WRAPPED_SPAN_RE = re.compile(
-    r"(?<!`)(`+)(?:(?!\n[ \t]*\n).)*?(?<!`)\1(?!`)", re.S
+CODE_SPAN_RE = re.compile(
+    r"(?<!`)(?<!\\)(`+)(?:(?!\n[ \t]*\n).)*?(?<!`)\1(?!`)", re.S
 )
 
 
 def blank_code_spans(text: str) -> str:
     """`text` with each inline code span replaced by spaces of equal width."""
     return CODE_SPAN_RE.sub(lambda m: " " * len(m.group(0)), text)
+
+
+def mask_code_spans(text: str) -> str:
+    """`text` with each code span replaced by filler of the same width.
+
+    Filler, not spaces. This copy is only used to FIND sentence boundaries,
+    and blanking a span to whitespace lets the separator's own `\\s+` swallow
+    it -- so a sentence that OPENS with a code span loses it, and reports one
+    word short with the span missing from its text.
+    """
+    return CODE_SPAN_RE.sub(lambda m: re.sub(r"[^\n]", "x", m.group(0)), text)
 
 
 def blank_spans_across(lines: list[str]) -> list[str]:
@@ -338,7 +361,7 @@ def blank_spans_across(lines: list[str]) -> list[str]:
     backtick blanks nothing, which is also what CommonMark does with it.
     """
     joined = "\n".join(lines)
-    blanked = WRAPPED_SPAN_RE.sub(
+    blanked = CODE_SPAN_RE.sub(
         lambda m: re.sub(r"[^\n]", " ", m.group(0)), joined
     )
     return blanked.split("\n")
@@ -2029,11 +2052,20 @@ def prose_units(pieces: list[Piece]) -> list[tuple[int, str]]:
     return units
 
 
-def split_sentences(unit: str):
+def split_sentences(unit: str, boundaries: str | None = None):
     """(offset, sentence) pairs. `re.split` drops the offsets, and the offset
-    is what maps a sentence back to the line it was written on."""
+    is what maps a sentence back to the line it was written on.
+
+    `boundaries` is where the full stops are LOOKED FOR, when that is not the
+    text itself. A period inside a code span is not a sentence end -- Rustdoc
+    renders "`foo. not sure why`" as one span -- and splitting there left a
+    fragment that CH003 read as deliberation. The sentence returned is always
+    sliced from `unit`, so the text reported and the words counted are the
+    ones the author wrote.
+    """
+    source = unit if boundaries is None else boundaries
     start = 0
-    for match in SENTENCE_SPLIT_RE.finditer(unit):
+    for match in SENTENCE_SPLIT_RE.finditer(source):
         yield start, unit[start:match.start()]
         start = match.end()
     yield start, unit[start:]
@@ -2059,7 +2091,7 @@ def check_prose_rules(path: str, pieces: list[Piece]) -> list[Finding]:
     """
     findings = []
     for _, unit, spans in prose_units(pieces):
-        for offset, sentence in split_sentences(unit):
+        for offset, sentence in split_sentences(unit, mask_code_spans(unit)):
             sentence = sentence.strip()
             if not sentence:
                 continue
@@ -3357,6 +3389,27 @@ RULE_TESTS = [
         "pub struct C;\n",
         {("CH002", 4)},
         "a span cannot reach out of its own comment",
+    ),
+    (
+        "/// Parse the `foo. not sure why` token.\n",
+        set(),
+        "a period inside a code span is not a sentence end",
+    ),
+    (
+        "// End here. `%` is the next sentence and it stays whole.\n",
+        set(),
+        "and a sentence that opens with a span keeps it",
+    ),
+    (
+        "/// Explain the \\`literal\n"
+        "/// TODO: issue required` syntax.\n",
+        {("CH002", 2)},
+        "an escaped backtick opens no span",
+    ),
+    (
+        "/// The URL parser treats `\\` as a path separator. TODO: issue required\n",
+        {("CH002", 1)},
+        "but a backslash inside one does not stop it closing",
     ),
 ]
 
