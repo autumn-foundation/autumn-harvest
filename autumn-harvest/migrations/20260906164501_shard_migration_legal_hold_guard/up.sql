@@ -29,3 +29,42 @@ ALTER TABLE harvest_shard_migrations
 -- gives the history guard.
 ALTER TABLE harvest_shard_migrations
     ADD COLUMN IF NOT EXISTS legal_hold_verified BOOLEAN NOT NULL DEFAULT FALSE;
+
+-- `begin_migration` resets both columns above when it reopens a settled
+-- (`DONE`/`ABORTED`) record for another attempt. That reset only runs when
+-- the code executing `begin_migration` knows these columns exist. During a
+-- rolling deployment, a PARENT-version process is schema-compatible and can
+-- still perform the reopening -- its `ON CONFLICT` update predates this
+-- migration and never touches either column, no matter how new the code is
+-- that later runs `verify_target_copy` or `commit_cutover` against the same
+-- row. Enforcing the reset only in application code is therefore not
+-- version-independent: it protects a reopening driven by new code, not one
+-- driven by old code against a database that already carries this migration.
+--
+-- A trigger closes that gap the same way the column additions themselves are
+-- closed against old code: at the schema, not the call site. Any UPDATE that
+-- carries this row's `phase` from a settled state back to `PENDING` -- the
+-- one transition `begin_migration` performs, regardless of which binary
+-- version issued it -- clears both columns as part of that same statement.
+-- `SET search_path` pins name resolution against a hostile search_path on
+-- the connection that fires the trigger.
+CREATE OR REPLACE FUNCTION harvest_shard_migrations_reset_hold_verification()
+RETURNS TRIGGER
+LANGUAGE plpgsql
+SET search_path = pg_catalog
+AS $$
+BEGIN
+    IF NEW.phase = 'PENDING' AND OLD.phase IN ('DONE', 'ABORTED') THEN
+        NEW.legal_hold_verified := FALSE;
+        NEW.verified_legal_hold_set_at := NULL;
+    END IF;
+    RETURN NEW;
+END;
+$$;
+
+DROP TRIGGER IF EXISTS harvest_shard_migrations_reset_hold_verification_trigger
+    ON harvest_shard_migrations;
+CREATE TRIGGER harvest_shard_migrations_reset_hold_verification_trigger
+    BEFORE UPDATE ON harvest_shard_migrations
+    FOR EACH ROW
+    EXECUTE FUNCTION harvest_shard_migrations_reset_hold_verification();

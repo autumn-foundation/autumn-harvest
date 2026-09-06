@@ -2872,3 +2872,70 @@ struct HoldMarkerRow {
     #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Timestamptz>)]
     verified_legal_hold_set_at: Option<chrono::DateTime<Utc>>,
 }
+
+#[tokio::test]
+async fn the_reset_trigger_clears_the_stale_hold_marker_even_when_the_caller_does_not() {
+    // Codex round 4 on PR #1406: `begin_migration`'s explicit reset only
+    // fires when the CODE PERFORMING THE REOPEN knows these columns exist. A
+    // parent-version process is schema-compatible and can still reopen a row
+    // through its OWN, older `ON CONFLICT` update, one that never mentions
+    // `legal_hold_verified`/`verified_legal_hold_set_at` at all. The
+    // application-level reset in `begin_migration` cannot protect against a
+    // caller that predates it. Only a trigger on the phase transition itself
+    // is independent of which binary performed the reopen. Prove that
+    // independence directly: reopen the row with a raw UPDATE shaped exactly
+    // like the OLD `begin_migration` (the phase transition alone, no mention
+    // of either hold column), and require the columns to clear anyway.
+    let shards = setup_two_shards().await;
+    let exec_id = quiescent_fixture(&shards, "old-code-reopen-clears-hold-marker").await;
+    let mut source = shards.source().await;
+
+    diesel::sql_query(
+        "INSERT INTO harvest_shard_migrations \
+             (execution_id, source_shard, target_shard, phase, \
+              legal_hold_verified, verified_legal_hold_set_at) \
+         VALUES ($1, $2, $3, 'DONE', TRUE, NULL)",
+    )
+    .bind::<diesel::sql_types::Uuid, _>(exec_id.as_uuid())
+    .bind::<diesel::sql_types::Integer, _>(SOURCE.as_i32())
+    .bind::<diesel::sql_types::Integer, _>(TARGET.as_i32())
+    .execute(&mut source)
+    .await
+    .expect("seed a settled record with a stale hold marker");
+
+    // Exactly the pre-#1317 `begin_migration` UPDATE: phase and the
+    // pre-existing verification fields, nothing naming either hold column.
+    diesel::sql_query(
+        "UPDATE harvest_shard_migrations \
+            SET phase = 'PENDING', target_shard = $2, source_shard = $3, \
+                verified_fingerprint = NULL, abort_reason = NULL, \
+                attempts = 0, last_error = NULL, updated_at = NOW() \
+          WHERE execution_id = $1 AND phase IN ('DONE', 'ABORTED')",
+    )
+    .bind::<diesel::sql_types::Uuid, _>(exec_id.as_uuid())
+    .bind::<diesel::sql_types::Integer, _>(SOURCE.as_i32())
+    .bind::<diesel::sql_types::Integer, _>(TARGET.as_i32())
+    .execute(&mut source)
+    .await
+    .expect("reopen with an old-shaped UPDATE that never names either hold column");
+
+    let row: HoldMarkerRow = diesel::sql_query(
+        "SELECT legal_hold_verified, verified_legal_hold_set_at \
+           FROM harvest_shard_migrations WHERE execution_id = $1",
+    )
+    .bind::<diesel::sql_types::Uuid, _>(exec_id.as_uuid())
+    .get_result(&mut source)
+    .await
+    .expect("load the reopened record");
+
+    assert!(
+        !row.legal_hold_verified,
+        "the trigger must clear the stale verification flag even when the \
+         reopening UPDATE never names it"
+    );
+    assert_eq!(
+        row.verified_legal_hold_set_at, None,
+        "the trigger must clear the stale hold stamp even when the \
+         reopening UPDATE never names it"
+    );
+}
