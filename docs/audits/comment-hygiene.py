@@ -312,14 +312,13 @@ TODO_REF_RE = re.compile(r"#\d+|https?://")
 #
 # A BACKSLASH-ESCAPED backtick is not an OPENER: Rustdoc renders "\\`literal"
 # and a later "`" as literal text, and treating the escaped tick as an opener
-# blanked the marker between them. The lookbehind is single-character, so an
-# escaped BACKSLASH before a real opener ("\\\\`") is refused as well; that
-# costs a blank this tree never needs, and errs toward reporting.
+# blanked the marker between them. Escapes are resolved BEFORE the spans are
+# found, rather than guarded for in the pattern, so the parity works out.
 #
-# The CLOSER carries no such guard, and must not. Backslash escapes do not
-# apply inside a code span, so "`\\`" is a span holding one backslash --
-# checked against rustdoc, which renders it as <code>\\</code>. Guarding the
-# closer left that span open and merged the sentences after it.
+# Inside a span there are no escapes at all: "`\\`" is a span holding one
+# backslash -- checked against rustdoc, which renders it as <code>\\</code>.
+# Masking escapes first gets that right too, because the mask never spans a
+# delimiter it did not consume.
 
 
 # The same span, allowed to wrap. Rustdoc renders "`literal" and "TODO:
@@ -331,14 +330,78 @@ TODO_REF_RE = re.compile(r"#\d+|https?://")
 # "``" pair -- against its first tick, and once that was guarded, against its
 # second -- blanking text CommonMark leaves literal and taking an absolute
 # rule off it. A run is only a delimiter when no backtick abuts it.
-CODE_SPAN_RE = re.compile(
-    r"(?<!`)(?<!\\)(`+)(?:(?!\n[ \t]*\n).)*?(?<!`)\1(?!`)", re.S
-)
+BACKTICK_RUN_RE = re.compile(r"`+")
+BLANK_LINE_RE = re.compile(r"\n[ \t]*\n")
+
+
+def escaped_backticks(text: str) -> set[int]:
+    """Offsets of the backticks an ODD run of backslashes escapes.
+
+    Parity, counted left to right, because a lookbehind cannot: one backslash
+    escapes the backtick after it, two escape each other and leave the
+    backtick to open a span as usual. Rustdoc renders "\\\\`marker`" with the
+    marker as code, and a single-character lookbehind refused that opener.
+    """
+    escaped, index = set(), 0
+    while index < len(text):
+        if text[index] != "\\":
+            index += 1
+            continue
+        run = index
+        while index < len(text) and text[index] == "\\":
+            index += 1
+        if (index - run) % 2 and index < len(text) and text[index] == "`":
+            escaped.add(index)
+            index += 1
+    return escaped
+
+
+def code_span_ranges(text: str) -> list[tuple[int, int]]:
+    """Where `text`'s inline code spans are.
+
+    Scanned rather than matched, because the rule has three parts a single
+    pattern kept getting wrong. A span's delimiter runs must be EXACTLY the
+    same length. An escaped backtick cannot OPEN one -- but inside an open
+    span there are no escapes at all, so "`\\`" is a span holding one
+    backslash, which is what Rustdoc renders. And a blank line ends the
+    paragraph, so no span reaches across one.
+    """
+    escaped = escaped_backticks(text)
+    runs = [match.span() for match in BACKTICK_RUN_RE.finditer(text)]
+    ranges = []
+    index = 0
+    while index < len(runs):
+        start, end = runs[index]
+        if start not in escaped:
+            for probe in range(index + 1, len(runs)):
+                closer = runs[probe]
+                if closer[1] - closer[0] != end - start:
+                    continue
+                if BLANK_LINE_RE.search(text, end, closer[0]):
+                    break
+                ranges.append((start, closer[1]))
+                index = probe
+                break
+        index += 1
+    return ranges
+
+
+def replace_spans(text: str, filler: str) -> str:
+    """`text` with each code span's characters replaced by `filler`.
+
+    Newlines survive, so a multi-line text splits back into the same lines.
+    """
+    out = list(text)
+    for start, end in code_span_ranges(text):
+        for index in range(start, end):
+            if out[index] != "\n":
+                out[index] = filler
+    return "".join(out)
 
 
 def blank_code_spans(text: str) -> str:
     """`text` with each inline code span replaced by spaces of equal width."""
-    return CODE_SPAN_RE.sub(lambda m: " " * len(m.group(0)), text)
+    return replace_spans(text, " ")
 
 
 def mask_code_spans(text: str) -> str:
@@ -349,7 +412,7 @@ def mask_code_spans(text: str) -> str:
     it -- so a sentence that OPENS with a code span loses it, and reports one
     word short with the span missing from its text.
     """
-    return CODE_SPAN_RE.sub(lambda m: re.sub(r"[^\n]", "x", m.group(0)), text)
+    return replace_spans(text, "x")
 
 
 def blank_spans_across(lines: list[str]) -> list[str]:
@@ -360,11 +423,7 @@ def blank_spans_across(lines: list[str]) -> list[str]:
     survive, so the result splits back into the same lines. An UNMATCHED
     backtick blanks nothing, which is also what CommonMark does with it.
     """
-    joined = "\n".join(lines)
-    blanked = CODE_SPAN_RE.sub(
-        lambda m: re.sub(r"[^\n]", " ", m.group(0)), joined
-    )
-    return blanked.split("\n")
+    return blank_code_spans("\n".join(lines)).split("\n")
 
 # First-person deliberation. "Actually" must open a sentence: mid-sentence it is
 # an ordinary adverb ("gated on THIS claimant actually, durably marking the
@@ -3410,6 +3469,11 @@ RULE_TESTS = [
         "/// The URL parser treats `\\` as a path separator. TODO: issue required\n",
         {("CH002", 1)},
         "but a backslash inside one does not stop it closing",
+    ),
+    (
+        "/// Explain the \\\\`TODO: marker` syntax.\n",
+        set(),
+        "two backslashes escape each other, so the span opens",
     ),
 ]
 

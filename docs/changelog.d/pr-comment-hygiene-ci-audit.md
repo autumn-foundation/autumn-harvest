@@ -1772,3 +1772,34 @@ Backslash escapes do not apply inside a code span.
 Corpus effect: 19825 to 19860, all CH007. Sentences that used to be cut at a
 period inside a span are now measured whole, so several fragments become one
 longer sentence. The ratchet recomputes both sides and stays clean.
+
+### Round fifty-seven — parity, and a scanner instead of a pattern
+
+One finding, and it is the caveat round fifty-six wrote down and shipped
+anyway: two backslashes escape each other, so the backtick after them still
+opens a code span. Rustdoc renders `` \\`TODO: marker` `` with the marker as
+code; the single-character lookbehind refused that opener and CH002 failed the
+build on it.
+
+Parity cannot be done with a lookbehind, and the first attempt — masking every
+`\x` escape before matching — was wrong in the other direction within a
+minute of measuring. It consumed the closing backtick of `` `\` ``, which is a
+span holding one backslash, and thirteen sentences in this tree merged with
+the ones after them.
+
+So the span finder is a scanner now, not a pattern. Three rules that a single
+regex kept getting wrong, each written out: the two delimiter runs must be
+exactly equal; an escaped backtick cannot OPEN a span, while inside an open one
+there are no escapes at all; and a blank line ends the paragraph, so no span
+crosses one. Rounds fifty-five, fifty-six and fifty-seven were all one of those
+three, and each pattern-level fix broke another.
+
+**This is the third round running where the review's finding was a limitation
+I had already written into a comment.** Round fifty-four noted the whole-file
+join was "rare"; round fifty-six noted the escaped-backslash caveat "errs
+toward reporting, and this tree never writes it". Both were Tier A defects one
+round later. A limitation worth documenting is worth implementing, and if it
+genuinely is not worth implementing it belongs in the follow-up issue, not in
+a comment beside the code that has it.
+
+Corpus effect: none.
