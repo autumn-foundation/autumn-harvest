@@ -234,6 +234,45 @@
 -- (`CONCURRENTLY` can leave an INVALID index behind on failure/cancellation --
 -- check `pg_index.indisvalid` for the index's oid and `DROP INDEX
 -- CONCURRENTLY` + retry if it is false before relying on it, on either path.)
-CREATE INDEX IF NOT EXISTS idx_harvest_events_activity_started_lookup
-    ON harvest_events (workflow_exec_id, (event_data #>> '{data,activity_id}'), timestamp)
-    WHERE event_type = 'ActivityStarted';
+--
+-- `IF NOT EXISTS` alone (Codex review, PR #1381, round 11) accepts a
+-- same-named index with a DIFFERENT definition -- an operator's earlier
+-- out-of-band build against a stale or mistaken copy of this recipe, for
+-- example. Silently accepting it would report this migration as applied
+-- without ever installing the intended lookup index, and would make
+-- `down.sql`'s `DROP INDEX IF EXISTS` drop an unrelated index instead. A
+-- same-named index that DOES match but is left INVALID is not safe to
+-- accept silently either: it means the out-of-band build never finished,
+-- so this statement would otherwise report success over a non-functional
+-- index. Verified against a toy table (all four cases): no existing index
+-- builds fresh; a matching, valid one is silently accepted, unchanged; a
+-- mismatched or an invalid one aborts the migration with a clear error
+-- instead of completing over it.
+DO $$
+DECLARE
+    existing_index_oid oid;
+    existing_def text;
+    existing_valid boolean;
+BEGIN
+    SELECT pg_class.oid, pg_get_indexdef(pg_class.oid), pg_index.indisvalid
+      INTO existing_index_oid, existing_def, existing_valid
+    FROM pg_class
+    JOIN pg_index ON pg_index.indexrelid = pg_class.oid
+    WHERE pg_class.relname = 'idx_harvest_events_activity_started_lookup'
+      AND pg_class.relkind IN ('i', 'I');
+
+    IF existing_index_oid IS NULL THEN
+        CREATE INDEX idx_harvest_events_activity_started_lookup
+            ON harvest_events (workflow_exec_id, (event_data #>> '{data,activity_id}'), timestamp)
+            WHERE event_type = 'ActivityStarted';
+    ELSIF regexp_replace(existing_def, '^CREATE INDEX \S+ ON \S+ ', '') <>
+          'USING btree (workflow_exec_id, ((event_data #>> ''{data,activity_id}''::text[])), "timestamp") WHERE (event_type = ''ActivityStarted''::text)'
+    THEN
+        RAISE EXCEPTION
+            'idx_harvest_events_activity_started_lookup already exists with an unexpected definition -- resolve the name collision (rename or drop the existing index) before retrying this migration: %',
+            existing_def;
+    ELSIF NOT existing_valid THEN
+        RAISE EXCEPTION
+            'idx_harvest_events_activity_started_lookup already exists with the expected definition but is INVALID -- DROP INDEX CONCURRENTLY and retry the out-of-band build before retrying this migration';
+    END IF;
+END $$;
