@@ -3785,7 +3785,7 @@ def diff_context(base_ref: str) -> tuple[str, set[str], dict[str, str]] | None:
     without that, every legacy finding in it looks new and an ordinary module
     rename fails CI over debt it did not introduce.
     """
-    def git(*args: str) -> str | None:
+    def git(*args: str, raw: bool = False) -> str | None:
         try:
             done = subprocess.run(
                 ("git", *args),
@@ -3796,27 +3796,57 @@ def diff_context(base_ref: str) -> tuple[str, set[str], dict[str, str]] | None:
             )
         except (OSError, ValueError):
             return None
-        return done.stdout.strip() if done.returncode == 0 else None
+        if done.returncode != 0:
+            return None
+        # `raw` keeps the NUL terminators that `-z` writes. Stripping is for
+        # a sha, not for a record separator.
+        return done.stdout if raw else done.stdout.strip()
 
     merge_base = git("merge-base", base_ref, "HEAD")
     if not merge_base:
         return None
-    listing = git("diff", "--name-status", "--find-renames", merge_base, "HEAD")
+    listing = git(
+        "diff", "-z", "--name-status", "--find-renames", merge_base, "HEAD", raw=True
+    )
     if listing is None:
         return None
+    changed, renames = parse_name_status(listing)
+    return merge_base, changed, renames
 
+
+def parse_name_status(listing: str) -> tuple[set[str], dict[str, str]]:
+    """The paths in a `git diff -z --name-status` listing, and its renames.
+
+    `-z`, and not the default, because git QUOTES a path it cannot write
+    plainly: a name with a non-ASCII character, a tab or a newline comes back
+    as `"src/\\303\\251.rs"`, quotes and octal escapes included. That string
+    does not end in `.rs`, so the file left the Tier B scope silently and the
+    run reported "gating 0 changed .rs file(s)" and passed. A ratchet that
+    quietly stops watching a file is worse than one that fails.
+
+    `-z` writes every field raw and NUL-terminated, so there is nothing to
+    unquote. The records are `STATUS\\0path\\0`, and `R100\\0old\\0new\\0`
+    for a rename or a copy -- status first, then one path or two.
+    """
+    fields = listing.split("\0")
     changed: set[str] = set()
     renames: dict[str, str] = {}
-    for row in listing.split("\n"):
-        if not row.strip():
+    index = 0
+    while index < len(fields):
+        status = fields[index]
+        if not status:
+            index += 1
             continue
-        fields = row.split("\t")
-        if fields[0].startswith("R") and len(fields) >= 3:
-            changed.add(fields[2])
-            renames[fields[2]] = fields[1]
-        elif len(fields) >= 2:
-            changed.add(fields[1])
-    return merge_base, changed, renames
+        if status[0] in "RC" and index + 2 < len(fields):
+            changed.add(fields[index + 2])
+            renames[fields[index + 2]] = fields[index + 1]
+            index += 3
+        elif index + 1 < len(fields):
+            changed.add(fields[index + 1])
+            index += 2
+        else:
+            break
+    return changed, renames
 
 
 def index_findings(findings: list[Finding]) -> dict:
@@ -6969,6 +6999,19 @@ def self_test() -> int:
             print(f"         line {w.lineno}: {w.message}")
     else:
         print("  [ok  ] the source compiles with no escape-sequence warning")
+
+    # The diff parser, which no fixture covered until a reviewer found that a
+    # non-ASCII path left the Tier B scope in silence. Real `git diff -z`
+    # output, captured from a scratch repository holding both shapes.
+    listing = "A\0src/\u00e9.rs\0R100\0src/a.rs\0src/\u00f1.rs\0M\0src/b.rs\0"
+    changed, renames = parse_name_status(listing)
+    want_changed = {"src/\u00e9.rs", "src/\u00f1.rs", "src/b.rs"}
+    want_renames = {"src/\u00f1.rs": "src/a.rs"}
+    ok = changed == want_changed and renames == want_renames
+    failures += 0 if ok else 1
+    print(f"  [{'ok  ' if ok else 'FAIL'}] a NUL-delimited diff keeps a non-ASCII path")
+    if not ok:
+        print(f"         changed {sorted(changed)!r}\n         renames {renames!r}")
 
     missed = [c for c in CONTRACTIONS_EXPECTED if not CONTRACTION_RE.search(f"The row {c} ready.")]
     wrong = [c for c in CONTRACTIONS_EXCLUDED if CONTRACTION_RE.search(f"The row {c} ready.")]

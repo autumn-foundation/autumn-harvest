@@ -3823,3 +3823,30 @@ Corpus effect: none, at 19311. Three fixtures.
 On timing: both scans are linear, measured at five sizes with the best of
 three runs each. A single sample at 40000 characters read 4.1 ms and
 looked superlinear; it was noise.
+
+Round 127 -- the ratchet stopped watching a file and said nothing.
+
+A changed path with a non-ASCII character, a tab or a newline left the
+Tier B scope silently. Git QUOTES a path it cannot write plainly, so
+`src/é.rs` arrives as `"src/\303\251.rs"` -- quotes and octal escapes
+included -- and that string does not end in `.rs`.
+
+Proved against real git output rather than argued. In a scratch
+repository holding an added `src/é.rs` and a rename to `src/ñ.rs`, the
+old parser returns two paths and NEITHER ends in `.rs`; the new one
+returns both correctly. The rename target was quoted too, so a rename to
+such a name was dropped as well, which the report did not mention.
+
+`-z` writes every field raw and NUL-terminated, so there is nothing to
+unquote: `STATUS\0path\0`, and `R100\0old\0new\0` for a rename or a copy.
+
+The parsing is its own function now, `parse_name_status`, so it can carry
+a fixture -- the round one hundred and twenty-five lesson, applied before
+a reviewer has to teach it twice. The fixture is real `-z` output
+captured from that scratch repository, holding both record shapes.
+
+A ratchet that quietly stops watching a file is worse than one that
+fails, which is what makes this worth more than the regex rounds around
+it.
+
+Corpus effect: none. Still gating the same 22 changed files.
