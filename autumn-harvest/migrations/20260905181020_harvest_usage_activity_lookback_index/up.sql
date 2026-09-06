@@ -113,6 +113,21 @@
 --     AND ic.relname LIKE 'idx_%_activity_started_lookup'
 --     AND NOT i.indisvalid;
 --   -- review and run the generated statements, THEN generate the builds:
+-- Name and `indisvalid` alone are not enough either (Codex review, PR
+-- #1381, round 7): they still accept a same-named index with a DIFFERENT
+-- definition -- different columns, expression, predicate, collation or
+-- opclass. Postgres attaches a leaf index to the new parent index by
+-- DEFINITION, not by name, so this recipe's own name is only a label we
+-- chose; a same-named leaf index with a different body would never be
+-- attached at the parent step regardless. Verified against a toy
+-- partitioned table: `pg_get_indexdef()` on two indexes built from an
+-- identical column list, expression and predicate returns byte-identical
+-- text after the leading `CREATE INDEX name ON schema.table` clause, even
+-- across different names and tables, so that suffix is a valid structural
+-- fingerprint. The comparison string below is this migration's own
+-- `idx_harvest_events_activity_started_lookup` fingerprint, read via
+-- `pg_get_indexdef()` against the already-applied unpartitioned index:
+--
 --   SELECT format(
 --       'CREATE INDEX CONCURRENTLY IF NOT EXISTS %I ON %I ' ||
 --       '(workflow_exec_id, (event_data #>> ''{data,activity_id}''), timestamp) ' ||
@@ -130,7 +145,21 @@
 --          WHERE i.indrelid = child.oid
 --            AND ic.relname = 'idx_' || child.relname || '_activity_started_lookup'
 --            AND i.indisvalid
+--            AND regexp_replace(pg_get_indexdef(i.indexrelid), '^CREATE INDEX \S+ ON \S+ ', '')
+--                = 'USING btree (workflow_exec_id, ((event_data #>> ''{data,activity_id}''::text[])), "timestamp") WHERE (event_type = ''ActivityStarted''::text)'
 --     );
+--
+-- A leaf that fails this stricter check for a reason OTHER than a missing
+-- index -- a same-named, differently-defined index already sits there --
+-- cannot be fixed by the build statement above: `CREATE INDEX CONCURRENTLY
+-- IF NOT EXISTS` skips silently on a name collision, regardless of whether
+-- the existing definition matches (verified: no error, just a NOTICE, and
+-- the mismatched index is left untouched). The convergence loop below
+-- therefore never converges for that one leaf -- it keeps reappearing in
+-- the build generator's output every pass. That stuck loop is the intended
+-- outcome: it surfaces the conflict to the operator instead of silently
+-- building the wrong index or skipping the leaf outright. Resolve it by
+-- hand -- rename or drop the conflicting index -- before continuing.
 --   -- review and run the generated statements, THEN:
 --   CREATE INDEX IF NOT EXISTS idx_harvest_events_activity_started_lookup
 --       ON harvest_events (workflow_exec_id, (event_data #>> '{data,activity_id}'), timestamp)
