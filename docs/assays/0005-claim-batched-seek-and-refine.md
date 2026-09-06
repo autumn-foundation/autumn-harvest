@@ -74,6 +74,8 @@ same non-adversarial fixture generator). New for this assay:
   and the next batch's keyset cursor, not rescanned per reference), a
   second batch fetched only when the first returns no eligible row.
 - `forced_index_diagnostic.sql` — added post-review; see below.
+- `forced_index_no_tiebreak_diagnostic.sql` — added post-review (round 2);
+  see below.
 - `results/run.log`, `results/*.txt`, `results/*.explain.txt` — every run
   this report's numbers are drawn from.
 
@@ -200,8 +202,8 @@ half of the reviewer's own proposed remedy, not a re-registration.
    incur. (Ledger #4's `claim_deferred()` has the identical structure and
    the identical gap in its own wall-clock numbers — not corrected here,
    since #4 is closed and this note only applies going forward.) This does
-   not change L4/L5's PASS on wall-clock, since the margins (35.7ms vs.
-   ≤100ms, 72.8ms vs. ≤400ms) are wide enough that per-batch network latency
+   not change L4/L5's PASS on wall-clock, since the margins (about 35ms vs.
+   ≤100ms, about 72ms vs. ≤400ms) are wide enough that per-batch network latency
    at any realistic value would not plausibly erase them — but it does mean
    this assay does not independently establish that.
 
@@ -216,60 +218,117 @@ half of the reviewer's own proposed remedy, not a re-registration.
    timed section, so `results/run.log` is regenerated, labeled, and current
    on every invocation.
 
+**Round 2 (same PR, next review pass on the corrected commit):**
+
+5. **Correctness bug (P1): the winner check used a stale batch-wide
+   snapshot, not the production path's per-candidate authoritative
+   recheck.** The corrected `claim_batched.sql` above still picked its
+   winner from `running_counts`, a `MATERIALIZED` CTE computed once per
+   batch from a pre-claim read — the same shape ledger #3's control query
+   uses, but without the production path's `pg_try_advisory_xact_lock`
+   serialization (`autumn-harvest/src/queue.rs:750-770`) or ledger #4's own
+   `claim_deferred()`, which has that lock. Two concurrent callers landing
+   on *different* candidates sharing a concurrency key could each read the
+   same stale count and both commit, exceeding the cap — the exact race the
+   advisory lock exists to prevent. This is a correctness gap, not (only)
+   the "unmeasured lock-contention performance" the pre-registration's
+   stubs list scoped it as. **Fixed:** `claim_batched.sql` now fetches a
+   batch via one query (unchanged cost), then walks the already-fetched,
+   already-locked rows procedurally — for each candidate with a
+   concurrency key, `pg_try_advisory_xact_lock` plus a fresh `COUNT`
+   against `harvest_task_queue` directly (the identical mechanism, and the
+   identical isolated query shape, ledger #4 already measured at ~1 buffer
+   regardless of key cardinality), moving to the next already-fetched
+   candidate on a failed lock or a failed count — no new backlog-wide
+   query either way. Re-run after the fix reproduces identical claimed
+   rows and batch counts (L4 still 2, L5 still 5) — the snapshot-vs-
+   authoritative distinction is invisible in a single-session apparatus by
+   construction (nothing else is racing), which is exactly why it took a
+   second review pass, not this apparatus's own testing, to catch.
+   `batch_claim.sql`'s isolated `EXPLAIN` no longer models the recheck at
+   all (it was modeling the now-removed, incorrect snapshot mechanism) —
+   it measures only the fetch step; the recheck's per-candidate cost is
+   ledger #4's own already-measured number, and its contribution to
+   end-to-end cost is visible directly in this section's `claim_batched()`
+   wall-clock figures below.
+
+6. **Rebuttal (P2, not accepted): the `id` tiebreak was proposed as the
+   actual explanation for the `Sort` node, not backlog depth or the
+   multi-queue binding.** A reviewer suggested that `finding 2`'s "Index
+   Scan, still `actual rows=10000`" result was an artifact of *this
+   assay's own* `id ASC` tiebreak — absent from `idx_harvest_tq_poll` and
+   from `docs/performance.md`'s #1177 baseline's `ORDER BY` — forcing a
+   sort of the (large, tied) backlog by `id`, and that flagging an
+   unresolved #1177-baseline discrepancy was therefore a false lead.
+   **Checked directly, not accepted:** `forced_index_no_tiebreak_diagnostic.sql`
+   re-runs the identical forced-index query with the `id` tiebreak removed
+   — byte-for-byte #1177's own `ORDER BY priority DESC, scheduled_at ASC`,
+   same `enable_seqscan`/`enable_bitmapscan` bias. The `Sort` node and
+   `actual rows=10000` both persist, essentially unchanged (582 buffers
+   vs. 585 with the tiebreak) — directly refuting the proposed mechanism.
+   The discrepancy against `docs/performance.md`'s own #1177 baseline
+   therefore stands as unresolved by this assay, as originally reported;
+   this round only adds a direct test ruling out one specific candidate
+   explanation for it, which a future depth-varying or binding-varying
+   re-charter would otherwise have had to rule out itself.
+
 ## 📊 Assay
 
 All measurements from `docs/assays/apparatus/0005-claim-batched-seek-and-refine/results/`
-(`run.log`, `*.txt`, `*.explain.txt`), from the apparatus's second run (post
-the corrections above), one continuous psql session.
+(`run.log`, `*.txt`, `*.explain.txt`), from the apparatus's third run (post
+both rounds of corrections above), one continuous psql session.
 
 **Buffers (L1, idle: 10,000 backlog, 4 queues, 256 keys, 0 RUNNING):**
 
 | | buffers |
 |:--|--:|
 | control (committed fix) | 132 |
-| candidate (`batch_claim.sql`, B=50) | 181 |
-| candidate, index forced (`forced_index_diagnostic.sql`) | 585 |
+| candidate fetch step (`batch_claim.sql`, B=50) | 180 |
+| candidate fetch, index forced (`forced_index_diagnostic.sql`) | 585 |
+| candidate fetch, index forced, no `id` tiebreak (rebuttal check) | 582 |
 
 **Wall-clock, raw `\timing` (no `EXPLAIN` instrumentation on either side, matching #4's methodology):**
 
 | scenario | keys | running | control (`control_raw.sql`) | candidate (`claim_batched()`) | batches |
 |:--|--:|--:|--:|--:|--:|
-| idle_256 | 256 | 0 | 6.699 ms | 9.220 ms | 1 |
-| hot_256 | 256 | 2,000 | 144.105 ms | 10.630 ms | 1 |
-| hot_5000 | 5,000 | 2,000 | 1,058.862 ms | 6.336 ms | 1 |
-| **l4_adversarial (50 poison)** | 256 | 20 | — (n/a) | **35.723 ms** | **2** |
-| **l5_adversarial (200 poison)** | 256 | 20 | — (n/a) | **72.759 ms** | **5** |
+| idle_256 | 256 | 0 | 6.999 ms | 8.876 ms | 1 |
+| hot_256 | 256 | 2,000 | 150.153 ms | 8.370 ms | 1 |
+| hot_5000 | 5,000 | 2,000 | 1,049.894 ms | 5.716 ms | 1 |
+| **l4_adversarial (50 poison)** | 256 | 20 | — (n/a) | **34.876 ms** | **2** |
+| **l5_adversarial (200 poison)** | 256 | 20 | — (n/a) | **71.653 ms** | **5** |
 
 (Wall-clock figures carry run-to-run noise on this box, same as every prior
 ledger entry — e.g. `hot_256` control ranged 144-222ms across this assay's
-two runs. Read them for order of magnitude relative to the same run's own
+three runs. Read them for order of magnitude relative to the same run's own
 control, not as exactly reproducible absolutes.)
 
 Equivalence check: candidate claimed the identical row id to control in
 every non-adversarial scenario (`results/equivalence_idle_256.txt`:
 `54293`/`54293`; `equivalence_hot_256.txt`: `64293`/`64293`; hot_5000's two
 raw outputs both read `22001`). Correctness in both adversarial scenarios
-was re-confirmed after the tiebreaker fix: same claimed row, same batch
-counts, in both L4 and L5.
+was re-confirmed after both the tiebreaker fix and the authoritative-recheck
+fix: same claimed row, same batch counts (L4: 2, L5: 5), across all three
+runs of this apparatus.
 
 **Against the lines:**
 
-- **L1 — PASS.** 181 buffers vs. ≤300 — 1.66x the committed fix's 132, well
+- **L1 — PASS.** 180 buffers vs. ≤300 — 1.36x the committed fix's 132, well
   inside the line and two orders of magnitude below ledger #3's 10,130-buffer
   kill. (See "Post-review corrections" above for what this number does and
   does not establish about *why* it's cheap.)
-- **L2 — PASS, decisively.** 6.336ms vs. ≤160ms — **25.2x** inside the line,
-  **167.1x** faster than this run's own control (1,058.862ms). The
-  recheck CTE's cost stays independent of global key cardinality (5,000
-  here vs. 256 at L1/L3) because it only ever touches the ≤50 distinct keys
-  actually present in the fetched batch — the one causal claim this
-  correction round left intact, since it concerns the recheck, not the
-  candidate fetch.
-- **L3 — PASS, decisively.** 10.630ms vs. ≤288.21ms (2x control's
-  144.105ms) — **13.6x faster than control outright**, not just inside the
+- **L2 — PASS, decisively.** 5.716ms vs. ≤160ms — **28.0x** inside the line,
+  **183.7x** faster than this run's own control (1,049.894ms). The
+  per-candidate authoritative recheck's cost stays independent of global
+  key cardinality (5,000 here vs. 256 at L1/L3) because each recheck only
+  ever counts one specific key's own `RUNNING` rows — the same query shape
+  and the same near-zero cost ledger #4 already measured directly — the one
+  causal claim both correction rounds left intact, since it concerns the
+  recheck, not the candidate fetch.
+- **L3 — PASS, decisively.** 8.370ms vs. ≤300.31ms (2x control's
+  150.153ms) — **17.9x faster than control outright**, not just inside the
   line.
 - **L4 — FAIL on the batch-count sub-criterion.** Wall-clock passes cleanly
-  (35.723ms vs. ≤100ms, **2.8x** inside the line) — but the shape resolved
+  (34.876ms vs. ≤100ms, **2.9x** inside the line) — but the shape resolved
   in **2 batches, not the registered 1**. This is a fencepost error in the
   pre-registration itself, not a mechanism finding: with `B=50` and exactly
   50 poisoned rows ranked ahead of the one claimable row, batch 1 fetches
@@ -280,16 +339,16 @@ counts, in both L4 and L5.
   registered "1" undercounted by exactly the one slot the claimable row
   itself occupies.
 - **L5 — FAIL on the same sub-criterion, same root cause.** Wall-clock
-  passes cleanly (72.759ms vs. ≤400ms, **5.5x** inside the line) — but the
+  passes cleanly (71.653ms vs. ≤400ms, **5.6x** inside the line) — but the
   shape resolved in **5 batches, not the registered 4**. Same fencepost:
   `ceil((200 + 1) / 50) = 5`, not `ceil(200/50) = 4`.
 
 **Riskiest assumption, checked first:** the risk this shape's own mechanism
 introduces (per the pre-registration) was whether cost degrades linearly in
 *batch count* rather than catastrophically, the way ledger #4's shape
-degraded catastrophically in *attempt count*. That holds: 35.723ms at 2
-batches, 72.759ms at 5 batches — a 2.5x batch-count increase producing a
-2.04x wall-clock increase, consistent with cost scaling as `batches ×
+degraded catastrophically in *attempt count*. That holds: 34.876ms at 2
+batches, 71.653ms at 5 batches — a 2.5x batch-count increase producing a
+2.05x wall-clock increase, consistent with cost scaling as `batches ×
 (cost of one batch)`. This is a real, substantive answer, but per the
 post-review correction above it is a narrower one than originally framed:
 it confirms batching degrades gracefully in *batch count* at this backlog
@@ -304,34 +363,41 @@ regardless of how the other three lines perform or why the miss happened.
 
 **This kill is on the pre-registration's own arithmetic, not on the
 candidate mechanism's batch-count scaling** — every wall-clock line clears
-by 2.8x-167x, and the batch-count scaling itself is linear as designed. But
-post-review correction narrows what this assay can claim even if the
-batch-count lines had been written correctly: this apparatus never
+by 2.9x-184x, and the batch-count scaling itself is linear as designed. But
+two rounds of post-review correction narrow what this assay can claim even
+if the batch-count lines had been written correctly: this apparatus never
 established that batching bounds cost independent of backlog depth, only
 that it doesn't cost meaningfully more than the (already `O(backlog)` at
-this fixture depth) current committed fix, at one fixed depth. The one
-claim that survives fully intact is the recheck CTE's cardinality
-independence (L2) — a real, narrower, still-useful property, but not the
+this fixture depth) current committed fix, at one fixed depth. The claim
+that survives fully intact is the per-candidate authoritative recheck's
+cardinality independence (L2) — a real, narrower, still-useful property,
+using the same mechanism and cost ledger #4 already established, not the
 full "seek and refine" story issue #1340 was named for.
 
 **What this assay establishes, and does not:**
 
-- Establishes: a single-round-trip-per-batch shape with a batch-scoped
-  recheck CTE is mechanically sound (correct row every time, including
-  under adversarial saturation) and does not cost meaningfully more than
-  the current fix, at this apparatus's one tested backlog depth.
+- Establishes: a single-round-trip-per-batch fetch, paired with the
+  production path's own per-candidate `pg_try_advisory_xact_lock` +
+  fresh-`COUNT` recheck (not a batch-wide snapshot — round 2's correction),
+  is mechanically sound (correct row every time, including under
+  adversarial saturation) and does not cost meaningfully more than the
+  current fix, at this apparatus's one tested backlog depth.
 - Establishes: batch-count scaling under adversarial depth is linear, not
   catastrophic — a real, positive finding about *this* mechanism's shape,
   independent of the batch-count-line fencepost bug.
 - Does **not** establish: that the candidate fetch itself avoids `O(backlog)`
   scanning as backlog depth grows — untested, and the forced-index
-  diagnostic suggests this specific query shape may not get `LIMIT`
+  diagnostic (with or without this assay's own `id` tiebreak — both
+  checked directly) suggests this specific query shape may not get `LIMIT`
   pushdown at any depth without further work (see the `docs/performance.md`
-  #1177-baseline discrepancy noted above).
+  #1177-baseline discrepancy noted above, which a proposed alternative
+  explanation was checked against and did not survive).
 - Does **not** establish: real-network round-trip cost at 2-5 batches
   (measured as 1 round trip here).
-- Does **not** establish: concurrent-claimer lock-contention cost (never
-  measured by this or any prior concurrency-gate assay).
+- Does **not** establish: throughput under real *concurrent* claimers
+  contending for the same rows/keys — the single-session apparatus can
+  exercise correct behavior for one caller at a time (which is what round
+  2's fix restored) but not lock contention or throughput across several.
 
 **Explicitly not this assay's finding, and an explicit re-charter, not an
 edit:** a corrected pre-registration (`ceil((poison_depth+1)/B)` batches as
@@ -352,13 +418,15 @@ sudo -u postgres createdb prospect_assay5   # or any local, non-production Postg
 cd docs/assays/apparatus/0005-claim-batched-seek-and-refine
 PGDATABASE=prospect_assay5 ./run_assay.sh
 cat results/run.log
-grep "Buffers: shared hit=181" results/idle_256-batch_claim.explain.txt
+grep "Buffers: shared hit=180" results/idle_256-batch_claim.explain.txt
 grep "Index Scan using idx_harvest_tq_poll" results/idle_256-forced_index.explain.txt
+grep "Sort Key" results/idle_256-forced_index_no_tiebreak.explain.txt
 ```
 
 `schema.sql`, `seed.sql`, `seed_adversarial_50.sql`, `seed_adversarial_200.sql`,
 `control.sql`, `control_raw.sql`, `batch_claim.sql`, `claim_batched.sql`,
-`forced_index_diagnostic.sql`, and `driver.sql` are archived alongside
+`forced_index_diagnostic.sql`, `forced_index_no_tiebreak_diagnostic.sql`,
+and `driver.sql` are archived alongside
 `run_assay.sh` in this directory, along with the full `results/*.txt` /
 `results/*.explain.txt` output and `results/run.log` (regenerated by
 `run_assay.sh` itself, per the tooling fix above) this report's tables are

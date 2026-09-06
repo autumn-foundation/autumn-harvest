@@ -1086,23 +1086,29 @@ fixtures' wall-clock all pass decisively; batch-count scaling under
 adversarial depth is linear, not catastrophic. It still kills: both
 adversarial fixtures resolved in one more batch than their pre-registered
 "exactly N" line allowed, because that line's own formula undercounted by
-the one slot the claimable row itself occupies. Post-review (Codex) further
-found the report had mischaracterized the candidate fetch as an
+the one slot the claimable row itself occupies. Two rounds of post-review (Codex) further
+found: the report had mischaracterized the candidate fetch as an
 index-ordered seek through `idx_harvest_tq_poll`; the archived `EXPLAIN`
 output shows a `Seq Scan` of the whole matching backlog instead (the same
 shape the committed fix's own control query plans as, at this apparatus's
 10,000-row depth), and a forced-index diagnostic shows forcing the index
 doesn't recover a bounded scan either — still reads every matching row,
-costs more, no `LIMIT` pushdown. So the assay's surviving claim is narrower
-than first reported: the recheck CTE's cost is cardinality-independent, and
-batching doesn't cost more than the current (already `O(backlog)` at this
-depth) fix — not that batching bounds cost as backlog depth grows, which
-remains untested. That gap also surfaces an unresolved discrepancy against
-this page's own #1177 baseline (reported there as a clean index scan with
-no `Sort` node, at a much larger fixture); a corrected-arithmetic
-re-charter, a depth-varying re-charter, that discrepancy, and the
-concurrent-claimer lock-contention question every concurrency-gate assay so
-far has left unmeasured all remain open, un-run pits.
+costs more, no `LIMIT` pushdown (a proposed alternative explanation, that
+the assay's own added tiebreak column caused this, was checked directly
+and did not hold up). Separately, the first fix's winner-pick used a
+stale batch-wide snapshot instead of the production path's per-candidate
+advisory-lock recheck (`queue.rs:750-770`) — a real concurrency-correctness
+gap a single-session apparatus can't surface on its own, fixed to match the
+mechanism ledger #4 already had right. So the assay's surviving claim is
+narrower than first reported: the per-candidate recheck's cost is
+cardinality-independent, and batching doesn't cost more than the current
+(already `O(backlog)` at this depth) fix — not that batching bounds cost as
+backlog depth grows, which remains untested. That gap also surfaces an
+unresolved discrepancy against this page's own #1177 baseline (reported
+there as a clean index scan with no `Sort` node, at a much larger fixture);
+a corrected-arithmetic re-charter, a depth-varying re-charter, that
+discrepancy, and real concurrent-claimer throughput (still unmeasured by
+any concurrency-gate assay so far) all remain open, un-run pits.
 
 Until a fix clears every line of some registered assay, deployments with
 concurrency-key cardinality in the low hundreds (the tested, committed

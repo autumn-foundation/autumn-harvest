@@ -32,6 +32,10 @@
 \i forced_index_diagnostic.sql
 \o
 
+\o results/idle_256-forced_index_no_tiebreak.explain.txt
+\i forced_index_no_tiebreak_diagnostic.sql
+\o
+
 \echo -- idle_256 control_raw --
 \timing on
 \o results/idle_256-control_raw.txt

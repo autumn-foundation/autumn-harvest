@@ -1,16 +1,16 @@
 -- idle_256 control_raw --
-Time: 6.699 ms
+Time: 6.999 ms
 -- idle_256 claim_batched --
-Time: 9.220 ms
+Time: 8.876 ms
 -- hot_256 control_raw --
-Time: 144.105 ms
+Time: 150.153 ms
 -- hot_256 claim_batched --
-Time: 10.630 ms
+Time: 8.370 ms
 -- hot_5000 control_raw --
-Time: 1058.862 ms (00:01.059)
+Time: 1049.894 ms (00:01.050)
 -- hot_5000 claim_batched --
-Time: 6.336 ms
+Time: 5.716 ms
 -- l4_adversarial_50 claim_batched --
-Time: 35.723 ms
+Time: 34.876 ms
 -- l5_adversarial_200 claim_batched --
-Time: 72.759 ms
+Time: 71.653 ms

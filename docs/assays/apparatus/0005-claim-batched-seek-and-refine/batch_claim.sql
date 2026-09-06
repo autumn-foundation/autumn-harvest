@@ -1,48 +1,37 @@
--- Candidate's single-round-trip batch query, isolated for EXPLAIN at the
--- non-adversarial scenarios (first batch only, no keyset cursor needed --
--- see claim_batched.sql for the multi-batch cursor and why `id` breaks
--- ties `priority`/`scheduled_at` alone cannot). The recheck CTE is scoped
--- to the batch's own distinct concurrency keys, not the backlog's global
--- key cardinality -- the specific mechanism this assay is testing against
--- ledger #3's failure mode.
+-- Candidate's batch-fetch step, isolated for EXPLAIN at the non-adversarial
+-- scenarios (first batch only, no keyset cursor needed -- see
+-- claim_batched.sql for the multi-batch cursor and why `id` breaks ties
+-- `priority`/`scheduled_at` alone cannot).
 --
--- NOTE (post-review, Codex): the `candidates` CTE below is a `Seq Scan` +
--- top-N `Sort` at this apparatus's 10,000-row backlog depth, not an
--- index-ordered seek through `idx_harvest_tq_poll` -- see
--- `forced_index_diagnostic.sql` for whether an index-driven plan is even
--- reachable for this query shape, and the report's Assay section for what
--- the natural-planner numbers below do and do not establish as a result.
+-- NOTE (post-review, Codex, round 2): this file previously also modeled
+-- the concurrency-gate recheck as a batch-scoped CTE computed once from a
+-- pre-claim snapshot. That mechanism was a genuine correctness gap (see
+-- claim_batched.sql's own note) and claim_batched.sql no longer uses it --
+-- the authoritative check is now a per-candidate `pg_try_advisory_xact_lock`
+-- + fresh `COUNT`, which is inherently procedural (order- and
+-- side-effect-dependent) and cannot be represented as a single `EXPLAIN`ed
+-- query, the same reason ledger #4 kept its own recheck cost in a separate
+-- isolated file (`recheck.sql`) rather than folding it into
+-- `candidate_select.sql`. This file therefore measures only the fetch
+-- step's own cost; the recheck's per-candidate cost is the same query
+-- shape ledger #4 already measured in isolation (~1 buffer at both 256 and
+-- 5,000 key cardinality), and its actual contribution to end-to-end cost
+-- is visible in this assay's own `claim_batched()` wall-clock numbers.
+--
+-- NOTE (post-review, Codex, round 2, second finding): the archived
+-- `EXPLAIN` output for this query shows a `Seq Scan` (or, forced, an
+-- `Index Scan` that still reads every matching row) feeding a top-N
+-- `Sort`, not a bounded index-ordered seek, at this apparatus's 10,000-row
+-- backlog depth -- see the report's post-review section, including a
+-- direct test showing this is not explained by the `id` tiebreak added
+-- below (the same `Sort`+`actual rows=10000` shape appears with or without
+-- it).
 EXPLAIN (ANALYZE, BUFFERS, VERBOSE, SETTINGS, TIMING OFF)
-WITH candidates AS (
-    SELECT id, task_type, concurrency_key, concurrency_cap, priority, scheduled_at
-    FROM harvest_task_queue
-    WHERE queue_name = ANY(ARRAY['bench-q-0','bench-q-1','bench-q-2','bench-q-3'])
-      AND state = 'PENDING'
-      AND scheduled_at <= NOW()
-    ORDER BY priority DESC, scheduled_at ASC, id ASC
-    LIMIT :batch_size
-    FOR UPDATE SKIP LOCKED
-),
-batch_keys AS MATERIALIZED (
-    SELECT DISTINCT concurrency_key, task_type
-    FROM candidates
-    WHERE concurrency_key IS NOT NULL AND concurrency_cap IS NOT NULL
-),
-running_counts AS MATERIALIZED (
-    SELECT t.concurrency_key, t.task_type, COUNT(*) AS running_count
-    FROM harvest_task_queue t
-    WHERE t.state = 'RUNNING'
-      AND t.worker_id IS NOT NULL
-      AND (t.concurrency_key, t.task_type) IN (SELECT concurrency_key, task_type FROM batch_keys)
-    GROUP BY t.concurrency_key, t.task_type
-)
-SELECT c.id, c.priority, c.scheduled_at
-FROM candidates c
-WHERE c.concurrency_key IS NULL
-   OR c.concurrency_cap IS NULL
-   OR COALESCE((
-        SELECT rc.running_count FROM running_counts rc
-        WHERE rc.concurrency_key = c.concurrency_key AND rc.task_type = c.task_type
-      ), 0) < c.concurrency_cap
-ORDER BY c.priority DESC, c.scheduled_at ASC, c.id ASC
-LIMIT 1;
+SELECT id, task_type, concurrency_key, concurrency_cap, priority, scheduled_at
+FROM harvest_task_queue
+WHERE queue_name = ANY(ARRAY['bench-q-0','bench-q-1','bench-q-2','bench-q-3'])
+  AND state = 'PENDING'
+  AND scheduled_at <= NOW()
+ORDER BY priority DESC, scheduled_at ASC, id ASC
+LIMIT :batch_size
+FOR UPDATE SKIP LOCKED;
