@@ -443,13 +443,26 @@ def replace_spans(text: str, filler: str) -> str:
 # in a <code> element exactly as it does a backtick span, so the absolute
 # rules must not read a narrative phrase or a marker inside one. Doc comments
 # only: nothing renders a `//` comment, where this is literal text.
-# The tag NAME must end here, and a word boundary does not say that: "\\b"
-# sits happily before punctuation, so "<code@example.com>" -- an e-mail
-# autolink Rustdoc renders as a mail link -- opened an element that masked
-# the rest of the paragraph. A tag name ends at whitespace, "/" or ">", and
-# "<code-block>" is a different element, not this one.
-CODE_OPEN_RE = re.compile(r"<code(?=[\s/>])[^<>]*>", re.I)
-CODE_CLOSE_RE = re.compile(r"</code\s*>", re.I)
+# CommonMark's open-tag grammar, not an approximation of it. Two rounds
+# tried to bound this pattern by what a tag may not contain, and each
+# accepted a shape Rustdoc escapes: "<code@example.com>" is a mail
+# autolink, "<code-block>" is a different element, and "<code =oops>" has
+# no attribute name where one is required. All three rendered the marker
+# beside them as prose while the audit masked it.
+#
+# The direction is the reason to spell the grammar out. Every character
+# this matcher takes loosely is an ABSOLUTE rule switched off to the end
+# of a block, so a generous pattern does not misreport -- it goes silent.
+_HTML_SPACE = r"[ \t\r\n\f]"
+_HTML_ATTR = (
+    _HTML_SPACE + r"+[A-Za-z_:][A-Za-z0-9_.:-]*"
+    r"(?:" + _HTML_SPACE + r"*=" + _HTML_SPACE + r"*"
+    r"(?:[^ \t\r\n\f\"'=<>`]+|'[^']*'|\"[^\"]*\"))?"
+)
+CODE_OPEN_RE = re.compile(
+    r"<code(?:" + _HTML_ATTR + r")*" + _HTML_SPACE + r"*/?>", re.I
+)
+CODE_CLOSE_RE = re.compile(r"</code" + _HTML_SPACE + r"*>", re.I)
 
 
 def inline_code_ranges(text: str) -> list[tuple[int, int]]:
@@ -3898,6 +3911,26 @@ RULE_TESTS = [
         "/// TODO: issue required` suffix.\n",
         {("CH002", 3)},
         "and a thematic break ends the paragraph on each side of it",
+    ),
+    (
+        "/// Explain <code =bad>TODO: add retry</code> here.\n",
+        {("CH002", 1)},
+        "an attribute must have a name, so this opens no element",
+    ),
+    (
+        "/// Explain <code class=\"x\">TODO: add retry</code> here.\n",
+        set(),
+        "a quoted attribute value is one",
+    ),
+    (
+        "/// Explain <code data-x=y>TODO: add retry</code> here.\n",
+        set(),
+        "and so is an unquoted one",
+    ),
+    (
+        "/// Explain <code title=\"a>b\">TODO: add retry</code> here.\n",
+        set(),
+        "a quoted value may hold the bracket that would end the tag",
     ),
 ]
 

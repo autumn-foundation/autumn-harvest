@@ -2006,3 +2006,35 @@ a nested comment in the middle of a line cannot spend it.
 Corpus effect: none. Three fixtures -- the heading, a span within one
 heading, which must still pair, and the thematic break that was already
 correct and is now pinned.
+
+### Round sixty-six — spell the grammar out, or keep guessing at it
+
+Two findings. One is fixed; one is already recorded in issue #1383 and
+stays there.
+
+**The `<code>` matcher now uses CommonMark's open-tag grammar.** Rounds
+sixty-two and sixty-four each bounded the pattern by what a tag may not
+contain, and each accepted a shape Rustdoc escapes: `<code@example.com>`
+is a mail autolink, `<code-block>` is a different element, and
+`<code =bad>` has no attribute name where one is required. Every one of
+them rendered the marker beside it as prose while the audit masked it.
+
+Three attempts at the same pattern is the signal to stop approximating.
+The grammar is short -- a tag name, then attributes that each need a
+name and may carry a quoted or unquoted value, then an optional slash
+and the bracket -- and writing it down also settles a shape no guess
+would have: `<code title="a>b">` is one attribute whose value holds the
+character that would otherwise end the tag.
+
+The direction is why this class keeps returning. Every character the
+matcher takes loosely is an ABSOLUTE rule switched off to the end of a
+block. A generous pattern here does not misreport; it goes silent.
+
+**An HTML block is still not scoped to its container** -- `/// > <pre>`
+followed by an unquoted line keeps the block open past the quote that
+opened it. That is issue #1383's first item, filed in round fifty-one and
+unchanged: it under-reports, no comment in this tree contains raw HTML,
+and the fence path's `scope` is the model it needs. It stays deferred.
+
+Corpus effect: none. Four fixtures, one for the malformed opener and
+three for the attribute forms that must keep working.
