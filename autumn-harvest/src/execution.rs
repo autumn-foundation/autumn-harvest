@@ -1515,9 +1515,8 @@ pub async fn start_or_load_workflow_execution(
     // the self-owned transaction path, so the row is durable by then.
     //
     // `Box::pin` keeps this future off the caller's stack. The collect future
-    // is large, and every caller of this function inlines it, so an unboxed
-    // future here pushes each of them over the `clippy::large_futures`
-    // threshold.
+    // is large, and every caller of this function inlines it. An unboxed future
+    // here pushes each caller over the `clippy::large_futures` threshold.
     let (collected, hints) = Box::pin(crate::dispatch::buffered(
         start_or_load_workflow_execution_collect(conn, request, false, false, None, gate),
     ))

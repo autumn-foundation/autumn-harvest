@@ -23828,8 +23828,8 @@ const DISPATCH_ABSENT_ROW_DELAY: Duration = Duration::from_millis(50);
 ///
 /// A `RUNNING` row with no `worker_id` is parked: a decision cycle finished and
 /// left the row waiting for a wake. A producer outside a buffering scope can
-/// publish a wake's hint before the wake commits, so the reference can arrive
-/// while the re-pend is still in flight. Three short releases cover that
+/// publish a wake's hint before the wake commits. The reference can therefore
+/// arrive while the re-pend is still in flight. Three short releases cover that
 /// window. After them the row is parked with no wake behind it, and the
 /// reference is dropped.
 const DISPATCH_PARKED_ROW_RELEASES: u32 = 3;
@@ -23846,23 +23846,21 @@ async fn dispatch_call<T>(
     call: impl std::future::Future<Output = HarvestResult<T>>,
     what: &'static str,
 ) -> HarvestResult<T> {
-    (tokio::time::timeout(DISPATCH_CALL_TIMEOUT, call).await).map_or_else(
-        |_| {
-            Err(HarvestError::Dispatch(format!(
-                "dispatch {what} did not answer within {DISPATCH_CALL_TIMEOUT:?}"
-            )))
-        },
-        |result| result,
-    )
+    (tokio::time::timeout(DISPATCH_CALL_TIMEOUT, call).await).unwrap_or_else(|_| {
+        Err(HarvestError::Dispatch(format!(
+            "dispatch {what} did not answer within {DISPATCH_CALL_TIMEOUT:?}"
+        )))
+    })
 }
 
 /// How many references one read asks for (issue #1312).
 ///
 /// The two pools have separate permits, and a workflow reference cannot start
 /// on an activity permit. `None` means both pools are full: a read now would
-/// hold references that nothing can start, so the caller sleeps instead. The
-/// sum is the bound, so a read never asks for more than the worker can start,
-/// and it never floors to one when there is no free permit at all.
+/// hold references that nothing can start, so the caller sleeps instead.
+///
+/// The sum of the two is the bound. A read never asks for more than the worker
+/// can start, and it never floors to one when no permit is free.
 const fn dispatch_read_size(free_workflow: usize, free_activity: usize) -> Option<usize> {
     let free = free_workflow.saturating_add(free_activity);
     if free == 0 {
@@ -23901,9 +23899,9 @@ impl DispatchLoopState {
         // `checked_sub` reads the timers back one hour. `Instant::now()` alone
         // is not elapsed against any real interval, so the first maintenance
         // pass and the first sweep would wait one interval each. A platform
-        // whose `Instant` epoch is younger than the offset returns `None`; the
-        // current instant is the correct fallback there, because the first
-        // sweep is then one interval late rather than never.
+        // whose `Instant` epoch is younger than the offset returns `None`. The
+        // current instant is the correct fallback there. The first sweep is
+        // then one interval late rather than never.
         let now = std::time::Instant::now();
         let past = now.checked_sub(DISPATCH_TIMER_START_OFFSET).unwrap_or(now);
         Self {
@@ -25767,6 +25765,11 @@ impl Worker {
     /// Claim the row one reference names, then ack or release the reference.
     ///
     /// Returns `true` when the row was claimed and dispatched.
+    ///
+    /// One reference is disposed of per call. [`crate::dispatch::TaskDispatch`]
+    /// takes one lease per `ack` and per `release`, so a batched disposal for
+    /// the whole read would need a trait change. That is a follow-up, not a
+    /// change this path can make on its own.
     async fn consume_reference(
         &self,
         pool: &DbPool,
@@ -25813,9 +25816,9 @@ impl Worker {
                 // `RUNNING`, and the redelivered reference is acked.
                 //
                 // The pool connection goes back before the ack. The ack is a
-                // round trip to the channel, and holding a connection across it
-                // would keep one connection per in-flight reference busy for a
-                // read the database has no part in (issue #1312 review).
+                // round trip to the channel. Holding a connection across it
+                // would keep one connection busy per in-flight reference, for a
+                // call the database has no part in (issue #1312 review).
                 drop(conn);
                 chaos_point!(DISPATCH_AFTER_CLAIM_BEFORE_ACK);
                 if let Err(error) = dispatch_call(installed.channel.ack(&lease), "ack").await {
@@ -37748,9 +37751,9 @@ mod tests {
 
     #[test]
     fn the_dispatch_loop_maintains_and_reconciles_on_its_first_iteration() {
-        // Real intervals, not `Duration::ZERO`: a timer that starts at the
-        // current instant is due against a zero interval whatever it holds, so
-        // a zero interval proves nothing.
+        // Real intervals, not `Duration::ZERO`. A timer that starts at the
+        // current instant is due against a zero interval whatever it holds. A
+        // zero interval therefore proves nothing.
         let mut state = DispatchLoopState::new();
         assert!(
             DispatchLoopState::due(&mut state.maintained, Duration::from_millis(20)),

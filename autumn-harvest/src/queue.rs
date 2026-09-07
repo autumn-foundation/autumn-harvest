@@ -1183,8 +1183,9 @@ const BY_ID_KEYS_ANCHOR: &str = "AND concurrency_cap IS NOT NULL ";
 /// set is the right one: the claim may select any of those rows. A by-id claim
 /// can select exactly one row, so every other pair it collects is work that no
 /// gate reads. On a deployment with a large due backlog the CTE would scan that
-/// whole backlog once per reference, which is the cost the dispatch path exists
-/// to avoid. The gate itself is unchanged: `concurrency_running_counts` still
+/// whole backlog once per reference. That scan is the cost the dispatch path
+/// exists to avoid. The gate itself is unchanged: `concurrency_running_counts`
+/// still
 /// aggregates the `RUNNING` population for the named row's key, and the
 /// authoritative advisory-locked recheck inside `claimed` is untouched.
 ///

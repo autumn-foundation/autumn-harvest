@@ -73,10 +73,10 @@ pub async fn send_signal_idempotent(
 
     // The wake at the end of this transaction re-pends a parked workflow task,
     // so it raises a dispatch hint (issue #1312). A hint published before the
-    // COMMIT names a row that no reader outside this transaction can see: the
+    // COMMIT names a row that no reader outside this transaction can see. The
     // reader probes it, finds nothing, and drops the reference after three
-    // short releases. The buffering scope holds the hint until the commit, so
-    // the signal reaches a worker through the channel rather than waiting for
+    // short releases. The buffering scope holds the hint until the commit. The
+    // signal then reaches a worker through the channel rather than waiting for
     // the reconcile sweep.
     crate::dispatch::buffered_settled(Box::pin(conn.transaction::<bool, HarvestError, _>(
         async |conn| {

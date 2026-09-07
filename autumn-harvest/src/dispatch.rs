@@ -290,9 +290,9 @@ pub async fn settle_scope<T, E>(outcome: Result<T, E>) -> Result<T, E> {
 /// `PENDING` row for them to name.
 ///
 /// The call is safe inside an outer scope. [`buffered`] does not nest, so a
-/// nested owner returns no hints and the outer owner keeps them. That is what
-/// [`settle_scope`] cannot do: it drains whichever scope is active, so a nested
-/// caller would publish the enclosing transaction's hints before that
+/// nested owner returns no hints and the outer owner keeps them.
+/// [`settle_scope`] cannot do that. It drains whichever scope is active, so a
+/// nested caller would publish the enclosing transaction's hints before that
 /// transaction commits.
 ///
 /// # Errors
@@ -748,10 +748,10 @@ impl TaskDispatch for MemoryDispatch {
         for hint in hints {
             state.published.push(hint.task_id);
             // Contract C1. A held reference with the same `scheduled_at` names
-            // the same row state, so the publish is a no-op and the reference
+            // the same row state. The publish is a no-op, and the reference
             // keeps its redelivery count and its backoff. A different
-            // `scheduled_at` means the row moved, so the reference moves with
-            // it and counts redeliveries again from zero.
+            // `scheduled_at` means the row moved. The reference moves with it
+            // and counts redeliveries again from zero.
             if let Some(held) = state.entries.get(&hint.task_id) {
                 if held.scheduled_at == hint.scheduled_at {
                     continue;
@@ -760,8 +760,8 @@ impl TaskDispatch for MemoryDispatch {
             }
             // A delivered reference is held by its consumer. Publishing again
             // must not create a second copy of it. The consumer judges the row
-            // against Postgres, which is the authority on the new due time, and
-            // the reconcile sweep republishes the row after the consumer
+            // against Postgres. Postgres is the authority on the new due time.
+            // The reconcile sweep republishes the row after the consumer
             // releases or acks the reference.
             if state
                 .inflight
@@ -1054,10 +1054,12 @@ mod tests {
     #[test]
     fn the_publisher_queue_is_bounded() {
         assert_eq!(PUBLISH_QUEUE_CAPACITY, 10_000);
-        assert!(
-            PUBLISH_BATCH_MAX <= PUBLISH_QUEUE_CAPACITY,
-            "one batch must not exceed the queue it drains"
-        );
+        const {
+            assert!(
+                PUBLISH_BATCH_MAX <= PUBLISH_QUEUE_CAPACITY,
+                "one batch must not exceed the queue it drains"
+            );
+        }
     }
 
     #[test]

@@ -120,9 +120,9 @@ fn needs_live_db(source: &str) -> bool {
 /// "all-ignored".
 ///
 /// The count is taken over comment-stripped code (see [`strip_line_comments`]).
-/// A module doc comment that names an `#[ignore]`d case in prose would
-/// otherwise inflate the ignored count above the real test count, and a suite
-/// with live cases would be reported as running nothing.
+/// A module doc comment can name an `#[ignore]`d case in prose. Such prose
+/// would otherwise inflate the ignored count above the real test count, and a
+/// suite with live cases would read as running nothing.
 fn all_tests_ignored(source: &str) -> bool {
     let code = strip_line_comments(source);
     let tests = code.matches("#[tokio::test").count() + code.matches("#[test]").count();

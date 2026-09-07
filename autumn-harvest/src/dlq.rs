@@ -563,9 +563,9 @@ pub async fn replay_dead_letter(
 
     // The re-enqueue below writes a `PENDING` task row, so it raises a dispatch
     // hint (issue #1312). The buffering scope holds the hint until this
-    // transaction commits. `conn` may already be inside a caller's transaction;
-    // the scope does not nest, so a nested call leaves its hints with the
-    // outermost owner instead of publishing them early.
+    // transaction commits. `conn` may already be inside a caller's transaction.
+    // The scope does not nest. A nested call therefore leaves its hints with
+    // the outermost owner instead of publishing them early.
     crate::dispatch::buffered_settled(Box::pin(conn.transaction::<Uuid, HarvestError, _>(
         async |conn| {
             let entry = dsl::harvest_dead_letters
