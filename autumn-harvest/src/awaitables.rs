@@ -323,15 +323,15 @@ struct HistoryCounts {
     closed_activities: usize,
     local_activities: usize,
     closed_local_activities: usize,
-    external_activities: usize,
     children: usize,
 }
 
 /// Counts, in one cheap pass over `rows`, how many entries each
 /// [`HistoryIndex`] collection will hold. The pass is a discriminant match
 /// with no cloning, formatting or hashing, so it costs far less than the
-/// indexing pass it precedes. There is no `timers` field: see
-/// [`HistoryIndex::with_capacity`] for why timer rows are not counted here.
+/// indexing pass it precedes. There is no `timers` or `external_activities`
+/// field: see [`HistoryIndex::with_capacity`] for why those rows are not
+/// counted here.
 fn count_history_categories(rows: &[(DateTime<Utc>, WorkflowEvent)]) -> HistoryCounts {
     let mut counts = HistoryCounts::default();
     for (_, event) in rows {
@@ -342,7 +342,6 @@ fn count_history_categories(rows: &[(DateTime<Utc>, WorkflowEvent)]) -> HistoryC
             | WorkflowEvent::ActivityTimedOut { .. }
             | WorkflowEvent::ActivityCompletedExternally { .. }
             | WorkflowEvent::ActivityFailedExternally { .. } => counts.closed_activities += 1,
-            WorkflowEvent::ActivityAwaitingExternal { .. } => counts.external_activities += 1,
             WorkflowEvent::LocalActivityScheduled { .. } => counts.local_activities += 1,
             WorkflowEvent::LocalActivityCompleted { .. }
             | WorkflowEvent::LocalActivityExhausted { .. } => {
@@ -401,14 +400,25 @@ impl HistoryIndex {
     /// an existing entry rather than adding one. A history that resets one
     /// timer 100,000 times would size both for 100,000 entries and use one.
     /// This benchmark gives every timer a unique id, so it never hits that
-    /// case (Codex review, PR #1414).
+    /// case.
+    ///
+    /// `external_activities` is excluded for the same duplicate-row reason.
+    /// `replay.rs`'s external-activity scan documents a second
+    /// `ActivityAwaitingExternal` row for the same activity id. A signal can
+    /// wake the workflow while an external activity is pending. The worker
+    /// then re-runs its scheduling code, appending another row for an id
+    /// already in history. `external_activities.insert` overwrites
+    /// the existing entry on a repeat id, rather than growing the map. So a
+    /// long-lived external activity with many such wakeups would size this
+    /// map for every wakeup, and use one entry. This benchmark gives every
+    /// external row a unique id, so it never hits that case either.
     fn with_capacity(counts: &HistoryCounts) -> Self {
         Self {
             activities: HashMap::with_capacity(counts.activities),
             closed_activities: HashSet::with_capacity(counts.closed_activities),
             local_activities: HashMap::with_capacity(counts.local_activities),
             closed_local_activities: HashSet::with_capacity(counts.closed_local_activities),
-            external_activities: HashMap::with_capacity(counts.external_activities),
+            external_activities: HashMap::new(),
             open_timer_arms: HashMap::new(),
             timer_order: Vec::new(),
             children: HashMap::new(),
