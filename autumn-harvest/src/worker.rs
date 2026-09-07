@@ -23143,6 +23143,12 @@ pub struct Worker {
     /// Longest claim-to-dispatch permit-wait for the activity semaphore
     /// (issue #548). See `workflow_permit_wait_micros`.
     activity_permit_wait_micros: Option<Arc<AtomicU64>>,
+    /// Workflow references claimed through the channel that do not hold their
+    /// permit yet (issue #1312). See [`DispatchReservation`].
+    dispatch_reserved_workflow: Arc<AtomicUsize>,
+    /// Activity references claimed through the channel that do not hold their
+    /// permit yet (issue #1312). See [`DispatchReservation`].
+    dispatch_reserved_activity: Arc<AtomicUsize>,
     /// Set the first time `spawn_monitoring_tasks` runs to completion (issue
     /// #548 review). Guards against a hypothetical second invocation (e.g. a
     /// future caller wrapping `run`/`run_with_listener` in a retry loop)
@@ -24029,6 +24035,54 @@ impl DispatchLoopState {
     }
 }
 
+/// One reference claimed through the channel that does not hold its permit yet.
+///
+/// A worker dispatches a claimed task by spawning it, and the spawned task is
+/// what acquires the pool permit. `available_permits` therefore still counts
+/// that permit as free for a moment. Without this reservation the next read
+/// would weigh the same free permit again and claim a second row the worker
+/// cannot start, which is the very outcome the per-kind gate exists to stop.
+///
+/// The guard is created before the claim and moved into the spawned task, which
+/// drops it as soon as it holds the permit. A claim that fails drops it at once.
+#[derive(Debug)]
+struct DispatchReservation(Arc<AtomicUsize>);
+
+impl DispatchReservation {
+    fn new(counter: &Arc<AtomicUsize>) -> Self {
+        counter.fetch_add(1, Ordering::Relaxed);
+        Self(Arc::clone(counter))
+    }
+}
+
+impl Drop for DispatchReservation {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
+/// Whether a reference of this kind may be claimed now (issue #1312).
+///
+/// The read is sized on the sum of both pools, and that is right: a read that
+/// asked for less would leave references no peer can see. The claim is not.
+/// A workflow row claimed with no free workflow permit sits `RUNNING` under
+/// this worker while it waits on the local semaphore, and a peer with capacity
+/// cannot claim it. The reference goes back to the channel instead.
+///
+/// `None` is a reference of unknown type. It keeps the behaviour dispatch had
+/// before the kind existed, so an entry an older build wrote still runs.
+const fn dispatch_kind_admitted(
+    kind: Option<crate::dispatch::DispatchKind>,
+    free_workflow: usize,
+    free_activity: usize,
+) -> bool {
+    match kind {
+        Some(crate::dispatch::DispatchKind::Workflow) => free_workflow > 0,
+        Some(crate::dispatch::DispatchKind::Activity) => free_activity > 0,
+        None => true,
+    }
+}
+
 /// Where the next reconcile sweep of one queue starts (issue #1312).
 ///
 /// A full page means rows may still sit below it, so the walk continues from
@@ -24226,6 +24280,8 @@ impl Worker {
             activity_permit_total: activity_parts.permit_total,
             workflow_permit_wait_micros: workflow_parts.permit_wait_micros,
             activity_permit_wait_micros: activity_parts.permit_wait_micros,
+            dispatch_reserved_workflow: Arc::new(AtomicUsize::new(0)),
+            dispatch_reserved_activity: Arc::new(AtomicUsize::new(0)),
             monitoring_started: std::sync::atomic::AtomicBool::new(false),
             shutdown: CancellationToken::new(),
             remote_drain_deadline: Arc::new(Mutex::new(None)),
@@ -25899,11 +25955,46 @@ impl Worker {
                     .await;
                 continue;
             }
+            if !dispatch_kind_admitted(
+                lease.kind,
+                self.free_permits(&self.workflow_semaphore, &self.dispatch_reserved_workflow),
+                self.free_permits(&self.activity_semaphore, &self.dispatch_reserved_activity),
+            ) {
+                // No permit for this pool. Give the reference straight back, so
+                // a peer with capacity reads it on its next poll.
+                let _ = dispatch_call(installed.channel.release(&lease, Duration::ZERO), "release")
+                    .await;
+                continue;
+            }
+            // The reservation is taken before the claim and lives until the
+            // spawned task holds its permit. See [`DispatchReservation`].
+            let reservation = match lease.kind {
+                Some(crate::dispatch::DispatchKind::Workflow) => {
+                    Some(DispatchReservation::new(&self.dispatch_reserved_workflow))
+                }
+                Some(crate::dispatch::DispatchKind::Activity) => {
+                    Some(DispatchReservation::new(&self.dispatch_reserved_activity))
+                }
+                None => None,
+            };
             dispatched |= self
-                .consume_reference(pool, shard, installed, state, lease)
+                .consume_reference(pool, shard, installed, state, lease, reservation)
                 .await;
         }
         dispatched
+    }
+
+    /// Permits of one pool that no claimed reference has spoken for yet.
+    fn free_permits(
+        &self,
+        semaphore: &tokio::sync::Semaphore,
+        reserved: &Arc<AtomicUsize>,
+    ) -> usize {
+        // Fully qualified: diesel's blanket `RunQueryDsl::load` is in scope here
+        // and shadows the inherent `AtomicUsize::load` through the `Arc` deref.
+        semaphore
+            .available_permits()
+            .saturating_sub(AtomicUsize::load(reserved, Ordering::Relaxed))
     }
 
     /// Drain the backlog through the Postgres claim path (issue #1312).
@@ -25972,6 +26063,7 @@ impl Worker {
         installed: &crate::dispatch::InstalledDispatch,
         state: &mut DispatchLoopState,
         lease: crate::dispatch::DispatchLease,
+        reservation: Option<DispatchReservation>,
     ) -> bool {
         let mut conn = match acquire_shard_conn(
             pool,
@@ -26027,7 +26119,7 @@ impl Worker {
                     queue = %task.queue_name,
                     "claimed task (dispatch)"
                 );
-                self.dispatch_task(task, pool);
+                self.dispatch_task(task, pool, reservation);
                 true
             }
             Ok(None) => {
@@ -26804,7 +26896,7 @@ impl Worker {
                             queue = %task.queue_name,
                             "claimed task (weighted)"
                         );
-                        self.dispatch_task(task, pool);
+                        self.dispatch_task(task, pool, None);
                         return true;
                     }
                     Ok(None) => {
@@ -26856,7 +26948,7 @@ impl Worker {
                 // exactly the capacity bottleneck the SLI is meant to page on.
                 // `schedule_to_start_secs` measures from task eligibility, so that
                 // permit wait is still captured in the recorded sample.
-                self.dispatch_task(task, pool);
+                self.dispatch_task(task, pool, None);
                 true
             }
             Ok(None) => {
@@ -26872,7 +26964,12 @@ impl Worker {
 
     /// Spawn a bounded Tokio task for the claimed work item.
     #[allow(clippy::too_many_lines)]
-    fn dispatch_task(&self, task: TaskQueueItem, pool: &DbPool) {
+    fn dispatch_task(
+        &self,
+        task: TaskQueueItem,
+        pool: &DbPool,
+        reservation: Option<DispatchReservation>,
+    ) {
         // Debug-only tripwire (issue #548 review): dispatch must never race
         // ahead of `spawn_monitoring_tasks`, which withholds a tuned
         // semaphore's permits down to the operator's initial target. A
@@ -26985,6 +27082,10 @@ impl Worker {
                 tracing::error!(task_id = %task_id, "semaphore closed");
                 return;
             };
+            // The permit is held, so the reference no longer needs a
+            // reservation against it (issue #1312). The early return above
+            // drops it too, so a closed semaphore cannot leak one.
+            drop(reservation);
 
             // Feed the adaptive slot tuner's permit-wait signal (issue #548).
             // A lock-free fetch_max so concurrent dispatches never contend;

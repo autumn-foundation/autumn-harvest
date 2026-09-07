@@ -162,13 +162,30 @@ fn retrying_activity_workflow(ctx: &WorkflowContext, input: serde_json::Value) -
     })
 }
 
-/// A workflow that holds its workflow permit for a while.
+/// An activity that runs inline and takes a while.
 ///
-/// The hold makes a second concurrent workflow row observable in the table.
-fn slow_workflow(_ctx: &WorkflowContext, input: serde_json::Value) -> BoxFut<'_> {
+/// A local activity runs inside the workflow task, so the workflow keeps its
+/// workflow permit for the whole call. A plain sleep in the workflow body
+/// cannot do this: the engine sees a suspension with no commands and fails the
+/// run.
+fn slow_local_activity(
+    _ctx: &autumn_harvest::ActivityContext,
+    input: serde_json::Value,
+) -> BoxFut<'_> {
     Box::pin(async move {
         tokio::time::sleep(Duration::from_millis(800)).await;
         Ok(input)
+    })
+}
+
+/// A workflow that holds its workflow permit for a while.
+///
+/// The hold makes a second concurrent workflow row observable in the table.
+fn slow_workflow(ctx: &WorkflowContext, input: serde_json::Value) -> BoxFut<'_> {
+    Box::pin(async move {
+        ctx.execute_local_activity_raw("slow_local", input, None, None)
+            .await
+            .map_err(|e| e.to_string())
     })
 }
 
@@ -531,6 +548,7 @@ async fn hint_publishes_after_commit_not_before() {
         scheduled_at: chrono::Utc::now(),
         priority: 0,
         shard: None,
+        kind: Some(autumn_harvest::dispatch::DispatchKind::Workflow),
     };
 
     let observed = Arc::clone(&channel);
@@ -592,6 +610,7 @@ async fn redelivery_of_a_terminal_row_is_acked() {
             scheduled_at: chrono::Utc::now(),
             priority: 0,
             shard: None,
+            kind: Some(autumn_harvest::dispatch::DispatchKind::Workflow),
         }])
         .await
         .expect("republish");
@@ -1371,6 +1390,7 @@ async fn a_multi_shard_worker_never_consumes_references() {
             scheduled_at: chrono::Utc::now(),
             priority: 0,
             shard: None,
+            kind: Some(autumn_harvest::dispatch::DispatchKind::Workflow),
         }])
         .await
         .expect("publish");
@@ -1486,7 +1506,11 @@ async fn a_workflow_reference_waits_for_a_workflow_permit() {
     let worker = Arc::new(make_worker_with(
         config,
         vec![wf_info("dispatch_slow", slow_workflow)],
-        vec![],
+        vec![ActivityInfo {
+            is_local: true,
+            default_queue: None,
+            ..act_info("slow_local", slow_local_activity, None)
+        }],
         empty_shared_state(),
     ));
 

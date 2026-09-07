@@ -503,6 +503,7 @@ pub async fn enqueue(conn: &mut AsyncPgConnection, params: &EnqueueParams) -> Ha
         &params.queue_name,
         params.scheduled_at,
         params.priority,
+        crate::dispatch::DispatchKind::from(params.task_type.as_str()),
     );
 
     Ok(task_id)
@@ -1512,7 +1513,7 @@ pub const fn dispatch_probe_query() -> &'static str {
 /// name the position it stopped at.
 #[must_use]
 pub const fn due_dispatch_hints_query() -> &'static str {
-    "SELECT id, queue_name, scheduled_at, priority \
+    "SELECT id, queue_name, scheduled_at, priority, task_type \
      FROM harvest_task_queue \
      WHERE queue_name = $1 \
        AND state = 'PENDING' \
@@ -1544,7 +1545,7 @@ pub const fn due_dispatch_hints_query() -> &'static str {
 /// walk.
 #[must_use]
 pub const fn due_dispatch_hints_after_query() -> &'static str {
-    "SELECT id, queue_name, scheduled_at, priority \
+    "SELECT id, queue_name, scheduled_at, priority, task_type \
      FROM harvest_task_queue \
      WHERE queue_name = $1 \
        AND state = 'PENDING' \
@@ -1661,6 +1662,8 @@ struct PendingHintRow {
     scheduled_at: DateTime<Utc>,
     #[diesel(sql_type = diesel::sql_types::Integer)]
     priority: i32,
+    #[diesel(sql_type = diesel::sql_types::Text)]
+    task_type: String,
 }
 
 impl PendingHintRow {
@@ -1681,6 +1684,7 @@ impl PendingHintRow {
             scheduled_at: self.scheduled_at,
             priority: self.priority,
             shard: None,
+            kind: Some(crate::dispatch::DispatchKind::from(self.task_type.as_str())),
         }
     }
 
@@ -1694,6 +1698,7 @@ impl PendingHintRow {
             // v1 rejects Redis dispatch on a sharded runtime at validation, so
             // a hint never has to name a shard. The field carries the follow-up.
             shard: None,
+            kind: Some(crate::dispatch::DispatchKind::from(self.task_type.as_str())),
         }
     }
 }
@@ -1701,7 +1706,7 @@ impl PendingHintRow {
 /// SQL for [`record_pending_hints`]. Reads the hint columns for named rows.
 #[must_use]
 pub const fn pending_hint_rows_query() -> &'static str {
-    "SELECT id, queue_name, scheduled_at, priority \
+    "SELECT id, queue_name, scheduled_at, priority, task_type \
      FROM harvest_task_queue \
      WHERE id = ANY($1) \
        AND state = 'PENDING'"
@@ -1716,6 +1721,7 @@ pub(crate) fn record_pending_hint(
     queue_name: &str,
     scheduled_at: DateTime<Utc>,
     priority: i32,
+    kind: crate::dispatch::DispatchKind,
 ) {
     if !crate::dispatch::is_installed() {
         return;
@@ -1726,6 +1732,7 @@ pub(crate) fn record_pending_hint(
         scheduled_at,
         priority,
         shard: None,
+        kind: Some(kind),
     });
 }
 
@@ -2543,14 +2550,14 @@ pub async fn requeue_for_retry(
     let next_run = Utc::now() + delay;
     let changeset = PendingRequeueChangeset::new(next_run, previous_error.to_string());
 
-    let (queue_name, priority) = diesel::update(
+    let (queue_name, priority, task_type) = diesel::update(
         dsl::harvest_task_queue
             .find(task_id)
             .filter(dsl::state.eq("RUNNING")),
     )
     .set(&changeset)
-    .returning((dsl::queue_name, dsl::priority))
-    .get_result::<(String, i32)>(conn)
+    .returning((dsl::queue_name, dsl::priority, dsl::task_type))
+    .get_result::<(String, i32, String)>(conn)
     .await
     .optional()
     .map_err(crate::error::database_error)?
@@ -2560,7 +2567,13 @@ pub async fn requeue_for_retry(
 
     // Dispatch hint (issue #1312). The retry is due at `next_run`, so the
     // channel parks the reference until then.
-    record_pending_hint(task_id, &queue_name, next_run, priority);
+    record_pending_hint(
+        task_id,
+        &queue_name,
+        next_run,
+        priority,
+        crate::dispatch::DispatchKind::from(task_type.as_str()),
+    );
 
     // Notify is best-effort: the task is already durably PENDING after the
     // UPDATE above and will be claimed on the next poll cycle even if
@@ -2645,7 +2658,13 @@ pub async fn requeue_workflow_task_nd_blocked(
     // Dispatch hint (issue #1312). No `pg_notify` fires here on purpose. The
     // channel parks a reference until `next_run` instead. That costs a poller
     // nothing and removes the backlog scan when the backoff elapses.
-    record_pending_hint(task_id, &queue_name, next_run, priority);
+    record_pending_hint(
+        task_id,
+        &queue_name,
+        next_run,
+        priority,
+        crate::dispatch::DispatchKind::Workflow,
+    );
 
     Ok(())
 }
@@ -2746,7 +2765,13 @@ pub async fn requeue_workflow_task_after_panic(
     // Dispatch hint (issue #1312). No `pg_notify` fires here on purpose. The
     // channel parks a reference until `next_run` instead. That costs a poller
     // nothing and removes the backlog scan when the backoff elapses.
-    record_pending_hint(task_id, &queue_name, next_run, priority);
+    record_pending_hint(
+        task_id,
+        &queue_name,
+        next_run,
+        priority,
+        crate::dispatch::DispatchKind::Workflow,
+    );
 
     Ok(())
 }
@@ -2901,7 +2926,13 @@ pub async fn force_retry_activity_now(
         crate::notify::notify_task_enqueued(conn, &actual_queue, task_id).await?;
         // Dispatch hint (issue #1312). Only when the row actually advanced: an
         // already-eligible row was hinted when it was first made `PENDING`.
-        record_pending_hint(task_id, &actual_queue, actual_scheduled_at, row.priority);
+        record_pending_hint(
+            task_id,
+            &actual_queue,
+            actual_scheduled_at,
+            row.priority,
+            crate::dispatch::DispatchKind::Activity,
+        );
     }
 
     Ok(RetryActivityOutcome {
@@ -2979,14 +3010,14 @@ pub async fn reschedule_task(
 ) -> HarvestResult<()> {
     use crate::schema::harvest_task_queue::dsl;
 
-    let (queue_name, priority) = diesel::update(
+    let (queue_name, priority, task_type) = diesel::update(
         dsl::harvest_task_queue
             .find(task_id)
             .filter(dsl::state.eq("RUNNING")),
     )
     .set(CleanContinuationChangeset::new(scheduled_at))
-    .returning((dsl::queue_name, dsl::priority))
-    .get_result::<(String, i32)>(conn)
+    .returning((dsl::queue_name, dsl::priority, dsl::task_type))
+    .get_result::<(String, i32, String)>(conn)
     .await
     .optional()
     .map_err(crate::error::database_error)?
@@ -2996,7 +3027,13 @@ pub async fn reschedule_task(
 
     crate::notify::notify_task_enqueued(conn, &queue_name, task_id).await?;
     // Dispatch hint (issue #1312).
-    record_pending_hint(task_id, &queue_name, scheduled_at, priority);
+    record_pending_hint(
+        task_id,
+        &queue_name,
+        scheduled_at,
+        priority,
+        crate::dispatch::DispatchKind::from(task_type.as_str()),
+    );
 
     Ok(())
 }
@@ -3021,7 +3058,7 @@ pub async fn defer_rate_limited_task(
 ) -> HarvestResult<()> {
     use crate::schema::harvest_task_queue::dsl;
 
-    let (queue_name, priority) = diesel::update(
+    let (queue_name, priority, task_type) = diesel::update(
         dsl::harvest_task_queue
             .find(task_id)
             .filter(dsl::state.eq("RUNNING")),
@@ -3034,8 +3071,8 @@ pub async fn defer_rate_limited_task(
             "GREATEST(attempt - 1, 0)",
         )),
     ))
-    .returning((dsl::queue_name, dsl::priority))
-    .get_result::<(String, i32)>(conn)
+    .returning((dsl::queue_name, dsl::priority, dsl::task_type))
+    .get_result::<(String, i32, String)>(conn)
     .await
     .optional()
     .map_err(crate::error::database_error)?
@@ -3045,7 +3082,13 @@ pub async fn defer_rate_limited_task(
 
     crate::notify::notify_task_enqueued(conn, &queue_name, task_id).await?;
     // Dispatch hint (issue #1312).
-    record_pending_hint(task_id, &queue_name, scheduled_at, priority);
+    record_pending_hint(
+        task_id,
+        &queue_name,
+        scheduled_at,
+        priority,
+        crate::dispatch::DispatchKind::from(task_type.as_str()),
+    );
 
     Ok(())
 }
@@ -3741,7 +3784,7 @@ const fn release_suspended_workflow_claim_query() -> &'static str {
        AND state = 'RUNNING' \
        AND worker_id = $2 \
        AND crash_strikes = $3 \
-     RETURNING id, queue_name, scheduled_at, priority"
+     RETURNING id, queue_name, scheduled_at, priority, task_type"
 }
 
 /// Release a still-claimed, but replay-suspended-empty-handed, workflow task
@@ -4318,7 +4361,7 @@ pub async fn wake_workflow_task(
     // NOTIFY was emitted for it, so a LISTEN-based worker would sleep until the
     // next poll interval. Notify those queues too so resume re-arms promptly.
     let already_due: Vec<PendingHintRow> = diesel::sql_query(
-        "SELECT id, queue_name, scheduled_at, priority FROM harvest_task_queue \
+        "SELECT id, queue_name, scheduled_at, priority, task_type FROM harvest_task_queue \
          WHERE workflow_exec_id = $1 \
            AND task_type = 'workflow' \
            AND state = 'PENDING' \
@@ -4412,7 +4455,7 @@ const fn primary_repend_workflow_task_query() -> &'static str {
            (state = 'RUNNING' AND worker_id IS NULL AND started_at IS NULL) \
            OR (state = 'PENDING' AND scheduled_at > $2 AND activity_name = 'mixed_signal_suspension') \
        ) \
-     RETURNING id, queue_name, scheduled_at, priority"
+     RETURNING id, queue_name, scheduled_at, priority, task_type"
 }
 
 /// SQL for [`wake_workflow_task`]'s dropped-wake fallback: marks a still-claimed
@@ -7184,7 +7227,7 @@ mod tests {
     fn release_suspended_workflow_claim_query_returns_every_hint_column() {
         let sql = release_suspended_workflow_claim_query();
         assert!(
-            sql.contains("RETURNING id, queue_name, scheduled_at, priority"),
+            sql.contains("RETURNING id, queue_name, scheduled_at, priority, task_type"),
             "the release must return the dispatch hint columns (issue #1312)"
         );
     }
@@ -8639,6 +8682,6 @@ mod tests {
     #[test]
     fn primary_repend_returns_every_hint_column() {
         let sql = primary_repend_workflow_task_query();
-        assert!(sql.contains("RETURNING id, queue_name, scheduled_at, priority"));
+        assert!(sql.contains("RETURNING id, queue_name, scheduled_at, priority, task_type"));
     }
 }

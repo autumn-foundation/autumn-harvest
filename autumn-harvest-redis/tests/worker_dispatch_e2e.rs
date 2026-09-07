@@ -1084,6 +1084,7 @@ async fn duplicate_reference_for_a_completed_row_is_acked_without_rerun() {
             scheduled_at: Utc::now(),
             priority: 0,
             shard: None,
+            kind: Some(autumn_harvest::dispatch::DispatchKind::Workflow),
         }])
         .await
         .expect("publish");

@@ -35,6 +35,48 @@ pub const DEFAULT_DISPATCH_RECONCILE_BATCH: usize = 1000;
 /// Default cap for the release backoff of a gated reference.
 pub const DEFAULT_DISPATCH_RELEASE_BACKOFF_CAP: Duration = Duration::from_secs(30);
 
+/// Which worker pool a reference needs (issue #1312).
+///
+/// The value is the `harvest_task_queue.task_type` column. A worker runs
+/// workflow tasks and activity tasks on separate semaphores, so a reference
+/// that does not say which pool it needs can only be weighed against the sum
+/// of the two.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum DispatchKind {
+    /// A workflow task. It runs on the workflow pool.
+    Workflow,
+    /// An activity task. It runs on the activity pool.
+    Activity,
+}
+
+impl DispatchKind {
+    /// The `task_type` column value for this kind.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Workflow => "workflow",
+            Self::Activity => "activity",
+        }
+    }
+}
+
+impl From<&str> for DispatchKind {
+    /// The kind a `task_type` column value names.
+    ///
+    /// A `CHECK` constraint holds the column to `workflow` or `activity`, so
+    /// only those two values reach this conversion. Any other value reads as a
+    /// workflow, which is the conservative half: a workflow reference is
+    /// weighed against the smaller pool of the two on a typical worker.
+    fn from(task_type: &str) -> Self {
+        if task_type == Self::Activity.as_str() {
+            Self::Activity
+        } else {
+            Self::Workflow
+        }
+    }
+}
+
 /// A reference to a claimable `harvest_task_queue` row.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DispatchHint {
@@ -48,6 +90,8 @@ pub struct DispatchHint {
     pub priority: i32,
     /// Shard the row lives on. `None` for a single-shard runtime.
     pub shard: Option<crate::types::ShardId>,
+    /// Pool the row needs. `None` for a reference of unknown type.
+    pub kind: Option<DispatchKind>,
 }
 
 /// One delivered reference. The worker must `ack` or `release` it.
@@ -63,6 +107,8 @@ pub struct DispatchLease {
     pub handle: String,
     /// Shard the row lives on. `None` for a single-shard runtime.
     pub shard: Option<crate::types::ShardId>,
+    /// Pool the row needs. `None` for a reference of unknown type.
+    pub kind: Option<DispatchKind>,
 }
 
 /// Counters returned by one maintenance pass.
@@ -573,6 +619,8 @@ struct MemoryEntry {
     due: DateTime<Utc>,
     redeliveries: u32,
     shard: Option<crate::types::ShardId>,
+    /// Pool the row needs, as the publish gave it.
+    kind: Option<DispatchKind>,
 }
 
 /// A reference delivered to a consumer and not yet acked.
@@ -807,6 +855,7 @@ impl TaskDispatch for MemoryDispatch {
                 due: hint.scheduled_at,
                 redeliveries: 0,
                 shard: hint.shard,
+                kind: hint.kind,
             };
             Self::place(&mut state, entry, now);
         }
@@ -852,6 +901,7 @@ impl TaskDispatch for MemoryDispatch {
                             redeliveries: entry.redeliveries,
                             handle: handle.clone(),
                             shard: entry.shard,
+                            kind: entry.kind,
                         });
                         state.inflight.insert(
                             handle,
@@ -951,6 +1001,7 @@ mod tests {
             scheduled_at: at,
             priority: 0,
             shard: None,
+            kind: Some(DispatchKind::Workflow),
         }
     }
 

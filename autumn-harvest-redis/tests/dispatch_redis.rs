@@ -121,6 +121,7 @@ fn hint(queue: &str, task_id: Uuid, scheduled_at: DateTime<Utc>) -> DispatchHint
         scheduled_at,
         priority: 0,
         shard: None,
+        kind: Some(autumn_harvest::dispatch::DispatchKind::Workflow),
     }
 }
 
