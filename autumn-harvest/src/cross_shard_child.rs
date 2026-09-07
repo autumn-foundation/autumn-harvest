@@ -1292,155 +1292,160 @@ async fn start_child_on_target(
     let workflow_name = row.workflow_name.clone();
     let parent_close_policy = row.parent_close_policy.clone();
 
-    Box::pin(conn.transaction::<(), HarvestError, _>(async |conn| {
-        let spec = spec.clone();
-        {
-            let already: Option<uuid::Uuid> = harvest_workflow_executions::table
-                .find(child_exec_id.as_uuid())
-                .select(harvest_workflow_executions::id)
-                .first(conn)
-                .await
-                .optional()
-                .map_err(crate::error::database_error)?;
-            if already.is_some() {
-                return Ok(());
-            }
+    // The child's queue task is written inside this transaction, so it raises a
+    // dispatch hint (issue #1312). The buffering scope holds the hint until the
+    // transaction commits on the target shard.
+    crate::dispatch::buffered_settled(Box::pin(conn.transaction::<(), HarvestError, _>(
+        async |conn| {
+            let spec = spec.clone();
+            {
+                let already: Option<uuid::Uuid> = harvest_workflow_executions::table
+                    .find(child_exec_id.as_uuid())
+                    .select(harvest_workflow_executions::id)
+                    .first(conn)
+                    .await
+                    .optional()
+                    .map_err(crate::error::database_error)?;
+                if already.is_some() {
+                    return Ok(());
+                }
 
-            // Anchor the PER-RUN deadlines at creation, not at the parent's
-            // decision. The relay can be minutes behind that decision — an
-            // unreachable target shard, a large backlog, a worker restart — and
-            // an absolute `deadline_at`/`sla_deadline_at` computed back then can
-            // already be in the past by the time the row lands, so the timeout
-            // and SLA scanners would time out or breach a child that has not run
-            // a single step. The normal start path derives these from the
-            // target's own start time for exactly this reason; the durations
-            // travel on the spec and become absolute here.
-            //
-            // The CHAIN deadline is the deliberate exception and is carried
-            // verbatim — see `CrossShardChildSpec::chain_deadline_at`.
-            let created_at = Utc::now();
-            let deadline_at = spec
-                .execution_timeout_secs
-                .map(|secs| created_at + chrono::Duration::seconds(secs));
-            let sla_deadline_at = spec
-                .sla_secs
-                .map(|secs| created_at + chrono::Duration::seconds(secs));
+                // Anchor the PER-RUN deadlines at creation, not at the parent's
+                // decision. The relay can be minutes behind that decision — an
+                // unreachable target shard, a large backlog, a worker restart — and
+                // an absolute `deadline_at`/`sla_deadline_at` computed back then can
+                // already be in the past by the time the row lands, so the timeout
+                // and SLA scanners would time out or breach a child that has not run
+                // a single step. The normal start path derives these from the
+                // target's own start time for exactly this reason; the durations
+                // travel on the spec and become absolute here.
+                //
+                // The CHAIN deadline is the deliberate exception and is carried
+                // verbatim — see `CrossShardChildSpec::chain_deadline_at`.
+                let created_at = Utc::now();
+                let deadline_at = spec
+                    .execution_timeout_secs
+                    .map(|secs| created_at + chrono::Duration::seconds(secs));
+                let sla_deadline_at = spec
+                    .sla_secs
+                    .map(|secs| created_at + chrono::Duration::seconds(secs));
 
-            let child_row = NewWorkflowExecution {
-                continued_from_exec_id: None,
-                first_exec_id: None,
-                chain_execution_timeout: spec
-                    .chain_execution_timeout_secs
-                    .map(chrono::Duration::seconds),
-                chain_deadline_at: spec.chain_deadline_at,
-                id: child_exec_id.as_uuid(),
-                workflow_name: &workflow_name,
-                workflow_id: &child_workflow_id,
-                run_id: uuid::Uuid::new_v4(),
-                // The child's row lives on the TARGET shard and must say so:
-                // its `ExecutionId` already encodes this shard, and a mismatched
-                // column would make every shard-filtered scanner query (timeouts,
-                // outboxes, the SLA sweep) skip it.
-                shard_id: row.target_shard,
-                input: spec.input.clone(),
-                parent_id: Some(parent_exec_id.as_uuid()),
-                queue_name: &spec.queue_name,
-                execution_timeout: spec.execution_timeout_secs.map(chrono::Duration::seconds),
-                deadline_at,
-                sla: spec.sla_secs.map(chrono::Duration::seconds),
-                sla_deadline_at,
-                memo: None,
-                search_attrs: None,
-                assigned_build_id: spec.assigned_build_id.clone(),
-                parent_close_policy: parent_close_policy.clone(),
-                owner: spec.owner.as_deref(),
-                runbook_url: spec.runbook_url.as_deref(),
-                severity: spec.severity.as_deref(),
-                context_headers: spec.context_headers.clone(),
-                schedule_id: None,
-                scheduled_for: None,
-                workflow_attempt: 1,
-                workflow_retry_policy: spec.retry_policy.clone(),
-                retry_of_exec_id: None,
-                origin: None,
-                completion_callbacks: None,
-                start_source: Some(crate::types::StartSource::Child.as_str()),
-                start_source_ref: Some(parent_exec_id_str.as_str()),
-                started_by: None,
-                quota_key: spec.quota_key.as_deref(),
-            };
-            let inserted = diesel::insert_into(harvest_workflow_executions::table)
-                .values(&child_row)
-                .on_conflict(harvest_workflow_executions::id)
-                .do_nothing()
-                .execute(conn)
-                .await
-                .map_err(crate::error::database_error)?;
-            if inserted == 0 {
-                // Another sweep won the race; its transaction owns the child's
-                // event and task.
-                return Ok(());
-            }
-
-            // The child's OWN declared quota (issue #946), enforced against the
-            // row this transaction just inserted and BEFORE its `WorkflowStarted`
-            // event is appended — the identical insert-then-enforce ordering the
-            // same-shard child path uses, so `history_bytes` reports usage
-            // strictly before this admission.
-            crate::execution::enforce_quota_admission(
-                conn,
-                spec.quota.map(QuotaCaps::to_policy),
-                spec.quota_key.as_deref(),
-                &workflow_name,
-                Some(metrics),
-            )
-            .await?;
-
-            // The CONFIGURED codec registry, never `PayloadCodecs::default()`.
-            // The child's `WorkflowStarted` carries its input, so writing it
-            // through the identity codec would store that payload in the clear
-            // on a deployment that has a keyed codec registered (#948) —
-            // silently, and only for children that opted into cross-shard
-            // placement. Every same-shard spawn path resolves its codecs from
-            // the runtime for exactly this reason.
-            //
-            // KNOWN GAP: the large-payload *offloader* is not applied here. It
-            // lives on the handler registry, which a scanner does not hold, and
-            // threading it would touch ~29 call sites across the repo for what
-            // is a storage optimisation rather than a correctness or
-            // confidentiality property — the child-input cap is already enforced
-            // at spawn time, so an over-cap payload never becomes a cross-shard
-            // child in the first place. Tracked as a follow-up.
-            store::append_events_offloaded_with_codecs(
-                conn,
-                child_exec_id,
-                &[WorkflowEvent::WorkflowStarted {
+                let child_row = NewWorkflowExecution {
+                    continued_from_exec_id: None,
+                    first_exec_id: None,
+                    chain_execution_timeout: spec
+                        .chain_execution_timeout_secs
+                        .map(chrono::Duration::seconds),
+                    chain_deadline_at: spec.chain_deadline_at,
+                    id: child_exec_id.as_uuid(),
+                    workflow_name: &workflow_name,
+                    workflow_id: &child_workflow_id,
+                    run_id: uuid::Uuid::new_v4(),
+                    // The child's row lives on the TARGET shard and must say so:
+                    // its `ExecutionId` already encodes this shard, and a mismatched
+                    // column would make every shard-filtered scanner query (timeouts,
+                    // outboxes, the SLA sweep) skip it.
+                    shard_id: row.target_shard,
                     input: spec.input.clone(),
-                    timestamp: created_at,
-                    last_completion_result: None,
-                    last_error: None,
-                    scheduled_time: None,
-                }],
-                0,
-                None,
-                codecs,
-            )
-            .await?;
+                    parent_id: Some(parent_exec_id.as_uuid()),
+                    queue_name: &spec.queue_name,
+                    execution_timeout: spec.execution_timeout_secs.map(chrono::Duration::seconds),
+                    deadline_at,
+                    sla: spec.sla_secs.map(chrono::Duration::seconds),
+                    sla_deadline_at,
+                    memo: None,
+                    search_attrs: None,
+                    assigned_build_id: spec.assigned_build_id.clone(),
+                    parent_close_policy: parent_close_policy.clone(),
+                    owner: spec.owner.as_deref(),
+                    runbook_url: spec.runbook_url.as_deref(),
+                    severity: spec.severity.as_deref(),
+                    context_headers: spec.context_headers.clone(),
+                    schedule_id: None,
+                    scheduled_for: None,
+                    workflow_attempt: 1,
+                    workflow_retry_policy: spec.retry_policy.clone(),
+                    retry_of_exec_id: None,
+                    origin: None,
+                    completion_callbacks: None,
+                    start_source: Some(crate::types::StartSource::Child.as_str()),
+                    start_source_ref: Some(parent_exec_id_str.as_str()),
+                    started_by: None,
+                    quota_key: spec.quota_key.as_deref(),
+                };
+                let inserted = diesel::insert_into(harvest_workflow_executions::table)
+                    .values(&child_row)
+                    .on_conflict(harvest_workflow_executions::id)
+                    .do_nothing()
+                    .execute(conn)
+                    .await
+                    .map_err(crate::error::database_error)?;
+                if inserted == 0 {
+                    // Another sweep won the race; its transaction owns the child's
+                    // event and task.
+                    return Ok(());
+                }
 
-            let mut params = queue::EnqueueParams::new(
-                spec.queue_name.clone(),
-                TaskType::Workflow,
-                spec.input.clone(),
-            );
-            params.workflow_exec_id = Some(child_exec_id.as_uuid());
-            params.required_build_id = spec.assigned_build_id.clone();
-            params.concurrency_key = spec.concurrency_key.clone();
-            params.max_concurrent = spec.max_concurrent;
-            params.trace_context = spec.trace_context.clone();
-            queue::enqueue(conn, &params).await?;
-            Ok(())
-        }
-    }))
+                // The child's OWN declared quota (issue #946), enforced against the
+                // row this transaction just inserted and BEFORE its `WorkflowStarted`
+                // event is appended — the identical insert-then-enforce ordering the
+                // same-shard child path uses, so `history_bytes` reports usage
+                // strictly before this admission.
+                crate::execution::enforce_quota_admission(
+                    conn,
+                    spec.quota.map(QuotaCaps::to_policy),
+                    spec.quota_key.as_deref(),
+                    &workflow_name,
+                    Some(metrics),
+                )
+                .await?;
+
+                // The CONFIGURED codec registry, never `PayloadCodecs::default()`.
+                // The child's `WorkflowStarted` carries its input, so writing it
+                // through the identity codec would store that payload in the clear
+                // on a deployment that has a keyed codec registered (#948) —
+                // silently, and only for children that opted into cross-shard
+                // placement. Every same-shard spawn path resolves its codecs from
+                // the runtime for exactly this reason.
+                //
+                // KNOWN GAP: the large-payload *offloader* is not applied here. It
+                // lives on the handler registry, which a scanner does not hold, and
+                // threading it would touch ~29 call sites across the repo for what
+                // is a storage optimisation rather than a correctness or
+                // confidentiality property — the child-input cap is already enforced
+                // at spawn time, so an over-cap payload never becomes a cross-shard
+                // child in the first place. Tracked as a follow-up.
+                store::append_events_offloaded_with_codecs(
+                    conn,
+                    child_exec_id,
+                    &[WorkflowEvent::WorkflowStarted {
+                        input: spec.input.clone(),
+                        timestamp: created_at,
+                        last_completion_result: None,
+                        last_error: None,
+                        scheduled_time: None,
+                    }],
+                    0,
+                    None,
+                    codecs,
+                )
+                .await?;
+
+                let mut params = queue::EnqueueParams::new(
+                    spec.queue_name.clone(),
+                    TaskType::Workflow,
+                    spec.input.clone(),
+                );
+                params.workflow_exec_id = Some(child_exec_id.as_uuid());
+                params.required_build_id = spec.assigned_build_id.clone();
+                params.concurrency_key = spec.concurrency_key.clone();
+                params.max_concurrent = spec.max_concurrent;
+                params.trace_context = spec.trace_context.clone();
+                queue::enqueue(conn, &params).await?;
+                Ok(())
+            }
+        },
+    )))
     .await
 }
 

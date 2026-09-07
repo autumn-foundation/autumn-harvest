@@ -796,7 +796,11 @@ pub async fn reset_workflow_execution(
     registry: Option<&HandlerRegistry>,
 ) -> Result<ResetResult, WorkflowResetError> {
     let mut request = request.normalized();
-    let (res, deferred_starts, workflow_name, closed_children) =
+    // `enqueue_fork_workflow_task` writes the fork's `PENDING` task row, so it
+    // raises a dispatch hint (issue #1312). The buffering scope holds the hint
+    // until this transaction commits. A hint published earlier names a row no
+    // reader outside this transaction can see.
+    let (res, deferred_starts, workflow_name, closed_children) = crate::dispatch::buffered_settled(
         Box::pin(conn.transaction::<(
             ResetResult,
             Vec<DeferredTriggerStart>,
@@ -891,8 +895,9 @@ pub async fn reset_workflow_execution(
                 source.workflow_name,
                 closed_children,
             ))
-        }))
-        .await?;
+        })),
+    )
+    .await?;
 
     for start in deferred_starts {
         start.spawn();

@@ -23823,6 +23823,62 @@ const DISPATCH_ABSENT_ROW_RELEASES: u32 = 3;
 /// Delay for the release of a reference whose row is not visible yet.
 const DISPATCH_ABSENT_ROW_DELAY: Duration = Duration::from_millis(50);
 
+/// Number of short releases a parked workflow row gets before its reference is
+/// acked.
+///
+/// A `RUNNING` row with no `worker_id` is parked: a decision cycle finished and
+/// left the row waiting for a wake. A producer outside a buffering scope can
+/// publish a wake's hint before the wake commits, so the reference can arrive
+/// while the re-pend is still in flight. Three short releases cover that
+/// window. After them the row is parked with no wake behind it, and the
+/// reference is dropped.
+const DISPATCH_PARKED_ROW_RELEASES: u32 = 3;
+
+/// Cap on one dispatch-channel call other than a read (contract C4).
+///
+/// A channel that accepts a call and never answers must not stall the worker.
+/// An elapsed timeout reads as a channel error, so the caller takes the same
+/// path a returned error takes.
+const DISPATCH_CALL_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Run one channel call under [`DISPATCH_CALL_TIMEOUT`].
+async fn dispatch_call<T>(
+    call: impl std::future::Future<Output = HarvestResult<T>>,
+    what: &'static str,
+) -> HarvestResult<T> {
+    (tokio::time::timeout(DISPATCH_CALL_TIMEOUT, call).await).map_or_else(
+        |_| {
+            Err(HarvestError::Dispatch(format!(
+                "dispatch {what} did not answer within {DISPATCH_CALL_TIMEOUT:?}"
+            )))
+        },
+        |result| result,
+    )
+}
+
+/// How many references one read asks for (issue #1312).
+///
+/// The two pools have separate permits, and a workflow reference cannot start
+/// on an activity permit. `None` means both pools are full: a read now would
+/// hold references that nothing can start, so the caller sleeps instead. The
+/// sum is the bound, so a read never asks for more than the worker can start,
+/// and it never floors to one when there is no free permit at all.
+const fn dispatch_read_size(free_workflow: usize, free_activity: usize) -> Option<usize> {
+    let free = free_workflow.saturating_add(free_activity);
+    if free == 0 {
+        return None;
+    }
+    if free < DISPATCH_READ_MAX {
+        Some(free)
+    } else {
+        Some(DISPATCH_READ_MAX)
+    }
+}
+
+/// How far back [`DispatchLoopState::new`] sets its timers, so both read as
+/// elapsed against any interval a worker configures.
+const DISPATCH_TIMER_START_OFFSET: Duration = Duration::from_secs(3600);
+
 /// What one dispatch loop remembers between iterations.
 #[derive(Debug)]
 struct DispatchLoopState {
@@ -23841,7 +23897,15 @@ impl DispatchLoopState {
         // reconciles before it waits on the channel. A worker that starts
         // against a channel with no references still finds the standing
         // backlog immediately.
-        let past = std::time::Instant::now();
+        //
+        // `checked_sub` reads the timers back one hour. `Instant::now()` alone
+        // is not elapsed against any real interval, so the first maintenance
+        // pass and the first sweep would wait one interval each. A platform
+        // whose `Instant` epoch is younger than the offset returns `None`; the
+        // current instant is the correct fallback there, because the first
+        // sweep is then one interval late rather than never.
+        let now = std::time::Instant::now();
+        let past = now.checked_sub(DISPATCH_TIMER_START_OFFSET).unwrap_or(now);
         Self {
             maintained: past,
             reconciled: past,
@@ -23900,7 +23964,17 @@ fn reference_outcome(
         return ReferenceOutcome::Ack;
     };
     if !probe.is_pending() {
-        // `RUNNING` or terminal. Another worker holds it, or it is finished.
+        // A parked workflow row is `RUNNING` with no owner. A wake for it may
+        // still be in flight, so hold the reference for a few short releases
+        // rather than drop it. See [`DISPATCH_PARKED_ROW_RELEASES`].
+        if probe.state == "RUNNING"
+            && !probe.has_worker
+            && redeliveries < DISPATCH_PARKED_ROW_RELEASES
+        {
+            return ReferenceOutcome::Release(DISPATCH_ABSENT_ROW_DELAY);
+        }
+        // `RUNNING` under a worker, or terminal. Another worker holds it, or it
+        // is finished.
         return ReferenceOutcome::Ack;
     }
     if probe.scheduled_at > now {
@@ -23988,7 +24062,10 @@ impl Worker {
             let pool_shards = 0;
             if shard_count > 1 || pool_shards > 1 {
                 return Err(HarvestError::Config(format!(
-                    "a dispatch channel is installed and this worker spans {shard_count}                      shard assignments and {pool_shards} sharded pool entries; dispatch                      supports single-shard runtimes only in v1 (issue #1312)"
+                    "a dispatch channel is installed and this worker spans \
+                     {shard_count} shard assignments and {pool_shards} sharded pool \
+                     entries; dispatch supports single-shard runtimes only in v1 \
+                     (issue #1312)"
                 )));
             }
         }
@@ -25587,7 +25664,11 @@ impl Worker {
         let settings = &installed.settings;
 
         if DispatchLoopState::due(&mut state.maintained, settings.poll_interval)
-            && let Err(error) = installed.channel.maintain(&self.config.queues).await
+            && let Err(error) = dispatch_call(
+                installed.channel.maintain(&self.config.queues),
+                "maintenance",
+            )
+            .await
         {
             self.log_dispatch_error(state, &error, "dispatch maintenance failed");
         }
@@ -25596,37 +25677,52 @@ impl Worker {
             self.run_dispatch_reconcile(pool, installed, state).await;
         }
 
-        // One read sized to the free concurrency, so the worker never holds
-        // more references than it can start. The semaphores gate execution,
-        // not claiming, so this is a bound and not a guarantee.
-        let free = self
-            .workflow_semaphore
-            .available_permits()
-            .saturating_add(self.activity_semaphore.available_permits());
-        let want = free.clamp(1, DISPATCH_READ_MAX);
+        // One read sized to the free permits of each pool, so the worker never
+        // holds more references than it can start. The semaphores gate
+        // execution, not claiming, so this is a bound and not a guarantee.
+        let Some(want) = dispatch_read_size(
+            self.workflow_semaphore.available_permits(),
+            self.activity_semaphore.available_permits(),
+        ) else {
+            // Both pools are full. A reference read now would sit in this
+            // worker's hands until a permit frees, which keeps it from a peer
+            // that has one. Sleep one poll interval instead.
+            tokio::select! {
+                () = self.shutdown.cancelled() => {}
+                () = tokio::time::sleep(self.config.poll_interval) => {}
+            }
+            return false;
+        };
 
-        let leases = match installed
-            .channel
-            .next(
-                &self.config.queues,
-                &self.config.worker_id,
-                want,
-                settings.poll_interval,
-            )
-            .await
-        {
-            Ok(leases) => leases,
-            Err(error) => {
+        // The read blocks for `poll_interval` by contract, so its cap is that
+        // wait plus the call timeout (contract C4). The shutdown arm gives a
+        // stopping worker its exit without waiting out the read.
+        let read = tokio::select! {
+            () = self.shutdown.cancelled() => return false,
+            result = tokio::time::timeout(
+                settings.poll_interval + DISPATCH_CALL_TIMEOUT,
+                installed.channel.next(
+                    &self.config.queues,
+                    &self.config.worker_id,
+                    want,
+                    settings.poll_interval,
+                ),
+            ) => result,
+        };
+
+        let leases = match read {
+            Ok(Ok(leases)) => leases,
+            Ok(Err(error)) => {
                 self.log_dispatch_error(state, &error, "dispatch read failed");
-                let dispatched = self
-                    .poll_once(
-                        pool,
-                        shard_acquire_bound(false, self.config.poll_interval),
-                        shard,
-                    )
-                    .await;
-                tokio::time::sleep(self.config.poll_interval).await;
-                return dispatched;
+                return self.fall_back_to_postgres(pool, shard).await;
+            }
+            Err(_) => {
+                let error = HarvestError::Dispatch(format!(
+                    "dispatch read did not answer within {:?}",
+                    settings.poll_interval + DISPATCH_CALL_TIMEOUT
+                ));
+                self.log_dispatch_error(state, &error, "dispatch read timed out");
+                return self.fall_back_to_postgres(pool, shard).await;
             }
         };
 
@@ -25634,12 +25730,36 @@ impl Worker {
         for lease in leases {
             if self.shutdown.is_cancelled() {
                 // Give the reference straight back so a peer serves it now.
-                let _ = installed.channel.release(&lease, Duration::ZERO).await;
+                let _ = dispatch_call(installed.channel.release(&lease, Duration::ZERO), "release")
+                    .await;
                 continue;
             }
             dispatched |= self
                 .consume_reference(pool, shard, installed, state, lease)
                 .await;
+        }
+        dispatched
+    }
+
+    /// Claim through the Postgres path for one iteration.
+    ///
+    /// The dispatch channel failed, so availability must equal the Postgres
+    /// path for this iteration.
+    async fn fall_back_to_postgres(
+        &self,
+        pool: &DbPool,
+        shard: Option<crate::types::ShardId>,
+    ) -> bool {
+        let dispatched = self
+            .poll_once(
+                pool,
+                shard_acquire_bound(false, self.config.poll_interval),
+                shard,
+            )
+            .await;
+        tokio::select! {
+            () = self.shutdown.cancelled() => {}
+            () = tokio::time::sleep(self.config.poll_interval) => {}
         }
         dispatched
     }
@@ -25691,8 +25811,14 @@ impl Worker {
                 // worker. A crash here leaves the reference in the channel's
                 // pending list; recovery redelivers it, the row reads
                 // `RUNNING`, and the redelivered reference is acked.
+                //
+                // The pool connection goes back before the ack. The ack is a
+                // round trip to the channel, and holding a connection across it
+                // would keep one connection per in-flight reference busy for a
+                // read the database has no part in (issue #1312 review).
+                drop(conn);
                 chaos_point!(DISPATCH_AFTER_CLAIM_BEFORE_ACK);
-                if let Err(error) = installed.channel.ack(&lease).await {
+                if let Err(error) = dispatch_call(installed.channel.ack(&lease), "ack").await {
                     // The claim is durable either way. A failed ack costs one
                     // redelivery, which finds the row `RUNNING` and acks.
                     self.log_dispatch_error(state, &error, "dispatch ack failed after a claim");
@@ -25703,7 +25829,6 @@ impl Worker {
                     queue = %task.queue_name,
                     "claimed task (dispatch)"
                 );
-                drop(conn);
                 self.dispatch_task(task, pool);
                 true
             }
@@ -25712,6 +25837,7 @@ impl Worker {
                     Ok(probe) => probe,
                     Err(error) => {
                         tracing::warn!(error = %error, task_id = %lease.task_id, "dispatch probe failed");
+                        drop(conn);
                         self.retry_reference(installed, &lease).await;
                         return false;
                     }
@@ -25722,10 +25848,15 @@ impl Worker {
                     chrono::Utc::now(),
                     &installed.settings,
                 );
+                // Same reason as the claimed arm: the disposal is a channel
+                // round trip, so the connection goes back first.
+                drop(conn);
                 let result = match outcome {
-                    ReferenceOutcome::Ack => installed.channel.ack(&lease).await,
+                    ReferenceOutcome::Ack => {
+                        dispatch_call(installed.channel.ack(&lease), "ack").await
+                    }
                     ReferenceOutcome::Release(delay) => {
-                        installed.channel.release(&lease, delay).await
+                        dispatch_call(installed.channel.release(&lease, delay), "release").await
                     }
                 };
                 if let Err(error) = result {
@@ -25735,6 +25866,7 @@ impl Worker {
             }
             Err(error) => {
                 tracing::error!(error = %error, task_id = %lease.task_id, "failed to claim a dispatched task");
+                drop(conn);
                 self.retry_reference(installed, &lease).await;
                 false
             }
@@ -25788,7 +25920,12 @@ impl Worker {
         if hints.is_empty() {
             return;
         }
-        if let Err(error) = installed.channel.publish(&hints).await {
+        // The connection goes back before the publish: the publish is a channel
+        // round trip that the database has no part in.
+        drop(conn);
+        if let Err(error) =
+            dispatch_call(installed.channel.publish(&hints), "reconcile publish").await
+        {
             self.log_dispatch_error(state, &error, "dispatch reconcile publish failed");
         }
     }
@@ -25803,10 +25940,11 @@ impl Worker {
         installed: &crate::dispatch::InstalledDispatch,
         lease: &crate::dispatch::DispatchLease,
     ) {
-        let _ = installed
-            .channel
-            .release(lease, self.config.poll_interval)
-            .await;
+        let _ = dispatch_call(
+            installed.channel.release(lease, self.config.poll_interval),
+            "release",
+        )
+        .await;
     }
 
     /// Log a channel error at most once per [`DISPATCH_ERROR_LOG_INTERVAL`].
@@ -26852,8 +26990,16 @@ impl Worker {
             // `PENDING`. A reader probes such a row and acks the reference.
             // The settle points on the two activity-finalize transactions drop
             // those hints before they get this far.
-            let ((), hints) = Box::pin(crate::dispatch::buffered(task_body)).await;
-            crate::dispatch::publish_now(hints).await;
+            //
+            // A deployment with no channel runs the body directly. The scope
+            // would allocate a buffer and one boxed future per task for hints
+            // that no hook ever raises, so the Postgres-only path skips it.
+            if crate::dispatch::is_installed() {
+                let ((), hints) = Box::pin(crate::dispatch::buffered(task_body)).await;
+                crate::dispatch::publish_now(hints).await;
+            } else {
+                task_body.await;
+            }
         });
     }
 
@@ -37535,6 +37681,43 @@ mod tests {
     }
 
     #[test]
+    fn a_parked_workflow_row_gets_three_short_releases_and_is_then_acked() {
+        let settings = dispatch_settings();
+        let now = chrono::Utc::now();
+        let parked = crate::queue::DispatchProbe {
+            state: "RUNNING".to_string(),
+            scheduled_at: now,
+            has_worker: false,
+        };
+
+        for redeliveries in 0..DISPATCH_PARKED_ROW_RELEASES {
+            assert_eq!(
+                reference_outcome(Some(&parked), redeliveries, now, &settings),
+                ReferenceOutcome::Release(DISPATCH_ABSENT_ROW_DELAY),
+                "a wake may be in flight against a parked row"
+            );
+        }
+        assert_eq!(
+            reference_outcome(Some(&parked), DISPATCH_PARKED_ROW_RELEASES, now, &settings),
+            ReferenceOutcome::Ack,
+            "a row still parked after the grace releases has no wake in flight"
+        );
+    }
+
+    #[test]
+    fn a_read_is_sized_to_the_free_permits_of_both_pools() {
+        assert_eq!(dispatch_read_size(0, 0), None, "no permit means no read");
+        assert_eq!(dispatch_read_size(1, 0), Some(1));
+        assert_eq!(dispatch_read_size(0, 1), Some(1));
+        assert_eq!(dispatch_read_size(2, 3), Some(5));
+        assert_eq!(
+            dispatch_read_size(1_000, 1_000),
+            Some(DISPATCH_READ_MAX),
+            "a read never asks for more than the cap"
+        );
+    }
+
+    #[test]
     fn an_absent_row_gets_three_short_releases_and_is_then_acked() {
         let settings = dispatch_settings();
         let now = chrono::Utc::now();
@@ -37565,18 +37748,48 @@ mod tests {
 
     #[test]
     fn the_dispatch_loop_maintains_and_reconciles_on_its_first_iteration() {
+        // Real intervals, not `Duration::ZERO`: a timer that starts at the
+        // current instant is due against a zero interval whatever it holds, so
+        // a zero interval proves nothing.
         let mut state = DispatchLoopState::new();
         assert!(
-            DispatchLoopState::due(&mut state.maintained, Duration::ZERO),
+            DispatchLoopState::due(&mut state.maintained, Duration::from_millis(20)),
             "the first iteration must maintain before it waits"
         );
         assert!(
-            DispatchLoopState::due(&mut state.reconciled, Duration::ZERO),
+            DispatchLoopState::due(&mut state.reconciled, Duration::from_secs(1)),
             "the first iteration must reconcile before it waits"
         );
         assert!(
             !DispatchLoopState::due(&mut state.maintained, Duration::from_secs(3600)),
             "a timer that has not elapsed is not due"
         );
+        assert!(
+            !DispatchLoopState::due(&mut state.reconciled, Duration::from_secs(3600)),
+            "a reset timer is not due again inside its interval"
+        );
+    }
+
+    #[test]
+    fn the_sharded_runtime_rejection_reads_as_one_sentence() {
+        let registry = Arc::new(HandlerRegistry::new(vec![], vec![]));
+        let channel = Arc::new(crate::dispatch::MemoryDispatch::new());
+        crate::dispatch::install(
+            channel as Arc<dyn crate::dispatch::TaskDispatch>,
+            crate::dispatch::DispatchSettings::default(),
+        );
+        let config = WorkerRuntimeConfig {
+            shard_assignments: vec![crate::types::ShardId::new(0), crate::types::ShardId::new(1)],
+            ..default_runtime_config()
+        };
+        let error = Worker::new(config, registry).expect_err("multi-shard must be rejected");
+        crate::dispatch::uninstall();
+
+        let message = error.to_string();
+        assert!(
+            !message.contains("  "),
+            "the rejection message has a run of spaces: {message}"
+        );
+        assert!(message.contains("single-shard runtimes only"), "{message}");
     }
 }

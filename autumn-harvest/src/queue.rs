@@ -1459,6 +1459,13 @@ pub const fn dispatch_probe_query() -> &'static str {
 /// `queue_name` and then carries `priority DESC, scheduled_at` — serves both
 /// the filter and the ordering. A single `queue_name = ANY(...)` statement
 /// would sort the union of every queue instead.
+///
+/// The queue-pause anti-join keeps the sweep off a held queue (issue #619). A
+/// paused queue's rows stay `PENDING` and due, so without it every sweep would
+/// republish the whole backlog of the outage. The claim then fails the pause
+/// gate, and each reference cycles through the release backoff instead. The
+/// anti-join is one probe per statement, not one per row, because the query
+/// binds exactly one queue name.
 #[must_use]
 pub const fn due_dispatch_hints_query() -> &'static str {
     "SELECT id, queue_name, scheduled_at, priority \
@@ -1466,6 +1473,7 @@ pub const fn due_dispatch_hints_query() -> &'static str {
      WHERE queue_name = $1 \
        AND state = 'PENDING' \
        AND scheduled_at <= NOW() \
+       AND NOT EXISTS (SELECT 1 FROM harvest_queue_pauses qp WHERE qp.queue_name = $1) \
      ORDER BY priority DESC, scheduled_at ASC \
      LIMIT $2"
 }
@@ -4170,12 +4178,17 @@ pub async fn wake_workflow_task(
     // Dispatch hints (issue #1312), one per re-pended or already-due row. The
     // `wake_requested` fallback needs none: it leaves the row `RUNNING` with
     // its owner, so there is nothing for a channel reader to claim.
-    crate::dispatch::record_hints(
-        repended
-            .iter()
-            .map(PendingHintRow::to_hint)
-            .collect::<Vec<_>>(),
-    );
+    //
+    // The vector is built only when a channel is installed. A deployment
+    // without one pays one atomic load rather than one allocation per wake.
+    if crate::dispatch::is_installed() {
+        crate::dispatch::record_hints(
+            repended
+                .iter()
+                .map(PendingHintRow::to_hint)
+                .collect::<Vec<_>>(),
+        );
+    }
 
     let mut queue_names: Vec<String> = repended
         .into_iter()
@@ -8359,6 +8372,17 @@ mod tests {
         assert!(sql.contains("ORDER BY priority DESC, scheduled_at ASC"));
         assert!(sql.contains("LIMIT $2"));
         assert!(sql.contains("priority"));
+    }
+
+    #[test]
+    fn due_dispatch_hints_query_skips_a_paused_queue() {
+        let sql = due_dispatch_hints_query();
+        assert!(
+            sql.contains(
+                "AND NOT EXISTS (SELECT 1 FROM harvest_queue_pauses qp WHERE qp.queue_name = $1)"
+            ),
+            "the reconcile sweep must not republish rows of a paused queue"
+        );
     }
 
     #[test]

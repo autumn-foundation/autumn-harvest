@@ -1477,10 +1477,15 @@ pub async fn resume_queue(
             .await?;
         let released = shifted.len();
         let shifted_ids: Vec<uuid::Uuid> = shifted.into_iter().map(|r| r.id).collect();
-        collector
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .extend(shifted_ids.iter().copied());
+        // Only a deployment with a channel needs the thawed ids. Without one
+        // the collector stays empty, so a resume of a large backlog does not
+        // hold a second copy of every id it shifted.
+        if crate::dispatch::is_installed() {
+            collector
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .extend(shifted_ids.iter().copied());
+        }
 
         // Second pass, LAST so it sees the freshest snapshot: a task still
         // held (our DELETE has not committed, so concurrent claimers still

@@ -1513,8 +1513,13 @@ pub async fn start_or_load_workflow_execution(
     // The start writes a `PENDING` task row, so it raises a dispatch hint
     // (issue #1312). Buffer it here and publish after the call returns: this is
     // the self-owned transaction path, so the row is durable by then.
-    let (collected, hints) = crate::dispatch::buffered(start_or_load_workflow_execution_collect(
-        conn, request, false, false, None, gate,
+    //
+    // `Box::pin` keeps this future off the caller's stack. The collect future
+    // is large, and every caller of this function inlines it, so an unboxed
+    // future here pushes each of them over the `clippy::large_futures`
+    // threshold.
+    let (collected, hints) = Box::pin(crate::dispatch::buffered(
+        start_or_load_workflow_execution_collect(conn, request, false, false, None, gate),
     ))
     .await;
     let (result, deferred_starts, deferred_checks, _cancel_metrics) = collected?;
@@ -1535,8 +1540,9 @@ pub async fn start_or_load_workflow_execution_with_metrics(
     gate: Option<crate::admission_gate::GateMode>,
 ) -> HarvestResult<StartedWorkflowExecution> {
     // Same post-commit publish as `start_or_load_workflow_execution`.
-    let (collected, hints) = crate::dispatch::buffered(start_or_load_workflow_execution_collect(
-        conn, request, false, false, metrics, gate,
+    // `Box::pin` for the same reason as the call above.
+    let (collected, hints) = Box::pin(crate::dispatch::buffered(
+        start_or_load_workflow_execution_collect(conn, request, false, false, metrics, gate),
     ))
     .await;
     let (result, deferred_starts, deferred_checks, cancel_metrics) = collected?;

@@ -815,7 +815,10 @@ impl WorkflowHandleClient {
         // it. `TransactionalStartOutcome::finish` — this method's documented
         // post-commit hook — publishes it. A caller that never calls `finish`
         // loses only latency: the worker's reconcile sweep republishes the row.
-        let (collected, start_hints) = crate::dispatch::buffered(async {
+        //
+        // `Box::pin` keeps this future off the caller's stack, as the two
+        // `start_or_load_workflow_execution` call sites do.
+        let (collected, start_hints) = Box::pin(crate::dispatch::buffered(async {
             if let Some(key) = options.idempotency_key.as_deref() {
                 self.start_workflow_transactional_idempotent(conn, params, key)
                     .await
@@ -872,7 +875,7 @@ impl WorkflowHandleClient {
                 }))
                 .await
             }
-        })
+        }))
         .await;
         let (started, deferred_starts, deferred_checks, cancel_metrics) = collected?;
 

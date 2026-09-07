@@ -105,8 +105,23 @@ impl Default for DispatchSettings {
 /// every due `PENDING` row that the channel does not hold.
 #[async_trait]
 pub trait TaskDispatch: Send + Sync + std::fmt::Debug {
-    /// Publish references. A reference that the channel already holds is a
-    /// no-op, unless the new `scheduled_at` is earlier than the held one.
+    /// Publish references, keyed on `scheduled_at`.
+    ///
+    /// The channel holds at most one reference per task id. `scheduled_at`
+    /// decides what a second publish for a held id does.
+    ///
+    /// * The same `scheduled_at` as the held reference is a no-op. The
+    ///   implementation refreshes the reference's dedupe lifetime and keeps
+    ///   everything else, including the redelivery count and any backoff a
+    ///   release parked it under.
+    /// * A different `scheduled_at` replaces the held reference. The row moved,
+    ///   so the reference moves to the new due time and its redelivery count
+    ///   starts again at zero.
+    ///
+    /// A released reference keeps the row's `scheduled_at`, not the time the
+    /// backoff parked it under. The reconcile sweep republishes a row with the
+    /// row's own `scheduled_at`, so a sweep never disturbs a backoff. A wake or
+    /// a retry writes a new `scheduled_at`, so it does move the reference.
     async fn publish(&self, hints: &[DispatchHint]) -> HarvestResult<()>;
 
     /// Read up to `max` due references for `queues`. Wait up to `wait` when
@@ -260,6 +275,34 @@ pub async fn flush_scope() {
 /// Returns `outcome` unchanged.
 pub async fn settle_scope<T, E>(outcome: Result<T, E>) -> Result<T, E> {
     let hints = take_scoped_hints();
+    if outcome.is_ok() {
+        publish_now(hints).await;
+    }
+    outcome
+}
+
+/// Run `f` in a buffering scope and settle its hints against its result.
+///
+/// This is the one call a transaction owner needs. `f` owns a transaction and
+/// returns its result. Every hint the transaction raises waits in the scope. A
+/// committed transaction publishes them, because each row they name is now
+/// durable. A rolled-back transaction discards them, because it left no
+/// `PENDING` row for them to name.
+///
+/// The call is safe inside an outer scope. [`buffered`] does not nest, so a
+/// nested owner returns no hints and the outer owner keeps them. That is what
+/// [`settle_scope`] cannot do: it drains whichever scope is active, so a nested
+/// caller would publish the enclosing transaction's hints before that
+/// transaction commits.
+///
+/// # Errors
+///
+/// Returns the result of `f` unchanged.
+pub async fn buffered_settled<T, E, F>(f: F) -> Result<T, E>
+where
+    F: Future<Output = Result<T, E>>,
+{
+    let (outcome, hints) = buffered(f).await;
     if outcome.is_ok() {
         publish_now(hints).await;
     }
@@ -421,6 +464,12 @@ pub const DEFAULT_MEMORY_VISIBILITY_TIMEOUT: Duration = Duration::from_secs(60);
 struct MemoryEntry {
     task_id: Uuid,
     queue_name: String,
+    /// The `scheduled_at` of the row, as the publish that placed this entry
+    /// gave it. Contract C1 keys the dedupe on this value, so a release must
+    /// keep it while it changes `due`.
+    scheduled_at: DateTime<Utc>,
+    /// When the entry becomes claimable. Equal to `scheduled_at` on publish, and
+    /// later than it while a release backs the entry off.
     due: DateTime<Utc>,
     redeliveries: u32,
     shard: Option<crate::types::ShardId>,
@@ -623,17 +672,22 @@ impl TaskDispatch for MemoryDispatch {
         let now = Utc::now();
         for hint in hints {
             state.published.push(hint.task_id);
-            // A reference the channel already holds is a no-op. An earlier due
-            // time moves a parked reference forward. A signal that arrives
-            // while a row is parked is therefore not held back by that entry.
+            // Contract C1. A held reference with the same `scheduled_at` names
+            // the same row state, so the publish is a no-op and the reference
+            // keeps its redelivery count and its backoff. A different
+            // `scheduled_at` means the row moved, so the reference moves with
+            // it and counts redeliveries again from zero.
             if let Some(held) = state.entries.get(&hint.task_id) {
-                if hint.scheduled_at >= held.due {
+                if held.scheduled_at == hint.scheduled_at {
                     continue;
                 }
                 Self::unplace(&mut state, hint.task_id);
             }
             // A delivered reference is held by its consumer. Publishing again
-            // must not create a second copy of it.
+            // must not create a second copy of it. The consumer judges the row
+            // against Postgres, which is the authority on the new due time, and
+            // the reconcile sweep republishes the row after the consumer
+            // releases or acks the reference.
             if state
                 .inflight
                 .values()
@@ -644,6 +698,7 @@ impl TaskDispatch for MemoryDispatch {
             let entry = MemoryEntry {
                 task_id: hint.task_id,
                 queue_name: hint.queue_name.clone(),
+                scheduled_at: hint.scheduled_at,
                 due: hint.scheduled_at,
                 redeliveries: 0,
                 shard: hint.shard,
@@ -988,6 +1043,84 @@ mod tests {
         let lease = read_one(&channel).await.expect("promoted lease");
         assert_eq!(lease.task_id, later.task_id);
         assert_eq!(channel.pending_references(), 0);
+    }
+
+    #[tokio::test]
+    async fn a_republish_at_the_same_due_time_leaves_a_backed_off_reference_alone() {
+        let channel = MemoryDispatch::new();
+        let one = hint("q", Utc::now());
+        channel
+            .publish(std::slice::from_ref(&one))
+            .await
+            .expect("publish");
+
+        let first = read_one(&channel).await.expect("first");
+        channel
+            .release(&first, Duration::from_secs(60))
+            .await
+            .expect("release");
+
+        // The reconcile sweep reads the same row and republishes it with the
+        // row's own `scheduled_at`. The backoff must survive that.
+        channel
+            .publish(std::slice::from_ref(&one))
+            .await
+            .expect("reconcile republish");
+        channel.maintain(&queues()).await.expect("maintain");
+        assert!(read_one(&channel).await.is_none());
+        assert_eq!(channel.pending_references(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_publish_at_a_new_due_time_moves_a_backed_off_reference_forward() {
+        let channel = MemoryDispatch::new();
+        // Both due times are in the past, so the case tests the dedupe rule and
+        // never the clock.
+        let one = hint("q", Utc::now() - chrono::Duration::seconds(2));
+        channel
+            .publish(std::slice::from_ref(&one))
+            .await
+            .expect("publish");
+
+        let first = read_one(&channel).await.expect("first");
+        channel
+            .release(&first, Duration::from_secs(60))
+            .await
+            .expect("release");
+
+        // A signal moved the row. Its `scheduled_at` differs, so the reference
+        // moves to the new due time and its redelivery count starts again.
+        let woken = DispatchHint {
+            scheduled_at: one.scheduled_at + chrono::Duration::seconds(1),
+            ..one.clone()
+        };
+        channel.publish(&[woken]).await.expect("wake");
+        channel.maintain(&queues()).await.expect("maintain");
+
+        let second = read_one(&channel).await.expect("second");
+        assert_eq!(second.task_id, one.task_id);
+        assert_eq!(second.redeliveries, 0);
+    }
+
+    #[tokio::test]
+    async fn a_publish_at_a_later_due_time_parks_a_ready_reference() {
+        let channel = MemoryDispatch::new();
+        let one = hint("q", Utc::now());
+        channel
+            .publish(std::slice::from_ref(&one))
+            .await
+            .expect("publish");
+
+        // A retry moved the row into the future. The reference moves with it.
+        let retried = DispatchHint {
+            scheduled_at: Utc::now() + chrono::Duration::seconds(60),
+            ..one.clone()
+        };
+        channel.publish(&[retried]).await.expect("retry");
+        channel.maintain(&queues()).await.expect("maintain");
+
+        assert!(read_one(&channel).await.is_none());
+        assert_eq!(channel.pending_references(), 1);
     }
 
     #[tokio::test]
