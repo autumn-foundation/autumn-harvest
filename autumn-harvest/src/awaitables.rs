@@ -258,7 +258,6 @@ struct OpenTimerArm {
 
 /// History-derived indexes consulted by both projection modes. Built in one
 /// O(n) pass over the timestamped rows.
-#[derive(Default)]
 struct HistoryIndex {
     /// `activity_id` → (name, scheduled-at) for regular activities.
     ///
@@ -311,9 +310,130 @@ struct HistoryIndex {
     last_event_at: Option<DateTime<Utc>>,
 }
 
+/// Per-category row counts used to pre-size [`HistoryIndex`]'s collections.
+/// Each field is an exact count of the event variants that insert into the
+/// same-named collection. Sizing from these counts, rather than from
+/// `rows.len()` for every field alike, gives each collection the capacity
+/// it will actually fill. No collection then takes a growth step. No
+/// collection is over-allocated either, even the several that always hold
+/// only a fraction of the full row count.
+#[derive(Default)]
+struct HistoryCounts {
+    activities: usize,
+    closed_activities: usize,
+    local_activities: usize,
+    closed_local_activities: usize,
+    children: usize,
+}
+
+/// Counts, in one cheap pass over `rows`, how many entries each
+/// [`HistoryIndex`] collection will hold. The pass is a discriminant match
+/// with no cloning, formatting or hashing, so it costs far less than the
+/// indexing pass it precedes. There is no `timers` or `external_activities`
+/// field: see [`HistoryIndex::with_capacity`] for why those rows are not
+/// counted here.
+fn count_history_categories(rows: &[(DateTime<Utc>, WorkflowEvent)]) -> HistoryCounts {
+    let mut counts = HistoryCounts::default();
+    for (_, event) in rows {
+        match event {
+            WorkflowEvent::ActivityScheduled { .. } => counts.activities += 1,
+            WorkflowEvent::ActivityCompleted { .. }
+            | WorkflowEvent::ActivityFailed { .. }
+            | WorkflowEvent::ActivityTimedOut { .. }
+            | WorkflowEvent::ActivityCompletedExternally { .. }
+            | WorkflowEvent::ActivityFailedExternally { .. } => counts.closed_activities += 1,
+            WorkflowEvent::LocalActivityScheduled { .. } => counts.local_activities += 1,
+            WorkflowEvent::LocalActivityCompleted { .. }
+            | WorkflowEvent::LocalActivityExhausted { .. } => {
+                counts.closed_local_activities += 1;
+            }
+            WorkflowEvent::ChildWorkflowStarted { .. } => counts.children += 1,
+            _ => {}
+        }
+    }
+    counts
+}
+
+impl HistoryIndex {
+    /// Pre-sizes every per-row collection from `counts`. Most fields get an
+    /// exact fit; the rest get a safe upper bound (see
+    /// [`count_history_categories`]).
+    ///
+    /// This type used to derive `Default`, so every collection started at
+    /// zero capacity and grew incrementally. Growing an empty, unsized
+    /// `HashMap`/`HashSet` forces `hashbrown` to rehash every
+    /// already-inserted key on each growth step — a `SipHash` pass apiece.
+    /// So a wide-fan-out history rehashed the same keys repeatedly on the
+    /// way up. Sizing every collection from its own count up front means no
+    /// growth step is ever taken, not just fewer of them.
+    ///
+    /// This also avoids over-allocating the collections that only ever hold
+    /// a fraction of the history. An earlier cut of this fix sized every
+    /// collection at `rows.len()` alike. That cost 5x the allocated bytes
+    /// (see the PR this landed in).
+    ///
+    /// `pending_updates`, `open_external_awaits` and `open_external_ops` are
+    /// excluded. Each is fully overwritten by a `.collect()` below, before
+    /// `build_history_index` returns. Any capacity given here would just be
+    /// dropped unused.
+    ///
+    /// `children` is excluded too, for a different reason. It is the one
+    /// collection this scan calls `.remove()` on, closing a child when its
+    /// terminal event arrives. `counts.children` counts every
+    /// `ChildWorkflowStarted` row in the whole history, not the peak number
+    /// open at once. A workflow that starts and completes many children in
+    /// sequence, not concurrently, can see those two numbers differ widely.
+    /// Sizing from the
+    /// former would allocate a table for children this scan is about to
+    /// remove again. That trades the growth-step cost this fix targets for
+    /// a bigger, one-time over-allocation. It is the same failure mode an
+    /// earlier, reverted cut of this fix hit for every field at once.
+    /// `child_order` has no such removal, so it stays sized from
+    /// `counts.children`.
+    ///
+    /// `open_timer_arms` and `timer_order` are excluded for a related
+    /// reason. `counts.timers` counts every `TimerStarted` row, but
+    /// `reset_timer`'s sliding-window pattern re-arms the same timer id
+    /// repeatedly (`docs`, `context.rs`'s `reset_timer`). Both collections
+    /// key or index by distinct timer id, guarded by
+    /// `open_timer_arms.contains_key`, so re-arms grow a `VecDeque` inside
+    /// an existing entry rather than adding one. A history that resets one
+    /// timer 100,000 times would size both for 100,000 entries and use one.
+    /// This benchmark gives every timer a unique id, so it never hits that
+    /// case.
+    ///
+    /// `external_activities` is excluded for the same duplicate-row reason.
+    /// `replay.rs`'s external-activity scan documents a second
+    /// `ActivityAwaitingExternal` row for the same activity id. A signal can
+    /// wake the workflow while an external activity is pending. The worker
+    /// then re-runs its scheduling code, appending another row for an id
+    /// already in history. `external_activities.insert` overwrites
+    /// the existing entry on a repeat id, rather than growing the map. So a
+    /// long-lived external activity with many such wakeups would size this
+    /// map for every wakeup, and use one entry. This benchmark gives every
+    /// external row a unique id, so it never hits that case either.
+    fn with_capacity(counts: &HistoryCounts) -> Self {
+        Self {
+            activities: HashMap::with_capacity(counts.activities),
+            closed_activities: HashSet::with_capacity(counts.closed_activities),
+            local_activities: HashMap::with_capacity(counts.local_activities),
+            closed_local_activities: HashSet::with_capacity(counts.closed_local_activities),
+            external_activities: HashMap::new(),
+            open_timer_arms: HashMap::new(),
+            timer_order: Vec::new(),
+            children: HashMap::new(),
+            child_order: Vec::with_capacity(counts.children),
+            pending_updates: Vec::new(),
+            open_external_awaits: Vec::new(),
+            open_external_ops: Vec::new(),
+            last_event_at: None,
+        }
+    }
+}
+
 #[allow(clippy::too_many_lines)]
 fn build_history_index(rows: &[(DateTime<Utc>, WorkflowEvent)]) -> HistoryIndex {
-    let mut index = HistoryIndex::default();
+    let mut index = HistoryIndex::with_capacity(&count_history_categories(rows));
     let mut resolved_updates: HashSet<String> = HashSet::new();
     let mut admitted_updates: Vec<(String, String, DateTime<Utc>)> = Vec::new();
     let mut external_awaits: Vec<(String, String, DateTime<Utc>)> = Vec::new();
