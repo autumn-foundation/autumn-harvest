@@ -41,7 +41,7 @@ testcontainers-modules = { workspace = true }
 # `autumn_harvest::worker::Worker` against Postgres and Redis, so it needs the
 # engine's database, test-helper and chaos features. Dev-only: the library
 # build still depends on `autumn-harvest` with default features off.
-autumn-harvest = { path = "../autumn-harvest", features = ["db", "testing", "chaos"] }
+autumn-harvest = { version = "0.6.0", path = "../autumn-harvest", features = ["db", "testing", "chaos"] }
 diesel = { workspace = true }
 diesel-async = { workspace = true }
 deadpool = { workspace = true }
