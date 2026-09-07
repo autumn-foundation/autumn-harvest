@@ -41,7 +41,7 @@ use autumn_harvest::audit::{
     OP_WORKFLOW_CANCEL, OP_WORKFLOW_PAUSE, OP_WORKFLOW_RESET, OP_WORKFLOW_RESUME,
     OP_WORKFLOW_SIGNAL, OP_WORKFLOW_TERMINATE, SOURCE_UI, STATUS_FAILED, STATUS_SUCCEEDED,
     TARGET_BUILD_ROUTING, TARGET_DEAD_LETTER, TARGET_GATE, TARGET_SCHEDULE, TARGET_WORKFLOW,
-    insert_audit,
+    insert_audit, insert_audit_batch,
 };
 use autumn_harvest::build_routing::{
     BuildCompatEntry, BuildPolicy, BuildReachability, all_build_reachability, declare_compat,
@@ -3059,7 +3059,7 @@ fn render_dead_letters_page(
     let body = html! {
         h2 { "Dead Letters" }
         @if let Some(message) = flash {
-            div.flash { (message) }
+            div.flash role="status" tabindex="-1" autofocus { (message) }
         }
         (render_dead_letter_view_toggle(filters, limit, refresh, None, false))
         (render_dead_letter_filters(filters, limit, refresh))
@@ -3091,7 +3091,19 @@ fn render_dead_letters_page(
         (render_dead_letter_pagination(page, limit, has_next, filters, refresh))
     };
 
-    layout_dead_letters("Dead Letters · Vantage", &body, refresh)
+    // `dead_letter_return_to_path` deliberately excludes `page`. It names
+    // the one-time redirect target after an action, and landing back on
+    // page 0 there is fine.
+    //
+    // Auto-refresh is different: it must keep the operator on the page
+    // they were reading. So it builds its own target here, matching
+    // `render_dead_letter_pagination`'s own link construction, instead of
+    // reusing that path (found in review, PR #1396).
+    let refresh_target = format!(
+        "../ui/dead-letters?page={page}{}",
+        build_dead_letter_query_string(limit, filters, refresh)
+    );
+    layout_dead_letters("Dead Letters · Vantage", &body, refresh, &refresh_target)
 }
 
 // ---------------------------------------------------------------------------
@@ -3135,7 +3147,7 @@ async fn render_dead_letters_summary_view(
     let body = html! {
         h2 { "Dead Letters" }
         @if let Some(message) = flash {
-            div.flash { (message) }
+            div.flash role="status" tabindex="-1" autofocus { (message) }
         }
         (render_dead_letter_view_toggle(filters, limit, refresh, Some(&group_by_value), true))
         (render_dead_letter_filters(filters, limit, refresh))
@@ -3163,10 +3175,20 @@ async fn render_dead_letters_summary_view(
         }
     };
 
+    let group_by_query = if group_by_value.is_empty() {
+        String::new()
+    } else {
+        format!("&group_by={}", url_encode(&group_by_value))
+    };
+    let refresh_target = format!(
+        "../ui/dead-letters?view=summary{}{group_by_query}",
+        build_dead_letter_query_string(limit, filters, refresh)
+    );
     Ok(layout_dead_letters(
         "Dead Letters · Summary · Vantage",
         &body,
         refresh,
+        &refresh_target,
     ))
 }
 
@@ -3849,7 +3871,25 @@ fn truncate_error(error: &str) -> String {
     }
 }
 
-fn layout_dead_letters(title: &str, body: &Markup, refresh: Option<u64>) -> Markup {
+/// `refresh_target` is the current filtered view's URL with no `flash`
+/// param. The caller builds it from the same filters, limit, and refresh
+/// already in its own scope.
+///
+/// A dead-letter action redirects here with `flash` appended to
+/// `return_to`. `return_to` itself preserves `refresh`. An operator with
+/// auto-refresh on would otherwise see this page's targetless `meta
+/// refresh` reload that same URL, flash included, on every interval. Each
+/// reload would re-announce and re-focus a stale message.
+///
+/// An explicit `url=` on the tag breaks that loop. The flash still shows
+/// and takes focus on the load right after the action. Every reload after
+/// that lands on the flash-free URL instead (found in review, PR #1396).
+fn layout_dead_letters(
+    title: &str,
+    body: &Markup,
+    refresh: Option<u64>,
+    refresh_target: &str,
+) -> Markup {
     html! {
         (PreEscaped("<!DOCTYPE html>"))
         html lang="en" {
@@ -3857,7 +3897,7 @@ fn layout_dead_letters(title: &str, body: &Markup, refresh: Option<u64>) -> Mark
                 meta charset="utf-8";
                 meta name="viewport" content="width=device-width,initial-scale=1";
                 @if let Some(secs) = refresh {
-                    meta http-equiv="refresh" content=(secs);
+                    meta http-equiv="refresh" content={ (secs) "; url=" (refresh_target) };
                 }
                 title { (title) }
                 style { (PreEscaped(STYLE)) }
@@ -4746,7 +4786,7 @@ fn render_workflow_detail(
         }
 
         @if let Some(message) = flash {
-            div.flash { (message) }
+            div.flash role="status" tabindex="-1" autofocus { (message) }
         }
 
         @if let Some(error) = execution.error.as_deref() {
@@ -6667,7 +6707,7 @@ fn render_dag_detail(
 ) -> Markup {
     let body = html! {
         @if let Some(message) = flash {
-            div class="flash" { (message) }
+            div class="flash" role="status" tabindex="-1" autofocus { (message) }
         }
         h2 { "DAG " code { (dag_name) } " runs" }
         @if let Some(run_id) = selected_run {
@@ -7459,7 +7499,7 @@ fn render_build_routing_page(
         }
 
         @if let Some(msg) = flash {
-            div.flash { (msg) }
+            div.flash role="status" tabindex="-1" autofocus { (msg) }
         }
 
         @if !diverged_queues.is_empty() {
@@ -8744,9 +8784,14 @@ async fn schedule_bulk_pause_ui(
         .await
         .unwrap_or_default();
         acted_on += updated_ids.len();
-        for id in &updated_ids {
-            let id_str = id.to_string();
-            let ar = NewAuditRecord {
+        // One multi-row insert per shard, not one round trip per updated
+        // schedule (issue #1399). Every record shares the same
+        // actor/operation/route/status/shard, so only the target id varies.
+        // `insert_audit_batch` preserves that shape exactly.
+        let id_strs: Vec<String> = updated_ids.iter().map(ToString::to_string).collect();
+        let records: Vec<NewAuditRecord<'_>> = id_strs
+            .iter()
+            .map(|id_str| NewAuditRecord {
                 actor: "ui",
                 operation: OP_SCHEDULE_PAUSE,
                 target_type: TARGET_SCHEDULE,
@@ -8758,9 +8803,9 @@ async fn schedule_bulk_pause_ui(
                 error_summary: None,
                 shard_id: Some(shard_id.as_i32()),
                 source: SOURCE_UI,
-            };
-            let _ = insert_audit(&mut conn, &ar).await;
-        }
+            })
+            .collect();
+        let _ = insert_audit_batch(&mut conn, &records).await;
     }
 
     schedule_bulk_redirect(&format!("Paused {acted_on} schedule(s)"))
@@ -8836,9 +8881,12 @@ async fn schedule_bulk_resume_ui(
         .await
         .unwrap_or_default();
         acted_on += updated_ids.len();
-        for id in &updated_ids {
-            let id_str = id.to_string();
-            let ar = NewAuditRecord {
+        // Same batching rationale as `schedule_bulk_pause_ui` above (issue
+        // #1399): one multi-row insert per shard, not one per resumed row.
+        let id_strs: Vec<String> = updated_ids.iter().map(ToString::to_string).collect();
+        let records: Vec<NewAuditRecord<'_>> = id_strs
+            .iter()
+            .map(|id_str| NewAuditRecord {
                 actor: "ui",
                 operation: OP_SCHEDULE_RESUME,
                 target_type: TARGET_SCHEDULE,
@@ -8850,9 +8898,9 @@ async fn schedule_bulk_resume_ui(
                 error_summary: None,
                 shard_id: Some(shard_id.as_i32()),
                 source: SOURCE_UI,
-            };
-            let _ = insert_audit(&mut conn, &ar).await;
-        }
+            })
+            .collect();
+        let _ = insert_audit_batch(&mut conn, &records).await;
     }
 
     schedule_bulk_redirect(&format!("Resumed {acted_on} schedule(s)"))
@@ -8928,7 +8976,7 @@ fn render_schedules_page(
         h2 { "Schedules" }
 
         @if let Some(message) = flash {
-            div.flash { (message) }
+            div.flash role="status" tabindex="-1" autofocus { (message) }
         }
 
         @if !unhealthy_summary.is_empty() {
@@ -9827,7 +9875,7 @@ fn render_schedule_runs_page(
         // "failed" count is the only place the operator is told about a partial
         // dispatch, so the message must not be dropped.
         @if let Some(message) = flash {
-            div.flash role="status" { (message) }
+            div.flash role="status" tabindex="-1" autofocus { (message) }
         }
 
         (render_schedule_drilldown_header(row, shard_id, "runs"))
@@ -12394,10 +12442,40 @@ mod tests {
     #[test]
     fn layout_dead_letters_includes_build_routing_nav_link() {
         let body = html! { p { "test" } };
-        let html = layout_dead_letters("Test", &body, None).into_string();
+        let html = layout_dead_letters("Test", &body, None, "").into_string();
         assert!(
             html.contains("build-routing"),
             "layout_dead_letters must include a Build Routing nav link"
+        );
+    }
+
+    #[test]
+    fn layout_dead_letters_refresh_tag_targets_flash_free_url() {
+        // A targetless `meta refresh` would reload this page's own URL.
+        // If that URL still carries `flash=...`, every auto-refresh
+        // interval re-announces and re-focuses the same stale message.
+        // The tag must instead point `url=` at the flash-free target the
+        // caller supplies.
+        let body = html! { p { "test" } };
+        let html = layout_dead_letters("Test", &body, Some(30), "../ui/dead-letters?limit=50")
+            .into_string();
+        assert!(
+            html.contains(r#"content="30; url=../ui/dead-letters?limit=50""#),
+            "refresh tag must target the flash-free URL: {html}"
+        );
+    }
+
+    #[test]
+    fn dead_letters_page_refresh_target_preserves_current_page() {
+        // PR #1396 review: the auto-refresh target must keep the operator
+        // on the page they were reading, not bounce them to page 0.
+        let filters = DeadLetterUiFilters::default();
+        let html =
+            render_dead_letters_page(&filters, &[], &[], false, 2, 50, false, 0, Some(30), None)
+                .into_string();
+        assert!(
+            html.contains(r"url=../ui/dead-letters?page=2"),
+            "refresh target must preserve page=2: {html}"
         );
     }
 

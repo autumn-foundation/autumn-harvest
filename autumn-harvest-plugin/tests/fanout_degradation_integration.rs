@@ -274,6 +274,13 @@ async fn seed_dead_letter(url: &str) {
 }
 
 async fn seed_worker(url: &str, worker_id: &str) {
+    seed_worker_with_assignments(url, worker_id, "[0]").await;
+}
+
+/// Seed a worker row with a caller-controlled `shard_assignments` JSON
+/// literal (e.g. `"[]"` for the empty auto/legacy shape, `"[1]"` for an
+/// explicit narrow assignment).
+async fn seed_worker_with_assignments(url: &str, worker_id: &str, shard_assignments_json: &str) {
     let mut conn = <AsyncPgConnection as AsyncConnection>::establish(url)
         .await
         .expect("connect");
@@ -281,7 +288,7 @@ async fn seed_worker(url: &str, worker_id: &str) {
         "INSERT INTO harvest_workers \
             (worker_id, last_heartbeat_at, status, queues, shard_assignments, max_concurrency, host) \
          VALUES \
-            ('{worker_id}', NOW(), 'Active', '[]'::jsonb, '[0]'::jsonb, 10, 'test-host') \
+            ('{worker_id}', NOW(), 'Active', '[]'::jsonb, '{shard_assignments_json}'::jsonb, 10, 'test-host') \
          ON CONFLICT (worker_id) DO NOTHING"
     );
     conn.batch_execute(&sql).await.expect("seed worker");
@@ -567,6 +574,76 @@ async fn workers_health_partial_carries_status() {
     // Additive: the FleetHealth fields stay at the top level.
     assert!(body["healthy"].is_number());
     assert!(body["by_queue"].is_object());
+}
+
+/// Issue #1208: a worker advertising the empty (auto/legacy)
+/// `shard_assignments` shape must be counted in `by_shard[N]`. N is the shard
+/// its row was actually read from, not dropped for naming no bucket.
+#[tokio::test]
+async fn workers_health_by_shard_counts_an_empty_assignment_worker_under_its_source_shard() {
+    let ((url0, url1), _guard) = setup_two_shards().await;
+    // `auto` is read from shard 1 and advertises no explicit assignment.
+    seed_worker_with_assignments(&url1, "auto", "[]").await;
+    // `narrow` is read from shard 0 but explicitly claims shard 1 — its
+    // literal claim must win regardless of the shard it was read from.
+    seed_worker_with_assignments(&url0, "narrow", "[1]").await;
+    let app = build_app(&url0, &url1, false);
+
+    let (status, body) = get_json(&app, "/workers/health").await;
+    assert_eq!(status, StatusCode::OK, "got {body}");
+    assert_eq!(body["status"], "complete", "got {body}");
+
+    let by_shard = &body["by_shard"];
+    assert_eq!(
+        by_shard["1"], 2,
+        "both the empty-assignment worker (by source) and the explicit \
+         worker (by claim) must land in shard 1's bucket: {body}"
+    );
+    assert!(
+        by_shard.get("0").is_none(),
+        "shard 0 must gain no phantom count from either worker: {body}"
+    );
+}
+
+/// A malformed (non-array) `shard_assignments` value is corrupt, not legacy,
+/// and must not be attributed to any shard.
+#[tokio::test]
+async fn workers_health_by_shard_ignores_a_malformed_assignment() {
+    let ((url0, url1), _guard) = setup_two_shards().await;
+    seed_worker_with_assignments(&url0, "corrupt", "\"not-an-array\"").await;
+    let app = build_app(&url0, &url1, false);
+
+    let (status, body) = get_json(&app, "/workers/health").await;
+    assert_eq!(status, StatusCode::OK, "got {body}");
+    assert_eq!(
+        body["by_shard"].as_object().map(serde_json::Map::len),
+        Some(0),
+        "a malformed shard_assignments value must not populate by_shard: {body}"
+    );
+    // The worker still counts toward the plain healthy total.
+    assert_eq!(body["healthy"], 1);
+}
+
+/// A worker that legitimately covers two shards registers a replicated row
+/// in each shard's own database (same `worker_id`, same explicit claim).
+/// Dedup must collapse those replicas to one before the literal tally runs,
+/// so the worker is not double-counted in either shard's bucket.
+#[tokio::test]
+async fn workers_health_by_shard_does_not_double_count_a_multi_shard_worker() {
+    let ((url0, url1), _guard) = setup_two_shards().await;
+    seed_worker_with_assignments(&url0, "multi", "[0, 1]").await;
+    seed_worker_with_assignments(&url1, "multi", "[0, 1]").await;
+    let app = build_app(&url0, &url1, false);
+
+    let (status, body) = get_json(&app, "/workers/health").await;
+    assert_eq!(status, StatusCode::OK, "got {body}");
+    assert_eq!(
+        body["healthy"], 1,
+        "the two replicas must dedup to one worker: {body}"
+    );
+    let by_shard = &body["by_shard"];
+    assert_eq!(by_shard["0"], 1, "got {body}");
+    assert_eq!(by_shard["1"], 1, "got {body}");
 }
 
 // ── AC4: writes still fail hard on a down shard ──────────────────────────────

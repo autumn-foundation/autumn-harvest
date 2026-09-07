@@ -704,19 +704,19 @@ tests": reproduced here, each independently defeats sort-elision regardless
 of the value it is tested against, so "cheap" was never an established
 finding — it was this page's own retracted reading of their *plan-eligibility*
 effect. Their marginal *cost* on the attribution table above is a different
-question. For worker sessions and sticky routing it remains unmeasured: in
+question. For sticky routing it remains unmeasured: in
 the full production query the `CASE` key and the always-present
 queue-pause/`schedule_to_close`-adjacent predicates already force the same
-collapsed plan shape regardless of these two, so their own incremental
+collapsed plan shape regardless of it, so its own incremental
 contribution can't be isolated this way — that would still need the
 seed-variant scenario work [known limitations](#known-limitations) already
-calls for. `schedule_to_close` (#378) is the exception: the seed-variant
-work this section describes as still-needed has since been done for that one
-column — see the [known limitations](#known-limitations) bullet above — by
-holding the same already-collapsed plan shape fixed and measuring the
-column's marginal buffer/storage cost directly, rather than trying to
-isolate it through a plan-shape change that #1177 shows does not happen
-either way.
+calls for. `schedule_to_close` (#378) and worker sessions (#606) are the
+exceptions: the seed-variant work this section describes as still-needed has
+since been done for both — see the [known limitations](#known-limitations)
+bullet above — by holding the same already-collapsed plan shape fixed and
+measuring each column's marginal buffer/storage cost directly, rather than
+trying to isolate it through a plan-shape change that #1177 shows does not
+happen either way.
 
 **Zero engine impact.** Like issue #786 and every fix on this page, this
 finding changes nothing about `claim_task_query()`: no new `WorkflowEvent`
@@ -1550,18 +1550,40 @@ from the benchmark are directly comparable.
     dropping this predicate alone would not recover the cheap plan, while
     this page measures what it costs to keep it, holding the already-collapsed
     plan shape fixed.
-  * **Worker sessions (#606), sticky routing (#235)** — their cost on the
-    attribution table above remains unmeasured; that is still scenario work,
-    same as before. What issue #1177 adds for these two (and, independently
-    of the cost measurement above, for `schedule_to_close` as well) is a
-    different kind of evidence, not a cost figure: in isolation, each
-    independently defeats sort-elision and `LIMIT` pushdown regardless of the
-    value it is tested against, reproducing the same collapsed plan shape
-    this page's own headline finding describes. See
+  * **Worker sessions (#606)** — measured directly, on a genuinely different
+    axis from issue #1177 just below: `docs/performance-worker-sessions.md`
+    seeds `session_id` and `sticky_worker_id`/`sticky_until`/`sticky_timeout`
+    via a per-row `INSERT`-then-`UPDATE`-then-`COMMIT` lifecycle matching
+    `queue::enqueue()`'s real per-task write (as issue #606's hard-pin design
+    always writes them) and finds a real, moderate-to-large buffer cost on the
+    claim query — +40.9% on a single first claim against a cache-warm table
+    at the 10,000-row headline depth, corroborated by a real 10,001-call
+    production-shaped drain at +29.0% (same order of magnitude, unlike an
+    earlier bulk-transaction capture this page's own history superseded).
+    Mechanism: row-width growth compounded by MVCC bloat from the second
+    write, not a plan inefficiency — no query-shape fix applies; see that
+    page for the full measurement, including why it does not isolate worker
+    sessions from sticky routing's own unmeasured cost, and an open question
+    about seeding transaction granularity for multi-activity decision
+    fan-outs that a review round raised but this pass did not chase down.
+    This is a buffer-cost measurement, not a plan-eligibility one — it does
+    not supersede or overlap with issue #1177's finding that worker
+    sessions' predicate, like `schedule_to_close`'s and sticky routing's,
+    independently defeats sort-elision (see immediately below); the two are
+    answers to different questions about the same predicate.
+  * **Sticky routing (#235)** — its cost on the attribution table above is
+    still unmeasured; that remains scenario work, same as before. What issue
+    #1177 adds is a different kind of evidence, not a cost figure: in
+    isolation, sticky routing's predicate — together with `schedule_to_close`'s
+    and worker sessions', both measured and covered above — independently
+    defeats sort-elision and `LIMIT` pushdown regardless of the value it is
+    tested against, reproducing the same collapsed plan shape this page's own
+    headline finding describes. See
     [any residual predicate defeats sort-elision](#any-residual-predicate-defeats-sort-elision-issue-1177).
     In the full production query the `CASE` key and the always-present
-    predicates already force that same collapse regardless of these two, so
-    their own marginal cost still can't be isolated this way. "cheap inline
+    predicates already force that same collapse regardless of any one of
+    these three, so their own marginal cost still can't be isolated this way.
+    "cheap inline
     column tests" was this page's own now-retracted reading of their
     *plan-eligibility* effect, not a corrected *cost* measurement — replacing
     one unsupported cost claim with another would be no improvement.
@@ -1608,6 +1630,12 @@ from the benchmark are directly comparable.
   `EXPLAIN`/`pg_stat_statements`/heap-growth evidence for that measurement.
 * `autumn-harvest/scripts/schedule_to_close_claim_perf_repro.sh` — regenerates
   that evidence from a clean checkout.
+* [`docs/performance-worker-sessions.md`](performance-worker-sessions.md) — the worker-sessions claim predicate
+  (#606) measurement referenced above.
+* `docs/perf-artifacts/worker-session-claim-predicate/` — committed
+  `EXPLAIN`/`pg_stat_statements` evidence for that measurement.
+* `autumn-harvest/scripts/worker_session_claim_perf_repro.sh` — regenerates
+  that evidence from a clean checkout.
 * [`docs/performance-history-ceiling.md`](performance-history-ceiling.md) — a separate scanner, not part of
   `claim_task_query()`: the workflow-history-ceiling check
   (`timeout::enforce_workflow_history_ceiling`, issue #493) fixed a
@@ -1651,6 +1679,9 @@ standalone note rather than part of the claim-path attribution table above:
 * [`docs/performance-schedule-overdue-aux.md`](performance-schedule-overdue-aux.md)
   — the same N+1 shape in `GET /admin/schedules`'s overdue-aux computation
   (issue #696).
+* [`docs/performance-usage-report-activity-lookback.md`](performance-usage-report-activity-lookback.md)
+  — indexing the activity-attempt lookback LATERAL join in `GET /admin/usage`
+  (issue #596), the one CTE the 2026-07 usage-report-indexes migration missed.
 * [`docs/performance-quota-history-bytes.md`](performance-quota-history-bytes.md)
   — measuring the `history_bytes` admission check's cost claim (issue #946
   AC7); partially inaccurate claim, no fix identified.

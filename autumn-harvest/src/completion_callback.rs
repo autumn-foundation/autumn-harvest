@@ -253,7 +253,13 @@ const fn is_ipv6_non_routable(ip: Ipv6Addr) -> bool {
     if ip.is_loopback() || ip.is_unspecified() || ip.is_multicast() {
         return true;
     }
-    if let Some(v4) = ip.to_ipv4_mapped() {
+    // `to_ipv4()` (unlike `to_ipv4_mapped()`) unwraps BOTH the modern
+    // IPv4-mapped form (`::ffff:a.b.c.d`, RFC 4291 `::ffff:0:0/96`) and the
+    // deprecated IPv4-compatible form (`::a.b.c.d`, the bare `::/96` prefix) —
+    // `to_ipv4_mapped()` alone returns `None` for the latter, letting a
+    // loopback/private IPv4 embedded that way skip this check entirely. A
+    // genuine global-unicast IPv6 address still yields `None` here.
+    if let Some(v4) = ip.to_ipv4() {
         return is_ipv4_non_routable(v4);
     }
     let seg0 = ip.segments()[0];
@@ -516,6 +522,37 @@ mod ssrf_tests {
             assert!(
                 matches!(err, SsrfRejection::IpNotRoutable { .. }),
                 "expected {addr} to be rejected as non-routable, got {err:?}"
+            );
+        }
+    }
+
+    // `is_ipv6_non_routable` only unwraps the IPv4-*mapped* form
+    // (`::ffff:a.b.c.d`, RFC 4291 `::ffff:0:0/96`) via `to_ipv4_mapped()` before
+    // checking `is_ipv4_non_routable`. The older IPv4-*compatible* form
+    // (`::a.b.c.d`, the bare `::/96` prefix) encodes the exact same embedded
+    // IPv4 address but `to_ipv4_mapped()` returns `None` for it, so a loopback
+    // or private IPv4 written this way skips the embedded-IPv4 check entirely
+    // and is classified routable — bypassing the very guarantee
+    // `validate_target_url`'s doc comment states: "even then is rejected if it
+    // is loopback/private/link-local/etc." `Ipv6Addr::to_ipv4()` (unlike
+    // `to_ipv4_mapped()`) unwraps both forms and still returns `None` for a
+    // genuine global-unicast IPv6 address (verified against `2001:db8::1` and
+    // a real public IPv6 literal), so swapping it in is a same-length,
+    // non-widening fix.
+    #[test]
+    fn rejects_ipv4_compatible_ipv6_embedding_a_loopback_or_private_address() {
+        let policy = SsrfPolicy::default().with_allow_ip_literals(true);
+        for addr in [
+            "::127.0.0.1",
+            "::10.0.0.5",
+            "::192.168.1.1",
+            "::169.254.1.1",
+        ] {
+            let err = validate_target_url(&format!("https://[{addr}]/hook"), &policy).unwrap_err();
+            assert!(
+                matches!(err, SsrfRejection::IpNotRoutable { .. }),
+                "expected IPv4-compatible {addr} to be rejected as non-routable \
+                 (it encodes a loopback/private IPv4 address), got {err:?}"
             );
         }
     }
