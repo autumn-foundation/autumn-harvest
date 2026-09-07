@@ -25,11 +25,18 @@ router quirk is not a contract this codebase can lean on either way it goes.
 **The fix rejects the value at both ends, not just the one route the issue
 reported.**
 
-1. **Creation.** `start_workflow` and `rerun_workflow`'s `workflow_id`
-   override both reject an explicit empty string with `400` (`"workflow_id
-   must not be empty"`), via a shared `reject_empty_workflow_id` helper.
-   Omitting the field is untouched. This is the root-cause fix: no new run
-   can be created with an unaddressable business id going forward.
+1. **Creation.** Every route that can create a fresh execution now rejects an
+   explicit empty `workflow_id` with `400` (`"workflow_id must not be
+   empty"`), via a shared `reject_empty_workflow_id` helper: `start_workflow`,
+   `rerun_workflow`'s override, `signal_with_start_workflow`, and
+   `update_with_start_workflow` (the latter two declare `workflow_id` as a
+   mandatory `String` rather than `Option<String>`, so an empty string
+   deserializes just as cleanly as a real one). `batch_start_workflows`
+   rejects the offending item in its per-item pre-validation pass instead
+   (`"status": "rejected"`), since one bad item must not sink an otherwise
+   valid non-atomic batch. Omitting the field is untouched everywhere. This
+   is the root-cause fix: no new run can be created with an unaddressable
+   business id going forward, through ANY start path.
 2. **Resolution.** `resolve_workflow_by_business_id` -- the resolver shared
    by every by-id route -- now rejects an empty `workflow_id` with `400`
    before any shard fan-out. This makes the whole ten-route family answer
@@ -42,6 +49,15 @@ reported.**
    into the same `400` every sibling route gives. Without this registration
    the request still never reaches a handler -- only 400 is answered, never
    silently the wrong success shape.
+4. **A second, narrower instance of the same bug, found by fixing the
+   first.** Registering route 3 exposed that `operation_id()` and
+   `normalize_route_template()` (both in `api.rs`, used for the generated
+   OpenAPI document and the read-only-role route classifier) also split
+   paths on `/` and silently dropped empty segments -- so the new
+   trailing-slash route collided onto the same operation id and the same
+   `matchit` classifier template as its 3-segment sibling (the issue #805/#776
+   "missing workflow_id" guard). Both functions now preserve a literal
+   trailing slash as a distinct marker instead of dropping it.
 
 **Scope.** No new `WorkflowEvent` variant, no migration, no `harvest_events`
 write -- pure input validation plus one additional route registration. The
@@ -62,7 +78,20 @@ a live, controllable workflow.
 Tests, red → green → refactor: `autumn-harvest-plugin/tests/by_id_integration.rs`
 (`start_with_empty_workflow_id_is_rejected_400`,
 `by_id_base_route_trailing_slash_rejects_empty_workflow_id` -- reproduces the
-issue's exact repro path, `by_id_sibling_route_rejects_empty_workflow_id`,
+issue's exact repro path, `by_id_sibling_route_rejects_empty_workflow_id` --
+seeds a real `workflow_id = ""` row directly through the engine, below the
+new HTTP guard, to reconstruct the actual pre-fix 200-via-sibling-route
+asymmetry, `cancel_by_id_rejects_empty_workflow_id` -- the shared resolver
+through a mutating, admin-gated route, `signal_with_start_rejects_empty_workflow_id_400`,
+`update_with_start_rejects_empty_workflow_id_400`,
+`batch_start_rejects_item_with_empty_workflow_id`,
 `start_with_omitted_workflow_id_still_auto_generates` as a regression guard)
 and `autumn-harvest-plugin/tests/workflow_rerun_integration.rs`
-(`rerun_with_empty_workflow_id_override_is_rejected_400`, R-66).
+(`rerun_with_empty_workflow_id_override_is_rejected_400`, R-66). Plus two unit
+tests pinning the trailing-slash fix itself:
+`normalize_route_template_preserves_a_trailing_slash` (`api.rs`) and
+`a_trailing_slash_gets_a_distinct_operation_id` (`openapi.rs`).
+
+Reviewed from three angles (correctness, manifest/doc consistency, test
+quality) before merge; the correctness pass is what found the
+signal-with-start / update-with-start / batch_start gaps above.
