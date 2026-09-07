@@ -278,6 +278,9 @@ pub mod debugger;
 /// Deterministic workflow guardrails: static source-level check for replay-breaking patterns.
 pub mod det_check;
 pub mod diagnostic;
+/// Task dispatch channel seam (issue #1312): Postgres stays the source of
+/// truth, a [`dispatch::TaskDispatch`] carries task references.
+pub mod dispatch;
 /// Effective runtime-configuration introspection (issue #695).
 ///
 /// [`effective_config::EffectiveConfigView`] is the serialisable, secret-free

@@ -66,6 +66,7 @@ chaos = ["db"]
 [dependencies]
 autumn-harvest-macros = { version = "0.6.0", path = "../autumn-harvest-macros" }
 tokio = { workspace = true }
+async-trait = "0.1"
 tokio-util = { version = "0.7", features = ["rt"] }
 serde = { workspace = true }
 serde_json = { workspace = true }
