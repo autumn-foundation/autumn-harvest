@@ -642,6 +642,19 @@ async fn explicit_shard_assignment_is_never_widened() {
 /// are the bounded acquisition in `transition_fleet_status`, the
 /// cancellable `pool.get()` in the heartbeat loop, and the same fix in the
 /// schedule-overdue sampler.
+///
+/// **Scope note.** This test calls `shutdown()` 300ms after start.
+/// `run_multi_shard`'s startup registration sequence against the exhausted
+/// shard takes about 10s on its own. Every other per-shard monitor loop
+/// (queue depth, timeout checker, poison-pill reclaimer, and more) shares
+/// the schedule-overdue sampler's cancellation shape at its own top of
+/// loop, but spawns only after that startup sequence finishes. So this
+/// test's early shutdown request has already landed before any of them
+/// starts its first tick. Each one breaks before ever calling
+/// `pool.get()`. A worker that runs long enough lets one of those loops
+/// start a real acquisition against a permanently-exhausted shard before
+/// shutdown is requested. That case is not covered by this test — see
+/// issue #1426.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn shutdown_completes_when_a_shard_pool_is_permanently_exhausted() {
     let _ = tracing_subscriber::fmt()
@@ -685,15 +698,18 @@ async fn shutdown_completes_when_a_shard_pool_is_permanently_exhausted() {
 
     worker.shutdown();
 
-    // Generous but finite: `shutdown_timeout` is 2s (`build_worker`), and
-    // each bounded shard acquisition is capped at a few seconds. A correct
-    // shutdown finishes in well under this bound. The property under test
-    // is "bounded", not "fast". See the module docs for why latency stays
-    // loose on shared CI.
-    let result = tokio::time::timeout(Duration::from_secs(30), handle).await;
+    // Generous but finite: `shutdown_timeout` is 2s (`build_worker`).
+    // Four separate bounded acquisitions land on shard 0 in sequence. Two
+    // happen during startup registration and two during the
+    // Draining/Stopped transitions. Each is capped at
+    // `MIN_SHARD_ACQUIRE_BOUND` (5s), so a correct shutdown takes roughly
+    // 20s before shard 1/2 work and test overhead. `90s` leaves
+    // comfortable headroom over the ~22s observed in practice. The
+    // property under test is "bounded", not "fast".
+    let result = tokio::time::timeout(Duration::from_secs(90), handle).await;
     assert!(
         result.is_ok(),
-        "worker shutdown did not complete within 30s while shard 0's pool was \
+        "worker shutdown did not complete within 90s while shard 0's pool was \
          permanently exhausted — shutdown must be bounded, never parked \
          forever (issue #1209 AC1/AC2)",
     );

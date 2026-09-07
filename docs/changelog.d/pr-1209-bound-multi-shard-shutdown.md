@@ -37,13 +37,28 @@ so it could also park past shutdown and block the monitor-task join in
   first pass is now selected against `cancel` the same way; a cancelled
   acquisition marks that pass incomplete (the same handling as a real
   connection error) and the loop's own tail check then exits.
-- `HarvestRunner::stop` bounds its `worker_handle.await` with
-  `shutdown_timeout` plus a fixed margin, as defense in depth: the worker's
-  own shutdown is now bounded end to end, so this should never fire, but it
-  keeps the runner's own contract intact if a future change reintroduces an
-  unbounded await on this path.
-
 No new `WorkflowEvent` variant, no migration (AC5).
+
+**Known residual gap (issue #1426).** An earlier draft of this PR also
+wrapped `HarvestRunner::stop`'s `worker_handle.await` in a timeout, framed as
+defense in depth. Review (both an internal pass and Codex) found that unsafe:
+on timeout it dropped the `JoinHandle` without aborting the task, so `stop()`
+could return while the worker (and any still-running per-shard monitor task)
+stayed alive — violating the documented invariant in `plugin.rs` that no task
+can evaluate a completion trigger once `stop()` returns. That addition was
+reverted; `HarvestRunner::stop` is unchanged from before this PR.
+
+Review also surfaced that this PR's fix is narrower than "shutdown is bounded
+end to end": roughly a dozen other per-shard monitor/sampler loops
+(`spawn_monitoring_tasks`) share the exact same shape — cancellation checked
+only *between* ticks, not against an in-flight `pool.get()`. The regression
+test below doesn't exercise them because it requests shutdown before any of
+them has ticked once (they spawn only after the ~10s startup registration
+sequence completes, so they observe the already-cancelled token before ever
+calling `pool.get()`). A worker that runs long enough for one of those loops
+to start a real acquisition against a since-exhausted shard, before shutdown
+is requested, would still hang. Tracked in #1426 as a same-shaped, separate
+fix.
 
 **Test evidence.**
 

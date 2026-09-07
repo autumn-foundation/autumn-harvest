@@ -845,18 +845,6 @@ impl PreparedHarvestRuntime {
     }
 }
 
-/// Extra time `HarvestRunner::stop` allows past a worker's own
-/// `shutdown_timeout` before it abandons the join (issue #1209).
-///
-/// The worker's shutdown sequence already bounds itself; this margin covers
-/// only the gap between that bound firing and the task actually returning.
-const WORKER_STOP_JOIN_MARGIN: std::time::Duration = std::time::Duration::from_secs(5);
-
-/// Fallback bound for `HarvestRunner::stop` when no worker `shutdown_timeout`
-/// is available. Unreachable in practice: `worker_handle` is only `Some` when
-/// `worker` is too, so the real `shutdown_timeout` is always read instead.
-const WORKER_STOP_FALLBACK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
-
 /// Running Harvest runtime ownership for a process.
 ///
 /// This owns any locally started worker and scheduler tasks while also
@@ -1136,9 +1124,6 @@ impl HarvestRunner {
             batch,
         } = self;
 
-        // Captured before `worker` is consumed below, so the join bound after
-        // it stops still has the runtime's own drain deadline to work from.
-        let worker_shutdown_timeout = worker.as_ref().map(|w| w.config.shutdown_timeout);
         if let Some(worker) = worker {
             worker.shutdown();
         }
@@ -1157,26 +1142,10 @@ impl HarvestRunner {
         if let Some(batch) = batch {
             batch.shutdown().await;
         }
-        if let Some(worker_handle) = worker_handle {
-            // Bounded defense-in-depth (issue #1209): the worker's own
-            // shutdown sequence is now bounded end to end, so this should
-            // never fire. It guards the runner's own contract in case a
-            // future change reintroduces an unbounded await on this path.
-            let bound = worker_shutdown_timeout.unwrap_or(WORKER_STOP_FALLBACK_TIMEOUT)
-                + WORKER_STOP_JOIN_MARGIN;
-            match tokio::time::timeout(bound, worker_handle).await {
-                Ok(Ok(())) => {}
-                Ok(Err(error)) => {
-                    tracing::warn!(error = %error, "harvest worker task failed during shutdown");
-                }
-                Err(_elapsed) => {
-                    tracing::warn!(
-                        ?bound,
-                        "harvest worker task did not stop within shutdown_timeout plus margin; \
-                         abandoning the join and returning to the caller"
-                    );
-                }
-            }
+        if let Some(worker_handle) = worker_handle
+            && let Err(error) = worker_handle.await
+        {
+            tracing::warn!(error = %error, "harvest worker task failed during shutdown");
         }
     }
 }
