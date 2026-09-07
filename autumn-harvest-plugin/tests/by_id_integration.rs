@@ -915,7 +915,7 @@ async fn start_with_empty_workflow_id_is_rejected_400() {
     let resp = send(
         &app,
         post_json(
-            "/workflows/order_flow/start",
+            "/workflows/progress_wf/start",
             &json!({"workflow_id": "", "input": "x"}),
         ),
     )
@@ -984,7 +984,7 @@ async fn start_with_omitted_workflow_id_still_auto_generates() {
 
     let resp = send(
         &app,
-        post_json("/workflows/order_flow/start", &json!({"input": "x"})),
+        post_json("/workflows/progress_wf/start", &json!({"input": "x"})),
     )
     .await;
     assert_eq!(resp.status, StatusCode::CREATED, "body: {}", resp.body);
