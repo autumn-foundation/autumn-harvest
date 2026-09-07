@@ -983,6 +983,29 @@ async fn by_id_sibling_route_rejects_empty_workflow_id() {
     assert_eq!(resp.body["detail"], json!("workflow_id must not be empty"));
 }
 
+/// issue #1353: the guard covers the MUTATING side of the by-id family too,
+/// not just reads. `cancel` shares `resolve_workflow_by_business_id` with
+/// every GET route above. It sits behind `require_admin` middleware, though.
+/// This is the only test here reaching that handler with an empty
+/// `workflow_id`.
+#[tokio::test]
+async fn cancel_by_id_rejects_empty_workflow_id() {
+    let (url, _c) = setup_database().await;
+    let pool = build_pool(&url);
+    let app = build_app(&pool, true);
+
+    let resp = send(
+        &app,
+        post_json(
+            "/workflows/by-id/order_flow//cancel",
+            &json!({"reason": "dup"}),
+        ),
+    )
+    .await;
+    assert_eq!(resp.status, StatusCode::BAD_REQUEST, "body: {}", resp.body);
+    assert_eq!(resp.body["detail"], json!("workflow_id must not be empty"));
+}
+
 /// issue #1353: omitting `workflow_id` (the pre-existing auto-generate path)
 /// is unaffected — only an explicit empty string is rejected.
 #[tokio::test]
