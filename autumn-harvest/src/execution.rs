@@ -617,9 +617,7 @@ pub async fn start_or_load_workflow_execution_collect(
     // can never resolve consistently. That is issue #1353's root cause. It is
     // never a valid identifier for a live, addressable execution.
     if request.workflow_id.is_empty() {
-        return Err(HarvestError::Config(
-            "workflow_id must not be empty".to_string(),
-        ));
+        return Err(HarvestError::EmptyWorkflowId);
     }
 
     // Validate delayed start parameters (issue #322)

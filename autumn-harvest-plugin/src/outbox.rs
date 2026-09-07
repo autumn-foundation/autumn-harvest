@@ -109,11 +109,22 @@ impl HarvestWorkflowOutboxRow {
 ///
 /// # Errors
 ///
-/// Returns a Diesel error if the outbox insert cannot be executed.
+/// Returns a Diesel error if the outbox insert cannot be executed, or if
+/// `request.workflow_id` is an explicit empty string (issue #1353, Codex
+/// review). `diesel::result::Error` has no dedicated variant for a rejected
+/// precondition, so `QueryBuilderError` carries it -- the query is never
+/// even built. Rejecting here, not only at dispatch time, means a
+/// successful `Ok(())` never promises delivery of a row that can never
+/// start.
 pub async fn enqueue_workflow_start_outbox(
     conn: &mut AsyncPgConnection,
     request: &WorkflowStartRequest,
 ) -> Result<(), diesel::result::Error> {
+    if request.workflow_id.is_empty() {
+        return Err(diesel::result::Error::QueryBuilderError(
+            "workflow_id must not be empty".into(),
+        ));
+    }
     diesel::insert_into(harvest_workflow_outbox::table)
         .values(NewHarvestWorkflowOutboxRow {
             workflow_name: &request.workflow_name,
@@ -292,18 +303,15 @@ pub(crate) async fn dispatch_workflow_start_request(
     state: &AppState,
     request: &WorkflowStartRequest,
 ) -> HarvestResult<ExecutionId> {
-    // issue #1353 (Codex review): `WorkflowStartRequest` is public API.
-    // `enqueue_workflow_start_outbox` takes it straight from an embedder.
-    // No HTTP layer runs `reject_empty_workflow_id` in between. Reject here
-    // instead, at the one place that actually starts the execution. This
-    // also covers a row enqueued before this fix shipped. Such a row keeps
-    // retrying with backoff, forever. This module has no dead-letter path
-    // for any permanent dispatch failure. But the row can never actually
-    // start.
+    // issue #1353 (Codex review): `enqueue_workflow_start_outbox` below
+    // already rejects a NEW empty workflow_id before persisting it. This is
+    // the backstop for a row enqueued before that admission guard shipped.
+    // Such a legacy row would otherwise retry with backoff forever. This
+    // module has no dead-letter path for any permanent dispatch failure.
+    // So reject it here too, at the one place that actually starts the
+    // execution.
     if request.workflow_id.is_empty() {
-        return Err(HarvestError::Config(
-            "workflow_id must not be empty".to_string(),
-        ));
+        return Err(HarvestError::EmptyWorkflowId);
     }
     let harvest_pool = state.extension::<HarvestDbPool>().ok_or_else(|| {
         HarvestError::Config(

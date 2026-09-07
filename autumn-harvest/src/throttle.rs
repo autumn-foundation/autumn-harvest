@@ -1192,6 +1192,24 @@ async fn fire_claimed_throttle_row(
             );
             Ok(None)
         }
+        // issue #1353 (Codex P1 review): mirrors the identical arm in
+        // `debounce.rs::fire_claimed_debounce_row`. An empty workflow_id
+        // here can only be a LEGACY row. The admission path now rejects an
+        // empty id before a throttle row can ever be written. Such a row
+        // can never start. An un-caught `?` would abort this whole batch's
+        // fire transaction and repeat the same failure every scanner tick,
+        // starving every later scanner duty. Drop the row and refund its
+        // reserved token, the same as the `AlreadyExists` arm.
+        Err(crate::error::HarvestError::EmptyWorkflowId) => {
+            delete_throttle_row(conn, row_id).await?;
+            crate::queue::refund_rate_limit_token(conn, &bucket).await?;
+            tracing::warn!(
+                workflow_name = %workflow_name,
+                throttle_key = %throttle_key,
+                "throttled start skipped: legacy row has an empty workflow_id (issue #1353)",
+            );
+            Ok(None)
+        }
         // issue #1053: the admission gate is closed on this workflow's real
         // queue at fire time. Halt-beats-pace — RE-DEFER: LEAVE the row (do NOT
         // delete) so a later tick fires it once the gate opens, and refund the

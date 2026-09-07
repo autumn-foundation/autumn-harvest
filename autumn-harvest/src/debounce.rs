@@ -944,6 +944,25 @@ async fn fire_claimed_debounce_row(
             );
             Ok(None)
         }
+        // issue #1353 (Codex P1 review): an empty workflow_id here can only
+        // be a LEGACY row. It predates this validation -- the admission
+        // path now rejects an empty id before a debounce row can ever be
+        // written. Such a row can never start, so retrying it changes
+        // nothing. An un-caught `?` here would abort this whole batch's
+        // fire transaction. It would repeat the same failure every scanner
+        // tick. That starves every later scanner duty for as long as the
+        // row sits at the head of the claim queue. That is the exact
+        // hazard the `AlreadyExists` arm above already guards against.
+        // Drop the row the same way.
+        Err(crate::error::HarvestError::EmptyWorkflowId) => {
+            delete_debounce_row(conn, row_id).await?;
+            tracing::warn!(
+                workflow_name = %workflow_name,
+                debounce_key = %debounce_key,
+                "debounced start skipped: legacy row has an empty workflow_id (issue #1353)",
+            );
+            Ok(None)
+        }
         // issue #946 (Task #7 hardening): a declared per-tenant quota is
         // exhausted at fire time. Unlike `AlreadyExists` above this is
         // TEMPORARY — the tenant's usage can free up as an existing
