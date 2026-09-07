@@ -427,6 +427,18 @@ impl Default for HarvestRuntimeConfig {
     }
 }
 
+impl HarvestRedisConfig {
+    /// The configured URL with any userinfo removed.
+    ///
+    /// A Redis URL can carry a user name and a password. Startup logs and
+    /// error messages name the endpoint, so they use this form. Returns
+    /// `None` when Redis dispatch is off.
+    #[must_use]
+    pub fn redacted_url(&self) -> Option<String> {
+        self.url.as_deref().map(redact_userinfo)
+    }
+}
+
 impl Default for HarvestRedisConfig {
     fn default() -> Self {
         Self {
@@ -603,6 +615,23 @@ fn parse_orphan_startup_action(key: &str, value: &str) -> Result<OrphanStartupAc
             "invalid orphaned_workflows value for {key}: {value:?}; expected one of: off, warn, fail"
         ))),
     }
+}
+
+/// Remove the `user:password@` part of a URL authority.
+///
+/// The scan is bounded to the authority: the first `/`, `?` or `#` after the
+/// scheme ends it. An `@` later in the path or the query is left alone.
+fn redact_userinfo(url: &str) -> String {
+    let Some(scheme_end) = url.find("://") else {
+        return url.to_owned();
+    };
+    let authority_start = scheme_end + 3;
+    let authority = &url[authority_start..];
+    let authority_end = authority.find(['/', '?', '#']).unwrap_or(authority.len());
+    let Some(at) = authority[..authority_end].rfind('@') else {
+        return url.to_owned();
+    };
+    format!("{}{}", &url[..authority_start], &authority[at + 1..])
 }
 
 fn parse_bool(key: &str, value: &str) -> Result<bool, ConfigError> {
