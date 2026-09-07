@@ -37773,6 +37773,106 @@ mod tests {
         );
     }
 
+    /// Finding F1 (issue #1312 review round 1). A full page means the walk may
+    /// have more rows below it, so the next sweep continues from the cursor.
+    #[test]
+    fn a_full_reconcile_page_keeps_the_cursor() {
+        let cursor = crate::queue::DispatchCursor {
+            priority: 5,
+            scheduled_at: chrono::Utc::now(),
+            id: uuid::Uuid::new_v4(),
+        };
+        assert_eq!(
+            next_reconcile_cursor(1000, 1000, Some(cursor.clone())),
+            Some(cursor),
+            "a full page must leave the walk where it stopped"
+        );
+    }
+
+    /// A short page is the end of the queue, so the walk wraps to the top.
+    /// Without the wrap a later write above the cursor is never swept.
+    #[test]
+    fn a_short_reconcile_page_wraps_the_cursor() {
+        let cursor = crate::queue::DispatchCursor {
+            priority: 5,
+            scheduled_at: chrono::Utc::now(),
+            id: uuid::Uuid::new_v4(),
+        };
+        assert_eq!(
+            next_reconcile_cursor(3, 1000, Some(cursor)),
+            None,
+            "a short page must wrap the walk to the top of the queue"
+        );
+        assert_eq!(
+            next_reconcile_cursor(0, 1000, None),
+            None,
+            "an empty page must wrap the walk to the top of the queue"
+        );
+    }
+
+    /// Finding F2 (issue #1312 review round 1). The cooldown starts at the
+    /// poll interval, doubles per consecutive failure and stops at the cap.
+    #[test]
+    fn the_degraded_cooldown_doubles_and_then_caps() {
+        let base = Duration::from_millis(100);
+        assert_eq!(degraded_cooldown(1, base), Duration::from_millis(100));
+        assert_eq!(degraded_cooldown(2, base), Duration::from_millis(200));
+        assert_eq!(degraded_cooldown(3, base), Duration::from_millis(400));
+        assert_eq!(degraded_cooldown(4, base), Duration::from_millis(800));
+        assert_eq!(
+            degraded_cooldown(64, base),
+            DISPATCH_DEGRADED_COOLDOWN_CAP,
+            "a long outage must not grow the cooldown without bound"
+        );
+        assert_eq!(
+            degraded_cooldown(0, base),
+            base,
+            "the schedule starts at the poll interval"
+        );
+    }
+
+    /// A worker enters degraded mode on a channel failure and leaves it on the
+    /// first successful channel call.
+    #[test]
+    fn a_successful_channel_call_clears_the_degraded_window() {
+        let base = Duration::from_secs(5);
+        let mut degraded = DispatchDegradation::new();
+        assert!(
+            !degraded.is_degraded(),
+            "a fresh worker is not in degraded mode"
+        );
+
+        assert_eq!(degraded.record_failure(base), base);
+        assert!(degraded.is_degraded(), "a channel failure opens the window");
+        assert_eq!(
+            degraded.record_failure(base),
+            base * 2,
+            "a second consecutive failure doubles the cooldown"
+        );
+
+        degraded.record_success();
+        assert!(
+            !degraded.is_degraded(),
+            "a successful channel call closes the window"
+        );
+        assert_eq!(
+            degraded.record_failure(base),
+            base,
+            "the schedule restarts at the poll interval after a success"
+        );
+    }
+
+    /// A cooldown that has run out lets the next iteration probe the channel.
+    #[test]
+    fn an_elapsed_cooldown_leaves_degraded_mode() {
+        let mut degraded = DispatchDegradation::new();
+        degraded.record_failure(Duration::ZERO);
+        assert!(
+            !degraded.is_degraded(),
+            "a cooldown of zero is elapsed at once, so the next iteration probes the channel"
+        );
+    }
+
     #[test]
     fn the_sharded_runtime_rejection_reads_as_one_sentence() {
         let registry = Arc::new(HandlerRegistry::new(vec![], vec![]));

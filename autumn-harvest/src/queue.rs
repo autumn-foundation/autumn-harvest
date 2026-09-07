@@ -8450,9 +8450,48 @@ mod tests {
         assert!(sql.contains("WHERE queue_name = $1"));
         assert!(sql.contains("AND state = 'PENDING'"));
         assert!(sql.contains("AND scheduled_at <= NOW()"));
-        assert!(sql.contains("ORDER BY priority DESC, scheduled_at ASC"));
+        assert!(sql.contains("ORDER BY priority DESC, scheduled_at ASC, id ASC"));
         assert!(sql.contains("LIMIT $2"));
         assert!(sql.contains("priority"));
+    }
+
+    /// The keyset predicate is the whole of issue #1312 round 1 finding F1.
+    /// A page of gated rows must not hide every row below it.
+    #[test]
+    fn due_dispatch_hints_after_query_pins_the_keyset_predicate() {
+        let sql = due_dispatch_hints_after_query();
+        assert!(
+            sql.contains(
+                "AND (priority < $3 \
+                 OR (priority = $3 AND scheduled_at > $4) \
+                 OR (priority = $3 AND scheduled_at = $4 AND id > $5))"
+            ),
+            "the keyset predicate must match the sweep order exactly: {sql}"
+        );
+    }
+
+    /// The order is total. Two rows that share a priority and a due time are
+    /// separated by `id`, so a page boundary is never ambiguous.
+    #[test]
+    fn due_dispatch_hints_after_query_walks_the_poll_index_order() {
+        let sql = due_dispatch_hints_after_query();
+        assert!(sql.contains("WHERE queue_name = $1"));
+        assert!(sql.contains("AND state = 'PENDING'"));
+        assert!(sql.contains("AND scheduled_at <= NOW()"));
+        assert!(sql.contains("ORDER BY priority DESC, scheduled_at ASC, id ASC"));
+        assert!(sql.contains("LIMIT $2"));
+    }
+
+    /// The paginated read keeps every gate the unpaginated read has.
+    #[test]
+    fn due_dispatch_hints_after_query_skips_a_paused_queue() {
+        let sql = due_dispatch_hints_after_query();
+        assert!(
+            sql.contains(
+                "AND NOT EXISTS (SELECT 1 FROM harvest_queue_pauses qp WHERE qp.queue_name = $1)"
+            ),
+            "the paginated sweep must not republish rows of a paused queue"
+        );
     }
 
     #[test]

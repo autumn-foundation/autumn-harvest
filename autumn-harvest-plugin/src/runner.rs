@@ -2014,7 +2014,123 @@ mod tests {
         autumn_harvest::dispatch::uninstall();
     }
 
-    /// The process-global dispatch slot is one resource. The two guard tests
+    /// A runner that owns nothing but the dispatch flag.
+    ///
+    /// `stop` is driven through this, so the case needs no database, no worker
+    /// and no scheduler.
+    fn runner_owning_dispatch(installed: bool) -> super::HarvestRunner {
+        let api_runtime = crate::api::HarvestApiRuntime::new(
+            std::sync::Arc::new(autumn_harvest::worker::HandlerRegistry::new(vec![], vec![])),
+            std::sync::Arc::new(autumn_harvest::scheduler::DagCatalog::default()),
+            std::sync::Arc::new(Vec::new()),
+            None,
+            Vec::new(),
+            autumn_harvest::scheduler::SchedulerMonitor::offline(),
+            crate::api::HarvestRetentionRuntime::disabled(
+                autumn_harvest::retention::RetentionConfig::default(),
+            ),
+            ShardRouter::single(),
+        );
+        super::HarvestRunner {
+            api_runtime,
+            storage_pool: crate::state::HarvestDbPool::single(tagged_pool(1)),
+            worker: None,
+            worker_handle: None,
+            scheduler: None,
+            retention: None,
+            batch: None,
+            dispatch_installed: installed,
+        }
+    }
+
+    /// Run `future` on a private current-thread runtime.
+    ///
+    /// The dispatch cases hold a blocking lock, so they stay synchronous.
+    fn block_on<F: std::future::Future>(future: F) -> F::Output {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("test runtime")
+            .block_on(future)
+    }
+
+    /// Finding F3 (issue #1312 review round 1). A restart with Redis off must
+    /// not keep publishing and consuming through the channel of the previous
+    /// runtime.
+    #[test]
+    fn a_disabled_start_clears_a_previously_installed_channel() {
+        let _lock = DISPATCH_TEST_LOCK.lock().unwrap_or_else(|error| {
+            DISPATCH_TEST_LOCK.clear_poison();
+            error.into_inner()
+        });
+
+        autumn_harvest::dispatch::install(
+            std::sync::Arc::new(autumn_harvest::dispatch::MemoryDispatch::new()),
+            autumn_harvest::dispatch::DispatchSettings::default(),
+        );
+
+        let config = crate::config::HarvestRuntimeConfig::default();
+        assert!(
+            config.redis.url.is_none(),
+            "the default config has redis dispatch off"
+        );
+        let installed = block_on(super::install_dispatch_channel(&config))
+            .expect("a disabled start must succeed");
+
+        assert!(!installed, "a disabled start installs no channel");
+        assert!(
+            autumn_harvest::dispatch::installed().is_none(),
+            "a disabled start must clear the channel a previous runtime installed"
+        );
+    }
+
+    /// The runner uninstalls the channel it installed when it stops.
+    #[test]
+    fn stop_uninstalls_a_channel_the_runner_installed() {
+        let _lock = DISPATCH_TEST_LOCK.lock().unwrap_or_else(|error| {
+            DISPATCH_TEST_LOCK.clear_poison();
+            error.into_inner()
+        });
+
+        autumn_harvest::dispatch::install(
+            std::sync::Arc::new(autumn_harvest::dispatch::MemoryDispatch::new()),
+            autumn_harvest::dispatch::DispatchSettings::default(),
+        );
+
+        block_on(runner_owning_dispatch(true).stop());
+
+        assert!(
+            autumn_harvest::dispatch::installed().is_none(),
+            "stop must uninstall the channel the runner installed"
+        );
+    }
+
+    /// A runner that installed no channel leaves the slot alone.
+    ///
+    /// Another owner in the same process may hold it, and this runner has no
+    /// claim on it.
+    #[test]
+    fn stop_leaves_a_channel_the_runner_did_not_install() {
+        let _lock = DISPATCH_TEST_LOCK.lock().unwrap_or_else(|error| {
+            DISPATCH_TEST_LOCK.clear_poison();
+            error.into_inner()
+        });
+
+        autumn_harvest::dispatch::install(
+            std::sync::Arc::new(autumn_harvest::dispatch::MemoryDispatch::new()),
+            autumn_harvest::dispatch::DispatchSettings::default(),
+        );
+
+        block_on(runner_owning_dispatch(false).stop());
+
+        assert!(
+            autumn_harvest::dispatch::is_installed(),
+            "stop must not uninstall a channel this runner never installed"
+        );
+        autumn_harvest::dispatch::uninstall();
+    }
+
+    /// The process-global dispatch slot is one resource. The dispatch cases
     /// take this lock so they never observe each other.
     static DISPATCH_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 }
