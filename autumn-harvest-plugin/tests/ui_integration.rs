@@ -917,6 +917,145 @@ async fn ui_dead_letters_lists_filters_and_replays_single_entry() {
     );
 }
 
+/// RED baseline this test replaces the assumption of: `parse_dead_letter_ui_filters`
+/// used to parse `task_kind` with `DeadLetterTaskKind::parse(..)?`, a bare `?`
+/// on `Result<_, AutumnError>` — an unrecognized value 400-aborted the whole
+/// `/dead-letters` response before the filter form (or the `workflow_name`
+/// filter the operator had already typed) ever rendered. Same
+/// discard-the-page-on-bad-filter pattern already fixed for the Workflows
+/// page's `started_after`/`started_before` (#1333) and the Workers page's
+/// `status`/`stale` (#1378) — this DLQ page was the one sibling list page
+/// still carrying it.
+///
+/// GREEN (this commit): the request still renders the DLQ page (`200`),
+/// preserves the other filter (`workflow_name=invoice_workflow`, still in
+/// its input's `value=`), and surfaces a `role="alert"` message naming the
+/// bad value and the valid options next to the Task kind field.
+#[tokio::test]
+async fn ui_dead_letters_unknown_task_kind_redisplays_form_instead_of_aborting_page() {
+    let (database_url, _container) = setup_test_database_url().await;
+    let app = build_single_shard_ui_app(&database_url);
+
+    let (status, html) = fetch_html(
+        &app,
+        "/dead-letters?task_kind=zombie&workflow_name=invoice_workflow",
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "an unknown task_kind value must not abort the whole DLQ page: {html}"
+    );
+    assert!(
+        html.contains("name=\"task_kind\""),
+        "filter form must still render: {html}"
+    );
+    assert!(
+        html.contains("value=\"invoice_workflow\""),
+        "the other filter the operator already typed must not be discarded: {html}"
+    );
+    assert!(
+        html.contains("role=\"alert\""),
+        "an inline, screen-reader-announced error must sit next to the field: {html}"
+    );
+    assert!(
+        html.contains("zombie") && html.contains("Activity"),
+        "the error must name the bad value and a valid option: {html}"
+    );
+    assert!(
+        html.contains("option value=\"zombie\" selected"),
+        "the Task kind select must echo the invalid value back as its selected \
+         option, not silently revert to 'All': {html}"
+    );
+}
+
+/// Same fix, `failed_after` side: `parse_dead_letter_time_filter` used to
+/// `?`-propagate a bare `AutumnError` on a malformed RFC 3339 timestamp.
+#[tokio::test]
+async fn ui_dead_letters_invalid_failed_after_redisplays_form_instead_of_aborting_page() {
+    let (database_url, _container) = setup_test_database_url().await;
+    let app = build_single_shard_ui_app(&database_url);
+
+    let (status, html) = fetch_html(
+        &app,
+        "/dead-letters?failed_after=not-a-date&workflow_name=invoice_workflow",
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "an invalid failed_after value must not abort the whole DLQ page: {html}"
+    );
+    assert!(
+        html.contains("value=\"invoice_workflow\""),
+        "the other filter the operator already typed must not be discarded: {html}"
+    );
+    assert!(
+        html.contains("role=\"alert\""),
+        "an inline, screen-reader-announced error must sit next to the field: {html}"
+    );
+    assert!(
+        html.contains("value=\"not-a-date\""),
+        "the operator's exact invalid text must be echoed back into the field: {html}"
+    );
+    assert!(
+        html.contains("RFC 3339"),
+        "the error must name the expected format: {html}"
+    );
+}
+
+/// Same fix, `failed_before` side.
+#[tokio::test]
+async fn ui_dead_letters_invalid_failed_before_redisplays_form_instead_of_aborting_page() {
+    let (database_url, _container) = setup_test_database_url().await;
+    let app = build_single_shard_ui_app(&database_url);
+
+    let (status, html) = fetch_html(
+        &app,
+        "/dead-letters?failed_before=not-a-date&workflow_name=invoice_workflow",
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "an invalid failed_before value must not abort the whole DLQ page: {html}"
+    );
+    assert!(
+        html.contains("value=\"invoice_workflow\""),
+        "the other filter the operator already typed must not be discarded: {html}"
+    );
+    assert!(
+        html.contains("role=\"alert\""),
+        "an inline, screen-reader-announced error must sit next to the field: {html}"
+    );
+    assert!(
+        html.contains("value=\"not-a-date\""),
+        "the operator's exact invalid text must be echoed back into the field: {html}"
+    );
+}
+
+/// Codex-review-class regression guard, matching #1333/#1378's own
+/// follow-up: an invalid filter's raw text must survive into pagination
+/// instead of being dropped on the very next click.
+#[tokio::test]
+async fn ui_dead_letters_invalid_task_kind_persists_across_pagination() {
+    let ((shard0_url, shard1_url), _container) = setup_sharded_test_database_urls().await;
+    let _seeded = seed_dead_letter_ui_fixture(&shard0_url, &shard1_url).await;
+    let app = build_sharded_api_with_ui_app(&shard0_url, &shard1_url);
+
+    let (status, html) = fetch_html(&app, "/ui/dead-letters?task_kind=zombie&limit=1").await;
+    assert_eq!(status, StatusCode::OK, "unexpected status: {html}");
+    assert!(
+        html.contains("Next"),
+        "test setup must produce a Next link to exercise pagination: {html}"
+    );
+    assert!(
+        html.contains("task_kind=zombie"),
+        "the invalid task_kind must be carried into the Next/Previous links \
+         instead of being dropped on the next page view: {html}"
+    );
+}
+
 /// DLQ Summary toggle (issue #385): the aggregation view groups entries,
 /// reports counts merged across shards, and links back into the filtered list.
 #[tokio::test]
