@@ -1858,4 +1858,84 @@ mod tests {
             "a caller that already ran the gate must be able to say so",
         );
     }
+    /// Redis dispatch is single-shard in v1 (issue #1312, contract C7). The
+    /// runner rejects the combination before it installs the channel, so a
+    /// multi-shard process never reaches a connected channel it cannot use.
+    #[test]
+    fn redis_dispatch_is_rejected_on_a_multi_shard_runtime() {
+        let error = super::reject_multi_shard_dispatch(true, 3)
+            .expect_err("a multi-shard runtime must reject redis dispatch");
+
+        assert!(
+            error.contains("1312") && error.contains("single-shard"),
+            "expected the rejection to name the limit and the issue, got {error}"
+        );
+    }
+
+    /// A single-shard runtime is the supported shape, so the check passes.
+    #[test]
+    fn redis_dispatch_is_accepted_on_a_single_shard_runtime() {
+        super::reject_multi_shard_dispatch(true, 1)
+            .expect("a single-shard runtime must accept redis dispatch");
+    }
+
+    /// With no URL the channel stays off, so the shard span does not matter.
+    #[test]
+    fn a_multi_shard_runtime_without_a_redis_url_starts() {
+        super::reject_multi_shard_dispatch(false, 4)
+            .expect("a runtime with redis dispatch off must not be rejected");
+    }
+
+    /// `start` installs the process-global channel before it builds the
+    /// worker. A later failure must leave no channel behind, or the next
+    /// runtime in this process inherits one it never configured (issue #1312).
+    #[test]
+    fn a_failed_startup_uninstalls_the_dispatch_channel() {
+        let _lock = DISPATCH_TEST_LOCK.lock().unwrap_or_else(|error| {
+            DISPATCH_TEST_LOCK.clear_poison();
+            error.into_inner()
+        });
+
+        autumn_harvest::dispatch::install(
+            std::sync::Arc::new(autumn_harvest::dispatch::MemoryDispatch::new()),
+            autumn_harvest::dispatch::DispatchSettings::default(),
+        );
+        assert!(
+            autumn_harvest::dispatch::is_installed(),
+            "the test fixture must install a channel"
+        );
+
+        drop(super::DispatchInstallGuard::new(true));
+
+        assert!(
+            !autumn_harvest::dispatch::is_installed(),
+            "a startup that fails after the install must uninstall the channel"
+        );
+    }
+
+    /// A startup that reaches the commit point keeps its channel installed.
+    #[test]
+    fn a_committed_guard_keeps_the_dispatch_channel() {
+        let _lock = DISPATCH_TEST_LOCK.lock().unwrap_or_else(|error| {
+            DISPATCH_TEST_LOCK.clear_poison();
+            error.into_inner()
+        });
+
+        autumn_harvest::dispatch::install(
+            std::sync::Arc::new(autumn_harvest::dispatch::MemoryDispatch::new()),
+            autumn_harvest::dispatch::DispatchSettings::default(),
+        );
+
+        super::DispatchInstallGuard::new(true).commit();
+
+        assert!(
+            autumn_harvest::dispatch::is_installed(),
+            "a committed guard must leave the channel installed"
+        );
+        autumn_harvest::dispatch::uninstall();
+    }
+
+    /// The process-global dispatch slot is one resource. The two guard tests
+    /// take this lock so they never observe each other.
+    static DISPATCH_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 }
