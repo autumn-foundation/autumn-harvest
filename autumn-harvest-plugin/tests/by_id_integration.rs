@@ -956,9 +956,11 @@ async fn by_id_base_route_trailing_slash_rejects_empty_workflow_id() {
 
 /// issue #1353: a sibling by-id route can be reached with an empty
 /// `workflow_id` via a non-final empty segment (`.../order_flow//stack`).
-/// `seed()` calls the engine directly, below the new HTTP-layer guard. A row
-/// with `workflow_id = ""` can therefore still exist. This reconstructs the
-/// exact pre-fix asymmetry. This route resolved such a row (200) by
+/// `start_or_load_workflow_execution` itself now rejects an empty
+/// `workflow_id` (issue #1353, core-level guard). This seeds a normal row
+/// instead, then force-updates `workflow_id` directly with a raw `UPDATE`.
+/// That sits below even the engine. It reconstructs a row that predates
+/// every layer of this fix. This route resolved such a row (200) by
 /// accident of `matchit`'s empty-segment matching -- a router detail, not a
 /// documented contract. The base route 404'd for the same row instead. It
 /// must now reject 400 here too, consistent with the base route.
@@ -967,7 +969,12 @@ async fn by_id_sibling_route_rejects_empty_workflow_id() {
     let (url, _c) = setup_database().await;
     let pool = build_pool(&url);
     let mut conn = pool.get().await.expect("conn");
-    seed(&mut conn, "order_flow", "", "RUNNING", 0).await;
+    let exec_id = seed(&mut conn, "order_flow", "pre-fix-seed", "RUNNING", 0).await;
+    diesel::update(harvest_workflow_executions::table.find(exec_id.as_uuid()))
+        .set(harvest_workflow_executions::workflow_id.eq(""))
+        .execute(&mut conn)
+        .await
+        .expect("force workflow_id empty below the engine guard");
     drop(conn);
 
     let app = build_app(&pool, true);

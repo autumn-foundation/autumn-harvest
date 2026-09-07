@@ -15778,6 +15778,7 @@ const MAX_START_IDEMPOTENCY_KEY_LEN: usize = 512;
 ///
 /// A whitespace-only id is out of scope. It is a normal, non-empty final
 /// path segment, so it does not trigger the router gap this issue addresses.
+#[allow(clippy::result_large_err)]
 fn reject_empty_workflow_id(raw: Option<&str>) -> Result<(), axum::response::Response> {
     use axum::response::IntoResponse as _;
     if raw == Some("") {
@@ -16303,9 +16304,32 @@ pub(crate) async fn start_workflow(
         }
     };
 
-    // issue #1353: reject an explicit empty workflow_id before any further
-    // work. Cheap, no DB dependency, so it runs ahead of everything else.
+    // issue #1353 (Codex P2 review): audit an empty-workflow_id rejection the
+    // same way "workflow not registered" below is audited, so this validation
+    // failure leaves the same trail every other one on this route does.
+    // `audit_context` and `route` are cheap (no DB, no runtime), so they move
+    // ahead of the check rather than duplicating them.
+    let (actor, source, request_id) = audit_context(&headers, &api_state);
+    let route = "POST /workflows/{workflow_name}/start";
     if let Err(resp) = reject_empty_workflow_id(request.workflow_id.as_deref()) {
+        if let Ok(pool) = api_state.storage_pool()
+            && let Ok(mut conn) = acquire_conn(pool.default_pool()).await
+        {
+            let ar = NewAuditRecord {
+                actor: &actor,
+                operation: OP_WORKFLOW_START,
+                target_type: TARGET_WORKFLOW,
+                target_id: Some(workflow_name.as_str()),
+                route_or_command: route,
+                request_id: request_id.as_deref(),
+                idempotency_key: None,
+                status: STATUS_FAILED,
+                error_summary: Some("empty workflow_id"),
+                shard_id: None,
+                source: &source,
+            };
+            let _ = audit::insert_audit(&mut conn, &ar).await;
+        }
         return resp;
     }
 
@@ -16398,9 +16422,6 @@ pub(crate) async fn start_workflow(
         Ok(r) => r,
         Err(e) => return map_error(e).into_response(),
     };
-
-    let (actor, source, request_id) = audit_context(&headers, &api_state);
-    let route = "POST /workflows/{workflow_name}/start";
 
     if !runtime.registry.workflows.contains_key(&workflow_name) {
         if let Ok(pool) = api_state.storage_pool()
@@ -20509,15 +20530,36 @@ pub(crate) async fn signal_with_start_workflow(
 ) -> axum::response::Response {
     use axum::response::IntoResponse as _;
 
-    // issue #1353: reject an explicit empty workflow_id before any further
-    // work. Cheap, no DB dependency, so it runs ahead of everything else.
-    // Unlike plain start, workflow_id is mandatory here, but the wire type is
-    // a bare String, so an empty string still deserializes cleanly.
+    let route = "POST /workflows/{workflow_name}/signal-with-start";
+
+    // issue #1353 (Codex P2 review): reject an explicit empty workflow_id
+    // before any further work. Audit it the same way every other validation
+    // failure on this route is audited. Cheap, no DB dependency beyond the
+    // audit write itself. Unlike plain start, workflow_id is mandatory here,
+    // but the wire type is a bare String, so an empty string still
+    // deserializes cleanly.
     if let Err(resp) = reject_empty_workflow_id(Some(request.workflow_id.as_str())) {
+        let (actor, source, request_id) = audit_context(&headers, &api_state);
+        if let Ok(pool) = api_state.storage_pool()
+            && let Ok(mut conn) = acquire_conn(pool.default_pool()).await
+        {
+            let ar = NewAuditRecord {
+                actor: &actor,
+                operation: OP_WORKFLOW_SIGNAL_WITH_START,
+                target_type: TARGET_WORKFLOW,
+                target_id: Some(workflow_name.as_str()),
+                route_or_command: route,
+                request_id: request_id.as_deref(),
+                idempotency_key: request.idempotency_key.as_deref(),
+                status: STATUS_FAILED,
+                error_summary: Some("empty workflow_id"),
+                shard_id: None,
+                source: &source,
+            };
+            let _ = audit::insert_audit(&mut conn, &ar).await;
+        }
         return resp;
     }
-
-    let route = "POST /workflows/{workflow_name}/signal-with-start";
 
     if matches!(
         request.id_reuse_policy.as_deref(),
@@ -21219,15 +21261,36 @@ async fn update_with_start_workflow(
 ) -> axum::response::Response {
     use axum::response::IntoResponse as _;
 
-    // issue #1353: reject an explicit empty workflow_id before any further
-    // work. Cheap, no DB dependency, so it runs ahead of everything else.
-    // Unlike plain start, workflow_id is mandatory here, but the wire type is
-    // a bare String, so an empty string still deserializes cleanly.
+    let route = "POST /workflows/{workflow_name}/update-with-start";
+
+    // issue #1353 (Codex P2 review): reject an explicit empty workflow_id
+    // before any further work. Audit it the same way every other validation
+    // failure on this route is audited. Cheap, no DB dependency beyond the
+    // audit write itself. Unlike plain start, workflow_id is mandatory here,
+    // but the wire type is a bare String, so an empty string still
+    // deserializes cleanly.
     if let Err(resp) = reject_empty_workflow_id(Some(request.workflow_id.as_str())) {
+        let (actor, source, request_id) = audit_context(&headers, &api_state);
+        if let Ok(pool) = api_state.storage_pool()
+            && let Ok(mut conn) = acquire_conn(pool.default_pool()).await
+        {
+            let ar = NewAuditRecord {
+                actor: &actor,
+                operation: OP_WORKFLOW_UPDATE_WITH_START,
+                target_type: TARGET_WORKFLOW,
+                target_id: Some(workflow_name.as_str()),
+                route_or_command: route,
+                request_id: request_id.as_deref(),
+                idempotency_key: request.idempotency_key.as_deref(),
+                status: STATUS_FAILED,
+                error_summary: Some("empty workflow_id"),
+                shard_id: None,
+                source: &source,
+            };
+            let _ = audit::insert_audit(&mut conn, &ar).await;
+        }
         return resp;
     }
-
-    let route = "POST /workflows/{workflow_name}/update-with-start";
 
     // `terminate_if_running` requires admin access (same gate as signal_with_start).
     if matches!(
