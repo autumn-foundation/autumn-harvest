@@ -5400,29 +5400,36 @@ pub(crate) fn monitor_shard_scope(
 /// there would starve a merely-busy shard rather than protect its peers.
 pub(crate) const MIN_SHARD_ACQUIRE_BOUND: Duration = Duration::from_secs(5);
 
-/// The per-shard pool-acquisition bound (issue #961 review, Codex P1).
+/// The per-shard pool-acquisition bound (issue #961 review, Codex P1; extended
+/// to shutdown by issue #1209).
 ///
 /// Harvest configures no deadpool `Timeouts`, so every `pool.get().await` is an
 /// **unbounded** wait. The multi-shard path visits its shards *sequentially* in
-/// two places, and in both a single exhausted or unreachable pool parks the one
-/// future and strands every peer shard:
+/// three places. In each, a single exhausted or unreachable pool parks the
+/// one future and strands every peer shard:
 ///
 /// * `run_multi_shard`'s startup loop (`register_in_fleet` +
 ///   `register_rate_limit_buckets` per shard) - a shard that never yields a
 ///   connection means the poll loop is never reached **at all**;
 /// * `run_poll_loop_multi`, which awaits each shard's `poll_once` in turn -
 ///   round-robin rotation cannot help, because the loop never reaches the
-///   rotation.
+///   rotation;
+/// * `run_multi_shard`'s shutdown sequence calls `transition_fleet_status` on
+///   every shard pool in turn, for both the Draining and the Stopped write.
+///   A shard whose pool never yields a connection would otherwise park
+///   process termination indefinitely (issue #1209).
 ///
-/// Auto-resolution (this issue) makes that the *default* shape for any
+/// Auto-resolution (issue #961) makes that the *default* shape for any
 /// multi-shard pool, which is why it is bounded here.
 ///
 /// Bounding converts the head-of-line block into "skip this shard for one
-/// iteration". Both call sites already have a graceful failure branch: a failed
-/// registration arms the per-shard pending flag the heartbeat task retries, and
-/// a failed poll simply returns `false` and rotates on. Under genuine
-/// saturation the shard is retried on the next pass rather than blocking its
-/// peers indefinitely.
+/// iteration". All three call sites already have a graceful failure branch.
+/// A failed registration arms the per-shard pending flag the heartbeat task
+/// retries. A failed poll simply returns `false` and rotates on. A failed
+/// shutdown transition is logged and skipped, so the other shards' writes
+/// and process termination still proceed. Under genuine saturation the
+/// shard is retried on the next pass rather than blocking its peers
+/// indefinitely.
 ///
 /// The cost is amortized, not free: a shard whose pool stays unavailable is
 /// re-probed once per rotation, so the loop pays the bound each time round.
@@ -22519,7 +22526,22 @@ fn spawn_schedule_overdue_sampler(
             // deleted).
             let mut pass_complete = true;
             for pool in &pools {
-                let mut conn = match pool.get().await {
+                // Selected against `cancel` (issue #1209). This pass runs
+                // before the loop's own cancellation check below. An
+                // exhausted shard pool here would otherwise park this task
+                // past shutdown. The join in `shutdown_and_cleanup_monitors`
+                // would then wait forever. A cancelled pass is incomplete,
+                // same as a real acquisition failure, so the rest of this
+                // loop iteration treats it identically.
+                let get_result = tokio::select! {
+                    () = cancel.cancelled() => None,
+                    result = pool.get() => Some(result),
+                };
+                let Some(get_result) = get_result else {
+                    pass_complete = false;
+                    break;
+                };
+                let mut conn = match get_result {
                     Ok(conn) => conn,
                     Err(error) => {
                         pass_complete = false;
@@ -24363,10 +24385,17 @@ impl Worker {
 
         tracing::info!(worker_id = %self.config.worker_id, "shutdown signal received (multi-shard)");
 
-        // Draining: transition status on every shard pool.
+        // Draining: transition status on every shard pool. Bounded (issue
+        // #1209): sequential visits mean one exhausted shard pool would
+        // otherwise park this loop and never reach its peers.
+        let shutdown_acquire_bound = shard_acquire_bound(true, self.config.poll_interval);
         for (_, shard_pool) in &shard_targets {
-            self.transition_fleet_status(shard_pool, crate::workers::WorkerStatus::Draining)
-                .await;
+            self.transition_fleet_status(
+                shard_pool,
+                crate::workers::WorkerStatus::Draining,
+                shutdown_acquire_bound,
+            )
+            .await;
         }
 
         tracing::info!(worker_id = %self.config.worker_id, "draining in-flight tasks (multi-shard)");
@@ -24374,8 +24403,12 @@ impl Worker {
 
         // Stopped: mark every shard pool's worker row stopped, then cancel heartbeats.
         for (_, shard_pool) in &shard_targets {
-            self.transition_fleet_status(shard_pool, crate::workers::WorkerStatus::Stopped)
-                .await;
+            self.transition_fleet_status(
+                shard_pool,
+                crate::workers::WorkerStatus::Stopped,
+                shutdown_acquire_bound,
+            )
+            .await;
         }
         heartbeat_cancel.cancel();
 
@@ -24699,15 +24732,17 @@ impl Worker {
 
         tracing::info!(worker_id = %self.config.worker_id, "shutdown signal received");
 
-        // Transition to Draining before waiting for in-flight tasks.
-        self.transition_fleet_status(pool, crate::workers::WorkerStatus::Draining)
+        // Transition to Draining before waiting for in-flight tasks. `None`:
+        // the single-shard path has no peer to strand, so this stays the
+        // original unbounded wait (AC3, issue #1209).
+        self.transition_fleet_status(pool, crate::workers::WorkerStatus::Draining, None)
             .await;
 
         tracing::info!(worker_id = %self.config.worker_id, "draining in-flight tasks");
         self.drain_in_flight().await;
 
         // All tasks complete — mark Stopped, then stop the heartbeat task.
-        self.transition_fleet_status(pool, crate::workers::WorkerStatus::Stopped)
+        self.transition_fleet_status(pool, crate::workers::WorkerStatus::Stopped, None)
             .await;
         heartbeat_cancel.cancel();
 
@@ -25841,8 +25876,19 @@ impl Worker {
     }
 
     /// Transition this worker's status in the fleet table.
-    async fn transition_fleet_status(&self, pool: &DbPool, status: crate::workers::WorkerStatus) {
-        match pool.get().await {
+    ///
+    /// `acquire_bound` follows `shard_acquire_bound`. `None` on the
+    /// single-shard path keeps the wait unbounded, byte-for-byte. `Some(_)`
+    /// applies during multi-shard shutdown. That sequence visits shards
+    /// sequentially, so one exhausted shard pool must not park the others'
+    /// Draining/Stopped writes (issue #1209).
+    async fn transition_fleet_status(
+        &self,
+        pool: &DbPool,
+        status: crate::workers::WorkerStatus,
+        acquire_bound: Option<Duration>,
+    ) {
+        match acquire_shard_conn(pool, acquire_bound).await {
             Ok(mut conn) => {
                 if let Err(error) =
                     crate::workers::transition_status(&mut conn, &self.config.worker_id, status)
