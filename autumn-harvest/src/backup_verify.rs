@@ -1024,10 +1024,22 @@ pub fn redact_dsn(dsn: &str) -> String {
     // `set_password()` below are no-ops, and the credential-bearing text
     // reaches `url.to_string()` verbatim. That contradicts this function's
     // own guarantee: never let a malformed-but-secret-bearing string reach a
-    // report or a log line. No valid Postgres DSN omits its host. So
-    // `host()`, not `cannot_be_a_base()`, is the check that catches both
-    // typos, and it never withholds an identity a caller could otherwise
-    // use.
+    // report or a log line.
+    //
+    // Withhold every hostless URL, not only the credential-bearing ones. A
+    // Postgres DSN CAN legitimately omit its host, for the default
+    // Unix-domain socket (`postgresql:///harvest`). Scanning `path()` for
+    // `@` looks like a way to tell that apart from the typo above. It is a
+    // bypass waiting to happen instead: `postgres:/user:hunter2%40host/db`
+    // still parses hostless and still carries the same credential. The
+    // literal `@` a naive scan looks for is gone there, percent-encoded.
+    // `redact_dsn` already documents its rule for this shape of doubt:
+    // "rather than emit a string we cannot prove is clean, we withhold it".
+    // No check built from the `url` crate's parsed fields alone can prove a
+    // hostless URL clean. So it is withheld whole, matching
+    // `parse_dsn_identity`'s own fail-closed precedent elsewhere in this
+    // file. The cost is one unlabeled shard in a report, on a Unix-socket
+    // DSN; the shard id already names it regardless.
     if url.host().is_none() {
         return "<unparseable dsn>".to_string();
     }
@@ -3728,6 +3740,45 @@ mod tests {
             redact_dsn("postgres://user:hunter2@[::1]/dbname").contains("[::1]"),
             "an authority-bearing IPv6 DSN must still redact-and-keep its identity"
         );
+
+    }
+
+    /// A hostless DSN is withheld even when it carries no credential at all —
+    /// a real, if narrow, cost of the fix above. `postgresql:///harvest` is
+    /// the documented libpq form for the default Unix-domain socket, and
+    /// `redact_dsn` now reports it as `<unparseable dsn>` rather than
+    /// `postgresql:///harvest`.
+    ///
+    /// Deliberate, not an oversight. An `@`-in-`path()` scan looks tempting,
+    /// to tell this case apart from the credential-bearing one.
+    /// `redact_dsn_withholds_a_credential_hidden_by_percent_encoding` below
+    /// shows it is a bypass waiting to happen instead. `redact_dsn`'s own
+    /// doc comment already states the rule this falls under: withhold
+    /// whatever cannot be proven clean.
+    #[test]
+    fn redact_dsn_withholds_a_hostless_unix_socket_dsn_too() {
+        for dsn in [
+            "postgresql:///harvest",
+            "postgresql:///harvest?host=%2Fvar%2Frun%2Fpostgresql",
+        ] {
+            assert_eq!(
+                redact_dsn(dsn),
+                "<unparseable dsn>",
+                "from {dsn} — see the doc comment on this test for why"
+            );
+        }
+    }
+
+    /// An `@`-in-`path()` scan is not a safe way to spare the identity of a
+    /// legitimate hostless DSN while still catching the credential-bearing
+    /// one. Percent-encoding the `@` defeats a literal-character scan. The
+    /// credential itself stays fully readable in the decoded path regardless.
+    /// This is why the fix above withholds every hostless DSN outright,
+    /// rather than trying to distinguish them.
+    #[test]
+    fn redact_dsn_withholds_a_credential_hidden_by_percent_encoding() {
+        let dsn = "postgres:/user:hunter2%40host/db";
+        assert_eq!(redact_dsn(dsn), "<unparseable dsn>", "from {dsn}");
     }
 
     #[test]
