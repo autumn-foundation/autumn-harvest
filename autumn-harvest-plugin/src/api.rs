@@ -16304,34 +16304,11 @@ pub(crate) async fn start_workflow(
         }
     };
 
-    // issue #1353 (Codex P2 review): audit an empty-workflow_id rejection the
-    // same way "workflow not registered" below is audited, so this validation
-    // failure leaves the same trail every other one on this route does.
-    // `audit_context` and `route` are cheap (no DB, no runtime), so they move
-    // ahead of the check rather than duplicating them.
+    // `audit_context` and `route` are cheap (no DB, no runtime); computed once
+    // here since the rest of this handler (the registry check below, the
+    // #1353 empty-workflow_id check further down, the probe) all need them.
     let (actor, source, request_id) = audit_context(&headers, &api_state);
     let route = "POST /workflows/{workflow_name}/start";
-    if let Err(resp) = reject_empty_workflow_id(request.workflow_id.as_deref()) {
-        if let Ok(pool) = api_state.storage_pool()
-            && let Ok(mut conn) = acquire_conn(pool.default_pool()).await
-        {
-            let ar = NewAuditRecord {
-                actor: &actor,
-                operation: OP_WORKFLOW_START,
-                target_type: TARGET_WORKFLOW,
-                target_id: Some(workflow_name.as_str()),
-                route_or_command: route,
-                request_id: request_id.as_deref(),
-                idempotency_key: None,
-                status: STATUS_FAILED,
-                error_summary: Some("empty workflow_id"),
-                shard_id: None,
-                source: &source,
-            };
-            let _ = audit::insert_audit(&mut conn, &ar).await;
-        }
-        return resp;
-    }
 
     // Workflow-start provenance (issue #740): default `api` for the plain HTTP
     // start route; a webhook-delegated start (`from_webhook`) overrides it to
@@ -16751,6 +16728,29 @@ pub(crate) async fn start_workflow(
         )
         .await
     {
+        return resp;
+    }
+
+    // issue #1353 (Codex P2 review, round 4): fresh-start-only validation,
+    // like every check below. It runs AFTER the committed-replay probe
+    // above. A keyed start that (pre-#1353) committed under an empty
+    // workflow_id can still be retried. Such a retry must return the `200`
+    // no-op, not a `400`. A `400` here would contradict the retry's own
+    // prior success. It would also audit a working retry as a failure.
+    if let Err(resp) = reject_empty_workflow_id(Some(workflow_id.as_str())) {
+        audit_start_failure(
+            &api_state,
+            &StartFailureAudit {
+                actor: &actor,
+                workflow_name: &workflow_name,
+                route,
+                request_id: request_id.as_deref(),
+                source: &source,
+                requested_shard_id: request.shard_id,
+            },
+            "empty workflow_id",
+        )
+        .await;
         return resp;
     }
 
@@ -20532,35 +20532,6 @@ pub(crate) async fn signal_with_start_workflow(
 
     let route = "POST /workflows/{workflow_name}/signal-with-start";
 
-    // issue #1353 (Codex P2 review): reject an explicit empty workflow_id
-    // before any further work. Audit it the same way every other validation
-    // failure on this route is audited. Cheap, no DB dependency beyond the
-    // audit write itself. Unlike plain start, workflow_id is mandatory here,
-    // but the wire type is a bare String, so an empty string still
-    // deserializes cleanly.
-    if let Err(resp) = reject_empty_workflow_id(Some(request.workflow_id.as_str())) {
-        let (actor, source, request_id) = audit_context(&headers, &api_state);
-        if let Ok(pool) = api_state.storage_pool()
-            && let Ok(mut conn) = acquire_conn(pool.default_pool()).await
-        {
-            let ar = NewAuditRecord {
-                actor: &actor,
-                operation: OP_WORKFLOW_SIGNAL_WITH_START,
-                target_type: TARGET_WORKFLOW,
-                target_id: Some(workflow_name.as_str()),
-                route_or_command: route,
-                request_id: request_id.as_deref(),
-                idempotency_key: request.idempotency_key.as_deref(),
-                status: STATUS_FAILED,
-                error_summary: Some("empty workflow_id"),
-                shard_id: None,
-                source: &source,
-            };
-            let _ = audit::insert_audit(&mut conn, &ar).await;
-        }
-        return resp;
-    }
-
     if matches!(
         request.id_reuse_policy.as_deref(),
         Some("terminate_if_running")
@@ -20714,6 +20685,35 @@ pub(crate) async fn signal_with_start_workflow(
         )
         .await
     {
+        return resp;
+    }
+
+    // issue #1353 (Codex P2 review, round 4): fresh-start-only validation,
+    // like every check below. It runs AFTER the committed-replay probe
+    // above. `start_workflow` orders its own check the same way, for the
+    // same reason. A keyed signal-with-start that (pre-#1353) committed
+    // under an empty workflow_id can still be retried. Such a retry must
+    // replay its `200` no-op, not a `400`. A `400` here would contradict
+    // the retry's own prior success.
+    if let Err(resp) = reject_empty_workflow_id(Some(workflow_id.as_str())) {
+        if let Ok(pool) = api_state.storage_pool()
+            && let Ok(mut conn) = acquire_conn(pool.default_pool()).await
+        {
+            let ar = NewAuditRecord {
+                actor: &actor,
+                operation: OP_WORKFLOW_SIGNAL_WITH_START,
+                target_type: TARGET_WORKFLOW,
+                target_id: Some(workflow_name.as_str()),
+                route_or_command: route,
+                request_id: request_id.as_deref(),
+                idempotency_key: request.idempotency_key.as_deref(),
+                status: STATUS_FAILED,
+                error_summary: Some("empty workflow_id"),
+                shard_id: None,
+                source: &source,
+            };
+            let _ = audit::insert_audit(&mut conn, &ar).await;
+        }
         return resp;
     }
 
@@ -21263,35 +21263,6 @@ async fn update_with_start_workflow(
 
     let route = "POST /workflows/{workflow_name}/update-with-start";
 
-    // issue #1353 (Codex P2 review): reject an explicit empty workflow_id
-    // before any further work. Audit it the same way every other validation
-    // failure on this route is audited. Cheap, no DB dependency beyond the
-    // audit write itself. Unlike plain start, workflow_id is mandatory here,
-    // but the wire type is a bare String, so an empty string still
-    // deserializes cleanly.
-    if let Err(resp) = reject_empty_workflow_id(Some(request.workflow_id.as_str())) {
-        let (actor, source, request_id) = audit_context(&headers, &api_state);
-        if let Ok(pool) = api_state.storage_pool()
-            && let Ok(mut conn) = acquire_conn(pool.default_pool()).await
-        {
-            let ar = NewAuditRecord {
-                actor: &actor,
-                operation: OP_WORKFLOW_UPDATE_WITH_START,
-                target_type: TARGET_WORKFLOW,
-                target_id: Some(workflow_name.as_str()),
-                route_or_command: route,
-                request_id: request_id.as_deref(),
-                idempotency_key: request.idempotency_key.as_deref(),
-                status: STATUS_FAILED,
-                error_summary: Some("empty workflow_id"),
-                shard_id: None,
-                source: &source,
-            };
-            let _ = audit::insert_audit(&mut conn, &ar).await;
-        }
-        return resp;
-    }
-
     // `terminate_if_running` requires admin access (same gate as signal_with_start).
     if matches!(
         request.id_reuse_policy.as_deref(),
@@ -21451,6 +21422,36 @@ async fn update_with_start_workflow(
     } else {
         None
     };
+
+    // issue #1353 (Codex P2 review, round 4): fresh-start-only validation,
+    // gated the same way the admission-gate and #373 schema checks below are
+    // -- skipped on a committed-replay hit. A keyed update-with-start that
+    // (pre-#1353) committed under an empty workflow_id can still be
+    // retried. Such a retry must replay its cached admission, not a `400`
+    // that contradicts its own prior success.
+    if probe_outcome.is_none()
+        && let Err(resp) = reject_empty_workflow_id(Some(workflow_id.as_str()))
+    {
+        if let Ok(pool) = api_state.storage_pool()
+            && let Ok(mut conn) = acquire_conn(pool.default_pool()).await
+        {
+            let ar = NewAuditRecord {
+                actor: &actor,
+                operation: OP_WORKFLOW_UPDATE_WITH_START,
+                target_type: TARGET_WORKFLOW,
+                target_id: Some(workflow_name.as_str()),
+                route_or_command: route,
+                request_id: request_id.as_deref(),
+                idempotency_key: request.idempotency_key.as_deref(),
+                status: STATUS_FAILED,
+                error_summary: Some("empty workflow_id"),
+                shard_id: None,
+                source: &source,
+            };
+            let _ = audit::insert_audit(&mut conn, &ar).await;
+        }
+        return resp;
+    }
 
     // Debounce admission is owned by POST /workflows/{name}/start. Ask the core
     // primitive to reject only a *fresh start* under its lock so an attach /
