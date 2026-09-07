@@ -570,9 +570,9 @@ pub fn is_busygroup(err: &RedisError) -> bool {
 /// Lua script that atomically promotes all due delayed tasks for a single
 /// queue onto its claimable stream.
 ///
-/// Shared with the dispatch channel in [`crate::dispatch`]: the two key
-/// families differ, but the promotion is the same operation over a sorted
-/// set, a payload hash and a stream.
+/// Shared with the dispatch channel in [`crate::dispatch`]. The two key
+/// families differ. The promotion is the same operation over a sorted set, a
+/// payload hash and a stream.
 ///
 /// Arguments:
 /// - `KEYS[1]`: the per-queue sorted set of task ids keyed by `scheduled_at`.
