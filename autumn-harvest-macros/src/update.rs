@@ -658,6 +658,46 @@ mod same_module_vs_nested_module_parity_tests {
         // two empty strings that would trivially "match".
         assert!(same_module_body.contains("update_with_start_workflow_execution"));
     }
+
+    fn use_line(full: &str) -> &str {
+        let start = full
+            .find("use ")
+            .unwrap_or_else(|| panic!("no `use` in generated output:\n{full}"));
+        let end = start
+            + full[start..]
+                .find("impl ")
+                .unwrap_or_else(|| panic!("no `impl` after `use` in:\n{full}"));
+        full[start..end].trim()
+    }
+
+    /// Pins the exact stub-`use` tokens `update_macro` emits for each shape
+    /// of `workflow = "..."` path. See `query.rs`'s identical sibling test:
+    /// all three handler macros resolve a `workflow` path to a stub `use`
+    /// the same way, ahead of that derivation moving to a single
+    /// `WorkflowPath::nested_stub_use_tokens`.
+    #[test]
+    fn stub_use_tokens_pinned_per_path_shape() {
+        assert_eq!(
+            use_line(&generate("some_mod::MyWorkflow")),
+            "use super :: * ; use super :: some_mod :: MyWorkflowStub ;"
+        );
+        assert_eq!(
+            use_line(&generate("self::MyWorkflow")),
+            "use super :: * ; use super :: MyWorkflowStub ;"
+        );
+        assert_eq!(
+            use_line(&generate("self::a::b::MyWorkflow")),
+            "use super :: * ; use super :: a :: b :: MyWorkflowStub ;"
+        );
+        assert_eq!(
+            use_line(&generate("crate::some_mod::MyWorkflow")),
+            "use super :: * ; use crate :: some_mod :: MyWorkflowStub ;"
+        );
+        assert_eq!(
+            use_line(&generate("::abs_mod::MyWorkflow")),
+            "use super :: * ; use :: abs_mod :: MyWorkflowStub ;"
+        );
+    }
 }
 
 // ── Characterization tests: signature-validation error paths ────────────────
