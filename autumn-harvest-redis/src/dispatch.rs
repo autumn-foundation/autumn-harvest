@@ -570,8 +570,8 @@ impl RedisDispatch {
     /// `due` moves the delivery time only. `reference.scheduled_at` keeps the
     /// row's due time, which is what contract C1 compares against.
     ///
-    /// The work runs in [`REQUEUE_LUA`], one call per queue, because the marker
-    /// must record where the reference landed and only the script sees the id
+    /// The work runs in [`REQUEUE_LUA`], one call per queue. The marker must
+    /// record where the reference landed. Only the script sees the id that
     /// `XADD` generates.
     async fn requeue_batch(
         &self,
@@ -741,9 +741,9 @@ impl RedisDispatch {
     /// consumer that only drops an unreadable entry leaves it there for good,
     /// because the entry never becomes a lease and so is never acked. The
     /// recovery pass then claims it on every sweep and leaves it pending again.
-    /// `XPENDING` reads a fixed window of `RECOVER_BATCH` entries, so enough
-    /// such entries hide every legitimate abandoned lease below them, and the
-    /// crash recovery this channel promises stops working.
+    /// `XPENDING` reads a fixed window of `RECOVER_BATCH` entries. Enough such
+    /// entries hide every legitimate abandoned lease below them. The crash
+    /// recovery this channel promises then stops working.
     ///
     /// The delete names each entry id, so nothing else leaves the stream. The
     /// dedupe marker is left alone: a reference that cannot be read does not
@@ -1080,21 +1080,21 @@ fn is_nogroup(err: &RedisError) -> bool {
 ///   hint, in hint order.
 ///
 /// Behaviour per hint (contract C1). The marker holds the due time **and the
-/// location** of the reference the channel already carries, as
-/// `<due_ms>|<stream entry id>` for a live entry and `<due_ms>|delayed` for a
-/// parked one. A hint whose due time equals the marker refreshes the marker TTL
-/// **only when that location still holds the reference**. Any other hint
-/// writes: the marker takes the new due time and location, a parked entry moves
-/// in place, and a due hint is added to the stream. Returns the number of hints
-/// that wrote.
+/// location** of the reference the channel already carries. The value is
+/// `<due_ms>|<stream entry id>` for a live entry. It is `<due_ms>|delayed` for
+/// a parked one. A hint whose due time equals the marker refreshes the marker
+/// TTL **only when that location still holds the reference**. Any other hint
+/// writes. The marker then takes the new due time and location, a parked entry
+/// moves in place, and a due hint is added to the stream. Returns the number of
+/// hints that wrote.
 ///
-/// **Why the location is in the marker (issue #1312 review round 1).** A
-/// reference can go while its marker stays: a key eviction, an external `XTRIM`
-/// and an operator deleting the stream all do it. A marker that carried only
-/// the due time made every republish a TTL refresh, so the marker lived for
-/// ever and the row stayed `PENDING` for ever. The reconcile sweep is the
-/// durability floor of this design, and that turned the floor off for one row.
-/// Verifying the location makes the sweep restore the reference instead.
+/// **Why the location is in the marker (issue #1312).** A reference can go
+/// while its marker stays. A key eviction, an external `XTRIM` and an operator
+/// deleting the stream all do it. A marker that carried only the due time made
+/// every republish a TTL refresh. The marker then lived for ever and the row
+/// stayed `PENDING` for ever. The reconcile sweep is the durability floor of
+/// this design, and that turned the floor off for one row. Verifying the
+/// location makes the sweep restore the reference instead.
 const PUBLISH_LUA: &str = r"
 local stream = KEYS[1]
 local delayed = KEYS[2]
@@ -1307,7 +1307,7 @@ mod tests {
         assert_eq!(decoded.shard, Some(2));
     }
 
-    /// Finding F7 (issue #1312 review round 1). The payload carries the pool
+    /// The payload carries the pool
     /// the reference needs, so a worker weighs it before it claims.
     #[test]
     fn a_payload_carries_the_reference_kind() {

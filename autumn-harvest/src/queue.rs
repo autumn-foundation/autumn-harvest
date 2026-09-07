@@ -1529,8 +1529,8 @@ pub const fn due_dispatch_hints_query() -> &'static str {
 /// the same bind order for `$1` and `$2`. The cursor binds to `$3` priority,
 /// `$4` due time and `$5` id.
 ///
-/// **Why the sweep must paginate.** The sweep cannot see most claim gates:
-/// build routing, an activity pause, a concurrency cap, a capability match and
+/// **Why the sweep must paginate.** The sweep cannot see most claim gates.
+/// Build routing, an activity pause, a concurrency cap, a capability match and
 /// a rate limit all live in the claim predicate, not in this statement. A page
 /// of rows that every worker rejects therefore looks claimable to the sweep. A
 /// sweep that always reads the top page republishes exactly those rows on every
@@ -1668,7 +1668,7 @@ struct PendingHintRow {
 
 impl PendingHintRow {
     /// The sweep position of this row.
-    fn to_cursor(&self) -> DispatchCursor {
+    const fn to_cursor(&self) -> DispatchCursor {
         DispatchCursor {
             priority: self.priority,
             scheduled_at: self.scheduled_at,
@@ -8610,7 +8610,7 @@ mod tests {
         assert!(sql.contains("priority"));
     }
 
-    /// The keyset predicate is the whole of issue #1312 round 1 finding F1.
+    /// The keyset predicate is the whole of the sweep pagination (issue #1312).
     /// A page of gated rows must not hide every row below it.
     #[test]
     fn due_dispatch_hints_after_query_pins_the_keyset_predicate() {

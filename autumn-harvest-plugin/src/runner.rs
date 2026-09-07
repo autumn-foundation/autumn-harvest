@@ -2075,7 +2075,7 @@ mod tests {
         autumn_harvest::dispatch::uninstall();
     }
 
-    /// Finding F6 (issue #1312 review round 1). A queue name the channel key
+    /// A queue name the channel key
     /// space cannot carry must fail startup, not degrade the process to the
     /// Postgres fallback in silence.
     #[test]
@@ -2148,7 +2148,7 @@ mod tests {
             .block_on(future)
     }
 
-    /// Finding F3 (issue #1312 review round 1). A restart with Redis off must
+    /// A restart with Redis off must
     /// not keep publishing and consuming through the channel of the previous
     /// runtime.
     #[test]

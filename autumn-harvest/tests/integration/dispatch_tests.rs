@@ -1179,7 +1179,7 @@ async fn seed_gated_rows(conn: &mut AsyncPgConnection, queue: &str, count: i32, 
 }
 
 /// The keyset walk reaches a row that sits below a full page of gated rows
-/// (issue #1312 review round 1, finding F1).
+/// (issue #1312).
 ///
 /// The first page is gated rows only. The claimable row is below them, so an
 /// unpaginated sweep can never reference it. The cursor carries the walk past
@@ -1234,7 +1234,7 @@ async fn the_reconcile_sweep_walks_past_a_full_page_of_gated_rows() {
 }
 
 /// A worker drains a claimable row that sits below a page of gated rows
-/// (issue #1312 review round 1, finding F1).
+/// (issue #1312).
 ///
 /// Without pagination every sweep republishes the same gated page and the
 /// claimable row is never referenced, so the run never completes.
@@ -1281,7 +1281,7 @@ async fn a_gated_page_does_not_starve_a_claimable_row() {
 }
 
 /// A channel outage must not throttle the Postgres path to one claim per
-/// failed read (issue #1312 review round 1, finding F2).
+/// failed read (issue #1312).
 ///
 /// The channel fails every call. A degraded worker runs the ordinary Postgres
 /// loop, so the seeded backlog drains at the Postgres rate. Without degraded
@@ -1345,7 +1345,7 @@ async fn a_channel_outage_drains_the_backlog_at_the_postgres_rate() {
 }
 
 /// A channel installed after the worker was built must not reach a multi-shard
-/// loop (issue #1312 review round 1, finding F5).
+/// loop (issue #1312).
 ///
 /// `Worker::new` refuses the combination, but a core caller can install the
 /// channel afterwards. The loop reads the process-global slot on every
@@ -1410,11 +1410,11 @@ async fn a_multi_shard_worker_never_consumes_references() {
 }
 
 /// A queue name the channel key space cannot carry is refused at startup
-/// (issue #1312 review round 1, finding F6).
+/// (issue #1312).
 ///
-/// The channel rejects such a name on every call, so a worker configured with
-/// one would live on the Postgres fallback for all of its queues and say
-/// nothing about it.
+/// The channel rejects such a name on every call. A worker configured with one
+/// would live on the Postgres fallback for all of its queues, and say nothing
+/// about it.
 #[tokio::test]
 async fn a_queue_name_with_a_colon_rejects_dispatch() {
     let _serial = DISPATCH_SERIAL.lock().await;
@@ -1429,8 +1429,11 @@ async fn a_queue_name_with_a_colon_rejects_dispatch() {
         telemetry,
     ));
 
-    let error = Worker::new(worker_config("tenant:priority", vec![ShardId::new(0)]), registry)
-        .expect_err("a colon in a queue name must be rejected under dispatch");
+    let error = Worker::new(
+        worker_config("tenant:priority", vec![ShardId::new(0)]),
+        registry,
+    )
+    .expect_err("a colon in a queue name must be rejected under dispatch");
     assert!(
         matches!(error, autumn_harvest::HarvestError::Config(ref msg)
             if msg.contains("tenant:priority")),
@@ -1446,8 +1449,11 @@ async fn a_queue_name_with_a_colon_rejects_dispatch() {
         empty_shared_state(),
         telemetry,
     ));
-    Worker::new(worker_config("tenant:priority", vec![ShardId::new(0)]), registry)
-        .expect("a colon in a queue name is fine without a channel");
+    Worker::new(
+        worker_config("tenant:priority", vec![ShardId::new(0)]),
+        registry,
+    )
+    .expect("a colon in a queue name is fine without a channel");
 }
 
 /// Rows this worker holds `RUNNING` on `queue` right now.
@@ -1473,7 +1479,7 @@ async fn running_owned_count(conn: &mut AsyncPgConnection, queue: &str) -> i64 {
 }
 
 /// A worker never claims past the free permits of the pool a reference needs
-/// (issue #1312 review round 1, finding F7).
+/// (issue #1312).
 ///
 /// The read is sized on the sum of both pools, so one read can hold two
 /// workflow references while only one workflow permit is free. Claiming both

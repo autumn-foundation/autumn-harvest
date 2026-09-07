@@ -5541,11 +5541,11 @@ pub(crate) const fn single_pool_entrypoint_rejects(
 /// Whether this worker may consume dispatch references (issue #1312).
 ///
 /// A reference carries a task id and no connection. A worker that drains
-/// several shards cannot tell which pool holds the named row, so a reference
-/// read on one shard would be claimed against another shard's database and
-/// always miss. Dispatch therefore needs a span of exactly one shard.
+/// several shards cannot tell which pool holds the named row. A reference read
+/// on one shard would be claimed against another shard's database and always
+/// miss. Dispatch therefore needs a span of exactly one shard.
 ///
-/// `Worker::new` applies the same rule, but a core caller can install the
+/// `Worker::new` applies the same rule. A core caller can still install the
 /// channel after construction, and the poll loop reads the process-global slot
 /// on every iteration. The loop decides once at run start and holds that
 /// decision, so a late install cannot widen the span. `shard` on
@@ -23959,7 +23959,7 @@ impl DispatchDegradation {
     }
 
     /// Record a successful channel call, which closes the window.
-    fn record_success(&mut self) {
+    const fn record_success(&mut self) {
         self.failures = 0;
         self.started = None;
     }
@@ -24037,13 +24037,13 @@ impl DispatchLoopState {
 
 /// One reference claimed through the channel that does not hold its permit yet.
 ///
-/// A worker dispatches a claimed task by spawning it, and the spawned task is
-/// what acquires the pool permit. `available_permits` therefore still counts
-/// that permit as free for a moment. Without this reservation the next read
-/// would weigh the same free permit again and claim a second row the worker
-/// cannot start, which is the very outcome the per-kind gate exists to stop.
+/// A worker dispatches a claimed task by spawning it. The spawned task is what
+/// acquires the pool permit, so `available_permits` still counts that permit as
+/// free for a moment. Without this reservation the next read weighs the same
+/// free permit again. It then claims a second row the worker cannot start,
+/// which is the outcome the per-kind gate exists to stop.
 ///
-/// The guard is created before the claim and moved into the spawned task, which
+/// The guard is created before the claim. It moves into the spawned task, which
 /// drops it as soon as it holds the permit. A claim that fails drops it at once.
 #[derive(Debug)]
 struct DispatchReservation(Arc<AtomicUsize>);
@@ -24063,10 +24063,10 @@ impl Drop for DispatchReservation {
 
 /// Whether a reference of this kind may be claimed now (issue #1312).
 ///
-/// The read is sized on the sum of both pools, and that is right: a read that
+/// The read is sized on the sum of both pools, and that is right. A read that
 /// asked for less would leave references no peer can see. The claim is not.
 /// A workflow row claimed with no free workflow permit sits `RUNNING` under
-/// this worker while it waits on the local semaphore, and a peer with capacity
+/// this worker while it waits on the local semaphore. A peer with capacity
 /// cannot claim it. The reference goes back to the channel instead.
 ///
 /// `None` is a reference of unknown type. It keeps the behaviour dispatch had
@@ -24091,7 +24091,7 @@ const fn dispatch_kind_admitted(
 /// the cursor.
 ///
 /// Split out from the sweep so the wrap rule is testable without a database.
-fn next_reconcile_cursor(
+const fn next_reconcile_cursor(
     page_len: usize,
     batch: usize,
     last: Option<crate::queue::DispatchCursor>,
@@ -24234,8 +24234,8 @@ impl Worker {
             }
 
             // A queue name the channel key space cannot carry (issue #1312).
-            // The channel rejects such a name on every call, so this worker
-            // would live on the Postgres fallback for all of its queues and say
+            // The channel rejects such a name on every call. This worker would
+            // live on the Postgres fallback for all of its queues, and say
             // nothing about it. Fail at startup instead.
             for queue in &config.queues {
                 crate::dispatch::validate_queue_name(queue).map_err(|reason| {
@@ -25853,8 +25853,8 @@ impl Worker {
     ///
     /// Returns `true` when at least one task was dispatched.
     ///
-    /// On a channel error it enters degraded mode: the worker drains through
-    /// [`Self::drain_postgres`] until the cooldown elapses, so availability
+    /// On a channel error it enters degraded mode. The worker then drains
+    /// through [`Self::drain_postgres`] until the cooldown elapses. Availability
     /// equals the Postgres path while the channel is unreachable.
     async fn run_dispatch_iteration(
         &self,
@@ -25957,8 +25957,8 @@ impl Worker {
             }
             if !dispatch_kind_admitted(
                 lease.kind,
-                self.free_permits(&self.workflow_semaphore, &self.dispatch_reserved_workflow),
-                self.free_permits(&self.activity_semaphore, &self.dispatch_reserved_activity),
+                Self::free_permits(&self.workflow_semaphore, &self.dispatch_reserved_workflow),
+                Self::free_permits(&self.activity_semaphore, &self.dispatch_reserved_activity),
             ) {
                 // No permit for this pool. Give the reference straight back, so
                 // a peer with capacity reads it on its next poll.
@@ -25985,11 +25985,7 @@ impl Worker {
     }
 
     /// Permits of one pool that no claimed reference has spoken for yet.
-    fn free_permits(
-        &self,
-        semaphore: &tokio::sync::Semaphore,
-        reserved: &Arc<AtomicUsize>,
-    ) -> usize {
+    fn free_permits(semaphore: &tokio::sync::Semaphore, reserved: &Arc<AtomicUsize>) -> usize {
         // Fully qualified: diesel's blanket `RunQueryDsl::load` is in scope here
         // and shadows the inherent `AtomicUsize::load` through the `Arc` deref.
         semaphore
@@ -26003,8 +25999,7 @@ impl Worker {
     /// backlog is empty, then wait one poll interval. A degraded worker
     /// therefore claims at the Postgres rate, not at one row per failed channel
     /// call. A channel call that fails can cost the poll interval plus the call
-    /// timeout, so one claim per call would be a throughput collapse rather
-    /// than a fallback.
+    /// timeout. One claim per call is a throughput collapse, not a fallback.
     ///
     /// Returns `true` when at least one task was dispatched.
     async fn drain_postgres(&self, pool: &DbPool, shard: Option<crate::types::ShardId>) -> bool {
@@ -26204,15 +26199,15 @@ impl Worker {
         let mut walked: Vec<(String, Option<crate::queue::DispatchCursor>)> = Vec::new();
         for queue in &self.config.queues {
             let after = state.reconcile_cursors.get(queue).cloned();
-            let page =
-                match queue::due_dispatch_hints_page(&mut conn, queue, batch, after.as_ref()).await
-                {
-                    Ok(page) => page,
-                    Err(error) => {
-                        tracing::warn!(error = %error, queue = %queue, "dispatch reconcile read failed");
-                        return true;
-                    }
-                };
+            let page = match queue::due_dispatch_hints_page(&mut conn, queue, batch, after.as_ref())
+                .await
+            {
+                Ok(page) => page,
+                Err(error) => {
+                    tracing::warn!(error = %error, queue = %queue, "dispatch reconcile read failed");
+                    return true;
+                }
+            };
             walked.push((
                 queue.clone(),
                 next_reconcile_cursor(page.hints.len(), batch, page.cursor),
@@ -38126,12 +38121,12 @@ mod tests {
         );
     }
 
-    /// Finding F7 (issue #1312 review round 1). A reference names the pool it
-    /// needs, and a worker claims it only when that pool has a free permit.
+    /// A reference names the pool it needs (issue #1312). A worker claims it
+    /// only when that pool has a free permit.
     ///
-    /// Sizing the read on the sum of both pools is right: a read that asked for
+    /// Sizing the read on the sum of both pools is right. A read that asked for
     /// less would leave references a peer cannot see. Claiming on the sum is
-    /// not: a workflow row claimed with no workflow permit blocks on this
+    /// not. A workflow row claimed with no workflow permit blocks on this
     /// worker's semaphore while a peer with capacity cannot claim it.
     #[test]
     fn a_reference_claims_only_against_its_own_pool() {
@@ -38152,12 +38147,15 @@ mod tests {
         );
     }
 
-    /// Finding F5 (issue #1312 review round 1). A channel installed after the
+    /// A channel installed after the
     /// worker was built must not put a multi-shard loop on the dispatch path.
     #[test]
     fn dispatch_is_allowed_only_on_a_single_shard_span() {
         assert!(dispatch_allowed_for_span(1, 1), "one shard, one pool");
-        assert!(dispatch_allowed_for_span(1, 0), "one shard, no sharded pool");
+        assert!(
+            dispatch_allowed_for_span(1, 0),
+            "one shard, no sharded pool"
+        );
         assert!(dispatch_allowed_for_span(0, 0), "no shard identity at all");
         assert!(
             !dispatch_allowed_for_span(2, 0),
@@ -38170,7 +38168,7 @@ mod tests {
         assert!(!dispatch_allowed_for_span(4, 4), "a wide worker is refused");
     }
 
-    /// Finding F1 (issue #1312 review round 1). A full page means the walk may
+    /// A full page means the walk may
     /// have more rows below it, so the next sweep continues from the cursor.
     #[test]
     fn a_full_reconcile_page_keeps_the_cursor() {
@@ -38207,7 +38205,7 @@ mod tests {
         );
     }
 
-    /// Finding F2 (issue #1312 review round 1). The cooldown starts at the
+    /// The cooldown starts at the
     /// poll interval, doubles per consecutive failure and stops at the cap.
     #[test]
     fn the_degraded_cooldown_doubles_and_then_caps() {

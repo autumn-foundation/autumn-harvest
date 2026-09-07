@@ -648,7 +648,7 @@ async fn connect_to_an_unreachable_address_fails_fast() {
 }
 
 /// An entry the channel cannot read must leave the pending entries list
-/// (issue #1312 review round 1, finding F4).
+/// (issue #1312).
 ///
 /// `XREADGROUP` puts every delivered entry in the pending entries list. A
 /// worker that only drops an unreadable entry leaves it there for good. The
@@ -716,7 +716,7 @@ async fn a_malformed_entry_leaves_the_pending_list() {
 }
 
 /// The recovery pass discards an entry it cannot read, rather than leaving it
-/// pending for the next pass (issue #1312 review round 1, finding F4).
+/// pending for the next pass (issue #1312).
 #[tokio::test(flavor = "multi_thread")]
 async fn the_recovery_pass_discards_a_malformed_entry() {
     let Some(fixture) = try_start(Duration::from_millis(300)).await else {
@@ -774,8 +774,7 @@ async fn the_recovery_pass_discards_a_malformed_entry() {
     );
 }
 
-/// A reference keeps the pool it needs across the stream (issue #1312 review
-/// round 1, finding F7).
+/// A reference keeps the pool it needs across the stream (issue #1312).
 #[tokio::test(flavor = "multi_thread")]
 async fn a_lease_carries_the_kind_of_its_hint() {
     let Some(fixture) = try_start(Duration::from_secs(60)).await else {
@@ -797,8 +796,7 @@ async fn a_lease_carries_the_kind_of_its_hint() {
     );
 }
 
-/// The marker must not outlive the reference it stands for (issue #1312
-/// review round 1, finding F8).
+/// The marker must not outlive the reference it stands for (issue #1312).
 ///
 /// A key eviction, an external `XTRIM` or an operator deleting the stream can
 /// take the entry and leave the marker. Every republish then refreshed the
@@ -860,7 +858,7 @@ async fn a_republish_restores_a_stream_entry_that_vanished() {
     assert_eq!(leases[0].task_id, task_id);
 }
 
-/// The same rule for a parked reference (issue #1312 review round 1, F8).
+/// The same rule for a parked reference (issue #1312).
 #[tokio::test(flavor = "multi_thread")]
 async fn a_republish_restores_a_parked_reference_that_vanished() {
     let Some(fixture) = try_start(Duration::from_secs(60)).await else {

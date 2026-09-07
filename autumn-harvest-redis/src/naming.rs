@@ -76,9 +76,9 @@ pub fn dispatch_marker_key(prefix: &str, task_id: &str) -> String {
 
 /// Key prefix every dedupe marker shares.
 ///
-/// The promote script builds a marker key from a task id it reads out of the
-/// delayed set, so it needs the prefix rather than a finished key. That is not
-/// cluster safe, and neither is the rest of this key family: the stream, the
+/// The promote script builds a marker key from a task id. It reads that id out
+/// of the delayed set, so it needs the prefix rather than a finished key. That
+/// is not cluster safe. Neither is the rest of this key family. The stream, the
 /// delayed set and a marker carry no hash tag, so they already fall in
 /// different slots.
 #[must_use]

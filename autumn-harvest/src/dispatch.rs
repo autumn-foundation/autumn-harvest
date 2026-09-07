@@ -38,9 +38,9 @@ pub const DEFAULT_DISPATCH_RELEASE_BACKOFF_CAP: Duration = Duration::from_secs(3
 /// Which worker pool a reference needs (issue #1312).
 ///
 /// The value is the `harvest_task_queue.task_type` column. A worker runs
-/// workflow tasks and activity tasks on separate semaphores, so a reference
-/// that does not say which pool it needs can only be weighed against the sum
-/// of the two.
+/// workflow tasks and activity tasks on separate semaphores. A reference that
+/// does not say which pool it needs can only be weighed against the sum of the
+/// two.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum DispatchKind {
@@ -66,8 +66,8 @@ impl From<&str> for DispatchKind {
     ///
     /// A `CHECK` constraint holds the column to `workflow` or `activity`, so
     /// only those two values reach this conversion. Any other value reads as a
-    /// workflow, which is the conservative half: a workflow reference is
-    /// weighed against the smaller pool of the two on a typical worker.
+    /// workflow. That is the conservative half. A typical worker weighs a
+    /// workflow reference against the smaller pool of the two.
     fn from(task_type: &str) -> Self {
         if task_type == Self::Activity.as_str() {
             Self::Activity
@@ -563,9 +563,9 @@ async fn publisher_loop(mut receiver: tokio::sync::mpsc::Receiver<DispatchHint>)
 /// is not its own. An empty name addresses no key space at all.
 ///
 /// The rule lives here, not in a channel implementation, because the worker and
-/// the plugin runner both apply it at startup. A channel that rejects the name
-/// on every call would otherwise leave a worker on the Postgres fallback for
-/// all of its queues, and say nothing about it.
+/// the plugin runner both apply it at startup. A channel rejects such a name on
+/// every call. A worker would otherwise stay on the Postgres fallback for all
+/// of its queues, and say nothing about it.
 ///
 /// # Errors
 ///
@@ -1018,7 +1018,7 @@ mod tests {
             .next()
     }
 
-    /// Finding F7 (issue #1312 review round 1). The kind is the `task_type`
+    /// The kind is the `task_type`
     /// column, so the two spellings must not drift.
     #[test]
     fn a_dispatch_kind_is_the_task_type_column() {
@@ -1046,7 +1046,7 @@ mod tests {
         );
     }
 
-    /// Finding F6 (issue #1312 review round 1). The rule must reject exactly
+    /// The rule must reject exactly
     /// what a channel implementation rejects, and nothing more.
     #[test]
     fn a_queue_name_with_a_colon_is_not_dispatchable() {
