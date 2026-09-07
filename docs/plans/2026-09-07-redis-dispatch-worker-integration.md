@@ -50,27 +50,35 @@ backlog scan and sort on every claim.
 `dispatch::record_hint` runs wherever `notify::notify_task_enqueued` runs.
 Inside a buffering scope the hint waits in a task-local buffer; the owner of
 the transaction flushes the buffer after commit. Outside a scope the hint goes
-to a background publisher task that batches and pipelines `XADD`. The two
-scoped owners are the workflow persist flow in `worker.rs` and the workflow
-start transaction in `execution.rs`.
+to a bounded background publisher task that batches and pipelines `XADD`. The
+scoped owners are the workflow persist flow in `worker.rs`, the workflow start
+transaction in `execution.rs` and `handle.rs`, and the transaction owners in
+`signal.rs`, `external_task.rs`, `sessions.rs`, `dlq.rs`, `reset.rs` and
+`cross_shard_child.rs`. A nested owner leaves its hints with the outermost one.
 
-A publish is idempotent per task id. The Redis implementation sets a marker
-key with `SET NX EX`; a duplicate publish is a no-op unless the new due time is
-earlier than a parked delayed entry, in which case the entry moves forward.
+A publish is idempotent per task id and keyed on `scheduled_at`. The Redis
+implementation keeps a marker key that stores the held reference's due time.
+A hint with the same `scheduled_at` is a no-op that refreshes the marker. A
+hint with a different `scheduled_at` means the row changed, so the reference
+moves to the new due time and its redelivery count resets. A released
+reference keeps the row's `scheduled_at`, so a reconcile republish never
+disturbs its backoff, while a wake or a retry does move it.
 
 ### 4.2 Consume
 
 Under Redis dispatch `Worker::poll_once` reads up to `n` references with one
 blocking `XREADGROUP` across all served queues, where `n` is the free
 concurrency. For each reference it runs `queue::claim_task_by_id_on_shard`,
-which is the existing claim statement plus one predicate on `id`. Outcomes:
+which is the existing claim statement plus one predicate on `id` in the
+candidate CTE and one in the concurrency pending-keys CTE. Outcomes:
 
 | Row state | Action |
 |-----------|--------|
 | claimed | ack the entry, dispatch the task |
 | `PENDING`, due, gated | release the entry with exponential backoff, capped |
 | `PENDING`, not yet due | release the entry until the due time |
-| `RUNNING`, terminal, or absent | ack the entry (absent rows get three short retries first, to cover an uncommitted insert) |
+| `RUNNING` and parked, or absent | release 50 ms, three times, then ack (a wake or an insert may be in flight) |
+| `RUNNING` and owned, or terminal | ack the entry |
 
 ### 4.3 Reconcile
 
@@ -105,12 +113,12 @@ duplicates work.
 |--------|---------|
 | Publish before commit, worker claims a row that is not visible | absent rows get three short retries; the reconciler is the floor |
 | Redis loses every entry | reconciler sweep |
-| Marker key leaks and blocks republish forever | markers expire (`dedupe_ttl`); an earlier due time overrides a parked entry |
-| A signal arrives while the row is parked in the delayed set | publish with an earlier due time moves the entry forward |
+| Marker key leaks and blocks republish forever | markers expire (`dedupe_ttl`) and refresh on every publish; a changed `scheduled_at` overrides the held entry |
+| A signal arrives while the row is parked in the delayed set | the wake writes a new `scheduled_at`, so the publish moves the entry forward |
 | Two workers read the same entry | `XREADGROUP` delivers once; the claim is `FOR UPDATE SKIP LOCKED` |
 | A worker crashes between claim and ack | PEL recovery; the redelivered reference finds the row `RUNNING` and acks |
 | A gated row cycles every poll | exponential backoff on release, capped at `dispatch_release_backoff_cap` |
-| Redis down | claim falls back to the Postgres poll path |
+| Redis down or hung | every channel call has a timeout; the claim falls back to the Postgres poll path for that iteration |
 | Multi-shard worker reads a reference for another shard's pool | v1 rejects Redis dispatch on sharded runtimes at startup: `HarvestRunner::start` refuses before it installs the channel, and `Worker::new` repeats the check. Config validation cannot see the resolved pool. The hint carries a shard slot for the follow-up |
 | Sticky affinity gate rejects every non-pinned worker | release with backoff; affinity is a cache hint, not a correctness rule |
 | `attempt` burns on redelivery | the by-id claim is the only `PENDING -> RUNNING` writer, and a gated miss never increments it |

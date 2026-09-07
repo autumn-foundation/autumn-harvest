@@ -6033,13 +6033,13 @@ async fn scheduler_tick_creates_and_executes_due_interval_runs() {
     let worker = build_test_worker(Arc::clone(&registry));
     let worker_task = spawn_test_worker(Arc::clone(&worker), pool.clone());
 
-    Box::pin(tick_once(
+    tick_once(
         pool.clone(),
         Arc::clone(&registry),
         Arc::clone(&dag_catalog),
         Arc::new(vec![workflow_schedule]),
         SchedulerMonitor::offline(),
-    ))
+    )
     .await
     .expect("scheduler tick should succeed");
 
@@ -6135,13 +6135,13 @@ async fn concurrent_scheduler_ticks_activate_due_dag_run_once() {
         let workflow_schedules = Arc::new(vec![workflow_schedule.clone()]);
         handles.push(tokio::spawn(async move {
             gate.wait().await;
-            Box::pin(tick_once(
+            tick_once(
                 pool,
                 registry,
                 dag_catalog,
                 workflow_schedules,
                 SchedulerMonitor::offline(),
-            ))
+            )
             .await
         }));
     }
@@ -6211,13 +6211,13 @@ async fn concurrent_scheduler_ticks_dispatch_due_workflow_schedule_once() {
         let workflow_schedules = Arc::clone(&workflow_schedules);
         handles.push(tokio::spawn(async move {
             gate.wait().await;
-            Box::pin(tick_once(
+            tick_once(
                 pool,
                 registry,
                 empty_dags,
                 workflow_schedules,
                 SchedulerMonitor::offline(),
-            ))
+            )
             .await
         }));
     }
@@ -6901,14 +6901,14 @@ async fn scheduler_tick_dispatches_scheduled_unified_dag_on_dag_shard() {
     ));
     let workflow_schedules = Arc::new(vec![workflow_schedule]);
 
-    Box::pin(tick_once_sharded(
+    tick_once_sharded(
         harvest_pool.sharded_pool().clone(),
         router.clone(),
         Arc::clone(&registry),
         Arc::clone(&dag_catalog),
         Arc::clone(&workflow_schedules),
         SchedulerMonitor::offline(),
-    ))
+    )
     .await
     .expect("initial sharded tick should register the schedule on the DAG shard");
 
@@ -6933,14 +6933,14 @@ async fn scheduler_tick_dispatches_scheduled_unified_dag_on_dag_shard() {
             .expect("failed to force unified DAG workflow schedule due");
     }
 
-    Box::pin(tick_once_sharded(
+    tick_once_sharded(
         harvest_pool.sharded_pool().clone(),
         router.clone(),
         registry,
         dag_catalog,
         workflow_schedules,
         SchedulerMonitor::offline(),
-    ))
+    )
     .await
     .expect("sharded tick should dispatch the due unified DAG schedule");
 
@@ -7041,14 +7041,14 @@ async fn scheduler_tick_removes_stale_unified_dag_schedule_from_old_shard() {
             .expect("failed to force stale unified DAG schedule due");
     }
 
-    Box::pin(tick_once_sharded(
+    tick_once_sharded(
         harvest_pool.sharded_pool().clone(),
         router.clone(),
         registry,
         dag_catalog,
         workflow_schedules,
         SchedulerMonitor::offline(),
-    ))
+    )
     .await
     .expect("sharded tick should clean stale rows before ticking schedules");
 
@@ -7175,14 +7175,14 @@ async fn scheduler_tick_removes_legacy_workflow_only_dag_schedule_from_old_shard
             .expect("failed to force legacy workflow-only DAG schedule due");
     }
 
-    Box::pin(tick_once_sharded(
+    tick_once_sharded(
         harvest_pool.sharded_pool().clone(),
         router.clone(),
         registry,
         dag_catalog,
         workflow_schedules,
         SchedulerMonitor::offline(),
-    ))
+    )
     .await
     .expect("sharded tick should clean legacy workflow-only rows before ticking schedules");
 
@@ -7306,14 +7306,14 @@ async fn scheduler_tick_removes_stale_classic_dag_schedule_from_old_shard() {
             .expect("failed to force stale classic DAG schedule due");
     }
 
-    Box::pin(tick_once_sharded(
+    tick_once_sharded(
         harvest_pool.sharded_pool().clone(),
         router.clone(),
         registry,
         dag_catalog,
         workflow_schedules,
         SchedulerMonitor::offline(),
-    ))
+    )
     .await
     .expect("sharded tick should clean stale classic DAG rows before ticking schedules");
 
@@ -7380,13 +7380,13 @@ async fn scheduler_tick_does_not_dispatch_removed_dag_schedule_rows() {
             .expect("failed to force removed DAG schedule due");
     }
 
-    Box::pin(tick_once(
+    tick_once(
         pool.clone(),
         Arc::new(HandlerRegistry::new(vec![], vec![])),
         Arc::new(DagCatalog::default()),
         Arc::new(Vec::new()),
         SchedulerMonitor::offline(),
-    ))
+    )
     .await
     .expect("scheduler tick should skip removed DAG-managed schedule rows");
 
@@ -7868,7 +7868,7 @@ async fn scheduler_tick_preserves_dag_metadata() {
             .expect("failed to force DAG schedule due");
     }
 
-    Box::pin(tick_once(
+    tick_once(
         pool.clone(),
         Arc::new(HandlerRegistry::new(
             vec![workflow_info_named(dag_name)],
@@ -7877,7 +7877,7 @@ async fn scheduler_tick_preserves_dag_metadata() {
         dag_catalog,
         Arc::new(vec![workflow_schedule]),
         SchedulerMonitor::offline(),
-    ))
+    )
     .await
     .expect("scheduler tick should dispatch DAG schedule");
 

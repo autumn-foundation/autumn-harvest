@@ -10290,14 +10290,13 @@ async fn schedule_backfill_ui(
     // audit record) but labels the audit with the UI's own route, so a
     // dashboard-initiated backfill is not recorded as an API call. Mirrors
     // `dag_retry_commit_ui`.
-    // `Box::pin` for the same reason as the API handler it shares.
-    let result = Box::pin(crate::api::schedule_backfill_inner(
+    let result = crate::api::schedule_backfill_inner(
         &api_state,
         &id_str,
         &headers,
         request,
         "POST /ui/schedules/{id}/backfill",
-    ))
+    )
     .await;
 
     match result {
