@@ -356,6 +356,55 @@ pub(crate) fn parse_and_validate_workflow_path(
     })
 }
 
+impl WorkflowPath {
+    /// Tokens for the `use #leading_colon #(#nested::)*Stub;` that lets a
+    /// generated companion module see this path's stub type. An absolute
+    /// path keeps its leading `::`. The module-segment tokens splice in
+    /// before the stub's name. A same-crate relative path is
+    /// `super`-prefixed and `self`-stripped. An absolute or
+    /// `crate`-prefixed path passes through verbatim.
+    ///
+    /// `#[query]`, `#[update]`, and `#[signal]` each resolve a `workflow`
+    /// path to a stub reference the same way. They share this derivation
+    /// rather than each carrying their own copy of it.
+    pub(crate) fn nested_stub_use_tokens(
+        &self,
+    ) -> (proc_macro2::TokenStream, Vec<proc_macro2::TokenStream>) {
+        let leading_colon = if self.is_absolute {
+            quote::quote! { :: }
+        } else {
+            quote::quote! {}
+        };
+        let nested_path_tokens = if self.is_absolute
+            || self
+                .original_module_parts
+                .first()
+                .is_some_and(|s| s == "crate")
+        {
+            self.path_tokens.clone()
+        } else if self.original_module_parts.is_empty() {
+            Vec::new()
+        } else {
+            let mut tokens = Vec::new();
+            tokens.push(quote::quote! { super });
+            let first = self.original_module_parts.first().unwrap();
+            if first == "self" {
+                for p in self.original_module_parts.iter().skip(1) {
+                    let id = quote::format_ident!("{}", p);
+                    tokens.push(quote::quote! { #id });
+                }
+            } else {
+                for p in &self.original_module_parts {
+                    let id = quote::format_ident!("{}", p);
+                    tokens.push(quote::quote! { #id });
+                }
+            }
+            tokens
+        };
+        (leading_colon, nested_path_tokens)
+    }
+}
+
 #[allow(clippy::option_if_let_else)]
 pub(crate) fn to_pascal_case(s: &str) -> String {
     let mut chars = s.chars();

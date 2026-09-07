@@ -89,6 +89,7 @@ pub fn signal_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         Ok(p) => p,
         Err(e) => return e.to_compile_error(),
     };
+    let (leading_colon, nested_path_tokens) = parsed_path.nested_stub_use_tokens();
     let workflow_simple_name = parsed_path.workflow_simple_name;
     let camel_wf = crate::to_pascal_case(&workflow_simple_name);
     let stub_ident = format_ident!("{camel_wf}Stub");
@@ -118,38 +119,6 @@ pub fn signal_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
 
     let mod_name = format_ident!("__autumn_signal_impl_{fn_name}");
     let path_tokens = parsed_path.path_tokens;
-    let is_absolute = parsed_path.is_absolute;
-    let leading_colon = if is_absolute {
-        quote! { :: }
-    } else {
-        quote! {}
-    };
-    let nested_path_tokens = if is_absolute
-        || parsed_path
-            .original_module_parts
-            .first()
-            .is_some_and(|s| s == "crate")
-    {
-        path_tokens.clone()
-    } else if parsed_path.original_module_parts.is_empty() {
-        Vec::new()
-    } else {
-        let mut tokens = Vec::new();
-        tokens.push(quote! { super });
-        let first = parsed_path.original_module_parts.first().unwrap();
-        if first == "self" {
-            for p in parsed_path.original_module_parts.iter().skip(1) {
-                let id = format_ident!("{}", p);
-                tokens.push(quote! { #id });
-            }
-        } else {
-            for p in &parsed_path.original_module_parts {
-                let id = format_ident!("{}", p);
-                tokens.push(quote! { #id });
-            }
-        }
-        tokens
-    };
     // Shared prologue: validate the target type, serialize the payload, and
     // enforce the signal payload cap before any insert.
     let cap_check = quote! {
@@ -312,6 +281,60 @@ mod signature_validation_characterization_tests {
         assert!(
             out.contains("must take") && out.contains("WorkflowContext"),
             "expected the ctx-param rejection message, got:\n{out}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod stub_path_resolution_characterization_tests {
+    use super::signal_macro;
+    use quote::quote;
+
+    fn generate(workflow_path: &str) -> String {
+        let attr = quote! { workflow = #workflow_path };
+        let item = quote! {
+            fn my_signal(ctx: &WorkflowContext, n: u32) {}
+        };
+        signal_macro(attr, item).to_string()
+    }
+
+    fn use_line(full: &str) -> &str {
+        let start = full
+            .find("use ")
+            .unwrap_or_else(|| panic!("no `use` in generated output:\n{full}"));
+        let end = start
+            + full[start..]
+                .find("impl ")
+                .unwrap_or_else(|| panic!("no `impl` after `use` in:\n{full}"));
+        full[start..end].trim()
+    }
+
+    /// Pins the exact stub-`use` tokens `signal_macro` emits for each shape
+    /// of `workflow = "..."` path. See `query.rs`/`update.rs`'s identical
+    /// sibling tests. All three handler macros resolve a `workflow` path to
+    /// a stub `use` the same way. That derivation is moving to a single
+    /// `WorkflowPath::nested_stub_use_tokens`.
+    #[test]
+    fn stub_use_tokens_pinned_per_path_shape() {
+        assert_eq!(
+            use_line(&generate("some_mod::MyWorkflow")),
+            "use super :: * ; use super :: some_mod :: MyWorkflowStub ;"
+        );
+        assert_eq!(
+            use_line(&generate("self::MyWorkflow")),
+            "use super :: * ; use super :: MyWorkflowStub ;"
+        );
+        assert_eq!(
+            use_line(&generate("self::a::b::MyWorkflow")),
+            "use super :: * ; use super :: a :: b :: MyWorkflowStub ;"
+        );
+        assert_eq!(
+            use_line(&generate("crate::some_mod::MyWorkflow")),
+            "use super :: * ; use crate :: some_mod :: MyWorkflowStub ;"
+        );
+        assert_eq!(
+            use_line(&generate("::abs_mod::MyWorkflow")),
+            "use super :: * ; use :: abs_mod :: MyWorkflowStub ;"
         );
     }
 }

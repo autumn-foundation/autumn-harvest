@@ -131,6 +131,7 @@ pub fn query_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         Ok(p) => p,
         Err(e) => return e.to_compile_error(),
     };
+    let (leading_colon, nested_path_tokens) = parsed_path.nested_stub_use_tokens();
     let workflow_simple_name = parsed_path.workflow_simple_name;
     let camel_wf = crate::to_pascal_case(&workflow_simple_name);
     let stub_ident = format_ident!("{camel_wf}Stub");
@@ -148,38 +149,6 @@ pub fn query_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
 
     let mod_name = format_ident!("__autumn_query_impl_{fn_name}");
     let path_tokens = parsed_path.path_tokens;
-    let is_absolute = parsed_path.is_absolute;
-    let leading_colon = if is_absolute {
-        quote! { :: }
-    } else {
-        quote! {}
-    };
-    let nested_path_tokens = if is_absolute
-        || parsed_path
-            .original_module_parts
-            .first()
-            .is_some_and(|s| s == "crate")
-    {
-        path_tokens.clone()
-    } else if parsed_path.original_module_parts.is_empty() {
-        Vec::new()
-    } else {
-        let mut tokens = Vec::new();
-        tokens.push(quote! { super });
-        let first = parsed_path.original_module_parts.first().unwrap();
-        if first == "self" {
-            for p in parsed_path.original_module_parts.iter().skip(1) {
-                let id = format_ident!("{}", p);
-                tokens.push(quote! { #id });
-            }
-        } else {
-            for p in &parsed_path.original_module_parts {
-                let id = format_ident!("{}", p);
-                tokens.push(quote! { #id });
-            }
-        }
-        tokens
-    };
     // See `update.rs`'s identical hoist (and its comment) for why this is a
     // single shared block spliced into both `impl_block` arms rather than
     // two hand-kept-in-sync copies.
@@ -414,6 +383,47 @@ mod same_module_vs_nested_module_parity_tests {
              divergence is a real, previously-shipped risk"
         );
         assert!(same_module_body.contains("execute_query_in_process"));
+    }
+
+    fn use_line(full: &str) -> &str {
+        let start = full
+            .find("use ")
+            .unwrap_or_else(|| panic!("no `use` in generated output:\n{full}"));
+        let end = start
+            + full[start..]
+                .find("impl ")
+                .unwrap_or_else(|| panic!("no `impl` after `use` in:\n{full}"));
+        full[start..end].trim()
+    }
+
+    /// Pins the exact stub-`use` tokens `query_macro` emits for each shape of
+    /// `workflow = "..."` path. The shapes are plain nested, `self::`-relative,
+    /// `crate::`-prefixed, and fully absolute (`::`-leading). This is before
+    /// the shared derivation moves to `WorkflowPath::nested_stub_use_tokens`.
+    /// See `update.rs`/`signal.rs`'s identical siblings: all three handler
+    /// macros resolve a `workflow` path to a stub `use` the same way.
+    #[test]
+    fn stub_use_tokens_pinned_per_path_shape() {
+        assert_eq!(
+            use_line(&generate("some_mod::MyWorkflow")),
+            "use super :: * ; use super :: some_mod :: MyWorkflowStub ;"
+        );
+        assert_eq!(
+            use_line(&generate("self::MyWorkflow")),
+            "use super :: * ; use super :: MyWorkflowStub ;"
+        );
+        assert_eq!(
+            use_line(&generate("self::a::b::MyWorkflow")),
+            "use super :: * ; use super :: a :: b :: MyWorkflowStub ;"
+        );
+        assert_eq!(
+            use_line(&generate("crate::some_mod::MyWorkflow")),
+            "use super :: * ; use crate :: some_mod :: MyWorkflowStub ;"
+        );
+        assert_eq!(
+            use_line(&generate("::abs_mod::MyWorkflow")),
+            "use super :: * ; use :: abs_mod :: MyWorkflowStub ;"
+        );
     }
 }
 
