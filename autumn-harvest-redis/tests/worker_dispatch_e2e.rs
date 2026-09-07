@@ -1163,6 +1163,10 @@ async fn crash_between_claim_commit_and_ack_neither_loses_nor_duplicates() {
     let state =
         await_execution_state(&db_url, exec_id, &["COMPLETED"], Duration::from_secs(30)).await;
     assert_eq!(state, "COMPLETED");
+    // The stale reference the child left behind is recovered on the
+    // visibility timeout, which can outlive the run. The worker stays up
+    // until the channel is clean.
+    probe.await_drained(QUEUE, Duration::from_secs(20)).await;
     worker.stop().await;
 
     assert_eq!(
