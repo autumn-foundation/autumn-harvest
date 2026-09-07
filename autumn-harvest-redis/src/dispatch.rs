@@ -26,20 +26,31 @@
 //! ## The dedupe marker
 //!
 //! A publish is idempotent per task id. The marker records that the channel
-//! already holds a reference for the row, so a second hint for the same row
-//! adds no second entry. `ack` deletes the marker, which is what lets the
-//! reconcile sweep republish the row on its next pass. The marker also
-//! expires after `dedupe_ttl`. A leaked marker therefore cannot block a
-//! republish for ever. A worker that dies between the read and the ack
-//! leaks one.
+//! already holds a reference for the row. Its **value** is the `scheduled_at`
+//! of the held reference, in unix milliseconds. `ack` deletes the marker,
+//! which is what lets the reconcile sweep republish the row on its next pass.
+//! The marker also expires after `dedupe_ttl`. A leaked marker therefore
+//! cannot block a republish for ever. A worker that dies between the read and
+//! the ack leaks one.
 //!
-//! ## The earlier-due override
+//! ## Publish idempotency (contract C1)
 //!
-//! A hint whose due time is earlier than a parked entry's moves that entry
-//! forward. A signal can arrive for a workflow that waits on a timer. The
-//! row's `scheduled_at` then moves back to now, and the parked reference
-//! must move with it. Without the override the marker would suppress the new
-//! hint, and the run would wait for the original timer.
+//! The rule is keyed on `scheduled_at`. The marker value makes the rule
+//! decidable for a live stream entry as well as for a parked one.
+//!
+//! - A hint with the **same** `scheduled_at` as the held reference is a no-op.
+//!   The marker TTL is refreshed. The reconcile sweep republishes a row it
+//!   has already published, so this is the common case.
+//! - A hint with a **different** `scheduled_at` replaces the held reference.
+//!   The row state changed, so the reference moves to the new due time and its
+//!   `redeliveries` resets to 0. A parked entry is moved in place. A live
+//!   stream entry cannot be removed safely, so the marker moves and a second
+//!   entry is added; the by-id claim drops the stale one.
+//!
+//! A released reference keeps the row's `scheduled_at` in its payload and in
+//! its marker. The backoff moves the delayed-set score only. A reconcile
+//! republish therefore never disturbs a backoff. A wake and a retry both move
+//! the row's `scheduled_at`, so each of them moves the reference.
 //!
 //! ## Delivery
 //!
@@ -48,7 +59,7 @@
 //! reference without running anything.
 
 use std::collections::{HashMap, HashSet};
-use std::sync::atomic::{AtomicI64, Ordering};
+use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -57,9 +68,9 @@ use autumn_harvest::dispatch::{DispatchHint, DispatchLease, DispatchMaintenance,
 use autumn_harvest::error::{HarvestError, HarvestResult};
 use autumn_harvest::types::ShardId;
 use chrono::{DateTime, Utc};
-use redis::aio::ConnectionManager;
+use redis::aio::{ConnectionManager, ConnectionManagerConfig};
 use redis::streams::{
-    StreamClaimReply, StreamPendingCountReply, StreamRangeReply, StreamReadOptions, StreamReadReply,
+    StreamClaimReply, StreamPendingCountReply, StreamReadOptions, StreamReadReply,
 };
 use redis::{AsyncCommands, RedisError, Script};
 use serde::{Deserialize, Serialize};
@@ -83,6 +94,19 @@ const PAYLOAD_FIELD: &str = "payload";
 const RECOVERY_CONSUMER: &str = "__recovered__";
 /// Pending entries inspected in one recovery pass per queue.
 const RECOVER_BATCH: usize = 128;
+
+/// Deadline for one connection attempt, and for [`RedisDispatch::connect`] as
+/// a whole (contract C4).
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+/// Deadline for one command on an open connection (contract C4).
+const RESPONSE_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Separator between the entry id and the payload inside a lease handle.
+///
+/// A stream entry id is `{milliseconds}-{sequence}`, so it never holds this
+/// character. The split therefore takes the first occurrence and the payload
+/// may contain the separator itself.
+const HANDLE_SEPARATOR: char = '|';
 
 /// Configuration for [`RedisDispatch`].
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -108,6 +132,27 @@ impl Default for RedisDispatchConfig {
             visibility_timeout: DEFAULT_VISIBILITY_TIMEOUT,
             dedupe_ttl: DEFAULT_DEDUPE_TTL,
         }
+    }
+}
+
+impl RedisDispatchConfig {
+    /// Reject a configuration that cannot name a key or a consumer group.
+    ///
+    /// An empty prefix produces keys that collide with another tenant's. An
+    /// empty group name makes `XGROUP CREATE` fail at the first publish, far
+    /// from the mistake. Both are rejected at construction instead.
+    fn validate(&self) -> RedisAdapterResult<()> {
+        if self.key_prefix.trim().is_empty() {
+            return Err(RedisAdapterError::InvalidConfig(
+                "key_prefix must not be empty".to_string(),
+            ));
+        }
+        if self.consumer_group.trim().is_empty() {
+            return Err(RedisAdapterError::InvalidConfig(
+                "consumer_group must not be empty".to_string(),
+            ));
+        }
+        Ok(())
     }
 }
 
@@ -139,9 +184,11 @@ impl DispatchRef {
 
     /// Rebuild a reference from a lease alone.
     ///
-    /// Used when the delivered entry is gone from the stream, so the priority
-    /// and the original due time cannot be read back. Priority degrades to the
-    /// default, which the v1 design already treats as best effort.
+    /// Used when the handle carries no payload, which happens only for a lease
+    /// this channel did not produce. Priority degrades to the default, which
+    /// the v1 design already treats as best effort. The row's `scheduled_at`
+    /// is unknown, so `now` stands in for it; a reconcile republish then moves
+    /// the reference instead of leaving it alone.
     fn from_lease(lease: &DispatchLease) -> Self {
         Self {
             task_id: lease.task_id,
@@ -161,6 +208,11 @@ impl DispatchRef {
             handle,
             shard: self.shard.map(ShardId::new),
         }
+    }
+
+    /// Marker value for this reference: the row's due time in milliseconds.
+    const fn marker_value(&self) -> i64 {
+        self.scheduled_at.timestamp_millis()
     }
 }
 
@@ -187,6 +239,8 @@ pub struct RedisDispatch {
     last_promote_ms: Arc<AtomicI64>,
     /// Unix milliseconds of the last recovery pass.
     last_recover_ms: Arc<AtomicI64>,
+    /// Number of reads served. It rotates the queue order of the next read.
+    reads: Arc<AtomicU64>,
 }
 
 impl std::fmt::Debug for RedisDispatch {
@@ -203,13 +257,18 @@ impl RedisDispatch {
     ///
     /// `blocking` must be a second connection. See the field documentation for
     /// why the blocking read cannot share the general-purpose connection.
-    #[must_use]
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RedisAdapterError::InvalidConfig`] when `config` has an empty
+    /// `key_prefix` or an empty `consumer_group`.
     pub fn from_connection(
         conn: ConnectionManager,
         blocking: ConnectionManager,
         config: RedisDispatchConfig,
-    ) -> Self {
-        Self {
+    ) -> RedisAdapterResult<Self> {
+        config.validate()?;
+        Ok(Self {
             conn,
             blocking,
             config: Arc::new(config),
@@ -218,20 +277,33 @@ impl RedisDispatch {
             ensured: Arc::new(Mutex::new(HashSet::new())),
             last_promote_ms: Arc::new(AtomicI64::new(0)),
             last_recover_ms: Arc::new(AtomicI64::new(0)),
-        }
+            reads: Arc::new(AtomicU64::new(0)),
+        })
     }
 
     /// Open two Redis connections and build a channel.
     ///
+    /// Both connections carry a 5 second connection timeout and a 5 second
+    /// response timeout (contract C4). The connection manager retries a lost
+    /// connection with its own backoff. This call is bounded on top of those
+    /// retries. A black-holed address therefore fails in about
+    /// [`CONNECT_TIMEOUT`], not after the whole retry budget.
+    ///
     /// # Errors
     ///
-    /// Returns [`RedisAdapterError::Redis`] if the URL cannot be parsed or a
-    /// connection cannot be established.
+    /// Returns [`RedisAdapterError::InvalidConfig`] for an unusable `config`.
+    /// Returns [`RedisAdapterError::TlsUnavailable`] for a `rediss://` URL
+    /// without the crate's `tls` feature. Returns
+    /// [`RedisAdapterError::ConnectTimeout`] when the server does not answer
+    /// inside the connect timeout. Returns [`RedisAdapterError::Redis`] when
+    /// the URL cannot be parsed, or when the server refuses the connection.
     pub async fn connect(url: &str, config: RedisDispatchConfig) -> RedisAdapterResult<Self> {
+        config.validate()?;
+        check_tls_support(url)?;
         let client = redis::Client::open(url)?;
-        let conn = ConnectionManager::new(client.clone()).await?;
-        let blocking = ConnectionManager::new(client).await?;
-        Ok(Self::from_connection(conn, blocking, config))
+        let conn = open_manager(&client).await?;
+        let blocking = open_manager(&client).await?;
+        Self::from_connection(conn, blocking, config)
     }
 
     /// Currently configured key prefix.
@@ -326,50 +398,81 @@ impl RedisDispatch {
         Ok(())
     }
 
-    /// Promote every due delayed reference for one queue onto its stream.
-    async fn promote_queue(&self, queue_name: &str) -> RedisAdapterResult<usize> {
-        // The group must exist before the script adds entries.
-        self.ensure_group(queue_name, false).await?;
-        let mut conn = self.conn.clone();
-        let promoted: i64 = self
-            .promote_script
-            .key(self.delayed_key(queue_name))
-            .key(self.payloads_key(queue_name))
-            .key(self.stream_key(queue_name))
-            .arg(Utc::now().timestamp_millis())
-            .invoke_async(&mut conn)
-            .await?;
-        Ok(usize::try_from(promoted).unwrap_or(0))
+    /// One `EVALSHA` of the promotion script per queue, in one pipeline.
+    fn promote_pipeline(&self, queues: &[String], now_ms: i64) -> redis::Pipeline {
+        let mut pipe = redis::pipe();
+        for queue in queues {
+            pipe.cmd("EVALSHA")
+                .arg(self.promote_script.get_hash())
+                .arg(3)
+                .arg(self.delayed_key(queue))
+                .arg(self.payloads_key(queue))
+                .arg(self.stream_key(queue))
+                .arg(now_ms);
+        }
+        pipe
     }
 
+    /// Promote every due delayed reference for every queue, in one round trip.
     async fn promote_queues(&self, queues: &[String]) -> RedisAdapterResult<usize> {
-        let mut total = 0;
-        for queue in queues {
-            total += self.promote_queue(queue).await?;
+        if queues.is_empty() {
+            return Ok(0);
         }
-        Ok(total)
+        // The groups must exist before the script adds entries.
+        self.ensure_groups(queues, false).await?;
+        let now_ms = Utc::now().timestamp_millis();
+        let mut conn = self.conn.clone();
+        let counts: Vec<i64> = match self
+            .promote_pipeline(queues, now_ms)
+            .query_async(&mut conn)
+            .await
+        {
+            Ok(counts) => counts,
+            Err(err) if err.kind() == redis::ErrorKind::NoScriptError => {
+                // The server forgot the script. A restart or `SCRIPT FLUSH`
+                // does that. Load it once and run the pipeline again.
+                let _: String = redis::cmd("SCRIPT")
+                    .arg("LOAD")
+                    .arg(PROMOTE_LUA)
+                    .query_async(&mut conn)
+                    .await?;
+                self.promote_pipeline(queues, now_ms)
+                    .query_async(&mut conn)
+                    .await?
+            }
+            Err(err) => return Err(err.into()),
+        };
+        Ok(counts
+            .into_iter()
+            .map(|count| usize::try_from(count).unwrap_or(0))
+            .sum())
     }
 
     /// Run a promotion pass at most once per `interval`.
     ///
-    /// A read happens on every poll, and a promotion costs one round trip per
-    /// queue. The rate limit keeps an idle worker's cost proportional to the
-    /// poll interval rather than to the number of reads.
+    /// A read happens on every poll, and a promotion costs one round trip. The
+    /// rate limit keeps an idle worker's cost proportional to the poll
+    /// interval rather than to the number of reads. `maintain` shares the same
+    /// slot with a zero interval. It therefore always promotes, and it claims
+    /// the slot. The read that follows it in the same iteration then skips its
+    /// own pass.
+    ///
+    /// Returns the number of promoted references, or `0` when the pass is
+    /// skipped.
     async fn promote_rate_limited(
         &self,
         queues: &[String],
         interval: Duration,
-    ) -> RedisAdapterResult<()> {
+    ) -> RedisAdapterResult<usize> {
         let interval_ms = i64::try_from(interval.as_millis()).unwrap_or(i64::MAX);
         if !claim_rate_limit_slot(
             &self.last_promote_ms,
             Utc::now().timestamp_millis(),
             interval_ms,
         ) {
-            return Ok(());
+            return Ok(0);
         }
-        self.promote_queues(queues).await?;
-        Ok(())
+        self.promote_queues(queues).await
     }
 
     /// Whether a recovery pass is due, claiming the slot when it is.
@@ -391,12 +494,12 @@ impl RedisDispatch {
         &self,
         keys: &[String],
         consumer: &str,
-        max: usize,
+        count: usize,
         wait: Duration,
     ) -> redis::RedisResult<StreamReadReply> {
         let mut options = StreamReadOptions::default()
             .group(&self.config.consumer_group, consumer)
-            .count(max);
+            .count(count);
         if !wait.is_zero() {
             // BLOCK 0 waits for ever, so a sub-millisecond wait rounds up.
             let wait_ms = usize::try_from(wait.as_millis())
@@ -415,42 +518,48 @@ impl RedisDispatch {
         queues: &[String],
         keys: &[String],
         consumer: &str,
-        max: usize,
+        count: usize,
         wait: Duration,
     ) -> RedisAdapterResult<StreamReadReply> {
-        match self.read_group(keys, consumer, max, wait).await {
+        match self.read_group(keys, consumer, count, wait).await {
             Ok(reply) => Ok(reply),
             Err(err) if is_nogroup(&err) => {
                 self.ensure_groups(queues, true).await?;
                 // The healed read does not wait again: the caller's wait
                 // budget was already spent on the first attempt.
-                Ok(self.read_group(keys, consumer, max, Duration::ZERO).await?)
+                Ok(self
+                    .read_group(keys, consumer, count, Duration::ZERO)
+                    .await?)
             }
             Err(err) => Err(err.into()),
         }
     }
 
-    /// Give one entry back to its stream, as a fresh entry due at `due`.
+    /// Queue the commands that give one entry back to its stream.
     ///
     /// The delivered entry is acked and deleted first, so the pending entries
-    /// list never holds a reference the worker no longer owns. The marker's
-    /// TTL is refreshed, not deleted: the row is still un-claimed, so a
-    /// republish must stay a no-op until the new entry is delivered.
-    async fn requeue(
+    /// list never holds a reference the worker no longer owns. The marker is
+    /// rewritten, not deleted. The row is still un-claimed, so a republish of
+    /// the same `scheduled_at` stays a no-op until the new entry is
+    /// delivered.
+    ///
+    /// `due` moves the delivery time only. `reference.scheduled_at` keeps the
+    /// row's due time, which is what contract C1 compares against.
+    fn push_requeue(
         &self,
+        pipe: &mut redis::Pipeline,
         handle: &str,
         reference: &DispatchRef,
         due: DateTime<Utc>,
     ) -> RedisAdapterResult<()> {
         let queue = &reference.queue_name;
         let key = self.stream_key(queue);
+        let entry_id = handle_entry_id(handle);
         let payload = serde_json::to_string(reference)?;
         let task_id = reference.task_id.to_string();
-        let mut pipe = redis::pipe();
-        pipe.atomic()
-            .xack(&key, &self.config.consumer_group, &[handle])
+        pipe.xack(&key, &self.config.consumer_group, &[entry_id])
             .ignore()
-            .xdel(&key, &[handle])
+            .xdel(&key, &[entry_id])
             .ignore();
         if due <= Utc::now() {
             pipe.xadd(&key, "*", &[(PAYLOAD_FIELD, payload.as_str())])
@@ -463,33 +572,41 @@ impl RedisDispatch {
         }
         pipe.cmd("SET")
             .arg(self.marker_key(reference.task_id))
-            .arg("1")
+            .arg(reference.marker_value())
             .arg("EX")
             .arg(self.dedupe_ttl_secs())
             .ignore();
-        let mut conn = self.conn.clone();
-        pipe.query_async::<()>(&mut conn).await?;
         Ok(())
     }
 
-    /// Read the stored reference of a delivered entry.
-    ///
-    /// Returns `None` when the entry is gone, which happens if a peer's
-    /// recovery pass already re-added it.
-    async fn read_entry(
+    /// Give one entry back to its stream, as a fresh entry due at `due`.
+    async fn requeue(
         &self,
-        queue: &str,
         handle: &str,
-    ) -> RedisAdapterResult<Option<DispatchRef>> {
+        reference: &DispatchRef,
+        due: DateTime<Utc>,
+    ) -> RedisAdapterResult<()> {
+        let entries = [(handle.to_string(), reference.clone())];
+        self.requeue_batch(&entries, due).await
+    }
+
+    /// Give several entries back to their streams in one round trip.
+    async fn requeue_batch(
+        &self,
+        entries: &[(String, DispatchRef)],
+        due: DateTime<Utc>,
+    ) -> RedisAdapterResult<()> {
+        if entries.is_empty() {
+            return Ok(());
+        }
+        let mut pipe = redis::pipe();
+        pipe.atomic();
+        for (handle, reference) in entries {
+            self.push_requeue(&mut pipe, handle, reference, due)?;
+        }
         let mut conn = self.conn.clone();
-        let reply: StreamRangeReply = conn.xrange(self.stream_key(queue), handle, handle).await?;
-        let Some(entry) = reply.ids.first() else {
-            return Ok(None);
-        };
-        let Some(payload) = entry_payload(&entry.map) else {
-            return Ok(None);
-        };
-        Ok(serde_json::from_str(&payload).ok())
+        pipe.query_async::<()>(&mut conn).await?;
+        Ok(())
     }
 
     async fn publish_inner(&self, hints: &[DispatchHint]) -> RedisAdapterResult<()> {
@@ -498,6 +615,7 @@ impl RedisDispatch {
         }
         let mut by_queue: HashMap<&str, Vec<&DispatchHint>> = HashMap::new();
         for hint in hints {
+            validate_queue_name(&hint.queue_name)?;
             by_queue
                 .entry(hint.queue_name.as_str())
                 .or_default()
@@ -539,8 +657,15 @@ impl RedisDispatch {
         wait: Duration,
     ) -> RedisAdapterResult<Vec<DispatchLease>> {
         let keys: Vec<String> = queues.iter().map(|queue| self.stream_key(queue)).collect();
+        // `COUNT` bounds one stream, not the whole read. Sizing it per stream
+        // keeps the read close to `max` entries in total. The order rotates
+        // per call, so the queue that fills the batch changes. No queue
+        // therefore starves behind a busy peer.
+        let offset = usize::try_from(self.reads.fetch_add(1, Ordering::Relaxed)).unwrap_or(0);
+        let ordered = rotate(&keys, offset);
+        let count = per_stream_count(max, ordered.len());
         let reply = self
-            .read_with_heal(queues, &keys, consumer, max, wait)
+            .read_with_heal(queues, &ordered, consumer, count, wait)
             .await?;
 
         let mut leases = Vec::new();
@@ -562,31 +687,40 @@ impl RedisDispatch {
                     continue;
                 };
                 if leases.len() < max {
-                    leases.push(reference.into_lease(entry.id));
+                    let handle = encode_handle(&entry.id, &payload);
+                    leases.push(reference.into_lease(handle));
                 } else {
                     surplus.push((entry.id, reference));
                 }
             }
         }
 
-        // `COUNT` bounds one stream, not the whole read, so a read across
-        // several queues can return more than the caller asked for. The
-        // caller's `max` is its free concurrency, so the surplus goes back on
-        // the stream at once rather than waiting for the visibility timeout.
-        for (handle, reference) in surplus {
-            self.requeue(&handle, &reference, Utc::now()).await?;
+        // The caller's `max` is its free concurrency, so a surplus goes back
+        // on the stream at once rather than waiting for the visibility
+        // timeout. One pipeline carries the whole surplus. A failure there
+        // costs one redelivery per entry, which the visibility timeout already
+        // covers, so the leases already collected are returned either way.
+        if !surplus.is_empty()
+            && let Err(error) = self.requeue_batch(&surplus, Utc::now()).await
+        {
+            tracing::warn!(
+                error = %error,
+                surplus = surplus.len(),
+                "failed to requeue surplus dispatch references"
+            );
         }
         Ok(leases)
     }
 
     async fn ack_inner(&self, lease: &DispatchLease) -> RedisAdapterResult<()> {
         let key = self.stream_key(&lease.queue_name);
+        let entry_id = handle_entry_id(&lease.handle);
         let mut conn = self.conn.clone();
         redis::pipe()
             .atomic()
-            .xack(&key, &self.config.consumer_group, &[lease.handle.as_str()])
+            .xack(&key, &self.config.consumer_group, &[entry_id])
             .ignore()
-            .xdel(&key, &[lease.handle.as_str()])
+            .xdel(&key, &[entry_id])
             .ignore()
             .del(self.marker_key(lease.task_id))
             .ignore()
@@ -600,15 +734,19 @@ impl RedisDispatch {
         lease: &DispatchLease,
         delay: Duration,
     ) -> RedisAdapterResult<()> {
-        let stored = self.read_entry(&lease.queue_name, &lease.handle).await?;
-        let mut reference = stored.unwrap_or_else(|| DispatchRef::from_lease(lease));
+        // The handle carries the payload (contract C2), so no read-back is
+        // needed and the priority survives the release.
+        let mut reference = handle_payload(&lease.handle)
+            .and_then(|payload| serde_json::from_str::<DispatchRef>(payload).ok())
+            .unwrap_or_else(|| DispatchRef::from_lease(lease));
         reference.redeliveries = lease.redeliveries.saturating_add(1);
         let chrono_delay = chrono::Duration::from_std(delay).map_err(|err| {
             RedisAdapterError::DurationOutOfRange(format!("release delay: {err}"))
         })?;
-        let due = Utc::now() + chrono_delay;
-        reference.scheduled_at = due;
-        self.requeue(&lease.handle, &reference, due).await
+        // `scheduled_at` stays the row's due time. Only the delivery time
+        // moves, so a reconcile republish does not disturb the backoff (C1).
+        self.requeue(&lease.handle, &reference, Utc::now() + chrono_delay)
+            .await
     }
 
     /// Re-add every entry that has been idle in the pending entries list
@@ -649,7 +787,7 @@ impl RedisDispatch {
             )
             .await?;
 
-        let mut recovered = 0;
+        let mut recovered = Vec::new();
         for entry in claimed.ids {
             let Some(payload) = entry_payload(&entry.map) else {
                 tracing::warn!(
@@ -668,12 +806,13 @@ impl RedisDispatch {
                 continue;
             };
             reference.redeliveries = reference.redeliveries.saturating_add(1);
-            let now = Utc::now();
-            reference.scheduled_at = now;
-            self.requeue(&entry.id, &reference, now).await?;
-            recovered += 1;
+            // `scheduled_at` keeps the row's due time (C1). The entry is due
+            // now, which the `due` argument below says.
+            recovered.push((entry.id, reference));
         }
-        Ok(recovered)
+        let count = recovered.len();
+        self.requeue_batch(&recovered, Utc::now()).await?;
+        Ok(count)
     }
 
     async fn recover_queues(&self, queues: &[String]) -> RedisAdapterResult<usize> {
@@ -701,6 +840,9 @@ impl TaskDispatch for RedisDispatch {
         if queues.is_empty() || max == 0 {
             return Ok(Vec::new());
         }
+        for queue in queues {
+            harvest(validate_queue_name(queue))?;
+        }
         harvest(self.promote_rate_limited(queues, wait).await)?;
         harvest(self.next_inner(queues, consumer, max, wait).await)
     }
@@ -717,7 +859,7 @@ impl TaskDispatch for RedisDispatch {
         if queues.is_empty() {
             return Ok(DispatchMaintenance::default());
         }
-        let promoted = harvest(self.promote_queues(queues).await)?;
+        let promoted = harvest(self.promote_rate_limited(queues, Duration::ZERO).await)?;
         let recovered = if self.recovery_is_due() {
             harvest(self.recover_queues(queues).await)?
         } else {
@@ -728,6 +870,102 @@ impl TaskDispatch for RedisDispatch {
             recovered,
         })
     }
+}
+
+/// Open one connection manager with the contract C4 timeouts.
+async fn open_manager(client: &redis::Client) -> RedisAdapterResult<ConnectionManager> {
+    let config = ConnectionManagerConfig::new()
+        .set_connection_timeout(CONNECT_TIMEOUT)
+        .set_response_timeout(RESPONSE_TIMEOUT);
+    // The manager retries the first connection with its own backoff, so the
+    // per-attempt timeout alone does not bound this call. The outer deadline
+    // does. A black-holed address therefore fails in about `CONNECT_TIMEOUT`
+    // rather than after the whole retry budget.
+    match tokio::time::timeout(
+        CONNECT_TIMEOUT,
+        ConnectionManager::new_with_config(client.clone(), config),
+    )
+    .await
+    {
+        Ok(result) => Ok(result?),
+        Err(_) => Err(RedisAdapterError::ConnectTimeout(CONNECT_TIMEOUT)),
+    }
+}
+
+/// Whether this build carries the crate's `tls` feature.
+const TLS_ENABLED: bool = cfg!(feature = "tls");
+
+/// Whether a URL asks for TLS.
+fn is_tls_url(url: &str) -> bool {
+    url.trim_start()
+        .split_once("://")
+        .is_some_and(|(scheme, _)| scheme.eq_ignore_ascii_case("rediss"))
+}
+
+/// Reject a TLS URL when the crate is built without the `tls` feature.
+///
+/// `redis` only speaks TLS when its own TLS feature is on. Without it a
+/// `rediss://` URL fails deep inside the client with a message that does not
+/// name the cause. This check names the feature instead.
+fn check_tls_support(url: &str) -> RedisAdapterResult<()> {
+    if is_tls_url(url) && !TLS_ENABLED {
+        return Err(RedisAdapterError::TlsUnavailable);
+    }
+    Ok(())
+}
+
+/// Reject a queue name that cannot be part of a key.
+///
+/// `:` separates the segments of every key in the family, so a queue name that
+/// holds one can address another queue's keys.
+fn validate_queue_name(queue_name: &str) -> RedisAdapterResult<()> {
+    if queue_name.is_empty() || queue_name.contains(':') {
+        return Err(RedisAdapterError::InvalidQueueName(queue_name.to_string()));
+    }
+    Ok(())
+}
+
+/// `COUNT` for one stream of a read that wants `max` entries in total.
+fn per_stream_count(max: usize, queues: usize) -> usize {
+    if queues == 0 {
+        return max.max(1);
+    }
+    max.div_ceil(queues).max(1)
+}
+
+/// `items`, rotated left by `offset` positions.
+fn rotate<T: Clone>(items: &[T], offset: usize) -> Vec<T> {
+    if items.is_empty() {
+        return Vec::new();
+    }
+    let start = offset % items.len();
+    items[start..]
+        .iter()
+        .chain(items[..start].iter())
+        .cloned()
+        .collect()
+}
+
+/// Build the opaque lease handle from an entry id and its payload.
+///
+/// Carrying the payload lets `release` rebuild the reference without an
+/// `XRANGE` read-back (contract C2).
+fn encode_handle(entry_id: &str, payload: &str) -> String {
+    format!("{entry_id}{HANDLE_SEPARATOR}{payload}")
+}
+
+/// The stream entry id inside a lease handle.
+fn handle_entry_id(handle: &str) -> &str {
+    handle
+        .split_once(HANDLE_SEPARATOR)
+        .map_or(handle, |(entry_id, _)| entry_id)
+}
+
+/// The stored payload inside a lease handle, if it carries one.
+fn handle_payload(handle: &str) -> Option<&str> {
+    handle
+        .split_once(HANDLE_SEPARATOR)
+        .map(|(_, payload)| payload)
 }
 
 /// Map an adapter result onto the engine's dispatch result.
@@ -782,11 +1020,11 @@ fn is_nogroup(err: &RedisError) -> bool {
 /// - `ARGV[3n..]`: task id, due time in unix milliseconds, and payload, per
 ///   hint, in hint order.
 ///
-/// Behaviour per hint: a hint whose task id is parked in the delayed set with
-/// a later due time moves forward. A hint whose marker exists otherwise is a
-/// no-op. Any other hint sets the marker and is added to the stream when it is
-/// due, or to the delayed set when it is not. Returns the number of hints that
-/// wrote.
+/// Behaviour per hint (contract C1). The marker holds the `scheduled_at` of
+/// the reference the channel already carries. A hint whose due time equals the
+/// marker is a no-op, and the marker TTL is refreshed. Any other hint writes.
+/// The marker then takes the new due time. A parked entry moves in place, and
+/// a due hint is added to the stream. Returns the number of hints that wrote.
 const PUBLISH_LUA: &str = r"
 local stream = KEYS[1]
 local delayed = KEYS[2]
@@ -798,19 +1036,14 @@ local count = (#ARGV - 2) / 3
 for i = 1, count do
     local marker = KEYS[3 + i]
     local task_id = ARGV[3 * i]
-    local due = tonumber(ARGV[3 * i + 1])
+    local due_text = ARGV[3 * i + 1]
     local payload = ARGV[3 * i + 2]
-    local parked = redis.call('ZSCORE', delayed, task_id)
-    local write = false
-    if parked then
-        if due < tonumber(parked) then
-            write = true
-        end
-    elseif redis.call('EXISTS', marker) == 0 then
-        write = true
-    end
-    if write then
-        redis.call('SET', marker, '1', 'EX', ttl)
+    local held = redis.call('GET', marker)
+    if held == due_text then
+        redis.call('EXPIRE', marker, ttl)
+    else
+        local due = tonumber(due_text)
+        redis.call('SET', marker, due_text, 'EX', ttl)
         if due <= now then
             redis.call('ZREM', delayed, task_id)
             redis.call('HDEL', payloads, task_id)
@@ -890,6 +1123,25 @@ mod tests {
     }
 
     #[test]
+    fn a_marker_value_is_the_due_time_in_milliseconds() {
+        let hint = DispatchHint {
+            task_id: Uuid::nil(),
+            queue_name: "q".to_string(),
+            scheduled_at: DateTime::parse_from_rfc3339("2026-09-07T12:00:00Z")
+                .unwrap()
+                .with_timezone(&Utc),
+            priority: 0,
+            shard: None,
+        };
+        // The publish script compares the marker against the same encoding of
+        // `scheduled_at` that a hint carries, so the two must agree.
+        assert_eq!(
+            DispatchRef::from_hint(&hint).marker_value(),
+            hint.scheduled_at.timestamp_millis()
+        );
+    }
+
+    #[test]
     fn a_lease_keeps_the_shard_slot() {
         let hint = DispatchHint {
             task_id: Uuid::nil(),
@@ -910,6 +1162,38 @@ mod tests {
         assert_eq!(rebuilt.queue_name, "default");
         assert_eq!(rebuilt.redeliveries, 4);
         assert_eq!(rebuilt.shard, Some(3));
+    }
+
+    #[test]
+    fn a_handle_carries_the_entry_id_and_the_payload() {
+        let hint = DispatchHint {
+            task_id: Uuid::new_v4(),
+            queue_name: "email".to_string(),
+            scheduled_at: Utc::now(),
+            priority: 9,
+            shard: None,
+        };
+        let payload = serde_json::to_string(&DispatchRef::from_hint(&hint)).unwrap();
+        let handle = encode_handle("1700000000000-3", &payload);
+        assert_eq!(handle_entry_id(&handle), "1700000000000-3");
+        let decoded: DispatchRef =
+            serde_json::from_str(handle_payload(&handle).expect("a payload")).unwrap();
+        assert_eq!(decoded.task_id, hint.task_id);
+        assert_eq!(decoded.priority, 9, "release must keep the priority");
+    }
+
+    #[test]
+    fn a_handle_with_no_payload_is_still_an_entry_id() {
+        assert_eq!(handle_entry_id("5-0"), "5-0");
+        assert!(handle_payload("5-0").is_none());
+    }
+
+    #[test]
+    fn a_payload_that_holds_the_separator_survives_the_split() {
+        let payload = r#"{"queue_name":"a|b"}"#;
+        let handle = encode_handle("7-1", payload);
+        assert_eq!(handle_entry_id(&handle), "7-1");
+        assert_eq!(handle_payload(&handle), Some(payload));
     }
 
     #[test]
@@ -989,6 +1273,108 @@ mod tests {
         assert!(
             !is_nogroup(&other),
             "a transport failure must not trigger a group heal"
+        );
+    }
+
+    #[test]
+    fn a_read_is_sized_per_stream() {
+        assert_eq!(per_stream_count(64, 1), 64);
+        assert_eq!(per_stream_count(64, 4), 16);
+        assert_eq!(per_stream_count(3, 2), 2, "the split rounds up");
+        assert_eq!(per_stream_count(1, 8), 1, "a stream always reads one");
+        assert_eq!(per_stream_count(0, 0), 1, "no queue still reads one");
+    }
+
+    #[test]
+    fn the_queue_order_rotates() {
+        let queues = vec!["a".to_string(), "b".to_string(), "c".to_string()];
+        assert_eq!(rotate(&queues, 0), vec!["a", "b", "c"]);
+        assert_eq!(rotate(&queues, 1), vec!["b", "c", "a"]);
+        assert_eq!(rotate(&queues, 2), vec!["c", "a", "b"]);
+        assert_eq!(rotate(&queues, 3), vec!["a", "b", "c"], "the offset wraps");
+        assert!(rotate::<String>(&[], 5).is_empty());
+    }
+
+    #[test]
+    fn a_queue_name_with_a_colon_is_rejected() {
+        assert!(validate_queue_name("default").is_ok());
+        for bad in ["", "a:b", ":", "harvest:dispatch"] {
+            let err = validate_queue_name(bad).expect_err("a bad name must be rejected");
+            assert!(
+                matches!(err, RedisAdapterError::InvalidQueueName(_)),
+                "unexpected error for {bad:?}: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_empty_prefix_or_group_is_rejected() {
+        let empty_prefix = RedisDispatchConfig {
+            key_prefix: "  ".to_string(),
+            ..RedisDispatchConfig::default()
+        };
+        assert!(matches!(
+            empty_prefix.validate(),
+            Err(RedisAdapterError::InvalidConfig(_))
+        ));
+        let empty_group = RedisDispatchConfig {
+            consumer_group: String::new(),
+            ..RedisDispatchConfig::default()
+        };
+        assert!(matches!(
+            empty_group.validate(),
+            Err(RedisAdapterError::InvalidConfig(_))
+        ));
+        assert!(RedisDispatchConfig::default().validate().is_ok());
+    }
+
+    #[test]
+    fn a_tls_url_is_recognised_by_its_scheme() {
+        assert!(is_tls_url("rediss://host:6379"));
+        assert!(is_tls_url("REDISS://host:6379"));
+        assert!(!is_tls_url("redis://host:6379"));
+        assert!(!is_tls_url("host:6379"));
+    }
+
+    #[cfg(not(feature = "tls"))]
+    #[test]
+    fn a_tls_url_is_rejected_without_the_tls_feature() {
+        let err = check_tls_support("rediss://host:6379").expect_err("TLS must be rejected");
+        assert!(
+            matches!(err, RedisAdapterError::TlsUnavailable),
+            "unexpected error: {err}"
+        );
+        assert!(
+            err.to_string().contains("tls"),
+            "the message must name the feature: {err}"
+        );
+        assert!(check_tls_support("redis://host:6379").is_ok());
+    }
+
+    #[cfg(not(feature = "tls"))]
+    #[tokio::test]
+    async fn connect_rejects_a_tls_url_without_the_tls_feature() {
+        let err = RedisDispatch::connect("rediss://127.0.0.1:6379", RedisDispatchConfig::default())
+            .await
+            .expect_err("TLS must be rejected before any connection attempt");
+        assert!(
+            matches!(err, RedisAdapterError::TlsUnavailable),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn connect_rejects_an_empty_key_prefix() {
+        let config = RedisDispatchConfig {
+            key_prefix: String::new(),
+            ..RedisDispatchConfig::default()
+        };
+        let err = RedisDispatch::connect("redis://127.0.0.1:6379", config)
+            .await
+            .expect_err("an empty prefix must be rejected before connecting");
+        assert!(
+            matches!(err, RedisAdapterError::InvalidConfig(_)),
+            "unexpected error: {err}"
         );
     }
 }
