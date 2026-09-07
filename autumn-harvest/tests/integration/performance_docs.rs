@@ -342,8 +342,12 @@ fn per_gate_bullets_quote_the_published_gate_table() {
 /// top-level item. Good enough to read one function's call sites out of a file
 /// this test does not otherwise need to understand.
 fn top_level_fn_body<'a>(src: &'a str, name: &str) -> Option<&'a str> {
-    let signature = format!("pub async fn {name}(");
-    let start = src.find(&signature)?;
+    // A private helper has no `pub`, so try both spellings.
+    let public = format!("pub async fn {name}(");
+    let private = format!("\nasync fn {name}(");
+    let start = src
+        .find(&public)
+        .or_else(|| src.find(&private).map(|i| i + 1))?;
     let rest = &src[start..];
     let end = rest.find("\n}\n")?;
     Some(&rest[..end])
@@ -392,16 +396,23 @@ fn claim_transaction_statements_are_all_named_in_the_docs() {
     // The guard follows the transaction, which is what it was always about.
     let body = top_level_fn_body(&queue_src, "claim_task_on_shard")
         .expect("queue.rs must define `pub async fn claim_task_on_shard(`");
+    // Issue #1312 moved the post-claim re-checks into a helper that the
+    // by-id claim shares. The transaction still runs every statement, so the
+    // guard follows the call into that helper.
+    let rechecks = top_level_fn_body(&queue_src, "apply_post_claim_rechecks")
+        .expect("queue.rs must define `async fn apply_post_claim_rechecks(`");
 
     let mut called: Vec<&str> = Vec::new();
-    for (idx, _) in body.match_indices("crate::queue_pause::") {
-        let tail = &body[idx + "crate::queue_pause::".len()..];
-        let end = tail
-            .find(|c: char| !(c.is_alphanumeric() || c == '_'))
-            .unwrap_or(tail.len());
-        let name = &tail[..end];
-        if !name.is_empty() && !called.contains(&name) {
-            called.push(name);
+    for body in [body, rechecks] {
+        for (idx, _) in body.match_indices("crate::queue_pause::") {
+            let tail = &body[idx + "crate::queue_pause::".len()..];
+            let end = tail
+                .find(|c: char| !(c.is_alphanumeric() || c == '_'))
+                .unwrap_or(tail.len());
+            let name = &tail[..end];
+            if !name.is_empty() && !called.contains(&name) {
+                called.push(name);
+            }
         }
     }
     assert!(
