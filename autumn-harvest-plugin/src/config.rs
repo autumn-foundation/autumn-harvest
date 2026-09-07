@@ -48,6 +48,19 @@ pub struct HarvestReadinessConfig {
     pub require_shard_readiness: bool,
 }
 
+/// Highest accepted `harvest.redis.poll_interval_ms`.
+///
+/// The value is the wait of one blocking read. The worker checks shutdown and
+/// the reconcile clock between reads, so a longer wait delays both.
+const REDIS_POLL_INTERVAL_CEILING_MS: u64 = 5_000;
+
+/// Lowest accepted `harvest.redis.visibility_timeout_ms`.
+///
+/// The timeout must outlast one Postgres claim. A shorter value lets a peer
+/// recover a reference the owning worker is still claiming, which costs a
+/// duplicate claim attempt on every reference.
+const REDIS_VISIBILITY_TIMEOUT_FLOOR_MS: u64 = 1_000;
+
 /// Redis dispatch channel settings (issue #1312).
 ///
 /// The channel carries references to claimable `harvest_task_queue` rows.
@@ -381,16 +394,41 @@ impl HarvestRuntimeConfig {
     /// A build without the `redis` cargo feature carries no channel
     /// implementation. A configured URL there is rejected, so an operator
     /// never runs a binary that silently ignores the setting.
+    ///
+    /// The bounds below are the ones a wrong value breaks silently. Every key
+    /// the channel owns carries `key_prefix`, so an empty prefix collides with
+    /// unrelated keys in a shared Redis. Redis rejects an empty consumer group
+    /// name at the first read, which is late. A poll interval above
+    /// [`REDIS_POLL_INTERVAL_CEILING_MS`] holds one blocking read open for
+    /// longer than the shutdown check tolerates. A visibility timeout below
+    /// [`REDIS_VISIBILITY_TIMEOUT_FLOOR_MS`] lets a peer recover a reference
+    /// the owning worker is still claiming.
     fn validate_redis(&self) -> Result<(), ConfigError> {
-        if self.redis.visibility_timeout_ms < 1 {
+        if self.redis.key_prefix.is_empty() {
             return Err(ConfigError::Validation(
-                "harvest.redis.visibility_timeout_ms must be at least 1".to_owned(),
+                "harvest.redis.key_prefix must not be empty".to_owned(),
             ));
+        }
+        if self.redis.consumer_group.is_empty() {
+            return Err(ConfigError::Validation(
+                "harvest.redis.consumer_group must not be empty".to_owned(),
+            ));
+        }
+        if self.redis.visibility_timeout_ms < REDIS_VISIBILITY_TIMEOUT_FLOOR_MS {
+            return Err(ConfigError::Validation(format!(
+                "harvest.redis.visibility_timeout_ms must be at least \
+                 {REDIS_VISIBILITY_TIMEOUT_FLOOR_MS}"
+            )));
         }
         if self.redis.poll_interval_ms < 1 {
             return Err(ConfigError::Validation(
                 "harvest.redis.poll_interval_ms must be at least 1".to_owned(),
             ));
+        }
+        if self.redis.poll_interval_ms > REDIS_POLL_INTERVAL_CEILING_MS {
+            return Err(ConfigError::Validation(format!(
+                "harvest.redis.poll_interval_ms must be at most {REDIS_POLL_INTERVAL_CEILING_MS}"
+            )));
         }
         if self.redis.reconcile_interval_ms < 1 {
             return Err(ConfigError::Validation(
@@ -617,21 +655,56 @@ fn parse_orphan_startup_action(key: &str, value: &str) -> Result<OrphanStartupAc
     }
 }
 
+/// What redaction returns when the authority cannot be isolated.
+///
+/// A caller prints this instead of a URL that may still hold a password.
+const REDACTED_URL: &str = "<redacted>";
+
 /// Remove the `user:password@` part of a URL authority.
 ///
 /// The scan is bounded to the authority: the first `/`, `?` or `#` after the
 /// scheme ends it. An `@` later in the path or the query is left alone.
+///
+/// The function fails closed and returns [`REDACTED_URL`] when it cannot
+/// isolate the authority (issue #1312). Two inputs reach that path. A string
+/// with no `://` has no authority. The second input is an unencoded `/`
+/// inside the password, as in `redis://user:pa/ss@host:6379`. That `/` moves
+/// the `@` out of the authority. The scan then sees `user:pa`, which is not a
+/// valid host and port. Returning the input unchanged in either case would
+/// print the password.
 fn redact_userinfo(url: &str) -> String {
     let Some(scheme_end) = url.find("://") else {
-        return url.to_owned();
+        return REDACTED_URL.to_owned();
     };
     let authority_start = scheme_end + 3;
-    let authority = &url[authority_start..];
-    let authority_end = authority.find(['/', '?', '#']).unwrap_or(authority.len());
-    let Some(at) = authority[..authority_end].rfind('@') else {
+    let rest = &url[authority_start..];
+    let authority_end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+    if let Some(at) = rest[..authority_end].rfind('@') {
+        return format!("{}{}", &url[..authority_start], &rest[at + 1..]);
+    }
+    if is_bare_host_and_port(&rest[..authority_end]) {
         return url.to_owned();
+    }
+    REDACTED_URL.to_owned()
+}
+
+/// True when `authority` reads as a host with an optional numeric port.
+///
+/// The check is what separates a credential-free URL from one whose password
+/// hides the `@` behind an unencoded `/`. A bracketed IPv6 literal keeps its
+/// brackets, so the port scan starts after the closing bracket.
+fn is_bare_host_and_port(authority: &str) -> bool {
+    let host_end = authority
+        .rfind(']')
+        .map_or(0, |bracket| bracket.saturating_add(1));
+    let (host, port) = match authority[host_end..].split_once(':') {
+        Some((head, port)) => (&authority[..host_end + head.len()], Some(port)),
+        None => (authority, None),
     };
-    format!("{}{}", &url[..authority_start], &authority[at + 1..])
+    if host.is_empty() {
+        return false;
+    }
+    port.is_none_or(|port| !port.is_empty() && port.bytes().all(|byte| byte.is_ascii_digit()))
 }
 
 fn parse_bool(key: &str, value: &str) -> Result<bool, ConfigError> {
@@ -1148,6 +1221,124 @@ key_prefix = "from_toml"
             config.redacted_url().as_deref(),
             Some("redis://cache.internal:6379/0?token=a@b")
         );
+    }
+
+    /// An unencoded `/` inside the password hides the `@` from the authority
+    /// scan, so the authority cannot be isolated. Redaction fails closed
+    /// (issue #1312).
+    #[test]
+    fn redacted_url_fails_closed_when_the_password_holds_a_slash() {
+        let config = HarvestRedisConfig {
+            url: Some("redis://user:pa/ss@host:6379".to_owned()),
+            ..HarvestRedisConfig::default()
+        };
+
+        let redacted = config.redacted_url().expect("a url is set");
+
+        assert!(
+            !redacted.contains("pa/ss"),
+            "the password must not survive redaction, got {redacted}"
+        );
+        assert_eq!(redacted, "<redacted>");
+    }
+
+    /// A password with no user name still leaves the host readable.
+    #[test]
+    fn redacted_url_drops_a_password_without_a_user_name() {
+        let config = HarvestRedisConfig {
+            url: Some("rediss://:pw@host/0?x=1".to_owned()),
+            ..HarvestRedisConfig::default()
+        };
+
+        let redacted = config.redacted_url().expect("a url is set");
+
+        assert_eq!(redacted, "rediss://host/0?x=1");
+        assert!(!redacted.contains("pw"));
+    }
+
+    /// A string with no `://` has no authority to isolate. Redaction fails
+    /// closed rather than echo the whole value.
+    #[test]
+    fn redacted_url_fails_closed_without_a_scheme_separator() {
+        let config = HarvestRedisConfig {
+            url: Some("operator:hunter2@cache.internal:6379".to_owned()),
+            ..HarvestRedisConfig::default()
+        };
+
+        let redacted = config.redacted_url().expect("a url is set");
+
+        assert_eq!(redacted, "<redacted>");
+        assert!(!redacted.contains("hunter2"));
+    }
+
+    /// Every key the channel owns carries the prefix. An empty prefix collides
+    /// with unrelated keys in the same Redis instance.
+    #[test]
+    fn harvest_config_redis_rejects_an_empty_key_prefix() {
+        let env = MockEnv::new().with("AUTUMN_HARVEST_REDIS__KEY_PREFIX", "");
+
+        let error = HarvestRuntimeConfig::load_with_env(&env)
+            .expect_err("an empty key prefix must fail validation");
+
+        assert!(
+            error.to_string().contains("harvest.redis.key_prefix"),
+            "expected a redis key_prefix validation error, got {error}"
+        );
+    }
+
+    /// Redis rejects an empty consumer group name, so the channel must reject
+    /// it at load rather than at the first read.
+    #[test]
+    fn harvest_config_redis_rejects_an_empty_consumer_group() {
+        let env = MockEnv::new().with("AUTUMN_HARVEST_REDIS__CONSUMER_GROUP", "");
+
+        let error = HarvestRuntimeConfig::load_with_env(&env)
+            .expect_err("an empty consumer group must fail validation");
+
+        assert!(
+            error.to_string().contains("harvest.redis.consumer_group"),
+            "expected a redis consumer_group validation error, got {error}"
+        );
+    }
+
+    /// The poll interval is the blocking-read wait of an idle worker. A value
+    /// above the ceiling delays the shutdown check and the reconcile sweep.
+    #[test]
+    fn harvest_config_redis_rejects_a_poll_interval_above_the_ceiling() {
+        let env = MockEnv::new().with("AUTUMN_HARVEST_REDIS__POLL_INTERVAL_MS", "5001");
+
+        let error = HarvestRuntimeConfig::load_with_env(&env)
+            .expect_err("a poll interval above the ceiling must fail validation");
+
+        assert!(
+            error.to_string().contains("harvest.redis.poll_interval_ms"),
+            "expected a redis poll_interval_ms validation error, got {error}"
+        );
+    }
+
+    /// A visibility timeout below the floor lets a peer recover a reference
+    /// that the owning worker still holds.
+    #[test]
+    fn harvest_config_redis_rejects_a_visibility_timeout_below_the_floor() {
+        let env = MockEnv::new().with("AUTUMN_HARVEST_REDIS__VISIBILITY_TIMEOUT_MS", "999");
+
+        let error = HarvestRuntimeConfig::load_with_env(&env)
+            .expect_err("a visibility timeout below the floor must fail validation");
+
+        assert!(
+            error
+                .to_string()
+                .contains("harvest.redis.visibility_timeout_ms"),
+            "expected a redis visibility_timeout_ms validation error, got {error}"
+        );
+    }
+
+    /// The documented defaults sit inside every bound the validator applies.
+    #[test]
+    fn harvest_config_redis_defaults_pass_validation() {
+        let env = MockEnv::new();
+
+        HarvestRuntimeConfig::load_with_env(&env).expect("the redis defaults must validate");
     }
 
     fn unique_temp_dir(label: &str) -> PathBuf {

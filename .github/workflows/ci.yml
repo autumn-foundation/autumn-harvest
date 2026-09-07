@@ -597,6 +597,13 @@ jobs:
       - name: Run plugin connector tests (issue #944)
         if: needs.changes.outputs.code == 'true' && matrix.shard == 2
         run: cargo test -p autumn-harvest-plugin --features connectors --lib connector
+      # Issue #1312. The `redis` feature changes two config paths: it accepts
+      # `[harvest.redis] url` instead of rejecting it, and it compiles the
+      # channel install. `--lib` without the feature covers neither, so the
+      # feature needs its own lib-test leg beside the other per-feature ones.
+      - name: Run plugin lib tests (redis feature, issue #1312)
+        if: needs.changes.outputs.code == 'true' && matrix.shard == 3
+        run: cargo test -p autumn-harvest-plugin --features redis --lib
       # No CI step ran the plugin's doctests, so a broken `///` example landed
       # silently (issue #944 review found exactly that). These are compile-only
       # (`no_run`), so they cost seconds and need no database.
@@ -829,6 +836,13 @@ jobs:
         # which shard `dev_runtime_lifecycle`'s row lands in.
         env:
           HARVEST_DEV_REQUIRE_POSTGRES: "1"
+          # Issue #1312, contract C3. The Redis suites obtain a fixture from
+          # `HARVEST_REDIS_TEST_URL` or from a testcontainers Redis. Either
+          # source can go away without a test failing, because the suites skip
+          # themselves when no fixture is reachable. This flag turns that skip
+          # into a panic, so "the Redis suites stopped testing anything" is a
+          # red build here rather than a silent green.
+          HARVEST_TEST_REQUIRE_REDIS: "1"
           SEMAPHORE_SHARD_COUNT: "10"
           SEMAPHORE_SHARD_INDEX: ${{ matrix.shard }}
         run: bash .github/ci/run-suites.sh run linux
@@ -1186,6 +1200,11 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: Check MSRV compiles
         run: cargo check --workspace
+      # `cargo check --workspace` builds default features only, so the
+      # optional `autumn-harvest-redis` dependency and the channel install in
+      # `runner.rs` never reach the MSRV compiler. Issue #1312.
+      - name: Check MSRV compiles (autumn-harvest-plugin redis feature, issue #1312)
+        run: cargo check -p autumn-harvest-plugin --features redis
 
   # Dependency ledger harness (Ballast). Runs `cargo deny check` against
   # `deny.toml`: advisories (RUSTSEC, joined against the lockfile — every

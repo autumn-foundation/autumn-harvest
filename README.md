@@ -1133,9 +1133,20 @@ url = "redis://cache:6379"
 ```
 
 Leave `url` unset and every worker stays on the Postgres claim path, which
-is the default. When Redis is unreachable the worker falls back to that same
-path, so availability does not depend on Redis. A build without the `redis`
-feature rejects a configured URL at startup rather than ignoring it.
+is the default. A build without the `redis` feature rejects a configured URL
+at config validation rather than ignoring it.
+
+The fallback covers the **running** state. A started process that loses Redis
+returns to the Postgres claim path, so availability with Redis down equals
+availability with Redis absent. It does not cover boot: a configured URL that
+cannot connect **fails startup**, in every mode, with an error naming the
+endpoint. A process that came up without its channel would look healthy and
+publish nothing, so the failure is loud instead.
+
+The connection is plaintext by default, and `redis://` sends the password in
+cleartext. `rediss://` needs the `tls` cargo feature of `autumn-harvest-redis`.
+v1 targets a single Redis instance and a single-shard runtime; Redis Cluster is
+not supported.
 
 See [`docs/operations/redis-dispatch.md`](docs/operations/redis-dispatch.md)
 for the key layout, the crash matrix, the failure modes and the v1 limits.
