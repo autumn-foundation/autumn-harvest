@@ -36,12 +36,24 @@ if [ ! -f "$guide" ]; then
   exit 1
 fi
 
-if ! grep -q "docs/upgrading/${version}.md" README.md; then
-  linked=$(grep -oE 'docs/upgrading/[0-9]+\.[0-9]+\.[0-9]+\.md' README.md | head -1)
+# Scoped to the pointer's own paragraph (the anchor sentence through the
+# next blank line), not the whole file — a correct link mentioned elsewhere
+# in README.md (a historical aside, a release note) must not satisfy this
+# check while the pointer sentence itself stays stale.
+pointer_block=$(awk '/Upgrading an existing deployment\?/{flag=1} flag{print; if (/^$/) exit}' README.md)
+
+if [ -z "$pointer_block" ]; then
+  echo "Could not find the \"Upgrading an existing deployment?\" pointer in" >&2
+  echo "README.md at all." >&2
+  exit 1
+fi
+
+if ! grep -q "docs/upgrading/${version}.md" <<<"$pointer_block"; then
+  linked=$(grep -oE 'docs/upgrading/[0-9]+\.[0-9]+\.[0-9]+\.md' <<<"$pointer_block" | head -1)
   echo "README.md's \"Upgrading an existing deployment?\" pointer does not" >&2
   echo "link to $guide, the guide for the current workspace version" >&2
   echo "($version)." >&2
-  echo "It currently links to: ${linked:-<no docs/upgrading/*.md link found>}" >&2
+  echo "It currently links to: ${linked:-<no docs/upgrading/*.md link found in that paragraph>}" >&2
   echo >&2
   echo "Fix: point README.md's upgrade pointer at $guide." >&2
   exit 1
