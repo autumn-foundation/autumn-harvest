@@ -58,6 +58,19 @@ reconcile_interval_ms = 1000
 | `poll_interval_ms` | `20` | Wait for one blocking read when the channel is idle. |
 | `reconcile_interval_ms` | `1000` | Interval of the reconcile sweep over due `PENDING` rows. |
 
+Configuration validation applies four bounds. `key_prefix` must not be empty,
+because every key the channel owns carries it, and an empty prefix collides
+with unrelated keys in a shared Redis. `consumer_group` must not be empty,
+because Redis rejects an empty group name. `poll_interval_ms` must be between
+1 and 5000, because the worker checks shutdown between blocking reads.
+`visibility_timeout_ms` must be at least 1000, because the timeout has to
+outlast one Postgres claim. `reconcile_interval_ms` must be at least 1.
+
+Queue names must not contain `:`. The colon separates the parts of every key
+the channel builds, so a queue named `a:b` and a queue named `a` sharing a
+suffix could address the same stream. The channel rejects such a name on
+publish and on read.
+
 Each key has an environment override:
 
 ```bash
@@ -73,12 +86,38 @@ An empty `AUTUMN_HARVEST_REDIS__URL` means "off", which matches
 `AUTUMN_HARVEST_DATABASE__URL`.
 
 Setting `url` needs the `redis` cargo feature of `autumn-harvest-plugin`. A
-build without that feature carries no channel implementation, so it **rejects**
-the URL at startup rather than ignoring it. The error names the feature.
+build without that feature carries no channel implementation, so configuration
+validation **rejects** the URL rather than ignoring it. The error names the
+feature.
+
+**A configured URL that cannot connect fails startup, in every mode.** The
+process refuses to boot and names the endpoint. The Postgres fallback below
+covers the *running* state only: it takes over when Redis goes away under a
+started process. It does not cover boot. A process that started without
+reaching its configured Redis would look healthy and publish nothing, so the
+channel fails fast and visibly instead.
 
 At startup a process that enables the channel logs one `INFO` line naming the
 endpoint, the key prefix and the consumer group. The endpoint is logged in
 credential-free form: any `user:password@` part of the URL is removed first.
+Redaction fails closed. When the authority cannot be isolated — a string with
+no `://`, or an unencoded `/` inside the password — the log and the error
+print `<redacted>` in place of the whole URL.
+
+### Transport security
+
+The connection is plaintext by default. A `redis://` URL sends the password
+in cleartext, and every reference travels in the clear. Use `rediss://` on any
+network you do not control.
+
+`rediss://` needs the `tls` cargo feature of `autumn-harvest-redis`. Without
+that feature the crate carries no TLS transport, so `RedisDispatch::connect`
+rejects a `rediss://` URL with an error naming the `tls` feature. Enable it in
+your own manifest:
+
+```toml
+autumn-harvest-redis = { version = "0.6", features = ["tls"] }
+```
 
 ## Key layout
 
@@ -105,6 +144,15 @@ Every worker joins the one consumer group named by `consumer_group`, so each
 reference is delivered to exactly one worker. A worker names itself as the
 consumer, which is what lets a peer recover its references after a crash.
 
+### Sizing
+
+Size Redis from the count of pending rows, not from the workflow history. A
+pending row costs roughly one marker key and one stream entry of about 200
+bytes. Ten thousand pending rows therefore cost single-digit megabytes.
+A reference carries no payload and no workflow state, so the figure does not
+move with activity input size. Markers expire, and an acked entry is trimmed,
+so a drained queue returns to near zero.
+
 ## Why it does not lose or duplicate work
 
 Two mechanisms carry the whole argument.
@@ -129,9 +177,21 @@ one row still race on `FOR UPDATE SKIP LOCKED`, and exactly one wins.
 | After the completion commit | row terminal | no reference | Nothing to do. |
 | After a publish, then Redis restarts | row `PENDING` | reference lost | The reconcile sweep republishes it. |
 
-The second row is the one the acceptance criteria name. The process-kill test
-`crash_between_claim_commit_and_ack_neither_loses_nor_duplicates` asserts it
-against a real Postgres and a real Redis.
+The second row is the one the acceptance criteria name. Two process-kill tests
+in `autumn-harvest-redis/tests/worker_dispatch_e2e.rs` assert it against a real
+Postgres and a real Redis, and they reach the window by two different routes.
+
+`crash_between_claim_commit_and_ack_neither_loses_nor_duplicates` kills the
+child on the **workflow** task. It uses a channel wrapper that aborts the
+process inside `ack`.
+
+`crash_on_the_activity_claim_neither_loses_nor_duplicates` kills the child on
+the **activity** task. It uses the `DISPATCH_AFTER_CLAIM_BEFORE_ACK` chaos
+point, armed to fire on its second hit, which is the activity claim. See
+[`docs/testing/chaos.md`](../testing/chaos.md).
+
+The chaos point covers the activity case only. The workflow case keeps the
+wrapper, so the two cases do not share one failure mode.
 
 ## Failure modes, and what you see
 
@@ -143,14 +203,29 @@ against a real Postgres and a real Redis.
 | A row is `PENDING` but a claim gate holds it | The reference is released with exponential backoff, capped | No error; the row waits for its gate |
 | A reference names a row that is absent | Three short releases, then an ack | No error; this covers a publish that raced its own transaction |
 | `[harvest.redis] url` set on a build without the `redis` feature | Startup fails at config validation | An error naming the `redis` cargo feature |
+| `[harvest.redis] url` set on a runtime with more than one shard pool | Startup fails before the channel is installed | An error naming the shard-pool count and issue #1312 |
+| `rediss://` on a build without the `tls` feature | Startup fails at connect | An error naming the `tls` cargo feature of `autumn-harvest-redis` |
+| `key_prefix` or `consumer_group` empty | Startup fails at config validation | An error naming the empty key |
 
-The fallback is the important one. Availability with Redis down equals
-availability with Redis absent, which is today's Postgres-only behaviour.
+The fallback is the important one, and its scope is exact. It covers the
+**running** state: a started process that loses Redis keeps working on the
+Postgres claim path, so availability with Redis down equals availability with
+Redis absent. It does not cover **boot**: a configured URL that cannot connect
+fails startup instead, in every mode.
 
 ## Limits in v1
 
-- **Single shard only.** A sharded runtime rejects Redis dispatch at
-  validation. The reference carries a shard slot for the follow-up work.
+- **Single shard only.** A reference carries a task id and no connection, so a
+  runtime that owns several shard pools cannot tell which pool holds the named
+  row. Two places enforce the limit. `HarvestRunner::start` rejects a
+  configured URL before it installs the channel, so a process with no worker
+  is covered too. `Worker::new` repeats the check. Neither is config
+  validation, which cannot see the resolved pool. The reference carries a
+  shard slot for the follow-up work.
+- **No Redis Cluster.** v1 targets one Redis instance. The keys carry no hash
+  tags, so a Cluster deployment spreads the streams, the delayed sets and the
+  markers of one queue across slots, and the Lua scripts that touch them
+  together fail. Redis Sentinel and a single primary are the supported shapes.
 - **Priority is best effort.** A stream delivers in publish order. Only the
   reconcile sweep publishes in priority order.
 - **Sticky affinity is best effort.** A non-pinned worker releases the

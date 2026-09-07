@@ -985,7 +985,17 @@ impl HarvestRunner {
         // worker is constructed, and in every mode. An API-only process owns
         // no worker but still publishes references for the fleet, so the
         // install cannot sit inside the `worker_enabled` branch.
-        install_dispatch_channel(config).await?;
+        //
+        // The shard-span check runs BEFORE the install (contract C7). A
+        // multi-shard process must fail startup without a connected channel
+        // behind it. `Worker::new` repeats the check, but only a
+        // worker-enabled process reaches it.
+        reject_multi_shard_dispatch(
+            config.redis.url.is_some(),
+            prepared.storage_pool.iter_shards().count(),
+        )
+        .map_err(AutumnError::service_unavailable_msg)?;
+        let dispatch_guard = DispatchInstallGuard::new(install_dispatch_channel(config).await?);
 
         let worker = if config.worker_enabled {
             let worker = Worker::new(
@@ -1020,6 +1030,7 @@ impl HarvestRunner {
         if let Some(guard) = prepared.audit_export_guard.take() {
             guard.commit();
         }
+        dispatch_guard.commit();
 
         let worker_id = worker
             .as_ref()
@@ -1245,6 +1256,65 @@ fn capture_effective_config(
     )
 }
 
+/// Reject Redis dispatch on a runtime that spans more than one shard.
+///
+/// Issue #1312 contract C7. A reference carries a task id and no connection.
+/// A runtime that owns several shard pools cannot tell which pool holds the
+/// named row. A reference read for one shard would then be claimed against
+/// another shard's database, and it would always miss. `Worker::new` applies
+/// the same rule. A worker-disabled process never builds a worker, and it
+/// would still publish. This check therefore runs in the runner, before the
+/// install.
+///
+/// # Errors
+///
+/// Returns the operator-facing message when a URL is configured and
+/// `shard_count` is above one.
+fn reject_multi_shard_dispatch(redis_url_set: bool, shard_count: usize) -> Result<(), String> {
+    if redis_url_set && shard_count > 1 {
+        return Err(format!(
+            "harvest.redis.url is set and this runtime resolves {shard_count} shard pools; \
+             redis dispatch supports single-shard runtimes only in v1 (issue #1312). Unset \
+             harvest.redis.url, or run one process per shard"
+        ));
+    }
+    Ok(())
+}
+
+/// Uninstall the process-global dispatch channel when startup fails later.
+///
+/// `start` installs the channel before it builds the worker, because an
+/// API-only process publishes too. A step after the install can still fail.
+/// The runtime is then dropped, but the channel is process-global and would
+/// stay installed for the next runtime in this process. The guard removes it
+/// unless [`DispatchInstallGuard::commit`] runs, which mirrors how
+/// `DeferredAuditExportInstall` guards the audit sink.
+struct DispatchInstallGuard {
+    /// True while the guard owns an install that startup has not confirmed.
+    armed: bool,
+}
+
+impl DispatchInstallGuard {
+    /// A guard over an install that happened, or an inert guard when it did
+    /// not.
+    const fn new(installed: bool) -> Self {
+        Self { armed: installed }
+    }
+
+    /// Keep the channel installed. Startup has passed every fallible step.
+    fn commit(mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for DispatchInstallGuard {
+    fn drop(&mut self) {
+        if self.armed {
+            autumn_harvest::dispatch::uninstall();
+        }
+    }
+}
+
 /// Lifetime of a publish marker key, which makes a publish idempotent per
 /// task id. The plan fixes it at ten minutes.
 #[cfg(feature = "redis")]
@@ -1256,16 +1326,22 @@ const DISPATCH_DEDUPE_TTL: std::time::Duration = std::time::Duration::from_secs(
 /// claimable `harvest_task_queue` rows. With no URL the runtime keeps the
 /// Postgres claim path and this is a no-op.
 ///
+/// Returns `true` when a channel is installed, so the caller can uninstall it
+/// if a later startup step fails.
+///
 /// # Errors
 ///
-/// Returns an error when the Redis endpoint cannot be reached. The message
-/// names the endpoint in credential-free form.
+/// Returns an error when the Redis endpoint cannot be reached. A configured
+/// URL that cannot connect fails startup in every mode, so an unreachable
+/// Redis is visible at boot rather than after the first read. The Postgres
+/// fallback covers the running state only. The message names the endpoint in
+/// credential-free form.
 #[cfg(feature = "redis")]
-async fn install_dispatch_channel(config: &HarvestRuntimeConfig) -> autumn_web::AutumnResult<()> {
+async fn install_dispatch_channel(config: &HarvestRuntimeConfig) -> autumn_web::AutumnResult<bool> {
     use std::time::Duration;
 
     let Some(url) = config.redis.url.as_deref() else {
-        return Ok(());
+        return Ok(false);
     };
     let endpoint = config
         .redis
@@ -1306,21 +1382,24 @@ async fn install_dispatch_channel(config: &HarvestRuntimeConfig) -> autumn_web::
         "redis dispatch enabled: workers read task references from redis and claim the named \
          row in postgres"
     );
-    Ok(())
+    Ok(true)
 }
 
 /// No dispatch channel exists without the `redis` cargo feature.
 ///
 /// Configuration validation rejects `[harvest.redis] url` on such a build, so
-/// this path can only be reached with Redis dispatch off.
+/// this path can only be reached with Redis dispatch off. The result is
+/// always `false`, because nothing is installed.
 ///
 /// # Errors
 ///
 /// Never returns an error.
 #[cfg(not(feature = "redis"))]
 #[allow(clippy::unused_async)]
-async fn install_dispatch_channel(_config: &HarvestRuntimeConfig) -> autumn_web::AutumnResult<()> {
-    Ok(())
+async fn install_dispatch_channel(
+    _config: &HarvestRuntimeConfig,
+) -> autumn_web::AutumnResult<bool> {
+    Ok(false)
 }
 
 /// The writable shards `assignments` does **not** cover, ascending (issue #961).

@@ -449,13 +449,13 @@ async fn wait_for_completed(url: &str, wf_name: &str, min_count: i64) -> Vec<Uui
 }
 
 async fn tick(pool: &DbPool, registry: &Arc<HandlerRegistry>) {
-    tick_once(
+    Box::pin(tick_once(
         pool.clone(),
         registry.clone(),
         Arc::new(DagCatalog::default()),
         Arc::new(vec![]),
         SchedulerMonitor::offline(),
-    )
+    ))
     .await
     .expect("tick_once must succeed");
 }
@@ -478,7 +478,7 @@ async fn patch_preserves_identity_and_carryover_across_the_edit() {
 
     // ── Run 1 under the pre-edit spec ────────────────────────────────────────
     arm_slot(&url, id, 300).await;
-    tick(&pool, &registry).await;
+    Box::pin(tick(&pool, &registry)).await;
 
     let worker = make_worker(registry.clone());
     let pool_clone = pool.clone();
@@ -551,7 +551,7 @@ async fn patch_preserves_identity_and_carryover_across_the_edit() {
     // ── Run 2 under the post-edit spec ───────────────────────────────────────
     let t_before_tick2 = Utc::now();
     arm_slot(&url, id, 200).await;
-    tick(&pool, &registry).await;
+    Box::pin(tick(&pool, &registry)).await;
     let completed_ids = wait_for_completed(&url, wf_name, 2).await;
     let run2_id = *completed_ids.iter().find(|r| **r != run1_ids[0]).unwrap();
 

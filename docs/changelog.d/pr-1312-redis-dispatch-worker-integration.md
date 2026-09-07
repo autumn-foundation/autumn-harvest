@@ -42,7 +42,12 @@ are recorded with their rejection reasons in
   short releases before an ack, which covers a publish that raced its own
   transaction; `RUNNING`, terminal and still-absent rows are acked.
 - **A publish is idempotent per task id**, through a marker key with a
-  ten-minute TTL. An earlier due time moves a parked delayed reference forward.
+  ten-minute TTL. The rule is keyed on `scheduled_at`: a hint carrying the same
+  `scheduled_at` as the held reference refreshes the marker and changes
+  nothing, and a hint carrying a different `scheduled_at` moves the reference
+  to the new due time and resets its redelivery count. A reconcile republish
+  therefore never disturbs a backed-off reference, while a wake or a retry
+  does move it.
 
 **Operator surface.** New `[harvest.redis]` config section with `url`,
 `key_prefix` (default `harvest`), `consumer_group` (default `harvest_workers`),
@@ -55,9 +60,15 @@ feature on `autumn-harvest-plugin` carrying the optional
 `autumn-harvest-redis` dependency; a build without the feature **rejects** a
 configured URL at validation rather than ignoring it. `HarvestRunner::start`
 installs the channel before the worker is constructed and in every mode, so an
-API-only process publishes too. A connect failure fails startup with an error
-naming the endpoint; the endpoint is credential-free in both the error and the
-one startup `INFO` line, via `HarvestRedisConfig::redacted_url`.
+API-only process publishes too; it rejects a configured URL first when the
+runtime resolves more than one shard pool, and it uninstalls the channel again
+if a later startup step fails. A connect failure fails startup with an error
+naming the endpoint, in every mode: the Postgres fallback covers the running
+state, not boot. The endpoint is credential-free in both the error and the
+one startup `INFO` line, via `HarvestRedisConfig::redacted_url`, which fails
+closed and prints `<redacted>` when it cannot isolate the authority. TLS needs
+the `tls` cargo feature of `autumn-harvest-redis` and is off by default, so a
+plain `redis://` URL sends the password in cleartext.
 
 **Invariant notes.** No new `WorkflowEvent` variant. No migration. No new
 table. No change to the `harvest_events` append-only invariant or to its two
@@ -67,27 +78,39 @@ a durability store, which is stated in the `dispatch.rs` module doc and proven
 by the reconcile sweep above.
 
 **v1 limits, stated rather than discovered later.** Single-shard runtimes only;
-a sharded runtime rejects Redis dispatch at validation, and the reference
-carries a shard slot for the follow-up. Priority order and sticky affinity
+`HarvestRunner::start` rejects a configured URL before the install when the
+runtime resolves more than one shard pool, `Worker::new` repeats the check, and
+the reference carries a shard slot for the follow-up. One Redis instance only:
+the keys carry no Cluster hash tags, so a Cluster deployment would spread one
+queue's keys across slots. Priority order and sticky affinity
 degrade to best effort, because a stream delivers in publish order and only the
 reconcile sweep publishes in priority order.
 
 **Test evidence.** Core unit tests for hint buffering and release backoff, plus
-DB tests against `dispatch::MemoryDispatch` (feature `testing`). Redis tests
-for dedupe, reschedule, batch read, release and pending-entry recovery. The
-end-to-end suite runs a real workflow through the channel against a live
-Postgres and a live Redis (`workflow_completes_through_the_channel`), and the
-process-kill test
-`crash_between_claim_commit_and_ack_neither_loses_nor_duplicates` aborts a child
-worker at the new `DISPATCH_AFTER_CLAIM_BEFORE_ACK` chaos point — after the
-claim transaction commits and before the ack — then asserts exactly one
-execution and a clean stream from the parent. Plugin unit tests cover the
-config section: defaults, TOML parse, the six environment overrides, interval
-and timeout validation, the missing-feature rejection, and credential-free URL
+DB tests against `dispatch::MemoryDispatch` (feature `testing`), where
+`workflow_completes_through_the_channel` drives a real workflow over the
+in-memory channel. Redis tests for dedupe, reschedule, batch read, release and
+pending-entry recovery. The end-to-end suite in `autumn-harvest-redis` runs a
+real workflow through a live Redis against a live Postgres
+(`workflow_completes_via_redis_dispatch`), and two process-kill tests cover the
+claim/ack window from both sides.
+`crash_between_claim_commit_and_ack_neither_loses_nor_duplicates` kills the
+child on the **workflow** task through a channel wrapper that aborts inside
+`ack`. `crash_on_the_activity_claim_neither_loses_nor_duplicates` kills it on
+the **activity** task through the new `DISPATCH_AFTER_CLAIM_BEFORE_ACK` chaos
+point, armed on its second hit. Both windows sit after the claim transaction
+commits and before the ack, and both assert exactly one execution and a clean
+stream from the parent. Plugin unit tests cover the config section: defaults,
+TOML parse, the six environment overrides, interval and timeout bounds, the
+non-empty prefix and consumer group, the missing-feature rejection, the
+multi-shard rejection, the dispatch install guard, and fail-closed URL
 redaction. CI gains per-crate clippy for `autumn-harvest-redis`, a plugin
 clippy step for the `redis` feature, `cargo test -p autumn-harvest-redis --lib`
-on the no-database leg, and three manifest rows that run the Redis suites on
-the Docker-backed Linux job.
+and `cargo test -p autumn-harvest-plugin --features redis --lib` on the
+no-database leg, an MSRV check of the plugin's `redis` feature,
+`HARVEST_TEST_REQUIRE_REDIS=1` on the Docker-backed Linux job so a missing
+Redis fixture fails instead of skipping, and three manifest rows that run the
+Redis suites on that job.
 
 **Throughput.** Assay #1 measured the standalone adapter at 12,004 claims/sec
 draining a 1,000-entry backlog with 8 claim-only workers, against 640/sec and
@@ -99,8 +122,9 @@ control in the same run.
 
 **Documentation.** New operator guide
 [`docs/operations/redis-dispatch.md`](../operations/redis-dispatch.md) (what it
-is, when to use it, configuration, key layout, consumer group, the crash
-matrix, failure modes, limits, how to turn it off).
+is, when to use it, configuration and its bounds, transport security, key
+layout, consumer group, sizing, the crash matrix and its two kill routes,
+failure modes, limits, how to turn it off).
 `docs/autumn-workflow-architecture.md` §9.1 now describes the wired channel and
 its limits instead of the "not yet wired" note, §14 documents the config
 section and the six environment variables, and the executive summary, the

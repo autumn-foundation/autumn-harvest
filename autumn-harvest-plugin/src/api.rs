@@ -25335,13 +25335,17 @@ pub(crate) async fn trigger_dag_run(
     headers: axum::http::HeaderMap,
     Json(request): Json<DagTriggerRequest>,
 ) -> Result<(axum::http::StatusCode, Json<StartWorkflowResponse>), AutumnError> {
-    trigger_dag_run_inner(
+    // `Box::pin`: the inner future crosses the `clippy::large_futures`
+    // threshold, because the start path it awaits carries the dispatch
+    // buffering scope (issue #1312). A handler future of that size is moved
+    // by the router on every request.
+    Box::pin(trigger_dag_run_inner(
         &api_state,
         dag_name,
         &headers,
         request,
         "POST /dags/{dag_name}/trigger",
-    )
+    ))
     .await
 }
 
@@ -29286,13 +29290,14 @@ async fn schedule_backfill(
     headers: axum::http::HeaderMap,
     Json(request): Json<ScheduleBackfillRequest>,
 ) -> Result<Json<ScheduleBackfillResponse>, AutumnError> {
-    schedule_backfill_inner(
+    // `Box::pin` for the same reason as `trigger_dag_run` above.
+    Box::pin(schedule_backfill_inner(
         &api_state,
         &id,
         &headers,
         request,
         "POST /admin/schedules/{id}/backfill",
-    )
+    ))
     .await
     .map(Json)
 }
