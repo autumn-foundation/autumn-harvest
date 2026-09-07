@@ -3440,7 +3440,7 @@ fn render_dlq_summary_group_by_form(
     html! {
         form.filters method="get" action="dead-letters" {
             input type="hidden" name="view" value="summary";
-            (render_dead_letter_hidden_filters(filters, filter_raw))
+            (render_dead_letter_hidden_filters_raw(filters, filter_raw))
             @if limit != DEFAULT_DLQ_PAGE_SIZE {
                 input type="hidden" name="limit" value=(limit);
             }
@@ -3701,7 +3701,7 @@ fn render_dead_letter_bulk_actions(
     html! {
         div."bulk-actions" {
             form method="post" action="../dead-letters/replay" onsubmit={ "return confirm('" (replay_confirm) "')" } {
-                (render_dead_letter_hidden_filters(filters, filter_raw))
+                (render_dead_letter_hidden_filters(filters))
                 input type="hidden" name="limit" value=(action_limit);
                 input type="hidden" name="return_to" value=(return_to);
                 button type="submit" disabled[total_matching == 0 || filters.is_empty()] {
@@ -3709,7 +3709,7 @@ fn render_dead_letter_bulk_actions(
                 }
             }
             form method="post" action="../dead-letters/discard" onsubmit={ "return confirm('" (discard_confirm) "')" } {
-                (render_dead_letter_hidden_filters(filters, filter_raw))
+                (render_dead_letter_hidden_filters(filters))
                 input type="hidden" name="limit" value=(action_limit);
                 input type="hidden" name="return_to" value=(return_to);
                 button.danger type="submit" disabled[total_matching == 0 || filters.is_empty()] {
@@ -3857,7 +3857,17 @@ fn render_dead_letter_detail(row: &DeadLetterUiRow) -> Markup {
     }
 }
 
-fn render_dead_letter_hidden_filters(
+/// Hidden filter fields for the DLQ page's GET forms — the group-by
+/// resubmit form, which routes back through `list_dead_letters_ui` and so
+/// handles an invalid value gracefully like every other GET on this page.
+/// Carries the raw text, not the parsed value. This lets an invalid value's
+/// inline error survive resubmission, instead of being silently dropped.
+/// Same reasoning as the Workers page's `build_worker_query_string` (Codex
+/// review, #1378 P2).
+///
+/// Do NOT use this for the bulk-action POST forms — see
+/// [`render_dead_letter_hidden_filters`], which those forms need instead.
+fn render_dead_letter_hidden_filters_raw(
     filters: &DeadLetterUiFilters,
     filter_raw: &DeadLetterUiFilterRaw,
 ) -> Markup {
@@ -3865,10 +3875,6 @@ fn render_dead_letter_hidden_filters(
         @if let Some(workflow_name) = filters.workflow_name.as_deref() {
             input type="hidden" name="workflow_name" value=(workflow_name);
         }
-        // Carries the raw text, not the parsed value. This lets an invalid
-        // value's inline error survive into the bulk-action forms, instead
-        // of being silently dropped. Same reasoning as the Workers page's
-        // `build_worker_query_string` (Codex review, #1378 P2).
         @if !filter_raw.task_kind.is_empty() {
             input type="hidden" name="task_kind" value=(filter_raw.task_kind);
         }
@@ -3877,6 +3883,40 @@ fn render_dead_letter_hidden_filters(
         }
         @if !filter_raw.failed_before.is_empty() {
             input type="hidden" name="failed_before" value=(filter_raw.failed_before);
+        }
+        @if let Some(shard_id) = filters.shard_id {
+            input type="hidden" name="shard_id" value=(shard_id);
+        }
+    }
+}
+
+/// Hidden filter fields for the DLQ page's bulk-action POST forms
+/// (`../dead-letters/replay`, `../dead-letters/discard`). Carries only the
+/// successfully parsed values, never raw text.
+///
+/// `parse_bulk_dlq_form` (autumn-harvest-plugin/src/api.rs) re-validates
+/// `task_kind`/`failed_after`/`failed_before` strictly and 400s on a bad
+/// value. Submitting an invalid raw value here — as
+/// [`render_dead_letter_hidden_filters_raw`] does for the GET group-by form —
+/// would reintroduce the exact bug this PR fixes, one layer down: the bulk
+/// action would abort instead of running, or redisplaying the inline error
+/// (Codex review, #1420). An invalid field is "filter not applied" on this
+/// page, so it is simply omitted here; the operator's raw text and the error
+/// still redisplay from `return_to`, which is built from the raw query
+/// string.
+fn render_dead_letter_hidden_filters(filters: &DeadLetterUiFilters) -> Markup {
+    html! {
+        @if let Some(workflow_name) = filters.workflow_name.as_deref() {
+            input type="hidden" name="workflow_name" value=(workflow_name);
+        }
+        @if let Some(task_kind) = filters.task_kind.map(DeadLetterTaskKind::as_label) {
+            input type="hidden" name="task_kind" value=(task_kind);
+        }
+        @if let Some(failed_after) = filters.failed_after.map(|ts| ts.to_rfc3339()) {
+            input type="hidden" name="failed_after" value=(failed_after);
+        }
+        @if let Some(failed_before) = filters.failed_before.map(|ts| ts.to_rfc3339()) {
+            input type="hidden" name="failed_before" value=(failed_before);
         }
         @if let Some(shard_id) = filters.shard_id {
             input type="hidden" name="shard_id" value=(shard_id);
@@ -11499,6 +11539,51 @@ mod tests {
         assert!(html.contains("Discard all matching (250)"));
         assert!(html.contains("Replay 250 matching dead-letter entries?"));
         assert!(html.contains("Discard 250 matching dead-letter entries?"));
+    }
+
+    /// Codex review on #1420: `parse_bulk_dlq_form` (autumn-harvest-plugin/
+    /// src/api.rs) re-validates `task_kind`/`failed_after`/`failed_before`
+    /// strictly and 400s on a bad value. The bulk-action forms must never
+    /// submit an invalid raw value as a hidden field, or replay/discard
+    /// aborts instead of running — the exact bug this PR fixes, one layer
+    /// down. An invalid field is "filter not applied" here, so it must be
+    /// omitted, not echoed with its raw (unparseable) text.
+    #[test]
+    fn dead_letter_bulk_actions_omit_invalid_filter_instead_of_submitting_raw_value() {
+        let filters = DeadLetterUiFilters {
+            workflow_name: Some("invoice_workflow".to_string()),
+            ..DeadLetterUiFilters::default()
+        };
+        let filter_raw = DeadLetterUiFilterRaw {
+            task_kind: "zombie".to_string(),
+            task_kind_error: Some("bad task_kind".to_string()),
+            failed_after: "not-a-date".to_string(),
+            failed_after_error: Some("bad failed_after".to_string()),
+            failed_before: String::new(),
+            failed_before_error: None,
+        };
+        let html =
+            render_dead_letter_bulk_actions(&filters, &filter_raw, DEFAULT_DLQ_PAGE_SIZE, None, 5)
+                .into_string();
+        assert!(
+            !html.contains("name=\"task_kind\""),
+            "the invalid task_kind must never be submitted as a bulk-action selector: {html}"
+        );
+        assert!(
+            !html.contains("name=\"failed_after\""),
+            "the invalid failed_after must never be submitted as a bulk-action selector: {html}"
+        );
+        assert!(
+            html.contains("value=\"invoice_workflow\""),
+            "the valid workflow_name filter must still be carried: {html}"
+        );
+        // The raw invalid text may still appear in `return_to` — that's a
+        // GET redirect target, not a bulk selector field, and carrying it
+        // is how the inline error redisplays after the action completes.
+        assert!(
+            html.contains("return_to") && html.contains("zombie"),
+            "the raw value is expected to survive in return_to, just not as a selector field: {html}"
+        );
     }
 
     #[test]
