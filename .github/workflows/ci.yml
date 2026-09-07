@@ -190,8 +190,15 @@ jobs:
       # Issue #1312: the Redis dispatch channel. Same issue #962 rule as the
       # verify crate below -- a workspace member gets NO clippy coverage
       # without its own step here.
+      #
+      # `--no-deps` scopes the deny to this crate. `autumn-harvest-redis`
+      # depends on `autumn-harvest` with `default-features = false`, and the
+      # core crate carries pre-existing lint warnings in that configuration
+      # (dead code behind the `db` feature, and pedantic suggestions). Without
+      # `--no-deps` this step would deny those, so it would report the core
+      # crate's no-default-features debt as a redis-crate failure.
       - name: Clippy autumn-harvest-redis
-        run: cargo clippy -p autumn-harvest-redis --all-targets -- -D warnings
+        run: cargo clippy -p autumn-harvest-redis --all-targets --no-deps -- -D warnings
       # Issue #962: a new workspace member gets NO clippy coverage unless a step
       # is added here — there is no `--workspace` clippy invocation in this job,
       # only per-crate ones. The verify crate opts into the workspace's pedantic
