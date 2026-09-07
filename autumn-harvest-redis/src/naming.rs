@@ -35,6 +35,45 @@ pub fn dlq_key(prefix: &str, queue_name: &str) -> String {
     format!("{prefix}:dlq:{queue_name}")
 }
 
+/// Per-queue Redis Stream that holds dispatch references (issue #1312).
+///
+/// The dispatch channel is a separate key family from the standalone queue
+/// above. A dispatch entry holds only a reference to a `harvest_task_queue`
+/// row, never the task payload.
+#[must_use]
+pub fn dispatch_stream_key(prefix: &str, queue_name: &str) -> String {
+    format!("{prefix}:dispatch:{queue_name}")
+}
+
+/// Per-queue sorted set of dispatch references that are not yet due.
+///
+/// The score is the due time in unix milliseconds. A promoter moves due
+/// members onto [`dispatch_stream_key`].
+#[must_use]
+pub fn dispatch_delayed_key(prefix: &str, queue_name: &str) -> String {
+    format!("{prefix}:dispatch:{queue_name}:delayed")
+}
+
+/// Per-queue hash that holds the payload of each delayed dispatch reference.
+///
+/// The sorted set orders by score alone, so the payload lives beside it,
+/// keyed by `task_id`.
+#[must_use]
+pub fn dispatch_payloads_key(prefix: &str, queue_name: &str) -> String {
+    format!("{prefix}:dispatch:{queue_name}:delayed:payloads")
+}
+
+/// Dedupe marker for one task id.
+///
+/// The marker makes a publish idempotent per task id. It expires after the
+/// configured dedupe TTL, so a leaked marker cannot block a republish for
+/// ever. The key is global to the prefix because a task id identifies a row
+/// on exactly one queue.
+#[must_use]
+pub fn dispatch_marker_key(prefix: &str, task_id: &str) -> String {
+    format!("{prefix}:dispatch:marker:{task_id}")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -56,5 +95,39 @@ mod tests {
     #[test]
     fn keys_respect_custom_prefix() {
         assert_eq!(stream_key("acme", "billing"), "acme:queue:billing");
+    }
+
+    #[test]
+    fn dispatch_keys_are_stable() {
+        assert_eq!(
+            dispatch_stream_key("harvest", "email"),
+            "harvest:dispatch:email"
+        );
+        assert_eq!(
+            dispatch_delayed_key("harvest", "email"),
+            "harvest:dispatch:email:delayed"
+        );
+        assert_eq!(
+            dispatch_payloads_key("harvest", "email"),
+            "harvest:dispatch:email:delayed:payloads"
+        );
+        assert_eq!(
+            dispatch_marker_key("harvest", "abc"),
+            "harvest:dispatch:marker:abc"
+        );
+    }
+
+    #[test]
+    fn dispatch_keys_never_collide_with_queue_keys() {
+        // The standalone queue owns `:queue:` and `:scheduled:`. The dispatch
+        // channel owns `:dispatch:`. One Redis can hold both under one prefix.
+        assert_ne!(
+            dispatch_stream_key("harvest", "email"),
+            stream_key("harvest", "email")
+        );
+        assert_ne!(
+            dispatch_delayed_key("harvest", "email"),
+            scheduled_zset_key("harvest", "email")
+        );
     }
 }

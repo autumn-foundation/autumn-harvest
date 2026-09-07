@@ -52,28 +52,56 @@
 //! # }
 //! ```
 //!
-//! ## Worker integration status
+//! ## Worker integration
 //!
-//! `autumn-harvest`'s worker currently calls Postgres queue functions directly
-//! and interleaves them with event-store writes inside a single Diesel
-//! transaction. Threading this crate through the existing `worker.rs` requires
-//! splitting those transactional boundaries -- in particular, the worker's
-//! "append events + update queue row" pattern becomes "append events, commit,
-//! then ack the Redis stream" with idempotency on replay. That refactor is a
-//! follow-up step and is intentionally not part of this crate's first
-//! delivery; this crate ships the adapter and its tests so the integration
-//! work can build on a stable foundation.
+//! [`RedisDispatch`] wires this crate into the `autumn-harvest` worker as a
+//! **dispatch channel** (issue #1312). It implements
+//! `autumn_harvest::dispatch::TaskDispatch`.
+//!
+//! Postgres keeps every `harvest_task_queue` row and stays the source of
+//! truth. A stream entry carries a reference only: the task id, the queue and
+//! the due time. A worker reads a reference, claims the named row in Postgres
+//! with the full claim predicate, and then acks the reference. Workflow state
+//! and event history stay in the Postgres transactions that exist today, so
+//! no transactional boundary moves.
+//!
+//! The channel is a latency and throughput optimization, never a durability
+//! store. The worker's reconcile sweep republishes due `PENDING` rows, so a
+//! lost entry, a dropped hint or a Redis restart all converge. If Redis is
+//! unreachable the worker falls back to the Postgres claim path.
+//!
+//! ### Limits in v1
+//!
+//! - **Single shard only.** A hint carries a shard slot, but a sharded
+//!   runtime rejects Redis dispatch at validation.
+//! - **Priority is best effort.** One stream per queue delivers in arrival
+//!   order. The reconcile sweep publishes in priority order, which is the
+//!   only priority signal the channel carries.
+//! - **Sticky affinity is best effort.** Any worker in the consumer group may
+//!   read any reference. The Postgres claim predicate still enforces the
+//!   affinity gate, and a rejected reference is released with backoff.
+//!
+//! ### Standalone adapter
+//!
+//! [`RedisTaskQueue`] and [`TaskQueueAdapter`] are unchanged and stay
+//! supported for callers that use this crate as a task queue on its own. The
+//! two key families do not overlap.
 
 #![cfg_attr(not(feature = "test-utils"), allow(rustdoc::private_intra_doc_links))]
 
 mod adapter;
+mod dispatch;
 mod envelope;
 mod error;
 mod naming;
 mod redis_queue;
 
 pub use adapter::{ClaimedTask, TaskQueueAdapter};
+pub use dispatch::{RedisDispatch, RedisDispatchConfig};
 pub use envelope::{EnqueueParams, TaskEnvelope, TaskType};
 pub use error::{RedisAdapterError, RedisAdapterResult};
-pub use naming::{dlq_key, scheduled_payloads_key, scheduled_zset_key, stream_key};
+pub use naming::{
+    dispatch_delayed_key, dispatch_marker_key, dispatch_payloads_key, dispatch_stream_key, dlq_key,
+    scheduled_payloads_key, scheduled_zset_key, stream_key,
+};
 pub use redis_queue::{RedisTaskQueue, RedisTaskQueueConfig};
