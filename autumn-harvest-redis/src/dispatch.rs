@@ -1154,6 +1154,39 @@ mod tests {
         assert_eq!(decoded.shard, Some(2));
     }
 
+    /// Finding F7 (issue #1312 review round 1). The payload carries the pool
+    /// the reference needs, so a worker weighs it before it claims.
+    #[test]
+    fn a_payload_carries_the_reference_kind() {
+        let hint = DispatchHint {
+            task_id: Uuid::new_v4(),
+            queue_name: "email".to_string(),
+            scheduled_at: Utc::now(),
+            priority: 0,
+            shard: None,
+            kind: Some(DispatchKind::Activity),
+        };
+        let payload = serde_json::to_string(&DispatchRef::from_hint(&hint)).unwrap();
+        let decoded: DispatchRef = serde_json::from_str(&payload).unwrap();
+        assert_eq!(decoded.kind, Some(DispatchKind::Activity));
+        assert_eq!(
+            decoded.into_lease("1-0".to_string()).kind,
+            Some(DispatchKind::Activity),
+            "the lease must name the pool the reference needs"
+        );
+    }
+
+    /// An entry written before the kind existed still parses.
+    #[test]
+    fn a_payload_without_a_kind_is_untyped() {
+        let payload = format!(
+            r#"{{"task_id":"{}","queue_name":"q","scheduled_at":"2026-09-07T12:00:00Z"}}"#,
+            Uuid::nil()
+        );
+        let decoded: DispatchRef = serde_json::from_str(&payload).expect("an old payload parses");
+        assert_eq!(decoded.kind, None, "an old entry carries no kind");
+    }
+
     #[test]
     fn a_payload_stores_the_due_time_as_rfc_3339() {
         let hint = DispatchHint {

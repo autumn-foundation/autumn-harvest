@@ -772,3 +772,135 @@ async fn the_recovery_pass_discards_a_malformed_entry() {
         "the discarded entry must leave the stream"
     );
 }
+
+/// A reference keeps the pool it needs across the stream (issue #1312 review
+/// round 1, finding F7).
+#[tokio::test(flavor = "multi_thread")]
+async fn a_lease_carries_the_kind_of_its_hint() {
+    let Some(fixture) = try_start(Duration::from_secs(60)).await else {
+        return;
+    };
+    let queues = vec!["typed".to_string()];
+    let task_id = Uuid::new_v4();
+
+    let mut typed = hint("typed", task_id, Utc::now());
+    typed.kind = Some(autumn_harvest::dispatch::DispatchKind::Activity);
+    fixture.dispatch.publish(&[typed]).await.expect("publish");
+
+    let leases = read(&fixture, &queues, 10).await;
+    assert_eq!(leases.len(), 1);
+    assert_eq!(
+        leases[0].kind,
+        Some(autumn_harvest::dispatch::DispatchKind::Activity),
+        "the lease must name the pool the reference needs"
+    );
+}
+
+/// The marker must not outlive the reference it stands for (issue #1312
+/// review round 1, finding F8).
+///
+/// A key eviction, an external `XTRIM` or an operator deleting the stream can
+/// take the entry and leave the marker. Every republish then refreshed the
+/// marker TTL, so the marker lived for good and the row stayed `PENDING` for
+/// good.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_republish_restores_a_stream_entry_that_vanished() {
+    let Some(fixture) = try_start(Duration::from_secs(60)).await else {
+        return;
+    };
+    let queues = vec!["vanished".to_string()];
+    let task_id = Uuid::new_v4();
+    let due = Utc::now();
+
+    fixture
+        .dispatch
+        .publish(&[hint("vanished", task_id, due)])
+        .await
+        .expect("publish");
+    assert_eq!(fixture.stream_len("vanished").await, 1);
+
+    // The entry goes; the marker stays.
+    let mut conn = fixture.raw.clone();
+    let ids: Vec<String> = redis::cmd("XRANGE")
+        .arg(fixture.stream_key("vanished"))
+        .arg("-")
+        .arg("+")
+        .query_async::<Vec<(String, Vec<String>)>>(&mut conn)
+        .await
+        .expect("xrange")
+        .into_iter()
+        .map(|(id, _)| id)
+        .collect();
+    let _: i64 = redis::cmd("XDEL")
+        .arg(fixture.stream_key("vanished"))
+        .arg(&ids[0])
+        .query_async(&mut conn)
+        .await
+        .expect("xdel");
+    assert_eq!(fixture.stream_len("vanished").await, 0);
+    assert!(
+        fixture.marker_exists(task_id).await,
+        "the case needs the marker to outlive the entry"
+    );
+
+    // The reconcile sweep republishes the same hint.
+    fixture
+        .dispatch
+        .publish(&[hint("vanished", task_id, due)])
+        .await
+        .expect("republish");
+
+    let leases = read(&fixture, &queues, 10).await;
+    assert_eq!(
+        leases.len(),
+        1,
+        "a republish must restore a reference the marker can no longer account for"
+    );
+    assert_eq!(leases[0].task_id, task_id);
+}
+
+/// The same rule for a parked reference (issue #1312 review round 1, F8).
+#[tokio::test(flavor = "multi_thread")]
+async fn a_republish_restores_a_parked_reference_that_vanished() {
+    let Some(fixture) = try_start(Duration::from_secs(60)).await else {
+        return;
+    };
+    let queues = vec!["parked".to_string()];
+    let task_id = Uuid::new_v4();
+    let due = Utc::now() + chrono::Duration::milliseconds(400);
+
+    fixture
+        .dispatch
+        .publish(&[hint("parked", task_id, due)])
+        .await
+        .expect("publish");
+
+    // The parked reference goes; the marker stays.
+    let mut conn = fixture.raw.clone();
+    let _: i64 = redis::cmd("ZREM")
+        .arg(format!("{}:dispatch:parked:delayed", fixture.prefix))
+        .arg(task_id.to_string())
+        .query_async(&mut conn)
+        .await
+        .expect("zrem");
+    assert!(
+        fixture.marker_exists(task_id).await,
+        "the case needs the marker to outlive the parked reference"
+    );
+
+    fixture
+        .dispatch
+        .publish(&[hint("parked", task_id, due)])
+        .await
+        .expect("republish");
+
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    fixture.dispatch.maintain(&queues).await.expect("maintain");
+    let leases = read(&fixture, &queues, 10).await;
+    assert_eq!(
+        leases.len(),
+        1,
+        "a republish must restore a parked reference the marker can no longer account for"
+    );
+    assert_eq!(leases[0].task_id, task_id);
+}

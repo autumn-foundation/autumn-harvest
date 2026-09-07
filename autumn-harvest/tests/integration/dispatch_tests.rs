@@ -162,6 +162,16 @@ fn retrying_activity_workflow(ctx: &WorkflowContext, input: serde_json::Value) -
     })
 }
 
+/// A workflow that holds its workflow permit for a while.
+///
+/// The hold makes a second concurrent workflow row observable in the table.
+fn slow_workflow(_ctx: &WorkflowContext, input: serde_json::Value) -> BoxFut<'_> {
+    Box::pin(async move {
+        tokio::time::sleep(Duration::from_millis(800)).await;
+        Ok(input)
+    })
+}
+
 /// A workflow with no activities, so the run needs exactly one claim.
 fn trivial_workflow(_ctx: &WorkflowContext, input: serde_json::Value) -> BoxFut<'_> {
     Box::pin(async move { Ok(input) })
@@ -1418,4 +1428,89 @@ async fn a_queue_name_with_a_colon_rejects_dispatch() {
     ));
     Worker::new(worker_config("tenant:priority", vec![ShardId::new(0)]), registry)
         .expect("a colon in a queue name is fine without a channel");
+}
+
+/// Rows this worker holds `RUNNING` on `queue` right now.
+///
+/// A parked workflow row is `RUNNING` with no owner, so the owner test is what
+/// separates a running task from a parked one.
+async fn running_owned_count(conn: &mut AsyncPgConnection, queue: &str) -> i64 {
+    #[derive(diesel::QueryableByName)]
+    struct Count {
+        #[diesel(sql_type = diesel::sql_types::BigInt)]
+        count: i64,
+    }
+    let row: Count = diesel::sql_query(
+        "SELECT COUNT(*) AS count FROM harvest_task_queue \
+         WHERE queue_name = $1 AND state = 'RUNNING' AND worker_id IS NOT NULL \
+           AND task_type = 'workflow'",
+    )
+    .bind::<diesel::sql_types::Text, _>(queue)
+    .get_result(conn)
+    .await
+    .expect("running count");
+    row.count
+}
+
+/// A worker never claims past the free permits of the pool a reference needs
+/// (issue #1312 review round 1, finding F7).
+///
+/// The read is sized on the sum of both pools, so one read can hold two
+/// workflow references while only one workflow permit is free. Claiming both
+/// puts a row in `RUNNING` under a worker that cannot start it, and a peer with
+/// capacity cannot claim it either.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_workflow_reference_waits_for_a_workflow_permit() {
+    let _serial = DISPATCH_SERIAL.lock().await;
+    let (url, _c) = setup_test_database_url_or_env().await;
+    let queue = unique_queue("f7_permits");
+    let _cleanup = SeededQueueGuard {
+        url: url.clone(),
+        queue: queue.clone(),
+    };
+
+    // Both starts run before the install, so the reconcile sweep publishes both
+    // references in one batch and one read delivers them together.
+    let mut conn = connect(&url).await;
+    let first = start_on(&mut conn, "dispatch_slow", &queue).await;
+    let second = start_on(&mut conn, "dispatch_slow", &queue).await;
+
+    let channel = Arc::new(MemoryDispatch::new());
+    let _guard = install(&channel);
+
+    let config = WorkerRuntimeConfig {
+        max_concurrent_workflows: 1,
+        max_concurrent_activities: 8,
+        ..worker_config(&queue, vec![ShardId::new(0)])
+    };
+    let worker = Arc::new(make_worker_with(
+        config,
+        vec![wf_info("dispatch_slow", slow_workflow)],
+        vec![],
+        empty_shared_state(),
+    ));
+
+    let pool = build_pool(&url);
+    let mut check = connect(&url).await;
+    with_worker(worker, pool, async {
+        let deadline = std::time::Instant::now() + Duration::from_secs(30);
+        loop {
+            let running = running_owned_count(&mut check, &queue).await;
+            assert!(
+                running <= 1,
+                "{running} workflow rows are RUNNING under a worker with one workflow permit"
+            );
+            let first_state = execution_state(&mut check, first).await;
+            let second_state = execution_state(&mut check, second).await;
+            if first_state == "COMPLETED" && second_state == "COMPLETED" {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the runs stayed in {first_state} and {second_state}"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await;
 }

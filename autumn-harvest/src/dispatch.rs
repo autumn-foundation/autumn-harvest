@@ -967,6 +967,34 @@ mod tests {
             .next()
     }
 
+    /// Finding F7 (issue #1312 review round 1). The kind is the `task_type`
+    /// column, so the two spellings must not drift.
+    #[test]
+    fn a_dispatch_kind_is_the_task_type_column() {
+        assert_eq!(DispatchKind::Workflow.as_str(), "workflow");
+        assert_eq!(DispatchKind::Activity.as_str(), "activity");
+        assert_eq!(DispatchKind::from("workflow"), DispatchKind::Workflow);
+        assert_eq!(DispatchKind::from("activity"), DispatchKind::Activity);
+    }
+
+    /// A hint carries its kind through the channel to the lease, so the worker
+    /// can weigh the reference against the pool it needs.
+    #[tokio::test]
+    async fn a_lease_carries_the_kind_of_its_hint() {
+        let channel = MemoryDispatch::new();
+        let mut activity = hint("q", Utc::now());
+        activity.kind = Some(DispatchKind::Activity);
+        channel.publish(&[activity.clone()]).await.expect("publish");
+
+        let lease = read_one(&channel).await.expect("one lease");
+        assert_eq!(lease.task_id, activity.task_id);
+        assert_eq!(
+            lease.kind,
+            Some(DispatchKind::Activity),
+            "the lease must name the pool the reference needs"
+        );
+    }
+
     /// Finding F6 (issue #1312 review round 1). The rule must reject exactly
     /// what a channel implementation rejects, and nothing more.
     #[test]

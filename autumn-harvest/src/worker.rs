@@ -38025,6 +38025,32 @@ mod tests {
         );
     }
 
+    /// Finding F7 (issue #1312 review round 1). A reference names the pool it
+    /// needs, and a worker claims it only when that pool has a free permit.
+    ///
+    /// Sizing the read on the sum of both pools is right: a read that asked for
+    /// less would leave references a peer cannot see. Claiming on the sum is
+    /// not: a workflow row claimed with no workflow permit blocks on this
+    /// worker's semaphore while a peer with capacity cannot claim it.
+    #[test]
+    fn a_reference_claims_only_against_its_own_pool() {
+        use crate::dispatch::DispatchKind;
+        assert!(dispatch_kind_admitted(Some(DispatchKind::Workflow), 1, 0));
+        assert!(
+            !dispatch_kind_admitted(Some(DispatchKind::Workflow), 0, 64),
+            "a free activity permit cannot start a workflow row"
+        );
+        assert!(dispatch_kind_admitted(Some(DispatchKind::Activity), 0, 1));
+        assert!(
+            !dispatch_kind_admitted(Some(DispatchKind::Activity), 64, 0),
+            "a free workflow permit cannot start an activity row"
+        );
+        assert!(
+            dispatch_kind_admitted(None, 0, 0),
+            "an untyped reference keeps the behaviour it had before the kind existed"
+        );
+    }
+
     /// Finding F5 (issue #1312 review round 1). A channel installed after the
     /// worker was built must not put a multi-shard loop on the dispatch path.
     #[test]
