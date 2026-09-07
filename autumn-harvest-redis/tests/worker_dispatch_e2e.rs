@@ -9,7 +9,7 @@
 //!
 //! ## Running them
 //!
-//! Both variables must be set, or every case skips:
+//! Set both variables to use an operator-supplied Postgres and Redis:
 //!
 //! ```sh
 //! HARVEST_TEST_DATABASE_URL=postgres://postgres@127.0.0.1:5432/harvest_redis_e2e \
@@ -17,40 +17,39 @@
 //!   cargo test -p autumn-harvest-redis --test worker_dispatch_e2e
 //! ```
 //!
-//! The database must already carry the harvest schema. Apply
-//! `autumn_harvest::test_init_sql()` once, or run the CLI migrate command.
+//! Without them each case starts a `testcontainers` Postgres and a
+//! `testcontainers` Redis, and skips when Docker is unavailable. Set
+//! `HARVEST_TEST_REQUIRE_REDIS=1` to turn that skip into a failure, which is
+//! what CI does: a suite that silently skips proves nothing.
 //!
-//! The cases share one process-global dispatch installation and one Postgres
-//! database, so a static mutex serializes them.
+//! An operator-supplied database must carry the harvest schema, or the
+//! fixture applies `autumn_harvest::test_init_sql()` to it once. A container
+//! database gets the same SQL through `with_init_sql`.
 //!
-//! ## Status against the core worker
+//! The cases share one process-global dispatch installation, so a static
+//! mutex serializes them.
+//!
+//! ## What the counters prove
 //!
 //! Every case asserts that the run really travelled on the channel, through
 //! the counting wrapper in [`CountingDispatch`]. Without that check a case
 //! would pass on a worker that ignored the channel. An empty stream then
 //! proves nothing.
 //!
-//! The counters need the core worker to publish hints and to consume
-//! references. Until that lands, every case reaches its workflow assertions
-//! and then fails on `the engine must publish references through the
-//! channel`. See `docs/plans/2026-09-07-redis-dispatch-worker-integration.md`
-//! section 7 for the work packages.
+//! ## The two crash cases
 //!
-//! ## The crash case
+//! Both run a second copy of this test binary as a child process. Both kill
+//! it between the by-id claim commit and the reference ack. Each child entry
+//! point is `#[ignore]`d, so an ordinary test run never starts it.
 //!
-//! `crash_between_claim_commit_and_ack_neither_loses_nor_duplicates` runs a
-//! second copy of this test binary as a child process. The child installs a
-//! channel that aborts the process inside `ack`. That is the window the
-//! acceptance criterion names. The Postgres claim has committed, and the
-//! reference is still in the pending entries list. The child never returns
-//! normally. `crash_child_worker` is the entry point it runs, and is
-//! `#[ignore]`d so an ordinary test run never starts it.
+//! `crash_between_claim_commit_and_ack_neither_loses_nor_duplicates` installs
+//! a channel that aborts the process inside `ack`. The kill lands on the
+//! first claim, which is the workflow task.
 //!
-//! The aborting channel replaces the chaos point
-//! `DISPATCH_AFTER_CLAIM_BEFORE_ACK` while that point is not in the
-//! catalogue. Both name the same window. Swapping to the chaos harness needs
-//! one `arm(ChaosPlan::scripted().kill_at(DISPATCH_AFTER_CLAIM_BEFORE_ACK))`
-//! call in the child and the plain channel in place of the wrapper.
+//! `crash_on_the_activity_claim_neither_loses_nor_duplicates` arms the chaos
+//! point `DISPATCH_AFTER_CLAIM_BEFORE_ACK` on its second hit, which is the
+//! activity task claim. The claim has committed, the row is `RUNNING`, and
+//! the reference is still in the pending entries list.
 
 use std::pin::Pin;
 use std::process::Command;
@@ -75,8 +74,12 @@ use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use diesel::prelude::QueryableByName;
 use diesel_async::pooled_connection::AsyncDieselConnectionManager;
-use diesel_async::{AsyncConnection, AsyncPgConnection, RunQueryDsl};
+use diesel_async::{AsyncConnection, AsyncPgConnection, RunQueryDsl, SimpleAsyncConnection};
 use redis::AsyncCommands;
+use testcontainers::runners::AsyncRunner;
+use testcontainers::{ContainerAsync, ImageExt};
+use testcontainers_modules::postgres::Postgres;
+use testcontainers_modules::redis::{REDIS_PORT, Redis};
 use uuid::Uuid;
 
 // ---------------------------------------------------------------------------
@@ -85,6 +88,7 @@ use uuid::Uuid;
 
 const DB_URL_VAR: &str = "HARVEST_TEST_DATABASE_URL";
 const REDIS_URL_VAR: &str = "HARVEST_REDIS_TEST_URL";
+const REQUIRE_VAR: &str = "HARVEST_TEST_REQUIRE_REDIS";
 const PREFIX_VAR: &str = "HARVEST_E2E_KEY_PREFIX";
 const EXEC_ID_VAR: &str = "HARVEST_E2E_EXEC_ID";
 const RUN_ID_VAR: &str = "HARVEST_E2E_RUN_ID";
@@ -92,11 +96,122 @@ const RUN_ID_VAR: &str = "HARVEST_E2E_RUN_ID";
 const CONSUMER_GROUP: &str = "harvest_workers";
 const QUEUE: &str = "default";
 
-/// The two URLs every case needs, or `None` so the case skips.
-fn urls() -> Option<(String, String)> {
-    let database = std::env::var(DB_URL_VAR).ok()?;
-    let redis = std::env::var(REDIS_URL_VAR).ok()?;
-    Some((database, redis))
+/// The Postgres and Redis a case runs against, and the containers that serve
+/// them.
+///
+/// The containers stop when this value drops, so a case must hold it for its
+/// whole body.
+struct Fixture {
+    database_url: String,
+    redis_url: String,
+    _postgres: Option<ContainerAsync<Postgres>>,
+    _redis: Option<ContainerAsync<Redis>>,
+}
+
+/// Whether a missing fixture must fail the run instead of skipping it.
+fn fixture_is_required() -> bool {
+    std::env::var(REQUIRE_VAR).is_ok_and(|value| value == "1")
+}
+
+/// Both fixtures, or `None` so the case skips.
+///
+/// An environment variable wins over a container, so a developer machine with
+/// a local Postgres and Redis needs no Docker. Under `HARVEST_TEST_REQUIRE_REDIS=1`
+/// a missing fixture panics: a suite that silently skips proves nothing.
+async fn fixture() -> Option<Fixture> {
+    match build_fixture().await {
+        Ok(fixture) => Some(fixture),
+        Err(reason) => {
+            assert!(
+                !fixture_is_required(),
+                "{REQUIRE_VAR}=1 demands a live fixture, and none could be obtained: {reason}"
+            );
+            eprintln!("skipping: {reason}");
+            None
+        }
+    }
+}
+
+async fn build_fixture() -> Result<Fixture, String> {
+    let (redis_url, redis_container) = redis_fixture().await?;
+    let (database_url, postgres_container) = postgres_fixture().await?;
+    Ok(Fixture {
+        database_url,
+        redis_url,
+        _postgres: postgres_container,
+        _redis: redis_container,
+    })
+}
+
+/// A Redis URL from the environment, or a `redis:5.0` container.
+async fn redis_fixture() -> Result<(String, Option<ContainerAsync<Redis>>), String> {
+    if let Ok(url) = std::env::var(REDIS_URL_VAR) {
+        return Ok((url, None));
+    }
+    let container = Redis::default()
+        .start()
+        .await
+        .map_err(|err| format!("no redis container: {err}"))?;
+    let host = container
+        .get_host()
+        .await
+        .map_err(|err| format!("no redis host: {err}"))?;
+    let port = container
+        .get_host_port_ipv4(REDIS_PORT)
+        .await
+        .map_err(|err| format!("no redis port: {err}"))?;
+    Ok((format!("redis://{host}:{port}"), Some(container)))
+}
+
+/// A Postgres URL from the environment, or a `postgres:16` container carrying
+/// the harvest schema.
+async fn postgres_fixture() -> Result<(String, Option<ContainerAsync<Postgres>>), String> {
+    if let Ok(url) = std::env::var(DB_URL_VAR) {
+        ensure_schema(&url).await?;
+        return Ok((url, None));
+    }
+    let container = Postgres::default()
+        .with_init_sql(autumn_harvest::test_init_sql().into_bytes())
+        .with_tag("16")
+        .start()
+        .await
+        .map_err(|err| format!("no postgres container: {err}"))?;
+    let host = container
+        .get_host()
+        .await
+        .map_err(|err| format!("no postgres host: {err}"))?;
+    let port = container
+        .get_host_port_ipv4(5432)
+        .await
+        .map_err(|err| format!("no postgres port: {err}"))?;
+    Ok((
+        format!("postgres://postgres:postgres@{host}:{port}/postgres"),
+        Some(container),
+    ))
+}
+
+/// Apply the harvest schema to an operator-supplied database once.
+///
+/// The probe runs on its own connection. A failed probe poisons the
+/// connection, so the apply needs a fresh one.
+async fn ensure_schema(url: &str) -> Result<(), String> {
+    let mut conn = <AsyncPgConnection as AsyncConnection>::establish(url)
+        .await
+        .map_err(|err| format!("{DB_URL_VAR} is unreachable: {err}"))?;
+    if conn
+        .batch_execute("SELECT 1 FROM harvest_workflow_executions LIMIT 0")
+        .await
+        .is_ok()
+    {
+        return Ok(());
+    }
+    let mut fresh = <AsyncPgConnection as AsyncConnection>::establish(url)
+        .await
+        .map_err(|err| format!("{DB_URL_VAR} is unreachable: {err}"))?;
+    fresh
+        .batch_execute(&autumn_harvest::test_init_sql())
+        .await
+        .map_err(|err| format!("the harvest schema could not be applied: {err}"))
 }
 
 /// Serializes the cases: the dispatch channel is process-global.
@@ -331,6 +446,27 @@ impl RedisProbe {
         let _: i64 = conn.del(keys).await.expect("del");
     }
 
+    /// Poll until the channel holds nothing for `queue`, or give up.
+    ///
+    /// A reference a crashed worker left in the pending entries list is
+    /// recovered on the visibility timeout. That recovery can land after the
+    /// run reaches its terminal state. It puts one entry back on the stream
+    /// for the running worker to ack. The wait lets that happen, so the drain
+    /// assertion measures convergence and not the instant the workflow
+    /// finished. Call it while a worker still runs.
+    async fn await_drained(&self, queue: &str, deadline: Duration) {
+        let until = Instant::now() + deadline;
+        loop {
+            let drained = self.stream_len(queue).await == 0
+                && self.pending_count(queue).await == 0
+                && self.marker_keys().await.is_empty();
+            if drained || Instant::now() >= until {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    }
+
     /// Assert that the channel holds nothing for `queue`.
     async fn assert_drained(&self, queue: &str) {
         assert_eq!(
@@ -364,6 +500,14 @@ struct TextRow {
 struct CountRow {
     #[diesel(sql_type = diesel::sql_types::BigInt)]
     value: i64,
+}
+
+#[derive(QueryableByName)]
+struct TypedStateRow {
+    #[diesel(sql_type = diesel::sql_types::Text)]
+    kind: String,
+    #[diesel(sql_type = diesel::sql_types::Text)]
+    value: String,
 }
 
 #[derive(QueryableByName)]
@@ -453,6 +597,24 @@ async fn task_states(conn: &mut AsyncPgConnection, exec_id: ExecutionId) -> Vec<
     .expect("task rows")
     .into_iter()
     .map(|row| row.value)
+    .collect()
+}
+
+/// The state of every task row of `exec_id`, keyed by task type.
+async fn task_states_by_type(
+    conn: &mut AsyncPgConnection,
+    exec_id: ExecutionId,
+) -> Vec<(String, String)> {
+    diesel::sql_query(
+        "SELECT task_type AS kind, state AS value FROM harvest_task_queue
+         WHERE workflow_exec_id = $1 ORDER BY id",
+    )
+    .bind::<diesel::sql_types::Uuid, _>(exec_id.as_uuid())
+    .load::<TypedStateRow>(conn)
+    .await
+    .expect("task rows")
+    .into_iter()
+    .map(|row| (row.kind, row.value))
     .collect()
 }
 
@@ -778,9 +940,10 @@ impl RunningWorker {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn workflow_completes_via_redis_dispatch() {
-    let Some((db_url, redis_url)) = urls() else {
+    let Some(env) = fixture().await else {
         return;
     };
+    let (db_url, redis_url) = (env.database_url.clone(), env.redis_url.clone());
     let _serial = SERIAL.lock().await;
     let prefix = format!("e2e_{}", Uuid::new_v4().simple());
     let run_id = prefix.clone();
@@ -811,9 +974,10 @@ async fn workflow_completes_via_redis_dispatch() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn signal_wakes_a_parked_workflow_through_redis() {
-    let Some((db_url, redis_url)) = urls() else {
+    let Some(env) = fixture().await else {
         return;
     };
+    let (db_url, redis_url) = (env.database_url.clone(), env.redis_url.clone());
     let _serial = SERIAL.lock().await;
     let prefix = format!("e2e_{}", Uuid::new_v4().simple());
     set_handler_scope(&db_url, &prefix);
@@ -850,9 +1014,10 @@ async fn signal_wakes_a_parked_workflow_through_redis() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn activity_retry_delay_is_honoured() {
-    let Some((db_url, redis_url)) = urls() else {
+    let Some(env) = fixture().await else {
         return;
     };
+    let (db_url, redis_url) = (env.database_url.clone(), env.redis_url.clone());
     let _serial = SERIAL.lock().await;
     let prefix = format!("e2e_{}", Uuid::new_v4().simple());
     let run_id = prefix.clone();
@@ -885,9 +1050,10 @@ async fn activity_retry_delay_is_honoured() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn duplicate_reference_for_a_completed_row_is_acked_without_rerun() {
-    let Some((db_url, redis_url)) = urls() else {
+    let Some(env) = fixture().await else {
         return;
     };
+    let (db_url, redis_url) = (env.database_url.clone(), env.redis_url.clone());
     let _serial = SERIAL.lock().await;
     let prefix = format!("e2e_{}", Uuid::new_v4().simple());
     let run_id = prefix.clone();
@@ -939,9 +1105,10 @@ async fn duplicate_reference_for_a_completed_row_is_acked_without_rerun() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn crash_between_claim_commit_and_ack_neither_loses_nor_duplicates() {
-    let Some((db_url, redis_url)) = urls() else {
+    let Some(env) = fixture().await else {
         return;
     };
+    let (db_url, redis_url) = (env.database_url.clone(), env.redis_url.clone());
     let _serial = SERIAL.lock().await;
     let prefix = format!("e2e_{}", Uuid::new_v4().simple());
     let run_id = prefix.clone();
@@ -957,15 +1124,14 @@ async fn crash_between_claim_commit_and_ack_neither_loses_nor_duplicates() {
 
     let exec_id = start_workflow(&mut conn, "e2e_single_note", &format!("wf-{prefix}")).await;
 
-    let mut child = Command::new(std::env::current_exe().expect("test binary path"))
-        .args(["--exact", "crash_child_worker", "--ignored", "--nocapture"])
-        .env(DB_URL_VAR, &db_url)
-        .env(REDIS_URL_VAR, &redis_url)
-        .env(PREFIX_VAR, &prefix)
-        .env(EXEC_ID_VAR, exec_id.as_uuid().to_string())
-        .env(RUN_ID_VAR, &run_id)
-        .spawn()
-        .expect("the child worker should start");
+    let mut child = spawn_child(
+        "crash_child_worker",
+        &db_url,
+        &redis_url,
+        &prefix,
+        exec_id,
+        &run_id,
+    );
     let status = wait_for_child(&mut child, Duration::from_secs(25));
 
     #[cfg(unix)]
@@ -1009,10 +1175,90 @@ async fn crash_between_claim_commit_and_ack_neither_loses_nor_duplicates() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn redis_restart_converges_through_reconcile() {
-    let Some((db_url, redis_url)) = urls() else {
+async fn crash_on_the_activity_claim_neither_loses_nor_duplicates() {
+    let Some(env) = fixture().await else {
         return;
     };
+    let (db_url, redis_url) = (env.database_url.clone(), env.redis_url.clone());
+    let _serial = SERIAL.lock().await;
+    let prefix = format!("e2e_{}", Uuid::new_v4().simple());
+    let run_id = prefix.clone();
+    set_handler_scope(&db_url, &run_id);
+
+    let mut conn = connect(&db_url).await;
+    ensure_side_effect_table(&mut conn).await;
+    // The parent installs the channel too, so the workflow start publishes
+    // the reference the child reads.
+    let (_dispatch, counters, _guard) =
+        install_dispatch(&redis_url, &prefix, Duration::from_secs(2)).await;
+    let probe = RedisProbe::connect(&redis_url, &prefix).await;
+
+    let exec_id = start_workflow(&mut conn, "e2e_single_note", &format!("wf-{prefix}")).await;
+
+    let mut child = spawn_child(
+        "crash_child_worker_at_activity_claim",
+        &db_url,
+        &redis_url,
+        &prefix,
+        exec_id,
+        &run_id,
+    );
+    let status = wait_for_child(&mut child, Duration::from_secs(25));
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::ExitStatusExt as _;
+        assert!(
+            status.signal().is_some(),
+            "the child must die by a signal, not exit normally: {status:?}"
+        );
+    }
+
+    let rows = task_states_by_type(&mut conn, exec_id).await;
+    assert!(
+        rows.iter()
+            .any(|(kind, state)| kind == "activity" && state == "RUNNING"),
+        "the activity claim committed, so its row must be RUNNING: {rows:?}"
+    );
+    assert_eq!(
+        side_effect_count(&mut conn, &run_id).await,
+        0,
+        "the kill lands before the activity body runs"
+    );
+    assert_eq!(
+        probe.pending_count(QUEUE).await,
+        1,
+        "the unacked activity reference must still be in the pending entries list"
+    );
+
+    // A second worker, in this process, must converge. The orphan reclaim
+    // re-pends the row. The reconcile sweep republishes it, and the recovery
+    // pass reclaims the stale reference.
+    let worker = RunningWorker::start(&db_url, &format!("w2-{prefix}"), Duration::from_secs(1));
+    let state =
+        await_execution_state(&db_url, exec_id, &["COMPLETED"], Duration::from_secs(60)).await;
+    assert_eq!(state, "COMPLETED");
+    // The stale reference the child left behind is recovered on the
+    // visibility timeout, which can outlive the run. The worker stays up
+    // until the channel is clean.
+    probe.await_drained(QUEUE, Duration::from_secs(20)).await;
+    worker.stop().await;
+
+    assert_eq!(
+        side_effect_count(&mut conn, &run_id).await,
+        1,
+        "the crash must neither lose nor duplicate the activity"
+    );
+    counters.assert_the_channel_carried_the_run();
+    probe.assert_drained(QUEUE).await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn redis_restart_converges_through_reconcile() {
+    let Some(env) = fixture().await else {
+        return;
+    };
+    let (db_url, redis_url) = (env.database_url.clone(), env.redis_url.clone());
     let _serial = SERIAL.lock().await;
     let prefix = format!("e2e_{}", Uuid::new_v4().simple());
     let run_id = prefix.clone();
@@ -1047,6 +1293,29 @@ async fn redis_restart_converges_through_reconcile() {
     );
     counters.assert_the_channel_carried_the_run();
     probe.assert_drained(QUEUE).await;
+}
+
+/// Start a child copy of this test binary at one `#[ignore]`d entry point.
+///
+/// The child gets its fixture URLs through the environment, so it reaches the
+/// same Postgres and the same Redis as the parent, container or not.
+fn spawn_child(
+    entry_point: &str,
+    db_url: &str,
+    redis_url: &str,
+    prefix: &str,
+    exec_id: ExecutionId,
+    run_id: &str,
+) -> std::process::Child {
+    Command::new(std::env::current_exe().expect("test binary path"))
+        .args(["--exact", entry_point, "--ignored", "--nocapture"])
+        .env(DB_URL_VAR, db_url)
+        .env(REDIS_URL_VAR, redis_url)
+        .env(PREFIX_VAR, prefix)
+        .env(EXEC_ID_VAR, exec_id.as_uuid().to_string())
+        .env(RUN_ID_VAR, run_id)
+        .spawn()
+        .expect("the child worker should start")
 }
 
 /// Wait for the child, killing it if it outlives `deadline`.
@@ -1153,6 +1422,80 @@ fn crash_child_worker() {
         .expect("child redis dispatch");
         autumn_harvest::dispatch::install(
             Arc::new(AbortBeforeAck { inner }),
+            DispatchSettings {
+                poll_interval: Duration::from_millis(20),
+                reconcile_interval: Duration::from_millis(500),
+                reconcile_batch: 100,
+                release_backoff_cap: Duration::from_secs(2),
+            },
+        );
+
+        let worker = Worker::new(
+            runtime_config(&format!("child-{run_id}"), Duration::from_secs(1)),
+            registry(),
+        )
+        .expect("child worker should build");
+        let pool = build_pool(&db_url);
+        worker.run(&pool).await;
+    });
+    eprintln!("child: worker returned without reaching the crash window");
+    std::process::exit(10);
+}
+
+/// The child process entry point of the activity crash case.
+///
+/// The chaos point fires on its second hit. The first hit is the workflow
+/// task claim, and the second is the activity task claim. The kill therefore
+/// lands with the activity row `RUNNING` and its reference unacked.
+#[test]
+#[ignore = "started as a child process by the activity crash case"]
+fn crash_child_worker_at_activity_claim() {
+    let db_url = std::env::var(DB_URL_VAR).expect("child needs the database url");
+    let redis_url = std::env::var(REDIS_URL_VAR).expect("child needs the redis url");
+    let prefix = std::env::var(PREFIX_VAR).expect("child needs the key prefix");
+    let exec_id = std::env::var(EXEC_ID_VAR).expect("child needs the execution id");
+    let run_id = std::env::var(RUN_ID_VAR).expect("child needs the run id");
+    eprintln!("child: chaos worker for execution {exec_id} under prefix {prefix}");
+    set_handler_scope(&db_url, &run_id);
+
+    // The child must never outlive the parent's wait. Exiting normally here
+    // fails the parent's signal assertion, which is the correct outcome: the
+    // crash window was never reached.
+    std::thread::spawn(|| {
+        std::thread::sleep(Duration::from_secs(20));
+        eprintln!("child: watchdog fired before the crash window");
+        std::process::exit(9);
+    });
+
+    let runtime = tokio::runtime::Runtime::new().expect("child runtime");
+    runtime.block_on(async move {
+        let _chaos =
+            autumn_harvest::chaos::arm(autumn_harvest::chaos::ChaosPlan::scripted().kill_at_hit(
+                autumn_harvest::chaos::points::DISPATCH_AFTER_CLAIM_BEFORE_ACK,
+                2,
+            ))
+            .await;
+        // `arm` installs a hook that reports a chaos kill and lets the task
+        // unwind. The parent needs a dead process, so the hook is replaced
+        // after arming, not before it.
+        std::panic::set_hook(Box::new(|info| {
+            eprintln!("child: panic: {info}");
+            std::process::abort();
+        }));
+
+        let dispatch = RedisDispatch::connect(
+            &redis_url,
+            RedisDispatchConfig {
+                key_prefix: prefix,
+                consumer_group: CONSUMER_GROUP.to_string(),
+                visibility_timeout: Duration::from_secs(2),
+                dedupe_ttl: Duration::from_secs(600),
+            },
+        )
+        .await
+        .expect("child redis dispatch");
+        autumn_harvest::dispatch::install(
+            Arc::new(dispatch),
             DispatchSettings {
                 poll_interval: Duration::from_millis(20),
                 reconcile_interval: Duration::from_millis(500),

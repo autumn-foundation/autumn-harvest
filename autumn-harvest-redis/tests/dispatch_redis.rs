@@ -247,7 +247,7 @@ async fn an_earlier_due_time_moves_a_delayed_entry_forward() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn a_later_due_time_for_a_held_entry_is_a_no_op() {
+async fn a_retry_moves_a_held_entry_later() {
     let Some(fixture) = try_start(Duration::from_secs(60)).await else {
         return;
     };
@@ -263,6 +263,8 @@ async fn a_later_due_time_for_a_held_entry_is_a_no_op() {
         )])
         .await
         .expect("park");
+    // A retry moves the row's `scheduled_at` later. Contract C1 keys on that
+    // value, so the parked reference moves with it.
     fixture
         .dispatch
         .publish(&[hint(
@@ -274,13 +276,93 @@ async fn a_later_due_time_for_a_held_entry_is_a_no_op() {
         .expect("later");
 
     tokio::time::sleep(Duration::from_millis(400)).await;
-    let leases = read(&fixture, &queues, 10).await;
-    assert_eq!(
-        leases.len(),
-        1,
-        "the later hint must not push the parked entry out"
+    assert!(
+        read(&fixture, &queues, 10).await.is_empty(),
+        "the later due time must hold the entry back"
     );
-    assert_eq!(leases[0].task_id, task_id);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_reconcile_republish_leaves_a_backed_off_entry_alone() {
+    let Some(fixture) = try_start(Duration::from_secs(60)).await else {
+        return;
+    };
+    let queues = vec!["gated".to_string()];
+    let task_id = Uuid::new_v4();
+    // The row's due time. Every republish of this row carries it again.
+    let scheduled_at = Utc::now();
+
+    fixture
+        .dispatch
+        .publish(&[hint("gated", task_id, scheduled_at)])
+        .await
+        .expect("publish");
+    let leases = read(&fixture, &queues, 10).await;
+    assert_eq!(leases.len(), 1);
+    fixture
+        .dispatch
+        .release(&leases[0], Duration::from_millis(600))
+        .await
+        .expect("release");
+
+    // The reconcile sweep republishes the same row with the same
+    // `scheduled_at`. Contract C1 makes that a no-op.
+    fixture
+        .dispatch
+        .publish(&[hint("gated", task_id, scheduled_at)])
+        .await
+        .expect("republish");
+    assert!(
+        read(&fixture, &queues, 10).await.is_empty(),
+        "a republish must not cut the backoff short"
+    );
+
+    tokio::time::sleep(Duration::from_millis(700)).await;
+    let again = read(&fixture, &queues, 10).await;
+    assert_eq!(again.len(), 1, "the entry returns once the backoff elapses");
+    assert_eq!(
+        again[0].redeliveries, 1,
+        "a republish must not reset the redelivery count"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_wake_moves_a_backed_off_entry_forward() {
+    let Some(fixture) = try_start(Duration::from_secs(60)).await else {
+        return;
+    };
+    let queues = vec!["waking".to_string()];
+    let task_id = Uuid::new_v4();
+    let scheduled_at = Utc::now();
+
+    fixture
+        .dispatch
+        .publish(&[hint("waking", task_id, scheduled_at)])
+        .await
+        .expect("publish");
+    let leases = read(&fixture, &queues, 10).await;
+    assert_eq!(leases.len(), 1);
+    fixture
+        .dispatch
+        .release(&leases[0], Duration::from_secs(3600))
+        .await
+        .expect("release");
+    assert!(read(&fixture, &queues, 10).await.is_empty());
+
+    // A signal moves the row's `scheduled_at`, so the reference moves too.
+    fixture
+        .dispatch
+        .publish(&[hint("waking", task_id, Utc::now())])
+        .await
+        .expect("wake");
+
+    let again = read(&fixture, &queues, 10).await;
+    assert_eq!(again.len(), 1, "a new due time must cut the backoff short");
+    assert_eq!(again[0].task_id, task_id);
+    assert_eq!(
+        again[0].redeliveries, 0,
+        "a moved reference restarts its redelivery count"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -475,4 +557,91 @@ async fn a_deleted_consumer_group_self_heals() {
         "a read must recreate the group and still see the live entry"
     );
     assert_eq!(leases[0].task_id, task_id);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_read_across_two_queues_returns_at_most_the_requested_count() {
+    let Some(fixture) = try_start(Duration::from_secs(60)).await else {
+        return;
+    };
+    let queues = vec!["left".to_string(), "right".to_string()];
+    let mut published = Vec::new();
+    for queue in &queues {
+        for _ in 0..2 {
+            let task_id = Uuid::new_v4();
+            published.push(task_id);
+            fixture
+                .dispatch
+                .publish(&[hint(queue, task_id, Utc::now())])
+                .await
+                .expect("publish");
+        }
+    }
+
+    // `COUNT` bounds one stream, so a read over two queues can return four
+    // entries for a caller that asked for three. The surplus goes back.
+    let leases = read(&fixture, &queues, 3).await;
+    assert_eq!(leases.len(), 3, "the read must honour the caller's cap");
+    assert_eq!(
+        fixture.pending_count("left").await + fixture.pending_count("right").await,
+        3,
+        "a requeued surplus must not stay in the pending entries list"
+    );
+
+    let rest = read(&fixture, &queues, 10).await;
+    assert_eq!(rest.len(), 1, "the surplus must be deliverable again");
+    let mut seen: Vec<Uuid> = leases
+        .iter()
+        .chain(rest.iter())
+        .map(|lease| lease.task_id)
+        .collect();
+    seen.sort_unstable();
+    published.sort_unstable();
+    assert_eq!(seen, published, "every reference must be delivered once");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn every_queue_is_served_when_the_read_cap_is_one() {
+    let Some(fixture) = try_start(Duration::from_secs(60)).await else {
+        return;
+    };
+    let queues = vec!["first".to_string(), "second".to_string()];
+    for queue in &queues {
+        fixture
+            .dispatch
+            .publish(&[hint(queue, Uuid::new_v4(), Utc::now())])
+            .await
+            .expect("publish");
+    }
+
+    // One lease per read, and the rotation must reach both queues.
+    let mut served = Vec::new();
+    for _ in 0..2 {
+        let leases = read(&fixture, &queues, 1).await;
+        assert_eq!(leases.len(), 1, "a cap of one must deliver one lease");
+        served.push(leases[0].queue_name.clone());
+    }
+    served.sort();
+    assert_eq!(
+        served,
+        vec!["first".to_string(), "second".to_string()],
+        "the queue order must rotate so no queue starves"
+    );
+}
+
+/// An address that accepts no connection, so `connect` has to time out.
+///
+/// Some environments answer with a reset at once. The case tolerates that:
+/// it asserts an error and a bound on the wait, not a wait.
+#[tokio::test(flavor = "multi_thread")]
+async fn connect_to_an_unreachable_address_fails_fast() {
+    let started = Instant::now();
+    let result =
+        RedisDispatch::connect("redis://10.255.255.1:6379", RedisDispatchConfig::default()).await;
+    let elapsed = started.elapsed();
+    assert!(result.is_err(), "an unreachable address must not connect");
+    assert!(
+        elapsed < Duration::from_secs(10),
+        "connect must fail inside its timeout (elapsed {elapsed:?})"
+    );
 }
