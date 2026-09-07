@@ -1,20 +1,21 @@
 //! Ledger performance investigation: `POST /dead-letters/discard`.
 //!
-//! `bulk_discard_dead_letters_for_selector` (in `autumn-harvest-plugin/src/
-//! api.rs`) batches its own row selection (`query_dead_letters_for_api_bulk`)
-//! up to `dlq::MAX_BULK_LIMIT` (1,000) rows, then discards the matches **one
-//! row at a time**: a `for row in rows` loop issuing one
+//! `bulk_discard_dead_letters_for_selector` (in
+//! `autumn-harvest-plugin/src/api.rs`) batches its own row selection
+//! (`query_dead_letters_for_api_bulk`) up to `dlq::MAX_BULK_LIMIT` (1,000)
+//! rows. It then discards the matches **one row at a time**. A
+//! `for row in rows` loop issues one
 //! `DELETE FROM harvest_dead_letters WHERE id = $1` per row. The library's
 //! own embedder-facing `dlq::bulk_discard_dead_letters` had the identical
 //! loop. Purging every dead letter that shares one broken activity's name
-//! -- the exact scenario `MAX_BULK_LIMIT` is sized for -- issued up to 1,000
-//! single-row `DELETE` statements in one HTTP request.
+//! is the exact scenario `MAX_BULK_LIMIT` is sized for. That purge issued
+//! up to 1,000 single-row `DELETE` statements in one HTTP request.
 //!
 //! The fix, `dlq::discard_dead_letters_batch`, replaces the loop at both
 //! call sites with one `DELETE ... WHERE id = ANY($1) RETURNING id`. Unlike
 //! `audit::insert_audit_batch` (a multi-row `INSERT` binding one column per
 //! row), `id = ANY($1)` binds the whole id list as a single array
-//! parameter, so there is no bound-parameter ceiling to chunk against even
+//! parameter. So there is no bound-parameter ceiling to chunk against even
 //! at the 1,000-row cap.
 //!
 //! This file is the harness + evidence generator for that investigation.
@@ -58,8 +59,8 @@ async fn setup_server() -> (String, DbGuard) {
     (url, Some(container))
 }
 
-/// Creates a fresh, uniquely-named, fully-migrated database off `admin_url`,
-/// so this harness's fixture and `pg_stat_statements` capture cannot collide
+/// Creates a fresh, uniquely-named, fully-migrated database off `admin_url`.
+/// This harness's fixture and `pg_stat_statements` capture cannot collide
 /// with, or be polluted by, any other test or run on the same server.
 async fn create_fresh_db(admin_url: &str, name: &str) -> String {
     let mut admin = AsyncPgConnection::establish(admin_url)
@@ -128,14 +129,16 @@ async fn post_json(app: &HarvestApiApp, uri: &str, payload: Value) -> (StatusCod
 // ── Fixture generation ──────────────────────────────────────────────────────
 
 /// Seeds `matching` dead letters whose `activity_name` is
-/// `dlq_bulk_perf_target`, so the bulk-discard filter selects exactly this
-/// set -- an operator purging every dead letter left by one broken activity,
-/// which is exactly the shape `dlq::MAX_BULK_LIMIT` is sized for (issue
-/// #1421). Also seeds `noise` unrelated dead letters spanning 25 other
-/// activity names and 4 queues, with skewed `attempts` and a `failed_at`
-/// spread over 90 days, plus NULL density on `owner`/`severity` matching
-/// production rows (both columns are optional annotations most dead letters
-/// never get). Pure set-based SQL, not a per-row Rust loop.
+/// `dlq_bulk_perf_target`. The bulk-discard filter then selects exactly
+/// this set -- an operator purging every dead letter left by one broken
+/// activity. That is exactly the shape `dlq::MAX_BULK_LIMIT` is sized for
+/// (issue #1421).
+///
+/// Also seeds `noise` unrelated dead letters spanning 25 other activity
+/// names and 4 queues. `attempts` is skewed and `failed_at` spreads over 90
+/// days. NULL density on `owner`/`severity` matches production rows -- both
+/// columns are optional annotations most dead letters never get. Pure
+/// set-based SQL, not a per-row Rust loop.
 async fn seed_fixture(conn: &mut AsyncPgConnection, matching: i64, noise: i64) {
     conn.batch_execute(&format!(
         "INSERT INTO harvest_dead_letters (
@@ -252,8 +255,8 @@ struct CountValue {
 async fn capture_dlq_bulk_discard_evidence() {
     // MATCHING is the endpoint's own `dlq::MAX_BULK_LIMIT` -- the real
     // production ceiling on how many rows one bulk-discard request can act
-    // on, not an arbitrary round number. NOISE models a lived-in DLQ with
-    // 25 other activities' failures still sitting in it.
+    // on. It is not an arbitrary round number. NOISE models a lived-in DLQ
+    // with 25 other activities' failures still sitting in it.
     const MATCHING: i64 = 1000;
     const NOISE: i64 = 4000;
 
@@ -286,8 +289,8 @@ async fn capture_dlq_bulk_discard_evidence() {
     reset_stats_for_db(&mut stats_conn, &db_name).await;
 
     // The one, real, public entry point: the exact request an operator's
-    // "purge every dead letter for this broken activity" action issues,
-    // at the endpoint's own row cap.
+    // "purge every dead letter for this broken activity" action issues. It
+    // runs at the endpoint's own row cap.
     let (status, body) = post_json(
         &app,
         "/dead-letters/discard",
@@ -448,10 +451,11 @@ async fn insert_dead_letter_row(conn: &mut AsyncPgConnection, activity: &str) ->
 }
 
 /// Proves `dlq::discard_dead_letters_batch` deletes exactly the rows the
-/// original per-row `diesel::delete(...find(id))` loop would have deleted,
-/// and returns exactly their ids -- for both a set of ids that all exist and
-/// a set where some ids are already gone (mirroring the `deleted == 0` skip
-/// path both the old loop and the new batch must handle identically).
+/// original per-row `diesel::delete(...find(id))` loop would have deleted.
+/// It also returns exactly their ids. Covers both a set of ids that all
+/// exist and a set where some ids are already gone. That mirrors the
+/// `deleted == 0` skip path both the old loop and the new batch must
+/// handle identically.
 #[tokio::test]
 async fn discard_dead_letters_batch_matches_per_row_delete_loop() {
     use autumn_harvest::dlq::discard_dead_letters_batch;
@@ -464,7 +468,7 @@ async fn discard_dead_letters_batch_matches_per_row_delete_loop() {
     let mut conn = AsyncPgConnection::establish(&url).await.expect("connect");
 
     // Group 1: every id exists. The original loop would have deleted all of
-    // them, one DELETE apiece; the batch must delete all of them in one
+    // them, one DELETE apiece. The batch must delete all of them in one
     // statement and return every id.
     let mut existing_ids = Vec::new();
     for i in 0..25 {
@@ -490,7 +494,7 @@ async fn discard_dead_letters_batch_matches_per_row_delete_loop() {
 
     // Group 2: half the ids exist, half never did. The original loop's
     // `Ok(0) => skipped += 1` branch silently dropped a missing id from
-    // `acted_ids`; the batch must do the same -- absent from the returned
+    // `acted_ids`. The batch must do the same -- absent from the returned
     // Vec, no error.
     let mut mixed_ids = Vec::new();
     for i in 0..10 {
@@ -512,10 +516,10 @@ async fn discard_dead_letters_batch_matches_per_row_delete_loop() {
     );
 }
 
-/// An empty slice must not touch the connection and must return `Ok(vec![])`
-/// rather than erroring -- an empty `id = ANY(...)` array is well-formed SQL,
-/// but sending it at all would be one more wasted round trip on the common
-/// "filter matched zero rows" path.
+/// An empty slice must not touch the connection. It must return
+/// `Ok(vec![])` rather than erroring. An empty `id = ANY(...)` array is
+/// well-formed SQL. But sending it at all would be one more wasted round
+/// trip on the common "filter matched zero rows" path.
 #[tokio::test]
 async fn discard_dead_letters_batch_on_empty_slice_is_a_no_op() {
     use autumn_harvest::dlq::discard_dead_letters_batch;
@@ -531,8 +535,8 @@ async fn discard_dead_letters_batch_on_empty_slice_is_a_no_op() {
 }
 
 /// A batch well past the old per-chunk cap other batched writers in this
-/// crate need (`audit::insert_audit_batch` chunks at 4,999 rows because a
-/// multi-row `INSERT` binds one parameter per column per row). A `DELETE
+/// crate need. `audit::insert_audit_batch` chunks at 4,999 rows, because a
+/// multi-row `INSERT` binds one parameter per column per row. A `DELETE
 /// ... WHERE id = ANY($1)` binds the whole list as a single array
 /// parameter, so this must succeed unchunked well beyond that boundary.
 #[tokio::test]

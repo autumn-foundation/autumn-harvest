@@ -872,8 +872,8 @@ pub async fn bulk_replay_dead_letters(
 /// the per-row `deleted == 0` skip this replaces rather than erroring.
 ///
 /// `id = ANY($1)` binds the id list as a single array parameter, not one
-/// bind per id, so there is no `PostgreSQL` bound-parameter ceiling to chunk
-/// against here — contrast [`crate::audit::insert_audit_batch`], which binds
+/// bind per id. So there is no `PostgreSQL` bound-parameter ceiling to chunk
+/// against here. Contrast [`crate::audit::insert_audit_batch`], which binds
 /// a column per row via a multi-row `VALUES` list.
 ///
 /// An empty slice never sends a statement.
@@ -881,11 +881,11 @@ pub async fn bulk_replay_dead_letters(
 /// # Errors
 ///
 /// Returns [`HarvestError::Database`] if the delete fails. On failure the
-/// batch is atomic: no row is deleted where a per-row loop could have
-/// deleted an earlier id and then hit an error on a later one, leaving a
-/// mixed state. See `docs/performance-dlq-bulk-discard.md`'s "Equivalence"
-/// section for why this is a disclosed strengthening, not a weakening, of
-/// the prior guarantee.
+/// batch is atomic. No row is deleted where a per-row loop could have
+/// deleted an earlier id. It could then hit an error on a later one,
+/// leaving a mixed state. See `docs/performance-dlq-bulk-discard.md`'s
+/// "Equivalence" section for why this is a disclosed strengthening, not a
+/// weakening, of the prior guarantee.
 pub async fn discard_dead_letters_batch(
     conn: &mut AsyncPgConnection,
     ids: &[Uuid],
@@ -910,12 +910,13 @@ pub async fn discard_dead_letters_batch(
 /// deletes are performed.
 ///
 /// A failure of the batched delete itself (statement timeout, lock
-/// contention) is **not** returned as an `Err`: it is captured into the
-/// returned [`BulkDlqResult::failures`], one [`BulkDlqFailure`] per
-/// selected id, with `acted_on` left at `0`. Callers that only check the
-/// outer `Result` — including a bare `?` — will treat this as success;
-/// inspect `failures` to detect it, exactly as callers of
-/// [`bulk_replay_dead_letters`] already must.
+/// contention) is **not** returned as an `Err`. It is captured into the
+/// returned [`BulkDlqResult::failures`] instead, one [`BulkDlqFailure`] per
+/// selected id, with `acted_on` left at `0`.
+///
+/// Callers that only check the outer `Result` — including a bare `?` — will
+/// treat this as success. Inspect `failures` to detect it, exactly as
+/// callers of [`bulk_replay_dead_letters`] already must.
 ///
 /// # Errors
 ///
@@ -942,10 +943,10 @@ pub async fn bulk_discard_dead_letters(
         });
     }
 
-    // A batch failure is captured into `failures` for every selected id
-    // rather than propagated, matching the API layer's
-    // `bulk_discard_dead_letters_for_selector` (kept in sync per this
-    // module's own convention) -- see that function's doc comment for why.
+    // A batch failure is captured into `failures` for every selected id,
+    // rather than propagated. This matches the API layer's
+    // `bulk_discard_dead_letters_for_selector`, kept in sync per this
+    // module's own convention -- see that function's doc comment for why.
     match discard_dead_letters_batch(conn, &ids).await {
         Ok(deleted_ids) => {
             let deleted: std::collections::HashSet<Uuid> = deleted_ids.into_iter().collect();

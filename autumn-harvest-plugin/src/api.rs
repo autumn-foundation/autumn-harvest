@@ -32447,23 +32447,23 @@ async fn bulk_discard_dead_letters_for_selector(
         return Ok(result);
     }
 
-    // One statement for the whole page instead of one DELETE per row (issue
-    // #1421): `dlq::discard_dead_letters_batch` binds `id = ANY($1)` as a
-    // single array parameter, so a 1,000-row bulk discard -- the endpoint's
-    // own `MAX_BULK_LIMIT` -- costs one round trip, not 1,000. See
+    // One statement replaces one DELETE per row (issue #1421).
+    // `dlq::discard_dead_letters_batch` binds `id = ANY($1)` as a single
+    // array parameter. A 1,000-row bulk discard -- the endpoint's own
+    // `MAX_BULK_LIMIT` -- costs one round trip, not 1,000. See
     // `docs/performance-dlq-bulk-discard.md`.
     //
     // A batch failure (statement timeout, lock contention) is captured into
-    // `result.failures` for every id this page selected rather than
-    // propagated with `?` (Codex review, PR #1422): `bulk_discard_from_shards`
-    // calls this once per shard and stops at the first `Err`, so raising here
-    // would abort every later shard and discard already-accumulated totals
-    // from earlier ones -- for a single Postgres-side hiccup on one shard's
-    // one statement, not a per-row business failure. Returning `Ok` with
-    // `failures` populated lets that loop move on to the next shard, and lets
-    // the handler's existing failures-aware status logic (500 only when
-    // NOTHING on the whole request succeeded, 200-with-failures otherwise)
-    // apply to discard exactly as it already does for replay.
+    // `result.failures` instead of propagated with `?` (Codex review, PR
+    // #1422). `bulk_discard_from_shards` calls this once per shard and stops
+    // at the first `Err`. Raising here would abort every later shard. It
+    // would also discard already-accumulated totals from earlier shards, for
+    // a single Postgres-side hiccup on one shard's one statement, not a
+    // per-row business failure. Returning `Ok` with `failures` populated
+    // lets that loop move on to the next shard. It also lets the handler's
+    // existing failures-aware status logic apply to discard exactly as it
+    // already does for replay. That logic returns 500 only when nothing in
+    // the whole request succeeded, and 200-with-failures otherwise.
     let ids: Vec<uuid::Uuid> = rows.iter().map(|row| row.id).collect();
     match dlq::discard_dead_letters_batch(conn, &ids).await {
         Ok(deleted_ids) => {
