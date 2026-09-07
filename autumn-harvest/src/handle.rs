@@ -809,10 +809,16 @@ impl WorkflowHandleClient {
         // start and increments `harvest.admission.blocked`, exactly like every
         // other in-process producer. See `StartProducer::Transactional` in the
         // admission-gate contract (`admission_gate.rs`) for the full rationale.
-        let (started, deferred_starts, deferred_checks, cancel_metrics) =
+        // The start writes a `PENDING` task row inside the caller's own
+        // transaction (issue #1312). Its dispatch hint must therefore not
+        // reach the channel until that transaction commits. The scope holds
+        // it. `TransactionalStartOutcome::finish` — this method's documented
+        // post-commit hook — publishes it. A caller that never calls `finish`
+        // loses only latency: the worker's reconcile sweep republishes the row.
+        let (collected, start_hints) = crate::dispatch::buffered(async {
             if let Some(key) = options.idempotency_key.as_deref() {
                 self.start_workflow_transactional_idempotent(conn, params, key)
-                    .await?
+                    .await
             } else {
                 // Issue #763 review (Codex finding): `in_outer_transaction = true`
                 // below tells `start_or_load_workflow_execution_collect` that a
@@ -864,8 +870,11 @@ impl WorkflowHandleClient {
                     )
                     .await
                 }))
-                .await?
-            };
+                .await
+            }
+        })
+        .await;
+        let (started, deferred_starts, deferred_checks, cancel_metrics) = collected?;
 
         Ok(TransactionalStartOutcome {
             exec_id: started.exec_id,
@@ -879,6 +888,7 @@ impl WorkflowHandleClient {
                 starts: deferred_starts,
                 checks: deferred_checks,
                 cancel_metrics,
+                hints: start_hints,
             },
         })
     }
@@ -1491,6 +1501,9 @@ struct PendingStartFollowUps {
     starts: Vec<DeferredTriggerStart>,
     checks: Vec<(ExecutionId, String)>,
     cancel_metrics: Vec<crate::execution::StartCancelledRun>,
+    /// Dispatch hints the start raised (issue #1312), held until the caller's
+    /// transaction commits.
+    hints: Vec<crate::dispatch::DispatchHint>,
 }
 
 /// Result of a staged, in-transaction workflow start (issue #763).
@@ -1540,6 +1553,10 @@ impl TransactionalStartOutcome {
     /// `deferred` is empty unless a `WorkflowIdConflictPolicy::Terminate`
     /// collision was resolved) to skip entirely.
     pub async fn finish(self) {
+        // Publish the dispatch hints the start raised (issue #1312). The
+        // caller's transaction has committed by contract, so the task row this
+        // hint names is durable and a worker may claim it.
+        crate::dispatch::publish_now(self.deferred.hints).await;
         for start in self.deferred.starts {
             start.spawn();
         }

@@ -11992,7 +11992,7 @@ async fn finalize_activity_completion(
         output: output.clone(),
     };
 
-    Box::pin(conn.transaction::<(), HarvestError, _>(async |conn| {
+    let result = Box::pin(conn.transaction::<(), HarvestError, _>(async |conn| {
         let output = output.clone();
         let history = lock_workflow_execution_and_load_history(conn, exec_id, codecs).await?;
         if pending_activity_id_for_task(&history.events, task, activity_name)?.is_none() {
@@ -12032,7 +12032,13 @@ async fn finalize_activity_completion(
         }
         queue::wake_workflow_task(conn, exec_id).await
     }))
-    .await
+    .await;
+
+    // Settle the dispatch hints this transaction raised (issue #1312). A
+    // committed transaction publishes them, because every row they name is now
+    // durable. A rolled-back transaction discards them, because it left no
+    // `PENDING` row for them to name.
+    crate::dispatch::settle_scope(result).await
 }
 
 async fn finalize_activity_failure(
@@ -12069,7 +12075,7 @@ async fn finalize_activity_failure(
     // `ActivityFailed` event (carrying `error_type`, `non_retryable`,
     // `details`) and the `WorkflowFailed` event that follows when the
     // workflow propagates the error.
-    Box::pin(conn.transaction::<(), HarvestError, _>(async |conn| {
+    let result = Box::pin(conn.transaction::<(), HarvestError, _>(async |conn| {
         let error = error.to_string();
         let history = lock_workflow_execution_and_load_history(conn, exec_id, codecs).await?;
         if pending_activity_id_for_task(&history.events, task, activity_name)?.is_none() {
@@ -12106,7 +12112,11 @@ async fn finalize_activity_failure(
         queue::fail_task(conn, task.id, &error).await?;
         queue::wake_workflow_task(conn, exec_id).await
     }))
-    .await
+    .await;
+
+    // Settle the dispatch hints this transaction raised (issue #1312), for the
+    // same reason as `finalize_activity_completion`.
+    crate::dispatch::settle_scope(result).await
 }
 
 /// Materialize any DUE `__child_timeout:` deadline timers into the parent's
@@ -13217,7 +13227,7 @@ async fn record_session_acquire_schedule_to_start_timeout(
     }
     .to_string();
 
-    Box::pin(conn.transaction::<(), HarvestError, _>(async |conn| {
+    let result = Box::pin(conn.transaction::<(), HarvestError, _>(async |conn| {
         let error = error.clone();
         let history = lock_workflow_execution_and_load_history(conn, exec_id, codecs).await?;
         let Some(state) = task_state_for_update(conn, task.id).await? else {
@@ -13241,7 +13251,11 @@ async fn record_session_acquire_schedule_to_start_timeout(
         queue::fail_task(conn, task.id, &error).await?;
         queue::wake_workflow_task(conn, exec_id).await
     }))
-    .await
+    .await;
+
+    // Settle the dispatch hints this transaction raised (issue #1312), for the
+    // same reason as `finalize_activity_completion`.
+    crate::dispatch::settle_scope(result).await
 }
 
 /// Handle the internal session-acquire activity (issue #606) -- see the
@@ -20272,6 +20286,11 @@ async fn process_workflow_task(
             // follow-up side effects have not fired yet. Convergence must still
             // hold: the completion-trigger outbox recovers un-fired triggers.
             crate::chaos_point!(WORKER_AFTER_OUTER_COMMIT);
+            // Publish the dispatch hints this cycle raised (issue #1312). The
+            // outer transaction has committed, so every row a hint names is
+            // durable. The nested `conn.transaction` calls inside the persist
+            // flow are SAVEPOINTs under it and deliberately do not flush.
+            crate::dispatch::flush_scope().await;
             // Only spawned now that the transaction above has committed (see
             // apply_race_loser_cancellations's doc comment) — spawning inside
             // the transaction closure could start a trigger workflow for a
@@ -23784,6 +23803,124 @@ fn multi_shard_listener_url(
         .map(|(_, url)| url.as_str())
 }
 
+// ---------------------------------------------------------------------------
+// Dispatch channel consume path (issue #1312)
+// ---------------------------------------------------------------------------
+
+/// Largest number of references one dispatch read asks for.
+const DISPATCH_READ_MAX: usize = 64;
+
+/// Shortest interval between two dispatch-channel error logs.
+const DISPATCH_ERROR_LOG_INTERVAL: Duration = Duration::from_secs(30);
+
+/// Number of short releases an absent row gets before the reference is acked.
+///
+/// A publish can beat its own transaction's commit, so a reference may name a
+/// row no reader can see yet. Three short releases cover that window; after
+/// them the row genuinely does not exist and the reference is dropped.
+const DISPATCH_ABSENT_ROW_RELEASES: u32 = 3;
+
+/// Delay for the release of a reference whose row is not visible yet.
+const DISPATCH_ABSENT_ROW_DELAY: Duration = Duration::from_millis(50);
+
+/// What one dispatch loop remembers between iterations.
+#[derive(Debug)]
+struct DispatchLoopState {
+    /// When the last maintenance pass ran.
+    maintained: std::time::Instant,
+    /// When the last reconcile sweep ran.
+    reconciled: std::time::Instant,
+    /// When a channel error was last logged, so a broken channel logs once per
+    /// interval instead of once per iteration.
+    error_logged: Option<std::time::Instant>,
+}
+
+impl DispatchLoopState {
+    fn new() -> Self {
+        // Both timers start elapsed, so the first iteration maintains and
+        // reconciles before it waits on the channel. A worker that starts
+        // against a channel with no references still finds the standing
+        // backlog immediately.
+        let past = std::time::Instant::now();
+        Self {
+            maintained: past,
+            reconciled: past,
+            error_logged: None,
+        }
+    }
+
+    /// True when `interval` has elapsed since `last`, which is then reset.
+    fn due(last: &mut std::time::Instant, interval: Duration) -> bool {
+        if last.elapsed() >= interval {
+            *last = std::time::Instant::now();
+            return true;
+        }
+        false
+    }
+
+    /// True when a channel error may be logged now.
+    fn may_log_error(&mut self) -> bool {
+        let now = std::time::Instant::now();
+        match self.error_logged {
+            Some(last) if now.duration_since(last) < DISPATCH_ERROR_LOG_INTERVAL => false,
+            _ => {
+                self.error_logged = Some(now);
+                true
+            }
+        }
+    }
+}
+
+/// What the worker does with one delivered reference.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReferenceOutcome {
+    /// The row is gone or is no longer claimable; ack the reference.
+    Ack,
+    /// The row is still claimable but gated; release with `delay`.
+    Release(Duration),
+}
+
+/// Decide what to do with a reference whose by-id claim returned `None`.
+///
+/// Split out from the loop so the outcome table in
+/// `docs/plans/2026-09-07-redis-dispatch-worker-integration.md` is testable
+/// without a database.
+fn reference_outcome(
+    probe: Option<&crate::queue::DispatchProbe>,
+    redeliveries: u32,
+    now: chrono::DateTime<chrono::Utc>,
+    settings: &crate::dispatch::DispatchSettings,
+) -> ReferenceOutcome {
+    let Some(probe) = probe else {
+        // Absent row. A publish can beat its own commit, so give the row a few
+        // short releases before dropping the reference.
+        if redeliveries < DISPATCH_ABSENT_ROW_RELEASES {
+            return ReferenceOutcome::Release(DISPATCH_ABSENT_ROW_DELAY);
+        }
+        return ReferenceOutcome::Ack;
+    };
+    if !probe.is_pending() {
+        // `RUNNING` or terminal. Another worker holds it, or it is finished.
+        return ReferenceOutcome::Ack;
+    }
+    if probe.scheduled_at > now {
+        // Not yet due. Hold the reference until the due time, so the channel
+        // parks it instead of cycling it once per poll.
+        let until = (probe.scheduled_at - now)
+            .to_std()
+            .unwrap_or(settings.release_backoff_cap);
+        return ReferenceOutcome::Release(until.min(settings.release_backoff_cap));
+    }
+    // Due but gated: a queue pause, a concurrency cap, a rate limit, sticky
+    // affinity, or any other claim gate. Back off so a held row does not cycle
+    // once per poll interval.
+    ReferenceOutcome::Release(crate::dispatch::release_delay(
+        redeliveries,
+        settings.poll_interval,
+        settings.release_backoff_cap,
+    ))
+}
+
 impl Worker {
     /// Create a new worker from validated config and a handler registry.
     ///
@@ -23832,6 +23969,29 @@ impl Worker {
         // defense-in-depth; this startup gate is the primary comprehensive check.
         crate::builder::validate_activity_rate_limits(registry.activities.values())
             .map_err(|err| HarvestError::Config(err.to_string()))?;
+
+        // Redis dispatch is single-shard in v1 (issue #1312). The channel
+        // carries a task id and no connection. A worker that drains several
+        // shards cannot tell which pool holds the named row. A reference read
+        // on one shard would then be claimed against another shard's database
+        // and always miss. Reject the combination at startup rather than let
+        // it degrade to a silent no-claim loop. `shard` on `DispatchHint`
+        // carries the follow-up that lifts this limit.
+        if crate::dispatch::installed().is_some() {
+            let shard_count = config.shard_assignments.len();
+            #[cfg(feature = "db")]
+            let pool_shards = config
+                .sharded_pool
+                .as_ref()
+                .map_or(0, crate::shard::ShardedDbPool::len);
+            #[cfg(not(feature = "db"))]
+            let pool_shards = 0;
+            if shard_count > 1 || pool_shards > 1 {
+                return Err(HarvestError::Config(format!(
+                    "a dispatch channel is installed and this worker spans {shard_count}                      shard assignments and {pool_shards} sharded pool entries; dispatch                      supports single-shard runtimes only in v1 (issue #1312)"
+                )));
+            }
+        }
 
         let mut ineligible_activities = Vec::new();
         for activity in registry.activities.values() {
@@ -25405,6 +25565,269 @@ impl Worker {
         )
     }
 
+    /// Run one dispatch-channel iteration (issue #1312).
+    ///
+    /// Reads up to the free concurrency in references. Claims each named row
+    /// with the full claim predicate. Acks or releases the reference by the
+    /// outcome table in [`reference_outcome`]. Maintenance and the reconcile
+    /// sweep run on their own intervals from here.
+    ///
+    /// Returns `true` when at least one task was dispatched.
+    ///
+    /// On a channel error it falls back to [`Self::poll_once`] for this
+    /// iteration, so availability equals the Postgres path when the channel is
+    /// unreachable.
+    async fn run_dispatch_iteration(
+        &self,
+        pool: &DbPool,
+        shard: Option<crate::types::ShardId>,
+        installed: &crate::dispatch::InstalledDispatch,
+        state: &mut DispatchLoopState,
+    ) -> bool {
+        let settings = &installed.settings;
+
+        if DispatchLoopState::due(&mut state.maintained, settings.poll_interval)
+            && let Err(error) = installed.channel.maintain(&self.config.queues).await
+        {
+            self.log_dispatch_error(state, &error, "dispatch maintenance failed");
+        }
+
+        if DispatchLoopState::due(&mut state.reconciled, settings.reconcile_interval) {
+            self.run_dispatch_reconcile(pool, installed, state).await;
+        }
+
+        // One read sized to the free concurrency, so the worker never holds
+        // more references than it can start. The semaphores gate execution,
+        // not claiming, so this is a bound and not a guarantee.
+        let free = self
+            .workflow_semaphore
+            .available_permits()
+            .saturating_add(self.activity_semaphore.available_permits());
+        let want = free.clamp(1, DISPATCH_READ_MAX);
+
+        let leases = match installed
+            .channel
+            .next(
+                &self.config.queues,
+                &self.config.worker_id,
+                want,
+                settings.poll_interval,
+            )
+            .await
+        {
+            Ok(leases) => leases,
+            Err(error) => {
+                self.log_dispatch_error(state, &error, "dispatch read failed");
+                let dispatched = self
+                    .poll_once(
+                        pool,
+                        shard_acquire_bound(false, self.config.poll_interval),
+                        shard,
+                    )
+                    .await;
+                tokio::time::sleep(self.config.poll_interval).await;
+                return dispatched;
+            }
+        };
+
+        let mut dispatched = false;
+        for lease in leases {
+            if self.shutdown.is_cancelled() {
+                // Give the reference straight back so a peer serves it now.
+                let _ = installed.channel.release(&lease, Duration::ZERO).await;
+                continue;
+            }
+            dispatched |= self
+                .consume_reference(pool, shard, installed, state, lease)
+                .await;
+        }
+        dispatched
+    }
+
+    /// Claim the row one reference names, then ack or release the reference.
+    ///
+    /// Returns `true` when the row was claimed and dispatched.
+    async fn consume_reference(
+        &self,
+        pool: &DbPool,
+        shard: Option<crate::types::ShardId>,
+        installed: &crate::dispatch::InstalledDispatch,
+        state: &mut DispatchLoopState,
+        lease: crate::dispatch::DispatchLease,
+    ) -> bool {
+        let mut conn = match acquire_shard_conn(
+            pool,
+            shard_acquire_bound(false, self.config.poll_interval),
+        )
+        .await
+        {
+            Ok(conn) => conn,
+            Err(error) => {
+                tracing::warn!(error = %error, "failed to get connection for a dispatch reference");
+                // The pool is unavailable, not the row, so give the reference
+                // straight back and let the next iteration try again.
+                self.retry_reference(installed, &lease).await;
+                return false;
+            }
+        };
+
+        let circuit_breakers = self.registry.circuit_breakers();
+        let claimed = queue::claim_task_by_id_on_shard(
+            &mut conn,
+            lease.task_id,
+            &self.config.queues,
+            &self.config.worker_id,
+            &self.config.build_id,
+            self.config.priority_aging_secs,
+            circuit_breakers.tracked_activity_names(),
+            &self.ineligible_activities,
+            shard,
+        )
+        .await;
+
+        match claimed {
+            Ok(Some(task)) => {
+                // The claim has committed and the row is `RUNNING` under this
+                // worker. A crash here leaves the reference in the channel's
+                // pending list; recovery redelivers it, the row reads
+                // `RUNNING`, and the redelivered reference is acked.
+                chaos_point!(DISPATCH_AFTER_CLAIM_BEFORE_ACK);
+                if let Err(error) = installed.channel.ack(&lease).await {
+                    // The claim is durable either way. A failed ack costs one
+                    // redelivery, which finds the row `RUNNING` and acks.
+                    self.log_dispatch_error(state, &error, "dispatch ack failed after a claim");
+                }
+                tracing::debug!(
+                    task_id = %task.id,
+                    task_type = %task.task_type,
+                    queue = %task.queue_name,
+                    "claimed task (dispatch)"
+                );
+                drop(conn);
+                self.dispatch_task(task, pool);
+                true
+            }
+            Ok(None) => {
+                let probe = match queue::dispatch_probe(&mut conn, lease.task_id).await {
+                    Ok(probe) => probe,
+                    Err(error) => {
+                        tracing::warn!(error = %error, task_id = %lease.task_id, "dispatch probe failed");
+                        self.retry_reference(installed, &lease).await;
+                        return false;
+                    }
+                };
+                let outcome = reference_outcome(
+                    probe.as_ref(),
+                    lease.redeliveries,
+                    chrono::Utc::now(),
+                    &installed.settings,
+                );
+                let result = match outcome {
+                    ReferenceOutcome::Ack => installed.channel.ack(&lease).await,
+                    ReferenceOutcome::Release(delay) => {
+                        installed.channel.release(&lease, delay).await
+                    }
+                };
+                if let Err(error) = result {
+                    self.log_dispatch_error(state, &error, "dispatch reference disposal failed");
+                }
+                false
+            }
+            Err(error) => {
+                tracing::error!(error = %error, task_id = %lease.task_id, "failed to claim a dispatched task");
+                self.retry_reference(installed, &lease).await;
+                false
+            }
+        }
+    }
+
+    /// Republish every due `PENDING` row for this worker's queues.
+    ///
+    /// This sweep is the channel's durability floor. A channel restart, a lost
+    /// reference, a dropped hint, or a crash between commit and publish all
+    /// converge through it.
+    async fn run_dispatch_reconcile(
+        &self,
+        pool: &DbPool,
+        installed: &crate::dispatch::InstalledDispatch,
+        state: &mut DispatchLoopState,
+    ) {
+        let mut conn = match acquire_shard_conn(
+            pool,
+            shard_acquire_bound(false, self.config.poll_interval),
+        )
+        .await
+        {
+            Ok(conn) => conn,
+            Err(error) => {
+                tracing::warn!(error = %error, "failed to get connection for the dispatch reconcile sweep");
+                return;
+            }
+        };
+        let hints = match queue::due_dispatch_hints(
+            &mut conn,
+            &self.config.queues,
+            installed.settings.reconcile_batch,
+        )
+        .await
+        {
+            Ok(hints) => hints,
+            Err(error) => {
+                tracing::warn!(error = %error, "dispatch reconcile read failed");
+                return;
+            }
+        };
+        // The throttle metrics ride on this sweep. The Postgres poll path
+        // emits them from an idle `poll_once`, which the dispatch path never
+        // runs. Without this the series would go dark under dispatch. The
+        // sweep already holds a connection and runs once per reconcile
+        // interval, so this costs one read per interval rather than one per
+        // poll.
+        self.emit_throttle_metrics(&mut conn).await;
+
+        if hints.is_empty() {
+            return;
+        }
+        if let Err(error) = installed.channel.publish(&hints).await {
+            self.log_dispatch_error(state, &error, "dispatch reconcile publish failed");
+        }
+    }
+
+    /// Give a reference back after a local failure, so the next iteration
+    /// retries it.
+    ///
+    /// The delay is one poll interval rather than the exponential backoff: the
+    /// row was never judged, so this is not evidence that it is gated.
+    async fn retry_reference(
+        &self,
+        installed: &crate::dispatch::InstalledDispatch,
+        lease: &crate::dispatch::DispatchLease,
+    ) {
+        let _ = installed
+            .channel
+            .release(lease, self.config.poll_interval)
+            .await;
+    }
+
+    /// Log a channel error at most once per [`DISPATCH_ERROR_LOG_INTERVAL`].
+    ///
+    /// A channel that is down fails on every iteration, so an unthrottled log
+    /// would bury the rest of the worker's output.
+    fn log_dispatch_error(
+        &self,
+        state: &mut DispatchLoopState,
+        error: &HarvestError,
+        message: &'static str,
+    ) {
+        if state.may_log_error() {
+            tracing::warn!(
+                worker_id = %self.config.worker_id,
+                error = %error,
+                "{message}"
+            );
+        }
+    }
+
     async fn run_poll_loop(
         &self,
         pool: &DbPool,
@@ -25412,6 +25835,10 @@ impl Worker {
         mut listener: Option<crate::notify::QueueListener>,
         registration_pending: &AtomicBool,
     ) {
+        // Dispatch-channel state for this loop (issue #1312). All three are
+        // inert when no channel is installed.
+        let mut dispatch_state = DispatchLoopState::new();
+
         while !self.shutdown.is_cancelled() {
             // Do not claim while this pool's registration is unverified: an
             // unregistered worker is invisible to peers' capability evidence AND
@@ -25422,6 +25849,30 @@ impl Worker {
                 tokio::select! {
                     () = self.shutdown.cancelled() => break,
                     () = tokio::time::sleep(self.config.poll_interval) => {}
+                }
+                continue;
+            }
+
+            // Dispatch channel (issue #1312). A reference names a row; the
+            // by-id claim applies the full claim predicate to it. The
+            // LISTEN/NOTIFY listener below is left alone: an extra wake is
+            // harmless and it keeps the fallback path warm.
+            //
+            // Configured queue weights (issue #515) do not apply to a
+            // reference read. The channel decides delivery order, and the
+            // reconcile sweep publishes in `(priority DESC, scheduled_at ASC)`
+            // order, so priority is best effort under dispatch. The weighted
+            // permutation still governs the `poll_once` fallback.
+            if let Some(installed) = crate::dispatch::installed() {
+                if self
+                    .run_dispatch_iteration(pool, shard, &installed, &mut dispatch_state)
+                    .await
+                    && let Some(shard) = shard
+                {
+                    self.registry
+                        .telemetry()
+                        .metrics
+                        .record_shard_dispatched(shard_metric_label(shard));
                 }
                 continue;
             }
@@ -26131,7 +26582,11 @@ impl Worker {
         // clock skew never leaks into the sample (issue #501 review).
         let dispatched_at = std::time::Instant::now();
 
-        tokio::spawn(async move {
+        // The task body is bound rather than spawned directly so it can run
+        // inside a dispatch buffering scope (issue #1312). Binding keeps the
+        // body at the same nesting, so this change adds no reindentation to
+        // the hottest file in the repo.
+        let task_body = async move {
             // Acquire semaphore permit — blocks if at concurrency limit.
             let Ok(permit) = semaphore.acquire().await else {
                 tracing::error!(task_id = %task_id, "semaphore closed");
@@ -26388,6 +26843,17 @@ impl Worker {
                     );
                 }
             }
+        };
+        tokio::spawn(async move {
+            // Every hint this task raises waits in the scope until the
+            // transaction that raised it commits and a flush point publishes
+            // it. This is the catch-all for a hint no flush point reached.
+            // A hint left by a rolled-back transaction names a row that is not
+            // `PENDING`. A reader probes such a row and acks the reference.
+            // The settle points on the two activity-finalize transactions drop
+            // those hints before they get this far.
+            let ((), hints) = Box::pin(crate::dispatch::buffered(task_body)).await;
+            crate::dispatch::publish_now(hints).await;
         });
     }
 
@@ -26951,6 +27417,9 @@ pub async fn reset_timed_out_workflow_task(pool: &DbPool, task_id: uuid::Uuid, w
     .await
     {
         Ok(n) if n > 0 => {
+            // Dispatch hint (issue #1312). The row is `PENDING` again with no
+            // owner, so the channel gets a reference to it.
+            crate::queue::record_pending_hints(&mut conn, &[task_id]).await;
             tracing::debug!(
                 task_id = %task_id,
                 worker_id = %worker_id,
@@ -36981,6 +37450,133 @@ mod tests {
         assert!(
             matches!(report.status, crate::testing::ReplayStatus::ReplaySucceeded),
             "a failing cycle's own persisted history must replay cleanly: {report}"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Dispatch reference outcome table (issue #1312)
+    // -----------------------------------------------------------------------
+
+    fn dispatch_settings() -> crate::dispatch::DispatchSettings {
+        crate::dispatch::DispatchSettings {
+            poll_interval: Duration::from_millis(20),
+            reconcile_interval: Duration::from_secs(1),
+            reconcile_batch: 100,
+            release_backoff_cap: Duration::from_secs(30),
+        }
+    }
+
+    fn probe(
+        state: &str,
+        scheduled_at: chrono::DateTime<chrono::Utc>,
+    ) -> crate::queue::DispatchProbe {
+        crate::queue::DispatchProbe {
+            state: state.to_string(),
+            scheduled_at,
+            has_worker: state == "RUNNING",
+        }
+    }
+
+    #[test]
+    fn a_due_gated_row_is_released_with_a_growing_delay() {
+        let settings = dispatch_settings();
+        let now = chrono::Utc::now();
+        let due = probe("PENDING", now - chrono::Duration::seconds(1));
+
+        assert_eq!(
+            reference_outcome(Some(&due), 0, now, &settings),
+            ReferenceOutcome::Release(Duration::from_millis(20))
+        );
+        assert_eq!(
+            reference_outcome(Some(&due), 3, now, &settings),
+            ReferenceOutcome::Release(Duration::from_millis(160))
+        );
+        assert_eq!(
+            reference_outcome(Some(&due), 40, now, &settings),
+            ReferenceOutcome::Release(settings.release_backoff_cap)
+        );
+    }
+
+    #[test]
+    fn a_row_that_is_not_due_yet_is_held_until_its_due_time() {
+        let settings = dispatch_settings();
+        let now = chrono::Utc::now();
+        let later = probe("PENDING", now + chrono::Duration::milliseconds(500));
+
+        assert_eq!(
+            reference_outcome(Some(&later), 0, now, &settings),
+            ReferenceOutcome::Release(Duration::from_millis(500))
+        );
+    }
+
+    #[test]
+    fn a_far_future_row_is_held_no_longer_than_the_backoff_cap() {
+        let settings = dispatch_settings();
+        let now = chrono::Utc::now();
+        let far = probe("PENDING", now + chrono::Duration::days(7));
+
+        assert_eq!(
+            reference_outcome(Some(&far), 0, now, &settings),
+            ReferenceOutcome::Release(settings.release_backoff_cap)
+        );
+    }
+
+    #[test]
+    fn a_running_or_terminal_row_is_acked() {
+        let settings = dispatch_settings();
+        let now = chrono::Utc::now();
+        for state in ["RUNNING", "COMPLETED", "FAILED", "CANCELLED"] {
+            assert_eq!(
+                reference_outcome(Some(&probe(state, now)), 0, now, &settings),
+                ReferenceOutcome::Ack,
+                "a {state} row must be acked"
+            );
+        }
+    }
+
+    #[test]
+    fn an_absent_row_gets_three_short_releases_and_is_then_acked() {
+        let settings = dispatch_settings();
+        let now = chrono::Utc::now();
+
+        for redeliveries in 0..DISPATCH_ABSENT_ROW_RELEASES {
+            assert_eq!(
+                reference_outcome(None, redeliveries, now, &settings),
+                ReferenceOutcome::Release(DISPATCH_ABSENT_ROW_DELAY),
+                "an uncommitted insert must get a short release"
+            );
+        }
+        assert_eq!(
+            reference_outcome(None, DISPATCH_ABSENT_ROW_RELEASES, now, &settings),
+            ReferenceOutcome::Ack,
+            "a row that is still absent after the grace releases is gone"
+        );
+    }
+
+    #[test]
+    fn the_dispatch_error_log_is_rate_limited() {
+        let mut state = DispatchLoopState::new();
+        assert!(state.may_log_error(), "the first error is always logged");
+        assert!(
+            !state.may_log_error(),
+            "a second error inside the interval is suppressed"
+        );
+    }
+
+    #[test]
+    fn the_dispatch_loop_maintains_and_reconciles_on_its_first_iteration() {
+        let mut state = DispatchLoopState::new();
+        assert!(
+            DispatchLoopState::due(&mut state.maintained, Duration::ZERO),
+            "the first iteration must maintain before it waits"
+        );
+        assert!(
+            DispatchLoopState::due(&mut state.reconciled, Duration::ZERO),
+            "the first iteration must reconcile before it waits"
+        );
+        assert!(
+            !DispatchLoopState::due(&mut state.maintained, Duration::from_secs(3600)),
+            "a timer that has not elapsed is not due"
         );
     }
 }
