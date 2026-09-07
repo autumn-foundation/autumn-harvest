@@ -3397,6 +3397,7 @@ mod tests {
                 // rejection ever moved back behind the gate, this test would
                 // start reaching for a database it has no access to.
                 startup: crate::config::HarvestStartupConfig::default(),
+                redis: crate::config::HarvestRedisConfig::default(),
             },
             HarvestRunnerResources::new(pool),
         )
@@ -3505,6 +3506,7 @@ mod tests {
             batch: crate::config::HarvestBatchConfig::default(),
             readiness: crate::config::HarvestReadinessConfig::default(),
             startup: crate::config::HarvestStartupConfig::default(),
+            redis: crate::config::HarvestRedisConfig::default(),
         };
 
         let harvest_pool = resolve_harvest_pool(&state, &config)

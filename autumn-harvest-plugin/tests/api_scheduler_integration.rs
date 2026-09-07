@@ -3029,6 +3029,7 @@ async fn external_runner_processes_workflows_started_via_management_api() {
             batch: autumn_harvest_plugin::HarvestBatchConfig::default(),
             readiness: autumn_harvest_plugin::HarvestReadinessConfig::default(),
             startup: autumn_harvest_plugin::HarvestStartupConfig::default(),
+            redis: autumn_harvest_plugin::HarvestRedisConfig::default(),
         },
         HarvestRunnerResources::new(pool.clone()),
     )
@@ -3076,6 +3077,7 @@ async fn external_runner_processes_workflows_started_via_management_api() {
             batch: autumn_harvest_plugin::HarvestBatchConfig::default(),
             readiness: autumn_harvest_plugin::HarvestReadinessConfig::default(),
             startup: autumn_harvest_plugin::HarvestStartupConfig::default(),
+            redis: autumn_harvest_plugin::HarvestRedisConfig::default(),
         },
         HarvestRunnerResources::new(pool.clone()),
     )
@@ -3727,6 +3729,7 @@ async fn retention_janitor_deletes_only_rows_older_than_max_age_and_cascades_chi
             batch: autumn_harvest_plugin::HarvestBatchConfig::default(),
             readiness: autumn_harvest_plugin::HarvestReadinessConfig::default(),
             startup: autumn_harvest_plugin::HarvestStartupConfig::default(),
+            redis: autumn_harvest_plugin::HarvestRedisConfig::default(),
         },
         HarvestRunnerResources::new(pool.clone()),
     )

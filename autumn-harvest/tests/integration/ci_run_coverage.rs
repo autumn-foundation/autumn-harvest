@@ -304,7 +304,7 @@ fn allowlisted(key: &str) -> bool {
 struct SuiteRow {
     /// `linux` | `linuxpart` | `allos` | `compileonly`.
     osclass: String,
-    /// `autumn-harvest` | `autumn-harvest-plugin`.
+    /// `autumn-harvest` | `autumn-harvest-plugin` | `autumn-harvest-redis`.
     krate: String,
     /// The `--test <target>` binary (core suites use `integration`).
     target: String,
@@ -357,7 +357,11 @@ fn parse_manifest() -> Vec<SuiteRow> {
     // would never match a coverage lookup. Reject either as a typo.
     // extend this set when a new crate/osclass is introduced.
     const VALID_OSCLASS: &[&str] = &["linux", "linuxpart", "allos", "compileonly"];
-    const VALID_CRATE: &[&str] = &["autumn-harvest", "autumn-harvest-plugin"];
+    const VALID_CRATE: &[&str] = &[
+        "autumn-harvest",
+        "autumn-harvest-plugin",
+        "autumn-harvest-redis",
+    ];
     let mut out = Vec::new();
     for (n, line) in MANIFEST.lines().enumerate() {
         let t = line.trim();

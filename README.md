@@ -312,6 +312,8 @@ for a compile-checked polling loop that works with and without the `db` feature.
 | [`autumn-harvest-plugin`](autumn-harvest-plugin/) | `HarvestPlugin` — wires the engine into an Autumn `AppBuilder`, mounts the management API, owns the runtime lifecycle |
 | [`autumn-harvest-macros`](autumn-harvest-macros/) | `#[workflow]`, `#[activity]`, `#[dag]`, `workflows![]`, `activities![]` proc macros |
 | [`autumn-harvest-cli`](autumn-harvest-cli/) | `harvest` CLI: thin operator client for the management API |
+| [`autumn-harvest-redis`](autumn-harvest-redis/) | Optional Redis Streams dispatch channel — carries references to claimable rows; Postgres stays the source of truth |
+| [`autumn-harvest-sqlite`](autumn-harvest-sqlite/) | Optional SQLite storage backend for single-process and embedded deployments |
 
 Use `autumn-harvest-plugin` if you're building an Autumn app. Use the bare
 `autumn-harvest` crate if you want to embed the engine in another framework or
@@ -1112,6 +1114,31 @@ require_shard_readiness = true
 
 The equivalent environment override is
 `AUTUMN_HARVEST_READINESS__REQUIRE_SHARD_READINESS=true`.
+
+## Redis dispatch (optional)
+
+Postgres is the only required infrastructure dependency. On a deep backlog
+the Postgres claim scans and sorts the queue on every claim. An optional
+Redis Streams **dispatch channel** removes that scan: the engine publishes a
+small reference (task id, queue, due time) for each claimable row, and a
+worker claims the named row in Postgres with the full claim predicate before
+it acks the reference. Postgres keeps every row, every claim gate and the
+whole history write path.
+
+Build `autumn-harvest-plugin` with the `redis` feature, then set the URL:
+
+```toml
+[harvest.redis]
+url = "redis://cache:6379"
+```
+
+Leave `url` unset and every worker stays on the Postgres claim path, which
+is the default. When Redis is unreachable the worker falls back to that same
+path, so availability does not depend on Redis. A build without the `redis`
+feature rejects a configured URL at startup rather than ignoring it.
+
+See [`docs/operations/redis-dispatch.md`](docs/operations/redis-dispatch.md)
+for the key layout, the crash matrix, the failure modes and the v1 limits.
 
 ## Testing workflow code changes with the replayer
 
