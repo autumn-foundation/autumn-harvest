@@ -2341,32 +2341,6 @@ struct DeadLetterUiFilterRaw {
     failed_before_error: Option<String>,
 }
 
-impl DeadLetterUiFilterRaw {
-    /// Derives raw display text from an already-parsed, always-valid filter
-    /// set. An example is a summary drilldown's synthesized filters. This
-    /// differs from operator input, so there is never an error to show.
-    fn from_filters(filters: &DeadLetterUiFilters) -> Self {
-        Self {
-            task_kind: filters
-                .task_kind
-                .map(DeadLetterTaskKind::as_label)
-                .unwrap_or_default()
-                .to_string(),
-            task_kind_error: None,
-            failed_after: filters
-                .failed_after
-                .map(|ts| ts.to_rfc3339())
-                .unwrap_or_default(),
-            failed_after_error: None,
-            failed_before: filters
-                .failed_before
-                .map(|ts| ts.to_rfc3339())
-                .unwrap_or_default(),
-            failed_before_error: None,
-        }
-    }
-}
-
 /// Parses the DLQ page's filters from raw query-string values. An
 /// unrecognized `task_kind`, or an unparseable `failed_after`/`failed_before`,
 /// used to `?`-abort the whole page. This happened before the filter form
@@ -3276,7 +3250,7 @@ async fn render_dead_letters_summary_view(
                 }
             }
         } @else {
-            (render_dlq_summary_table(&response, &group_by, filters, limit, refresh))
+            (render_dlq_summary_table(&response, &group_by, filters, filter_raw, limit, refresh))
         }
     };
 
@@ -3480,6 +3454,7 @@ fn render_dlq_summary_table(
     response: &autumn_harvest::dlq::DlqAggregateResponse,
     group_by: &[autumn_harvest::dlq::DlqGroupDimension],
     filters: &DeadLetterUiFilters,
+    filter_raw: &DeadLetterUiFilterRaw,
     limit: i64,
     refresh: Option<u64>,
 ) -> Markup {
@@ -3528,7 +3503,7 @@ fn render_dlq_summary_table(
                             @if is_other {
                                 "—"
                             } @else {
-                                @let (href, partial) = dlq_summary_drilldown_href(&group.key, group_by, filters, limit, refresh);
+                                @let (href, partial) = dlq_summary_drilldown_href(&group.key, group_by, filters, filter_raw, limit, refresh);
                                 a href=(href) title=[partial.then_some("Some dimensions have no list-view filter — results may include extra rows from other groups")] {
                                     @if partial {
                                         "View entries (partial filter) →"
@@ -3564,14 +3539,22 @@ fn dlq_summary_drilldown_href(
     key: &serde_json::Value,
     group_by: &[autumn_harvest::dlq::DlqGroupDimension],
     filters: &DeadLetterUiFilters,
+    filter_raw: &DeadLetterUiFilterRaw,
     limit: i64,
     refresh: Option<u64>,
 ) -> (String, bool) {
     use autumn_harvest::dlq::DlqGroupDimension;
 
     // Start from the filters already applied to the summary so drill-down
-    // narrows rather than widens.
+    // narrows rather than widens. `drill_raw` starts as a clone of the
+    // summary's own raw state, not a derivation from `drill`. Codex review
+    // on #1420: a derived-only `drill_raw` silently dropped an invalid
+    // failed_after/failed_before (and its error) on every "View entries"
+    // link, even though this function never touches those two fields. The
+    // view toggle, refresh, and group-by form all preserve that same
+    // invalid value; the drilldown link must not be the one exception.
     let mut drill = filters.clone();
+    let mut drill_raw = filter_raw.clone();
     let mut partial = false;
     for dim in group_by {
         match dim {
@@ -3582,7 +3565,17 @@ fn dlq_summary_drilldown_href(
             }
             DlqGroupDimension::TaskType => {
                 if let Some(serde_json::Value::String(task_type)) = key.get("task_type") {
+                    // This field IS synthesized fresh from the group's own
+                    // key, unlike failed_after/failed_before above. It is
+                    // always valid (or absent), so its raw text and error
+                    // are overwritten to match, not merely inherited.
                     drill.task_kind = DeadLetterTaskKind::parse(task_type).ok();
+                    drill_raw.task_kind = drill
+                        .task_kind
+                        .map(DeadLetterTaskKind::as_label)
+                        .unwrap_or_default()
+                        .to_string();
+                    drill_raw.task_kind_error = None;
                 }
             }
             // No list-view filter exists for these dimensions; the link will
@@ -3598,7 +3591,6 @@ fn dlq_summary_drilldown_href(
         }
     }
 
-    let drill_raw = DeadLetterUiFilterRaw::from_filters(&drill);
     let query = build_dead_letter_query_string(limit, &drill, &drill_raw, refresh);
     let href = if query.is_empty() {
         "dead-letters".to_string()
@@ -11524,7 +11516,7 @@ mod tests {
             ..DeadLetterUiFilters::default()
         };
 
-        let filter_raw = DeadLetterUiFilterRaw::from_filters(&filters);
+        let filter_raw = DeadLetterUiFilterRaw::default();
         let html = render_dead_letter_bulk_actions(
             &filters,
             &filter_raw,
@@ -11594,7 +11586,7 @@ mod tests {
             ..DeadLetterUiFilters::default()
         };
 
-        let filter_raw = DeadLetterUiFilterRaw::from_filters(&filters);
+        let filter_raw = DeadLetterUiFilterRaw::default();
         let html = render_dead_letter_bulk_actions(
             &filters,
             &filter_raw,
@@ -11769,6 +11761,78 @@ mod tests {
         assert!(
             query.contains("failed_after=not-a-date"),
             "invalid failed_after must round-trip: {query}"
+        );
+    }
+
+    /// Codex review on #1420: a summary drilldown's "View entries" link
+    /// used to derive its `drill_raw` solely from the successfully parsed
+    /// filters, silently dropping an invalid `failed_after`/`failed_before`
+    /// and its error — even though this function never touches those two
+    /// fields. The view toggle, refresh, and group-by form all preserve
+    /// that same invalid value; the drilldown link must not be the one
+    /// exception.
+    #[test]
+    fn dlq_summary_drilldown_href_preserves_invalid_failed_after() {
+        use autumn_harvest::dlq::DlqGroupDimension;
+
+        let filters = DeadLetterUiFilters {
+            workflow_name: Some("invoice_workflow".to_string()),
+            ..DeadLetterUiFilters::default()
+        };
+        let filter_raw = DeadLetterUiFilterRaw {
+            task_kind: String::new(),
+            task_kind_error: None,
+            failed_after: "not-a-date".to_string(),
+            failed_after_error: Some("bad failed_after".to_string()),
+            failed_before: String::new(),
+            failed_before_error: None,
+        };
+        let key = serde_json::json!({"workflow_name": "invoice_workflow"});
+        let (href, _partial) = dlq_summary_drilldown_href(
+            &key,
+            &[DlqGroupDimension::WorkflowName],
+            &filters,
+            &filter_raw,
+            DEFAULT_DLQ_PAGE_SIZE,
+            None,
+        );
+        assert!(
+            href.contains("failed_after=not-a-date"),
+            "the drilldown link must preserve the invalid failed_after the \
+             summary view had, not silently drop it: {href}"
+        );
+    }
+
+    /// Same review: the `task_kind` field IS synthesized by this function
+    /// for the `TaskType` group-by dimension, so its raw text is
+    /// overwritten to match the group's own key rather than inherited from
+    /// a stale, unrelated error the summary view happened to be showing.
+    #[test]
+    fn dlq_summary_drilldown_href_overwrites_task_kind_synthesized_from_group() {
+        use autumn_harvest::dlq::DlqGroupDimension;
+
+        let filters = DeadLetterUiFilters::default();
+        let filter_raw = DeadLetterUiFilterRaw {
+            task_kind: "zombie".to_string(),
+            task_kind_error: Some("stale error from an unrelated typo".to_string()),
+            failed_after: String::new(),
+            failed_after_error: None,
+            failed_before: String::new(),
+            failed_before_error: None,
+        };
+        let key = serde_json::json!({"task_type": "ACTIVITY"});
+        let (href, _partial) = dlq_summary_drilldown_href(
+            &key,
+            &[DlqGroupDimension::TaskType],
+            &filters,
+            &filter_raw,
+            DEFAULT_DLQ_PAGE_SIZE,
+            None,
+        );
+        assert!(
+            href.contains("task_kind=Activity"),
+            "the drilldown must use the group's own task_type, not the \
+             stale raw value: {href}"
         );
     }
 
