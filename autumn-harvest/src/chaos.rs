@@ -200,6 +200,19 @@ pub mod points {
         caps: CAP_DROP_NOTIFY,
     };
 
+    /// In the worker's dispatch consume path, after the by-id claim
+    /// transaction commits and before the reference is acked.
+    ///
+    /// Race window for issue #1312: a worker that dies here leaves the row
+    /// `RUNNING` and the reference in the channel's pending list. The
+    /// poison-pill reclaim re-pends the row, the reconcile sweep republishes
+    /// it, and the recovered stale reference is acked as a no-op — so the
+    /// crash neither loses nor duplicates work.
+    pub const DISPATCH_AFTER_CLAIM_BEFORE_ACK: ChaosPoint = ChaosPoint {
+        name: "dispatch.after_claim.before_ack",
+        caps: CAP_KILL | CAP_DELAY,
+    };
+
     /// Every catalogue point, in a stable order.
     pub const ALL: &[ChaosPoint] = &[
         QUEUE_PARK_BEFORE_UPDATE,
@@ -210,6 +223,7 @@ pub mod points {
         SCHED_AFTER_START_BEFORE_ADVANCE,
         POISON_RECLAIM_BEFORE_LOAD,
         NOTIFY_TASK_ENQUEUED,
+        DISPATCH_AFTER_CLAIM_BEFORE_ACK,
     ];
 
     /// Ratchet on the catalogue size. Bump deliberately when adding points.

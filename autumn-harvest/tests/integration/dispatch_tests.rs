@@ -4,9 +4,9 @@
 //!
 //! The dispatch channel is process-global, so every case here takes
 //! [`DISPATCH_SERIAL`] and uninstalls the channel through a guard on the way
-//! out. The cases drive the real worker loop against a real Postgres, exactly
-//! as `workflow_retry_tests` does, so the claim path, the release backoff and
-//! the reconcile sweep are the shipped ones.
+//! out. The cases drive the real worker loop against a real Postgres, as
+//! `workflow_retry_tests` does. The claim path, the release backoff and the
+//! reconcile sweep are therefore the shipped ones.
 
 use std::pin::Pin;
 use std::sync::Arc;
@@ -415,9 +415,9 @@ async fn workflow_completes_through_the_channel() {
     })
     .await;
 
-    // Every task row this run produced must have been delivered by the channel
-    // before it could reach `RUNNING`: the by-id claim is the only writer of
-    // that transition on this path.
+    // Every task row this run produced reached `RUNNING` through a channel
+    // delivery. The by-id claim is the only writer of that transition on this
+    // path.
     let delivered = channel.delivered_ids();
     for task in tasks_for(&mut check, exec_id).await {
         assert!(

@@ -495,6 +495,16 @@ pub async fn enqueue(conn: &mut AsyncPgConnection, params: &EnqueueParams) -> Ha
 
     crate::notify::notify_task_enqueued(conn, &params.queue_name, task_id).await?;
 
+    // Dispatch hint (issue #1312). The row is `PENDING`, so the channel gets a
+    // reference to it. A row scheduled in the future is still recorded; the
+    // channel parks the reference until the due time.
+    record_pending_hint(
+        task_id,
+        &params.queue_name,
+        params.scheduled_at,
+        params.priority,
+    );
+
     Ok(task_id)
 }
 // NOTE (issue #619 / Ledger perf pass, buffers -98% @10k): the queue-pause
@@ -1071,9 +1081,9 @@ pub async fn claim_task_on_shard(
     // `SKIP LOCKED` past that row regardless — it is `RUNNING` either way — so
     // the added contention is the duration of a single PK probe.
     let mut tx = conn.build_transaction().read_committed();
-    let claimed: Option<TaskQueueItem> = tx
+    let outcome: ClaimOutcome = tx
         .run(
-            async |conn: &mut AsyncPgConnection| -> HarvestResult<Option<TaskQueueItem>> {
+            async |conn: &mut AsyncPgConnection| -> HarvestResult<ClaimOutcome> {
                 // Cross-region DR fence (issue #954). Two fully separate
                 // arms rather than one boxed builder: `BoxedSqlQuery::bind`
                 // heap-allocates per bind and dispatches dynamically, and the
@@ -1121,83 +1131,474 @@ pub async fn claim_task_on_shard(
                 .map_err(crate::error::database_error)?;
 
                 let Some(task) = result.into_iter().next() else {
-                    return Ok(None);
+                    return Ok(ClaimOutcome::Empty);
                 };
 
-                // Commit-order barrier (issue #619 round-18 review). The
-                // re-check below reads a snapshot taken *before* this
-                // transaction commits, so on its own it cannot stop a pause
-                // from committing — and being acknowledged to the operator —
-                // in the window between that snapshot and our COMMIT. Taking
-                // the *shared* mode of the key `pause_queue` takes exclusively
-                // makes that impossible: a pause cannot commit while any claim
-                // holds it, so a claim can only ever commit *before* the hold
-                // is acknowledged.
-                //
-                // It must be the `try` variant and it must be here rather than
-                // before the claim: the queue is not known until a task is in
-                // hand, so this path holds task rows and then wants the lock,
-                // the inverse of `resume_queue`'s advisory-then-rows order. A
-                // blocking acquire would be an ABBA deadlock; a failed `try`
-                // simply means a pause or resume is committing right now, so we
-                // give the claim back and let the next poll re-decide against
-                // committed state. See `queue_pause::try_lock_queue_for_claim`.
-                if !crate::queue_pause::try_lock_queue_for_claim(conn, &task.queue_name).await? {
-                    crate::queue_pause::release_claim(conn, task.id, worker_id).await?;
-                    return Ok(None);
-                }
-
-                // Authoritative queue-pause re-check (issue #619). The anti-join in
-                // the claim above is evaluated against that statement's snapshot,
-                // so a pause committing while the claim was in flight is invisible
-                // to it and the task would be dispatched into the very outage the
-                // hold exists to ride out. This is a *separate statement* and so
-                // takes a fresh snapshot (guaranteed by the pinned `READ COMMITTED`
-                // above), releasing the claim back to `PENDING` if the queue is now
-                // held. Holding the shared queue lock above makes its verdict
-                // authoritative *through commit* rather than only as of its own
-                // snapshot. See `queue_pause::release_claim_if_queue_paused` for
-                // why an exclusive lock inside the claim itself was rejected: it
-                // would serialize all claims for a queue and defeat `SKIP LOCKED`.
-                if crate::queue_pause::release_claim_if_queue_paused(conn, task.id, worker_id)
-                    .await?
-                {
-                    return Ok(None);
-                }
-
-                // Authoritative activity-pause re-check (issue #807). Same
-                // reasoning as the queue-pause re-check directly above: the
-                // `paused_activities` pre-filter in the claim is evaluated
-                // against that statement's snapshot, so a pause committing
-                // while the claim was in flight is invisible to it. This is a
-                // separate statement and therefore takes a fresh snapshot.
-                //
-                // Gated on `task_type` so a workflow task -- which can never be
-                // held by an activity pause -- pays no extra round trip on the
-                // hot claim path. The guard is not merely an optimization: it
-                // makes the added cost fall only on the rows the feature can
-                // actually hold.
-                //
-                // Unlike the queue-pause path there is no advisory-lock barrier
-                // here, so this verdict is authoritative as of its own snapshot
-                // rather than through commit. See the "Residual window" section
-                // on `activity_pause::release_claim_if_activity_paused` for the
-                // precise bound and why it is accepted.
-                if task.task_type == crate::activity_pause::ACTIVITY_TASK_TYPE
-                    && crate::activity_pause::release_claim_if_activity_paused(
-                        conn, task.id, worker_id,
-                    )
-                    .await?
-                {
-                    return Ok(None);
-                }
-
-                Ok(Some(task))
+                apply_post_claim_rechecks(conn, task, worker_id).await
             },
         )
         .await?;
 
-    Ok(claimed)
+    match outcome {
+        ClaimOutcome::Claimed(task) => Ok(Some(*task)),
+        // A released row is `PENDING` again now that this transaction has
+        // committed, and no dispatch reference names it, so hint it (issue
+        // #1312). The by-id path below deliberately does not: its caller still
+        // holds the reference and releases it with backoff.
+        ClaimOutcome::Released(task_id) => {
+            record_pending_hints(conn, &[task_id]).await;
+            Ok(None)
+        }
+        ClaimOutcome::Empty => Ok(None),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Dispatch channel support (issue #1312)
+// ---------------------------------------------------------------------------
+
+/// The `candidate` CTE predicate that the by-id claim adds.
+///
+/// The anchor is the queue-pause array test, which appears exactly once in the
+/// base query. Splicing after it keeps the added predicate inside `candidate`
+/// and leaves every other gate as the same text.
+const BY_ID_ANCHOR: &str = "AND NOT (harvest_task_queue.queue_name = ANY(paused_queues.names)) ";
+
+/// Splice `AND harvest_task_queue.id = <bind>` into `base`'s `candidate` CTE.
+///
+/// The assertion on the anchor count guards a future edit. An edit that
+/// duplicates or renames the anchor panics at first use. Without it, a by-id
+/// claim could silently claim some other row.
+fn splice_by_id_predicate(base: &str, bind: &str) -> String {
+    assert_eq!(
+        base.matches(BY_ID_ANCHOR).count(),
+        1,
+        "claim query by-id anchor must appear exactly once"
+    );
+    base.replace(
+        BY_ID_ANCHOR,
+        &format!("{BY_ID_ANCHOR}AND harvest_task_queue.id = {bind} "),
+    )
+}
+
+/// [`claim_task_query`] restricted to one named row (issue #1312).
+///
+/// Identical to the base query plus one predicate on `harvest_task_queue.id`
+/// in the `candidate` CTE, so every one of the thirteen claim gates still
+/// applies. A dispatch reference names a row; it never authorizes a claim.
+/// Binds `$7` task id on top of the base query's `$1..$6`.
+///
+/// # Why a splice rather than a second literal
+///
+/// The base query is the engine's hottest statement and every gate in it is
+/// pinned by a test. A copy would fork those guarantees the first time either
+/// copy is edited. See [`claim_task_query_fenced`] for the same argument.
+#[must_use]
+pub fn claim_task_by_id_query() -> &'static str {
+    static BY_ID: std::sync::LazyLock<String> =
+        std::sync::LazyLock::new(|| splice_by_id_predicate(claim_task_query(), "$7"));
+    &BY_ID
+}
+
+/// [`claim_task_by_id_query`] with the cross-region DR fence spliced in.
+///
+/// Derived from [`claim_task_query_fenced`], which already binds `$7` shard id
+/// and `$8` pinned generation, so the by-id predicate binds `$9`.
+#[must_use]
+pub fn claim_task_by_id_query_fenced() -> &'static str {
+    static BY_ID_FENCED: std::sync::LazyLock<String> =
+        std::sync::LazyLock::new(|| splice_by_id_predicate(claim_task_query_fenced(), "$9"));
+    &BY_ID_FENCED
+}
+
+/// What one claim transaction concluded.
+#[derive(Debug)]
+enum ClaimOutcome {
+    /// The row is claimed and held by this worker.
+    Claimed(Box<TaskQueueItem>),
+    /// A post-claim re-check gave the row back. It is `PENDING` again once
+    /// this transaction commits.
+    Released(Uuid),
+    /// No row matched the claim predicate.
+    Empty,
+}
+
+/// The post-claim re-checks shared by [`claim_task_on_shard`] and
+/// [`claim_task_by_id_on_shard`].
+///
+/// Runs inside the caller's `READ COMMITTED` transaction, after the claim
+/// statement returned a row. See the long comment on [`claim_task_on_shard`]
+/// for why each step exists.
+async fn apply_post_claim_rechecks(
+    conn: &mut AsyncPgConnection,
+    task: TaskQueueItem,
+    worker_id: &str,
+) -> HarvestResult<ClaimOutcome> {
+    // Commit-order barrier (issue #619). The re-check below
+    // reads a snapshot taken *before* this transaction commits, so on its own
+    // it cannot stop a pause from committing — and being acknowledged to the
+    // operator — in the window between that snapshot and our COMMIT. Taking
+    // the *shared* mode of the key `pause_queue` takes exclusively makes that
+    // impossible: a pause cannot commit while any claim holds it, so a claim
+    // can only ever commit *before* the hold is acknowledged.
+    //
+    // It must be the `try` variant and it must be here rather than before the
+    // claim: the queue is not known until a task is in hand, so this path
+    // holds task rows and then wants the lock, the inverse of `resume_queue`'s
+    // advisory-then-rows order. A blocking acquire would be an ABBA deadlock;
+    // a failed `try` simply means a pause or resume is committing right now,
+    // so we give the claim back and let the next poll re-decide against
+    // committed state. See `queue_pause::try_lock_queue_for_claim`.
+    if !crate::queue_pause::try_lock_queue_for_claim(conn, &task.queue_name).await? {
+        crate::queue_pause::release_claim(conn, task.id, worker_id).await?;
+        return Ok(ClaimOutcome::Released(task.id));
+    }
+
+    // Authoritative queue-pause re-check (issue #619). The anti-join in the
+    // claim above is evaluated against that statement's snapshot, so a pause
+    // committing while the claim was in flight is invisible to it and the task
+    // would be dispatched into the very outage the hold exists to ride out.
+    // This is a *separate statement* and so takes a fresh snapshot (guaranteed
+    // by the pinned `READ COMMITTED` above), releasing the claim back to
+    // `PENDING` if the queue is now held. Holding the shared queue lock above
+    // makes its verdict authoritative *through commit* rather than only as of
+    // its own snapshot. See `queue_pause::release_claim_if_queue_paused` for
+    // why an exclusive lock inside the claim itself was rejected: it would
+    // serialize all claims for a queue and defeat `SKIP LOCKED`.
+    if crate::queue_pause::release_claim_if_queue_paused(conn, task.id, worker_id).await? {
+        return Ok(ClaimOutcome::Released(task.id));
+    }
+
+    // Authoritative activity-pause re-check (issue #807). Same reasoning as the
+    // queue-pause re-check directly above: the `paused_activities` pre-filter
+    // in the claim is evaluated against that statement's snapshot, so a pause
+    // committing while the claim was in flight is invisible to it. This is a
+    // separate statement and therefore takes a fresh snapshot.
+    //
+    // Gated on `task_type` so a workflow task -- which can never be held by an
+    // activity pause -- pays no extra round trip on the hot claim path. The
+    // guard is not merely an optimization: it makes the added cost fall only on
+    // the rows the feature can actually hold.
+    //
+    // Unlike the queue-pause path there is no advisory-lock barrier here, so
+    // this verdict is authoritative as of its own snapshot rather than through
+    // commit. See the "Residual window" section on
+    // `activity_pause::release_claim_if_activity_paused` for the precise bound
+    // and why it is accepted.
+    if task.task_type == crate::activity_pause::ACTIVITY_TASK_TYPE
+        && crate::activity_pause::release_claim_if_activity_paused(conn, task.id, worker_id).await?
+    {
+        return Ok(ClaimOutcome::Released(task.id));
+    }
+
+    Ok(ClaimOutcome::Claimed(Box::new(task)))
+}
+
+/// Claim one **named** `harvest_task_queue` row (issue #1312).
+///
+/// The dispatch channel carries a reference to a row. This claims that row
+/// with the full claim predicate. Every gate [`claim_task_on_shard`] applies
+/// still applies. So do both authoritative post-claim re-checks and the
+/// queue-pause advisory barrier. The query text, the transaction shape and the
+/// isolation level are the same. A reference is a latency hint, never an
+/// authorization.
+///
+/// Returns `None` when the row is gone, is not `PENDING`, is not yet due, or
+/// fails any gate. The caller decides from [`dispatch_probe`] whether to
+/// release the reference with backoff or to ack it.
+///
+/// # Errors
+///
+/// Returns [`crate::error::HarvestError::Database`] on query failure.
+#[allow(clippy::too_many_arguments)]
+pub async fn claim_task_by_id_on_shard(
+    conn: &mut AsyncPgConnection,
+    task_id: Uuid,
+    queues: &[String],
+    worker_id: &str,
+    worker_build_id: &str,
+    priority_aging_secs: Option<u32>,
+    circuit_breaker_activities: &[String],
+    ineligible_activities: &[String],
+    shard: Option<crate::types::ShardId>,
+) -> HarvestResult<Option<TaskQueueItem>> {
+    let aging_secs_i64: Option<i64> = priority_aging_secs.map(i64::from);
+
+    let mut tx = conn.build_transaction().read_committed();
+    let outcome: ClaimOutcome = tx
+        .run(
+            async |conn: &mut AsyncPgConnection| -> HarvestResult<ClaimOutcome> {
+                // Two fully separate arms for the same reason
+                // `claim_task_on_shard` uses them: a boxed builder
+                // heap-allocates per bind and dispatches dynamically.
+                let result: Vec<TaskQueueItem> = match fence_binding(shard) {
+                    None => {
+                        diesel::sql_query(claim_task_by_id_query())
+                            .bind::<diesel::sql_types::Text, _>(worker_id)
+                            .bind::<diesel::sql_types::Array<diesel::sql_types::Text>, _>(queues)
+                            .bind::<diesel::sql_types::Text, _>(worker_build_id)
+                            .bind::<diesel::sql_types::Nullable<diesel::sql_types::BigInt>, _>(
+                                aging_secs_i64,
+                            )
+                            .bind::<diesel::sql_types::Array<diesel::sql_types::Text>, _>(
+                                circuit_breaker_activities,
+                            )
+                            .bind::<diesel::sql_types::Array<diesel::sql_types::Text>, _>(
+                                ineligible_activities,
+                            )
+                            .bind::<diesel::sql_types::Uuid, _>(task_id)
+                            .load(conn)
+                            .await
+                    }
+                    Some((fence_shard, generation)) => {
+                        diesel::sql_query(claim_task_by_id_query_fenced())
+                            .bind::<diesel::sql_types::Text, _>(worker_id)
+                            .bind::<diesel::sql_types::Array<diesel::sql_types::Text>, _>(queues)
+                            .bind::<diesel::sql_types::Text, _>(worker_build_id)
+                            .bind::<diesel::sql_types::Nullable<diesel::sql_types::BigInt>, _>(
+                                aging_secs_i64,
+                            )
+                            .bind::<diesel::sql_types::Array<diesel::sql_types::Text>, _>(
+                                circuit_breaker_activities,
+                            )
+                            .bind::<diesel::sql_types::Array<diesel::sql_types::Text>, _>(
+                                ineligible_activities,
+                            )
+                            .bind::<diesel::sql_types::Integer, _>(fence_shard)
+                            .bind::<diesel::sql_types::BigInt, _>(generation)
+                            .bind::<diesel::sql_types::Uuid, _>(task_id)
+                            .load(conn)
+                            .await
+                    }
+                }
+                .map_err(crate::error::database_error)?;
+
+                let Some(task) = result.into_iter().next() else {
+                    return Ok(ClaimOutcome::Empty);
+                };
+
+                apply_post_claim_rechecks(conn, task, worker_id).await
+            },
+        )
+        .await?;
+
+    match outcome {
+        ClaimOutcome::Claimed(task) => Ok(Some(*task)),
+        // No hint on this path. The caller holds the dispatch reference for
+        // this row and releases it with backoff. That is the reference the row
+        // needs. A second one would only duplicate it.
+        ClaimOutcome::Released(_) | ClaimOutcome::Empty => Ok(None),
+    }
+}
+
+/// What a dispatch reference's row looks like right now (issue #1312).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DispatchProbe {
+    /// The row's `state` column.
+    pub state: String,
+    /// The time the row becomes claimable.
+    pub scheduled_at: DateTime<Utc>,
+    /// True when a worker holds the row.
+    pub has_worker: bool,
+}
+
+impl DispatchProbe {
+    /// True when the row can still become claimable.
+    #[must_use]
+    pub fn is_pending(&self) -> bool {
+        self.state == "PENDING"
+    }
+}
+
+/// Read the state of the row a dispatch reference names (issue #1312).
+///
+/// The worker calls this only when the by-id claim returned `None`, to choose
+/// between releasing the reference with backoff and acking it.
+///
+/// # Errors
+///
+/// Returns [`crate::error::HarvestError::Database`] on query failure.
+pub async fn dispatch_probe(
+    conn: &mut AsyncPgConnection,
+    task_id: Uuid,
+) -> HarvestResult<Option<DispatchProbe>> {
+    #[derive(diesel::QueryableByName)]
+    struct Row {
+        #[diesel(sql_type = diesel::sql_types::Text)]
+        state: String,
+        #[diesel(sql_type = diesel::sql_types::Timestamptz)]
+        scheduled_at: DateTime<Utc>,
+        #[diesel(sql_type = diesel::sql_types::Bool)]
+        has_worker: bool,
+    }
+
+    let rows: Vec<Row> = diesel::sql_query(dispatch_probe_query())
+        .bind::<diesel::sql_types::Uuid, _>(task_id)
+        .load(conn)
+        .await
+        .map_err(crate::error::database_error)?;
+
+    Ok(rows.into_iter().next().map(|row| DispatchProbe {
+        state: row.state,
+        scheduled_at: row.scheduled_at,
+        has_worker: row.has_worker,
+    }))
+}
+
+/// SQL for [`dispatch_probe`]. A primary-key read of three columns.
+#[must_use]
+pub const fn dispatch_probe_query() -> &'static str {
+    "SELECT state, scheduled_at, worker_id IS NOT NULL AS has_worker \
+     FROM harvest_task_queue \
+     WHERE id = $1"
+}
+
+/// SQL for [`due_dispatch_hints`], one queue per call (issue #1312).
+///
+/// One queue per statement so `idx_harvest_tq_poll` — which leads on
+/// `queue_name` and then carries `priority DESC, scheduled_at` — serves both
+/// the filter and the ordering. A single `queue_name = ANY(...)` statement
+/// would sort the union of every queue instead.
+#[must_use]
+pub const fn due_dispatch_hints_query() -> &'static str {
+    "SELECT id, queue_name, scheduled_at, priority \
+     FROM harvest_task_queue \
+     WHERE queue_name = $1 \
+       AND state = 'PENDING' \
+       AND scheduled_at <= NOW() \
+     ORDER BY priority DESC, scheduled_at ASC \
+     LIMIT $2"
+}
+
+/// Every due `PENDING` row for `queues`, as dispatch hints (issue #1312).
+///
+/// This is the reconcile sweep's read. It is the durability floor for the
+/// channel. A channel restart, a lost reference, a dropped hint and a crash
+/// between commit and publish all converge through it.
+///
+/// `limit` bounds the rows returned per queue.
+///
+/// # Errors
+///
+/// Returns [`crate::error::HarvestError::Database`] on query failure.
+pub async fn due_dispatch_hints(
+    conn: &mut AsyncPgConnection,
+    queues: &[String],
+    limit: usize,
+) -> HarvestResult<Vec<crate::dispatch::DispatchHint>> {
+    let capped = i64::try_from(limit).unwrap_or(i64::MAX);
+    let mut hints = Vec::new();
+    for queue in queues {
+        let rows: Vec<PendingHintRow> = diesel::sql_query(due_dispatch_hints_query())
+            .bind::<diesel::sql_types::Text, _>(queue)
+            .bind::<diesel::sql_types::BigInt, _>(capped)
+            .load(conn)
+            .await
+            .map_err(crate::error::database_error)?;
+        hints.extend(rows.into_iter().map(PendingHintRow::into_hint));
+    }
+    Ok(hints)
+}
+
+/// The columns a dispatch hint carries, read back from a row.
+#[derive(diesel::QueryableByName)]
+struct PendingHintRow {
+    #[diesel(sql_type = diesel::sql_types::Uuid)]
+    id: Uuid,
+    #[diesel(sql_type = diesel::sql_types::Text)]
+    queue_name: String,
+    #[diesel(sql_type = diesel::sql_types::Timestamptz)]
+    scheduled_at: DateTime<Utc>,
+    #[diesel(sql_type = diesel::sql_types::Integer)]
+    priority: i32,
+}
+
+impl PendingHintRow {
+    /// The hint for this row, borrowing the row.
+    fn to_hint(&self) -> crate::dispatch::DispatchHint {
+        crate::dispatch::DispatchHint {
+            task_id: self.id,
+            queue_name: self.queue_name.clone(),
+            scheduled_at: self.scheduled_at,
+            priority: self.priority,
+            shard: None,
+        }
+    }
+
+    fn into_hint(self) -> crate::dispatch::DispatchHint {
+        crate::dispatch::DispatchHint {
+            task_id: self.id,
+            queue_name: self.queue_name,
+            scheduled_at: self.scheduled_at,
+            priority: self.priority,
+            // v1 rejects Redis dispatch on a sharded runtime at validation, so
+            // a hint never has to name a shard. The field carries the follow-up.
+            shard: None,
+        }
+    }
+}
+
+/// SQL for [`record_pending_hints`]. Reads the hint columns for named rows.
+#[must_use]
+pub const fn pending_hint_rows_query() -> &'static str {
+    "SELECT id, queue_name, scheduled_at, priority \
+     FROM harvest_task_queue \
+     WHERE id = ANY($1) \
+       AND state = 'PENDING'"
+}
+
+/// Record a dispatch hint for one row a write left `PENDING`.
+///
+/// The values are already in the caller's hand. The call costs one atomic
+/// load with no channel installed, and one buffer push with one.
+pub(crate) fn record_pending_hint(
+    task_id: Uuid,
+    queue_name: &str,
+    scheduled_at: DateTime<Utc>,
+    priority: i32,
+) {
+    if !crate::dispatch::is_installed() {
+        return;
+    }
+    crate::dispatch::record_hint(crate::dispatch::DispatchHint {
+        task_id,
+        queue_name: queue_name.to_string(),
+        scheduled_at,
+        priority,
+        shard: None,
+    });
+}
+
+/// Record dispatch hints for rows a write left `PENDING`, by id.
+///
+/// For the writers that do not hold the queue name, due time and priority in
+/// the first place. The read runs **only** when a channel is installed, so a
+/// deployment without one issues no extra statement.
+///
+/// A failure is logged and dropped: a hint is a latency optimization and the
+/// reconcile sweep republishes any row this misses.
+pub(crate) async fn record_pending_hints(conn: &mut AsyncPgConnection, ids: &[Uuid]) {
+    if ids.is_empty() || !crate::dispatch::is_installed() {
+        return;
+    }
+    let rows: Result<Vec<PendingHintRow>, _> = diesel::sql_query(pending_hint_rows_query())
+        .bind::<diesel::sql_types::Array<diesel::sql_types::Uuid>, _>(ids)
+        .load(conn)
+        .await;
+    match rows {
+        Ok(rows) => {
+            crate::dispatch::record_hints(
+                rows.into_iter().map(PendingHintRow::into_hint).collect(),
+            );
+        }
+        Err(error) => {
+            tracing::debug!(
+                error = %error,
+                count = ids.len(),
+                "failed to read dispatch hint rows; the reconcile sweep republishes them"
+            );
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1973,20 +2374,24 @@ pub async fn requeue_for_retry(
     let next_run = Utc::now() + delay;
     let changeset = PendingRequeueChangeset::new(next_run, previous_error.to_string());
 
-    let queue_name = diesel::update(
+    let (queue_name, priority) = diesel::update(
         dsl::harvest_task_queue
             .find(task_id)
             .filter(dsl::state.eq("RUNNING")),
     )
     .set(&changeset)
-    .returning(dsl::queue_name)
-    .get_result::<String>(conn)
+    .returning((dsl::queue_name, dsl::priority))
+    .get_result::<(String, i32)>(conn)
     .await
     .optional()
     .map_err(crate::error::database_error)?
     .ok_or_else(|| {
         crate::error::HarvestError::NotFound(format!("task queue item {task_id} is not running"))
     })?;
+
+    // Dispatch hint (issue #1312). The retry is due at `next_run`, so the
+    // channel parks the reference until then.
+    record_pending_hint(task_id, &queue_name, next_run, priority);
 
     // Notify is best-effort: the task is already durably PENDING after the
     // UPDATE above and will be claimed on the next poll cycle even if
@@ -2057,15 +2462,21 @@ pub async fn requeue_workflow_task_nd_blocked(
         dsl::wake_requested.eq(false),
         dsl::activity_name.eq(None::<String>),
     ))
-    .execute(conn)
+    .returning((dsl::queue_name, dsl::priority))
+    .get_results::<(String, i32)>(conn)
     .await
     .map_err(crate::error::database_error)?;
 
-    if updated == 0 {
+    let Some((queue_name, priority)) = updated.into_iter().next() else {
         return Err(crate::error::HarvestError::NotFound(format!(
             "task queue item {task_id} is not a running workflow task"
         )));
-    }
+    };
+
+    // Dispatch hint (issue #1312). No `pg_notify` fires here on purpose. The
+    // channel parks a reference until `next_run` instead. That costs a poller
+    // nothing and removes the backlog scan when the backoff elapses.
+    record_pending_hint(task_id, &queue_name, next_run, priority);
 
     Ok(())
 }
@@ -2152,15 +2563,21 @@ pub async fn requeue_workflow_task_after_panic(
         dsl::wake_requested.eq(false),
         dsl::activity_name.eq(None::<String>),
     ))
-    .execute(conn)
+    .returning((dsl::queue_name, dsl::priority))
+    .get_results::<(String, i32)>(conn)
     .await
     .map_err(crate::error::database_error)?;
 
-    if updated == 0 {
+    let Some((queue_name, priority)) = updated.into_iter().next() else {
         return Err(crate::error::HarvestError::NotFound(format!(
             "task queue item {task_id} is not a running workflow task"
         )));
-    }
+    };
+
+    // Dispatch hint (issue #1312). No `pg_notify` fires here on purpose. The
+    // channel parks a reference until `next_run` instead. That costs a poller
+    // nothing and removes the backlog scan when the backoff elapses.
+    record_pending_hint(task_id, &queue_name, next_run, priority);
 
     Ok(())
 }
@@ -2313,6 +2730,9 @@ pub async fn force_retry_activity_now(
 
     if actually_advanced {
         crate::notify::notify_task_enqueued(conn, &actual_queue, task_id).await?;
+        // Dispatch hint (issue #1312). Only when the row actually advanced: an
+        // already-eligible row was hinted when it was first made `PENDING`.
+        record_pending_hint(task_id, &actual_queue, actual_scheduled_at, row.priority);
     }
 
     Ok(RetryActivityOutcome {
@@ -2390,14 +2810,14 @@ pub async fn reschedule_task(
 ) -> HarvestResult<()> {
     use crate::schema::harvest_task_queue::dsl;
 
-    let queue_name = diesel::update(
+    let (queue_name, priority) = diesel::update(
         dsl::harvest_task_queue
             .find(task_id)
             .filter(dsl::state.eq("RUNNING")),
     )
     .set(CleanContinuationChangeset::new(scheduled_at))
-    .returning(dsl::queue_name)
-    .get_result::<String>(conn)
+    .returning((dsl::queue_name, dsl::priority))
+    .get_result::<(String, i32)>(conn)
     .await
     .optional()
     .map_err(crate::error::database_error)?
@@ -2406,6 +2826,8 @@ pub async fn reschedule_task(
     })?;
 
     crate::notify::notify_task_enqueued(conn, &queue_name, task_id).await?;
+    // Dispatch hint (issue #1312).
+    record_pending_hint(task_id, &queue_name, scheduled_at, priority);
 
     Ok(())
 }
@@ -2430,7 +2852,7 @@ pub async fn defer_rate_limited_task(
 ) -> HarvestResult<()> {
     use crate::schema::harvest_task_queue::dsl;
 
-    let queue_name = diesel::update(
+    let (queue_name, priority) = diesel::update(
         dsl::harvest_task_queue
             .find(task_id)
             .filter(dsl::state.eq("RUNNING")),
@@ -2443,8 +2865,8 @@ pub async fn defer_rate_limited_task(
             "GREATEST(attempt - 1, 0)",
         )),
     ))
-    .returning(dsl::queue_name)
-    .get_result::<String>(conn)
+    .returning((dsl::queue_name, dsl::priority))
+    .get_result::<(String, i32)>(conn)
     .await
     .optional()
     .map_err(crate::error::database_error)?
@@ -2453,6 +2875,8 @@ pub async fn defer_rate_limited_task(
     })?;
 
     crate::notify::notify_task_enqueued(conn, &queue_name, task_id).await?;
+    // Dispatch hint (issue #1312).
+    record_pending_hint(task_id, &queue_name, scheduled_at, priority);
 
     Ok(())
 }
@@ -2726,6 +3150,11 @@ pub async fn release_task_for_capability_miss(
         .get_results::<DistinctMissWorkersRow>(conn)
         .await
         .map_err(crate::error::database_error)?;
+    // Dispatch hint (issue #1312). The release statement returns the miss
+    // cardinality rather than the hint columns, so the hint is read by id.
+    if !released.is_empty() {
+        record_pending_hints(conn, &[task_id]).await;
+    }
     Ok(released
         .into_iter()
         .next()
@@ -3676,7 +4105,7 @@ pub async fn wake_workflow_task(
     conn: &mut AsyncPgConnection,
     exec_id: ExecutionId,
 ) -> HarvestResult<()> {
-    let mut queue_names = primary_repend_workflow_task(conn, exec_id).await?;
+    let mut repended = primary_repend_workflow_task(conn, exec_id).await?;
 
     // Dropped-wake fix: if no row was parked and re-pended above, the target
     // workflow task may currently be claimed and mid-processing (state =
@@ -3692,7 +4121,7 @@ pub async fn wake_workflow_task(
     // and clears this flag when the in-flight cycle later parks, and re-pends
     // immediately instead of actually parking if it was set -- closing the
     // race without this call ever blocking or retrying.
-    if queue_names.is_empty() {
+    if repended.is_empty() {
         let fallback_updated = diesel::sql_query(wake_requested_fallback_query())
             .bind::<diesel::sql_types::Uuid, _>(exec_id.as_uuid())
             .execute(conn)
@@ -3712,7 +4141,7 @@ pub async fn wake_workflow_task(
             // target. Retry the primary re-pend query once: if the row is now
             // genuinely parked (the common outcome of that exact race), this
             // catches it directly instead of depending on `wake_requested`.
-            queue_names = primary_repend_workflow_task(conn, exec_id).await?;
+            repended = primary_repend_workflow_task(conn, exec_id).await?;
         }
     }
 
@@ -3722,33 +4151,35 @@ pub async fn wake_workflow_task(
     // immediately claimable once the execution is RUNNING again, but no fresh
     // NOTIFY was emitted for it, so a LISTEN-based worker would sleep until the
     // next poll interval. Notify those queues too so resume re-arms promptly.
-    let already_due_queue_names: Vec<String> = {
-        use diesel::deserialize::QueryableByName;
-        use diesel::sql_types::Text;
+    let already_due: Vec<PendingHintRow> = diesel::sql_query(
+        "SELECT id, queue_name, scheduled_at, priority FROM harvest_task_queue \
+         WHERE workflow_exec_id = $1 \
+           AND task_type = 'workflow' \
+           AND state = 'PENDING' \
+           AND scheduled_at <= $2",
+    )
+    .bind::<diesel::sql_types::Uuid, _>(exec_id.as_uuid())
+    .bind::<diesel::sql_types::Timestamptz, _>(Utc::now())
+    .load(conn)
+    .await
+    .map_err(crate::error::database_error)?;
 
-        #[derive(QueryableByName)]
-        struct QueueNameRow {
-            #[diesel(sql_type = Text)]
-            queue_name: String,
-        }
+    repended.extend(already_due);
 
-        let rows: Vec<QueueNameRow> = diesel::sql_query(
-            "SELECT DISTINCT queue_name FROM harvest_task_queue \
-             WHERE workflow_exec_id = $1 \
-               AND task_type = 'workflow' \
-               AND state = 'PENDING' \
-               AND scheduled_at <= $2",
-        )
-        .bind::<diesel::sql_types::Uuid, _>(exec_id.as_uuid())
-        .bind::<diesel::sql_types::Timestamptz, _>(Utc::now())
-        .load(conn)
-        .await
-        .map_err(crate::error::database_error)?;
+    // Dispatch hints (issue #1312), one per re-pended or already-due row. The
+    // `wake_requested` fallback needs none: it leaves the row `RUNNING` with
+    // its owner, so there is nothing for a channel reader to claim.
+    crate::dispatch::record_hints(
+        repended
+            .iter()
+            .map(PendingHintRow::to_hint)
+            .collect::<Vec<_>>(),
+    );
 
-        rows.into_iter().map(|r| r.queue_name).collect()
-    };
-
-    queue_names.extend(already_due_queue_names);
+    let mut queue_names: Vec<String> = repended
+        .into_iter()
+        .map(|row| row.queue_name)
+        .collect::<Vec<_>>();
     queue_names.sort();
     queue_names.dedup();
 
@@ -3771,27 +4202,22 @@ pub async fn wake_workflow_task(
 /// is older) and report ~skew seconds of phantom latency for an immediately
 /// claimed follow-up task (issue #501 review). The wake instant is this cycle's
 /// true eligibility, so an immediately-served wake correctly reports ~0.
+///
+/// The statement returns the hint columns rather than `queue_name` alone
+/// (issue #1312). A re-pended row is then published to the dispatch channel
+/// with its own id, due time and priority.
 async fn primary_repend_workflow_task(
     conn: &mut AsyncPgConnection,
     exec_id: ExecutionId,
-) -> HarvestResult<Vec<String>> {
-    use diesel::deserialize::QueryableByName;
-    use diesel::sql_types::Text;
-
-    #[derive(QueryableByName)]
-    struct QueueNameRow {
-        #[diesel(sql_type = Text)]
-        queue_name: String,
-    }
-
-    let rows: Vec<QueueNameRow> = diesel::sql_query(primary_repend_workflow_task_query())
+) -> HarvestResult<Vec<PendingHintRow>> {
+    let rows: Vec<PendingHintRow> = diesel::sql_query(primary_repend_workflow_task_query())
         .bind::<diesel::sql_types::Uuid, _>(exec_id.as_uuid())
         .bind::<diesel::sql_types::Timestamptz, _>(Utc::now() - IMMEDIATE_SCHEDULE_SKEW_ALLOWANCE)
         .load(conn)
         .await
         .map_err(crate::error::database_error)?;
 
-    Ok(rows.into_iter().map(|r| r.queue_name).collect())
+    Ok(rows)
 }
 
 /// SQL for [`primary_repend_workflow_task`]. Extracted as a `const fn` so its
@@ -3815,7 +4241,7 @@ const fn primary_repend_workflow_task_query() -> &'static str {
            (state = 'RUNNING' AND worker_id IS NULL AND started_at IS NULL) \
            OR (state = 'PENDING' AND scheduled_at > $2 AND activity_name = 'mixed_signal_suspension') \
        ) \
-     RETURNING queue_name"
+     RETURNING id, queue_name, scheduled_at, priority"
 }
 
 /// SQL for [`wake_workflow_task`]'s dropped-wake fallback: marks a still-claimed

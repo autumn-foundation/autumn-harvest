@@ -1408,8 +1408,15 @@ pub async fn resume_queue(
     // emits the level on the `BEGIN`, so it travels with the query. This
     // mirrors `queue::claim_task`, which pins the same level for the same
     // fresh-snapshot reason.
+    // Ids the shift below thawed, collected so the dispatch hints for them are
+    // published **after** this transaction commits (issue #1312). Publishing
+    // from inside would name rows a channel reader still sees as held.
+    let thawed: std::sync::Arc<std::sync::Mutex<Vec<uuid::Uuid>>> =
+        std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let collector = std::sync::Arc::clone(&thawed);
+
     let mut tx = conn.build_transaction().read_committed();
-    Box::pin(tx.run::<ResumeOutcome, HarvestError, _>(async |conn| {
+    let outcome = Box::pin(tx.run::<ResumeOutcome, HarvestError, _>(async |conn| {
         // Same lock the pause path and the timeout enforcer take, so a
         // resume cannot interleave with either.
         //
@@ -1470,6 +1477,10 @@ pub async fn resume_queue(
             .await?;
         let released = shifted.len();
         let shifted_ids: Vec<uuid::Uuid> = shifted.into_iter().map(|r| r.id).collect();
+        collector
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .extend(shifted_ids.iter().copied());
 
         // Second pass, LAST so it sees the freshest snapshot: a task still
         // held (our DELETE has not committed, so concurrent claimers still
@@ -1525,7 +1536,18 @@ pub async fn resume_queue(
             released_paused_by: Some(row.paused_by),
         })
     }))
-    .await
+    .await?;
+
+    // Dispatch hints for the thawed backlog (issue #1312). The channel dedupes
+    // by task id, so a row a reconcile sweep already published costs nothing.
+    let ids = std::mem::take(
+        &mut *thawed
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner),
+    );
+    crate::queue::record_pending_hints(conn, &ids).await;
+
+    Ok(outcome)
 }
 
 /// Every currently-paused queue on this shard, with its held-task count.

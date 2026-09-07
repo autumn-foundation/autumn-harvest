@@ -662,6 +662,10 @@ mod scanner {
                 ReclaimAction::Requeue => {
                     if requeue_orphan(conn, &task, new_strikes, worker_stale_secs).await? {
                         summary.requeued += 1;
+                        // Dispatch hint (issue #1312). The orphan is `PENDING`
+                        // again and its inner transaction has committed, so the
+                        // channel gets a reference to it.
+                        crate::queue::record_pending_hints(conn, &[task.id]).await;
                     }
                 }
             }
