@@ -173,6 +173,10 @@ jobs:
         run: cargo clippy -p autumn-harvest-plugin --all-targets --features connectors -- -D warnings
       - name: Clippy autumn-harvest-plugin (sqs feature)
         run: cargo clippy -p autumn-harvest-plugin --all-targets --features sqs -- -D warnings
+      # Issue #1312: the runtime wiring for the Redis dispatch channel is
+      # `cfg`d out of the default build, so only this step compiles it.
+      - name: Clippy autumn-harvest-plugin (redis feature)
+        run: cargo clippy -p autumn-harvest-plugin --all-targets --features redis -- -D warnings
       - name: Install librdkafka build deps
         run: sudo apt-get update && sudo apt-get install -y libcurl4-openssl-dev
       - name: Clippy autumn-harvest-plugin (kafka feature)
@@ -183,6 +187,11 @@ jobs:
         run: cargo clippy -p autumn-harvest-cli --all-targets -- -D warnings
       - name: Clippy autumn-harvest-sqlite
         run: cargo clippy -p autumn-harvest-sqlite --all-targets -- -D warnings
+      # Issue #1312: the Redis dispatch channel. Same issue #962 rule as the
+      # verify crate below -- a workspace member gets NO clippy coverage
+      # without its own step here.
+      - name: Clippy autumn-harvest-redis
+        run: cargo clippy -p autumn-harvest-redis --all-targets -- -D warnings
       # Issue #962: a new workspace member gets NO clippy coverage unless a step
       # is added here — there is no `--workspace` clippy invocation in this job,
       # only per-crate ones. The verify crate opts into the workspace's pedantic
@@ -617,6 +626,12 @@ jobs:
       - name: Run autumn-harvest-sqlite tests (issue #1068)
         if: needs.changes.outputs.code == 'true' && matrix.shard == 3
         run: cargo test -p autumn-harvest-sqlite
+      # Issue #1312. `--lib` only: the crate's integration suites need a live
+      # Redis (and, for the end-to-end suite, a live Postgres), so they run on
+      # the Docker-backed `test-db-linux` job through the manifest instead.
+      - name: Run autumn-harvest-redis unit tests (issue #1312)
+        if: needs.changes.outputs.code == 'true' && matrix.shard == 3
+        run: cargo test -p autumn-harvest-redis --lib
       - name: Run business_metrics example tests (issue #758)
         if: needs.changes.outputs.code == 'true' && matrix.shard == 0
         run: cargo test -p autumn-harvest --no-default-features --features testing --example business_metrics
