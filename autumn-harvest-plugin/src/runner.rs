@@ -1340,13 +1340,13 @@ const DISPATCH_DEDUPE_TTL: std::time::Duration = std::time::Duration::from_secs(
 async fn install_dispatch_channel(config: &HarvestRuntimeConfig) -> autumn_web::AutumnResult<bool> {
     use std::time::Duration;
 
-    let Some(url) = config.redis.url.as_deref() else {
+    // The endpoint string comes from the redacted form only, so neither the
+    // startup log line nor the connect error can carry a password. Both
+    // halves are `Some` together, because both read `config.redis.url`.
+    let (Some(url), Some(endpoint)) = (config.redis.url.as_deref(), config.redis.redacted_url())
+    else {
         return Ok(false);
     };
-    let endpoint = config
-        .redis
-        .redacted_url()
-        .unwrap_or_else(|| "redis".to_owned());
 
     let channel = autumn_harvest_redis::RedisDispatch::connect(
         url,

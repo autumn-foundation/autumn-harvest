@@ -111,7 +111,7 @@ duplicates work.
 | A worker crashes between claim and ack | PEL recovery; the redelivered reference finds the row `RUNNING` and acks |
 | A gated row cycles every poll | exponential backoff on release, capped at `dispatch_release_backoff_cap` |
 | Redis down | claim falls back to the Postgres poll path |
-| Multi-shard worker reads a reference for another shard's pool | v1 rejects Redis dispatch on sharded runtimes at validation; the hint carries a shard slot for the follow-up |
+| Multi-shard worker reads a reference for another shard's pool | v1 rejects Redis dispatch on sharded runtimes at startup: `HarvestRunner::start` refuses before it installs the channel, and `Worker::new` repeats the check. Config validation cannot see the resolved pool. The hint carries a shard slot for the follow-up |
 | Sticky affinity gate rejects every non-pinned worker | release with backoff; affinity is a cache hint, not a correctness rule |
 | `attempt` burns on redelivery | the by-id claim is the only `PENDING -> RUNNING` writer, and a gated miss never increments it |
 
