@@ -149,6 +149,7 @@ linux        autumn-harvest-plugin  connector_sqs_broker             sqs        
 linux        autumn-harvest-plugin  dag_run_graph_integration        -                          -
 linux        autumn-harvest-plugin  dev_runtime_lifecycle            dev-runtime                -
 linux        autumn-harvest-plugin  dlq_aggregate_integration        -                          -
+linux        autumn-harvest-plugin  dlq_bulk_discard_perf            -                          -
 linux        autumn-harvest-plugin  dlq_bulk_integration             -                          -
 linux        autumn-harvest-plugin  eligibility_tests                -                          -
 linux        autumn-harvest-plugin  fail_now_integration             -                          -

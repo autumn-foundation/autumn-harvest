@@ -32447,19 +32447,24 @@ async fn bulk_discard_dead_letters_for_selector(
         return Ok(result);
     }
 
-    for row in rows {
-        let id = row.id;
-        let deleted = diesel::delete(harvest_dead_letters::table.find(id))
-            .execute(conn)
-            .await
-            .map_err(database_error)?;
-        if deleted > 0 {
-            result.acted_on += 1;
-            result.ids.push(id.to_string());
-        } else {
-            result.skipped += 1;
-        }
-    }
+    // One statement for the whole page instead of one DELETE per row (issue
+    // #1421): `dlq::discard_dead_letters_batch` binds `id = ANY($1)` as a
+    // single array parameter, so a 1,000-row bulk discard -- the endpoint's
+    // own `MAX_BULK_LIMIT` -- costs one round trip, not 1,000. See
+    // `docs/performance-dlq-bulk-discard.md`.
+    let ids: Vec<uuid::Uuid> = rows.iter().map(|row| row.id).collect();
+    let deleted: std::collections::HashSet<uuid::Uuid> =
+        dlq::discard_dead_letters_batch(conn, &ids)
+            .await?
+            .into_iter()
+            .collect();
+    result.ids = ids
+        .iter()
+        .filter(|id| deleted.contains(id))
+        .map(ToString::to_string)
+        .collect();
+    result.acted_on = result.ids.len();
+    result.skipped = ids.len() - result.acted_on;
 
     Ok(result)
 }
