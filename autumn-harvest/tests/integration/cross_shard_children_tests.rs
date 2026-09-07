@@ -1025,19 +1025,36 @@ async fn the_parent_close_cascade_reaches_a_cross_shard_detached_child() {
 
     // The cascade is recorded on the parent with the SAME event variant the
     // same-shard path uses — no new variant (AC6).
-    let mut conn = shard_conn(&sharded, PARENT_SHARD).await;
-    let history = autumn_harvest::store::load_history(&mut conn, parent)
-        .await
-        .expect("parent history");
-    assert!(
-        history.events.iter().any(|e| matches!(
-            e,
-            WorkflowEvent::ChildWorkflowCascadeApplied { policy, .. }
-                if *policy == ParentClosePolicy::RequestCancel
-        )),
-        "the cross-shard cascade must be recorded on the parent like any other"
-    );
-    drop(conn);
+    //
+    // `apply_cascade_bookkeeping` (cross_shard_child.rs) cancels the child
+    // on its own shard first. It then appends this event to the parent, on
+    // a separate connection to a separate database. The two writes can
+    // never share one transaction. The loop above only proves the first
+    // write landed. Polling again here, instead of reading once, closes the
+    // real gap between them. Reproduced locally: 1/50 runs read the
+    // parent's history inside that gap and failed on a one-shot check.
+    let cascade_deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    loop {
+        let mut conn = shard_conn(&sharded, PARENT_SHARD).await;
+        let history = autumn_harvest::store::load_history(&mut conn, parent)
+            .await
+            .expect("parent history");
+        drop(conn);
+        if history.events.iter().any(|e| {
+            matches!(
+                e,
+                WorkflowEvent::ChildWorkflowCascadeApplied { policy, .. }
+                    if *policy == ParentClosePolicy::RequestCancel
+            )
+        }) {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < cascade_deadline,
+            "the cross-shard cascade must be recorded on the parent like any other"
+        );
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
 
     assert_eq!(
         outbox_count(&sharded, PARENT_SHARD).await,
