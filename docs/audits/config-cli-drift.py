@@ -392,6 +392,17 @@ def scan_doc(path: Path, real_config_paths, real_env_vars, real_flags):
     return deduped
 
 
+def rel(path: Path) -> str:
+    """Repo-relative POSIX path, for a report line.
+
+    Defined here rather than inline because every report branch below needs
+    it. Without it a single drift hit ended the run with a `NameError`
+    traceback instead of naming the page it found — the report was unusable
+    exactly when it had something to say.
+    """
+    return path.resolve().relative_to(REPO_ROOT).as_posix()
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--json", action="store_true")
