@@ -1696,4 +1696,5 @@ standalone note rather than part of the claim-path attribution table above:
   poll, measured in socket-syscall counts (PR #1387).
 * [`docs/performance-schedule-bulk-audit.md`](performance-schedule-bulk-audit.md)
   — the per-row audit-insert N+1 in the Vantage schedules bulk-pause/resume
-  actions (issue #951), batched into one insert per shard.
+  actions (issue #951), batched into one chunked insert call per shard
+  (multiple statements past 4,999 matched rows).
