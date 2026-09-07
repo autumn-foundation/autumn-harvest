@@ -3740,7 +3740,6 @@ mod tests {
             redact_dsn("postgres://user:hunter2@[::1]/dbname").contains("[::1]"),
             "an authority-bearing IPv6 DSN must still redact-and-keep its identity"
         );
-
     }
 
     /// A hostless DSN is withheld even when it carries no credential at all —
