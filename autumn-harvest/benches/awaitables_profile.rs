@@ -7,7 +7,14 @@
 //! evidence on this (shared-vCPU) machine — every number this harness
 //! produces evidence for is a deterministic instruction count
 //! (`valgrind --tool=callgrind`) or allocation count/bytes
-//! (`valgrind --tool=dhat`), both reproducible bit-for-bit on any machine.
+//! (`valgrind --tool=dhat`). dhat counts are bit-for-bit reproducible on any
+//! machine; callgrind counts are **not** quite: this fixture's ids
+//! (`ActivityExecId::new()` and friends) are random UUIDs, and both this
+//! harness's own tallying and `project_awaitables`'s internal maps hash them
+//! through `std::collections::HashMap`'s randomly-seeded `RandomState`, so
+//! instruction counts vary by roughly 0.02-0.03% between runs (measured; see
+//! the Baseline section below) -- the same source of variance
+//! `dlq_aggregate_profile.rs` documents for the same reason.
 //!
 //! # Workload
 //!
@@ -50,6 +57,29 @@
 //! off it). `AWAITABLES_PROFILE_REPS` (default `1_500`) sets how many times
 //! the (fixed) history is projected in each mode — i.e. how many simulated
 //! `/awaitables`-shaped requests are served.
+//!
+//! # Baseline
+//!
+//! Default parameters (`N=400`, `REPS=1_500`, 1 140 rows, 3 000
+//! `project_awaitables` calls), same machine, two independent runs each:
+//!
+//! | tool                                          | metric       | run 1         | run 2         |
+//! |------------------------------------------------|--------------|---------------|---------------|
+//! | callgrind (Ir, `--branch-sim=no --cache-sim=no`) | instructions | 3,431,587,478 | 3,430,788,543 |
+//! | dhat                                            | alloc bytes  | 439,776,557   | 439,776,557   |
+//! | dhat                                            | alloc blocks | 2,689,832     | 2,689,832     |
+//!
+//! `callgrind_annotate --threshold=95` attributes the bulk of the total to
+//! `HashMap`/`HashSet` growth inside `build_history_index`:
+//! `core::hash::BuildHasher::hash_one` (20.4%) and
+//! `<sip::Hasher as Hasher>::write` (18.8%) together account for 39.2%, and
+//! `hashbrown::raw::RawTable::reserve_rehash` alone — table growth
+//! re-hashing every already-inserted key — is 17.0%, called from
+//! `HashMap::insert` (3,140,092 calls total across the run). `HistoryIndex`
+//! is built via `#[derive(Default)]` (every collection starts at zero
+//! capacity) and grown incrementally by the per-row scan, so every one of
+//! its seven `HashMap`/`HashSet` fields re-hashes its own already-inserted
+//! keys on each doubling as `build_history_index` walks the row slice.
 
 use autumn_harvest::awaitables::{AWAITABLE_CATEGORY_CAP, WaitSetInput, project_awaitables};
 use autumn_harvest::context::WorkflowCommand;
