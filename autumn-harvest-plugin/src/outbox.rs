@@ -292,6 +292,19 @@ pub(crate) async fn dispatch_workflow_start_request(
     state: &AppState,
     request: &WorkflowStartRequest,
 ) -> HarvestResult<ExecutionId> {
+    // issue #1353 (Codex review): `WorkflowStartRequest` is public API.
+    // `enqueue_workflow_start_outbox` takes it straight from an embedder.
+    // No HTTP layer runs `reject_empty_workflow_id` in between. Reject here
+    // instead, at the one place that actually starts the execution. This
+    // also covers a row enqueued before this fix shipped. Such a row keeps
+    // retrying with backoff, forever. This module has no dead-letter path
+    // for any permanent dispatch failure. But the row can never actually
+    // start.
+    if request.workflow_id.is_empty() {
+        return Err(HarvestError::Config(
+            "workflow_id must not be empty".to_string(),
+        ));
+    }
     let harvest_pool = state.extension::<HarvestDbPool>().ok_or_else(|| {
         HarvestError::Config(
             "Harvest workflow publication is missing HarvestDbPool on AppState".into(),
@@ -575,6 +588,32 @@ mod tests {
         );
         // Defensive: id is the PK so >1 is impossible, but never count it as one start.
         assert!(!outbox_bypass_should_count(2));
+    }
+
+    /// issue #1353 (Codex review, pure, no DB): `dispatch_workflow_start_request`
+    /// rejects an empty `workflow_id` before touching any state extension.
+    /// This test therefore runs against a bare `AppState` with nothing
+    /// installed. A caller of the public `enqueue_workflow_start_outbox`
+    /// cannot bypass the guard that the HTTP start routes apply.
+    #[tokio::test]
+    async fn dispatch_rejects_empty_workflow_id() {
+        let state = AppState::for_test();
+        let request = WorkflowStartRequest {
+            workflow_name: "user_onboarding".to_owned(),
+            workflow_id: String::new(),
+            queue_name: "default".to_owned(),
+            input: Value::Null,
+            memo: None,
+            search_attrs: None,
+        };
+
+        let err = dispatch_workflow_start_request(&state, &request)
+            .await
+            .expect_err("empty workflow_id must be rejected");
+        assert!(
+            err.to_string().contains("workflow_id must not be empty"),
+            "unexpected error: {err}"
+        );
     }
 
     /// F-round11 (DB): `mark_outbox_row_delivered` surfaces the affected-row count so
