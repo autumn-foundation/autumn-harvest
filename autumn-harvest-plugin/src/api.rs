@@ -5669,6 +5669,12 @@ fn normalize_route_template(path: &str) -> String {
     }
     if out.is_empty() {
         out.push('/');
+    } else if path.len() > 1 && path.ends_with('/') {
+        // issue #1353: preserve a literal trailing slash. `matchit` binds it
+        // as a distinct route from the no-slash form. Dropping it here would
+        // collide two separately registered routes onto one template (e.g.
+        // the by-id empty-`workflow_id` guard and its name-only sibling).
+        out.push('/');
     }
     out
 }
@@ -53419,6 +53425,21 @@ mod tests {
                 "/workflows/by-id/{workflow_name}/{workflow_id}/query/{query_name}"
             ),
             "/workflows/by-id/{p0}/{p1}/query/{p2}"
+        );
+    }
+
+    /// issue #1353: a literal trailing slash must survive normalization as a
+    /// distinct template, or its `matchit` insert collides with the no-slash
+    /// sibling (`route_class_matchers_build_without_conflict` catches this).
+    #[test]
+    fn normalize_route_template_preserves_a_trailing_slash() {
+        assert_eq!(
+            normalize_route_template("/workflows/by-id/{workflow_name}/"),
+            "/workflows/by-id/{p0}/"
+        );
+        assert_ne!(
+            normalize_route_template("/workflows/by-id/{workflow_name}/"),
+            normalize_route_template("/workflows/by-id/{workflow_name}")
         );
     }
 
