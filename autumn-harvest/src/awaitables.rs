@@ -382,6 +382,20 @@ impl HistoryIndex {
     /// excluded. Each is fully overwritten by a `.collect()` below, before
     /// `build_history_index` returns. Any capacity given here would just be
     /// dropped unused.
+    ///
+    /// `children` is excluded too, for a different reason. It is the one
+    /// collection this scan calls `.remove()` on, closing a child when its
+    /// terminal event arrives. `counts.children` counts every
+    /// `ChildWorkflowStarted` row in the whole history, not the peak number
+    /// open at once. A workflow that starts and completes many children in
+    /// sequence, not concurrently, can see those two numbers differ widely.
+    /// Sizing from the
+    /// former would allocate a table for children this scan is about to
+    /// remove again. That trades the growth-step cost this fix targets for
+    /// a bigger, one-time over-allocation. It is the same failure mode an
+    /// earlier, reverted cut of this fix hit for every field at once.
+    /// `child_order` has no such removal, so it stays sized from
+    /// `counts.children`.
     fn with_capacity(counts: &HistoryCounts) -> Self {
         Self {
             activities: HashMap::with_capacity(counts.activities),
@@ -391,7 +405,7 @@ impl HistoryIndex {
             external_activities: HashMap::with_capacity(counts.external_activities),
             open_timer_arms: HashMap::with_capacity(counts.timers),
             timer_order: Vec::with_capacity(counts.timers),
-            children: HashMap::with_capacity(counts.children),
+            children: HashMap::new(),
             child_order: Vec::with_capacity(counts.children),
             pending_updates: Vec::new(),
             open_external_awaits: Vec::new(),
