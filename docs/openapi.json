@@ -7582,6 +7582,42 @@
         "x-harvest-route-class": "read_only"
       }
     },
+    "/workflows/by-id/{workflow_name}/": {
+      "get": {
+        "description": "Empty-workflow_id guard for the business-id route family (issue #1353): the literal trailing-slash form of GET /workflows/by-id/{workflow_name}/{workflow_id}, reached when a caller supplies an empty workflow_id. Always returns 400 -- workflow_id is a value the API accepted at start with no validation, but the by-id route family cannot address an empty id consistently, so it is rejected uniformly instead. No read, no write.",
+        "operationId": "get_workflows_by_id_by_workflow_name_slash",
+        "parameters": [
+          {
+            "description": "Business workflow type name.",
+            "in": "path",
+            "name": "workflow_name",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "description": "Shape is documented in the response description, not as a schema."
+                }
+              }
+            },
+            "description": "Always 400: workflow_id must not be empty. workflow_id must not be empty."
+          }
+        },
+        "summary": "Empty-workflow_id guard for the business-id route family (issue #1353): the literal trailing-slash form of GET /workflows/by-id/{workflow_name}/{workflow_id}...",
+        "tags": [
+          "workflow"
+        ],
+        "x-harvest-idempotency": "Safe",
+        "x-harvest-read-only": true,
+        "x-harvest-route-class": "read_only"
+      }
+    },
     "/workflows/by-id/{workflow_name}/{workflow_id}": {
       "get": {
         "description": "Describe the current run for a business (workflow_name, workflow_id). Resolves (workflow_name, workflow_id) to the current run: the single active (non-terminal) run if one exists, else the most recent terminal run, else 404 (never 500). Shard-aware. The resolved execution_id is returned on every response in the X-Harvest-Execution-Id header (and in the JSON body where present); acting by business id always reaches the live run even after a continue-as-new/reset fork.",
