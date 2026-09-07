@@ -23971,9 +23971,9 @@ impl Worker {
             .map_err(|err| HarvestError::Config(err.to_string()))?;
 
         // Redis dispatch is single-shard in v1 (issue #1312). The channel
-        // carries a task id and no connection: a worker that drains several
-        // shards cannot tell which pool holds the named row, so a reference
-        // read on one shard would be claimed against another shard's database
+        // carries a task id and no connection. A worker that drains several
+        // shards cannot tell which pool holds the named row. A reference read
+        // on one shard would then be claimed against another shard's database
         // and always miss. Reject the combination at startup rather than let
         // it degrade to a silent no-claim loop. `shard` on `DispatchHint`
         // carries the follow-up that lifts this limit.
@@ -25567,10 +25567,10 @@ impl Worker {
 
     /// Run one dispatch-channel iteration (issue #1312).
     ///
-    /// Reads up to the free concurrency in references, claims each named row
-    /// with the full claim predicate, and acks or releases the reference by
-    /// the outcome table in [`reference_outcome`]. Maintenance and the
-    /// reconcile sweep run on their own intervals from here.
+    /// Reads up to the free concurrency in references. Claims each named row
+    /// with the full claim predicate. Acks or releases the reference by the
+    /// outcome table in [`reference_outcome`]. Maintenance and the reconcile
+    /// sweep run on their own intervals from here.
     ///
     /// Returns `true` when at least one task was dispatched.
     ///
@@ -25664,12 +25664,9 @@ impl Worker {
             Ok(conn) => conn,
             Err(error) => {
                 tracing::warn!(error = %error, "failed to get connection for a dispatch reference");
-                // Give the reference back promptly: the pool, not the row, is
-                // what is unavailable.
-                let _ = installed
-                    .channel
-                    .release(&lease, self.config.poll_interval)
-                    .await;
+                // The pool is unavailable, not the row, so give the reference
+                // straight back and let the next iteration try again.
+                self.retry_reference(installed, &lease).await;
                 return false;
             }
         };
@@ -25715,10 +25712,7 @@ impl Worker {
                     Ok(probe) => probe,
                     Err(error) => {
                         tracing::warn!(error = %error, task_id = %lease.task_id, "dispatch probe failed");
-                        let _ = installed
-                            .channel
-                            .release(&lease, self.config.poll_interval)
-                            .await;
+                        self.retry_reference(installed, &lease).await;
                         return false;
                     }
                 };
@@ -25741,10 +25735,7 @@ impl Worker {
             }
             Err(error) => {
                 tracing::error!(error = %error, task_id = %lease.task_id, "failed to claim a dispatched task");
-                let _ = installed
-                    .channel
-                    .release(&lease, self.config.poll_interval)
-                    .await;
+                self.retry_reference(installed, &lease).await;
                 false
             }
         }
@@ -25792,6 +25783,22 @@ impl Worker {
         if let Err(error) = installed.channel.publish(&hints).await {
             self.log_dispatch_error(state, &error, "dispatch reconcile publish failed");
         }
+    }
+
+    /// Give a reference back after a local failure, so the next iteration
+    /// retries it.
+    ///
+    /// The delay is one poll interval rather than the exponential backoff: the
+    /// row was never judged, so this is not evidence that it is gated.
+    async fn retry_reference(
+        &self,
+        installed: &crate::dispatch::InstalledDispatch,
+        lease: &crate::dispatch::DispatchLease,
+    ) {
+        let _ = installed
+            .channel
+            .release(lease, self.config.poll_interval)
+            .await;
     }
 
     /// Log a channel error at most once per [`DISPATCH_ERROR_LOG_INTERVAL`].
@@ -26828,8 +26835,8 @@ impl Worker {
             // transaction that raised it commits and a flush point publishes
             // it. This is the catch-all for a hint no flush point reached.
             // A hint left by a rolled-back transaction names a row that is not
-            // `PENDING`, so a reader probes it and acks the reference; the
-            // settle points on the two activity-finalize transactions drop
+            // `PENDING`. A reader probes such a row and acks the reference.
+            // The settle points on the two activity-finalize transactions drop
             // those hints before they get this far.
             let ((), hints) = Box::pin(crate::dispatch::buffered(task_body)).await;
             crate::dispatch::publish_now(hints).await;
@@ -37429,6 +37436,133 @@ mod tests {
         assert!(
             matches!(report.status, crate::testing::ReplayStatus::ReplaySucceeded),
             "a failing cycle's own persisted history must replay cleanly: {report}"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Dispatch reference outcome table (issue #1312)
+    // -----------------------------------------------------------------------
+
+    fn dispatch_settings() -> crate::dispatch::DispatchSettings {
+        crate::dispatch::DispatchSettings {
+            poll_interval: Duration::from_millis(20),
+            reconcile_interval: Duration::from_secs(1),
+            reconcile_batch: 100,
+            release_backoff_cap: Duration::from_secs(30),
+        }
+    }
+
+    fn probe(
+        state: &str,
+        scheduled_at: chrono::DateTime<chrono::Utc>,
+    ) -> crate::queue::DispatchProbe {
+        crate::queue::DispatchProbe {
+            state: state.to_string(),
+            scheduled_at,
+            has_worker: state == "RUNNING",
+        }
+    }
+
+    #[test]
+    fn a_due_gated_row_is_released_with_a_growing_delay() {
+        let settings = dispatch_settings();
+        let now = chrono::Utc::now();
+        let due = probe("PENDING", now - chrono::Duration::seconds(1));
+
+        assert_eq!(
+            reference_outcome(Some(&due), 0, now, &settings),
+            ReferenceOutcome::Release(Duration::from_millis(20))
+        );
+        assert_eq!(
+            reference_outcome(Some(&due), 3, now, &settings),
+            ReferenceOutcome::Release(Duration::from_millis(160))
+        );
+        assert_eq!(
+            reference_outcome(Some(&due), 40, now, &settings),
+            ReferenceOutcome::Release(settings.release_backoff_cap)
+        );
+    }
+
+    #[test]
+    fn a_row_that_is_not_due_yet_is_held_until_its_due_time() {
+        let settings = dispatch_settings();
+        let now = chrono::Utc::now();
+        let later = probe("PENDING", now + chrono::Duration::milliseconds(500));
+
+        assert_eq!(
+            reference_outcome(Some(&later), 0, now, &settings),
+            ReferenceOutcome::Release(Duration::from_millis(500))
+        );
+    }
+
+    #[test]
+    fn a_far_future_row_is_held_no_longer_than_the_backoff_cap() {
+        let settings = dispatch_settings();
+        let now = chrono::Utc::now();
+        let far = probe("PENDING", now + chrono::Duration::days(7));
+
+        assert_eq!(
+            reference_outcome(Some(&far), 0, now, &settings),
+            ReferenceOutcome::Release(settings.release_backoff_cap)
+        );
+    }
+
+    #[test]
+    fn a_running_or_terminal_row_is_acked() {
+        let settings = dispatch_settings();
+        let now = chrono::Utc::now();
+        for state in ["RUNNING", "COMPLETED", "FAILED", "CANCELLED"] {
+            assert_eq!(
+                reference_outcome(Some(&probe(state, now)), 0, now, &settings),
+                ReferenceOutcome::Ack,
+                "a {state} row must be acked"
+            );
+        }
+    }
+
+    #[test]
+    fn an_absent_row_gets_three_short_releases_and_is_then_acked() {
+        let settings = dispatch_settings();
+        let now = chrono::Utc::now();
+
+        for redeliveries in 0..DISPATCH_ABSENT_ROW_RELEASES {
+            assert_eq!(
+                reference_outcome(None, redeliveries, now, &settings),
+                ReferenceOutcome::Release(DISPATCH_ABSENT_ROW_DELAY),
+                "an uncommitted insert must get a short release"
+            );
+        }
+        assert_eq!(
+            reference_outcome(None, DISPATCH_ABSENT_ROW_RELEASES, now, &settings),
+            ReferenceOutcome::Ack,
+            "a row that is still absent after the grace releases is gone"
+        );
+    }
+
+    #[test]
+    fn the_dispatch_error_log_is_rate_limited() {
+        let mut state = DispatchLoopState::new();
+        assert!(state.may_log_error(), "the first error is always logged");
+        assert!(
+            !state.may_log_error(),
+            "a second error inside the interval is suppressed"
+        );
+    }
+
+    #[test]
+    fn the_dispatch_loop_maintains_and_reconciles_on_its_first_iteration() {
+        let mut state = DispatchLoopState::new();
+        assert!(
+            DispatchLoopState::due(&mut state.maintained, Duration::ZERO),
+            "the first iteration must maintain before it waits"
+        );
+        assert!(
+            DispatchLoopState::due(&mut state.reconciled, Duration::ZERO),
+            "the first iteration must reconcile before it waits"
+        );
+        assert!(
+            !DispatchLoopState::due(&mut state.maintained, Duration::from_secs(3600)),
+            "a timer that has not elapsed is not due"
         );
     }
 }

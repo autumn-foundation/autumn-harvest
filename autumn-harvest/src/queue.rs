@@ -1525,6 +1525,7 @@ impl PendingHintRow {
         }
     }
 
+    /// The hint for this row, consuming the row.
     fn into_hint(self) -> crate::dispatch::DispatchHint {
         crate::dispatch::DispatchHint {
             task_id: self.id,

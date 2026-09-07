@@ -313,6 +313,8 @@ pub fn record_hint(hint: DispatchHint) {
 
 /// Record several hints. Equivalent to [`record_hint`] per element.
 pub fn record_hints(hints: Vec<DispatchHint>) {
+    // One guard for the whole batch, so a deployment with no channel does not
+    // pay one load per hint.
     if !is_installed() {
         return;
     }

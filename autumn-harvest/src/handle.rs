@@ -810,9 +810,9 @@ impl WorkflowHandleClient {
         // other in-process producer. See `StartProducer::Transactional` in the
         // admission-gate contract (`admission_gate.rs`) for the full rationale.
         // The start writes a `PENDING` task row inside the caller's own
-        // transaction, so its dispatch hint must not reach the channel until
-        // that transaction commits (issue #1312). The scope holds it, and
-        // `TransactionalStartOutcome::finish` — this method's documented
+        // transaction (issue #1312). Its dispatch hint must therefore not
+        // reach the channel until that transaction commits. The scope holds
+        // it. `TransactionalStartOutcome::finish` — this method's documented
         // post-commit hook — publishes it. A caller that never calls `finish`
         // loses only latency: the worker's reconcile sweep republishes the row.
         let (collected, start_hints) = crate::dispatch::buffered(async {
