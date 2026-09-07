@@ -324,18 +324,14 @@ struct HistoryCounts {
     local_activities: usize,
     closed_local_activities: usize,
     external_activities: usize,
-    timers: usize,
     children: usize,
 }
 
 /// Counts, in one cheap pass over `rows`, how many entries each
 /// [`HistoryIndex`] collection will hold. The pass is a discriminant match
 /// with no cloning, formatting or hashing, so it costs far less than the
-/// indexing pass it precedes. `timers` over-counts distinct timer ids by
-/// re-arm events, since a timer can start more than once. That only makes
-/// `open_timer_arms`/`timer_order`'s resulting capacity a safe upper bound,
-/// the same way it already ignores `TimerFired`/`TimerCancelled` rows
-/// entirely.
+/// indexing pass it precedes. There is no `timers` field: see
+/// [`HistoryIndex::with_capacity`] for why timer rows are not counted here.
 fn count_history_categories(rows: &[(DateTime<Utc>, WorkflowEvent)]) -> HistoryCounts {
     let mut counts = HistoryCounts::default();
     for (_, event) in rows {
@@ -352,7 +348,6 @@ fn count_history_categories(rows: &[(DateTime<Utc>, WorkflowEvent)]) -> HistoryC
             | WorkflowEvent::LocalActivityExhausted { .. } => {
                 counts.closed_local_activities += 1;
             }
-            WorkflowEvent::TimerStarted { .. } => counts.timers += 1,
             WorkflowEvent::ChildWorkflowStarted { .. } => counts.children += 1,
             _ => {}
         }
@@ -396,6 +391,17 @@ impl HistoryIndex {
     /// earlier, reverted cut of this fix hit for every field at once.
     /// `child_order` has no such removal, so it stays sized from
     /// `counts.children`.
+    ///
+    /// `open_timer_arms` and `timer_order` are excluded for a related
+    /// reason. `counts.timers` counts every `TimerStarted` row, but
+    /// `reset_timer`'s sliding-window pattern re-arms the same timer id
+    /// repeatedly (`docs`, `context.rs`'s `reset_timer`). Both collections
+    /// key or index by distinct timer id, guarded by
+    /// `open_timer_arms.contains_key`, so re-arms grow a `VecDeque` inside
+    /// an existing entry rather than adding one. A history that resets one
+    /// timer 100,000 times would size both for 100,000 entries and use one.
+    /// This benchmark gives every timer a unique id, so it never hits that
+    /// case (Codex review, PR #1414).
     fn with_capacity(counts: &HistoryCounts) -> Self {
         Self {
             activities: HashMap::with_capacity(counts.activities),
@@ -403,8 +409,8 @@ impl HistoryIndex {
             local_activities: HashMap::with_capacity(counts.local_activities),
             closed_local_activities: HashSet::with_capacity(counts.closed_local_activities),
             external_activities: HashMap::with_capacity(counts.external_activities),
-            open_timer_arms: HashMap::with_capacity(counts.timers),
-            timer_order: Vec::with_capacity(counts.timers),
+            open_timer_arms: HashMap::new(),
+            timer_order: Vec::new(),
             children: HashMap::new(),
             child_order: Vec::with_capacity(counts.children),
             pending_updates: Vec::new(),
