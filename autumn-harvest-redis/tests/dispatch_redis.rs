@@ -645,3 +645,130 @@ async fn connect_to_an_unreachable_address_fails_fast() {
         "connect must fail inside its timeout (elapsed {elapsed:?})"
     );
 }
+
+/// An entry the channel cannot read must leave the pending entries list
+/// (issue #1312 review round 1, finding F4).
+///
+/// `XREADGROUP` puts every delivered entry in the pending entries list. A
+/// worker that only drops an unreadable entry leaves it there for good. The
+/// recovery pass then claims it on every sweep and leaves it pending again.
+/// `XPENDING` reads a fixed window, so enough such entries hide every
+/// legitimate abandoned lease below them.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_malformed_entry_leaves_the_pending_list() {
+    let Some(fixture) = try_start(Duration::from_millis(300)).await else {
+        return;
+    };
+    let queues = vec!["malformed".to_string()];
+    let task_id = Uuid::new_v4();
+
+    // A real publish creates the consumer group the hand-written entries need.
+    fixture
+        .dispatch
+        .publish(&[hint("malformed", task_id, Utc::now())])
+        .await
+        .expect("publish");
+
+    let key = fixture.stream_key("malformed");
+    let mut conn = fixture.raw.clone();
+    let _: String = redis::cmd("XADD")
+        .arg(&key)
+        .arg("*")
+        .arg("other")
+        .arg("no payload field here")
+        .query_async(&mut conn)
+        .await
+        .expect("xadd an entry with no payload field");
+    let _: String = redis::cmd("XADD")
+        .arg(&key)
+        .arg("*")
+        .arg("payload")
+        .arg("{ this is not json")
+        .query_async(&mut conn)
+        .await
+        .expect("xadd an entry with an unreadable payload");
+
+    let leases = read(&fixture, &queues, 10).await;
+    assert_eq!(leases.len(), 1, "only the legitimate entry yields a lease");
+    assert_eq!(leases[0].task_id, task_id);
+
+    assert_eq!(
+        fixture.pending_count("malformed").await,
+        1,
+        "a malformed entry must be acknowledged, so only the live lease is pending"
+    );
+    assert_eq!(
+        fixture.stream_len("malformed").await,
+        1,
+        "a malformed entry must be deleted, and nothing else with it"
+    );
+
+    // The legitimate lease is abandoned. Recovery must still reach it.
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    let counts = fixture.dispatch.maintain(&queues).await.expect("maintain");
+    assert_eq!(counts.recovered, 1, "the abandoned lease must be recovered");
+    assert_eq!(
+        fixture.pending_count("malformed").await,
+        0,
+        "no entry may be left pending after the recovery pass"
+    );
+}
+
+/// The recovery pass discards an entry it cannot read, rather than leaving it
+/// pending for the next pass (issue #1312 review round 1, finding F4).
+#[tokio::test(flavor = "multi_thread")]
+async fn the_recovery_pass_discards_a_malformed_entry() {
+    let Some(fixture) = try_start(Duration::from_millis(300)).await else {
+        return;
+    };
+    let queues = vec!["recover_malformed".to_string()];
+    let task_id = Uuid::new_v4();
+
+    fixture
+        .dispatch
+        .publish(&[hint("recover_malformed", task_id, Utc::now())])
+        .await
+        .expect("publish");
+    let leases = read(&fixture, &queues, 10).await;
+    assert_eq!(leases.len(), 1);
+    fixture.dispatch.ack(&leases[0]).await.expect("ack");
+
+    // A malformed entry that reaches the pending list without going through
+    // `next`. A peer on an older build is one way to get one.
+    let key = fixture.stream_key("recover_malformed");
+    let mut conn = fixture.raw.clone();
+    let _: String = redis::cmd("XADD")
+        .arg(&key)
+        .arg("*")
+        .arg("payload")
+        .arg("{ this is not json")
+        .query_async(&mut conn)
+        .await
+        .expect("xadd an entry with an unreadable payload");
+    let _: redis::streams::StreamReadReply = redis::cmd("XREADGROUP")
+        .arg("GROUP")
+        .arg("harvest_workers")
+        .arg("peer")
+        .arg("COUNT")
+        .arg(10)
+        .arg("STREAMS")
+        .arg(&key)
+        .arg(">")
+        .query_async(&mut conn)
+        .await
+        .expect("peer read");
+    assert_eq!(fixture.pending_count("recover_malformed").await, 1);
+
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    fixture.dispatch.maintain(&queues).await.expect("maintain");
+    assert_eq!(
+        fixture.pending_count("recover_malformed").await,
+        0,
+        "the recovery pass must discard an entry it cannot read"
+    );
+    assert_eq!(
+        fixture.stream_len("recover_malformed").await,
+        0,
+        "the discarded entry must leave the stream"
+    );
+}

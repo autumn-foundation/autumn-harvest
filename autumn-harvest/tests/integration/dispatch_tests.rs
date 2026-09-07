@@ -1314,3 +1314,108 @@ async fn a_channel_outage_drains_the_backlog_at_the_postgres_rate() {
         "the backlog took {elapsed:?} to drain; the channel outage throttled the Postgres path"
     );
 }
+
+/// A channel installed after the worker was built must not reach a multi-shard
+/// loop (issue #1312 review round 1, finding F5).
+///
+/// `Worker::new` refuses the combination, but a core caller can install the
+/// channel afterwards. The loop reads the process-global slot on every
+/// iteration, so the refusal has to hold at run time as well.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_multi_shard_worker_never_consumes_references() {
+    let _serial = DISPATCH_SERIAL.lock().await;
+    let (url, _c) = setup_test_database_url_or_env().await;
+    let queue = unique_queue("f5_span");
+    let _cleanup = SeededQueueGuard {
+        url: url.clone(),
+        queue: queue.clone(),
+    };
+
+    let mut conn = connect(&url).await;
+    let exec_id = start_on(&mut conn, "dispatch_trivial", &queue).await;
+    let task_id = tasks_for(&mut conn, exec_id)
+        .await
+        .into_iter()
+        .next()
+        .expect("one workflow task")
+        .id;
+
+    // The worker is built with no channel, so `Worker::new` has nothing to
+    // refuse. Two shard assignments and no sharded pool keep it on the
+    // single-pool entry point.
+    let worker = Arc::new(make_worker_with(
+        worker_config(&queue, vec![ShardId::new(0), ShardId::new(1)]),
+        vec![wf_info("dispatch_trivial", trivial_workflow)],
+        vec![],
+        empty_shared_state(),
+    ));
+
+    // The channel arrives after construction, and it already holds a reference
+    // for the seeded row.
+    let channel = Arc::new(MemoryDispatch::new());
+    let _guard = install(&channel);
+    channel
+        .publish(&[autumn_harvest::dispatch::DispatchHint {
+            task_id,
+            queue_name: queue.clone(),
+            scheduled_at: chrono::Utc::now(),
+            priority: 0,
+            shard: None,
+        }])
+        .await
+        .expect("publish");
+
+    let pool = build_pool(&url);
+    let mut check = connect(&url).await;
+    with_worker(worker, pool, async {
+        wait_for_state(&mut check, exec_id, &["COMPLETED"], Duration::from_secs(30)).await;
+    })
+    .await;
+
+    assert!(
+        channel.delivered_ids().is_empty(),
+        "a multi-shard worker must not consume references, got {:?}",
+        channel.delivered_ids()
+    );
+}
+
+/// A queue name the channel key space cannot carry is refused at startup
+/// (issue #1312 review round 1, finding F6).
+///
+/// The channel rejects such a name on every call, so a worker configured with
+/// one would live on the Postgres fallback for all of its queues and say
+/// nothing about it.
+#[tokio::test]
+async fn a_queue_name_with_a_colon_rejects_dispatch() {
+    let _serial = DISPATCH_SERIAL.lock().await;
+    let channel = Arc::new(MemoryDispatch::new());
+    let guard = install(&channel);
+
+    let telemetry = Arc::new(TelemetryConfig::builder().build());
+    let registry = Arc::new(HandlerRegistry::with_state_and_telemetry(
+        vec![wf_info("dispatch_trivial", trivial_workflow)],
+        vec![],
+        empty_shared_state(),
+        telemetry,
+    ));
+
+    let error = Worker::new(worker_config("tenant:priority", vec![ShardId::new(0)]), registry)
+        .expect_err("a colon in a queue name must be rejected under dispatch");
+    assert!(
+        matches!(error, autumn_harvest::HarvestError::Config(ref msg)
+            if msg.contains("tenant:priority")),
+        "the rejection must name the queue, got {error:?}"
+    );
+
+    // The same config builds once the channel is gone.
+    drop(guard);
+    let telemetry = Arc::new(TelemetryConfig::builder().build());
+    let registry = Arc::new(HandlerRegistry::with_state_and_telemetry(
+        vec![wf_info("dispatch_trivial", trivial_workflow)],
+        vec![],
+        empty_shared_state(),
+        telemetry,
+    ));
+    Worker::new(worker_config("tenant:priority", vec![ShardId::new(0)]), registry)
+        .expect("a colon in a queue name is fine without a channel");
+}

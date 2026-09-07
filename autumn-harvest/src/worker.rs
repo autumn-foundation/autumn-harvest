@@ -23877,6 +23877,73 @@ const fn dispatch_read_size(free_workflow: usize, free_activity: usize) -> Optio
 /// elapsed against any interval a worker configures.
 const DISPATCH_TIMER_START_OFFSET: Duration = Duration::from_secs(3600);
 
+/// Ceiling for the degraded-mode cooldown (issue #1312).
+///
+/// The cooldown is how long a worker stays on the Postgres path before it
+/// probes the channel again. The cap bounds how long a recovered channel stays
+/// unused.
+const DISPATCH_DEGRADED_COOLDOWN_CAP: Duration = Duration::from_secs(30);
+
+/// The cooldown a worker takes after `failures` consecutive channel failures.
+///
+/// The first failure waits one poll interval. Each further failure doubles the
+/// wait, up to [`DISPATCH_DEGRADED_COOLDOWN_CAP`]. A dead channel therefore
+/// costs one probe every thirty seconds rather than one per iteration.
+fn degraded_cooldown(failures: u32, poll_interval: Duration) -> Duration {
+    let steps = failures.saturating_sub(1);
+    let factor = 1_u32.checked_shl(steps).unwrap_or(u32::MAX);
+    poll_interval
+        .checked_mul(factor)
+        .unwrap_or(DISPATCH_DEGRADED_COOLDOWN_CAP)
+        .min(DISPATCH_DEGRADED_COOLDOWN_CAP)
+}
+
+/// The degraded-mode window of one dispatch loop (issue #1312).
+///
+/// A channel error puts the worker on the Postgres claim path for a cooldown.
+/// The worker drains the backlog there at the Postgres rate, so a Redis outage
+/// costs throughput and not availability. Without the window the worker claims
+/// one row per failed read, and a read can take the poll interval plus the call
+/// timeout to fail.
+#[derive(Debug)]
+struct DispatchDegradation {
+    /// Consecutive channel failures since the last success.
+    failures: u32,
+    /// When the current cooldown started, and how long it runs.
+    started: Option<(std::time::Instant, Duration)>,
+}
+
+impl DispatchDegradation {
+    const fn new() -> Self {
+        Self {
+            failures: 0,
+            started: None,
+        }
+    }
+
+    /// Record a channel failure and open the cooldown it earns.
+    ///
+    /// Returns the cooldown, so the caller can log it.
+    fn record_failure(&mut self, poll_interval: Duration) -> Duration {
+        self.failures = self.failures.saturating_add(1);
+        let cooldown = degraded_cooldown(self.failures, poll_interval);
+        self.started = Some((std::time::Instant::now(), cooldown));
+        cooldown
+    }
+
+    /// Record a successful channel call, which closes the window.
+    fn record_success(&mut self) {
+        self.failures = 0;
+        self.started = None;
+    }
+
+    /// True while the worker must stay on the Postgres claim path.
+    fn is_degraded(&self) -> bool {
+        self.started
+            .is_some_and(|(at, cooldown)| at.elapsed() < cooldown)
+    }
+}
+
 /// What one dispatch loop remembers between iterations.
 #[derive(Debug)]
 struct DispatchLoopState {
@@ -23887,6 +23954,12 @@ struct DispatchLoopState {
     /// When a channel error was last logged, so a broken channel logs once per
     /// interval instead of once per iteration.
     error_logged: Option<std::time::Instant>,
+    /// Where the reconcile sweep stopped in each queue.
+    ///
+    /// A queue with no entry starts its next sweep at the top.
+    reconcile_cursors: std::collections::HashMap<String, crate::queue::DispatchCursor>,
+    /// The degraded-mode window for a failing channel.
+    degraded: DispatchDegradation,
 }
 
 impl DispatchLoopState {
@@ -23908,6 +23981,8 @@ impl DispatchLoopState {
             maintained: past,
             reconciled: past,
             error_logged: None,
+            reconcile_cursors: std::collections::HashMap::new(),
+            degraded: DispatchDegradation::new(),
         }
     }
 
@@ -23931,6 +24006,22 @@ impl DispatchLoopState {
             }
         }
     }
+}
+
+/// Where the next reconcile sweep of one queue starts (issue #1312).
+///
+/// A full page means rows may still sit below it, so the walk continues from
+/// `last`. A short page is the end of the queue, so the walk wraps to the top.
+/// Without the wrap the sweep would never see a row a later write puts above
+/// the cursor.
+///
+/// Split out from the sweep so the wrap rule is testable without a database.
+fn next_reconcile_cursor(
+    page_len: usize,
+    batch: usize,
+    last: Option<crate::queue::DispatchCursor>,
+) -> Option<crate::queue::DispatchCursor> {
+    if page_len < batch { None } else { last }
 }
 
 /// What the worker does with one delivered reference.
@@ -25649,9 +25740,9 @@ impl Worker {
     ///
     /// Returns `true` when at least one task was dispatched.
     ///
-    /// On a channel error it falls back to [`Self::poll_once`] for this
-    /// iteration, so availability equals the Postgres path when the channel is
-    /// unreachable.
+    /// On a channel error it enters degraded mode: the worker drains through
+    /// [`Self::drain_postgres`] until the cooldown elapses, so availability
+    /// equals the Postgres path while the channel is unreachable.
     async fn run_dispatch_iteration(
         &self,
         pool: &DbPool,
@@ -25661,18 +25752,34 @@ impl Worker {
     ) -> bool {
         let settings = &installed.settings;
 
-        if DispatchLoopState::due(&mut state.maintained, settings.poll_interval)
-            && let Err(error) = dispatch_call(
+        // Degraded mode (issue #1312). The channel failed recently, so this
+        // iteration does not touch it. A channel call that fails costs the poll
+        // interval plus the call timeout, and one claim per such call is far
+        // below the Postgres rate. The cooldown expires on its own, and the
+        // next iteration probes the channel again.
+        if state.degraded.is_degraded() {
+            return self.drain_postgres(pool, shard).await;
+        }
+
+        if DispatchLoopState::due(&mut state.maintained, settings.poll_interval) {
+            match dispatch_call(
                 installed.channel.maintain(&self.config.queues),
                 "maintenance",
             )
             .await
-        {
-            self.log_dispatch_error(state, &error, "dispatch maintenance failed");
+            {
+                Ok(_) => state.degraded.record_success(),
+                Err(error) => {
+                    self.enter_degraded(state, &error, "dispatch maintenance failed", settings);
+                    return self.drain_postgres(pool, shard).await;
+                }
+            }
         }
 
-        if DispatchLoopState::due(&mut state.reconciled, settings.reconcile_interval) {
-            self.run_dispatch_reconcile(pool, installed, state).await;
+        if DispatchLoopState::due(&mut state.reconciled, settings.reconcile_interval)
+            && !self.run_dispatch_reconcile(pool, installed, state).await
+        {
+            return self.drain_postgres(pool, shard).await;
         }
 
         // One read sized to the free permits of each pool, so the worker never
@@ -25709,18 +25816,21 @@ impl Worker {
         };
 
         let leases = match read {
-            Ok(Ok(leases)) => leases,
+            Ok(Ok(leases)) => {
+                state.degraded.record_success();
+                leases
+            }
             Ok(Err(error)) => {
-                self.log_dispatch_error(state, &error, "dispatch read failed");
-                return self.fall_back_to_postgres(pool, shard).await;
+                self.enter_degraded(state, &error, "dispatch read failed", settings);
+                return self.drain_postgres(pool, shard).await;
             }
             Err(_) => {
                 let error = HarvestError::Dispatch(format!(
                     "dispatch read did not answer within {:?}",
                     settings.poll_interval + DISPATCH_CALL_TIMEOUT
                 ));
-                self.log_dispatch_error(state, &error, "dispatch read timed out");
-                return self.fall_back_to_postgres(pool, shard).await;
+                self.enter_degraded(state, &error, "dispatch read timed out", settings);
+                return self.drain_postgres(pool, shard).await;
             }
         };
 
@@ -25739,27 +25849,55 @@ impl Worker {
         dispatched
     }
 
-    /// Claim through the Postgres path for one iteration.
+    /// Drain the backlog through the Postgres claim path (issue #1312).
     ///
-    /// The dispatch channel failed, so availability must equal the Postgres
-    /// path for this iteration.
-    async fn fall_back_to_postgres(
-        &self,
-        pool: &DbPool,
-        shard: Option<crate::types::ShardId>,
-    ) -> bool {
-        let dispatched = self
-            .poll_once(
-                pool,
-                shard_acquire_bound(false, self.config.poll_interval),
-                shard,
-            )
-            .await;
+    /// This is the ordinary poll loop, one iteration of it: claim until the
+    /// backlog is empty, then wait one poll interval. A degraded worker
+    /// therefore claims at the Postgres rate, not at one row per failed channel
+    /// call. A channel call that fails can cost the poll interval plus the call
+    /// timeout, so one claim per call would be a throughput collapse rather
+    /// than a fallback.
+    ///
+    /// Returns `true` when at least one task was dispatched.
+    async fn drain_postgres(&self, pool: &DbPool, shard: Option<crate::types::ShardId>) -> bool {
+        let mut dispatched = false;
+        while !self.shutdown.is_cancelled() {
+            if !self
+                .poll_once(
+                    pool,
+                    shard_acquire_bound(false, self.config.poll_interval),
+                    shard,
+                )
+                .await
+            {
+                break;
+            }
+            dispatched = true;
+        }
         tokio::select! {
             () = self.shutdown.cancelled() => {}
             () = tokio::time::sleep(self.config.poll_interval) => {}
         }
         dispatched
+    }
+
+    /// Log a channel error and open the degraded-mode cooldown it earns.
+    fn enter_degraded(
+        &self,
+        state: &mut DispatchLoopState,
+        error: &HarvestError,
+        message: &'static str,
+        settings: &crate::dispatch::DispatchSettings,
+    ) {
+        let cooldown = state.degraded.record_failure(settings.poll_interval);
+        if state.may_log_error() {
+            tracing::warn!(
+                worker_id = %self.config.worker_id,
+                error = %error,
+                cooldown_ms = cooldown.as_millis(),
+                "{message}; claiming through postgres until the cooldown elapses"
+            );
+        }
     }
 
     /// Claim the row one reference names, then ack or release the reference.
@@ -25876,17 +26014,27 @@ impl Worker {
         }
     }
 
-    /// Republish every due `PENDING` row for this worker's queues.
+    /// Republish one page of due `PENDING` rows for this worker's queues.
     ///
     /// This sweep is the channel's durability floor. A channel restart, a lost
     /// reference, a dropped hint, or a crash between commit and publish all
     /// converge through it.
+    ///
+    /// The sweep walks each queue with a keyset cursor rather than re-reading
+    /// the top page (issue #1312). The sweep cannot see most claim gates, so a
+    /// page of rows every worker rejects looks claimable to it. Re-reading that
+    /// page would hide every claimable row below it for as long as the gate
+    /// holds. See [`crate::queue::due_dispatch_hints_after_query`].
+    ///
+    /// Returns `false` when a channel call failed, so the caller can enter
+    /// degraded mode. A database failure returns `true`: the database is not
+    /// the channel, and the Postgres claim path cannot help with it.
     async fn run_dispatch_reconcile(
         &self,
         pool: &DbPool,
         installed: &crate::dispatch::InstalledDispatch,
         state: &mut DispatchLoopState,
-    ) {
+    ) -> bool {
         let mut conn = match acquire_shard_conn(
             pool,
             shard_acquire_bound(false, self.config.poll_interval),
@@ -25896,22 +26044,39 @@ impl Worker {
             Ok(conn) => conn,
             Err(error) => {
                 tracing::warn!(error = %error, "failed to get connection for the dispatch reconcile sweep");
-                return;
+                return true;
             }
         };
-        let hints = match queue::due_dispatch_hints(
-            &mut conn,
-            &self.config.queues,
-            installed.settings.reconcile_batch,
-        )
-        .await
-        {
-            Ok(hints) => hints,
-            Err(error) => {
-                tracing::warn!(error = %error, "dispatch reconcile read failed");
-                return;
-            }
-        };
+
+        let batch = installed.settings.reconcile_batch;
+        let mut hints = Vec::new();
+        // The cursors are applied after every queue is read, so a read failure
+        // part way through leaves the walk where it was.
+        let mut walked: Vec<(String, Option<crate::queue::DispatchCursor>)> = Vec::new();
+        for queue in &self.config.queues {
+            let after = state.reconcile_cursors.get(queue).cloned();
+            let page =
+                match queue::due_dispatch_hints_page(&mut conn, queue, batch, after.as_ref()).await
+                {
+                    Ok(page) => page,
+                    Err(error) => {
+                        tracing::warn!(error = %error, queue = %queue, "dispatch reconcile read failed");
+                        return true;
+                    }
+                };
+            walked.push((
+                queue.clone(),
+                next_reconcile_cursor(page.hints.len(), batch, page.cursor),
+            ));
+            hints.extend(page.hints);
+        }
+        for (queue, cursor) in walked {
+            match cursor {
+                Some(cursor) => state.reconcile_cursors.insert(queue, cursor),
+                None => state.reconcile_cursors.remove(&queue),
+            };
+        }
+
         // The throttle metrics ride on this sweep. The Postgres poll path
         // emits them from an idle `poll_once`, which the dispatch path never
         // runs. Without this the series would go dark under dispatch. The
@@ -25921,7 +26086,7 @@ impl Worker {
         self.emit_throttle_metrics(&mut conn).await;
 
         if hints.is_empty() {
-            return;
+            return true;
         }
         // The connection goes back before the publish: the publish is a channel
         // round trip that the database has no part in.
@@ -25929,8 +26094,16 @@ impl Worker {
         if let Err(error) =
             dispatch_call(installed.channel.publish(&hints), "reconcile publish").await
         {
-            self.log_dispatch_error(state, &error, "dispatch reconcile publish failed");
+            self.enter_degraded(
+                state,
+                &error,
+                "dispatch reconcile publish failed",
+                &installed.settings,
+            );
+            return false;
         }
+        state.degraded.record_success();
+        true
     }
 
     /// Give a reference back after a local failure, so the next iteration
@@ -37771,6 +37944,24 @@ mod tests {
             !DispatchLoopState::due(&mut state.reconciled, Duration::from_secs(3600)),
             "a reset timer is not due again inside its interval"
         );
+    }
+
+    /// Finding F5 (issue #1312 review round 1). A channel installed after the
+    /// worker was built must not put a multi-shard loop on the dispatch path.
+    #[test]
+    fn dispatch_is_allowed_only_on_a_single_shard_span() {
+        assert!(dispatch_allowed_for_span(1, 1), "one shard, one pool");
+        assert!(dispatch_allowed_for_span(1, 0), "one shard, no sharded pool");
+        assert!(dispatch_allowed_for_span(0, 0), "no shard identity at all");
+        assert!(
+            !dispatch_allowed_for_span(2, 0),
+            "two shard assignments cannot resolve a reference to a pool"
+        );
+        assert!(
+            !dispatch_allowed_for_span(1, 2),
+            "two pooled shards cannot resolve a reference to a pool"
+        );
+        assert!(!dispatch_allowed_for_span(4, 4), "a wide worker is refused");
     }
 
     /// Finding F1 (issue #1312 review round 1). A full page means the walk may

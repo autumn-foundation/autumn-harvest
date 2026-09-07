@@ -937,6 +937,30 @@ mod tests {
             .next()
     }
 
+    /// Finding F6 (issue #1312 review round 1). The rule must reject exactly
+    /// what a channel implementation rejects, and nothing more.
+    #[test]
+    fn a_queue_name_with_a_colon_is_not_dispatchable() {
+        assert!(validate_queue_name("default").is_ok());
+        assert!(validate_queue_name("tenant-priority").is_ok());
+        assert!(validate_queue_name("a.b_c-1").is_ok());
+
+        let error = validate_queue_name("tenant:priority")
+            .expect_err("a colon separates the channel key space");
+        assert!(
+            error.contains("tenant:priority"),
+            "the message must name the queue: {error}"
+        );
+        assert!(
+            error.contains(':'),
+            "the message must name the rule: {error}"
+        );
+        assert!(
+            validate_queue_name("").is_err(),
+            "an empty queue name is not dispatchable"
+        );
+    }
+
     #[test]
     fn release_delay_doubles_and_then_holds_at_the_cap() {
         let base = Duration::from_millis(20);
