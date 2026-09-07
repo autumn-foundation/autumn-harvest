@@ -358,14 +358,14 @@ pub(crate) fn parse_and_validate_workflow_path(
 
 impl WorkflowPath {
     /// Tokens for the `use #leading_colon #(#nested::)*Stub;` that lets a
-    /// generated companion module see this path's stub type: the leading
-    /// `::` for an absolute path, and the module-segment tokens to splice
-    /// before the stub's name (`super`-prefixed and `self`-stripped for a
-    /// same-crate relative path, verbatim for an absolute or
-    /// `crate`-prefixed one).
+    /// generated companion module see this path's stub type. An absolute
+    /// path keeps its leading `::`. The module-segment tokens splice in
+    /// before the stub's name. A same-crate relative path is
+    /// `super`-prefixed and `self`-stripped. An absolute or
+    /// `crate`-prefixed path passes through verbatim.
     ///
     /// `#[query]`, `#[update]`, and `#[signal]` each resolve a `workflow`
-    /// path to a stub reference the same way, so they share this derivation
+    /// path to a stub reference the same way. They share this derivation
     /// rather than each carrying their own copy of it.
     pub(crate) fn nested_stub_use_tokens(
         &self,

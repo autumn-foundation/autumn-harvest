@@ -311,9 +311,9 @@ mod stub_path_resolution_characterization_tests {
 
     /// Pins the exact stub-`use` tokens `signal_macro` emits for each shape
     /// of `workflow = "..."` path. See `query.rs`/`update.rs`'s identical
-    /// sibling tests: all three handler macros resolve a `workflow` path to
-    /// a stub `use` the same way, ahead of that derivation moving to a
-    /// single `WorkflowPath::nested_stub_use_tokens`.
+    /// sibling tests. All three handler macros resolve a `workflow` path to
+    /// a stub `use` the same way. That derivation is moving to a single
+    /// `WorkflowPath::nested_stub_use_tokens`.
     #[test]
     fn stub_use_tokens_pinned_per_path_shape() {
         assert_eq!(

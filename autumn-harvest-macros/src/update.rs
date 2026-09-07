@@ -640,9 +640,9 @@ mod same_module_vs_nested_module_parity_tests {
     }
 
     /// Pins the exact stub-`use` tokens `update_macro` emits for each shape
-    /// of `workflow = "..."` path. See `query.rs`'s identical sibling test:
-    /// all three handler macros resolve a `workflow` path to a stub `use`
-    /// the same way, ahead of that derivation moving to a single
+    /// of `workflow = "..."` path. See `query.rs`'s identical sibling test.
+    /// All three handler macros resolve a `workflow` path to a stub `use`
+    /// the same way. That derivation is moving to a single
     /// `WorkflowPath::nested_stub_use_tokens`.
     #[test]
     fn stub_use_tokens_pinned_per_path_shape() {

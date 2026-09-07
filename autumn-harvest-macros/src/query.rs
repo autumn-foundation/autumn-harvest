@@ -397,11 +397,11 @@ mod same_module_vs_nested_module_parity_tests {
     }
 
     /// Pins the exact stub-`use` tokens `query_macro` emits for each shape of
-    /// `workflow = "..."` path -- plain nested, `self::`-relative,
-    /// `crate::`-prefixed, and fully absolute (`::`-leading) -- before the
-    /// shared derivation moves to `WorkflowPath::nested_stub_use_tokens`. See
-    /// `update.rs`/`signal.rs`'s identical siblings: all three handler macros
-    /// resolve a `workflow` path to a stub `use` the same way.
+    /// `workflow = "..."` path. The shapes are plain nested, `self::`-relative,
+    /// `crate::`-prefixed, and fully absolute (`::`-leading). This is before
+    /// the shared derivation moves to `WorkflowPath::nested_stub_use_tokens`.
+    /// See `update.rs`/`signal.rs`'s identical siblings: all three handler
+    /// macros resolve a `workflow` path to a stub `use` the same way.
     #[test]
     fn stub_use_tokens_pinned_per_path_shape() {
         assert_eq!(
