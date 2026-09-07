@@ -933,26 +933,47 @@ pub async fn bulk_discard_dead_letters(
         });
     }
 
-    let deleted: std::collections::HashSet<Uuid> = discard_dead_letters_batch(conn, &ids)
-        .await?
-        .into_iter()
-        .collect();
-    let acted_ids: Vec<String> = ids
-        .iter()
-        .filter(|id| deleted.contains(id))
-        .map(ToString::to_string)
-        .collect();
-    let acted_on = acted_ids.len();
-    let skipped = ids.len() - acted_on;
-
-    Ok(BulkDlqResult {
-        matched,
-        acted_on,
-        skipped,
-        ids: acted_ids,
-        dry_run: false,
-        failures: Vec::new(),
-    })
+    // A batch failure is captured into `failures` for every selected id
+    // rather than propagated, matching the API layer's
+    // `bulk_discard_dead_letters_for_selector` (kept in sync per this
+    // module's own convention) -- see that function's doc comment for why.
+    match discard_dead_letters_batch(conn, &ids).await {
+        Ok(deleted_ids) => {
+            let deleted: std::collections::HashSet<Uuid> = deleted_ids.into_iter().collect();
+            let acted_ids: Vec<String> = ids
+                .iter()
+                .filter(|id| deleted.contains(id))
+                .map(ToString::to_string)
+                .collect();
+            let acted_on = acted_ids.len();
+            let skipped = ids.len() - acted_on;
+            Ok(BulkDlqResult {
+                matched,
+                acted_on,
+                skipped,
+                ids: acted_ids,
+                dry_run: false,
+                failures: Vec::new(),
+            })
+        }
+        Err(e) => {
+            let reason = e.to_string();
+            Ok(BulkDlqResult {
+                matched,
+                acted_on: 0,
+                skipped: 0,
+                ids: Vec::new(),
+                dry_run: false,
+                failures: ids
+                    .iter()
+                    .map(|id| BulkDlqFailure {
+                        id: id.to_string(),
+                        reason: reason.clone(),
+                    })
+                    .collect(),
+            })
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
