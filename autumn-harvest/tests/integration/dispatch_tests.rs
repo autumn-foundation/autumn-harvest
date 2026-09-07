@@ -38,6 +38,41 @@ type BoxFut<'a> =
 /// process-global, so two cases sharing it would read each other's references.
 static DISPATCH_SERIAL: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
+/// Resumes a paused queue when the case ends, panic or not.
+///
+/// The database is shared across cases. A failed assertion inside the paused
+/// window would otherwise leave the queue held for every case that follows.
+struct PausedQueueGuard {
+    url: String,
+    queue: &'static str,
+}
+
+impl Drop for PausedQueueGuard {
+    fn drop(&mut self) {
+        let url = self.url.clone();
+        let queue = self.queue;
+        // `Drop` is not async, and the current runtime may already be stopping.
+        // A short-lived thread with its own runtime answers both.
+        let resumed = std::thread::spawn(move || {
+            let Ok(runtime) = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+            else {
+                return;
+            };
+            runtime.block_on(async move {
+                let Ok(mut conn) = AsyncPgConnection::establish(&url).await else {
+                    return;
+                };
+                let _ =
+                    autumn_harvest::queue_pause::resume_queue(&mut conn, queue, "operator").await;
+            });
+        })
+        .join();
+        assert!(resumed.is_ok(), "the queue-resume guard panicked");
+    }
+}
+
 /// Uninstalls the channel when the case ends, panic or not.
 struct InstalledGuard;
 
@@ -130,6 +165,15 @@ fn retrying_activity_workflow(ctx: &WorkflowContext, input: serde_json::Value) -
 /// A workflow with no activities, so the run needs exactly one claim.
 fn trivial_workflow(_ctx: &WorkflowContext, input: serde_json::Value) -> BoxFut<'_> {
     Box::pin(async move { Ok(input) })
+}
+
+/// A workflow that parks on one signal, so the run needs a wake to finish.
+fn signal_waiting_workflow(ctx: &WorkflowContext, _input: serde_json::Value) -> BoxFut<'_> {
+    Box::pin(async move {
+        ctx.receive_signal::<serde_json::Value>("go")
+            .await
+            .map_err(|e| e.to_string())
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -563,6 +607,10 @@ async fn gated_row_is_released_with_backoff() {
     autumn_harvest::queue_pause::pause_queue(&mut conn, "default", "test", "operator", None)
         .await
         .expect("pause");
+    let _resume = PausedQueueGuard {
+        url: url.clone(),
+        queue: "default",
+    };
     let exec_id = start(&mut conn, "dispatch_trivial").await;
 
     let pool = build_pool(&url);
@@ -758,4 +806,256 @@ async fn multi_shard_worker_rejects_dispatch() {
         registry,
     )
     .expect("multi-shard builds without a channel");
+}
+
+/// The reconcile sweep does not republish the rows of a paused queue.
+#[tokio::test]
+async fn the_reconcile_sweep_skips_a_paused_queue() {
+    let _serial = DISPATCH_SERIAL.lock().await;
+    let (url, _c) = setup_test_database_url_or_env().await;
+    let channel = Arc::new(MemoryDispatch::new());
+    let _guard = install(&channel);
+
+    let mut conn = connect(&url).await;
+    let exec_id = start(&mut conn, "dispatch_trivial").await;
+    let task_ids: Vec<uuid::Uuid> = tasks_for(&mut conn, exec_id)
+        .await
+        .into_iter()
+        .map(|row| row.id)
+        .collect();
+    assert_eq!(task_ids.len(), 1, "the start writes one workflow task");
+
+    let queues = vec!["default".to_string()];
+    let due = autumn_harvest::queue::due_dispatch_hints(&mut conn, &queues, 100)
+        .await
+        .expect("sweep read");
+    assert!(
+        due.iter().any(|hint| hint.task_id == task_ids[0]),
+        "an unheld due row must be swept"
+    );
+
+    autumn_harvest::queue_pause::pause_queue(&mut conn, "default", "test", "operator", None)
+        .await
+        .expect("pause");
+    let _resume = PausedQueueGuard {
+        url: url.clone(),
+        queue: "default",
+    };
+
+    let held = autumn_harvest::queue::due_dispatch_hints(&mut conn, &queues, 100)
+        .await
+        .expect("sweep read while paused");
+    assert!(
+        held.is_empty(),
+        "a paused queue must not be swept, got {held:?}"
+    );
+}
+
+/// A signal delivered inside its own transaction reaches a worker through the
+/// channel, without waiting for the reconcile sweep.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_signal_reaches_the_worker_before_the_reconcile_sweep() {
+    let _serial = DISPATCH_SERIAL.lock().await;
+    let (url, _c) = setup_test_database_url_or_env().await;
+    let channel = Arc::new(MemoryDispatch::new());
+    // A reconcile interval far longer than the case. Anything that completes
+    // here was carried by a hint, never by the sweep.
+    let reconcile_interval = Duration::from_secs(30);
+    let _guard = install_with(
+        &channel,
+        DispatchSettings {
+            reconcile_interval,
+            ..dispatch_settings()
+        },
+    );
+
+    let mut conn = connect(&url).await;
+    let exec_id = start(&mut conn, "dispatch_signal_wait").await;
+
+    let pool = build_pool(&url);
+    let worker = Arc::new(make_worker(
+        vec![wf_info("dispatch_signal_wait", signal_waiting_workflow)],
+        vec![],
+        empty_shared_state(),
+    ));
+
+    let mut check = connect(&url).await;
+    with_worker(worker, pool, async {
+        // The run parks on the signal. Its task row is `RUNNING` with no owner.
+        let deadline = std::time::Instant::now() + Duration::from_secs(20);
+        loop {
+            let parked = tasks_for(&mut check, exec_id)
+                .await
+                .iter()
+                .all(|row| row.state == "RUNNING");
+            if parked && !channel.delivered_ids().is_empty() {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the run never parked on its signal"
+            );
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+
+        let mut sender = connect(&url).await;
+        let sent_at = std::time::Instant::now();
+        autumn_harvest::signal::send_signal(
+            &mut sender,
+            exec_id,
+            "go",
+            serde_json::json!({"ok": true}),
+        )
+        .await
+        .expect("signal");
+
+        wait_for_state(&mut check, exec_id, &["COMPLETED"], Duration::from_secs(20)).await;
+        let elapsed = sent_at.elapsed();
+        assert!(
+            elapsed < reconcile_interval,
+            "the signal took {elapsed:?}, which is the reconcile interval or more; \
+             the wake hint did not reach the channel"
+        );
+    })
+    .await;
+}
+
+/// The by-id claim runs against Postgres with the cross-region DR fence
+/// spliced in, and the fence still decides the outcome.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_by_id_claim_honours_the_dr_fence() {
+    use autumn_harvest::replication::{
+        FenceRegistry, ShardGeneration, bump_generation, ensure_generation_row,
+    };
+
+    let _serial = DISPATCH_SERIAL.lock().await;
+    let (url, _c) = setup_test_database_url_or_env().await;
+    let mut conn = connect(&url).await;
+
+    let shard = ShardId::new(0);
+    let generation = ensure_generation_row(&mut conn, shard)
+        .await
+        .expect("generation row");
+
+    let exec_id = start(&mut conn, "dispatch_trivial").await;
+    let task_id = tasks_for(&mut conn, exec_id)
+        .await
+        .into_iter()
+        .next()
+        .expect("one workflow task")
+        .id;
+
+    // A worker pinned to the current generation claims the named row.
+    FenceRegistry::clear();
+    FenceRegistry::register(shard, generation);
+    FenceRegistry::set_default_shard(shard);
+    let claimed = autumn_harvest::queue::claim_task_by_id_on_shard(
+        &mut conn,
+        task_id,
+        &["default".to_string()],
+        "dr-worker",
+        "",
+        None,
+        &[],
+        &[],
+        Some(shard),
+    )
+    .await
+    .expect("fenced by-id claim");
+    assert_eq!(
+        claimed.map(|task| task.id),
+        Some(task_id),
+        "a worker on the current generation must claim its own row"
+    );
+
+    // Give the row back, promote the shard, and try again with the now-stale pin.
+    autumn_harvest::queue::release_terminal_workflow_claim(&mut conn, task_id, "dr-worker", 0)
+        .await
+        .expect("release");
+    bump_generation(&mut conn, shard, "promote", "operator")
+        .await
+        .expect("bump");
+    let fenced = autumn_harvest::queue::claim_task_by_id_on_shard(
+        &mut conn,
+        task_id,
+        &["default".to_string()],
+        "dr-worker",
+        "",
+        None,
+        &[],
+        &[],
+        Some(shard),
+    )
+    .await
+    .expect("fenced by-id claim");
+    FenceRegistry::clear();
+    assert!(
+        fenced.is_none(),
+        "a fenced worker must not claim a row by id"
+    );
+    // The generation moved, so the local binding is stale by construction.
+    let _ = ShardGeneration::new(0);
+}
+
+/// A transactional start holds its hint until the caller commits, and
+/// `TransactionalStartOutcome::finish` publishes it.
+#[tokio::test]
+async fn a_transactional_start_publishes_its_hint_on_finish() {
+    use autumn_harvest::TransactionalStartOptions;
+    use autumn_harvest::handle::WorkflowHandleClient;
+
+    let _serial = DISPATCH_SERIAL.lock().await;
+    let (url, _c) = setup_test_database_url_or_env().await;
+    let channel = Arc::new(MemoryDispatch::new());
+    let _guard = install(&channel);
+
+    let client = WorkflowHandleClient::single(build_pool(&url), url.clone())
+        .with_workflows(vec![wf_info("dispatch_trivial", trivial_workflow)]);
+    let mut conn = connect(&url).await;
+    let workflow_id = format!("dispatch-tx-{}", uuid::Uuid::new_v4());
+
+    let observed = Arc::clone(&channel);
+    let outcome = Box::pin(conn.transaction::<_, autumn_harvest::HarvestError, _>({
+        let client = client.clone();
+        let workflow_id = workflow_id.clone();
+        async move |conn| {
+            let outcome = client
+                .start_workflow_transactional(
+                    conn,
+                    "dispatch_trivial",
+                    &workflow_id,
+                    serde_json::Value::Null,
+                    TransactionalStartOptions::new(),
+                )
+                .await?;
+            assert!(
+                observed.published_ids().is_empty(),
+                "a staged start must not publish before the caller commits"
+            );
+            Ok(outcome)
+        }
+    }))
+    .await
+    .expect("the transaction must commit");
+
+    let exec_id = outcome.exec_id;
+    assert!(
+        channel.published_ids().is_empty(),
+        "the commit alone does not publish; `finish` does"
+    );
+
+    outcome.finish().await;
+
+    let mut check = connect(&url).await;
+    let task_ids: Vec<uuid::Uuid> = tasks_for(&mut check, exec_id)
+        .await
+        .into_iter()
+        .map(|row| row.id)
+        .collect();
+    assert_eq!(task_ids.len(), 1, "the start writes one workflow task");
+    assert_eq!(
+        channel.published_ids(),
+        task_ids,
+        "finish must publish the hint the start raised"
+    );
 }

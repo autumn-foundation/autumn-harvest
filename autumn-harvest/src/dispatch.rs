@@ -373,10 +373,73 @@ pub fn record_hints(hints: Vec<DispatchHint>) {
 /// Largest number of hints one background `publish` call carries.
 const PUBLISH_BATCH_MAX: usize = 256;
 
+/// Capacity of the queue that feeds the background publisher.
+///
+/// The queue is bounded so an unreachable channel cannot grow it without limit.
+/// A hint is small, so this holds well under a megabyte, and a burst of that
+/// size is already several seconds of enqueue work. A hint dropped at the
+/// bound costs latency, never work: the reconcile sweep republishes its row.
+const PUBLISH_QUEUE_CAPACITY: usize = 10_000;
+
+/// Shortest interval between two "publisher queue full" warnings.
+const DROPPED_HINT_LOG_INTERVAL: Duration = Duration::from_secs(30);
+
+/// Hints the background publisher dropped because its queue was full.
+static DROPPED_HINTS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// When the full-queue warning was last emitted.
+static DROPPED_HINT_LOGGED: Mutex<Option<std::time::Instant>> = Mutex::new(None);
+
+/// Number of hints the background publisher has dropped in this process.
+///
+/// The counter only grows. A non-zero value means the channel could not keep
+/// up with the enqueue rate, and the reconcile sweep carried those rows.
+#[must_use]
+pub fn dropped_hints() -> u64 {
+    DROPPED_HINTS.load(Ordering::Relaxed)
+}
+
+/// True when the full-queue warning may be emitted now, which resets `last`.
+fn may_log_dropped(
+    last: &mut Option<std::time::Instant>,
+    now: std::time::Instant,
+    interval: Duration,
+) -> bool {
+    match *last {
+        Some(at) if now.duration_since(at) < interval => false,
+        _ => {
+            *last = Some(now);
+            true
+        }
+    }
+}
+
+/// Count one dropped hint and warn at most once per interval.
+fn record_dropped_hint() {
+    let dropped = DROPPED_HINTS
+        .fetch_add(1, Ordering::Relaxed)
+        .saturating_add(1);
+    let may_log = {
+        let mut last = lock(&DROPPED_HINT_LOGGED);
+        may_log_dropped(
+            &mut last,
+            std::time::Instant::now(),
+            DROPPED_HINT_LOG_INTERVAL,
+        )
+    };
+    if may_log {
+        tracing::warn!(
+            dropped,
+            capacity = PUBLISH_QUEUE_CAPACITY,
+            "the dispatch publisher queue is full; the reconcile sweep republishes these rows"
+        );
+    }
+}
+
 /// The background publisher task and the channel that feeds it.
 #[derive(Debug)]
 struct Publisher {
-    sender: tokio::sync::mpsc::UnboundedSender<DispatchHint>,
+    sender: tokio::sync::mpsc::Sender<DispatchHint>,
     task: tokio::task::JoinHandle<()>,
 }
 
@@ -402,9 +465,16 @@ fn publish_in_background(mut hint: DispatchHint) {
     if let Some(publisher) = slot.as_ref()
         && !publisher.task.is_finished()
     {
-        match publisher.sender.send(hint) {
+        match publisher.sender.try_send(hint) {
             Ok(()) => return,
-            Err(returned) => hint = returned.0,
+            Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+                // The queue is at its bound. Drop the hint rather than block the
+                // caller, which is a database write path.
+                drop(slot);
+                record_dropped_hint();
+                return;
+            }
+            Err(tokio::sync::mpsc::error::TrySendError::Closed(returned)) => hint = returned,
         }
     }
     let Ok(runtime) = tokio::runtime::Handle::try_current() else {
@@ -414,15 +484,15 @@ fn publish_in_background(mut hint: DispatchHint) {
         *slot = None;
         return;
     };
-    let (sender, receiver) = tokio::sync::mpsc::unbounded_channel();
+    let (sender, receiver) = tokio::sync::mpsc::channel(PUBLISH_QUEUE_CAPACITY);
     let task = runtime.spawn(publisher_loop(receiver));
-    // The receiver is alive, so this send cannot fail.
-    let _ = sender.send(hint);
+    // The receiver is alive and the queue is empty, so this send cannot fail.
+    let _ = sender.try_send(hint);
     *slot = Some(Publisher { sender, task });
 }
 
 /// Drain the publisher channel and issue one `publish` call per batch.
-async fn publisher_loop(mut receiver: tokio::sync::mpsc::UnboundedReceiver<DispatchHint>) {
+async fn publisher_loop(mut receiver: tokio::sync::mpsc::Receiver<DispatchHint>) {
     while let Some(first) = receiver.recv().await {
         let mut batch = Vec::with_capacity(1);
         batch.push(first);
@@ -512,6 +582,11 @@ struct MemoryState {
 /// leases with redelivery counts, and recovery of a lease a crashed consumer
 /// left behind. The test knobs [`MemoryDispatch::fail_next`] and
 /// [`MemoryDispatch::drop_all`] reproduce a channel error and a channel wipe.
+///
+/// The four event logs — published, delivered, acked and released — grow for
+/// the life of the instance. They are what a case asserts against, so nothing
+/// trims them. The type is behind the `testing` feature and every instance
+/// lives for one case, so the growth is bounded by that case.
 #[cfg(feature = "testing")]
 #[derive(Debug)]
 pub struct MemoryDispatch {
@@ -973,6 +1048,126 @@ mod tests {
         .await;
         assert!(leftover.is_empty());
         assert_eq!(channel.published_ids(), vec![one.task_id]);
+        uninstall();
+    }
+
+    #[test]
+    fn the_publisher_queue_is_bounded() {
+        assert_eq!(PUBLISH_QUEUE_CAPACITY, 10_000);
+        assert!(
+            PUBLISH_BATCH_MAX <= PUBLISH_QUEUE_CAPACITY,
+            "one batch must not exceed the queue it drains"
+        );
+    }
+
+    #[test]
+    fn the_dropped_hint_warning_is_rate_limited() {
+        let interval = Duration::from_secs(30);
+        let start = std::time::Instant::now();
+        let mut last = None;
+
+        assert!(
+            may_log_dropped(&mut last, start, interval),
+            "the first drop is always logged"
+        );
+        assert!(
+            !may_log_dropped(&mut last, start + Duration::from_secs(1), interval),
+            "a second drop inside the interval is suppressed"
+        );
+        assert!(
+            may_log_dropped(&mut last, start + Duration::from_secs(31), interval),
+            "a drop after the interval is logged again"
+        );
+    }
+
+    #[tokio::test]
+    async fn settle_scope_discards_the_hints_of_a_failed_transaction() {
+        let _guard = INSTALL_LOCK.lock().await;
+        let channel = Arc::new(MemoryDispatch::new());
+        install(
+            Arc::clone(&channel) as Arc<dyn TaskDispatch>,
+            DispatchSettings::default(),
+        );
+
+        let one = hint("q", Utc::now());
+        let inner = one.clone();
+        let (outcome, leftover) = buffered(async move {
+            record_hint(inner);
+            settle_scope(Err::<(), &str>("the transaction rolled back")).await
+        })
+        .await;
+
+        assert!(outcome.is_err());
+        assert!(leftover.is_empty(), "settle takes the buffer either way");
+        assert!(
+            channel.published_ids().is_empty(),
+            "a rolled-back transaction leaves no PENDING row to name"
+        );
+        uninstall();
+    }
+
+    #[tokio::test]
+    async fn buffered_settled_publishes_on_commit_and_discards_on_rollback() {
+        let _guard = INSTALL_LOCK.lock().await;
+        let channel = Arc::new(MemoryDispatch::new());
+        install(
+            Arc::clone(&channel) as Arc<dyn TaskDispatch>,
+            DispatchSettings::default(),
+        );
+
+        let committed = hint("q", Utc::now());
+        let inner = committed.clone();
+        let outcome = buffered_settled(async move {
+            record_hint(inner);
+            Ok::<(), &str>(())
+        })
+        .await;
+        assert!(outcome.is_ok());
+        assert_eq!(channel.published_ids(), vec![committed.task_id]);
+
+        let rolled_back = hint("q", Utc::now());
+        let inner = rolled_back.clone();
+        let outcome = buffered_settled(async move {
+            record_hint(inner);
+            Err::<(), &str>("rolled back")
+        })
+        .await;
+        assert!(outcome.is_err());
+        assert_eq!(
+            channel.published_ids(),
+            vec![committed.task_id],
+            "a rolled-back owner publishes nothing"
+        );
+        uninstall();
+    }
+
+    #[tokio::test]
+    async fn buffered_settled_leaves_the_hints_with_an_outer_owner() {
+        let _guard = INSTALL_LOCK.lock().await;
+        let channel = Arc::new(MemoryDispatch::new());
+        install(
+            Arc::clone(&channel) as Arc<dyn TaskDispatch>,
+            DispatchSettings::default(),
+        );
+
+        let one = hint("q", Utc::now());
+        let inner = one.clone();
+        let observed = Arc::clone(&channel);
+        let ((), outer) = buffered(async move {
+            let outcome = buffered_settled(async move {
+                record_hint(inner);
+                Ok::<(), &str>(())
+            })
+            .await;
+            assert!(outcome.is_ok());
+            assert!(
+                observed.published_ids().is_empty(),
+                "a nested owner must not publish the enclosing transaction's hints"
+            );
+        })
+        .await;
+
+        assert_eq!(outer, vec![one]);
         uninstall();
     }
 

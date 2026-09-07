@@ -1164,10 +1164,32 @@ pub async fn claim_task_on_shard(
 /// and leaves every other gate as the same text.
 const BY_ID_ANCHOR: &str = "AND NOT (harvest_task_queue.queue_name = ANY(paused_queues.names)) ";
 
-/// Splice `AND harvest_task_queue.id = <bind>` into `base`'s `candidate` CTE.
+/// The `concurrency_pending_keys` predicate that the by-id claim adds.
 ///
-/// The assertion on the anchor count guards a future edit. An edit that
-/// duplicates or renames the anchor panics at first use. Without it, a by-id
+/// The anchor is the last test of that CTE, which appears exactly once in the
+/// base query.
+const BY_ID_KEYS_ANCHOR: &str = "AND concurrency_cap IS NOT NULL ";
+
+/// Splice the by-id predicates into `base`.
+///
+/// Two predicates go in, both binding the same task id. The first restricts
+/// `candidate` to the named row, which is what makes the claim a by-id claim.
+/// The second restricts `concurrency_pending_keys` to the named row.
+///
+/// # Why the CTE needs its own predicate
+///
+/// `concurrency_pending_keys` collects the `(concurrency_key, task_type)` pairs
+/// of every due `PENDING` row on the worker's queues. In the base query that
+/// set is the right one: the claim may select any of those rows. A by-id claim
+/// can select exactly one row, so every other pair it collects is work that no
+/// gate reads. On a deployment with a large due backlog the CTE would scan that
+/// whole backlog once per reference, which is the cost the dispatch path exists
+/// to avoid. The gate itself is unchanged: `concurrency_running_counts` still
+/// aggregates the `RUNNING` population for the named row's key, and the
+/// authoritative advisory-locked recheck inside `claimed` is untouched.
+///
+/// The assertion on each anchor count guards a future edit. An edit that
+/// duplicates or renames an anchor panics at first use. Without it, a by-id
 /// claim could silently claim some other row.
 fn splice_by_id_predicate(base: &str, bind: &str) -> String {
     assert_eq!(
@@ -1175,18 +1197,28 @@ fn splice_by_id_predicate(base: &str, bind: &str) -> String {
         1,
         "claim query by-id anchor must appear exactly once"
     );
+    assert_eq!(
+        base.matches(BY_ID_KEYS_ANCHOR).count(),
+        1,
+        "claim query concurrency-keys anchor must appear exactly once"
+    );
     base.replace(
         BY_ID_ANCHOR,
         &format!("{BY_ID_ANCHOR}AND harvest_task_queue.id = {bind} "),
+    )
+    .replace(
+        BY_ID_KEYS_ANCHOR,
+        &format!("{BY_ID_KEYS_ANCHOR}AND id = {bind} "),
     )
 }
 
 /// [`claim_task_query`] restricted to one named row (issue #1312).
 ///
-/// Identical to the base query plus one predicate on `harvest_task_queue.id`
-/// in the `candidate` CTE, so every one of the thirteen claim gates still
-/// applies. A dispatch reference names a row; it never authorizes a claim.
-/// Binds `$7` task id on top of the base query's `$1..$6`.
+/// Identical to the base query plus two predicates on the row id: one in the
+/// `candidate` CTE and one in `concurrency_pending_keys`. Every one of the
+/// thirteen claim gates still applies. A dispatch reference names a row; it
+/// never authorizes a claim. Binds `$7` task id on top of the base query's
+/// `$1..$6`.
 ///
 /// # Why a splice rather than a second literal
 ///
@@ -1203,7 +1235,7 @@ pub fn claim_task_by_id_query() -> &'static str {
 /// [`claim_task_by_id_query`] with the cross-region DR fence spliced in.
 ///
 /// Derived from [`claim_task_query_fenced`], which already binds `$7` shard id
-/// and `$8` pinned generation, so the by-id predicate binds `$9`.
+/// and `$8` pinned generation, so both by-id predicates bind `$9`.
 #[must_use]
 pub fn claim_task_by_id_query_fenced() -> &'static str {
     static BY_ID_FENCED: std::sync::LazyLock<String> =
@@ -1212,6 +1244,12 @@ pub fn claim_task_by_id_query_fenced() -> &'static str {
 }
 
 /// What one claim transaction concluded.
+///
+/// `Claimed` boxes its row on purpose. `TaskQueueItem` carries about forty
+/// columns, so an unboxed variant would put a `clippy::large_enum_variant`
+/// warning on every `Released` and `Empty` value the claim path moves. The box
+/// is one allocation per successful claim and it is freed at the `match` in the
+/// caller, which unwraps it into the returned `Option`.
 #[derive(Debug)]
 enum ClaimOutcome {
     /// The row is claimed and held by this worker.
@@ -1586,29 +1624,38 @@ pub(crate) fn record_pending_hint(
 ///
 /// A failure is logged and dropped: a hint is a latency optimization and the
 /// reconcile sweep republishes any row this misses.
+///
+/// The read runs in chunks of [`PENDING_HINT_READ_CHUNK`] ids. A queue resume
+/// can thaw a backlog of any size, and one statement carrying every id would
+/// build an array bound only by that backlog.
 pub(crate) async fn record_pending_hints(conn: &mut AsyncPgConnection, ids: &[Uuid]) {
     if ids.is_empty() || !crate::dispatch::is_installed() {
         return;
     }
-    let rows: Result<Vec<PendingHintRow>, _> = diesel::sql_query(pending_hint_rows_query())
-        .bind::<diesel::sql_types::Array<diesel::sql_types::Uuid>, _>(ids)
-        .load(conn)
-        .await;
-    match rows {
-        Ok(rows) => {
-            crate::dispatch::record_hints(
-                rows.into_iter().map(PendingHintRow::into_hint).collect(),
-            );
-        }
-        Err(error) => {
-            tracing::debug!(
-                error = %error,
-                count = ids.len(),
-                "failed to read dispatch hint rows; the reconcile sweep republishes them"
-            );
+    for chunk in ids.chunks(PENDING_HINT_READ_CHUNK) {
+        let rows: Result<Vec<PendingHintRow>, _> = diesel::sql_query(pending_hint_rows_query())
+            .bind::<diesel::sql_types::Array<diesel::sql_types::Uuid>, _>(chunk)
+            .load(conn)
+            .await;
+        match rows {
+            Ok(rows) => {
+                crate::dispatch::record_hints(
+                    rows.into_iter().map(PendingHintRow::into_hint).collect(),
+                );
+            }
+            Err(error) => {
+                tracing::debug!(
+                    error = %error,
+                    count = chunk.len(),
+                    "failed to read dispatch hint rows; the reconcile sweep republishes them"
+                );
+            }
         }
     }
 }
+
+/// Largest number of ids one [`record_pending_hints`] statement carries.
+const PENDING_HINT_READ_CHUNK: usize = 1_000;
 
 // ---------------------------------------------------------------------------
 // ---------------------------------------------------------------------------
@@ -3581,7 +3628,7 @@ const fn release_suspended_workflow_claim_query() -> &'static str {
        AND state = 'RUNNING' \
        AND worker_id = $2 \
        AND crash_strikes = $3 \
-     RETURNING id"
+     RETURNING id, queue_name, scheduled_at, priority"
 }
 
 /// Release a still-claimed, but replay-suspended-empty-handed, workflow task
@@ -3681,21 +3728,18 @@ async fn release_workflow_claim_inner(
     worker_id: &str,
     crash_strikes: i32,
 ) -> HarvestResult<bool> {
-    // Only the row's *existence* matters -- the id is bound, not read back.
-    #[derive(diesel::QueryableByName)]
-    struct IdRow {
-        #[allow(dead_code)]
-        #[diesel(sql_type = diesel::sql_types::Uuid)]
-        id: Uuid,
-    }
-
-    let rows: Vec<IdRow> = diesel::sql_query(release_suspended_workflow_claim_query())
+    let rows: Vec<PendingHintRow> = diesel::sql_query(release_suspended_workflow_claim_query())
         .bind::<diesel::sql_types::Uuid, _>(task_id)
         .bind::<diesel::sql_types::Text, _>(worker_id)
         .bind::<diesel::sql_types::Integer, _>(crash_strikes)
         .get_results(conn)
         .await
         .map_err(crate::error::database_error)?;
+    // Dispatch hint (issue #1312). The release leaves the row `PENDING` with no
+    // owner and `scheduled_at = NOW()`, so it is claimable and no reference
+    // names it. The `RETURNING` list already carries every hint column, so the
+    // hint costs no extra statement.
+    crate::dispatch::record_hints(rows.iter().map(PendingHintRow::to_hint).collect());
     Ok(!rows.is_empty())
 }
 
@@ -7024,6 +7068,15 @@ mod tests {
     }
 
     #[test]
+    fn release_suspended_workflow_claim_query_returns_every_hint_column() {
+        let sql = release_suspended_workflow_claim_query();
+        assert!(
+            sql.contains("RETURNING id, queue_name, scheduled_at, priority"),
+            "the release must return the dispatch hint columns (issue #1312)"
+        );
+    }
+
+    #[test]
     fn release_suspended_workflow_claim_query_is_ownership_guarded_and_not_skip_locked() {
         let sql = release_suspended_workflow_claim_query();
         assert!(sql.contains("SET state = 'PENDING'"));
@@ -8290,16 +8343,20 @@ mod tests {
     ];
 
     #[test]
-    fn by_id_claim_query_is_the_base_query_plus_exactly_one_predicate() {
+    fn by_id_claim_query_is_the_base_query_plus_exactly_two_predicates() {
         let base = claim_task_query();
         let by_id = claim_task_by_id_query();
-        let predicate = "AND harvest_task_queue.id = $7 ";
+        let candidate_predicate = "AND harvest_task_queue.id = $7 ";
+        let keys_predicate = "AND id = $7 ";
 
-        assert_eq!(by_id.matches(predicate).count(), 1);
+        assert_eq!(by_id.matches(candidate_predicate).count(), 1);
+        assert_eq!(by_id.matches(keys_predicate).count(), 1);
         assert_eq!(
-            by_id.replace(predicate, ""),
+            by_id
+                .replace(candidate_predicate, "")
+                .replace(keys_predicate, ""),
             base,
-            "the by-id query must differ from the base query by one predicate only"
+            "the by-id query must differ from the base query by two predicates only"
         );
     }
 
@@ -8326,12 +8383,19 @@ mod tests {
     }
 
     #[test]
-    fn fenced_by_id_claim_query_is_the_fenced_query_plus_exactly_one_predicate() {
-        let predicate = "AND harvest_task_queue.id = $9 ";
+    fn fenced_by_id_claim_query_is_the_fenced_query_plus_exactly_two_predicates() {
+        let candidate_predicate = "AND harvest_task_queue.id = $9 ";
+        let keys_predicate = "AND id = $9 ";
         let fenced = claim_task_by_id_query_fenced();
 
-        assert_eq!(fenced.matches(predicate).count(), 1);
-        assert_eq!(fenced.replace(predicate, ""), claim_task_query_fenced());
+        assert_eq!(fenced.matches(candidate_predicate).count(), 1);
+        assert_eq!(fenced.matches(keys_predicate).count(), 1);
+        assert_eq!(
+            fenced
+                .replace(candidate_predicate, "")
+                .replace(keys_predicate, ""),
+            claim_task_query_fenced()
+        );
     }
 
     #[test]
@@ -8360,6 +8424,22 @@ mod tests {
         assert!(
             candidate < predicate && predicate < claimed,
             "the by-id predicate must sit inside the candidate CTE"
+        );
+    }
+
+    #[test]
+    fn the_by_id_key_predicate_lands_inside_the_pending_keys_cte() {
+        let by_id = claim_task_by_id_query();
+        let predicate = by_id.find("AND id = $7").expect("predicate");
+        let keys = by_id
+            .find("concurrency_pending_keys AS MATERIALIZED (")
+            .expect("pending keys CTE");
+        let counts = by_id
+            .find("concurrency_running_counts AS MATERIALIZED (")
+            .expect("running counts CTE");
+        assert!(
+            keys < predicate && predicate < counts,
+            "the by-id key predicate must sit inside concurrency_pending_keys"
         );
     }
 
