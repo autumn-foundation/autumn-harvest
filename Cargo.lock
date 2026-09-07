@@ -350,6 +350,7 @@ version = "0.6.0"
 dependencies = [
  "async-trait",
  "autumn-harvest",
+ "autumn-harvest-redis",
  "autumn-web",
  "aws-config",
  "aws-sdk-sqs",
