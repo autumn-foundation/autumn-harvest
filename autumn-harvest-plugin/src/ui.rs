@@ -3858,7 +3858,7 @@ fn render_dead_letter_detail(row: &DeadLetterUiRow) -> Markup {
 }
 
 /// Hidden filter fields for the DLQ page's GET forms — the group-by
-/// resubmit form, which routes back through `list_dead_letters_ui` and so
+/// resubmit form. It routes back through `list_dead_letters_ui`, so it
 /// handles an invalid value gracefully like every other GET on this page.
 /// Carries the raw text, not the parsed value. This lets an invalid value's
 /// inline error survive resubmission, instead of being silently dropped.
@@ -3896,14 +3896,14 @@ fn render_dead_letter_hidden_filters_raw(
 ///
 /// `parse_bulk_dlq_form` (autumn-harvest-plugin/src/api.rs) re-validates
 /// `task_kind`/`failed_after`/`failed_before` strictly and 400s on a bad
-/// value. Submitting an invalid raw value here — as
-/// [`render_dead_letter_hidden_filters_raw`] does for the GET group-by form —
-/// would reintroduce the exact bug this PR fixes, one layer down: the bulk
-/// action would abort instead of running, or redisplaying the inline error
-/// (Codex review, #1420). An invalid field is "filter not applied" on this
-/// page, so it is simply omitted here; the operator's raw text and the error
-/// still redisplay from `return_to`, which is built from the raw query
-/// string.
+/// value. [`render_dead_letter_hidden_filters_raw`] submits an invalid raw
+/// value on the GET group-by form, which is safe there. Doing the same
+/// here would reintroduce the exact bug this PR fixes, one layer down. The
+/// bulk action would abort instead of running, or redisplaying the inline
+/// error (Codex review, #1420). An invalid field is "filter not applied"
+/// on this page, so it is simply omitted here. The operator's raw text and
+/// the error still redisplay from `return_to`, which is built from the raw
+/// query string.
 fn render_dead_letter_hidden_filters(filters: &DeadLetterUiFilters) -> Markup {
     html! {
         @if let Some(workflow_name) = filters.workflow_name.as_deref() {
@@ -11544,10 +11544,11 @@ mod tests {
     /// Codex review on #1420: `parse_bulk_dlq_form` (autumn-harvest-plugin/
     /// src/api.rs) re-validates `task_kind`/`failed_after`/`failed_before`
     /// strictly and 400s on a bad value. The bulk-action forms must never
-    /// submit an invalid raw value as a hidden field, or replay/discard
-    /// aborts instead of running — the exact bug this PR fixes, one layer
-    /// down. An invalid field is "filter not applied" here, so it must be
-    /// omitted, not echoed with its raw (unparseable) text.
+    /// submit an invalid raw value as a hidden field. Otherwise
+    /// replay/discard aborts instead of running — the exact bug this PR
+    /// fixes, one layer down. An invalid field is "filter not applied"
+    /// here, so it must be omitted, not echoed with its raw, unparseable
+    /// text.
     #[test]
     fn dead_letter_bulk_actions_omit_invalid_filter_instead_of_submitting_raw_value() {
         let filters = DeadLetterUiFilters {
@@ -11577,8 +11578,8 @@ mod tests {
             html.contains("value=\"invoice_workflow\""),
             "the valid workflow_name filter must still be carried: {html}"
         );
-        // The raw invalid text may still appear in `return_to` — that's a
-        // GET redirect target, not a bulk selector field, and carrying it
+        // The raw invalid text may still appear in `return_to`. It is a
+        // GET redirect target, not a bulk selector field. Carrying it there
         // is how the inline error redisplays after the action completes.
         assert!(
             html.contains("return_to") && html.contains("zombie"),
