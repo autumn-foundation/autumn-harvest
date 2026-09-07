@@ -25777,6 +25777,14 @@ impl Worker {
                 return;
             }
         };
+        // The throttle metrics ride on this sweep. The Postgres poll path
+        // emits them from an idle `poll_once`, which the dispatch path never
+        // runs. Without this the series would go dark under dispatch. The
+        // sweep already holds a connection and runs once per reconcile
+        // interval, so this costs one read per interval rather than one per
+        // poll.
+        self.emit_throttle_metrics(&mut conn).await;
+
         if hints.is_empty() {
             return;
         }
@@ -25849,6 +25857,12 @@ impl Worker {
             // by-id claim applies the full claim predicate to it. The
             // LISTEN/NOTIFY listener below is left alone: an extra wake is
             // harmless and it keeps the fallback path warm.
+            //
+            // Configured queue weights (issue #515) do not apply to a
+            // reference read. The channel decides delivery order, and the
+            // reconcile sweep publishes in `(priority DESC, scheduled_at ASC)`
+            // order, so priority is best effort under dispatch. The weighted
+            // permutation still governs the `poll_once` fallback.
             if let Some(installed) = crate::dispatch::installed() {
                 if self
                     .run_dispatch_iteration(pool, shard, &installed, &mut dispatch_state)
