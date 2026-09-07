@@ -648,9 +648,9 @@ async fn explicit_shard_assignment_is_never_widened() {
 /// shard takes about 10s on its own. Every other per-shard monitor loop
 /// (queue depth, timeout checker, poison-pill reclaimer, and more) shares
 /// the schedule-overdue sampler's cancellation shape at its own top of
-/// loop, but spawns only after that startup sequence finishes. So this
-/// test's early shutdown request has already landed before any of them
-/// starts its first tick. Each one breaks before ever calling
+/// loop. Each one spawns only after that startup sequence finishes. So
+/// this test's early shutdown request has already landed before any of
+/// them starts its first tick. Each one breaks before ever calling
 /// `pool.get()`. A worker that runs long enough lets one of those loops
 /// start a real acquisition against a permanently-exhausted shard before
 /// shutdown is requested. That case is not covered by this test — see
