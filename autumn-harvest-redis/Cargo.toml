@@ -37,6 +37,14 @@ testcontainers-modules = { workspace = true, optional = true }
 tokio = { workspace = true, features = ["test-util", "macros"] }
 testcontainers = { workspace = true }
 testcontainers-modules = { workspace = true }
+# The worker end-to-end suite (tests/worker_dispatch_e2e.rs) drives a real
+# `autumn_harvest::worker::Worker` against Postgres and Redis, so it needs the
+# engine's database, test-helper and chaos features. Dev-only: the library
+# build still depends on `autumn-harvest` with default features off.
+autumn-harvest = { path = "../autumn-harvest", features = ["db", "testing", "chaos"] }
+diesel = { workspace = true }
+diesel-async = { workspace = true }
+deadpool = { workspace = true }
 
 [[bench]]
 name = "claim_roundtrip_profile"

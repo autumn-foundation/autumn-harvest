@@ -560,7 +560,7 @@ impl TaskQueueAdapter for RedisTaskQueue {
     }
 }
 
-fn is_busygroup(err: &RedisError) -> bool {
+pub fn is_busygroup(err: &RedisError) -> bool {
     err.code() == Some("BUSYGROUP")
         || err.detail().is_some_and(|d| {
             d.contains("BUSYGROUP") || d.contains("Consumer Group name already exists")
@@ -569,6 +569,10 @@ fn is_busygroup(err: &RedisError) -> bool {
 
 /// Lua script that atomically promotes all due delayed tasks for a single
 /// queue onto its claimable stream.
+///
+/// Shared with the dispatch channel in [`crate::dispatch`]. The two key
+/// families differ. The promotion is the same operation over a sorted set, a
+/// payload hash and a stream.
 ///
 /// Arguments:
 /// - `KEYS[1]`: the per-queue sorted set of task ids keyed by `scheduled_at`.
@@ -580,7 +584,7 @@ fn is_busygroup(err: &RedisError) -> bool {
 /// supplied timestamp, looks the matching payload up in the hash, XADDs it to
 /// the stream, and removes both index entries. Returns the number of members
 /// promoted.
-const PROMOTE_LUA: &str = r"
+pub const PROMOTE_LUA: &str = r"
 local zset = KEYS[1]
 local payloads = KEYS[2]
 local stream = KEYS[3]
