@@ -4,17 +4,19 @@
 //! now?" management-API endpoint (issue #615): `/workflows/{id}/awaitables`,
 //! and the awaitables sub-report folded into `/workflows/{id}/diagnose` and
 //! `/workflows/{id}/replay-diagnosis`. Wall-clock timing is not admissible
-//! evidence on this (shared-vCPU) machine — every number this harness
-//! produces evidence for is a deterministic instruction count
-//! (`valgrind --tool=callgrind`) or allocation count/bytes
-//! (`valgrind --tool=dhat`). dhat counts are bit-for-bit reproducible on any
-//! machine; callgrind counts are **not** quite: this fixture's ids
-//! (`ActivityExecId::new()` and friends) are random UUIDs, and both this
-//! harness's own tallying and `project_awaitables`'s internal maps hash them
-//! through `std::collections::HashMap`'s randomly-seeded `RandomState`, so
+//! evidence on this (shared-vCPU) machine. Every number this harness
+//! produces is evidence of a deterministic instruction count
+//! (`valgrind --tool=callgrind`) or of an allocation count/bytes figure
+//! (`valgrind --tool=dhat`).
+//!
+//! dhat counts are bit-for-bit reproducible on any machine. Callgrind counts
+//! are not quite: this fixture's ids (`ActivityExecId::new()` and friends)
+//! are random UUIDs. This harness's own tallying, and
+//! `project_awaitables`'s internal maps, both hash those ids. The hash comes
+//! from `std::collections::HashMap`'s randomly-seeded `RandomState`, so
 //! instruction counts vary by roughly 0.02-0.03% between runs (measured; see
-//! the Baseline section below) -- the same source of variance
-//! `dlq_aggregate_profile.rs` documents for the same reason.
+//! the Baseline section below). `dlq_aggregate_profile.rs` documents the
+//! same source of variance for the same reason.
 //!
 //! # Workload
 //!
@@ -70,16 +72,18 @@
 //! | dhat                                            | alloc blocks | 2,689,832     | 2,689,832     |
 //!
 //! `callgrind_annotate --threshold=95` attributes the bulk of the total to
-//! `HashMap`/`HashSet` growth inside `build_history_index`:
+//! `HashMap`/`HashSet` growth inside `build_history_index`.
 //! `core::hash::BuildHasher::hash_one` (20.4%) and
-//! `<sip::Hasher as Hasher>::write` (18.8%) together account for 39.2%, and
-//! `hashbrown::raw::RawTable::reserve_rehash` alone — table growth
-//! re-hashing every already-inserted key — is 17.0%, called from
-//! `HashMap::insert` (3,140,092 calls total across the run). `HistoryIndex`
-//! is built via `#[derive(Default)]` (every collection starts at zero
-//! capacity) and grown incrementally by the per-row scan, so every one of
-//! its seven `HashMap`/`HashSet` fields re-hashes its own already-inserted
-//! keys on each doubling as `build_history_index` walks the row slice.
+//! `<sip::Hasher as Hasher>::write` (18.8%) together account for 39.2%.
+//! `hashbrown::raw::RawTable::reserve_rehash` alone is 17.0% — table growth
+//! re-hashing every already-inserted key. It is called from
+//! `HashMap::insert` (3,140,092 calls total across the run).
+//!
+//! `HistoryIndex` is built via `#[derive(Default)]`, so every collection
+//! starts at zero capacity. `build_history_index`'s per-row scan then grows
+//! each collection incrementally. So every one of `HistoryIndex`'s seven
+//! `HashMap`/`HashSet` fields re-hashes its own already-inserted keys on
+//! each doubling, as the scan proceeds.
 
 use autumn_harvest::awaitables::{AWAITABLE_CATEGORY_CAP, WaitSetInput, project_awaitables};
 use autumn_harvest::context::WorkflowCommand;
