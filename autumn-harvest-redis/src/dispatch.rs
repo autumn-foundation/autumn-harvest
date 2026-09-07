@@ -29,17 +29,17 @@
 //! already holds a reference for the row, so a second hint for the same row
 //! adds no second entry. `ack` deletes the marker, which is what lets the
 //! reconcile sweep republish the row on its next pass. The marker also
-//! expires after `dedupe_ttl`, so a marker that leaks — a worker that dies
-//! between the read and the ack, for example — cannot block a republish for
-//! ever.
+//! expires after `dedupe_ttl`. A leaked marker therefore cannot block a
+//! republish for ever. A worker that dies between the read and the ack
+//! leaks one.
 //!
 //! ## The earlier-due override
 //!
 //! A hint whose due time is earlier than a parked entry's moves that entry
-//! forward. This is the case where a signal arrives for a workflow that waits
-//! on a timer: the row's `scheduled_at` moves back to now, and the parked
-//! reference must move with it. Without the override the marker would
-//! suppress the new hint and the run would wait for the original timer.
+//! forward. A signal can arrive for a workflow that waits on a timer. The
+//! row's `scheduled_at` then moves back to now, and the parked reference
+//! must move with it. Without the override the marker would suppress the new
+//! hint, and the run would wait for the original timer.
 //!
 //! ## Delivery
 //!
@@ -284,10 +284,10 @@ impl RedisDispatch {
     /// The group starts at `0`, not at the stream tail. Every live entry in a
     /// dispatch stream is an outstanding reference, because `ack` and
     /// `release` both delete the entry they finish with. Starting at the tail
-    /// would strand every live entry whenever a group has to be recreated —
-    /// after an operator deletes it, or after Redis loses the group but keeps
-    /// the stream. Starting at `0` redelivers them instead, which the
-    /// at-least-once contract already covers.
+    /// would strand every live entry when a group is recreated. That happens
+    /// after an operator deletes the group, or after Redis loses the group
+    /// but keeps the stream. Starting at `0` redelivers them instead, which
+    /// the at-least-once contract already covers.
     async fn ensure_group(&self, queue_name: &str, force: bool) -> RedisAdapterResult<()> {
         if !force {
             let cached = self
@@ -752,7 +752,7 @@ impl TaskDispatch for RedisDispatch {
 /// Map an adapter error onto the engine's dispatch error.
 ///
 /// The worker treats any dispatch error as a signal to fall back to the
-/// Postgres claim path for that iteration, so the message is diagnostic only.
+/// Postgres claim path. The message is diagnostic only.
 fn to_harvest(err: &RedisAdapterError) -> HarvestError {
     HarvestError::Dispatch(err.to_string())
 }
