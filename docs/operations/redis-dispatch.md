@@ -30,9 +30,21 @@ Turn it on when the queue is deep and the claim path is the bottleneck.
 4-core reference machine, falling to 29/sec at a 10,000-row backlog. The fall
 is the backlog scan.
 
+**What it delivers, measured.**
+[`docs/assays/0006-redis-dispatch-integrated-throughput.md`](../assays/0006-redis-dispatch-integrated-throughput.md)
+runs a real four-worker pool against a real Postgres, with and without the
+channel. Draining a 10,000-workflow backlog on the 4-core reference machine,
+the channel sustained a mean **173.04 completed tasks/sec**. The same pool on
+the Postgres claim path completed **zero** task rows in the same window. Read
+the channel as a large multiplier at a deep backlog. Do not read it as 10,000
+tasks/sec: that assay is a kill on that figure, and the integrated path misses
+it by more than fifty times.
+
 Leave it off when the backlog is shallow. A shallow backlog makes the scan
 cheap, so the channel adds a network hop and an operational dependency for no
-measured gain.
+measured gain. The same assay measures that cost directly: paced at 86.52
+workflows/sec against an emptying queue, dispatch-latency p99 was 426.96 ms
+with the channel and 146.09 ms without it.
 
 Redis dispatch does not raise durability, and it is not a way to survive a
 Postgres outage. Postgres remains required.
@@ -252,4 +264,5 @@ the `redis` cargo feature.
 - [`docs/autumn-workflow-architecture.md`](../autumn-workflow-architecture.md) §9.1 — the design in context
 - `docs/plans/2026-09-07-redis-dispatch-worker-integration.md` — the full plan, including the reverse brainstorm
 - [`docs/assays/0001-redis-adapter-throughput-ceiling.md`](../assays/0001-redis-adapter-throughput-ceiling.md) — the standalone throughput measurement and its caveats
+- [`docs/assays/0006-redis-dispatch-integrated-throughput.md`](../assays/0006-redis-dispatch-integrated-throughput.md) — the integrated, deployment-shaped throughput measurement and its verdict
 - [`docs/performance.md`](../performance.md) — the Postgres claim-path numbers

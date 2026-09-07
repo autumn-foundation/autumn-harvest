@@ -2,11 +2,11 @@
 // public API of `autumn-harvest` and `autumn-harvest-redis` only. It modifies
 // no workspace crate.
 //
-// It measures the deployment-shaped question of assay ledger #6: does the
-// integrated Redis dispatch path (a real `Worker` pool, real Postgres claim
-// and completion transactions, Postgres as the source of truth) clear the
-// founding ">10,000 tasks/sec" line, and by what multiplier over the same
-// pool on the Postgres claim path.
+// It measures the deployment-shaped question of assay ledger #6. The
+// integrated path is a real `Worker` pool, real Postgres claim and completion
+// transactions, and Postgres as the source of truth. Does that path clear the
+// founding ">10,000 tasks/sec" line? By what multiplier does it beat the same
+// pool on the Postgres claim path?
 //
 // The pool shape, the workload, the two shapes and the repetition plan come
 // from `docs/rnd/2026-09-07-redis-dispatch-integrated-throughput-preregistration.md`.
@@ -216,7 +216,7 @@ impl Shape {
 ///
 /// The handlers are plain function pointers with no state of their own, so
 /// the coordinates live in process globals. The pool is separate from the
-/// worker pool: a handler that competed for a worker connection would charge
+/// worker pool. A handler that competed for a worker connection would charge
 /// the measurement for a queue this deployment shape does not have.
 static SIDE_EFFECT_POOL: OnceLock<RwLock<Option<DbPool>>> = OnceLock::new();
 
@@ -476,10 +476,10 @@ async fn drain_window(conn: &mut AsyncPgConnection) -> (i64, f64) {
 ///
 /// The sample is `started_at - GREATEST(created_at, scheduled_at)`. The
 /// pre-registration writes the line as `created_at` to `started_at`. A row
-/// that is deliberately parked until a future `scheduled_at` would charge
-/// that park time to the channel, so the later of the two timestamps is the
-/// point from which the row is actually claimable. `created_at` is nullable
-/// for pre-upgrade rows, so it falls back to `scheduled_at`.
+/// parked until a future `scheduled_at` would charge that park time to the
+/// channel. The later of the two timestamps is therefore the point from which
+/// the row is claimable. `created_at` is nullable for pre-upgrade rows, so it
+/// falls back to `scheduled_at`.
 async fn latency(conn: &mut AsyncPgConnection, task_type: Option<&str>) -> LatencyRow {
     let filter = match task_type {
         Some(kind) => format!("AND task_type = '{kind}'"),
@@ -726,8 +726,8 @@ async fn start_one(conn: &mut AsyncPgConnection, workflow_id: &str) -> bool {
 /// Seed `count` workflow starts through the public start API.
 ///
 /// The starts run on `seeders` connections in parallel. One connection cannot
-/// seed ten thousand rows quickly enough to keep the seed phase short, and the
-/// seed phase is not part of any measured window.
+/// seed ten thousand rows quickly enough. The seed phase is not part of any
+/// measured window.
 async fn seed(url: &str, run: &str, count: usize, seeders: usize) -> (usize, Duration) {
     let started = Instant::now();
     let mut set = tokio::task::JoinSet::new();
@@ -996,7 +996,10 @@ async fn run_drain(settings: &Settings, arm: Arm, rep: usize) -> DrainRun {
 async fn paced_starts(url: &str, run: &str, rate: f64, secs: u64) -> (usize, f64) {
     let tick = Duration::from_millis(10);
     let ticks = (secs * 1000) / 10;
-    let per_tick = (rate / 100.0).max(1.0);
+    // Starts the tick owes, which is fractional below one hundred per second.
+    // The `owed` accumulator carries the fraction to the next tick, so a rate
+    // under one hundred per second is held exactly rather than rounded up.
+    let per_tick = rate / 100.0;
     let starter_pool = build_pool(url, 32);
     let started = Arc::new(AtomicU64::new(0));
     let mut interval = tokio::time::interval(tick);
@@ -1171,11 +1174,13 @@ async fn run() {
 
     // The paced rate is the drain arm's sustained rate in workflow
     // equivalents. It comes from completed task rows, not from completed
-    // executions: a truncated control drain completes task rows without
-    // completing a single execution, and a zero there would leave the paced
-    // control arm with no rate to hold.
+    // executions. A truncated control drain completes task rows without
+    // completing one execution. A zero there would leave the paced control
+    // arm with no rate to hold.
     let redis_drain_rate = paced_rate(&drains, Arm::Redis);
     let control_drain_rate = paced_rate(&drains, Arm::Control);
+    #[allow(clippy::cast_precision_loss, reason = "a paced rate is a small number")]
+    let paced_override = env_u64("ASSAY6_PACED_RATE_MILLI", 0) as f64 / 1000.0;
 
     let mut paced: Vec<PacedRun> = Vec::new();
     if settings.runs_shape(Shape::Paced) {
@@ -1188,10 +1193,16 @@ async fn run() {
                     Arm::Redis => redis_drain_rate,
                     Arm::Control => control_drain_rate,
                 };
-                let rate = if rate > 0.0 {
+                // A control drain that completes no task row has no rate of
+                // its own. It then holds the Redis arm's rate, so both arms
+                // face the same offered load. `ASSAY6_PACED_RATE` overrides
+                // both, which is how the paced shape is re-run on its own.
+                let rate = if paced_override > 0.0 {
+                    paced_override
+                } else if rate > 0.0 {
                     rate
                 } else {
-                    env_u64("ASSAY6_PACED_FALLBACK_RATE", 100) as f64
+                    redis_drain_rate
                 };
                 let result = run_paced(&settings, arm, rep, rate).await;
                 result.print();

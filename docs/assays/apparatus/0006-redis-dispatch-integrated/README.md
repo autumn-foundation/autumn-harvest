@@ -28,7 +28,10 @@ own per-run prefix. It never calls `FLUSHALL`.
 | `ASSAY6_WORKFLOWS` | `10000` | seeded workflows per drain run |
 | `ASSAY6_REPS` | `3` | repetitions per arm per shape |
 | `ASSAY6_PACED_SECS` | `30` | length of the paced window |
-| `ASSAY6_DRAIN_CAP_SECS` | `600` | cap on one drain, after which the run is truncated |
+| `ASSAY6_DRAIN_CAP_SECS` | `600` | cap on one Redis-arm run, after which it is truncated |
+| `ASSAY6_CONTROL_CAP_SECS` | `ASSAY6_DRAIN_CAP_SECS` | the same cap for the control arm, which needs its own |
+| `ASSAY6_WORKER_POLL_MS` | `25` | `WorkerRuntimeConfig.poll_interval`, which also drives the metrics samplers |
+| `ASSAY6_PACED_RATE_MILLI` | unset | paced starts per second in thousandths, so the paced shape runs on its own |
 | `ASSAY6_SEEDERS` | `16` | parallel connections used to seed |
 | `ASSAY6_SHAPES` | `drain,paced` | narrow the matrix to one shape |
 | `ASSAY6_ARMS` | `redis,control` | narrow the matrix to one arm |
