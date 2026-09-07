@@ -57,7 +57,8 @@ child workflows, idempotency, and operating the service — read
 [`docs/getting-started/`](docs/getting-started/).
 
 Upgrading an existing deployment? See the
-[0.4.0 → 0.5.0 upgrade guide](docs/upgrading/0.5.0.md).
+[0.5.0 → 0.6.0 upgrade guide](docs/upgrading/0.6.0.md) — the previous
+[0.4.0 → 0.5.0 upgrade guide](docs/upgrading/0.5.0.md) covers the hop before that.
 
 Working on the engine itself? [`docs/architecture.md`](docs/architecture.md) is
 the workspace, design-decision, module and macro reference, and
