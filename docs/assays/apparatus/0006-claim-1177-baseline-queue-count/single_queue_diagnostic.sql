@@ -1,15 +1,17 @@
--- Secondary arm, not itself production-representative (post-review,
--- Codex, P1): the production claim path (autumn-harvest/src/queue.rs:641)
--- always binds queue_name = ANY($2), so a real single-queue worker never
--- takes a scalar-equality path. This file is kept only as a sanity check
--- that scalar equality behaves the same as single-element ANY() below --
--- see single_queue_any_diagnostic.sql for the arm this assay's verdict
--- actually rests on. Byte-for-byte forced_index_no_tiebreak_diagnostic.sql
--- from ledger #5, with only the queue predicate changed to scalar
--- equality (queue_name = 'bench-q-0') instead of a 4-queue
--- ANY(ARRAY[...]). Same enable_seqscan/enable_bitmapscan bias, same
--- no-residual-predicate base query, same ORDER BY (no id tiebreak,
--- matching #1177's own).
+-- Ledger #6's own preregistered arm (docs/rnd/2026-09-07-claim-1177-
+-- baseline-queue-count-preregistration.md, lines 38-48): this assay's
+-- verdict is graded against this file's result, not against
+-- single_queue_any_diagnostic.sql's. Scalar equality is not itself a
+-- production code path (autumn-harvest/src/queue.rs:641 always binds
+-- queue_name = ANY($2), even for one queue) -- that gap is exactly what
+-- single_queue_any_diagnostic.sql and ledger #7 exist to test separately;
+-- see ledger #6's own report for why that question was spun into its own
+-- re-charter rather than graded here. Byte-for-byte
+-- forced_index_no_tiebreak_diagnostic.sql from ledger #5, with only the
+-- queue predicate changed to scalar equality (queue_name = 'bench-q-0')
+-- instead of a 4-queue ANY(ARRAY[...]). Same enable_seqscan/
+-- enable_bitmapscan bias, same no-residual-predicate base query, same
+-- ORDER BY (no id tiebreak, matching #1177's own).
 BEGIN;
 SET LOCAL enable_seqscan = off;
 SET LOCAL enable_bitmapscan = off;

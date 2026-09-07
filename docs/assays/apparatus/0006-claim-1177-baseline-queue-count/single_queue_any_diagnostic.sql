@@ -1,10 +1,11 @@
--- Post-review (Codex, P1): the production claim path
--- (autumn-harvest/src/queue.rs:641) always binds queue_name = ANY($2),
--- even for a worker polling exactly one queue -- there is no scalar-
--- equality code path. single_queue_diagnostic.sql's scalar-equality test
--- therefore does not establish what a real single-queue deployment's plan
--- looks like; it only shows scalar equality is cheap, which was never in
--- question. This file is the corrected, production-representative test:
+-- Ledger #7's own preregistered arm (docs/rnd/2026-09-07-claim-any-
+-- cardinality-preregistration.md) -- not graded as part of ledger #6
+-- (see single_queue_diagnostic.sql, ledger #6's own arm, and ledger #6's
+-- report for why this question was spun into its own re-charter). The
+-- production claim path (autumn-harvest/src/queue.rs:641) always binds
+-- queue_name = ANY($2), even for a worker polling exactly one queue --
+-- there is no scalar-equality code path -- so this file, not
+-- single_queue_diagnostic.sql, is the production-representative shape.
 -- ANY() over a single-element array, same queue predicate shape as every
 -- other arm in this apparatus, varying only cardinality (1 element here
 -- vs. 4 in multi_queue_control.sql).
