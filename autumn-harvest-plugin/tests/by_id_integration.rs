@@ -947,9 +947,10 @@ async fn by_id_base_route_trailing_slash_rejects_empty_workflow_id() {
         resp.body
     );
     assert_eq!(
-        resp.body["error"],
+        resp.body["detail"],
         json!("workflow_id must not be empty"),
-        "must reuse the shared by-id empty-id rejection, not a bespoke message"
+        "must reuse resolve_workflow_by_business_id's shared rejection: {}",
+        resp.body
     );
 }
 
@@ -971,7 +972,7 @@ async fn by_id_sibling_route_rejects_empty_workflow_id() {
         "empty workflow_id on a sibling route must be rejected 400: {}",
         resp.body
     );
-    assert_eq!(resp.body["error"], json!("workflow_id must not be empty"));
+    assert_eq!(resp.body["detail"], json!("workflow_id must not be empty"));
 }
 
 /// issue #1353: omitting `workflow_id` (the pre-existing auto-generate path)
