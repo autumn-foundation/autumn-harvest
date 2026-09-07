@@ -1001,6 +1001,11 @@ impl HarvestRunner {
             prepared.storage_pool.iter_shards().count(),
         )
         .map_err(AutumnError::service_unavailable_msg)?;
+        reject_dispatch_queue_names(
+            config.redis.url.is_some(),
+            &prepared.worker_runtime_config.queues,
+        )
+        .map_err(AutumnError::service_unavailable_msg)?;
         let dispatch_installed = install_dispatch_channel(config).await?;
         let dispatch_guard = DispatchInstallGuard::new(dispatch_installed);
 
@@ -1294,6 +1299,35 @@ fn reject_multi_shard_dispatch(redis_url_set: bool, shard_count: usize) -> Resul
              redis dispatch supports single-shard runtimes only in v1 (issue #1312). Unset \
              harvest.redis.url, or run one process per shard"
         ));
+    }
+    Ok(())
+}
+
+/// Reject Redis dispatch on a runtime whose queue names the channel cannot
+/// carry (issue #1312).
+///
+/// The channel builds its keys from the queue name, so it rejects a name that
+/// is empty or holds a colon. `WorkerConfig` and the Postgres claim path accept
+/// both. A process configured that way would fail every channel call and live
+/// on the Postgres fallback for all of its queues, in silence. `Worker::new`
+/// applies the same rule. A worker-disabled process never builds a worker, and
+/// it would still publish, so this check runs in the runner as well.
+///
+/// # Errors
+///
+/// Returns the operator-facing message when a URL is configured and a queue
+/// name fails [`autumn_harvest::dispatch::validate_queue_name`].
+fn reject_dispatch_queue_names(redis_url_set: bool, queues: &[String]) -> Result<(), String> {
+    if !redis_url_set {
+        return Ok(());
+    }
+    for queue in queues {
+        autumn_harvest::dispatch::validate_queue_name(queue).map_err(|reason| {
+            format!(
+                "harvest.redis.url is set and this runtime serves a queue redis dispatch \
+                 cannot address: {reason}. Unset harvest.redis.url, or rename the queue"
+            )
+        })?;
     }
     Ok(())
 }

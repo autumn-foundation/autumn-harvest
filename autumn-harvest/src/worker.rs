@@ -5538,6 +5538,27 @@ pub(crate) const fn single_pool_entrypoint_rejects(
     resolved_assignments > 1 && has_sharded_pool
 }
 
+/// Whether this worker may consume dispatch references (issue #1312).
+///
+/// A reference carries a task id and no connection. A worker that drains
+/// several shards cannot tell which pool holds the named row, so a reference
+/// read on one shard would be claimed against another shard's database and
+/// always miss. Dispatch therefore needs a span of exactly one shard.
+///
+/// `Worker::new` applies the same rule, but a core caller can install the
+/// channel after construction, and the poll loop reads the process-global slot
+/// on every iteration. The loop decides once at run start and holds that
+/// decision, so a late install cannot widen the span. `shard` on
+/// [`crate::dispatch::DispatchHint`] carries the follow-up that lifts the
+/// limit.
+#[must_use]
+pub(crate) const fn dispatch_allowed_for_span(
+    shard_assignments: usize,
+    pool_shards: usize,
+) -> bool {
+    shard_assignments <= 1 && pool_shards <= 1
+}
+
 /// Whether a shard's poll loop may claim tasks, given that shard's pending
 /// fleet-registration state (issue #804, Codex round-54 P1).
 ///
@@ -24149,13 +24170,26 @@ impl Worker {
                 .map_or(0, crate::shard::ShardedDbPool::len);
             #[cfg(not(feature = "db"))]
             let pool_shards = 0;
-            if shard_count > 1 || pool_shards > 1 {
+            if !dispatch_allowed_for_span(shard_count, pool_shards) {
                 return Err(HarvestError::Config(format!(
                     "a dispatch channel is installed and this worker spans \
                      {shard_count} shard assignments and {pool_shards} sharded pool \
                      entries; dispatch supports single-shard runtimes only in v1 \
                      (issue #1312)"
                 )));
+            }
+
+            // A queue name the channel key space cannot carry (issue #1312).
+            // The channel rejects such a name on every call, so this worker
+            // would live on the Postgres fallback for all of its queues and say
+            // nothing about it. Fail at startup instead.
+            for queue in &config.queues {
+                crate::dispatch::validate_queue_name(queue).map_err(|reason| {
+                    HarvestError::Config(format!(
+                        "a dispatch channel is installed and this worker serves a queue it \
+                         cannot address: {reason}"
+                    ))
+                })?;
             }
         }
 
@@ -25020,8 +25054,31 @@ impl Worker {
             [shard, ..] => Some(*shard),
             [] => None,
         };
-        self.run_poll_loop(pool, poll_shard, listener, &registration_pending)
-            .await;
+
+        // Decide the dispatch span once, here, and hold it for the whole loop
+        // (issue #1312). `Worker::new` applies the same rule, but a core caller
+        // can install the channel after construction, and the loop reads the
+        // process-global slot on every iteration. Deciding per iteration would
+        // let such an install put a multi-shard worker on the dispatch path.
+        #[cfg(feature = "db")]
+        let pool_shards = self
+            .config
+            .sharded_pool
+            .as_ref()
+            .map_or(0, crate::shard::ShardedDbPool::len);
+        #[cfg(not(feature = "db"))]
+        let pool_shards = 0;
+        let dispatch_allowed =
+            dispatch_allowed_for_span(self.config.shard_assignments.len(), pool_shards);
+
+        self.run_poll_loop(
+            pool,
+            poll_shard,
+            listener,
+            &registration_pending,
+            dispatch_allowed,
+        )
+        .await;
 
         tracing::info!(worker_id = %self.config.worker_id, "shutdown signal received");
 
@@ -26142,16 +26199,25 @@ impl Worker {
         }
     }
 
+    /// The single-pool poll loop.
+    ///
+    /// `dispatch_allowed` is the run-start decision of
+    /// [`dispatch_allowed_for_span`]. The multi-shard loop
+    /// (`run_poll_loop_multi`) has no dispatch branch at all, so every loop
+    /// `run_multi_shard` starts is on the Postgres path by construction.
     async fn run_poll_loop(
         &self,
         pool: &DbPool,
         shard: Option<crate::types::ShardId>,
         mut listener: Option<crate::notify::QueueListener>,
         registration_pending: &AtomicBool,
+        dispatch_allowed: bool,
     ) {
         // Dispatch-channel state for this loop (issue #1312). All three are
         // inert when no channel is installed.
         let mut dispatch_state = DispatchLoopState::new();
+        // A channel this loop refuses is logged once, not once per iteration.
+        let mut dispatch_refusal_logged = false;
 
         while !self.shutdown.is_cancelled() {
             // Do not claim while this pool's registration is unverified: an
@@ -26178,17 +26244,30 @@ impl Worker {
             // order, so priority is best effort under dispatch. The weighted
             // permutation still governs the `poll_once` fallback.
             if let Some(installed) = crate::dispatch::installed() {
-                if self
-                    .run_dispatch_iteration(pool, shard, &installed, &mut dispatch_state)
-                    .await
-                    && let Some(shard) = shard
-                {
-                    self.registry
-                        .telemetry()
-                        .metrics
-                        .record_shard_dispatched(shard_metric_label(shard));
+                if dispatch_allowed {
+                    if self
+                        .run_dispatch_iteration(pool, shard, &installed, &mut dispatch_state)
+                        .await
+                        && let Some(shard) = shard
+                    {
+                        self.registry
+                            .telemetry()
+                            .metrics
+                            .record_shard_dispatched(shard_metric_label(shard));
+                    }
+                    continue;
                 }
-                continue;
+                drop(installed);
+                if !dispatch_refusal_logged {
+                    dispatch_refusal_logged = true;
+                    tracing::error!(
+                        worker_id = %self.config.worker_id,
+                        shard_assignments = self.config.shard_assignments.len(),
+                        "a dispatch channel is installed but this worker spans more than one \
+                         shard; dispatch supports single-shard runtimes only in v1 (issue \
+                         #1312). This worker claims through postgres"
+                    );
+                }
             }
 
             if self

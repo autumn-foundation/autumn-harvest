@@ -510,6 +510,36 @@ async fn publisher_loop(mut receiver: tokio::sync::mpsc::Receiver<DispatchHint>)
 // Release backoff
 // ---------------------------------------------------------------------------
 
+/// Whether a queue name can travel through a dispatch channel (issue #1312).
+///
+/// A channel builds its keys from the queue name. The Redis channel joins key
+/// parts with a colon, so a name that holds one would address a key space that
+/// is not its own. An empty name addresses no key space at all.
+///
+/// The rule lives here, not in a channel implementation, because the worker and
+/// the plugin runner both apply it at startup. A channel that rejects the name
+/// on every call would otherwise leave a worker on the Postgres fallback for
+/// all of its queues, and say nothing about it.
+///
+/// # Errors
+///
+/// Returns the operator-facing message when `queue_name` is empty or holds a
+/// colon.
+pub fn validate_queue_name(queue_name: &str) -> Result<(), String> {
+    if queue_name.is_empty() {
+        return Err(
+            "a dispatch channel cannot carry an empty queue name (issue #1312)".to_string(),
+        );
+    }
+    if queue_name.contains(':') {
+        return Err(format!(
+            "queue name \"{queue_name}\" holds a ':', which a dispatch channel uses to \
+             separate its key parts (issue #1312)"
+        ));
+    }
+    Ok(())
+}
+
 /// Delay before a released reference is delivered again.
 ///
 /// `min(cap, base * 2^redeliveries)`, saturating at `cap`. A gated row

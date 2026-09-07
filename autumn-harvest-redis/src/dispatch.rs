@@ -670,20 +670,26 @@ impl RedisDispatch {
 
         let mut leases = Vec::new();
         let mut surplus = Vec::new();
+        let mut malformed = Vec::new();
         for stream in reply.keys {
+            let stream_key = stream.key;
             for entry in stream.ids {
                 let Some(payload) = entry_payload(&entry.map) else {
                     tracing::warn!(
                         entry_id = %entry.id,
-                        "dropping dispatch entry with no payload field"
+                        stream = %stream_key,
+                        "discarding dispatch entry with no payload field"
                     );
+                    malformed.push((stream_key.clone(), entry.id));
                     continue;
                 };
                 let Ok(reference) = serde_json::from_str::<DispatchRef>(&payload) else {
                     tracing::warn!(
                         entry_id = %entry.id,
-                        "dropping dispatch entry with an unreadable payload"
+                        stream = %stream_key,
+                        "discarding dispatch entry with an unreadable payload"
                     );
+                    malformed.push((stream_key.clone(), entry.id));
                     continue;
                 };
                 if leases.len() < max {
@@ -709,7 +715,45 @@ impl RedisDispatch {
                 "failed to requeue surplus dispatch references"
             );
         }
+
+        if let Err(error) = self.discard_entries(&malformed).await {
+            tracing::warn!(
+                error = %error,
+                malformed = malformed.len(),
+                "failed to discard unreadable dispatch entries"
+            );
+        }
         Ok(leases)
+    }
+
+    /// Acknowledge and delete entries that carry no readable reference.
+    ///
+    /// `XREADGROUP` puts every delivered entry in the pending entries list. A
+    /// consumer that only drops an unreadable entry leaves it there for good,
+    /// because the entry never becomes a lease and so is never acked. The
+    /// recovery pass then claims it on every sweep and leaves it pending again.
+    /// `XPENDING` reads a fixed window of `RECOVER_BATCH` entries, so enough
+    /// such entries hide every legitimate abandoned lease below them, and the
+    /// crash recovery this channel promises stops working.
+    ///
+    /// The delete names each entry id, so nothing else leaves the stream. The
+    /// dedupe marker is left alone: a reference that cannot be read does not
+    /// say which task it belongs to.
+    async fn discard_entries(&self, entries: &[(String, String)]) -> RedisAdapterResult<()> {
+        if entries.is_empty() {
+            return Ok(());
+        }
+        let mut pipe = redis::pipe();
+        pipe.atomic();
+        for (key, entry_id) in entries {
+            pipe.xack(key, &self.config.consumer_group, &[entry_id])
+                .ignore()
+                .xdel(key, &[entry_id])
+                .ignore();
+        }
+        let mut conn = self.conn.clone();
+        pipe.query_async::<()>(&mut conn).await?;
+        Ok(())
     }
 
     async fn ack_inner(&self, lease: &DispatchLease) -> RedisAdapterResult<()> {
@@ -788,21 +832,24 @@ impl RedisDispatch {
             .await?;
 
         let mut recovered = Vec::new();
+        let mut malformed = Vec::new();
         for entry in claimed.ids {
             let Some(payload) = entry_payload(&entry.map) else {
                 tracing::warn!(
                     queue = %queue_name,
                     entry_id = %entry.id,
-                    "dropping recovered entry with no payload field"
+                    "discarding recovered entry with no payload field"
                 );
+                malformed.push((key.clone(), entry.id));
                 continue;
             };
             let Ok(mut reference) = serde_json::from_str::<DispatchRef>(&payload) else {
                 tracing::warn!(
                     queue = %queue_name,
                     entry_id = %entry.id,
-                    "dropping recovered entry with an unreadable payload"
+                    "discarding recovered entry with an unreadable payload"
                 );
+                malformed.push((key.clone(), entry.id));
                 continue;
             };
             reference.redeliveries = reference.redeliveries.saturating_add(1);
@@ -810,6 +857,9 @@ impl RedisDispatch {
             // now, which the `due` argument below says.
             recovered.push((entry.id, reference));
         }
+        // An entry the pass cannot read stays pending unless it is discarded
+        // here. See [`RedisDispatch::discard_entries`].
+        self.discard_entries(&malformed).await?;
         let count = recovered.len();
         self.requeue_batch(&recovered, Utc::now()).await?;
         Ok(count)
