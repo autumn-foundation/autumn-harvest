@@ -1014,6 +1014,18 @@ pub fn redact_dsn(dsn: &str) -> String {
     let Ok(mut url) = url::Url::parse(trimmed) else {
         return "<unparseable dsn>".to_string();
     };
+    // A DSN missing `//` after the scheme still parses as `Ok`. Example:
+    // `postgres:user:hunter2@host/db`, one character short of the documented
+    // form. The parser reads it as a "cannot-be-a-base" URL with no authority
+    // component. `password()` and `set_password()` below are no-ops on such a
+    // URL. Without this check the credential-bearing tail reaches
+    // `url.to_string()` verbatim. That contradicts this function's own
+    // guarantee: a malformed-but-secret-bearing string must never reach a
+    // report or a log line. No valid Postgres DSN is cannot-be-a-base, so
+    // this check never withholds an identity a caller could otherwise use.
+    if url.cannot_be_a_base() {
+        return "<unparseable dsn>".to_string();
+    }
     // A password can hide in the query string as well as in the userinfo. We
     // cannot rewrite what we cannot enumerate, so withhold the whole thing.
     //
@@ -3664,6 +3676,43 @@ mod tests {
         // needs to know which database a failure was about.
         let plain = redact_dsn("postgres://db.prod/harvest?sslmode=require");
         assert!(plain.contains("db.prod"), "got {plain}");
+    }
+
+    /// 🪝 Snag: a DSN missing `//` after the scheme is one character short of
+    /// the documented `postgres://` form. The `url` crate still parses it, as
+    /// a "cannot-be-a-base" URL with no authority component at all. On such a
+    /// URL, `password()` and `set_password()` are no-ops, so the credential
+    /// in the opaque tail reaches the output verbatim. This contradicts the
+    /// function's own doc comment: a malformed-but-secret-bearing string must
+    /// never reach a report or a log line. `dr_connect`,
+    /// `dr_connect_read_only`, and `scratch_guard` in `autumn-harvest-cli`
+    /// each interpolate `redact_dsn(dsn)` into a `CliError::InvalidInput`
+    /// message on a connection failure or a scratch-guard refusal. A DSN
+    /// typo dropping the `//` there leaks the real password into that
+    /// message.
+    #[test]
+    fn redact_dsn_withholds_a_cannot_be_a_base_dsn() {
+        for dsn in [
+            "postgres:hunter2",
+            "postgres:user:hunter2@host/db",
+            "postgres:user:hunter2@host/db?a=1",
+            " postgres:user:hunter2@host/db",
+            "POSTGRESQL:user:hunter2@host/db",
+        ] {
+            let redacted = redact_dsn(dsn);
+            assert_eq!(
+                redacted, "<unparseable dsn>",
+                "credential leaked from {dsn}: {redacted}"
+            );
+        }
+
+        // Sanity: the ordinary well-formed cases are unaffected by this check
+        // — they are never `cannot_be_a_base`.
+        assert!(redact_dsn("postgres://app:hunter2@db.prod:5432/harvest").contains("db.prod"));
+        assert!(
+            redact_dsn("postgres://user:hunter2@[::1]/dbname").contains("[::1]"),
+            "an authority-bearing IPv6 DSN must still redact-and-keep its identity"
+        );
     }
 
     #[test]
