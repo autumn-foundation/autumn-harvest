@@ -152,7 +152,10 @@ async fn publish_then_next_round_trips_a_hint() {
     assert_eq!(leases[0].task_id, task_id);
     assert_eq!(leases[0].queue_name, "default");
     assert_eq!(leases[0].redeliveries, 0);
-    assert!(!leases[0].handle.is_empty(), "handle is the stream entry id");
+    assert!(
+        !leases[0].handle.is_empty(),
+        "handle is the stream entry id"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -164,9 +167,10 @@ async fn duplicate_publish_is_a_no_op() {
     let task_id = Uuid::new_v4();
     let hint = hint("default", task_id, Utc::now());
 
-    fixture.dispatch.publish(&[hint.clone()]).await.expect("one");
-    fixture.dispatch.publish(&[hint.clone()]).await.expect("two");
-    fixture.dispatch.publish(&[hint]).await.expect("three");
+    let batch = std::slice::from_ref(&hint);
+    fixture.dispatch.publish(batch).await.expect("one");
+    fixture.dispatch.publish(batch).await.expect("two");
+    fixture.dispatch.publish(batch).await.expect("three");
 
     assert_eq!(
         fixture.stream_len("default").await,
@@ -234,7 +238,11 @@ async fn an_earlier_due_time_moves_a_delayed_entry_forward() {
         .expect("move forward");
 
     let leases = read(&fixture, &queues, 10).await;
-    assert_eq!(leases.len(), 1, "an earlier due time must override the park");
+    assert_eq!(
+        leases.len(),
+        1,
+        "an earlier due time must override the park"
+    );
     assert_eq!(leases[0].task_id, task_id);
 }
 
@@ -286,7 +294,10 @@ async fn one_read_spans_two_queues() {
 
     fixture
         .dispatch
-        .publish(&[hint("alpha", alpha, Utc::now()), hint("beta", beta, Utc::now())])
+        .publish(&[
+            hint("alpha", alpha, Utc::now()),
+            hint("beta", beta, Utc::now()),
+        ])
         .await
         .expect("publish");
 
@@ -350,14 +361,21 @@ async fn ack_deletes_the_marker_so_a_republish_is_delivered() {
         .expect("publish");
     let leases = read(&fixture, &queues, 10).await;
     assert_eq!(leases.len(), 1);
-    assert!(fixture.marker_exists(task_id).await, "publish sets a marker");
+    assert!(
+        fixture.marker_exists(task_id).await,
+        "publish sets a marker"
+    );
 
     fixture.dispatch.ack(&leases[0]).await.expect("ack");
     assert!(
         !fixture.marker_exists(task_id).await,
         "ack must delete the marker"
     );
-    assert_eq!(fixture.stream_len("acked").await, 0, "ack deletes the entry");
+    assert_eq!(
+        fixture.stream_len("acked").await,
+        0,
+        "ack deletes the entry"
+    );
     assert_eq!(fixture.pending_count("acked").await, 0);
 
     fixture
@@ -396,10 +414,7 @@ async fn maintain_recovers_an_unacked_lease_after_the_visibility_timeout() {
     let again = read(&fixture, &queues, 10).await;
     assert_eq!(again.len(), 1, "a recovered entry is delivered again");
     assert_eq!(again[0].task_id, task_id);
-    assert_eq!(
-        again[0].redeliveries, 1,
-        "recovery counts one redelivery"
-    );
+    assert_eq!(again[0].redeliveries, 1, "recovery counts one redelivery");
 }
 
 #[tokio::test(flavor = "multi_thread")]
