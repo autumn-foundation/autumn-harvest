@@ -1,0 +1,25 @@
+-- after: every statement pg_stat_statements recorded for this database during one real POST /dead-letters/discard request, 1000 matching dead letters --
+REQUEST TOTAL: calls=7 buffers=2433
+discard-delete shape's share: calls=1/7 (14.3%), buffers=2104/2433 (86.5%)
+
+calls=1 shared_blks_hit=2104 shared_blks_read=0 total_buffers=2104
+query=DELETE FROM "harvest_dead_letters" WHERE ("harvest_dead_letters"."id" = ANY($1)) RETURNING "harvest_dead_letters"."id"
+
+calls=1 shared_blks_hit=113 shared_blks_read=5 total_buffers=118
+query=INSERT INTO "harvest_audit_log" ("actor", "operation", "target_type", "target_id", "route_or_command", "request_id", "idempotency_key", "status", "error_summary", "shard_id", "source") VALUES ($1, $2, $3, DEFAULT, $4, DEFAULT, DEFAULT, $5, DEFAULT, DEFAULT, $6) RETURNING "harvest_audit_log"."id"
+
+calls=1 shared_blks_hit=107 shared_blks_read=0 total_buffers=107
+query=SELECT "harvest_dead_letters"."id", "harvest_dead_letters"."original_task_id", "harvest_dead_letters"."queue_name", "harvest_dead_letters"."task_type", "harvest_dead_letters"."workflow_exec_id", "harvest_dead_letters"."activity_name", "harvest_dead_letters"."input", "harvest_dead_letters"."error", "harvest_dead_letters"."attempts", "harvest_dead_letters"."failed_at", "harvest_dead_letters"."owner", "harvest_dead_letters"."severity", "harvest_dead_letters"."workflow_name", "harvest_dead_letters"."quota_key" FROM "harvest_dead_letters" WHERE ("harvest_dead_letters"."activity_name" = $1) ORDER BY "harvest_dead_letters"."failed_at" ASC LIMIT $2
+
+calls=1 shared_blks_hit=104 shared_blks_read=0 total_buffers=104
+query=SELECT COUNT(*) FROM "harvest_dead_letters" WHERE ("harvest_dead_letters"."activity_name" = $1)
+
+calls=1 shared_blks_hit=0 shared_blks_read=0 total_buffers=0
+query=SET CLIENT_ENCODING TO 'UTF8'
+
+calls=1 shared_blks_hit=0 shared_blks_read=0 total_buffers=0
+query=SELECT $1
+
+calls=1 shared_blks_hit=0 shared_blks_read=0 total_buffers=0
+query=SET TIME ZONE 'UTC'
+

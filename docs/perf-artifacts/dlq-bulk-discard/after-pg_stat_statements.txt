@@ -1,0 +1,6 @@
+-- after: pg_stat_statements @ one real POST /dead-letters/discard request, 1000 matching + 4000 noise dead letters --
+TOTAL across matching statement shapes: calls=1 buffers=2104
+
+calls=1 shared_blks_hit=2104 shared_blks_read=0 total_buffers=2104
+query=DELETE FROM "harvest_dead_letters" WHERE ("harvest_dead_letters"."id" = ANY($1)) RETURNING "harvest_dead_letters"."id"
+

@@ -933,8 +933,10 @@ pub async fn bulk_discard_dead_letters(
         });
     }
 
-    let deleted: std::collections::HashSet<Uuid> =
-        discard_dead_letters_batch(conn, &ids).await?.into_iter().collect();
+    let deleted: std::collections::HashSet<Uuid> = discard_dead_letters_batch(conn, &ids)
+        .await?
+        .into_iter()
+        .collect();
     let acted_ids: Vec<String> = ids
         .iter()
         .filter(|id| deleted.contains(id))

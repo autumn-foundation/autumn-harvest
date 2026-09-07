@@ -78,14 +78,19 @@ variable unset the harness falls back to a `postgres:16` testcontainer.
 One `POST /dead-letters/discard {"activity_name": "dlq_bulk_perf_target",
 "limit": 1000}` request, 1,000 matching + 4,000 noise dead letters,
 `pg_stat_statements` reset immediately before the request and snapshotted
-immediately after it:
+immediately after it (before, i.e. the per-row loop):
 
-<!-- PERF_NUMBERS_BEFORE -->
+| statement shape | calls | buffers | share of request calls | share of request buffers |
+|:--|--:|--:|--:|--:|
+| `DELETE FROM harvest_dead_letters WHERE id = $1` (per-row, before) | 1 000 | 4 000 | 99.4% | 92.4% |
+| whole request (before) | 1 006 | 4 329 | 100% | 100% |
 
-98%+ of calls is nowhere near the "under 5% of both calls and buffers, stop"
-floor — this is squarely the class of N+1 the profiling step exists to
-catch, the same pattern `schedule_bulk_pause_ui`/`schedule_bulk_resume_ui`'s
-audit-insert loop showed (`docs/performance-schedule-bulk-audit.md`).
+99.4% of calls is nowhere near the "under 5% of both calls and buffers,
+stop" floor — this is squarely the class of N+1 the profiling step exists
+to catch, the same pattern `schedule_bulk_pause_ui`/`schedule_bulk_resume_ui`'s
+audit-insert loop showed (`docs/performance-schedule-bulk-audit.md`). The
+rest of the request is one audit-log insert, one `SELECT` for the matching
+page, and one `COUNT(*)` for `matched` — none of them the target here.
 
 ## The fix
 
@@ -141,10 +146,30 @@ identical per-row loop.
 
 ## Measurement
 
-<!-- PERF_NUMBERS_AFTER -->
+Same fixture, same request, after the fix:
+
+| statement shape | calls | buffers |
+|:--|--:|--:|
+| `DELETE ... WHERE id = ANY($1) RETURNING id` (batched, after) | 1 | 2 104 |
+| whole request (after) | 7 | 2 433 |
+
+| | before | after | Δ |
+|:--|--:|--:|--:|
+| discard-delete calls | 1 000 | 1 | **-99.9%** (1,000x fewer) |
+| discard-delete buffers | 4 000 | 2 104 | **-47.4%** |
+| whole-request calls | 1 006 | 7 | **-99.3%** |
+| whole-request buffers | 4 329 | 2 433 | **-43.8%** |
 
 The call-count elimination alone clears the impact floor ("statement count
-per request drops from O(n) to O(1)" needs no other justification).
+per request drops from O(n) to O(1)" needs no other justification). The
+buffer count also dropped substantially and was not the target — with the
+per-row loop, each single-row `DELETE ... WHERE id = $1` cost 4 buffers on
+average (a primary-key btree descent plus a heap fetch, paid 1,000 times);
+the batched form still visits the same rows through the same primary-key
+index, but a single `= ANY($1)` scan reuses buffer pins across matches
+instead of re-walking the index root/branch pages on every call, so the
+same logical work costs fewer total buffer touches. This is a bonus, not
+the claim: the statement-count elimination is what clears the floor.
 
 Full before/after artifacts (`pg_stat_statements` snapshots and the whole
 request's statement list) are committed under

@@ -296,7 +296,10 @@ async fn capture_dlq_bulk_discard_evidence() {
     .await;
     assert_eq!(status, StatusCode::OK, "response body: {body}");
     assert_eq!(body["matched"], MATCHING);
-    assert_eq!(body["acted_on"], MATCHING, "every matching row must be discarded");
+    assert_eq!(
+        body["acted_on"], MATCHING,
+        "every matching row must be discarded"
+    );
     assert_eq!(body["skipped"], 0);
 
     // ONE snapshot query -- see `snapshot_statements`'s sibling in
