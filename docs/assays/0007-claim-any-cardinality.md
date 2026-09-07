@@ -144,17 +144,26 @@ record cannot distinguish between them without further work:
   text describing the binding as `ANY($1)` — came from a scalar-equality
   query, or from some other unstated difference in that reproduction.
 
-**For the named decider:** the corrected, load-bearing finding across
-ledgers #6 and #7 together is that **no** queue-count story, high or low,
-gives single-queue deployments a free pass on this cost under the query
-shape `queue.rs` actually emits. Any future #1340 re-charter should treat
-this `ORDER BY`/`LIMIT` cost as present at every queue cardinality a real
-worker can have, not as a multi-queue-specific tax. Whether Postgres's
+**For the named decider — scoped to what was actually measured.** Across
+ledgers #6 and #7, cardinalities 1, 2, and 4 were tested; 3 and every
+value above 4 were not. The plan shape held identical at all three tested
+points and the mechanism (an `ANY()` bind defeating sort-elision
+independent of the specific array) gives no principled reason to expect a
+different shape at 3 or at higher cardinalities, but that is an inference
+from the mechanism, not a measurement — this report does not claim
+coverage of the full range a real worker's queue count could take. A
+future #1340 re-charter should treat this `ORDER BY`/`LIMIT` cost as
+present at every cardinality actually tested here (1, 2, 4), reasonably
+expect it to hold at untested points given the shared mechanism, and
+re-verify directly (cheap: one more seed parameter and one more
+`EXPLAIN`, using this same apparatus) before relying on it at a
+cardinality this record didn't check, rather than treating "no
+queue-count story" as itself an established universal. Whether Postgres's
 planner ever elides sort for `ANY()` over one element under *any*
 schema — a general-Postgres-behavior question, not specific to this
 repository — remains a further, un-chartered, and likely low-value pit
-(the practical answer for this codebase is already established: it
-doesn't, here).
+(the practical answer for this codebase, at the cardinalities checked, is
+already established: it doesn't).
 
 ## 💰 Cost to productionize
 
@@ -167,15 +176,17 @@ a feature to build.
 sudo -u postgres createdb prospect_assay6   # or any local, non-production Postgres 16
 cd docs/assays/apparatus/0006-claim-1177-baseline-queue-count
 sudo -u postgres PGDATABASE=prospect_assay6 ./run_assay.sh
-sudo -u postgres PGDATABASE=prospect_assay6 psql -v backlog=10000 -v queues=2 -v keys=256 -v running_rows=0 \
-  -f ../0005-claim-batched-seek-and-refine/seed.sql
-sudo -u postgres PGDATABASE=prospect_assay6 psql -f any_cardinality_2_diagnostic.sql
 grep -c "Sort Key" results/multi_queue_control.explain.txt   # 1
 grep -c "Sort Key" results/single_queue_any.explain.txt      # 1 -- not blind, see pre-registration section
 grep -c "Sort Key" results/any_cardinality_2.explain.txt     # 1 -- this record's blind confirmatory line
 grep -c "Sort Key" results/single_queue_scalar.explain.txt   # 0 -- ledger #6's own line, for reference
 ```
 
-One new apparatus file, `any_cardinality_2_diagnostic.sql`, added under
-ledger #6's apparatus directory; everything else reused verbatim. No
-migration added, no crate code changed. The prototype does not merge.
+`run_assay.sh` now runs all four arms (control, single-queue `ANY`,
+single-queue scalar, and this record's cardinality-2 arm) in one pass and
+writes each result fresh to its own `results/*.explain.txt`, so the
+`grep` commands above always validate a just-produced plan, never a
+stale checked-in one. One new apparatus file,
+`any_cardinality_2_diagnostic.sql`, added under ledger #6's apparatus
+directory; everything else reused verbatim. No migration added, no crate
+code changed. The prototype does not merge.

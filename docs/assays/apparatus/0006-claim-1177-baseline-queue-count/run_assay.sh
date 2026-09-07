@@ -22,4 +22,9 @@ psql -v ON_ERROR_STOP=1 -f single_queue_any_diagnostic.sql | tee results/single_
 echo "--- single-queue, scalar equality (secondary arm -- not itself a production shape) ---" | tee -a results/run.log
 psql -v ON_ERROR_STOP=1 -f single_queue_diagnostic.sql | tee results/single_queue_scalar.explain.txt | tee -a results/run.log
 
+echo "--- ledger #7's blind confirmation: ANY() over a 2-element array ---" | tee -a results/run.log
+psql -v ON_ERROR_STOP=1 -v backlog=10000 -v queues=2 -v keys=256 -v running_rows=0 \
+  -f ../0005-claim-batched-seek-and-refine/seed.sql | tee -a results/run.log
+psql -v ON_ERROR_STOP=1 -f any_cardinality_2_diagnostic.sql | tee results/any_cardinality_2.explain.txt | tee -a results/run.log
+
 echo "--- done ---" | tee -a results/run.log

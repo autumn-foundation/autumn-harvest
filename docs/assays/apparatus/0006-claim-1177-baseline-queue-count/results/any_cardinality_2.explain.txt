@@ -21,8 +21,8 @@ SET
  Settings: enable_seqscan = 'off', enable_bitmapscan = 'off'
  Planning:
    Buffers: shared hit=223
- Planning Time: 0.756 ms
- Execution Time: 4.247 ms
+ Planning Time: 0.635 ms
+ Execution Time: 4.124 ms
 (20 rows)
 
 ROLLBACK
