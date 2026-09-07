@@ -116,7 +116,7 @@ Redis suites on that job.
 draining a 1,000-entry backlog with 8 claim-only workers, against 640/sec and
 29/sec for the Postgres claim path at 1,000-row and 10,000-row backlogs. That
 comparison is not matched and does not measure the wired path, which also pays
-a Postgres claim per reference. The deployment-shaped assay #6 reports the
+a Postgres claim per reference. The deployment-shaped assay #8 reports the
 integrated number, against a pre-registered kill line and a matched Postgres
 control in the same run.
 

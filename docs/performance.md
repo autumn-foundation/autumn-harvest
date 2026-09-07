@@ -704,12 +704,19 @@ tests": reproduced here, each independently defeats sort-elision regardless
 of the value it is tested against, so "cheap" was never an established
 finding — it was this page's own retracted reading of their *plan-eligibility*
 effect. Their marginal *cost* on the attribution table above is a different
-question and remains unmeasured: in the full production query the `CASE` key
-and the always-present queue-pause/`schedule_to_close`-adjacent predicates
-already force the same collapsed plan shape regardless of these three, so
-their own incremental contribution can't be isolated this way — that would
-still need the seed-variant scenario work [known limitations](#known-limitations)
-already calls for.
+question. For sticky routing it remains unmeasured: in
+the full production query the `CASE` key and the always-present
+queue-pause/`schedule_to_close`-adjacent predicates already force the same
+collapsed plan shape regardless of it, so its own incremental
+contribution can't be isolated this way — that would still need the
+seed-variant scenario work [known limitations](#known-limitations) already
+calls for. `schedule_to_close` (#378) and worker sessions (#606) are the
+exceptions: the seed-variant work this section describes as still-needed has
+since been done for both — see the [known limitations](#known-limitations)
+bullet above — by holding the same already-collapsed plan shape fixed and
+measuring each column's marginal buffer/storage cost directly, rather than
+trying to isolate it through a plan-shape change that #1177 shows does not
+happen either way.
 
 **Zero engine impact.** Like issue #786 and every fix on this page, this
 finding changes nothing about `claim_task_query()`: no new `WorkflowEvent`
@@ -1451,6 +1458,98 @@ from the benchmark are directly comparable.
     pauses a queue closed that specific gap and, as a direct result, replaced
     the correlated anti-join with a one-time prefilter — see
     [the queue-pause anti-join fix](#the-queue-pause-anti-join-fix).
+  * **`schedule_to_close` (#378)** — measured directly:
+    [`docs/performance-schedule-to-close.md`](performance-schedule-to-close.md) seeds `schedule_to_close_at`
+    (rather than leaving it null) and **confirms this page's own suspicion on
+    magnitude, but not on mechanism**: a small, real shared-buffer-hit cost
+    (+3.6% to +7.5% across the two backlog depths where both labels land on
+    the same plan — the 100,000-row depth's committed run has the two
+    labels land on *different* plans for the candidate scan, so it does not
+    get a clean percentage; see that page's "100,000-row plan choice"
+    section), corroborated by two
+    standalone MVCC-bloat scripts, one bulk and one per-row — heap +5.2%
+    both, the partial index itself +90% (30→57 pages, a small base that
+    reads as a large percentage for the same reason the `dirtied`/`written`
+    EXPLAIN counters do below) —
+    nowhere near the 20% impact floor, measured where a percentage is
+    stable: shared-buffer-hit totals, and `harvest_task_queue`'s total
+    on-disk footprint growth (+12.3%: heap plus every index plus TOAST,
+    measured directly with `pg_total_relation_size` rather than summed
+    from a chosen subset of relations — `no-schedule-to-close` grows 324
+    pages total, `schedule-to-close` grows 364), not against the
+    `dirtied`/`written` EXPLAIN counters' own small base (4→5, 2→3) or the
+    index's own page count on its own, which that page reports as absolute
+    counts instead of floor-compared percentages — Codex review flagged
+    that a percentage on a base that small (+25%/+50% dirtied/written;
+    +90% for the index alone) is unstable and would not track the real
+    per-claim cost. Codex review
+    caught that the predicate text alone (a plain inline column test) is not
+    the whole story: `harvest_task_queue` carries a partial index on this
+    column for the timeout scanner, and the claim `UPDATE` writes a new
+    entry to it for every `schedule-to-close` row — a fixed, depth-independent
+    +1 dirtied/+1 written page at every backlog depth tested, additive with a
+    separate row-width effect on the candidate scan that *does* scale with
+    depth. Review also caught that the harness's first seeded deadline gave
+    every row the byte-identical value, letting B-tree deduplication
+    understate the index's real growth by roughly 3x — fixed by seeding a
+    distinct, per-row deadline instead. See that page's "Plan" and
+    "Write-side cost" sections for the buffer- and storage-level evidence.
+    One thing did **not** reproduce cleanly across this pass's several
+    capture runs: the real 10,001-call `pg_stat_statements` drain's
+    aggregate delta varied run to run, but only the most recent run's
+    artifacts are ever committed -- the repro script overwrites the same
+    canonical filenames each time -- so that page states only the one
+    auditable, committed number for driving the real `claim_task()`
+    function (**+4.2%**, combining `claim_task_query()`'s own SQL with the
+    two post-claim queue-/activity-pause rechecks it also issues on every
+    successful claim — `claim_task_query()` alone is +1.9%, reported
+    separately since it's what the `EXPLAIN`-based evidence above is built
+    on), without asserting a range, a frequency, or a direction (e.g.
+    "always positive") for runs whose evidence no longer exists in the
+    repository to audit. An earlier revision of this page's real-drain
+    figures and buffer deltas used a confounded seeding methodology
+    instead: the two labels had been seeded with independently-random
+    `id`/`activity_id` values, and since every claim's non-HOT `UPDATE`
+    touches every applicable index on the table, not just the one this
+    predicate adds, some of what had looked like a `schedule_to_close_at`
+    effect on the main query may have been that confound instead — see
+    that page's "Workload" section for the fix. That earlier revision's
+    own artifacts are no longer committed (the repro script overwrites
+    the same canonical filenames every run), so this page does not cite
+    its pre-fix percentages or draw a magnitude conclusion from the
+    comparison. The committed run now shows the two labels landing on *different* plans at
+    the 100,000-row depth, with the expensive one on `no-schedule-to-close`
+    this time (an earlier, since-superseded committed run had neither
+    label on the expensive plan, so this is the only committed data point
+    for which label it lands on). That page's "100,000-row plan choice"
+    section is explicit that this does **not** show the instability is
+    unrelated to `schedule_to_close_at` — populating that column changes
+    the planner's actual row-count estimate for the shared candidate scan
+    (68,360 vs. 99,990 in this run's own committed plans, both against a
+    real 100,000 rows), so a plan flip either way is equally consistent
+    with that predicate's effect on planner inputs and with unrelated
+    `ANALYZE`-sample noise; the page does not have the evidence to tell
+    those apart. That same section also explains why it asserts
+    no frequency, ratio, or before/after count for this, including why an
+    earlier revision's "N of M runs" framing, and later a spelled-out
+    sample-of-two-against-two restating the same statistic in prose, both
+    had to be walked back once those runs' artifacts were no longer
+    available to audit. **This is a different question from issue #1177's
+    finding** (see
+    [any residual predicate defeats sort-elision](#any-residual-predicate-defeats-sort-elision-issue-1177))
+    that this same column independently defeats sort-elision/`LIMIT`
+    pushdown regardless of its value — a plan-*eligibility* effect. This
+    page's capture measures the column's marginal buffer/storage cost
+    against `claim_task_query()` exactly as it stands today, where the
+    `CASE` key and the other always-present residual predicates already
+    force the collapsed plan shape in both the seeded and unseeded state
+    (every committed plan needs the same external-merge `Sort` regardless
+    of which scan feeds it, including the 100,000-row depth's committed
+    run, where the two labels land on different scans but the identical
+    sort either way) — so the two findings don't conflict: #1177 explains why
+    dropping this predicate alone would not recover the cheap plan, while
+    this page measures what it costs to keep it, holding the already-collapsed
+    plan shape fixed.
   * **Worker sessions (#606)** — measured directly, on a genuinely different
     axis from issue #1177 just below: `docs/performance-worker-sessions.md`
     seeds `session_id` and `sticky_worker_id`/`sticky_until`/`sticky_timeout`
@@ -1472,24 +1571,25 @@ from the benchmark are directly comparable.
     sessions' predicate, like `schedule_to_close`'s and sticky routing's,
     independently defeats sort-elision (see immediately below); the two are
     answers to different questions about the same predicate.
-  * **`schedule_to_close` (#378), sticky routing (#235)** — their cost on the
-    attribution table above is still unmeasured; that remains scenario work,
-    same as before. What issue #1177 adds is a different kind of evidence,
-    not a cost figure: in isolation, each — together with worker sessions'
-    predicate, covered above — independently defeats sort-elision and
-    `LIMIT` pushdown regardless of the value it is tested against,
-    reproducing the same collapsed plan shape this page's own headline
-    finding describes. See
+  * **Sticky routing (#235)** — its cost on the attribution table above is
+    still unmeasured; that remains scenario work, same as before. What issue
+    #1177 adds is a different kind of evidence, not a cost figure: in
+    isolation, sticky routing's predicate — together with `schedule_to_close`'s
+    and worker sessions', both measured and covered above — independently
+    defeats sort-elision and `LIMIT` pushdown regardless of the value it is
+    tested against, reproducing the same collapsed plan shape this page's own
+    headline finding describes. See
     [any residual predicate defeats sort-elision](#any-residual-predicate-defeats-sort-elision-issue-1177).
     In the full production query the `CASE` key and the always-present
-    predicates already force that same collapse regardless of these two, so
-    their own marginal cost still can't be isolated this way. "cheap inline
+    predicates already force that same collapse regardless of any one of
+    these three, so their own marginal cost still can't be isolated this way.
+    "cheap inline
     column tests" was this page's own now-retracted reading of their
     *plan-eligibility* effect, not a corrected *cost* measurement — replacing
     one unsupported cost claim with another would be no improvement.
 
-  Adding these is scenario work, not query work: each needs a seed variant and a
-  report row, on a bench that already runs 15-30 minutes.
+  Adding one of these is scenario work, not query work: each needs a seed
+  variant and a report row, on a bench that already runs 15-30 minutes.
 * **Queue count is a parameter, but it is not swept.** `Scenario.queues`
   parameterizes how many distinct queues the backlog spreads across, and every
   published row holds it at 4. Backlog depth and claimer count *are* varied.
@@ -1523,6 +1623,12 @@ from the benchmark are directly comparable.
 * `docs/perf-artifacts/capability-labels-claim-predicate/` — committed
   `EXPLAIN`/`pg_stat_statements` evidence for that measurement.
 * `autumn-harvest/scripts/capability_labels_claim_perf_repro.sh` — regenerates
+  that evidence from a clean checkout.
+* [`docs/performance-schedule-to-close.md`](performance-schedule-to-close.md) — the `schedule_to_close_at` claim
+  predicate (#378) measurement referenced above.
+* `docs/perf-artifacts/schedule-to-close-claim-predicate/` — committed
+  `EXPLAIN`/`pg_stat_statements`/heap-growth evidence for that measurement.
+* `autumn-harvest/scripts/schedule_to_close_claim_perf_repro.sh` — regenerates
   that evidence from a clean checkout.
 * [`docs/performance-worker-sessions.md`](performance-worker-sessions.md) — the worker-sessions claim predicate
   (#606) measurement referenced above.
@@ -1585,3 +1691,10 @@ standalone note rather than part of the claim-path attribution table above:
 * [`docs/performance-sqlite-runtime-drive.md`](performance-sqlite-runtime-drive.md)
   — the first profiling harness for `autumn-harvest-sqlite`; findings only, no
   local fix cleared the floor.
+* [`docs/performance-redis-claim-roundtrip.md`](performance-redis-claim-roundtrip.md)
+  — a duplicate `ensure_group` round trip on every `RedisTaskQueue::claim`
+  poll, measured in socket-syscall counts (PR #1387).
+* [`docs/performance-schedule-bulk-audit.md`](performance-schedule-bulk-audit.md)
+  — the per-row audit-insert N+1 in the Vantage schedules bulk-pause/resume
+  actions (issue #951), batched into one chunked insert call per shard
+  (multiple statements past 4,999 matched rows).

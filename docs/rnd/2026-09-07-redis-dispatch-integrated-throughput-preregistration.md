@@ -1,4 +1,4 @@
-# ⛏️ Prospect pre-registration: does integrated Redis dispatch clear the founding ">10,000 tasks/sec" line in a deployment-shaped run? (assay ledger #6)
+# ⛏️ Prospect pre-registration: does integrated Redis dispatch clear the founding ">10,000 tasks/sec" line in a deployment-shaped run? (assay ledger #8)
 
 **Committed:** 2026-09-07T01:35:00Z, before any apparatus was built or
 measurement taken. This document is the contract; the report that follows it
@@ -101,6 +101,6 @@ suite. All are recorded again in the report's stubs list.
 ## ⏱️ Time box
 
 One session, single pass, after the integration merges. The apparatus lives
-at `docs/assays/apparatus/0006-redis-dispatch-integrated/`, is not a
+at `docs/assays/apparatus/0008-redis-dispatch-integrated/`, is not a
 workspace member, and calls only public APIs of `autumn-harvest` and
 `autumn-harvest-redis`.

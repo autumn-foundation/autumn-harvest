@@ -2,7 +2,7 @@
 // public API of `autumn-harvest` and `autumn-harvest-redis` only. It modifies
 // no workspace crate.
 //
-// It measures the deployment-shaped question of assay ledger #6. The
+// It measures the deployment-shaped question of assay ledger #8. The
 // integrated path is a real `Worker` pool, real Postgres claim and completion
 // transactions, and Postgres as the source of truth. Does that path clear the
 // founding ">10,000 tasks/sec" line? By what multiplier does it beat the same
@@ -1142,7 +1142,7 @@ async fn run() {
     let settings = Settings::from_env();
     let wall = Instant::now();
 
-    println!("# assay ledger #6: integrated Redis dispatch throughput");
+    println!("# assay ledger #8: integrated Redis dispatch throughput");
     println!(
         "# workflows={} reps={} paced_secs={} drain_cap_secs={} pool={} workers={} \
          wf_slots={} act_slots={} worker_poll_ms={}",

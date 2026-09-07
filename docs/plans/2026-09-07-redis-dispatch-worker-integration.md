@@ -151,7 +151,7 @@ duplicates work.
 | Core seam | `dispatch.rs`, `queue.rs` (`claim_task_by_id_on_shard`, probe, reconcile query), `notify.rs`, `execution.rs`, `worker.rs`, `builder.rs` | unit tests for buffering and backoff; DB tests with `MemoryDispatch` |
 | Redis implementation | `autumn-harvest-redis/src/dispatch.rs`, `redis_queue.rs` | Redis tests for dedupe, reschedule, batch read, release, recovery; end-to-end and process-kill tests |
 | Operator wiring | plugin `config.rs`, `runner.rs`, plugin feature `redis`, CI steps, docs | config parse and validation tests |
-| Assay #6 | `docs/rnd/...-preregistration.md`, `docs/assays/0006-*.md`, apparatus | pre-registration commit first |
+| Assay #8 | `docs/rnd/...-preregistration.md`, `docs/assays/0006-*.md`, apparatus | pre-registration commit first |
 
 ## 8. Acceptance criteria map
 
@@ -159,4 +159,4 @@ duplicates work.
 |----|----------|
 | Operator can configure Redis dispatch end to end | `[harvest.redis]` config, plugin wiring, end-to-end test with real Postgres and Redis |
 | Crash between the Postgres commit and the Redis ack loses nothing and duplicates nothing | process-kill test: the child worker aborts after the claim commit and before the ack; the parent verifies one execution and a clean stream |
-| Deployment-shaped throughput assay gates the 10,000 tasks/s claim | assay #6 with a pre-registered kill line and a matched Postgres control in the same run |
+| Deployment-shaped throughput assay gates the 10,000 tasks/s claim | assay #8 with a pre-registered kill line and a matched Postgres control in the same run |

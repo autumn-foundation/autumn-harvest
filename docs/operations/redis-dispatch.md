@@ -31,7 +31,7 @@ Turn it on when the queue is deep and the claim path is the bottleneck.
 is the backlog scan.
 
 **What it delivers, measured.**
-[`docs/assays/0006-redis-dispatch-integrated-throughput.md`](../assays/0006-redis-dispatch-integrated-throughput.md)
+[`docs/assays/0008-redis-dispatch-integrated-throughput.md`](../assays/0008-redis-dispatch-integrated-throughput.md)
 runs a real four-worker pool against a real Postgres, with and without the
 channel. Draining a 10,000-workflow backlog on the 4-core reference machine,
 the channel sustained a mean **173.04 completed tasks/sec**. The same pool on
@@ -264,5 +264,5 @@ the `redis` cargo feature.
 - [`docs/autumn-workflow-architecture.md`](../autumn-workflow-architecture.md) §9.1 — the design in context
 - `docs/plans/2026-09-07-redis-dispatch-worker-integration.md` — the full plan, including the reverse brainstorm
 - [`docs/assays/0001-redis-adapter-throughput-ceiling.md`](../assays/0001-redis-adapter-throughput-ceiling.md) — the standalone throughput measurement and its caveats
-- [`docs/assays/0006-redis-dispatch-integrated-throughput.md`](../assays/0006-redis-dispatch-integrated-throughput.md) — the integrated, deployment-shaped throughput measurement and its verdict
+- [`docs/assays/0008-redis-dispatch-integrated-throughput.md`](../assays/0008-redis-dispatch-integrated-throughput.md) — the integrated, deployment-shaped throughput measurement and its verdict
 - [`docs/performance.md`](../performance.md) — the Postgres claim-path numbers

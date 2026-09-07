@@ -1,5 +1,5 @@
 # NON-PRODUCTION THROWAWAY APPARATUS — see
-# ../../0006-redis-dispatch-integrated-throughput.md
+# ../../0008-redis-dispatch-integrated-throughput.md
 #
 # Archived for reproducibility only. Deliberately NOT a member of the
 # workspace root Cargo.toml and must never become one: it exists to answer one

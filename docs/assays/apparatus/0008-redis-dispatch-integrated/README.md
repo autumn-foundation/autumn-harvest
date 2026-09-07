@@ -1,7 +1,7 @@
-# Apparatus for assay #6: integrated Redis dispatch throughput
+# Apparatus for assay #8: integrated Redis dispatch throughput
 
 Non-production. Not a workspace member. See
-[`../../0006-redis-dispatch-integrated-throughput.md`](../../0006-redis-dispatch-integrated-throughput.md)
+[`../../0008-redis-dispatch-integrated-throughput.md`](../../0008-redis-dispatch-integrated-throughput.md)
 for the question, the pre-registration and the verdict this code answers.
 
 It runs a real four-`Worker` pool against a real Postgres, once with
@@ -12,7 +12,7 @@ and the same workload.
 ```bash
 psql -h 127.0.0.1 -U postgres -c 'create database assay6'
 redis-server --daemonize yes --port 6379 --save "" --appendonly no
-cargo run --release --manifest-path docs/assays/apparatus/0006-redis-dispatch-integrated/Cargo.toml
+cargo run --release --manifest-path docs/assays/apparatus/0008-redis-dispatch-integrated/Cargo.toml
 ```
 
 The binary drops and recreates its own database before every run, applies

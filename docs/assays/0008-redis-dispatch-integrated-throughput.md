@@ -1,8 +1,13 @@
-# ⛏️ Prospect: does integrated Redis dispatch clear the founding ">10,000 tasks/sec" line in a deployment-shaped run? (kill: 173.04 tasks/sec against a 10,000 line, ledger #6)
+# ⛏️ Prospect: does integrated Redis dispatch clear the founding ">10,000 tasks/sec" line in a deployment-shaped run? (kill: 173.04 tasks/sec against a 10,000 line, ledger #8)
 
-> Status: **measured.** The Pre-registration section below was committed
+> Status: **measured.** Pre-registered as ledger #6; renumbered to #8 at
+> merge time because ledgers #6 and #7 landed on `trunk-dev` first (PR
+> #1418). The number is an index, not part of the contract.
+>
+> Status detail: The Pre-registration section below was committed
 > (`46955f9`) before the apparatus was built or run; nothing in it has been
-> edited since. The Apparatus, Assay, Verdict and Reproduce sections were
+> edited since, except the ledger number in its title and apparatus path.
+> The Apparatus, Assay, Verdict and Reproduce sections were
 > appended afterward, in a follow-up commit, with the actual numbers.
 
 ## 🎯 Question
@@ -107,7 +112,7 @@ Copied verbatim from
 ## 🧪 Apparatus
 
 A standalone Rust binary
-(`docs/assays/apparatus/0006-redis-dispatch-integrated/`, archived, **not a
+(`docs/assays/apparatus/0008-redis-dispatch-integrated/`, archived, **not a
 workspace member, never build against it**) with path dependencies on the real
 `autumn-harvest` (features `db`, `testing`) and `autumn-harvest-redis` crates.
 It calls public APIs only. Zero lines of any workspace crate were touched.
@@ -477,7 +482,7 @@ uptime
 # Build and run the archived apparatus. Never add it to the workspace
 # Cargo.toml.
 export CARGO_TARGET_DIR="$PWD/target"
-cd docs/assays/apparatus/0006-redis-dispatch-integrated
+cd docs/assays/apparatus/0008-redis-dispatch-integrated
 cargo build --release
 
 # The drain sweep: 3 repetitions per arm, alternating, 10,000 workflows each,
@@ -505,5 +510,5 @@ run, and deletes only the Redis keys under its own per-run prefix. It never
 calls `FLUSHALL`.
 
 See
-[`docs/assays/apparatus/0006-redis-dispatch-integrated/README.md`](apparatus/0006-redis-dispatch-integrated/README.md)
+[`docs/assays/apparatus/0008-redis-dispatch-integrated/README.md`](apparatus/0008-redis-dispatch-integrated/README.md)
 for the full list of environment knobs.

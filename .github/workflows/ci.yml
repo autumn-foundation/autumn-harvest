@@ -148,6 +148,15 @@ jobs:
         # var nor the doc. See
         # scripts/check-dev-database-url-placeholder-caveat.sh.
         run: ./scripts/check-dev-database-url-placeholder-caveat.sh
+      - name: Check README upgrade-guide pointer is current
+        # Guards a real, reproduced-live defect: README.md's own top-level
+        # "Upgrading an existing deployment?" pointer is a hand-written link
+        # that nothing keeps in sync with docs/upgrading/. After 0.6.0.md
+        # shipped and docs/getting-started/README.md was updated to call it
+        # "the current" guide, README.md's front-door pointer still linked to
+        # the superseded 0.4.0 -> 0.5.0 guide. See
+        # scripts/check-readme-upgrade-guide-current.sh.
+        run: ./scripts/check-readme-upgrade-guide-current.sh
       - name: Check formatting
         run: cargo fmt --all -- --check
       - name: Clippy autumn-harvest
