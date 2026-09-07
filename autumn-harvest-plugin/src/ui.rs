@@ -3548,11 +3548,12 @@ fn dlq_summary_drilldown_href(
     // Start from the filters already applied to the summary so drill-down
     // narrows rather than widens. `drill_raw` starts as a clone of the
     // summary's own raw state, not a derivation from `drill`. Codex review
-    // on #1420: a derived-only `drill_raw` silently dropped an invalid
-    // failed_after/failed_before (and its error) on every "View entries"
-    // link, even though this function never touches those two fields. The
-    // view toggle, refresh, and group-by form all preserve that same
-    // invalid value; the drilldown link must not be the one exception.
+    // on #1420 found the bug in a derived-only `drill_raw`: it silently
+    // dropped an invalid failed_after/failed_before, and its error, on
+    // every "View entries" link. This function never touches those two
+    // fields. The view toggle, refresh, and group-by form all preserve
+    // that same invalid value. The drilldown link must not be the one
+    // exception.
     let mut drill = filters.clone();
     let mut drill_raw = filter_raw.clone();
     let mut partial = false;
@@ -11766,11 +11767,11 @@ mod tests {
 
     /// Codex review on #1420: a summary drilldown's "View entries" link
     /// used to derive its `drill_raw` solely from the successfully parsed
-    /// filters, silently dropping an invalid `failed_after`/`failed_before`
-    /// and its error — even though this function never touches those two
-    /// fields. The view toggle, refresh, and group-by form all preserve
-    /// that same invalid value; the drilldown link must not be the one
-    /// exception.
+    /// filters. This silently dropped an invalid `failed_after`/
+    /// `failed_before` and its error, even though this function never
+    /// touches those two fields. The view toggle, refresh, and group-by
+    /// form all preserve that same invalid value. The drilldown link must
+    /// not be the one exception.
     #[test]
     fn dlq_summary_drilldown_href_preserves_invalid_failed_after() {
         use autumn_harvest::dlq::DlqGroupDimension;
@@ -11803,10 +11804,10 @@ mod tests {
         );
     }
 
-    /// Same review: the `task_kind` field IS synthesized by this function
-    /// for the `TaskType` group-by dimension, so its raw text is
-    /// overwritten to match the group's own key rather than inherited from
-    /// a stale, unrelated error the summary view happened to be showing.
+    /// Same review: the `task_kind` field IS synthesized by this function,
+    /// for the `TaskType` group-by dimension. Its raw text is overwritten
+    /// to match the group's own key. It must not inherit a stale, unrelated
+    /// error the summary view happened to be showing.
     #[test]
     fn dlq_summary_drilldown_href_overwrites_task_kind_synthesized_from_group() {
         use autumn_harvest::dlq::DlqGroupDimension;
