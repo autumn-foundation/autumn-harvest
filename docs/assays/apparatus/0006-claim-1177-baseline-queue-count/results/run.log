@@ -30,35 +30,65 @@ SET
  Settings: enable_seqscan = 'off', enable_bitmapscan = 'off'
  Planning:
    Buffers: shared hit=223
- Planning Time: 0.575 ms
- Execution Time: 4.489 ms
+ Planning Time: 0.662 ms
+ Execution Time: 4.391 ms
 (20 rows)
 
 ROLLBACK
---- single-queue test (the pre-registered hypothesis) ---
+--- single-queue, ANY() over a 1-element array (production-representative shape) ---
 TRUNCATE TABLE
 INSERT 0 10000
+INSERT 0 0
 ANALYZE
+BEGIN
+SET
+SET
+                                                                                           QUERY PLAN                                                                                            
+-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+ Limit  (cost=899.79..900.42 rows=50 width=35) (actual rows=50 loops=1)
+   Output: id, task_type, priority, scheduled_at, ctid
+   Buffers: shared hit=195
+   ->  LockRows  (cost=899.79..1024.79 rows=10000 width=35) (actual rows=50 loops=1)
+         Output: id, task_type, priority, scheduled_at, ctid
+         Buffers: shared hit=195
+         ->  Sort  (cost=899.79..924.79 rows=10000 width=35) (actual rows=50 loops=1)
+               Output: id, task_type, priority, scheduled_at, ctid
+               Sort Key: harvest_task_queue.priority DESC, harvest_task_queue.scheduled_at
+               Sort Method: quicksort  Memory: 1010kB
+               Buffers: shared hit=145
+               ->  Index Scan using idx_harvest_tq_poll on public.harvest_task_queue  (cost=0.29..567.60 rows=10000 width=35) (actual rows=10000 loops=1)
+                     Output: id, task_type, priority, scheduled_at, ctid
+                     Index Cond: ((harvest_task_queue.queue_name = ANY ('{bench-q-0}'::text[])) AND (harvest_task_queue.state = 'PENDING'::text) AND (harvest_task_queue.scheduled_at <= now()))
+                     Buffers: shared hit=139
+ Settings: enable_seqscan = 'off', enable_bitmapscan = 'off'
+ Planning:
+   Buffers: shared hit=223
+ Planning Time: 0.849 ms
+ Execution Time: 13.942 ms
+(20 rows)
+
+ROLLBACK
+--- single-queue, scalar equality (secondary arm -- not itself a production shape) ---
 BEGIN
 SET
 SET
                                                                                    QUERY PLAN                                                                                    
 ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
- Limit  (cost=0.29..3.32 rows=50 width=35) (actual rows=50 loops=1)
+ Limit  (cost=0.29..3.62 rows=50 width=35) (actual rows=50 loops=1)
    Output: id, task_type, priority, scheduled_at, ctid
    Buffers: shared hit=53
-   ->  LockRows  (cost=0.29..607.48 rows=10000 width=35) (actual rows=50 loops=1)
+   ->  LockRows  (cost=0.29..667.60 rows=10000 width=35) (actual rows=50 loops=1)
          Output: id, task_type, priority, scheduled_at, ctid
          Buffers: shared hit=53
-         ->  Index Scan using idx_harvest_tq_poll on public.harvest_task_queue  (cost=0.29..507.48 rows=10000 width=35) (actual rows=50 loops=1)
+         ->  Index Scan using idx_harvest_tq_poll on public.harvest_task_queue  (cost=0.29..567.60 rows=10000 width=35) (actual rows=50 loops=1)
                Output: id, task_type, priority, scheduled_at, ctid
                Index Cond: ((harvest_task_queue.queue_name = 'bench-q-0'::text) AND (harvest_task_queue.state = 'PENDING'::text) AND (harvest_task_queue.scheduled_at <= now()))
                Buffers: shared hit=3
  Settings: enable_seqscan = 'off', enable_bitmapscan = 'off'
  Planning:
-   Buffers: shared hit=175 read=1
- Planning Time: 0.545 ms
- Execution Time: 0.099 ms
+   Buffers: shared hit=172
+ Planning Time: 0.513 ms
+ Execution Time: 0.111 ms
 (15 rows)
 
 ROLLBACK
