@@ -7,7 +7,7 @@
 pub use crate::api::{HarvestApiRuntime, HarvestApiState, harvest_api_router};
 pub use crate::config::{
     HarvestDatabaseConfig, HarvestMode, HarvestOutboxConfig, HarvestReadinessConfig,
-    HarvestRuntimeConfig,
+    HarvestRedisConfig, HarvestRuntimeConfig,
 };
 pub use crate::outbox::{
     WorkflowStartRequest, drain_workflow_start_outbox_once, enqueue_workflow_start_outbox,

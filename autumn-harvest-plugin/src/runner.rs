@@ -981,6 +981,12 @@ impl HarvestRunner {
             })?;
         }
 
+        // Issue #1312: install the process-global dispatch channel BEFORE the
+        // worker is constructed, and in every mode. An API-only process owns
+        // no worker but still publishes references for the fleet, so the
+        // install cannot sit inside the `worker_enabled` branch.
+        install_dispatch_channel(config).await?;
+
         let worker = if config.worker_enabled {
             let worker = Worker::new(
                 prepared.worker_runtime_config.clone(),
@@ -1237,6 +1243,84 @@ fn capture_effective_config(
         DEFAULT_WORKER_POLL_INTERVAL,
         Some(resolved_sharding),
     )
+}
+
+/// Lifetime of a publish marker key, which makes a publish idempotent per
+/// task id. The plan fixes it at ten minutes.
+#[cfg(feature = "redis")]
+const DISPATCH_DEDUPE_TTL: std::time::Duration = std::time::Duration::from_secs(600);
+
+/// Install the Redis dispatch channel when `[harvest.redis] url` is set.
+///
+/// Postgres stays the source of truth. The channel only carries references to
+/// claimable `harvest_task_queue` rows. With no URL the runtime keeps the
+/// Postgres claim path and this is a no-op.
+///
+/// # Errors
+///
+/// Returns an error when the Redis endpoint cannot be reached. The message
+/// names the endpoint in credential-free form.
+#[cfg(feature = "redis")]
+async fn install_dispatch_channel(config: &HarvestRuntimeConfig) -> autumn_web::AutumnResult<()> {
+    use std::time::Duration;
+
+    let Some(url) = config.redis.url.as_deref() else {
+        return Ok(());
+    };
+    let endpoint = config
+        .redis
+        .redacted_url()
+        .unwrap_or_else(|| "redis".to_owned());
+
+    let channel = autumn_harvest_redis::RedisDispatch::connect(
+        url,
+        autumn_harvest_redis::RedisDispatchConfig {
+            key_prefix: config.redis.key_prefix.clone(),
+            consumer_group: config.redis.consumer_group.clone(),
+            visibility_timeout: Duration::from_millis(config.redis.visibility_timeout_ms),
+            dedupe_ttl: DISPATCH_DEDUPE_TTL,
+        },
+    )
+    .await
+    .map_err(|error| {
+        AutumnError::service_unavailable_msg(format!(
+            "failed to connect the Redis dispatch channel at {endpoint}: {error}"
+        ))
+    })?;
+
+    autumn_harvest::dispatch::install(
+        Arc::new(channel),
+        autumn_harvest::dispatch::DispatchSettings {
+            poll_interval: Duration::from_millis(config.redis.poll_interval_ms),
+            reconcile_interval: Duration::from_millis(config.redis.reconcile_interval_ms),
+            ..autumn_harvest::dispatch::DispatchSettings::default()
+        },
+    );
+
+    tracing::info!(
+        endpoint = %endpoint,
+        key_prefix = %config.redis.key_prefix,
+        consumer_group = %config.redis.consumer_group,
+        poll_interval_ms = config.redis.poll_interval_ms,
+        reconcile_interval_ms = config.redis.reconcile_interval_ms,
+        "redis dispatch enabled: workers read task references from redis and claim the named \
+         row in postgres"
+    );
+    Ok(())
+}
+
+/// No dispatch channel exists without the `redis` cargo feature.
+///
+/// Configuration validation rejects `[harvest.redis] url` on such a build, so
+/// this path can only be reached with Redis dispatch off.
+///
+/// # Errors
+///
+/// Never returns an error.
+#[cfg(not(feature = "redis"))]
+#[allow(clippy::unused_async)]
+async fn install_dispatch_channel(_config: &HarvestRuntimeConfig) -> autumn_web::AutumnResult<()> {
+    Ok(())
 }
 
 /// The writable shards `assignments` does **not** cover, ascending (issue #961).

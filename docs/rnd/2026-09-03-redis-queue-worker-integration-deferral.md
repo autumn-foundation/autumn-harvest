@@ -1,5 +1,12 @@
 # 🏛️ Keystone [deferred]: Redis task-queue worker-integration (trigger: signed throughput commitment or tier-1 saturation evidence)
 
+> **Superseded (2026-09-07).** Issue #1312 is the dated, owned trigger this
+> record asked for. The design lives in
+> `docs/plans/2026-09-07-redis-dispatch-worker-integration.md`, and the
+> operator guide is
+> [`docs/operations/redis-dispatch.md`](../operations/redis-dispatch.md). The
+> record below is kept as written, because it states why the work waited.
+
 **Status:** deferral record — no RFC, no code change, no decision required from
 architecture review.
 **Scope examined:** `autumn-harvest-redis/`, `autumn-harvest/src/worker.rs`,

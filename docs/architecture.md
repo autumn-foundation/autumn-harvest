@@ -63,15 +63,22 @@ autumn-harvest/          <- workspace root
       workflow.rs
       activity.rs
       collect.rs
+  autumn-harvest-plugin/ <- Autumn integration: HarvestPlugin, management API, runtime lifecycle
+  autumn-harvest-cli/    <- `harvest` operator CLI over the management API
+  autumn-harvest-redis/  <- optional Redis Streams dispatch channel (issue #1312)
+  autumn-harvest-sqlite/ <- optional SQLite storage backend
+  autumn-harvest-verify/ <- semantic (MIR-level) determinism analyzer (issue #962)
 ```
 
-Two crates in the workspace. `autumn-harvest` is the public library. `autumn-harvest-macros` is a separate proc-macro crate consumed by `autumn-harvest` via `prelude.rs`.
+Seven crates in the workspace. `autumn-harvest` is the public library and `autumn-harvest-macros` is a separate proc-macro crate consumed by `autumn-harvest` via `prelude.rs`. `autumn-harvest-plugin` is the Autumn integration. `autumn-harvest-cli`, `autumn-harvest-redis`, `autumn-harvest-sqlite` and `autumn-harvest-verify` are optional. The list above omits `examples/`, whose members are illustrations rather than published crates.
 
 ## Architecture
 
 ### Crate Relationship
 
 `autumn-harvest` is the core engine crate. It re-exports everything from `autumn-harvest-macros` through `prelude.rs`. Autumn-specific integration lives in the separate `autumn-harvest-plugin` crate, which provides `HarvestPlugin`, the management API router, and app lifecycle wiring.
+
+`autumn-harvest-redis` is an **optional** dependency of `autumn-harvest-plugin`, behind that crate's `redis` cargo feature (issue #1312). It implements the core `dispatch::TaskDispatch` seam over Redis Streams. The default build never compiles it, and the plugin rejects `[harvest.redis] url` on a build without the feature. `autumn-harvest-redis` depends on `autumn-harvest` with `default-features = false`, so the channel never pulls the `db` feature into a caller that does not want it. See [`docs/operations/redis-dispatch.md`](operations/redis-dispatch.md).
 
 Macro-generated code must use `::autumn_harvest::` paths for everything. The proc-macro crate has no dependency on `serde_json` or `autumn-web` itself; it emits token streams that resolve via the `::autumn_harvest::` path. `lib.rs` re-exports `serde_json` at `::autumn_harvest::serde_json` and exposes its own local `task_duration()` parser at `::autumn_harvest::task_duration` for exactly this reason.
 
@@ -198,6 +205,7 @@ Current implementation scope: `ExecutionId`/`ShardId` encoding, `ShardRouter`, `
 | `executor.rs` | 2 | Workflow executor: `run_workflow` drives replay + live execution, handles suspension |
 | `queue.rs` | 2 | Postgres task queue: `enqueue`, `claim` (FOR UPDATE SKIP LOCKED), `complete`, `fail` |
 | `notify.rs` | 2 | LISTEN/NOTIFY wrapper: `Listener` (async stream), `Notifier` (pg_notify), channel naming |
+| `dispatch.rs` | 3.x | Task dispatch channel seam (issue #1312): `TaskDispatch` trait (`publish`/`next`/`ack`/`release`/`maintain`), `DispatchHint` (task id, queue, `scheduled_at`, priority, shard), `DispatchLease`, `DispatchMaintenance`, `DispatchSettings` (`poll_interval`, `reconcile_interval`, `reconcile_batch`, `release_backoff_cap`) and the process-global `install`/`installed`/`uninstall`. The channel carries references to claimable `harvest_task_queue` rows; Postgres stays the source of truth, and a worker still claims the named row with the full claim predicate. It is a latency and throughput optimization, never a durability store: the worker's reconcile sweep republishes every due `PENDING` row the channel does not hold. No new event variant, no migration. The Redis Streams implementation lives in `autumn-harvest-redis`; see [`docs/operations/redis-dispatch.md`](operations/redis-dispatch.md). |
 | `worker.rs` | 2 | Worker runtime: poll loop, semaphore-bounded concurrent dispatch, graceful shutdown |
 | `workers.rs` | 4 | Worker fleet registry: `register_worker`, `heartbeat_worker`, `transition_status`, `list_workers`, `get_worker`, `fleet_health`, `spawn_worker_heartbeat` |
 | `heartbeat.rs` | 2 | Batched heartbeat flusher: debounced channel receiver, last-write-wins timestamp + checkpoint payload DB update |
