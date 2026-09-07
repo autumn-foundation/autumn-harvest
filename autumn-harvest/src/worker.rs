@@ -37773,6 +37773,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "testing")]
     #[test]
     fn the_sharded_runtime_rejection_reads_as_one_sentence() {
         let registry = Arc::new(HandlerRegistry::new(vec![], vec![]));
