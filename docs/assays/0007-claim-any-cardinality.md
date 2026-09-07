@@ -82,24 +82,33 @@ Fresh run, same database (`prospect_assay6`), reseeded from scratch:
 
 **Control** (4-queue `ANY`, reproduced from ledger #6): `Sort` node
 present, `Index Scan` reads all 10,000 matching rows, 591 buffers,
-4.933ms.
+5.075ms.
 
 **Test, cardinality 1** (single-queue `ANY(ARRAY['bench-q-0'])`, same
 10,000-row backlog, all in one queue — not blind, see pre-registration
 section above): `Sort` node **present** — `Index Scan` reads all 10,000
-matching rows (not the `LIMIT`ed 50), 195 buffers, 4.117ms.
+matching rows (not the `LIMIT`ed 50), 195 buffers, 4.040ms.
 
 **Blind confirmation, cardinality 2** (`ANY(ARRAY['bench-q-0',
 'bench-q-1'])`, 10,000 rows split between the two queues, never run
 before commit `04306dd`): `Sort` node **present** — `Index Scan` reads
-all 10,000 matching rows, 329 buffers, 4.247ms. Buffers scale
+all 10,000 matching rows, 329 buffers, 4.124ms. Buffers scale
 roughly with cardinality (195 at n=1, 329 at n=2, 591 at n=4 — each
 queue's own share of the index range, scanned in full), but the
 structural shape — `Sort` present, no `LIMIT` pushdown — does not change
 at any cardinality tested.
 
 For reference, scalar equality (ledger #6's own pre-registered arm, same
-seed): no `Sort` node, 53 buffers, bounded scan (50 rows read).
+seed): no `Sort` node, 53 buffers, bounded scan (50 rows read), 0.171ms.
+
+All four buffer counts are bit-for-bit identical across every rerun of
+this apparatus, including the final rerun archived here; execution-time
+milliseconds are not (each arm's own number moved between runs on
+identical data — e.g. the control alone read 4.489-5.075ms across
+different runs) and are reported only as this archived run's own
+figures, never as a claim about relative cost. Buffers, and the
+structural presence/absence of a `Sort` node, are what every verdict in
+this ledger entry and #6 is graded against.
 
 `grep -c "Sort Key"`: control (n=4) 1, `ANY` at n=2 1, `ANY` at n=1 1,
 scalar equality 0. Full output archived at

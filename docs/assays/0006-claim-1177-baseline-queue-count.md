@@ -126,15 +126,24 @@ transaction, same `LIMIT 50`, same `FOR UPDATE SKIP LOCKED`.
 
 **Control** (4-queue `ANY`, 10,000 rows spread round-robin across
 `bench-q-0..3`): `Sort` node present, `Index Scan` reads all 10,000
-matching rows, 591 buffers, 4.933ms.
+matching rows, 591 buffers, 5.075ms (execution time; see the note below
+the numbers on why buffers, not this, are what's graded).
 
 **Pre-registered test** (single-queue scalar equality, all 10,000 rows in
 `bench-q-0`): **no `Sort` node**, bounded scan (50 rows read, matching
-`LIMIT`), 53 buffers, 0.109ms.
+`LIMIT`), 53 buffers, 0.171ms.
 
 **Not graded here — see ledger #7** (single-queue `ANY` over a
 single-element array): `Sort` node present, full 10,000-row scan, 195
 buffers.
+
+Buffer counts (591 / 53 / 195) are bit-for-bit identical across every
+rerun of this apparatus, including the final rerun that produced the
+numbers above; execution-time milliseconds are not (they moved run to
+run — e.g. this control read 4.489-5.075ms across different runs on
+identical data) and are reported only as the archived run's own number,
+never as a claim about relative cost. Buffers are what this report's
+verdict is graded against.
 
 `grep -c "Sort Key"`: control 1, pre-registered scalar test 0, `ANY`
 arm (ledger #7's own evidence) 1. Full output archived at
