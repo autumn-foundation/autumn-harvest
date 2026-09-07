@@ -159,6 +159,7 @@ pub fn update_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         Ok(p) => p,
         Err(e) => return e.to_compile_error(),
     };
+    let (leading_colon, nested_path_tokens) = parsed_path.nested_stub_use_tokens();
     let workflow_simple_name = parsed_path.workflow_simple_name;
     let camel_wf = crate::to_pascal_case(&workflow_simple_name);
     let stub_ident = format_ident!("{camel_wf}Stub");
@@ -179,38 +180,6 @@ pub fn update_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
 
     let mod_name = format_ident!("__autumn_update_impl_{fn_name}");
     let path_tokens = parsed_path.path_tokens;
-    let is_absolute = parsed_path.is_absolute;
-    let leading_colon = if is_absolute {
-        quote! { :: }
-    } else {
-        quote! {}
-    };
-    let nested_path_tokens = if is_absolute
-        || parsed_path
-            .original_module_parts
-            .first()
-            .is_some_and(|s| s == "crate")
-    {
-        path_tokens.clone()
-    } else if parsed_path.original_module_parts.is_empty() {
-        Vec::new()
-    } else {
-        let mut tokens = Vec::new();
-        tokens.push(quote! { super });
-        let first = parsed_path.original_module_parts.first().unwrap();
-        if first == "self" {
-            for p in parsed_path.original_module_parts.iter().skip(1) {
-                let id = format_ident!("{}", p);
-                tokens.push(quote! { #id });
-            }
-        } else {
-            for p in &parsed_path.original_module_parts {
-                let id = format_ident!("{}", p);
-                tokens.push(quote! { #id });
-            }
-        }
-        tokens
-    };
     // The three typed-stub methods are identical whether `#stub_ident` is
     // implemented directly (same-module case) or inside a private mod that
     // re-imports it (nested-module case, needed so the `impl` sees the type
