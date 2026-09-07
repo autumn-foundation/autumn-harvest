@@ -89,6 +89,7 @@ named `email`:
 |-----|------|-------|
 | `harvest:dispatch:email` | stream | References that are due now |
 | `harvest:dispatch:email:delayed` | sorted set | References parked until their due time, scored by that time |
+| `harvest:dispatch:email:delayed:payloads` | hash | Payload of each parked reference, keyed by task id |
 | `harvest:dispatch:marker:<task_id>` | string | Publish marker that makes a publish idempotent per task id |
 
 `autumn-harvest-redis/src/naming.rs` is the single source of truth for the key
