@@ -33,8 +33,8 @@ pub enum RedisAdapterError {
     #[error("invalid redis dispatch configuration: {0}")]
     InvalidConfig(String),
 
-    /// A `rediss://` URL was given, but the crate was built without the `tls`
-    /// feature.
+    /// A `rediss://` URL was given, but this release carries no TLS
+    /// transport (issue #1429).
     ///
     /// The message never repeats the URL. A dispatch URL carries the
     /// password, so it never reaches an error string.
