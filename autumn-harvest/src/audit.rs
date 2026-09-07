@@ -647,6 +647,12 @@ pub const CLASSIFIED_ROUTES: &[(&str, RouteClass)] = &[
         "GET /workflows/by-id/{workflow_name}/{workflow_id}",
         RouteClass::ReadOnly,
     ),
+    // Empty-workflow_id guard (issue #1353): literal trailing-slash form of
+    // the base route above; always returns 400 (no read, no write).
+    (
+        "GET /workflows/by-id/{workflow_name}/",
+        RouteClass::ReadOnly,
+    ),
     (
         "GET /workflows/by-id/{workflow_name}/{workflow_id}/result",
         RouteClass::ReadOnly,
@@ -977,6 +983,8 @@ pub const EXCLUDED_ROUTES: &[&str] = &[
     // ALL_MUTATION_ROUTES with `None` (both mean "not audited") but is NOT in
     // EXCLUDED_ROUTES, so the by-id variant must not be either.
     "GET /workflows/by-id/{workflow_name}/{workflow_id}",
+    // Empty-workflow_id guard (issue #1353): always 400, no read, no write.
+    "GET /workflows/by-id/{workflow_name}/",
     "GET /workflows/by-id/{workflow_name}/{workflow_id}/stack",
     "GET /workflows/by-id/{workflow_name}/{workflow_id}/children",
     "GET /workflows/by-id/{workflow_name}/{workflow_id}/query/{query_name}",
@@ -1268,6 +1276,8 @@ pub const ALL_MUTATION_ROUTES: &[(&str, Option<&str>)] = &[
     // delegate to them; the delegated handler writes the audit row under the
     // exec-id route string with the resolved exec_id as the target).
     ("GET /workflows/by-id/{workflow_name}/{workflow_id}", None),
+    // Empty-workflow_id guard (issue #1353): always 400, never audited.
+    ("GET /workflows/by-id/{workflow_name}/", None),
     (
         "GET /workflows/by-id/{workflow_name}/{workflow_id}/result",
         None,
