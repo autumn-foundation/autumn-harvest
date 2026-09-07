@@ -798,6 +798,153 @@ orphaned_workflows = "explode"
         );
     }
 
+    #[test]
+    fn harvest_config_redis_defaults_leave_dispatch_off() {
+        let env = MockEnv::new();
+        let config = HarvestRuntimeConfig::load_with_env(&env).expect("harvest config should load");
+
+        assert_eq!(config.redis.url, None);
+        assert_eq!(config.redis.key_prefix, "harvest");
+        assert_eq!(config.redis.consumer_group, "harvest_workers");
+        assert_eq!(config.redis.visibility_timeout_ms, 60_000);
+        assert_eq!(config.redis.poll_interval_ms, 20);
+        assert_eq!(config.redis.reconcile_interval_ms, 1_000);
+    }
+
+    #[test]
+    fn harvest_config_redis_section_parses_from_toml() {
+        let dir = unique_temp_dir("harvest-config-redis-toml");
+        write_file(
+            &dir.join("autumn.toml"),
+            r#"
+[harvest.redis]
+key_prefix = "acme"
+consumer_group = "acme_workers"
+visibility_timeout_ms = 30000
+poll_interval_ms = 5
+reconcile_interval_ms = 250
+"#,
+        );
+        let env = MockEnv::new().with("AUTUMN_MANIFEST_DIR", dir.to_string_lossy().as_ref());
+
+        let config = HarvestRuntimeConfig::load_with_env(&env).expect("harvest config should load");
+
+        assert_eq!(config.redis.url, None);
+        assert_eq!(config.redis.key_prefix, "acme");
+        assert_eq!(config.redis.consumer_group, "acme_workers");
+        assert_eq!(config.redis.visibility_timeout_ms, 30_000);
+        assert_eq!(config.redis.poll_interval_ms, 5);
+        assert_eq!(config.redis.reconcile_interval_ms, 250);
+    }
+
+    #[test]
+    fn harvest_config_redis_env_overrides_toml() {
+        let dir = unique_temp_dir("harvest-config-redis-env");
+        write_file(
+            &dir.join("autumn.toml"),
+            r#"
+[harvest.redis]
+key_prefix = "from_toml"
+"#,
+        );
+        let env = MockEnv::new()
+            .with("AUTUMN_MANIFEST_DIR", dir.to_string_lossy().as_ref())
+            .with("AUTUMN_HARVEST_REDIS__KEY_PREFIX", "from_env")
+            .with("AUTUMN_HARVEST_REDIS__CONSUMER_GROUP", "env_workers")
+            .with("AUTUMN_HARVEST_REDIS__VISIBILITY_TIMEOUT_MS", "15000")
+            .with("AUTUMN_HARVEST_REDIS__POLL_INTERVAL_MS", "40")
+            .with("AUTUMN_HARVEST_REDIS__RECONCILE_INTERVAL_MS", "2000");
+
+        let config = HarvestRuntimeConfig::load_with_env(&env).expect("harvest config should load");
+
+        assert_eq!(config.redis.key_prefix, "from_env");
+        assert_eq!(config.redis.consumer_group, "env_workers");
+        assert_eq!(config.redis.visibility_timeout_ms, 15_000);
+        assert_eq!(config.redis.poll_interval_ms, 40);
+        assert_eq!(config.redis.reconcile_interval_ms, 2_000);
+    }
+
+    #[test]
+    fn harvest_config_redis_empty_url_env_leaves_dispatch_off() {
+        let env = MockEnv::new().with("AUTUMN_HARVEST_REDIS__URL", "");
+
+        let config = HarvestRuntimeConfig::load_with_env(&env).expect("harvest config should load");
+
+        assert_eq!(config.redis.url, None);
+    }
+
+    #[test]
+    fn harvest_config_redis_rejects_a_zero_poll_interval() {
+        let env = MockEnv::new().with("AUTUMN_HARVEST_REDIS__POLL_INTERVAL_MS", "0");
+
+        let error = HarvestRuntimeConfig::load_with_env(&env)
+            .expect_err("a zero poll interval must fail validation");
+
+        assert!(
+            error.to_string().contains("harvest.redis.poll_interval_ms"),
+            "expected a redis poll_interval_ms validation error, got {error}"
+        );
+    }
+
+    #[test]
+    fn harvest_config_redis_rejects_a_zero_reconcile_interval() {
+        let env = MockEnv::new().with("AUTUMN_HARVEST_REDIS__RECONCILE_INTERVAL_MS", "0");
+
+        let error = HarvestRuntimeConfig::load_with_env(&env)
+            .expect_err("a zero reconcile interval must fail validation");
+
+        assert!(
+            error
+                .to_string()
+                .contains("harvest.redis.reconcile_interval_ms"),
+            "expected a redis reconcile_interval_ms validation error, got {error}"
+        );
+    }
+
+    #[test]
+    fn harvest_config_redis_rejects_a_zero_visibility_timeout() {
+        let env = MockEnv::new().with("AUTUMN_HARVEST_REDIS__VISIBILITY_TIMEOUT_MS", "0");
+
+        let error = HarvestRuntimeConfig::load_with_env(&env)
+            .expect_err("a zero visibility timeout must fail validation");
+
+        assert!(
+            error
+                .to_string()
+                .contains("harvest.redis.visibility_timeout_ms"),
+            "expected a redis visibility_timeout_ms validation error, got {error}"
+        );
+    }
+
+    /// A build without the `redis` feature carries no channel implementation.
+    /// A configured URL must therefore fail at load, not start a runtime that
+    /// silently ignores it.
+    #[cfg(not(feature = "redis"))]
+    #[test]
+    fn harvest_config_redis_url_without_the_feature_is_rejected() {
+        let env = MockEnv::new().with("AUTUMN_HARVEST_REDIS__URL", "redis://127.0.0.1:6379");
+
+        let error = HarvestRuntimeConfig::load_with_env(&env)
+            .expect_err("a redis url must fail validation without the redis feature");
+
+        let message = error.to_string();
+        assert!(
+            message.contains("redis") && message.contains("feature"),
+            "expected the error to name the `redis` cargo feature, got {error}"
+        );
+    }
+
+    /// A build with the `redis` feature accepts a configured URL.
+    #[cfg(feature = "redis")]
+    #[test]
+    fn harvest_config_redis_url_with_the_feature_is_accepted() {
+        let env = MockEnv::new().with("AUTUMN_HARVEST_REDIS__URL", "redis://127.0.0.1:6379");
+
+        let config = HarvestRuntimeConfig::load_with_env(&env).expect("harvest config should load");
+
+        assert_eq!(config.redis.url.as_deref(), Some("redis://127.0.0.1:6379"));
+    }
+
     fn unique_temp_dir(label: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!(
             "autumn-harvest-plugin-{label}-{}",
