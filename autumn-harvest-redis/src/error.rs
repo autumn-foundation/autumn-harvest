@@ -28,6 +28,22 @@ pub enum RedisAdapterError {
     /// The queue name contained characters that are not allowed.
     #[error("invalid queue name '{0}'")]
     InvalidQueueName(String),
+
+    /// A configuration value is not usable.
+    #[error("invalid redis dispatch configuration: {0}")]
+    InvalidConfig(String),
+
+    /// A `rediss://` URL was given, but the crate was built without the `tls`
+    /// feature.
+    ///
+    /// The message names the feature rather than the URL. A dispatch URL
+    /// carries the password, so it never reaches an error string.
+    #[error("TLS is off: build autumn-harvest-redis with the `tls` feature to use a rediss:// url")]
+    TlsUnavailable,
+
+    /// The connection was not established inside the connect timeout.
+    #[error("redis connect timed out after {0:?}")]
+    ConnectTimeout(std::time::Duration),
 }
 
 /// Convenience result alias used throughout the adapter.
