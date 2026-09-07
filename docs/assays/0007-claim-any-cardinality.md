@@ -126,13 +126,16 @@ structurally identical to the 4-queue control in every case.
 
 ## 🏁 Verdict
 
-**Confirmed: operator, not cardinality** — now on a genuinely blind
-result, not just the cardinality-1 comparison alone. `ANY()` defeats
-sort-elision on `idx_harvest_tq_poll` regardless of how many elements the
-array holds: cardinalities 1, 2, and 4 all show the identical structural
-shape (`Sort` node present, full backlog scan, no `LIMIT` pushdown). Only
-scalar equality, a query shape no production code path in this
-repository emits, gets the cheap plan.
+**Confirmed: operator, not cardinality, at the three cardinalities
+tested (1, 2, and 4)** — now on a genuinely blind result, not just the
+cardinality-1 comparison alone. `ANY()` defeats sort-elision on
+`idx_harvest_tq_poll` at every array size this record measured: all
+three show the identical structural shape (`Sort` node present, full
+backlog scan, no `LIMIT` pushdown). Only scalar equality, a query shape
+no production code path in this repository emits, gets the cheap plan.
+This record does not claim coverage beyond those three points — see "For
+the named decider" below for exactly what is and isn't established for
+cardinalities not measured here.
 
 **This both answers its own question and deepens ledger #5's original,
 still-only-partially-resolved discrepancy against issue #1177.**
