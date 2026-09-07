@@ -7826,4 +7826,136 @@ mod tests {
         apply_activity_requirements(&mut demands, &std::collections::HashMap::new());
         assert_eq!(demands[0].required_capabilities, None);
     }
+
+    // -----------------------------------------------------------------------
+    // Dispatch channel (issue #1312)
+    // -----------------------------------------------------------------------
+
+    /// The gates the by-id claim must keep, one distinctive fragment each.
+    const CLAIM_GATES: &[&str] = &[
+        "AND NOT (harvest_task_queue.queue_name = ANY(paused_queues.names))",
+        "schedule_to_close_at IS NULL",
+        "sticky_worker_id IS NULL",
+        "session_id IS NULL",
+        "concurrency_key IS NULL",
+        "required_build_id IS NULL",
+        "AND e.state = 'PAUSED'",
+        "OR NOT (activity_name = ANY($6))",
+        "OR NOT (activity_name = ANY(paused_activities.names))",
+        "required_capabilities IS NULL",
+        "rate_limit_key IS NULL",
+        "AND state = 'PENDING'",
+        "AND scheduled_at <= NOW()",
+        "LIMIT 1 FOR UPDATE SKIP LOCKED",
+    ];
+
+    #[test]
+    fn by_id_claim_query_is_the_base_query_plus_exactly_one_predicate() {
+        let base = claim_task_query();
+        let by_id = claim_task_by_id_query();
+        let predicate = "AND harvest_task_queue.id = $7 ";
+
+        assert_eq!(by_id.matches(predicate).count(), 1);
+        assert_eq!(
+            by_id.replace(predicate, ""),
+            base,
+            "the by-id query must differ from the base query by one predicate only"
+        );
+    }
+
+    #[test]
+    fn by_id_claim_query_keeps_every_gate() {
+        let by_id = claim_task_by_id_query();
+        for gate in CLAIM_GATES {
+            assert!(by_id.contains(gate), "by-id claim query dropped: {gate}");
+        }
+    }
+
+    #[test]
+    fn fenced_by_id_claim_query_keeps_every_gate_and_the_fence() {
+        let fenced = claim_task_by_id_query_fenced();
+        for gate in CLAIM_GATES {
+            assert!(
+                fenced.contains(gate),
+                "fenced by-id claim query dropped: {gate}"
+            );
+        }
+        assert!(fenced.contains("FROM harvest_shard_generation"));
+        assert!(fenced.contains("WHERE shard_id = $7 AND generation = $8"));
+        assert!(fenced.contains("CROSS JOIN worker_info CROSS JOIN fence "));
+    }
+
+    #[test]
+    fn fenced_by_id_claim_query_is_the_fenced_query_plus_exactly_one_predicate() {
+        let predicate = "AND harvest_task_queue.id = $9 ";
+        let fenced = claim_task_by_id_query_fenced();
+
+        assert_eq!(fenced.matches(predicate).count(), 1);
+        assert_eq!(fenced.replace(predicate, ""), claim_task_query_fenced());
+    }
+
+    #[test]
+    fn by_id_claim_binds_the_task_id_after_the_base_binds() {
+        // The unfenced form binds `$1..$6` exactly as the base query does, so
+        // the task id takes the next free position. The fenced form adds the
+        // shard and generation binds first, so the task id takes `$9`.
+        for bind in ["$1", "$2", "$3", "$4", "$5", "$6"] {
+            assert!(claim_task_by_id_query().contains(bind));
+            assert!(claim_task_by_id_query_fenced().contains(bind));
+        }
+        assert!(!claim_task_by_id_query().contains("$8"));
+        assert!(!claim_task_by_id_query().contains("$9"));
+        assert!(claim_task_by_id_query_fenced().contains("$7"));
+        assert!(claim_task_by_id_query_fenced().contains("$8"));
+    }
+
+    #[test]
+    fn the_by_id_predicate_lands_inside_the_candidate_cte() {
+        let by_id = claim_task_by_id_query();
+        let predicate = by_id
+            .find("AND harvest_task_queue.id = $7")
+            .expect("predicate");
+        let candidate = by_id.find("candidate AS (").expect("candidate CTE");
+        let claimed = by_id.find("claimed AS (").expect("claimed CTE");
+        assert!(
+            candidate < predicate && predicate < claimed,
+            "the by-id predicate must sit inside the candidate CTE"
+        );
+    }
+
+    #[test]
+    fn due_dispatch_hints_query_orders_for_the_poll_index() {
+        let sql = due_dispatch_hints_query();
+        assert!(sql.contains("WHERE queue_name = $1"));
+        assert!(sql.contains("AND state = 'PENDING'"));
+        assert!(sql.contains("AND scheduled_at <= NOW()"));
+        assert!(sql.contains("ORDER BY priority DESC, scheduled_at ASC"));
+        assert!(sql.contains("LIMIT $2"));
+        assert!(sql.contains("priority"));
+    }
+
+    #[test]
+    fn dispatch_probe_query_reads_state_due_time_and_ownership() {
+        let sql = dispatch_probe_query();
+        assert!(sql.contains("SELECT state, scheduled_at, worker_id IS NOT NULL AS has_worker"));
+        assert!(sql.contains("WHERE id = $1"));
+    }
+
+    #[test]
+    fn dispatch_probe_reports_pending_only_for_pending_rows() {
+        let probe = |state: &str| DispatchProbe {
+            state: state.to_string(),
+            scheduled_at: Utc::now(),
+            has_worker: false,
+        };
+        assert!(probe("PENDING").is_pending());
+        assert!(!probe("RUNNING").is_pending());
+        assert!(!probe("COMPLETED").is_pending());
+    }
+
+    #[test]
+    fn primary_repend_returns_every_hint_column() {
+        let sql = primary_repend_workflow_task_query();
+        assert!(sql.contains("RETURNING id, queue_name, scheduled_at, priority"));
+    }
 }

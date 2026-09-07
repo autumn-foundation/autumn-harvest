@@ -28,6 +28,7 @@ const EXPECTED: &[(&str, &str)] = &[
     ("SCHED_AFTER_START_BEFORE_ADVANCE", "chaos_point"),
     ("POISON_RECLAIM_BEFORE_LOAD", "chaos_fallible"),
     ("NOTIFY_TASK_ENQUEUED", "chaos_drop_notify"),
+    ("DISPATCH_AFTER_CLAIM_BEFORE_ACK", "chaos_point"),
 ];
 
 /// The wiring macros a production call site may use.
