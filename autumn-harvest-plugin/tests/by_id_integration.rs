@@ -956,20 +956,28 @@ async fn by_id_base_route_trailing_slash_rejects_empty_workflow_id() {
 
 /// issue #1353: a sibling by-id route can be reached with an empty
 /// `workflow_id` via a non-final empty segment (`.../order_flow//stack`).
-/// That previously resolved (200) by accident of `matchit`'s empty-segment
-/// matching — a router detail, not a documented contract. It must now reject
-/// 400, consistent with the base route.
+/// `seed()` calls the engine directly, below the new HTTP-layer guard. A row
+/// with `workflow_id = ""` can therefore still exist. This reconstructs the
+/// exact pre-fix asymmetry. This route resolved such a row (200) by
+/// accident of `matchit`'s empty-segment matching -- a router detail, not a
+/// documented contract. The base route 404'd for the same row instead. It
+/// must now reject 400 here too, consistent with the base route.
 #[tokio::test]
 async fn by_id_sibling_route_rejects_empty_workflow_id() {
     let (url, _c) = setup_database().await;
     let pool = build_pool(&url);
+    let mut conn = pool.get().await.expect("conn");
+    seed(&mut conn, "order_flow", "", "RUNNING", 0).await;
+    drop(conn);
+
     let app = build_app(&pool, true);
 
     let resp = send(&app, get("/workflows/by-id/order_flow//stack")).await;
     assert_eq!(
         resp.status,
         StatusCode::BAD_REQUEST,
-        "empty workflow_id on a sibling route must be rejected 400: {}",
+        "empty workflow_id on a sibling route must be rejected 400 even for \
+         a pre-existing row: {}",
         resp.body
     );
     assert_eq!(resp.body["detail"], json!("workflow_id must not be empty"));
@@ -995,5 +1003,82 @@ async fn start_with_omitted_workflow_id_still_auto_generates() {
             .is_some_and(|id| !id.is_empty()),
         "an omitted workflow_id must still auto-generate a non-empty id: {}",
         resp.body
+    );
+}
+
+// ── issue #1353 review (correctness pass): the empty-`workflow_id` guard
+// must cover every route that can create a fresh execution, not only
+// `POST /workflows/{name}/start`. `signal-with-start`, `update-with-start`
+// and `batch_start` each parse their own request struct. Each can reach the
+// DB with an unvalidated `workflow_id`. Each needs its own call site.
+
+/// issue #1353: `signal-with-start`'s `workflow_id` is a mandatory `String`,
+/// not `Option<String>` like plain start. An empty string deserializes
+/// cleanly and must be rejected explicitly.
+#[tokio::test]
+async fn signal_with_start_rejects_empty_workflow_id_400() {
+    let (url, _c) = setup_database().await;
+    let pool = build_pool(&url);
+    let app = build_app(&pool, true);
+
+    let resp = send(
+        &app,
+        post_json(
+            "/workflows/progress_wf/signal-with-start",
+            &json!({"workflow_id": "", "signal_name": "approve"}),
+        ),
+    )
+    .await;
+    assert_eq!(resp.status, StatusCode::BAD_REQUEST, "body: {}", resp.body);
+    assert_eq!(resp.body["error"], json!("workflow_id must not be empty"));
+}
+
+/// issue #1353: `update-with-start`'s `workflow_id` is a mandatory `String`,
+/// same gap as `signal-with-start`.
+#[tokio::test]
+async fn update_with_start_rejects_empty_workflow_id_400() {
+    let (url, _c) = setup_database().await;
+    let pool = build_pool(&url);
+    let app = build_app(&pool, true);
+
+    let resp = send(
+        &app,
+        post_json(
+            "/workflows/progress_wf/update-with-start",
+            &json!({"workflow_id": "", "update_name": "bump"}),
+        ),
+    )
+    .await;
+    assert_eq!(resp.status, StatusCode::BAD_REQUEST, "body: {}", resp.body);
+    assert_eq!(resp.body["error"], json!("workflow_id must not be empty"));
+}
+
+/// issue #1353: a `batch_start` item with an explicit empty `workflow_id` is
+/// rejected per-item, not silently started under `""`. The batch itself
+/// still 200s in non-atomic mode; the item carries `status: "rejected"`.
+#[tokio::test]
+async fn batch_start_rejects_item_with_empty_workflow_id() {
+    let (url, _c) = setup_database().await;
+    let pool = build_pool(&url);
+    let app = build_app(&pool, true);
+
+    let resp = send(
+        &app,
+        post_json(
+            "/workflows/batch_start",
+            &json!({
+                "items": [{"workflow_name": "progress_wf", "workflow_id": ""}],
+                "atomic": false
+            }),
+        ),
+    )
+    .await;
+    assert_eq!(resp.status, StatusCode::OK, "body: {}", resp.body);
+    let results = resp.body["results"].as_array().expect("results array");
+    assert_eq!(results.len(), 1);
+    assert_eq!(results[0]["status"], json!("rejected"));
+    assert_eq!(
+        results[0]["error"],
+        json!("workflow_id must not be empty")
     );
 }

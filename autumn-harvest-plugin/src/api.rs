@@ -15769,11 +15769,15 @@ fn workflow_resolving_throttle(
 const MAX_START_IDEMPOTENCY_KEY_LEN: usize = 512;
 
 /// Reject an explicitly-empty `workflow_id` (issue #1353), shared by
-/// `start_workflow` and `rerun_workflow`'s override field. Omitting the field
-/// is untouched: `None` still auto-generates a UUID, or reuses the source's
-/// key on a rerun. An explicit empty string is different -- a degenerate
-/// business id the by-id route family cannot address consistently. Reject it
-/// at the boundary instead of accepting it as a live, addressable identifier.
+/// `start_workflow`, `signal_with_start_workflow`, `update_with_start_workflow`,
+/// and `rerun_workflow`'s override field. Omitting the field is untouched:
+/// `None` still auto-generates a UUID, or reuses the source's key on a
+/// rerun. An explicit empty string is different -- a degenerate business id
+/// the by-id route family cannot address consistently. Reject it at the
+/// boundary instead of accepting it as a live, addressable identifier.
+///
+/// A whitespace-only id is out of scope. It is a normal, non-empty final
+/// path segment, so it does not trigger the router gap this issue addresses.
 fn reject_empty_workflow_id(raw: Option<&str>) -> Result<(), axum::response::Response> {
     use axum::response::IntoResponse as _;
     if raw == Some("") {
@@ -19088,6 +19092,11 @@ async fn batch_start_workflows(
                 "workflow '{}' is a registered DAG; use POST /dags/{{name}}/trigger",
                 item.workflow_name
             ))
+        } else if item.workflow_id.as_deref() == Some("") {
+            // issue #1353: an explicit empty workflow_id is a degenerate
+            // business id the by-id route family cannot address consistently.
+            // Reject it per-item, same as the standalone start route.
+            Some("workflow_id must not be empty".to_string())
         } else if item.workflow_id.is_none()
             && workflow_has_resolving_debounce(
                 &runtime.registry,
@@ -20500,6 +20509,14 @@ pub(crate) async fn signal_with_start_workflow(
 ) -> axum::response::Response {
     use axum::response::IntoResponse as _;
 
+    // issue #1353: reject an explicit empty workflow_id before any further
+    // work. Cheap, no DB dependency, so it runs ahead of everything else.
+    // Unlike plain start, workflow_id is mandatory here, but the wire type is
+    // a bare String, so an empty string still deserializes cleanly.
+    if let Err(resp) = reject_empty_workflow_id(Some(request.workflow_id.as_str())) {
+        return resp;
+    }
+
     let route = "POST /workflows/{workflow_name}/signal-with-start";
 
     if matches!(
@@ -21201,6 +21218,14 @@ async fn update_with_start_workflow(
     Json(request): Json<UpdateWithStartRequest>,
 ) -> axum::response::Response {
     use axum::response::IntoResponse as _;
+
+    // issue #1353: reject an explicit empty workflow_id before any further
+    // work. Cheap, no DB dependency, so it runs ahead of everything else.
+    // Unlike plain start, workflow_id is mandatory here, but the wire type is
+    // a bare String, so an empty string still deserializes cleanly.
+    if let Err(resp) = reject_empty_workflow_id(Some(request.workflow_id.as_str())) {
+        return resp;
+    }
 
     let route = "POST /workflows/{workflow_name}/update-with-start";
 
