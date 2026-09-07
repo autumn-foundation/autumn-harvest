@@ -1691,3 +1691,10 @@ standalone note rather than part of the claim-path attribution table above:
 * [`docs/performance-sqlite-runtime-drive.md`](performance-sqlite-runtime-drive.md)
   — the first profiling harness for `autumn-harvest-sqlite`; findings only, no
   local fix cleared the floor.
+* [`docs/performance-redis-claim-roundtrip.md`](performance-redis-claim-roundtrip.md)
+  — a duplicate `ensure_group` round trip on every `RedisTaskQueue::claim`
+  poll, measured in socket-syscall counts (PR #1387).
+* [`docs/performance-schedule-bulk-audit.md`](performance-schedule-bulk-audit.md)
+  — the per-row audit-insert N+1 in the Vantage schedules bulk-pause/resume
+  actions (issue #951), batched into one chunked insert call per shard
+  (multiple statements past 4,999 matched rows).
