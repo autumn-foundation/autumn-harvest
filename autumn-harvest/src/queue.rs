@@ -503,6 +503,7 @@ pub async fn enqueue(conn: &mut AsyncPgConnection, params: &EnqueueParams) -> Ha
         &params.queue_name,
         params.scheduled_at,
         params.priority,
+        crate::dispatch::DispatchKind::from(params.task_type.as_str()),
     );
 
     Ok(task_id)
@@ -1505,25 +1506,134 @@ pub const fn dispatch_probe_query() -> &'static str {
 /// gate, and each reference cycles through the release backoff instead. The
 /// anti-join is one probe per statement, not one per row, because the query
 /// binds exactly one queue name.
+///
+/// `id` closes the order. Two rows can share a priority and a due time, so
+/// without it the order is not total and a page boundary is ambiguous. The
+/// keyset walk in [`due_dispatch_hints_after_query`] needs a total order to
+/// name the position it stopped at.
 #[must_use]
 pub const fn due_dispatch_hints_query() -> &'static str {
-    "SELECT id, queue_name, scheduled_at, priority \
+    "SELECT id, queue_name, scheduled_at, priority, task_type \
      FROM harvest_task_queue \
      WHERE queue_name = $1 \
        AND state = 'PENDING' \
        AND scheduled_at <= NOW() \
        AND NOT EXISTS (SELECT 1 FROM harvest_queue_pauses qp WHERE qp.queue_name = $1) \
-     ORDER BY priority DESC, scheduled_at ASC \
+     ORDER BY priority DESC, scheduled_at ASC, id ASC \
      LIMIT $2"
 }
 
-/// Every due `PENDING` row for `queues`, as dispatch hints (issue #1312).
+/// SQL for [`due_dispatch_hints_page`] with a cursor (issue #1312).
+///
+/// Same shape as [`due_dispatch_hints_query`] plus one keyset predicate, and
+/// the same bind order for `$1` and `$2`. The cursor binds to `$3` priority,
+/// `$4` due time and `$5` id.
+///
+/// **Why the sweep must paginate.** The sweep cannot see most claim gates.
+/// Build routing, an activity pause, a concurrency cap, a capability match and
+/// a rate limit all live in the claim predicate, not in this statement. A page
+/// of rows that every worker rejects therefore looks claimable to the sweep. A
+/// sweep that always reads the top page republishes exactly those rows on every
+/// pass, and no row below the page is ever referenced. Under dispatch the
+/// worker runs no Postgres claim after an empty read, so such a row is never
+/// claimed at all. The keyset walk carries the sweep past the page instead.
+///
+/// The predicate is written as a disjunction on `(priority, scheduled_at, id)`
+/// rather than as a row comparison, because `priority` descends while the other
+/// two ascend. It keeps `priority` and `scheduled_at` as plain range tests on
+/// the leading columns of `idx_harvest_tq_poll`, so the index still serves the
+/// walk.
+#[must_use]
+pub const fn due_dispatch_hints_after_query() -> &'static str {
+    "SELECT id, queue_name, scheduled_at, priority, task_type \
+     FROM harvest_task_queue \
+     WHERE queue_name = $1 \
+       AND state = 'PENDING' \
+       AND scheduled_at <= NOW() \
+       AND NOT EXISTS (SELECT 1 FROM harvest_queue_pauses qp WHERE qp.queue_name = $1) \
+       AND (priority < $3 \
+            OR (priority = $3 AND scheduled_at > $4) \
+            OR (priority = $3 AND scheduled_at = $4 AND id > $5)) \
+     ORDER BY priority DESC, scheduled_at ASC, id ASC \
+     LIMIT $2"
+}
+
+/// A position in the reconcile sweep's walk over one queue.
+///
+/// The three fields are the sweep's sort key, in order. Together they name one
+/// row, so the next page starts strictly below it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DispatchCursor {
+    /// Priority of the last row of the page.
+    pub priority: i32,
+    /// Due time of the last row of the page.
+    pub scheduled_at: DateTime<Utc>,
+    /// Identifier of the last row of the page.
+    pub id: Uuid,
+}
+
+/// One page of the reconcile sweep over one queue.
+#[derive(Debug, Clone, Default)]
+pub struct DispatchHintPage {
+    /// The hints this page carries, in sweep order.
+    pub hints: Vec<crate::dispatch::DispatchHint>,
+    /// The position of the last row, or `None` for an empty page.
+    pub cursor: Option<DispatchCursor>,
+}
+
+/// One page of due `PENDING` rows for `queue`, as dispatch hints (issue #1312).
 ///
 /// This is the reconcile sweep's read. It is the durability floor for the
 /// channel. A channel restart, a lost reference, a dropped hint and a crash
 /// between commit and publish all converge through it.
 ///
-/// `limit` bounds the rows returned per queue.
+/// `limit` bounds the rows returned. `after` continues a walk from an earlier
+/// page; `None` starts at the top of the queue. The returned cursor names the
+/// last row of the page. See [`due_dispatch_hints_after_query`] for why the
+/// sweep walks rather than re-reading the top page.
+///
+/// # Errors
+///
+/// Returns [`crate::error::HarvestError::Database`] on query failure.
+pub async fn due_dispatch_hints_page(
+    conn: &mut AsyncPgConnection,
+    queue: &str,
+    limit: usize,
+    after: Option<&DispatchCursor>,
+) -> HarvestResult<DispatchHintPage> {
+    let capped = i64::try_from(limit).unwrap_or(i64::MAX);
+    let rows: Vec<PendingHintRow> = match after {
+        None => {
+            diesel::sql_query(due_dispatch_hints_query())
+                .bind::<diesel::sql_types::Text, _>(queue)
+                .bind::<diesel::sql_types::BigInt, _>(capped)
+                .load(conn)
+                .await
+        }
+        Some(cursor) => {
+            diesel::sql_query(due_dispatch_hints_after_query())
+                .bind::<diesel::sql_types::Text, _>(queue)
+                .bind::<diesel::sql_types::BigInt, _>(capped)
+                .bind::<diesel::sql_types::Integer, _>(cursor.priority)
+                .bind::<diesel::sql_types::Timestamptz, _>(cursor.scheduled_at)
+                .bind::<diesel::sql_types::Uuid, _>(cursor.id)
+                .load(conn)
+                .await
+        }
+    }
+    .map_err(crate::error::database_error)?;
+
+    let cursor = rows.last().map(PendingHintRow::to_cursor);
+    Ok(DispatchHintPage {
+        hints: rows.into_iter().map(PendingHintRow::into_hint).collect(),
+        cursor,
+    })
+}
+
+/// The first page of due `PENDING` rows for every queue in `queues`.
+///
+/// `limit` bounds the rows returned per queue. A caller that must reach rows
+/// below the first page walks with [`due_dispatch_hints_page`] instead.
 ///
 /// # Errors
 ///
@@ -1533,16 +1643,10 @@ pub async fn due_dispatch_hints(
     queues: &[String],
     limit: usize,
 ) -> HarvestResult<Vec<crate::dispatch::DispatchHint>> {
-    let capped = i64::try_from(limit).unwrap_or(i64::MAX);
     let mut hints = Vec::new();
     for queue in queues {
-        let rows: Vec<PendingHintRow> = diesel::sql_query(due_dispatch_hints_query())
-            .bind::<diesel::sql_types::Text, _>(queue)
-            .bind::<diesel::sql_types::BigInt, _>(capped)
-            .load(conn)
-            .await
-            .map_err(crate::error::database_error)?;
-        hints.extend(rows.into_iter().map(PendingHintRow::into_hint));
+        let page = due_dispatch_hints_page(conn, queue, limit, None).await?;
+        hints.extend(page.hints);
     }
     Ok(hints)
 }
@@ -1558,9 +1662,20 @@ struct PendingHintRow {
     scheduled_at: DateTime<Utc>,
     #[diesel(sql_type = diesel::sql_types::Integer)]
     priority: i32,
+    #[diesel(sql_type = diesel::sql_types::Text)]
+    task_type: String,
 }
 
 impl PendingHintRow {
+    /// The sweep position of this row.
+    const fn to_cursor(&self) -> DispatchCursor {
+        DispatchCursor {
+            priority: self.priority,
+            scheduled_at: self.scheduled_at,
+            id: self.id,
+        }
+    }
+
     /// The hint for this row, borrowing the row.
     fn to_hint(&self) -> crate::dispatch::DispatchHint {
         crate::dispatch::DispatchHint {
@@ -1569,6 +1684,7 @@ impl PendingHintRow {
             scheduled_at: self.scheduled_at,
             priority: self.priority,
             shard: None,
+            kind: Some(crate::dispatch::DispatchKind::from(self.task_type.as_str())),
         }
     }
 
@@ -1582,6 +1698,7 @@ impl PendingHintRow {
             // v1 rejects Redis dispatch on a sharded runtime at validation, so
             // a hint never has to name a shard. The field carries the follow-up.
             shard: None,
+            kind: Some(crate::dispatch::DispatchKind::from(self.task_type.as_str())),
         }
     }
 }
@@ -1589,7 +1706,7 @@ impl PendingHintRow {
 /// SQL for [`record_pending_hints`]. Reads the hint columns for named rows.
 #[must_use]
 pub const fn pending_hint_rows_query() -> &'static str {
-    "SELECT id, queue_name, scheduled_at, priority \
+    "SELECT id, queue_name, scheduled_at, priority, task_type \
      FROM harvest_task_queue \
      WHERE id = ANY($1) \
        AND state = 'PENDING'"
@@ -1604,6 +1721,7 @@ pub(crate) fn record_pending_hint(
     queue_name: &str,
     scheduled_at: DateTime<Utc>,
     priority: i32,
+    kind: crate::dispatch::DispatchKind,
 ) {
     if !crate::dispatch::is_installed() {
         return;
@@ -1614,6 +1732,7 @@ pub(crate) fn record_pending_hint(
         scheduled_at,
         priority,
         shard: None,
+        kind: Some(kind),
     });
 }
 
@@ -2431,14 +2550,14 @@ pub async fn requeue_for_retry(
     let next_run = Utc::now() + delay;
     let changeset = PendingRequeueChangeset::new(next_run, previous_error.to_string());
 
-    let (queue_name, priority) = diesel::update(
+    let (queue_name, priority, task_type) = diesel::update(
         dsl::harvest_task_queue
             .find(task_id)
             .filter(dsl::state.eq("RUNNING")),
     )
     .set(&changeset)
-    .returning((dsl::queue_name, dsl::priority))
-    .get_result::<(String, i32)>(conn)
+    .returning((dsl::queue_name, dsl::priority, dsl::task_type))
+    .get_result::<(String, i32, String)>(conn)
     .await
     .optional()
     .map_err(crate::error::database_error)?
@@ -2448,7 +2567,13 @@ pub async fn requeue_for_retry(
 
     // Dispatch hint (issue #1312). The retry is due at `next_run`, so the
     // channel parks the reference until then.
-    record_pending_hint(task_id, &queue_name, next_run, priority);
+    record_pending_hint(
+        task_id,
+        &queue_name,
+        next_run,
+        priority,
+        crate::dispatch::DispatchKind::from(task_type.as_str()),
+    );
 
     // Notify is best-effort: the task is already durably PENDING after the
     // UPDATE above and will be claimed on the next poll cycle even if
@@ -2533,7 +2658,13 @@ pub async fn requeue_workflow_task_nd_blocked(
     // Dispatch hint (issue #1312). No `pg_notify` fires here on purpose. The
     // channel parks a reference until `next_run` instead. That costs a poller
     // nothing and removes the backlog scan when the backoff elapses.
-    record_pending_hint(task_id, &queue_name, next_run, priority);
+    record_pending_hint(
+        task_id,
+        &queue_name,
+        next_run,
+        priority,
+        crate::dispatch::DispatchKind::Workflow,
+    );
 
     Ok(())
 }
@@ -2634,7 +2765,13 @@ pub async fn requeue_workflow_task_after_panic(
     // Dispatch hint (issue #1312). No `pg_notify` fires here on purpose. The
     // channel parks a reference until `next_run` instead. That costs a poller
     // nothing and removes the backlog scan when the backoff elapses.
-    record_pending_hint(task_id, &queue_name, next_run, priority);
+    record_pending_hint(
+        task_id,
+        &queue_name,
+        next_run,
+        priority,
+        crate::dispatch::DispatchKind::Workflow,
+    );
 
     Ok(())
 }
@@ -2789,7 +2926,13 @@ pub async fn force_retry_activity_now(
         crate::notify::notify_task_enqueued(conn, &actual_queue, task_id).await?;
         // Dispatch hint (issue #1312). Only when the row actually advanced: an
         // already-eligible row was hinted when it was first made `PENDING`.
-        record_pending_hint(task_id, &actual_queue, actual_scheduled_at, row.priority);
+        record_pending_hint(
+            task_id,
+            &actual_queue,
+            actual_scheduled_at,
+            row.priority,
+            crate::dispatch::DispatchKind::Activity,
+        );
     }
 
     Ok(RetryActivityOutcome {
@@ -2867,14 +3010,14 @@ pub async fn reschedule_task(
 ) -> HarvestResult<()> {
     use crate::schema::harvest_task_queue::dsl;
 
-    let (queue_name, priority) = diesel::update(
+    let (queue_name, priority, task_type) = diesel::update(
         dsl::harvest_task_queue
             .find(task_id)
             .filter(dsl::state.eq("RUNNING")),
     )
     .set(CleanContinuationChangeset::new(scheduled_at))
-    .returning((dsl::queue_name, dsl::priority))
-    .get_result::<(String, i32)>(conn)
+    .returning((dsl::queue_name, dsl::priority, dsl::task_type))
+    .get_result::<(String, i32, String)>(conn)
     .await
     .optional()
     .map_err(crate::error::database_error)?
@@ -2884,7 +3027,13 @@ pub async fn reschedule_task(
 
     crate::notify::notify_task_enqueued(conn, &queue_name, task_id).await?;
     // Dispatch hint (issue #1312).
-    record_pending_hint(task_id, &queue_name, scheduled_at, priority);
+    record_pending_hint(
+        task_id,
+        &queue_name,
+        scheduled_at,
+        priority,
+        crate::dispatch::DispatchKind::from(task_type.as_str()),
+    );
 
     Ok(())
 }
@@ -2909,7 +3058,7 @@ pub async fn defer_rate_limited_task(
 ) -> HarvestResult<()> {
     use crate::schema::harvest_task_queue::dsl;
 
-    let (queue_name, priority) = diesel::update(
+    let (queue_name, priority, task_type) = diesel::update(
         dsl::harvest_task_queue
             .find(task_id)
             .filter(dsl::state.eq("RUNNING")),
@@ -2922,8 +3071,8 @@ pub async fn defer_rate_limited_task(
             "GREATEST(attempt - 1, 0)",
         )),
     ))
-    .returning((dsl::queue_name, dsl::priority))
-    .get_result::<(String, i32)>(conn)
+    .returning((dsl::queue_name, dsl::priority, dsl::task_type))
+    .get_result::<(String, i32, String)>(conn)
     .await
     .optional()
     .map_err(crate::error::database_error)?
@@ -2933,7 +3082,13 @@ pub async fn defer_rate_limited_task(
 
     crate::notify::notify_task_enqueued(conn, &queue_name, task_id).await?;
     // Dispatch hint (issue #1312).
-    record_pending_hint(task_id, &queue_name, scheduled_at, priority);
+    record_pending_hint(
+        task_id,
+        &queue_name,
+        scheduled_at,
+        priority,
+        crate::dispatch::DispatchKind::from(task_type.as_str()),
+    );
 
     Ok(())
 }
@@ -3629,7 +3784,7 @@ const fn release_suspended_workflow_claim_query() -> &'static str {
        AND state = 'RUNNING' \
        AND worker_id = $2 \
        AND crash_strikes = $3 \
-     RETURNING id, queue_name, scheduled_at, priority"
+     RETURNING id, queue_name, scheduled_at, priority, task_type"
 }
 
 /// Release a still-claimed, but replay-suspended-empty-handed, workflow task
@@ -4206,7 +4361,7 @@ pub async fn wake_workflow_task(
     // NOTIFY was emitted for it, so a LISTEN-based worker would sleep until the
     // next poll interval. Notify those queues too so resume re-arms promptly.
     let already_due: Vec<PendingHintRow> = diesel::sql_query(
-        "SELECT id, queue_name, scheduled_at, priority FROM harvest_task_queue \
+        "SELECT id, queue_name, scheduled_at, priority, task_type FROM harvest_task_queue \
          WHERE workflow_exec_id = $1 \
            AND task_type = 'workflow' \
            AND state = 'PENDING' \
@@ -4300,7 +4455,7 @@ const fn primary_repend_workflow_task_query() -> &'static str {
            (state = 'RUNNING' AND worker_id IS NULL AND started_at IS NULL) \
            OR (state = 'PENDING' AND scheduled_at > $2 AND activity_name = 'mixed_signal_suspension') \
        ) \
-     RETURNING id, queue_name, scheduled_at, priority"
+     RETURNING id, queue_name, scheduled_at, priority, task_type"
 }
 
 /// SQL for [`wake_workflow_task`]'s dropped-wake fallback: marks a still-claimed
@@ -7072,7 +7227,7 @@ mod tests {
     fn release_suspended_workflow_claim_query_returns_every_hint_column() {
         let sql = release_suspended_workflow_claim_query();
         assert!(
-            sql.contains("RETURNING id, queue_name, scheduled_at, priority"),
+            sql.contains("RETURNING id, queue_name, scheduled_at, priority, task_type"),
             "the release must return the dispatch hint columns (issue #1312)"
         );
     }
@@ -8450,9 +8605,48 @@ mod tests {
         assert!(sql.contains("WHERE queue_name = $1"));
         assert!(sql.contains("AND state = 'PENDING'"));
         assert!(sql.contains("AND scheduled_at <= NOW()"));
-        assert!(sql.contains("ORDER BY priority DESC, scheduled_at ASC"));
+        assert!(sql.contains("ORDER BY priority DESC, scheduled_at ASC, id ASC"));
         assert!(sql.contains("LIMIT $2"));
         assert!(sql.contains("priority"));
+    }
+
+    /// The keyset predicate is the whole of the sweep pagination (issue #1312).
+    /// A page of gated rows must not hide every row below it.
+    #[test]
+    fn due_dispatch_hints_after_query_pins_the_keyset_predicate() {
+        let sql = due_dispatch_hints_after_query();
+        assert!(
+            sql.contains(
+                "AND (priority < $3 \
+                 OR (priority = $3 AND scheduled_at > $4) \
+                 OR (priority = $3 AND scheduled_at = $4 AND id > $5))"
+            ),
+            "the keyset predicate must match the sweep order exactly: {sql}"
+        );
+    }
+
+    /// The order is total. Two rows that share a priority and a due time are
+    /// separated by `id`, so a page boundary is never ambiguous.
+    #[test]
+    fn due_dispatch_hints_after_query_walks_the_poll_index_order() {
+        let sql = due_dispatch_hints_after_query();
+        assert!(sql.contains("WHERE queue_name = $1"));
+        assert!(sql.contains("AND state = 'PENDING'"));
+        assert!(sql.contains("AND scheduled_at <= NOW()"));
+        assert!(sql.contains("ORDER BY priority DESC, scheduled_at ASC, id ASC"));
+        assert!(sql.contains("LIMIT $2"));
+    }
+
+    /// The paginated read keeps every gate the unpaginated read has.
+    #[test]
+    fn due_dispatch_hints_after_query_skips_a_paused_queue() {
+        let sql = due_dispatch_hints_after_query();
+        assert!(
+            sql.contains(
+                "AND NOT EXISTS (SELECT 1 FROM harvest_queue_pauses qp WHERE qp.queue_name = $1)"
+            ),
+            "the paginated sweep must not republish rows of a paused queue"
+        );
     }
 
     #[test]
@@ -8488,6 +8682,6 @@ mod tests {
     #[test]
     fn primary_repend_returns_every_hint_column() {
         let sql = primary_repend_workflow_task_query();
-        assert!(sql.contains("RETURNING id, queue_name, scheduled_at, priority"));
+        assert!(sql.contains("RETURNING id, queue_name, scheduled_at, priority, task_type"));
     }
 }

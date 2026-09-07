@@ -163,6 +163,33 @@ fn retrying_activity_workflow(ctx: &WorkflowContext, input: serde_json::Value) -
     })
 }
 
+/// An activity that runs inline and takes a while.
+///
+/// A local activity runs inside the workflow task, so the workflow keeps its
+/// workflow permit for the whole call. A plain sleep in the workflow body
+/// cannot do this: the engine sees a suspension with no commands and fails the
+/// run.
+fn slow_local_activity(
+    _ctx: &autumn_harvest::ActivityContext,
+    input: serde_json::Value,
+) -> BoxFut<'_> {
+    Box::pin(async move {
+        tokio::time::sleep(Duration::from_millis(800)).await;
+        Ok(input)
+    })
+}
+
+/// A workflow that holds its workflow permit for a while.
+///
+/// The hold makes a second concurrent workflow row observable in the table.
+fn slow_workflow(ctx: &WorkflowContext, input: serde_json::Value) -> BoxFut<'_> {
+    Box::pin(async move {
+        ctx.execute_local_activity_raw("slow_local", input, None, None)
+            .await
+            .map_err(|e| e.to_string())
+    })
+}
+
 /// A workflow with no activities, so the run needs exactly one claim.
 fn trivial_workflow(_ctx: &WorkflowContext, input: serde_json::Value) -> BoxFut<'_> {
     Box::pin(async move { Ok(input) })
@@ -300,6 +327,24 @@ fn make_worker(
     activities: Vec<ActivityInfo>,
     shared_state: autumn_harvest::context::SharedState,
 ) -> Worker {
+    make_worker_with(
+        worker_config("default", vec![ShardId::new(0)]),
+        workflows,
+        activities,
+        shared_state,
+    )
+}
+
+/// Build a worker on a caller-supplied runtime config.
+///
+/// A case that needs its own queue, its own build id or its own poll interval
+/// goes through here.
+fn make_worker_with(
+    config: WorkerRuntimeConfig,
+    workflows: Vec<WorkflowInfo>,
+    activities: Vec<ActivityInfo>,
+    shared_state: autumn_harvest::context::SharedState,
+) -> Worker {
     let telemetry = Arc::new(TelemetryConfig::builder().build());
     let registry = Arc::new(HandlerRegistry::with_state_and_telemetry(
         workflows,
@@ -307,11 +352,18 @@ fn make_worker(
         shared_state,
         telemetry,
     ));
-    Worker::new(worker_config("default", vec![ShardId::new(0)]), registry)
-        .expect("worker should build")
+    Worker::new(config, registry).expect("worker should build")
 }
 
 async fn start(conn: &mut AsyncPgConnection, workflow_name: &'static str) -> ExecutionId {
+    start_on(conn, workflow_name, "default").await
+}
+
+async fn start_on(
+    conn: &mut AsyncPgConnection,
+    workflow_name: &'static str,
+    queue: &str,
+) -> ExecutionId {
     let workflow_id = format!("{workflow_name}-{}", uuid::Uuid::new_v4());
     start_or_load_workflow_execution(
         conn,
@@ -321,7 +373,7 @@ async fn start(conn: &mut AsyncPgConnection, workflow_name: &'static str) -> Exe
             exec_id: ExecutionId::new_for_shard(ShardId::new(0)),
             input: serde_json::Value::Null,
             parent_id: None,
-            queue_name: "default",
+            queue_name: queue,
             execution_timeout: None,
             memo: None,
             search_attrs: None,
@@ -497,6 +549,7 @@ async fn hint_publishes_after_commit_not_before() {
         scheduled_at: chrono::Utc::now(),
         priority: 0,
         shard: None,
+        kind: Some(autumn_harvest::dispatch::DispatchKind::Workflow),
     };
 
     let observed = Arc::clone(&channel);
@@ -558,6 +611,7 @@ async fn redelivery_of_a_terminal_row_is_acked() {
             scheduled_at: chrono::Utc::now(),
             priority: 0,
             shard: None,
+            kind: Some(autumn_harvest::dispatch::DispatchKind::Workflow),
         }])
         .await
         .expect("republish");
@@ -1066,4 +1120,435 @@ async fn a_transactional_start_publishes_its_hint_on_finish() {
         task_ids,
         "finish must publish the hint the start raised"
     );
+}
+
+/// Deletes a case's own queue rows when the case ends, panic or not.
+///
+/// The database is shared across cases. A case that seeds a large gated
+/// backlog must not leave it behind for the next case to sweep.
+struct SeededQueueGuard {
+    url: String,
+    queue: String,
+}
+
+impl Drop for SeededQueueGuard {
+    fn drop(&mut self) {
+        let url = self.url.clone();
+        let queue = self.queue.clone();
+        // `Drop` is not async, and the current runtime may already be stopping.
+        // A short-lived thread with its own runtime answers both.
+        let cleared = std::thread::spawn(move || {
+            let Ok(runtime) = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+            else {
+                return;
+            };
+            runtime.block_on(async move {
+                let Ok(mut conn) = AsyncPgConnection::establish(&url).await else {
+                    return;
+                };
+                let _ = diesel::sql_query("DELETE FROM harvest_task_queue WHERE queue_name = $1")
+                    .bind::<diesel::sql_types::Text, _>(&queue)
+                    .execute(&mut conn)
+                    .await;
+            });
+        })
+        .join();
+        assert!(cleared.is_ok(), "the seeded-queue guard panicked");
+    }
+}
+
+/// A queue name no other case shares, so a seeded backlog stays local.
+fn unique_queue(prefix: &str) -> String {
+    format!("{prefix}_{}", uuid::Uuid::new_v4().simple())
+}
+
+/// Seed `count` due `PENDING` rows that no worker in the case can claim.
+///
+/// The gate is build routing: the rows demand a build id the worker does not
+/// carry, so the claim predicate rejects every one of them. The sweep cannot
+/// see that gate, which is exactly the condition finding F1 describes.
+async fn seed_gated_rows(conn: &mut AsyncPgConnection, queue: &str, count: i32, priority: i32) {
+    diesel::sql_query(
+        "INSERT INTO harvest_task_queue \
+         (queue_name, task_type, input, state, priority, scheduled_at, \
+          required_build_id, max_attempts) \
+         SELECT $1, 'workflow', '{}'::jsonb, 'PENDING', $2, \
+                NOW() - INTERVAL '1 minute', 'build-no-worker-carries', 1 \
+         FROM generate_series(1, $3)",
+    )
+    .bind::<diesel::sql_types::Text, _>(queue)
+    .bind::<diesel::sql_types::Integer, _>(priority)
+    .bind::<diesel::sql_types::Integer, _>(count)
+    .execute(conn)
+    .await
+    .expect("seed gated rows");
+}
+
+/// The keyset walk reaches a row that sits below a full page of gated rows
+/// (issue #1312).
+///
+/// The first page is gated rows only. The claimable row is below them, so an
+/// unpaginated sweep can never reference it. The cursor carries the walk past
+/// the page, and the second page holds the claimable row.
+#[tokio::test]
+async fn the_reconcile_sweep_walks_past_a_full_page_of_gated_rows() {
+    let _serial = DISPATCH_SERIAL.lock().await;
+    let (url, _c) = setup_test_database_url_or_env().await;
+    let queue = unique_queue("f1_page");
+    let _cleanup = SeededQueueGuard {
+        url: url.clone(),
+        queue: queue.clone(),
+    };
+
+    let mut conn = connect(&url).await;
+    seed_gated_rows(&mut conn, &queue, 1500, 5).await;
+    let exec_id = start_on(&mut conn, "dispatch_trivial", &queue).await;
+    let claimable = tasks_for(&mut conn, exec_id)
+        .await
+        .into_iter()
+        .next()
+        .expect("one workflow task")
+        .id;
+
+    let batch = 1000;
+    let first = autumn_harvest::queue::due_dispatch_hints_page(&mut conn, &queue, batch, None)
+        .await
+        .expect("first sweep page");
+    assert_eq!(first.hints.len(), batch, "the first page must be full");
+    assert!(
+        !first.hints.iter().any(|hint| hint.task_id == claimable),
+        "the claimable row sorts below a full page of gated rows"
+    );
+    let cursor = first.cursor.expect("a full page carries a cursor");
+
+    let second =
+        autumn_harvest::queue::due_dispatch_hints_page(&mut conn, &queue, batch, Some(&cursor))
+            .await
+            .expect("second sweep page");
+    assert!(
+        second.hints.len() < batch,
+        "the second page must be short, so the walk wraps"
+    );
+    assert!(
+        second.hints.iter().any(|hint| hint.task_id == claimable),
+        "the keyset walk must reach the row below the gated page"
+    );
+    assert!(
+        second.hints.iter().all(|hint| hint.task_id != cursor.id),
+        "the keyset predicate is exclusive of the cursor row"
+    );
+}
+
+/// A worker drains a claimable row that sits below a page of gated rows
+/// (issue #1312).
+///
+/// Without pagination every sweep republishes the same gated page and the
+/// claimable row is never referenced, so the run never completes.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_gated_page_does_not_starve_a_claimable_row() {
+    let _serial = DISPATCH_SERIAL.lock().await;
+    let (url, _c) = setup_test_database_url_or_env().await;
+    let queue = unique_queue("f1_worker");
+    let _cleanup = SeededQueueGuard {
+        url: url.clone(),
+        queue: queue.clone(),
+    };
+
+    let mut conn = connect(&url).await;
+    seed_gated_rows(&mut conn, &queue, 250, 5).await;
+    // The start runs before the install, so no hint reaches the channel. The
+    // reconcile sweep is then the only path from this row to the worker.
+    let exec_id = start_on(&mut conn, "dispatch_trivial", &queue).await;
+
+    let channel = Arc::new(MemoryDispatch::new());
+    let _guard = install_with(
+        &channel,
+        DispatchSettings {
+            reconcile_batch: 100,
+            reconcile_interval: Duration::from_millis(200),
+            release_backoff_cap: Duration::from_secs(2),
+            ..dispatch_settings()
+        },
+    );
+
+    let pool = build_pool(&url);
+    let worker = Arc::new(make_worker_with(
+        worker_config(&queue, vec![ShardId::new(0)]),
+        vec![wf_info("dispatch_trivial", trivial_workflow)],
+        vec![],
+        empty_shared_state(),
+    ));
+
+    let mut check = connect(&url).await;
+    with_worker(worker, pool, async {
+        wait_for_state(&mut check, exec_id, &["COMPLETED"], Duration::from_secs(45)).await;
+    })
+    .await;
+}
+
+/// A channel outage must not throttle the Postgres path to one claim per
+/// failed read (issue #1312).
+///
+/// The channel fails every call. A degraded worker runs the ordinary Postgres
+/// loop, so the seeded backlog drains at the Postgres rate. Without degraded
+/// mode the worker claims one row per iteration and sleeps a poll interval
+/// between claims.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_channel_outage_drains_the_backlog_at_the_postgres_rate() {
+    let _serial = DISPATCH_SERIAL.lock().await;
+    let (url, _c) = setup_test_database_url_or_env().await;
+    let queue = unique_queue("f2_outage");
+    let _cleanup = SeededQueueGuard {
+        url: url.clone(),
+        queue: queue.clone(),
+    };
+
+    let channel = Arc::new(MemoryDispatch::new());
+    channel.fail_next(usize::MAX);
+    let _guard = install(&channel);
+
+    let mut conn = connect(&url).await;
+    let mut executions = Vec::new();
+    for _ in 0..30 {
+        executions.push(start_on(&mut conn, "dispatch_trivial", &queue).await);
+    }
+
+    // One second per claim is the cost of the old fallback: one `poll_once`
+    // per failed read, then a sleep. Thirty rows would need thirty seconds.
+    let poll_interval = Duration::from_secs(1);
+    let config = WorkerRuntimeConfig {
+        poll_interval,
+        ..worker_config(&queue, vec![ShardId::new(0)])
+    };
+    let pool = build_pool(&url);
+    let worker = Arc::new(make_worker_with(
+        config,
+        vec![wf_info("dispatch_trivial", trivial_workflow)],
+        vec![],
+        empty_shared_state(),
+    ));
+
+    let mut check = connect(&url).await;
+    let started = std::time::Instant::now();
+    with_worker(worker, pool, async {
+        for exec_id in &executions {
+            wait_for_state(
+                &mut check,
+                *exec_id,
+                &["COMPLETED"],
+                Duration::from_secs(45),
+            )
+            .await;
+        }
+    })
+    .await;
+    let elapsed = started.elapsed();
+
+    assert!(
+        elapsed < Duration::from_secs(20),
+        "the backlog took {elapsed:?} to drain; the channel outage throttled the Postgres path"
+    );
+}
+
+/// A channel installed after the worker was built must not reach a multi-shard
+/// loop (issue #1312).
+///
+/// `Worker::new` refuses the combination, but a core caller can install the
+/// channel afterwards. The loop reads the process-global slot on every
+/// iteration, so the refusal has to hold at run time as well.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_multi_shard_worker_never_consumes_references() {
+    let _serial = DISPATCH_SERIAL.lock().await;
+    let (url, _c) = setup_test_database_url_or_env().await;
+    let queue = unique_queue("f5_span");
+    let _cleanup = SeededQueueGuard {
+        url: url.clone(),
+        queue: queue.clone(),
+    };
+
+    let mut conn = connect(&url).await;
+    let exec_id = start_on(&mut conn, "dispatch_trivial", &queue).await;
+    let task_id = tasks_for(&mut conn, exec_id)
+        .await
+        .into_iter()
+        .next()
+        .expect("one workflow task")
+        .id;
+
+    // The worker is built with no channel, so `Worker::new` has nothing to
+    // refuse. Two shard assignments and no sharded pool keep it on the
+    // single-pool entry point.
+    let worker = Arc::new(make_worker_with(
+        worker_config(&queue, vec![ShardId::new(0), ShardId::new(1)]),
+        vec![wf_info("dispatch_trivial", trivial_workflow)],
+        vec![],
+        empty_shared_state(),
+    ));
+
+    // The channel arrives after construction, and it already holds a reference
+    // for the seeded row.
+    let channel = Arc::new(MemoryDispatch::new());
+    let _guard = install(&channel);
+    channel
+        .publish(&[autumn_harvest::dispatch::DispatchHint {
+            task_id,
+            queue_name: queue.clone(),
+            scheduled_at: chrono::Utc::now(),
+            priority: 0,
+            shard: None,
+            kind: Some(autumn_harvest::dispatch::DispatchKind::Workflow),
+        }])
+        .await
+        .expect("publish");
+
+    let pool = build_pool(&url);
+    let mut check = connect(&url).await;
+    with_worker(worker, pool, async {
+        wait_for_state(&mut check, exec_id, &["COMPLETED"], Duration::from_secs(30)).await;
+    })
+    .await;
+
+    assert!(
+        channel.delivered_ids().is_empty(),
+        "a multi-shard worker must not consume references, got {:?}",
+        channel.delivered_ids()
+    );
+}
+
+/// A queue name the channel key space cannot carry is refused at startup
+/// (issue #1312).
+///
+/// The channel rejects such a name on every call. A worker configured with one
+/// would live on the Postgres fallback for all of its queues, and say nothing
+/// about it.
+#[tokio::test]
+async fn a_queue_name_with_a_colon_rejects_dispatch() {
+    let _serial = DISPATCH_SERIAL.lock().await;
+    let channel = Arc::new(MemoryDispatch::new());
+    let guard = install(&channel);
+
+    let telemetry = Arc::new(TelemetryConfig::builder().build());
+    let registry = Arc::new(HandlerRegistry::with_state_and_telemetry(
+        vec![wf_info("dispatch_trivial", trivial_workflow)],
+        vec![],
+        empty_shared_state(),
+        telemetry,
+    ));
+
+    let error = Worker::new(
+        worker_config("tenant:priority", vec![ShardId::new(0)]),
+        registry,
+    )
+    .expect_err("a colon in a queue name must be rejected under dispatch");
+    assert!(
+        matches!(error, autumn_harvest::HarvestError::Config(ref msg)
+            if msg.contains("tenant:priority")),
+        "the rejection must name the queue, got {error:?}"
+    );
+
+    // The same config builds once the channel is gone.
+    drop(guard);
+    let telemetry = Arc::new(TelemetryConfig::builder().build());
+    let registry = Arc::new(HandlerRegistry::with_state_and_telemetry(
+        vec![wf_info("dispatch_trivial", trivial_workflow)],
+        vec![],
+        empty_shared_state(),
+        telemetry,
+    ));
+    Worker::new(
+        worker_config("tenant:priority", vec![ShardId::new(0)]),
+        registry,
+    )
+    .expect("a colon in a queue name is fine without a channel");
+}
+
+/// Rows this worker holds `RUNNING` on `queue` right now.
+///
+/// A parked workflow row is `RUNNING` with no owner, so the owner test is what
+/// separates a running task from a parked one.
+async fn running_owned_count(conn: &mut AsyncPgConnection, queue: &str) -> i64 {
+    #[derive(diesel::QueryableByName)]
+    struct Count {
+        #[diesel(sql_type = diesel::sql_types::BigInt)]
+        count: i64,
+    }
+    let row: Count = diesel::sql_query(
+        "SELECT COUNT(*) AS count FROM harvest_task_queue \
+         WHERE queue_name = $1 AND state = 'RUNNING' AND worker_id IS NOT NULL \
+           AND task_type = 'workflow'",
+    )
+    .bind::<diesel::sql_types::Text, _>(queue)
+    .get_result(conn)
+    .await
+    .expect("running count");
+    row.count
+}
+
+/// A worker never claims past the free permits of the pool a reference needs
+/// (issue #1312).
+///
+/// The read is sized on the sum of both pools, so one read can hold two
+/// workflow references while only one workflow permit is free. Claiming both
+/// puts a row in `RUNNING` under a worker that cannot start it, and a peer with
+/// capacity cannot claim it either.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_workflow_reference_waits_for_a_workflow_permit() {
+    let _serial = DISPATCH_SERIAL.lock().await;
+    let (url, _c) = setup_test_database_url_or_env().await;
+    let queue = unique_queue("f7_permits");
+    let _cleanup = SeededQueueGuard {
+        url: url.clone(),
+        queue: queue.clone(),
+    };
+
+    // Both starts run before the install, so the reconcile sweep publishes both
+    // references in one batch and one read delivers them together.
+    let mut conn = connect(&url).await;
+    let first = start_on(&mut conn, "dispatch_slow", &queue).await;
+    let second = start_on(&mut conn, "dispatch_slow", &queue).await;
+
+    let channel = Arc::new(MemoryDispatch::new());
+    let _guard = install(&channel);
+
+    let config = WorkerRuntimeConfig {
+        max_concurrent_workflows: 1,
+        max_concurrent_activities: 8,
+        ..worker_config(&queue, vec![ShardId::new(0)])
+    };
+    let worker = Arc::new(make_worker_with(
+        config,
+        vec![wf_info("dispatch_slow", slow_workflow)],
+        vec![ActivityInfo {
+            is_local: true,
+            default_queue: None,
+            ..act_info("slow_local", slow_local_activity, None)
+        }],
+        empty_shared_state(),
+    ));
+
+    let pool = build_pool(&url);
+    let mut check = connect(&url).await;
+    with_worker(worker, pool, async {
+        let deadline = std::time::Instant::now() + Duration::from_secs(30);
+        loop {
+            let running = running_owned_count(&mut check, &queue).await;
+            assert!(
+                running <= 1,
+                "{running} workflow rows are RUNNING under a worker with one workflow permit"
+            );
+            let first_state = execution_state(&mut check, first).await;
+            let second_state = execution_state(&mut check, second).await;
+            if first_state == "COMPLETED" && second_state == "COMPLETED" {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the runs stayed in {first_state} and {second_state}"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await;
 }

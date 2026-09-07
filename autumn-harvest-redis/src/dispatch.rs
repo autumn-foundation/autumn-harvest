@@ -64,7 +64,9 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use async_trait::async_trait;
-use autumn_harvest::dispatch::{DispatchHint, DispatchLease, DispatchMaintenance, TaskDispatch};
+use autumn_harvest::dispatch::{
+    DispatchHint, DispatchKind, DispatchLease, DispatchMaintenance, TaskDispatch,
+};
 use autumn_harvest::error::{HarvestError, HarvestResult};
 use autumn_harvest::types::ShardId;
 use chrono::{DateTime, Utc};
@@ -78,9 +80,10 @@ use uuid::Uuid;
 
 use crate::error::{RedisAdapterError, RedisAdapterResult};
 use crate::naming::{
-    dispatch_delayed_key, dispatch_marker_key, dispatch_payloads_key, dispatch_stream_key,
+    dispatch_delayed_key, dispatch_marker_key, dispatch_marker_prefix, dispatch_payloads_key,
+    dispatch_stream_key,
 };
-use crate::redis_queue::{PROMOTE_LUA, is_busygroup};
+use crate::redis_queue::is_busygroup;
 
 const DEFAULT_KEY_PREFIX: &str = "harvest";
 const DEFAULT_CONSUMER_GROUP: &str = "harvest_workers";
@@ -168,6 +171,10 @@ struct DispatchRef {
     redeliveries: u32,
     #[serde(default)]
     shard: Option<i32>,
+    /// Pool the row needs (issue #1312). Absent in an entry an older build
+    /// wrote, which then reads as an untyped reference.
+    #[serde(default)]
+    kind: Option<DispatchKind>,
 }
 
 impl DispatchRef {
@@ -179,6 +186,7 @@ impl DispatchRef {
             priority: hint.priority,
             redeliveries: 0,
             shard: hint.shard.map(ShardId::as_i32),
+            kind: hint.kind,
         }
     }
 
@@ -197,6 +205,7 @@ impl DispatchRef {
             priority: 0,
             redeliveries: lease.redeliveries,
             shard: lease.shard.map(ShardId::as_i32),
+            kind: lease.kind,
         }
     }
 
@@ -207,6 +216,7 @@ impl DispatchRef {
             redeliveries: self.redeliveries,
             handle,
             shard: self.shard.map(ShardId::new),
+            kind: self.kind,
         }
     }
 
@@ -233,6 +243,7 @@ pub struct RedisDispatch {
     config: Arc<RedisDispatchConfig>,
     publish_script: Arc<Script>,
     promote_script: Arc<Script>,
+    requeue_script: Arc<Script>,
     /// Queues whose consumer group this process already created.
     ensured: Arc<Mutex<HashSet<String>>>,
     /// Unix milliseconds of the last promotion pass driven by a read.
@@ -273,7 +284,8 @@ impl RedisDispatch {
             blocking,
             config: Arc::new(config),
             publish_script: Arc::new(Script::new(PUBLISH_LUA)),
-            promote_script: Arc::new(Script::new(PROMOTE_LUA)),
+            promote_script: Arc::new(Script::new(PROMOTE_MARKED_LUA)),
+            requeue_script: Arc::new(Script::new(REQUEUE_LUA)),
             ensured: Arc::new(Mutex::new(HashSet::new())),
             last_promote_ms: Arc::new(AtomicI64::new(0)),
             last_recover_ms: Arc::new(AtomicI64::new(0)),
@@ -408,7 +420,9 @@ impl RedisDispatch {
                 .arg(self.delayed_key(queue))
                 .arg(self.payloads_key(queue))
                 .arg(self.stream_key(queue))
-                .arg(now_ms);
+                .arg(now_ms)
+                .arg(dispatch_marker_prefix(&self.config.key_prefix))
+                .arg(self.dedupe_ttl_secs());
         }
         pipe
     }
@@ -433,7 +447,7 @@ impl RedisDispatch {
                 // does that. Load it once and run the pipeline again.
                 let _: String = redis::cmd("SCRIPT")
                     .arg("LOAD")
-                    .arg(PROMOTE_LUA)
+                    .arg(PROMOTE_MARKED_LUA)
                     .query_async(&mut conn)
                     .await?;
                 self.promote_pipeline(queues, now_ms)
@@ -535,50 +549,6 @@ impl RedisDispatch {
         }
     }
 
-    /// Queue the commands that give one entry back to its stream.
-    ///
-    /// The delivered entry is acked and deleted first, so the pending entries
-    /// list never holds a reference the worker no longer owns. The marker is
-    /// rewritten, not deleted. The row is still un-claimed, so a republish of
-    /// the same `scheduled_at` stays a no-op until the new entry is
-    /// delivered.
-    ///
-    /// `due` moves the delivery time only. `reference.scheduled_at` keeps the
-    /// row's due time, which is what contract C1 compares against.
-    fn push_requeue(
-        &self,
-        pipe: &mut redis::Pipeline,
-        handle: &str,
-        reference: &DispatchRef,
-        due: DateTime<Utc>,
-    ) -> RedisAdapterResult<()> {
-        let queue = &reference.queue_name;
-        let key = self.stream_key(queue);
-        let entry_id = handle_entry_id(handle);
-        let payload = serde_json::to_string(reference)?;
-        let task_id = reference.task_id.to_string();
-        pipe.xack(&key, &self.config.consumer_group, &[entry_id])
-            .ignore()
-            .xdel(&key, &[entry_id])
-            .ignore();
-        if due <= Utc::now() {
-            pipe.xadd(&key, "*", &[(PAYLOAD_FIELD, payload.as_str())])
-                .ignore();
-        } else {
-            pipe.zadd(self.delayed_key(queue), &task_id, due.timestamp_millis())
-                .ignore()
-                .hset(self.payloads_key(queue), &task_id, payload.as_str())
-                .ignore();
-        }
-        pipe.cmd("SET")
-            .arg(self.marker_key(reference.task_id))
-            .arg(reference.marker_value())
-            .arg("EX")
-            .arg(self.dedupe_ttl_secs())
-            .ignore();
-        Ok(())
-    }
-
     /// Give one entry back to its stream, as a fresh entry due at `due`.
     async fn requeue(
         &self,
@@ -591,6 +561,18 @@ impl RedisDispatch {
     }
 
     /// Give several entries back to their streams in one round trip.
+    ///
+    /// The delivered entry is acked and deleted first, so the pending entries
+    /// list never holds a reference the worker no longer owns. The marker is
+    /// rewritten, not deleted. The row is still un-claimed, so a republish of
+    /// the same `scheduled_at` stays a no-op until the new entry is delivered.
+    ///
+    /// `due` moves the delivery time only. `reference.scheduled_at` keeps the
+    /// row's due time, which is what contract C1 compares against.
+    ///
+    /// The work runs in [`REQUEUE_LUA`], one call per queue. The marker must
+    /// record where the reference landed. Only the script sees the id that
+    /// `XADD` generates.
     async fn requeue_batch(
         &self,
         entries: &[(String, DispatchRef)],
@@ -599,13 +581,40 @@ impl RedisDispatch {
         if entries.is_empty() {
             return Ok(());
         }
-        let mut pipe = redis::pipe();
-        pipe.atomic();
+        let mut by_queue: HashMap<&str, Vec<(&String, &DispatchRef)>> = HashMap::new();
         for (handle, reference) in entries {
-            self.push_requeue(&mut pipe, handle, reference, due)?;
+            by_queue
+                .entry(reference.queue_name.as_str())
+                .or_default()
+                .push((handle, reference));
         }
-        let mut conn = self.conn.clone();
-        pipe.query_async::<()>(&mut conn).await?;
+        let now_ms = Utc::now().timestamp_millis();
+        let due_ms = due.timestamp_millis();
+        let ttl = self.dedupe_ttl_secs();
+        for (queue, batch) in by_queue {
+            let mut invocation = self.requeue_script.prepare_invoke();
+            invocation
+                .key(self.stream_key(queue))
+                .key(self.delayed_key(queue))
+                .key(self.payloads_key(queue));
+            for (_, reference) in &batch {
+                invocation.key(self.marker_key(reference.task_id));
+            }
+            invocation
+                .arg(now_ms)
+                .arg(ttl)
+                .arg(self.config.consumer_group.as_str());
+            for (handle, reference) in &batch {
+                invocation
+                    .arg(handle_entry_id(handle))
+                    .arg(reference.task_id.to_string())
+                    .arg(due_ms)
+                    .arg(reference.marker_value())
+                    .arg(serde_json::to_string(reference)?);
+            }
+            let mut conn = self.conn.clone();
+            let _: i64 = invocation.invoke_async(&mut conn).await?;
+        }
         Ok(())
     }
 
@@ -670,20 +679,26 @@ impl RedisDispatch {
 
         let mut leases = Vec::new();
         let mut surplus = Vec::new();
+        let mut malformed = Vec::new();
         for stream in reply.keys {
+            let stream_key = stream.key;
             for entry in stream.ids {
                 let Some(payload) = entry_payload(&entry.map) else {
                     tracing::warn!(
                         entry_id = %entry.id,
-                        "dropping dispatch entry with no payload field"
+                        stream = %stream_key,
+                        "discarding dispatch entry with no payload field"
                     );
+                    malformed.push((stream_key.clone(), entry.id));
                     continue;
                 };
                 let Ok(reference) = serde_json::from_str::<DispatchRef>(&payload) else {
                     tracing::warn!(
                         entry_id = %entry.id,
-                        "dropping dispatch entry with an unreadable payload"
+                        stream = %stream_key,
+                        "discarding dispatch entry with an unreadable payload"
                     );
+                    malformed.push((stream_key.clone(), entry.id));
                     continue;
                 };
                 if leases.len() < max {
@@ -709,7 +724,45 @@ impl RedisDispatch {
                 "failed to requeue surplus dispatch references"
             );
         }
+
+        if let Err(error) = self.discard_entries(&malformed).await {
+            tracing::warn!(
+                error = %error,
+                malformed = malformed.len(),
+                "failed to discard unreadable dispatch entries"
+            );
+        }
         Ok(leases)
+    }
+
+    /// Acknowledge and delete entries that carry no readable reference.
+    ///
+    /// `XREADGROUP` puts every delivered entry in the pending entries list. A
+    /// consumer that only drops an unreadable entry leaves it there for good,
+    /// because the entry never becomes a lease and so is never acked. The
+    /// recovery pass then claims it on every sweep and leaves it pending again.
+    /// `XPENDING` reads a fixed window of `RECOVER_BATCH` entries. Enough such
+    /// entries hide every legitimate abandoned lease below them. The crash
+    /// recovery this channel promises then stops working.
+    ///
+    /// The delete names each entry id, so nothing else leaves the stream. The
+    /// dedupe marker is left alone: a reference that cannot be read does not
+    /// say which task it belongs to.
+    async fn discard_entries(&self, entries: &[(String, String)]) -> RedisAdapterResult<()> {
+        if entries.is_empty() {
+            return Ok(());
+        }
+        let mut pipe = redis::pipe();
+        pipe.atomic();
+        for (key, entry_id) in entries {
+            pipe.xack(key, &self.config.consumer_group, &[entry_id])
+                .ignore()
+                .xdel(key, &[entry_id])
+                .ignore();
+        }
+        let mut conn = self.conn.clone();
+        pipe.query_async::<()>(&mut conn).await?;
+        Ok(())
     }
 
     async fn ack_inner(&self, lease: &DispatchLease) -> RedisAdapterResult<()> {
@@ -788,21 +841,24 @@ impl RedisDispatch {
             .await?;
 
         let mut recovered = Vec::new();
+        let mut malformed = Vec::new();
         for entry in claimed.ids {
             let Some(payload) = entry_payload(&entry.map) else {
                 tracing::warn!(
                     queue = %queue_name,
                     entry_id = %entry.id,
-                    "dropping recovered entry with no payload field"
+                    "discarding recovered entry with no payload field"
                 );
+                malformed.push((key.clone(), entry.id));
                 continue;
             };
             let Ok(mut reference) = serde_json::from_str::<DispatchRef>(&payload) else {
                 tracing::warn!(
                     queue = %queue_name,
                     entry_id = %entry.id,
-                    "dropping recovered entry with an unreadable payload"
+                    "discarding recovered entry with an unreadable payload"
                 );
+                malformed.push((key.clone(), entry.id));
                 continue;
             };
             reference.redeliveries = reference.redeliveries.saturating_add(1);
@@ -810,6 +866,9 @@ impl RedisDispatch {
             // now, which the `due` argument below says.
             recovered.push((entry.id, reference));
         }
+        // An entry the pass cannot read stays pending unless it is discarded
+        // here. See [`RedisDispatch::discard_entries`].
+        self.discard_entries(&malformed).await?;
         let count = recovered.len();
         self.requeue_batch(&recovered, Utc::now()).await?;
         Ok(count)
@@ -1019,11 +1078,22 @@ fn is_nogroup(err: &RedisError) -> bool {
 /// - `ARGV[3n..]`: task id, due time in unix milliseconds, and payload, per
 ///   hint, in hint order.
 ///
-/// Behaviour per hint (contract C1). The marker holds the `scheduled_at` of
-/// the reference the channel already carries. A hint whose due time equals the
-/// marker is a no-op, and the marker TTL is refreshed. Any other hint writes.
-/// The marker then takes the new due time. A parked entry moves in place, and
-/// a due hint is added to the stream. Returns the number of hints that wrote.
+/// Behaviour per hint (contract C1). The marker holds the due time **and the
+/// location** of the reference the channel already carries. The value is
+/// `<due_ms>|<stream entry id>` for a live entry. It is `<due_ms>|delayed` for
+/// a parked one. A hint whose due time equals the marker refreshes the marker
+/// TTL **only when that location still holds the reference**. Any other hint
+/// writes. The marker then takes the new due time and location, a parked entry
+/// moves in place, and a due hint is added to the stream. Returns the number of
+/// hints that wrote.
+///
+/// **Why the location is in the marker (issue #1312).** A reference can go
+/// while its marker stays. A key eviction, an external `XTRIM` and an operator
+/// deleting the stream all do it. A marker that carried only the due time made
+/// every republish a TTL refresh. The marker then lived for ever and the row
+/// stayed `PENDING` for ever. The reconcile sweep is the durability floor of
+/// this design, and that turned the floor off for one row. Verifying the
+/// location makes the sweep restore the reference instead.
 const PUBLISH_LUA: &str = r"
 local stream = KEYS[1]
 local delayed = KEYS[2]
@@ -1038,23 +1108,144 @@ for i = 1, count do
     local due_text = ARGV[3 * i + 1]
     local payload = ARGV[3 * i + 2]
     local held = redis.call('GET', marker)
-    if held == due_text then
+    local held_due = false
+    local held_at = false
+    if held then
+        local sep = string.find(held, '|', 1, true)
+        if sep then
+            held_due = string.sub(held, 1, sep - 1)
+            held_at = string.sub(held, sep + 1)
+        end
+    end
+    local intact = false
+    if held_due == due_text then
+        if held_at == 'delayed' then
+            intact = redis.call('ZSCORE', delayed, task_id) ~= false
+        else
+            intact = #redis.call('XRANGE', stream, held_at, held_at) > 0
+        end
+    end
+    if intact then
         redis.call('EXPIRE', marker, ttl)
     else
         local due = tonumber(due_text)
-        redis.call('SET', marker, due_text, 'EX', ttl)
         if due <= now then
             redis.call('ZREM', delayed, task_id)
             redis.call('HDEL', payloads, task_id)
-            redis.call('XADD', stream, '*', 'payload', payload)
+            local id = redis.call('XADD', stream, '*', 'payload', payload)
+            redis.call('SET', marker, due_text .. '|' .. id, 'EX', ttl)
         else
             redis.call('ZADD', delayed, due, task_id)
             redis.call('HSET', payloads, task_id, payload)
+            redis.call('SET', marker, due_text .. '|delayed', 'EX', ttl)
         end
         written = written + 1
     end
 end
 return written
+";
+
+/// Lua script that gives delivered entries back to their stream.
+///
+/// Keys:
+/// - `KEYS[1]`: the queue's dispatch stream.
+/// - `KEYS[2]`: the queue's delayed sorted set.
+/// - `KEYS[3]`: the queue's delayed payload hash.
+/// - `KEYS[4..]`: one dedupe marker per entry, in entry order.
+///
+/// Arguments:
+/// - `ARGV[1]`: now, in unix milliseconds.
+/// - `ARGV[2]`: dedupe marker TTL, in seconds.
+/// - `ARGV[3]`: the consumer group name.
+/// - `ARGV[4n..]`: entry id, task id, delivery time in unix milliseconds, the
+///   row's due time in unix milliseconds, and payload, per entry.
+///
+/// The old entry is acked and deleted, so the pending entries list never holds
+/// a reference the worker gave back. The marker then names the new location, so
+/// a republish can verify it. See [`PUBLISH_LUA`] for why that matters. Returns
+/// the number of entries handled.
+const REQUEUE_LUA: &str = r"
+local stream = KEYS[1]
+local delayed = KEYS[2]
+local payloads = KEYS[3]
+local now = tonumber(ARGV[1])
+local ttl = tonumber(ARGV[2])
+local group = ARGV[3]
+local idx = 3
+local count = (#ARGV - 3) / 5
+for i = 1, count do
+    local marker = KEYS[3 + i]
+    local entry_id = ARGV[idx + 1]
+    local task_id = ARGV[idx + 2]
+    local due = tonumber(ARGV[idx + 3])
+    local scheduled = ARGV[idx + 4]
+    local payload = ARGV[idx + 5]
+    idx = idx + 5
+    redis.call('XACK', stream, group, entry_id)
+    redis.call('XDEL', stream, entry_id)
+    if due <= now then
+        redis.call('ZREM', delayed, task_id)
+        redis.call('HDEL', payloads, task_id)
+        local id = redis.call('XADD', stream, '*', 'payload', payload)
+        redis.call('SET', marker, scheduled .. '|' .. id, 'EX', ttl)
+    else
+        redis.call('ZADD', delayed, due, task_id)
+        redis.call('HSET', payloads, task_id, payload)
+        redis.call('SET', marker, scheduled .. '|delayed', 'EX', ttl)
+    end
+end
+return count
+";
+
+/// Lua script that promotes due delayed references onto the stream.
+///
+/// The dispatch analogue of [`crate::redis_queue::PROMOTE_LUA`]. It does the
+/// same work and rewrites each promoted reference's marker, because the marker
+/// names where the reference is and a promotion moves it. See [`PUBLISH_LUA`].
+///
+/// Keys:
+/// - `KEYS[1]`: the queue's delayed sorted set.
+/// - `KEYS[2]`: the queue's delayed payload hash.
+/// - `KEYS[3]`: the queue's dispatch stream.
+///
+/// Arguments:
+/// - `ARGV[1]`: now, in unix milliseconds.
+/// - `ARGV[2]`: the key prefix every dedupe marker shares.
+/// - `ARGV[3]`: dedupe marker TTL, in seconds.
+///
+/// The marker key is built inside the script, because the task ids come out of
+/// the sorted set and are not known to the caller. See
+/// [`crate::naming::dispatch_marker_prefix`] on why that is acceptable here.
+/// Returns the number of members promoted.
+const PROMOTE_MARKED_LUA: &str = r"
+local zset = KEYS[1]
+local payloads = KEYS[2]
+local stream = KEYS[3]
+local now_ms = tonumber(ARGV[1])
+local marker_prefix = ARGV[2]
+local ttl = tonumber(ARGV[3])
+local due = redis.call('ZRANGEBYSCORE', zset, '-inf', now_ms)
+local promoted = 0
+for _, task_id in ipairs(due) do
+    local payload = redis.call('HGET', payloads, task_id)
+    if payload then
+        local id = redis.call('XADD', stream, '*', 'payload', payload)
+        redis.call('HDEL', payloads, task_id)
+        local marker = marker_prefix .. task_id
+        local held = redis.call('GET', marker)
+        if held then
+            local sep = string.find(held, '|', 1, true)
+            local held_due = held
+            if sep then
+                held_due = string.sub(held, 1, sep - 1)
+            end
+            redis.call('SET', marker, held_due .. '|' .. id, 'EX', ttl)
+        end
+        promoted = promoted + 1
+    end
+    redis.call('ZREM', zset, task_id)
+end
+return promoted
 ";
 
 #[cfg(test)]
@@ -1068,6 +1259,7 @@ mod tests {
             redeliveries,
             handle: "1-0".to_string(),
             shard: Some(ShardId::new(3)),
+            kind: Some(DispatchKind::Workflow),
         }
     }
 
@@ -1086,6 +1278,16 @@ mod tests {
     }
 
     #[test]
+    fn requeue_script_compiles() {
+        let _ = Script::new(REQUEUE_LUA);
+    }
+
+    #[test]
+    fn promote_script_compiles() {
+        let _ = Script::new(PROMOTE_MARKED_LUA);
+    }
+
+    #[test]
     fn a_reference_round_trips_through_its_payload() {
         let hint = DispatchHint {
             task_id: Uuid::new_v4(),
@@ -1093,6 +1295,7 @@ mod tests {
             scheduled_at: Utc::now(),
             priority: 7,
             shard: Some(ShardId::new(2)),
+            kind: None,
         };
         let payload = serde_json::to_string(&DispatchRef::from_hint(&hint)).unwrap();
         let decoded: DispatchRef = serde_json::from_str(&payload).unwrap();
@@ -1101,6 +1304,39 @@ mod tests {
         assert_eq!(decoded.priority, 7);
         assert_eq!(decoded.redeliveries, 0);
         assert_eq!(decoded.shard, Some(2));
+    }
+
+    /// The payload carries the pool
+    /// the reference needs, so a worker weighs it before it claims.
+    #[test]
+    fn a_payload_carries_the_reference_kind() {
+        let hint = DispatchHint {
+            task_id: Uuid::new_v4(),
+            queue_name: "email".to_string(),
+            scheduled_at: Utc::now(),
+            priority: 0,
+            shard: None,
+            kind: Some(DispatchKind::Activity),
+        };
+        let payload = serde_json::to_string(&DispatchRef::from_hint(&hint)).unwrap();
+        let decoded: DispatchRef = serde_json::from_str(&payload).unwrap();
+        assert_eq!(decoded.kind, Some(DispatchKind::Activity));
+        assert_eq!(
+            decoded.into_lease("1-0".to_string()).kind,
+            Some(DispatchKind::Activity),
+            "the lease must name the pool the reference needs"
+        );
+    }
+
+    /// An entry written before the kind existed still parses.
+    #[test]
+    fn a_payload_without_a_kind_is_untyped() {
+        let payload = format!(
+            r#"{{"task_id":"{}","queue_name":"q","scheduled_at":"2026-09-07T12:00:00Z"}}"#,
+            Uuid::nil()
+        );
+        let decoded: DispatchRef = serde_json::from_str(&payload).expect("an old payload parses");
+        assert_eq!(decoded.kind, None, "an old entry carries no kind");
     }
 
     #[test]
@@ -1113,6 +1349,7 @@ mod tests {
                 .with_timezone(&Utc),
             priority: 0,
             shard: None,
+            kind: None,
         };
         let payload = serde_json::to_string(&DispatchRef::from_hint(&hint)).unwrap();
         assert!(
@@ -1131,6 +1368,7 @@ mod tests {
                 .with_timezone(&Utc),
             priority: 0,
             shard: None,
+            kind: None,
         };
         // The publish script compares the marker against the same encoding of
         // `scheduled_at` that a hint carries, so the two must agree.
@@ -1148,6 +1386,7 @@ mod tests {
             scheduled_at: Utc::now(),
             priority: 0,
             shard: Some(ShardId::new(5)),
+            kind: None,
         };
         let built = DispatchRef::from_hint(&hint).into_lease("9-1".to_string());
         assert_eq!(built.shard, Some(ShardId::new(5)));
@@ -1171,6 +1410,7 @@ mod tests {
             scheduled_at: Utc::now(),
             priority: 9,
             shard: None,
+            kind: None,
         };
         let payload = serde_json::to_string(&DispatchRef::from_hint(&hint)).unwrap();
         let handle = encode_handle("1700000000000-3", &payload);

@@ -858,6 +858,12 @@ pub struct HarvestRunner {
     scheduler: Option<SchedulerRuntime>,
     retention: Option<RetentionRuntime>,
     batch: Option<BatchRuntime>,
+    /// True when this runner installed the process-global dispatch channel.
+    ///
+    /// The slot is process wide and outlives one runner, so `stop` must give it
+    /// back (issue #1312). A runner that installed nothing leaves the slot
+    /// alone, because another owner in the same process may hold it.
+    dispatch_installed: bool,
 }
 
 /// Background batch-operations executor handle (issue #102).
@@ -995,7 +1001,13 @@ impl HarvestRunner {
             prepared.storage_pool.iter_shards().count(),
         )
         .map_err(AutumnError::service_unavailable_msg)?;
-        let dispatch_guard = DispatchInstallGuard::new(install_dispatch_channel(config).await?);
+        reject_dispatch_queue_names(
+            config.redis.url.is_some(),
+            &prepared.worker_runtime_config.queues,
+        )
+        .map_err(AutumnError::service_unavailable_msg)?;
+        let dispatch_installed = install_dispatch_channel(config).await?;
+        let dispatch_guard = DispatchInstallGuard::new(dispatch_installed);
 
         let worker = if config.worker_enabled {
             let worker = Worker::new(
@@ -1114,6 +1126,7 @@ impl HarvestRunner {
             scheduler,
             retention,
             batch,
+            dispatch_installed,
         })
     }
 
@@ -1130,6 +1143,10 @@ impl HarvestRunner {
     }
 
     /// Stop any locally owned worker and scheduler tasks.
+    ///
+    /// A runner that installed the dispatch channel also uninstalls it. The
+    /// slot is process wide, so a channel left behind would still carry
+    /// references for a runtime that has stopped (issue #1312).
     pub async fn stop(self) {
         let Self {
             api_runtime: _,
@@ -1139,7 +1156,12 @@ impl HarvestRunner {
             scheduler,
             retention,
             batch,
+            dispatch_installed,
         } = self;
+
+        if dispatch_installed {
+            autumn_harvest::dispatch::uninstall();
+        }
 
         if let Some(worker) = worker {
             worker.shutdown();
@@ -1281,6 +1303,35 @@ fn reject_multi_shard_dispatch(redis_url_set: bool, shard_count: usize) -> Resul
     Ok(())
 }
 
+/// Reject Redis dispatch on a runtime whose queue names the channel cannot
+/// carry (issue #1312).
+///
+/// The channel builds its keys from the queue name, so it rejects a name that
+/// is empty or holds a colon. `WorkerConfig` and the Postgres claim path accept
+/// both. A process configured that way would fail every channel call and live
+/// on the Postgres fallback for all of its queues, in silence. `Worker::new`
+/// applies the same rule. A worker-disabled process never builds a worker, and
+/// it would still publish, so this check runs in the runner as well.
+///
+/// # Errors
+///
+/// Returns the operator-facing message when a URL is configured and a queue
+/// name fails [`autumn_harvest::dispatch::validate_queue_name`].
+fn reject_dispatch_queue_names(redis_url_set: bool, queues: &[String]) -> Result<(), String> {
+    if !redis_url_set {
+        return Ok(());
+    }
+    for queue in queues {
+        autumn_harvest::dispatch::validate_queue_name(queue).map_err(|reason| {
+            format!(
+                "harvest.redis.url is set and this runtime serves a queue redis dispatch \
+                 cannot address: {reason}. Unset harvest.redis.url, or rename the queue"
+            )
+        })?;
+    }
+    Ok(())
+}
+
 /// Uninstall the process-global dispatch channel when startup fails later.
 ///
 /// `start` installs the channel before it builds the worker, because an
@@ -1345,6 +1396,11 @@ async fn install_dispatch_channel(config: &HarvestRuntimeConfig) -> autumn_web::
     // halves are `Some` together, because both read `config.redis.url`.
     let (Some(url), Some(endpoint)) = (config.redis.url.as_deref(), config.redis.redacted_url())
     else {
+        // Redis is off for this start. The slot is process wide, so a channel a
+        // previous runtime installed is still live in it (issue #1312). Leaving
+        // it there would keep this process publishing and consuming through a
+        // channel the operator has turned off.
+        autumn_harvest::dispatch::uninstall();
         return Ok(false);
     };
 
@@ -1391,6 +1447,10 @@ async fn install_dispatch_channel(config: &HarvestRuntimeConfig) -> autumn_web::
 /// this path can only be reached with Redis dispatch off. The result is
 /// always `false`, because nothing is installed.
 ///
+/// The slot is still cleared. It is process wide, so a channel another owner
+/// installed would otherwise stay live for a runtime that has Redis off
+/// (issue #1312).
+///
 /// # Errors
 ///
 /// Never returns an error.
@@ -1399,6 +1459,7 @@ async fn install_dispatch_channel(config: &HarvestRuntimeConfig) -> autumn_web::
 async fn install_dispatch_channel(
     _config: &HarvestRuntimeConfig,
 ) -> autumn_web::AutumnResult<bool> {
+    autumn_harvest::dispatch::uninstall();
     Ok(false)
 }
 
@@ -2014,7 +2075,156 @@ mod tests {
         autumn_harvest::dispatch::uninstall();
     }
 
-    /// The process-global dispatch slot is one resource. The two guard tests
+    /// A queue name the channel key
+    /// space cannot carry must fail startup, not degrade the process to the
+    /// Postgres fallback in silence.
+    #[test]
+    fn redis_dispatch_rejects_a_queue_name_with_a_colon() {
+        let queues = vec!["default".to_string(), "tenant:priority".to_string()];
+        let error = super::reject_dispatch_queue_names(true, &queues)
+            .expect_err("a colon in a queue name must fail startup");
+        assert!(
+            error.contains("tenant:priority"),
+            "the message must name the queue: {error}"
+        );
+        assert!(
+            error.contains("harvest.redis.url"),
+            "the message must name the setting to unset: {error}"
+        );
+    }
+
+    #[test]
+    fn dispatchable_queue_names_are_accepted() {
+        let queues = vec!["default".to_string(), "tenant-priority".to_string()];
+        super::reject_dispatch_queue_names(true, &queues)
+            .expect("a plain queue name must be accepted");
+    }
+
+    /// With no URL the channel stays off, so the queue names do not matter.
+    #[test]
+    fn queue_names_are_unchecked_when_redis_dispatch_is_off() {
+        let queues = vec!["tenant:priority".to_string()];
+        super::reject_dispatch_queue_names(false, &queues)
+            .expect("a runtime with redis dispatch off must not be rejected");
+    }
+
+    /// A runner that owns nothing but the dispatch flag.
+    ///
+    /// `stop` is driven through this, so the case needs no database, no worker
+    /// and no scheduler.
+    fn runner_owning_dispatch(installed: bool) -> super::HarvestRunner {
+        let api_runtime = crate::api::HarvestApiRuntime::new(
+            std::sync::Arc::new(autumn_harvest::worker::HandlerRegistry::new(vec![], vec![])),
+            std::sync::Arc::new(autumn_harvest::scheduler::DagCatalog::default()),
+            std::sync::Arc::new(Vec::new()),
+            None,
+            Vec::new(),
+            autumn_harvest::scheduler::SchedulerMonitor::offline(),
+            crate::api::HarvestRetentionRuntime::disabled(
+                autumn_harvest::retention::RetentionConfig::default(),
+            ),
+            ShardRouter::single(),
+        );
+        super::HarvestRunner {
+            api_runtime,
+            storage_pool: crate::state::HarvestDbPool::single(tagged_pool(1)),
+            worker: None,
+            worker_handle: None,
+            scheduler: None,
+            retention: None,
+            batch: None,
+            dispatch_installed: installed,
+        }
+    }
+
+    /// Run `future` on a private current-thread runtime.
+    ///
+    /// The dispatch cases hold a blocking lock, so they stay synchronous.
+    fn block_on<F: std::future::Future>(future: F) -> F::Output {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("test runtime")
+            .block_on(future)
+    }
+
+    /// A restart with Redis off must
+    /// not keep publishing and consuming through the channel of the previous
+    /// runtime.
+    #[test]
+    fn a_disabled_start_clears_a_previously_installed_channel() {
+        let _lock = DISPATCH_TEST_LOCK.lock().unwrap_or_else(|error| {
+            DISPATCH_TEST_LOCK.clear_poison();
+            error.into_inner()
+        });
+
+        autumn_harvest::dispatch::install(
+            std::sync::Arc::new(autumn_harvest::dispatch::MemoryDispatch::new()),
+            autumn_harvest::dispatch::DispatchSettings::default(),
+        );
+
+        let config = crate::config::HarvestRuntimeConfig::default();
+        assert!(
+            config.redis.url.is_none(),
+            "the default config has redis dispatch off"
+        );
+        let installed = block_on(super::install_dispatch_channel(&config))
+            .expect("a disabled start must succeed");
+
+        assert!(!installed, "a disabled start installs no channel");
+        assert!(
+            autumn_harvest::dispatch::installed().is_none(),
+            "a disabled start must clear the channel a previous runtime installed"
+        );
+    }
+
+    /// The runner uninstalls the channel it installed when it stops.
+    #[test]
+    fn stop_uninstalls_a_channel_the_runner_installed() {
+        let _lock = DISPATCH_TEST_LOCK.lock().unwrap_or_else(|error| {
+            DISPATCH_TEST_LOCK.clear_poison();
+            error.into_inner()
+        });
+
+        autumn_harvest::dispatch::install(
+            std::sync::Arc::new(autumn_harvest::dispatch::MemoryDispatch::new()),
+            autumn_harvest::dispatch::DispatchSettings::default(),
+        );
+
+        block_on(runner_owning_dispatch(true).stop());
+
+        assert!(
+            autumn_harvest::dispatch::installed().is_none(),
+            "stop must uninstall the channel the runner installed"
+        );
+    }
+
+    /// A runner that installed no channel leaves the slot alone.
+    ///
+    /// Another owner in the same process may hold it, and this runner has no
+    /// claim on it.
+    #[test]
+    fn stop_leaves_a_channel_the_runner_did_not_install() {
+        let _lock = DISPATCH_TEST_LOCK.lock().unwrap_or_else(|error| {
+            DISPATCH_TEST_LOCK.clear_poison();
+            error.into_inner()
+        });
+
+        autumn_harvest::dispatch::install(
+            std::sync::Arc::new(autumn_harvest::dispatch::MemoryDispatch::new()),
+            autumn_harvest::dispatch::DispatchSettings::default(),
+        );
+
+        block_on(runner_owning_dispatch(false).stop());
+
+        assert!(
+            autumn_harvest::dispatch::is_installed(),
+            "stop must not uninstall a channel this runner never installed"
+        );
+        autumn_harvest::dispatch::uninstall();
+    }
+
+    /// The process-global dispatch slot is one resource. The dispatch cases
     /// take this lock so they never observe each other.
     static DISPATCH_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 }

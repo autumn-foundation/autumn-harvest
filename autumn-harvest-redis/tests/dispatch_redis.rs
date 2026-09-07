@@ -121,6 +121,7 @@ fn hint(queue: &str, task_id: Uuid, scheduled_at: DateTime<Utc>) -> DispatchHint
         scheduled_at,
         priority: 0,
         shard: None,
+        kind: Some(autumn_harvest::dispatch::DispatchKind::Workflow),
     }
 }
 
@@ -644,4 +645,261 @@ async fn connect_to_an_unreachable_address_fails_fast() {
         elapsed < Duration::from_secs(10),
         "connect must fail inside its timeout (elapsed {elapsed:?})"
     );
+}
+
+/// An entry the channel cannot read must leave the pending entries list
+/// (issue #1312).
+///
+/// `XREADGROUP` puts every delivered entry in the pending entries list. A
+/// worker that only drops an unreadable entry leaves it there for good. The
+/// recovery pass then claims it on every sweep and leaves it pending again.
+/// `XPENDING` reads a fixed window, so enough such entries hide every
+/// legitimate abandoned lease below them.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_malformed_entry_leaves_the_pending_list() {
+    let Some(fixture) = try_start(Duration::from_millis(300)).await else {
+        return;
+    };
+    let queues = vec!["malformed".to_string()];
+    let task_id = Uuid::new_v4();
+
+    // A real publish creates the consumer group the hand-written entries need.
+    fixture
+        .dispatch
+        .publish(&[hint("malformed", task_id, Utc::now())])
+        .await
+        .expect("publish");
+
+    let key = fixture.stream_key("malformed");
+    let mut conn = fixture.raw.clone();
+    let _: String = redis::cmd("XADD")
+        .arg(&key)
+        .arg("*")
+        .arg("other")
+        .arg("no payload field here")
+        .query_async(&mut conn)
+        .await
+        .expect("xadd an entry with no payload field");
+    let _: String = redis::cmd("XADD")
+        .arg(&key)
+        .arg("*")
+        .arg("payload")
+        .arg("{ this is not json")
+        .query_async(&mut conn)
+        .await
+        .expect("xadd an entry with an unreadable payload");
+
+    let leases = read(&fixture, &queues, 10).await;
+    assert_eq!(leases.len(), 1, "only the legitimate entry yields a lease");
+    assert_eq!(leases[0].task_id, task_id);
+
+    assert_eq!(
+        fixture.pending_count("malformed").await,
+        1,
+        "a malformed entry must be acknowledged, so only the live lease is pending"
+    );
+    assert_eq!(
+        fixture.stream_len("malformed").await,
+        1,
+        "a malformed entry must be deleted, and nothing else with it"
+    );
+
+    // The legitimate lease is abandoned. Recovery must still reach it.
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    let counts = fixture.dispatch.maintain(&queues).await.expect("maintain");
+    assert_eq!(counts.recovered, 1, "the abandoned lease must be recovered");
+    assert_eq!(
+        fixture.pending_count("malformed").await,
+        0,
+        "no entry may be left pending after the recovery pass"
+    );
+}
+
+/// The recovery pass discards an entry it cannot read, rather than leaving it
+/// pending for the next pass (issue #1312).
+#[tokio::test(flavor = "multi_thread")]
+async fn the_recovery_pass_discards_a_malformed_entry() {
+    let Some(fixture) = try_start(Duration::from_millis(300)).await else {
+        return;
+    };
+    let queues = vec!["recover_malformed".to_string()];
+    let task_id = Uuid::new_v4();
+
+    fixture
+        .dispatch
+        .publish(&[hint("recover_malformed", task_id, Utc::now())])
+        .await
+        .expect("publish");
+    let leases = read(&fixture, &queues, 10).await;
+    assert_eq!(leases.len(), 1);
+    fixture.dispatch.ack(&leases[0]).await.expect("ack");
+
+    // A malformed entry that reaches the pending list without going through
+    // `next`. A peer on an older build is one way to get one.
+    let key = fixture.stream_key("recover_malformed");
+    let mut conn = fixture.raw.clone();
+    let _: String = redis::cmd("XADD")
+        .arg(&key)
+        .arg("*")
+        .arg("payload")
+        .arg("{ this is not json")
+        .query_async(&mut conn)
+        .await
+        .expect("xadd an entry with an unreadable payload");
+    let _: redis::streams::StreamReadReply = redis::cmd("XREADGROUP")
+        .arg("GROUP")
+        .arg("harvest_workers")
+        .arg("peer")
+        .arg("COUNT")
+        .arg(10)
+        .arg("STREAMS")
+        .arg(&key)
+        .arg(">")
+        .query_async(&mut conn)
+        .await
+        .expect("peer read");
+    assert_eq!(fixture.pending_count("recover_malformed").await, 1);
+
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    fixture.dispatch.maintain(&queues).await.expect("maintain");
+    assert_eq!(
+        fixture.pending_count("recover_malformed").await,
+        0,
+        "the recovery pass must discard an entry it cannot read"
+    );
+    assert_eq!(
+        fixture.stream_len("recover_malformed").await,
+        0,
+        "the discarded entry must leave the stream"
+    );
+}
+
+/// A reference keeps the pool it needs across the stream (issue #1312).
+#[tokio::test(flavor = "multi_thread")]
+async fn a_lease_carries_the_kind_of_its_hint() {
+    let Some(fixture) = try_start(Duration::from_secs(60)).await else {
+        return;
+    };
+    let queues = vec!["typed".to_string()];
+    let task_id = Uuid::new_v4();
+
+    let mut typed = hint("typed", task_id, Utc::now());
+    typed.kind = Some(autumn_harvest::dispatch::DispatchKind::Activity);
+    fixture.dispatch.publish(&[typed]).await.expect("publish");
+
+    let leases = read(&fixture, &queues, 10).await;
+    assert_eq!(leases.len(), 1);
+    assert_eq!(
+        leases[0].kind,
+        Some(autumn_harvest::dispatch::DispatchKind::Activity),
+        "the lease must name the pool the reference needs"
+    );
+}
+
+/// The marker must not outlive the reference it stands for (issue #1312).
+///
+/// A key eviction, an external `XTRIM` or an operator deleting the stream can
+/// take the entry and leave the marker. Every republish then refreshed the
+/// marker TTL, so the marker lived for good and the row stayed `PENDING` for
+/// good.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_republish_restores_a_stream_entry_that_vanished() {
+    let Some(fixture) = try_start(Duration::from_secs(60)).await else {
+        return;
+    };
+    let queues = vec!["vanished".to_string()];
+    let task_id = Uuid::new_v4();
+    let due = Utc::now();
+
+    fixture
+        .dispatch
+        .publish(&[hint("vanished", task_id, due)])
+        .await
+        .expect("publish");
+    assert_eq!(fixture.stream_len("vanished").await, 1);
+
+    // The entry goes; the marker stays.
+    let mut conn = fixture.raw.clone();
+    let ids: Vec<String> = redis::cmd("XRANGE")
+        .arg(fixture.stream_key("vanished"))
+        .arg("-")
+        .arg("+")
+        .query_async::<Vec<(String, Vec<String>)>>(&mut conn)
+        .await
+        .expect("xrange")
+        .into_iter()
+        .map(|(id, _)| id)
+        .collect();
+    let _: i64 = redis::cmd("XDEL")
+        .arg(fixture.stream_key("vanished"))
+        .arg(&ids[0])
+        .query_async(&mut conn)
+        .await
+        .expect("xdel");
+    assert_eq!(fixture.stream_len("vanished").await, 0);
+    assert!(
+        fixture.marker_exists(task_id).await,
+        "the case needs the marker to outlive the entry"
+    );
+
+    // The reconcile sweep republishes the same hint.
+    fixture
+        .dispatch
+        .publish(&[hint("vanished", task_id, due)])
+        .await
+        .expect("republish");
+
+    let leases = read(&fixture, &queues, 10).await;
+    assert_eq!(
+        leases.len(),
+        1,
+        "a republish must restore a reference the marker can no longer account for"
+    );
+    assert_eq!(leases[0].task_id, task_id);
+}
+
+/// The same rule for a parked reference (issue #1312).
+#[tokio::test(flavor = "multi_thread")]
+async fn a_republish_restores_a_parked_reference_that_vanished() {
+    let Some(fixture) = try_start(Duration::from_secs(60)).await else {
+        return;
+    };
+    let queues = vec!["parked".to_string()];
+    let task_id = Uuid::new_v4();
+    let due = Utc::now() + chrono::Duration::milliseconds(400);
+
+    fixture
+        .dispatch
+        .publish(&[hint("parked", task_id, due)])
+        .await
+        .expect("publish");
+
+    // The parked reference goes; the marker stays.
+    let mut conn = fixture.raw.clone();
+    let _: i64 = redis::cmd("ZREM")
+        .arg(format!("{}:dispatch:parked:delayed", fixture.prefix))
+        .arg(task_id.to_string())
+        .query_async(&mut conn)
+        .await
+        .expect("zrem");
+    assert!(
+        fixture.marker_exists(task_id).await,
+        "the case needs the marker to outlive the parked reference"
+    );
+
+    fixture
+        .dispatch
+        .publish(&[hint("parked", task_id, due)])
+        .await
+        .expect("republish");
+
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    fixture.dispatch.maintain(&queues).await.expect("maintain");
+    let leases = read(&fixture, &queues, 10).await;
+    assert_eq!(
+        leases.len(),
+        1,
+        "a republish must restore a parked reference the marker can no longer account for"
+    );
+    assert_eq!(leases[0].task_id, task_id);
 }

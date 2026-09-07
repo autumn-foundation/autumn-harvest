@@ -35,6 +35,48 @@ pub const DEFAULT_DISPATCH_RECONCILE_BATCH: usize = 1000;
 /// Default cap for the release backoff of a gated reference.
 pub const DEFAULT_DISPATCH_RELEASE_BACKOFF_CAP: Duration = Duration::from_secs(30);
 
+/// Which worker pool a reference needs (issue #1312).
+///
+/// The value is the `harvest_task_queue.task_type` column. A worker runs
+/// workflow tasks and activity tasks on separate semaphores. A reference that
+/// does not say which pool it needs can only be weighed against the sum of the
+/// two.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum DispatchKind {
+    /// A workflow task. It runs on the workflow pool.
+    Workflow,
+    /// An activity task. It runs on the activity pool.
+    Activity,
+}
+
+impl DispatchKind {
+    /// The `task_type` column value for this kind.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Workflow => "workflow",
+            Self::Activity => "activity",
+        }
+    }
+}
+
+impl From<&str> for DispatchKind {
+    /// The kind a `task_type` column value names.
+    ///
+    /// A `CHECK` constraint holds the column to `workflow` or `activity`, so
+    /// only those two values reach this conversion. Any other value reads as a
+    /// workflow. That is the conservative half. A typical worker weighs a
+    /// workflow reference against the smaller pool of the two.
+    fn from(task_type: &str) -> Self {
+        if task_type == Self::Activity.as_str() {
+            Self::Activity
+        } else {
+            Self::Workflow
+        }
+    }
+}
+
 /// A reference to a claimable `harvest_task_queue` row.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DispatchHint {
@@ -48,6 +90,8 @@ pub struct DispatchHint {
     pub priority: i32,
     /// Shard the row lives on. `None` for a single-shard runtime.
     pub shard: Option<crate::types::ShardId>,
+    /// Pool the row needs. `None` for a reference of unknown type.
+    pub kind: Option<DispatchKind>,
 }
 
 /// One delivered reference. The worker must `ack` or `release` it.
@@ -63,6 +107,8 @@ pub struct DispatchLease {
     pub handle: String,
     /// Shard the row lives on. `None` for a single-shard runtime.
     pub shard: Option<crate::types::ShardId>,
+    /// Pool the row needs. `None` for a reference of unknown type.
+    pub kind: Option<DispatchKind>,
 }
 
 /// Counters returned by one maintenance pass.
@@ -510,6 +556,36 @@ async fn publisher_loop(mut receiver: tokio::sync::mpsc::Receiver<DispatchHint>)
 // Release backoff
 // ---------------------------------------------------------------------------
 
+/// Whether a queue name can travel through a dispatch channel (issue #1312).
+///
+/// A channel builds its keys from the queue name. The Redis channel joins key
+/// parts with a colon, so a name that holds one would address a key space that
+/// is not its own. An empty name addresses no key space at all.
+///
+/// The rule lives here, not in a channel implementation, because the worker and
+/// the plugin runner both apply it at startup. A channel rejects such a name on
+/// every call. A worker would otherwise stay on the Postgres fallback for all
+/// of its queues, and say nothing about it.
+///
+/// # Errors
+///
+/// Returns the operator-facing message when `queue_name` is empty or holds a
+/// colon.
+pub fn validate_queue_name(queue_name: &str) -> Result<(), String> {
+    if queue_name.is_empty() {
+        return Err(
+            "a dispatch channel cannot carry an empty queue name (issue #1312)".to_string(),
+        );
+    }
+    if queue_name.contains(':') {
+        return Err(format!(
+            "queue name \"{queue_name}\" holds a ':', which a dispatch channel uses to \
+             separate its key parts (issue #1312)"
+        ));
+    }
+    Ok(())
+}
+
 /// Delay before a released reference is delivered again.
 ///
 /// `min(cap, base * 2^redeliveries)`, saturating at `cap`. A gated row
@@ -543,6 +619,8 @@ struct MemoryEntry {
     due: DateTime<Utc>,
     redeliveries: u32,
     shard: Option<crate::types::ShardId>,
+    /// Pool the row needs, as the publish gave it.
+    kind: Option<DispatchKind>,
 }
 
 /// A reference delivered to a consumer and not yet acked.
@@ -777,6 +855,7 @@ impl TaskDispatch for MemoryDispatch {
                 due: hint.scheduled_at,
                 redeliveries: 0,
                 shard: hint.shard,
+                kind: hint.kind,
             };
             Self::place(&mut state, entry, now);
         }
@@ -822,6 +901,7 @@ impl TaskDispatch for MemoryDispatch {
                             redeliveries: entry.redeliveries,
                             handle: handle.clone(),
                             shard: entry.shard,
+                            kind: entry.kind,
                         });
                         state.inflight.insert(
                             handle,
@@ -921,6 +1001,7 @@ mod tests {
             scheduled_at: at,
             priority: 0,
             shard: None,
+            kind: Some(DispatchKind::Workflow),
         }
     }
 
@@ -935,6 +1016,58 @@ mod tests {
             .expect("read")
             .into_iter()
             .next()
+    }
+
+    /// The kind is the `task_type`
+    /// column, so the two spellings must not drift.
+    #[test]
+    fn a_dispatch_kind_is_the_task_type_column() {
+        assert_eq!(DispatchKind::Workflow.as_str(), "workflow");
+        assert_eq!(DispatchKind::Activity.as_str(), "activity");
+        assert_eq!(DispatchKind::from("workflow"), DispatchKind::Workflow);
+        assert_eq!(DispatchKind::from("activity"), DispatchKind::Activity);
+    }
+
+    /// A hint carries its kind through the channel to the lease, so the worker
+    /// can weigh the reference against the pool it needs.
+    #[tokio::test]
+    async fn a_lease_carries_the_kind_of_its_hint() {
+        let channel = MemoryDispatch::new();
+        let mut activity = hint("q", Utc::now());
+        activity.kind = Some(DispatchKind::Activity);
+        channel.publish(&[activity.clone()]).await.expect("publish");
+
+        let lease = read_one(&channel).await.expect("one lease");
+        assert_eq!(lease.task_id, activity.task_id);
+        assert_eq!(
+            lease.kind,
+            Some(DispatchKind::Activity),
+            "the lease must name the pool the reference needs"
+        );
+    }
+
+    /// The rule must reject exactly
+    /// what a channel implementation rejects, and nothing more.
+    #[test]
+    fn a_queue_name_with_a_colon_is_not_dispatchable() {
+        assert!(validate_queue_name("default").is_ok());
+        assert!(validate_queue_name("tenant-priority").is_ok());
+        assert!(validate_queue_name("a.b_c-1").is_ok());
+
+        let error = validate_queue_name("tenant:priority")
+            .expect_err("a colon separates the channel key space");
+        assert!(
+            error.contains("tenant:priority"),
+            "the message must name the queue: {error}"
+        );
+        assert!(
+            error.contains(':'),
+            "the message must name the rule: {error}"
+        );
+        assert!(
+            validate_queue_name("").is_err(),
+            "an empty queue name is not dispatchable"
+        );
     }
 
     #[test]
