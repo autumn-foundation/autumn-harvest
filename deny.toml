@@ -21,20 +21,41 @@ feature-depth = 1
 [advisories]
 yanked = "deny"
 ignore = [
-    # RUSTSEC-2026-0253 — lru 0.16.4, use-after-free in LruCache::pop() when
-    # a stored key/value's Drop panics mid-pop. This IS a direct dependency
-    # (autumn-harvest/src/cache.rs's WorkflowCache::remove calls
-    # LruCache::pop()), so usage exists. But the key type is `Uuid` (Copy, no
-    # custom Drop — cannot panic on drop) and the value type
-    # `CachedWorkflowState` (a Vec<WorkflowEvent> of plain data, no custom
-    # Drop either). Neither stored type can panic during drop, so this call
-    # site cannot trigger the UB the advisory describes.
-    # Verdict: unreachable (usage confirmed, exploitability requires a
-    # panicking Drop our types don't have). The fix (>=0.18.2) is a manifest
-    # bump (0.16 -> 0.18); good candidate for the first scheduled batch once
-    # a changelog read confirms no breaking API surface we use.
-    # Revisit: next scheduled batch.
-    { id = "RUSTSEC-2026-0253", reason = "unreachable: LruCache::pop() is called (cache.rs), but our key (Uuid) and value (CachedWorkflowState) types have no custom Drop, so the panic-during-drop precondition can't occur. Candidate for next scheduled batch (0.16->0.18 manifest bump). Revisit: next scheduled batch." },
+    # RUSTSEC-2026-0253 — lru, use-after-free in LruCache::pop() when a
+    # stored key's Drop panics mid-pop (pop() drops the key via
+    # ptr::drop_in_place before calling self.detach(), so a panicking Drop
+    # skips detach and leaves dangling list pointers). FIXED for our own
+    # instance in the scheduled-batch bump flagged by the prior Ballast PR:
+    # autumn-harvest/Cargo.toml's `lru = "0.16"` -> `"0.18"`, lockfile at
+    # 0.18.4 (patched >= 0.18.2). CHANGELOG.md read start to finish
+    # (0.16.4 -> 0.18.4): every entry is additive (new methods, MSRV bumps,
+    # this exact panic-safety fix); nothing touches new/put/get/pop/len/
+    # is_empty/cap, the only methods autumn-harvest/src/cache.rs calls.
+    # Rehearsal: `cargo check -p autumn-harvest --all-features` and
+    # `cargo test -p autumn-harvest --lib cache::` (8 tests) both green;
+    # `cargo check --workspace` green; the bump also unified with autumn-web's
+    # own transitive `lru` requirement (previously resolved separately at
+    # 0.18.0, itself still < 0.18.2 and therefore still affected) onto the
+    # same patched 0.18.4 instance, so autumn-web's exposure closes too as a
+    # side effect, not just ours.
+    #
+    # One instance remains in the graph and keeps this ignore entry alive:
+    # ratatui-core 0.1.0 pins `lru = "0.16"` in its own manifest (external,
+    # not ours to bump), resolving to 0.16.4 — still an affected version.
+    # Verdict: unreachable. Traced in ratatui-core's source
+    # (src/layout/layout.rs): its LAYOUT_CACHE never calls `pop()`; the only
+    # cache-shrinking call is `resize()`, which calls `pop_lru()`
+    # (lru-0.16.4/src/lib.rs:1358) via `remove_last()`. Read `pop()` (line
+    # 1278) against `pop_lru()` (line 1358) side by side in the 0.16.4
+    # source: only `pop()` drops the key in place before detaching; `pop_lru`
+    # never does that drop-then-detach sequence, so it cannot hit this bug
+    # regardless of the stored key/value types' Drop behavior. Key type is
+    # `(Rect, Layout)` regardless, and neither has a custom Drop impl (no
+    # `impl Drop` for either in ratatui-core's source) — so this instance is
+    # unreachable on two independent grounds, either of which is sufficient.
+    # Revisit: ratatui-core raises its own `lru` requirement past 0.18.2, or
+    # starts calling `pop()` on this cache.
+    { id = "RUSTSEC-2026-0253", reason = "unreachable: only remaining affected instance is ratatui-core 0.1.0's own `lru = \"0.16\"` pin (external, resolves 0.16.4); our own instance is fixed (0.18.4). ratatui-core's cache only calls pop_lru() via resize(), never the vulnerable pop(), and its key type (Rect, Layout) has no custom Drop either. Revisit: ratatui-core bumps past 0.18.2 or starts calling pop()." },
 
     # RUSTSEC-2026-0258 — h2, unbounded empty DATA frames. The hyper-1.x/
     # axum/autumn-web instance (h2 0.4.13) was fixed in the harness PR
