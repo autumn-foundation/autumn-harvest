@@ -609,10 +609,10 @@ pub async fn start_or_load_workflow_execution_collect(
     let exec_id = request.exec_id;
     let shard_id_value = request.shard_id();
 
-    // issue #1353 (Codex P2 review): reject an empty workflow_id here, at the
-    // one true engine primitive every start path funnels through. The
-    // `autumn-harvest-plugin` HTTP/outbox entry points already reject it
-    // earlier, but this is the boundary a direct library embedder cannot
+    // Reject an empty workflow_id here, at the one true engine primitive
+    // every start path funnels through (issue #1353). The
+    // `autumn-harvest-plugin` HTTP and outbox entry points already reject
+    // it earlier, but this is the boundary a direct library embedder cannot
     // route around. An empty business id is a value the by-id management API
     // can never resolve consistently. That is issue #1353's root cause. It is
     // never a valid identifier for a live, addressable execution.

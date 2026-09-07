@@ -59,6 +59,19 @@ reported.**
    "missing workflow_id" guard). Both functions now preserve a literal
    trailing slash as a distinct marker instead of dropping it.
 
+5. **Deferred-start admission.** Three more public entry points can create a
+   fresh execution later, not at call time: `debounce::admit_debounced_start`,
+   `throttle::reserve_or_defer`, and `event_batch::admit_batched_start`. Each
+   persists a row (or reserves a token) now and starts the run on a later
+   scanner tick. Each now rejects an empty `workflow_id` at admission, before
+   that row or token exists -- the same rule as point 1, applied where the
+   start and the validation are not the same call. A legacy row that
+   predates this change is handled at fire time instead:
+   `fire_claimed_debounce_row` and `fire_claimed_throttle_row` delete it and
+   log a warning rather than letting one bad row abort the whole scanner
+   batch's transaction (`event_batch`'s fire path already handled this
+   generically).
+
 **Scope.** No new `WorkflowEvent` variant, no migration, no `harvest_events`
 write -- pure input validation plus one additional route registration. The
 new route is wired into every manifest a by-id route touches: `CLASSIFIED_ROUTES`

@@ -355,6 +355,12 @@ pub async fn admit_debounced_start(
         )));
     }
 
+    // Reject an empty id before persisting a row (issue #1353). A stored
+    // deferred start with no id could only be discarded on fire, not started.
+    if params.workflow_id.is_empty() {
+        return Err(crate::error::HarvestError::EmptyWorkflowId);
+    }
+
     let now = Utc::now();
     // Clamp absurd/overflowing durations to a large-but-finite value and use
     // checked addition so an extreme `window`/`max_wait` can never panic.
@@ -944,10 +950,10 @@ async fn fire_claimed_debounce_row(
             );
             Ok(None)
         }
-        // issue #1353 (Codex P1 review): an empty workflow_id here can only
-        // be a LEGACY row. It predates this validation -- the admission
-        // path now rejects an empty id before a debounce row can ever be
-        // written. Such a row can never start, so retrying it changes
+        // An empty workflow_id here can only be a LEGACY row (issue #1353).
+        // It predates this validation -- the admission path now rejects an
+        // empty id before a debounce row can ever be written. Such a row
+        // can never start, so retrying it changes
         // nothing. An un-caught `?` here would abort this whole batch's
         // fire transaction. It would repeat the same failure every scanner
         // tick. That starves every later scanner duty for as long as the

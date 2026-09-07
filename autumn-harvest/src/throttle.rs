@@ -785,6 +785,13 @@ pub async fn reserve_or_defer(
     conn: &mut diesel_async::AsyncPgConnection,
     params: AdmitThrottleParams<'_>,
 ) -> crate::error::HarvestResult<ThrottleAdmission> {
+    // Reject an empty id before any lookup, reservation, or persisted row
+    // (issue #1353). A reserved token or deferred row with no id could only
+    // be discarded on fire, not started.
+    if params.workflow_id.is_empty() {
+        return Err(crate::error::HarvestError::EmptyWorkflowId);
+    }
+
     // (0) Bypass entirely when an active execution already makes this
     // admission a no-op or an immediate reject under the caller's reuse
     // policy. TerminateIfRunning always starts fresh (cancel + replace), so
@@ -1192,8 +1199,8 @@ async fn fire_claimed_throttle_row(
             );
             Ok(None)
         }
-        // issue #1353 (Codex P1 review): mirrors the identical arm in
-        // `debounce.rs::fire_claimed_debounce_row`. An empty workflow_id
+        // Mirrors the identical arm in `debounce.rs::fire_claimed_debounce_row`
+        // (issue #1353). An empty workflow_id
         // here can only be a LEGACY row. The admission path now rejects an
         // empty id before a throttle row can ever be written. Such a row
         // can never start. An un-caught `?` would abort this whole batch's

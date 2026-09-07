@@ -16304,9 +16304,9 @@ pub(crate) async fn start_workflow(
         }
     };
 
-    // `audit_context` and `route` are cheap (no DB, no runtime); computed once
-    // here since the rest of this handler (the registry check below, the
-    // #1353 empty-workflow_id check further down, the probe) all need them.
+    // `audit_context` and `route` are cheap: no DB call, no runtime cost.
+    // Compute them once here. The registry check, the issue #1353
+    // empty-workflow_id check, and the probe below all need them.
     let (actor, source, request_id) = audit_context(&headers, &api_state);
     let route = "POST /workflows/{workflow_name}/start";
 
@@ -16731,12 +16731,12 @@ pub(crate) async fn start_workflow(
         return resp;
     }
 
-    // issue #1353 (Codex P2 review, round 4): fresh-start-only validation,
-    // like every check below. It runs AFTER the committed-replay probe
-    // above. A keyed start that (pre-#1353) committed under an empty
-    // workflow_id can still be retried. Such a retry must return the `200`
-    // no-op, not a `400`. A `400` here would contradict the retry's own
-    // prior success. It would also audit a working retry as a failure.
+    // This check is fresh-start-only, like every check below (issue #1353).
+    // It runs AFTER the committed-replay probe above. A keyed start that
+    // (pre-#1353) committed under an empty workflow_id can still be
+    // retried. Such a retry must return the `200` no-op, not a `400`. A
+    // `400` here would contradict the retry's own prior success. It would
+    // also audit a working retry as a failure.
     if let Err(resp) = reject_empty_workflow_id(Some(workflow_id.as_str())) {
         audit_start_failure(
             &api_state,
@@ -20688,13 +20688,13 @@ pub(crate) async fn signal_with_start_workflow(
         return resp;
     }
 
-    // issue #1353 (Codex P2 review, round 4): fresh-start-only validation,
-    // like every check below. It runs AFTER the committed-replay probe
-    // above. `start_workflow` orders its own check the same way, for the
-    // same reason. A keyed signal-with-start that (pre-#1353) committed
-    // under an empty workflow_id can still be retried. Such a retry must
-    // replay its `200` no-op, not a `400`. A `400` here would contradict
-    // the retry's own prior success.
+    // This check is fresh-start-only, like every check below (issue #1353).
+    // It runs AFTER the committed-replay probe above. `start_workflow`
+    // orders its own check the same way, for the same reason. A keyed
+    // signal-with-start that (pre-#1353) committed under an empty
+    // workflow_id can still be retried. Such a retry must replay its `200`
+    // no-op, not a `400`. A `400` here would contradict the retry's own
+    // prior success.
     if let Err(resp) = reject_empty_workflow_id(Some(workflow_id.as_str())) {
         if let Ok(pool) = api_state.storage_pool()
             && let Ok(mut conn) = acquire_conn(pool.default_pool()).await
@@ -21423,12 +21423,12 @@ async fn update_with_start_workflow(
         None
     };
 
-    // issue #1353 (Codex P2 review, round 4): fresh-start-only validation,
-    // gated the same way the admission-gate and #373 schema checks below are
-    // -- skipped on a committed-replay hit. A keyed update-with-start that
-    // (pre-#1353) committed under an empty workflow_id can still be
-    // retried. Such a retry must replay its cached admission, not a `400`
-    // that contradicts its own prior success.
+    // This check is fresh-start-only (issue #1353). It is gated the same
+    // way the admission-gate and #373 schema checks below are: skipped on
+    // a committed-replay hit. A keyed update-with-start that (pre-#1353)
+    // committed under an empty workflow_id can still be retried. Such a
+    // retry must replay its cached admission, not a `400` that contradicts
+    // its own prior success.
     if probe_outcome.is_none()
         && let Err(resp) = reject_empty_workflow_id(Some(workflow_id.as_str()))
     {
