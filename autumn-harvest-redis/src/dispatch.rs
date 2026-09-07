@@ -359,40 +359,32 @@ impl RedisDispatch {
         &self,
         queues: &[String],
         interval: Duration,
-    ) -> HarvestResult<()> {
-        let now = Utc::now().timestamp_millis();
+    ) -> RedisAdapterResult<()> {
         let interval_ms = i64::try_from(interval.as_millis()).unwrap_or(i64::MAX);
-        let last = self.last_promote_ms.load(Ordering::Relaxed);
-        if now.saturating_sub(last) < interval_ms {
+        if !claim_rate_limit_slot(
+            &self.last_promote_ms,
+            Utc::now().timestamp_millis(),
+            interval_ms,
+        ) {
             return Ok(());
         }
-        if self
-            .last_promote_ms
-            .compare_exchange(last, now, Ordering::AcqRel, Ordering::Relaxed)
-            .is_err()
-        {
-            // Another task took this pass.
-            return Ok(());
-        }
-        self.promote_queues(queues)
-            .await
-            .map_err(|err| to_harvest(&err))?;
+        self.promote_queues(queues).await?;
         Ok(())
     }
 
     /// Whether a recovery pass is due, claiming the slot when it is.
+    ///
+    /// Recovery runs twice per visibility timeout, so a reference left by a
+    /// dead consumer waits at most one and a half timeouts.
     fn recovery_is_due(&self) -> bool {
-        let now = Utc::now().timestamp_millis();
         let interval_ms = i64::try_from(self.config.visibility_timeout.as_millis() / 2)
             .unwrap_or(i64::MAX)
             .max(1);
-        let last = self.last_recover_ms.load(Ordering::Relaxed);
-        if now.saturating_sub(last) < interval_ms {
-            return false;
-        }
-        self.last_recover_ms
-            .compare_exchange(last, now, Ordering::AcqRel, Ordering::Relaxed)
-            .is_ok()
+        claim_rate_limit_slot(
+            &self.last_recover_ms,
+            Utc::now().timestamp_millis(),
+            interval_ms,
+        )
     }
 
     async fn read_group(
@@ -696,9 +688,7 @@ impl RedisDispatch {
 #[async_trait]
 impl TaskDispatch for RedisDispatch {
     async fn publish(&self, hints: &[DispatchHint]) -> HarvestResult<()> {
-        self.publish_inner(hints)
-            .await
-            .map_err(|err| to_harvest(&err))
+        harvest(self.publish_inner(hints).await)
     }
 
     async fn next(
@@ -711,34 +701,25 @@ impl TaskDispatch for RedisDispatch {
         if queues.is_empty() || max == 0 {
             return Ok(Vec::new());
         }
-        self.promote_rate_limited(queues, wait).await?;
-        self.next_inner(queues, consumer, max, wait)
-            .await
-            .map_err(|err| to_harvest(&err))
+        harvest(self.promote_rate_limited(queues, wait).await)?;
+        harvest(self.next_inner(queues, consumer, max, wait).await)
     }
 
     async fn ack(&self, lease: &DispatchLease) -> HarvestResult<()> {
-        self.ack_inner(lease).await.map_err(|err| to_harvest(&err))
+        harvest(self.ack_inner(lease).await)
     }
 
     async fn release(&self, lease: &DispatchLease, delay: Duration) -> HarvestResult<()> {
-        self.release_inner(lease, delay)
-            .await
-            .map_err(|err| to_harvest(&err))
+        harvest(self.release_inner(lease, delay).await)
     }
 
     async fn maintain(&self, queues: &[String]) -> HarvestResult<DispatchMaintenance> {
         if queues.is_empty() {
             return Ok(DispatchMaintenance::default());
         }
-        let promoted = self
-            .promote_queues(queues)
-            .await
-            .map_err(|err| to_harvest(&err))?;
+        let promoted = harvest(self.promote_queues(queues).await)?;
         let recovered = if self.recovery_is_due() {
-            self.recover_queues(queues)
-                .await
-                .map_err(|err| to_harvest(&err))?
+            harvest(self.recover_queues(queues).await)?
         } else {
             0
         };
@@ -749,12 +730,25 @@ impl TaskDispatch for RedisDispatch {
     }
 }
 
-/// Map an adapter error onto the engine's dispatch error.
+/// Map an adapter result onto the engine's dispatch result.
 ///
 /// The worker treats any dispatch error as a signal to fall back to the
 /// Postgres claim path. The message is diagnostic only.
-fn to_harvest(err: &RedisAdapterError) -> HarvestError {
-    HarvestError::Dispatch(err.to_string())
+fn harvest<T>(result: RedisAdapterResult<T>) -> HarvestResult<T> {
+    result.map_err(|err| HarvestError::Dispatch(err.to_string()))
+}
+
+/// Claim a rate-limited slot, returning whether the caller may run the pass.
+///
+/// The compare and exchange makes exactly one of several concurrent callers
+/// win, so a busy worker never runs the same pass twice at once.
+fn claim_rate_limit_slot(slot: &AtomicI64, now_ms: i64, interval_ms: i64) -> bool {
+    let last = slot.load(Ordering::Relaxed);
+    if now_ms.saturating_sub(last) < interval_ms {
+        return false;
+    }
+    slot.compare_exchange(last, now_ms, Ordering::AcqRel, Ordering::Relaxed)
+        .is_ok()
 }
 
 /// Read the `payload` field of a stream entry.
@@ -948,6 +942,45 @@ mod tests {
             .expect_err("an error reply must extract into a RedisError");
         assert_eq!(err.code(), Some("NOGROUP"));
         assert!(is_nogroup(&err));
+    }
+
+    #[test]
+    fn a_rate_limit_slot_admits_one_caller_per_interval() {
+        let slot = AtomicI64::new(0);
+        assert!(
+            claim_rate_limit_slot(&slot, 1_000, 500),
+            "the first pass always runs"
+        );
+        assert!(
+            !claim_rate_limit_slot(&slot, 1_400, 500),
+            "a second pass inside the interval is skipped"
+        );
+        assert!(
+            claim_rate_limit_slot(&slot, 1_500, 500),
+            "a pass at the interval runs again"
+        );
+    }
+
+    #[test]
+    fn a_zero_interval_never_rate_limits() {
+        let slot = AtomicI64::new(0);
+        assert!(claim_rate_limit_slot(&slot, 10, 0));
+        assert!(claim_rate_limit_slot(&slot, 10, 0));
+    }
+
+    #[test]
+    fn an_adapter_error_maps_onto_the_dispatch_error() {
+        let err = RedisAdapterError::InvalidQueueName("bad name".to_string());
+        let mapped = harvest::<()>(Err(err)).expect_err("an error must stay an error");
+        match mapped {
+            HarvestError::Dispatch(message) => {
+                assert!(
+                    message.contains("bad name"),
+                    "the message must carry the cause: {message}"
+                );
+            }
+            other => panic!("expected a dispatch error, got {other:?}"),
+        }
     }
 
     #[test]
