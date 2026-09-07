@@ -909,10 +909,19 @@ pub async fn discard_dead_letters_batch(
 /// statement, without re-enqueueing. When `filter.dry_run` is `true`, no
 /// deletes are performed.
 ///
+/// A failure of the batched delete itself (statement timeout, lock
+/// contention) is **not** returned as an `Err`: it is captured into the
+/// returned [`BulkDlqResult::failures`], one [`BulkDlqFailure`] per
+/// selected id, with `acted_on` left at `0`. Callers that only check the
+/// outer `Result` — including a bare `?` — will treat this as success;
+/// inspect `failures` to detect it, exactly as callers of
+/// [`bulk_replay_dead_letters`] already must.
+///
 /// # Errors
 ///
-/// Returns [`HarvestError::Database`] if the initial filter query, or the
-/// batched delete itself, fails.
+/// Returns [`HarvestError::Database`] if the initial filter query (row
+/// selection or the `matched` count) fails, before any delete is
+/// attempted.
 pub async fn bulk_discard_dead_letters(
     conn: &mut AsyncPgConnection,
     filter: &BulkDlqFilter,
