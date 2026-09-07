@@ -1,4 +1,4 @@
-# ⛏️ Prospect: does multi-queue `ANY($1)` explain ledger #5's #1177-baseline discrepancy? (refuted: Sort node persists at cardinality 1, 195 buffers, `ANY` vs 53 buffers, `=`)
+# ⛏️ Prospect: does multi-queue `ANY($1)` explain ledger #5's #1177-baseline discrepancy? (confirmed, per its own literal registered intervention: 0 vs 3 Sort-node lines — see ledger #7 for the production-representative follow-up)
 
 ## 🎯 Question
 
@@ -12,13 +12,12 @@ already names one variable that reproduction didn't hold constant against
 #1177's own fixture: `queue_name = ANY($1)` over several queues, versus
 #1177's single-queue seed.
 
-**Falsifiable question:** holding backlog depth (10,000 matching rows),
-index bias, and query text otherwise identical, does reducing ledger #5's
-apparatus from 4 queues to 1 — keeping the production-representative
-`queue_name = ANY($2)` binding shape (`autumn-harvest/src/queue.rs:641`
-always binds this way, never a scalar equality, regardless of how many
-queues a worker polls) — reproduce issue #1177's reported plan shape:
-`Index Scan using idx_harvest_tq_poll`, **zero** `Sort` nodes?
+**Falsifiable question, exactly as pre-registered:** holding backlog depth
+(10,000 matching rows), index bias, and query text otherwise identical,
+does replacing the 4-queue `queue_name = ANY(ARRAY[...])` predicate with a
+single-queue `queue_name = 'bench-q-0'` **scalar equality** reproduce issue
+#1177's reported plan shape — `Index Scan using idx_harvest_tq_poll`,
+**zero** `Sort` nodes?
 
 **Decision this feeds:** whoever next re-charters issue #1340's
 seek-and-refine work (ledger #5's own named successor) needs to know
@@ -33,7 +32,9 @@ owner.
 
 Committed before any measurement:
 [`docs/rnd/2026-09-07-claim-1177-baseline-queue-count-preregistration.md`](../rnd/2026-09-07-claim-1177-baseline-queue-count-preregistration.md)
-(commit `fffeef6`).
+(commit `fffeef6`). Its own text (lines 38-48) defines the single-queue
+intervention explicitly as scalar equality, `queue_name = 'bench-q-0'` —
+not `ANY()` over a single-element array.
 
 - **Confirms:** single-queue run's `EXPLAIN` contains `Index Scan using
   idx_harvest_tq_poll` and zero `Sort` nodes.
@@ -42,44 +43,43 @@ Committed before any measurement:
 - No partial credit; an ambiguous shape (e.g. `Bitmap Heap Scan`) reports
   as undetermined.
 
-## ⚠️ Post-review corrections (Codex)
+## ⚠️ Post-review corrections and a self-correction (Codex, two rounds)
 
-This assay's first pass (commit `7dcf677`) operationalized "single-queue"
-as `queue_name = 'bench-q-0'` — scalar equality — and reported a
-**confirmed** verdict on that basis. Two review findings on the PR caught
-real defects in that pass, both verified against the codebase before this
-report was rewritten:
+**Round 1 (P2, legitimate, fixed in place):** the first pass's custom
+`seed_single_queue.sql` omitted `concurrency_key`/`concurrency_cap`, while
+ledger #5's own `seed.sql` (reused for the multi-queue control) populates
+both on every row — different tuple width, so the original 591-vs-53-buffer
+comparison wasn't from otherwise-identical row shapes. Fixed by deleting
+the custom seed and reusing `../0005-claim-batched-seek-and-refine/seed.sql`
+directly for every arm, varying only its `queues` parameter. Re-running
+the **pre-registered scalar-equality intervention** with the corrected
+seed still shows zero `Sort` nodes (53 buffers) — the fix changes the
+measurement's rigor, not its verdict.
 
-1. **P1 — the scalar-equality test isn't production-representative.** The
-   claim path's actual query (`autumn-harvest/src/queue.rs:641`,
-   confirmed by reading the file) binds `queue_name = ANY($2)`
-   unconditionally — there is no code path where a single-queue worker
-   gets scalar equality instead. The original test therefore showed only
-   that scalar equality is cheap (never in question) and said nothing
-   about what a real single-queue deployment's plan looks like. Fixed by
-   adding `single_queue_any_diagnostic.sql`: the same query, same bias,
-   `ANY(ARRAY['bench-q-0'])` — a single-element array, the actual shape a
-   one-queue worker binds. The scalar-equality file is kept only as a
-   secondary sanity check, relabeled as such, not as this assay's
-   evidence.
-2. **P2 — the original single-queue seed wasn't row-identical to the
-   control's.** The custom `seed_single_queue.sql` omitted
-   `concurrency_key`/`concurrency_cap`, while ledger #5's own `seed.sql`
-   (reused unmodified for the multi-queue control) populates both on every
-   row — different tuple width, so the reported 591-vs-53-buffer
-   comparison wasn't from otherwise-identical row shapes. Fixed by
-   deleting the custom seed and reusing `../0005-claim-batched-seek-and-refine/seed.sql`
-   directly for every arm, varying only its `queues` parameter (4 for the
-   control, 1 for both single-queue arms; `keys=256`, `running_rows=0`
-   unchanged throughout).
+**Round 1 (P1) and this assay's own overcorrection, since reverted:** a
+second finding (verified against `autumn-harvest/src/queue.rs:641`) noted
+that scalar equality is not a shape any production code path takes — the
+claim path always binds `queue_name = ANY($2)`, even for a single-queue
+worker. That is true and important, but this assay's first response to it
+was wrong: it substituted an `ANY(ARRAY['bench-q-0'])` arm for the
+pre-registered scalar-equality one, found a `Sort` node there, and used
+*that* result to flip this assay's own verdict to "refuted." **A second
+Codex review round (P1, round 2) caught the error**: the committed
+pre-registration's own text defines "single-queue" as scalar equality, and
+that intervention passed its own stated criterion — grading a different,
+unregistered intervention instead and reporting a reversed verdict is
+exactly the after-the-fact goalpost-moving this ledger's own charter
+forbids ("a discovery... spawns an explicitly re-chartered assay — it
+never edits this one").
 
-Rerunning with both fixes **reverses the verdict** — see below. This is
-exactly the "genuinely learned the line was miscalibrated" case the
-pre-registration's own terms anticipate: the committed pass/fail criteria
-did not move, but what "single-queue" means was corrected to the shape
-that actually answers the question, following the same in-place
-post-review-correction pattern ledger #3/#4/#5 established for apparatus
-defects a reviewer catches before the report is trusted.
+**This report is the correction of that overcorrection.** The verdict
+below is graded against the pre-registration's own literal, committed
+criteria — scalar equality — and nothing else. The `ANY()`-cardinality
+question is real, was worth asking, and now has its own proper
+pre-registration and its own report:
+[ledger #7](0007-claim-any-cardinality.md). Its finding does **not**
+change this assay's verdict; it answers a different, explicitly
+re-chartered question.
 
 ## 🔍 Prior art
 
@@ -96,14 +96,14 @@ internal to this repo's own prior measurements.
 
 - `schema.sql` — ledger #5's own `harvest_task_queue` + `idx_harvest_tq_poll`,
   copied unmodified.
-- `single_queue_any_diagnostic.sql` — **the corrected, production-representative
-  test.** Ledger #5's `forced_index_no_tiebreak_diagnostic.sql`, with the
-  queue predicate changed to `queue_name = ANY(ARRAY['bench-q-0'])` — a
-  single-element array, varying only cardinality against the control's
-  4-element array, matching the operator shape `queue.rs` actually uses.
-- `single_queue_diagnostic.sql` — secondary arm, scalar equality
-  (`queue_name = 'bench-q-0'`); kept as a sanity check, not evidence for
-  this assay's verdict (see post-review §1 above).
+- `single_queue_diagnostic.sql` — **the pre-registered test.** Ledger #5's
+  `forced_index_no_tiebreak_diagnostic.sql`, with the queue predicate
+  changed to scalar equality (`queue_name = 'bench-q-0'`). Everything
+  else — the index bias, the base predicate, the `ORDER BY` (no `id`
+  tiebreak), `LIMIT 50`, `FOR UPDATE SKIP LOCKED` — copied verbatim.
+- `single_queue_any_diagnostic.sql` — the arm this assay does **not**
+  grade (see post-review above); its own question and finding live in
+  [ledger #7](0007-claim-any-cardinality.md).
 - `multi_queue_control.sql` — the control: ledger #5's own
   `forced_index_no_tiebreak_diagnostic.sql` re-run unmodified (4-queue
   `ANY`), to confirm the phenomenon reproduces on *this* Postgres instance
@@ -125,101 +125,56 @@ same `enable_seqscan`/`enable_bitmapscan = off` bias, same rolled-back
 transaction, same `LIMIT 50`, same `FOR UPDATE SKIP LOCKED`.
 
 **Control** (4-queue `ANY`, 10,000 rows spread round-robin across
-`bench-q-0..3`):
+`bench-q-0..3`): `Sort` node present, `Index Scan` reads all 10,000
+matching rows, 591 buffers, 4.933ms.
 
-```
-Limit (actual rows=50)         Buffers: shared hit=591   Execution Time: 4.391ms
-  LockRows (actual rows=50)
-    Sort (actual rows=50)      Sort Key: priority DESC, scheduled_at
-      Index Scan using idx_harvest_tq_poll (actual rows=10000)
-      Index Cond: queue_name = ANY('{bench-q-0,bench-q-1,bench-q-2,bench-q-3}'::text[]) ...
-```
+**Pre-registered test** (single-queue scalar equality, all 10,000 rows in
+`bench-q-0`): **no `Sort` node**, bounded scan (50 rows read, matching
+`LIMIT`), 53 buffers, 0.109ms.
 
-**Test** (single-queue `ANY`, all 10,000 rows in `bench-q-0`, single-element array):
+**Not graded here — see ledger #7** (single-queue `ANY` over a
+single-element array): `Sort` node present, full 10,000-row scan, 195
+buffers.
 
-```
-Limit (actual rows=50)         Buffers: shared hit=195   Execution Time: 13.942ms
-  LockRows (actual rows=50)
-    Sort (actual rows=50)      Sort Key: priority DESC, scheduled_at
-      Index Scan using idx_harvest_tq_poll (actual rows=10000)
-      Index Cond: queue_name = ANY('{bench-q-0}'::text[]) ...
-```
-
-**A `Sort` node is still present**, and the `Index Scan` still reads all
-10,000 matching rows rather than the `LIMIT`ed 50 — structurally identical
-to the 4-queue control, just cheaper in absolute buffers because the
-underlying index range scanned is smaller. Cardinality dropped from 4 to
-1; the plan shape did not change. (Execution time is noisier than buffers
-at this scale — 13.942ms here vs. 4.391ms for the nominally more-expensive
-control — and is not read as a signal on its own; buffer counts and plan
-shape are.)
-
-**Secondary arm** (single-queue scalar equality, same seed):
-
-```
-Limit (actual rows=50)         Buffers: shared hit=53    Execution Time: 0.111ms
-  LockRows (actual rows=50)
-    Index Scan using idx_harvest_tq_poll (actual rows=50)
-    Index Cond: queue_name = 'bench-q-0' ...
-```
-
-No `Sort` node, bounded scan (50 rows read, matching `LIMIT`) — this is
-the result the original pass reported and mistook for the answer to the
-production-relevant question.
-
-`grep -c` for a `Sort` node's constituent lines (`Sort` node line +
-`Sort Key` line): control 2, single-queue `ANY` 2, single-queue scalar 0.
-Full output archived at
+`grep -c "Sort Key"`: control 1, pre-registered scalar test 0, `ANY`
+arm (ledger #7's own evidence) 1. Full output archived at
 [`results/multi_queue_control.explain.txt`](apparatus/0006-claim-1177-baseline-queue-count/results/multi_queue_control.explain.txt),
-[`results/single_queue_any.explain.txt`](apparatus/0006-claim-1177-baseline-queue-count/results/single_queue_any.explain.txt),
-[`results/single_queue_scalar.explain.txt`](apparatus/0006-claim-1177-baseline-queue-count/results/single_queue_scalar.explain.txt).
+[`results/single_queue_scalar.explain.txt`](apparatus/0006-claim-1177-baseline-queue-count/results/single_queue_scalar.explain.txt),
+[`results/single_queue_any.explain.txt`](apparatus/0006-claim-1177-baseline-queue-count/results/single_queue_any.explain.txt).
 
-**Against the line:** the production-representative single-queue run
-(`ANY` over a single-element array) still shows a `Sort` node — this
-**refutes** the pre-registered hypothesis, cleanly, with no ambiguity to
-adjudicate.
+**Against the line:** the pre-registered single-queue run (scalar
+equality) shows `Index Scan using idx_harvest_tq_poll`, zero `Sort`
+nodes — **confirms** the pre-registered hypothesis exactly, with no
+ambiguity to adjudicate.
 
 ## 🏁 Verdict
 
-**Refuted.** Multi-queue cardinality does not explain ledger #5's
-`Sort`-node discrepancy against issue #1177's reported baseline: dropping
-from 4 queues to 1, while keeping the `ANY()` operator shape the
-production claim path actually uses, changes nothing structural about the
-plan — `Sort` node present, full 10,000-row scan, both times. Only
-switching the operator itself, from `ANY()` to scalar `=` — a change no
-production code path makes — eliminates the `Sort` node and restores
-bounded `LIMIT` pushdown (53 buffers, 0 `Sort` nodes, vs. 195 buffers, a
-`Sort` node present, at identical cardinality and identical seed).
+**Confirmed**, graded strictly against this assay's own committed,
+literal criteria: swapping the 4-queue `ANY()` predicate for a
+single-queue scalar-equality predicate — the intervention the
+pre-registration actually specified — eliminates the `Sort` node and
+restores bounded `LIMIT` pushdown (53 vs. 591 buffers, at identical
+backlog depth and identical row shape).
 
-**This is a more consequential finding than the confirmed verdict it
-replaces, and a worse one for the decision it feeds.** It does not resolve
-ledger #5's "unresolved discrepancy against #1177" — it deepens it:
-`docs/performance.md` reports that issue #1177's own baseline, using the
-identical `ANY($1)` binding, returned a clean `Index Scan` with no `Sort`
-at *some* undocumented cardinality. This apparatus cannot reproduce that
-clean shape via `ANY()` at cardinality 1, the cardinality most favorable
-to sort-elision working (a single-element array is, semantically, exactly
-one value). Two possibilities remain open and this assay cannot
-distinguish between them: (a) something about this apparatus or Postgres
-instance differs from #1177's own reproduction in a way neither this nor
-ledger #5's apparatus has isolated, or (b) `ANY()` genuinely never gets
-sort-elision from this planner regardless of array cardinality, and
-#1177's own reported clean baseline came from a scalar-equality query, not
-an `ANY()` one, despite its own text describing the binding as `ANY($1)`.
-Both are new, un-chartered pits, not settled by this apparatus.
+**What this resolves, and what it doesn't — read narrowly.** This assay
+establishes that *some* single-value queue predicate gets the cheap plan
+where a 4-value `ANY()` predicate doesn't; it does **not** establish that
+this is because of *cardinality* per se, and it does **not** establish
+that a real single-queue deployment gets this plan, since
+`autumn-harvest/src/queue.rs:641` never emits scalar equality — every
+deployment, one queue or many, binds `ANY($2)`. That distinction is
+exactly what [ledger #7](0007-claim-any-cardinality.md) was chartered to
+resolve, and its answer is a `Sort` node persists under `ANY()` even at
+cardinality 1 — so this assay's confirmed result, while accurate to its
+own letter, should not be read as "single-queue deployments are cheap."
+It answers the narrower question it actually pre-registered: the discrete
+identity of the 4-queue `ANY()` predicate, not queue count in the
+abstract, is what a scalar-equality control lacks.
 
-**For the named decider:** the corrected, load-bearing finding is that
-queue count is **not** a safe independent axis to treat as "cheap at low
-cardinality" — a single-queue worker, using the query shape
-`queue.rs` actually emits, gets the same `Sort`-and-full-scan plan a
-4-queue worker does, at this apparatus's measured 10,000-row depth. Any
-future #1340 re-charter should not assume single-queue deployments get a
-free pass on this specific `ORDER BY`/`LIMIT` cost; that assumption, which
-this assay's own first pass asserted, is now retracted. Whether the
-`ANY()`-vs-`=` operator gap itself is worth a further re-charter (e.g.
-checking whether Postgres's planner ever elides sort for `ANY()` over one
-element, independent of this schema) is a new, separate, un-chartered
-question — not answered here.
+**For the named decider:** do not use this report alone to conclude
+single-queue deployments avoid this cost — read it together with ledger
+#7, whose finding is the operationally relevant one for any real
+deployment shape.
 
 ## 💰 Cost to productionize
 
@@ -234,13 +189,12 @@ sudo -u postgres createdb prospect_assay6   # or any local, non-production Postg
 cd docs/assays/apparatus/0006-claim-1177-baseline-queue-count
 sudo -u postgres PGDATABASE=prospect_assay6 ./run_assay.sh
 grep -c "Sort Key" results/multi_queue_control.explain.txt   # 1
-grep -c "Sort Key" results/single_queue_any.explain.txt      # 1
-grep -c "Sort Key" results/single_queue_scalar.explain.txt   # 0
+grep -c "Sort Key" results/single_queue_scalar.explain.txt   # 0 -- this assay's own line
+grep -c "Sort Key" results/single_queue_any.explain.txt      # 1 -- ledger #7's evidence, not graded here
 ```
 
-`schema.sql`, `single_queue_any_diagnostic.sql`,
-`single_queue_diagnostic.sql`, `multi_queue_control.sql`, `run_assay.sh`,
-and the full `results/*.txt` / `results/run.log` this report draws from
-are archived alongside this report. No migration was added to
-`autumn-harvest/migrations/`; no crate code changed. The prototype does
-not merge.
+`schema.sql`, `single_queue_diagnostic.sql`, `single_queue_any_diagnostic.sql`,
+`multi_queue_control.sql`, `run_assay.sh`, and the full `results/*.txt` /
+`results/run.log` this report draws from are archived alongside this
+report. No migration was added to `autumn-harvest/migrations/`; no crate
+code changed. The prototype does not merge.

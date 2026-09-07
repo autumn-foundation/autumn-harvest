@@ -17,7 +17,7 @@ SET
  Planning:
    Buffers: shared hit=172
  Planning Time: 0.513 ms
- Execution Time: 0.111 ms
+ Execution Time: 0.109 ms
 (15 rows)
 
 ROLLBACK
