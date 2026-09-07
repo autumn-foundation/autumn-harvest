@@ -1343,8 +1343,8 @@ mod tests {
             "unexpected error: {err}"
         );
         assert!(
-            err.to_string().contains("tls"),
-            "the message must name the feature: {err}"
+            err.to_string().contains("TLS is not supported"),
+            "the message must state the limit: {err}"
         );
         assert!(check_tls_support("redis://host:6379").is_ok());
     }
