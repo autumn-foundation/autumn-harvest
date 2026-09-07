@@ -292,8 +292,8 @@ impl RedisDispatch {
     /// # Errors
     ///
     /// Returns [`RedisAdapterError::InvalidConfig`] for an unusable `config`.
-    /// Returns [`RedisAdapterError::TlsUnavailable`] for a `rediss://` URL
-    /// without the crate's `tls` feature. Returns
+    /// Returns [`RedisAdapterError::TlsUnavailable`] for a `rediss://` URL,
+    /// because this release carries no TLS transport. Returns
     /// [`RedisAdapterError::ConnectTimeout`] when the server does not answer
     /// inside the connect timeout. Returns [`RedisAdapterError::Redis`] when
     /// the URL cannot be parsed, or when the server refuses the connection.
@@ -892,9 +892,6 @@ async fn open_manager(client: &redis::Client) -> RedisAdapterResult<ConnectionMa
     }
 }
 
-/// Whether this build carries the crate's `tls` feature.
-const TLS_ENABLED: bool = cfg!(feature = "tls");
-
 /// Whether a URL asks for TLS.
 fn is_tls_url(url: &str) -> bool {
     url.trim_start()
@@ -902,13 +899,15 @@ fn is_tls_url(url: &str) -> bool {
         .is_some_and(|(scheme, _)| scheme.eq_ignore_ascii_case("rediss"))
 }
 
-/// Reject a TLS URL when the crate is built without the `tls` feature.
+/// Reject a TLS URL.
 ///
-/// `redis` only speaks TLS when its own TLS feature is on. Without it a
-/// `rediss://` URL fails deep inside the client with a message that does not
-/// name the cause. This check names the feature instead.
+/// The workspace `redis` dependency carries no TLS feature in this release.
+/// Its TLS stack depends on the unmaintained `rustls-pemfile` crate, which the
+/// dependency ledger (`cargo deny`) refuses. Without this check a `rediss://`
+/// URL fails deep inside the client with a message that does not name the
+/// cause. Issue #1429 tracks TLS support.
 fn check_tls_support(url: &str) -> RedisAdapterResult<()> {
-    if is_tls_url(url) && !TLS_ENABLED {
+    if is_tls_url(url) {
         return Err(RedisAdapterError::TlsUnavailable);
     }
     Ok(())
@@ -1336,9 +1335,8 @@ mod tests {
         assert!(!is_tls_url("host:6379"));
     }
 
-    #[cfg(not(feature = "tls"))]
     #[test]
-    fn a_tls_url_is_rejected_without_the_tls_feature() {
+    fn a_tls_url_is_rejected() {
         let err = check_tls_support("rediss://host:6379").expect_err("TLS must be rejected");
         assert!(
             matches!(err, RedisAdapterError::TlsUnavailable),
@@ -1351,9 +1349,8 @@ mod tests {
         assert!(check_tls_support("redis://host:6379").is_ok());
     }
 
-    #[cfg(not(feature = "tls"))]
     #[tokio::test]
-    async fn connect_rejects_a_tls_url_without_the_tls_feature() {
+    async fn connect_rejects_a_tls_url() {
         let err = RedisDispatch::connect("rediss://127.0.0.1:6379", RedisDispatchConfig::default())
             .await
             .expect_err("TLS must be rejected before any connection attempt");

@@ -36,9 +36,11 @@ pub enum RedisAdapterError {
     /// A `rediss://` URL was given, but the crate was built without the `tls`
     /// feature.
     ///
-    /// The message names the feature rather than the URL. A dispatch URL
-    /// carries the password, so it never reaches an error string.
-    #[error("TLS is off: build autumn-harvest-redis with the `tls` feature to use a rediss:// url")]
+    /// The message never repeats the URL. A dispatch URL carries the
+    /// password, so it never reaches an error string.
+    #[error(
+        "TLS is not supported in this release: use a redis:// url (issue #1429 tracks rediss://)"
+    )]
     TlsUnavailable,
 
     /// The connection was not established inside the connect timeout.

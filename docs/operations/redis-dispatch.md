@@ -123,14 +123,11 @@ The connection is plaintext by default. A `redis://` URL sends the password
 in cleartext, and every reference travels in the clear. Use `rediss://` on any
 network you do not control.
 
-`rediss://` needs the `tls` cargo feature of `autumn-harvest-redis`. Without
-that feature the crate carries no TLS transport, so `RedisDispatch::connect`
-rejects a `rediss://` URL with an error naming the `tls` feature. Enable it in
-your own manifest:
-
-```toml
-autumn-harvest-redis = { version = "0.6", features = ["tls"] }
-```
+This release carries no TLS transport, so `RedisDispatch::connect` rejects a
+`rediss://` URL with an error that says so. The `redis` client's TLS stack
+depends on an unmaintained crate that the dependency ledger refuses. Issue
+#1429 tracks TLS support. Until then, keep Redis on a private network or
+behind a TLS tunnel that terminates on the host.
 
 ## Key layout
 
@@ -217,7 +214,7 @@ wrapper, so the two cases do not share one failure mode.
 | A reference names a row that is absent | Three short releases, then an ack | No error; this covers a publish that raced its own transaction |
 | `[harvest.redis] url` set on a build without the `redis` feature | Startup fails at config validation | An error naming the `redis` cargo feature |
 | `[harvest.redis] url` set on a runtime with more than one shard pool | Startup fails before the channel is installed | An error naming the shard-pool count and issue #1312 |
-| `rediss://` on a build without the `tls` feature | Startup fails at connect | An error naming the `tls` cargo feature of `autumn-harvest-redis` |
+| `rediss://` URL | Startup fails at connect | An error stating that this release carries no TLS transport (issue #1429) |
 | `key_prefix` or `consumer_group` empty | Startup fails at config validation | An error naming the empty key |
 
 The fallback is the important one, and its scope is exact. It covers the

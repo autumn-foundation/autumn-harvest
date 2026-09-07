@@ -76,10 +76,10 @@
 //!   family spreads a queue's stream, delayed set, payload hash and markers
 //!   over several keys. No hash tag binds them to one slot. A cluster would
 //!   therefore reject the multi-key scripts.
-//! - **No TLS by default.** A `rediss://` URL needs the crate's `tls`
-//!   feature. Without it the URL is rejected at `connect` with a message that
-//!   names the feature. A plain `redis://` URL sends the password in
-//!   cleartext.
+//! - **No TLS.** A `rediss://` URL is rejected at `connect` with a message
+//!   that says so. The `redis` client's TLS stack depends on an unmaintained
+//!   crate that the dependency ledger refuses; issue #1429 tracks TLS. A
+//!   plain `redis://` URL sends the password in cleartext.
 //! - **Single shard only.** A hint carries a shard slot, but a sharded
 //!   runtime rejects Redis dispatch at validation.
 //! - **Priority is best effort.** One stream per queue delivers in arrival

@@ -16,10 +16,6 @@ default = []
 # Enables the testcontainers-backed integration test scaffolding for downstream
 # users that want to spin up an in-process Redis for their own tests.
 test-utils = ["dep:testcontainers", "dep:testcontainers-modules"]
-# Enables TLS (`rediss://`) connections. Off by default: `redis` pulls a whole
-# TLS stack with it. Without this feature a `rediss://` URL is rejected with a
-# message that names the feature.
-tls = ["redis/tokio-rustls-comp"]
 
 [dependencies]
 autumn-harvest = { version = "0.6.0", path = "../autumn-harvest", default-features = false }

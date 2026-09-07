@@ -66,9 +66,10 @@ if a later startup step fails. A connect failure fails startup with an error
 naming the endpoint, in every mode: the Postgres fallback covers the running
 state, not boot. The endpoint is credential-free in both the error and the
 one startup `INFO` line, via `HarvestRedisConfig::redacted_url`, which fails
-closed and prints `<redacted>` when it cannot isolate the authority. TLS needs
-the `tls` cargo feature of `autumn-harvest-redis` and is off by default, so a
-plain `redis://` URL sends the password in cleartext.
+closed and prints `<redacted>` when it cannot isolate the authority. TLS is
+not supported in this release: a `rediss://` URL is rejected with a message
+that says so (issue #1429), and a plain `redis://` URL sends the password in
+cleartext.
 
 **Invariant notes.** No new `WorkflowEvent` variant. No migration. No new
 table. No change to the `harvest_events` append-only invariant or to its two
