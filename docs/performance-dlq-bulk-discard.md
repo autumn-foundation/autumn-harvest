@@ -208,15 +208,25 @@ asserts `matched == acted_on == 1000` and `skipped == 0` against the live
 HTTP handler, and separately confirms all 4,000 noise rows remain
 untouched — the filter's selectivity is exact, not just the delete count.
 
-The pre-existing `dlq_bulk_integration.rs` regression tests —
-`bulk_discard_with_empty_filter_returns_400`,
-`bulk_discard_removes_entries_without_enqueueing`,
-`bulk_discard_error_class_deletes_only_matching`,
-`bulk_cause_post_filter_precedes_limit`,
-`bulk_cause_across_shards_honors_global_limit`,
-`bulk_cause_dry_run_count_equals_aggregate_facet` — pass unchanged against
-the fix: none of them assert on statement count, and the response shape
-(`matched`/`acted_on`/`skipped`/`ids`/`dry_run`/`failures`) is unchanged.
+**The pre-existing `dlq_bulk_integration.rs` regression tests could not be
+executed in this session's sandbox** — that file's `setup_test_database_url`
+always provisions a Docker testcontainer, unconditionally, and this
+sandbox has no reachable Docker daemon (`/var/run/docker.sock` missing,
+confirmed by every one of that file's 18 tests failing identically at
+container startup, including tests this change never touches, e.g. every
+`bulk_replay_*` test). That is an environment limitation, not evidence
+about this diff.
+
+What *is* verified: the diff is confined to the 20 lines after the
+`selector.dry_run()` early return in `bulk_discard_dead_letters_for_selector`
+(and the mirror change in `dlq::bulk_discard_dead_letters`). Every code
+path those regression tests actually exercise beyond the delete
+itself — `dlq_bulk_empty_filter_response`'s 400, `count_api_bulk_filter_matches`/
+`query_dead_letters_for_api_bulk`'s filter and cause/limit interaction,
+the `dry_run` early return, and the response shape
+(`matched`/`acted_on`/`skipped`/`ids`/`dry_run`/`failures`) — is
+byte-for-byte unchanged by this diff. CI provisions Docker and will run
+`dlq_bulk_integration.rs` for real on this PR.
 
 **Disclosed behavior change, unhappy path only.** The old per-row loop was
 best-effort under a mid-operation failure: a connection error on row *k*

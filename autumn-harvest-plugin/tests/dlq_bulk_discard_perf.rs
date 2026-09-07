@@ -427,6 +427,26 @@ async fn zz_capture_dlq_bulk_discard_perf_evidence() {
 
 // ── Equivalence: batched delete vs. the original per-row loop ──────────────
 
+async fn insert_dead_letter_row(conn: &mut AsyncPgConnection, activity: &str) -> uuid::Uuid {
+    autumn_harvest::dlq::dead_letter(
+        conn,
+        &autumn_harvest::dlq::NewDeadLetterEntry {
+            original_task_id: uuid::Uuid::new_v4(),
+            queue_name: "default".to_string(),
+            task_type: "ACTIVITY".to_string(),
+            workflow_exec_id: None,
+            activity_name: Some(activity.to_string()),
+            input: serde_json::json!({ "test": true }),
+            error: format!("{activity} failed"),
+            attempts: 3,
+            owner: None,
+            severity: None,
+        },
+    )
+    .await
+    .expect("dead-letter insert should succeed")
+}
+
 /// Proves `dlq::discard_dead_letters_batch` deletes exactly the rows the
 /// original per-row `diesel::delete(...find(id))` loop would have deleted,
 /// and returns exactly their ids -- for both a set of ids that all exist and
@@ -443,32 +463,12 @@ async fn discard_dead_letters_batch_matches_per_row_delete_loop() {
     let url = create_fresh_db(&admin, &unique("dlq_discard_batch_equiv")).await;
     let mut conn = AsyncPgConnection::establish(&url).await.expect("connect");
 
-    async fn insert_row(conn: &mut AsyncPgConnection, activity: &str) -> uuid::Uuid {
-        autumn_harvest::dlq::dead_letter(
-            conn,
-            &autumn_harvest::dlq::NewDeadLetterEntry {
-                original_task_id: uuid::Uuid::new_v4(),
-                queue_name: "default".to_string(),
-                task_type: "ACTIVITY".to_string(),
-                workflow_exec_id: None,
-                activity_name: Some(activity.to_string()),
-                input: serde_json::json!({ "test": true }),
-                error: format!("{activity} failed"),
-                attempts: 3,
-                owner: None,
-                severity: None,
-            },
-        )
-        .await
-        .expect("dead-letter insert should succeed")
-    }
-
     // Group 1: every id exists. The original loop would have deleted all of
     // them, one DELETE apiece; the batch must delete all of them in one
     // statement and return every id.
     let mut existing_ids = Vec::new();
     for i in 0..25 {
-        existing_ids.push(insert_row(&mut conn, &format!("equiv_all_exist_{i}")).await);
+        existing_ids.push(insert_dead_letter_row(&mut conn, &format!("equiv_all_exist_{i}")).await);
     }
     let mut deleted = discard_dead_letters_batch(&mut conn, &existing_ids)
         .await
@@ -494,7 +494,7 @@ async fn discard_dead_letters_batch_matches_per_row_delete_loop() {
     // Vec, no error.
     let mut mixed_ids = Vec::new();
     for i in 0..10 {
-        mixed_ids.push(insert_row(&mut conn, &format!("equiv_mixed_{i}")).await);
+        mixed_ids.push(insert_dead_letter_row(&mut conn, &format!("equiv_mixed_{i}")).await);
     }
     let missing_ids: Vec<uuid::Uuid> = (0..10).map(|_| uuid::Uuid::new_v4()).collect();
     let mut probe_ids = mixed_ids.clone();
