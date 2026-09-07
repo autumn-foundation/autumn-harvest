@@ -1144,10 +1144,11 @@ cannot connect **fails startup**, in every mode, with an error naming the
 endpoint. A process that came up without its channel would look healthy and
 publish nothing, so the failure is loud instead.
 
-The connection is plaintext by default, and `redis://` sends the password in
-cleartext. `rediss://` needs the `tls` cargo feature of `autumn-harvest-redis`.
-v1 targets a single Redis instance and a single-shard runtime; Redis Cluster is
-not supported.
+The connection is plaintext, and `redis://` sends the password in cleartext.
+This release carries no TLS transport: a `rediss://` URL is rejected at
+startup, and issue #1429 tracks TLS support. Keep Redis on a private network
+or behind a TLS tunnel that terminates on the host. v1 targets a single Redis
+instance and a single-shard runtime; Redis Cluster is not supported.
 
 See [`docs/operations/redis-dispatch.md`](docs/operations/redis-dispatch.md)
 for the key layout, the crash matrix, the failure modes and the v1 limits.
