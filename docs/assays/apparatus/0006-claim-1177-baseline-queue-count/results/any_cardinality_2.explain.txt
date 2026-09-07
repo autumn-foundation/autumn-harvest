@@ -3,26 +3,26 @@ SET
 SET
                                                                                                 QUERY PLAN                                                                                                 
 -----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
- Limit  (cost=1051.31..1051.93 rows=50 width=35) (actual rows=50 loops=1)
-   Output: id, task_type, priority, scheduled_at, ctid
+ Limit  (cost=1051.31..1051.93 rows=50 width=51) (actual rows=50 loops=1)
+   Output: id, task_type, concurrency_key, concurrency_cap, priority, scheduled_at, ctid
    Buffers: shared hit=329
-   ->  LockRows  (cost=1051.31..1176.31 rows=10000 width=35) (actual rows=50 loops=1)
-         Output: id, task_type, priority, scheduled_at, ctid
+   ->  LockRows  (cost=1051.31..1176.31 rows=10000 width=51) (actual rows=50 loops=1)
+         Output: id, task_type, concurrency_key, concurrency_cap, priority, scheduled_at, ctid
          Buffers: shared hit=329
-         ->  Sort  (cost=1051.31..1076.31 rows=10000 width=35) (actual rows=50 loops=1)
-               Output: id, task_type, priority, scheduled_at, ctid
+         ->  Sort  (cost=1051.31..1076.31 rows=10000 width=51) (actual rows=50 loops=1)
+               Output: id, task_type, concurrency_key, concurrency_cap, priority, scheduled_at, ctid
                Sort Key: harvest_task_queue.priority DESC, harvest_task_queue.scheduled_at
-               Sort Method: quicksort  Memory: 1010kB
+               Sort Method: quicksort  Memory: 1166kB
                Buffers: shared hit=279
-               ->  Index Scan using idx_harvest_tq_poll on public.harvest_task_queue  (cost=0.29..719.12 rows=10000 width=35) (actual rows=10000 loops=1)
-                     Output: id, task_type, priority, scheduled_at, ctid
+               ->  Index Scan using idx_harvest_tq_poll on public.harvest_task_queue  (cost=0.29..719.12 rows=10000 width=51) (actual rows=10000 loops=1)
+                     Output: id, task_type, concurrency_key, concurrency_cap, priority, scheduled_at, ctid
                      Index Cond: ((harvest_task_queue.queue_name = ANY ('{bench-q-0,bench-q-1}'::text[])) AND (harvest_task_queue.state = 'PENDING'::text) AND (harvest_task_queue.scheduled_at <= now()))
                      Buffers: shared hit=273
  Settings: enable_seqscan = 'off', enable_bitmapscan = 'off'
  Planning:
-   Buffers: shared hit=223
- Planning Time: 0.635 ms
- Execution Time: 4.124 ms
+   Buffers: shared hit=229
+ Planning Time: 0.477 ms
+ Execution Time: 4.064 ms
 (20 rows)
 
 ROLLBACK

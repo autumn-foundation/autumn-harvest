@@ -43,7 +43,7 @@ not `ANY()` over a single-element array.
 - No partial credit; an ambiguous shape (e.g. `Bitmap Heap Scan`) reports
   as undetermined.
 
-## ⚠️ Post-review corrections and a self-correction (Codex, two rounds)
+## ⚠️ Post-review corrections and a self-correction (Codex, three rounds)
 
 **Round 1 (P2, legitimate, fixed in place):** the first pass's custom
 `seed_single_queue.sql` omitted `concurrency_key`/`concurrency_cap`, while
@@ -80,6 +80,21 @@ pre-registration and its own report:
 [ledger #7](0007-claim-any-cardinality.md). Its finding does **not**
 change this assay's verdict; it answers a different, explicitly
 re-chartered question.
+
+**Round 3 (P2, legitimate, fixed in place):** `multi_queue_control.sql`
+was labeled a verbatim rerun of ledger #5's own
+`forced_index_no_tiebreak_diagnostic.sql`, but it had silently narrowed
+the `SELECT` list (dropping `concurrency_key`/`concurrency_cap`) and
+hardcoded `LIMIT 50` instead of the parameterized `LIMIT :batch_size` —
+so it wasn't actually the query it claimed to be, and a narrower target
+list can in principle change sort memory footprint and planner behavior.
+Fixed by restoring the exact `SELECT` list and parameterization in every
+diagnostic file in this apparatus (`multi_queue_control.sql` is now
+byte-for-byte identical to ledger #5's file apart from the shared
+`:batch_size` bind). Re-ran the full apparatus fresh: all buffer counts
+are bit-for-bit unchanged (591/195/53/329) and every `Sort`-node
+presence/absence call is identical — the fix corrects a real
+accuracy-of-claim problem without moving any verdict.
 
 ## 🔍 Prior art
 
@@ -126,12 +141,12 @@ transaction, same `LIMIT 50`, same `FOR UPDATE SKIP LOCKED`.
 
 **Control** (4-queue `ANY`, 10,000 rows spread round-robin across
 `bench-q-0..3`): `Sort` node present, `Index Scan` reads all 10,000
-matching rows, 591 buffers, 5.075ms (execution time; see the note below
+matching rows, 591 buffers, 4.577ms (execution time; see the note below
 the numbers on why buffers, not this, are what's graded).
 
 **Pre-registered test** (single-queue scalar equality, all 10,000 rows in
 `bench-q-0`): **no `Sort` node**, bounded scan (50 rows read, matching
-`LIMIT`), 53 buffers, 0.171ms.
+`LIMIT`), 53 buffers, 0.078ms.
 
 **Not graded here — see ledger #7** (single-queue `ANY` over a
 single-element array): `Sort` node present, full 10,000-row scan, 195
@@ -140,7 +155,7 @@ buffers.
 Buffer counts (591 / 53 / 195) are bit-for-bit identical across every
 rerun of this apparatus, including the final rerun that produced the
 numbers above; execution-time milliseconds are not (they moved run to
-run — e.g. this control read 4.489-5.075ms across different runs on
+run — e.g. this control read 4.391-5.075ms across different runs on
 identical data) and are reported only as the archived run's own number,
 never as a claim about relative cost. Buffers are what this report's
 verdict is graded against.

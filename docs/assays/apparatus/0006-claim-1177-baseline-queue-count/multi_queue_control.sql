@@ -8,12 +8,12 @@ BEGIN;
 SET LOCAL enable_seqscan = off;
 SET LOCAL enable_bitmapscan = off;
 EXPLAIN (ANALYZE, BUFFERS, VERBOSE, SETTINGS, TIMING OFF)
-SELECT id, task_type, priority, scheduled_at
+SELECT id, task_type, concurrency_key, concurrency_cap, priority, scheduled_at
 FROM harvest_task_queue
 WHERE queue_name = ANY(ARRAY['bench-q-0','bench-q-1','bench-q-2','bench-q-3'])
   AND state = 'PENDING'
   AND scheduled_at <= NOW()
 ORDER BY priority DESC, scheduled_at ASC
-LIMIT 50
+LIMIT :batch_size
 FOR UPDATE SKIP LOCKED;
 ROLLBACK;

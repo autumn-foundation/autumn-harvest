@@ -3,21 +3,21 @@ SET
 SET
                                                                                    QUERY PLAN                                                                                    
 ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
- Limit  (cost=0.29..3.62 rows=50 width=35) (actual rows=50 loops=1)
-   Output: id, task_type, priority, scheduled_at, ctid
+ Limit  (cost=0.29..3.62 rows=50 width=51) (actual rows=50 loops=1)
+   Output: id, task_type, concurrency_key, concurrency_cap, priority, scheduled_at, ctid
    Buffers: shared hit=53
-   ->  LockRows  (cost=0.29..667.60 rows=10000 width=35) (actual rows=50 loops=1)
-         Output: id, task_type, priority, scheduled_at, ctid
+   ->  LockRows  (cost=0.29..667.60 rows=10000 width=51) (actual rows=50 loops=1)
+         Output: id, task_type, concurrency_key, concurrency_cap, priority, scheduled_at, ctid
          Buffers: shared hit=53
-         ->  Index Scan using idx_harvest_tq_poll on public.harvest_task_queue  (cost=0.29..567.60 rows=10000 width=35) (actual rows=50 loops=1)
-               Output: id, task_type, priority, scheduled_at, ctid
+         ->  Index Scan using idx_harvest_tq_poll on public.harvest_task_queue  (cost=0.29..567.60 rows=10000 width=51) (actual rows=50 loops=1)
+               Output: id, task_type, concurrency_key, concurrency_cap, priority, scheduled_at, ctid
                Index Cond: ((harvest_task_queue.queue_name = 'bench-q-0'::text) AND (harvest_task_queue.state = 'PENDING'::text) AND (harvest_task_queue.scheduled_at <= now()))
                Buffers: shared hit=3
  Settings: enable_seqscan = 'off', enable_bitmapscan = 'off'
  Planning:
-   Buffers: shared hit=172
- Planning Time: 0.507 ms
- Execution Time: 0.171 ms
+   Buffers: shared hit=178
+ Planning Time: 0.365 ms
+ Execution Time: 0.078 ms
 (15 rows)
 
 ROLLBACK
