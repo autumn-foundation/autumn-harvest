@@ -11,6 +11,15 @@ machine-readable registry of every route** — method, path, auth class, request
 and response fields — is [`docs/api-contract.json`](api-contract.json) (see
 [`api-contract-guide.md`](api-contract-guide.md) for how to consume it).
 
+## OpenAPI 3.1 document
+
+An OpenAPI 3.1 document for every route on this page is served at
+`GET {api_path}/openapi.json` and checked in at
+[`docs/openapi.json`](openapi.json). Point any OpenAPI generator at it for a
+typed client with no hand-written HTTP. See [`openapi.md`](openapi.md) for the
+ten-minute path, what the document carries, and what it deliberately leaves
+open.
+
 New route families added in **0.5.0** (all in the contract; each has a CLI verb):
 
 - `GET /workflows/summaries` — tiered-retention summaries of expired runs (#752).

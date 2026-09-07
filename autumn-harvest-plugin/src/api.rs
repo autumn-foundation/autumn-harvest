@@ -4971,6 +4971,9 @@ pub fn harvest_api_router(api_state: HarvestApiState) -> Router<AppState> {
             post(redrive_dead_letters_handler).route_layer(require_admin.clone()),
         )
         .route("/health", get(health))
+        // No admin gate: a client generator fetches this before it holds any
+        // credential. An embedder's own auth middleware still gates it.
+        .route("/openapi.json", get(crate::openapi::get_openapi_document))
         .route(
             "/admin/preflight",
             get(preflight).route_layer(require_admin.clone()),
@@ -6271,8 +6274,12 @@ pub const fn management_api_routes() -> &'static [(&'static str, &'static str)] 
         ("GET", "/batch-operations"),
         ("POST", "/batch-operations"),
         ("GET", "/batch-operations/{id}"),
+        // ── task priority (issue #249) ────────────────────────────────────────
+        ("PATCH", "/tasks/{id}"),
         // ── health & admin ────────────────────────────────────────────────────
         ("GET", "/health"),
+        // The published OpenAPI 3.1 document for this router.
+        ("GET", "/openapi.json"),
         ("GET", "/admin/preflight"),
         ("GET", "/admin/shards/health"),
         ("GET", "/admin/queue-coverage"),
@@ -6412,6 +6419,8 @@ pub const fn management_api_request_fields()
                 "idempotency_key",
                 "shard_id",
                 "residency_key",
+                "context_headers",
+                "priority",
             ]),
         ),
         (
@@ -6630,6 +6639,7 @@ pub const fn management_api_request_fields()
         // ── workers ───────────────────────────────────────────────────────────
         ("POST", "/workers/{worker_id}/drain", Some(&["deadline_at"])),
         // ── batch operations ──────────────────────────────────────────────────
+        ("PATCH", "/tasks/{id}", Some(&["priority"])),
         (
             "POST",
             "/batch-operations",
@@ -6705,6 +6715,14 @@ pub const fn management_api_request_fields()
                 "skip_policy",
                 "catchup_policy",
                 "catchup_window_secs",
+                "timezone",
+                "jitter_secs",
+                "overlap_policy",
+                "buffer_all_max",
+                "consecutive_failure_limit",
+                "end_at",
+                "max_runs",
+                "retry_policy",
             ]),
         ),
         (
@@ -6728,6 +6746,7 @@ pub const fn management_api_request_fields()
                 "catchup_policy",
                 "catchup_window_secs",
                 "retry_policy",
+                "workflow_name",
             ]),
         ),
         ("POST", "/admin/schedules/{id}/pause", Some(&["reason"])),
@@ -7570,6 +7589,11 @@ pub const fn management_api_response_fields()
             ]),
         ),
         ("GET", "/batch-operations/{id}", None), // BatchJobView (external model)
+        (
+            "PATCH",
+            "/tasks/{id}",
+            Some(&["task_id", "priority", "updated"]),
+        ),
         // ── health & admin ────────────────────────────────────────────────────
         (
             "GET",
@@ -7584,6 +7608,8 @@ pub const fn management_api_response_fields()
                 "shard_readiness",
             ]),
         ),
+        // The OpenAPI document itself, a free-form JSON object.
+        ("GET", "/openapi.json", None),
         (
             "GET",
             "/admin/preflight",

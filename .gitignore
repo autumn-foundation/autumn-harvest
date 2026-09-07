@@ -6,3 +6,9 @@ __pycache__/
 
 # Nested cargo target dirs (e.g. per-agent --target-dir runs inside member crates)
 **/target/
+
+# Generated TypeScript client (examples/typescript-client, issue #694). The
+# types are regenerated from the served OpenAPI document on every run, so they
+# are build output, not source.
+node_modules/
+examples/typescript-client/src/harvest-api.ts

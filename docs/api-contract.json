@@ -26,6 +26,7 @@
   },
   "auth_note": "Route authorization posture is classified in issue #174. This contract records the route surface and category; auth enforcement is separate.",
   "audit_note": "Mutating routes (read_only: false) are covered by the audit trail (issue #158). The audit endpoint itself is read-only.",
+  "openapi_note": "Two OpenAPI 3.1 documents are generated from this file (issue #694): autumn-harvest-plugin/openapi.json, which the crate compiles in and serves, and docs/openapi.json, the pretty-printed copy. Run `scripts/regenerate-openapi.sh` whenever a route, parameter, request field or response field changes here; it writes both. Every parameter must declare `in` and `required`, and every request body must declare `required`. The transform rejects an entry that does not, and refuses a request body on a read method. See docs/openapi.md.",
   "routes": [
     {
       "method": "GET",
@@ -45,6 +46,18 @@
           "in": "query",
           "required": false,
           "description": "Filter by registered workflow name."
+        },
+        {
+          "name": "owner",
+          "in": "query",
+          "required": false,
+          "description": "Filter by the execution owner, matched exactly. A blank value is ignored."
+        },
+        {
+          "name": "severity",
+          "in": "query",
+          "required": false,
+          "description": "Filter by the execution severity label, matched exactly. A blank value is ignored."
         },
         {
           "name": "search_attr",
@@ -125,6 +138,30 @@
           "in": "query",
           "required": false,
           "description": "Filter by workflow-start provenance (issue #740). One of the bounded StartSource set: api, schedule, backfill, signal_with_start, update_with_start, completion_trigger, webhook, child, batch, continue_as_new, reset, outbox, or 'unknown' (matches NULL / pre-upgrade rows). Any other value returns 400."
+        },
+        {
+          "name": "failure_cause",
+          "in": "query",
+          "required": false,
+          "description": "Filter to executions whose search_attrs carry this failure_cause value."
+        },
+        {
+          "name": "no_progress_minutes",
+          "in": "query",
+          "required": false,
+          "description": "Stalled-workflow discovery (issue #486). A positive integer N. Returns RUNNING and SUSPENDED executions with no recorded progress for N minutes, sorted by staleness. PAUSED executions are excluded unless state=PAUSED is given, because a pause blocks progress by design. Keyset pagination does not apply on this path. A value below 1, or a non-numeric value, returns 400. Cannot be combined with history_bloat_min_events, which returns 400."
+        },
+        {
+          "name": "include_sleeping",
+          "in": "query",
+          "required": false,
+          "description": "When 'true', keep correctly-sleeping executions in the no_progress_minutes result. An execution is correctly sleeping when a future-dated timer is its only pending item and no timer is overdue. Such an execution is excluded by default, because it has nothing to progress on."
+        },
+        {
+          "name": "min_history_events",
+          "in": "query",
+          "required": false,
+          "description": "General-purpose history-size filter (issue #493). A non-negative integer N. Restricts the response to executions whose recorded harvest_events count is >= N. Composes freely with state, order and pagination, unlike history_bloat_min_events."
         },
         {
           "name": "history_bloat_min_events",
@@ -452,6 +489,19 @@
           "completed_at"
         ]
       },
+      "additional_responses": [
+        {
+          "status": 204,
+          "description": "The execution is still running after the wait window. The body is empty and Retry-After is 1; poll again.",
+          "headers": [
+            {
+              "name": "Retry-After",
+              "type": "integer",
+              "description": "Seconds to wait before polling again. Always 1."
+            }
+          ]
+        }
+      ],
       "error_responses": [
         {
           "status": 400,
@@ -1054,6 +1104,7 @@
       ],
       "request_body": null,
       "success_response": {
+        "content_type": "text/event-stream",
         "status": 200,
         "note": "Content-Type: text/event-stream. Frames: event:progress (data = the published chunk JSON, id = monotonic seq), a terminal event:end, or event:error. If the execution is already terminal at connect, a single event:end frame is sent and the stream closes. SEQ CLIENT CONTRACT: id is a monotonic per-execution LOGICAL-POSITION identity (not a per-chunk counter). Subscribers should dedupe by seq (keep-first) for at-most-once-per-position display, and use forward seq JUMPS to detect gaps after reconnect. A re-driven workflow position re-emits the SAME seq (best-effort); a re-emitted chunk MAY carry different content for non-deterministic chunks — the first-delivered is canonical. seq is per exec_id; a continue-as-new successor is a new exec_id on a new stream whose seq restarts. Chunks may be DROPPED best-effort under back-pressure (slow client) — the monotonic seq lets the client detect the resulting gap.",
         "free_form": true
@@ -1087,6 +1138,15 @@
           "in": "path",
           "required": true,
           "description": "Registered workflow function name."
+        }
+      ],
+      "headers": [
+        {
+          "name": "Idempotency-Key",
+          "in": "header",
+          "required": false,
+          "type": "string",
+          "description": "Request-scoped idempotency key (issue #808). It wins over the body idempotency_key field, and it is the only way to recover an already-committed start when the body itself is malformed. A present-but-empty key is a 400, never a silent non-idempotent start."
         }
       ],
       "request_body": {
@@ -1182,6 +1242,18 @@
             "name": "residency_key",
             "required": false,
             "description": "Pin this workflow via an operator-declared residency key, e.g. 'eu' (issue #697). Mutually exclusive with shard_id. Resolved through the router's declared residency map (ShardRouter::with_residency_map), which is stable across process restarts and across any widening of the readable/writable shard sets. An undeclared or blank key returns 400 rather than falling back to the rendezvous hash."
+          },
+          {
+  "name": "context_headers",
+  "type": "object",
+  "required": false,
+  "description": "Caller-supplied trace or correlation headers, threaded onto the execution row and carried through the run."
+          },
+          {
+  "name": "priority",
+  "type": "string",
+  "required": false,
+  "description": "Dispatch priority for this execution's tasks. Defaults to Normal when omitted."
           }
         ]
       },
@@ -1206,6 +1278,129 @@
           "shard_id"
         ]
       },
+      "additional_responses": [
+        {
+          "status": 200,
+          "description": "An existing execution was returned instead of a new one being created (reuse_policy, or conflict_policy use_existing).",
+          "fields": [
+            "execution_id",
+            "workflow_name",
+            "workflow_id",
+            "state",
+            "debounced",
+            "debounce_key",
+            "fire_at",
+            "pending_count",
+            "batched",
+            "flushed",
+            "batch_key",
+            "max_size",
+            "started_fresh",
+            "deduplicated",
+            "shard_id"
+          ]
+        },
+        {
+          "status": 202,
+          "description": "The start was DEFERRED by a debounce, event-batch or start-throttle policy, so no execution exists yet and the body carries no execution_id. Exactly one of debounced, batched or throttled is true, and the remaining fields are the ones that policy reports. A batch admission that flushed immediately returns 201 with execution_id instead.",
+          "fields": [
+            {
+              "name": "debounced",
+              "type": "boolean",
+              "description": "Present and true when a debounce policy deferred the start."
+            },
+            {
+              "name": "batched",
+              "type": "boolean",
+              "description": "Present and true when an event-batch policy folded the start into a pending batch."
+            },
+            {
+              "name": "flushed",
+              "type": "boolean",
+              "description": "Batch only. False on this response; a flush returns 201."
+            },
+            {
+              "name": "throttled",
+              "type": "boolean",
+              "description": "Present and true when a start-throttle policy deferred the start."
+            },
+            {
+              "name": "workflow_name",
+              "type": "string",
+              "description": "The workflow type the deferred start names."
+            },
+            {
+              "name": "workflow_id",
+              "type": "string",
+              "description": "The business id the deferred start reserved."
+            },
+            {
+              "name": "debounce_key",
+              "type": "string",
+              "description": "Debounce only. The resolved debounce key."
+            },
+            {
+              "name": "batch_key",
+              "type": "string",
+              "description": "Batch only. The resolved batch key."
+            },
+            {
+              "name": "throttle_key",
+              "type": "string",
+              "description": "Throttle only. The resolved throttle bucket key."
+            },
+            {
+              "name": "fire_at",
+              "type": "string",
+              "description": "Debounce and batch only. When the deferred start is due, RFC 3339."
+            },
+            {
+              "name": "deferred_at",
+              "type": "string",
+              "description": "Throttle only. When the start was deferred, RFC 3339."
+            },
+            {
+              "name": "pending_count",
+              "type": "integer",
+              "description": "Debounce and batch only. How many starts are folded into this pending admission."
+            },
+            {
+              "name": "max_size",
+              "type": "integer",
+              "description": "Batch only. The batch size that triggers a flush."
+            },
+            {
+              "name": "shard_id",
+              "type": "integer",
+              "description": "Throttle only, and only for a pinned start. The shard the deferred start is placed on (issue #697)."
+            }
+          ]
+        },
+        {
+          "status": 422,
+          "content_type": [
+            "application/json",
+            "text/plain"
+          ],
+          "description": "A completion callback target rejected the start, as the JSON body below. No execution was created. The same status is returned as plain text when the request body is syntactically valid JSON that does not deserialize into the start request. The handler forwards that extractor rejection unchanged, so the body is the extractor message rather than this object.",
+          "fields": [
+            {
+              "name": "error",
+              "type": "string",
+              "description": "Always 'completion callback target rejected'."
+            },
+            {
+              "name": "url",
+              "type": "string",
+              "description": "The callback target that rejected it."
+            },
+            {
+              "name": "rejection",
+              "description": "Machine-readable rejection detail, naming the rule that refused the target (allowlist, scheme, or IP literal)."
+            }
+          ]
+        }
+      ],
       "error_responses": [
         {
           "status": 400,
@@ -1213,23 +1408,27 @@
         },
         {
           "status": 401,
-          "description": "Requires admin authentication only when the request can forcibly cancel a currently-ACTIVE (RUNNING/PAUSED) prior — i.e. the resolved active-conflict behavior is Terminate (issue #685): conflict_policy=terminate_existing (any reuse_policy), or reuse_policy=terminate_if_running with the default/omitted conflict_policy. Non-destructive combinations — e.g. reuse_policy=terminate_if_running combined with conflict_policy=use_existing (the idempotent-starter shape) or conflict_policy=fail — cannot cancel a live run and do NOT require admin. Returned only when admin is required and admin auth is absent."
+          "description": "Requires admin authentication only when the request can forcibly cancel a currently-ACTIVE (RUNNING/PAUSED) prior \u2014 i.e. the resolved active-conflict behavior is Terminate (issue #685): conflict_policy=terminate_existing (any reuse_policy), or reuse_policy=terminate_if_running with the default/omitted conflict_policy. Non-destructive combinations \u2014 e.g. reuse_policy=terminate_if_running combined with conflict_policy=use_existing (the idempotent-starter shape) or conflict_policy=fail \u2014 cannot cancel a live run and do NOT require admin. Returned only when admin is required and admin auth is absent."
         },
         {
           "status": 409,
           "description": "Duplicate workflow_id with conflicting reuse policy, or conflict_policy=fail over an ACTIVE (RUNNING/PAUSED) prior (issue #685)."
         },
         {
+          "status": 413,
+          "description": "The serialized workflow input exceeds max_workflow_input_bytes."
+        },
+        {
           "status": 429,
           "description": "The workflow's declared per-tenant resource quota (issue #946, QuotaPolicy) is exhausted for the resolved key on a FRESH admission only (an attach to an existing run never re-checks the quota). Body is {\"error\": \"quota exceeded\", \"workflow_name\", \"key\", \"resource\", \"limit\", \"current\"} naming which of max_active_executions / max_history_bytes / max_dead_letters was hit and the usage observed immediately before this admission (current excludes the would-be admission itself). No execution row, event, or task queue row is created for a rejected start. Never returned for a workflow with no declared QuotaPolicy."
         },
         {
-          "status": 503,
-          "description": "Admission blocked by an active gate (including the debounce-key shard gate for debounced starts). A retry of an already-successful idempotency_key start (issue #808) bypasses the gate and returns the existing execution as a 200 no-op instead, since it is not fresh admission; a genuinely fresh keyed start is still gated."
-        },
-        {
           "status": 500,
           "description": "Database or scheduling error."
+        },
+        {
+          "status": 503,
+          "description": "Admission blocked by an active gate (including the debounce-key shard gate for debounced starts). A retry of an already-successful idempotency_key start (issue #808) bypasses the gate and returns the existing execution as a 200 no-op instead, since it is not fresh admission; a genuinely fresh keyed start is still gated."
         }
       ]
     },
@@ -1316,6 +1515,41 @@
           "signal_delivered"
         ]
       },
+      "additional_responses": [
+        {
+          "status": 200,
+          "description": "An existing live execution was signaled instead of a fresh one being started.",
+          "fields": [
+            "execution_id",
+            "workflow_name",
+            "workflow_id",
+            "state",
+            "started_fresh",
+            "signal_delivered"
+          ]
+        },
+        {
+          "status": 503,
+          "description": "An admission gate blocked the start. Retry once the gate clears.",
+          "fields": [
+            {
+              "name": "error",
+              "type": "string",
+              "description": "Always 'admission blocked'."
+            },
+            {
+              "name": "gate_id",
+              "type": "string",
+              "description": "The gate that blocked the start."
+            },
+            {
+              "name": "reason",
+              "type": "string",
+              "description": "The gate's stated reason."
+            }
+          ]
+        }
+      ],
       "error_responses": [
         {
           "status": 400,
@@ -1451,6 +1685,56 @@
           }
         ]
       },
+      "additional_responses": [
+        {
+          "status": 200,
+          "description": "An existing live execution was attached instead of a fresh one being started.",
+          "fields": [
+            {
+              "name": "execution_id"
+            },
+            {
+              "name": "workflow_name"
+            },
+            {
+              "name": "workflow_id"
+            },
+            {
+              "name": "state"
+            },
+            {
+              "name": "started_fresh"
+            },
+            {
+              "name": "update_id"
+            },
+            {
+              "name": "result"
+            }
+          ]
+        },
+        {
+          "status": 503,
+          "description": "An admission gate blocked the start. Retry once the gate clears.",
+          "fields": [
+            {
+              "name": "error",
+              "type": "string",
+              "description": "Always 'admission blocked'."
+            },
+            {
+              "name": "gate_id",
+              "type": "string",
+              "description": "The gate that blocked the start."
+            },
+            {
+              "name": "reason",
+              "type": "string",
+              "description": "The gate's stated reason."
+            }
+          ]
+        }
+      ],
       "error_responses": [
         {
           "status": 400,
@@ -1475,6 +1759,10 @@
         {
           "status": 500,
           "description": "Database or scheduling error."
+        },
+        {
+          "status": 504,
+          "description": "The update did not complete within the wait window. The execution was started and the update was admitted; poll the update result."
         }
       ]
     },
@@ -1494,7 +1782,7 @@
         }
       ],
       "request_body": {
-        "required": false,
+        "required": true,
         "free_form": false,
         "fields": [
           {
@@ -1516,6 +1804,20 @@
           "failed_task_count"
         ]
       },
+      "additional_responses": [
+        {
+          "status": 202,
+          "description": "The cancellation was recorded and the workflow will observe it at its next yield. Same fields as the 200.",
+          "fields": [
+            "ok",
+            "execution_id",
+            "state",
+            "reason",
+            "newly_cancelled",
+            "failed_task_count"
+          ]
+        }
+      ],
       "error_responses": [
         {
           "status": 404,
@@ -1755,6 +2057,10 @@
           "description": "Execution not found."
         },
         {
+          "status": 409,
+          "description": "The execution is paused, so the mutation was rejected. Resume it first, or wait for the hold to clear."
+        },
+        {
           "status": 500,
           "description": "Database error."
         }
@@ -1821,12 +2127,16 @@
           "description": "Execution not found. Also returned when the id encodes a shard neither this node's pools nor the router know about (nothing here could host it)."
         },
         {
-          "status": 503,
-          "description": "The execution's owning shard could not be queried, so it is unknown whether it exists or was mutated (retriable -- this endpoint is idempotent, see the idempotency note above): the id encodes a shard this deployment knows about (router-readable or default) but which has no configured storage pool on this node -- the normal state mid a shard-add rollout -- or that shard's pool connection could not be acquired. Deliberately not a 404 (a false negative for an execution that may exist on its own shard) and never a silent write to the wrong database via the default-shard fallback other single-execution routes still use."
+          "status": 409,
+          "description": "The execution is paused, so the mutation was rejected. Resume it first, or wait for the hold to clear."
         },
         {
           "status": 500,
           "description": "Database error."
+        },
+        {
+          "status": 503,
+          "description": "The execution's owning shard could not be queried, so it is unknown whether it exists or was mutated (retriable -- this endpoint is idempotent, see the idempotency note above): the id encodes a shard this deployment knows about (router-readable or default) but which has no configured storage pool on this node -- the normal state mid a shard-add rollout -- or that shard's pool connection could not be acquired. Deliberately not a 404 (a false negative for an execution that may exist on its own shard) and never a silent write to the wrong database via the default-shard fallback other single-execution routes still use."
         }
       ]
     },
@@ -1944,6 +2254,10 @@
           "description": "Execution not found."
         },
         {
+          "status": 409,
+          "description": "The execution is paused, so the mutation was rejected. Resume it first, or wait for the hold to clear."
+        },
+        {
           "status": 500,
           "description": "Database error."
         }
@@ -1990,6 +2304,10 @@
         {
           "status": 404,
           "description": "Execution not found."
+        },
+        {
+          "status": 409,
+          "description": "The execution is paused, so the mutation was rejected. Resume it first, or wait for the hold to clear."
         },
         {
           "status": 500,
@@ -2215,6 +2533,19 @@
         },
         "note": "Status is 202 when outcome=\"redriven\" and 200 when outcome=\"not_failed\"; the field set is identical either way."
       },
+      "additional_responses": [
+        {
+          "status": 200,
+          "description": "outcome is not_failed: the delivery was not in a failed state, so nothing was redriven.",
+          "fields": [
+            "ok",
+            "execution_id",
+            "delivery_id",
+            "outcome",
+            "current_state"
+          ]
+        }
+      ],
       "error_responses": [
         {
           "status": 404,
@@ -2268,7 +2599,7 @@
           },
           {
             "name": "operator_id",
-            "required": false,
+            "required": true,
             "description": "Identity of the operator."
           },
           {
@@ -2291,6 +2622,59 @@
           "source_signals_buffered"
         ]
       },
+      "additional_responses": [
+        {
+          "status": 200,
+          "description": "dry_run=true: the reset plan is computed and returned, and nothing is written. Read unresolved_side_effects and the nearest_valid_* anchors before committing.",
+          "fields": [
+            {
+              "name": "reset_to_event_id",
+              "type": "integer",
+              "description": "The event id the fork would happen at."
+            },
+            {
+              "name": "events_carried_over",
+              "type": "integer",
+              "description": "How many events the new run would inherit."
+            },
+            {
+              "name": "unresolved_side_effects",
+              "type": "array",
+              "description": "Side effects the plan cannot replay safely."
+            },
+            {
+              "name": "nearest_valid_before",
+              "type": "integer",
+              "description": "The closest valid reset point before the requested one, when it is invalid."
+            },
+            {
+              "name": "nearest_valid_after",
+              "type": "integer",
+              "description": "The closest valid reset point after the requested one."
+            },
+            {
+              "name": "source_tasks_to_cancel",
+              "type": "integer",
+              "description": "Pending tasks the reset would cancel on the source run."
+            },
+            {
+              "name": "source_timers_to_remove",
+              "type": "integer",
+              "description": "Timers the reset would remove."
+            },
+            {
+              "name": "source_signals_to_drop",
+              "type": "integer",
+              "description": "Signals the reset would drop."
+            },
+            {
+              "name": "source_signals_to_buffer",
+              "type": "integer",
+              "description": "Signals the reset would buffer for the new run."
+            }
+          ]
+        }
+      ],
       "error_responses": [
         {
           "status": 400,
@@ -2303,6 +2687,10 @@
         {
           "status": 500,
           "description": "Database error."
+        },
+        {
+          "status": 409,
+          "description": "The source execution is terminal, or it holds a durable mutex that the reset cannot take."
         }
       ]
     },
@@ -2340,7 +2728,7 @@
         }
       ],
       "request_body": {
-        "required": false,
+        "required": true,
         "free_form": true,
         "description": "Optional signal payload \u2014 the entire body is passed verbatim to the signal handler.",
         "fields": []
@@ -2356,8 +2744,16 @@
       },
       "error_responses": [
         {
+          "status": 400,
+          "description": "The idempotency key is empty, not UTF-8, or reserved, or the payload failed schema validation for this signal."
+        },
+        {
           "status": 404,
           "description": "Execution not found."
+        },
+        {
+          "status": 413,
+          "description": "The signal payload exceeds max_signal_payload_bytes. The cap is enforced at submission, before the signal is persisted."
         },
         {
           "status": 500,
@@ -2540,7 +2936,7 @@
         }
       ],
       "request_body": {
-        "required": false,
+        "required": true,
         "free_form": false,
         "fields": [
           {
@@ -2555,6 +2951,65 @@
         "note": "Returns 202 Accepted when wait=admitted (update durably recorded); returns 200 OK with outcome when wait=completed (default).",
         "free_form": true
       },
+      "additional_responses": [
+        {
+          "status": 200,
+          "description": "wait=completed (the default): the update ran to completion and its handler output is returned.",
+          "fields": [
+            {
+              "name": "update_id",
+              "type": "string",
+              "description": "The update id."
+            },
+            {
+              "name": "output",
+              "description": "The update handler's return value, any JSON."
+            }
+          ]
+        },
+        {
+          "status": 409,
+          "description": "wait=completed: the update failed, was rejected by the handler, or was orphaned by a workflow that reached a terminal state first. A failure carries error; an orphan carries error_type and workflow_state.",
+          "fields": [
+            {
+              "name": "update_id",
+              "type": "string",
+              "description": "The update id."
+            },
+            {
+              "name": "error",
+              "type": "string",
+              "description": "Handler failure or rejection message. Absent on an orphaned update."
+            },
+            {
+              "name": "error_type",
+              "type": "string",
+              "description": "Orphan classification. Present only when the workflow went terminal first."
+            },
+            {
+              "name": "workflow_state",
+              "type": "string",
+              "description": "The terminal workflow state that orphaned the update."
+            }
+          ]
+        },
+        {
+          "status": 422,
+          "description": "The update's validator rejected it, so no UpdateAdmitted event was written.",
+          "fields": [
+            {
+              "name": "error",
+              "type": "string",
+              "description": "Always 'update rejected by validator'."
+            },
+            {
+              "name": "reason",
+              "type": "string",
+              "description": "The validator's rejection reason."
+            }
+          ]
+        }
+      ],
       "error_responses": [
         {
           "status": 400,
@@ -2603,11 +3058,40 @@
       "additional_responses": [
         {
           "status": 202,
-          "description": "Update admitted but not yet completed (still in-flight)."
+          "description": "Update admitted but not yet completed (still in-flight).",
+          "fields": [
+            {
+              "name": "update_id",
+              "type": "string",
+              "description": "The admitted update id."
+            }
+          ]
         },
         {
           "status": 409,
-          "description": "Update failed or was rejected by the handler."
+          "description": "Update failed, was rejected by the handler, or was orphaned by a terminal workflow. A rejected update carries error; an orphaned one carries error_type and workflow_state instead.",
+          "fields": [
+            {
+              "name": "update_id",
+              "type": "string",
+              "description": "The update id."
+            },
+            {
+              "name": "error",
+              "type": "string",
+              "description": "Handler failure or rejection message. Absent on an orphaned update."
+            },
+            {
+              "name": "error_type",
+              "type": "string",
+              "description": "Orphan classification. Present only when the workflow reached a terminal state first."
+            },
+            {
+              "name": "workflow_state",
+              "type": "string",
+              "description": "The terminal workflow state that orphaned the update."
+            }
+          ]
         }
       ],
       "error_responses": [
@@ -2833,6 +3317,38 @@
           }
         ]
       },
+      "additional_responses": [
+        {
+          "status": 200,
+          "description": "dry_run was true. The plan is returned and nothing is written; new_run_exec_id and events_carried_over are omitted.",
+          "fields": [
+            {
+              "name": "dry_run",
+              "description": "True for a dry-run preview."
+            },
+            {
+              "name": "dag_name",
+              "description": "The DAG name."
+            },
+            {
+              "name": "source_run_exec_id",
+              "description": "The source DAG run execution id."
+            },
+            {
+              "name": "reset_to_event_id",
+              "description": "Resolved 0-based reset event id passed to the #148 reset."
+            },
+            {
+              "name": "nodes_to_re_execute",
+              "description": "Nodes that will re-execute on the new run."
+            },
+            {
+              "name": "nodes_carried_over",
+              "description": "Nodes whose recorded results are carried over."
+            }
+          ]
+        }
+      ],
       "error_responses": [
         {
           "status": 400,
@@ -2864,7 +3380,7 @@
         }
       ],
       "request_body": {
-        "required": false,
+        "required": true,
         "free_form": false,
         "fields": [
           {
@@ -2948,10 +3464,11 @@
           "description": "Maximum number of entries to return."
         },
         {
-          "name": "cursor",
+          "name": "owner",
           "in": "query",
           "required": false,
-          "description": "Pagination cursor."
+          "type": "string",
+          "description": "Filter to dead letters owned by one workflow or activity."
         }
       ],
       "request_body": null,
@@ -3273,6 +3790,17 @@
           "task_id"
         ]
       },
+      "additional_responses": [
+        {
+          "status": 202,
+          "description": "The replay was accepted and the workflow was re-enqueued. Same fields as the 200.",
+          "fields": [
+            "ok",
+            "dead_letter_id",
+            "task_id"
+          ]
+        }
+      ],
       "error_responses": [
         {
           "status": 404,
@@ -3382,7 +3910,7 @@
         }
       ],
       "request_body": {
-        "required": false,
+        "required": true,
         "free_form": false,
         "fields": [
           {
@@ -3479,7 +4007,7 @@
         }
       ],
       "request_body": {
-        "required": false,
+        "required": true,
         "free_form": false,
         "fields": [
           {
@@ -3687,7 +4215,7 @@
         }
       ],
       "request_body": {
-        "required": false,
+        "required": true,
         "free_form": false,
         "fields": [
           {
@@ -3768,6 +4296,20 @@
           "in": "query",
           "required": false,
           "description": "Maximum number of operations to return."
+        },
+        {
+          "name": "status",
+          "in": "query",
+          "required": false,
+          "type": "string",
+          "description": "Filter by batch job status."
+        },
+        {
+          "name": "action",
+          "in": "query",
+          "required": false,
+          "type": "string",
+          "description": "Filter by the action the batch applies: cancel, terminate, or signal."
         }
       ],
       "request_body": null,
@@ -3848,10 +4390,121 @@
         ],
         "notes": "Polymorphic response. A real submit (dry_run false/omitted) returns 202 Accepted with {batch_job_id}. When dry_run is true, returns 200 with a read-only preview: {dry_run:true, action, filter (the normalized filter echoed back), matched_count, per_shard (array of {shard_id, matched_count} summing to matched_count), sample (array of up to sample_cap {execution_id, workflow_name, state} rows ordered by id ascending, global across all shards), sample_cap (100), sample_truncated (matched_count > sample.len()), status ('complete'|'partial'), unavailable_shards (array of {shard_id, reason}, omitted when empty)}. Partial-shard degradation (mirrors POST /workflows/batch_reset): when a shard is unreachable the preview returns 200 with status='partial' naming the unavailable shard instead of failing with a 500 — and matched_count is then a LOWER BOUND over reachable shards only. A dry_run is admin-only (this route is Mutating) and does NOT validate signal_name/payload — the real submit may still 400. An empty/criteria-less filter is rejected 400 with the same guard as a real submit."
       },
+      "additional_responses": [
+        {
+          "status": 200,
+          "description": "dry_run was true. No batch was submitted; the response is the plan envelope instead of { batch_job_id }.",
+          "fields": [
+            {
+              "name": "dry_run",
+              "type": "boolean",
+              "description": "Always true on this response."
+            },
+            {
+              "name": "action",
+              "type": "string",
+              "description": "The action the batch would apply."
+            },
+            {
+              "name": "filter",
+              "description": "The filter the plan was computed for."
+            },
+            {
+              "name": "matched_count",
+              "type": "integer",
+              "description": "How many executions the filter matched."
+            },
+            {
+              "name": "per_shard",
+              "description": "Matched counts per shard."
+            },
+            {
+              "name": "sample",
+              "description": "A sample of the matched executions."
+            },
+            {
+              "name": "sample_cap",
+              "type": "integer",
+              "description": "The global sample cap the sample was bounded by."
+            },
+            {
+              "name": "sample_truncated",
+              "type": "boolean",
+              "description": "Whether the sample was cut short."
+            },
+            {
+              "name": "status",
+              "type": "string",
+              "description": "complete, partial, or unavailable."
+            },
+            {
+              "name": "unavailable_shards",
+              "description": "Shards that could not be reached."
+            }
+          ]
+        }
+      ],
       "error_responses": [
         {
           "status": 400,
           "description": "Invalid action or missing required fields."
+        },
+        {
+          "status": 500,
+          "description": "Database error."
+        }
+      ]
+    },
+    {
+      "method": "PATCH",
+      "path": "/tasks/{id}",
+      "category": "queue",
+      "read_only": false,
+      "description": "Re-prioritize a pending task without restarting its workflow (issue #249). An already-running task ignores the change; the next retry attempt uses the new priority. Admin only, and audited as task.reprioritize.",
+      "idempotency": "Idempotent: setting the same priority twice leaves the row unchanged and returns the same body.",
+      "params": [
+        {
+          "name": "id",
+          "in": "path",
+          "required": true,
+          "description": "Task UUID."
+        }
+      ],
+      "request_body": {
+        "required": true,
+        "free_form": false,
+        "fields": [
+          {
+            "name": "priority",
+            "type": "string",
+            "required": true,
+            "description": "New task priority."
+          }
+        ]
+      },
+      "success_response": {
+        "status": 200,
+        "fields": [
+          "task_id",
+          "priority",
+          "updated"
+        ],
+        "field_notes": {
+          "updated": "true when the task row was re-prioritized; false when the task is terminal, so the row still exists but is no longer claimable."
+        }
+      },
+      "error_responses": [
+        {
+          "status": 400,
+          "description": "Task id is not a UUID, or the priority value is unknown."
+        },
+        {
+          "status": 401,
+          "description": "Authentication required."
+        },
+        {
+          "status": 404,
+          "description": "No task with that id on any shard."
         },
         {
           "status": 500,
@@ -4092,6 +4745,36 @@
           "shard_readiness"
         ]
       },
+      "additional_responses": [
+        {
+          "status": 503,
+          "description": "Shard readiness is enforced and at least one shard is not ready. Same body as the 200; read shard_readiness for the detail.",
+          "fields": [
+            "runtime_ready",
+            "worker_id",
+            "queues",
+            "dag_count",
+            "scheduler",
+            "shard_readiness_enforced",
+            "shard_readiness"
+          ]
+        }
+      ],
+      "error_responses": []
+    },
+    {
+      "method": "GET",
+      "path": "/openapi.json",
+      "category": "discovery",
+      "read_only": true,
+      "description": "Serve the OpenAPI 3.1 document for this management API (issue #694). The document is derived from this contract, so it covers every route listed here and nothing else. Read-only, and never behind the built-in admin guard: a client generator must reach it before it holds a credential. An embedder that wraps the whole router in its own auth middleware (api_with_auth) gates this route too. The identical document is checked in at docs/openapi.json.",
+      "params": [],
+      "request_body": null,
+      "success_response": {
+        "status": 200,
+        "free_form": true,
+        "note": "The OpenAPI 3.1 document as a JSON object, with keys openapi, info, servers, security, tags, paths and components."
+      },
       "error_responses": []
     },
     {
@@ -4236,6 +4919,23 @@
         ],
         "notes": "A write reaching only SOME readable shards returns 207 Multi-Status with body { \"override\": <the same fields as the 200 body>, \"shard_errors\": [\"shard {id}: {error}\", ...] } -- the override is NOT in effect on the shards named in shard_errors, so a subsequent read/dispatch there still sees the prior state (or the declared baseline if none was ever set); re-issue the request (it is idempotent). The reported override/effective values reflect the PERSISTED row from whichever shard's write is used to build the response, not the request body verbatim -- the separate, permanent POST /admin/rate-limits/{key} route (issue #332) can independently change a bucket's declared refill_rate/burst per shard, so the two may already disagree across shards even before this call. A fully applied request returns plain 200 and omits shard_errors."
       },
+      "additional_responses": [
+        {
+          "status": 207,
+          "description": "The fan-out reached only SOME shards. The body carries the result computed from the shards that answered, plus shard_errors naming the ones that did not, so the caller can retry or reconcile.",
+          "fields": [
+            {
+              "name": "override",
+              "description": "The override as it stands on the shards that answered."
+            },
+            {
+              "name": "shard_errors",
+              "type": "array",
+              "description": "One entry per shard the write or read could not reach, naming the shard and the reason."
+            }
+          ]
+        }
+      ],
       "error_responses": [
         {
           "status": 400,
@@ -4294,6 +4994,23 @@
         ],
         "notes": "A clear reaching only SOME readable shards returns 207 Multi-Status with body { \"override\": <the same fields as the 200 body>, \"shard_errors\": [\"shard {id}: {error}\", ...] }. The override REMAINS ACTIVE (unless independently expired) on the shards named in shard_errors -- the clear did not reach them -- so a subsequent read/dispatch there can still observe the overridden rate; re-issue the request (it is idempotent). A fully applied clear returns plain 200 and omits shard_errors, with override_active: false."
       },
+      "additional_responses": [
+        {
+          "status": 207,
+          "description": "The fan-out reached only SOME shards. The body carries the result computed from the shards that answered, plus shard_errors naming the ones that did not, so the caller can retry or reconcile.",
+          "fields": [
+            {
+              "name": "override",
+              "description": "The pacing as it stands on the shards that answered."
+            },
+            {
+              "name": "shard_errors",
+              "type": "array",
+              "description": "One entry per shard the write or read could not reach, naming the shard and the reason."
+            }
+          ]
+        }
+      ],
       "error_responses": [
         {
           "status": 401,
@@ -4364,6 +5081,23 @@
         ],
         "notes": "A write reaching only SOME readable shards returns 207 Multi-Status with body { \"override\": <the same fields as the 200 body>, \"shard_errors\": [\"shard {id}: {error}\", ...] } -- the override is NOT in effect on the shards named in shard_errors, so a deferred-start row already queued there still sees the prior state (or the declared baseline if none was ever set); re-issue the request (it is idempotent). The reported override/effective values reflect the PERSISTED row from whichever shard's write is used to build the response, not the request body verbatim. A fully applied request returns plain 200 and omits shard_errors."
       },
+      "additional_responses": [
+        {
+          "status": 207,
+          "description": "The fan-out reached only SOME shards. The body carries the result computed from the shards that answered, plus shard_errors naming the ones that did not, so the caller can retry or reconcile.",
+          "fields": [
+            {
+              "name": "override",
+              "description": "The override as it stands on the shards that answered."
+            },
+            {
+              "name": "shard_errors",
+              "type": "array",
+              "description": "One entry per shard the write or read could not reach, naming the shard and the reason."
+            }
+          ]
+        }
+      ],
       "error_responses": [
         {
           "status": 400,
@@ -4422,6 +5156,23 @@
         ],
         "notes": "A clear reaching only SOME readable shards returns 207 Multi-Status with body { \"override\": <the same fields as the 200 body>, \"shard_errors\": [\"shard {id}: {error}\", ...] }. The override REMAINS ACTIVE (unless independently expired) on the shards named in shard_errors -- the clear did not reach them -- so a deferred-start row already queued there can still observe the overridden rate; re-issue the request (it is idempotent). A fully applied clear returns plain 200 and omits shard_errors, with override_active: false."
       },
+      "additional_responses": [
+        {
+          "status": 207,
+          "description": "The fan-out reached only SOME shards. The body carries the result computed from the shards that answered, plus shard_errors naming the ones that did not, so the caller can retry or reconcile.",
+          "fields": [
+            {
+              "name": "override",
+              "description": "The pacing as it stands on the shards that answered."
+            },
+            {
+              "name": "shard_errors",
+              "type": "array",
+              "description": "One entry per shard the write or read could not reach, naming the shard and the reason."
+            }
+          ]
+        }
+      ],
       "error_responses": [
         {
           "status": 401,
@@ -4471,6 +5222,33 @@
         ],
         "notes": "A read reaching only SOME readable shards, OR a read of shards that disagree on override state, returns 207 Multi-Status with body { \"override\": <the same fields as the 200 body>, \"shard_errors\": [\"shard {id}: {error}\", ...], \"shard_disagreement\": <bool>, \"shards\": { \"<shard_id>\": <per-shard body, same fields as the 200 body>, ... } }. `override` (the flattened top-level view) prefers a LIVE override on ANY reachable shard -- it never silently reports override_active:false merely because a different (inactive) shard happens to have fewer raw tokens. `shard_disagreement` compares each shard's RESOLVED EFFECTIVE (refill_rate, burst) -- not the raw override_refill_rate/override_burst columns -- so it is true both when reachable shards disagree on the active/inactive boolean, and when byte-identical override columns nonetheless resolve to different effective values because a partial legacy POST /admin/rate-limits/{key} (issue #332) left the shards with divergent persisted BASELINES and an omitted override field falls back to each shard's own (diverged) baseline (issue #945 review, round 5, P2). Millisecond clock skew on override_expires_at alone across a normal successful multi-shard SET does not count as disagreement. `shards` is present whenever the response is 207 (both the shard-outage and the disagreement case) and lists every REACHABLE shard's own view (shard IDs named only in shard_errors are omitted, since their row could not be read). A fully reachable, fully agreeing read returns plain 200 and omits shard_errors/shard_disagreement/shards."
       },
+      "additional_responses": [
+        {
+          "status": 207,
+          "description": "The fan-out reached only SOME shards. The body carries the result computed from the shards that answered, plus shard_errors naming the ones that did not, so the caller can retry or reconcile.",
+          "fields": [
+            {
+              "name": "override",
+              "description": "The override read from the shards that answered."
+            },
+            {
+              "name": "shard_errors",
+              "type": "array",
+              "description": "One entry per shard the write or read could not reach, naming the shard and the reason."
+            },
+            {
+              "name": "shard_disagreement",
+              "type": "boolean",
+              "description": "True when the answering shards do not agree on the override."
+            },
+            {
+              "name": "shards",
+              "type": "object",
+              "description": "The per-shard view behind the disagreement, keyed by shard id."
+            }
+          ]
+        }
+      ],
       "error_responses": [
         {
           "status": 401,
@@ -5291,6 +6069,10 @@
       ],
       "request_body": null,
       "success_response": {
+        "content_type": [
+          "application/json",
+          "text/plain; version=0.0.4; charset=utf-8"
+        ],
         "status": 200,
         "free_form": true
       },
@@ -5310,6 +6092,7 @@
       "params": [],
       "request_body": null,
       "success_response": {
+        "content_type": "text/plain; version=0.0.4; charset=utf-8",
         "status": 200,
         "free_form": true
       },
@@ -5340,6 +6123,12 @@
           "description": "Execution state group: active or terminal."
         },
         {
+          "name": "state",
+          "in": "query",
+          "required": false,
+          "description": "Comma-separated execution states, as an alternative to the state_group shorthand. An unknown state returns 400."
+        },
+        {
           "name": "updated_after",
           "in": "query",
           "required": false,
@@ -5368,6 +6157,12 @@
           "in": "query",
           "required": false,
           "description": "Payload inclusion: full, redacted, or omit."
+        },
+        {
+          "name": "max_bytes",
+          "in": "query",
+          "required": false,
+          "description": "Cap on the decoded payload bytes an entry may contribute. An entry over the cap is reported with its size instead of its payload."
         }
       ],
       "request_body": null,
@@ -5839,6 +6634,53 @@
             "name": "catchup_window_secs",
             "required": false,
             "description": "Window length in seconds when catchup_policy = window; ignored otherwise (issue #484)."
+          },
+          {
+  "name": "timezone",
+  "type": "string",
+  "required": false,
+  "description": "IANA timezone the cron expression is evaluated in. Defaults to UTC."
+          },
+          {
+  "name": "jitter_secs",
+  "type": "integer",
+  "required": false,
+  "description": "Random delay added to each fire, in seconds, to spread a thundering herd."
+          },
+          {
+  "name": "overlap_policy",
+  "type": "string",
+  "required": false,
+  "description": "What to do when a fire lands while the previous run is still going: skip, buffer_one, buffer_all, or allow_all."
+          },
+          {
+  "name": "buffer_all_max",
+  "type": "integer",
+  "required": false,
+  "description": "Cap on the buffered backlog when overlap_policy is buffer_all."
+          },
+          {
+  "name": "consecutive_failure_limit",
+  "type": "integer",
+  "required": false,
+  "description": "Pause the schedule after this many consecutive failed runs. Null disables the limit."
+          },
+          {
+  "name": "end_at",
+  "type": "string",
+  "required": false,
+  "description": "RFC 3339 instant after which the schedule stops firing."
+          },
+          {
+  "name": "max_runs",
+  "type": "integer",
+  "required": false,
+  "description": "Total number of runs this schedule may produce before it is exhausted."
+          },
+          {
+  "name": "retry_policy",
+  "required": false,
+  "description": "Retry policy applied to each run this schedule starts. Defaults to the workflow's own policy."
           }
         ]
       },
@@ -5983,6 +6825,12 @@
             "name": "retry_policy",
             "required": false,
             "description": "New schedule-level workflow retry policy (issue #523). Tri-state: omit = unchanged, explicit null = clear."
+          },
+          {
+  "name": "workflow_name",
+  "type": "string",
+  "required": false,
+  "description": "Retarget the schedule at a different registered workflow."
           }
         ]
       },
@@ -6291,6 +7139,10 @@
           "description": "Schedule not found."
         },
         {
+          "status": 409,
+          "description": "The schedule is exhausted: end_at has passed, max_runs is spent, or exhausted_at is set. Extend the limits before backfilling."
+        },
+        {
           "status": 500,
           "description": "Database error or partial shard failure."
         }
@@ -6464,10 +7316,12 @@
       "idempotency": "Fully idempotent read-only operation; no state is written.",
       "params": [],
       "request_body": {
+        "required": true,
         "free_form": false,
         "fields": [
           {
             "name": "schedule_expr",
+          "required": true,
             "type": "string",
             "description": "Cron, interval, or manual expression (same format as POST /admin/schedules/workflow)."
           },
@@ -6578,24 +7432,39 @@
       "description": "List schedule-decision records (fire/skip/overlap/catchup outcomes) across all schedules.",
       "params": [
         {
-          "name": "schedule_id",
-          "type": "string",
-          "description": "Filter by schedule UUID."
-        },
-        {
           "name": "decision",
+          "in": "query",
+          "required": false,
           "type": "string",
           "description": "Filter by decision kind (e.g. fired, skipped, overlap_skipped)."
         },
         {
           "name": "reason",
+          "in": "query",
+          "required": false,
           "type": "string",
           "description": "Filter by reason label."
         },
         {
           "name": "limit",
+          "in": "query",
+          "required": false,
           "type": "integer",
           "description": "Maximum number of records to return. Defaults to 50."
+        },
+        {
+          "name": "schedule_name",
+          "in": "query",
+          "required": false,
+          "type": "string",
+          "description": "Filter to one schedule by name. This is the filter the handler applies; there is no id filter on this route."
+        },
+        {
+          "name": "since",
+          "in": "query",
+          "required": false,
+          "type": "string",
+          "description": "RFC 3339 lower bound on occurred_at."
         }
       ],
       "request_body": null,
@@ -6623,32 +7492,50 @@
       "description": "List the workflow executions a schedule launched, newest-slot-first (ordered by scheduled_for, falling back to started_at for slot-less manual fires), each with its terminal state, a collapsed outcome (completed/failed/timed_out/cancelled/terminated/running), the first line of the error for terminally-failed runs, and the dispatch origin (scheduled/backfill/manual_trigger). Echoes the schedule's next_run_at and a per-state cadence summary counting only scheduled-origin runs. Fans out across shards; reports partial results when a shard is unavailable instead of failing. 404s an unknown schedule id. A malformed percent-encoded query-string byte sequence (an invalid UTF-8 byte, or an incomplete/non-hex `%` escape) is rejected with a 400 before any parameter is parsed, rather than silently substituting the Unicode replacement character and proceeding with a wrong-but-plausible value (issue #1151, sweeping the issue #774 `queue-coverage` fix to every other raw-pairs route).",
       "params": [
         {
+          "name": "id",
+          "in": "path",
+          "required": true,
+          "description": "Schedule UUID."
+        },
+        {
           "name": "state",
+          "in": "query",
+          "required": false,
           "type": "string",
           "description": "Filter by execution state (repeatable, or comma-separated), e.g. FAILED,TIMED_OUT."
         },
         {
           "name": "origin",
+          "in": "query",
+          "required": false,
           "type": "string",
           "description": "Filter by dispatch origin: scheduled, backfill, or manual_trigger (repeatable)."
         },
         {
           "name": "since",
+          "in": "query",
+          "required": false,
           "type": "string",
           "description": "Inclusive lower bound on started_at: RFC 3339 timestamp or relative duration like 24h."
         },
         {
           "name": "until",
+          "in": "query",
+          "required": false,
           "type": "string",
           "description": "Exclusive upper bound on started_at: RFC 3339 timestamp or relative duration."
         },
         {
           "name": "limit",
+          "in": "query",
+          "required": false,
           "type": "integer",
           "description": "Maximum runs to return (default 20, clamped 1-200). A value above 200 is clamped and reported via the echoed limit and next_cursor; a limit below 1 or non-integer is a 400."
         },
         {
           "name": "cursor",
+          "in": "query",
+          "required": false,
           "type": "string",
           "description": "Opaque keyset cursor from a prior response's next_cursor for the next page."
         }
@@ -6696,19 +7583,38 @@
       "description": "List schedule-decision records for a specific schedule.",
       "params": [
         {
+          "name": "id",
+          "in": "path",
+          "required": true,
+          "description": "Schedule UUID."
+        },
+        {
           "name": "decision",
+          "in": "query",
+          "required": false,
           "type": "string",
           "description": "Filter by decision kind."
         },
         {
           "name": "reason",
+          "in": "query",
+          "required": false,
           "type": "string",
           "description": "Filter by reason label."
         },
         {
           "name": "limit",
+          "in": "query",
+          "required": false,
           "type": "integer",
           "description": "Maximum number of records to return. Defaults to 50."
+        },
+        {
+          "name": "since",
+          "in": "query",
+          "required": false,
+          "type": "string",
+          "description": "RFC 3339 lower bound on occurred_at."
         }
       ],
       "request_body": null,
@@ -7045,6 +7951,7 @@
       ],
       "request_body": null,
       "success_response": {
+        "content_type": "text/event-stream",
         "status": 200,
         "note": "Content-Type: text/event-stream. Each SSE message carries id (BIGSERIAL), event (WorkflowEvent type name), and data (JSON event value). A final event:stream-end message signals terminal execution state. Returns 409 Conflict with {error:slow_consumer, drop_after_event_id} when the client is too far behind.",
         "free_form": true
@@ -7139,6 +8046,23 @@
           "ramp_percent"
         ]
       },
+      "additional_responses": [
+        {
+          "status": 207,
+          "description": "The fan-out reached only SOME shards. The body carries the result computed from the shards that answered, plus shard_errors naming the ones that did not, so the caller can retry or reconcile.",
+          "fields": [
+            {
+              "name": "policy",
+              "description": "The policy as written to the shards that answered."
+            },
+            {
+              "name": "shard_errors",
+              "type": "array",
+              "description": "One entry per shard the write or read could not reach, naming the shard and the reason."
+            }
+          ]
+        }
+      ],
       "error_responses": [
         {
           "status": 401,
@@ -7207,6 +8131,23 @@
           "declared_at"
         ]
       },
+      "additional_responses": [
+        {
+          "status": 207,
+          "description": "The fan-out reached only SOME shards. The body carries the result computed from the shards that answered, plus shard_errors naming the ones that did not, so the caller can retry or reconcile.",
+          "fields": [
+            {
+              "name": "entry",
+              "description": "The declaration as written to the shards that answered."
+            },
+            {
+              "name": "shard_errors",
+              "type": "array",
+              "description": "One entry per shard the write or read could not reach, naming the shard and the reason."
+            }
+          ]
+        }
+      ],
       "error_responses": [
         {
           "status": 401,
@@ -7250,6 +8191,24 @@
           "revoked"
         ]
       },
+      "additional_responses": [
+        {
+          "status": 207,
+          "description": "The fan-out reached only SOME shards. The body carries the result computed from the shards that answered, plus shard_errors naming the ones that did not, so the caller can retry or reconcile.",
+          "fields": [
+            {
+              "name": "revoked",
+              "type": "boolean",
+              "description": "True when at least one answering shard held the row."
+            },
+            {
+              "name": "shard_errors",
+              "type": "array",
+              "description": "One entry per shard the write or read could not reach, naming the shard and the reason."
+            }
+          ]
+        }
+      ],
       "error_responses": [
         {
           "status": 401,
@@ -7347,6 +8306,23 @@
           "ramp_percent"
         ]
       },
+      "additional_responses": [
+        {
+          "status": 207,
+          "description": "The fan-out reached only SOME shards. The body carries the result computed from the shards that answered, plus shard_errors naming the ones that did not, so the caller can retry or reconcile.",
+          "fields": [
+            {
+              "name": "policy",
+              "description": "The ramp as written to the shards that answered."
+            },
+            {
+              "name": "shard_errors",
+              "type": "array",
+              "description": "One entry per shard the write or read could not reach, naming the shard and the reason."
+            }
+          ]
+        }
+      ],
       "error_responses": [
         {
           "status": 400,
@@ -7399,6 +8375,23 @@
           "ramp_percent"
         ]
       },
+      "additional_responses": [
+        {
+          "status": 207,
+          "description": "The fan-out reached only SOME shards. The body carries the result computed from the shards that answered, plus shard_errors naming the ones that did not, so the caller can retry or reconcile.",
+          "fields": [
+            {
+              "name": "policy",
+              "description": "The last policy seen before the clear."
+            },
+            {
+              "name": "shard_errors",
+              "type": "array",
+              "description": "One entry per shard the write or read could not reach, naming the shard and the reason."
+            }
+          ]
+        }
+      ],
       "error_responses": [
         {
           "status": 401,
@@ -7422,10 +8415,7 @@
       "description": "List all active (non-lifted) admission gates. The response also carries a `producers` block enumerating every in-process workflow-start producer and whether it is `gated`, `gated_at_admission` (deferred-fire producers gated at HTTP admission whose scanner fire is exempt-with-bypass-counter), `gated_at_relay` (gated authoritatively at relay/fire time on the target/real queue: the cross-shard completion-trigger relay blocks + drops a matching gate, and — since issue #1053 — the throttle scanner blocks + re-defers a matching gate; else both count the bypass), or `exempt_by_design` (with a rationale), so the admission-gate contract is discoverable without reading source (issue #618).",
       "idempotency": "Read-only; always idempotent.",
       "params": [],
-      "request_body": {
-        "required": false,
-        "free_form": true
-      },
+      "request_body": null,
       "success_response": {
         "status": 200,
         "free_form": true
@@ -7551,10 +8541,7 @@
       "description": "List all scoped API tokens as metadata only (issue #942). The plaintext secret and its hash are never returned — only id, name, scope, created_at, expires_at, last_used_at, revoked_at.",
       "idempotency": "Read-only; always idempotent.",
       "params": [],
-      "request_body": {
-        "required": false,
-        "free_form": true
-      },
+      "request_body": null,
       "success_response": {
         "status": 200,
         "free_form": true
@@ -7624,6 +8611,10 @@
         {
           "status": 503,
           "description": "Database unavailable."
+        },
+        {
+          "status": 500,
+          "description": "The token row could not be written. The response carries a generic message; the detail is in the audit record."
         }
       ]
     },
@@ -7738,6 +8729,31 @@
         ],
         "notes": "A hold applied to only SOME target shards returns 207 Multi-Status with `ok: false` and `status: \"partial\"`, plus a `partial_failures` string naming the shards that were not reached (including a shard the router knows about but this process has no pool for). The hold is NOT in effect fleet-wide in that case \u2014 the missed shards keep dispatching \u2014 so re-issue the request (it is idempotent). A fully applied request returns 200 with `ok: true` and `status: \"complete\"`, and omits `partial_failures`. Cross-shard provenance: `held_task_count` is the fleet-wide sum, while the top-level `reason`/`paused_by`/`paused_at`/`scope_shard_id` describe the EARLIEST hold (tie-broken by shard id \u2014 the same rule `GET /admin/queues/paused` and the Vantage banner use, so the three surfaces never disagree). Because an idempotent re-pause preserves each shard's ORIGINAL provenance, a fleet-wide request landing over pre-existing scoped holds leaves the shards disagreeing: `shards` then carries every shard's own `{shard_id, newly_paused, reason, paused_by, paused_at, scope_shard_id, held_task_count}` and `provenance_uniform` is false. `provenance_uniform` compares `(reason, paused_by, scope_shard_id)` and deliberately NOT `paused_at`, since each shard stamps its own NOW()."
       },
+      "additional_responses": [
+        {
+          "status": 207,
+          "description": "The hold reached only SOME shards. The body is the 200 body plus partial_failures naming the shards that did not apply it, so an operator can see the hold is not fleet-wide.",
+          "fields": [
+            "ok",
+            "status",
+            "queue_name",
+            "newly_paused",
+            "reason",
+            "paused_by",
+            "paused_at",
+            "scope_shard_id",
+            "held_task_count",
+            "provenance_uniform",
+            "shards",
+            "partial_failures",
+            {
+              "name": "partial_failures",
+              "type": "string",
+              "description": "Summary of the shards the hold could not be applied to. Present only on this status."
+            }
+          ]
+        }
+      ],
       "error_responses": [
         {
           "status": 400,
@@ -7800,6 +8816,30 @@
         ],
         "notes": "A resume applied to only SOME target shards returns 207 Multi-Status with `ok: false`, `status: \"partial\"` and a `partial_failures` string. Work remains held on the shards that were not reached \u2014 the safe direction, but not a completed thaw \u2014 so re-issue the request (it is idempotent). A fully applied request returns 200 with `ok: true` and `status: \"complete\"`. Cross-shard provenance: the resume DELETES the pause rows, so this response is the ONLY surviving record of what was released. `released_task_count` is the fleet-wide sum and `paused_duration_secs` the longest hold; the top-level `released_reason`/`released_paused_by` describe THAT same longest-held shard (tie-broken by lowest shard id), so the duration and the story it is paired with always come from one shard. `shards` carries every shard's own `{shard_id, newly_resumed, released_task_count, paused_duration_secs, released_reason, released_paused_by}` so independently-paused shards lose nothing, and `provenance_uniform` is false when the released shards disagree on `(released_reason, released_paused_by)`. A shard that was not paused contributes null provenance and is ignored by the summary."
       },
+      "additional_responses": [
+        {
+          "status": 207,
+          "description": "The hold reached only SOME shards. The body is the 200 body plus partial_failures naming the shards that did not apply it, so an operator can see the hold is not fleet-wide.",
+          "fields": [
+            "ok",
+            "status",
+            "queue_name",
+            "newly_resumed",
+            "released_task_count",
+            "paused_duration_secs",
+            "released_reason",
+            "released_paused_by",
+            "provenance_uniform",
+            "shards",
+            "partial_failures",
+            {
+              "name": "partial_failures",
+              "type": "string",
+              "description": "Summary of the shards the hold could not be applied to. Present only on this status."
+            }
+          ]
+        }
+      ],
       "error_responses": [
         {
           "status": 400,
@@ -7945,6 +8985,31 @@
         ],
         "notes": "A hold applied to only SOME shards returns 207 Multi-Status with `ok: false` and `status: \"partial\"`, plus a `partial_failures` string naming the shards that were not reached (including a shard the router knows about but this process has no pool for). The hold is NOT in effect fleet-wide in that case -- the missed shards keep dispatching -- so re-issue the request (it is idempotent). A fully applied request returns 200 with `ok: true` and `status: \"complete\"`, and omits `partial_failures`. Cross-shard provenance: `held_task_count` is the fleet-wide sum, while the top-level `reason`/`paused_by`/`paused_at`/`scope_shard_id` describe the EARLIEST hold (tie-broken by shard id -- the same rule the read endpoints use). Because an idempotent re-pause preserves each shard's ORIGINAL provenance, a request landing over a pre-existing hold leaves the shards disagreeing: `shards` then carries every shard's own `{shard_id, newly_paused, reason, paused_by, paused_at, scope_shard_id, held_task_count}` and `provenance_uniform` is false. `provenance_uniform` compares `(reason, paused_by, scope_shard_id)` and deliberately NOT `paused_at`, since each shard stamps its own NOW(). `scope_shard_id` is always null for a hold placed by this route (fleet-wide); it is reported because the underlying column records the INTENT of whichever surface wrote each row."
       },
+      "additional_responses": [
+        {
+          "status": 207,
+          "description": "The hold reached only SOME shards. The body is the 200 body plus partial_failures naming the shards that did not apply it, so an operator can see the hold is not fleet-wide.",
+          "fields": [
+            "ok",
+            "status",
+            "activity_name",
+            "newly_paused",
+            "reason",
+            "paused_by",
+            "paused_at",
+            "scope_shard_id",
+            "held_task_count",
+            "provenance_uniform",
+            "shards",
+            "partial_failures",
+            {
+              "name": "partial_failures",
+              "type": "string",
+              "description": "Summary of the shards the hold could not be applied to. Present only on this status."
+            }
+          ]
+        }
+      ],
       "error_responses": [
         {
           "status": 400,
@@ -8001,6 +9066,30 @@
         ],
         "notes": "A resume applied to only SOME shards returns 207 Multi-Status with `ok: false`, `status: \"partial\"` and a `partial_failures` string. Work remains held on the shards that were not reached -- the safe direction, but not a completed thaw -- so re-issue the request (it is idempotent). A fully applied request returns 200 with `ok: true` and `status: \"complete\"`. Cross-shard provenance: the resume DELETES the pause rows, so this response and the audit row are the ONLY surviving record of what was released. `released_task_count` is the fleet-wide sum and `paused_duration_secs` the longest hold; the top-level `released_reason`/`released_paused_by` describe THAT same longest-held shard (tie-broken by lowest shard id), so the duration and the story it is paired with always come from one shard. `shards` carries every shard's own `{shard_id, newly_resumed, released_task_count, paused_duration_secs, released_reason, released_paused_by}`, and `provenance_uniform` is false when the released shards disagree on `(released_reason, released_paused_by)`. A shard that was not paused contributes null provenance and is ignored by the summary."
       },
+      "additional_responses": [
+        {
+          "status": 207,
+          "description": "The hold reached only SOME shards. The body is the 200 body plus partial_failures naming the shards that did not apply it, so an operator can see the hold is not fleet-wide.",
+          "fields": [
+            "ok",
+            "status",
+            "activity_name",
+            "newly_resumed",
+            "released_task_count",
+            "paused_duration_secs",
+            "released_reason",
+            "released_paused_by",
+            "provenance_uniform",
+            "shards",
+            "partial_failures",
+            {
+              "name": "partial_failures",
+              "type": "string",
+              "description": "Summary of the shards the hold could not be applied to. Present only on this status."
+            }
+          ]
+        }
+      ],
       "error_responses": [
         {
           "status": 400,
@@ -8212,6 +9301,12 @@
         }
       ],
       "request_body": null,
+      "response_headers": [
+        {
+          "name": "X-Harvest-Execution-Id",
+          "description": "The execution id this call resolved to. Stamped on every response the delegate returns, success or error. Absent when resolution itself failed, so a 404 for an unknown (workflow_name, workflow_id) does not carry it."
+        }
+      ],
       "success_response": {
         "status": 200,
         "free_form": true,
@@ -8225,6 +9320,10 @@
         {
           "status": 500,
           "description": "Database error."
+        },
+        {
+          "status": 503,
+          "description": "The business id could not be resolved: an expected shard has no pool in this process, or its connection could not be acquired. The resolver fails closed with 503 rather than reporting a false 404, so retry once the shard is reachable."
         }
       ]
     },
@@ -8255,15 +9354,38 @@
         }
       ],
       "request_body": null,
+      "response_headers": [
+        {
+          "name": "X-Harvest-Execution-Id",
+          "description": "The execution id this call resolved to. Stamped on every response the delegate returns, success or error. Absent when resolution itself failed, so a 404 for an unknown (workflow_name, workflow_id) does not carry it."
+        }
+      ],
       "success_response": {
         "status": 200,
         "free_form": true,
         "note": "Same body as GET /workflows/{id}/result (204 No Content with Retry-After when still running). Resolved execution_id in the X-Harvest-Execution-Id header on every response."
       },
+      "additional_responses": [
+        {
+          "status": 204,
+          "description": "The execution is still running after the wait window. The body is empty and Retry-After is 1; poll again.",
+          "headers": [
+            {
+              "name": "Retry-After",
+              "type": "integer",
+              "description": "Seconds to wait before polling again. Always 1."
+            }
+          ]
+        }
+      ],
       "error_responses": [
         {
           "status": 400,
           "description": "Invalid wait duration."
+        },
+        {
+          "status": 400,
+          "description": "Malformed query string: a percent-encoded byte sequence in the query does not decode to valid UTF-8."
         },
         {
           "status": 404,
@@ -8274,10 +9396,9 @@
           "description": "Database or listener error."
         },
         {
-          "status": 400,
-          "description": "Malformed query string: a percent-encoded byte sequence in the query does not decode to valid UTF-8."
+          "status": 503,
+          "description": "The business id could not be resolved: an expected shard has no pool in this process, or its connection could not be acquired. The resolver fails closed with 503 rather than reporting a false 404, so retry once the shard is reachable."
         }
-
       ]
     },
     {
@@ -8301,6 +9422,12 @@
         }
       ],
       "request_body": null,
+      "response_headers": [
+        {
+          "name": "X-Harvest-Execution-Id",
+          "description": "The execution id this call resolved to. Stamped on every response the delegate returns, success or error. Absent when resolution itself failed, so a 404 for an unknown (workflow_name, workflow_id) does not carry it."
+        }
+      ],
       "success_response": {
         "status": 200,
         "free_form": true,
@@ -8314,6 +9441,10 @@
         {
           "status": 500,
           "description": "Database error."
+        },
+        {
+          "status": 503,
+          "description": "The business id could not be resolved: an expected shard has no pool in this process, or its connection could not be acquired. The resolver fails closed with 503 rather than reporting a false 404, so retry once the shard is reachable."
         }
       ]
     },
@@ -8369,12 +9500,22 @@
         }
       ],
       "request_body": null,
+      "response_headers": [
+        {
+          "name": "X-Harvest-Execution-Id",
+          "description": "The execution id this call resolved to. Stamped on every response the delegate returns, success or error. Absent when resolution itself failed, so a 404 for an unknown (workflow_name, workflow_id) does not carry it."
+        }
+      ],
       "success_response": {
         "status": 200,
         "free_form": true,
         "note": "Same body as GET /workflows/{id}/children ({items, next_cursor}); resolved execution_id in the X-Harvest-Execution-Id header."
       },
       "error_responses": [
+        {
+          "status": 400,
+          "description": "Malformed query string: a percent-encoded byte sequence in the query does not decode to valid UTF-8."
+        },
         {
           "status": 404,
           "description": "No run for (workflow_name, workflow_id)."
@@ -8384,10 +9525,9 @@
           "description": "Database error."
         },
         {
-          "status": 400,
-          "description": "Malformed query string: a percent-encoded byte sequence in the query does not decode to valid UTF-8."
+          "status": 503,
+          "description": "The business id could not be resolved: an expected shard has no pool in this process, or its connection could not be acquired. The resolver fails closed with 503 rather than reporting a false 404, so retry once the shard is reachable."
         }
-
       ]
     },
     {
@@ -8430,11 +9570,17 @@
         }
       ],
       "request_body": {
-        "required": false,
+        "required": true,
         "free_form": true,
         "description": "Optional signal payload passed verbatim to the handler.",
         "fields": []
       },
+      "response_headers": [
+        {
+          "name": "X-Harvest-Execution-Id",
+          "description": "The execution id this call resolved to. Stamped on every response the delegate returns, success or error. Absent when resolution itself failed, so a 404 for an unknown (workflow_name, workflow_id) does not carry it."
+        }
+      ],
       "success_response": {
         "status": 202,
         "fields": [
@@ -8447,12 +9593,24 @@
       },
       "error_responses": [
         {
+          "status": 400,
+          "description": "The idempotency key is empty, not UTF-8, or reserved, or the payload failed schema validation for this signal."
+        },
+        {
           "status": 404,
           "description": "No run for (workflow_name, workflow_id)."
         },
         {
+          "status": 413,
+          "description": "The signal payload exceeds max_signal_payload_bytes. The cap is enforced at submission, before the signal is persisted."
+        },
+        {
           "status": 500,
           "description": "Database error."
+        },
+        {
+          "status": 503,
+          "description": "The business id could not be resolved: an expected shard has no pool in this process, or its connection could not be acquired. The resolver fails closed with 503 rather than reporting a false 404, so retry once the shard is reachable."
         }
       ]
     },
@@ -8483,6 +9641,12 @@
         }
       ],
       "request_body": null,
+      "response_headers": [
+        {
+          "name": "X-Harvest-Execution-Id",
+          "description": "The execution id this call resolved to. Stamped on every response the delegate returns, success or error. Absent when resolution itself failed, so a 404 for an unknown (workflow_name, workflow_id) does not carry it."
+        }
+      ],
       "success_response": {
         "status": 200,
         "fields": [
@@ -8548,6 +9712,12 @@
           }
         ]
       },
+      "response_headers": [
+        {
+          "name": "X-Harvest-Execution-Id",
+          "description": "The execution id this call resolved to. Stamped on every response the delegate returns, success or error. Absent when resolution itself failed, so a 404 for an unknown (workflow_name, workflow_id) does not carry it."
+        }
+      ],
       "success_response": {
         "status": 200,
         "fields": [
@@ -8600,7 +9770,7 @@
         }
       ],
       "request_body": {
-        "required": false,
+        "required": true,
         "free_form": false,
         "fields": [
           {
@@ -8610,6 +9780,12 @@
           }
         ]
       },
+      "response_headers": [
+        {
+          "name": "X-Harvest-Execution-Id",
+          "description": "The execution id this call resolved to. Stamped on every response the delegate returns, success or error. Absent when resolution itself failed, so a 404 for an unknown (workflow_name, workflow_id) does not carry it."
+        }
+      ],
       "success_response": {
         "status": 202,
         "fields": [
@@ -8637,6 +9813,10 @@
         {
           "status": 500,
           "description": "Database error."
+        },
+        {
+          "status": 503,
+          "description": "The business id could not be resolved: an expected shard has no pool in this process, or its connection could not be acquired. The resolver fails closed with 503 rather than reporting a false 404, so retry once the shard is reachable."
         }
       ]
     },
@@ -8672,6 +9852,12 @@
           }
         ]
       },
+      "response_headers": [
+        {
+          "name": "X-Harvest-Execution-Id",
+          "description": "The execution id this call resolved to. Stamped on every response the delegate returns, success or error. Absent when resolution itself failed, so a 404 for an unknown (workflow_name, workflow_id) does not carry it."
+        }
+      ],
       "success_response": {
         "status": 200,
         "fields": [
@@ -8704,6 +9890,10 @@
         {
           "status": 500,
           "description": "Database error."
+        },
+        {
+          "status": 503,
+          "description": "The business id could not be resolved: an expected shard has no pool in this process, or its connection could not be acquired. The resolver fails closed with 503 rather than reporting a false 404, so retry once the shard is reachable."
         }
       ]
     },
@@ -8733,6 +9923,12 @@
         "free_form": false,
         "fields": []
       },
+      "response_headers": [
+        {
+          "name": "X-Harvest-Execution-Id",
+          "description": "The execution id this call resolved to. Stamped on every response the delegate returns, success or error. Absent when resolution itself failed, so a 404 for an unknown (workflow_name, workflow_id) does not carry it."
+        }
+      ],
       "success_response": {
         "status": 200,
         "fields": [
@@ -8756,6 +9952,10 @@
         {
           "status": 500,
           "description": "Database error."
+        },
+        {
+          "status": 503,
+          "description": "The business id could not be resolved: an expected shard has no pool in this process, or its connection could not be acquired. The resolver fails closed with 503 rather than reporting a false 404, so retry once the shard is reachable."
         }
       ]
     }

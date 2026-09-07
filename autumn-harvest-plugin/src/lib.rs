@@ -70,6 +70,12 @@ pub mod webhook_receiver;
 #[cfg(feature = "mcp")]
 pub mod mcp_tools;
 
+/// OpenAPI 3.1 document for the management API (issue #694).
+///
+/// Derived from `docs/api-contract.json` and served read-only at
+/// `GET /openapi.json`, so an integrator can generate a typed client.
+pub mod openapi;
+
 /// Built-in Prometheus scrape endpoint (issue #355).
 ///
 /// Registers the nine ADR-0001 §7 catalogue metrics as an autumn-web

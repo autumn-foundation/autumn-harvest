@@ -297,10 +297,11 @@ pub const DEFAULT_AUDIT_RETENTION_DAYS: i64 = 90;
 pub enum RouteClass {
     /// Always safe to expose without authentication.
     ///
-    /// Currently only `GET /health`. Kubernetes liveness/readiness probes and
-    /// load-balancer health checks commonly require this endpoint to be
-    /// reachable without credentials. Exposing it is an explicit product
-    /// decision, not an oversight.
+    /// `GET /health` and `GET /openapi.json`. Kubernetes liveness/readiness
+    /// probes and load-balancer health checks commonly require the health
+    /// endpoint to be reachable without credentials. The `OpenAPI` document
+    /// describes the route surface only and carries no execution state.
+    /// Exposing both is an explicit product decision, not an oversight.
     PublicSafe,
 
     /// Reads operator state but does not modify workflow execution.
@@ -360,6 +361,9 @@ pub const CLASSIFIED_ROUTES: &[(&str, RouteClass)] = &[
     // Kubernetes liveness/readiness probes and load-balancer health checks
     // require /health to be reachable without credentials.
     ("GET /health", RouteClass::PublicSafe),
+    // The published OpenAPI document. Route surface only, no execution state,
+    // and a client generator must reach it before it holds a credential.
+    ("GET /openapi.json", RouteClass::PublicSafe),
     // ── ReadOnly ── reads state, does not modify workflow execution ───────────
     // Audit-export status (issue #953): read-only, admin-gated. Reports cursor
     // position, lag, and last error — never audit record contents.
@@ -910,6 +914,7 @@ pub const EXCLUDED_ROUTES: &[&str] = &[
     "GET /dags/{dag_name}/runs/{run_exec_id}",
     "GET /dead-letters",
     "GET /health",
+    "GET /openapi.json",
     "GET /admin/preflight",
     "GET /admin/shards/health",
     "GET /admin/queue-coverage",
@@ -1092,6 +1097,7 @@ pub const ALL_MUTATION_ROUTES: &[(&str, Option<&str>)] = &[
     ("POST /dlq/redrive", Some(OP_DLQ_REDRIVE)),
     // Health / observability (read-only)
     ("GET /health", None),
+    ("GET /openapi.json", None),
     ("GET /admin/preflight", None),
     ("GET /admin/shards/health", None),
     ("GET /admin/queue-coverage", None),

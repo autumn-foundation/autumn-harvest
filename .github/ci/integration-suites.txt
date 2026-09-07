@@ -59,6 +59,7 @@ allos        autumn-harvest-plugin  contract_regression              -          
 allos        autumn-harvest-plugin  dev_runtime_tests                dev-runtime                -
 allos        autumn-harvest-plugin  effective_config_http_tests      -                          -
 allos        autumn-harvest-plugin  gate_no_global_install           -                          -
+allos        autumn-harvest-plugin  openapi_spec                     -                          -
 allos        autumn-harvest-plugin  security                         -                          -
 allos        autumn-harvest-plugin  sse_stream_tests                 -                          -
 compileonly  autumn-harvest-plugin  dev_runtime_managed              dev-runtime-managed        -
