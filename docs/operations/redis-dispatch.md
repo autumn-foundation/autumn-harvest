@@ -58,18 +58,19 @@ reconcile_interval_ms = 1000
 | `poll_interval_ms` | `20` | Wait for one blocking read when the channel is idle. |
 | `reconcile_interval_ms` | `1000` | Interval of the reconcile sweep over due `PENDING` rows. |
 
-Configuration validation applies four bounds. `key_prefix` must not be empty,
+Configuration validation bounds every key. `key_prefix` must not be empty,
 because every key the channel owns carries it, and an empty prefix collides
 with unrelated keys in a shared Redis. `consumer_group` must not be empty,
 because Redis rejects an empty group name. `poll_interval_ms` must be between
 1 and 5000, because the worker checks shutdown between blocking reads.
 `visibility_timeout_ms` must be at least 1000, because the timeout has to
-outlast one Postgres claim. `reconcile_interval_ms` must be at least 1.
+outlast one Postgres claim. `reconcile_interval_ms` must be at least 1. The
+`autumn-harvest-redis` crate repeats the prefix and group checks at connect.
 
 Queue names must not contain `:`. The colon separates the parts of every key
-the channel builds, so a queue named `a:b` and a queue named `a` sharing a
-suffix could address the same stream. The channel rejects such a name on
-publish and on read.
+the channel builds, as the key layout below shows. A queue named
+`email:delayed` would therefore build the same key as the delayed set of a
+queue named `email`. The channel rejects such a name on publish and on read.
 
 Each key has an environment override:
 
