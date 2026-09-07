@@ -1014,16 +1014,21 @@ pub fn redact_dsn(dsn: &str) -> String {
     let Ok(mut url) = url::Url::parse(trimmed) else {
         return "<unparseable dsn>".to_string();
     };
-    // A DSN missing `//` after the scheme still parses as `Ok`. Example:
-    // `postgres:user:hunter2@host/db`, one character short of the documented
-    // form. The parser reads it as a "cannot-be-a-base" URL with no authority
-    // component. `password()` and `set_password()` below are no-ops on such a
-    // URL. Without this check the credential-bearing tail reaches
-    // `url.to_string()` verbatim. That contradicts this function's own
-    // guarantee: a malformed-but-secret-bearing string must never reach a
-    // report or a log line. No valid Postgres DSN is cannot-be-a-base, so
-    // this check never withholds an identity a caller could otherwise use.
-    if url.cannot_be_a_base() {
+    // A DSN missing one or both `/` after the scheme still parses as `Ok`.
+    // Dropping both (`postgres:user:hunter2@host/db`) yields a
+    // "cannot-be-a-base" URL with no authority at all. Dropping only the
+    // second (`postgres:/user:hunter2@host/db`) is worse. There the parser
+    // reads the rest as an ordinary absolute PATH. So `cannot_be_a_base()`
+    // reads `false` — an ordinary base URL, just one with no host. Either
+    // way there is no authority component. So `password()` and
+    // `set_password()` below are no-ops, and the credential-bearing text
+    // reaches `url.to_string()` verbatim. That contradicts this function's
+    // own guarantee: never let a malformed-but-secret-bearing string reach a
+    // report or a log line. No valid Postgres DSN omits its host. So
+    // `host()`, not `cannot_be_a_base()`, is the check that catches both
+    // typos, and it never withholds an identity a caller could otherwise
+    // use.
+    if url.host().is_none() {
         return "<unparseable dsn>".to_string();
     }
     // A password can hide in the query string as well as in the userinfo. We
@@ -3678,26 +3683,36 @@ mod tests {
         assert!(plain.contains("db.prod"), "got {plain}");
     }
 
-    /// 🪝 Snag: a DSN missing `//` after the scheme is one character short of
-    /// the documented `postgres://` form. The `url` crate still parses it, as
-    /// a "cannot-be-a-base" URL with no authority component at all. On such a
-    /// URL, `password()` and `set_password()` are no-ops, so the credential
-    /// in the opaque tail reaches the output verbatim. This contradicts the
-    /// function's own doc comment: a malformed-but-secret-bearing string must
-    /// never reach a report or a log line. `dr_connect`,
-    /// `dr_connect_read_only`, and `scratch_guard` in `autumn-harvest-cli`
-    /// each interpolate `redact_dsn(dsn)` into a `CliError::InvalidInput`
-    /// message on a connection failure or a scratch-guard refusal. A DSN
-    /// typo dropping the `//` there leaks the real password into that
-    /// message.
+    /// 🪝 Snag: a DSN missing one or both `/` after the scheme is one or two
+    /// characters short of the documented `postgres://` form. The `url`
+    /// crate still parses it. Dropping both slashes yields a
+    /// "cannot-be-a-base" URL with no authority at all. Dropping only the
+    /// second slash is a distinct case: an ordinary base URL, an absolute
+    /// path, still with no host. A `cannot_be_a_base()`-only check misses
+    /// this case, caught by Codex's review of this PR's first pass. Neither
+    /// URL has a `host()`. So `password()`
+    /// and `set_password()` are no-ops on both, and the credential in the
+    /// tail reaches the output verbatim. This contradicts the function's
+    /// own doc comment: a malformed-but-secret-bearing string must never
+    /// reach a report or a log line. `dr_connect`, `dr_connect_read_only`,
+    /// and `scratch_guard` in `autumn-harvest-cli` each interpolate
+    /// `redact_dsn(dsn)` into a `CliError::InvalidInput` message. That
+    /// message fires on a connection failure or a scratch-guard refusal. A
+    /// DSN typo dropping a `/` there leaks the real password into it.
     #[test]
-    fn redact_dsn_withholds_a_cannot_be_a_base_dsn() {
+    fn redact_dsn_withholds_a_hostless_dsn() {
         for dsn in [
             "postgres:hunter2",
             "postgres:user:hunter2@host/db",
             "postgres:user:hunter2@host/db?a=1",
             " postgres:user:hunter2@host/db",
             "POSTGRESQL:user:hunter2@host/db",
+            // Dropping only the SECOND slash is the more likely
+            // one-character typo on `postgres://`. It still parses as a
+            // base URL (a path, just with no host), not
+            // `cannot_be_a_base`. Flagged by Codex's review of this PR's
+            // first pass, which checked `cannot_be_a_base()` alone.
+            "postgres:/user:hunter2@host/db",
         ] {
             let redacted = redact_dsn(dsn);
             assert_eq!(
