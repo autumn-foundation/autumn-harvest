@@ -48,14 +48,20 @@ if [ -z "$pointer_block" ]; then
   exit 1
 fi
 
-if ! grep -q "docs/upgrading/${version}.md" <<<"$pointer_block"; then
-  linked=$(grep -oE 'docs/upgrading/[0-9]+\.[0-9]+\.[0-9]+\.md' <<<"$pointer_block" | head -1)
-  echo "README.md's \"Upgrading an existing deployment?\" pointer does not" >&2
-  echo "link to $guide, the guide for the current workspace version" >&2
-  echo "($version)." >&2
-  echo "It currently links to: ${linked:-<no docs/upgrading/*.md link found in that paragraph>}" >&2
+# The paragraph may name more than one guide (the current one, plus a
+# pointer to the hop before it for readers further behind). Only the FIRST
+# markdown link is the primary pointer readers are told to follow, so check
+# that one specifically — a correct current-version link anywhere later in
+# the paragraph must not paper over a stale primary link.
+primary_link=$(grep -oE '\]\([^)]+\)' <<<"$pointer_block" | head -1 | sed -E 's/^\]\(([^)]+)\)$/\1/')
+
+if [ "$primary_link" != "$guide" ]; then
+  echo "README.md's \"Upgrading an existing deployment?\" pointer's primary" >&2
+  echo "link does not point to $guide, the guide for the current workspace" >&2
+  echo "version ($version)." >&2
+  echo "Its primary link currently points to: ${primary_link:-<no markdown link found in that paragraph>}" >&2
   echo >&2
-  echo "Fix: point README.md's upgrade pointer at $guide." >&2
+  echo "Fix: make the first link in that paragraph point at $guide." >&2
   exit 1
 fi
 
