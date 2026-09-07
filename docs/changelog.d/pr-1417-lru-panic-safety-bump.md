@@ -16,8 +16,15 @@ bump, and the 0.18.2 panic-safety fix itself). Nothing touches `new`,
 `put`, `get`, `pop`, `len`, `is_empty`, or `cap` — the entire surface
 `cache.rs` calls — so the bump carries no migration.
 
-Change: `autumn-harvest/Cargo.toml`'s `lru = "0.16"` -> `"0.18"`; lockfile
-now at 0.18.4. This also unified with `autumn-web`'s own transitive `lru`
+Change: `autumn-harvest/Cargo.toml`'s `lru = "0.16"` -> `"0.18.2"` (not the
+bare `"0.18"` this PR started with — Codex's review caught that `^0.18`
+still accepts the unpatched 0.18.0/0.18.1 releases, so it wouldn't actually
+enforce the fix if a downstream lockfile, or a future `cargo update`,
+picked one of those; `deny.toml`'s ignore entry is keyed on the advisory ID
+only, not per-instance, so it can't catch that regression either. `0.18.2`
+is the floor the advisory itself names as patched). Lockfile now at 0.18.4,
+already satisfying the tightened requirement — no lockfile change from the
+manifest fix. This also unified with `autumn-web`'s own transitive `lru`
 dependency, which independently resolved to 0.18.0 before this PR — a
 version still inside the vulnerable range (< 0.18.2) — onto the same
 patched 0.18.4 instance, closing `autumn-web`'s exposure as a side effect,
