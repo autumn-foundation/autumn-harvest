@@ -1100,8 +1100,5 @@ async fn batch_start_rejects_item_with_empty_workflow_id() {
     let results = resp.body["results"].as_array().expect("results array");
     assert_eq!(results.len(), 1);
     assert_eq!(results[0]["status"], json!("rejected"));
-    assert_eq!(
-        results[0]["error"],
-        json!("workflow_id must not be empty")
-    );
+    assert_eq!(results[0]["error"], json!("workflow_id must not be empty"));
 }
