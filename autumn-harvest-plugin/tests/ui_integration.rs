@@ -917,20 +917,21 @@ async fn ui_dead_letters_lists_filters_and_replays_single_entry() {
     );
 }
 
-/// RED baseline this test replaces the assumption of: `parse_dead_letter_ui_filters`
-/// used to parse `task_kind` with `DeadLetterTaskKind::parse(..)?`, a bare `?`
-/// on `Result<_, AutumnError>` — an unrecognized value 400-aborted the whole
-/// `/dead-letters` response before the filter form (or the `workflow_name`
-/// filter the operator had already typed) ever rendered. Same
-/// discard-the-page-on-bad-filter pattern already fixed for the Workflows
-/// page's `started_after`/`started_before` (#1333) and the Workers page's
-/// `status`/`stale` (#1378) — this DLQ page was the one sibling list page
+/// RED baseline this test replaces the assumption of:
+/// `parse_dead_letter_ui_filters` used to parse `task_kind` with
+/// `DeadLetterTaskKind::parse(..)?`, a bare `?` on `Result<_, AutumnError>`.
+/// An unrecognized value 400-aborted the whole `/dead-letters` response
+/// before the filter form ever rendered. That discarded the `workflow_name`
+/// filter the operator had already typed. Same discard-the-page-on-bad-filter
+/// pattern already fixed for the Workflows page's
+/// `started_after`/`started_before` (#1333) and the Workers page's
+/// `status`/`stale` (#1378). This DLQ page was the one sibling list page
 /// still carrying it.
 ///
-/// GREEN (this commit): the request still renders the DLQ page (`200`),
+/// GREEN (this commit): the request still renders the DLQ page (`200`). It
 /// preserves the other filter (`workflow_name=invoice_workflow`, still in
-/// its input's `value=`), and surfaces a `role="alert"` message naming the
-/// bad value and the valid options next to the Task kind field.
+/// its input's `value=`). It also surfaces a `role="alert"` message naming
+/// the bad value and the valid options next to the Task kind field.
 #[tokio::test]
 async fn ui_dead_letters_unknown_task_kind_redisplays_form_instead_of_aborting_page() {
     let (database_url, _container) = setup_test_database_url().await;

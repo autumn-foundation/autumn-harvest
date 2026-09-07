@@ -2323,14 +2323,14 @@ async fn list_dead_letters_ui(
     ))
 }
 
-/// Raw text and validation errors for the DLQ filter fields that can fail to
-/// parse (`task_kind`, `failed_after`, `failed_before`). Carried alongside
-/// `DeadLetterUiFilters` — which holds only the successfully parsed values —
-/// so an invalid value's inline error and exact typed text persist across
-/// the filter form, pagination, and the bulk-action forms instead of
-/// reverting the moment the request moves past the initial submit. Same
-/// `(parsed, raw_display, error)` contract as `parse_worker_status_filter`
-/// on the Workers page (#1378).
+/// Raw text and validation errors for the DLQ filter fields that can fail
+/// to parse: `task_kind`, `failed_after`, `failed_before`. Carried alongside
+/// `DeadLetterUiFilters`, which holds only the successfully parsed values.
+/// This lets an invalid value's inline error and its exact typed text
+/// persist. They survive the filter form, pagination, and the bulk-action
+/// forms. Without this, they would revert the moment the request moves past
+/// the initial submit. Same `(parsed, raw_display, error)` contract as
+/// `parse_worker_status_filter` uses on the Workers page (#1378).
 #[derive(Debug, Clone, Default)]
 struct DeadLetterUiFilterRaw {
     task_kind: String,
@@ -2343,8 +2343,8 @@ struct DeadLetterUiFilterRaw {
 
 impl DeadLetterUiFilterRaw {
     /// Derives raw display text from an already-parsed, always-valid filter
-    /// set — e.g. a summary drilldown's synthesized filters — rather than
-    /// from operator input, so there is never an error to show.
+    /// set. An example is a summary drilldown's synthesized filters. This
+    /// differs from operator input, so there is never an error to show.
     fn from_filters(filters: &DeadLetterUiFilters) -> Self {
         Self {
             task_kind: filters
@@ -2369,12 +2369,13 @@ impl DeadLetterUiFilterRaw {
 
 /// Parses the DLQ page's filters from raw query-string values. An
 /// unrecognized `task_kind`, or an unparseable `failed_after`/`failed_before`,
-/// used to `?`-abort the whole page before the filter form ever rendered —
-/// discarding whichever of the five filters the operator had already typed.
-/// This now degrades each bad field to "not applied" and hands back its raw
-/// text plus an error to redisplay inline, so a bad value costs one field,
-/// not the page — same fix as `parse_started_bound` (#1333) and
-/// `parse_worker_status_filter` (#1378) on the sibling list pages.
+/// used to `?`-abort the whole page. This happened before the filter form
+/// ever rendered. It discarded whichever of the five filters the operator
+/// had already typed. This now degrades each bad field to "not applied"
+/// instead. It hands back the raw text plus an error to redisplay inline. A
+/// bad value now costs one field, not the page. Same fix as
+/// `parse_started_bound` (#1333) and `parse_worker_status_filter` (#1378)
+/// use on the sibling list pages.
 fn parse_dead_letter_ui_filters(
     workflow_name: Option<&str>,
     task_kind: Option<&str>,
@@ -2412,10 +2413,10 @@ fn parse_dead_letter_ui_filters(
 }
 
 /// Parses the DLQ page's `task_kind` filter. Returns `(parsed, raw_display,
-/// error)`: on an unrecognized value `parsed` is `None` (the filter is not
-/// applied) and `error` carries a message to render next to the field,
-/// while `raw_display` echoes the operator's exact trimmed input so the
-/// caller can carry it through pagination and resubmission.
+/// error)`. On an unrecognized value, `parsed` is `None`, so the filter is
+/// not applied. `error` then carries a message to render next to the field.
+/// `raw_display` echoes the operator's exact trimmed input. The caller uses
+/// it to carry the value through pagination and resubmission.
 fn parse_dead_letter_task_kind_filter(
     raw: Option<&str>,
 ) -> (Option<DeadLetterTaskKind>, String, Option<String>) {
@@ -3633,10 +3634,10 @@ fn render_dead_letter_filters(
                     option value="" selected[task_kind.is_none() && filter_raw.task_kind_error.is_none()] { "All" }
                     option value="Activity" selected[task_kind == Some("Activity")] { "Activity" }
                     option value="Workflow" selected[task_kind == Some("Workflow")] { "Workflow" }
-                    // An unrecognized value is rendered as its own option so the
-                    // select echoes it back instead of silently reverting to
-                    // "All" (same treatment as the Workers page's status filter,
-                    // #1378).
+                    // An unrecognized value is rendered as its own option.
+                    // This makes the select echo it back instead of silently
+                    // reverting to "All" — same treatment as the Workers
+                    // page's status filter (#1378).
                     @if filter_raw.task_kind_error.is_some() {
                         option value=(filter_raw.task_kind) selected { (filter_raw.task_kind) }
                     }
@@ -3864,9 +3865,9 @@ fn render_dead_letter_hidden_filters(
         @if let Some(workflow_name) = filters.workflow_name.as_deref() {
             input type="hidden" name="workflow_name" value=(workflow_name);
         }
-        // Carries the raw text (not the parsed value) so an invalid value's
-        // inline error survives into the bulk-action forms instead of being
-        // silently dropped — same reasoning as the Workers page's
+        // Carries the raw text, not the parsed value. This lets an invalid
+        // value's inline error survive into the bulk-action forms, instead
+        // of being silently dropped. Same reasoning as the Workers page's
         // `build_worker_query_string` (Codex review, #1378 P2).
         @if !filter_raw.task_kind.is_empty() {
             input type="hidden" name="task_kind" value=(filter_raw.task_kind);
@@ -3928,10 +3929,11 @@ fn build_dead_letter_query_string(
     if let Some(workflow_name) = filters.workflow_name.as_deref() {
         let _ = write!(out, "&workflow_name={}", url_encode(workflow_name));
     }
-    // Carry the raw text (not the parsed value) so an invalid value's inline
-    // error persists across pagination instead of being silently dropped —
-    // same reasoning as `build_query_string`'s started_after/started_before
-    // handling on the Workflows page (Codex review, #1378 P2).
+    // Carry the raw text, not the parsed value. This lets an invalid
+    // value's inline error persist across pagination, instead of being
+    // silently dropped. Same reasoning as `build_query_string`'s
+    // started_after/started_before handling on the Workflows page (Codex
+    // review, #1378 P2).
     if !filter_raw.task_kind.is_empty() {
         let _ = write!(out, "&task_kind={}", url_encode(&filter_raw.task_kind));
     }
@@ -11546,14 +11548,14 @@ mod tests {
     /// GREEN — the fix under test: an unrecognized `task_kind` no longer
     /// aborts `list_dead_letters_ui`. It degrades to "filter not applied"
     /// (parsed is `None`) while carrying the raw text and a recovery
-    /// message, so the page can redisplay the form inline instead of
-    /// discarding it — same contract as `parse_worker_status_filter` on the
+    /// message. The page can then redisplay the form inline, instead of
+    /// discarding it. Same contract as `parse_worker_status_filter` on the
     /// Workers page (#1378). Before this change, `parse_dead_letter_ui_filters`
     /// `?`-propagated `DeadLetterTaskKind::parse`'s bare
-    /// `AutumnError::bad_request_msg` here, which aborted the whole
-    /// `/dead-letters` response before the filter form (or the
-    /// `workflow_name`/`shard_id` filters the operator had already typed)
-    /// was ever rendered.
+    /// `AutumnError::bad_request_msg` here. That aborted the whole
+    /// `/dead-letters` response before the filter form was ever rendered —
+    /// along with the `workflow_name`/`shard_id` filters the operator had
+    /// already typed.
     #[test]
     fn parse_dead_letter_task_kind_filter_rejects_unknown_value_without_erroring() {
         let (parsed, raw, error) = parse_dead_letter_task_kind_filter(Some("zombie"));
@@ -11592,10 +11594,10 @@ mod tests {
 
     /// GREEN — the fix under test: a malformed `failed_after`/`failed_before`
     /// no longer aborts the page. Before this change,
-    /// `parse_dead_letter_time_filter` returned `Result<_, AutumnError>` and
-    /// `parse_dead_letter_ui_filters` propagated it with a bare `?`, matching
-    /// the same discard-the-page-on-bad-filter pattern already fixed on the
-    /// Workflows page's `started_after`/`started_before` (#1333).
+    /// `parse_dead_letter_time_filter` returned `Result<_, AutumnError>`.
+    /// `parse_dead_letter_ui_filters` then propagated it with a bare `?`.
+    /// That matched the same discard-the-page-on-bad-filter pattern already
+    /// fixed on the Workflows page's `started_after`/`started_before` (#1333).
     #[test]
     fn parse_dead_letter_time_filter_rejects_malformed_value_without_erroring() {
         let (parsed, raw, error) =
@@ -11658,9 +11660,9 @@ mod tests {
     }
 
     /// Codex-review-class regression guard, matching #1378 P2/#1333's own
-    /// follow-up: an invalid filter's raw text (not the parsed — always
-    /// `None` — value) must survive into pagination and bulk-action hidden
-    /// fields, or the inline error vanishes on the very next click.
+    /// follow-up. An invalid filter's raw text — not the parsed value,
+    /// always `None` — must survive into pagination and bulk-action hidden
+    /// fields. Otherwise the inline error vanishes on the very next click.
     #[test]
     fn build_dead_letter_query_string_carries_invalid_raw_values() {
         let filters = DeadLetterUiFilters::default();
