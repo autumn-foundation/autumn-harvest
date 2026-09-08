@@ -169,10 +169,14 @@ Two mechanisms carry the whole argument.
 
 **The reconcile sweep is the durability floor.** Every
 `reconcile_interval_ms` a worker reads due `PENDING` rows for its queues in
-`(priority DESC, scheduled_at ASC)` order, bounded by a batch size, and
-publishes them. A lost reference, a dropped hint, a crash between commit and
-publish, and a full Redis restart all converge through this sweep. Redis
-persistence is therefore not required for correctness.
+`(priority DESC, scheduled_at ASC)` order, one page per sweep, and publishes
+them. The sweep keeps a cursor per queue, so a page of rows that a claim gate
+holds never hides the rows behind it. A lost reference, a dropped hint, a
+crash between commit and publish, and a full Redis restart all converge
+through this sweep. Redis persistence is therefore not required for
+correctness. A publish with the same due time as the held reference is a
+no-op, but only after the channel verifies the reference still exists. A
+marker whose reference vanished is rewritten, and the reference is recreated.
 
 **The Postgres claim is still the only `PENDING -> RUNNING` writer.** A
 reference grants nothing. Two workers that somehow both hold a reference for
@@ -208,7 +212,9 @@ wrapper, so the two cases do not share one failure mode.
 | Situation | Behaviour | What the operator sees |
 |-----------|-----------|------------------------|
 | Redis unreachable at startup | Startup fails | One error naming the endpoint in credential-free form |
-| Redis becomes unreachable while running | The worker falls back to the Postgres claim path for that iteration | Throughput returns to the Postgres numbers; work continues |
+| Redis becomes unreachable while running | The worker enters a Postgres-only mode for a cooldown, then probes the channel again. The cooldown starts at the poll interval, doubles per failure and stops at 30 s | Throughput returns to the Postgres numbers; work continues |
+| A malformed entry reaches a stream | The worker acks and deletes it | One warning naming the entry id |
+| A reference names a task kind with no free permit on this worker | The reference goes back to the stream for a peer | No error; a peer with capacity claims the row |
 | Redis returns and the streams are empty | The reconcile sweep refills them | A latency bump of at most one reconcile interval |
 | A row is `PENDING` but a claim gate holds it | The reference is released with exponential backoff, capped | No error; the row waits for its gate |
 | A reference names a row that is absent | Three short releases, then an ack | No error; this covers a publish that raced its own transaction |
@@ -216,6 +222,7 @@ wrapper, so the two cases do not share one failure mode.
 | `[harvest.redis] url` set on a runtime with more than one shard pool | Startup fails before the channel is installed | An error naming the shard-pool count and issue #1312 |
 | `rediss://` URL | Startup fails at connect | An error stating that this release carries no TLS transport (issue #1429) |
 | `key_prefix` or `consumer_group` empty | Startup fails at config validation | An error naming the empty key |
+| A worker queue name is empty or holds a `:` | Startup fails before the channel is installed; `Worker::new` repeats the check | An error naming the queue and the rule |
 
 The fallback is the important one, and its scope is exact. It covers the
 **running** state: a started process that loses Redis keeps working on the

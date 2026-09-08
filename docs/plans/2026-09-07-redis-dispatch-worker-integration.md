@@ -83,8 +83,9 @@ candidate CTE and one in the concurrency pending-keys CTE. Outcomes:
 ### 4.3 Reconcile
 
 Every `dispatch_reconcile_interval` the worker reads due `PENDING` rows for its
-queues in `(priority DESC, scheduled_at ASC)` order, bounded by a batch size,
-and publishes them. The marker keys make this cheap when the stream already
+queues in `(priority DESC, scheduled_at ASC)` order, one page per sweep with a
+keyset cursor per queue, and publishes them. A page of gated rows therefore
+never hides the rows behind it. The marker keys make this cheap when the stream already
 holds the rows. This sweep is the durability floor: a Redis restart, a lost
 entry, a dropped hint, or a crash between commit and publish all converge
 through it. It is the Redis analogue of Temporal's matching reload from
@@ -118,7 +119,10 @@ duplicates work.
 | Two workers read the same entry | `XREADGROUP` delivers once; the claim is `FOR UPDATE SKIP LOCKED` |
 | A worker crashes between claim and ack | PEL recovery; the redelivered reference finds the row `RUNNING` and acks |
 | A gated row cycles every poll | exponential backoff on release, capped at `dispatch_release_backoff_cap` |
-| Redis down or hung | every channel call has a timeout; the claim falls back to the Postgres poll path for that iteration |
+| Redis down or hung | every channel call has a timeout; the worker enters a Postgres-only mode for a cooldown that doubles up to 30 s, then probes the channel again |
+| A reference names a task kind this worker cannot run now | references carry their kind; a worker claims only against a free permit of that kind and returns the rest to the stream |
+| A marker outlives its reference | a same-time publish verifies the reference and recreates it when it is gone |
+| A queue name holds a `:` | rejected at startup and in `Worker::new` |
 | Multi-shard worker reads a reference for another shard's pool | v1 rejects Redis dispatch on sharded runtimes at startup: `HarvestRunner::start` refuses before it installs the channel, and `Worker::new` repeats the check. Config validation cannot see the resolved pool. The hint carries a shard slot for the follow-up |
 | Sticky affinity gate rejects every non-pinned worker | release with backoff; affinity is a cache hint, not a correctness rule |
 | `attempt` burns on redelivery | the by-id claim is the only `PENDING -> RUNNING` writer, and a gated miss never increments it |
