@@ -2191,6 +2191,12 @@ async fn ui_schedules_delete_action_redirects() {
 }
 
 /// Auto-refresh: `?refresh=30` emits a meta http-equiv refresh tag.
+///
+/// The tag's `content` carries an explicit, flash-free `url=` target
+/// (Codex review, #1437 P2), not a bare interval. A repeating reload
+/// must land on the operator's current filtered view, instead of
+/// looping on a stale flash message — see `layout_schedules`'s own doc
+/// comment.
 #[tokio::test]
 async fn ui_schedules_auto_refresh_meta_tag() {
     let (database_url, _container) = setup_test_database_url().await;
@@ -2199,8 +2205,9 @@ async fn ui_schedules_auto_refresh_meta_tag() {
     let (status, html) = fetch_html(&app, "/schedules?refresh=30").await;
     assert_eq!(status, StatusCode::OK);
     assert!(
-        html.contains("content=\"30\"") && html.contains("http-equiv=\"refresh\""),
-        "auto-refresh meta tag with content=30 missing: {html}"
+        html.contains(r#"content="30; url=schedules?page=0&refresh=30""#)
+            && html.contains("http-equiv=\"refresh\""),
+        "auto-refresh meta tag with content=30 and a flash-free target missing: {html}"
     );
 
     let (_, html_no_refresh) = fetch_html(&app, "/schedules").await;
@@ -2822,11 +2829,25 @@ async fn ui_schedules_health_filter_narrows_to_unhealthy_rows() {
         "healthy row must be filtered out: {html}"
     );
 
+    // #1437 (this PR's own subject): an unknown health value used to
+    // `?`-abort the whole page with a bare 400. It now degrades to
+    // "filter not applied" instead, like every other Vantage list-page
+    // filter. A visible `role="alert"` error names the bad value. That
+    // is neither the silent all-match the earlier version of this test
+    // worried about, nor a page-abort.
     let (status, html) = fetch_html(&app, "/schedules?health=bogus").await;
     assert_eq!(
         status,
-        StatusCode::BAD_REQUEST,
-        "an unknown health value must be a 400, not a silent all-match: {html}"
+        StatusCode::OK,
+        "an unknown health value must redisplay the form, not abort the page: {html}"
+    );
+    assert!(
+        html.contains("role=\"alert\"") && html.contains("bogus"),
+        "the bad value must be named in a visible, screen-reader-announced error: {html}"
+    );
+    assert!(
+        html.contains("healthy_row") && html.contains("paused_row"),
+        "with the health filter not applied, both rows must show: {html}"
     );
 }
 
