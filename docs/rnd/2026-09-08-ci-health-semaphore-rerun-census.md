@@ -40,12 +40,19 @@ them by signature:
 | `Clippy autumn-harvest-plugin` (`clippy::result_large_err`) | 1 | a genuine 128-byte `Err` variant introduced by that commit — real lint violation |
 | runner infra | 1 | `Test (no-db, ubuntu-latest, shard 2)`, run `34059892793`: `##[error]The runner has received a shutdown signal` mid-compile, exit 143 — a GitHub-hosted-runner preemption, not a suite defect |
 
-**9/9 root-caused, 0/9 flaky.** None of these are a same-commit disagreement — each
-is a deterministic function of that commit's own diff (or, for the one infra case, an
-external runner event outside this pipeline's control). No evidence of shared-state
-leakage, timing races, or order dependence in any of the 9. This confirms and
-sharpens the 09-03 report's "quarantine is clean, no orphaned skips" finding with an
-actual failure-by-failure audit rather than a source-grep for `#[ignore]`.
+**9/9 root-caused; 0/8 suite-attributable flakes; 1/9 external infra transient.** A
+Codex review comment on this PR correctly caught an earlier draft's unqualified
+"0/9 flaky," which contradicted this same section's own identification of the runner
+shutdown as nondeterministic — a known root cause does not make a failure
+deterministic, and an external preemption is a form of nondeterminism, just not a
+suite defect. Corrected: 8 of the 9 are a deterministic function of that commit's own
+diff (no same-commit disagreement possible, since the defect is in the diff itself);
+the 9th (run `34059892793`) is nondeterministic but external to the suite — the
+runner disappeared mid-compile, not mid-assertion, and does not recur elsewhere in
+the sample. No evidence of shared-state leakage, timing races, or order dependence in
+any of the 9. This confirms and sharpens the 09-03 report's "quarantine is clean, no
+orphaned skips" finding with an actual failure-by-failure audit rather than a
+source-grep for `#[ignore]`.
 
 One incidental observation, not a flake and not actioned here: the
 `sqlite_feasibility_docs` panic message repeats the same live-count number on both
@@ -71,12 +78,18 @@ in the sample.
 ## 🔧 Treatment
 
 None. Nothing in this sample clears the impact floor: no flaky test to make
-deterministic (none found), no product bug surfaced (all 9 failures are correctly
-attributed to their own commit's defect), no timing win identified beyond what
+deterministic (none found), no product bug surfaced (8 of 9 failures are correctly
+attributed to their own commit's defect, and the 9th is external infra), no timing
+win identified beyond what
 `docs/rnd/2026-09-06-ci-health-semaphore-cache-audit-followup.md` already measured
-and credited, no quarantine entries to retire (there is still no quarantine ledger
-in this repo — nothing is skipped). Per this role's own gate, a report is the
-correct outcome here, not a PR against `ci.yml` or any test file.
+and credited, no quarantine entries to retire — there is still no quarantine ledger
+in this repo, and no unowned flake quarantine was found. A Codex review comment on
+this PR correctly caught an earlier draft overstating this as "nothing is skipped":
+a repo-wide search at this commit's parent finds 31 `#[ignore = "..."]` tests
+(Docker-only, performance, and manual-probe cases), each carrying a documented reason
+at the point of use — owned, intentional skips, not a flake quarantine, but still
+skipped by a normal test run. Per this role's own gate, a report is the correct
+outcome here, not a PR against `ci.yml` or any test file.
 
 The three items already routed in prior reports remain open and unchanged by this
 session, which had no more tool access than the previous ones:
@@ -94,9 +107,10 @@ session, which had no more tool access than the previous ones:
 
 - **Rerun-button census:** 0/100, unchanged from 09-03/09-06.
 - **Failure clustering (new this round):** 9/100 sampled completed runs failed;
-  9/9 root-caused; 0/9 flaky; 5 distinct signatures, none recurring with contradictory
-  verdicts on the same commit. No revert check applies — there is no fix in this
-  report to verify red-then-green on.
+  9/9 root-caused; 0/8 suite-attributable flakes; 1/9 external infra transient;
+  5 distinct signatures, none recurring with contradictory verdicts on the same
+  commit. No revert check applies — there is no fix in this report to verify
+  red-then-green on.
 
 ## 🔬 Reproduce
 
