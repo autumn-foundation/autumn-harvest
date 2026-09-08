@@ -2282,6 +2282,38 @@ async fn ui_schedules_bulk_pause_pauses_matching_rows() {
     );
 }
 
+/// Codex review on #1437 (P2): before this fix, a bulk-action redirect
+/// always landed on a bare, unfiltered `schedules?flash=…`. That dropped
+/// whatever filters the operator had set, including a still-unresolved
+/// invalid value and its inline error, on the very next Pause/Resume
+/// click. Submitting the rendered `return_to` hidden field must land
+/// back on the same filtered view instead.
+#[tokio::test]
+async fn ui_schedules_bulk_pause_redirect_preserves_the_filtered_view() {
+    let (database_url, _container) = setup_test_database_url().await;
+    let app = build_single_shard_ui_app(&database_url);
+
+    let (status, headers, _body) = post_form(
+        &app,
+        "/schedules/bulk-pause",
+        "kind=Workflow&return_to=schedules%3Fkind%3DWorkflow",
+    )
+    .await;
+    assert!(
+        status == StatusCode::SEE_OTHER || status == StatusCode::FOUND,
+        "bulk-pause must redirect (got {status})"
+    );
+    let location = headers
+        .get("location")
+        .expect("redirect must have Location header")
+        .to_str()
+        .unwrap();
+    assert!(
+        location.starts_with("schedules?kind=Workflow&flash="),
+        "the redirect must preserve the operator's filtered view, not drop it: {location}"
+    );
+}
+
 /// Codex review on #1437 (P1): before this fix, an invalid `shard_id` in
 /// a bulk-action POST silently dropped to "no shard restriction". It
 /// paused schedules on every shard instead of rejecting the request —

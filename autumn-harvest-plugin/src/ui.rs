@@ -7866,6 +7866,12 @@ struct ScheduleBulkParams {
     health: Option<String>,
     #[serde(default)]
     shard_id: Option<String>,
+    /// The filtered list-page path to redirect back to after the action,
+    /// including an unresolved invalid value's raw text. Without it, the
+    /// redirect always lands on a bare, unfiltered `schedules?flash=…`
+    /// (Codex review, #1437 P2). See `schedule_bulk_redirect_to`.
+    #[serde(default)]
+    return_to: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -9154,7 +9160,10 @@ async fn schedule_bulk_pause_ui(
         let _ = insert_audit_batch(&mut conn, &records).await;
     }
 
-    schedule_bulk_redirect(&format!("Paused {acted_on} schedule(s)"))
+    schedule_bulk_redirect_to(
+        params.return_to.as_deref(),
+        &format!("Paused {acted_on} schedule(s)"),
+    )
 }
 
 async fn schedule_bulk_resume_ui(
@@ -9252,7 +9261,10 @@ async fn schedule_bulk_resume_ui(
         let _ = insert_audit_batch(&mut conn, &records).await;
     }
 
-    schedule_bulk_redirect(&format!("Resumed {acted_on} schedule(s)"))
+    schedule_bulk_redirect_to(
+        params.return_to.as_deref(),
+        &format!("Resumed {acted_on} schedule(s)"),
+    )
 }
 
 /// Redirect back to the schedules list with a flash message.
@@ -9274,9 +9286,55 @@ fn schedule_redirect(flash: &str) -> axum::response::Response {
     schedule_redirect_from(2, flash)
 }
 
-/// Redirect from a `/schedules/…` list-level action (one segment deep).
-fn schedule_bulk_redirect(flash: &str) -> axum::response::Response {
-    schedule_redirect_from(1, flash)
+/// Redirect from a bulk-action POST (`/schedules/bulk-pause`,
+/// `/schedules/bulk-resume`) back to the operator's filtered view instead
+/// of always landing on a bare, unfiltered `schedules?flash=…`.
+///
+/// Before this fix, the bulk forms submitted only the parsed filters
+/// (`render_schedule_hidden_filters`). An operator with an unresolved
+/// invalid filter and its inline error lost both the moment they paused
+/// or resumed anything. That is the same "action discards what you were
+/// looking at" gap. #1420 already fixed it for the DLQ page's own bulk
+/// actions (Codex review, #1437 P2).
+///
+/// `return_to` is the bulk form's own hidden field. It is built by
+/// `schedule_return_to_path` from the same filters the list page just
+/// rendered — raw text, invalid values included. It is validated against
+/// the expected `schedules[?...]` shape before use. That is the same
+/// guard `is_dead_letter_ui_return_path` applies to the DLQ page's
+/// `return_to`, so this operator-supplied field can never redirect
+/// anywhere else.
+fn schedule_bulk_redirect_to(return_to: Option<&str>, flash: &str) -> axum::response::Response {
+    use axum::response::IntoResponse as _;
+    let base = return_to
+        .map(str::trim)
+        .filter(|value| is_schedule_ui_return_path(value))
+        .map_or_else(|| "schedules".to_string(), str::to_string);
+    let separator = if base.contains('?') { '&' } else { '?' };
+    let location = format!("{base}{separator}flash={}", url_encode(flash));
+    axum::response::Redirect::to(&location).into_response()
+}
+
+fn is_schedule_ui_return_path(value: &str) -> bool {
+    match value.strip_prefix("schedules") {
+        Some("") => true,
+        Some(rest) => rest.starts_with('?'),
+        None => false,
+    }
+}
+
+fn schedule_return_to_path(
+    filters: &ScheduleUiFilters,
+    filter_raw: &ScheduleUiFilterRaw,
+    limit: i64,
+    refresh: Option<u64>,
+) -> String {
+    let query = build_schedule_query_string(limit, filters, filter_raw, refresh);
+    if query.is_empty() {
+        "schedules".to_string()
+    } else {
+        format!("schedules?{}", &query[1..])
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -9474,6 +9532,7 @@ fn render_schedule_bulk_actions(
     distribution: &str,
 ) -> Markup {
     let return_qs = build_schedule_query_string(limit, filters, filter_raw, refresh);
+    let return_to = schedule_return_to_path(filters, filter_raw, limit, refresh);
     let dist_suffix = if distribution.is_empty() {
         String::new()
     } else {
@@ -9484,6 +9543,7 @@ fn render_schedule_bulk_actions(
             form method="post" action="schedules/bulk-pause"
                 onsubmit={ "return confirm('Pause " (total_matching) " matching schedule(s)" (&dist_suffix) "?')" } {
                 (render_schedule_hidden_filters(filters))
+                input type="hidden" name="return_to" value=(return_to);
                 button type="submit" disabled[total_matching == 0] {
                     "Pause all matching (" (total_matching) ")"
                 }
@@ -9491,6 +9551,7 @@ fn render_schedule_bulk_actions(
             form method="post" action="schedules/bulk-resume"
                 onsubmit={ "return confirm('Resume " (total_matching) " matching schedule(s)" (&dist_suffix) "?')" } {
                 (render_schedule_hidden_filters(filters))
+                input type="hidden" name="return_to" value=(return_to);
                 button type="submit" disabled[total_matching == 0] {
                     "Resume all matching (" (total_matching) ")"
                 }
@@ -16130,6 +16191,7 @@ mod tests {
             paused: None,
             health: Some("Unhealthy".to_string()),
             shard_id: None,
+            return_to: None,
         })
         .unwrap();
         assert!(
@@ -16151,6 +16213,7 @@ mod tests {
             paused: None,
             health: None,
             shard_id: Some("north".to_string()),
+            return_to: None,
         });
         assert!(
             result.is_err(),
@@ -16166,6 +16229,7 @@ mod tests {
             paused: None,
             health: None,
             shard_id: Some("2".to_string()),
+            return_to: None,
         })
         .unwrap();
         assert_eq!(filters.shard_id, Some(2));
@@ -16179,6 +16243,7 @@ mod tests {
             paused: None,
             health: None,
             shard_id: None,
+            return_to: None,
         })
         .unwrap();
         assert_eq!(filters.shard_id, None);
@@ -16189,9 +16254,115 @@ mod tests {
             paused: None,
             health: None,
             shard_id: Some("   ".to_string()),
+            return_to: None,
         })
         .unwrap();
         assert_eq!(filters.shard_id, None);
+    }
+
+    /// Codex review on #1437 (P2): a bulk-action redirect used to always
+    /// land on a bare, unfiltered `schedules?flash=…`. That dropped
+    /// whatever the operator was filtered to, including an unresolved
+    /// invalid value and its inline error. `schedule_bulk_redirect_to`
+    /// must preserve a valid `return_to` instead.
+    #[test]
+    fn schedule_bulk_redirect_to_preserves_a_valid_return_to() {
+        let response =
+            schedule_bulk_redirect_to(Some("schedules?kind=zombie&target=billing"), "Paused 3");
+        let location = response
+            .headers()
+            .get(axum::http::header::LOCATION)
+            .expect("redirect must set Location")
+            .to_str()
+            .unwrap();
+        assert!(
+            location.starts_with("schedules?kind=zombie&target=billing&flash="),
+            "the operator's filtered view, invalid value included, must survive \
+             the redirect: {location}"
+        );
+    }
+
+    /// A `return_to` that does not match the Schedules page's own path
+    /// shape must never be trusted as a redirect target. It is an
+    /// operator-supplied form field, so a hand-crafted or foreign value
+    /// falls back to the safe default instead of an open redirect.
+    #[test]
+    fn schedule_bulk_redirect_to_rejects_a_foreign_return_to() {
+        for unsafe_value in [
+            "https://evil.example/phish",
+            "//evil.example",
+            "workflows",
+            "schedulesXYZ",
+        ] {
+            let response = schedule_bulk_redirect_to(Some(unsafe_value), "Paused 1");
+            let location = response
+                .headers()
+                .get(axum::http::header::LOCATION)
+                .expect("redirect must set Location")
+                .to_str()
+                .unwrap();
+            assert!(
+                location.starts_with("schedules?flash="),
+                "an unrecognized return_to ({unsafe_value:?}) must fall back to the \
+                 safe default, not redirect off the Schedules page: {location}"
+            );
+        }
+    }
+
+    #[test]
+    fn schedule_bulk_redirect_to_falls_back_when_return_to_is_absent() {
+        let response = schedule_bulk_redirect_to(None, "Resumed 2");
+        let location = response
+            .headers()
+            .get(axum::http::header::LOCATION)
+            .expect("redirect must set Location")
+            .to_str()
+            .unwrap();
+        assert!(location.starts_with("schedules?flash="), "{location}");
+    }
+
+    #[test]
+    fn schedule_return_to_path_round_trips_invalid_filters() {
+        let filters = ScheduleUiFilters::default();
+        let filter_raw = ScheduleUiFilterRaw {
+            kind: "zombie".to_string(),
+            kind_error: Some("bad kind".to_string()),
+            ..ScheduleUiFilterRaw::default()
+        };
+        let path = schedule_return_to_path(&filters, &filter_raw, DEFAULT_SCHEDULE_PAGE_SIZE, None);
+        assert_eq!(path, "schedules?kind=zombie");
+    }
+
+    #[test]
+    fn schedule_return_to_path_is_bare_schedules_when_no_filters_are_set() {
+        let filters = ScheduleUiFilters::default();
+        let filter_raw = ScheduleUiFilterRaw::default();
+        let path = schedule_return_to_path(&filters, &filter_raw, DEFAULT_SCHEDULE_PAGE_SIZE, None);
+        assert_eq!(path, "schedules");
+    }
+
+    #[test]
+    fn render_schedule_bulk_actions_includes_return_to_for_both_forms() {
+        let filters = ScheduleUiFilters {
+            target: Some("billing".to_string()),
+            ..ScheduleUiFilters::default()
+        };
+        let filter_raw = ScheduleUiFilterRaw::default();
+        let html = render_schedule_bulk_actions(
+            &filters,
+            &filter_raw,
+            DEFAULT_SCHEDULE_PAGE_SIZE,
+            None,
+            3,
+            "3 Workflow",
+        )
+        .into_string();
+        assert_eq!(
+            html.matches("name=\"return_to\" value=\"schedules?target=billing\"")
+                .count(),
+            2,
+            "both the pause and resume forms must carry the filtered return_to: {html}"
+        );
     }
 
     /// A paused DAG schedule cannot be committed (the endpoint rejects it), so
