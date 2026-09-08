@@ -185,6 +185,8 @@ mod scheduler_catchup_tests;
 #[cfg(feature = "db")]
 mod scheduler_ha_tests;
 #[cfg(feature = "db")]
+mod scheduler_overdue_pass_perf;
+#[cfg(feature = "db")]
 mod scheduler_overdue_tests;
 #[cfg(feature = "db")]
 mod scheduler_registration_tests;
