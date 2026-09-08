@@ -2454,13 +2454,15 @@ fn parse_dead_letter_time_filter(
 /// directly on the `Query<..>` extractor struct. Axum deserializes query
 /// structs before the handler body runs, so a non-numeric value never
 /// reached the page's own graceful-degradation code. It failed the
-/// extractor itself, aborting the request with a bare framework 400 before
-/// any `HarvestApiState`, any HTML, or any of the operator's other filters
-/// were even looked at — the same page-abort defect the sibling string
-/// filters already fix, but one layer earlier and with no styled error at
-/// all. Retyping the field `Option<String>` on the params struct and
-/// parsing it here, like every other filter on these pages, moves the
-/// failure from the extractor into the handler where it can degrade
+/// extractor itself instead, aborting the request with a bare framework
+/// 400. That happened before any `HarvestApiState`, any HTML, or any of
+/// the operator's other filters were even looked at. It is the same
+/// page-abort defect the sibling string filters already fix, but one
+/// layer earlier and with no styled error at all.
+///
+/// The fix retypes the field `Option<String>` on the params struct and
+/// parses it here, like every other filter on these pages. That moves the
+/// failure from the extractor into the handler, where it can degrade
 /// gracefully. `field` names the query parameter in the error message,
 /// since the pages spell it `shard` or `shard_id`.
 fn parse_shard_id_filter(field: &str, raw: Option<&str>) -> (Option<i32>, String, Option<String>) {
@@ -8149,17 +8151,18 @@ struct ScheduleUiFilterRaw {
 }
 
 /// Parses the Schedules page's `kind` filter from a raw query-string value.
-/// Returns `(parsed, raw_display, error)`: on success `error` is `None`; on
-/// an unrecognized value `parsed` is `ScheduleKindFilter::All` (the filter
-/// is not applied) while `error` carries a message to render next to the
-/// field.
+/// Returns `(parsed, raw_display, error)`. On success `error` is `None`.
+/// On an unrecognized value `parsed` is `ScheduleKindFilter::All`, so the
+/// filter is not applied, and `error` carries a message to render next to
+/// the field.
 ///
 /// Issue: `list_schedules_ui` used to `?`-propagate `ScheduleKindFilter::
 /// parse`'s `Result` directly. A bad value aborted the whole page with a
-/// bare 400 before the filter form, the table, or the operator's other
-/// filters ever rendered — the exact page-abort defect already fixed on
-/// this page's three sibling list pages (Workflows #1333, Workers #1378,
-/// Dead-Letters #1420), on the one page those PRs never reached.
+/// bare 400. That happened before the filter form, the table, or the
+/// operator's other filters ever rendered. It is the exact page-abort
+/// defect already fixed on this page's three sibling list pages: Workflows
+/// #1333, Workers #1378, Dead-Letters #1420. It is the one page those PRs
+/// never reached.
 fn parse_schedule_kind_filter(raw: Option<&str>) -> (ScheduleKindFilter, String, Option<String>) {
     let Some(trimmed) = raw.map(str::trim).filter(|v| !v.is_empty()) else {
         return (ScheduleKindFilter::All, String::new(), None);
@@ -8341,13 +8344,14 @@ async fn list_schedules_ui(
     let page = params.page.unwrap_or(0).max(0);
     let offset = page.saturating_mul(limit);
 
-    // The page used to `?`-propagate each of these on a bad value, aborting
-    // the whole request with a bare 400 before the filter form ever
-    // rendered — discarding whichever of the five filters the operator had
-    // already typed. Each bad field now degrades to "not applied" instead,
-    // handing back the raw text plus an error to redisplay inline. Same fix
-    // as `parse_worker_status_filter` (#1378) and `parse_dead_letter_ui_
-    // filters` (#1420) use on the sibling list pages.
+    // The page used to `?`-propagate each of these on a bad value. That
+    // aborted the whole request with a bare 400 before the filter form
+    // ever rendered. It discarded whichever of the five filters the
+    // operator had already typed. Each bad field now degrades to "not
+    // applied" instead, handing back the raw text plus an error to
+    // redisplay inline. Same fix as `parse_worker_status_filter` (#1378)
+    // and `parse_dead_letter_ui_filters` (#1420) use on the sibling list
+    // pages.
     let (kind, kind_raw, kind_error) = parse_schedule_kind_filter(params.kind.as_deref());
     let (paused_filter, paused_raw, paused_error) =
         parse_schedule_paused_filter(params.paused.as_deref());
@@ -9858,11 +9862,11 @@ fn build_schedule_query_string(
     if let Some(ref target) = filters.target {
         let _ = write!(out, "&target={}", url_encode(target));
     }
-    // Carry the raw text (not the parsed value) so an invalid value's inline
-    // error persists across pagination instead of being silently dropped —
-    // same reasoning as `build_dead_letter_query_string`'s task_kind/
-    // failed_after/failed_before handling on the DLQ page (Codex review,
-    // #1378 P2, #1420).
+    // Carry the raw text, not the parsed value. This lets an invalid
+    // value's inline error persist across pagination, instead of being
+    // silently dropped. Same reasoning as `build_dead_letter_query_string`'s
+    // task_kind/failed_after/failed_before handling on the DLQ page (Codex
+    // review, #1378 P2, #1420).
     if !filter_raw.kind.is_empty() {
         let _ = write!(out, "&kind={}", url_encode(&filter_raw.kind));
     }
@@ -11892,11 +11896,12 @@ mod tests {
     /// GREEN — the fix under test: `shard`/`shard_id` used to be typed
     /// `Option<i32>` straight on the `Query<..>` extractor struct on all
     /// three list pages. A non-numeric value failed axum's own query
-    /// deserialization, aborting the request with a bare framework 400
-    /// before any handler, filter form, or the operator's other filters
-    /// ever rendered — one layer earlier than the page-abort bug the
-    /// `task_kind`/`failed_after`/`failed_before`/`status`/`stale` filters
-    /// already fix, and with no styled error at all.
+    /// deserialization, aborting the request with a bare framework 400.
+    /// That happened before any handler, filter form, or the operator's
+    /// other filters ever rendered. It is one layer earlier than the
+    /// page-abort bug the `task_kind`/`failed_after`/`failed_before`/
+    /// `status`/`stale` filters already fix, and with no styled error at
+    /// all.
     #[test]
     fn parse_shard_id_filter_accepts_valid_values() {
         assert_eq!(
@@ -12470,10 +12475,10 @@ mod tests {
         assert!(q.contains("refresh=30"), "missing refresh: {q}");
     }
 
-    /// GREEN — the fix under test: an invalid raw value (which a caller
-    /// would otherwise have parsed to `All`/`None` and lost) is carried
-    /// through verbatim, so a Next/Previous click or bulk-action resubmit
-    /// doesn't drop the still-unresolved filter and its inline error — same
+    /// GREEN — the fix under test: an invalid raw value is carried through
+    /// verbatim. A caller would otherwise have parsed it to `All`/`None`
+    /// and lost it. A Next/Previous click or bulk-action resubmit must not
+    /// drop the still-unresolved filter and its inline error. Same
     /// contract as `build_dead_letter_query_string` on the DLQ page.
     #[test]
     fn build_schedule_query_string_carries_invalid_raw_values() {

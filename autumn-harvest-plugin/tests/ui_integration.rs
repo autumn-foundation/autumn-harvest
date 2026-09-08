@@ -1058,9 +1058,9 @@ async fn ui_dead_letters_invalid_task_kind_persists_across_pagination() {
 }
 
 /// `shard_id` used to be typed `Option<i32>` straight on the DLQ page's
-/// `Query<..>` extractor struct, so a non-numeric value failed axum's own
-/// query deserialization — a bare framework 400 before `list_dead_letters_ui`
-/// ever ran, one layer earlier than the `task_kind`/`failed_after`/
+/// `Query<..>` extractor struct. A non-numeric value failed axum's own
+/// query deserialization, a bare framework 400 before `list_dead_letters_ui`
+/// ever ran. That is one layer earlier than the `task_kind`/`failed_after`/
 /// `failed_before` page-abort bug #1420 already fixed on this same page.
 #[tokio::test]
 async fn ui_dead_letters_invalid_shard_id_redisplays_form_instead_of_aborting_page() {
@@ -1462,10 +1462,10 @@ async fn ui_workers_unknown_stale_value_redisplays_form_instead_of_aborting_page
 }
 
 /// `shard` used to be typed `Option<i32>` straight on the Workers page's
-/// `Query<..>` extractor struct, so a non-numeric value failed axum's own
-/// query deserialization — a bare framework 400 before `list_workers_ui`
-/// ever ran, one layer earlier than the status/stale page-abort bug #1378
-/// already fixed on this same page.
+/// `Query<..>` extractor struct. A non-numeric value failed axum's own
+/// query deserialization, a bare framework 400 before `list_workers_ui`
+/// ever ran. That is one layer earlier than the status/stale page-abort
+/// bug #1378 already fixed on this same page.
 #[tokio::test]
 async fn ui_workers_invalid_shard_value_redisplays_form_instead_of_aborting_page() {
     let (database_url, _container) = setup_test_database_url().await;
@@ -1932,11 +1932,11 @@ async fn ui_schedules_filter_by_kind_dag() {
 }
 
 /// `list_schedules_ui` used to `?`-propagate `ScheduleKindFilter::parse`'s
-/// `Result` directly, so a bad `kind` value aborted the whole page with a
-/// bare 400 before the filter form, the table, or the operator's other
-/// filters ever rendered — the exact page-abort defect already fixed on
-/// this page's three sibling list pages (Workflows #1333, Workers #1378,
-/// Dead-Letters #1420), which never reached the Schedules page itself.
+/// `Result` directly. A bad `kind` value aborted the whole page with a
+/// bare 400, before the filter form, the table, or the operator's other
+/// filters ever rendered. It is the exact page-abort defect already fixed
+/// on this page's three sibling list pages: Workflows #1333, Workers
+/// #1378, Dead-Letters #1420. It never reached the Schedules page itself.
 #[tokio::test]
 async fn ui_schedules_invalid_kind_value_redisplays_form_instead_of_aborting_page() {
     let (database_url, _container) = setup_test_database_url().await;
@@ -1967,11 +1967,11 @@ async fn ui_schedules_invalid_kind_value_redisplays_form_instead_of_aborting_pag
     );
 }
 
-/// Same page-abort defect, `shard_id` side: it was typed `Option<i32>`
+/// Same page-abort defect, `shard_id` side. It was typed `Option<i32>`
 /// straight on the `Query<..>` extractor struct, so a non-numeric value
-/// failed axum's own query deserialization before the handler ran at all —
-/// one layer earlier than the `kind`/`paused`/`health` fix above, and with
-/// no styled error whatsoever.
+/// failed axum's own query deserialization before the handler ran at all.
+/// That is one layer earlier than the `kind`/`paused`/`health` fix above,
+/// and with no styled error whatsoever.
 #[tokio::test]
 async fn ui_schedules_invalid_shard_id_redisplays_form_instead_of_aborting_page() {
     let (database_url, _container) = setup_test_database_url().await;
