@@ -262,9 +262,9 @@ async fn run_executor_once_deadlocks_on_a_pool_with_no_spare_connection() {
     // could turn the hang into a fast `Err` instead. This test must reject
     // that outcome too, not just the absence of a 15-second wait.
     match outcome {
-        Err(_) => panic!(
-            "run_executor_once must not hang: it needs only one connection at a time, \
-             but held onto the job-listing connection for the whole tick instead of \
+        Err(elapsed) => panic!(
+            "run_executor_once must not hang ({elapsed}): it needs only one connection at a \
+             time, but held onto the job-listing connection for the whole tick instead of \
              releasing it before process_job claims its own (issue #1360). A batch \
              executor tick that hangs forever also hangs `BatchRuntime::shutdown` \
              (runner.rs awaits the same JoinHandle with no abort fallback), so one \

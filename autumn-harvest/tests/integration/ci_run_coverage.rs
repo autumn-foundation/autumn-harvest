@@ -187,9 +187,18 @@ const ALLOWLIST_CHAOS_REASON: &str = "chaos-feature-gated (issue #940): DOES run
      seeds — NOT the manifest's `test` job (chaos is `#[cfg(feature = \"chaos\")]`, off by default and \
      seed-driven/slower, so it is deliberately not part of every PR run). Not a coverage gap.";
 
+const ALLOWLIST_CONFIRMED_HANG_REASON: &str = "issue #1360: every test in this module is #[ignore]d on \
+     purpose. It reproduces a confirmed permanent hang, bounded to 15s via tokio::time::timeout so it \
+     fails fast rather than parking a CI job the way #1350 once did. This is not coverage debt to wire \
+     up; it stays ignored until the deadlock is fixed.";
+
 const ALLOWLIST: &[(&str, &str)] = &[
     // ── core (autumn-harvest/tests/integration) ──
     ("core:audit_tests", ALLOWLIST_DEBT_REASON),
+    (
+        "core:batch_executor_pool_exhaustion_tests",
+        ALLOWLIST_CONFIRMED_HANG_REASON,
+    ),
     ("core:build_routing_tests", ALLOWLIST_DEBT_REASON),
     ("core:cache_delta_load_tests", ALLOWLIST_DEBT_REASON),
     ("core:cancellation_tests", ALLOWLIST_DEBT_REASON),
