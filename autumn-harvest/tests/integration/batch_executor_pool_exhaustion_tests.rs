@@ -58,13 +58,15 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use autumn_harvest::batch::{BatchAction, BatchExecutorConfig, BatchFilter, run_executor_once};
-use autumn_harvest::models::NewWorkflowExecution;
+use autumn_harvest::models::{NewWorkflowExecution, WorkflowExecution};
 use autumn_harvest::schema::harvest_workflow_executions;
 use autumn_harvest::shard::ShardedDbPool;
 use autumn_harvest::telemetry::NoOpMetrics;
 use autumn_harvest::types::ExecutionId;
 use autumn_harvest::worker::DbPool;
 
+use diesel::QueryDsl;
+use diesel::SelectableHelper;
 use diesel_async::AsyncPgConnection;
 use diesel_async::RunQueryDsl;
 use diesel_async::SimpleAsyncConnection;
@@ -79,6 +81,21 @@ use testcontainers_modules::testcontainers::runners::AsyncRunner;
 /// `HARVEST_TEST_DATABASE_URL` (a real Postgres already reachable in this
 /// environment) over a testcontainers container so the test runs without
 /// Docker.
+/// Swap the database-name path segment of a Postgres URL, preserving any
+/// query string. Mirrors `shard_placement_by_id_tests::rewrite_pg_db`: a
+/// naive `rsplit_once('/')` would drop options like `?sslmode=require` from
+/// `HARVEST_TEST_DATABASE_URL`, breaking the per-test database connection on
+/// a server that requires them.
+fn rewrite_pg_db(base: &str, db: &str) -> String {
+    let after_scheme = base.find("://").map_or(0, |i| i + 3);
+    let rest = &base[after_scheme..];
+    let (authority, tail) = rest
+        .find('/')
+        .map_or((rest, ""), |i| (&rest[..i], &rest[i + 1..]));
+    let query = tail.find('?').map_or("", |i| &tail[i..]);
+    format!("{}{}/{}{}", &base[..after_scheme], authority, db, query)
+}
+
 async fn setup_one_database() -> (String, Option<ContainerAsync<Postgres>>) {
     if let Ok(base_url) = std::env::var("HARVEST_TEST_DATABASE_URL") {
         let db_name = format!("harvest1360_{}", uuid::Uuid::new_v4().simple());
@@ -89,10 +106,7 @@ async fn setup_one_database() -> (String, Option<ContainerAsync<Postgres>>) {
             .batch_execute(&format!("CREATE DATABASE \"{db_name}\""))
             .await
             .expect("create per-test database");
-        let prefix = base_url
-            .rsplit_once('/')
-            .map_or(base_url.as_str(), |(p, _)| p);
-        let new_url = format!("{prefix}/{db_name}");
+        let new_url = rewrite_pg_db(&base_url, &db_name);
         let mut conn = <AsyncPgConnection as diesel_async::AsyncConnection>::establish(&new_url)
             .await
             .expect("connect to per-test database");
@@ -172,9 +186,18 @@ async fn insert_running_row(conn: &mut AsyncPgConnection, exec_id: ExecutionId) 
         .expect("insert running execution row");
 }
 
+async fn load_execution(conn: &mut AsyncPgConnection, exec_id: ExecutionId) -> WorkflowExecution {
+    harvest_workflow_executions::table
+        .find(exec_id.as_uuid())
+        .select(WorkflowExecution::as_select())
+        .first(conn)
+        .await
+        .expect("load execution")
+}
+
 /// Reproduction test.
 ///
-/// A single-shard deployment has a pool at capacity: max_size 1. This is
+/// A single-shard deployment has a pool at capacity: `max_size` 1. This is
 /// the simplest case of "no spare connection." One open batch job matches
 /// one execution. This permanently hangs `run_executor_once`. No pool
 /// aliasing, no rebalancing, and no concurrent load are required.
@@ -235,13 +258,27 @@ async fn run_executor_once_deadlocks_on_a_pool_with_no_spare_connection() {
     )
     .await;
 
-    assert!(
-        outcome.is_ok(),
-        "run_executor_once must not hang: it needs only one connection at a time, \
-         but held onto the job-listing connection for the whole tick instead of \
-         releasing it before process_job claims its own (issue #1360). A batch \
-         executor tick that hangs forever also hangs `BatchRuntime::shutdown` \
-         (runner.rs awaits the same JoinHandle with no abort fallback), so one \
-         exhausted shard pool wedges the whole process's shutdown path too."
+    // Unwrap both result layers. A bounded acquisition timeout added later
+    // could turn the hang into a fast `Err` instead. This test must reject
+    // that outcome too, not just the absence of a 15-second wait.
+    match outcome {
+        Err(_) => panic!(
+            "run_executor_once must not hang: it needs only one connection at a time, \
+             but held onto the job-listing connection for the whole tick instead of \
+             releasing it before process_job claims its own (issue #1360). A batch \
+             executor tick that hangs forever also hangs `BatchRuntime::shutdown` \
+             (runner.rs awaits the same JoinHandle with no abort fallback), so one \
+             exhausted shard pool wedges the whole process's shutdown path too."
+        ),
+        Ok(Err(error)) => panic!("run_executor_once must succeed, not fail: {error}"),
+        Ok(Ok(())) => {}
+    }
+
+    let mut verify = pool.get().await.expect("verify connection");
+    assert_eq!(
+        load_execution(&mut verify, exec_id).await.state,
+        "CANCELLED",
+        "the batch job must actually cancel its matched target, not merely \
+         return without hanging"
     );
 }
