@@ -2221,13 +2221,13 @@ async fn list_dead_letters_ui(
         .clamp(1, MAX_PAGE_SIZE);
     let page = params.page.unwrap_or(0).max(0);
     let offset = page.saturating_mul(limit);
-    let filters = parse_dead_letter_ui_filters(
+    let (filters, filter_raw) = parse_dead_letter_ui_filters(
         params.workflow_name.as_deref(),
         params.task_kind.as_deref(),
         params.failed_after.as_deref(),
         params.failed_before.as_deref(),
         params.shard_id,
-    )?;
+    );
 
     let pool = api_state.storage_pool().map_err(map_error)?;
 
@@ -2236,6 +2236,7 @@ async fn list_dead_letters_ui(
         return render_dead_letters_summary_view(
             &pool,
             &filters,
+            &filter_raw,
             params.group_by.as_deref(),
             limit,
             params.refresh,
@@ -2309,6 +2310,7 @@ async fn list_dead_letters_ui(
 
     Ok(render_dead_letters_page(
         &filters,
+        &filter_raw,
         &page_rows,
         &shard_errors,
         is_multi_shard,
@@ -2321,47 +2323,121 @@ async fn list_dead_letters_ui(
     ))
 }
 
+/// Raw text and validation errors for the DLQ filter fields that can fail
+/// to parse: `task_kind`, `failed_after`, `failed_before`. Carried alongside
+/// `DeadLetterUiFilters`, which holds only the successfully parsed values.
+/// This lets an invalid value's inline error and its exact typed text
+/// persist. They survive the filter form, pagination, and the bulk-action
+/// forms. Without this, they would revert the moment the request moves past
+/// the initial submit. Same `(parsed, raw_display, error)` contract as
+/// `parse_worker_status_filter` uses on the Workers page (#1378).
+#[derive(Debug, Clone, Default)]
+struct DeadLetterUiFilterRaw {
+    task_kind: String,
+    task_kind_error: Option<String>,
+    failed_after: String,
+    failed_after_error: Option<String>,
+    failed_before: String,
+    failed_before_error: Option<String>,
+}
+
+/// Parses the DLQ page's filters from raw query-string values. An
+/// unrecognized `task_kind`, or an unparseable `failed_after`/`failed_before`,
+/// used to `?`-abort the whole page. This happened before the filter form
+/// ever rendered. It discarded whichever of the five filters the operator
+/// had already typed. This now degrades each bad field to "not applied"
+/// instead. It hands back the raw text plus an error to redisplay inline. A
+/// bad value now costs one field, not the page. Same fix as
+/// `parse_started_bound` (#1333) and `parse_worker_status_filter` (#1378)
+/// use on the sibling list pages.
 fn parse_dead_letter_ui_filters(
     workflow_name: Option<&str>,
     task_kind: Option<&str>,
     failed_after: Option<&str>,
     failed_before: Option<&str>,
     shard_id: Option<i32>,
-) -> Result<DeadLetterUiFilters, AutumnError> {
+) -> (DeadLetterUiFilters, DeadLetterUiFilterRaw) {
     let workflow_name = workflow_name
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .map(str::to_string);
-    let task_kind = task_kind
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(DeadLetterTaskKind::parse)
-        .transpose()?;
-    let failed_after = parse_dead_letter_time_filter("failed_after", failed_after)?;
-    let failed_before = parse_dead_letter_time_filter("failed_before", failed_before)?;
+    let (task_kind, task_kind_raw, task_kind_error) = parse_dead_letter_task_kind_filter(task_kind);
+    let (failed_after, failed_after_raw, failed_after_error) =
+        parse_dead_letter_time_filter("failed_after", failed_after);
+    let (failed_before, failed_before_raw, failed_before_error) =
+        parse_dead_letter_time_filter("failed_before", failed_before);
 
-    Ok(DeadLetterUiFilters {
-        workflow_name,
-        task_kind,
-        failed_after,
-        failed_before,
-        shard_id,
-    })
+    (
+        DeadLetterUiFilters {
+            workflow_name,
+            task_kind,
+            failed_after,
+            failed_before,
+            shard_id,
+        },
+        DeadLetterUiFilterRaw {
+            task_kind: task_kind_raw,
+            task_kind_error,
+            failed_after: failed_after_raw,
+            failed_after_error,
+            failed_before: failed_before_raw,
+            failed_before_error,
+        },
+    )
 }
 
+/// Parses the DLQ page's `task_kind` filter. Returns `(parsed, raw_display,
+/// error)`. On an unrecognized value, `parsed` is `None`, so the filter is
+/// not applied. `error` then carries a message to render next to the field.
+/// `raw_display` echoes the operator's exact trimmed input. The caller uses
+/// it to carry the value through pagination and resubmission.
+fn parse_dead_letter_task_kind_filter(
+    raw: Option<&str>,
+) -> (Option<DeadLetterTaskKind>, String, Option<String>) {
+    let Some(trimmed) = raw.map(str::trim).filter(|v| !v.is_empty()) else {
+        return (None, String::new(), None);
+    };
+    match trimmed.to_ascii_lowercase().as_str() {
+        "activity" => (
+            Some(DeadLetterTaskKind::Activity),
+            trimmed.to_string(),
+            None,
+        ),
+        "workflow" => (
+            Some(DeadLetterTaskKind::Workflow),
+            trimmed.to_string(),
+            None,
+        ),
+        other => (
+            None,
+            trimmed.to_string(),
+            Some(format!(
+                "Unknown task_kind '{other}'; expected Activity or Workflow. Filter not applied."
+            )),
+        ),
+    }
+}
+
+/// Parses one of the DLQ page's `failed_after`/`failed_before` filters with
+/// the same "filter not applied, raw input carried through, error
+/// redisplayed inline" contract as [`parse_dead_letter_task_kind_filter`].
 fn parse_dead_letter_time_filter(
     field: &str,
     raw: Option<&str>,
-) -> Result<Option<DateTime<Utc>>, AutumnError> {
-    let Some(value) = raw.map(str::trim).filter(|value| !value.is_empty()) else {
-        return Ok(None);
+) -> (Option<DateTime<Utc>>, String, Option<String>) {
+    let Some(trimmed) = raw.map(str::trim).filter(|v| !v.is_empty()) else {
+        return (None, String::new(), None);
     };
-    let parsed = DateTime::parse_from_rfc3339(value)
-        .map_err(|_| {
-            AutumnError::bad_request_msg(format!("invalid {field}; expected RFC 3339 timestamp"))
-        })?
-        .with_timezone(&Utc);
-    Ok(Some(parsed))
+    let Ok(parsed) = DateTime::parse_from_rfc3339(trimmed) else {
+        return (
+            None,
+            trimmed.to_string(),
+            Some(format!(
+                "Invalid {field}; expected RFC 3339 timestamp. Filter not applied."
+            )),
+        );
+    };
+    (Some(parsed.with_timezone(&Utc)), trimmed.to_string(), None)
 }
 
 async fn load_dead_letters_from_shards_for_ui(
@@ -3046,6 +3122,7 @@ async fn load_workers_from_shards(
 #[allow(clippy::too_many_arguments)]
 fn render_dead_letters_page(
     filters: &DeadLetterUiFilters,
+    filter_raw: &DeadLetterUiFilterRaw,
     rows: &[DeadLetterUiRow],
     shard_errors: &[(ShardId, &str)],
     is_multi_shard: bool,
@@ -3061,9 +3138,9 @@ fn render_dead_letters_page(
         @if let Some(message) = flash {
             div.flash role="status" tabindex="-1" autofocus { (message) }
         }
-        (render_dead_letter_view_toggle(filters, limit, refresh, None, false))
-        (render_dead_letter_filters(filters, limit, refresh))
-        (render_dead_letter_bulk_actions(filters, limit, refresh, total_matching))
+        (render_dead_letter_view_toggle(filters, filter_raw, limit, refresh, None, false))
+        (render_dead_letter_filters(filters, filter_raw, limit, refresh))
+        (render_dead_letter_bulk_actions(filters, filter_raw, limit, refresh, total_matching))
 
         @if rows.is_empty() && shard_errors.is_empty() {
             div.card.empty {
@@ -3085,10 +3162,10 @@ fn render_dead_letters_page(
                 }
             }
 
-            (render_dead_letter_table(rows, filters, limit, refresh))
+            (render_dead_letter_table(rows, filters, filter_raw, limit, refresh))
         }
 
-        (render_dead_letter_pagination(page, limit, has_next, filters, refresh))
+        (render_dead_letter_pagination(page, limit, has_next, filters, filter_raw, refresh))
     };
 
     // `dead_letter_return_to_path` deliberately excludes `page`. It names
@@ -3101,7 +3178,7 @@ fn render_dead_letters_page(
     // reusing that path (found in review, PR #1396).
     let refresh_target = format!(
         "../ui/dead-letters?page={page}{}",
-        build_dead_letter_query_string(limit, filters, refresh)
+        build_dead_letter_query_string(limit, filters, filter_raw, refresh)
     );
     layout_dead_letters("Dead Letters · Vantage", &body, refresh, &refresh_target)
 }
@@ -3112,9 +3189,11 @@ fn render_dead_letters_page(
 
 /// Render the DLQ summary view: in-process root-cause aggregation, the same
 /// computation behind `GET /dead-letters/aggregate`, surfaced as a UI toggle.
+#[allow(clippy::too_many_arguments)]
 async fn render_dead_letters_summary_view(
     pool: &crate::HarvestDbPool,
     filters: &DeadLetterUiFilters,
+    filter_raw: &DeadLetterUiFilterRaw,
     group_by_raw: Option<&str>,
     limit: i64,
     refresh: Option<u64>,
@@ -3149,9 +3228,9 @@ async fn render_dead_letters_summary_view(
         @if let Some(message) = flash {
             div.flash role="status" tabindex="-1" autofocus { (message) }
         }
-        (render_dead_letter_view_toggle(filters, limit, refresh, Some(&group_by_value), true))
-        (render_dead_letter_filters(filters, limit, refresh))
-        (render_dlq_summary_group_by_form(filters, limit, refresh, &group_by))
+        (render_dead_letter_view_toggle(filters, filter_raw, limit, refresh, Some(&group_by_value), true))
+        (render_dead_letter_filters(filters, filter_raw, limit, refresh))
+        (render_dlq_summary_group_by_form(filters, filter_raw, limit, refresh, &group_by))
 
         @for (shard_id, error) in &shard_errors {
             div.shard-error {
@@ -3171,7 +3250,7 @@ async fn render_dead_letters_summary_view(
                 }
             }
         } @else {
-            (render_dlq_summary_table(&response, &group_by, filters, limit, refresh))
+            (render_dlq_summary_table(&response, &group_by, filters, filter_raw, limit, refresh))
         }
     };
 
@@ -3182,7 +3261,7 @@ async fn render_dead_letters_summary_view(
     };
     let refresh_target = format!(
         "../ui/dead-letters?view=summary{}{group_by_query}",
-        build_dead_letter_query_string(limit, filters, refresh)
+        build_dead_letter_query_string(limit, filters, filter_raw, refresh)
     );
     Ok(layout_dead_letters(
         "Dead Letters · Summary · Vantage",
@@ -3275,12 +3354,13 @@ async fn aggregate_dead_letters_for_ui(
 
 fn render_dead_letter_view_toggle(
     filters: &DeadLetterUiFilters,
+    filter_raw: &DeadLetterUiFilterRaw,
     limit: i64,
     refresh: Option<u64>,
     group_by_value: Option<&str>,
     summary_active: bool,
 ) -> Markup {
-    let base = build_dead_letter_query_string(limit, filters, refresh);
+    let base = build_dead_letter_query_string(limit, filters, filter_raw, refresh);
     let list_href = if base.is_empty() {
         "dead-letters".to_string()
     } else {
@@ -3307,6 +3387,7 @@ fn render_dead_letter_view_toggle(
 
 fn render_dlq_summary_group_by_form(
     filters: &DeadLetterUiFilters,
+    filter_raw: &DeadLetterUiFilterRaw,
     limit: i64,
     refresh: Option<u64>,
     selected: &[autumn_harvest::dlq::DlqGroupDimension],
@@ -3333,7 +3414,7 @@ fn render_dlq_summary_group_by_form(
     html! {
         form.filters method="get" action="dead-letters" {
             input type="hidden" name="view" value="summary";
-            (render_dead_letter_hidden_filters(filters))
+            (render_dead_letter_hidden_filters_raw(filters, filter_raw))
             @if limit != DEFAULT_DLQ_PAGE_SIZE {
                 input type="hidden" name="limit" value=(limit);
             }
@@ -3373,6 +3454,7 @@ fn render_dlq_summary_table(
     response: &autumn_harvest::dlq::DlqAggregateResponse,
     group_by: &[autumn_harvest::dlq::DlqGroupDimension],
     filters: &DeadLetterUiFilters,
+    filter_raw: &DeadLetterUiFilterRaw,
     limit: i64,
     refresh: Option<u64>,
 ) -> Markup {
@@ -3421,7 +3503,7 @@ fn render_dlq_summary_table(
                             @if is_other {
                                 "—"
                             } @else {
-                                @let (href, partial) = dlq_summary_drilldown_href(&group.key, group_by, filters, limit, refresh);
+                                @let (href, partial) = dlq_summary_drilldown_href(&group.key, group_by, filters, filter_raw, limit, refresh);
                                 a href=(href) title=[partial.then_some("Some dimensions have no list-view filter — results may include extra rows from other groups")] {
                                     @if partial {
                                         "View entries (partial filter) →"
@@ -3457,14 +3539,23 @@ fn dlq_summary_drilldown_href(
     key: &serde_json::Value,
     group_by: &[autumn_harvest::dlq::DlqGroupDimension],
     filters: &DeadLetterUiFilters,
+    filter_raw: &DeadLetterUiFilterRaw,
     limit: i64,
     refresh: Option<u64>,
 ) -> (String, bool) {
     use autumn_harvest::dlq::DlqGroupDimension;
 
     // Start from the filters already applied to the summary so drill-down
-    // narrows rather than widens.
+    // narrows rather than widens. `drill_raw` starts as a clone of the
+    // summary's own raw state, not a derivation from `drill`. Codex review
+    // on #1420 found the bug in a derived-only `drill_raw`: it silently
+    // dropped an invalid failed_after/failed_before, and its error, on
+    // every "View entries" link. This function never touches those two
+    // fields. The view toggle, refresh, and group-by form all preserve
+    // that same invalid value. The drilldown link must not be the one
+    // exception.
     let mut drill = filters.clone();
+    let mut drill_raw = filter_raw.clone();
     let mut partial = false;
     for dim in group_by {
         match dim {
@@ -3475,7 +3566,17 @@ fn dlq_summary_drilldown_href(
             }
             DlqGroupDimension::TaskType => {
                 if let Some(serde_json::Value::String(task_type)) = key.get("task_type") {
+                    // This field IS synthesized fresh from the group's own
+                    // key, unlike failed_after/failed_before above. It is
+                    // always valid (or absent), so its raw text and error
+                    // are overwritten to match, not merely inherited.
                     drill.task_kind = DeadLetterTaskKind::parse(task_type).ok();
+                    drill_raw.task_kind = drill
+                        .task_kind
+                        .map(DeadLetterTaskKind::as_label)
+                        .unwrap_or_default()
+                        .to_string();
+                    drill_raw.task_kind_error = None;
                 }
             }
             // No list-view filter exists for these dimensions; the link will
@@ -3491,7 +3592,7 @@ fn dlq_summary_drilldown_href(
         }
     }
 
-    let query = build_dead_letter_query_string(limit, &drill, refresh);
+    let query = build_dead_letter_query_string(limit, &drill, &drill_raw, refresh);
     let href = if query.is_empty() {
         "dead-letters".to_string()
     } else {
@@ -3502,19 +3603,12 @@ fn dlq_summary_drilldown_href(
 
 fn render_dead_letter_filters(
     filters: &DeadLetterUiFilters,
+    filter_raw: &DeadLetterUiFilterRaw,
     limit: i64,
     refresh: Option<u64>,
 ) -> Markup {
     let workflow_name = filters.workflow_name.as_deref().unwrap_or("");
     let task_kind = filters.task_kind.map(DeadLetterTaskKind::as_label);
-    let failed_after = filters
-        .failed_after
-        .map(|ts| ts.to_rfc3339())
-        .unwrap_or_default();
-    let failed_before = filters
-        .failed_before
-        .map(|ts| ts.to_rfc3339())
-        .unwrap_or_default();
     let shard_id = filters
         .shard_id
         .map(|id| id.to_string())
@@ -3530,18 +3624,34 @@ fn render_dead_letter_filters(
             label {
                 "Task kind"
                 select name="task_kind" {
-                    option value="" selected[task_kind.is_none()] { "All" }
+                    option value="" selected[task_kind.is_none() && filter_raw.task_kind_error.is_none()] { "All" }
                     option value="Activity" selected[task_kind == Some("Activity")] { "Activity" }
                     option value="Workflow" selected[task_kind == Some("Workflow")] { "Workflow" }
+                    // An unrecognized value is rendered as its own option.
+                    // This makes the select echo it back instead of silently
+                    // reverting to "All" — same treatment as the Workers
+                    // page's status filter (#1378).
+                    @if filter_raw.task_kind_error.is_some() {
+                        option value=(filter_raw.task_kind) selected { (filter_raw.task_kind) }
+                    }
+                }
+                @if let Some(error) = &filter_raw.task_kind_error {
+                    span.field-error role="alert" { (error) }
                 }
             }
             label {
                 "Failed after"
-                input type="text" name="failed_after" value=(failed_after) placeholder="2026-05-10T00:00:00Z";
+                input type="text" name="failed_after" value=(filter_raw.failed_after) placeholder="2026-05-10T00:00:00Z";
+                @if let Some(error) = &filter_raw.failed_after_error {
+                    span.field-error role="alert" { (error) }
+                }
             }
             label {
                 "Failed before"
-                input type="text" name="failed_before" value=(failed_before) placeholder="2026-05-11T00:00:00Z";
+                input type="text" name="failed_before" value=(filter_raw.failed_before) placeholder="2026-05-11T00:00:00Z";
+                @if let Some(error) = &filter_raw.failed_before_error {
+                    span.field-error role="alert" { (error) }
+                }
             }
             label {
                 "Shard"
@@ -3570,11 +3680,12 @@ fn render_dead_letter_filters(
 
 fn render_dead_letter_bulk_actions(
     filters: &DeadLetterUiFilters,
+    filter_raw: &DeadLetterUiFilterRaw,
     limit: i64,
     refresh: Option<u64>,
     total_matching: usize,
 ) -> Markup {
-    let return_to = dead_letter_return_to_path(filters, limit, refresh);
+    let return_to = dead_letter_return_to_path(filters, filter_raw, limit, refresh);
     let action_limit = dead_letter_bulk_action_limit(total_matching);
     let replay_label = dead_letter_bulk_action_label("Replay", action_limit, total_matching);
     let discard_label = dead_letter_bulk_action_label("Discard", action_limit, total_matching);
@@ -3629,10 +3740,11 @@ fn dead_letter_bulk_action_confirm(
 fn render_dead_letter_table(
     rows: &[DeadLetterUiRow],
     filters: &DeadLetterUiFilters,
+    filter_raw: &DeadLetterUiFilterRaw,
     limit: i64,
     refresh: Option<u64>,
 ) -> Markup {
-    let return_to = dead_letter_return_to_path(filters, limit, refresh);
+    let return_to = dead_letter_return_to_path(filters, filter_raw, limit, refresh);
     html! {
         table {
             thead {
@@ -3738,21 +3850,65 @@ fn render_dead_letter_detail(row: &DeadLetterUiRow) -> Markup {
     }
 }
 
-fn render_dead_letter_hidden_filters(filters: &DeadLetterUiFilters) -> Markup {
-    let task_kind = filters.task_kind.map(DeadLetterTaskKind::as_label);
-    let failed_after = filters.failed_after.map(|ts| ts.to_rfc3339());
-    let failed_before = filters.failed_before.map(|ts| ts.to_rfc3339());
+/// Hidden filter fields for the DLQ page's GET forms — the group-by
+/// resubmit form. It routes back through `list_dead_letters_ui`, so it
+/// handles an invalid value gracefully like every other GET on this page.
+/// Carries the raw text, not the parsed value. This lets an invalid value's
+/// inline error survive resubmission, instead of being silently dropped.
+/// Same reasoning as the Workers page's `build_worker_query_string` (Codex
+/// review, #1378 P2).
+///
+/// Do NOT use this for the bulk-action POST forms — see
+/// [`render_dead_letter_hidden_filters`], which those forms need instead.
+fn render_dead_letter_hidden_filters_raw(
+    filters: &DeadLetterUiFilters,
+    filter_raw: &DeadLetterUiFilterRaw,
+) -> Markup {
     html! {
         @if let Some(workflow_name) = filters.workflow_name.as_deref() {
             input type="hidden" name="workflow_name" value=(workflow_name);
         }
-        @if let Some(task_kind) = task_kind {
+        @if !filter_raw.task_kind.is_empty() {
+            input type="hidden" name="task_kind" value=(filter_raw.task_kind);
+        }
+        @if !filter_raw.failed_after.is_empty() {
+            input type="hidden" name="failed_after" value=(filter_raw.failed_after);
+        }
+        @if !filter_raw.failed_before.is_empty() {
+            input type="hidden" name="failed_before" value=(filter_raw.failed_before);
+        }
+        @if let Some(shard_id) = filters.shard_id {
+            input type="hidden" name="shard_id" value=(shard_id);
+        }
+    }
+}
+
+/// Hidden filter fields for the DLQ page's bulk-action POST forms
+/// (`../dead-letters/replay`, `../dead-letters/discard`). Carries only the
+/// successfully parsed values, never raw text.
+///
+/// `parse_bulk_dlq_form` (autumn-harvest-plugin/src/api.rs) re-validates
+/// `task_kind`/`failed_after`/`failed_before` strictly and 400s on a bad
+/// value. [`render_dead_letter_hidden_filters_raw`] submits an invalid raw
+/// value on the GET group-by form, which is safe there. Doing the same
+/// here would reintroduce the exact bug this PR fixes, one layer down. The
+/// bulk action would abort instead of running, or redisplaying the inline
+/// error (Codex review, #1420). An invalid field is "filter not applied"
+/// on this page, so it is simply omitted here. The operator's raw text and
+/// the error still redisplay from `return_to`, which is built from the raw
+/// query string.
+fn render_dead_letter_hidden_filters(filters: &DeadLetterUiFilters) -> Markup {
+    html! {
+        @if let Some(workflow_name) = filters.workflow_name.as_deref() {
+            input type="hidden" name="workflow_name" value=(workflow_name);
+        }
+        @if let Some(task_kind) = filters.task_kind.map(DeadLetterTaskKind::as_label) {
             input type="hidden" name="task_kind" value=(task_kind);
         }
-        @if let Some(failed_after) = failed_after.as_deref() {
+        @if let Some(failed_after) = filters.failed_after.map(|ts| ts.to_rfc3339()) {
             input type="hidden" name="failed_after" value=(failed_after);
         }
-        @if let Some(failed_before) = failed_before.as_deref() {
+        @if let Some(failed_before) = filters.failed_before.map(|ts| ts.to_rfc3339()) {
             input type="hidden" name="failed_before" value=(failed_before);
         }
         @if let Some(shard_id) = filters.shard_id {
@@ -3766,9 +3922,10 @@ fn render_dead_letter_pagination(
     limit: i64,
     has_next: bool,
     filters: &DeadLetterUiFilters,
+    filter_raw: &DeadLetterUiFilterRaw,
     refresh: Option<u64>,
 ) -> Markup {
-    let base = build_dead_letter_query_string(limit, filters, refresh);
+    let base = build_dead_letter_query_string(limit, filters, filter_raw, refresh);
     html! {
         div.pagination {
             @if page > 0 {
@@ -3795,6 +3952,7 @@ fn render_dead_letter_pagination(
 fn build_dead_letter_query_string(
     limit: i64,
     filters: &DeadLetterUiFilters,
+    filter_raw: &DeadLetterUiFilterRaw,
     refresh: Option<u64>,
 ) -> String {
     let mut out = String::new();
@@ -3804,21 +3962,26 @@ fn build_dead_letter_query_string(
     if let Some(workflow_name) = filters.workflow_name.as_deref() {
         let _ = write!(out, "&workflow_name={}", url_encode(workflow_name));
     }
-    if let Some(task_kind) = filters.task_kind {
-        let _ = write!(out, "&task_kind={}", task_kind.as_label());
+    // Carry the raw text, not the parsed value. This lets an invalid
+    // value's inline error persist across pagination, instead of being
+    // silently dropped. Same reasoning as `build_query_string`'s
+    // started_after/started_before handling on the Workflows page (Codex
+    // review, #1378 P2).
+    if !filter_raw.task_kind.is_empty() {
+        let _ = write!(out, "&task_kind={}", url_encode(&filter_raw.task_kind));
     }
-    if let Some(failed_after) = filters.failed_after {
+    if !filter_raw.failed_after.is_empty() {
         let _ = write!(
             out,
             "&failed_after={}",
-            url_encode(&failed_after.to_rfc3339())
+            url_encode(&filter_raw.failed_after)
         );
     }
-    if let Some(failed_before) = filters.failed_before {
+    if !filter_raw.failed_before.is_empty() {
         let _ = write!(
             out,
             "&failed_before={}",
-            url_encode(&failed_before.to_rfc3339())
+            url_encode(&filter_raw.failed_before)
         );
     }
     if let Some(shard_id) = filters.shard_id {
@@ -3832,10 +3995,11 @@ fn build_dead_letter_query_string(
 
 fn dead_letter_return_to_path(
     filters: &DeadLetterUiFilters,
+    filter_raw: &DeadLetterUiFilterRaw,
     limit: i64,
     refresh: Option<u64>,
 ) -> String {
-    let query = build_dead_letter_query_string(limit, filters, refresh);
+    let query = build_dead_letter_query_string(limit, filters, filter_raw, refresh);
     if query.is_empty() {
         "../ui/dead-letters".to_string()
     } else {
@@ -11353,14 +11517,67 @@ mod tests {
             ..DeadLetterUiFilters::default()
         };
 
-        let html = render_dead_letter_bulk_actions(&filters, DEFAULT_DLQ_PAGE_SIZE, None, 250)
-            .into_string();
+        let filter_raw = DeadLetterUiFilterRaw::default();
+        let html = render_dead_letter_bulk_actions(
+            &filters,
+            &filter_raw,
+            DEFAULT_DLQ_PAGE_SIZE,
+            None,
+            250,
+        )
+        .into_string();
 
         assert!(html.contains("name=\"limit\" value=\"250\""));
         assert!(html.contains("Replay all matching (250)"));
         assert!(html.contains("Discard all matching (250)"));
         assert!(html.contains("Replay 250 matching dead-letter entries?"));
         assert!(html.contains("Discard 250 matching dead-letter entries?"));
+    }
+
+    /// Codex review on #1420: `parse_bulk_dlq_form` (autumn-harvest-plugin/
+    /// src/api.rs) re-validates `task_kind`/`failed_after`/`failed_before`
+    /// strictly and 400s on a bad value. The bulk-action forms must never
+    /// submit an invalid raw value as a hidden field. Otherwise
+    /// replay/discard aborts instead of running — the exact bug this PR
+    /// fixes, one layer down. An invalid field is "filter not applied"
+    /// here, so it must be omitted, not echoed with its raw, unparseable
+    /// text.
+    #[test]
+    fn dead_letter_bulk_actions_omit_invalid_filter_instead_of_submitting_raw_value() {
+        let filters = DeadLetterUiFilters {
+            workflow_name: Some("invoice_workflow".to_string()),
+            ..DeadLetterUiFilters::default()
+        };
+        let filter_raw = DeadLetterUiFilterRaw {
+            task_kind: "zombie".to_string(),
+            task_kind_error: Some("bad task_kind".to_string()),
+            failed_after: "not-a-date".to_string(),
+            failed_after_error: Some("bad failed_after".to_string()),
+            failed_before: String::new(),
+            failed_before_error: None,
+        };
+        let html =
+            render_dead_letter_bulk_actions(&filters, &filter_raw, DEFAULT_DLQ_PAGE_SIZE, None, 5)
+                .into_string();
+        assert!(
+            !html.contains("name=\"task_kind\""),
+            "the invalid task_kind must never be submitted as a bulk-action selector: {html}"
+        );
+        assert!(
+            !html.contains("name=\"failed_after\""),
+            "the invalid failed_after must never be submitted as a bulk-action selector: {html}"
+        );
+        assert!(
+            html.contains("value=\"invoice_workflow\""),
+            "the valid workflow_name filter must still be carried: {html}"
+        );
+        // The raw invalid text may still appear in `return_to`. It is a
+        // GET redirect target, not a bulk selector field. Carrying it there
+        // is how the inline error redisplays after the action completes.
+        assert!(
+            html.contains("return_to") && html.contains("zombie"),
+            "the raw value is expected to survive in return_to, just not as a selector field: {html}"
+        );
     }
 
     #[test]
@@ -11370,14 +11587,254 @@ mod tests {
             ..DeadLetterUiFilters::default()
         };
 
-        let html = render_dead_letter_bulk_actions(&filters, DEFAULT_DLQ_PAGE_SIZE, None, 1_200)
-            .into_string();
+        let filter_raw = DeadLetterUiFilterRaw::default();
+        let html = render_dead_letter_bulk_actions(
+            &filters,
+            &filter_raw,
+            DEFAULT_DLQ_PAGE_SIZE,
+            None,
+            1_200,
+        )
+        .into_string();
 
         assert!(html.contains("name=\"limit\" value=\"1000\""));
         assert!(html.contains("Replay first 1000 matching (1200 total)"));
         assert!(html.contains("Discard first 1000 matching (1200 total)"));
         assert!(html.contains("Replay first 1000 of 1200 matching dead-letter entries?"));
         assert!(html.contains("Discard first 1000 of 1200 matching dead-letter entries?"));
+    }
+
+    #[test]
+    fn parse_dead_letter_task_kind_filter_accepts_known_values_case_insensitively() {
+        assert_eq!(
+            parse_dead_letter_task_kind_filter(Some("Activity")),
+            (
+                Some(DeadLetterTaskKind::Activity),
+                "Activity".to_string(),
+                None
+            )
+        );
+        assert_eq!(
+            parse_dead_letter_task_kind_filter(Some("workflow")),
+            (
+                Some(DeadLetterTaskKind::Workflow),
+                "workflow".to_string(),
+                None
+            )
+        );
+    }
+
+    /// GREEN — the fix under test: an unrecognized `task_kind` no longer
+    /// aborts `list_dead_letters_ui`. It degrades to "filter not applied"
+    /// (parsed is `None`) while carrying the raw text and a recovery
+    /// message. The page can then redisplay the form inline, instead of
+    /// discarding it. Same contract as `parse_worker_status_filter` on the
+    /// Workers page (#1378). Before this change, `parse_dead_letter_ui_filters`
+    /// `?`-propagated `DeadLetterTaskKind::parse`'s bare
+    /// `AutumnError::bad_request_msg` here. That aborted the whole
+    /// `/dead-letters` response before the filter form was ever rendered —
+    /// along with the `workflow_name`/`shard_id` filters the operator had
+    /// already typed.
+    #[test]
+    fn parse_dead_letter_task_kind_filter_rejects_unknown_value_without_erroring() {
+        let (parsed, raw, error) = parse_dead_letter_task_kind_filter(Some("zombie"));
+        assert_eq!(parsed, None, "an invalid task_kind must not be applied");
+        assert_eq!(
+            raw, "zombie",
+            "the operator's exact raw input is echoed back"
+        );
+        let error = error.expect("an invalid task_kind must carry a redisplayable error");
+        assert!(
+            error.contains("zombie") && error.contains("Activity"),
+            "error names the bad value and a valid option: {error}"
+        );
+    }
+
+    #[test]
+    fn parse_dead_letter_task_kind_filter_blank_or_missing_is_not_an_error() {
+        assert_eq!(
+            parse_dead_letter_task_kind_filter(None),
+            (None, String::new(), None)
+        );
+        assert_eq!(
+            parse_dead_letter_task_kind_filter(Some("   ")),
+            (None, String::new(), None)
+        );
+    }
+
+    #[test]
+    fn parse_dead_letter_time_filter_accepts_rfc3339() {
+        let (parsed, raw, error) =
+            parse_dead_letter_time_filter("failed_after", Some("2026-05-10T00:00:00Z"));
+        assert!(parsed.is_some());
+        assert_eq!(raw, "2026-05-10T00:00:00Z");
+        assert_eq!(error, None);
+    }
+
+    /// GREEN — the fix under test: a malformed `failed_after`/`failed_before`
+    /// no longer aborts the page. Before this change,
+    /// `parse_dead_letter_time_filter` returned `Result<_, AutumnError>`.
+    /// `parse_dead_letter_ui_filters` then propagated it with a bare `?`.
+    /// That matched the same discard-the-page-on-bad-filter pattern already
+    /// fixed on the Workflows page's `started_after`/`started_before` (#1333).
+    #[test]
+    fn parse_dead_letter_time_filter_rejects_malformed_value_without_erroring() {
+        let (parsed, raw, error) =
+            parse_dead_letter_time_filter("failed_after", Some("not-a-date"));
+        assert_eq!(parsed, None, "an invalid timestamp must not be applied");
+        assert_eq!(
+            raw, "not-a-date",
+            "the operator's exact raw input is echoed back"
+        );
+        let error = error.expect("an invalid timestamp must carry a redisplayable error");
+        assert!(
+            error.contains("failed_after") && error.contains("RFC 3339"),
+            "error names the field and the expected format: {error}"
+        );
+    }
+
+    #[test]
+    fn parse_dead_letter_time_filter_blank_or_missing_is_not_an_error() {
+        assert_eq!(
+            parse_dead_letter_time_filter("failed_after", None),
+            (None, String::new(), None)
+        );
+        assert_eq!(
+            parse_dead_letter_time_filter("failed_after", Some("   ")),
+            (None, String::new(), None)
+        );
+    }
+
+    #[test]
+    fn render_dead_letter_filters_shows_inline_errors() {
+        let filters = DeadLetterUiFilters::default();
+        let filter_raw = DeadLetterUiFilterRaw {
+            task_kind: "zombie".to_string(),
+            task_kind_error: Some(
+                "Unknown task_kind 'zombie'; expected Activity or Workflow. Filter not applied."
+                    .to_string(),
+            ),
+            failed_after: "not-a-date".to_string(),
+            failed_after_error: Some(
+                "Invalid failed_after; expected RFC 3339 timestamp. Filter not applied."
+                    .to_string(),
+            ),
+            failed_before: String::new(),
+            failed_before_error: None,
+        };
+        let html = render_dead_letter_filters(&filters, &filter_raw, DEFAULT_DLQ_PAGE_SIZE, None)
+            .into_string();
+        assert!(
+            html.contains("field-error") && html.contains("zombie"),
+            "task_kind error must render inline: {html}"
+        );
+        assert!(
+            html.contains("option value=\"zombie\" selected"),
+            "the invalid task_kind must be echoed back as the selected option: {html}"
+        );
+        assert!(
+            html.contains("not-a-date"),
+            "failed_after error and raw text must render inline: {html}"
+        );
+    }
+
+    /// Codex-review-class regression guard, matching #1378 P2/#1333's own
+    /// follow-up. An invalid filter's raw text — not the parsed value,
+    /// always `None` — must survive into pagination and bulk-action hidden
+    /// fields. Otherwise the inline error vanishes on the very next click.
+    #[test]
+    fn build_dead_letter_query_string_carries_invalid_raw_values() {
+        let filters = DeadLetterUiFilters::default();
+        let filter_raw = DeadLetterUiFilterRaw {
+            task_kind: "zombie".to_string(),
+            task_kind_error: Some("bad task_kind".to_string()),
+            failed_after: "not-a-date".to_string(),
+            failed_after_error: Some("bad failed_after".to_string()),
+            failed_before: String::new(),
+            failed_before_error: None,
+        };
+        let query =
+            build_dead_letter_query_string(DEFAULT_DLQ_PAGE_SIZE, &filters, &filter_raw, None);
+        assert!(
+            query.contains("task_kind=zombie"),
+            "invalid task_kind must round-trip: {query}"
+        );
+        assert!(
+            query.contains("failed_after=not-a-date"),
+            "invalid failed_after must round-trip: {query}"
+        );
+    }
+
+    /// Codex review on #1420: a summary drilldown's "View entries" link
+    /// used to derive its `drill_raw` solely from the successfully parsed
+    /// filters. This silently dropped an invalid `failed_after`/
+    /// `failed_before` and its error, even though this function never
+    /// touches those two fields. The view toggle, refresh, and group-by
+    /// form all preserve that same invalid value. The drilldown link must
+    /// not be the one exception.
+    #[test]
+    fn dlq_summary_drilldown_href_preserves_invalid_failed_after() {
+        use autumn_harvest::dlq::DlqGroupDimension;
+
+        let filters = DeadLetterUiFilters {
+            workflow_name: Some("invoice_workflow".to_string()),
+            ..DeadLetterUiFilters::default()
+        };
+        let filter_raw = DeadLetterUiFilterRaw {
+            task_kind: String::new(),
+            task_kind_error: None,
+            failed_after: "not-a-date".to_string(),
+            failed_after_error: Some("bad failed_after".to_string()),
+            failed_before: String::new(),
+            failed_before_error: None,
+        };
+        let key = serde_json::json!({"workflow_name": "invoice_workflow"});
+        let (href, _partial) = dlq_summary_drilldown_href(
+            &key,
+            &[DlqGroupDimension::WorkflowName],
+            &filters,
+            &filter_raw,
+            DEFAULT_DLQ_PAGE_SIZE,
+            None,
+        );
+        assert!(
+            href.contains("failed_after=not-a-date"),
+            "the drilldown link must preserve the invalid failed_after the \
+             summary view had, not silently drop it: {href}"
+        );
+    }
+
+    /// Same review: the `task_kind` field IS synthesized by this function,
+    /// for the `TaskType` group-by dimension. Its raw text is overwritten
+    /// to match the group's own key. It must not inherit a stale, unrelated
+    /// error the summary view happened to be showing.
+    #[test]
+    fn dlq_summary_drilldown_href_overwrites_task_kind_synthesized_from_group() {
+        use autumn_harvest::dlq::DlqGroupDimension;
+
+        let filters = DeadLetterUiFilters::default();
+        let filter_raw = DeadLetterUiFilterRaw {
+            task_kind: "zombie".to_string(),
+            task_kind_error: Some("stale error from an unrelated typo".to_string()),
+            failed_after: String::new(),
+            failed_after_error: None,
+            failed_before: String::new(),
+            failed_before_error: None,
+        };
+        let key = serde_json::json!({"task_type": "ACTIVITY"});
+        let (href, _partial) = dlq_summary_drilldown_href(
+            &key,
+            &[DlqGroupDimension::TaskType],
+            &filters,
+            &filter_raw,
+            DEFAULT_DLQ_PAGE_SIZE,
+            None,
+        );
+        assert!(
+            href.contains("task_kind=Activity"),
+            "the drilldown must use the group's own task_type, not the \
+             stale raw value: {href}"
+        );
     }
 
     #[test]
@@ -12470,9 +12927,21 @@ mod tests {
         // PR #1396 review: the auto-refresh target must keep the operator
         // on the page they were reading, not bounce them to page 0.
         let filters = DeadLetterUiFilters::default();
-        let html =
-            render_dead_letters_page(&filters, &[], &[], false, 2, 50, false, 0, Some(30), None)
-                .into_string();
+        let filter_raw = DeadLetterUiFilterRaw::default();
+        let html = render_dead_letters_page(
+            &filters,
+            &filter_raw,
+            &[],
+            &[],
+            false,
+            2,
+            50,
+            false,
+            0,
+            Some(30),
+            None,
+        )
+        .into_string();
         assert!(
             html.contains(r"url=../ui/dead-letters?page=2"),
             "refresh target must preserve page=2: {html}"
