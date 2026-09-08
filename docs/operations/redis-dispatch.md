@@ -64,7 +64,7 @@ reconcile_interval_ms = 1000
 | Key | Default | Meaning |
 |-----|---------|---------|
 | `url` | unset | Redis connection URL. Unset means Redis dispatch is off. |
-| `key_prefix` | `harvest` | Prefix for every key the channel owns. |
+| `key_prefix` | `harvest` | Prefix for every key the channel owns. A process serving a single non-default shard appends `:s<shard>` to it. |
 | `consumer_group` | `harvest_workers` | Redis Streams consumer group the workers join. |
 | `visibility_timeout_ms` | `60000` | How long a delivered reference may stay unacked before another worker recovers it. |
 | `poll_interval_ms` | `20` | Wait for one blocking read when the channel is idle. |
@@ -111,7 +111,7 @@ reaching its configured Redis would look healthy and publish nothing, so the
 channel fails fast and visibly instead.
 
 At startup a process that enables the channel logs one `INFO` line naming the
-endpoint, the key prefix and the consumer group. The endpoint is logged in
+endpoint, the effective key prefix and the consumer group. The endpoint is logged in
 credential-free form: any `user:password@` part of the URL is removed first.
 Redaction fails closed. When the authority cannot be isolated — a string with
 no `://`, or an unencoded `/` inside the password — the log and the error
@@ -131,8 +131,21 @@ behind a TLS tunnel that terminates on the host.
 
 ## Key layout
 
-Every key carries the configured prefix. With the default prefix and a queue
-named `email`:
+Every key carries the **effective** prefix. The effective prefix is the
+configured `key_prefix`, plus `:s<shard>` when this process serves a single
+non-default shard. A process that serves the default shard — every unsharded
+deployment — uses the configured prefix unchanged. The startup `INFO` line
+prints the effective prefix.
+
+The suffix gives each shard its own key family. One process per shard is how a
+sharded fleet meets the single-shard limit below, and without the suffix every
+process in that fleet would read one stream. A worker for shard B would then
+read shard A's reference, probe B's database, find no row and ack the
+reference as absent, while A's row waited for A's reconcile sweep. The suffix
+extends the configured prefix and never replaces it, so a prefix that already
+namespaces an environment keeps that namespace.
+
+With the default prefix and a queue named `email`:
 
 | Key | Kind | Holds |
 |-----|------|-------|
@@ -212,14 +225,14 @@ wrapper, so the two cases do not share one failure mode.
 | Situation | Behaviour | What the operator sees |
 |-----------|-----------|------------------------|
 | Redis unreachable at startup | Startup fails | One error naming the endpoint in credential-free form |
-| Redis becomes unreachable while running | The worker enters a Postgres-only mode for a cooldown, then probes the channel again. The cooldown starts at the poll interval, doubles per failure and stops at 30 s | Throughput returns to the Postgres numbers; work continues |
+| Redis becomes unreachable while running | The worker enters a Postgres-only mode for a cooldown, then probes the channel again. The cooldown starts at the poll interval, doubles per failed reference read and stops at 30 s. Only a successful reference read clears it, because `maintain` and `publish` run on a different connection | Throughput returns to the Postgres numbers; work continues |
 | A malformed entry reaches a stream | The worker acks and deletes it | One warning naming the entry id |
 | A reference names a task kind with no free permit on this worker | The reference goes back to the stream for a peer | No error; a peer with capacity claims the row |
 | Redis returns and the streams are empty | The reconcile sweep refills them | A latency bump of at most one reconcile interval |
 | A row is `PENDING` but a claim gate holds it | The reference is released with exponential backoff, capped | No error; the row waits for its gate |
 | A reference names a row that is absent | Three short releases, then an ack | No error; this covers a publish that raced its own transaction |
 | `[harvest.redis] url` set on a build without the `redis` feature | Startup fails at config validation | An error naming the `redis` cargo feature |
-| `[harvest.redis] url` set on a runtime with more than one shard pool | Startup fails before the channel is installed | An error naming the shard-pool count and issue #1312 |
+| `[harvest.redis] url` set on a runtime with more than one shard pool | Startup fails before the channel is installed | An error naming the shard-pool count and issue #1312; run one process per shard instead |
 | `rediss://` URL | Startup fails at connect | An error stating that this release carries no TLS transport (issue #1429) |
 | `key_prefix` or `consumer_group` empty | Startup fails at config validation | An error naming the empty key |
 | A worker queue name is empty or holds a `:` | Startup fails before the channel is installed; `Worker::new` repeats the check | An error naming the queue and the rule |
@@ -232,13 +245,19 @@ fails startup instead, in every mode.
 
 ## Limits in v1
 
-- **Single shard only.** A reference carries a task id and no connection, so a
-  runtime that owns several shard pools cannot tell which pool holds the named
-  row. Two places enforce the limit. `HarvestRunner::start` rejects a
-  configured URL before it installs the channel, so a process with no worker
-  is covered too. `Worker::new` repeats the check. Neither is config
-  validation, which cannot see the resolved pool. The reference carries a
-  shard slot for the follow-up work.
+- **Single shard per process.** A reference carries a task id and no
+  connection, so a runtime that owns several shard pools cannot tell which pool
+  holds the named row. Two places enforce the limit. `HarvestRunner::start`
+  rejects a configured URL before it installs the channel, so a process with no
+  worker is covered too. `Worker::new` repeats the check. Neither is config
+  validation, which cannot see the resolved pool. The reference carries a shard
+  slot for the follow-up work.
+
+  A sharded fleet may still use Redis dispatch by running one process per
+  shard. Each such process owns its own key family automatically, through the
+  `:s<shard>` prefix suffix in [Key layout](#key-layout). A central API process
+  that spans several shards is still rejected, because it publishes for shards
+  it cannot separate. Issue #1429 tracks true multi-shard routing.
 - **No Redis Cluster.** v1 targets one Redis instance. The keys carry no hash
   tags, so a Cluster deployment spreads the streams, the delayed sets and the
   markers of one queue across slots, and the Lua scripts that touch them

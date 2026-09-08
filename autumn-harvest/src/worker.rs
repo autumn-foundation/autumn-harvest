@@ -23958,8 +23958,15 @@ impl DispatchDegradation {
         cooldown
     }
 
-    /// Record a successful channel call, which closes the window.
-    const fn record_success(&mut self) {
+    /// Record a successful reference read, which closes the window.
+    ///
+    /// Only a read may close it. `maintain` and `publish` run on the general
+    /// connection, and `next` runs on the blocking read connection. A worker
+    /// whose read connection alone is unhealthy still completes maintenance
+    /// and publishes. If those calls cleared the window, every hung read would
+    /// open the minimum cooldown instead of the doubled one, and an
+    /// intermittently idle worker would pay one failed read per cycle.
+    const fn record_read_success(&mut self) {
         self.failures = 0;
         self.started = None;
     }
@@ -25874,19 +25881,18 @@ impl Worker {
             return self.drain_postgres(pool, shard).await;
         }
 
-        if DispatchLoopState::due(&mut state.maintained, settings.poll_interval) {
-            match dispatch_call(
+        // A maintenance success does not clear the degraded window. Only a
+        // successful reference read does. See
+        // [`DispatchDegradation::record_read_success`].
+        if DispatchLoopState::due(&mut state.maintained, settings.poll_interval)
+            && let Err(error) = dispatch_call(
                 installed.channel.maintain(&self.config.queues),
                 "maintenance",
             )
             .await
-            {
-                Ok(_) => state.degraded.record_success(),
-                Err(error) => {
-                    self.enter_degraded(state, &error, "dispatch maintenance failed", settings);
-                    return self.drain_postgres(pool, shard).await;
-                }
-            }
+        {
+            self.enter_degraded(state, &error, "dispatch maintenance failed", settings);
+            return self.drain_postgres(pool, shard).await;
         }
 
         if DispatchLoopState::due(&mut state.reconciled, settings.reconcile_interval)
@@ -25930,7 +25936,7 @@ impl Worker {
 
         let leases = match read {
             Ok(Ok(leases)) => {
-                state.degraded.record_success();
+                state.degraded.record_read_success();
                 leases
             }
             Ok(Err(error)) => {
@@ -26246,7 +26252,9 @@ impl Worker {
             );
             return false;
         }
-        state.degraded.record_success();
+        // A publish success does not clear the degraded window either. The
+        // read path owns that window, and the publish runs on the general
+        // connection.
         true
     }
 

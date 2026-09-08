@@ -78,10 +78,18 @@ channel is off. The channel is a latency and throughput optimization and never
 a durability store, which is stated in the `dispatch.rs` module doc and proven
 by the reconcile sweep above.
 
-**v1 limits, stated rather than discovered later.** Single-shard runtimes only;
+**v1 limits, stated rather than discovered later.** One shard per process;
 `HarvestRunner::start` rejects a configured URL before the install when the
 runtime resolves more than one shard pool, `Worker::new` repeats the check, and
-the reference carries a shard slot for the follow-up. One Redis instance only:
+the reference carries a shard slot for the follow-up. A sharded fleet meets
+that limit by running one process per shard, and each shard's processes then
+use their own Redis key family automatically: a process that serves a single
+non-default shard appends `:s<shard>` to the configured `key_prefix`, so a
+reference only ever reaches a process that holds the named row. An unsharded
+deployment resolves the default shard and keeps the configured prefix
+unchanged. A central API process that spans several shards still rejects Redis
+dispatch at startup, because it cannot separate the shards it publishes for
+(issue #1429 tracks true multi-shard routing). One Redis instance only:
 the keys carry no Cluster hash tags, so a Cluster deployment would spread one
 queue's keys across slots. Priority order and sticky affinity
 degrade to best effort, because a stream delivers in publish order and only the

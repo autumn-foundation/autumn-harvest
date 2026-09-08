@@ -996,17 +996,22 @@ impl HarvestRunner {
         // multi-shard process must fail startup without a connected channel
         // behind it. `Worker::new` repeats the check, but only a
         // worker-enabled process reaches it.
-        reject_multi_shard_dispatch(
-            config.redis.url.is_some(),
-            prepared.storage_pool.iter_shards().count(),
-        )
-        .map_err(AutumnError::service_unavailable_msg)?;
+        let dispatch_shards = prepared.storage_pool.sharded_pool().shard_ids();
+        reject_multi_shard_dispatch(config.redis.url.is_some(), dispatch_shards.len())
+            .map_err(AutumnError::service_unavailable_msg)?;
         reject_dispatch_queue_names(
             config.redis.url.is_some(),
             &prepared.worker_runtime_config.queues,
         )
         .map_err(AutumnError::service_unavailable_msg)?;
-        let dispatch_installed = install_dispatch_channel(config).await?;
+        // The shard this process owns, which names its key family. The check
+        // above proves the runtime resolves one shard at most, so any other
+        // count leaves the configured prefix alone.
+        let dispatch_shard = match dispatch_shards.as_slice() {
+            [only] => Some(*only),
+            _ => None,
+        };
+        let dispatch_installed = install_dispatch_channel(config, dispatch_shard).await?;
         let dispatch_guard = DispatchInstallGuard::new(dispatch_installed);
 
         let worker = if config.worker_enabled {
@@ -1332,6 +1337,44 @@ fn reject_dispatch_queue_names(redis_url_set: bool, queues: &[String]) -> Result
     Ok(())
 }
 
+/// The shard an unsharded deployment resolves.
+///
+/// [`ShardedDbPool::single`] builds exactly this shard. A runtime that reports
+/// it owns one database and no shard layout.
+const DEFAULT_DISPATCH_SHARD: ShardId = ShardId::new(0);
+
+/// The Redis key prefix this process owns, for the shard it serves.
+///
+/// Issue #1312 limits Redis dispatch to a runtime that resolves one shard
+/// pool. A sharded fleet meets that limit by running one process per shard, so
+/// every process passes the check. The configured prefix alone would then give
+/// every process in the fleet the same `{prefix}:dispatch:{queue}` stream. A
+/// worker for shard B would read shard A's reference, probe B's database, find
+/// no row, release it three times and ack it as absent. Shard A's row would
+/// wait for A's reconcile sweep, and a peer could steal it again.
+///
+/// The shard suffix gives each shard its own key family, so a reference only
+/// ever reaches a process that holds the named row. The suffix extends the
+/// configured prefix and never replaces it, so an operator who namespaces the
+/// prefix per environment keeps that namespace.
+///
+/// [`DEFAULT_DISPATCH_SHARD`] keeps the plain prefix. Every single-database
+/// deployment resolves that shard, and a suffix there would move the key
+/// family away from the references a previous release published.
+///
+/// A central API process that spans several shards still rejects Redis
+/// dispatch at startup. Issue #1429 tracks true multi-shard routing.
+#[cfg_attr(not(feature = "redis"), allow(dead_code))]
+#[must_use]
+fn effective_dispatch_prefix(configured: &str, shard: Option<ShardId>) -> String {
+    match shard {
+        Some(shard) if shard != DEFAULT_DISPATCH_SHARD => {
+            format!("{configured}:s{}", shard.as_i32())
+        }
+        _ => configured.to_string(),
+    }
+}
+
 /// Uninstall the process-global dispatch channel when startup fails later.
 ///
 /// `start` installs the channel before it builds the worker, because an
@@ -1388,7 +1431,10 @@ const DISPATCH_DEDUPE_TTL: std::time::Duration = std::time::Duration::from_secs(
 /// fallback covers the running state only. The message names the endpoint in
 /// credential-free form.
 #[cfg(feature = "redis")]
-async fn install_dispatch_channel(config: &HarvestRuntimeConfig) -> autumn_web::AutumnResult<bool> {
+async fn install_dispatch_channel(
+    config: &HarvestRuntimeConfig,
+    shard: Option<ShardId>,
+) -> autumn_web::AutumnResult<bool> {
     use std::time::Duration;
 
     // The endpoint string comes from the redacted form only, so neither the
@@ -1404,10 +1450,13 @@ async fn install_dispatch_channel(config: &HarvestRuntimeConfig) -> autumn_web::
         return Ok(false);
     };
 
+    // Each shard's processes own their own key family (issue #1312).
+    let key_prefix = effective_dispatch_prefix(&config.redis.key_prefix, shard);
+
     let channel = autumn_harvest_redis::RedisDispatch::connect(
         url,
         autumn_harvest_redis::RedisDispatchConfig {
-            key_prefix: config.redis.key_prefix.clone(),
+            key_prefix: key_prefix.clone(),
             consumer_group: config.redis.consumer_group.clone(),
             visibility_timeout: Duration::from_millis(config.redis.visibility_timeout_ms),
             dedupe_ttl: DISPATCH_DEDUPE_TTL,
@@ -1431,7 +1480,7 @@ async fn install_dispatch_channel(config: &HarvestRuntimeConfig) -> autumn_web::
 
     tracing::info!(
         endpoint = %endpoint,
-        key_prefix = %config.redis.key_prefix,
+        key_prefix = %key_prefix,
         consumer_group = %config.redis.consumer_group,
         poll_interval_ms = config.redis.poll_interval_ms,
         reconcile_interval_ms = config.redis.reconcile_interval_ms,
@@ -1458,6 +1507,7 @@ async fn install_dispatch_channel(config: &HarvestRuntimeConfig) -> autumn_web::
 #[allow(clippy::unused_async)]
 async fn install_dispatch_channel(
     _config: &HarvestRuntimeConfig,
+    _shard: Option<ShardId>,
 ) -> autumn_web::AutumnResult<bool> {
     autumn_harvest::dispatch::uninstall();
     Ok(false)
@@ -2215,7 +2265,7 @@ mod tests {
             config.redis.url.is_none(),
             "the default config has redis dispatch off"
         );
-        let installed = block_on(super::install_dispatch_channel(&config))
+        let installed = block_on(super::install_dispatch_channel(&config, None))
             .expect("a disabled start must succeed");
 
         assert!(!installed, "a disabled start installs no channel");
