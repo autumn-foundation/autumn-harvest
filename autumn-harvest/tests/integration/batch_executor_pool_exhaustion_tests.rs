@@ -39,10 +39,18 @@
 //! `autumn_harvest_plugin::runner::BatchRuntime::spawn` calls
 //! `run_executor_once` in a bare loop with no timeout. `BatchRuntime::
 //! shutdown` then awaits that same stuck task, with no abort fallback. A
-//! hang here therefore wedges the whole process's graceful shutdown too. It
-//! triggers whenever a shard's pool has no spare connection at the moment a
-//! batch job is open. The simplest case, reproduced here, is a pool of
-//! size one.
+//! hang here therefore wedges the whole process's graceful shutdown too.
+//!
+//! The real trigger is narrower than any exhausted pool. That distinction
+//! matters for severity. The executor itself permanently retains at most
+//! two connections while a shard has an open job: the job-listing
+//! connection and `owning_conn`. Unrelated borrowers that merely exhaust a
+//! larger pool eventually return their connections and unblock the
+//! executor. That case is a stall, not a permanent hang. The unconditional
+//! deadlock needs the pool's total capacity at or below what the executor
+//! itself retains. In practice that means `max_size` 1 or 2, regardless of
+//! any other load. The simplest case, reproduced here, is a pool of size
+//! one.
 //!
 //! `#[ignore]` applies because this is a confirmed hang, not a flake.
 //! Running it un-ignored would reproduce the "one test parks a CI job for
@@ -215,10 +223,11 @@ async fn run_executor_once_deadlocks_on_a_pool_with_no_spare_connection() {
     // same pool. It uses that second connection to claim and record the
     // job.
     //
-    // A size-one pool is the minimal reproduction case. The real-world
-    // trigger is a pool that concurrent load has merely exhausted, at the
-    // moment the executor tick fires. A permanently-size-one pool is not
-    // required in production.
+    // A size-one pool is the minimal reproduction case. The general
+    // trigger is `max_size` at or below what the executor itself
+    // permanently retains here: the job-listing connection plus
+    // `owning_conn`, so `max_size` 1 or 2. A pool merely busy with
+    // unrelated work does not hang this way; those connections return.
     let pool = build_pool_with_max_size(&url, 1);
     let sharded = ShardedDbPool::single(pool.clone());
 
