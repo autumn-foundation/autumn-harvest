@@ -2282,6 +2282,36 @@ async fn ui_schedules_bulk_pause_pauses_matching_rows() {
     );
 }
 
+/// Codex review on #1437 (P1): before this fix, an invalid `shard_id` in
+/// a bulk-action POST silently dropped to "no shard restriction". It
+/// paused schedules on every shard instead of rejecting the request —
+/// the exact scope-broadening a mutating endpoint must never allow.
+#[tokio::test]
+async fn ui_schedules_bulk_pause_rejects_invalid_shard_id_instead_of_broadening_scope() {
+    let (database_url, _container) = setup_test_database_url().await;
+    let id = insert_test_schedule(&database_url, "Workflow", "shard_guard_target", false).await;
+
+    let app = build_single_shard_ui_app(&database_url);
+    let (status, _headers, body) = post_form(&app, "/schedules/bulk-pause", "shard_id=north").await;
+    assert!(
+        status.is_client_error(),
+        "an invalid shard_id must reject the bulk action, not silently drop the \
+         restriction and pause every shard: got {status}, body: {body}"
+    );
+
+    let mut conn = AsyncPgConnection::establish(&database_url).await.unwrap();
+    let paused: bool = autumn_harvest::schema::harvest_schedules::table
+        .filter(autumn_harvest::schema::harvest_schedules::id.eq(id))
+        .select(autumn_harvest::schema::harvest_schedules::is_paused)
+        .first(&mut conn)
+        .await
+        .unwrap();
+    assert!(
+        !paused,
+        "no schedule should be paused when the bulk action itself is rejected"
+    );
+}
+
 /// Pagination: `?limit=1` caps the list to 1 row and shows Next link.
 #[tokio::test]
 async fn ui_schedules_pagination() {

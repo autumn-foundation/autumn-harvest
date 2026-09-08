@@ -3700,7 +3700,7 @@ fn render_dead_letter_filters(
             }
             label {
                 "Shard"
-                input type="number" name="shard_id" value=(filter_raw.shard_id) placeholder="e.g. 0";
+                input type="text" inputmode="numeric" pattern="-?[0-9]*" name="shard_id" value=(filter_raw.shard_id) placeholder="e.g. 0";
                 @if let Some(error) = &filter_raw.shard_id_error {
                     span.field-error role="alert" { (error) }
                 }
@@ -4326,7 +4326,7 @@ fn render_worker_filters(
             }
             label {
                 "Shard"
-                input type="number" name="shard" value=(shard_raw) placeholder="e.g. 0";
+                input type="text" inputmode="numeric" pattern="-?[0-9]*" name="shard" value=(shard_raw) placeholder="e.g. 0";
                 @if let Some(error) = shard_error {
                     span.field-error role="alert" { (error) }
                 }
@@ -8440,7 +8440,30 @@ async fn list_schedules_ui(
 }
 
 /// Parse a `ScheduleUiFilters` from optional string fields.
-fn parse_schedule_bulk_filters(params: &ScheduleBulkParams) -> ScheduleUiFilters {
+/// Parses a `ScheduleUiFilters` for the bulk-action POST forms
+/// (`../schedules/bulk-pause`, `../schedules/bulk-resume`).
+///
+/// `kind`/`paused`/`health` keep the pre-existing "unrecognized value
+/// omits that filter" leniency. This PR does not touch that behavior. It
+/// matches the GET list page's "filter not applied" contract for a bad
+/// value.
+///
+/// `shard_id` does not keep that leniency. Unlike the other three
+/// fields, a broadened `shard_id` does not just show the operator a
+/// bigger table. It *pauses or resumes schedules on every shard*, not
+/// just the one they scoped the action to. Before this PR, `shard_id:
+/// Option<i32>` was typed directly on `ScheduleBulkParams`. A non-numeric
+/// value therefore failed axum's `Form<..>` extraction, and the whole
+/// request 400ed before any schedule was touched. Retyping it
+/// `Option<String>` fixes the GET-page 400 (see `parse_shard_id_filter`).
+/// Silently dropping a parse failure to `None` here would mean "no shard
+/// restriction". That would reopen the same gap one layer down. Here,
+/// "not applied" would mean "every shard", not "not this shard" (Codex
+/// review, P1). A malformed `shard_id` in a bulk form is therefore
+/// rejected outright, restoring the pre-PR behavior for this one field.
+fn parse_schedule_bulk_filters(
+    params: &ScheduleBulkParams,
+) -> Result<ScheduleUiFilters, AutumnError> {
     let kind = params
         .kind
         .as_deref()
@@ -8462,17 +8485,21 @@ fn parse_schedule_bulk_filters(params: &ScheduleBulkParams) -> ScheduleUiFilters
         .map(str::trim)
         .filter(|s| !s.is_empty())
         .map(str::to_string);
-    let shard_id = params
-        .shard_id
-        .as_deref()
-        .and_then(|s| s.trim().parse::<i32>().ok());
-    ScheduleUiFilters {
+    let shard_id = match params.shard_id.as_deref().map(str::trim) {
+        None | Some("") => None,
+        Some(raw) => Some(raw.parse::<i32>().map_err(|_| {
+            AutumnError::bad_request_msg(format!(
+                "invalid shard_id '{raw}'; expected a whole number"
+            ))
+        })?),
+    };
+    Ok(ScheduleUiFilters {
         target,
         kind,
         paused,
         health,
         shard_id,
-    }
+    })
 }
 
 /// Find a schedule by id across all shards. Returns the row, the shard it lives
@@ -9047,7 +9074,10 @@ async fn schedule_bulk_pause_ui(
     use autumn_harvest::schema::harvest_schedules::dsl;
     use axum::response::IntoResponse as _;
 
-    let filters = parse_schedule_bulk_filters(&params);
+    let filters = match parse_schedule_bulk_filters(&params) {
+        Ok(f) => f,
+        Err(e) => return e.into_response(),
+    };
 
     let pool = match api_state.storage_pool() {
         Ok(p) => p,
@@ -9134,7 +9164,10 @@ async fn schedule_bulk_resume_ui(
     use autumn_harvest::schema::harvest_schedules::dsl;
     use axum::response::IntoResponse as _;
 
-    let filters = parse_schedule_bulk_filters(&params);
+    let filters = match parse_schedule_bulk_filters(&params) {
+        Ok(f) => f,
+        Err(e) => return e.into_response(),
+    };
 
     let pool = match api_state.storage_pool() {
         Ok(p) => p,
@@ -9406,7 +9439,7 @@ fn render_schedule_filters(
             }
             label {
                 "Shard"
-                input type="number" name="shard_id" value=(filter_raw.shard_id) placeholder="e.g. 0";
+                input type="text" inputmode="numeric" pattern="-?[0-9]*" name="shard_id" value=(filter_raw.shard_id) placeholder="e.g. 0";
                 @if let Some(error) = &filter_raw.shard_id_error {
                     span.field-error role="alert" { (error) }
                 }
@@ -16097,12 +16130,68 @@ mod tests {
             paused: None,
             health: Some("Unhealthy".to_string()),
             shard_id: None,
-        });
+        })
+        .unwrap();
         assert!(
             !filters.matches(ShardId::new(0), &healthy),
             "a healthy schedule must not be swept up by a health=Unhealthy bulk action"
         );
         assert!(filters.matches(ShardId::new(0), &unhealthy));
+    }
+
+    /// Codex review on #1437 (P1): a malformed `shard_id` in a bulk-action
+    /// POST must reject the request. It must not silently drop to "no
+    /// shard restriction" and pause/resume schedules on every shard,
+    /// instead of the one the operator scoped the action to.
+    #[test]
+    fn parse_schedule_bulk_filters_rejects_invalid_shard_id() {
+        let result = parse_schedule_bulk_filters(&ScheduleBulkParams {
+            target: None,
+            kind: None,
+            paused: None,
+            health: None,
+            shard_id: Some("north".to_string()),
+        });
+        assert!(
+            result.is_err(),
+            "an invalid shard_id must reject the bulk action, not broaden it to all shards"
+        );
+    }
+
+    #[test]
+    fn parse_schedule_bulk_filters_accepts_valid_shard_id() {
+        let filters = parse_schedule_bulk_filters(&ScheduleBulkParams {
+            target: None,
+            kind: None,
+            paused: None,
+            health: None,
+            shard_id: Some("2".to_string()),
+        })
+        .unwrap();
+        assert_eq!(filters.shard_id, Some(2));
+    }
+
+    #[test]
+    fn parse_schedule_bulk_filters_blank_or_missing_shard_id_is_not_an_error() {
+        let filters = parse_schedule_bulk_filters(&ScheduleBulkParams {
+            target: None,
+            kind: None,
+            paused: None,
+            health: None,
+            shard_id: None,
+        })
+        .unwrap();
+        assert_eq!(filters.shard_id, None);
+
+        let filters = parse_schedule_bulk_filters(&ScheduleBulkParams {
+            target: None,
+            kind: None,
+            paused: None,
+            health: None,
+            shard_id: Some("   ".to_string()),
+        })
+        .unwrap();
+        assert_eq!(filters.shard_id, None);
     }
 
     /// A paused DAG schedule cannot be committed (the endpoint rejects it), so
