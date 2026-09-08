@@ -89,21 +89,15 @@ use testcontainers_modules::testcontainers::runners::AsyncRunner;
 /// `HARVEST_TEST_DATABASE_URL` (a real Postgres already reachable in this
 /// environment) over a testcontainers container so the test runs without
 /// Docker.
-/// Swap the database-name path segment of a Postgres URL, preserving any
-/// query string. Mirrors `shard_placement_by_id_tests::rewrite_pg_db`: a
-/// naive `rsplit_once('/')` would drop options like `?sslmode=require` from
-/// `HARVEST_TEST_DATABASE_URL`, breaking the per-test database connection on
-/// a server that requires them.
-fn rewrite_pg_db(base: &str, db: &str) -> String {
-    let after_scheme = base.find("://").map_or(0, |i| i + 3);
-    let rest = &base[after_scheme..];
-    let (authority, tail) = rest
-        .find('/')
-        .map_or((rest, ""), |i| (&rest[..i], &rest[i + 1..]));
-    let query = tail.find('?').map_or("", |i| &tail[i..]);
-    format!("{}{}/{}{}", &base[..after_scheme], authority, db, query)
-}
-
+///
+/// Rewrites the target database name with `claim_bench_support::with_db_name`
+/// rather than a hand-rolled split. A naive query-preserving rewrite still
+/// breaks. A `dbname` query parameter outranks the URL path for `tokio-
+/// postgres`. Carrying it verbatim would silently reconnect this test to
+/// the operator's original database instead of the fresh one. `with_db_name`
+/// strips an overriding `dbname`, plain or percent-encoded, while keeping
+/// every other query option. Dozens of regression tests in
+/// `claim_bench_support` already fought over this exact behavior.
 async fn setup_one_database() -> (String, Option<ContainerAsync<Postgres>>) {
     if let Ok(base_url) = std::env::var("HARVEST_TEST_DATABASE_URL") {
         let db_name = format!("harvest1360_{}", uuid::Uuid::new_v4().simple());
@@ -114,7 +108,8 @@ async fn setup_one_database() -> (String, Option<ContainerAsync<Postgres>>) {
             .batch_execute(&format!("CREATE DATABASE \"{db_name}\""))
             .await
             .expect("create per-test database");
-        let new_url = rewrite_pg_db(&base_url, &db_name);
+        let new_url =
+            super::claim_bench_support::with_db_name(&base_url, &db_name).expect("rewrite URL");
         let mut conn = <AsyncPgConnection as diesel_async::AsyncConnection>::establish(&new_url)
             .await
             .expect("connect to per-test database");
