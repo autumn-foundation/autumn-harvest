@@ -23964,8 +23964,8 @@ impl DispatchDegradation {
     /// connection, and `next` runs on the blocking read connection. A worker
     /// whose read connection alone is unhealthy still completes maintenance
     /// and publishes. If those calls cleared the window, every hung read would
-    /// open the minimum cooldown instead of the doubled one, and an
-    /// intermittently idle worker would pay one failed read per cycle.
+    /// open the minimum cooldown instead of the doubled one. An intermittently
+    /// idle worker would then pay one failed read per cycle.
     const fn record_read_success(&mut self) {
         self.failures = 0;
         self.started = None;
