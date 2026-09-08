@@ -1698,3 +1698,6 @@ standalone note rather than part of the claim-path attribution table above:
   — the per-row audit-insert N+1 in the Vantage schedules bulk-pause/resume
   actions (issue #951), batched into one chunked insert call per shard
   (multiple statements past 4,999 matched rows).
+* [`docs/performance-dlq-bulk-discard.md`](performance-dlq-bulk-discard.md) —
+  the per-row `DELETE` N+1 in `POST /dead-letters/discard` (issue #1421),
+  batched into one `DELETE ... WHERE id = ANY($1)` call.
