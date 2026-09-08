@@ -2026,6 +2026,53 @@ mod tests {
             .expect("a runtime with redis dispatch off must not be rejected");
     }
 
+    /// An unsharded runtime keeps the configured prefix exactly (issue #1312).
+    ///
+    /// Every existing single-database deployment resolves the default shard.
+    /// A suffix there would move the key family and strand the references a
+    /// previous release published.
+    #[test]
+    fn the_default_shard_keeps_the_configured_dispatch_prefix() {
+        assert_eq!(
+            super::effective_dispatch_prefix("harvest", Some(ShardId::new(0))),
+            "harvest"
+        );
+        assert_eq!(super::effective_dispatch_prefix("harvest", None), "harvest");
+    }
+
+    /// A process that owns one non-default shard gets its own key family.
+    ///
+    /// Every process in a sharded fleet passes the single-shard check. Without
+    /// the suffix they would all read one stream, and a worker would probe its
+    /// own database for another shard's row.
+    #[test]
+    fn a_non_default_shard_gets_its_own_dispatch_prefix() {
+        assert_eq!(
+            super::effective_dispatch_prefix("harvest", Some(ShardId::new(3))),
+            "harvest:s3"
+        );
+        assert_eq!(
+            super::effective_dispatch_prefix("harvest", Some(ShardId::new(1))),
+            "harvest:s1"
+        );
+    }
+
+    /// The suffix extends the configured prefix and never replaces it.
+    ///
+    /// An operator who already namespaces the prefix per environment keeps
+    /// that namespace, so two environments on one Redis stay separate.
+    #[test]
+    fn a_configured_dispatch_prefix_survives_the_shard_suffix() {
+        assert_eq!(
+            super::effective_dispatch_prefix("acme:staging", Some(ShardId::new(7))),
+            "acme:staging:s7"
+        );
+        assert_eq!(
+            super::effective_dispatch_prefix("acme:staging", Some(ShardId::new(0))),
+            "acme:staging"
+        );
+    }
+
     /// `start` installs the process-global channel before it builds the
     /// worker. A later failure must leave no channel behind, or the next
     /// runtime in this process inherits one it never configured (issue #1312).

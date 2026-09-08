@@ -38227,9 +38227,9 @@ mod tests {
     }
 
     /// A worker enters degraded mode on a channel failure and leaves it on the
-    /// first successful channel call.
+    /// first successful reference read.
     #[test]
-    fn a_successful_channel_call_clears_the_degraded_window() {
+    fn a_successful_read_clears_the_degraded_window() {
         let base = Duration::from_secs(5);
         let mut degraded = DispatchDegradation::new();
         assert!(
@@ -38245,15 +38245,40 @@ mod tests {
             "a second consecutive failure doubles the cooldown"
         );
 
-        degraded.record_success();
+        degraded.record_read_success();
         assert!(
             !degraded.is_degraded(),
-            "a successful channel call closes the window"
+            "a successful reference read closes the window"
         );
         assert_eq!(
             degraded.record_failure(base),
             base,
-            "the schedule restarts at the poll interval after a success"
+            "the schedule restarts at the poll interval after a successful read"
+        );
+    }
+
+    /// A healthy maintenance call must not shrink the cooldown of a failing
+    /// read path (issue #1312).
+    ///
+    /// `maintain` and `publish` run on the general connection. `next` runs on
+    /// the blocking read connection. Only the read connection can be
+    /// unhealthy, so a success on the other two proves nothing about the read
+    /// path. If either cleared the window, every hung read would open the
+    /// minimum cooldown, and an idle worker would spend one failed read per
+    /// cycle.
+    #[test]
+    fn a_successful_maintenance_call_does_not_shrink_the_cooldown() {
+        let base = Duration::from_secs(5);
+        let mut degraded = DispatchDegradation::new();
+
+        assert_eq!(degraded.record_failure(base), base, "the first failed read");
+        // The worker runs a successful maintenance pass here. The window
+        // tracks the health of the read path only. A maintenance success
+        // therefore leaves the failure counter alone.
+        assert_eq!(
+            degraded.record_failure(base),
+            base * 2,
+            "the second failed read doubles the cooldown across a healthy maintenance pass"
         );
     }
 
