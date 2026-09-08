@@ -865,25 +865,72 @@ pub async fn bulk_replay_dead_letters(
     })
 }
 
-/// Bulk discard dead-letter entries matching `filter`.
+/// Delete several dead-letter rows by id in one statement.
 ///
-/// Each matching row is deleted from `harvest_dead_letters` without
-/// re-enqueueing. A per-row failure does not affect other rows. When
-/// `filter.dry_run` is `true`, no deletes are performed.
+/// Returns the ids that were actually deleted. An id already gone (raced
+/// discard, already replayed) is silently absent from the result, matching
+/// the per-row `deleted == 0` skip this replaces rather than erroring.
+///
+/// `id = ANY($1)` binds the id list as a single array parameter, not one
+/// bind per id. So there is no `PostgreSQL` bound-parameter ceiling to chunk
+/// against here. Contrast [`crate::audit::insert_audit_batch`], which binds
+/// a column per row via a multi-row `VALUES` list.
+///
+/// An empty slice never sends a statement.
 ///
 /// # Errors
 ///
-/// Returns [`HarvestError::Database`] if the initial filter query fails.
-/// Per-row delete errors are captured in [`BulkDlqResult::failures`].
+/// Returns [`HarvestError::Database`] if the delete fails. On failure the
+/// batch is atomic. No row is deleted where a per-row loop could have
+/// deleted an earlier id. It could then hit an error on a later one,
+/// leaving a mixed state. See `docs/performance-dlq-bulk-discard.md`'s
+/// "Equivalence" section for why this is a disclosed strengthening, not a
+/// weakening, of the prior guarantee.
+pub async fn discard_dead_letters_batch(
+    conn: &mut AsyncPgConnection,
+    ids: &[Uuid],
+) -> HarvestResult<Vec<Uuid>> {
+    use crate::schema::harvest_dead_letters::dsl;
+
+    if ids.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    diesel::delete(dsl::harvest_dead_letters.filter(dsl::id.eq_any(ids)))
+        .returning(dsl::id)
+        .get_results(conn)
+        .await
+        .map_err(crate::error::database_error)
+}
+
+/// Bulk discard dead-letter entries matching `filter`.
+///
+/// All matching rows are deleted from `harvest_dead_letters` in one
+/// statement, without re-enqueueing. When `filter.dry_run` is `true`, no
+/// deletes are performed.
+///
+/// A failure of the batched delete itself (statement timeout, lock
+/// contention) is **not** returned as an `Err`. It is captured into the
+/// returned [`BulkDlqResult::failures`] instead, one [`BulkDlqFailure`] per
+/// selected id, with `acted_on` left at `0`.
+///
+/// Callers that only check the outer `Result` — including a bare `?` — will
+/// treat this as success. Inspect `failures` to detect it, exactly as
+/// callers of [`bulk_replay_dead_letters`] already must.
+///
+/// # Errors
+///
+/// Returns [`HarvestError::Database`] if the initial filter query (row
+/// selection or the `matched` count) fails, before any delete is
+/// attempted.
 pub async fn bulk_discard_dead_letters(
     conn: &mut AsyncPgConnection,
     filter: &BulkDlqFilter,
 ) -> HarvestResult<BulkDlqResult> {
-    use crate::schema::harvest_dead_letters::dsl;
-
     let matched = usize::try_from(count_bulk_filter_matches(conn, filter).await?).unwrap_or(0);
     let rows = query_dead_letters_for_bulk(conn, filter).await?;
-    let preview_ids: Vec<String> = rows.iter().map(|r| r.id.to_string()).collect();
+    let ids: Vec<Uuid> = rows.iter().map(|r| r.id).collect();
+    let preview_ids: Vec<String> = ids.iter().map(ToString::to_string).collect();
 
     if filter.dry_run {
         return Ok(BulkDlqResult {
@@ -896,41 +943,47 @@ pub async fn bulk_discard_dead_letters(
         });
     }
 
-    let mut acted_on = 0usize;
-    let mut skipped = 0usize;
-    let mut acted_ids: Vec<String> = Vec::with_capacity(rows.len());
-    let mut failures: Vec<BulkDlqFailure> = Vec::with_capacity(rows.len());
-
-    for row in &rows {
-        match diesel::delete(dsl::harvest_dead_letters.find(row.id))
-            .execute(conn)
-            .await
-            .map_err(crate::error::database_error)
-        {
-            Ok(0) => {
-                skipped += 1;
-            }
-            Ok(_) => {
-                acted_on += 1;
-                acted_ids.push(row.id.to_string());
-            }
-            Err(e) => {
-                failures.push(BulkDlqFailure {
-                    id: row.id.to_string(),
-                    reason: e.to_string(),
-                });
-            }
+    // A batch failure is captured into `failures` for every selected id,
+    // rather than propagated. This matches the API layer's
+    // `bulk_discard_dead_letters_for_selector`, kept in sync per this
+    // module's own convention -- see that function's doc comment for why.
+    match discard_dead_letters_batch(conn, &ids).await {
+        Ok(deleted_ids) => {
+            let deleted: std::collections::HashSet<Uuid> = deleted_ids.into_iter().collect();
+            let acted_ids: Vec<String> = ids
+                .iter()
+                .filter(|id| deleted.contains(id))
+                .map(ToString::to_string)
+                .collect();
+            let acted_on = acted_ids.len();
+            let skipped = ids.len() - acted_on;
+            Ok(BulkDlqResult {
+                matched,
+                acted_on,
+                skipped,
+                ids: acted_ids,
+                dry_run: false,
+                failures: Vec::new(),
+            })
+        }
+        Err(e) => {
+            let reason = e.to_string();
+            Ok(BulkDlqResult {
+                matched,
+                acted_on: 0,
+                skipped: 0,
+                ids: Vec::new(),
+                dry_run: false,
+                failures: ids
+                    .iter()
+                    .map(|id| BulkDlqFailure {
+                        id: id.to_string(),
+                        reason: reason.clone(),
+                    })
+                    .collect(),
+            })
         }
     }
-
-    Ok(BulkDlqResult {
-        matched,
-        acted_on,
-        skipped,
-        ids: acted_ids,
-        dry_run: false,
-        failures,
-    })
 }
 
 // ---------------------------------------------------------------------------

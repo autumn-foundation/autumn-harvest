@@ -32638,17 +32638,44 @@ async fn bulk_discard_dead_letters_for_selector(
         return Ok(result);
     }
 
-    for row in rows {
-        let id = row.id;
-        let deleted = diesel::delete(harvest_dead_letters::table.find(id))
-            .execute(conn)
-            .await
-            .map_err(database_error)?;
-        if deleted > 0 {
-            result.acted_on += 1;
-            result.ids.push(id.to_string());
-        } else {
-            result.skipped += 1;
+    // One statement replaces one DELETE per row (issue #1421).
+    // `dlq::discard_dead_letters_batch` binds `id = ANY($1)` as a single
+    // array parameter. A 1,000-row bulk discard -- the endpoint's own
+    // `MAX_BULK_LIMIT` -- costs one round trip, not 1,000. See
+    // `docs/performance-dlq-bulk-discard.md`.
+    //
+    // A batch failure (statement timeout, lock contention) is captured into
+    // `result.failures` instead of propagated with `?` (Codex review, PR
+    // #1422). `bulk_discard_from_shards` calls this once per shard and stops
+    // at the first `Err`. Raising here would abort every later shard. It
+    // would also discard already-accumulated totals from earlier shards, for
+    // a single Postgres-side hiccup on one shard's one statement, not a
+    // per-row business failure. Returning `Ok` with `failures` populated
+    // lets that loop move on to the next shard. It also lets the handler's
+    // existing failures-aware status logic apply to discard exactly as it
+    // already does for replay. That logic returns 500 only when nothing in
+    // the whole request succeeded, and 200-with-failures otherwise.
+    let ids: Vec<uuid::Uuid> = rows.iter().map(|row| row.id).collect();
+    match dlq::discard_dead_letters_batch(conn, &ids).await {
+        Ok(deleted_ids) => {
+            let deleted: std::collections::HashSet<uuid::Uuid> = deleted_ids.into_iter().collect();
+            result.ids = ids
+                .iter()
+                .filter(|id| deleted.contains(id))
+                .map(ToString::to_string)
+                .collect();
+            result.acted_on = result.ids.len();
+            result.skipped = ids.len() - result.acted_on;
+        }
+        Err(e) => {
+            let reason = e.to_string();
+            result.failures = ids
+                .iter()
+                .map(|id| dlq::BulkDlqFailure {
+                    id: id.to_string(),
+                    reason: reason.clone(),
+                })
+                .collect();
         }
     }
 
