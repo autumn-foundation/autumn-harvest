@@ -145,6 +145,12 @@ reference as absent, while A's row waited for A's reconcile sweep. The suffix
 extends the configured prefix and never replaces it, so a prefix that already
 namespaces an environment keeps that namespace.
 
+An upgrade moves a non-default shard to a new key family. References that the
+previous release published for that shard stay in the old stream, and no worker
+reads them again. Nothing is lost: the rows are still `PENDING` in Postgres,
+and the reconcile sweep republishes them into the new family within one
+`reconcile_interval`. Delete the old keys at leisure with a prefix scan.
+
 With the default prefix and a queue named `email`:
 
 | Key | Kind | Holds |
