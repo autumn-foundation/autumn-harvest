@@ -29,7 +29,6 @@ use diesel::prelude::*;
 use diesel_async::AsyncConnection;
 use diesel_async::AsyncPgConnection;
 use diesel_async::RunQueryDsl;
-use diesel_async::SimpleAsyncConnection;
 use diesel_async::pooled_connection::AsyncDieselConnectionManager;
 
 type BoxFut<'a> =
@@ -986,13 +985,6 @@ async fn the_by_id_claim_honours_the_dr_fence() {
     let _serial = DISPATCH_SERIAL.lock().await;
     let (url, _c) = setup_test_database_url_or_env().await;
     let mut conn = connect(&url).await;
-    // The shared fixture schema predates the DR tables. The migration is
-    // idempotent, so applying it here is safe on a migrated database too.
-    conn.batch_execute(include_str!(
-        "../../migrations/20260726000000_harvest_shard_generation/up.sql"
-    ))
-    .await
-    .expect("shard generation schema");
 
     let shard = ShardId::new(0);
     let generation = ensure_generation_row(&mut conn, shard)

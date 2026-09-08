@@ -417,7 +417,25 @@ const LEGACY_INIT_SQL: &str = concat!(
     // every deployment that never runs a rebalance.
     "ALTER TABLE harvest_workflow_executions ADD COLUMN IF NOT EXISTS migrated_to_shard INTEGER NULL;\n",
     "ALTER TABLE harvest_workflow_executions ADD COLUMN IF NOT EXISTS migrated_at TIMESTAMPTZ NULL;\n",
-    "ALTER TABLE harvest_workflow_executions ADD COLUMN IF NOT EXISTS migrated_from_shards JSONB NULL;\n"
+    "ALTER TABLE harvest_workflow_executions ADD COLUMN IF NOT EXISTS migrated_from_shards JSONB NULL;\n",
+    // issue #1312: the fenced by-id claim reads the DR generation row, so the
+    // shared fixture carries the two DR tables from migration
+    // 20260726000000_harvest_shard_generation.
+    "CREATE TABLE IF NOT EXISTS harvest_shard_generation (\n",
+    "    shard_id INTEGER PRIMARY KEY,\n",
+    "    generation BIGINT NOT NULL DEFAULT 0,\n",
+    "    fenced_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),\n",
+    "    fenced_by TEXT NULL,\n",
+    "    fenced_reason TEXT NULL,\n",
+    "    CONSTRAINT harvest_shard_generation_non_negative CHECK (generation >= 0)\n",
+    ");\n",
+    "CREATE TABLE IF NOT EXISTS harvest_replication_heartbeat (\n",
+    "    shard_id INTEGER NOT NULL,\n",
+    "    beat_lsn PG_LSN NOT NULL,\n",
+    "    beat_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),\n",
+    "    PRIMARY KEY (shard_id, beat_lsn)\n",
+    ");\n",
+    "CREATE INDEX IF NOT EXISTS harvest_replication_heartbeat_shard_at_idx ON harvest_replication_heartbeat (shard_id, beat_at DESC);\n"
 );
 
 /// Start a Postgres container with the harvest schema applied and return
