@@ -242,7 +242,11 @@ forward unchanged from prior reports, one new from §3:
 # tail_lines=40-100) to read the panic/assertion or clippy diagnostic directly.
 
 # Cancelled-run hidden-failure audit (§3): for each run with overall
-# conclusion == "cancelled", pull list_workflow_jobs(resource_id=<run_id>) and check
-# every job's own conclusion — a job conclusion of "failure" inside an overall
-# "cancelled" run is the case this report's original sample missed.
+# conclusion == "cancelled", pull list_workflow_jobs(resource_id=<run_id>,
+# perPage=100) — this workflow's matrices can expand past the API's default
+# 30-job page for a full code PR, so always pass perPage=100 (or page through
+# the rest) and check total_count against the returned array length before
+# trusting a run as "clean." Then check every job's own conclusion — a job
+# conclusion of "failure" inside an overall "cancelled" run is the case this
+# report's original sample missed.
 ```
