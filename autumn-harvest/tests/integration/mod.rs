@@ -21,6 +21,8 @@ mod auto_heartbeat_tests;
 mod awaitables_tests;
 #[cfg(all(feature = "db", feature = "testing"))]
 mod backup_verify_tests;
+#[cfg(feature = "db")]
+mod batch_executor_pool_exhaustion_tests;
 mod benchmarks_docs;
 #[cfg(feature = "db")]
 mod build_routing_tests;
