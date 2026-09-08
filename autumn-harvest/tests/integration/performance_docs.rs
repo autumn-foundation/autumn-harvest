@@ -667,9 +667,11 @@ fn the_case_key_is_not_published_as_sufficient_to_restore_the_cheap_plan() {
 /// having measured them. Issue #1177 reproduces — for each independently —
 /// that they defeat sort-elision regardless of the value tested against, so
 /// "cheap" was never an established finding. That is a plan-eligibility
-/// result, not a cost measurement: their marginal cost on the attribution
-/// table remains unmeasured, and the bullet must say so rather than swap one
-/// unsupported cost claim for another.
+/// result, not a cost measurement. All three predicates now carry a
+/// completed cost measurement of their own (`schedule_to_close` #378,
+/// worker sessions #606, sticky routing #235), so the bullet must keep
+/// crediting that separate work rather than re-asserting "cheap" or
+/// conflating the two kinds of evidence.
 #[test]
 fn known_limitations_no_longer_calls_the_unmeasured_predicates_cheap() {
     let doc = read_performance_doc();
@@ -684,13 +686,15 @@ fn known_limitations_no_longer_calls_the_unmeasured_predicates_cheap() {
          tested against, so they were never cheap — they were untested."
     );
     assert!(
-        flat.contains("their own marginal cost still can't be isolated this way"),
+        flat.contains(
+            "cost measurement above is what fills the gap that plan-eligibility finding cannot"
+        ),
         "the Known limitations bullet for `schedule_to_close` (#378), worker \
          sessions (#606) and sticky routing (#235) must keep distinguishing \
          issue #1177's plan-eligibility finding (each independently defeats \
-         sort-elision) from a cost measurement (still unmeasured, still \
-         scenario work) — conflating the two would replace one unsupported \
-         cost claim with another."
+         sort-elision) from each predicate's own completed cost measurement \
+         — conflating the two would replace one unsupported cost claim with \
+         another."
     );
 }
 

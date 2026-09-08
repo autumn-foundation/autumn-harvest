@@ -1577,21 +1577,23 @@ from the benchmark are directly comparable.
     seeds `sticky_worker_id`/`sticky_until`/`sticky_timeout` (session_id left
     `NULL`, isolating this predicate from worker sessions' own) via the same
     per-row `INSERT`-then-`UPDATE`-then-`COMMIT` lifecycle
-    `queue::enqueue()`'s real write uses for an ordinary sticky pin, and
-    finds a real, moderate buffer cost at ordinary backlog depths — +18.9%
-    at 1,000 rows, +32.9% at the 10,000-row headline depth, corroborated by
-    a real 10,001-call production-shaped drain at +21.5%. Mechanism: the
-    same row-width/MVCC growth worker sessions' page documents, smaller in
-    magnitude since only one column pair is set rather than two — no
-    query-shape fix applies. At the 100,000-row depth the buffer delta
-    reverses sign (-65.9%): a genuine `EXPLAIN`-documented plan-shape
-    crossover (`no-sticky` picks `idx_harvest_tq_poll`, `sticky-routing`
-    picks a plain `Seq Scan`, driven by a cardinality-estimate divergence on
-    the `IS NULL` vs. `= $1` branches of the predicate), observed at one
-    depth rather than the ≥3 this persona's own rules require before
-    treating a plan-shape change as a general finding — see that page's
-    dedicated section on it rather than citing the 100,000-row number as a
-    continuation of the 1,000/10,000 trend. What issue #1177 adds is a
+    `queue::enqueue()`'s real write uses for an ordinary sticky pin, reusing
+    the `no-sticky` control's exact `id`/`activity_id` values in their
+    original physical insertion order (a Codex review finding on this page's
+    own PR caught an earlier revision seeding each label's B-trees with
+    independently-random keys instead — see that page's Harness correction
+    section), and finds a real, moderate buffer cost that **grows
+    monotonically across every published depth** — +18.9% at 1,000 rows,
+    +32.9% at the 10,000-row headline depth, +36.2% at 100,000 rows —
+    corroborated by a real 10,001-call production-shaped drain at +18.3%.
+    Mechanism: the same row-width/MVCC growth worker sessions' page
+    documents, smaller in magnitude since only one column pair is set
+    rather than two — no query-shape fix applies. Both labels choose the
+    identical `Seq Scan` plan shape at every depth including 100,000 rows;
+    an earlier revision of this measurement reported a plan-shape crossover
+    there, which review traced to the same seeding confound rather than to
+    `sticky_worker_id` itself — see that page for the corrected capture.
+    What issue #1177 adds is a
     different kind of evidence, not a cost figure: in isolation, sticky
     routing's predicate — together with `schedule_to_close`'s and worker
     sessions', both also measured — independently defeats sort-elision and

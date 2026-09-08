@@ -3902,7 +3902,7 @@ async fn zz_capture_worker_session_claim_evidence() {
 #[allow(clippy::too_many_lines)] // one-shot evidence capture, not a CI assertion
 async fn zz_capture_sticky_routing_claim_evidence() {
     use diesel::QueryableByName;
-    use diesel_async::RunQueryDsl;
+    use diesel_async::{AsyncPgConnection, RunQueryDsl};
 
     #[derive(QueryableByName)]
     struct ExplainRow {
@@ -3932,6 +3932,100 @@ async fn zz_capture_sticky_routing_claim_evidence() {
     // down, which binds it as a plain parameter, not SQL text.
     const WORKER_ID: &str = "deadbeef-dead-4bee-8bee-deadbeefcafe";
 
+    // Captures the currently-seeded `no-sticky` fixture's `id`/`activity_id`
+    // values (and every other seeded column). The `sticky-routing` label
+    // reuses them EXACTLY, instead of generating a fresh, independent set of
+    // random UUIDs for itself -- the same fix
+    // `snapshot_seed_for_schedule_to_close`/
+    // `reseed_from_schedule_to_close_snapshot` apply to the schedule-to-close
+    // capture, for the identical reason (a Codex review finding on this PR).
+    //
+    // Every claim is a non-HOT `UPDATE` that touches every index on
+    // `harvest_task_queue`, not just the sticky-routing partial index. If the
+    // two labels' primary-key and `activity_id` B-trees held independently
+    // random keys instead, page-split/traversal noise from those OTHER
+    // indexes could rival the effect this capture attributes to
+    // `sticky_worker_id` itself. Reusing identical indexed values across
+    // labels makes the sticky columns the only input that actually varies
+    // between them.
+    //
+    // A PLAIN table, not `TEMP`: the per-depth `EXPLAIN` loop below shares it
+    // on one connection, but the stat-snapshot loop further down seeds and
+    // drains each label on its OWN freshly-`db::connect()`ed connection. A
+    // `TEMP` table is connection-session-scoped and would not survive from
+    // the `no-sticky` label's connection to the `sticky-routing` label's.
+    //
+    // Numbered by `ROW_NUMBER() OVER (ORDER BY ctid)`, not `id`. `ctid`
+    // (physical tuple location) preserves original insertion order, for a
+    // table that has only ever been seeded once with no intervening updates
+    // or deletes. Ordering by the random primary key would scramble it
+    // instead.
+    async fn snapshot_seed_for_sticky_routing(conn: &mut AsyncPgConnection) {
+        diesel::sql_query("DROP TABLE IF EXISTS zz_sticky_seed_snapshot")
+            .execute(conn)
+            .await
+            .expect("drop any leftover seed snapshot from a previous run");
+
+        diesel::sql_query(
+            "CREATE TABLE zz_sticky_seed_snapshot AS \
+               SELECT id, queue_name, task_type, activity_name, activity_id, input, \
+                      state, priority, max_attempts, scheduled_at, \
+                      ROW_NUMBER() OVER (ORDER BY ctid) - 1 AS i \
+               FROM harvest_task_queue",
+        )
+        .execute(conn)
+        .await
+        .expect("snapshot the no-sticky seed before re-seeding");
+    }
+
+    // Re-seeds `harvest_task_queue` for the `sticky-routing` label from the
+    // snapshot `snapshot_seed_for_sticky_routing` took of the `no-sticky`
+    // label's own seed, reusing its exact `id`/`activity_id` values in their
+    // original physical insertion order. Unlike
+    // `reseed_from_schedule_to_close_snapshot`'s single `INSERT ... SELECT`,
+    // this re-seed reproduces `queue::enqueue()`'s real two-statement
+    // per-row lifecycle (`INSERT`, then a separate `UPDATE` setting the
+    // sticky columns, each its own committed transaction) -- see
+    // `harvest_bench_reseed_sticky_from_snapshot`'s own definition below for
+    // why a bulk `INSERT` followed by one bulk `UPDATE` would misrepresent
+    // the physical heap layout that lifecycle produces. Drops the snapshot
+    // table once consumed.
+    async fn reseed_from_sticky_routing_snapshot(
+        conn: &mut AsyncPgConnection,
+        sticky_worker_literal: &str,
+    ) {
+        diesel::sql_query("TRUNCATE harvest_task_queue")
+            .execute(conn)
+            .await
+            .expect("truncate before the sticky-routing re-seed");
+        diesel::sql_query("SET synchronous_commit = off")
+            .execute(conn)
+            .await
+            .expect("relax synchronous_commit for this seeding session only");
+
+        diesel::sql_query(format!(
+            "CALL harvest_bench_reseed_sticky_from_snapshot({sticky_worker_literal})"
+        ))
+        .execute(conn)
+        .await
+        .expect(
+            "re-seed rows carrying sticky_worker_id/sticky_until/sticky_timeout, \
+             reusing the no-sticky seed's exact id/activity_id values in the \
+             same physical insertion order, via the per-row \
+             INSERT-then-UPDATE procedure",
+        );
+
+        diesel::sql_query("DROP TABLE zz_sticky_seed_snapshot")
+            .execute(conn)
+            .await
+            .expect("drop the seed snapshot now that it has been consumed");
+
+        diesel::sql_query("ANALYZE harvest_task_queue")
+            .execute(conn)
+            .await
+            .expect("re-analyze after the sticky-routing re-seed");
+    }
+
     let Some(bench) = bench_db_or_skip().await else {
         eprintln!("no database reachable; nothing captured");
         return;
@@ -3949,41 +4043,44 @@ async fn zz_capture_sticky_routing_claim_evidence() {
     let raw = autumn_harvest::queue::claim_task_query();
     let worker_literal = format!("'{WORKER_ID}'");
 
-    // Server-side per-row seeding procedure for the `sticky-routing` label.
-    // Mirrors `harvest_bench_seed_worker_session_rows` exactly, minus
+    // Server-side per-row reseeding procedure for the `sticky-routing`
+    // label, consuming `zz_sticky_seed_snapshot` in physical insertion
+    // order instead of generating fresh random ids. Mirrors
+    // `harvest_bench_seed_worker_session_rows`'s
+    // `INSERT`-then-`UPDATE`-then-`COMMIT` lifecycle exactly, minus
     // `session_id` -- see that procedure's doc comment in
     // `zz_capture_worker_session_claim_evidence` for why a bulk `INSERT`
     // followed by one bulk `UPDATE` would misrepresent the physical heap
-    // layout `queue::enqueue()` produces. One `CALL` per depth, not N
-    // network round trips; each iteration inserts one row, updates it by
-    // id, and COMMITs before the next iteration begins, matching N
-    // sequential `queue::enqueue()` calls with `with_sticky()` set.
+    // layout `queue::enqueue()` produces. One `CALL`, not N network round
+    // trips: the loop runs entirely server-side.
     let mut proc_conn = db::connect(&bench.url).await;
     diesel::sql_query(
-        "CREATE OR REPLACE PROCEDURE harvest_bench_seed_sticky_routing_rows( \
-             p_prefix text, p_queues int, p_activity text, \
-             p_sticky_worker text, p_count int \
+        "CREATE OR REPLACE PROCEDURE harvest_bench_reseed_sticky_from_snapshot( \
+             p_sticky_worker text \
          ) \
          LANGUAGE plpgsql AS $proc$ \
          DECLARE \
-             i int; \
-             v_id uuid; \
+             rec RECORD; \
          BEGIN \
-             FOR i IN 0..p_count - 1 LOOP \
+             FOR rec IN \
+                 SELECT id, queue_name, task_type, activity_name, activity_id, input, \
+                        state, priority, max_attempts, scheduled_at \
+                 FROM zz_sticky_seed_snapshot \
+                 ORDER BY i \
+             LOOP \
                  INSERT INTO harvest_task_queue \
-                     (queue_name, task_type, activity_name, activity_id, input, \
+                     (id, queue_name, task_type, activity_name, activity_id, input, \
                       state, priority, max_attempts, scheduled_at) \
                  VALUES ( \
-                     p_prefix || '-q-' || (i % p_queues), 'activity', p_activity, \
-                     gen_random_uuid(), '{}'::jsonb, 'PENDING', 0, 3, \
-                     NOW() - INTERVAL '1 second' \
-                 ) \
-                 RETURNING id INTO v_id; \
+                     rec.id, rec.queue_name, rec.task_type, rec.activity_name, \
+                     rec.activity_id, rec.input, rec.state, rec.priority, \
+                     rec.max_attempts, rec.scheduled_at \
+                 ); \
                  UPDATE harvest_task_queue \
                     SET sticky_worker_id = p_sticky_worker, \
                         sticky_until = NOW() + INTERVAL '24 hours', \
                         sticky_timeout = INTERVAL '24 hours' \
-                  WHERE id = v_id; \
+                  WHERE id = rec.id; \
                  COMMIT; \
              END LOOP; \
          END; \
@@ -3991,7 +4088,7 @@ async fn zz_capture_sticky_routing_claim_evidence() {
     )
     .execute(&mut proc_conn)
     .await
-    .expect("create the per-row sticky-routing seeding procedure");
+    .expect("create the per-row sticky-routing reseed-from-snapshot procedure");
     // Companion procedure for a fair `no-sticky` control -- the same
     // per-row-committed lifecycle, without the follow-up `UPDATE`. This
     // isolates exactly the incremental cost the sticky pin adds, not the
@@ -4072,43 +4169,21 @@ async fn zz_capture_sticky_routing_claim_evidence() {
 
         for label in ["no-sticky", "sticky-routing"] {
             if label == "sticky-routing" {
-                // Re-seed to match `queue::enqueue()`'s real per-task write
-                // lifecycle for an ordinary sticky-pinned activity: one
-                // `INSERT` (no sticky columns, no session_id), immediately
-                // followed by its own `UPDATE` setting `sticky_worker_id` /
-                // `sticky_until` / `sticky_timeout`. Each pair is its own
-                // committed transaction, matching what a fleet enqueueing N
-                // sticky-pinned tasks over time actually writes.
-                diesel::sql_query("TRUNCATE harvest_task_queue")
-                    .execute(&mut conn)
-                    .await
-                    .expect("truncate before the sticky-routing re-seed");
-                // Scoped to this connection, not `proc_conn`, which only ever
-                // creates the procedure. Each depth iteration opens a fresh
-                // connection, so this must be set again here.
-                diesel::sql_query("SET synchronous_commit = off")
-                    .execute(&mut conn)
-                    .await
-                    .expect("relax synchronous_commit for this seeding session only");
-                diesel::sql_query(format!(
-                    "CALL harvest_bench_seed_sticky_routing_rows( \
-                         '{}', {}, '{}', {worker_literal}, {} \
-                     )",
-                    db::BENCH_PREFIX,
-                    scenario.queues,
-                    db::BENCH_ACTIVITY,
-                    backlog,
-                ))
-                .execute(&mut conn)
-                .await
-                .expect(
-                    "seed the sticky-routing backlog via the per-row \
-                     INSERT-then-UPDATE procedure",
-                );
-                diesel::sql_query("ANALYZE harvest_task_queue")
-                    .execute(&mut conn)
-                    .await
-                    .expect("re-analyze after the sticky-routing re-seed");
+                // Re-seed FRESH, reusing the no-sticky seed's exact
+                // id/activity_id values (see
+                // `snapshot_seed_for_sticky_routing`), via
+                // `queue::enqueue()`'s real per-task write lifecycle for an
+                // ordinary sticky-pinned activity: one `INSERT` (no sticky
+                // columns, no session_id), immediately followed by its own
+                // `UPDATE` setting `sticky_worker_id` / `sticky_until` /
+                // `sticky_timeout`. Each pair is its own committed
+                // transaction, matching what a fleet enqueueing N
+                // sticky-pinned tasks over time actually writes. The
+                // no-sticky label's `EXPLAIN ANALYZE` above ran inside a
+                // rolled-back transaction, so its seeded rows are still
+                // exactly as `db::seed()` left them here.
+                snapshot_seed_for_sticky_routing(&mut conn).await;
+                reseed_from_sticky_routing_snapshot(&mut conn, &worker_literal).await;
             }
 
             // `EXPLAIN ANALYZE` really executes the statement, including the
@@ -4190,20 +4265,6 @@ async fn zz_capture_sticky_routing_claim_evidence() {
         let seeded = db::seed(&mut stats_conn, headline).await;
         let queues = db::queue_names(headline);
 
-        // Both labels re-seed `harvest_task_queue` via a per-row-committed
-        // procedure for the write-cost measurement below, for the same
-        // reason `zz_capture_worker_session_claim_evidence` does: comparing
-        // `db::seed()`'s bulk `INSERT` against a per-row `INSERT`+`UPDATE`
-        // pair would measure statement-granularity overhead, not the
-        // sticky-pin cost this page is about.
-        diesel::sql_query("TRUNCATE harvest_task_queue")
-            .execute(&mut stats_conn)
-            .await
-            .expect("truncate before the per-row re-seed");
-        diesel::sql_query("SET synchronous_commit = off")
-            .execute(&mut stats_conn)
-            .await
-            .expect("relax synchronous_commit for this seeding session only");
         // `pg_stat_statements.track` defaults to `top`. The `INSERT`/`UPDATE`
         // statements executed inside either procedure below, as opposed to
         // the top-level `CALL` itself, would never be recorded individually
@@ -4222,22 +4283,27 @@ async fn zz_capture_sticky_routing_claim_evidence() {
                  or grant SET on this parameter to the role it names",
             );
         if label == "sticky-routing" {
-            diesel::sql_query(format!(
-                "CALL harvest_bench_seed_sticky_routing_rows( \
-                     '{}', {}, '{}', {worker_literal}, {} \
-                 )",
-                db::BENCH_PREFIX,
-                headline.queues,
-                db::BENCH_ACTIVITY,
-                headline.backlog,
-            ))
-            .execute(&mut stats_conn)
-            .await
-            .expect(
-                "seed the headline sticky-routing backlog via the per-row \
-                 INSERT-then-UPDATE procedure",
-            );
+            // Reuses the `no-sticky` label's exact id/activity_id values
+            // (see `snapshot_seed_for_sticky_routing`), snapshotted at the
+            // end of that label's own iteration below onto a plain table
+            // this fresh connection can still see -- a `TEMP` table would
+            // not survive across the two labels' separate connections.
+            reseed_from_sticky_routing_snapshot(&mut stats_conn, &worker_literal).await;
         } else {
+            // Both labels re-seed `harvest_task_queue` via a per-row-committed
+            // procedure for the write-cost measurement below, for the same
+            // reason `zz_capture_worker_session_claim_evidence` does: comparing
+            // `db::seed()`'s bulk `INSERT` against a per-row `INSERT`+`UPDATE`
+            // pair would measure statement-granularity overhead, not the
+            // sticky-pin cost this page is about.
+            diesel::sql_query("TRUNCATE harvest_task_queue")
+                .execute(&mut stats_conn)
+                .await
+                .expect("truncate before the per-row re-seed");
+            diesel::sql_query("SET synchronous_commit = off")
+                .execute(&mut stats_conn)
+                .await
+                .expect("relax synchronous_commit for this seeding session only");
             diesel::sql_query(format!(
                 "CALL harvest_bench_seed_plain_rows('{}', {}, '{}', {})",
                 db::BENCH_PREFIX,
@@ -4251,11 +4317,19 @@ async fn zz_capture_sticky_routing_claim_evidence() {
                 "seed the headline no-sticky backlog via the per-row \
                  INSERT-only procedure",
             );
+            diesel::sql_query("ANALYZE harvest_task_queue")
+                .execute(&mut stats_conn)
+                .await
+                .expect("re-analyze before the stat-snapshot drain");
+            // Snapshot immediately after seeding, before the claim drain
+            // below mutates state -- the `sticky-routing` iteration that
+            // follows reuses these exact id/activity_id values instead of
+            // generating its own independently-random set. See
+            // `snapshot_seed_for_sticky_routing`'s doc comment for why this
+            // must be a plain table, not `TEMP`: each label iteration opens
+            // its OWN fresh connection via `db::connect()` above.
+            snapshot_seed_for_sticky_routing(&mut stats_conn).await;
         }
-        diesel::sql_query("ANALYZE harvest_task_queue")
-            .execute(&mut stats_conn)
-            .await
-            .expect("re-analyze before the stat-snapshot drain");
 
         // Drive the real claim path repeatedly so pg_stat_statements
         // accumulates real, attributed `calls`/buffer counters for the

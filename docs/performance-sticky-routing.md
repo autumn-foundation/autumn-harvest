@@ -15,9 +15,10 @@ issue #235) from the worker-sessions predicate that sits immediately below
 it in the same `candidate` CTE and always sets `sticky_worker_id` too.
 
 The headline result is the same shape as worker sessions': a real,
-moderate buffer cost at ordinary backlog depths -- **+18.9%** at 1,000 rows,
-**+32.9%** at the 10,000-row headline depth, corroborated by a real
-10,001-call production-shaped drain at **+21.5%** (same direction, same
+moderate buffer cost that **grows monotonically across every published
+backlog depth** -- **+18.9%** at 1,000 rows, **+32.9%** at the 10,000-row
+headline depth, **+36.2%** at 100,000 rows, corroborated by a real
+10,001-call production-shaped drain at **+18.3%** (same direction, same
 order of magnitude -- see [Measurement](#measurement)). The mechanism is the
 same one `docs/performance-worker-sessions.md` documents: row-width growth
 from populating previously-`NULL` columns, compounded by the MVCC cost of
@@ -25,12 +26,71 @@ from populating previously-`NULL` columns, compounded by the MVCC cost of
 There is no query-shape fix, because the `WHERE` clause already evaluates
 the predicate as a plain inline test on a row the scan reads regardless.
 
-At the largest tested depth (100,000 rows) the buffer count **reverses
-sign** -- sticky-routing reads *fewer* buffers than no-sticky, not more.
-This is not the same predicate-evaluation cost the smaller depths measure:
-it is a genuine plan-shape crossover, reported in full under
-[The 100,000-row crossover](#the-100000-row-crossover) rather than folded
-into the headline number.
+**An earlier revision of this page reported a plan-shape crossover at
+100,000 rows instead** (sticky-routing reading *fewer* buffers than
+no-sticky). Codex review on this page's own PR traced that to a seeding
+confound, not to `sticky_worker_id`: the two labels' primary-key and
+`activity_id` B-trees held independently-random values, and page-split
+noise from those OTHER indexes was large enough to flip which access path
+the planner preferred at that depth. See
+[Harness correction](#harness-correction-eliminating-a-seeding-confound)
+for the fix and the corrected capture, which shows both labels choosing the
+identical `Seq Scan` plan at every depth, including 100,000 rows.
+
+## Harness correction: eliminating a seeding confound
+
+The first committed capture seeded `no-sticky` and `sticky-routing` each
+with their own, independently-random `id`/`activity_id` UUIDs (`no-sticky`
+via `db::seed()`/`harvest_bench_seed_plain_rows`'s own `gen_random_uuid()`
+calls, `sticky-routing` via a since-removed `harvest_bench_seed_sticky_routing_rows`
+procedure that generated its own). Every claim is a non-HOT `UPDATE` that
+touches every applicable index on `harvest_task_queue` -- the primary key
+and `idx_harvest_tq_activity_id` unconditionally, not just the
+sticky-routing partial index. Codex review on this page's own PR pointed
+out that independently-random keys in those OTHER indexes' B-trees could
+add page-split/traversal noise of a similar size to the effect this page
+attributes to `sticky_worker_id` -- the exact confound
+`docs/performance-schedule-to-close.md` documents fixing for its own
+predicate on PR #1339. The first committed capture's 100,000-row plan-shape
+"crossover", described above, turned out to be a symptom of exactly this:
+reproduced with matched keys, both labels choose the identical `Seq Scan`
+at that depth.
+
+The fix follows `docs/performance-schedule-to-close.md`'s own two-part
+correction:
+
+1. **Snapshot the `no-sticky` control's exact seeded values.**
+   `snapshot_seed_for_sticky_routing` copies `id`, `activity_id`, and every
+   other seeded column out of `harvest_task_queue` into a plain (not
+   `TEMP`) table, numbered by `ROW_NUMBER() OVER (ORDER BY ctid)` --
+   physical insertion order, not the random primary key -- for the same
+   reason schedule_to_close's fix orders by `ctid`: ordering by `id` would
+   scramble the re-insert into a different physical order than the control
+   used.
+2. **Re-seed `sticky-routing` from that snapshot, not from fresh random
+   values.** `reseed_from_sticky_routing_snapshot` truncates
+   `harvest_task_queue` and calls a PL/pgSQL procedure
+   (`harvest_bench_reseed_sticky_from_snapshot`) that reads the snapshot in
+   `i` order and, per row, `INSERT`s it with its *exact* `id`/`activity_id`
+   from the control, then `UPDATE`s the sticky columns, then `COMMIT`s --
+   preserving both the exact indexed values and the interleaved
+   `INSERT`-then-`UPDATE`-then-`COMMIT` physical layout the original
+   procedure established.
+
+Unlike schedule_to_close's fix, this one must also survive the real-drain
+loop's cross-connection boundary: the per-depth `EXPLAIN` sweep seeds both
+labels on one shared connection, but the stat-snapshot loop opens a
+**fresh** `db::connect()` per label. A plain table, snapshotted at the end
+of the `no-sticky` label's own iteration, is visible to the `sticky-routing`
+label's later connection against the same database; a `TEMP` table would
+not have survived the boundary, the same problem schedule_to_close's second
+fix round addressed.
+
+The impact was real, not cosmetic: the 100,000-row `EXPLAIN` delta moved
+from **-65.9%** (a false plan-shape crossover) to **+36.2%** (the same
+monotonic-growth trend as the smaller depths), and the real-drain aggregate
+moved from +21.5% to +18.3%. Both remaining deltas are corroborating, not
+confounded -- see [Measurement](#measurement).
 
 ## Workload
 
@@ -57,14 +117,18 @@ identical in every other column:
   worker-sessions page gives: with no follow-up `UPDATE` ever run against
   these rows, batching the `INSERT` creates no dead-tuple asymmetry.
 - **`sticky-routing`** -- seeded per row via
-  `harvest_bench_seed_sticky_routing_rows` (`INSERT` with no sticky columns
-  and no `session_id`, `UPDATE` setting `sticky_worker_id` to the claiming
-  worker's own id / `sticky_until` to `NOW() + 24h` / `sticky_timeout` to
-  `24h`, `COMMIT`, repeat) -- the same interleaved, per-row-committed
-  procedure shape `zz_capture_worker_session_claim_evidence` established,
-  minus the `session_id` column. Setting `sticky_worker_id = $1` with a
-  future `sticky_until` makes the predicate evaluate `TRUE` for every row,
-  so the claimable row count is **identical** between the two labels (see
+  `harvest_bench_reseed_sticky_from_snapshot`, reusing the `no-sticky`
+  control's exact `id`/`activity_id` values in their original physical
+  insertion order (see
+  [Harness correction](#harness-correction-eliminating-a-seeding-confound)):
+  `INSERT` with no sticky columns and no `session_id`, `UPDATE` setting
+  `sticky_worker_id` to the claiming worker's own id / `sticky_until` to
+  `NOW() + 24h` / `sticky_timeout` to `24h`, `COMMIT`, repeat -- the same
+  interleaved, per-row-committed procedure shape
+  `zz_capture_worker_session_claim_evidence` established, minus the
+  `session_id` column. Setting `sticky_worker_id = $1` with a future
+  `sticky_until` makes the predicate evaluate `TRUE` for every row, so the
+  claimable row count is **identical** between the two labels (see
   [Equivalence](#equivalence)).
 
 Both states are captured for `EXPLAIN (ANALYZE, BUFFERS, VERBOSE, SETTINGS,
@@ -79,25 +143,37 @@ empty poll, each its own committed transaction, matching production).
 
 ## Plan
 
-At 1,000 and 10,000 rows the two plans are structurally identical -- same
-`Seq Scan` on `harvest_task_queue`, same in-memory `quicksort`, same CTE
-structure -- and differ only in buffer counts:
+At every published depth -- 1,000, 10,000, and 100,000 rows -- the two
+plans are structurally identical: same `Seq Scan` on `harvest_task_queue`,
+same join order, same CTE structure, and (at 100,000 rows) the same
+external-merge disk sort -- differing only in buffer counts:
 
 ```text
 backlog=10,000:
-no-sticky:       Seq Scan on harvest_task_queue  Buffers: shared hit=253  (actual rows=10000 loops=1)
-sticky-routing:  Seq Scan on harvest_task_queue  Buffers: shared hit=343  (actual rows=10000 loops=1)
+no-sticky:       Seq Scan on harvest_task_queue  Buffers: shared hit=244  (actual rows=10000 loops=1)
+sticky-routing:  Seq Scan on harvest_task_queue  Buffers: shared hit=334  (actual rows=10000 loops=1)
+
+backlog=100,000:
+no-sticky:       Seq Scan on harvest_task_queue  Buffers: shared hit=2440  (actual rows=100000 loops=1)
+sticky-routing:  Seq Scan on harvest_task_queue  Buffers: shared hit=3335  (actual rows=100000 loops=1)
 ```
 
-The `Seq Scan` node's own delta (253 -> 343, +90) accounts for the whole
-query's delta at this depth exactly (274 -> 364, +90) -- the entire cost is
+The `Seq Scan` node's own delta accounts for the whole query's delta at
+every depth almost exactly (10,000 rows: 244 -> 334, +90, against a
+whole-query delta of 274 -> 364, +90; 100,000 rows: 2440 -> 3335, +895,
+against a whole-query delta of 2473 -> 3368, +895) -- the entire cost is
 inside the scan reading physically more pages, the same signature
-`docs/performance-worker-sessions.md` documents. This rules out a plan-shape
-explanation at these two depths: `sticky_worker_id IS NULL OR ...` is a
-`Filter:` clause evaluated row-by-row during the scan, not a separate
-`SubPlan`/`InitPlan`.
+`docs/performance-worker-sessions.md` documents. This rules out a
+plan-shape explanation at any tested depth: `sticky_worker_id IS NULL OR
+...` is a `Filter:` clause evaluated row-by-row during the scan, not a
+separate `SubPlan`/`InitPlan`.
 
-At 100,000 rows this stops being true -- see below.
+The planner's own row-count *estimate* for this scan is exact for both
+labels at 100,000 rows (`rows=100000`, matching the actual count) -- unlike
+an earlier, confounded revision of this capture, where independently-random
+seed keys skewed `no-sticky`'s estimate to 68,360 against an actual
+100,000 and flipped its preferred access path to an `Index Scan`. See
+[Harness correction](#harness-correction-eliminating-a-seeding-confound).
 
 ## Measurement
 
@@ -112,60 +188,23 @@ read`) for `claim_task_query()`'s whole-query root node, `no-sticky` vs
 |---:|---:|---:|---:|---:|
 | 1,000 | 53 | 63 | +10 | +18.9% |
 | 10,000 (headline) | 274 | 364 | +90 | **+32.9%** |
-| 100,000 | 9,878 | 3,367 | -6,511 | **-65.9%** (plan-shape crossover, see below) |
+| 100,000 | 2,473 | 3,368 | +895 | **+36.2%** |
 
-The 1,000/10,000 delta grows with backlog size, consistent with a per-row
-storage effect that compounds with the number of rows touched -- the same
-signature `docs/performance-worker-sessions.md` reports for the analogous
-worker-session predicate (that page's own deltas: +20.8% / +40.9%). The
-100,000-row row is **not** a continuation of that trend; see the next
-section before citing it as one.
-
-### The 100,000-row crossover
-
-At 100,000 rows both labels' sort still spills to disk (`Sort Method:
-external merge Disk: 15280kB`, `temp read=495 written=1914` -- identical in
-both artifacts, confirming issue #1177's finding that this residual
-predicate defeats sort-elision regardless of the value tested against it,
-corroborated again here). What changes is the base access path the planner
-picks *underneath* that sort:
-
-```text
-no-sticky (100,000 rows):
-  Index Scan using idx_harvest_tq_poll on harvest_task_queue
-    (cost=0.29..1555627.18 rows=68360 width=192) (actual rows=100000 loops=1)
-    Buffers: shared hit=9845
-
-sticky-routing (100,000 rows):
-  Seq Scan on harvest_task_queue
-    (cost=0.00..2264834.00 rows=99990 width=197) (actual rows=100000 loops=1)
-    Buffers: shared hit=3334
-```
-
-Both scans return the true row count, 100,000, but the planner's own
-row-count *estimate* diverges sharply between the two queries: 68,360 for
-`no-sticky`'s `sticky_worker_id IS NULL` branch (a 31.6% underestimate) vs.
-99,990 for `sticky-routing`'s `sticky_worker_id = 'deadbeef-...'` branch (a
-near-exact estimate). `no-sticky`'s underestimate is what makes
-`idx_harvest_tq_poll` look cheap enough to prefer over a `Seq Scan` at this
-depth; the estimate for `sticky-routing` gives the optimizer no such reason,
-so it picks the plain `Seq Scan` (3,334 shared-hit buffers vs. the index
-path's 9,845). Whichever access path costs less at a given depth is what
-each query gets independently -- the two labels are not choosing between
-the same two options at the same cost, because the residual predicate
-changes the cardinality estimate feeding that choice.
-
-This is a real, `EXPLAIN`-documented plan-shape difference, not
-measurement noise -- but it is observed at exactly **one** of the three
-published `BACKLOG_SWEEP` depths, not the "≥3 data sizes" this persona's own
-rules require before treating a plan-shape change as a general finding
-rather than a fixture-specific coincidence. At 1,000 and 10,000 rows both
-labels choose `Seq Scan` (see [Plan](#plan)); the crossover to
-`idx_harvest_tq_poll` for `no-sticky` happens somewhere between 10,000 and
-100,000 rows, and this pass does not narrow that further. Reported here in
-full because it directly contradicts the 1,000/10,000 trend if skimmed
-without this section, not because it is a claim about sticky routing's cost
-at production scale.
+The delta grows monotonically with backlog size across all three published
+depths, consistent with a per-row storage effect that compounds with the
+number of rows touched -- the same signature `docs/performance-worker-sessions.md`
+reports for the analogous worker-session predicate (that page's own
+deltas: +20.8% / +40.9% / +45.9%). At 100,000 rows both labels' sort still
+spills to disk (`Sort Method: external merge Disk: 15280kB`, `temp
+read=495 written=1914` -- identical in both artifacts, confirming issue
+#1177's finding that this residual predicate defeats sort-elision
+regardless of the value tested against it, corroborated again here), but
+the access path underneath that sort is the identical `Seq Scan` for both
+labels -- see [Plan](#plan). An earlier, confounded revision of this
+capture reported a plan-shape crossover at this depth instead; see
+[Harness correction](#harness-correction-eliminating-a-seeding-confound)
+for why that was an artifact of the seeding fixture, not of
+`sticky_worker_id`.
 
 ### Corroboration: `pg_stat_statements` over the real claim-drain
 
@@ -181,10 +220,10 @@ rechecks `queue::claim_task()` also issues per claim:
 
 | state | calls | main query `shared_blks_hit` |
 |---|---:|---:|
-| no-sticky | 10,001 | 5,079,670 |
-| sticky-routing | 10,001 | 6,170,940 |
+| no-sticky | 10,001 | 5,201,282 |
+| sticky-routing | 10,001 | 6,150,622 |
 
-Aggregate delta: **+21.5%** -- the same direction and order of magnitude as
+Aggregate delta: **+18.3%** -- the same direction and order of magnitude as
 the single-first-claim 10,000-row finding (+32.9%), and smaller than
 worker-sessions' combined predicate delta (+29.0% aggregate) in the same
 direction a subset predicate should be: ordinary sticky routing alone is one
@@ -213,9 +252,9 @@ each label, both going through the same per-row-committed lifecycle
 | state | statement(s) | calls | `shared_blks_hit` |
 |---|---|---:|---:|
 | no-sticky | `INSERT` only | 10,000 | 137,982 |
-| sticky-routing | `INSERT` + `UPDATE` | 10,000 each | 138,492 + 218,658 = 357,150 |
+| sticky-routing | `INSERT` + `UPDATE` | 10,000 each | 138,486 + 218,701 = 357,187 |
 
-Delta: **+158.8%** to write the identical row count through the real
+Delta: **+158.9%** to write the identical row count through the real
 two-statement, per-row-committed lifecycle. As with worker sessions, three
 mechanisms compose this and this pass does not attribute the delta across
 them individually: a second statement per row, a second MVCC tuple version
@@ -232,7 +271,7 @@ The wider row's rewrite cost is not one-time: PostgreSQL creates a new
 tuple version on every subsequent `UPDATE` regardless of which columns that
 `UPDATE` touches, so a sticky-pinned row's extra width recurs on the
 claiming `UPDATE` inside `claim_task_query()`'s own `claimed` CTE (already
-folded into the [+21.5% aggregate figure](#corroboration-pg_stat_statements-over-the-real-claim-drain)
+folded into the [+18.3% aggregate figure](#corroboration-pg_stat_statements-over-the-real-claim-drain)
 above), and on any later heartbeat or retry `UPDATE` this pass does not
 measure.
 
@@ -247,7 +286,7 @@ inefficiency SQL can route around:
 
 - The predicate itself is a plain `Filter:` boolean test with no `SubPlan`
   or `InitPlan` to rewrite -- confirmed directly in the captured `EXPLAIN`
-  output at 1,000 and 10,000 rows, where the entire buffer delta lands
+  output at every tested depth, where the entire buffer delta lands
   inside the scan node itself (see [Plan](#plan)).
 - `docs/performance-worker-sessions.md` already surfaces the real
   optimization candidate here -- collapsing `queue::enqueue()`'s
@@ -257,11 +296,10 @@ inefficiency SQL can route around:
   sticky-pin caller, ordinary routing included, so changing its write path
   is shared write-plumbing work, not a query-shape fix. This page does not
   repeat that analysis; it applies unchanged.
-- The 100,000-row crossover ([above](#the-100000-row-crossover)) is a
-  statistics/cardinality-estimate effect on the *existing* plan choice, not
-  a defect a query rewrite fixes -- and it is observed at one depth, not the
-  three this persona's own rules require before treating a plan-shape
-  change as actionable.
+- Plan shape is stable across all three tested depths -- both labels choose
+  a plain `Seq Scan` at 1,000, 10,000, and 100,000 rows, with no crossover
+  to an `Index Scan` once the seeding confound is eliminated (see
+  [Harness correction](#harness-correction-eliminating-a-seeding-confound)).
 
 **Scope of this conclusion.** As with the worker-sessions and
 capability-labels pages, every measurement here is I/O-scoped (`EXPLAIN
@@ -270,10 +308,6 @@ measure CPU cost.
 
 ## Known limitations
 
-- **The 100,000-row plan-shape crossover is reported at one depth, not
-  three.** See [The 100,000-row crossover](#the-100000-row-crossover). Where
-  the crossover actually sits between 10,000 and 100,000 rows is not
-  narrowed by this pass.
 - **The seeding fixture assumes one activity enqueued per transaction; a
   real fan-out from one workflow decision does not.**
   `worker.rs::persist_scheduled_activities` wraps its entire per-decision
@@ -282,7 +316,7 @@ measure CPU cost.
   identical limitation, and its correction on what direction batching would
   move the write-side figure (unknown, not "at or above"), applies here
   unchanged -- this page does not re-run that analysis independently.
-- **The write-side `+158.8%` figure is not decomposed across its
+- **The write-side `+158.9%` figure is not decomposed across its
   contributing mechanisms** (statement count, MVCC tuple version, partial
   index maintenance), for the same reason `docs/performance-worker-sessions.md`
   does not decompose its own `+188.2%` figure: isolating each share needs a
@@ -304,7 +338,12 @@ measure CPU cost.
   TIMING OFF)` for each, drains the real 10,000-row headline scenario
   through `queue::claim_task()` at both states while snapshotting
   `pg_stat_statements`, and asserts claim-count equivalence against ground
-  truth as a correctness check.
+  truth as a correctness check. `snapshot_seed_for_sticky_routing` /
+  `reseed_from_sticky_routing_snapshot` (plus the server-side
+  `harvest_bench_reseed_sticky_from_snapshot` procedure) reuse the
+  `no-sticky` control's exact `id`/`activity_id` values for the
+  `sticky-routing` label -- see
+  [Harness correction](#harness-correction-eliminating-a-seeding-confound).
 - `docs/perf-artifacts/sticky-routing-claim-predicate/` -- the committed
   `EXPLAIN` captures, `pg_stat_statements` snapshots, and a
   `fixture-summary.txt` for both data states at all three depths.

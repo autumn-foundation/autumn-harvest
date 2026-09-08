@@ -355,8 +355,10 @@ only) -- this pass did not separately measure CPU cost.
   are always written together), so this is not resolvable from this capture
   alone. The two pages' figures are at least directionally consistent:
   sticky routing alone measures smaller than worker sessions' combined
-  figure at every comparable point (+18.9%/+32.9%/+21.5% vs. this page's
-  +20.8%/+40.9%/+29.0%), as expected for a subset predicate.
+  figure at every comparable point -- EXPLAIN buffer deltas across the same
+  three backlog depths, +18.9%/+32.9%/+36.2% vs. this page's own
+  +20.8%/+40.9%/+45.9%, and the real-drain aggregate, +18.3% vs. this
+  page's +29.0% -- as expected for a subset predicate.
 - **The seeding fixture assumes one activity enqueued per transaction; a
   real fan-out from one workflow decision does not.** A review finding
   (round 5) correctly caught that `worker.rs::persist_scheduled_activities`
