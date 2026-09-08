@@ -5545,6 +5545,27 @@ pub(crate) const fn single_pool_entrypoint_rejects(
     resolved_assignments > 1 && has_sharded_pool
 }
 
+/// Whether this worker may consume dispatch references (issue #1312).
+///
+/// A reference carries a task id and no connection. A worker that drains
+/// several shards cannot tell which pool holds the named row. A reference read
+/// on one shard would be claimed against another shard's database and always
+/// miss. Dispatch therefore needs a span of exactly one shard.
+///
+/// `Worker::new` applies the same rule. A core caller can still install the
+/// channel after construction, and the poll loop reads the process-global slot
+/// on every iteration. The loop decides once at run start and holds that
+/// decision, so a late install cannot widen the span. `shard` on
+/// [`crate::dispatch::DispatchHint`] carries the follow-up that lifts the
+/// limit.
+#[must_use]
+pub(crate) const fn dispatch_allowed_for_span(
+    shard_assignments: usize,
+    pool_shards: usize,
+) -> bool {
+    shard_assignments <= 1 && pool_shards <= 1
+}
+
 /// Whether a shard's poll loop may claim tasks, given that shard's pending
 /// fleet-registration state (issue #804, Codex round-54 P1).
 ///
@@ -11999,7 +12020,7 @@ async fn finalize_activity_completion(
         output: output.clone(),
     };
 
-    Box::pin(conn.transaction::<(), HarvestError, _>(async |conn| {
+    let result = Box::pin(conn.transaction::<(), HarvestError, _>(async |conn| {
         let output = output.clone();
         let history = lock_workflow_execution_and_load_history(conn, exec_id, codecs).await?;
         if pending_activity_id_for_task(&history.events, task, activity_name)?.is_none() {
@@ -12039,7 +12060,13 @@ async fn finalize_activity_completion(
         }
         queue::wake_workflow_task(conn, exec_id).await
     }))
-    .await
+    .await;
+
+    // Settle the dispatch hints this transaction raised (issue #1312). A
+    // committed transaction publishes them, because every row they name is now
+    // durable. A rolled-back transaction discards them, because it left no
+    // `PENDING` row for them to name.
+    crate::dispatch::settle_scope(result).await
 }
 
 async fn finalize_activity_failure(
@@ -12076,7 +12103,7 @@ async fn finalize_activity_failure(
     // `ActivityFailed` event (carrying `error_type`, `non_retryable`,
     // `details`) and the `WorkflowFailed` event that follows when the
     // workflow propagates the error.
-    Box::pin(conn.transaction::<(), HarvestError, _>(async |conn| {
+    let result = Box::pin(conn.transaction::<(), HarvestError, _>(async |conn| {
         let error = error.to_string();
         let history = lock_workflow_execution_and_load_history(conn, exec_id, codecs).await?;
         if pending_activity_id_for_task(&history.events, task, activity_name)?.is_none() {
@@ -12113,7 +12140,11 @@ async fn finalize_activity_failure(
         queue::fail_task(conn, task.id, &error).await?;
         queue::wake_workflow_task(conn, exec_id).await
     }))
-    .await
+    .await;
+
+    // Settle the dispatch hints this transaction raised (issue #1312), for the
+    // same reason as `finalize_activity_completion`.
+    crate::dispatch::settle_scope(result).await
 }
 
 /// Materialize any DUE `__child_timeout:` deadline timers into the parent's
@@ -13224,7 +13255,7 @@ async fn record_session_acquire_schedule_to_start_timeout(
     }
     .to_string();
 
-    Box::pin(conn.transaction::<(), HarvestError, _>(async |conn| {
+    let result = Box::pin(conn.transaction::<(), HarvestError, _>(async |conn| {
         let error = error.clone();
         let history = lock_workflow_execution_and_load_history(conn, exec_id, codecs).await?;
         let Some(state) = task_state_for_update(conn, task.id).await? else {
@@ -13248,7 +13279,11 @@ async fn record_session_acquire_schedule_to_start_timeout(
         queue::fail_task(conn, task.id, &error).await?;
         queue::wake_workflow_task(conn, exec_id).await
     }))
-    .await
+    .await;
+
+    // Settle the dispatch hints this transaction raised (issue #1312), for the
+    // same reason as `finalize_activity_completion`.
+    crate::dispatch::settle_scope(result).await
 }
 
 /// Handle the internal session-acquire activity (issue #606) -- see the
@@ -20279,6 +20314,11 @@ async fn process_workflow_task(
             // follow-up side effects have not fired yet. Convergence must still
             // hold: the completion-trigger outbox recovers un-fired triggers.
             crate::chaos_point!(WORKER_AFTER_OUTER_COMMIT);
+            // Publish the dispatch hints this cycle raised (issue #1312). The
+            // outer transaction has committed, so every row a hint names is
+            // durable. The nested `conn.transaction` calls inside the persist
+            // flow are SAVEPOINTs under it and deliberately do not flush.
+            crate::dispatch::flush_scope().await;
             // Only spawned now that the transaction above has committed (see
             // apply_race_loser_cancellations's doc comment) — spawning inside
             // the transaction closure could start a trigger workflow for a
@@ -23125,6 +23165,12 @@ pub struct Worker {
     /// Longest claim-to-dispatch permit-wait for the activity semaphore
     /// (issue #548). See `workflow_permit_wait_micros`.
     activity_permit_wait_micros: Option<Arc<AtomicU64>>,
+    /// Workflow references claimed through the channel that do not hold their
+    /// permit yet (issue #1312). See [`DispatchReservation`].
+    dispatch_reserved_workflow: Arc<AtomicUsize>,
+    /// Activity references claimed through the channel that do not hold their
+    /// permit yet (issue #1312). See [`DispatchReservation`].
+    dispatch_reserved_activity: Arc<AtomicUsize>,
     /// Set the first time `spawn_monitoring_tasks` runs to completion (issue
     /// #548 review). Guards against a hypothetical second invocation (e.g. a
     /// future caller wrapping `run`/`run_with_listener` in a retry loop)
@@ -23806,6 +23852,342 @@ fn multi_shard_listener_url(
         .map(|(_, url)| url.as_str())
 }
 
+// ---------------------------------------------------------------------------
+// Dispatch channel consume path (issue #1312)
+// ---------------------------------------------------------------------------
+
+/// Largest number of references one dispatch read asks for.
+const DISPATCH_READ_MAX: usize = 64;
+
+/// Shortest interval between two dispatch-channel error logs.
+const DISPATCH_ERROR_LOG_INTERVAL: Duration = Duration::from_secs(30);
+
+/// Number of short releases an absent row gets before the reference is acked.
+///
+/// A publish can beat its own transaction's commit, so a reference may name a
+/// row no reader can see yet. Three short releases cover that window; after
+/// them the row genuinely does not exist and the reference is dropped.
+const DISPATCH_ABSENT_ROW_RELEASES: u32 = 3;
+
+/// Delay for the release of a reference whose row is not visible yet.
+const DISPATCH_ABSENT_ROW_DELAY: Duration = Duration::from_millis(50);
+
+/// Number of short releases a parked workflow row gets before its reference is
+/// acked.
+///
+/// A `RUNNING` row with no `worker_id` is parked: a decision cycle finished and
+/// left the row waiting for a wake. A producer outside a buffering scope can
+/// publish a wake's hint before the wake commits. The reference can therefore
+/// arrive while the re-pend is still in flight. Three short releases cover that
+/// window. After them the row is parked with no wake behind it, and the
+/// reference is dropped.
+const DISPATCH_PARKED_ROW_RELEASES: u32 = 3;
+
+/// Cap on one dispatch-channel call other than a read (contract C4).
+///
+/// A channel that accepts a call and never answers must not stall the worker.
+/// An elapsed timeout reads as a channel error, so the caller takes the same
+/// path a returned error takes.
+const DISPATCH_CALL_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Run one channel call under [`DISPATCH_CALL_TIMEOUT`].
+async fn dispatch_call<T>(
+    call: impl std::future::Future<Output = HarvestResult<T>>,
+    what: &'static str,
+) -> HarvestResult<T> {
+    (tokio::time::timeout(DISPATCH_CALL_TIMEOUT, call).await).unwrap_or_else(|_| {
+        Err(HarvestError::Dispatch(format!(
+            "dispatch {what} did not answer within {DISPATCH_CALL_TIMEOUT:?}"
+        )))
+    })
+}
+
+/// How many references one read asks for (issue #1312).
+///
+/// The two pools have separate permits, and a workflow reference cannot start
+/// on an activity permit. `None` means both pools are full: a read now would
+/// hold references that nothing can start, so the caller sleeps instead.
+///
+/// The sum of the two is the bound. A read never asks for more than the worker
+/// can start, and it never floors to one when no permit is free.
+const fn dispatch_read_size(free_workflow: usize, free_activity: usize) -> Option<usize> {
+    let free = free_workflow.saturating_add(free_activity);
+    if free == 0 {
+        return None;
+    }
+    if free < DISPATCH_READ_MAX {
+        Some(free)
+    } else {
+        Some(DISPATCH_READ_MAX)
+    }
+}
+
+/// How far back [`DispatchLoopState::new`] sets its timers, so both read as
+/// elapsed against any interval a worker configures.
+const DISPATCH_TIMER_START_OFFSET: Duration = Duration::from_secs(3600);
+
+/// Ceiling for the degraded-mode cooldown (issue #1312).
+///
+/// The cooldown is how long a worker stays on the Postgres path before it
+/// probes the channel again. The cap bounds how long a recovered channel stays
+/// unused.
+const DISPATCH_DEGRADED_COOLDOWN_CAP: Duration = Duration::from_secs(30);
+
+/// The cooldown a worker takes after `failures` consecutive channel failures.
+///
+/// The first failure waits one poll interval. Each further failure doubles the
+/// wait, up to [`DISPATCH_DEGRADED_COOLDOWN_CAP`]. A dead channel therefore
+/// costs one probe every thirty seconds rather than one per iteration.
+fn degraded_cooldown(failures: u32, poll_interval: Duration) -> Duration {
+    let steps = failures.saturating_sub(1);
+    let factor = 1_u32.checked_shl(steps).unwrap_or(u32::MAX);
+    poll_interval
+        .checked_mul(factor)
+        .unwrap_or(DISPATCH_DEGRADED_COOLDOWN_CAP)
+        .min(DISPATCH_DEGRADED_COOLDOWN_CAP)
+}
+
+/// The degraded-mode window of one dispatch loop (issue #1312).
+///
+/// A channel error puts the worker on the Postgres claim path for a cooldown.
+/// The worker drains the backlog there at the Postgres rate, so a Redis outage
+/// costs throughput and not availability. Without the window the worker claims
+/// one row per failed read, and a read can take the poll interval plus the call
+/// timeout to fail.
+#[derive(Debug)]
+struct DispatchDegradation {
+    /// Consecutive channel failures since the last success.
+    failures: u32,
+    /// When the current cooldown started, and how long it runs.
+    started: Option<(std::time::Instant, Duration)>,
+}
+
+impl DispatchDegradation {
+    const fn new() -> Self {
+        Self {
+            failures: 0,
+            started: None,
+        }
+    }
+
+    /// Record a channel failure and open the cooldown it earns.
+    ///
+    /// Returns the cooldown, so the caller can log it.
+    fn record_failure(&mut self, poll_interval: Duration) -> Duration {
+        self.failures = self.failures.saturating_add(1);
+        let cooldown = degraded_cooldown(self.failures, poll_interval);
+        self.started = Some((std::time::Instant::now(), cooldown));
+        cooldown
+    }
+
+    /// Record a successful reference read, which closes the window.
+    ///
+    /// Only a read may close it. `maintain` and `publish` run on the general
+    /// connection, and `next` runs on the blocking read connection. A worker
+    /// whose read connection alone is unhealthy still completes maintenance
+    /// and publishes. If those calls cleared the window, every hung read would
+    /// open the minimum cooldown instead of the doubled one. An intermittently
+    /// idle worker would then pay one failed read per cycle.
+    const fn record_read_success(&mut self) {
+        self.failures = 0;
+        self.started = None;
+    }
+
+    /// True while the worker must stay on the Postgres claim path.
+    fn is_degraded(&self) -> bool {
+        self.started
+            .is_some_and(|(at, cooldown)| at.elapsed() < cooldown)
+    }
+}
+
+/// What one dispatch loop remembers between iterations.
+#[derive(Debug)]
+struct DispatchLoopState {
+    /// When the last maintenance pass ran.
+    maintained: std::time::Instant,
+    /// When the last reconcile sweep ran.
+    reconciled: std::time::Instant,
+    /// When a channel error was last logged, so a broken channel logs once per
+    /// interval instead of once per iteration.
+    error_logged: Option<std::time::Instant>,
+    /// Where the reconcile sweep stopped in each queue.
+    ///
+    /// A queue with no entry starts its next sweep at the top.
+    reconcile_cursors: std::collections::HashMap<String, crate::queue::DispatchCursor>,
+    /// The degraded-mode window for a failing channel.
+    degraded: DispatchDegradation,
+}
+
+impl DispatchLoopState {
+    fn new() -> Self {
+        // Both timers start elapsed, so the first iteration maintains and
+        // reconciles before it waits on the channel. A worker that starts
+        // against a channel with no references still finds the standing
+        // backlog immediately.
+        //
+        // `checked_sub` reads the timers back one hour. `Instant::now()` alone
+        // is not elapsed against any real interval, so the first maintenance
+        // pass and the first sweep would wait one interval each. A platform
+        // whose `Instant` epoch is younger than the offset returns `None`. The
+        // current instant is the correct fallback there. The first sweep is
+        // then one interval late rather than never.
+        let now = std::time::Instant::now();
+        let past = now.checked_sub(DISPATCH_TIMER_START_OFFSET).unwrap_or(now);
+        Self {
+            maintained: past,
+            reconciled: past,
+            error_logged: None,
+            reconcile_cursors: std::collections::HashMap::new(),
+            degraded: DispatchDegradation::new(),
+        }
+    }
+
+    /// True when `interval` has elapsed since `last`, which is then reset.
+    fn due(last: &mut std::time::Instant, interval: Duration) -> bool {
+        if last.elapsed() >= interval {
+            *last = std::time::Instant::now();
+            return true;
+        }
+        false
+    }
+
+    /// True when a channel error may be logged now.
+    fn may_log_error(&mut self) -> bool {
+        let now = std::time::Instant::now();
+        match self.error_logged {
+            Some(last) if now.duration_since(last) < DISPATCH_ERROR_LOG_INTERVAL => false,
+            _ => {
+                self.error_logged = Some(now);
+                true
+            }
+        }
+    }
+}
+
+/// One reference claimed through the channel that does not hold its permit yet.
+///
+/// A worker dispatches a claimed task by spawning it. The spawned task is what
+/// acquires the pool permit, so `available_permits` still counts that permit as
+/// free for a moment. Without this reservation the next read weighs the same
+/// free permit again. It then claims a second row the worker cannot start,
+/// which is the outcome the per-kind gate exists to stop.
+///
+/// The guard is created before the claim. It moves into the spawned task, which
+/// drops it as soon as it holds the permit. A claim that fails drops it at once.
+#[derive(Debug)]
+struct DispatchReservation(Arc<AtomicUsize>);
+
+impl DispatchReservation {
+    fn new(counter: &Arc<AtomicUsize>) -> Self {
+        counter.fetch_add(1, Ordering::Relaxed);
+        Self(Arc::clone(counter))
+    }
+}
+
+impl Drop for DispatchReservation {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
+/// Whether a reference of this kind may be claimed now (issue #1312).
+///
+/// The read is sized on the sum of both pools, and that is right. A read that
+/// asked for less would leave references no peer can see. The claim is not.
+/// A workflow row claimed with no free workflow permit sits `RUNNING` under
+/// this worker while it waits on the local semaphore. A peer with capacity
+/// cannot claim it. The reference goes back to the channel instead.
+///
+/// `None` is a reference of unknown type. It keeps the behaviour dispatch had
+/// before the kind existed, so an entry an older build wrote still runs.
+const fn dispatch_kind_admitted(
+    kind: Option<crate::dispatch::DispatchKind>,
+    free_workflow: usize,
+    free_activity: usize,
+) -> bool {
+    match kind {
+        Some(crate::dispatch::DispatchKind::Workflow) => free_workflow > 0,
+        Some(crate::dispatch::DispatchKind::Activity) => free_activity > 0,
+        None => true,
+    }
+}
+
+/// Where the next reconcile sweep of one queue starts (issue #1312).
+///
+/// A full page means rows may still sit below it, so the walk continues from
+/// `last`. A short page is the end of the queue, so the walk wraps to the top.
+/// Without the wrap the sweep would never see a row a later write puts above
+/// the cursor.
+///
+/// Split out from the sweep so the wrap rule is testable without a database.
+const fn next_reconcile_cursor(
+    page_len: usize,
+    batch: usize,
+    last: Option<crate::queue::DispatchCursor>,
+) -> Option<crate::queue::DispatchCursor> {
+    if page_len < batch { None } else { last }
+}
+
+/// What the worker does with one delivered reference.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReferenceOutcome {
+    /// The row is gone or is no longer claimable; ack the reference.
+    Ack,
+    /// The row is still claimable but gated; release with `delay`.
+    Release(Duration),
+}
+
+/// Decide what to do with a reference whose by-id claim returned `None`.
+///
+/// Split out from the loop so the outcome table in
+/// `docs/plans/2026-09-07-redis-dispatch-worker-integration.md` is testable
+/// without a database.
+fn reference_outcome(
+    probe: Option<&crate::queue::DispatchProbe>,
+    redeliveries: u32,
+    now: chrono::DateTime<chrono::Utc>,
+    settings: &crate::dispatch::DispatchSettings,
+) -> ReferenceOutcome {
+    let Some(probe) = probe else {
+        // Absent row. A publish can beat its own commit, so give the row a few
+        // short releases before dropping the reference.
+        if redeliveries < DISPATCH_ABSENT_ROW_RELEASES {
+            return ReferenceOutcome::Release(DISPATCH_ABSENT_ROW_DELAY);
+        }
+        return ReferenceOutcome::Ack;
+    };
+    if !probe.is_pending() {
+        // A parked workflow row is `RUNNING` with no owner. A wake for it may
+        // still be in flight, so hold the reference for a few short releases
+        // rather than drop it. See [`DISPATCH_PARKED_ROW_RELEASES`].
+        if probe.state == "RUNNING"
+            && !probe.has_worker
+            && redeliveries < DISPATCH_PARKED_ROW_RELEASES
+        {
+            return ReferenceOutcome::Release(DISPATCH_ABSENT_ROW_DELAY);
+        }
+        // `RUNNING` under a worker, or terminal. Another worker holds it, or it
+        // is finished.
+        return ReferenceOutcome::Ack;
+    }
+    if probe.scheduled_at > now {
+        // Not yet due. Hold the reference until the due time, so the channel
+        // parks it instead of cycling it once per poll.
+        let until = (probe.scheduled_at - now)
+            .to_std()
+            .unwrap_or(settings.release_backoff_cap);
+        return ReferenceOutcome::Release(until.min(settings.release_backoff_cap));
+    }
+    // Due but gated: a queue pause, a concurrency cap, a rate limit, sticky
+    // affinity, or any other claim gate. Back off so a held row does not cycle
+    // once per poll interval.
+    ReferenceOutcome::Release(crate::dispatch::release_delay(
+        redeliveries,
+        settings.poll_interval,
+        settings.release_backoff_cap,
+    ))
+}
+
 impl Worker {
     /// Create a new worker from validated config and a handler registry.
     ///
@@ -23855,6 +24237,45 @@ impl Worker {
         crate::builder::validate_activity_rate_limits(registry.activities.values())
             .map_err(|err| HarvestError::Config(err.to_string()))?;
 
+        // Redis dispatch is single-shard in v1 (issue #1312). The channel
+        // carries a task id and no connection. A worker that drains several
+        // shards cannot tell which pool holds the named row. A reference read
+        // on one shard would then be claimed against another shard's database
+        // and always miss. Reject the combination at startup rather than let
+        // it degrade to a silent no-claim loop. `shard` on `DispatchHint`
+        // carries the follow-up that lifts this limit.
+        if crate::dispatch::installed().is_some() {
+            let shard_count = config.shard_assignments.len();
+            #[cfg(feature = "db")]
+            let pool_shards = config
+                .sharded_pool
+                .as_ref()
+                .map_or(0, crate::shard::ShardedDbPool::len);
+            #[cfg(not(feature = "db"))]
+            let pool_shards = 0;
+            if !dispatch_allowed_for_span(shard_count, pool_shards) {
+                return Err(HarvestError::Config(format!(
+                    "a dispatch channel is installed and this worker spans \
+                     {shard_count} shard assignments and {pool_shards} sharded pool \
+                     entries; dispatch supports single-shard runtimes only in v1 \
+                     (issue #1312)"
+                )));
+            }
+
+            // A queue name the channel key space cannot carry (issue #1312).
+            // The channel rejects such a name on every call. This worker would
+            // live on the Postgres fallback for all of its queues, and say
+            // nothing about it. Fail at startup instead.
+            for queue in &config.queues {
+                crate::dispatch::validate_queue_name(queue).map_err(|reason| {
+                    HarvestError::Config(format!(
+                        "a dispatch channel is installed and this worker serves a queue it \
+                         cannot address: {reason}"
+                    ))
+                })?;
+            }
+        }
+
         let mut ineligible_activities = Vec::new();
         for activity in registry.activities.values() {
             if let Some(requires) = activity.requires {
@@ -23888,6 +24309,8 @@ impl Worker {
             activity_permit_total: activity_parts.permit_total,
             workflow_permit_wait_micros: workflow_parts.permit_wait_micros,
             activity_permit_wait_micros: activity_parts.permit_wait_micros,
+            dispatch_reserved_workflow: Arc::new(AtomicUsize::new(0)),
+            dispatch_reserved_activity: Arc::new(AtomicUsize::new(0)),
             monitoring_started: std::sync::atomic::AtomicBool::new(false),
             shutdown: CancellationToken::new(),
             remote_drain_deadline: Arc::new(Mutex::new(None)),
@@ -24727,8 +25150,31 @@ impl Worker {
             [shard, ..] => Some(*shard),
             [] => None,
         };
-        self.run_poll_loop(pool, poll_shard, listener, &registration_pending)
-            .await;
+
+        // Decide the dispatch span once, here, and hold it for the whole loop
+        // (issue #1312). `Worker::new` applies the same rule, but a core caller
+        // can install the channel after construction, and the loop reads the
+        // process-global slot on every iteration. Deciding per iteration would
+        // let such an install put a multi-shard worker on the dispatch path.
+        #[cfg(feature = "db")]
+        let pool_shards = self
+            .config
+            .sharded_pool
+            .as_ref()
+            .map_or(0, crate::shard::ShardedDbPool::len);
+        #[cfg(not(feature = "db"))]
+        let pool_shards = 0;
+        let dispatch_allowed =
+            dispatch_allowed_for_span(self.config.shard_assignments.len(), pool_shards);
+
+        self.run_poll_loop(
+            pool,
+            poll_shard,
+            listener,
+            &registration_pending,
+            dispatch_allowed,
+        )
+        .await;
 
         tracing::info!(worker_id = %self.config.worker_id, "shutdown signal received");
 
@@ -25440,13 +25886,469 @@ impl Worker {
         )
     }
 
+    /// Run one dispatch-channel iteration (issue #1312).
+    ///
+    /// Reads up to the free concurrency in references. Claims each named row
+    /// with the full claim predicate. Acks or releases the reference by the
+    /// outcome table in [`reference_outcome`]. Maintenance and the reconcile
+    /// sweep run on their own intervals from here.
+    ///
+    /// Returns `true` when at least one task was dispatched.
+    ///
+    /// On a channel error it enters degraded mode. The worker then drains
+    /// through [`Self::drain_postgres`] until the cooldown elapses. Availability
+    /// equals the Postgres path while the channel is unreachable.
+    async fn run_dispatch_iteration(
+        &self,
+        pool: &DbPool,
+        shard: Option<crate::types::ShardId>,
+        installed: &crate::dispatch::InstalledDispatch,
+        state: &mut DispatchLoopState,
+    ) -> bool {
+        let settings = &installed.settings;
+
+        // Degraded mode (issue #1312). The channel failed recently, so this
+        // iteration does not touch it. A channel call that fails costs the poll
+        // interval plus the call timeout, and one claim per such call is far
+        // below the Postgres rate. The cooldown expires on its own, and the
+        // next iteration probes the channel again.
+        if state.degraded.is_degraded() {
+            return self.drain_postgres(pool, shard).await;
+        }
+
+        // A maintenance success does not clear the degraded window. Only a
+        // successful reference read does. See
+        // [`DispatchDegradation::record_read_success`].
+        if DispatchLoopState::due(&mut state.maintained, settings.poll_interval)
+            && let Err(error) = dispatch_call(
+                installed.channel.maintain(&self.config.queues),
+                "maintenance",
+            )
+            .await
+        {
+            self.enter_degraded(state, &error, "dispatch maintenance failed", settings);
+            return self.drain_postgres(pool, shard).await;
+        }
+
+        if DispatchLoopState::due(&mut state.reconciled, settings.reconcile_interval)
+            && !self.run_dispatch_reconcile(pool, installed, state).await
+        {
+            return self.drain_postgres(pool, shard).await;
+        }
+
+        // One read sized to the free permits of each pool, so the worker never
+        // holds more references than it can start. The semaphores gate
+        // execution, not claiming, so this is a bound and not a guarantee.
+        let Some(want) = dispatch_read_size(
+            self.workflow_semaphore.available_permits(),
+            self.activity_semaphore.available_permits(),
+        ) else {
+            // Both pools are full. A reference read now would sit in this
+            // worker's hands until a permit frees, which keeps it from a peer
+            // that has one. Sleep one poll interval instead.
+            tokio::select! {
+                () = self.shutdown.cancelled() => {}
+                () = tokio::time::sleep(self.config.poll_interval) => {}
+            }
+            return false;
+        };
+
+        // The read blocks for `poll_interval` by contract, so its cap is that
+        // wait plus the call timeout (contract C4). The shutdown arm gives a
+        // stopping worker its exit without waiting out the read.
+        let read = tokio::select! {
+            () = self.shutdown.cancelled() => return false,
+            result = tokio::time::timeout(
+                settings.poll_interval + DISPATCH_CALL_TIMEOUT,
+                installed.channel.next(
+                    &self.config.queues,
+                    &self.config.worker_id,
+                    want,
+                    settings.poll_interval,
+                ),
+            ) => result,
+        };
+
+        let leases = match read {
+            Ok(Ok(leases)) => {
+                state.degraded.record_read_success();
+                leases
+            }
+            Ok(Err(error)) => {
+                self.enter_degraded(state, &error, "dispatch read failed", settings);
+                return self.drain_postgres(pool, shard).await;
+            }
+            Err(_) => {
+                let error = HarvestError::Dispatch(format!(
+                    "dispatch read did not answer within {:?}",
+                    settings.poll_interval + DISPATCH_CALL_TIMEOUT
+                ));
+                self.enter_degraded(state, &error, "dispatch read timed out", settings);
+                return self.drain_postgres(pool, shard).await;
+            }
+        };
+
+        let mut dispatched = false;
+        for lease in leases {
+            if self.shutdown.is_cancelled() {
+                // Give the reference straight back so a peer serves it now.
+                let _ = dispatch_call(installed.channel.release(&lease, Duration::ZERO), "release")
+                    .await;
+                continue;
+            }
+            if !dispatch_kind_admitted(
+                lease.kind,
+                Self::free_permits(&self.workflow_semaphore, &self.dispatch_reserved_workflow),
+                Self::free_permits(&self.activity_semaphore, &self.dispatch_reserved_activity),
+            ) {
+                // No permit for this pool. Give the reference straight back, so
+                // a peer with capacity reads it on its next poll.
+                let _ = dispatch_call(installed.channel.release(&lease, Duration::ZERO), "release")
+                    .await;
+                continue;
+            }
+            // The reservation is taken before the claim and lives until the
+            // spawned task holds its permit. See [`DispatchReservation`].
+            let reservation = match lease.kind {
+                Some(crate::dispatch::DispatchKind::Workflow) => {
+                    Some(DispatchReservation::new(&self.dispatch_reserved_workflow))
+                }
+                Some(crate::dispatch::DispatchKind::Activity) => {
+                    Some(DispatchReservation::new(&self.dispatch_reserved_activity))
+                }
+                None => None,
+            };
+            dispatched |= self
+                .consume_reference(pool, shard, installed, state, lease, reservation)
+                .await;
+        }
+        dispatched
+    }
+
+    /// Permits of one pool that no claimed reference has spoken for yet.
+    fn free_permits(semaphore: &tokio::sync::Semaphore, reserved: &Arc<AtomicUsize>) -> usize {
+        // Fully qualified: diesel's blanket `RunQueryDsl::load` is in scope here
+        // and shadows the inherent `AtomicUsize::load` through the `Arc` deref.
+        semaphore
+            .available_permits()
+            .saturating_sub(AtomicUsize::load(reserved, Ordering::Relaxed))
+    }
+
+    /// Drain the backlog through the Postgres claim path (issue #1312).
+    ///
+    /// This is the ordinary poll loop, one iteration of it: claim until the
+    /// backlog is empty, then wait one poll interval. A degraded worker
+    /// therefore claims at the Postgres rate, not at one row per failed channel
+    /// call. A channel call that fails can cost the poll interval plus the call
+    /// timeout. One claim per call is a throughput collapse, not a fallback.
+    ///
+    /// Returns `true` when at least one task was dispatched.
+    async fn drain_postgres(&self, pool: &DbPool, shard: Option<crate::types::ShardId>) -> bool {
+        let mut dispatched = false;
+        while !self.shutdown.is_cancelled() {
+            if !self
+                .poll_once(
+                    pool,
+                    shard_acquire_bound(false, self.config.poll_interval),
+                    shard,
+                )
+                .await
+            {
+                break;
+            }
+            dispatched = true;
+        }
+        tokio::select! {
+            () = self.shutdown.cancelled() => {}
+            () = tokio::time::sleep(self.config.poll_interval) => {}
+        }
+        dispatched
+    }
+
+    /// Log a channel error and open the degraded-mode cooldown it earns.
+    fn enter_degraded(
+        &self,
+        state: &mut DispatchLoopState,
+        error: &HarvestError,
+        message: &'static str,
+        settings: &crate::dispatch::DispatchSettings,
+    ) {
+        let cooldown = state.degraded.record_failure(settings.poll_interval);
+        if state.may_log_error() {
+            tracing::warn!(
+                worker_id = %self.config.worker_id,
+                error = %error,
+                cooldown_ms = cooldown.as_millis(),
+                "{message}; claiming through postgres until the cooldown elapses"
+            );
+        }
+    }
+
+    /// Claim the row one reference names, then ack or release the reference.
+    ///
+    /// Returns `true` when the row was claimed and dispatched.
+    ///
+    /// One reference is disposed of per call. [`crate::dispatch::TaskDispatch`]
+    /// takes one lease per `ack` and per `release`, so a batched disposal for
+    /// the whole read would need a trait change. That is a follow-up, not a
+    /// change this path can make on its own.
+    async fn consume_reference(
+        &self,
+        pool: &DbPool,
+        shard: Option<crate::types::ShardId>,
+        installed: &crate::dispatch::InstalledDispatch,
+        state: &mut DispatchLoopState,
+        lease: crate::dispatch::DispatchLease,
+        reservation: Option<DispatchReservation>,
+    ) -> bool {
+        let mut conn = match acquire_shard_conn(
+            pool,
+            shard_acquire_bound(false, self.config.poll_interval),
+        )
+        .await
+        {
+            Ok(conn) => conn,
+            Err(error) => {
+                tracing::warn!(error = %error, "failed to get connection for a dispatch reference");
+                // The pool is unavailable, not the row, so give the reference
+                // straight back and let the next iteration try again.
+                self.retry_reference(installed, &lease).await;
+                return false;
+            }
+        };
+
+        let circuit_breakers = self.registry.circuit_breakers();
+        let claimed = queue::claim_task_by_id_on_shard(
+            &mut conn,
+            lease.task_id,
+            &self.config.queues,
+            &self.config.worker_id,
+            &self.config.build_id,
+            self.config.priority_aging_secs,
+            circuit_breakers.tracked_activity_names(),
+            &self.ineligible_activities,
+            shard,
+        )
+        .await;
+
+        match claimed {
+            Ok(Some(task)) => {
+                // The claim has committed and the row is `RUNNING` under this
+                // worker. A crash here leaves the reference in the channel's
+                // pending list; recovery redelivers it, the row reads
+                // `RUNNING`, and the redelivered reference is acked.
+                //
+                // The pool connection goes back before the ack. The ack is a
+                // round trip to the channel. Holding a connection across it
+                // would keep one connection busy per in-flight reference, for a
+                // call the database has no part in (issue #1312 review).
+                drop(conn);
+                chaos_point!(DISPATCH_AFTER_CLAIM_BEFORE_ACK);
+                if let Err(error) = dispatch_call(installed.channel.ack(&lease), "ack").await {
+                    // The claim is durable either way. A failed ack costs one
+                    // redelivery, which finds the row `RUNNING` and acks.
+                    self.log_dispatch_error(state, &error, "dispatch ack failed after a claim");
+                }
+                tracing::debug!(
+                    task_id = %task.id,
+                    task_type = %task.task_type,
+                    queue = %task.queue_name,
+                    "claimed task (dispatch)"
+                );
+                self.dispatch_task(task, pool, reservation);
+                true
+            }
+            Ok(None) => {
+                let probe = match queue::dispatch_probe(&mut conn, lease.task_id).await {
+                    Ok(probe) => probe,
+                    Err(error) => {
+                        tracing::warn!(error = %error, task_id = %lease.task_id, "dispatch probe failed");
+                        drop(conn);
+                        self.retry_reference(installed, &lease).await;
+                        return false;
+                    }
+                };
+                let outcome = reference_outcome(
+                    probe.as_ref(),
+                    lease.redeliveries,
+                    chrono::Utc::now(),
+                    &installed.settings,
+                );
+                // Same reason as the claimed arm: the disposal is a channel
+                // round trip, so the connection goes back first.
+                drop(conn);
+                let result = match outcome {
+                    ReferenceOutcome::Ack => {
+                        dispatch_call(installed.channel.ack(&lease), "ack").await
+                    }
+                    ReferenceOutcome::Release(delay) => {
+                        dispatch_call(installed.channel.release(&lease, delay), "release").await
+                    }
+                };
+                if let Err(error) = result {
+                    self.log_dispatch_error(state, &error, "dispatch reference disposal failed");
+                }
+                false
+            }
+            Err(error) => {
+                tracing::error!(error = %error, task_id = %lease.task_id, "failed to claim a dispatched task");
+                drop(conn);
+                self.retry_reference(installed, &lease).await;
+                false
+            }
+        }
+    }
+
+    /// Republish one page of due `PENDING` rows for this worker's queues.
+    ///
+    /// This sweep is the channel's durability floor. A channel restart, a lost
+    /// reference, a dropped hint, or a crash between commit and publish all
+    /// converge through it.
+    ///
+    /// The sweep walks each queue with a keyset cursor rather than re-reading
+    /// the top page (issue #1312). The sweep cannot see most claim gates, so a
+    /// page of rows every worker rejects looks claimable to it. Re-reading that
+    /// page would hide every claimable row below it for as long as the gate
+    /// holds. See [`crate::queue::due_dispatch_hints_after_query`].
+    ///
+    /// Returns `false` when a channel call failed, so the caller can enter
+    /// degraded mode. A database failure returns `true`: the database is not
+    /// the channel, and the Postgres claim path cannot help with it.
+    async fn run_dispatch_reconcile(
+        &self,
+        pool: &DbPool,
+        installed: &crate::dispatch::InstalledDispatch,
+        state: &mut DispatchLoopState,
+    ) -> bool {
+        let mut conn = match acquire_shard_conn(
+            pool,
+            shard_acquire_bound(false, self.config.poll_interval),
+        )
+        .await
+        {
+            Ok(conn) => conn,
+            Err(error) => {
+                tracing::warn!(error = %error, "failed to get connection for the dispatch reconcile sweep");
+                return true;
+            }
+        };
+
+        let batch = installed.settings.reconcile_batch;
+        let mut hints = Vec::new();
+        // The cursors are applied after every queue is read, so a read failure
+        // part way through leaves the walk where it was.
+        let mut walked: Vec<(String, Option<crate::queue::DispatchCursor>)> = Vec::new();
+        for queue in &self.config.queues {
+            let after = state.reconcile_cursors.get(queue).cloned();
+            let page = match queue::due_dispatch_hints_page(&mut conn, queue, batch, after.as_ref())
+                .await
+            {
+                Ok(page) => page,
+                Err(error) => {
+                    tracing::warn!(error = %error, queue = %queue, "dispatch reconcile read failed");
+                    return true;
+                }
+            };
+            walked.push((
+                queue.clone(),
+                next_reconcile_cursor(page.hints.len(), batch, page.cursor),
+            ));
+            hints.extend(page.hints);
+        }
+        for (queue, cursor) in walked {
+            match cursor {
+                Some(cursor) => state.reconcile_cursors.insert(queue, cursor),
+                None => state.reconcile_cursors.remove(&queue),
+            };
+        }
+
+        // The throttle metrics ride on this sweep. The Postgres poll path
+        // emits them from an idle `poll_once`, which the dispatch path never
+        // runs. Without this the series would go dark under dispatch. The
+        // sweep already holds a connection and runs once per reconcile
+        // interval, so this costs one read per interval rather than one per
+        // poll.
+        self.emit_throttle_metrics(&mut conn).await;
+
+        if hints.is_empty() {
+            return true;
+        }
+        // The connection goes back before the publish: the publish is a channel
+        // round trip that the database has no part in.
+        drop(conn);
+        if let Err(error) =
+            dispatch_call(installed.channel.publish(&hints), "reconcile publish").await
+        {
+            self.enter_degraded(
+                state,
+                &error,
+                "dispatch reconcile publish failed",
+                &installed.settings,
+            );
+            return false;
+        }
+        // A publish success does not clear the degraded window either. The
+        // read path owns that window, and the publish runs on the general
+        // connection.
+        true
+    }
+
+    /// Give a reference back after a local failure, so the next iteration
+    /// retries it.
+    ///
+    /// The delay is one poll interval rather than the exponential backoff: the
+    /// row was never judged, so this is not evidence that it is gated.
+    async fn retry_reference(
+        &self,
+        installed: &crate::dispatch::InstalledDispatch,
+        lease: &crate::dispatch::DispatchLease,
+    ) {
+        let _ = dispatch_call(
+            installed.channel.release(lease, self.config.poll_interval),
+            "release",
+        )
+        .await;
+    }
+
+    /// Log a channel error at most once per [`DISPATCH_ERROR_LOG_INTERVAL`].
+    ///
+    /// A channel that is down fails on every iteration, so an unthrottled log
+    /// would bury the rest of the worker's output.
+    fn log_dispatch_error(
+        &self,
+        state: &mut DispatchLoopState,
+        error: &HarvestError,
+        message: &'static str,
+    ) {
+        if state.may_log_error() {
+            tracing::warn!(
+                worker_id = %self.config.worker_id,
+                error = %error,
+                "{message}"
+            );
+        }
+    }
+
+    /// The single-pool poll loop.
+    ///
+    /// `dispatch_allowed` is the run-start decision of
+    /// [`dispatch_allowed_for_span`]. The multi-shard loop
+    /// (`run_poll_loop_multi`) has no dispatch branch at all, so every loop
+    /// `run_multi_shard` starts is on the Postgres path by construction.
     async fn run_poll_loop(
         &self,
         pool: &DbPool,
         shard: Option<crate::types::ShardId>,
         mut listener: Option<crate::notify::QueueListener>,
         registration_pending: &AtomicBool,
+        dispatch_allowed: bool,
     ) {
+        // Dispatch-channel state for this loop (issue #1312). All three are
+        // inert when no channel is installed.
+        let mut dispatch_state = DispatchLoopState::new();
+        // A channel this loop refuses is logged once, not once per iteration.
+        let mut dispatch_refusal_logged = false;
+
         while !self.shutdown.is_cancelled() {
             // Do not claim while this pool's registration is unverified: an
             // unregistered worker is invisible to peers' capability evidence AND
@@ -25459,6 +26361,43 @@ impl Worker {
                     () = tokio::time::sleep(self.config.poll_interval) => {}
                 }
                 continue;
+            }
+
+            // Dispatch channel (issue #1312). A reference names a row; the
+            // by-id claim applies the full claim predicate to it. The
+            // LISTEN/NOTIFY listener below is left alone: an extra wake is
+            // harmless and it keeps the fallback path warm.
+            //
+            // Configured queue weights (issue #515) do not apply to a
+            // reference read. The channel decides delivery order, and the
+            // reconcile sweep publishes in `(priority DESC, scheduled_at ASC)`
+            // order, so priority is best effort under dispatch. The weighted
+            // permutation still governs the `poll_once` fallback.
+            if let Some(installed) = crate::dispatch::installed() {
+                if dispatch_allowed {
+                    if self
+                        .run_dispatch_iteration(pool, shard, &installed, &mut dispatch_state)
+                        .await
+                        && let Some(shard) = shard
+                    {
+                        self.registry
+                            .telemetry()
+                            .metrics
+                            .record_shard_dispatched(shard_metric_label(shard));
+                    }
+                    continue;
+                }
+                drop(installed);
+                if !dispatch_refusal_logged {
+                    dispatch_refusal_logged = true;
+                    tracing::error!(
+                        worker_id = %self.config.worker_id,
+                        shard_assignments = self.config.shard_assignments.len(),
+                        "a dispatch channel is installed but this worker spans more than one \
+                         shard; dispatch supports single-shard runtimes only in v1 (issue \
+                         #1312). This worker claims through postgres"
+                    );
+                }
             }
 
             if self
@@ -26006,7 +26945,7 @@ impl Worker {
                             queue = %task.queue_name,
                             "claimed task (weighted)"
                         );
-                        self.dispatch_task(task, pool);
+                        self.dispatch_task(task, pool, None);
                         return true;
                     }
                     Ok(None) => {
@@ -26058,7 +26997,7 @@ impl Worker {
                 // exactly the capacity bottleneck the SLI is meant to page on.
                 // `schedule_to_start_secs` measures from task eligibility, so that
                 // permit wait is still captured in the recorded sample.
-                self.dispatch_task(task, pool);
+                self.dispatch_task(task, pool, None);
                 true
             }
             Ok(None) => {
@@ -26074,7 +27013,12 @@ impl Worker {
 
     /// Spawn a bounded Tokio task for the claimed work item.
     #[allow(clippy::too_many_lines)]
-    fn dispatch_task(&self, task: TaskQueueItem, pool: &DbPool) {
+    fn dispatch_task(
+        &self,
+        task: TaskQueueItem,
+        pool: &DbPool,
+        reservation: Option<DispatchReservation>,
+    ) {
         // Debug-only tripwire (issue #548 review): dispatch must never race
         // ahead of `spawn_monitoring_tasks`, which withholds a tuned
         // semaphore's permits down to the operator's initial target. A
@@ -26177,12 +27121,20 @@ impl Worker {
         // clock skew never leaks into the sample (issue #501 review).
         let dispatched_at = std::time::Instant::now();
 
-        tokio::spawn(async move {
+        // The task body is bound rather than spawned directly so it can run
+        // inside a dispatch buffering scope (issue #1312). Binding keeps the
+        // body at the same nesting, so this change adds no reindentation to
+        // the hottest file in the repo.
+        let task_body = async move {
             // Acquire semaphore permit — blocks if at concurrency limit.
             let Ok(permit) = semaphore.acquire().await else {
                 tracing::error!(task_id = %task_id, "semaphore closed");
                 return;
             };
+            // The permit is held, so the reference no longer needs a
+            // reservation against it (issue #1312). The early return above
+            // drops it too, so a closed semaphore cannot leak one.
+            drop(reservation);
 
             // Feed the adaptive slot tuner's permit-wait signal (issue #548).
             // A lock-free fetch_max so concurrent dispatches never contend;
@@ -26433,6 +27385,25 @@ impl Worker {
                         "task execution failed"
                     );
                 }
+            }
+        };
+        tokio::spawn(async move {
+            // Every hint this task raises waits in the scope until the
+            // transaction that raised it commits and a flush point publishes
+            // it. This is the catch-all for a hint no flush point reached.
+            // A hint left by a rolled-back transaction names a row that is not
+            // `PENDING`. A reader probes such a row and acks the reference.
+            // The settle points on the two activity-finalize transactions drop
+            // those hints before they get this far.
+            //
+            // A deployment with no channel runs the body directly. The scope
+            // would allocate a buffer and one boxed future per task for hints
+            // that no hook ever raises, so the Postgres-only path skips it.
+            if crate::dispatch::is_installed() {
+                let ((), hints) = Box::pin(crate::dispatch::buffered(task_body)).await;
+                crate::dispatch::publish_now(hints).await;
+            } else {
+                task_body.await;
             }
         });
     }
@@ -26997,6 +27968,9 @@ pub async fn reset_timed_out_workflow_task(pool: &DbPool, task_id: uuid::Uuid, w
     .await
     {
         Ok(n) if n > 0 => {
+            // Dispatch hint (issue #1312). The row is `PENDING` again with no
+            // owner, so the channel gets a reference to it.
+            crate::queue::record_pending_hints(&mut conn, &[task_id]).await;
             tracing::debug!(
                 task_id = %task_id,
                 worker_id = %worker_id,
@@ -37028,5 +38002,372 @@ mod tests {
             matches!(report.status, crate::testing::ReplayStatus::ReplaySucceeded),
             "a failing cycle's own persisted history must replay cleanly: {report}"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // Dispatch reference outcome table (issue #1312)
+    // -----------------------------------------------------------------------
+
+    fn dispatch_settings() -> crate::dispatch::DispatchSettings {
+        crate::dispatch::DispatchSettings {
+            poll_interval: Duration::from_millis(20),
+            reconcile_interval: Duration::from_secs(1),
+            reconcile_batch: 100,
+            release_backoff_cap: Duration::from_secs(30),
+        }
+    }
+
+    fn probe(
+        state: &str,
+        scheduled_at: chrono::DateTime<chrono::Utc>,
+    ) -> crate::queue::DispatchProbe {
+        crate::queue::DispatchProbe {
+            state: state.to_string(),
+            scheduled_at,
+            has_worker: state == "RUNNING",
+        }
+    }
+
+    #[test]
+    fn a_due_gated_row_is_released_with_a_growing_delay() {
+        let settings = dispatch_settings();
+        let now = chrono::Utc::now();
+        let due = probe("PENDING", now - chrono::Duration::seconds(1));
+
+        assert_eq!(
+            reference_outcome(Some(&due), 0, now, &settings),
+            ReferenceOutcome::Release(Duration::from_millis(20))
+        );
+        assert_eq!(
+            reference_outcome(Some(&due), 3, now, &settings),
+            ReferenceOutcome::Release(Duration::from_millis(160))
+        );
+        assert_eq!(
+            reference_outcome(Some(&due), 40, now, &settings),
+            ReferenceOutcome::Release(settings.release_backoff_cap)
+        );
+    }
+
+    #[test]
+    fn a_row_that_is_not_due_yet_is_held_until_its_due_time() {
+        let settings = dispatch_settings();
+        let now = chrono::Utc::now();
+        let later = probe("PENDING", now + chrono::Duration::milliseconds(500));
+
+        assert_eq!(
+            reference_outcome(Some(&later), 0, now, &settings),
+            ReferenceOutcome::Release(Duration::from_millis(500))
+        );
+    }
+
+    #[test]
+    fn a_far_future_row_is_held_no_longer_than_the_backoff_cap() {
+        let settings = dispatch_settings();
+        let now = chrono::Utc::now();
+        let far = probe("PENDING", now + chrono::Duration::days(7));
+
+        assert_eq!(
+            reference_outcome(Some(&far), 0, now, &settings),
+            ReferenceOutcome::Release(settings.release_backoff_cap)
+        );
+    }
+
+    #[test]
+    fn a_running_or_terminal_row_is_acked() {
+        let settings = dispatch_settings();
+        let now = chrono::Utc::now();
+        for state in ["RUNNING", "COMPLETED", "FAILED", "CANCELLED"] {
+            assert_eq!(
+                reference_outcome(Some(&probe(state, now)), 0, now, &settings),
+                ReferenceOutcome::Ack,
+                "a {state} row must be acked"
+            );
+        }
+    }
+
+    #[test]
+    fn a_parked_workflow_row_gets_three_short_releases_and_is_then_acked() {
+        let settings = dispatch_settings();
+        let now = chrono::Utc::now();
+        let parked = crate::queue::DispatchProbe {
+            state: "RUNNING".to_string(),
+            scheduled_at: now,
+            has_worker: false,
+        };
+
+        for redeliveries in 0..DISPATCH_PARKED_ROW_RELEASES {
+            assert_eq!(
+                reference_outcome(Some(&parked), redeliveries, now, &settings),
+                ReferenceOutcome::Release(DISPATCH_ABSENT_ROW_DELAY),
+                "a wake may be in flight against a parked row"
+            );
+        }
+        assert_eq!(
+            reference_outcome(Some(&parked), DISPATCH_PARKED_ROW_RELEASES, now, &settings),
+            ReferenceOutcome::Ack,
+            "a row still parked after the grace releases has no wake in flight"
+        );
+    }
+
+    #[test]
+    fn a_read_is_sized_to_the_free_permits_of_both_pools() {
+        assert_eq!(dispatch_read_size(0, 0), None, "no permit means no read");
+        assert_eq!(dispatch_read_size(1, 0), Some(1));
+        assert_eq!(dispatch_read_size(0, 1), Some(1));
+        assert_eq!(dispatch_read_size(2, 3), Some(5));
+        assert_eq!(
+            dispatch_read_size(1_000, 1_000),
+            Some(DISPATCH_READ_MAX),
+            "a read never asks for more than the cap"
+        );
+    }
+
+    #[test]
+    fn an_absent_row_gets_three_short_releases_and_is_then_acked() {
+        let settings = dispatch_settings();
+        let now = chrono::Utc::now();
+
+        for redeliveries in 0..DISPATCH_ABSENT_ROW_RELEASES {
+            assert_eq!(
+                reference_outcome(None, redeliveries, now, &settings),
+                ReferenceOutcome::Release(DISPATCH_ABSENT_ROW_DELAY),
+                "an uncommitted insert must get a short release"
+            );
+        }
+        assert_eq!(
+            reference_outcome(None, DISPATCH_ABSENT_ROW_RELEASES, now, &settings),
+            ReferenceOutcome::Ack,
+            "a row that is still absent after the grace releases is gone"
+        );
+    }
+
+    #[test]
+    fn the_dispatch_error_log_is_rate_limited() {
+        let mut state = DispatchLoopState::new();
+        assert!(state.may_log_error(), "the first error is always logged");
+        assert!(
+            !state.may_log_error(),
+            "a second error inside the interval is suppressed"
+        );
+    }
+
+    #[test]
+    fn the_dispatch_loop_maintains_and_reconciles_on_its_first_iteration() {
+        // Real intervals, not `Duration::ZERO`. A timer that starts at the
+        // current instant is due against a zero interval whatever it holds. A
+        // zero interval therefore proves nothing.
+        let mut state = DispatchLoopState::new();
+        assert!(
+            DispatchLoopState::due(&mut state.maintained, Duration::from_millis(20)),
+            "the first iteration must maintain before it waits"
+        );
+        assert!(
+            DispatchLoopState::due(&mut state.reconciled, Duration::from_secs(1)),
+            "the first iteration must reconcile before it waits"
+        );
+        assert!(
+            !DispatchLoopState::due(&mut state.maintained, Duration::from_secs(3600)),
+            "a timer that has not elapsed is not due"
+        );
+        assert!(
+            !DispatchLoopState::due(&mut state.reconciled, Duration::from_secs(3600)),
+            "a reset timer is not due again inside its interval"
+        );
+    }
+
+    /// A reference names the pool it needs (issue #1312). A worker claims it
+    /// only when that pool has a free permit.
+    ///
+    /// Sizing the read on the sum of both pools is right. A read that asked for
+    /// less would leave references a peer cannot see. Claiming on the sum is
+    /// not. A workflow row claimed with no workflow permit blocks on this
+    /// worker's semaphore while a peer with capacity cannot claim it.
+    #[test]
+    fn a_reference_claims_only_against_its_own_pool() {
+        use crate::dispatch::DispatchKind;
+        assert!(dispatch_kind_admitted(Some(DispatchKind::Workflow), 1, 0));
+        assert!(
+            !dispatch_kind_admitted(Some(DispatchKind::Workflow), 0, 64),
+            "a free activity permit cannot start a workflow row"
+        );
+        assert!(dispatch_kind_admitted(Some(DispatchKind::Activity), 0, 1));
+        assert!(
+            !dispatch_kind_admitted(Some(DispatchKind::Activity), 64, 0),
+            "a free workflow permit cannot start an activity row"
+        );
+        assert!(
+            dispatch_kind_admitted(None, 0, 0),
+            "an untyped reference keeps the behaviour it had before the kind existed"
+        );
+    }
+
+    /// A channel installed after the
+    /// worker was built must not put a multi-shard loop on the dispatch path.
+    #[test]
+    fn dispatch_is_allowed_only_on_a_single_shard_span() {
+        assert!(dispatch_allowed_for_span(1, 1), "one shard, one pool");
+        assert!(
+            dispatch_allowed_for_span(1, 0),
+            "one shard, no sharded pool"
+        );
+        assert!(dispatch_allowed_for_span(0, 0), "no shard identity at all");
+        assert!(
+            !dispatch_allowed_for_span(2, 0),
+            "two shard assignments cannot resolve a reference to a pool"
+        );
+        assert!(
+            !dispatch_allowed_for_span(1, 2),
+            "two pooled shards cannot resolve a reference to a pool"
+        );
+        assert!(!dispatch_allowed_for_span(4, 4), "a wide worker is refused");
+    }
+
+    /// A full page means the walk may
+    /// have more rows below it, so the next sweep continues from the cursor.
+    #[test]
+    fn a_full_reconcile_page_keeps_the_cursor() {
+        let cursor = crate::queue::DispatchCursor {
+            priority: 5,
+            scheduled_at: chrono::Utc::now(),
+            id: uuid::Uuid::new_v4(),
+        };
+        assert_eq!(
+            next_reconcile_cursor(1000, 1000, Some(cursor.clone())),
+            Some(cursor),
+            "a full page must leave the walk where it stopped"
+        );
+    }
+
+    /// A short page is the end of the queue, so the walk wraps to the top.
+    /// Without the wrap a later write above the cursor is never swept.
+    #[test]
+    fn a_short_reconcile_page_wraps_the_cursor() {
+        let cursor = crate::queue::DispatchCursor {
+            priority: 5,
+            scheduled_at: chrono::Utc::now(),
+            id: uuid::Uuid::new_v4(),
+        };
+        assert_eq!(
+            next_reconcile_cursor(3, 1000, Some(cursor)),
+            None,
+            "a short page must wrap the walk to the top of the queue"
+        );
+        assert_eq!(
+            next_reconcile_cursor(0, 1000, None),
+            None,
+            "an empty page must wrap the walk to the top of the queue"
+        );
+    }
+
+    /// The cooldown starts at the
+    /// poll interval, doubles per consecutive failure and stops at the cap.
+    #[test]
+    fn the_degraded_cooldown_doubles_and_then_caps() {
+        let base = Duration::from_millis(100);
+        assert_eq!(degraded_cooldown(1, base), Duration::from_millis(100));
+        assert_eq!(degraded_cooldown(2, base), Duration::from_millis(200));
+        assert_eq!(degraded_cooldown(3, base), Duration::from_millis(400));
+        assert_eq!(degraded_cooldown(4, base), Duration::from_millis(800));
+        assert_eq!(
+            degraded_cooldown(64, base),
+            DISPATCH_DEGRADED_COOLDOWN_CAP,
+            "a long outage must not grow the cooldown without bound"
+        );
+        assert_eq!(
+            degraded_cooldown(0, base),
+            base,
+            "the schedule starts at the poll interval"
+        );
+    }
+
+    /// A worker enters degraded mode on a channel failure and leaves it on the
+    /// first successful reference read.
+    #[test]
+    fn a_successful_read_clears_the_degraded_window() {
+        let base = Duration::from_secs(5);
+        let mut degraded = DispatchDegradation::new();
+        assert!(
+            !degraded.is_degraded(),
+            "a fresh worker is not in degraded mode"
+        );
+
+        assert_eq!(degraded.record_failure(base), base);
+        assert!(degraded.is_degraded(), "a channel failure opens the window");
+        assert_eq!(
+            degraded.record_failure(base),
+            base * 2,
+            "a second consecutive failure doubles the cooldown"
+        );
+
+        degraded.record_read_success();
+        assert!(
+            !degraded.is_degraded(),
+            "a successful reference read closes the window"
+        );
+        assert_eq!(
+            degraded.record_failure(base),
+            base,
+            "the schedule restarts at the poll interval after a successful read"
+        );
+    }
+
+    /// A healthy maintenance call must not shrink the cooldown of a failing
+    /// read path (issue #1312).
+    ///
+    /// `maintain` and `publish` run on the general connection. `next` runs on
+    /// the blocking read connection. Only the read connection can be
+    /// unhealthy, so a success on the other two proves nothing about the read
+    /// path. If either cleared the window, every hung read would open the
+    /// minimum cooldown, and an idle worker would spend one failed read per
+    /// cycle.
+    #[test]
+    fn a_successful_maintenance_call_does_not_shrink_the_cooldown() {
+        let base = Duration::from_secs(5);
+        let mut degraded = DispatchDegradation::new();
+
+        assert_eq!(degraded.record_failure(base), base, "the first failed read");
+        // The worker runs a successful maintenance pass here. The window
+        // tracks the health of the read path only. A maintenance success
+        // therefore leaves the failure counter alone.
+        assert_eq!(
+            degraded.record_failure(base),
+            base * 2,
+            "the second failed read doubles the cooldown across a healthy maintenance pass"
+        );
+    }
+
+    /// A cooldown that has run out lets the next iteration probe the channel.
+    #[test]
+    fn an_elapsed_cooldown_leaves_degraded_mode() {
+        let mut degraded = DispatchDegradation::new();
+        degraded.record_failure(Duration::ZERO);
+        assert!(
+            !degraded.is_degraded(),
+            "a cooldown of zero is elapsed at once, so the next iteration probes the channel"
+        );
+    }
+
+    #[cfg(feature = "testing")]
+    #[test]
+    fn the_sharded_runtime_rejection_reads_as_one_sentence() {
+        let registry = Arc::new(HandlerRegistry::new(vec![], vec![]));
+        let channel = Arc::new(crate::dispatch::MemoryDispatch::new());
+        crate::dispatch::install(
+            channel as Arc<dyn crate::dispatch::TaskDispatch>,
+            crate::dispatch::DispatchSettings::default(),
+        );
+        let config = WorkerRuntimeConfig {
+            shard_assignments: vec![crate::types::ShardId::new(0), crate::types::ShardId::new(1)],
+            ..default_runtime_config()
+        };
+        let error = Worker::new(config, registry).expect_err("multi-shard must be rejected");
+        crate::dispatch::uninstall();
+
+        let message = error.to_string();
+        assert!(
+            !message.contains("  "),
+            "the rejection message has a run of spaces: {message}"
+        );
+        assert!(message.contains("single-shard runtimes only"), "{message}");
     }
 }

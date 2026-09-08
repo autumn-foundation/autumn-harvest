@@ -39,7 +39,7 @@ are implemented. First-class Saga compensation is implemented through the
 
 Autumn Harvest is a workflow orchestration engine that combines Airflow's DAG scheduling model with Temporal's durable execution guarantees, implemented natively in Rust as a companion to the Autumn web framework. It provides code-as-workflow definitions through proc macros, Postgres-backed persistence using the same diesel-async + deadpool stack as Autumn, and production-grade features including sharding, retries, timeouts, heartbeats, signals, and queries.
 
-The core thesis: workflows should be defined in Rust with the same ergonomics as Autumn routes and tasks, scheduled like Airflow DAGs, and executed with Temporal's durability guarantees — all without requiring external brokers like Redis, RabbitMQ, or a separate Temporal server. Postgres is the only infrastructure dependency.
+The core thesis: workflows should be defined in Rust with the same ergonomics as Autumn routes and tasks, scheduled like Airflow DAGs, and executed with Temporal's durability guarantees — all without requiring external brokers like Redis, RabbitMQ, or a separate Temporal server. Postgres is the only *required* infrastructure dependency. An optional Redis dispatch channel raises the claim rate on a saturated queue; it is off by default and adds no guarantee Postgres does not already provide (§9.1).
 
 ---
 
@@ -1014,7 +1014,11 @@ Autumn Harvest uses Postgres as the task queue. No external broker (Redis, Rabbi
 
 **Measured, not targeted.** The "~10,000 tasks/second" framing above described a target, not a measurement, and the measured claim path falls well short of it: `docs/performance.md` publishes 640 claims/sec at an 8-concurrent-claimer / 1,000-row-backlog scenario on a 4-core reference machine, falling to 29/sec at a 10,000-row backlog. The bottleneck is a documented, partially-fixed structural query-plan defect (a non-indexable `ORDER BY` forcing a full sequential scan and sort per claim), not a flat ops/sec wall — see that page for the detail and the fixes already landed.
 
-**When Postgres is not enough:** an optional `autumn-harvest-redis` adapter crate exists (see `autumn-harvest-redis/`) that uses Redis Streams for the task queue while keeping Postgres for history and state — an escape hatch, not the default path. Its standalone throughput has been measured (docs/assays/0001-redis-adapter-throughput-ceiling.md), and the founding ">10,000 tasks/second, reliably sustained" claim looks achievable, not refuted: draining a 1,000-entry backlog with 8 claim-only workers averaged 12,004 claims/sec across three runs. That number is *not* a matched comparison against the Postgres figure above — two attempts at matching the workload shape (queue topology, drain fraction, backlog depth held roughly constant) both turned out to miss how `docs/performance.md`'s own harness actually works, so no multiplier is reported. A narrower, artificially-constrained sub-question this assay separately posed — an always-near-empty queue at exactly 8 concurrent workers — did miss 10,000/sec (~8,760 mean); see the report for why that is not the same finding. More importantly, **the adapter is not yet wired into the worker** (`autumn-harvest-redis/src/lib.rs` documents the required transactional-boundary refactor as unbuilt), so it cannot be turned on by an operator today regardless of throughput.
+**When Postgres is not enough:** the optional `autumn-harvest-redis` crate supplies a Redis Streams **dispatch channel**, wired into the worker by issue #1312. Postgres stays the source of truth. Every `harvest_task_queue` row, every claim gate, and the whole history write path are unchanged. The channel carries only a small reference to a claimable row: task id, queue, and due time. A worker reads a reference, claims the named row in Postgres with the full existing claim predicate, and then acks the reference. The claim commit is the only Postgres write the reference exists to trigger, so the ack follows that commit immediately. A reconcile sweep republishes due `PENDING` rows on a fixed interval. That sweep is the durability floor: a lost reference, a dropped hint, and a Redis restart all converge through it. When Redis is unreachable the worker falls back to the Postgres claim path for that iteration, so availability equals the Postgres-only path. That fallback covers the running state, not boot: a configured URL that cannot connect fails startup in every mode, with an error naming the endpoint. Turn the channel on with `[harvest.redis] url` and the `redis` cargo feature of `autumn-harvest-plugin`. Leave the URL unset and nothing changes. See [`docs/operations/redis-dispatch.md`](operations/redis-dispatch.md).
+
+**v1 limits.** Single-shard runtimes only: `HarvestRunner::start` rejects a configured URL before it installs the channel when the runtime resolves more than one shard pool, and `Worker::new` repeats the check. Config validation cannot enforce this, because it does not see the resolved pool. One Redis instance only: the keys carry no Cluster hash tags. This release carries no TLS transport: a `rediss://` URL is rejected at startup (issue #1429 tracks TLS), and a plain `redis://` URL sends the password in cleartext. Priority order and sticky affinity degrade to best effort, because a stream delivers in publish order and only the reconcile sweep publishes in priority order.
+
+**Numbers, and what they do not yet say.** The *standalone* adapter throughput is measured in [`docs/assays/0001-redis-adapter-throughput-ceiling.md`](assays/0001-redis-adapter-throughput-ceiling.md): draining a 1,000-entry backlog with 8 claim-only workers averaged 12,004 claims/sec across three runs. That number is *not* a matched comparison against the Postgres figure above — two attempts at matching the workload shape (queue topology, drain fraction, backlog depth held roughly constant) both turned out to miss how `docs/performance.md`'s own harness actually works, so no multiplier is reported. A narrower, artificially-constrained sub-question that assay separately posed — an always-near-empty queue at exactly 8 concurrent workers — did miss 10,000/sec (~8,760 mean); see the report for why that is not the same finding. Neither figure measures the wired path, which also pays a Postgres claim per reference. The deployment-shaped number is now measured in [`docs/assays/0008-redis-dispatch-integrated-throughput.md`](assays/0008-redis-dispatch-integrated-throughput.md): the integrated path sustained a mean **173.04 completed tasks/sec** draining a 10,000-workflow backlog on the four-core reference machine, where the same worker pool on the Postgres claim path completed **zero** task rows in the same window. That assay is a **kill** on the founding line. Redis dispatch delivers a large measured multiplier over the Postgres path at a deep backlog, not 10,000 tasks/sec, and its dispatch-latency p99 at that pace (426.96 ms) misses the assay's 250 ms line as well.
 
 ### 9.2 Queue Semantics
 
@@ -1418,7 +1422,17 @@ require_shard_readiness = false  # default: false — when true, `/health` retur
 
 [harvest.startup]
 orphaned_workflows = "warn"   # "off" | "warn" | "fail" — default: warn
+
+[harvest.redis]
+url = "redis://cache:6379"        # unset by default — unset means Redis dispatch is off
+key_prefix = "harvest"            # default: harvest — prefix for every key the channel owns
+consumer_group = "harvest_workers" # default: harvest_workers — the Redis Streams consumer group the workers join
+visibility_timeout_ms = 60000     # default: 60000 — how long a delivered reference may stay unacked before recovery
+poll_interval_ms = 20             # default: 20 — blocking read wait when the channel is idle
+reconcile_interval_ms = 1000      # default: 1000 — interval of the reconcile sweep over due PENDING rows
 ```
+
+Setting `harvest.redis.url` needs the `redis` cargo feature of `autumn-harvest-plugin`. A build without that feature carries no channel implementation, so it rejects the URL at load rather than ignoring it. Validation also rejects an empty `key_prefix` or `consumer_group`, a `poll_interval_ms` outside 1 to 5000, and a `visibility_timeout_ms` below 1000. See [`docs/operations/redis-dispatch.md`](operations/redis-dispatch.md).
 
 **Not part of this schema.** Sharding (`ShardedDbPool`, `HarvestRunnerResources::with_sharded_pool`) and per-worker queue/capability routing (`WorkerConfig::with_shard_assignments`, task-queue labels) are configured through the Rust builder API, not TOML or env vars — see [`docs/sharding.md`](sharding.md) and [`docs/getting-started/09-worker-routing.md`](getting-started/09-worker-routing.md). History retention is configured via `HarvestBuilder::retention(RetentionConfig { .. })`, also Rust-only (§13.4 above). The management API's mount path is chosen by the embedder via `HarvestPlugin::api` (or `api_with_auth`/`api_with_role_auth` for an authenticated mount), not a config key.
 
@@ -1439,6 +1453,12 @@ AUTUMN_HARVEST_BATCH__CONCURRENCY=32
 AUTUMN_HARVEST_BATCH__TICK_INTERVAL_MS=500
 AUTUMN_HARVEST_READINESS__REQUIRE_SHARD_READINESS=true
 AUTUMN_HARVEST_STARTUP__ORPHANED_WORKFLOWS=fail
+AUTUMN_HARVEST_REDIS__URL=redis://cache:6379
+AUTUMN_HARVEST_REDIS__KEY_PREFIX=harvest
+AUTUMN_HARVEST_REDIS__CONSUMER_GROUP=harvest_workers
+AUTUMN_HARVEST_REDIS__VISIBILITY_TIMEOUT_MS=60000
+AUTUMN_HARVEST_REDIS__POLL_INTERVAL_MS=20
+AUTUMN_HARVEST_REDIS__RECONCILE_INTERVAL_MS=1000
 ```
 
 Profile-specific overrides work the same way, in a profile-named file:
@@ -1670,7 +1690,7 @@ The foundation. After this phase, you can define and execute workflows and activ
 - Child workflow support (`ctx.spawn_child_workflow`)
 - Continue-as-new (for infinite-running workflows)
 - Workflow versioning (handle code changes across running workflows)
-- Optional Redis-backed task queue adapter (`autumn-harvest-redis`)
+- Optional Redis dispatch channel (`autumn-harvest-redis`), wired into the worker by issue #1312
 - Cron workflow schedules (recurring workflows without the DAG model)
 - Batch operations (start/signal/cancel many workflows at once)
 - Workflow search with custom attributes and SQL-like query syntax
@@ -1685,8 +1705,8 @@ The foundation. After this phase, you can define and execute workflows and activ
 | Workflow definition | SDK code (Go, Java, Python, TS) | Python DAGs | Rust proc macros |
 | Scheduling | Timer-based in workflow | Cron/timetable on DAGs | Both (timers in workflows + cron on DAGs) |
 | Persistence | Postgres/MySQL/Cassandra | Postgres/MySQL | Postgres only |
-| Task queue | gRPC-based, in-memory + DB | Celery/K8s/Local executor | Postgres-backed (SKIP LOCKED + LISTEN/NOTIFY) |
-| External broker | None (built into server) | Redis/RabbitMQ (for Celery) | None (Postgres only) |
+| Task queue | gRPC-based, in-memory + DB | Celery/K8s/Local executor | Postgres-backed (SKIP LOCKED + LISTEN/NOTIFY), with an optional Redis dispatch channel in front of it |
+| External broker | None (built into server) | Redis/RabbitMQ (for Celery) | None by default; optional Redis for dispatch only, never for state |
 | Infrastructure | Separate Temporal server | Separate Airflow server | Embedded in application |
 | Sharding | Hash-based, immutable count | None (DB-level only) | Hash-based, immutable count |
 | Signals/Queries | Yes | No (XCom for task data) | Yes |

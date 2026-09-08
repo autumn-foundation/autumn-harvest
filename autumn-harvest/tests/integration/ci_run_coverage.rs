@@ -71,6 +71,12 @@ const CORE_MOD_RS: &str = include_str!("mod.rs");
 ///     `webhook_receiver_integration`, and `webhook_durable_integration` evaded
 ///     classification entirely (fail-open). Broadened here so they are caught.
 ///
+/// A third family calls a *shared* fixture helper instead of building the
+/// container itself: `integration_e2e::setup_test_database_url` and
+/// `setup_test_database_url_or_env`. The caller carries none of the tokens
+/// above, so the caller was fail-open. The two helper names are tokens as
+/// well, which classifies every caller of the shared fixture.
+///
 /// Matching is against comment-stripped code only (see [`strip_line_comments`]):
 /// several genuinely no-DB HTTP tests reference their sibling `testcontainers`
 /// suite in `//!` prose, and the deliberately env-gated `status_summary_localpg`
@@ -85,6 +91,8 @@ const LIVE_DB_TOKENS: &[&str] = &[
     "run_pending(",
     "TestDb",
     "testcontainers",
+    "setup_test_database_url(",
+    "setup_test_database_url_or_env(",
 ];
 
 /// Drop whole-line comments (`//`, `///`, `//!`) so container tokens that
@@ -110,9 +118,15 @@ fn needs_live_db(source: &str) -> bool {
 /// credited as covering it (the target must be allowlisted instead). Counts
 /// `#[ignore]` against the total test count; a file with no tests is not
 /// "all-ignored".
+///
+/// The count is taken over comment-stripped code (see [`strip_line_comments`]).
+/// A module doc comment can name an `#[ignore]`d case in prose. Such prose
+/// would otherwise inflate the ignored count above the real test count, and a
+/// suite with live cases would read as running nothing.
 fn all_tests_ignored(source: &str) -> bool {
-    let tests = source.matches("#[tokio::test").count() + source.matches("#[test]").count();
-    let ignored = source.matches("#[ignore").count();
+    let code = strip_line_comments(source);
+    let tests = code.matches("#[tokio::test").count() + code.matches("#[test]").count();
+    let ignored = code.matches("#[ignore").count();
     tests > 0 && ignored >= tests
 }
 
@@ -304,7 +318,7 @@ fn allowlisted(key: &str) -> bool {
 struct SuiteRow {
     /// `linux` | `linuxpart` | `allos` | `compileonly`.
     osclass: String,
-    /// `autumn-harvest` | `autumn-harvest-plugin`.
+    /// `autumn-harvest` | `autumn-harvest-plugin` | `autumn-harvest-redis`.
     krate: String,
     /// The `--test <target>` binary (core suites use `integration`).
     target: String,
@@ -357,7 +371,11 @@ fn parse_manifest() -> Vec<SuiteRow> {
     // would never match a coverage lookup. Reject either as a typo.
     // extend this set when a new crate/osclass is introduced.
     const VALID_OSCLASS: &[&str] = &["linux", "linuxpart", "allos", "compileonly"];
-    const VALID_CRATE: &[&str] = &["autumn-harvest", "autumn-harvest-plugin"];
+    const VALID_CRATE: &[&str] = &[
+        "autumn-harvest",
+        "autumn-harvest-plugin",
+        "autumn-harvest-redis",
+    ];
     let mut out = Vec::new();
     for (n, line) in MANIFEST.lines().enumerate() {
         let t = line.trim();
@@ -676,6 +694,29 @@ fn paved_path_db_tests_are_classified_and_flagged_all_ignored() {
             "{stem}: all its tests are #[ignore]d — a run could not execute it"
         );
     }
+}
+
+#[test]
+fn shared_fixture_callers_are_classified_as_db_gated() {
+    let dir = core_integration_dir();
+    // These suites build no container of their own. They call the shared
+    // `integration_e2e` fixture, so only the helper name identifies them.
+    for stem in ["dispatch_tests", "ctx_info_tests"] {
+        let src = read_source(&dir.join(format!("{stem}.rs")));
+        assert!(
+            needs_live_db(&src),
+            "{stem} calls the shared database fixture and must classify as DB-gated"
+        );
+    }
+}
+
+#[test]
+fn all_tests_ignored_counts_code_and_not_prose() {
+    let source = "//! - [`zz_evidence`] -- `#[ignore]`d prose.\n                  #[tokio::test]\nasync fn live() {}\n                  #[tokio::test]\n#[ignore = \"slow\"]\nasync fn evidence() {}\n";
+    assert!(
+        !all_tests_ignored(source),
+        "a doc comment that names an ignored case must not hide the live case"
+    );
 }
 
 #[test]

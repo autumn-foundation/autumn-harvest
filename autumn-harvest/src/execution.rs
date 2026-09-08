@@ -1521,8 +1521,19 @@ pub async fn start_or_load_workflow_execution(
     // Top-level caller (`in_outer_transaction = false`): if a TerminateIfRunning
     // pre-check cancellation commits and the replacement start then fails, the
     // collect fn spawns the cancellation's follow-ups itself before returning Err.
-    let (result, deferred_starts, deferred_checks, _cancel_metrics) =
-        start_or_load_workflow_execution_collect(conn, request, false, false, None, gate).await?;
+    // The start writes a `PENDING` task row, so it raises a dispatch hint
+    // (issue #1312). Buffer it here and publish after the call returns: this is
+    // the self-owned transaction path, so the row is durable by then.
+    //
+    // `Box::pin` keeps this future off the caller's stack. The collect future
+    // is large, and every caller of this function inlines it. An unboxed future
+    // here pushes each caller over the `clippy::large_futures` threshold.
+    let (collected, hints) = Box::pin(crate::dispatch::buffered(
+        start_or_load_workflow_execution_collect(conn, request, false, false, None, gate),
+    ))
+    .await;
+    let (result, deferred_starts, deferred_checks, _cancel_metrics) = collected?;
+    crate::dispatch::publish_now(hints).await;
     for start in deferred_starts {
         start.spawn();
     }
@@ -1538,9 +1549,14 @@ pub async fn start_or_load_workflow_execution_with_metrics(
     metrics: Option<&(dyn crate::telemetry::MetricsRecorder + Send + Sync)>,
     gate: Option<crate::admission_gate::GateMode>,
 ) -> HarvestResult<StartedWorkflowExecution> {
-    let (result, deferred_starts, deferred_checks, cancel_metrics) =
-        start_or_load_workflow_execution_collect(conn, request, false, false, metrics, gate)
-            .await?;
+    // Same post-commit publish as `start_or_load_workflow_execution`.
+    // `Box::pin` for the same reason as the call above.
+    let (collected, hints) = Box::pin(crate::dispatch::buffered(
+        start_or_load_workflow_execution_collect(conn, request, false, false, metrics, gate),
+    ))
+    .await;
+    let (result, deferred_starts, deferred_checks, cancel_metrics) = collected?;
+    crate::dispatch::publish_now(hints).await;
     for start in deferred_starts {
         start.spawn();
     }

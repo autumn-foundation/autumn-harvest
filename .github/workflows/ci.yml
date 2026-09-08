@@ -182,6 +182,10 @@ jobs:
         run: cargo clippy -p autumn-harvest-plugin --all-targets --features connectors -- -D warnings
       - name: Clippy autumn-harvest-plugin (sqs feature)
         run: cargo clippy -p autumn-harvest-plugin --all-targets --features sqs -- -D warnings
+      # Issue #1312: the runtime wiring for the Redis dispatch channel is
+      # `cfg`d out of the default build, so only this step compiles it.
+      - name: Clippy autumn-harvest-plugin (redis feature)
+        run: cargo clippy -p autumn-harvest-plugin --all-targets --features redis -- -D warnings
       - name: Install librdkafka build deps
         run: sudo apt-get update && sudo apt-get install -y libcurl4-openssl-dev
       - name: Clippy autumn-harvest-plugin (kafka feature)
@@ -192,6 +196,18 @@ jobs:
         run: cargo clippy -p autumn-harvest-cli --all-targets -- -D warnings
       - name: Clippy autumn-harvest-sqlite
         run: cargo clippy -p autumn-harvest-sqlite --all-targets -- -D warnings
+      # Issue #1312: the Redis dispatch channel. Same issue #962 rule as the
+      # verify crate below -- a workspace member gets NO clippy coverage
+      # without its own step here.
+      #
+      # `--no-deps` scopes the deny to this crate. `autumn-harvest-redis`
+      # depends on `autumn-harvest` with `default-features = false`, and the
+      # core crate carries pre-existing lint warnings in that configuration
+      # (dead code behind the `db` feature, and pedantic suggestions). Without
+      # `--no-deps` this step would deny those, so it would report the core
+      # crate's no-default-features debt as a redis-crate failure.
+      - name: Clippy autumn-harvest-redis
+        run: cargo clippy -p autumn-harvest-redis --all-targets --no-deps -- -D warnings
       # Issue #962: a new workspace member gets NO clippy coverage unless a step
       # is added here — there is no `--workspace` clippy invocation in this job,
       # only per-crate ones. The verify crate opts into the workspace's pedantic
@@ -590,6 +606,13 @@ jobs:
       - name: Run plugin connector tests (issue #944)
         if: needs.changes.outputs.code == 'true' && matrix.shard == 2
         run: cargo test -p autumn-harvest-plugin --features connectors --lib connector
+      # Issue #1312. The `redis` feature changes two config paths: it accepts
+      # `[harvest.redis] url` instead of rejecting it, and it compiles the
+      # channel install. `--lib` without the feature covers neither, so the
+      # feature needs its own lib-test leg beside the other per-feature ones.
+      - name: Run plugin lib tests (redis feature, issue #1312)
+        if: needs.changes.outputs.code == 'true' && matrix.shard == 3
+        run: cargo test -p autumn-harvest-plugin --features redis --lib
       # No CI step ran the plugin's doctests, so a broken `///` example landed
       # silently (issue #944 review found exactly that). These are compile-only
       # (`no_run`), so they cost seconds and need no database.
@@ -626,6 +649,12 @@ jobs:
       - name: Run autumn-harvest-sqlite tests (issue #1068)
         if: needs.changes.outputs.code == 'true' && matrix.shard == 3
         run: cargo test -p autumn-harvest-sqlite
+      # Issue #1312. `--lib` only: the crate's integration suites need a live
+      # Redis (and, for the end-to-end suite, a live Postgres), so they run on
+      # the Docker-backed `test-db-linux` job through the manifest instead.
+      - name: Run autumn-harvest-redis unit tests (issue #1312)
+        if: needs.changes.outputs.code == 'true' && matrix.shard == 3
+        run: cargo test -p autumn-harvest-redis --lib
       - name: Run business_metrics example tests (issue #758)
         if: needs.changes.outputs.code == 'true' && matrix.shard == 0
         run: cargo test -p autumn-harvest --no-default-features --features testing --example business_metrics
@@ -816,6 +845,13 @@ jobs:
         # which shard `dev_runtime_lifecycle`'s row lands in.
         env:
           HARVEST_DEV_REQUIRE_POSTGRES: "1"
+          # Issue #1312, contract C3. The Redis suites obtain a fixture from
+          # `HARVEST_REDIS_TEST_URL` or from a testcontainers Redis. Either
+          # source can go away without a test failing, because the suites skip
+          # themselves when no fixture is reachable. This flag turns that skip
+          # into a panic, so "the Redis suites stopped testing anything" is a
+          # red build here rather than a silent green.
+          HARVEST_TEST_REQUIRE_REDIS: "1"
           SEMAPHORE_SHARD_COUNT: "10"
           SEMAPHORE_SHARD_INDEX: ${{ matrix.shard }}
         run: bash .github/ci/run-suites.sh run linux
@@ -1173,6 +1209,11 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: Check MSRV compiles
         run: cargo check --workspace
+      # `cargo check --workspace` builds default features only, so the
+      # optional `autumn-harvest-redis` dependency and the channel install in
+      # `runner.rs` never reach the MSRV compiler. Issue #1312.
+      - name: Check MSRV compiles (autumn-harvest-plugin redis feature, issue #1312)
+        run: cargo check -p autumn-harvest-plugin --features redis
 
   # Dependency ledger harness (Ballast). Runs `cargo deny check` against
   # `deny.toml`: advisories (RUSTSEC, joined against the lockfile — every

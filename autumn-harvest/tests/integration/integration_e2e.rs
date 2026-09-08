@@ -291,7 +291,10 @@ const INIT_SQL: &str = concat!(
     // not from this deliberately partial bundle.
     include_str!(
         "../../migrations/20260906014820_harvest_completion_trigger_outbox_backoff/up.sql"
-    )
+    ),
+    // issue #1312: the fenced by-id claim reads the DR generation row, so this
+    // bundle carries the cross-region DR tables.
+    include_str!("../../migrations/20260726000000_harvest_shard_generation/up.sql")
 );
 
 /// The minimal "legacy" migration set used by the upgrade-path regression
@@ -12196,7 +12199,16 @@ async fn windowed_fan_out_peak_task_rows_bounded_by_window() {
 /// table is caught automatically, with no second list to maintain.
 #[test]
 fn init_sql_creates_every_table_the_claim_path_references() {
-    let claim_sql = autumn_harvest::queue::claim_task_query();
+    // Both claim statements, not only the unfenced one. The fenced variant
+    // splices in `harvest_shard_generation`. No other query names that table.
+    // Scanning only the base query left that gap to a Docker-backed CI cycle
+    // (issue #1312).
+    let claim_sql = format!(
+        "{} {}",
+        autumn_harvest::queue::claim_task_query(),
+        autumn_harvest::queue::claim_task_query_fenced()
+    );
+    let claim_sql = claim_sql.as_str();
 
     let mut tables: Vec<String> = Vec::new();
     let bytes = claim_sql.as_bytes();
@@ -12218,7 +12230,7 @@ fn init_sql_creates_every_table_the_claim_path_references() {
 
     assert!(
         !tables.is_empty(),
-        "expected to find harvest_* identifiers in claim_task_query(); the token scan is broken"
+        "expected to find harvest_* identifiers in the claim queries; the token scan is broken"
     );
 
     let missing: Vec<&String> = tables

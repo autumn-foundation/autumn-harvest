@@ -1,0 +1,31 @@
+# NON-PRODUCTION THROWAWAY APPARATUS — see
+# ../../0008-redis-dispatch-integrated-throughput.md
+#
+# Archived for reproducibility only. Deliberately NOT a member of the
+# workspace root Cargo.toml and must never become one: it exists to answer one
+# assay question, not to be built, tested, or depended on by anything else.
+[package]
+name = "redis_dispatch_integrated_assay"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+# Detached from the repo's root workspace (see the file-level comment above)
+# rather than added to its members/exclude list.
+[workspace]
+
+[dependencies]
+autumn-harvest = { path = "../../../../autumn-harvest", features = ["db", "testing"] }
+autumn-harvest-redis = { path = "../../../../autumn-harvest-redis" }
+async-trait = "0.1"
+chrono = "0.4"
+deadpool = "0.13"
+diesel = { version = "2.3", features = ["postgres_backend", "uuid", "chrono", "serde_json", "64-column-tables"] }
+diesel-async = { version = "0.9", features = ["deadpool", "postgres"] }
+redis = { version = "0.27", default-features = false, features = ["tokio-comp", "connection-manager", "streams", "script"] }
+serde_json = "1"
+tokio = { version = "1", features = ["full"] }
+uuid = { version = "1", features = ["v4"] }
+
+[profile.release]
+opt-level = 3

@@ -306,6 +306,10 @@ pub enum HarvestError {
     #[error("database error: {0}")]
     Database(String),
 
+    /// The task dispatch channel failed (issue #1312).
+    #[error("dispatch error: {0}")]
+    Dispatch(String),
+
     /// Replay encountered a payload encoded with an unregistered codec id.
     #[error("unknown payload codec: {id}")]
     UnknownPayloadCodec {

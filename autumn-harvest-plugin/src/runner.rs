@@ -858,6 +858,12 @@ pub struct HarvestRunner {
     scheduler: Option<SchedulerRuntime>,
     retention: Option<RetentionRuntime>,
     batch: Option<BatchRuntime>,
+    /// True when this runner installed the process-global dispatch channel.
+    ///
+    /// The slot is process wide and outlives one runner, so `stop` must give it
+    /// back (issue #1312). A runner that installed nothing leaves the slot
+    /// alone, because another owner in the same process may hold it.
+    dispatch_installed: bool,
 }
 
 /// Background batch-operations executor handle (issue #102).
@@ -981,6 +987,33 @@ impl HarvestRunner {
             })?;
         }
 
+        // Issue #1312: install the process-global dispatch channel BEFORE the
+        // worker is constructed, and in every mode. An API-only process owns
+        // no worker but still publishes references for the fleet, so the
+        // install cannot sit inside the `worker_enabled` branch.
+        //
+        // The shard-span check runs BEFORE the install (contract C7). A
+        // multi-shard process must fail startup without a connected channel
+        // behind it. `Worker::new` repeats the check, but only a
+        // worker-enabled process reaches it.
+        let dispatch_shards = prepared.storage_pool.sharded_pool().shard_ids();
+        reject_multi_shard_dispatch(config.redis.url.is_some(), dispatch_shards.len())
+            .map_err(AutumnError::service_unavailable_msg)?;
+        reject_dispatch_queue_names(
+            config.redis.url.is_some(),
+            &prepared.worker_runtime_config.queues,
+        )
+        .map_err(AutumnError::service_unavailable_msg)?;
+        // The shard this process owns, which names its key family. The check
+        // above proves the runtime resolves one shard at most, so any other
+        // count leaves the configured prefix alone.
+        let dispatch_shard = match dispatch_shards.as_slice() {
+            [only] => Some(*only),
+            _ => None,
+        };
+        let dispatch_installed = install_dispatch_channel(config, dispatch_shard).await?;
+        let dispatch_guard = DispatchInstallGuard::new(dispatch_installed);
+
         let worker = if config.worker_enabled {
             let worker = Worker::new(
                 prepared.worker_runtime_config.clone(),
@@ -1014,6 +1047,7 @@ impl HarvestRunner {
         if let Some(guard) = prepared.audit_export_guard.take() {
             guard.commit();
         }
+        dispatch_guard.commit();
 
         let worker_id = worker
             .as_ref()
@@ -1097,6 +1131,7 @@ impl HarvestRunner {
             scheduler,
             retention,
             batch,
+            dispatch_installed,
         })
     }
 
@@ -1113,6 +1148,10 @@ impl HarvestRunner {
     }
 
     /// Stop any locally owned worker and scheduler tasks.
+    ///
+    /// A runner that installed the dispatch channel also uninstalls it. The
+    /// slot is process wide, so a channel left behind would still carry
+    /// references for a runtime that has stopped (issue #1312).
     pub async fn stop(self) {
         let Self {
             api_runtime: _,
@@ -1122,7 +1161,12 @@ impl HarvestRunner {
             scheduler,
             retention,
             batch,
+            dispatch_installed,
         } = self;
+
+        if dispatch_installed {
+            autumn_harvest::dispatch::uninstall();
+        }
 
         if let Some(worker) = worker {
             worker.shutdown();
@@ -1237,6 +1281,236 @@ fn capture_effective_config(
         DEFAULT_WORKER_POLL_INTERVAL,
         Some(resolved_sharding),
     )
+}
+
+/// Reject Redis dispatch on a runtime that spans more than one shard.
+///
+/// Issue #1312 contract C7. A reference carries a task id and no connection.
+/// A runtime that owns several shard pools cannot tell which pool holds the
+/// named row. A reference read for one shard would then be claimed against
+/// another shard's database, and it would always miss. `Worker::new` applies
+/// the same rule. A worker-disabled process never builds a worker, and it
+/// would still publish. This check therefore runs in the runner, before the
+/// install.
+///
+/// # Errors
+///
+/// Returns the operator-facing message when a URL is configured and
+/// `shard_count` is above one.
+fn reject_multi_shard_dispatch(redis_url_set: bool, shard_count: usize) -> Result<(), String> {
+    if redis_url_set && shard_count > 1 {
+        return Err(format!(
+            "harvest.redis.url is set and this runtime resolves {shard_count} shard pools; \
+             redis dispatch supports single-shard runtimes only in v1 (issue #1312). Unset \
+             harvest.redis.url, or run one process per shard"
+        ));
+    }
+    Ok(())
+}
+
+/// Reject Redis dispatch on a runtime whose queue names the channel cannot
+/// carry (issue #1312).
+///
+/// The channel builds its keys from the queue name, so it rejects a name that
+/// is empty or holds a colon. `WorkerConfig` and the Postgres claim path accept
+/// both. A process configured that way would fail every channel call and live
+/// on the Postgres fallback for all of its queues, in silence. `Worker::new`
+/// applies the same rule. A worker-disabled process never builds a worker, and
+/// it would still publish, so this check runs in the runner as well.
+///
+/// # Errors
+///
+/// Returns the operator-facing message when a URL is configured and a queue
+/// name fails [`autumn_harvest::dispatch::validate_queue_name`].
+fn reject_dispatch_queue_names(redis_url_set: bool, queues: &[String]) -> Result<(), String> {
+    if !redis_url_set {
+        return Ok(());
+    }
+    for queue in queues {
+        autumn_harvest::dispatch::validate_queue_name(queue).map_err(|reason| {
+            format!(
+                "harvest.redis.url is set and this runtime serves a queue redis dispatch \
+                 cannot address: {reason}. Unset harvest.redis.url, or rename the queue"
+            )
+        })?;
+    }
+    Ok(())
+}
+
+/// The shard an unsharded deployment resolves.
+///
+/// [`ShardedDbPool::single`] builds exactly this shard. A runtime that reports
+/// it owns one database and no shard layout.
+const DEFAULT_DISPATCH_SHARD: ShardId = ShardId::new(0);
+
+/// The Redis key prefix this process owns, for the shard it serves.
+///
+/// Issue #1312 limits Redis dispatch to a runtime that resolves one shard
+/// pool. A sharded fleet meets that limit by running one process per shard, so
+/// every process passes the check. The configured prefix alone would then give
+/// every process in the fleet the same `{prefix}:dispatch:{queue}` stream. A
+/// worker for shard B would read shard A's reference, probe B's database, find
+/// no row, release it three times and ack it as absent. Shard A's row would
+/// wait for A's reconcile sweep, and a peer could steal it again.
+///
+/// The shard suffix gives each shard its own key family, so a reference only
+/// ever reaches a process that holds the named row. The suffix extends the
+/// configured prefix and never replaces it, so an operator who namespaces the
+/// prefix per environment keeps that namespace.
+///
+/// [`DEFAULT_DISPATCH_SHARD`] keeps the plain prefix. Every single-database
+/// deployment resolves that shard, and a suffix there would move the key
+/// family away from the references a previous release published.
+///
+/// A central API process that spans several shards still rejects Redis
+/// dispatch at startup. Issue #1429 tracks true multi-shard routing.
+#[cfg_attr(not(feature = "redis"), allow(dead_code))]
+#[must_use]
+fn effective_dispatch_prefix(configured: &str, shard: Option<ShardId>) -> String {
+    match shard {
+        Some(shard) if shard != DEFAULT_DISPATCH_SHARD => {
+            format!("{configured}:s{}", shard.as_i32())
+        }
+        _ => configured.to_string(),
+    }
+}
+
+/// Uninstall the process-global dispatch channel when startup fails later.
+///
+/// `start` installs the channel before it builds the worker, because an
+/// API-only process publishes too. A step after the install can still fail.
+/// The runtime is then dropped, but the channel is process-global and would
+/// stay installed for the next runtime in this process. The guard removes it
+/// unless [`DispatchInstallGuard::commit`] runs, which mirrors how
+/// `DeferredAuditExportInstall` guards the audit sink.
+struct DispatchInstallGuard {
+    /// True while the guard owns an install that startup has not confirmed.
+    armed: bool,
+}
+
+impl DispatchInstallGuard {
+    /// A guard over an install that happened, or an inert guard when it did
+    /// not.
+    const fn new(installed: bool) -> Self {
+        Self { armed: installed }
+    }
+
+    /// Keep the channel installed. Startup has passed every fallible step.
+    fn commit(mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for DispatchInstallGuard {
+    fn drop(&mut self) {
+        if self.armed {
+            autumn_harvest::dispatch::uninstall();
+        }
+    }
+}
+
+/// Lifetime of a publish marker key, which makes a publish idempotent per
+/// task id. The plan fixes it at ten minutes.
+#[cfg(feature = "redis")]
+const DISPATCH_DEDUPE_TTL: std::time::Duration = std::time::Duration::from_secs(600);
+
+/// Install the Redis dispatch channel when `[harvest.redis] url` is set.
+///
+/// Postgres stays the source of truth. The channel only carries references to
+/// claimable `harvest_task_queue` rows. With no URL the runtime keeps the
+/// Postgres claim path and this is a no-op.
+///
+/// Returns `true` when a channel is installed, so the caller can uninstall it
+/// if a later startup step fails.
+///
+/// # Errors
+///
+/// Returns an error when the Redis endpoint cannot be reached. A configured
+/// URL that cannot connect fails startup in every mode, so an unreachable
+/// Redis is visible at boot rather than after the first read. The Postgres
+/// fallback covers the running state only. The message names the endpoint in
+/// credential-free form.
+#[cfg(feature = "redis")]
+async fn install_dispatch_channel(
+    config: &HarvestRuntimeConfig,
+    shard: Option<ShardId>,
+) -> autumn_web::AutumnResult<bool> {
+    use std::time::Duration;
+
+    // The endpoint string comes from the redacted form only, so neither the
+    // startup log line nor the connect error can carry a password. Both
+    // halves are `Some` together, because both read `config.redis.url`.
+    let (Some(url), Some(endpoint)) = (config.redis.url.as_deref(), config.redis.redacted_url())
+    else {
+        // Redis is off for this start. The slot is process wide, so a channel a
+        // previous runtime installed is still live in it (issue #1312). Leaving
+        // it there would keep this process publishing and consuming through a
+        // channel the operator has turned off.
+        autumn_harvest::dispatch::uninstall();
+        return Ok(false);
+    };
+
+    // Each shard's processes own their own key family (issue #1312).
+    let key_prefix = effective_dispatch_prefix(&config.redis.key_prefix, shard);
+
+    let channel = autumn_harvest_redis::RedisDispatch::connect(
+        url,
+        autumn_harvest_redis::RedisDispatchConfig {
+            key_prefix: key_prefix.clone(),
+            consumer_group: config.redis.consumer_group.clone(),
+            visibility_timeout: Duration::from_millis(config.redis.visibility_timeout_ms),
+            dedupe_ttl: DISPATCH_DEDUPE_TTL,
+        },
+    )
+    .await
+    .map_err(|error| {
+        AutumnError::service_unavailable_msg(format!(
+            "failed to connect the Redis dispatch channel at {endpoint}: {error}"
+        ))
+    })?;
+
+    autumn_harvest::dispatch::install(
+        Arc::new(channel),
+        autumn_harvest::dispatch::DispatchSettings {
+            poll_interval: Duration::from_millis(config.redis.poll_interval_ms),
+            reconcile_interval: Duration::from_millis(config.redis.reconcile_interval_ms),
+            ..autumn_harvest::dispatch::DispatchSettings::default()
+        },
+    );
+
+    tracing::info!(
+        endpoint = %endpoint,
+        key_prefix = %key_prefix,
+        consumer_group = %config.redis.consumer_group,
+        poll_interval_ms = config.redis.poll_interval_ms,
+        reconcile_interval_ms = config.redis.reconcile_interval_ms,
+        "redis dispatch enabled: workers read task references from redis and claim the named \
+         row in postgres"
+    );
+    Ok(true)
+}
+
+/// No dispatch channel exists without the `redis` cargo feature.
+///
+/// Configuration validation rejects `[harvest.redis] url` on such a build, so
+/// this path can only be reached with Redis dispatch off. The result is
+/// always `false`, because nothing is installed.
+///
+/// The slot is still cleared. It is process wide, so a channel another owner
+/// installed would otherwise stay live for a runtime that has Redis off
+/// (issue #1312).
+///
+/// # Errors
+///
+/// Never returns an error.
+#[cfg(not(feature = "redis"))]
+#[allow(clippy::unused_async)]
+async fn install_dispatch_channel(
+    _config: &HarvestRuntimeConfig,
+    _shard: Option<ShardId>,
+) -> autumn_web::AutumnResult<bool> {
+    autumn_harvest::dispatch::uninstall();
+    Ok(false)
 }
 
 /// The writable shards `assignments` does **not** cover, ascending (issue #961).
@@ -1774,4 +2048,280 @@ mod tests {
             "a caller that already ran the gate must be able to say so",
         );
     }
+    /// Redis dispatch is single-shard in v1 (issue #1312, contract C7). The
+    /// runner rejects the combination before it installs the channel, so a
+    /// multi-shard process never reaches a connected channel it cannot use.
+    #[test]
+    fn redis_dispatch_is_rejected_on_a_multi_shard_runtime() {
+        let error = super::reject_multi_shard_dispatch(true, 3)
+            .expect_err("a multi-shard runtime must reject redis dispatch");
+
+        assert!(
+            error.contains("1312") && error.contains("single-shard"),
+            "expected the rejection to name the limit and the issue, got {error}"
+        );
+    }
+
+    /// A single-shard runtime is the supported shape, so the check passes.
+    #[test]
+    fn redis_dispatch_is_accepted_on_a_single_shard_runtime() {
+        super::reject_multi_shard_dispatch(true, 1)
+            .expect("a single-shard runtime must accept redis dispatch");
+    }
+
+    /// With no URL the channel stays off, so the shard span does not matter.
+    #[test]
+    fn a_multi_shard_runtime_without_a_redis_url_starts() {
+        super::reject_multi_shard_dispatch(false, 4)
+            .expect("a runtime with redis dispatch off must not be rejected");
+    }
+
+    /// An unsharded runtime keeps the configured prefix exactly (issue #1312).
+    ///
+    /// Every existing single-database deployment resolves the default shard.
+    /// A suffix there would move the key family and strand the references a
+    /// previous release published.
+    #[test]
+    fn the_default_shard_keeps_the_configured_dispatch_prefix() {
+        assert_eq!(
+            super::effective_dispatch_prefix("harvest", Some(ShardId::new(0))),
+            "harvest"
+        );
+        assert_eq!(super::effective_dispatch_prefix("harvest", None), "harvest");
+    }
+
+    /// A process that owns one non-default shard gets its own key family.
+    ///
+    /// Every process in a sharded fleet passes the single-shard check. Without
+    /// the suffix they would all read one stream, and a worker would probe its
+    /// own database for another shard's row.
+    #[test]
+    fn a_non_default_shard_gets_its_own_dispatch_prefix() {
+        assert_eq!(
+            super::effective_dispatch_prefix("harvest", Some(ShardId::new(3))),
+            "harvest:s3"
+        );
+        assert_eq!(
+            super::effective_dispatch_prefix("harvest", Some(ShardId::new(1))),
+            "harvest:s1"
+        );
+    }
+
+    /// The suffix extends the configured prefix and never replaces it.
+    ///
+    /// An operator who already namespaces the prefix per environment keeps
+    /// that namespace, so two environments on one Redis stay separate.
+    #[test]
+    fn a_configured_dispatch_prefix_survives_the_shard_suffix() {
+        assert_eq!(
+            super::effective_dispatch_prefix("acme:staging", Some(ShardId::new(7))),
+            "acme:staging:s7"
+        );
+        assert_eq!(
+            super::effective_dispatch_prefix("acme:staging", Some(ShardId::new(0))),
+            "acme:staging"
+        );
+    }
+
+    /// `start` installs the process-global channel before it builds the
+    /// worker. A later failure must leave no channel behind, or the next
+    /// runtime in this process inherits one it never configured (issue #1312).
+    #[test]
+    fn a_failed_startup_uninstalls_the_dispatch_channel() {
+        let _lock = DISPATCH_TEST_LOCK.lock().unwrap_or_else(|error| {
+            DISPATCH_TEST_LOCK.clear_poison();
+            error.into_inner()
+        });
+
+        autumn_harvest::dispatch::install(
+            std::sync::Arc::new(autumn_harvest::dispatch::MemoryDispatch::new()),
+            autumn_harvest::dispatch::DispatchSettings::default(),
+        );
+        assert!(
+            autumn_harvest::dispatch::is_installed(),
+            "the test fixture must install a channel"
+        );
+
+        drop(super::DispatchInstallGuard::new(true));
+
+        assert!(
+            !autumn_harvest::dispatch::is_installed(),
+            "a startup that fails after the install must uninstall the channel"
+        );
+    }
+
+    /// A startup that reaches the commit point keeps its channel installed.
+    #[test]
+    fn a_committed_guard_keeps_the_dispatch_channel() {
+        let _lock = DISPATCH_TEST_LOCK.lock().unwrap_or_else(|error| {
+            DISPATCH_TEST_LOCK.clear_poison();
+            error.into_inner()
+        });
+
+        autumn_harvest::dispatch::install(
+            std::sync::Arc::new(autumn_harvest::dispatch::MemoryDispatch::new()),
+            autumn_harvest::dispatch::DispatchSettings::default(),
+        );
+
+        super::DispatchInstallGuard::new(true).commit();
+
+        assert!(
+            autumn_harvest::dispatch::is_installed(),
+            "a committed guard must leave the channel installed"
+        );
+        autumn_harvest::dispatch::uninstall();
+    }
+
+    /// A queue name the channel key
+    /// space cannot carry must fail startup, not degrade the process to the
+    /// Postgres fallback in silence.
+    #[test]
+    fn redis_dispatch_rejects_a_queue_name_with_a_colon() {
+        let queues = vec!["default".to_string(), "tenant:priority".to_string()];
+        let error = super::reject_dispatch_queue_names(true, &queues)
+            .expect_err("a colon in a queue name must fail startup");
+        assert!(
+            error.contains("tenant:priority"),
+            "the message must name the queue: {error}"
+        );
+        assert!(
+            error.contains("harvest.redis.url"),
+            "the message must name the setting to unset: {error}"
+        );
+    }
+
+    #[test]
+    fn dispatchable_queue_names_are_accepted() {
+        let queues = vec!["default".to_string(), "tenant-priority".to_string()];
+        super::reject_dispatch_queue_names(true, &queues)
+            .expect("a plain queue name must be accepted");
+    }
+
+    /// With no URL the channel stays off, so the queue names do not matter.
+    #[test]
+    fn queue_names_are_unchecked_when_redis_dispatch_is_off() {
+        let queues = vec!["tenant:priority".to_string()];
+        super::reject_dispatch_queue_names(false, &queues)
+            .expect("a runtime with redis dispatch off must not be rejected");
+    }
+
+    /// A runner that owns nothing but the dispatch flag.
+    ///
+    /// `stop` is driven through this, so the case needs no database, no worker
+    /// and no scheduler.
+    fn runner_owning_dispatch(installed: bool) -> super::HarvestRunner {
+        let api_runtime = crate::api::HarvestApiRuntime::new(
+            std::sync::Arc::new(autumn_harvest::worker::HandlerRegistry::new(vec![], vec![])),
+            std::sync::Arc::new(autumn_harvest::scheduler::DagCatalog::default()),
+            std::sync::Arc::new(Vec::new()),
+            None,
+            Vec::new(),
+            autumn_harvest::scheduler::SchedulerMonitor::offline(),
+            crate::api::HarvestRetentionRuntime::disabled(
+                autumn_harvest::retention::RetentionConfig::default(),
+            ),
+            ShardRouter::single(),
+        );
+        super::HarvestRunner {
+            api_runtime,
+            storage_pool: crate::state::HarvestDbPool::single(tagged_pool(1)),
+            worker: None,
+            worker_handle: None,
+            scheduler: None,
+            retention: None,
+            batch: None,
+            dispatch_installed: installed,
+        }
+    }
+
+    /// Run `future` on a private current-thread runtime.
+    ///
+    /// The dispatch cases hold a blocking lock, so they stay synchronous.
+    fn block_on<F: std::future::Future>(future: F) -> F::Output {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("test runtime")
+            .block_on(future)
+    }
+
+    /// A restart with Redis off must
+    /// not keep publishing and consuming through the channel of the previous
+    /// runtime.
+    #[test]
+    fn a_disabled_start_clears_a_previously_installed_channel() {
+        let _lock = DISPATCH_TEST_LOCK.lock().unwrap_or_else(|error| {
+            DISPATCH_TEST_LOCK.clear_poison();
+            error.into_inner()
+        });
+
+        autumn_harvest::dispatch::install(
+            std::sync::Arc::new(autumn_harvest::dispatch::MemoryDispatch::new()),
+            autumn_harvest::dispatch::DispatchSettings::default(),
+        );
+
+        let config = crate::config::HarvestRuntimeConfig::default();
+        assert!(
+            config.redis.url.is_none(),
+            "the default config has redis dispatch off"
+        );
+        let installed = block_on(super::install_dispatch_channel(&config, None))
+            .expect("a disabled start must succeed");
+
+        assert!(!installed, "a disabled start installs no channel");
+        assert!(
+            autumn_harvest::dispatch::installed().is_none(),
+            "a disabled start must clear the channel a previous runtime installed"
+        );
+    }
+
+    /// The runner uninstalls the channel it installed when it stops.
+    #[test]
+    fn stop_uninstalls_a_channel_the_runner_installed() {
+        let _lock = DISPATCH_TEST_LOCK.lock().unwrap_or_else(|error| {
+            DISPATCH_TEST_LOCK.clear_poison();
+            error.into_inner()
+        });
+
+        autumn_harvest::dispatch::install(
+            std::sync::Arc::new(autumn_harvest::dispatch::MemoryDispatch::new()),
+            autumn_harvest::dispatch::DispatchSettings::default(),
+        );
+
+        block_on(runner_owning_dispatch(true).stop());
+
+        assert!(
+            autumn_harvest::dispatch::installed().is_none(),
+            "stop must uninstall the channel the runner installed"
+        );
+    }
+
+    /// A runner that installed no channel leaves the slot alone.
+    ///
+    /// Another owner in the same process may hold it, and this runner has no
+    /// claim on it.
+    #[test]
+    fn stop_leaves_a_channel_the_runner_did_not_install() {
+        let _lock = DISPATCH_TEST_LOCK.lock().unwrap_or_else(|error| {
+            DISPATCH_TEST_LOCK.clear_poison();
+            error.into_inner()
+        });
+
+        autumn_harvest::dispatch::install(
+            std::sync::Arc::new(autumn_harvest::dispatch::MemoryDispatch::new()),
+            autumn_harvest::dispatch::DispatchSettings::default(),
+        );
+
+        block_on(runner_owning_dispatch(false).stop());
+
+        assert!(
+            autumn_harvest::dispatch::is_installed(),
+            "stop must not uninstall a channel this runner never installed"
+        );
+        autumn_harvest::dispatch::uninstall();
+    }
+
+    /// The process-global dispatch slot is one resource. The dispatch cases
+    /// take this lock so they never observe each other.
+    static DISPATCH_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 }

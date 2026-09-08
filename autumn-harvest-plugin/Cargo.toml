@@ -58,6 +58,12 @@ dev-runtime = ["dep:tokio-postgres"]
 # (1.87) is below this workspace's 1.88 — so unlike `wasm-activities` this
 # feature raises no effective MSRV at all.
 dev-runtime-managed = ["dev-runtime", "dep:postgresql_archive"]
+# Redis dispatch channel (issue #1312). Off by default: with the feature off
+# the runtime keeps the Postgres claim path, and `[harvest.redis] url` is
+# rejected at config validation rather than silently ignored. The channel
+# carries references to claimable `harvest_task_queue` rows; Postgres stays
+# the source of truth. See `docs/operations/redis-dispatch.md`.
+redis = ["dep:autumn-harvest-redis"]
 
 
 [dependencies]
@@ -114,6 +120,9 @@ tokio-postgres = { version = "0.7.18", optional = true }
 postgresql_archive = { version = "0.19", default-features = false, features = ["theseus", "rustls"], optional = true }
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
 thiserror = { workspace = true }
+# Redis Streams dispatch channel (issue #1312), behind the `redis` feature.
+# Optional so the default build keeps a Postgres-only dependency graph.
+autumn-harvest-redis = { version = "0.6.0", path = "../autumn-harvest-redis", optional = true }
 
 # ── Broker connectors (issue #944) — all optional, all off by default ──
 # Object-safe async traits for the EventSource / DeadLetterSink seams

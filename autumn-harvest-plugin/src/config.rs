@@ -48,6 +48,40 @@ pub struct HarvestReadinessConfig {
     pub require_shard_readiness: bool,
 }
 
+/// Highest accepted `harvest.redis.poll_interval_ms`.
+///
+/// The value is the wait of one blocking read. The worker checks shutdown and
+/// the reconcile clock between reads, so a longer wait delays both.
+const REDIS_POLL_INTERVAL_CEILING_MS: u64 = 5_000;
+
+/// Lowest accepted `harvest.redis.visibility_timeout_ms`.
+///
+/// The timeout must outlast one Postgres claim. A shorter value lets a peer
+/// recover a reference the owning worker is still claiming, which costs a
+/// duplicate claim attempt on every reference.
+const REDIS_VISIBILITY_TIMEOUT_FLOOR_MS: u64 = 1_000;
+
+/// Redis dispatch channel settings (issue #1312).
+///
+/// The channel carries references to claimable `harvest_task_queue` rows.
+/// Postgres stays the source of truth. `url` is the switch: `None` leaves
+/// every worker on the Postgres claim path, which is the default.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HarvestRedisConfig {
+    /// Redis connection URL. `None` disables Redis dispatch.
+    pub url: Option<String>,
+    /// Prefix for every key the channel owns.
+    pub key_prefix: String,
+    /// Redis Streams consumer group the workers join.
+    pub consumer_group: String,
+    /// Time a delivered reference may stay unacked before recovery.
+    pub visibility_timeout_ms: u64,
+    /// Wait for one blocking read when the channel is idle.
+    pub poll_interval_ms: u64,
+    /// Interval for the reconcile sweep over due `PENDING` rows.
+    pub reconcile_interval_ms: u64,
+}
+
 /// What to do when workflow-type reachability finds an orphaned type at
 /// startup (issue #700 AC4).
 ///
@@ -86,6 +120,7 @@ pub struct HarvestRuntimeConfig {
     pub batch: HarvestBatchConfig,
     pub readiness: HarvestReadinessConfig,
     pub startup: HarvestStartupConfig,
+    pub redis: HarvestRedisConfig,
 }
 
 impl HarvestRuntimeConfig {
@@ -171,6 +206,24 @@ impl HarvestRuntimeConfig {
         if let Some(orphaned_workflows) = partial.startup.orphaned_workflows {
             self.startup.orphaned_workflows = orphaned_workflows;
         }
+        if let Some(url) = partial.redis.url {
+            self.redis.url = Some(url);
+        }
+        if let Some(key_prefix) = partial.redis.key_prefix {
+            self.redis.key_prefix = key_prefix;
+        }
+        if let Some(consumer_group) = partial.redis.consumer_group {
+            self.redis.consumer_group = consumer_group;
+        }
+        if let Some(visibility_timeout_ms) = partial.redis.visibility_timeout_ms {
+            self.redis.visibility_timeout_ms = visibility_timeout_ms;
+        }
+        if let Some(poll_interval_ms) = partial.redis.poll_interval_ms {
+            self.redis.poll_interval_ms = poll_interval_ms;
+        }
+        if let Some(reconcile_interval_ms) = partial.redis.reconcile_interval_ms {
+            self.redis.reconcile_interval_ms = reconcile_interval_ms;
+        }
     }
 
     fn apply_env_overrides(&mut self, env: &dyn Env) -> Result<(), ConfigError> {
@@ -247,6 +300,34 @@ impl HarvestRuntimeConfig {
             )?;
         }
 
+        // Issue #1312. An empty `AUTUMN_HARVEST_REDIS__URL` means "off", the
+        // same convention `AUTUMN_HARVEST_DATABASE__URL` uses above.
+        if let Ok(url) = env.var("AUTUMN_HARVEST_REDIS__URL") {
+            self.redis.url = (!url.is_empty()).then_some(url);
+        }
+        if let Ok(key_prefix) = env.var("AUTUMN_HARVEST_REDIS__KEY_PREFIX") {
+            self.redis.key_prefix = key_prefix;
+        }
+        if let Ok(consumer_group) = env.var("AUTUMN_HARVEST_REDIS__CONSUMER_GROUP") {
+            self.redis.consumer_group = consumer_group;
+        }
+        if let Ok(visibility_timeout_ms) = env.var("AUTUMN_HARVEST_REDIS__VISIBILITY_TIMEOUT_MS") {
+            self.redis.visibility_timeout_ms = parse_u64(
+                "AUTUMN_HARVEST_REDIS__VISIBILITY_TIMEOUT_MS",
+                &visibility_timeout_ms,
+            )?;
+        }
+        if let Ok(poll_interval_ms) = env.var("AUTUMN_HARVEST_REDIS__POLL_INTERVAL_MS") {
+            self.redis.poll_interval_ms =
+                parse_u64("AUTUMN_HARVEST_REDIS__POLL_INTERVAL_MS", &poll_interval_ms)?;
+        }
+        if let Ok(reconcile_interval_ms) = env.var("AUTUMN_HARVEST_REDIS__RECONCILE_INTERVAL_MS") {
+            self.redis.reconcile_interval_ms = parse_u64(
+                "AUTUMN_HARVEST_REDIS__RECONCILE_INTERVAL_MS",
+                &reconcile_interval_ms,
+            )?;
+        }
+
         Ok(())
     }
 
@@ -303,6 +384,67 @@ impl HarvestRuntimeConfig {
             ));
         }
 
+        self.validate_redis()?;
+
+        Ok(())
+    }
+
+    /// Validate the `[harvest.redis]` section (issue #1312).
+    ///
+    /// A build without the `redis` cargo feature carries no channel
+    /// implementation. A configured URL there is rejected, so an operator
+    /// never runs a binary that silently ignores the setting.
+    ///
+    /// The bounds below are the ones a wrong value breaks silently. Every key
+    /// the channel owns carries `key_prefix`, so an empty prefix collides with
+    /// unrelated keys in a shared Redis. Redis rejects an empty consumer group
+    /// name at the first read, which is late. A poll interval above
+    /// [`REDIS_POLL_INTERVAL_CEILING_MS`] holds one blocking read open for
+    /// longer than the shutdown check tolerates. A visibility timeout below
+    /// [`REDIS_VISIBILITY_TIMEOUT_FLOOR_MS`] lets a peer recover a reference
+    /// the owning worker is still claiming.
+    fn validate_redis(&self) -> Result<(), ConfigError> {
+        if self.redis.key_prefix.is_empty() {
+            return Err(ConfigError::Validation(
+                "harvest.redis.key_prefix must not be empty".to_owned(),
+            ));
+        }
+        if self.redis.consumer_group.is_empty() {
+            return Err(ConfigError::Validation(
+                "harvest.redis.consumer_group must not be empty".to_owned(),
+            ));
+        }
+        if self.redis.visibility_timeout_ms < REDIS_VISIBILITY_TIMEOUT_FLOOR_MS {
+            return Err(ConfigError::Validation(format!(
+                "harvest.redis.visibility_timeout_ms must be at least \
+                 {REDIS_VISIBILITY_TIMEOUT_FLOOR_MS}"
+            )));
+        }
+        if self.redis.poll_interval_ms < 1 {
+            return Err(ConfigError::Validation(
+                "harvest.redis.poll_interval_ms must be at least 1".to_owned(),
+            ));
+        }
+        if self.redis.poll_interval_ms > REDIS_POLL_INTERVAL_CEILING_MS {
+            return Err(ConfigError::Validation(format!(
+                "harvest.redis.poll_interval_ms must be at most {REDIS_POLL_INTERVAL_CEILING_MS}"
+            )));
+        }
+        if self.redis.reconcile_interval_ms < 1 {
+            return Err(ConfigError::Validation(
+                "harvest.redis.reconcile_interval_ms must be at least 1".to_owned(),
+            ));
+        }
+
+        if self.redis.url.is_some() && !cfg!(feature = "redis") {
+            return Err(ConfigError::Validation(
+                "harvest.redis.url is set but this binary is built without the `redis` cargo \
+                 feature of autumn-harvest-plugin; rebuild with `--features redis` or unset \
+                 harvest.redis.url"
+                    .to_owned(),
+            ));
+        }
+
         Ok(())
     }
 }
@@ -318,6 +460,32 @@ impl Default for HarvestRuntimeConfig {
             batch: HarvestBatchConfig::default(),
             readiness: HarvestReadinessConfig::default(),
             startup: HarvestStartupConfig::default(),
+            redis: HarvestRedisConfig::default(),
+        }
+    }
+}
+
+impl HarvestRedisConfig {
+    /// The configured URL with any userinfo removed.
+    ///
+    /// A Redis URL can carry a user name and a password. Startup logs and
+    /// error messages name the endpoint, so they use this form. Returns
+    /// `None` when Redis dispatch is off.
+    #[must_use]
+    pub fn redacted_url(&self) -> Option<String> {
+        self.url.as_deref().map(redact_userinfo)
+    }
+}
+
+impl Default for HarvestRedisConfig {
+    fn default() -> Self {
+        Self {
+            url: None,
+            key_prefix: "harvest".to_owned(),
+            consumer_group: "harvest_workers".to_owned(),
+            visibility_timeout_ms: 60_000,
+            poll_interval_ms: 20,
+            reconcile_interval_ms: 1_000,
         }
     }
 }
@@ -366,6 +534,8 @@ struct PartialHarvestRuntimeConfig {
     readiness: PartialHarvestReadinessConfig,
     #[serde(default)]
     startup: PartialHarvestStartupConfig,
+    #[serde(default)]
+    redis: PartialHarvestRedisConfig,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -401,6 +571,16 @@ struct PartialHarvestReadinessConfig {
 #[derive(Debug, Default, Deserialize)]
 struct PartialHarvestStartupConfig {
     orphaned_workflows: Option<OrphanStartupAction>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct PartialHarvestRedisConfig {
+    url: Option<String>,
+    key_prefix: Option<String>,
+    consumer_group: Option<String>,
+    visibility_timeout_ms: Option<u64>,
+    poll_interval_ms: Option<u64>,
+    reconcile_interval_ms: Option<u64>,
 }
 
 fn find_config_file_named(filename: &str, env: &dyn Env) -> PathBuf {
@@ -473,6 +653,58 @@ fn parse_orphan_startup_action(key: &str, value: &str) -> Result<OrphanStartupAc
             "invalid orphaned_workflows value for {key}: {value:?}; expected one of: off, warn, fail"
         ))),
     }
+}
+
+/// What redaction returns when the authority cannot be isolated.
+///
+/// A caller prints this instead of a URL that may still hold a password.
+const REDACTED_URL: &str = "<redacted>";
+
+/// Remove the `user:password@` part of a URL authority.
+///
+/// The scan is bounded to the authority: the first `/`, `?` or `#` after the
+/// scheme ends it. An `@` later in the path or the query is left alone.
+///
+/// The function fails closed and returns [`REDACTED_URL`] when it cannot
+/// isolate the authority (issue #1312). Two inputs reach that path. A string
+/// with no `://` has no authority. The second input is an unencoded `/`
+/// inside the password, as in `redis://user:pa/ss@host:6379`. That `/` moves
+/// the `@` out of the authority. The scan then sees `user:pa`, which is not a
+/// valid host and port. Returning the input unchanged in either case would
+/// print the password.
+fn redact_userinfo(url: &str) -> String {
+    let Some(scheme_end) = url.find("://") else {
+        return REDACTED_URL.to_owned();
+    };
+    let authority_start = scheme_end + 3;
+    let rest = &url[authority_start..];
+    let authority_end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+    if let Some(at) = rest[..authority_end].rfind('@') {
+        return format!("{}{}", &url[..authority_start], &rest[at + 1..]);
+    }
+    if is_bare_host_and_port(&rest[..authority_end]) {
+        return url.to_owned();
+    }
+    REDACTED_URL.to_owned()
+}
+
+/// True when `authority` reads as a host with an optional numeric port.
+///
+/// The check is what separates a credential-free URL from one whose password
+/// hides the `@` behind an unencoded `/`. A bracketed IPv6 literal keeps its
+/// brackets, so the port scan starts after the closing bracket.
+fn is_bare_host_and_port(authority: &str) -> bool {
+    let host_end = authority
+        .rfind(']')
+        .map_or(0, |bracket| bracket.saturating_add(1));
+    let (host, port) = match authority[host_end..].split_once(':') {
+        Some((head, port)) => (&authority[..host_end + head.len()], Some(port)),
+        None => (authority, None),
+    };
+    if host.is_empty() {
+        return false;
+    }
+    port.is_none_or(|port| !port.is_empty() && port.bytes().all(|byte| byte.is_ascii_digit()))
 }
 
 fn parse_bool(key: &str, value: &str) -> Result<bool, ConfigError> {
@@ -796,6 +1028,317 @@ orphaned_workflows = "explode"
             "expected the TOML deserialization error to reference the bad value \
              or the field, got {error}"
         );
+    }
+
+    #[test]
+    fn harvest_config_redis_defaults_leave_dispatch_off() {
+        let env = MockEnv::new();
+        let config = HarvestRuntimeConfig::load_with_env(&env).expect("harvest config should load");
+
+        assert_eq!(config.redis.url, None);
+        assert_eq!(config.redis.key_prefix, "harvest");
+        assert_eq!(config.redis.consumer_group, "harvest_workers");
+        assert_eq!(config.redis.visibility_timeout_ms, 60_000);
+        assert_eq!(config.redis.poll_interval_ms, 20);
+        assert_eq!(config.redis.reconcile_interval_ms, 1_000);
+    }
+
+    #[test]
+    fn harvest_config_redis_section_parses_from_toml() {
+        let dir = unique_temp_dir("harvest-config-redis-toml");
+        write_file(
+            &dir.join("autumn.toml"),
+            r#"
+[harvest.redis]
+key_prefix = "acme"
+consumer_group = "acme_workers"
+visibility_timeout_ms = 30000
+poll_interval_ms = 5
+reconcile_interval_ms = 250
+"#,
+        );
+        let env = MockEnv::new().with("AUTUMN_MANIFEST_DIR", dir.to_string_lossy().as_ref());
+
+        let config = HarvestRuntimeConfig::load_with_env(&env).expect("harvest config should load");
+
+        assert_eq!(config.redis.url, None);
+        assert_eq!(config.redis.key_prefix, "acme");
+        assert_eq!(config.redis.consumer_group, "acme_workers");
+        assert_eq!(config.redis.visibility_timeout_ms, 30_000);
+        assert_eq!(config.redis.poll_interval_ms, 5);
+        assert_eq!(config.redis.reconcile_interval_ms, 250);
+    }
+
+    #[test]
+    fn harvest_config_redis_env_overrides_toml() {
+        let dir = unique_temp_dir("harvest-config-redis-env");
+        write_file(
+            &dir.join("autumn.toml"),
+            r#"
+[harvest.redis]
+key_prefix = "from_toml"
+"#,
+        );
+        let env = MockEnv::new()
+            .with("AUTUMN_MANIFEST_DIR", dir.to_string_lossy().as_ref())
+            .with("AUTUMN_HARVEST_REDIS__KEY_PREFIX", "from_env")
+            .with("AUTUMN_HARVEST_REDIS__CONSUMER_GROUP", "env_workers")
+            .with("AUTUMN_HARVEST_REDIS__VISIBILITY_TIMEOUT_MS", "15000")
+            .with("AUTUMN_HARVEST_REDIS__POLL_INTERVAL_MS", "40")
+            .with("AUTUMN_HARVEST_REDIS__RECONCILE_INTERVAL_MS", "2000");
+
+        let config = HarvestRuntimeConfig::load_with_env(&env).expect("harvest config should load");
+
+        assert_eq!(config.redis.key_prefix, "from_env");
+        assert_eq!(config.redis.consumer_group, "env_workers");
+        assert_eq!(config.redis.visibility_timeout_ms, 15_000);
+        assert_eq!(config.redis.poll_interval_ms, 40);
+        assert_eq!(config.redis.reconcile_interval_ms, 2_000);
+    }
+
+    #[test]
+    fn harvest_config_redis_empty_url_env_leaves_dispatch_off() {
+        let env = MockEnv::new().with("AUTUMN_HARVEST_REDIS__URL", "");
+
+        let config = HarvestRuntimeConfig::load_with_env(&env).expect("harvest config should load");
+
+        assert_eq!(config.redis.url, None);
+    }
+
+    #[test]
+    fn harvest_config_redis_rejects_a_zero_poll_interval() {
+        let env = MockEnv::new().with("AUTUMN_HARVEST_REDIS__POLL_INTERVAL_MS", "0");
+
+        let error = HarvestRuntimeConfig::load_with_env(&env)
+            .expect_err("a zero poll interval must fail validation");
+
+        assert!(
+            error.to_string().contains("harvest.redis.poll_interval_ms"),
+            "expected a redis poll_interval_ms validation error, got {error}"
+        );
+    }
+
+    #[test]
+    fn harvest_config_redis_rejects_a_zero_reconcile_interval() {
+        let env = MockEnv::new().with("AUTUMN_HARVEST_REDIS__RECONCILE_INTERVAL_MS", "0");
+
+        let error = HarvestRuntimeConfig::load_with_env(&env)
+            .expect_err("a zero reconcile interval must fail validation");
+
+        assert!(
+            error
+                .to_string()
+                .contains("harvest.redis.reconcile_interval_ms"),
+            "expected a redis reconcile_interval_ms validation error, got {error}"
+        );
+    }
+
+    #[test]
+    fn harvest_config_redis_rejects_a_zero_visibility_timeout() {
+        let env = MockEnv::new().with("AUTUMN_HARVEST_REDIS__VISIBILITY_TIMEOUT_MS", "0");
+
+        let error = HarvestRuntimeConfig::load_with_env(&env)
+            .expect_err("a zero visibility timeout must fail validation");
+
+        assert!(
+            error
+                .to_string()
+                .contains("harvest.redis.visibility_timeout_ms"),
+            "expected a redis visibility_timeout_ms validation error, got {error}"
+        );
+    }
+
+    /// A build without the `redis` feature carries no channel implementation.
+    /// A configured URL must therefore fail at load, not start a runtime that
+    /// silently ignores it.
+    #[cfg(not(feature = "redis"))]
+    #[test]
+    fn harvest_config_redis_url_without_the_feature_is_rejected() {
+        let env = MockEnv::new().with("AUTUMN_HARVEST_REDIS__URL", "redis://127.0.0.1:6379");
+
+        let error = HarvestRuntimeConfig::load_with_env(&env)
+            .expect_err("a redis url must fail validation without the redis feature");
+
+        let message = error.to_string();
+        assert!(
+            message.contains("redis") && message.contains("feature"),
+            "expected the error to name the `redis` cargo feature, got {error}"
+        );
+    }
+
+    /// A build with the `redis` feature accepts a configured URL.
+    #[cfg(feature = "redis")]
+    #[test]
+    fn harvest_config_redis_url_with_the_feature_is_accepted() {
+        let env = MockEnv::new().with("AUTUMN_HARVEST_REDIS__URL", "redis://127.0.0.1:6379");
+
+        let config = HarvestRuntimeConfig::load_with_env(&env).expect("harvest config should load");
+
+        assert_eq!(config.redis.url.as_deref(), Some("redis://127.0.0.1:6379"));
+    }
+
+    #[test]
+    fn redacted_url_is_none_when_dispatch_is_off() {
+        assert_eq!(HarvestRedisConfig::default().redacted_url(), None);
+    }
+
+    #[test]
+    fn redacted_url_keeps_the_host_and_drops_the_credentials() {
+        let config = HarvestRedisConfig {
+            url: Some("redis://operator:hunter2@cache.internal:6379/2".to_owned()),
+            ..HarvestRedisConfig::default()
+        };
+
+        let redacted = config.redacted_url().expect("a url is set");
+
+        assert_eq!(redacted, "redis://cache.internal:6379/2");
+        assert!(!redacted.contains("hunter2"));
+        assert!(!redacted.contains("operator"));
+    }
+
+    #[test]
+    fn redacted_url_leaves_a_credential_free_url_intact() {
+        let config = HarvestRedisConfig {
+            url: Some("rediss://cache.internal:6380".to_owned()),
+            ..HarvestRedisConfig::default()
+        };
+
+        assert_eq!(
+            config.redacted_url().as_deref(),
+            Some("rediss://cache.internal:6380")
+        );
+    }
+
+    #[test]
+    fn redacted_url_ignores_an_at_sign_after_the_authority() {
+        // A password in the path or query must not make the host disappear.
+        let config = HarvestRedisConfig {
+            url: Some("redis://cache.internal:6379/0?token=a@b".to_owned()),
+            ..HarvestRedisConfig::default()
+        };
+
+        assert_eq!(
+            config.redacted_url().as_deref(),
+            Some("redis://cache.internal:6379/0?token=a@b")
+        );
+    }
+
+    /// An unencoded `/` inside the password hides the `@` from the authority
+    /// scan, so the authority cannot be isolated. Redaction fails closed
+    /// (issue #1312).
+    #[test]
+    fn redacted_url_fails_closed_when_the_password_holds_a_slash() {
+        let config = HarvestRedisConfig {
+            url: Some("redis://user:pa/ss@host:6379".to_owned()),
+            ..HarvestRedisConfig::default()
+        };
+
+        let redacted = config.redacted_url().expect("a url is set");
+
+        assert!(
+            !redacted.contains("pa/ss"),
+            "the password must not survive redaction, got {redacted}"
+        );
+        assert_eq!(redacted, "<redacted>");
+    }
+
+    /// A password with no user name still leaves the host readable.
+    #[test]
+    fn redacted_url_drops_a_password_without_a_user_name() {
+        let config = HarvestRedisConfig {
+            url: Some("rediss://:pw@host/0?x=1".to_owned()),
+            ..HarvestRedisConfig::default()
+        };
+
+        let redacted = config.redacted_url().expect("a url is set");
+
+        assert_eq!(redacted, "rediss://host/0?x=1");
+        assert!(!redacted.contains("pw"));
+    }
+
+    /// A string with no `://` has no authority to isolate. Redaction fails
+    /// closed rather than echo the whole value.
+    #[test]
+    fn redacted_url_fails_closed_without_a_scheme_separator() {
+        let config = HarvestRedisConfig {
+            url: Some("operator:hunter2@cache.internal:6379".to_owned()),
+            ..HarvestRedisConfig::default()
+        };
+
+        let redacted = config.redacted_url().expect("a url is set");
+
+        assert_eq!(redacted, "<redacted>");
+        assert!(!redacted.contains("hunter2"));
+    }
+
+    /// Every key the channel owns carries the prefix. An empty prefix collides
+    /// with unrelated keys in the same Redis instance.
+    #[test]
+    fn harvest_config_redis_rejects_an_empty_key_prefix() {
+        let env = MockEnv::new().with("AUTUMN_HARVEST_REDIS__KEY_PREFIX", "");
+
+        let error = HarvestRuntimeConfig::load_with_env(&env)
+            .expect_err("an empty key prefix must fail validation");
+
+        assert!(
+            error.to_string().contains("harvest.redis.key_prefix"),
+            "expected a redis key_prefix validation error, got {error}"
+        );
+    }
+
+    /// Redis rejects an empty consumer group name, so the channel must reject
+    /// it at load rather than at the first read.
+    #[test]
+    fn harvest_config_redis_rejects_an_empty_consumer_group() {
+        let env = MockEnv::new().with("AUTUMN_HARVEST_REDIS__CONSUMER_GROUP", "");
+
+        let error = HarvestRuntimeConfig::load_with_env(&env)
+            .expect_err("an empty consumer group must fail validation");
+
+        assert!(
+            error.to_string().contains("harvest.redis.consumer_group"),
+            "expected a redis consumer_group validation error, got {error}"
+        );
+    }
+
+    /// The poll interval is the blocking-read wait of an idle worker. A value
+    /// above the ceiling delays the shutdown check and the reconcile sweep.
+    #[test]
+    fn harvest_config_redis_rejects_a_poll_interval_above_the_ceiling() {
+        let env = MockEnv::new().with("AUTUMN_HARVEST_REDIS__POLL_INTERVAL_MS", "5001");
+
+        let error = HarvestRuntimeConfig::load_with_env(&env)
+            .expect_err("a poll interval above the ceiling must fail validation");
+
+        assert!(
+            error.to_string().contains("harvest.redis.poll_interval_ms"),
+            "expected a redis poll_interval_ms validation error, got {error}"
+        );
+    }
+
+    /// A visibility timeout below the floor lets a peer recover a reference
+    /// that the owning worker still holds.
+    #[test]
+    fn harvest_config_redis_rejects_a_visibility_timeout_below_the_floor() {
+        let env = MockEnv::new().with("AUTUMN_HARVEST_REDIS__VISIBILITY_TIMEOUT_MS", "999");
+
+        let error = HarvestRuntimeConfig::load_with_env(&env)
+            .expect_err("a visibility timeout below the floor must fail validation");
+
+        assert!(
+            error
+                .to_string()
+                .contains("harvest.redis.visibility_timeout_ms"),
+            "expected a redis visibility_timeout_ms validation error, got {error}"
+        );
+    }
+
+    /// The documented defaults sit inside every bound the validator applies.
+    #[test]
+    fn harvest_config_redis_defaults_pass_validation() {
+        let env = MockEnv::new();
+
+        HarvestRuntimeConfig::load_with_env(&env).expect("the redis defaults must validate");
     }
 
     fn unique_temp_dir(label: &str) -> PathBuf {

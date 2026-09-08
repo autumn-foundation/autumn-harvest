@@ -313,6 +313,8 @@ for a compile-checked polling loop that works with and without the `db` feature.
 | [`autumn-harvest-plugin`](autumn-harvest-plugin/) | `HarvestPlugin` — wires the engine into an Autumn `AppBuilder`, mounts the management API, owns the runtime lifecycle |
 | [`autumn-harvest-macros`](autumn-harvest-macros/) | `#[workflow]`, `#[activity]`, `#[dag]`, `workflows![]`, `activities![]` proc macros |
 | [`autumn-harvest-cli`](autumn-harvest-cli/) | `harvest` CLI: thin operator client for the management API |
+| [`autumn-harvest-redis`](autumn-harvest-redis/) | Optional Redis Streams dispatch channel — carries references to claimable rows; Postgres stays the source of truth |
+| [`autumn-harvest-sqlite`](autumn-harvest-sqlite/) | Optional SQLite storage backend for single-process and embedded deployments |
 
 Use `autumn-harvest-plugin` if you're building an Autumn app. Use the bare
 `autumn-harvest` crate if you want to embed the engine in another framework or
@@ -1113,6 +1115,43 @@ require_shard_readiness = true
 
 The equivalent environment override is
 `AUTUMN_HARVEST_READINESS__REQUIRE_SHARD_READINESS=true`.
+
+## Redis dispatch (optional)
+
+Postgres is the only required infrastructure dependency. On a deep backlog
+the Postgres claim scans and sorts the queue on every claim. An optional
+Redis Streams **dispatch channel** removes that scan: the engine publishes a
+small reference (task id, queue, due time) for each claimable row, and a
+worker claims the named row in Postgres with the full claim predicate before
+it acks the reference. Postgres keeps every row, every claim gate and the
+whole history write path.
+
+Build `autumn-harvest-plugin` with the `redis` feature, then set the URL:
+
+```toml
+[harvest.redis]
+url = "redis://cache:6379"
+```
+
+Leave `url` unset and every worker stays on the Postgres claim path, which
+is the default. A build without the `redis` feature rejects a configured URL
+at config validation rather than ignoring it.
+
+The fallback covers the **running** state. A started process that loses Redis
+returns to the Postgres claim path, so availability with Redis down equals
+availability with Redis absent. It does not cover boot: a configured URL that
+cannot connect **fails startup**, in every mode, with an error naming the
+endpoint. A process that came up without its channel would look healthy and
+publish nothing, so the failure is loud instead.
+
+The connection is plaintext, and `redis://` sends the password in cleartext.
+This release carries no TLS transport: a `rediss://` URL is rejected at
+startup, and issue #1429 tracks TLS support. Keep Redis on a private network
+or behind a TLS tunnel that terminates on the host. v1 targets a single Redis
+instance and a single-shard runtime; Redis Cluster is not supported.
+
+See [`docs/operations/redis-dispatch.md`](docs/operations/redis-dispatch.md)
+for the key layout, the crash matrix, the failure modes and the v1 limits.
 
 ## Testing workflow code changes with the replayer
 
