@@ -1057,6 +1057,44 @@ async fn ui_dead_letters_invalid_task_kind_persists_across_pagination() {
     );
 }
 
+/// `shard_id` used to be typed `Option<i32>` straight on the DLQ page's
+/// `Query<..>` extractor struct, so a non-numeric value failed axum's own
+/// query deserialization — a bare framework 400 before `list_dead_letters_ui`
+/// ever ran, one layer earlier than the `task_kind`/`failed_after`/
+/// `failed_before` page-abort bug #1420 already fixed on this same page.
+#[tokio::test]
+async fn ui_dead_letters_invalid_shard_id_redisplays_form_instead_of_aborting_page() {
+    let (database_url, _container) = setup_test_database_url().await;
+    let app = build_single_shard_ui_app(&database_url);
+
+    let (status, html) = fetch_html(
+        &app,
+        "/dead-letters?shard_id=north&workflow_name=invoice_workflow",
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "an invalid shard_id must not abort the whole DLQ page: {html}"
+    );
+    assert!(
+        html.contains("value=\"invoice_workflow\""),
+        "the other filter the operator already typed must not be discarded: {html}"
+    );
+    assert!(
+        html.contains("role=\"alert\""),
+        "an inline, screen-reader-announced error must sit next to the field: {html}"
+    );
+    assert!(
+        html.contains("value=\"north\""),
+        "the operator's exact invalid text must be echoed back into the field: {html}"
+    );
+    assert!(
+        html.contains("shard_id") && html.contains("north"),
+        "the error must name the field and the bad value: {html}"
+    );
+}
+
 /// DLQ Summary toggle (issue #385): the aggregation view groups entries,
 /// reports counts merged across shards, and links back into the filtered list.
 #[tokio::test]
@@ -1420,6 +1458,40 @@ async fn ui_workers_unknown_stale_value_redisplays_form_instead_of_aborting_page
     assert!(
         html.contains("True"),
         "the error must name the exact bad value the operator sent: {html}"
+    );
+}
+
+/// `shard` used to be typed `Option<i32>` straight on the Workers page's
+/// `Query<..>` extractor struct, so a non-numeric value failed axum's own
+/// query deserialization — a bare framework 400 before `list_workers_ui`
+/// ever ran, one layer earlier than the status/stale page-abort bug #1378
+/// already fixed on this same page.
+#[tokio::test]
+async fn ui_workers_invalid_shard_value_redisplays_form_instead_of_aborting_page() {
+    let (database_url, _container) = setup_test_database_url().await;
+    let app = build_single_shard_ui_app(&database_url);
+
+    let (status, html) = fetch_html(&app, "/workers?shard=north&build_id=abc123").await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "an invalid shard value must not abort the whole Workers page: {html}"
+    );
+    assert!(
+        html.contains("value=\"abc123\""),
+        "the other filter the operator already typed must not be discarded: {html}"
+    );
+    assert!(
+        html.contains("role=\"alert\""),
+        "an inline, screen-reader-announced error must sit next to the field: {html}"
+    );
+    assert!(
+        html.contains("value=\"north\""),
+        "the operator's exact invalid text must be echoed back into the field: {html}"
+    );
+    assert!(
+        html.contains("shard") && html.contains("north"),
+        "the error must name the field and the bad value: {html}"
     );
 }
 
@@ -1856,6 +1928,76 @@ async fn ui_schedules_filter_by_kind_dag() {
     assert!(
         !html.contains("wf_hidden"),
         "workflow row should not appear after kind=Dag: {html}"
+    );
+}
+
+/// `list_schedules_ui` used to `?`-propagate `ScheduleKindFilter::parse`'s
+/// `Result` directly, so a bad `kind` value aborted the whole page with a
+/// bare 400 before the filter form, the table, or the operator's other
+/// filters ever rendered — the exact page-abort defect already fixed on
+/// this page's three sibling list pages (Workflows #1333, Workers #1378,
+/// Dead-Letters #1420), which never reached the Schedules page itself.
+#[tokio::test]
+async fn ui_schedules_invalid_kind_value_redisplays_form_instead_of_aborting_page() {
+    let (database_url, _container) = setup_test_database_url().await;
+    let app = build_single_shard_ui_app(&database_url);
+
+    let (status, html) = fetch_html(&app, "/schedules?kind=zombie&target=billing").await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "an invalid kind value must not abort the whole Schedules page: {html}"
+    );
+    assert!(
+        html.contains("value=\"billing\""),
+        "the other filter the operator already typed must not be discarded: {html}"
+    );
+    assert!(
+        html.contains("role=\"alert\""),
+        "an inline, screen-reader-announced error must sit next to the field: {html}"
+    );
+    assert!(
+        html.contains("option value=\"zombie\" selected"),
+        "the Kind select must echo the invalid value back as its selected \
+         option, not silently revert to 'All': {html}"
+    );
+    assert!(
+        html.contains("zombie") && html.contains("Workflow"),
+        "the error must name the bad value and a valid option: {html}"
+    );
+}
+
+/// Same page-abort defect, `shard_id` side: it was typed `Option<i32>`
+/// straight on the `Query<..>` extractor struct, so a non-numeric value
+/// failed axum's own query deserialization before the handler ran at all —
+/// one layer earlier than the `kind`/`paused`/`health` fix above, and with
+/// no styled error whatsoever.
+#[tokio::test]
+async fn ui_schedules_invalid_shard_id_redisplays_form_instead_of_aborting_page() {
+    let (database_url, _container) = setup_test_database_url().await;
+    let app = build_single_shard_ui_app(&database_url);
+
+    let (status, html) = fetch_html(&app, "/schedules?shard_id=north&target=billing").await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "an invalid shard_id must not abort the whole Schedules page: {html}"
+    );
+    assert!(
+        html.contains("value=\"billing\""),
+        "the other filter the operator already typed must not be discarded: {html}"
+    );
+    assert!(
+        html.contains("role=\"alert\""),
+        "an inline, screen-reader-announced error must sit next to the field: {html}"
+    );
+    assert!(
+        html.contains("value=\"north\""),
+        "the operator's exact invalid text must be echoed back into the field: {html}"
+    );
+    assert!(
+        html.contains("shard_id") && html.contains("north"),
+        "the error must name the field and the bad value: {html}"
     );
 }
 
