@@ -157,6 +157,18 @@ jobs:
         # the superseded 0.4.0 -> 0.5.0 guide. See
         # scripts/check-readme-upgrade-guide-current.sh.
         run: ./scripts/check-readme-upgrade-guide-current.sh
+      - name: Check search_attr query-string syntax in docs
+        # Guards a real, reproduced-live defect: examples/billing-autumn-web's
+        # README — the repository's own reference example for a real
+        # integration, the first thing README.md points a reader at past the
+        # tiny hello-world path — gave `search_attr=tenant_id=acme` in the
+        # curl it tells a reader to run right after starting a checkout.
+        # parse_workflow_filters splits the value on ':', not '=', so that
+        # exact command 400s: "invalid search_attr 'tenant_id=acme'; expected
+        # 'key:value'". No CI job runs this example, so nothing else catches
+        # this class of drift. See
+        # scripts/check-search-attr-query-syntax.sh.
+        run: ./scripts/check-search-attr-query-syntax.sh
       - name: Check formatting
         run: cargo fmt --all -- --check
       - name: Clippy autumn-harvest
