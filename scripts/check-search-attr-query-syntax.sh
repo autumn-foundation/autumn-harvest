@@ -5,7 +5,11 @@
 # Mechanism this guards against: `parse_workflow_filters` in
 # autumn-harvest-plugin/src/api.rs parses each `search_attr` query value with
 # `value.split_once(':')` and 400s with "invalid search_attr '...'; expected
-# 'key:value'" when no colon is present. README.md documents the correct
+# 'key:value'" when no colon is present. That value has already been
+# percent-decoded by `strict_query::decode_or_autumn_error` before
+# `parse_workflow_filters` sees it, so a literal `:` and its percent-encoded
+# form `%3A`/`%3a` are equally valid on the wire — this guard accepts both
+# (Codex review, PR #1432). README.md documents the correct
 # `?search_attr=tenant:acme` shape, but examples/billing-autumn-web/README.md
 # — the repository's own "reference example for the less tiny path" and the
 # first thing a reader building a real integration is pointed at — gave
@@ -36,7 +40,7 @@ while IFS=: read -r file line_no line; do
     if [ -z "$value" ]; then
       continue
     fi
-    if [[ "$value" =~ ^[^:=]+: ]]; then
+    if [[ "$value" =~ ^[^:=]+: ]] || [[ "$value" =~ ^[^:=]+%3[Aa] ]]; then
       continue
     fi
     echo "$file:$line_no: 'search_attr=$value' does not match the API's" \
