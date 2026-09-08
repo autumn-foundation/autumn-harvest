@@ -2204,8 +2204,11 @@ async fn ui_schedules_auto_refresh_meta_tag() {
 
     let (status, html) = fetch_html(&app, "/schedules?refresh=30").await;
     assert_eq!(status, StatusCode::OK);
+    // Maud HTML-escapes attribute values. The rendered `&` between query
+    // params comes back as `&amp;`, same as every other multi-param
+    // assertion in this file (Codex review, #1437).
     assert!(
-        html.contains(r#"content="30; url=schedules?page=0&refresh=30""#)
+        html.contains(r#"content="30; url=schedules?page=0&amp;refresh=30""#)
             && html.contains("http-equiv=\"refresh\""),
         "auto-refresh meta tag with content=30 and a flash-free target missing: {html}"
     );
