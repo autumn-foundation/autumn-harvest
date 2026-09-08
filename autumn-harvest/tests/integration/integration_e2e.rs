@@ -12200,8 +12200,8 @@ async fn windowed_fan_out_peak_task_rows_bounded_by_window() {
 #[test]
 fn init_sql_creates_every_table_the_claim_path_references() {
     // Both claim statements, not only the unfenced one. The fenced variant
-    // splices in `harvest_shard_generation`, a table no other query names, so
-    // scanning only the base query left that gap to a Docker-backed CI cycle
+    // splices in `harvest_shard_generation`. No other query names that table.
+    // Scanning only the base query left that gap to a Docker-backed CI cycle
     // (issue #1312).
     let claim_sql = format!(
         "{} {}",
