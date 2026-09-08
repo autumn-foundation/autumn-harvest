@@ -8,12 +8,19 @@ the rerun-button census and, new this round, clusters every red `pull_request`-e
 cache-correctness and windows-`no-db` timing findings but had not yet checked whether
 any of the reds in this repo's history are actually flaky.
 
-## 🎯 Verdict path (unchanged)
+## 🎯 Verdict path
 
-Same as all four prior reports. Branch-protection status for `test-db-linux`'s 10
-shards and `test-nodb`'s 12 shards is still unconfirmed from this session — no
-branch-protection-read tool is exposed here, checked again today. Not re-diagnosing;
-flagging that the gap is still open.
+Branch-protection status for `test-db-linux`'s 10 shards and `test-nodb`'s 12 shards
+is still unconfirmed from this session — no branch-protection-read tool is exposed
+here, checked again today. Not re-diagnosing; flagging that the gap is still open.
+
+**Not unchanged, per a Codex review comment on this PR:** `ci.yml` now also defines
+`openapi-client-smoke` (`ci.yml:984-990`), added after the 09-06 report and carrying
+the identical "not yet enforced" comment as `test-nodb`/`test-db-linux`. This report's
+own earlier draft said the verdict path was "same as all four prior reports," which
+missed that a third unenforced check now exists — a failure in generated-client
+generation or execution may also not block merging, unconfirmed the same way as the
+other two families.
 
 ## 🌡️ Symptom
 
@@ -21,10 +28,24 @@ flagging that the gap is still open.
 
 100 most recent completed `pull_request`-event `ci.yml` runs, `run_attempt` field
 checked directly: **0/100 show `run_attempt > 1`.** Identical to the 09-03 and 09-06
-reports' findings — still no reflexive-rerun culture, still no ambient retry wrapper
-anywhere in this pipeline. Conclusion split across the same 100: 25 success, 66
-cancelled (superseded by a later push to the same PR — expected under a
-cancel-in-progress concurrency group, not a CI-health signal), 9 failure.
+reports' findings — still no reflexive-rerun culture, no whole-job or workflow-level
+rerun in the sample. Conclusion split across the same 100: 25 success, 66 cancelled
+(superseded by a later push to the same PR — expected under a cancel-in-progress
+concurrency group, not a CI-health signal), 9 failure.
+
+**Narrowed per a Codex review comment on this PR:** `run_attempt` cannot see a
+retry that happens *inside* a single job step, and one exists —
+`openapi-client-smoke` (`ci.yml:1057-1059`) runs `npm ci --no-audit --no-fund ||
+(sleep 10 && npm ci --no-audit --no-fund)`, an in-step sleep-and-retry around the npm
+registry specifically, with a comment at the call site limiting it to that one
+external boundary ("the registry is the one thing here that fails for unrelated
+reasons. Two tries, then it is real."). That is the shape this role's own charter
+calls sanctioned — declared, bounded, at a genuinely external boundary — not the
+banned ambient/suite-level kind. But it does mean this census cannot support "no
+retry wrapper anywhere in this pipeline" as a blanket claim, and it cannot observe
+this class of transient failure (a first-attempt `npm ci` failure recovered by the
+second attempt still shows as `run_attempt == 1` and a green conclusion). Narrowed
+to what the census actually measures: no workflow- or job-level reruns.
 
 ### 2. Every one of the 9 failures, root-caused, not just tallied
 
