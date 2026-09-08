@@ -5499,34 +5499,64 @@ pub struct OverdueSamplePass {
     pub min_cadence_step: Option<Duration>,
 }
 
+/// Calendar names for the batched exclusions query, restricted to
+/// schedules that would actually reach the lookup.
+///
+/// Mirrors `resolve_effective_fire_at`'s original per-schedule
+/// short-circuit: a calendar name, a pending slot, and a parseable
+/// cadence must all be present. Not every calendar name any schedule
+/// carries reaches that check.
+///
+/// A calendar used only by manual or exhausted schedules
+/// (`next_run_at = None`), or by schedules with an unparseable cadence,
+/// was never queried by the old per-schedule loop. Including such a name
+/// here would let a failure on it abort the whole pass, when before it
+/// never surfaced.
+fn calendar_names_needing_exclusions(schedules: &[HarvestSchedule]) -> Vec<&str> {
+    schedules
+        .iter()
+        .filter(|s| s.next_run_at.is_some())
+        .filter_map(|s| {
+            let cal_name = s.calendar_name.as_deref()?;
+            let expr = s.schedule_expr.as_deref()?;
+            parse_schedule_from_expr(expr)?;
+            Some(cal_name)
+        })
+        .collect::<std::collections::BTreeSet<_>>()
+        .into_iter()
+        .collect()
+}
+
 /// Compute the overdue verdict for every schedule on one shard, plus the shard's
 /// fastest active cadence (issue #696).
 ///
-/// Loads all schedule rows on `conn` and computes the tick's exact
+/// Loads all schedule rows on `conn`. It computes the tick's exact
 /// shard-local running basis via the batched [`schedule_running_basis_batch`]
-/// (`RUNNING`/`PAUSED` count + #607 pending-throttle backlog) and the
-/// calendar-adjusted fire time via [`resolve_effective_fire_at_pure`] fed by
-/// [`crate::calendar::load_exclusions_for_calendars`] — one grouped query
-/// each for every schedule on the shard, instead of up to three round trips
-/// *per schedule row* — so the `at_capacity` suppression fires *exactly* when
-/// the tick would hold `next_run_at`. Then runs the pure [`schedule_overdue`]
-/// predicate against `now`. ALL schedules are returned (including
-/// paused/exhausted, which resolve to not-overdue) so the sampler can keep
-/// the gauge fresh. In the same pass it tracks the minimum cadence of active
-/// schedules for the adaptive sampler interval (Codex round 4) — gathered
-/// here to avoid a second schedule load.
+/// (`RUNNING`/`PAUSED` count + #607 pending-throttle backlog). It computes
+/// the calendar-adjusted fire time via [`resolve_effective_fire_at_pure`],
+/// fed by [`crate::calendar::load_exclusions_for_calendars`]. Each of those
+/// is one grouped query for every schedule on the shard, instead of up to
+/// three round trips *per schedule row*. The `at_capacity` suppression
+/// therefore fires *exactly* when the tick would hold `next_run_at`. The
+/// pure [`schedule_overdue`] predicate then runs against `now`. ALL
+/// schedules are returned (including paused/exhausted, which resolve to
+/// not-overdue) so the sampler can keep the gauge fresh. In the same pass it
+/// tracks the minimum cadence of active schedules. This feeds the adaptive
+/// sampler interval (issue #696) and is gathered here to avoid a second
+/// schedule load.
 ///
-/// This mirrors the batching `autumn-harvest-plugin/src/api.rs`'s
-/// `load_schedule_overdue_aux_by_shard` applies to the same three lookups for
-/// `GET /admin/schedules` (issue #696 / Codex round 3, Ledger perf pass).
-/// That investigation named this sampler as the identical N+1 shape on a
-/// periodic background pass rather than a per-HTTP-request path, and left it
-/// as a follow-up. See `docs/performance-schedule-overdue-aux.md`'s "Known
-/// limitations". Unlike that endpoint, a failed batch here propagates as an
-/// `Err` (via `?`), matching this function's pre-existing per-schedule error
-/// behavior: the old loop's `schedule_running_basis(..).await?` and
+/// This mirrors the batching that `autumn-harvest-plugin/src/api.rs`'s
+/// `load_schedule_overdue_aux_by_shard` applies to the same three lookups
+/// for `GET /admin/schedules` (issue #696, Ledger perf pass). That
+/// investigation named this sampler as the identical N+1 shape on a
+/// periodic background pass, not a per-HTTP-request path. It left this as
+/// a follow-up. See `docs/performance-schedule-overdue-aux.md`'s "Known
+/// limitations". Unlike that endpoint, a failed batch here propagates as
+/// an `Err` (via `?`). This matches the function's pre-existing
+/// per-schedule error behavior: the old loop's
+/// `schedule_running_basis(..).await?` and
 /// `resolve_effective_fire_at(..).await?` calls already failed the whole
-/// pass on any query error, so batching does not change error semantics.
+/// pass on any query error. So batching does not change error semantics.
 ///
 /// # Errors
 ///
@@ -5542,9 +5572,9 @@ pub async fn overdue_schedule_pass(
         .await
         .map_err(crate::error::database_error)?;
 
-    // Batched, once per shard (see the doc comment above): replaces what used
-    // to be up to three DB round trips *per schedule row* with exactly two
-    // grouped queries covering every schedule on the shard at once.
+    // Batched, once per shard (see the doc comment above). Replaces what
+    // used to be up to three DB round trips *per schedule row*. Now exactly
+    // two grouped queries cover every schedule on the shard at once.
     let schedule_names: Vec<(uuid::Uuid, &str)> = schedules
         .iter()
         .map(|s| {
@@ -5559,12 +5589,7 @@ pub async fn overdue_schedule_pass(
         .collect();
     let basis = schedule_running_basis_batch(conn, &schedule_names).await?;
 
-    let calendar_names: Vec<&str> = schedules
-        .iter()
-        .filter_map(|s| s.calendar_name.as_deref())
-        .collect::<std::collections::BTreeSet<_>>()
-        .into_iter()
-        .collect();
+    let calendar_names = calendar_names_needing_exclusions(&schedules);
     let exclusions = crate::calendar::load_exclusions_for_calendars(conn, &calendar_names).await?;
 
     let mut samples = Vec::with_capacity(schedules.len());
@@ -5609,9 +5634,10 @@ pub async fn overdue_schedule_pass(
             s.catchup,
         )
         .is_catchup_enabled();
-        // Calendar-adjusted fire time (Codex round 3): resolve the tick's own
-        // calendar rebasing, in memory against the exclusions batch loaded
-        // once above, so a calendar-deferred future fire is not flagged.
+        // Calendar-adjusted fire time (issue #696): resolves the tick's own
+        // calendar rebasing in memory, against the exclusions batch loaded
+        // once above. A calendar-deferred future fire is therefore not
+        // flagged.
         let effective_fire_at = s.calendar_name.as_deref().and_then(|cal_name| {
             let empty: Vec<NaiveDate> = Vec::new();
             let excluded = exclusions.get(cal_name).unwrap_or(&empty);
