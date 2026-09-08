@@ -135,6 +135,12 @@ pub async fn admit_batched_start(
         )));
     }
 
+    // Reject an empty id before persisting a row (issue #1353). A stored
+    // batch with no id could only be discarded on fire, not started.
+    if params.workflow_id.is_empty() {
+        return Err(HarvestError::EmptyWorkflowId);
+    }
+
     let now = Utc::now();
     let max_wait_chrono = chrono::Duration::from_std(params.max_wait)
         .unwrap_or_else(|_| chrono::Duration::days(365 * 100));

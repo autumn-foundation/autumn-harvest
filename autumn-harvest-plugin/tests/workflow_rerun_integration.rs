@@ -3635,3 +3635,28 @@ async fn rerun_of_failed_source_with_no_retry_successor_still_works() {
     let (status, body) = post_json(&app, &rerun_uri(&source), json!({})).await;
     assert_eq!(status, StatusCode::CREATED, "{body}");
 }
+
+/// R-66: issue #1353 — an explicit empty `workflow_id` override is rejected
+/// 400, the same rejection `start_workflow` now applies. An empty override is
+/// distinct from omitting the field (R-18: reuses the source's key). It is
+/// never a valid literal business id, so the source is left untouched.
+#[tokio::test]
+async fn rerun_with_empty_workflow_id_override_is_rejected_400() {
+    let (url, _c) = setup_database().await;
+    let pool = build_pool(&url);
+    let wf = "rr_empty_override_wf";
+    let app = build_app(&pool, vec![plain_info(wf)]);
+    let mut conn = pool.get().await.unwrap();
+
+    let wf_id = unique("rr-empty-override");
+    let source = seed_terminal(&mut conn, wf, &wf_id, "COMPLETED").await;
+
+    let (status, body) = post_json(&app, &rerun_uri(&source), json!({"workflow_id": ""})).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert_eq!(body["error"], json!("workflow_id must not be empty"));
+    assert_eq!(
+        load_exec(&mut conn, &source).await.state,
+        "COMPLETED",
+        "a rejected override must not seal or touch the source"
+    );
+}

@@ -884,3 +884,228 @@ async fn name_only_by_id_path_is_rejected_400() {
     );
     assert_eq!(resp_post.body["error"], json!("workflow_id is required"));
 }
+
+// ── issue #1353: an explicit empty workflow_id is rejected, not silently
+// addressable through nine of ten by-id routes and 404 on the tenth ──────────
+//
+// `workflow_id: ""` is a value distinct from omitting the field. Omitting it
+// auto-generates a UUID. The API accepted an explicit empty string too, as a
+// literal business id, with no validation.
+//
+// `matchit` (the router `axum` uses) cannot bind an empty FINAL path segment.
+// So `GET /workflows/by-id/{name}/{id}` 404'd for such a run. Every sibling
+// by-id route resolved it fine instead, because it reaches the empty id via a
+// non-final segment (e.g. `.../{id}/stack`). That split was an internal
+// contradiction for one identifier.
+//
+// The fix closes the gap at both ends. It rejects the value at creation
+// (start, and the rerun override). It also rejects it uniformly across the
+// whole by-id route family. A pre-existing row is then never split 200 on
+// nine routes and 404 on the tenth.
+
+/// issue #1353: starting a workflow with an explicit empty `workflow_id` is
+/// rejected 400. Distinguishes "explicitly empty" (rejected) from "omitted"
+/// (auto-generates a UUID, unaffected by this change).
+#[tokio::test]
+async fn start_with_empty_workflow_id_is_rejected_400() {
+    let (url, _c) = setup_database().await;
+    let pool = build_pool(&url);
+    let app = build_app(&pool, true);
+
+    let resp = send(
+        &app,
+        post_json(
+            "/workflows/progress_wf/start",
+            &json!({"workflow_id": "", "input": "x"}),
+        ),
+    )
+    .await;
+    assert_eq!(
+        resp.status,
+        StatusCode::BAD_REQUEST,
+        "empty workflow_id must be rejected 400: {}",
+        resp.body
+    );
+    assert_eq!(resp.body["error"], json!("workflow_id must not be empty"));
+}
+
+/// issue #1353: the base by-id route is addressed with the trailing-slash
+/// form (`GET .../order_flow/`). That form carries an empty `workflow_id`. It
+/// must reject with the SAME 400 every sibling route gives for an empty id,
+/// not axum's structural 404. Reproduces the issue's exact repro path.
+#[tokio::test]
+async fn by_id_base_route_trailing_slash_rejects_empty_workflow_id() {
+    let (url, _c) = setup_database().await;
+    let pool = build_pool(&url);
+    let app = build_app(&pool, true);
+
+    let resp = send(&app, get("/workflows/by-id/order_flow/")).await;
+    assert_eq!(
+        resp.status,
+        StatusCode::BAD_REQUEST,
+        "trailing-slash empty workflow_id must be rejected 400, not a router 404: {}",
+        resp.body
+    );
+    assert_eq!(
+        resp.body["detail"],
+        json!("workflow_id must not be empty"),
+        "must reuse resolve_workflow_by_business_id's shared rejection: {}",
+        resp.body
+    );
+}
+
+/// issue #1353: a sibling by-id route can be reached with an empty
+/// `workflow_id` via a non-final empty segment (`.../order_flow//stack`).
+/// `start_or_load_workflow_execution` itself now rejects an empty
+/// `workflow_id` (issue #1353, core-level guard). This seeds a normal row
+/// instead, then force-updates `workflow_id` directly with a raw `UPDATE`.
+/// That sits below even the engine. It reconstructs a row that predates
+/// every layer of this fix. This route resolved such a row (200) by
+/// accident of `matchit`'s empty-segment matching -- a router detail, not a
+/// documented contract. The base route 404'd for the same row instead. It
+/// must now reject 400 here too, consistent with the base route.
+#[tokio::test]
+async fn by_id_sibling_route_rejects_empty_workflow_id() {
+    let (url, _c) = setup_database().await;
+    let pool = build_pool(&url);
+    let mut conn = pool.get().await.expect("conn");
+    let exec_id = seed(&mut conn, "order_flow", "pre-fix-seed", "RUNNING", 0).await;
+    diesel::update(harvest_workflow_executions::table.find(exec_id.as_uuid()))
+        .set(harvest_workflow_executions::workflow_id.eq(""))
+        .execute(&mut conn)
+        .await
+        .expect("force workflow_id empty below the engine guard");
+    drop(conn);
+
+    let app = build_app(&pool, true);
+
+    let resp = send(&app, get("/workflows/by-id/order_flow//stack")).await;
+    assert_eq!(
+        resp.status,
+        StatusCode::BAD_REQUEST,
+        "empty workflow_id on a sibling route must be rejected 400 even for \
+         a pre-existing row: {}",
+        resp.body
+    );
+    assert_eq!(resp.body["detail"], json!("workflow_id must not be empty"));
+}
+
+/// issue #1353: the guard covers the MUTATING side of the by-id family too,
+/// not just reads. `cancel` shares `resolve_workflow_by_business_id` with
+/// every GET route above. It sits behind `require_admin` middleware, though.
+/// This is the only test here reaching that handler with an empty
+/// `workflow_id`.
+#[tokio::test]
+async fn cancel_by_id_rejects_empty_workflow_id() {
+    let (url, _c) = setup_database().await;
+    let pool = build_pool(&url);
+    let app = build_app(&pool, true);
+
+    let resp = send(
+        &app,
+        post_json(
+            "/workflows/by-id/order_flow//cancel",
+            &json!({"reason": "dup"}),
+        ),
+    )
+    .await;
+    assert_eq!(resp.status, StatusCode::BAD_REQUEST, "body: {}", resp.body);
+    assert_eq!(resp.body["detail"], json!("workflow_id must not be empty"));
+}
+
+/// issue #1353: omitting `workflow_id` (the pre-existing auto-generate path)
+/// is unaffected — only an explicit empty string is rejected.
+#[tokio::test]
+async fn start_with_omitted_workflow_id_still_auto_generates() {
+    let (url, _c) = setup_database().await;
+    let pool = build_pool(&url);
+    let app = build_app(&pool, true);
+
+    let resp = send(
+        &app,
+        post_json("/workflows/progress_wf/start", &json!({"input": "x"})),
+    )
+    .await;
+    assert_eq!(resp.status, StatusCode::CREATED, "body: {}", resp.body);
+    assert!(
+        resp.body["workflow_id"]
+            .as_str()
+            .is_some_and(|id| !id.is_empty()),
+        "an omitted workflow_id must still auto-generate a non-empty id: {}",
+        resp.body
+    );
+}
+
+// ── issue #1353 review (correctness pass): the empty-`workflow_id` guard
+// must cover every route that can create a fresh execution, not only
+// `POST /workflows/{name}/start`. `signal-with-start`, `update-with-start`
+// and `batch_start` each parse their own request struct. Each can reach the
+// DB with an unvalidated `workflow_id`. Each needs its own call site.
+
+/// issue #1353: `signal-with-start`'s `workflow_id` is a mandatory `String`,
+/// not `Option<String>` like plain start. An empty string deserializes
+/// cleanly and must be rejected explicitly.
+#[tokio::test]
+async fn signal_with_start_rejects_empty_workflow_id_400() {
+    let (url, _c) = setup_database().await;
+    let pool = build_pool(&url);
+    let app = build_app(&pool, true);
+
+    let resp = send(
+        &app,
+        post_json(
+            "/workflows/progress_wf/signal-with-start",
+            &json!({"workflow_id": "", "signal_name": "approve"}),
+        ),
+    )
+    .await;
+    assert_eq!(resp.status, StatusCode::BAD_REQUEST, "body: {}", resp.body);
+    assert_eq!(resp.body["error"], json!("workflow_id must not be empty"));
+}
+
+/// issue #1353: `update-with-start`'s `workflow_id` is a mandatory `String`,
+/// same gap as `signal-with-start`.
+#[tokio::test]
+async fn update_with_start_rejects_empty_workflow_id_400() {
+    let (url, _c) = setup_database().await;
+    let pool = build_pool(&url);
+    let app = build_app(&pool, true);
+
+    let resp = send(
+        &app,
+        post_json(
+            "/workflows/progress_wf/update-with-start",
+            &json!({"workflow_id": "", "update_name": "bump"}),
+        ),
+    )
+    .await;
+    assert_eq!(resp.status, StatusCode::BAD_REQUEST, "body: {}", resp.body);
+    assert_eq!(resp.body["error"], json!("workflow_id must not be empty"));
+}
+
+/// issue #1353: a `batch_start` item with an explicit empty `workflow_id` is
+/// rejected per-item, not silently started under `""`. The batch itself
+/// still 200s in non-atomic mode; the item carries `status: "rejected"`.
+#[tokio::test]
+async fn batch_start_rejects_item_with_empty_workflow_id() {
+    let (url, _c) = setup_database().await;
+    let pool = build_pool(&url);
+    let app = build_app(&pool, true);
+
+    let resp = send(
+        &app,
+        post_json(
+            "/workflows/batch_start",
+            &json!({
+                "items": [{"workflow_name": "progress_wf", "workflow_id": ""}],
+                "atomic": false
+            }),
+        ),
+    )
+    .await;
+    assert_eq!(resp.status, StatusCode::OK, "body: {}", resp.body);
+    let results = resp.body["results"].as_array().expect("results array");
+    assert_eq!(results.len(), 1);
+    assert_eq!(results[0]["status"], json!("rejected"));
+    assert_eq!(results[0]["error"], json!("workflow_id must not be empty"));
+}

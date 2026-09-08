@@ -292,6 +292,14 @@ fn route_class(method: &str, path: &str) -> &'static str {
 
 /// A stable, unique operation id, so a generated client keeps method names
 /// across regenerations. `{param}` becomes `by_param`.
+///
+/// A literal trailing slash is a distinct, separately registered route
+/// (issue #1353). `matchit` binds it differently from the no-slash form. Two
+/// routes can therefore share every segment and differ only in that slash --
+/// for example, the by-id empty-`workflow_id` guard and its name-only
+/// sibling. Splitting on `/` and dropping empty segments would collapse both
+/// onto the same id. The trailing slash gets its own marker instead of being
+/// dropped silently.
 fn operation_id(method: &str, path: &str) -> String {
     let mut id = method.to_lowercase();
     for segment in path.split('/').filter(|s| !s.is_empty()) {
@@ -302,6 +310,9 @@ fn operation_id(method: &str, path: &str) -> String {
         } else {
             id.push_str(&sanitize(segment));
         }
+    }
+    if path.len() > 1 && path.ends_with('/') {
+        id.push_str("_slash");
     }
     id
 }
@@ -795,6 +806,16 @@ mod tests {
             "post_workflows_by_workflow_name_start"
         );
         assert_eq!(operation_id("GET", "/openapi.json"), "get_openapi_json");
+    }
+
+    /// issue #1353: a literal trailing slash must not collapse onto the same
+    /// operation id as its no-slash sibling.
+    #[test]
+    fn a_trailing_slash_gets_a_distinct_operation_id() {
+        let no_slash = operation_id("GET", "/workflows/by-id/{workflow_name}");
+        let with_slash = operation_id("GET", "/workflows/by-id/{workflow_name}/");
+        assert_ne!(no_slash, with_slash);
+        assert_eq!(with_slash, format!("{no_slash}_slash"));
     }
 
     #[test]

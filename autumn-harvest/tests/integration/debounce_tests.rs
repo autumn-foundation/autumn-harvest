@@ -885,3 +885,32 @@ async fn fire_emits_debounce_fired_metric() {
     assert_eq!(fired_events.len(), 1);
     assert_eq!(fired_events[0].0, wf);
 }
+
+// ── Empty workflow_id admission (issue #1353) ─────────────────────────────────
+
+// Admission must reject an empty id before it writes a row. A written row
+// with no id could only be discarded on fire, never started.
+#[tokio::test]
+async fn admit_rejects_empty_workflow_id_before_writing_a_row() {
+    let (mut conn, _c) = setup_db().await;
+
+    let wf = "empty_id_wf";
+    let key = "tenant:empty-id";
+    let window = Duration::from_secs(60);
+    let max_wait = Duration::from_secs(60);
+
+    let err = admit_debounced_start(
+        &mut conn,
+        admit_params(wf, key, "", serde_json::json!({}), window, max_wait),
+        false,
+    )
+    .await
+    .expect_err("empty workflow_id must be rejected");
+    assert!(matches!(
+        err,
+        autumn_harvest::error::HarvestError::EmptyWorkflowId
+    ));
+
+    // No row was written.
+    assert_eq!(debounce_row_count(&mut conn, wf, key).await, 0);
+}

@@ -9329,6 +9329,34 @@
     },
     {
       "method": "GET",
+      "path": "/workflows/by-id/{workflow_name}/",
+      "category": "workflow",
+      "read_only": true,
+      "idempotency": "Safe",
+      "description": "Empty-workflow_id guard for the business-id route family (issue #1353): the literal trailing-slash form of GET /workflows/by-id/{workflow_name}/{workflow_id}, reached when a caller supplies an empty workflow_id. Always returns 400 -- workflow_id is a value the API accepted at start with no validation, but the by-id route family cannot address an empty id consistently, so it is rejected uniformly instead. No read, no write.",
+      "params": [
+        {
+          "name": "workflow_name",
+          "in": "path",
+          "required": true,
+          "description": "Business workflow type name."
+        }
+      ],
+      "request_body": null,
+      "success_response": {
+        "status": 400,
+        "free_form": true,
+        "note": "Always 400: workflow_id must not be empty."
+      },
+      "error_responses": [
+        {
+          "status": 400,
+          "description": "workflow_id must not be empty."
+        }
+      ]
+    },
+    {
+      "method": "GET",
       "path": "/workflows/by-id/{workflow_name}/{workflow_id}/result",
       "category": "workflow",
       "read_only": true,

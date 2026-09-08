@@ -379,6 +379,16 @@ pub enum HarvestError {
     #[error("invalid configuration: {0}")]
     Config(String),
 
+    /// `workflow_id` was an explicit empty string (issue #1353).
+    ///
+    /// Distinct from [`Self::Config`] so a caller can pattern-match on it
+    /// precisely. A debounce or throttle fire scanner treats it as a
+    /// permanently doomed legacy row -- one that predates this validation.
+    /// It deletes the row, like [`Self::AlreadyExists`]. It does not
+    /// propagate the error and abort the whole batch transaction.
+    #[error("workflow_id must not be empty")]
+    EmptyWorkflowId,
+
     /// A workflow execution with the same `(workflow_name, workflow_id)` already
     /// exists and the caller's reuse policy does not permit reuse.
     ///

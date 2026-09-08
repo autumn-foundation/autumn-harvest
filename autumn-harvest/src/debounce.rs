@@ -355,6 +355,12 @@ pub async fn admit_debounced_start(
         )));
     }
 
+    // Reject an empty id before persisting a row (issue #1353). A stored
+    // deferred start with no id could only be discarded on fire, not started.
+    if params.workflow_id.is_empty() {
+        return Err(crate::error::HarvestError::EmptyWorkflowId);
+    }
+
     let now = Utc::now();
     // Clamp absurd/overflowing durations to a large-but-finite value and use
     // checked addition so an extreme `window`/`max_wait` can never panic.
@@ -941,6 +947,25 @@ async fn fire_claimed_debounce_row(
                 debounce_key = %debounce_key,
                 workflow_id = %workflow_id,
                 "debounced start skipped: workflow_id already exists under reuse policy",
+            );
+            Ok(None)
+        }
+        // An empty workflow_id here can only be a LEGACY row (issue #1353).
+        // It predates this validation -- the admission path now rejects an
+        // empty id before a debounce row can ever be written. Such a row
+        // can never start, so retrying it changes
+        // nothing. An un-caught `?` here would abort this whole batch's
+        // fire transaction. It would repeat the same failure every scanner
+        // tick. That starves every later scanner duty for as long as the
+        // row sits at the head of the claim queue. That is the exact
+        // hazard the `AlreadyExists` arm above already guards against.
+        // Drop the row the same way.
+        Err(crate::error::HarvestError::EmptyWorkflowId) => {
+            delete_debounce_row(conn, row_id).await?;
+            tracing::warn!(
+                workflow_name = %workflow_name,
+                debounce_key = %debounce_key,
+                "debounced start skipped: legacy row has an empty workflow_id (issue #1353)",
             );
             Ok(None)
         }

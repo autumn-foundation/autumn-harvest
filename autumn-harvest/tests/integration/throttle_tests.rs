@@ -2607,3 +2607,30 @@ async fn scanner_fire_of_a_backfill_deferral_does_not_record_schedule_run_metric
          behavior (it never calls record_schedule_run either)"
     );
 }
+
+// ── Empty workflow_id admission (issue #1353) ─────────────────────────────────
+
+// Admission must reject an empty id before it reserves a token or writes a
+// deferred row. A reservation or row with no id could only be discarded on
+// fire, never started.
+#[tokio::test]
+async fn reserve_rejects_empty_workflow_id_before_reserving_or_deferring() {
+    let (mut conn, _url, _c) = setup_db().await;
+
+    let wf = "empty_id_throttle_wf";
+    let key = "tenant:empty-id-throttle";
+
+    let err = reserve_or_defer(
+        &mut conn,
+        params(wf, key, "", serde_json::json!({}), 1.0, 1.0, None, None),
+    )
+    .await
+    .expect_err("empty workflow_id must be rejected");
+    assert!(matches!(
+        err,
+        autumn_harvest::error::HarvestError::EmptyWorkflowId
+    ));
+
+    // No token was reserved and no row was written.
+    assert_eq!(throttle_row_count(&mut conn, key).await, 0);
+}

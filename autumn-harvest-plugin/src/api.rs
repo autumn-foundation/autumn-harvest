@@ -4223,6 +4223,20 @@ pub(crate) async fn resolve_workflow_by_business_id(
     workflow_name: &str,
     workflow_id: &str,
 ) -> Result<ExecutionId, AutumnError> {
+    // issue #1353: reject an empty workflow_id uniformly across the whole
+    // by-id route family, before any shard fan-out. `matchit` cannot bind an
+    // empty FINAL path segment. The base route (`GET .../{name}/{id}`)
+    // therefore 404'd at the router for such a value. Every sibling route
+    // resolved it instead, because its empty id lands on a non-final segment
+    // (e.g. `.../{id}/stack`). That made the family inconsistent for one
+    // identifier. Rejecting it here, ahead of resolution, makes all ten
+    // routes answer 400 alike, regardless of which router-matching quirk let
+    // the request through.
+    if workflow_id.is_empty() {
+        return Err(AutumnError::bad_request_msg(
+            "workflow_id must not be empty",
+        ));
+    }
     let pools = crate::shard_fanout::pools_by_shard(api_state);
     let expected = crate::shard_fanout::expected_shards(api_state, &pools);
     let mut candidates = Vec::new();
@@ -4323,6 +4337,29 @@ async fn get_workflow_by_id(
     )
     .await;
     finalize_by_id(out, exec_id)
+}
+
+/// `GET /workflows/by-id/{workflow_name}/` — literal-trailing-slash form of
+/// the base by-id route (issue #1353). `matchit` cannot bind an empty FINAL
+/// path segment as `{workflow_id}`. This shape therefore needs its own
+/// registration to reach a handler at all. Without it, axum answers a
+/// structural 404 ("no route matches") before any application code runs.
+/// Delegates to [`get_workflow_by_id`] with `workflow_id = ""`, which
+/// [`resolve_workflow_by_business_id`] now rejects 400 -- the same answer
+/// every other by-id route gives for an empty id.
+async fn get_workflow_by_id_trailing_slash(
+    Extension(api_state): Extension<HarvestApiState>,
+    Path(workflow_name): Path<String>,
+    headers: axum::http::HeaderMap,
+    maybe_session: Option<Extension<Session>>,
+) -> axum::response::Response {
+    get_workflow_by_id(
+        Extension(api_state),
+        Path((workflow_name, String::new())),
+        headers,
+        maybe_session,
+    )
+    .await
 }
 
 /// `GET /workflows/by-id/{workflow_name}/{workflow_id}/result` — terminal-output
@@ -4761,6 +4798,18 @@ pub fn harvest_api_router(api_state: HarvestApiState) -> Router<AppState> {
         .route(
             "/workflows/by-id/{workflow_name}/{workflow_id}",
             get(get_workflow_by_id),
+        )
+        // Empty-workflow_id guard (issue #1353): the literal trailing-slash
+        // shape of the base route above. `matchit` will not bind an empty
+        // FINAL segment to `{workflow_id}`. Without this registration the
+        // request never reaches a handler at all. It would 404 at the router
+        // instead -- a structural failure, not the 400 every sibling by-id
+        // route now gives for an empty id. Distinct literal template from
+        // both the 3-segment name-only guard and the 4-segment param route,
+        // so no collision.
+        .route(
+            "/workflows/by-id/{workflow_name}/",
+            get(get_workflow_by_id_trailing_slash),
         )
         .route(
             "/workflows/by-id/{workflow_name}/{workflow_id}/result",
@@ -5620,6 +5669,12 @@ fn normalize_route_template(path: &str) -> String {
     }
     if out.is_empty() {
         out.push('/');
+    } else if path.len() > 1 && path.ends_with('/') {
+        // issue #1353: preserve a literal trailing slash. `matchit` binds it
+        // as a distinct route from the no-slash form. Dropping it here would
+        // collide two separately registered routes onto one template (e.g.
+        // the by-id empty-`workflow_id` guard and its name-only sibling).
+        out.push('/');
     }
     out
 }
@@ -6204,6 +6259,9 @@ pub const fn management_api_routes() -> &'static [(&'static str, &'static str)] 
         ("GET", "/workflows/by-id/{workflow_name}"),
         ("POST", "/workflows/by-id/{workflow_name}"),
         ("GET", "/workflows/by-id/{workflow_name}/{workflow_id}"),
+        // Empty-workflow_id guard (issue #1353): literal trailing-slash form
+        // of the base route above; always 400.
+        ("GET", "/workflows/by-id/{workflow_name}/"),
         (
             "GET",
             "/workflows/by-id/{workflow_name}/{workflow_id}/result",
@@ -15710,6 +15768,32 @@ fn workflow_resolving_throttle(
 /// clean `400` at the API boundary instead.
 const MAX_START_IDEMPOTENCY_KEY_LEN: usize = 512;
 
+/// Reject an explicitly-empty `workflow_id` (issue #1353), shared by
+/// `start_workflow`, `signal_with_start_workflow`, `update_with_start_workflow`,
+/// and `rerun_workflow`'s override field. Omitting the field is untouched:
+/// `None` still auto-generates a UUID, or reuses the source's key on a
+/// rerun. An explicit empty string is different -- a degenerate business id
+/// the by-id route family cannot address consistently. Reject it at the
+/// boundary instead of accepting it as a live, addressable identifier.
+///
+/// A whitespace-only id is out of scope. It is a normal, non-empty final
+/// path segment, so it does not trigger the router gap this issue addresses.
+#[allow(clippy::result_large_err)]
+fn reject_empty_workflow_id(raw: Option<&str>) -> Result<(), axum::response::Response> {
+    use axum::response::IntoResponse as _;
+    if raw == Some("") {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": "workflow_id must not be empty",
+                "detail": "omit workflow_id to auto-generate one, or supply a non-empty value"
+            })),
+        )
+            .into_response());
+    }
+    Ok(())
+}
+
 /// Shared trim + empty-`400` + length-cap validation for a request-scoped
 /// `idempotency_key` (issue #808), used by both the `Idempotency-Key` header
 /// and the body-field source so the two never diverge. `Ok(None)` = no key;
@@ -16220,6 +16304,12 @@ pub(crate) async fn start_workflow(
         }
     };
 
+    // `audit_context` and `route` are cheap: no DB call, no runtime cost.
+    // Compute them once here. The registry check, the issue #1353
+    // empty-workflow_id check, and the probe below all need them.
+    let (actor, source, request_id) = audit_context(&headers, &api_state);
+    let route = "POST /workflows/{workflow_name}/start";
+
     // Workflow-start provenance (issue #740): default `api` for the plain HTTP
     // start route; a webhook-delegated start (`from_webhook`) overrides it to
     // `webhook`. Applied uniformly to the direct start and every deferred
@@ -16309,9 +16399,6 @@ pub(crate) async fn start_workflow(
         Ok(r) => r,
         Err(e) => return map_error(e).into_response(),
     };
-
-    let (actor, source, request_id) = audit_context(&headers, &api_state);
-    let route = "POST /workflows/{workflow_name}/start";
 
     if !runtime.registry.workflows.contains_key(&workflow_name) {
         if let Ok(pool) = api_state.storage_pool()
@@ -16641,6 +16728,29 @@ pub(crate) async fn start_workflow(
         )
         .await
     {
+        return resp;
+    }
+
+    // This check is fresh-start-only, like every check below (issue #1353).
+    // It runs AFTER the committed-replay probe above. A keyed start that
+    // (pre-#1353) committed under an empty workflow_id can still be
+    // retried. Such a retry must return the `200` no-op, not a `400`. A
+    // `400` here would contradict the retry's own prior success. It would
+    // also audit a working retry as a failure.
+    if let Err(resp) = reject_empty_workflow_id(Some(workflow_id.as_str())) {
+        audit_start_failure(
+            &api_state,
+            &StartFailureAudit {
+                actor: &actor,
+                workflow_name: &workflow_name,
+                route,
+                request_id: request_id.as_deref(),
+                source: &source,
+                requested_shard_id: request.shard_id,
+            },
+            "empty workflow_id",
+        )
+        .await;
         return resp;
     }
 
@@ -19003,6 +19113,11 @@ async fn batch_start_workflows(
                 "workflow '{}' is a registered DAG; use POST /dags/{{name}}/trigger",
                 item.workflow_name
             ))
+        } else if item.workflow_id.as_deref() == Some("") {
+            // issue #1353: an explicit empty workflow_id is a degenerate
+            // business id the by-id route family cannot address consistently.
+            // Reject it per-item, same as the standalone start route.
+            Some("workflow_id must not be empty".to_string())
         } else if item.workflow_id.is_none()
             && workflow_has_resolving_debounce(
                 &runtime.registry,
@@ -20573,6 +20688,35 @@ pub(crate) async fn signal_with_start_workflow(
         return resp;
     }
 
+    // This check is fresh-start-only, like every check below (issue #1353).
+    // It runs AFTER the committed-replay probe above. `start_workflow`
+    // orders its own check the same way, for the same reason. A keyed
+    // signal-with-start that (pre-#1353) committed under an empty
+    // workflow_id can still be retried. Such a retry must replay its `200`
+    // no-op, not a `400`. A `400` here would contradict the retry's own
+    // prior success.
+    if let Err(resp) = reject_empty_workflow_id(Some(workflow_id.as_str())) {
+        if let Ok(pool) = api_state.storage_pool()
+            && let Ok(mut conn) = acquire_conn(pool.default_pool()).await
+        {
+            let ar = NewAuditRecord {
+                actor: &actor,
+                operation: OP_WORKFLOW_SIGNAL_WITH_START,
+                target_type: TARGET_WORKFLOW,
+                target_id: Some(workflow_name.as_str()),
+                route_or_command: route,
+                request_id: request_id.as_deref(),
+                idempotency_key: request.idempotency_key.as_deref(),
+                status: STATUS_FAILED,
+                error_summary: Some("empty workflow_id"),
+                shard_id: None,
+                source: &source,
+            };
+            let _ = audit::insert_audit(&mut conn, &ar).await;
+        }
+        return resp;
+    }
+
     // issue #610: structural schema validation of the signal payload against
     // the signal handler's published `arg_schema` (if any). Runs before any
     // durable start/attach so a malformed signal is rejected at the edge with a
@@ -21278,6 +21422,36 @@ async fn update_with_start_workflow(
     } else {
         None
     };
+
+    // This check is fresh-start-only (issue #1353). It is gated the same
+    // way the admission-gate and #373 schema checks below are: skipped on
+    // a committed-replay hit. A keyed update-with-start that (pre-#1353)
+    // committed under an empty workflow_id can still be retried. Such a
+    // retry must replay its cached admission, not a `400` that contradicts
+    // its own prior success.
+    if probe_outcome.is_none()
+        && let Err(resp) = reject_empty_workflow_id(Some(workflow_id.as_str()))
+    {
+        if let Ok(pool) = api_state.storage_pool()
+            && let Ok(mut conn) = acquire_conn(pool.default_pool()).await
+        {
+            let ar = NewAuditRecord {
+                actor: &actor,
+                operation: OP_WORKFLOW_UPDATE_WITH_START,
+                target_type: TARGET_WORKFLOW,
+                target_id: Some(workflow_name.as_str()),
+                route_or_command: route,
+                request_id: request_id.as_deref(),
+                idempotency_key: request.idempotency_key.as_deref(),
+                status: STATUS_FAILED,
+                error_summary: Some("empty workflow_id"),
+                shard_id: None,
+                source: &source,
+            };
+            let _ = audit::insert_audit(&mut conn, &ar).await;
+        }
+        return resp;
+    }
 
     // Debounce admission is owned by POST /workflows/{name}/start. Ask the core
     // primitive to reject only a *fresh start* under its lock so an attach /
@@ -22357,6 +22531,23 @@ async fn rerun_workflow(
             }
         }
     };
+
+    // issue #1353: reject an explicit empty workflow_id override before the
+    // main connection is acquired below. Mirrors the malformed-JSON-body
+    // audit just above: the id is well-formed, so audit through the
+    // execution's own shard.
+    if let Err(resp) = reject_empty_workflow_id(request.workflow_id.as_deref()) {
+        if let Ok(mut c) = db_conn_for_execution(&api_state, exec_id).await {
+            audit_rerun_failure_on(
+                &mut c,
+                &audit_ctx,
+                Some(&exec_id_str),
+                "empty workflow_id override",
+            )
+            .await;
+        }
+        return resp;
+    }
 
     // From here on every failure audit rides the CALLER'S connection: acquiring
     // a second pool connection while this one is held deadlocks a size-1 pool
@@ -53323,6 +53514,21 @@ mod tests {
                 "/workflows/by-id/{workflow_name}/{workflow_id}/query/{query_name}"
             ),
             "/workflows/by-id/{p0}/{p1}/query/{p2}"
+        );
+    }
+
+    /// issue #1353: a literal trailing slash must survive normalization as a
+    /// distinct template, or its `matchit` insert collides with the no-slash
+    /// sibling (`route_class_matchers_build_without_conflict` catches this).
+    #[test]
+    fn normalize_route_template_preserves_a_trailing_slash() {
+        assert_eq!(
+            normalize_route_template("/workflows/by-id/{workflow_name}/"),
+            "/workflows/by-id/{p0}/"
+        );
+        assert_ne!(
+            normalize_route_template("/workflows/by-id/{workflow_name}/"),
+            normalize_route_template("/workflows/by-id/{workflow_name}")
         );
     }
 

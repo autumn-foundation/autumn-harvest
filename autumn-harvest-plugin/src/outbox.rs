@@ -109,11 +109,22 @@ impl HarvestWorkflowOutboxRow {
 ///
 /// # Errors
 ///
-/// Returns a Diesel error if the outbox insert cannot be executed.
+/// Returns a Diesel error if the outbox insert cannot be executed, or if
+/// `request.workflow_id` is an explicit empty string (issue #1353, Codex
+/// review). `diesel::result::Error` has no dedicated variant for a rejected
+/// precondition, so `QueryBuilderError` carries it -- the query is never
+/// even built. Rejecting here, not only at dispatch time, means a
+/// successful `Ok(())` never promises delivery of a row that can never
+/// start.
 pub async fn enqueue_workflow_start_outbox(
     conn: &mut AsyncPgConnection,
     request: &WorkflowStartRequest,
 ) -> Result<(), diesel::result::Error> {
+    if request.workflow_id.is_empty() {
+        return Err(diesel::result::Error::QueryBuilderError(
+            "workflow_id must not be empty".into(),
+        ));
+    }
     diesel::insert_into(harvest_workflow_outbox::table)
         .values(NewHarvestWorkflowOutboxRow {
             workflow_name: &request.workflow_name,
@@ -292,6 +303,16 @@ pub(crate) async fn dispatch_workflow_start_request(
     state: &AppState,
     request: &WorkflowStartRequest,
 ) -> HarvestResult<ExecutionId> {
+    // issue #1353 (Codex review): `enqueue_workflow_start_outbox` below
+    // already rejects a NEW empty workflow_id before persisting it. This is
+    // the backstop for a row enqueued before that admission guard shipped.
+    // Such a legacy row would otherwise retry with backoff forever. This
+    // module has no dead-letter path for any permanent dispatch failure.
+    // So reject it here too, at the one place that actually starts the
+    // execution.
+    if request.workflow_id.is_empty() {
+        return Err(HarvestError::EmptyWorkflowId);
+    }
     let harvest_pool = state.extension::<HarvestDbPool>().ok_or_else(|| {
         HarvestError::Config(
             "Harvest workflow publication is missing HarvestDbPool on AppState".into(),
@@ -575,6 +596,32 @@ mod tests {
         );
         // Defensive: id is the PK so >1 is impossible, but never count it as one start.
         assert!(!outbox_bypass_should_count(2));
+    }
+
+    /// issue #1353 (Codex review, pure, no DB): `dispatch_workflow_start_request`
+    /// rejects an empty `workflow_id` before touching any state extension.
+    /// This test therefore runs against a bare `AppState` with nothing
+    /// installed. A caller of the public `enqueue_workflow_start_outbox`
+    /// cannot bypass the guard that the HTTP start routes apply.
+    #[tokio::test]
+    async fn dispatch_rejects_empty_workflow_id() {
+        let state = AppState::for_test();
+        let request = WorkflowStartRequest {
+            workflow_name: "user_onboarding".to_owned(),
+            workflow_id: String::new(),
+            queue_name: "default".to_owned(),
+            input: Value::Null,
+            memo: None,
+            search_attrs: None,
+        };
+
+        let err = dispatch_workflow_start_request(&state, &request)
+            .await
+            .expect_err("empty workflow_id must be rejected");
+        assert!(
+            err.to_string().contains("workflow_id must not be empty"),
+            "unexpected error: {err}"
+        );
     }
 
     /// F-round11 (DB): `mark_outbox_row_delivered` surfaces the affected-row count so

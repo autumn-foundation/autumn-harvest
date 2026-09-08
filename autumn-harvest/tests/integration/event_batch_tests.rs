@@ -342,3 +342,45 @@ async fn test_event_batch_time_flush() {
         .unwrap();
     assert_eq!(fired, 1);
 }
+
+// ── Empty workflow_id admission (issue #1353) ─────────────────────────────────
+
+// Admission must reject an empty id before it writes a row. A written row
+// with no id could only be discarded on fire, never started.
+#[tokio::test]
+async fn admit_batched_start_rejects_empty_workflow_id_before_writing_a_row() {
+    let (mut conn, _container) = setup_db().await;
+
+    let p = AdmitBatchParams {
+        workflow_name: "empty_id_batch_wf".to_string(),
+        batch_key: "key-empty-id".to_string(),
+        workflow_id: String::new(),
+        queue_name: "default".to_string(),
+        payload: json!({}),
+        start_options: DebounceStartOptions::default(),
+        max_wait: Duration::from_secs(10),
+        max_size: 3,
+        shard_id: 0,
+    };
+    let err = admit_batched_start(&mut conn, p, None)
+        .await
+        .expect_err("empty workflow_id must be rejected");
+    assert!(matches!(
+        err,
+        autumn_harvest::error::HarvestError::EmptyWorkflowId
+    ));
+
+    #[derive(diesel::QueryableByName)]
+    struct Count {
+        #[diesel(sql_type = diesel::sql_types::BigInt)]
+        n: i64,
+    }
+    let n =
+        diesel::sql_query("SELECT COUNT(*) AS n FROM harvest_event_batches WHERE batch_key = $1")
+            .bind::<diesel::sql_types::Text, _>("key-empty-id")
+            .get_result::<Count>(&mut conn)
+            .await
+            .expect("count query")
+            .n;
+    assert_eq!(n, 0, "no row was written");
+}
