@@ -52,7 +52,7 @@ curl -s -X POST http://localhost:8081/billing/checkout \
 The outbox relay starts `billing_checkout` asynchronously. Find the execution in the UI or:
 
 ```bash
-curl -s 'http://localhost:8081/api/harvest/workflows?workflow_name=billing_checkout&search_attr=tenant_id=acme' | jq .
+curl -s 'http://localhost:8081/api/harvest/workflows?workflow_name=billing_checkout&search_attr=tenant_id:acme' | jq .
 ```
 
 Then deliver the gateway callback signal:
