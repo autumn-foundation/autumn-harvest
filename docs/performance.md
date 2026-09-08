@@ -704,19 +704,19 @@ tests": reproduced here, each independently defeats sort-elision regardless
 of the value it is tested against, so "cheap" was never an established
 finding — it was this page's own retracted reading of their *plan-eligibility*
 effect. Their marginal *cost* on the attribution table above is a different
-question. For sticky routing it remains unmeasured: in
-the full production query the `CASE` key and the always-present
+question: in the full production query the `CASE` key and the always-present
 queue-pause/`schedule_to_close`-adjacent predicates already force the same
-collapsed plan shape regardless of it, so its own incremental
-contribution can't be isolated this way — that would still need the
-seed-variant scenario work [known limitations](#known-limitations) already
-calls for. `schedule_to_close` (#378) and worker sessions (#606) are the
-exceptions: the seed-variant work this section describes as still-needed has
-since been done for both — see the [known limitations](#known-limitations)
-bullet above — by holding the same already-collapsed plan shape fixed and
-measuring each column's marginal buffer/storage cost directly, rather than
-trying to isolate it through a plan-shape change that #1177 shows does not
-happen either way.
+collapsed plan shape regardless of any one of these three predicates, so
+none of their incremental contributions can be isolated through a
+plan-shape change — that needs the seed-variant scenario work
+[known limitations](#known-limitations) already calls for. That work has
+since been done for all three — `schedule_to_close` (#378, PR #1339),
+worker sessions (#606, PR #1358), and sticky routing (#235,
+[`docs/performance-sticky-routing.md`](performance-sticky-routing.md)) — see
+the [known limitations](#known-limitations) bullet above — by holding the
+same already-collapsed plan shape fixed and measuring each column's
+marginal buffer/storage cost directly, rather than trying to isolate it
+through a plan-shape change that #1177 shows does not happen either way.
 
 **Zero engine impact.** Like issue #786 and every fix on this page, this
 finding changes nothing about `claim_task_query()`: no new `WorkflowEvent`
@@ -1563,33 +1563,51 @@ from the benchmark are directly comparable.
     Mechanism: row-width growth compounded by MVCC bloat from the second
     write, not a plan inefficiency — no query-shape fix applies; see that
     page for the full measurement, including why it does not isolate worker
-    sessions from sticky routing's own unmeasured cost, and an open question
-    about seeding transaction granularity for multi-activity decision
-    fan-outs that a review round raised but this pass did not chase down.
+    sessions from ordinary sticky routing's own cost (measured separately,
+    immediately below), and an open question about seeding transaction
+    granularity for multi-activity decision fan-outs that a review round
+    raised but this pass did not chase down.
     This is a buffer-cost measurement, not a plan-eligibility one — it does
     not supersede or overlap with issue #1177's finding that worker
     sessions' predicate, like `schedule_to_close`'s and sticky routing's,
     independently defeats sort-elision (see immediately below); the two are
     answers to different questions about the same predicate.
-  * **Sticky routing (#235)** — its cost on the attribution table above is
-    still unmeasured; that remains scenario work, same as before. What issue
-    #1177 adds is a different kind of evidence, not a cost figure: in
-    isolation, sticky routing's predicate — together with `schedule_to_close`'s
-    and worker sessions', both measured and covered above — independently
-    defeats sort-elision and `LIMIT` pushdown regardless of the value it is
-    tested against, reproducing the same collapsed plan shape this page's own
-    headline finding describes. See
+  * **Sticky routing (#235)** — measured directly:
+    [`docs/performance-sticky-routing.md`](performance-sticky-routing.md)
+    seeds `sticky_worker_id`/`sticky_until`/`sticky_timeout` (session_id left
+    `NULL`, isolating this predicate from worker sessions' own) via the same
+    per-row `INSERT`-then-`UPDATE`-then-`COMMIT` lifecycle
+    `queue::enqueue()`'s real write uses for an ordinary sticky pin, and
+    finds a real, moderate buffer cost at ordinary backlog depths — +18.9%
+    at 1,000 rows, +32.9% at the 10,000-row headline depth, corroborated by
+    a real 10,001-call production-shaped drain at +21.5%. Mechanism: the
+    same row-width/MVCC growth worker sessions' page documents, smaller in
+    magnitude since only one column pair is set rather than two — no
+    query-shape fix applies. At the 100,000-row depth the buffer delta
+    reverses sign (-65.9%): a genuine `EXPLAIN`-documented plan-shape
+    crossover (`no-sticky` picks `idx_harvest_tq_poll`, `sticky-routing`
+    picks a plain `Seq Scan`, driven by a cardinality-estimate divergence on
+    the `IS NULL` vs. `= $1` branches of the predicate), observed at one
+    depth rather than the ≥3 this persona's own rules require before
+    treating a plan-shape change as a general finding — see that page's
+    dedicated section on it rather than citing the 100,000-row number as a
+    continuation of the 1,000/10,000 trend. What issue #1177 adds is a
+    different kind of evidence, not a cost figure: in isolation, sticky
+    routing's predicate — together with `schedule_to_close`'s and worker
+    sessions', both also measured — independently defeats sort-elision and
+    `LIMIT` pushdown regardless of the value it is tested against,
+    reproducing the same collapsed plan shape this page's own headline
+    finding describes. See
     [any residual predicate defeats sort-elision](#any-residual-predicate-defeats-sort-elision-issue-1177).
     In the full production query the `CASE` key and the always-present
     predicates already force that same collapse regardless of any one of
-    these three, so their own marginal cost still can't be isolated this way.
-    "cheap inline
-    column tests" was this page's own now-retracted reading of their
-    *plan-eligibility* effect, not a corrected *cost* measurement — replacing
-    one unsupported cost claim with another would be no improvement.
-
-  Adding one of these is scenario work, not query work: each needs a seed
-  variant and a report row, on a bench that already runs 15-30 minutes.
+    these three, so this page's own cost measurement above is what fills
+    the gap that plan-eligibility finding cannot. "cheap inline column
+    tests" was this page's own now-retracted reading of their
+    *plan-eligibility* effect, not a corrected *cost* measurement —
+    replacing one unsupported cost claim with another would have been no
+    improvement, which is why all three now carry a real measurement
+    instead.
 * **Queue count is a parameter, but it is not swept.** `Scenario.queues`
   parameterizes how many distinct queues the backlog spreads across, and every
   published row holds it at 4. Backlog depth and claimer count *are* varied.
