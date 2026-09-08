@@ -669,8 +669,8 @@ fn the_case_key_is_not_published_as_sufficient_to_restore_the_cheap_plan() {
 /// "cheap" was never an established finding. That is a plan-eligibility
 /// result, not a cost measurement. All three predicates now carry a
 /// completed cost measurement of their own (`schedule_to_close` #378,
-/// worker sessions #606, sticky routing #235), so the bullet must keep
-/// crediting that separate work rather than re-asserting "cheap" or
+/// worker sessions #606, sticky routing #235). The bullet must keep
+/// crediting that separate work, rather than re-asserting "cheap" or
 /// conflating the two kinds of evidence.
 #[test]
 fn known_limitations_no_longer_calls_the_unmeasured_predicates_cheap() {
