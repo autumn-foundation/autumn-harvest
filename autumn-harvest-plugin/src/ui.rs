@@ -9311,6 +9311,15 @@ fn schedule_redirect(flash: &str) -> axum::response::Response {
 /// directory instead. It would land on `.../schedules/schedules?...` — a
 /// 404 after a mutation that otherwise succeeded (Codex review, #1437
 /// P2, verified against `urllib.parse.urljoin`).
+///
+/// `is_schedule_ui_return_path` also rejects a control character. A raw
+/// `\n` could reach it from a hand-crafted or malformed POST. The
+/// `Redirect`'s own `into_response` builds the `Location` header with
+/// `HeaderValue::try_from`, which rejects those bytes and falls back to
+/// a bare `500` (Codex review, #1437 P2). That is not a panic in this
+/// axum version, verified by reading `axum-0.8.9`'s own `Redirect::
+/// into_response`. It is still the wrong response after a mutation that
+/// already succeeded.
 fn schedule_bulk_redirect_to(return_to: Option<&str>, flash: &str) -> axum::response::Response {
     use axum::response::IntoResponse as _;
     let base = return_to
@@ -9323,6 +9332,9 @@ fn schedule_bulk_redirect_to(return_to: Option<&str>, flash: &str) -> axum::resp
 }
 
 fn is_schedule_ui_return_path(value: &str) -> bool {
+    if value.bytes().any(|b| b.is_ascii_control()) {
+        return false;
+    }
     match value.strip_prefix("../schedules") {
         Some("") => true,
         Some(rest) => rest.starts_with('?'),
@@ -16389,6 +16401,11 @@ mod tests {
             // not be trusted either — see `schedule_bulk_redirect_to`'s
             // own doc comment.
             "schedules?kind=Workflow",
+            // A form-decoded control character (a raw newline, here)
+            // would make `HeaderValue::try_from` reject the `Location`
+            // header. That is an internal error after a mutation that
+            // already succeeded (Codex review, #1437 P2).
+            "../schedules?x=a\nb",
         ] {
             let response = schedule_bulk_redirect_to(Some(unsafe_value), "Paused 1");
             let location = response

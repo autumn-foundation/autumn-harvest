@@ -2338,6 +2338,40 @@ async fn ui_schedules_bulk_pause_redirect_preserves_the_filtered_view() {
     );
 }
 
+/// Codex review on #1437 (P2): a `return_to` with a form-decoded control
+/// character (`%0A` decodes to a raw newline) used to reach
+/// `axum::response::Redirect::to` unfiltered. `HeaderValue::try_from`
+/// rejects that byte, so the mutation succeeded but the response became
+/// an internal error instead of a redirect to the operator's filtered
+/// view.
+#[tokio::test]
+async fn ui_schedules_bulk_pause_rejects_control_characters_in_return_to() {
+    let (database_url, _container) = setup_test_database_url().await;
+    let app = build_single_shard_ui_app(&database_url);
+
+    let (status, headers, body) = post_form(
+        &app,
+        "/schedules/bulk-pause",
+        "return_to=..%2Fschedules%3Fx%3Da%0Ab",
+    )
+    .await;
+    assert!(
+        status == StatusCode::SEE_OTHER || status == StatusCode::FOUND,
+        "a return_to with a control character must fall back to the safe \
+         default redirect, not fail the response after the mutation already \
+         ran (got {status}): {body}"
+    );
+    let location = headers
+        .get("location")
+        .expect("redirect must have Location header")
+        .to_str()
+        .unwrap();
+    assert!(
+        location.starts_with("../schedules?flash="),
+        "must fall back to the safe default, not carry the raw control character: {location}"
+    );
+}
+
 /// Codex review on #1437 (P1): before this fix, an invalid `shard_id` in
 /// a bulk-action POST silently dropped to "no shard restriction". It
 /// paused schedules on every shard instead of rejecting the request —
