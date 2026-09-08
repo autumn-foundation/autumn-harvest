@@ -2,42 +2,44 @@
 //! Ledger performance investigation: `scheduler::overdue_schedule_pass`.
 //!
 //! `docs/performance-schedule-overdue-aux.md`'s "Known limitations" named
-//! this function as carrying the identical per-schedule-loop N+1 shape its
+//! this function. It carries the identical per-schedule-loop N+1 shape its
 //! own fix batched away from `GET /admin/schedules`'s
-//! `load_schedule_overdue_aux_by_shard`, left as a follow-up because it is a
-//! periodic background pass, not a per-HTTP-request path (different
-//! workload, different profile). This file is that follow-up.
+//! `load_schedule_overdue_aux_by_shard`. That fix left this one as a
+//! follow-up because it is a periodic background pass, not a
+//! per-HTTP-request path (different workload, different profile). This
+//! file is that follow-up.
 //!
 //! `overdue_schedule_pass` runs on every worker's adaptive-interval sampler
 //! tick (`worker.rs`'s `overdue_schedule_pass` call site), once per shard,
-//! over every schedule row on that shard: for each one it called
-//! `scheduler::schedule_running_basis` (a `COUNT(*)` on
+//! over every schedule row on that shard. For each one it called
+//! `scheduler::schedule_running_basis`. That is a `COUNT(*)` on
 //! `harvest_workflow_executions` plus
-//! `throttle::pending_throttle_count_for_workflow` -- itself a `to_regclass`
-//! existence check *and* a second count query, unconditionally, on every
-//! call) and, for calendar-bearing schedules,
-//! `scheduler::resolve_effective_fire_at`, which re-queries
+//! `throttle::pending_throttle_count_for_workflow` -- itself a
+//! `to_regclass` existence check *and* a second count query,
+//! unconditionally, on every call. For calendar-bearing schedules it also
+//! called `scheduler::resolve_effective_fire_at`, which re-queries
 //! `calendar::load_exclusions_for_calendar` from scratch even when several
-//! schedules share the same calendar. Up to four round trips per schedule
-//! row, on every sampler tick, forever, for the lifetime of the process --
-//! the same class of bug the aux-lookup fix documents: "workflow/activity
-//! bookkeeping queries that are individually trivial but collectively
-//! dominant... they will never show up in a buffer ranking, only in a
-//! `calls` ranking."
+//! schedules share the same calendar. That is up to four round trips per
+//! schedule row, on every sampler tick, forever, for the lifetime of the
+//! process. It is the same class of bug the aux-lookup fix documents:
+//! "workflow/activity bookkeeping queries that are individually trivial
+//! but collectively dominant... they will never show up in a buffer
+//! ranking, only in a `calls` ranking."
 //!
 //! The fix reuses the exact batched functions the aux-lookup fix already
-//! built and tested (`schedule_running_basis_batch`,
+//! built and tested: `schedule_running_basis_batch` and
 //! `resolve_effective_fire_at_pure` fed by
-//! `calendar::load_exclusions_for_calendars`) inside `overdue_schedule_pass`
-//! itself: one grouped running-basis query and one grouped
-//! calendar-exclusions query, covering every schedule on the shard, instead
-//! of up to three round trips per row.
+//! `calendar::load_exclusions_for_calendars`. Inside
+//! `overdue_schedule_pass` itself, this is one grouped running-basis query
+//! and one grouped calendar-exclusions query. Each covers every schedule on
+//! the shard, instead of up to three round trips per row.
 //!
-//! Evidence is `pg_stat_statements` call/buffer counts (not wall-clock, not
-//! admissible on a shared-vCPU machine) -- the same tool and the same
-//! statement-shape filter `schedule_overdue_aux_perf.rs` uses for the sibling
-//! fix, over three schedule-population sizes to also demonstrate the O(n) ->
-//! O(1) call-count shape directly (not just one point on the curve).
+//! Evidence is `pg_stat_statements` call/buffer counts, not wall-clock --
+//! wall-clock is not admissible on a shared-vCPU machine. This uses the
+//! same tool and the same statement-shape filter
+//! `schedule_overdue_aux_perf.rs` uses for the sibling fix. It sweeps three
+//! schedule-population sizes to also demonstrate the O(n) -> O(1)
+//! call-count shape directly, not just one point on the curve.
 
 #![allow(clippy::too_many_lines)]
 
@@ -69,10 +71,10 @@ async fn setup_server() -> (String, DbGuard) {
     (url, Some(container))
 }
 
-/// Creates a fresh, uniquely-named, fully-migrated database off `admin_url`,
-/// mirroring `schedule_overdue_aux_perf.rs`'s own convention, so this
-/// harness's fixture and `pg_stat_statements` capture cannot collide with --
-/// or be polluted by -- any other test/run sharing the same server.
+/// Creates a fresh, uniquely-named, fully-migrated database off `admin_url`.
+/// This mirrors `schedule_overdue_aux_perf.rs`'s own convention. This
+/// harness's fixture and `pg_stat_statements` capture then cannot collide
+/// with -- or be polluted by -- any other test/run sharing the same server.
 async fn create_fresh_db(admin_url: &str, name: &str) -> String {
     let mut admin = AsyncPgConnection::establish(admin_url)
         .await
@@ -100,20 +102,20 @@ fn unique(prefix: &str) -> String {
 // ── Fixture generation ──────────────────────────────────────────────────────
 
 /// The fixed slot every calendar-bearing schedule's `next_run_at` is pinned
-/// to; every calendar's exclusion set includes this exact date, so
+/// to. Every calendar's exclusion set includes this exact date, so
 /// `resolve_effective_fire_at`/`resolve_effective_fire_at_pure` actually
 /// rebase it (not a vacuous "calendar present but never excluded" no-op).
-/// Identical fixture shape to `schedule_overdue_aux_perf.rs` -- same
-/// investigation family, same class of bug -- so the two measurements are
-/// directly comparable.
+/// This is the identical fixture shape as `schedule_overdue_aux_perf.rs` --
+/// same investigation family, same class of bug -- so the two measurements
+/// are directly comparable.
 const PINNED_CALENDAR_SLOT: &str = "2026-06-15T12:00:00+00:00";
 const CALENDAR_COUNT: i64 = 3;
 
-/// Seeds `n` schedules (each its own `workflow_name`), a shared pool of
+/// Seeds `n` schedules, each its own `workflow_name`, plus a shared pool of
 /// `CALENDAR_COUNT` calendars (every 10th schedule references one, cycling
-/// through them), `RUNNING`/`PAUSED` executions for every 4th schedule's
-/// workflow, and pending-throttle rows for every 7th schedule's workflow.
-/// Pure set-based SQL, not a per-row Rust loop -- identical to
+/// through them). It also seeds `RUNNING`/`PAUSED` executions for every 4th
+/// schedule's workflow, and pending-throttle rows for every 7th schedule's
+/// workflow. Pure set-based SQL, not a per-row Rust loop -- identical to
 /// `schedule_overdue_aux_perf.rs::seed_fixture`.
 async fn seed_fixture(conn: &mut AsyncPgConnection, n: i64) {
     conn.batch_execute(&format!(
@@ -236,10 +238,10 @@ async fn reset_stats_for_db(conn: &mut AsyncPgConnection, db_name: &str) {
 }
 
 /// Every statement recorded for this database since the last reset, in ONE
-/// query -- see `schedule_overdue_aux_perf.rs::snapshot_statements`'s doc
+/// query. See `schedule_overdue_aux_perf.rs::snapshot_statements`'s doc
 /// comment for why a second `pg_stat_statements` query here would pollute
-/// whatever total is computed from it (a real bug caught in that sibling
-/// investigation's own review).
+/// whatever total is computed from it. That is a real bug caught in that
+/// sibling investigation's own review.
 async fn snapshot_statements(conn: &mut AsyncPgConnection, db_name: &str) -> Vec<StatRow> {
     diesel::sql_query(format!(
         "SELECT query, calls, shared_blks_hit, shared_blks_read, \
@@ -257,12 +259,13 @@ async fn snapshot_statements(conn: &mut AsyncPgConnection, db_name: &str) -> Vec
     )
 }
 
-/// Whether `row` is one of the statement shapes this investigation targets:
-/// the running-basis count on `harvest_workflow_executions`, the throttle
-/// existence-check (`to_regclass`) and count on `harvest_start_throttle`, and
-/// the calendar-exclusions lookup on `harvest_calendar_exclusions`. Mirrors
-/// `schedule_overdue_aux_perf.rs::is_aux_lookup_statement` exactly (same
-/// underlying lookups, same statement shapes).
+/// Whether `row` is one of the statement shapes this investigation targets.
+/// That set is: the running-basis count on `harvest_workflow_executions`,
+/// the throttle existence-check (`to_regclass`) and count on
+/// `harvest_start_throttle`, and the calendar-exclusions lookup on
+/// `harvest_calendar_exclusions`. Mirrors
+/// `schedule_overdue_aux_perf.rs::is_aux_lookup_statement` exactly -- same
+/// underlying lookups, same statement shapes.
 fn is_aux_lookup_statement(row: &StatRow) -> bool {
     let q = row.query.to_ascii_lowercase();
     (q.contains("harvest_workflow_executions") && q.contains("workflow_name"))
@@ -342,8 +345,8 @@ async fn measure_one_pass(admin: &str, label: &str, n: i64) -> SizePoint {
 
 /// Sweeps three schedule-population sizes so the artifact demonstrates the
 /// O(n) (before) / O(1) (after) call-count shape directly, not just one
-/// point on the curve -- run once against the pre-fix code (checked out at
-/// the commit before this investigation's change) and once against the
+/// point on the curve. Run once against the pre-fix code, checked out at
+/// the commit before this investigation's change. Run again against the
 /// post-fix code, with `PERF_LABEL` distinguishing the two artifact sets.
 #[tokio::test]
 #[ignore = "evidence generator, not a CI assertion -- see \
@@ -386,12 +389,12 @@ async fn zz_capture_overdue_schedule_pass_perf_evidence() {
 // ── Equivalence: the batched pass vs. the original per-schedule loop ───────
 
 /// Proves `overdue_schedule_pass`'s batched running-basis and calendar
-/// lookups agree exactly with the original per-schedule loop (the pre-fix
-/// implementation, reconstructed inline here from the still-`pub`,
-/// unmodified single-item functions `schedule_running_basis` and
-/// `resolve_effective_fire_at`) across the same fixture and connection --
-/// mirroring `schedule_overdue_aux_perf.rs`'s equivalence-test pattern for
-/// the sibling fix.
+/// lookups agree exactly with the original per-schedule loop, across the
+/// same fixture and connection. The "before" side is reconstructed inline
+/// here from the still-`pub`, unmodified single-item functions
+/// `schedule_running_basis` and `resolve_effective_fire_at`. This mirrors
+/// `schedule_overdue_aux_perf.rs`'s equivalence-test pattern for the
+/// sibling fix.
 #[tokio::test]
 async fn overdue_schedule_pass_matches_the_original_per_schedule_loop() {
     use autumn_harvest::models::HarvestSchedule;
@@ -449,13 +452,12 @@ async fn overdue_schedule_pass_matches_the_original_per_schedule_loop() {
          (got {calendar_bearing}) for this equivalence check to mean anything"
     );
 
-    // "After": the batched pass, via the pure predicate's own inputs. We
-    // cannot read `overdue_schedule_pass`'s internal `at_capacity` /
-    // `effective_fire_at` directly (private to the loop), so this test
-    // instead calls the same batched building blocks
-    // `overdue_schedule_pass` now uses, the identical way it uses them --
-    // proving the *inputs* to the overdue predicate match, which is exactly
-    // what the "before" loop above computed.
+    // "After": the batched pass, via the pure predicate's own inputs.
+    // `overdue_schedule_pass`'s internal `at_capacity` / `effective_fire_at`
+    // are private to its loop. So this test instead calls the same batched
+    // building blocks `overdue_schedule_pass` now uses, the identical way
+    // it uses them. This proves the *inputs* to the overdue predicate
+    // match, which is exactly what the "before" loop above computed.
     let schedule_names: Vec<(uuid::Uuid, &str)> = schedules
         .iter()
         .map(|s| {
@@ -468,10 +470,9 @@ async fn overdue_schedule_pass_matches_the_original_per_schedule_loop() {
             )
         })
         .collect();
-    let basis =
-        autumn_harvest::scheduler::schedule_running_basis_batch(&mut conn, &schedule_names)
-            .await
-            .expect("batched basis query");
+    let basis = autumn_harvest::scheduler::schedule_running_basis_batch(&mut conn, &schedule_names)
+        .await
+        .expect("batched basis query");
 
     let calendar_names: Vec<&str> = schedules
         .iter()
