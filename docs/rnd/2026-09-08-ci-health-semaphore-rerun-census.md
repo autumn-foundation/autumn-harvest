@@ -99,6 +99,18 @@ just the run's:
 `34089954017`, `34075787182`, `34055805573`) had no hidden failures — every job in
 them was either a clean `success` or a clean `cancelled` with no prior `failure`.
 
+**A Codex review comment on this PR correctly flagged that the first pass of this
+check didn't request `perPage=100`, and this workflow's matrices can expand past the
+default 30-job page for a full code PR.** Re-ran `list_workflow_jobs` with
+`perPage=100` for all 6 "clean" runs: each returns `total_count` 12 or 13, matching
+the number of jobs actually listed both times — the matrix jobs in each of these 6
+runs never expanded past their single unexpanded placeholder entry, because
+cancellation landed early (during `Lint` or before), before the gating jobs that
+unlock matrix expansion had finished. No pagination gap existed for these 6, and the
+4/10 hit-rate tally is unchanged. (The 4 runs where a hidden failure *was* found each
+had a `total_count` of 13–35 that matched their returned array length too, checked at
+the time — including the two fetched with an explicit `perPage=50`.)
+
 **Revised tally across the 19 runs actually inspected (9 explicit-failure + 10
 sampled cancelled):** 13 real failures found, not 9. Of those 13: 11 are deterministic,
 commit-specific defects (comment hygiene ×4, doc/code-sync gates ×4 across three
