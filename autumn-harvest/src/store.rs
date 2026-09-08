@@ -1328,6 +1328,15 @@ pub async fn load_history_page(
 /// Callers that need cross-shard discovery should call this once per shard and
 /// merge the rows after applying any global ordering/pagination.
 ///
+/// Clone-class note: the filter chain, the `.select(...)` list, and the row
+/// mapping below repeat verbatim in [`load_workflow_children_multi`]. Apply
+/// any change to the status, name, cursor, or limit filter to both
+/// functions.
+///
+/// Two instances only, introduced together in PR #1183. No missed-fix has
+/// occurred on either copy since. The merge-evidence bar (rule of three, or
+/// a missed-fix) is not met yet, so the duplication stays.
+///
 /// # Errors
 ///
 /// Returns [`crate::error::HarvestError::Database`] on query failure.
@@ -1459,6 +1468,12 @@ fn workflow_child_row_from_parts(
 /// the whole set of matching rows.
 ///
 /// Returns an empty vec without querying when `parent_ids` is empty.
+///
+/// Clone-class note: the filter chain, the `.select(...)` list, and the row
+/// mapping below repeat verbatim in [`load_workflow_children`]. Apply any
+/// change to the status, name, cursor, or limit filter to both functions.
+/// Two instances only, introduced together in PR #1183, so the
+/// merge-evidence bar is not met yet. See the note on `load_workflow_children`.
 ///
 /// # Errors
 ///
