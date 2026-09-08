@@ -2296,7 +2296,7 @@ async fn ui_schedules_bulk_pause_redirect_preserves_the_filtered_view() {
     let (status, headers, _body) = post_form(
         &app,
         "/schedules/bulk-pause",
-        "kind=Workflow&return_to=schedules%3Fkind%3DWorkflow",
+        "kind=Workflow&return_to=..%2Fschedules%3Fkind%3DWorkflow",
     )
     .await;
     assert!(
@@ -2307,10 +2307,34 @@ async fn ui_schedules_bulk_pause_redirect_preserves_the_filtered_view() {
         .get("location")
         .expect("redirect must have Location header")
         .to_str()
-        .unwrap();
+        .unwrap()
+        .to_string();
     assert!(
-        location.starts_with("schedules?kind=Workflow&flash="),
+        location.starts_with("../schedules?kind=Workflow&flash="),
         "the redirect must preserve the operator's filtered view, not drop it: {location}"
+    );
+
+    // Codex review on #1437 (P2): a relative `Location` resolves against
+    // the URL this test posted to (`/schedules/bulk-pause`), not the
+    // list page. Follow it the way a browser does: RFC 3986 §5.3 has
+    // `../` step back out of `bulk-pause`'s own directory. Confirm it
+    // actually lands on the Schedules list, instead of the doubled-path
+    // 404 a bare `schedules?...` would have produced.
+    let resolved = format!(
+        "/{}",
+        location
+            .strip_prefix("../")
+            .expect("location must start with ../ to resolve correctly from bulk-pause")
+    );
+    assert!(
+        resolved.starts_with("/schedules?kind=Workflow&flash="),
+        "unexpected resolved redirect target: {resolved}"
+    );
+    let (list_status, list_body) = fetch_html(&app, &resolved).await;
+    assert_eq!(
+        list_status,
+        StatusCode::OK,
+        "the resolved redirect target must actually load the Schedules list, not 404: {list_body}"
     );
 }
 

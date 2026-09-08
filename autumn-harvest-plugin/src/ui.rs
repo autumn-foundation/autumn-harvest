@@ -9300,29 +9300,38 @@ fn schedule_redirect(flash: &str) -> axum::response::Response {
 /// `return_to` is the bulk form's own hidden field. It is built by
 /// `schedule_return_to_path` from the same filters the list page just
 /// rendered — raw text, invalid values included. It is validated against
-/// the expected `schedules[?...]` shape before use. That is the same
+/// the expected `../schedules[?...]` shape before use. That is the same
 /// guard `is_dead_letter_ui_return_path` applies to the DLQ page's
 /// `return_to`, so this operator-supplied field can never redirect
 /// anywhere else.
+///
+/// The `../` matters. The `Location` header resolves relative to the URL
+/// this handler was posted to (`.../schedules/bulk-pause`), not to the
+/// list page. A bare `schedules?...` would merge onto that path's own
+/// directory instead. It would land on `.../schedules/schedules?...` — a
+/// 404 after a mutation that otherwise succeeded (Codex review, #1437
+/// P2, verified against `urllib.parse.urljoin`).
 fn schedule_bulk_redirect_to(return_to: Option<&str>, flash: &str) -> axum::response::Response {
     use axum::response::IntoResponse as _;
     let base = return_to
         .map(str::trim)
         .filter(|value| is_schedule_ui_return_path(value))
-        .map_or_else(|| "schedules".to_string(), str::to_string);
+        .map_or_else(|| "../schedules".to_string(), str::to_string);
     let separator = if base.contains('?') { '&' } else { '?' };
     let location = format!("{base}{separator}flash={}", url_encode(flash));
     axum::response::Redirect::to(&location).into_response()
 }
 
 fn is_schedule_ui_return_path(value: &str) -> bool {
-    match value.strip_prefix("schedules") {
+    match value.strip_prefix("../schedules") {
         Some("") => true,
         Some(rest) => rest.starts_with('?'),
         None => false,
     }
 }
 
+/// Built for the bulk-action forms' `return_to` hidden field, so its base
+/// carries the `../` those forms need — see `schedule_bulk_redirect_to`.
 fn schedule_return_to_path(
     filters: &ScheduleUiFilters,
     filter_raw: &ScheduleUiFilterRaw,
@@ -9331,9 +9340,9 @@ fn schedule_return_to_path(
 ) -> String {
     let query = build_schedule_query_string(limit, filters, filter_raw, refresh);
     if query.is_empty() {
-        "schedules".to_string()
+        "../schedules".to_string()
     } else {
-        format!("schedules?{}", &query[1..])
+        format!("../schedules?{}", &query[1..])
     }
 }
 
@@ -9435,7 +9444,16 @@ fn render_schedules_page(
         (render_schedule_pagination(page, limit, has_next, filters, filter_raw, refresh))
     };
 
-    layout_schedules("Schedules · Vantage", &body, refresh, "")
+    // Auto-refresh must keep the operator on the page they were reading,
+    // with no `flash` carried forward — see `layout_schedules`'s own doc
+    // comment. It keeps `page`, unlike `schedule_return_to_path`, which
+    // deliberately excludes it (a one-time post-action redirect can land
+    // back on page 0 without harm; a repeating reload cannot).
+    let refresh_target = format!(
+        "schedules?page={page}{}",
+        build_schedule_query_string(limit, filters, filter_raw, refresh)
+    );
+    layout_schedules("Schedules · Vantage", &body, refresh, "", &refresh_target)
 }
 
 fn render_schedule_filters(
@@ -10230,6 +10248,7 @@ fn render_schedule_preview_page(
         &body,
         None,
         SCHEDULE_DRILLDOWN_BASE,
+        "",
     )
 }
 
@@ -10446,6 +10465,7 @@ fn render_schedule_runs_page(
         &body,
         None,
         SCHEDULE_DRILLDOWN_BASE,
+        "",
     )
 }
 
@@ -10852,6 +10872,7 @@ fn render_schedule_backfill_form(
         &body,
         None,
         SCHEDULE_DRILLDOWN_BASE,
+        "",
     )
 }
 
@@ -10959,6 +10980,7 @@ fn render_schedule_backfill_confirm(
         &body,
         None,
         SCHEDULE_DRILLDOWN_BASE,
+        "",
     )
 }
 
@@ -11166,7 +11188,27 @@ fn layout_gates(title: &str, body: &Markup) -> Markup {
 /// `/schedules` passes `""`, and the `/schedules/{id}/{leaf}` drill-downs pass
 /// [`SCHEDULE_DRILLDOWN_BASE`] (`../../`). Without it every nav link on a
 /// drill-down resolves relative to `/schedules/{id}/` and 404s.
-fn layout_schedules(title: &str, body: &Markup, refresh: Option<u64>, base_href: &str) -> Markup {
+/// `refresh_target` is the current filtered list view's URL, page
+/// included, with no `flash` param. Only the list page passes a real
+/// one. The drill-down pages never enable `refresh`, so an empty string
+/// is fine there. The `@if let Some(secs)` guard below never renders the
+/// tag in that case.
+///
+/// A bulk action redirects here with `flash` appended to `return_to`.
+/// `return_to` itself preserves `refresh`. Without an explicit target,
+/// an operator with auto-refresh on would see this page's meta refresh
+/// reload that same flash-bearing URL on every interval. Each reload
+/// would re-announce and re-focus a stale message. Same fix as
+/// `layout_dead_letters` already applies, found in review there as PR
+/// #1396. Codex review on #1437 P2: newly reachable once the bulk
+/// actions started preserving `refresh` through `return_to`.
+fn layout_schedules(
+    title: &str,
+    body: &Markup,
+    refresh: Option<u64>,
+    base_href: &str,
+    refresh_target: &str,
+) -> Markup {
     html! {
         (PreEscaped("<!DOCTYPE html>"))
         html lang="en" {
@@ -11174,7 +11216,7 @@ fn layout_schedules(title: &str, body: &Markup, refresh: Option<u64>, base_href:
                 meta charset="utf-8";
                 meta name="viewport" content="width=device-width,initial-scale=1";
                 @if let Some(secs) = refresh {
-                    meta http-equiv="refresh" content=(secs);
+                    meta http-equiv="refresh" content={ (secs) "; url=" (refresh_target) };
                 }
                 title { (title) }
                 style { (PreEscaped(STYLE)) }
@@ -12599,7 +12641,7 @@ mod tests {
     #[test]
     fn layout_schedules_has_nav_link() {
         let body = html! { p { "test" } };
-        let html = layout_schedules("Test", &body, None, "").into_string();
+        let html = layout_schedules("Test", &body, None, "", "").into_string();
         assert!(
             html.contains("schedules"),
             "layout_schedules must include schedules link"
@@ -12617,11 +12659,60 @@ mod tests {
     #[test]
     fn layout_schedules_auto_refresh_tag() {
         let body = html! { p { "test" } };
-        let html_with = layout_schedules("T", &body, Some(30), "").into_string();
+        let html_with =
+            layout_schedules("T", &body, Some(30), "", "schedules?page=0").into_string();
         assert!(html_with.contains("http-equiv=\"refresh\""));
-        assert!(html_with.contains("content=\"30\""));
-        let html_without = layout_schedules("T", &body, None, "").into_string();
+        assert!(html_with.contains(r#"content="30; url=schedules?page=0""#));
+        let html_without = layout_schedules("T", &body, None, "", "").into_string();
         assert!(!html_without.contains("http-equiv=\"refresh\""));
+    }
+
+    /// Codex review on #1437 (P2): a targetless `meta refresh` would
+    /// reload this page's own URL. If that URL still carries `flash=...`
+    /// (as it does right after a bulk pause/resume redirect), every
+    /// auto-refresh interval re-announces and re-focuses the same stale
+    /// message. The tag must instead point `url=` at the flash-free
+    /// target the caller supplies — same fix as `layout_dead_letters`
+    /// already applies (PR #1396).
+    #[test]
+    fn layout_schedules_refresh_tag_targets_flash_free_url() {
+        let body = html! { p { "test" } };
+        let html =
+            layout_schedules("Test", &body, Some(30), "", "schedules?kind=Workflow").into_string();
+        assert!(
+            html.contains(r#"content="30; url=schedules?kind=Workflow""#),
+            "refresh tag must target the flash-free URL: {html}"
+        );
+    }
+
+    /// PR #1396's own review class, applied to the Schedules page. The
+    /// auto-refresh target must keep the operator on the page they were
+    /// reading, not bounce them to page 0.
+    #[test]
+    fn schedules_page_refresh_target_preserves_current_page() {
+        let filters = ScheduleUiFilters::default();
+        let filter_raw = ScheduleUiFilterRaw::default();
+        let html = render_schedules_page(
+            &[],
+            &[],
+            false,
+            &filters,
+            &filter_raw,
+            &std::collections::HashMap::new(),
+            2,
+            50,
+            false,
+            0,
+            "",
+            "",
+            Some(30),
+            None,
+        )
+        .into_string();
+        assert!(
+            html.contains("url=schedules?page=2"),
+            "refresh target must preserve page=2: {html}"
+        );
     }
 
     #[test]
@@ -13340,7 +13431,7 @@ mod tests {
     #[test]
     fn layout_schedules_includes_build_routing_nav_link() {
         let body = html! { p { "test" } };
-        let html = layout_schedules("Test", &body, None, "").into_string();
+        let html = layout_schedules("Test", &body, None, "", "").into_string();
         assert!(
             html.contains("build-routing"),
             "layout_schedules must include a Build Routing nav link"
@@ -16268,7 +16359,7 @@ mod tests {
     #[test]
     fn schedule_bulk_redirect_to_preserves_a_valid_return_to() {
         let response =
-            schedule_bulk_redirect_to(Some("schedules?kind=zombie&target=billing"), "Paused 3");
+            schedule_bulk_redirect_to(Some("../schedules?kind=zombie&target=billing"), "Paused 3");
         let location = response
             .headers()
             .get(axum::http::header::LOCATION)
@@ -16276,7 +16367,7 @@ mod tests {
             .to_str()
             .unwrap();
         assert!(
-            location.starts_with("schedules?kind=zombie&target=billing&flash="),
+            location.starts_with("../schedules?kind=zombie&target=billing&flash="),
             "the operator's filtered view, invalid value included, must survive \
              the redirect: {location}"
         );
@@ -16293,6 +16384,11 @@ mod tests {
             "//evil.example",
             "workflows",
             "schedulesXYZ",
+            // Bare "schedules" (no "../") is the pre-fix shape. It 404s
+            // when resolved against the bulk-action POST URL, so it must
+            // not be trusted either — see `schedule_bulk_redirect_to`'s
+            // own doc comment.
+            "schedules?kind=Workflow",
         ] {
             let response = schedule_bulk_redirect_to(Some(unsafe_value), "Paused 1");
             let location = response
@@ -16302,7 +16398,7 @@ mod tests {
                 .to_str()
                 .unwrap();
             assert!(
-                location.starts_with("schedules?flash="),
+                location.starts_with("../schedules?flash="),
                 "an unrecognized return_to ({unsafe_value:?}) must fall back to the \
                  safe default, not redirect off the Schedules page: {location}"
             );
@@ -16318,7 +16414,7 @@ mod tests {
             .expect("redirect must set Location")
             .to_str()
             .unwrap();
-        assert!(location.starts_with("schedules?flash="), "{location}");
+        assert!(location.starts_with("../schedules?flash="), "{location}");
     }
 
     #[test]
@@ -16330,7 +16426,7 @@ mod tests {
             ..ScheduleUiFilterRaw::default()
         };
         let path = schedule_return_to_path(&filters, &filter_raw, DEFAULT_SCHEDULE_PAGE_SIZE, None);
-        assert_eq!(path, "schedules?kind=zombie");
+        assert_eq!(path, "../schedules?kind=zombie");
     }
 
     #[test]
@@ -16338,7 +16434,7 @@ mod tests {
         let filters = ScheduleUiFilters::default();
         let filter_raw = ScheduleUiFilterRaw::default();
         let path = schedule_return_to_path(&filters, &filter_raw, DEFAULT_SCHEDULE_PAGE_SIZE, None);
-        assert_eq!(path, "schedules");
+        assert_eq!(path, "../schedules");
     }
 
     #[test]
@@ -16358,7 +16454,7 @@ mod tests {
         )
         .into_string();
         assert_eq!(
-            html.matches("name=\"return_to\" value=\"schedules?target=billing\"")
+            html.matches("name=\"return_to\" value=\"../schedules?target=billing\"")
                 .count(),
             2,
             "both the pause and resume forms must carry the filtered return_to: {html}"
