@@ -1654,7 +1654,17 @@ pub fn spawn_worker_heartbeat(
                 AtomicUsize::load(&act_max, Ordering::Relaxed),
             );
             let in_use_sessions = crate::sessions::session_slot_count(&session_slots_in_use);
-            match pool.get().await {
+            // Selected against `cancel` (issue #1209). Harvest configures no
+            // deadpool `Timeouts`, so `pool.get()` alone can park this task
+            // indefinitely on an exhausted shard pool. The top-of-loop select
+            // only guards the sleep between ticks. A tick already parked here
+            // would otherwise never observe shutdown, and the join in
+            // `run_multi_shard`/`run_with_listener` would wait forever.
+            let get_result = tokio::select! {
+                () = cancel.cancelled() => break,
+                result = pool.get() => result,
+            };
+            match get_result {
                 Ok(mut conn) => {
                     let () = do_heartbeat_tick(
                         &mut conn,

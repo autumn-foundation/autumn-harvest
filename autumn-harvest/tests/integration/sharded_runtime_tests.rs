@@ -615,6 +615,126 @@ async fn explicit_shard_assignment_is_never_widened() {
     let _ = tokio::time::timeout(Duration::from_secs(10), handle).await;
 }
 
+// ── issue #1209 ──────────────────────────────────────────────────────────
+
+/// **Issue #1209 AC1/AC2.** Shutdown must complete within a bounded multiple
+/// of `shutdown_timeout`, even when one shard's pool never yields a
+/// connection. The healthy shards' Draining/Stopped transitions must still
+/// be written.
+///
+/// `transition_fleet_status` opened with a bare `pool.get().await`. The
+/// multi-shard shutdown sequence visits every shard sequentially. Shard 0's
+/// exhausted pool used to park the Draining and Stopped loops forever. The
+/// other shards' rows were never updated, and the process never terminated.
+///
+/// The heartbeat task has the same shape. Its own `pool.get().await` was not
+/// selected against its cancel token, so a heartbeat already parked in
+/// acquisition was joined indefinitely.
+///
+/// This test drives the full public `Worker::run` shutdown path. It caught
+/// a third instance of the same defect this way. The schedule-overdue
+/// sampler's eager first pass (`spawn_schedule_overdue_sampler`) called
+/// `pool.get().await` on every shard pool before its own cancellation
+/// check. It could therefore also park past shutdown. That acquisition is
+/// now selected against `cancel` as well.
+///
+/// Reverting any of the three fixes makes this test time out. The fixes
+/// are the bounded acquisition in `transition_fleet_status`, the
+/// cancellable `pool.get()` in the heartbeat loop, and the same fix in the
+/// schedule-overdue sampler.
+///
+/// **Scope note.** This test calls `shutdown()` 300ms after start.
+/// `run_multi_shard`'s startup registration sequence against the exhausted
+/// shard takes about 10s on its own. Every other per-shard monitor loop
+/// (queue depth, timeout checker, poison-pill reclaimer, and more) shares
+/// the schedule-overdue sampler's cancellation shape at its own top of
+/// loop. Each one spawns only after that startup sequence finishes. So
+/// this test's early shutdown request has already landed before any of
+/// them starts its first tick. Each one breaks before ever calling
+/// `pool.get()`. A worker that runs long enough lets one of those loops
+/// start a real acquisition against a permanently-exhausted shard before
+/// shutdown is requested. That case is not covered by this test — see
+/// issue #1426.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn shutdown_completes_when_a_shard_pool_is_permanently_exhausted() {
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+        .try_init();
+    let (urls, _container) = setup_shard_databases(&SHARDS).await;
+    let saturated = ShardId::new(0);
+    let sharded = build_sharded_pool_with_saturable_shard(&urls, saturated);
+    let metrics = Arc::new(ShardMetrics::default());
+
+    // Take shard 0's ONLY connection and hold it for the whole test. Every
+    // acquisition against shard 0 — including the shutdown transitions and
+    // the heartbeat — blocks for as long as this is held.
+    let saturating_conn = sharded
+        .exact_pool_for(saturated)
+        .expect("shard 0 pool")
+        .get()
+        .await
+        .expect("hold shard 0's only connection");
+
+    let worker_id = "w-shutdown-hang";
+    let worker = build_worker(&sharded, Vec::new(), Arc::clone(&metrics), worker_id);
+    assert_eq!(
+        worker.config.shard_assignments.len(),
+        SHARDS.len(),
+        "auto-resolution should have widened this worker to every pool shard",
+    );
+
+    let default_pool = sharded
+        .exact_pool_for(ShardId::new(1))
+        .expect("shard 1 pool")
+        .clone();
+    let runner = Arc::clone(&worker);
+    let handle = tokio::spawn(async move {
+        runner.run(&default_pool).await;
+    });
+
+    // Give the worker a moment to finish startup (registration, heartbeats,
+    // first poll) before requesting shutdown.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    worker.shutdown();
+
+    // Generous but finite: `shutdown_timeout` is 2s (`build_worker`).
+    // Four separate bounded acquisitions land on shard 0 in sequence. Two
+    // happen during startup registration and two during the
+    // Draining/Stopped transitions. Each is capped at
+    // `MIN_SHARD_ACQUIRE_BOUND` (5s), so a correct shutdown takes roughly
+    // 20s before shard 1/2 work and test overhead. `90s` leaves
+    // comfortable headroom over the ~22s observed in practice. The
+    // property under test is "bounded", not "fast".
+    let result = tokio::time::timeout(Duration::from_secs(90), handle).await;
+    assert!(
+        result.is_ok(),
+        "worker shutdown did not complete within 90s while shard 0's pool was \
+         permanently exhausted — shutdown must be bounded, never parked \
+         forever (issue #1209 AC1/AC2)",
+    );
+
+    drop(saturating_conn);
+
+    // AC1: the healthy shards' fleet rows must still reach Stopped even
+    // though shard 0 never yielded a connection.
+    for shard in [1, 2] {
+        let url = &urls[&ShardId::new(shard)];
+        let mut conn = <AsyncPgConnection as AsyncConnection>::establish(url)
+            .await
+            .expect("connect to healthy shard for status check");
+        let status = autumn_harvest::workers::read_worker_status(&mut conn, worker_id)
+            .await
+            .expect("read worker status");
+        assert_eq!(
+            status.as_deref(),
+            Some("Stopped"),
+            "shard {shard}'s worker row must reach Stopped even though shard 0's \
+             pool never yielded a connection (issue #1209 AC1)",
+        );
+    }
+}
+
 // ── AC5 ───────────────────────────────────────────────────────────────────
 
 /// **AC5.** A deep backlog on one assigned shard must not starve dispatch on
