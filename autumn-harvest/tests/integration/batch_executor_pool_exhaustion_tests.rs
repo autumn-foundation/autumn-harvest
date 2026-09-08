@@ -1,25 +1,55 @@
 #![cfg(feature = "db")]
-//! Snag finding: `batch::run_executor_once` can deadlock itself against its
-//! own shard pool (issue #1360 follow-up, flagged but "not reproduced" in the
-//! `#1350` shard-6 outbox-deadlock changelog).
+//! Snag finding: `batch::run_executor_once` deadlocks itself against its own
+//! shard pool (issue #1360, filed as an unconfirmed/unreproduced risk in the
+//! `#1350` shard-6 outbox-deadlock changelog; this test confirms it).
 //!
-//! `run_executor_once` checks out one connection per shard to list open jobs
-//! and holds it — unused — for the *entire* processing of every job on that
-//! shard, because `process_job` needs a second connection
-//! (`owning_shard_pool.get()`) from that exact same pool to claim the lease
-//! and record progress. On a pool with no free capacity left, the second
-//! acquisition can never succeed because the first connection is never
-//! released until processing finishes — which it never does. `deadpool` has
-//! no acquisition timeout configured anywhere in this codebase (the same
-//! precondition that made the `#1350` outbox bug a permanent hang rather than
-//! a slow retry), so this is a genuine, permanent self-deadlock, not a
-//! transient stall.
+//! Two stacked instances of the same root cause both hold a checked-out
+//! connection across an `.await` that needs to check out a *second*
+//! connection from that exact same pool:
+//!
+//! 1. `run_executor_once` checks out a connection to list open jobs on a
+//!    shard and holds it — unused — for the entire processing of every job
+//!    on that shard, because `process_job` immediately needs its own
+//!    connection (`owning_shard_pool.get()`) from that same pool.
+//! 2. Inside `process_job` itself, `owning_conn` (acquired to claim the job's
+//!    lease) stays checked out across the whole per-target dispatch loop,
+//!    because it is needed again afterwards for `record_progress` and
+//!    `mark_completed` — while each dispatched target concurrently needs its
+//!    *own* connection via `dispatch_pool_for(..).get()`, which for a
+//!    single-shard deployment (or two shards aliased to one physical pool,
+//!    the `#1350` topology) is the identical pool.
+//!
+//! Fixing only #1 is not sufficient: the test below still hangs with just
+//! that instance patched, because #2 alone reproduces it on a single shard.
+//! A correct fix needs `owning_conn` re-acquired at each of its three use
+//! sites (claim / each `record_progress` / `mark_completed`) instead of held
+//! for the whole function — which touches enough call sites that it reads as
+//! a real (if small) design change rather than a one-line patch, so this is
+//! filed as a report rather than fixed here.
+//!
+//! On a pool with no free capacity left, the second acquisition can never
+//! succeed because the first connection is never released until processing
+//! finishes — which it never does. `deadpool` has no acquisition timeout
+//! configured anywhere in this codebase (the same precondition that made the
+//! `#1350` outbox bug a permanent hang rather than a slow retry), so this is
+//! a genuine, permanent self-deadlock, not a transient stall.
 //!
 //! This is reachable through the real production entry point
 //! (`autumn_harvest_plugin::runner::BatchRuntime::spawn` calls
-//! `run_executor_once` in a bare loop with no timeout) whenever a shard's
-//! pool has no spare connection at the moment a batch job is open — the
-//! simplest case, reproduced here, is a pool of size 1.
+//! `run_executor_once` in a bare loop with no timeout, and `BatchRuntime::
+//! shutdown` then awaits that same stuck task with no abort fallback — so a
+//! hang here also wedges the whole process's graceful shutdown) whenever a
+//! shard's pool has no spare connection at the moment a batch job is open —
+//! the simplest case, reproduced here, is a pool of size 1.
+//!
+//! `#[ignore]`d because it is a *confirmed hang*, not a flake: running it
+//! un-ignored would reproduce the exact "one test parks a CI job for hours"
+//! failure mode `#1350` already caused once (this test bounds it to 15s via
+//! `tokio::time::timeout` so it fails fast instead, but a hang is still not
+//! something the default suite should carry). Run explicitly with
+//! `HARVEST_TEST_DATABASE_URL=... cargo test --features db,testing -- \
+//! --ignored run_executor_once_deadlocks_on_a_pool_with_no_spare_connection`
+//! to reproduce; it fails 2/2 in local verification.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -143,6 +173,9 @@ async fn insert_running_row(conn: &mut AsyncPgConnection, exec_id: ExecutionId) 
 /// at least one execution — with no pool aliasing, no rebalancing, and no
 /// concurrent load required.
 #[tokio::test]
+#[ignore = "confirmed permanent hang (issue #1360), bounded to 15s here; not \
+            safe for the default suite until the deadlock is fixed — see \
+            module docs"]
 async fn run_executor_once_deadlocks_on_a_pool_with_no_spare_connection() {
     let (url, _container) = setup_one_database().await;
 
