@@ -1057,6 +1057,44 @@ async fn ui_dead_letters_invalid_task_kind_persists_across_pagination() {
     );
 }
 
+/// `shard_id` used to be typed `Option<i32>` straight on the DLQ page's
+/// `Query<..>` extractor struct. A non-numeric value failed axum's own
+/// query deserialization, a bare framework 400 before `list_dead_letters_ui`
+/// ever ran. That is one layer earlier than the `task_kind`/`failed_after`/
+/// `failed_before` page-abort bug #1420 already fixed on this same page.
+#[tokio::test]
+async fn ui_dead_letters_invalid_shard_id_redisplays_form_instead_of_aborting_page() {
+    let (database_url, _container) = setup_test_database_url().await;
+    let app = build_single_shard_ui_app(&database_url);
+
+    let (status, html) = fetch_html(
+        &app,
+        "/dead-letters?shard_id=north&workflow_name=invoice_workflow",
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "an invalid shard_id must not abort the whole DLQ page: {html}"
+    );
+    assert!(
+        html.contains("value=\"invoice_workflow\""),
+        "the other filter the operator already typed must not be discarded: {html}"
+    );
+    assert!(
+        html.contains("role=\"alert\""),
+        "an inline, screen-reader-announced error must sit next to the field: {html}"
+    );
+    assert!(
+        html.contains("value=\"north\""),
+        "the operator's exact invalid text must be echoed back into the field: {html}"
+    );
+    assert!(
+        html.contains("shard_id") && html.contains("north"),
+        "the error must name the field and the bad value: {html}"
+    );
+}
+
 /// DLQ Summary toggle (issue #385): the aggregation view groups entries,
 /// reports counts merged across shards, and links back into the filtered list.
 #[tokio::test]
@@ -1420,6 +1458,40 @@ async fn ui_workers_unknown_stale_value_redisplays_form_instead_of_aborting_page
     assert!(
         html.contains("True"),
         "the error must name the exact bad value the operator sent: {html}"
+    );
+}
+
+/// `shard` used to be typed `Option<i32>` straight on the Workers page's
+/// `Query<..>` extractor struct. A non-numeric value failed axum's own
+/// query deserialization, a bare framework 400 before `list_workers_ui`
+/// ever ran. That is one layer earlier than the status/stale page-abort
+/// bug #1378 already fixed on this same page.
+#[tokio::test]
+async fn ui_workers_invalid_shard_value_redisplays_form_instead_of_aborting_page() {
+    let (database_url, _container) = setup_test_database_url().await;
+    let app = build_single_shard_ui_app(&database_url);
+
+    let (status, html) = fetch_html(&app, "/workers?shard=north&build_id=abc123").await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "an invalid shard value must not abort the whole Workers page: {html}"
+    );
+    assert!(
+        html.contains("value=\"abc123\""),
+        "the other filter the operator already typed must not be discarded: {html}"
+    );
+    assert!(
+        html.contains("role=\"alert\""),
+        "an inline, screen-reader-announced error must sit next to the field: {html}"
+    );
+    assert!(
+        html.contains("value=\"north\""),
+        "the operator's exact invalid text must be echoed back into the field: {html}"
+    );
+    assert!(
+        html.contains("shard") && html.contains("north"),
+        "the error must name the field and the bad value: {html}"
     );
 }
 
@@ -1859,6 +1931,76 @@ async fn ui_schedules_filter_by_kind_dag() {
     );
 }
 
+/// `list_schedules_ui` used to `?`-propagate `ScheduleKindFilter::parse`'s
+/// `Result` directly. A bad `kind` value aborted the whole page with a
+/// bare 400, before the filter form, the table, or the operator's other
+/// filters ever rendered. It is the exact page-abort defect already fixed
+/// on this page's three sibling list pages: Workflows #1333, Workers
+/// #1378, Dead-Letters #1420. It never reached the Schedules page itself.
+#[tokio::test]
+async fn ui_schedules_invalid_kind_value_redisplays_form_instead_of_aborting_page() {
+    let (database_url, _container) = setup_test_database_url().await;
+    let app = build_single_shard_ui_app(&database_url);
+
+    let (status, html) = fetch_html(&app, "/schedules?kind=zombie&target=billing").await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "an invalid kind value must not abort the whole Schedules page: {html}"
+    );
+    assert!(
+        html.contains("value=\"billing\""),
+        "the other filter the operator already typed must not be discarded: {html}"
+    );
+    assert!(
+        html.contains("role=\"alert\""),
+        "an inline, screen-reader-announced error must sit next to the field: {html}"
+    );
+    assert!(
+        html.contains("option value=\"zombie\" selected"),
+        "the Kind select must echo the invalid value back as its selected \
+         option, not silently revert to 'All': {html}"
+    );
+    assert!(
+        html.contains("zombie") && html.contains("Workflow"),
+        "the error must name the bad value and a valid option: {html}"
+    );
+}
+
+/// Same page-abort defect, `shard_id` side. It was typed `Option<i32>`
+/// straight on the `Query<..>` extractor struct, so a non-numeric value
+/// failed axum's own query deserialization before the handler ran at all.
+/// That is one layer earlier than the `kind`/`paused`/`health` fix above,
+/// and with no styled error whatsoever.
+#[tokio::test]
+async fn ui_schedules_invalid_shard_id_redisplays_form_instead_of_aborting_page() {
+    let (database_url, _container) = setup_test_database_url().await;
+    let app = build_single_shard_ui_app(&database_url);
+
+    let (status, html) = fetch_html(&app, "/schedules?shard_id=north&target=billing").await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "an invalid shard_id must not abort the whole Schedules page: {html}"
+    );
+    assert!(
+        html.contains("value=\"billing\""),
+        "the other filter the operator already typed must not be discarded: {html}"
+    );
+    assert!(
+        html.contains("role=\"alert\""),
+        "an inline, screen-reader-announced error must sit next to the field: {html}"
+    );
+    assert!(
+        html.contains("value=\"north\""),
+        "the operator's exact invalid text must be echoed back into the field: {html}"
+    );
+    assert!(
+        html.contains("shard_id") && html.contains("north"),
+        "the error must name the field and the bad value: {html}"
+    );
+}
+
 /// Filter `paused=Paused` shows only paused rows.
 #[tokio::test]
 async fn ui_schedules_filter_by_paused() {
@@ -2049,6 +2191,12 @@ async fn ui_schedules_delete_action_redirects() {
 }
 
 /// Auto-refresh: `?refresh=30` emits a meta http-equiv refresh tag.
+///
+/// The tag's `content` carries an explicit, flash-free `url=` target
+/// (Codex review, #1437 P2), not a bare interval. A repeating reload
+/// must land on the operator's current filtered view, instead of
+/// looping on a stale flash message — see `layout_schedules`'s own doc
+/// comment.
 #[tokio::test]
 async fn ui_schedules_auto_refresh_meta_tag() {
     let (database_url, _container) = setup_test_database_url().await;
@@ -2056,9 +2204,13 @@ async fn ui_schedules_auto_refresh_meta_tag() {
 
     let (status, html) = fetch_html(&app, "/schedules?refresh=30").await;
     assert_eq!(status, StatusCode::OK);
+    // Maud HTML-escapes attribute values. The rendered `&` between query
+    // params comes back as `&amp;`, same as every other multi-param
+    // assertion in this file (Codex review, #1437).
     assert!(
-        html.contains("content=\"30\"") && html.contains("http-equiv=\"refresh\""),
-        "auto-refresh meta tag with content=30 missing: {html}"
+        html.contains(r#"content="30; url=schedules?page=0&amp;refresh=30""#)
+            && html.contains("http-equiv=\"refresh\""),
+        "auto-refresh meta tag with content=30 and a flash-free target missing: {html}"
     );
 
     let (_, html_no_refresh) = fetch_html(&app, "/schedules").await;
@@ -2137,6 +2289,126 @@ async fn ui_schedules_bulk_pause_pauses_matching_rows() {
     assert!(
         !paused_other,
         "other_dag should NOT be paused (different kind)"
+    );
+}
+
+/// Codex review on #1437 (P2): before this fix, a bulk-action redirect
+/// always landed on a bare, unfiltered `schedules?flash=…`. That dropped
+/// whatever filters the operator had set, including a still-unresolved
+/// invalid value and its inline error, on the very next Pause/Resume
+/// click. Submitting the rendered `return_to` hidden field must land
+/// back on the same filtered view instead.
+#[tokio::test]
+async fn ui_schedules_bulk_pause_redirect_preserves_the_filtered_view() {
+    let (database_url, _container) = setup_test_database_url().await;
+    let app = build_single_shard_ui_app(&database_url);
+
+    let (status, headers, _body) = post_form(
+        &app,
+        "/schedules/bulk-pause",
+        "kind=Workflow&return_to=..%2Fschedules%3Fkind%3DWorkflow",
+    )
+    .await;
+    assert!(
+        status == StatusCode::SEE_OTHER || status == StatusCode::FOUND,
+        "bulk-pause must redirect (got {status})"
+    );
+    let location = headers
+        .get("location")
+        .expect("redirect must have Location header")
+        .to_str()
+        .unwrap()
+        .to_string();
+    assert!(
+        location.starts_with("../schedules?kind=Workflow&flash="),
+        "the redirect must preserve the operator's filtered view, not drop it: {location}"
+    );
+
+    // Codex review on #1437 (P2): a relative `Location` resolves against
+    // the URL this test posted to (`/schedules/bulk-pause`), not the
+    // list page. Follow it the way a browser does: RFC 3986 §5.3 has
+    // `../` step back out of `bulk-pause`'s own directory. Confirm it
+    // actually lands on the Schedules list, instead of the doubled-path
+    // 404 a bare `schedules?...` would have produced.
+    let resolved = format!(
+        "/{}",
+        location
+            .strip_prefix("../")
+            .expect("location must start with ../ to resolve correctly from bulk-pause")
+    );
+    assert!(
+        resolved.starts_with("/schedules?kind=Workflow&flash="),
+        "unexpected resolved redirect target: {resolved}"
+    );
+    let (list_status, list_body) = fetch_html(&app, &resolved).await;
+    assert_eq!(
+        list_status,
+        StatusCode::OK,
+        "the resolved redirect target must actually load the Schedules list, not 404: {list_body}"
+    );
+}
+
+/// Codex review on #1437 (P2): a `return_to` with a form-decoded control
+/// character (`%0A` decodes to a raw newline) used to reach
+/// `axum::response::Redirect::to` unfiltered. `HeaderValue::try_from`
+/// rejects that byte, so the mutation succeeded but the response became
+/// an internal error instead of a redirect to the operator's filtered
+/// view.
+#[tokio::test]
+async fn ui_schedules_bulk_pause_rejects_control_characters_in_return_to() {
+    let (database_url, _container) = setup_test_database_url().await;
+    let app = build_single_shard_ui_app(&database_url);
+
+    let (status, headers, body) = post_form(
+        &app,
+        "/schedules/bulk-pause",
+        "return_to=..%2Fschedules%3Fx%3Da%0Ab",
+    )
+    .await;
+    assert!(
+        status == StatusCode::SEE_OTHER || status == StatusCode::FOUND,
+        "a return_to with a control character must fall back to the safe \
+         default redirect, not fail the response after the mutation already \
+         ran (got {status}): {body}"
+    );
+    let location = headers
+        .get("location")
+        .expect("redirect must have Location header")
+        .to_str()
+        .unwrap();
+    assert!(
+        location.starts_with("../schedules?flash="),
+        "must fall back to the safe default, not carry the raw control character: {location}"
+    );
+}
+
+/// Codex review on #1437 (P1): before this fix, an invalid `shard_id` in
+/// a bulk-action POST silently dropped to "no shard restriction". It
+/// paused schedules on every shard instead of rejecting the request —
+/// the exact scope-broadening a mutating endpoint must never allow.
+#[tokio::test]
+async fn ui_schedules_bulk_pause_rejects_invalid_shard_id_instead_of_broadening_scope() {
+    let (database_url, _container) = setup_test_database_url().await;
+    let id = insert_test_schedule(&database_url, "Workflow", "shard_guard_target", false).await;
+
+    let app = build_single_shard_ui_app(&database_url);
+    let (status, _headers, body) = post_form(&app, "/schedules/bulk-pause", "shard_id=north").await;
+    assert!(
+        status.is_client_error(),
+        "an invalid shard_id must reject the bulk action, not silently drop the \
+         restriction and pause every shard: got {status}, body: {body}"
+    );
+
+    let mut conn = AsyncPgConnection::establish(&database_url).await.unwrap();
+    let paused: bool = autumn_harvest::schema::harvest_schedules::table
+        .filter(autumn_harvest::schema::harvest_schedules::id.eq(id))
+        .select(autumn_harvest::schema::harvest_schedules::is_paused)
+        .first(&mut conn)
+        .await
+        .unwrap();
+    assert!(
+        !paused,
+        "no schedule should be paused when the bulk action itself is rejected"
     );
 }
 
@@ -2560,11 +2832,25 @@ async fn ui_schedules_health_filter_narrows_to_unhealthy_rows() {
         "healthy row must be filtered out: {html}"
     );
 
+    // #1437 (this PR's own subject): an unknown health value used to
+    // `?`-abort the whole page with a bare 400. It now degrades to
+    // "filter not applied" instead, like every other Vantage list-page
+    // filter. A visible `role="alert"` error names the bad value. That
+    // is neither the silent all-match the earlier version of this test
+    // worried about, nor a page-abort.
     let (status, html) = fetch_html(&app, "/schedules?health=bogus").await;
     assert_eq!(
         status,
-        StatusCode::BAD_REQUEST,
-        "an unknown health value must be a 400, not a silent all-match: {html}"
+        StatusCode::OK,
+        "an unknown health value must redisplay the form, not abort the page: {html}"
+    );
+    assert!(
+        html.contains("role=\"alert\"") && html.contains("bogus"),
+        "the bad value must be named in a visible, screen-reader-announced error: {html}"
+    );
+    assert!(
+        html.contains("healthy_row") && html.contains("paused_row"),
+        "with the health filter not applied, both rows must show: {html}"
     );
 }
 

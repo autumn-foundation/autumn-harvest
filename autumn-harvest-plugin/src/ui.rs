@@ -373,7 +373,7 @@ pub(crate) struct WorkerListParams {
     status: Option<String>,
     /// Filter by source shard id.
     #[serde(default)]
-    shard: Option<i32>,
+    shard: Option<String>,
     /// Set to `"true"` to show only stale workers.
     #[serde(default)]
     stale: Option<String>,
@@ -429,7 +429,7 @@ pub(crate) struct DeadLetterListParams {
     #[serde(default)]
     failed_before: Option<String>,
     #[serde(default)]
-    shard_id: Option<i32>,
+    shard_id: Option<String>,
     #[serde(default)]
     refresh: Option<u64>,
     #[serde(default)]
@@ -2226,7 +2226,7 @@ async fn list_dead_letters_ui(
         params.task_kind.as_deref(),
         params.failed_after.as_deref(),
         params.failed_before.as_deref(),
-        params.shard_id,
+        params.shard_id.as_deref(),
     );
 
     let pool = api_state.storage_pool().map_err(map_error)?;
@@ -2339,6 +2339,8 @@ struct DeadLetterUiFilterRaw {
     failed_after_error: Option<String>,
     failed_before: String,
     failed_before_error: Option<String>,
+    shard_id: String,
+    shard_id_error: Option<String>,
 }
 
 /// Parses the DLQ page's filters from raw query-string values. An
@@ -2355,7 +2357,7 @@ fn parse_dead_letter_ui_filters(
     task_kind: Option<&str>,
     failed_after: Option<&str>,
     failed_before: Option<&str>,
-    shard_id: Option<i32>,
+    shard_id: Option<&str>,
 ) -> (DeadLetterUiFilters, DeadLetterUiFilterRaw) {
     let workflow_name = workflow_name
         .map(str::trim)
@@ -2366,6 +2368,7 @@ fn parse_dead_letter_ui_filters(
         parse_dead_letter_time_filter("failed_after", failed_after);
     let (failed_before, failed_before_raw, failed_before_error) =
         parse_dead_letter_time_filter("failed_before", failed_before);
+    let (shard_id, shard_id_raw, shard_id_error) = parse_shard_id_filter("shard_id", shard_id);
 
     (
         DeadLetterUiFilters {
@@ -2382,6 +2385,8 @@ fn parse_dead_letter_ui_filters(
             failed_after_error,
             failed_before: failed_before_raw,
             failed_before_error,
+            shard_id: shard_id_raw,
+            shard_id_error,
         },
     )
 }
@@ -2438,6 +2443,42 @@ fn parse_dead_letter_time_filter(
         );
     };
     (Some(parsed.with_timezone(&Utc)), trimmed.to_string(), None)
+}
+
+/// Parses a `shard`/`shard_id` filter shared by the Workers, Dead-Letters,
+/// and Schedules list pages. Returns `(parsed, raw_display, error)` with the
+/// same "filter not applied, raw input carried through, error redisplayed
+/// inline" contract as [`parse_dead_letter_time_filter`].
+///
+/// Issue: on all three pages this field used to be typed `Option<i32>`
+/// directly on the `Query<..>` extractor struct. Axum deserializes query
+/// structs before the handler body runs, so a non-numeric value never
+/// reached the page's own graceful-degradation code. It failed the
+/// extractor itself instead, aborting the request with a bare framework
+/// 400. That happened before any `HarvestApiState`, any HTML, or any of
+/// the operator's other filters were even looked at. It is the same
+/// page-abort defect the sibling string filters already fix, but one
+/// layer earlier and with no styled error at all.
+///
+/// The fix retypes the field `Option<String>` on the params struct and
+/// parses it here, like every other filter on these pages. That moves the
+/// failure from the extractor into the handler, where it can degrade
+/// gracefully. `field` names the query parameter in the error message,
+/// since the pages spell it `shard` or `shard_id`.
+fn parse_shard_id_filter(field: &str, raw: Option<&str>) -> (Option<i32>, String, Option<String>) {
+    let Some(trimmed) = raw.map(str::trim).filter(|v| !v.is_empty()) else {
+        return (None, String::new(), None);
+    };
+    let Ok(parsed) = trimmed.parse::<i32>() else {
+        return (
+            None,
+            trimmed.to_string(),
+            Some(format!(
+                "Invalid {field} '{trimmed}'; expected a whole number. Filter not applied."
+            )),
+        );
+    };
+    (Some(parsed), trimmed.to_string(), None)
 }
 
 async fn load_dead_letters_from_shards_for_ui(
@@ -2615,6 +2656,13 @@ async fn list_workers_ui(
     let (status_filter, status_raw, status_error) =
         parse_worker_status_filter(params.status.as_deref());
     let (stale_only, stale_raw, stale_error) = parse_worker_stale_filter(params.stale.as_deref());
+    // Same fix, applied to the numeric `shard` filter. `shard` was still
+    // typed `Option<i32>` directly on the `Query<..>` extractor struct. A
+    // non-numeric value aborted with a bare framework 400 before this
+    // handler ever ran. That is one layer earlier than the page-abort bug
+    // status/stale already fix, with no styled error at all.
+    let (shard_filter, shard_raw, shard_error) =
+        parse_shard_id_filter("shard", params.shard.as_deref());
 
     let limit = params
         .limit
@@ -2647,7 +2695,7 @@ async fn list_workers_ui(
                 .flat_map(move |rows| rows.iter().map(move |r| (shard_id, r.clone())))
         })
         .filter(|(shard_id, row)| {
-            if params.shard.is_some_and(|f| shard_id.as_i32() != f) {
+            if shard_filter.is_some_and(|f| shard_id.as_i32() != f) {
                 return false;
             }
             if let Some(sf) = status_filter
@@ -2712,7 +2760,8 @@ async fn list_workers_ui(
         status_filter,
         &status_raw,
         status_error.as_deref(),
-        params.shard,
+        &shard_raw,
+        shard_error.as_deref(),
         stale_only,
         &stale_raw,
         stale_error.as_deref(),
@@ -3609,10 +3658,6 @@ fn render_dead_letter_filters(
 ) -> Markup {
     let workflow_name = filters.workflow_name.as_deref().unwrap_or("");
     let task_kind = filters.task_kind.map(DeadLetterTaskKind::as_label);
-    let shard_id = filters
-        .shard_id
-        .map(|id| id.to_string())
-        .unwrap_or_default();
     let refresh_value = refresh.map(|secs| secs.to_string()).unwrap_or_default();
 
     html! {
@@ -3655,7 +3700,10 @@ fn render_dead_letter_filters(
             }
             label {
                 "Shard"
-                input type="number" name="shard_id" value=(shard_id) placeholder="e.g. 0";
+                input type="text" inputmode="numeric" pattern="-?[0-9]*" name="shard_id" value=(filter_raw.shard_id) placeholder="e.g. 0";
+                @if let Some(error) = &filter_raw.shard_id_error {
+                    span.field-error role="alert" { (error) }
+                }
             }
             label {
                 "Per page"
@@ -3877,8 +3925,8 @@ fn render_dead_letter_hidden_filters_raw(
         @if !filter_raw.failed_before.is_empty() {
             input type="hidden" name="failed_before" value=(filter_raw.failed_before);
         }
-        @if let Some(shard_id) = filters.shard_id {
-            input type="hidden" name="shard_id" value=(shard_id);
+        @if !filter_raw.shard_id.is_empty() {
+            input type="hidden" name="shard_id" value=(filter_raw.shard_id);
         }
     }
 }
@@ -3984,8 +4032,8 @@ fn build_dead_letter_query_string(
             url_encode(&filter_raw.failed_before)
         );
     }
-    if let Some(shard_id) = filters.shard_id {
-        let _ = write!(out, "&shard_id={shard_id}");
+    if !filter_raw.shard_id.is_empty() {
+        let _ = write!(out, "&shard_id={}", url_encode(&filter_raw.shard_id));
     }
     if let Some(refresh) = refresh {
         let _ = write!(out, "&refresh={refresh}");
@@ -4101,7 +4149,8 @@ fn render_workers_page(
     status_filter: Option<&str>,
     status_raw: &str,
     status_error: Option<&str>,
-    shard_filter: Option<i32>,
+    shard_raw: &str,
+    shard_error: Option<&str>,
     stale_only: bool,
     stale_raw: &str,
     stale_error: Option<&str>,
@@ -4120,7 +4169,7 @@ fn render_workers_page(
         (render_paused_queues_banner(&paused_queues.rows, &paused_queues.unreadable_shards))
 
         // Filters
-        (render_worker_filters(status_filter, status_raw, status_error, shard_filter, stale_only, stale_raw, stale_error, build_id_filter, limit))
+        (render_worker_filters(status_filter, status_raw, status_error, shard_raw, shard_error, stale_only, stale_raw, stale_error, build_id_filter, limit))
 
         // Worker table (grouped by shard if multi-shard)
         @if total_workers == 0 && shard_errors.is_empty() {
@@ -4153,7 +4202,7 @@ fn render_workers_page(
             }
         }
 
-        (render_worker_pagination(page, limit, has_next, status_raw, shard_filter, stale_raw, build_id_filter))
+        (render_worker_pagination(page, limit, has_next, status_raw, shard_raw, stale_raw, build_id_filter))
     };
 
     layout_workers("Workers · Vantage", &body, refresh)
@@ -4240,14 +4289,14 @@ fn render_worker_filters(
     status_filter: Option<&str>,
     status_raw: &str,
     status_error: Option<&str>,
-    shard_filter: Option<i32>,
+    shard_raw: &str,
+    shard_error: Option<&str>,
     stale_only: bool,
     stale_raw: &str,
     stale_error: Option<&str>,
     build_id_filter: Option<&str>,
     limit: i64,
 ) -> Markup {
-    let shard_value = shard_filter.map(|s| s.to_string()).unwrap_or_default();
     let build_id_value = build_id_filter.unwrap_or("");
     html! {
         form.filters method="get" action="workers" {
@@ -4277,7 +4326,10 @@ fn render_worker_filters(
             }
             label {
                 "Shard"
-                input type="number" name="shard" value=(shard_value) placeholder="e.g. 0";
+                input type="text" inputmode="numeric" pattern="-?[0-9]*" name="shard" value=(shard_raw) placeholder="e.g. 0";
+                @if let Some(error) = shard_error {
+                    span.field-error role="alert" { (error) }
+                }
             }
             label {
                 "Stale only"
@@ -4307,12 +4359,11 @@ fn render_worker_pagination(
     limit: i64,
     has_next: bool,
     status_raw: &str,
-    shard_filter: Option<i32>,
+    shard_raw: &str,
     stale_raw: &str,
     build_id_filter: Option<&str>,
 ) -> Markup {
-    let base =
-        build_worker_query_string(limit, status_raw, shard_filter, stale_raw, build_id_filter);
+    let base = build_worker_query_string(limit, status_raw, shard_raw, stale_raw, build_id_filter);
     html! {
         div.pagination {
             @if page > 0 {
@@ -4339,7 +4390,7 @@ fn render_worker_pagination(
 fn build_worker_query_string(
     limit: i64,
     status_raw: &str,
-    shard_filter: Option<i32>,
+    shard_raw: &str,
     stale_raw: &str,
     build_id_filter: Option<&str>,
 ) -> String {
@@ -4357,8 +4408,8 @@ fn build_worker_query_string(
     if let Some(build_id) = build_id_filter {
         let _ = write!(out, "&build_id={}", url_encode(build_id));
     }
-    if let Some(shard) = shard_filter {
-        let _ = write!(out, "&shard={shard}");
+    if !shard_raw.is_empty() {
+        let _ = write!(out, "&shard={}", url_encode(shard_raw));
     }
     if !stale_raw.is_empty() {
         let _ = write!(out, "&stale={}", url_encode(stale_raw));
@@ -7794,7 +7845,7 @@ pub(crate) struct ScheduleListParams {
     #[serde(default)]
     health: Option<String>,
     #[serde(default)]
-    shard_id: Option<i32>,
+    shard_id: Option<String>,
     #[serde(default)]
     refresh: Option<u64>,
     #[serde(default)]
@@ -7814,7 +7865,13 @@ struct ScheduleBulkParams {
     #[serde(default)]
     health: Option<String>,
     #[serde(default)]
-    shard_id: Option<i32>,
+    shard_id: Option<String>,
+    /// The filtered list-page path to redirect back to after the action,
+    /// including an unresolved invalid value's raw text. Without it, the
+    /// redirect always lands on a bare, unfiltered `schedules?flash=…`
+    /// (Codex review, #1437 P2). See `schedule_bulk_redirect_to`.
+    #[serde(default)]
+    return_to: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -8082,6 +8139,95 @@ impl ScheduleUiFilters {
     }
 }
 
+/// Raw text and validation errors for the Schedules page's `kind`, `paused`,
+/// `health`, and `shard_id` filters. Carried alongside `ScheduleUiFilters`,
+/// which holds only the successfully parsed values. Same `(parsed,
+/// raw_display, error)` contract, and the same reason for existing, as
+/// `DeadLetterUiFilterRaw` on the DLQ page.
+#[derive(Debug, Clone, Default)]
+struct ScheduleUiFilterRaw {
+    kind: String,
+    kind_error: Option<String>,
+    paused: String,
+    paused_error: Option<String>,
+    health: String,
+    health_error: Option<String>,
+    shard_id: String,
+    shard_id_error: Option<String>,
+}
+
+/// Parses the Schedules page's `kind` filter from a raw query-string value.
+/// Returns `(parsed, raw_display, error)`. On success `error` is `None`.
+/// On an unrecognized value `parsed` is `ScheduleKindFilter::All`, so the
+/// filter is not applied, and `error` carries a message to render next to
+/// the field.
+///
+/// Issue: `list_schedules_ui` used to `?`-propagate `ScheduleKindFilter::
+/// parse`'s `Result` directly. A bad value aborted the whole page with a
+/// bare 400. That happened before the filter form, the table, or the
+/// operator's other filters ever rendered. It is the exact page-abort
+/// defect already fixed on this page's three sibling list pages: Workflows
+/// #1333, Workers #1378, Dead-Letters #1420. It is the one page those PRs
+/// never reached.
+fn parse_schedule_kind_filter(raw: Option<&str>) -> (ScheduleKindFilter, String, Option<String>) {
+    let Some(trimmed) = raw.map(str::trim).filter(|v| !v.is_empty()) else {
+        return (ScheduleKindFilter::All, String::new(), None);
+    };
+    match trimmed.to_ascii_lowercase().as_str() {
+        "workflow" => (ScheduleKindFilter::Workflow, trimmed.to_string(), None),
+        "dag" => (ScheduleKindFilter::Dag, trimmed.to_string(), None),
+        other => (
+            ScheduleKindFilter::All,
+            trimmed.to_string(),
+            Some(format!(
+                "Unknown kind '{other}'; expected Workflow, Dag, or empty. Filter not applied."
+            )),
+        ),
+    }
+}
+
+/// Parses the Schedules page's `paused` filter. Same contract and same fix
+/// as [`parse_schedule_kind_filter`].
+fn parse_schedule_paused_filter(
+    raw: Option<&str>,
+) -> (SchedulePausedFilter, String, Option<String>) {
+    let Some(trimmed) = raw.map(str::trim).filter(|v| !v.is_empty()) else {
+        return (SchedulePausedFilter::All, String::new(), None);
+    };
+    match trimmed.to_ascii_lowercase().as_str() {
+        "paused" => (SchedulePausedFilter::Paused, trimmed.to_string(), None),
+        "active" => (SchedulePausedFilter::Active, trimmed.to_string(), None),
+        other => (
+            SchedulePausedFilter::All,
+            trimmed.to_string(),
+            Some(format!(
+                "Unknown paused value '{other}'; expected Paused, Active, or empty. Filter not applied."
+            )),
+        ),
+    }
+}
+
+/// Parses the Schedules page's `health` filter. Same contract and same fix
+/// as [`parse_schedule_kind_filter`].
+fn parse_schedule_health_filter(
+    raw: Option<&str>,
+) -> (ScheduleHealthFilter, String, Option<String>) {
+    let Some(trimmed) = raw.map(str::trim).filter(|v| !v.is_empty()) else {
+        return (ScheduleHealthFilter::All, String::new(), None);
+    };
+    match trimmed.to_ascii_lowercase().as_str() {
+        "unhealthy" => (ScheduleHealthFilter::Unhealthy, trimmed.to_string(), None),
+        "healthy" => (ScheduleHealthFilter::Healthy, trimmed.to_string(), None),
+        other => (
+            ScheduleHealthFilter::All,
+            trimmed.to_string(),
+            Some(format!(
+                "Unknown health '{other}'; expected Unhealthy, Healthy, or empty. Filter not applied."
+            )),
+        ),
+    }
+}
+
 async fn load_schedules_from_shards_ui(api_state: &HarvestApiState) -> Vec<ShardScheduleResult> {
     let pool = match api_state.storage_pool() {
         Ok(p) => p,
@@ -8204,24 +8350,21 @@ async fn list_schedules_ui(
     let page = params.page.unwrap_or(0).max(0);
     let offset = page.saturating_mul(limit);
 
-    let kind = params
-        .kind
-        .as_deref()
-        .map(ScheduleKindFilter::parse)
-        .transpose()?
-        .unwrap_or(ScheduleKindFilter::All);
-    let paused_filter = params
-        .paused
-        .as_deref()
-        .map(SchedulePausedFilter::parse)
-        .transpose()?
-        .unwrap_or(SchedulePausedFilter::All);
-    let health_filter = params
-        .health
-        .as_deref()
-        .map(ScheduleHealthFilter::parse)
-        .transpose()?
-        .unwrap_or(ScheduleHealthFilter::All);
+    // The page used to `?`-propagate each of these on a bad value. That
+    // aborted the whole request with a bare 400 before the filter form
+    // ever rendered. It discarded whichever of the five filters the
+    // operator had already typed. Each bad field now degrades to "not
+    // applied" instead, handing back the raw text plus an error to
+    // redisplay inline. Same fix as `parse_worker_status_filter` (#1378)
+    // and `parse_dead_letter_ui_filters` (#1420) use on the sibling list
+    // pages.
+    let (kind, kind_raw, kind_error) = parse_schedule_kind_filter(params.kind.as_deref());
+    let (paused_filter, paused_raw, paused_error) =
+        parse_schedule_paused_filter(params.paused.as_deref());
+    let (health_filter, health_raw, health_error) =
+        parse_schedule_health_filter(params.health.as_deref());
+    let (shard_id, shard_id_raw, shard_id_error) =
+        parse_shard_id_filter("shard_id", params.shard_id.as_deref());
     let target = params
         .target
         .as_deref()
@@ -8234,7 +8377,17 @@ async fn list_schedules_ui(
         kind,
         paused: paused_filter,
         health: health_filter,
-        shard_id: params.shard_id,
+        shard_id,
+    };
+    let filter_raw = ScheduleUiFilterRaw {
+        kind: kind_raw,
+        kind_error,
+        paused: paused_raw,
+        paused_error,
+        health: health_raw,
+        health_error,
+        shard_id: shard_id_raw,
+        shard_id_error,
     };
 
     let shard_results = load_schedules_from_shards_ui(&api_state).await;
@@ -8279,6 +8432,7 @@ async fn list_schedules_ui(
         &shard_errors,
         is_multi_shard,
         &filters,
+        &filter_raw,
         &decisions,
         page,
         limit,
@@ -8292,7 +8446,30 @@ async fn list_schedules_ui(
 }
 
 /// Parse a `ScheduleUiFilters` from optional string fields.
-fn parse_schedule_bulk_filters(params: &ScheduleBulkParams) -> ScheduleUiFilters {
+/// Parses a `ScheduleUiFilters` for the bulk-action POST forms
+/// (`../schedules/bulk-pause`, `../schedules/bulk-resume`).
+///
+/// `kind`/`paused`/`health` keep the pre-existing "unrecognized value
+/// omits that filter" leniency. This PR does not touch that behavior. It
+/// matches the GET list page's "filter not applied" contract for a bad
+/// value.
+///
+/// `shard_id` does not keep that leniency. Unlike the other three
+/// fields, a broadened `shard_id` does not just show the operator a
+/// bigger table. It *pauses or resumes schedules on every shard*, not
+/// just the one they scoped the action to. Before this PR, `shard_id:
+/// Option<i32>` was typed directly on `ScheduleBulkParams`. A non-numeric
+/// value therefore failed axum's `Form<..>` extraction, and the whole
+/// request 400ed before any schedule was touched. Retyping it
+/// `Option<String>` fixes the GET-page 400 (see `parse_shard_id_filter`).
+/// Silently dropping a parse failure to `None` here would mean "no shard
+/// restriction". That would reopen the same gap one layer down. Here,
+/// "not applied" would mean "every shard", not "not this shard" (Codex
+/// review, P1). A malformed `shard_id` in a bulk form is therefore
+/// rejected outright, restoring the pre-PR behavior for this one field.
+fn parse_schedule_bulk_filters(
+    params: &ScheduleBulkParams,
+) -> Result<ScheduleUiFilters, AutumnError> {
     let kind = params
         .kind
         .as_deref()
@@ -8314,13 +8491,21 @@ fn parse_schedule_bulk_filters(params: &ScheduleBulkParams) -> ScheduleUiFilters
         .map(str::trim)
         .filter(|s| !s.is_empty())
         .map(str::to_string);
-    ScheduleUiFilters {
+    let shard_id = match params.shard_id.as_deref().map(str::trim) {
+        None | Some("") => None,
+        Some(raw) => Some(raw.parse::<i32>().map_err(|_| {
+            AutumnError::bad_request_msg(format!(
+                "invalid shard_id '{raw}'; expected a whole number"
+            ))
+        })?),
+    };
+    Ok(ScheduleUiFilters {
         target,
         kind,
         paused,
         health,
-        shard_id: params.shard_id,
-    }
+        shard_id,
+    })
 }
 
 /// Find a schedule by id across all shards. Returns the row, the shard it lives
@@ -8895,7 +9080,10 @@ async fn schedule_bulk_pause_ui(
     use autumn_harvest::schema::harvest_schedules::dsl;
     use axum::response::IntoResponse as _;
 
-    let filters = parse_schedule_bulk_filters(&params);
+    let filters = match parse_schedule_bulk_filters(&params) {
+        Ok(f) => f,
+        Err(e) => return e.into_response(),
+    };
 
     let pool = match api_state.storage_pool() {
         Ok(p) => p,
@@ -8972,7 +9160,10 @@ async fn schedule_bulk_pause_ui(
         let _ = insert_audit_batch(&mut conn, &records).await;
     }
 
-    schedule_bulk_redirect(&format!("Paused {acted_on} schedule(s)"))
+    schedule_bulk_redirect_to(
+        params.return_to.as_deref(),
+        &format!("Paused {acted_on} schedule(s)"),
+    )
 }
 
 async fn schedule_bulk_resume_ui(
@@ -8982,7 +9173,10 @@ async fn schedule_bulk_resume_ui(
     use autumn_harvest::schema::harvest_schedules::dsl;
     use axum::response::IntoResponse as _;
 
-    let filters = parse_schedule_bulk_filters(&params);
+    let filters = match parse_schedule_bulk_filters(&params) {
+        Ok(f) => f,
+        Err(e) => return e.into_response(),
+    };
 
     let pool = match api_state.storage_pool() {
         Ok(p) => p,
@@ -9067,7 +9261,10 @@ async fn schedule_bulk_resume_ui(
         let _ = insert_audit_batch(&mut conn, &records).await;
     }
 
-    schedule_bulk_redirect(&format!("Resumed {acted_on} schedule(s)"))
+    schedule_bulk_redirect_to(
+        params.return_to.as_deref(),
+        &format!("Resumed {acted_on} schedule(s)"),
+    )
 }
 
 /// Redirect back to the schedules list with a flash message.
@@ -9089,9 +9286,76 @@ fn schedule_redirect(flash: &str) -> axum::response::Response {
     schedule_redirect_from(2, flash)
 }
 
-/// Redirect from a `/schedules/…` list-level action (one segment deep).
-fn schedule_bulk_redirect(flash: &str) -> axum::response::Response {
-    schedule_redirect_from(1, flash)
+/// Redirect from a bulk-action POST (`/schedules/bulk-pause`,
+/// `/schedules/bulk-resume`) back to the operator's filtered view instead
+/// of always landing on a bare, unfiltered `schedules?flash=…`.
+///
+/// Before this fix, the bulk forms submitted only the parsed filters
+/// (`render_schedule_hidden_filters`). An operator with an unresolved
+/// invalid filter and its inline error lost both the moment they paused
+/// or resumed anything. That is the same "action discards what you were
+/// looking at" gap. #1420 already fixed it for the DLQ page's own bulk
+/// actions (Codex review, #1437 P2).
+///
+/// `return_to` is the bulk form's own hidden field. It is built by
+/// `schedule_return_to_path` from the same filters the list page just
+/// rendered — raw text, invalid values included. It is validated against
+/// the expected `../schedules[?...]` shape before use. That is the same
+/// guard `is_dead_letter_ui_return_path` applies to the DLQ page's
+/// `return_to`, so this operator-supplied field can never redirect
+/// anywhere else.
+///
+/// The `../` matters. The `Location` header resolves relative to the URL
+/// this handler was posted to (`.../schedules/bulk-pause`), not to the
+/// list page. A bare `schedules?...` would merge onto that path's own
+/// directory instead. It would land on `.../schedules/schedules?...` — a
+/// 404 after a mutation that otherwise succeeded (Codex review, #1437
+/// P2, verified against `urllib.parse.urljoin`).
+///
+/// `is_schedule_ui_return_path` also rejects a control character. A raw
+/// `\n` could reach it from a hand-crafted or malformed POST. The
+/// `Redirect`'s own `into_response` builds the `Location` header with
+/// `HeaderValue::try_from`, which rejects those bytes and falls back to
+/// a bare `500` (Codex review, #1437 P2). That is not a panic in this
+/// axum version, verified by reading `axum-0.8.9`'s own `Redirect::
+/// into_response`. It is still the wrong response after a mutation that
+/// already succeeded.
+fn schedule_bulk_redirect_to(return_to: Option<&str>, flash: &str) -> axum::response::Response {
+    use axum::response::IntoResponse as _;
+    let base = return_to
+        .map(str::trim)
+        .filter(|value| is_schedule_ui_return_path(value))
+        .map_or_else(|| "../schedules".to_string(), str::to_string);
+    let separator = if base.contains('?') { '&' } else { '?' };
+    let location = format!("{base}{separator}flash={}", url_encode(flash));
+    axum::response::Redirect::to(&location).into_response()
+}
+
+fn is_schedule_ui_return_path(value: &str) -> bool {
+    if value.bytes().any(|b| b.is_ascii_control()) {
+        return false;
+    }
+    match value.strip_prefix("../schedules") {
+        Some("") => true,
+        Some(rest) => rest.starts_with('?'),
+        None => false,
+    }
+}
+
+/// Built for the bulk-action forms' `return_to` hidden field, so its base
+/// carries the `../` those forms need — see `schedule_bulk_redirect_to`.
+fn schedule_return_to_path(
+    filters: &ScheduleUiFilters,
+    filter_raw: &ScheduleUiFilterRaw,
+    limit: i64,
+    refresh: Option<u64>,
+) -> String {
+    let query = build_schedule_query_string(limit, filters, filter_raw, refresh);
+    if query.is_empty() {
+        "../schedules".to_string()
+    } else {
+        format!("../schedules?{}", &query[1..])
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -9123,6 +9387,7 @@ fn render_schedules_page(
     shard_errors: &[(ShardId, String)],
     is_multi_shard: bool,
     filters: &ScheduleUiFilters,
+    filter_raw: &ScheduleUiFilterRaw,
     decisions: &std::collections::HashMap<uuid::Uuid, Vec<ScheduleDecision>>,
     page: i64,
     limit: i64,
@@ -9136,6 +9401,13 @@ fn render_schedules_page(
     refresh: Option<u64>,
     flash: Option<&str>,
 ) -> Markup {
+    // The "show only unhealthy" link forces `health=Unhealthy`, so it clears
+    // any stale health error the same way it clears the parsed override.
+    let unhealthy_link_raw = ScheduleUiFilterRaw {
+        health: String::new(),
+        health_error: None,
+        ..filter_raw.clone()
+    };
     let body = html! {
         h2 { "Schedules" }
 
@@ -9148,14 +9420,14 @@ fn render_schedules_page(
                 strong { "Needs attention: " }
                 (unhealthy_summary)
                 " — "
-                a href={ "schedules?health=Unhealthy" (PreEscaped(&build_schedule_query_string(limit, &ScheduleUiFilters { health: ScheduleHealthFilter::All, ..filters.clone() }, refresh))) } {
+                a href={ "schedules?health=Unhealthy" (PreEscaped(&build_schedule_query_string(limit, &ScheduleUiFilters { health: ScheduleHealthFilter::All, ..filters.clone() }, &unhealthy_link_raw, refresh))) } {
                     "show only unhealthy"
                 }
             }
         }
 
-        (render_schedule_filters(filters, limit, refresh))
-        (render_schedule_bulk_actions(filters, limit, refresh, total_filtered, distribution))
+        (render_schedule_filters(filters, filter_raw, limit, refresh))
+        (render_schedule_bulk_actions(filters, filter_raw, limit, refresh, total_filtered, distribution))
 
         @if rows.is_empty() && shard_errors.is_empty() {
             div.card.empty {
@@ -9181,22 +9453,28 @@ fn render_schedules_page(
             div."table-scroll" { (render_schedule_table(rows, is_multi_shard, decisions)) }
         }
 
-        (render_schedule_pagination(page, limit, has_next, filters, refresh))
+        (render_schedule_pagination(page, limit, has_next, filters, filter_raw, refresh))
     };
 
-    layout_schedules("Schedules · Vantage", &body, refresh, "")
+    // Auto-refresh must keep the operator on the page they were reading,
+    // with no `flash` carried forward — see `layout_schedules`'s own doc
+    // comment. It keeps `page`, unlike `schedule_return_to_path`, which
+    // deliberately excludes it (a one-time post-action redirect can land
+    // back on page 0 without harm; a repeating reload cannot).
+    let refresh_target = format!(
+        "schedules?page={page}{}",
+        build_schedule_query_string(limit, filters, filter_raw, refresh)
+    );
+    layout_schedules("Schedules · Vantage", &body, refresh, "", &refresh_target)
 }
 
 fn render_schedule_filters(
     filters: &ScheduleUiFilters,
+    filter_raw: &ScheduleUiFilterRaw,
     limit: i64,
     refresh: Option<u64>,
 ) -> Markup {
     let target_val = filters.target.as_deref().unwrap_or("");
-    let kind_val = filters.kind.as_label();
-    let paused_val = filters.paused.as_label();
-    let health_val = filters.health.as_label();
-    let shard_val = filters.shard_id.map(|s| s.to_string()).unwrap_or_default();
     let refresh_value = refresh.map(|s| s.to_string()).unwrap_or_default();
 
     html! {
@@ -9208,30 +9486,51 @@ fn render_schedule_filters(
             label {
                 "Kind"
                 select name="kind" {
-                    option value="" selected[kind_val.is_empty()] { "All" }
-                    option value="Workflow" selected[kind_val == "Workflow"] { "Workflow" }
-                    option value="Dag" selected[kind_val == "Dag"] { "Dag" }
+                    option value="" selected[filter_raw.kind.is_empty() && filter_raw.kind_error.is_none()] { "All" }
+                    option value="Workflow" selected[filters.kind == ScheduleKindFilter::Workflow] { "Workflow" }
+                    option value="Dag" selected[filters.kind == ScheduleKindFilter::Dag] { "Dag" }
+                    @if filter_raw.kind_error.is_some() {
+                        option value=(filter_raw.kind) selected { (filter_raw.kind) }
+                    }
+                }
+                @if let Some(error) = &filter_raw.kind_error {
+                    span.field-error role="alert" { (error) }
                 }
             }
             label {
                 "Paused"
                 select name="paused" {
-                    option value="" selected[paused_val.is_empty()] { "All" }
-                    option value="Paused" selected[paused_val == "Paused"] { "Paused" }
-                    option value="Active" selected[paused_val == "Active"] { "Active" }
+                    option value="" selected[filter_raw.paused.is_empty() && filter_raw.paused_error.is_none()] { "All" }
+                    option value="Paused" selected[filters.paused == SchedulePausedFilter::Paused] { "Paused" }
+                    option value="Active" selected[filters.paused == SchedulePausedFilter::Active] { "Active" }
+                    @if filter_raw.paused_error.is_some() {
+                        option value=(filter_raw.paused) selected { (filter_raw.paused) }
+                    }
+                }
+                @if let Some(error) = &filter_raw.paused_error {
+                    span.field-error role="alert" { (error) }
                 }
             }
             label {
                 "Health"
                 select name="health" {
-                    option value="" selected[health_val.is_empty()] { "All" }
-                    option value="Unhealthy" selected[health_val == "Unhealthy"] { "Unhealthy" }
-                    option value="Healthy" selected[health_val == "Healthy"] { "Healthy" }
+                    option value="" selected[filter_raw.health.is_empty() && filter_raw.health_error.is_none()] { "All" }
+                    option value="Unhealthy" selected[filters.health == ScheduleHealthFilter::Unhealthy] { "Unhealthy" }
+                    option value="Healthy" selected[filters.health == ScheduleHealthFilter::Healthy] { "Healthy" }
+                    @if filter_raw.health_error.is_some() {
+                        option value=(filter_raw.health) selected { (filter_raw.health) }
+                    }
+                }
+                @if let Some(error) = &filter_raw.health_error {
+                    span.field-error role="alert" { (error) }
                 }
             }
             label {
                 "Shard"
-                input type="number" name="shard_id" value=(shard_val) placeholder="e.g. 0";
+                input type="text" inputmode="numeric" pattern="-?[0-9]*" name="shard_id" value=(filter_raw.shard_id) placeholder="e.g. 0";
+                @if let Some(error) = &filter_raw.shard_id_error {
+                    span.field-error role="alert" { (error) }
+                }
             }
             label {
                 "Per page"
@@ -9256,12 +9555,14 @@ fn render_schedule_filters(
 
 fn render_schedule_bulk_actions(
     filters: &ScheduleUiFilters,
+    filter_raw: &ScheduleUiFilterRaw,
     limit: i64,
     refresh: Option<u64>,
     total_matching: usize,
     distribution: &str,
 ) -> Markup {
-    let return_qs = build_schedule_query_string(limit, filters, refresh);
+    let return_qs = build_schedule_query_string(limit, filters, filter_raw, refresh);
+    let return_to = schedule_return_to_path(filters, filter_raw, limit, refresh);
     let dist_suffix = if distribution.is_empty() {
         String::new()
     } else {
@@ -9272,6 +9573,7 @@ fn render_schedule_bulk_actions(
             form method="post" action="schedules/bulk-pause"
                 onsubmit={ "return confirm('Pause " (total_matching) " matching schedule(s)" (&dist_suffix) "?')" } {
                 (render_schedule_hidden_filters(filters))
+                input type="hidden" name="return_to" value=(return_to);
                 button type="submit" disabled[total_matching == 0] {
                     "Pause all matching (" (total_matching) ")"
                 }
@@ -9279,6 +9581,7 @@ fn render_schedule_bulk_actions(
             form method="post" action="schedules/bulk-resume"
                 onsubmit={ "return confirm('Resume " (total_matching) " matching schedule(s)" (&dist_suffix) "?')" } {
                 (render_schedule_hidden_filters(filters))
+                input type="hidden" name="return_to" value=(return_to);
                 button type="submit" disabled[total_matching == 0] {
                     "Resume all matching (" (total_matching) ")"
                 }
@@ -9645,9 +9948,10 @@ fn render_schedule_pagination(
     limit: i64,
     has_next: bool,
     filters: &ScheduleUiFilters,
+    filter_raw: &ScheduleUiFilterRaw,
     refresh: Option<u64>,
 ) -> Markup {
-    let base = build_schedule_query_string(limit, filters, refresh);
+    let base = build_schedule_query_string(limit, filters, filter_raw, refresh);
     html! {
         div.pagination {
             @if page > 0 {
@@ -9672,6 +9976,7 @@ fn render_schedule_pagination(
 fn build_schedule_query_string(
     limit: i64,
     filters: &ScheduleUiFilters,
+    filter_raw: &ScheduleUiFilterRaw,
     refresh: Option<u64>,
 ) -> String {
     let mut out = String::new();
@@ -9681,17 +9986,22 @@ fn build_schedule_query_string(
     if let Some(ref target) = filters.target {
         let _ = write!(out, "&target={}", url_encode(target));
     }
-    if !matches!(filters.kind, ScheduleKindFilter::All) {
-        let _ = write!(out, "&kind={}", filters.kind.as_label());
+    // Carry the raw text, not the parsed value. This lets an invalid
+    // value's inline error persist across pagination, instead of being
+    // silently dropped. Same reasoning as `build_dead_letter_query_string`'s
+    // task_kind/failed_after/failed_before handling on the DLQ page (Codex
+    // review, #1378 P2, #1420).
+    if !filter_raw.kind.is_empty() {
+        let _ = write!(out, "&kind={}", url_encode(&filter_raw.kind));
     }
-    if !matches!(filters.paused, SchedulePausedFilter::All) {
-        let _ = write!(out, "&paused={}", filters.paused.as_label());
+    if !filter_raw.paused.is_empty() {
+        let _ = write!(out, "&paused={}", url_encode(&filter_raw.paused));
     }
-    if !matches!(filters.health, ScheduleHealthFilter::All) {
-        let _ = write!(out, "&health={}", filters.health.as_label());
+    if !filter_raw.health.is_empty() {
+        let _ = write!(out, "&health={}", url_encode(&filter_raw.health));
     }
-    if let Some(shard_id) = filters.shard_id {
-        let _ = write!(out, "&shard_id={shard_id}");
+    if !filter_raw.shard_id.is_empty() {
+        let _ = write!(out, "&shard_id={}", url_encode(&filter_raw.shard_id));
     }
     if let Some(secs) = refresh {
         let _ = write!(out, "&refresh={secs}");
@@ -9950,6 +10260,7 @@ fn render_schedule_preview_page(
         &body,
         None,
         SCHEDULE_DRILLDOWN_BASE,
+        "",
     )
 }
 
@@ -10166,6 +10477,7 @@ fn render_schedule_runs_page(
         &body,
         None,
         SCHEDULE_DRILLDOWN_BASE,
+        "",
     )
 }
 
@@ -10572,6 +10884,7 @@ fn render_schedule_backfill_form(
         &body,
         None,
         SCHEDULE_DRILLDOWN_BASE,
+        "",
     )
 }
 
@@ -10679,6 +10992,7 @@ fn render_schedule_backfill_confirm(
         &body,
         None,
         SCHEDULE_DRILLDOWN_BASE,
+        "",
     )
 }
 
@@ -10886,7 +11200,27 @@ fn layout_gates(title: &str, body: &Markup) -> Markup {
 /// `/schedules` passes `""`, and the `/schedules/{id}/{leaf}` drill-downs pass
 /// [`SCHEDULE_DRILLDOWN_BASE`] (`../../`). Without it every nav link on a
 /// drill-down resolves relative to `/schedules/{id}/` and 404s.
-fn layout_schedules(title: &str, body: &Markup, refresh: Option<u64>, base_href: &str) -> Markup {
+/// `refresh_target` is the current filtered list view's URL, page
+/// included, with no `flash` param. Only the list page passes a real
+/// one. The drill-down pages never enable `refresh`, so an empty string
+/// is fine there. The `@if let Some(secs)` guard below never renders the
+/// tag in that case.
+///
+/// A bulk action redirects here with `flash` appended to `return_to`.
+/// `return_to` itself preserves `refresh`. Without an explicit target,
+/// an operator with auto-refresh on would see this page's meta refresh
+/// reload that same flash-bearing URL on every interval. Each reload
+/// would re-announce and re-focus a stale message. Same fix as
+/// `layout_dead_letters` already applies, found in review there as PR
+/// #1396. Codex review on #1437 P2: newly reachable once the bulk
+/// actions started preserving `refresh` through `return_to`.
+fn layout_schedules(
+    title: &str,
+    body: &Markup,
+    refresh: Option<u64>,
+    base_href: &str,
+    refresh_target: &str,
+) -> Markup {
     html! {
         (PreEscaped("<!DOCTYPE html>"))
         html lang="en" {
@@ -10894,7 +11228,7 @@ fn layout_schedules(title: &str, body: &Markup, refresh: Option<u64>, base_href:
                 meta charset="utf-8";
                 meta name="viewport" content="width=device-width,initial-scale=1";
                 @if let Some(secs) = refresh {
-                    meta http-equiv="refresh" content=(secs);
+                    meta http-equiv="refresh" content={ (secs) "; url=" (refresh_target) };
                 }
                 title { (title) }
                 style { (PreEscaped(STYLE)) }
@@ -11555,6 +11889,8 @@ mod tests {
             failed_after_error: Some("bad failed_after".to_string()),
             failed_before: String::new(),
             failed_before_error: None,
+            shard_id: String::new(),
+            shard_id_error: None,
         };
         let html =
             render_dead_letter_bulk_actions(&filters, &filter_raw, DEFAULT_DLQ_PAGE_SIZE, None, 5)
@@ -11705,6 +12041,55 @@ mod tests {
         );
     }
 
+    /// GREEN — the fix under test: `shard`/`shard_id` used to be typed
+    /// `Option<i32>` straight on the `Query<..>` extractor struct on all
+    /// three list pages. A non-numeric value failed axum's own query
+    /// deserialization, aborting the request with a bare framework 400.
+    /// That happened before any handler, filter form, or the operator's
+    /// other filters ever rendered. It is one layer earlier than the
+    /// page-abort bug the `task_kind`/`failed_after`/`failed_before`/
+    /// `status`/`stale` filters already fix, and with no styled error at
+    /// all.
+    #[test]
+    fn parse_shard_id_filter_accepts_valid_values() {
+        assert_eq!(
+            parse_shard_id_filter("shard_id", Some("0")),
+            (Some(0), "0".to_string(), None)
+        );
+        assert_eq!(
+            parse_shard_id_filter("shard_id", Some("  3  ")),
+            (Some(3), "3".to_string(), None)
+        );
+        assert_eq!(
+            parse_shard_id_filter("shard_id", Some("-1")),
+            (Some(-1), "-1".to_string(), None)
+        );
+    }
+
+    #[test]
+    fn parse_shard_id_filter_rejects_invalid_value_without_erroring() {
+        let (parsed, raw, error) = parse_shard_id_filter("shard_id", Some("north"));
+        assert_eq!(parsed, None, "an invalid shard_id must not be applied");
+        assert_eq!(raw, "north", "the raw text must echo the operator's input");
+        let message = error.expect("an invalid shard_id must carry a redisplayable error");
+        assert!(
+            message.contains("north") && message.contains("shard_id"),
+            "the error must name the bad value and the field: {message}"
+        );
+    }
+
+    #[test]
+    fn parse_shard_id_filter_blank_or_missing_is_not_an_error() {
+        assert_eq!(
+            parse_shard_id_filter("shard_id", None),
+            (None, String::new(), None)
+        );
+        assert_eq!(
+            parse_shard_id_filter("shard_id", Some("   ")),
+            (None, String::new(), None)
+        );
+    }
+
     #[test]
     fn render_dead_letter_filters_shows_inline_errors() {
         let filters = DeadLetterUiFilters::default();
@@ -11721,6 +12106,11 @@ mod tests {
             ),
             failed_before: String::new(),
             failed_before_error: None,
+            shard_id: "north".to_string(),
+            shard_id_error: Some(
+                "Invalid shard_id 'north'; expected a whole number. Filter not applied."
+                    .to_string(),
+            ),
         };
         let html = render_dead_letter_filters(&filters, &filter_raw, DEFAULT_DLQ_PAGE_SIZE, None)
             .into_string();
@@ -11735,6 +12125,10 @@ mod tests {
         assert!(
             html.contains("not-a-date"),
             "failed_after error and raw text must render inline: {html}"
+        );
+        assert!(
+            html.contains("north") && html.contains("Invalid shard_id"),
+            "shard_id error and raw text must render inline: {html}"
         );
     }
 
@@ -11752,6 +12146,8 @@ mod tests {
             failed_after_error: Some("bad failed_after".to_string()),
             failed_before: String::new(),
             failed_before_error: None,
+            shard_id: "north".to_string(),
+            shard_id_error: Some("bad shard_id".to_string()),
         };
         let query =
             build_dead_letter_query_string(DEFAULT_DLQ_PAGE_SIZE, &filters, &filter_raw, None);
@@ -11762,6 +12158,10 @@ mod tests {
         assert!(
             query.contains("failed_after=not-a-date"),
             "invalid failed_after must round-trip: {query}"
+        );
+        assert!(
+            query.contains("shard_id=north"),
+            "invalid shard_id must round-trip: {query}"
         );
     }
 
@@ -11787,6 +12187,8 @@ mod tests {
             failed_after_error: Some("bad failed_after".to_string()),
             failed_before: String::new(),
             failed_before_error: None,
+            shard_id: String::new(),
+            shard_id_error: None,
         };
         let key = serde_json::json!({"workflow_name": "invoice_workflow"});
         let (href, _partial) = dlq_summary_drilldown_href(
@@ -11820,6 +12222,8 @@ mod tests {
             failed_after_error: None,
             failed_before: String::new(),
             failed_before_error: None,
+            shard_id: String::new(),
+            shard_id_error: None,
         };
         let key = serde_json::json!({"task_type": "ACTIVITY"});
         let (href, _partial) = dlq_summary_drilldown_href(
@@ -11937,14 +12341,14 @@ mod tests {
     #[test]
     fn build_worker_query_string_empty_defaults() {
         assert_eq!(
-            build_worker_query_string(DEFAULT_PAGE_SIZE, "", None, "", None),
+            build_worker_query_string(DEFAULT_PAGE_SIZE, "", "", "", None),
             ""
         );
     }
 
     #[test]
     fn build_worker_query_string_includes_all_params() {
-        let q = build_worker_query_string(10, "Active", Some(1), "true", None);
+        let q = build_worker_query_string(10, "Active", "1", "true", None);
         assert!(q.contains("limit=10"));
         assert!(q.contains("status=Active"));
         assert!(q.contains("shard=1"));
@@ -11957,10 +12361,14 @@ mod tests {
     /// filter and its inline error (Codex review, #1378 P2).
     #[test]
     fn build_worker_query_string_carries_invalid_raw_values() {
-        let q = build_worker_query_string(DEFAULT_PAGE_SIZE, "zombie", None, "True", None);
+        let q = build_worker_query_string(DEFAULT_PAGE_SIZE, "zombie", "north", "True", None);
         assert!(
             q.contains("status=zombie"),
             "an invalid status must still round-trip through pagination: {q}"
+        );
+        assert!(
+            q.contains("shard=north"),
+            "an invalid shard must still round-trip through pagination: {q}"
         );
         assert!(
             q.contains("stale=True"),
@@ -12182,8 +12590,9 @@ mod tests {
     #[test]
     fn build_schedule_query_string_omits_defaults() {
         let filters = ScheduleUiFilters::default();
+        let filter_raw = ScheduleUiFilterRaw::default();
         assert_eq!(
-            build_schedule_query_string(DEFAULT_SCHEDULE_PAGE_SIZE, &filters, None),
+            build_schedule_query_string(DEFAULT_SCHEDULE_PAGE_SIZE, &filters, &filter_raw, None),
             ""
         );
     }
@@ -12197,7 +12606,14 @@ mod tests {
             health: ScheduleHealthFilter::Unhealthy,
             shard_id: Some(2),
         };
-        let q = build_schedule_query_string(10, &filters, Some(30));
+        let filter_raw = ScheduleUiFilterRaw {
+            kind: "Workflow".to_string(),
+            paused: "Paused".to_string(),
+            health: "Unhealthy".to_string(),
+            shard_id: "2".to_string(),
+            ..ScheduleUiFilterRaw::default()
+        };
+        let q = build_schedule_query_string(10, &filters, &filter_raw, Some(30));
         assert!(q.contains("health=Unhealthy"), "missing health: {q}");
         assert!(q.contains("limit=10"), "missing limit: {q}");
         assert!(q.contains("target=payment"), "missing target: {q}");
@@ -12207,10 +12623,37 @@ mod tests {
         assert!(q.contains("refresh=30"), "missing refresh: {q}");
     }
 
+    /// GREEN — the fix under test: an invalid raw value is carried through
+    /// verbatim. A caller would otherwise have parsed it to `All`/`None`
+    /// and lost it. A Next/Previous click or bulk-action resubmit must not
+    /// drop the still-unresolved filter and its inline error. Same
+    /// contract as `build_dead_letter_query_string` on the DLQ page.
+    #[test]
+    fn build_schedule_query_string_carries_invalid_raw_values() {
+        let filters = ScheduleUiFilters::default();
+        let filter_raw = ScheduleUiFilterRaw {
+            kind: "zombie".to_string(),
+            kind_error: Some("bad kind".to_string()),
+            shard_id: "north".to_string(),
+            shard_id_error: Some("bad shard_id".to_string()),
+            ..ScheduleUiFilterRaw::default()
+        };
+        let q =
+            build_schedule_query_string(DEFAULT_SCHEDULE_PAGE_SIZE, &filters, &filter_raw, None);
+        assert!(
+            q.contains("kind=zombie"),
+            "an invalid kind must still round-trip through pagination: {q}"
+        );
+        assert!(
+            q.contains("shard_id=north"),
+            "an invalid shard_id must still round-trip through pagination: {q}"
+        );
+    }
+
     #[test]
     fn layout_schedules_has_nav_link() {
         let body = html! { p { "test" } };
-        let html = layout_schedules("Test", &body, None, "").into_string();
+        let html = layout_schedules("Test", &body, None, "", "").into_string();
         assert!(
             html.contains("schedules"),
             "layout_schedules must include schedules link"
@@ -12228,11 +12671,60 @@ mod tests {
     #[test]
     fn layout_schedules_auto_refresh_tag() {
         let body = html! { p { "test" } };
-        let html_with = layout_schedules("T", &body, Some(30), "").into_string();
+        let html_with =
+            layout_schedules("T", &body, Some(30), "", "schedules?page=0").into_string();
         assert!(html_with.contains("http-equiv=\"refresh\""));
-        assert!(html_with.contains("content=\"30\""));
-        let html_without = layout_schedules("T", &body, None, "").into_string();
+        assert!(html_with.contains(r#"content="30; url=schedules?page=0""#));
+        let html_without = layout_schedules("T", &body, None, "", "").into_string();
         assert!(!html_without.contains("http-equiv=\"refresh\""));
+    }
+
+    /// Codex review on #1437 (P2): a targetless `meta refresh` would
+    /// reload this page's own URL. If that URL still carries `flash=...`
+    /// (as it does right after a bulk pause/resume redirect), every
+    /// auto-refresh interval re-announces and re-focuses the same stale
+    /// message. The tag must instead point `url=` at the flash-free
+    /// target the caller supplies — same fix as `layout_dead_letters`
+    /// already applies (PR #1396).
+    #[test]
+    fn layout_schedules_refresh_tag_targets_flash_free_url() {
+        let body = html! { p { "test" } };
+        let html =
+            layout_schedules("Test", &body, Some(30), "", "schedules?kind=Workflow").into_string();
+        assert!(
+            html.contains(r#"content="30; url=schedules?kind=Workflow""#),
+            "refresh tag must target the flash-free URL: {html}"
+        );
+    }
+
+    /// PR #1396's own review class, applied to the Schedules page. The
+    /// auto-refresh target must keep the operator on the page they were
+    /// reading, not bounce them to page 0.
+    #[test]
+    fn schedules_page_refresh_target_preserves_current_page() {
+        let filters = ScheduleUiFilters::default();
+        let filter_raw = ScheduleUiFilterRaw::default();
+        let html = render_schedules_page(
+            &[],
+            &[],
+            false,
+            &filters,
+            &filter_raw,
+            &std::collections::HashMap::new(),
+            2,
+            50,
+            false,
+            0,
+            "",
+            "",
+            Some(30),
+            None,
+        )
+        .into_string();
+        assert!(
+            html.contains("url=schedules?page=2"),
+            "refresh target must preserve page=2: {html}"
+        );
     }
 
     #[test]
@@ -12951,7 +13443,7 @@ mod tests {
     #[test]
     fn layout_schedules_includes_build_routing_nav_link() {
         let body = html! { p { "test" } };
-        let html = layout_schedules("Test", &body, None, "").into_string();
+        let html = layout_schedules("Test", &body, None, "", "").into_string();
         assert!(
             html.contains("build-routing"),
             "layout_schedules must include a Build Routing nav link"
@@ -13128,6 +13620,7 @@ mod tests {
             None,
             "",
             None,
+            "",
             None,
             false,
             "",
@@ -13148,7 +13641,8 @@ mod tests {
             None,
             "zombie",
             Some("Unknown status 'zombie'; expected Active, Draining, or Stopped. Filter not applied."),
-            None,
+            "north",
+            Some("Invalid shard 'north'; expected a whole number. Filter not applied."),
             false,
             "True",
             Some("Unknown stale value 'True'; expected 'true' or 'false'. Filter not applied."),
@@ -13159,6 +13653,10 @@ mod tests {
         assert!(
             html.contains("field-error") && html.contains("zombie"),
             "status error must render inline: {html}"
+        );
+        assert!(
+            html.contains("north") && html.contains("Invalid shard"),
+            "shard error must render inline: {html}"
         );
         assert!(
             html.contains("True"),
@@ -13177,6 +13675,7 @@ mod tests {
             None,
             "zombie",
             Some("Unknown status 'zombie'; expected Active, Draining, or Stopped. Filter not applied."),
+            "",
             None,
             false,
             "",
@@ -13287,7 +13786,7 @@ mod tests {
 
     #[test]
     fn build_worker_query_string_includes_build_id() {
-        let q = build_worker_query_string(DEFAULT_PAGE_SIZE, "", None, "", Some("abc123"));
+        let q = build_worker_query_string(DEFAULT_PAGE_SIZE, "", "", "", Some("abc123"));
         assert!(
             q.contains("build_id=abc123"),
             "query string must include build_id"
@@ -15795,12 +16294,188 @@ mod tests {
             paused: None,
             health: Some("Unhealthy".to_string()),
             shard_id: None,
-        });
+            return_to: None,
+        })
+        .unwrap();
         assert!(
             !filters.matches(ShardId::new(0), &healthy),
             "a healthy schedule must not be swept up by a health=Unhealthy bulk action"
         );
         assert!(filters.matches(ShardId::new(0), &unhealthy));
+    }
+
+    /// Codex review on #1437 (P1): a malformed `shard_id` in a bulk-action
+    /// POST must reject the request. It must not silently drop to "no
+    /// shard restriction" and pause/resume schedules on every shard,
+    /// instead of the one the operator scoped the action to.
+    #[test]
+    fn parse_schedule_bulk_filters_rejects_invalid_shard_id() {
+        let result = parse_schedule_bulk_filters(&ScheduleBulkParams {
+            target: None,
+            kind: None,
+            paused: None,
+            health: None,
+            shard_id: Some("north".to_string()),
+            return_to: None,
+        });
+        assert!(
+            result.is_err(),
+            "an invalid shard_id must reject the bulk action, not broaden it to all shards"
+        );
+    }
+
+    #[test]
+    fn parse_schedule_bulk_filters_accepts_valid_shard_id() {
+        let filters = parse_schedule_bulk_filters(&ScheduleBulkParams {
+            target: None,
+            kind: None,
+            paused: None,
+            health: None,
+            shard_id: Some("2".to_string()),
+            return_to: None,
+        })
+        .unwrap();
+        assert_eq!(filters.shard_id, Some(2));
+    }
+
+    #[test]
+    fn parse_schedule_bulk_filters_blank_or_missing_shard_id_is_not_an_error() {
+        let filters = parse_schedule_bulk_filters(&ScheduleBulkParams {
+            target: None,
+            kind: None,
+            paused: None,
+            health: None,
+            shard_id: None,
+            return_to: None,
+        })
+        .unwrap();
+        assert_eq!(filters.shard_id, None);
+
+        let filters = parse_schedule_bulk_filters(&ScheduleBulkParams {
+            target: None,
+            kind: None,
+            paused: None,
+            health: None,
+            shard_id: Some("   ".to_string()),
+            return_to: None,
+        })
+        .unwrap();
+        assert_eq!(filters.shard_id, None);
+    }
+
+    /// Codex review on #1437 (P2): a bulk-action redirect used to always
+    /// land on a bare, unfiltered `schedules?flash=…`. That dropped
+    /// whatever the operator was filtered to, including an unresolved
+    /// invalid value and its inline error. `schedule_bulk_redirect_to`
+    /// must preserve a valid `return_to` instead.
+    #[test]
+    fn schedule_bulk_redirect_to_preserves_a_valid_return_to() {
+        let response =
+            schedule_bulk_redirect_to(Some("../schedules?kind=zombie&target=billing"), "Paused 3");
+        let location = response
+            .headers()
+            .get(axum::http::header::LOCATION)
+            .expect("redirect must set Location")
+            .to_str()
+            .unwrap();
+        assert!(
+            location.starts_with("../schedules?kind=zombie&target=billing&flash="),
+            "the operator's filtered view, invalid value included, must survive \
+             the redirect: {location}"
+        );
+    }
+
+    /// A `return_to` that does not match the Schedules page's own path
+    /// shape must never be trusted as a redirect target. It is an
+    /// operator-supplied form field, so a hand-crafted or foreign value
+    /// falls back to the safe default instead of an open redirect.
+    #[test]
+    fn schedule_bulk_redirect_to_rejects_a_foreign_return_to() {
+        for unsafe_value in [
+            "https://evil.example/phish",
+            "//evil.example",
+            "workflows",
+            "schedulesXYZ",
+            // Bare "schedules" (no "../") is the pre-fix shape. It 404s
+            // when resolved against the bulk-action POST URL, so it must
+            // not be trusted either — see `schedule_bulk_redirect_to`'s
+            // own doc comment.
+            "schedules?kind=Workflow",
+            // A form-decoded control character (a raw newline, here)
+            // would make `HeaderValue::try_from` reject the `Location`
+            // header. That is an internal error after a mutation that
+            // already succeeded (Codex review, #1437 P2).
+            "../schedules?x=a\nb",
+        ] {
+            let response = schedule_bulk_redirect_to(Some(unsafe_value), "Paused 1");
+            let location = response
+                .headers()
+                .get(axum::http::header::LOCATION)
+                .expect("redirect must set Location")
+                .to_str()
+                .unwrap();
+            assert!(
+                location.starts_with("../schedules?flash="),
+                "an unrecognized return_to ({unsafe_value:?}) must fall back to the \
+                 safe default, not redirect off the Schedules page: {location}"
+            );
+        }
+    }
+
+    #[test]
+    fn schedule_bulk_redirect_to_falls_back_when_return_to_is_absent() {
+        let response = schedule_bulk_redirect_to(None, "Resumed 2");
+        let location = response
+            .headers()
+            .get(axum::http::header::LOCATION)
+            .expect("redirect must set Location")
+            .to_str()
+            .unwrap();
+        assert!(location.starts_with("../schedules?flash="), "{location}");
+    }
+
+    #[test]
+    fn schedule_return_to_path_round_trips_invalid_filters() {
+        let filters = ScheduleUiFilters::default();
+        let filter_raw = ScheduleUiFilterRaw {
+            kind: "zombie".to_string(),
+            kind_error: Some("bad kind".to_string()),
+            ..ScheduleUiFilterRaw::default()
+        };
+        let path = schedule_return_to_path(&filters, &filter_raw, DEFAULT_SCHEDULE_PAGE_SIZE, None);
+        assert_eq!(path, "../schedules?kind=zombie");
+    }
+
+    #[test]
+    fn schedule_return_to_path_is_bare_schedules_when_no_filters_are_set() {
+        let filters = ScheduleUiFilters::default();
+        let filter_raw = ScheduleUiFilterRaw::default();
+        let path = schedule_return_to_path(&filters, &filter_raw, DEFAULT_SCHEDULE_PAGE_SIZE, None);
+        assert_eq!(path, "../schedules");
+    }
+
+    #[test]
+    fn render_schedule_bulk_actions_includes_return_to_for_both_forms() {
+        let filters = ScheduleUiFilters {
+            target: Some("billing".to_string()),
+            ..ScheduleUiFilters::default()
+        };
+        let filter_raw = ScheduleUiFilterRaw::default();
+        let html = render_schedule_bulk_actions(
+            &filters,
+            &filter_raw,
+            DEFAULT_SCHEDULE_PAGE_SIZE,
+            None,
+            3,
+            "3 Workflow",
+        )
+        .into_string();
+        assert_eq!(
+            html.matches("name=\"return_to\" value=\"../schedules?target=billing\"")
+                .count(),
+            2,
+            "both the pause and resume forms must carry the filtered return_to: {html}"
+        );
     }
 
     /// A paused DAG schedule cannot be committed (the endpoint rejects it), so
@@ -15947,12 +16622,18 @@ mod tests {
             health: ScheduleHealthFilter::All,
             shard_id: Some(1),
         };
+        let filter_raw = ScheduleUiFilterRaw {
+            kind: "Workflow".to_string(),
+            shard_id: "1".to_string(),
+            ..ScheduleUiFilterRaw::default()
+        };
         let qs = build_schedule_query_string(
             DEFAULT_SCHEDULE_PAGE_SIZE,
             &ScheduleUiFilters {
                 health: ScheduleHealthFilter::All,
                 ..filters
             },
+            &filter_raw,
             None,
         );
         assert!(qs.contains("target=billing"), "target lost: {qs}");
