@@ -397,16 +397,17 @@ pub enum HarvestError {
     /// [`crate::execution::RETRY_CHAIN_MAX_DEPTH`] while walking to the live
     /// attempt (issue #843).
     ///
-    /// Distinct from [`Self::Config`] (issue #1445 review) so a caller can
-    /// pattern-match on it precisely rather than inspecting the rendered
-    /// message: `resolve_live_attempt_id` runs ahead of `cancel`/`pause`'s own
-    /// "already terminal" state-conflict check, on the same call path, and a
-    /// message-content match risked misclassifying either direction --
-    /// matching too broadly relabels this operational, corrupted-chain
-    /// failure as a 409 state conflict; matching too narrowly (or being
-    /// spoofed by attacker/caller-controlled text interpolated into an
-    /// unrelated `Config` message, e.g. a queue name) fails to catch it. This
-    /// is an operator-facing engine fault, not a bad request -- an
+    /// Distinct from [`Self::Config`] (issue #1445) so a caller can
+    /// pattern-match on it precisely, rather than inspecting the rendered
+    /// message. `resolve_live_attempt_id` runs ahead of `cancel`/`pause`'s
+    /// own "already terminal" state-conflict check, on the same call path.
+    /// A message-content match risks misclassifying either direction there.
+    /// Matching too broadly relabels this operational, corrupted-chain
+    /// failure as a 409 state conflict. Matching too narrowly fails to catch
+    /// it. Either way it can also be spoofed: caller-controlled text can
+    /// land inside an unrelated `Config` message, for example a queue name.
+    ///
+    /// This is an operator-facing engine fault, not a bad request. An
     /// operator seeing it has a corrupted chain, not a request to fix.
     #[error(
         "retry chain for execution {exec_id} exceeds the maximum walk depth of {max_depth}; \

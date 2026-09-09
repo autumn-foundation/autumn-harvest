@@ -22931,20 +22931,23 @@ async fn rerun_workflow(
 
 /// Build a `409 Conflict` response from a state-conflict error (issue #383).
 ///
-/// Callers besides cancel/pause/rerun route their own distinct state-conflict
-/// messages through this same helper as `Config` (e.g.
-/// `POST /admin/build-routing/ramp` without a base policy, `retry-now` on a
-/// non-`PENDING` task), so the match below defaults every `Config` to 409.
-/// The one known exception -- `resolve_live_attempt_id`'s retry-chain
-/// max-depth guard (issue #843), surfaced on the same cancel/pause
-/// live-attempt-routing call path but an operational, corrupted-chain
-/// failure rather than a resource-state conflict -- is excluded by its own
-/// distinct [`HarvestError::RetryChainMaxDepthExceeded`] variant, not by
-/// inspecting message text (issue #1445 review, round 3): matching on
-/// substring content is spoofable by caller-controlled text interpolated
-/// into an unrelated `Config` message (e.g. a queue name), in either
-/// direction -- wrongly admitting an unrelated conflict into 409, or, as in
-/// round 2's allow-list attempt, wrongly excluding one.
+/// Many callers besides cancel/pause/rerun route their own distinct
+/// state-conflict messages through this same helper as `Config`. Examples:
+/// `POST /admin/build-routing/ramp` without a base policy, and `retry-now`
+/// on a non-`PENDING` task. So the match below defaults every `Config` to
+/// 409.
+///
+/// The one known exception is `resolve_live_attempt_id`'s retry-chain
+/// max-depth guard (issue #843). It is surfaced on the same cancel/pause
+/// live-attempt-routing call path. It is an operational, corrupted-chain
+/// failure, not a resource-state conflict.
+///
+/// [`HarvestError::RetryChainMaxDepthExceeded`] excludes that one case by
+/// its own distinct variant, not by inspecting message text (issue #1445).
+/// A substring match is spoofable: caller-controlled text can land inside an
+/// unrelated `Config` message, for example a queue name. That risks two
+/// failure directions -- wrongly admitting an unrelated conflict into 409,
+/// or wrongly excluding a genuine one.
 fn conflict_from(error: HarvestError) -> AutumnError {
     match error {
         error @ HarvestError::RetryChainMaxDepthExceeded { .. } => map_error(error),
@@ -50215,8 +50218,8 @@ mod tests {
     fn conflict_from_excludes_the_retry_chain_max_depth_guard() {
         // `resolve_live_attempt_id`'s retry-chain max-depth guard (issue #843)
         // is surfaced on the cancel/pause live-attempt-routing call path via
-        // its own typed variant (issue #1445 review, round 3), not `Config`.
-        // It must NOT be reported as a 409 resource-state conflict: it is an
+        // its own typed variant (issue #1445), not `Config`. It must NOT be
+        // reported as a 409 resource-state conflict. It is an
         // operational/corrupted-chain failure, not "the workflow already
         // finished."
         let err = HarvestError::RetryChainMaxDepthExceeded {
@@ -50233,7 +50236,7 @@ mod tests {
     fn conflict_from_still_maps_other_state_conflicts_to_409() {
         // Callers besides cancel/pause/rerun route their own distinct
         // state-conflict messages through this same helper as `Config`
-        // (issue #1445 review, round 2) -- e.g. `POST /admin/build-routing/ramp`
+        // (issue #1445). One example: `POST /admin/build-routing/ramp`
         // without a base policy. `conflict_from` must default every `Config`
         // to 409, excluding only `RetryChainMaxDepthExceeded` above.
         let err = HarvestError::Config(
@@ -50249,13 +50252,13 @@ mod tests {
 
     #[test]
     fn conflict_from_config_is_not_spoofable_by_interpolated_text() {
-        // Round 3 finding: a message-content match on `Config` is spoofable by
-        // caller-controlled text interpolated into an unrelated conflict (e.g.
-        // a queue name containing "exceeds the maximum walk depth"). Since the
-        // retry-chain guard is now excluded by its own typed variant rather
-        // than by inspecting message text, a `Config` conflict carrying that
-        // exact phrase still maps to 409 -- the classification no longer reads
-        // the message at all.
+        // Issue #1445 finding: a message-content match on `Config` is
+        // spoofable. Caller-controlled text can land inside an unrelated
+        // conflict, e.g. a queue name containing "exceeds the maximum walk
+        // depth". The retry-chain guard is now excluded by its own typed
+        // variant, not by inspecting message text. A `Config` conflict
+        // carrying that exact phrase still maps to 409. The classification
+        // no longer reads the message at all.
         let err = HarvestError::Config(
             "cannot set a build ramp for queue 'exceeds the maximum walk depth of 256': no base \
              build policy is configured"
