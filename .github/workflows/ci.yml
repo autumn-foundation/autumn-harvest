@@ -169,6 +169,15 @@ jobs:
         # this class of drift. See
         # scripts/check-search-attr-query-syntax.sh.
         run: ./scripts/check-search-attr-query-syntax.sh
+      - name: Check README testing-dependency version pin
+        # Guards a real, reproduced-live defect: README.md's "Testing
+        # workflow code changes with the replayer" section pinned
+        # `autumn-harvest = { version = "0.2", features = ["testing"] }` as
+        # a dev-dependency, four minor versions behind the `"0.6"` pin the
+        # reader already added in the same manifest per Chapter 1, and
+        # nothing keeps the two pins in sync as releases ship. See
+        # scripts/check-readme-testing-dep-version.sh.
+        run: ./scripts/check-readme-testing-dep-version.sh
       - name: Check formatting
         run: cargo fmt --all -- --check
       - name: Clippy autumn-harvest

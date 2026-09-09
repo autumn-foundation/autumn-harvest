@@ -1163,7 +1163,7 @@ replay-safe against recorded production histories using `WorkflowReplayer`
 
 ```toml
 # Cargo.toml — in your app's dev-dependencies
-autumn-harvest = { version = "0.2", features = ["testing"] }
+autumn-harvest = { version = "0.6", features = ["testing"] }
 ```
 
 ```rust
