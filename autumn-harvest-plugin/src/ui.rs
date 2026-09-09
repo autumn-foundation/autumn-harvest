@@ -10143,7 +10143,7 @@ fn render_schedule_preview_page(
         (render_schedule_drilldown_header(row, shard_id, "preview"))
 
         @if preview.is_paused || row.auto_paused_at.is_some() {
-            div.degraded-banner role="status" {
+            div.degraded-banner role="status" tabindex="-1" autofocus {
                 @if row.auto_paused_at.is_some() && !preview.is_paused {
                     strong { "Schedule is auto-paused. " }
                     "The scheduler excludes auto-paused schedules from firing (#360), "
@@ -10158,7 +10158,7 @@ fn render_schedule_preview_page(
             }
         }
         @if let Some(ref reason) = preview.exhausted_reason {
-            div.degraded-banner role="status" {
+            div.degraded-banner role="status" tabindex="-1" autofocus {
                 strong { "Schedule is exhausted. " }
                 "It will never fire again (" (reason) ")."
             }
@@ -10360,7 +10360,7 @@ fn render_schedule_runs_page(
         // truncated data.
         @match response.status {
             FanoutStatus::Partial => {
-                div.degraded-banner role="status" {
+                div.degraded-banner role="status" tabindex="-1" autofocus {
                     strong { "Some shards unreachable. " }
                     "This history and its summary cover only the shards that answered; "
                     "counts may be understated."
@@ -10368,7 +10368,7 @@ fn render_schedule_runs_page(
                 }
             }
             FanoutStatus::Unavailable => {
-                div.degraded-banner role="status" {
+                div.degraded-banner role="status" tabindex="-1" autofocus {
                     strong { "No shard could be reached. " }
                     "No run history could be read, so this page shows nothing rather "
                     "than an empty history — retry once shards recover."
@@ -10835,7 +10835,9 @@ fn render_schedule_backfill_form(
         (render_schedule_drilldown_header(row, shard_id, "backfill"))
 
         @if let Some(message) = error {
-            div.degraded-banner role="status" { strong { "Backfill not started. " } (message) }
+            div.degraded-banner role="status" tabindex="-1" autofocus {
+                strong { "Backfill not started. " } (message)
+            }
         }
 
         div.card {
@@ -10932,7 +10934,7 @@ fn render_schedule_backfill_confirm(
                 }
             }
             @if let Some(ref warning) = dry_run.paused_schedule_warning {
-                div.degraded-banner role="status" { (warning) }
+                div.degraded-banner role="status" tabindex="-1" autofocus { (warning) }
             }
             @if !dry_run.planned_timestamps.is_empty() {
                 h3 { "Planned fire times" }
