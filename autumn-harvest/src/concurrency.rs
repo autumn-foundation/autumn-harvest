@@ -635,6 +635,25 @@ async fn supersede_inner(
                     }
                     continue;
                 }
+                // A candidate's own detached child has a corrupted stored
+                // `parent_close_policy` (issue #1445). This used to arrive
+                // here as `Config` and take the warn-and-skip branch above.
+                // It is a typed variant now, matched by type instead of by
+                // its rendered message. The corrupt-neighbour handling is
+                // unchanged: skip this one candidate. Do not abort every
+                // future admission for the key on one bad row.
+                Err(error @ crate::error::HarvestError::InvalidParentClosePolicy { .. }) => {
+                    tracing::warn!(
+                        candidate = %candidate.exec_id,
+                        workflow = %workflow_name,
+                        concurrency_key = %concurrency_key,
+                        error = %error,
+                        "harvest: latest-wins supersede skipped a candidate on an \
+                         unexpected error; the key may remain over its declared limit \
+                         until the next admission",
+                    );
+                    continue;
+                }
                 Err(e) => return Err(e),
             };
 
