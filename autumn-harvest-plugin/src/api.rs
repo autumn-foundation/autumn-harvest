@@ -22930,18 +22930,29 @@ async fn rerun_workflow(
 }
 
 /// Build a `409 Conflict` response from a state-conflict error (issue #383).
+///
+/// Callers besides cancel/pause/rerun route their own distinct state-conflict
+/// messages through this same helper (e.g. `POST /admin/build-routing/ramp`
+/// without a base policy, `retry-now` on a non-`PENDING` task), so the match
+/// below must default every `Config` to 409 and deny-list the one known
+/// exception, not allow-list a single message shape (issue #1445 review,
+/// round 2 -- an earlier allow-list version broke every other caller's
+/// conflict classification).
 fn conflict_from(error: HarvestError) -> AutumnError {
     match error {
-        // Only a genuine state conflict ("already terminal"), surfaced by the
-        // core as `Config`, maps to 409. `Config` is also the core's catch-all
-        // for unrelated operational failures on the same call path -- e.g.
         // `resolve_live_attempt_id`'s retry-chain max-depth guard (issue #843)
-        // -- and those must keep the normal mapping (400), not be reported as
-        // a resource-state conflict (issue #1445 review). Everything else --
-        // NotFound (404), Database (500), etc. -- also flows through the
-        // normal mapper so a real persistence failure is not masked as a
-        // state conflict.
-        HarvestError::Config(msg) if msg.contains("is already terminal") => {
+        // is surfaced as `Config` on the same cancel/pause live-attempt-routing
+        // call path as the genuine "already terminal" conflict, but it is an
+        // operational/corrupted-chain failure, not a resource-state conflict --
+        // it must keep the normal mapping instead of being reported as 409.
+        HarvestError::Config(msg) if msg.contains("exceeds the maximum walk depth") => {
+            map_error(HarvestError::Config(msg))
+        }
+        // Every other `Config` is a genuine state conflict, surfaced by the
+        // core in that shape, and maps to 409. Everything besides `Config` --
+        // NotFound (404), Database (500), etc. -- flows through the normal
+        // mapper so a real persistence failure is not masked as a conflict.
+        HarvestError::Config(msg) => {
             AutumnError::bad_request_msg(msg).with_status(axum::http::StatusCode::CONFLICT)
         }
         other => map_error(other),
@@ -50196,13 +50207,11 @@ mod tests {
     }
 
     #[test]
-    fn conflict_from_leaves_other_config_errors_at_their_normal_status() {
-        // `Config` is also the core's catch-all for unrelated operational
-        // failures on the same call path -- e.g. `resolve_live_attempt_id`'s
-        // retry-chain max-depth guard (issue #843). Those must NOT be reported
-        // as a 409 resource-state conflict: `conflict_from` used to match on
-        // every `Config` variant regardless of message, which would have
-        // relabeled a corrupted-chain operational failure as "the workflow
+    fn conflict_from_excludes_the_retry_chain_max_depth_guard() {
+        // `resolve_live_attempt_id`'s retry-chain max-depth guard (issue #843)
+        // is also surfaced as `Config` on the cancel/pause live-attempt-routing
+        // call path. It must NOT be reported as a 409 resource-state conflict:
+        // it is an operational/corrupted-chain failure, not "the workflow
         // already finished."
         let err = HarvestError::Config(
             "retry chain for execution 00000000-0000-4000-8000-000000000001 exceeds the \
@@ -50210,6 +50219,25 @@ mod tests {
                 .to_string(),
         );
         assert_ne!(
+            conflict_from(err).status(),
+            axum::http::StatusCode::CONFLICT
+        );
+    }
+
+    #[test]
+    fn conflict_from_still_maps_other_state_conflicts_to_409() {
+        // Callers besides cancel/pause/rerun route their own distinct
+        // state-conflict messages through this same helper (issue #1445
+        // review, round 2) -- e.g. `POST /admin/build-routing/ramp` without a
+        // base policy. `conflict_from` must default every `Config` to 409 and
+        // deny-list only the one known exception above, not allow-list a
+        // single message shape.
+        let err = HarvestError::Config(
+            "cannot set a build ramp for queue 'no-base-policy': no base build policy is \
+             configured"
+                .to_string(),
+        );
+        assert_eq!(
             conflict_from(err).status(),
             axum::http::StatusCode::CONFLICT
         );

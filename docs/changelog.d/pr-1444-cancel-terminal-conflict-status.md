@@ -39,16 +39,31 @@ Regression test:
 `X-Harvest-Execution-Id` set, and confirms the rejected cancel left the
 execution's state untouched.
 
-Codex review on this PR (issue #1445) caught that `conflict_from` itself was
-imprecise: it mapped *every* `HarvestError::Config` to 409, not only the
-"already terminal" state conflict — so a cancel that instead hit
-`resolve_live_attempt_id`'s retry-chain max-depth guard (issue #843, also
-surfaced as `Config`, an operational failure unrelated to execution state)
-would have been mislabeled a 409 conflict too. `conflict_from` now matches
-on the "is already terminal" message content — the same content-matching
-convention `concurrency.rs` and `worker.rs` already use to classify this
-exact error — before mapping to 409; every other `Config` message keeps the
-normal mapping. Unit tests:
-`conflict_from_maps_already_terminal_config_to_409` and
-`conflict_from_leaves_other_config_errors_at_their_normal_status`
-(`autumn-harvest-plugin/src/api.rs`).
+Codex review on this PR (issue #1445) caught, in two rounds, that
+`conflict_from` needed to distinguish the retry-chain max-depth guard
+(`resolve_live_attempt_id`, issue #843 — also surfaced as `Config` on the
+cancel/pause live-attempt-routing call path, but an operational,
+corrupted-chain failure unrelated to execution state) from every other
+caller's `Config`-shaped state conflict:
+
+- **Round 1** narrowed `conflict_from` to only map messages containing
+  "is already terminal" to 409. That over-corrected: `conflict_from` is the
+  shared helper for every mutating route's state-conflict response, not
+  just cancel/pause/rerun's — `POST /admin/build-routing/ramp` without a
+  base policy, `retry-now` on a non-`PENDING` task, and others each route
+  their own distinct `Config` message through it, and an allow-list of one
+  message shape demoted every one of those to 400 (confirmed against
+  `set_ramp_without_base_policy_returns_conflict` in
+  `build_ramp_integration.rs`, a Docker-backed test this sandbox cannot run
+  directly).
+- **Round 2** replaced the allow-list with a deny-list: `conflict_from`
+  again defaults every `Config` to 409, excluding only the one message
+  unique to the retry-chain max-depth guard ("exceeds the maximum walk
+  depth").
+
+Unit tests (`autumn-harvest-plugin/src/api.rs`, exercising the pure
+`conflict_from` function directly — no DB required):
+`conflict_from_maps_already_terminal_config_to_409`,
+`conflict_from_excludes_the_retry_chain_max_depth_guard`, and
+`conflict_from_still_maps_other_state_conflicts_to_409` (the last using the
+exact build-ramp message text, pinning the round-1 regression).
