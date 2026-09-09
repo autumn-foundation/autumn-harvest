@@ -120,6 +120,35 @@ pub fn outcome_for_state(state: &str) -> &'static str {
     }
 }
 
+/// Index a chain's rows for [`assemble_run_chain`].
+///
+/// Returns `continued_from_exec_id` -> row index (first occurrence wins on a
+/// duplicate key), plus the set of every `exec_id` present. The map mirrors
+/// exactly what `rows.iter().position(|r| r.continued_from_exec_id ==
+/// Some(id))` would find: the first matching index in iteration order.
+///
+/// This turns two per-row O(n) rescans into O(1) lookups: the per-hop
+/// forward-link walk, and the per-row missing-predecessor check. Both were
+/// an O(n^2) pair in chain length. Chain length is not bounded by
+/// configuration; continue-as-new chains are the one place in this codebase
+/// where it grows unbounded. So the quadratic pair is a real, not
+/// synthetic, scaling risk.
+fn index_chain_rows(
+    rows: &[RunChainRow],
+) -> (
+    std::collections::HashMap<Uuid, usize>,
+    std::collections::HashSet<Uuid>,
+) {
+    let mut successor_by_predecessor = std::collections::HashMap::with_capacity(rows.len());
+    for (i, row) in rows.iter().enumerate() {
+        if let Some(pred) = row.continued_from_exec_id {
+            successor_by_predecessor.entry(pred).or_insert(i);
+        }
+    }
+    let exec_id_present = rows.iter().map(|r| r.exec_id).collect();
+    (successor_by_predecessor, exec_id_present)
+}
+
 /// Assemble an ordered [`RunChainResponse`] from a flat set of chain-member rows.
 ///
 /// `head_exec_id` is the resolved chain head — the plugin computes it from the
@@ -160,6 +189,7 @@ pub fn assemble_run_chain(rows: Vec<RunChainRow>, head_exec_id: Uuid) -> RunChai
 
     let n = rows.len();
     let mut visited = vec![false; n];
+    let (successor_by_predecessor, exec_id_present) = index_chain_rows(&rows);
 
     // Stable `(started_at, exec_id)` ordering used for fallbacks.
     let mut by_time: Vec<usize> = (0..n).collect();
@@ -190,9 +220,9 @@ pub fn assemble_run_chain(rows: Vec<RunChainRow>, head_exec_id: Uuid) -> RunChai
         // corrupt-fork duplicate is still recovered by the defensive time-order
         // pass below.
         let current_exec_id = rows[current].exec_id;
-        let next = rows
-            .iter()
-            .position(|r| r.continued_from_exec_id == Some(current_exec_id))
+        let next = successor_by_predecessor
+            .get(&current_exec_id)
+            .copied()
             .filter(|&i| !visited[i]);
 
         if let Some(next_idx) = next {
@@ -289,7 +319,7 @@ pub fn assemble_run_chain(rows: Vec<RunChainRow>, head_exec_id: Uuid) -> RunChai
     // confidence stays governed by the lacks-backlink / participates rule.
     let any_predecessor_missing = rows.iter().any(|row| {
         row.continued_from_exec_id
-            .is_some_and(|pred| !rows.iter().any(|r| r.exec_id == pred))
+            .is_some_and(|pred| !exec_id_present.contains(&pred))
     });
     let head_unknown = (head_lacks_backlink && head_participates_in_can && !confirmed_origin)
         || any_predecessor_missing;
