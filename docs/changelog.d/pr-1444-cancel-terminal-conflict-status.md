@@ -92,12 +92,33 @@ caller's `Config`-shaped state conflict:
   `map_error` exclude the new variant the same way as
   `RetryChainMaxDepthExceeded`, preserving its pre-#1445 400 status.
 
+- **Round 5**: giving `apply_parent_close_cascade`'s parse failure its own
+  type had a downstream consequence round 4 missed.
+  `concurrency::supersede_inner` (latest-wins admission) calls
+  `cancel_workflow_execution_collect` on each superseded candidate and
+  already special-cased `HarvestError::Config` there: not a race against the
+  candidate's own natural completion (silent), but a "genuine fault inside
+  the cancel" (warn, then skip that one candidate) — specifically so one
+  candidate's corrupted `parent_close_policy` could never wedge every future
+  admission for the concurrency key. `InvalidParentClosePolicy` no longer
+  matches that `Config` arm, so it fell to the function's `Err(e) => return
+  Err(e)` default instead — turning the documented warn-and-skip into an
+  aborted admission transaction on the exact corrupt-neighbour case the
+  comment there describes. Added a matching arm for
+  `InvalidParentClosePolicy` in `supersede_inner`
+  (`autumn-harvest/src/concurrency.rs`) alongside the `Config` one,
+  preserving the skip. Always warns (it is always the "genuine fault"
+  branch, never the benign already-terminal race the `Config` arm also
+  covers).
+
 Also lint-only, no behavior change: reworded several of these comments to
 cite issue #1445 instead of "round N" (CI's comment-hygiene job flags
 review-round references) and split a few over-25-word sentences. The local
 sandbox has a shallow clone, so `comment-hygiene.py --base origin/trunk-dev`
 initially fell back to report-only mode and missed both; re-verified after
-fetching `origin/trunk-dev` locally.
+fetching `origin/trunk-dev` locally. That same shallow-clone gap also meant
+the check only sees *committed* diffs (`git merge-base` needs a commit), so
+the round-5 fix had to be committed before it could be verified this way.
 
 Unit tests (`autumn-harvest-plugin/src/api.rs`, exercising the pure
 `conflict_from` function directly — no DB required):
@@ -111,4 +132,8 @@ finding), and `conflict_from_excludes_an_invalid_parent_close_policy`
 (pinning the round-4 finding). `retry_chain_routing_tests.rs`'s
 `a_chain_deeper_than_the_walk_bound_fails_closed` (Docker-backed, cannot run
 in this sandbox, compile-checked only) now asserts the typed variant instead
-of `Config`.
+of `Config`. The round-5 `supersede_inner` fix has no dedicated test: it
+would need a corrupted `parent_close_policy` row racing a concurrency-key
+admission, and `concurrency_supersede_tests.rs` is also Docker-backed.
+Verified by inspection and by the symmetry with the already-tested
+`Config` arm it now mirrors.
