@@ -22206,7 +22206,7 @@ async fn cancel_workflow(
                 source: &source,
             };
             let _ = audit::insert_audit(&mut conn, &ar).await;
-            Err(map_error(e))
+            Err(conflict_from(e))
         }
         Ok(cancelled) => {
             // Issue #843: the audit record's subject is the execution actually
@@ -22930,12 +22930,34 @@ async fn rerun_workflow(
 }
 
 /// Build a `409 Conflict` response from a state-conflict error (issue #383).
+///
+/// Many callers besides cancel/pause/rerun route their own distinct
+/// state-conflict messages through this same helper as `Config`. Examples:
+/// `POST /admin/build-routing/ramp` without a base policy, and `retry-now`
+/// on a non-`PENDING` task. So the match below defaults every `Config` to
+/// 409.
+///
+/// Two known exceptions are surfaced on the same cancel/terminate call path.
+/// Both are operational or data-integrity failures, not resource-state
+/// conflicts. One is `resolve_live_attempt_id`'s retry-chain max-depth guard
+/// (issue #843). The other is `apply_parent_close_cascade`'s parse of a
+/// corrupted stored `parent_close_policy` column (issue #1445).
+///
+/// [`HarvestError::RetryChainMaxDepthExceeded`] and
+/// [`HarvestError::InvalidParentClosePolicy`] each exclude their case by its
+/// own distinct variant, not by inspecting message text (issue #1445). A
+/// substring match is spoofable: caller-controlled text can land inside an
+/// unrelated `Config` message, for example a queue name. That risks two
+/// failure directions -- wrongly admitting an unrelated conflict into 409,
+/// or wrongly excluding a genuine one.
 fn conflict_from(error: HarvestError) -> AutumnError {
     match error {
-        // Only a genuine state conflict (e.g. "already terminal"),
-        // surfaced by the core as `Config`, maps to 409. Everything else —
-        // NotFound (404), Database (500), etc. — flows through the normal mapper
-        // so a real persistence failure is not masked as a state conflict.
+        error @ (HarvestError::RetryChainMaxDepthExceeded { .. }
+        | HarvestError::InvalidParentClosePolicy { .. }) => map_error(error),
+        // Every `Config` is a genuine state conflict, surfaced by the core in
+        // that shape, and maps to 409. Everything else -- NotFound (404),
+        // Database (500), etc. -- flows through the normal mapper so a real
+        // persistence failure is not masked as a conflict.
         HarvestError::Config(msg) => {
             AutumnError::bad_request_msg(msg).with_status(axum::http::StatusCode::CONFLICT)
         }
@@ -42434,6 +42456,12 @@ pub(crate) fn map_error(error: HarvestError) -> AutumnError {
         | HarvestError::WorkflowFailed {
             reason: message, ..
         } => AutumnError::bad_request_msg(message),
+        // Preserves each variant's pre-#1445 status: both used to be a plain
+        // `Config`, which this same arm maps to 400.
+        error @ (HarvestError::RetryChainMaxDepthExceeded { .. }
+        | HarvestError::InvalidParentClosePolicy { .. }) => {
+            AutumnError::bad_request_msg(error.to_string())
+        }
         HarvestError::UpdateRejected { reason } => {
             AutumnError::bad_request_msg(reason).with_status(axum::http::StatusCode::CONFLICT)
         }
@@ -50172,6 +50200,95 @@ mod tests {
         assert!(
             msg.contains("unknown conflict_policy"),
             "error must mention unknown conflict_policy: {msg}"
+        );
+    }
+
+    // -- conflict_from precision (issue #1445 review) --
+
+    #[test]
+    fn conflict_from_maps_already_terminal_config_to_409() {
+        let err = HarvestError::Config(
+            "workflow execution 00000000-0000-4000-8000-000000000001 is already terminal \
+             (COMPLETED)"
+                .to_string(),
+        );
+        assert_eq!(
+            conflict_from(err).status(),
+            axum::http::StatusCode::CONFLICT
+        );
+    }
+
+    #[test]
+    fn conflict_from_excludes_the_retry_chain_max_depth_guard() {
+        // `resolve_live_attempt_id`'s retry-chain max-depth guard (issue #843)
+        // is surfaced on the cancel/pause live-attempt-routing call path via
+        // its own typed variant (issue #1445), not `Config`. It must NOT be
+        // reported as a 409 resource-state conflict. It is an
+        // operational/corrupted-chain failure, not "the workflow already
+        // finished."
+        let err = HarvestError::RetryChainMaxDepthExceeded {
+            exec_id: ExecutionId::new_for_shard(ShardId::new(0)),
+            max_depth: 256,
+        };
+        assert_ne!(
+            conflict_from(err).status(),
+            axum::http::StatusCode::CONFLICT
+        );
+    }
+
+    #[test]
+    fn conflict_from_excludes_an_invalid_parent_close_policy() {
+        // `apply_parent_close_cascade`'s parse of a corrupted stored
+        // `parent_close_policy` column (issue #1445) is reached from the same
+        // cancel/terminate transaction as a genuine "already terminal"
+        // conflict. It can fire even on a still-`RUNNING` parent. It must
+        // NOT be reported as a 409 resource-state conflict. It is a
+        // data-integrity fault, not proof the workflow already finished.
+        let err = HarvestError::InvalidParentClosePolicy {
+            child_exec_id: ExecutionId::new_for_shard(ShardId::new(0)),
+            raw: "not-a-real-policy".to_string(),
+        };
+        assert_ne!(
+            conflict_from(err).status(),
+            axum::http::StatusCode::CONFLICT
+        );
+    }
+
+    #[test]
+    fn conflict_from_still_maps_other_state_conflicts_to_409() {
+        // Callers besides cancel/pause/rerun route their own distinct
+        // state-conflict messages through this same helper as `Config`
+        // (issue #1445). One example: `POST /admin/build-routing/ramp`
+        // without a base policy. `conflict_from` must default every `Config`
+        // to 409, excluding only `RetryChainMaxDepthExceeded` above.
+        let err = HarvestError::Config(
+            "cannot set a build ramp for queue 'no-base-policy': no base build policy is \
+             configured"
+                .to_string(),
+        );
+        assert_eq!(
+            conflict_from(err).status(),
+            axum::http::StatusCode::CONFLICT
+        );
+    }
+
+    #[test]
+    fn conflict_from_config_is_not_spoofable_by_interpolated_text() {
+        // Issue #1445 finding: a message-content match on `Config` is
+        // spoofable. Caller-controlled text can land inside an unrelated
+        // conflict, e.g. a queue name containing "exceeds the maximum walk
+        // depth". The retry-chain guard is now excluded by its own typed
+        // variant, not by inspecting message text. A `Config` conflict
+        // carrying that exact phrase still maps to 409. The classification
+        // no longer reads the message at all.
+        let err = HarvestError::Config(
+            "cannot set a build ramp for queue 'exceeds the maximum walk depth of 256': no base \
+             build policy is configured"
+                .to_string(),
+        );
+        assert_eq!(
+            conflict_from(err).status(),
+            axum::http::StatusCode::CONFLICT
         );
     }
 

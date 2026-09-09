@@ -393,6 +393,55 @@ pub enum HarvestError {
     #[error("workflow_id must not be empty")]
     EmptyWorkflowId,
 
+    /// The workflow-level retry chain rooted at `exec_id` exceeded
+    /// [`crate::execution::RETRY_CHAIN_MAX_DEPTH`] while walking to the live
+    /// attempt (issue #843).
+    ///
+    /// Distinct from [`Self::Config`] (issue #1445) so a caller can
+    /// pattern-match on it precisely, rather than inspecting the rendered
+    /// message. `resolve_live_attempt_id` runs ahead of `cancel`/`pause`'s
+    /// own "already terminal" state-conflict check, on the same call path.
+    /// A message-content match risks misclassifying either direction there.
+    /// Matching too broadly relabels this operational, corrupted-chain
+    /// failure as a 409 state conflict. Matching too narrowly fails to catch
+    /// it. Either way it can also be spoofed: caller-controlled text can
+    /// land inside an unrelated `Config` message, for example a queue name.
+    ///
+    /// This is an operator-facing engine fault, not a bad request. An
+    /// operator seeing it has a corrupted chain, not a request to fix.
+    #[error(
+        "retry chain for execution {exec_id} exceeds the maximum walk depth of {max_depth}; \
+         refusing to route to a possibly-stale attempt"
+    )]
+    RetryChainMaxDepthExceeded {
+        /// The execution whose retry chain was being walked.
+        exec_id: ExecutionId,
+        /// The configured maximum walk depth that was exceeded.
+        max_depth: usize,
+    },
+
+    /// A child execution's stored `parent_close_policy` column failed to
+    /// parse as a [`crate::types::ParentClosePolicy`] (issue #1445).
+    ///
+    /// Reached from [`crate::execution::apply_parent_close_cascade`], on the
+    /// same `cancel`/`terminate` transaction path as a genuine "already
+    /// terminal" state conflict. Distinct from [`Self::Config`] for the same
+    /// reason as [`Self::RetryChainMaxDepthExceeded`].
+    ///
+    /// This is a data-integrity fault on stored parent/child linkage, not a
+    /// resource-state conflict. It can surface even when the target
+    /// execution is not terminal at all -- a `RUNNING` parent with a
+    /// corrupted child row. A blanket `Config` match would misreport it as
+    /// 409 "already terminal". That would tell an operator the workflow
+    /// finished when it did not.
+    #[error("stored parent_close_policy is invalid for child execution {child_exec_id}: {raw:?}")]
+    InvalidParentClosePolicy {
+        /// The child execution whose stored policy failed to parse.
+        child_exec_id: ExecutionId,
+        /// The raw, unparseable stored value.
+        raw: String,
+    },
+
     /// A workflow execution with the same `(workflow_name, workflow_id)` already
     /// exists and the caller's reuse policy does not permit reuse.
     ///

@@ -1202,9 +1202,16 @@ async fn a_chain_deeper_than_the_walk_bound_fails_closed() {
     let error = autumn_harvest::execution::resolve_live_attempt_id(&mut conn, head)
         .await
         .expect_err("a chain deeper than the walk bound must fail closed, not return a stale row");
+    // Distinct from `Config` (issue #1445 review) so cancel/pause's shared
+    // `conflict_from` mapper can pattern-match this precisely instead of
+    // inspecting the rendered message.
     assert!(
-        matches!(error, autumn_harvest::HarvestError::Config(_)),
-        "expected a Config error naming the depth, got {error:?}"
+        matches!(
+            error,
+            autumn_harvest::HarvestError::RetryChainMaxDepthExceeded { exec_id, max_depth }
+                if exec_id == head && max_depth == autumn_harvest::execution::RETRY_CHAIN_MAX_DEPTH
+        ),
+        "expected a RetryChainMaxDepthExceeded error naming the depth, got {error:?}"
     );
 
     // Falsifier: the live attempt genuinely IS beyond the bound, so the pre-fix

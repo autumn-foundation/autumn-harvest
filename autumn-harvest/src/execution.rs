@@ -2901,7 +2901,7 @@ pub const RETRY_CHAIN_MAX_REDRIVES: usize = RETRY_CHAIN_MAX_DEPTH;
 ///
 /// Returns [`HarvestError::NotFound`] when `exec_id` does not exist,
 /// [`HarvestError::Database`] for query failures, and
-/// [`HarvestError::Config`] when the chain exceeds [`RETRY_CHAIN_MAX_DEPTH`]
+/// [`HarvestError::RetryChainMaxDepthExceeded`] when the chain exceeds [`RETRY_CHAIN_MAX_DEPTH`]
 /// (fail-closed — see that constant).
 pub async fn resolve_live_attempt(
     conn: &mut AsyncPgConnection,
@@ -2927,7 +2927,7 @@ pub async fn resolve_live_attempt(
 ///
 /// Returns [`HarvestError::NotFound`] when `exec_id` does not exist,
 /// [`HarvestError::Database`] for query failures, and
-/// [`HarvestError::Config`] when the chain exceeds [`RETRY_CHAIN_MAX_DEPTH`]
+/// [`HarvestError::RetryChainMaxDepthExceeded`] when the chain exceeds [`RETRY_CHAIN_MAX_DEPTH`]
 /// (see the fail-closed rationale on that constant).
 pub async fn walk_retry_chain(
     conn: &mut AsyncPgConnection,
@@ -2980,10 +2980,10 @@ pub async fn walk_retry_chain(
         "harvest: retry chain exceeded the maximum walk depth; refusing to route \
          to a possibly-stale attempt"
     );
-    Err(HarvestError::Config(format!(
-        "retry chain for execution {exec_id} exceeds the maximum walk depth of \
-         {RETRY_CHAIN_MAX_DEPTH}; refusing to route to a possibly-stale attempt"
-    )))
+    Err(HarvestError::RetryChainMaxDepthExceeded {
+        exec_id,
+        max_depth: RETRY_CHAIN_MAX_DEPTH,
+    })
 }
 
 /// [`walk_retry_chain`], returning only the [`ExecutionId`]s.
@@ -4210,9 +4210,12 @@ pub(crate) async fn apply_parent_close_cascade(
     for (child_uuid, child_workflow_name, policy_opt) in running_children {
         let child_exec_id = ExecutionId::from_uuid(child_uuid);
         let policy_str = policy_opt.expect("filtered by is_not_null");
-        let policy = policy_str
-            .parse::<ParentClosePolicy>()
-            .map_err(HarvestError::Config)?;
+        let policy = policy_str.parse::<ParentClosePolicy>().map_err(|_| {
+            HarvestError::InvalidParentClosePolicy {
+                child_exec_id,
+                raw: policy_str,
+            }
+        })?;
 
         let (action, mut child_deferred, mut child_closed) = match policy {
             ParentClosePolicy::Abandon => (None, Vec::new(), Vec::new()),
