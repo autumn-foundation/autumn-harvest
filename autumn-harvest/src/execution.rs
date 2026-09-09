@@ -4210,9 +4210,12 @@ pub(crate) async fn apply_parent_close_cascade(
     for (child_uuid, child_workflow_name, policy_opt) in running_children {
         let child_exec_id = ExecutionId::from_uuid(child_uuid);
         let policy_str = policy_opt.expect("filtered by is_not_null");
-        let policy = policy_str
-            .parse::<ParentClosePolicy>()
-            .map_err(HarvestError::Config)?;
+        let policy = policy_str.parse::<ParentClosePolicy>().map_err(|_| {
+            HarvestError::InvalidParentClosePolicy {
+                child_exec_id,
+                raw: policy_str,
+            }
+        })?;
 
         let (action, mut child_deferred, mut child_closed) = match policy {
             ParentClosePolicy::Abandon => (None, Vec::new(), Vec::new()),

@@ -75,15 +75,40 @@ caller's `Config`-shaped state conflict:
   classification. `map_error`'s new arm preserves the pre-#1445 status (400)
   for this case outside of `conflict_from`.
 
+- **Round 4**: a second, independent `Config` source on the same
+  cancel/terminate transaction path was found: `apply_parent_close_cascade`
+  parses each active detached child's stored `parent_close_policy` column,
+  and `.map_err(HarvestError::Config)` on a corrupted value would also have
+  been swept into the round-2/3 deny-list's 409 default — even though the
+  cancelled *parent* need not be terminal at all (a still-`RUNNING` parent
+  with one corrupted child row hits this). Gave it the same treatment as the
+  retry-chain guard: a dedicated
+  `HarvestError::InvalidParentClosePolicy { child_exec_id, raw }` variant,
+  constructed at the one parse call site in `apply_parent_close_cascade`
+  that is reachable from the HTTP `cancel`/`terminate` routes.
+  (`parent_close_cascade_event_count`'s own, separate parse of the same
+  column is on the worker's internal task-processing path, never reaches
+  `conflict_from`, and is left as `Config`, unchanged.) `conflict_from` and
+  `map_error` exclude the new variant the same way as
+  `RetryChainMaxDepthExceeded`, preserving its pre-#1445 400 status.
+
+Also lint-only, no behavior change: reworded several of these comments to
+cite issue #1445 instead of "round N" (CI's comment-hygiene job flags
+review-round references) and split a few over-25-word sentences. The local
+sandbox has a shallow clone, so `comment-hygiene.py --base origin/trunk-dev`
+initially fell back to report-only mode and missed both; re-verified after
+fetching `origin/trunk-dev` locally.
+
 Unit tests (`autumn-harvest-plugin/src/api.rs`, exercising the pure
 `conflict_from` function directly — no DB required):
 `conflict_from_maps_already_terminal_config_to_409`,
 `conflict_from_excludes_the_retry_chain_max_depth_guard`,
 `conflict_from_still_maps_other_state_conflicts_to_409` (using the exact
-build-ramp message text, pinning the round-1 regression), and
+build-ramp message text, pinning the round-1 regression),
 `conflict_from_config_is_not_spoofable_by_interpolated_text` (a `Config`
 conflict whose message contains the excluded phrase, pinning the round-3
-finding). `retry_chain_routing_tests.rs`'s
+finding), and `conflict_from_excludes_an_invalid_parent_close_policy`
+(pinning the round-4 finding). `retry_chain_routing_tests.rs`'s
 `a_chain_deeper_than_the_walk_bound_fails_closed` (Docker-backed, cannot run
 in this sandbox, compile-checked only) now asserts the typed variant instead
 of `Config`.

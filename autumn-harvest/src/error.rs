@@ -420,6 +420,28 @@ pub enum HarvestError {
         max_depth: usize,
     },
 
+    /// A child execution's stored `parent_close_policy` column failed to
+    /// parse as a [`crate::types::ParentClosePolicy`] (issue #1445).
+    ///
+    /// Reached from [`crate::execution::apply_parent_close_cascade`], on the
+    /// same `cancel`/`terminate` transaction path as a genuine "already
+    /// terminal" state conflict. Distinct from [`Self::Config`] for the same
+    /// reason as [`Self::RetryChainMaxDepthExceeded`].
+    ///
+    /// This is a data-integrity fault on stored parent/child linkage, not a
+    /// resource-state conflict. It can surface even when the target
+    /// execution is not terminal at all -- a `RUNNING` parent with a
+    /// corrupted child row. A blanket `Config` match would misreport it as
+    /// 409 "already terminal". That would tell an operator the workflow
+    /// finished when it did not.
+    #[error("stored parent_close_policy is invalid for child execution {child_exec_id}: {raw:?}")]
+    InvalidParentClosePolicy {
+        /// The child execution whose stored policy failed to parse.
+        child_exec_id: ExecutionId,
+        /// The raw, unparseable stored value.
+        raw: String,
+    },
+
     /// A workflow execution with the same `(workflow_name, workflow_id)` already
     /// exists and the caller's reuse policy does not permit reuse.
     ///
