@@ -5464,6 +5464,16 @@ pub(crate) const fn shard_acquire_bound(
     }
 }
 
+async fn await_with_bound<F, T>(
+    future: F,
+    bound: Duration,
+) -> Result<T, tokio::time::error::Elapsed>
+where
+    F: std::future::Future<Output = T>,
+{
+    tokio::time::timeout(bound, future).await
+}
+
 /// A pooled connection, optionally acquired under a bound.
 ///
 /// The single source of truth for [`shard_acquire_bound`]'s two behaviours, so
@@ -5487,9 +5497,9 @@ async fn acquire_shard_conn(
     String,
 > {
     match acquire_bound {
-        Some(bound) => match tokio::time::timeout(bound, pool.get()).await {
+        Some(bound) => match await_with_bound(pool.get(), bound).await {
             Ok(result) => result.map_err(|e| e.to_string()),
-            Err(_elapsed) => Err(format!(
+            Err(_) => Err(format!(
                 "pool acquisition exceeded {bound:?}; skipping this shard for one iteration"
             )),
         },
@@ -24427,6 +24437,16 @@ impl Worker {
             .map(|shard| (*shard, pool.clone()))
             .collect();
 
+        #[cfg(feature = "db")]
+        let use_multi_shard = shard_targets.len() > 1
+            && self
+                .config
+                .sharded_pool
+                .as_ref()
+                .is_some_and(|sp| sp.shard_ids().len() > 1);
+        #[cfg(not(feature = "db"))]
+        let use_multi_shard = false;
+
         // Issue #965: startup-seed. Make every builder-registered WASM activity
         // module available on each shard's database before the poll loop begins,
         // so an embedder who only calls `HarvestBuilder::wasm_activity(...)` and
@@ -24468,8 +24488,9 @@ impl Worker {
                             .map(|(shard, shard_pool)| (Some(*shard), shard_pool))
                             .collect()
                     };
+                let acquire_bound = shard_acquire_bound(use_multi_shard, self.config.poll_interval);
                 for (shard, shard_pool) in seed_targets {
-                    match shard_pool.get().await {
+                    match acquire_shard_conn(shard_pool, acquire_bound).await {
                         Ok(mut conn) => {
                             if let Err(e) = crate::wasm_store::seed_registered_wasm_modules(
                                 &mut conn,
@@ -24503,18 +24524,6 @@ impl Worker {
                 }
             }
         }
-
-        // More than one distinct shard target → multi-shard loop.
-        // One or zero targets (or single-pool fallback) → existing path.
-        #[cfg(feature = "db")]
-        let use_multi_shard = shard_targets.len() > 1
-            && self
-                .config
-                .sharded_pool
-                .as_ref()
-                .is_some_and(|sp| sp.shard_ids().len() > 1);
-        #[cfg(not(feature = "db"))]
-        let use_multi_shard = false;
 
         if use_multi_shard {
             self.run_multi_shard(shard_targets, pool).await;
@@ -24658,37 +24667,49 @@ impl Worker {
             );
         }
 
-        let mut shard_listeners: Vec<Option<crate::notify::QueueListener>> = Vec::new();
-        for (shard_id, _) in shard_targets {
+        let bound = shard_acquire_bound(true, self.config.poll_interval)
+            .expect("multi-shard startup has an acquisition bound");
+        futures::future::join_all(shard_targets.iter().map(|(shard_id, _)| async move {
             let listener_url =
                 multi_shard_listener_url(&self.config.shard_notification_database_urls, *shard_id);
-            let listener = match listener_url {
-                Some(url) => {
-                    match crate::notify::QueueListener::connect(url, &self.config.queues).await {
-                        Ok(l) => {
-                            tracing::info!(
-                                worker_id = %self.config.worker_id,
-                                shard_id = %shard_id.as_i32(),
-                                "per-shard LISTEN/NOTIFY listener connected"
-                            );
-                            Some(l)
-                        }
-                        Err(error) => {
-                            tracing::warn!(
-                                worker_id = %self.config.worker_id,
-                                shard_id = %shard_id.as_i32(),
-                                error = %error,
-                                "per-shard LISTEN/NOTIFY failed; shard will fall back to polling"
-                            );
-                            None
-                        }
+            match listener_url {
+                Some(url) => match await_with_bound(
+                    crate::notify::QueueListener::connect(url, &self.config.queues),
+                    bound,
+                )
+                .await
+                {
+                    Ok(Ok(listener)) => {
+                        tracing::info!(
+                            worker_id = %self.config.worker_id,
+                            shard_id = %shard_id.as_i32(),
+                            "per-shard LISTEN/NOTIFY listener connected"
+                        );
+                        Some(listener)
                     }
-                }
+                    Ok(Err(error)) => {
+                        tracing::warn!(
+                            worker_id = %self.config.worker_id,
+                            shard_id = %shard_id.as_i32(),
+                            error = %error,
+                            "per-shard LISTEN/NOTIFY failed; shard will fall back to polling"
+                        );
+                        None
+                    }
+                    Err(_) => {
+                        tracing::warn!(
+                            worker_id = %self.config.worker_id,
+                            shard_id = %shard_id.as_i32(),
+                            bound = ?bound,
+                            "per-shard LISTEN/NOTIFY timed out; shard will fall back to polling"
+                        );
+                        None
+                    }
+                },
                 None => None,
-            };
-            shard_listeners.push(listener);
-        }
-        shard_listeners
+            }
+        }))
+        .await
     }
 
     async fn run_multi_shard(
@@ -30146,6 +30167,29 @@ mod tests {
                 "the single-shard path must keep the original unbounded pool.get().await",
             );
         }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn bounded_wait_times_out() {
+        let bound = Duration::from_secs(5);
+        let result = await_with_bound(
+            async {
+                tokio::time::sleep(Duration::from_secs(6)).await;
+            },
+            bound,
+        )
+        .await;
+
+        assert!(result.is_err(), "a pending startup operation must time out");
+    }
+
+    #[tokio::test]
+    async fn bounded_wait_preserves_success() {
+        let value = await_with_bound(async { 42 }, Duration::from_secs(5))
+            .await
+            .expect("a ready startup operation must succeed");
+
+        assert_eq!(value, 42);
     }
 
     /// The single-pool entrypoint refuses a multi-shard config, and only when
