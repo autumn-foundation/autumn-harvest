@@ -3,6 +3,8 @@
 #[cfg(feature = "db")]
 mod active_workflow_gauge_tests;
 mod activity_default_floor_tests;
+#[cfg(feature = "db")]
+mod activity_enqueue_batch_perf;
 mod activity_failure_tests;
 #[cfg(feature = "db")]
 mod activity_info_tests;

@@ -9416,10 +9416,13 @@ async fn persist_scheduled_activities(
             for (bucket_key, refill_rate, burst) in &dynamic_rate_buckets {
                 queue::ensure_rate_limit_bucket(conn, bucket_key, *refill_rate, *burst).await?;
             }
-            let mut activity_task_ids = Vec::with_capacity(enqueued.len());
-            for params in &enqueued {
-                activity_task_ids.push(queue::enqueue(conn, params).await?);
-            }
+            // One multi-row INSERT for the whole fan-out, not one per
+            // activity (Ledger perf pass). A decision that schedules N
+            // activities in one suspension used to cost N single-row
+            // INSERT statements here. See `queue::enqueue_batch`'s doc
+            // comment for the mechanism and the rare sticky-pin
+            // follow-up it still issues per row.
+            let activity_task_ids = queue::enqueue_batch(conn, &enqueued).await?;
             let mut race_next_event_id = next_event_id.saturating_add(events_len);
             let deferred = apply_race_loser_cancellations(
                 conn,
@@ -11334,10 +11337,11 @@ async fn persist_mixed_suspension_batch(
         for (bucket_key, refill_rate, burst) in &dynamic_rate_buckets {
             queue::ensure_rate_limit_bucket(conn, bucket_key, *refill_rate, *burst).await?;
         }
-        let mut activity_task_ids = Vec::with_capacity(enqueued.len());
-        for params in &enqueued {
-            activity_task_ids.push(queue::enqueue(conn, params).await?);
-        }
+        // One multi-row INSERT for the whole fan-out, not one per
+        // activity (Ledger perf pass). See the sibling call site in
+        // `persist_scheduled_activities`, and `queue::enqueue_batch`'s
+        // own doc comment for the mechanism.
+        let activity_task_ids = queue::enqueue_batch(conn, &enqueued).await?;
 
         // Insert the durable rows for genuinely new timers.
         for (timer_id, fires_at) in &new_timer_rows {

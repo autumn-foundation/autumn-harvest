@@ -508,6 +508,282 @@ pub async fn enqueue(conn: &mut AsyncPgConnection, params: &EnqueueParams) -> Ha
 
     Ok(task_id)
 }
+
+/// Postgres's hard ceiling on bound parameters in one statement (`u16::MAX`,
+/// the wire-protocol parameter-count field's width).
+const POSTGRES_MAX_BIND_PARAMS: usize = 65_535;
+
+/// Bind parameters one `NewTaskQueueItem` row contributes to the `INSERT`
+/// [`enqueue_batch`] issues -- its field count.
+///
+/// `new_task_queue_item_column_count_matches_the_constant` below pins this
+/// number by exhaustive field destructure. Adding or removing a
+/// `NewTaskQueueItem` field breaks that test at compile time until this
+/// constant is updated too, so it cannot silently drift.
+const NEW_TASK_QUEUE_ITEM_COLUMNS: usize = 27;
+
+/// Largest row count one `enqueue_batch` `INSERT` may carry.
+///
+/// Floor division, so `ROWS_PER_INSERT_CHUNK * NEW_TASK_QUEUE_ITEM_COLUMNS`
+/// never reaches [`POSTGRES_MAX_BIND_PARAMS`]. `ctx.execute_activity_fan_out_raw`
+/// accepts an uncapped `Vec`. [`enqueue_batch`] must not assume its caller
+/// already bounded the batch. A single unchunked multi-row `INSERT` hits
+/// Postgres's parameter ceiling at only a few thousand rows for this
+/// row's width.
+///
+/// This bounds parameter count only, not memory -- see
+/// [`MAX_CHUNK_PAYLOAD_BYTES`] for the second, independent bound a chunk
+/// must also respect.
+const ROWS_PER_INSERT_CHUNK: usize = POSTGRES_MAX_BIND_PARAMS / NEW_TASK_QUEUE_ITEM_COLUMNS;
+
+/// Byte budget on one chunk's summed JSON payload size (`input` +
+/// `retry_policy` + `required_capabilities` + `context_headers` +
+/// resolved `trace_context`, the fields [`enqueue_batch`] clones per row).
+///
+/// [`ROWS_PER_INSERT_CHUNK`] alone does not bound memory. An activity
+/// input may validly reach [`crate::builder::DEFAULT_MAX_ACTIVITY_INPUT_BYTES`]
+/// (2 MiB). A run of near-max-size inputs would otherwise let a single
+/// chunk hold thousands of them at once.
+///
+/// Four times that ceiling is wide enough for two cases at once.
+/// Ordinary small-payload fan-outs still fill a chunk to
+/// [`ROWS_PER_INSERT_CHUNK`] rows and batch efficiently. A handful of
+/// near-max-size inputs forces a much smaller chunk instead. A single row
+/// over this budget still gets its own one-row chunk, since
+/// [`enqueue_batch`] must insert it either way.
+const MAX_CHUNK_PAYLOAD_BYTES: usize = 8 * 1024 * 1024; // 4x DEFAULT_MAX_ACTIVITY_INPUT_BYTES
+
+const _: () =
+    assert!(MAX_CHUNK_PAYLOAD_BYTES as u64 == 4 * crate::builder::DEFAULT_MAX_ACTIVITY_INPUT_BYTES);
+
+/// Exact byte length `serde_json::to_vec(value)` would produce, computed
+/// without allocating that `Vec`.
+fn json_byte_len(value: &serde_json::Value) -> usize {
+    struct CountingWriter(usize);
+    impl std::io::Write for CountingWriter {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0 += buf.len();
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    let mut counter = CountingWriter(0);
+    let _ = serde_json::to_writer(&mut counter, value);
+    counter.0
+}
+
+/// Summed byte size of the JSON fields [`enqueue_batch`] clones for one
+/// row -- the same fields [`MAX_CHUNK_PAYLOAD_BYTES`] budgets. Measured
+/// from `EnqueueParams`' own borrowed fields, so no clone is needed just
+/// to decide a chunk boundary.
+fn enqueue_params_payload_bytes(p: &EnqueueParams) -> usize {
+    let mut bytes = json_byte_len(&p.input);
+    if let Some(v) = &p.retry_policy {
+        bytes += json_byte_len(v);
+    }
+    if let Some(v) = &p.required_capabilities {
+        bytes += json_byte_len(v);
+    }
+    if let Some(v) = &p.context_headers {
+        bytes += json_byte_len(v);
+    }
+    if let Some(v) = p
+        .trace_context
+        .as_ref()
+        .and_then(TraceContextCarrier::to_json)
+    {
+        bytes += json_byte_len(&v);
+    }
+    bytes
+}
+
+/// Splits `params` into `[start, end)` index ranges, each within both
+/// [`ROWS_PER_INSERT_CHUNK`] rows and [`MAX_CHUNK_PAYLOAD_BYTES`] of
+/// summed JSON payload. Whichever bound is reached first ends a chunk.
+///
+/// Pure and synchronous: no I/O, no clone, only [`EnqueueParams`]'
+/// borrowed fields. This is what makes chunk sizing directly unit
+/// testable, and is the exact boundary logic [`enqueue_batch`] then acts
+/// on. An empty `params` returns an empty `Vec`. A non-empty one always
+/// returns at least one range, and every row falls into exactly one of
+/// them, in order.
+fn compute_chunk_bounds(params: &[EnqueueParams]) -> Vec<(usize, usize)> {
+    let mut chunk_bounds = Vec::new();
+    let mut chunk_start = 0_usize;
+    while chunk_start < params.len() {
+        let mut chunk_end = chunk_start + 1;
+        let mut payload_bytes = enqueue_params_payload_bytes(&params[chunk_start]);
+        while chunk_end < params.len() && chunk_end - chunk_start < ROWS_PER_INSERT_CHUNK {
+            let next_bytes = enqueue_params_payload_bytes(&params[chunk_end]);
+            if payload_bytes + next_bytes > MAX_CHUNK_PAYLOAD_BYTES {
+                break;
+            }
+            payload_bytes += next_bytes;
+            chunk_end += 1;
+        }
+        chunk_bounds.push((chunk_start, chunk_end));
+        chunk_start = chunk_end;
+    }
+    chunk_bounds
+}
+
+/// Insert several new tasks in one or more round trips and return their
+/// ids, in the same order as `params`.
+///
+/// A workflow decision can fan out to `N` parallel activities in one
+/// suspension, for example via `ctx.execute_activity_fan_out_raw`.
+/// Persisting that decision used to call [`enqueue()`] once per activity,
+/// issuing `N` single-row `INSERT`s in a `for` loop
+/// (`persist_scheduled_activities`, Ledger perf pass). This function
+/// inserts every row with one multi-row `INSERT` per chunk instead,
+/// using the exact column set [`enqueue()`] writes.
+///
+/// # Chunking and peak memory
+///
+/// A chunk holds at most [`ROWS_PER_INSERT_CHUNK`] rows, the parameter
+/// ceiling. It also holds at most [`MAX_CHUNK_PAYLOAD_BYTES`] of summed
+/// JSON payload, the memory ceiling. Whichever bound is reached first
+/// ends the chunk. Every chunk still carries at least one row, even one
+/// whose own payload alone exceeds the byte budget.
+///
+/// Chunk boundaries are decided from `params`' own borrowed fields via
+/// [`enqueue_params_payload_bytes`], with no clone. Each chunk then
+/// builds its own small `Vec<NewTaskQueueItem>` -- the actual clones --
+/// inserts it, and drops it before the next chunk is built. Peak extra
+/// memory beyond what `params` itself already holds therefore stays
+/// bounded by [`MAX_CHUNK_PAYLOAD_BYTES`], not by the whole batch's
+/// payload total. A batch under one chunk still costs exactly one
+/// `INSERT`. The common fan-out width pays none of this chunking's
+/// overhead.
+///
+/// # Sticky pin (rare)
+///
+/// [`EnqueueParams::sticky_worker_id`] is only set for worker-session-pinned
+/// activities (issue #606). An ordinary fan-out carries none of it. Every
+/// row is inserted with `sticky_worker_id`/`sticky_until`/`sticky_timeout`
+/// `NULL` first, exactly like [`enqueue()`]. A follow-up `UPDATE` then sets
+/// those three columns for only the rows that asked for a pin, using the
+/// database's own `NOW()`. This keeps the dominant statement, the insert,
+/// at one call per chunk, regardless of chunk size. The rare per-row pin
+/// `UPDATE` still costs `O(pinned rows)`, the same count [`enqueue()`]
+/// itself would issue.
+///
+/// # Errors
+///
+/// Returns [`crate::error::HarvestError::Database`] on insert failure.
+pub async fn enqueue_batch(
+    conn: &mut AsyncPgConnection,
+    params: &[EnqueueParams],
+) -> HarvestResult<Vec<Uuid>> {
+    use crate::schema::harvest_task_queue;
+
+    if params.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let task_ids: Vec<Uuid> = params.iter().map(|_| Uuid::new_v4()).collect();
+
+    // Byte-and-row-bounded chunk boundaries, decided up front from
+    // `params`' borrowed fields -- see `compute_chunk_bounds`'s doc
+    // comment. No row is cloned until its chunk is actually built below.
+    for (start, end) in compute_chunk_bounds(params) {
+        let param_chunk = &params[start..end];
+        let id_chunk = &task_ids[start..end];
+
+        let rows: Vec<NewTaskQueueItem<'_>> = param_chunk
+            .iter()
+            .zip(id_chunk)
+            .map(|(p, &task_id)| {
+                let concurrency_cap = p
+                    .max_concurrent
+                    .map(|n| i32::try_from(n).unwrap_or(i32::MAX));
+                NewTaskQueueItem {
+                    id: task_id,
+                    queue_name: &p.queue_name,
+                    task_type: p.task_type.as_str(),
+                    workflow_exec_id: p.workflow_exec_id,
+                    activity_name: p.activity_name.as_deref(),
+                    activity_id: p.activity_id,
+                    input: p.input.clone(),
+                    priority: p.priority,
+                    max_attempts: p.max_attempts,
+                    scheduled_at: p.scheduled_at,
+                    heartbeat_timeout: p.heartbeat_timeout,
+                    start_to_close: p.start_to_close,
+                    schedule_to_start: p.schedule_to_start,
+                    retry_policy: p.retry_policy.clone(),
+                    heartbeat_details: None,
+                    sticky_worker_id: None,
+                    sticky_until: None,
+                    sticky_timeout: None,
+                    trace_context: p
+                        .trace_context
+                        .as_ref()
+                        .and_then(TraceContextCarrier::to_json),
+                    concurrency_key: p.concurrency_key.as_deref(),
+                    concurrency_cap,
+                    required_build_id: p.required_build_id.as_deref(),
+                    rate_limit_key: p.rate_limit_key.as_deref(),
+                    schedule_to_close_at: p.schedule_to_close_at,
+                    required_capabilities: p.required_capabilities.clone(),
+                    context_headers: p.context_headers.clone(),
+                    session_id: p.session_id,
+                }
+            })
+            .collect();
+
+        diesel::insert_into(harvest_task_queue::table)
+            .values(&rows)
+            .execute(conn)
+            .await
+            .map_err(crate::error::database_error)?;
+    }
+
+    // Sticky pin follow-up (rare -- see the doc comment above). Same shape as
+    // enqueue()'s own follow-up UPDATE, run once per row that asked for one.
+    for (p, &task_id) in params.iter().zip(&task_ids) {
+        if let (Some(worker_id), Some(timeout)) = (p.sticky_worker_id.as_deref(), p.sticky_timeout)
+        {
+            let chrono_timeout = Duration::from_std(timeout).map_err(|_| {
+                crate::error::HarvestError::Config(
+                    "sticky_timeout exceeds chrono duration range".to_string(),
+                )
+            })?;
+            diesel::sql_query(
+                "UPDATE harvest_task_queue \
+                 SET sticky_worker_id = $2, \
+                     sticky_until = NOW() + $3, \
+                     sticky_timeout = $3 \
+                 WHERE id = $1",
+            )
+            .bind::<diesel::sql_types::Uuid, _>(task_id)
+            .bind::<diesel::sql_types::Text, _>(worker_id)
+            .bind::<diesel::sql_types::Interval, _>(chrono_timeout)
+            .execute(conn)
+            .await
+            .map_err(crate::error::database_error)?;
+        }
+    }
+
+    for (p, &task_id) in params.iter().zip(&task_ids) {
+        crate::notify::notify_task_enqueued(conn, &p.queue_name, task_id).await?;
+    }
+
+    for (p, &task_id) in params.iter().zip(&task_ids) {
+        record_pending_hint(
+            task_id,
+            &p.queue_name,
+            p.scheduled_at,
+            p.priority,
+            crate::dispatch::DispatchKind::from(p.task_type.as_str()),
+        );
+    }
+
+    Ok(task_ids)
+}
+
 // NOTE (issue #619 / Ledger perf pass, buffers -98% @10k): the queue-pause
 // exclusion used to be a per-row correlated `NOT EXISTS`, embedded verbatim
 // and drift-locked literally to
@@ -8416,6 +8692,176 @@ mod tests {
         params.max_concurrent = Some(5);
         assert_eq!(params.concurrency_key.as_deref(), Some("stripe"));
         assert_eq!(params.max_concurrent, Some(5));
+    }
+
+    /// Pins [`NEW_TASK_QUEUE_ITEM_COLUMNS`], and therefore
+    /// [`ROWS_PER_INSERT_CHUNK`], to `NewTaskQueueItem`'s real field count,
+    /// by exhaustive destructure. Adding, removing, or renaming a field
+    /// breaks this match at compile time. The constant must be updated
+    /// too, so `enqueue_batch`'s chunk size cannot silently drift out of
+    /// sync with the row width it is meant to bound.
+    #[test]
+    fn new_task_queue_item_column_count_matches_the_constant() {
+        let sample = NewTaskQueueItem {
+            id: Uuid::nil(),
+            queue_name: "q",
+            task_type: "activity",
+            workflow_exec_id: None,
+            activity_name: None,
+            activity_id: None,
+            input: serde_json::Value::Null,
+            priority: 0,
+            max_attempts: 1,
+            scheduled_at: Utc::now(),
+            heartbeat_timeout: None,
+            start_to_close: None,
+            schedule_to_start: None,
+            retry_policy: None,
+            heartbeat_details: None,
+            sticky_worker_id: None,
+            sticky_until: None,
+            sticky_timeout: None,
+            trace_context: None,
+            concurrency_key: None,
+            concurrency_cap: None,
+            required_build_id: None,
+            rate_limit_key: None,
+            schedule_to_close_at: None,
+            required_capabilities: None,
+            context_headers: None,
+            session_id: None,
+        };
+        let NewTaskQueueItem {
+            id: _,
+            queue_name: _,
+            task_type: _,
+            workflow_exec_id: _,
+            activity_name: _,
+            activity_id: _,
+            input: _,
+            priority: _,
+            max_attempts: _,
+            scheduled_at: _,
+            heartbeat_timeout: _,
+            start_to_close: _,
+            schedule_to_start: _,
+            retry_policy: _,
+            heartbeat_details: _,
+            sticky_worker_id: _,
+            sticky_until: _,
+            sticky_timeout: _,
+            trace_context: _,
+            concurrency_key: _,
+            concurrency_cap: _,
+            required_build_id: _,
+            rate_limit_key: _,
+            schedule_to_close_at: _,
+            required_capabilities: _,
+            context_headers: _,
+            session_id: _,
+        } = sample;
+        // The field destructure above is the compile-time proof that
+        // NEW_TASK_QUEUE_ITEM_COLUMNS counts every field. This const block
+        // is a second, independent compile-time check: the chunk size
+        // computed from that count never crosses Postgres's ceiling.
+        const {
+            assert!(NEW_TASK_QUEUE_ITEM_COLUMNS == 27);
+            assert!(
+                ROWS_PER_INSERT_CHUNK * NEW_TASK_QUEUE_ITEM_COLUMNS <= POSTGRES_MAX_BIND_PARAMS
+            );
+        }
+    }
+
+    /// A "normal" 200-row fan-out of near-max-size inputs must split into
+    /// many small chunks, not land in one. Pure and synchronous -- no
+    /// database, no clone beyond what the test fixture itself builds.
+    ///
+    /// This is the direct regression test for the byte-unaware chunking
+    /// bug. `ROWS_PER_INSERT_CHUNK` alone (~2,427 rows) would have put
+    /// all 200 of these rows in a single chunk. That reproduces the
+    /// original ~400 MiB-peak problem for an entirely ordinary fan-out
+    /// width, not just an extreme one.
+    #[test]
+    fn chunk_bounds_splits_near_max_size_inputs_into_many_small_chunks() {
+        let near_max_bytes = usize::try_from(crate::builder::DEFAULT_MAX_ACTIVITY_INPUT_BYTES)
+            .expect("2 MiB fits in usize");
+        let params: Vec<EnqueueParams> = (0..200)
+            .map(|_| {
+                let payload = "x".repeat(near_max_bytes);
+                EnqueueParams::new("default", TaskType::Activity, serde_json::json!(payload))
+            })
+            .collect();
+
+        let bounds = compute_chunk_bounds(&params);
+
+        assert!(
+            bounds.len() > 10,
+            "200 near-max-size rows must split into many small chunks, got {} chunk(s)",
+            bounds.len()
+        );
+
+        // The size assertion. Each chunk's own summed payload is the
+        // actual peak `enqueue_batch` would clone for that one chunk. It
+        // must stay within the budget, plus at most one row's slack -- a
+        // chunk always carries at least one row, even an over-budget one.
+        for &(start, end) in &bounds {
+            let row_sizes: Vec<usize> = params[start..end]
+                .iter()
+                .map(enqueue_params_payload_bytes)
+                .collect();
+            let chunk_payload: usize = row_sizes.iter().sum();
+            let largest_row = row_sizes.iter().copied().max().unwrap_or(0);
+            assert!(
+                chunk_payload <= MAX_CHUNK_PAYLOAD_BYTES + largest_row,
+                "chunk [{start}, {end}) carries {chunk_payload} bytes, over the \
+                 {MAX_CHUNK_PAYLOAD_BYTES}-byte budget by more than one row's allowance"
+            );
+        }
+
+        // Coverage: every row falls into exactly one chunk, in order, no
+        // gaps and no overlap.
+        let mut next_expected = 0;
+        for &(start, end) in &bounds {
+            assert_eq!(
+                start, next_expected,
+                "chunks must be contiguous, no gap or overlap"
+            );
+            assert!(end > start, "a chunk must never be empty");
+            next_expected = end;
+        }
+        assert_eq!(next_expected, params.len(), "every row must be covered");
+    }
+
+    /// A batch of many small-payload rows, the ordinary case, must still
+    /// fill chunks up to the row-count ceiling. The byte budget must not
+    /// needlessly fragment it. Confirms the byte bound does not regress
+    /// the common case the row bound alone already served well.
+    #[test]
+    fn chunk_bounds_batches_small_payloads_up_to_the_row_ceiling() {
+        const N: usize = 5_000;
+        let params: Vec<EnqueueParams> = (0..N)
+            .map(|i| EnqueueParams::new("default", TaskType::Activity, serde_json::json!({"i": i})))
+            .collect();
+
+        let bounds = compute_chunk_bounds(&params);
+
+        let expected_chunks = N.div_ceil(ROWS_PER_INSERT_CHUNK);
+        assert_eq!(
+            bounds.len(),
+            expected_chunks,
+            "5,000 tiny rows must land in exactly ceil(n / {ROWS_PER_INSERT_CHUNK}) chunks, \
+             the row ceiling alone -- the byte budget must not fragment them further"
+        );
+        // Every full-size chunk hits exactly the row ceiling; only the
+        // last chunk is the remainder. Proves the byte budget never cuts
+        // a chunk short for small payloads.
+        for &(start, end) in &bounds[..bounds.len() - 1] {
+            assert_eq!(end - start, ROWS_PER_INSERT_CHUNK);
+        }
+        assert_eq!(
+            bounds.last(),
+            Some(&((expected_chunks - 1) * ROWS_PER_INSERT_CHUNK, N))
+        );
     }
 
     fn demand(

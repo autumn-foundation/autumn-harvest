@@ -1725,3 +1725,9 @@ standalone note rather than part of the claim-path attribution table above:
 * [`docs/performance-dlq-bulk-discard.md`](performance-dlq-bulk-discard.md) —
   the per-row `DELETE` N+1 in `POST /dead-letters/discard` (issue #1421),
   batched into one `DELETE ... WHERE id = ANY($1)` call.
+* [`docs/performance-activity-fanout-enqueue.md`](performance-activity-fanout-enqueue.md)
+  — the per-activity `INSERT` N+1 in a workflow decision's
+  `ScheduleActivity` fan-out (`persist_scheduled_activities` /
+  `persist_mixed_suspension_batch`), batched into one multi-row `INSERT`
+  call via `queue::enqueue_batch` (`enqueue_calls` n → 1 at every swept
+  size).
