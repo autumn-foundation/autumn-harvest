@@ -19,6 +19,7 @@ use autumn_harvest::debugger::{
 };
 use autumn_harvest::event::{SideEffectKind, WorkflowEvent};
 use autumn_harvest::info::WorkflowHandlerFn;
+use autumn_harvest::policy::RetryPolicy;
 use autumn_harvest::prelude::activity;
 use autumn_harvest::testing::HistorySnapshot;
 use autumn_harvest::types::{ActivityExecId, ExecutionId, TimerId};
@@ -844,6 +845,87 @@ async fn a_subsecond_local_activity_timeout_change_is_a_divergence() {
         "this regression is only meaningful while the summaries are identical"
     );
     assert_ne!(l.commands[0].payload, r.commands[0].payload);
+}
+
+fn local_activity_from_builder_defaults<'a>(
+    ctx: &'a WorkflowContext,
+    _input: Value,
+) -> Pin<Box<dyn Future<Output = Result<Value, String>> + Send + 'a>> {
+    Box::pin(async move {
+        let _: Value = ctx
+            .execute_local_activity_raw("checksum", json!({}), None, None)
+            .await
+            .map_err(|e| e.to_string())?;
+        Ok(json!("done"))
+    })
+}
+
+#[tokio::test]
+async fn candidate_activity_defaults_reach_prefix_replay() {
+    let history = snapshot("local_wf", vec![started()]);
+    let short = debugger("local_wf", local_activity_from_builder_defaults)
+        .activity_defaults(None, Some(std::time::Duration::from_millis(100)))
+        .trace_snapshot(history.clone())
+        .await
+        .expect("registered");
+    let long = debugger("local_wf", local_activity_from_builder_defaults)
+        .activity_defaults(None, Some(std::time::Duration::from_millis(900)))
+        .trace_snapshot(history)
+        .await
+        .expect("registered");
+
+    let diff = diff_traces(&short, &long);
+    assert!(!diff.is_clean());
+    let div = diff
+        .divergence
+        .expect("candidate defaults must change the frontier command");
+    assert!(matches!(
+        div.kind,
+        DiffKind::CommandMismatch { command_index: 0 }
+    ));
+    let short_command = &div.left.expect("short side").commands[0];
+    let long_command = &div.right.expect("long side").commands[0];
+    assert_eq!(short_command.summary, long_command.summary);
+    let short_payload = short_command.payload.as_ref().expect("payload");
+    let long_payload = long_command.payload.as_ref().expect("payload");
+    assert_eq!(short_payload["start_to_close"]["nanos"], 100_000_000);
+    assert_eq!(long_payload["start_to_close"]["nanos"], 900_000_000);
+}
+
+#[tokio::test]
+async fn candidate_activity_retry_default_reaches_prefix_replay() {
+    let history = snapshot("local_wf", vec![started()]);
+    let three = debugger("local_wf", local_activity_from_builder_defaults)
+        .activity_defaults(
+            Some(RetryPolicy::fixed(3, std::time::Duration::from_secs(1))),
+            None,
+        )
+        .trace_snapshot(history.clone())
+        .await
+        .expect("registered");
+    let five = debugger("local_wf", local_activity_from_builder_defaults)
+        .activity_defaults(
+            Some(RetryPolicy::fixed(5, std::time::Duration::from_secs(1))),
+            None,
+        )
+        .trace_snapshot(history)
+        .await
+        .expect("registered");
+
+    let diff = diff_traces(&three, &five);
+    assert!(!diff.is_clean());
+    let div = diff.divergence.expect("retry defaults must differ");
+    assert!(matches!(
+        div.kind,
+        DiffKind::CommandMismatch { command_index: 0 }
+    ));
+    let three_command = &div.left.expect("three-attempt side").commands[0];
+    let five_command = &div.right.expect("five-attempt side").commands[0];
+    assert_eq!(three_command.summary, five_command.summary);
+    let three_payload = three_command.payload.as_ref().expect("payload");
+    let five_payload = five_command.payload.as_ref().expect("payload");
+    assert_eq!(three_payload["retry_policy"]["max_attempts"], 3);
+    assert_eq!(five_payload["retry_policy"]["max_attempts"], 5);
 }
 
 #[test]
