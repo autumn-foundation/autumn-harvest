@@ -60,10 +60,30 @@ caller's `Config`-shaped state conflict:
   again defaults every `Config` to 409, excluding only the one message
   unique to the retry-chain max-depth guard ("exceeds the maximum walk
   depth").
+- **Round 3**: message-content matching, in either direction, is spoofable
+  by caller-controlled text interpolated into an unrelated `Config` message
+  — e.g. `set_build_ramp` embeds the caller's `queue_name` verbatim, so a
+  queue literally named to contain "exceeds the maximum walk depth" would
+  have forced its own genuine conflict back down to 400. Gave the
+  retry-chain guard its own typed `HarvestError::RetryChainMaxDepthExceeded
+  { exec_id, max_depth }` variant (`autumn-harvest/src/error.rs`), mirroring
+  the `EmptyWorkflowId` precedent (issue #1353) for exactly this class of
+  problem, and `resolve_live_attempt_id`/`walk_retry_chain`
+  (`autumn-harvest/src/execution.rs`) now construct it instead of `Config`.
+  `conflict_from` and `map_error` (`autumn-harvest-plugin/src/api.rs`) match
+  the variant directly — no message inspection anywhere in the
+  classification. `map_error`'s new arm preserves the pre-#1445 status (400)
+  for this case outside of `conflict_from`.
 
 Unit tests (`autumn-harvest-plugin/src/api.rs`, exercising the pure
 `conflict_from` function directly — no DB required):
 `conflict_from_maps_already_terminal_config_to_409`,
-`conflict_from_excludes_the_retry_chain_max_depth_guard`, and
-`conflict_from_still_maps_other_state_conflicts_to_409` (the last using the
-exact build-ramp message text, pinning the round-1 regression).
+`conflict_from_excludes_the_retry_chain_max_depth_guard`,
+`conflict_from_still_maps_other_state_conflicts_to_409` (using the exact
+build-ramp message text, pinning the round-1 regression), and
+`conflict_from_config_is_not_spoofable_by_interpolated_text` (a `Config`
+conflict whose message contains the excluded phrase, pinning the round-3
+finding). `retry_chain_routing_tests.rs`'s
+`a_chain_deeper_than_the_walk_bound_fails_closed` (Docker-backed, cannot run
+in this sandbox, compile-checked only) now asserts the typed variant instead
+of `Config`.

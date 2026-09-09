@@ -393,6 +393,32 @@ pub enum HarvestError {
     #[error("workflow_id must not be empty")]
     EmptyWorkflowId,
 
+    /// The workflow-level retry chain rooted at `exec_id` exceeded
+    /// [`crate::execution::RETRY_CHAIN_MAX_DEPTH`] while walking to the live
+    /// attempt (issue #843).
+    ///
+    /// Distinct from [`Self::Config`] (issue #1445 review) so a caller can
+    /// pattern-match on it precisely rather than inspecting the rendered
+    /// message: `resolve_live_attempt_id` runs ahead of `cancel`/`pause`'s own
+    /// "already terminal" state-conflict check, on the same call path, and a
+    /// message-content match risked misclassifying either direction --
+    /// matching too broadly relabels this operational, corrupted-chain
+    /// failure as a 409 state conflict; matching too narrowly (or being
+    /// spoofed by attacker/caller-controlled text interpolated into an
+    /// unrelated `Config` message, e.g. a queue name) fails to catch it. This
+    /// is an operator-facing engine fault, not a bad request -- an
+    /// operator seeing it has a corrupted chain, not a request to fix.
+    #[error(
+        "retry chain for execution {exec_id} exceeds the maximum walk depth of {max_depth}; \
+         refusing to route to a possibly-stale attempt"
+    )]
+    RetryChainMaxDepthExceeded {
+        /// The execution whose retry chain was being walked.
+        exec_id: ExecutionId,
+        /// The configured maximum walk depth that was exceeded.
+        max_depth: usize,
+    },
+
     /// A workflow execution with the same `(workflow_name, workflow_id)` already
     /// exists and the caller's reuse policy does not permit reuse.
     ///
