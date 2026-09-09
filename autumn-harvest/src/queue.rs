@@ -509,16 +509,49 @@ pub async fn enqueue(conn: &mut AsyncPgConnection, params: &EnqueueParams) -> Ha
     Ok(task_id)
 }
 
-/// Insert several new tasks in one round trip and return their ids, in the
-/// same order as `params`.
+/// Postgres's hard ceiling on bound parameters in one statement (`u16::MAX`,
+/// the wire-protocol parameter-count field's width).
+const POSTGRES_MAX_BIND_PARAMS: usize = 65_535;
+
+/// Bind parameters one `NewTaskQueueItem` row contributes to the `INSERT`
+/// [`enqueue_batch`] issues -- its field count.
+///
+/// `new_task_queue_item_column_count_matches_the_constant` below pins this
+/// number by exhaustive field destructure. Adding or removing a
+/// `NewTaskQueueItem` field breaks that test at compile time until this
+/// constant is updated too, so it cannot silently drift.
+const NEW_TASK_QUEUE_ITEM_COLUMNS: usize = 27;
+
+/// Largest row count one `enqueue_batch` `INSERT` may carry.
+///
+/// Floor division, so `ROWS_PER_INSERT_CHUNK * NEW_TASK_QUEUE_ITEM_COLUMNS`
+/// never reaches [`POSTGRES_MAX_BIND_PARAMS`]. `ctx.execute_activity_fan_out_raw`
+/// accepts an uncapped `Vec`. [`enqueue_batch`] must not assume its caller
+/// already bounded the batch. A single unchunked multi-row `INSERT` hits
+/// Postgres's parameter ceiling at only a few thousand rows for this
+/// row's width.
+const ROWS_PER_INSERT_CHUNK: usize = POSTGRES_MAX_BIND_PARAMS / NEW_TASK_QUEUE_ITEM_COLUMNS;
+
+/// Insert several new tasks in one or more round trips and return their
+/// ids, in the same order as `params`.
 ///
 /// A workflow decision can fan out to `N` parallel activities in one
 /// suspension, for example via `ctx.execute_activity_fan_out_raw`.
 /// Persisting that decision used to call [`enqueue()`] once per activity,
 /// issuing `N` single-row `INSERT`s in a `for` loop
 /// (`persist_scheduled_activities`, Ledger perf pass). This function
-/// inserts every row in one multi-row `INSERT` instead, using the exact
-/// column set [`enqueue()`] writes.
+/// inserts every row with one multi-row `INSERT` per [`ROWS_PER_INSERT_CHUNK`]
+/// rows instead, using the exact column set [`enqueue()`] writes.
+///
+/// # Chunking and peak memory
+///
+/// Each chunk builds its own small `Vec<NewTaskQueueItem>`, inserts it, and
+/// drops it before the next chunk is built. Peak extra memory beyond what
+/// `params` itself already holds stays bounded to one chunk's worth of
+/// cloned `input`/`retry_policy`/`required_capabilities`/
+/// `context_headers`/`trace_context` payloads, not the whole batch's. A
+/// batch under one chunk still costs exactly one `INSERT`. The common
+/// fan-out width pays none of this chunking's overhead.
 ///
 /// # Sticky pin (rare)
 ///
@@ -528,7 +561,7 @@ pub async fn enqueue(conn: &mut AsyncPgConnection, params: &EnqueueParams) -> Ha
 /// `NULL` first, exactly like [`enqueue()`]. A follow-up `UPDATE` then sets
 /// those three columns for only the rows that asked for a pin, using the
 /// database's own `NOW()`. This keeps the dominant statement, the insert,
-/// at exactly one call per batch, regardless of size. The rare per-row pin
+/// at one call per chunk, regardless of chunk size. The rare per-row pin
 /// `UPDATE` still costs `O(pinned rows)`, the same count [`enqueue()`]
 /// itself would issue.
 ///
@@ -547,53 +580,58 @@ pub async fn enqueue_batch(
 
     let task_ids: Vec<Uuid> = params.iter().map(|_| Uuid::new_v4()).collect();
 
-    let rows: Vec<NewTaskQueueItem<'_>> = params
-        .iter()
-        .zip(&task_ids)
-        .map(|(p, &task_id)| {
-            let concurrency_cap = p
-                .max_concurrent
-                .map(|n| i32::try_from(n).unwrap_or(i32::MAX));
-            NewTaskQueueItem {
-                id: task_id,
-                queue_name: &p.queue_name,
-                task_type: p.task_type.as_str(),
-                workflow_exec_id: p.workflow_exec_id,
-                activity_name: p.activity_name.as_deref(),
-                activity_id: p.activity_id,
-                input: p.input.clone(),
-                priority: p.priority,
-                max_attempts: p.max_attempts,
-                scheduled_at: p.scheduled_at,
-                heartbeat_timeout: p.heartbeat_timeout,
-                start_to_close: p.start_to_close,
-                schedule_to_start: p.schedule_to_start,
-                retry_policy: p.retry_policy.clone(),
-                heartbeat_details: None,
-                sticky_worker_id: None,
-                sticky_until: None,
-                sticky_timeout: None,
-                trace_context: p
-                    .trace_context
-                    .as_ref()
-                    .and_then(TraceContextCarrier::to_json),
-                concurrency_key: p.concurrency_key.as_deref(),
-                concurrency_cap,
-                required_build_id: p.required_build_id.as_deref(),
-                rate_limit_key: p.rate_limit_key.as_deref(),
-                schedule_to_close_at: p.schedule_to_close_at,
-                required_capabilities: p.required_capabilities.clone(),
-                context_headers: p.context_headers.clone(),
-                session_id: p.session_id,
-            }
-        })
-        .collect();
+    for (param_chunk, id_chunk) in params
+        .chunks(ROWS_PER_INSERT_CHUNK)
+        .zip(task_ids.chunks(ROWS_PER_INSERT_CHUNK))
+    {
+        let rows: Vec<NewTaskQueueItem<'_>> = param_chunk
+            .iter()
+            .zip(id_chunk)
+            .map(|(p, &task_id)| {
+                let concurrency_cap = p
+                    .max_concurrent
+                    .map(|n| i32::try_from(n).unwrap_or(i32::MAX));
+                NewTaskQueueItem {
+                    id: task_id,
+                    queue_name: &p.queue_name,
+                    task_type: p.task_type.as_str(),
+                    workflow_exec_id: p.workflow_exec_id,
+                    activity_name: p.activity_name.as_deref(),
+                    activity_id: p.activity_id,
+                    input: p.input.clone(),
+                    priority: p.priority,
+                    max_attempts: p.max_attempts,
+                    scheduled_at: p.scheduled_at,
+                    heartbeat_timeout: p.heartbeat_timeout,
+                    start_to_close: p.start_to_close,
+                    schedule_to_start: p.schedule_to_start,
+                    retry_policy: p.retry_policy.clone(),
+                    heartbeat_details: None,
+                    sticky_worker_id: None,
+                    sticky_until: None,
+                    sticky_timeout: None,
+                    trace_context: p
+                        .trace_context
+                        .as_ref()
+                        .and_then(TraceContextCarrier::to_json),
+                    concurrency_key: p.concurrency_key.as_deref(),
+                    concurrency_cap,
+                    required_build_id: p.required_build_id.as_deref(),
+                    rate_limit_key: p.rate_limit_key.as_deref(),
+                    schedule_to_close_at: p.schedule_to_close_at,
+                    required_capabilities: p.required_capabilities.clone(),
+                    context_headers: p.context_headers.clone(),
+                    session_id: p.session_id,
+                }
+            })
+            .collect();
 
-    diesel::insert_into(harvest_task_queue::table)
-        .values(&rows)
-        .execute(conn)
-        .await
-        .map_err(crate::error::database_error)?;
+        diesel::insert_into(harvest_task_queue::table)
+            .values(&rows)
+            .execute(conn)
+            .await
+            .map_err(crate::error::database_error)?;
+    }
 
     // Sticky pin follow-up (rare -- see the doc comment above). Same shape as
     // enqueue()'s own follow-up UPDATE, run once per row that asked for one.
@@ -637,6 +675,7 @@ pub async fn enqueue_batch(
 
     Ok(task_ids)
 }
+
 // NOTE (issue #619 / Ledger perf pass, buffers -98% @10k): the queue-pause
 // exclusion used to be a per-row correlated `NOT EXISTS`, embedded verbatim
 // and drift-locked literally to
@@ -8545,6 +8584,84 @@ mod tests {
         params.max_concurrent = Some(5);
         assert_eq!(params.concurrency_key.as_deref(), Some("stripe"));
         assert_eq!(params.max_concurrent, Some(5));
+    }
+
+    /// Pins [`NEW_TASK_QUEUE_ITEM_COLUMNS`], and therefore
+    /// [`ROWS_PER_INSERT_CHUNK`], to `NewTaskQueueItem`'s real field count,
+    /// by exhaustive destructure. Adding, removing, or renaming a field
+    /// breaks this match at compile time. The constant must be updated
+    /// too, so `enqueue_batch`'s chunk size cannot silently drift out of
+    /// sync with the row width it is meant to bound.
+    #[test]
+    fn new_task_queue_item_column_count_matches_the_constant() {
+        let sample = NewTaskQueueItem {
+            id: Uuid::nil(),
+            queue_name: "q",
+            task_type: "activity",
+            workflow_exec_id: None,
+            activity_name: None,
+            activity_id: None,
+            input: serde_json::Value::Null,
+            priority: 0,
+            max_attempts: 1,
+            scheduled_at: Utc::now(),
+            heartbeat_timeout: None,
+            start_to_close: None,
+            schedule_to_start: None,
+            retry_policy: None,
+            heartbeat_details: None,
+            sticky_worker_id: None,
+            sticky_until: None,
+            sticky_timeout: None,
+            trace_context: None,
+            concurrency_key: None,
+            concurrency_cap: None,
+            required_build_id: None,
+            rate_limit_key: None,
+            schedule_to_close_at: None,
+            required_capabilities: None,
+            context_headers: None,
+            session_id: None,
+        };
+        let NewTaskQueueItem {
+            id: _,
+            queue_name: _,
+            task_type: _,
+            workflow_exec_id: _,
+            activity_name: _,
+            activity_id: _,
+            input: _,
+            priority: _,
+            max_attempts: _,
+            scheduled_at: _,
+            heartbeat_timeout: _,
+            start_to_close: _,
+            schedule_to_start: _,
+            retry_policy: _,
+            heartbeat_details: _,
+            sticky_worker_id: _,
+            sticky_until: _,
+            sticky_timeout: _,
+            trace_context: _,
+            concurrency_key: _,
+            concurrency_cap: _,
+            required_build_id: _,
+            rate_limit_key: _,
+            schedule_to_close_at: _,
+            required_capabilities: _,
+            context_headers: _,
+            session_id: _,
+        } = sample;
+        // The field destructure above is the compile-time proof that
+        // NEW_TASK_QUEUE_ITEM_COLUMNS counts every field. This const block
+        // is a second, independent compile-time check: the chunk size
+        // computed from that count never crosses Postgres's ceiling.
+        const {
+            assert!(NEW_TASK_QUEUE_ITEM_COLUMNS == 27);
+            assert!(
+                ROWS_PER_INSERT_CHUNK * NEW_TASK_QUEUE_ITEM_COLUMNS <= POSTGRES_MAX_BIND_PARAMS
+            );
+        }
     }
 
     fn demand(

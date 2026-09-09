@@ -488,6 +488,77 @@ async fn enqueue_batch_returns_ids_in_input_order() {
     }
 }
 
+/// A batch past Postgres's bind-parameter ceiling must still succeed.
+///
+/// `NewTaskQueueItem` carries 27 columns, so one unchunked multi-row
+/// `INSERT` hits Postgres's 65,535-bind-parameter ceiling at 2,428 rows
+/// (`65_535 / 27 = 2427`, floor). 3,000 rows spans that boundary: two
+/// chunks, not one. This is a direct regression test for the
+/// pre-chunking bug. `execute_activity_fan_out_raw` accepts an uncapped
+/// `Vec`, and a large-enough fan-out returned a DB error before
+/// `enqueue_batch` chunked its insert. Also checks order survives the
+/// chunk boundary, not just within one chunk.
+#[tokio::test]
+async fn enqueue_batch_handles_a_batch_past_the_parameter_ceiling() {
+    use autumn_harvest::models::TaskQueueItem;
+    use autumn_harvest::schema::harvest_task_queue;
+    use diesel::SelectableHelper;
+
+    const N: usize = 3_000;
+
+    let (admin, _guard) = setup_server().await;
+    let url = create_fresh_db(&admin, &unique("enqueue_batch_over_ceiling")).await;
+    let mut conn = AsyncPgConnection::establish(&url).await.expect("connect");
+    let exec_id = seed_execution(&mut conn, &unique("enqueue_batch_over_ceiling_wf")).await;
+    let params = build_fanout_params(exec_id, N);
+
+    let ids = queue::enqueue_batch(&mut conn, &params).await.expect(
+        "enqueue_batch must not fail once its INSERT is chunked under the parameter ceiling",
+    );
+    assert_eq!(
+        ids.len(),
+        N,
+        "every row across every chunk must be enqueued"
+    );
+
+    let unique_ids: std::collections::HashSet<_> = ids.iter().collect();
+    assert_eq!(
+        unique_ids.len(),
+        N,
+        "ids must not repeat across chunk boundaries"
+    );
+
+    let row_count: i64 = harvest_task_queue::table
+        .filter(harvest_task_queue::workflow_exec_id.eq(exec_id))
+        .count()
+        .get_result(&mut conn)
+        .await
+        .expect("count enqueued rows");
+    assert_eq!(
+        row_count,
+        i64::try_from(N).unwrap(),
+        "every chunk's INSERT must commit"
+    );
+
+    // Spot-check order at both ends and across the chunk boundary (row
+    // 2,427, zero-indexed). Each id must still resolve to its own
+    // positional activity name, the same contract
+    // `enqueue_batch_returns_ids_in_input_order` pins for a single chunk.
+    for i in [0_usize, 1, 2_426, 2_427, 2_428, N - 1] {
+        let row: TaskQueueItem = harvest_task_queue::table
+            .filter(harvest_task_queue::id.eq(ids[i]))
+            .select(TaskQueueItem::as_select())
+            .get_result(&mut conn)
+            .await
+            .expect("row for id should exist");
+        assert_eq!(
+            row.activity_name.as_deref(),
+            Some(format!("fan_out_step_{i}").as_str()),
+            "ids[{i}] must correspond to params[{i}] across the chunk boundary"
+        );
+    }
+}
+
 // ── End-to-end: a real workflow's fan-out, driven through Worker::run ──────
 
 fn fan_out_handler<'a>(
