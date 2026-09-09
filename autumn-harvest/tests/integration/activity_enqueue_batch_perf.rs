@@ -258,9 +258,9 @@ async fn measure_one_fanout(admin: &str, label: &str, n: usize) -> SizePoint {
         .expect("stats connection");
     reset_stats_for_db(&mut stats_conn, &db_name).await;
 
-    // The one real public entry point under test: `queue::enqueue` (looped,
-    // "before") or `queue::enqueue_batch` (one call, "after") -- the exact
-    // functions `persist_scheduled_activities` /
+    // The real public entry point under test: `queue::enqueue` (looped,
+    // "before") or `queue::enqueue_batch` (one call, "after"). These are
+    // the exact functions `persist_scheduled_activities` and
     // `persist_mixed_suspension_batch` call to persist a fan-out decision.
     let wal_before = wal_bytes(&mut stats_conn).await;
     let ids = if label == "before" {
@@ -460,6 +460,10 @@ async fn enqueue_batch_on_empty_slice_is_a_no_op() {
 /// (`activity_task_ids` doc comment, `autumn-harvest/src/worker.rs`).
 #[tokio::test]
 async fn enqueue_batch_returns_ids_in_input_order() {
+    use autumn_harvest::models::TaskQueueItem;
+    use autumn_harvest::schema::harvest_task_queue;
+    use diesel::SelectableHelper;
+
     let (admin, _guard) = setup_server().await;
     let url = create_fresh_db(&admin, &unique("enqueue_batch_order")).await;
     let mut conn = AsyncPgConnection::establish(&url).await.expect("connect");
@@ -469,9 +473,6 @@ async fn enqueue_batch_returns_ids_in_input_order() {
         .await
         .expect("enqueue_batch");
 
-    use autumn_harvest::models::TaskQueueItem;
-    use autumn_harvest::schema::harvest_task_queue;
-    use diesel::SelectableHelper;
     for (i, id) in ids.iter().enumerate() {
         let row: TaskQueueItem = harvest_task_queue::table
             .filter(harvest_task_queue::id.eq(id))
