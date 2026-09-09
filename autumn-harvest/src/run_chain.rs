@@ -120,16 +120,19 @@ pub fn outcome_for_state(state: &str) -> &'static str {
     }
 }
 
-/// Index a chain's rows for [`assemble_run_chain`]: `continued_from_exec_id`
-/// -> row index (first occurrence wins on a duplicate key, mirroring exactly
-/// what `rows.iter().position(|r| r.continued_from_exec_id == Some(id))`
-/// would find -- the first matching index in iteration order), and the set
-/// of every `exec_id` present. Turns the per-hop forward-link walk and the
-/// per-row missing-predecessor check from an O(n) rescan each -- an O(n^2)
-/// pair in chain length -- into O(1) lookups. Continue-as-new chains are the
-/// one place in this codebase where that length is not bounded by
-/// configuration, so the quadratic pair is a real, not synthetic, scaling
-/// risk.
+/// Index a chain's rows for [`assemble_run_chain`].
+///
+/// Returns `continued_from_exec_id` -> row index (first occurrence wins on a
+/// duplicate key), plus the set of every `exec_id` present. The map mirrors
+/// exactly what `rows.iter().position(|r| r.continued_from_exec_id ==
+/// Some(id))` would find: the first matching index in iteration order.
+///
+/// This turns two per-row O(n) rescans into O(1) lookups: the per-hop
+/// forward-link walk, and the per-row missing-predecessor check. Both were
+/// an O(n^2) pair in chain length. Chain length is not bounded by
+/// configuration; continue-as-new chains are the one place in this codebase
+/// where it grows unbounded. So the quadratic pair is a real, not
+/// synthetic, scaling risk.
 fn index_chain_rows(
     rows: &[RunChainRow],
 ) -> (
