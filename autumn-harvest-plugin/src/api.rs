@@ -22932,11 +22932,16 @@ async fn rerun_workflow(
 /// Build a `409 Conflict` response from a state-conflict error (issue #383).
 fn conflict_from(error: HarvestError) -> AutumnError {
     match error {
-        // Only a genuine state conflict (e.g. "already terminal"),
-        // surfaced by the core as `Config`, maps to 409. Everything else —
-        // NotFound (404), Database (500), etc. — flows through the normal mapper
-        // so a real persistence failure is not masked as a state conflict.
-        HarvestError::Config(msg) => {
+        // Only a genuine state conflict ("already terminal"), surfaced by the
+        // core as `Config`, maps to 409. `Config` is also the core's catch-all
+        // for unrelated operational failures on the same call path -- e.g.
+        // `resolve_live_attempt_id`'s retry-chain max-depth guard (issue #843)
+        // -- and those must keep the normal mapping (400), not be reported as
+        // a resource-state conflict (issue #1445 review). Everything else --
+        // NotFound (404), Database (500), etc. -- also flows through the
+        // normal mapper so a real persistence failure is not masked as a
+        // state conflict.
+        HarvestError::Config(msg) if msg.contains("is already terminal") => {
             AutumnError::bad_request_msg(msg).with_status(axum::http::StatusCode::CONFLICT)
         }
         other => map_error(other),
@@ -50172,6 +50177,41 @@ mod tests {
         assert!(
             msg.contains("unknown conflict_policy"),
             "error must mention unknown conflict_policy: {msg}"
+        );
+    }
+
+    // -- conflict_from precision (issue #1445 review) --
+
+    #[test]
+    fn conflict_from_maps_already_terminal_config_to_409() {
+        let err = HarvestError::Config(
+            "workflow execution 00000000-0000-4000-8000-000000000001 is already terminal \
+             (COMPLETED)"
+                .to_string(),
+        );
+        assert_eq!(
+            conflict_from(err).status(),
+            axum::http::StatusCode::CONFLICT
+        );
+    }
+
+    #[test]
+    fn conflict_from_leaves_other_config_errors_at_their_normal_status() {
+        // `Config` is also the core's catch-all for unrelated operational
+        // failures on the same call path -- e.g. `resolve_live_attempt_id`'s
+        // retry-chain max-depth guard (issue #843). Those must NOT be reported
+        // as a 409 resource-state conflict: `conflict_from` used to match on
+        // every `Config` variant regardless of message, which would have
+        // relabeled a corrupted-chain operational failure as "the workflow
+        // already finished."
+        let err = HarvestError::Config(
+            "retry chain for execution 00000000-0000-4000-8000-000000000001 exceeds the \
+             maximum walk depth of 256; refusing to route to a possibly-stale attempt"
+                .to_string(),
+        );
+        assert_ne!(
+            conflict_from(err).status(),
+            axum::http::StatusCode::CONFLICT
         );
     }
 
