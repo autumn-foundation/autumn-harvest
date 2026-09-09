@@ -34,7 +34,18 @@ fi
 
 minor_version=$(echo "$full_version" | sed -E 's/^([0-9]+\.[0-9]+)\..*/\1/')
 
-pin_line=$(grep -m1 'autumn-harvest = { version = "[^"]*", features = \["testing"\]' README.md)
+# Scoped to the "### CI pattern" section's own block (that heading through
+# the next heading), not the whole file — a correct pin appearing anywhere
+# else in README.md must not paper over a stale pin in this specific
+# snippet, and a stale pin appearing elsewhere must not fail this check.
+ci_pattern_block=$(awk '/^### CI pattern$/{flag=1; next} flag && /^##/{exit} flag{print}' README.md)
+
+if [ -z "$ci_pattern_block" ]; then
+  echo "Could not find the \"### CI pattern\" section in README.md at all." >&2
+  exit 1
+fi
+
+pin_line=$(grep -m1 'autumn-harvest = { version = "[^"]*", features = \["testing"\]' <<<"$ci_pattern_block")
 
 if [ -z "$pin_line" ]; then
   echo "Could not find the testing-dependency pin (\"autumn-harvest = {" >&2
