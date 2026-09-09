@@ -428,5 +428,14 @@ harness = false
 name = "timeline_profile"
 harness = false
 
+# Deterministic (non-criterion) instruction/allocation-count profiling harness
+# for `run_chain::assemble_run_chain` -- the pure ordering pass behind
+# `GET /workflows/{id}/run-chain` (issue #701). No feature requirement:
+# `run_chain.rs` is pure and unconditional (no DB access). See
+# `benches/run_chain_profile.rs`.
+[[bench]]
+name = "run_chain_profile"
+harness = false
+
 [lints]
 workspace = true
