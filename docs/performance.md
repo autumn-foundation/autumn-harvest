@@ -1699,6 +1699,10 @@ standalone note rather than part of the claim-path attribution table above:
 * [`docs/performance-schedule-overdue-aux.md`](performance-schedule-overdue-aux.md)
   — the same N+1 shape in `GET /admin/schedules`'s overdue-aux computation
   (issue #696).
+* [`docs/performance-schedule-overdue-pass.md`](performance-schedule-overdue-pass.md)
+  — the aux-lookup fix's own named follow-up: the identical N+1 shape in
+  `scheduler::overdue_schedule_pass`, the scheduler tick's periodic
+  overdue-gauge sampler (issue #696).
 * [`docs/performance-usage-report-activity-lookback.md`](performance-usage-report-activity-lookback.md)
   — indexing the activity-attempt lookback LATERAL join in `GET /admin/usage`
   (issue #596), the one CTE the 2026-07 usage-report-indexes migration missed.
