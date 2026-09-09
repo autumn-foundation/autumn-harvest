@@ -508,6 +508,135 @@ pub async fn enqueue(conn: &mut AsyncPgConnection, params: &EnqueueParams) -> Ha
 
     Ok(task_id)
 }
+
+/// Insert several new tasks in one round trip and return their ids, in the
+/// same order as `params`.
+///
+/// A workflow decision can fan out to `N` parallel activities in one
+/// suspension, for example via `ctx.execute_activity_fan_out_raw`.
+/// Persisting that decision used to call [`enqueue()`] once per activity,
+/// issuing `N` single-row `INSERT`s in a `for` loop
+/// (`persist_scheduled_activities`, Ledger perf pass). This function
+/// inserts every row in one multi-row `INSERT` instead, using the exact
+/// column set [`enqueue()`] writes.
+///
+/// # Sticky pin (rare)
+///
+/// [`EnqueueParams::sticky_worker_id`] is only set for worker-session-pinned
+/// activities (issue #606). An ordinary fan-out carries none of it. Every
+/// row is inserted with `sticky_worker_id`/`sticky_until`/`sticky_timeout`
+/// `NULL` first, exactly like [`enqueue()`]. A follow-up `UPDATE` then sets
+/// those three columns for only the rows that asked for a pin, using the
+/// database's own `NOW()`. This keeps the dominant statement, the insert,
+/// at exactly one call per batch, regardless of size. The rare per-row pin
+/// `UPDATE` still costs `O(pinned rows)`, the same count [`enqueue()`]
+/// itself would issue.
+///
+/// # Errors
+///
+/// Returns [`crate::error::HarvestError::Database`] on insert failure.
+pub async fn enqueue_batch(
+    conn: &mut AsyncPgConnection,
+    params: &[EnqueueParams],
+) -> HarvestResult<Vec<Uuid>> {
+    use crate::schema::harvest_task_queue;
+
+    if params.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let task_ids: Vec<Uuid> = params.iter().map(|_| Uuid::new_v4()).collect();
+
+    let rows: Vec<NewTaskQueueItem<'_>> = params
+        .iter()
+        .zip(&task_ids)
+        .map(|(p, &task_id)| {
+            let concurrency_cap = p
+                .max_concurrent
+                .map(|n| i32::try_from(n).unwrap_or(i32::MAX));
+            NewTaskQueueItem {
+                id: task_id,
+                queue_name: &p.queue_name,
+                task_type: p.task_type.as_str(),
+                workflow_exec_id: p.workflow_exec_id,
+                activity_name: p.activity_name.as_deref(),
+                activity_id: p.activity_id,
+                input: p.input.clone(),
+                priority: p.priority,
+                max_attempts: p.max_attempts,
+                scheduled_at: p.scheduled_at,
+                heartbeat_timeout: p.heartbeat_timeout,
+                start_to_close: p.start_to_close,
+                schedule_to_start: p.schedule_to_start,
+                retry_policy: p.retry_policy.clone(),
+                heartbeat_details: None,
+                sticky_worker_id: None,
+                sticky_until: None,
+                sticky_timeout: None,
+                trace_context: p
+                    .trace_context
+                    .as_ref()
+                    .and_then(TraceContextCarrier::to_json),
+                concurrency_key: p.concurrency_key.as_deref(),
+                concurrency_cap,
+                required_build_id: p.required_build_id.as_deref(),
+                rate_limit_key: p.rate_limit_key.as_deref(),
+                schedule_to_close_at: p.schedule_to_close_at,
+                required_capabilities: p.required_capabilities.clone(),
+                context_headers: p.context_headers.clone(),
+                session_id: p.session_id,
+            }
+        })
+        .collect();
+
+    diesel::insert_into(harvest_task_queue::table)
+        .values(&rows)
+        .execute(conn)
+        .await
+        .map_err(crate::error::database_error)?;
+
+    // Sticky pin follow-up (rare -- see the doc comment above). Same shape as
+    // enqueue()'s own follow-up UPDATE, run once per row that asked for one.
+    for (p, &task_id) in params.iter().zip(&task_ids) {
+        if let (Some(worker_id), Some(timeout)) = (p.sticky_worker_id.as_deref(), p.sticky_timeout)
+        {
+            let chrono_timeout = Duration::from_std(timeout).map_err(|_| {
+                crate::error::HarvestError::Config(
+                    "sticky_timeout exceeds chrono duration range".to_string(),
+                )
+            })?;
+            diesel::sql_query(
+                "UPDATE harvest_task_queue \
+                 SET sticky_worker_id = $2, \
+                     sticky_until = NOW() + $3, \
+                     sticky_timeout = $3 \
+                 WHERE id = $1",
+            )
+            .bind::<diesel::sql_types::Uuid, _>(task_id)
+            .bind::<diesel::sql_types::Text, _>(worker_id)
+            .bind::<diesel::sql_types::Interval, _>(chrono_timeout)
+            .execute(conn)
+            .await
+            .map_err(crate::error::database_error)?;
+        }
+    }
+
+    for (p, &task_id) in params.iter().zip(&task_ids) {
+        crate::notify::notify_task_enqueued(conn, &p.queue_name, task_id).await?;
+    }
+
+    for (p, &task_id) in params.iter().zip(&task_ids) {
+        record_pending_hint(
+            task_id,
+            &p.queue_name,
+            p.scheduled_at,
+            p.priority,
+            crate::dispatch::DispatchKind::from(p.task_type.as_str()),
+        );
+    }
+
+    Ok(task_ids)
+}
 // NOTE (issue #619 / Ledger perf pass, buffers -98% @10k): the queue-pause
 // exclusion used to be a per-row correlated `NOT EXISTS`, embedded verbatim
 // and drift-locked literally to
