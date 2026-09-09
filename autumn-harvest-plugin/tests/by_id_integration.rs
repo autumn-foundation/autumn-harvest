@@ -558,6 +558,52 @@ async fn cancel_by_id_requires_admin_then_cancels() {
     assert_eq!(load_state(&mut conn, exec_id).await, "CANCELLED");
 }
 
+// Cancelling an already-terminal execution is a genuine state conflict, not a
+// malformed request: it must answer 409 like its `pause`/`rerun` siblings on
+// the identical `HarvestError::Config("… already terminal …")`, and like the
+// route's own published contract (`docs/openapi.json`, both the exec-id and
+// by-id `cancel` operations document 409 for this case). Regression test for
+// the gap where `cancel_workflow` skipped the shared `conflict_from` mapper
+// and fell through to a generic 400.
+#[tokio::test]
+async fn cancel_by_id_on_terminal_execution_returns_conflict_not_bad_request() {
+    let (url, _c) = setup_database().await;
+    let pool = build_pool(&url);
+    let mut conn = pool.get().await.expect("conn");
+    let exec_id = seed(
+        &mut conn,
+        "order_flow",
+        "order-already-done",
+        "COMPLETED",
+        0,
+    )
+    .await;
+    drop(conn);
+
+    let app = build_app(&pool, true);
+    let resp = send(
+        &app,
+        post_json(
+            "/workflows/by-id/order_flow/order-already-done/cancel",
+            &json!({}),
+        ),
+    )
+    .await;
+    assert_eq!(resp.status, StatusCode::CONFLICT, "body: {}", resp.body);
+    assert_eq!(resp.body["status"], json!(409));
+    assert_eq!(
+        resp.exec_id_header.as_deref(),
+        Some(exec_id.to_string().as_str())
+    );
+
+    let mut conn = pool.get().await.expect("conn");
+    assert_eq!(
+        load_state(&mut conn, exec_id).await,
+        "COMPLETED",
+        "a rejected cancel must not mutate the terminal execution"
+    );
+}
+
 // ── Continue-as-new correctness (the success metric) ─────────────────────────
 //
 // A cached exec_id would target the sealed predecessor; business-id resolution

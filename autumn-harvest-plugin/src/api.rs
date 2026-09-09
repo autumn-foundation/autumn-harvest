@@ -22206,7 +22206,7 @@ async fn cancel_workflow(
                 source: &source,
             };
             let _ = audit::insert_audit(&mut conn, &ar).await;
-            Err(map_error(e))
+            Err(conflict_from(e))
         }
         Ok(cancelled) => {
             // Issue #843: the audit record's subject is the execution actually
