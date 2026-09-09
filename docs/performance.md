@@ -15,14 +15,16 @@ and the one that has accreted roughly a `WHERE` predicate per phase since 3.7:
 | PAUSED-execution skip | #383 |
 | worker sessions | #606 |
 | queue pauses | #619 |
+| activity pauses | #807 |
 | capability labels | #382 |
 | sticky routing | #235 |
 
 Each was added for correctness. None was measured. This page is the measurement
 — **for five of them**. The attribution table below varies build-id routing,
 per-key concurrency, the rate-limit gate, the circuit-breaker tracked set and
-the PAUSED skip. The other five are present in the query and held constant, so
-this page says nothing about what they cost; see
+the PAUSED skip. The harness also tracks populated queue- and activity-pause
+arrays. The other four are present in the query and held constant, so this page
+says nothing about what they cost; see
 [known limitations](#known-limitations).
 
 > **Looking for end-to-end numbers?** This page measures the claim and enqueue
@@ -96,7 +98,7 @@ The tables on this page came from these two commands:
 
 ```bash
 # The full exploratory report (the tables on this page).
-# Expect this to take 15-30 minutes: it sweeps three backlog depths, eight gate
+# Expect this to take 15-30 minutes: it sweeps three backlog depths, ten gate
 # scenarios and three enqueue depths, and a 100k-row scenario is slow on purpose.
 HARVEST_TEST_DATABASE_URL=postgres://postgres:postgres@localhost:5432/postgres \
 HARVEST_BENCH_SCENARIO_SECS=180 \
@@ -570,6 +572,24 @@ found it triggers the claim sort's disk spill at roughly 10x lower backlog
 depth than this issue's own no-op-predicate threshold — a materially
 different, and independently interesting, cost profile from the one
 established here.
+
+Issue #1215 reported this fixed-depth sweep on Postgres 16. Each pause case had
+20,000 total rows and 10,000 survivors:
+
+| Gate | Pauses | Sort | Disk |
+|:--|--:|:--|--:|
+| none | 0 | quicksort | 0 |
+| queue pause | 1 | quicksort | 0 |
+| queue pause | 199 | external merge | 32,064 kB |
+| activity pause | 20 | external merge | 5,776 kB |
+| activity pause | 199 | external merge | 47,848 kB |
+
+The harness uses 200 as a regression sentinel. Its two pause scenarios run in
+the per-gate report and print full `EXPLAIN` plans beside the baseline. Both
+seed one held and one surviving backlog. The queue case also widens the `$2`
+queue bind so all paused queues reach the prefilter. Read that row as the
+operational cost of a worker polling many paused queues, not isolated array
+cost. A 10/50/200 cardinality sweep remains useful follow-up work.
 
 **A separate, narrower diagnostic goes further, for the sticky-routing
 predicate specifically, under `FOR UPDATE SKIP LOCKED`.** With the competing
@@ -1436,13 +1456,12 @@ from the benchmark are directly comparable.
   what a production backlog looks like. A real queue with mixed priorities and
   spread arrival times may sort differently — probably not cheaper, but this is
   measured on the degenerate case and should be read that way.
-* **Half the claim-path predicates are varied; the other half are not measured
-  at all.** The attribution table covers five: build-id routing (#171), per-key
+* **The attribution table does not measure every predicate.** It covers five:
+  build-id routing (#171), per-key
   concurrency (#247), the rate-limit gate (#332/#699), the circuit-breaker
-  tracked set (#369) and the PAUSED skip (#383). Five more are present in the
-  query on every claim but are never given anything to match, so their subplans
-  run against empty or null input and this page reports nothing about their
-  cost. Ranked by how much that omission is likely to matter:
+  tracked set (#369) and the PAUSED skip (#383). The harness now also tracks
+  populated queue- and activity-pause arrays. Four predicates remain on their
+  cheapest null path. Ranked by likely impact:
   * **Capability labels (#382)** — measured directly:
     [`docs/performance-capability-labels.md`](performance-capability-labels.md) seeds `required_capabilities`
     (rather than leaving it null) and finds a real, +24–36% buffer cost on the
@@ -1458,6 +1477,14 @@ from the benchmark are directly comparable.
     pauses a queue closed that specific gap and, as a direct result, replaced
     the correlated anti-join with a one-time prefilter — see
     [the queue-pause anti-join fix](#the-queue-pause-anti-join-fix).
+    That result covers one paused queue, not a wide array. Issue #1215 found
+    that 199 paused queues can spill a 10,000-row surviving claim sort to disk.
+    `ClaimGate::ManyQueuesPaused` tracks that equal-depth case.
+  * **Activity pauses (#807)** — issue #1215 found the same spill with 20
+    paused activities at a 10,000-row surviving backlog.
+    `ClaimGate::ManyActivitiesPaused` seeds 200 pauses plus equal held and
+    claimable backlogs. It tracks the risk without changing claim semantics on
+    an unverified optimizer hypothesis.
   * **`schedule_to_close` (#378)** — measured directly:
     [`docs/performance-schedule-to-close.md`](performance-schedule-to-close.md) seeds `schedule_to_close_at`
     (rather than leaving it null) and **confirms this page's own suspicion on

@@ -4,12 +4,12 @@
 //! issue #135) but had no number at all for `queue::claim_task` — the single
 //! most scalability-critical query in the engine, and the one that has accreted
 //! roughly a `WHERE` predicate per phase since 3.7. This benchmark produces the
-//! reference numbers published in `docs/performance.md`, attributes cost to five
+//! reference numbers published in `docs/performance.md`, attributes cost to seven
 //! representative accreted gates, and prints the claim plan so the next
 //! contributor to touch that query can see what they are changing.
 //!
-//! The gate breakdown measures five predicates. The other five are evaluated on
-//! every claim but are left on their cheapest null/empty path by every scenario
+//! The gate breakdown measures seven predicates. Four more are evaluated on
+//! every claim but are left on their cheapest null path by every scenario
 //! here, so they are exercised rather than measured — `docs/performance.md`
 //! names them and says so.
 //!
@@ -241,9 +241,9 @@ fn print_claim_row(report: &ClaimReport, label: &str) {
 /// contention is the point *there*.
 const ATTRIBUTION_CLAIMERS: usize = 2;
 
-/// Per-gate attribution: what do five representative accreted predicates cost?
+/// Per-gate attribution for seven representative predicates.
 ///
-/// Five, not all ten: the rest sit on their null/empty path in every scenario
+/// Seven, not all eleven: the rest sit on their null path in every scenario
 /// here, so this section cannot price them. See `docs/performance.md`.
 async fn gate_breakdown(db: &BenchDb) {
     let headline = Scenario {
@@ -381,12 +381,8 @@ async fn enqueue_section(db: &BenchDb) {
     println!();
 }
 
-/// The plan. The single most useful artifact for a contributor about to add
-/// predicate number twelve.
+/// Plans for the baseline and wide pause arrays.
 async fn explain_section(db: &BenchDb) {
-    let headline = headline_scenario();
-    println!("## `EXPLAIN (ANALYZE, BUFFERS)` — headline claim");
-    println!();
     // Bounded for the same reason as the report header: this section runs after
     // every measurement, so a stall here would hang the process with all the
     // numbers already printed and nothing left to wait for. Failing loudly is
@@ -395,22 +391,34 @@ async fn explain_section(db: &BenchDb) {
     let deadline = std::time::Instant::now() + scenario_time_budget();
     let mut conn =
         with_setup_deadline("explain-section connect", deadline, db::connect(&db.url)).await;
-    with_setup_deadline(
-        "explain-section seed",
-        deadline,
-        db::seed(&mut conn, headline),
-    )
-    .await;
-    let plan = with_setup_deadline(
-        "explain-section EXPLAIN",
-        deadline,
-        db::explain_claim(&mut conn, headline),
-    )
-    .await;
-    println!("```text");
-    println!("{plan}");
-    println!("```");
-    println!();
+    for gate in [
+        ClaimGate::Baseline,
+        ClaimGate::ManyQueuesPaused,
+        ClaimGate::ManyActivitiesPaused,
+    ] {
+        let scenario = Scenario {
+            gate,
+            ..headline_scenario()
+        };
+        println!("## `EXPLAIN (ANALYZE, BUFFERS)` — {}", gate.as_str());
+        println!();
+        with_setup_deadline(
+            "explain-section seed",
+            deadline,
+            db::seed(&mut conn, scenario),
+        )
+        .await;
+        let plan = with_setup_deadline(
+            "explain-section EXPLAIN",
+            deadline,
+            db::explain_claim(&mut conn, scenario),
+        )
+        .await;
+        println!("```text");
+        println!("{plan}");
+        println!("```");
+        println!();
+    }
     println!(
         "> Read the top `Sort` / scan nodes first: they show whether the claim \
          still rides an index or has fallen back to scanning and sorting the \

@@ -480,8 +480,8 @@ can reproduce any of them on your own hardware.
 
 [`docs/performance.md`](docs/performance.md) is the component-level complement:
 it publishes measured task-claim and enqueue baselines: how claim latency scales with pending-backlog depth (the
-number that answers *"when do I add a shard?"*), what five representative
-claim-path predicates cost (five more are in the query on every claim but are
+number that answers *"when do I add a shard?"*), what seven representative
+claim-path predicates cost (four more are in the query on every claim but are
 left on their cheapest null/empty path, so they are evaluated rather than
 measured — the page names them), and the `EXPLAIN (ANALYZE, BUFFERS)` plan
 behind both. Like the
