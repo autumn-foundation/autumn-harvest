@@ -103,9 +103,14 @@ noise control, so none of that configuration bounds it. Little's law on the
 end to end per workflow — bounds how long a workflow spends in the system.
 It says nothing about how that time splits between dispatch waiting,
 database work, and worker execution; this suite does not instrument that
-split for the throughput scenario itself. Shortening the poll interval,
-adding workers, or giving Postgres its own cores all move the number, and
-none of them is an architectural change.
+split for the throughput scenario itself. Adding workers, or giving Postgres
+its own cores, moves the number, and neither is an architectural change. The
+poll interval is not as direct a lever as it looks: with LISTEN/NOTIFY wired,
+as it is here, a successful notification wakes a worker in a fixed 50 ms
+regardless of the configured interval, and a worker claiming tasks back to
+back under load never waits at all. The interval mainly bounds a *missed*
+notification, per
+[the configuration these numbers were taken at](#the-configuration-these-numbers-were-taken-at).
 
 Neither point says whether Harvest is faster or slower than anything else.
 This suite has not run another engine's benchmark, and a competitor's own
