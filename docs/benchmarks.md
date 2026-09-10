@@ -77,23 +77,31 @@ misleading on their own — independent of which engine comes out ahead.
 
 **The unit is not the same.** This page's headline counts whole workflows.
 Other engines often publish a per-transition, per-action, or per-step figure
-instead. The canonical workflow this page measures dispatches **4**
-`harvest_task_queue` rows per completed run: one workflow-task row, reused for
-the whole execution, plus one activity-task row per activity (three). So a
-number in this page's unit is smaller than the same physical work counted the
-other way by roughly that factor. Multiply a `workflows/sec` cell by **4** for
-a rough per-dispatched-task rate in a shape closer to what a per-transition or
-per-action page publishes. That reading is derived from the measurement below,
-not a second measured result.
+instead. The canonical workflow this page measures is claimed off
+`harvest_task_queue` **7** times per completed run: the workflow task is
+claimed once to start the run, then once more each time an activity
+completes and wakes it (three activities, so four workflow-task claims in
+total), plus one claim per activity task (three). A claim is a dispatch —
+a worker picking up and running a queued row — not a count of distinct rows;
+the workflow task keeps one row for the whole run, reused through park and
+wake updates, and gets claimed four times from it. So a number in this
+page's unit is smaller than the same physical work counted the other way by
+roughly that factor. Multiply a `workflows/sec` cell by **7** for a rough
+per-dispatched-task rate in a shape closer to what a per-transition or
+per-action page publishes. That reading is derived from the measurement
+below, not a second measured result.
 
 **The configuration is a floor, not a ceiling.** Every cell below is
 latency-bound, by choice: a 25 ms poll interval, one worker per shard, and
 four logical CPUs shared with Postgres and the load generator — see
 [the configuration these numbers were taken at](#the-configuration-these-numbers-were-taken-at).
 Little's law on the 1-shard cell — 32 workflows in flight ÷ 23.73/sec ≈ 1.35 s
-end to end per workflow — shows most of that time is dispatch wait, not engine
-work. Shortening the poll interval, adding workers, or giving Postgres its own
-cores all move the number, and none of them is an architectural change.
+end to end per workflow — bounds how long a workflow spends in the system.
+It says nothing about how that time splits between dispatch waiting,
+database work, and worker execution; this suite does not instrument that
+split for the throughput scenario itself. Shortening the poll interval,
+adding workers, or giving Postgres its own cores all move the number, and
+none of them is an architectural change.
 
 Neither point says whether Harvest is faster or slower than anything else.
 This suite has not run another engine's benchmark, and a competitor's own
