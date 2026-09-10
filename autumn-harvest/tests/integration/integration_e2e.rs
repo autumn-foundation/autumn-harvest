@@ -4947,6 +4947,21 @@ async fn wait_for_completion_with_diagnostics(
 /// at any given moment) and the outer wait bound from 90s to 180s to give
 /// a legitimately-contended cycle room to finish rather than fail the test
 /// outright; see the wait-bound call site below for the full reasoning.
+///
+/// **2026-09-09 CI-health investigation (issue #1459):** this test failed on
+/// `trunk-dev`, run 34282622366, job `Test DB (linux, shard 6)`. The parent
+/// decision cycle stayed `RUNNING`. `wake_requested` was true and `attempt`
+/// was frozen at 2. All five children had already completed. A controlled
+/// experiment pinned four concurrent copies to two CPUs. It reproduced this
+/// exact signature in five of twelve runs. Zero of fifteen unconstrained
+/// runs failed. The mechanism is a gap in `reset_timed_out_workflow_task`'s
+/// own documented pool-retry budget. That budget can exhaust under
+/// contention. A stuck row then has no backstop. The poison-pill orphan
+/// reclaimer only reclaims tasks owned by a dead worker. It does not
+/// reclaim a wedged task on a live worker. See issue #1459 for the full
+/// diagnosis and reproduction steps. This is a product-level gap, not a
+/// test-tolerance problem. The bound below is not widened again for this
+/// cause.
 #[tokio::test(flavor = "multi_thread", worker_threads = 12)]
 async fn worker_completes_ten_child_fan_out_within_wall_clock_bound() {
     let (database_url, _container) = setup_test_database_url().await;
