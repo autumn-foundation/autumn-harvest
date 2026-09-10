@@ -2901,7 +2901,9 @@ async fn completion_trigger_defers_to_outbox_when_target_quota_exceeded() {
     // fix under test) is what actually runs, mirroring the convention in
     // `workflow_id_targeted_tests.rs`/`transactional_start_tests.rs`.
     autumn_harvest::shard::install_global_router(autumn_harvest::shard::ShardRouter::single());
-    let _sharded_pool = autumn_harvest::shard::ShardedDbPool::single(build_test_pool(&url));
+    let sharded_pool = Some(autumn_harvest::shard::ShardedDbPool::single(build_test_pool(
+        &url,
+    )));
 
     let source_wf = leaked("quota_trigger_source");
     let target_wf = leaked("quota_trigger_target");
@@ -3016,8 +3018,59 @@ async fn completion_trigger_defers_to_outbox_when_target_quota_exceeded() {
     // start the target.
     mark_terminal(&mut conn, blocker, "CANCELLED").await;
 
+    // 2026-09-10 CI-health investigation. Measured rate: 3 failures in 48
+    // contended runs (4 concurrent copies pinned to 2 CPUs), 0 in 15
+    // uncontended runs. Every reproduction shares the CI failure's exact
+    // signature: "target row was never created by the outbox retry; last
+    // count was 1". Mechanism: the background sweep can claim this row
+    // between the two assertions above and the free above. A claim made
+    // while the blocker still holds the slot stamps a QUOTA_REDEFER_BACKOFF
+    // (5s, `completion_trigger.rs`) on the row. Under contention that
+    // backoff can outlast the fixed 10s deadline below.
+    //
+    // Two narrower fixes were measured here and discarded. A single clear
+    // of `next_attempt_at`, right after the free above, cuts the rate. It
+    // does not close it: 1 failure in 48. A sweep transaction already in
+    // flight can commit its own backoff after the clear runs. A single
+    // direct call to the sweep function, right here, has the same
+    // residual gap. The window is shorter, but the gap is the same kind.
+    // An in-flight sweep transaction can still commit a backoff between
+    // the clear and this call. Re-clearing alone on every poll tick, with
+    // no direct call, made the rate worse: 4 in 48. That is plausibly the
+    // extra write contending with the sweep's own write, under the same
+    // 2-CPU pin.
+    //
+    // The loop below instead drives the retry itself on every tick. Each
+    // tick clears the backoff, then calls
+    // `enforce_completion_triggers_outbox` directly. That is the exact
+    // function the background sweep calls. It is the same pattern the
+    // rest of this file and `admission_gate_authoritative_tests.rs`
+    // already use for deterministic outbox coverage. A tick that loses
+    // the residual race to a concurrent sweep transaction costs only
+    // 50ms. That is far less than the sweep's own `poll_interval`. The
+    // next pass clears again, instead of waiting on background timing to
+    // eventually win. The background loop keeps running throughout and
+    // may also relay this row on its own. Both paths are safe, since
+    // production workers race the same way. The row count check is the
+    // actual assertion; the deadline below is the genuine-stall backstop.
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
     loop {
+        diesel::sql_query(
+            "UPDATE harvest_completion_trigger_outbox SET next_attempt_at = NULL \
+             WHERE source_exec_id = $1",
+        )
+        .bind::<diesel::sql_types::Uuid, _>(source.as_uuid())
+        .execute(&mut conn)
+        .await
+        .expect("clear outbox backoff after freeing the quota slot");
+        let _ = enforce_completion_triggers_outbox(
+            &mut conn,
+            &NoOpMetrics,
+            &sharded_pool,
+            &[ShardId::new(0)],
+        )
+        .await;
+
         let n = count_rows(&mut conn, target_row_count_sql, &[target_wf]).await;
         if n == 2 {
             break;
