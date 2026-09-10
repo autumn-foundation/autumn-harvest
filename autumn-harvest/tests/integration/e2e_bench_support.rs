@@ -157,6 +157,25 @@ pub const BENCH_ACTIVITIES: [&str; 3] = [
     "harvest_e2e_bench_step_3",
 ];
 
+/// Task dispatches per completed `bench_workflow` run.
+///
+/// A dispatch is a claim: a worker picks up a `harvest_task_queue` row and
+/// runs it. The workflow task keeps one row for the whole execution, reused
+/// through park and wake updates. The engine still claims that one row
+/// several times. It claims the row once to start the run, then once more
+/// each time an activity completes and wakes it. Three sequential activities
+/// give four workflow-task claims: the start, plus one resume per activity.
+/// Each activity also gets claimed once, as its own row. The total is
+/// `2 * BENCH_ACTIVITIES.len() + 1`: four workflow-task dispatches plus one
+/// activity-task dispatch per entry in [`BENCH_ACTIVITIES`].
+///
+/// `docs/benchmarks.md` publishes this multiplier next to the headline table
+/// (issue #1309). A reader can use it to convert a workflows/sec cell into a
+/// rough per-dispatched-task rate, comparable to another engine's own units.
+/// The constant derives from the workflow's real shape, so the published
+/// number cannot drift from it.
+pub const DISPATCHES_PER_WORKFLOW: usize = 2 * BENCH_ACTIVITIES.len() + 1;
+
 /// Path prefix the plugin's harvest API router is nested under.
 pub const SIGNAL_ROUTE_PREFIX: &str = "/api/harvest/workflows";
 

@@ -69,6 +69,55 @@ Four things a reader should take from that table before anything else:
   it, so the results file records it as an observation and declines to guess at
   a mechanism.
 
+### Reading this next to another engine
+
+Before putting `23.73 workflows/sec` next to a number from another
+durable-execution engine's own page, two things make that comparison
+misleading on their own — independent of which engine comes out ahead.
+
+**The unit is not the same.** This page's headline counts whole workflows.
+Other engines often publish a per-transition, per-action, or per-step figure
+instead. The canonical workflow this page measures is claimed off
+`harvest_task_queue` **7** times per completed run: the workflow task is
+claimed once to start the run, then once more each time an activity
+completes and wakes it (three activities, so four workflow-task claims in
+total), plus one claim per activity task (three). A claim is a dispatch —
+a worker picking up and running a queued row — not a count of distinct rows;
+the workflow task keeps one row for the whole run, reused through park and
+wake updates, and gets claimed four times from it. So a number in this
+page's unit is smaller than the same physical work counted the other way by
+roughly that factor. Multiply a `workflows/sec` cell by **7** for a rough
+per-dispatched-task rate in a shape closer to what a per-transition or
+per-action page publishes. That reading is derived from the measurement
+below, not a second measured result.
+
+**The configuration is a floor, not a ceiling.** The three database-backed
+scenarios — `throughput`, `dispatch_latency`, `signal_roundtrip` — are
+latency-bound below, by choice: a 25 ms poll interval, one worker per shard,
+and four logical CPUs shared with Postgres and the load generator — see
+[the configuration these numbers were taken at](#the-configuration-these-numbers-were-taken-at).
+`replay_throughput` is exempt: it runs entirely in memory as this page's
+noise control, so none of that configuration bounds it. Little's law on the
+`throughput` scenario's 1-shard cell — 32 workflows in flight ÷ 23.73/sec ≈
+1.35 s
+end to end per workflow — bounds how long a workflow spends in the system.
+It says nothing about how that time splits between dispatch waiting,
+database work, and worker execution; this suite does not instrument that
+split for the throughput scenario itself. Adding workers, or giving Postgres
+its own cores, moves the number, and neither is an architectural change. The
+poll interval is not as direct a lever as it looks: with LISTEN/NOTIFY wired,
+as it is here, a successful notification wakes a worker in a fixed 50 ms
+regardless of the configured interval, and a worker claiming tasks back to
+back under load never waits at all. The interval mainly bounds a *missed*
+notification, per
+[the configuration these numbers were taken at](#the-configuration-these-numbers-were-taken-at).
+
+Neither point says whether Harvest is faster or slower than anything else.
+This suite has not run another engine's benchmark, and a competitor's own
+published figure would carry accuracy and staleness this project cannot vouch
+for. A comparison worth trusting re-runs both engines on the same hardware,
+which is why this suite ships in the repo — see [Reproducing](#reproducing).
+
 ### Results by release
 
 Each release's numbers are kept, not overwritten:
