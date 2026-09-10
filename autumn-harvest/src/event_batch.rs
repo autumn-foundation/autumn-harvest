@@ -277,6 +277,25 @@ pub async fn admit_batched_start(
                     let batch_start_source_ref = opts.start_source_ref.clone();
                     let batch_started_by = opts.started_by.clone();
 
+                    // Issue #1230 Finding 1: `row.buffered_payloads` below
+                    // merges every buffered admission's payload into one
+                    // JSON array. That is not the single admission a quota
+                    // key expression resolves against. Capture the FIRST
+                    // buffered payload separately, before the array moves
+                    // into `input`. Pass it as
+                    // `start_or_load_workflow_execution_collect`'s
+                    // quota-key resolution override. The batch's charge
+                    // lands on whichever admission arrived first. That
+                    // mirrors `harvest_event_batches`' own
+                    // first-admission-wins rule for every other captured
+                    // start option.
+                    let quota_key_input_override: Option<serde_json::Value> = row
+                        .buffered_payloads
+                        .as_ref()
+                        .and_then(|v| v.as_array())
+                        .and_then(|items| items.iter().next())
+                        .cloned();
+
                     let params = crate::execution::StartWorkflowParams {
                         workflow_name: &row.workflow_name,
                         workflow_id: &row.workflow_id,
@@ -327,7 +346,13 @@ pub async fn admit_batched_start(
 
                     let (started, deferred_starts, deferred_checks, cancel_metrics) =
                         crate::execution::start_or_load_workflow_execution_collect(
-                            conn, params, true, false, None, None,
+                            conn,
+                            params,
+                            true,
+                            false,
+                            None,
+                            None,
+                            quota_key_input_override.as_ref(),
                         )
                         .await?;
 
@@ -609,6 +634,15 @@ async fn fire_claimed_batch_row(
     let batch_start_source_ref = opts.start_source_ref.clone();
     let batch_started_by = opts.started_by.clone();
 
+    // Issue #1230 Finding 1: see the identical capture in
+    // `admit_batched_start` above for the full rationale. `row.buffered_payloads`
+    // here is the merged array; the first element is the quota-key override.
+    let quota_key_input_override: Option<serde_json::Value> = row
+        .buffered_payloads
+        .as_array()
+        .and_then(|items| items.iter().next())
+        .cloned();
+
     let params = crate::execution::StartWorkflowParams {
         workflow_name: &workflow_name,
         workflow_id: &workflow_id,
@@ -655,7 +689,13 @@ async fn fire_claimed_batch_row(
     };
 
     let start_res = crate::execution::start_or_load_workflow_execution_collect(
-        conn, params, true, false, None, None,
+        conn,
+        params,
+        true,
+        false,
+        None,
+        None,
+        quota_key_input_override.as_ref(),
     )
     .await;
 

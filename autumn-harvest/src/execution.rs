@@ -583,6 +583,16 @@ pub(crate) async fn enforce_quota_admission(
 /// [`GateMode`](crate::admission_gate::GateMode) selects the cache read (fail-closed
 /// `Check` for fresh admissions, snapshot-only `CheckCached` for continuation).
 ///
+/// `quota_key_input_override`, when `Some`, is resolved against instead of
+/// `request.input` for the declared [`crate::quota::QuotaPolicy`]'s key
+/// expression (issue #1230 Finding 1). Only [`crate::event_batch`] passes
+/// one. A batched fire's `request.input` is the whole merged array of
+/// every admitted payload. That is not the single admission a quota key
+/// expression is meant to resolve against. `event_batch.rs` passes the
+/// first buffered payload here instead. Every other caller passes
+/// `None`, so `request.input`
+/// resolves the key exactly as before this parameter existed.
+///
 /// # Errors
 ///
 /// - [`HarvestError::AlreadyExists`] when `RejectDuplicate` rejects.
@@ -600,6 +610,7 @@ pub async fn start_or_load_workflow_execution_collect(
     reject_fresh_if_debounced: bool,
     metrics: Option<&(dyn crate::telemetry::MetricsRecorder + Send + Sync)>,
     gate: Option<crate::admission_gate::GateMode>,
+    quota_key_input_override: Option<&serde_json::Value>,
 ) -> HarvestResult<(
     StartedWorkflowExecution,
     Vec<DeferredTriggerStart>,
@@ -695,20 +706,30 @@ pub async fn start_or_load_workflow_execution_collect(
                     .and_then(|map| map.get(request.workflow_name))
                     .and_then(|meta| meta.quota)
             });
-    // `resolve_quota_key_for_admission_input`, not the plain
-    // `resolve_quota_key` (issue #1230 Finding 1). `request.input` is a
-    // JSON ARRAY, not an object, for a batched-start fire.
-    // `event_batch.rs` merges every buffered admission's payload into one
-    // array before calling this function. The plain resolver requires an
-    // object at the first path segment. It returns `None` for an array,
-    // so it silently skipped all three quota dimensions for EVERY
-    // batched execution. The admission-input-aware resolver peeks at the
-    // array's first element instead, restoring enforcement. See its doc
-    // comment for the first-admission-wins semantics this implies. A
-    // direct (non-batched) start's `input` is already an object, so this
-    // is byte-identical to the plain resolver for every other start path.
+    // Resolve against `quota_key_input_override` when the caller supplies
+    // one, not `request.input` (issue #1230 Finding 1). `event_batch.rs`
+    // merges every buffered admission's payload into one JSON array before
+    // calling this function. So `request.input` is that merged array, not
+    // an object, for a batched-start fire. `resolve_quota_key` requires an
+    // object at the first path segment. It returned `None` for that array.
+    // That silently skipped all three quota dimensions for EVERY batched
+    // execution. `event_batch.rs` now passes the FIRST buffered payload
+    // (a plain object) as the override, restoring enforcement. See
+    // `event_batch.rs`'s call sites for the first-admission-wins rationale.
+    //
+    // This is an explicit override, not a peek into `request.input`
+    // itself. A direct (non-batched) start's `input` is caller-controlled
+    // application data. Nothing in this crate requires it to be an
+    // object. Peeking into a top-level array there would silently change
+    // quota resolution for any embedder whose workflow legitimately takes
+    // an array as its input. This fix must not do that. Only
+    // `event_batch.rs`'s own known-shape aggregate is ever unwrapped this
+    // way.
     let quota_key: Option<String> = quota_policy.and_then(|p| {
-        crate::quota::resolve_quota_key_for_admission_input(p.key_expr, &request.input)
+        crate::quota::resolve_quota_key(
+            p.key_expr,
+            quota_key_input_override.unwrap_or(&request.input),
+        )
     });
     // A resolved key is stamped onto the row for EVERY admission that has
     // one -- including a retry-exempt admission below, which still tags its
@@ -1542,7 +1563,7 @@ pub async fn start_or_load_workflow_execution(
     // is large, and every caller of this function inlines it. An unboxed future
     // here pushes each caller over the `clippy::large_futures` threshold.
     let (collected, hints) = Box::pin(crate::dispatch::buffered(
-        start_or_load_workflow_execution_collect(conn, request, false, false, None, gate),
+        start_or_load_workflow_execution_collect(conn, request, false, false, None, gate, None),
     ))
     .await;
     let (result, deferred_starts, deferred_checks, _cancel_metrics) = collected?;
@@ -1565,7 +1586,7 @@ pub async fn start_or_load_workflow_execution_with_metrics(
     // Same post-commit publish as `start_or_load_workflow_execution`.
     // `Box::pin` for the same reason as the call above.
     let (collected, hints) = Box::pin(crate::dispatch::buffered(
-        start_or_load_workflow_execution_collect(conn, request, false, false, metrics, gate),
+        start_or_load_workflow_execution_collect(conn, request, false, false, metrics, gate, None),
     ))
     .await;
     let (result, deferred_starts, deferred_checks, cancel_metrics) = collected?;
@@ -1672,7 +1693,7 @@ pub async fn start_or_load_workflow_execution_idempotent(
                 crate::start_idempotency::StartIdempotencyReservation::Reserved => {
                     let workflow_name = request.workflow_name;
                     let (started, ds, dc, cm) = start_or_load_workflow_execution_collect(
-                        conn, request, true, false, metrics, gate,
+                        conn, request, true, false, metrics, gate, None,
                     )
                     .await?;
                     // The reserve wrote the claim pointing at `new_exec_id`.
@@ -5353,6 +5374,7 @@ pub async fn signal_with_start_workflow_execution_with_metrics(
                         true,
                         metrics,
                         None,
+                        None,
                     )
                     .await?;
                 deferred_starts.append(&mut deferred);
@@ -5368,6 +5390,7 @@ pub async fn signal_with_start_workflow_execution_with_metrics(
                         false,
                         metrics,
                         gate,
+                        None,
                     )
                     .await?;
                 deferred_starts.append(&mut deferred);
@@ -5421,6 +5444,7 @@ pub async fn signal_with_start_workflow_execution_with_metrics(
                         false,
                         metrics,
                         gate,
+                        None,
                     )
                     .await?;
                 deferred_starts.append(&mut deferred);
@@ -6052,6 +6076,7 @@ pub async fn rerun_workflow_execution(
                     /* reject_fresh_if_debounced = */ false,
                     metrics,
                     Some(crate::admission_gate::GateMode::Check),
+                    None,
                 )
                 .await?;
 
@@ -6564,6 +6589,7 @@ pub async fn update_with_start_workflow_execution_with_metrics(
                         true,
                         metrics,
                         None,
+                        None,
                     )
                     .await?;
                 deferred_starts.append(&mut deferred);
@@ -6579,6 +6605,7 @@ pub async fn update_with_start_workflow_execution_with_metrics(
                         false,
                         metrics,
                         gate,
+                        None,
                     )
                     .await?;
                 deferred_starts.append(&mut deferred);
@@ -6623,6 +6650,7 @@ pub async fn update_with_start_workflow_execution_with_metrics(
                         false,
                         metrics,
                         gate,
+                        None,
                     )
                     .await?;
                 deferred_starts.append(&mut deferred);

@@ -1790,6 +1790,7 @@ pub fn evaluate_triggers_for_execution_collecting<'a>(
                     // counting that the primitive cannot), so it is not gated again
                     // here — pass `None` to avoid double-counting (issue #618).
                     None,
+                    None,
                 )
                 .await
                 {

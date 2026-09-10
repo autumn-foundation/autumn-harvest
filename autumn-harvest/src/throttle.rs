@@ -1159,6 +1159,7 @@ async fn fire_claimed_throttle_row(
         false,
         Some(metrics),
         Some(crate::admission_gate::GateMode::CheckCached),
+        None,
     )
     .await
     {
@@ -1315,8 +1316,8 @@ async fn fire_claimed_throttle_row(
 /// Each transaction then holds one key while it waits for the other: an
 /// ABBA wait-for cycle. Postgres aborts one transaction with a raw
 /// `deadlock_detected` error. That error is not
-/// [`crate::error::HarvestError::QuotaExceeded`], so the dedicated
-/// re-defer arm below does not catch it. It propagates out through
+/// [`crate::error::HarvestError::QuotaExceeded`], so no arm in this
+/// scanner's fire path catches it. It propagates out through
 /// `enforce_timeouts_once` and aborts every OTHER duty in that tick, not
 /// just the one row that collided.
 ///

@@ -19909,6 +19909,7 @@ async fn batch_start_workflows(
                 // `Err(e)` arm below (never a hard batch failure) — the block is
                 // counted once by the primitive.
                 Some(autumn_harvest::admission_gate::GateMode::Check),
+                None,
             )
             .await;
 
