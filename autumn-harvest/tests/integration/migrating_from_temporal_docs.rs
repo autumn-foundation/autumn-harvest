@@ -271,6 +271,81 @@ fn comparison_page_links_back_to_the_migration_guide() {
     );
 }
 
+/// Issue #1219, gap 1: a schedule-driven workflow type bypasses the
+/// app-level cutover flag entirely, since the Temporal server starts its
+/// executions directly. The playbook must say so, and must send the reader
+/// to harvest's own schedule pause and catchup primitives rather than leave
+/// them to guess.
+#[test]
+fn dual_run_playbook_covers_schedule_driven_cutover() {
+    let guide = read_doc(GUIDE_PATH);
+    let playbook = section_body(&guide, "## Dual-run cutover playbook");
+
+    assert!(
+        playbook.contains("Temporal Schedule"),
+        "the playbook must name the schedule-driven-type gap (issue #1219): the Temporal \
+         server starts a Temporal Schedule's executions directly, bypassing the app-level flag"
+    );
+    assert!(
+        playbook.to_lowercase().contains("buffered"),
+        "the playbook must address firings a Temporal Schedule buffers during the quiesce \
+         window, so they are not silently dropped or duplicated (issue #1219)"
+    );
+    assert!(
+        playbook.contains("/admin/schedules/{id}/pause"),
+        "the playbook must point to harvest's own schedule pause primitive so the harvest \
+         side does not fire before the reader is ready (issue #229, issue #1219)"
+    );
+    assert!(
+        playbook.contains("CatchupPolicy"),
+        "the playbook must point to the catchup-policy primitive for the harvest schedule's \
+         first-tick backlog decision (issue #484, issue #1219)"
+    );
+}
+
+/// Issue #1219, gap 2: a follow-up operation (signal, query, update, cancel)
+/// against one already-started execution must route by where that execution
+/// started, never by the current flag value -- the flag can flip between an
+/// execution's start and a later follow-up call against it.
+#[test]
+fn dual_run_playbook_covers_follow_up_engine_routing() {
+    let guide = read_doc(GUIDE_PATH);
+    let playbook = section_body(&guide, "## Dual-run cutover playbook");
+
+    assert!(
+        playbook.to_lowercase().contains("follow-up"),
+        "the playbook must name follow-up operations (signal, query, update, cancel) as a \
+         distinct routing concern from a new start (issue #1219)"
+    );
+    assert!(
+        playbook.contains("-> engine") || playbook.contains("→ engine"),
+        "the playbook must state the general rule: persist which engine started each \
+         execution, and route follow-ups by that record (issue #1219)"
+    );
+    assert!(
+        playbook.contains("special case"),
+        "step 7's end-of-lifecycle handoff must be framed as a special case of the general \
+         follow-up-routing rule, not a standalone exception (issue #1219)"
+    );
+}
+
+/// Issue #1219, gap 2 (continued): the worked example's own `cancel` signal
+/// is the concrete hazard the issue names -- sent to the wrong engine, it
+/// either no-ops or spuriously starts a new execution. The commentary must
+/// cross-link the general routing rule, not just show the signal in
+/// isolation.
+#[test]
+fn worked_example_commentary_cross_links_engine_routing_rule() {
+    let guide = read_doc(GUIDE_PATH);
+    let commentary = section_body(&guide, "### What changed, and why");
+
+    assert!(
+        commentary.contains("engine that started"),
+        "the worked example's commentary must cross-link the general engine-routing rule for \
+         its own `cancel` signal (issue #1219)"
+    );
+}
+
 #[test]
 fn ci_workflow_exercises_the_worked_example() {
     let ci = read_doc(".github/workflows/ci.yml");
