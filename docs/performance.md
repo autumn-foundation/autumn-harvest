@@ -22,8 +22,8 @@ and the one that has accreted roughly a `WHERE` predicate per phase since 3.7:
 Each was added for correctness. None was measured. This page is the measurement
 — **for five of them**. The attribution table below varies build-id routing,
 per-key concurrency, the rate-limit gate, the circuit-breaker tracked set and
-the PAUSED skip. The other five are present in the query and held constant, so
-this page says nothing about what they cost; see
+the PAUSED skip. The other six are present in the query and held constant, so
+this page says nothing about what they cost in *that* table; see
 [known limitations](#known-limitations).
 
 > **Looking for end-to-end numbers?** This page measures the claim and enqueue
@@ -838,9 +838,10 @@ reproducible via
 `harvest_activity_pauses` table on every claim, so array size tracks the
 pause table's total population directly. Twenty paused activity types — a
 realistic response to a multi-service incident, not an edge case — is
-enough to spill the claim sort to disk, at a backlog roughly a tenth the
-size issue #1177 needed to trigger the same spill against an empty pause
-table.
+enough to spill the claim sort to disk. That is far below the
+[few-hundred-thousand-row depth](#any-residual-predicate-defeats-sort-elision-issue-1177)
+issue #1177's own locked-scenario reproduction needed to trigger the same
+spill against an empty pause table.
 
 **`paused_queues` stays cheap only while the worker's own bind stays
 small.** [The `$2` bound above](#the-queue-pause-anti-join-fix) keeps a
@@ -1516,9 +1517,10 @@ from the benchmark are directly comparable.
   * **Activity pauses (#807)** — not previously in this list at all. Issue
     #1215 swept `harvest_activity_pauses`' array size against the same
     10,000-row headline backlog and found the claim sort spills to disk once
-    the array holds around 20 rows, roughly a tenth of the backlog depth
-    issue #1177 needed to trigger the same spill against an empty pause
-    table. Unlike queue pauses, `paused_activities` reads the whole table on
+    the array holds around 20 rows — far below the [few-hundred-thousand-row
+    depth issue #1177's own locked-scenario reproduction needed](#any-residual-predicate-defeats-sort-elision-issue-1177)
+    to trigger the same spill against an empty pause table. Unlike queue
+    pauses, `paused_activities` reads the whole table on
     every claim with no bind to keep the array small, so this exposure needs
     no unusual worker shape — pausing 20 or more activity types during a
     multi-service incident is realistic on its own. See

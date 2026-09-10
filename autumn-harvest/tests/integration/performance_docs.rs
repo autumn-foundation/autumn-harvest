@@ -1688,3 +1688,121 @@ fn known_limitations_documents_the_pause_array_size_finding() {
          the finding below about array width."
     );
 }
+
+/// The pause-array-size table must quote the committed evidence, not a
+/// number someone typed by hand and forgot to update.
+///
+/// Every earlier gate table on this page has its own cross-check against a
+/// committed source. This one had none. A reviewer of issue #1215's own fix
+/// found the two new prose-only guards above would not have caught a wrong
+/// number, only a missing one. This parses every disk-spill figure out of
+/// `docs/perf-artifacts/pause-array-size/summary.txt` and requires each one
+/// to appear in the doc.
+#[test]
+fn pause_array_size_table_matches_the_committed_summary() {
+    let doc = read_performance_doc();
+    let doc_flat = doc.replace(' ', "");
+    let summary =
+        read_normalized(&repo_root().join("docs/perf-artifacts/pause-array-size/summary.txt"));
+
+    let mut checked = 0;
+    for line in summary.lines() {
+        let Some(after) = line.split("Disk: ").nth(1) else {
+            continue;
+        };
+        let kb: String = after.chars().take_while(char::is_ascii_digit).collect();
+        assert!(
+            !kb.is_empty(),
+            "could not parse a disk-kB figure out of summary line: {line}"
+        );
+        let needle = format!("{kb}kBdisk");
+        assert!(
+            doc_flat.contains(&needle),
+            "docs/performance.md does not quote {kb}kB disk, but \
+             docs/perf-artifacts/pause-array-size/summary.txt reports it on \
+             this line: {line}. Regenerate the table from the committed \
+             summary rather than retyping figures by hand."
+        );
+        checked += 1;
+    }
+    assert!(
+        checked >= 3,
+        "expected at least 3 disk-spill lines in the committed summary \
+         (activity-pause array=20/199, queue-pause-wide array=199); parsed \
+         {checked} -- the summary format may have drifted from what this \
+         guard expects"
+    );
+}
+
+/// The "N more are present" prose must track the top predicate table's own
+/// row count, everywhere it is stated.
+///
+/// Issue #1215 added an 11th row to the top-of-file predicate table. This
+/// page states the unmeasured count twice. The PR that added the row fixed
+/// one occurrence and missed the other. That is exactly the class of drift
+/// this whole test module exists to catch, this time inside the same file.
+#[test]
+fn unmeasured_predicate_count_matches_the_top_table() {
+    let doc = read_performance_doc();
+    let start = doc
+        .find("| Predicate | Issue |")
+        .expect("the top-of-file predicate table must exist");
+    let end = doc[start..]
+        .find("\n\n")
+        .map(|off| start + off)
+        .unwrap_or(doc.len());
+    let table = &doc[start..end];
+    // Every row is a `| name | #NNN |` line; subtract the header and the
+    // `|:--|:--|` separator.
+    let row_count = table
+        .lines()
+        .filter(|l| l.trim_start().starts_with('|'))
+        .count()
+        - 2;
+
+    const MEASURED: usize = 5;
+    assert!(
+        row_count > MEASURED,
+        "the top predicate table has {row_count} rows, at or below the \
+         {MEASURED} the attribution table measures -- either the table lost \
+         rows or MEASURED needs revisiting"
+    );
+    let unmeasured = row_count - MEASURED;
+    let word = match unmeasured {
+        5 => "five",
+        6 => "six",
+        7 => "seven",
+        8 => "eight",
+        n => panic!(
+            "unmeasured predicate count is {n}; this guard only spells five \
+             through eight -- extend the word list before trusting it"
+        ),
+    };
+
+    let perf_doc = doc.clone();
+    let readme = read_normalized(&repo_root().join("README.md"));
+    for (rel, text, needle) in [
+        (
+            "docs/performance.md (opening table intro)",
+            &perf_doc,
+            format!("other {word} are present"),
+        ),
+        (
+            "docs/performance.md (Known limitations)",
+            &perf_doc,
+            format!("{word} more are present"),
+        ),
+        (
+            "README.md",
+            &readme,
+            format!("{word} more are in the query"),
+        ),
+    ] {
+        assert!(
+            text.to_lowercase().contains(&needle),
+            "{rel} must say \"{needle}\" for the unmeasured-predicate count \
+             ({row_count} total - {MEASURED} measured), matching the \
+             top-of-file predicate table's current row count."
+        );
+    }
+}

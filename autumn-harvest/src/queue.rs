@@ -866,11 +866,12 @@ pub async fn enqueue_batch(
 /// **That unbounded width has a measured cost, not only a theoretical one.**
 /// Issue #1215 found the claim sort spills to disk once
 /// `harvest_activity_pauses` holds around 20 rows, at a 10 000-row backlog.
-/// That is roughly a tenth of the backlog depth issue #1177 needed to trigger
-/// the same spill against an empty pause table. Pausing that many activity
-/// types during one incident is a realistic operator action, not an edge
-/// case. See `docs/performance.md`'s Known limitations section for the
-/// measured comparison against `paused_queues`. That page explains why no
+/// That is far below the few-hundred-thousand-row depth issue #1177's own
+/// locked-scenario reproduction needed to trigger the same spill against an
+/// empty pause table. Pausing that many activity types during one incident
+/// is a realistic operator action, not an edge case. See
+/// `docs/performance.md`'s Known limitations section for the measured
+/// comparison against `paused_queues`. That page explains why no
 /// query-shape fix is proposed here.
 ///
 /// **Both activity-name gates (`$6` and `paused_activities`) are guarded by
