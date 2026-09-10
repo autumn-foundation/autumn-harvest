@@ -7438,7 +7438,7 @@ pub async fn persist_workflow_completion(
             .await?;
             update_workflow_execution_completed(conn, exec_id, worker_id, &output).await?;
             queue::complete_task(conn, task_id, output).await?;
-            let (mut deferred, closed_children) = apply_parent_close_cascade(conn, exec_id).await?;
+            let (mut deferred, closed_children) = apply_parent_close_cascade(conn, exec_id, codecs).await?;
             let mut tx_cancel_metrics = Vec::new();
             let triggers = crate::completion_trigger::evaluate_triggers_for_execution_collecting(
                 conn,
@@ -7740,7 +7740,7 @@ pub async fn persist_workflow_failure(
                     started_by: exec_ref.started_by.as_deref(),
                 };
 
-                match crate::execution::start_or_load_workflow_execution_collect(
+                match crate::execution::start_or_load_workflow_execution_collect_with_codecs(
                     conn,
                     retry_params,
                     true,
@@ -7749,6 +7749,7 @@ pub async fn persist_workflow_failure(
                     // Workflow-level retry (#523) is in-flight continuation of an
                     // existing logical run, not a fresh admission — never gated.
                     None,
+                    codecs,
                 )
                 .await
                 {
@@ -7799,7 +7800,7 @@ pub async fn persist_workflow_failure(
 
             let mut tx_cancel_metrics = Vec::new();
             if !retry_committed {
-                let (cascade, closed_children) = apply_parent_close_cascade(conn, exec_id).await?;
+                let (cascade, closed_children) = apply_parent_close_cascade(conn, exec_id, codecs).await?;
                 deferred.extend(cascade);
                 deferred_checks.extend(closed_children);
                 let triggers =
@@ -9988,7 +9989,14 @@ async fn persist_all_started_child_workflows(
         let parent_events: Vec<WorkflowEvent> =
             all_events_by_pos.into_iter().map(|(_, e)| e).collect();
         for event in parent_events {
-            store::append_single_event(conn, parent_exec_id, event).await?;
+            // Issue #1243: `ChildWorkflowStarted.input` is payload-bearing.
+            store::append_single_event_with_codecs(
+                conn,
+                parent_exec_id,
+                event,
+                registry.payload_codecs(),
+            )
+            .await?;
         }
         create_detached_child_executions(conn, registry, parent_execution, commands, &execute_span)
             .await?;
@@ -10887,7 +10895,15 @@ async fn persist_child_timeout_race(
                 _ => None,
             });
             for event in events {
-                store::append_single_event(conn, parent_exec_id, event).await?;
+                // Issue #1243: a raced `ChildWorkflowStarted.input` is
+                // payload-bearing.
+                store::append_single_event_with_codecs(
+                    conn,
+                    parent_exec_id,
+                    event,
+                    registry.payload_codecs(),
+                )
+                .await?;
             }
 
             // Defensive: a suspension batch never carries CancelRaceLosers in
@@ -12329,6 +12345,9 @@ pub async fn wake_parent_for_child_completion(
     parent_exec_id: ExecutionId,
     child_exec_id: ExecutionId,
     output: serde_json::Value,
+    // Issue #1243: `ChildWorkflowCompleted.output` is payload-bearing, so this
+    // write encodes under the same registry replay decodes with.
+    codecs: &crate::payload_codec::PayloadCodecs,
 ) -> HarvestResult<()> {
     // Issue #956: a cross-shard parent is not on this connection. Appending to it
     // here would return `NotFound` and roll back the CHILD's terminal
@@ -12355,7 +12374,7 @@ pub async fn wake_parent_for_child_completion(
         child_id: child_exec_id,
         output,
     };
-    store::append_single_event(conn, parent_exec_id, event).await?;
+    store::append_single_event_with_codecs(conn, parent_exec_id, event, codecs).await?;
     queue::wake_workflow_task(conn, parent_exec_id).await
 }
 
@@ -12365,6 +12384,8 @@ pub async fn wake_parent_for_child_failure(
     parent_exec_id: ExecutionId,
     child_exec_id: ExecutionId,
     error: &str,
+    // Issue #1243: a typed `ChildWorkflowFailed.details` is payload-bearing.
+    codecs: &crate::payload_codec::PayloadCodecs,
 ) -> HarvestResult<()> {
     // Issue #956: same cross-shard guard as `wake_parent_for_child_completion` —
     // the parent is not on this connection, and appending here would roll back
@@ -12387,7 +12408,7 @@ pub async fn wake_parent_for_child_failure(
     // which decode to all-None typed fields (legacy behaviour preserved).
     let decoded = crate::failure::decode_workflow_failure(error);
     let event = WorkflowEvent::child_workflow_failed_typed(child_exec_id, &decoded);
-    store::append_single_event(conn, parent_exec_id, event).await?;
+    store::append_single_event_with_codecs(conn, parent_exec_id, event, codecs).await?;
     queue::wake_workflow_task(conn, parent_exec_id).await
 }
 
@@ -12427,7 +12448,7 @@ pub async fn persist_child_workflow_completion(
                 .await?;
             update_workflow_execution_completed(conn, exec_id, worker_id, &output).await?;
             queue::complete_task(conn, task_id, output.clone()).await?;
-            let (mut deferred, closed_children) = apply_parent_close_cascade(conn, exec_id).await?;
+            let (mut deferred, closed_children) = apply_parent_close_cascade(conn, exec_id, codecs).await?;
             let mut tx_cancel_metrics = Vec::new();
             let triggers = crate::completion_trigger::evaluate_triggers_for_execution_collecting(
                 conn,
@@ -12438,7 +12459,7 @@ pub async fn persist_child_workflow_completion(
             )
             .await?;
             deferred.extend(triggers);
-            wake_parent_for_child_completion(conn, parent_exec_id, exec_id, output).await?;
+            wake_parent_for_child_completion(conn, parent_exec_id, exec_id, output, codecs).await?;
             Ok((deferred, closed_children, tx_cancel_metrics))
         }))
         .await?;
@@ -12507,7 +12528,7 @@ pub async fn persist_child_workflow_failure(
             update_workflow_execution_failed(conn, exec_id, worker_id, &message, nd_details)
                 .await?;
             queue::fail_task(conn, task_id, &message).await?;
-            let (mut deferred, closed_children) = apply_parent_close_cascade(conn, exec_id).await?;
+            let (mut deferred, closed_children) = apply_parent_close_cascade(conn, exec_id, codecs).await?;
             let mut tx_cancel_metrics = Vec::new();
             let triggers = crate::completion_trigger::evaluate_triggers_for_execution_collecting(
                 conn,
@@ -12518,7 +12539,7 @@ pub async fn persist_child_workflow_failure(
             )
             .await?;
             deferred.extend(triggers);
-            wake_parent_for_child_failure(conn, parent_exec_id, exec_id, &raw_error).await?;
+            wake_parent_for_child_failure(conn, parent_exec_id, exec_id, &raw_error, codecs).await?;
             Ok((deferred, closed_children, tx_cancel_metrics))
         }))
         .await?;
@@ -18124,7 +18145,7 @@ pub async fn move_workflow_to_dlq_for_history_cap(
             // execution to RUNNING. Mirrors the poison-pill quarantine and
             // workflow-task-timeout seal paths.
             queue::fail_open_tasks_for_execution(conn, exec_id, &reason).await?;
-            let (mut deferred, closed_children) = apply_parent_close_cascade(conn, exec_id).await?;
+            let (mut deferred, closed_children) = apply_parent_close_cascade(conn, exec_id, codecs).await?;
             let mut pending_cancel_metrics = Vec::new();
             let failed_triggers =
                 crate::completion_trigger::evaluate_triggers_for_execution_collecting(
@@ -18137,7 +18158,8 @@ pub async fn move_workflow_to_dlq_for_history_cap(
                 .await?;
             deferred.extend(failed_triggers);
             if let Some(parent_exec_id) = parent_exec_id {
-                wake_parent_for_child_failure(conn, parent_exec_id, exec_id, &reason).await?;
+                wake_parent_for_child_failure(conn, parent_exec_id, exec_id, &reason, codecs)
+                    .await?;
             }
             Ok((deferred, closed_children, pending_cancel_metrics))
         }))
@@ -27745,7 +27767,7 @@ pub async fn quarantine_workflow_task_timeout(
                         .execute(conn)
                         .await;
                         let (mut deferred, closed_children) =
-                            apply_parent_close_cascade(conn, exec_id).await?;
+                            apply_parent_close_cascade(conn, exec_id, codecs).await?;
                         let mut pending_cancel_metrics = Vec::new();
                         let triggers =
                             crate::completion_trigger::evaluate_triggers_for_execution_collecting(
@@ -27770,6 +27792,7 @@ pub async fn quarantine_workflow_task_timeout(
                                 parent_exec_id,
                                 exec_id,
                                 &error_msg,
+                                codecs,
                             )
                             .await;
                         }

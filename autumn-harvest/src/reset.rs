@@ -1325,7 +1325,15 @@ async fn terminate_source_execution(
     // tables are absent (guarded).
     crate::mutex::sweep_terminal_holder_and_wake(conn, source_exec_id).await?;
 
-    let (deferred, closed_children) = apply_parent_close_cascade(conn, source_exec_id).await?;
+    // Issue #1243: this cascade's own events never carry a payload-bearing
+    // field, and the reset path has no configured registry threaded through
+    // it -- the identity registry is exact here, not a shortcut.
+    let (deferred, closed_children) = apply_parent_close_cascade(
+        conn,
+        source_exec_id,
+        &crate::store::DEFAULT_PAYLOAD_CODECS,
+    )
+    .await?;
 
     Ok((deferred, closed_children))
 }

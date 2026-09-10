@@ -606,6 +606,40 @@ pub async fn start_or_load_workflow_execution_collect(
     Vec<(ExecutionId, String)>,
     Vec<StartCancelledRun>,
 )> {
+    start_or_load_workflow_execution_collect_with_codecs(
+        conn,
+        request,
+        in_outer_transaction,
+        reject_fresh_if_debounced,
+        metrics,
+        gate,
+        &store::DEFAULT_PAYLOAD_CODECS,
+    )
+    .await
+}
+
+/// [`start_or_load_workflow_execution_collect`], encoding
+/// `WorkflowStarted.input`/`last_completion_result` through `codecs` (issue
+/// #1243) instead of the identity registry.
+///
+/// # Errors
+///
+/// Same as [`start_or_load_workflow_execution_collect`].
+#[allow(clippy::too_many_lines, clippy::too_many_arguments)]
+pub async fn start_or_load_workflow_execution_collect_with_codecs(
+    conn: &mut AsyncPgConnection,
+    request: StartWorkflowParams<'_>,
+    in_outer_transaction: bool,
+    reject_fresh_if_debounced: bool,
+    metrics: Option<&(dyn crate::telemetry::MetricsRecorder + Send + Sync)>,
+    gate: Option<crate::admission_gate::GateMode>,
+    codecs: &crate::payload_codec::PayloadCodecs,
+) -> HarvestResult<(
+    StartedWorkflowExecution,
+    Vec<DeferredTriggerStart>,
+    Vec<(ExecutionId, String)>,
+    Vec<StartCancelledRun>,
+)> {
     let exec_id = request.exec_id;
     let shard_id_value = request.shard_id();
 
@@ -1101,7 +1135,7 @@ pub async fn start_or_load_workflow_execution_collect(
                 last_error: carryover_error,
                 scheduled_time: request.scheduled_for,
             };
-            store::append_events(conn, exec_id, &[started_event], 0).await?;
+            store::append_events_with_codecs(conn, exec_id, &[started_event], 0, codecs).await?;
             queue::enqueue(conn, &enqueue).await?;
 
             // Latest-wins supersede (issue #811). Runs HERE -- inside the start
@@ -1297,6 +1331,7 @@ pub async fn start_or_load_workflow_execution_collect(
                         conn,
                         ExecutionId::from_uuid(existing.id),
                         &mut tx_deferred_checks,
+                        codecs,
                     )
                     .await?;
                     let (started_wf, mut extra_deferred) = replace_execution(
@@ -1310,6 +1345,7 @@ pub async fn start_or_load_workflow_execution_collect(
                         quota_enforcement_policy,
                         quota_key.as_deref(),
                         metrics,
+                        codecs,
                     )
                     .await?;
                     deferred.append(&mut extra_deferred);
@@ -1367,6 +1403,7 @@ pub async fn start_or_load_workflow_execution_collect(
                                 quota_enforcement_policy,
                                 quota_key.as_deref(),
                                 metrics,
+                                codecs,
                             )
                             .await?;
                             // Replacing our own terminal prior still admits a new
@@ -1420,6 +1457,7 @@ pub async fn start_or_load_workflow_execution_collect(
                         quota_enforcement_policy,
                         quota_key.as_deref(),
                         metrics,
+                        codecs,
                     )
                     .await?;
                     // Same as the two arms above: a replacement admits a new run
@@ -1518,6 +1556,22 @@ pub async fn start_or_load_workflow_execution(
     request: StartWorkflowParams<'_>,
     gate: Option<crate::admission_gate::GateMode>,
 ) -> HarvestResult<StartedWorkflowExecution> {
+    start_or_load_workflow_execution_with_codecs(conn, request, gate, &store::DEFAULT_PAYLOAD_CODECS)
+        .await
+}
+
+/// [`start_or_load_workflow_execution`], encoding `WorkflowStarted.input` /
+/// `last_completion_result` through `codecs` (issue #1243).
+///
+/// # Errors
+///
+/// Same as [`start_or_load_workflow_execution`].
+pub async fn start_or_load_workflow_execution_with_codecs(
+    conn: &mut AsyncPgConnection,
+    request: StartWorkflowParams<'_>,
+    gate: Option<crate::admission_gate::GateMode>,
+    codecs: &crate::payload_codec::PayloadCodecs,
+) -> HarvestResult<StartedWorkflowExecution> {
     // Top-level caller (`in_outer_transaction = false`): if a TerminateIfRunning
     // pre-check cancellation commits and the replacement start then fails, the
     // collect fn spawns the cancellation's follow-ups itself before returning Err.
@@ -1529,7 +1583,9 @@ pub async fn start_or_load_workflow_execution(
     // is large, and every caller of this function inlines it. An unboxed future
     // here pushes each caller over the `clippy::large_futures` threshold.
     let (collected, hints) = Box::pin(crate::dispatch::buffered(
-        start_or_load_workflow_execution_collect(conn, request, false, false, None, gate),
+        start_or_load_workflow_execution_collect_with_codecs(
+            conn, request, false, false, None, gate, codecs,
+        ),
     ))
     .await;
     let (result, deferred_starts, deferred_checks, _cancel_metrics) = collected?;
@@ -1549,10 +1605,36 @@ pub async fn start_or_load_workflow_execution_with_metrics(
     metrics: Option<&(dyn crate::telemetry::MetricsRecorder + Send + Sync)>,
     gate: Option<crate::admission_gate::GateMode>,
 ) -> HarvestResult<StartedWorkflowExecution> {
+    start_or_load_workflow_execution_with_metrics_and_codecs(
+        conn,
+        request,
+        metrics,
+        gate,
+        &store::DEFAULT_PAYLOAD_CODECS,
+    )
+    .await
+}
+
+/// [`start_or_load_workflow_execution_with_metrics`], encoding
+/// `WorkflowStarted.input` / `last_completion_result` through `codecs` (issue
+/// #1243).
+///
+/// # Errors
+///
+/// Same as [`start_or_load_workflow_execution_with_metrics`].
+pub async fn start_or_load_workflow_execution_with_metrics_and_codecs(
+    conn: &mut AsyncPgConnection,
+    request: StartWorkflowParams<'_>,
+    metrics: Option<&(dyn crate::telemetry::MetricsRecorder + Send + Sync)>,
+    gate: Option<crate::admission_gate::GateMode>,
+    codecs: &crate::payload_codec::PayloadCodecs,
+) -> HarvestResult<StartedWorkflowExecution> {
     // Same post-commit publish as `start_or_load_workflow_execution`.
     // `Box::pin` for the same reason as the call above.
     let (collected, hints) = Box::pin(crate::dispatch::buffered(
-        start_or_load_workflow_execution_collect(conn, request, false, false, metrics, gate),
+        start_or_load_workflow_execution_collect_with_codecs(
+            conn, request, false, false, metrics, gate, codecs,
+        ),
     ))
     .await;
     let (result, deferred_starts, deferred_checks, cancel_metrics) = collected?;
@@ -1620,6 +1702,35 @@ pub async fn start_or_load_workflow_execution_idempotent(
     metrics: Option<&(dyn crate::telemetry::MetricsRecorder + Send + Sync)>,
     gate: Option<crate::admission_gate::GateMode>,
 ) -> HarvestResult<IdempotentStartOutcome> {
+    start_or_load_workflow_execution_idempotent_with_codecs(
+        conn,
+        request,
+        idempotency_key,
+        window_secs,
+        metrics,
+        gate,
+        &store::DEFAULT_PAYLOAD_CODECS,
+    )
+    .await
+}
+
+/// [`start_or_load_workflow_execution_idempotent`], encoding
+/// `WorkflowStarted.input` / `last_completion_result` through `codecs` (issue
+/// #1243).
+///
+/// # Errors
+///
+/// Same as [`start_or_load_workflow_execution_idempotent`].
+#[allow(clippy::too_many_arguments)]
+pub async fn start_or_load_workflow_execution_idempotent_with_codecs(
+    conn: &mut AsyncPgConnection,
+    request: StartWorkflowParams<'_>,
+    idempotency_key: &str,
+    window_secs: f64,
+    metrics: Option<&(dyn crate::telemetry::MetricsRecorder + Send + Sync)>,
+    gate: Option<crate::admission_gate::GateMode>,
+    codecs: &crate::payload_codec::PayloadCodecs,
+) -> HarvestResult<IdempotentStartOutcome> {
     let new_exec_id = request.exec_id;
     let shard_id = request.shard_id();
 
@@ -1658,8 +1769,8 @@ pub async fn start_or_load_workflow_execution_idempotent(
                 )),
                 crate::start_idempotency::StartIdempotencyReservation::Reserved => {
                     let workflow_name = request.workflow_name;
-                    let (started, ds, dc, cm) = start_or_load_workflow_execution_collect(
-                        conn, request, true, false, metrics, gate,
+                    let (started, ds, dc, cm) = start_or_load_workflow_execution_collect_with_codecs(
+                        conn, request, true, false, metrics, gate, codecs,
                     )
                     .await?;
                     // The reserve wrote the claim pointing at `new_exec_id`.
@@ -2322,6 +2433,9 @@ async fn replace_execution(
     quota_policy: Option<crate::quota::QuotaPolicy>,
     quota_key: Option<&str>,
     metrics: Option<&(dyn crate::telemetry::MetricsRecorder + Send + Sync)>,
+    // Issue #1243: `WorkflowStarted.input`/`last_completion_result` are
+    // payload-bearing, so this write encodes under the configured registry.
+    codecs: &crate::payload_codec::PayloadCodecs,
 ) -> HarvestResult<(StartedWorkflowExecution, Vec<DeferredTriggerStart>)> {
     if request.start_at.is_some_and(|sa| sa < now) {
         return Err(HarvestError::Config(
@@ -2403,7 +2517,7 @@ async fn replace_execution(
         last_error: carryover_error,
         scheduled_time: request.scheduled_for,
     };
-    store::append_events(conn, new_exec_id, &[started_event], 0).await?;
+    store::append_events_with_codecs(conn, new_exec_id, &[started_event], 0, codecs).await?;
     queue::enqueue(conn, enqueue).await?;
 
     Ok((
@@ -2420,17 +2534,22 @@ async fn inline_cancel(
     conn: &mut AsyncPgConnection,
     exec_id: ExecutionId,
     deferred_checks: &mut Vec<(ExecutionId, String)>,
+    // Issue #1243: `WorkflowCancelled.reason` is a plain string, never a
+    // payload-bearing field, but every write takes the configured registry
+    // uniformly so no site needs a payload/no-payload judgement call.
+    codecs: &crate::payload_codec::PayloadCodecs,
 ) -> HarvestResult<Vec<DeferredTriggerStart>> {
     let reason = "terminated to start new execution";
     // Undecoded: this reads `next_event_id` only (see the loader's docs).
     let history = store::load_history_undecoded(conn, exec_id).await?;
-    store::append_events(
+    store::append_events_with_codecs(
         conn,
         exec_id,
         &[WorkflowEvent::WorkflowCancelled {
             reason: reason.to_string(),
         }],
         history.next_event_id,
+        codecs,
     )
     .await?;
     diesel::update(harvest_workflow_executions::table.find(exec_id.as_uuid()))
@@ -2450,7 +2569,7 @@ async fn inline_cancel(
     queue::fail_open_tasks_for_execution(conn, exec_id, &format!("workflow cancelled: {reason}"))
         .await?;
     let (mut deferred, closed_children) =
-        Box::pin(apply_parent_close_cascade(conn, exec_id)).await?;
+        Box::pin(apply_parent_close_cascade(conn, exec_id, codecs)).await?;
     // issue #1197, item 1: this path never threads a metrics recorder, so the
     // plain wrapper's own throwaway collector is already correct here — no
     // collecting variant needed (there is nothing to collect).
@@ -2522,6 +2641,10 @@ async fn notify_awaited_parent_of_child_terminal(
     child_exec_id: ExecutionId,
     execution: &WorkflowExecution,
     error: String,
+    // Issue #1243: `error` here is always the engine's own untyped reason
+    // string, never a payload field, but every `append_single_event` call
+    // site takes the configured registry uniformly.
+    codecs: &crate::payload_codec::PayloadCodecs,
 ) -> HarvestResult<()> {
     if let Some(parent_uuid) = execution.parent_id
         && execution.parent_close_policy.is_none()
@@ -2558,10 +2681,11 @@ async fn notify_awaited_parent_of_child_terminal(
             // `TimerFired` under the same parent-row MAX(event_id) discipline as
             // the child terminal below, so the deadline is ordered first.
             crate::worker::materialize_due_child_timeout_deadlines(conn, parent_exec_id).await?;
-            store::append_single_event(
+            store::append_single_event_with_codecs(
                 conn,
                 parent_exec_id,
                 WorkflowEvent::child_workflow_failed(child_exec_id, error),
+                codecs,
             )
             .await?;
             queue::wake_workflow_task(conn, parent_exec_id).await?;
@@ -2741,14 +2865,26 @@ pub async fn cancel_workflow_execution_collect(
             let total_failed_or_deleted = deleted_pending + failed_task_count;
             // Wake a parent blocked on this child's await (#787): cancelling
             // an awaited child out-of-band must surface to the parent.
+            // Issue #1243: neither write below carries a payload-bearing
+            // field (a plain reason string and a cascade bookkeeping event),
+            // and `cancel_workflow_execution_collect` is a public entry point
+            // with no configured registry threaded through its many external
+            // callers -- the identity registry is exact here, not a
+            // shortcut.
             notify_awaited_parent_of_child_terminal(
                 conn,
                 exec_id,
                 &execution,
                 format!("child workflow cancelled: {reason}"),
+                &crate::store::DEFAULT_PAYLOAD_CODECS,
             )
             .await?;
-            let (mut deferred, closed_children) = apply_parent_close_cascade(conn, exec_id).await?;
+            let (mut deferred, closed_children) = apply_parent_close_cascade(
+                conn,
+                exec_id,
+                &crate::store::DEFAULT_PAYLOAD_CODECS,
+            )
+            .await?;
             // issue #1197, item 1: this evaluation's own supersede/cancel
             // metrics are still discarded by the plain wrapper's throwaway
             // collector (this transaction is a nested SAVEPOINT from the
@@ -4184,6 +4320,10 @@ pub(crate) async fn parent_close_cascade_event_count(
 pub(crate) async fn apply_parent_close_cascade(
     conn: &mut AsyncPgConnection,
     parent_exec_id: ExecutionId,
+    // Issue #1243: none of this cascade's own events carry a payload-bearing
+    // field, but every `append_single_event` call site takes the configured
+    // registry uniformly, so no site needs a payload/no-payload judgement call.
+    codecs: &crate::payload_codec::PayloadCodecs,
 ) -> HarvestResult<(Vec<DeferredTriggerStart>, Vec<(ExecutionId, String)>)> {
     use crate::store;
 
@@ -4225,6 +4365,7 @@ pub(crate) async fn apply_parent_close_cascade(
                     child_exec_id,
                     &child_workflow_name,
                     "parent closed",
+                    codecs,
                 )
                 .await?;
                 (success.then_some("request_cancel"), d, c)
@@ -4235,6 +4376,7 @@ pub(crate) async fn apply_parent_close_cascade(
                     child_exec_id,
                     &child_workflow_name,
                     "ParentClosed",
+                    codecs,
                 )
                 .await?;
                 (success.then_some("terminate"), d, c)
@@ -4248,7 +4390,7 @@ pub(crate) async fn apply_parent_close_cascade(
         deferred.append(&mut child_deferred);
         closed_children.append(&mut child_closed);
 
-        store::append_single_event(
+        store::append_single_event_with_codecs(
             conn,
             parent_exec_id,
             crate::event::WorkflowEvent::ChildWorkflowCascadeApplied {
@@ -4256,6 +4398,7 @@ pub(crate) async fn apply_parent_close_cascade(
                 policy,
                 action: action_str.to_string(),
             },
+            codecs,
         )
         .await?;
     }
@@ -4268,6 +4411,7 @@ async fn cascade_cancel_detached_child(
     exec_id: ExecutionId,
     workflow_name: &str,
     reason: &str,
+    codecs: &crate::payload_codec::PayloadCodecs,
 ) -> HarvestResult<(bool, Vec<DeferredTriggerStart>, Vec<(ExecutionId, String)>)> {
     let mut deferred_starts = Vec::new();
     let mut closed_executions = Vec::new();
@@ -4292,12 +4436,13 @@ async fn cascade_cancel_detached_child(
     }
     closed_executions.push((exec_id, workflow_name.to_string()));
 
-    store::append_single_event(
+    store::append_single_event_with_codecs(
         conn,
         exec_id,
         WorkflowEvent::WorkflowCancelled {
             reason: reason.to_string(),
         },
+        codecs,
     )
     .await?;
     queue::fail_open_tasks_for_execution(
@@ -4307,7 +4452,7 @@ async fn cascade_cancel_detached_child(
     )
     .await?;
     let (mut child_deferred, mut child_closed) =
-        Box::pin(apply_parent_close_cascade(conn, exec_id)).await?;
+        Box::pin(apply_parent_close_cascade(conn, exec_id, codecs)).await?;
     deferred_starts.append(&mut child_deferred);
     closed_executions.append(&mut child_closed);
 
@@ -4329,6 +4474,7 @@ async fn cascade_terminate_detached_child(
     exec_id: ExecutionId,
     workflow_name: &str,
     reason: &str,
+    codecs: &crate::payload_codec::PayloadCodecs,
 ) -> HarvestResult<(bool, Vec<DeferredTriggerStart>, Vec<(ExecutionId, String)>)> {
     let mut deferred_starts = Vec::new();
     let mut closed_executions = Vec::new();
@@ -4353,10 +4499,11 @@ async fn cascade_terminate_detached_child(
     }
     closed_executions.push((exec_id, workflow_name.to_string()));
 
-    store::append_single_event(
+    store::append_single_event_with_codecs(
         conn,
         exec_id,
         WorkflowEvent::workflow_failed(reason.to_string()),
+        codecs,
     )
     .await?;
     queue::fail_open_tasks_for_execution(
@@ -4366,7 +4513,7 @@ async fn cascade_terminate_detached_child(
     )
     .await?;
     let (mut child_deferred, mut child_closed) =
-        Box::pin(apply_parent_close_cascade(conn, exec_id)).await?;
+        Box::pin(apply_parent_close_cascade(conn, exec_id, codecs)).await?;
     deferred_starts.append(&mut child_deferred);
     closed_executions.append(&mut child_closed);
 
@@ -4510,14 +4657,24 @@ pub async fn terminate_workflow_execution_collect(
             // Wake a parent blocked on this child's await (#787):
             // force-terminating an awaited child out-of-band must surface
             // to the parent so it does not park forever.
+            // Issue #1243: same identity-registry rationale as
+            // `cancel_workflow_execution_collect` above -- neither write
+            // carries a payload-bearing field, and this public entry point
+            // has no configured registry threaded through it.
             notify_awaited_parent_of_child_terminal(
                 conn,
                 exec_id,
                 &execution,
                 format!("child workflow terminated: {reason}"),
+                &crate::store::DEFAULT_PAYLOAD_CODECS,
             )
             .await?;
-            let (mut deferred, closed_children) = apply_parent_close_cascade(conn, exec_id).await?;
+            let (mut deferred, closed_children) = apply_parent_close_cascade(
+                conn,
+                exec_id,
+                &crate::store::DEFAULT_PAYLOAD_CODECS,
+            )
+            .await?;
             // Force-terminate fires `Terminated` completion triggers, NOT
             // `Cancelled` — a force-kill is distinct from a cooperative
             // cancellation downstream (issue #504). Operators opt into
@@ -5162,6 +5319,30 @@ pub async fn signal_with_start_workflow_execution_with_metrics(
     conn: &mut AsyncPgConnection,
     request: SignalWithStartParams<'_>,
     metrics: Option<&(dyn crate::telemetry::MetricsRecorder + Send + Sync)>,
+    gate: Option<crate::admission_gate::GateMode>,
+) -> HarvestResult<SignalWithStartOutcome> {
+    signal_with_start_workflow_execution_with_metrics_and_codecs(
+        conn,
+        request,
+        metrics,
+        gate,
+        &store::DEFAULT_PAYLOAD_CODECS,
+    )
+    .await
+}
+
+/// [`signal_with_start_workflow_execution_with_metrics`], encoding
+/// `WorkflowStarted.input` / `last_completion_result` through `codecs` (issue
+/// #1243).
+///
+/// # Errors
+///
+/// Same as [`signal_with_start_workflow_execution_with_metrics`].
+#[allow(clippy::too_many_lines, clippy::too_many_arguments)]
+pub async fn signal_with_start_workflow_execution_with_metrics_and_codecs(
+    conn: &mut AsyncPgConnection,
+    request: SignalWithStartParams<'_>,
+    metrics: Option<&(dyn crate::telemetry::MetricsRecorder + Send + Sync)>,
     // Admission gate (issue #618, PR #1014). Threaded into the fresh-create start
     // calls below so a signal-with-start that CREATES a new execution is gated
     // AUTHORITATIVELY under the primitive's `FOR UPDATE` lock — closing the
@@ -5172,6 +5353,7 @@ pub async fn signal_with_start_workflow_execution_with_metrics(
     // The `reject_fresh_if_debounced` branch stays `None` — debounce owns its own
     // admission (bypass-counted scanner relay).
     gate: Option<crate::admission_gate::GateMode>,
+    codecs: &crate::payload_codec::PayloadCodecs,
 ) -> HarvestResult<SignalWithStartOutcome> {
     // Single outer transaction: pre-cancel + start (or attach) + signal insert commit
     // atomically. Inner conn.transaction calls become savepoints under this wrapper.
@@ -5333,13 +5515,14 @@ pub async fn signal_with_start_workflow_execution_with_metrics(
             // its deferred list is empty and spawned defensively.
             let started = if request.reject_fresh_if_debounced {
                 let (s, mut deferred, mut checks, mut metrics_list) =
-                    start_or_load_workflow_execution_collect(
+                    start_or_load_workflow_execution_collect_with_codecs(
                         conn,
                         build_start_request(request.exec_id, effective_policy),
                         true,
                         true,
                         metrics,
                         None,
+                        codecs,
                     )
                     .await?;
                 deferred_starts.append(&mut deferred);
@@ -5348,13 +5531,14 @@ pub async fn signal_with_start_workflow_execution_with_metrics(
                 s
             } else {
                 let (s, mut deferred, mut checks, mut metrics_list) =
-                    start_or_load_workflow_execution_collect(
+                    start_or_load_workflow_execution_collect_with_codecs(
                         conn,
                         build_start_request(request.exec_id, effective_policy),
                         true,
                         false,
                         metrics,
                         gate,
+                        codecs,
                     )
                     .await?;
                 deferred_starts.append(&mut deferred);
@@ -5398,7 +5582,7 @@ pub async fn signal_with_start_workflow_execution_with_metrics(
                 ) {
                 let fresh_exec_id = ExecutionId::new_for_shard(started.exec_id.shard());
                 let (fresh, mut deferred, mut checks, mut metrics_list) =
-                    start_or_load_workflow_execution_collect(
+                    start_or_load_workflow_execution_collect_with_codecs(
                         conn,
                         build_start_request(
                             fresh_exec_id,
@@ -5408,6 +5592,7 @@ pub async fn signal_with_start_workflow_execution_with_metrics(
                         false,
                         metrics,
                         gate,
+                        codecs,
                     )
                     .await?;
                 deferred_starts.append(&mut deferred);
@@ -6412,6 +6597,30 @@ pub async fn update_with_start_workflow_execution_with_metrics(
     conn: &mut AsyncPgConnection,
     request: UpdateWithStartParams<'_>,
     metrics: Option<&(dyn crate::telemetry::MetricsRecorder + Send + Sync)>,
+    gate: Option<crate::admission_gate::GateMode>,
+) -> HarvestResult<UpdateWithStartOutcome> {
+    update_with_start_workflow_execution_with_metrics_and_codecs(
+        conn,
+        request,
+        metrics,
+        gate,
+        &store::DEFAULT_PAYLOAD_CODECS,
+    )
+    .await
+}
+
+/// [`update_with_start_workflow_execution_with_metrics`], encoding
+/// `WorkflowStarted.input` / `last_completion_result` through `codecs` (issue
+/// #1243).
+///
+/// # Errors
+///
+/// Same as [`update_with_start_workflow_execution_with_metrics`].
+#[allow(clippy::too_many_lines, clippy::too_many_arguments)]
+pub async fn update_with_start_workflow_execution_with_metrics_and_codecs(
+    conn: &mut AsyncPgConnection,
+    request: UpdateWithStartParams<'_>,
+    metrics: Option<&(dyn crate::telemetry::MetricsRecorder + Send + Sync)>,
     // Admission gate (issue #618, PR #1014) — see the sibling doc on
     // `signal_with_start_workflow_execution_with_metrics`. Threaded into the
     // fresh-create start calls so an update-with-start that CREATES is gated
@@ -6419,6 +6628,7 @@ pub async fn update_with_start_workflow_execution_with_metrics(
     // `Some(GateMode::Check)`, continuation/example callers pass `None`, and the
     // `reject_fresh_if_debounced` branch stays `None`.
     gate: Option<crate::admission_gate::GateMode>,
+    codecs: &crate::payload_codec::PayloadCodecs,
 ) -> HarvestResult<UpdateWithStartOutcome> {
     // Capture the queue for the post-commit update.admitted metric (issue #684)
     // before `request` is moved into the transaction closure. The update name is
@@ -6544,13 +6754,14 @@ pub async fn update_with_start_workflow_execution_with_metrics(
             // the rejection (issue #499). Attach returns the existing live run.
             let started = if request.reject_fresh_if_debounced {
                 let (s, mut deferred, mut checks, mut metrics_list) =
-                    start_or_load_workflow_execution_collect(
+                    start_or_load_workflow_execution_collect_with_codecs(
                         conn,
                         build_start_request(request.exec_id, effective_policy),
                         true,
                         true,
                         metrics,
                         None,
+                        codecs,
                     )
                     .await?;
                 deferred_starts.append(&mut deferred);
@@ -6559,13 +6770,14 @@ pub async fn update_with_start_workflow_execution_with_metrics(
                 s
             } else {
                 let (s, mut deferred, mut checks, mut metrics_list) =
-                    start_or_load_workflow_execution_collect(
+                    start_or_load_workflow_execution_collect_with_codecs(
                         conn,
                         build_start_request(request.exec_id, effective_policy),
                         true,
                         false,
                         metrics,
                         gate,
+                        codecs,
                     )
                     .await?;
                 deferred_starts.append(&mut deferred);
@@ -6600,7 +6812,7 @@ pub async fn update_with_start_workflow_execution_with_metrics(
                 ) {
                 let fresh_exec_id = ExecutionId::new_for_shard(started.exec_id.shard());
                 let (fresh, mut deferred, mut checks, mut metrics_list) =
-                    start_or_load_workflow_execution_collect(
+                    start_or_load_workflow_execution_collect_with_codecs(
                         conn,
                         build_start_request(
                             fresh_exec_id,
@@ -6610,6 +6822,7 @@ pub async fn update_with_start_workflow_execution_with_metrics(
                         false,
                         metrics,
                         gate,
+                        codecs,
                     )
                     .await?;
                 deferred_starts.append(&mut deferred);

@@ -1007,7 +1007,17 @@ async fn commit_workflow_execution_timeout(
             .await?;
         }
 
-        let (mut deferred, closed_children) = apply_parent_close_cascade(conn, exec_id).await?;
+        // Issue #1243: neither this cascade nor `timeout_event`
+        // (`WorkflowExecutionTimedOut`) carries a payload-bearing field, and
+        // `enforce_workflow_execution_timeouts` has no configured registry
+        // threaded through its many test call sites -- identity is exact
+        // here, not a shortcut.
+        let (mut deferred, closed_children) = apply_parent_close_cascade(
+            conn,
+            exec_id,
+            &crate::store::DEFAULT_PAYLOAD_CODECS,
+        )
+        .await?;
         let mut pending_cancel_metrics = Vec::new();
         let triggers = crate::completion_trigger::evaluate_triggers_for_execution_collecting(
             conn,
@@ -1726,7 +1736,8 @@ async fn enforce_workflow_timeout(
         .await?;
         update_workflow_execution_timed_out(conn, exec_id, &error).await?;
         queue::fail_task(conn, task.id, &error).await?;
-        let (mut deferred, closed_children) = apply_parent_close_cascade(conn, exec_id).await?;
+        let (mut deferred, closed_children) =
+            apply_parent_close_cascade(conn, exec_id, codecs).await?;
         let mut pending_cancel_metrics = Vec::new();
         let triggers = crate::completion_trigger::evaluate_triggers_for_execution_collecting(
             conn,
@@ -4280,15 +4291,30 @@ pub async fn enforce_timeouts_once(
         metrics,
     )
     .await?;
-    count +=
-        crate::debounce::fire_due_debounced_starts(conn, sharded_pool, shard_assignments, metrics)
-            .await?;
-    count +=
-        crate::throttle::fire_due_throttled_starts(conn, sharded_pool, shard_assignments, metrics)
-            .await?;
-    count +=
-        crate::event_batch::fire_due_event_batches(conn, sharded_pool, shard_assignments, metrics)
-            .await?;
+    count += crate::debounce::fire_due_debounced_starts_with_codecs(
+        conn,
+        sharded_pool,
+        shard_assignments,
+        metrics,
+        payload_codecs,
+    )
+    .await?;
+    count += crate::throttle::fire_due_throttled_starts_with_codecs(
+        conn,
+        sharded_pool,
+        shard_assignments,
+        metrics,
+        payload_codecs,
+    )
+    .await?;
+    count += crate::event_batch::fire_due_event_batches_with_codecs(
+        conn,
+        sharded_pool,
+        shard_assignments,
+        metrics,
+        payload_codecs,
+    )
+    .await?;
     count += crate::completion_callback::fire_due_completion_deliveries(
         conn,
         sharded_pool,
@@ -4296,7 +4322,7 @@ pub async fn enforce_timeouts_once(
     )
     .await?;
     if let Some(ceiling) = max_workflow_history_events {
-        count += enforce_workflow_history_ceiling(conn, ceiling, metrics).await?;
+        count += enforce_workflow_history_ceiling(conn, ceiling, metrics, payload_codecs).await?;
     }
     count +=
         crate::sessions::enforce_broken_sessions(conn, session_worker_stale_secs, payload_codecs)
@@ -4571,6 +4597,8 @@ pub async fn enforce_workflow_history_ceiling(
     conn: &mut AsyncPgConnection,
     ceiling: u64,
     metrics: &(dyn MetricsRecorder + Send + Sync),
+    // Issue #1243: threaded to `apply_parent_close_cascade` below.
+    codecs: &crate::payload_codec::PayloadCodecs,
 ) -> HarvestResult<usize> {
     use diesel::sql_types::{BigInt, Nullable, Text, Uuid as SqlUuid};
 
@@ -4687,7 +4715,7 @@ pub async fn enforce_workflow_history_ceiling(
                 }
 
                 let (mut deferred, closed_children) =
-                    apply_parent_close_cascade(conn, exec_id).await?;
+                    apply_parent_close_cascade(conn, exec_id, codecs).await?;
                 let mut pending_cancel_metrics = Vec::new();
                 let triggers =
                     crate::completion_trigger::evaluate_triggers_for_execution_collecting(

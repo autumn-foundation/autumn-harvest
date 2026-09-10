@@ -126,6 +126,27 @@ pub async fn admit_batched_start(
         Vec<crate::completion_trigger::DeferredTriggerStart>,
     )>,
 > {
+    admit_batched_start_with_codecs(conn, params, metrics, &crate::store::DEFAULT_PAYLOAD_CODECS).await
+}
+
+/// [`admit_batched_start`], encoding a flushed `WorkflowStarted.input` through
+/// `codecs` (issue #1243).
+///
+/// # Errors
+///
+/// Same as [`admit_batched_start`].
+#[cfg(feature = "db")]
+pub async fn admit_batched_start_with_codecs(
+    conn: &mut AsyncPgConnection,
+    params: AdmitBatchParams,
+    metrics: Option<&(dyn crate::telemetry::MetricsRecorder + Send + Sync)>,
+    codecs: &crate::payload_codec::PayloadCodecs,
+) -> HarvestResult<
+    Option<(
+        BatchAdmitOutcome,
+        Vec<crate::completion_trigger::DeferredTriggerStart>,
+    )>,
+> {
     use diesel_async::AsyncConnection;
 
     if params.batch_key.len() > 1024 {
@@ -326,8 +347,8 @@ pub async fn admit_batched_start(
                     };
 
                     let (started, deferred_starts, deferred_checks, cancel_metrics) =
-                        crate::execution::start_or_load_workflow_execution_collect(
-                            conn, params, true, false, None, None,
+                        crate::execution::start_or_load_workflow_execution_collect_with_codecs(
+                            conn, params, true, false, None, None, codecs,
                         )
                         .await?;
 
@@ -440,6 +461,7 @@ async fn fire_due_on_conn(
     conn: &mut diesel_async::AsyncPgConnection,
     shard_id: Option<i32>,
     metrics: Option<&(dyn crate::telemetry::MetricsRecorder + Send + Sync)>,
+    codecs: &crate::payload_codec::PayloadCodecs,
 ) -> HarvestResult<(
     Vec<String>,
     Vec<crate::completion_trigger::DeferredTriggerStart>,
@@ -511,7 +533,7 @@ async fn fire_due_on_conn(
             };
 
             if let Some(row) = due_rows.into_iter().next() {
-                match fire_claimed_batch_row(conn, row).await {
+                match fire_claimed_batch_row(conn, row, codecs).await {
                     Ok(Some((exec_id, deferred, checks, cancel_metrics))) => {
                         Ok(Some((exec_id, deferred, checks, cancel_metrics)))
                     }
@@ -555,6 +577,7 @@ async fn fire_due_on_conn(
 async fn fire_claimed_batch_row(
     conn: &mut diesel_async::AsyncPgConnection,
     row: FireDueBatchRow,
+    codecs: &crate::payload_codec::PayloadCodecs,
 ) -> HarvestResult<
     Option<(
         String,
@@ -654,8 +677,8 @@ async fn fire_claimed_batch_row(
         started_by: batch_started_by.as_deref(),
     };
 
-    let start_res = crate::execution::start_or_load_workflow_execution_collect(
-        conn, params, true, false, None, None,
+    let start_res = crate::execution::start_or_load_workflow_execution_collect_with_codecs(
+        conn, params, true, false, None, None, codecs,
     )
     .await;
 
@@ -776,6 +799,29 @@ pub async fn fire_due_event_batches(
     shard_assignments: &[crate::types::ShardId],
     metrics: &(dyn crate::telemetry::MetricsRecorder + Send + Sync),
 ) -> HarvestResult<usize> {
+    fire_due_event_batches_with_codecs(
+        conn,
+        sharded_pool,
+        shard_assignments,
+        metrics,
+        &crate::store::DEFAULT_PAYLOAD_CODECS,
+    )
+    .await
+}
+
+/// [`fire_due_event_batches`], encoding a flushed `WorkflowStarted.input`
+/// through `codecs` (issue #1243).
+///
+/// # Errors
+///
+/// Same as [`fire_due_event_batches`].
+pub async fn fire_due_event_batches_with_codecs(
+    conn: &mut diesel_async::AsyncPgConnection,
+    sharded_pool: &Option<crate::shard::ShardedDbPool>,
+    shard_assignments: &[crate::types::ShardId],
+    metrics: &(dyn crate::telemetry::MetricsRecorder + Send + Sync),
+    codecs: &crate::payload_codec::PayloadCodecs,
+) -> HarvestResult<usize> {
     let mut fired_count = 0usize;
     let mut deferred_to_spawn = Vec::new();
 
@@ -786,15 +832,19 @@ pub async fn fire_due_event_batches(
                     .get()
                     .await
                     .map_err(|e| crate::error::HarvestError::Database(e.to_string()))?;
-                let (fired, deferred) =
-                    fire_due_on_conn(&mut shard_conn, Some(shard_id.as_i32()), Some(metrics))
-                        .await?;
+                let (fired, deferred) = fire_due_on_conn(
+                    &mut shard_conn,
+                    Some(shard_id.as_i32()),
+                    Some(metrics),
+                    codecs,
+                )
+                .await?;
                 fired_count += fired.len();
                 deferred_to_spawn.extend(deferred);
             }
         }
     } else {
-        let (fired, deferred) = fire_due_on_conn(conn, None, Some(metrics)).await?;
+        let (fired, deferred) = fire_due_on_conn(conn, None, Some(metrics), codecs).await?;
         fired_count += fired.len();
         deferred_to_spawn.extend(deferred);
     }

@@ -146,9 +146,14 @@ async fn enforce_workflow_history_ceiling_terminates_only_oversized_running_rows
         .await
         .expect("mark control row COMPLETED");
 
-    enforce_workflow_history_ceiling(&mut conn, FUNCTIONAL_TEST_CEILING as u64, &NoOpMetrics)
-        .await
-        .expect("scanner run");
+    enforce_workflow_history_ceiling(
+        &mut conn,
+        FUNCTIONAL_TEST_CEILING as u64,
+        &NoOpMetrics,
+        &autumn_harvest::payload_codec::PayloadCodecs::default(),
+    )
+    .await
+    .expect("scanner run");
 
     let over = load_state(&mut conn, over_id).await;
     assert_eq!(over.state, "FAILED", "over-ceiling RUNNING row must FAIL");

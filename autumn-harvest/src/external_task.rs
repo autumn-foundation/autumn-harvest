@@ -313,6 +313,8 @@ pub async fn complete_externally(
     conn: &mut AsyncPgConnection,
     token: ExternalActivityToken,
     output: serde_json::Value,
+    // Issue #1243: `ActivityCompletedExternally.output` is payload-bearing.
+    codecs: &crate::payload_codec::PayloadCodecs,
 ) -> HarvestResult<bool> {
     // The wake below re-pends a parked workflow task, so it raises a dispatch
     // hint (issue #1312). The buffering scope holds the hint until this
@@ -343,7 +345,7 @@ pub async fn complete_externally(
                 token,
                 output,
             };
-            store::append_single_event(conn, exec_id, event).await?;
+            store::append_single_event_with_codecs(conn, exec_id, event, codecs).await?;
             crate::queue::wake_workflow_task(conn, exec_id).await?;
 
             Ok(true)

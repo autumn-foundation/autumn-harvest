@@ -702,6 +702,105 @@ async fn replay_fidelity_is_byte_identical_across_a_sweep() {
     );
 }
 
+// ── issue #1243: the production start path must honor a builder-configured
+// codec, not the identity default ────────────────────────────────────────────
+
+#[tokio::test]
+async fn a_builder_configured_codec_encrypts_the_start_input_and_replay_round_trips_it() {
+    // Drives the real production start entry point
+    // (`execution::start_or_load_workflow_execution_collect_with_codecs`) with a
+    // codec configured the way an embedder actually configures one --
+    // `HarvestBuilder::payload_codec_key` -- rather than calling
+    // `store::append_events_with_codecs` directly as the other tests in this
+    // file do. `WorkflowStarted.input` is the first event of every execution;
+    // before issue #1243 it always went through the identity registry.
+    let (url, _c) = setup_isolated_db().await;
+    let mut conn = connect(&url).await;
+
+    let builder = autumn_harvest::HarvestBuilder::new().payload_codec_key("k1", XorCodec(0x11));
+    let codecs = builder.payload_codecs().clone();
+
+    let exec_id = ExecutionId::new();
+    let params = autumn_harvest::execution::StartWorkflowParams {
+        workflow_name: "codec_boundary_wf",
+        workflow_id: "codec-boundary-1",
+        exec_id,
+        input: json!({"ssn": "111-22-3333"}),
+        parent_id: None,
+        queue_name: "default",
+        execution_timeout: None,
+        memo: None,
+        search_attrs: None,
+        reuse_policy: autumn_harvest::types::WorkflowIdReusePolicy::AllowDuplicate,
+        conflict_policy: autumn_harvest::types::WorkflowIdConflictPolicy::Unspecified,
+        trace_context: None,
+        max_execution_timeout_ceiling: None,
+        chain_execution_timeout: None,
+        max_workflow_chain_timeout_ceiling: None,
+        inherited_chain_deadline_at: None,
+        concurrency_key: None,
+        concurrency_limit: None,
+        concurrency_on_conflict: autumn_harvest::concurrency::ConcurrencyOnConflict::Defer,
+        priority: autumn_harvest::types::Priority::default(),
+        max_workflow_input_bytes: 0,
+        start_at: None,
+        delay: None,
+        max_workflow_start_delay: None,
+        owner: None,
+        runbook_url: None,
+        severity: None,
+        context_headers: None,
+        sla: None,
+        schedule_id: None,
+        scheduled_for: None,
+        workflow_attempt: 1,
+        workflow_retry_policy: None,
+        retry_of_exec_id: None,
+        max_workflow_attempts_ceiling: None,
+        origin: None,
+        completion_callbacks: None,
+        start_source: autumn_harvest::StartSource::Api,
+        start_source_ref: None,
+        started_by: None,
+    };
+
+    autumn_harvest::execution::start_or_load_workflow_execution_collect_with_codecs(
+        &mut conn, params, false, false, None, None, &codecs,
+    )
+    .await
+    .expect("start with a configured codec");
+
+    // Ciphertext on disk: the raw row must carry a keyed envelope, not plaintext.
+    let raw = raw_event_data(&mut conn, exec_id).await;
+    assert_eq!(
+        kid_of(&raw[0], "input"),
+        Some("k1".to_string()),
+        "WorkflowStarted.input must be a keyed codec envelope on disk: {:?}",
+        raw[0]
+    );
+
+    // Replay round-trips: decoding through the same registry recovers the input.
+    let history = store::load_history_with_codecs(&mut conn, exec_id, &codecs)
+        .await
+        .expect("load history");
+    match &history.events[0] {
+        WorkflowEvent::WorkflowStarted { input, .. } => {
+            assert_eq!(*input, json!({"ssn": "111-22-3333"}));
+        }
+        other => panic!("unexpected event: {other:?}"),
+    }
+    let report = WorkflowReplayer::new()
+        .register_fn("codec_boundary_wf", |_ctx, input| {
+            Box::pin(async move { Ok(input) })
+        })
+        .replay_from_events(history.events)
+        .await;
+    assert!(
+        matches!(report.status, ReplayStatus::ReplaySucceeded),
+        "replay must succeed decoding through the configured registry:\n{report}"
+    );
+}
+
 #[tokio::test]
 async fn an_erasure_tombstone_committed_before_the_sweep_is_never_overwritten() {
     // The ordinary (non-racing) half: a row already tombstoned carries no

@@ -37,43 +37,31 @@ history onto the new key.
 
 ## Wiring it up
 
-> **Read this first — which writes are codec-aware.** Issue #1243 is partly
-> landed, so the answer differs by path. Be precise about this before you plan
-> a rotation, because it decides what the sweep will actually find.
+> **Read this first — which writes are codec-aware.** All of them (issue
+> #1243). Every production write path encodes through the configured
+> registry, and the worker replays with the *same* registry, so a mixed-key
+> history round-trips end to end.
 >
-> **Codec-aware today** — these go through `store::append_events_with_codecs`
-> under the configured registry, and the worker replays with the *same*
-> registry, so a mixed-key history round-trips:
+> This includes:
 >
-> - the worker's **batched** task-processing writes: activity results and
+> - the worker's batched task-processing writes: activity results and
 >   failures, workflow completions and failures, timers, signals, DLQ and
 >   quarantine writes;
 > - `ActivityCompleted.output` committed inline by `ctx.run_transactional`;
 > - `ActivityFailed.details` from a broken session;
-> - `WorkflowFailed.details` from the poison-pill reclaimer.
+> - `WorkflowFailed.details` from the poison-pill reclaimer;
+> - `execution.rs`'s start paths — `WorkflowStarted.input` and
+>   `last_completion_result`, the first event of every execution;
+> - every payload-bearing `store::append_single_event` call:
+>   `ChildWorkflowStarted.input`, `ChildWorkflowCompleted.output`, a typed
+>   `ChildWorkflowFailed.details` (both `worker.rs` and the cross-shard child
+>   relay), and `ActivityCompletedExternally.output` (`external_task.rs`).
 >
-> **Still identity-only** — two groups, both tracked by #1243:
->
-> - `execution.rs`'s start paths, so `WorkflowStarted.input` is stored in the
->   clear. That is the *first* event of every execution and often the most
->   sensitive payload in it.
-> - every write that goes through `store::append_single_event`, which has no
->   codec-aware counterpart yet. The payload-bearing ones are
->   `ChildWorkflowStarted.input` and `ChildWorkflowCompleted.output` (both
->   `worker.rs`) and `ActivityCompletedExternally.output`
->   (`external_task.rs`). Note the consequence for **child workflows
->   specifically**: a child's own history is codec-aware, but the parent's
->   mirror of the child's input and output is not.
->
-> Treat rotation as incomplete until #1243 closes: the sweep converts the rest
-> of the history, and anything written in the clear before the fix stays
-> plaintext (the sweep never newly encrypts plaintext, by design). It is an
-> ADR-0003 write-path defect rather than a rotation defect.
->
-> Nothing here is blocked by that gap — every rotation primitive operates
-> correctly on whatever the write path stores, and the census counts only what
-> is genuinely encoded — but a green retirement gate says nothing about start
-> inputs, and neither does a completed sweep.
+> A handful of writes stay on the identity registry deliberately: parent-close
+> cascade bookkeeping, operator cancel/terminate reasons, and similar events
+> carry no payload-bearing field at all (see `PayloadCodecs::encode_event`'s
+> field list), so encoding them is a byte-for-byte no-op. Nothing in that group
+> is reachable from a workflow's real input, output, or error detail.
 
 ```rust
 use autumn_harvest::payload_codec::CODEC_LEGACY_KEY_ID;

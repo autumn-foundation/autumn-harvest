@@ -128,9 +128,9 @@ use autumn_harvest::{
     SignalWithStartOutcome, SignalWithStartParams, StartWorkflowParams, TriageFieldChange,
     TriageOutcome, TriagePatch, UpdateWithStartOutcome, UpdateWithStartParams,
     WorkflowHandleClient, WorkflowResult, annotate_workflow_execution,
-    signal_with_start_workflow_execution_with_metrics,
-    start_or_load_workflow_execution_with_metrics,
-    update_with_start_workflow_execution_with_metrics,
+    signal_with_start_workflow_execution_with_metrics_and_codecs,
+    start_or_load_workflow_execution_with_metrics_and_codecs,
+    update_with_start_workflow_execution_with_metrics_and_codecs,
 };
 
 use crate::lineage::{
@@ -18502,7 +18502,7 @@ pub(crate) async fn start_workflow(
                 .into_response();
         }
         let window_secs = api_state.start_idempotency_window().as_secs_f64();
-        let idem = autumn_harvest::start_or_load_workflow_execution_idempotent(
+        let idem = autumn_harvest::start_or_load_workflow_execution_idempotent_with_codecs(
             &mut conn,
             StartWorkflowParams {
                 workflow_name: &workflow_name,
@@ -18563,6 +18563,7 @@ pub(crate) async fn start_workflow(
             // back the idempotency reservation (retryable); a committed-replay
             // short-circuited to `200` above never reaches here.
             Some(autumn_harvest::admission_gate::GateMode::Check),
+            runtime.registry.payload_codecs(),
         )
         .await;
 
@@ -18799,11 +18800,12 @@ pub(crate) async fn start_workflow(
     // attach admits nothing and is never gated (returns the existing run). This path
     // is reached by every non-debounce / non-batch start (plain, auto-id, and a
     // throttle-`Reserved` fall-through — its token is refunded on a block below).
-    let result = start_or_load_workflow_execution_with_metrics(
+    let result = start_or_load_workflow_execution_with_metrics_and_codecs(
         &mut conn,
         start_params,
         metrics_ref,
         Some(autumn_harvest::admission_gate::GateMode::Check),
+        runtime.registry.payload_codecs(),
     )
     .await;
 
@@ -19847,7 +19849,7 @@ async fn batch_start_workflows(
             // rejection below (issue #499).
             let item_reject_fresh =
                 workflow_has_resolving_debounce(&runtime.registry, &item.workflow_name, &input);
-            let start_result = autumn_harvest::execution::start_or_load_workflow_execution_collect(
+            let start_result = autumn_harvest::execution::start_or_load_workflow_execution_collect_with_codecs(
                 &mut conn,
                 StartWorkflowParams {
                     workflow_name: &item.workflow_name,
@@ -19909,6 +19911,7 @@ async fn batch_start_workflows(
                 // `Err(e)` arm below (never a hard batch failure) — the block is
                 // counted once by the primitive.
                 Some(autumn_harvest::admission_gate::GateMode::Check),
+                runtime.registry.payload_codecs(),
             )
             .await;
 
@@ -21000,7 +21003,7 @@ pub(crate) async fn signal_with_start_workflow(
     let sws_workflow_retry_policy =
         info_retry_policy_sws.and_then(|p| serde_json::to_value(&p).ok());
 
-    let result = signal_with_start_workflow_execution_with_metrics(
+    let result = signal_with_start_workflow_execution_with_metrics_and_codecs(
         &mut conn,
         SignalWithStartParams {
             workflow_name: &workflow_name,
@@ -21060,6 +21063,7 @@ pub(crate) async fn signal_with_start_workflow(
         // pre-check block short-circuits before this call, so a fresh create is
         // never double-counted.
         Some(autumn_harvest::admission_gate::GateMode::Check),
+        runtime.registry.payload_codecs(),
     )
     .await;
 
@@ -21849,7 +21853,7 @@ async fn update_with_start_workflow(
     let result = match probe_outcome {
         Some(outcome) => Ok(outcome),
         None => {
-            update_with_start_workflow_execution_with_metrics(
+            update_with_start_workflow_execution_with_metrics_and_codecs(
                 &mut conn,
                 params,
                 Some(runtime.registry.telemetry().metrics.as_ref()),
@@ -21859,6 +21863,7 @@ async fn update_with_start_workflow(
                 // create TOCTOU; a pre-check block short-circuits before this call,
                 // so no double-count.
                 Some(autumn_harvest::admission_gate::GateMode::Check),
+                runtime.registry.payload_codecs(),
             )
             .await
         }
@@ -28936,7 +28941,7 @@ async fn trigger_schedule_now(
     // schedule id and attributed to the operator (mirrors the throttle-carrier
     // branch above). Bound in the enclosing scope so the ref outlives the params.
     let manual_schedule_id_str = schedule_id.to_string();
-    let result = start_or_load_workflow_execution_with_metrics(
+    let result = start_or_load_workflow_execution_with_metrics_and_codecs(
         &mut exec_conn,
         StartWorkflowParams {
             workflow_name: &workflow_name,
@@ -29003,6 +29008,7 @@ async fn trigger_schedule_now(
         },
         Some(runtime.registry.telemetry().metrics.as_ref()),
         None,
+        runtime.registry.payload_codecs(),
     )
     .await;
 
@@ -30395,7 +30401,7 @@ pub(crate) async fn schedule_backfill_inner(
                 // `backfill`, referencing the schedule id and the operator actor —
                 // matching the throttled branch above.
                 let schedule_id_str = schedule_id.to_string();
-                let result = start_or_load_workflow_execution_with_metrics(
+                let result = start_or_load_workflow_execution_with_metrics_and_codecs(
                     &mut conn,
                     StartWorkflowParams {
                         workflow_name: &wf_name,
@@ -30473,6 +30479,7 @@ pub(crate) async fn schedule_backfill_inner(
                     },
                     Some(runtime.registry.telemetry().metrics.as_ref()),
                     None,
+                    runtime.registry.payload_codecs(),
                 )
                 .await;
                 match result {
@@ -30751,7 +30758,7 @@ pub(crate) async fn schedule_backfill_inner(
                 // Provenance for a non-throttled DAG backfill (issue #740):
                 // `backfill`, referencing the schedule id and the operator actor.
                 let schedule_id_str = schedule_id.to_string();
-                let start_result = start_or_load_workflow_execution_with_metrics(
+                let start_result = start_or_load_workflow_execution_with_metrics_and_codecs(
                     &mut conn,
                     StartWorkflowParams {
                         workflow_name: &dag_name,
@@ -30807,6 +30814,7 @@ pub(crate) async fn schedule_backfill_inner(
                     },
                     Some(runtime.registry.telemetry().metrics.as_ref()),
                     None,
+                    runtime.registry.payload_codecs(),
                 )
                 .await;
                 match start_result {
@@ -43512,10 +43520,12 @@ async fn complete_external_activity(
         }
     };
     let output = request.output.unwrap_or(Value::Null);
+    let codecs = api_state.payload_codecs();
 
     let complete_result = resolve_external_on_shards(&api_state, token, |conn, tok| {
         let out = output.clone();
-        Box::pin(async move { external_task::complete_externally(conn, tok, out).await })
+        let codecs = codecs.clone();
+        Box::pin(async move { external_task::complete_externally(conn, tok, out, &codecs).await })
     })
     .await;
 
