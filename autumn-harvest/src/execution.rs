@@ -480,12 +480,20 @@ fn record_quota_rejected_metric(
 /// claim time for issue #247) both skip enforcement entirely -- a no-policy
 /// workflow pays only the one cheap `Option` check (AC9's "zero default
 /// overhead").
+///
+/// `pending_supersede_credit` (issue #1228, Finding 1): additional slots to
+/// subtract from `active_executions`, beyond the caller's own row. A
+/// `cancel_running` admission's supersede pass has not run yet. It WILL
+/// shed this many incumbents on the same key before the transaction
+/// commits. Every caller except the fresh-insert path in
+/// `start_or_load_workflow_execution_collect` passes `0` (no effect).
 pub(crate) async fn enforce_quota_admission(
     conn: &mut AsyncPgConnection,
     quota_policy: Option<crate::quota::QuotaPolicy>,
     quota_key: Option<&str>,
     workflow_name: &str,
     metrics: Option<&(dyn crate::telemetry::MetricsRecorder + Send + Sync)>,
+    pending_supersede_credit: u64,
 ) -> HarvestResult<()> {
     let Some(policy) = quota_policy else {
         return Ok(());
@@ -513,8 +521,13 @@ pub(crate) async fn enforce_quota_admission(
     // current=99, not 100). `history_bytes`/`dead_letters` need no such
     // adjustment: the just-inserted row has appended no events yet
     // (`WorkflowStarted` is appended by the caller, AFTER this check) and
-    // has no dead-letter rows of its own.
-    usage.active_executions = usage.active_executions.saturating_sub(1);
+    // has no dead-letter rows of its own. `pending_supersede_credit` also
+    // subtracts out incumbents a `cancel_running` pass will shed before
+    // commit -- see this function's own doc comment.
+    usage.active_executions = usage
+        .active_executions
+        .saturating_sub(1)
+        .saturating_sub(i64::try_from(pending_supersede_credit).unwrap_or(i64::MAX));
     if let Some(violation) = crate::quota::check_quota(&usage, &policy) {
         record_quota_rejected_metric(metrics, workflow_name, violation.resource);
         return Err(HarvestError::QuotaExceeded {
@@ -1064,6 +1077,34 @@ pub async fn start_or_load_workflow_execution_collect(
                     });
                 }
             }
+            // Quota admission counts every non-terminal row on the key
+            // (issue #1228, Finding 1). That count includes an incumbent
+            // the `cancel_running` supersede pass below is about to cancel.
+            // A quota check that ignores this sees the key at its cap and
+            // rejects the newer request before supersede ever runs. This
+            // silently defeats `cancel_running` under a tight cap.
+            //
+            // Fixed by a dry-run credit, not by moving supersede earlier.
+            // The actual cancellation must stay AFTER this row's own
+            // `WorkflowStarted` event and task are durable. See
+            // `run_latest_wins_supersede`'s own doc comment for why. So
+            // quota admission instead asks how many runs supersede WOULD
+            // shed right now. It cancels nothing yet.
+            let supersede_credit: u64 = if request.concurrency_on_conflict.is_cancel_running()
+                && let Some(key) = request.concurrency_key.as_deref()
+            {
+                let shed = crate::concurrency::dry_run_supersede_shed_count(
+                    conn,
+                    request.workflow_name,
+                    key,
+                    request.concurrency_limit.unwrap_or(1),
+                    exec_id,
+                )
+                .await?;
+                u64::try_from(shed).unwrap_or(u64::MAX)
+            } else {
+                0
+            };
             // Enforce the declared per-tenant resource quota (issue #946),
             // scoped to the fresh-insert path exactly like the payload cap
             // above -- an ATTACH to an existing execution never reaches
@@ -1081,6 +1122,7 @@ pub async fn start_or_load_workflow_execution_collect(
                 quota_key.as_deref(),
                 request.workflow_name,
                 metrics,
+                supersede_credit,
             )
             .await?;
             // Resolve last-completion-result carryover (issue #488).
@@ -1112,7 +1154,8 @@ pub async fn start_or_load_workflow_execution_collect(
             // The advisory lock inside `supersede_running_for_key` serializes
             // concurrent admissions for the same key, which is what makes AC6's
             // "later-admitted run wins" a function of admission order rather than
-            // wall-clock.
+            // wall-clock. It re-acquires the SAME per-key lock the dry-run credit
+            // above already took, so this never contends with itself.
             let started = StartedWorkflowExecution::from_row(execution, true);
             let (tx_cancel_metrics, supersede_deferred) = run_latest_wins_supersede(
                 conn,
@@ -2268,6 +2311,13 @@ mod resolve_by_workflow_id_tests {
 /// A no-op (returns two empty vecs, issues zero statements) unless the request
 /// declares `CancelRunning` AND resolved a concurrency key, so `Defer` starts are
 /// byte-for-byte unchanged.
+///
+/// The caller's quota check (`enforce_quota_admission`) runs BEFORE this,
+/// exactly as before issue #1228. It now gets a dry-run credit for however
+/// many runs this pass is about to shed. See
+/// [`crate::concurrency::dry_run_supersede_shed_count`]. That credit is
+/// what makes a tight quota cap see the freed slot; the actual
+/// cancellation stays here, unmoved.
 #[cfg(feature = "db")]
 async fn run_latest_wins_supersede(
     conn: &mut AsyncPgConnection,
@@ -2377,6 +2427,7 @@ async fn replace_execution(
         quota_key,
         request.workflow_name,
         metrics,
+        0, // no dry-run supersede credit on this path (issue #1228, Finding 1)
     )
     .await?;
     let start_timestamp = if request.delay.is_some_and(|d| d > chrono::Duration::zero())

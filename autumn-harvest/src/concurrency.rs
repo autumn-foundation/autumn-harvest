@@ -458,6 +458,46 @@ tokio::task_local! {
     static ADMITTING: Vec<crate::types::ExecutionId>;
 }
 
+/// Dry-run count of how many runs [`supersede_running_for_key`] would shed
+/// for `(workflow_name, key)` right now (issue #1228, Finding 1). Cancels
+/// nothing.
+///
+/// A quota check needs to see the slot(s) a later `cancel_running` pass will
+/// free, without moving the actual cancellation earlier. The real pass must
+/// stay AFTER the admitted row's own `WorkflowStarted` event and task are
+/// durable — see [`supersede_running_for_key`]'s own doc comment for why.
+/// This dry run only reads OTHER rows on the key, so it carries none of that
+/// requirement.
+///
+/// Takes the same per-key advisory lock the real pass takes. The lock is
+/// transaction-scoped and re-entrant, so the later real pass simply
+/// re-acquires what this already holds — no double-counting, no new lock
+/// order.
+///
+/// # Errors
+///
+/// Propagates database failures from the advisory lock or the candidate scan.
+#[cfg(feature = "db")]
+pub async fn dry_run_supersede_shed_count(
+    conn: &mut diesel_async::AsyncPgConnection,
+    workflow_name: &str,
+    concurrency_key: &str,
+    limit: u32,
+    self_exec_id: crate::types::ExecutionId,
+) -> crate::error::HarvestResult<usize> {
+    lock_concurrency_key(conn, concurrency_key).await?;
+    let inherited: Vec<crate::types::ExecutionId> =
+        ADMITTING.try_with(Clone::clone).unwrap_or_default();
+    let fetch_cap =
+        i64::from(limit).saturating_add(i64::try_from(SUPERSEDE_SCAN_LIMIT).unwrap_or(i64::MAX));
+    let others =
+        active_runs_for_key(conn, workflow_name, concurrency_key, self_exec_id, fetch_cap).await?;
+    let (candidates, protected): (Vec<SupersededRun>, Vec<SupersededRun>) = others
+        .into_iter()
+        .partition(|run| !inherited.contains(&run.exec_id));
+    Ok(supersede_plan(candidates.len(), protected.len(), limit).shed)
+}
+
 /// Latest-wins: cancel the OLDEST in-flight runs for `(workflow_name, key)` until
 /// the post-admission population respects `limit` (issue #811).
 ///
