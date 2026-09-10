@@ -2279,20 +2279,20 @@ async fn get_start_throttle_pacing_override_detects_diverged_baseline_disagreeme
 
 // ── issue #1229: fan-out completeness on the four mutation handlers ────────
 //
-// `GET .../override`'s partial-outage handling (round 2/4/5 above) already
-// fans out over every shard the ROUTER knows about, not merely every shard
-// this process holds a live pool for -- see `get_start_throttle_pacing_override`
-// and `shard_fanout::expected_shards`'s own doc comment. The four MUTATION
+// `get_start_throttle_pacing_override`'s partial-outage handling already
+// fans out over every shard the ROUTER knows about. See
+// `shard_fanout::expected_shards`'s own doc comment. It does not merely use
+// every shard this process holds a live pool for. The four MUTATION
 // handlers (SET/CLEAR, rate-limit and start-throttle) instead looped over
-// `pool.iter_shards()` directly, so a shard the router already advertises
-// mid a shard-add rollout, but this process has no pool for yet, was
-// dropped from the fan-out silently: not attempted, not counted in
+// `pool.iter_shards()` directly. A shard the router advertises mid a
+// shard-add rollout can lack a pool on this process. That shard was dropped
+// from the fan-out silently. It was not attempted, not counted in
 // `shard_errors`, and the handler still returned a bare `200`.
 //
-// Each test below installs a pool for shard 0 only, but a router that also
+// Each test below installs a pool for shard 0 only. Its router also
 // advertises shard 1 as readable -- the exact mid-rollout state
-// `expected_shards` exists to catch -- and asserts the response degrades to
-// `207` naming shard 1, instead of a silent `200`.
+// `expected_shards` exists to catch. Each test asserts the response
+// degrades to `207` naming shard 1, instead of a silent `200`.
 
 fn router_knows_shard_1_but_has_no_pool_for_it(live_pool: DbPool) -> HarvestDbPool {
     let mut pools = BTreeMap::new();
@@ -2446,13 +2446,13 @@ async fn clear_start_throttle_pacing_override_reports_router_known_shard_with_no
 
 // ── issue #1229: unknown JSON fields must be rejected, not silently dropped ─
 //
-// Neither request struct was annotated `#[serde(deny_unknown_fields)]`, so a
-// typo'd field (e.g. `brust` instead of `burst`) parsed successfully with the
-// typo'd value silently discarded. Under the routes' own documented
-// replace-not-merge semantics, the field the caller MEANT to set then reverts
-// to the declared baseline instead -- an operator responding to an incident
-// could believe (per the `200`) that a burst-focused mitigation took effect
-// when it silently did not.
+// Neither request struct was annotated `#[serde(deny_unknown_fields)]`. A
+// typo'd field (e.g. `brust` instead of `burst`) parsed successfully with
+// the typo'd value silently discarded. The routes' own documented semantics
+// replace the whole override, never merge it. So the field the caller MEANT
+// to set then reverts to the declared baseline instead. An operator
+// responding to an incident could believe, per the `200`, that a
+// burst-focused mitigation took effect when it silently did not.
 
 #[tokio::test]
 async fn set_rate_limit_pacing_override_rejects_unknown_field() {
@@ -2503,13 +2503,13 @@ async fn set_start_throttle_pacing_override_rejects_unknown_field() {
 // ── issue #1229: semantic validation failures must be audited ──────────────
 //
 // `audit_context` was only called AFTER every early-return validation check
-// in the SET handlers (and the registry-lookup checks in the CLEAR
-// handlers), so a rejected administrative attempt -- an invalid rate/burst,
-// an empty override, an invalid TTL, an unknown JSON field, an undeclared
-// activity/workflow, or a dynamic-key policy -- left zero trace in the audit
-// log. Each test below drives every rejection branch through the real HTTP
-// route, then reads `GET /admin/audit` back to prove a `"failed"` row exists
-// for each one.
+// in the SET handlers. The CLEAR handlers only called it after their own
+// registry-lookup checks. So a rejected administrative attempt left zero
+// trace in the audit log. That covers an invalid rate/burst, an empty
+// override, an invalid TTL, an unknown JSON field, an undeclared
+// activity/workflow, and a dynamic-key policy. Each test below drives every
+// rejection branch through the real HTTP route. It then reads
+// `GET /admin/audit` back to prove a `"failed"` row exists for each one.
 
 #[tokio::test]
 async fn set_rate_limit_pacing_override_audits_every_rejection_branch() {
@@ -2610,10 +2610,9 @@ async fn set_rate_limit_pacing_override_audits_every_rejection_branch() {
              {expected_substring:?}, got: {declared_failures:?}"
         );
     }
-    // The unknown-field rejection is caught by axum's `JsonRejection` before
-    // the handler can compute a `declared_name`-keyed row from the parsed
-    // body -- it is still audited, just keyed by the path's `activity_name`
-    // like every other pre-parse rejection.
+    // axum's `JsonRejection` catches this before the handler parses the
+    // body. The audit row is still keyed by the path's `activity_name`,
+    // same as every other pre-parse rejection.
     assert!(
         records.iter().any(|r| r["target_id"] == json!(declared_name)
             && r["status"] == json!("failed")

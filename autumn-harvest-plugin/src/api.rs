@@ -33790,11 +33790,11 @@ async fn set_start_throttle_pacing_override(
     let (actor, source, request_id) = audit_context(&headers, &api_state);
     let route = "POST /admin/start-throttle/{workflow_name}/override";
 
-    // Every early return in this handler goes through `reject!` so it is
+    // Every early return in this handler goes through `reject!`. It is
     // audited as a `STATUS_FAILED` row before responding (issue #1229,
-    // finding 3) -- an unrecognized JSON field, a bad refill/burst, an
-    // invalid TTL, an undeclared workflow, or a dynamic-key policy must all
-    // leave a trace, not just a successful shard write.
+    // finding 3). An unrecognized JSON field, a bad refill/burst, an
+    // invalid TTL, an undeclared workflow, or a dynamic-key policy must
+    // all leave a trace. A successful shard write alone is not enough.
     macro_rules! reject {
         ($err:expr) => {{
             let err = $err;
@@ -33815,10 +33815,10 @@ async fn set_start_throttle_pacing_override(
         }};
     }
 
-    // Unwrapped in-handler, not by a bare `Json` extractor, so a rejected
-    // body -- most importantly an unknown field, rejected via
-    // `deny_unknown_fields` -- surfaces as this route's documented `400`,
-    // with a failed audit row, never axum's default plain-text `422`
+    // The body is unwrapped in-handler, not by a bare `Json` extractor. A
+    // rejected body -- most importantly an unknown field, rejected via
+    // `deny_unknown_fields` -- surfaces as this route's documented `400`.
+    // It carries a failed audit row, never axum's default plain-text `422`
     // (mirrors `update_schedule_handler`).
     let request = match body {
         Ok(Json(req)) => req,
@@ -33880,13 +33880,14 @@ async fn set_start_throttle_pacing_override(
     let declared_burst = policy.burst;
     let key = autumn_harvest::throttle::bucket_key(&workflow_name, "");
 
-    // Fan out over every shard the ROUTER knows about, not merely every
-    // shard this process holds a live pool for -- `pool.iter_shards()`
+    // Fan out over every shard the ROUTER knows about. Do not merely use
+    // every shard this process holds a live pool for. `pool.iter_shards()`
     // silently dropped a shard the router already advertises mid a
-    // shard-add rollout, so a mutation could return a bare `200` while a
+    // shard-add rollout. A mutation could then return a bare `200` while a
     // real, router-known shard never received the write (issue #1229,
     // finding 1). A missing pool for an expected shard is now a fan-out
-    // failure, folded into `shard_errors` like any other unreachable shard.
+    // failure. It is folded into `shard_errors` like any other unreachable
+    // shard.
     let pools = crate::shard_fanout::pools_by_shard(&api_state);
     let expected = crate::shard_fanout::expected_shards(&api_state, &pools);
 
@@ -34037,10 +34038,10 @@ async fn clear_start_throttle_pacing_override(
     let (actor, source, request_id) = audit_context(&headers, &api_state);
     let route = "DELETE /admin/start-throttle/{workflow_name}/override";
 
-    // Every early return in this handler goes through `reject!` so it is
+    // Every early return in this handler goes through `reject!`. It is
     // audited as a `STATUS_FAILED` row before responding (issue #1229,
-    // finding 3): an undeclared workflow or a dynamic-key policy must leave
-    // a trace, not just a successful shard write.
+    // finding 3). An undeclared workflow or a dynamic-key policy must
+    // leave a trace. A successful shard write alone is not enough.
     macro_rules! reject {
         ($err:expr) => {{
             let err = $err;
@@ -34089,9 +34090,10 @@ async fn clear_start_throttle_pacing_override(
     let declared_burst = policy.burst;
     let key = autumn_harvest::throttle::bucket_key(&workflow_name, "");
 
-    // Fan out over every shard the ROUTER knows about, not merely every
-    // shard this process holds a live pool for (issue #1229, finding 1) --
-    // see the identical comment in `set_start_throttle_pacing_override`.
+    // Fan out over every shard the ROUTER knows about. Do not merely use
+    // every shard this process holds a live pool for (issue #1229,
+    // finding 1). See the identical comment in
+    // `set_start_throttle_pacing_override`.
     let pools = crate::shard_fanout::pools_by_shard(&api_state);
     let expected = crate::shard_fanout::expected_shards(&api_state, &pools);
 
@@ -34820,11 +34822,11 @@ async fn set_rate_limit_pacing_override(
     let (actor, source, request_id) = audit_context(&headers, &api_state);
     let route = "POST /admin/rate-limits/{activity_name}/override";
 
-    // Every early return in this handler goes through `reject!` so it is
+    // Every early return in this handler goes through `reject!`. It is
     // audited as a `STATUS_FAILED` row before responding (issue #1229,
-    // finding 3) -- an unrecognized JSON field, a bad refill/burst, an
-    // invalid TTL, an undeclared activity, or a dynamic-key policy must all
-    // leave a trace, not just a successful shard write.
+    // finding 3). An unrecognized JSON field, a bad refill/burst, an
+    // invalid TTL, an undeclared activity, or a dynamic-key policy must
+    // all leave a trace. A successful shard write alone is not enough.
     macro_rules! reject {
         ($err:expr) => {{
             let err = $err;
@@ -34845,10 +34847,10 @@ async fn set_rate_limit_pacing_override(
         }};
     }
 
-    // Unwrapped in-handler, not by a bare `Json` extractor, so a rejected
-    // body -- most importantly an unknown field, rejected via
-    // `deny_unknown_fields` -- surfaces as this route's documented `400`,
-    // with a failed audit row, never axum's default plain-text `422`
+    // The body is unwrapped in-handler, not by a bare `Json` extractor. A
+    // rejected body -- most importantly an unknown field, rejected via
+    // `deny_unknown_fields` -- surfaces as this route's documented `400`.
+    // It carries a failed audit row, never axum's default plain-text `422`
     // (mirrors `update_schedule_handler`).
     let request = match body {
         Ok(Json(req)) => req,
@@ -34911,9 +34913,10 @@ async fn set_rate_limit_pacing_override(
         .rate_limit_key
         .map_or_else(|| activity_name.clone(), std::string::ToString::to_string);
 
-    // Fan out over every shard the ROUTER knows about, not merely every
-    // shard this process holds a live pool for (issue #1229, finding 1) --
-    // see the identical comment in `set_start_throttle_pacing_override`.
+    // Fan out over every shard the ROUTER knows about. Do not merely use
+    // every shard this process holds a live pool for (issue #1229,
+    // finding 1). See the identical comment in
+    // `set_start_throttle_pacing_override`.
     let pools = crate::shard_fanout::pools_by_shard(&api_state);
     let expected = crate::shard_fanout::expected_shards(&api_state, &pools);
 
@@ -35062,10 +35065,10 @@ async fn clear_rate_limit_pacing_override(
     let (actor, source, request_id) = audit_context(&headers, &api_state);
     let route = "DELETE /admin/rate-limits/{activity_name}/override";
 
-    // Every early return in this handler goes through `reject!` so it is
+    // Every early return in this handler goes through `reject!`. It is
     // audited as a `STATUS_FAILED` row before responding (issue #1229,
-    // finding 3): an undeclared activity or a dynamic-key policy must leave
-    // a trace, not just a successful shard write.
+    // finding 3). An undeclared activity or a dynamic-key policy must
+    // leave a trace. A successful shard write alone is not enough.
     macro_rules! reject {
         ($err:expr) => {{
             let err = $err;
@@ -35115,9 +35118,10 @@ async fn clear_rate_limit_pacing_override(
         .rate_limit_key
         .map_or_else(|| activity_name.clone(), std::string::ToString::to_string);
 
-    // Fan out over every shard the ROUTER knows about, not merely every
-    // shard this process holds a live pool for (issue #1229, finding 1) --
-    // see the identical comment in `set_start_throttle_pacing_override`.
+    // Fan out over every shard the ROUTER knows about. Do not merely use
+    // every shard this process holds a live pool for (issue #1229,
+    // finding 1). See the identical comment in
+    // `set_start_throttle_pacing_override`.
     let pools = crate::shard_fanout::pools_by_shard(&api_state);
     let expected = crate::shard_fanout::expected_shards(&api_state, &pools);
 
