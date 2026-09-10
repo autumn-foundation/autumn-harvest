@@ -246,17 +246,125 @@ fn local_iteration_example_is_scoped_to_chaos_tests_module() {
     );
 }
 
+/// The exact filter token following `--test integration` in a command.
+///
+/// Skips whitespace and backslash continuations between the flag and its
+/// argument. The doc wraps its filter onto the next line after one such
+/// continuation. This is a token boundary, not a prefix: `chaos_tests::`
+/// and `chaos_tests::chaos_seeded_convergence_sweep` extract as different,
+/// unequal tokens. A `contains`/prefix check cannot tell them apart.
+fn extract_filter_argument(command: &str) -> &str {
+    const FLAG: &str = "--test integration";
+    let after_flag = command
+        .find(FLAG)
+        .map(|i| &command[i + FLAG.len()..])
+        .unwrap_or_else(|| panic!("command has no {FLAG:?}: {command}"));
+    let arg_start = after_flag.trim_start_matches(|c: char| c.is_whitespace() || c == '\\');
+    let arg_end = arg_start
+        .find(char::is_whitespace)
+        .unwrap_or(arg_start.len());
+    let token = &arg_start[..arg_end];
+    // A token starting with `--` is another flag (e.g. `--no-run`), not a
+    // filter argument. `--test integration` with no filter runs the whole
+    // binary; treat that the same as no token at all.
+    if token.is_empty() || token.starts_with("--") {
+        panic!("no filter argument follows {FLAG:?} in command: {command}");
+    }
+    token
+}
+
+#[test]
+fn extract_filter_argument_reads_the_token_on_the_same_line() {
+    let command = "cargo test -p autumn-harvest --features chaos --test integration chaos_tests:: -- --nocapture --test-threads=1";
+    assert_eq!(extract_filter_argument(command), "chaos_tests::");
+}
+
+#[test]
+fn extract_filter_argument_reads_the_token_past_a_line_continuation() {
+    // Mirrors the doc's own layout. Its filter sits on the next line,
+    // after a backslash continuation, not on the flag's own line.
+    let command = "HARVEST_TEST_DATABASE_URL=postgres://x \\\n  CHAOS_SEEDS=8 cargo test --features chaos --test integration \\\n  chaos_tests::";
+    assert_eq!(extract_filter_argument(command), "chaos_tests::");
+}
+
+#[test]
+#[should_panic(expected = "no filter argument follows")]
+fn extract_filter_argument_panics_when_the_flag_has_no_following_token() {
+    extract_filter_argument("cargo test --test integration --no-run");
+}
+
+#[test]
+fn extract_filter_argument_detects_a_ci_narrowed_filter_the_doc_still_calls_broad() {
+    // Reproduces the Codex finding directly: CI narrows to a specific
+    // test, but the doc's worked example keeps the broader module filter.
+    // A `contains` check on each side independently would pass both.
+    // Only an exact-equality comparison catches the divergence.
+    let ci_command =
+        "cargo test --test integration chaos_tests::chaos_seeded_convergence_sweep -- --nocapture";
+    let doc_command = "cargo test --features chaos --test integration \\\n  chaos_tests::";
+
+    let ci_filter = extract_filter_argument(ci_command);
+    let doc_filter = extract_filter_argument(doc_command);
+
+    assert!(
+        ci_command.contains("chaos_tests::") && doc_command.contains("chaos_tests::"),
+        "both commands satisfy the old, insufficient prefix check"
+    );
+    assert_ne!(
+        ci_filter, doc_filter,
+        "a narrowed CI filter must be distinguishable from the doc's \
+         broader one, not masked by a shared prefix"
+    );
+}
+
+#[test]
+fn extract_filter_argument_detects_a_doc_narrowed_filter_ci_still_calls_broad() {
+    // The reverse direction: the doc narrows while CI stays broad.
+    let ci_command = "cargo test --test integration chaos_tests:: -- --nocapture";
+    let doc_command = "cargo test --features chaos --test integration \\\n  chaos_tests::chaos_seeded_convergence_sweep";
+
+    let ci_filter = extract_filter_argument(ci_command);
+    let doc_filter = extract_filter_argument(doc_command);
+
+    assert_ne!(
+        ci_filter, doc_filter,
+        "a narrowed doc filter must be distinguishable from CI's broader \
+         one, not masked by a shared prefix"
+    );
+}
+
 /// Ties the doc's example filter to CI's own filter, so the two can never
 /// silently diverge -- e.g. CI narrows to a smaller sub-filter while the doc
 /// keeps recommending the wider (now-stale) one it claims to mirror.
+///
+/// Compares the exact filter *argument* extracted from each side, not a
+/// shared-prefix `contains` check -- see `extract_filter_argument`.
 #[test]
 fn doc_example_filter_matches_chaos_workflow_filter() {
     let workflow = read_normalized(&repo_root().join(".github/workflows/chaos.yml"));
-    assert!(
-        workflow.contains("--test integration chaos_tests::"),
-        ".github/workflows/chaos.yml must run the DB-backed chaos suite \
-         scoped to `chaos_tests::` -- this is the exact filter \
-         docs/testing/chaos.md's local-iteration example claims to mirror"
+    let ci_stanza = workflow_step_stanza(&workflow, "chaos_tests::").expect(
+        ".github/workflows/chaos.yml must have a step running the \
+         chaos_tests:: suite",
+    );
+    let ci_run_line = ci_stanza
+        .lines()
+        .find(|line| line.contains("--test integration"))
+        .expect("the chaos_tests:: step must have a --test integration run line");
+    let ci_filter = extract_filter_argument(ci_run_line);
+
+    let doc = read_chaos_doc();
+    let block = bash_block_containing(&doc, "HARVEST_TEST_DATABASE_URL");
+    let command_only = strip_comment_lines(block);
+    let commands = split_into_commands(&command_only);
+    let local_db_command = command_containing(&commands, "HARVEST_TEST_DATABASE_URL");
+    let doc_filter = extract_filter_argument(local_db_command);
+
+    assert_eq!(
+        doc_filter, ci_filter,
+        "docs/testing/chaos.md's local-iteration example must use the \
+         exact same filter argument as .github/workflows/chaos.yml, not \
+         merely share a `chaos_tests::` prefix -- doc filter: \
+         {doc_filter:?}, CI filter: {ci_filter:?}"
     );
 }
 
