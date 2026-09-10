@@ -739,8 +739,8 @@ async fn shutdown_completes_when_a_shard_pool_is_permanently_exhausted() {
 
 /// **Issue #1212, Finding 1.** `build_shard_listeners` must bound each
 /// per-shard `QueueListener::connect`. `run_poll_loop_multi` starts only
-/// after this loop finishes, so a stalled connect on one shard used to
-/// strand every shard, not only the one with the bad notification URL.
+/// after this loop finishes. A stalled connect on one shard used to strand
+/// every shard, not only the one with the bad notification URL.
 ///
 /// The black-hole listener below accepts the TCP connection but never sends
 /// the Postgres startup response, so the handshake never completes. This is
