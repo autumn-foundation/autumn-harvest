@@ -219,8 +219,10 @@ async fn snapshot_statements(conn: &mut AsyncPgConnection, db_name: &str) -> Vec
 /// `workflow_name` against `harvest_schedules`, so one predicate covers both
 /// sides of the before/after comparison.
 fn is_schedule_lookup_statement(row: &StatRow) -> bool {
+    // Diesel quotes identifiers (`FROM "harvest_schedules"`), so match
+    // loosely rather than assume unquoted `FROM harvest_schedules`.
     let q = row.query.to_ascii_lowercase();
-    q.contains("from harvest_schedules") && q.contains("workflow_name")
+    q.contains("harvest_schedules") && q.contains("workflow_name")
 }
 
 async fn wal_bytes(conn: &mut AsyncPgConnection) -> i64 {
@@ -247,6 +249,12 @@ struct SizePoint {
     total_buffers: i64,
     wal_bytes: i64,
     processed: usize,
+    /// Every statement `enforce_completion_triggers_outbox` issued for this
+    /// point, ranked by buffers then by calls -- the profile the charter's
+    /// "profile before hypothesis" step asks for, captured alongside the
+    /// direct measurement rather than as a separate run.
+    profile_by_buffers: Vec<String>,
+    profile_by_calls: Vec<String>,
 }
 
 /// One measurement point: `n` outbox rows across `DISTINCT_NAMES` target
@@ -257,10 +265,16 @@ struct SizePoint {
 const DISTINCT_NAMES: usize = 5;
 const NAMES_WITH_SCHEDULE: usize = 3;
 
-async fn measure_one_batch(admin: &str, label: &str, n: usize) -> SizePoint {
-    let db_id = unique(&format!("outbox_queue_perf_{label}_{n}"));
-    let default_db = format!("{db_id}_shard0");
-    let target_db = format!("{db_id}_shard1");
+async fn measure_one_batch(admin: &str, _label: &str, n: usize) -> SizePoint {
+    // Postgres identifiers truncate silently at 63 bytes (`NAMEDATALEN`): a
+    // `label`+`n`-qualified prefix here made the "_shard0"/"_shard1"
+    // suffixes collide after truncation, so the second `CREATE DATABASE`
+    // silently targeted the first database again. Keep the physical name
+    // short and let `unique()`'s UUID carry all the uniqueness a test
+    // database needs; `label`/`n` still tag the point in-memory below.
+    let db_id = unique("otbq");
+    let default_db = format!("{db_id}_s0");
+    let target_db = format!("{db_id}_s1");
     let default_url = create_fresh_db(admin, &default_db).await;
     let target_url = create_fresh_db(admin, &target_db).await;
 
@@ -322,6 +336,31 @@ async fn measure_one_batch(admin: &str, label: &str, n: usize) -> SizePoint {
     let total_calls: i64 = all_rows.iter().map(|r| r.calls).sum();
     let total_buffers: i64 = all_rows.iter().map(|r| r.total_buffers).sum();
 
+    fn fmt_row(r: &StatRow, total_calls: i64, total_buffers: i64) -> String {
+        let query: String = r.query.split_whitespace().collect::<Vec<_>>().join(" ");
+        let query = if query.len() > 90 { format!("{}...", &query[..90]) } else { query };
+        format!(
+            "calls={:>4} ({:>5.1}%)  buffers={:>5} ({:>5.1}%)  {query}",
+            r.calls,
+            100.0 * r.calls as f64 / total_calls.max(1) as f64,
+            r.total_buffers,
+            100.0 * r.total_buffers as f64 / total_buffers.max(1) as f64,
+        )
+    }
+    // `snapshot_statements` already orders by total_buffers DESC.
+    let profile_by_buffers: Vec<String> = all_rows
+        .iter()
+        .take(10)
+        .map(|r| fmt_row(r, total_calls, total_buffers))
+        .collect();
+    let mut by_calls: Vec<&StatRow> = all_rows.iter().collect();
+    by_calls.sort_by(|a, b| b.calls.cmp(&a.calls));
+    let profile_by_calls: Vec<String> = by_calls
+        .iter()
+        .take(10)
+        .map(|r| fmt_row(r, total_calls, total_buffers))
+        .collect();
+
     SizePoint {
         n: i64::try_from(n).unwrap(),
         lookup_calls,
@@ -330,6 +369,8 @@ async fn measure_one_batch(admin: &str, label: &str, n: usize) -> SizePoint {
         total_buffers,
         wal_bytes: wal_after - wal_before,
         processed,
+        profile_by_buffers,
+        profile_by_calls,
     }
 }
 
@@ -352,6 +393,7 @@ async fn zz_capture_completion_trigger_outbox_queue_perf_evidence() {
         "-- {label}: outbox relay queue-name resolution, pg_stat_statements sweep --\n\
          n\tprocessed\tlookup_calls\tlookup_buffers\ttotal_calls\ttotal_buffers\twal_bytes"
     )];
+    let mut headline_profile: Option<(Vec<String>, Vec<String>)> = None;
     for n in [5_usize, 20, 50] {
         let point = measure_one_batch(&admin, &label, n).await;
         eprintln!(
@@ -375,6 +417,25 @@ async fn zz_capture_completion_trigger_outbox_queue_perf_evidence() {
             point.total_buffers,
             point.wal_bytes
         ));
+        if n == 50 {
+            headline_profile = Some((point.profile_by_buffers, point.profile_by_calls));
+        }
+    }
+    if let Some((by_buffers, by_calls)) = headline_profile {
+        let mut profile_lines = vec![format!(
+            "-- {label}: headline scenario (n=50), top statements by buffers --"
+        )];
+        profile_lines.extend(by_buffers);
+        profile_lines.push(String::new());
+        profile_lines.push(format!(
+            "-- {label}: headline scenario (n=50), top statements by calls --"
+        ));
+        profile_lines.extend(by_calls);
+        std::fs::write(
+            out_dir.join(format!("{label}-profile-n50.txt")),
+            profile_lines.join("\n") + "\n",
+        )
+        .expect("write profile artifact");
     }
     std::fs::write(
         out_dir.join(format!("{label}-sweep.txt")),

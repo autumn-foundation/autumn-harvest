@@ -1,0 +1,5 @@
+-- before: outbox relay queue-name resolution, pg_stat_statements sweep --
+n	processed	lookup_calls	lookup_buffers	total_calls	total_buffers	wal_bytes
+5	5	5	8	36	46	108184
+20	20	20	32	126	160	150976
+50	50	50	80	306	390	153544
