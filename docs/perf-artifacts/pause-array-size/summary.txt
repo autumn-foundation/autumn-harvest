@@ -1,0 +1,10 @@
+predicate=activity-pause array_size=0 backlog=10000 Sort Method: quicksort  Memory: 2103kB
+predicate=activity-pause array_size=1 backlog=10000 Sort Method: quicksort  Memory: 2416kB
+predicate=activity-pause array_size=20 backlog=10000 Sort Method: external merge  Disk: 7504kB
+predicate=activity-pause array_size=199 backlog=10000 Sort Method: external merge  Disk: 63656kB
+predicate=queue-pause-bound array_size=0 backlog=10000 Sort Method: quicksort  Memory: 2103kB
+predicate=queue-pause-bound array_size=1 backlog=10000 Sort Method: quicksort  Memory: 2103kB
+predicate=queue-pause-bound array_size=20 backlog=10000 Sort Method: quicksort  Memory: 2103kB
+predicate=queue-pause-bound array_size=199 backlog=10000 Sort Method: quicksort  Memory: 2103kB
+predicate=queue-pause-wide array_size=0 backlog=10000 Sort Method: quicksort  Memory: 2103kB
+predicate=queue-pause-wide array_size=199 backlog=10000 Sort Method: external merge  Disk: 40704kB

@@ -1,0 +1,106 @@
+-- queue-pause-wide: claim_task_query() @ backlog=10000, 203-queue worker (4 real + 199 empty), 199 of the 199 empty queues paused --
+CTE Scan on claimed  (cost=442810.73..442810.75 rows=1 width=817) (actual rows=1 loops=1)
+  Buffers: shared hit=1413 dirtied=4 written=2, temp read=484 written=5098
+  CTE paused_queues
+    ->  Aggregate  (cost=5.81..5.82 rows=1 width=32) (actual rows=1 loops=1)
+          Buffers: shared hit=2
+          ->  Seq Scan on harvest_queue_pauses  (cost=0.51..5.49 rows=127 width=15) (actual rows=199 loops=1)
+                Filter: (queue_name = ANY ('{harvest-bench-q-0,harvest-bench-q-1,harvest-bench-q-2,harvest-bench-q-3,pase-wide-q-0,pase-wide-q-1,pase-wide-q-2,pase-wide-q-3,pase-wide-q-4,pase-wide-q-5,pase-wide-q-6,pase-wide-q-7,pase-wide-q-8,pase-wide-q-9,pase-wide-q-10,pase-wide-q-11,pase-wide-q-12,pase-wide-q-13,pase-wide-q-14,pase-wide-q-15,pase-wide-q-16,pase-wide-q-17,pase-wide-q-18,pase-wide-q-19,pase-wide-q-20,pase-wide-q-21,pase-wide-q-22,pase-wide-q-23,pase-wide-q-24,pase-wide-q-25,pase-wide-q-26,pase-wide-q-27,pase-wide-q-28,pase-wide-q-29,pase-wide-q-30,pase-wide-q-31,pase-wide-q-32,pase-wide-q-33,pase-wide-q-34,pase-wide-q-35,pase-wide-q-36,pase-wide-q-37,pase-wide-q-38,pase-wide-q-39,pase-wide-q-40,pase-wide-q-41,pase-wide-q-42,pase-wide-q-43,pase-wide-q-44,pase-wide-q-45,pase-wide-q-46,pase-wide-q-47,pase-wide-q-48,pase-wide-q-49,pase-wide-q-50,pase-wide-q-51,pase-wide-q-52,pase-wide-q-53,pase-wide-q-54,pase-wide-q-55,pase-wide-q-56,pase-wide-q-57,pase-wide-q-58,pase-wide-q-59,pase-wide-q-60,pase-wide-q-61,pase-wide-q-62,pase-wide-q-63,pase-wide-q-64,pase-wide-q-65,pase-wide-q-66,pase-wide-q-67,pase-wide-q-68,pase-wide-q-69,pase-wide-q-70,pase-wide-q-71,pase-wide-q-72,pase-wide-q-73,pase-wide-q-74,pase-wide-q-75,pase-wide-q-76,pase-wide-q-77,pase-wide-q-78,pase-wide-q-79,pase-wide-q-80,pase-wide-q-81,pase-wide-q-82,pase-wide-q-83,pase-wide-q-84,pase-wide-q-85,pase-wide-q-86,pase-wide-q-87,pase-wide-q-88,pase-wide-q-89,pase-wide-q-90,pase-wide-q-91,pase-wide-q-92,pase-wide-q-93,pase-wide-q-94,pase-wide-q-95,pase-wide-q-96,pase-wide-q-97,pase-wide-q-98,pase-wide-q-99,pase-wide-q-100,pase-wide-q-101,pase-wide-q-102,pase-wide-q-103,pase-wide-q-104,pase-wide-q-105,pase-wide-q-106,pase-wide-q-107,pase-wide-q-108,pase-wide-q-109,pase-wide-q-110,pase-wide-q-111,pase-wide-q-112,pase-wide-q-113,pase-wide-q-114,pase-wide-q-115,pase-wide-q-116,pase-wide-q-117,pase-wide-q-118,pase-wide-q-119,pase-wide-q-120,pase-wide-q-121,pase-wide-q-122,pase-wide-q-123,pase-wide-q-124,pase-wide-q-125,pase-wide-q-126,pase-wide-q-127,pase-wide-q-128,pase-wide-q-129,pase-wide-q-130,pase-wide-q-131,pase-wide-q-132,pase-wide-q-133,pase-wide-q-134,pase-wide-q-135,pase-wide-q-136,pase-wide-q-137,pase-wide-q-138,pase-wide-q-139,pase-wide-q-140,pase-wide-q-141,pase-wide-q-142,pase-wide-q-143,pase-wide-q-144,pase-wide-q-145,pase-wide-q-146,pase-wide-q-147,pase-wide-q-148,pase-wide-q-149,pase-wide-q-150,pase-wide-q-151,pase-wide-q-152,pase-wide-q-153,pase-wide-q-154,pase-wide-q-155,pase-wide-q-156,pase-wide-q-157,pase-wide-q-158,pase-wide-q-159,pase-wide-q-160,pase-wide-q-161,pase-wide-q-162,pase-wide-q-163,pase-wide-q-164,pase-wide-q-165,pase-wide-q-166,pase-wide-q-167,pase-wide-q-168,pase-wide-q-169,pase-wide-q-170,pase-wide-q-171,pase-wide-q-172,pase-wide-q-173,pase-wide-q-174,pase-wide-q-175,pase-wide-q-176,pase-wide-q-177,pase-wide-q-178,pase-wide-q-179,pase-wide-q-180,pase-wide-q-181,pase-wide-q-182,pase-wide-q-183,pase-wide-q-184,pase-wide-q-185,pase-wide-q-186,pase-wide-q-187,pase-wide-q-188,pase-wide-q-189,pase-wide-q-190,pase-wide-q-191,pase-wide-q-192,pase-wide-q-193,pase-wide-q-194,pase-wide-q-195,pase-wide-q-196,pase-wide-q-197,pase-wide-q-198}'::text[]))
+                Buffers: shared hit=2
+  CTE paused_activities
+    ->  Aggregate  (cost=21.38..21.39 rows=1 width=32) (actual rows=1 loops=1)
+          ->  Seq Scan on harvest_activity_pauses  (cost=0.00..19.10 rows=910 width=26) (actual rows=0 loops=1)
+  CTE concurrency_pending_keys
+    ->  Unique  (cost=469.52..469.53 rows=1 width=41) (never executed)
+          ->  Sort  (cost=469.52..469.52 rows=1 width=41) (never executed)
+                Sort Key: harvest_task_queue.concurrency_key, harvest_task_queue.task_type
+                ->  Seq Scan on harvest_task_queue  (cost=0.51..469.51 rows=1 width=41) (never executed)
+                      Filter: ((concurrency_key IS NOT NULL) AND (concurrency_cap IS NOT NULL) AND (state = 'PENDING'::text) AND (queue_name = ANY ('{harvest-bench-q-0,harvest-bench-q-1,harvest-bench-q-2,harvest-bench-q-3,pase-wide-q-0,pase-wide-q-1,pase-wide-q-2,pase-wide-q-3,pase-wide-q-4,pase-wide-q-5,pase-wide-q-6,pase-wide-q-7,pase-wide-q-8,pase-wide-q-9,pase-wide-q-10,pase-wide-q-11,pase-wide-q-12,pase-wide-q-13,pase-wide-q-14,pase-wide-q-15,pase-wide-q-16,pase-wide-q-17,pase-wide-q-18,pase-wide-q-19,pase-wide-q-20,pase-wide-q-21,pase-wide-q-22,pase-wide-q-23,pase-wide-q-24,pase-wide-q-25,pase-wide-q-26,pase-wide-q-27,pase-wide-q-28,pase-wide-q-29,pase-wide-q-30,pase-wide-q-31,pase-wide-q-32,pase-wide-q-33,pase-wide-q-34,pase-wide-q-35,pase-wide-q-36,pase-wide-q-37,pase-wide-q-38,pase-wide-q-39,pase-wide-q-40,pase-wide-q-41,pase-wide-q-42,pase-wide-q-43,pase-wide-q-44,pase-wide-q-45,pase-wide-q-46,pase-wide-q-47,pase-wide-q-48,pase-wide-q-49,pase-wide-q-50,pase-wide-q-51,pase-wide-q-52,pase-wide-q-53,pase-wide-q-54,pase-wide-q-55,pase-wide-q-56,pase-wide-q-57,pase-wide-q-58,pase-wide-q-59,pase-wide-q-60,pase-wide-q-61,pase-wide-q-62,pase-wide-q-63,pase-wide-q-64,pase-wide-q-65,pase-wide-q-66,pase-wide-q-67,pase-wide-q-68,pase-wide-q-69,pase-wide-q-70,pase-wide-q-71,pase-wide-q-72,pase-wide-q-73,pase-wide-q-74,pase-wide-q-75,pase-wide-q-76,pase-wide-q-77,pase-wide-q-78,pase-wide-q-79,pase-wide-q-80,pase-wide-q-81,pase-wide-q-82,pase-wide-q-83,pase-wide-q-84,pase-wide-q-85,pase-wide-q-86,pase-wide-q-87,pase-wide-q-88,pase-wide-q-89,pase-wide-q-90,pase-wide-q-91,pase-wide-q-92,pase-wide-q-93,pase-wide-q-94,pase-wide-q-95,pase-wide-q-96,pase-wide-q-97,pase-wide-q-98,pase-wide-q-99,pase-wide-q-100,pase-wide-q-101,pase-wide-q-102,pase-wide-q-103,pase-wide-q-104,pase-wide-q-105,pase-wide-q-106,pase-wide-q-107,pase-wide-q-108,pase-wide-q-109,pase-wide-q-110,pase-wide-q-111,pase-wide-q-112,pase-wide-q-113,pase-wide-q-114,pase-wide-q-115,pase-wide-q-116,pase-wide-q-117,pase-wide-q-118,pase-wide-q-119,pase-wide-q-120,pase-wide-q-121,pase-wide-q-122,pase-wide-q-123,pase-wide-q-124,pase-wide-q-125,pase-wide-q-126,pase-wide-q-127,pase-wide-q-128,pase-wide-q-129,pase-wide-q-130,pase-wide-q-131,pase-wide-q-132,pase-wide-q-133,pase-wide-q-134,pase-wide-q-135,pase-wide-q-136,pase-wide-q-137,pase-wide-q-138,pase-wide-q-139,pase-wide-q-140,pase-wide-q-141,pase-wide-q-142,pase-wide-q-143,pase-wide-q-144,pase-wide-q-145,pase-wide-q-146,pase-wide-q-147,pase-wide-q-148,pase-wide-q-149,pase-wide-q-150,pase-wide-q-151,pase-wide-q-152,pase-wide-q-153,pase-wide-q-154,pase-wide-q-155,pase-wide-q-156,pase-wide-q-157,pase-wide-q-158,pase-wide-q-159,pase-wide-q-160,pase-wide-q-161,pase-wide-q-162,pase-wide-q-163,pase-wide-q-164,pase-wide-q-165,pase-wide-q-166,pase-wide-q-167,pase-wide-q-168,pase-wide-q-169,pase-wide-q-170,pase-wide-q-171,pase-wide-q-172,pase-wide-q-173,pase-wide-q-174,pase-wide-q-175,pase-wide-q-176,pase-wide-q-177,pase-wide-q-178,pase-wide-q-179,pase-wide-q-180,pase-wide-q-181,pase-wide-q-182,pase-wide-q-183,pase-wide-q-184,pase-wide-q-185,pase-wide-q-186,pase-wide-q-187,pase-wide-q-188,pase-wide-q-189,pase-wide-q-190,pase-wide-q-191,pase-wide-q-192,pase-wide-q-193,pase-wide-q-194,pase-wide-q-195,pase-wide-q-196,pase-wide-q-197,pase-wide-q-198}'::text[])) AND (scheduled_at <= now()))
+  CTE concurrency_running_counts
+    ->  GroupAggregate  (cost=5.93..5.95 rows=1 width=49) (never executed)
+          Group Key: t.concurrency_key, t.task_type
+          ->  Sort  (cost=5.93..5.94 rows=1 width=41) (never executed)
+                Sort Key: t.concurrency_key, t.task_type
+                ->  Nested Loop Semi Join  (cost=0.12..5.92 rows=1 width=41) (never executed)
+                      Join Filter: (concurrency_pending_keys.concurrency_key = t.concurrency_key)
+                      ->  Index Scan using idx_harvest_tq_running on harvest_task_queue t  (cost=0.12..5.89 rows=1 width=41) (never executed)
+                            Filter: (worker_id IS NOT NULL)
+                      ->  CTE Scan on concurrency_pending_keys  (cost=0.00..0.02 rows=1 width=32) (never executed)
+  CTE candidate
+    ->  Limit  (cost=442285.38..442285.39 rows=1 width=250) (actual rows=1 loops=1)
+          Buffers: shared hit=1392, temp read=484 written=5098
+          ->  LockRows  (cost=442285.38..442398.45 rows=9046 width=250) (actual rows=1 loops=1)
+                Buffers: shared hit=1392, temp read=484 written=5098
+                ->  Sort  (cost=442285.38..442307.99 rows=9046 width=250) (actual rows=1 loops=1)
+                      Sort Key: (CASE WHEN ((harvest_task_queue_1.sticky_worker_id = 'pase-worker'::text) AND (harvest_task_queue_1.sticky_until > now())) THEN 1 ELSE 0 END) DESC, harvest_task_queue_1.priority DESC, harvest_task_queue_1.scheduled_at
+                      Sort Method: external merge  Disk: 40704kB
+                      Buffers: shared hit=1391, temp read=484 written=5098
+                      ->  Nested Loop  (cost=0.29..442240.15 rows=9046 width=250) (actual rows=10000 loops=1)
+                            Join Filter: ((harvest_task_queue_1.task_type <> 'activity'::text) OR (harvest_task_queue_1.activity_name IS NULL) OR (harvest_task_queue_1.activity_name <> ALL (paused_activities.names)))
+                            Buffers: shared hit=1391
+                            ->  CTE Scan on paused_activities  (cost=0.00..0.02 rows=1 width=88) (actual rows=1 loops=1)
+                            ->  Nested Loop  (cost=0.29..441934.51 rows=9511 width=230) (actual rows=10000 loops=1)
+                                  Join Filter: (harvest_task_queue_1.queue_name <> ALL (paused_queues.names))
+                                  Buffers: shared hit=1391
+                                  ->  CTE Scan on paused_queues  (cost=0.00..0.02 rows=1 width=88) (actual rows=1 loops=1)
+                                        Buffers: shared hit=2
+                                  ->  Index Scan using idx_harvest_tq_poll on harvest_task_queue harvest_task_queue_1  (cost=0.29..441709.49 rows=10000 width=192) (actual rows=10000 loops=1)
+                                        Index Cond: ((queue_name = ANY ('{harvest-bench-q-0,harvest-bench-q-1,harvest-bench-q-2,harvest-bench-q-3,pase-wide-q-0,pase-wide-q-1,pase-wide-q-2,pase-wide-q-3,pase-wide-q-4,pase-wide-q-5,pase-wide-q-6,pase-wide-q-7,pase-wide-q-8,pase-wide-q-9,pase-wide-q-10,pase-wide-q-11,pase-wide-q-12,pase-wide-q-13,pase-wide-q-14,pase-wide-q-15,pase-wide-q-16,pase-wide-q-17,pase-wide-q-18,pase-wide-q-19,pase-wide-q-20,pase-wide-q-21,pase-wide-q-22,pase-wide-q-23,pase-wide-q-24,pase-wide-q-25,pase-wide-q-26,pase-wide-q-27,pase-wide-q-28,pase-wide-q-29,pase-wide-q-30,pase-wide-q-31,pase-wide-q-32,pase-wide-q-33,pase-wide-q-34,pase-wide-q-35,pase-wide-q-36,pase-wide-q-37,pase-wide-q-38,pase-wide-q-39,pase-wide-q-40,pase-wide-q-41,pase-wide-q-42,pase-wide-q-43,pase-wide-q-44,pase-wide-q-45,pase-wide-q-46,pase-wide-q-47,pase-wide-q-48,pase-wide-q-49,pase-wide-q-50,pase-wide-q-51,pase-wide-q-52,pase-wide-q-53,pase-wide-q-54,pase-wide-q-55,pase-wide-q-56,pase-wide-q-57,pase-wide-q-58,pase-wide-q-59,pase-wide-q-60,pase-wide-q-61,pase-wide-q-62,pase-wide-q-63,pase-wide-q-64,pase-wide-q-65,pase-wide-q-66,pase-wide-q-67,pase-wide-q-68,pase-wide-q-69,pase-wide-q-70,pase-wide-q-71,pase-wide-q-72,pase-wide-q-73,pase-wide-q-74,pase-wide-q-75,pase-wide-q-76,pase-wide-q-77,pase-wide-q-78,pase-wide-q-79,pase-wide-q-80,pase-wide-q-81,pase-wide-q-82,pase-wide-q-83,pase-wide-q-84,pase-wide-q-85,pase-wide-q-86,pase-wide-q-87,pase-wide-q-88,pase-wide-q-89,pase-wide-q-90,pase-wide-q-91,pase-wide-q-92,pase-wide-q-93,pase-wide-q-94,pase-wide-q-95,pase-wide-q-96,pase-wide-q-97,pase-wide-q-98,pase-wide-q-99,pase-wide-q-100,pase-wide-q-101,pase-wide-q-102,pase-wide-q-103,pase-wide-q-104,pase-wide-q-105,pase-wide-q-106,pase-wide-q-107,pase-wide-q-108,pase-wide-q-109,pase-wide-q-110,pase-wide-q-111,pase-wide-q-112,pase-wide-q-113,pase-wide-q-114,pase-wide-q-115,pase-wide-q-116,pase-wide-q-117,pase-wide-q-118,pase-wide-q-119,pase-wide-q-120,pase-wide-q-121,pase-wide-q-122,pase-wide-q-123,pase-wide-q-124,pase-wide-q-125,pase-wide-q-126,pase-wide-q-127,pase-wide-q-128,pase-wide-q-129,pase-wide-q-130,pase-wide-q-131,pase-wide-q-132,pase-wide-q-133,pase-wide-q-134,pase-wide-q-135,pase-wide-q-136,pase-wide-q-137,pase-wide-q-138,pase-wide-q-139,pase-wide-q-140,pase-wide-q-141,pase-wide-q-142,pase-wide-q-143,pase-wide-q-144,pase-wide-q-145,pase-wide-q-146,pase-wide-q-147,pase-wide-q-148,pase-wide-q-149,pase-wide-q-150,pase-wide-q-151,pase-wide-q-152,pase-wide-q-153,pase-wide-q-154,pase-wide-q-155,pase-wide-q-156,pase-wide-q-157,pase-wide-q-158,pase-wide-q-159,pase-wide-q-160,pase-wide-q-161,pase-wide-q-162,pase-wide-q-163,pase-wide-q-164,pase-wide-q-165,pase-wide-q-166,pase-wide-q-167,pase-wide-q-168,pase-wide-q-169,pase-wide-q-170,pase-wide-q-171,pase-wide-q-172,pase-wide-q-173,pase-wide-q-174,pase-wide-q-175,pase-wide-q-176,pase-wide-q-177,pase-wide-q-178,pase-wide-q-179,pase-wide-q-180,pase-wide-q-181,pase-wide-q-182,pase-wide-q-183,pase-wide-q-184,pase-wide-q-185,pase-wide-q-186,pase-wide-q-187,pase-wide-q-188,pase-wide-q-189,pase-wide-q-190,pase-wide-q-191,pase-wide-q-192,pase-wide-q-193,pase-wide-q-194,pase-wide-q-195,pase-wide-q-196,pase-wide-q-197,pase-wide-q-198}'::text[])) AND (state = 'PENDING'::text) AND (scheduled_at <= now()))
+                                        Filter: (((session_id IS NULL) OR (sticky_worker_id = 'pase-worker'::text)) AND ((task_type <> 'workflow'::text) OR (workflow_exec_id IS NULL) OR (NOT (SubPlan 6))) AND ((schedule_to_close_at IS NULL) OR (schedule_to_close_at > now())) AND ((sticky_worker_id IS NULL) OR (sticky_worker_id = 'pase-worker'::text) OR (sticky_until IS NULL) OR (sticky_until <= now())) AND ((concurrency_key IS NULL) OR (concurrency_cap IS NULL) OR (COALESCE((SubPlan 5), '0'::bigint) < concurrency_cap)) AND ((rate_limit_key IS NULL) OR (activity_name = ANY ('{}'::text[])) OR (hashed SubPlan 14)) AND ((required_capabilities IS NULL) OR (NOT (SubPlan 12))))
+                                        Buffers: shared hit=1389
+                                        SubPlan 6
+                                          ->  Seq Scan on harvest_workflow_executions e  (cost=0.00..0.00 rows=1 width=0) (never executed)
+                                                Filter: ((id = harvest_task_queue_1.workflow_exec_id) AND (state = 'PAUSED'::text))
+                                        SubPlan 5
+                                          ->  CTE Scan on concurrency_running_counts rc  (cost=0.00..0.03 rows=1 width=8) (never executed)
+                                                Filter: ((concurrency_key = harvest_task_queue_1.concurrency_key) AND (task_type = harvest_task_queue_1.task_type))
+                                        SubPlan 14
+                                          ->  Seq Scan on harvest_rate_limit_buckets b  (cost=0.00..43.00 rows=183 width=32) (never executed)
+                                                Filter: (LEAST(COALESCE(CASE WHEN (override_expires_at > now()) THEN override_burst ELSE NULL::double precision END, burst), ((tokens + ((GREATEST('0'::numeric, EXTRACT(epoch FROM (LEAST(COALESCE(override_expires_at, last_refilled_at), now()) - last_refilled_at))))::double precision * COALESCE(override_refill_rate, refill_rate))) + ((GREATEST('0'::numeric, EXTRACT(epoch FROM (now() - GREATEST(COALESCE(override_expires_at, last_refilled_at), last_refilled_at)))))::double precision * refill_rate))) >= '1'::double precision)
+                                        SubPlan 12
+                                          ->  Function Scan on jsonb_array_elements r  (cost=32.65..38.90 rows=2 width=0) (never executed)
+                                                Filter: (((value ? 'Exact'::text) AND (((COALESCE($8, '{}'::jsonb) ->> ((value -> 'Exact'::text) ->> 'key'::text)) IS NULL) OR ((COALESCE($9, '{}'::jsonb) ->> ((value -> 'Exact'::text) ->> 'key'::text)) <> ((value -> 'Exact'::text) ->> 'value'::text)))) OR ((value ? 'In'::text) AND (((COALESCE($10, '{}'::jsonb) ->> ((value -> 'In'::text) ->> 'key'::text)) IS NULL) OR (NOT (((value -> 'In'::text) -> 'values'::text) @> jsonb_build_array((COALESCE($11, '{}'::jsonb) ->> ((value -> 'In'::text) ->> 'key'::text))))))))
+                                                InitPlan 8 (returns $8)
+                                                  ->  Index Scan using harvest_workers_pkey on harvest_workers  (cost=0.14..8.16 rows=1 width=32) (never executed)
+                                                        Index Cond: (worker_id = 'pase-worker'::text)
+                                                InitPlan 9 (returns $9)
+                                                  ->  Index Scan using harvest_workers_pkey on harvest_workers harvest_workers_1  (cost=0.14..8.16 rows=1 width=32) (never executed)
+                                                        Index Cond: (worker_id = 'pase-worker'::text)
+                                                InitPlan 10 (returns $10)
+                                                  ->  Index Scan using harvest_workers_pkey on harvest_workers harvest_workers_2  (cost=0.14..8.16 rows=1 width=32) (never executed)
+                                                        Index Cond: (worker_id = 'pase-worker'::text)
+                                                InitPlan 11 (returns $11)
+                                                  ->  Index Scan using harvest_workers_pkey on harvest_workers harvest_workers_3  (cost=0.14..8.16 rows=1 width=32) (never executed)
+                                                        Index Cond: (worker_id = 'pase-worker'::text)
+  CTE rate_limit_debit
+    ->  Update on harvest_rate_limit_buckets b_1  (cost=0.15..8.38 rows=1 width=78) (actual rows=0 loops=1)
+          ->  Nested Loop  (cost=0.15..8.38 rows=1 width=78) (actual rows=0 loops=1)
+                ->  CTE Scan on candidate  (cost=0.00..0.02 rows=1 width=88) (actual rows=1 loops=1)
+                      Filter: (activity_name <> ALL ('{}'::text[]))
+                ->  Index Scan using harvest_rate_limit_buckets_pkey on harvest_rate_limit_buckets b_1  (cost=0.15..8.22 rows=1 width=94) (actual rows=0 loops=1)
+                      Index Cond: ((key)::text = (candidate.rate_limit_key)::text)
+                      Filter: (LEAST(COALESCE(CASE WHEN (override_expires_at > now()) THEN override_burst ELSE NULL::double precision END, burst), ((tokens + ((GREATEST('0'::numeric, EXTRACT(epoch FROM (LEAST(COALESCE(override_expires_at, last_refilled_at), now()) - last_refilled_at))))::double precision * COALESCE(override_refill_rate, refill_rate))) + ((GREATEST('0'::numeric, EXTRACT(epoch FROM (now() - GREATEST(COALESCE(override_expires_at, last_refilled_at), last_refilled_at)))))::double precision * refill_rate))) >= '1'::double precision)
+  CTE claimed
+    ->  Update on harvest_task_queue harvest_task_queue_2  (cost=0.29..14.27 rows=1 width=123) (actual rows=1 loops=1)
+          Buffers: shared hit=1413 dirtied=4 written=2, temp read=484 written=5098
+          ->  Nested Loop  (cost=0.29..14.27 rows=1 width=123) (actual rows=1 loops=1)
+                Buffers: shared hit=1395, temp read=484 written=5098
+                ->  CTE Scan on candidate candidate_1  (cost=0.00..5.96 rows=1 width=56) (actual rows=1 loops=1)
+                      Filter: (((rate_limit_key IS NULL) OR (activity_name = ANY ('{}'::text[])) OR (hashed SubPlan 19)) AND ((concurrency_key IS NULL) OR (pg_try_advisory_xact_lock((hashtext(concurrency_key))::bigint) AND ((concurrency_cap IS NULL) OR ((SubPlan 17) < concurrency_cap)))))
+                      Buffers: shared hit=1392, temp read=484 written=5098
+                      SubPlan 19
+                        ->  CTE Scan on rate_limit_debit  (cost=0.00..0.02 rows=1 width=32) (never executed)
+                      SubPlan 17
+                        ->  Aggregate  (cost=5.90..5.91 rows=1 width=8) (never executed)
+                              ->  Index Scan using idx_harvest_tq_running on harvest_task_queue recheck  (cost=0.12..5.89 rows=1 width=0) (never executed)
+                                    Filter: ((worker_id IS NOT NULL) AND (concurrency_key = candidate_1.concurrency_key) AND (task_type = candidate_1.task_type))
+                ->  Index Scan using harvest_task_queue_pkey on harvest_task_queue harvest_task_queue_2  (cost=0.29..8.30 rows=1 width=26) (actual rows=1 loops=1)
+                      Index Cond: (id = candidate_1.id)
+                      Buffers: shared hit=3
+Planning:
+  Buffers: shared hit=684 read=42
+Planning Time: 4.469 ms
+JIT:
+  Functions: 129
+  Options: Inlining false, Optimization false, Expressions true, Deforming true
+Execution Time: 190.963 ms

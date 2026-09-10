@@ -1631,3 +1631,60 @@ fn claim_gate_docs_do_not_claim_the_delta_isolates_the_anti_join() {
          equal-total-depth comparison, not predicate isolation."
     );
 }
+
+/// The `ClaimGate` known-gaps list must name activity pauses (#807).
+///
+/// Issue #1215 found this predicate absent from the gap list even though it
+/// is unmeasured by every scenario here exactly like the other five gaps —
+/// a maintainer reading only this enum would not learn it exists.
+#[test]
+fn claim_gate_docs_name_the_activity_pause_gap() {
+    let harness = read_normalized(
+        &Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/integration/claim_bench_support.rs"),
+    );
+    let start = harness
+        .find("Which accreted claim-path gate a scenario exercises")
+        .expect("the harness must document `ClaimGate`");
+    let end = harness
+        .find("pub enum ClaimGate {")
+        .expect("the harness must declare `pub enum ClaimGate`");
+    let region = &harness[start..end];
+
+    assert!(
+        region.contains("#807"),
+        "the `ClaimGate` doc comment's known-gaps list does not mention \
+         issue #807 (activity pauses). It names five gaps and omits a sixth: \
+         no scenario here seeds `harvest_activity_pauses` either, so a \
+         maintainer reading only this list would not know the predicate \
+         exists."
+    );
+}
+
+/// `docs/performance.md`'s Known limitations section must document the
+/// activity-pause gap (#807) that issue #1215 found missing from it, and
+/// must not present the queue-pause fix (#619) as resolved at every array
+/// size without qualification.
+#[test]
+fn known_limitations_documents_the_pause_array_size_finding() {
+    let doc = read_performance_doc();
+    let flat = collapse_ws(&doc);
+
+    assert!(
+        flat.contains("Activity pauses (#807)"),
+        "docs/performance.md's Known limitations section must list activity \
+         pauses (#807) alongside the other five unmeasured-in-the-attribution-\
+         table predicates. Issue #1215 found it absent entirely — not even \
+         acknowledged as a gap."
+    );
+    assert!(
+        doc.contains("#the-pause-array-size-sweep-issue-1215"),
+        "the activity-pauses bullet must link to the pause-array-size sweep \
+         that measures it, or the claim is unsourced."
+    );
+    assert!(
+        flat.contains("That fix was measured against exactly one active pause"),
+        "the queue-pauses (#619) bullet must say its fix was only measured \
+         against a single active pause, or a reader has no reason to expect \
+         the finding below about array width."
+    );
+}
