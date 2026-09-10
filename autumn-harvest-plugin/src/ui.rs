@@ -320,7 +320,12 @@ struct WorkflowSignalForm {
 
 #[derive(Debug, Deserialize)]
 struct WorkflowResetForm {
-    reset_to_event_id: i64,
+    /// Raw submitted text, not `i64`. A malformed value must reach the
+    /// handler as text. It then redisplays as a flash error, instead of
+    /// aborting the request at the `Form` extractor. See
+    /// `parse_reset_to_event_id`.
+    #[serde(default)]
+    reset_to_event_id: String,
     #[serde(default)]
     reason: Option<String>,
 }
@@ -2019,6 +2024,37 @@ async fn signal_workflow_ui(
     Ok(axum::response::Redirect::to(&redirect_url).into_response())
 }
 
+/// Parse the "Reset to event N" field (1-based, matching the timeline "#"
+/// column) from its raw submitted text.
+///
+/// `WorkflowResetForm` types this field as `String`, not `i64`. axum's
+/// `Form` extractor runs `serde` deserialization before the handler body
+/// executes. A field typed directly as `i64` therefore rejects the whole
+/// request with a bare, unstyled 400 on a non-numeric value. No HTML
+/// renders, and the operator's entered reason is never read. That is the
+/// same page-abort mechanism #1333/#1378/#1420/#1437 fixed for the list
+/// pages' filter fields.
+///
+/// This form differs from those filters. It is not a filter; it is the
+/// runbook's destructive recovery action. Operators use it for a stuck
+/// child workflow or a non-determinism failure (`docs/vantage-ui.md`
+/// scenarios 3 and 4). Parsing here keeps a malformed value inside the
+/// handler. It then renders as the same flash-redirect error
+/// `signal_workflow_ui` already produces for an invalid JSON payload.
+///
+/// Range and existence validation — does this event id exist on this
+/// execution — stays downstream in `validate_reset_point`. This function
+/// rejects only text that is not a whole number.
+fn parse_reset_to_event_id(raw: &str) -> Result<i64, String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Err("event number is required".to_string());
+    }
+    trimmed
+        .parse::<i64>()
+        .map_err(|_| format!("invalid event number '{trimmed}'; expected a whole number"))
+}
+
 async fn reset_workflow_ui(
     Extension(api_state): Extension<HarvestApiState>,
     headers: axum::http::HeaderMap,
@@ -2038,22 +2074,29 @@ async fn reset_workflow_ui(
         .to_string();
 
     // The form shows 1-based event numbers (matching the timeline "#" column).
-    // The reset API accepts 0-based event IDs.
-    let reset_to_event_id = form.reset_to_event_id.saturating_sub(1);
-
-    let request = WorkflowResetRequest {
-        reset_to_event_id: Some(reset_to_event_id),
-        reset_point: None,
-        reason,
-        operator_id: actor.clone(),
-        signal_reapply: ResetSignalReapplyPolicy::default(),
-        allow_terminal_source: false,
-        refuse_erased_source: false,
+    // The reset API accepts 0-based event IDs. A malformed value is rejected
+    // here, inside the handler, instead of guessing an event number the
+    // operator never typed. This mirrors the reject-rather-than-guess rule
+    // #1437's bulk-action fix applied to a mutating endpoint.
+    let reset_result = match parse_reset_to_event_id(&form.reset_to_event_id) {
+        Ok(event_number) => {
+            let request = WorkflowResetRequest {
+                reset_to_event_id: Some(event_number.saturating_sub(1)),
+                reset_point: None,
+                reason,
+                operator_id: actor.clone(),
+                signal_reapply: ResetSignalReapplyPolicy::default(),
+                allow_terminal_source: false,
+                refuse_erased_source: false,
+            };
+            let runtime = api_state.runtime().ok();
+            let registry = runtime.as_ref().map(|r| r.registry().as_ref());
+            reset_workflow_execution(&mut conn, exec_id, request, registry)
+                .await
+                .map_err(|e| e.to_string())
+        }
+        Err(e) => Err(e),
     };
-
-    let runtime = api_state.runtime().ok();
-    let registry = runtime.as_ref().map(|r| r.registry().as_ref());
-    let reset_result = reset_workflow_execution(&mut conn, exec_id, request, registry).await;
     let (status, error_summary, flash) = match &reset_result {
         Ok(result) => (
             STATUS_SUCCEEDED,
@@ -2063,14 +2106,11 @@ async fn reset_workflow_ui(
                 result.new_exec_id
             )),
         ),
-        Err(e) => {
-            let msg = e.to_string();
-            (
-                STATUS_FAILED,
-                Some(msg.clone()),
-                url_encode(&format!("Reset failed: {msg}")),
-            )
-        }
+        Err(msg) => (
+            STATUS_FAILED,
+            Some(msg.clone()),
+            url_encode(&format!("Reset failed: {msg}")),
+        ),
     };
     let _ = insert_audit(
         &mut conn,
@@ -12039,6 +12079,53 @@ mod tests {
             parse_dead_letter_time_filter("failed_after", Some("   ")),
             (None, String::new(), None)
         );
+    }
+
+    /// GREEN — the fix under test. `reset_to_event_id` used to be typed
+    /// `i64` straight on the `Form<..>` extractor struct for the "Reset to
+    /// event N" action. A non-numeric value failed axum's own form
+    /// deserialization. That aborted the request with a bare framework 400.
+    /// The handler never ran. The operator's reason was never read, and no
+    /// flash message could render. Reset is not a filter; it is the
+    /// runbook's destructive recovery action for a stuck child workflow or
+    /// a non-determinism failure. A malformed value must be rejected with a
+    /// clear error. It must never be silently defaulted to some other
+    /// event.
+    #[test]
+    fn parse_reset_to_event_id_accepts_valid_values() {
+        assert_eq!(parse_reset_to_event_id("1"), Ok(1));
+        assert_eq!(parse_reset_to_event_id("  42  "), Ok(42));
+        assert_eq!(parse_reset_to_event_id("0"), Ok(0));
+        assert_eq!(parse_reset_to_event_id("-3"), Ok(-3));
+    }
+
+    #[test]
+    fn parse_reset_to_event_id_rejects_non_numeric_text() {
+        let err = parse_reset_to_event_id("abc").expect_err("must reject non-numeric text");
+        assert!(
+            err.contains("abc"),
+            "the error must name the bad value: {err}"
+        );
+    }
+
+    #[test]
+    fn parse_reset_to_event_id_rejects_a_fraction() {
+        // A `type="number"` input's `step="1"` default blocks this in a
+        // real browser. A bare `Form` POST from any other client is still a
+        // reachable path. It must not 400 before the handler runs.
+        assert!(parse_reset_to_event_id("1.5").is_err());
+    }
+
+    #[test]
+    fn parse_reset_to_event_id_rejects_i64_overflow() {
+        assert!(parse_reset_to_event_id("99999999999999999999").is_err());
+    }
+
+    #[test]
+    fn parse_reset_to_event_id_rejects_blank_or_missing() {
+        let err = parse_reset_to_event_id("").expect_err("empty text must be rejected");
+        assert!(err.contains("required"), "error must explain why: {err}");
+        assert!(parse_reset_to_event_id("   ").is_err());
     }
 
     /// GREEN — the fix under test: `shard`/`shard_id` used to be typed
