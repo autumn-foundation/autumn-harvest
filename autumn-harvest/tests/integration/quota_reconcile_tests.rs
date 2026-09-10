@@ -395,3 +395,47 @@ async fn zero_batch_size_disables_the_sweep() {
     assert_eq!(summary, autumn_harvest::quota_reconcile::ReconcileSummary::default());
     assert_eq!(read_quota_key(&mut conn, exec_id).await, None);
 }
+
+#[tokio::test]
+async fn batch_size_bounds_a_single_sweep_and_the_rest_finish_on_the_next_one() {
+    let (mut conn, _container) = setup_db().await;
+    let workflow_name = leaked("wf_batched");
+    let policy = QuotaPolicy::new("tenant_id").with_max_active_executions(10);
+    let _guard = MetadataGuard::install_one(workflow_name, policy).await;
+
+    let mut exec_ids = Vec::new();
+    for _ in 0..5 {
+        let id = insert_execution(
+            &mut conn,
+            workflow_name,
+            "RUNNING",
+            serde_json::json!({ "tenant_id": "acme" }),
+            None,
+        )
+        .await;
+        exec_ids.push(id);
+    }
+
+    let first = reconcile_quota_keys(&mut conn, 2).await.expect("first sweep");
+    assert_eq!(
+        first.backfilled, 2,
+        "LIMIT $1 must cap one sweep to batch_size rows, not the full candidate set"
+    );
+
+    let mut backfilled_after_first = 0;
+    for &id in &exec_ids {
+        if read_quota_key(&mut conn, id).await.is_some() {
+            backfilled_after_first += 1;
+        }
+    }
+    assert_eq!(backfilled_after_first, 2, "exactly batch_size rows written, no more");
+
+    let second = reconcile_quota_keys(&mut conn, 2).await.expect("second sweep");
+    assert_eq!(second.backfilled, 2);
+    let third = reconcile_quota_keys(&mut conn, 2).await.expect("third sweep");
+    assert_eq!(third.backfilled, 1, "the fifth and last row finishes on a later sweep");
+
+    for id in exec_ids {
+        assert_eq!(read_quota_key(&mut conn, id).await, Some("acme".to_string()));
+    }
+}

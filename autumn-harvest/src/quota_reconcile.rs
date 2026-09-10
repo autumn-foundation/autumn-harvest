@@ -37,7 +37,12 @@
 //! closes both cases with one mechanism, and never touches the startup
 //! path, so it cannot delay boot on a deployment with a large non-terminal
 //! backlog: [`spawn_quota_key_reconciler_for_shard`]'s per-tick work is
-//! bounded by `batch_size` regardless of how many eligible rows exist.
+//! bounded by `batch_size` regardless of how many eligible rows exist --
+//! and, thanks to `idx_harvest_we_quota_reconcile_candidates` (see
+//! [`quota_reconcile_candidate_query`]'s doc comment), so is the SCAN that
+//! finds them. The existing `idx_harvest_we_state` index covers only
+//! `RUNNING`, not `PAUSED`, so it cannot serve this query on its own; the
+//! dedicated index closes that gap.
 //!
 //! # Residual window
 //!
@@ -47,6 +52,20 @@
 //! interval after the policy takes effect. That is the same order of
 //! magnitude as the rollout gap the migration already documents as bounded
 //! and self-healing, not a new risk class.
+//!
+//! # Out of scope: `harvest_dead_letters.quota_key`
+//!
+//! This sweep only ever reads and writes `harvest_workflow_executions`. A
+//! dead letter denormalizes its `quota_key` from its owning execution's row
+//! at DLQ-insert time ([`crate::dlq::dead_letter`]); one inserted before
+//! that execution's own row was backfilled -- or before this module existed
+//! -- keeps `quota_key = NULL` permanently, since nothing ever revisits
+//! `harvest_dead_letters` afterward. `max_dead_letters` accounting for such
+//! historical rows stays blind. Issue #1226's own draft acceptance criteria
+//! scope this module to non-terminal execution rows only and call a
+//! separate DLQ backfill lower priority; it is tracked, not silently
+//! dropped, but is a deliberately separate follow-up rather than part of
+//! this sweep.
 
 use crate::quota::{QuotaPolicy, quota_key_over_cap, resolve_quota_key};
 
@@ -147,12 +166,18 @@ struct CandidateRow {
 
 /// SQL for [`reconcile_quota_keys`]'s candidate scan.
 ///
-/// `state IN ('RUNNING', 'PAUSED')` is backed by `idx_harvest_we_state`
-/// (migration `20260409000000_harvest_initial`), so the scan is bounded by
-/// the deployment's current non-terminal row count, not its full execution
-/// history -- `quota_key IS NULL` is then a cheap residual filter over that
-/// already-narrow set. `LIMIT $1` bounds one tick's work regardless of how
-/// large that set is.
+/// Backed by `idx_harvest_we_quota_reconcile_candidates` (migration
+/// `20260910192721_harvest_quota_reconcile_candidate_index`), a partial
+/// index on this exact predicate -- `idx_harvest_we_state` (migration
+/// `20260409000000_harvest_initial`) covers only `state = 'RUNNING'`, not
+/// `PAUSED`, so it cannot serve this query's `IN` and the scan would
+/// otherwise fall back to a full sequential scan of
+/// `harvest_workflow_executions` on every tick, unbounded by the current
+/// non-terminal row count. Because the new index's predicate already
+/// includes `quota_key IS NULL`, a row leaves the index the moment its
+/// `quota_key` is backfilled -- the index always covers exactly today's
+/// candidate set, never the table's full history. `LIMIT $1` then bounds
+/// one tick's work regardless of how large that set is.
 #[cfg(feature = "db")]
 const CANDIDATE_SQL: &str = "\
     SELECT id, workflow_name, input FROM harvest_workflow_executions \
@@ -215,7 +240,7 @@ pub async fn reconcile_quota_keys(
         let policy = registered_quota_policy(&row.workflow_name);
         match resolve_backfill(policy, &row.input) {
             ReconcileOutcome::Backfilled(key) => {
-                diesel::sql_query(
+                let rows_affected = diesel::sql_query(
                     "UPDATE harvest_workflow_executions SET quota_key = $1 \
                      WHERE id = $2 AND quota_key IS NULL",
                 )
@@ -224,7 +249,13 @@ pub async fn reconcile_quota_keys(
                 .execute(conn)
                 .await
                 .map_err(database_error)?;
-                summary.backfilled += 1;
+                // A concurrent sweep may have already backfilled this exact
+                // row between this call's candidate scan and its UPDATE --
+                // `rows_affected == 0` then, and the count must not credit a
+                // write that did not happen.
+                if rows_affected > 0 {
+                    summary.backfilled += 1;
+                }
             }
             ReconcileOutcome::Unresolvable => summary.unresolvable += 1,
             ReconcileOutcome::OverCap(observed_bytes) => {
