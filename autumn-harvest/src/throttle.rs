@@ -1301,6 +1301,72 @@ async fn fire_claimed_throttle_row(
     }
 }
 
+/// Pre-acquire every distinct quota advisory lock a claimed due-row batch
+/// needs, in one deterministic (sorted) order, before any row fires
+/// (issue #1230 Finding 2).
+///
+/// Mirrors the awaited-child fan-out fix in `worker.rs` (issue #946) and
+/// [`crate::debounce`]'s identical helper. Without this, the per-row loop
+/// below acquires each `pg_advisory_xact_lock` one at a time, in claim
+/// order. Two concurrent scanner transactions can claim disjoint row
+/// batches -- two replicas of this scanner, or this scanner racing
+/// `debounce`'s. `SKIP LOCKED` guarantees the batches do not overlap, but
+/// both can still need the same set of quota locks, in opposite orders.
+/// Each transaction then holds one key while it waits for the other: an
+/// ABBA wait-for cycle. Postgres aborts one transaction with a raw
+/// `deadlock_detected` error. That error is not
+/// [`crate::error::HarvestError::QuotaExceeded`], so the dedicated
+/// re-defer arm below does not catch it. It propagates out through
+/// `enforce_timeouts_once` and aborts every OTHER duty in that tick, not
+/// just the one row that collided.
+///
+/// Sorting the acquisition order makes the cycle impossible. Every
+/// transaction that reaches a claimed batch acquires the same keys in the
+/// same order. So no two transactions can ever hold a lock the other
+/// waits for. [`crate::quota::lock_quota_key`]'s `pg_advisory_xact_lock`
+/// is re-entrant within one session, so `fire_claimed_throttle_row`'s own
+/// `enforce_quota_admission` call simply re-acquires what this already
+/// holds -- no other change is needed.
+#[cfg(feature = "db")]
+async fn pre_lock_quota_keys_for_claimed_batch(
+    conn: &mut diesel_async::AsyncPgConnection,
+    due_rows: &[FireDueRow],
+) -> crate::error::HarvestResult<()> {
+    for (workflow_name, key) in &collect_quota_lock_keys(due_rows) {
+        crate::quota::lock_quota_key(conn, workflow_name, key).await?;
+    }
+    Ok(())
+}
+
+/// Pure half of [`pre_lock_quota_keys_for_claimed_batch`]: the distinct,
+/// sorted `(workflow_name, quota_key)` pairs a claimed batch needs locked.
+/// Split out so the ordering invariant is unit-testable without a database
+/// (issue #1230 Finding 2).
+#[cfg(feature = "db")]
+fn collect_quota_lock_keys(
+    due_rows: &[FireDueRow],
+) -> std::collections::BTreeSet<(String, String)> {
+    let mut quota_lock_keys: std::collections::BTreeSet<(String, String)> =
+        std::collections::BTreeSet::new();
+    for row in due_rows {
+        let policy = crate::completion_trigger::GLOBAL_WORKFLOW_METADATA
+            .read()
+            .ok()
+            .and_then(|lock| {
+                lock.as_ref()
+                    .and_then(|map| map.get(&row.workflow_name))
+                    .and_then(|meta| meta.quota)
+            });
+        if let Some(policy) = policy
+            && policy.has_any_cap()
+            && let Some(key) = crate::quota::resolve_quota_key(policy.key_expr, &row.input)
+        {
+            quota_lock_keys.insert((row.workflow_name.clone(), key));
+        }
+    }
+    quota_lock_keys
+}
+
 /// Scan and fire due throttle rows on a single shard connection.
 #[cfg(feature = "db")]
 async fn fire_due_on_conn(
@@ -1428,6 +1494,8 @@ async fn fire_due_on_conn(
                 .load(conn)
                 .await
                 .map_err(crate::error::database_error)?;
+
+            pre_lock_quota_keys_for_claimed_batch(conn, &due_rows).await?;
 
             let mut results = Vec::with_capacity(due_rows.len());
             for row in due_rows {
@@ -2114,5 +2182,154 @@ mod tests {
         assert!(!active);
         assert_eq!(refill, None);
         assert_eq!(burst, None);
+    }
+
+    // ── collect_quota_lock_keys (issue #1230 Finding 2) ──────────────────────
+
+    #[cfg(feature = "db")]
+    mod quota_lock_keys {
+        use super::*;
+        use crate::completion_trigger::{GLOBAL_WORKFLOW_METADATA, WorkflowMetadata};
+        use crate::quota::QuotaPolicy;
+        use std::collections::HashMap;
+        use std::sync::Mutex;
+
+        /// Serializes access to the process-global [`GLOBAL_WORKFLOW_METADATA`]
+        /// mirror across this module's tests (mirrors
+        /// `quota_enforcement_tests.rs`'s identical `TEST_SERIAL` convention).
+        static TEST_SERIAL: Mutex<()> = Mutex::new(());
+
+        fn wf_meta(quota: Option<QuotaPolicy>) -> WorkflowMetadata {
+            WorkflowMetadata {
+                concurrency: None,
+                max_input_bytes: None,
+                owner: None,
+                runbook_url: None,
+                severity: None,
+                input_schema: None,
+                sla: None,
+                retry_policy: None,
+                quota,
+            }
+        }
+
+        /// Installs `map` as [`GLOBAL_WORKFLOW_METADATA`] for the duration of
+        /// `body`, restoring whatever was there before -- including on panic.
+        fn with_metadata<T>(map: HashMap<String, WorkflowMetadata>, body: impl FnOnce() -> T) -> T {
+            let _permit = TEST_SERIAL
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let previous = {
+                let mut lock = GLOBAL_WORKFLOW_METADATA.write().expect("metadata lock");
+                lock.take()
+            };
+            *GLOBAL_WORKFLOW_METADATA.write().expect("metadata lock") = Some(map);
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(body));
+            *GLOBAL_WORKFLOW_METADATA.write().expect("metadata lock") = previous;
+            result.unwrap_or_else(|e| std::panic::resume_unwind(e))
+        }
+
+        fn row(workflow_name: &str, tenant: &str) -> FireDueRow {
+            FireDueRow {
+                id: uuid::Uuid::new_v4(),
+                workflow_name: workflow_name.to_string(),
+                throttle_key: "irrelevant".to_string(),
+                bucket_key: "irrelevant".to_string(),
+                workflow_id: uuid::Uuid::new_v4().to_string(),
+                queue_name: "default".to_string(),
+                input: serde_json::json!({ "tenant_id": tenant }),
+                start_options: serde_json::json!({}),
+                expires_at: None,
+                shard_id: 0,
+            }
+        }
+
+        #[test]
+        fn dedupes_and_sorts_the_same_regardless_of_claim_order() {
+            // The exact invariant that closes the ABBA hazard. Two claimed
+            // batches need the SAME two keys, presented in OPPOSITE row
+            // order. They must still lock those keys in the SAME order.
+            let mut map = HashMap::new();
+            map.insert(
+                "wf_a".to_string(),
+                wf_meta(Some(
+                    QuotaPolicy::new("tenant_id").with_max_active_executions(100),
+                )),
+            );
+            with_metadata(map, || {
+                let forward = vec![row("wf_a", "tenant-1"), row("wf_a", "tenant-2")];
+                let reverse = vec![row("wf_a", "tenant-2"), row("wf_a", "tenant-1")];
+
+                let forward_keys: Vec<_> = collect_quota_lock_keys(&forward).into_iter().collect();
+                let reverse_keys: Vec<_> = collect_quota_lock_keys(&reverse).into_iter().collect();
+
+                assert_eq!(forward_keys, reverse_keys);
+                assert_eq!(
+                    forward_keys,
+                    vec![
+                        ("wf_a".to_string(), "tenant-1".to_string()),
+                        ("wf_a".to_string(), "tenant-2".to_string()),
+                    ]
+                );
+            });
+        }
+
+        #[test]
+        fn dedupes_repeated_key_within_one_batch() {
+            let mut map = HashMap::new();
+            map.insert(
+                "wf_a".to_string(),
+                wf_meta(Some(
+                    QuotaPolicy::new("tenant_id").with_max_active_executions(100),
+                )),
+            );
+            with_metadata(map, || {
+                let rows = vec![
+                    row("wf_a", "tenant-1"),
+                    row("wf_a", "tenant-1"),
+                    row("wf_a", "tenant-1"),
+                ];
+                assert_eq!(collect_quota_lock_keys(&rows).len(), 1);
+            });
+        }
+
+        #[test]
+        fn skips_a_workflow_with_no_declared_quota_policy() {
+            with_metadata(HashMap::new(), || {
+                let rows = vec![row("wf_no_policy", "tenant-1")];
+                assert!(collect_quota_lock_keys(&rows).is_empty());
+            });
+        }
+
+        #[test]
+        fn skips_a_policy_with_no_caps_declared() {
+            let mut map = HashMap::new();
+            map.insert(
+                "wf_a".to_string(),
+                wf_meta(Some(QuotaPolicy::new("tenant_id"))),
+            );
+            with_metadata(map, || {
+                let rows = vec![row("wf_a", "tenant-1")];
+                assert!(
+                    collect_quota_lock_keys(&rows).is_empty(),
+                    "has_any_cap() == false must never be locked -- it is never enforced"
+                );
+            });
+        }
+
+        #[test]
+        fn skips_a_row_whose_key_expression_does_not_resolve() {
+            let mut map = HashMap::new();
+            map.insert(
+                "wf_a".to_string(),
+                wf_meta(Some(
+                    QuotaPolicy::new("no_such_field").with_max_active_executions(100),
+                )),
+            );
+            with_metadata(map, || {
+                let rows = vec![row("wf_a", "tenant-1")];
+                assert!(collect_quota_lock_keys(&rows).is_empty());
+            });
+        }
     }
 }

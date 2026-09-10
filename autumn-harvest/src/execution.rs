@@ -695,8 +695,21 @@ pub async fn start_or_load_workflow_execution_collect(
                     .and_then(|map| map.get(request.workflow_name))
                     .and_then(|meta| meta.quota)
             });
-    let quota_key: Option<String> =
-        quota_policy.and_then(|p| crate::quota::resolve_quota_key(p.key_expr, &request.input));
+    // `resolve_quota_key_for_admission_input`, not the plain
+    // `resolve_quota_key` (issue #1230 Finding 1). `request.input` is a
+    // JSON ARRAY, not an object, for a batched-start fire.
+    // `event_batch.rs` merges every buffered admission's payload into one
+    // array before calling this function. The plain resolver requires an
+    // object at the first path segment. It returns `None` for an array,
+    // so it silently skipped all three quota dimensions for EVERY
+    // batched execution. The admission-input-aware resolver peeks at the
+    // array's first element instead, restoring enforcement. See its doc
+    // comment for the first-admission-wins semantics this implies. A
+    // direct (non-batched) start's `input` is already an object, so this
+    // is byte-identical to the plain resolver for every other start path.
+    let quota_key: Option<String> = quota_policy.and_then(|p| {
+        crate::quota::resolve_quota_key_for_admission_input(p.key_expr, &request.input)
+    });
     // A resolved key is stamped onto the row for EVERY admission that has
     // one -- including a retry-exempt admission below, which still tags its
     // row for future usage accounting -- so this bound must be checked
