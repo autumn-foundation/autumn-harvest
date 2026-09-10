@@ -22,19 +22,26 @@ issue #1202 as P2 round 4).
   `command_containing` for the doc, both already used elsewhere in this
   file) and asserts the two extracted arguments are **exactly equal**, not
   merely prefix-matching.
+- The CI side now strips `#` comment lines before searching for the
+  `chaos_tests::` step, matching the doc side's existing guard against a
+  comment mentioning the filter as prose.
 - TDD: unit tests for `extract_filter_argument` (same-line, continuation-
-  wrapped, no-following-token panic) plus two fixture regressions
+  wrapped, both no-token panic branches) plus two fixture regressions
   reproducing the Codex scenario in both directions (CI narrows / doc
-  narrows) were written and confirmed red before the helper existed, then
-  green after.
+  narrows), and one end-to-end synthetic pipeline test, were written and
+  confirmed red before the fix existed, then green after.
 - Manually reproduced the real-world scenario by narrowing
   `.github/workflows/chaos.yml`'s filter to
   `chaos_tests::chaos_seeded_convergence_sweep` — the new equality test
   failed as expected (`left: "chaos_tests::"`, `right:
   "chaos_tests::chaos_seeded_convergence_sweep"`), then reverted.
+- Reviewed from three independent angles (correctness, STE/style,
+  test-coverage) by separate review passes; no blocking findings. Fixed:
+  one untested panic branch, one unnumbered issue reference in a comment,
+  and the CI-side comment-stripping gap above.
 
 No production code changed — `chaos_docs.rs` is a test-only doc/CI parity
 guard behind no feature flag. `cargo test -p autumn-harvest --test
-integration chaos_docs::` (13/13), `cargo fmt -p autumn-harvest -- --check`,
+integration chaos_docs::` (15/15), `cargo fmt -p autumn-harvest -- --check`,
 and `python3 docs/audits/comment-hygiene.py --base origin/trunk-dev` are
 all clean.

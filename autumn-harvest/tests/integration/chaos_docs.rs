@@ -253,6 +253,10 @@ fn local_iteration_example_is_scoped_to_chaos_tests_module() {
 /// continuation. This is a token boundary, not a prefix: `chaos_tests::`
 /// and `chaos_tests::chaos_seeded_convergence_sweep` extract as different,
 /// unequal tokens. A `contains`/prefix check cannot tell them apart.
+///
+/// Reads the FIRST `--test integration` in `command`. Every call site here
+/// passes an already-isolated single command or run line, so one match is
+/// the only one expected.
 fn extract_filter_argument(command: &str) -> &str {
     const FLAG: &str = "--test integration";
     let after_flag = command
@@ -294,11 +298,17 @@ fn extract_filter_argument_panics_when_the_flag_has_no_following_token() {
 }
 
 #[test]
+#[should_panic(expected = "command has no")]
+fn extract_filter_argument_panics_when_the_flag_is_absent() {
+    extract_filter_argument("cargo test --lib chaos::");
+}
+
+#[test]
 fn extract_filter_argument_detects_a_ci_narrowed_filter_the_doc_still_calls_broad() {
-    // Reproduces the Codex finding directly: CI narrows to a specific
-    // test, but the doc's worked example keeps the broader module filter.
-    // A `contains` check on each side independently would pass both.
-    // Only an exact-equality comparison catches the divergence.
+    // Reproduces issue #1224 directly: CI narrows to a specific test, but
+    // the doc's worked example keeps the broader module filter. A
+    // `contains` check on each side independently would pass both. Only
+    // an exact-equality comparison catches the divergence.
     let ci_command =
         "cargo test --test integration chaos_tests::chaos_seeded_convergence_sweep -- --nocapture";
     let doc_command = "cargo test --features chaos --test integration \\\n  chaos_tests::";
@@ -341,7 +351,12 @@ fn extract_filter_argument_detects_a_doc_narrowed_filter_ci_still_calls_broad() 
 /// shared-prefix `contains` check -- see `extract_filter_argument`.
 #[test]
 fn doc_example_filter_matches_chaos_workflow_filter() {
-    let workflow = read_normalized(&repo_root().join(".github/workflows/chaos.yml"));
+    // Stripped the same way as the doc side (below). A `#` comment in
+    // chaos.yml could name `chaos_tests::` as prose. Left unstripped, it
+    // could mis-anchor `workflow_step_stanza` to the wrong step.
+    let workflow = strip_comment_lines(&read_normalized(
+        &repo_root().join(".github/workflows/chaos.yml"),
+    ));
     let ci_stanza = workflow_step_stanza(&workflow, "chaos_tests::").expect(
         ".github/workflows/chaos.yml must have a step running the \
          chaos_tests:: suite",
@@ -365,6 +380,35 @@ fn doc_example_filter_matches_chaos_workflow_filter() {
          exact same filter argument as .github/workflows/chaos.yml, not \
          merely share a `chaos_tests::` prefix -- doc filter: \
          {doc_filter:?}, CI filter: {ci_filter:?}"
+    );
+}
+
+#[test]
+fn doc_and_ci_extraction_pipeline_detects_divergence_end_to_end() {
+    // Runs the exact same pipeline as `doc_example_filter_matches_chaos_workflow_filter`
+    // above, on synthetic text standing in for chaos.yml and chaos.md. Proves
+    // the GUARD catches a divergence, not just `extract_filter_argument` in
+    // isolation.
+    let workflow = "\n      - uses: actions/checkout@v4\n      - name: Run chaos reproducers\n        run: cargo test --features chaos --test integration chaos_tests::chaos_seeded_convergence_sweep -- --nocapture\n      - name: A later step\n        run: echo later\n";
+    let ci_stanza = workflow_step_stanza(workflow, "chaos_tests::").expect("stanza present");
+    let ci_run_line = ci_stanza
+        .lines()
+        .find(|line| line.contains("--test integration"))
+        .expect("run line present");
+    let ci_filter = extract_filter_argument(ci_run_line);
+
+    let doc = "```bash\n# Scope the run to `chaos_tests::`:\nHARVEST_TEST_DATABASE_URL=postgres://x \\\n  CHAOS_SEEDS=8 cargo test --features chaos --test integration \\\n  chaos_tests::\n```\n";
+    let block = bash_block_containing(doc, "HARVEST_TEST_DATABASE_URL");
+    let command_only = strip_comment_lines(block);
+    let commands = split_into_commands(&command_only);
+    let local_db_command = command_containing(&commands, "HARVEST_TEST_DATABASE_URL");
+    let doc_filter = extract_filter_argument(local_db_command);
+
+    assert_ne!(
+        doc_filter, ci_filter,
+        "a CI filter narrowed to a specific test must be distinguishable \
+         from the doc's broader one, through the full extraction pipeline, \
+         not just the extract_filter_argument helper alone"
     );
 }
 
