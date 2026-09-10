@@ -1634,9 +1634,9 @@ fn claim_gate_docs_do_not_claim_the_delta_isolates_the_anti_join() {
 
 /// The `ClaimGate` known-gaps list must name activity pauses (#807).
 ///
-/// Issue #1215 found this predicate absent from the gap list even though it
-/// is unmeasured by every scenario here exactly like the other five gaps —
-/// a maintainer reading only this enum would not learn it exists.
+/// Issue #1215 found this predicate absent from the gap list. It is
+/// unmeasured by every scenario here, exactly like the other five gaps. A
+/// maintainer reading only this enum would not learn it exists.
 #[test]
 fn claim_gate_docs_name_the_activity_pause_gap() {
     let harness = read_normalized(
@@ -1661,7 +1661,7 @@ fn claim_gate_docs_name_the_activity_pause_gap() {
 }
 
 /// `docs/performance.md`'s Known limitations section must document the
-/// activity-pause gap (#807) that issue #1215 found missing from it, and
+/// activity-pause gap (#807) that issue #1215 found missing from it. It
 /// must not present the queue-pause fix (#619) as resolved at every array
 /// size without qualification.
 #[test]

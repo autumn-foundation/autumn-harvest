@@ -60,11 +60,11 @@
 /// 3.7. These variants let the benchmark attribute cost to **five** of them
 /// instead of reporting a single opaque number.
 ///
-/// Deliberately **not exhaustive**, and the gap is not visible from this list:
-/// capability labels (#382), queue pauses (#619), `schedule_to_close` (#378),
-/// worker sessions (#606), sticky routing (#235) and activity pauses (#807)
-/// are all in the query on every claim, but `db::seed_backlog` leaves their
-/// columns null and no scenario here ever inserts a `harvest_queue_pauses` or
+/// Deliberately **not exhaustive**, and the gap is not visible from this
+/// list. Capability labels (#382), queue pauses (#619), `schedule_to_close`
+/// (#378), worker sessions (#606), sticky routing (#235) and activity pauses
+/// (#807) are in the query on every claim. `db::seed_backlog` leaves their
+/// columns null. No scenario here ever inserts a `harvest_queue_pauses` or
 /// `harvest_activity_pauses` row, so those subplans only ever see empty or
 /// null input. They are evaluated, not measured — the cheapest path each of
 /// them has. Adding one means a seed variant *and* a report row; see the
@@ -3769,9 +3769,9 @@ pub mod db {
         .await;
     }
 
-    /// Seed `harvest_queue_pauses` with `count` rows: one real pause (the
-    /// scenario's first polled queue) plus `count - 1` unrelated names, so the
-    /// anti-join's array is realistically wide rather than a single element.
+    /// Seed `harvest_queue_pauses` with `count` rows. One is a real pause on
+    /// the scenario's first polled queue. The rest are unrelated names, so
+    /// the anti-join's array is realistically wide, not a single element.
     ///
     /// Set-based, like every other seed function here -- see issue #1215,
     /// which found the anti-join's cost scales with array size, not just

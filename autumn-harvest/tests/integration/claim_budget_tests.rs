@@ -4930,8 +4930,8 @@ async fn zz_capture_concurrency_key_claim_evidence() {
 /// `reset()` must clear every pause table, not only `harvest_queue_pauses`.
 ///
 /// A row a prior scenario left in `harvest_activity_pauses` would silently
-/// contaminate the next scenario's claim-path measurement -- issue #1215
-/// found `harvest_activity_pauses` was never truncated at all, so every
+/// contaminate the next scenario's claim-path measurement. Issue #1215
+/// found `harvest_activity_pauses` was never truncated at all. Every
 /// scenario after the first real pause seed would carry it forward.
 #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
 async fn reset_clears_every_pause_table() {
@@ -4979,8 +4979,8 @@ async fn reset_clears_every_pause_table() {
 }
 
 /// `claim_task()` must still exclude only the paused queue and the paused
-/// activity when their pause tables hold a realistically wide array (issue
-/// #1215's own reproduction used up to 199 entries), not just one row.
+/// activity, even when their pause tables hold a realistically wide array.
+/// Issue #1215's own reproduction used up to 199 entries, not just one row.
 ///
 /// Three candidate rows, one of each shape that matters: a paused queue, a
 /// paused activity, and neither. Only the third is claimable.
@@ -5059,28 +5059,29 @@ async fn claim_excludes_paused_rows_with_a_realistically_wide_pause_array() {
 }
 
 /// Generates the committed evidence for the pause-array-size finding (issue
-/// #1215): the claim sort's disk-spill trigger depends on how *wide* the
+/// #1215). The claim sort's disk-spill trigger depends on how *wide* the
 /// `<> ALL(...)` array is, not only on backlog depth.
 ///
 /// Unlike [`zz_capture_queue_pause_claim_evidence`], this toggles *data*
-/// (pause-array size), not code -- the same style
-/// `zz_capture_capability_labels_claim_evidence` uses, because issue #1215
-/// found no query-shape fix here, only a cost that scales with array width.
+/// (pause-array size), not code. It uses the same style as
+/// `zz_capture_capability_labels_claim_evidence`: issue #1215 found no
+/// query-shape fix here, only a cost that scales with array width.
 ///
 /// Every array here is seeded as ballast: unrelated names that exclude zero
-/// real candidate rows, so a size effect cannot be explained by a change in
-/// which rows are eligible -- the same no-op-predicate isolation issue #1177
-/// and #786 already established for backlog depth, extended to array width.
+/// real candidate rows. A size effect cannot be explained by a change in
+/// which rows are eligible this way. Issue #1177 and #786 already
+/// established the same no-op-predicate isolation for backlog depth; this
+/// extends it to array width.
 ///
 /// Three sweeps:
 /// * `activity-pause` -- `paused_activities` reads the whole table
-///   unconditionally (see the doc comment on `claim_task_query`), so array
-///   size alone should drive its cost regardless of the worker's own bind.
-/// * `queue-pause-bound` -- a typical worker ($2 = its own 4 polled queues);
-///   `paused_queues` pre-filters to $2, so ballast pauses on queues this
+///   unconditionally (see the doc comment on `claim_task_query`). Array
+///   size alone should drive its cost, regardless of the worker's own bind.
+/// * `queue-pause-bound` -- a typical worker ($2 = its own 4 polled queues).
+///   `paused_queues` pre-filters to $2. Ballast pauses on queues this
 ///   worker never polls should never enter the array at all.
 /// * `queue-pause-wide` -- an atypical worker whose own $2 bind is itself
-///   wide (203 polled queues), which lets `paused_queues`' bound reach the
+///   wide (203 polled queues). That lets `paused_queues`' bound reach the
 ///   same array size `queue-pause-bound` cannot.
 ///
 /// `#[ignore]`d on purpose: a one-shot evidence-capture tool, not a repeatable
