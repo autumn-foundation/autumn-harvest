@@ -38,16 +38,16 @@ while IFS= read -r file; do
       "code block; bash requires 'NAME=value', not '\$env:NAME = \"value\"'." >&2
     violations=$((violations + 1))
   done < <(awk '
-    /^```/ {
+    /^ {0,3}```/ {
       if (in_fence) { in_fence = 0 }
-      else { in_fence = 1; lang = tolower($0); sub(/^```[ \t]*/, "", lang) }
+      else { in_fence = 1; lang = tolower($0); sub(/^ {0,3}```[ \t]*/, "", lang) }
       next
     }
     in_fence && lang == "bash" && /^[ \t]*\$env:[A-Za-z_][A-Za-z0-9_]*[ \t]*=/ {
       print NR ":" $0
     }
   ' "$file")
-done < <(grep -rlE '^```bash' --include="*.md" . 2>/dev/null | grep -vE "^\./target/")
+done < <(grep -rlE '^ {0,3}```bash' --include="*.md" . 2>/dev/null | grep -vE "^\./target/")
 
 if [ "$violations" -gt 0 ]; then
   echo >&2
