@@ -216,7 +216,14 @@ fn the_doc_names_no_competitor_engine() {
     // engine's own benchmark, so it cannot vouch for the figure or its
     // staleness.
     let doc = benchmarks_doc().to_lowercase();
-    for name in ["temporal", "dbos", "cadence", "zeebe", "conductor", "restate"] {
+    for name in [
+        "temporal",
+        "dbos",
+        "cadence",
+        "zeebe",
+        "conductor",
+        "restate",
+    ] {
         assert!(
             !doc.contains(name),
             "docs/benchmarks.md names a competitor engine ({name}); issue #1309 asks this page \
