@@ -107,6 +107,15 @@ before it shipped; that suite is green against the dry-run-credit fix, and
 was also confirmed green against unmodified `execution.rs` (so the fix
 introduces no NEW dependency the suite would need to guard).
 
+A follow-up multi-angle review (three independent agents: concurrency
+correctness, test coverage, comment style) flagged that every Finding-1
+test above shed exactly one incumbent, never proving the credit
+generalizes past a single-incumbent shed. Added
+`cancel_running_supersede_credit_generalizes_past_a_single_incumbent`:
+`concurrency_limit = 2`, two admitted runs, then a THIRD admission that
+must shed exactly the OLDEST of the two down to the limit -- pinning both
+"shed more than one" and "shed the right one" in a single case.
+
 Finding 2: `create_detached_child_executions` is private, so it cannot be
 driven directly from an integration test. New
 `autumn-harvest/tests/integration/quota_lock_ordering_tests.rs` instead
@@ -125,3 +134,18 @@ exact property the `BTreeSet` pre-acquisition pass relies on. The existing
 its mixed-batch sibling) and `concurrency_supersede_tests.rs`'s full issue
 #811 suite were re-run against the refactored function and stay green,
 guarding against a regression in the existing per-child/per-key behavior.
+
+The same review round flagged that both cited detached-child tests spawn
+exactly ONE child per batch, so the new `BTreeSet` pre-acquisition pass's
+own interesting behavior -- deduping and sorting across SEVERAL distinct
+`(workflow_name, quota_key)` pairs in one batch -- was never exercised;
+a subtly wrong cross-shard or already-created skip inside the new loop
+would have passed both existing tests untouched. Added
+`detached_child_multi_spawn_batch_locks_every_distinct_key_and_admits_all`:
+one parent spawns four detached children across two workflow types and
+two tenant keys in a single decision cycle (a shared key under different
+types, and different keys under one type), and asserts all four are
+created with the correct resolved `quota_key`.
+
+Three independent review agents (concurrency correctness, test coverage,
+comment style) found no other genuine defects in the shipped fix.
