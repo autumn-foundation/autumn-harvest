@@ -72,18 +72,18 @@
 //!
 //! # Pre-upgrade rollout gap, closed by a periodic reconciler (issue #1226)
 //!
-//! Because `quota_key` is resolved only at admission time, an execution
-//! that was already `RUNNING`/`PAUSED` *before* its workflow type's
-//! [`QuotaPolicy`] was declared/deployed would otherwise keep
+//! `quota_key` is resolved only at admission time. Consider an execution
+//! already `RUNNING`/`PAUSED` *before* its workflow type's
+//! [`QuotaPolicy`] was declared/deployed. It would otherwise keep
 //! `quota_key = NULL` for the rest of its life — neither counted against
 //! the new cap nor blocked by it. [`crate::quota_reconcile`] closes this:
 //! a periodic, shard-local sweep re-resolves and backfills `quota_key` for
-//! exactly such rows, using this module's own [`resolve_quota_key`] — the
-//! same function the live admission path calls — so a backfilled value can
-//! never drift from what a fresh admission would compute.
+//! exactly such rows. It uses this module's own [`resolve_quota_key`] —
+//! the same function the live admission path calls. A backfilled value
+//! can therefore never drift from what a fresh admission would compute.
 //!
-//! The sweep runs on the worker's heartbeat cadence rather than
-//! synchronously inside admission, so a row stays invisible to
+//! The sweep runs on the worker's heartbeat cadence, not synchronously
+//! inside admission. A row therefore stays invisible to
 //! [`load_quota_usage`] for up to one reconcile interval after its policy
 //! takes effect. See [`crate::quota_reconcile`]'s module doc for the full
 //! design (why periodic rather than startup-once, and why that residual

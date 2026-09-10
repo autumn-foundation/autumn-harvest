@@ -154,8 +154,8 @@ diesel::table! {
         /// be resolved from the input. Never read on replay -- purely an
         /// admission-time bookkeeping column backing the quota usage counts.
         /// Also backfilled post-INSERT, once, by `quota_reconcile`'s periodic
-        /// sweep (issue #1226) for a row whose policy was declared after it
-        /// started -- guarded by `WHERE quota_key IS NULL`, so this never
+        /// sweep (issue #1226), for a row whose policy was declared after it
+        /// started. Guarded by `WHERE quota_key IS NULL`, so this never
         /// overwrites a value admission already set.
         quota_key -> Nullable<Text>,
         /// Forwarding pointer for a shard-rebalanced execution (issue #964).

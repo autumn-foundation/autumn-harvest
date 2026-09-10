@@ -25565,16 +25565,18 @@ impl Worker {
             })
             .collect();
         // `quota_key` backfill reconciler (issue #1226): one per assigned
-        // shard pool, mirroring the poison-pill/session reconcilers above --
-        // each backfills `quota_key` on non-terminal executions left NULL by
+        // shard pool, mirroring the poison-pill/session reconcilers above.
+        // Each backfills `quota_key` on non-terminal executions left NULL by
         // a `QuotaPolicy` declared after those rows started, scoped to that
         // shard's own database. Reuses the heartbeat cadence rather than a
-        // dedicated interval knob, matching `session_slot_reconcilers`. The
-        // batch size is a fixed internal constant, not a `WorkerConfig` knob:
-        // `WorkerRuntimeConfig` is built as a bare struct literal at dozens
-        // of call sites across the test suite with no `Default`/spread, so a
-        // new required field there is disproportionate churn for a value
-        // that only needs to be "bounded", not operator-tunable.
+        // dedicated interval knob, matching `session_slot_reconcilers`.
+        //
+        // The batch size is a fixed internal constant, not a `WorkerConfig`
+        // knob. `WorkerRuntimeConfig` is built as a bare struct literal at
+        // dozens of call sites across the test suite, with no
+        // `Default`/spread. A new required field there is disproportionate
+        // churn for a value that only needs to be "bounded", not
+        // operator-tunable.
         let quota_key_reconcilers: Vec<_> = shard_pools_for_monitors
             .iter()
             .map(|(shard_pool, _shard)| {

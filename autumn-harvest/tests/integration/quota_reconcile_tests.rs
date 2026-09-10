@@ -207,9 +207,9 @@ async fn pre_upgrade_active_execution_gets_backfilled() {
 async fn combined_pre_and_post_upgrade_usage_is_capped_after_reconciliation() {
     let (mut conn, _container) = setup_db().await;
     let workflow_name = leaked("wf_combined");
-    // Cap == the eventual TOTAL (2 pre-upgrade + 1 post-upgrade) so a
-    // violation appears only once reconciliation makes the pre-upgrade rows
-    // visible -- the exact bug issue #1226 describes.
+    // Cap == the eventual TOTAL (2 pre-upgrade + 1 post-upgrade). A
+    // violation therefore appears only once reconciliation makes the
+    // pre-upgrade rows visible -- the exact bug issue #1226 describes.
     let policy = QuotaPolicy::new("tenant_id").with_max_active_executions(3);
     let _guard = MetadataGuard::install_one(workflow_name, policy).await;
 
