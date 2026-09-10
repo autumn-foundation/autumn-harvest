@@ -229,6 +229,29 @@ fn is_schedule_lookup_statement(row: &StatRow) -> bool {
     q.contains("harvest_schedules") && q.contains("workflow_name")
 }
 
+/// One human-readable profile line: `calls`/`buffers` plus each one's share
+/// of the point's totals, and a whitespace-collapsed, truncated query text.
+/// Precision loss from `i64 as f64` is immaterial here -- these are
+/// percentages over call/buffer counts in the hundreds, nowhere near f64's
+/// 52-bit mantissa limit, and the result is a debug/artifact string, not a
+/// value anything computes from.
+#[allow(clippy::cast_precision_loss)]
+fn fmt_row(r: &StatRow, total_calls: i64, total_buffers: i64) -> String {
+    let query: String = r.query.split_whitespace().collect::<Vec<_>>().join(" ");
+    let query = if query.len() > 90 {
+        format!("{}...", &query[..90])
+    } else {
+        query
+    };
+    format!(
+        "calls={:>4} ({:>5.1}%)  buffers={:>5} ({:>5.1}%)  {query}",
+        r.calls,
+        100.0 * r.calls as f64 / total_calls.max(1) as f64,
+        r.total_buffers,
+        100.0 * r.total_buffers as f64 / total_buffers.max(1) as f64,
+    )
+}
+
 async fn wal_bytes(conn: &mut AsyncPgConnection) -> i64 {
     #[derive(diesel::QueryableByName)]
     struct WalRow {
@@ -340,21 +363,6 @@ async fn measure_one_batch(admin: &str, _label: &str, n: usize) -> SizePoint {
     let total_calls: i64 = all_rows.iter().map(|r| r.calls).sum();
     let total_buffers: i64 = all_rows.iter().map(|r| r.total_buffers).sum();
 
-    fn fmt_row(r: &StatRow, total_calls: i64, total_buffers: i64) -> String {
-        let query: String = r.query.split_whitespace().collect::<Vec<_>>().join(" ");
-        let query = if query.len() > 90 {
-            format!("{}...", &query[..90])
-        } else {
-            query
-        };
-        format!(
-            "calls={:>4} ({:>5.1}%)  buffers={:>5} ({:>5.1}%)  {query}",
-            r.calls,
-            100.0 * r.calls as f64 / total_calls.max(1) as f64,
-            r.total_buffers,
-            100.0 * r.total_buffers as f64 / total_buffers.max(1) as f64,
-        )
-    }
     // `snapshot_statements` already orders by total_buffers DESC.
     let profile_by_buffers: Vec<String> = all_rows
         .iter()
