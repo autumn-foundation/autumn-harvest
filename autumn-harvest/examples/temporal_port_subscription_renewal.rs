@@ -251,9 +251,11 @@ mod tests {
             "a pre-recorded cancellation must complete the run cleanly: {result:?}"
         );
 
-        // The fixture ends at `SignalReceived` -- `system_now()` reads the
-        // live frontier there, not a replayed value. That is the sanctioned
-        // frontier exception (issue #798), not drift, so no deferred error.
+        // `for_replay` sets `strict_replay` to false, so a `NoMatch` at
+        // the frontier never counts as a divergence here. The fixture
+        // ends at `SignalReceived`; `system_now()` reads the live
+        // frontier there, not a replayed value, so no deferred error is
+        // recorded.
         assert_eq!(
             ctx.take_deferred_nd_error(),
             None,
