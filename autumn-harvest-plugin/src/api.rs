@@ -33751,9 +33751,9 @@ async fn audit_rejected_pacing_override(
 /// Every early return in the four pacing-override mutation handlers goes
 /// through this macro so it is audited before responding (issue #1229,
 /// finding 3). One module-level macro, instead of one copy per handler.
-/// Every argument is passed explicitly, not read from an enclosing local by
-/// bare name: a `macro_rules!` defined outside a function cannot see that
-/// function's locals, only tokens its caller hands it.
+/// Every argument is passed explicitly. It is not read from an enclosing
+/// local by bare name. A `macro_rules!` defined outside a function cannot
+/// see that function's locals. It only sees tokens its caller hands it.
 macro_rules! reject_pacing_override {
     (
         $pool:expr, $actor:expr, $source:expr, $request_id:expr,
