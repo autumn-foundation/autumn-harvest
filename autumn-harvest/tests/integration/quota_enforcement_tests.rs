@@ -2901,9 +2901,9 @@ async fn completion_trigger_defers_to_outbox_when_target_quota_exceeded() {
     // fix under test) is what actually runs, mirroring the convention in
     // `workflow_id_targeted_tests.rs`/`transactional_start_tests.rs`.
     autumn_harvest::shard::install_global_router(autumn_harvest::shard::ShardRouter::single());
-    let sharded_pool = Some(autumn_harvest::shard::ShardedDbPool::single(build_test_pool(
-        &url,
-    )));
+    let sharded_pool = Some(autumn_harvest::shard::ShardedDbPool::single(
+        build_test_pool(&url),
+    ));
 
     let source_wf = leaked("quota_trigger_source");
     let target_wf = leaked("quota_trigger_target");
