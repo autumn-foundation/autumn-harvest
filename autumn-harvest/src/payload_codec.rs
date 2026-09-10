@@ -117,10 +117,10 @@ pub const MAX_CODEC_KEY_ID_BYTES: usize = 64;
 /// codec envelope version under (issue #1244).
 ///
 /// Written automatically by `workers::register_worker` /
-/// `workers::heartbeat_worker` — never operator-configured, so an old binary
-/// that has never heard of this label can never claim a version it cannot
-/// read. Absence reads as [`CODEC_ENVELOPE_VERSION_LEGACY`] (`1`), which is
-/// the fail-closed default: `codec_rotation::activate_codec_key` refuses to
+/// `workers::heartbeat_worker`. It is never operator-configured, so an old
+/// binary that has never heard of this label can never claim a version it
+/// cannot read. Absence reads as [`CODEC_ENVELOPE_VERSION_LEGACY`] (`1`) — the
+/// fail-closed default. `codec_rotation::activate_codec_key` refuses to
 /// switch new writes to a keyed codec while any live worker's row is missing
 /// this label or names a version below [`CODEC_ENVELOPE_VERSION_KEYED`].
 pub const CODEC_ENVELOPE_CAPABILITY_LABEL: &str = "codec_envelope_version";
@@ -128,12 +128,14 @@ pub const CODEC_ENVELOPE_CAPABILITY_LABEL: &str = "codec_envelope_version";
 /// Merge this build's highest readable envelope version into a worker's
 /// `labels` JSON (issue #1244).
 ///
-/// `labels` is otherwise entirely operator-chosen (issue #382); this is the
-/// one key the engine itself writes, and it always overwrites any prior
-/// value — a worker cannot advertise a capability its own binary does not
-/// have. Non-object `labels` (never produced by [`crate::worker::WorkerRegistration`]
-/// but not ruled out by its type) is replaced with a fresh object rather than
-/// silently dropping the capability marker.
+/// `labels` is otherwise entirely operator-chosen (issue #382). This is the
+/// one key the engine itself writes. It always overwrites any prior value —
+/// a worker cannot advertise a capability its own binary does not have.
+///
+/// Non-object `labels` is replaced with a fresh object, rather than silently
+/// dropping the capability marker. [`crate::worker::WorkerRegistration`]
+/// never actually produces a non-object value; its type does not rule one
+/// out.
 #[must_use]
 pub fn advertise_codec_capability(labels: &Value) -> Value {
     let mut merged = match labels {
@@ -1274,10 +1276,10 @@ mod tests {
 
     #[test]
     fn advertise_codec_capability_overwrites_a_forged_lower_version() {
-        // The label is engine-written, never operator-configured -- a stale or
-        // tampered value must never survive the merge (issue #1244's whole
+        // The label is engine-written, never operator-configured. A stale or
+        // tampered value must never survive the merge. Issue #1244's whole
         // point is that this label can be trusted as this binary's true
-        // capability).
+        // capability.
         let merged = advertise_codec_capability(&json!({"codec_envelope_version": 1}));
         assert_eq!(
             merged[CODEC_ENVELOPE_CAPABILITY_LABEL],

@@ -149,9 +149,10 @@ impl std::fmt::Display for CodecKeyShardRemainder {
 /// One worker that blocks activating a keyed codec (issue #1244).
 ///
 /// A live worker that does not advertise support for the version-2 envelope
-/// would silently hand a `kid`-bearing payload to workflow code unchanged
-/// instead of decoding it (see [`crate::payload_codec::PayloadCodecs::set_active_key`]).
-/// Activation is refused while any such worker is live, on any expected shard.
+/// would silently hand a `kid`-bearing payload to workflow code unchanged.
+/// It would not decode it (see
+/// [`crate::payload_codec::PayloadCodecs::set_active_key`]). Activation is
+/// refused while any such worker is live, on any expected shard.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct CodecKeyActivationBlocker {
     /// The shard this worker's heartbeat row was read from.
@@ -403,9 +404,9 @@ pub enum HarvestError {
     /// #1244).
     ///
     /// `blockers` names, per shard, every live worker still missing the
-    /// capability advertisement, or a shard that could not be read (which
-    /// blocks activation just as firmly — an uncounted shard is never proof
-    /// every worker on it is upgraded).
+    /// capability advertisement. A shard that could not be read is named too.
+    /// It blocks activation just as firmly — an uncounted shard is never
+    /// proof every worker on it is upgraded.
     #[error(
         "codec key id {key_id} cannot be activated: {} worker(s) or shard(s) block it ({})",
         blockers.len(),

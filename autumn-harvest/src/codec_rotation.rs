@@ -1205,8 +1205,8 @@ mod db {
     }
 
     /// Durably record `key_id` becoming the active key on this connection's
-    /// shard (issue #1244): any other row still marked `active` is demoted to
-    /// `retiring` with `retiring_since = NOW()` in the same transaction, so
+    /// shard (issue #1244). Any other row still marked `active` is demoted to
+    /// `retiring` with `retiring_since = NOW()`, in the same transaction. So
     /// there is never a moment with zero or two active rows.
     async fn write_key_state_activation(
         conn: &mut AsyncPgConnection,
@@ -1242,8 +1242,8 @@ mod db {
     /// Durably record `key_id` as retired on this connection's shard (issue
     /// #1244). Best-effort bookkeeping: the in-memory
     /// [`PayloadCodecs::retire_key_local`] drop is what actually stops this
-    /// process encoding or decoding with the key, so a failure here is logged
-    /// by the caller rather than un-retiring the key.
+    /// process encoding or decoding with the key. A failure here is logged by
+    /// the caller rather than un-retiring the key.
     async fn write_key_state_retired(
         conn: &mut AsyncPgConnection,
         key_id: &str,
@@ -1264,11 +1264,10 @@ mod db {
     /// for the keyed (version-2) codec envelope (issue #1244).
     ///
     /// "Live" mirrors [`crate::worker::worker_stale_secs`]'s convention: a
-    /// heartbeat within `worker_stale_secs`. The capability check tolerates a
-    /// malformed label value (never written by this crate, but `labels` is an
-    /// operator-facing JSONB column) by treating anything that is not a bare
-    /// non-negative integer the same as a missing label — fail closed, not a
-    /// query error.
+    /// heartbeat within `worker_stale_secs`. `labels` is an operator-facing
+    /// JSONB column, so its value is never trusted to parse. The capability
+    /// check treats anything that is not a bare non-negative integer the same
+    /// as a missing label — fail closed, not a query error.
     #[allow(clippy::cast_precision_loss)] // a liveness window in seconds never approaches 2^53
     async fn blocking_workers(
         conn: &mut AsyncPgConnection,
@@ -1307,6 +1306,30 @@ mod db {
         Ok(rows.into_iter().next().map(|r| r.key_id))
     }
 
+    /// Resolve a connection to `shard` within `sharded_pool`, or the reason it
+    /// could not be reached (issue #1244).
+    ///
+    /// A missing pool or a failed acquisition must fail closed, never skip the
+    /// shard silently. Shared by every per-shard loop in this module that
+    /// needs that guarantee: [`census_remaining`], [`staleness_gate`], and
+    /// [`activate_codec_key`]'s capability check.
+    async fn resolve_shard_conn(
+        sharded_pool: &crate::shard::ShardedDbPool,
+        shard: crate::types::ShardId,
+    ) -> Result<
+        deadpool::managed::Object<
+            diesel_async::pooled_connection::AsyncDieselConnectionManager<AsyncPgConnection>,
+        >,
+        String,
+    > {
+        let Some(pool) = sharded_pool.exact_pool_for(shard) else {
+            return Err("no connection pool for this shard in this process".to_string());
+        };
+        pool.get()
+            .await
+            .map_err(|e| format!("connection unavailable: {e}"))
+    }
+
     /// One census pass: `key_id`'s remaining `harvest_events` rows per
     /// expected shard (issue #948, AC6). Never checks `expected_shards`
     /// completeness against `sharded_pool` — callers that need the
@@ -1319,23 +1342,14 @@ mod db {
         let mut remaining = Vec::new();
         for shard in expected_shards {
             let shard_id = shard.as_i32();
-            let Some(pool) = sharded_pool.exact_pool_for(*shard) else {
-                remaining.push(CodecKeyShardRemainder {
-                    shard_id,
-                    rows: 0,
-                    reachable: false,
-                    reason: Some("no connection pool for this shard in this process".to_string()),
-                });
-                continue;
-            };
-            let mut conn = match pool.get().await {
+            let mut conn = match resolve_shard_conn(sharded_pool, *shard).await {
                 Ok(c) => c,
-                Err(e) => {
+                Err(reason) => {
                     remaining.push(CodecKeyShardRemainder {
                         shard_id,
                         rows: 0,
                         reachable: false,
-                        reason: Some(format!("connection unavailable: {e}")),
+                        reason: Some(reason),
                     });
                     continue;
                 }
@@ -1375,24 +1389,24 @@ mod db {
     /// observable to it:
     ///
     /// 1. **Another live writer.** A worker that has not yet observed the new
-    ///    active key keeps encoding under the old one, and will do so again a
-    ///    millisecond after the census reads zero.
+    ///    active key keeps encoding under the old one. It writes another
+    ///    old-key row a millisecond after the census reads zero.
     /// 2. **An in-flight append.** A transaction that already encoded its
     ///    payload under the old key, but has not committed, is invisible to the
     ///    census and becomes visible immediately afterwards.
     ///
-    /// The default path (`NotConfirmed`) closes hazard 1 structurally: it
+    /// The default path (`NotConfirmed`) closes hazard 1 structurally. It
     /// requires every expected shard's durable `harvest_codec_key_state` row to
-    /// have named this key `"retiring"` for at least `staleness_window`, which
-    /// [`activate_codec_key`] stamps the instant a newer key becomes active.
-    /// Every other process refreshes its own view of the active key at most
-    /// every scanner-tick interval (see [`refresh_active_codec_key`]), so once
-    /// `staleness_window` safely exceeds twice that interval, no conforming
-    /// writer can still be encoding under the outgoing key. It narrows hazard 2
-    /// with an immediate recensus before finalizing (see `retire_codec_key`'s
-    /// `recheck_delay`), but cannot close it completely without tracking
-    /// individual transaction lifetimes — a known, documented limitation, not a
-    /// silent gap.
+    /// have named this key `"retiring"` for at least `staleness_window`.
+    /// [`activate_codec_key`] stamps that row the instant a newer key becomes
+    /// active. Every other process refreshes its own view of the active key
+    /// at most every scanner-tick interval (see [`refresh_active_codec_key`]).
+    /// So once `staleness_window` safely exceeds twice that interval, no
+    /// conforming writer can still be encoding under the outgoing key. This
+    /// path narrows hazard 2 with an immediate recensus before finalizing (see
+    /// `retire_codec_key`'s `recheck_delay`). It cannot close hazard 2
+    /// completely without tracking individual transaction lifetimes — a known,
+    /// documented limitation, not a silent gap.
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     pub enum FleetWriteFence {
         /// Skip the durable staleness-window wait and go straight to the
@@ -1436,10 +1450,10 @@ mod db {
         Ok(())
     }
 
-    /// The structural half of [`FleetWriteFence::NotConfirmed`] (issue #1244):
-    /// every expected shard must show `key_id` durably `"retiring"`, and the
-    /// latest of those transitions (the straggling shard sets the pace) must be
-    /// at least `staleness_window` in the past.
+    /// The structural half of [`FleetWriteFence::NotConfirmed`] (issue #1244).
+    /// Every expected shard must show `key_id` durably `"retiring"`. The
+    /// latest of those transitions (the straggling shard sets the pace) must
+    /// be at least `staleness_window` in the past.
     async fn staleness_gate(
         sharded_pool: &crate::shard::ShardedDbPool,
         expected_shards: &[crate::types::ShardId],
@@ -1450,23 +1464,14 @@ mod db {
         let mut latest_retiring_since: Option<DateTime<Utc>> = None;
         for shard in expected_shards {
             let shard_id = shard.as_i32();
-            let Some(pool) = sharded_pool.exact_pool_for(*shard) else {
-                remaining.push(CodecKeyShardRemainder {
-                    shard_id,
-                    rows: 0,
-                    reachable: false,
-                    reason: Some("no connection pool for this shard in this process".to_string()),
-                });
-                continue;
-            };
-            let mut conn = match pool.get().await {
+            let mut conn = match resolve_shard_conn(sharded_pool, *shard).await {
                 Ok(c) => c,
-                Err(e) => {
+                Err(reason) => {
                     remaining.push(CodecKeyShardRemainder {
                         shard_id,
                         rows: 0,
                         reachable: false,
-                        reason: Some(format!("connection unavailable: {e}")),
+                        reason: Some(reason),
                     });
                     continue;
                 }
@@ -1572,7 +1577,6 @@ mod db {
     ///   shard, the remaining row count, an unreadable shard, an incomplete
     ///   durable transition to `"retiring"`, or time left on the staleness
     ///   window.
-    #[allow(clippy::too_many_arguments)]
     pub async fn retire_codec_key(
         sharded_pool: &crate::shard::ShardedDbPool,
         expected_shards: &[crate::types::ShardId],
@@ -1633,20 +1637,22 @@ mod db {
             });
         }
 
-        if fence == FleetWriteFence::NotConfirmed {
-            for shard in expected_shards {
-                if let Some(pool) = sharded_pool.exact_pool_for(*shard)
-                    && let Ok(mut conn) = pool.get().await
-                    && let Err(e) = write_key_state_retired(&mut conn, key_id).await
-                {
-                    tracing::warn!(
-                        error = %e,
-                        key_id,
-                        shard_id = shard.as_i32(),
-                        "codec key state: failed to record retirement (bookkeeping only; the \
-                         in-memory key was still dropped)"
-                    );
-                }
+        // Bookkeeping runs regardless of `fence`. The escape hatch skips only
+        // the staleness-window *wait* (see `FleetWriteFence`'s doc), never the
+        // durable record that the key is now retired. Best-effort -- a failed
+        // write here does not un-retire the key.
+        for shard in expected_shards {
+            if let Some(pool) = sharded_pool.exact_pool_for(*shard)
+                && let Ok(mut conn) = pool.get().await
+                && let Err(e) = write_key_state_retired(&mut conn, key_id).await
+            {
+                tracing::warn!(
+                    error = %e,
+                    key_id,
+                    shard_id = shard.as_i32(),
+                    "codec key state: failed to record retirement (bookkeeping only; the \
+                     in-memory key was still dropped)"
+                );
             }
         }
 
@@ -1660,13 +1666,14 @@ mod db {
     /// # Why the check exists
     ///
     /// A pre-#948 reader recognises an envelope only as exactly three keys at
-    /// version 1; a version-2 envelope (four keys, a `kid`) comes back
+    /// version 1. A version-2 envelope (four keys, a `kid`) comes back
     /// unchanged from its decoder — silent wrong data, not an error. See
-    /// [`PayloadCodecs::set_active_key`]'s rustdoc. This function is the
-    /// structural version of that rustdoc's manual rollout-ordering warning:
-    /// every live worker's `harvest_workers.labels` row must advertise
-    /// [`crate::payload_codec::CODEC_ENVELOPE_VERSION_KEYED`] support before
-    /// activation is allowed to proceed at all.
+    /// [`PayloadCodecs::set_active_key`]'s rustdoc.
+    ///
+    /// This function is the structural version of that rustdoc's manual
+    /// rollout-ordering warning. Every live worker's `harvest_workers.labels`
+    /// row must advertise [`crate::payload_codec::CODEC_ENVELOPE_VERSION_KEYED`]
+    /// support before activation is allowed to proceed at all.
     ///
     /// "Live" mirrors [`crate::worker::worker_stale_secs`]: pass that
     /// function's result (computed from the deployment's configured
@@ -1677,13 +1684,22 @@ mod db {
     /// blocks activation on its own.
     ///
     /// On success, every expected shard's `harvest_codec_key_state` is updated
-    /// durably (the previously active row, if any, becomes `"retiring"`) and
+    /// durably (the previously active row, if any, becomes `"retiring"`), and
     /// this process's registry is flipped via [`PayloadCodecs::set_active_key`].
-    /// Shard writes are sequential, not two-phase-committed: a failure partway
-    /// through leaves some shards active and others not-yet-written, which is
-    /// why the call returns the first write error rather than continuing past
-    /// it — re-running once the underlying failure is fixed converges every
+    /// Shard writes are sequential, not two-phase-committed. A failure partway
+    /// through leaves some shards active and others not-yet-written. The call
+    /// therefore returns the first write error rather than continuing past
+    /// it. Re-running once the underlying failure is fixed converges every
     /// shard via `ON CONFLICT DO UPDATE`.
+    ///
+    /// This function does not coordinate across concurrent calls activating
+    /// **different** keys. Each shard resolves such a race independently, and
+    /// whichever write commits last on a shard wins it. So two operators
+    /// racing to rotate onto different keys at once can leave different
+    /// shards durably active on different keys. Nothing in this crate detects
+    /// that split automatically. An operator who runs concurrent rotations
+    /// must reconcile it by hand: re-run one `activate_codec_key` call to
+    /// converge every shard.
     ///
     /// # Errors
     ///
@@ -1692,16 +1708,9 @@ mod db {
     /// - [`HarvestError::CodecKeyActivationBlocked`] naming every blocking live
     ///   worker or unreachable/omitted shard.
     /// - Any database error from the durable write, after the checks pass.
-    ///
-    /// # Panics
-    ///
-    /// Never in practice: the durable-write loop re-resolves each shard's pool
-    /// via [`crate::shard::ShardedDbPool::exact_pool_for`], which the
-    /// capability-check loop above already proved `Some` for every shard this
-    /// point is reached with (any `None` there was pushed onto `blockers` and
-    /// returned before this loop runs). `sharded_pool` is an immutable
-    /// reference throughout, so the second lookup cannot disagree with the
-    /// first.
+    ///   This includes a shard that became unreachable between the capability
+    ///   check and this call's own write. A connection is re-resolved per
+    ///   shard rather than held across the two passes.
     pub async fn activate_codec_key(
         sharded_pool: &crate::shard::ShardedDbPool,
         expected_shards: &[crate::types::ShardId],
@@ -1742,25 +1751,15 @@ mod db {
 
         for shard in expected_shards {
             let shard_id = shard.as_i32();
-            let Some(pool) = sharded_pool.exact_pool_for(*shard) else {
-                blockers.push(CodecKeyActivationBlocker {
-                    shard_id,
-                    worker_id: None,
-                    host: None,
-                    reachable: false,
-                    reason: Some("no connection pool for this shard in this process".to_string()),
-                });
-                continue;
-            };
-            let mut conn = match pool.get().await {
+            let mut conn = match resolve_shard_conn(sharded_pool, *shard).await {
                 Ok(c) => c,
-                Err(e) => {
+                Err(reason) => {
                     blockers.push(CodecKeyActivationBlocker {
                         shard_id,
                         worker_id: None,
                         host: None,
                         reachable: false,
-                        reason: Some(format!("connection unavailable: {e}")),
+                        reason: Some(reason),
                     });
                     continue;
                 }
@@ -1791,15 +1790,15 @@ mod db {
         }
 
         for shard in expected_shards {
-            let pool = sharded_pool
-                .exact_pool_for(*shard)
-                .expect("checked reachable above");
-            let mut conn = pool.get().await.map_err(|e| {
-                HarvestError::Database(format!(
-                    "codec key activation: connection unavailable on shard {}: {e}",
-                    shard.as_i32()
-                ))
-            })?;
+            let mut conn = resolve_shard_conn(sharded_pool, *shard)
+                .await
+                .map_err(|reason| {
+                    HarvestError::Database(format!(
+                        "codec key activation: shard {} became unreachable between the capability \
+                     check and the durable write: {reason}",
+                        shard.as_i32()
+                    ))
+                })?;
             write_key_state_activation(&mut conn, key_id).await?;
         }
 
@@ -1812,23 +1811,24 @@ mod db {
     /// Folded into [`crate::timeout::enforce_timeouts_once`] right beside the
     /// re-encryption sweep — shard-local, on the connection the caller already
     /// holds, on the same bounded cadence. This is what turns
-    /// [`activate_codec_key`]'s durable write into a fact every *other* process
-    /// eventually observes: the deployment's configured scanner-tick interval
-    /// is the bound in [`FleetWriteFence`]'s "twice the refresh interval"
-    /// argument.
+    /// [`activate_codec_key`]'s durable write into a fact every *other*
+    /// process eventually observes. The deployment's configured scanner-tick
+    /// interval is the bound in [`FleetWriteFence`]'s "twice the refresh
+    /// interval" argument.
     ///
-    /// Never surfaces an error that should break the rest of the tick: an
-    /// unreachable table, an active key this process never registered, or a
-    /// local flip failure are all logged and swallowed by the caller, the same
-    /// posture as [`sweep_codec_reencryption`] beside it. Returns `true` when
-    /// this call actually changed the local active key.
+    /// Never surfaces an error that should break the rest of the tick. Three
+    /// things are logged and swallowed by the caller instead: an unreachable
+    /// table, an active key this process never registered, and a local flip
+    /// failure. That is the same posture as [`sweep_codec_reencryption`]
+    /// beside it. Returns `true` when this call actually changed the local
+    /// active key.
     ///
     /// # Errors
     ///
-    /// Propagates database failures reading the table; never a local-flip
-    /// failure (logged separately, since flipping to an unregistered key is
-    /// expected during a rotation window and must not look like a query
-    /// failure).
+    /// Propagates database failures reading the table. Never a local-flip
+    /// failure. That is logged separately, because flipping to an
+    /// unregistered key is expected during a rotation window. It must not
+    /// look like a query failure.
     pub async fn refresh_active_codec_key(
         conn: &mut AsyncPgConnection,
         codecs: &PayloadCodecs,

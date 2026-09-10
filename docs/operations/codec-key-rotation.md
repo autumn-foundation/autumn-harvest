@@ -194,6 +194,14 @@ On success it durably marks `key_id` `active`, marks the previously active key
 (if any) `retiring`, and flips this process's registry immediately — the same
 zero-restart-window guarantee `set_active_key` always gave.
 
+**Do not run two rotations at once.** `activate_codec_key` does not coordinate
+across concurrent calls activating *different* keys: each shard resolves such
+a race independently, so two operators rotating onto different keys at the
+same time can leave different shards durably active on different keys.
+Nothing detects that split automatically — run one rotation to completion
+before starting another, and if you suspect a race happened, re-run
+`activate_codec_key` with your intended key to converge every shard.
+
 ## Retiring the old key
 
 ```rust
@@ -361,9 +369,12 @@ history, runs the sweep, and replays again, asserting identical decoded
 histories and `ReplaySucceeded` both times.
 
 The sweep writes with a **compare-and-swap** on the row's previous bytes, so it
-always loses a race against PII erasure or a heartbeat checkpoint. That is the
-only safe direction: writing re-encrypted ciphertext over an erasure tombstone
-would resurrect payload data the erasure had just destroyed.
+always loses a race against PII erasure — the only other code path that
+mutates `harvest_events.event_data` after insert (see CLAUDE.md's Engine
+Invariants; a heartbeat checkpoint mutates `harvest_task_queue`, not the event
+log, so it is not a party to this race). Losing is the only safe direction:
+writing re-encrypted ciphertext over an erasure tombstone would resurrect
+payload data the erasure had just destroyed.
 
 ## Troubleshooting
 

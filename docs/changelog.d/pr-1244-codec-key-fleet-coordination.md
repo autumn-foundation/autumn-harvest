@@ -50,9 +50,27 @@ parameters) or adopts the structural path.
 Tests: `payload_codec.rs` gains 4 unit tests for the capability-label merge
 (fresh object, preserves operator labels, overwrites a forged/stale value,
 tolerates a non-object `labels`). `codec_rotation_db_tests.rs` gains 8
-DB-backed tests: the staleness window blocking a genuine zero census, a
-purely-local flip never satisfying the structural gate (and the escape hatch
-still working), the recheck catching a row that commits between the two
-census passes (AC5's second interleaving), the reader-capability handshake
-blocking/allowing/ignoring-a-stale-worker, and the bounded-staleness refresh
-picking up another process's activation.
+DB-backed tests: the staleness window blocking a genuine zero census; a
+purely-local flip never satisfying the structural gate, with the escape hatch
+still working; the escape hatch still durably recording the retirement (a
+Codex-round regression test — see below); the recheck catching a row that
+commits between the two census passes (AC5's second interleaving); the
+reader-capability handshake blocking/allowing/ignoring-a-stale-worker; and the
+bounded-staleness refresh picking up another process's activation.
+
+**Review fixes.** Four independent review passes (correctness/concurrency,
+security, docs/STE, simplification) ran against the initial implementation.
+Security and simplification passes found no defects requiring a code change.
+The correctness pass found one real bug, fixed before this shipped:
+`retire_codec_key`'s `FleetWriteFence::ConfirmedByOperator` escape hatch was
+skipping the durable "retired" bookkeeping write along with the
+staleness-window wait it is documented to skip, so a key retired through the
+escape hatch stayed durably `"retiring"` forever. It also flagged a
+documented (not code-fixed) limitation: `activate_codec_key` does not
+coordinate across concurrent calls activating *different* keys, so two
+uncoordinated concurrent rotations can leave different shards durably active
+on different keys — now called out in both the rustdoc and the runbook. The
+docs pass found a stray pre-#1244 runbook claim that the re-encryption
+sweep's compare-and-swap "loses a race against ... a heartbeat checkpoint",
+which CLAUDE.md's Engine Invariants section already established is not a
+`harvest_events` writer — corrected.

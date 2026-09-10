@@ -298,6 +298,22 @@ async fn cursor_row_count(conn: &mut AsyncPgConnection) -> i64 {
     row.n
 }
 
+/// `harvest_codec_key_state.state` for `key_id`, or `None` when no row exists.
+async fn key_state(conn: &mut AsyncPgConnection, key_id: &str) -> Option<String> {
+    #[derive(diesel::QueryableByName)]
+    struct State {
+        #[diesel(sql_type = diesel::sql_types::Text)]
+        state: String,
+    }
+    let rows: Vec<State> =
+        diesel::sql_query("SELECT state FROM harvest_codec_key_state WHERE key_id = $1")
+            .bind::<diesel::sql_types::Text, _>(key_id)
+            .load(conn)
+            .await
+            .expect("load key state");
+    rows.into_iter().next().map(|r| r.state)
+}
+
 fn kid_of(event_data: &Value, field: &str) -> Option<String> {
     event_data["data"][field][CODEC_ENVELOPE_KID_KEY]
         .as_str()
@@ -996,10 +1012,10 @@ async fn retirement_is_refused_while_rows_remain_and_succeeds_at_zero() {
 // ── issue #1244: the structural write fence ──────────────────────────────────
 
 /// `activate_codec_key` is what durably marks the superseded key "retiring".
-/// Until that has held for `staleness_window`, `retire_codec_key`'s default
-/// (structural) path refuses -- even though the census is a genuine zero,
-/// which is exactly the case the old boolean `FleetWriteFence` could not
-/// distinguish from "another worker just hasn't rolled forward yet".
+/// `retire_codec_key`'s default (structural) path refuses until that has held
+/// for `staleness_window` -- even though the census is a genuine zero. That
+/// is exactly the case the old boolean `FleetWriteFence` could not
+/// distinguish from "another worker has not rolled forward yet".
 #[tokio::test]
 async fn retirement_waits_for_the_staleness_window_even_at_a_zero_census() {
     let (url, _c) = setup_isolated_db().await;
@@ -1010,7 +1026,7 @@ async fn retirement_waits_for_the_staleness_window_even_at_a_zero_census() {
 
     // `two_key_registry` bootstraps k1 active only in this process's local
     // memory (mirroring `register_key`'s "first key becomes active"
-    // convenience) -- an operator durably activates it too, so it has a
+    // convenience). An operator durably activates it too, so it has a
     // `harvest_codec_key_state` row to demote when a newer key supersedes it.
     activate_codec_key(&sharded, &shards, &codecs, "k1", 60)
         .await
@@ -1062,9 +1078,10 @@ async fn retirement_waits_for_the_staleness_window_even_at_a_zero_census() {
 
 /// A **local-only** flip (the old #948 behaviour, `PayloadCodecs::set_active_key`
 /// called directly rather than through `activate_codec_key`) never durably
-/// marks the superseded key "retiring". The structural gate refuses on exactly
-/// that basis -- this is the regression test for the hazard #1244 exists to
-/// close: a per-process flip must never be mistaken for a fleet-wide one.
+/// marks the superseded key "retiring". The structural gate refuses on
+/// exactly that basis. This is the regression test for the hazard #1244
+/// exists to close: a per-process flip must never be mistaken for a
+/// fleet-wide one.
 #[tokio::test]
 async fn retirement_via_the_structural_gate_refuses_a_purely_local_flip() {
     let (url, _c) = setup_isolated_db().await;
@@ -1113,6 +1130,50 @@ async fn retirement_via_the_structural_gate_refuses_a_purely_local_flip() {
     .await
     .expect("the escape hatch skips the structural gate");
     assert!(codecs.codec_for_key("k1").is_none());
+}
+
+/// The escape hatch skips only the staleness-window *wait* (see
+/// `FleetWriteFence`'s doc). It must not also skip durably recording the
+/// retirement, or `harvest_codec_key_state` would claim a destroyed key is
+/// still merely "retiring" forever.
+#[tokio::test]
+async fn retirement_via_the_escape_hatch_still_records_the_durable_retirement() {
+    let (url, _c) = setup_isolated_db().await;
+    let mut conn = connect(&url).await;
+    let codecs = two_key_registry();
+    let pool = build_pool(&url);
+    let sharded = ShardedDbPool::single(pool);
+    let shards = [ShardId::new(0)];
+
+    activate_codec_key(&sharded, &shards, &codecs, "k1", 60)
+        .await
+        .expect("no live workers to block activation");
+    activate_codec_key(&sharded, &shards, &codecs, "k2", 60)
+        .await
+        .expect("no live workers to block activation");
+    assert_eq!(
+        key_state(&mut conn, "k1").await.as_deref(),
+        Some("retiring")
+    );
+
+    retire_codec_key(
+        &sharded,
+        &shards,
+        &codecs,
+        "k1",
+        FleetWriteFence::ConfirmedByOperator,
+        Duration::ZERO,
+        Duration::ZERO,
+    )
+    .await
+    .expect("zero rows and the escape hatch retire the key");
+
+    assert_eq!(
+        key_state(&mut conn, "k1").await.as_deref(),
+        Some("retired"),
+        "the escape hatch must not leave the durable row stuck at \"retiring\" \
+         after the key is actually gone"
+    );
 }
 
 /// AC5's second required interleaving: a row that was not even written at the
@@ -1357,8 +1418,8 @@ async fn activation_ignores_a_worker_whose_heartbeat_is_stale() {
 
 /// `refresh_active_codec_key` is the mechanism that turns a durable
 /// `activate_codec_key` write into a fact another process's `PayloadCodecs`
-/// observes -- simulated here as two independent registries sharing a
-/// database, one that called `activate_codec_key` and one that only refreshes.
+/// observes. Simulated here as two independent registries sharing a
+/// database: one calls `activate_codec_key`, the other only refreshes.
 #[tokio::test]
 async fn refresh_active_codec_key_picks_up_a_fleet_wide_activation_from_another_process() {
     let (url, _c) = setup_isolated_db().await;
