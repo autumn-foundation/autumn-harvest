@@ -438,6 +438,7 @@ changed, or a certified build whose real branch was never exercised).
 | `.queries(...)` / `.updates(...)` | The candidate's declarative `#[query]` / `#[update]` registrations. A body branching on `ctx.list_query_names()` sees an **empty** registry without these. Pass the same `queries![…]` / `updates![…]` collection the build registers; entries for other workflow types are filtered out exactly as the worker filters them. |
 | `.payload_caps(...)` / `.payload_offload_threshold(...)` | The candidate's payload limits (#252, #524). |
 | `.payload_offloader(...)` | A `PayloadOffloader` over the deployment's `PayloadStore`, so claim-check reference envelopes (#524) are inflated back to the real payload before the body sees them. **Optional:** with none configured an envelope displays as an envelope and is never an error, which is the contract for an export debugged with no store to hand. |
+| `.activity_defaults(...)` | The candidate's worker-level activity retry and start-to-close defaults. Replay applies them to frontier local-activity commands (#620). |
 | `.history_policy(...)` / `.build_id(...)` / `.state(...)` | The candidate's history thresholds, build id, and shared application state. |
 
 The `HistorySnapshot`'s own replay inputs — `workflow_id`, `queue_name`,
