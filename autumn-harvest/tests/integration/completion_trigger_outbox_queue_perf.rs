@@ -372,7 +372,7 @@ async fn measure_one_batch(admin: &str, _label: &str, n: usize) -> SizePoint {
         .map(|r| fmt_row(r, total_calls, total_buffers))
         .collect();
     let mut by_calls: Vec<&StatRow> = all_rows.iter().collect();
-    by_calls.sort_by(|a, b| b.calls.cmp(&a.calls));
+    by_calls.sort_by_key(|r| std::cmp::Reverse(r.calls));
     let profile_by_calls: Vec<String> = by_calls
         .iter()
         .take(10)
