@@ -307,6 +307,65 @@ pub const fn reclaim_expired_lock_stmt() -> &'static str {
      RETURNING holder_exec_id"
 }
 
+/// Fenced reclaim, waiter cleanup and head-of-line lookup, combined into one
+/// round trip (issue #1177's own playbook: "bookkeeping queries that are
+/// individually trivial but collectively dominant").
+///
+/// Sequentially identical to [`reclaim_expired_lock_stmt`] +
+/// [`delete_holder_waiter_for_key_stmt`] + [`head_of_line_stmt`], run as
+/// three separate statements in the same transaction. But a
+/// data-modifying CTE's effect is visible only to a **sibling** statement
+/// that explicitly references its output. It is never visible through a
+/// plain scan of the base table. Three separate statements in one
+/// transaction behave differently: there, each later statement's own
+/// snapshot *does* see the previous statement's committed writes.
+///
+/// So `head_waiter` cannot simply re-`SELECT` from
+/// `harvest_mutex_waiters`. It anti-joins against `deleted_waiter`'s
+/// `RETURNING` output instead, to exclude the row `deleted_waiter` just
+/// removed. That reproduces exactly what the three-statement sequence
+/// saw.
+///
+/// `$1` = `lock_key`. The outer `SELECT` has no `FROM`, so this always
+/// returns exactly one row. `reclaimed_holder` is `NULL` iff the reclaim
+/// lost the race, mirroring `reclaim_expired_lock_stmt` returning no row.
+/// In that case `deleted_waiter` and the `head_waiter` lookup do no real
+/// work: the `head_waiter` subquery's `EXISTS (SELECT 1 FROM reclaimed)`
+/// guard is `false`, exactly matching the caller-side
+/// `if let Some(h) = reclaimed` gate.
+#[must_use]
+pub const fn reclaim_expired_lock_and_wake_target_stmt() -> &'static str {
+    "WITH reclaimed AS ( \
+         DELETE FROM harvest_mutex_locks l \
+         WHERE l.lock_key = $1 \
+           AND l.lease_expires_at < now() \
+           AND NOT EXISTS ( \
+             SELECT 1 FROM harvest_workflow_executions e \
+             WHERE e.id = l.holder_exec_id AND e.state = 'PAUSED' \
+           ) \
+         RETURNING holder_exec_id \
+     ), \
+     deleted_waiter AS ( \
+         DELETE FROM harvest_mutex_waiters w \
+         USING reclaimed r \
+         WHERE w.lock_key = $1 AND w.waiter_exec_id = r.holder_exec_id \
+         RETURNING w.waiter_exec_id \
+     ) \
+     SELECT \
+         (SELECT holder_exec_id FROM reclaimed) AS reclaimed_holder, \
+         ( \
+             SELECT w2.waiter_exec_id \
+             FROM harvest_mutex_waiters w2 \
+             WHERE w2.lock_key = $1 \
+               AND EXISTS (SELECT 1 FROM reclaimed) \
+               AND NOT EXISTS ( \
+                 SELECT 1 FROM deleted_waiter dw WHERE dw.waiter_exec_id = w2.waiter_exec_id \
+               ) \
+             ORDER BY w2.id ASC \
+             LIMIT 1 \
+         ) AS head_waiter"
+}
+
 /// Push every lease held by `$1` (`holder_exec_id`) forward by `$2` seconds
 /// (double). Single-lock-type UPDATE — no advisory lock needed (no ABBA).
 #[must_use]
@@ -345,8 +404,8 @@ mod db_ops {
         MutexGrantOutcome, advisory_lock_stmt, delete_holder_waiter_for_key_stmt,
         enqueue_waiter_stmt, expired_leases_stmt, grant_lock_stmt, head_of_line_stmt,
         held_keys_for_holder_stmt, holder_holds_any_stmt, is_grantable_head_stmt,
-        reclaim_expired_lock_stmt, release_lock_by_holder_key_stmt, release_lock_stmt,
-        renew_leases_for_holder_stmt, waiter_keys_for_holder_stmt,
+        reclaim_expired_lock_and_wake_target_stmt, release_lock_by_holder_key_stmt,
+        release_lock_stmt, renew_leases_for_holder_stmt, waiter_keys_for_holder_stmt,
     };
     use crate::error::{HarvestResult, database_error};
     use crate::types::ExecutionId;
@@ -379,10 +438,14 @@ mod db_ops {
         waiter_exec_id: uuid::Uuid,
     }
 
+    /// Result row for [`reclaim_expired_lock_and_wake_target_stmt`]. Both
+    /// columns are `NULL` when the reclaim lost the race.
     #[derive(diesel::QueryableByName)]
-    struct HolderRow {
-        #[diesel(sql_type = diesel::sql_types::Uuid)]
-        holder_exec_id: uuid::Uuid,
+    struct ReclaimAndWakeTargetRow {
+        #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Uuid>)]
+        reclaimed_holder: Option<uuid::Uuid>,
+        #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Uuid>)]
+        head_waiter: Option<uuid::Uuid>,
     }
 
     #[derive(diesel::QueryableByName)]
@@ -693,24 +756,22 @@ mod db_ops {
         for k in keys {
             advisory_lock(conn, &k.lock_key).await?;
 
-            let reclaimed: Option<HolderRow> = diesel::sql_query(reclaim_expired_lock_stmt())
-                .bind::<diesel::sql_types::Text, _>(&k.lock_key)
-                .get_result(conn)
-                .await
-                .optional()
-                .map_err(database_error)?;
-
-            if let Some(h) = reclaimed {
-                let reclaimed_holder = ExecutionId::from_uuid(h.holder_exec_id);
-                diesel::sql_query(delete_holder_waiter_for_key_stmt())
+            // Reclaim, waiter cleanup and head-of-line lookup in one round
+            // trip instead of three. See
+            // `reclaim_expired_lock_and_wake_target_stmt`'s doc comment for
+            // why the combined statement's `head_waiter` subquery has to
+            // anti-join against `deleted_waiter`, rather than re-reading
+            // `harvest_mutex_waiters` directly.
+            let row: ReclaimAndWakeTargetRow =
+                diesel::sql_query(reclaim_expired_lock_and_wake_target_stmt())
                     .bind::<diesel::sql_types::Text, _>(&k.lock_key)
-                    .bind::<diesel::sql_types::Uuid, _>(reclaimed_holder.as_uuid())
-                    .execute(conn)
+                    .get_result(conn)
                     .await
                     .map_err(database_error)?;
 
-                if let Some(head) = head_of_line(conn, &k.lock_key).await? {
-                    crate::queue::wake_workflow_task(conn, head).await?;
+            if row.reclaimed_holder.is_some() {
+                if let Some(head) = row.head_waiter {
+                    crate::queue::wake_workflow_task(conn, ExecutionId::from_uuid(head)).await?;
                 }
                 count += 1;
             }
