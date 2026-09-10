@@ -178,6 +178,15 @@ jobs:
         # nothing keeps the two pins in sync as releases ship. See
         # scripts/check-readme-testing-dep-version.sh.
         run: ./scripts/check-readme-testing-dep-version.sh
+      - name: Check for PowerShell env-var syntax in bash blocks
+        # Guards a real, reproduced-live defect: examples/standalone-runner's
+        # README fenced its "Run" section ```bash, matching every sibling
+        # example, but the two lines setting DATABASE_URL and AUTUMN_PROFILE
+        # used PowerShell's `$env:NAME = "value"` assignment instead of bash's
+        # `NAME=value`. Pasted verbatim into bash, each line is silently
+        # skipped ("command not found") and neither variable ends up set. See
+        # scripts/check-no-powershell-env-syntax.sh.
+        run: ./scripts/check-no-powershell-env-syntax.sh
       - name: Check formatting
         run: cargo fmt --all -- --check
       - name: Clippy autumn-harvest

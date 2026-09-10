@@ -15,8 +15,8 @@ framework ceremony.
 ```bash
 docker compose -f examples/standalone-runner/compose.yaml up -d
 
-$env:DATABASE_URL = "postgres://runner:runner@localhost:5434/runner"
-$env:AUTUMN_PROFILE = "dev"
+DATABASE_URL=postgres://runner:runner@localhost:5434/runner \
+AUTUMN_PROFILE=dev \
 cargo run -p standalone-runner
 ```
 
