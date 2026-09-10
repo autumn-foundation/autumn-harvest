@@ -1593,6 +1593,13 @@ async fn rate_limit_override_set_and_clear_record_audit_rows() {
         set_record["route_or_command"],
         json!("POST /admin/rate-limits/{activity_name}/override")
     );
+    // Issue #1229's new audit-on-rejection machinery must never double-fire
+    // on a SUCCESSFUL request. `.find` above passes even on a duplicate row.
+    assert_eq!(
+        records.iter().filter(|r| r["target_id"] == json!(name)).count(),
+        1,
+        "a successful SET must record exactly one audit row: {records:?}"
+    );
 
     let (status, body) = get_json(
         &app,
@@ -1609,6 +1616,11 @@ async fn rate_limit_override_set_and_clear_record_audit_rows() {
     assert_eq!(
         clear_record["route_or_command"],
         json!("DELETE /admin/rate-limits/{activity_name}/override")
+    );
+    assert_eq!(
+        records.iter().filter(|r| r["target_id"] == json!(name)).count(),
+        1,
+        "a successful CLEAR must record exactly one audit row: {records:?}"
     );
 }
 
@@ -1644,6 +1656,13 @@ async fn throttle_override_set_and_clear_record_audit_rows() {
         set_record["route_or_command"],
         json!("POST /admin/start-throttle/{workflow_name}/override")
     );
+    // Issue #1229's new audit-on-rejection machinery must never double-fire
+    // on a SUCCESSFUL request. `.find` above passes even on a duplicate row.
+    assert_eq!(
+        records.iter().filter(|r| r["target_id"] == json!(key)).count(),
+        1,
+        "a successful SET must record exactly one audit row: {records:?}"
+    );
 
     let (status, body) = get_json(
         &app,
@@ -1660,6 +1679,11 @@ async fn throttle_override_set_and_clear_record_audit_rows() {
     assert_eq!(
         clear_record["route_or_command"],
         json!("DELETE /admin/start-throttle/{workflow_name}/override")
+    );
+    assert_eq!(
+        records.iter().filter(|r| r["target_id"] == json!(key)).count(),
+        1,
+        "a successful CLEAR must record exactly one audit row: {records:?}"
     );
 }
 
@@ -2441,6 +2465,120 @@ async fn clear_start_throttle_pacing_override_reports_router_known_shard_with_no
                 .as_str()
                 .is_some_and(|s| s.contains("shard 1")))),
         "shard 1 must be named as unreachable, not silently dropped: {body}"
+    );
+}
+
+// A total outage (every expected shard unreachable) must still fail closed
+// with a `503`, the same as it did before the fan-out fix. The fix folds a
+// missing pool into `shard_errors` alongside a live-but-dead pool; these
+// tests prove that never degrades a total outage into a false success.
+
+fn single_dead_shard() -> (HarvestDbPool, ShardRouter) {
+    let mut pools = BTreeMap::new();
+    pools.insert(ShardId::new(0), dead_pool());
+    let sharded_pool = ShardedDbPool::from_map(pools, ShardId::new(0));
+    let router = ShardRouter::new(
+        vec![ShardId::new(0)],
+        vec![ShardId::new(0)],
+        ShardId::new(0),
+    );
+    (HarvestDbPool::sharded(sharded_pool), router)
+}
+
+#[tokio::test]
+async fn set_rate_limit_pacing_override_returns_503_on_total_shard_outage() {
+    let name = leaked_name("send_email");
+    let (pool, router) = single_dead_shard();
+    let app = build_sharded_app(
+        pool,
+        router,
+        vec![rate_limited_activity_info(name, 5.0, 5.0)],
+        vec![],
+    );
+
+    let (status, body) = post_json(
+        &app,
+        &format!("/admin/rate-limits/{name}/override"),
+        json!({ "refill_rate": 42.0, "ttl_secs": 300 }),
+    )
+    .await;
+
+    assert_eq!(
+        status,
+        StatusCode::SERVICE_UNAVAILABLE,
+        "a total shard outage must fail closed, not report a false success: {body}"
+    );
+    assert!(
+        body.get("errors").is_some(),
+        "503 body should name the unreachable shard(s): {body}"
+    );
+}
+
+#[tokio::test]
+async fn clear_rate_limit_pacing_override_returns_503_on_total_shard_outage() {
+    let name = leaked_name("send_email");
+    let (pool, router) = single_dead_shard();
+    let app = build_sharded_app(
+        pool,
+        router,
+        vec![rate_limited_activity_info(name, 5.0, 5.0)],
+        vec![],
+    );
+
+    let (status, body) = delete_json(&app, &format!("/admin/rate-limits/{name}/override")).await;
+
+    assert_eq!(
+        status,
+        StatusCode::SERVICE_UNAVAILABLE,
+        "a total shard outage must fail closed, not report a false success: {body}"
+    );
+    assert!(
+        body.get("errors").is_some(),
+        "503 body should name the unreachable shard(s): {body}"
+    );
+}
+
+#[tokio::test]
+async fn set_start_throttle_pacing_override_returns_503_on_total_shard_outage() {
+    let name = leaked_name("onboard_user");
+    let (pool, router) = single_dead_shard();
+    let app = build_sharded_app(pool, router, vec![], vec![static_throttled_info(name, "5/m", 5.0)]);
+
+    let (status, body) = post_json(
+        &app,
+        &format!("/admin/start-throttle/{name}/override"),
+        json!({ "refill_per_sec": 1.0, "ttl_secs": 300 }),
+    )
+    .await;
+
+    assert_eq!(
+        status,
+        StatusCode::SERVICE_UNAVAILABLE,
+        "a total shard outage must fail closed, not report a false success: {body}"
+    );
+    assert!(
+        body.get("errors").is_some(),
+        "503 body should name the unreachable shard(s): {body}"
+    );
+}
+
+#[tokio::test]
+async fn clear_start_throttle_pacing_override_returns_503_on_total_shard_outage() {
+    let name = leaked_name("onboard_user");
+    let (pool, router) = single_dead_shard();
+    let app = build_sharded_app(pool, router, vec![], vec![static_throttled_info(name, "5/m", 5.0)]);
+
+    let (status, body) =
+        delete_json(&app, &format!("/admin/start-throttle/{name}/override")).await;
+
+    assert_eq!(
+        status,
+        StatusCode::SERVICE_UNAVAILABLE,
+        "a total shard outage must fail closed, not report a false success: {body}"
+    );
+    assert!(
+        body.get("errors").is_some(),
+        "503 body should name the unreachable shard(s): {body}"
     );
 }
 
