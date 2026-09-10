@@ -334,12 +334,13 @@ your whole application.
 
    Create the equivalent harvest `WorkflowSchedule`, but keep it paused.
    Use `POST /admin/schedules/{id}/pause` (issue #229) to hold it. Set its
-   `CatchupPolicy` (issue #484). That policy decides what its first tick
-   does with any backlog. Unpause the harvest schedule only at a defined
-   boundary, once you confirm the Temporal side is quiesced.
+   `CatchupPolicy` (issue #484) to control what happens to any backlog
+   once the schedule resumes ticking. Confirm the Temporal Schedule is
+   paused, and its buffered firings are resolved. Unpause the harvest
+   schedule only then, at a defined boundary.
 
-   A follow-up operation against one already-started execution routes by
-   a different rule. A signal, a query, an update, and a cancellation each
+   A follow-up operation against one already-started execution follows a
+   different rule. A signal, a query, an update, and a cancellation each
    name one specific execution, not a workflow type. Route each by where
    that execution actually started. Never route it by the flag's current
    value. The flag can flip between an execution's start and a later
@@ -349,14 +350,14 @@ your whole application.
    Persist a `(workflow_name, workflow_id) -> engine` record at start
    time. Look up that record for every follow-up call against a specific
    execution. Route the call to the engine the record names. A `cancel`
-   signal routed to the wrong engine does not fail loudly. It does
-   nothing there, and leaves the real execution un-cancelled. Against a
-   `SignalWithStart`-shaped call, a wrong-engine route is worse: it can
+   signal routed to the wrong engine may not fail loudly. It can do
+   nothing there, while the real execution stays un-cancelled. Against a
+   `SignalWithStart`-shaped call, a wrong-engine route is worse. It can
    start a new, spurious execution on that engine instead.
 
-   Step 7, below, is a special case of this same rule. It hands off one
-   long-lived entity execution at the end of its lifecycle. Apply the
-   rule above to every other follow-up operation during the whole
+   The handoff in step 7, below, is a special case of this rule. It hands
+   off one long-lived entity execution at the end of its lifecycle. Apply
+   the rule above to every other follow-up operation during the whole
    dual-run window, not only to that one case.
 2. **Port and validate one workflow type completely before you flip its
    flag.** Run the [Workflow-porting checklist](#workflow-porting-checklist)
@@ -439,11 +440,6 @@ your whole application.
    this shape: it keeps renewing a subscription until a `cancel` signal
    arrives. Do not wait for such an execution to drain.
 
-   The handoff below is a special case of step 1's general
-   follow-up-routing rule. Route the `cancel` signal below, and the final
-   read after it, to the engine that started this specific execution.
-   Never route either action by the flag's current value.
-
    Do not take a live snapshot of its state. Do not start harvest from
    that snapshot either. A query against a running execution can go stale
    immediately. The execution can still advance after you read it. It can
@@ -477,6 +473,11 @@ your whole application.
    workflow to race the wait against the signal instead. Harvest's
    `ctx.receive_signal_timeout` (issue #476) is the primitive for that
    race on the harvest side.
+
+   The handoff above is a special case of step 1's general
+   follow-up-routing rule. Route the `cancel` signal above, and the final
+   read after it, to the engine that started this specific execution.
+   Never route either action by the flag's current value.
 
    Treat each entity's handoff as a deliberate cutover step, not a bulk
    migration. Each one is a live, stateful run. It is not disposable
@@ -690,8 +691,8 @@ async fn subscription_renewal(
   follow-up-routing rule in the [Dual-run cutover
   playbook](#dual-run-cutover-playbook), step 1, above. A `cancel` signal
   sent to the wrong engine does nothing there. It leaves the real
-  execution un-cancelled, which then blocks the step 7 drain this
-  playbook depends on.
+  execution un-cancelled. That un-cancelled execution then blocks the
+  step 7 drain this playbook depends on.
 - **Dispatch timing.** Temporal's `setHandler` callback fires as soon as the
   signal arrives, mid-await. Harvest's push handler dispatches only on the
   *next* history-consulting call the workflow body makes. A signal recorded

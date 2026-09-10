@@ -279,7 +279,7 @@ fn comparison_page_links_back_to_the_migration_guide() {
 #[test]
 fn dual_run_playbook_covers_schedule_driven_cutover() {
     let guide = read_doc(GUIDE_PATH);
-    let playbook = section_body(&guide, "## Dual-run cutover playbook");
+    let playbook = flatten_whitespace(section_body(&guide, "## Dual-run cutover playbook"));
 
     assert!(
         playbook.contains("Temporal Schedule"),
@@ -287,9 +287,9 @@ fn dual_run_playbook_covers_schedule_driven_cutover() {
          server starts a Temporal Schedule's executions directly, bypassing the app-level flag"
     );
     assert!(
-        playbook.to_lowercase().contains("buffered"),
-        "the playbook must address firings a Temporal Schedule buffers during the quiesce \
-         window, so they are not silently dropped or duplicated (issue #1219)"
+        playbook.contains("run silently") && playbook.contains("drop a buffered firing silently"),
+        "the playbook must say a buffered firing is neither run nor dropped silently during \
+         the quiesce window (issue #1219)"
     );
     assert!(
         playbook.contains("/admin/schedules/{id}/pause"),
@@ -299,18 +299,23 @@ fn dual_run_playbook_covers_schedule_driven_cutover() {
     assert!(
         playbook.contains("CatchupPolicy"),
         "the playbook must point to the catchup-policy primitive for the harvest schedule's \
-         first-tick backlog decision (issue #484, issue #1219)"
+         backlog decision (issue #484, issue #1219)"
+    );
+    assert!(
+        playbook.contains("at a defined boundary"),
+        "the playbook must gate enabling the harvest schedule on a defined boundary, once the \
+         Temporal side is confirmed paused and resolved, not on pausing alone (issue #1219)"
     );
 }
 
 /// Issue #1219, gap 2: a follow-up operation (signal, query, update, cancel)
 /// against one already-started execution must route by where that execution
-/// started, never by the current flag value -- the flag can flip between an
-/// execution's start and a later follow-up call against it.
+/// started. It must never route by the current flag value. The flag can flip
+/// between an execution's start and a later follow-up call against it.
 #[test]
 fn dual_run_playbook_covers_follow_up_engine_routing() {
     let guide = read_doc(GUIDE_PATH);
-    let playbook = section_body(&guide, "## Dual-run cutover playbook");
+    let playbook = flatten_whitespace(section_body(&guide, "## Dual-run cutover playbook"));
 
     assert!(
         playbook.to_lowercase().contains("follow-up"),
@@ -323,21 +328,26 @@ fn dual_run_playbook_covers_follow_up_engine_routing() {
          execution, and route follow-ups by that record (issue #1219)"
     );
     assert!(
-        playbook.contains("special case"),
-        "step 7's end-of-lifecycle handoff must be framed as a special case of the general \
-         follow-up-routing rule, not a standalone exception (issue #1219)"
+        playbook.contains("Never route it by the flag's current value"),
+        "the playbook must state the negative rule too: never route a follow-up by \
+         re-consulting the current flag value (issue #1219)"
+    );
+    assert!(
+        playbook.contains("is a special case of step 1's general follow-up-routing rule"),
+        "step 7's end-of-lifecycle handoff must itself be framed as a special case of the \
+         general follow-up-routing rule, not a standalone exception (issue #1219)"
     );
 }
 
 /// Issue #1219, gap 2 (continued): the worked example's own `cancel` signal
-/// is the concrete hazard the issue names -- sent to the wrong engine, it
+/// is the concrete hazard the issue names. Sent to the wrong engine, it
 /// either no-ops or spuriously starts a new execution. The commentary must
 /// cross-link the general routing rule, not just show the signal in
 /// isolation.
 #[test]
 fn worked_example_commentary_cross_links_engine_routing_rule() {
     let guide = read_doc(GUIDE_PATH);
-    let commentary = section_body(&guide, "### What changed, and why");
+    let commentary = flatten_whitespace(section_body(&guide, "### What changed, and why"));
 
     assert!(
         commentary.contains("engine that started"),
@@ -461,6 +471,17 @@ fn guards_run_on_docs_only_changes() {
          must run unconditionally: a condition is how these guards would stop running on \
          docs-only PRs again. Stanza:\n{stanza}"
     );
+}
+
+/// Collapse every run of whitespace, including a hand-wrapped line break, to
+/// one space.
+///
+/// This guide hand-wraps prose at roughly 80 columns. A multi-word phrase
+/// assertion against the raw text can span a wrap point and silently miss a
+/// match that is present to a human reader. Flatten first, so a phrase
+/// assertion is robust to where the author happened to wrap the line.
+fn flatten_whitespace(text: &str) -> String {
+    text.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
 /// Read a file with line endings normalised to `\n`.
