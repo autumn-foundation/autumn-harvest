@@ -320,6 +320,47 @@ your whole application.
    or a harvest execution. An in-flight execution of either engine keeps
    running on the engine that started it. See the
    [history-import non-goal](#non-goals) above.
+
+   **A schedule-driven type needs one more step before this flag does
+   anything.** A Temporal Schedule fires new executions directly from the
+   Temporal server. Application code, and the flag above, are never
+   consulted. Flipping the flag routes a caller-initiated start correctly.
+   It does not stop the Temporal Schedule from also firing on its own. If
+   the mapped harvest `WorkflowSchedule` (see [Schedules](#schedules)
+   above) is enabled at the same time, both engines independently fire the
+   same logical job. Each duplicates whatever that job does: a duplicate
+   charge, a duplicate notification, a duplicate batch. For a scheduled
+   workflow type: pause the Temporal Schedule first. Confirm it is
+   quiesced. Decide what to do with any firings it buffered during that
+   window, drop them or replay them by hand, before you enable the
+   harvest side. `CatchupPolicy` (issue #484) governs the harvest
+   schedule's own backlog on its first tick; it has no visibility into
+   firings the Temporal side already buffered, so that decision is yours
+   to make first. Only then create or enable the mapped `WorkflowSchedule`.
+   `POST /admin/schedules/{id}/pause` (issue #229) keeps the harvest side
+   off until you are ready, the same way you paused the Temporal side.
+
+   **A follow-up operation against one already-started execution — a
+   signal, a query, an update, a cancellation — must route by where that
+   execution actually started, never by the flag's current value.** The
+   flag only decides where the *next new* start goes; the sentence above
+   already says an in-flight execution keeps running on the engine that
+   started it, and the same holds for every operation sent to it
+   afterward. Re-deriving "which engine hosts this execution" from
+   today's flag misroutes every such operation for an execution that
+   started before the last flip. A signal or cancel sent to the wrong
+   engine silently does nothing there. A `SignalWithStart`-shaped call
+   against the wrong engine does something worse: it starts a new,
+   spurious execution instead of reaching the one you meant. Persist
+   which engine started each execution — a
+   `(workflow_name, workflow_id) -> engine` record, written once, at
+   start time — and route every later operation for that execution by
+   looking it up, never by re-reading the flag. The
+   [worked example](#worked-example)'s `cancel` signal, below, is exactly
+   this case: sent to the wrong engine, it leaves the real execution
+   running and uncancelled. Step 7's end-of-lifecycle drain handoff,
+   further down, is this same rule applied once, to a single specific
+   execution — not a separate mechanism.
 2. **Port and validate one workflow type completely before you flip its
    flag.** Run the [Workflow-porting checklist](#workflow-porting-checklist)
    against it. Confirm `WorkflowReplayer` reports no non-determinism against
@@ -394,6 +435,10 @@ your whole application.
    Temporal's own visibility API can confirm this count. Confirm zero
    pending harvest starts still routed to Temporal for it. Then remove that
    type's Temporal worker code.
+
+   The handoff below is step 1's own follow-up-routing rule, applied once,
+   to a single specific execution: send this operation to the engine this
+   execution actually started on, never to whatever the flag says today.
 
    A long-lived entity workflow may never reach zero on its own. It loops
    forever through `continueAsNew`, and nothing inside that loop ever
