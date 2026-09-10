@@ -4,36 +4,38 @@
 //!
 //! `enforce_completion_triggers_outbox` (`autumn-harvest/src/completion_trigger.rs`)
 //! is the scanner that relays a batch of up to `OUTBOX_CLAIM_BATCH_LIMIT`
-//! (50) cross-shard completion-trigger targets on every poll tick. For each
-//! task whose `queue_name` column is `NULL`, it calls `resolve_target_queue`
-//! -- one `SELECT queue_name FROM harvest_schedules WHERE workflow_name = $1`
-//! against the default shard, on that task's own turn through the loop.
+//! (50) cross-shard completion-trigger targets on every poll tick. For
+//! each task whose `queue_name` column is `NULL`, it calls
+//! `resolve_target_queue`. That is one `SELECT queue_name FROM
+//! harvest_schedules WHERE workflow_name = $1` against the default shard,
+//! on that task's own turn through the loop.
 //!
 //! `queue_name` is `NULL` on the common path: `CompletionTrigger::new`
 //! defaults it to `None`, and a caller must explicitly call
-//! `.with_queue_name(...)` to set it. A fan-in deployment -- many source
-//! executions whose completions all route through the same downstream
-//! trigger -- fills a claim batch with rows that share a `target_shard` and,
-//! commonly, a `target_workflow_name` too. This is exactly the shape this
-//! persona's own charter names: "Workflow/activity bookkeeping queries
-//! (Harvest) that are individually trivial and collectively dominant. These
-//! will never show up in a buffer ranking; find them by `calls`."
+//! `.with_queue_name(...)` to set it. A fan-in deployment sends many
+//! source executions' completions through the same downstream trigger.
+//! That fills a claim batch with rows that share a `target_shard`.
+//! Commonly, they also share a `target_workflow_name`. This is exactly
+//! the shape this persona's own charter names: "Workflow/activity
+//! bookkeeping queries (Harvest) that are individually trivial and
+//! collectively dominant. These will never show up in a buffer ranking;
+//! find them by `calls`."
 //!
 //! The fix adds `resolve_target_queues_batch`: one round trip resolving
-//! every distinct `target_workflow_name` needing a lookup in the batch, via
-//! `workflow_name = ANY($1)`. `harvest_schedules_workflow_name_unique`
-//! (issue #91's migration) means the batched query cannot return more than
-//! one row per name, so the per-name answer is unchanged -- only the
-//! round-trip count moves, from one per row needing a lookup to exactly one
-//! per scan tick (falling back to the original per-row path only if the
-//! batch attempt itself could not run, e.g. no default-shard pool).
+//! every distinct `target_workflow_name` needing a lookup in the batch,
+//! via `workflow_name = ANY($1)`. `harvest_schedules_workflow_name_unique`
+//! (issue #91's migration) means the batched query cannot return more
+//! than one row per name. So the per-name answer is unchanged -- only the
+//! round-trip count moves, from one per row needing a lookup to exactly
+//! one per scan tick. It falls back to the original per-row path only if
+//! the batch attempt itself could not run, e.g. no default-shard pool.
 //!
 //! Evidence here is `pg_stat_statements` call and buffer counts, never
-//! wall-clock. Wall-clock is not admissible on a shared-vCPU machine. This
-//! harness follows the same shape as `activity_enqueue_batch_perf.rs`: a
-//! fresh, uniquely-named, fully-migrated database per measurement point,
-//! `pg_stat_statements` reset immediately before the measured call and
-//! snapshotted immediately after it.
+//! wall-clock. Wall-clock is not admissible on a shared-vCPU machine.
+//! This harness follows the same shape as `activity_enqueue_batch_perf.rs`.
+//! It uses a fresh, uniquely-named, fully-migrated database per
+//! measurement point. `pg_stat_statements` is reset immediately before
+//! the measured call, and snapshotted immediately after it.
 
 #![allow(clippy::too_many_lines)]
 
@@ -107,9 +109,9 @@ fn build_test_pool(database_url: &str) -> DbPool {
         .expect("failed to build test pool")
 }
 
-/// Seeds `count` unrelated DAG-kind `harvest_schedules` rows so the table
-/// the batched query filters against has realistic cardinality, not a toy
-/// table sized to exactly what the test needs.
+/// Seeds `count` unrelated DAG-kind `harvest_schedules` rows. This gives
+/// the table the batched query filters against realistic cardinality,
+/// not a toy table sized to exactly what the test needs.
 async fn seed_unrelated_dag_schedules(conn: &mut AsyncPgConnection, count: usize) {
     for i in 0..count {
         diesel::sql_query(
@@ -140,13 +142,13 @@ async fn seed_workflow_schedule(
         .expect("seed workflow schedule");
 }
 
-/// Builds `n` production-shaped outbox rows for one scan batch: every row
+/// Builds `n` production-shaped outbox rows for one scan batch. Every row
 /// has `queue_name = NULL` (the common, un-overridden case) and
-/// `next_attempt_at = NULL` (fresh tier), `target_shard = 1` (cross-shard,
-/// the only case the outbox exists for), cycling through `distinct_names`
-/// target workflow names -- the fan-in skew a real completion-trigger
-/// deployment produces when many source executions share one downstream
-/// trigger.
+/// `next_attempt_at = NULL` (fresh tier). Every row also has
+/// `target_shard = 1`: cross-shard is the only case the outbox exists
+/// for. Rows cycle through `distinct_names` target workflow names -- the
+/// fan-in skew a real completion-trigger deployment produces when many
+/// source executions share one downstream trigger.
 fn build_outbox_rows(n: usize, distinct_names: &[String]) -> Vec<NewCompletionTriggerOutboxDb> {
     (0..n)
         .map(|i| NewCompletionTriggerOutboxDb {
@@ -231,10 +233,10 @@ fn is_schedule_lookup_statement(row: &StatRow) -> bool {
 
 /// One human-readable profile line: `calls`/`buffers` plus each one's share
 /// of the point's totals, and a whitespace-collapsed, truncated query text.
-/// Precision loss from `i64 as f64` is immaterial here -- these are
-/// percentages over call/buffer counts in the hundreds, nowhere near f64's
-/// 52-bit mantissa limit, and the result is a debug/artifact string, not a
-/// value anything computes from.
+/// Precision loss from `i64 as f64` is immaterial here. These are
+/// percentages over call/buffer counts in the hundreds, nowhere near
+/// f64's 52-bit mantissa limit. The result is a debug/artifact string,
+/// not a value anything computes from.
 #[allow(clippy::cast_precision_loss)]
 fn fmt_row(r: &StatRow, total_calls: i64, total_buffers: i64) -> String {
     let query: String = r.query.split_whitespace().collect::<Vec<_>>().join(" ");
@@ -276,28 +278,28 @@ struct SizePoint {
     total_buffers: i64,
     wal_bytes: i64,
     processed: usize,
-    /// Every statement `enforce_completion_triggers_outbox` issued for this
-    /// point, ranked by buffers then by calls -- the profile the charter's
-    /// "profile before hypothesis" step asks for, captured alongside the
-    /// direct measurement rather than as a separate run.
+    /// Every statement `enforce_completion_triggers_outbox` issued for
+    /// this point, ranked by buffers then by calls. This is the profile
+    /// the charter's "profile before hypothesis" step asks for, captured
+    /// alongside the direct measurement rather than as a separate run.
     profile_by_buffers: Vec<String>,
     profile_by_calls: Vec<String>,
 }
 
 /// One measurement point: `n` outbox rows across `DISTINCT_NAMES` target
-/// workflow names, three of which carry a matching `harvest_schedules` row
-/// (exercising the match branch) and two of which do not (exercising the
-/// `default_workflow_queue()` fallback branch) -- both branches identical
-/// before and after the fix.
+/// workflow names. Three of the names carry a matching `harvest_schedules`
+/// row, exercising the match branch. Two do not, exercising the
+/// `default_workflow_queue()` fallback branch. Both branches behave
+/// identically before and after the fix.
 const DISTINCT_NAMES: usize = 5;
 const NAMES_WITH_SCHEDULE: usize = 3;
 
 async fn measure_one_batch(admin: &str, _label: &str, n: usize) -> SizePoint {
-    // Postgres identifiers truncate silently at 63 bytes (`NAMEDATALEN`): a
-    // `label`+`n`-qualified prefix here made the "_shard0"/"_shard1"
+    // Postgres identifiers truncate silently at 63 bytes (`NAMEDATALEN`).
+    // A `label`+`n`-qualified prefix here made the "_shard0"/"_shard1"
     // suffixes collide after truncation, so the second `CREATE DATABASE`
     // silently targeted the first database again. Keep the physical name
-    // short and let `unique()`'s UUID carry all the uniqueness a test
+    // short, and let `unique()`'s UUID carry all the uniqueness a test
     // database needs; `label`/`n` still tag the point in-memory below.
     let db_id = unique("otbq");
     let default_db = format!("{db_id}_s0");
@@ -464,9 +466,9 @@ async fn zz_capture_completion_trigger_outbox_queue_perf_evidence() {
 // ── Equivalence: batched resolution matches the per-row resolve exactly ────
 
 /// Proves the fix resolves the identical `queue_name` for every task the
-/// per-row `resolve_target_queue` path would have -- both the
+/// per-row `resolve_target_queue` path would have. It covers both the
 /// schedule-match branch and the `default_workflow_queue()` fallback
-/// branch -- by reading back what each task actually started with.
+/// branch, by reading back what each task actually started with.
 #[tokio::test]
 async fn outbox_scan_resolves_the_same_queue_with_or_without_batching() {
     let (admin, _guard) = setup_server().await;
