@@ -84,6 +84,34 @@
 //! registry-aware startup reconciliation pass that re-resolves and
 //! backfills `quota_key` for such rows is tracked as a follow-up in
 //! issue #1226.
+//!
+//! # Known limitation — batched-start key attribution (issue #1230)
+//!
+//! A batched execution charges its quota to whichever admission arrived
+//! first for the shared `batch(key = ...)` (see
+//! `crate::event_batch`'s own doc for the mechanism). Two consequences
+//! follow directly from that rule, not from a defect in it:
+//!
+//! - A caller who admits into a batch without a resolvable quota-key
+//!   field pays no quota charge for that admission. A direct start has
+//!   the same gap. Fail-open on an unresolvable key is this crate's
+//!   existing, uniform contract — see `unresolvable_key_fails_open` in
+//!   `quota_enforcement_tests.rs`. Batching does not change that
+//!   contract. It does not add a NEW way to evade it.
+//! - When a `batch(key = ...)` is shared across more than one tenant,
+//!   the resolved quota key belongs to the FIRST admission. That need
+//!   not be the admission whose payload happened to fill the batch and
+//!   trigger the fire. A caller who triggers a synchronous flush
+//!   (`admit_batched_start`'s in-request path) can therefore observe
+//!   another admission's resolved key. That key appears in the
+//!   [`HarvestError::QuotaExceeded`](crate::error::HarvestError::QuotaExceeded)
+//!   `key` field of a `429` response. Issue #946 AC4 already returns
+//!   that same wire shape for every other quota rejection. Batching
+//!   only changes whose key a caller might see, not the shape or
+//!   existence of the field. Sharing one `batch_key` across tenants is
+//!   an unusual workflow design choice. The common case, collapsing one
+//!   tenant's own burst into one run, never exposes another tenant's
+//!   key, because there is no other tenant in the batch.
 
 #[cfg(feature = "db")]
 use diesel::sql_types::{BigInt, Nullable, Text};
