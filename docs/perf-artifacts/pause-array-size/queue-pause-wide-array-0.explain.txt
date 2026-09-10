@@ -1,6 +1,6 @@
 -- queue-pause-wide: claim_task_query() @ backlog=10000, 203-queue worker (4 real + 199 empty), 0 of the 199 empty queues paused --
 CTE Scan on claimed  (cost=442805.43..442805.45 rows=1 width=817) (actual rows=1 loops=1)
-  Buffers: shared hit=1414 dirtied=5 written=3
+  Buffers: shared hit=1411 dirtied=4 written=2
   CTE paused_queues
     ->  Aggregate  (cost=0.51..0.52 rows=1 width=32) (actual rows=1 loops=1)
           ->  Seq Scan on harvest_queue_pauses  (cost=0.51..0.51 rows=1 width=26) (actual rows=0 loops=1)
@@ -79,7 +79,7 @@ CTE Scan on claimed  (cost=442805.43..442805.45 rows=1 width=817) (actual rows=1
                       Filter: (LEAST(COALESCE(CASE WHEN (override_expires_at > now()) THEN override_burst ELSE NULL::double precision END, burst), ((tokens + ((GREATEST('0'::numeric, EXTRACT(epoch FROM (LEAST(COALESCE(override_expires_at, last_refilled_at), now()) - last_refilled_at))))::double precision * COALESCE(override_refill_rate, refill_rate))) + ((GREATEST('0'::numeric, EXTRACT(epoch FROM (now() - GREATEST(COALESCE(override_expires_at, last_refilled_at), last_refilled_at)))))::double precision * refill_rate))) >= '1'::double precision)
   CTE claimed
     ->  Update on harvest_task_queue harvest_task_queue_2  (cost=0.29..14.27 rows=1 width=123) (actual rows=1 loops=1)
-          Buffers: shared hit=1414 dirtied=5 written=3
+          Buffers: shared hit=1411 dirtied=4 written=2
           ->  Nested Loop  (cost=0.29..14.27 rows=1 width=123) (actual rows=1 loops=1)
                 Buffers: shared hit=1393
                 ->  CTE Scan on candidate candidate_1  (cost=0.00..5.96 rows=1 width=56) (actual rows=1 loops=1)
@@ -95,9 +95,9 @@ CTE Scan on claimed  (cost=442805.43..442805.45 rows=1 width=817) (actual rows=1
                       Index Cond: (id = candidate_1.id)
                       Buffers: shared hit=3
 Planning:
-  Buffers: shared hit=680 read=43
-Planning Time: 3.921 ms
+  Buffers: shared hit=678 read=43
+Planning Time: 4.357 ms
 JIT:
   Functions: 129
   Options: Inlining false, Optimization false, Expressions true, Deforming true
-Execution Time: 139.858 ms
+Execution Time: 144.391 ms

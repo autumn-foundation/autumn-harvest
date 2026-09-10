@@ -1,6 +1,6 @@
--- activity-pause: claim_task_query() @ backlog=10000, paused_activities array size=1 (ballast, 0% selectivity) --
-CTE Scan on claimed  (cost=441981.67..441981.69 rows=1 width=817) (actual rows=1 loops=1)
-  Buffers: shared hit=275 dirtied=4 written=2
+-- activity-pause: claim_task_query() @ backlog=10000, paused_activities array size=0 (ballast, 0% selectivity) --
+CTE Scan on claimed  (cost=441980.66..441980.68 rows=1 width=817) (actual rows=1 loops=1)
+  Buffers: shared hit=277 dirtied=5 written=3
   CTE paused_queues
     ->  Aggregate  (cost=13.11..13.12 rows=1 width=32) (actual rows=1 loops=1)
           Buffers: shared hit=8
@@ -11,10 +11,8 @@ CTE Scan on claimed  (cost=441981.67..441981.69 rows=1 width=817) (actual rows=1
                       Index Cond: (queue_name = ANY ('{harvest-bench-q-0,harvest-bench-q-1,harvest-bench-q-2,harvest-bench-q-3}'::text[]))
                       Buffers: shared hit=8
   CTE paused_activities
-    ->  Aggregate  (cost=1.01..1.02 rows=1 width=32) (actual rows=1 loops=1)
-          Buffers: shared hit=1
-          ->  Seq Scan on harvest_activity_pauses  (cost=0.00..1.01 rows=1 width=18) (actual rows=1 loops=1)
-                Buffers: shared hit=1
+    ->  Aggregate  (cost=0.01..0.01 rows=1 width=32) (actual rows=1 loops=1)
+          ->  Seq Scan on harvest_activity_pauses  (cost=0.00..0.00 rows=1 width=26) (actual rows=0 loops=1)
   CTE concurrency_pending_keys
     ->  Unique  (cost=469.01..469.02 rows=1 width=41) (never executed)
           ->  Sort  (cost=469.01..469.01 rows=1 width=41) (never executed)
@@ -33,18 +31,17 @@ CTE Scan on claimed  (cost=441981.67..441981.69 rows=1 width=817) (actual rows=1
                       ->  CTE Scan on concurrency_pending_keys  (cost=0.00..0.02 rows=1 width=32) (never executed)
   CTE candidate
     ->  Limit  (cost=441469.89..441469.90 rows=1 width=250) (actual rows=1 loops=1)
-          Buffers: shared hit=254
+          Buffers: shared hit=253
           ->  LockRows  (cost=441469.89..441582.96 rows=9046 width=250) (actual rows=1 loops=1)
-                Buffers: shared hit=254
+                Buffers: shared hit=253
                 ->  Sort  (cost=441469.89..441492.50 rows=9046 width=250) (actual rows=1 loops=1)
                       Sort Key: (CASE WHEN ((harvest_task_queue_1.sticky_worker_id = 'pase-worker'::text) AND (harvest_task_queue_1.sticky_until > now())) THEN 1 ELSE 0 END) DESC, harvest_task_queue_1.priority DESC, harvest_task_queue_1.scheduled_at
-                      Sort Method: quicksort  Memory: 2416kB
-                      Buffers: shared hit=253
+                      Sort Method: quicksort  Memory: 2103kB
+                      Buffers: shared hit=252
                       ->  Nested Loop  (cost=0.00..441424.66 rows=9046 width=250) (actual rows=10000 loops=1)
                             Join Filter: ((harvest_task_queue_1.task_type <> 'activity'::text) OR (harvest_task_queue_1.activity_name IS NULL) OR (harvest_task_queue_1.activity_name <> ALL (paused_activities.names)))
-                            Buffers: shared hit=253
+                            Buffers: shared hit=252
                             ->  CTE Scan on paused_activities  (cost=0.00..0.02 rows=1 width=88) (actual rows=1 loops=1)
-                                  Buffers: shared hit=1
                             ->  Nested Loop  (cost=0.00..441119.02 rows=9511 width=230) (actual rows=10000 loops=1)
                                   Join Filter: (harvest_task_queue_1.queue_name <> ALL (paused_queues.names))
                                   Buffers: shared hit=252
@@ -87,12 +84,12 @@ CTE Scan on claimed  (cost=441981.67..441981.69 rows=1 width=817) (actual rows=1
                       Filter: (LEAST(COALESCE(CASE WHEN (override_expires_at > now()) THEN override_burst ELSE NULL::double precision END, burst), ((tokens + ((GREATEST('0'::numeric, EXTRACT(epoch FROM (LEAST(COALESCE(override_expires_at, last_refilled_at), now()) - last_refilled_at))))::double precision * COALESCE(override_refill_rate, refill_rate))) + ((GREATEST('0'::numeric, EXTRACT(epoch FROM (now() - GREATEST(COALESCE(override_expires_at, last_refilled_at), last_refilled_at)))))::double precision * refill_rate))) >= '1'::double precision)
   CTE claimed
     ->  Update on harvest_task_queue harvest_task_queue_2  (cost=0.29..14.27 rows=1 width=123) (actual rows=1 loops=1)
-          Buffers: shared hit=275 dirtied=4 written=2
+          Buffers: shared hit=277 dirtied=5 written=3
           ->  Nested Loop  (cost=0.29..14.27 rows=1 width=123) (actual rows=1 loops=1)
-                Buffers: shared hit=257
+                Buffers: shared hit=256
                 ->  CTE Scan on candidate candidate_1  (cost=0.00..5.96 rows=1 width=56) (actual rows=1 loops=1)
                       Filter: (((rate_limit_key IS NULL) OR (activity_name = ANY ('{}'::text[])) OR (hashed SubPlan 19)) AND ((concurrency_key IS NULL) OR (pg_try_advisory_xact_lock((hashtext(concurrency_key))::bigint) AND ((concurrency_cap IS NULL) OR ((SubPlan 17) < concurrency_cap)))))
-                      Buffers: shared hit=254
+                      Buffers: shared hit=253
                       SubPlan 19
                         ->  CTE Scan on rate_limit_debit  (cost=0.00..0.02 rows=1 width=32) (never executed)
                       SubPlan 17
@@ -103,9 +100,9 @@ CTE Scan on claimed  (cost=441981.67..441981.69 rows=1 width=817) (actual rows=1
                       Index Cond: (id = candidate_1.id)
                       Buffers: shared hit=3
 Planning:
-  Buffers: shared hit=747 read=42
-Planning Time: 3.798 ms
+  Buffers: shared hit=692 read=43
+Planning Time: 3.931 ms
 JIT:
   Functions: 126
   Options: Inlining false, Optimization false, Expressions true, Deforming true
-Execution Time: 141.321 ms
+Execution Time: 168.381 ms

@@ -819,29 +819,47 @@ measurement on this page still tests both pause tables at a single array
 size: one active pause, or none. Issue #1215 swept array size instead — 0,
 1, 20 and 199 ballast rows, each excluding zero real candidate rows (0%
 selectivity, isolating array width from backlog depth the same way issue
-#1177 isolates predicate presence from selectivity) — against the
-10,000-row headline backlog. Full artifacts are committed under
-[`docs/perf-artifacts/pause-array-size/`](perf-artifacts/pause-array-size/),
+#1177 isolates predicate presence from selectivity). The `paused_activities`
+sweep is crossed against every depth in the published `BACKLOG_SWEEP`
+(1,000 / 10,000 / 100,000), not held at the headline depth alone — the
+queue-pause sweeps stay at the 10,000-row headline, since they answer a
+yes/no bound question the query already settles identically at every depth,
+not a magnitude question depth could shift. Full artifacts are committed
+under [`docs/perf-artifacts/pause-array-size/`](perf-artifacts/pause-array-size/),
 reproducible via
 `autumn-harvest/scripts/pause_array_size_claim_perf_repro.sh`.
 
-| Predicate | Worker's own `$2` | Array size | Sort method |
-|:--|:--|--:|:--|
-| `paused_activities` (#807) | 4 queues | 0 / 1 | quicksort, in memory |
-| `paused_activities` (#807) | 4 queues | 20 | external merge, 7 504kB disk |
-| `paused_activities` (#807) | 4 queues | 199 | external merge, 63 656kB disk |
-| `paused_queues` (#619) | 4 queues (typical) | 0 / 1 / 20 / 199 | quicksort, in memory |
-| `paused_queues` (#619) | 203 queues (atypical) | 0 | quicksort, in memory |
-| `paused_queues` (#619) | 203 queues (atypical) | 199 | external merge, 40 704kB disk |
+| Predicate | Backlog | Worker's own `$2` | Array size | Sort method |
+|:--|--:|:--|--:|:--|
+| `paused_activities` (#807) | 1 000 | 4 queues | 0 / 1 / 20 | quicksort, in memory |
+| `paused_activities` (#807) | 1 000 | 4 queues | 199 | external merge, 6 368kB disk |
+| `paused_activities` (#807) | 10 000 | 4 queues | 0 / 1 | quicksort, in memory |
+| `paused_activities` (#807) | 10 000 | 4 queues | 20 | external merge, 7 504kB disk |
+| `paused_activities` (#807) | 10 000 | 4 queues | 199 | external merge, 63 656kB disk |
+| `paused_activities` (#807) | 100 000 | 4 queues | 0 | external merge, 15 280kB disk |
+| `paused_activities` (#807) | 100 000 | 4 queues | 1 | external merge, 18 432kB disk |
+| `paused_activities` (#807) | 100 000 | 4 queues | 20 | external merge, 74 992kB disk |
+| `paused_activities` (#807) | 100 000 | 4 queues | 199 | external merge, 635 488kB disk |
+| `paused_queues` (#619) | 10 000 | 4 queues (typical) | 0 / 1 / 20 / 199 | quicksort, in memory |
+| `paused_queues` (#619) | 10 000 | 203 queues (atypical) | 0 | quicksort, in memory |
+| `paused_queues` (#619) | 10 000 | 203 queues (atypical) | 199 | external merge, 40 704kB disk |
 
-**`paused_activities` has no bound to protect it.** It reads the whole
-`harvest_activity_pauses` table on every claim, so array size tracks the
-pause table's total population directly. Twenty paused activity types — a
-realistic response to a multi-service incident, not an edge case — is
-enough to spill the claim sort to disk. That is far below the
+**`paused_activities` has no bound to protect it, and the array-size
+threshold that spills it is itself lower at greater backlog depth.** It
+reads the whole `harvest_activity_pauses` table on every claim, so array
+size tracks the pause table's total population directly. At the
+10,000-row headline depth, twenty paused activity types — a realistic
+response to a multi-service incident, not an edge case — is enough to
+spill the claim sort to disk; that is far below the
 [few-hundred-thousand-row depth](#any-residual-predicate-defeats-sort-elision-issue-1177)
 issue #1177's own locked-scenario reproduction needed to trigger the same
-spill against an empty pause table.
+spill against an empty pause table. At 1,000 rows the threshold is higher
+(between 20 and 199). At 100,000 rows this sweep found the sort already
+spilling with **zero** paused activities — a backlog-depth-driven spill
+this page's own [claim-latency-vs-backlog-depth table](#claim-latency-vs-backlog-depth)
+is already consistent with, independent of this predicate; array size
+still compounds it further there, from 15 280kB at zero paused activities
+to 635 488kB at 199.
 
 **`paused_queues` stays cheap only while the worker's own bind stays
 small.** [The `$2` bound above](#the-queue-pause-anti-join-fix) keeps a
@@ -1515,15 +1533,18 @@ from the benchmark are directly comparable.
     [the pause-array-size sweep](#the-pause-array-size-sweep-issue-1215) for
     why, and for the one atypical worker shape where it does not.
   * **Activity pauses (#807)** — not previously in this list at all. Issue
-    #1215 swept `harvest_activity_pauses`' array size against the same
-    10,000-row headline backlog and found the claim sort spills to disk once
-    the array holds around 20 rows — far below the [few-hundred-thousand-row
-    depth issue #1177's own locked-scenario reproduction needed](#any-residual-predicate-defeats-sort-elision-issue-1177)
-    to trigger the same spill against an empty pause table. Unlike queue
-    pauses, `paused_activities` reads the whole table on
-    every claim with no bind to keep the array small, so this exposure needs
-    no unusual worker shape — pausing 20 or more activity types during a
-    multi-service incident is realistic on its own. See
+    #1215 swept `harvest_activity_pauses`' array size, crossed against the
+    full `BACKLOG_SWEEP`, and found the claim sort spills to disk once the
+    array holds around 20 rows at the 10,000-row headline depth — far below
+    the [few-hundred-thousand-row depth issue #1177's own locked-scenario
+    reproduction needed](#any-residual-predicate-defeats-sort-elision-issue-1177)
+    to trigger the same spill against an empty pause table. That threshold
+    is depth-dependent, not fixed: higher at 1,000 rows, and already crossed
+    at 100,000 rows with zero paused activities. Unlike queue pauses,
+    `paused_activities` reads the whole table on every claim with no bind to
+    keep the array small, so this exposure needs no unusual worker shape —
+    pausing 20 or more activity types during a multi-service incident is
+    realistic on its own, at the headline depth. See
     [the pause-array-size sweep](#the-pause-array-size-sweep-issue-1215) for
     the full measurement. No query-shape fix is proposed here.
   * **`schedule_to_close` (#378)** — measured directly:

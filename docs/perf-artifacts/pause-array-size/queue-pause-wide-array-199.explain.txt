@@ -98,9 +98,9 @@ CTE Scan on claimed  (cost=442810.73..442810.75 rows=1 width=817) (actual rows=1
                       Index Cond: (id = candidate_1.id)
                       Buffers: shared hit=3
 Planning:
-  Buffers: shared hit=684 read=42
-Planning Time: 4.469 ms
+  Buffers: shared hit=682 read=42
+Planning Time: 4.115 ms
 JIT:
   Functions: 129
   Options: Inlining false, Optimization false, Expressions true, Deforming true
-Execution Time: 190.963 ms
+Execution Time: 188.122 ms

@@ -4979,8 +4979,15 @@ async fn reset_clears_every_pause_table() {
 }
 
 /// `claim_task()` must still exclude only the paused queue and the paused
-/// activity, even when their pause tables hold a realistically wide array.
-/// Issue #1215's own reproduction used up to 199 entries, not just one row.
+/// activity, even when both pause tables hold 199 rows. That is issue
+/// #1215's own reproduction scale, not just one row.
+///
+/// The 199 rows do not mean a 199-element array for both predicates. Only
+/// `paused_activities` reads the whole table, so its array is genuinely
+/// that wide here. `paused_queues` stays bound to the worker's own 2 polled
+/// queues (see `docs/performance.md`'s pause-array-size sweep). Only its
+/// one real pause among the 199 rows ever reaches the array. This test
+/// still proves exclusion holds at that table scale for both.
 ///
 /// Three candidate rows, one of each shape that matters: a paused queue, a
 /// paused activity, and neither. Only the third is claimable.
@@ -5077,16 +5084,35 @@ async fn claim_excludes_paused_rows_with_a_realistically_wide_pause_array() {
 /// * `activity-pause` -- `paused_activities` reads the whole table
 ///   unconditionally (see the doc comment on `claim_task_query`). Array
 ///   size alone should drive its cost, regardless of the worker's own bind.
+///   Crossed against `BACKLOG_SWEEP`, not just the 10,000-row headline.
+///   Issue #1215 asked to see this finding against the existing depth
+///   sweep, not a single fixed depth.
 /// * `queue-pause-bound` -- a typical worker ($2 = its own 4 polled queues).
 ///   `paused_queues` pre-filters to $2. Ballast pauses on queues this
-///   worker never polls should never enter the array at all.
+///   worker never polls should never enter the array at all. Held at the
+///   10,000-row headline depth. This sweep asks whether ballast enters the
+///   array at all. That is a yes/no bound question the query answers
+///   identically at every depth, not a magnitude question depth could shift.
 /// * `queue-pause-wide` -- an atypical worker whose own $2 bind is itself
 ///   wide (203 polled queues). That lets `paused_queues`' bound reach the
-///   same array size `queue-pause-bound` cannot.
+///   same array size `queue-pause-bound` cannot. Also held at the headline
+///   depth, for the same reason.
+///
+/// Array sizes 0/1/20/199 match issue #1215's own reproduction table (its
+/// Scenario C/E rows), not its separate 10/50/200 suggestion. This way the
+/// evidence corroborates the kB figures the issue already reported, instead
+/// of producing a fresh, disconnected set of numbers.
 ///
 /// `#[ignore]`d on purpose: a one-shot evidence-capture tool, not a repeatable
 /// CI assertion. See `zz_capture_queue_pause_claim_evidence` for the full
-/// rationale.
+/// rationale. No predicate on this page has an automated `Sort Method`
+/// assertion in CI. Asserting on planner-internal plan shape is fragile
+/// against Postgres version and `work_mem` drift. Every predicate here
+/// publishes a committed snapshot instead. What CI *does* gate for this
+/// finding is correctness, not the plan shape.
+/// [`claim_excludes_paused_rows_with_a_realistically_wide_pause_array`]
+/// above asserts `claim_task()` still excludes the right rows at this same
+/// pause-table scale.
 #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
 #[ignore = "evidence generator, not a CI assertion -- run via \
             autumn-harvest/scripts/pause_array_size_claim_perf_repro.sh"]
@@ -5148,6 +5174,8 @@ async fn zz_capture_pause_array_size_claim_evidence() {
         (plan_text, sort_method)
     }
 
+    // The headline depth, used by the two queue-pause sweeps below (see
+    // their doc comments for why they hold depth fixed).
     const BACKLOG: usize = 10_000;
     const ARRAY_SIZES: [usize; 4] = [0, 1, 20, 199];
 
@@ -5173,47 +5201,50 @@ async fn zz_capture_pause_array_size_claim_evidence() {
 
     let mut summary_lines: Vec<String> = Vec::new();
 
-    // ── activity-pause: unconditional, no bound to escape it ───────────────
-    for size in ARRAY_SIZES {
-        let mut conn = db::connect(&bench.url).await;
-        let scenario = Scenario {
-            backlog: BACKLOG,
-            claimers: 1,
-            queues: 4,
-            gate: ClaimGate::Baseline,
-        };
-        db::seed(&mut conn, scenario).await;
-        if size > 0 {
-            db::seed_activity_pauses(&mut conn, "pase-ballast-real", size).await;
-        }
-        diesel::sql_query("ANALYZE harvest_activity_pauses")
-            .execute(&mut conn)
-            .await
-            .expect("analyze");
+    // ── activity-pause: unconditional, no bound to escape it. Crossed
+    // against BACKLOG_SWEEP, not held at one depth -- see the doc comment.
+    for backlog in super::claim_bench_support::BACKLOG_SWEEP {
+        for size in ARRAY_SIZES {
+            let mut conn = db::connect(&bench.url).await;
+            let scenario = Scenario {
+                backlog,
+                claimers: 1,
+                queues: 4,
+                gate: ClaimGate::Baseline,
+            };
+            db::seed(&mut conn, scenario).await;
+            if size > 0 {
+                db::seed_activity_pauses(&mut conn, "pase-ballast-real", size).await;
+            }
+            diesel::sql_query("ANALYZE harvest_activity_pauses")
+                .execute(&mut conn)
+                .await
+                .expect("analyze");
 
-        let queue_bind = format!(
-            "ARRAY[{}]::text[]",
-            db::queue_names(scenario)
-                .iter()
-                .map(|q| format!("'{q}'"))
-                .collect::<Vec<_>>()
-                .join(",")
-        );
-        let (plan_text, sort_method) = explain_with_binds(&mut conn, raw, &queue_bind).await;
-        std::fs::write(
-            out_dir.join(format!("activity-pause-array-{size}.explain.txt")),
-            format!(
-                "-- activity-pause: claim_task_query() @ backlog={BACKLOG}, \
-                 paused_activities array size={size} (ballast, 0% selectivity) --\n{plan_text}\n"
-            ),
-        )
-        .expect("write explain artifact");
-        summary_lines.push(format!(
-            "predicate=activity-pause array_size={size} backlog={BACKLOG} {}",
-            sort_method
-                .as_deref()
-                .unwrap_or("Sort Method: (no Sort node)"),
-        ));
+            let queue_bind = format!(
+                "ARRAY[{}]::text[]",
+                db::queue_names(scenario)
+                    .iter()
+                    .map(|q| format!("'{q}'"))
+                    .collect::<Vec<_>>()
+                    .join(",")
+            );
+            let (plan_text, sort_method) = explain_with_binds(&mut conn, raw, &queue_bind).await;
+            std::fs::write(
+                out_dir.join(format!("activity-pause-backlog-{backlog}-array-{size}.explain.txt")),
+                format!(
+                    "-- activity-pause: claim_task_query() @ backlog={backlog}, \
+                     paused_activities array size={size} (ballast, 0% selectivity) --\n{plan_text}\n"
+                ),
+            )
+            .expect("write explain artifact");
+            summary_lines.push(format!(
+                "predicate=activity-pause array_size={size} backlog={backlog} {}",
+                sort_method
+                    .as_deref()
+                    .unwrap_or("Sort Method: (no Sort node)"),
+            ));
+        }
     }
 
     // ── queue-pause, bound-typical: $2 stays at the worker's own 4 queues ──

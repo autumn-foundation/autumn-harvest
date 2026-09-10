@@ -11,9 +11,25 @@ Issue #1215 found both gaps share one root cause: the claim sort's
 disk-spill trigger depends on the width of the `<> ALL(...)` anti-join
 array, not only on backlog depth. A new evidence-capture test,
 `claim_budget_tests::zz_capture_pause_array_size_claim_evidence`, sweeps
-array size (0/1/20/199 ballast rows, 0% selectivity) at the 10,000-row
-headline backlog for both pause tables and commits the resulting `EXPLAIN`
-plans under `docs/perf-artifacts/pause-array-size/`.
+array size (0/1/20/199 ballast rows, 0% selectivity — matching the issue's
+own reproduction table rather than its separate 10/50/200 suggestion, so
+this evidence corroborates the kB figures the issue already reported) and
+commits the resulting `EXPLAIN` plans under
+`docs/perf-artifacts/pause-array-size/`. The `paused_activities` sweep is
+crossed against the full published `BACKLOG_SWEEP` (1,000/10,000/100,000),
+per the issue's own ask, not held at one depth; the `paused_queues` sweeps
+stay at the 10,000-row headline, since they answer a bound question the
+query already settles identically at every depth.
+
+Crossing backlog depth surfaced a finding the single-depth version of this
+sweep could not have: the array-size threshold that spills
+`paused_activities`' sort is itself depth-dependent. It is higher at 1,000
+rows than at the 10,000-row headline, and at 100,000 rows the sort was
+already spilling with **zero** paused activities — consistent with, not
+contradicting, this page's own pre-existing claim-latency-vs-backlog-depth
+table, which already shows severe degradation at that depth independent of
+this predicate. Array size still compounds it further there (15,280kB at
+zero paused activities, 635,488kB at 199).
 
 **The two predicates are not equally exposed.** `paused_activities` (#807)
 reads `harvest_activity_pauses` in full on every claim, with no bind to
