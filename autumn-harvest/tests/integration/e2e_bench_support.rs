@@ -157,6 +157,20 @@ pub const BENCH_ACTIVITIES: [&str; 3] = [
     "harvest_e2e_bench_step_3",
 ];
 
+/// Dispatched `harvest_task_queue` rows per completed `bench_workflow` run.
+///
+/// One row is the workflow task. The engine reuses that same row for the
+/// whole execution through park and wake updates. It never inserts a second
+/// workflow-task row for one execution. One more row goes out per entry in
+/// [`BENCH_ACTIVITIES`], as an activity task.
+///
+/// `docs/benchmarks.md` publishes this multiplier next to the headline
+/// table (issue #1309). A reader can use it to convert a workflows/sec cell
+/// into a rough per-dispatched-task rate, comparable to another engine's own
+/// units. The constant derives from the workflow's real shape, so the
+/// published number cannot drift from it.
+pub const DISPATCHES_PER_WORKFLOW: usize = 1 + BENCH_ACTIVITIES.len();
+
 /// Path prefix the plugin's harvest API router is nested under.
 pub const SIGNAL_ROUTE_PREFIX: &str = "/api/harvest/workflows";
 

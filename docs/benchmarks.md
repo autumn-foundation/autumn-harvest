@@ -69,6 +69,38 @@ Four things a reader should take from that table before anything else:
   it, so the results file records it as an observation and declines to guess at
   a mechanism.
 
+### Reading this next to another engine
+
+Before putting `23.73 workflows/sec` next to a number from another
+durable-execution engine's own page, two things make that comparison
+misleading on their own — independent of which engine comes out ahead.
+
+**The unit is not the same.** This page's headline counts whole workflows.
+Other engines often publish a per-transition, per-action, or per-step figure
+instead. The canonical workflow this page measures dispatches **4**
+`harvest_task_queue` rows per completed run: one workflow-task row, reused for
+the whole execution, plus one activity-task row per activity (three). So a
+number in this page's unit is smaller than the same physical work counted the
+other way by roughly that factor. Multiply a `workflows/sec` cell by **4** for
+a rough per-dispatched-task rate in a shape closer to what a per-transition or
+per-action page publishes. That reading is derived from the measurement below,
+not a second measured result.
+
+**The configuration is a floor, not a ceiling.** Every cell below is
+latency-bound, by choice: a 25 ms poll interval, one worker per shard, and
+four logical CPUs shared with Postgres and the load generator — see
+[the configuration these numbers were taken at](#the-configuration-these-numbers-were-taken-at).
+Little's law on the 1-shard cell — 32 workflows in flight ÷ 23.73/sec ≈ 1.35 s
+end to end per workflow — shows most of that time is dispatch wait, not engine
+work. Shortening the poll interval, adding workers, or giving Postgres its own
+cores all move the number, and none of them is an architectural change.
+
+Neither point says whether Harvest is faster or slower than anything else.
+This suite has not run another engine's benchmark, and a competitor's own
+published figure would carry accuracy and staleness this project cannot vouch
+for. A comparison worth trusting re-runs both engines on the same hardware,
+which is why this suite ships in the repo — see [Reproducing](#reproducing).
+
 ### Results by release
 
 Each release's numbers are kept, not overwritten:

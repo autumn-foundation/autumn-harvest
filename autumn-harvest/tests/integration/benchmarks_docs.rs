@@ -20,10 +20,11 @@
 use std::path::{Path, PathBuf};
 
 use super::e2e_bench_support::{
-    BenchScenario, CHECK_ENV_VAR, INFLIGHT_ENV_VAR, MAX_CONCURRENT_ACTIVITIES,
-    MAX_CONCURRENT_WORKFLOWS, POOL_SIZE_PER_SHARD, PUBLISHED_BASELINES, PUBLISHED_RESULTS_VERSION,
-    REPRO_TOLERANCE_PCT, SCENARIO_FILTER_ENV_VAR, SHARD_COUNTS, SHARD_FILTER_ENV_VAR,
-    SHARD_URLS_ENV_VAR, THROUGHPUT_INFLIGHT_PER_SHARD, WORKERS_PER_SHARD, WORKFLOWS_ENV_VAR,
+    BenchScenario, CHECK_ENV_VAR, DISPATCHES_PER_WORKFLOW, INFLIGHT_ENV_VAR,
+    MAX_CONCURRENT_ACTIVITIES, MAX_CONCURRENT_WORKFLOWS, POOL_SIZE_PER_SHARD, PUBLISHED_BASELINES,
+    PUBLISHED_RESULTS_VERSION, REPRO_TOLERANCE_PCT, SCENARIO_FILTER_ENV_VAR, SHARD_COUNTS,
+    SHARD_FILTER_ENV_VAR, SHARD_URLS_ENV_VAR, THROUGHPUT_INFLIGHT_PER_SHARD, WORKERS_PER_SHARD,
+    WORKFLOWS_ENV_VAR,
 };
 
 fn repo_root() -> PathBuf {
@@ -171,6 +172,57 @@ fn the_doc_frames_the_numbers_as_reference_machine_guidance() {
         doc.contains("Reproduce them on your own hardware"),
         "the page must tell a reader to re-measure rather than design against these figures"
     );
+}
+
+#[test]
+fn the_doc_carries_a_comparison_reading_note_at_the_headline_table() {
+    // Issue #1309: a reader compares this page's number against another
+    // engine's own page at the headline table. The caveat belongs there,
+    // not only in Known limitations further down.
+    let doc = benchmarks_doc();
+    let heading = "### Reading this next to another engine";
+    let note_at = doc
+        .find(heading)
+        .unwrap_or_else(|| panic!("docs/benchmarks.md must carry a {heading:?} section"));
+    let table_end = doc
+        .find("### Results by release")
+        .expect("docs/benchmarks.md must have a `### Results by release` section");
+    assert!(
+        note_at < table_end,
+        "the comparison-reading note must sit with the headline table, before `### Results by \
+         release`, not only further down the page"
+    );
+
+    let note = &doc[note_at..table_end];
+    assert!(
+        note.to_lowercase().contains("unit"),
+        "the note must say the unit (whole workflows) differs from what other engines publish"
+    );
+    assert!(
+        note.contains("floor"),
+        "the note must say the published configuration is a floor, not a ceiling"
+    );
+    assert!(
+        note.contains(&DISPATCHES_PER_WORKFLOW.to_string()),
+        "the note must state the dispatches-per-workflow multiplier ({DISPATCHES_PER_WORKFLOW}), \
+         pinned to the workflow's real shape, not a number typed by hand"
+    );
+}
+
+#[test]
+fn the_doc_names_no_competitor_engine() {
+    // Issue #1309 AC: "No competitor figures are quoted on the page." Naming
+    // one invites pairing it with a number. This suite has not run that
+    // engine's own benchmark, so it cannot vouch for the figure or its
+    // staleness.
+    let doc = benchmarks_doc().to_lowercase();
+    for name in ["temporal", "dbos", "cadence", "zeebe", "conductor", "restate"] {
+        assert!(
+            !doc.contains(name),
+            "docs/benchmarks.md names a competitor engine ({name}); issue #1309 asks this page \
+             to explain the comparison methodology, never quote a competitor's own figure"
+        );
+    }
 }
 
 #[test]
