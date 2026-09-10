@@ -490,8 +490,14 @@ pub async fn dry_run_supersede_shed_count(
         ADMITTING.try_with(Clone::clone).unwrap_or_default();
     let fetch_cap =
         i64::from(limit).saturating_add(i64::try_from(SUPERSEDE_SCAN_LIMIT).unwrap_or(i64::MAX));
-    let others =
-        active_runs_for_key(conn, workflow_name, concurrency_key, self_exec_id, fetch_cap).await?;
+    let others = active_runs_for_key(
+        conn,
+        workflow_name,
+        concurrency_key,
+        self_exec_id,
+        fetch_cap,
+    )
+    .await?;
     let (candidates, protected): (Vec<SupersededRun>, Vec<SupersededRun>) = others
         .into_iter()
         .partition(|run| !inherited.contains(&run.exec_id));

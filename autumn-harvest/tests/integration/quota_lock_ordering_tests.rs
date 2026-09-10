@@ -175,10 +175,11 @@ async fn same_order_lock_acquisition_never_deadlocks() {
 
     end(&mut conn1).await; // Releases A and B, unblocking conn2's A request.
 
-    let (a_result, b_result, mut conn2) = tokio::time::timeout(std::time::Duration::from_secs(10), conn2_task)
-        .await
-        .expect("conn2 must proceed once conn1 releases, never wait for a detector timeout")
-        .expect("conn2 task join");
+    let (a_result, b_result, mut conn2) =
+        tokio::time::timeout(std::time::Duration::from_secs(10), conn2_task)
+            .await
+            .expect("conn2 must proceed once conn1 releases, never wait for a detector timeout")
+            .expect("conn2 task join");
 
     a_result.expect("conn2's A request must succeed once conn1 releases it");
     b_result.expect("conn2's B request must succeed -- never contended, so never a deadlock");

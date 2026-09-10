@@ -22,7 +22,9 @@ use autumn_harvest::concurrency::ConcurrencyOnConflict;
 use autumn_harvest::error::HarvestError;
 use autumn_harvest::execution::{StartWorkflowParams, start_or_load_workflow_execution};
 use autumn_harvest::quota::QuotaPolicy;
-use autumn_harvest::types::{ExecutionId, StartSource, WorkflowIdConflictPolicy, WorkflowIdReusePolicy};
+use autumn_harvest::types::{
+    ExecutionId, StartSource, WorkflowIdConflictPolicy, WorkflowIdReusePolicy,
+};
 use diesel_async::{AsyncConnection, AsyncPgConnection, RunQueryDsl};
 use uuid::Uuid;
 
@@ -288,6 +290,88 @@ async fn cancel_running_supersede_chain_never_trips_the_quota_cap() {
     assert_eq!(
         row_state(&mut conn, last_id.expect("at least one admission ran")).await,
         "RUNNING"
+    );
+}
+
+/// The dry-run credit must generalize past a single incumbent. With
+/// `concurrency_limit = 2`, a THIRD run on a key already holding two sheds
+/// exactly the oldest one. That is down to the limit, not down to zero. A
+/// `max_active_executions = 2` quota cap must see that one-run credit. It
+/// must not see the raw pre-shed count of three.
+#[tokio::test]
+async fn cancel_running_supersede_credit_generalizes_past_a_single_incumbent() {
+    let (url, _c) = setup_test_database_url_or_env().await;
+    let mut conn = connect(&url).await;
+
+    let wf = leaked("supersede_vs_quota_limit2");
+    let key = "acme";
+    let policy = QuotaPolicy::new("tenant_id").with_max_active_executions(2);
+    let _guard = MetadataGuard::install_one(wf, policy).await;
+
+    let wid_a = format!("a-{}", Uuid::new_v4().simple());
+    let mut p_a = params(
+        wf,
+        &wid_a,
+        ExecutionId::new(),
+        key,
+        ConcurrencyOnConflict::CancelRunning,
+    );
+    p_a.concurrency_limit = Some(2);
+    let first = start_or_load_workflow_execution(&mut conn, p_a, None)
+        .await
+        .expect("first admission must succeed");
+
+    let wid_b = format!("b-{}", Uuid::new_v4().simple());
+    let mut p_b = params(
+        wf,
+        &wid_b,
+        ExecutionId::new(),
+        key,
+        ConcurrencyOnConflict::CancelRunning,
+    );
+    p_b.concurrency_limit = Some(2);
+    let second = start_or_load_workflow_execution(&mut conn, p_b, None)
+        .await
+        .expect("second admission must succeed, limit is 2");
+    assert_eq!(active_count(&mut conn, wf, key).await, 2);
+
+    let wid_c = format!("c-{}", Uuid::new_v4().simple());
+    let mut p_c = params(
+        wf,
+        &wid_c,
+        ExecutionId::new(),
+        key,
+        ConcurrencyOnConflict::CancelRunning,
+    );
+    p_c.concurrency_limit = Some(2);
+    let third = start_or_load_workflow_execution(&mut conn, p_c, None)
+        .await
+        .unwrap_or_else(|e| {
+            panic!(
+                "the third admission must shed the oldest incumbent down to \
+                 the limit of 2, not be rejected on quota -- got {e:?}"
+            )
+        });
+
+    assert_eq!(
+        row_state(&mut conn, ExecutionId::from_uuid(first.exec_id.as_uuid())).await,
+        "CANCELLED",
+        "the OLDEST incumbent must be the one shed, not the newer second run"
+    );
+    assert_eq!(
+        row_state(&mut conn, ExecutionId::from_uuid(second.exec_id.as_uuid())).await,
+        "RUNNING",
+        "the second run is younger than the shed target and must survive"
+    );
+    assert_eq!(
+        row_state(&mut conn, ExecutionId::from_uuid(third.exec_id.as_uuid())).await,
+        "RUNNING"
+    );
+    assert_eq!(
+        active_count(&mut conn, wf, key).await,
+        2,
+        "the key must settle at exactly the limit of 2, not 1 (over-shed) or \
+         3 (quota wrongly rejected the shed credit)"
     );
 }
 
