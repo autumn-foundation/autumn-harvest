@@ -314,7 +314,7 @@
 //!   - `concurrency` (#247), `debounce` (#499), `batch` (#518), `throttle` (#607) —
 //!     pre-start admission-gate features with no single-writer analog.
 //!   - `quota` (#946) — per-tenant resource quota enforcement needs the shared
-//!     Postgres task queue's advisory lock, absent on this single-writer backend.
+//!     Postgres backend's admission-time advisory lock, absent here.
 //!   - a raised `max_input_bytes` (#252) — a per-workflow raised input cap is not
 //!     threaded into this backend's replay caps, so the global default would apply
 //!     and silently REJECT an input the workflow declared acceptable; rejected so

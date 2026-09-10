@@ -309,13 +309,14 @@ impl SqliteRuntime {
     /// # Panics
     ///
     /// Panics (setup-time, mirroring the Postgres `HarvestPlugin::build()` panic on
-    /// registration misconfiguration) if `info` declares an execution- or
-    /// admission-affecting feature this backend cannot honor — `execution_timeout`,
-    /// a workflow-level `retry_policy` (`#[workflow(retry(...))]`), `concurrency`,
-    /// `debounce`, `batch`, `throttle`, or a raised `max_input_bytes`. The panic
-    /// message names the specific feature and points at the supported alternative;
-    /// running the workflow with the feature silently missing would diverge from the
-    /// declared `#[workflow(...)]` contract (Codex #1069 P2, `runtime.rs:602`/`:686`).
+    /// registration misconfiguration) if `info` declares an unsupported execution- or
+    /// admission-affecting feature. That includes `execution_timeout`, a
+    /// workflow-level `retry_policy` (`#[workflow(retry(...))]`), `concurrency`,
+    /// `debounce`, `batch`, `throttle`, `quota`, or a raised `max_input_bytes`. The
+    /// panic message names the specific feature and points at the supported
+    /// alternative. Running the workflow with the feature silently missing would
+    /// diverge from the declared `#[workflow(...)]` contract (Codex #1069 P2,
+    /// `runtime.rs:602`/`:686`).
     pub fn register_workflow(&mut self, info: &WorkflowInfo) {
         if let Some((feature, hint)) = unsupported_workflow_feature(info) {
             panic!(
@@ -2157,8 +2158,8 @@ fn cancellable_timer_unsupported(cmd: &WorkflowCommand) -> SqliteError {
 /// - **REJECTED** — changes lifecycle, admission, or retry semantics if ignored:
 ///   `execution_timeout` (#243), workflow-level `retry_policy` (#523), `concurrency`
 ///   (#247), `debounce` (#499), `batch` (#518), and `throttle` (#607). Also `quota`
-///   (#946) and a raised `max_input_bytes` (#252): it lowers the effective input
-///   cap versus the declared contract if dropped.
+///   (#946). A raised `max_input_bytes` (#252) lowers the effective input cap versus
+///   the declared contract if dropped.
 /// - **ACCEPTED, inert** — pure metadata / observability, harmless to ignore because
 ///   execution never consults them here: `sla` (#487 — no scanner, so no
 ///   `sla_breached` metric; NO wrong execution), `owner` / `runbook_url` / `severity`
@@ -2217,8 +2218,9 @@ const fn unsupported_workflow_feature(info: &WorkflowInfo) -> Option<(&'static s
     if info.quota.is_some() {
         return Some((
             "quota",
-            "Per-tenant resource quota enforcement requires the shared Postgres task \
-             queue's advisory lock, which the single-writer backend has no analog for.",
+            "Per-tenant resource quota enforcement needs an admission-time advisory \
+             lock (`lock_quota_key`) on the shared Postgres backend, which the \
+             single-writer backend has no analog for.",
         ));
     }
     if info.max_input_bytes.is_some() {
@@ -2801,6 +2803,17 @@ mod feature_gate_tests {
         let mut info = base_wf_info();
         info.max_input_bytes = Some(8 * 1024 * 1024);
         rejected("max_input_bytes", &info);
+    }
+
+    #[test]
+    fn a_capless_quota_is_rejected_too() {
+        // `#[workflow(quota(key = "..."))]` with no cap arg is a legal, if
+        // unusual, declaration (`QuotaPolicy::has_any_cap` can be false). The
+        // gate checks `info.quota.is_some()`, not the caps inside it, so an
+        // author-declared policy is rejected even before any cap is attached.
+        let mut info = base_wf_info();
+        info.quota = Some(QuotaPolicy::new("input.tenant_id"));
+        rejected("quota", &info);
     }
 
     #[test]
