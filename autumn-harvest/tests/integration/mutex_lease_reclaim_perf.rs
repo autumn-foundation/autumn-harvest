@@ -248,9 +248,12 @@ async fn seed_fixture(conn: &mut AsyncPgConnection, n: i64) {
 }
 
 fn expected_reclaimed_count(n: i64) -> i64 {
-    (1..=n)
-        .filter(|gs| gs % NOT_EXPIRED_EVERY != 0 && gs % PAUSED_EVERY != 0)
-        .count() as i64
+    i64::try_from(
+        (1..=n)
+            .filter(|gs| gs % NOT_EXPIRED_EVERY != 0 && gs % PAUSED_EVERY != 0)
+            .count(),
+    )
+    .expect("reclaimed count fits in i64 for any realistic fixture size")
 }
 
 // ── pg_stat_statements capture (mirrors scheduler_overdue_pass_perf.rs) ────
@@ -327,7 +330,9 @@ fn is_advisory_lock_statement(row: &StatRow) -> bool {
 }
 
 fn is_wake_statement(row: &StatRow) -> bool {
-    row.query.to_ascii_lowercase().contains("harvest_task_queue")
+    row.query
+        .to_ascii_lowercase()
+        .contains("harvest_task_queue")
 }
 
 struct SizePoint {
@@ -516,7 +521,10 @@ async fn reclaim_wakes_the_correct_head_of_line_and_leaves_everything_else_alone
     let reclaimed = reclaim_expired_leases_and_wake(&mut conn)
         .await
         .expect("reclaim should succeed");
-    assert_eq!(reclaimed as i64, expected_reclaimed_count(N));
+    assert_eq!(
+        i64::try_from(reclaimed).expect("reclaimed count fits in i64"),
+        expected_reclaimed_count(N)
+    );
 
     let mut checked_not_expired = 0;
     let mut checked_paused = 0;
@@ -547,7 +555,9 @@ async fn reclaim_wakes_the_correct_head_of_line_and_leaves_everything_else_alone
             );
             if has_waiter {
                 assert_eq!(
-                    task_queue_state(&mut conn, external_waiter_uuid(gs)).await.as_deref(),
+                    task_queue_state(&mut conn, external_waiter_uuid(gs))
+                        .await
+                        .as_deref(),
                     Some("RUNNING"),
                     "key {key}: nothing was reclaimed, so its waiter must stay parked"
                 );
@@ -569,7 +579,9 @@ async fn reclaim_wakes_the_correct_head_of_line_and_leaves_everything_else_alone
 
         // The external waiter is the one true head of line and must be woken.
         assert_eq!(
-            task_queue_state(&mut conn, external_waiter_uuid(gs)).await.as_deref(),
+            task_queue_state(&mut conn, external_waiter_uuid(gs))
+                .await
+                .as_deref(),
             Some("PENDING"),
             "key {key}: the external waiter must be woken (repended to PENDING)"
         );
@@ -590,9 +602,15 @@ async fn reclaim_wakes_the_correct_head_of_line_and_leaves_everything_else_alone
         }
     }
 
-    assert!(checked_not_expired >= 3, "fixture must seed non-expired control keys");
+    assert!(
+        checked_not_expired >= 3,
+        "fixture must seed non-expired control keys"
+    );
     assert!(checked_paused >= 3, "fixture must seed PAUSED-holder keys");
-    assert!(checked_plain_reclaim >= 3, "fixture must seed plain reclaims");
+    assert!(
+        checked_plain_reclaim >= 3,
+        "fixture must seed plain reclaims"
+    );
     assert!(
         checked_self_and_external >= 3,
         "fixture must seed keys with both a self-waiter and an external waiter -- \

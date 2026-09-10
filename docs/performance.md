@@ -1731,3 +1731,9 @@ standalone note rather than part of the claim-path attribution table above:
   `persist_mixed_suspension_batch`), batched into one multi-row `INSERT`
   call via `queue::enqueue_batch` (`enqueue_calls` n → 1 at every swept
   size).
+* [`docs/performance-mutex-lease-reclaim.md`](performance-mutex-lease-reclaim.md)
+  — the per-key three-statement N+1 in `mutex::reclaim_expired_leases_and_wake`,
+  the durable-mutex lease scanner's crash-recovery sweep, collapsed into
+  one statement per key (`calls` -66.7% at every swept size; buffers flat
+  by design, so the fix is measured in DB-socket syscalls instead: `sendto`
+  -44.5%, `recvfrom` -40.9%).
