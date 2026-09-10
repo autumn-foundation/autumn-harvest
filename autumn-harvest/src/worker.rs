@@ -24431,6 +24431,21 @@ impl Worker {
             .map(|shard| (*shard, pool.clone()))
             .collect();
 
+        // More than one distinct shard target → multi-shard loop.
+        // One or zero targets (or single-pool fallback) → existing path.
+        // Computed here, ahead of the WASM seed block below. Seeding then
+        // applies the same per-call-site acquisition bound the multi-shard
+        // path already uses (issue #1212).
+        #[cfg(feature = "db")]
+        let use_multi_shard = shard_targets.len() > 1
+            && self
+                .config
+                .sharded_pool
+                .as_ref()
+                .is_some_and(|sp| sp.shard_ids().len() > 1);
+        #[cfg(not(feature = "db"))]
+        let use_multi_shard = false;
+
         // Issue #965: startup-seed. Make every builder-registered WASM activity
         // module available on each shard's database before the poll loop begins,
         // so an embedder who only calls `HarvestBuilder::wasm_activity(...)` and
@@ -24449,6 +24464,14 @@ impl Worker {
         // Otherwise the worker would advertise WASM activities that resolve to a
         // non-retryable `WasmModuleUnavailable` on that shard indefinitely. This
         // mirrors the missing-shard-pool guard at `run()` entry.
+        //
+        // Bounded on multi-shard. Issue #1212, Finding 2.
+        // This loop is sequential. One exhausted or unreachable shard pool
+        // can park it forever. No shard then reaches registration or
+        // polling. A bounded acquisition still fails closed on that shard.
+        // It matches the existing intent. It bounds the wait instead of
+        // hanging. Single-shard keeps the original unbounded
+        // `pool.get().await`. That path has no peer shard to strand.
         #[cfg(feature = "wasm-activities")]
         {
             let registrations = self.registry.wasm_module_registrations();
@@ -24472,8 +24495,10 @@ impl Worker {
                             .map(|(shard, shard_pool)| (Some(*shard), shard_pool))
                             .collect()
                     };
+                let seed_acquire_bound =
+                    shard_acquire_bound(use_multi_shard, self.config.poll_interval);
                 for (shard, shard_pool) in seed_targets {
-                    match shard_pool.get().await {
+                    match acquire_shard_conn(shard_pool, seed_acquire_bound).await {
                         Ok(mut conn) => {
                             if let Err(e) = crate::wasm_store::seed_registered_wasm_modules(
                                 &mut conn,
@@ -24507,18 +24532,6 @@ impl Worker {
                 }
             }
         }
-
-        // More than one distinct shard target → multi-shard loop.
-        // One or zero targets (or single-pool fallback) → existing path.
-        #[cfg(feature = "db")]
-        let use_multi_shard = shard_targets.len() > 1
-            && self
-                .config
-                .sharded_pool
-                .as_ref()
-                .is_some_and(|sp| sp.shard_ids().len() > 1);
-        #[cfg(not(feature = "db"))]
-        let use_multi_shard = false;
 
         if use_multi_shard {
             self.run_multi_shard(shard_targets, pool).await;
@@ -24662,14 +24675,31 @@ impl Worker {
             );
         }
 
+        // Bounded. Issue #1212, Finding 1.
+        // This loop is sequential. It runs before the poll loop starts.
+        // An unreachable notification host can stall the TCP connect step.
+        // That stall can take minutes, or run forever behind a silent
+        // firewall. It then strands every assigned shard, not only this
+        // one. `build_shard_listeners` runs only from the multi-shard path.
+        // So the bound always applies. A timed-out connect falls back to
+        // polling on that shard. A connect error already takes the same
+        // fallback.
+        let connect_bound = shard_acquire_bound(true, self.config.poll_interval)
+            .expect("multi_shard=true always yields Some bound");
+
         let mut shard_listeners: Vec<Option<crate::notify::QueueListener>> = Vec::new();
         for (shard_id, _) in shard_targets {
             let listener_url =
                 multi_shard_listener_url(&self.config.shard_notification_database_urls, *shard_id);
             let listener = match listener_url {
                 Some(url) => {
-                    match crate::notify::QueueListener::connect(url, &self.config.queues).await {
-                        Ok(l) => {
+                    match tokio::time::timeout(
+                        connect_bound,
+                        crate::notify::QueueListener::connect(url, &self.config.queues),
+                    )
+                    .await
+                    {
+                        Ok(Ok(l)) => {
                             tracing::info!(
                                 worker_id = %self.config.worker_id,
                                 shard_id = %shard_id.as_i32(),
@@ -24677,12 +24707,22 @@ impl Worker {
                             );
                             Some(l)
                         }
-                        Err(error) => {
+                        Ok(Err(error)) => {
                             tracing::warn!(
                                 worker_id = %self.config.worker_id,
                                 shard_id = %shard_id.as_i32(),
                                 error = %error,
                                 "per-shard LISTEN/NOTIFY failed; shard will fall back to polling"
+                            );
+                            None
+                        }
+                        Err(_elapsed) => {
+                            tracing::warn!(
+                                worker_id = %self.config.worker_id,
+                                shard_id = %shard_id.as_i32(),
+                                bound = ?connect_bound,
+                                "per-shard LISTEN/NOTIFY connect exceeded bound; shard will \
+                                 fall back to polling"
                             );
                             None
                         }
