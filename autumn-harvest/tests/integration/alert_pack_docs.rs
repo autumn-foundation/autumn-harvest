@@ -288,6 +288,52 @@ fn every_alert_links_to_a_complete_runbook_section() {
     }
 }
 
+#[test]
+fn shard_undrained_alert_does_not_infer_poller_absence_from_dispatches() {
+    let pack = read_pack();
+    let rules = pack["rules"].as_array().expect("rules must be an array");
+    let rule = rules
+        .iter()
+        .find(|rule| rule["id"].as_str() == Some("harvest_shard_undrained"))
+        .expect("shard-undrained alert must exist");
+    let expressions = rule["prometheus"]["expressions"]
+        .as_array()
+        .expect("expressions must be an array");
+    let narrow = expressions.get(1).expect("narrow expression must exist");
+    let expr = narrow["expr"]
+        .as_str()
+        .expect("expression must be a string");
+    let note = narrow["note"].as_str().expect("note must be a string");
+    let description = rule["description"]
+        .as_str()
+        .expect("description must be a string");
+
+    assert!(
+        expr.starts_with("max by (shard) (harvest_shard_stranded_pending) > 0 unless ")
+            && expr.contains("rate(harvest_shard_dispatched_total[5m])")
+            && !expr.contains("== 0"),
+        "the narrow expression must retain absent dispatch series: {expr}"
+    );
+    assert!(
+        note.contains("unable to claim") && !note.contains("genuinely no covering poller"),
+        "zero dispatch activity must not prove poller absence: {note}"
+    );
+    assert!(
+        description.contains("no live worker can claim")
+            && !description.contains("no live worker is polling"),
+        "the alert description must state the claimability condition: {description}"
+    );
+
+    let runbook = read_doc("docs/runbooks/harvest-alerts.md");
+    let section = markdown_section(&runbook, "harvest_shard_undrained")
+        .expect("shard-undrained runbook section must exist");
+    assert!(
+        section.contains("`polls queue(s)` means no shard-assigned worker polls")
+            && section.contains("`capability/build/sticky requirements` means a covering poller"),
+        "the runbook must branch on shard-health blocking reasons"
+    );
+}
+
 /// The replication-down alert must key on the standby count, not on lag.
 ///
 /// A dead standby produces **no lag reading at all** — the lag series is
