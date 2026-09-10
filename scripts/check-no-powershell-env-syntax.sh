@@ -25,14 +25,29 @@ set -uo pipefail
 
 cd "$(dirname "${BASH_SOURCE[0]}")/.."
 
+# A bare, file-wide grep would also flag a legitimate ```powershell fence
+# (docs/plans/2026-07-06-consolidate-integration-tests.md has two) if one
+# ever gained an `$env:` line of its own — that syntax is correct there.
+# Track fence language per file and only check lines inside a ```bash fence
+# (Codex review, PR #1453).
 violations=0
 
-while IFS=: read -r file line_no line; do
-  echo "$file:$line_no: PowerShell env-var syntax '${line#*:}' in a bash" \
-    "code block; bash requires 'NAME=value', not '\$env:NAME = \"value\"'." >&2
-  violations=$((violations + 1))
-done < <(grep -rnE '^\s*\$env:[A-Za-z_][A-Za-z0-9_]*\s*=' --include="*.md" . 2>/dev/null \
-  | grep -vE "^\./target/")
+while IFS= read -r file; do
+  while IFS=: read -r line_no line; do
+    echo "$file:$line_no: PowerShell env-var syntax '${line}' in a bash" \
+      "code block; bash requires 'NAME=value', not '\$env:NAME = \"value\"'." >&2
+    violations=$((violations + 1))
+  done < <(awk '
+    /^```/ {
+      if (in_fence) { in_fence = 0 }
+      else { in_fence = 1; lang = tolower($0); sub(/^```[ \t]*/, "", lang) }
+      next
+    }
+    in_fence && lang == "bash" && /^[ \t]*\$env:[A-Za-z_][A-Za-z0-9_]*[ \t]*=/ {
+      print NR ":" $0
+    }
+  ' "$file")
+done < <(grep -rlE '^```bash' --include="*.md" . 2>/dev/null | grep -vE "^\./target/")
 
 if [ "$violations" -gt 0 ]; then
   echo >&2
