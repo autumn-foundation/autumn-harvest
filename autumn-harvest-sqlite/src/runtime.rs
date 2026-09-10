@@ -2154,11 +2154,11 @@ fn cancellable_timer_unsupported(cmd: &WorkflowCommand) -> SqliteError {
 /// The partition (see the crate-level "Unsupported `WorkflowInfo`-level features"
 /// section for the full audit):
 ///
-/// - **REJECTED** — changes lifecycle / admission / retry semantics if ignored:
+/// - **REJECTED** — changes lifecycle, admission, or retry semantics if ignored:
 ///   `execution_timeout` (#243), workflow-level `retry_policy` (#523), `concurrency`
-///   (#247), `debounce` (#499), `batch` (#518), `throttle` (#607), `quota` (#946),
-///   and a raised `max_input_bytes` (#252, which lowers the effective input cap vs.
-///   the declared contract if dropped).
+///   (#247), `debounce` (#499), `batch` (#518), and `throttle` (#607). Also `quota`
+///   (#946) and a raised `max_input_bytes` (#252): it lowers the effective input
+///   cap versus the declared contract if dropped.
 /// - **ACCEPTED, inert** — pure metadata / observability, harmless to ignore because
 ///   execution never consults them here: `sla` (#487 — no scanner, so no
 ///   `sla_breached` metric; NO wrong execution), `owner` / `runbook_url` / `severity`
