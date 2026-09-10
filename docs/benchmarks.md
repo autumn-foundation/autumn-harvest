@@ -91,11 +91,15 @@ per-dispatched-task rate in a shape closer to what a per-transition or
 per-action page publishes. That reading is derived from the measurement
 below, not a second measured result.
 
-**The configuration is a floor, not a ceiling.** Every cell below is
-latency-bound, by choice: a 25 ms poll interval, one worker per shard, and
-four logical CPUs shared with Postgres and the load generator — see
+**The configuration is a floor, not a ceiling.** The three database-backed
+scenarios — `throughput`, `dispatch_latency`, `signal_roundtrip` — are
+latency-bound below, by choice: a 25 ms poll interval, one worker per shard,
+and four logical CPUs shared with Postgres and the load generator — see
 [the configuration these numbers were taken at](#the-configuration-these-numbers-were-taken-at).
-Little's law on the 1-shard cell — 32 workflows in flight ÷ 23.73/sec ≈ 1.35 s
+`replay_throughput` is exempt: it runs entirely in memory as this page's
+noise control, so none of that configuration bounds it. Little's law on the
+`throughput` scenario's 1-shard cell — 32 workflows in flight ÷ 23.73/sec ≈
+1.35 s
 end to end per workflow — bounds how long a workflow spends in the system.
 It says nothing about how that time splits between dispatch waiting,
 database work, and worker execution; this suite does not instrument that
