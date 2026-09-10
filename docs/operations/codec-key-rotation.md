@@ -1,4 +1,4 @@
-# Payload codec key rotation (issue #948)
+# Payload codec key rotation (issues #948, #1244)
 
 Rotating the key that protects stored workflow payloads, and retiring the old
 one with proof that nothing still depends on it.
@@ -34,6 +34,10 @@ history onto the new key.
   one — batched, rate-limitable, idempotent, resumable.
 - Retiring a key is **gated**: it is refused while any reachable shard still
   holds a row referencing it, and an *unreachable* shard blocks retirement too.
+- Both preconditions are **structural, not operator discipline** (issue
+  #1244): a durable `harvest_codec_key_state` table records each key's
+  lifecycle fleet-wide, and activation checks every live worker's advertised
+  envelope-reading capability before it flips new writes to a keyed codec.
 
 ## Wiring it up
 
@@ -91,8 +95,16 @@ let harvest = HarvestBuilder::new()
 
 The registry's rotation state is **shared across clones**, so
 `PayloadCodecs::set_active_key` at runtime (a config reload) takes effect for
-every writer immediately. There is no restart-ordering window in which a worker
-that booted before the flip keeps writing under the retired key.
+every writer immediately, in *this process*. There is no restart-ordering
+window in which a clone taken before the flip keeps writing under the retired
+key.
+
+`.active_payload_codec_key(...)` at build time is a same-process bootstrap
+convenience — the process is not serving traffic yet, so there is no fleet to
+coordinate. For every activation after that, including your very first
+runtime rotation, use `codec_rotation::activate_codec_key` (below) instead of
+calling `set_active_key` directly: it is what gives `retire_codec_key`'s
+default gate the durable record it needs.
 
 ## Running the sweep
 
@@ -155,6 +167,33 @@ has stalled shows as
 `rate(harvest_codec_reencrypted_total[5m]) == 0` while
 `GET /admin/codec/rotation` still reports rows remaining.
 
+## Activating a key
+
+```rust
+autumn_harvest::codec_rotation::activate_codec_key(
+    &sharded_pool,
+    &expected_shards,
+    &codecs,
+    "2026-q3",
+    worker_stale_secs, // crate::worker::worker_stale_secs(your worker_heartbeat_interval)
+).await?;
+```
+
+This is the fleet-safe path (issue #1244). Prefer it over the local-only
+`PayloadCodecs::set_active_key` for every activation, including your very
+first key — `retire_codec_key`'s default gate (below) needs a durable record
+of when a key became active, and `set_active_key` alone never writes one.
+
+It refuses with `HarvestError::CodecKeyActivationBlocked` while any live
+worker's `harvest_workers` row does not advertise support for envelope
+version 2 (see "Upgrade every reader" below), and is fail-closed the same way
+retirement is: an unreachable shard, or a shard this process can see but
+omitted from `expected_shards`, blocks activation on its own.
+
+On success it durably marks `key_id` `active`, marks the previously active key
+(if any) `retiring`, and flips this process's registry immediately — the same
+zero-restart-window guarantee `set_active_key` always gave.
+
 ## Retiring the old key
 
 ```rust
@@ -165,53 +204,65 @@ autumn_harvest::codec_rotation::retire_codec_key(
     &expected_shards,
     &codecs,
     CODEC_LEGACY_KEY_ID,
-    // Only after the three steps in "Retirement needs a fleet write fence" below.
-    FleetWriteFence::ConfirmedByOperator,
+    FleetWriteFence::NotConfirmed, // the structural gate; see below
+    staleness_window,
+    recheck_delay,
 ).await?;
 ```
 
 It refuses with `HarvestError::CodecKeyRetirementBlocked` naming the remaining
 count **per shard** while any row is left, and succeeds only at exactly zero
-everywhere. It is **fail-closed** in five separate ways, all deliberate:
+everywhere, confirmed **twice** (`recheck_delay` apart) before it finalizes
+anything. It is fail-closed in every one of these ways, all deliberate:
 
 - a shard with no connection pool in this process blocks retirement;
 - a shard whose census errors blocks retirement;
 - an empty shard list is refused outright — proving nothing is not proving zero;
 - a shard list that omits a shard this process can see is refused;
-- an unattested `FleetWriteFence` is refused however clean the census is.
+- with `FleetWriteFence::NotConfirmed`, a shard whose durable key state is not
+  `"retiring"` yet, or whose staleness window has not elapsed, blocks
+  retirement.
 
-### ⚠️ Retirement needs a fleet write fence, and the census cannot supply it
+### ⚠️ Retirement needs a fleet write fence — issue #1244 makes it structural
 
-`retire_codec_key` takes a `FleetWriteFence`, and passing
-`FleetWriteFence::NotConfirmed` refuses the retirement no matter how clean the
-census is. This is not ceremony. `PayloadCodecs` is a **per-process** registry:
-`set_active_key` on one worker is invisible to every other worker, and the
-census only sees rows that are committed and visible, at one instant, on the
-shards this process can reach. Two things it therefore cannot see:
+`PayloadCodecs` is a **per-process** registry: a purely local
+`set_active_key` call is invisible to every other worker. The census only
+sees rows that are committed and visible, at one instant, on the shards this
+process can reach. Two things it therefore cannot see on its own:
 
-1. **Another live writer.** A worker that has not yet been rolled onto the new
+1. **Another live writer.** A worker that has not yet rolled onto the new
    active key is still encoding under the old one, and will write another
    old-key row a millisecond after your census read zero.
 2. **An in-flight append.** A transaction that already encoded its payload
    under the old key but has not committed is invisible to the census, and
    becomes visible immediately after it.
 
-In both cases the gate would have returned `Ok` and dropped the decoder, and a
-row exists that this process can no longer read. If you took that `Ok` as
-licence to destroy the key material, it is unreadable permanently.
+`FleetWriteFence::NotConfirmed` — the default, and the path this section is
+about — closes hazard 1 structurally instead of by operator attestation:
 
-**Establish the fence before you attest it:**
+- `activate_codec_key` durably stamps the superseded key `"retiring"` with a
+  timestamp, on every expected shard.
+- Every other process refreshes its view of the active key from that same
+  durable table at least once per scanner-tick interval (folded into
+  `enforce_timeouts_once`, right beside the re-encryption sweep — see
+  `codec_rotation::refresh_active_codec_key`).
+- So once `staleness_window` safely exceeds **twice** your configured tick
+  interval, no conforming writer can still be encoding under the outgoing
+  key. Pass a `staleness_window` that reflects your deployment's actual tick
+  cadence — this function does not guess it for you.
 
-1. Roll the new active key to **every** worker in the fleet (not just the one
-   you are running the gate from) and confirm the rollout completed.
-2. Let in-flight appends drain — wait past your longest activity/append
-   timeout, or stop writers outright.
-3. Confirm the census reads zero, via `GET /admin/codec/rotation`, and that it
-   *stays* zero across that drain window.
+Hazard 2 is narrowed, not eliminated, by the built-in double census:
+`recheck_delay` is how long to wait between the first (zero) census and the
+recheck before finalizing. A wider delay catches a slower straggling commit at
+the cost of a slower retirement call; it cannot close the hazard completely
+without tracking individual transaction lifetimes, which this crate does not
+do.
 
-Only then pass `FleetWriteFence::ConfirmedByOperator`. Harvest does not
-coordinate the fleet and does not pretend to — the attestation is you saying
-you did the three steps above.
+**The escape hatch.** `FleetWriteFence::ConfirmedByOperator` skips the durable
+staleness-window check (the census still runs, twice) — for a single-process
+embedder where "another live writer" cannot exist by construction, or a test.
+Passing it elsewhere is asserting hazard 1 does not apply; Harvest cannot
+verify that for you.
 
 ### ⚠️ Upgrade every reader before activating a keyed codec
 
@@ -222,16 +273,25 @@ else *unchanged* rather than rejecting it. A pre-#948 worker therefore hands the
 raw envelope object to workflow code as if it were the payload — silent wrong
 data, not a loud failure.
 
-So the deployment order is not optional:
+`activate_codec_key` (issue #1244) enforces the deployment order
+structurally: it refuses while any worker that has heartbeated within
+`worker_stale_secs` does not advertise `codec_envelope_version >= 2` in its
+`harvest_workers.labels` row. Every #1244-capable binary advertises this
+automatically, on registration and every heartbeat — there is nothing to
+configure. A binary built before #1244 never writes the label at all, so it
+reads as version 1 and blocks activation by default (fail closed).
 
-1. Deploy the #948-capable binary to **every** reader in the fleet.
-2. Confirm the rollout completed.
+So the deployment order remains the same, now enforced rather than merely
+documented:
+
+1. Deploy the #1244-capable binary to **every** reader in the fleet.
+2. Confirm the rollout completed (or just call `activate_codec_key` — it
+   tells you who is still missing).
 3. *Then* activate a keyed codec.
 
 Registering keys is safe at any point: while the legacy key is active no `kid`
 is written and envelopes stay version 1, byte-identical to what a pre-#948
-deployment stores. It is the **activation** that must come last. Harvest cannot
-enforce this — it has no fleet-wide view of which binaries are running.
+deployment stores. It is the **activation** that must come last.
 
 ### ⚠️ What "zero" does and does not authorise
 

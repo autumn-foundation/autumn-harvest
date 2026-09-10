@@ -311,6 +311,10 @@ pub async fn register_worker<S: std::hash::BuildHasher + Send + Sync>(
     let shards_json =
         serde_json::to_value(shard_assignments).map_err(HarvestError::Serialization)?;
     let labels_json = serde_json::to_value(labels).map_err(HarvestError::Serialization)?;
+    // Issue #1244: every registration advertises this binary's highest
+    // readable codec envelope version, so `codec_rotation::activate_codec_key`
+    // can refuse while any live worker cannot read a keyed envelope.
+    let labels_json = crate::payload_codec::advertise_codec_capability(&labels_json);
 
     let row = NewHarvestWorker {
         worker_id,
@@ -440,11 +444,15 @@ pub async fn heartbeat_worker(
     labels: &serde_json::Value,
     in_use_sessions: i32,
 ) -> HarvestResult<usize> {
+    // Issue #1244: refreshed on every heartbeat, not just at registration, so
+    // a worker's advertised capability never outlives an upgrade or downgrade
+    // of its own binary.
+    let labels = crate::payload_codec::advertise_codec_capability(labels);
     let affected = diesel::update(harvest_workers::table.find(worker_id))
         .set((
             harvest_workers::last_heartbeat_at.eq(Utc::now()),
             harvest_workers::in_flight_count.eq(in_flight_count),
-            harvest_workers::labels.eq(labels),
+            harvest_workers::labels.eq(&labels),
             harvest_workers::in_use_sessions.eq(in_use_sessions),
         ))
         .execute(conn)

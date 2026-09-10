@@ -4359,6 +4359,21 @@ pub async fn enforce_timeouts_once(
              timeout-pass residents"
         ),
     }
+    // Refresh this process's active codec key from the durable, fleet-wide
+    // `harvest_codec_key_state` table (issue #1244). Runs right after the
+    // sweep above for the same reason: shard-local, on this connection, never
+    // allowed to break the rest of the tick. This is the bounded-staleness
+    // mechanism `codec_rotation::FleetWriteFence`'s retirement gate relies on
+    // -- every process observes an `activate_codec_key` call within one tick
+    // interval of it landing.
+    match crate::codec_rotation::refresh_active_codec_key(conn, payload_codecs).await {
+        Ok(_flipped) => {}
+        Err(e) => tracing::warn!(
+            error = %e,
+            "codec key state refresh failed; continuing with the remaining timeout-pass \
+             residents"
+        ),
+    }
     // Reclaim expired durable-mutex leases (crash recovery, issue #691) and wake
     // each freed key's new head of line. Shard-local: it runs against this
     // connection's own database (like `enforce_broken_sessions`), and is a no-op
