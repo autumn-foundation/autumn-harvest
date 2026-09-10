@@ -1743,14 +1743,15 @@ fn pause_array_size_table_matches_the_committed_summary() {
 /// this whole test module exists to catch, this time inside the same file.
 #[test]
 fn unmeasured_predicate_count_matches_the_top_table() {
+    const MEASURED: usize = 5;
+
     let doc = read_performance_doc();
     let start = doc
         .find("| Predicate | Issue |")
         .expect("the top-of-file predicate table must exist");
     let end = doc[start..]
         .find("\n\n")
-        .map(|off| start + off)
-        .unwrap_or(doc.len());
+        .map_or(doc.len(), |off| start + off);
     let table = &doc[start..end];
     // Every row is a `| name | #NNN |` line; subtract the header and the
     // `|:--|:--|` separator.
@@ -1760,7 +1761,6 @@ fn unmeasured_predicate_count_matches_the_top_table() {
         .count()
         - 2;
 
-    const MEASURED: usize = 5;
     assert!(
         row_count > MEASURED,
         "the top predicate table has {row_count} rows, at or below the \
