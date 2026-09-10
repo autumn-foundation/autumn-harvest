@@ -37,10 +37,9 @@ history onto the new key.
 
 ## Wiring it up
 
-> **Read this first — which writes are codec-aware.** All of them (issue
-> #1243). Every production write path encodes through the configured
-> registry, and the worker replays with the *same* registry, so a mixed-key
-> history round-trips end to end.
+> **Read this first — which writes are codec-aware.** Every payload-bearing
+> write does (issue #1243). The worker replays with the *same* registry, so a
+> mixed-key history round-trips end to end.
 >
 > This includes:
 >
@@ -55,13 +54,35 @@ history onto the new key.
 > - every payload-bearing `store::append_single_event` call:
 >   `ChildWorkflowStarted.input`, `ChildWorkflowCompleted.output`, a typed
 >   `ChildWorkflowFailed.details` (both `worker.rs` and the cross-shard child
->   relay), and `ActivityCompletedExternally.output` (`external_task.rs`).
+>   relay), and `ActivityCompletedExternally.output` (`external_task.rs`);
+> - `UpdateAdmitted.input` (`store::admit_update_event`) and a workflow rerun's
+>   own start input (`execution::rerun_workflow_execution`);
+> - `scheduler.rs`'s three dispatch paths: a schedule tick, a buffered-run
+>   drain, and a unified-DAG trigger;
+> - `completion_trigger.rs`'s relay-gate-checked start, both
+>   `evaluate_triggers_for_execution` variants, the outbox sweep, and a
+>   cross-shard `DeferredTriggerStart` (the registry rides on the struct since
+>   `spawn` runs detached from the evaluating call's scope);
+> - the plugin layer: `admit_batched_start` (event-batch admission), the
+>   outbox relay's workflow-start dispatch, a UI-triggered manual schedule
+>   fire, and the outbound webhook-delivery start.
 >
-> A handful of writes stay on the identity registry deliberately: parent-close
-> cascade bookkeeping, operator cancel/terminate reasons, and similar events
-> carry no payload-bearing field at all (see `PayloadCodecs::encode_event`'s
-> field list), so encoding them is a byte-for-byte no-op. Nothing in that group
-> is reachable from a workflow's real input, output, or error detail.
+> Two groups stay on the identity registry, for different reasons:
+>
+> - Events with no payload-bearing field at all: parent-close cascade
+>   bookkeeping, operator cancel/terminate reasons, pause/resume, and
+>   `WorkflowRedriven`. Encoding these is a byte-for-byte no-op (see
+>   `PayloadCodecs::encode_event`'s field list) — nothing in this group is
+>   reachable from a workflow's real input, output, or error detail.
+> - A disclosed residual gap: `cancel_workflow_execution_collect`,
+>   `terminate_workflow_execution_collect`, and
+>   `commit_workflow_execution_timeout` each fire a completion-trigger
+>   evaluation with the identity registry. These three public functions have
+>   many external callers with no configured registry threaded through, so
+>   closing this gap needs a signature change beyond issue #1243's scope. The
+>   events these three write directly carry no payload field either, so only
+>   a *downstream* trigger-fired start could be affected — track closing this
+>   under a follow-up issue.
 
 ```rust
 use autumn_harvest::payload_codec::CODEC_LEGACY_KEY_ID;

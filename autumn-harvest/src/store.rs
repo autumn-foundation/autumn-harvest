@@ -499,8 +499,8 @@ pub async fn load_raw_started_carryover(
 /// Append a single event to a workflow's history without loading the full log.
 ///
 /// Delegates to [`append_single_event_with_codecs`] under the identity
-/// registry. Every production call site should use the `_with_codecs` sibling
-/// instead (issue #1243) — this wrapper exists for the tests that do not
+/// registry (issue #1243). A payload-bearing call site should use the
+/// `_with_codecs` sibling instead. This wrapper exists for tests that do not
 /// exercise a configured codec.
 ///
 /// # Errors
@@ -688,6 +688,33 @@ pub async fn admit_update_event(
     input: serde_json::Value,
     metrics: Option<&dyn crate::telemetry::MetricsRecorder>,
 ) -> HarvestResult<()> {
+    admit_update_event_with_codecs(
+        conn,
+        exec_id,
+        update_id,
+        name,
+        input,
+        metrics,
+        &DEFAULT_PAYLOAD_CODECS,
+    )
+    .await
+}
+
+/// [`admit_update_event`], encoding `UpdateAdmitted.input` through `codecs`
+/// (issue #1243).
+///
+/// # Errors
+///
+/// Same as [`admit_update_event`].
+pub async fn admit_update_event_with_codecs(
+    conn: &mut AsyncPgConnection,
+    exec_id: ExecutionId,
+    update_id: crate::types::UpdateId,
+    name: String,
+    input: serde_json::Value,
+    metrics: Option<&dyn crate::telemetry::MetricsRecorder>,
+    codecs: &crate::payload_codec::PayloadCodecs,
+) -> HarvestResult<()> {
     use crate::models::WorkflowExecution;
     use crate::schema::harvest_workflow_executions;
     use diesel::dsl::max;
@@ -740,7 +767,7 @@ pub async fn admit_update_event(
                 input,
                 timestamp: chrono::Utc::now(),
             };
-            append_events(conn, exec_id, &[event], next_id).await?;
+            append_events_with_codecs(conn, exec_id, &[event], next_id, codecs).await?;
             Ok((execution.workflow_name, execution.queue_name))
         }),
     )

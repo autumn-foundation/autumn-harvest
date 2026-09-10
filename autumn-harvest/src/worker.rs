@@ -7438,16 +7438,19 @@ pub async fn persist_workflow_completion(
             .await?;
             update_workflow_execution_completed(conn, exec_id, worker_id, &output).await?;
             queue::complete_task(conn, task_id, output).await?;
-            let (mut deferred, closed_children) = apply_parent_close_cascade(conn, exec_id, codecs).await?;
+            let (mut deferred, closed_children) =
+                apply_parent_close_cascade(conn, exec_id, codecs).await?;
             let mut tx_cancel_metrics = Vec::new();
-            let triggers = crate::completion_trigger::evaluate_triggers_for_execution_collecting(
-                conn,
-                exec_id,
-                crate::completion_trigger::TerminalState::Completed,
-                metrics,
-                &mut tx_cancel_metrics,
-            )
-            .await?;
+            let triggers =
+                crate::completion_trigger::evaluate_triggers_for_execution_collecting_with_codecs(
+                    conn,
+                    exec_id,
+                    crate::completion_trigger::TerminalState::Completed,
+                    metrics,
+                    &mut tx_cancel_metrics,
+                    codecs,
+                )
+                .await?;
             deferred.extend(triggers);
             Ok((deferred, closed_children, tx_cancel_metrics))
         }))
@@ -7804,12 +7807,13 @@ pub async fn persist_workflow_failure(
                 deferred.extend(cascade);
                 deferred_checks.extend(closed_children);
                 let triggers =
-                    crate::completion_trigger::evaluate_triggers_for_execution_collecting(
+                    crate::completion_trigger::evaluate_triggers_for_execution_collecting_with_codecs(
                         conn,
                         exec_id,
                         crate::completion_trigger::TerminalState::Failed,
                         metrics,
                         &mut tx_cancel_metrics,
+                    codecs,
                     )
                     .await?;
                 deferred.extend(triggers);
@@ -8901,7 +8905,10 @@ async fn persist_activity_wait_park(
             plan_timer_lifecycle(conn, exec_id, commands).await?;
         let marker_events = pre_suspension_events_from_commands(commands, &mut timer_events);
         for event in marker_events {
-            store::append_single_event(conn, exec_id, event).await?;
+            // Issue #1243: a marker/side-effect/detached-child-spawn event
+            // here can carry `details`/`value`/`input`, all payload-bearing.
+            store::append_single_event_with_codecs(conn, exec_id, event, registry.payload_codecs())
+                .await?;
         }
         detached_spawns.persist(conn, commands).await?;
 
@@ -12448,16 +12455,19 @@ pub async fn persist_child_workflow_completion(
                 .await?;
             update_workflow_execution_completed(conn, exec_id, worker_id, &output).await?;
             queue::complete_task(conn, task_id, output.clone()).await?;
-            let (mut deferred, closed_children) = apply_parent_close_cascade(conn, exec_id, codecs).await?;
+            let (mut deferred, closed_children) =
+                apply_parent_close_cascade(conn, exec_id, codecs).await?;
             let mut tx_cancel_metrics = Vec::new();
-            let triggers = crate::completion_trigger::evaluate_triggers_for_execution_collecting(
-                conn,
-                exec_id,
-                crate::completion_trigger::TerminalState::Completed,
-                metrics,
-                &mut tx_cancel_metrics,
-            )
-            .await?;
+            let triggers =
+                crate::completion_trigger::evaluate_triggers_for_execution_collecting_with_codecs(
+                    conn,
+                    exec_id,
+                    crate::completion_trigger::TerminalState::Completed,
+                    metrics,
+                    &mut tx_cancel_metrics,
+                    codecs,
+                )
+                .await?;
             deferred.extend(triggers);
             wake_parent_for_child_completion(conn, parent_exec_id, exec_id, output, codecs).await?;
             Ok((deferred, closed_children, tx_cancel_metrics))
@@ -12528,18 +12538,22 @@ pub async fn persist_child_workflow_failure(
             update_workflow_execution_failed(conn, exec_id, worker_id, &message, nd_details)
                 .await?;
             queue::fail_task(conn, task_id, &message).await?;
-            let (mut deferred, closed_children) = apply_parent_close_cascade(conn, exec_id, codecs).await?;
+            let (mut deferred, closed_children) =
+                apply_parent_close_cascade(conn, exec_id, codecs).await?;
             let mut tx_cancel_metrics = Vec::new();
-            let triggers = crate::completion_trigger::evaluate_triggers_for_execution_collecting(
-                conn,
-                exec_id,
-                crate::completion_trigger::TerminalState::Failed,
-                metrics,
-                &mut tx_cancel_metrics,
-            )
-            .await?;
+            let triggers =
+                crate::completion_trigger::evaluate_triggers_for_execution_collecting_with_codecs(
+                    conn,
+                    exec_id,
+                    crate::completion_trigger::TerminalState::Failed,
+                    metrics,
+                    &mut tx_cancel_metrics,
+                    codecs,
+                )
+                .await?;
             deferred.extend(triggers);
-            wake_parent_for_child_failure(conn, parent_exec_id, exec_id, &raw_error, codecs).await?;
+            wake_parent_for_child_failure(conn, parent_exec_id, exec_id, &raw_error, codecs)
+                .await?;
             Ok((deferred, closed_children, tx_cancel_metrics))
         }))
         .await?;
@@ -14375,7 +14389,9 @@ async fn persist_scheduled_external_activity(
                 plan_timer_lifecycle(conn, exec_id, commands).await?;
             let marker_events = pre_suspension_events_from_commands(commands, &mut timer_events);
             for event in marker_events {
-                store::append_single_event(conn, exec_id, event).await?;
+                // Issue #1243: a marker/side-effect/detached-child-spawn
+                // event here can carry `details`/`value`/`input`.
+                store::append_single_event_with_codecs(conn, exec_id, event, codecs).await?;
             }
             detached_spawns.persist(conn, commands).await?;
 
@@ -18145,15 +18161,17 @@ pub async fn move_workflow_to_dlq_for_history_cap(
             // execution to RUNNING. Mirrors the poison-pill quarantine and
             // workflow-task-timeout seal paths.
             queue::fail_open_tasks_for_execution(conn, exec_id, &reason).await?;
-            let (mut deferred, closed_children) = apply_parent_close_cascade(conn, exec_id, codecs).await?;
+            let (mut deferred, closed_children) =
+                apply_parent_close_cascade(conn, exec_id, codecs).await?;
             let mut pending_cancel_metrics = Vec::new();
             let failed_triggers =
-                crate::completion_trigger::evaluate_triggers_for_execution_collecting(
+                crate::completion_trigger::evaluate_triggers_for_execution_collecting_with_codecs(
                     conn,
                     exec_id,
                     crate::completion_trigger::TerminalState::Failed,
                     metrics,
                     &mut pending_cancel_metrics,
+                    codecs,
                 )
                 .await?;
             deferred.extend(failed_triggers);
@@ -27770,12 +27788,13 @@ pub async fn quarantine_workflow_task_timeout(
                             apply_parent_close_cascade(conn, exec_id, codecs).await?;
                         let mut pending_cancel_metrics = Vec::new();
                         let triggers =
-                            crate::completion_trigger::evaluate_triggers_for_execution_collecting(
+                            crate::completion_trigger::evaluate_triggers_for_execution_collecting_with_codecs(
                                 conn,
                                 exec_id,
                                 crate::completion_trigger::TerminalState::Failed,
                                 Some(metrics),
                                 &mut pending_cancel_metrics,
+                            codecs,
                             )
                             .await?;
                         deferred.extend(triggers);

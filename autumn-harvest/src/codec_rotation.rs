@@ -1830,14 +1830,16 @@ mod tests {
                 + text.matches("append_events_offloaded(").count()
         }
 
-        // Issue #1243 closed the `WorkflowStarted.input` gap: `execution.rs`'s
-        // start paths now encode through `append_events_with_codecs`. The
-        // remaining 5 are non-payload-bearing writes on public entry points
-        // with no configured registry threaded through their many external
-        // callers (`WorkflowCancelled`/`workflow_failed` reason strings on the
-        // cancel/terminate/inline-cancel paths) — identity is exact there, not
-        // a gap. `reset.rs` keeps its fork marker and source-execution
-        // terminal, neither of which carries a payload-bearing field either.
+        // Issue #1243 closed the `WorkflowStarted.input` gap. `execution.rs`'s
+        // start paths now encode through `append_events_with_codecs`.
+        //
+        // The remaining 5 write `WorkflowCancelled` (from
+        // `cancel_workflow_execution_collect` and
+        // `terminate_workflow_execution_collect`), `WorkflowExecutionPaused`,
+        // `WorkflowExecutionResumed`, and `WorkflowRedriven`. None of these
+        // carry a `PAYLOAD_FIELD_KEYS` field, so identity is exact here.
+        // `reset.rs` keeps its fork marker and source-execution terminal, also
+        // both free of payload fields.
         const KNOWN_IDENTITY_APPENDS: &[(&str, usize)] = &[("execution.rs", 5), ("reset.rs", 2)];
 
         let engine_sources: &[(&str, &str)] = &[

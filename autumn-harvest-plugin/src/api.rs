@@ -17978,10 +17978,11 @@ pub(crate) async fn start_workflow(
             },
         };
 
-        match autumn_harvest::event_batch::admit_batched_start(
+        match autumn_harvest::event_batch::admit_batched_start_with_codecs(
             &mut batch_conn,
             admit_params,
             Some(runtime.registry.telemetry().metrics.as_ref()),
+            runtime.registry.payload_codecs(),
         )
         .await
         {
@@ -22826,11 +22827,12 @@ async fn rerun_workflow(
         trace_context: runtime.registry.telemetry().capture_trace_context(),
     };
 
-    let result = autumn_harvest::execution::rerun_workflow_execution(
+    let result = autumn_harvest::execution::rerun_workflow_execution_with_codecs(
         &mut conn,
         exec_id,
         rerun_request,
         metrics_ref,
+        runtime.registry.payload_codecs(),
     )
     .await;
 
@@ -44604,13 +44606,14 @@ pub(crate) async fn admit_update(
     // attempt. `admit_update_event` verifies RUNNING under the same FOR UPDATE
     // lock and rolls back on rejection, so a re-driven admit can never
     // double-admit.
-    let mut admit = store::admit_update_event(
+    let mut admit = store::admit_update_event_with_codecs(
         &mut conn,
         target,
         update_id,
         update_name.clone(),
         request.input.clone(),
         Some(runtime.registry.telemetry().metrics.as_ref()),
+        runtime.registry.payload_codecs(),
     )
     .await;
     for _ in 0..autumn_harvest::execution::RETRY_CHAIN_MAX_REDRIVES {
@@ -44622,13 +44625,14 @@ pub(crate) async fn admit_update(
             return map_error(error).into_response();
         }
         target = fresh;
-        admit = store::admit_update_event(
+        admit = store::admit_update_event_with_codecs(
             &mut conn,
             target,
             update_id,
             update_name.clone(),
             request.input.clone(),
             Some(runtime.registry.telemetry().metrics.as_ref()),
+            runtime.registry.payload_codecs(),
         )
         .await;
     }

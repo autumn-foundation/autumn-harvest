@@ -63,8 +63,8 @@ use autumn_harvest::schema::{
     harvest_signals, harvest_task_queue, harvest_timers, harvest_workflow_executions,
 };
 use autumn_harvest::signal::send_signal;
-use autumn_harvest::start_or_load_workflow_execution_with_metrics;
-use autumn_harvest::store::admit_update_event;
+use autumn_harvest::start_or_load_workflow_execution_with_metrics_and_codecs;
+use autumn_harvest::store::admit_update_event_with_codecs;
 use autumn_harvest::types::{
     ExecutionId as HarvestExecutionId, Priority, ShardId, UpdateId, WorkflowIdReusePolicy,
 };
@@ -2144,13 +2144,15 @@ async fn trigger_update_ui(
     let ui_metrics = ui_runtime
         .as_ref()
         .map(|r| r.registry().telemetry().metrics.as_ref());
-    let (status, error_summary, flash) = match admit_update_event(
+    let ui_codecs = api_state.payload_codecs();
+    let (status, error_summary, flash) = match admit_update_event_with_codecs(
         &mut conn,
         exec_id,
         update_id,
         form.update_name.clone(),
         payload_json,
         ui_metrics,
+        &ui_codecs,
     )
     .await
     {
@@ -8894,7 +8896,7 @@ async fn execute_schedule_trigger_ui(
 
     // Provenance ref for a manual UI schedule trigger is the schedule id (#740).
     let ui_schedule_id_str = row.id.to_string();
-    let result = start_or_load_workflow_execution_with_metrics(
+    let result = start_or_load_workflow_execution_with_metrics_and_codecs(
         conn,
         StartWorkflowParams {
             workflow_name,
@@ -8947,6 +8949,7 @@ async fn execute_schedule_trigger_ui(
         },
         Some(runtime.registry().telemetry().metrics.as_ref()),
         None,
+        runtime.registry().payload_codecs(),
     )
     .await;
     let (status, outcome) = if result.is_ok() {

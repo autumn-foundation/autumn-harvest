@@ -352,12 +352,13 @@ mod scanner {
             apply_parent_close_cascade(conn, exec_id, codecs).await?;
         let mut pending_cancel_metrics = Vec::new();
         let failed_triggers =
-            crate::completion_trigger::evaluate_triggers_for_execution_collecting(
+            crate::completion_trigger::evaluate_triggers_for_execution_collecting_with_codecs(
                 conn,
                 exec_id,
                 crate::completion_trigger::TerminalState::Failed,
                 metrics,
                 &mut pending_cancel_metrics,
+                codecs,
             )
             .await?;
         deferred.extend(failed_triggers);

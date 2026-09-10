@@ -23,7 +23,8 @@ use crate::error::{HarvestError, HarvestResult, TimeoutType, database_error};
 use crate::execution::{
     CancelledWorkflowExecution, StartWorkflowParams, StartedWorkflowExecution,
     check_and_report_unfinished_handlers, load_execution,
-    start_or_load_workflow_execution_collect_with_codecs, start_or_load_workflow_execution_with_codecs,
+    start_or_load_workflow_execution_collect_with_codecs,
+    start_or_load_workflow_execution_with_codecs,
 };
 use crate::models::WorkflowExecution;
 use crate::notify::{WorkflowEventListener, WorkflowEventWaitOutcome};
@@ -649,9 +650,13 @@ impl WorkflowHandleClient {
         conn: &mut AsyncPgConnection,
         request: StartWorkflowParams<'_>,
     ) -> HarvestResult<StartedWorkflowHandle> {
-        let started =
-            start_or_load_workflow_execution_with_codecs(conn, request, None, &self.inner.payload_codecs)
-                .await?;
+        let started = start_or_load_workflow_execution_with_codecs(
+            conn,
+            request,
+            None,
+            &self.inner.payload_codecs,
+        )
+        .await?;
         let handle = self.handle(started.exec_id);
         Ok(StartedWorkflowHandle { started, handle })
     }
@@ -2282,13 +2287,14 @@ impl WorkflowHandle {
         // (woken below), which emits update.completed/failed, so admitting
         // without recording admitted would leave this path asymmetric. The
         // recorder defaults to a no-op when the client was built without one.
-        let mut admit = crate::store::admit_update_event(
+        let mut admit = crate::store::admit_update_event_with_codecs(
             conn,
             target,
             update_id,
             name.to_string(),
             input.clone(),
             Some(self.client.inner.metrics.as_ref()),
+            &self.client.inner.payload_codecs,
         )
         .await;
         for _ in 0..crate::execution::RETRY_CHAIN_MAX_REDRIVES {
@@ -2302,13 +2308,14 @@ impl WorkflowHandle {
             target = fresh;
             self.validate_workflow_type_for(conn, target, workflow_name)
                 .await?;
-            admit = crate::store::admit_update_event(
+            admit = crate::store::admit_update_event_with_codecs(
                 conn,
                 target,
                 update_id,
                 name.to_string(),
                 input.clone(),
                 Some(self.client.inner.metrics.as_ref()),
+                &self.client.inner.payload_codecs,
             )
             .await;
         }

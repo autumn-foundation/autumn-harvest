@@ -708,12 +708,12 @@ async fn replay_fidelity_is_byte_identical_across_a_sweep() {
 #[tokio::test]
 async fn a_builder_configured_codec_encrypts_the_start_input_and_replay_round_trips_it() {
     // Drives the real production start entry point
-    // (`execution::start_or_load_workflow_execution_collect_with_codecs`) with a
-    // codec configured the way an embedder actually configures one --
-    // `HarvestBuilder::payload_codec_key` -- rather than calling
-    // `store::append_events_with_codecs` directly as the other tests in this
-    // file do. `WorkflowStarted.input` is the first event of every execution;
-    // before issue #1243 it always went through the identity registry.
+    // (`execution::start_or_load_workflow_execution_collect_with_codecs`).
+    // The codec is configured the way an embedder actually configures one,
+    // via `HarvestBuilder::payload_codec_key`. Other tests in this file call
+    // `store::append_events_with_codecs` directly instead.
+    // `WorkflowStarted.input` is the first event of every execution; before
+    // issue #1243 it always went through the identity registry.
     let (url, _c) = setup_isolated_db().await;
     let mut conn = connect(&url).await;
 

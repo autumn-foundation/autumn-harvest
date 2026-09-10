@@ -17,7 +17,7 @@ use uuid::Uuid;
 use autumn_harvest::error::{HarvestError, HarvestResult, database_error};
 use autumn_harvest::shard::ShardRouter;
 use autumn_harvest::types::{ExecutionId, Priority};
-use autumn_harvest::{StartWorkflowParams, start_or_load_workflow_execution_with_metrics};
+use autumn_harvest::{StartWorkflowParams, start_or_load_workflow_execution_with_metrics_and_codecs};
 
 use crate::config::HarvestOutboxConfig;
 use crate::state::HarvestDbPool;
@@ -352,7 +352,14 @@ pub(crate) async fn dispatch_workflow_start_request(
         .and_then(|registry| registry.max_workflow_attempts_ceiling);
     let sla = info_sla.and_then(|d| chrono::Duration::from_std(d).ok());
 
-    let start = start_or_load_workflow_execution_with_metrics(
+    // Issue #1243: `WorkflowStarted.input` is payload-bearing. Fall back to
+    // the identity registry only when no `HandlerRegistry` extension is
+    // installed at all, which never happens in a real deployment.
+    let dispatch_codecs = registry_ext
+        .as_ref()
+        .map(|r| r.payload_codecs().clone())
+        .unwrap_or_default();
+    let start = start_or_load_workflow_execution_with_metrics_and_codecs(
         &mut conn,
         StartWorkflowParams {
             workflow_name: &request.workflow_name,
@@ -403,6 +410,7 @@ pub(crate) async fn dispatch_workflow_start_request(
                 as &(dyn autumn_harvest::telemetry::MetricsRecorder + Send + Sync)
         }),
         None,
+        &dispatch_codecs,
     )
     .await?;
 

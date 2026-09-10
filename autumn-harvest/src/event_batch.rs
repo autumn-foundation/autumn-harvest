@@ -126,7 +126,8 @@ pub async fn admit_batched_start(
         Vec<crate::completion_trigger::DeferredTriggerStart>,
     )>,
 > {
-    admit_batched_start_with_codecs(conn, params, metrics, &crate::store::DEFAULT_PAYLOAD_CODECS).await
+    admit_batched_start_with_codecs(conn, params, metrics, &crate::store::DEFAULT_PAYLOAD_CODECS)
+        .await
 }
 
 /// [`admit_batched_start`], encoding a flushed `WorkflowStarted.input` through
@@ -815,6 +816,7 @@ pub async fn fire_due_event_batches(
 /// # Errors
 ///
 /// Same as [`fire_due_event_batches`].
+#[cfg(feature = "db")]
 pub async fn fire_due_event_batches_with_codecs(
     conn: &mut diesel_async::AsyncPgConnection,
     sharded_pool: &Option<crate::shard::ShardedDbPool>,

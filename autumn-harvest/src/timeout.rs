@@ -1008,23 +1008,23 @@ async fn commit_workflow_execution_timeout(
         }
 
         // Issue #1243: neither this cascade nor `timeout_event`
-        // (`WorkflowExecutionTimedOut`) carries a payload-bearing field, and
-        // `enforce_workflow_execution_timeouts` has no configured registry
-        // threaded through its many test call sites -- identity is exact
-        // here, not a shortcut.
-        let (mut deferred, closed_children) = apply_parent_close_cascade(
-            conn,
-            exec_id,
-            &crate::store::DEFAULT_PAYLOAD_CODECS,
-        )
-        .await?;
+        // (`WorkflowExecutionTimedOut`) carries a payload-bearing field.
+        // `enforce_workflow_execution_timeouts` also has no configured
+        // registry threaded through its many test call sites. Identity is
+        // exact here, not a shortcut.
+        let (mut deferred, closed_children) =
+            apply_parent_close_cascade(conn, exec_id, &crate::store::DEFAULT_PAYLOAD_CODECS)
+                .await?;
         let mut pending_cancel_metrics = Vec::new();
-        let triggers = crate::completion_trigger::evaluate_triggers_for_execution_collecting(
+        // Issue #1243: same identity-registry rationale as this function's
+        // `apply_parent_close_cascade` call above.
+        let triggers = crate::completion_trigger::evaluate_triggers_for_execution_collecting_with_codecs(
             conn,
             exec_id,
             crate::completion_trigger::TerminalState::TimedOut,
             metrics,
             &mut pending_cancel_metrics,
+            &crate::store::DEFAULT_PAYLOAD_CODECS,
         )
         .await?;
         deferred.extend(triggers);
@@ -1739,12 +1739,13 @@ async fn enforce_workflow_timeout(
         let (mut deferred, closed_children) =
             apply_parent_close_cascade(conn, exec_id, codecs).await?;
         let mut pending_cancel_metrics = Vec::new();
-        let triggers = crate::completion_trigger::evaluate_triggers_for_execution_collecting(
+        let triggers = crate::completion_trigger::evaluate_triggers_for_execution_collecting_with_codecs(
             conn,
             exec_id,
             crate::completion_trigger::TerminalState::TimedOut,
             Some(metrics),
             &mut pending_cancel_metrics,
+            codecs,
         )
         .await?;
         deferred.extend(triggers);
@@ -4265,11 +4266,12 @@ pub async fn enforce_timeouts_once(
         payload_codecs,
     )
     .await?;
-    count += crate::completion_trigger::enforce_completion_triggers_outbox(
+    count += crate::completion_trigger::enforce_completion_triggers_outbox_with_codecs(
         conn,
         metrics,
         sharded_pool,
         shard_assignments,
+        payload_codecs,
     )
     .await?;
     // Cross-shard child workflows (issue #956). Runs on this shard's own
@@ -4718,12 +4720,13 @@ pub async fn enforce_workflow_history_ceiling(
                     apply_parent_close_cascade(conn, exec_id, codecs).await?;
                 let mut pending_cancel_metrics = Vec::new();
                 let triggers =
-                    crate::completion_trigger::evaluate_triggers_for_execution_collecting(
+                    crate::completion_trigger::evaluate_triggers_for_execution_collecting_with_codecs(
                         conn,
                         exec_id,
                         crate::completion_trigger::TerminalState::Failed,
                         Some(metrics),
                         &mut pending_cancel_metrics,
+                        codecs,
                     )
                     .await?;
                 deferred.extend(triggers);

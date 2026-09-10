@@ -1434,7 +1434,9 @@ async fn fire_due_on_conn(
 
             let mut results = Vec::with_capacity(due_rows.len());
             for row in due_rows {
-                if let Some(item) = fire_claimed_throttle_row(conn, row, now, metrics, codecs).await? {
+                if let Some(item) =
+                    fire_claimed_throttle_row(conn, row, now, metrics, codecs).await?
+                {
                     results.push(item);
                 }
             }
