@@ -736,11 +736,24 @@ async fn resolve_target_queues_batch(
     // never does. Skip defensively rather than unwrap: this filters nothing
     // in practice and turns a would-be panic into a harmless miss (the
     // caller's per-row fallback still covers it).
-    rows.into_iter()
-        .filter_map(|(name, queue)| {
-            name.map(|n| (n, queue.unwrap_or_else(default_workflow_queue)))
-        })
-        .collect()
+    let mut resolved: std::collections::HashMap<String, String> = rows
+        .into_iter()
+        .filter_map(|(name, queue)| name.map(|n| (n, queue.unwrap_or_else(default_workflow_queue))))
+        .collect();
+
+    // A name with NO `harvest_schedules` row at all is simply absent from
+    // `rows` -- SQL's `= ANY` has nothing to return a NULL match for -- so
+    // without this it would fall through to the per-row fallback exactly
+    // like a genuine lookup failure would, defeating the batch for every
+    // such name instead of resolving it to the correct default here.
+    // `resolve_target_queue` reaches the identical `default_workflow_queue()`
+    // answer for this case via its own `.optional()` returning `Ok(None)`.
+    for name in names {
+        resolved
+            .entry(name.clone())
+            .or_insert_with(default_workflow_queue);
+    }
+    resolved
 }
 
 /// Resolve the start queue for a **cross-shard** completion-trigger target.
@@ -2277,13 +2290,14 @@ pub async fn enforce_completion_triggers_outbox(
         }
         set.into_iter().collect()
     };
-    let mut resolved_queues = std::collections::HashMap::new();
-    if !names_needing_lookup.is_empty()
+    let resolved_queues = if !names_needing_lookup.is_empty()
         && let Some(sp) = sharded_pool.as_ref()
         && let Ok(mut default_conn) = sp.pool_for(sp.default_shard()).get().await
     {
-        resolved_queues = resolve_target_queues_batch(&mut default_conn, &names_needing_lookup).await;
-    }
+        resolve_target_queues_batch(&mut default_conn, &names_needing_lookup).await
+    } else {
+        std::collections::HashMap::new()
+    };
 
     let mut processed_count = 0;
     for task in pending_tasks {

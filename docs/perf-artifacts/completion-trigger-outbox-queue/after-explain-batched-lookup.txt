@@ -1,0 +1,40 @@
+-- EXPLAIN (ANALYZE, BUFFERS, VERBOSE, SETTINGS) for resolve_target_queues_batch's
+-- single ANY($1) lookup, replacing the n per-row SELECTs it batches away.
+-- Same 303-row harvest_schedules fixture as before-explain-per-row-lookup.txt
+-- (300 unrelated DAG rows + 3 matching workflow-kind rows). The array below
+-- has 5 names -- the DISTINCT_NAMES the n=50 sweep point cycles through --
+-- 3 of which the harness's outbox rows had already relayed and deleted by
+-- the time this was captured (so the first three are the harness's real
+-- generated names; the last two are placeholders in the same
+-- "outbox_perf_wf_<i>_..." shape standing in for the 2 names that never
+-- matched a schedule row, reproducing the batch's real 3-matched/2-missed
+-- composition).
+--
+--     psql -c "EXPLAIN (ANALYZE, BUFFERS, VERBOSE, SETTINGS)
+--       SELECT \"harvest_schedules\".\"workflow_name\", \"harvest_schedules\".\"queue_name\"
+--       FROM \"harvest_schedules\"
+--       WHERE \"harvest_schedules\".\"workflow_name\" = ANY(ARRAY[...5 names...]);"
+--
+-- Postgres 16.13. Planner chooses a Seq Scan over 5 index probes at this
+-- table size (303 rows, cost 11.95) -- expected and fine: harvest_schedules
+-- is operator-configured (cron/workflow schedules), not a per-execution
+-- table, so hundreds of rows is already a realistic upper end, and either
+-- plan shape costs the same 7 buffers regardless of n. The claim this fix
+-- makes is about call count (1 call per scan tick, not n), not about which
+-- plan the lookup itself takes. See
+-- docs/performance-completion-trigger-outbox-queue.md.
+
+                                                                                                                                       QUERY PLAN
+-----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+ Seq Scan on public.harvest_schedules  (cost=0.00..11.95 rows=5 width=64) (actual time=0.085..0.086 rows=3 loops=1)
+   Output: workflow_name, queue_name
+   Filter: (harvest_schedules.workflow_name = ANY ('{outbox_perf_wf_0_cffc9e0ca81f4651af1efdb914d91f64,outbox_perf_wf_1_1a8ba7bf6c154d568089a94100e1291a,outbox_perf_wf_2_65cbccd0cf7d458183bdce3eecb33107,outbox_perf_wf_3_no_schedule_row,outbox_perf_wf_4_no_schedule_row}'::text[]))
+   Rows Removed by Filter: 300
+   Buffers: shared hit=7
+ Query Identifier: 6673369170665216780
+ Planning:
+   Buffers: shared hit=285
+ Planning Time: 0.772 ms
+ Execution Time: 0.100 ms
+(10 rows)
+

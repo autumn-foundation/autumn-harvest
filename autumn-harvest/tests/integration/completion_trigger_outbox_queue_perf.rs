@@ -124,7 +124,11 @@ async fn seed_unrelated_dag_schedules(conn: &mut AsyncPgConnection, count: usize
 
 /// Seeds a workflow-kind schedule row (the row `resolve_target_queue`'s
 /// lookup is written to find) for `workflow_name`, carrying `queue_name`.
-async fn seed_workflow_schedule(conn: &mut AsyncPgConnection, workflow_name: &str, queue_name: &str) {
+async fn seed_workflow_schedule(
+    conn: &mut AsyncPgConnection,
+    workflow_name: &str,
+    queue_name: &str,
+) {
     diesel::insert_into(harvest_schedules::table)
         .values((
             harvest_schedules::workflow_name.eq(Some(workflow_name.to_string())),
@@ -338,7 +342,11 @@ async fn measure_one_batch(admin: &str, _label: &str, n: usize) -> SizePoint {
 
     fn fmt_row(r: &StatRow, total_calls: i64, total_buffers: i64) -> String {
         let query: String = r.query.split_whitespace().collect::<Vec<_>>().join(" ");
-        let query = if query.len() > 90 { format!("{}...", &query[..90]) } else { query };
+        let query = if query.len() > 90 {
+            format!("{}...", &query[..90])
+        } else {
+            query
+        };
         format!(
             "calls={:>4} ({:>5.1}%)  buffers={:>5} ({:>5.1}%)  {query}",
             r.calls,
@@ -543,12 +551,11 @@ async fn started_queue_names(conn: &mut AsyncPgConnection) -> HashMap<String, St
         #[diesel(sql_type = diesel::sql_types::Text)]
         queue_name: String,
     }
-    let rows: Vec<Row> = diesel::sql_query(
-        "SELECT workflow_id, queue_name FROM harvest_workflow_executions",
-    )
-    .load(conn)
-    .await
-    .expect("load started executions");
+    let rows: Vec<Row> =
+        diesel::sql_query("SELECT workflow_id, queue_name FROM harvest_workflow_executions")
+            .load(conn)
+            .await
+            .expect("load started executions");
     rows.into_iter()
         .map(|r| (r.workflow_id, r.queue_name))
         .collect()
@@ -562,9 +569,13 @@ async fn outbox_scan_on_no_pending_rows_is_a_no_op() {
         .await
         .expect("connect");
     let sharded_pool = Some(ShardedDbPool::single(build_test_pool(&default_url)));
-    let processed =
-        enforce_completion_triggers_outbox(&mut conn, &NoOpMetrics, &sharded_pool, &[ShardId::new(0)])
-            .await
-            .expect("enforce_completion_triggers_outbox should succeed on an empty outbox");
+    let processed = enforce_completion_triggers_outbox(
+        &mut conn,
+        &NoOpMetrics,
+        &sharded_pool,
+        &[ShardId::new(0)],
+    )
+    .await
+    .expect("enforce_completion_triggers_outbox should succeed on an empty outbox");
     assert_eq!(processed, 0);
 }
