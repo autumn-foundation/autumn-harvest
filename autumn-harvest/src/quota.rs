@@ -70,20 +70,24 @@
 //! workflow type with no declared [`QuotaPolicy`] leaves `quota_key = NULL`
 //! everywhere and pays zero enforcement overhead (issue #946 AC9).
 //!
-//! # Known limitation — pre-upgrade rollout gap (issue #1226)
+//! # Pre-upgrade rollout gap, closed by a periodic reconciler (issue #1226)
 //!
 //! Because `quota_key` is resolved only at admission time, an execution
 //! that was already `RUNNING`/`PAUSED` *before* its workflow type's
-//! [`QuotaPolicy`] was declared/deployed keeps `quota_key = NULL` for the
-//! rest of its life — it is neither counted against the new cap nor
-//! blocked by it. The migration deliberately ships with no SQL backfill
-//! (the key-resolution expression is Rust application code, not something
-//! a pure-SQL migration can evaluate), so this is a bounded, self-healing
-//! rollout-window gap rather than a permanent one: pre-existing executions
-//! age out of it as they complete, fail, or are otherwise collected. A
-//! registry-aware startup reconciliation pass that re-resolves and
-//! backfills `quota_key` for such rows is tracked as a follow-up in
-//! issue #1226.
+//! [`QuotaPolicy`] was declared/deployed would otherwise keep
+//! `quota_key = NULL` for the rest of its life — neither counted against
+//! the new cap nor blocked by it. [`crate::quota_reconcile`] closes this:
+//! a periodic, shard-local sweep re-resolves and backfills `quota_key` for
+//! exactly such rows, using this module's own [`resolve_quota_key`] — the
+//! same function the live admission path calls — so a backfilled value can
+//! never drift from what a fresh admission would compute.
+//!
+//! The sweep runs on the worker's heartbeat cadence rather than
+//! synchronously inside admission, so a row stays invisible to
+//! [`load_quota_usage`] for up to one reconcile interval after its policy
+//! takes effect. See [`crate::quota_reconcile`]'s module doc for the full
+//! design (why periodic rather than startup-once, and why that residual
+//! window is not a new risk class).
 
 #[cfg(feature = "db")]
 use diesel::sql_types::{BigInt, Nullable, Text};
