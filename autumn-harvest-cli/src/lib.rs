@@ -16021,6 +16021,93 @@ mod usage_cli_tests {
         let rendered = format_usage_table(&value);
         assert!(rendered.contains("No usage groups found."));
     }
+
+    #[test]
+    fn format_workflow_summaries_table_renders_rows_and_next_cursor() {
+        let value = serde_json::json!({
+            "summaries": [
+                {
+                    "execution_id": "exec-1",
+                    "workflow_name": "onboarding",
+                    "workflow_id": "wf-1",
+                    "state": "completed",
+                    "completed_at": "2026-05-18T00:00:00Z",
+                    "duration_ms": 4200,
+                    "shard_id": 3
+                }
+            ],
+            "next_cursor": "abc123"
+        });
+        let rendered = format_workflow_summaries_table(&value);
+        assert!(rendered.contains("EXEC ID"), "{rendered}");
+        assert!(rendered.contains("exec-1"), "{rendered}");
+        assert!(rendered.contains("onboarding"), "{rendered}");
+        assert!(rendered.ends_with("\nnext_cursor: abc123"), "{rendered}");
+    }
+
+    #[test]
+    fn format_workflow_summaries_table_reports_no_summaries() {
+        let value = serde_json::json!({ "summaries": [] });
+        assert_eq!(
+            format_workflow_summaries_table(&value),
+            "No execution summaries found."
+        );
+    }
+
+    #[test]
+    fn format_run_chain_table_renders_rows_workflow_id_and_head_unknown_note() {
+        let value = serde_json::json!({
+            "workflow_id": "wf-9",
+            "head_unknown": true,
+            "runs": [
+                {
+                    "sequence": 1,
+                    "exec_id": "exec-1",
+                    "run_id": "run-1",
+                    "state": "completed",
+                    "outcome": "success",
+                    "started_at": "2026-05-18T00:00:00Z",
+                    "completed_at": "2026-05-18T00:05:00Z",
+                    "continued_to_exec_id": "exec-2"
+                }
+            ]
+        });
+        let rendered = format_run_chain_table(&value);
+        assert!(rendered.starts_with("workflow_id: wf-9\n"), "{rendered}");
+        assert!(rendered.contains("exec-1"), "{rendered}");
+        assert!(rendered.contains("note: head_unknown"), "{rendered}");
+    }
+
+    #[test]
+    fn format_run_chain_table_reports_no_runs() {
+        let value = serde_json::json!({ "runs": [] });
+        assert_eq!(format_run_chain_table(&value), "No run chain found.");
+    }
+
+    #[test]
+    fn format_audit_table_renders_target_type_and_id_joined() {
+        let value = serde_json::json!([
+            {
+                "occurred_at": "2026-05-18T00:00:00Z",
+                "actor": "operator@example.com",
+                "operation": "pause",
+                "target_type": "workflow",
+                "target_id": "wf-1",
+                "status": "ok",
+                "source": "cli",
+                "error_summary": null
+            }
+        ]);
+        let rendered = format_audit_table(&value);
+        assert!(rendered.contains("workflow:wf-1"), "{rendered}");
+        assert!(rendered.contains("operator@example.com"), "{rendered}");
+    }
+
+    #[test]
+    fn format_audit_table_reports_no_records() {
+        let value = serde_json::json!([]);
+        assert_eq!(format_audit_table(&value), "No audit records found.");
+    }
 }
 
 #[cfg(test)]
