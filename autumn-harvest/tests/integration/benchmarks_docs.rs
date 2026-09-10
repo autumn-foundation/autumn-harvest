@@ -202,10 +202,14 @@ fn the_doc_carries_a_comparison_reading_note_at_the_headline_table() {
         note.contains("floor"),
         "the note must say the published configuration is a floor, not a ceiling"
     );
+    // Match the bold-rendered multiplier, not a bare digit. A bare `contains`
+    // check on "7" also matches the unrelated "23.73" headline figure two
+    // lines up. A mistyped multiplier would still pass that check.
+    let rendered = format!("**{DISPATCHES_PER_WORKFLOW}**");
     assert!(
-        note.contains(&DISPATCHES_PER_WORKFLOW.to_string()),
-        "the note must state the dispatches-per-workflow multiplier ({DISPATCHES_PER_WORKFLOW}), \
-         pinned to the workflow's real shape, not a number typed by hand"
+        note.contains(&rendered),
+        "the note must state the dispatches-per-workflow multiplier as `{rendered}`, pinned to \
+         the workflow's real shape, not a number typed by hand"
     );
 }
 
