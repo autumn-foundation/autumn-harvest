@@ -22216,6 +22216,11 @@ fn spawn_concurrency_sampler(
     interval: Duration,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
+        // No recorder configured: never issue the sampler SQL (issue #1428,
+        // matching `spawn_queue_depth_sampler`'s guard above).
+        if !telemetry.metrics.is_enabled() {
+            return;
+        }
         loop {
             tokio::select! {
                 () = cancel.cancelled() => break,
@@ -22312,6 +22317,11 @@ fn spawn_rate_limit_sampler(
     interval: Duration,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
+        // No recorder configured: never issue the sampler SQL (issue #1428,
+        // matching `spawn_queue_depth_sampler`'s guard above).
+        if !telemetry.metrics.is_enabled() {
+            return;
+        }
         loop {
             tokio::select! {
                 () = cancel.cancelled() => break,
@@ -22411,6 +22421,11 @@ fn spawn_dlq_depth_sampler(
     interval: Duration,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
+        // No recorder configured: never issue the sampler SQL (issue #1428,
+        // matching `spawn_queue_depth_sampler`'s guard above).
+        if !telemetry.metrics.is_enabled() {
+            return;
+        }
         loop {
             tokio::select! {
                 () = cancel.cancelled() => break,
@@ -23389,6 +23404,11 @@ fn spawn_history_oversized_sampler(
     interval: Duration,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
+        // No recorder configured: never issue the sampler SQL (issue #1428,
+        // matching `spawn_queue_depth_sampler`'s guard above).
+        if !telemetry.metrics.is_enabled() {
+            return;
+        }
         let mut reported_workflows = std::collections::HashSet::new();
         loop {
             tokio::select! {
@@ -28890,6 +28910,41 @@ mod tests {
             ),
         )
         .expect("write evidence artifact");
+    }
+
+    /// Regression pin for issue #1428. The four previously-unguarded
+    /// samplers must never touch the pool when metrics are disabled,
+    /// matching every guarded sibling (`spawn_queue_depth_sampler` and
+    /// friends). Not timing-sensitive: the guard makes the count exactly
+    /// zero, unconditionally. No race with real connect-refusal timing can
+    /// make this test flaky in either direction.
+    #[tokio::test(start_paused = true)]
+    async fn metrics_disabled_samplers_never_touch_the_pool() {
+        use tracing_subscriber::layer::SubscriberExt;
+
+        let interval = Duration::from_millis(50);
+        let counter = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let subscriber =
+            tracing_subscriber::registry().with(PoolTouchCounter(Arc::clone(&counter)));
+        let _guard = tracing::subscriber::set_default(subscriber);
+
+        let telemetry = Arc::new(crate::telemetry::TelemetryConfig::default());
+        let pool = unreachable_pool("postgres://127.0.0.1:1/sampler-guard-regression");
+        let cancel = CancellationToken::new();
+        let handles = spawn_the_four_unguarded_samplers(&pool, &cancel, &telemetry, interval);
+
+        advance_sampler_ticks(interval, 20).await;
+        cancel.cancel();
+        for handle in handles {
+            let _ = tokio::time::timeout(Duration::from_secs(5), handle).await;
+        }
+
+        assert_eq!(
+            load_pool_touch_count(&counter),
+            0,
+            "a metrics-disabled deployment must never reach pool.get() in any of these \
+             four samplers"
+        );
     }
 
     #[test]
