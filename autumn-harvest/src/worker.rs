@@ -28739,9 +28739,9 @@ mod tests {
     // Four samplers issued their SQL with no `metrics.is_enabled()` guard,
     // unlike their six siblings (`spawn_queue_depth_sampler` above sets the
     // pattern). `unreachable_pool` makes the bug falsifiable without a
-    // database: a guarded sampler returns before its first `pool.get()`, so
-    // it never logs the failure below. An unguarded one logs it once per
-    // loop pass, so the count is a direct, deterministic proxy for "how many
+    // database: a guarded sampler returns before its first `pool.get()`.
+    // It never logs the failure below. An unguarded one logs it once per
+    // loop pass. The count is a direct, deterministic proxy for "how many
     // times a sampler touched the pool."
 
     /// A [`tracing_subscriber::Layer`] that counts events carrying the
@@ -28782,10 +28782,11 @@ mod tests {
         }
     }
 
-    /// Reads `counter` via a fully-qualified call. `diesel_async::RunQueryDsl`
-    /// is implemented for every `Sized` type, including `Arc<AtomicUsize>`,
-    /// so a plain `counter.load(ordering)` resolves to that blanket trait
-    /// method instead of `AtomicUsize::load` and fails to compile.
+    /// Reads `counter` via a fully-qualified call.
+    /// `diesel_async::RunQueryDsl` is implemented for every `Sized` type,
+    /// including `Arc<AtomicUsize>`. A plain `counter.load(ordering)`
+    /// resolves to that blanket trait method instead of
+    /// `AtomicUsize::load`, and fails to compile.
     fn load_pool_touch_count(counter: &Arc<std::sync::atomic::AtomicUsize>) -> usize {
         std::sync::atomic::AtomicUsize::load(counter, std::sync::atomic::Ordering::SeqCst)
     }
