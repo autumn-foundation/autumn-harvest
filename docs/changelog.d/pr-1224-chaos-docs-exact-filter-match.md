@@ -108,10 +108,20 @@ issue #1202 as P2 round 4).
   diagnosable CI failure, not a silent wrong pass -- the opposite of
   every other finding in this issue. Documented as a known, accepted
   trade-off in `skip_continuation_gap`'s doc comment instead.
+- A sixth Codex round found a real gap the round-3 "pass the whole
+  stanza" fix introduced: `extract_filter_argument` matches the FIRST
+  occurrence of the flag, so a step `- name:` line that itself reads
+  like `Run --test integration chaos_tests:: suite` would match there
+  instead of the real `run:` command, silently comparing against stale
+  prose if the actual command has since narrowed. Added `run_command`,
+  which anchors to the stanza's `run:` key specifically (to the end of
+  the stanza, so multi-line/continuation commands still work). This
+  subsumes the round-3 fix rather than replacing it. Fixture test
+  confirmed against a step name containing look-alike text.
 
 No production code changed — `chaos_docs.rs` is a test-only doc/CI parity
 guard behind no feature flag. `cargo test -p autumn-harvest --test
-integration chaos_docs::` (23/23), `cargo fmt -p autumn-harvest -- --check`,
+integration chaos_docs::` (24/24), `cargo fmt -p autumn-harvest -- --check`,
 `cargo clippy -p autumn-harvest --all-features --tests -- -D warnings`,
 and `python3 docs/audits/comment-hygiene.py --base origin/trunk-dev` are
 all clean.

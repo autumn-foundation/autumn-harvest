@@ -519,11 +519,14 @@ fn doc_example_filter_matches_chaos_workflow_filter() {
         ".github/workflows/chaos.yml must have a step running the \
          chaos_tests:: suite",
     );
-    // Pass the whole stanza, not a single `.lines().find(...)` match. A
-    // `run:` command can wrap across lines: a `\` continuation, or a
-    // folded `>-` block. A single-line match would lose the filter to
-    // that break. The doc's own example wraps its filter the same way.
-    let ci_filter = extract_filter_argument(ci_stanza);
+    // Anchor to the `run:` value specifically, not a single
+    // `.lines().find(...)` match and not the whole stanza. A `run:`
+    // command can wrap across lines: a `\` continuation, or a folded
+    // `>-` block. A single-line match would lose the filter to that
+    // break. The doc's own example wraps its filter the same way. The
+    // whole stanza also includes the step's `- name:` line, which could
+    // itself contain look-alike prose -- see `run_command`.
+    let ci_filter = extract_filter_argument(run_command(ci_stanza));
 
     let doc = read_chaos_doc();
     let block = bash_block_containing(&doc, "HARVEST_TEST_DATABASE_URL");
@@ -551,7 +554,10 @@ fn doc_example_filter_matches_chaos_workflow_filter_tolerates_a_wrapped_ci_run_l
     // filters still matched. Passing the whole stanza fixes this.
     let workflow = "\n      - name: Run chaos reproducers\n        run: cargo test --features chaos --test integration \\\n          chaos_tests::\n";
     let ci_stanza = workflow_step_stanza(workflow, "chaos_tests::").expect("stanza present");
-    assert_eq!(extract_filter_argument(ci_stanza), "chaos_tests::");
+    assert_eq!(
+        extract_filter_argument(run_command(ci_stanza)),
+        "chaos_tests::"
+    );
 }
 
 #[test]
@@ -562,7 +568,7 @@ fn doc_and_ci_extraction_pipeline_detects_divergence_end_to_end() {
     // isolation.
     let workflow = "\n      - uses: actions/checkout@v4\n      - name: Run chaos reproducers\n        run: cargo test --features chaos --test integration chaos_tests::chaos_seeded_convergence_sweep -- --nocapture\n      - name: A later step\n        run: echo later\n";
     let ci_stanza = workflow_step_stanza(workflow, "chaos_tests::").expect("stanza present");
-    let ci_filter = extract_filter_argument(ci_stanza);
+    let ci_filter = extract_filter_argument(run_command(ci_stanza));
 
     let doc = "```bash\n# Scope the run to `chaos_tests::`:\nHARVEST_TEST_DATABASE_URL=postgres://x \\\n  CHAOS_SEEDS=8 cargo test --features chaos --test integration \\\n  chaos_tests::\n```\n";
     let block = bash_block_containing(doc, "HARVEST_TEST_DATABASE_URL");
@@ -631,6 +637,39 @@ fn step_stanza_covers_keys_written_after_run() {
         !stanza.contains("Some earlier step"),
         "the stanza must start at its own `- name:`, not an earlier step's. \
          Stanza:\n{stanza}"
+    );
+}
+
+/// The step stanza's `run:` value, from the `run:` key to the end of the
+/// stanza.
+///
+/// A step's `- name:` line can itself contain text that reads like
+/// `--test integration <filter>`, e.g. a name describing the check the
+/// step runs. `extract_filter_argument` matches the FIRST occurrence.
+/// Passing the whole stanza risks matching that prose instead of the
+/// real command. That could mask a real divergence if the `run:` line
+/// has since narrowed. Anchoring to `run:` specifically rules that out.
+fn run_command(stanza: &str) -> &str {
+    let mut offset = 0;
+    for line in stanza.split_inclusive('\n') {
+        let trimmed = line.trim_start();
+        if trimmed.starts_with("run:") {
+            return &stanza[offset + (line.len() - trimmed.len())..];
+        }
+        offset += line.len();
+    }
+    panic!("stanza has no `run:` key: {stanza}");
+}
+
+#[test]
+fn run_command_skips_a_look_alike_filter_in_the_step_name() {
+    // Codex finding on PR #1474: a step name mentioning `--test
+    // integration chaos_tests::` as prose must not be mistaken for the
+    // real command.
+    let stanza = "\n      - name: Run --test integration chaos_tests:: suite\n        run: cargo test --features chaos --test integration chaos_tests::specific\n";
+    assert_eq!(
+        extract_filter_argument(run_command(stanza)),
+        "chaos_tests::specific"
     );
 }
 
