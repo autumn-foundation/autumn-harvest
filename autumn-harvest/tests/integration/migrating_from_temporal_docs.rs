@@ -412,6 +412,16 @@ fn dual_run_playbook_covers_schedule_driven_cutover() {
 /// can do exactly that before the retry runs. Restrict the retry to
 /// `AllowDuplicate` or `RejectDuplicate`, the two policies that
 /// never replace a prior execution outright.
+///
+/// A tenth review found three more gaps. The scheduled-firing fix
+/// assumed a hook that does not exist. Harvest's built-in scheduler
+/// starts an execution directly. It exposes no callback for a reader to
+/// write a record at. Capture a schedule-driven type's Temporal-side
+/// ids once, at cutover, instead. The harvest-only reuse-policy advice
+/// also does not carry over to Temporal, whose own policy of the same
+/// name means something different. Retrying a lost update response is
+/// not safe either. Every admission mints a fresh update id, so a
+/// retry can run the update a second time.
 #[test]
 fn dual_run_playbook_covers_follow_up_engine_routing() {
     let guide = read_doc(GUIDE_PATH);
@@ -462,12 +472,27 @@ fn dual_run_playbook_covers_follow_up_engine_routing() {
          (issue #1219)"
     );
     assert!(
-        playbook.contains("Any start that lands on harvest writes this record")
-            && playbook.contains("harvest's own schedule fired it directly"),
-        "the playbook must write the routing record for every harvest-side start, scheduled \
-         or flag-routed alike -- a schedule-driven type's follow-ups need the same mechanism \
-         as any other type, not a type-level \"which schedule is active\" shortcut that \
-         misroutes a pre-cutover in-flight execution (issue #1219, PR #1473 Codex P1)"
+        playbook.contains("A schedule-driven type has no hook to write this record")
+            && playbook.contains("Temporal's own visibility API"),
+        "the playbook must not claim harvest's built-in scheduler exposes a callback to write \
+         the routing record -- it does not -- and must instead capture a schedule-driven \
+         type's in-flight Temporal ids once, at cutover, through Temporal's own visibility \
+         API (issue #1219, PR #1473 Codex P1)"
+    );
+    assert!(
+        playbook.contains("On the harvest side, retry it")
+            && playbook.contains("Temporal's own reject-duplicate equivalent"),
+        "the playbook must scope the AllowDuplicate/RejectDuplicate reconciliation guidance to \
+         harvest only -- Temporal's own reuse policy of the same name means something \
+         different (a new execution once the prior closes, not \"return the original \
+         regardless of state\") (issue #1219, PR #1473 Codex P1)"
+    );
+    assert!(
+        playbook.contains("Do not retry the update call itself if its result goes missing")
+            && playbook.contains("mints a fresh update id"),
+        "the playbook must warn that retrying a lost update response can run the update's own \
+         logic a second time, since every admission mints a fresh update id with no dedup key \
+         (issue #1219, PR #1473 Codex P1)"
     );
     assert!(
         playbook.contains("This record names the current owner only")

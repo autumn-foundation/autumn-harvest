@@ -385,19 +385,29 @@ your whole application.
    opposite state undetectable. A real execution can exist with no
    record, defaulting to the wrong engine.
 
-   Any start that lands on harvest writes this record, whether an
-   application-level flag routed it there or harvest's own schedule
-   fired it directly. Both are your own system's code paths. Overwrite
+   An application-level flag routes a new request in your own code,
+   whether it sends the request to harvest or, after a rollback, back
+   to Temporal. Write the record at that same decision point. Overwrite
    any earlier record for the same id. Treat a missing record as
-   Temporal. A flag-routed start there, a rollback's restart, and a
-   Temporal Schedule's own direct firing are all Temporal's by default.
-   Nothing in your system could have started any of them on harvest
-   instead.
+   Temporal. A flag-routed start there, and a rollback's restart, are
+   both Temporal's by default. Nothing in your system could have
+   started either one on harvest instead.
+
+   A schedule-driven type has no hook to write this record for a
+   harvest-fired execution. Harvest's built-in scheduler starts each
+   firing directly. It exposes no callback before or after admission
+   for your own code to run. Capture ownership a different way instead.
+   Before you pause the Temporal Schedule, list every in-flight
+   Temporal execution of that type through Temporal's own visibility
+   API. Treat a follow-up against one of those captured ids as
+   Temporal's, permanently. Treat any other id of that type as
+   harvest's. Only harvest's schedule can start a new one once Temporal
+   is paused.
 
    Reconcile a record that names an engine with no matching execution.
    Query that engine's own resolution for the id. A miss there means
    the start never actually completed, or its result was never
-   observed. Retry it, but only under
+   observed. On the harvest side, retry it, but only under
    `WorkflowIdReusePolicy::AllowDuplicate` (the default) or
    `RejectDuplicate`. Both return the original execution, or refuse
    outright, no matter what state it reached.
@@ -406,6 +416,12 @@ your whole application.
    on purpose. Each can start a genuine second execution once the first
    reaches a terminal state. That duplicates whatever side effects the
    first one already committed. Neither is safe for this retry.
+
+   Do not carry this same policy choice over to a Temporal-side
+   reconciliation. Temporal's own reuse policy of the same name means
+   something different. It allows a new execution once the prior one
+   closes. That is not "return the original regardless of state." Use
+   Temporal's own reject-duplicate equivalent for this retry instead.
 
    This record names the current owner only. It matches harvest's own
    by-id resolution (issue #805), which also resolves to the latest
@@ -429,17 +445,23 @@ your whole application.
    under the update. `admit_update` resolves only a workflow-level
    retry chain, not a continue-as-new chain, so it will not find the
    new current run for you there. Keep the gap between the two calls
-   short. Re-resolve by-id and retry if the update does not land as
-   expected. Use Temporal's own equivalent business-id resolution on
-   the Temporal side.
+   short.
+
+   Do not retry the update call itself if its result goes missing.
+   Every admission mints a fresh update id, with no dedup key of its
+   own. A retry can run the update's own logic a second time. If you
+   lose the response, read the execution's state instead to confirm
+   whether the update already applied, rather than resending it. Use
+   Temporal's own equivalent business-id resolution on the Temporal
+   side.
 
    This design replaces three separate resolution attempts. A terminal
    execution keeps routing to the engine that finished it, since
    nothing overwrote its record. A reused workflow id after a rollback
    gets a fresh record the moment the rollback's own flag flip routes
-   the new start to Temporal. A schedule-driven type's harvest-side
-   firings write their own record too, the same as any other harvest
-   start.
+   the new start to Temporal. A schedule-driven type instead captures
+   its Temporal-side ids once, at cutover, since harvest's own
+   scheduler has no hook to write one.
 
    Confirm the previous execution under a reused id is not still active
    on its own engine before you start a new one elsewhere. Query
