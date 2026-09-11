@@ -237,9 +237,10 @@ Four items routed forward, two carried from prior reports and two new:
   audited at job level (vs. 10/66 sampled in 09-08) — 15/54 (28%) hid a real
   failure; 11 deterministic, 1 external infra, 2 flake-candidate instances
   (1 signature), 1 dependency-ledger drift.
-- **Explicit-failure census:** 14/14 runs classified, but full per-run detail
-  recoverable for only 1/14 after a mid-investigation context-compaction loss —
-  disclosed in §2 rather than papered over.
+- **Explicit-failure census:** 14/14 runs classified with full per-run detail —
+  13/14 re-pulled after a mid-investigation context-compaction loss initially
+  left only their aggregate (8 comment-hygiene, 3 clippy, 2 doc/code-sync;
+  1/14 external infra), per a Codex review comment on this PR.
 - **Flake-candidate reproduction:** 0/92 local reps failed (60 isolated-test +
   32 full-module, both under `taskset -c 0,1` contention) — inconclusive, not a
   measured rate, no fix follows from this.
