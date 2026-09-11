@@ -26,6 +26,13 @@ announces correctly. That gap is silent: the field still submits, the
 sighted operator still sees the adjacent text, and no error, contrast, or
 flash-message audit here would ever catch it.
 
+Recognizing a "real control" is not just a word search: `strip_comments`
+removes `//`/`/* */` comments first, and `mask_text_strings` blanks every
+rendered-text string second, so neither a comment nor a label's own text
+node can supply the word or the terminator `CONTROL_OPEN` looks for. Only
+an attribute value's own string (following `=`) survives masking, which
+is what lets `for`/`id` resolution keep working.
+
 Usage:
     python3 docs/audits/vantage-label-association.py
 
@@ -124,6 +131,46 @@ def strip_comments(src: str) -> str:
     return "".join(out)
 
 
+def mask_text_strings(src: str) -> str:
+    """Blank the contents of every string literal that is not an attribute
+    value -- a maud rendered-text node (`"Task kind"`) or an ordinary Rust
+    string argument (`String::from("Paused")`) -- while leaving an
+    attribute value's own quotes and content untouched (`ID_ATTR` and
+    `FOR_ATTR` both read real content out of those). A string is an
+    attribute value only when the previous non-whitespace character is
+    `=`; anything else is text, and gets masked.
+
+    Without this, `CONTROL_OPEN`'s own terminator search can be satisfied
+    from *inside* a rendered string. A label whose real control moved to a
+    sibling, but which still renders text like `"select one;"`, supplies
+    the trailing `;` `CONTROL_OPEN` is looking for from the quoted text
+    itself, not from a real element (Codex review, PR #1485, following up
+    on the comment-only version of the same gap already closed by
+    `strip_comments`). Call this after `strip_comments` so a quote that
+    was only ever inside a comment has already been removed and cannot be
+    mistaken for the start of a string here."""
+    out = list(src)
+    i, n = 0, len(src)
+    while i < n:
+        if src[i] != '"':
+            i += 1
+            continue
+        j = i - 1
+        while j >= 0 and src[j] in " \t\n\r":
+            j -= 1
+        is_attr_value = j >= 0 and src[j] == "="
+        k = i + 1
+        while k < n and src[k] != '"':
+            k += 2 if src[k] == "\\" else 1
+        end = min(k, n)
+        if not is_attr_value:
+            for p in range(i + 1, end):
+                if out[p] != "\n":
+                    out[p] = " "
+        i = end + 1
+    return "".join(out)
+
+
 def control_ids(src: str) -> set[str]:
     ids = set()
     for m in CONTROL_OPEN.finditer(src):
@@ -184,7 +231,7 @@ def blank_style_block(src: str) -> str:
 
 
 def main():
-    src = strip_comments(blank_style_block(UI_RS.read_text()))
+    src = mask_text_strings(strip_comments(blank_style_block(UI_RS.read_text())))
     ids = control_ids(src)
 
     sites = []
