@@ -74,6 +74,29 @@
 //! order of magnitude as the rollout gap the migration already documents
 //! as bounded and self-healing, not a new risk class.
 //!
+//! Concretely, this can transiently admit ONE execution over a cap. That
+//! is not merely delayed enforcement: an admission racing a
+//! not-yet-processed backfill can read a stale, undercounted usage and
+//! admit. The physical count lands one over `max_active_executions` once
+//! both commit.
+//!
+//! The backfill's own UPDATE takes [`crate::quota::lock_quota_key`]. That
+//! is the same advisory lock
+//! [`crate::execution::enforce_quota_admission`] holds around its own
+//! check-then-admit, so whichever side acquires the lock first sees a
+//! consistent count. This narrows the window: it now depends on ordinary
+//! transaction-start ordering, not the entire interleaving space.
+//!
+//! It cannot fully close the window, though. Consider an admission that
+//! already committed before this sweep's next tick even begins. It was
+//! never going to see the not-yet-backfilled rows, no matter what lock
+//! either side holds.
+//!
+//! Closing that residual slice would require resolving `quota_key`
+//! synchronously inside every admission for a pre-existing row. That is
+//! the design this module deliberately avoids (see "Runs periodically,
+//! not once at startup" above).
+//!
 //! # Out of scope: `harvest_dead_letters.quota_key`
 //!
 //! This sweep only ever reads and writes `harvest_workflow_executions`. A
@@ -93,12 +116,12 @@ use crate::quota::{QuotaPolicy, quota_key_over_cap, resolve_quota_key};
 #[cfg(feature = "db")]
 use diesel::sql_types::{BigInt, Jsonb, Nullable, Text};
 #[cfg(feature = "db")]
-use diesel_async::{AsyncPgConnection, RunQueryDsl};
+use diesel_async::{AsyncConnection, AsyncPgConnection, RunQueryDsl};
 #[cfg(feature = "db")]
 use uuid::Uuid;
 
 #[cfg(feature = "db")]
-use crate::error::{HarvestResult, database_error};
+use crate::error::{HarvestError, HarvestResult, database_error};
 
 // ---------------------------------------------------------------------------
 // Pure decision logic -- no DB dependency, unit-tested without the `db` feature
@@ -330,15 +353,29 @@ pub async fn reconcile_quota_keys_from(
         let policy = registered_quota_policy(&row.workflow_name);
         match resolve_backfill(policy, &row.input) {
             ReconcileOutcome::Backfilled(key) => {
-                let rows_affected = diesel::sql_query(
-                    "UPDATE harvest_workflow_executions SET quota_key = $1 \
-                     WHERE id = $2 AND quota_key IS NULL",
-                )
-                .bind::<Text, _>(key)
-                .bind::<diesel::sql_types::Uuid, _>(row.id)
-                .execute(conn)
-                .await
-                .map_err(database_error)?;
+                let workflow_name = row.workflow_name.clone();
+                // Same lock `enforce_quota_admission` takes around its own
+                // check-then-admit (`quota::lock_quota_key`). A concurrent
+                // admission for this exact key reads a stale, pre-backfill
+                // count only if it wins the race to acquire this lock
+                // first. See this function's doc comment for why that
+                // residual, ordering-dependent window cannot be closed
+                // further without a synchronous-with-admission design.
+                let rows_affected = Box::pin(conn.transaction::<usize, HarvestError, _>(
+                    async move |conn| {
+                        crate::quota::lock_quota_key(conn, &workflow_name, &key).await?;
+                        diesel::sql_query(
+                            "UPDATE harvest_workflow_executions SET quota_key = $1 \
+                             WHERE id = $2 AND quota_key IS NULL",
+                        )
+                        .bind::<Text, _>(key)
+                        .bind::<diesel::sql_types::Uuid, _>(row.id)
+                        .execute(conn)
+                        .await
+                        .map_err(database_error)
+                    },
+                ))
+                .await?;
                 // A concurrent sweep may have already backfilled this exact
                 // row, between this call's candidate scan and its UPDATE.
                 // `rows_affected == 0` then. The count must not credit a
