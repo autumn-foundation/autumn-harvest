@@ -184,10 +184,20 @@ issue #1202 as P2 round 4).
   disproportionate scope as the YAML-folding finding declined earlier
   in this issue. chaos.yml's `run:` is a single, unchained command
   today; this is not a live bug.
+- A twelfth Codex round found a real gap the eleventh round's unnamed-step
+  fix left open: `workflow_step_stanza` now bounds an unnamed step's
+  stanza correctly, but `run_command` still only recognized `run:` alone
+  on its own line. An unnamed step writes it inline (`- run: ...`), so
+  `run_command` never found the key and panicked instead of extracting
+  the command. Fixed by recognizing the `- run:` form and treating its
+  key as sitting two columns past the list marker, so a sibling key
+  below (`env:`) still bounds the value correctly. Fixture test confirmed
+  against an unnamed step with a sibling `env:` block whose text reads
+  like a different filter.
 
 No production code changed — `chaos_docs.rs` is a test-only doc/CI parity
 guard behind no feature flag. `cargo test -p autumn-harvest --test
-integration chaos_docs::` (30/30), `cargo fmt -p autumn-harvest -- --check`,
+integration chaos_docs::` (31/31), `cargo fmt -p autumn-harvest -- --check`,
 `cargo clippy -p autumn-harvest --all-features --tests -- -D warnings`,
 and `python3 docs/audits/comment-hygiene.py --base origin/trunk-dev` are
 all clean.

@@ -794,6 +794,12 @@ fn workflow_step_stanza_treats_an_unnamed_step_as_its_own_boundary() {
 /// `if:`, ...) is not part of the run value. A more-indented line is a
 /// continuation of `run:`'s own value. A line at the same or shallower
 /// indentation is the next key. It ends the slice.
+///
+/// An unnamed step writes its `run:` key right after the list marker
+/// (`- run:`), not alone on its own line. That key sits two columns
+/// deeper than the marker, level with where a sibling key would go. The
+/// search accounts for that offset so the boundary check still lines
+/// up with a sibling like `env:`.
 fn run_command(stanza: &str) -> &str {
     let mut offset = 0;
     let mut run: Option<(usize, usize)> = None;
@@ -802,8 +808,11 @@ fn run_command(stanza: &str) -> &str {
         let indent = line.len() - trimmed.len();
         match run {
             None => {
-                if trimmed.starts_with("run:") {
-                    run = Some((offset + indent, indent));
+                let (key, key_indent) = trimmed
+                    .strip_prefix("- ")
+                    .map_or((trimmed, indent), |rest| (rest, indent + 2));
+                if key.starts_with("run:") {
+                    run = Some((offset + key_indent, key_indent));
                 }
             }
             Some((start, run_indent)) => {
@@ -843,6 +852,21 @@ fn run_command_excludes_a_sibling_key_after_run() {
     // succeed by reading past it into the env: block.
     let stanza = "\n      - name: Run chaos reproducers\n        run: cargo test --features chaos --test integration_tests chaos_tests::specific\n        env:\n          NOTE: \"--test integration chaos_tests::\"\n";
     extract_filter_argument(run_command(stanza));
+}
+
+#[test]
+fn run_command_recognizes_the_inline_run_key_on_an_unnamed_step() {
+    // Codex finding on PR #1474: an unnamed step's `run:` key sits right
+    // after the list marker (`- run:`), not alone on its own line. The
+    // old check matched only a line starting with `run:`, so it never
+    // found this key and panicked instead of extracting the command.
+    // A sibling `env:` key below must still end the run value here,
+    // exactly as it does for a named step.
+    let stanza = "\n      - run: cargo test --features chaos --test integration chaos_tests::specific\n        env:\n          NOTE: \"--test integration chaos_tests::\"\n";
+    assert_eq!(
+        extract_filter_argument(run_command(stanza)),
+        "chaos_tests::specific"
+    );
 }
 
 /// This module's own guards must run on a docs-only PR, where the `test`
