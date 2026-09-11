@@ -78,10 +78,13 @@ than trusting the run's overall `cancelled` verdict.
 The remaining 39/54 showed every job as `success`/`cancelled`/`skipped` — no hidden
 failures.
 
-**Combined with §2: 27 of 29 total failure instances found across both sections
-trace to a deterministic, commit-specific defect or to external infra
-nondeterminism; 2 share one flake-candidate signature; 1 is dependency-ledger
-drift, not a suite-reliability question.**
+**Combined with §2: 26 of 29 total failure instances found across both sections
+trace to a deterministic, commit-specific defect (24) or to external infra
+nondeterminism (2); 2 share one flake-candidate signature; 1 is dependency-ledger
+drift, not a suite-reliability question.** (§2: 13 deterministic + 1 external
+infra = 14. §3: 11 deterministic + 1 external infra + 2 flake-candidate + 1
+dependency-ledger = 15. 14 + 15 = 29; 13+11=24 deterministic, 1+1=2 external
+infra, 24+2=26.)
 
 ### 4. The flake candidate: `dispatch_tests::the_by_id_claim_honours_the_dr_fence`
 
@@ -135,11 +138,15 @@ rate exists, so no fix is being proposed.**
 
 ## 🔍 Diagnosis
 
-**§2/§3 (27 of 29 failures):** deterministic, commit-specific lint/fmt/doc-sync/
+**§2/§3 (26 of 29 failures):** deterministic, commit-specific lint/fmt/doc-sync/
 migration-hygiene/manifest-coverage/compile-time-feature-gating defects, or
 external infra (a new paging-file-exhaustion shape on Windows, plus a repeat of
 the already-documented Docker-registry pull failure). None are suite-level
-flakes. **§4 (2 of 29):** an unconfirmed flake candidate. Verdict on test-vs-product
+flakes. **1 of 29** (`34162176528`) is dependency-ledger drift — `cargo-deny`
+catching up to an advisory published against an existing, unchanged dependency —
+neither a suite defect nor infra noise, so it is tracked separately and not
+counted toward either bucket. **§4 (2 of 29):** an unconfirmed flake candidate.
+Verdict on test-vs-product
 cannot be rendered yet — the hard gate's own §3 requirement ("show the
 nondeterminism lives in the test, not the thing it tests, before touching any
 test") is not met, because no reproduction exists to interrogate. This is
@@ -147,9 +154,10 @@ explicitly not being treated as a proven test bug or a proven product bug; it is
 an open question with a plausible mechanism and two real occurrences.
 
 **Windows no-db long pole, re-measured (§5 below):** confirmed still present and
-measurably worse than the 09-06 baseline. Not yet root-caused to one commit — it
-grew across several merges in this window, not as a single step change, so
-"which commit" is an open question, not "no cause exists."
+measurably worse than the 09-06 baseline, in an uncontrolled sample of four
+single runs on four different branches. Not root-caused to any commit — "which
+commit, if any single one" is an open question a real bisect has to answer, not
+something this report's opportunistic sample can settle either way.
 
 ## 🔧 Treatment
 
@@ -193,7 +201,8 @@ Four items routed forward, two carried from prior reports and two new:
   09-03/09-06/09-08.
 - **Cancelled-run census:** 54/54 cancelled runs in the fresh sample fully
   audited at job level (vs. 10/66 sampled in 09-08) — 15/54 (28%) hid a real
-  failure; 13 deterministic, 1 external infra, 1 (2 instances) flake candidate.
+  failure; 11 deterministic, 1 external infra, 2 flake-candidate instances
+  (1 signature), 1 dependency-ledger drift.
 - **Explicit-failure census:** 14/14 runs classified, but full per-run detail
   recoverable for only 1/14 after a mid-investigation context-compaction loss —
   disclosed in §2 rather than papered over.
@@ -209,16 +218,25 @@ Four items routed forward, two carried from prior reports and two new:
   | `34553672251` | 2026-09-11 02:11 | 62.9 min | 40.6 min | 92.8 min |
   | `34570712844` | 2026-09-11 06:37 | 63.4 min | 36.2 min | 93.7 min |
 
-  Windows shard 3 grew ~62% (39.2→63.4 min); ubuntu shard 3 grew ~57–77% in the
-  same window — a shared, cross-OS slowdown, not windows-specific in cause, just
-  windows-specific in which shard remains the long pole (its baseline was
-  already highest). The growth is spread across several commits merged between
-  2026-09-08 and 2026-09-11 (df4bd0d "#1427" among them), not a single step at
-  one commit — the first post-#1427 sample (51.6 min) is already up from the
-  pre-#1427 baseline (39.2 min) but is itself well below the latest samples
-  (62.9–63.4 min), so later commits in the window added further weight. Overall
-  run wall-clock is now ~93 min, up from the 58.9–66.5 min range the 09-06
-  report measured.
+  Windows shard 3 grew ~62% (39.2→63.4 min) and ubuntu shard 3 grew ~57–77% in
+  the same window. **Attribution caveat, flagged by a Codex review comment on
+  this PR and correct:** each row is one opportunistic sample from a different
+  PR's own branch and commit, on whatever hosted runner GitHub happened to
+  assign, with cache state and runner-fleet load uncontrolled between them.
+  That is enough to show a real timing *increase* across the sampled runs — it
+  is not a controlled measurement and does not by itself prove the increase is
+  spread across several merges rather than concentrated in one, or that
+  branch-specific factors (a slower runner class that day, a colder cache on
+  that particular branch) aren't contributing. The original draft of this
+  section claimed the growth was "spread across several commits ... not a
+  single step," which overstated what four uncontrolled single-run samples can
+  support; corrected here to: **a real timing increase is observed in this
+  sample, its distribution across commits is not yet established, and item 4
+  below (an actual bisect, or repeated same-commit runs to control for runner
+  variance) is required before attributing it to any specific change.** Overall
+  run wall-clock is now ~93 min in the two latest samples, up from the
+  58.9–66.5 min range the 09-06 report measured — also reported as an
+  observation from this same uncontrolled sample, not a controlled trend.
 - No revert check applies — no fix in this report to verify red-then-green on.
 
 ## 🔬 Reproduce
