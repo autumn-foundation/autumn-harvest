@@ -11,7 +11,7 @@
 //! agentd serve &                         # the daemon: the only writer
 //! agentd submit "summarise the README"   # returns an execution id
 //! agentd status <id>                     # the session, including why it parked
-//! agentd approve <id>                    # release a gated write
+//! agentd approve <id> <token>            # release a gated write
 //! agentd history <id>                    # the recorded event log
 //! ```
 //!

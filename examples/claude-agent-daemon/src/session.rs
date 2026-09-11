@@ -24,9 +24,11 @@ use crate::tools;
 
 /// The signal-name prefix the CLI sends a decision to.
 ///
-/// The full name carries the tool-use id (see [`approval_signal`]). A decision
-/// therefore names the one call it releases. A stale or repeated approval stays
-/// staged under its own name, and never releases a later, unseen call.
+/// The full name adds the turn, the position in that turn, and the tool-use id
+/// (see [`approval_signal`]). The daemon requires that full name as the
+/// approval token, so a decision names the one wait it releases. A stale or
+/// repeated approval stays staged under its own name. It never releases a
+/// later, unseen call.
 pub const SIGNAL_TOOL_APPROVAL: &str = "tool_approval";
 
 /// The registered workflow name.
