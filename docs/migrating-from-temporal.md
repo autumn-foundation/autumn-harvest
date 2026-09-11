@@ -326,27 +326,27 @@ your whole application.
    directly. No application code runs in that path. The flag above
    controls nothing for it.
 
-   Pick one cutover timestamp. Create the harvest `WorkflowSchedule`
-   paused from the start, any time before that timestamp.
-   `WorkflowSchedule::with_paused(true)` sets this in the same insert
-   that creates the schedule. There is no window between an enabled
-   create and a separate pause call for a scheduler tick to land in.
+   Pick one cutover timestamp. Create the harvest `WorkflowSchedule` at
+   that timestamp, already paused. `WorkflowSchedule::with_paused(true)`
+   sets this in the same insert that creates the schedule. Its first
+   computed slot then falls at or after the cutover timestamp, since
+   nothing was due before a schedule that did not yet exist.
 
-   A schedule paused at creation can still accrue a backlog. Pausing
-   prevents a fire, not the passage of time. A slot can still come due
-   between creation and the cutover timestamp. Neither engine's catchup
-   policy resolves that backlog for you. Temporal's `CatchupWindow` and
-   harvest's `CatchupPolicy` (issue #484) each govern a missed interval
-   as a whole, not slot by slot. Neither has a mode that reliably fires
-   none of it. Harvest's `CatchupPolicy::SkipAll` still fires the oldest
-   missed slot, for one example.
+   Do not create the harvest schedule earlier and leave it paused,
+   waiting for the cutover timestamp. A slot can come due during that
+   wait, and neither engine's catchup policy resolves it cleanly for
+   you. Temporal's `CatchupWindow` and harvest's `CatchupPolicy` (issue
+   #484) each govern a missed interval as a whole, not slot by slot.
+   Neither has a mode that reliably fires none of it. Harvest's
+   `CatchupPolicy::SkipAll` still fires the oldest missed slot, for one
+   example.
 
-   At the cutover timestamp, pause the Temporal Schedule first. Then
-   unpause the harvest schedule with `POST /admin/schedules/{id}/resume`
-   (issue #229). A small gap between the two calls is still possible.
-   Treat a slot missed inside it as a deliberate, bounded loss, or fire
-   it by hand through `POST /admin/schedules/{id}/trigger`. Keep the gap
-   short enough that this stays rare.
+   Pause the Temporal Schedule first, then create and unpause the
+   harvest schedule with `POST /admin/schedules/{id}/resume` (issue
+   #229). A small gap between the two calls is still possible. Treat a
+   slot missed inside it as a deliberate, bounded loss, or fire it by
+   hand through `POST /admin/schedules/{id}/trigger`. Keep the gap short
+   enough that this stays rare.
 
    A follow-up operation against one already-started execution follows a
    different rule. A signal, a query, an update, and a cancellation each
@@ -517,11 +517,17 @@ your whole application.
 
    Routing the `cancel` signal above is a special case of step 1's
    general follow-up-routing rule. Route it to whichever engine hosts
-   this specific execution right now. Never route it by the flag's
-   current value. The final read after it is not that same case. By the
-   time you make it, you already know the execution is terminal, so
-   there is no engine left to resolve. Read it directly by the harvest
-   execution id the cancel step resolved.
+   this specific execution right now. For this forward handoff, that is
+   Temporal. The entity being drained never started on harvest, so the
+   by-id resolution finds nothing active there and falls through. Never
+   route the signal by the flag's current value.
+
+   The final read after it is not that same case. By the time you make
+   it, you already know the execution is terminal, so there is no engine
+   left to resolve. Read it directly from Temporal, the same execution
+   the cancel step resolved -- not from harvest, which does not have
+   this execution yet. Only after that read do you start the harvest
+   execution.
 
    Treat each entity's handoff as a deliberate cutover step, not a bulk
    migration. Each one is a live, stateful run. It is not disposable

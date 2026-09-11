@@ -277,14 +277,17 @@ fn comparison_page_links_back_to_the_migration_guide() {
 /// to harvest's own schedule pause and catchup primitives rather than leave
 /// them to guess.
 ///
-/// Three PR reviews (Codex, all P1) found real defects here. The first said
+/// Four PR reviews (Codex, all P1) found real defects here. The first said
 /// Temporal exposes a per-firing list an operator can inspect and accept or
 /// reject; it does not. The second said harvest's `CatchupPolicy::SkipAll`
 /// suppresses an entire missed interval; it does not, it fires the oldest
 /// slot. The third found the "pause after create" sequence this fix then
-/// tried left a race window for a scheduler tick to fire into. The fix now
-/// creates the harvest schedule already paused, in the same insert, and
-/// resumes it at one cutover timestamp instead of reconciling a backlog.
+/// tried left a race window for a scheduler tick to fire into. The fourth
+/// found a gap in that fix too. Letting the reader create the harvest
+/// schedule "any time before" cutover, even paused, still let a slot come
+/// due and fire on resume. The fix now creates the harvest schedule
+/// already paused, at the cutover timestamp itself, so no slot is ever
+/// due before it exists.
 #[test]
 fn dual_run_playbook_covers_schedule_driven_cutover() {
     let guide = read_doc(GUIDE_PATH);
@@ -312,6 +315,12 @@ fn dual_run_playbook_covers_schedule_driven_cutover() {
          PR #1473 Codex P1)"
     );
     assert!(
+        playbook.contains("Do not create the harvest schedule earlier and leave it paused"),
+        "the playbook must not let the reader create the harvest schedule ahead of the \
+         cutover timestamp even paused, since a slot can still come due and fire on resume \
+         (issue #1219, PR #1473 Codex P1)"
+    );
+    assert!(
         playbook.contains("SkipAll` still fires the oldest missed slot"),
         "the playbook must correct the record: `CatchupPolicy::SkipAll` still fires one slot, \
          it does not suppress an entire missed interval (issue #1219, PR #1473 Codex P1)"
@@ -333,9 +342,10 @@ fn dual_run_playbook_covers_schedule_driven_cutover() {
 /// hosts it right now. It must never route by the current flag value, or
 /// by a fact fixed at start time.
 ///
-/// Four PR reviews (Codex, three P1 and one P2) found real gaps in three
-/// successive attempts at this rule, plus one gap in the fourth. A
-/// persisted "record at start time" cannot cover a schedule-driven
+/// Five PR reviews (Codex, four P1 and one P2) found real gaps here. Three
+/// were successive attempts at this rule, and two more were found in the
+/// fourth attempt. A persisted "record at start time" cannot cover a
+/// schedule-driven
 /// execution, or one that predates the record. Comparing a start time to
 /// a cutover timestamp fails when a Temporal slot fires late. A record
 /// written once goes stale, too: `WorkflowIdReusePolicy` lets a new
@@ -344,6 +354,10 @@ fn dual_run_playbook_covers_schedule_driven_cutover() {
 /// harvest already ships (issue #805). That resolution assumes a workflow
 /// id is active on at most one engine at a time. The by-id family also
 /// covers signals, queries, and cancellations only, not updates.
+///
+/// Applying the resolved-engine language to step 7's forward handoff also
+/// named the wrong engine for its final read. That execution never ran on
+/// harvest at all.
 #[test]
 fn dual_run_playbook_covers_follow_up_engine_routing() {
     let guide = read_doc(GUIDE_PATH);
@@ -398,6 +412,13 @@ fn dual_run_playbook_covers_follow_up_engine_routing() {
         playbook.contains("no engine left to resolve"),
         "step 7's final read must be carved out from the general routing rule: it targets a \
          known-terminal execution, not an unresolved one (issue #1219, PR #1473 Codex P1)"
+    );
+    assert!(
+        playbook.contains("For this forward handoff, that is Temporal")
+            && playbook.contains("Read it directly from Temporal"),
+        "step 7's forward handoff drains an execution that only ever ran on Temporal -- the \
+         cancel and the final read must resolve to Temporal, not to harvest, which does not \
+         have this execution yet (issue #1219, PR #1473 Codex P1)"
     );
 }
 
