@@ -26,6 +26,9 @@ const API_VERSION: &str = "2023-06-01";
 /// model by category, so one refusal does not end the session. Remove this
 /// header and the `fallbacks` field together to turn the behaviour off.
 const FALLBACK_BETA: &str = "server-side-fallback-2026-07-01";
+/// The `stop_reason` of a turn that stopped to call a tool.
+const STOP_TOOL_USE: &str = "tool_use";
+
 /// The default model. Adaptive thinking is on by default on this model.
 pub const DEFAULT_MODEL: &str = "claude-opus-5";
 /// The default output cap for a non-streaming request.
@@ -282,6 +285,13 @@ pub fn has_addressable_calls(reply: &TurnReply) -> bool {
 /// the block types. A block type this example does not know about therefore
 /// still passes, instead of failing a session the model handled correctly.
 pub fn is_usable(reply: &TurnReply) -> bool {
+    // A turn that stopped TO CALL A TOOL must carry one. A malformed
+    // `{"content":[null],"stop_reason":"tool_use"}` would otherwise pass,
+    // merely because its stop reason is not `end_turn`. The loop then takes
+    // its no-tool-calls branch and reports a finished session.
+    if reply.stop_reason == STOP_TOOL_USE {
+        return !reply.tool_calls.is_empty();
+    }
     !reply.text.is_empty() || !reply.tool_calls.is_empty() || reply.stop_reason != "end_turn"
 }
 

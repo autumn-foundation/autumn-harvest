@@ -962,11 +962,23 @@ fn a_turn_that_says_nothing_is_not_an_answer() {
     // A stop reason that speaks for itself needs no content.
     let refused = TurnReply {
         stop_reason: "refusal".to_string(),
-        ..empty
+        ..empty.clone()
     };
     assert!(
         claude::is_usable(&refused),
         "a refusal reports itself and must not be re-classified"
+    );
+
+    // A turn that stopped TO CALL A TOOL must carry one. Otherwise the loop
+    // takes its no-tool-calls branch and reports a finished session.
+    let promised = TurnReply {
+        content: json!([null]),
+        stop_reason: "tool_use".to_string(),
+        ..empty
+    };
+    assert!(
+        !claude::is_usable(&promised),
+        "a `tool_use` turn with no call is not usable"
     );
 }
 

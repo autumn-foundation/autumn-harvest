@@ -278,6 +278,12 @@ Honest limits, so nothing here reads as a promise:
   `--socket` with different databases, two daemons starting at once can both
   find the socket stale, and the loser ends up running but unreachable. Give
   each daemon its own `--socket`.
+- **An atomic write replaces the file, so it replaces its owner.** The rename
+  that makes a write all-or-nothing installs a new inode, which the daemon
+  owns. Its mode is carried over, but an unprivileged process cannot give a
+  file back to another user, so a workspace shared between users is not a good
+  fit. Writing in place would keep the owner and lose the atomicity; this
+  example keeps the atomicity.
 - **The socket file outlives the daemon.** Shutdown does not unlink it: no
   check can prove a public pathname still names *this* daemon's socket, and
   deleting someone else's is worse than leaving a stale one. The next start
