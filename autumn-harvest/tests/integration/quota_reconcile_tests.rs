@@ -387,9 +387,9 @@ async fn workflow_type_with_no_declared_policy_is_never_a_candidate() {
     // non-empty (not the zero-registrations early exit, covered
     // separately by `zero_registered_policies_anywhere_skips_the_scan_
     // entirely`). `workflow_name` itself is absent from the registered
-    // set, so `CANDIDATE_SQL`'s `workflow_name = ANY($1)` filter excludes
-    // this row from the scan entirely -- it is never fetched, not
-    // fetched-then-classified `NoPolicy`. That is what stops a mixed
+    // set. `CANDIDATE_SQL`'s `workflow_name = ANY($1)` filter therefore
+    // excludes this row from the scan entirely -- it is never fetched,
+    // not fetched-then-classified `NoPolicy`. That is what stops a mixed
     // deployment from re-fetching every no-policy row's JSON input on
     // every tick forever.
     let other_workflow_name = leaked("wf_has_policy");

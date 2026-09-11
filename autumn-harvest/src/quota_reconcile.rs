@@ -246,13 +246,13 @@ struct CandidateRow {
 ///
 /// `workflow_name = ANY($1)` restricts the scan to workflow types with a
 /// currently-registered `QuotaPolicy` (see
-/// [`registered_quota_workflow_names`]). Without it, a mixed deployment
-/// (some workflow types quota'd, others not) would re-fetch every
-/// no-policy row's JSON input on every tick forever, since a `NoPolicy`
-/// row never sets `quota_key` and so never leaves the index. `$1` is
-/// re-read from the live registry on every call, so a policy declared
-/// mid-uptime (or removed) takes effect on the very next tick, not just
-/// at the next restart.
+/// [`registered_quota_workflow_names`]). A `NoPolicy` row never sets
+/// `quota_key`, so it never leaves the index on its own. Without this
+/// filter, a mixed deployment (some workflow types quota'd, others not)
+/// would re-fetch every no-policy row's JSON input on every tick,
+/// forever. `$1` is re-read from the live registry on every call. A
+/// policy declared mid-uptime, or removed, therefore takes effect on
+/// the very next tick, not just at the next restart.
 ///
 /// `AND ($2::uuid IS NULL OR id > $2) ORDER BY id LIMIT $3` is a keyset
 /// cursor, not a bare `LIMIT`. A row this sweep can never resolve --
@@ -303,10 +303,10 @@ fn registered_quota_policy(workflow_name: &str) -> Option<QuotaPolicy> {
 ///
 /// [`reconcile_quota_keys_from`] binds this as `CANDIDATE_SQL`'s
 /// `workflow_name = ANY($1)` filter, so a workflow type with no declared
-/// policy is never a candidate at all. Without it, a mixed deployment
-/// (some workflow types quota'd, others not) would re-fetch every
-/// no-policy row forever: `NoPolicy` never sets `quota_key`, so nothing
-/// ever shrinks the index for those rows.
+/// policy is never a candidate at all. `NoPolicy` never sets
+/// `quota_key`, so nothing ever shrinks the index for those rows.
+/// Without this filter, a mixed deployment (some workflow types
+/// quota'd, others not) would re-fetch every no-policy row forever.
 ///
 /// An empty result means the scan itself should be skipped entirely
 /// (`workflow_name = ANY('{}')` matches nothing, but issuing that query
