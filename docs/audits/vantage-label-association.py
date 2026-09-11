@@ -10,9 +10,13 @@ Vantage has no client-side JavaScript for this: an `<input>`/`<select>`/
 either a `for="…"` attribute pointing at the control's `id`, or a
 `<label>` that wraps the control as a descendant (the implicit-association
 form, valid per the HTML spec without any `for`/`id` pair at all). Every
-`label { … }` block in this file uses the wrapping form — `for="` does not
-appear anywhere in `ui.rs` — so the audit's job is narrow: for each
-`label`, does its own rendered block contain a labelable control?
+`label { … }` block in this file uses the wrapping form today — `for="`
+does not appear anywhere in `ui.rs` — but the audit checks both paths, and
+checks the `for` path for real: a `for="typo"` next to an `id="actual"`
+resolves to nothing in a browser, so a bare "the attribute is present"
+check would pass a label that is still broken. The audit collects every
+literal `id="…"` on a labelable control in the file and only counts a
+`for` as valid when its value is one of them.
 
 A `label` that only sits *next to* its control (siblings under the same
 `form`, not parent/child) associates with nothing. A screen reader then
@@ -51,12 +55,36 @@ ATTR = r'\s+[\w-]+\s*=\s*(?:"[^"]*"|\([^()]*\))'
 LABEL_OPEN = re.compile(rf"(?<![\w-])label\b((?:{ATTR})*)\s*\{{")
 
 # An explicit association: `for="some-id"` on the label's own opening tag.
-FOR_ATTR = re.compile(r'(?<![\w-])for\s*=\s*"[^"]+"')
+# Captures the target id so it can be checked against a real control below --
+# a `for` naming no control on the page (a typo, a stale rename) associates
+# with nothing, exactly like having no `for` at all.
+FOR_ATTR = re.compile(r'(?<![\w-])for\s*=\s*"([^"]+)"')
 
 # A labelable control anywhere inside the label's block, as a real element
 # (word boundary before the tag name, so `textinput_helper` or similar
 # never matches).
 CONTROL = re.compile(r"(?<![\w.-])(input|select|textarea)\b")
+
+# A labelable control's own opening tag, from the tag name to the `;` that
+# self-closes it (`input`) or the `{` that starts its block (`select`,
+# `textarea`) -- mirrors LABEL_OPEN's brace-based scan, but a control can
+# also self-close, so both terminators are accepted.
+CONTROL_OPEN = re.compile(r"(?<![\w.-])(?:input|select|textarea)\b[^;{]*?[;{]")
+
+# A literal `id="…"` on a control's own opening tag. Only a literal is
+# resolvable statically; a computed `id=(expr)` cannot be, so a `for`
+# pointing at one is never counted as resolved -- unverifiable is not the
+# same as verified.
+ID_ATTR = re.compile(r'(?<![\w-])id\s*=\s*"([^"]+)"')
+
+
+def control_ids(src: str) -> set[str]:
+    ids = set()
+    for m in CONTROL_OPEN.finditer(src):
+        id_match = ID_ATTR.search(m.group(0))
+        if id_match:
+            ids.add(id_match.group(1))
+    return ids
 
 
 def line_of(src: str, index: int) -> int:
@@ -111,6 +139,7 @@ def blank_style_block(src: str) -> str:
 
 def main():
     src = blank_style_block(UI_RS.read_text())
+    ids = control_ids(src)
 
     sites = []
     for m in LABEL_OPEN.finditer(src):
@@ -119,7 +148,8 @@ def main():
         block_end = find_block_end(src, open_brace)
         block_text = src[open_brace:block_end]
 
-        has_for = bool(FOR_ATTR.search(open_tag_attrs))
+        for_match = FOR_ATTR.search(open_tag_attrs)
+        has_for = bool(for_match) and for_match.group(1) in ids
         has_control = bool(CONTROL.search(block_text))
         sites.append((line_of(src, m.start()), has_for, has_control))
 
