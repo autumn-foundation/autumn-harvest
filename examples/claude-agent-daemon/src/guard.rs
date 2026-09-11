@@ -23,9 +23,17 @@
 //! which is a separate domain, so this lock never contends with the engine.
 
 use std::fs::{File, OpenOptions};
+use std::os::unix::fs::OpenOptionsExt;
 use std::path::Path;
 
-use rustix::fs::{FlockOperation, flock};
+use rustix::fs::{FlockOperation, Mode, flock};
+use rustix::process::umask;
+
+/// The mode a new database and its sidecars are created with.
+const PRIVATE_MODE: u32 = 0o600;
+
+/// The mask that yields [`PRIVATE_MODE`] for anything created under it.
+const PRIVATE_UMASK: u32 = 0o177;
 
 /// The lock one daemon holds for the life of its process.
 ///
@@ -50,6 +58,12 @@ pub fn acquire(db: &Path) -> Result<DaemonLock, String> {
         .read(true)
         .write(true)
         .truncate(false)
+        // The database holds every prompt, tool input, and tool result, which
+        // includes the content of each file the agent read. It is at least as
+        // sensitive as the control socket, so it is private from the moment it
+        // exists. The mode applies at CREATION only, so an existing database
+        // keeps whatever the operator chose for it.
+        .mode(PRIVATE_MODE)
         .open(db)
         .map_err(|e| format!("cannot open {}: {e}", db.display()))?;
 
@@ -63,4 +77,17 @@ pub fn acquire(db: &Path) -> Result<DaemonLock, String> {
     })?;
 
     Ok(DaemonLock { _file: file })
+}
+
+/// Run `f` with a mask that makes everything it creates owner-only.
+///
+/// `SQLite` creates the `-wal` and `-shm` sidecars itself, and the control
+/// socket is created by the listener. Neither takes a mode from this code, so
+/// the mask is what makes them private. It does so AT CREATION, leaving no
+/// window in which another local user can open them.
+pub fn with_private_umask<T>(f: impl FnOnce() -> T) -> T {
+    let previous = umask(Mode::from_bits_truncate(PRIVATE_UMASK));
+    let result = f();
+    umask(previous);
+    result
 }

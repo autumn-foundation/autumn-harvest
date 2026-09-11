@@ -19,8 +19,6 @@ use std::time::Duration;
 
 use autumn_harvest_sqlite::{ExecutionId, RunState, SqliteRuntime};
 use rusqlite::Connection;
-use rustix::fs::Mode;
-use rustix::process::umask;
 use serde_json::Value;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
@@ -37,9 +35,6 @@ use crate::tools;
 
 /// How many control commands may queue while the runtime is busy.
 const COMMAND_BACKLOG: usize = 32;
-
-/// The mask that makes the control socket owner-only (`0600`).
-const SOCKET_UMASK: u32 = 0o177;
 
 /// Everything the daemon needs to start.
 pub struct Options {
@@ -117,7 +112,9 @@ pub async fn serve(options: Options) -> Result<(), String> {
 
     // Opening the file applies the schema and reclaims any task a previous
     // process left RUNNING. In-flight sessions resume by replay from here.
-    let mut runtime = SqliteRuntime::open(&options.db)
+    // The `-wal` and `-shm` sidecars are created by `SQLite`, and they carry
+    // the same data as the database. The mask makes them private too.
+    let mut runtime = guard::with_private_umask(|| SqliteRuntime::open(&options.db))
         .map_err(|e| format!("cannot open {}: {e}", options.db.display()))?;
     runtime.register_workflow(&session::agent_session_info());
     runtime.register_activity(&session::claude_turn_info(), claude::activity_body(model));
@@ -205,10 +202,8 @@ pub async fn bind(socket: &Path) -> Result<UnixListener, String> {
             .map_err(|e| format!("cannot remove the stale socket {}: {e}", socket.display()))?;
     }
 
-    let previous = umask(Mode::from_bits_truncate(SOCKET_UMASK));
-    let listener = UnixListener::bind(socket);
-    umask(previous);
-    listener.map_err(|e| format!("cannot listen on {}: {e}", socket.display()))
+    guard::with_private_umask(|| UnixListener::bind(socket))
+        .map_err(|e| format!("cannot listen on {}: {e}", socket.display()))
 }
 
 /// Accept connections and forward each request to the main loop.

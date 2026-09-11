@@ -821,3 +821,71 @@ fn a_billed_response_that_is_not_a_message_is_refused() {
     ));
     assert!(refused.non_retryable, "a billed malformed body is terminal");
 }
+
+#[test]
+fn a_new_database_and_its_sidecars_are_owner_only() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = tempfile::tempdir().expect("a temporary directory");
+    let db = dir.path().join("agentd.db");
+
+    // The database holds every prompt and every tool result, so it is at least
+    // as sensitive as the control socket.
+    let held = guard::acquire(&db).expect("the lock is taken");
+    let mode = std::fs::metadata(&db)
+        .expect("the database exists")
+        .permissions()
+        .mode()
+        & 0o777;
+    assert_eq!(mode, 0o600, "a new database must be owner-only");
+    drop(held);
+
+    // The `-wal` and `-shm` sidecars carry the same data, and `SQLite` creates
+    // them itself, so the mask is what makes them private.
+    let runtime = guard::with_private_umask(|| SqliteRuntime::open(&db));
+    drop(runtime.expect("the runtime opens"));
+    for sidecar in ["agentd.db-wal", "agentd.db-shm"] {
+        let path = dir.path().join(sidecar);
+        if let Ok(meta) = std::fs::metadata(&path) {
+            assert_eq!(
+                meta.permissions().mode() & 0o777,
+                0o600,
+                "{sidecar} must be owner-only"
+            );
+        }
+    }
+}
+
+#[test]
+fn the_toolbox_refuses_a_named_pipe_without_blocking_on_it() {
+    use std::ffi::CString;
+
+    let dir = tempfile::tempdir().expect("a temporary directory");
+    let workspace = dir.path().to_path_buf();
+    let fifo = workspace.join("pipe");
+
+    let path = CString::new(fifo.to_string_lossy().as_bytes()).expect("a C path");
+    // SAFETY: `path` is a valid, NUL-terminated C string that lives across the
+    // call, and `mkfifo` only reads it.
+    let made = unsafe { libc::mkfifo(path.as_ptr(), 0o600) };
+    assert_eq!(made, 0, "the test fixture needs a FIFO");
+
+    // A FIFO with no writer blocks a plain open. One runtime serves every
+    // session, so a blocked body would wedge the whole daemon.
+    let body = tools::activity_body(workspace.clone());
+    for tool in [tools::TOOL_READ_FILE, tools::TOOL_WRITE_FILE] {
+        let raw = body(tool_request(
+            &workspace,
+            tool,
+            json!({ "path": "pipe", "content": "x" }),
+        ))
+        .expect("a tool failure is a result, not an activity error");
+        let outcome: ToolOutcome = serde_json::from_value(raw).expect("the outcome decodes");
+        assert!(outcome.is_error, "{tool} must refuse a FIFO");
+        assert!(
+            outcome.output.contains("not an ordinary file"),
+            "unexpected message from {tool}: {}",
+            outcome.output
+        );
+    }
+}

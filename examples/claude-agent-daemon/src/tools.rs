@@ -9,6 +9,7 @@
 //! the rest of the disk.
 
 use std::io::Read;
+use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Component, Path, PathBuf};
 
 use serde_json::{Value, json};
@@ -243,7 +244,12 @@ fn list_files(workspace: &Path, relative: &str) -> Result<String, String> {
 /// matters because the file can grow between the two steps.
 fn read_file(workspace: &Path, relative: &str) -> Result<String, String> {
     let path = resolve(workspace, relative)?;
-    let size = std::fs::metadata(&path)
+    let file = open_regular(&path, relative)?;
+
+    // The size comes from the OPEN descriptor, so it describes the file that
+    // was opened rather than whatever the path named a moment earlier.
+    let size = file
+        .metadata()
         .map_err(|e| format!("cannot read `{relative}`: {e}"))?
         .len();
     if size > MAX_FILE_BYTES as u64 {
@@ -252,7 +258,6 @@ fn read_file(workspace: &Path, relative: &str) -> Result<String, String> {
         ));
     }
 
-    let file = std::fs::File::open(&path).map_err(|e| format!("cannot read `{relative}`: {e}"))?;
     let mut bytes = Vec::new();
     file.take(MAX_FILE_BYTES as u64 + 1)
         .read_to_end(&mut bytes)
@@ -266,12 +271,51 @@ fn read_file(workspace: &Path, relative: &str) -> Result<String, String> {
     String::from_utf8(bytes).map_err(|_| format!("`{relative}` is not UTF-8 text"))
 }
 
+/// Open a path for reading, and prove it is an ordinary file.
+///
+/// Two flags carry the safety here. `O_NOFOLLOW` refuses a symbolic link at the
+/// final component, even one that appears between the check and this open.
+/// `O_NONBLOCK` stops a FIFO from blocking the open itself. A named pipe with
+/// no writer would otherwise hang this body, and with it the whole daemon. One
+/// runtime serves every session and every command.
+///
+/// The file type is then read from the descriptor, so the answer describes what
+/// was opened and cannot be swapped afterwards.
+fn open_regular(path: &Path, relative: &str) -> Result<std::fs::File, String> {
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc_o_nofollow() | libc_o_nonblock())
+        .open(path)
+        .map_err(|e| format!("cannot read `{relative}`: {e}"))?;
+
+    let kind = file
+        .metadata()
+        .map_err(|e| format!("cannot read `{relative}`: {e}"))?
+        .file_type();
+    if !kind.is_file() {
+        return Err(format!("`{relative}` is not an ordinary file"));
+    }
+    Ok(file)
+}
+
+/// `O_NOFOLLOW`, from the platform's own headers.
+const fn libc_o_nofollow() -> i32 {
+    rustix::fs::OFlags::NOFOLLOW.bits().cast_signed()
+}
+
+/// `O_NONBLOCK`, from the platform's own headers.
+const fn libc_o_nonblock() -> i32 {
+    rustix::fs::OFlags::NONBLOCK.bits().cast_signed()
+}
+
 /// Write one text file, creating the parent directories.
 ///
 /// The body is idempotent: the same call writes the same bytes. That matters
 /// because activity execution is at-least-once. A crash between the write and
 /// its commit re-runs this body on resume.
 fn write_file(workspace: &Path, relative: &str, content: &str) -> Result<String, String> {
+    use std::io::Write;
+
     if content.len() > MAX_FILE_BYTES {
         return Err(format!(
             "the content is {} bytes; the limit is {MAX_FILE_BYTES}",
@@ -279,10 +323,30 @@ fn write_file(workspace: &Path, relative: &str, content: &str) -> Result<String,
         ));
     }
     let path = resolve(workspace, relative)?;
+
+    // An existing target must be an ordinary file. A FIFO would block this
+    // body, and with it the whole daemon, and a device is not something a tool
+    // call should write through.
+    if std::fs::symlink_metadata(&path).is_ok_and(|existing| !existing.file_type().is_file()) {
+        return Err(format!("`{relative}` is not an ordinary file"));
+    }
+
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)
             .map_err(|e| format!("cannot create the parent of `{relative}`: {e}"))?;
     }
-    std::fs::write(&path, content).map_err(|e| format!("cannot write `{relative}`: {e}"))?;
+
+    // `O_NOFOLLOW` again: the final component must not be a link, even one
+    // that appears after the check above.
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .custom_flags(libc_o_nofollow())
+        .open(&path)
+        .map_err(|e| format!("cannot write `{relative}`: {e}"))?;
+    file.write_all(content.as_bytes())
+        .map_err(|e| format!("cannot write `{relative}`: {e}"))?;
+
     Ok(format!("wrote {} bytes to `{relative}`", content.len()))
 }

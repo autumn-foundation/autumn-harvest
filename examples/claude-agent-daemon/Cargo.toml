@@ -28,6 +28,8 @@ tracing = { workspace = true }
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 [dev-dependencies]
+# `mkfifo`, to build the special-file the toolbox must refuse.
+libc = "0.2"
 tempfile = "3"
 
 [lints]

@@ -23,9 +23,10 @@ With no `ANTHROPIC_API_KEY` set, the daemon registers a small **offline stub
 model** instead of calling the API. The stub drives the same loop: it lists the
 workspace, proposes one file write (which needs your approval), and answers.
 
+Run these from the repository root — Cargo needs the workspace manifest:
+
 ```bash
-mkdir -p /tmp/agent-demo && cd /tmp/agent-demo
-echo '# Demo project' > README.md && cd ..
+mkdir -p /tmp/agent-demo && echo '# Demo project' > /tmp/agent-demo/README.md
 
 cargo run -p claude-agent-daemon -- serve --workspace /tmp/agent-demo &
 
@@ -113,6 +114,11 @@ never reads as a clean one: `end_turn` is a finished answer, `max_tokens` means
 the turn hit the output cap and the answer is cut short (raise `--max-tokens`),
 and `refusal` means a classifier declined the request.
 
+**The database is owner-only too.** It holds every prompt, tool input, and tool
+result, including the content of each file the agent read — so a new database
+is created `0600`, and the `-wal` and `-shm` sidecars are created under a
+narrowed umask. An existing database keeps whatever mode the operator gave it.
+
 **The control socket is owner-only.** Whoever can connect can spend money and
 approve writes with the daemon's privileges, so the socket is created `0600`
 under a narrowed umask — private at creation, with no window to connect
@@ -189,13 +195,13 @@ is ever approved sight unseen.
 cargo test -p claude-agent-daemon
 ```
 
-Eighteen tests, all offline: the happy path, a denied tool call, the restart
-proof, the workspace sandbox (two symlink escapes and the read cap), a
-truncated turn, a stale approval, the full approval view, a session bound to
-another workspace and to another model, the single-writer lock through every
-alias, the socket's privacy, the drive interval, which API failures may be
-retried, a billed response that is not a message, and one end-to-end run
-through the daemon socket.
+Twenty tests, all offline: the happy path, a denied tool call, the restart
+proof, the workspace sandbox (two symlink escapes, the read cap, and a named
+pipe), a truncated turn, a stale approval, the full approval view, a session
+bound to another workspace and to another model, the single-writer lock through
+every alias, the database and socket permissions, the drive interval, which API
+failures may be retried, a billed response that is not a message, and one
+end-to-end run through the daemon socket.
 
 ## What this example does not do
 
@@ -232,6 +238,15 @@ Honest limits, so nothing here reads as a promise:
   not retried at all, since a retry there would be charged again for certain. A
   rate limit or a server fault produced no turn, so those still back off and
   retry as the policy says.
+- **The workspace is confined, not sandboxed.** The toolbox refuses a path
+  that escapes, a symbolic link at the final component (`O_NOFOLLOW` on the
+  open, so a link appearing after the check loses too), and anything that is
+  not an ordinary file. What it does not do is traverse through opened
+  directory descriptors, so a *concurrent local process* that swaps a parent
+  directory for a symlink mid-call can still win that race. Closing it needs
+  `openat`-based traversal, which is more machinery than an example should
+  carry. The model is the untrusted party here, and it cannot win that race;
+  another process running as you already can do worse directly.
 - **Unix only.** The control surface is a Unix domain socket, so the daemon
   runs on Linux and macOS. A Windows port needs a named pipe or a TCP port.
 - **The offline stub is not Claude.** It exists so the durability story is

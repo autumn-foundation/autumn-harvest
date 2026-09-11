@@ -1425,6 +1425,7 @@ dependencies = [
  "autumn-harvest",
  "autumn-harvest-sqlite",
  "clap",
+ "libc",
  "reqwest",
  "rusqlite",
  "rustix 1.1.4",
