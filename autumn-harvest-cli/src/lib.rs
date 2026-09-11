@@ -8014,22 +8014,7 @@ fn format_usage_table(value: &Value) -> String {
         ]);
     }
 
-    let widths = (0..rows[0].len())
-        .map(|col| rows.iter().map(|row| row[col].len()).max().unwrap_or(0))
-        .collect::<Vec<_>>();
-    let table = rows
-        .iter()
-        .map(|row| {
-            row.iter()
-                .enumerate()
-                .map(|(col, cell)| format!("{cell:<width$}", width = widths[col]))
-                .collect::<Vec<_>>()
-                .join("  ")
-                .trim_end()
-                .to_string()
-        })
-        .collect::<Vec<_>>()
-        .join("\n");
+    let table = render_table(&rows);
 
     format!("{summary}\n\n{table}")
 }
@@ -8130,22 +8115,7 @@ fn format_dlq_aggregate_table(value: &Value) -> String {
         rows.push(row);
     }
 
-    let widths = (0..rows[0].len())
-        .map(|col| rows.iter().map(|row| row[col].len()).max().unwrap_or(0))
-        .collect::<Vec<_>>();
-    let table = rows
-        .iter()
-        .map(|row| {
-            row.iter()
-                .enumerate()
-                .map(|(col, cell)| format!("{cell:<width$}", width = widths[col]))
-                .collect::<Vec<_>>()
-                .join("  ")
-                .trim_end()
-                .to_string()
-        })
-        .collect::<Vec<_>>()
-        .join("\n");
+    let table = render_table(&rows);
 
     let mut summary = format!("total: {total}  filtered: {filtered}");
     if truncated {
@@ -8196,21 +8166,7 @@ fn format_rate_limit_table(value: &Value) -> String {
         ]);
     }
 
-    let widths = (0..rows[0].len())
-        .map(|col| rows.iter().map(|row| row[col].len()).max().unwrap_or(0))
-        .collect::<Vec<_>>();
-    rows.iter()
-        .map(|row| {
-            row.iter()
-                .enumerate()
-                .map(|(col, cell)| format!("{cell:<width$}", width = widths[col]))
-                .collect::<Vec<_>>()
-                .join("  ")
-                .trim_end()
-                .to_string()
-        })
-        .collect::<Vec<_>>()
-        .join("\n")
+    render_table(&rows)
 }
 
 fn format_f64(value: Option<&Value>) -> String {
@@ -8374,22 +8330,7 @@ fn format_canary_table(value: &Value) -> String {
             ]);
         }
 
-        let widths = (0..rows[0].len())
-            .map(|col| rows.iter().map(|row| row[col].len()).max().unwrap_or(0))
-            .collect::<Vec<_>>();
-        let table = rows
-            .iter()
-            .map(|row| {
-                row.iter()
-                    .enumerate()
-                    .map(|(col, cell)| format!("{cell:<width$}", width = widths[col]))
-                    .collect::<Vec<_>>()
-                    .join("  ")
-                    .trim_end()
-                    .to_string()
-            })
-            .collect::<Vec<_>>()
-            .join("\n");
+        let table = render_table(&rows);
 
         let _ = writeln!(out, "\nSummary by Workflow Type:\n{table}");
     }
@@ -8434,22 +8375,7 @@ fn format_canary_table(value: &Value) -> String {
             ]);
         }
 
-        let widths = (0..rows[0].len())
-            .map(|col| rows.iter().map(|row| row[col].len()).max().unwrap_or(0))
-            .collect::<Vec<_>>();
-        let table = rows
-            .iter()
-            .map(|row| {
-                row.iter()
-                    .enumerate()
-                    .map(|(col, cell)| format!("{cell:<width$}", width = widths[col]))
-                    .collect::<Vec<_>>()
-                    .join("  ")
-                    .trim_end()
-                    .to_string()
-            })
-            .collect::<Vec<_>>()
-            .join("\n");
+        let table = render_table(&rows);
 
         let _ = writeln!(out, "\nReplay Failures:\n{table}");
 
@@ -8599,22 +8525,7 @@ fn format_preflight_table(value: &Value) -> String {
         ]);
     }
 
-    let widths = (0..rows[0].len())
-        .map(|col| rows.iter().map(|row| row[col].len()).max().unwrap_or(0))
-        .collect::<Vec<_>>();
-    let table = rows
-        .iter()
-        .map(|row| {
-            row.iter()
-                .enumerate()
-                .map(|(col, cell)| format!("{cell:<width$}", width = widths[col]))
-                .collect::<Vec<_>>()
-                .join("  ")
-                .trim_end()
-                .to_string()
-        })
-        .collect::<Vec<_>>()
-        .join("\n");
+    let table = render_table(&rows);
 
     let findings = format_preflight_findings(checks);
     if findings.is_empty() {
@@ -8722,22 +8633,7 @@ fn format_shard_health_table(value: &Value) -> String {
         ]);
     }
 
-    let widths = (0..rows[0].len())
-        .map(|col| rows.iter().map(|row| row[col].len()).max().unwrap_or(0))
-        .collect::<Vec<_>>();
-    let table = rows
-        .iter()
-        .map(|row| {
-            row.iter()
-                .enumerate()
-                .map(|(col, cell)| format!("{cell:<width$}", width = widths[col]))
-                .collect::<Vec<_>>()
-                .join("  ")
-                .trim_end()
-                .to_string()
-        })
-        .collect::<Vec<_>>()
-        .join("\n");
+    let table = render_table(&rows);
 
     format!("overall_readiness: {overall}\nobserved_at: {observed_at}\n\n{table}")
 }
@@ -8788,22 +8684,7 @@ fn format_version_usage_table(value: &Value) -> String {
         ]);
     }
 
-    let widths = (0..rows[0].len())
-        .map(|col| rows.iter().map(|row| row[col].len()).max().unwrap_or(0))
-        .collect::<Vec<_>>();
-    let table = rows
-        .iter()
-        .map(|row| {
-            row.iter()
-                .enumerate()
-                .map(|(col, cell)| format!("{cell:<width$}", width = widths[col]))
-                .collect::<Vec<_>>()
-                .join("  ")
-                .trim_end()
-                .to_string()
-        })
-        .collect::<Vec<_>>()
-        .join("\n");
+    let table = render_table(&rows);
 
     format!("status: {status}\nobserved_at: {observed_at}\n\n{table}")
 }
@@ -9011,22 +8892,7 @@ fn format_workflow_reachability_table(value: &Value) -> String {
         ]);
     }
 
-    let widths = (0..rows[0].len())
-        .map(|col| rows.iter().map(|row| row[col].len()).max().unwrap_or(0))
-        .collect::<Vec<_>>();
-    let table = rows
-        .iter()
-        .map(|row| {
-            row.iter()
-                .enumerate()
-                .map(|(col, cell)| format!("{cell:<width$}", width = widths[col]))
-                .collect::<Vec<_>>()
-                .join("  ")
-                .trim_end()
-                .to_string()
-        })
-        .collect::<Vec<_>>()
-        .join("\n");
+    let table = render_table(&rows);
 
     let unavailable = value
         .get("shards")
@@ -9142,22 +9008,7 @@ fn format_activity_list_table(value: &Value) -> String {
         ]);
     }
 
-    let widths = (0..rows[0].len())
-        .map(|col| rows.iter().map(|row| row[col].len()).max().unwrap_or(0))
-        .collect::<Vec<_>>();
-    let table = rows
-        .iter()
-        .map(|row| {
-            row.iter()
-                .enumerate()
-                .map(|(col, cell)| format!("{cell:<width$}", width = widths[col]))
-                .collect::<Vec<_>>()
-                .join("  ")
-                .trim_end()
-                .to_string()
-        })
-        .collect::<Vec<_>>()
-        .join("\n");
+    let table = render_table(&rows);
 
     format!("status: {status}\n\n{table}")
 }
@@ -9333,22 +9184,7 @@ fn format_queue_coverage_table(value: &Value) -> String {
         ]);
     }
 
-    let widths = (0..rows[0].len())
-        .map(|col| rows.iter().map(|row| row[col].len()).max().unwrap_or(0))
-        .collect::<Vec<_>>();
-    let table = rows
-        .iter()
-        .map(|row| {
-            row.iter()
-                .enumerate()
-                .map(|(col, cell)| format!("{cell:<width$}", width = widths[col]))
-                .collect::<Vec<_>>()
-                .join("  ")
-                .trim_end()
-                .to_string()
-        })
-        .collect::<Vec<_>>()
-        .join("\n");
+    let table = render_table(&rows);
 
     format!(
         "status: {status}\nobserved_at: {observed_at}\ntotal_uncovered_queues: {total_uncovered}\n\n{table}{footer}{paused_note}"
@@ -9531,22 +9367,7 @@ fn format_handoff_table(value: &Value) -> String {
         ]);
     }
 
-    let widths = (0..rows[0].len())
-        .map(|col| rows.iter().map(|row| row[col].len()).max().unwrap_or(0))
-        .collect::<Vec<_>>();
-    let table = rows
-        .iter()
-        .map(|row| {
-            row.iter()
-                .enumerate()
-                .map(|(col, cell)| format!("{cell:<width$}", width = widths[col]))
-                .collect::<Vec<_>>()
-                .join("  ")
-                .trim_end()
-                .to_string()
-        })
-        .collect::<Vec<_>>()
-        .join("\n");
+    let table = render_table(&rows);
 
     let coverage = coverage.map_or_else(String::new, handoff_coverage_summary);
     if coverage.is_empty() {
@@ -9615,22 +9436,7 @@ fn format_workflow_children_table(value: &Value) -> String {
         ]);
     }
 
-    let widths = (0..rows[0].len())
-        .map(|col| rows.iter().map(|row| row[col].len()).max().unwrap_or(0))
-        .collect::<Vec<_>>();
-    let mut rendered = rows
-        .iter()
-        .map(|row| {
-            row.iter()
-                .enumerate()
-                .map(|(col, cell)| format!("{cell:<width$}", width = widths[col]))
-                .collect::<Vec<_>>()
-                .join("  ")
-                .trim_end()
-                .to_string()
-        })
-        .collect::<Vec<_>>()
-        .join("\n");
+    let mut rendered = render_table(&rows);
 
     if let Some(cursor) = value.get("next_cursor").and_then(Value::as_str) {
         rendered.push_str("\nnext_cursor: ");
@@ -9669,22 +9475,7 @@ fn format_workflow_summaries_table(value: &Value) -> String {
         ]);
     }
 
-    let widths = (0..rows[0].len())
-        .map(|col| rows.iter().map(|row| row[col].len()).max().unwrap_or(0))
-        .collect::<Vec<_>>();
-    let mut rendered = rows
-        .iter()
-        .map(|row| {
-            row.iter()
-                .enumerate()
-                .map(|(col, cell)| format!("{cell:<width$}", width = widths[col]))
-                .collect::<Vec<_>>()
-                .join("  ")
-                .trim_end()
-                .to_string()
-        })
-        .collect::<Vec<_>>()
-        .join("\n");
+    let mut rendered = render_table(&rows);
 
     if let Some(cursor) = value.get("next_cursor").and_then(Value::as_str) {
         rendered.push_str("\nnext_cursor: ");
@@ -9905,22 +9696,7 @@ fn format_run_chain_table(value: &Value) -> String {
         ]);
     }
 
-    let widths = (0..rows[0].len())
-        .map(|col| rows.iter().map(|row| row[col].len()).max().unwrap_or(0))
-        .collect::<Vec<_>>();
-    let mut rendered = rows
-        .iter()
-        .map(|row| {
-            row.iter()
-                .enumerate()
-                .map(|(col, cell)| format!("{cell:<width$}", width = widths[col]))
-                .collect::<Vec<_>>()
-                .join("  ")
-                .trim_end()
-                .to_string()
-        })
-        .collect::<Vec<_>>()
-        .join("\n");
+    let mut rendered = render_table(&rows);
 
     if let Some(workflow_id) = value.get("workflow_id").and_then(Value::as_str) {
         rendered = format!("workflow_id: {workflow_id}\n{rendered}");
@@ -9974,6 +9750,13 @@ fn format_audit_table(value: &Value) -> String {
         ]);
     }
 
+    render_table(&rows)
+}
+
+/// Render rows as a column-aligned table. Each column takes the width of its
+/// widest cell. Two spaces separate columns, and trailing padding on each
+/// line is trimmed. Callers must pass at least one row (the header).
+fn render_table(rows: &[Vec<String>]) -> String {
     let widths = (0..rows[0].len())
         .map(|col| rows.iter().map(|row| row[col].len()).max().unwrap_or(0))
         .collect::<Vec<_>>();
@@ -12904,22 +12687,7 @@ fn format_retirement_check_table(value: &Value) -> String {
         ]);
     }
 
-    let widths = (0..rows[0].len())
-        .map(|col| rows.iter().map(|row| row[col].len()).max().unwrap_or(0))
-        .collect::<Vec<_>>();
-    let table = rows
-        .iter()
-        .map(|row| {
-            row.iter()
-                .enumerate()
-                .map(|(col, cell)| format!("{cell:<width$}", width = widths[col]))
-                .collect::<Vec<_>>()
-                .join("  ")
-                .trim_end()
-                .to_string()
-        })
-        .collect::<Vec<_>>()
-        .join("\n");
+    let table = render_table(&rows);
 
     format!("{header}\n\n{table}")
 }
@@ -16020,6 +15788,117 @@ mod usage_cli_tests {
         });
         let rendered = format_usage_table(&value);
         assert!(rendered.contains("No usage groups found."));
+    }
+
+    #[test]
+    fn render_table_pads_columns_to_their_widest_cell() {
+        let rows = vec![
+            vec!["A".to_string(), "BB".to_string()],
+            vec!["CCC".to_string(), "D".to_string()],
+        ];
+        assert_eq!(render_table(&rows), "A    BB\nCCC  D");
+    }
+
+    #[test]
+    fn render_table_trims_trailing_padding_on_each_line() {
+        let rows = vec![
+            vec!["A".to_string(), "B".to_string(), "C".to_string()],
+            vec![String::new(), String::new(), String::new()],
+        ];
+        assert_eq!(render_table(&rows), "A  B  C\n");
+    }
+
+    #[test]
+    fn render_table_handles_a_single_row() {
+        let rows = vec![vec!["HEADER".to_string()]];
+        assert_eq!(render_table(&rows), "HEADER");
+    }
+
+    #[test]
+    fn format_workflow_summaries_table_renders_rows_and_next_cursor() {
+        let value = serde_json::json!({
+            "summaries": [
+                {
+                    "execution_id": "exec-1",
+                    "workflow_name": "onboarding",
+                    "workflow_id": "wf-1",
+                    "state": "completed",
+                    "completed_at": "2026-05-18T00:00:00Z",
+                    "duration_ms": 4200,
+                    "shard_id": 3
+                }
+            ],
+            "next_cursor": "abc123"
+        });
+        let rendered = format_workflow_summaries_table(&value);
+        assert!(rendered.contains("EXEC ID"), "{rendered}");
+        assert!(rendered.contains("exec-1"), "{rendered}");
+        assert!(rendered.contains("onboarding"), "{rendered}");
+        assert!(rendered.ends_with("\nnext_cursor: abc123"), "{rendered}");
+    }
+
+    #[test]
+    fn format_workflow_summaries_table_reports_no_summaries() {
+        let value = serde_json::json!({ "summaries": [] });
+        assert_eq!(
+            format_workflow_summaries_table(&value),
+            "No execution summaries found."
+        );
+    }
+
+    #[test]
+    fn format_run_chain_table_renders_rows_workflow_id_and_head_unknown_note() {
+        let value = serde_json::json!({
+            "workflow_id": "wf-9",
+            "head_unknown": true,
+            "runs": [
+                {
+                    "sequence": 1,
+                    "exec_id": "exec-1",
+                    "run_id": "run-1",
+                    "state": "completed",
+                    "outcome": "success",
+                    "started_at": "2026-05-18T00:00:00Z",
+                    "completed_at": "2026-05-18T00:05:00Z",
+                    "continued_to_exec_id": "exec-2"
+                }
+            ]
+        });
+        let rendered = format_run_chain_table(&value);
+        assert!(rendered.starts_with("workflow_id: wf-9\n"), "{rendered}");
+        assert!(rendered.contains("exec-1"), "{rendered}");
+        assert!(rendered.contains("note: head_unknown"), "{rendered}");
+    }
+
+    #[test]
+    fn format_run_chain_table_reports_no_runs() {
+        let value = serde_json::json!({ "runs": [] });
+        assert_eq!(format_run_chain_table(&value), "No run chain found.");
+    }
+
+    #[test]
+    fn format_audit_table_renders_target_type_and_id_joined() {
+        let value = serde_json::json!([
+            {
+                "occurred_at": "2026-05-18T00:00:00Z",
+                "actor": "operator@example.com",
+                "operation": "pause",
+                "target_type": "workflow",
+                "target_id": "wf-1",
+                "status": "ok",
+                "source": "cli",
+                "error_summary": null
+            }
+        ]);
+        let rendered = format_audit_table(&value);
+        assert!(rendered.contains("workflow:wf-1"), "{rendered}");
+        assert!(rendered.contains("operator@example.com"), "{rendered}");
+    }
+
+    #[test]
+    fn format_audit_table_reports_no_records() {
+        let value = serde_json::json!([]);
+        assert_eq!(format_audit_table(&value), "No audit records found.");
     }
 }
 
