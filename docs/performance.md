@@ -829,20 +829,30 @@ under [`docs/perf-artifacts/pause-array-size/`](perf-artifacts/pause-array-size/
 reproducible via
 `autumn-harvest/scripts/pause_array_size_claim_perf_repro.sh`.
 
-| Predicate | Backlog | Worker's own `$2` | Array size | Sort method |
-|:--|--:|:--|--:|:--|
-| `paused_activities` (#807) | 1 000 | 4 queues | 0 / 1 / 20 | quicksort, in memory |
-| `paused_activities` (#807) | 1 000 | 4 queues | 199 | external merge, 6 368kB disk |
-| `paused_activities` (#807) | 10 000 | 4 queues | 0 / 1 | quicksort, in memory |
-| `paused_activities` (#807) | 10 000 | 4 queues | 20 | external merge, 7 504kB disk |
-| `paused_activities` (#807) | 10 000 | 4 queues | 199 | external merge, 63 656kB disk |
-| `paused_activities` (#807) | 100 000 | 4 queues | 0 | external merge, 15 280kB disk |
-| `paused_activities` (#807) | 100 000 | 4 queues | 1 | external merge, 18 432kB disk |
-| `paused_activities` (#807) | 100 000 | 4 queues | 20 | external merge, 74 992kB disk |
-| `paused_activities` (#807) | 100 000 | 4 queues | 199 | external merge, 635 488kB disk |
-| `paused_queues` (#619) | 10 000 | 4 queues (typical) | 0 / 1 / 20 / 199 | quicksort, in memory |
-| `paused_queues` (#619) | 10 000 | 203 queues (atypical) | 0 | quicksort, in memory |
-| `paused_queues` (#619) | 10 000 | 203 queues (atypical) | 199 | external merge, 40 704kB disk |
+| Predicate | Backlog | Worker's own `$2` | Ballast pauses seeded | `paused_*` array size | Sort method |
+|:--|--:|:--|--:|--:|:--|
+| `paused_activities` (#807) | 1 000 | 4 queues | 0 / 1 / 20 | 0 / 1 / 20 | quicksort, in memory |
+| `paused_activities` (#807) | 1 000 | 4 queues | 199 | 199 | external merge, 6 368kB disk |
+| `paused_activities` (#807) | 10 000 | 4 queues | 0 / 1 | 0 / 1 | quicksort, in memory |
+| `paused_activities` (#807) | 10 000 | 4 queues | 20 | 20 | external merge, 7 504kB disk |
+| `paused_activities` (#807) | 10 000 | 4 queues | 199 | 199 | external merge, 63 656kB disk |
+| `paused_activities` (#807) | 100 000 | 4 queues | 0 | 0 | external merge, 15 280kB disk |
+| `paused_activities` (#807) | 100 000 | 4 queues | 1 | 1 | external merge, 18 432kB disk |
+| `paused_activities` (#807) | 100 000 | 4 queues | 20 | 20 | external merge, 74 992kB disk |
+| `paused_activities` (#807) | 100 000 | 4 queues | 199 | 199 | external merge, 635 488kB disk |
+| `paused_queues` (#619) | 10 000 | 4 queues (typical) | 0 / 1 / 20 / 199 | 0 (none of these ballast queues are in `$2`) | quicksort, in memory |
+| `paused_queues` (#619) | 10 000 | 203 queues (atypical) | 0 | 0 | quicksort, in memory |
+| `paused_queues` (#619) | 10 000 | 203 queues (atypical) | 199 | 199 | external merge, 40 704kB disk |
+
+For `paused_activities`, ballast seeded and array size are always equal — it
+reads the whole table unconditionally, so nothing filters the array down.
+For `paused_queues`, they diverge exactly when `$2` excludes the ballast:
+the typical-worker rows above seed up to 199 pauses but never widen the
+array past zero, because `$2` (this worker's 4 polled queues) never
+includes any of the seeded names. The Sort Method column tracks array
+size, not ballast count, in every row — consistently zero disk cost while
+the array stays at zero, regardless of how large the underlying pause
+table grows.
 
 **`paused_activities` has no bound to protect it, and the array-size
 threshold that spills it is itself lower at greater backlog depth.** It
