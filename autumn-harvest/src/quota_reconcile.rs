@@ -262,10 +262,10 @@ struct CandidateRow {
 /// would re-fetch every no-policy row's JSON input on every tick,
 /// forever. `$1` is re-read from the live registry on every call. A
 /// policy declared mid-uptime, or removed, therefore takes effect
-/// starting with the very next tick, not just at the next restart. See
-/// this module's doc comment for exactly when a given ROW becomes
-/// visible: immediately if sorted ahead of the cursor, or at the next
-/// pass wrap if sorted behind it.
+/// starting with the very next tick, not just at the next restart.
+/// See this module's doc comment for exactly when a given ROW becomes
+/// visible. It is immediate if sorted ahead of the cursor, or waits for
+/// the next pass wrap if sorted behind it.
 ///
 /// KNOWN SCALING TRADE-OFF: this filter is a residual predicate, not an
 /// index seek. `idx_harvest_we_quota_reconcile_candidates` orders by
