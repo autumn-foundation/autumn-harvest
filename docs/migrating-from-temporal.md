@@ -406,10 +406,23 @@ your whole application.
    It misses one the schedule fires in that same gap. Pausing first
    closes both gaps. No new firing can start once Temporal is paused.
 
+   Temporal's own visibility can lag behind its executions. This lag is
+   real when the deployment uses an eventually consistent store for
+   it. A just-finished or just-started execution may not appear in the
+   list right away. Wait past that deployment's own indexing delay
+   before you trust the list as complete.
+
    Treat a follow-up against one of those captured ids as Temporal's,
    permanently, no matter what state that execution reached. Treat any
    other id of that type as harvest's. Only harvest's schedule can
    start a new one once Temporal is paused.
+
+   A rollback of a schedule-driven type reverses this capture. Pause
+   the harvest schedule first, then resume the Temporal Schedule.
+   Treat any id of that type started after this point as Temporal's,
+   since only Temporal's schedule can start one once harvest is
+   paused. The ids captured at the forward cutover keep the
+   classification they already have.
 
    Reconcile a record that names an engine with no matching execution.
    Query that engine's own resolution for the id. A miss there means
@@ -478,6 +491,15 @@ your whole application.
    waits for `COMPLETED` before starting the new execution. Apply the
    same discipline to any other reused id, including one reused across a
    rollback.
+
+   This check-then-start sequence has its own race. Two concurrent
+   requests for the same reused id can each observe no active run,
+   then each start on a different engine. Neither engine's own query
+   is transactional with the other, and neither is transactional with
+   your own start call. Serialize this sequence yourself. Take an
+   application-level lock keyed on `(workflow_name, workflow_id)`
+   before you query either engine, and hold it until your own start
+   call returns. Release it only then.
 
    A `cancel` signal routed to the wrong engine may not fail loudly. It
    can do nothing there, while the real execution stays un-cancelled.

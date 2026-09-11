@@ -292,6 +292,14 @@ fn comparison_page_links_back_to_the_migration_guide() {
 /// interval schedule's phase. `Schedule::Interval` computes its first
 /// slot from the creation moment, not from the original schedule's own
 /// phase.
+///
+/// A twelfth review found two more gaps, in the pause-then-list capture
+/// added for the schedule-driven-type routing record. Pausing first
+/// closes the two ordering gaps that review found. But a store behind
+/// Temporal's own visibility can still lag its executions. A query
+/// right after the pause can still omit one. The same capture also only
+/// ever ran forward, at cutover. A rollback resumes the Temporal
+/// Schedule, and nothing captured the ids it fires after that.
 #[test]
 fn dual_run_playbook_covers_schedule_driven_cutover() {
     let guide = read_doc(GUIDE_PATH);
@@ -345,6 +353,21 @@ fn dual_run_playbook_covers_schedule_driven_cutover() {
         playbook.contains("CatchupPolicy"),
         "the playbook must point to the catchup-policy primitive for the harvest schedule's \
          backlog decision (issue #484, issue #1219)"
+    );
+    assert!(
+        playbook.contains("Temporal's own visibility can lag behind its executions")
+            && playbook.contains("eventually consistent"),
+        "the playbook must warn that an eventually consistent Temporal visibility store can \
+         still omit a just-started or just-finished execution right after the pause, \
+         independent of the pause-then-list ordering fix (issue #1219, PR #1473 Codex P1)"
+    );
+    assert!(
+        playbook.contains("A rollback of a schedule-driven type reverses this capture")
+            && playbook.contains("resume the Temporal Schedule"),
+        "the playbook must cover the reverse direction of the schedule-driven capture: a \
+         rollback resumes the Temporal Schedule, and every id fired after that point must \
+         resolve to Temporal even though it postdates the forward-cutover snapshot \
+         (issue #1219, PR #1473 Codex P1)"
     );
 }
 
@@ -511,6 +534,14 @@ fn dual_run_playbook_covers_follow_up_engine_routing() {
 /// between resolving an id and using it. Also covered: the activity check
 /// a reused id needs before a new start. So is the negative flag-routing
 /// rule, and step 7's own handoff as a special case of the general rule.
+///
+/// A twelfth review found that activity check has its own race. Two
+/// concurrent requests for the same reused id can each pass it, then
+/// start on different engines. Querying both engines first does not
+/// serialize anything. Neither engine's query is transactional with
+/// the other one, or with the start. The fix names the gap. It asks
+/// the reader to hold their own lock around the whole check-then-start
+/// sequence instead.
 #[test]
 fn dual_run_playbook_covers_follow_up_resolution_mechanics() {
     let guide = read_doc(GUIDE_PATH);
@@ -551,6 +582,15 @@ fn dual_run_playbook_covers_follow_up_resolution_mechanics() {
         "the playbook must tell the reader to confirm the previous execution under a reused \
          id is not still active on its own engine, checking both engines, before starting a \
          new one elsewhere (issue #1219, PR #1473 Codex P1)"
+    );
+    assert!(
+        playbook.contains("This check-then-start sequence has its own race")
+            && playbook.contains("application-level lock"),
+        "the playbook must name the residual race in its own check-then-start sequence -- two \
+         concurrent requests for a reused id can each observe no active run and then start on \
+         different engines, since neither engine's query is transactional with the other or \
+         with the start call -- and tell the reader to serialize it with their own \
+         application-level lock (issue #1219, PR #1473 Codex P1)"
     );
     assert!(
         playbook.contains("Pause the Temporal Schedule first")
