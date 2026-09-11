@@ -755,15 +755,15 @@ impl HistoryMatcher {
         // every cursor-based scan (issue #383). They carry no workflow command,
         // so settling them up front keeps the matcher's scan loops unchanged.
         //
-        // Post-terminal bookkeeping gets the same treatment, for the same
-        // reason (issue #1262): a workflow-level retry's
-        // `WorkflowRetryScheduled` (#523), and a parent-close cascade's
-        // `ChildWorkflowCascadeApplied` (#347), carry no workflow command.
-        // The workflow function never consumes either. Both are always
-        // transparent, not only while searching for a redrive's
-        // superseded terminal. Left opaque, a retried-then-redriven run's
-        // cursor gets stuck on the bookkeeping event itself, before it
-        // ever reaches the marker or dispatch behind it.
+        // Post-terminal bookkeeping gets the same treatment (issue #1262).
+        // A workflow-level retry's `WorkflowRetryScheduled` (#523) and a
+        // parent-close cascade's `ChildWorkflowCascadeApplied` (#347)
+        // carry no workflow command. The workflow function never consumes
+        // either. Both are always transparent, not only while searching
+        // for a redrive's superseded terminal. Left opaque, a
+        // retried-then-redriven run's cursor gets stuck on the
+        // bookkeeping event itself, before it ever reaches the marker or
+        // dispatch behind it.
         let mut transparent_events: HashSet<usize> = events
             .iter()
             .enumerate()

@@ -778,8 +778,8 @@ pub enum WorkflowEvent {
     /// `WorkflowRedriven` stays non-transparent (a genuinely failed run).
     ///
     /// The same superseded cycle can leave other records behind its last
-    /// dispatch — a marker, a side effect, a detached spawn, a timer arm
-    /// or cancel.
+    /// dispatch. Those are a marker, a side effect, a detached spawn, or
+    /// a timer arm or cancel.
     /// [`crate::replay::HistoryMatcher::superseded_cycle_tail_indices`]
     /// marks those transparent too (issue #1262). A re-issued dispatch
     /// still advances past them instead of diverging.
