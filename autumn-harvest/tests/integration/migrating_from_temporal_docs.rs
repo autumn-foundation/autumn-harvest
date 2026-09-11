@@ -276,6 +276,12 @@ fn comparison_page_links_back_to_the_migration_guide() {
 /// executions directly. The playbook must say so, and must send the reader
 /// to harvest's own schedule pause and catchup primitives rather than leave
 /// them to guess.
+///
+/// A first version of this fix said Temporal exposes a per-firing list an
+/// operator can inspect and accept or reject. A PR review (Codex, P1) named
+/// that mechanism false: Temporal's `CatchupWindow` policy decides the whole
+/// missed interval at once, not firing by firing. These assertions guard
+/// the corrected claim instead.
 #[test]
 fn dual_run_playbook_covers_schedule_driven_cutover() {
     let guide = read_doc(GUIDE_PATH);
@@ -287,9 +293,19 @@ fn dual_run_playbook_covers_schedule_driven_cutover() {
          server starts a Temporal Schedule's executions directly, bypassing the app-level flag"
     );
     assert!(
-        playbook.contains("run silently") && playbook.contains("drop a buffered firing silently"),
-        "the playbook must say a buffered firing is neither run nor dropped silently during \
-         the quiesce window (issue #1219)"
+        playbook.contains("CatchupWindow"),
+        "the playbook must name Temporal's real per-schedule catchup primitive, not an \
+         invented per-firing accept/reject list (issue #1219, PR #1473 Codex P1)"
+    );
+    assert!(
+        playbook.contains("cutover timestamp"),
+        "the playbook must gate the missed interval and the harvest schedule's activation on \
+         one defined cutover timestamp, not on pausing alone (issue #1219, PR #1473 Codex P1)"
+    );
+    assert!(
+        playbook.contains("exactly one engine"),
+        "the playbook must say the missed interval is governed on exactly one engine, so \
+         neither engine silently drops or duplicates it (issue #1219)"
     );
     assert!(
         playbook.contains("/admin/schedules/{id}/pause"),
@@ -301,17 +317,19 @@ fn dual_run_playbook_covers_schedule_driven_cutover() {
         "the playbook must point to the catchup-policy primitive for the harvest schedule's \
          backlog decision (issue #484, issue #1219)"
     );
-    assert!(
-        playbook.contains("at a defined boundary"),
-        "the playbook must gate enabling the harvest schedule on a defined boundary, once the \
-         Temporal side is confirmed paused and resolved, not on pausing alone (issue #1219)"
-    );
 }
 
 /// Issue #1219, gap 2: a follow-up operation (signal, query, update, cancel)
 /// against one already-started execution must route by where that execution
 /// started. It must never route by the current flag value. The flag can flip
 /// between an execution's start and a later follow-up call against it.
+///
+/// A first version of this fix said to persist a record "at start time" for
+/// every execution. A PR review (Codex, P1) named two classes this cannot
+/// cover. One is a schedule-driven execution, which no application code
+/// starts. The other is an execution that predates the record's own
+/// introduction. These assertions guard the corrected, two-part
+/// resolution rule instead.
 #[test]
 fn dual_run_playbook_covers_follow_up_engine_routing() {
     let guide = read_doc(GUIDE_PATH);
@@ -323,9 +341,20 @@ fn dual_run_playbook_covers_follow_up_engine_routing() {
          distinct routing concern from a new start (issue #1219)"
     );
     assert!(
-        playbook.contains("-> engine") || playbook.contains("→ engine"),
-        "the playbook must state the general rule: persist which engine started each \
-         execution, and route follow-ups by that record (issue #1219)"
+        playbook.contains("-> harvest") || playbook.contains("→ harvest"),
+        "the playbook must state the general rule: record a harvest start, and route \
+         follow-ups by that record (issue #1219)"
+    );
+    assert!(
+        playbook.contains("Treat a missing record as Temporal"),
+        "the playbook must resolve a not-yet-ported execution's missing record to Temporal, \
+         not leave it unresolved (issue #1219, PR #1473 Codex P1)"
+    );
+    assert!(
+        playbook.contains("needs no such record") && playbook.contains("cutover timestamp"),
+        "the playbook must resolve a schedule-driven execution's engine by comparing its \
+         start time to the schedule's cutover timestamp, since no application code starts it \
+         to write a record (issue #1219, PR #1473 Codex P1)"
     );
     assert!(
         playbook.contains("Never route it by the flag's current value"),

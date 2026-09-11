@@ -327,17 +327,22 @@ your whole application.
    controls nothing for it.
 
    Pause the Temporal Schedule first. Do this before you rely on the flag
-   for that type. Check the firings the Temporal Schedule buffered during
-   the pause. Decide whether each buffered firing runs or drops. Do not
-   let a buffered firing run silently. Do not drop a buffered firing
-   silently either.
+   for that type. Pausing gives you no per-firing list to accept or
+   reject. Temporal's own `CatchupWindow` policy decides, as a whole,
+   whether the missed interval fires or drops once the schedule resumes.
+
+   Pick one cutover timestamp for the missed interval. Set the Temporal
+   Schedule's `CatchupWindow` deliberately, so it fires or skips that
+   interval on its own terms. Do not let the default `CatchupWindow`
+   decide this by accident.
 
    Create the equivalent harvest `WorkflowSchedule`, but keep it paused.
-   Use `POST /admin/schedules/{id}/pause` (issue #229) to hold it. Set its
-   `CatchupPolicy` (issue #484) to control what happens to any backlog
-   once the schedule resumes ticking. Confirm the Temporal Schedule is
-   paused, and its buffered firings are resolved. Unpause the harvest
-   schedule only then, at a defined boundary.
+   Use `POST /admin/schedules/{id}/pause` (issue #229) to hold it. Govern
+   the missed interval on exactly one engine. Set the harvest schedule's
+   `CatchupPolicy` (issue #484) to `SkipAll` if Temporal's `CatchupWindow`
+   already covers the interval. Set `CatchupPolicy` to cover it instead
+   if Temporal skips the interval. Unpause the harvest schedule only at
+   the same cutover timestamp.
 
    A follow-up operation against one already-started execution follows a
    different rule. A signal, a query, an update, and a cancellation each
@@ -347,13 +352,24 @@ your whole application.
    follow-up call against it. The current flag value can then name the
    wrong engine for an execution that started earlier.
 
-   Persist a `(workflow_name, workflow_id) -> engine` record at start
-   time. Look up that record for every follow-up call against a specific
-   execution. Route the call to the engine the record names. A `cancel`
-   signal routed to the wrong engine may not fail loudly. It can do
-   nothing there, while the real execution stays un-cancelled. Against a
-   `SignalWithStart`-shaped call, a wrong-engine route is worse. It can
-   start a new, spurious execution on that engine instead.
+   Write a `(workflow_name, workflow_id) -> harvest` record the moment
+   the type-level flag routes a new request to harvest. Look up that
+   record for every follow-up call against a specific execution. Treat a
+   missing record as Temporal. Every execution of a not-yet-ported type
+   predates this record by construction. A missing record is therefore
+   correct for it, not a gap.
+
+   A schedule-driven type needs no such record. Compare an execution's
+   start time to the schedule's cutover timestamp from above instead.
+   Before that timestamp, the execution is Temporal. At or after it, the
+   execution is harvest.
+
+   Route every follow-up call by this resolved engine, never by the
+   flag's current value. A `cancel` signal routed to the wrong engine may
+   not fail loudly. It can do nothing there, while the real execution
+   stays un-cancelled. Against a `SignalWithStart`-shaped call, a
+   wrong-engine route is worse. It can start a new, spurious execution on
+   that engine instead.
 
    The handoff in step 7, below, is a special case of this rule. It hands
    off one long-lived entity execution at the end of its lifecycle. Apply
