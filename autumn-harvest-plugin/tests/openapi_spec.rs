@@ -371,7 +371,7 @@ fn known_routes_carry_their_expected_class() {
 
 /// Issue #1457: resume, triage, and legal-hold never reject a paused
 /// execution. Their handlers do not check pause state. A 409 stays declared
-/// on these routes (reserved for a future conflict), but its text must never
+/// on these routes, reserved for a future conflict. Its text must never
 /// claim a conflict that cannot happen.
 #[test]
 fn resume_triage_and_legal_hold_do_not_document_a_pause_conflict() {
@@ -388,20 +388,34 @@ fn resume_triage_and_legal_hold_do_not_document_a_pause_conflict() {
             .iter()
             .find(|route| route["method"] == method && route["path"] == path)
             .unwrap_or_else(|| panic!("{method} {path} is missing from the contract"));
-        let documents_pause_conflict = route["error_responses"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|entry| {
-                entry["status"] == 409
-                    && entry["description"]
-                        .as_str()
-                        .is_some_and(|text| text.contains("is paused"))
-            });
+        let responses = route["error_responses"].as_array().unwrap();
+        let pause_wording = responses.iter().find(|entry| {
+            entry["status"] == 409
+                && entry["description"]
+                    .as_str()
+                    .is_some_and(|text| text.to_lowercase().contains("paus"))
+        });
         assert!(
-            !documents_pause_conflict,
-            "{method} {path} documents a 409 for being paused, but the handler \
-             never checks pause state"
+            pause_wording.is_none(),
+            "{method} {path} documents a 409 that mentions pause state, but the \
+             handler never checks pause state: {pause_wording:?}"
+        );
+
+        let reserved = responses
+            .iter()
+            .find(|entry| entry["status"] == 409)
+            .unwrap_or_else(|| {
+                panic!(
+                    "{method} {path} must still declare a 409 (issue #1457): \
+                     docs/audits/openapi-response-coverage.py requires it, since \
+                     the handler routes through the generic conflict_from helper"
+                )
+            });
+        assert_eq!(
+            reserved["description"],
+            "Reserved for a future state conflict (issue #1457). No path in the \
+             current handler returns this status.",
+            "{method} {path}: the reserved 409 description drifted"
         );
     }
 }
