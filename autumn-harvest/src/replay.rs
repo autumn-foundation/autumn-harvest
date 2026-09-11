@@ -819,6 +819,20 @@ impl HistoryMatcher {
             for i in Self::abandoned_dispatch_indices(&events[..redrive_idx]) {
                 transparent_events.insert(i);
             }
+            // Issue #1262: an abandoned pair is not the only record a
+            // failing cycle writes before its terminal `WorkflowFailed`.
+            // The cycle can also record a `MarkerRecorded` or
+            // `SideEffectRecorded` event after the dispatch a redrive
+            // wants to re-issue — for example a `ctx.version()` call.
+            // Left opaque, that record blocks the cursor. A re-issued
+            // dispatch compares against it positionally and reports
+            // `Diverged` instead of appending live. Swallow the rest of
+            // that same superseded cycle's tail too.
+            for i in
+                Self::superseded_cycle_tail_indices(&events[..redrive_idx], &transparent_events)
+            {
+                transparent_events.insert(i);
+            }
         }
         // Terminal-failure tail (issue #952): a run sealed FAILED can never
         // grow another event, so everything from its terminal event onward is
@@ -975,6 +989,55 @@ impl HistoryMatcher {
                     indices.push(i);
                 }
                 _ => {}
+            }
+        }
+        indices
+    }
+
+    /// Indices of a superseded failing cycle's remaining pre-terminal
+    /// records (issue #1262).
+    ///
+    /// [`Self::abandoned_dispatch_indices`] already covers the abandoned
+    /// dispatch pairs. This function covers the rest: `MarkerRecorded` and
+    /// `SideEffectRecorded` events the same cycle wrote, with or without
+    /// an abandoned pair present.
+    ///
+    /// A decision cycle's events are contiguous. No durable wait settles
+    /// mid-cycle; a wait settles only between cycles. So this walks
+    /// backward from `events.len()` (the caller passes the pre-redrive
+    /// prefix) and swallows a run of `MarkerRecorded` / `SideEffectRecorded`
+    /// events. It skips an index the caller already marked transparent,
+    /// such as the terminal `WorkflowFailed` or an abandoned pair.
+    ///
+    /// The walk cannot cross into an earlier cycle unless that cycle's own
+    /// wait already resolved. It stops at the first event that is not
+    /// already transparent and not a marker or side effect. A settled
+    /// completion, such as `ActivityCompleted` or `TimerFired`, marks the
+    /// boundary of that earlier, non-superseded cycle. Its own markers
+    /// must stay positionally matchable. Swallowing them would silently
+    /// break `ctx.version()` and `ctx.patched()` determinism for a cycle
+    /// the redrive never touched (issues #687 and #603).
+    ///
+    /// The function fails closed. An event that is neither already
+    /// transparent nor a marker or side effect stops the walk at once. An
+    /// event kind this function does not recognize stays opaque rather
+    /// than being guessed at.
+    fn superseded_cycle_tail_indices(
+        events: &[WorkflowEvent],
+        transparent_events: &HashSet<usize>,
+    ) -> Vec<usize> {
+        let mut indices = Vec::new();
+        let mut idx = events.len();
+        while idx > 0 {
+            idx -= 1;
+            if transparent_events.contains(&idx) {
+                continue;
+            }
+            match events[idx] {
+                WorkflowEvent::MarkerRecorded { .. } | WorkflowEvent::SideEffectRecorded { .. } => {
+                    indices.push(idx);
+                }
+                _ => break,
             }
         }
         indices
@@ -9477,6 +9540,152 @@ mod tests {
             matcher.match_child_workflow("worker_child", &Value::Null),
             HistoryMatch::NoMatch,
             "the reopened run must re-dispatch the child live"
+        );
+    }
+
+    /// Issue #1262: a failing cycle can record more than an abandoned
+    /// dispatch pair before it fails. Here it also records a
+    /// `MarkerRecorded` event after the dispatch. The marker is not an
+    /// abandoned-dispatch shape, so it needs its own transparency rule.
+    /// Without one, the cursor lands on the marker and reports `Diverged`
+    /// instead of allowing a live re-dispatch.
+    #[test]
+    fn a_marker_recorded_after_an_abandoned_dispatch_still_re_dispatches_live() {
+        let child_id = ExecutionId::new();
+        let events = vec![
+            WorkflowEvent::WorkflowStarted {
+                input: Value::Null,
+                timestamp: chrono::Utc::now(),
+                last_completion_result: None,
+                last_error: None,
+                scheduled_time: None,
+            },
+            WorkflowEvent::ChildWorkflowStarted {
+                child_id,
+                workflow_name: "worker_child".into(),
+                input: Value::Null,
+            },
+            WorkflowEvent::ChildWorkflowFailed {
+                child_id,
+                error: crate::event::ABANDONED_DISPATCH_REASON.to_string(),
+                error_type: None,
+                details: None,
+                non_retryable: Some(true),
+            },
+            WorkflowEvent::MarkerRecorded {
+                name: "m".into(),
+                details: Value::Null,
+            },
+            WorkflowEvent::workflow_failed("budget exceeded"),
+            WorkflowEvent::WorkflowRedriven {
+                redriven_at: chrono::Utc::now(),
+                dead_letter_id: uuid::Uuid::new_v4(),
+                reason: None,
+            },
+        ];
+        let mut matcher = HistoryMatcher::new(events);
+        assert!(
+            matcher.is_consumed(3),
+            "the marker the failing cycle wrote after the dispatch must be transparent too"
+        );
+        matcher.advance(); // past WorkflowStarted
+        assert_eq!(
+            matcher.match_child_workflow("worker_child", &Value::Null),
+            HistoryMatch::NoMatch,
+            "a durable record trailing the abandoned dispatch must not block re-dispatch"
+        );
+    }
+
+    /// Issue #1262: the same defect occurs with no abandoned-dispatch pair
+    /// at all. A failing cycle can record a plain marker and then fail,
+    /// with no dispatch in between. The marker alone must not block the
+    /// redrive.
+    #[test]
+    fn a_bare_marker_before_a_redriven_terminal_still_re_dispatches_live() {
+        let events = vec![
+            WorkflowEvent::WorkflowStarted {
+                input: Value::Null,
+                timestamp: chrono::Utc::now(),
+                last_completion_result: None,
+                last_error: None,
+                scheduled_time: None,
+            },
+            WorkflowEvent::MarkerRecorded {
+                name: "m".into(),
+                details: Value::Null,
+            },
+            WorkflowEvent::workflow_failed("budget exceeded"),
+            WorkflowEvent::WorkflowRedriven {
+                redriven_at: chrono::Utc::now(),
+                dead_letter_id: uuid::Uuid::new_v4(),
+                reason: None,
+            },
+        ];
+        let mut matcher = HistoryMatcher::new(events);
+        assert!(
+            matcher.is_consumed(1),
+            "a bare marker recorded by the failing cycle must be transparent on redrive"
+        );
+        matcher.advance(); // past WorkflowStarted
+        assert_eq!(
+            matcher.match_child_workflow("worker_child", &Value::Null),
+            HistoryMatch::NoMatch,
+            "the reopened run must re-dispatch live instead of diverging on the marker"
+        );
+    }
+
+    /// Negative control (issue #1262): a marker from an earlier,
+    /// non-superseded cycle must stay opaque across the redrive. That
+    /// cycle's own dispatch already completed before the failing cycle
+    /// started. Swallowing its marker would silently break
+    /// `ctx.version()` and `ctx.patched()` positional matching for a
+    /// cycle the redrive never touched.
+    #[test]
+    fn a_marker_from_an_earlier_completed_cycle_stays_opaque_across_a_redrive() {
+        let activity_id = ActivityExecId::new();
+        let events = vec![
+            WorkflowEvent::WorkflowStarted {
+                input: Value::Null,
+                timestamp: chrono::Utc::now(),
+                last_completion_result: None,
+                last_error: None,
+                scheduled_time: None,
+            },
+            WorkflowEvent::MarkerRecorded {
+                name: "version:early".into(),
+                details: Value::Null,
+            },
+            WorkflowEvent::ActivityScheduled {
+                activity_id,
+                name: "charge".into(),
+                input: Value::Null,
+                queue: "default".into(),
+            },
+            // This completion ends the earlier cycle: everything before it,
+            // including the marker above, is settled, non-superseded history.
+            WorkflowEvent::ActivityCompleted {
+                activity_id,
+                output: Value::Null,
+            },
+            WorkflowEvent::MarkerRecorded {
+                name: "m".into(),
+                details: Value::Null,
+            },
+            WorkflowEvent::workflow_failed("budget exceeded"),
+            WorkflowEvent::WorkflowRedriven {
+                redriven_at: chrono::Utc::now(),
+                dead_letter_id: uuid::Uuid::new_v4(),
+                reason: None,
+            },
+        ];
+        let matcher = HistoryMatcher::new(events);
+        assert!(
+            !matcher.is_consumed(1),
+            "the earlier cycle's own marker must stay positionally matchable"
+        );
+        assert!(
+            matcher.is_consumed(4),
+            "the failing cycle's own marker, past the last completion, must be transparent"
         );
     }
 
