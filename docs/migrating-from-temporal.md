@@ -345,31 +345,37 @@ your whole application.
 
    A follow-up operation against one already-started execution follows a
    different rule. A signal, a query, an update, and a cancellation each
-   name one specific execution, not a workflow type. Route each by where
-   that execution actually started. Never route it by the flag's current
-   value. The flag can flip between an execution's start and a later
-   follow-up call against it. The current flag value can then name the
-   wrong engine for an execution that started earlier.
+   name one specific execution, not a workflow type. Route each by which
+   engine actually hosts it right now. Never route it by the flag's
+   current value. The flag can flip between an execution's start and a
+   later follow-up call against it.
 
-   Write a `(workflow_name, workflow_id) -> harvest` record the moment
-   the type-level flag routes a new request to harvest. Look up that
-   record for every follow-up call against a specific execution. Treat a
-   missing record as Temporal. Every execution of a not-yet-ported type
-   predates this record by construction. A missing record is therefore
-   correct for it, not a gap.
+   A workflow id can also outlive one execution. `WorkflowIdReusePolicy`
+   lets a new execution reuse the same `(workflow_name, workflow_id)`
+   after the old one closes. That reuse can land on the other engine
+   after a rollback. Neither the flag nor a record written once at start
+   time survives that reuse.
 
-   A schedule-driven type needs no such record either. Query harvest for
-   the execution directly instead. Treat a missing execution there as
-   Temporal too. This check holds regardless of any gap or hand-fired
-   slot around the cutover, since it asks the engine itself, not a
-   timestamp.
+   Ask harvest which engine hosts the execution instead of writing your
+   own record. Harvest's `/workflows/by-id/{workflow_name}/{workflow_id}`
+   route family (issue #805) already resolves a business id to its
+   current run. That run is the active one if one exists, or the most
+   recent terminal run otherwise. Query it first. Route the follow-up
+   through that same by-id family when it reports an active run. Route
+   to Temporal when it reports no active run, whether that means no run
+   at all or only a terminal predecessor.
 
-   Route every follow-up call by this resolved engine, never by the
-   flag's current value. A `cancel` signal routed to the wrong engine may
-   not fail loudly. It can do nothing there, while the real execution
-   stays un-cancelled. Against a `SignalWithStart`-shaped call, a
-   wrong-engine route is worse. It can start a new, spurious execution on
-   that engine instead.
+   This one check replaces three separate rules with one. A
+   schedule-driven execution needs it because nothing else persists
+   anything for it. A not-yet-ported execution needs it because harvest
+   never has one to report. A reused workflow id after a rollback needs
+   it because harvest's own resolution already prefers the active run
+   over a stale terminal one.
+
+   A `cancel` signal routed to the wrong engine may not fail loudly. It
+   can do nothing there, while the real execution stays un-cancelled.
+   Against a `SignalWithStart`-shaped call, a wrong-engine route is
+   worse. It can start a new, spurious execution on that engine instead.
 
    The handoff in step 7, below, is a special case of this rule. It hands
    off one long-lived entity execution at the end of its lifecycle. Apply
@@ -492,8 +498,8 @@ your whole application.
 
    The handoff above is a special case of step 1's general
    follow-up-routing rule. Route the `cancel` signal above, and the final
-   read after it, to the engine that started this specific execution.
-   Never route either action by the flag's current value.
+   read after it, to whichever engine currently hosts this specific
+   execution. Never route either action by the flag's current value.
 
    Treat each entity's handoff as a deliberate cutover step, not a bulk
    migration. Each one is a live, stateful run. It is not disposable
@@ -701,9 +707,9 @@ async fn subscription_renewal(
   helper instead. It blocks one code point, rather than reacting from
   anywhere in the workflow body. See the [Signals](#signals) row above.
 - **Routing the `cancel` signal itself.** This example assumes `cancel`
-  already reaches the engine that started this subscription's execution.
-  A real dual-run cutover cannot assume that. Look up the engine that
-  started this specific execution first. See the general
+  already reaches the engine currently hosting this subscription's
+  execution. A real dual-run cutover cannot assume that. Look up which
+  engine hosts this specific execution first. See the general
   follow-up-routing rule in the [Dual-run cutover
   playbook](#dual-run-cutover-playbook), step 1, above. A `cancel` signal
   sent to the wrong engine does nothing there. It leaves the real

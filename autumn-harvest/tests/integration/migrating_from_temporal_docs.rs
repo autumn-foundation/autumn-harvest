@@ -328,19 +328,18 @@ fn dual_run_playbook_covers_schedule_driven_cutover() {
 }
 
 /// Issue #1219, gap 2: a follow-up operation (signal, query, update, cancel)
-/// against one already-started execution must route by where that execution
-/// started. It must never route by the current flag value. The flag can flip
-/// between an execution's start and a later follow-up call against it.
+/// against one already-started execution must route to whichever engine
+/// hosts it right now. It must never route by the current flag value, or
+/// by a fact fixed at start time.
 ///
-/// Two PR reviews (Codex, both P1) found real gaps here. The first said a
-/// persisted "record at start time" cannot cover a schedule-driven
-/// execution, since no application code starts it. The same gap applies to
-/// an execution that predates the record's own introduction.
-///
-/// The second review found the schedule-driven fallback this fix first
-/// tried -- comparing an execution's start time to the cutover timestamp --
-/// still wrong. A hand-fired or delayed Temporal slot can start after that
-/// timestamp. The fix now queries harvest directly, never a timestamp.
+/// Three PR reviews (Codex, all P1) found real gaps in three successive
+/// attempts at this rule. A persisted "record at start time" cannot cover
+/// a schedule-driven execution, or one that predates the record. Comparing
+/// a start time to a cutover timestamp fails when a Temporal slot fires
+/// late. A record written once goes stale, too: `WorkflowIdReusePolicy`
+/// lets a new execution reuse the same id after a rollback. The fix drops
+/// all three attempts. It asks harvest live instead, through the by-id
+/// resolution harvest already ships (issue #805).
 #[test]
 fn dual_run_playbook_covers_follow_up_engine_routing() {
     let guide = read_doc(GUIDE_PATH);
@@ -352,21 +351,20 @@ fn dual_run_playbook_covers_follow_up_engine_routing() {
          distinct routing concern from a new start (issue #1219)"
     );
     assert!(
-        playbook.contains("-> harvest") || playbook.contains("→ harvest"),
-        "the playbook must state the general rule: record a harvest start, and route \
-         follow-ups by that record (issue #1219)"
+        playbook.contains("WorkflowIdReusePolicy") && playbook.contains("rollback"),
+        "the playbook must name workflow-id reuse across a rollback as a hazard a persisted \
+         record cannot survive (issue #1219, PR #1473 Codex P1)"
     );
     assert!(
-        playbook.contains("Treat a missing record as Temporal"),
-        "the playbook must resolve a not-yet-ported execution's missing record to Temporal, \
-         not leave it unresolved (issue #1219, PR #1473 Codex P1)"
+        playbook.contains("/workflows/by-id/{workflow_name}/{workflow_id}"),
+        "the playbook must route follow-ups through harvest's own by-id resolution (issue \
+         #805), not a record the reader maintains (issue #1219, PR #1473 Codex P1)"
     );
     assert!(
-        playbook.contains("needs no such record")
-            && playbook.contains("Query harvest for the execution directly"),
-        "the playbook must resolve a schedule-driven execution's engine with a live lookup \
-         against harvest, not a timestamp comparison -- a comparison a hand-fired or delayed \
-         slot can cross in the wrong direction (issue #1219, PR #1473 Codex P1)"
+        playbook.contains("active run") && playbook.contains("terminal"),
+        "the playbook must say the by-id resolution prefers an active run over a stale \
+         terminal one -- the property that makes it safe across a reused workflow id \
+         (issue #1219, PR #1473 Codex P1)"
     );
     assert!(
         playbook.contains("Never route it by the flag's current value"),
@@ -391,7 +389,7 @@ fn worked_example_commentary_cross_links_engine_routing_rule() {
     let commentary = flatten_whitespace(section_body(&guide, "### What changed, and why"));
 
     assert!(
-        commentary.contains("engine that started"),
+        commentary.contains("engine currently hosting"),
         "the worked example's commentary must cross-link the general engine-routing rule for \
          its own `cancel` signal (issue #1219)"
     );
