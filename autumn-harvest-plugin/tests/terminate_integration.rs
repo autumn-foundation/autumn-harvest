@@ -373,14 +373,24 @@ async fn terminate_idempotent_reason_matches_state() {
     let mut conn = AsyncPgConnection::establish(&url).await.unwrap();
 
     let cases: &[(&str, &str, Option<&str>, &str)] = &[
-        ("completed-1", "COMPLETED", None, "workflow already completed"),
+        (
+            "completed-1",
+            "COMPLETED",
+            None,
+            "workflow already completed",
+        ),
         (
             "continued-1",
             "CONTINUED_AS_NEW",
             None,
             "workflow already continued as new",
         ),
-        ("cancelled-1", "CANCELLED", None, "workflow already cancelled"),
+        (
+            "cancelled-1",
+            "CANCELLED",
+            None,
+            "workflow already cancelled",
+        ),
         (
             "failed-1",
             "FAILED",

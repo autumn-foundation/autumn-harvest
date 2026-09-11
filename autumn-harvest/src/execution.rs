@@ -395,7 +395,10 @@ impl CancelledWorkflowExecution {
             "CONTINUED_AS_NEW" => "continued as new",
             "TERMINATED" => "terminated",
             other => {
-                return format!("workflow already in terminal state {}", other.to_lowercase());
+                return format!(
+                    "workflow already in terminal state {}",
+                    other.to_lowercase()
+                );
             }
         };
         format!("workflow already {phrase}")
