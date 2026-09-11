@@ -1176,6 +1176,55 @@ async fn retirement_via_the_escape_hatch_still_records_the_durable_retirement() 
     );
 }
 
+/// The very first `activate_codec_key` call an embedder ever makes finds an
+/// empty `harvest_codec_key_state`. Nothing is there to demote. So the key
+/// this process is rotating *away from* must be seeded as `"retiring"`
+/// directly -- otherwise it would never be retirable.
+#[tokio::test]
+async fn first_activation_ever_seeds_the_outgoing_key_as_retiring() {
+    let (url, _c) = setup_isolated_db().await;
+    let mut conn = connect(&url).await;
+    let codecs = two_key_registry();
+    let pool = build_pool(&url);
+    let sharded = ShardedDbPool::single(pool);
+    let shards = [ShardId::new(0)];
+
+    assert_eq!(
+        key_state(&mut conn, "k1").await,
+        None,
+        "harvest_codec_key_state starts empty -- \"k1\" was never durable"
+    );
+
+    // The first-ever call, activating "k2" directly -- never a prior call
+    // activating the already-active "k1" first.
+    activate_codec_key(&sharded, &shards, &codecs, "k2", 60)
+        .await
+        .expect("no live workers to block activation");
+
+    assert_eq!(
+        key_state(&mut conn, "k1").await.as_deref(),
+        Some("retiring"),
+        "the outgoing key must be seeded as retiring even though it was \
+         never durably active"
+    );
+
+    retire_codec_key(
+        &sharded,
+        &shards,
+        &codecs,
+        "k1",
+        FleetWriteFence::NotConfirmed,
+        Duration::ZERO,
+        Duration::ZERO,
+    )
+    .await
+    .expect(
+        "the seeded row must satisfy the real structural staleness gate, not just the \
+         escape hatch",
+    );
+    assert_eq!(key_state(&mut conn, "k1").await.as_deref(), Some("retired"));
+}
+
 /// AC5's second required interleaving: a row that was not even written at the
 /// first census commits **during** the recheck delay. `retire_codec_key` must
 /// catch it on the second pass rather than finalizing on the first zero.

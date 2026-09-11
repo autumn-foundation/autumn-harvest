@@ -1172,6 +1172,19 @@ mod db {
         state: String,
         #[diesel(sql_type = Nullable<Timestamptz>)]
         retiring_since: Option<DateTime<Utc>>,
+        /// Seconds since `retiring_since`, computed entirely on this shard's
+        /// own database clock. `NULL` when `retiring_since` is `NULL`.
+        ///
+        /// [`staleness_gate`] uses this, never `Utc::now() -
+        /// retiring_since`. Comparing a DB-stamped timestamp against the
+        /// *caller's* host clock is only correct when the two clocks agree.
+        ///
+        /// A retirement host whose clock runs ahead of a shard's database
+        /// would otherwise see an inflated `elapsed`. It could pass the gate
+        /// before that shard's own live workers had actually had
+        /// `staleness_window` to refresh.
+        #[diesel(sql_type = Nullable<Double>)]
+        elapsed_secs: Option<f64>,
     }
 
     #[derive(diesel::QueryableByName)]
@@ -1197,7 +1210,9 @@ mod db {
         key_id: &str,
     ) -> HarvestResult<Option<KeyStateRow>> {
         let rows: Vec<KeyStateRow> = diesel::sql_query(
-            "SELECT state, retiring_since FROM harvest_codec_key_state WHERE key_id = $1",
+            "SELECT state, retiring_since, \
+                    EXTRACT(EPOCH FROM (NOW() - retiring_since))::float8 AS elapsed_secs \
+               FROM harvest_codec_key_state WHERE key_id = $1",
         )
         .bind::<Text, _>(key_id)
         .load(conn)
@@ -1210,12 +1225,27 @@ mod db {
     /// shard (issue #1244). Any other row still marked `active` is demoted to
     /// `retiring` with `retiring_since = NOW()`, in the same transaction. So
     /// there is never a moment with zero or two active rows.
+    ///
+    /// `outgoing_key_id` is `codecs.active_key_id()` as read *before* this
+    /// call -- the key this process considered active a moment ago.
+    ///
+    /// A first activation ever, on an empty `harvest_codec_key_state`, has
+    /// no durable `"active"` row for the UPDATE above to demote. The
+    /// in-memory outgoing key was never durable to begin with. Left alone,
+    /// that key would carry no `"retiring"` row forever, and
+    /// [`retire_codec_key`]'s structural gate would refuse it permanently.
+    ///
+    /// So when that UPDATE demotes nothing, this seeds a `"retiring"` row
+    /// for `outgoing_key_id` directly. It uses `ON CONFLICT DO NOTHING`: a
+    /// row already there, in any state, is a fact this call must not
+    /// overwrite.
     async fn write_key_state_activation(
         conn: &mut AsyncPgConnection,
         key_id: &str,
+        outgoing_key_id: &str,
     ) -> HarvestResult<()> {
         conn.transaction::<(), HarvestError, _>(async |conn| {
-            diesel::sql_query(
+            let demoted = diesel::sql_query(
                 "UPDATE harvest_codec_key_state \
                     SET state = 'retiring', retiring_since = NOW(), updated_at = NOW() \
                   WHERE state = 'active' AND key_id <> $1",
@@ -1224,6 +1254,19 @@ mod db {
             .execute(conn)
             .await
             .map_err(database_error)?;
+
+            if demoted == 0 && outgoing_key_id != key_id {
+                diesel::sql_query(
+                    "INSERT INTO harvest_codec_key_state \
+                         (key_id, state, retiring_since, updated_at) \
+                     VALUES ($1, 'retiring', NOW(), NOW()) \
+                     ON CONFLICT (key_id) DO NOTHING",
+                )
+                .bind::<Text, _>(outgoing_key_id)
+                .execute(conn)
+                .await
+                .map_err(database_error)?;
+            }
 
             diesel::sql_query(
                 "INSERT INTO harvest_codec_key_state (key_id, state, activated_at, updated_at) \
@@ -1442,18 +1485,33 @@ mod db {
     ///    payload under the old key, but has not committed, is invisible to the
     ///    census and becomes visible immediately afterwards.
     ///
-    /// The default path (`NotConfirmed`) closes hazard 1 structurally. It
+    /// The default path (`NotConfirmed`) narrows hazard 1 structurally. It
     /// requires every expected shard's durable `harvest_codec_key_state` row to
     /// have named this key `"retiring"` for at least `staleness_window`.
     /// [`activate_codec_key`] stamps that row the instant a newer key becomes
-    /// active. Every other process refreshes its own view of the active key
-    /// at most every scanner-tick interval (see [`refresh_active_codec_key`]).
-    /// So once `staleness_window` safely exceeds twice that interval, no
-    /// conforming writer can still be encoding under the outgoing key. This
-    /// path narrows hazard 2 with an immediate recensus before finalizing (see
-    /// `retire_codec_key`'s `recheck_delay`). It cannot close hazard 2
-    /// completely without tracking individual transaction lifetimes — a known,
-    /// documented limitation, not a silent gap.
+    /// active.
+    ///
+    /// Every other process refreshes its own view of the active key.
+    /// Roughly every scanner-tick interval, see
+    /// [`refresh_active_codec_key`], **provided that process's scanner
+    /// loop is actually ticking on schedule.**
+    ///
+    /// That proviso is not free. [`crate::timeout::spawn_timeout_checker_for_shard`]
+    /// bounds its own pool acquisition to one `interval`, so pool contention
+    /// alone cannot stretch a tick unboundedly. It does **not** bound the
+    /// enforcement pass itself: a single slow or wedged query inside that
+    /// pass can still delay the refresh beyond `interval`.
+    ///
+    /// `staleness_window` is an operational margin, set generously past the
+    /// deployment's nominal `interval` for exactly this reason. It is not a
+    /// proof immune to a stuck scanner. A scanner loop that has stopped
+    /// ticking entirely is `crate::scanner_health`'s job to surface, separately from
+    /// this gate.
+    ///
+    /// This path narrows hazard 2 with an immediate recensus before
+    /// finalizing (see `retire_codec_key`'s `recheck_delay`). It cannot close
+    /// hazard 2 completely without tracking individual transaction lifetimes
+    /// — a known, documented limitation, not a silent gap.
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     pub enum FleetWriteFence {
         /// Skip the durable staleness-window wait and go straight to the
@@ -1499,8 +1557,11 @@ mod db {
 
     /// The structural half of [`FleetWriteFence::NotConfirmed`] (issue #1244).
     /// Every expected shard must show `key_id` durably `"retiring"`. The
-    /// latest of those transitions (the straggling shard sets the pace) must
-    /// be at least `staleness_window` in the past.
+    /// least-aged of those transitions (the straggling shard sets the pace)
+    /// must be at least `staleness_window` in the past.
+    ///
+    /// Elapsed time is computed on each shard's own database clock, never
+    /// the caller's host clock -- see [`KeyStateRow::elapsed_secs`].
     async fn staleness_gate(
         sharded_pool: &crate::shard::ShardedDbPool,
         expected_shards: &[crate::types::ShardId],
@@ -1508,7 +1569,11 @@ mod db {
         staleness_window: Duration,
     ) -> HarvestResult<()> {
         let mut remaining: Vec<CodecKeyShardRemainder> = Vec::new();
-        let mut latest_retiring_since: Option<DateTime<Utc>> = None;
+        // The binding constraint is the LEAST-elapsed shard. Every shard's
+        // own window must have elapsed, so the whole gate is only as stale
+        // as its freshest transition. Kept alongside its own
+        // `retiring_since` purely for the error message below.
+        let mut least_elapsed: Option<(f64, DateTime<Utc>)> = None;
         for shard in expected_shards {
             let shard_id = shard.as_i32();
             let mut conn = match resolve_shard_conn(sharded_pool, *shard).await {
@@ -1526,8 +1591,15 @@ mod db {
             match read_key_state(&mut conn, key_id).await {
                 Ok(Some(row)) if row.state == "retiring" => {
                     let since = row.retiring_since.unwrap_or_else(Utc::now);
-                    latest_retiring_since =
-                        Some(latest_retiring_since.map_or(since, |m| m.max(since)));
+                    // A `NULL` `elapsed_secs` (retiring_since somehow NULL on a
+                    // "retiring" row) fails closed as zero elapsed, never as
+                    // "already stale enough".
+                    let elapsed_secs = row.elapsed_secs.unwrap_or(0.0);
+                    let is_new_min =
+                        least_elapsed.is_none_or(|(min_secs, _)| elapsed_secs < min_secs);
+                    if is_new_min {
+                        least_elapsed = Some((elapsed_secs, since));
+                    }
                 }
                 Ok(Some(row)) => remaining.push(CodecKeyShardRemainder {
                     shard_id,
@@ -1564,13 +1636,15 @@ mod db {
             });
         }
         // `remaining` is empty, so every expected shard matched the `Ok(Some(_))`
-        // "retiring" arm above and contributed to `latest_retiring_since`.
-        let since = latest_retiring_since
-            .expect("every shard reached the retiring arm when `remaining` is empty");
-        let elapsed = Utc::now().signed_duration_since(since);
-        let window = chrono::Duration::from_std(staleness_window).unwrap_or(chrono::Duration::MAX);
-        if elapsed < window {
-            let remaining_secs = (window - elapsed).num_seconds().max(0);
+        // "retiring" arm above and contributed to `least_elapsed`.
+        let (elapsed_secs, since) =
+            least_elapsed.expect("every shard reached the retiring arm when `remaining` is empty");
+        let window_secs = staleness_window.as_secs_f64();
+        if elapsed_secs < window_secs {
+            // A staleness window measured in seconds never remotely
+            // approaches `i64::MAX`.
+            #[allow(clippy::cast_possible_truncation)]
+            let remaining_secs = (window_secs - elapsed_secs).round().max(0.0) as i64;
             return Err(HarvestError::CodecKeyRetirementBlocked {
                 key_id: key_id.to_string(),
                 remaining: expected_shards
@@ -1581,7 +1655,7 @@ mod db {
                         reachable: true,
                         reason: Some(format!(
                             "retirement staleness window not yet elapsed: {remaining_secs}s \
-                             remaining (retiring since {since})"
+                             remaining (least-aged shard retiring since {since})"
                         )),
                     })
                     .collect(),
@@ -1874,6 +1948,11 @@ mod db {
         // call are not rolled back. This is the same partial-write outcome
         // this function's own rustdoc already documents for a plain
         // database error here, converged by re-running once fixed.
+        //
+        // Read before any shard is written, once, not per shard. It names
+        // the single in-memory key this process is rotating away from --
+        // the same fact on every shard this call touches.
+        let outgoing_key_id = codecs.active_key_id();
         for shard in expected_shards {
             let shard_id = shard.as_i32();
             let mut conn = resolve_shard_conn(sharded_pool, *shard)
@@ -1899,7 +1978,7 @@ mod db {
                     blockers: blockers_from_rows(shard_id, recheck),
                 });
             }
-            write_key_state_activation(&mut conn, key_id).await?;
+            write_key_state_activation(&mut conn, key_id, &outgoing_key_id).await?;
         }
 
         codecs.set_active_key(key_id)
@@ -1909,15 +1988,17 @@ mod db {
     /// `harvest_codec_key_state` table (issue #1244).
     ///
     /// Folded into [`crate::timeout::enforce_timeouts_once`] — shard-local, on
-    /// the connection the caller already holds, on the same bounded cadence.
+    /// the connection the caller already holds, on the same nominal cadence.
     /// This is what turns [`activate_codec_key`]'s durable write into a fact
-    /// every *other* process eventually observes. The deployment's configured
-    /// scanner-tick interval is the bound in [`FleetWriteFence`]'s "twice the
-    /// refresh interval" argument.
+    /// every *other* process eventually observes.
     ///
-    /// That bound only holds if this call runs on *every* tick. So
-    /// `enforce_timeouts_once` places it before any resident that can end the
-    /// tick early with `?`, not beside the re-encryption sweep.
+    /// The deployment's configured scanner-tick interval is the operational
+    /// margin [`FleetWriteFence`]'s docs discuss. See the caveats there
+    /// about what that margin does and does not actually bound.
+    ///
+    /// This call runs on *every* tick that reaches it. So
+    /// `enforce_timeouts_once` places it before any resident that can end
+    /// the tick early with `?`, not beside the re-encryption sweep.
     ///
     /// The sweep sits later, among the fallible residents, because its own
     /// safety comes from idempotent, re-run-to-converge CAS writes. It does

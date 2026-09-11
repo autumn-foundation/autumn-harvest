@@ -4517,8 +4517,18 @@ pub fn spawn_timeout_checker_for_shard(
                 }
             }
 
-            match pool.get().await {
-                Ok(mut conn) => match enforce_timeouts_once(
+            // Bounded to `interval`. Unbounded pool contention here would
+            // silently stretch this loop's actual period past `interval`,
+            // which is exactly the assumption
+            // `codec_rotation::FleetWriteFence`'s staleness window relies
+            // on.
+            //
+            // Skipping this tick and retrying next `interval` is the same
+            // posture `acquire_shard_conn` already uses for registration and
+            // heartbeats. It is better than blocking the whole scanner on
+            // one contested pool.
+            match tokio::time::timeout(interval, pool.get()).await {
+                Ok(Ok(mut conn)) => match enforce_timeouts_once(
                     &mut conn,
                     &*telemetry.metrics,
                     unknown_target_grace_window,
@@ -4540,8 +4550,14 @@ pub fn spawn_timeout_checker_for_shard(
                         tracing::error!(error = %e, "failed to enforce timed-out tasks");
                     }
                 },
-                Err(e) => {
+                Ok(Err(e)) => {
                     tracing::error!(error = %e, "failed to acquire DB connection for timeout check");
+                }
+                Err(_elapsed) => {
+                    tracing::error!(
+                        ?interval,
+                        "pool acquisition exceeded the tick interval; skipping this tick"
+                    );
                 }
             }
 

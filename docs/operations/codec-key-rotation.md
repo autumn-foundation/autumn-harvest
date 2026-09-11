@@ -251,13 +251,17 @@ about — closes hazard 1 structurally instead of by operator attestation:
 - `activate_codec_key` durably stamps the superseded key `"retiring"` with a
   timestamp, on every expected shard.
 - Every other process refreshes its view of the active key from that same
-  durable table at least once per scanner-tick interval (folded into
-  `enforce_timeouts_once`, right beside the re-encryption sweep — see
-  `codec_rotation::refresh_active_codec_key`).
-- So once `staleness_window` safely exceeds **twice** your configured tick
-  interval, no conforming writer can still be encoding under the outgoing
-  key. Pass a `staleness_window` that reflects your deployment's actual tick
-  cadence — this function does not guess it for you.
+  durable table roughly once per scanner-tick interval (folded into
+  `enforce_timeouts_once`, before any resident that can end the tick early —
+  see `codec_rotation::refresh_active_codec_key`), **provided that process's
+  scanner loop is actually keeping up.** Pool acquisition for the tick is
+  bounded to one `interval`, but the enforcement pass itself is not: a slow
+  or wedged query inside it can still delay a refresh past `interval`.
+- So `staleness_window` is an operational margin, not a hard guarantee — set
+  it well past **twice** your deployment's nominal tick interval to absorb
+  ordinary jitter, and treat `crate::scanner_health`'s liveness signal, not
+  this gate, as the thing that tells you a scanner has actually stopped
+  ticking.
 
 Hazard 2 is narrowed, not eliminated, by the built-in double census:
 `recheck_delay` is how long to wait between the first (zero) census and the
