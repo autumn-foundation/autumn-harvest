@@ -22601,6 +22601,20 @@ fn spawn_concurrency_sampler(
     interval: Duration,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
+        // No recorder configured, and no DEBUG subscriber would observe the
+        // saturation trace below either: skip the sampler SQL entirely
+        // (issue #1428). Unlike its three siblings, this sampler's
+        // saturation trace is a metrics-independent operator signal (see
+        // the doc comment above). PR #1468 review (Codex, P2) found that a
+        // blanket `is_enabled()`-only guard would silence it. That happens
+        // for a deployment with no metrics recorder but with DEBUG tracing
+        // on. `tracing::enabled!` keeps that deployment's sampler active,
+        // at zero extra cost for one with neither configured.
+        if !telemetry.metrics.is_enabled()
+            && !tracing::enabled!(target: "autumn_harvest::worker", tracing::Level::DEBUG)
+        {
+            return;
+        }
         loop {
             tokio::select! {
                 () = cancel.cancelled() => break,
@@ -22697,6 +22711,11 @@ fn spawn_rate_limit_sampler(
     interval: Duration,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
+        // No recorder configured: never issue the sampler SQL (issue #1428,
+        // matching `spawn_queue_depth_sampler`'s guard above).
+        if !telemetry.metrics.is_enabled() {
+            return;
+        }
         loop {
             tokio::select! {
                 () = cancel.cancelled() => break,
@@ -22796,6 +22815,11 @@ fn spawn_dlq_depth_sampler(
     interval: Duration,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
+        // No recorder configured: never issue the sampler SQL (issue #1428,
+        // matching `spawn_queue_depth_sampler`'s guard above).
+        if !telemetry.metrics.is_enabled() {
+            return;
+        }
         loop {
             tokio::select! {
                 () = cancel.cancelled() => break,
@@ -23777,6 +23801,11 @@ fn spawn_history_oversized_sampler(
     interval: Duration,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
+        // No recorder configured: never issue the sampler SQL (issue #1428,
+        // matching `spawn_queue_depth_sampler`'s guard above).
+        if !telemetry.metrics.is_enabled() {
+            return;
+        }
         let mut reported_workflows = std::collections::HashSet::new();
         loop {
             tokio::select! {
@@ -29200,6 +29229,266 @@ mod tests {
             .max_size(max_size)
             .build()
             .expect("pool builds without connecting")
+    }
+
+    // ── Issue #1428: metrics-disabled samplers must never touch the pool ────
+    //
+    // Four samplers issued their SQL with no `metrics.is_enabled()` guard.
+    // Their six siblings all check it first (`spawn_queue_depth_sampler`
+    // above sets the pattern).
+    //
+    // One exception: `spawn_concurrency_sampler`'s guard also stays open
+    // for a DEBUG subscriber. PR #1468 review (Codex, P2) found this gap.
+    // Its own touch count depends on the ambient tracing level too, not on
+    // `is_enabled()` alone. The tests below cover both halves separately.
+    //
+    // Evidence: a first version of this harness counted pool touches via
+    // a `tracing::debug!` message each sampler's failure branch emits. PR
+    // #1468 review (Codex, P2) found that vacuous. Filtering the
+    // subscriber to INFO, to model "no DEBUG subscriber," also suppresses
+    // the DEBUG event the counter relied on. The count then reads zero
+    // whether or not the guard actually works. `AcceptCountingListener`
+    // below counts real TCP `accept()`s on a loopback listener instead. No
+    // tracing level can silence that channel. "Zero touches" then only
+    // holds when the guard genuinely never reaches `pool.get()`.
+
+    /// A loopback listener standing in for Postgres, counting every
+    /// accepted connection before dropping it. The Postgres handshake then
+    /// fails, the same outward effect as [`unreachable_pool`]. The accept
+    /// itself is already counted by the time that happens.
+    struct AcceptCountingListener {
+        pool: DbPool,
+        accepts: Arc<std::sync::atomic::AtomicUsize>,
+        acceptor: tokio::task::JoinHandle<()>,
+    }
+
+    impl AcceptCountingListener {
+        fn touch_count(&self) -> usize {
+            // Fully qualified: `diesel_async::RunQueryDsl::load` is
+            // implemented for every `Sized` type, including
+            // `Arc<AtomicUsize>`. A plain `self.accepts.load(ordering)`
+            // resolves to that blanket trait method instead of
+            // `AtomicUsize::load`, and fails to compile.
+            std::sync::atomic::AtomicUsize::load(&self.accepts, std::sync::atomic::Ordering::SeqCst)
+        }
+
+        /// Stops the background accept loop. Tests call this once they are
+        /// done driving samplers against `self.pool`, before asserting.
+        fn stop(&self) {
+            self.acceptor.abort();
+        }
+    }
+
+    async fn accept_counting_pool() -> AcceptCountingListener {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind an ephemeral loopback port");
+        let addr = listener.local_addr().expect("listener has a local address");
+        let accepts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let accepts_for_task = Arc::clone(&accepts);
+        let acceptor = tokio::spawn(async move {
+            while let Ok((stream, _)) = listener.accept().await {
+                accepts_for_task.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                drop(stream);
+            }
+        });
+        let manager = diesel_async::pooled_connection::AsyncDieselConnectionManager::<
+            diesel_async::AsyncPgConnection,
+        >::new(format!("postgres://sampler-guard@{addr}/sampler-guard"));
+        let pool = deadpool::managed::Pool::builder(manager)
+            .max_size(1)
+            .build()
+            .expect("pool builds without connecting");
+        AcceptCountingListener {
+            pool,
+            accepts,
+            acceptor,
+        }
+    }
+
+    /// A [`tracing_subscriber::Layer`] with every method left at its
+    /// default (no-op) implementation. Attaching one to a subscriber with
+    /// no filter makes `tracing::enabled!` read a level as on. That is
+    /// what the DEBUG-tracing test below needs. It records nothing, since
+    /// that test proves control flow (`pool.get()` is reached), not log
+    /// content.
+    struct DebugTracingOn;
+
+    impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for DebugTracingOn {}
+
+    /// Advances the paused clock by `interval`, `n` times, yielding after
+    /// each advance. Each sampler loop sleeps for `interval` before its
+    /// body runs, so `n` advances let it complete up to `n` passes.
+    async fn advance_sampler_ticks(interval: Duration, n: usize) {
+        for _ in 0..n {
+            tokio::time::advance(interval).await;
+            tokio::task::yield_now().await;
+        }
+    }
+
+    /// Spawns the four samplers issue #1428 named, against the same `pool`,
+    /// `cancel`, `telemetry`, and `interval`. The extra per-sampler
+    /// arguments (queue names, shard id, soft threshold) are representative
+    /// values; none of them affect whether the pool is ever touched.
+    fn spawn_the_four_unguarded_samplers(
+        pool: &DbPool,
+        cancel: &CancellationToken,
+        telemetry: &Arc<crate::telemetry::TelemetryConfig>,
+        interval: Duration,
+    ) -> Vec<tokio::task::JoinHandle<()>> {
+        vec![
+            spawn_concurrency_sampler(
+                vec![pool.clone()],
+                cancel.clone(),
+                telemetry.clone(),
+                vec!["default".to_string()],
+                interval,
+            ),
+            spawn_rate_limit_sampler(
+                vec![pool.clone()],
+                cancel.clone(),
+                telemetry.clone(),
+                interval,
+            ),
+            spawn_dlq_depth_sampler(pool.clone(), cancel.clone(), telemetry.clone(), 0, interval),
+            spawn_history_oversized_sampler(
+                vec![pool.clone()],
+                cancel.clone(),
+                telemetry.clone(),
+                100,
+                interval,
+            ),
+        ]
+    }
+
+    /// Issue #1428 evidence generator. Spawns the four samplers against an
+    /// [`accept_counting_pool`]. Metrics stay disabled and no tracing
+    /// subscriber is installed, so DEBUG is off. That is the realistic
+    /// unconfigured-deployment default. It advances a paused clock by
+    /// `TICKS` sampler intervals, and counts accepted connections. Not a
+    /// CI assertion — see `docs/performance-metrics-sampler-guard.md`.
+    /// Set `PERF_LABEL` to tag the artifact `before`/`after` the fix.
+    #[tokio::test(start_paused = true)]
+    #[ignore = "evidence generator, not a CI assertion -- see \
+                docs/performance-metrics-sampler-guard.md"]
+    async fn zz_capture_metrics_sampler_guard_pool_touch_evidence() {
+        const TICKS: usize = 20;
+        let interval = Duration::from_millis(50);
+
+        let telemetry = Arc::new(crate::telemetry::TelemetryConfig::default());
+        assert!(
+            !telemetry.metrics.is_enabled(),
+            "this harness must model an unconfigured, metrics-disabled deployment"
+        );
+        let listener = accept_counting_pool().await;
+        let cancel = CancellationToken::new();
+        let handles =
+            spawn_the_four_unguarded_samplers(&listener.pool, &cancel, &telemetry, interval);
+
+        advance_sampler_ticks(interval, TICKS).await;
+        cancel.cancel();
+        for handle in handles {
+            let _ = tokio::time::timeout(Duration::from_secs(5), handle).await;
+        }
+        listener.stop();
+
+        let touches = listener.touch_count();
+        let label = std::env::var("PERF_LABEL").unwrap_or_else(|_| "unlabeled".to_string());
+        eprintln!("label={label} ticks={TICKS} samplers=4 pool_touches={touches}");
+
+        let out_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .expect("autumn-harvest/ has a workspace-root parent")
+            .join("docs")
+            .join("perf-artifacts")
+            .join("metrics-sampler-guard");
+        std::fs::create_dir_all(&out_dir).expect("create artifact output directory");
+        std::fs::write(
+            out_dir.join(format!("{label}-counts.txt")),
+            format!(
+                "-- {label}: metrics-disabled sampler pool-touch count, 4 samplers, \
+                 {TICKS} ticks, interval={interval:?} --\nsamplers\tticks\tpool_touches\n4\t\
+                 {TICKS}\t{touches}\n"
+            ),
+        )
+        .expect("write evidence artifact");
+    }
+
+    /// Regression pin for issue #1428. The four previously-unguarded
+    /// samplers must never touch the pool under an unconfigured
+    /// deployment's usual state: metrics disabled and no DEBUG subscriber
+    /// listening. This matches every guarded sibling
+    /// (`spawn_queue_depth_sampler` and friends). It counts real accepted
+    /// connections (`AcceptCountingListener`), not a tracing event. A
+    /// subscriber filtered to hide the count cannot pass this test
+    /// vacuously. PR #1468 review (Codex, P2) found that gap.
+    #[tokio::test(start_paused = true)]
+    async fn metrics_disabled_samplers_never_touch_the_pool() {
+        let interval = Duration::from_millis(50);
+        let telemetry = Arc::new(crate::telemetry::TelemetryConfig::default());
+        let listener = accept_counting_pool().await;
+        let cancel = CancellationToken::new();
+        let handles =
+            spawn_the_four_unguarded_samplers(&listener.pool, &cancel, &telemetry, interval);
+
+        advance_sampler_ticks(interval, 20).await;
+        cancel.cancel();
+        for handle in handles {
+            let _ = tokio::time::timeout(Duration::from_secs(5), handle).await;
+        }
+        listener.stop();
+
+        assert_eq!(
+            listener.touch_count(),
+            0,
+            "a metrics-disabled deployment with no DEBUG subscriber must never reach \
+             pool.get() in any of these four samplers"
+        );
+    }
+
+    /// Codex review on PR #1468 (P2) found a gap: a blanket
+    /// `is_enabled()`-only guard on `spawn_concurrency_sampler` would
+    /// silence its documented saturation trace. That happens for a
+    /// deployment that runs with DEBUG tracing but no metrics recorder.
+    /// Pins the fix: with metrics disabled but DEBUG enabled, the sampler
+    /// still reaches `pool.get()`. Its three siblings keep no such tracing
+    /// exception.
+    #[tokio::test(start_paused = true)]
+    async fn concurrency_sampler_stays_active_for_its_saturation_trace_under_debug_tracing() {
+        use tracing_subscriber::layer::SubscriberExt;
+
+        // No filter: attaching this layer at all is enough to make
+        // `tracing::enabled!` read DEBUG as on, modeling a deployment that
+        // runs with DEBUG tracing.
+        let subscriber = tracing_subscriber::registry().with(DebugTracingOn);
+        let _guard = tracing::subscriber::set_default(subscriber);
+
+        let interval = Duration::from_millis(50);
+        let telemetry = Arc::new(crate::telemetry::TelemetryConfig::default());
+        assert!(
+            !telemetry.metrics.is_enabled(),
+            "this test's point is metrics disabled, DEBUG tracing enabled"
+        );
+        let listener = accept_counting_pool().await;
+        let cancel = CancellationToken::new();
+        let handle = spawn_concurrency_sampler(
+            vec![listener.pool.clone()],
+            cancel.clone(),
+            telemetry,
+            vec!["default".to_string()],
+            interval,
+        );
+
+        advance_sampler_ticks(interval, 5).await;
+        cancel.cancel();
+        let _ = tokio::time::timeout(Duration::from_secs(5), handle).await;
+        listener.stop();
+
+        assert!(
+            listener.touch_count() > 0,
+            "with DEBUG tracing enabled, spawn_concurrency_sampler must still reach \
+             pool.get() even though metrics are disabled, or its saturation trace goes dark"
+        );
     }
 
     #[test]
