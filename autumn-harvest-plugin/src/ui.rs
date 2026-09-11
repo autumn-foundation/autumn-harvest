@@ -15157,8 +15157,8 @@ mod tests {
     #[test]
     fn jump_to_event_control_has_a_programmatically_associated_label() {
         // Every other `label`/control pair in this file relies on the
-        // dashboard's own convention -- a `<label>` that wraps its control --
-        // which the browser associates even with no `for`/`id` pair. This
+        // dashboard's own convention: a `<label>` wraps its control. The
+        // browser associates the two even with no `for`/`id` pair. This
         // control alone rendered the label and the input as siblings, so a
         // screen reader announced the field with no accessible name at all.
         // Assert the wrapping structurally: the `jump_event` input must sit
