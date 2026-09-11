@@ -333,6 +333,74 @@ async fn terminate_idempotent_on_terminal() {
     );
 }
 
+/// Terminate on a naturally-COMPLETED execution must not claim a
+/// cancellation that never happened (issue #1456). The run has no
+/// `WorkflowCancelled` event and no stored `error`, so the reason must
+/// name the real terminal state instead of falling back to cancel's text.
+#[tokio::test]
+async fn terminate_completed_reason_does_not_claim_cancellation() {
+    let (url, _container) = setup_database().await;
+    let pool = build_pool(&url);
+    let app = build_app(&pool);
+    let mut conn = AsyncPgConnection::establish(&url).await.unwrap();
+
+    let exec_id = seed_running(&mut conn, "naturally-completed").await;
+    diesel::update(harvest_workflow_executions::table.find(exec_id.as_uuid()))
+        .set((
+            harvest_workflow_executions::state.eq("COMPLETED"),
+            harvest_workflow_executions::completed_at.eq(Some(Utc::now())),
+        ))
+        .execute(&mut conn)
+        .await
+        .unwrap();
+
+    let (status, body) = post_json(&app, &format!("/workflows/{exec_id}/terminate"), json!({}))
+        .await;
+
+    assert_eq!(status, StatusCode::ACCEPTED, "body: {body}");
+    assert_eq!(body["state"], "COMPLETED");
+    assert_ne!(
+        body["reason"], "workflow already cancelled",
+        "a COMPLETED run was never cancelled: {body}"
+    );
+    assert_eq!(
+        body["reason"], "workflow already completed",
+        "reason must name the run's actual terminal state: {body}"
+    );
+}
+
+/// Terminate on an already-FAILED execution with a stored error must
+/// still surface that error verbatim, not a derived default (issue
+/// #1456 fix must not regress the case an `error` column is present).
+#[tokio::test]
+async fn terminate_failed_reason_keeps_stored_error() {
+    let (url, _container) = setup_database().await;
+    let pool = build_pool(&url);
+    let app = build_app(&pool);
+    let mut conn = AsyncPgConnection::establish(&url).await.unwrap();
+
+    let exec_id = seed_running(&mut conn, "already-failed").await;
+    diesel::update(harvest_workflow_executions::table.find(exec_id.as_uuid()))
+        .set((
+            harvest_workflow_executions::state.eq("FAILED"),
+            harvest_workflow_executions::completed_at.eq(Some(Utc::now())),
+            harvest_workflow_executions::error.eq(Some("boom: handler panicked")),
+        ))
+        .execute(&mut conn)
+        .await
+        .unwrap();
+
+    let (status, body) = post_json(&app, &format!("/workflows/{exec_id}/terminate"), json!({}))
+        .await;
+
+    assert_eq!(status, StatusCode::ACCEPTED, "body: {body}");
+    assert_eq!(body["state"], "FAILED");
+    assert_eq!(
+        body["reason"], "boom: handler panicked",
+        "a stored error must win over any derived default: {body}"
+    );
+}
+
 /// (d) Unknown execution id → 404.
 #[tokio::test]
 async fn terminate_unknown_returns_404() {
