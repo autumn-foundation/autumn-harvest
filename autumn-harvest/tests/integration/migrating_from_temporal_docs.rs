@@ -422,6 +422,14 @@ fn dual_run_playbook_covers_schedule_driven_cutover() {
 /// name means something different. Retrying a lost update response is
 /// not safe either. Every admission mints a fresh update id, so a
 /// retry can run the update a second time.
+///
+/// An eleventh review found a gap in that same capture step. Querying
+/// Temporal's in-flight executions before pausing the schedule misses
+/// two cases. An execution that finishes just before the query is not
+/// in-flight, so the query skips it. A firing that starts in the gap
+/// between the query and the pause is not captured either. Both then
+/// misroute as harvest's. Pausing first, then listing every execution
+/// of that type, open and closed alike, closes both gaps.
 #[test]
 fn dual_run_playbook_covers_follow_up_engine_routing() {
     let guide = read_doc(GUIDE_PATH);
@@ -529,6 +537,15 @@ fn dual_run_playbook_covers_follow_up_engine_routing() {
         "the playbook must tell the reader to confirm the previous execution under a reused \
          id is not still active on its own engine, checking both engines, before starting a \
          new one elsewhere (issue #1219, PR #1473 Codex P1)"
+    );
+    assert!(
+        playbook.contains("Pause the Temporal Schedule first")
+            && playbook.contains("open and closed executions, not only the in-flight ones"),
+        "the playbook must pause the Temporal Schedule before capturing its schedule-driven \
+         type's ids, and capture open and closed executions alike -- querying in-flight \
+         executions before the pause misses one that finishes just before the query and one \
+         the schedule fires in the gap before the pause takes effect (issue #1219, PR #1473 \
+         Codex P1)"
     );
     assert!(
         playbook.contains("Never route it by the flag's current value"),

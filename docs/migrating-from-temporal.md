@@ -397,12 +397,19 @@ your whole application.
    harvest-fired execution. Harvest's built-in scheduler starts each
    firing directly. It exposes no callback before or after admission
    for your own code to run. Capture ownership a different way instead.
-   Before you pause the Temporal Schedule, list every in-flight
-   Temporal execution of that type through Temporal's own visibility
-   API. Treat a follow-up against one of those captured ids as
-   Temporal's, permanently. Treat any other id of that type as
-   harvest's. Only harvest's schedule can start a new one once Temporal
-   is paused.
+
+   Pause the Temporal Schedule first. Then list every execution of
+   that type Temporal has ever started, through Temporal's own
+   visibility API. List open and closed executions, not only the
+   in-flight ones. A query taken before the pause misses two cases. It
+   misses an execution that finishes between the query and the pause.
+   It misses one the schedule fires in that same gap. Pausing first
+   closes both gaps. No new firing can start once Temporal is paused.
+
+   Treat a follow-up against one of those captured ids as Temporal's,
+   permanently, no matter what state that execution reached. Treat any
+   other id of that type as harvest's. Only harvest's schedule can
+   start a new one once Temporal is paused.
 
    Reconcile a record that names an engine with no matching execution.
    Query that engine's own resolution for the id. A miss there means
