@@ -378,6 +378,14 @@ impl CancelledWorkflowExecution {
     ///
     /// Named after the row's actual state per [`crate::erase::TERMINAL_STATES`],
     /// not a single fixed phrase. An unrecognised state still names itself.
+    ///
+    /// MIGRATED deliberately gets no specific phrase here. It is terminal
+    /// only in the narrow sense that nothing more happens on THIS shard
+    /// (issue #964). The run stays alive on another shard, not done.
+    /// Cancel and signal both refuse to call it plainly terminal, for the
+    /// same reason (`execution.rs`'s own cancel arm, `signal.rs`). The
+    /// generic fallback below states only what is true here: this row is
+    /// sealed. It does not imply the run itself has ended.
     fn default_idempotent_reason(state: &str) -> String {
         let phrase = match state {
             "COMPLETED" => "completed",
@@ -386,8 +394,9 @@ impl CancelledWorkflowExecution {
             "TIMED_OUT" => "timed out",
             "CONTINUED_AS_NEW" => "continued as new",
             "TERMINATED" => "terminated",
-            "MIGRATED" => "migrated to another shard",
-            other => return format!("workflow already in terminal state {other}"),
+            other => {
+                return format!("workflow already in terminal state {}", other.to_lowercase());
+            }
         };
         format!("workflow already {phrase}")
     }
@@ -418,16 +427,67 @@ impl CancelledWorkflowExecution {
 mod idempotent_reason_tests {
     use super::CancelledWorkflowExecution;
 
-    /// A COMPLETED row must not get cancel's fallback text (issue #1456).
+    /// Every named state maps to its exact reason (issue #1456). A loose
+    /// `contains` check would still pass a reason that also says
+    /// "cancelled" alongside the right word, so this pins the full string.
     #[test]
-    fn completed_reason_does_not_claim_cancellation() {
-        let reason = CancelledWorkflowExecution::default_idempotent_reason("COMPLETED");
-        assert_eq!(reason, "workflow already completed");
-        assert_ne!(reason, "workflow already cancelled");
+    fn named_states_map_to_exact_reasons() {
+        let cases = [
+            ("COMPLETED", "workflow already completed"),
+            ("FAILED", "workflow already failed"),
+            ("CANCELLED", "workflow already cancelled"),
+            ("TIMED_OUT", "workflow already timed out"),
+            ("CONTINUED_AS_NEW", "workflow already continued as new"),
+            ("TERMINATED", "workflow already terminated"),
+        ];
+        for (state, expected) in cases {
+            assert_eq!(
+                CancelledWorkflowExecution::default_idempotent_reason(state),
+                expected
+            );
+        }
+    }
+
+    /// No state but CANCELLED itself may claim a cancellation that never
+    /// happened — the exact defect this issue reported for COMPLETED.
+    #[test]
+    fn only_cancelled_names_cancellation() {
+        for state in crate::erase::TERMINAL_STATES {
+            let reason = CancelledWorkflowExecution::default_idempotent_reason(state);
+            if *state == "CANCELLED" {
+                assert_eq!(reason, "workflow already cancelled");
+            } else {
+                assert!(
+                    !reason.contains("cancelled"),
+                    "reason for {state} must not claim cancellation, got: {reason}"
+                );
+            }
+        }
+    }
+
+    /// MIGRATED gets the generic fallback, not a specific claim (issue
+    /// #1456 review). The run is alive on another shard, not done, so
+    /// the reason must not read as a completed termination.
+    #[test]
+    fn migrated_uses_the_generic_fallback() {
+        assert_eq!(
+            CancelledWorkflowExecution::default_idempotent_reason("MIGRATED"),
+            "workflow already in terminal state migrated"
+        );
+    }
+
+    /// A state outside `TERMINAL_STATES` still names itself instead of
+    /// panicking or silently defaulting to cancel's text.
+    #[test]
+    fn unrecognised_state_names_itself() {
+        assert_eq!(
+            CancelledWorkflowExecution::default_idempotent_reason("SOME_FUTURE_STATE"),
+            "workflow already in terminal state some_future_state"
+        );
     }
 
     /// Every terminal state in `TERMINAL_STATES` gets a reason naming it,
-    /// not a one-size-fits-all fallback.
+    /// so a state added there without a matching arm here is caught.
     #[test]
     fn every_terminal_state_names_itself() {
         for state in crate::erase::TERMINAL_STATES {
@@ -438,14 +498,6 @@ mod idempotent_reason_tests {
                 "reason for {state} must name it, got: {reason}"
             );
         }
-    }
-
-    #[test]
-    fn cancelled_reason_is_unchanged() {
-        assert_eq!(
-            CancelledWorkflowExecution::default_idempotent_reason("CANCELLED"),
-            "workflow already cancelled"
-        );
     }
 }
 

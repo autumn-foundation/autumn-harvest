@@ -28,16 +28,29 @@ the derived reason for `CANCELLED` is unchanged —
 `"workflow already cancelled"`. A stored `error` still always wins over the
 derived default, on both call sites.
 
+`MIGRATED` — the sealed source of a shard migration (issue #964) — is in
+`TERMINAL_STATES` and reachable through terminate's own terminal-state
+check, but deliberately gets no specific phrase. That row is terminal only
+in the sense that nothing more happens on *this* shard; the run itself
+stays alive on another shard, so a confident "already migrated" claim
+would read as a completed termination it is not. It falls to the generic
+`"workflow already in terminal state migrated"` instead, matching the
+caution cancel and signal already apply to this state elsewhere.
+
 No new `WorkflowEvent` variant, no migration — a pure read-path fix, no
 change to any stored row.
 
 Tests:
 - `execution::idempotent_reason_tests` (`autumn-harvest/src/execution.rs`,
-  unit, no DB): every state in `TERMINAL_STATES` gets a reason naming it,
-  and `CANCELLED`'s derived reason is unchanged.
-- `terminate_completed_reason_does_not_claim_cancellation` and
-  `terminate_failed_reason_keeps_stored_error`
+  unit, no DB): every named state maps to its exact reason, no state but
+  `CANCELLED` claims cancellation, `MIGRATED` and an unrecognised state
+  both fall to the generic phrasing, and every state in `TERMINAL_STATES`
+  is covered.
+- `terminate_idempotent_reason_matches_state`
   (`autumn-harvest-plugin/tests/terminate_integration.rs`, integration,
   real Postgres): a naturally-`COMPLETED` run's terminate response no
-  longer claims cancellation, and a stored `error` on a `FAILED` run still
-  passes through verbatim.
+  longer claims cancellation; `CONTINUED_AS_NEW` (the other
+  never-populates-`error` state) gets its own derived reason; terminate
+  against an already-`CANCELLED` row still answers `"workflow already
+  cancelled"`; and a stored `error` on a `FAILED` run still passes
+  through verbatim.

@@ -200,6 +200,28 @@ async fn seed_running(conn: &mut AsyncPgConnection, workflow_id: &str) -> Execut
     exec_id
 }
 
+/// Seed an execution already in a terminal state, bypassing the terminal
+/// transition itself. Used to exercise terminate's idempotent no-op path
+/// against a state it never produced.
+async fn seed_terminal(
+    conn: &mut AsyncPgConnection,
+    workflow_id: &str,
+    state: &str,
+    error: Option<&str>,
+) -> ExecutionId {
+    let exec_id = seed_running(conn, workflow_id).await;
+    diesel::update(harvest_workflow_executions::table.find(exec_id.as_uuid()))
+        .set((
+            harvest_workflow_executions::state.eq(state),
+            harvest_workflow_executions::completed_at.eq(Some(Utc::now())),
+            harvest_workflow_executions::error.eq(error),
+        ))
+        .execute(conn)
+        .await
+        .unwrap();
+    exec_id
+}
+
 async fn state_of(conn: &mut AsyncPgConnection, exec_id: ExecutionId) -> String {
     harvest_workflow_executions::table
         .find(exec_id.as_uuid())
@@ -333,72 +355,51 @@ async fn terminate_idempotent_on_terminal() {
     );
 }
 
-/// Terminate on a naturally-COMPLETED execution must not claim a
-/// cancellation that never happened (issue #1456). The run has no
-/// `WorkflowCancelled` event and no stored `error`. The reason must name
-/// the real terminal state instead of falling back to cancel's text.
+/// Terminate's idempotent no-op reports a reason matching the row's real
+/// terminal state, not a cancel-specific fallback (issue #1456). A
+/// naturally-COMPLETED run — the reported repro — has no `error` and no
+/// `WorkflowCancelled` event, so its reason must not claim cancellation.
+/// CONTINUED_AS_NEW never populates `error` either, so it exercises the
+/// same derived-reason path. CANCELLED reaches `idempotent()` here via
+/// terminate's own terminal-state check, not cancel's. That pins the
+/// shared helper to answering "workflow already cancelled" from this
+/// call site too. FAILED, with a stored error, proves the derived
+/// reason never overrides a real one.
 #[tokio::test]
-async fn terminate_completed_reason_does_not_claim_cancellation() {
+async fn terminate_idempotent_reason_matches_state() {
     let (url, _container) = setup_database().await;
     let pool = build_pool(&url);
     let app = build_app(&pool);
     let mut conn = AsyncPgConnection::establish(&url).await.unwrap();
 
-    let exec_id = seed_running(&mut conn, "naturally-completed").await;
-    diesel::update(harvest_workflow_executions::table.find(exec_id.as_uuid()))
-        .set((
-            harvest_workflow_executions::state.eq("COMPLETED"),
-            harvest_workflow_executions::completed_at.eq(Some(Utc::now())),
-        ))
-        .execute(&mut conn)
-        .await
-        .unwrap();
+    let cases: &[(&str, &str, Option<&str>, &str)] = &[
+        ("completed-1", "COMPLETED", None, "workflow already completed"),
+        (
+            "continued-1",
+            "CONTINUED_AS_NEW",
+            None,
+            "workflow already continued as new",
+        ),
+        ("cancelled-1", "CANCELLED", None, "workflow already cancelled"),
+        (
+            "failed-1",
+            "FAILED",
+            Some("boom: handler panicked"),
+            "boom: handler panicked",
+        ),
+    ];
 
-    let (status, body) = post_json(&app, &format!("/workflows/{exec_id}/terminate"), json!({}))
-        .await;
+    for (workflow_id, state, error, expected_reason) in cases {
+        let exec_id = seed_terminal(&mut conn, workflow_id, state, *error).await;
 
-    assert_eq!(status, StatusCode::ACCEPTED, "body: {body}");
-    assert_eq!(body["state"], "COMPLETED");
-    assert_ne!(
-        body["reason"], "workflow already cancelled",
-        "a COMPLETED run was never cancelled: {body}"
-    );
-    assert_eq!(
-        body["reason"], "workflow already completed",
-        "reason must name the run's actual terminal state: {body}"
-    );
-}
+        let (status, body) =
+            post_json(&app, &format!("/workflows/{exec_id}/terminate"), json!({})).await;
 
-/// Terminate on an already-FAILED execution with a stored error must
-/// still surface that error verbatim, not a derived default. The
-/// issue #1456 fix must not regress the case where `error` is present.
-#[tokio::test]
-async fn terminate_failed_reason_keeps_stored_error() {
-    let (url, _container) = setup_database().await;
-    let pool = build_pool(&url);
-    let app = build_app(&pool);
-    let mut conn = AsyncPgConnection::establish(&url).await.unwrap();
-
-    let exec_id = seed_running(&mut conn, "already-failed").await;
-    diesel::update(harvest_workflow_executions::table.find(exec_id.as_uuid()))
-        .set((
-            harvest_workflow_executions::state.eq("FAILED"),
-            harvest_workflow_executions::completed_at.eq(Some(Utc::now())),
-            harvest_workflow_executions::error.eq(Some("boom: handler panicked")),
-        ))
-        .execute(&mut conn)
-        .await
-        .unwrap();
-
-    let (status, body) = post_json(&app, &format!("/workflows/{exec_id}/terminate"), json!({}))
-        .await;
-
-    assert_eq!(status, StatusCode::ACCEPTED, "body: {body}");
-    assert_eq!(body["state"], "FAILED");
-    assert_eq!(
-        body["reason"], "boom: handler panicked",
-        "a stored error must win over any derived default: {body}"
-    );
+        assert_eq!(status, StatusCode::ACCEPTED, "state {state}, body: {body}");
+        assert_eq!(body["state"], *state, "state {state}: {body}");
+        assert_eq!(body["newly_terminated"], false, "state {state}: {body}");
+        assert_eq!(body["reason"], *expected_reason, "state {state}: {body}");
+    }
 }
 
 /// (d) Unknown execution id → 404.
