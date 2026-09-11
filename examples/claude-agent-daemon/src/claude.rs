@@ -171,7 +171,19 @@ fn call_api(
             "its response was not a message: `content` and `stop_reason` are required",
         ));
     }
-    Ok(parse_reply(&payload))
+
+    let reply = parse_reply(&payload);
+    // A finished turn that says nothing and calls nothing is not an answer. A
+    // malformed block, or an empty `content`, reaches this point as a clean
+    // `end_turn` with no text. That would report a billed non-answer as a
+    // finished session.
+    if !is_usable(&reply) {
+        return Err(body_failure(
+            status,
+            "its response carried no text and no tool call",
+        ));
+    }
+    Ok(reply)
 }
 
 /// Build the request body.
@@ -237,6 +249,17 @@ fn http_failure(status: reqwest::StatusCode, body: &str) -> String {
 pub fn is_message(payload: &Value) -> bool {
     payload.get("content").is_some_and(Value::is_array)
         && payload.get("stop_reason").is_some_and(Value::is_string)
+}
+
+/// Can this reply move the session forward?
+///
+/// The test is on the projection rather than on each content block. A reply is
+/// usable when it says something, asks for a tool, or reports a stop reason
+/// that speaks for itself. That covers a malformed block without enumerating
+/// the block types. A block type this example does not know about therefore
+/// still passes, instead of failing a session the model handled correctly.
+pub fn is_usable(reply: &TurnReply) -> bool {
+    !reply.text.is_empty() || !reply.tool_calls.is_empty() || reply.stop_reason != "end_turn"
 }
 
 /// Project one API response into the durable [`TurnReply`].

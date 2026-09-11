@@ -889,3 +889,86 @@ fn the_toolbox_refuses_a_named_pipe_without_blocking_on_it() {
         );
     }
 }
+
+#[test]
+fn a_write_replaces_its_target_atomically() {
+    let dir = tempfile::tempdir().expect("a temporary directory");
+    let workspace = dir.path().to_path_buf();
+    std::fs::write(workspace.join("notes.md"), "the previous content")
+        .expect("the fixture is written");
+
+    let body = tools::activity_body(workspace.clone());
+    let raw = body(tool_request(
+        &workspace,
+        tools::TOOL_WRITE_FILE,
+        json!({ "path": "notes.md", "content": "the approved content" }),
+    ))
+    .expect("a tool failure is a result, not an activity error");
+    let outcome: ToolOutcome = serde_json::from_value(raw).expect("the outcome decodes");
+    assert!(
+        !outcome.is_error,
+        "the write must succeed: {}",
+        outcome.output
+    );
+
+    assert_eq!(
+        std::fs::read_to_string(workspace.join("notes.md")).expect("the target exists"),
+        "the approved content"
+    );
+
+    // The scratch file is renamed, never left behind.
+    let leftovers: Vec<_> = std::fs::read_dir(&workspace)
+        .expect("the workspace lists")
+        .filter_map(std::result::Result::ok)
+        .map(|entry| entry.file_name().to_string_lossy().into_owned())
+        .filter(|name| name.contains("agentd-tmp"))
+        .collect();
+    assert!(leftovers.is_empty(), "scratch files remain: {leftovers:?}");
+}
+
+#[test]
+fn a_turn_that_says_nothing_is_not_an_answer() {
+    // A malformed content block, or an empty `content`, reaches the projection
+    // as a clean `end_turn` with no text. Reporting that as a finished session
+    // would present a billed non-answer as work.
+    let empty = TurnReply {
+        content: json!([]),
+        stop_reason: "end_turn".to_string(),
+        text: String::new(),
+        tool_calls: Vec::new(),
+    };
+    assert!(
+        !claude::is_usable(&empty),
+        "an empty end_turn is not usable"
+    );
+
+    let spoken = TurnReply {
+        text: "here is the summary".to_string(),
+        ..empty.clone()
+    };
+    assert!(claude::is_usable(&spoken), "text makes a turn usable");
+
+    let calling = TurnReply {
+        stop_reason: "tool_use".to_string(),
+        tool_calls: vec![ToolCall {
+            id: "toolu_x".to_string(),
+            name: tools::TOOL_READ_FILE.to_string(),
+            input: json!({ "path": "." }),
+        }],
+        ..empty.clone()
+    };
+    assert!(
+        claude::is_usable(&calling),
+        "a tool call makes a turn usable"
+    );
+
+    // A stop reason that speaks for itself needs no content.
+    let refused = TurnReply {
+        stop_reason: "refusal".to_string(),
+        ..empty
+    };
+    assert!(
+        claude::is_usable(&refused),
+        "a refusal reports itself and must not be re-classified"
+    );
+}

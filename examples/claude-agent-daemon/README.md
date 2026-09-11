@@ -180,8 +180,10 @@ is ever approved sight unseen.
   not only lexical: a symbolic link at the final component is refused, and the
   deepest existing ancestor is resolved through every link and must stay under
   the real workspace root. The 64 KiB read cap is checked before the file is
-  allocated, so one huge file cannot take the daemon down. `write_file` is the
-  one tool the workflow gates on approval.
+  allocated, so one huge file cannot take the daemon down. A write lands
+  atomically, through a scratch file renamed over the target, so an approved
+  file is never left half-written. `write_file` is the one tool the workflow
+  gates on approval.
 - **[`src/daemon.rs`](src/daemon.rs)** — the socket, the drive tick, and the
   single-writer main loop.
 - **[`src/inspect.rs`](src/inspect.rs)** — a second, **read-only** connection
@@ -195,13 +197,14 @@ is ever approved sight unseen.
 cargo test -p claude-agent-daemon
 ```
 
-Twenty tests, all offline: the happy path, a denied tool call, the restart
+Twenty-two tests, all offline: the happy path, a denied tool call, the restart
 proof, the workspace sandbox (two symlink escapes, the read cap, and a named
-pipe), a truncated turn, a stale approval, the full approval view, a session
-bound to another workspace and to another model, the single-writer lock through
-every alias, the database and socket permissions, the drive interval, which API
-failures may be retried, a billed response that is not a message, and one
-end-to-end run through the daemon socket.
+pipe), an atomic write, a truncated turn, a turn that says nothing, a stale
+approval, the full approval view, a session bound to another workspace and to
+another model, the single-writer lock through every alias, the database and
+socket permissions, the drive interval, which API failures may be retried, a
+billed response that is not a message, and one end-to-end run through the
+daemon socket.
 
 ## What this example does not do
 

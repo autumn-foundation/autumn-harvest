@@ -314,8 +314,6 @@ const fn libc_o_nonblock() -> i32 {
 /// because activity execution is at-least-once. A crash between the write and
 /// its commit re-runs this body on resume.
 fn write_file(workspace: &Path, relative: &str, content: &str) -> Result<String, String> {
-    use std::io::Write;
-
     if content.len() > MAX_FILE_BYTES {
         return Err(format!(
             "the content is {} bytes; the limit is {MAX_FILE_BYTES}",
@@ -336,17 +334,55 @@ fn write_file(workspace: &Path, relative: &str, content: &str) -> Result<String,
             .map_err(|e| format!("cannot create the parent of `{relative}`: {e}"))?;
     }
 
-    // `O_NOFOLLOW` again: the final component must not be a link, even one
-    // that appears after the check above.
-    let mut file = std::fs::OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .custom_flags(libc_o_nofollow())
-        .open(&path)
-        .map_err(|e| format!("cannot write `{relative}`: {e}"))?;
-    file.write_all(content.as_bytes())
-        .map_err(|e| format!("cannot write `{relative}`: {e}"))?;
+    // Write through a temporary file beside the target, then rename over it. A
+    // write that fails part way, on a full disk or a quota, would otherwise
+    // leave the approved file truncated. The tool reports that as a result
+    // rather than an activity error, so nothing would retry it. The rename is
+    // atomic inside one directory, so the target holds the whole content or it
+    // is untouched.
+    let temporary = temporary_beside(&path)?;
+    drop(std::fs::remove_file(&temporary));
+
+    let outcome = write_through(&temporary, &path, content);
+    if outcome.is_err() {
+        drop(std::fs::remove_file(&temporary));
+    }
+    outcome.map_err(|e| format!("cannot write `{relative}`: {e}"))?;
 
     Ok(format!("wrote {} bytes to `{relative}`", content.len()))
+}
+
+/// The scratch path one write uses, beside its target.
+///
+/// The same directory matters: a rename is only atomic within one filesystem.
+fn temporary_beside(path: &Path) -> Result<PathBuf, String> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| "the target has no directory".to_string())?;
+    let name = path
+        .file_name()
+        .ok_or_else(|| "the target has no file name".to_string())?
+        .to_string_lossy()
+        .into_owned();
+    Ok(parent.join(format!(".{name}.agentd-tmp")))
+}
+
+/// Fill the scratch file, flush it, and rename it over the target.
+fn write_through(temporary: &Path, target: &Path, content: &str) -> Result<(), std::io::Error> {
+    use std::io::Write;
+
+    // `create_new` refuses to write through anything that already exists, and
+    // `O_NOFOLLOW` refuses a link, as everywhere else in this module.
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .custom_flags(libc_o_nofollow())
+        .open(temporary)?;
+    file.write_all(content.as_bytes())?;
+    // Flush before the rename, so a crash cannot leave the target naming a file
+    // whose content never reached the disk.
+    file.sync_all()?;
+    drop(file);
+
+    std::fs::rename(temporary, target)
 }
