@@ -39,9 +39,26 @@ issue #1202 as P2 round 4).
   test-coverage) by separate review passes; no blocking findings. Fixed:
   one untested panic branch, one unnumbered issue reference in a comment,
   and the CI-side comment-stripping gap above.
+- Codex's automated PR review (PR #1474) found a further real gap:
+  `cargo test --help` documents `[OPTIONS] [TESTNAME]`, so a cargo option
+  (e.g. `-q`) between the flag and the filter extracted as if it were the
+  filter itself — a shared option on both sides masked a real divergence,
+  the same failure class this issue exists to close. Fixed by skipping
+  any token starting with `-` until the real filter (or a bare `--`,
+  which ends cargo's own options and means no filter was given). TDD:
+  reproduced the exact scenario as a fixture test, confirmed it red
+  against the prior implementation, fixed, confirmed green.
+- CI's `Lint` job caught two `-D warnings` clippy findings
+  (`map_unwrap_or`, `manual_assert`) that a local ad-hoc clippy run had
+  missed (it failed first on unrelated pre-existing files under a
+  different feature-flag combination, before ever reaching this one).
+  Fixed by switching to `map_or_else` and a direct `assert!`, then
+  verified locally with CI's exact invocation: `cargo clippy -p
+  autumn-harvest --all-features --tests -- -D warnings` (clean).
 
 No production code changed — `chaos_docs.rs` is a test-only doc/CI parity
 guard behind no feature flag. `cargo test -p autumn-harvest --test
-integration chaos_docs::` (15/15), `cargo fmt -p autumn-harvest -- --check`,
+integration chaos_docs::` (17/17), `cargo fmt -p autumn-harvest -- --check`,
+`cargo clippy -p autumn-harvest --all-features --tests -- -D warnings`,
 and `python3 docs/audits/comment-hygiene.py --base origin/trunk-dev` are
 all clean.

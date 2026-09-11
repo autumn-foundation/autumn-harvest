@@ -257,24 +257,32 @@ fn local_iteration_example_is_scoped_to_chaos_tests_module() {
 /// Reads the FIRST `--test integration` in `command`. Every call site here
 /// passes an already-isolated single command or run line, so one match is
 /// the only one expected.
+///
+/// `cargo test --help` documents `[OPTIONS] [TESTNAME]`: a cargo option
+/// (e.g. `-q`) can sit between the flag and the filter. Skips such an
+/// option instead of returning it as if it were the filter. A bare `--`
+/// ends cargo's own options, so finding it before any filter token means
+/// there is no filter.
 fn extract_filter_argument(command: &str) -> &str {
     const FLAG: &str = "--test integration";
-    let after_flag = command
-        .find(FLAG)
-        .map(|i| &command[i + FLAG.len()..])
-        .unwrap_or_else(|| panic!("command has no {FLAG:?}: {command}"));
-    let arg_start = after_flag.trim_start_matches(|c: char| c.is_whitespace() || c == '\\');
-    let arg_end = arg_start
-        .find(char::is_whitespace)
-        .unwrap_or(arg_start.len());
-    let token = &arg_start[..arg_end];
-    // A token starting with `--` is another flag (e.g. `--no-run`), not a
-    // filter argument. `--test integration` with no filter runs the whole
-    // binary; treat that the same as no token at all.
-    if token.is_empty() || token.starts_with("--") {
-        panic!("no filter argument follows {FLAG:?} in command: {command}");
+    let after_flag = command.find(FLAG).map_or_else(
+        || panic!("command has no {FLAG:?}: {command}"),
+        |i| &command[i + FLAG.len()..],
+    );
+    let mut rest = after_flag;
+    loop {
+        rest = rest.trim_start_matches(|c: char| c.is_whitespace() || c == '\\');
+        let end = rest.find(char::is_whitespace).unwrap_or(rest.len());
+        let token = &rest[..end];
+        assert!(
+            !token.is_empty() && token != "--",
+            "no filter argument follows {FLAG:?} in command: {command}"
+        );
+        if !token.starts_with('-') {
+            return token;
+        }
+        rest = &rest[end..];
     }
-    token
 }
 
 #[test]
@@ -301,6 +309,38 @@ fn extract_filter_argument_panics_when_the_flag_has_no_following_token() {
 #[should_panic(expected = "command has no")]
 fn extract_filter_argument_panics_when_the_flag_is_absent() {
     extract_filter_argument("cargo test --lib chaos::");
+}
+
+#[test]
+fn extract_filter_argument_skips_a_cargo_option_before_the_filter() {
+    // Codex finding on PR #1474: `cargo test --help` documents
+    // `[OPTIONS] [TESTNAME]`. Cargo accepts a short option, e.g. `-q`,
+    // between `--test integration` and the filter. Skip such an option
+    // instead of returning it as if it were the filter.
+    let command = "cargo test --test integration -q chaos_tests::chaos_seeded_convergence_sweep";
+    assert_eq!(
+        extract_filter_argument(command),
+        "chaos_tests::chaos_seeded_convergence_sweep"
+    );
+}
+
+#[test]
+fn extract_filter_argument_detects_divergence_hidden_behind_a_shared_cargo_option() {
+    // The exact scenario Codex flagged: both sides insert the same `-q`
+    // before their filter. Returning the first non-`--` token extracts
+    // `-q` from both sides and calls them equal. That masks a real filter
+    // divergence -- the same class of bug issue #1224 closed.
+    let ci_command = "cargo test --test integration -q chaos_tests::chaos_seeded_convergence_sweep -- --nocapture";
+    let doc_command = "cargo test --features chaos --test integration -q \\\n  chaos_tests::";
+
+    let ci_filter = extract_filter_argument(ci_command);
+    let doc_filter = extract_filter_argument(doc_command);
+
+    assert_ne!(
+        ci_filter, doc_filter,
+        "a filter divergence must not be masked by a cargo option shared \
+         by both commands"
+    );
 }
 
 #[test]
