@@ -554,3 +554,115 @@ async fn supersede_credit_does_not_cross_a_mismatched_quota_key() {
          rejected second admission never persisted"
     );
 }
+
+async fn begin(conn: &mut AsyncPgConnection) {
+    diesel::sql_query("BEGIN")
+        .execute(conn)
+        .await
+        .expect("begin transaction");
+}
+
+async fn end(conn: &mut AsyncPgConnection) {
+    let _ = diesel::sql_query("ROLLBACK").execute(conn).await;
+}
+
+/// `dry_run_supersede_credit` must lock the rows it scans, not just read
+/// them (issue #1228 review, P1). Without a lock, an unrelated candidate
+/// could complete between this scan and the real pass's later, independent
+/// re-scan. That would shrink the population `supersede_plan` counts
+/// there, silently invalidating a credit already spent.
+///
+/// Proven deterministically, not by timing: start two runs sharing one
+/// concurrency key. Hold the dry run's transaction open and attempt to
+/// complete one of the scanned runs from a SECOND connection. That attempt
+/// must BLOCK -- proving the scan took a real row lock -- and only proceed
+/// once the first transaction ends.
+#[tokio::test]
+async fn dry_run_credit_row_locks_the_scanned_population() {
+    let (url, _c) = setup_test_database_url_or_env().await;
+    let mut setup_conn = connect(&url).await;
+
+    let wf = leaked("supersede_credit_row_lock");
+    let shared_key = leaked("shared_lock");
+
+    let x_id = ExecutionId::new();
+    start_or_load_workflow_execution(
+        &mut setup_conn,
+        params(
+            wf,
+            &format!("x-{}", Uuid::new_v4().simple()),
+            x_id,
+            shared_key,
+            ConcurrencyOnConflict::Defer,
+        ),
+        None,
+    )
+    .await
+    .expect("x must start");
+
+    let y_id = ExecutionId::new();
+    start_or_load_workflow_execution(
+        &mut setup_conn,
+        params(
+            wf,
+            &format!("y-{}", Uuid::new_v4().simple()),
+            y_id,
+            shared_key,
+            ConcurrencyOnConflict::Defer,
+        ),
+        None,
+    )
+    .await
+    .expect("y must start");
+
+    let mut scan_conn = connect(&url).await;
+    begin(&mut scan_conn).await;
+    autumn_harvest::concurrency::dry_run_supersede_credit(
+        &mut scan_conn,
+        wf,
+        shared_key,
+        1,
+        ExecutionId::new(), // excludes neither x nor y
+        "acme",
+    )
+    .await
+    .expect("dry run must scan the shared-key population");
+
+    // Attempt to complete y from a SEPARATE connection while the scan's
+    // transaction is still open. An unlocked scan lets this finish right
+    // away; a row-locked one blocks it until `scan_conn` ends.
+    let mut complete_conn = connect(&url).await;
+    let y_uuid = y_id.as_uuid();
+    let complete_task = tokio::spawn(async move {
+        diesel::sql_query(
+            "UPDATE harvest_workflow_executions SET state = 'COMPLETED', \
+             completed_at = now() WHERE id = $1",
+        )
+        .bind::<diesel::sql_types::Uuid, _>(y_uuid)
+        .execute(&mut complete_conn)
+        .await
+    });
+
+    // Give the concurrent UPDATE time to reach the server and start
+    // waiting on the row lock. This is the same one-directional setup
+    // wait `quota_lock_ordering_tests.rs` uses for its own deterministic
+    // setup.
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    assert!(
+        !complete_task.is_finished(),
+        "completing a scanned row while the dry run's transaction is open \
+         must block on that row's lock, not succeed immediately"
+    );
+
+    end(&mut scan_conn).await;
+
+    let update_result = tokio::time::timeout(std::time::Duration::from_secs(10), complete_task)
+        .await
+        .expect("the blocked UPDATE must proceed once the scan's transaction ends")
+        .expect("task join")
+        .expect("UPDATE must succeed once unblocked");
+    assert_eq!(
+        update_result, 1,
+        "the UPDATE must affect exactly the one row it targeted"
+    );
+}

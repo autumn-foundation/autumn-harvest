@@ -493,20 +493,20 @@ pub struct SupersedeCredit {
 ///
 /// # No advisory lock (Codex review, PR #1484)
 ///
-/// This performs a plain, unlocked read. Taking `lock_concurrency_key` here
-/// would acquire it BEFORE `enforce_quota_admission`'s `lock_quota_key` on
-/// this path. `replace_execution`'s three admission arms take the quota
-/// lock first and the concurrency lock later, in the real supersede pass
-/// run after `replace_execution` returns. Locking here first would invert
-/// that order between the two paths — an ABBA hazard. Reading unlocked
-/// keeps this path's lock order identical to every other: quota lock in
+/// This takes no `lock_concurrency_key`. Taking it here would acquire it
+/// BEFORE `enforce_quota_admission`'s `lock_quota_key` on this path.
+/// `replace_execution`'s three admission arms take the quota lock first
+/// and the concurrency lock later, in the real supersede pass run after
+/// `replace_execution` returns. Locking here first would invert that
+/// order between the two paths — an ABBA hazard. Skipping it keeps this
+/// path's lock order identical to every other: quota lock in
 /// `enforce_quota_admission`, then concurrency lock in the real supersede
 /// pass.
 ///
-/// The cost is a stale read under true concurrent contention on the same
-/// key. That tolerance already exists and is documented elsewhere: the
-/// "residual over limit" telemetry covers exactly this class of transient
-/// overshoot. It self-corrects on the next admission for the key.
+/// # Row locks (issue #1228 review, P1)
+///
+/// The candidate scan below takes `FOR UPDATE` on every row it returns.
+/// See that query's own comment for the staleness this closes.
 ///
 /// # Errors
 ///
@@ -546,6 +546,19 @@ pub async fn dry_run_supersede_credit(
     // Mirrors `active_runs_for_key`'s own query (same candidate population,
     // same oldest-first order), plus the `quota_key` column that function
     // has no need for.
+    //
+    // `FOR UPDATE` (issue #1228 review, P1) freezes this population for the
+    // rest of the transaction. A candidate outside the credited set could
+    // otherwise complete before the real pass re-scans, shrinking
+    // `candidates.len()` and lowering the `shed` target computed there. The
+    // real pass would then shed FEWER runs than this credit assumed,
+    // admitting an over-cap population that never converges. Locking the
+    // full scanned population, not only the credited rows, prevents that.
+    // No row here can change state until this transaction ends. The real
+    // pass's later, independent re-scan then sees the identical population
+    // and computes the identical `shed`. A row that starts existing only
+    // AFTER this scan only grows `candidates.len()`. That can only raise
+    // `shed`, never lower it -- the safe direction, so it needs no lock.
     let rows: Vec<Row> = diesel::sql_query(
         "SELECT e.id, e.quota_key \
          FROM harvest_workflow_executions e \
@@ -559,7 +572,8 @@ pub async fn dry_run_supersede_credit(
                  AND t.concurrency_key = $3 \
            ) \
          ORDER BY e.started_at ASC, e.id ASC \
-         LIMIT $4",
+         LIMIT $4 \
+         FOR UPDATE OF e",
     )
     .bind::<diesel::sql_types::Text, _>(workflow_name)
     .bind::<diesel::sql_types::Array<diesel::sql_types::Uuid>, _>(excluded)

@@ -251,3 +251,42 @@ and `quota_enforcement_tests.rs` (36/39, the 3 failures a pre-existing,
 already-tracked `quota_blocked_outbox_*` flake family unrelated to this
 change) against the corrected design. All green apart from that known
 flake family.
+
+## Follow-up 3 — PR #1484 review: lock the rows the credit depends on
+
+A third automated review round found one more P1 defect in the credit
+above: it stayed vulnerable to a stale scan, just from a different
+angle than Follow-up 2.
+
+**P1 — an unrelated candidate could still shrink the population.**
+Computing the credit under the quota lock stops a SECOND admission for
+the same quota key from racing in. It does not stop an ORDINARY
+candidate -- one in a DIFFERENT quota bucket, sharing only the
+concurrency key -- from completing on its own between the dry run's
+scan and the real pass's later, independent re-scan. That completion
+shrinks `candidates.len()`, which can lower the `shed` target
+`supersede_plan` computes at the real pass. The real pass then sheds
+FEWER runs than the credit assumed, and the admission it already let
+through commits over cap.
+
+Fixed: the dry run's candidate query now takes `FOR UPDATE` on every row
+it returns, not only the credited ones. No row in that population can
+change state until the transaction ends, so the real pass's later
+re-scan sees the identical population and computes the identical
+`shed`. A row that starts existing only after the scan only grows the
+population, which can only raise `shed`, never lower it -- the safe
+direction, so it needs no lock.
+
+New test `dry_run_credit_row_locks_the_scanned_population`
+(`quota_supersede_ordering_tests.rs`) proves the lock is real, not
+timing-dependent: it holds the dry run's transaction open on one
+connection, attempts to complete one of the scanned rows from a SECOND
+connection, and asserts that attempt blocks until the first transaction
+ends.
+
+Re-ran all four suites above against the row-locked design: `quota_
+supersede_ordering_tests.rs` (6/6, the new test included),
+`quota_lock_ordering_tests.rs` (2/2), `concurrency_supersede_tests.rs`
+(20/20), and `quota_enforcement_tests.rs` (35/39, the same known
+`quota_blocked_outbox_*` flake family). All green apart from that
+family.
