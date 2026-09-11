@@ -775,6 +775,11 @@ async fn a_cross_shard_child_cancelled_before_creation_is_born_cancelled() {
 /// This erase reported success while the child's `input`/`output` stayed
 /// in the clear on shard 1. The fix additionally reads
 /// `harvest_cross_shard_children` and routes to the child's own shard.
+// Long by construction. Each phase (force parent terminal, record the
+// outbox pointer, force child terminal, erase, assert) needs its own
+// connection and full setup. Splitting them would scatter one scenario
+// across several helpers a reader would have to reassemble.
+#[allow(clippy::too_many_lines)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn erasing_a_parent_reaches_a_terminal_cross_shard_childs_payloads() {
     let (urls, _container) = setup_shard_databases(&SHARDS).await;
@@ -888,7 +893,7 @@ async fn erasing_a_parent_reaches_a_terminal_cross_shard_childs_payloads() {
     assert!(
         output
             .as_ref()
-            .is_some_and(|o| autumn_harvest::erase::is_erasure_tombstone(o)),
+            .is_some_and(autumn_harvest::erase::is_erasure_tombstone),
         "the cross-shard child's output must be tombstoned, got {output:?}"
     );
 }
@@ -902,6 +907,9 @@ async fn erasing_a_parent_reaches_a_terminal_cross_shard_childs_payloads() {
 /// fix, an erase left that second, fully readable copy untouched forever.
 /// That was a false success on the same PII the erase call claims to
 /// remove.
+// Long by construction: see the comment on
+// `erasing_a_parent_reaches_a_terminal_cross_shard_childs_payloads` above.
+#[allow(clippy::too_many_lines)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn erasing_a_parent_scrubs_the_outbox_child_specs_input() {
     let (urls, _container) = setup_shard_databases(&SHARDS).await;

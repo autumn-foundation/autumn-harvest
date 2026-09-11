@@ -84,6 +84,11 @@ const POLL_BATCH: i64 = 1_000;
 const DUE_PREDICATE: &str = "(last_attempt_at IS NULL OR last_attempt_at < NOW() - \
      (LEAST(attempts, 6) * INTERVAL '5 seconds'))";
 
+/// Recorded as the `WorkflowCancelled` reason for a child born cancelled
+/// (issue #1263 item 13). See [`start_child_on_target`]'s cancellation arm.
+const CROSS_SHARD_BORN_CANCELLED_REASON: &str =
+    "parent requested cancellation before the relay created this child";
+
 /// Everything the relay needs to create the child on the target shard, with
 /// every default **already resolved** at spawn time.
 ///
@@ -1064,7 +1069,7 @@ async fn apply_action(
             Ok(deleted > 0)
         }
         CrossShardChildAction::StartChild => {
-            start_child_on_target(pool, row, acquire_bound, codecs, metrics).await?;
+            start_child_on_target(conn, pool, row, acquire_bound, codecs, metrics).await?;
             // Only after the child is durably committed on the target shard.
             // A crash before this update simply re-runs the insert, which the
             // child's primary key makes a no-op.
@@ -1284,6 +1289,7 @@ async fn record_attempt_failure(
 // cross-shard child gets, which is the one thing a reader needs to check here.
 #[allow(clippy::too_many_lines)]
 async fn start_child_on_target(
+    parent_conn: &mut AsyncPgConnection,
     pool: &ShardedDbPool,
     row: &CrossShardChildRow,
     acquire_bound: Option<std::time::Duration>,
@@ -1300,6 +1306,24 @@ async fn start_child_on_target(
     let parent_exec_id_str = parent_exec_id.to_string();
     let workflow_name = row.workflow_name.clone();
     let parent_close_policy = row.parent_close_policy.clone();
+
+    // Re-read the cancel flag now rather than trust `row`'s snapshot from
+    // the top of this sweep (issue #1263 item 13 follow-up). The snapshot
+    // cannot see a cancellation that commits after the sweep's batch read
+    // but before this specific child's creation. A target worker could
+    // otherwise claim and run a task the parent already cancelled. This
+    // narrows that window to the time between this query and the target
+    // transaction's own commit. It runs on `parent_conn`'s own connection,
+    // held in no transaction of its own, so it never blocks on the target
+    // shard's work below.
+    let cancel_requested: bool = harvest_cross_shard_children::table
+        .find(row.child_exec_id)
+        .select(harvest_cross_shard_children::cancel_requested)
+        .first(parent_conn)
+        .await
+        .optional()
+        .map_err(crate::error::database_error)?
+        .unwrap_or(row.cancel_requested);
 
     // The child's queue task is written inside this transaction, so it raises a
     // dispatch hint (issue #1312). The buffering scope holds the hint until the
@@ -1441,16 +1465,14 @@ async fn start_child_on_target(
                     last_error: None,
                     scheduled_time: None,
                 };
-                const CANCEL_REASON: &str =
-                    "parent requested cancellation before the relay created this child";
-                if row.cancel_requested {
+                if cancel_requested {
                     store::append_events_offloaded_with_codecs(
                         conn,
                         child_exec_id,
                         &[
                             started_event,
                             WorkflowEvent::WorkflowCancelled {
-                                reason: CANCEL_REASON.to_string(),
+                                reason: CROSS_SHARD_BORN_CANCELLED_REASON.to_string(),
                             },
                         ],
                         0,
@@ -1480,12 +1502,30 @@ async fn start_child_on_target(
                     )
                     .set((
                         harvest_workflow_executions::state.eq("CANCELLED"),
-                        harvest_workflow_executions::error.eq(Some(CANCEL_REASON)),
+                        harvest_workflow_executions::error
+                            .eq(Some(CROSS_SHARD_BORN_CANCELLED_REASON)),
                         harvest_workflow_executions::completed_at.eq(Some(created_at)),
                     ))
                     .execute(conn)
                     .await
                     .map_err(crate::error::database_error)?;
+                    // A born-cancelled child bypasses `cancel_workflow_execution`.
+                    // So its completion triggers need this explicit call (issue
+                    // #1263 item 13 follow-up). Otherwise a workflow configured
+                    // to start on this child's cancellation never would. Every
+                    // returned start already has its own durable outbox row,
+                    // committed by this same call. `spawn()` here is a
+                    // best-effort latency nudge, not the only path to it.
+                    for start in crate::completion_trigger::evaluate_triggers_for_execution(
+                        conn,
+                        child_exec_id,
+                        crate::completion_trigger::TerminalState::Cancelled,
+                        None,
+                    )
+                    .await?
+                    {
+                        start.spawn();
+                    }
                     return Ok(());
                 }
                 store::append_events_offloaded_with_codecs(

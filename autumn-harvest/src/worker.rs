@@ -12532,21 +12532,29 @@ pub async fn materialize_due_child_timeout_deadlines(
 /// child's terminal straight back into the inline append this guard exists to
 /// prevent.
 ///
-/// An unencoded parent's shard is resolved from `conn` — a durable,
-/// `SELECT`ed fact — rather than from the installed router (issue #1263 item
-/// 11). Placement can be resolved by a **context-local** router
-/// ([`crate::context::WorkflowContext::with_shard_router`]). Asking the
-/// process-global router here can then disagree with whatever router
-/// actually decided where the parent's own row was normalised to at start
-/// (`StartWorkflowParams::shard_id`). `conn` is always the shard this call
-/// runs on. So "is the parent's row visible on `conn`" is exactly the
-/// durable question this guard needs answered, with no router involved at
-/// all.
+/// An unencoded parent's shard is resolved from its own row's `shard_id`
+/// column — a durable, `SELECT`ed fact. It is not resolved from the
+/// installed router (issue #1263 item 11). Placement can be resolved by a
+/// **context-local** router ([`crate::context::WorkflowContext::with_shard_router`]).
+/// Asking the process-global router here can then disagree with whatever
+/// router actually decided where the parent's own row was normalised to at
+/// start (`StartWorkflowParams::shard_id`).
+///
+/// Reading `shard_id` rather than only checking presence on `conn` matters
+/// for a second reason: this function has callers on BOTH sides.
+/// `wake_parent_for_child_completion`/`_failure` run on the CHILD's
+/// connection; `apply_race_loser_cancellations` runs on the PARENT's own
+/// connection (issue #1263 item 11 follow-up). A parent is always found on
+/// its own connection. So a bare presence check there would report
+/// "co-located" no matter where the child actually lives, silently letting
+/// a cross-shard race loser keep running forever. Comparing the parent's
+/// actual `shard_id` against the child's encoded shard answers the question
+/// correctly, regardless of which side's connection this call runs on.
 ///
 /// With no router installed there is no second database to be on, so
 /// nothing is cross-shard. This still holds with the DB-backed
-/// unencoded-parent check: an unencoded parent's row is created on whichever
-/// single shard the deployment has, which is `conn`'s shard.
+/// unencoded-parent check: an unencoded parent's row is created on the
+/// deployment's one shard, which its own `shard_id` column records.
 ///
 /// # Errors
 ///
@@ -12566,17 +12574,24 @@ pub async fn parent_is_on_another_shard(
     if !parent.shard().is_unencoded() {
         return Ok(child_shard != parent.shard());
     }
-    // The parent's id carries no shard bits (a legacy/single-shard-minted id).
-    // Its row's presence on THIS connection is the durable answer: found here
-    // means co-located (never cross-shard), absent means it lives elsewhere.
-    let found: Option<uuid::Uuid> = harvest_workflow_executions::table
+    // The parent's id carries no shard bits (a legacy/single-shard-minted
+    // id). Read its row's own `shard_id` column directly rather than only
+    // checking presence. A caller running on the PARENT's own connection
+    // (e.g. `apply_race_loser_cancellations`) always finds the parent's row
+    // there. That would make a presence check trivially "co-located",
+    // regardless of where the child actually lives. Comparing the parent's
+    // durable `shard_id` against the child's encoded shard is correct no
+    // matter which side's connection this call runs on.
+    let parent_shard: Option<i32> = harvest_workflow_executions::table
         .find(parent.as_uuid())
-        .select(harvest_workflow_executions::id)
+        .select(harvest_workflow_executions::shard_id)
         .first(conn)
         .await
         .optional()
         .map_err(crate::error::database_error)?;
-    Ok(found.is_none())
+    // Absent here means the parent's row is not on `conn` at all, so the two
+    // cannot be co-located on it — always cross-shard.
+    Ok(parent_shard.is_none_or(|shard| child_shard != ShardId::new(shard)))
 }
 
 pub async fn wake_parent_for_child_completion(

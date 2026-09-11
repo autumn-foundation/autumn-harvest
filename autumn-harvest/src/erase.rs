@@ -1042,12 +1042,30 @@ mod db {
                 });
                 continue;
             };
-            let outcome = match crate::shard_rebalance::conn_for_shard(
-                pool,
-                ShardId::new(target_shard),
+            // Bounded, not a bare `pool.get().await` (issue #1263 item 10
+            // follow-up). The caller's own parent-shard connection stays
+            // checked out for the whole recursive descent below. For the
+            // top-level call, it is also inside an open transaction.
+            // Picture shard A's child on B, with its own child back on A.
+            // Once a pool is small or busy, that reciprocal chain can
+            // deadlock right here. This is the same class of bug
+            // `worker::shard_acquire_bound` (issue #961) exists to convert
+            // from a permanent hang into a reportable failure.
+            let checkout = tokio::time::timeout(
+                crate::worker::MIN_SHARD_ACQUIRE_BOUND,
+                crate::shard_rebalance::conn_for_shard(pool, ShardId::new(target_shard)),
             )
             .await
-            {
+            .unwrap_or_else(|_| {
+                Err(HarvestError::ShardUnavailable {
+                    shard_id: target_shard,
+                    reason: format!(
+                        "pool checkout did not complete within {:?}",
+                        crate::worker::MIN_SHARD_ACQUIRE_BOUND
+                    ),
+                })
+            });
+            let outcome = match checkout {
                 Ok(mut target_conn) => {
                     Box::pin(
                         target_conn.transaction::<_, HarvestError, _>(async |target_conn| {
