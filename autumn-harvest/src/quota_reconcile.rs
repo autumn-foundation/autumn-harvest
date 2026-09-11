@@ -111,12 +111,16 @@ pub enum ReconcileOutcome {
 /// backfilled value can therefore never drift from what a fresh admission
 /// would have computed for the same input.
 #[must_use]
-pub fn resolve_backfill(policy: Option<QuotaPolicy>, input: &serde_json::Value) -> ReconcileOutcome {
+pub fn resolve_backfill(
+    policy: Option<QuotaPolicy>,
+    input: &serde_json::Value,
+) -> ReconcileOutcome {
     let Some(policy) = policy else {
         return ReconcileOutcome::NoPolicy;
     };
     resolve_quota_key(policy.key_expr, input).map_or(ReconcileOutcome::Unresolvable, |key| {
-        quota_key_over_cap(&key).map_or(ReconcileOutcome::Backfilled(key), ReconcileOutcome::OverCap)
+        quota_key_over_cap(&key)
+            .map_or(ReconcileOutcome::Backfilled(key), ReconcileOutcome::OverCap)
     })
 }
 

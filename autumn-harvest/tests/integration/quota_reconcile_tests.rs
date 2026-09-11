@@ -285,12 +285,16 @@ async fn second_run_is_a_no_op() {
     )
     .await;
 
-    let first = reconcile_quota_keys(&mut conn, 100).await.expect("first sweep");
+    let first = reconcile_quota_keys(&mut conn, 100)
+        .await
+        .expect("first sweep");
     assert_eq!(first.backfilled, 1);
     let key_after_first = read_quota_key(&mut conn, exec_id).await;
     assert_eq!(key_after_first, Some("acme".to_string()));
 
-    let second = reconcile_quota_keys(&mut conn, 100).await.expect("second sweep");
+    let second = reconcile_quota_keys(&mut conn, 100)
+        .await
+        .expect("second sweep");
     assert_eq!(
         second,
         autumn_harvest::quota_reconcile::ReconcileSummary::default(),
@@ -321,7 +325,11 @@ async fn terminal_rows_are_never_touched() {
 
     let summary = reconcile_quota_keys(&mut conn, 100).await.expect("sweep");
 
-    assert_eq!(summary.total_scanned(), 0, "a terminal row is never a candidate");
+    assert_eq!(
+        summary.total_scanned(),
+        0,
+        "a terminal row is never a candidate"
+    );
     assert_eq!(read_quota_key(&mut conn, exec_id).await, None);
 }
 
@@ -392,7 +400,10 @@ async fn zero_batch_size_disables_the_sweep() {
 
     let summary = reconcile_quota_keys(&mut conn, 0).await.expect("sweep");
 
-    assert_eq!(summary, autumn_harvest::quota_reconcile::ReconcileSummary::default());
+    assert_eq!(
+        summary,
+        autumn_harvest::quota_reconcile::ReconcileSummary::default()
+    );
     assert_eq!(read_quota_key(&mut conn, exec_id).await, None);
 }
 
@@ -416,7 +427,9 @@ async fn batch_size_bounds_a_single_sweep_and_the_rest_finish_on_the_next_one() 
         exec_ids.push(id);
     }
 
-    let first = reconcile_quota_keys(&mut conn, 2).await.expect("first sweep");
+    let first = reconcile_quota_keys(&mut conn, 2)
+        .await
+        .expect("first sweep");
     assert_eq!(
         first.backfilled, 2,
         "LIMIT $1 must cap one sweep to batch_size rows, not the full candidate set"
@@ -428,14 +441,27 @@ async fn batch_size_bounds_a_single_sweep_and_the_rest_finish_on_the_next_one() 
             backfilled_after_first += 1;
         }
     }
-    assert_eq!(backfilled_after_first, 2, "exactly batch_size rows written, no more");
+    assert_eq!(
+        backfilled_after_first, 2,
+        "exactly batch_size rows written, no more"
+    );
 
-    let second = reconcile_quota_keys(&mut conn, 2).await.expect("second sweep");
+    let second = reconcile_quota_keys(&mut conn, 2)
+        .await
+        .expect("second sweep");
     assert_eq!(second.backfilled, 2);
-    let third = reconcile_quota_keys(&mut conn, 2).await.expect("third sweep");
-    assert_eq!(third.backfilled, 1, "the fifth and last row finishes on a later sweep");
+    let third = reconcile_quota_keys(&mut conn, 2)
+        .await
+        .expect("third sweep");
+    assert_eq!(
+        third.backfilled, 1,
+        "the fifth and last row finishes on a later sweep"
+    );
 
     for id in exec_ids {
-        assert_eq!(read_quota_key(&mut conn, id).await, Some("acme".to_string()));
+        assert_eq!(
+            read_quota_key(&mut conn, id).await,
+            Some("acme".to_string())
+        );
     }
 }
