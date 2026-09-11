@@ -431,5 +431,15 @@ fn write_through(
     file.sync_all()?;
     drop(file);
 
-    std::fs::rename(temporary, target)
+    std::fs::rename(temporary, target)?;
+
+    // The rename itself is durable only once the DIRECTORY entry is. Without
+    // this, a host crash can restore the old target, or lose a new one. The
+    // history meanwhile records the write as done and never re-runs it.
+    // Syncing the file alone does not cover the entry that names it.
+    if let Some(parent) = target.parent() {
+        std::fs::File::open(parent)?.sync_all()?;
+    }
+
+    Ok(())
 }

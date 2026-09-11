@@ -184,9 +184,10 @@ is ever approved sight unseen.
   deepest existing ancestor is resolved through every link and must stay under
   the real workspace root. The 64 KiB read cap is checked before the file is
   allocated, so one huge file cannot take the daemon down. A write lands
-  atomically, through a scratch file renamed over the target, so an approved
-  file is never left half-written, and it keeps the mode of the file it
-  replaces — a content change is not a permission change. A file the agent
+  atomically, through a scratch file renamed over the target, with both the
+  file and the directory entry flushed, so an approved file is never left
+  half-written and the replacement survives a host crash. It keeps the mode of
+  the file it replaces — a content change is not a permission change. A file the agent
   creates starts `0600`. `write_file` is the one tool the workflow gates on
   approval.
 - **[`src/daemon.rs`](src/daemon.rs)** — the socket, the drive tick, and the
@@ -259,6 +260,17 @@ Honest limits, so nothing here reads as a promise:
   `openat`-based traversal, which is more machinery than an example should
   carry. The model is the untrusted party here, and it cannot win that race;
   another process running as you already can do worse directly.
+- **Startup paths are not race-free against a local attacker.** The daemon
+  locks the database and then opens it by path, and it reclaims a stale socket
+  by checking it and then replacing it. A local process racing either sequence
+  can defeat it. Both would need an identity the pathname cannot carry — and
+  `SQLite` must be handed a path, since that is how it names its write-ahead
+  log. The same reasoning applies: whoever can win these races already runs as
+  you.
+- **Two daemons must not share one socket path.** Pointed at the same
+  `--socket` with different databases, two daemons starting at once can both
+  find the socket stale, and the loser ends up running but unreachable. Give
+  each daemon its own `--socket`.
 - **The socket file outlives the daemon.** Shutdown does not unlink it: no
   check can prove a public pathname still names *this* daemon's socket, and
   deleting someone else's is worse than leaving a stale one. The next start
