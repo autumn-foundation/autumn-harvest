@@ -407,8 +407,10 @@ async fn assert_fence_rejects_a_stale_generation_and_names_both_epochs() {
         .unwrap();
 
     FenceRegistry::clear();
-    FenceRegistry::register(ShardId::new(0), ShardGeneration::new(0)).expect("no conflicting pin in this test");
-    FenceRegistry::set_default_shard(ShardId::new(0)).expect("no conflicting default shard in this test");
+    FenceRegistry::register(ShardId::new(0), ShardGeneration::new(0))
+        .expect("no conflicting pin in this test");
+    FenceRegistry::set_default_shard(ShardId::new(0))
+        .expect("no conflicting default shard in this test");
 
     // Still current: the assert is a no-op.
     assert_fence(&mut conn, ShardId::new(0))
@@ -466,7 +468,8 @@ async fn a_missing_generation_row_fences_a_pinned_worker() {
     // Pinned, but the row this worker pinned against is gone — a restore from a
     // backup taken before DR was enabled, or a hand-edited database. Fail
     // closed: a pinned worker with nothing to check against must stop.
-    FenceRegistry::register(ShardId::new(0), ShardGeneration::new(3)).expect("no conflicting pin in this test");
+    FenceRegistry::register(ShardId::new(0), ShardGeneration::new(3))
+        .expect("no conflicting pin in this test");
     let err = assert_fence(&mut conn, ShardId::new(0))
         .await
         .expect_err("a pinned worker must fail closed when the row is absent");
@@ -500,8 +503,10 @@ async fn a_fenced_worker_cannot_persist_events() {
     .unwrap();
 
     FenceRegistry::clear();
-    FenceRegistry::register(ShardId::new(0), ShardGeneration::new(0)).expect("no conflicting pin in this test");
-    FenceRegistry::set_default_shard(ShardId::new(0)).expect("no conflicting default shard in this test");
+    FenceRegistry::register(ShardId::new(0), ShardGeneration::new(0))
+        .expect("no conflicting pin in this test");
+    FenceRegistry::set_default_shard(ShardId::new(0))
+        .expect("no conflicting default shard in this test");
     bump_generation(&mut conn, ShardId::new(0), "promote", "oncall")
         .await
         .unwrap();
@@ -598,8 +603,10 @@ async fn a_fenced_worker_cannot_re_encrypt_history() {
     // This worker is pinned to generation 0; the region has been promoted past
     // it.
     FenceRegistry::clear();
-    FenceRegistry::register(ShardId::new(0), ShardGeneration::new(0)).expect("no conflicting pin in this test");
-    FenceRegistry::set_default_shard(ShardId::new(0)).expect("no conflicting default shard in this test");
+    FenceRegistry::register(ShardId::new(0), ShardGeneration::new(0))
+        .expect("no conflicting pin in this test");
+    FenceRegistry::set_default_shard(ShardId::new(0))
+        .expect("no conflicting default shard in this test");
     bump_generation(&mut conn, ShardId::new(0), "promote", "oncall")
         .await
         .unwrap();
@@ -693,8 +700,10 @@ async fn a_fenced_worker_cannot_backfill_quota_keys() {
     // This worker is pinned to generation 0; the region has been promoted
     // past it.
     FenceRegistry::clear();
-    FenceRegistry::register(ShardId::new(0), ShardGeneration::new(0)).expect("no conflicting pin in this test");
-    FenceRegistry::set_default_shard(ShardId::new(0)).expect("no conflicting default shard in this test");
+    FenceRegistry::register(ShardId::new(0), ShardGeneration::new(0))
+        .expect("no conflicting pin in this test");
+    FenceRegistry::set_default_shard(ShardId::new(0))
+        .expect("no conflicting default shard in this test");
     bump_generation(&mut conn, ShardId::new(0), "promote", "oncall")
         .await
         .unwrap();
@@ -751,8 +760,10 @@ async fn a_fenced_worker_cannot_claim_tasks() {
         .expect("enqueue");
 
     FenceRegistry::clear();
-    FenceRegistry::register(ShardId::new(0), ShardGeneration::new(0)).expect("no conflicting pin in this test");
-    FenceRegistry::set_default_shard(ShardId::new(0)).expect("no conflicting default shard in this test");
+    FenceRegistry::register(ShardId::new(0), ShardGeneration::new(0))
+        .expect("no conflicting pin in this test");
+    FenceRegistry::set_default_shard(ShardId::new(0))
+        .expect("no conflicting default shard in this test");
 
     // Current epoch: the claim succeeds exactly as it did before #954.
     let claimed = autumn_harvest::queue::claim_task_on_shard(
@@ -832,8 +843,10 @@ async fn a_fence_bump_cannot_commit_while_a_persist_holds_the_fence() {
         .unwrap();
 
     FenceRegistry::clear();
-    FenceRegistry::register(ShardId::new(0), ShardGeneration::new(0)).expect("no conflicting pin in this test");
-    FenceRegistry::set_default_shard(ShardId::new(0)).expect("no conflicting default shard in this test");
+    FenceRegistry::register(ShardId::new(0), ShardGeneration::new(0))
+        .expect("no conflicting pin in this test");
+    FenceRegistry::set_default_shard(ShardId::new(0))
+        .expect("no conflicting default shard in this test");
 
     // Session A: open a transaction and pass the fence check. Its ACCESS SHARE
     // on harvest_shard_generation is now held until A commits.
@@ -1129,7 +1142,11 @@ async fn promotion_never_rewinds_a_descending_sequence() {
     }
 
     assert_eq!(
-        scalar(&mut conn, "SELECT pg_sequence_last_value('dr_desc_seq') AS v").await,
+        scalar(
+            &mut conn,
+            "SELECT pg_sequence_last_value('dr_desc_seq') AS v"
+        )
+        .await,
         -2
     );
 
@@ -1138,7 +1155,11 @@ async fn promotion_never_rewinds_a_descending_sequence() {
         .expect("promotion");
 
     assert_eq!(
-        scalar(&mut conn, "SELECT pg_sequence_last_value('dr_desc_seq') AS v").await,
+        scalar(
+            &mut conn,
+            "SELECT pg_sequence_last_value('dr_desc_seq') AS v"
+        )
+        .await,
         -2,
         "a descending sequence must not be reset back up to a table MAX"
     );
@@ -2167,7 +2188,8 @@ async fn promotion_body(regions: &Regions) -> Result<(), String> {
 
     // ── A surviving region-A worker, pinned to the pre-failover epoch. ────
     FenceRegistry::clear();
-    FenceRegistry::register(shard, ShardGeneration::new(0)).expect("no conflicting pin in this test");
+    FenceRegistry::register(shard, ShardGeneration::new(0))
+        .expect("no conflicting pin in this test");
     FenceRegistry::set_default_shard(shard).expect("no conflicting default shard in this test");
 
     let stale_claim = autumn_harvest::queue::claim_task_on_shard(
