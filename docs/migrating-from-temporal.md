@@ -396,9 +396,16 @@ your whole application.
 
    Reconcile a record that names an engine with no matching execution.
    Query that engine's own resolution for the id. A miss there means
-   the start never actually completed. Retry it.
-   `WorkflowIdReusePolicy` already makes a retried start safe against
-   one that silently succeeded.
+   the start never actually completed, or its result was never
+   observed. Retry it, but only under
+   `WorkflowIdReusePolicy::AllowDuplicate` (the default) or
+   `RejectDuplicate`. Both return the original execution, or refuse
+   outright, no matter what state it reached.
+
+   `AllowDuplicateFailedOnly` and `TerminateIfRunning` do the opposite
+   on purpose. Each can start a genuine second execution once the first
+   reaches a terminal state. That duplicates whatever side effects the
+   first one already committed. Neither is safe for this retry.
 
    This record names the current owner only. It matches harvest's own
    by-id resolution (issue #805), which also resolves to the latest

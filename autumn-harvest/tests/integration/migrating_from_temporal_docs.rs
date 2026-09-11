@@ -404,6 +404,14 @@ fn dual_run_playbook_covers_schedule_driven_cutover() {
 /// calls. A continue-as-new between them can seal the id before the
 /// update reaches it. `admit_update` does not follow that chain the way
 /// it follows a retry chain.
+///
+/// One more review found the reconciliation retry itself unsafe under
+/// two reuse policies. `AllowDuplicateFailedOnly` and
+/// `TerminateIfRunning` both start a genuine second execution once the
+/// first reaches a terminal state. A silently succeeded first attempt
+/// can do exactly that before the retry runs. Restrict the retry to
+/// `AllowDuplicate` or `RejectDuplicate`, the two policies that
+/// never replace a prior execution outright.
 #[test]
 fn dual_run_playbook_covers_follow_up_engine_routing() {
     let guide = read_doc(GUIDE_PATH);
@@ -439,6 +447,14 @@ fn dual_run_playbook_covers_follow_up_engine_routing() {
         "the playbook must tell the reader how to recover from the one bad state \
          write-before-start can leave behind: a record naming an engine with nothing \
          actually running there yet (issue #1219, PR #1473 Codex P1)"
+    );
+    assert!(
+        playbook.contains("WorkflowIdReusePolicy::AllowDuplicate")
+            && playbook.contains("Neither is safe for this retry"),
+        "the playbook must restrict the reconciliation retry to a reuse policy that returns \
+         the original execution or refuses outright -- AllowDuplicateFailedOnly and \
+         TerminateIfRunning can each start a genuine second execution once the first reaches \
+         a terminal state, duplicating its side effects (issue #1219, PR #1473 Codex P1)"
     );
     assert!(
         playbook.contains("Treat a missing record as Temporal"),
