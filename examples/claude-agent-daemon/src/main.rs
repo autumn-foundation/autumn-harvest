@@ -240,6 +240,10 @@ fn print_session(view: &SessionView) {
     if let Some(blocked) = &view.blocked_on {
         println!("  blocked: {blocked}");
     }
+    if let Some(pending) = &view.pending {
+        println!("  pending: {} ({})", pending.tool, pending.id);
+        println!("           {}", pending.input);
+    }
     if let Some(answer) = &view.answer {
         println!("  answer:  {answer}");
     }

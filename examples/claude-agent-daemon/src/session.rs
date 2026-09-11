@@ -22,7 +22,11 @@ use serde_json::{Value, json};
 
 use crate::tools;
 
-/// The signal name the CLI sends to release an approval-gated tool call.
+/// The signal-name prefix the CLI sends a decision to.
+///
+/// The full name carries the tool-use id (see [`approval_signal`]). A decision
+/// therefore names the one call it releases. A stale or repeated approval stays
+/// staged under its own name, and never releases a later, unseen call.
 pub const SIGNAL_TOOL_APPROVAL: &str = "tool_approval";
 
 /// The registered workflow name.
@@ -123,6 +127,18 @@ impl ToolOutcome {
     }
 }
 
+/// The signal name that releases one specific tool call.
+pub fn approval_signal(call_id: &str) -> String {
+    format!("{SIGNAL_TOOL_APPROVAL}:{call_id}")
+}
+
+/// The tool-use id one approval signal name releases.
+pub fn approval_call_id(signal_name: &str) -> Option<&str> {
+    signal_name
+        .strip_prefix(SIGNAL_TOOL_APPROVAL)?
+        .strip_prefix(':')
+}
+
 /// The decision the CLI sends for an approval-gated tool call.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ApprovalDecision {
@@ -209,8 +225,10 @@ pub async fn agent_session(
 
 /// Run one tool call that a human must release first.
 ///
-/// The wait races the `tool_approval` signal against a durable deadline timer.
-/// A missing decision denies the call, which keeps an unattended daemon moving.
+/// The wait races this call's own approval signal against a durable deadline
+/// timer. A missing decision denies the call, which keeps an unattended daemon
+/// moving. The signal name carries the tool-use id, so a decision meant for an
+/// earlier call cannot release this one.
 async fn gated_call(
     ctx: &WorkflowContext,
     task: &SessionTask,
@@ -218,7 +236,7 @@ async fn gated_call(
 ) -> Result<ToolOutcome, String> {
     let decision: Option<ApprovalDecision> = ctx
         .receive_signal_timeout(
-            SIGNAL_TOOL_APPROVAL,
+            &approval_signal(&call.id),
             Duration::from_secs(task.approval_timeout_secs),
         )
         .await

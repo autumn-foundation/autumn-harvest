@@ -44,7 +44,7 @@ impl DaemonLock {
 /// Returns an error if the lock file cannot be created, or if another process
 /// already holds the lock.
 pub fn acquire(db: &Path) -> Result<DaemonLock, String> {
-    let path = lock_path(db);
+    let path = lock_path(db)?;
     let file = OpenOptions::new()
         .create(true)
         .truncate(false)
@@ -67,9 +67,30 @@ pub fn acquire(db: &Path) -> Result<DaemonLock, String> {
 /// The lock file that belongs to `db`.
 ///
 /// The name is derived rather than fixed, so two databases in one directory
-/// take two different locks.
-fn lock_path(db: &Path) -> PathBuf {
-    let mut name = db.as_os_str().to_os_string();
+/// take two different locks. It is derived from the RESOLVED path, not the
+/// spelling. Two daemons can name one file differently: `current.db -> real.db`
+/// and `real.db` open the same database, so both must take the same lock. A
+/// database that does not exist yet is resolved through its parent directory,
+/// which does.
+fn lock_path(db: &Path) -> Result<PathBuf, String> {
+    let resolved = if db.exists() {
+        db.canonicalize()
+            .map_err(|e| format!("cannot resolve {}: {e}", db.display()))?
+    } else {
+        let parent = match db.parent() {
+            Some(parent) if !parent.as_os_str().is_empty() => parent,
+            _ => Path::new("."),
+        };
+        let name = db
+            .file_name()
+            .ok_or_else(|| format!("{} is not a database file name", db.display()))?;
+        parent
+            .canonicalize()
+            .map_err(|e| format!("cannot resolve {}: {e}", parent.display()))?
+            .join(name)
+    };
+
+    let mut name = resolved.into_os_string();
     name.push(".lock");
-    PathBuf::from(name)
+    Ok(PathBuf::from(name))
 }

@@ -57,15 +57,28 @@ fn runtime(db: &Path, workspace: &Path, calls: &Arc<AtomicUsize>) -> SqliteRunti
     rt
 }
 
-/// Deliver an approval decision.
-fn approve(rt: &mut SqliteRuntime, exec: ExecutionId) {
+/// Deliver an approval decision to the signal a session is waiting on.
+fn approve(rt: &mut SqliteRuntime, exec: ExecutionId, signal: &str) {
     let payload = serde_json::to_value(ApprovalDecision {
         approved: true,
         note: None,
     })
     .expect("the decision encodes");
-    rt.send_signal(exec, SIGNAL_TOOL_APPROVAL, payload)
+    rt.send_signal(exec, signal, payload)
         .expect("the signal is staged");
+}
+
+/// Drive to the next stop and return the approval signal the run waits on.
+async fn drive_to_approval(rt: &mut SqliteRuntime, exec: ExecutionId) -> String {
+    let state = rt.run_until_blocked(exec).await.expect("the run advances");
+    let RunState::WaitingSignal(signal) = state else {
+        panic!("expected an approval wait, got {state:?}");
+    };
+    assert!(
+        session::approval_call_id(&signal).is_some(),
+        "the wait must name the tool call it releases: {signal}"
+    );
+    signal
 }
 
 #[tokio::test]
@@ -82,18 +95,14 @@ async fn a_session_runs_its_tools_and_finishes_after_approval() {
         .expect("the session starts");
 
     // Turn one lists the workspace. Turn two proposes a write, which parks the
-    // run on the approval signal.
-    let state = rt.run_until_blocked(exec).await.expect("the run advances");
-    assert!(
-        matches!(&state, RunState::WaitingSignal(name) if name == SIGNAL_TOOL_APPROVAL),
-        "expected an approval wait, got {state:?}"
-    );
+    // run on that call's own approval signal.
+    let signal = drive_to_approval(&mut rt, exec).await;
     assert!(
         !workspace.join("agent-notes.md").exists(),
         "the gated write must not run before approval"
     );
 
-    approve(&mut rt, exec);
+    approve(&mut rt, exec, &signal);
     let state = rt.run_until_blocked(exec).await.expect("the run finishes");
     assert!(
         matches!(state, RunState::Completed(_)),
@@ -117,14 +126,14 @@ async fn a_denied_call_is_reported_to_the_model_and_the_session_continues() {
     let exec = rt
         .start_workflow(WORKFLOW_NAME, task())
         .expect("the session starts");
-    rt.run_until_blocked(exec).await.expect("the run advances");
+    let signal = drive_to_approval(&mut rt, exec).await;
 
     let payload = serde_json::to_value(ApprovalDecision {
         approved: false,
         note: Some("not this file".to_string()),
     })
     .expect("the decision encodes");
-    rt.send_signal(exec, SIGNAL_TOOL_APPROVAL, payload)
+    rt.send_signal(exec, &signal, payload)
         .expect("the signal is staged");
 
     let state = rt.run_until_blocked(exec).await.expect("the run finishes");
@@ -147,13 +156,13 @@ async fn a_restart_resumes_the_session_without_repeating_model_calls() {
 
     // Session one drives to the approval block, then the process "crashes".
     let first_calls = Arc::new(AtomicUsize::new(0));
-    let exec = {
+    let (exec, signal) = {
         let mut rt = runtime(&db, &workspace, &first_calls);
         let exec = rt
             .start_workflow(WORKFLOW_NAME, task())
             .expect("the session starts");
-        rt.run_until_blocked(exec).await.expect("the run advances");
-        exec
+        let signal = drive_to_approval(&mut rt, exec).await;
+        (exec, signal)
     };
     assert_eq!(first_calls.load(Ordering::SeqCst), 2, "two model calls");
 
@@ -161,7 +170,7 @@ async fn a_restart_resumes_the_session_without_repeating_model_calls() {
     // turn after the approval reaches the model.
     let second_calls = Arc::new(AtomicUsize::new(0));
     let mut rt = runtime(&db, &workspace, &second_calls);
-    approve(&mut rt, exec);
+    approve(&mut rt, exec, &signal);
     let state = rt.run_until_blocked(exec).await.expect("the run finishes");
 
     assert!(
@@ -256,6 +265,15 @@ async fn the_daemon_serves_one_session_over_its_socket() {
             break;
         }
         if !approved && view.blocked_on.is_some() {
+            // An operator approves an action, not a session, so the exact call
+            // must be visible before the decision.
+            let pending = view.pending.as_ref().expect("the pending call is shown");
+            assert_eq!(pending.tool, tools::TOOL_WRITE_FILE);
+            assert!(
+                pending.input.contains("agent-notes.md"),
+                "the status must show what the write does: {}",
+                pending.input
+            );
             protocol::call(
                 &socket,
                 &Request::Approve {
@@ -403,5 +421,94 @@ fn a_second_daemon_cannot_open_a_database_another_one_holds() {
     assert!(
         guard::acquire(&db).is_ok(),
         "the lock must be free once its holder is gone"
+    );
+}
+
+#[tokio::test]
+async fn a_stale_approval_cannot_release_a_later_tool_call() {
+    let dir = tempfile::tempdir().expect("a temporary directory");
+    let workspace = dir.path().join("workspace");
+    std::fs::create_dir_all(&workspace).expect("the workspace is created");
+
+    let calls = Arc::new(AtomicUsize::new(0));
+    let mut rt = runtime(&dir.path().join("agentd.db"), &workspace, &calls);
+    let exec = rt
+        .start_workflow(WORKFLOW_NAME, task())
+        .expect("the session starts");
+    let signal = drive_to_approval(&mut rt, exec).await;
+
+    // A decision that does not name this call must not release it. The bare
+    // prefix is what an early or repeated `approve` used to stage.
+    let payload = serde_json::to_value(ApprovalDecision {
+        approved: true,
+        note: None,
+    })
+    .expect("the decision encodes");
+    rt.send_signal(exec, SIGNAL_TOOL_APPROVAL, payload)
+        .expect("the signal is staged");
+
+    let state = rt.run_until_blocked(exec).await.expect("the run advances");
+    assert!(
+        matches!(&state, RunState::WaitingSignal(name) if name == &signal),
+        "an unaddressed decision must leave the call parked, got {state:?}"
+    );
+    assert!(
+        !workspace.join("agent-notes.md").exists(),
+        "an unaddressed decision must not authorise the write"
+    );
+
+    // The decision that names the call does release it.
+    approve(&mut rt, exec, &signal);
+    let state = rt.run_until_blocked(exec).await.expect("the run finishes");
+    assert!(
+        matches!(state, RunState::Completed(_)),
+        "expected completion, got {state:?}"
+    );
+}
+
+#[test]
+fn the_daemon_lock_follows_the_database_through_a_symlink() {
+    let dir = tempfile::tempdir().expect("a temporary directory");
+    let real = dir.path().join("real.db");
+    let alias = dir.path().join("current.db");
+    std::fs::write(&real, b"").expect("the database file is created");
+    std::os::unix::fs::symlink(&real, &alias).expect("the alias is created");
+
+    // Two spellings of one file must take one lock, or two daemons write it.
+    let held = guard::acquire(&real).expect("the first daemon takes the lock");
+    assert!(
+        guard::acquire(&alias).is_err(),
+        "an alias of a held database must not take a second lock"
+    );
+
+    drop(held);
+    assert!(
+        guard::acquire(&alias).is_ok(),
+        "the lock must be free once its holder is gone"
+    );
+}
+
+#[test]
+fn the_toolbox_refuses_a_file_over_the_read_cap_without_reading_it() {
+    let dir = tempfile::tempdir().expect("a temporary directory");
+    let workspace = dir.path().to_path_buf();
+    let oversized = vec![b'x'; 70 * 1024];
+    std::fs::write(workspace.join("big.txt"), &oversized).expect("the fixture is written");
+
+    let body = tools::activity_body(workspace);
+    let call = ToolCall {
+        id: "toolu_test".to_string(),
+        name: tools::TOOL_READ_FILE.to_string(),
+        input: json!({ "path": "big.txt" }),
+    };
+    let raw = body(serde_json::to_value(call).expect("the call encodes"))
+        .expect("a tool failure is a result, not an activity error");
+    let outcome: ToolOutcome = serde_json::from_value(raw).expect("the outcome decodes");
+
+    assert!(outcome.is_error, "an oversized file must not be read");
+    assert!(
+        outcome.output.contains("the limit is"),
+        "unexpected message: {}",
+        outcome.output
     );
 }

@@ -108,12 +108,30 @@ fn call_api(
         })
     });
 
-    // A transport failure is transient by nature, so it keeps the plain error
-    // string and the activity retry policy applies.
+    // A failure BEFORE a response arrived keeps the plain error string, so the
+    // activity retry policy applies. This is the ambiguous window. The request
+    // may already have reached the API, and the Messages API takes no
+    // idempotency key. A retry here can therefore pay for one turn twice. The
+    // window is one turn wide, and the README names it.
     let response = response.map_err(|e| format!("the request to the Claude API failed: {e}"))?;
     let status = response.status();
-    let text = tokio::task::block_in_place(|| Handle::current().block_on(response.text()))
-        .map_err(|e| format!("the Claude API response body failed to read: {e}"))?;
+
+    // A failure reading the body is NOT ambiguous: the request was accepted,
+    // and a retry would buy the same turn a second time for certain. Fail the
+    // attempt terminally instead, and let the operator decide.
+    let text = match tokio::task::block_in_place(|| Handle::current().block_on(response.text())) {
+        Ok(text) => text,
+        Err(e) => {
+            return Err(ActivityFailure::non_retryable(
+                "ClaudeApiResponseLost",
+                format!(
+                    "the Claude API accepted the request and its response was lost: {e}. \
+                     The turn is not retried, because a retry would be charged again."
+                ),
+            )
+            .into_error_payload());
+        }
+    };
 
     if !status.is_success() {
         return Err(http_failure(status, &text));

@@ -26,9 +26,9 @@ use tokio::sync::{mpsc, oneshot};
 use crate::claude::{self, ModelConfig};
 use crate::guard;
 use crate::inspect::{self, ExecutionRow};
-use crate::protocol::{Request, Response, SessionView};
+use crate::protocol::{PendingCall, Request, Response, SessionView};
 use crate::session::{
-    self, ApprovalDecision, SIGNAL_TOOL_APPROVAL, SessionReport, SessionTask, WORKFLOW_NAME,
+    self, ApprovalDecision, SessionReport, SessionTask, TurnReply, WORKFLOW_NAME,
 };
 use crate::tools;
 
@@ -49,6 +49,23 @@ pub struct Options {
 
 /// One control command plus the channel its answer goes back on.
 type Job = (Request, oneshot::Sender<Response>);
+
+/// The largest tool input the status prints. An operator decides from it, so
+/// it is generous; the marker says when there is more.
+const MAX_PENDING_INPUT_CHARS: usize = 2000;
+
+/// Why one session is parked, and what would release it.
+#[derive(Clone)]
+struct ParkedState {
+    /// The operator-facing reason.
+    reason: String,
+    /// The signal name a decision must carry, when the session waits for one.
+    /// It names the exact tool call, so an approval cannot release another.
+    signal: Option<String>,
+}
+
+/// The parked sessions this daemon knows about.
+type Parked = HashMap<ExecutionId, ParkedState>;
 
 /// Run the daemon until `Ctrl-C`.
 ///
@@ -104,7 +121,7 @@ pub async fn serve(options: Options) -> Result<(), String> {
         );
     }
 
-    let mut blocked: HashMap<ExecutionId, String> = HashMap::new();
+    let mut blocked: Parked = Parked::new();
     let mut ticker = tokio::time::interval(options.tick);
     loop {
         tokio::select! {
@@ -207,7 +224,7 @@ async fn serve_connection(stream: UnixStream, tx: mpsc::Sender<Job>) {
 fn handle(
     runtime: &mut SqliteRuntime,
     reader: &Connection,
-    blocked: &HashMap<ExecutionId, String>,
+    blocked: &Parked,
     request: Request,
 ) -> Response {
     match request {
@@ -216,7 +233,7 @@ fn handle(
             max_turns,
             approval_timeout_secs,
         } => submit(runtime, goal, max_turns, approval_timeout_secs),
-        Request::Status { execution_id } => match sessions(reader, blocked) {
+        Request::Status { execution_id } => match sessions(runtime, reader, blocked) {
             Ok(views) => views
                 .into_iter()
                 .find(|view| view.execution_id == execution_id)
@@ -228,7 +245,7 @@ fn handle(
                 ),
             Err(message) => Response::Error { message },
         },
-        Request::List => match sessions(reader, blocked) {
+        Request::List => match sessions(runtime, reader, blocked) {
             Ok(sessions) => Response::Sessions { sessions },
             Err(message) => Response::Error { message },
         },
@@ -237,7 +254,7 @@ fn handle(
             execution_id,
             approved,
             note,
-        } => approve(runtime, &execution_id, approved, note),
+        } => approve(runtime, blocked, &execution_id, approved, note),
     }
 }
 
@@ -274,8 +291,14 @@ fn submit(
 }
 
 /// Deliver one approval decision.
+///
+/// The decision is addressed to the signal the session is waiting on, and that
+/// name carries the tool-use id. A decision can therefore only release the call
+/// the operator was shown. An early, repeated, or stale `approve` has no live
+/// wait to land in, so it is refused here rather than staged for a later call.
 fn approve(
     runtime: &mut SqliteRuntime,
+    blocked: &Parked,
     execution_id: &str,
     approved: bool,
     note: Option<String>,
@@ -288,6 +311,11 @@ fn approve(
             };
         }
     };
+    let Some(signal) = blocked.get(&exec).and_then(|state| state.signal.clone()) else {
+        return Response::Error {
+            message: format!("session {execution_id} is not waiting for a decision"),
+        };
+    };
     let decision = ApprovalDecision { approved, note };
     let payload = match serde_json::to_value(decision) {
         Ok(value) => value,
@@ -297,7 +325,7 @@ fn approve(
             };
         }
     };
-    match runtime.send_signal(exec, SIGNAL_TOOL_APPROVAL, payload) {
+    match runtime.send_signal(exec, &signal, payload) {
         Ok(()) => Response::Ack {
             detail: if approved {
                 "approved".to_string()
@@ -350,17 +378,18 @@ fn event_label(event: &autumn_harvest::WorkflowEvent) -> String {
 
 /// Project every execution row into an operator view.
 fn sessions(
+    runtime: &SqliteRuntime,
     reader: &Connection,
-    blocked: &HashMap<ExecutionId, String>,
+    blocked: &Parked,
 ) -> Result<Vec<SessionView>, String> {
     Ok(inspect::executions(reader, WORKFLOW_NAME)?
         .into_iter()
-        .map(|row| view(&row, blocked))
+        .map(|row| view(runtime, &row, blocked))
         .collect())
 }
 
 /// Build one operator view.
-fn view(row: &ExecutionRow, blocked: &HashMap<ExecutionId, String>) -> SessionView {
+fn view(runtime: &SqliteRuntime, row: &ExecutionRow, blocked: &Parked) -> SessionView {
     let goal = serde_json::from_str::<SessionTask>(&row.input_json)
         .map_or_else(|_| "<unreadable task>".to_string(), |task| task.goal);
     let answer = row
@@ -373,20 +402,59 @@ fn view(row: &ExecutionRow, blocked: &HashMap<ExecutionId, String>) -> SessionVi
                 report.stop, report.turns, report.tool_calls, report.answer
             )
         });
-    let blocked_on = row
-        .exec_id
-        .parse::<ExecutionId>()
-        .ok()
-        .and_then(|exec| blocked.get(&exec).cloned());
+    let exec = row.exec_id.parse::<ExecutionId>().ok();
+    let state = exec.and_then(|exec| blocked.get(&exec));
+    let pending = match (exec, state.and_then(|state| state.signal.as_deref())) {
+        (Some(exec), Some(signal)) => pending_call(runtime, exec, signal),
+        _ => None,
+    };
 
     SessionView {
         execution_id: row.exec_id.clone(),
         goal,
         state: row.state.clone(),
-        blocked_on,
+        blocked_on: state.map(|state| state.reason.clone()),
+        pending,
         answer,
         error: row.error.clone(),
     }
+}
+
+/// Read the awaited tool call back out of the event log.
+///
+/// The daemon holds no copy of it. The call was recorded as the result of the
+/// model activity, so the history is the source of truth here. That is true of
+/// the run itself as well. The most recent model reply holds the awaited call,
+/// so the scan runs backwards.
+fn pending_call(runtime: &SqliteRuntime, exec: ExecutionId, signal: &str) -> Option<PendingCall> {
+    let call_id = session::approval_call_id(signal)?;
+    let history = runtime.load_history(exec).ok()?;
+
+    for event in history.iter().rev() {
+        let value = serde_json::to_value(event).ok()?;
+        if value.get("type").and_then(Value::as_str) != Some("ActivityCompleted") {
+            continue;
+        }
+        let Some(output) = value.pointer("/data/output") else {
+            continue;
+        };
+        let Ok(reply) = serde_json::from_value::<TurnReply>(output.clone()) else {
+            continue;
+        };
+        if let Some(call) = reply.tool_calls.into_iter().find(|call| call.id == call_id) {
+            let mut input = call.input.to_string();
+            if input.chars().count() > MAX_PENDING_INPUT_CHARS {
+                input = input.chars().take(MAX_PENDING_INPUT_CHARS).collect();
+                input.push_str(" … (truncated)");
+            }
+            return Some(PendingCall {
+                id: call.id,
+                tool: call.name,
+                input,
+            });
+        }
+    }
+    None
 }
 
 /// Every session the tick must drive.
@@ -409,22 +477,23 @@ fn running_sessions(reader: &Connection) -> Vec<ExecutionId> {
 }
 
 /// Drive one session to its next stopping point.
-async fn drive_one(
-    runtime: &mut SqliteRuntime,
-    exec: ExecutionId,
-    blocked: &mut HashMap<ExecutionId, String>,
-) {
+async fn drive_one(runtime: &mut SqliteRuntime, exec: ExecutionId, blocked: &mut Parked) {
     match runtime.run_until_blocked(exec).await {
         Ok(RunState::WaitingSignal(name)) => {
-            let reason = if name == SIGNAL_TOOL_APPROVAL {
+            let reason = if session::approval_call_id(&name).is_some() {
                 "waiting for a tool approval".to_string()
             } else {
                 format!("waiting for the `{name}` signal")
             };
-            note(blocked, exec, reason);
+            note(blocked, exec, reason, Some(name));
         }
         Ok(RunState::WaitingTimer) => {
-            note(blocked, exec, "waiting for a durable timer".to_string());
+            note(
+                blocked,
+                exec,
+                "waiting for a durable timer".to_string(),
+                None,
+            );
         }
         Ok(RunState::Completed(output)) => {
             blocked.remove(&exec);
@@ -442,9 +511,9 @@ async fn drive_one(
 }
 
 /// Record why a session is parked, logging only the changes.
-fn note(blocked: &mut HashMap<ExecutionId, String>, exec: ExecutionId, reason: String) {
-    if blocked.get(&exec) != Some(&reason) {
+fn note(blocked: &mut Parked, exec: ExecutionId, reason: String, signal: Option<String>) {
+    if blocked.get(&exec).map(|state| state.reason.as_str()) != Some(reason.as_str()) {
         tracing::info!(%exec, reason = %reason, "session parked");
-        blocked.insert(exec, reason);
     }
+    blocked.insert(exec, ParkedState { reason, signal });
 }

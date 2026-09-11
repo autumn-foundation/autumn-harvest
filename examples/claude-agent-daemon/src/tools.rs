@@ -8,6 +8,7 @@
 //! absolute path and any path that leaves the root, so a model cannot reach
 //! the rest of the disk.
 
+use std::io::Read;
 use std::path::{Component, Path, PathBuf};
 
 use serde_json::{Value, json};
@@ -209,15 +210,33 @@ fn list_files(workspace: &Path, relative: &str) -> Result<String, String> {
 }
 
 /// Read one text file, up to the size cap.
+///
+/// The cap is applied BEFORE the file is allocated. A plain read of a
+/// multi-gigabyte file would exhaust the daemon and stop every session. So the
+/// size is checked first, and the read itself is bounded. The second bound
+/// matters because the file can grow between the two steps.
 fn read_file(workspace: &Path, relative: &str) -> Result<String, String> {
     let path = resolve(workspace, relative)?;
-    let bytes = std::fs::read(&path).map_err(|e| format!("cannot read `{relative}`: {e}"))?;
-    if bytes.len() > MAX_FILE_BYTES {
+    let size = std::fs::metadata(&path)
+        .map_err(|e| format!("cannot read `{relative}`: {e}"))?
+        .len();
+    if size > MAX_FILE_BYTES as u64 {
         return Err(format!(
-            "`{relative}` is {} bytes; the limit is {MAX_FILE_BYTES}",
-            bytes.len()
+            "`{relative}` is {size} bytes; the limit is {MAX_FILE_BYTES}"
         ));
     }
+
+    let file = std::fs::File::open(&path).map_err(|e| format!("cannot read `{relative}`: {e}"))?;
+    let mut bytes = Vec::new();
+    file.take(MAX_FILE_BYTES as u64 + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|e| format!("cannot read `{relative}`: {e}"))?;
+    if bytes.len() > MAX_FILE_BYTES {
+        return Err(format!(
+            "`{relative}` grew past the {MAX_FILE_BYTES} byte limit while it was read"
+        ));
+    }
+
     String::from_utf8(bytes).map_err(|_| format!("`{relative}` is not UTF-8 text"))
 }
 

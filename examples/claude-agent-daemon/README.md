@@ -11,8 +11,8 @@ this example shows what the engine gives you once the loop lives inside one:
 
 | Agent-harness problem | What the engine does here |
 | --- | --- |
-| A restart loses the session | Every turn is in history; a restart **replays** it and pays for nothing twice |
-| A tool must not run unattended | The loop parks on a durable **signal** with a **deadline**, not on an in-memory future |
+| A restart loses the session | Every committed turn is in history; a restart **replays** it instead of buying it again |
+| A tool must not run unattended | The loop parks on a durable **signal** with a **deadline**, and the signal names the one call it releases |
 | A rate limit kills the run | The model call is an **activity** with a retry policy and backoff |
 | "What did it actually do?" | The **event log** is the audit trail — `agentd history <id>` |
 | A crash mid-tool re-runs it | Activity execution is **at-least-once**, so the tool bodies are idempotent |
@@ -36,6 +36,8 @@ cargo run -p claude-agent-daemon -- status <id>
 #  ffffc7df-…  RUNNING
 #    goal:    summarise the README
 #    blocked: waiting for a tool approval
+#    pending: write_file (toolu_offline_write)
+#             {"content":"# Offline stub\n…","path":"agent-notes.md"}
 
 cargo run -p claude-agent-daemon -- approve <id>
 cargo run -p claude-agent-daemon -- status <id>
@@ -110,6 +112,13 @@ never reads as a clean one: `end_turn` is a finished answer, `max_tokens` means
 the turn hit the output cap and the answer is cut short (raise `--max-tokens`),
 and `refusal` means a classifier declined the request.
 
+**Approval is per call, not per session.** The workflow waits on a signal whose
+name carries the tool-use id, and `status` prints the exact call — the tool, its
+id, and its arguments — before you decide. `approve <id>` is addressed to the
+call the daemon is currently parked on, so an early or repeated decision has no
+live wait to land in and is refused rather than stored for some later, unseen
+write.
+
 ## How it is put together
 
 ```text
@@ -143,8 +152,9 @@ and `refusal` means a classifier declined the request.
   `write_file`, each confined to the workspace directory. The confinement is
   not only lexical: a symbolic link at the final component is refused, and the
   deepest existing ancestor is resolved through every link and must stay under
-  the real workspace root. `write_file` is the one tool the workflow gates on
-  approval.
+  the real workspace root. The 64 KiB read cap is checked before the file is
+  allocated, so one huge file cannot take the daemon down. `write_file` is the
+  one tool the workflow gates on approval.
 - **[`src/daemon.rs`](src/daemon.rs)** — the socket, the drive tick, and the
   single-writer main loop.
 - **[`src/inspect.rs`](src/inspect.rs)** — a second, **read-only** connection
@@ -158,16 +168,19 @@ and `refusal` means a classifier declined the request.
 cargo test -p claude-agent-daemon
 ```
 
-Eight tests, all offline: the happy path, a denied tool call, the restart
-proof, the workspace sandbox (including two symlink escapes), a truncated turn,
-the single-writer lock, and one end-to-end run through the daemon socket.
+Eleven tests, all offline: the happy path, a denied tool call, the restart
+proof, the workspace sandbox (two symlink escapes and the read cap), a
+truncated turn, a stale approval, the single-writer lock and its aliasing, and
+one end-to-end run through the daemon socket.
 
 ## What this example does not do
 
 Honest limits, so nothing here reads as a promise:
 
 - **One writer.** The daemon owns the database file, and holds an exclusive
-  `flock` on `<db>.lock` to prove it. The lock is taken **before** the database
+  `flock` on `<db>.lock` to prove it. The lock name comes from the resolved
+  path, so two spellings of one database (`current.db -> real.db`) take one
+  lock. The lock is taken **before** the database
   is opened, because opening reclaims every task left `RUNNING` by a dead
   process: a second daemon that opened the file first would reclaim a *live*
   task and run its activity twice. The kernel releases the lock when the holder
@@ -184,6 +197,14 @@ Honest limits, so nothing here reads as a promise:
   timer deadline.
 - **No streaming.** One turn is one non-streaming request, because an activity
   result is a value, not a stream. Token-by-token output needs a side channel.
+- **One turn can be paid for twice.** Activity execution is at-least-once, and
+  the Messages API takes no idempotency key. If the daemon dies, or the
+  connection drops, after the API accepts a request but before the result is
+  committed, that one turn is sent again on resume. The window is one turn
+  wide, and only the uncommitted turn: every turn already in history replays
+  for free, which is the property the restart proof shows. The one unambiguous
+  case — the request accepted, its response lost — is not retried at all, since
+  a retry there would be charged again for certain.
 - **Unix only.** The control surface is a Unix domain socket, so the daemon
   runs on Linux and macOS. A Windows port needs a named pipe or a TCP port.
 - **The offline stub is not Claude.** It exists so the durability story is

@@ -59,10 +59,25 @@ pub struct SessionView {
     pub state: String,
     /// Why a running session is parked, when the daemon knows.
     pub blocked_on: Option<String>,
+    /// The tool call awaiting a decision, read back from the event log.
+    pub pending: Option<PendingCall>,
     /// The report of a finished session.
     pub answer: Option<String>,
     /// The error of a failed session.
     pub error: Option<String>,
+}
+
+/// The tool call one parked session is waiting on.
+///
+/// An operator approves an action, not a session, so the exact call is part of
+/// the status. Approving what you cannot see is not approval.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PendingCall {
+    /// The tool-use id. The approval signal carries it.
+    pub id: String,
+    pub tool: String,
+    /// The call arguments as JSON, truncated for a terminal.
+    pub input: String,
 }
 
 /// Send one request to the daemon and read its answer.
