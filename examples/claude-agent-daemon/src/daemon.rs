@@ -13,11 +13,14 @@
 //! Postgres core instead.
 
 use std::collections::HashMap;
+use std::os::unix::fs::FileTypeExt;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use autumn_harvest_sqlite::{ExecutionId, RunState, SqliteRuntime};
 use rusqlite::Connection;
+use rustix::fs::Mode;
+use rustix::process::umask;
 use serde_json::Value;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
@@ -34,6 +37,9 @@ use crate::tools;
 
 /// How many control commands may queue while the runtime is busy.
 const COMMAND_BACKLOG: usize = 32;
+
+/// The mask that makes the control socket owner-only (`0600`).
+const SOCKET_UMASK: u32 = 0o177;
 
 /// Everything the daemon needs to start.
 pub struct Options {
@@ -80,12 +86,25 @@ pub async fn serve(options: Options) -> Result<(), String> {
             options.workspace.display()
         )
     })?;
+    // Resolve it once. Every session records this value, and the tool activity
+    // refuses a call whose session belongs to a different workspace.
+    let workspace = options
+        .workspace
+        .canonicalize()
+        .map_err(|e| {
+            format!(
+                "cannot resolve the workspace {}: {e}",
+                options.workspace.display()
+            )
+        })?
+        .to_string_lossy()
+        .into_owned();
 
     // Take the per-database lock FIRST. The open below reclaims every task left
     // `RUNNING` by a dead process. A second daemon opening the same file would
     // reclaim a LIVE task, and its activity would run twice. The lock lives as
     // long as this call, and the kernel releases it if the process dies.
-    let lock = guard::acquire(&options.db)?;
+    let _lock = guard::acquire(&options.db)?;
 
     let model = ModelConfig::new(options.api_key, options.model, options.max_tokens)?;
     let live = model.is_live();
@@ -108,7 +127,6 @@ pub async fn serve(options: Options) -> Result<(), String> {
 
     tracing::info!(
         db = %options.db.display(),
-        lock = %lock.path().display(),
         socket = %options.socket.display(),
         workspace = %options.workspace.display(),
         model = if live { "claude api" } else { "offline stub" },
@@ -127,7 +145,7 @@ pub async fn serve(options: Options) -> Result<(), String> {
         tokio::select! {
             job = rx.recv() => {
                 let Some((request, answer)) = job else { break };
-                let response = handle(&mut runtime, &reader, &blocked, request);
+                let response = handle(&mut runtime, &reader, &blocked, &workspace, request);
                 // A closed receiver means the client hung up. Nothing to do.
                 drop(answer.send(response));
             }
@@ -155,16 +173,35 @@ pub async fn serve(options: Options) -> Result<(), String> {
 }
 
 /// Take the control socket, refusing to displace a live daemon.
-async fn bind(socket: &Path) -> Result<UnixListener, String> {
-    if socket.exists() {
+///
+/// Anything already at the path is removed ONLY when it is a socket. A typo in
+/// `--socket` must not delete a file, so any other kind of entry is an error.
+///
+/// The socket is created owner-only. Whoever can connect to it can spend money
+/// and approve writes with this daemon's privileges, so a permissive umask must
+/// not decide that. The mask is narrowed across the bind, which makes the
+/// socket private AT CREATION: there is no window in which another local user
+/// can connect.
+pub async fn bind(socket: &Path) -> Result<UnixListener, String> {
+    if let Ok(existing) = std::fs::symlink_metadata(socket) {
+        if !existing.file_type().is_socket() {
+            return Err(format!(
+                "{} exists and is not a socket. Refusing to remove it.",
+                socket.display()
+            ));
+        }
         if UnixStream::connect(socket).await.is_ok() {
             return Err(format!("a daemon already listens on {}", socket.display()));
         }
-        // The file outlived its process, so it is safe to replace.
+        // The socket outlived its process, so it is safe to replace.
         std::fs::remove_file(socket)
             .map_err(|e| format!("cannot remove the stale socket {}: {e}", socket.display()))?;
     }
-    UnixListener::bind(socket).map_err(|e| format!("cannot listen on {}: {e}", socket.display()))
+
+    let previous = umask(Mode::from_bits_truncate(SOCKET_UMASK));
+    let listener = UnixListener::bind(socket);
+    umask(previous);
+    listener.map_err(|e| format!("cannot listen on {}: {e}", socket.display()))
 }
 
 /// Accept connections and forward each request to the main loop.
@@ -225,6 +262,7 @@ fn handle(
     runtime: &mut SqliteRuntime,
     reader: &Connection,
     blocked: &Parked,
+    workspace: &str,
     request: Request,
 ) -> Response {
     match request {
@@ -232,7 +270,7 @@ fn handle(
             goal,
             max_turns,
             approval_timeout_secs,
-        } => submit(runtime, goal, max_turns, approval_timeout_secs),
+        } => submit(runtime, workspace, goal, max_turns, approval_timeout_secs),
         Request::Status { execution_id } => match sessions(runtime, reader, blocked) {
             Ok(views) => views
                 .into_iter()
@@ -261,6 +299,7 @@ fn handle(
 /// Start one session.
 fn submit(
     runtime: &mut SqliteRuntime,
+    workspace: &str,
     goal: String,
     max_turns: u32,
     approval_timeout_secs: u64,
@@ -269,6 +308,7 @@ fn submit(
         goal,
         max_turns,
         approval_timeout_secs,
+        workspace: workspace.to_string(),
     };
     let input = match serde_json::to_value(task) {
         Ok(value) => value,

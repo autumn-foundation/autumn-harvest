@@ -56,6 +56,10 @@ pub struct SessionTask {
     pub max_turns: u32,
     /// How long an approval-gated tool call waits before it is denied.
     pub approval_timeout_secs: u64,
+    /// The resolved workspace this session belongs to, as it stood at submit
+    /// time. It is recorded in history, so a daemon restarted on a DIFFERENT
+    /// directory cannot apply this session's approved writes there.
+    pub workspace: String,
 }
 
 /// One entry of the Messages API `messages` array.
@@ -87,6 +91,17 @@ impl Message {
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct TurnRequest {
     pub messages: Vec<Message>,
+}
+
+/// The input of one `run_tool` activity.
+///
+/// The workspace rides with the call so the daemon that runs it can prove it
+/// serves the same one. Without that, a restart pointed elsewhere would run an
+/// already-approved write against another project.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ToolRequest {
+    pub workspace: String,
+    pub call: ToolCall,
 }
 
 /// One `tool_use` block the model emitted.
@@ -213,7 +228,7 @@ pub async fn agent_session(
             let outcome = if tools::needs_approval(&call.name) {
                 gated_call(ctx, &task, &call).await?
             } else {
-                run_tool_call(ctx, &call).await?
+                run_tool_call(ctx, &task.workspace, &call).await?
             };
             results.push(tool_result_block(&call.id, &outcome));
         }
@@ -243,7 +258,7 @@ async fn gated_call(
         .map_err(|e| e.to_string())?;
 
     match decision {
-        Some(d) if d.approved => run_tool_call(ctx, call).await,
+        Some(d) if d.approved => run_tool_call(ctx, &task.workspace, call).await,
         Some(d) => Ok(ToolOutcome::error(format!(
             "denied by the operator: {}",
             d.note.unwrap_or_else(|| "no reason given".to_string())
@@ -256,10 +271,20 @@ async fn gated_call(
 }
 
 /// Execute one tool call as a durable activity.
-async fn run_tool_call(ctx: &WorkflowContext, call: &ToolCall) -> Result<ToolOutcome, String> {
-    ctx.execute_activity(&run_tool_info(), call.clone())
-        .await
-        .map_err(|e| e.to_string())
+async fn run_tool_call(
+    ctx: &WorkflowContext,
+    workspace: &str,
+    call: &ToolCall,
+) -> Result<ToolOutcome, String> {
+    ctx.execute_activity(
+        &run_tool_info(),
+        ToolRequest {
+            workspace: workspace.to_string(),
+            call: call.clone(),
+        },
+    )
+    .await
+    .map_err(|e| e.to_string())
 }
 
 /// Build the `tool_result` block the next request carries.
@@ -309,6 +334,9 @@ pub async fn claude_turn(
 /// failure is reported to the model as a `tool_result`, not as an activity
 /// error, so the loop keeps its history clean.
 #[activity(start_to_close = "60s")]
-pub async fn run_tool(_ctx: &ActivityContext, _call: ToolCall) -> Result<ToolOutcome, String> {
+pub async fn run_tool(
+    _ctx: &ActivityContext,
+    _request: ToolRequest,
+) -> Result<ToolOutcome, String> {
     Ok(ToolOutcome::default())
 }

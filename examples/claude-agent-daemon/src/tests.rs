@@ -18,18 +18,41 @@ use crate::guard;
 use crate::protocol::{self, Request, Response};
 use crate::session::{
     self, ApprovalDecision, SIGNAL_TOOL_APPROVAL, SessionReport, SessionTask, ToolCall,
-    ToolOutcome, TurnReply, TurnRequest, WORKFLOW_NAME,
+    ToolOutcome, ToolRequest, TurnReply, TurnRequest, WORKFLOW_NAME,
 };
 use crate::tools;
 
+/// The resolved workspace identity a session records.
+fn workspace_id(workspace: &Path) -> String {
+    workspace
+        .canonicalize()
+        .expect("the workspace resolves")
+        .to_string_lossy()
+        .into_owned()
+}
+
 /// The task every test submits.
-fn task() -> Value {
+fn task(workspace: &Path) -> Value {
     serde_json::to_value(SessionTask {
         goal: "summarise the workspace".to_string(),
         max_turns: 6,
         approval_timeout_secs: 300,
+        workspace: workspace_id(workspace),
     })
     .expect("the task encodes")
+}
+
+/// One `run_tool` activity input, as the workflow would build it.
+fn tool_request(workspace: &Path, tool: &str, input: Value) -> Value {
+    serde_json::to_value(ToolRequest {
+        workspace: workspace_id(workspace),
+        call: ToolCall {
+            id: "toolu_test".to_string(),
+            name: tool.to_string(),
+            input,
+        },
+    })
+    .expect("the call encodes")
 }
 
 /// A stub model body that counts its calls.
@@ -91,7 +114,7 @@ async fn a_session_runs_its_tools_and_finishes_after_approval() {
     let calls = Arc::new(AtomicUsize::new(0));
     let mut rt = runtime(&dir.path().join("agentd.db"), &workspace, &calls);
     let exec = rt
-        .start_workflow(WORKFLOW_NAME, task())
+        .start_workflow(WORKFLOW_NAME, task(&workspace))
         .expect("the session starts");
 
     // Turn one lists the workspace. Turn two proposes a write, which parks the
@@ -124,7 +147,7 @@ async fn a_denied_call_is_reported_to_the_model_and_the_session_continues() {
     let calls = Arc::new(AtomicUsize::new(0));
     let mut rt = runtime(&dir.path().join("agentd.db"), &workspace, &calls);
     let exec = rt
-        .start_workflow(WORKFLOW_NAME, task())
+        .start_workflow(WORKFLOW_NAME, task(&workspace))
         .expect("the session starts");
     let signal = drive_to_approval(&mut rt, exec).await;
 
@@ -159,7 +182,7 @@ async fn a_restart_resumes_the_session_without_repeating_model_calls() {
     let (exec, signal) = {
         let mut rt = runtime(&db, &workspace, &first_calls);
         let exec = rt
-            .start_workflow(WORKFLOW_NAME, task())
+            .start_workflow(WORKFLOW_NAME, task(&workspace))
             .expect("the session starts");
         let signal = drive_to_approval(&mut rt, exec).await;
         (exec, signal)
@@ -188,14 +211,12 @@ async fn a_restart_resumes_the_session_without_repeating_model_calls() {
 fn the_toolbox_refuses_a_path_outside_the_workspace() {
     let dir = tempfile::tempdir().expect("a temporary directory");
     let body = tools::activity_body(dir.path().to_path_buf());
-    let call = ToolCall {
-        id: "toolu_test".to_string(),
-        name: tools::TOOL_READ_FILE.to_string(),
-        input: json!({ "path": "../../etc/passwd" }),
-    };
-
-    let raw = body(serde_json::to_value(call).expect("the call encodes"))
-        .expect("a tool failure is a result, not an activity error");
+    let raw = body(tool_request(
+        dir.path(),
+        tools::TOOL_READ_FILE,
+        json!({ "path": "../../etc/passwd" }),
+    ))
+    .expect("a tool failure is a result, not an activity error");
     let outcome: ToolOutcome = serde_json::from_value(raw).expect("the outcome decodes");
     assert!(outcome.is_error, "the escape must fail");
     assert!(
@@ -341,7 +362,7 @@ async fn a_truncated_turn_never_reports_a_clean_finish() {
     );
 
     let exec = rt
-        .start_workflow(WORKFLOW_NAME, task())
+        .start_workflow(WORKFLOW_NAME, task(&workspace))
         .expect("the session starts");
     let state = rt.run_until_blocked(exec).await.expect("the run finishes");
     let RunState::Completed(output) = state else {
@@ -371,15 +392,14 @@ fn the_toolbox_refuses_a_symlink_that_escapes_the_workspace() {
     std::os::unix::fs::symlink(outside.join("secret.txt"), workspace.join("direct"))
         .expect("the link is created");
 
-    let body = tools::activity_body(workspace);
+    let body = tools::activity_body(workspace.clone());
     for path in ["link/secret.txt", "direct"] {
-        let call = ToolCall {
-            id: "toolu_test".to_string(),
-            name: tools::TOOL_READ_FILE.to_string(),
-            input: json!({ "path": path }),
-        };
-        let raw = body(serde_json::to_value(call).expect("the call encodes"))
-            .expect("a tool failure is a result, not an activity error");
+        let raw = body(tool_request(
+            &workspace,
+            tools::TOOL_READ_FILE,
+            json!({ "path": path }),
+        ))
+        .expect("a tool failure is a result, not an activity error");
         let outcome: ToolOutcome = serde_json::from_value(raw).expect("the outcome decodes");
         assert!(outcome.is_error, "`{path}` must not resolve");
         assert!(
@@ -389,13 +409,12 @@ fn the_toolbox_refuses_a_symlink_that_escapes_the_workspace() {
     }
 
     // A write through the escaping link must not land outside either.
-    let call = ToolCall {
-        id: "toolu_test".to_string(),
-        name: tools::TOOL_WRITE_FILE.to_string(),
-        input: json!({ "path": "link/planted.txt", "content": "planted" }),
-    };
-    let raw = body(serde_json::to_value(call).expect("the call encodes"))
-        .expect("a tool failure is a result, not an activity error");
+    let raw = body(tool_request(
+        &workspace,
+        tools::TOOL_WRITE_FILE,
+        json!({ "path": "link/planted.txt", "content": "planted" }),
+    ))
+    .expect("a tool failure is a result, not an activity error");
     let outcome: ToolOutcome = serde_json::from_value(raw).expect("the outcome decodes");
     assert!(outcome.is_error, "the write must not resolve");
     assert!(
@@ -433,7 +452,7 @@ async fn a_stale_approval_cannot_release_a_later_tool_call() {
     let calls = Arc::new(AtomicUsize::new(0));
     let mut rt = runtime(&dir.path().join("agentd.db"), &workspace, &calls);
     let exec = rt
-        .start_workflow(WORKFLOW_NAME, task())
+        .start_workflow(WORKFLOW_NAME, task(&workspace))
         .expect("the session starts");
     let signal = drive_to_approval(&mut rt, exec).await;
 
@@ -467,23 +486,30 @@ async fn a_stale_approval_cannot_release_a_later_tool_call() {
 }
 
 #[test]
-fn the_daemon_lock_follows_the_database_through_a_symlink() {
+fn the_daemon_lock_follows_the_database_through_every_alias() {
     let dir = tempfile::tempdir().expect("a temporary directory");
     let real = dir.path().join("real.db");
-    let alias = dir.path().join("current.db");
+    let symlinked = dir.path().join("current.db");
+    let hard_linked = dir.path().join("same.db");
     std::fs::write(&real, b"").expect("the database file is created");
-    std::os::unix::fs::symlink(&real, &alias).expect("the alias is created");
+    std::os::unix::fs::symlink(&real, &symlinked).expect("the symbolic link is created");
+    std::fs::hard_link(&real, &hard_linked).expect("the hard link is created");
 
-    // Two spellings of one file must take one lock, or two daemons write it.
+    // Every name for one file must take one lock, or two daemons write it. A
+    // hard link is the case a resolved PATHNAME cannot collapse: both names are
+    // canonical. The lock is held on the file itself, so both reach it.
     let held = guard::acquire(&real).expect("the first daemon takes the lock");
-    assert!(
-        guard::acquire(&alias).is_err(),
-        "an alias of a held database must not take a second lock"
-    );
+    for alias in [&symlinked, &hard_linked] {
+        assert!(
+            guard::acquire(alias).is_err(),
+            "{} must not take a second lock on a held database",
+            alias.display()
+        );
+    }
 
     drop(held);
     assert!(
-        guard::acquire(&alias).is_ok(),
+        guard::acquire(&symlinked).is_ok(),
         "the lock must be free once its holder is gone"
     );
 }
@@ -495,14 +521,13 @@ fn the_toolbox_refuses_a_file_over_the_read_cap_without_reading_it() {
     let oversized = vec![b'x'; 70 * 1024];
     std::fs::write(workspace.join("big.txt"), &oversized).expect("the fixture is written");
 
-    let body = tools::activity_body(workspace);
-    let call = ToolCall {
-        id: "toolu_test".to_string(),
-        name: tools::TOOL_READ_FILE.to_string(),
-        input: json!({ "path": "big.txt" }),
-    };
-    let raw = body(serde_json::to_value(call).expect("the call encodes"))
-        .expect("a tool failure is a result, not an activity error");
+    let body = tools::activity_body(workspace.clone());
+    let raw = body(tool_request(
+        &workspace,
+        tools::TOOL_READ_FILE,
+        json!({ "path": "big.txt" }),
+    ))
+    .expect("a tool failure is a result, not an activity error");
     let outcome: ToolOutcome = serde_json::from_value(raw).expect("the outcome decodes");
 
     assert!(outcome.is_error, "an oversized file must not be read");
@@ -510,5 +535,79 @@ fn the_toolbox_refuses_a_file_over_the_read_cap_without_reading_it() {
         outcome.output.contains("the limit is"),
         "unexpected message: {}",
         outcome.output
+    );
+}
+
+#[tokio::test]
+async fn a_session_refuses_to_run_in_another_workspace() {
+    let dir = tempfile::tempdir().expect("a temporary directory");
+    let theirs = dir.path().join("their-project");
+    let ours = dir.path().join("our-project");
+    std::fs::create_dir_all(&theirs).expect("the workspace is created");
+    std::fs::create_dir_all(&ours).expect("the workspace is created");
+
+    // The session belongs to one workspace; this daemon serves another. A
+    // restart pointed elsewhere must not run the session's writes here.
+    let calls = Arc::new(AtomicUsize::new(0));
+    let mut rt = runtime(&dir.path().join("agentd.db"), &ours, &calls);
+    let exec = rt
+        .start_workflow(WORKFLOW_NAME, task(&theirs))
+        .expect("the session starts");
+
+    let state = rt.run_until_blocked(exec).await.expect("the run advances");
+    let RunState::Failed(error) = state else {
+        panic!("expected a terminal failure, got {state:?}");
+    };
+    assert!(
+        error.contains("belongs to the workspace"),
+        "unexpected failure: {error}"
+    );
+    assert!(
+        !ours.join("agent-notes.md").exists(),
+        "a session from another workspace must not write here"
+    );
+}
+
+#[tokio::test]
+async fn the_control_socket_is_private_and_never_deletes_another_file() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = tempfile::tempdir().expect("a temporary directory");
+
+    // A typo in `--socket` must not destroy the file it happens to name.
+    let precious = dir.path().join("notes.txt");
+    std::fs::write(&precious, "keep me").expect("the file is written");
+    let refused = daemon::bind(&precious).await;
+    assert!(refused.is_err(), "a regular file must not be bound over");
+    assert_eq!(
+        std::fs::read_to_string(&precious).expect("the file survives"),
+        "keep me",
+        "the file must not be deleted"
+    );
+
+    // Whoever can connect can spend money, so the socket is owner-only.
+    let socket = dir.path().join("agentd.sock");
+    let listener = daemon::bind(&socket).await.expect("the socket binds");
+    let mode = std::fs::metadata(&socket)
+        .expect("the socket exists")
+        .permissions()
+        .mode()
+        & 0o777;
+    assert_eq!(mode, 0o600, "the control socket must be owner-only");
+    drop(listener);
+}
+
+#[test]
+fn a_zero_drive_interval_is_rejected() {
+    use clap::Parser;
+
+    // A zero period panics the timer, which would take the daemon down.
+    assert!(
+        crate::Cli::try_parse_from(["agentd", "serve", "--tick-ms", "0"]).is_err(),
+        "a zero tick must be refused at the boundary"
+    );
+    assert!(
+        crate::Cli::try_parse_from(["agentd", "serve", "--tick-ms", "1"]).is_ok(),
+        "one millisecond is a usable period"
     );
 }

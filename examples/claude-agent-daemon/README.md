@@ -112,6 +112,17 @@ never reads as a clean one: `end_turn` is a finished answer, `max_tokens` means
 the turn hit the output cap and the answer is cut short (raise `--max-tokens`),
 and `refusal` means a classifier declined the request.
 
+**The control socket is owner-only.** Whoever can connect can spend money and
+approve writes with the daemon's privileges, so the socket is created `0600`
+under a narrowed umask — private at creation, with no window to connect
+through. A path that already holds something other than a socket is never
+removed: a typo in `--socket` reports an error instead of deleting a file.
+
+**A session is bound to its workspace.** The resolved workspace is recorded in
+the session's history at submit time, and a tool call is refused when the
+daemon serves a different one. Otherwise a restart pointed at another directory
+could apply an already-approved write to the wrong project.
+
 **Approval is per call, not per session.** The workflow waits on a signal whose
 name carries the tool-use id, and `status` prints the exact call — the tool, its
 id, and its arguments — before you decide. `approve <id>` is addressed to the
@@ -159,8 +170,8 @@ write.
   single-writer main loop.
 - **[`src/inspect.rs`](src/inspect.rs)** — a second, **read-only** connection
   for the listing the runtime does not expose.
-- **[`src/guard.rs`](src/guard.rs)** — the exclusive per-database lock that
-  keeps "one writer" true across processes.
+- **[`src/guard.rs`](src/guard.rs)** — the exclusive lock on the database file
+  that keeps "one writer" true across processes.
 
 ## Tests
 
@@ -168,19 +179,21 @@ write.
 cargo test -p claude-agent-daemon
 ```
 
-Eleven tests, all offline: the happy path, a denied tool call, the restart
+Fourteen tests, all offline: the happy path, a denied tool call, the restart
 proof, the workspace sandbox (two symlink escapes and the read cap), a
-truncated turn, a stale approval, the single-writer lock and its aliasing, and
-one end-to-end run through the daemon socket.
+truncated turn, a stale approval, a session bound to another workspace, the
+single-writer lock through every alias, the socket's privacy, the drive
+interval, and one end-to-end run through the daemon socket.
 
 ## What this example does not do
 
 Honest limits, so nothing here reads as a promise:
 
 - **One writer.** The daemon owns the database file, and holds an exclusive
-  `flock` on `<db>.lock` to prove it. The lock name comes from the resolved
-  path, so two spellings of one database (`current.db -> real.db`) take one
-  lock. The lock is taken **before** the database
+  `flock` on that file to prove it. The lock is on the file itself rather than
+  on a name derived from its path, so every alias — a symbolic link, a hard
+  link, a different spelling — reaches the same lock. It is taken **before** the
+  database
   is opened, because opening reclaims every task left `RUNNING` by a dead
   process: a second daemon that opened the file first would reclaim a *live*
   task and run its activity twice. The kernel releases the lock when the holder

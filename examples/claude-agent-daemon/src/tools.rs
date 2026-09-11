@@ -13,7 +13,9 @@ use std::path::{Component, Path, PathBuf};
 
 use serde_json::{Value, json};
 
-use crate::session::{ToolCall, ToolOutcome};
+use autumn_harvest::failure::{ActivityFailure, IntoActivityErrorString};
+
+use crate::session::{ToolCall, ToolOutcome, ToolRequest};
 
 /// List the entries of one directory.
 pub const TOOL_LIST_FILES: &str = "list_files";
@@ -82,17 +84,41 @@ pub fn definitions() -> Value {
 
 /// Build the synchronous activity body the runtime registers for `run_tool`.
 ///
-/// The workspace root is captured here rather than passed through the workflow.
-/// It is daemon configuration, so it stays out of the recorded history.
+/// The daemon's workspace root is captured here. The call carries the workspace
+/// its session was started in, and the two must be the same one. A daemon
+/// restarted on another directory therefore refuses the call instead of running
+/// an already-approved write against the wrong project. The refusal is
+/// non-retryable, so the session fails loudly and the operator can restart the
+/// daemon where the session belongs.
 pub fn activity_body(
     workspace: PathBuf,
 ) -> impl Fn(Value) -> Result<Value, String> + Send + Sync + 'static {
     move |input| {
-        let call: ToolCall =
+        let request: ToolRequest =
             serde_json::from_value(input).map_err(|e| format!("malformed tool call: {e}"))?;
-        let outcome = dispatch(&workspace, &call);
+        if !serves(&workspace, &request.workspace) {
+            return Err(ActivityFailure::non_retryable(
+                "WorkspaceMismatch",
+                format!(
+                    "this session belongs to the workspace `{}`, and this daemon serves `{}`",
+                    request.workspace,
+                    workspace.display()
+                ),
+            )
+            .into_error_payload());
+        }
+        let outcome = dispatch(&workspace, &request.call);
         serde_json::to_value(outcome).map_err(|e| format!("tool result is not JSON: {e}"))
     }
+}
+
+/// Does this daemon serve the workspace the session was started in?
+///
+/// The comparison is between resolved paths, so a different spelling of one
+/// directory still matches.
+fn serves(root: &Path, recorded: &str) -> bool {
+    root.canonicalize()
+        .is_ok_and(|real| real == Path::new(recorded))
 }
 
 /// Run one tool call.

@@ -12,12 +12,18 @@
 //! `--socket` lets two daemons write one file forever. So the lock is held on
 //! the DATABASE, and it is taken before the file is opened.
 //!
-//! `flock` is the mechanism because the kernel releases it when the holder
-//! dies, however it dies. A crashed daemon therefore strands nothing, which is
-//! what keeps the restart path clean.
+//! The lock is taken on the database FILE ITSELF, never on a sidecar named
+//! after its path. Many names reach one database: a symbolic link, a hard link,
+//! a relative spelling. Only the file's own identity collapses every one of
+//! them, and an open descriptor is exactly that identity.
+//!
+//! `flock` is the mechanism for two reasons. The kernel releases it when the
+//! holder dies, however it dies, so a crashed daemon strands nothing and the
+//! restart path stays clean. And `SQLite` locks with `fcntl` record locks,
+//! which is a separate domain, so this lock never contends with the engine.
 
 use std::fs::{File, OpenOptions};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use rustix::fs::{FlockOperation, flock};
 
@@ -27,30 +33,25 @@ use rustix::fs::{FlockOperation, flock};
 /// releases the lock; so does process exit.
 pub struct DaemonLock {
     _file: File,
-    path: PathBuf,
 }
 
-impl DaemonLock {
-    /// The lock file this daemon holds.
-    pub fn path(&self) -> &Path {
-        &self.path
-    }
-}
-
-/// Take the exclusive lock for `db`, or report who holds it.
+/// Take the exclusive lock for `db`, or report that another daemon holds it.
 ///
 /// # Errors
 ///
-/// Returns an error if the lock file cannot be created, or if another process
-/// already holds the lock.
+/// Returns an error if the database file cannot be opened, or if another
+/// process already holds the lock.
 pub fn acquire(db: &Path) -> Result<DaemonLock, String> {
-    let path = lock_path(db)?;
+    // Create the file when it is absent. An empty file is a valid, empty
+    // `SQLite` database, and the runtime initializes it on open. Creating it
+    // here is what gives a brand-new database an identity to lock.
     let file = OpenOptions::new()
         .create(true)
-        .truncate(false)
+        .read(true)
         .write(true)
-        .open(&path)
-        .map_err(|e| format!("cannot open the lock file {}: {e}", path.display()))?;
+        .truncate(false)
+        .open(db)
+        .map_err(|e| format!("cannot open {}: {e}", db.display()))?;
 
     // Non-blocking, so a second daemon fails at once with a clear message
     // rather than hanging on a lock it will never get.
@@ -61,36 +62,5 @@ pub fn acquire(db: &Path) -> Result<DaemonLock, String> {
         )
     })?;
 
-    Ok(DaemonLock { _file: file, path })
-}
-
-/// The lock file that belongs to `db`.
-///
-/// The name is derived rather than fixed, so two databases in one directory
-/// take two different locks. It is derived from the RESOLVED path, not the
-/// spelling. Two daemons can name one file differently: `current.db -> real.db`
-/// and `real.db` open the same database, so both must take the same lock. A
-/// database that does not exist yet is resolved through its parent directory,
-/// which does.
-fn lock_path(db: &Path) -> Result<PathBuf, String> {
-    let resolved = if db.exists() {
-        db.canonicalize()
-            .map_err(|e| format!("cannot resolve {}: {e}", db.display()))?
-    } else {
-        let parent = match db.parent() {
-            Some(parent) if !parent.as_os_str().is_empty() => parent,
-            _ => Path::new("."),
-        };
-        let name = db
-            .file_name()
-            .ok_or_else(|| format!("{} is not a database file name", db.display()))?;
-        parent
-            .canonicalize()
-            .map_err(|e| format!("cannot resolve {}: {e}", parent.display()))?
-            .join(name)
-    };
-
-    let mut name = resolved.into_os_string();
-    name.push(".lock");
-    Ok(PathBuf::from(name))
+    Ok(DaemonLock { _file: file })
 }
