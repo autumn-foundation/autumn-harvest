@@ -540,7 +540,7 @@ async fn batch_size_bounds_a_single_sweep_and_the_rest_finish_on_the_next_one() 
 async fn cursor_advances_past_permanently_stuck_rows_so_a_resolvable_row_is_not_starved() {
     let (mut conn, _container) = setup_db().await;
     // Both workflow types carry a registered policy, so `CANDIDATE_SQL`'s
-    // `workflow_name = ANY($1)` filter returns rows for each -- otherwise
+    // `workflow_name = ANY($1)` filter returns rows for each. Otherwise
     // this test would pass on the very first tick regardless of cursor
     // behavior, since an unregistered type's rows are never fetched at
     // all. `wf_stuck`'s input omits the policy's key field, so every one

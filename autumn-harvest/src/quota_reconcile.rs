@@ -480,10 +480,11 @@ pub async fn reconcile_quota_keys_from(
 /// full-pass wrap, even if every recent batch was full.
 ///
 /// A natural wrap only fires once a batch returns fewer rows than
-/// `batch_size` (see [`reconcile_quota_keys_from`]'s doc comment). A
-/// sustained backlog of permanently-stuck rows -- unresolvable or
-/// over-cap, for a workflow type that already has a policy -- can keep
-/// every batch full indefinitely. Consider a `QuotaPolicy` declared
+/// `batch_size` (see [`reconcile_quota_keys_from`]'s doc comment).
+/// Consider a sustained backlog of permanently-stuck rows --
+/// unresolvable or over-cap, for a workflow type that already has a
+/// policy. It can keep every batch full indefinitely. Now consider a
+/// `QuotaPolicy` declared
 /// mid-uptime for a DIFFERENT, previously-unregistered workflow type.
 /// Its rows can sort below the cursor. Such a row then stays invisible
 /// for as long as that backlog lasts, contradicting the "next tick"
