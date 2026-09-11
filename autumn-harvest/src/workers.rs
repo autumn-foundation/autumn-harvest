@@ -338,7 +338,9 @@ pub async fn register_worker<S: std::hash::BuildHasher + Send + Sync>(
         .do_update()
         .set((
             harvest_workers::started_at.eq(excluded(harvest_workers::started_at)),
-            harvest_workers::last_heartbeat_at.eq(Utc::now()),
+            // The shard database's own clock, never this host's `Utc::now()`
+            // -- see the matching rationale on `heartbeat_worker` below.
+            harvest_workers::last_heartbeat_at.eq(diesel::dsl::now),
             harvest_workers::queues.eq(excluded(harvest_workers::queues)),
             harvest_workers::shard_assignments.eq(excluded(harvest_workers::shard_assignments)),
             harvest_workers::max_concurrency.eq(excluded(harvest_workers::max_concurrency)),
@@ -457,7 +459,16 @@ pub async fn heartbeat_worker(
     let labels = crate::payload_codec::advertise_codec_capability(labels, registered_codec_key_ids);
     let affected = diesel::update(harvest_workers::table.find(worker_id))
         .set((
-            harvest_workers::last_heartbeat_at.eq(Utc::now()),
+            // The shard database's own clock, never this host's
+            // `Utc::now()`. `codec_rotation::blocking_workers` computes
+            // liveness as `NOW() - last_heartbeat_at`, entirely on the
+            // database side.
+            //
+            // A `last_heartbeat_at` stamped by a skewed worker host would
+            // compare unevenly against that `NOW()`. A continuously live
+            // worker could misclassify as stale and be silently excluded
+            // from the codec-capability gate.
+            harvest_workers::last_heartbeat_at.eq(diesel::dsl::now),
             harvest_workers::in_flight_count.eq(in_flight_count),
             harvest_workers::labels.eq(&labels),
             harvest_workers::in_use_sessions.eq(in_use_sessions),
