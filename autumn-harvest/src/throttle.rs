@@ -1447,6 +1447,74 @@ fn order_due_rows_for_deadlock_free_firing(due_rows: Vec<FireDueRow>) -> Vec<Fir
     order_rows_by_quota_key(due_rows, &snapshot_quota_policies())
 }
 
+/// Pre-acquire every distinct rate-limit bucket row a claimed due-row batch
+/// needs, in one deterministic (sorted) order, before any row fires (issue
+/// #1230 Finding 2 review).
+///
+/// [`fire_claimed_throttle_row`] debits a bucket's token with a plain
+/// `UPDATE harvest_rate_limit_buckets ... WHERE key = $1`. Postgres holds
+/// that row's lock for the rest of this transaction, exactly like a quota
+/// advisory lock. Two independent scanner transactions can therefore
+/// deadlock on BUCKET locks alone (review). It is the same ABBA shape as
+/// the original quota-lock hazard, but on a dimension
+/// [`order_rows_by_quota_key`] never looks at. Batch A fires (bucket X,
+/// quota 1) then (bucket Y, quota 2). Batch B fires (bucket Y, quota 1)
+/// then (bucket X, quota 2).
+///
+/// Bucket locks and quota locks need a JOINT global order, not two
+/// separate ones. This uses tiering. Every row's bucket lock is acquired
+/// before its own execution-row lock and quota lock. That ordering is
+/// already fixed, unconditionally, by [`fire_claimed_throttle_row`]'s own
+/// code. So this defines "every bucket lock in the batch" as one tier,
+/// acquired in sorted order before any row starts its
+/// execution-row-then-quota-key work. That keeps every row's own
+/// bucket-before-quota order intact. It adds bucket-vs-bucket
+/// deadlock-freedom on top of the already-proven quota-vs-quota and
+/// execution-row-vs-quota-lock safety, instead of competing with them.
+///
+/// This is safe where the equivalent pre-lock for QUOTA keys was NOT
+/// (issue #1230 Finding 2 follow-up, P1 -- see
+/// [`order_due_rows_for_deadlock_free_firing`]'s doc comment). That
+/// pre-lock inverted lock order against a concurrent DIRECT start, which
+/// also touches quota locks. Nothing outside this scanner ever touches a
+/// rate-limit bucket row. `reserve_or_defer` only ever INSERTs the
+/// pending throttle row; it never debits a token itself. So there is no
+/// external caller whose acquisition order this pre-lock could invert.
+///
+/// Locking (not debiting) a bucket row ahead of time is also safe on its
+/// own terms. `reserve_or_defer` calls `ensure_throttle_bucket` before
+/// `insert_pending_throttle_row`, so the bucket row this pre-lock targets
+/// already exists by the time any throttle row can reference it. This
+/// takes a bare `FOR UPDATE` read lock, not the debit itself.
+/// [`fire_claimed_throttle_row`]'s later `try_consume_rate_limit_token`
+/// re-acquires the SAME already-held row lock. Postgres row locks are
+/// re-entrant within one session. It still does the actual
+/// debit-if-available check then, unchanged.
+#[cfg(feature = "db")]
+async fn pre_lock_rate_limit_buckets_for_claimed_batch(
+    conn: &mut diesel_async::AsyncPgConnection,
+    due_rows: &[FireDueRow],
+) -> crate::error::HarvestResult<()> {
+    use diesel_async::RunQueryDsl;
+    for bucket_key in collect_distinct_bucket_keys(due_rows) {
+        diesel::sql_query("SELECT key FROM harvest_rate_limit_buckets WHERE key = $1 FOR UPDATE")
+            .bind::<diesel::sql_types::Text, _>(&bucket_key)
+            .execute(conn)
+            .await
+            .map_err(crate::error::database_error)?;
+    }
+    Ok(())
+}
+
+/// Pure half of [`pre_lock_rate_limit_buckets_for_claimed_batch`]: the
+/// distinct, sorted bucket keys a claimed batch needs locked. Split out so
+/// the ordering invariant is unit-testable without a database (issue #1230
+/// Finding 2 review).
+#[cfg(feature = "db")]
+fn collect_distinct_bucket_keys(due_rows: &[FireDueRow]) -> std::collections::BTreeSet<String> {
+    due_rows.iter().map(|row| row.bucket_key.clone()).collect()
+}
+
 /// Pure half of [`order_due_rows_for_deadlock_free_firing`]. Sorts
 /// `due_rows` against an explicit `quota_by_workflow` map, instead of the
 /// process-global one. So the ordering invariant is unit-testable with a
@@ -1592,6 +1660,7 @@ async fn fire_due_on_conn(
                 .await
                 .map_err(crate::error::database_error)?;
 
+            pre_lock_rate_limit_buckets_for_claimed_batch(conn, &due_rows).await?;
             let due_rows = order_due_rows_for_deadlock_free_firing(due_rows);
 
             let mut results = Vec::with_capacity(due_rows.len());
@@ -2430,6 +2499,54 @@ mod tests {
             )]);
             let r = row("wf_a", "tenant-1");
             assert_eq!(resolve_row_quota_lock_key(&r, &quota), None);
+        }
+    }
+
+    // ── collect_distinct_bucket_keys (issue #1230 Finding 2 review) ──────────
+
+    #[cfg(feature = "db")]
+    mod bucket_lock_ordering {
+        use super::*;
+
+        fn row(bucket_key: &str) -> FireDueRow {
+            FireDueRow {
+                id: uuid::Uuid::new_v4(),
+                workflow_name: "wf_a".to_string(),
+                throttle_key: "irrelevant".to_string(),
+                bucket_key: bucket_key.to_string(),
+                workflow_id: uuid::Uuid::new_v4().to_string(),
+                queue_name: "default".to_string(),
+                input: serde_json::json!({}),
+                start_options: serde_json::json!({}),
+                expires_at: None,
+                shard_id: 0,
+            }
+        }
+
+        #[test]
+        fn dedupes_and_sorts_the_same_regardless_of_claim_order() {
+            // The exact invariant that closes the bucket-vs-bucket ABBA
+            // hazard. Two claimed batches need the SAME two bucket keys,
+            // presented in OPPOSITE claim order. They must still lock
+            // those keys in the SAME order.
+            let forward: Vec<_> = collect_distinct_bucket_keys(&[row("bucket-a"), row("bucket-b")])
+                .into_iter()
+                .collect();
+            let reverse: Vec<_> = collect_distinct_bucket_keys(&[row("bucket-b"), row("bucket-a")])
+                .into_iter()
+                .collect();
+
+            assert_eq!(forward, reverse);
+            assert_eq!(
+                forward,
+                vec!["bucket-a".to_string(), "bucket-b".to_string()]
+            );
+        }
+
+        #[test]
+        fn dedupes_repeated_bucket_within_one_batch() {
+            let rows = [row("bucket-a"), row("bucket-a"), row("bucket-a")];
+            assert_eq!(collect_distinct_bucket_keys(&rows).len(), 1);
         }
     }
 }
