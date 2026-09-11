@@ -118,10 +118,20 @@ issue #1202 as P2 round 4).
   the stanza, so multi-line/continuation commands still work). This
   subsumes the round-3 fix rather than replacing it. Fixture test
   confirmed against a step name containing look-alike text.
+- A seventh Codex round found that `find_flag_end` still silently picks
+  the FIRST valid occurrence if two exist, e.g. a `run:` script that
+  echoes the command before executing it -- comparing against a stale
+  logged command instead of the one cargo actually runs. Unlike the
+  YAML-folding finding, this has a clean, bounded fix already used
+  elsewhere in this file (`command_containing` panics on ambiguous
+  matches the same way): `find_flag_end` now panics, naming the
+  command, when it finds more than one boundary-valid occurrence,
+  instead of guessing which one is real. Fixture test confirmed against
+  an echoed-then-executed command with two different filters.
 
 No production code changed — `chaos_docs.rs` is a test-only doc/CI parity
 guard behind no feature flag. `cargo test -p autumn-harvest --test
-integration chaos_docs::` (24/24), `cargo fmt -p autumn-harvest -- --check`,
+integration chaos_docs::` (25/25), `cargo fmt -p autumn-harvest -- --check`,
 `cargo clippy -p autumn-harvest --all-features --tests -- -D warnings`,
 and `python3 docs/audits/comment-hygiene.py --base origin/trunk-dev` are
 all clean.

@@ -263,6 +263,11 @@ fn local_iteration_example_is_scoped_to_chaos_tests_module() {
 /// real flag, even though a `\` sits right before it. The boundary
 /// before `flag` must be plain whitespace, or the exact two-character
 /// `\` + newline ending of a real continuation.
+///
+/// Panics if TWO OR MORE real occurrences exist, e.g. a `run:` script
+/// that echoes the command before executing it. Picking the first one
+/// would risk comparing against a stale logged command instead of the
+/// one cargo actually runs.
 fn find_flag_end(command: &str, flag: &str) -> Option<usize> {
     let before_ok = |prefix: &str| match prefix.chars().next_back() {
         None => true,
@@ -271,15 +276,21 @@ fn find_flag_end(command: &str, flag: &str) -> Option<usize> {
     };
     let after_ok = |c: char| c.is_whitespace() || c == '\\';
     let mut search_from = 0;
-    loop {
-        let rel = command[search_from..].find(flag)?;
+    let mut found = None::<usize>;
+    while let Some(rel) = command[search_from..].find(flag) {
         let start = search_from + rel;
         let end = start + flag.len();
         if before_ok(&command[..start]) && command[end..].chars().next().is_none_or(after_ok) {
-            return Some(end);
+            assert!(
+                found.is_none(),
+                "multiple {flag:?} occurrences in command, ambiguous which \
+                 is the real invocation: {command}"
+            );
+            found = Some(end);
         }
         search_from = end;
     }
+    found
 }
 
 /// Skips horizontal whitespace and real `\` + newline continuations from
@@ -430,6 +441,19 @@ fn extract_filter_argument_ignores_a_same_prefix_longer_target_name() {
     // `_tests` as the filter. The guard requires a token boundary, so no
     // real `--test integration` flag is found here.
     extract_filter_argument("cargo test --test integration_tests chaos_tests::");
+}
+
+#[test]
+#[should_panic(expected = "multiple")]
+fn extract_filter_argument_panics_on_multiple_flag_occurrences() {
+    // Codex finding on PR #1474: a run: script could echo the command
+    // before executing it. That gives two boundary-valid occurrences of
+    // the flag. Picking the first would risk comparing against a stale
+    // logged command, not the real one cargo runs. The guard must fail
+    // loudly on the ambiguity instead.
+    extract_filter_argument(
+        "echo cargo test --test integration chaos_tests:: && cargo test --test integration chaos_tests::specific",
+    );
 }
 
 #[test]
