@@ -258,31 +258,34 @@ fn local_iteration_example_is_scoped_to_chaos_tests_module() {
 /// passes an already-isolated single command or run line, so one match is
 /// the only one expected.
 ///
-/// `cargo test --help` documents `[OPTIONS] [TESTNAME]`: a cargo option
-/// (e.g. `-q`) can sit between the flag and the filter. Skips such an
-/// option instead of returning it as if it were the filter. A bare `--`
-/// ends cargo's own options, so finding it before any filter token means
-/// there is no filter.
+/// `cargo test --help` documents `[OPTIONS] [TESTNAME]`: some cargo option
+/// could sit between the flag and the filter. This guard does not try to
+/// parse cargo options. Some take a value token and some do not, and
+/// guessing wrong risks the exact silent mismatch this issue closed. It
+/// requires the filter immediately after the flag and panics on anything
+/// else, naming the offending token.
 fn extract_filter_argument(command: &str) -> &str {
     const FLAG: &str = "--test integration";
     let after_flag = command.find(FLAG).map_or_else(
         || panic!("command has no {FLAG:?}: {command}"),
         |i| &command[i + FLAG.len()..],
     );
-    let mut rest = after_flag;
-    loop {
-        rest = rest.trim_start_matches(|c: char| c.is_whitespace() || c == '\\');
-        let end = rest.find(char::is_whitespace).unwrap_or(rest.len());
-        let token = &rest[..end];
-        assert!(
-            !token.is_empty() && token != "--",
-            "no filter argument follows {FLAG:?} in command: {command}"
-        );
-        if !token.starts_with('-') {
-            return token;
-        }
-        rest = &rest[end..];
-    }
+    let arg_start = after_flag.trim_start_matches(|c: char| c.is_whitespace() || c == '\\');
+    let arg_end = arg_start
+        .find(char::is_whitespace)
+        .unwrap_or(arg_start.len());
+    let token = &arg_start[..arg_end];
+    assert!(
+        !token.is_empty(),
+        "no filter argument follows {FLAG:?} in command: {command}"
+    );
+    assert!(
+        !token.starts_with('-'),
+        "found a cargo option ({token:?}) between the flag and filter -- \
+         this guard requires the filter immediately after {FLAG:?}. \
+         command: {command}"
+    );
+    token
 }
 
 #[test]
@@ -300,9 +303,18 @@ fn extract_filter_argument_reads_the_token_past_a_line_continuation() {
 }
 
 #[test]
-#[should_panic(expected = "no filter argument follows")]
+#[should_panic(expected = "cargo option")]
 fn extract_filter_argument_panics_when_the_flag_has_no_following_token() {
+    // `--no-run` stands where the filter should be. It is itself a cargo
+    // option, not a test name. The guard treats it the same as any other
+    // option found there.
     extract_filter_argument("cargo test --test integration --no-run");
+}
+
+#[test]
+#[should_panic(expected = "no filter argument follows")]
+fn extract_filter_argument_panics_when_nothing_follows_the_flag() {
+    extract_filter_argument("cargo test --test integration");
 }
 
 #[test]
@@ -312,35 +324,26 @@ fn extract_filter_argument_panics_when_the_flag_is_absent() {
 }
 
 #[test]
-fn extract_filter_argument_skips_a_cargo_option_before_the_filter() {
-    // Codex finding on PR #1474: `cargo test --help` documents
-    // `[OPTIONS] [TESTNAME]`. Cargo accepts a short option, e.g. `-q`,
-    // between `--test integration` and the filter. Skip such an option
-    // instead of returning it as if it were the filter.
-    let command = "cargo test --test integration -q chaos_tests::chaos_seeded_convergence_sweep";
-    assert_eq!(
-        extract_filter_argument(command),
-        "chaos_tests::chaos_seeded_convergence_sweep"
-    );
+#[should_panic(expected = "cargo option")]
+fn extract_filter_argument_panics_on_a_valueless_cargo_option_before_the_filter() {
+    // First Codex finding on PR #1474: `cargo test --help` documents
+    // `[OPTIONS] [TESTNAME]`. A short option, e.g. `-q`, is valid between
+    // `--test integration` and the filter. Fail loudly here rather than
+    // guess past it -- see the value-taking-option test below for why
+    // guessing cannot be made complete.
+    extract_filter_argument("cargo test --test integration -q chaos_tests::specific");
 }
 
 #[test]
-fn extract_filter_argument_detects_divergence_hidden_behind_a_shared_cargo_option() {
-    // The exact scenario Codex flagged: both sides insert the same `-q`
-    // before their filter. Returning the first non-`--` token extracts
-    // `-q` from both sides and calls them equal. That masks a real filter
-    // divergence -- the same class of bug issue #1224 closed.
-    let ci_command = "cargo test --test integration -q chaos_tests::chaos_seeded_convergence_sweep -- --nocapture";
-    let doc_command = "cargo test --features chaos --test integration -q \\\n  chaos_tests::";
-
-    let ci_filter = extract_filter_argument(ci_command);
-    let doc_filter = extract_filter_argument(doc_command);
-
-    assert_ne!(
-        ci_filter, doc_filter,
-        "a filter divergence must not be masked by a cargo option shared \
-         by both commands"
-    );
+#[should_panic(expected = "cargo option")]
+fn extract_filter_argument_panics_on_a_value_taking_cargo_option_before_the_filter() {
+    // Second Codex finding: `--color always` is a value-taking option in
+    // the same documented position. A version that skips single tokens
+    // starting with `-` would skip `--color`. It would then wrongly
+    // return `always` -- the option's VALUE -- as the filter.
+    // Enumerating which options take a value is a losing game. This
+    // guard refuses to play it -- it fails loudly on any option here.
+    extract_filter_argument("cargo test --test integration --color always chaos_tests::specific");
 }
 
 #[test]

@@ -39,15 +39,24 @@ issue #1202 as P2 round 4).
   test-coverage) by separate review passes; no blocking findings. Fixed:
   one untested panic branch, one unnumbered issue reference in a comment,
   and the CI-side comment-stripping gap above.
-- Codex's automated PR review (PR #1474) found a further real gap:
-  `cargo test --help` documents `[OPTIONS] [TESTNAME]`, so a cargo option
-  (e.g. `-q`) between the flag and the filter extracted as if it were the
-  filter itself — a shared option on both sides masked a real divergence,
-  the same failure class this issue exists to close. Fixed by skipping
-  any token starting with `-` until the real filter (or a bare `--`,
-  which ends cargo's own options and means no filter was given). TDD:
-  reproduced the exact scenario as a fixture test, confirmed it red
-  against the prior implementation, fixed, confirmed green.
+- Codex's automated PR review (PR #1474) found a further real gap, in two
+  rounds: `cargo test --help` documents `[OPTIONS] [TESTNAME]`, so a cargo
+  option between the flag and the filter extracted as if it were the
+  filter itself. A shared option on both sides masked a real divergence —
+  the same failure class this issue closed. Round 1 (`-q`, a valueless
+  option) was fixed by skipping any token starting with `-`; round 2
+  (`--color always`, a value-taking option) showed that fix incomplete,
+  since a value-taking option's *value* doesn't start with `-` either and
+  would itself be returned as the filter.
+- Rather than enumerate which cargo options take a value (an open-ended,
+  never-quite-complete list), `extract_filter_argument` now requires the
+  filter immediately after the flag and panics, naming the offending
+  token, on any option found there instead. Neither real file (chaos.yml,
+  chaos.md) ever places an option in that position, so this is not a
+  behavior change for either — only a stricter, honest contract that
+  fails loud instead of guessing. TDD: both Codex scenarios are fixture
+  tests confirmed red against the prior (skip-based) implementation, then
+  green after the fix.
 - CI's `Lint` job caught two `-D warnings` clippy findings
   (`map_unwrap_or`, `manual_assert`) that a local ad-hoc clippy run had
   missed (it failed first on unrelated pre-existing files under a
@@ -58,7 +67,7 @@ issue #1202 as P2 round 4).
 
 No production code changed — `chaos_docs.rs` is a test-only doc/CI parity
 guard behind no feature flag. `cargo test -p autumn-harvest --test
-integration chaos_docs::` (17/17), `cargo fmt -p autumn-harvest -- --check`,
+integration chaos_docs::` (18/18), `cargo fmt -p autumn-harvest -- --check`,
 `cargo clippy -p autumn-harvest --all-features --tests -- -D warnings`,
 and `python3 docs/audits/comment-hygiene.py --base origin/trunk-dev` are
 all clean.
