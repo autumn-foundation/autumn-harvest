@@ -1,0 +1,257 @@
+# 🚦 Semaphore CI health — the cancelled-run census, finished, plus a new flake candidate
+
+**Status:** health report — no PR opened against `ci.yml`, no test changed. Follows
+`docs/rnd/2026-09-08-ci-health-semaphore-rerun-census.md`, which found that this
+workflow's `fail-fast: false` matrix jobs under a cancel-in-progress concurrency
+group can hide a real job failure inside an overall `cancelled` run, and sampled
+only 10 of 66 cancelled runs (4/10 hit rate) before flagging the gap as unmeasured.
+This report finishes that census on a fresh 100-run sample, finds one genuine
+flake candidate, and attempts — without success — to reproduce it at a measured
+rate. It also re-measures the windows-`no-db` long pole first flagged 2026-09-06:
+it has gotten worse, not better.
+
+## 🎯 Verdict path
+
+Same verdict path as every prior report in this series: `ci.yml`'s `test-nodb`
+(12 shards) and `test-db-linux` (10 shards) matrices, plus `openapi-client-smoke`,
+still carry "not yet enforced" comments with branch-protection status unconfirmed
+from this session — no branch-protection-read tool is exposed here, checked again
+today. No cache-usage/listing tool is exposed either. Both gaps are unchanged
+across all six reports in this series (09-03 through today); routing them forward
+again below rather than re-describing them.
+
+## 🌡️ Symptom
+
+### 1. Rerun-button census, repeated on a fresh 100-run sample
+
+100 most recent completed `pull_request`-event `ci.yml` runs (2026-09-07 18:15 UTC
+through 2026-09-11 07:19 UTC): 32 success, 54 cancelled, 14 failure. **1/100 shows
+`run_attempt > 1`** — the first non-zero count in this series (09-03/09-06/09-08 all
+found 0/100). Traced to source: run `34467134226`, a manual `rerun_failed_jobs`
+issued by a Semaphore session itself while driving PR #1460 (issue #1459) to green,
+not a developer reflexive-rerun-button press. **Still 0/100 developer-initiated
+reruns** — narrowed, not contradicted.
+
+### 2. The 14 explicit failures
+
+**Disclosure:** the sub-investigation that gathered this section hit a
+context-compaction boundary mid-run. Full per-run detail survived for 1 of the 14
+runs; for the other 13 only the aggregate classification survived (the run IDs
+themselves were lost with the compacted turn). Reporting exactly what is verified,
+not reconstructing the missing 13 from memory:
+
+| Run | Signature | Class |
+|---|---|---|
+| `34573811773` | `Test (windows-latest)` compile step: `error[E0786]: found invalid metadata files for crate 'autumn_harvest'` → `failed to mmap file '...libautumn_harvest-*.rlib': The paging file is too small for this operation to complete. (os error 1455)` | **External infra** — Windows runner memory/paging-file exhaustion. A different infra-failure shape than any prior report in this series (those found a GitHub-runner shutdown and a Docker-registry pull failure; this is the first paging-file exhaustion observed) |
+| 13 others | Aggregate only, verified at the time but not re-derivable now: lint/fmt/doc-sync-gate class | Deterministic, commit-specific (13/13 per the preserved aggregate) |
+
+**Row-level detail for the 13 should be re-pulled by whoever needs it** — flagging
+the gap rather than inventing run IDs or error text to fill it.
+
+### 3. The cancelled-run census, finished
+
+All 54 of the 54 cancelled runs in the fresh sample were checked (not a sub-sample
+this time): `list_workflow_jobs(perPage=100)` per run, `total_count` confirmed
+against the returned array length, every job's own `conclusion` inspected rather
+than trusting the run's overall `cancelled` verdict.
+
+**15 of 54 (28%) hid at least one real job failure.** Full list:
+
+| Run | Failed job(s) | Signature | Class |
+|---|---|---|---|
+| `34511547383` | Lint | `cargo fmt --check` diff | Deterministic |
+| `34444753299` | Lint | `cargo fmt --check` diff | Deterministic |
+| `34387029856` | 5 jobs, 1 root cause | `ci_run_coverage::every_db_gated_test_has_a_ci_run_step_or_is_allowlisted` panic (manifest-completeness gate) | Deterministic |
+| `34263945990` | `Test (no-db)` ×2 | `ui_integration.rs:2826` — `ui_schedules_health_filter_narrows_to_unhealthy_rows`, `left: 200, right: 400` | Deterministic (single occurrence) |
+| `34200783185` | Lint | Clippy `match_wild_err_arm` | Deterministic |
+| `34200351621` | Lint | Clippy `doc_markdown` | Deterministic |
+| `34199661486` | Lint | `cargo fmt --check` diff | Deterministic |
+| `34195246573` | `Test`/`Test (no-db)` ×3 OS | `ci_run_coverage::every_db_gated_test_has_a_ci_run_step_or_is_allowlisted` panic — missing manifest row for `scheduler_overdue_pass_perf` | Deterministic |
+| `34177004263` | `Test DB (linux, shard 8)` | `failed to start Postgres container: ... PullImage { descriptor: "postgres:16" } ... "bytes remaining on stream"` | **External infra** — same signature the 09-08 report already documented |
+| `34172807956` | `Test DB (linux, shard 5)` | `dispatch_tests::the_by_id_claim_honours_the_dr_fence` panics at `dispatch_tests.rs:992`: `relation "harvest_shard_generation" does not exist` | **Flake candidate — see §4** |
+| `34170137842` | 5 jobs, 1 root cause | `migration_hygiene::no_new_handrolled_migration_bundles_outside_allowlist` panic | Deterministic |
+| `34167481977` | `Test DB (linux, shard 5)` | Same test, `dispatch_tests.rs:938`: `relation "harvest_shard_generation" does not exist` | **Flake candidate — see §4** |
+| `34165189395` | `Test` ×3 OS | `error[E0433]: cannot find MemoryDispatch in dispatch` — used unconditionally in `worker.rs:37779` but gated behind `#[cfg(feature = "testing")]` | Deterministic (compile-time; identical on all OSes by construction) |
+| `34162176528` | Dependency ledger (`cargo-deny`) | `RUSTSEC-2025-0134`: `rustls-pemfile` unmaintained, no safe upgrade | Dependency-ledger drift, not a CI-reliability issue |
+| `34160646952` | Lint | `cargo fmt --check` diff | Deterministic |
+
+The remaining 39/54 showed every job as `success`/`cancelled`/`skipped` — no hidden
+failures.
+
+**Combined with §2: 27 of 29 total failure instances found across both sections
+trace to a deterministic, commit-specific defect or to external infra
+nondeterminism; 2 share one flake-candidate signature; 1 is dependency-ledger
+drift, not a suite-reliability question.**
+
+### 4. The flake candidate: `dispatch_tests::the_by_id_claim_honours_the_dr_fence`
+
+Two occurrences, two different commits (the panic's source line moved from 938 to
+992 between them, so the file changed), same shard slot (`Test DB (linux, shard
+5)`), same error: `relation "harvest_shard_generation" does not exist`. Both were
+absorbed under an overall `cancelled` verdict — neither would appear in a census
+that trusted run-level conclusions, which is exactly the gap this census exists to
+close.
+
+**Mechanism attempted:** `harvest_shard_generation` is created by migration
+`20260726000000_harvest_shard_generation` and is present in `INIT_SQL`, which
+`setup_test_database_url_or_env()` (`integration_e2e.rs:498`) applies via
+`Postgres::default().with_init_sql(...)` — a fresh testcontainers Postgres per
+test function, not a database shared across the shard's test binary. A real,
+independently-verified fact about the dependency stack: `testcontainers-modules`
+0.15.0's Postgres module waits on `WaitFor::message_on_stderr` /
+`message_on_stdout("database system is ready to accept connections")` with no
+`.with_times(2)`, and `testcontainers` 0.27.3's `LogWaitStrategy` defaults `times`
+to 1 — i.e., it latches onto the *first* occurrence of that message. The official
+Postgres image logs that exact line twice when init scripts are configured (once
+for the ephemeral instance that runs them, again for the final server), which is
+the class of race this dependency pairing is known to be exposed to in general.
+
+**This is a plausible mechanism, not a confirmed one — say so plainly.** It was
+not confirmed against this specific failure (no container logs from the two CI
+runs were pulled to check log ordering), and it does not obviously explain how an
+external client would even observe "relation does not exist" rather than
+"connection refused" if the temporary initdb-scripts instance in the official
+image binds only its Unix socket, not the mapped TCP port. Flagging the
+verified facts (dependency versions, default wait-strategy behavior) and the
+open question (does this specific image/entry point expose the race this way)
+separately rather than collapsing them into a single claimed cause.
+
+**Reproduction attempted, did not reproduce:** built the `integration` test binary
+with `--features testing` locally (Docker available, 4 vCPUs) and ran, under
+`taskset -c 0,1` CPU-pinned contention (matching the method PR #1464 used
+successfully on a different flake):
+
+- 60 concurrent reps of the single test alone (10 rounds × 6 concurrent copies): **0/60 failed.**
+- 32 concurrent reps of the full `dispatch_tests` module, all ~18 tests per rep,
+  serialized internally by `DISPATCH_SERIAL` (8 rounds × 4 concurrent copies):
+  **0/32 failed.**
+
+**92/92 clean locally.** Per this role's own hard gate, that is not a fix-ready
+result — it means the local harness (a 4-vCPU sandbox running one or a few
+copies of this test concurrently) does not reproduce whatever CI's actual
+10-parallel-shard, shared-runner-fleet load produces, or the true rate is low
+enough that even 92 reps isn't past the noise floor. Either way, **no measured
+rate exists, so no fix is being proposed.**
+
+## 🔍 Diagnosis
+
+**§2/§3 (27 of 29 failures):** deterministic, commit-specific lint/fmt/doc-sync/
+migration-hygiene/manifest-coverage/compile-time-feature-gating defects, or
+external infra (a new paging-file-exhaustion shape on Windows, plus a repeat of
+the already-documented Docker-registry pull failure). None are suite-level
+flakes. **§4 (2 of 29):** an unconfirmed flake candidate. Verdict on test-vs-product
+cannot be rendered yet — the hard gate's own §3 requirement ("show the
+nondeterminism lives in the test, not the thing it tests, before touching any
+test") is not met, because no reproduction exists to interrogate. This is
+explicitly not being treated as a proven test bug or a proven product bug; it is
+an open question with a plausible mechanism and two real occurrences.
+
+**Windows no-db long pole, re-measured (§5 below):** confirmed still present and
+measurably worse than the 09-06 baseline. Not yet root-caused to one commit — it
+grew across several merges in this window, not as a single step change, so
+"which commit" is an open question, not "no cause exists."
+
+## 🔧 Treatment
+
+None shipped — nothing here clears the impact floor. Specifically:
+
+- No flaky test made deterministic: the one flake candidate has 2 occurrences and
+  0/92 local reproductions, nowhere near the ≥20 (≥50 for low-rate) same-commit
+  rerun bar this role's own gate requires before calling a rate and naming a fix.
+- No product bug filed: the mechanism is unconfirmed, not diagnosed.
+- No timing fix: the windows regression (§5) is real and worth someone's time, but
+  bisecting it across several merges to find the specific contributor(s) is a
+  separate investigation from what this report's session budget covered.
+- No quarantine: quarantining `the_by_id_claim_honours_the_dr_fence` would remove
+  the only detector of whatever this is before its mechanism is known — exactly
+  what this role's charter says not to do "without a diagnosis showing the test
+  was testing nothing."
+
+Four items routed forward, two carried from prior reports and two new:
+
+1. **Cache-usage API access** (carried from 09-05 through 09-08) — still no
+   `cache/usage` or `caches`-listing method among the tools available here.
+2. **Branch-protection confirmation** (carried from 09-04 through 09-08) — still
+   no branch-protection-read tool; `test-nodb`, `test-db-linux`, and
+   `openapi-client-smoke` all remain unconfirmed against live branch protection.
+3. **New: reproduce the `dispatch_tests` flake candidate at CI scale, not
+   sandbox scale.** 92/92 clean locally under 2-CPU-pinned contention; CI's
+   actual failure mode may need the real 10-parallel-shard runner-fleet load
+   (or many more reps) to surface. Whoever has access to a CI-scale
+   reproduction environment (or the patience for a much larger rep count) should
+   pull the actual container logs from `34172807956`/`34167481977` first, if
+   they're still retrievable, to check the ready-message-ordering hypothesis in
+   §4 directly before spending compute on blind reruns.
+4. **New: bisect the windows-`no-db` timing regression (§5)** across the
+   2026-09-08–11 merge window to find which change(s) contributed, rather than
+   treating "it's worse" as the final word.
+
+## 📊 Measurement
+
+- **Rerun-button census:** 1/100 `run_attempt > 1`, traced to a Semaphore
+  session's own manual rerun — 0/100 developer-initiated, consistent with
+  09-03/09-06/09-08.
+- **Cancelled-run census:** 54/54 cancelled runs in the fresh sample fully
+  audited at job level (vs. 10/66 sampled in 09-08) — 15/54 (28%) hid a real
+  failure; 13 deterministic, 1 external infra, 1 (2 instances) flake candidate.
+- **Explicit-failure census:** 14/14 runs classified, but full per-run detail
+  recoverable for only 1/14 after a mid-investigation context-compaction loss —
+  disclosed in §2 rather than papered over.
+- **Flake-candidate reproduction:** 0/92 local reps failed (60 isolated-test +
+  32 full-module, both under `taskset -c 0,1` contention) — inconclusive, not a
+  measured rate, no fix follows from this.
+- **Windows no-db timing (§5):**
+
+  | Run | When | `no-db, windows-latest, shard 3` | `no-db, ubuntu-latest, shard 3` | Run wall-clock |
+  |---|---|---:|---:|---:|
+  | `34166818680` | 2026-09-07 (pre-#1427) | 39.2 min | 23.0 min | — |
+  | `34268170391` | 2026-09-08 19:18 (first post-#1427) | 51.6 min | 30.3 min | — |
+  | `34553672251` | 2026-09-11 02:11 | 62.9 min | 40.6 min | 92.8 min |
+  | `34570712844` | 2026-09-11 06:37 | 63.4 min | 36.2 min | 93.7 min |
+
+  Windows shard 3 grew ~62% (39.2→63.4 min); ubuntu shard 3 grew ~57–77% in the
+  same window — a shared, cross-OS slowdown, not windows-specific in cause, just
+  windows-specific in which shard remains the long pole (its baseline was
+  already highest). The growth is spread across several commits merged between
+  2026-09-08 and 2026-09-11 (df4bd0d "#1427" among them), not a single step at
+  one commit — the first post-#1427 sample (51.6 min) is already up from the
+  pre-#1427 baseline (39.2 min) but is itself well below the latest samples
+  (62.9–63.4 min), so later commits in the window added further weight. Overall
+  run wall-clock is now ~93 min, up from the 58.9–66.5 min range the 09-06
+  report measured.
+- No revert check applies — no fix in this report to verify red-then-green on.
+
+## 🔬 Reproduce
+
+```sh
+# Rerun-button census + explicit-failure classification:
+# actions_list(method="list_workflow_runs", resource_id="ci.yml",
+#   workflow_runs_filter={event:"pull_request", status:"completed"}, perPage=100)
+# then filter conclusion and run_attempt.
+
+# Cancelled-run hidden-failure audit (full census, not a sample):
+# for every run with conclusion=="cancelled": list_workflow_jobs(resource_id=run,
+# perPage=100), confirm total_count matches the returned length, then check every
+# job's own `conclusion` field (not just the run's).
+
+# Flake-candidate local reproduction:
+cargo test -p autumn-harvest --features testing --test integration --no-run
+BIN=target/debug/deps/integration-<hash>
+# isolated-test contention:
+for round in $(seq 1 10); do
+  for i in 1 2 3 4 5 6; do
+    taskset -c 0,1 "$BIN" --test-threads=1 \
+      dispatch_tests::the_by_id_claim_honours_the_dr_fence &
+  done; wait
+done
+# full-module contention (DISPATCH_SERIAL still serializes within each process):
+for round in $(seq 1 8); do
+  for i in 1 2 3 4; do
+    taskset -c 0,1 "$BIN" --test-threads=1 dispatch_tests:: &
+  done; wait
+done
+
+# Windows no-db timing:
+# list_workflow_jobs(resource_id=<run>, perPage=100), compute
+# (completed_at - started_at) per job, filter to "no-db, <os>, shard N" names.
+```
