@@ -17,7 +17,9 @@ use uuid::Uuid;
 use autumn_harvest::error::{HarvestError, HarvestResult, database_error};
 use autumn_harvest::shard::ShardRouter;
 use autumn_harvest::types::{ExecutionId, Priority};
-use autumn_harvest::{StartWorkflowParams, start_or_load_workflow_execution_with_metrics_and_codecs};
+use autumn_harvest::{
+    StartWorkflowParams, start_or_load_workflow_execution_with_metrics_and_codecs,
+};
 
 use crate::config::HarvestOutboxConfig;
 use crate::state::HarvestDbPool;

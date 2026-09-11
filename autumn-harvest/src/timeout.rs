@@ -1018,15 +1018,16 @@ async fn commit_workflow_execution_timeout(
         let mut pending_cancel_metrics = Vec::new();
         // Issue #1243: same identity-registry rationale as this function's
         // `apply_parent_close_cascade` call above.
-        let triggers = crate::completion_trigger::evaluate_triggers_for_execution_collecting_with_codecs(
-            conn,
-            exec_id,
-            crate::completion_trigger::TerminalState::TimedOut,
-            metrics,
-            &mut pending_cancel_metrics,
-            &crate::store::DEFAULT_PAYLOAD_CODECS,
-        )
-        .await?;
+        let triggers =
+            crate::completion_trigger::evaluate_triggers_for_execution_collecting_with_codecs(
+                conn,
+                exec_id,
+                crate::completion_trigger::TerminalState::TimedOut,
+                metrics,
+                &mut pending_cancel_metrics,
+                &crate::store::DEFAULT_PAYLOAD_CODECS,
+            )
+            .await?;
         deferred.extend(triggers);
         Ok((true, deferred, closed_children, pending_cancel_metrics))
     }))
@@ -1739,15 +1740,16 @@ async fn enforce_workflow_timeout(
         let (mut deferred, closed_children) =
             apply_parent_close_cascade(conn, exec_id, codecs).await?;
         let mut pending_cancel_metrics = Vec::new();
-        let triggers = crate::completion_trigger::evaluate_triggers_for_execution_collecting_with_codecs(
-            conn,
-            exec_id,
-            crate::completion_trigger::TerminalState::TimedOut,
-            Some(metrics),
-            &mut pending_cancel_metrics,
-            codecs,
-        )
-        .await?;
+        let triggers =
+            crate::completion_trigger::evaluate_triggers_for_execution_collecting_with_codecs(
+                conn,
+                exec_id,
+                crate::completion_trigger::TerminalState::TimedOut,
+                Some(metrics),
+                &mut pending_cancel_metrics,
+                codecs,
+            )
+            .await?;
         deferred.extend(triggers);
         if execution.parent_close_policy.is_none()
             && let Some(parent_uuid) = execution.parent_id

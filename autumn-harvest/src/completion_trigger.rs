@@ -2184,6 +2184,7 @@ pub async fn enforce_completion_triggers_outbox(
 /// # Errors
 ///
 /// Same as [`enforce_completion_triggers_outbox`].
+#[cfg(feature = "db")]
 #[allow(clippy::too_many_lines)]
 pub async fn enforce_completion_triggers_outbox_with_codecs(
     conn: &mut diesel_async::AsyncPgConnection,

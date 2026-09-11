@@ -19850,71 +19850,73 @@ async fn batch_start_workflows(
             // rejection below (issue #499).
             let item_reject_fresh =
                 workflow_has_resolving_debounce(&runtime.registry, &item.workflow_name, &input);
-            let start_result = autumn_harvest::execution::start_or_load_workflow_execution_collect_with_codecs(
-                &mut conn,
-                StartWorkflowParams {
-                    workflow_name: &item.workflow_name,
-                    workflow_id,
-                    exec_id,
-                    input,
-                    parent_id: None,
-                    queue_name: &queue_name,
-                    execution_timeout: None,
-                    memo: None,
-                    search_attrs: item.search_attributes.clone(),
-                    reuse_policy: WorkflowIdReusePolicy::AllowDuplicate,
-                    conflict_policy: autumn_harvest::types::WorkflowIdConflictPolicy::Unspecified,
-                    trace_context: trace_ctx,
-                    max_execution_timeout_ceiling: max_exec_timeout_ceiling,
-                    // Chain-scoped lifetime cap (issue #617): workflow-type default
-                    // + fleet-wide ceiling-as-default, at parity with the per-run
-                    // ceiling threaded above.
-                    chain_execution_timeout: info_chain_execution_timeout
-                        .and_then(|d| chrono::Duration::from_std(d).ok()),
-                    max_workflow_chain_timeout_ceiling: max_chain_timeout_ceiling,
-                    inherited_chain_deadline_at: None,
-                    concurrency_key,
-                    concurrency_limit,
-                    concurrency_on_conflict,
-                    priority: item.priority.unwrap_or_default(),
-                    max_workflow_input_bytes: effective_wf_cap,
-                    start_at: None,
-                    delay: None,
-                    max_workflow_start_delay: None,
-                    owner,
-                    runbook_url,
-                    severity,
-                    context_headers: item.context_headers.clone(),
-                    sla,
-                    schedule_id: None,
-                    scheduled_for: None,
-                    workflow_attempt: 1,
-                    workflow_retry_policy: item_workflow_retry_policy,
-                    retry_of_exec_id: None,
-                    max_workflow_attempts_ceiling: api_state.max_workflow_attempts(),
-                    origin: None,
-                    completion_callbacks: None,
-                    // Batch-start API immediate path (issue #740): provenance is
-                    // `batch`, attributed to the operator that issued the batch.
-                    // Mirrors the throttle-carrier branch above.
-                    start_source: autumn_harvest::StartSource::Batch,
-                    start_source_ref: None,
-                    started_by: Some(actor.as_str()),
-                },
-                false,
-                item_reject_fresh,
-                Some(runtime.registry.telemetry().metrics.as_ref()),
-                // issue #618 (PR #1014): gate each batch item authoritatively under
-                // the primitive's `FOR UPDATE` lock. This closes the batch TOCTOU
-                // (Phase 1's policy-blind pre-check can skip the gate for an item
-                // whose prior seals before Phase 2 starts it). A blocked item's
-                // `Err(AdmissionBlocked)` is mapped to a per-item rejection by the
-                // `Err(e)` arm below (never a hard batch failure) — the block is
-                // counted once by the primitive.
-                Some(autumn_harvest::admission_gate::GateMode::Check),
-                runtime.registry.payload_codecs(),
-            )
-            .await;
+            let start_result =
+                autumn_harvest::execution::start_or_load_workflow_execution_collect_with_codecs(
+                    &mut conn,
+                    StartWorkflowParams {
+                        workflow_name: &item.workflow_name,
+                        workflow_id,
+                        exec_id,
+                        input,
+                        parent_id: None,
+                        queue_name: &queue_name,
+                        execution_timeout: None,
+                        memo: None,
+                        search_attrs: item.search_attributes.clone(),
+                        reuse_policy: WorkflowIdReusePolicy::AllowDuplicate,
+                        conflict_policy:
+                            autumn_harvest::types::WorkflowIdConflictPolicy::Unspecified,
+                        trace_context: trace_ctx,
+                        max_execution_timeout_ceiling: max_exec_timeout_ceiling,
+                        // Chain-scoped lifetime cap (issue #617): workflow-type default
+                        // + fleet-wide ceiling-as-default, at parity with the per-run
+                        // ceiling threaded above.
+                        chain_execution_timeout: info_chain_execution_timeout
+                            .and_then(|d| chrono::Duration::from_std(d).ok()),
+                        max_workflow_chain_timeout_ceiling: max_chain_timeout_ceiling,
+                        inherited_chain_deadline_at: None,
+                        concurrency_key,
+                        concurrency_limit,
+                        concurrency_on_conflict,
+                        priority: item.priority.unwrap_or_default(),
+                        max_workflow_input_bytes: effective_wf_cap,
+                        start_at: None,
+                        delay: None,
+                        max_workflow_start_delay: None,
+                        owner,
+                        runbook_url,
+                        severity,
+                        context_headers: item.context_headers.clone(),
+                        sla,
+                        schedule_id: None,
+                        scheduled_for: None,
+                        workflow_attempt: 1,
+                        workflow_retry_policy: item_workflow_retry_policy,
+                        retry_of_exec_id: None,
+                        max_workflow_attempts_ceiling: api_state.max_workflow_attempts(),
+                        origin: None,
+                        completion_callbacks: None,
+                        // Batch-start API immediate path (issue #740): provenance is
+                        // `batch`, attributed to the operator that issued the batch.
+                        // Mirrors the throttle-carrier branch above.
+                        start_source: autumn_harvest::StartSource::Batch,
+                        start_source_ref: None,
+                        started_by: Some(actor.as_str()),
+                    },
+                    false,
+                    item_reject_fresh,
+                    Some(runtime.registry.telemetry().metrics.as_ref()),
+                    // issue #618 (PR #1014): gate each batch item authoritatively under
+                    // the primitive's `FOR UPDATE` lock. This closes the batch TOCTOU
+                    // (Phase 1's policy-blind pre-check can skip the gate for an item
+                    // whose prior seals before Phase 2 starts it). A blocked item's
+                    // `Err(AdmissionBlocked)` is mapped to a per-item rejection by the
+                    // `Err(e)` arm below (never a hard batch failure) — the block is
+                    // counted once by the primitive.
+                    Some(autumn_harvest::admission_gate::GateMode::Check),
+                    runtime.registry.payload_codecs(),
+                )
+                .await;
 
             let start_result = match start_result {
                 Ok((started, deferred, checks, cancel_metrics)) => {
