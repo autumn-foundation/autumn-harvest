@@ -579,6 +579,15 @@ fn doc_example_filter_matches_chaos_workflow_filter() {
     let local_db_command = command_containing(&commands, "HARVEST_TEST_DATABASE_URL");
     let doc_filter = extract_filter_argument(local_db_command);
 
+    assert!(
+        doc_filter.starts_with("chaos_tests::") && ci_filter.starts_with("chaos_tests::"),
+        "both filters must target the chaos_tests module. Equality alone \
+         is not enough: if both sides drifted to the same wrong token \
+         that merely contains `chaos_tests::` as a substring (e.g. \
+         `nonchaos_tests::`), cargo would match zero tests on both sides \
+         and the equality check would still pass -- doc filter: \
+         {doc_filter:?}, CI filter: {ci_filter:?}"
+    );
     assert_eq!(
         doc_filter, ci_filter,
         "docs/testing/chaos.md's local-iteration example must use the \
@@ -626,6 +635,40 @@ fn doc_and_ci_extraction_pipeline_detects_divergence_end_to_end() {
         "a CI filter narrowed to a specific test must be distinguishable \
          from the doc's broader one, through the full extraction pipeline, \
          not just the extract_filter_argument helper alone"
+    );
+}
+
+#[test]
+#[should_panic(expected = "chaos_tests module")]
+fn doc_and_ci_extraction_pipeline_rejects_a_shared_wrong_module_drift() {
+    // Codex finding on PR #1474: both sides could drift to the SAME
+    // wrong token. It only needs to contain `chaos_tests::` as a
+    // substring, e.g. `nonchaos_tests::`. The two extracted filters
+    // would then be equal to each other. Equality alone would pass,
+    // even though cargo matches zero real tests on either side.
+    // Reproduces the same module-prefix check
+    // `doc_example_filter_matches_chaos_workflow_filter` runs, on
+    // synthetic text standing in for this drift.
+    let workflow = "\n      - name: Run chaos reproducers\n        run: cargo test --features chaos --test integration nonchaos_tests:: -- --nocapture\n";
+    let ci_stanza = workflow_step_stanza(workflow, "chaos_tests::").expect("stanza present");
+    let ci_filter = extract_filter_argument(run_command(ci_stanza));
+
+    let doc = "```bash\nHARVEST_TEST_DATABASE_URL=postgres://x \\\n  cargo test --features chaos --test integration \\\n  nonchaos_tests::\n```\n";
+    let block = bash_block_containing(doc, "HARVEST_TEST_DATABASE_URL");
+    let command_only = strip_comment_lines(block);
+    let commands = split_into_commands(&command_only);
+    let local_db_command = command_containing(&commands, "HARVEST_TEST_DATABASE_URL");
+    let doc_filter = extract_filter_argument(local_db_command);
+
+    assert_eq!(
+        doc_filter, ci_filter,
+        "the equality check alone deliberately passes here -- that is \
+         the whole point of this fixture"
+    );
+    assert!(
+        doc_filter.starts_with("chaos_tests::") && ci_filter.starts_with("chaos_tests::"),
+        "both filters must target the chaos_tests module -- doc filter: \
+         {doc_filter:?}, CI filter: {ci_filter:?}"
     );
 }
 

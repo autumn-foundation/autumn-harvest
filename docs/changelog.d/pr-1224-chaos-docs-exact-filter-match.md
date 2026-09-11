@@ -155,10 +155,19 @@ issue #1202 as P2 round 4).
   second step also contains `needle`, instead of silently picking the
   first. Fixture test confirmed against two steps both containing the
   needle.
+- A tenth Codex round found a gap independent of extraction correctness:
+  if BOTH the doc and CI drifted to the SAME wrong token that merely
+  contains `chaos_tests::` as a substring (e.g. `nonchaos_tests::`), the
+  two extracted filters would be equal to each other, and the equality
+  check alone would pass -- while cargo matches zero real tests on
+  either side. Added a `starts_with("chaos_tests::")` assertion on both
+  extracted filters, alongside (not instead of) the equality check.
+  Fixture test confirmed against a shared drift to a look-alike, wrong
+  module name.
 
 No production code changed — `chaos_docs.rs` is a test-only doc/CI parity
 guard behind no feature flag. `cargo test -p autumn-harvest --test
-integration chaos_docs::` (28/28), `cargo fmt -p autumn-harvest -- --check`,
+integration chaos_docs::` (29/29), `cargo fmt -p autumn-harvest -- --check`,
 `cargo clippy -p autumn-harvest --all-features --tests -- -D warnings`,
 and `python3 docs/audits/comment-hygiene.py --base origin/trunk-dev` are
 all clean.
