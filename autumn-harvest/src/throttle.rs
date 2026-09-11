@@ -1420,6 +1420,28 @@ fn snapshot_quota_policies() -> std::collections::HashMap<String, crate::quota::
 /// None of them took the shared mutex (review). Splitting the map out as
 /// an explicit argument removes the shared global from the tested code
 /// path entirely. So there is nothing left to race.
+///
+/// One more caveat is specific to `throttle` (review). This reorders by
+/// quota key, not by `bucket_key`. `bucket_key` is throttle's own
+/// fairness unit. The per-key-fair claim CTE partitions by it (issue
+/// #607). A single bucket can still contain rows under two different
+/// quota keys. When it does, this sort can fire that bucket's rows out
+/// of `deferred_at` order.
+///
+/// Closing that fully needs one visiting order that respects two
+/// independent keys at once: `bucket_key`, for claim-order fairness, and
+/// the quota key, for deadlock-freedom. No pure reordering of rows
+/// satisfies both in every case. Take a bucket with rows under key A and
+/// key B, claimed oldest-first as B then A. Deadlock-freedom wants A
+/// before B, since A sorts first. The bucket's own FIFO wants B before A
+/// instead.
+///
+/// Deadlock-freedom is the safety property here. An aborted transaction
+/// fails every duty in that tick, not just one row. So this fix keeps
+/// deadlock-freedom, and accepts a narrower fairness cost instead. A
+/// bucket that mixes quota keys can, rarely, admit a newer row before an
+/// older one. That only happens in the same tick, under scarce tokens.
+/// The delayed row is not lost. It fires on the very next scan.
 #[cfg(feature = "db")]
 fn order_due_rows_for_deadlock_free_firing(due_rows: Vec<FireDueRow>) -> Vec<FireDueRow> {
     order_rows_by_quota_key(due_rows, &snapshot_quota_policies())
