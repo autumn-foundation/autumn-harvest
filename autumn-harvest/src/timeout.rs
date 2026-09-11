@@ -245,6 +245,132 @@ pub const fn workflow_history_ceiling_query() -> &'static str {
      WHERE event_count >= $1"
 }
 
+/// The one query shape behind all three external-outbox scanners
+/// (issue #1486).
+///
+/// The three scanners differ only in the request type they claim, the two
+/// events that resolve it, and the payload key that correlates them. The
+/// shape must stay identical across the three, so it is written once here
+/// and substituted, rather than copied.
+///
+/// `$1` is the caller's shard assignment list. `$2` is the per-sweep list of
+/// event ids this sweep already gave up on.
+///
+/// # Why every join is a `LATERAL`
+///
+/// Both joins are pinned to their correlated form on purpose. The plain
+/// `INNER JOIN` plus `NOT EXISTS` this replaced let the planner pick each
+/// join strategy from a row estimate. That estimate swings across the
+/// outbox's own draining range. `ANALYZE` records a backlog, the backlog
+/// drains, and the stored estimate stays orders of magnitude above the
+/// truth. Past a crossover point the planner stops correlating. It reads the
+/// whole table once instead, and a drain loop pays that on every iteration.
+/// Issue #1486 measured the result as a 271% regression.
+///
+/// A `LIMIT 1` inside a `LATERAL` cannot be pulled up into the outer query.
+/// The correlated shape is therefore structural. It is not a plan the
+/// planner happens to prefer today.
+///
+/// `LEFT JOIN LATERAL ... WHERE res.resolved IS NULL` is the `NOT EXISTS` it
+/// replaces, and not a `NOT IN`. The subquery projects a constant, so the
+/// join column is null exactly when no resolution row matched. A `NOT IN`
+/// would change the answer whenever a correlation id is SQL NULL.
+///
+/// # Why the `ORDER BY`
+///
+/// `ORDER BY e.timestamp, e.id` pins the outer scan the same way. Only
+/// `idx_harvest_events_external_outbox_pending` produces that order. Every
+/// competing plan needs a sort, and a sort under `LIMIT 1` must read every
+/// candidate first. The ordered index scan returns after one row. It wins
+/// whatever the row estimate says.
+///
+/// `ORDER BY e.id` alone does not pin it. `harvest_events_pkey` supplies
+/// that order too. Under an inflated estimate the planner walks the primary
+/// key, and filters every unrelated event out of a full ascending scan.
+/// Prefixing the order with `event_type` does not help either. The planner
+/// drops a column that the `WHERE` clause pins to a constant, because the
+/// remaining order is all it has to satisfy.
+///
+/// The order is also the drain order. `timestamp` is the request instant the
+/// grace-window check already reads, and `id` breaks ties. The oldest
+/// pending request goes first, so newer arrivals cannot starve a backlog.
+macro_rules! external_outbox_claim_query {
+    (requested = $requested:literal, resolved = ($first:literal, $second:literal), key = $key:literal) => {
+        concat!(
+            "SELECT e.* FROM harvest_events e \
+             JOIN LATERAL ( \
+                 SELECT 1 AS running_exec FROM harvest_workflow_executions x \
+                 WHERE x.id = e.workflow_exec_id \
+                   AND x.state = 'RUNNING' \
+                   AND x.shard_id = ANY($1) \
+                 LIMIT 1 \
+             ) running ON TRUE \
+             LEFT JOIN LATERAL ( \
+                 SELECT 1 AS resolved FROM harvest_events res \
+                 WHERE res.workflow_exec_id = e.workflow_exec_id \
+                   AND res.event_type IN ('",
+            $first,
+            "', '",
+            $second,
+            "') \
+                   AND res.event_data->'data'->>'",
+            $key,
+            "' = e.event_data->'data'->>'",
+            $key,
+            "' \
+                 LIMIT 1 \
+             ) res ON TRUE \
+             WHERE e.event_type = '",
+            $requested,
+            "' \
+               AND (e.event_data->'data'->>'",
+            $key,
+            "') IS NOT NULL \
+               AND NOT (e.id = ANY($2)) \
+               AND res.resolved IS NULL \
+             ORDER BY e.timestamp, e.id \
+             LIMIT 1 \
+             FOR UPDATE OF e SKIP LOCKED"
+        )
+    };
+}
+
+/// SQL behind the external-signal outbox scanner
+/// ([`enforce_external_signals_outbox`], issue #1146). Shape and plan
+/// rationale: [`external_outbox_claim_query`].
+#[must_use]
+pub const fn external_signal_outbox_claim_query() -> &'static str {
+    external_outbox_claim_query!(
+        requested = "ExternalSignalRequested",
+        resolved = ("ExternalSignalDelivered", "ExternalSignalFailed"),
+        key = "signal_id"
+    )
+}
+
+/// SQL behind the external-cancel outbox scanner
+/// ([`enforce_external_cancels_outbox`], issue #1146). Shape and plan
+/// rationale: [`external_outbox_claim_query`].
+#[must_use]
+pub const fn external_cancel_outbox_claim_query() -> &'static str {
+    external_outbox_claim_query!(
+        requested = "ExternalCancelRequested",
+        resolved = ("ExternalCancelDelivered", "ExternalCancelFailed"),
+        key = "cancel_id"
+    )
+}
+
+/// SQL behind the external-await outbox scanner
+/// ([`enforce_external_awaits_outbox`], issue #1146). Shape and plan
+/// rationale: [`external_outbox_claim_query`].
+#[must_use]
+pub const fn external_await_outbox_claim_query() -> &'static str {
+    external_outbox_claim_query!(
+        requested = "ExternalAwaitRequested",
+        resolved = ("ExternalAwaitResolved", "ExternalAwaitFailed"),
+        key = "await_id"
+    )
+}
+
 /// SQL query to find RUNNING workflow executions that have exceeded either their
 /// per-run `execution_timeout` deadline (issue #243) OR their chain-scoped
 /// lifetime cap deadline (issue #617).
@@ -2836,21 +2962,7 @@ pub async fn enforce_external_signals_outbox(
                 let shards = shards_clone;
                 let codecs = codecs_clone;
                 let excluded = excluded_clone;
-                let sql = "SELECT e.* FROM harvest_events e \
-                           INNER JOIN harvest_workflow_executions execs ON e.workflow_exec_id = execs.id \
-                           WHERE e.event_type = 'ExternalSignalRequested' \
-                             AND execs.state = 'RUNNING' \
-                             AND execs.shard_id = ANY($1) \
-                             AND (e.event_data->'data'->>'signal_id') IS NOT NULL \
-                             AND NOT (e.id = ANY($2)) \
-                             AND NOT EXISTS ( \
-                                 SELECT 1 FROM harvest_events res \
-                                 WHERE res.workflow_exec_id = e.workflow_exec_id \
-                                   AND res.event_type IN ('ExternalSignalDelivered', 'ExternalSignalFailed') \
-                                   AND res.event_data->'data'->>'signal_id' = e.event_data->'data'->>'signal_id' \
-                             ) \
-                           LIMIT 1 \
-                           FOR UPDATE OF e SKIP LOCKED";
+                let sql = external_signal_outbox_claim_query();
 
                 let row_opt: Option<crate::models::HarvestEvent> = diesel::sql_query(sql)
                     .bind::<diesel::sql_types::Array<diesel::sql_types::Integer>, _>(&shards)
@@ -3320,21 +3432,7 @@ pub async fn enforce_external_cancels_outbox(
                 let shards = shards_clone;
                 let codecs = codecs_clone;
                 let excluded = excluded_clone;
-                let sql = "SELECT e.* FROM harvest_events e \
-                           INNER JOIN harvest_workflow_executions execs ON e.workflow_exec_id = execs.id \
-                           WHERE e.event_type = 'ExternalCancelRequested' \
-                             AND execs.state = 'RUNNING' \
-                             AND execs.shard_id = ANY($1) \
-                             AND (e.event_data->'data'->>'cancel_id') IS NOT NULL \
-                             AND NOT (e.id = ANY($2)) \
-                             AND NOT EXISTS ( \
-                                 SELECT 1 FROM harvest_events res \
-                                 WHERE res.workflow_exec_id = e.workflow_exec_id \
-                                   AND res.event_type IN ('ExternalCancelDelivered', 'ExternalCancelFailed') \
-                                   AND res.event_data->'data'->>'cancel_id' = e.event_data->'data'->>'cancel_id' \
-                             ) \
-                           LIMIT 1 \
-                           FOR UPDATE OF e SKIP LOCKED";
+                let sql = external_cancel_outbox_claim_query();
 
                 let row_opt: Option<crate::models::HarvestEvent> = diesel::sql_query(sql)
                     .bind::<diesel::sql_types::Array<diesel::sql_types::Integer>, _>(&shards)
@@ -3877,21 +3975,7 @@ pub async fn enforce_external_awaits_outbox(
                 let shards = shards_clone;
                 let codecs = codecs_clone;
                 let excluded = excluded_clone;
-                let sql = "SELECT e.* FROM harvest_events e \
-                           INNER JOIN harvest_workflow_executions execs ON e.workflow_exec_id = execs.id \
-                           WHERE e.event_type = 'ExternalAwaitRequested' \
-                             AND execs.state = 'RUNNING' \
-                             AND execs.shard_id = ANY($1) \
-                             AND (e.event_data->'data'->>'await_id') IS NOT NULL \
-                             AND NOT (e.id = ANY($2)) \
-                             AND NOT EXISTS ( \
-                                 SELECT 1 FROM harvest_events res \
-                                 WHERE res.workflow_exec_id = e.workflow_exec_id \
-                                   AND res.event_type IN ('ExternalAwaitResolved', 'ExternalAwaitFailed') \
-                                   AND res.event_data->'data'->>'await_id' = e.event_data->'data'->>'await_id' \
-                             ) \
-                           LIMIT 1 \
-                           FOR UPDATE OF e SKIP LOCKED";
+                let sql = external_await_outbox_claim_query();
 
                 let row_opt: Option<crate::models::HarvestEvent> = diesel::sql_query(sql)
                     .bind::<diesel::sql_types::Array<diesel::sql_types::Integer>, _>(&shards)

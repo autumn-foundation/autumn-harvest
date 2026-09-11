@@ -1,0 +1,44 @@
+Limit  (cost=0.55..1394.38 rows=1 width=192) (actual rows=1 loops=1)
+  Output: e.id, e.workflow_exec_id, e.event_id, e.event_type, e.event_data, e."timestamp", e.cohort, e.ctid, running.*, res.*
+  Buffers: shared hit=7 read=1
+  ->  LockRows  (cost=0.55..1394.38 rows=1 width=192) (actual rows=1 loops=1)
+        Output: e.id, e.workflow_exec_id, e.event_id, e.event_type, e.event_data, e."timestamp", e.cohort, e.ctid, running.*, res.*
+        Buffers: shared hit=7 read=1
+        ->  Nested Loop Left Join  (cost=0.55..1394.37 rows=1 width=192) (actual rows=1 loops=1)
+              Output: e.id, e.workflow_exec_id, e.event_id, e.event_type, e.event_data, e."timestamp", e.cohort, e.ctid, running.*, res.*
+              Filter: (res.resolved IS NULL)
+              Buffers: shared hit=6 read=1
+              ->  Nested Loop  (cost=0.42..838.81 rows=68 width=164) (actual rows=1 loops=1)
+                    Output: e.id, e.workflow_exec_id, e.event_id, e.event_type, e.event_data, e."timestamp", e.cohort, e.ctid, running.*
+                    Buffers: shared hit=4 read=1
+                    ->  Index Scan using idx_harvest_events_external_outbox_pending on public.harvest_events e  (cost=0.14..272.79 rows=68 width=140) (actual rows=1 loops=1)
+                          Output: e.id, e.workflow_exec_id, e.event_id, e.event_type, e.event_data, e."timestamp", e.cohort, e.ctid
+                          Index Cond: (e.event_type = 'ExternalSignalRequested'::text)
+                          Filter: (((e.event_data -> 'data'::text) ->> 'signal_id'::text) IS NOT NULL)
+                          Buffers: shared hit=1 read=1
+                    ->  Subquery Scan on running  (cost=0.28..8.31 rows=1 width=24) (actual rows=1 loops=1)
+                          Output: running.*
+                          Buffers: shared hit=3
+                          ->  Limit  (cost=0.28..8.30 rows=1 width=4) (actual rows=1 loops=1)
+                                Output: 1
+                                Buffers: shared hit=3
+                                ->  Index Scan using harvest_workflow_executions_pkey on public.harvest_workflow_executions x  (cost=0.28..8.30 rows=1 width=4) (actual rows=1 loops=1)
+                                      Output: 1
+                                      Index Cond: (x.id = e.workflow_exec_id)
+                                      Filter: ((x.shard_id = ANY ('{0}'::integer[])) AND (x.state = 'RUNNING'::text))
+                                      Buffers: shared hit=3
+              ->  Subquery Scan on res  (cost=0.13..8.16 rows=1 width=32) (actual rows=0 loops=1)
+                    Output: res.*, res.resolved
+                    Buffers: shared hit=2
+                    ->  Limit  (cost=0.13..8.15 rows=1 width=4) (actual rows=0 loops=1)
+                          Output: 1
+                          Buffers: shared hit=2
+                          ->  Index Scan using idx_harvest_events_external_signal_resolved on public.harvest_events res_1  (cost=0.13..8.15 rows=1 width=4) (actual rows=0 loops=1)
+                                Output: 1
+                                Index Cond: ((res_1.workflow_exec_id = e.workflow_exec_id) AND (((res_1.event_data -> 'data'::text) ->> 'signal_id'::text) = ((e.event_data -> 'data'::text) ->> 'signal_id'::text)))
+                                Buffers: shared hit=2
+Query Identifier: 7955472029689320880
+Planning:
+  Buffers: shared hit=173 read=4
+Planning Time: 0.911 ms
+Execution Time: 0.094 ms
