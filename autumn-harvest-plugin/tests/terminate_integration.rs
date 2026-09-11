@@ -335,8 +335,8 @@ async fn terminate_idempotent_on_terminal() {
 
 /// Terminate on a naturally-COMPLETED execution must not claim a
 /// cancellation that never happened (issue #1456). The run has no
-/// `WorkflowCancelled` event and no stored `error`, so the reason must
-/// name the real terminal state instead of falling back to cancel's text.
+/// `WorkflowCancelled` event and no stored `error`. The reason must name
+/// the real terminal state instead of falling back to cancel's text.
 #[tokio::test]
 async fn terminate_completed_reason_does_not_claim_cancellation() {
     let (url, _container) = setup_database().await;
@@ -370,8 +370,8 @@ async fn terminate_completed_reason_does_not_claim_cancellation() {
 }
 
 /// Terminate on an already-FAILED execution with a stored error must
-/// still surface that error verbatim, not a derived default (issue
-/// #1456 fix must not regress the case an `error` column is present).
+/// still surface that error verbatim, not a derived default. The
+/// issue #1456 fix must not regress the case where `error` is present.
 #[tokio::test]
 async fn terminate_failed_reason_keeps_stored_error() {
     let (url, _container) = setup_database().await;
