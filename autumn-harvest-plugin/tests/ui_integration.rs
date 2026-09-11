@@ -4974,6 +4974,46 @@ async fn detail_page_reset_action_redirects_with_flash() {
     );
 }
 
+/// GREEN — `reset_to_event_id` used to be typed `i64` directly on
+/// `WorkflowResetForm`. A non-numeric value failed axum's own `Form`
+/// deserialization before `reset_workflow_ui` ever ran. That was a bare
+/// framework 400, not the styled flash-redirect every other action on this
+/// page produces. Reset is the runbook's destructive recovery action, not
+/// a filter, so the fix rejects the value with a clear message. It does
+/// not guess an event number the operator never typed.
+#[tokio::test]
+async fn detail_page_reset_action_with_invalid_event_number_redirects_with_flash_instead_of_aborting()
+ {
+    let (database_url, _container) = setup_test_database_url().await;
+    let exec_id =
+        insert_workflow_on_url(&database_url, ShardId::new(0), "reset_wf3", "reset-3").await;
+
+    let app = build_single_shard_ui_app(&database_url);
+    let (status, headers, body) = post_form(
+        &app,
+        &format!("/workflows/{exec_id}/reset"),
+        "reset_to_event_id=not-a-number&reason=oops",
+    )
+    .await;
+    assert!(
+        status == StatusCode::SEE_OTHER || status == StatusCode::FOUND,
+        "an invalid event number must redirect with a flash error, not abort the request (got {status}): {body}"
+    );
+    let location = headers
+        .get("location")
+        .expect("redirect must have Location header")
+        .to_str()
+        .unwrap();
+    assert!(
+        location.contains(&exec_id.to_string()) || location.contains("workflows"),
+        "redirect must go back to the detail page: {location}"
+    );
+    assert!(
+        location.contains("flash"),
+        "redirect must carry a flash message naming the bad value: {location}"
+    );
+}
+
 /// Detail page shows a "Jump to event" control in large histories.
 #[tokio::test]
 async fn detail_page_has_jump_to_event_n_control() {

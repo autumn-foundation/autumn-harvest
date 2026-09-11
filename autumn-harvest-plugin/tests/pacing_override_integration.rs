@@ -1593,6 +1593,16 @@ async fn rate_limit_override_set_and_clear_record_audit_rows() {
         set_record["route_or_command"],
         json!("POST /admin/rate-limits/{activity_name}/override")
     );
+    // Issue #1229's new audit-on-rejection machinery must never double-fire
+    // on a SUCCESSFUL request. `.find` above passes even on a duplicate row.
+    assert_eq!(
+        records
+            .iter()
+            .filter(|r| r["target_id"] == json!(name))
+            .count(),
+        1,
+        "a successful SET must record exactly one audit row: {records:?}"
+    );
 
     let (status, body) = get_json(
         &app,
@@ -1609,6 +1619,14 @@ async fn rate_limit_override_set_and_clear_record_audit_rows() {
     assert_eq!(
         clear_record["route_or_command"],
         json!("DELETE /admin/rate-limits/{activity_name}/override")
+    );
+    assert_eq!(
+        records
+            .iter()
+            .filter(|r| r["target_id"] == json!(name))
+            .count(),
+        1,
+        "a successful CLEAR must record exactly one audit row: {records:?}"
     );
 }
 
@@ -1644,6 +1662,16 @@ async fn throttle_override_set_and_clear_record_audit_rows() {
         set_record["route_or_command"],
         json!("POST /admin/start-throttle/{workflow_name}/override")
     );
+    // Issue #1229's new audit-on-rejection machinery must never double-fire
+    // on a SUCCESSFUL request. `.find` above passes even on a duplicate row.
+    assert_eq!(
+        records
+            .iter()
+            .filter(|r| r["target_id"] == json!(key))
+            .count(),
+        1,
+        "a successful SET must record exactly one audit row: {records:?}"
+    );
 
     let (status, body) = get_json(
         &app,
@@ -1660,6 +1688,14 @@ async fn throttle_override_set_and_clear_record_audit_rows() {
     assert_eq!(
         clear_record["route_or_command"],
         json!("DELETE /admin/start-throttle/{workflow_name}/override")
+    );
+    assert_eq!(
+        records
+            .iter()
+            .filter(|r| r["target_id"] == json!(key))
+            .count(),
+        1,
+        "a successful CLEAR must record exactly one audit row: {records:?}"
     );
 }
 
@@ -2159,6 +2195,84 @@ async fn list_rate_limits_reports_disagreement_across_live_shards() {
     );
 }
 
+/// Issue #1222: a shard with NO bucket row for a key is not "no policy" --
+/// it is "un-overridden baseline policy, not yet materialized". The next
+/// dispatch on that shard lazily creates a baseline-only bucket and enforces
+/// a DIFFERENT effective rate than an active override on a sibling shard.
+/// `list_rate_limits` must flag that as disagreement, not silently drop the
+/// row-less shard from consideration.
+#[tokio::test]
+async fn list_rate_limits_reports_disagreement_when_a_shard_has_no_row() {
+    let (url_0, _container_0) = setup_one_shard().await;
+    let (url_1, _container_1) = setup_one_shard().await;
+    let pool_0 = build_pool(&url_0);
+    let pool_1 = build_pool(&url_1);
+
+    let name = leaked_name("send_email");
+
+    // Shard 0: a live ACTIVE override.
+    let expires_at = chrono::Utc::now() + chrono::Duration::seconds(300);
+    {
+        let mut conn = pool_0.get().await.expect("shard 0 conn");
+        diesel::sql_query(
+            "INSERT INTO harvest_rate_limit_buckets \
+             (key, refill_rate, burst, tokens, last_refilled_at, created_at, updated_at, \
+              override_refill_rate, override_burst, override_expires_at) \
+             VALUES ($1, $2, $2, $3, NOW(), NOW(), NOW(), $4, $4, $5)",
+        )
+        .bind::<diesel::sql_types::Text, _>(name)
+        .bind::<diesel::sql_types::Double, _>(0.001)
+        .bind::<diesel::sql_types::Double, _>(1000.0)
+        .bind::<diesel::sql_types::Double, _>(1000.0)
+        .bind::<diesel::sql_types::Timestamptz, _>(expires_at)
+        .execute(&mut conn)
+        .await
+        .expect("seed shard 0 (active)");
+    }
+
+    // Shard 1: NO row at all for this key -- not an inactive row, an absent
+    // one. This is the exact repro shape from issue #1222.
+
+    let mut pools = BTreeMap::new();
+    pools.insert(ShardId::new(0), pool_0);
+    pools.insert(ShardId::new(1), pool_1);
+    let sharded_pool = ShardedDbPool::from_map(pools, ShardId::new(0));
+    let router = ShardRouter::new(
+        vec![ShardId::new(0), ShardId::new(1)],
+        vec![ShardId::new(0), ShardId::new(1)],
+        ShardId::new(0),
+    );
+
+    let app = build_sharded_app(
+        HarvestDbPool::sharded(sharded_pool),
+        router,
+        vec![rate_limited_activity_info(name, 0.001, 5.0)],
+        vec![],
+    );
+
+    let (status, list) = get_json(&app, "/admin/rate-limits").await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "the list read itself never fails on a genuine disagreement, only surfaces it: {list}"
+    );
+    let entry = list
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|b| b["key"] == json!(name))
+        .unwrap_or_else(|| panic!("{name} bucket listed: {list:?}"));
+
+    assert_eq!(
+        entry["shard_disagreement"],
+        json!(true),
+        "shard 1 has not materialized a bucket row yet, but its NEXT \
+         dispatch will enforce the un-overridden baseline -- a genuinely \
+         different effective rate than shard 0's active override. That \
+         must count as disagreement even though only one row exists: {entry}"
+    );
+}
+
 /// Issue #945 review, round 5, finding 2: the round-4 disagreement check
 /// compared only the RAW `override_refill_rate`/`override_burst` columns.
 /// A partial legacy `POST /admin/rate-limits/{key}` fan-out (issue #332)
@@ -2275,4 +2389,779 @@ async fn get_start_throttle_pacing_override_detects_diverged_baseline_disagreeme
         json!(30.0),
         "shard 1's omitted override_burst falls back to ITS OWN (diverged) baseline: {shards}"
     );
+}
+
+// ── issue #1229: fan-out completeness on the four mutation handlers ────────
+//
+// `get_start_throttle_pacing_override`'s partial-outage handling already
+// fans out over every shard the ROUTER knows about. See
+// `shard_fanout::expected_shards`'s own doc comment. It does not merely use
+// every shard this process holds a live pool for. The four MUTATION
+// handlers (SET/CLEAR, rate-limit and start-throttle) instead looped over
+// `pool.iter_shards()` directly. A shard the router advertises mid a
+// shard-add rollout can lack a pool on this process. That shard was dropped
+// from the fan-out silently. It was not attempted, not counted in
+// `shard_errors`, and the handler still returned a bare `200`.
+//
+// Each test below installs a pool for shard 0 only. Its router also
+// advertises shard 1 as readable -- the exact mid-rollout state
+// `expected_shards` exists to catch. Each test asserts the response
+// degrades to `207` naming shard 1, instead of a silent `200`.
+
+fn router_knows_shard_1_but_has_no_pool_for_it(live_pool: DbPool) -> HarvestDbPool {
+    let mut pools = BTreeMap::new();
+    pools.insert(ShardId::new(0), live_pool);
+    HarvestDbPool::sharded(ShardedDbPool::from_map(pools, ShardId::new(0)))
+}
+
+fn router_readable_on_shards_0_and_1() -> ShardRouter {
+    ShardRouter::new(
+        vec![ShardId::new(0), ShardId::new(1)],
+        vec![ShardId::new(0), ShardId::new(1)],
+        ShardId::new(0),
+    )
+}
+
+#[tokio::test]
+async fn set_rate_limit_pacing_override_reports_router_known_shard_with_no_pool() {
+    let (live_url, _container) = setup_one_shard().await;
+    let live_pool = build_pool(&live_url);
+    let name = leaked_name("send_email");
+
+    let app = build_sharded_app(
+        router_knows_shard_1_but_has_no_pool_for_it(live_pool),
+        router_readable_on_shards_0_and_1(),
+        vec![rate_limited_activity_info(name, 5.0, 5.0)],
+        vec![],
+    );
+
+    let (status, body) = post_json(
+        &app,
+        &format!("/admin/rate-limits/{name}/override"),
+        json!({ "refill_rate": 42.0, "ttl_secs": 300 }),
+    )
+    .await;
+
+    assert_eq!(
+        status,
+        StatusCode::MULTI_STATUS,
+        "a router-known shard with no pool must not be silently omitted \
+         from the fan-out -- shard 0's write succeeding must not paper over \
+         shard 1 never having been attempted: {body}"
+    );
+    assert!(
+        body["shard_errors"].as_array().is_some_and(|errs| errs
+            .iter()
+            .any(|e| e.as_str().is_some_and(|s| s.contains("shard 1")))),
+        "shard 1 must be named as unreachable, not silently dropped: {body}"
+    );
+}
+
+#[tokio::test]
+async fn clear_rate_limit_pacing_override_reports_router_known_shard_with_no_pool() {
+    let (live_url, _container) = setup_one_shard().await;
+    let live_pool = build_pool(&live_url);
+    let name = leaked_name("send_email");
+
+    let app = build_sharded_app(
+        router_knows_shard_1_but_has_no_pool_for_it(live_pool),
+        router_readable_on_shards_0_and_1(),
+        vec![rate_limited_activity_info(name, 5.0, 5.0)],
+        vec![],
+    );
+
+    let (status, body) = delete_json(&app, &format!("/admin/rate-limits/{name}/override")).await;
+
+    assert_eq!(
+        status,
+        StatusCode::MULTI_STATUS,
+        "a router-known shard with no pool must not be silently omitted \
+         from the fan-out: {body}"
+    );
+    assert!(
+        body["shard_errors"].as_array().is_some_and(|errs| errs
+            .iter()
+            .any(|e| e.as_str().is_some_and(|s| s.contains("shard 1")))),
+        "shard 1 must be named as unreachable, not silently dropped: {body}"
+    );
+}
+
+#[tokio::test]
+async fn set_start_throttle_pacing_override_reports_router_known_shard_with_no_pool() {
+    let (live_url, _container) = setup_one_shard().await;
+    let live_pool = build_pool(&live_url);
+    let name = leaked_name("onboard_user");
+
+    let app = build_sharded_app(
+        router_knows_shard_1_but_has_no_pool_for_it(live_pool),
+        router_readable_on_shards_0_and_1(),
+        vec![],
+        vec![static_throttled_info(name, "5/m", 5.0)],
+    );
+
+    let (status, body) = post_json(
+        &app,
+        &format!("/admin/start-throttle/{name}/override"),
+        json!({ "refill_per_sec": 1.0, "ttl_secs": 300 }),
+    )
+    .await;
+
+    assert_eq!(
+        status,
+        StatusCode::MULTI_STATUS,
+        "a router-known shard with no pool must not be silently omitted \
+         from the fan-out: {body}"
+    );
+    assert!(
+        body["shard_errors"].as_array().is_some_and(|errs| errs
+            .iter()
+            .any(|e| e.as_str().is_some_and(|s| s.contains("shard 1")))),
+        "shard 1 must be named as unreachable, not silently dropped: {body}"
+    );
+}
+
+#[tokio::test]
+async fn clear_start_throttle_pacing_override_reports_router_known_shard_with_no_pool() {
+    let (live_url, _container) = setup_one_shard().await;
+    let live_pool = build_pool(&live_url);
+    let name = leaked_name("onboard_user");
+
+    let app = build_sharded_app(
+        router_knows_shard_1_but_has_no_pool_for_it(live_pool),
+        router_readable_on_shards_0_and_1(),
+        vec![],
+        vec![static_throttled_info(name, "5/m", 5.0)],
+    );
+
+    let (status, body) = delete_json(&app, &format!("/admin/start-throttle/{name}/override")).await;
+
+    assert_eq!(
+        status,
+        StatusCode::MULTI_STATUS,
+        "a router-known shard with no pool must not be silently omitted \
+         from the fan-out: {body}"
+    );
+    assert!(
+        body["shard_errors"].as_array().is_some_and(|errs| errs
+            .iter()
+            .any(|e| e.as_str().is_some_and(|s| s.contains("shard 1")))),
+        "shard 1 must be named as unreachable, not silently dropped: {body}"
+    );
+}
+
+// A total outage (every expected shard unreachable) must still fail closed
+// with a `503` naming the unreachable shard(s). That matches its behavior
+// before the fan-out fix.
+//
+// These tests must NOT use an unreachable pool (a dead port) for the
+// outage. `HarvestDbPool::default_pool()` is the pool the audit write below
+// the shard loop uses. It resolves through the same `ShardedDbPool` the
+// fan-out reads via `pools_by_shard`/`expected_shards` (`state.rs`). A
+// single-shard fixture has only one pool. An unreachable pool kills the
+// audit connection too. The handler then 503s on "audit DB connection
+// unavailable". It never reaches the `{"errors": shard_errors}` branch this
+// PR's fix touches. A Codex review comment on this PR (issue #1229) caught
+// that. An earlier version of these tests used `dead_pool()` and asserted
+// only `body.get("errors").is_some()`. That wrong-branch response also
+// satisfies this assertion. Its problem-details envelope carries an
+// unrelated, always-present, empty `errors` field.
+//
+// Instead the fixture stays on ONE live, reachable connection, so the audit
+// write still succeeds. It drops `harvest_rate_limit_buckets`, the table
+// both the rate-limit and start-throttle bucket queries share (keyed by
+// `throttle::bucket_key`). So only the shard WRITE query fails. That
+// reaches the exact branch under test.
+
+async fn single_shard_with_bucket_table_dropped()
+-> (HarvestDbPool, ShardRouter, Option<ContainerAsync<Postgres>>) {
+    let (url, container) = setup_one_shard().await;
+    let pool = build_pool(&url);
+    {
+        let mut conn = pool.get().await.expect("pooled conn");
+        diesel::sql_query("DROP TABLE harvest_rate_limit_buckets")
+            .execute(&mut conn)
+            .await
+            .expect("drop the bucket table to fail the shard write, not the connection");
+    }
+    let mut pools = BTreeMap::new();
+    pools.insert(ShardId::new(0), pool);
+    let sharded_pool = ShardedDbPool::from_map(pools, ShardId::new(0));
+    let router = ShardRouter::new(
+        vec![ShardId::new(0)],
+        vec![ShardId::new(0)],
+        ShardId::new(0),
+    );
+    (HarvestDbPool::sharded(sharded_pool), router, container)
+}
+
+#[tokio::test]
+async fn set_rate_limit_pacing_override_returns_503_on_total_shard_outage() {
+    let name = leaked_name("send_email");
+    let (pool, router, _container) = single_shard_with_bucket_table_dropped().await;
+    let app = build_sharded_app(
+        pool,
+        router,
+        vec![rate_limited_activity_info(name, 5.0, 5.0)],
+        vec![],
+    );
+
+    let (status, body) = post_json(
+        &app,
+        &format!("/admin/rate-limits/{name}/override"),
+        json!({ "refill_rate": 42.0, "ttl_secs": 300 }),
+    )
+    .await;
+
+    assert_eq!(
+        status,
+        StatusCode::SERVICE_UNAVAILABLE,
+        "a total shard outage must fail closed, not report a false success: {body}"
+    );
+    assert!(
+        body["errors"]
+            .as_array()
+            .is_some_and(|errs| !errs.is_empty()),
+        "503 body should name the unreachable shard(s): {body}"
+    );
+}
+
+#[tokio::test]
+async fn clear_rate_limit_pacing_override_returns_503_on_total_shard_outage() {
+    let name = leaked_name("send_email");
+    let (pool, router, _container) = single_shard_with_bucket_table_dropped().await;
+    let app = build_sharded_app(
+        pool,
+        router,
+        vec![rate_limited_activity_info(name, 5.0, 5.0)],
+        vec![],
+    );
+
+    let (status, body) = delete_json(&app, &format!("/admin/rate-limits/{name}/override")).await;
+
+    assert_eq!(
+        status,
+        StatusCode::SERVICE_UNAVAILABLE,
+        "a total shard outage must fail closed, not report a false success: {body}"
+    );
+    assert!(
+        body["errors"]
+            .as_array()
+            .is_some_and(|errs| !errs.is_empty()),
+        "503 body should name the unreachable shard(s): {body}"
+    );
+}
+
+#[tokio::test]
+async fn set_start_throttle_pacing_override_returns_503_on_total_shard_outage() {
+    let name = leaked_name("onboard_user");
+    let (pool, router, _container) = single_shard_with_bucket_table_dropped().await;
+    let app = build_sharded_app(
+        pool,
+        router,
+        vec![],
+        vec![static_throttled_info(name, "5/m", 5.0)],
+    );
+
+    let (status, body) = post_json(
+        &app,
+        &format!("/admin/start-throttle/{name}/override"),
+        json!({ "refill_per_sec": 1.0, "ttl_secs": 300 }),
+    )
+    .await;
+
+    assert_eq!(
+        status,
+        StatusCode::SERVICE_UNAVAILABLE,
+        "a total shard outage must fail closed, not report a false success: {body}"
+    );
+    assert!(
+        body["errors"]
+            .as_array()
+            .is_some_and(|errs| !errs.is_empty()),
+        "503 body should name the unreachable shard(s): {body}"
+    );
+}
+
+#[tokio::test]
+async fn clear_start_throttle_pacing_override_returns_503_on_total_shard_outage() {
+    let name = leaked_name("onboard_user");
+    let (pool, router, _container) = single_shard_with_bucket_table_dropped().await;
+    let app = build_sharded_app(
+        pool,
+        router,
+        vec![],
+        vec![static_throttled_info(name, "5/m", 5.0)],
+    );
+
+    let (status, body) = delete_json(&app, &format!("/admin/start-throttle/{name}/override")).await;
+
+    assert_eq!(
+        status,
+        StatusCode::SERVICE_UNAVAILABLE,
+        "a total shard outage must fail closed, not report a false success: {body}"
+    );
+    assert!(
+        body["errors"]
+            .as_array()
+            .is_some_and(|errs| !errs.is_empty()),
+        "503 body should name the unreachable shard(s): {body}"
+    );
+}
+
+// ── issue #1229: unknown JSON fields must be rejected, not silently dropped ─
+//
+// Neither request struct was annotated `#[serde(deny_unknown_fields)]`. A
+// typo'd field (e.g. `brust` instead of `burst`) parsed successfully with
+// the typo'd value silently discarded. The routes' own documented semantics
+// replace the whole override, never merge it. So the field the caller MEANT
+// to set then reverts to the declared baseline instead. An operator
+// responding to an incident could believe, per the `200`, that a
+// burst-focused mitigation took effect when it silently did not.
+
+#[tokio::test]
+async fn set_rate_limit_pacing_override_rejects_unknown_field() {
+    let (url, _container) = setup_database().await;
+    let pool = build_pool(&url);
+    let name = leaked_name("send_email");
+    let app = build_app(
+        &pool,
+        vec![rate_limited_activity_info(name, 5.0, 5.0)],
+        vec![],
+    );
+
+    let (status, body) = post_json(
+        &app,
+        &format!("/admin/rate-limits/{name}/override"),
+        json!({ "refill_rate": 50.0, "brust": 100.0, "ttl_secs": 300 }),
+    )
+    .await;
+
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "an unrecognized field must 400, not silently drop the typo'd value: {body}"
+    );
+}
+
+#[tokio::test]
+async fn set_start_throttle_pacing_override_rejects_unknown_field() {
+    let (url, _container) = setup_database().await;
+    let pool = build_pool(&url);
+    let name = leaked_name("onboard_user");
+    let app = build_app(&pool, vec![], vec![static_throttled_info(name, "5/m", 5.0)]);
+
+    let (status, body) = post_json(
+        &app,
+        &format!("/admin/start-throttle/{name}/override"),
+        json!({ "refill_per_sec": 1.0, "brust": 100.0, "ttl_secs": 300 }),
+    )
+    .await;
+
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "an unrecognized field must 400, not silently drop the typo'd value: {body}"
+    );
+}
+
+// ── issue #1229: semantic validation failures must be audited ──────────────
+//
+// `audit_context` was only called AFTER every early-return validation check
+// in the SET handlers. The CLEAR handlers only called it after their own
+// registry-lookup checks. So a rejected administrative attempt left zero
+// trace in the audit log. That covers an invalid rate/burst, an empty
+// override, an invalid TTL, an unknown JSON field, an undeclared
+// activity/workflow, and a dynamic-key policy. Each test below drives every
+// rejection branch through the real HTTP route. It then reads
+// `GET /admin/audit` back to prove a `"failed"` row exists for each one.
+
+#[tokio::test]
+async fn set_rate_limit_pacing_override_audits_every_rejection_branch() {
+    let (url, _container) = setup_database().await;
+    let pool = build_pool(&url);
+    let declared_name = leaked_name("send_email");
+    let dynamic_name = leaked_name("dynamic_email");
+    let undeclared_name = leaked_name("never_registered_activity");
+    let no_limit_name = leaked_name("no_limit_activity");
+
+    let mut dynamic_activity = rate_limited_activity_info(dynamic_name, 5.0, 5.0);
+    dynamic_activity.rate_limit_key_expr = Some("input.tenant_id");
+    let mut no_limit_activity = rate_limited_activity_info(no_limit_name, 5.0, 5.0);
+    no_limit_activity.rate_limit_rps = None;
+    no_limit_activity.rate_limit_burst = None;
+
+    let app = build_app(
+        &pool,
+        vec![
+            rate_limited_activity_info(declared_name, 5.0, 5.0),
+            dynamic_activity,
+            no_limit_activity,
+        ],
+        vec![],
+    );
+    let path = format!("/admin/rate-limits/{declared_name}/override");
+
+    let (status, body) =
+        post_json(&app, &path, json!({ "refill_rate": -1.0, "ttl_secs": 60 })).await;
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "invalid refill_rate: {body}"
+    );
+
+    let (status, body) = post_json(&app, &path, json!({ "burst": 0.5, "ttl_secs": 60 })).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "invalid burst: {body}");
+
+    let (status, body) = post_json(&app, &path, json!({ "ttl_secs": 60 })).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "empty override: {body}");
+
+    let (status, body) = post_json(&app, &path, json!({ "refill_rate": 5.0, "ttl_secs": 0 })).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "invalid ttl_secs: {body}");
+
+    let (status, body) = post_json(
+        &app,
+        &path,
+        json!({ "refill_rate": 5.0, "brust": 1.0, "ttl_secs": 60 }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "unknown field: {body}");
+
+    let (status, body) = post_json(
+        &app,
+        &format!("/admin/rate-limits/{undeclared_name}/override"),
+        json!({ "refill_rate": 5.0, "ttl_secs": 60 }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "undeclared activity: {body}");
+
+    let (status, body) = post_json(
+        &app,
+        &format!("/admin/rate-limits/{no_limit_name}/override"),
+        json!({ "refill_rate": 5.0, "ttl_secs": 60 }),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::NOT_FOUND,
+        "no declared rate limit: {body}"
+    );
+
+    let (status, body) = post_json(
+        &app,
+        &format!("/admin/rate-limits/{dynamic_name}/override"),
+        json!({ "refill_rate": 5.0, "ttl_secs": 60 }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT, "dynamic per-key: {body}");
+
+    let (status, body) = get_json(
+        &app,
+        "/admin/audit?operation=rate_limit.pacing_override.set",
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let records = body.as_array().expect("audit response is a raw array");
+
+    let declared_failures: Vec<&str> = records
+        .iter()
+        .filter(|r| r["target_id"] == json!(declared_name) && r["status"] == json!("failed"))
+        .filter_map(|r| r["error_summary"].as_str())
+        .collect();
+    for expected_substring in [
+        "refill_rate must be a finite number",
+        "burst must be a finite number",
+        "must override at least one of",
+        "ttl_secs must be greater than zero",
+    ] {
+        assert!(
+            declared_failures
+                .iter()
+                .any(|s| s.contains(expected_substring)),
+            "expected a failed audit row whose error_summary contains \
+             {expected_substring:?}, got: {declared_failures:?}"
+        );
+    }
+    // axum's `JsonRejection` catches this before the handler parses the
+    // body. The audit row is still keyed by the path's `activity_name`,
+    // same as every other pre-parse rejection.
+    assert!(
+        records
+            .iter()
+            .any(|r| r["target_id"] == json!(declared_name)
+                && r["status"] == json!("failed")
+                && r["error_summary"]
+                    .as_str()
+                    .is_some_and(|s| s.contains("brust") || s.to_lowercase().contains("unknown"))),
+        "the unknown-field rejection must also be audited: {records:?}"
+    );
+
+    for (name, expected_substring) in [
+        (undeclared_name, "is not registered"),
+        (no_limit_name, "has no declared rate limit"),
+        (dynamic_name, "dynamic per-key rate limit"),
+    ] {
+        assert!(
+            records.iter().any(|r| r["target_id"] == json!(name)
+                && r["status"] == json!("failed")
+                && r["error_summary"]
+                    .as_str()
+                    .is_some_and(|s| s.contains(expected_substring))),
+            "expected a failed audit row for {name} containing {expected_substring:?}: {records:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn clear_rate_limit_pacing_override_audits_every_rejection_branch() {
+    let (url, _container) = setup_database().await;
+    let pool = build_pool(&url);
+    let dynamic_name = leaked_name("dynamic_email");
+    let undeclared_name = leaked_name("never_registered_activity");
+    let no_limit_name = leaked_name("no_limit_activity");
+
+    let mut dynamic_activity = rate_limited_activity_info(dynamic_name, 5.0, 5.0);
+    dynamic_activity.rate_limit_key_expr = Some("input.tenant_id");
+    let mut no_limit_activity = rate_limited_activity_info(no_limit_name, 5.0, 5.0);
+    no_limit_activity.rate_limit_rps = None;
+    no_limit_activity.rate_limit_burst = None;
+
+    let app = build_app(&pool, vec![dynamic_activity, no_limit_activity], vec![]);
+
+    let (status, body) = delete_json(
+        &app,
+        &format!("/admin/rate-limits/{undeclared_name}/override"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "undeclared activity: {body}");
+
+    let (status, body) = delete_json(
+        &app,
+        &format!("/admin/rate-limits/{no_limit_name}/override"),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::NOT_FOUND,
+        "no declared rate limit: {body}"
+    );
+
+    let (status, body) =
+        delete_json(&app, &format!("/admin/rate-limits/{dynamic_name}/override")).await;
+    assert_eq!(status, StatusCode::CONFLICT, "dynamic per-key: {body}");
+
+    let (status, body) = get_json(
+        &app,
+        "/admin/audit?operation=rate_limit.pacing_override.clear",
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let records = body.as_array().expect("audit response is a raw array");
+
+    for (name, expected_substring) in [
+        (undeclared_name, "is not registered"),
+        (no_limit_name, "has no declared rate limit"),
+        (dynamic_name, "dynamic per-key rate limit"),
+    ] {
+        assert!(
+            records.iter().any(|r| r["target_id"] == json!(name)
+                && r["status"] == json!("failed")
+                && r["error_summary"]
+                    .as_str()
+                    .is_some_and(|s| s.contains(expected_substring))),
+            "expected a failed audit row for {name} containing {expected_substring:?}: {records:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn set_start_throttle_pacing_override_audits_every_rejection_branch() {
+    let (url, _container) = setup_database().await;
+    let pool = build_pool(&url);
+    let declared_name = leaked_name("onboard_user");
+    let dynamic_name = leaked_name("dynamic_onboard_user");
+    let undeclared_name = leaked_name("never_registered_wf");
+    let no_throttle_name = leaked_name("no_throttle_wf");
+
+    let dynamic_wf = WorkflowInfo {
+        throttle: Some(
+            ThrottlePolicy::from_rate_str("5/m", Some(5.0), Some("input.tenant_id"), None)
+                .expect("valid rate"),
+        ),
+        ..static_throttled_info(dynamic_name, "5/m", 5.0)
+    };
+    let mut no_throttle_wf = static_throttled_info(no_throttle_name, "5/m", 5.0);
+    no_throttle_wf.throttle = None;
+
+    let app = build_app(
+        &pool,
+        vec![],
+        vec![
+            static_throttled_info(declared_name, "5/m", 5.0),
+            dynamic_wf,
+            no_throttle_wf,
+        ],
+    );
+    let path = format!("/admin/start-throttle/{declared_name}/override");
+
+    let (status, body) = post_json(
+        &app,
+        &path,
+        json!({ "refill_per_sec": -1.0, "ttl_secs": 60 }),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "invalid refill_per_sec: {body}"
+    );
+
+    let (status, body) = post_json(&app, &path, json!({ "burst": 0.5, "ttl_secs": 60 })).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "invalid burst: {body}");
+
+    let (status, body) = post_json(&app, &path, json!({ "ttl_secs": 60 })).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "empty override: {body}");
+
+    let (status, body) =
+        post_json(&app, &path, json!({ "refill_per_sec": 5.0, "ttl_secs": 0 })).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "invalid ttl_secs: {body}");
+
+    let (status, body) = post_json(
+        &app,
+        &format!("/admin/start-throttle/{undeclared_name}/override"),
+        json!({ "refill_per_sec": 5.0, "ttl_secs": 60 }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "undeclared workflow: {body}");
+
+    let (status, body) = post_json(
+        &app,
+        &format!("/admin/start-throttle/{no_throttle_name}/override"),
+        json!({ "refill_per_sec": 5.0, "ttl_secs": 60 }),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::NOT_FOUND,
+        "no declared throttle: {body}"
+    );
+
+    let (status, body) = post_json(
+        &app,
+        &format!("/admin/start-throttle/{dynamic_name}/override"),
+        json!({ "refill_per_sec": 5.0, "ttl_secs": 60 }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT, "dynamic per-key: {body}");
+
+    let (status, body) = get_json(
+        &app,
+        "/admin/audit?operation=start_throttle.pacing_override.set",
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let records = body.as_array().expect("audit response is a raw array");
+
+    let declared_failures: Vec<&str> = records
+        .iter()
+        .filter(|r| r["target_id"] == json!(declared_name) && r["status"] == json!("failed"))
+        .filter_map(|r| r["error_summary"].as_str())
+        .collect();
+    for expected_substring in [
+        "refill_per_sec must be a finite number",
+        "burst must be a finite number",
+        "must override at least one of",
+        "ttl_secs must be greater than zero",
+    ] {
+        assert!(
+            declared_failures
+                .iter()
+                .any(|s| s.contains(expected_substring)),
+            "expected a failed audit row whose error_summary contains \
+             {expected_substring:?}, got: {declared_failures:?}"
+        );
+    }
+
+    for (name, expected_substring) in [
+        (undeclared_name, "is not registered"),
+        (no_throttle_name, "has no declared start throttle"),
+        (dynamic_name, "dynamic per-key start throttle"),
+    ] {
+        assert!(
+            records.iter().any(|r| r["target_id"] == json!(name)
+                && r["status"] == json!("failed")
+                && r["error_summary"]
+                    .as_str()
+                    .is_some_and(|s| s.contains(expected_substring))),
+            "expected a failed audit row for {name} containing {expected_substring:?}: {records:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn clear_start_throttle_pacing_override_audits_every_rejection_branch() {
+    let (url, _container) = setup_database().await;
+    let pool = build_pool(&url);
+    let dynamic_name = leaked_name("dynamic_onboard_user");
+    let undeclared_name = leaked_name("never_registered_wf");
+    let no_throttle_name = leaked_name("no_throttle_wf");
+
+    let dynamic_wf = WorkflowInfo {
+        throttle: Some(
+            ThrottlePolicy::from_rate_str("5/m", Some(5.0), Some("input.tenant_id"), None)
+                .expect("valid rate"),
+        ),
+        ..static_throttled_info(dynamic_name, "5/m", 5.0)
+    };
+    let mut no_throttle_wf = static_throttled_info(no_throttle_name, "5/m", 5.0);
+    no_throttle_wf.throttle = None;
+
+    let app = build_app(&pool, vec![], vec![dynamic_wf, no_throttle_wf]);
+
+    let (status, body) = delete_json(
+        &app,
+        &format!("/admin/start-throttle/{undeclared_name}/override"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "undeclared workflow: {body}");
+
+    let (status, body) = delete_json(
+        &app,
+        &format!("/admin/start-throttle/{no_throttle_name}/override"),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::NOT_FOUND,
+        "no declared throttle: {body}"
+    );
+
+    let (status, body) = delete_json(
+        &app,
+        &format!("/admin/start-throttle/{dynamic_name}/override"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT, "dynamic per-key: {body}");
+
+    let (status, body) = get_json(
+        &app,
+        "/admin/audit?operation=start_throttle.pacing_override.clear",
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let records = body.as_array().expect("audit response is a raw array");
+
+    for (name, expected_substring) in [
+        (undeclared_name, "is not registered"),
+        (no_throttle_name, "has no declared start throttle"),
+        (dynamic_name, "dynamic per-key start throttle"),
+    ] {
+        assert!(
+            records.iter().any(|r| r["target_id"] == json!(name)
+                && r["status"] == json!("failed")
+                && r["error_summary"]
+                    .as_str()
+                    .is_some_and(|s| s.contains(expected_substring))),
+            "expected a failed audit row for {name} containing {expected_substring:?}: {records:?}"
+        );
+    }
 }

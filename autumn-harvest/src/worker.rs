@@ -2953,6 +2953,10 @@ struct LocalActivityCommandBatch {
     pre_schedule_events: Vec<WorkflowEvent>,
     post_schedule_events: Vec<WorkflowEvent>,
     detached_commands: Vec<WorkflowCommand>,
+    /// Raw `CancelRaceLosers` commands from the batch (issue #1247). Resolved
+    /// by [`run_local_activity_inline`] inside its own event-append
+    /// transaction, not here — see the field's use site for why.
+    race_loser_commands: Vec<WorkflowCommand>,
     run: LocalActivityRun,
 }
 
@@ -2972,18 +2976,42 @@ fn local_activity_history_cap_reached(next_event_id: i32, cap: Option<u64>) -> O
 
 /// Extract a `RunLocalActivity` command from an owned command list.
 ///
-/// Marker and detached-spawn events are split around the local activity command
-/// so `LocalActivityScheduled` is written at its actual command position.
-/// The `result_tx` inside the command is dropped immediately — the workflow
-/// coroutine was already dropped when the 100 ms suspension timeout fired, so
-/// nobody is listening on the receiving end.
+/// Marker, detached-spawn, timer-bookkeeping, and update-result events are
+/// split around the local activity command so `LocalActivityScheduled` is
+/// written at its actual command position. The `result_tx` inside the
+/// command is dropped immediately — the workflow coroutine was already
+/// dropped when the 100 ms suspension timeout fired, so nobody is listening
+/// on the receiving end.
+///
+/// Issue #1247: before this fix, the original four kinds
+/// (`RecordMarker`, `RecordSideEffect`, `SpawnDetachedChildWorkflow`,
+/// `RunLocalActivity`) were the only ones handled. Every other command hit a
+/// `_ => {}` catch-all and was silently dropped. A co-batched `CancelTimer`
+/// lost its durable row delete and its `TimerCancelled` event. A co-batched
+/// `RecordUpdateResult` lost its `UpdateCompleted`/`UpdateFailed` event
+/// outright. No later cycle ever re-emits it.
+///
+/// The match below is now exhaustive. Every `WorkflowCommand` variant either
+/// gets handled, is a documented no-op the caller already handles, or is
+/// provably unreachable and panics if it ever arrives.
+#[allow(clippy::too_many_lines)]
 fn extract_run_local_activity(commands: Vec<WorkflowCommand>) -> LocalActivityCommandBatch {
+    // Positional TimerStarted/TimerCancelled plan for a co-batched
+    // CancelTimer or ArmTimer{for_await:false} (issue #1247). Pure, so it
+    // costs nothing when the batch carries neither. Shared with the general
+    // suspension path's plan_timer_lifecycle. `armed_indices` names any
+    // ArmTimer{for_await:true} arm — local_activity_batch_conflict rejects
+    // that command before this function runs, so the unreachable! arm below
+    // is the actual backstop if that guard is ever loosened.
+    let (mut timer_events, _armed_indices) = plan_timer_lifecycle_pure(&commands);
+
     // ⚡ Bolt: Pre-allocate vector capacity to avoid intermediate allocations
     let mut pre_schedule_events = Vec::with_capacity(commands.len());
     let mut post_schedule_events = Vec::new();
     let mut detached_commands = Vec::new();
+    let mut race_loser_commands = Vec::new();
     let mut local_run = None;
-    for cmd in commands {
+    for (i, cmd) in commands.into_iter().enumerate() {
         match cmd {
             WorkflowCommand::RecordMarker { name, details } => {
                 let event = WorkflowEvent::MarkerRecorded { name, details };
@@ -3048,13 +3076,95 @@ fn extract_run_local_activity(commands: Vec<WorkflowCommand>) -> LocalActivityCo
                     last_error,
                 });
             }
-            _ => {} // unexpected alongside RunLocalActivity; ignore
+            // Timer bookkeeping a local activity may legally share a batch
+            // with (issue #1247). The caller deletes CancelTimer's durable
+            // harvest_timers row before this function runs (see
+            // delete_local_activity_cancelled_timers). ArmTimer{for_await:
+            // false} never touches that table. Both need only their
+            // positional history event here.
+            WorkflowCommand::CancelTimer { .. }
+            | WorkflowCommand::ArmTimer {
+                for_await: false, ..
+            } => {
+                if let Some(event) = timer_events[i].take() {
+                    if local_run.is_some() {
+                        post_schedule_events.push(event);
+                    } else {
+                        pre_schedule_events.push(event);
+                    }
+                }
+            }
+            WorkflowCommand::RecordUpdateResult { update_id, result } => {
+                let event = match result {
+                    Ok(output) => WorkflowEvent::UpdateCompleted { update_id, output },
+                    Err(error) => WorkflowEvent::UpdateFailed { update_id, error },
+                };
+                if local_run.is_some() {
+                    post_schedule_events.push(event);
+                } else {
+                    pre_schedule_events.push(event);
+                }
+            }
+            // Event-less bookkeeping the caller already persisted before
+            // calling this function. Search attributes
+            // (persist_search_attrs_from_commands), the current_details
+            // breadcrumb (persist_current_details_from_commands), durable
+            // logs (persist_workflow_logs_from_commands), ephemeral progress
+            // (notify_progress_from_commands), and the mutex release
+            // (process_mutex_releases_from_commands) are all handled there.
+            // Nothing left to do here.
+            WorkflowCommand::UpsertSearchAttributes { .. }
+            | WorkflowCommand::SetCurrentDetails { .. }
+            | WorkflowCommand::RecordLog { .. }
+            | WorkflowCommand::PublishProgress { .. }
+            | WorkflowCommand::ReleaseMutex { .. } => {}
+            // A resolved ctx.race() CAN co-batch CancelRaceLosers with a local
+            // activity. The loser branches started on an earlier cycle, so no
+            // start command trips local_activity_batch_conflict. Collected
+            // here rather than resolved inline (issue #1247).
+            // apply_race_loser_cancellations must commit in the SAME
+            // transaction as this batch's own winner marker and
+            // LocalActivityScheduled event. run_local_activity_inline
+            // resolves it, not this function.
+            cmd @ WorkflowCommand::CancelRaceLosers { .. } => {
+                race_loser_commands.push(cmd);
+            }
+            // Every other kind is a durable awaitable, a terminal outcome, or
+            // an external-workflow command. local_activity_batch_conflict (or
+            // the dispatch arm's AcquireMutex guard, or
+            // split_mixed_signal_batch) already rejects or strips it before
+            // this function runs.
+            //
+            // No `_` arm on purpose. A new WorkflowCommand variant must fail
+            // to compile here, not fall through and be silently dropped
+            // again — the defect this issue fixes.
+            other @ (WorkflowCommand::ScheduleActivity { .. }
+            | WorkflowCommand::WaitForActivity { .. }
+            | WorkflowCommand::ScheduleExternalActivity { .. }
+            | WorkflowCommand::StartTimer { .. }
+            | WorkflowCommand::StartChildWorkflow { .. }
+            | WorkflowCommand::WaitForSignal { .. }
+            | WorkflowCommand::Complete { .. }
+            | WorkflowCommand::Fail { .. }
+            | WorkflowCommand::ContinueAsNew { .. }
+            | WorkflowCommand::SignalExternalWorkflow { .. }
+            | WorkflowCommand::RequestCancelExternalWorkflow { .. }
+            | WorkflowCommand::AwaitExternalWorkflow { .. }
+            | WorkflowCommand::ArmTimer {
+                for_await: true, ..
+            }
+            | WorkflowCommand::AcquireMutex { .. }) => unreachable!(
+                "{} cannot reach extract_run_local_activity; an earlier guard \
+                 must reject it first (issue #1247)",
+                workflow_command_name(&other)
+            ),
         }
     }
     LocalActivityCommandBatch {
         pre_schedule_events,
         post_schedule_events,
         detached_commands,
+        race_loser_commands,
         run: local_run.expect("called only after confirming RunLocalActivity is present"),
     }
 }
@@ -4096,11 +4206,22 @@ async fn run_local_activity_inline(
     // accounting is retired atomically with this activity's frontier-resolving
     // append. See `append_frontier_resolution`.
     frontier: FrontierAccounting<'_>,
+    // Issue #1247: `harvest.update.*` metrics for any `RecordUpdateResult` in
+    // this batch, precomputed by the caller (pure, from the pre-split command
+    // list). Emitted here, right after the prefix transaction below commits.
+    // Not by the caller after this function returns — the update event is
+    // already durable at that point. That holds regardless of what a LATER
+    // handler attempt or the frontier-resolving append does, including an
+    // `Err` this function returns afterward. Empty when the batch carries no
+    // `RecordUpdateResult`, or when one was already persisted and emitted by
+    // the caller's external-command branch.
+    update_result_metrics: &[(String, bool, Option<chrono::DateTime<chrono::Utc>>)],
 ) -> HarvestResult<LocalActivityInlineOutcome> {
     let LocalActivityCommandBatch {
         pre_schedule_events,
         post_schedule_events,
         detached_commands,
+        race_loser_commands,
         run,
     } = batch;
     // Issue #804: a local activity runs INLINE on the workflow worker, so a
@@ -4188,26 +4309,92 @@ async fn run_local_activity_inline(
         });
     }
     prefix_events.extend(post_schedule_events);
-    if !prefix_events.is_empty() || !detached_commands.is_empty() {
+    // Issue #1247: events apply_race_loser_cancellations durably appends
+    // for a co-batched CancelRaceLosers — a cancelled loser activity's
+    // ActivityFailed, or a cancelled loser child's terminal. Folded into
+    // this function's own returned events below. Otherwise the immediate
+    // in-process re-drive that follows would replay against an in-memory
+    // history missing them. They are durable in the DB, but invisible to
+    // this cycle's replay, which can then diverge from what actually
+    // happened live.
+    let (race_loser_deferred, race_loser_events): (
+        Vec<crate::completion_trigger::DeferredTriggerStart>,
+        Vec<WorkflowEvent>,
+    ) = if !prefix_events.is_empty()
+        || !detached_commands.is_empty()
+        || !race_loser_commands.is_empty()
+    {
         let events = prefix_events.clone();
         let event_start = *next_event_id;
-        Box::pin(conn.transaction::<(), HarvestError, _>(async |conn| {
-            store::append_events_with_codecs(
-                conn,
-                exec_id,
-                &events,
-                event_start,
-                registry.payload_codecs(),
-            )
-            .await?;
-            detached_spawns.persist(conn, &detached_commands).await
-        }))
-        .await?;
-        *next_event_id += i32::try_from(prefix_events.len())
+        let events_len = i32::try_from(events.len())
             .map_err(|_| HarvestError::Config("event count overflow".into()))?;
+        let (deferred, loser_events) =
+            Box::pin(conn.transaction::<_, HarvestError, _>(async |conn| {
+                store::append_events_with_codecs(
+                    conn,
+                    exec_id,
+                    &events,
+                    event_start,
+                    registry.payload_codecs(),
+                )
+                .await?;
+                detached_spawns.persist(conn, &detached_commands).await?;
+                // Issue #1247: resolve any co-batched CancelRaceLosers in the
+                // SAME transaction as this batch's own events (the winner
+                // marker and LocalActivityScheduled).
+                // apply_race_loser_cancellations documents that requirement
+                // itself. A crash between the two would let replay see a
+                // durably-cancelled loser with no recorded winner, free to
+                // pick a different one.
+                //
+                // Runs LAST, after detached_spawns.persist, not before it.
+                // apply_race_loser_cancellations records telemetry as a
+                // synchronous side effect with no rollback on its own. A
+                // recoverable failure from persist (QuotaExceeded) retries
+                // the whole task. A still-uncommitted cancellation ahead of
+                // it would then re-run and double-count that telemetry once
+                // the retry succeeds. persist carries no such hazard itself:
+                // its own detached-child rows commit or roll back with the
+                // rest of this transaction, atomically.
+                let mut cursor = event_start + events_len;
+                apply_race_loser_cancellations(
+                    conn,
+                    exec_id,
+                    &race_loser_commands,
+                    &mut cursor,
+                    registry,
+                )
+                .await
+            }))
+            .await?;
+        let loser_events_len = i32::try_from(loser_events.len())
+            .map_err(|_| HarvestError::Config("event count overflow".into()))?;
+        *next_event_id = event_start + events_len + loser_events_len;
+        (deferred, loser_events)
+    } else {
+        (Vec::new(), Vec::new())
+    };
+    // Spawn only after the transaction above committed — a rolled-back
+    // cancellation must never start a cross-shard cancel trigger.
+    for start in race_loser_deferred {
+        start.spawn();
     }
+    // Issue #1247: emit update-result metrics now, not after this function
+    // returns. Any RecordUpdateResult event in this batch is part of
+    // `prefix_events`, already durable at this point. A LATER failure in
+    // this function — a handler attempt, the frontier-resolving append —
+    // must not leave the metric permanently uncounted. Replay never
+    // re-derives an already-terminal update, so this is the only chance to
+    // emit it. A no-op when `update_result_metrics` is empty.
+    emit_update_result_metrics(
+        registry.telemetry().metrics.as_ref(),
+        owner.workflow_type,
+        queue_name,
+        update_result_metrics,
+    );
 
     let mut all_new_events = prefix_events;
+    all_new_events.extend(race_loser_events);
     if let Some(event_count) =
         local_activity_history_cap_reached(*next_event_id, history_event_hard_cap)
     {
@@ -8553,7 +8740,7 @@ async fn persist_signal_wait_park(
                 .await?;
             detached_spawns.persist(conn, commands).await?;
             let mut race_next_event_id = next_event_id.saturating_add(events_len);
-            let deferred = apply_race_loser_cancellations(
+            let (deferred, _race_loser_events) = apply_race_loser_cancellations(
                 conn,
                 exec_id,
                 commands,
@@ -8787,7 +8974,7 @@ async fn persist_mutex_acquire_park(
                 .await?;
             detached_spawns.persist(conn, commands).await?;
             let mut race_next_event_id = next_event_id.saturating_add(events_len);
-            let deferred = apply_race_loser_cancellations(
+            let (deferred, _race_loser_events) = apply_race_loser_cancellations(
                 conn,
                 exec_id,
                 commands,
@@ -8911,7 +9098,7 @@ async fn persist_activity_wait_park(
             .any(|activity_id| has_activity_terminal_event(&history.events, *activity_id));
 
         let mut next_event_id = history.next_event_id;
-        let deferred =
+        let (deferred, _race_loser_events) =
             apply_race_loser_cancellations(conn, exec_id, commands, &mut next_event_id, registry)
                 .await?;
 
@@ -9424,7 +9611,7 @@ async fn persist_scheduled_activities(
             // follow-up it still issues per row.
             let activity_task_ids = queue::enqueue_batch(conn, &enqueued).await?;
             let mut race_next_event_id = next_event_id.saturating_add(events_len);
-            let deferred = apply_race_loser_cancellations(
+            let (deferred, _race_loser_events) = apply_race_loser_cancellations(
                 conn,
                 exec_id,
                 commands,
@@ -9579,7 +9766,7 @@ async fn persist_started_timer(
         detached_spawns.persist(conn, commands).await?;
 
         let mut race_next_event_id = next_event_id.saturating_add(events_len);
-        let deferred = apply_race_loser_cancellations(
+        let (deferred, _race_loser_events) = apply_race_loser_cancellations(
             conn,
             exec_id,
             commands,
@@ -9997,7 +10184,7 @@ async fn persist_all_started_child_workflows(
             store::load_history_with_codecs(conn, parent_exec_id, registry.payload_codecs())
                 .await?
                 .next_event_id;
-        let race_deferred = apply_race_loser_cancellations(
+        let (race_deferred, _race_loser_events) = apply_race_loser_cancellations(
             conn,
             parent_exec_id,
             commands,
@@ -10898,7 +11085,7 @@ async fn persist_child_timeout_race(
             // above wrote a variable number of events) so the cursor never
             // reuses a consumed id.
             let mut race_next_event_id = store::next_event_id_for(conn, parent_exec_id).await?;
-            let deferred = apply_race_loser_cancellations(
+            let (deferred, _race_loser_events) = apply_race_loser_cancellations(
                 conn,
                 parent_exec_id,
                 commands,
@@ -11325,7 +11512,7 @@ async fn persist_mixed_suspension_batch(
 
         detached_spawns.persist(conn, commands).await?;
 
-        let deferred =
+        let (deferred, _race_loser_events) =
             apply_race_loser_cancellations(conn, exec_id, commands, &mut next_event_id, registry)
                 .await?;
 
@@ -14361,7 +14548,7 @@ async fn persist_scheduled_external_activity(
             let mut race_next_event_id = store::load_history_with_codecs(conn, exec_id, codecs)
                 .await?
                 .next_event_id;
-            let deferred = apply_race_loser_cancellations(
+            let (deferred, _race_loser_events) = apply_race_loser_cancellations(
                 conn,
                 exec_id,
                 commands,
@@ -14446,7 +14633,7 @@ async fn persist_scheduled_external_activity(
             )
             .await?;
             let mut race_next_event_id = next_event_id.saturating_add(events_len);
-            let deferred = apply_race_loser_cancellations(
+            let (deferred, _race_loser_events) = apply_race_loser_cancellations(
                 conn,
                 exec_id,
                 commands,
@@ -14505,7 +14692,7 @@ async fn persist_bookkeeping_and_requeue_workflow(
         }
         detached_spawns.persist(conn, commands).await?;
         let mut race_next_event_id = next_event_id.saturating_add(events_len);
-        let deferred = apply_race_loser_cancellations(
+        let (deferred, _race_loser_events) = apply_race_loser_cancellations(
             conn,
             exec_id,
             commands,
@@ -14565,10 +14752,28 @@ pub async fn apply_race_loser_cancellations(
     commands: &[WorkflowCommand],
     next_event_id: &mut i32,
     registry: &HandlerRegistry,
-) -> HarvestResult<Vec<crate::completion_trigger::DeferredTriggerStart>> {
+) -> HarvestResult<(
+    Vec<crate::completion_trigger::DeferredTriggerStart>,
+    Vec<WorkflowEvent>,
+)> {
     let mut deferred = Vec::new();
     let mut synthetic_events = Vec::new();
+    // Issue #1247: events a child-loser cancellation already appended
+    // inline. See the `total_child_events_appended` reload below. Kept
+    // separate from `synthetic_events` — that vector is appended to `harvest_events`
+    // again at the end of this function, and these are already durable.
+    // Combined with `synthetic_events` only in the return value, for a
+    // caller that re-drives the workflow in-process this same cycle.
+    let mut child_terminal_events = Vec::new();
     let metrics = &registry.telemetry().metrics;
+    // Issue #1247: entry-point cursor for the single post-loop reload
+    // below, and the metrics that reload's success gates.
+    let function_entry_next_event_id = *next_event_id;
+    let mut child_terminal_metrics: Vec<(String, String)> = Vec::new();
+    // Issue #1247: same deferral as `child_terminal_metrics`, for the
+    // activity-loser trio below. The post-loop reload can fail, and these
+    // metrics have no undo either.
+    let mut activity_loser_metrics: Vec<(String, String)> = Vec::new();
 
     for cmd in commands {
         let WorkflowCommand::CancelRaceLosers {
@@ -14596,19 +14801,13 @@ pub async fn apply_race_loser_cancellations(
                     non_retryable: true,
                     details: None,
                 });
-                metrics.record_activity_completed_with_error_type(
-                    &activity_name,
-                    &queue_name,
-                    0.0,
-                    ActivityStatus::Failed,
-                    Some("Error"),
-                );
-                metrics.record_activity_failed(&activity_name, "", "Error", true);
-                metrics.record_activity_attempt(
-                    &activity_name,
-                    &queue_name,
-                    ActivityStatus::Failed,
-                );
+                // Issue #1247: deferred past the post-loop reload below.
+                // `cancel_activity_task` is not yet durable outside this
+                // transaction, so a later reload failure rolls it back.
+                // Recording the metric trio now would survive that
+                // rollback and double-count on the retry that re-cancels
+                // the same activity.
+                activity_loser_metrics.push((activity_name, queue_name));
             }
         }
 
@@ -14654,12 +14853,13 @@ pub async fn apply_race_loser_cancellations(
                 Ok((_, mut starts, _closed_children, terminal_metric)) => {
                     deferred.append(&mut starts);
                     if let Some((child_workflow_name, queue_name)) = terminal_metric {
-                        crate::telemetry::emit_workflow_terminal(
-                            metrics.as_ref(),
-                            &child_workflow_name,
-                            &queue_name,
-                            WorkflowStatus::Cancelled,
-                        );
+                        // Issue #1247: defer the metric past the reload
+                        // below. `emit_workflow_terminal` has no undo.
+                        // Recording it here, before that later fallible
+                        // read, would survive a reload failure. The reload
+                        // failure rolls back this whole transaction,
+                        // cancellation included.
+                        child_terminal_metrics.push((child_workflow_name, queue_name));
                         // A race child is always an *awaited* child of this very
                         // execution (parent_id = exec_id, parent_close_policy =
                         // None), so a genuine (newly-cancelled) cancellation here
@@ -14675,7 +14875,7 @@ pub async fn apply_race_loser_cancellations(
                         // append that follows would reuse a consumed id and fail on
                         // `UNIQUE(workflow_exec_id, event_id)`. Re-read the true next
                         // event id under the parent row lock that `notify_awaited_
-                        // parent_of_child_terminal`'s append already holds (Codex P2).
+                        // parent_of_child_terminal`'s append already holds.
                         *next_event_id = store::next_event_id_for(conn, exec_id).await?;
                     }
                 }
@@ -14701,6 +14901,19 @@ pub async fn apply_race_loser_cancellations(
         }
     }
 
+    child_terminal_events.extend(
+        reload_race_loser_events_and_emit_metrics(
+            conn,
+            exec_id,
+            registry,
+            function_entry_next_event_id,
+            *next_event_id,
+            &child_terminal_metrics,
+            &activity_loser_metrics,
+        )
+        .await?,
+    );
+
     if !synthetic_events.is_empty() {
         let inserted = store::append_events_with_codecs(
             conn,
@@ -14713,7 +14926,66 @@ pub async fn apply_race_loser_cancellations(
         *next_event_id = next_event_id.saturating_add(i32::try_from(inserted).unwrap_or(0));
     }
 
-    Ok(deferred)
+    // Issue #1247: return every event this call durably appended. Child
+    // terminals come first — appended inline, mid-loop, so they hold the
+    // lower ids — then the batched activity terminals just above. A caller
+    // re-driving the workflow in-process this same cycle can then extend
+    // its in-memory history with them before doing so.
+    child_terminal_events.extend(synthetic_events);
+    Ok((deferred, child_terminal_events))
+}
+
+/// One reload for every child `apply_race_loser_cancellations` cancelled,
+/// not one per child (issue #1247). The delta between `next_event_id` at
+/// function entry and at loop-end is exactly the events those
+/// cancellations appended. Synthetic activity-loser events are appended
+/// separately, after this call. They are excluded by construction.
+///
+/// Emits every deferred child-cancellation and activity-loser metric only
+/// after the reload succeeds (issue #1247). A reload failure then rolls
+/// back the transaction with no metric recorded for it.
+async fn reload_race_loser_events_and_emit_metrics(
+    conn: &mut AsyncPgConnection,
+    exec_id: ExecutionId,
+    registry: &HandlerRegistry,
+    function_entry_next_event_id: i32,
+    next_event_id: i32,
+    child_terminal_metrics: &[(String, String)],
+    activity_loser_metrics: &[(String, String)],
+) -> HarvestResult<Vec<WorkflowEvent>> {
+    let mut child_terminal_events = Vec::new();
+    let total_child_events_appended =
+        usize::try_from(next_event_id - function_entry_next_event_id).unwrap_or_default();
+    if total_child_events_appended > 0 {
+        let history =
+            store::load_history_with_codecs(conn, exec_id, registry.payload_codecs()).await?;
+        let start = history
+            .events
+            .len()
+            .saturating_sub(total_child_events_appended);
+        child_terminal_events.extend_from_slice(&history.events[start..]);
+    }
+    let metrics = &registry.telemetry().metrics;
+    for (child_workflow_name, queue_name) in child_terminal_metrics {
+        crate::telemetry::emit_workflow_terminal(
+            metrics.as_ref(),
+            child_workflow_name,
+            queue_name,
+            WorkflowStatus::Cancelled,
+        );
+    }
+    for (activity_name, queue_name) in activity_loser_metrics {
+        metrics.record_activity_completed_with_error_type(
+            activity_name,
+            queue_name,
+            0.0,
+            ActivityStatus::Failed,
+            Some("Error"),
+        );
+        metrics.record_activity_failed(activity_name, "", "Error", true);
+        metrics.record_activity_attempt(activity_name, queue_name, ActivityStatus::Failed);
+    }
+    Ok(child_terminal_events)
 }
 
 /// Pure event-emission plan for the **fresh-arm** timer commands
@@ -15132,6 +15404,35 @@ async fn plan_timer_lifecycle(
     }
 
     Ok((events_by_index, min_fires_at))
+}
+
+/// Delete the `harvest_timers` row for each `CancelTimer` co-batched with a
+/// `RunLocalActivity` (issue #1247), before the inline local-activity run.
+///
+/// A `CancelTimer` here can target a row from an earlier cycle's
+/// `ArmTimer { for_await: true }` (a durable await that already parked and
+/// armed the row). Deleting it up front closes the race the issue describes.
+/// Without this, the row survives into the local activity's execution
+/// window. The sweeper can then fire it there, appending `TimerFired` where
+/// replay expects `TimerCancelled`. `delete_pending_timer` filters
+/// `fired = false`, so a `CancelTimer` with no matching row (the common case
+/// — a fresh, unawaited arm never inserted one) is a no-op.
+///
+/// [`extract_run_local_activity`] handles the row-less `TimerStarted`/
+/// `TimerCancelled` **events** for the same commands. This function owns
+/// only the DB side, mirroring how [`process_mutex_releases_from_commands`]
+/// is called separately from the event extraction for `ReleaseMutex`.
+async fn delete_local_activity_cancelled_timers(
+    conn: &mut AsyncPgConnection,
+    exec_id: ExecutionId,
+    commands: &[WorkflowCommand],
+) -> HarvestResult<()> {
+    for cmd in commands {
+        if let WorkflowCommand::CancelTimer { timer_id } = cmd {
+            queue::delete_pending_timer(conn, exec_id, timer_id).await?;
+        }
+    }
+    Ok(())
 }
 
 #[allow(clippy::too_many_lines)]
@@ -17694,7 +17995,7 @@ async fn persist_terminal_outcome_commands(
     // function in. The returned starts are NOT spawned here — the caller
     // must only spawn them after that outer transaction commits (see
     // `apply_race_loser_cancellations`'s doc comment).
-    let race_deferred_triggers = apply_race_loser_cancellations(
+    let (race_deferred_triggers, _race_loser_events) = apply_race_loser_cancellations(
         conn,
         persistence.exec_id,
         pending_cmds,
@@ -18981,6 +19282,22 @@ async fn process_workflow_task(
                     &prepared.execution.workflow_name,
                 )
                 .await?;
+                // Issue #1247 (FIX-B twin, timer half): delete any
+                // harvest_timers row a co-batched CancelTimer targets, BEFORE
+                // the inline local-activity re-drive. Same rationale as the
+                // ReleaseMutex resolution above, applied to a durable timer
+                // row instead of a durable lock.
+                delete_local_activity_cancelled_timers(conn, prepared.exec_id, &commands).await?;
+                // Issue #1247: a resolved ctx.race() can co-batch
+                // CancelRaceLosers with a local activity. The loser branches
+                // started on an earlier cycle, so this batch carries no start
+                // command for them. local_activity_batch_conflict has nothing
+                // to reject. Unlike the bookkeeping above,
+                // extract_run_local_activity collects it instead of resolving
+                // it here. apply_race_loser_cancellations must commit in the
+                // SAME transaction as this batch's own winner marker and
+                // LocalActivityScheduled event, so run_local_activity_inline
+                // runs it.
                 // Sync in-memory snapshot so a subsequent continue_as_new in the
                 // same task copies the patched attrs to the successor row.
                 prepared.execution.search_attrs = apply_search_attrs_patch_in_memory(
@@ -19004,6 +19321,54 @@ async fn process_workflow_task(
                             | WorkflowCommand::AwaitExternalWorkflow { .. }
                     )
                 }) {
+                    // Issue #1247, twin of issue #684's fix at the other
+                    // split_mixed_signal_batch call site below. That split
+                    // drops RecordUpdateResult from `remaining` without
+                    // persisting it. So extract_run_local_activity's
+                    // RecordUpdateResult arm never sees it in this branch.
+                    // Persist it here, before the split, so an update result
+                    // co-batched with an external command is not lost.
+                    //
+                    // The loop below re-drives the workflow in-process against
+                    // `history_events` once the local activity resolves. Build
+                    // the same UpdateCompleted/UpdateFailed events
+                    // `persist_update_result_commands` durably appends. Add
+                    // them to `history_events` too. Otherwise that re-drive
+                    // sees only `UpdateAdmitted`, `execute_admitted_update`
+                    // takes its live path, and the handler runs a second time.
+                    let update_result_events: Vec<WorkflowEvent> = commands
+                        .iter()
+                        .filter_map(|cmd| match cmd {
+                            WorkflowCommand::RecordUpdateResult { update_id, result } => {
+                                Some(match result {
+                                    Ok(output) => WorkflowEvent::UpdateCompleted {
+                                        update_id: *update_id,
+                                        output: output.clone(),
+                                    },
+                                    Err(error) => WorkflowEvent::UpdateFailed {
+                                        update_id: *update_id,
+                                        error: error.clone(),
+                                    },
+                                })
+                            }
+                            _ => None,
+                        })
+                        .collect();
+                    persist_update_result_commands(
+                        conn,
+                        prepared.exec_id,
+                        &commands,
+                        &mut next_event_id,
+                        registry.payload_codecs(),
+                    )
+                    .await?;
+                    history_events.extend(update_result_events);
+                    emit_update_result_metrics(
+                        telemetry.metrics.as_ref(),
+                        &prepared.execution.workflow_name,
+                        &task.queue_name,
+                        &collect_update_result_metrics(&history_events, &commands),
+                    );
                     let (signal_items, remaining) = split_mixed_signal_batch(commands);
                     if !signal_items.is_empty() {
                         let new_events = match persist_external_signal_inline(
@@ -19060,6 +19425,18 @@ async fn process_workflow_task(
                 } else {
                     commands
                 };
+                // Issue #1247: `collect_update_result_metrics` is pure (no
+                // DB), so capture it now, before `commands` is consumed
+                // below. The `harvest.update.*` counters are emitted only
+                // after `run_local_activity_inline` durably appends this
+                // cycle's events. The Persisted-arm emission never sees this
+                // cycle's commands. The loop re-drives the workflow before
+                // reaching it, mirroring why the two split_mixed_signal_batch
+                // call sites emit inline too. Empty when the external-command
+                // branch above already persisted and emitted for every
+                // RecordUpdateResult in this batch.
+                let update_result_metrics =
+                    collect_update_result_metrics(&history_events, &commands);
                 let detached_spawns = DetachedSpawnPersistence {
                     registry,
                     parent_execution: &prepared.execution,
@@ -19087,6 +19464,7 @@ async fn process_workflow_task(
                         worker_id,
                         reset_committed: frontier_reset_committed,
                     },
+                    &update_result_metrics,
                 )
                 .await
                 {
@@ -19126,6 +19504,11 @@ async fn process_workflow_task(
                         event_count,
                     } => {
                         history_events.extend(events);
+                        // Issue #1247: no emit_update_result_metrics call
+                        // here — run_local_activity_inline already emitted
+                        // any update-result metrics for this batch, right
+                        // after its prefix transaction committed. See that
+                        // function's `update_result_metrics` parameter.
                         let deferred = fail_workflow_for_history_cap(
                             conn,
                             registry,
@@ -19168,6 +19551,8 @@ async fn process_workflow_task(
                 // independent failure point after the progress became durable,
                 // and a failure would strand this still-claimed row.
                 history_events.extend(new_events);
+                // Issue #1247: no emit_update_result_metrics call here either
+                // — see the comment on the HistoryCapReached arm above.
                 let current_history_event_count =
                     u64::try_from(history_events.len()).unwrap_or(u64::MAX);
                 if let Some(cap) = registry.history_policy().event_hard_cap()
@@ -23300,6 +23685,9 @@ struct WorkerMonitoringHandles {
     /// Worker-session local-registry reconcilers (issue #606). Empty when
     /// `db` is disabled.
     session_slot_reconcilers: Vec<tokio::task::JoinHandle<()>>,
+    /// `quota_key` backfill reconcilers (issue #1226). Empty when `db` is
+    /// disabled.
+    quota_key_reconcilers: Vec<tokio::task::JoinHandle<()>>,
     history_oversized_sampler: tokio::task::JoinHandle<()>,
     /// Active-workflow population gauge sampler (issue #770). The task self-
     /// no-ops when metrics are disabled.
@@ -24460,6 +24848,21 @@ impl Worker {
             .map(|shard| (*shard, pool.clone()))
             .collect();
 
+        // More than one distinct shard target → multi-shard loop.
+        // One or zero targets (or single-pool fallback) → existing path.
+        // Computed here, ahead of the WASM seed block below. Seeding then
+        // applies the same per-call-site acquisition bound the multi-shard
+        // path already uses (issue #1212).
+        #[cfg(feature = "db")]
+        let use_multi_shard = shard_targets.len() > 1
+            && self
+                .config
+                .sharded_pool
+                .as_ref()
+                .is_some_and(|sp| sp.shard_ids().len() > 1);
+        #[cfg(not(feature = "db"))]
+        let use_multi_shard = false;
+
         // Issue #965: startup-seed. Make every builder-registered WASM activity
         // module available on each shard's database before the poll loop begins,
         // so an embedder who only calls `HarvestBuilder::wasm_activity(...)` and
@@ -24478,6 +24881,14 @@ impl Worker {
         // Otherwise the worker would advertise WASM activities that resolve to a
         // non-retryable `WasmModuleUnavailable` on that shard indefinitely. This
         // mirrors the missing-shard-pool guard at `run()` entry.
+        //
+        // Bounded on multi-shard. Issue #1212, Finding 2.
+        // This loop is sequential. One exhausted or unreachable shard pool
+        // can park it forever. No shard then reaches registration or
+        // polling. A bounded acquisition still fails closed on that shard.
+        // It matches the existing intent. It bounds the wait instead of
+        // hanging. Single-shard keeps the original unbounded
+        // `pool.get().await`. That path has no peer shard to strand.
         #[cfg(feature = "wasm-activities")]
         {
             let registrations = self.registry.wasm_module_registrations();
@@ -24501,8 +24912,10 @@ impl Worker {
                             .map(|(shard, shard_pool)| (Some(*shard), shard_pool))
                             .collect()
                     };
+                let seed_acquire_bound =
+                    shard_acquire_bound(use_multi_shard, self.config.poll_interval);
                 for (shard, shard_pool) in seed_targets {
-                    match shard_pool.get().await {
+                    match acquire_shard_conn(shard_pool, seed_acquire_bound).await {
                         Ok(mut conn) => {
                             if let Err(e) = crate::wasm_store::seed_registered_wasm_modules(
                                 &mut conn,
@@ -24536,18 +24949,6 @@ impl Worker {
                 }
             }
         }
-
-        // More than one distinct shard target → multi-shard loop.
-        // One or zero targets (or single-pool fallback) → existing path.
-        #[cfg(feature = "db")]
-        let use_multi_shard = shard_targets.len() > 1
-            && self
-                .config
-                .sharded_pool
-                .as_ref()
-                .is_some_and(|sp| sp.shard_ids().len() > 1);
-        #[cfg(not(feature = "db"))]
-        let use_multi_shard = false;
 
         if use_multi_shard {
             self.run_multi_shard(shard_targets, pool).await;
@@ -24691,14 +25092,31 @@ impl Worker {
             );
         }
 
+        // Bounded. Issue #1212, Finding 1.
+        // This loop is sequential. It runs before the poll loop starts.
+        // An unreachable notification host can stall the TCP connect step.
+        // That stall can take minutes, or run forever behind a silent
+        // firewall. It then strands every assigned shard, not only this
+        // one. `build_shard_listeners` runs only from the multi-shard path.
+        // So the bound always applies. A timed-out connect falls back to
+        // polling on that shard. A connect error already takes the same
+        // fallback.
+        let connect_bound = shard_acquire_bound(true, self.config.poll_interval)
+            .expect("multi_shard=true always yields Some bound");
+
         let mut shard_listeners: Vec<Option<crate::notify::QueueListener>> = Vec::new();
         for (shard_id, _) in shard_targets {
             let listener_url =
                 multi_shard_listener_url(&self.config.shard_notification_database_urls, *shard_id);
             let listener = match listener_url {
                 Some(url) => {
-                    match crate::notify::QueueListener::connect(url, &self.config.queues).await {
-                        Ok(l) => {
+                    match tokio::time::timeout(
+                        connect_bound,
+                        crate::notify::QueueListener::connect(url, &self.config.queues),
+                    )
+                    .await
+                    {
+                        Ok(Ok(l)) => {
                             tracing::info!(
                                 worker_id = %self.config.worker_id,
                                 shard_id = %shard_id.as_i32(),
@@ -24706,12 +25124,22 @@ impl Worker {
                             );
                             Some(l)
                         }
-                        Err(error) => {
+                        Ok(Err(error)) => {
                             tracing::warn!(
                                 worker_id = %self.config.worker_id,
                                 shard_id = %shard_id.as_i32(),
                                 error = %error,
                                 "per-shard LISTEN/NOTIFY failed; shard will fall back to polling"
+                            );
+                            None
+                        }
+                        Err(_elapsed) => {
+                            tracing::warn!(
+                                worker_id = %self.config.worker_id,
+                                shard_id = %shard_id.as_i32(),
+                                bound = ?connect_bound,
+                                "per-shard LISTEN/NOTIFY connect exceeded bound; shard will \
+                                 fall back to polling"
                             );
                             None
                         }
@@ -25027,6 +25455,11 @@ impl Worker {
         for handle in monitors.session_slot_reconcilers {
             if let Err(error) = handle.await {
                 tracing::warn!(error = %error, "session slot reconciler failed during shutdown");
+            }
+        }
+        for handle in monitors.quota_key_reconcilers {
+            if let Err(error) = handle.await {
+                tracing::warn!(error = %error, "quota_key reconciler failed during shutdown");
             }
         }
         for handle in monitors.pause_auto_resumers {
@@ -25585,6 +26018,31 @@ impl Worker {
                 )
             })
             .collect();
+        // `quota_key` backfill reconciler (issue #1226): one per assigned
+        // shard pool, mirroring the poison-pill/session reconcilers above.
+        // Each backfills `quota_key` on non-terminal executions left NULL by
+        // a `QuotaPolicy` declared after those rows started, scoped to that
+        // shard's own database. Reuses the heartbeat cadence rather than a
+        // dedicated interval knob, matching `session_slot_reconcilers`.
+        //
+        // The batch size is a fixed internal constant, not a `WorkerConfig`
+        // knob. `WorkerRuntimeConfig` is built as a bare struct literal at
+        // dozens of call sites across the test suite, with no
+        // `Default`/spread. A new required field there is disproportionate
+        // churn for a value that only needs to be "bounded", not
+        // operator-tunable.
+        let quota_key_reconcilers: Vec<_> = shard_pools_for_monitors
+            .iter()
+            .map(|(shard_pool, shard)| {
+                crate::quota_reconcile::spawn_quota_key_reconciler_for_shard(
+                    shard_pool.clone(),
+                    self.shutdown.clone(),
+                    self.config.worker_heartbeat_interval,
+                    crate::quota_reconcile::QUOTA_RECONCILE_DEFAULT_BATCH,
+                    *shard,
+                )
+            })
+            .collect();
         let pause_auto_resumers: Vec<_> = shard_pools_for_monitors
             .iter()
             .map(|(shard_pool, shard)| {
@@ -25842,6 +26300,7 @@ impl Worker {
             poison_pill_reclaimers,
             pause_auto_resumers,
             session_slot_reconcilers,
+            quota_key_reconcilers,
             history_oversized_sampler,
             workflow_active_sampler,
             worker_slot_sampler,
@@ -26532,6 +26991,15 @@ impl Worker {
                     worker_id = %self.config.worker_id,
                     error = %error,
                     "session slot reconciler task failed during shutdown"
+                );
+            }
+        }
+        for handle in monitors.quota_key_reconcilers {
+            if let Err(error) = handle.await {
+                tracing::warn!(
+                    worker_id = %self.config.worker_id,
+                    error = %error,
+                    "quota_key reconciler task failed during shutdown"
                 );
             }
         }
@@ -32537,6 +33005,185 @@ mod tests {
                     && *input == serde_json::Value::Null
             ),
             "detached spawn emitted before RunLocalActivity must stay before LocalActivityScheduled"
+        );
+    }
+
+    /// Issue #1247: a `CancelTimer` co-batched with a local activity must keep
+    /// its `TimerCancelled` event, not be dropped by the old `_ => {}` catch-all.
+    #[test]
+    fn extract_run_local_activity_preserves_cancel_timer_before_local_command() {
+        let commands = vec![
+            WorkflowCommand::CancelTimer {
+                timer_id: crate::types::TimerId::new("t"),
+            },
+            WorkflowCommand::RunLocalActivity {
+                activity_id: crate::types::ActivityExecId::new(),
+                name: "format_data".to_string(),
+                input: serde_json::Value::Null,
+                start_to_close: None,
+                retry_policy: None,
+                result_tx: oneshot::channel::<Result<serde_json::Value, String>>().0,
+                already_scheduled: false,
+                failed_attempts: 0,
+                last_error: None,
+            },
+        ];
+
+        let batch = extract_run_local_activity(commands);
+
+        assert!(batch.post_schedule_events.is_empty());
+        assert!(
+            matches!(
+                batch.pre_schedule_events.as_slice(),
+                [WorkflowEvent::TimerCancelled { timer_id }]
+                    if timer_id.as_str() == "t"
+            ),
+            "a CancelTimer emitted before RunLocalActivity must record TimerCancelled \
+             before LocalActivityScheduled: {:?}",
+            batch.pre_schedule_events
+        );
+    }
+
+    /// Issue #1247: a resolved `ctx.race()` can leave a `CancelRaceLosers` in
+    /// the same batch as a `RunLocalActivity`. The loser branches started on
+    /// an earlier cycle, so no start command trips
+    /// `local_activity_batch_conflict`. `extract_run_local_activity` must not
+    /// panic on it. It must not resolve it inline either.
+    /// `apply_race_loser_cancellations` must commit in the same transaction
+    /// as this batch's own events. So this function only collects the
+    /// command; `run_local_activity_inline` resolves it.
+    #[test]
+    fn extract_run_local_activity_collects_a_co_batched_cancel_race_losers() {
+        let loser_activity_id = crate::types::ActivityExecId::new();
+        let commands = vec![
+            WorkflowCommand::CancelRaceLosers {
+                activities: vec![loser_activity_id],
+                children: Vec::new(),
+                timers: vec![crate::types::TimerId::new("loser-timer")],
+            },
+            WorkflowCommand::RunLocalActivity {
+                activity_id: crate::types::ActivityExecId::new(),
+                name: "format_data".to_string(),
+                input: serde_json::Value::Null,
+                start_to_close: None,
+                retry_policy: None,
+                result_tx: oneshot::channel::<Result<serde_json::Value, String>>().0,
+                already_scheduled: false,
+                failed_attempts: 0,
+                last_error: None,
+            },
+        ];
+
+        let batch = extract_run_local_activity(commands);
+
+        assert!(
+            batch.pre_schedule_events.is_empty() && batch.post_schedule_events.is_empty(),
+            "CancelRaceLosers emits no event here — run_local_activity_inline \
+             resolves it inside its own transaction: {:?} / {:?}",
+            batch.pre_schedule_events,
+            batch.post_schedule_events
+        );
+        assert!(
+            matches!(
+                batch.race_loser_commands.as_slice(),
+                [WorkflowCommand::CancelRaceLosers { activities, children, timers }]
+                    if activities == &[loser_activity_id]
+                        && children.is_empty()
+                        && timers.len() == 1
+                        && timers[0].as_str() == "loser-timer"
+            ),
+            "the CancelRaceLosers command must be carried through, not dropped: {:?}",
+            batch.race_loser_commands
+        );
+    }
+
+    /// Issue #1247: the fresh-arm (`for_await: false`) twin of the test above —
+    /// `ArmTimer` co-batched with a local activity keeps its `TimerStarted`
+    /// event, positioned after `LocalActivityScheduled` here.
+    #[test]
+    fn extract_run_local_activity_preserves_fresh_timer_arm_after_local_command() {
+        let commands = vec![
+            WorkflowCommand::RunLocalActivity {
+                activity_id: crate::types::ActivityExecId::new(),
+                name: "format_data".to_string(),
+                input: serde_json::Value::Null,
+                start_to_close: None,
+                retry_policy: None,
+                result_tx: oneshot::channel::<Result<serde_json::Value, String>>().0,
+                already_scheduled: false,
+                failed_attempts: 0,
+                last_error: None,
+            },
+            WorkflowCommand::ArmTimer {
+                timer_id: crate::types::TimerId::new("t"),
+                duration_secs: 30,
+                for_await: false,
+            },
+        ];
+
+        let batch = extract_run_local_activity(commands);
+
+        assert!(batch.pre_schedule_events.is_empty());
+        assert!(
+            matches!(
+                batch.post_schedule_events.as_slice(),
+                [WorkflowEvent::TimerStarted { timer_id, duration_secs: 30 }]
+                    if timer_id.as_str() == "t"
+            ),
+            "a fresh ArmTimer emitted after RunLocalActivity must record TimerStarted \
+             after LocalActivityScheduled: {:?}",
+            batch.post_schedule_events
+        );
+    }
+
+    /// Issue #1247: `RecordUpdateResult` co-batched with a local activity must
+    /// keep its `UpdateCompleted`/`UpdateFailed` event. Before this fix it was
+    /// the most severe drop of the eight, since no later cycle ever re-emits it.
+    #[test]
+    fn extract_run_local_activity_preserves_record_update_result_success_and_failure() {
+        let ok_id = crate::types::UpdateId::new();
+        let err_id = crate::types::UpdateId::new();
+        let commands = vec![
+            WorkflowCommand::RecordUpdateResult {
+                update_id: ok_id,
+                result: Ok(serde_json::json!({"ok": true})),
+            },
+            WorkflowCommand::RunLocalActivity {
+                activity_id: crate::types::ActivityExecId::new(),
+                name: "format_data".to_string(),
+                input: serde_json::Value::Null,
+                start_to_close: None,
+                retry_policy: None,
+                result_tx: oneshot::channel::<Result<serde_json::Value, String>>().0,
+                already_scheduled: false,
+                failed_attempts: 0,
+                last_error: None,
+            },
+            WorkflowCommand::RecordUpdateResult {
+                update_id: err_id,
+                result: Err("handler exploded".to_string()),
+            },
+        ];
+
+        let batch = extract_run_local_activity(commands);
+
+        assert!(
+            matches!(
+                batch.pre_schedule_events.as_slice(),
+                [WorkflowEvent::UpdateCompleted { update_id, output }]
+                    if *update_id == ok_id && *output == serde_json::json!({"ok": true})
+            ),
+            "the update result before RunLocalActivity must land before LocalActivityScheduled: {:?}",
+            batch.pre_schedule_events
+        );
+        assert!(
+            matches!(
+                batch.post_schedule_events.as_slice(),
+                [WorkflowEvent::UpdateFailed { update_id, error }]
+                    if *update_id == err_id && error == "handler exploded"
+            ),
+            "the update result after RunLocalActivity must land after LocalActivityScheduled: {:?}",
+            batch.post_schedule_events
         );
     }
 

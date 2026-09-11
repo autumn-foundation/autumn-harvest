@@ -1741,3 +1741,8 @@ standalone note rather than part of the claim-path attribution table above:
   — four worker samplers issuing SQL with no `metrics.is_enabled()` guard
   (issue #1428), eliminated entirely rather than reduced (pool-touch count
   and corroborating `strace` `connect` calls both N → 0).
+* [`docs/performance-completion-trigger-outbox-queue.md`](performance-completion-trigger-outbox-queue.md)
+  — the per-row `harvest_schedules` lookup in
+  `completion_trigger::enforce_completion_triggers_outbox`'s cross-shard
+  relay scan, batched into one `workflow_name = ANY($1)` call via
+  `resolve_target_queues_batch` (`lookup_calls` n → 1 at every swept size).
