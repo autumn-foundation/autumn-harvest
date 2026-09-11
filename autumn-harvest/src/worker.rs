@@ -22216,9 +22216,18 @@ fn spawn_concurrency_sampler(
     interval: Duration,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
-        // No recorder configured: never issue the sampler SQL (issue #1428,
-        // matching `spawn_queue_depth_sampler`'s guard above).
-        if !telemetry.metrics.is_enabled() {
+        // No recorder configured, and no DEBUG subscriber would observe the
+        // saturation trace below either: skip the sampler SQL entirely
+        // (issue #1428). Unlike its three siblings, this sampler's
+        // saturation trace is a metrics-independent operator signal (see
+        // the doc comment above). PR #1468 review (Codex, P2) found that a
+        // blanket `is_enabled()`-only guard would silence it. That happens
+        // for a deployment with no metrics recorder but with DEBUG tracing
+        // on. `tracing::enabled!` keeps that deployment's sampler active,
+        // at zero extra cost for one with neither configured.
+        if !telemetry.metrics.is_enabled()
+            && !tracing::enabled!(target: "autumn_harvest::worker", tracing::Level::DEBUG)
+        {
             return;
         }
         loop {
@@ -28763,6 +28772,11 @@ mod tests {
     // It never logs the failure below. An unguarded one logs it once per
     // loop pass. The count is a direct, deterministic proxy for "how many
     // times a sampler touched the pool."
+    //
+    // One exception: `spawn_concurrency_sampler`'s guard also stays open
+    // for a DEBUG subscriber (PR #1468 review). Its own touch count depends
+    // on the ambient tracing level too, not on `is_enabled()` alone. The
+    // tests below cover both halves of that guard separately.
 
     /// A [`tracing_subscriber::Layer`] that counts events carrying the
     /// "could not acquire DB connection" message each sampler's failure
@@ -28865,14 +28879,23 @@ mod tests {
     #[ignore = "evidence generator, not a CI assertion -- see \
                 docs/performance-metrics-sampler-guard.md"]
     async fn zz_capture_metrics_sampler_guard_pool_touch_evidence() {
+        use tracing_subscriber::Layer;
         use tracing_subscriber::layer::SubscriberExt;
 
         const TICKS: usize = 20;
         let interval = Duration::from_millis(50);
 
+        // INFO, not the harness's ambient default, models an unconfigured
+        // deployment's usual log level. `spawn_concurrency_sampler`'s
+        // DEBUG-tracing check then reads false here. That matches a real
+        // deployment with no metrics recorder and no DEBUG tracing on. See
+        // `concurrency_sampler_stays_active_for_its_saturation_trace_under_debug_tracing`
+        // for the other half.
         let counter = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let subscriber =
-            tracing_subscriber::registry().with(PoolTouchCounter(Arc::clone(&counter)));
+        let subscriber = tracing_subscriber::registry().with(
+            PoolTouchCounter(Arc::clone(&counter))
+                .with_filter(tracing_subscriber::filter::LevelFilter::INFO),
+        );
         let _guard = tracing::subscriber::set_default(subscriber);
 
         let telemetry = Arc::new(crate::telemetry::TelemetryConfig::default());
@@ -28913,19 +28936,24 @@ mod tests {
     }
 
     /// Regression pin for issue #1428. The four previously-unguarded
-    /// samplers must never touch the pool when metrics are disabled,
-    /// matching every guarded sibling (`spawn_queue_depth_sampler` and
-    /// friends). Not timing-sensitive: the guard makes the count exactly
-    /// zero, unconditionally. No race with real connect-refusal timing can
-    /// make this test flaky in either direction.
+    /// samplers must never touch the pool under an unconfigured
+    /// deployment's usual state: metrics disabled and no DEBUG subscriber
+    /// listening. This matches every guarded sibling
+    /// (`spawn_queue_depth_sampler` and friends). Not timing-sensitive: the
+    /// guard makes the count exactly zero, unconditionally, under this
+    /// subscriber. No race with real connect-refusal timing can make this
+    /// test flaky in either direction.
     #[tokio::test(start_paused = true)]
     async fn metrics_disabled_samplers_never_touch_the_pool() {
+        use tracing_subscriber::Layer;
         use tracing_subscriber::layer::SubscriberExt;
 
         let interval = Duration::from_millis(50);
         let counter = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let subscriber =
-            tracing_subscriber::registry().with(PoolTouchCounter(Arc::clone(&counter)));
+        let subscriber = tracing_subscriber::registry().with(
+            PoolTouchCounter(Arc::clone(&counter))
+                .with_filter(tracing_subscriber::filter::LevelFilter::INFO),
+        );
         let _guard = tracing::subscriber::set_default(subscriber);
 
         let telemetry = Arc::new(crate::telemetry::TelemetryConfig::default());
@@ -28942,8 +28970,53 @@ mod tests {
         assert_eq!(
             load_pool_touch_count(&counter),
             0,
-            "a metrics-disabled deployment must never reach pool.get() in any of these \
-             four samplers"
+            "a metrics-disabled deployment with no DEBUG subscriber must never reach \
+             pool.get() in any of these four samplers"
+        );
+    }
+
+    /// Codex review on PR #1468 (P2) found a gap: a blanket
+    /// `is_enabled()`-only guard on `spawn_concurrency_sampler` would
+    /// silence its documented saturation trace. That happens for a
+    /// deployment that runs with DEBUG tracing but no metrics recorder.
+    /// Pins the fix: with metrics disabled but DEBUG enabled, the sampler
+    /// still reaches `pool.get()`. Its three siblings keep no such tracing
+    /// exception.
+    #[tokio::test(start_paused = true)]
+    async fn concurrency_sampler_stays_active_for_its_saturation_trace_under_debug_tracing() {
+        use tracing_subscriber::layer::SubscriberExt;
+
+        let interval = Duration::from_millis(50);
+        let counter = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        // No level filter: this subscriber's ambient default enables DEBUG,
+        // modeling a deployment that runs with DEBUG tracing on.
+        let subscriber =
+            tracing_subscriber::registry().with(PoolTouchCounter(Arc::clone(&counter)));
+        let _guard = tracing::subscriber::set_default(subscriber);
+
+        let telemetry = Arc::new(crate::telemetry::TelemetryConfig::default());
+        assert!(
+            !telemetry.metrics.is_enabled(),
+            "this test's point is metrics disabled, DEBUG tracing enabled"
+        );
+        let pool = unreachable_pool("postgres://127.0.0.1:1/sampler-guard-debug-exception");
+        let cancel = CancellationToken::new();
+        let handle = spawn_concurrency_sampler(
+            vec![pool],
+            cancel.clone(),
+            telemetry,
+            vec!["default".to_string()],
+            interval,
+        );
+
+        advance_sampler_ticks(interval, 5).await;
+        cancel.cancel();
+        let _ = tokio::time::timeout(Duration::from_secs(5), handle).await;
+
+        assert!(
+            load_pool_touch_count(&counter) > 0,
+            "with DEBUG tracing enabled, spawn_concurrency_sampler must still reach \
+             pool.get() even though metrics are disabled, or its saturation trace goes dark"
         );
     }
 

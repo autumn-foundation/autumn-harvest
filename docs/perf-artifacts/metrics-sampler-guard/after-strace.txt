@@ -1,8 +1,8 @@
 
 running 1 test
-strace: Process 17841 attached
+strace: Process 23324 attached
 label=after ticks=20 samplers=4 pool_touches=0
 test worker::tests::zz_capture_metrics_sampler_guard_pool_touch_evidence ... ok
 
-test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 3405 filtered out; finished in 0.01s
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 3406 filtered out; finished in 0.01s
 

@@ -64,6 +64,26 @@ changes: a metrics-enabled deployment (the only configuration under which
 these samplers ever produced a used value) is byte-for-byte unaffected,
 since `is_enabled()` returns `true` for it and the guard is a no-op.
 
+**Review amendment (Codex, PR #1468, P2):** `spawn_concurrency_sampler` is
+not quite like its three siblings. It also emits a `DEBUG` trace
+("concurrency cap saturated; pending tasks deferred until a slot frees")
+that is a metrics-independent operator signal, not gated on the metrics
+recorder before this fix. A blanket `is_enabled()`-only guard would have
+silenced that trace for a deployment with no metrics recorder but with
+DEBUG tracing enabled. Its guard is instead:
+
+```rust
+if !telemetry.metrics.is_enabled()
+    && !tracing::enabled!(target: "autumn_harvest::worker", tracing::Level::DEBUG)
+{
+    return;
+}
+```
+
+so it stays active whenever *either* signal could use its output. The
+other three samplers have no such trace and keep the plain
+`is_enabled()`-only guard.
+
 ## 📊 Measurement
 
 Wall-clock timing is not admissible evidence on this (shared-vCPU) machine.
@@ -72,9 +92,15 @@ The counter here is a direct proxy for "did a sampler ever reach
 `zz_capture_metrics_sampler_guard_pool_touch_evidence` test spawns all four
 samplers against `unreachable_pool` (a pool aimed at a closed port, so
 `pool.get()` fails fast and the sampler's own failure branch logs "...could
-not acquire DB connection") with `NoOpMetrics`, advances a paused clock by
-20 sampler intervals, and counts how many times that log line fires — one
-per pool touch.
+not acquire DB connection") with `NoOpMetrics` and its tracing subscriber
+filtered to `INFO` (DEBUG off, the realistic unconfigured-deployment
+default), advances a paused clock by 20 sampler intervals, and counts how
+many times that log line fires — one per pool touch.
+
+A separate test, `concurrency_sampler_stays_active_for_its_saturation_trace_
+under_debug_tracing`, pins the review amendment's other half: with metrics
+disabled but DEBUG left enabled, `spawn_concurrency_sampler` alone still
+reaches `pool.get()` (count > 0), so its saturation trace keeps firing.
 
 A second, independent counter corroborates it: `strace -f -c -e
 trace=connect,socket` against the compiled test binary running the same
@@ -118,9 +144,11 @@ strace -f -c -e trace=connect,socket "$BIN" \
   worker::tests::zz_capture_metrics_sampler_guard_pool_touch_evidence \
   --exact --ignored --nocapture
 
-# Permanent regression assertion (always run):
+# Permanent regression assertions (always run):
 cargo test -p autumn-harvest --lib -- \
-  worker::tests::metrics_disabled_samplers_never_touch_the_pool --exact
+  worker::tests::metrics_disabled_samplers_never_touch_the_pool \
+  worker::tests::concurrency_sampler_stays_active_for_its_saturation_trace_under_debug_tracing \
+  --exact
 ```
 
 ## Verification
@@ -137,3 +165,6 @@ cargo test -p autumn-harvest --lib -- \
 - Issue [#1428](https://github.com/autumn-foundation/autumn-harvest/issues/1428).
 - `docs/assays/0008-redis-dispatch-integrated-throughput.md` — the
   deployment-shaped profile that found this and named all four samplers.
+- PR [#1468](https://github.com/autumn-foundation/autumn-harvest/pull/1468)
+  review (Codex, P2) — found the `spawn_concurrency_sampler` saturation-trace
+  gap the "Change" section's amendment fixes.
