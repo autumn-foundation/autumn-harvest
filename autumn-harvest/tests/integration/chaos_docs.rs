@@ -273,6 +273,16 @@ fn local_iteration_example_is_scoped_to_chaos_tests_module() {
 /// escapes the next character instead of separating words.
 /// `--test integration\ chaos_tests::` glues `integration` and the rest
 /// into ONE escaped-space argument, not a flag followed by a filter.
+///
+/// Known, accepted limitation: the multiple-occurrence check above
+/// counts TEXTUAL matches, not executed ones. `echo ... --test
+/// integration chaos_tests:: && cargo test --tests chaos_tests::specific`
+/// has only one textual `--test integration`, inside the `echo`, so it
+/// passes uncaught. Telling an echoed argument from an executed
+/// command needs shell-command-boundary parsing (`&&`/`;`/`|`, plus
+/// quoting). That is the same class of disproportionate scope as the
+/// YAML-folding limitation in `skip_continuation_gap`. chaos.yml's
+/// `run:` is a single, unchained command today.
 fn find_flag_end(command: &str, flag: &str) -> Option<usize> {
     let before_ok = |prefix: &str| match prefix.chars().next_back() {
         None => true,
@@ -672,9 +682,9 @@ fn doc_and_ci_extraction_pipeline_rejects_a_shared_wrong_module_drift() {
     );
 }
 
-/// The **whole** workflow step stanza containing `needle`, from its `- name:`
-/// through to the line before the next step's `- name:` (or the end of the
-/// block).
+/// The **whole** workflow step stanza containing `needle`. Starts at
+/// its own `- ` list-item marker. Ends at the line before the next
+/// step's `- ` marker, or the end of the block.
 ///
 /// Bounding at the *next* step rather than at `needle` is the load-bearing
 /// part. Slicing only up to the matched text sits inside the step's `run:`
@@ -689,11 +699,17 @@ fn doc_and_ci_extraction_pipeline_rejects_a_shared_wrong_module_drift() {
 /// could be scoped with the same filter text as the step that really
 /// runs it. Silently picking the first match risks anchoring parity to
 /// the wrong step.
+///
+/// `name:` is optional on a GitHub Actions step -- chaos.yml's own
+/// `checkout`/`rust-toolchain`/`rust-cache` steps have none. The marker
+/// matches any step list item, not only named ones. An unnamed step
+/// now opens its own stanza. It no longer merges silently into the
+/// previous named one.
 fn workflow_step_stanza<'a>(block: &'a str, needle: &str) -> Option<&'a str> {
-    const STEP: &str = "\n      - name:";
+    const STEP: &str = "\n      - ";
     let at = block.find(needle)?;
     let start = block[..at].rfind(STEP).unwrap_or(0);
-    // Search for the next step from just past this stanza's own `- name:`, so
+    // Search for the next step from just past this stanza's own `- `, so
     // the marker we started from is not rediscovered as the terminator.
     let after_marker = start + STEP.len();
     let end = block[after_marker..]
@@ -746,6 +762,20 @@ fn workflow_step_stanza_panics_when_the_needle_appears_in_two_steps() {
     // the FIRST stanza containing the needle would then silently anchor
     // parity to the compile step, not the one CI really runs.
     let block = "\n      - name: Compile chaos suite\n        run: cargo test --test integration chaos_tests:: --no-run\n\n      - name: Run chaos reproducers\n        run: cargo test --test integration chaos_tests::specific\n";
+    workflow_step_stanza(block, "chaos_tests::");
+}
+
+#[test]
+#[should_panic(expected = "multiple")]
+fn workflow_step_stanza_treats_an_unnamed_step_as_its_own_boundary() {
+    // Codex finding on PR #1474: a step without `name:` is still a real
+    // step -- chaos.yml's own checkout/toolchain/cache steps have none.
+    // The old marker only recognized named steps, so an unnamed
+    // execution step's content stayed inside the PRECEDING named
+    // step's stanza. That silently bypassed the multiple-steps check
+    // above: the two occurrences looked like one, inside one (wrongly
+    // bounded) stanza.
+    let block = "\n      - name: Compile chaos suite\n        run: cargo test --test integration chaos_tests:: --no-run\n      - run: cargo test --test integration chaos_tests::specific\n";
     workflow_step_stanza(block, "chaos_tests::");
 }
 

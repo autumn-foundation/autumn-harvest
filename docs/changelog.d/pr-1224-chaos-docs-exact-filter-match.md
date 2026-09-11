@@ -164,10 +164,30 @@ issue #1202 as P2 round 4).
   extracted filters, alongside (not instead of) the equality check.
   Fixture test confirmed against a shared drift to a look-alike, wrong
   module name.
+- An eleventh Codex round found two more points. (1) `workflow_step_stanza`'s
+  step-boundary marker only recognized `- name:` list items, but `name:`
+  is optional on a GitHub Actions step -- chaos.yml's own
+  checkout/toolchain/cache steps have none. An unnamed step's content
+  silently stayed inside the preceding named step's stanza, which could
+  bypass the multiple-steps ambiguity check. Broadened the marker to any
+  `- ` step list item. Fixture test confirmed against an unnamed
+  execution step following a named compile-only one. (2) A `run:`
+  script that echoes a command containing the flag before executing a
+  DIFFERENT real invocation (e.g. `echo ... --test integration
+  chaos_tests:: && cargo test --tests chaos_tests::specific`) has only
+  ONE textual occurrence of `--test integration`, so neither the
+  multiple-occurrence check nor the module-prefix check catches it --
+  the echoed text is silently treated as the real command. **Not
+  implemented.** A correct fix needs shell-command-boundary parsing
+  (splitting on `&&`/`;`/`|` while respecting quoting) to tell an
+  echoed argument from an executed one -- the same class of
+  disproportionate scope as the YAML-folding finding declined earlier
+  in this issue. chaos.yml's `run:` is a single, unchained command
+  today; this is not a live bug.
 
 No production code changed — `chaos_docs.rs` is a test-only doc/CI parity
 guard behind no feature flag. `cargo test -p autumn-harvest --test
-integration chaos_docs::` (29/29), `cargo fmt -p autumn-harvest -- --check`,
+integration chaos_docs::` (30/30), `cargo fmt -p autumn-harvest -- --check`,
 `cargo clippy -p autumn-harvest --all-features --tests -- -D warnings`,
 and `python3 docs/audits/comment-hygiene.py --base origin/trunk-dev` are
 all clean.
