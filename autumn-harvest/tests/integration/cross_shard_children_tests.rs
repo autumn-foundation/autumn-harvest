@@ -533,9 +533,9 @@ async fn a_distributed_fan_out_places_children_on_other_shards() {
 /// absolute timestamp computed back when the parent decided to spawn it.
 ///
 /// This writes the outbox row directly, bypassing the spawn path. The
-/// test then controls exactly how long the "relay" waits before creating
-/// the child — the manual sweep call below — modelling a relay that runs
-/// late.
+/// test then controls exactly how long the "relay" — the manual sweep
+/// call below — waits before creating the child. That models a relay
+/// running late.
 ///
 /// The pre-fix relay carried an absolute `chain_deadline_at` computed at
 /// spawn time verbatim. A late relay could then hand the child an
@@ -555,9 +555,9 @@ async fn a_cross_shard_childs_chain_deadline_is_anchored_at_its_own_creation() {
     let parent = start_parent(&sharded, "child_echo", "chain-deadline-1").await;
     let child_shard = ShardId::new(1);
     let child_id = ExecutionId::new_for_shard(child_shard);
-    // Short enough that a chain deadline anchored at THIS instant (the
-    // spec's creation — the pre-fix bug) is easy to tell apart, after the
-    // delay below, from one anchored at the child's OWN creation.
+    // Short enough to tell two anchors apart after the delay below: THIS
+    // instant (the spec's creation — the pre-fix bug), versus the child's
+    // OWN creation (the fix).
     let chain_execution_timeout_secs = 5i64;
 
     let spec = autumn_harvest::cross_shard_child::CrossShardChildSpec {
@@ -657,8 +657,8 @@ async fn a_cross_shard_childs_chain_deadline_is_anchored_at_its_own_creation() {
 ///
 /// The child's row and a runnable queue task were then both committed
 /// before the cancel took effect. That is a window in which a worker
-/// could claim that task, and run the child's first decision cycle for a
-/// child that had already lost its race.
+/// could claim that task. It could then run the child's first decision
+/// cycle for a child that had already lost its race.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_cross_shard_child_cancelled_before_creation_is_born_cancelled() {
     let (urls, _container) = setup_shard_databases(&SHARDS).await;
@@ -759,10 +759,10 @@ async fn a_cross_shard_child_cancelled_before_creation_is_born_cancelled() {
 /// same-shard children.
 ///
 /// The parent and child rows are built directly, with no worker and no
-/// relay sweep. The test controls the exact scenario: a terminal parent on
-/// shard 0, a terminal child on shard 1, and the
-/// `harvest_cross_shard_children` pointer between them still present on
-/// shard 0.
+/// relay sweep. This is the exact scenario under test: a terminal parent
+/// on shard 0, and a terminal child on shard 1. The
+/// `harvest_cross_shard_children` pointer between them is still present
+/// on shard 0.
 ///
 /// The realistic window is an erasure requested at or shortly after both
 /// are terminal. That is before either the relay or retention has swept
