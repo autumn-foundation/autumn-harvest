@@ -1397,7 +1397,7 @@ async fn start_child_on_target(
                     spec.quota_key.as_deref(),
                     &workflow_name,
                     Some(metrics),
-                    crate::concurrency::SupersedeCredit::default(), // no dry-run credit on a cross-shard child spawn
+                    None, // no dry-run credit on a cross-shard child spawn (children never declare cancel_running)
                 )
                 .await?;
 

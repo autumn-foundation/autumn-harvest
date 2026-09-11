@@ -208,3 +208,46 @@ All existing Finding-1 tests in `quota_supersede_ordering_tests.rs`, the
 new mismatched-key test above, and the full `concurrency_supersede_
 tests.rs` and `quota_enforcement_tests.rs` suites stay green against the
 corrected design.
+
+## Follow-up 2 — PR #1484 review: replace_execution credit, lock-then-scan order
+
+A second automated review round, on the follow-up above, found two more
+P1 defects. Both are fixed here.
+
+**P1 — `replace_execution` never got a credit.** Every one of
+`replace_execution`'s three callers runs `run_latest_wins_supersede`
+right after it returns, exactly like the fresh-insert path. But
+`replace_execution` always passed `SupersedeCredit::default()` to
+`enforce_quota_admission`, so a `cancel_running` replacement sharing a
+concurrency key with a DIFFERENT `workflow_id`'s incumbent hit the same
+bug Finding 1 fixed on the fresh-insert path. Fixed: `replace_execution`
+now builds the same dry-run description the fresh-insert path does, from
+its own `request` and the replacement's new row id.
+
+**P1 — the scan could go stale before the quota lock.** The fresh-insert
+path ran its dry-run scan BEFORE calling `enforce_quota_admission`,
+unlocked. Two admissions resolving the SAME `quota_key` could race: one
+scans and gets credited for a slot, then a second admission takes the
+quota lock first and consumes that slot for real, and the first
+admission's later check still spends a credit for a slot that is already
+gone. Fixed by moving the scan itself inside `enforce_quota_admission`,
+run right after it takes `lock_quota_key`. Every admission for one quota
+key now serializes through that single lock, so no other admission can
+consume a credited slot between the scan and the check.
+
+Both fixes share one new type, `PendingSupersede` (`concurrency_key`,
+`concurrency_limit`, `self_exec_id`): callers now describe a pending
+supersede pass instead of pre-computing its credit, and
+`enforce_quota_admission` dry-runs it itself, under its own lock. The
+four child-spawn call sites (three in `worker.rs`, one in
+`cross_shard_child.rs`) pass `None` -- children only ever declare
+`ConcurrencyOnConflict::Defer`, so this is a type change only, not a
+behavior change.
+
+Re-ran `quota_supersede_ordering_tests.rs` (5/5), `quota_lock_ordering_
+tests.rs` (2/2), `concurrency_supersede_tests.rs` (20/20, including
+`nested_self_referential_admission_emits_residual_over_limit_counter`),
+and `quota_enforcement_tests.rs` (36/39, the 3 failures a pre-existing,
+already-tracked `quota_blocked_outbox_*` flake family unrelated to this
+change) against the corrected design. All green apart from that known
+flake family.
