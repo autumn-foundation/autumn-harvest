@@ -834,6 +834,18 @@ impl PayloadCodecs {
         // output carried; it is unique to WorkflowStarted among event variants.
         for key in crate::payload_store::PAYLOAD_FIELD_KEYS {
             if let Some(payload) = data.get_mut(key) {
+                // Issue #1243 review: offload composes AFTER codec encode
+                // (see `PayloadOffloader::offload_event_value`). A
+                // continue-as-new carryover (issue #524) can forward an
+                // offload reference verbatim, and that reference already
+                // holds a blob pointer, not ciphertext. Encoding it here
+                // would encrypt the pointer instead of the payload and hide
+                // it from the offloader's own already-offloaded check. Skip
+                // it, matching the re-encryption sweep's identical guard in
+                // `codec_rotation.rs`.
+                if encode && crate::payload_store::is_offload_envelope(payload) {
+                    continue;
+                }
                 if encode {
                     *payload = self.encode_payload(payload)?;
                 } else {

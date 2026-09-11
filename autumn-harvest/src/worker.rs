@@ -16778,6 +16778,15 @@ pub async fn persist_workflow_continue_as_new(
     let carried_lcr_ref = raw_carryover
         .as_ref()
         .and_then(crate::payload_store::extract_offload_ref);
+    // Issue #1243 review: `raw_carryover` is the STORED representation, a
+    // codec envelope under a real codec. `decode_payload` leaves an offload
+    // reference untouched, so the blob-forwarding path above still applies.
+    // It returns plaintext unchanged too. So it only unwraps an inline codec
+    // envelope -- exactly the case that needs one decode before the
+    // successor's write re-encodes it once.
+    let raw_carryover = raw_carryover
+        .map(|value| registry.payload_codecs().decode_payload(&value))
+        .transpose()?;
     let carryover_for_event = raw_carryover.or_else(|| persistence.carryover_result.clone());
 
     // The new execution stays on the same shard so all of its event log,

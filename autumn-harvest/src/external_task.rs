@@ -306,6 +306,11 @@ pub async fn find_by_token_locked(
 /// parked workflow task.  Returns `true` if the state transition happened,
 /// `false` if the token was already in a terminal state (idempotent).
 ///
+/// Delegates to [`complete_externally_with_codecs`] under the identity
+/// registry (issue #1243). A payload-bearing call site should use the
+/// `_with_codecs` sibling instead. This wrapper keeps the pre-#1243 public
+/// signature for an out-of-tree caller.
+///
 /// # Errors
 ///
 /// Returns [`HarvestError::NotFound`] when `token` is unknown on this shard.
@@ -313,7 +318,21 @@ pub async fn complete_externally(
     conn: &mut AsyncPgConnection,
     token: ExternalActivityToken,
     output: serde_json::Value,
-    // Issue #1243: `ActivityCompletedExternally.output` is payload-bearing.
+) -> HarvestResult<bool> {
+    complete_externally_with_codecs(conn, token, output, &crate::store::DEFAULT_PAYLOAD_CODECS)
+        .await
+}
+
+/// [`complete_externally`], encoding `ActivityCompletedExternally.output`
+/// through `codecs` (issue #1243).
+///
+/// # Errors
+///
+/// Same as [`complete_externally`].
+pub async fn complete_externally_with_codecs(
+    conn: &mut AsyncPgConnection,
+    token: ExternalActivityToken,
+    output: serde_json::Value,
     codecs: &crate::payload_codec::PayloadCodecs,
 ) -> HarvestResult<bool> {
     // The wake below re-pends a parked workflow task, so it raises a dispatch

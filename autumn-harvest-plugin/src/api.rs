@@ -43529,7 +43529,9 @@ async fn complete_external_activity(
     let complete_result = resolve_external_on_shards(&api_state, token, |conn, tok| {
         let out = output.clone();
         let codecs = codecs.clone();
-        Box::pin(async move { external_task::complete_externally(conn, tok, out, &codecs).await })
+        Box::pin(async move {
+            external_task::complete_externally_with_codecs(conn, tok, out, &codecs).await
+        })
     })
     .await;
 

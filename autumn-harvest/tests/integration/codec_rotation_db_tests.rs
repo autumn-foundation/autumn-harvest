@@ -801,6 +801,144 @@ async fn a_builder_configured_codec_encrypts_the_start_input_and_replay_round_tr
     );
 }
 
+// ── issue #1243 review: continue-as-new must not double-encode a carried
+// `last_completion_result` ──────────────────────────────────────────────────
+
+#[tokio::test]
+async fn continue_as_new_decodes_the_carried_codec_envelope_before_reencoding_it() {
+    // `persist_workflow_continue_as_new` forwards the predecessor's STORED
+    // `last_completion_result` verbatim (issue #524), to preserve scheduled
+    // carryover across a fork without re-resolving it. Under a real codec that
+    // stored value is already a ciphertext envelope. Encoding it again on the
+    // successor's write would wrap ciphertext in ciphertext. Replay would
+    // then decode only the outer layer and hand workflow code a codec
+    // envelope instead of the real prior output.
+    use std::time::Duration;
+
+    use autumn_harvest::models::TaskQueueItem;
+    use autumn_harvest::queue::{self, EnqueueParams, TaskType};
+    use autumn_harvest::schema::{harvest_task_queue, harvest_workflow_executions};
+    use autumn_harvest::worker::{
+        HandlerRegistry, WorkflowTaskPersistence, persist_workflow_continue_as_new,
+    };
+
+    let (url, _c) = setup_isolated_db().await;
+    let mut conn = connect(&url).await;
+
+    let codecs = PayloadCodecs::default();
+    codecs
+        .register_key("k1", Arc::new(XorCodec(0x11)))
+        .expect("register k1");
+    codecs.set_active_key("k1").expect("activate k1");
+
+    let secret_output = json!({"secret": "prior-output"});
+    let exec_id = insert_execution(&mut conn, "cx1243_continue_as_new").await;
+    store::append_events_with_codecs(
+        &mut conn,
+        exec_id,
+        &[WorkflowEvent::WorkflowStarted {
+            input: json!({}),
+            timestamp: Utc::now(),
+            last_completion_result: Some(secret_output.clone()),
+            last_error: None,
+            scheduled_time: None,
+        }],
+        0,
+        &codecs,
+    )
+    .await
+    .expect("append predecessor WorkflowStarted");
+
+    let mut enqueue = EnqueueParams::new("default", TaskType::Workflow, json!({}));
+    enqueue.workflow_exec_id = Some(exec_id.as_uuid());
+    enqueue.scheduled_at = Utc::now() - chrono::Duration::seconds(5);
+    queue::enqueue(&mut conn, &enqueue)
+        .await
+        .expect("enqueue task");
+    diesel::update(
+        harvest_task_queue::table
+            .filter(harvest_task_queue::workflow_exec_id.eq(Some(exec_id.as_uuid()))),
+    )
+    .set((
+        harvest_task_queue::state.eq("RUNNING"),
+        harvest_task_queue::worker_id.eq(Some("worker-a")),
+        harvest_task_queue::started_at.eq(Some(Utc::now())),
+    ))
+    .execute(&mut conn)
+    .await
+    .expect("claim task");
+    let task = harvest_task_queue::table
+        .filter(harvest_task_queue::workflow_exec_id.eq(Some(exec_id.as_uuid())))
+        .select(TaskQueueItem::as_select())
+        .first(&mut conn)
+        .await
+        .expect("load claimed task");
+    let execution = harvest_workflow_executions::table
+        .find(exec_id.as_uuid())
+        .select(autumn_harvest::models::WorkflowExecution::as_select())
+        .first(&mut conn)
+        .await
+        .expect("reload execution");
+
+    let registry = HandlerRegistry::new(Vec::new(), Vec::new()).with_payload_codecs(codecs.clone());
+    // `carryover_result: None` forces the raw-carryover path under test --
+    // the decoded fallback is not exercised here.
+    let persistence = WorkflowTaskPersistence::new_for_test(
+        &task,
+        "worker-a",
+        exec_id,
+        1,
+        Duration::ZERO,
+        None,
+        None,
+        None,
+    );
+    let redirected_to_failure = persist_workflow_continue_as_new(
+        &mut conn,
+        &registry,
+        persistence,
+        &execution,
+        json!({}),
+        None,
+    )
+    .await
+    .expect("continue-as-new persists");
+    assert!(
+        !redirected_to_failure,
+        "a same-type continuation with no target constraints must create a successor, \
+         not redirect to a terminal failure"
+    );
+
+    let predecessor_history = store::load_history_with_codecs(&mut conn, exec_id, &codecs)
+        .await
+        .expect("load predecessor history");
+    let new_exec_id = predecessor_history
+        .events
+        .iter()
+        .find_map(|e| match e {
+            WorkflowEvent::WorkflowContinuedAsNew { new_exec_id, .. } => Some(*new_exec_id),
+            _ => None,
+        })
+        .expect("predecessor must carry a WorkflowContinuedAsNew marker");
+
+    let successor_history = store::load_history_with_codecs(&mut conn, new_exec_id, &codecs)
+        .await
+        .expect("load successor history");
+    match &successor_history.events[0] {
+        WorkflowEvent::WorkflowStarted {
+            last_completion_result,
+            ..
+        } => {
+            assert_eq!(
+                *last_completion_result,
+                Some(secret_output),
+                "the successor must see the real prior output, not a codec envelope"
+            );
+        }
+        other => panic!("unexpected successor event: {other:?}"),
+    }
+}
+
 #[tokio::test]
 async fn an_erasure_tombstone_committed_before_the_sweep_is_never_overwritten() {
     // The ordinary (non-racing) half: a row already tombstoned carries no
