@@ -5358,9 +5358,11 @@ fn render_workflow_detail(
                         }
                         a href=(workflow_detail_href(last_page, selected_log_level)) { "Jump to latest" }
                         form method="get" style="display:inline-flex;gap:6px;align-items:center;margin-left:8px" {
-                            label style="font-size:12px;color:#94a3b8" { "Jump to event:" }
-                            input type="number" name="jump_event" min="1" max=(total_events) placeholder="N"
-                                style="width:70px;background:#1e293b;color:#e2e8f0;border:1px solid #334155;border-radius:4px;padding:4px 6px;font-size:12px";
+                            label style="font-size:12px;color:#94a3b8;display:inline-flex;align-items:center;gap:6px" {
+                                "Jump to event:"
+                                input type="number" name="jump_event" min="1" max=(total_events) placeholder="N"
+                                    style="width:70px;background:#1e293b;color:#e2e8f0;border:1px solid #334155;border-radius:4px;padding:4px 6px;font-size:12px";
+                            }
                             button type="submit" style="background:#2563eb;color:#fff;border:0;border-radius:4px;padding:4px 10px;font-size:12px;cursor:pointer" { "Go" }
                         }
                     }
@@ -15149,6 +15151,57 @@ mod tests {
         assert!(
             html.contains("?event_page=3&amp;log_level=warn"),
             "a level-filter link must carry the current event page"
+        );
+    }
+
+    #[test]
+    fn jump_to_event_control_has_a_programmatically_associated_label() {
+        // Every other `label`/control pair in this file relies on the
+        // dashboard's own convention -- a `<label>` that wraps its control --
+        // which the browser associates even with no `for`/`id` pair. This
+        // control alone rendered the label and the input as siblings, so a
+        // screen reader announced the field with no accessible name at all.
+        // Assert the wrapping structurally: the `jump_event` input must sit
+        // between the `<label>` carrying "Jump to event:" and its close tag.
+        let execution = stub_execution();
+        let blocked = stub_blocked_on();
+        let html = render_workflow_detail(
+            &execution,
+            150, // total_events, past DETAIL_EVENT_PAGE_SIZE so the control renders
+            &[],
+            &[],
+            &[],
+            false,
+            &[],
+            0,
+            &blocked,
+            None,
+            None,
+            &WorkflowLogsPanelData {
+                lines: &[],
+                admin: true,
+                ..Default::default()
+            },
+        )
+        .into_string();
+
+        let label_text_pos = html
+            .find("Jump to event:")
+            .expect("the jump-to-event control must render past the pagination threshold");
+        let label_open = html[..label_text_pos]
+            .rfind("<label")
+            .expect("\"Jump to event:\" must be inside a <label>");
+        let label_close = label_text_pos
+            + html[label_text_pos..]
+                .find("</label>")
+                .expect("the label must be closed");
+        let input_pos = html
+            .find("name=\"jump_event\"")
+            .expect("the jump_event input must render");
+        assert!(
+            label_open < input_pos && input_pos < label_close,
+            "the jump_event input must be a descendant of its <label>, not a \
+             sibling -- otherwise it has no programmatic accessible name"
         );
     }
 
