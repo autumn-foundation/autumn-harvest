@@ -443,24 +443,33 @@ your whole application.
    before you resume. Otherwise the resume duplicates every side
    effect harvest's own firings already committed.
 
-   Reconcile a record that names an engine with no matching execution.
-   Query that engine's own resolution for the id. A miss there means
-   the start never actually completed, or its result was never
-   observed. On the harvest side, retry it, but only under
-   `WorkflowIdReusePolicy::AllowDuplicate` (the default) or
-   `RejectDuplicate`. Both return the original execution, or refuse
-   outright, no matter what state it reached.
+   Querying by workflow id alone cannot tell two things apart, on a
+   reused id. That id can already carry an older, unrelated execution
+   on the engine the record names. A query then finds that older
+   execution and reads as a hit. The intended new start never actually
+   happened. `AllowDuplicate` then attaches to the old execution
+   instead of creating the intended one.
+
+   Generate a fresh idempotency key for the start attempt instead.
+   Persist it alongside the pending record, before the start call.
+   Pass it as the `Idempotency-Key` header (issue #808). Reconcile by
+   retrying that exact same call with that same key, not by querying
+   the workflow id again. Harvest dedups a repeated key onto its own
+   earlier same-key start. That dedup is scoped to `(workflow_name,
+   idempotency_key)`, regardless of any older execution already under
+   that workflow id. The retry response's own `deduplicated` field
+   then says which case happened.
+
+   This dedup window is bounded, 24 hours by default. Reconcile well
+   inside it. Temporal's own start call is already idempotent per
+   attempt, through its client-generated request id. Retry it directly
+   for a Temporal-side reconciliation.
 
    `AllowDuplicateFailedOnly` and `TerminateIfRunning` do the opposite
    on purpose. Each can start a genuine second execution once the first
    reaches a terminal state. That duplicates whatever side effects the
-   first one already committed. Neither is safe for this retry.
-
-   Do not carry this same policy choice over to a Temporal-side
-   reconciliation. Temporal's own reuse policy of the same name means
-   something different. It allows a new execution once the prior one
-   closes. That is not "return the original regardless of state." Use
-   Temporal's own reject-duplicate equivalent for this retry instead.
+   first one already committed. Neither is safe for this retry, on a
+   genuine miss where the key was never processed before.
 
    This record names the current owner only. It matches harvest's own
    by-id resolution (issue #805), which also resolves to the latest

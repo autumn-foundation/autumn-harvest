@@ -497,6 +497,13 @@ fn dual_run_playbook_covers_schedule_driven_cutover() {
 /// between the query and the pause is not captured either. Both then
 /// misroute as harvest's. Pausing first, then listing every execution
 /// of that type, open and closed alike, closes both gaps.
+///
+/// A fifteenth review found the reconciliation retry itself resolves
+/// by workflow id alone. A reused id can already carry an older,
+/// unrelated execution on the named engine. Querying that id then
+/// reads as a hit, even though this attempt never actually happened.
+/// Retry by a persisted idempotency key instead, scoped to this one
+/// attempt rather than to the workflow id's whole history.
 #[test]
 fn dual_run_playbook_covers_follow_up_engine_routing() {
     let guide = read_doc(GUIDE_PATH);
@@ -528,16 +535,25 @@ fn dual_run_playbook_covers_follow_up_engine_routing() {
          (issue #1219, PR #1473 Codex P1)"
     );
     assert!(
-        playbook.contains("Reconcile a record that names an engine with no matching execution"),
-        "the playbook must tell the reader how to recover from the one bad state \
-         write-before-start can leave behind: a record naming an engine with nothing \
-         actually running there yet (issue #1219, PR #1473 Codex P1)"
+        playbook.contains("Querying by workflow id alone cannot tell two things apart")
+            && playbook.contains("reads as a hit"),
+        "the playbook must not resolve a pending record's crash reconciliation by querying the \
+         workflow id alone -- a reused id can already carry an older, unrelated execution on \
+         the named engine, which reads as a false hit even though the intended new start never \
+         happened (issue #1219, PR #1473 Codex P1)"
     );
     assert!(
-        playbook.contains("WorkflowIdReusePolicy::AllowDuplicate")
-            && playbook.contains("Neither is safe for this retry"),
-        "the playbook must restrict the reconciliation retry to a reuse policy that returns \
-         the original execution or refuses outright -- AllowDuplicateFailedOnly and \
+        playbook.contains("Generate a fresh idempotency key for the start attempt")
+            && playbook.contains("Idempotency-Key` header (issue #808)"),
+        "the playbook must reconcile a pending record by retrying the exact same start call \
+         with a persisted idempotency key, not by re-querying the workflow id, so the retry is \
+         scoped to this specific attempt rather than to the workflow id's whole history \
+         (issue #1219, PR #1473 Codex P1)"
+    );
+    assert!(
+        playbook.contains("Neither is safe for this retry"),
+        "the playbook must restrict the reconciliation retry's own reuse policy to one that \
+         returns the original execution or refuses outright -- AllowDuplicateFailedOnly and \
          TerminateIfRunning can each start a genuine second execution once the first reaches \
          a terminal state, duplicating its side effects (issue #1219, PR #1473 Codex P1)"
     );
@@ -555,12 +571,11 @@ fn dual_run_playbook_covers_follow_up_engine_routing() {
          API (issue #1219, PR #1473 Codex P1)"
     );
     assert!(
-        playbook.contains("On the harvest side, retry it")
-            && playbook.contains("Temporal's own reject-duplicate equivalent"),
-        "the playbook must scope the AllowDuplicate/RejectDuplicate reconciliation guidance to \
-         harvest only -- Temporal's own reuse policy of the same name means something \
-         different (a new execution once the prior closes, not \"return the original \
-         regardless of state\") (issue #1219, PR #1473 Codex P1)"
+        playbook.contains("Temporal's own start call is already idempotent per attempt")
+            && playbook.contains("client-generated request id"),
+        "the playbook must reconcile a Temporal-side pending record by retrying the start call \
+         directly, relying on Temporal's own client-generated request id for idempotency, \
+         rather than reusing harvest's reuse-policy naming (issue #1219, PR #1473 Codex P1)"
     );
     assert!(
         playbook.contains("Do not retry the update call itself if its result goes missing")
