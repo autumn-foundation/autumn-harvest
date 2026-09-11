@@ -692,7 +692,7 @@ impl PayloadCodecs {
     ///
     /// Several batches — one per shard, say — may pin the same key id at once;
     /// the pin is a count, not a flag.
-    #[must_use]
+    #[must_use = "dropping the guard immediately un-pins the key"]
     pub fn pin_key_for_sweep(&self, key_id: &str) -> SweepKeyPin {
         let mut guard = self.keys_write();
         *guard.sweep_pins.entry(key_id.to_string()).or_insert(0) += 1;
