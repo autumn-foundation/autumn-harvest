@@ -1395,17 +1395,29 @@ fn snapshot_quota_policies() -> std::collections::HashMap<String, crate::quota::
 /// execution-row-then-quota-key order intact. So it cannot invert against
 /// a direct start's order.
 ///
-/// This narrows, but does not close, one related hazard. Two rows in the
-/// SAME batch can resolve to the SAME quota key. The second row's target
-/// execution can be concurrently touched by a direct start. Firing the
-/// first row leaves this transaction holding that key for the rest of the
-/// batch. That is by design -- it is what makes the cap apply across the
-/// whole batch. So the second row's execution-row wait can still cycle
-/// against a direct start. That direct start holds that execution row and
-/// wants the same key. That hazard already existed before Finding 2's
-/// original fix. Holding a quota lock across multiple rows in one batch
-/// is inherent to batch-wide enforcement. This change does not introduce
-/// it.
+/// This narrows, but does not close, one related hazard (review,
+/// revised). Once this transaction holds any row's key, every LATER
+/// row's execution is exposed. A concurrent direct start under
+/// `TerminateIfRunning` can touch that later row's execution. That
+/// direct start resolves its OWN quota key from its OWN, possibly
+/// newer, input -- not from the later row's stale, persisted input.
+///
+/// If that freshly-resolved key matches a key this transaction already
+/// holds, a cycle is possible. This transaction waits on the execution
+/// row the direct start holds. The direct start waits on the key this
+/// transaction already holds.
+///
+/// This hazard does not depend on row order. Whichever row processes
+/// first holds nothing while it waits, so it cannot cycle. Every later
+/// row can. No reordering of a multi-row batch closes this. Only ever
+/// holding at most one execution's locks at a time would close it
+/// fully. That conflicts with enforcing one cap across a whole batch in
+/// one transaction.
+///
+/// Holding a quota lock across multiple rows in one batch is inherent
+/// to batch-wide enforcement, and it predates Finding 2. This change
+/// does not introduce the hazard. It only changes which specific row
+/// and key pairings are exposed on a given tick.
 ///
 /// This function is a thin wrapper. It snapshots the declared quota
 /// policies once, then delegates the actual sort to
