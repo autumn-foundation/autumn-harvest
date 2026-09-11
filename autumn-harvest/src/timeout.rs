@@ -4326,7 +4326,9 @@ pub async fn enforce_timeouts_once(
     )
     .await?;
     if let Some(ceiling) = max_workflow_history_events {
-        count += enforce_workflow_history_ceiling(conn, ceiling, metrics, payload_codecs).await?;
+        count +=
+            enforce_workflow_history_ceiling_with_codecs(conn, ceiling, metrics, payload_codecs)
+                .await?;
     }
     count +=
         crate::sessions::enforce_broken_sessions(conn, session_worker_stale_secs, payload_codecs)
@@ -4595,9 +4597,34 @@ pub fn spawn_timeout_checker_for_shard(
 /// # Errors
 ///
 /// Returns the first database or persistence error encountered.
+///
+/// Delegates to [`enforce_workflow_history_ceiling_with_codecs`] under the
+/// identity registry (issue #1243 review, P2). A payload-bearing call site
+/// should use the `_with_codecs` sibling instead. This wrapper keeps the
+/// pre-#1243 public signature for an out-of-tree caller.
+#[cfg(feature = "db")]
+pub async fn enforce_workflow_history_ceiling(
+    conn: &mut AsyncPgConnection,
+    ceiling: u64,
+    metrics: &(dyn MetricsRecorder + Send + Sync),
+) -> HarvestResult<usize> {
+    enforce_workflow_history_ceiling_with_codecs(
+        conn,
+        ceiling,
+        metrics,
+        &crate::store::DEFAULT_PAYLOAD_CODECS,
+    )
+    .await
+}
+
+/// [`enforce_workflow_history_ceiling`], encoding through `codecs` (issue #1243).
+///
+/// # Errors
+///
+/// Same as [`enforce_workflow_history_ceiling`].
 #[cfg(feature = "db")]
 #[allow(clippy::too_many_lines)]
-pub async fn enforce_workflow_history_ceiling(
+pub async fn enforce_workflow_history_ceiling_with_codecs(
     conn: &mut AsyncPgConnection,
     ceiling: u64,
     metrics: &(dyn MetricsRecorder + Send + Sync),

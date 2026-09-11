@@ -849,12 +849,20 @@ pub async fn reset_workflow_execution(
             let new_exec_id = ExecutionId::new_for_shard(ShardId::new(source.shard_id));
             let source_next_event_id = rows.last().map_or(0, |row| row.event_id.saturating_add(1));
 
+            // Issue #1243 review (P1): a completion trigger fired by this
+            // cascade can start a new workflow. It needs the caller's real
+            // registry, not the identity default. `reset_workflow_execution`
+            // already receives one.
             let (deferred, closed_children) = terminate_source_execution(
                 conn,
                 exec_id,
                 new_exec_id,
                 &request,
                 source_next_event_id,
+                registry.map_or(
+                    &crate::store::DEFAULT_PAYLOAD_CODECS,
+                    HandlerRegistry::payload_codecs,
+                ),
             )
             .await?;
             let fork = insert_fork_execution(conn, &source, new_exec_id).await?;
@@ -1270,6 +1278,7 @@ async fn terminate_source_execution(
     new_exec_id: ExecutionId,
     request: &WorkflowResetRequest,
     source_next_event_id: i32,
+    codecs: &crate::payload_codec::PayloadCodecs,
 ) -> Result<(Vec<DeferredTriggerStart>, Vec<(ExecutionId, String)>), WorkflowResetError> {
     crate::store::append_events(
         conn,
@@ -1325,12 +1334,8 @@ async fn terminate_source_execution(
     // tables are absent (guarded).
     crate::mutex::sweep_terminal_holder_and_wake(conn, source_exec_id).await?;
 
-    // Issue #1243: this cascade's own events never carry a payload-bearing
-    // field. The reset path also has no configured registry threaded
-    // through it. The identity registry is exact here, not a shortcut.
     let (deferred, closed_children) =
-        apply_parent_close_cascade(conn, source_exec_id, &crate::store::DEFAULT_PAYLOAD_CODECS)
-            .await?;
+        apply_parent_close_cascade(conn, source_exec_id, codecs).await?;
 
     Ok((deferred, closed_children))
 }
