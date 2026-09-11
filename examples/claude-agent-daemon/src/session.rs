@@ -60,6 +60,12 @@ pub struct SessionTask {
     /// time. It is recorded in history, so a daemon restarted on a DIFFERENT
     /// directory cannot apply this session's approved writes there.
     pub workspace: String,
+    /// The model this session runs on, recorded the same way and for the same
+    /// reason. A restart under a different model would continue one
+    /// conversation on another one, and thinking blocks are bound to the model
+    /// that produced them. A restart with a key would also move an offline
+    /// session onto billed calls.
+    pub model: String,
 }
 
 /// One entry of the Messages API `messages` array.
@@ -90,6 +96,9 @@ impl Message {
 /// The input of one `claude_turn` activity: the whole conversation so far.
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct TurnRequest {
+    /// The model identity the session was started under. The daemon proves it
+    /// still serves that model before it sends the turn.
+    pub model: String,
     pub messages: Vec<Message>,
 }
 
@@ -192,6 +201,7 @@ pub async fn agent_session(
             .execute_activity(
                 &claude_turn_info(),
                 TurnRequest {
+                    model: task.model.clone(),
                     messages: messages.clone(),
                 },
             )

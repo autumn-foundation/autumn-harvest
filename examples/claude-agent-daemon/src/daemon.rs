@@ -111,6 +111,9 @@ pub async fn serve(options: Options) -> Result<(), String> {
 
     let model = ModelConfig::new(options.api_key, options.model, options.max_tokens)?;
     let live = model.is_live();
+    // Every session records this, and a turn is refused by a daemon serving a
+    // different model. See `ModelConfig::identity`.
+    let identity = model.identity();
 
     // Opening the file applies the schema and reclaims any task a previous
     // process left RUNNING. In-flight sessions resume by replay from here.
@@ -148,7 +151,8 @@ pub async fn serve(options: Options) -> Result<(), String> {
         tokio::select! {
             job = rx.recv() => {
                 let Some((request, answer)) = job else { break };
-                let response = handle(&mut runtime, &reader, &blocked, &workspace, request);
+                let response =
+                    handle(&mut runtime, &reader, &blocked, &workspace, &identity, request);
                 // A closed receiver means the client hung up. Nothing to do.
                 drop(answer.send(response));
             }
@@ -266,6 +270,7 @@ fn handle(
     reader: &Connection,
     blocked: &Parked,
     workspace: &str,
+    model: &str,
     request: Request,
 ) -> Response {
     match request {
@@ -273,7 +278,14 @@ fn handle(
             goal,
             max_turns,
             approval_timeout_secs,
-        } => submit(runtime, workspace, goal, max_turns, approval_timeout_secs),
+        } => submit(
+            runtime,
+            workspace,
+            model,
+            goal,
+            max_turns,
+            approval_timeout_secs,
+        ),
         Request::Status { execution_id, full } => match sessions(runtime, reader, blocked, full) {
             Ok(views) => views
                 .into_iter()
@@ -304,6 +316,7 @@ fn handle(
 fn submit(
     runtime: &mut SqliteRuntime,
     workspace: &str,
+    model: &str,
     goal: String,
     max_turns: u32,
     approval_timeout_secs: u64,
@@ -313,6 +326,7 @@ fn submit(
         max_turns,
         approval_timeout_secs,
         workspace: workspace.to_string(),
+        model: model.to_string(),
     };
     let input = match serde_json::to_value(task) {
         Ok(value) => value,

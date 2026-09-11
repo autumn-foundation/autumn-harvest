@@ -119,10 +119,14 @@ under a narrowed umask — private at creation, with no window to connect
 through. A path that already holds something other than a socket is never
 removed: a typo in `--socket` reports an error instead of deleting a file.
 
-**A session is bound to its workspace.** The resolved workspace is recorded in
-the session's history at submit time, and a tool call is refused when the
-daemon serves a different one. Otherwise a restart pointed at another directory
-could apply an already-approved write to the wrong project.
+**A session is bound to its workspace and its model.** Both are recorded in the
+session's history at submit time, and a call is refused when the daemon serves
+a different one. Otherwise a restart pointed at another directory could apply
+an already-approved write to the wrong project, and a restart under another
+model — or with an API key where there was none — would continue one
+conversation on a different model, or move an offline session onto billed
+calls. `--max-tokens` is deliberately not fenced: it is a per-request budget
+rather than an identity, so changing it between restarts is ordinary tuning.
 
 **Approval is per call, not per session.** The workflow waits on a signal whose
 name carries the tool-use id, and `status` prints the exact call — the tool, its
@@ -185,12 +189,13 @@ is ever approved sight unseen.
 cargo test -p claude-agent-daemon
 ```
 
-Sixteen tests, all offline: the happy path, a denied tool call, the restart
+Eighteen tests, all offline: the happy path, a denied tool call, the restart
 proof, the workspace sandbox (two symlink escapes and the read cap), a
 truncated turn, a stale approval, the full approval view, a session bound to
-another workspace, the single-writer lock through every alias, the socket's
-privacy, the drive interval, which API failures may be retried, and one
-end-to-end run through the daemon socket.
+another workspace and to another model, the single-writer lock through every
+alias, the socket's privacy, the drive interval, which API failures may be
+retried, a billed response that is not a message, and one end-to-end run
+through the daemon socket.
 
 ## What this example does not do
 

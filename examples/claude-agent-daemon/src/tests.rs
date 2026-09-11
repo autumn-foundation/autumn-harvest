@@ -31,13 +31,19 @@ fn workspace_id(workspace: &Path) -> String {
         .into_owned()
 }
 
-/// The task every test submits.
+/// The task every test submits. The stub model is what the tests register.
 fn task(workspace: &Path) -> Value {
+    task_on(workspace, claude::OFFLINE_MODEL)
+}
+
+/// A task recorded against a specific model identity.
+fn task_on(workspace: &Path, model: &str) -> Value {
     serde_json::to_value(SessionTask {
         goal: "summarise the workspace".to_string(),
         max_turns: 6,
         approval_timeout_secs: 300,
         workspace: workspace_id(workspace),
+        model: model.to_string(),
     })
     .expect("the task encodes")
 }
@@ -56,12 +62,20 @@ fn tool_request(workspace: &Path, tool: &str, input: Value) -> Value {
 }
 
 /// A stub model body that counts its calls.
+///
+/// It stands in for `claude::activity_body` with no API key, so it answers to
+/// the same recorded identity.
 fn counting_model(
     calls: Arc<AtomicUsize>,
 ) -> impl Fn(Value) -> Result<Value, String> + Send + Sync + 'static {
     move |input| {
         let request: TurnRequest =
             serde_json::from_value(input).map_err(|e| format!("bad request: {e}"))?;
+        assert_eq!(
+            request.model,
+            claude::OFFLINE_MODEL,
+            "a turn must carry the identity its session recorded"
+        );
         calls.fetch_add(1, Ordering::SeqCst);
         serde_json::to_value(claude::offline::reply(&request))
             .map_err(|e| format!("bad reply: {e}"))
@@ -736,4 +750,74 @@ fn only_an_accepted_request_is_refused_a_retry() {
         rejected.non_retryable,
         "a rejected request must not be retried"
     );
+}
+
+#[tokio::test]
+async fn a_session_refuses_to_continue_on_another_model() {
+    let dir = tempfile::tempdir().expect("a temporary directory");
+    let workspace = dir.path().join("workspace");
+    std::fs::create_dir_all(&workspace).expect("the workspace is created");
+
+    // The session was started on the offline stub; this daemon serves a real
+    // model. Continuing would move a conversation onto another model, and an
+    // offline session onto billed calls.
+    let model = claude::ModelConfig::new(
+        Some("sk-ant-not-a-real-key".to_string()),
+        claude::DEFAULT_MODEL.to_string(),
+        claude::DEFAULT_MAX_TOKENS,
+    )
+    .expect("the configuration builds");
+
+    let mut rt = SqliteRuntime::open(dir.path().join("agentd.db")).expect("the database opens");
+    rt.register_workflow(&session::agent_session_info());
+    rt.register_activity(&session::claude_turn_info(), claude::activity_body(model));
+    rt.register_activity(
+        &session::run_tool_info(),
+        tools::activity_body(workspace.clone()),
+    );
+
+    let exec = rt
+        .start_workflow(WORKFLOW_NAME, task_on(&workspace, claude::OFFLINE_MODEL))
+        .expect("the session starts");
+    let state = rt.run_until_blocked(exec).await.expect("the run advances");
+
+    let RunState::Failed(error) = state else {
+        panic!("expected a terminal failure, got {state:?}");
+    };
+    assert!(
+        error.contains("this session runs on"),
+        "unexpected failure: {error}"
+    );
+}
+
+#[test]
+fn a_billed_response_that_is_not_a_message_is_refused() {
+    use autumn_harvest::failure::parse_error_payload_full;
+
+    // Valid JSON is not yet a message. Without the shape check these fall
+    // through every default and record a clean, empty `end_turn`.
+    for malformed in [
+        json!({}),
+        json!({ "content": [] }),
+        json!({ "stop_reason": "end_turn" }),
+        json!({ "content": "not an array", "stop_reason": "end_turn" }),
+    ] {
+        assert!(
+            !claude::is_message(&malformed),
+            "{malformed} must not pass as a message"
+        );
+    }
+
+    let message = json!({
+        "content": [{ "type": "text", "text": "hello" }],
+        "stop_reason": "end_turn",
+    });
+    assert!(claude::is_message(&message), "a real message must pass");
+
+    // A malformed body from an accepted request is terminal, like the others.
+    let refused = parse_error_payload_full(&claude::body_failure(
+        reqwest::StatusCode::OK,
+        "its response was not a message",
+    ));
+    assert!(refused.non_retryable, "a billed malformed body is terminal");
 }

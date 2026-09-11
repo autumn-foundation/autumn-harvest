@@ -42,6 +42,9 @@ pub struct ModelConfig {
     pub http: reqwest::Client,
 }
 
+/// The identity an offline session records, in place of a model name.
+pub const OFFLINE_MODEL: &str = "offline-stub";
+
 impl ModelConfig {
     /// Build the configuration from the resolved daemon options.
     ///
@@ -65,6 +68,18 @@ impl ModelConfig {
     pub const fn is_live(&self) -> bool {
         self.api_key.is_some()
     }
+
+    /// What a session started under this configuration records.
+    ///
+    /// The offline stub is an identity of its own, so a restart WITH a key
+    /// cannot quietly move an offline session onto billed calls.
+    pub fn identity(&self) -> String {
+        if self.is_live() {
+            self.model.clone()
+        } else {
+            OFFLINE_MODEL.to_string()
+        }
+    }
 }
 
 /// Build the synchronous activity body the runtime registers for `claude_turn`.
@@ -74,6 +89,20 @@ pub fn activity_body(
     move |input| {
         let request: TurnRequest =
             serde_json::from_value(input).map_err(|e| format!("malformed turn request: {e}"))?;
+        // A session continues on the model it started on. Earlier turns came
+        // from that model, and its thinking blocks are bound to it. A restart
+        // under another model would change the conversation, not resume it.
+        let identity = config.identity();
+        if request.model != identity {
+            return Err(ActivityFailure::non_retryable(
+                "ModelMismatch",
+                format!(
+                    "this session runs on `{}`, and this daemon serves `{identity}`",
+                    request.model
+                ),
+            )
+            .into_error_payload());
+        }
         let reply = match config.api_key.as_deref() {
             Some(key) => call_api(&config, key, &request)?,
             None => offline::reply(&request),
@@ -133,6 +162,15 @@ fn call_api(
             ));
         }
     };
+    // Valid JSON is not yet a message. An accepted `{}` would fall through
+    // every default below and record a clean, empty `end_turn`. That reports a
+    // malformed billed response as a finished session.
+    if !is_message(&payload) {
+        return Err(body_failure(
+            status,
+            "its response was not a message: `content` and `stop_reason` are required",
+        ));
+    }
     Ok(parse_reply(&payload))
 }
 
@@ -189,6 +227,16 @@ fn http_failure(status: reqwest::StatusCode, body: &str) -> String {
         format!("the Claude API returned {status}: {detail}"),
     )
     .into_error_payload()
+}
+
+/// Does this payload have the shape of a Messages API response?
+///
+/// Only the two fields the reply is built from are required. A response that
+/// carries them can be projected; one that does not is malformed, however well
+/// formed its JSON is.
+pub fn is_message(payload: &Value) -> bool {
+    payload.get("content").is_some_and(Value::is_array)
+        && payload.get("stop_reason").is_some_and(Value::is_string)
 }
 
 /// Project one API response into the durable [`TurnReply`].

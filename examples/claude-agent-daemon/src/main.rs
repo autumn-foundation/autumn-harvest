@@ -77,13 +77,18 @@ enum Command {
         #[arg(long, env = "AGENTD_MODEL", default_value = claude::DEFAULT_MODEL)]
         model: String,
         /// The output cap of one turn.
-        #[arg(long, default_value_t = claude::DEFAULT_MAX_TOKENS)]
+        #[arg(long, env = "AGENTD_MAX_TOKENS", default_value_t = claude::DEFAULT_MAX_TOKENS)]
         max_tokens: u32,
         /// How often the daemon drives its sessions, in milliseconds.
         ///
         /// A zero period has no meaning and panics the timer, so one is the
         /// floor.
-        #[arg(long, default_value_t = 500, value_parser = clap::value_parser!(u64).range(1..))]
+        #[arg(
+            long,
+            env = "AGENTD_TICK_MS",
+            default_value_t = 500,
+            value_parser = clap::value_parser!(u64).range(1..)
+        )]
         tick_ms: u64,
         /// The API key. An absent key selects the offline stub model.
         #[arg(long, env = "ANTHROPIC_API_KEY", hide_env_values = true)]
