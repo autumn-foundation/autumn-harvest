@@ -14,7 +14,8 @@
 //! - A second run is a no-op (idempotent).
 //! - Terminal rows are never touched.
 //! - An over-cap resolved key is left NULL rather than written.
-//! - A workflow type with no declared policy is left NULL.
+//! - A workflow type with no declared policy is never a scan candidate,
+//!   even in a mixed deployment where some other type has one.
 //! - A deployment with no policy registered anywhere skips the scan.
 //! - The keyset cursor advances past rows it can never resolve, so they
 //!   cannot starve a resolvable row sorted behind them.
@@ -379,14 +380,18 @@ async fn over_cap_resolved_key_is_left_null() {
 }
 
 #[tokio::test]
-async fn workflow_type_with_no_declared_policy_is_left_null() {
+async fn workflow_type_with_no_declared_policy_is_never_a_candidate() {
     let (mut conn, _container) = setup_db().await;
     let workflow_name = leaked("wf_no_policy");
     // A DIFFERENT workflow type has a policy, so the registry is
-    // non-empty and the row is genuinely scanned and classified
-    // `NoPolicy`. It is not skipped by the zero-registrations early exit
-    // (covered separately by
-    // `zero_registered_policies_anywhere_skips_the_scan_entirely`).
+    // non-empty (not the zero-registrations early exit, covered
+    // separately by `zero_registered_policies_anywhere_skips_the_scan_
+    // entirely`). `workflow_name` itself is absent from the registered
+    // set, so `CANDIDATE_SQL`'s `workflow_name = ANY($1)` filter excludes
+    // this row from the scan entirely -- it is never fetched, not
+    // fetched-then-classified `NoPolicy`. That is what stops a mixed
+    // deployment from re-fetching every no-policy row's JSON input on
+    // every tick forever.
     let other_workflow_name = leaked("wf_has_policy");
     let policy = QuotaPolicy::new("tenant_id").with_max_active_executions(10);
     let _guard = MetadataGuard::install_one(other_workflow_name, policy).await;
@@ -404,7 +409,11 @@ async fn workflow_type_with_no_declared_policy_is_left_null() {
         .await
         .expect("sweep");
 
-    assert_eq!(summary.no_policy, 1);
+    assert_eq!(
+        summary.total_scanned(),
+        0,
+        "excluded by the SQL filter, not scanned and classified NoPolicy"
+    );
     assert_eq!(read_quota_key(&mut conn, exec_id).await, None);
 }
 

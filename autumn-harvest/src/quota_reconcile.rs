@@ -44,9 +44,11 @@
 //! stable cursor: a policy declared mid-uptime changes some rows' outcome
 //! between passes. Only `id` order does not.
 //!
-//! A deployment with no workflow type declaring a `QuotaPolicy` anywhere
-//! skips the scan entirely instead ([`any_quota_policy_registered`]).
-//! That avoids sweeping rows it already knows it cannot act on.
+//! The scan is also restricted to workflow types with a currently-
+//! registered `QuotaPolicy` ([`registered_quota_workflow_names`]). A
+//! deployment with no such policy anywhere skips the scan entirely; a
+//! mixed deployment never fetches a no-policy type's rows at all. That
+//! avoids sweeping rows it already knows it cannot act on.
 //!
 //! # Runs periodically, not once at startup
 //!
@@ -242,13 +244,22 @@ struct CandidateRow {
 /// therefore always covers exactly today's candidate set, never the
 /// table's full history.
 ///
-/// `AND ($1::uuid IS NULL OR id > $1) ORDER BY id LIMIT $2` is a keyset
+/// `workflow_name = ANY($1)` restricts the scan to workflow types with a
+/// currently-registered `QuotaPolicy` (see
+/// [`registered_quota_workflow_names`]). Without it, a mixed deployment
+/// (some workflow types quota'd, others not) would re-fetch every
+/// no-policy row's JSON input on every tick forever, since a `NoPolicy`
+/// row never sets `quota_key` and so never leaves the index. `$1` is
+/// re-read from the live registry on every call, so a policy declared
+/// mid-uptime (or removed) takes effect on the very next tick, not just
+/// at the next restart.
+///
+/// `AND ($2::uuid IS NULL OR id > $2) ORDER BY id LIMIT $3` is a keyset
 /// cursor, not a bare `LIMIT`. A row this sweep can never resolve --
-/// [`ReconcileOutcome::Unresolvable`], [`ReconcileOutcome::OverCap`], or a
-/// workflow type still declaring no policy -- never leaves the index.
-/// A bare `LIMIT` with no stable order could therefore return the SAME
-/// stuck rows every tick, starving every resolvable row sorted behind
-/// them, indefinitely.
+/// [`ReconcileOutcome::Unresolvable`] or [`ReconcileOutcome::OverCap`] --
+/// never leaves the index. A bare `LIMIT` with no stable order could
+/// therefore return the SAME stuck rows every tick, starving every
+/// resolvable row sorted behind them, indefinitely.
 ///
 /// The cursor makes every tick move strictly past whatever it just
 /// examined. A full pass over the candidate set therefore completes in a
@@ -259,9 +270,10 @@ struct CandidateRow {
 const CANDIDATE_SQL: &str = "\
     SELECT id, workflow_name, input FROM harvest_workflow_executions \
     WHERE quota_key IS NULL AND state IN ('RUNNING', 'PAUSED') \
-      AND ($1::uuid IS NULL OR id > $1) \
+      AND workflow_name = ANY($1) \
+      AND ($2::uuid IS NULL OR id > $2) \
     ORDER BY id \
-    LIMIT $2";
+    LIMIT $3";
 
 /// The exact SQL text [`reconcile_quota_keys`] executes for its candidate
 /// scan. Exposed read-only for tests, mirroring
@@ -286,28 +298,36 @@ fn registered_quota_policy(workflow_name: &str) -> Option<QuotaPolicy> {
         })
 }
 
-/// `true` when at least one currently-registered workflow type declares a
+/// Names of every currently-registered workflow type declaring a
 /// [`QuotaPolicy`], anywhere in the process.
 ///
-/// A deployment that has not adopted quotas at all leaves every active
-/// execution matching the candidate scan's predicate forever. `NoPolicy`
-/// never sets `quota_key`, so nothing shrinks the index for such a
-/// deployment.
+/// [`reconcile_quota_keys_from`] binds this as `CANDIDATE_SQL`'s
+/// `workflow_name = ANY($1)` filter, so a workflow type with no declared
+/// policy is never a candidate at all. Without it, a mixed deployment
+/// (some workflow types quota'd, others not) would re-fetch every
+/// no-policy row forever: `NoPolicy` never sets `quota_key`, so nothing
+/// ever shrinks the index for those rows.
 ///
-/// This check lets [`reconcile_quota_keys_from`] skip the scan entirely
-/// instead. That avoids a real, unbounded query cost sweeping rows it
-/// already knows it cannot act on. It matches issue #946 AC9's
-/// zero-overhead promise for a no-quota deployment.
+/// An empty result means the scan itself should be skipped entirely
+/// (`workflow_name = ANY('{}')` matches nothing, but issuing that query
+/// is still a real round trip). [`reconcile_quota_keys_from`] special-
+/// cases this to avoid the round trip, matching issue #946 AC9's
+/// zero-overhead promise for a deployment that has not adopted quotas at
+/// all.
 #[cfg(feature = "db")]
-fn any_quota_policy_registered() -> bool {
+fn registered_quota_workflow_names() -> Vec<String> {
     crate::completion_trigger::GLOBAL_WORKFLOW_METADATA
         .read()
         .ok()
         .and_then(|lock| {
-            lock.as_ref()
-                .map(|map| map.values().any(|meta| meta.quota.is_some()))
+            lock.as_ref().map(|map| {
+                map.iter()
+                    .filter(|(_, meta)| meta.quota.is_some())
+                    .map(|(name, _)| name.clone())
+                    .collect()
+            })
         })
-        .unwrap_or(false)
+        .unwrap_or_default()
 }
 
 /// Scan up to `batch_size` non-terminal executions with `quota_key IS NULL`.
@@ -330,8 +350,8 @@ fn any_quota_policy_registered() -> bool {
 /// comment).
 ///
 /// `batch_size <= 0`, or no workflow type anywhere currently declaring a
-/// `QuotaPolicy` (see [`any_quota_policy_registered`]), is a no-op that
-/// returns `after_id` unchanged and issues no query at all.
+/// `QuotaPolicy` (see [`registered_quota_workflow_names`]), is a no-op
+/// that returns `after_id` unchanged and issues no query at all.
 ///
 /// Idempotent: a row already backfilled, by this call or a concurrent one,
 /// no longer matches the candidate scan's `quota_key IS NULL` predicate.
@@ -359,7 +379,8 @@ pub async fn reconcile_quota_keys_from(
     shard: Option<crate::types::ShardId>,
 ) -> HarvestResult<(ReconcileSummary, Option<Uuid>)> {
     let mut summary = ReconcileSummary::default();
-    if batch_size <= 0 || !any_quota_policy_registered() {
+    let workflow_names = registered_quota_workflow_names();
+    if batch_size <= 0 || workflow_names.is_empty() {
         return Ok((summary, after_id));
     }
     // Mirrors `queue::fence_binding`. `UNENCODED` is the documented
@@ -368,6 +389,7 @@ pub async fn reconcile_quota_keys_from(
     let shard = shard.unwrap_or(crate::types::ShardId::UNENCODED);
 
     let rows: Vec<CandidateRow> = diesel::sql_query(CANDIDATE_SQL)
+        .bind::<diesel::sql_types::Array<Text>, _>(workflow_names)
         .bind::<Nullable<diesel::sql_types::Uuid>, _>(after_id)
         .bind::<BigInt, _>(batch_size)
         .load(conn)
@@ -632,6 +654,12 @@ mod tests {
         assert!(CANDIDATE_SQL.contains("quota_key IS NULL"));
         assert!(CANDIDATE_SQL.contains("state IN ('RUNNING', 'PAUSED')"));
         assert!(!CANDIDATE_SQL.contains("SUSPENDED"));
+    }
+
+    #[cfg(feature = "db")]
+    #[test]
+    fn candidate_sql_restricts_to_quota_governed_workflow_names() {
+        assert!(CANDIDATE_SQL.contains("workflow_name = ANY($1)"));
     }
 
     #[cfg(feature = "db")]
