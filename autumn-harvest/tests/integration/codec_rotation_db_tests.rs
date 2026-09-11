@@ -1382,7 +1382,7 @@ async fn activation_succeeds_once_every_live_worker_advertises_the_keyed_envelop
         &mut conn,
         "worker-new",
         0,
-        &json!({"codec_envelope_version": 2}),
+        &json!({"codec_envelope_version": 2, "codec_registered_key_ids": ["k2"]}),
     )
     .await;
 
@@ -1392,8 +1392,57 @@ async fn activation_succeeds_once_every_live_worker_advertises_the_keyed_envelop
 
     activate_codec_key(&sharded, &[ShardId::new(0)], &codecs, "k2", 60)
         .await
-        .expect("every live worker advertises version 2");
+        .expect("every live worker advertises version 2 and has k2 registered");
     assert_eq!(codecs.active_key_id(), "k2");
+}
+
+/// A worker's binary can support the version-2 envelope's syntax fleet-wide
+/// before the target key's material reaches every worker's config.
+/// Envelope support alone must not be read as proof this worker can decode
+/// payloads written under the specific key being activated.
+#[tokio::test]
+async fn activation_is_refused_while_a_live_worker_lacks_the_target_key() {
+    let (url, _c) = setup_isolated_db().await;
+    let mut conn = connect(&url).await;
+    // Envelope v2 capable, but only "k1" ever reached this worker's config --
+    // "k2" is the key this test activates.
+    insert_worker_row(
+        &mut conn,
+        "worker-partial",
+        0,
+        &json!({"codec_envelope_version": 2, "codec_registered_key_ids": ["k1"]}),
+    )
+    .await;
+
+    let codecs = two_key_registry();
+    let pool = build_pool(&url);
+    let sharded = ShardedDbPool::single(pool);
+
+    let err = activate_codec_key(&sharded, &[ShardId::new(0)], &codecs, "k2", 60)
+        .await
+        .expect_err("a live worker without k2 registered cannot decode payloads written under it");
+    match err {
+        HarvestError::CodecKeyActivationBlocked { key_id, blockers } => {
+            assert_eq!(key_id, "k2");
+            assert_eq!(blockers.len(), 1);
+            assert_eq!(blockers[0].worker_id.as_deref(), Some("worker-partial"));
+            assert!(blockers[0].reachable);
+            assert!(
+                blockers[0]
+                    .reason
+                    .as_deref()
+                    .is_some_and(|r| r.contains("k2") && r.contains("not registered")),
+                "{:?}",
+                blockers[0].reason
+            );
+        }
+        other => panic!("expected CodecKeyActivationBlocked, got {other:?}"),
+    }
+    assert_eq!(
+        codecs.active_key_id(),
+        "k1",
+        "a refused activation must not flip the local registry"
+    );
 }
 
 #[tokio::test]

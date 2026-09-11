@@ -125,24 +125,43 @@ pub const MAX_CODEC_KEY_ID_BYTES: usize = 64;
 /// this label or names a version below [`CODEC_ENVELOPE_VERSION_KEYED`].
 pub const CODEC_ENVELOPE_CAPABILITY_LABEL: &str = "codec_envelope_version";
 
-/// Merge this build's highest readable envelope version into a worker's
-/// `labels` JSON (issue #1244).
+/// `harvest_workers.labels` key a worker advertises its registered codec key
+/// ids under (issue #1244).
 ///
-/// `labels` is otherwise entirely operator-chosen (issue #382). This is the
-/// one key the engine itself writes. It always overwrites any prior value —
-/// a worker cannot advertise a capability its own binary does not have.
+/// Envelope version alone proves a worker's *binary* can parse a version-2
+/// envelope. It proves nothing about whether that worker's `PayloadCodecs`
+/// has the *specific* key being activated registered.
+///
+/// An operator can deploy the new binary fleet-wide before pushing the new
+/// key's material everywhere. A worker missing the key cannot decode a
+/// payload written under it. So `codec_rotation::activate_codec_key` also
+/// refuses while any live worker's row omits the target key id here.
+///
+/// Written automatically, refreshed on every heartbeat: never
+/// operator-configured, mirroring [`CODEC_ENVELOPE_CAPABILITY_LABEL`].
+/// Absence reads as "no keys registered" — the fail-closed default.
+pub const CODEC_REGISTERED_KEY_IDS_LABEL: &str = "codec_registered_key_ids";
+
+/// Merge this build's highest readable envelope version, and this process's
+/// registered codec key ids, into a worker's `labels` JSON (issue #1244).
+///
+/// `labels` is otherwise entirely operator-chosen (issue #382). These are the
+/// two keys the engine itself writes. Both always overwrite any prior
+/// value — a worker cannot advertise a capability its own binary and
+/// registry do not actually have.
 ///
 /// Non-object `labels` is replaced with a fresh object, rather than silently
-/// dropping the capability marker. [`crate::worker::WorkerRegistration`]
+/// dropping the capability markers. [`crate::worker::WorkerRegistration`]
 /// never actually produces a non-object value; its type does not rule one
 /// out.
 #[must_use]
-pub fn advertise_codec_capability(labels: &Value) -> Value {
+pub fn advertise_codec_capability(labels: &Value, registered_key_ids: &[String]) -> Value {
     let mut merged = match labels {
         Value::Object(map) => Value::Object(map.clone()),
         _ => Value::Object(serde_json::Map::new()),
     };
     merged[CODEC_ENVELOPE_CAPABILITY_LABEL] = Value::from(CODEC_ENVELOPE_VERSION_KEYED);
+    merged[CODEC_REGISTERED_KEY_IDS_LABEL] = Value::from(registered_key_ids.to_vec());
     merged
 }
 
@@ -1256,22 +1275,27 @@ mod tests {
 
     #[test]
     fn advertise_codec_capability_adds_the_label_to_an_empty_object() {
-        let merged = advertise_codec_capability(&json!({}));
+        let merged = advertise_codec_capability(&json!({}), &[]);
         assert_eq!(
             merged[CODEC_ENVELOPE_CAPABILITY_LABEL],
             CODEC_ENVELOPE_VERSION_KEYED
         );
+        assert_eq!(merged[CODEC_REGISTERED_KEY_IDS_LABEL], json!([]));
     }
 
     #[test]
     fn advertise_codec_capability_preserves_operator_labels() {
-        let merged = advertise_codec_capability(&json!({"gpu": "true", "region": "eu-west-1"}));
+        let merged = advertise_codec_capability(
+            &json!({"gpu": "true", "region": "eu-west-1"}),
+            &["k1".to_string()],
+        );
         assert_eq!(merged["gpu"], "true");
         assert_eq!(merged["region"], "eu-west-1");
         assert_eq!(
             merged[CODEC_ENVELOPE_CAPABILITY_LABEL],
             CODEC_ENVELOPE_VERSION_KEYED
         );
+        assert_eq!(merged[CODEC_REGISTERED_KEY_IDS_LABEL], json!(["k1"]));
     }
 
     #[test]
@@ -1280,7 +1304,7 @@ mod tests {
         // tampered value must never survive the merge. Issue #1244's whole
         // point is that this label can be trusted as this binary's true
         // capability.
-        let merged = advertise_codec_capability(&json!({"codec_envelope_version": 1}));
+        let merged = advertise_codec_capability(&json!({"codec_envelope_version": 1}), &[]);
         assert_eq!(
             merged[CODEC_ENVELOPE_CAPABILITY_LABEL],
             CODEC_ENVELOPE_VERSION_KEYED
@@ -1288,8 +1312,19 @@ mod tests {
     }
 
     #[test]
+    fn advertise_codec_capability_overwrites_forged_registered_keys() {
+        // Same trust boundary as the version label above: this process's
+        // actual registry always wins over anything already in `labels`.
+        let merged = advertise_codec_capability(
+            &json!({"codec_registered_key_ids": ["not-really-registered"]}),
+            &["k1".to_string(), "k2".to_string()],
+        );
+        assert_eq!(merged[CODEC_REGISTERED_KEY_IDS_LABEL], json!(["k1", "k2"]));
+    }
+
+    #[test]
     fn advertise_codec_capability_replaces_a_non_object_labels_value() {
-        let merged = advertise_codec_capability(&json!("not-an-object"));
+        let merged = advertise_codec_capability(&json!("not-an-object"), &[]);
         assert!(merged.is_object());
         assert_eq!(
             merged[CODEC_ENVELOPE_CAPABILITY_LABEL],

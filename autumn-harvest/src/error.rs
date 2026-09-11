@@ -148,11 +148,19 @@ impl std::fmt::Display for CodecKeyShardRemainder {
 
 /// One worker that blocks activating a keyed codec (issue #1244).
 ///
+/// Two independent reasons put a worker on this list.
+///
 /// A live worker that does not advertise support for the version-2 envelope
 /// would silently hand a `kid`-bearing payload to workflow code unchanged.
 /// It would not decode it (see
-/// [`crate::payload_codec::PayloadCodecs::set_active_key`]). Activation is
-/// refused while any such worker is live, on any expected shard.
+/// [`crate::payload_codec::PayloadCodecs::set_active_key`]).
+///
+/// A live worker can support version 2 but still lack the target key id.
+/// That worker would fail to decode a payload some other worker encodes
+/// under it.
+///
+/// Activation is refused while any such worker is live, on any expected
+/// shard. `reason` (from the reachable path) says which.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct CodecKeyActivationBlocker {
     /// The shard this worker's heartbeat row was read from.
@@ -166,7 +174,9 @@ pub struct CodecKeyActivationBlocker {
     /// `false` when the shard could not be read; activation is refused on
     /// that basis alone, the same fail-closed posture as retirement.
     pub reachable: bool,
-    /// Why the shard could not be read, when `reachable` is `false`.
+    /// Why the shard could not be read, when `reachable` is `false`. Why
+    /// this worker blocks activation, when `reachable` is `true` -- missing
+    /// envelope-version support, or the target key id not registered.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,
 }
@@ -174,9 +184,13 @@ pub struct CodecKeyActivationBlocker {
 impl std::fmt::Display for CodecKeyActivationBlocker {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         if self.reachable {
+            let reason = self
+                .reason
+                .as_deref()
+                .unwrap_or("cannot read envelope version 2");
             write!(
                 f,
-                "shard {}: worker {} on {} cannot read envelope version 2",
+                "shard {}: worker {} on {} {reason}",
                 self.shard_id,
                 self.worker_id.as_deref().unwrap_or("?"),
                 self.host.as_deref().unwrap_or("?")

@@ -1180,6 +1180,8 @@ mod db {
         worker_id: String,
         #[diesel(sql_type = Text)]
         host: String,
+        #[diesel(sql_type = Text)]
+        reason: String,
     }
 
     #[derive(diesel::QueryableByName)]
@@ -1260,36 +1262,81 @@ mod db {
         Ok(())
     }
 
-    /// Live workers on this connection's shard that do not advertise support
-    /// for the keyed (version-2) codec envelope (issue #1244).
+    /// Live workers on this connection's shard that cannot safely read or
+    /// write under `key_id` (issue #1244).
+    ///
+    /// Blocks on either of two independent conditions:
+    ///
+    /// 1. The worker does not advertise support for the keyed (version-2)
+    ///    codec envelope, so it cannot even parse a `kid`-bearing payload.
+    /// 2. The worker's binary does support version 2, but its own
+    ///    `PayloadCodecs` does not have `key_id` registered. It cannot
+    ///    decode a payload some other worker encoded under it.
+    ///
+    /// A staggered rollout can deploy the new binary fleet-wide before the
+    /// new key's material reaches every worker's config. So condition 2 is
+    /// not implied by condition 1.
     ///
     /// "Live" mirrors [`crate::worker::worker_stale_secs`]'s convention: a
     /// heartbeat within `worker_stale_secs`. `labels` is an operator-facing
-    /// JSONB column, so its value is never trusted to parse. The capability
-    /// check treats anything that is not a bare non-negative integer the same
-    /// as a missing label — fail closed, not a query error.
+    /// JSONB column, so its value is never trusted to parse. Both checks
+    /// treat a malformed or absent label as failing — fail closed, not a
+    /// query error.
     #[allow(clippy::cast_precision_loss)] // a liveness window in seconds never approaches 2^53
     async fn blocking_workers(
         conn: &mut AsyncPgConnection,
         worker_stale_secs: i64,
+        key_id: &str,
     ) -> HarvestResult<Vec<BlockingWorkerRow>> {
         diesel::sql_query(
-            "SELECT worker_id, host FROM harvest_workers \
+            "SELECT worker_id, host, \
+                    CASE WHEN COALESCE( \
+                                 CASE WHEN labels ->> $2 ~ '^[0-9]+$' \
+                                      THEN (labels ->> $2)::bigint \
+                                      ELSE NULL END, \
+                                 1 \
+                               ) < $3 \
+                         THEN 'cannot read envelope version 2' \
+                         ELSE 'codec key ' || $4 || ' is not registered on this worker' \
+                    END AS reason \
+               FROM harvest_workers \
               WHERE status <> 'Stopped' \
                 AND NOW() - last_heartbeat_at <= make_interval(secs => $1::float8) \
-                AND COALESCE( \
-                      CASE WHEN labels ->> $2 ~ '^[0-9]+$' \
-                           THEN (labels ->> $2)::bigint \
-                           ELSE NULL END, \
-                      1 \
-                    ) < $3",
+                AND ( \
+                      COALESCE( \
+                        CASE WHEN labels ->> $2 ~ '^[0-9]+$' \
+                             THEN (labels ->> $2)::bigint \
+                             ELSE NULL END, \
+                        1 \
+                      ) < $3 \
+                      OR NOT COALESCE(labels -> $5 ? $4, false) \
+                    )",
         )
         .bind::<Double, _>(worker_stale_secs as f64)
         .bind::<Text, _>(crate::payload_codec::CODEC_ENVELOPE_CAPABILITY_LABEL)
         .bind::<BigInt, _>(crate::payload_codec::CODEC_ENVELOPE_VERSION_KEYED)
+        .bind::<Text, _>(key_id)
+        .bind::<Text, _>(crate::payload_codec::CODEC_REGISTERED_KEY_IDS_LABEL)
         .load(conn)
         .await
         .map_err(database_error)
+    }
+
+    /// Wrap [`blocking_workers`]'s rows as [`CodecKeyActivationBlocker`]s for
+    /// one shard (issue #1244).
+    fn blockers_from_rows(
+        shard_id: i32,
+        rows: Vec<BlockingWorkerRow>,
+    ) -> Vec<CodecKeyActivationBlocker> {
+        rows.into_iter()
+            .map(|r| CodecKeyActivationBlocker {
+                shard_id,
+                worker_id: Some(r.worker_id),
+                host: Some(r.host),
+                reachable: true,
+                reason: Some(r.reason),
+            })
+            .collect()
     }
 
     /// This connection's shard's current fleet-wide active key, per
@@ -1660,8 +1707,7 @@ mod db {
     }
 
     /// Activate a codec key fleet-wide, refusing while any live worker cannot
-    /// read the version-2 envelope this activation would start writing (issue
-    /// #1244).
+    /// safely read or write under `key_id` (issue #1244).
     ///
     /// # Why the check exists
     ///
@@ -1673,7 +1719,15 @@ mod db {
     /// This function is the structural version of that rustdoc's manual
     /// rollout-ordering warning. Every live worker's `harvest_workers.labels`
     /// row must advertise [`crate::payload_codec::CODEC_ENVELOPE_VERSION_KEYED`]
-    /// support before activation is allowed to proceed at all.
+    /// support, **and** carry `key_id` in
+    /// [`crate::payload_codec::CODEC_REGISTERED_KEY_IDS_LABEL`], before
+    /// activation is allowed to proceed at all.
+    ///
+    /// The second half matters separately from the first. A binary can
+    /// support the version-2 envelope's *syntax* fleet-wide before the
+    /// target key's *material* reaches every worker's config. A worker
+    /// missing the key cannot decode a payload some other worker encodes
+    /// under it.
     ///
     /// "Live" mirrors [`crate::worker::worker_stale_secs`]: pass that
     /// function's result (computed from the deployment's configured
@@ -1683,14 +1737,35 @@ mod db {
     /// omitted from `expected_shards` while this process holds a pool for it,
     /// blocks activation on its own.
     ///
+    /// # Two passes, not one
+    ///
+    /// The capability check above runs as one bulk pass over every expected
+    /// shard before anything is written. A second, per-shard pass then
+    /// re-checks and writes each shard back to back, on the same connection.
+    ///
+    /// The bulk pass alone would leave a gap. A worker that registers, or
+    /// sends its first heartbeat, strictly after that pass and before this
+    /// call's last shard write was never scanned. The per-shard recheck
+    /// catches that worker on its own shard. It runs immediately before the
+    /// write that shard would otherwise make unsafe for it.
+    ///
+    /// This narrows the gap; it does not close it to zero. A worker can
+    /// still slip in between one shard's own recheck and that shard's own
+    /// write. Those are two statements back to back, on one already-open
+    /// connection. Closing that residual fully would need a
+    /// registration-side fence:
+    /// worker registration itself consulting `harvest_codec_key_state`. This
+    /// function does not implement that.
+    ///
     /// On success, every expected shard's `harvest_codec_key_state` is updated
     /// durably (the previously active row, if any, becomes `"retiring"`), and
     /// this process's registry is flipped via [`PayloadCodecs::set_active_key`].
     /// Shard writes are sequential, not two-phase-committed. A failure partway
-    /// through leaves some shards active and others not-yet-written. The call
-    /// therefore returns the first write error rather than continuing past
-    /// it. Re-running once the underlying failure is fixed converges every
-    /// shard via `ON CONFLICT DO UPDATE`.
+    /// through — a database error, or the per-shard recheck above finding a
+    /// new blocker — leaves some shards active and others not-yet-written.
+    /// The call therefore returns the first such error rather than continuing
+    /// past it. Re-running once the underlying failure is fixed converges
+    /// every shard via `ON CONFLICT DO UPDATE`.
     ///
     /// This function does not coordinate across concurrent calls activating
     /// **different** keys. Each shard resolves such a race independently, and
@@ -1764,14 +1839,8 @@ mod db {
                     continue;
                 }
             };
-            match blocking_workers(&mut conn, worker_stale_secs).await {
-                Ok(rows) => blockers.extend(rows.into_iter().map(|r| CodecKeyActivationBlocker {
-                    shard_id,
-                    worker_id: Some(r.worker_id),
-                    host: Some(r.host),
-                    reachable: true,
-                    reason: None,
-                })),
+            match blocking_workers(&mut conn, worker_stale_secs, key_id).await {
+                Ok(rows) => blockers.extend(blockers_from_rows(shard_id, rows)),
                 Err(e) => blockers.push(CodecKeyActivationBlocker {
                     shard_id,
                     worker_id: None,
@@ -1789,7 +1858,24 @@ mod db {
             });
         }
 
+        // Re-check each shard's capability immediately before writing it, on
+        // the same connection the write itself uses. The bulk census above
+        // ran as one pass over every shard. A worker that registered or
+        // heartbeated *after* it -- one that never advertised `key_id` --
+        // would otherwise go durably unblocked.
+        //
+        // This narrows that window. It shrinks "the whole census-plus-write
+        // pass" down to "this one shard's own back-to-back
+        // recheck-then-write". It catches the same case the bulk census
+        // exists for, just later.
+        //
+        // A shard that fails this recheck stops the loop without writing
+        // that shard or any shard after it. Shards already written in this
+        // call are not rolled back. This is the same partial-write outcome
+        // this function's own rustdoc already documents for a plain
+        // database error here, converged by re-running once fixed.
         for shard in expected_shards {
+            let shard_id = shard.as_i32();
             let mut conn = resolve_shard_conn(sharded_pool, *shard)
                 .await
                 .map_err(|reason| {
@@ -1799,6 +1885,20 @@ mod db {
                         shard.as_i32()
                     ))
                 })?;
+            let recheck = blocking_workers(&mut conn, worker_stale_secs, key_id)
+                .await
+                .map_err(|e| {
+                    HarvestError::Database(format!(
+                        "codec key activation: shard {shard_id} pre-write capability recheck \
+                         failed: {e}"
+                    ))
+                })?;
+            if !recheck.is_empty() {
+                return Err(HarvestError::CodecKeyActivationBlocked {
+                    key_id: key_id.to_string(),
+                    blockers: blockers_from_rows(shard_id, recheck),
+                });
+            }
             write_key_state_activation(&mut conn, key_id).await?;
         }
 
@@ -1808,13 +1908,20 @@ mod db {
     /// Refresh this process's active codec key from the durable, fleet-wide
     /// `harvest_codec_key_state` table (issue #1244).
     ///
-    /// Folded into [`crate::timeout::enforce_timeouts_once`] right beside the
-    /// re-encryption sweep — shard-local, on the connection the caller already
-    /// holds, on the same bounded cadence. This is what turns
-    /// [`activate_codec_key`]'s durable write into a fact every *other*
-    /// process eventually observes. The deployment's configured scanner-tick
-    /// interval is the bound in [`FleetWriteFence`]'s "twice the refresh
-    /// interval" argument.
+    /// Folded into [`crate::timeout::enforce_timeouts_once`] — shard-local, on
+    /// the connection the caller already holds, on the same bounded cadence.
+    /// This is what turns [`activate_codec_key`]'s durable write into a fact
+    /// every *other* process eventually observes. The deployment's configured
+    /// scanner-tick interval is the bound in [`FleetWriteFence`]'s "twice the
+    /// refresh interval" argument.
+    ///
+    /// That bound only holds if this call runs on *every* tick. So
+    /// `enforce_timeouts_once` places it before any resident that can end the
+    /// tick early with `?`, not beside the re-encryption sweep.
+    ///
+    /// The sweep sits later, among the fallible residents, because its own
+    /// safety comes from idempotent, re-run-to-converge CAS writes. It does
+    /// not depend on a staleness-window timing proof the way this call does.
     ///
     /// Never surfaces an error that should break the rest of the tick. Three
     /// things are logged and swallowed by the caller instead: an unreachable

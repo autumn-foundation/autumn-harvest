@@ -25887,6 +25887,7 @@ impl Worker {
             Arc::clone(&self.drain_deadline_max),
             Arc::clone(&self.session_slots_in_use),
             registration_pending,
+            self.registry.payload_codecs().clone(),
         )
     }
 
@@ -26675,6 +26676,7 @@ impl Worker {
                 match crate::workers::register_worker_and_clear_stale_miss_evidence(
                     &mut conn,
                     &registration,
+                    &self.registry.payload_codecs().registered_key_ids(),
                 )
                 .await
                 {
