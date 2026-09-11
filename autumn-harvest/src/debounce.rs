@@ -715,6 +715,15 @@ async fn resolve_quota_lock_ids(
     due_rows: &[FireDueRow],
     quota_by_workflow: &std::collections::HashMap<String, crate::quota::QuotaPolicy>,
 ) -> crate::error::HarvestResult<std::collections::HashMap<(String, String), i32>> {
+    // Defined before any statements to satisfy clippy::items_after_statements.
+    #[derive(diesel::QueryableByName)]
+    struct HashRow {
+        #[diesel(sql_type = diesel::sql_types::Text)]
+        namespace: String,
+        #[diesel(sql_type = diesel::sql_types::Integer)]
+        lock_id: i32,
+    }
+
     use diesel_async::RunQueryDsl;
 
     let distinct_keys: std::collections::BTreeSet<(String, String)> = due_rows
@@ -732,13 +741,6 @@ async fn resolve_quota_lock_ids(
         })
         .collect();
 
-    #[derive(diesel::QueryableByName)]
-    struct HashRow {
-        #[diesel(sql_type = diesel::sql_types::Text)]
-        namespace: String,
-        #[diesel(sql_type = diesel::sql_types::Integer)]
-        lock_id: i32,
-    }
     let hash_of_namespace: std::collections::HashMap<String, i32> = diesel::sql_query(
         "SELECT n AS namespace, hashtext(n) AS lock_id FROM unnest($1::text[]) AS n",
     )
