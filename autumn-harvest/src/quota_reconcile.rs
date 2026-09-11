@@ -82,25 +82,27 @@
 //! `spawn_monitoring_tasks` starts one reconciler per assigned shard, on
 //! every worker process assigned to that shard. Nothing elects a single
 //! reconciler or claims disjoint batches between them: two workers can
-//! fetch overlapping candidate rows on the same tick. This mirrors
-//! [`crate::poison_pill::reclaim_orphaned_tasks`] and
-//! [`crate::sessions::spawn_session_slot_reconciler`], neither of which
-//! coordinates across workers on a shard either -- it is this codebase's
+//! fetch overlapping candidate rows on the same tick.
+//!
+//! This mirrors [`crate::poison_pill::reclaim_orphaned_tasks`] and
+//! [`crate::sessions::spawn_session_slot_reconciler`]. Neither
+//! coordinates across workers on a shard either. It is this codebase's
 //! standing pattern for periodic per-shard scanners, not a gap unique to
 //! this module.
 //!
 //! Correctness does not depend on exclusivity. `WHERE quota_key IS NULL`
 //! on both the scan and the UPDATE means a row a concurrent worker
-//! already backfilled simply is not there to re-write; the loser's
-//! `rows_affected == 0` and its count is not credited (see
-//! [`reconcile_quota_keys_from`]'s doc comment). The cost of an
-//! overlapping tick is wasted work: an extra transaction and advisory
-//! lock acquisition per redundantly-fetched row, scaling with worker
-//! count on a shard. Electing one reconciler, or having each worker
-//! claim a disjoint batch before processing it, would remove that
-//! waste -- but doing so only here, while every sibling scanner stays
-//! uncoordinated, would be an inconsistent one-off. It is a
-//! cross-cutting improvement, if wanted, not a fix this module owes on
+//! already backfilled simply is not there to re-write. The loser's
+//! `rows_affected == 0`, and its count is not credited (see
+//! [`reconcile_quota_keys_from`]'s doc comment).
+//!
+//! The cost of an overlapping tick is wasted work. An extra transaction
+//! and advisory lock acquisition per redundantly-fetched row, scaling
+//! with worker count on a shard. Electing one reconciler, or having each
+//! worker claim a disjoint batch first, would remove that waste. But
+//! doing so only here, while every sibling scanner stays uncoordinated,
+//! would be an inconsistent one-off. It is a cross-cutting improvement,
+//! if wanted, not a fix this module owes on
 //! its own.
 //!
 //! # Residual window
