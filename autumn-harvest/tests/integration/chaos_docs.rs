@@ -641,6 +641,11 @@ fn doc_and_ci_extraction_pipeline_detects_divergence_end_to_end() {
 /// `sqlite_feasibility_docs::workflow_step_stanza`, which exists precisely
 /// because that exact reordering once silently re-gated a doc guard while its
 /// own "is this unconditional?" test kept reporting success.
+///
+/// Panics if a SECOND step also contains `needle`. A compile-only step
+/// could be scoped with the same filter text as the step that really
+/// runs it. Silently picking the first match risks anchoring parity to
+/// the wrong step.
 fn workflow_step_stanza<'a>(block: &'a str, needle: &str) -> Option<&'a str> {
     const STEP: &str = "\n      - name:";
     let at = block.find(needle)?;
@@ -651,6 +656,11 @@ fn workflow_step_stanza<'a>(block: &'a str, needle: &str) -> Option<&'a str> {
     let end = block[after_marker..]
         .find(STEP)
         .map_or(block.len(), |rel| after_marker + rel);
+    assert!(
+        !block[end..].contains(needle),
+        "multiple steps contain {needle:?}, ambiguous which is the real \
+         one: {block}"
+    );
     Some(&block[start..end])
 }
 
@@ -682,6 +692,18 @@ fn step_stanza_covers_keys_written_after_run() {
         "the stanza must start at its own `- name:`, not an earlier step's. \
          Stanza:\n{stanza}"
     );
+}
+
+#[test]
+#[should_panic(expected = "multiple")]
+fn workflow_step_stanza_panics_when_the_needle_appears_in_two_steps() {
+    // Codex finding on PR #1474: a compile-only step could be scoped
+    // with the same filter text as the step that actually executes it.
+    // For example, `--test integration chaos_tests:: --no-run`. Picking
+    // the FIRST stanza containing the needle would then silently anchor
+    // parity to the compile step, not the one CI really runs.
+    let block = "\n      - name: Compile chaos suite\n        run: cargo test --test integration chaos_tests:: --no-run\n\n      - name: Run chaos reproducers\n        run: cargo test --test integration chaos_tests::specific\n";
+    workflow_step_stanza(block, "chaos_tests::");
 }
 
 /// The step stanza's `run:` value. Starts at the `run:` key. Ends at

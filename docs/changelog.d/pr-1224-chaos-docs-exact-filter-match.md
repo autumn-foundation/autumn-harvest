@@ -144,10 +144,21 @@ issue #1202 as P2 round 4).
   stops at the next step. Both are fixture tests, confirmed against a
   glued-backslash-then-space command and a step with a misleading `env:`
   block.
+- A ninth Codex round found the same ambiguity class one level up:
+  `workflow_step_stanza` picks the FIRST step containing `needle`
+  (`chaos_tests::`), so if a compile-only step were ever ALSO scoped
+  with that text (e.g. `--test integration chaos_tests:: --no-run`),
+  parity could silently anchor to the compile step instead of the one
+  that actually executes. `find_flag_end` already panics on ambiguous
+  multiple occurrences within one command (round 7); `workflow_step_stanza`
+  now does the same across steps -- it panics, naming the block, if a
+  second step also contains `needle`, instead of silently picking the
+  first. Fixture test confirmed against two steps both containing the
+  needle.
 
 No production code changed — `chaos_docs.rs` is a test-only doc/CI parity
 guard behind no feature flag. `cargo test -p autumn-harvest --test
-integration chaos_docs::` (27/27), `cargo fmt -p autumn-harvest -- --check`,
+integration chaos_docs::` (28/28), `cargo fmt -p autumn-harvest -- --check`,
 `cargo clippy -p autumn-harvest --all-features --tests -- -D warnings`,
 and `python3 docs/audits/comment-hygiene.py --base origin/trunk-dev` are
 all clean.
