@@ -148,6 +148,31 @@ fn params<'a>(
     }
 }
 
+/// Same as [`params`], but lets the concurrency key and the quota-resolving
+/// `tenant_id` diverge. Issue #1228 covers exactly this mismatched shape:
+/// two tenants can share one `concurrency_key` while each keeps its own
+/// `tenant_id`-derived quota key.
+fn params_with_distinct_keys<'a>(
+    workflow_name: &'a str,
+    workflow_id: &'a str,
+    exec_id: ExecutionId,
+    tenant_id: &'a str,
+    concurrency_key: &'a str,
+    on_conflict: ConcurrencyOnConflict,
+    concurrency_limit: u32,
+) -> StartWorkflowParams<'a> {
+    let mut request = params(
+        workflow_name,
+        workflow_id,
+        exec_id,
+        concurrency_key,
+        on_conflict,
+    );
+    request.input = serde_json::json!({ "tenant_id": tenant_id });
+    request.concurrency_limit = Some(concurrency_limit);
+    request
+}
+
 async fn row_state(conn: &mut AsyncPgConnection, exec_id: ExecutionId) -> String {
     #[derive(diesel::QueryableByName)]
     struct State {
@@ -425,5 +450,107 @@ async fn defer_policy_still_enforces_the_quota_cap_unchanged() {
         active_count(&mut conn, wf, key).await,
         1,
         "the rejected attempt must leave the incumbent untouched"
+    );
+}
+
+/// Credit must not cross tenants (issue #1228 review, P1). Two tenants can
+/// share one `concurrency_key` while each keeps its own `tenant_id`-derived
+/// quota key. A `cancel_running` supersede shedding the OTHER tenant's
+/// incumbent under that shared key must never credit THIS tenant's own
+/// quota check.
+#[tokio::test]
+async fn supersede_credit_does_not_cross_a_mismatched_quota_key() {
+    let (url, _c) = setup_test_database_url_or_env().await;
+    let mut conn = connect(&url).await;
+
+    let wf = leaked("supersede_vs_quota_mismatch");
+    let shared_concurrency_key = leaked("shared_lock");
+    let policy = QuotaPolicy::new("tenant_id").with_max_active_executions(1);
+    let _guard = MetadataGuard::install_one(wf, policy).await;
+
+    // Tenant "acme" holds the shared concurrency key.
+    let acme_id = ExecutionId::new();
+    start_or_load_workflow_execution(
+        &mut conn,
+        params_with_distinct_keys(
+            wf,
+            &format!("acme-{}", Uuid::new_v4().simple()),
+            acme_id,
+            "acme",
+            shared_concurrency_key,
+            ConcurrencyOnConflict::CancelRunning,
+            1,
+        ),
+        None,
+    )
+    .await
+    .expect("acme's first admission must succeed");
+
+    // Tenant "beta" already sits at its own quota cap, on an unrelated
+    // concurrency key nothing else will ever touch.
+    let beta_solo_key = leaked("beta_solo");
+    let beta_first_id = ExecutionId::new();
+    start_or_load_workflow_execution(
+        &mut conn,
+        params_with_distinct_keys(
+            wf,
+            &format!("beta-solo-{}", Uuid::new_v4().simple()),
+            beta_first_id,
+            "beta",
+            beta_solo_key,
+            ConcurrencyOnConflict::Defer,
+            1,
+        ),
+        None,
+    )
+    .await
+    .expect("beta's first admission must succeed");
+
+    // Beta now admits a second run under the SAME shared concurrency key
+    // acme holds. Supersede would shed acme's incumbent to honor
+    // `concurrency_limit = 1` on that shared key. But acme's row carries
+    // quota_key "acme", not "beta". Beta's own quota already sits at its
+    // cap of 1 (the solo row above), so this admission must still be
+    // rejected.
+    let beta_second_id = ExecutionId::new();
+    let err = start_or_load_workflow_execution(
+        &mut conn,
+        params_with_distinct_keys(
+            wf,
+            &format!("beta-shared-{}", Uuid::new_v4().simple()),
+            beta_second_id,
+            "beta",
+            shared_concurrency_key,
+            ConcurrencyOnConflict::CancelRunning,
+            1,
+        ),
+        None,
+    )
+    .await
+    .expect_err(
+        "acme's shed credit must not cross into beta's quota check -- beta \
+         is genuinely at its own cap and must be rejected",
+    );
+    assert!(
+        matches!(err, HarvestError::QuotaExceeded { .. }),
+        "expected QuotaExceeded, got {err:?}"
+    );
+
+    assert_eq!(
+        row_state(&mut conn, acme_id).await,
+        "RUNNING",
+        "acme's incumbent must survive -- the rejected admission rolls back \
+         the whole transaction before supersede ever cancels anything"
+    );
+    assert_eq!(
+        active_count(&mut conn, wf, "acme").await,
+        1,
+        "acme's quota usage is untouched by beta's rejected admission"
+    );
+    assert_eq!(
+        active_count(&mut conn, wf, "beta").await,
+        1,
+        "beta's quota usage stays at its pre-existing solo row -- the \
+         rejected second admission never persisted"
     );
 }

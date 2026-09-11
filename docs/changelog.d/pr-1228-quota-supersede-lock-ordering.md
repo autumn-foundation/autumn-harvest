@@ -156,3 +156,55 @@ under a busy test run, despite completing in ~5s in isolation. Gave it
 its own 30s poll loop instead, the same margin
 `wait_for_execution_state_with_timeout` documents for exactly this
 reason (that helper is private to `integration_e2e.rs`).
+
+## Follow-up — PR #1484 review: quota-key scoping, lock order, history bytes
+
+Automated review on PR #1484 (this fix) found three P1 defects and one P2
+gap in the dry-run credit above. All four are fixed here. The dry-run
+function is renamed `dry_run_supersede_credit` and returns a
+`SupersedeCredit` struct (`active_executions`, `history_bytes`) instead of
+a bare `usize`.
+
+**P1 — credit leaked across quota keys.** `concurrency_key` and
+`quota_key` resolve from two independent expressions. They can differ.
+The old function credited every shed run on the concurrency key,
+regardless of its own `quota_key`. Two tenants sharing one
+`concurrency_key` could see tenant A's cancellation free capacity for
+tenant B's unrelated quota. Fixed: the query also selects each
+candidate's `quota_key` column. Only shed candidates whose `quota_key`
+matches the checked one count toward the credit. New test
+`supersede_credit_does_not_cross_a_mismatched_quota_key` pins this: tenant
+"beta" sits at its own quota cap on an unrelated key, a shared
+`concurrency_key` sheds tenant "acme"'s incumbent, and beta's admission
+is still correctly rejected with `QuotaExceeded`.
+
+**P1 — a new ABBA lock-order hazard.** The old dry run took
+`lock_concurrency_key` before `enforce_quota_admission`'s
+`lock_quota_key` on the fresh-insert path. `replace_execution`'s three
+admission arms take the quota lock first and the concurrency lock later,
+in the real supersede pass. The two paths disagreed on lock order -- a
+genuine deadlock risk under concurrent admissions. Fixed by dropping the
+lock from the dry run entirely. It now performs a plain, unlocked read.
+The cost is a stale read under true concurrent contention on the same
+key. That tolerance already exists (the "residual over limit" telemetry)
+and self-corrects on the next admission.
+
+**P1 — credit ignored `history_bytes`.** The old credit covered only
+`active_executions`. A `max_history_bytes` cap stayed broken under
+`cancel_running`, for the same reason Finding 1 broke
+`max_active_executions`. Fixed: the dry run also sums
+`pg_column_size(event_data)` for the matching shed candidates'
+`harvest_events` rows. `enforce_quota_admission` subtracts that sum from
+`usage.history_bytes` too.
+
+**P2 — the dry run ran even when quota could not use it.** No policy, no
+declared cap, or no resolvable quota key all made the credit dead weight.
+The fresh-insert path still always paid the extra query. Fixed: the dry
+run now runs only when `quota_enforcement_policy` declares a cap AND a
+quota key resolves, matching AC9's zero-default-overhead rule for the
+rest of this feature.
+
+All existing Finding-1 tests in `quota_supersede_ordering_tests.rs`, the
+new mismatched-key test above, and the full `concurrency_supersede_
+tests.rs` and `quota_enforcement_tests.rs` suites stay green against the
+corrected design.

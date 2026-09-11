@@ -458,50 +458,152 @@ tokio::task_local! {
     static ADMITTING: Vec<crate::types::ExecutionId>;
 }
 
-/// Dry-run count of how many runs [`supersede_running_for_key`] would shed
-/// for `(workflow_name, key)` right now (issue #1228, Finding 1). Cancels
-/// nothing.
+/// Slots [`dry_run_supersede_credit`] finds a pending `cancel_running` pass
+/// will free, scoped to ONE `quota_key`.
+#[cfg(feature = "db")]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct SupersedeCredit {
+    /// How many of the shed runs share the checked `quota_key`.
+    pub active_executions: u64,
+    /// Their combined `harvest_events` payload bytes.
+    pub history_bytes: i64,
+}
+
+/// Dry-run count of the shed slots a `cancel_running` pass would free.
+///
+/// Counts how many runs [`supersede_running_for_key`] would shed for
+/// `(workflow_name, concurrency_key)` right now, scoped to the runs that
+/// ALSO carry `quota_key` (issue #1228, Finding 1). Cancels nothing.
 ///
 /// A quota check needs to see the slot(s) a later `cancel_running` pass will
 /// free, without moving the actual cancellation earlier. The real pass must
 /// stay AFTER the admitted row's own `WorkflowStarted` event and task are
 /// durable — see [`supersede_running_for_key`]'s own doc comment for why.
-/// This dry run only reads OTHER rows on the key, so it carries none of that
-/// requirement.
 ///
-/// Takes the same per-key advisory lock the real pass takes. The lock is
-/// transaction-scoped and re-entrant, so the later real pass simply
-/// re-acquires what this already holds — no double-counting, no new lock
-/// order.
+/// # Scoping (Codex review, PR #1484)
+///
+/// `concurrency_key` and `quota_key` are resolved by two independent
+/// expressions. They can differ. A shed candidate without a matching
+/// `quota_key` belongs to a different tenant's quota bucket. Crediting it
+/// here would free capacity for the WRONG tenant. This function counts only
+/// candidates whose persisted `quota_key` column matches. It counts only
+/// among the OLDEST `shed` candidates the real pass would actually cancel —
+/// the same `candidates.into_iter().take(shed)` selection `supersede_inner`
+/// uses.
+///
+/// # No advisory lock (Codex review, PR #1484)
+///
+/// This performs a plain, unlocked read. Taking `lock_concurrency_key` here
+/// would acquire it BEFORE `enforce_quota_admission`'s `lock_quota_key` on
+/// this path. `replace_execution`'s three admission arms take the quota
+/// lock first and the concurrency lock later, in the real supersede pass
+/// run after `replace_execution` returns. Locking here first would invert
+/// that order between the two paths — an ABBA hazard. Reading unlocked
+/// keeps this path's lock order identical to every other: quota lock in
+/// `enforce_quota_admission`, then concurrency lock in the real supersede
+/// pass.
+///
+/// The cost is a stale read under true concurrent contention on the same
+/// key. That tolerance already exists and is documented elsewhere: the
+/// "residual over limit" telemetry covers exactly this class of transient
+/// overshoot. It self-corrects on the next admission for the key.
 ///
 /// # Errors
 ///
-/// Propagates database failures from the advisory lock or the candidate scan.
+/// Propagates database failures from the candidate scan or the history-bytes
+/// lookup.
 #[cfg(feature = "db")]
-pub async fn dry_run_supersede_shed_count(
+pub async fn dry_run_supersede_credit(
     conn: &mut diesel_async::AsyncPgConnection,
     workflow_name: &str,
     concurrency_key: &str,
     limit: u32,
     self_exec_id: crate::types::ExecutionId,
-) -> crate::error::HarvestResult<usize> {
-    lock_concurrency_key(conn, concurrency_key).await?;
+    quota_key: &str,
+) -> crate::error::HarvestResult<SupersedeCredit> {
+    use diesel_async::RunQueryDsl;
+
+    #[derive(diesel::QueryableByName)]
+    struct Row {
+        #[diesel(sql_type = diesel::sql_types::Uuid)]
+        id: uuid::Uuid,
+        #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Text>)]
+        quota_key: Option<String>,
+    }
+
+    #[derive(diesel::QueryableByName)]
+    struct HistoryRow {
+        #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::BigInt>)]
+        history_bytes: Option<i64>,
+    }
+
     let inherited: Vec<crate::types::ExecutionId> =
         ADMITTING.try_with(Clone::clone).unwrap_or_default();
     let fetch_cap =
         i64::from(limit).saturating_add(i64::try_from(SUPERSEDE_SCAN_LIMIT).unwrap_or(i64::MAX));
-    let others = active_runs_for_key(
-        conn,
-        workflow_name,
-        concurrency_key,
-        self_exec_id,
-        fetch_cap,
+    let excluded: Vec<uuid::Uuid> = vec![self_exec_id.as_uuid()];
+
+    // Mirrors `active_runs_for_key`'s own query (same candidate population,
+    // same oldest-first order), plus the `quota_key` column that function
+    // has no need for.
+    let rows: Vec<Row> = diesel::sql_query(
+        "SELECT e.id, e.quota_key \
+         FROM harvest_workflow_executions e \
+         WHERE e.workflow_name = $1 \
+           AND e.state IN ('RUNNING', 'PAUSED') \
+           AND e.id <> ALL($2) \
+           AND EXISTS ( \
+               SELECT 1 FROM harvest_task_queue t \
+               WHERE t.workflow_exec_id = e.id \
+                 AND t.task_type = 'workflow' \
+                 AND t.concurrency_key = $3 \
+           ) \
+         ORDER BY e.started_at ASC, e.id ASC \
+         LIMIT $4",
     )
-    .await?;
-    let (candidates, protected): (Vec<SupersededRun>, Vec<SupersededRun>) = others
+    .bind::<diesel::sql_types::Text, _>(workflow_name)
+    .bind::<diesel::sql_types::Array<diesel::sql_types::Uuid>, _>(excluded)
+    .bind::<diesel::sql_types::Text, _>(concurrency_key)
+    .bind::<diesel::sql_types::BigInt, _>(fetch_cap)
+    .load(conn)
+    .await
+    .map_err(crate::error::database_error)?;
+
+    let (candidates, protected): (Vec<Row>, Vec<Row>) = rows.into_iter().partition(|r| {
+        !inherited.contains(&crate::types::ExecutionId::from_uuid(r.id))
+    });
+    let shed = supersede_plan(candidates.len(), protected.len(), limit).shed;
+
+    // The actual shed set: the OLDEST `shed` candidates, exactly what
+    // `supersede_inner`'s own `candidates.into_iter().take(shed)` cancels.
+    // Only the ones sharing `quota_key` credit THIS admission's usage.
+    let shed_matching_ids: Vec<uuid::Uuid> = candidates
         .into_iter()
-        .partition(|run| !inherited.contains(&run.exec_id));
-    Ok(supersede_plan(candidates.len(), protected.len(), limit).shed)
+        .take(shed)
+        .filter(|r| r.quota_key.as_deref() == Some(quota_key))
+        .map(|r| r.id)
+        .collect();
+    let active_executions = u64::try_from(shed_matching_ids.len()).unwrap_or(u64::MAX);
+    if shed_matching_ids.is_empty() {
+        return Ok(SupersedeCredit {
+            active_executions,
+            history_bytes: 0,
+        });
+    }
+
+    let history_row: HistoryRow = diesel::sql_query(
+        "SELECT SUM(pg_column_size(event_data))::BIGINT AS history_bytes \
+         FROM harvest_events WHERE workflow_exec_id = ANY($1)",
+    )
+    .bind::<diesel::sql_types::Array<diesel::sql_types::Uuid>, _>(shed_matching_ids)
+    .get_result(conn)
+    .await
+    .map_err(crate::error::database_error)?;
+
+    Ok(SupersedeCredit {
+        active_executions,
+        history_bytes: history_row.history_bytes.unwrap_or(0),
+    })
 }
 
 /// Latest-wins: cancel the OLDEST in-flight runs for `(workflow_name, key)` until

@@ -10202,7 +10202,7 @@ async fn persist_all_started_child_workflows(
                 child_quota_key.as_deref(),
                 &child.workflow_name,
                 Some(registry.telemetry().metrics.as_ref()),
-                0, // no dry-run supersede credit on a child spawn
+                crate::concurrency::SupersedeCredit::default(), // no dry-run credit on a child spawn
             )
             .await?;
             store::append_events_offloaded_with_codecs(
@@ -10722,7 +10722,7 @@ async fn insert_awaited_child_execution(
         child_quota_key.as_deref(),
         &child.workflow_name,
         Some(registry.telemetry().metrics.as_ref()),
-        0, // no dry-run supersede credit on a child spawn
+        crate::concurrency::SupersedeCredit::default(), // no dry-run credit on a child spawn
     )
     .await?;
     store::append_events_offloaded_with_codecs(
@@ -12843,7 +12843,7 @@ async fn create_detached_child_executions(
             child_quota_key.as_deref(),
             workflow_name.as_str(),
             Some(registry.telemetry().metrics.as_ref()),
-            0, // no dry-run supersede credit on a detached child spawn
+            crate::concurrency::SupersedeCredit::default(), // no dry-run credit on a detached child spawn
         )
         .await?;
 
