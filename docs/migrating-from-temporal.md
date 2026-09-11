@@ -332,6 +332,16 @@ your whole application.
    computed slot then falls at or after the cutover timestamp, since
    nothing was due before a schedule that did not yet exist.
 
+   An interval schedule re-anchors its phase to that creation moment.
+   `Schedule::Interval` computes its first slot as the cutover timestamp
+   plus the interval, not as the next occurrence of the original
+   Temporal schedule's own phase. Pick the cutover timestamp to land
+   exactly on that original phase, so the new interval continues it
+   instead of shifting it. Use `Schedule::Cron` instead if the phase
+   matters and you cannot guarantee that alignment. A cron expression
+   computes its next slot from its own absolute phase, not from when you
+   happened to create it.
+
    Do not create the harvest schedule earlier and leave it paused,
    waiting for the cutover timestamp. A slot can come due during that
    wait, and neither engine's catchup policy resolves it cleanly for
@@ -359,47 +369,63 @@ your whole application.
    A workflow id can also outlive one execution. `WorkflowIdReusePolicy`
    lets a new execution reuse the same `(workflow_name, workflow_id)`
    after the old one closes. That reuse can land on the other engine
-   after a rollback. Neither the flag nor a record written once at start
-   time survives that reuse.
+   after a rollback. A terminal execution is not the same thing as a
+   reused id, though. Most terminal executions just finished normally,
+   with nothing after them. Confusing the two is the hazard. Treating
+   every terminal run as "not here, try the other engine" misroutes it.
+   An ordinary completed run still needs its own follow-ups routed
+   correctly, such as a query for its result.
 
-   Ask harvest which engine hosts the execution instead of writing your
-   own record. Harvest's `/workflows/by-id/{workflow_name}/{workflow_id}`
-   route family (issue #805) already resolves a business id to its
-   current run. That run is the active one if one exists, or the most
-   recent terminal run otherwise. Query it first. Route a signal, a
-   query, or a cancellation through that same by-id family when it
-   reports an active run. The family has no update route. Read the
-   resolved execution id from the query response instead, then send the
-   update to `POST /workflows/{id}/update/{update_name}` with that id.
-   Route any of these to Temporal when the by-id query reports no active
-   run. That covers no run at all, or only a terminal predecessor.
+   Write a `(workflow_name, workflow_id) -> engine` record at every new
+   start, on whichever engine that start actually lands on. Overwrite
+   any earlier record for the same id. A type-level flag
+   routes a new request in application code, whether that flag sends it
+   to harvest or, after a rollback, back to Temporal. Write the record
+   at that same decision point, on either side of the flag. Treat a
+   missing record as Temporal. An execution that predates this record,
+   or one a Temporal Schedule starts directly with no application code
+   in the path, is Temporal's by default.
 
-   This one check replaces three separate rules with one. A
-   schedule-driven execution needs it because nothing else persists
-   anything for it. A not-yet-ported execution needs it because harvest
-   never has one to report. A reused workflow id after a rollback needs
-   it because harvest's own resolution already prefers the active run
-   over a stale terminal one.
+   Once you know the engine, resolve the current execution on it before
+   you act. Harvest's `/workflows/by-id/{workflow_name}/{workflow_id}`
+   route family (issue #805) does this on the harvest side. It resolves
+   a business id to its current run. A stale cached execution id can be
+   left behind by a continue-as-new or a reset. This resolution keeps
+   such a stale id from misdirecting a signal, a query, or a
+   cancellation. Route those three operations through that same by-id
+   family. The family has no update route. Read the resolved execution
+   id from its response instead, then send the update to `POST
+   /workflows/{id}/update/{update_name}` with that id. Use Temporal's
+   own equivalent business-id resolution on the Temporal side.
 
-   That last case still assumes a workflow id is active on at most one
-   engine at a time. Confirm that before you start a new execution under
-   a reused id. Query harvest's by-id resolution above. Check Temporal's
-   own visibility API too. Start the new execution only once both report
-   no active run for that id. Step 7's handoff below already follows
-   this discipline. It waits for `COMPLETED` before starting the new
-   execution. Apply the same discipline to any other reused id,
-   including one reused across a rollback.
+   This one record replaces three separate resolution attempts. A
+   terminal execution keeps routing to the engine that finished it,
+   since nothing overwrote its record. A schedule-driven execution needs
+   no record from the Temporal side, since a missing record already
+   defaults there. A reused workflow id after a rollback gets a fresh
+   record the moment the rollback's own flag flip routes the new start
+   to Temporal.
+
+   Confirm the previous execution under a reused id is not still active
+   on its own engine before you start a new one elsewhere. Query
+   harvest's by-id resolution above. Check Temporal's own visibility API
+   too. Start the new execution only once both report no active run for
+   that id. Step 7's handoff below already follows this discipline. It
+   waits for `COMPLETED` before starting the new execution. Apply the
+   same discipline to any other reused id, including one reused across a
+   rollback.
 
    A `cancel` signal routed to the wrong engine may not fail loudly. It
    can do nothing there, while the real execution stays un-cancelled.
    Against a `SignalWithStart`-shaped call, a wrong-engine route is
    worse. It can start a new, spurious execution on that engine instead.
 
-   The handoff in step 7, below, is a special case of this rule, with one
-   exception. Its final read targets an execution you already know is
-   terminal. The general rule's "no active run" case does not apply
-   there. Apply the rule above to every other follow-up operation during
-   the whole dual-run window.
+   The handoff in step 7, below, is a special case of this rule. Its
+   `cancel` signal and its final read both route by the same record. A
+   terminal execution's record still names the engine that ran it.
+   Nothing has started a replacement yet at that point. Apply the rule
+   above to every other follow-up operation during the whole dual-run
+   window, not only to that one case.
 2. **Port and validate one workflow type completely before you flip its
    flag.** Run the [Workflow-porting checklist](#workflow-porting-checklist)
    against it. Confirm `WorkflowReplayer` reports no non-determinism against
@@ -516,18 +542,16 @@ your whole application.
    race on the harvest side.
 
    Routing the `cancel` signal above is a special case of step 1's
-   general follow-up-routing rule. Route it to whichever engine hosts
-   this specific execution right now. For this forward handoff, that is
-   Temporal. The entity being drained never started on harvest, so the
-   by-id resolution finds nothing active there and falls through. Never
-   route the signal by the flag's current value.
+   general follow-up-routing rule. Route it by the entity's own
+   `(workflow_name, workflow_id) -> engine` record. For this forward
+   handoff, that record is missing or still names Temporal. No start has
+   ever routed this entity to harvest yet. Never route the signal by the
+   flag's current value.
 
-   The final read after it is not that same case. By the time you make
-   it, you already know the execution is terminal, so there is no engine
-   left to resolve. Read it directly from Temporal, the same execution
-   the cancel step resolved -- not from harvest, which does not have
-   this execution yet. Only after that read do you start the harvest
-   execution.
+   Read the final state from that same engine: Temporal, not harvest.
+   The record does not change until a new execution actually starts
+   elsewhere. The harvest execution here only starts after this read,
+   not before it.
 
    Treat each entity's handoff as a deliberate cutover step, not a bulk
    migration. Each one is a live, stateful run. It is not disposable
@@ -735,11 +759,12 @@ async fn subscription_renewal(
   helper instead. It blocks one code point, rather than reacting from
   anywhere in the workflow body. See the [Signals](#signals) row above.
 - **Routing the `cancel` signal itself.** This example assumes `cancel`
-  already reaches the engine currently hosting this subscription's
-  execution. A real dual-run cutover cannot assume that. Look up which
-  engine hosts this specific execution first. See the general
-  follow-up-routing rule in the [Dual-run cutover
-  playbook](#dual-run-cutover-playbook), step 1, above. A `cancel` signal
+  already reaches the engine hosting this subscription's execution. A
+  real dual-run cutover cannot assume that. Look up the
+  `(workflow_name, workflow_id) -> engine` record for this specific
+  execution first. See the general follow-up-routing rule in the
+  [Dual-run cutover playbook](#dual-run-cutover-playbook), step 1,
+  above. A `cancel` signal
   sent to the wrong engine does nothing there. It leaves the real
   execution un-cancelled. That un-cancelled execution then blocks the
   step 7 drain this playbook depends on.

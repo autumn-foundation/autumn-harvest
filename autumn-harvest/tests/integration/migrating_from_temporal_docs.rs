@@ -277,7 +277,7 @@ fn comparison_page_links_back_to_the_migration_guide() {
 /// to harvest's own schedule pause and catchup primitives rather than leave
 /// them to guess.
 ///
-/// Four PR reviews (Codex, all P1) found real defects here. The first said
+/// Five PR reviews (Codex, all P1) found real defects here. The first said
 /// Temporal exposes a per-firing list an operator can inspect and accept or
 /// reject; it does not. The second said harvest's `CatchupPolicy::SkipAll`
 /// suppresses an entire missed interval; it does not, it fires the oldest
@@ -287,7 +287,11 @@ fn comparison_page_links_back_to_the_migration_guide() {
 /// schedule "any time before" cutover, even paused, still let a slot come
 /// due and fire on resume. The fix now creates the harvest schedule
 /// already paused, at the cutover timestamp itself, so no slot is ever
-/// due before it exists.
+/// due before it exists. The fifth found a side effect of that fix.
+/// Creating a schedule at an arbitrary cutover timestamp re-anchors an
+/// interval schedule's phase. `Schedule::Interval` computes its first
+/// slot from the creation moment, not from the original schedule's own
+/// phase.
 #[test]
 fn dual_run_playbook_covers_schedule_driven_cutover() {
     let guide = read_doc(GUIDE_PATH);
@@ -313,6 +317,13 @@ fn dual_run_playbook_covers_schedule_driven_cutover() {
         "the playbook must create the harvest schedule already paused, in the same insert, \
          not enabled-then-paused -- the gap a scheduler tick could fire into (issue #1219, \
          PR #1473 Codex P1)"
+    );
+    assert!(
+        playbook.contains("An interval schedule re-anchors its phase to that creation moment")
+            && playbook.contains("Schedule::Cron"),
+        "the playbook must warn that `Schedule::Interval` re-anchors its phase to the \
+         creation moment, and offer `Schedule::Cron` for a cadence whose phase must survive \
+         the cutover (issue #1219, PR #1473 Codex P1)"
     );
     assert!(
         playbook.contains("Do not create the harvest schedule earlier and leave it paused"),
@@ -342,18 +353,24 @@ fn dual_run_playbook_covers_schedule_driven_cutover() {
 /// hosts it right now. It must never route by the current flag value, or
 /// by a fact fixed at start time.
 ///
-/// Five PR reviews (Codex, four P1 and one P2) found real gaps here. Three
-/// were successive attempts at this rule, and two more were found in the
-/// fourth attempt. A persisted "record at start time" cannot cover a
-/// schedule-driven
-/// execution, or one that predates the record. Comparing a start time to
-/// a cutover timestamp fails when a Temporal slot fires late. A record
-/// written once goes stale, too: `WorkflowIdReusePolicy` lets a new
-/// execution reuse the same id after a rollback. The fix drops all three
-/// attempts. It asks harvest live instead, through the by-id resolution
-/// harvest already ships (issue #805). That resolution assumes a workflow
-/// id is active on at most one engine at a time. The by-id family also
-/// covers signals, queries, and cancellations only, not updates.
+/// Six PR reviews (Codex, five P1 and one P2) found real gaps here across
+/// five successive attempts at this rule. A persisted "record at start
+/// time" cannot cover a schedule-driven execution, or one that predates
+/// the record. Comparing a start time to a cutover timestamp fails when a
+/// Temporal slot fires late.
+///
+/// A live "query harvest, active beats terminal" resolution fixes both
+/// of those. It creates a new gap, though. It misroutes an ordinary
+/// completed run's own follow-ups. A terminal execution is not the same
+/// thing as a stale one.
+///
+/// The fix returns to a persisted record. This time it writes a fresh
+/// record at every new start, on either engine, overwriting the last
+/// one. A terminal execution's record still names the engine that ran
+/// it. A rollback's new start gets a fresh record of its own. Harvest's
+/// by-id resolution (issue #805) still resolves the current execution
+/// once the record names harvest. That family covers signals, queries,
+/// and cancellations only, not updates.
 ///
 /// Applying the resolved-engine language to step 7's forward handoff also
 /// named the wrong engine for its final read. That execution never ran on
@@ -370,18 +387,33 @@ fn dual_run_playbook_covers_follow_up_engine_routing() {
     );
     assert!(
         playbook.contains("WorkflowIdReusePolicy") && playbook.contains("rollback"),
-        "the playbook must name workflow-id reuse across a rollback as a hazard a persisted \
-         record cannot survive (issue #1219, PR #1473 Codex P1)"
+        "the playbook must name workflow-id reuse across a rollback as a hazard the \
+         resolution must survive (issue #1219, PR #1473 Codex P1)"
+    );
+    assert!(
+        playbook.contains("A terminal execution is not the same thing as a")
+            && playbook.contains("misroutes it"),
+        "the playbook must distinguish an ordinary terminal execution from a superseded one \
+         -- routing every terminal run's follow-ups to the other engine breaks a plain \
+         completed-run query (issue #1219, PR #1473 Codex P1)"
+    );
+    assert!(
+        playbook.contains("record at every new")
+            && playbook.contains("Overwrite any earlier record for the same id"),
+        "the playbook must write the routing record at every new start, on whichever engine \
+         it lands on, overwriting the previous record -- this is what keeps a terminal \
+         execution's record correct and gives a rollback's new start a fresh record \
+         (issue #1219, PR #1473 Codex P1)"
+    );
+    assert!(
+        playbook.contains("Treat a missing record as Temporal"),
+        "the playbook must resolve a not-yet-ported or schedule-driven execution's missing \
+         record to Temporal (issue #1219)"
     );
     assert!(
         playbook.contains("/workflows/by-id/{workflow_name}/{workflow_id}"),
-        "the playbook must route follow-ups through harvest's own by-id resolution (issue \
-         #805), not a record the reader maintains (issue #1219, PR #1473 Codex P1)"
-    );
-    assert!(
-        playbook.contains("active run") && playbook.contains("terminal"),
-        "the playbook must say the by-id resolution prefers an active run over a stale \
-         terminal one -- the property that makes it safe across a reused workflow id \
+        "the playbook must resolve the current execution on the named engine through \
+         harvest's own by-id resolution (issue #805) once the record says harvest \
          (issue #1219, PR #1473 Codex P1)"
     );
     assert!(
@@ -392,11 +424,11 @@ fn dual_run_playbook_covers_follow_up_engine_routing() {
          route (issue #1219, PR #1473 Codex P2)"
     );
     assert!(
-        playbook.contains("active on at most one engine at a time")
+        playbook.contains("is not still active")
             && playbook.contains("Temporal's own visibility API"),
-        "the playbook must say the by-id resolution assumes a workflow id is active on at \
-         most one engine, and must tell the reader to confirm that against both engines \
-         before starting a new execution under a reused id (issue #1219, PR #1473 Codex P1)"
+        "the playbook must tell the reader to confirm the previous execution under a reused \
+         id is not still active on its own engine, checking both engines, before starting a \
+         new one elsewhere (issue #1219, PR #1473 Codex P1)"
     );
     assert!(
         playbook.contains("Never route it by the flag's current value"),
@@ -409,16 +441,11 @@ fn dual_run_playbook_covers_follow_up_engine_routing() {
          general follow-up-routing rule, not a standalone exception (issue #1219)"
     );
     assert!(
-        playbook.contains("no engine left to resolve"),
-        "step 7's final read must be carved out from the general routing rule: it targets a \
-         known-terminal execution, not an unresolved one (issue #1219, PR #1473 Codex P1)"
-    );
-    assert!(
-        playbook.contains("For this forward handoff, that is Temporal")
-            && playbook.contains("Read it directly from Temporal"),
-        "step 7's forward handoff drains an execution that only ever ran on Temporal -- the \
-         cancel and the final read must resolve to Temporal, not to harvest, which does not \
-         have this execution yet (issue #1219, PR #1473 Codex P1)"
+        playbook.contains("that record is missing or still names Temporal")
+            && playbook.contains("Temporal, not harvest"),
+        "step 7's forward handoff drains an execution that only ever ran on Temporal -- both \
+         the cancel and the final read must resolve to Temporal, since no start has ever \
+         routed this entity to harvest (issue #1219, PR #1473 Codex P1)"
     );
 }
 
@@ -433,7 +460,7 @@ fn worked_example_commentary_cross_links_engine_routing_rule() {
     let commentary = flatten_whitespace(section_body(&guide, "### What changed, and why"));
 
     assert!(
-        commentary.contains("engine currently hosting"),
+        commentary.contains("(workflow_name, workflow_id) -> engine` record"),
         "the worked example's commentary must cross-link the general engine-routing rule for \
          its own `cancel` signal (issue #1219)"
     );
