@@ -379,13 +379,31 @@ fn dual_run_playbook_covers_schedule_driven_cutover() {
 /// A later PR review found two more gaps in the persisted-record fix.
 /// Harvest's own schedule tick starts an execution the same way
 /// Temporal's schedule does. Neither has a flag decision point to write
-/// a record at. Route those by which schedule is active instead.
+/// a record at.
 ///
 /// The record also only ever named the current owner, not every
 /// generation a reused id ever had. A follow-up against a superseded
 /// generation needs its own captured handle from when that generation
 /// was current. Issue #805 already expects this same discipline of a
 /// stale exec id.
+///
+/// A further review found three gaps past that.
+///
+/// Writing the record after the start, not before, leaves an
+/// undetectable inconsistency if the two ever split. An execution can
+/// exist with no record, defaulting to the wrong engine.
+///
+/// Routing a schedule-driven type by which schedule is active broke a
+/// rule the guide already stated. An in-flight execution stays on the
+/// engine that started it. A pre-cutover Temporal firing would misroute
+/// once harvest's schedule took over. The fix writes the record for
+/// every harvest-side start instead, scheduled or flag-routed alike.
+/// Schedule-driven types then use the same mechanism as any other.
+///
+/// Reading an execution id and sending an update to it are two separate
+/// calls. A continue-as-new between them can seal the id before the
+/// update reaches it. `admit_update` does not follow that chain the way
+/// it follows a retry chain.
 #[test]
 fn dual_run_playbook_covers_follow_up_engine_routing() {
     let guide = read_doc(GUIDE_PATH);
@@ -409,12 +427,18 @@ fn dual_run_playbook_covers_follow_up_engine_routing() {
          completed-run query (issue #1219, PR #1473 Codex P1)"
     );
     assert!(
-        playbook.contains("record at every new")
+        playbook.contains("record before you")
             && playbook.contains("Overwrite any earlier record for the same id"),
-        "the playbook must write the routing record at every new start, on whichever engine \
-         it lands on, overwriting the previous record -- this is what keeps a terminal \
-         execution's record correct and gives a rollback's new start a fresh record \
+        "the playbook must write the routing record before the start, not after, so a crash \
+         between the two leaves a detectable inconsistency rather than a real execution with \
+         no record -- and it must overwrite the previous record on every new start \
          (issue #1219, PR #1473 Codex P1)"
+    );
+    assert!(
+        playbook.contains("Reconcile a record that names an engine with no matching execution"),
+        "the playbook must tell the reader how to recover from the one bad state \
+         write-before-start can leave behind: a record naming an engine with nothing \
+         actually running there yet (issue #1219, PR #1473 Codex P1)"
     );
     assert!(
         playbook.contains("Treat a missing record as Temporal"),
@@ -422,12 +446,12 @@ fn dual_run_playbook_covers_follow_up_engine_routing() {
          (issue #1219)"
     );
     assert!(
-        playbook.contains("needs a different default once its harvest schedule is unpaused")
-            && playbook.contains("which schedule is currently active for that type"),
-        "the playbook must not apply the missing-record default to a schedule-driven type: \
-         harvest's own scheduler starts its executions with no flag decision point to write \
-         a record at either, so it must route by which schedule is active instead \
-         (issue #1219, PR #1473 Codex P1)"
+        playbook.contains("Any start that lands on harvest writes this record")
+            && playbook.contains("harvest's own schedule fired it directly"),
+        "the playbook must write the routing record for every harvest-side start, scheduled \
+         or flag-routed alike -- a schedule-driven type's follow-ups need the same mechanism \
+         as any other type, not a type-level \"which schedule is active\" shortcut that \
+         misroutes a pre-cutover in-flight execution (issue #1219, PR #1473 Codex P1)"
     );
     assert!(
         playbook.contains("This record names the current owner only")
@@ -449,6 +473,14 @@ fn dual_run_playbook_covers_follow_up_engine_routing() {
         "the playbook must not route an update through the by-id family, which does not \
          carry one -- it must resolve the execution id first and use the exec-id update \
          route (issue #1219, PR #1473 Codex P2)"
+    );
+    assert!(
+        playbook.contains("admit_update` resolves only a workflow-level")
+            && playbook.contains("continue-as-new chain"),
+        "the playbook must warn that the two-step update recipe (resolve id, then send \
+         update) is not atomic: a continue-as-new in between can seal the id, and \
+         `admit_update` does not follow that chain the way it follows a retry chain \
+         (issue #1219, PR #1473 Codex P2)"
     );
     assert!(
         playbook.contains("is not still active")

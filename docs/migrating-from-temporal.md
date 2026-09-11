@@ -376,31 +376,35 @@ your whole application.
    An ordinary completed run still needs its own follow-ups routed
    correctly, such as a query for its result.
 
-   Write a `(workflow_name, workflow_id) -> engine` record at every new
-   start, on whichever engine that start actually lands on. Overwrite
-   any earlier record for the same id. This record names the current
-   owner only. It matches harvest's own by-id resolution (issue #805),
-   which also resolves to the latest run, not a specific historical
-   one. A follow-up against a specific prior generation needs its own
-   engine and execution id, captured from when that generation was
-   current.
+   Write a `(workflow_name, workflow_id) -> engine` record before you
+   start the execution, not after. The start and the record write are
+   two separate operations. A crash between them is possible in either
+   order. Writing the record first bounds the damage. At worst, a
+   record names an engine with no matching execution yet. That is a
+   state you can detect and retry. Writing it after leaves the
+   opposite state undetectable. A real execution can exist with no
+   record, defaulting to the wrong engine.
 
-   A type-level flag routes a new request in application code, whether
-   that flag sends it to harvest or, after a rollback, back to
-   Temporal. Write the record at that same decision point, on either
-   side of the flag. Treat a missing record as Temporal. An execution
-   that predates this record, or one a Temporal Schedule starts
-   directly with no application code in the path, is Temporal's by
-   default.
+   Any start that lands on harvest writes this record, whether an
+   application-level flag routed it there or harvest's own schedule
+   fired it directly. Both are your own system's code paths. Overwrite
+   any earlier record for the same id. Treat a missing record as
+   Temporal. A flag-routed start there, a rollback's restart, and a
+   Temporal Schedule's own direct firing are all Temporal's by default.
+   Nothing in your system could have started any of them on harvest
+   instead.
 
-   A schedule-driven type needs a different default once its harvest
-   schedule is unpaused. Harvest's own scheduler then starts every new
-   execution directly, the same way Temporal's schedule does on its own
-   side. No flag decision point writes a record for either one. Route
-   a schedule-driven type's follow-ups by which schedule is currently
-   active for that type, not by a missing-record default. Only the
-   engine whose schedule is unpaused can have started a new execution
-   of that type.
+   Reconcile a record that names an engine with no matching execution.
+   Query that engine's own resolution for the id. A miss there means
+   the start never actually completed. Retry it.
+   `WorkflowIdReusePolicy` already makes a retried start safe against
+   one that silently succeeded.
+
+   This record names the current owner only. It matches harvest's own
+   by-id resolution (issue #805), which also resolves to the latest
+   run, not a specific historical one. A follow-up against a specific
+   prior generation needs its own engine and execution id, captured
+   from when that generation was current.
 
    Once you know the engine, resolve the current execution on it before
    you act. Harvest's `/workflows/by-id/{workflow_name}/{workflow_id}`
@@ -409,17 +413,26 @@ your whole application.
    left behind by a continue-as-new or a reset. This resolution keeps
    such a stale id from misdirecting a signal, a query, or a
    cancellation. Route those three operations through that same by-id
-   family. The family has no update route. Read the resolved execution
-   id from its response instead, then send the update to `POST
-   /workflows/{id}/update/{update_name}` with that id. Use Temporal's
-   own equivalent business-id resolution on the Temporal side.
+   family.
+
+   The family has no update route. Read the resolved execution id from
+   its response, then send the update to `POST
+   /workflows/{id}/update/{update_name}` with that id. A continue-as-new
+   between those two calls can still move the id you read out from
+   under the update. `admit_update` resolves only a workflow-level
+   retry chain, not a continue-as-new chain, so it will not find the
+   new current run for you there. Keep the gap between the two calls
+   short. Re-resolve by-id and retry if the update does not land as
+   expected. Use Temporal's own equivalent business-id resolution on
+   the Temporal side.
 
    This design replaces three separate resolution attempts. A terminal
    execution keeps routing to the engine that finished it, since
    nothing overwrote its record. A reused workflow id after a rollback
    gets a fresh record the moment the rollback's own flag flip routes
-   the new start to Temporal. A schedule-driven type needs neither
-   record: which schedule is unpaused already answers the question.
+   the new start to Temporal. A schedule-driven type's harvest-side
+   firings write their own record too, the same as any other harvest
+   start.
 
    Confirm the previous execution under a reused id is not still active
    on its own engine before you start a new one elsewhere. Query
