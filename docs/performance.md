@@ -1737,3 +1737,8 @@ standalone note rather than part of the claim-path attribution table above:
   one statement per key (`calls` -66.7% at every swept size; buffers flat
   by design, so the fix is measured in DB-socket syscalls instead: `sendto`
   -44.5%, `recvfrom` -40.9%).
+* [`docs/performance-completion-trigger-outbox-queue.md`](performance-completion-trigger-outbox-queue.md)
+  — the per-row `harvest_schedules` lookup in
+  `completion_trigger::enforce_completion_triggers_outbox`'s cross-shard
+  relay scan, batched into one `workflow_name = ANY($1)` call via
+  `resolve_target_queues_batch` (`lookup_calls` n → 1 at every swept size).
