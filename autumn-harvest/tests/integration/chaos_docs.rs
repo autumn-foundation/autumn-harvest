@@ -246,6 +246,29 @@ fn local_iteration_example_is_scoped_to_chaos_tests_module() {
     );
 }
 
+/// The end index of `flag` in `command`, only at a real token boundary.
+///
+/// A plain substring search would match `flag` as a prefix of a longer,
+/// different token, e.g. `--test integration` inside `--test
+/// integration_tests`. Requires the character right after `flag` to be
+/// whitespace, `\`, or absent (end of string). Keeps searching past a
+/// false match instead of accepting the first substring hit.
+fn find_flag_end(command: &str, flag: &str) -> Option<usize> {
+    let mut search_from = 0;
+    loop {
+        let rel = command[search_from..].find(flag)?;
+        let end = search_from + rel + flag.len();
+        let boundary_ok = command[end..]
+            .chars()
+            .next()
+            .is_none_or(|c| c.is_whitespace() || c == '\\');
+        if boundary_ok {
+            return Some(end);
+        }
+        search_from = end;
+    }
+}
+
 /// The exact filter token following `--test integration` in a command.
 ///
 /// Skips whitespace and backslash continuations between the flag and its
@@ -264,11 +287,16 @@ fn local_iteration_example_is_scoped_to_chaos_tests_module() {
 /// guessing wrong risks the exact silent mismatch this issue closed. It
 /// requires the filter immediately after the flag and panics on anything
 /// else, naming the offending token.
+///
+/// `command.find` alone would match `--test integration` as a prefix of
+/// a longer, different target name, e.g. `--test integration_tests`.
+/// Requires a token boundary (whitespace, `\`, or end of string) right
+/// after `FLAG`, so a same-prefix target name is never mistaken for it.
 fn extract_filter_argument(command: &str) -> &str {
     const FLAG: &str = "--test integration";
-    let after_flag = command.find(FLAG).map_or_else(
+    let after_flag = find_flag_end(command, FLAG).map_or_else(
         || panic!("command has no {FLAG:?}: {command}"),
-        |i| &command[i + FLAG.len()..],
+        |end| &command[end..],
     );
     let arg_start = after_flag.trim_start_matches(|c: char| c.is_whitespace() || c == '\\');
     let arg_end = arg_start
@@ -315,6 +343,17 @@ fn extract_filter_argument_panics_when_the_flag_has_no_following_token() {
 #[should_panic(expected = "no filter argument follows")]
 fn extract_filter_argument_panics_when_nothing_follows_the_flag() {
     extract_filter_argument("cargo test --test integration");
+}
+
+#[test]
+#[should_panic(expected = "command has no")]
+fn extract_filter_argument_ignores_a_same_prefix_longer_target_name() {
+    // Codex finding on PR #1474: `--test integration` is a substring of
+    // `--test integration_tests`, a different, valid cargo target name.
+    // A plain `command.find` would match that prefix and misread
+    // `_tests` as the filter. The guard requires a token boundary, so no
+    // real `--test integration` flag is found here.
+    extract_filter_argument("cargo test --test integration_tests chaos_tests::");
 }
 
 #[test]
@@ -404,11 +443,11 @@ fn doc_example_filter_matches_chaos_workflow_filter() {
         ".github/workflows/chaos.yml must have a step running the \
          chaos_tests:: suite",
     );
-    let ci_run_line = ci_stanza
-        .lines()
-        .find(|line| line.contains("--test integration"))
-        .expect("the chaos_tests:: step must have a --test integration run line");
-    let ci_filter = extract_filter_argument(ci_run_line);
+    // Pass the whole stanza, not a single `.lines().find(...)` match. A
+    // `run:` command can wrap across lines: a `\` continuation, or a
+    // folded `>-` block. A single-line match would lose the filter to
+    // that break. The doc's own example wraps its filter the same way.
+    let ci_filter = extract_filter_argument(ci_stanza);
 
     let doc = read_chaos_doc();
     let block = bash_block_containing(&doc, "HARVEST_TEST_DATABASE_URL");
@@ -427,6 +466,19 @@ fn doc_example_filter_matches_chaos_workflow_filter() {
 }
 
 #[test]
+fn doc_example_filter_matches_chaos_workflow_filter_tolerates_a_wrapped_ci_run_line() {
+    // Codex finding on PR #1474: an earlier version read only the single
+    // physical line containing `--test integration` out of the CI
+    // stanza. If chaos.yml ever wraps its filter onto a continuation
+    // line, that single line has no filter on it. The doc's own example
+    // already does this. The guard panicked even though the real
+    // filters still matched. Passing the whole stanza fixes this.
+    let workflow = "\n      - name: Run chaos reproducers\n        run: cargo test --features chaos --test integration \\\n          chaos_tests::\n";
+    let ci_stanza = workflow_step_stanza(workflow, "chaos_tests::").expect("stanza present");
+    assert_eq!(extract_filter_argument(ci_stanza), "chaos_tests::");
+}
+
+#[test]
 fn doc_and_ci_extraction_pipeline_detects_divergence_end_to_end() {
     // Runs the exact same pipeline as `doc_example_filter_matches_chaos_workflow_filter`
     // above, on synthetic text standing in for chaos.yml and chaos.md. Proves
@@ -434,11 +486,7 @@ fn doc_and_ci_extraction_pipeline_detects_divergence_end_to_end() {
     // isolation.
     let workflow = "\n      - uses: actions/checkout@v4\n      - name: Run chaos reproducers\n        run: cargo test --features chaos --test integration chaos_tests::chaos_seeded_convergence_sweep -- --nocapture\n      - name: A later step\n        run: echo later\n";
     let ci_stanza = workflow_step_stanza(workflow, "chaos_tests::").expect("stanza present");
-    let ci_run_line = ci_stanza
-        .lines()
-        .find(|line| line.contains("--test integration"))
-        .expect("run line present");
-    let ci_filter = extract_filter_argument(ci_run_line);
+    let ci_filter = extract_filter_argument(ci_stanza);
 
     let doc = "```bash\n# Scope the run to `chaos_tests::`:\nHARVEST_TEST_DATABASE_URL=postgres://x \\\n  CHAOS_SEEDS=8 cargo test --features chaos --test integration \\\n  chaos_tests::\n```\n";
     let block = bash_block_containing(doc, "HARVEST_TEST_DATABASE_URL");

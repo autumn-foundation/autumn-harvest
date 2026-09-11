@@ -64,10 +64,22 @@ issue #1202 as P2 round 4).
   Fixed by switching to `map_or_else` and a direct `assert!`, then
   verified locally with CI's exact invocation: `cargo clippy -p
   autumn-harvest --all-features --tests -- -D warnings` (clean).
+- A third Codex round found two more gaps in the same area. (1) A plain
+  `command.find("--test integration")` matched as a prefix of a longer,
+  different target name (`--test integration_tests`); a new
+  `find_flag_end` helper now requires a token boundary right after the
+  flag and keeps searching past a false match. (2) The CI-side extraction
+  read only the single physical line containing the flag out of the step
+  stanza, so a `run:` command wrapped across lines (a `\` continuation or
+  a folded `>-` block) — a shape chaos.yml doesn't use today, but the
+  doc's own example does — would panic even with matching filters; now
+  passes the whole stanza, which `extract_filter_argument` already
+  tolerates via its whitespace/continuation skip. Both are fixture tests,
+  confirmed against a real boundary case and a real continuation case.
 
 No production code changed — `chaos_docs.rs` is a test-only doc/CI parity
 guard behind no feature flag. `cargo test -p autumn-harvest --test
-integration chaos_docs::` (18/18), `cargo fmt -p autumn-harvest -- --check`,
+integration chaos_docs::` (20/20), `cargo fmt -p autumn-harvest -- --check`,
 `cargo clippy -p autumn-harvest --all-features --tests -- -D warnings`,
 and `python3 docs/audits/comment-hygiene.py --base origin/trunk-dev` are
 all clean.
