@@ -300,6 +300,13 @@ fn comparison_page_links_back_to_the_migration_guide() {
 /// right after the pause can still omit one. The same capture also only
 /// ever ran forward, at cutover. A rollback resumes the Temporal
 /// Schedule, and nothing captured the ids it fires after that.
+///
+/// A thirteenth review found the interval-phase advice itself does not
+/// hold up. Picking a cutover timestamp to land on the original phase
+/// assumes the reader can choose the actual insert moment.
+/// `WorkflowSchedule` and its create request take no such anchor.
+/// `Utc::now()` at the real insert sets the phase instead, later still
+/// once request and database latency are added in.
 #[test]
 fn dual_run_playbook_covers_schedule_driven_cutover() {
     let guide = read_doc(GUIDE_PATH);
@@ -332,6 +339,16 @@ fn dual_run_playbook_covers_schedule_driven_cutover() {
         "the playbook must warn that `Schedule::Interval` re-anchors its phase to the \
          creation moment, and offer `Schedule::Cron` for a cadence whose phase must survive \
          the cutover (issue #1219, PR #1473 Codex P1)"
+    );
+    assert!(
+        playbook.contains(
+            "Neither `WorkflowSchedule` nor its create request accepts that \
+             moment as an input"
+        ) && playbook.contains("You cannot choose it to land on the original phase"),
+        "the playbook must not imply the reader can pick a cutover timestamp to land an \
+         interval schedule on its original phase -- neither `WorkflowSchedule` nor its create \
+         request takes an anchor, the actual insert moment is `Utc::now()` at registration, \
+         and request/database latency moves it later still (issue #1219, PR #1473 Codex P1)"
     );
     assert!(
         playbook.contains("Do not create the harvest schedule earlier and leave it paused"),

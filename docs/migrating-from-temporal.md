@@ -333,14 +333,17 @@ your whole application.
    nothing was due before a schedule that did not yet exist.
 
    An interval schedule re-anchors its phase to that creation moment.
-   `Schedule::Interval` computes its first slot as the cutover timestamp
-   plus the interval, not as the next occurrence of the original
-   Temporal schedule's own phase. Pick the cutover timestamp to land
-   exactly on that original phase, so the new interval continues it
-   instead of shifting it. Use `Schedule::Cron` instead if the phase
-   matters and you cannot guarantee that alignment. A cron expression
-   computes its next slot from its own absolute phase, not from when you
-   happened to create it.
+   `Schedule::Interval` computes its first slot as `Utc::now()` at the
+   actual insert, plus the interval. That is not the next occurrence
+   of the original Temporal schedule's own phase.
+
+   Neither `WorkflowSchedule` nor its create request accepts that
+   moment as an input. You cannot choose it to land on the original
+   phase, only observe it after the fact. Request and database latency
+   move it later still, past whatever instant you were aiming for. Use
+   `Schedule::Cron` instead when the phase must survive the cutover. A
+   cron expression computes its next slot from its own absolute phase,
+   not from when you happened to create it.
 
    Do not create the harvest schedule earlier and leave it paused,
    waiting for the cutover timestamp. A slot can come due during that
