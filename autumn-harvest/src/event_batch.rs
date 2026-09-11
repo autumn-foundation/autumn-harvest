@@ -350,7 +350,7 @@ pub async fn admit_batched_start(
                             params,
                             true,
                             false,
-                            None,
+                            metrics,
                             None,
                             quota_key_input_override.as_ref(),
                         )
@@ -536,7 +536,7 @@ async fn fire_due_on_conn(
             };
 
             if let Some(row) = due_rows.into_iter().next() {
-                match fire_claimed_batch_row(conn, row).await {
+                match fire_claimed_batch_row(conn, row, metrics).await {
                     Ok(Some((exec_id, deferred, checks, cancel_metrics))) => {
                         Ok(Some((exec_id, deferred, checks, cancel_metrics)))
                     }
@@ -580,6 +580,7 @@ async fn fire_due_on_conn(
 async fn fire_claimed_batch_row(
     conn: &mut diesel_async::AsyncPgConnection,
     row: FireDueBatchRow,
+    metrics: Option<&(dyn crate::telemetry::MetricsRecorder + Send + Sync)>,
 ) -> HarvestResult<
     Option<(
         String,
@@ -693,7 +694,7 @@ async fn fire_claimed_batch_row(
         params,
         true,
         false,
-        None,
+        metrics,
         None,
         quota_key_input_override.as_ref(),
     )

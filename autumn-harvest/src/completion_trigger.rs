@@ -598,16 +598,6 @@ pub static GLOBAL_WORKFLOW_METADATA: std::sync::RwLock<
     Option<std::collections::HashMap<String, WorkflowMetadata>>,
 > = std::sync::RwLock::new(None);
 
-/// Serializes every test, in any module, that installs a temporary
-/// [`GLOBAL_WORKFLOW_METADATA`] value. `cargo test`'s default harness runs
-/// a crate's unit tests multi-threaded in one process. So a mutex local to
-/// one module only serializes that module's own tests. It does not stop
-/// `debounce`'s and `throttle`'s metadata-mutating tests from interleaving
-/// on this one process-global value (issue #1230 Finding 2 review, P2).
-#[cfg(all(test, feature = "db"))]
-pub(crate) static GLOBAL_WORKFLOW_METADATA_TEST_SERIAL: std::sync::Mutex<()> =
-    std::sync::Mutex::new(());
-
 #[cfg(feature = "db")]
 pub static GLOBAL_MAX_WORKFLOW_INPUT_BYTES: std::sync::RwLock<u64> =
     std::sync::RwLock::new(crate::builder::DEFAULT_MAX_WORKFLOW_INPUT_BYTES);
