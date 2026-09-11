@@ -675,7 +675,21 @@ impl SqliteRuntime {
                         Some((prior_exec, prior_state)),
                     ) => {
                         if prior_state == "FAILED" {
-                            store::seal_execution(&tx, prior_exec, SEALED_STATE)?;
+                            // Snag exploratory QA finding, sibling to issue #1374. A
+                            // direct `seal_execution` call here skipped the
+                            // undelivered-signal cleanup that `cancel_and_seal_prior`
+                            // performs.
+                            //
+                            // A signal staged while the prior was RUNNING can outlive
+                            // it. The prior can fail on its own before the workflow
+                            // consumes that signal.
+                            //
+                            // Route through the same helper that `TerminateIfRunning`
+                            // uses instead. `prior_state` is FAILED here, so this call
+                            // only seals the prior. It records no cancellation event.
+                            // It cleans up no PENDING task or timer. It adds only the
+                            // signal cleanup, compared to the direct call it replaces.
+                            cancel_and_seal_prior(&tx, prior_exec, &prior_state)?;
                             insert_fresh_execution(&tx, workflow_name, Some(id), input)?
                         } else {
                             StartOutcome {

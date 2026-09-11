@@ -821,6 +821,71 @@ async fn failed_prior_allow_duplicate_failed_only_replaces() {
     assert_eq!(active_rows_for_key(&path, "fail_wf", "f-3"), 1);
 }
 
+// Snag exploratory QA finding. `AllowDuplicateFailedOnly`'s replace-a-FAILED-
+// prior arm seals the prior with a direct `store::seal_execution` call. See
+// the `if prior_state == "FAILED"` branch in runtime.rs.
+//
+// That call bypasses `cancel_and_seal_prior`, the helper the
+// `TerminateIfRunning` arm uses. `cancel_and_seal_prior` carries the
+// `delete_undelivered_signals_for_execution` cleanup added for issue #1374.
+//
+// Issue #1374 established this reasoning: a signal staged while RUNNING can
+// outlive a prior that reaches FAILED on its own. The workflow never
+// awaited that signal name, so the signal stays undelivered.
+//
+// The same reasoning applies here. A signal staged while the prior was
+// still RUNNING, and never consumed before the prior failed on its own, is
+// the same orphan #1374 fixed. This path reaches it through the other seal
+// call, the one #1374 did not touch.
+//
+// This backend documents no retention or GC pass, so nothing else ever
+// reclaims the row.
+#[tokio::test]
+async fn allow_duplicate_failed_only_orphans_an_undelivered_signal_on_the_replaced_prior() {
+    let (_dir, path) = temp_db();
+    let mut rt = runtime_at(&path);
+
+    // Stage a signal while the prior is still RUNNING (pre-drive), for a name
+    // fail_wf never awaits...
+    let prior = rt
+        .start_workflow_with_id("fail_wf", "afo-1", json!({"seed": true}))
+        .unwrap();
+    rt.send_signal(prior, "never_consumed", json!({})).unwrap();
+    assert_eq!(
+        undelivered_signal_count(&path, prior),
+        1,
+        "prior has one staged, undelivered signal"
+    );
+
+    // ...then let it run to FAILED on its own, without ever consuming that signal.
+    let _ = rt.run_until_blocked(prior).await;
+    assert_eq!(raw_state(&path, prior), "FAILED");
+    assert_eq!(
+        undelivered_signal_count(&path, prior),
+        1,
+        "the signal is still undelivered after the prior failed on its own"
+    );
+
+    let out = rt
+        .start_workflow_with_reuse_policy(
+            "fail_wf",
+            "afo-1",
+            json!({}),
+            WorkflowIdReusePolicy::AllowDuplicateFailedOnly,
+        )
+        .unwrap();
+    assert!(out.created, "a FAILED prior is replaced");
+    assert_eq!(raw_state(&path, prior), "CONTINUED_AS_NEW");
+
+    assert_eq!(
+        undelivered_signal_count(&path, prior),
+        0,
+        "the replaced FAILED prior's undelivered signal must be cleaned up too, \
+         exactly as issue #1374 fixed for the TerminateIfRunning seal path — \
+         otherwise it is orphaned forever (no retention/GC pass on this backend)"
+    );
+}
+
 #[tokio::test]
 async fn failed_prior_terminate_if_running_starts_fresh_no_cancel_event() {
     let (_dir, path) = temp_db();
