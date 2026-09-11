@@ -925,12 +925,13 @@ impl BatchRuntime {
 /// at startup, forever.
 ///
 /// This closes that half of the gap: the process's own view of the active
-/// key catches up on a bounded cadence, same as a worker's. It does **not**
-/// close the other half -- `codec_rotation::activate_codec_key`'s
-/// capability scan reads `harvest_workers`, and a process with no local
-/// worker never has a row there, so it stays invisible to that scan. An
-/// operator whose API/scheduler-only processes must gate activation on
-/// their own capability needs a separate mechanism; none exists yet.
+/// key catches up on a bounded cadence, same as a worker's.
+///
+/// It does **not** close the other half. `codec_rotation::activate_codec_key`'s
+/// capability scan reads `harvest_workers`. A process with no local worker
+/// never has a row there, so it stays invisible to that scan. An operator
+/// whose API/scheduler-only processes must gate activation on their own
+/// capability needs a separate mechanism; none exists yet.
 struct CodecRefreshRuntime {
     cancel: CancellationToken,
     handle: JoinHandle<()>,
@@ -945,9 +946,22 @@ impl CodecRefreshRuntime {
         let cancel = CancellationToken::new();
         let cancel_for_task = cancel.clone();
         let handle = tokio::spawn(async move {
-            loop {
+            'outer: loop {
                 for (shard, pool) in sharded_pool.iter_shards() {
-                    match pool.get().await {
+                    // Selected against `cancel`, mirroring
+                    // `spawn_worker_heartbeat` (issue #1209). Harvest
+                    // configures no deadpool `Timeouts`, so a bare
+                    // `pool.get()` can park this task indefinitely on an
+                    // exhausted shard pool or a database outage. Without
+                    // this, `shutdown` cancels the token and then awaits
+                    // this task's handle, so a parked acquisition would
+                    // make an API- or scheduler-only `HarvestRunner::stop`
+                    // hang forever.
+                    let get_result = tokio::select! {
+                        () = cancel_for_task.cancelled() => break 'outer,
+                        result = pool.get() => result,
+                    };
+                    match get_result {
                         Ok(mut conn) => {
                             if let Err(error) =
                                 autumn_harvest::codec_rotation::refresh_active_codec_key(
