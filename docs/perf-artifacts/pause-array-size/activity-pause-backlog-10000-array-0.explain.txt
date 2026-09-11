@@ -1,6 +1,6 @@
 -- activity-pause: claim_task_query() @ backlog=10000, paused_activities array size=0 (ballast, 0% selectivity) --
 CTE Scan on claimed  (cost=441980.66..441980.68 rows=1 width=817) (actual rows=1 loops=1)
-  Buffers: shared hit=277 dirtied=5 written=3
+  Buffers: shared hit=274 dirtied=4 written=2
   CTE paused_queues
     ->  Aggregate  (cost=13.11..13.12 rows=1 width=32) (actual rows=1 loops=1)
           Buffers: shared hit=8
@@ -84,7 +84,7 @@ CTE Scan on claimed  (cost=441980.66..441980.68 rows=1 width=817) (actual rows=1
                       Filter: (LEAST(COALESCE(CASE WHEN (override_expires_at > now()) THEN override_burst ELSE NULL::double precision END, burst), ((tokens + ((GREATEST('0'::numeric, EXTRACT(epoch FROM (LEAST(COALESCE(override_expires_at, last_refilled_at), now()) - last_refilled_at))))::double precision * COALESCE(override_refill_rate, refill_rate))) + ((GREATEST('0'::numeric, EXTRACT(epoch FROM (now() - GREATEST(COALESCE(override_expires_at, last_refilled_at), last_refilled_at)))))::double precision * refill_rate))) >= '1'::double precision)
   CTE claimed
     ->  Update on harvest_task_queue harvest_task_queue_2  (cost=0.29..14.27 rows=1 width=123) (actual rows=1 loops=1)
-          Buffers: shared hit=277 dirtied=5 written=3
+          Buffers: shared hit=274 dirtied=4 written=2
           ->  Nested Loop  (cost=0.29..14.27 rows=1 width=123) (actual rows=1 loops=1)
                 Buffers: shared hit=256
                 ->  CTE Scan on candidate candidate_1  (cost=0.00..5.96 rows=1 width=56) (actual rows=1 loops=1)
@@ -101,8 +101,8 @@ CTE Scan on claimed  (cost=441980.66..441980.68 rows=1 width=817) (actual rows=1
                       Buffers: shared hit=3
 Planning:
   Buffers: shared hit=692 read=43
-Planning Time: 3.931 ms
+Planning Time: 4.600 ms
 JIT:
   Functions: 126
   Options: Inlining false, Optimization false, Expressions true, Deforming true
-Execution Time: 168.381 ms
+Execution Time: 2727.018 ms

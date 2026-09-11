@@ -5238,8 +5238,10 @@ async fn zz_capture_pause_array_size_claim_evidence() {
                 ),
             )
             .expect("write explain artifact");
+            // `paused_activities` reads the table unconditionally, so the
+            // materialized array size always equals the ballast seeded.
             summary_lines.push(format!(
-                "predicate=activity-pause array_size={size} backlog={backlog} {}",
+                "predicate=activity-pause ballast={size} array_size={size} backlog={backlog} {}",
                 sort_method
                     .as_deref()
                     .unwrap_or("Sort Method: (no Sort node)"),
@@ -5286,8 +5288,11 @@ async fn zz_capture_pause_array_size_claim_evidence() {
             ),
         )
         .expect("write explain artifact");
+        // `$2` never includes the seeded ballast names here. The
+        // materialized array size stays 0 regardless of ballast seeded.
+        // Unlike the other two sweeps, this is not the same number.
         summary_lines.push(format!(
-            "predicate=queue-pause-bound array_size={size} backlog={BACKLOG} {}",
+            "predicate=queue-pause-bound ballast={size} array_size=0 backlog={BACKLOG} {}",
             sort_method
                 .as_deref()
                 .unwrap_or("Sort Method: (no Sort node)"),
@@ -5344,8 +5349,10 @@ async fn zz_capture_pause_array_size_claim_evidence() {
             ),
         )
         .expect("write explain artifact");
+        // `$2` is wide enough here to include the ballast, so the
+        // materialized array size again equals the ballast seeded.
         summary_lines.push(format!(
-            "predicate=queue-pause-wide array_size={size} backlog={BACKLOG} {}",
+            "predicate=queue-pause-wide ballast={size} array_size={size} backlog={BACKLOG} {}",
             sort_method
                 .as_deref()
                 .unwrap_or("Sort Method: (no Sort node)"),

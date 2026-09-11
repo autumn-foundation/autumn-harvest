@@ -1693,8 +1693,9 @@ fn known_limitations_documents_the_pause_array_size_finding() {
 /// the same three fields the doc table is keyed by.
 struct SummaryRow {
     predicate: String,
-    array_size: u32,
+    ballast: u32,
     backlog: u32,
+    sort_method: String,
     disk_kb: Option<u32>,
 }
 
@@ -1714,14 +1715,24 @@ fn parse_summary_row(line: &str) -> SummaryRow {
             .parse()
             .unwrap_or_else(|_| panic!("could not parse a disk-kB figure out of: {line}"))
     });
+    let sort_method = line
+        .split("Sort Method: ")
+        .nth(1)
+        .unwrap_or_else(|| panic!("summary line missing `Sort Method: `: {line}"))
+        .split("  ")
+        .next()
+        .unwrap_or_else(|| panic!("summary line has no text after `Sort Method: `: {line}"))
+        .trim()
+        .to_string();
     SummaryRow {
         predicate: field_after(line, "predicate=").to_string(),
-        array_size: field_after(line, "array_size=")
+        ballast: field_after(line, "ballast=")
             .parse()
-            .unwrap_or_else(|_| panic!("could not parse array_size out of: {line}")),
+            .unwrap_or_else(|_| panic!("could not parse ballast out of: {line}")),
         backlog: field_after(line, "backlog=")
             .parse()
             .unwrap_or_else(|_| panic!("could not parse backlog out of: {line}")),
+        sort_method,
         disk_kb,
     }
 }
@@ -1733,6 +1744,7 @@ struct DocRow {
     predicate: String,
     backlog: u32,
     ballast_sizes: Vec<u32>,
+    sort_method: String,
     disk_kb: Option<u32>,
 }
 
@@ -1775,6 +1787,13 @@ fn parse_doc_row(line: &str) -> DocRow {
         })
         .collect();
 
+    let sort_method = sort_cell
+        .split(',')
+        .next()
+        .unwrap_or_else(|| panic!("sort-method cell has no comma-delimited method name: {line}"))
+        .trim()
+        .to_string();
+
     let sort_flat = sort_cell.replace(' ', "");
     let disk_kb = if sort_flat.contains("disk") {
         let idx = sort_flat
@@ -1801,6 +1820,7 @@ fn parse_doc_row(line: &str) -> DocRow {
         predicate,
         backlog,
         ballast_sizes,
+        sort_method,
         disk_kb,
     }
 }
@@ -1820,6 +1840,13 @@ fn parse_doc_row(line: &str) -> DocRow {
 /// This parses both the summary and the doc table into rows keyed by
 /// (predicate, ballast count, backlog). Each doc row is compared against
 /// its own matching summary row, not the document as one flat string.
+///
+/// A third round found this row-keyed version still reduced each row to
+/// only its spill classification and kB figure. A regenerated capture
+/// switching `quicksort` for another in-memory method, such as `top-N
+/// heapsort`, would still show `disk_kb: None` on both sides and pass.
+/// This also compares the sort method name itself, not only whether it
+/// spilled.
 #[test]
 fn pause_array_size_table_matches_the_committed_summary() {
     let doc = read_performance_doc();
@@ -1853,7 +1880,7 @@ fn pause_array_size_table_matches_the_committed_summary() {
         for ballast in &doc_row.ballast_sizes {
             doc_ballast_entries += 1;
             let key_desc = format!(
-                "predicate={} array_size={ballast} backlog={}",
+                "predicate={} ballast={ballast} backlog={}",
                 doc_row.predicate, doc_row.backlog
             );
             let (idx, summary_row) = summary_rows
@@ -1861,7 +1888,7 @@ fn pause_array_size_table_matches_the_committed_summary() {
                 .enumerate()
                 .find(|(_, s)| {
                     s.predicate == doc_row.predicate
-                        && s.array_size == *ballast
+                        && s.ballast == *ballast
                         && s.backlog == doc_row.backlog
                 })
                 .unwrap_or_else(|| {
@@ -1872,6 +1899,13 @@ fn pause_array_size_table_matches_the_committed_summary() {
                     )
                 });
             matched[idx] = true;
+            assert_eq!(
+                doc_row.sort_method, summary_row.sort_method,
+                "docs/performance.md's row for {key_desc} names sort method \
+                 {:?}, but the committed summary reports {:?} for this \
+                 exact row",
+                doc_row.sort_method, summary_row.sort_method
+            );
             match (doc_row.disk_kb, summary_row.disk_kb) {
                 (Some(doc_kb), Some(summary_kb)) => assert_eq!(
                     doc_kb, summary_kb,

@@ -104,5 +104,5 @@ CTE Scan on claimed  (cost=44238.15..44238.17 rows=1 width=817) (actual rows=1 l
                       Buffers: shared hit=3
 Planning:
   Buffers: shared hit=709 read=42
-Planning Time: 3.780 ms
-Execution Time: 2.657 ms
+Planning Time: 4.231 ms
+Execution Time: 2.987 ms
