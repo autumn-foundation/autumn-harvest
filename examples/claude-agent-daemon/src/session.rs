@@ -152,15 +152,27 @@ impl ToolOutcome {
 }
 
 /// The signal name that releases one specific tool call.
-pub fn approval_signal(call_id: &str) -> String {
-    format!("{SIGNAL_TOOL_APPROVAL}:{call_id}")
+///
+/// The name carries the turn and the position within it, not only the tool-use
+/// id. That makes it unique to ONE wait in the whole run, which matters for a
+/// decision that arrives late. A deadline that expires first is recorded ahead
+/// of the decision. The wait then resolves as a timeout, and the decision lands
+/// in history unconsumed. Under a name shared with a later wait, that stashed
+/// approval would release a call nobody reviewed. A name bound to its own
+/// occurrence can never be matched again.
+pub fn approval_signal(turn: u32, position: usize, call_id: &str) -> String {
+    format!("{SIGNAL_TOOL_APPROVAL}:{turn}:{position}:{call_id}")
 }
 
 /// The tool-use id one approval signal name releases.
 pub fn approval_call_id(signal_name: &str) -> Option<&str> {
-    signal_name
-        .strip_prefix(SIGNAL_TOOL_APPROVAL)?
-        .strip_prefix(':')
+    let mut parts = signal_name.splitn(4, ':');
+    if parts.next()? != SIGNAL_TOOL_APPROVAL {
+        return None;
+    }
+    parts.next()?;
+    parts.next()?;
+    parts.next()
 }
 
 /// The decision the CLI sends for an approval-gated tool call.
@@ -233,10 +245,10 @@ pub async fn agent_session(
         // user message. A split teaches the model to stop calling tools in
         // parallel, so the results are collected first and pushed together.
         let mut results = Vec::with_capacity(reply.tool_calls.len());
-        for call in reply.tool_calls {
+        for (position, call) in reply.tool_calls.into_iter().enumerate() {
             tool_calls += 1;
             let outcome = if tools::needs_approval(&call.name) {
-                gated_call(ctx, &task, &call).await?
+                gated_call(ctx, &task, turn, position, &call).await?
             } else {
                 run_tool_call(ctx, &task.workspace, &call).await?
             };
@@ -252,16 +264,19 @@ pub async fn agent_session(
 ///
 /// The wait races this call's own approval signal against a durable deadline
 /// timer. A missing decision denies the call, which keeps an unattended daemon
-/// moving. The signal name carries the tool-use id, so a decision meant for an
-/// earlier call cannot release this one.
+/// moving. The signal name identifies this one wait (see [`approval_signal`]).
+/// No decision meant for another call, or arriving too late for this one, can
+/// therefore release it.
 async fn gated_call(
     ctx: &WorkflowContext,
     task: &SessionTask,
+    turn: u32,
+    position: usize,
     call: &ToolCall,
 ) -> Result<ToolOutcome, String> {
     let decision: Option<ApprovalDecision> = ctx
         .receive_signal_timeout(
-            &approval_signal(&call.id),
+            &approval_signal(turn, position, &call.id),
             Duration::from_secs(task.approval_timeout_secs),
         )
         .await

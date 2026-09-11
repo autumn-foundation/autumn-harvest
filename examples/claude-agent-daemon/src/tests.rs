@@ -1354,3 +1354,43 @@ async fn a_workspace_path_that_cannot_be_written_down_is_refused() {
         "unexpected message: {message}"
     );
 }
+
+#[test]
+fn an_approval_signal_names_one_wait_and_only_that_wait() {
+    // A late decision is recorded in history behind its expired deadline, where
+    // it stays unconsumed. Under a name shared with a later wait it would
+    // release a call nobody reviewed. So the name carries the turn and the
+    // position as well as the tool-use id.
+    let first = session::approval_signal(1, 0, "toolu_a");
+    let same_call_later_turn = session::approval_signal(2, 0, "toolu_a");
+    let same_turn_later_call = session::approval_signal(1, 1, "toolu_a");
+
+    assert_ne!(
+        first, same_call_later_turn,
+        "a later turn must wait on its own name"
+    );
+    assert_ne!(
+        first, same_turn_later_call,
+        "a second call in one turn must wait on its own name"
+    );
+
+    // The operator still decides by tool-use id, so the name must give it back.
+    for name in [&first, &same_call_later_turn, &same_turn_later_call] {
+        assert_eq!(
+            session::approval_call_id(name),
+            Some("toolu_a"),
+            "the call id must survive the round trip: {name}"
+        );
+    }
+
+    // An id containing the separator still round-trips, and a name that is not
+    // an approval signal is not mistaken for one.
+    let odd = session::approval_signal(3, 4, "toolu:with:colons");
+    assert_eq!(
+        session::approval_call_id(&odd),
+        Some("toolu:with:colons"),
+        "the id is the remainder of the name"
+    );
+    assert_eq!(session::approval_call_id("something_else:1:0:x"), None);
+    assert_eq!(session::approval_call_id("tool_approval"), None);
+}
