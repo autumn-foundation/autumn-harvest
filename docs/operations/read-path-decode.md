@@ -160,22 +160,13 @@ Two attribution details:
   write-side integration) stored them. The read path decodes any envelope it
   finds and passes everything else through untouched.
 - Because the walk is envelope-driven, business data stored as plaintext that
-  happens to be byte-for-byte a codec envelope is transformed on the decoded
-  view: decoded when its `codec_id` is registered, replaced with an
-  `_harvest_undecodable` marker when not (see the provenance caveat above; the
-  stored bytes are never altered). Issue #1253 prevents this **for every value
-  written from that fix forward** — an entire payload field (`input`,
-  `output`, `details`, …) that collides with an envelope shape is escaped at
-  write time; see the ADR-0003 issue #1253 addendum. It does not fix a row
-  already written before that fix shipped: that remains exactly as ambiguous
-  as it always was, a documented residual risk, not something this read path
-  can retroactively disambiguate. A collision **nested inside** business
-  data, below the top level of a payload field, is a separate, narrower,
-  unchanged case: the engine never writes a nested envelope (or a nested
-  escape wrapper — the wrapper's two-key shape is deliberately hard for
-  business data to hit by accident) itself, so this residual case is a
-  read-path display quirk only, never something the rotation sweep can act on
-  or corrupt.
+  happens to be byte-for-byte a codec envelope — at any nesting depth — is
+  transformed on the decoded view: decoded when its `codec_id` is registered,
+  replaced with an `_harvest_undecodable` marker when not (see the provenance
+  caveat above; the stored bytes are never altered). Issue #1253 tracks this;
+  a write-time fix was attempted and reverted after CI showed it broke an
+  unrelated invariant (see the ADR-0003 issue #1253 addendum) — the collision
+  remains open.
 - Offload envelopes (`_harvest_offload_envelope`, issue #524) and erasure
   tombstones (`_harvest_erased`, issue #495) pass through untouched. In
   particular, decode-on-read never inflates offload refs: an offloaded field
