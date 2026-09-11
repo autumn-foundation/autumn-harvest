@@ -564,6 +564,8 @@ async fn each_gate_scenario_actually_seeds_its_trigger_column() {
             ClaimGate::RateLimited | ClaimGate::CircuitBreakerSet | ClaimGate::AllGates
         );
         let expect_paused = matches!(gate, ClaimGate::PausedRows | ClaimGate::AllGates);
+        let expect_many_queues = gate == ClaimGate::ManyQueuesPaused;
+        let expect_many_activities = gate == ClaimGate::ManyActivitiesPaused;
         // The equal-depth control seeds twice the claimable rows and nothing
         // else; every other gate seeds exactly one backlog of claimable rows.
         let expect_claimable = if gate == ClaimGate::DoubleBacklog {
@@ -605,6 +607,30 @@ async fn each_gate_scenario_actually_seeds_its_trigger_column() {
             census.build_compat_rows,
             i64::from(expect_build),
             "gate `{name}`: build-compat declaration census wrong ({census:?})",
+        );
+        assert_eq!(
+            census.queue_pause_rows,
+            if expect_many_queues { 200 } else { 0 }
+        );
+        assert_eq!(
+            census.activity_pause_rows,
+            if expect_many_activities { 200 } else { 0 }
+        );
+        assert_eq!(
+            census.queue_paused_tasks,
+            if expect_many_queues { want } else { 0 }
+        );
+        assert_eq!(
+            census.activity_paused_tasks,
+            if expect_many_activities { want } else { 0 }
+        );
+        assert_eq!(
+            census.matched_queue_pauses,
+            if expect_many_queues { 200 } else { 0 }
+        );
+        assert_eq!(
+            census.matched_activity_pauses,
+            if expect_many_activities { 200 } else { 0 }
         );
     }
 }

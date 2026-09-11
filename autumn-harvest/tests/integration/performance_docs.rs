@@ -1150,8 +1150,8 @@ fn the_all_gates_delta_is_not_published_as_a_predicate_bound() {
 /// The two overview files and the bench's own docs must not claim to price
 /// *every* claim-path predicate.
 ///
-/// The harness measures five. The other five — `schedule_to_close`, worker
-/// sessions, queue pauses, capability labels and sticky routing — are evaluated
+/// The harness measures seven. The other four — `schedule_to_close`, worker
+/// sessions, capability labels and sticky routing — are evaluated
 /// on every claim but sit on their cheapest null/empty path in every scenario
 /// here, so they are exercised rather than measured.
 ///
@@ -1189,17 +1189,30 @@ fn overview_docs_do_not_claim_complete_predicate_coverage() {
             assert!(
                 !asserted_in_own_voice(&text, banned),
                 "{rel} states \"{banned}\", claiming the benchmark prices every \
-                 claim-path predicate. It prices five of ten; the rest are \
+                 claim-path predicate. It prices seven of eleven; the rest are \
                  evaluated on their null/empty path and are not measured."
             );
         }
 
         assert!(
-            text.contains("five representative"),
-            "{rel} must say the benchmark attributes cost to five \
+            text.contains("seven representative"),
+            "{rel} must say the benchmark attributes cost to seven \
              *representative* predicates. Dropping the qualifier while \
              describing the gate breakdown reads as complete coverage."
         );
+    }
+}
+
+#[test]
+fn performance_docs_track_wide_pause_arrays() {
+    let doc = read_normalized(&repo_root().join("docs/performance.md"));
+    for required in [
+        "Issue #1215",
+        "ClaimGate::ManyQueuesPaused",
+        "ClaimGate::ManyActivitiesPaused",
+        "10,000-row surviving backlog",
+    ] {
+        assert!(doc.contains(required), "missing `{required}`");
     }
 }
 

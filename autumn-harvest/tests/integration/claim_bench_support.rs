@@ -57,15 +57,14 @@
 /// Which accreted claim-path gate a scenario exercises.
 ///
 /// `claim_task`'s `WHERE` clause has grown roughly a predicate per phase since
-/// 3.7. These variants let the benchmark attribute cost to **five** of them
+/// 3.7. These variants let the benchmark attribute cost to seven of them
 /// instead of reporting a single opaque number.
 ///
 /// Deliberately **not exhaustive**, and the gap is not visible from this list:
-/// capability labels (#382), queue pauses (#619), `schedule_to_close` (#378),
-/// worker sessions (#606) and sticky routing (#235) are all in the query on
-/// every claim, but `db::seed_backlog` leaves their columns null and nothing
-/// ever inserts a `harvest_queue_pauses` row, so those subplans only ever see
-/// empty or null input. They are evaluated, not measured — the cheapest path
+/// capability labels (#382), `schedule_to_close` (#378), worker sessions
+/// (#606) and sticky routing (#235) are all in the query on
+/// every claim, but `db::seed_backlog` leaves their columns null, so those
+/// predicates only see null input. They are evaluated, not measured — the cheapest path
 /// each of them has. Adding one means a seed variant *and* a report row; see
 /// the "Known limitations" section of `docs/performance.md`, which ranks them
 /// by how much the omission is likely to matter.
@@ -114,7 +113,13 @@ pub enum ClaimGate {
     /// see [`Self::DoubleBacklog`] for why the two scenarios sort different
     /// populations.
     PausedRows,
-    /// Every gate above at once.
+    /// Two hundred paused queues and one backlog each of held and claimable
+    /// rows. This tracks the array-width spill found in issue #1215.
+    ManyQueuesPaused,
+    /// Two hundred paused activities and one backlog each of held and
+    /// claimable rows. This tracks the array-width spill found in issue #1215.
+    ManyActivitiesPaused,
+    /// The original five gates at once. Wide-pause cases stay separate.
     ///
     /// Not a strict upper bound: the circuit-breaker tracked set short-circuits
     /// the rate-limit `EXISTS` and the debit CTE (`= ANY($5)` wins), so a
@@ -135,6 +140,8 @@ impl ClaimGate {
             Self::CircuitBreakerSet => "circuit_breaker_set",
             Self::DoubleBacklog => "double_backlog",
             Self::PausedRows => "paused_rows",
+            Self::ManyQueuesPaused => "many_queues_paused",
+            Self::ManyActivitiesPaused => "many_activities_paused",
             Self::AllGates => "all_gates",
         }
     }
@@ -143,7 +150,7 @@ impl ClaimGate {
     /// "baseline, then what each predicate adds". `DoubleBacklog` sits directly
     /// before `PausedRows` because it is that row's control.
     #[must_use]
-    pub const fn all() -> [Self; 8] {
+    pub const fn all() -> [Self; 10] {
         [
             Self::Baseline,
             Self::BuildPolicy,
@@ -152,14 +159,16 @@ impl ClaimGate {
             Self::CircuitBreakerSet,
             Self::DoubleBacklog,
             Self::PausedRows,
+            Self::ManyQueuesPaused,
+            Self::ManyActivitiesPaused,
             Self::AllGates,
         ]
     }
 
     /// Which gate a row's `vs` column should be measured against.
     ///
-    /// Every gate compares to `Baseline` except `PausedRows`, whose honest
-    /// comparand is the equal-total-depth [`Self::DoubleBacklog`] control.
+    /// Each pause-population scenario uses the equal-depth
+    /// [`Self::DoubleBacklog`] control. Other gates use `Baseline`.
     ///
     /// That pairing controls for table depth. It does **not** isolate the
     /// `NOT EXISTS` anti-join — see [`Self::DoubleBacklog`] — so a report
@@ -168,7 +177,9 @@ impl ClaimGate {
     #[must_use]
     pub const fn comparand(self) -> Self {
         match self {
-            Self::PausedRows => Self::DoubleBacklog,
+            Self::PausedRows | Self::ManyQueuesPaused | Self::ManyActivitiesPaused => {
+                Self::DoubleBacklog
+            }
             _ => Self::Baseline,
         }
     }
@@ -2803,11 +2814,16 @@ mod pure_tests {
         // comparand must be the equal-depth control.
         assert_eq!(ClaimGate::PausedRows.comparand(), ClaimGate::DoubleBacklog);
         for gate in ClaimGate::all() {
-            if gate != ClaimGate::PausedRows {
+            if !matches!(
+                gate,
+                ClaimGate::PausedRows
+                    | ClaimGate::ManyQueuesPaused
+                    | ClaimGate::ManyActivitiesPaused
+            ) {
                 assert_eq!(
                     gate.comparand(),
                     ClaimGate::Baseline,
-                    "{}: only paused_rows needs a non-baseline comparand",
+                    "{}: only equal-depth pause scenarios need a non-baseline comparand",
                     gate.as_str(),
                 );
             }
@@ -2823,6 +2839,8 @@ mod pure_tests {
         let before = names.len();
         names.dedup();
         assert_eq!(names.len(), before, "gate identifiers must be unique");
+        assert!(names.contains(&"many_queues_paused"));
+        assert!(names.contains(&"many_activities_paused"));
     }
 
     /// No cleanup here may reach for `DROP DATABASE ... WITH (FORCE)`.
@@ -3611,7 +3629,8 @@ pub mod db {
             conn,
             "TRUNCATE harvest_task_queue, harvest_workflow_executions, \
              harvest_rate_limit_buckets, harvest_build_compat, harvest_build_policies, \
-             harvest_workers, harvest_queue_pauses RESTART IDENTITY CASCADE",
+             harvest_workers, harvest_queue_pauses, harvest_activity_pauses \
+             RESTART IDENTITY CASCADE",
         )
         .await;
     }
@@ -3623,7 +3642,11 @@ pub mod db {
     /// Every queue a scenario spreads its backlog across.
     #[must_use]
     pub fn queue_names(scenario: Scenario) -> Vec<String> {
-        (0..scenario.queues.max(1)).map(queue_name).collect()
+        let mut names: Vec<_> = (0..scenario.queues.max(1)).map(queue_name).collect();
+        if scenario.gate == ClaimGate::ManyQueuesPaused {
+            names.extend((0..MANY_PAUSES).map(|i| format!("{BENCH_PREFIX}-paused-q-{i}")));
+        }
+        names
     }
 
     /// The build id the claiming worker advertises for this scenario.
@@ -3675,6 +3698,64 @@ pub mod db {
     /// the same number of table rows, and only `PausedRows` adds the anti-join.
     const fn wants_double_backlog(gate: ClaimGate) -> bool {
         matches!(gate, ClaimGate::DoubleBacklog)
+    }
+
+    const MANY_PAUSES: usize = 200;
+
+    async fn seed_many_pauses(
+        conn: &mut AsyncPgConnection,
+        gate: ClaimGate,
+        backlog: usize,
+        queues: usize,
+    ) {
+        let (table, column, prefix) = match gate {
+            ClaimGate::ManyQueuesPaused => (
+                "harvest_queue_pauses",
+                "queue_name",
+                format!("{BENCH_PREFIX}-paused-q-"),
+            ),
+            ClaimGate::ManyActivitiesPaused => (
+                "harvest_activity_pauses",
+                "activity_name",
+                format!("{BENCH_PREFIX}-paused-activity-"),
+            ),
+            _ => return,
+        };
+        exec(
+            conn,
+            &format!(
+                "INSERT INTO {table} ({column}, reason) \
+                 SELECT '{prefix}' || i, 'benchmark' \
+                 FROM generate_series(0, {}) AS s(i)",
+                MANY_PAUSES - 1
+            ),
+        )
+        .await;
+
+        let (queue_expr, activity_expr) = match gate {
+            ClaimGate::ManyQueuesPaused => (
+                format!("'{prefix}' || (i % {MANY_PAUSES})"),
+                format!("'{BENCH_ACTIVITY}'"),
+            ),
+            ClaimGate::ManyActivitiesPaused => (
+                format!("'{BENCH_PREFIX}-q-' || (i % {queues})"),
+                format!("'{prefix}' || (i % {MANY_PAUSES})"),
+            ),
+            _ => unreachable!(),
+        };
+        exec(
+            conn,
+            &format!(
+                "INSERT INTO harvest_task_queue \
+                   (queue_name, task_type, activity_name, activity_id, input, state, \
+                    priority, max_attempts, scheduled_at) \
+                 SELECT {queue_expr}, 'activity', {activity_expr}, gen_random_uuid(), \
+                        '{{}}'::jsonb, 'PENDING', 0, 3, NOW() - INTERVAL '1 second' \
+                 FROM generate_series(0, {}) AS s(i)",
+                backlog - 1
+            ),
+        )
+        .await;
     }
 
     /// Seed the worker fleet.
@@ -3846,9 +3927,18 @@ pub mod db {
             seed_paused_ballast(conn, backlog, queues).await;
             seeded_rows += backlog;
         }
+        if matches!(
+            gate,
+            ClaimGate::ManyQueuesPaused | ClaimGate::ManyActivitiesPaused
+        ) {
+            seed_many_pauses(conn, gate, backlog, queues).await;
+            seeded_rows += backlog;
+        }
 
         exec(conn, "ANALYZE harvest_task_queue").await;
         exec(conn, "ANALYZE harvest_workflow_executions").await;
+        exec(conn, "ANALYZE harvest_queue_pauses").await;
+        exec(conn, "ANALYZE harvest_activity_pauses").await;
 
         SeedOutcome {
             seeded_rows,
@@ -4516,6 +4606,18 @@ pub mod db {
         /// `harvest_build_compat` declarations, without which a build-routed
         /// claim would take the cheap equality leg instead of the `EXISTS`.
         pub build_compat_rows: i64,
+        /// Populated queue-pause array entries.
+        pub queue_pause_rows: i64,
+        /// Populated activity-pause array entries.
+        pub activity_pause_rows: i64,
+        /// Pending tasks matched by a queue pause.
+        pub queue_paused_tasks: i64,
+        /// Pending tasks matched by an activity pause.
+        pub activity_paused_tasks: i64,
+        /// Queue pauses represented in the held backlog.
+        pub matched_queue_pauses: i64,
+        /// Activity pauses represented in the held backlog.
+        pub matched_activity_pauses: i64,
         /// Pending rows *not* blocked by a PAUSED execution — i.e. the rows a
         /// claim can actually take. Load-bearing for the `double_backlog`
         /// control: if it silently seeded one backlog instead of two, it would
@@ -4569,12 +4671,57 @@ pub mod db {
                 "SELECT COUNT(*)::bigint AS n FROM harvest_build_compat",
             )
             .await,
+            queue_pause_rows: count(
+                conn,
+                "SELECT COUNT(*)::bigint AS n FROM harvest_queue_pauses",
+            )
+            .await,
+            activity_pause_rows: count(
+                conn,
+                "SELECT COUNT(*)::bigint AS n FROM harvest_activity_pauses",
+            )
+            .await,
+            queue_paused_tasks: count(
+                conn,
+                "SELECT COUNT(*)::bigint AS n FROM harvest_task_queue t \
+                 JOIN harvest_queue_pauses p ON p.queue_name = t.queue_name \
+                 WHERE t.state = 'PENDING'",
+            )
+            .await,
+            activity_paused_tasks: count(
+                conn,
+                "SELECT COUNT(*)::bigint AS n FROM harvest_task_queue t \
+                 JOIN harvest_activity_pauses p ON p.activity_name = t.activity_name \
+                 WHERE t.state = 'PENDING' AND t.task_type = 'activity'",
+            )
+            .await,
+            matched_queue_pauses: count(
+                conn,
+                "SELECT COUNT(DISTINCT p.queue_name)::bigint AS n \
+                 FROM harvest_queue_pauses p \
+                 JOIN harvest_task_queue t ON t.queue_name = p.queue_name \
+                 WHERE t.state = 'PENDING'",
+            )
+            .await,
+            matched_activity_pauses: count(
+                conn,
+                "SELECT COUNT(DISTINCT p.activity_name)::bigint AS n \
+                 FROM harvest_activity_pauses p \
+                 JOIN harvest_task_queue t ON t.activity_name = p.activity_name \
+                 WHERE t.state = 'PENDING' AND t.task_type = 'activity'",
+            )
+            .await,
             claimable_rows: count(
                 conn,
                 "SELECT COUNT(*)::bigint AS n FROM harvest_task_queue t \
                  LEFT JOIN harvest_workflow_executions e ON e.id = t.workflow_exec_id \
                  WHERE t.state = 'PENDING' \
-                   AND (e.id IS NULL OR e.state <> 'PAUSED')",
+                   AND (e.id IS NULL OR e.state <> 'PAUSED') \
+                   AND NOT EXISTS (SELECT 1 FROM harvest_queue_pauses qp \
+                                   WHERE qp.queue_name = t.queue_name) \
+                   AND (t.task_type <> 'activity' OR t.activity_name IS NULL OR \
+                        NOT EXISTS (SELECT 1 FROM harvest_activity_pauses ap \
+                                    WHERE ap.activity_name = t.activity_name))",
             )
             .await,
         }

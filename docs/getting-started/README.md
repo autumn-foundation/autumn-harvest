@@ -81,8 +81,8 @@ Start with [Chapter 1 →](01-project-skeleton.md)
   from one API call, CLI command, or Vantage panel instead of correlating by
   `execution_id` in a log aggregator.
 - **Performance.** [`performance.md`](../performance.md) publishes measured
-  task-claim and enqueue baselines, attributes cost to five representative
-  claim-path predicates (five others are evaluated on every claim but left on
+  task-claim and enqueue baselines, attributes cost to seven representative
+  claim-path predicates (four others are evaluated on every claim but left on
   their cheapest null/empty path, so they are not measured — the page names
   them), and explains the CI-gated budget — read it before deciding whether a
   deep backlog means you need another shard.
