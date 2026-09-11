@@ -512,6 +512,179 @@ async fn a_fenced_worker_cannot_re_encrypt_history() {
 }
 
 #[tokio::test]
+async fn a_fenced_worker_cannot_advance_the_rotation_cursor() {
+    // Sibling to `a_fenced_worker_cannot_re_encrypt_history` (issue #1257).
+    // Before this fix, `write_cursor` had no fence check of its own. Even
+    // while the per-row CAS correctly refused to touch `harvest_events`,
+    // the sweep still reached `write_cursor`. It recorded progress past a
+    // row it was fenced away from. A worker pinned to a superseded
+    // generation must not record any rotation progress at all.
+    let _serial = registry_guard().await;
+    let (url, _db) = require_db!("rotate_cursor");
+    let mut conn = connect(&url).await;
+    ensure_generation_row(&mut conn, ShardId::new(0))
+        .await
+        .unwrap();
+
+    let exec_id = ExecutionId::new_for_shard(ShardId::new(0));
+    diesel::sql_query(
+        "INSERT INTO harvest_workflow_executions \
+             (id, workflow_name, workflow_id, state, input, shard_id) \
+         VALUES ($1, 'wf', 'rotate-cursor-1', 'RUNNING', '{}'::jsonb, 0)",
+    )
+    .bind::<diesel::sql_types::Uuid, _>(exec_id.as_uuid())
+    .execute(&mut conn)
+    .await
+    .unwrap();
+
+    // A history row encoded under `k1`, with `k2` now active: exactly what
+    // the sweep exists to convert.
+    let codecs = autumn_harvest::payload_codec::PayloadCodecs::default();
+    codecs
+        .register_key("k1", std::sync::Arc::new(DrXorCodec(0x5a)))
+        .unwrap();
+    codecs
+        .register_key("k2", std::sync::Arc::new(DrXorCodec(0x33)))
+        .unwrap();
+    codecs.set_active_key("k1").unwrap();
+    let encoded = codecs
+        .encode_payload(&serde_json::json!({"secret": "value"}))
+        .unwrap();
+    diesel::sql_query(
+        "INSERT INTO harvest_events (workflow_exec_id, event_id, event_type, event_data) \
+         VALUES ($1, 0, 'WorkflowStarted', $2)",
+    )
+    .bind::<diesel::sql_types::Uuid, _>(exec_id.as_uuid())
+    .bind::<diesel::sql_types::Jsonb, _>(serde_json::json!({
+        "type": "WorkflowStarted",
+        "data": {"input": encoded, "timestamp": "2026-08-31T00:00:00Z"}
+    }))
+    .execute(&mut conn)
+    .await
+    .unwrap();
+    codecs.set_active_key("k2").unwrap();
+
+    // This worker is pinned to generation 0; the region has been promoted
+    // past it.
+    FenceRegistry::clear();
+    FenceRegistry::register(ShardId::new(0), ShardGeneration::new(0));
+    FenceRegistry::set_default_shard(ShardId::new(0));
+    bump_generation(&mut conn, ShardId::new(0), "promote", "oncall")
+        .await
+        .unwrap();
+
+    let _ = autumn_harvest::codec_rotation::sweep_codec_reencryption_once(
+        &mut conn,
+        0,
+        &codecs,
+        100,
+        &NoOpMetrics,
+    )
+    .await;
+
+    #[derive(diesel::QueryableByName)]
+    struct Count {
+        #[diesel(sql_type = diesel::sql_types::BigInt)]
+        n: i64,
+    }
+    let rows: Vec<Count> =
+        diesel::sql_query("SELECT COUNT(*) AS n FROM harvest_codec_rotation_cursor")
+            .load(&mut conn)
+            .await
+            .unwrap();
+    assert_eq!(
+        rows[0].n, 0,
+        "a fenced worker must not record rotation progress it was fenced away from"
+    );
+    FenceRegistry::clear();
+}
+
+#[tokio::test]
+async fn a_fenced_sweep_that_converts_nothing_still_fails_closed() {
+    // Sibling to `a_fenced_worker_cannot_re_encrypt_history` (issue #1257,
+    // acceptance criterion: a sweep batch that converts no rows must still
+    // fail closed under a stale fence). A batch with nothing to convert
+    // never calls the per-row fenced CAS at all. `write_cursor` and
+    // `claim_completed_cursor_revalidation` are the only writes left on
+    // this path, so they are the only guard against a stale worker
+    // recording progress.
+    //
+    // The cursor here is already complete and due for revalidation. An
+    // unfenced worker would also win `claim_completed_cursor_revalidation`
+    // and bump `updated_at` even though it converted nothing.
+    let _serial = registry_guard().await;
+    let (url, _db) = require_db!("rotate_cursor_empty");
+    let mut conn = connect(&url).await;
+    ensure_generation_row(&mut conn, ShardId::new(0))
+        .await
+        .unwrap();
+
+    diesel::sql_query(
+        "INSERT INTO harvest_codec_rotation_cursor \
+             (shard_id, active_key_id, last_event_id, rows_reencrypted, \
+              unresolved_rows, completed_at, updated_at) \
+         VALUES (0, 'k2', 0, 0, 0, NOW() - interval '1 hour', \
+                 NOW() - interval '1 hour')",
+    )
+    .execute(&mut conn)
+    .await
+    .unwrap();
+
+    let codecs = autumn_harvest::payload_codec::PayloadCodecs::default();
+    codecs
+        .register_key("k2", std::sync::Arc::new(DrXorCodec(0x33)))
+        .unwrap();
+    codecs.set_active_key("k2").unwrap();
+
+    // This worker is pinned to generation 0; the region has been promoted
+    // past it.
+    FenceRegistry::clear();
+    FenceRegistry::register(ShardId::new(0), ShardGeneration::new(0));
+    FenceRegistry::set_default_shard(ShardId::new(0));
+    bump_generation(&mut conn, ShardId::new(0), "promote", "oncall")
+        .await
+        .unwrap();
+
+    let _ = autumn_harvest::codec_rotation::sweep_codec_reencryption_once(
+        &mut conn,
+        0,
+        &codecs,
+        100,
+        &NoOpMetrics,
+    )
+    .await;
+
+    #[derive(diesel::QueryableByName)]
+    struct Row {
+        #[diesel(sql_type = diesel::sql_types::BigInt)]
+        last_event_id: i64,
+        #[diesel(sql_type = diesel::sql_types::Timestamptz)]
+        updated_at: chrono::DateTime<chrono::Utc>,
+    }
+    let rows: Vec<Row> = diesel::sql_query(
+        "SELECT last_event_id, updated_at FROM harvest_codec_rotation_cursor \
+         WHERE shard_id = 0",
+    )
+    .load(&mut conn)
+    .await
+    .unwrap();
+    assert_eq!(
+        rows.len(),
+        1,
+        "the pre-existing cursor row must survive untouched"
+    );
+    assert_eq!(
+        rows[0].last_event_id, 0,
+        "a fenced worker must not advance a cursor it examined nothing under"
+    );
+    assert!(
+        rows[0].updated_at < chrono::Utc::now() - chrono::Duration::minutes(30),
+        "a fenced worker must not win the revalidation claim and bump updated_at"
+    );
+    FenceRegistry::clear();
+}
+
+#[tokio::test]
 async fn a_fenced_worker_cannot_backfill_quota_keys() {
     // The quota_key backfill reconciler (issue #1226, follow-up to #946)
     // is a second module that UPDATEs `harvest_workflow_executions`

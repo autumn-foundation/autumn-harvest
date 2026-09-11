@@ -337,7 +337,7 @@ pub const CODEC_ROTATION_DEFAULT_BATCH: i64 = 200;
 pub use db::{
     CodecRotationCursor, FleetWriteFence, ShardRotationProgress, compare_and_swap_event,
     count_rows_by_key_id, load_shard_rotation_progress, load_shard_rotation_progress_against,
-    retire_codec_key, sweep_codec_reencryption, sweep_codec_reencryption_once,
+    retire_codec_key, sweep_codec_reencryption, sweep_codec_reencryption_once, write_cursor,
 };
 
 #[cfg(feature = "db")]
@@ -714,6 +714,7 @@ mod db {
         if !cursor_table_present(conn).await? {
             return Ok(0);
         }
+        let shard = crate::types::ShardId::new(shard_id);
         // Resolve the target key ONCE for the whole batch. Every row is
         // re-encoded under this exact key id, so a concurrent `set_active_key`
         // cannot straddle a row, and the progress we file below is attributed to
@@ -759,15 +760,7 @@ mod db {
             let mut candidate = original.clone();
             match reencrypt_event_payload_fields_under(codecs, &active_key_id, &mut candidate) {
                 Ok(outcome) if outcome.changed() => {
-                    if compare_and_swap_event(
-                        conn,
-                        crate::types::ShardId::new(shard_id),
-                        row.id,
-                        &original,
-                        &candidate,
-                    )
-                    .await?
-                    {
+                    if compare_and_swap_event(conn, shard, row.id, &original, &candidate).await? {
                         rewritten += 1;
                     } else {
                         // The row changed under us — a PII erasure, or another
@@ -854,7 +847,7 @@ mod db {
         // that commits below the cursor is only ever found this way.
         let census_needed = if reached_end && unresolved_total == 0 {
             if already_complete {
-                claim_completed_cursor_revalidation(conn, shard_id).await?
+                claim_completed_cursor_revalidation(conn, shard).await?
             } else {
                 true
             }
@@ -931,7 +924,7 @@ mod db {
         if !cursor_unchanged {
             write_cursor(
                 conn,
-                shard_id,
+                shard,
                 &active_key_id,
                 next_last_event_id,
                 rows_reencrypted_total,
@@ -1026,13 +1019,6 @@ mod db {
         Ok(updated > 0)
     }
 
-    /// Persist the pass's absolute state.
-    ///
-    /// Absolute rather than incremental (`SET x = x + n`) because the values are
-    /// computed from a read this same call made: only one scanner per shard runs
-    /// this, and a second one racing it simply overwrites with its own
-    /// consistent view rather than compounding two partial increments onto a
-    /// row whose meaning it never read.
     /// Atomically claim the right to re-census a completed shard.
     ///
     /// Returns `true` for the ONE caller that wins the interval.
@@ -1062,7 +1048,31 @@ mod db {
     /// the interval is a rate limit on an expensive scan, not a lease on
     /// completing it. A crash mid-census costs one skipped revalidation, which
     /// the next interval picks up.
+    ///
+    /// ## Fencing (issue #954, issue #1257)
+    ///
+    /// Fenced the same way as [`write_cursor`]. Claiming the interval writes
+    /// `updated_at`, so a worker pinned to a superseded generation must not
+    /// be the one who wins the claim.
     async fn claim_completed_cursor_revalidation(
+        conn: &mut AsyncPgConnection,
+        shard: crate::types::ShardId,
+    ) -> HarvestResult<bool> {
+        use diesel_async::AsyncConnection as _;
+
+        if crate::replication::FenceRegistry::is_enabled() {
+            return Box::pin(
+                conn.transaction::<bool, HarvestError, _>(async move |conn| {
+                    crate::replication::assert_fence(conn, shard).await?;
+                    claim_completed_cursor_revalidation_statement(conn, shard.as_i32()).await
+                }),
+            )
+            .await;
+        }
+        claim_completed_cursor_revalidation_statement(conn, shard.as_i32()).await
+    }
+
+    async fn claim_completed_cursor_revalidation_statement(
         conn: &mut AsyncPgConnection,
         shard_id: i32,
     ) -> HarvestResult<bool> {
@@ -1081,7 +1091,93 @@ mod db {
         Ok(claimed > 0)
     }
 
-    async fn write_cursor(
+    /// Persist the pass's absolute state.
+    ///
+    /// The value is absolute, not incremental (`SET x = x + n`), because it
+    /// comes from one read this same call already did.
+    ///
+    /// ## The write is a compare-and-swap (issue #1257)
+    ///
+    /// Two sweepers can read the same cursor row and each compute their own
+    /// next state from it. The write that commits last must not silently
+    /// overwrite a fresher one -- a lost update moves the cursor backward or
+    /// drops rows from `rows_reencrypted`.
+    ///
+    /// The `WHERE` clause on `DO UPDATE` guards against that. It applies the
+    /// write only when the new `last_event_id` and `rows_reencrypted` are
+    /// each at least the stored value, for the same `active_key_id`. A write
+    /// computed from a stale read fails this check and is dropped, not
+    /// applied -- mirroring [`compare_and_swap_event`] for `harvest_events`.
+    ///
+    /// Two writes always apply, by design:
+    /// - A different `active_key_id` starts a fresh pass. Its
+    ///   `last_event_id` is not comparable to the previous key's.
+    /// - `last_event_id = 0` is the deliberate rewind a pass takes when it
+    ///   leaves rows unresolved (see `sweep_codec_reencryption_once`). That
+    ///   reset must stay possible, even over a higher stored value.
+    ///
+    /// ## Fencing (issue #954, issue #1257)
+    ///
+    /// Fenced the same way as [`compare_and_swap_event`]. When
+    /// [`crate::replication::FenceRegistry::is_enabled`] holds, the write
+    /// runs inside a transaction behind [`crate::replication::assert_fence`].
+    /// A worker pinned to a superseded generation cannot advance the cursor
+    /// this way -- including a batch that converted no rows and so never
+    /// reached the per-row CAS. The fence check is skipped when fencing is
+    /// off: one statement, no extra round trip.
+    ///
+    /// `#[doc(hidden)] pub` so the CAS is directly testable by an
+    /// integration test. Not part of the engine's stable API.
+    ///
+    /// # Errors
+    ///
+    /// Propagates database failures, and
+    /// [`crate::error::HarvestError::ShardFenced`] when this process is
+    /// pinned to a superseded generation.
+    #[doc(hidden)]
+    pub async fn write_cursor(
+        conn: &mut AsyncPgConnection,
+        shard: crate::types::ShardId,
+        active_key_id: &str,
+        last_event_id: i64,
+        rows_reencrypted: i64,
+        unresolved_rows: i64,
+        completed_at: Option<DateTime<Utc>>,
+    ) -> HarvestResult<bool> {
+        use diesel_async::AsyncConnection as _;
+
+        if crate::replication::FenceRegistry::is_enabled() {
+            let active_key_id = active_key_id.to_string();
+            return Box::pin(
+                conn.transaction::<bool, HarvestError, _>(async move |conn| {
+                    crate::replication::assert_fence(conn, shard).await?;
+                    write_cursor_statement(
+                        conn,
+                        shard.as_i32(),
+                        &active_key_id,
+                        last_event_id,
+                        rows_reencrypted,
+                        unresolved_rows,
+                        completed_at,
+                    )
+                    .await
+                }),
+            )
+            .await;
+        }
+        write_cursor_statement(
+            conn,
+            shard.as_i32(),
+            active_key_id,
+            last_event_id,
+            rows_reencrypted,
+            unresolved_rows,
+            completed_at,
+        )
+        .await
+    }
+
+    async fn write_cursor_statement(
         conn: &mut AsyncPgConnection,
         shard_id: i32,
         active_key_id: &str,
@@ -1089,8 +1185,8 @@ mod db {
         rows_reencrypted: i64,
         unresolved_rows: i64,
         completed_at: Option<DateTime<Utc>>,
-    ) -> HarvestResult<()> {
-        diesel::sql_query(
+    ) -> HarvestResult<bool> {
+        let applied = diesel::sql_query(
             "INSERT INTO harvest_codec_rotation_cursor \
                  (shard_id, active_key_id, last_event_id, rows_reencrypted, unresolved_rows, \
                   completed_at, updated_at) \
@@ -1101,7 +1197,12 @@ mod db {
                  rows_reencrypted = EXCLUDED.rows_reencrypted, \
                  unresolved_rows = EXCLUDED.unresolved_rows, \
                  completed_at = EXCLUDED.completed_at, \
-                 updated_at = NOW()",
+                 updated_at = NOW() \
+             WHERE harvest_codec_rotation_cursor.active_key_id <> EXCLUDED.active_key_id \
+                OR EXCLUDED.last_event_id = 0 \
+                OR (harvest_codec_rotation_cursor.last_event_id <= EXCLUDED.last_event_id \
+                    AND harvest_codec_rotation_cursor.rows_reencrypted \
+                        <= EXCLUDED.rows_reencrypted)",
         )
         .bind::<Integer, _>(shard_id)
         .bind::<Text, _>(active_key_id)
@@ -1112,7 +1213,14 @@ mod db {
         .execute(conn)
         .await
         .map_err(database_error)?;
-        Ok(())
+        if applied == 0 {
+            tracing::debug!(
+                shard_id,
+                "codec rotation cursor write dropped: a newer pass already advanced this \
+                 shard's cursor"
+            );
+        }
+        Ok(applied > 0)
     }
 
     /// Run one sweep batch for the shard this connection already serves

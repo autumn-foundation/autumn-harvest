@@ -41,7 +41,7 @@ use std::sync::{Arc, Mutex};
 
 use autumn_harvest::codec_rotation::{
     FleetWriteFence, load_shard_rotation_progress, load_shard_rotation_progress_against,
-    retire_codec_key, sweep_codec_reencryption_once,
+    retire_codec_key, sweep_codec_reencryption_once, write_cursor,
 };
 use autumn_harvest::erase::erasure_tombstone;
 use autumn_harvest::error::HarvestError;
@@ -279,6 +279,46 @@ async fn cursor_row_count(conn: &mut AsyncPgConnection) -> i64 {
             .await
             .expect("count cursor rows");
     row.n
+}
+
+/// A shard's raw cursor row, unfiltered by active key.
+///
+/// [`load_shard_rotation_progress`] only reports a cursor that matches the
+/// caller's active key. A CAS test needs the stored row regardless of which
+/// key it names, so it reads the table directly instead.
+struct CursorSnapshot {
+    active_key_id: String,
+    last_event_id: i64,
+    rows_reencrypted: i64,
+    unresolved_rows: i64,
+}
+
+async fn cursor_row(conn: &mut AsyncPgConnection, shard_id: i32) -> Option<CursorSnapshot> {
+    #[derive(diesel::QueryableByName)]
+    struct Row {
+        #[diesel(sql_type = diesel::sql_types::Text)]
+        active_key_id: String,
+        #[diesel(sql_type = diesel::sql_types::BigInt)]
+        last_event_id: i64,
+        #[diesel(sql_type = diesel::sql_types::BigInt)]
+        rows_reencrypted: i64,
+        #[diesel(sql_type = diesel::sql_types::BigInt)]
+        unresolved_rows: i64,
+    }
+    let rows: Vec<Row> = diesel::sql_query(
+        "SELECT active_key_id, last_event_id, rows_reencrypted, unresolved_rows \
+         FROM harvest_codec_rotation_cursor WHERE shard_id = $1",
+    )
+    .bind::<diesel::sql_types::Integer, _>(shard_id)
+    .load(conn)
+    .await
+    .expect("load cursor row");
+    rows.into_iter().next().map(|r| CursorSnapshot {
+        active_key_id: r.active_key_id,
+        last_event_id: r.last_event_id,
+        rows_reencrypted: r.rows_reencrypted,
+        unresolved_rows: r.unresolved_rows,
+    })
 }
 
 fn kid_of(event_data: &Value, field: &str) -> Option<String> {
@@ -2065,4 +2105,108 @@ async fn a_completed_cursor_advances_over_rows_it_has_examined() {
         after.completed_at.is_some(),
         "advancing over already-converted rows must not un-complete the pass"
     );
+}
+
+// ── issue #1257: the cursor write is a compare-and-swap ──────────────────────
+
+#[tokio::test]
+async fn a_stale_cursor_write_cannot_overwrite_newer_progress() {
+    // Two sweepers can read the same cursor row and each compute their own
+    // next state from it. Without a guard, whichever write commits last wins
+    // outright, even when it started from an older read. The cursor then
+    // moves backward and `rows_reencrypted` can decrease -- the race issue
+    // #1257 reports.
+    //
+    // Exercised directly against `write_cursor`, the same way
+    // `a_stale_read_can_never_overwrite_a_committed_erasure` exercises
+    // `compare_and_swap_event` directly: the batch-oriented sweep entry
+    // point runs single-threaded on one connection and cannot express two
+    // writers racing the same read.
+    let (url, _c) = setup_isolated_db().await;
+    let mut conn = connect(&url).await;
+    let shard = ShardId::new(0);
+
+    // The baseline both sweepers read: last_event_id 100, 50 rows converted.
+    let applied = write_cursor(&mut conn, shard, "k2", 100, 50, 0, None)
+        .await
+        .expect("baseline write");
+    assert!(applied, "an insert with no prior row must always apply");
+
+    // The winner commits progress computed from that baseline first.
+    let applied = write_cursor(&mut conn, shard, "k2", 200, 60, 0, None)
+        .await
+        .expect("winner write");
+    assert!(applied, "a forward write over the row it read must apply");
+
+    // The loser also read the 100 / 50 baseline, and only now commits its
+    // own, smaller, progress.
+    let applied = write_cursor(&mut conn, shard, "k2", 150, 55, 0, None)
+        .await
+        .expect("stale write");
+    assert!(
+        !applied,
+        "a write computed from a stale read must be dropped, not applied"
+    );
+
+    let cursor = cursor_row(&mut conn, 0).await.expect("cursor row");
+    assert_eq!(
+        cursor.last_event_id, 200,
+        "the cursor must not move backward"
+    );
+    assert_eq!(
+        cursor.rows_reencrypted, 60,
+        "the rewrite total must not decrease"
+    );
+}
+
+#[tokio::test]
+async fn a_deliberate_rewind_to_zero_always_applies() {
+    // `last_event_id = 0` is the deliberate reset a pass takes when it
+    // leaves rows unresolved (see `sweep_codec_reencryption_once`). The CAS
+    // guard must not mistake that reset for a stale write and drop it, even
+    // over a stored value that is higher.
+    let (url, _c) = setup_isolated_db().await;
+    let mut conn = connect(&url).await;
+    let shard = ShardId::new(0);
+
+    let applied = write_cursor(&mut conn, shard, "k2", 500, 40, 0, None)
+        .await
+        .expect("baseline write");
+    assert!(applied, "the baseline write must apply");
+
+    let applied = write_cursor(&mut conn, shard, "k2", 0, 40, 3, None)
+        .await
+        .expect("rewind write");
+    assert!(applied, "a rewind to last_event_id = 0 must always apply");
+
+    let cursor = cursor_row(&mut conn, 0).await.expect("cursor row");
+    assert_eq!(cursor.last_event_id, 0);
+    assert_eq!(cursor.unresolved_rows, 3);
+}
+
+#[tokio::test]
+async fn a_new_active_key_always_starts_a_fresh_pass() {
+    // A cursor recorded against a different key belongs to a different pass
+    // entirely. Its `last_event_id` is not comparable to the new key's, so a
+    // fresh pass must apply even when its `last_event_id` reads lower than
+    // the old key's.
+    let (url, _c) = setup_isolated_db().await;
+    let mut conn = connect(&url).await;
+    let shard = ShardId::new(0);
+
+    write_cursor(&mut conn, shard, "k1", 900, 80, 0, None)
+        .await
+        .expect("k1 pass write");
+
+    let applied = write_cursor(&mut conn, shard, "k2", 10, 1, 0, None)
+        .await
+        .expect("k2 pass write");
+    assert!(
+        applied,
+        "a cursor write for a different active key must always apply"
+    );
+
+    let cursor = cursor_row(&mut conn, 0).await.expect("cursor row");
+    assert_eq!(cursor.active_key_id, "k2");
+    assert_eq!(cursor.last_event_id, 10);
 }
