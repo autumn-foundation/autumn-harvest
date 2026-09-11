@@ -1338,6 +1338,76 @@ async fn sse_stream_emits_decoded_frames_and_writes_decode_audit_at_open() {
     assert_eq!(audit[0].0.as_deref(), Some(exec_id.to_string().as_str()));
 }
 
+/// Issue #1458: the terminal `stream-end` block must match
+/// `docs/management-api.md`'s "Terminal marker" section. That section shows
+/// an `id:` line and a `data` object with `reason`, `execution_id`, and
+/// `state`. Today's code sends only `reason`, with no `id:` line.
+#[tokio::test]
+async fn sse_stream_end_block_carries_id_execution_id_and_state() {
+    let (url, _container) = setup_database().await;
+    let pool = build_pool(&url);
+    let app = build_app_with(
+        &pool,
+        &AppConfig {
+            admin: true,
+            codecs: false,
+            decode_on_read: false,
+            notification_url: Some(&url),
+        },
+    );
+    let mut conn = AsyncPgConnection::establish(&url).await.unwrap();
+
+    let exec_id = seed_running(&mut conn, "sse-terminal-marker", json!({})).await;
+    append_events(
+        &mut conn,
+        exec_id,
+        &[WorkflowEvent::WorkflowCompleted {
+            output: json!(null),
+        }],
+    )
+    .await;
+    mark_completed(&mut conn, exec_id, json!(null)).await;
+
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri(format!("/executions/{exec_id}/events/stream"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .expect("open SSE stream");
+    assert_eq!(response.status(), StatusCode::OK);
+    let bytes = tokio::time::timeout(
+        std::time::Duration::from_secs(30),
+        axum::body::to_bytes(response.into_body(), usize::MAX),
+    )
+    .await
+    .expect("terminal execution's stream must close after backfill")
+    .expect("read SSE body");
+    let stream_text = String::from_utf8_lossy(&bytes);
+
+    let end_block = stream_text
+        .split("\n\n")
+        .find(|block| block.contains("event: stream-end"))
+        .unwrap_or_else(|| panic!("no stream-end block in: {stream_text}"));
+
+    assert!(
+        end_block.trim_start().starts_with("id: "),
+        "stream-end block must start with an id: line: {end_block}"
+    );
+    assert!(
+        end_block.contains(&format!("\"execution_id\":\"{exec_id}\"")),
+        "stream-end data must carry execution_id: {end_block}"
+    );
+    assert!(
+        end_block.contains("\"state\":\"COMPLETED\""),
+        "stream-end data must carry the raw state: {end_block}"
+    );
+}
+
 /// AC6: decode-only-when-admin. On an ungated route, a non-admin caller
 /// (flag on, no session) receives today's bytes — the stored ciphertext.
 #[tokio::test]
