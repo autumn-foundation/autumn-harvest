@@ -254,19 +254,28 @@ fn local_iteration_example_is_scoped_to_chaos_tests_module() {
 /// `--test integration_tests`. It can also match `flag` glued onto a
 /// preceding token: inside `test--test integration`. That second shape
 /// is one malformed shell argument, not a real flag. Requires a
-/// boundary -- whitespace, `\`, or start/end of string -- on both sides
-/// of `flag`. Keeps searching past a false match instead of accepting
-/// the first substring hit.
+/// boundary on both sides of `flag`. Keeps searching past a false match
+/// instead of accepting the first substring hit.
+///
+/// A lone `\` right before `flag` is not a real boundary. Bash only
+/// treats `\` as a separator inside a `\` + newline continuation, never
+/// alone. `cargo test\--test integration` is one glued argument, not a
+/// real flag, even though a `\` sits right before it. The boundary
+/// before `flag` must be plain whitespace, or the exact two-character
+/// `\` + newline ending of a real continuation.
 fn find_flag_end(command: &str, flag: &str) -> Option<usize> {
-    let is_boundary = |c: char| c.is_whitespace() || c == '\\';
+    let before_ok = |prefix: &str| match prefix.chars().next_back() {
+        None => true,
+        Some('\n') => prefix.ends_with("\\\n"),
+        Some(c) => c.is_whitespace(),
+    };
+    let after_ok = |c: char| c.is_whitespace() || c == '\\';
     let mut search_from = 0;
     loop {
         let rel = command[search_from..].find(flag)?;
         let start = search_from + rel;
         let end = start + flag.len();
-        let before_ok = command[..start].chars().next_back().is_none_or(is_boundary);
-        let after_ok = command[end..].chars().next().is_none_or(is_boundary);
-        if before_ok && after_ok {
+        if before_ok(&command[..start]) && command[end..].chars().next().is_none_or(after_ok) {
             return Some(end);
         }
         search_from = end;
@@ -281,6 +290,15 @@ fn find_flag_end(command: &str, flag: &str) -> Option<usize> {
 /// with no filter at all. Treating that newline as skippable whitespace
 /// would let this guard extract a filter that could never actually run,
 /// masking exactly that regression.
+///
+/// Known, accepted limitation: chaos.yml's `run:` value is a single
+/// physical line today, never a folded YAML block scalar. A folded
+/// `>-` scalar would fold its source newlines into spaces before the
+/// shell ever runs it. This function cannot see that folding -- it
+/// only sees the raw file text. A future folded `run:` would panic
+/// here even though the folded command is valid. That is an accepted
+/// trade-off: failing loud on an unsupported format beats silently
+/// accepting a broken one.
 fn skip_continuation_gap(s: &str) -> &str {
     let mut rest = s;
     loop {
@@ -375,6 +393,17 @@ fn extract_filter_argument_requires_a_boundary_before_the_flag() {
     // one malformed shell argument, not a real `--test` flag. The guard
     // must not accept it just because a boundary follows the match.
     extract_filter_argument("cargo test--test integration chaos_tests::");
+}
+
+#[test]
+#[should_panic(expected = "command has no")]
+fn extract_filter_argument_rejects_a_lone_backslash_glued_to_the_flag() {
+    // Codex finding on PR #1474: if a doc continuation after `cargo
+    // test\` loses only its trailing newline, the source becomes `cargo
+    // test\--test integration ...`. Bash never treats a lone `\` as a
+    // separator, only `\` immediately followed by a newline. The guard
+    // must not accept the stray backslash as a boundary either.
+    extract_filter_argument("cargo test\\--test integration chaos_tests::");
 }
 
 #[test]

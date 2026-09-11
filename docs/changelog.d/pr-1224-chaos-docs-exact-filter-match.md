@@ -90,10 +90,28 @@ issue #1202 as P2 round 4).
   results panics, exactly matching what the real shell would do. Both
   are fixture tests, confirmed against a glued-flag case and a
   dropped-backslash case.
+- A fifth Codex round found the mirror gap in `find_flag_end`'s own
+  boundary check (round 4 only tightened the flag-to-filter gap): a
+  lone `\` immediately before the flag was still accepted as a
+  boundary, even though bash never treats a bare `\` as a separator
+  (only `\` + newline). `cargo test\--test integration` is one glued
+  argument, not a real flag. The before-check now requires plain
+  whitespace, or the exact `\` + newline ending of a real continuation.
+  Fixture test confirmed against a glued-backslash command.
+- The same round raised a second point -- a YAML `run: >-` folded
+  scalar joins its source lines with a space, not a real newline, so
+  round 4's bare-newline panic would misfire on a workflow reformatted
+  that way. Verified and **not applied**: chaos.yml's `run:` is a
+  single physical line today, so this is not a live bug; implementing
+  it would mean parsing YAML block-scalar styles inside a docs/CI
+  parity smoke test; and the failure mode is a loud, immediately
+  diagnosable CI failure, not a silent wrong pass -- the opposite of
+  every other finding in this issue. Documented as a known, accepted
+  trade-off in `skip_continuation_gap`'s doc comment instead.
 
 No production code changed — `chaos_docs.rs` is a test-only doc/CI parity
 guard behind no feature flag. `cargo test -p autumn-harvest --test
-integration chaos_docs::` (22/22), `cargo fmt -p autumn-harvest -- --check`,
+integration chaos_docs::` (23/23), `cargo fmt -p autumn-harvest -- --check`,
 `cargo clippy -p autumn-harvest --all-features --tests -- -D warnings`,
 and `python3 docs/audits/comment-hygiene.py --base origin/trunk-dev` are
 all clean.
