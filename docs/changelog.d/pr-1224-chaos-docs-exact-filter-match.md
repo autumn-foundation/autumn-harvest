@@ -76,10 +76,24 @@ issue #1202 as P2 round 4).
   passes the whole stanza, which `extract_filter_argument` already
   tolerates via its whitespace/continuation skip. Both are fixture tests,
   confirmed against a real boundary case and a real continuation case.
+- A fourth Codex round found the symmetric case of (1) above, plus a
+  soundness gap in the continuation skip itself. (3) `find_flag_end`
+  only checked the boundary *after* the flag; a missing space could glue
+  it onto a preceding token (`test--test integration`) and still match.
+  It now checks both sides. (4) The whitespace skip between the flag and
+  filter treated a bare newline the same as a real `\`-continuation. If
+  the doc's example ever lost its continuation backslash, the real
+  `cargo test` invocation would run unfiltered, but this guard would
+  still extract a filter and pass. A new `skip_continuation_gap` skips
+  only `\` immediately followed by a newline, plus ordinary horizontal
+  whitespace; a bare newline now stops the skip and the empty token that
+  results panics, exactly matching what the real shell would do. Both
+  are fixture tests, confirmed against a glued-flag case and a
+  dropped-backslash case.
 
 No production code changed — `chaos_docs.rs` is a test-only doc/CI parity
 guard behind no feature flag. `cargo test -p autumn-harvest --test
-integration chaos_docs::` (20/20), `cargo fmt -p autumn-harvest -- --check`,
+integration chaos_docs::` (22/22), `cargo fmt -p autumn-harvest -- --check`,
 `cargo clippy -p autumn-harvest --all-features --tests -- -D warnings`,
 and `python3 docs/audits/comment-hygiene.py --base origin/trunk-dev` are
 all clean.

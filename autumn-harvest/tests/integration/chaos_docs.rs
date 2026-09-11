@@ -246,26 +246,51 @@ fn local_iteration_example_is_scoped_to_chaos_tests_module() {
     );
 }
 
-/// The end index of `flag` in `command`, only at a real token boundary.
+/// The end index of `flag` in `command`, only at a real token boundary on
+/// BOTH sides.
 ///
-/// A plain substring search would match `flag` as a prefix of a longer,
-/// different token, e.g. `--test integration` inside `--test
-/// integration_tests`. Requires the character right after `flag` to be
-/// whitespace, `\`, or absent (end of string). Keeps searching past a
-/// false match instead of accepting the first substring hit.
+/// A plain substring search has two failure modes. It can match `flag`
+/// as a prefix of a longer, different token: `--test integration` inside
+/// `--test integration_tests`. It can also match `flag` glued onto a
+/// preceding token: inside `test--test integration`. That second shape
+/// is one malformed shell argument, not a real flag. Requires a
+/// boundary -- whitespace, `\`, or start/end of string -- on both sides
+/// of `flag`. Keeps searching past a false match instead of accepting
+/// the first substring hit.
 fn find_flag_end(command: &str, flag: &str) -> Option<usize> {
+    let is_boundary = |c: char| c.is_whitespace() || c == '\\';
     let mut search_from = 0;
     loop {
         let rel = command[search_from..].find(flag)?;
-        let end = search_from + rel + flag.len();
-        let boundary_ok = command[end..]
-            .chars()
-            .next()
-            .is_none_or(|c| c.is_whitespace() || c == '\\');
-        if boundary_ok {
+        let start = search_from + rel;
+        let end = start + flag.len();
+        let before_ok = command[..start].chars().next_back().is_none_or(is_boundary);
+        let after_ok = command[end..].chars().next().is_none_or(is_boundary);
+        if before_ok && after_ok {
             return Some(end);
         }
         search_from = end;
+    }
+}
+
+/// Skips horizontal whitespace and real `\` + newline continuations from
+/// the start of `s`. Stops at a bare newline instead of skipping it.
+///
+/// A bare newline ends a shell command. If the doc's example ever drops
+/// its continuation backslash, the real `cargo test` invocation runs
+/// with no filter at all. Treating that newline as skippable whitespace
+/// would let this guard extract a filter that could never actually run,
+/// masking exactly that regression.
+fn skip_continuation_gap(s: &str) -> &str {
+    let mut rest = s;
+    loop {
+        if let Some(next) = rest.strip_prefix(|c: char| c == ' ' || c == '\t') {
+            rest = next;
+        } else if let Some(next) = rest.strip_prefix("\\\n") {
+            rest = next;
+        } else {
+            return rest;
+        }
     }
 }
 
@@ -298,7 +323,7 @@ fn extract_filter_argument(command: &str) -> &str {
         || panic!("command has no {FLAG:?}: {command}"),
         |end| &command[end..],
     );
-    let arg_start = after_flag.trim_start_matches(|c: char| c.is_whitespace() || c == '\\');
+    let arg_start = skip_continuation_gap(after_flag);
     let arg_end = arg_start
         .find(char::is_whitespace)
         .unwrap_or(arg_start.len());
@@ -328,6 +353,28 @@ fn extract_filter_argument_reads_the_token_past_a_line_continuation() {
     // after a backslash continuation, not on the flag's own line.
     let command = "HARVEST_TEST_DATABASE_URL=postgres://x \\\n  CHAOS_SEEDS=8 cargo test --features chaos --test integration \\\n  chaos_tests::";
     assert_eq!(extract_filter_argument(command), "chaos_tests::");
+}
+
+#[test]
+#[should_panic(expected = "no filter argument follows")]
+fn extract_filter_argument_panics_on_a_bare_newline_with_no_continuation_backslash() {
+    // Codex finding on PR #1474: a bare newline ends a shell command. If
+    // the doc's example ever drops its continuation backslash, the real
+    // invocation runs unfiltered. This guard must not treat that dropped
+    // backslash as ordinary whitespace and quietly extract a filter that
+    // could never actually run.
+    let command = "cargo test --features chaos --test integration \n  chaos_tests::";
+    extract_filter_argument(command);
+}
+
+#[test]
+#[should_panic(expected = "command has no")]
+fn extract_filter_argument_requires_a_boundary_before_the_flag() {
+    // Codex finding on PR #1474: a missing space could glue the flag
+    // onto a preceding token, e.g. `test--test integration`. That is
+    // one malformed shell argument, not a real `--test` flag. The guard
+    // must not accept it just because a boundary follows the match.
+    extract_filter_argument("cargo test--test integration chaos_tests::");
 }
 
 #[test]
