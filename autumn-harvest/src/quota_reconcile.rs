@@ -39,19 +39,20 @@
 //! [`reconcile_quota_keys_from`] returns a resumable `id` cursor instead,
 //! and [`spawn_quota_key_reconciler_for_shard`] carries it forward across
 //! ticks. Every tick therefore moves strictly past whatever it just
-//! examined. A full pass over the candidate set completes in a bounded
-//! number of ticks as a result. `quota_key IS NULL` is not itself a
-//! stable cursor: a policy declared mid-uptime changes some rows' outcome
-//! between passes. Only `id` order does not.
+//! examined. A full pass over the CURRENT candidate set completes in a
+//! bounded number of ticks as a result: at most `ceil(candidates /
+//! batch_size)`, however large that backlog is. Nothing short-circuits
+//! that count early, on purpose -- an early, fixed-tick wrap would
+//! abandon a large permanently-stuck prefix before the pass reaches the
+//! resolvable rows sorted behind it, reopening the exact starvation this
+//! cursor exists to prevent.
 //!
-//! A natural wrap (see [`reconcile_quota_keys_from`]'s doc comment) fires
-//! only once a batch comes back short. A sustained backlog of
-//! already-registered but permanently-stuck rows could otherwise keep
-//! every batch full. That would delay the wrap past a newly-registered
-//! workflow type's rows sorted below the cursor.
-//! `spawn_quota_key_reconciler_for_shard` also forces a wrap after
-//! [`QUOTA_RECONCILE_FORCE_WRAP_EVERY_N_TICKS`] ticks regardless, so that
-//! staleness is bounded by tick count, not by backlog composition.
+//! `quota_key IS NULL` is not itself a stable cursor: a policy declared
+//! mid-uptime changes some rows' outcome between passes. Only `id` order
+//! does not. A row sorted AHEAD of the current cursor sees a newly
+//! declared policy on the very next tick. A row sorted BEHIND it is not
+//! revisited until the current pass finishes and wraps -- staleness
+//! bounded by that pass's own length, not by a fixed number of ticks.
 //!
 //! The scan is also restricted to workflow types with a currently-
 //! registered `QuotaPolicy` ([`registered_quota_workflow_names`]). A
@@ -259,9 +260,25 @@ struct CandidateRow {
 /// `quota_key`, so it never leaves the index on its own. Without this
 /// filter, a mixed deployment (some workflow types quota'd, others not)
 /// would re-fetch every no-policy row's JSON input on every tick,
-/// forever. `$1` is re-read from the live registry on every call. A
-/// policy declared mid-uptime, or removed, therefore takes effect on
-/// the very next tick, not just at the next restart.
+/// forever. `$1` is re-read from the live registry on every call, so a
+/// policy declared mid-uptime, or removed, takes effect starting with
+/// the very next tick -- not just at the next restart. See this
+/// module's doc comment for exactly when a given ROW becomes visible:
+/// immediately if sorted ahead of the cursor, or at the next pass wrap
+/// if sorted behind it.
+///
+/// KNOWN SCALING TRADE-OFF: this filter is a residual predicate, not an
+/// index seek. `idx_harvest_we_quota_reconcile_candidates` orders by
+/// `id` alone, so Postgres evaluates `workflow_name = ANY($1)` against
+/// each id-ordered candidate row, not by jumping straight to matches. In
+/// a mixed deployment with a huge non-quota'd population and few
+/// matching rows, one tick can touch many discarded rows before filling
+/// `batch_size`. A `(workflow_name, id)` index was considered and
+/// rejected: it would enable that seek, but could no longer serve
+/// `ORDER BY id LIMIT $3` without sorting every matching row first --
+/// trading today's bounded cost against a large EXCLUDED population for
+/// a bounded cost against a large REGISTERED one instead, not a strict
+/// win. See the migration's own comment for the full trade-off.
 ///
 /// `AND ($2::uuid IS NULL OR id > $2) ORDER BY id LIMIT $3` is a keyset
 /// cursor, not a bare `LIMIT`. A row this sweep can never resolve --
@@ -476,44 +493,6 @@ pub async fn reconcile_quota_keys_from(
     Ok((summary, next_cursor))
 }
 
-/// Ticks after which [`spawn_quota_key_reconciler_for_shard`] forces a
-/// full-pass wrap, even if every recent batch was full.
-///
-/// A natural wrap only fires once a batch returns fewer rows than
-/// `batch_size` (see [`reconcile_quota_keys_from`]'s doc comment).
-/// Consider a sustained backlog of permanently-stuck rows --
-/// unresolvable or over-cap, for a workflow type that already has a
-/// policy. It can keep every batch full indefinitely. Now consider a
-/// `QuotaPolicy` declared
-/// mid-uptime for a DIFFERENT, previously-unregistered workflow type.
-/// Its rows can sort below the cursor. Such a row then stays invisible
-/// for as long as that backlog lasts, contradicting the "next tick"
-/// claim in `CANDIDATE_SQL`'s doc comment. Forcing a wrap after a
-/// bounded number of ticks caps that staleness regardless of backlog
-/// composition.
-const QUOTA_RECONCILE_FORCE_WRAP_EVERY_N_TICKS: u32 = 20;
-
-/// Decide the next tick's cursor and tick counter for
-/// [`spawn_quota_key_reconciler_for_shard`].
-///
-/// Wraps to `None` on a natural short batch (`next_cursor` is already
-/// `None`), or once `ticks_since_wrap` reaches
-/// [`QUOTA_RECONCILE_FORCE_WRAP_EVERY_N_TICKS`], whichever comes first.
-/// Pure and DB-free so the forced-wrap bound is unit-testable without a
-/// backlog large enough to actually sustain 20 full batches.
-#[cfg(feature = "db")]
-const fn next_sweep_cursor(
-    next_cursor: Option<Uuid>,
-    ticks_since_wrap: u32,
-) -> (Option<Uuid>, u32) {
-    let ticks_since_wrap = ticks_since_wrap + 1;
-    if next_cursor.is_none() || ticks_since_wrap >= QUOTA_RECONCILE_FORCE_WRAP_EVERY_N_TICKS {
-        (None, 0)
-    } else {
-        (next_cursor, ticks_since_wrap)
-    }
-}
-
 /// Single-pass convenience wrapper over [`reconcile_quota_keys_from`].
 ///
 /// Always starts from the beginning of the candidate set (`after_id =
@@ -567,10 +546,6 @@ pub fn spawn_quota_key_reconciler_for_shard(
         // every tick to the same rows. Each tick resumes strictly past
         // the last row the previous tick examined.
         let mut cursor: Option<Uuid> = None;
-        // Forces a wrap after `QUOTA_RECONCILE_FORCE_WRAP_EVERY_N_TICKS`
-        // ticks even without a natural short batch. See that constant's
-        // doc comment for why a natural wrap alone is not bounded.
-        let mut ticks_since_wrap: u32 = 0;
         loop {
             tokio::select! {
                 () = cancel.cancelled() => break,
@@ -580,8 +555,7 @@ pub fn spawn_quota_key_reconciler_for_shard(
                 Ok(mut conn) => {
                     match reconcile_quota_keys_from(&mut conn, batch_size, cursor, shard).await {
                         Ok((summary, next_cursor)) => {
-                            (cursor, ticks_since_wrap) =
-                                next_sweep_cursor(next_cursor, ticks_since_wrap);
+                            cursor = next_cursor;
                             if summary.backfilled > 0 {
                                 tracing::info!(
                                     backfilled = summary.backfilled,
@@ -718,41 +692,5 @@ mod tests {
     #[test]
     fn candidate_query_accessor_matches_the_executed_sql() {
         assert_eq!(quota_reconcile_candidate_query(), CANDIDATE_SQL);
-    }
-
-    // -- next_sweep_cursor -----------------------------------------------
-
-    #[cfg(feature = "db")]
-    #[test]
-    fn a_natural_short_batch_wraps_immediately() {
-        assert_eq!(next_sweep_cursor(None, 5), (None, 0));
-    }
-
-    #[cfg(feature = "db")]
-    #[test]
-    fn a_full_batch_advances_the_cursor_and_the_tick_counter() {
-        let id = Uuid::nil();
-        assert_eq!(next_sweep_cursor(Some(id), 3), (Some(id), 4));
-    }
-
-    #[cfg(feature = "db")]
-    #[test]
-    fn a_sustained_run_of_full_batches_still_forces_a_wrap() {
-        // Simulates `QUOTA_RECONCILE_FORCE_WRAP_EVERY_N_TICKS` consecutive
-        // full batches, as a persistent backlog of already-registered
-        // permanently-stuck rows could produce. A newly-registered
-        // workflow type's rows sorted below the cursor must not stay
-        // invisible forever behind that backlog.
-        let id = Uuid::nil();
-        let mut cursor = Some(id);
-        let mut ticks = 0u32;
-        for _ in 0..QUOTA_RECONCILE_FORCE_WRAP_EVERY_N_TICKS {
-            (cursor, ticks) = next_sweep_cursor(cursor, ticks);
-        }
-        assert_eq!(
-            (cursor, ticks),
-            (None, 0),
-            "the pass must wrap by the Nth tick even though every batch was full"
-        );
     }
 }

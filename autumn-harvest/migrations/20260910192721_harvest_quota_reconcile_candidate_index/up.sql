@@ -12,7 +12,22 @@
 -- current candidate set, not the table's full history. The `(id)` key is
 -- not just eligibility bookkeeping: quota_reconcile's candidate scan orders
 -- by `id` and resumes from a cursor, so this index also backs that keyset
--- scan directly -- a workflow-name-and-quota-key column list would not.
+-- scan directly -- a workflow-name-leading column list would not.
+--
+-- KNOWN SCALING TRADE-OFF. CANDIDATE_SQL also filters `workflow_name =
+-- ANY($1)`, evaluated as a residual predicate against each id-ordered row
+-- this index yields, not as an index seek. In a mixed deployment with a
+-- very large non-quota'd population and few matching rows, one tick's
+-- scan can touch many discarded rows before filling `batch_size`.
+--
+-- A `(workflow_name, id)` key was considered and rejected here: it would
+-- let Postgres seek directly to matching workflow types, but could no
+-- longer serve `ORDER BY id LIMIT $3` without sorting every matching row
+-- first. That swaps today's bounded-per-tick cost against a large
+-- EXCLUDED population for a bounded-per-tick cost against a large
+-- REGISTERED backlog instead -- not a strict win. Confirming which side
+-- is actually cheaper needs `EXPLAIN ANALYZE` against production-scale
+-- data. Tracked as a follow-up, not silently accepted.
 --
 -- On a live deployment prefer the concurrent form, which cannot run inside
 -- Diesel's migration transaction:
