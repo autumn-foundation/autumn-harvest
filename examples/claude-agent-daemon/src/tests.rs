@@ -1094,30 +1094,163 @@ fn a_write_keeps_the_mode_of_the_file_it_replaces() {
     assert_eq!(mode, 0o600, "a new file must be owner-only");
 }
 
-#[tokio::test]
-async fn the_socket_path_is_only_removed_while_it_is_still_ours() {
+#[test]
+fn a_write_keeps_a_group_readable_mode_the_umask_would_strip() {
+    use std::os::unix::fs::PermissionsExt;
+
     let dir = tempfile::tempdir().expect("a temporary directory");
-    let socket = dir.path().join("agentd.sock");
+    let workspace = dir.path().to_path_buf();
+    let shared = workspace.join("shared.txt");
+    std::fs::write(&shared, "old").expect("the fixture is written");
+    std::fs::set_permissions(&shared, std::fs::Permissions::from_mode(0o660))
+        .expect("the fixture is made group-writable");
 
-    let listener = daemon::bind(&socket).await.expect("the socket binds");
-    let bound = daemon::socket_identity(&socket);
-    drop(listener);
-
-    // Something replaced the path while the daemon was running. The shutdown
-    // must not delete it: it could be another daemon's socket, or a file.
-    std::fs::remove_file(&socket).expect("the socket is removed");
-    std::fs::write(&socket, "someone else's file").expect("a replacement appears");
-    daemon::remove_own_socket(&socket, bound);
+    // A mode passed to `open` is filtered through the umask, so `0660` would
+    // come back `0640` under the common one. The mode is applied to the
+    // descriptor instead, where nothing filters it.
+    let body = tools::activity_body(workspace.clone());
+    let raw = body(tool_request(
+        &workspace,
+        tools::TOOL_WRITE_FILE,
+        json!({ "path": "shared.txt", "content": "new" }),
+    ))
+    .expect("a tool failure is a result, not an activity error");
+    let outcome: ToolOutcome = serde_json::from_value(raw).expect("the outcome decodes");
     assert!(
-        socket.exists(),
-        "a replacement at the socket path must survive"
+        !outcome.is_error,
+        "the write must succeed: {}",
+        outcome.output
     );
 
-    // Its own socket it does remove.
-    std::fs::remove_file(&socket).expect("the replacement is removed");
-    let listener = daemon::bind(&socket).await.expect("the socket binds again");
-    let bound = daemon::socket_identity(&socket);
-    drop(listener);
-    daemon::remove_own_socket(&socket, bound);
-    assert!(!socket.exists(), "its own socket must be cleaned up");
+    let mode = std::fs::metadata(&shared)
+        .expect("the target exists")
+        .permissions()
+        .mode()
+        & 0o777;
+    assert_eq!(
+        mode, 0o660,
+        "the target's mode must survive the replacement"
+    );
+}
+
+#[test]
+fn a_write_never_removes_a_file_that_occupies_a_scratch_name() {
+    let dir = tempfile::tempdir().expect("a temporary directory");
+    let workspace = dir.path().to_path_buf();
+
+    // Whatever sits on a scratch name may be residue someone wants to read.
+    // The write picks another name rather than deleting it.
+    let squatter = workspace.join(format!(".notes.md.agentd-{}-0.tmp", std::process::id()));
+    std::fs::write(&squatter, "do not delete me").expect("the fixture is written");
+
+    let body = tools::activity_body(workspace.clone());
+    let raw = body(tool_request(
+        &workspace,
+        tools::TOOL_WRITE_FILE,
+        json!({ "path": "notes.md", "content": "the approved content" }),
+    ))
+    .expect("a tool failure is a result, not an activity error");
+    let outcome: ToolOutcome = serde_json::from_value(raw).expect("the outcome decodes");
+    assert!(
+        !outcome.is_error,
+        "the write must succeed: {}",
+        outcome.output
+    );
+
+    assert_eq!(
+        std::fs::read_to_string(&squatter).expect("the occupant survives"),
+        "do not delete me"
+    );
+    assert_eq!(
+        std::fs::read_to_string(workspace.join("notes.md")).expect("the target exists"),
+        "the approved content"
+    );
+}
+
+#[tokio::test]
+async fn a_decision_can_only_be_delivered_once() {
+    let dir = tempfile::tempdir().expect("a temporary directory");
+    let socket = dir.path().join("agentd.sock");
+    let options = daemon::Options {
+        db: dir.path().join("agentd.db"),
+        socket: socket.clone(),
+        workspace: dir.path().join("workspace"),
+        model: claude::DEFAULT_MODEL.to_string(),
+        max_tokens: claude::DEFAULT_MAX_TOKENS,
+        tick: Duration::from_millis(50),
+        api_key: None,
+    };
+    let daemon = tokio::spawn(daemon::serve(options));
+
+    let mut ready = false;
+    for _ in 0..100 {
+        if socket.exists() {
+            ready = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(ready, "the daemon never bound its socket");
+
+    let submitted = protocol::call(
+        &socket,
+        &Request::Submit {
+            goal: "summarise the workspace".to_string(),
+            max_turns: 6,
+            approval_timeout_secs: 300,
+        },
+    )
+    .await
+    .expect("the submit is answered");
+    let Response::Submitted { execution_id } = submitted else {
+        panic!("unexpected answer: {submitted:?}");
+    };
+
+    // Wait for the gate, then send the SAME decision twice in a row. The
+    // second must be refused: two staged signals would leave one queued for a
+    // later call to consume without being shown.
+    let mut call_id = None;
+    for _ in 0..200 {
+        let answer = protocol::call(
+            &socket,
+            &Request::Status {
+                execution_id: execution_id.clone(),
+                full: false,
+            },
+        )
+        .await
+        .expect("the status is answered");
+        let Response::Session { session } = answer else {
+            panic!("unexpected answer: {answer:?}");
+        };
+        if let Some(pending) = session.pending {
+            call_id = Some(pending.id);
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    let call_id = call_id.expect("the session never asked for approval");
+
+    let decision = |id: String| Request::Approve {
+        execution_id: execution_id.clone(),
+        call_id: id,
+        approved: true,
+        note: None,
+    };
+    let first = protocol::call(&socket, &decision(call_id.clone()))
+        .await
+        .expect("the first decision is answered");
+    assert!(
+        matches!(first, Response::Ack { .. }),
+        "the first decision must be accepted: {first:?}"
+    );
+    let second = protocol::call(&socket, &decision(call_id))
+        .await
+        .expect("the second decision is answered");
+    assert!(
+        matches!(second, Response::Error { .. }),
+        "a repeated decision must be refused: {second:?}"
+    );
+
+    daemon.abort();
 }

@@ -142,6 +142,9 @@ while you read, and a decision must never land on the next call instead. An
 early or repeated decision has no live wait to land in and is refused too,
 rather than stored for some later, unseen write.
 
+A decision is spent when it is delivered: a repeated `approve` is refused
+rather than staging a second signal that a later call could consume.
+
 A write can carry up to 64 KiB, and `status` trims a long one to stay readable.
 It says so when it does, and `status <id> --full` prints every byte — so nothing
 is ever approved sight unseen.
@@ -199,15 +202,16 @@ is ever approved sight unseen.
 cargo test -p claude-agent-daemon
 ```
 
-Twenty-six tests, all offline: the happy path, a denied tool call, the restart
+Twenty-eight tests, all offline: the happy path, a denied tool call, the restart
 proof, the workspace sandbox (two symlink escapes, the read cap, and a named
 pipe), an atomic write, a truncated turn, a turn that says nothing, a stale
 approval, the full approval view, a session bound to another workspace and to
 another model, the single-writer lock through every alias, the database and
 socket permissions, a refused hard-linked database, a turn whose tool calls
-share an id, a write that keeps its target's mode, the socket cleanup, the
-drive interval, which API failures may be retried, a billed response that is
-not a message, and one end-to-end run through the daemon socket.
+share an id, a repeated decision, a write that keeps its target's mode
+(including one the umask would strip) and never deletes a file on a scratch
+name, the drive interval, which API failures may be retried, a billed response
+that is not a message, and one end-to-end run through the daemon socket.
 
 ## What this example does not do
 
@@ -255,6 +259,10 @@ Honest limits, so nothing here reads as a promise:
   `openat`-based traversal, which is more machinery than an example should
   carry. The model is the untrusted party here, and it cannot win that race;
   another process running as you already can do worse directly.
+- **The socket file outlives the daemon.** Shutdown does not unlink it: no
+  check can prove a public pathname still names *this* daemon's socket, and
+  deleting someone else's is worse than leaving a stale one. The next start
+  reclaims it, once it has proved the entry is a socket that nobody answers on.
 - **Unix only.** The control surface is a Unix domain socket, so the daemon
   runs on Linux and macOS. A Windows port needs a named pipe or a TCP port.
 - **The offline stub is not Claude.** It exists so the durability story is

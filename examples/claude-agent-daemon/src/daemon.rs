@@ -13,7 +13,7 @@
 //! Postgres core instead.
 
 use std::collections::HashMap;
-use std::os::unix::fs::{FileTypeExt, MetadataExt};
+use std::os::unix::fs::FileTypeExt;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -125,9 +125,6 @@ pub async fn serve(options: Options) -> Result<(), String> {
 
     let reader = inspect::open(&options.db)?;
     let listener = bind(&options.socket).await?;
-    // Remembered now, so the cleanup on the way out can tell whether the path
-    // still names this socket.
-    let bound = socket_identity(&options.socket);
     let (tx, mut rx) = mpsc::channel::<Job>(COMMAND_BACKLOG);
     tokio::spawn(accept_loop(listener, tx));
 
@@ -151,8 +148,14 @@ pub async fn serve(options: Options) -> Result<(), String> {
         tokio::select! {
             job = rx.recv() => {
                 let Some((request, answer)) = job else { break };
-                let response =
-                    handle(&mut runtime, &reader, &blocked, &workspace, &identity, request);
+                let response = handle(
+                    &mut runtime,
+                    &reader,
+                    &mut blocked,
+                    &workspace,
+                    &identity,
+                    request,
+                );
                 // A closed receiver means the client hung up. Nothing to do.
                 drop(answer.send(response));
             }
@@ -174,45 +177,20 @@ pub async fn serve(options: Options) -> Result<(), String> {
         }
     }
 
-    tracing::info!("agentd is stopping; in-flight sessions resume on the next start");
-    remove_own_socket(&options.socket, bound);
+    // The socket path is deliberately NOT removed here.
+    //
+    // Whatever occupies it at this moment may not be this daemon's socket. The
+    // path can be replaced while the daemon runs. An inode number is also
+    // reused as soon as it is freed. Neither the type nor the identity can
+    // therefore prove ownership of a public pathname. Deleting another
+    // daemon's socket is worse than leaving a stale one, and a stale one costs
+    // nothing. `bind` reclaims it at the next start, once it has proved that
+    // it is a socket and that nobody answers on it.
+    tracing::info!(
+        socket = %options.socket.display(),
+        "agentd is stopping; in-flight sessions resume on the next start",
+    );
     Ok(())
-}
-
-/// The filesystem identity of the socket this daemon bound.
-pub type SocketIdentity = Option<(u64, u64)>;
-
-/// Read the identity of the entry at `socket`.
-pub fn socket_identity(socket: &Path) -> SocketIdentity {
-    std::fs::symlink_metadata(socket)
-        .ok()
-        .map(|meta| (meta.dev(), meta.ino()))
-}
-
-/// Remove the socket path, but only while it still names the bound socket.
-///
-/// The path can be replaced while the daemon runs, by cleanup tooling or by an
-/// operator. Removing whatever happens to be there on the way out would then
-/// delete another daemon's socket, or an unrelated file. The startup check
-/// cannot cover this: it ran before the replacement.
-///
-/// Both the type and the identity are checked. The type carries the weight
-/// here. An inode number is reused as soon as it is freed. A file created in
-/// place of the removed socket can therefore hold the same number. What
-/// remains is a
-/// replacement that is also a socket and reused that number. That is not worth
-/// more machinery than this.
-pub fn remove_own_socket(socket: &Path, bound: SocketIdentity) {
-    let still_ours = std::fs::symlink_metadata(socket)
-        .is_ok_and(|meta| meta.file_type().is_socket() && Some((meta.dev(), meta.ino())) == bound);
-    if bound.is_some() && still_ours {
-        drop(std::fs::remove_file(socket));
-    } else {
-        tracing::warn!(
-            socket = %socket.display(),
-            "the socket path no longer names this daemon's socket; leaving it alone",
-        );
-    }
 }
 
 /// Take the control socket, refusing to displace a live daemon.
@@ -302,7 +280,7 @@ async fn serve_connection(stream: UnixStream, tx: mpsc::Sender<Job>) {
 fn handle(
     runtime: &mut SqliteRuntime,
     reader: &Connection,
-    blocked: &Parked,
+    blocked: &mut Parked,
     workspace: &str,
     model: &str,
     request: Request,
@@ -390,7 +368,7 @@ fn submit(
 /// wait to land in, so it is refused here rather than staged for a later call.
 fn approve(
     runtime: &mut SqliteRuntime,
-    blocked: &Parked,
+    blocked: &mut Parked,
     execution_id: &str,
     call_id: &str,
     approved: bool,
@@ -432,13 +410,25 @@ fn approve(
         }
     };
     match runtime.send_signal(exec, &signal, payload) {
-        Ok(()) => Response::Ack {
-            detail: if approved {
-                "approved".to_string()
-            } else {
-                "denied".to_string()
-            },
-        },
+        Ok(()) => {
+            // The wait is spent the moment a decision is staged. Without this,
+            // a second `approve` before the next drive tick would stage a
+            // SECOND signal. The first releases this call and the other stays
+            // queued, where a later call reusing the id could consume it and
+            // run without being shown. The next tick re-reads the run's real
+            // state, so clearing it here loses nothing.
+            if let Some(state) = blocked.get_mut(&exec) {
+                state.signal = None;
+                state.reason = "a decision is delivered; awaiting the next drive".to_string();
+            }
+            Response::Ack {
+                detail: if approved {
+                    "approved".to_string()
+                } else {
+                    "denied".to_string()
+                },
+            }
+        }
         Err(e) => Response::Error {
             message: format!("cannot deliver the decision: {e}"),
         },

@@ -30,6 +30,9 @@ const MAX_FILE_BYTES: usize = 64 * 1024;
 /// The largest directory listing this toolbox returns.
 const MAX_ENTRIES: usize = 200;
 
+/// How many scratch names one write tries before it gives up.
+const SCRATCH_ATTEMPTS: u32 = 16;
+
 /// The mode a file this toolbox CREATES is given.
 ///
 /// A file the agent brings into being starts private. An existing file keeps
@@ -346,9 +349,6 @@ fn write_file(workspace: &Path, relative: &str, content: &str) -> Result<String,
     // rather than an activity error, so nothing would retry it. The rename is
     // atomic inside one directory, so the target holds the whole content or it
     // is untouched.
-    let temporary = temporary_beside(&path)?;
-    drop(std::fs::remove_file(&temporary));
-
     // The rename replaces the target's inode, so the scratch file carries the
     // mode the result must have. An existing target keeps its own mode. The
     // operator approved a change of content. Making a private file
@@ -357,7 +357,8 @@ fn write_file(workspace: &Path, relative: &str, content: &str) -> Result<String,
         existing.permissions().mode() & 0o7777
     });
 
-    let outcome = write_through(&temporary, &path, content, mode);
+    let (temporary, file) = create_scratch(&path)?;
+    let outcome = write_through(file, &temporary, &path, content, mode);
     if outcome.is_err() {
         drop(std::fs::remove_file(&temporary));
     }
@@ -366,10 +367,14 @@ fn write_file(workspace: &Path, relative: &str, content: &str) -> Result<String,
     Ok(format!("wrote {} bytes to `{relative}`", content.len()))
 }
 
-/// The scratch path one write uses, beside its target.
+/// Create a scratch file beside the target, and return it with its path.
 ///
 /// The same directory matters: a rename is only atomic within one filesystem.
-fn temporary_beside(path: &Path) -> Result<PathBuf, String> {
+/// The name is unique per attempt, and the file is created with `create_new`.
+/// Nothing that already occupies a name is removed or written through. A fixed
+/// name would have to be deleted first, and that name can belong to something
+/// a person wants to keep.
+fn create_scratch(path: &Path) -> Result<(PathBuf, std::fs::File), String> {
     let parent = path
         .parent()
         .ok_or_else(|| "the target has no directory".to_string())?;
@@ -378,11 +383,35 @@ fn temporary_beside(path: &Path) -> Result<PathBuf, String> {
         .ok_or_else(|| "the target has no file name".to_string())?
         .to_string_lossy()
         .into_owned();
-    Ok(parent.join(format!(".{name}.agentd-tmp")))
+
+    let pid = std::process::id();
+    let mut last = None;
+    for attempt in 0..SCRATCH_ATTEMPTS {
+        let candidate = parent.join(format!(".{name}.agentd-{pid}-{attempt}.tmp"));
+        // `O_NOFOLLOW` refuses a link, as everywhere else in this module. The
+        // mode is deliberately conservative here; the target's mode is applied
+        // to the descriptor below, where no umask can filter it.
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(NEW_FILE_MODE)
+            .custom_flags(libc_o_nofollow())
+            .open(&candidate)
+        {
+            Ok(file) => return Ok((candidate, file)),
+            Err(e) => last = Some(e),
+        }
+    }
+
+    Err(last.map_or_else(
+        || format!("cannot create a scratch file beside `{name}`"),
+        |e| format!("cannot create a scratch file beside `{name}`: {e}"),
+    ))
 }
 
-/// Fill the scratch file, flush it, and rename it over the target.
+/// Fill the scratch file, give it the target's mode, and rename it over it.
 fn write_through(
+    mut file: std::fs::File,
     temporary: &Path,
     target: &Path,
     content: &str,
@@ -390,17 +419,13 @@ fn write_through(
 ) -> Result<(), std::io::Error> {
     use std::io::Write;
 
-    // `create_new` refuses to write through anything that already exists, and
-    // `O_NOFOLLOW` refuses a link, as everywhere else in this module. The mode
-    // is set at creation, so the file is never briefly more open than the
-    // target it replaces.
-    let mut file = std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .mode(mode)
-        .custom_flags(libc_o_nofollow())
-        .open(temporary)?;
     file.write_all(content.as_bytes())?;
+
+    // `chmod` on the open descriptor, NOT a creation mode. A mode passed to
+    // `open` is filtered through the umask, so a `0660` target would come back
+    // `0640` under the common one. This sets exactly what was captured.
+    file.set_permissions(std::fs::Permissions::from_mode(mode))?;
+
     // Flush before the rename, so a crash cannot leave the target naming a file
     // whose content never reached the disk.
     file.sync_all()?;
