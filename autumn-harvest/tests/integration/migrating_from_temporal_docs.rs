@@ -277,11 +277,13 @@ fn comparison_page_links_back_to_the_migration_guide() {
 /// to harvest's own schedule pause and catchup primitives rather than leave
 /// them to guess.
 ///
-/// A first version of this fix said Temporal exposes a per-firing list an
-/// operator can inspect and accept or reject. A PR review (Codex, P1) named
-/// that mechanism false: Temporal's `CatchupWindow` policy decides the whole
-/// missed interval at once, not firing by firing. These assertions guard
-/// the corrected claim instead.
+/// Two PR reviews (Codex, both P1) found real defects here. The first said
+/// Temporal exposes a per-firing list an operator can inspect and accept or
+/// reject; it does not. The second said harvest's `CatchupPolicy::SkipAll`
+/// suppresses an entire missed interval; it does not, it fires the oldest
+/// slot. The fix now avoids relying on either engine's catchup machinery.
+/// Pause Temporal and create the harvest schedule close together, at one
+/// cutover timestamp, so no backlog accrues to reconcile.
 #[test]
 fn dual_run_playbook_covers_schedule_driven_cutover() {
     let guide = read_doc(GUIDE_PATH);
@@ -303,9 +305,15 @@ fn dual_run_playbook_covers_schedule_driven_cutover() {
          one defined cutover timestamp, not on pausing alone (issue #1219, PR #1473 Codex P1)"
     );
     assert!(
-        playbook.contains("exactly one engine"),
-        "the playbook must say the missed interval is governed on exactly one engine, so \
-         neither engine silently drops or duplicates it (issue #1219)"
+        playbook.contains("as close together as you can"),
+        "the playbook must say to pause Temporal and create the harvest schedule close \
+         together at one cutover timestamp, not create the harvest schedule ahead of time \
+         and leave it accruing a backlog while paused (issue #1219, PR #1473 Codex P1)"
+    );
+    assert!(
+        playbook.contains("SkipAll` still fires the oldest missed slot"),
+        "the playbook must correct the record: `CatchupPolicy::SkipAll` still fires one slot, \
+         it does not suppress an entire missed interval (issue #1219, PR #1473 Codex P1)"
     );
     assert!(
         playbook.contains("/admin/schedules/{id}/pause"),
@@ -324,12 +332,15 @@ fn dual_run_playbook_covers_schedule_driven_cutover() {
 /// started. It must never route by the current flag value. The flag can flip
 /// between an execution's start and a later follow-up call against it.
 ///
-/// A first version of this fix said to persist a record "at start time" for
-/// every execution. A PR review (Codex, P1) named two classes this cannot
-/// cover. One is a schedule-driven execution, which no application code
-/// starts. The other is an execution that predates the record's own
-/// introduction. These assertions guard the corrected, two-part
-/// resolution rule instead.
+/// Two PR reviews (Codex, both P1) found real gaps here. The first said a
+/// persisted "record at start time" cannot cover a schedule-driven
+/// execution, since no application code starts it. The same gap applies to
+/// an execution that predates the record's own introduction.
+///
+/// The second review found the schedule-driven fallback this fix first
+/// tried -- comparing an execution's start time to the cutover timestamp --
+/// still wrong. A hand-fired or delayed Temporal slot can start after that
+/// timestamp. The fix now queries harvest directly, never a timestamp.
 #[test]
 fn dual_run_playbook_covers_follow_up_engine_routing() {
     let guide = read_doc(GUIDE_PATH);
@@ -351,10 +362,11 @@ fn dual_run_playbook_covers_follow_up_engine_routing() {
          not leave it unresolved (issue #1219, PR #1473 Codex P1)"
     );
     assert!(
-        playbook.contains("needs no such record") && playbook.contains("cutover timestamp"),
-        "the playbook must resolve a schedule-driven execution's engine by comparing its \
-         start time to the schedule's cutover timestamp, since no application code starts it \
-         to write a record (issue #1219, PR #1473 Codex P1)"
+        playbook.contains("needs no such record")
+            && playbook.contains("Query harvest for the execution directly"),
+        "the playbook must resolve a schedule-driven execution's engine with a live lookup \
+         against harvest, not a timestamp comparison -- a comparison a hand-fired or delayed \
+         slot can cross in the wrong direction (issue #1219, PR #1473 Codex P1)"
     );
     assert!(
         playbook.contains("Never route it by the flag's current value"),

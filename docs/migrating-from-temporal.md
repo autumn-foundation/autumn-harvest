@@ -326,23 +326,22 @@ your whole application.
    directly. No application code runs in that path. The flag above
    controls nothing for it.
 
-   Pause the Temporal Schedule first. Do this before you rely on the flag
-   for that type. Pausing gives you no per-firing list to accept or
-   reject. Temporal's own `CatchupWindow` policy decides, as a whole,
-   whether the missed interval fires or drops once the schedule resumes.
+   Pick one cutover timestamp. Do not create the harvest schedule ahead
+   of time and leave it paused. A paused schedule accrues missed slots.
+   Neither engine's catchup policy resolves them for you. Temporal's
+   `CatchupWindow` and harvest's `CatchupPolicy` (issue #484) each govern
+   a missed interval as a whole, not slot by slot. Neither has a mode
+   that reliably fires none of it. Harvest's `CatchupPolicy::SkipAll`
+   still fires the oldest missed slot, for one example.
 
-   Pick one cutover timestamp for the missed interval. Set the Temporal
-   Schedule's `CatchupWindow` deliberately, so it fires or skips that
-   interval on its own terms. Do not let the default `CatchupWindow`
-   decide this by accident.
-
-   Create the equivalent harvest `WorkflowSchedule`, but keep it paused.
-   Use `POST /admin/schedules/{id}/pause` (issue #229) to hold it. Govern
-   the missed interval on exactly one engine. Set the harvest schedule's
-   `CatchupPolicy` (issue #484) to `SkipAll` if Temporal's `CatchupWindow`
-   already covers the interval. Set `CatchupPolicy` to cover it instead
-   if Temporal skips the interval. Unpause the harvest schedule only at
-   the same cutover timestamp.
+   Pause the Temporal Schedule and create the harvest `WorkflowSchedule`
+   as close together as you can, right at the cutover timestamp. Use
+   `POST /admin/schedules/{id}/pause` (issue #229) if any gap between the
+   two actions is unavoidable. Unpause the harvest schedule the moment
+   the Temporal Schedule is confirmed paused. Treat a slot missed inside
+   that gap as a deliberate, bounded loss, or fire it by hand through
+   `POST /admin/schedules/{id}/trigger`. Keep the gap short enough that
+   this stays rare.
 
    A follow-up operation against one already-started execution follows a
    different rule. A signal, a query, an update, and a cancellation each
@@ -359,10 +358,11 @@ your whole application.
    predates this record by construction. A missing record is therefore
    correct for it, not a gap.
 
-   A schedule-driven type needs no such record. Compare an execution's
-   start time to the schedule's cutover timestamp from above instead.
-   Before that timestamp, the execution is Temporal. At or after it, the
-   execution is harvest.
+   A schedule-driven type needs no such record either. Query harvest for
+   the execution directly instead. Treat a missing execution there as
+   Temporal too. This check holds regardless of any gap or hand-fired
+   slot around the cutover, since it asks the engine itself, not a
+   timestamp.
 
    Route every follow-up call by this resolved engine, never by the
    flag's current value. A `cancel` signal routed to the wrong engine may
