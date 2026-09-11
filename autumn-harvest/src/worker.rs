@@ -25579,12 +25579,13 @@ impl Worker {
         // operator-tunable.
         let quota_key_reconcilers: Vec<_> = shard_pools_for_monitors
             .iter()
-            .map(|(shard_pool, _shard)| {
+            .map(|(shard_pool, shard)| {
                 crate::quota_reconcile::spawn_quota_key_reconciler_for_shard(
                     shard_pool.clone(),
                     self.shutdown.clone(),
                     self.config.worker_heartbeat_interval,
                     crate::quota_reconcile::QUOTA_RECONCILE_DEFAULT_BATCH,
+                    *shard,
                 )
             })
             .collect();

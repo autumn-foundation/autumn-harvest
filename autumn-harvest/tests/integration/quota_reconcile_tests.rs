@@ -40,6 +40,12 @@ use uuid::Uuid;
 // Shared harness
 // ---------------------------------------------------------------------------
 
+/// Every row in this file is inserted with `shard_id = 0` (see
+/// `insert_execution`). Fed straight through to `reconcile_quota_keys`'s
+/// DR-fence assertion, which is a no-op unless this process has a pinned
+/// generation for the shard.
+const SHARD: Option<autumn_harvest::types::ShardId> = Some(autumn_harvest::types::ShardId::new(0));
+
 async fn setup_db() -> (AsyncPgConnection, ContainerAsync<Postgres>) {
     let container = Postgres::default()
         .with_tag("16")
@@ -196,7 +202,9 @@ async fn pre_upgrade_active_execution_gets_backfilled() {
     )
     .await;
 
-    let summary = reconcile_quota_keys(&mut conn, 100).await.expect("sweep");
+    let summary = reconcile_quota_keys(&mut conn, 100, SHARD)
+        .await
+        .expect("sweep");
 
     assert_eq!(summary.backfilled, 1);
     assert_eq!(summary.total_scanned(), 1);
@@ -256,7 +264,9 @@ async fn combined_pre_and_post_upgrade_usage_is_capped_after_reconciliation() {
         "usage of 1 against a cap of 3 must not violate -- the bug this test guards against"
     );
 
-    let summary = reconcile_quota_keys(&mut conn, 100).await.expect("sweep");
+    let summary = reconcile_quota_keys(&mut conn, 100, SHARD)
+        .await
+        .expect("sweep");
     assert_eq!(summary.backfilled, 2);
 
     let usage_after = load_quota_usage(&mut conn, workflow_name, "acme")
@@ -288,14 +298,14 @@ async fn second_run_is_a_no_op() {
     )
     .await;
 
-    let first = reconcile_quota_keys(&mut conn, 100)
+    let first = reconcile_quota_keys(&mut conn, 100, SHARD)
         .await
         .expect("first sweep");
     assert_eq!(first.backfilled, 1);
     let key_after_first = read_quota_key(&mut conn, exec_id).await;
     assert_eq!(key_after_first, Some("acme".to_string()));
 
-    let second = reconcile_quota_keys(&mut conn, 100)
+    let second = reconcile_quota_keys(&mut conn, 100, SHARD)
         .await
         .expect("second sweep");
     assert_eq!(
@@ -326,7 +336,9 @@ async fn terminal_rows_are_never_touched() {
     )
     .await;
 
-    let summary = reconcile_quota_keys(&mut conn, 100).await.expect("sweep");
+    let summary = reconcile_quota_keys(&mut conn, 100, SHARD)
+        .await
+        .expect("sweep");
 
     assert_eq!(
         summary.total_scanned(),
@@ -353,7 +365,9 @@ async fn over_cap_resolved_key_is_left_null() {
     )
     .await;
 
-    let summary = reconcile_quota_keys(&mut conn, 100).await.expect("sweep");
+    let summary = reconcile_quota_keys(&mut conn, 100, SHARD)
+        .await
+        .expect("sweep");
 
     assert_eq!(summary.over_cap, 1);
     assert_eq!(summary.backfilled, 0);
@@ -386,7 +400,9 @@ async fn workflow_type_with_no_declared_policy_is_left_null() {
     )
     .await;
 
-    let summary = reconcile_quota_keys(&mut conn, 100).await.expect("sweep");
+    let summary = reconcile_quota_keys(&mut conn, 100, SHARD)
+        .await
+        .expect("sweep");
 
     assert_eq!(summary.no_policy, 1);
     assert_eq!(read_quota_key(&mut conn, exec_id).await, None);
@@ -407,7 +423,9 @@ async fn zero_registered_policies_anywhere_skips_the_scan_entirely() {
     )
     .await;
 
-    let summary = reconcile_quota_keys(&mut conn, 100).await.expect("sweep");
+    let summary = reconcile_quota_keys(&mut conn, 100, SHARD)
+        .await
+        .expect("sweep");
 
     assert_eq!(
         summary,
@@ -433,7 +451,9 @@ async fn zero_batch_size_disables_the_sweep() {
     )
     .await;
 
-    let summary = reconcile_quota_keys(&mut conn, 0).await.expect("sweep");
+    let summary = reconcile_quota_keys(&mut conn, 0, SHARD)
+        .await
+        .expect("sweep");
 
     assert_eq!(
         summary,
@@ -462,7 +482,7 @@ async fn batch_size_bounds_a_single_sweep_and_the_rest_finish_on_the_next_one() 
         exec_ids.push(id);
     }
 
-    let first = reconcile_quota_keys(&mut conn, 2)
+    let first = reconcile_quota_keys(&mut conn, 2, SHARD)
         .await
         .expect("first sweep");
     assert_eq!(
@@ -481,11 +501,11 @@ async fn batch_size_bounds_a_single_sweep_and_the_rest_finish_on_the_next_one() 
         "exactly batch_size rows written, no more"
     );
 
-    let second = reconcile_quota_keys(&mut conn, 2)
+    let second = reconcile_quota_keys(&mut conn, 2, SHARD)
         .await
         .expect("second sweep");
     assert_eq!(second.backfilled, 2);
-    let third = reconcile_quota_keys(&mut conn, 2)
+    let third = reconcile_quota_keys(&mut conn, 2, SHARD)
         .await
         .expect("third sweep");
     assert_eq!(
@@ -541,7 +561,7 @@ async fn cursor_advances_past_permanently_stuck_rows_so_a_resolvable_row_is_not_
     // then still finds the resolvable row, even if it sorted last.
     let mut cursor = None;
     for _ in 0..8 {
-        let (_summary, next_cursor) = reconcile_quota_keys_from(&mut conn, 1, cursor)
+        let (_summary, next_cursor) = reconcile_quota_keys_from(&mut conn, 1, cursor, SHARD)
             .await
             .expect("sweep tick");
         cursor = next_cursor;

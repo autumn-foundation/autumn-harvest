@@ -97,6 +97,19 @@
 //! the design this module deliberately avoids (see "Runs periodically,
 //! not once at startup" above).
 //!
+//! # Cross-region DR fencing (issue #954)
+//!
+//! Every backfill UPDATE asserts [`crate::replication::assert_fence`]
+//! first, inside the same transaction, exactly like
+//! [`crate::store::append_single_event`] does for `harvest_events`.
+//!
+//! Consider a worker pinned to a superseded shard generation. It must
+//! release without writing a quota key derived from its own
+//! possibly-stale registry view, onto a database another region now
+//! owns. The assert is a cheap in-process check when this worker has no
+//! pinned generation for the shard. A deployment that never enables
+//! `dr_fencing` pays nothing extra.
+//!
 //! # Out of scope: `harvest_dead_letters.quota_key`
 //!
 //! This sweep only ever reads and writes `harvest_workflow_executions`. A
@@ -325,19 +338,34 @@ fn any_quota_policy_registered() -> bool {
 /// The UPDATE itself repeats that predicate, so a race between two sweeps
 /// skips rather than double-writes.
 ///
+/// `shard` is asserted via [`crate::replication::assert_fence`] before
+/// every write, exactly like [`crate::store::append_single_event`] does
+/// for `harvest_events` (cross-region DR, issue #954).
+///
+/// Consider a worker pinned to a superseded shard generation. Its
+/// registry view may be stale. It must not write a `quota_key` derived
+/// from that view onto a database another region now owns.
+///
 /// # Errors
 ///
-/// Returns [`crate::error::HarvestError::Database`] on query failure.
+/// Returns [`crate::error::HarvestError::Database`] on query failure, or
+/// [`crate::error::HarvestError::ShardFenced`] if this process is pinned
+/// to a superseded generation for `shard`.
 #[cfg(feature = "db")]
 pub async fn reconcile_quota_keys_from(
     conn: &mut AsyncPgConnection,
     batch_size: i64,
     after_id: Option<Uuid>,
+    shard: Option<crate::types::ShardId>,
 ) -> HarvestResult<(ReconcileSummary, Option<Uuid>)> {
     let mut summary = ReconcileSummary::default();
     if batch_size <= 0 || !any_quota_policy_registered() {
         return Ok((summary, after_id));
     }
+    // Mirrors `queue::fence_binding`. `UNENCODED` is the documented
+    // sentinel for "let the fence registry resolve its pinned default
+    // shard", the right fallback for a deployment with one unsharded pool.
+    let shard = shard.unwrap_or(crate::types::ShardId::UNENCODED);
 
     let rows: Vec<CandidateRow> = diesel::sql_query(CANDIDATE_SQL)
         .bind::<Nullable<diesel::sql_types::Uuid>, _>(after_id)
@@ -363,6 +391,12 @@ pub async fn reconcile_quota_keys_from(
                 // further without a synchronous-with-admission design.
                 let rows_affected = Box::pin(conn.transaction::<usize, HarvestError, _>(
                     async move |conn| {
+                        // Cross-region DR fence (issue #954), before the
+                        // quota lock. A fenced worker must release
+                        // without ever taking a lock the owning region
+                        // needs, not just skip the write after acquiring
+                        // it.
+                        crate::replication::assert_fence(conn, shard).await?;
                         crate::quota::lock_quota_key(conn, &workflow_name, &key).await?;
                         diesel::sql_query(
                             "UPDATE harvest_workflow_executions SET quota_key = $1 \
@@ -422,13 +456,16 @@ pub async fn reconcile_quota_keys_from(
 ///
 /// # Errors
 ///
-/// Returns [`crate::error::HarvestError::Database`] on query failure.
+/// Returns [`crate::error::HarvestError::Database`] on query failure, or
+/// [`crate::error::HarvestError::ShardFenced`] if this process is pinned
+/// to a superseded generation for `shard`.
 #[cfg(feature = "db")]
 pub async fn reconcile_quota_keys(
     conn: &mut AsyncPgConnection,
     batch_size: i64,
+    shard: Option<crate::types::ShardId>,
 ) -> HarvestResult<ReconcileSummary> {
-    reconcile_quota_keys_from(conn, batch_size, None)
+    reconcile_quota_keys_from(conn, batch_size, None, shard)
         .await
         .map(|(summary, _next_cursor)| summary)
 }
@@ -439,6 +476,10 @@ pub async fn reconcile_quota_keys(
 ///
 /// `batch_size <= 0` disables the sweep: the task returns immediately
 /// without polling, mirroring `codec_rotation_batch_size = 0`.
+///
+/// `shard` is passed to every tick's [`reconcile_quota_keys_from`] call
+/// for its cross-region DR fence assertion (issue #954) -- see that
+/// function's doc comment.
 #[cfg(feature = "db")]
 #[must_use]
 pub fn spawn_quota_key_reconciler_for_shard(
@@ -446,6 +487,7 @@ pub fn spawn_quota_key_reconciler_for_shard(
     cancel: tokio_util::sync::CancellationToken,
     interval: std::time::Duration,
     batch_size: i64,
+    shard: Option<crate::types::ShardId>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         if batch_size <= 0 {
@@ -463,7 +505,7 @@ pub fn spawn_quota_key_reconciler_for_shard(
             }
             match pool.get().await {
                 Ok(mut conn) => {
-                    match reconcile_quota_keys_from(&mut conn, batch_size, cursor).await {
+                    match reconcile_quota_keys_from(&mut conn, batch_size, cursor, shard).await {
                         Ok((summary, next_cursor)) => {
                             cursor = next_cursor;
                             if summary.backfilled > 0 {
