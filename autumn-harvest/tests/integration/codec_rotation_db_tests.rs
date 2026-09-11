@@ -32,6 +32,14 @@
 //!   covered in the plugin crate's `codec_rotation_admin_integration.rs`.
 //! - **AC8** (composition with offload / erasure) —
 //!   [`offload_envelopes_and_tombstones_survive_a_sweep_untouched`].
+//! - **Issue #1257** (`write_cursor` is a compare-and-swap; DR fencing on the
+//!   cursor writers) — [`a_stale_cursor_write_cannot_overwrite_newer_progress`],
+//!   [`a_stale_rewind_cannot_decrease_rows_reencrypted`],
+//!   [`a_deliberate_rewind_to_zero_always_applies`], and
+//!   [`a_new_active_key_always_starts_a_fresh_pass`] cover the CAS guard.
+//!   `cross_region_dr_tests.rs`'s `a_fenced_worker_cannot_advance_the_rotation_cursor`
+//!   and `a_fenced_sweep_that_converts_nothing_still_fails_closed` cover the
+//!   fencing.
 //!
 //! Runs against `HARVEST_TEST_DATABASE_URL` when set (each test gets its own
 //! throwaway database, because the rotation census is shard-wide by design),
@@ -2119,8 +2127,8 @@ async fn a_stale_cursor_write_cannot_overwrite_newer_progress() {
     //
     // Exercised directly against `write_cursor`, the same way
     // `a_stale_read_can_never_overwrite_a_committed_erasure` exercises
-    // `compare_and_swap_event` directly: the batch-oriented sweep entry
-    // point runs single-threaded on one connection and cannot express two
+    // `compare_and_swap_event` directly. The batch-oriented sweep entry
+    // point runs single-threaded on one connection. It cannot express two
     // writers racing the same read.
     let (url, _c) = setup_isolated_db().await;
     let mut conn = connect(&url).await;
@@ -2163,8 +2171,9 @@ async fn a_stale_cursor_write_cannot_overwrite_newer_progress() {
 async fn a_deliberate_rewind_to_zero_always_applies() {
     // `last_event_id = 0` is the deliberate reset a pass takes when it
     // leaves rows unresolved (see `sweep_codec_reencryption_once`). The CAS
-    // guard must not mistake that reset for a stale write and drop it, even
-    // over a stored value that is higher.
+    // guard must not mistake that reset for a stale write and drop it.
+    // That holds even over a stored `last_event_id` that is higher, as
+    // long as `rows_reencrypted` still holds or grows (held equal here).
     let (url, _c) = setup_isolated_db().await;
     let mut conn = connect(&url).await;
     let shard = ShardId::new(0);
@@ -2185,11 +2194,57 @@ async fn a_deliberate_rewind_to_zero_always_applies() {
 }
 
 #[tokio::test]
+async fn a_stale_rewind_cannot_decrease_rows_reencrypted() {
+    // A rewind resets `last_event_id` to 0 unconditionally, but the row it
+    // writes is still one write. The `WHERE` guard must not let that
+    // exemption carry `rows_reencrypted` down with it.
+    //
+    // Two sweepers can each read the same baseline. Each loses some of
+    // its own rows to the other's `compare_and_swap_event`. Each then
+    // lands in the `unresolved_total > 0` rewind branch with a different
+    // `rows_reencrypted_total`, computed from that one shared read.
+    let (url, _c) = setup_isolated_db().await;
+    let mut conn = connect(&url).await;
+    let shard = ShardId::new(0);
+
+    // The baseline both sweepers read: 100 rows already converted.
+    let applied = write_cursor(&mut conn, shard, "k2", 500, 100, 0, None)
+        .await
+        .expect("baseline write");
+    assert!(applied, "the baseline write must apply");
+
+    // The winner converts 30 more of its own rows, then loses the rest of
+    // its batch to the other sweeper. It rewinds at 100 + 30 = 130.
+    let applied = write_cursor(&mut conn, shard, "k2", 0, 130, 20, None)
+        .await
+        .expect("winner rewind");
+    assert!(applied, "the winner's rewind must apply");
+
+    // The loser read the SAME 100-row baseline. It converted only 20 of
+    // its own rows, and also rewinds at 100 + 20 = 120. That is lower than
+    // what is now stored, even though its own `last_event_id` write is
+    // the deliberate reset that always applies.
+    let applied = write_cursor(&mut conn, shard, "k2", 0, 120, 30, None)
+        .await
+        .expect("stale rewind");
+    assert!(
+        !applied,
+        "a rewind computed from a stale read must not decrease rows_reencrypted"
+    );
+
+    let cursor = cursor_row(&mut conn, 0).await.expect("cursor row");
+    assert_eq!(
+        cursor.rows_reencrypted, 130,
+        "the winner's higher count must survive the loser's rewind"
+    );
+}
+
+#[tokio::test]
 async fn a_new_active_key_always_starts_a_fresh_pass() {
     // A cursor recorded against a different key belongs to a different pass
-    // entirely. Its `last_event_id` is not comparable to the new key's, so a
-    // fresh pass must apply even when its `last_event_id` reads lower than
-    // the old key's.
+    // entirely. Its `last_event_id` and `rows_reencrypted` are not
+    // comparable to the new key's. A fresh pass must apply even when both
+    // read lower than the old key's.
     let (url, _c) = setup_isolated_db().await;
     let mut conn = connect(&url).await;
     let shard = ShardId::new(0);
@@ -2209,4 +2264,8 @@ async fn a_new_active_key_always_starts_a_fresh_pass() {
     let cursor = cursor_row(&mut conn, 0).await.expect("cursor row");
     assert_eq!(cursor.active_key_id, "k2");
     assert_eq!(cursor.last_event_id, 10);
+    assert_eq!(
+        cursor.rows_reencrypted, 1,
+        "the fresh pass's own count must land, not a value carried over"
+    );
 }

@@ -514,11 +514,17 @@ async fn a_fenced_worker_cannot_re_encrypt_history() {
 #[tokio::test]
 async fn a_fenced_worker_cannot_advance_the_rotation_cursor() {
     // Sibling to `a_fenced_worker_cannot_re_encrypt_history` (issue #1257).
-    // Before this fix, `write_cursor` had no fence check of its own. Even
-    // while the per-row CAS correctly refused to touch `harvest_events`,
-    // the sweep still reached `write_cursor`. It recorded progress past a
-    // row it was fenced away from. A worker pinned to a superseded
-    // generation must not record any rotation progress at all.
+    // A worker pinned to a superseded generation must not record any
+    // rotation progress at all, not just leave `harvest_events` untouched.
+    //
+    // With a convertible row present, the existing per-row fence on
+    // `compare_and_swap_event` (issue #954) already errors out of the
+    // sweep before `write_cursor` is reached. So this scenario alone does
+    // not discriminate the fix from before it. See
+    // `a_fenced_sweep_that_converts_nothing_still_fails_closed` for the
+    // batch that reaches `write_cursor` with nothing to convert. This test
+    // stays as a direct check that no cursor row leaks in the common case
+    // too.
     let _serial = registry_guard().await;
     let (url, _db) = require_db!("rotate_cursor");
     let mut conn = connect(&url).await;
@@ -668,6 +674,12 @@ async fn a_fenced_sweep_that_converts_nothing_still_fails_closed() {
     .load(&mut conn)
     .await
     .unwrap();
+    // `rows.len()` and `last_event_id` hold both before and after this
+    // fix. The seeded row already starts at `last_event_id = 0`, so they
+    // document the row is untouched rather than proving the fence fired.
+    // `updated_at` is the assertion that actually distinguishes a fenced
+    // `claim_completed_cursor_revalidation` from an unfenced one. An
+    // unfenced worker would have won the claim and bumped it to `NOW()`.
     assert_eq!(
         rows.len(),
         1,

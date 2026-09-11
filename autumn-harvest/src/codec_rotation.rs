@@ -1103,18 +1103,26 @@ mod db {
     /// overwrite a fresher one -- a lost update moves the cursor backward or
     /// drops rows from `rows_reencrypted`.
     ///
-    /// The `WHERE` clause on `DO UPDATE` guards against that. It applies the
-    /// write only when the new `last_event_id` and `rows_reencrypted` are
-    /// each at least the stored value, for the same `active_key_id`. A write
-    /// computed from a stale read fails this check and is dropped, not
-    /// applied -- mirroring [`compare_and_swap_event`] for `harvest_events`.
+    /// The `WHERE` clause on `DO UPDATE` guards against that. For the same
+    /// `active_key_id`, it applies the write only when the new
+    /// `rows_reencrypted` is at least the stored value. A write computed
+    /// from a stale read fails this check and is dropped, not applied --
+    /// mirroring [`compare_and_swap_event`] for `harvest_events`.
     ///
-    /// Two writes always apply, by design:
+    /// `rows_reencrypted` never gets a rewind exception. Every branch that
+    /// resets `last_event_id` still carries `rows_reencrypted` forward from
+    /// the same read (see `sweep_codec_reencryption_once`). A stale write
+    /// can never legitimately need to lower it.
+    ///
+    /// `last_event_id` gets two exceptions:
     /// - A different `active_key_id` starts a fresh pass. Its
-    ///   `last_event_id` is not comparable to the previous key's.
+    ///   `last_event_id` is not comparable to the previous key's, so the
+    ///   whole write applies regardless of `rows_reencrypted` too.
     /// - `last_event_id = 0` is the deliberate rewind a pass takes when it
-    ///   leaves rows unresolved (see `sweep_codec_reencryption_once`). That
-    ///   reset must stay possible, even over a higher stored value.
+    ///   leaves rows unresolved. That reset must stay possible even over a
+    ///   higher stored `last_event_id`. It still needs `rows_reencrypted`
+    ///   to pass its own check, or a stale rewind could drop rows from the
+    ///   count it carries forward.
     ///
     /// ## Fencing (issue #954, issue #1257)
     ///
@@ -1122,9 +1130,9 @@ mod db {
     /// [`crate::replication::FenceRegistry::is_enabled`] holds, the write
     /// runs inside a transaction behind [`crate::replication::assert_fence`].
     /// A worker pinned to a superseded generation cannot advance the cursor
-    /// this way -- including a batch that converted no rows and so never
-    /// reached the per-row CAS. The fence check is skipped when fencing is
-    /// off: one statement, no extra round trip.
+    /// this way. That covers a batch that converted no rows too, since such
+    /// a batch never reaches the per-row CAS. The fence check is skipped
+    /// when fencing is off: one statement, no extra round trip.
     ///
     /// `#[doc(hidden)] pub` so the CAS is directly testable by an
     /// integration test. Not part of the engine's stable API.
@@ -1199,10 +1207,12 @@ mod db {
                  completed_at = EXCLUDED.completed_at, \
                  updated_at = NOW() \
              WHERE harvest_codec_rotation_cursor.active_key_id <> EXCLUDED.active_key_id \
-                OR EXCLUDED.last_event_id = 0 \
-                OR (harvest_codec_rotation_cursor.last_event_id <= EXCLUDED.last_event_id \
-                    AND harvest_codec_rotation_cursor.rows_reencrypted \
-                        <= EXCLUDED.rows_reencrypted)",
+                OR ( \
+                     (EXCLUDED.last_event_id = 0 \
+                      OR harvest_codec_rotation_cursor.last_event_id <= EXCLUDED.last_event_id) \
+                     AND harvest_codec_rotation_cursor.rows_reencrypted \
+                         <= EXCLUDED.rows_reencrypted \
+                   )",
         )
         .bind::<Integer, _>(shard_id)
         .bind::<Text, _>(active_key_id)
