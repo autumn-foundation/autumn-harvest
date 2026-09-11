@@ -1340,14 +1340,27 @@ fn resolve_row_quota_lock_key(row: &FireDueRow) -> Option<(String, String)> {
 /// `enforce_timeouts_once` and aborts every OTHER duty in that tick, not
 /// just the one row that collided.
 ///
-/// Sorting each batch by its rows' resolved quota key fixes this. The
-/// `workflow_id` breaks ties, so the order stays total and reproducible.
-/// Every transaction now visits key1 before key2. So no two transactions
-/// can ever hold a key the other waits for. This function only REORDERS
-/// the batch -- it does not lock anything itself. Each row still locks
-/// its own execution row first, then its own quota key. That is the SAME
+/// Sorting each batch by its rows' resolved quota key fixes this. Every
+/// transaction now visits key1 before key2. So no two transactions can
+/// ever hold a key the other waits for. This function only REORDERS the
+/// batch -- it does not lock anything itself. Each row still locks its
+/// own execution row first, then its own quota key. That is the SAME
 /// order a direct (non-batched) start uses. This fire loop behaved the
 /// same way before this fix.
+///
+/// The sort is stable and compares ONLY the resolved key (review, P2).
+/// Two rows with the same key -- or with no key at all -- keep their
+/// original relative order. That order is the claim query's
+/// `deferred_at ASC`, within a bucket's rank-capped share (see
+/// `fire_due_on_conn`'s claim SQL). It is the documented per-bucket FIFO
+/// admission order (issue #607).
+///
+/// An earlier version of this fix broke ties on `workflow_id` instead.
+/// That scrambled FIFO whenever two claimed rows shared a bucket, or
+/// carried no quota policy at all. A fresh `workflow_id` does not
+/// correlate with arrival order. Comparing only the key avoids that.
+/// Same-key rows are equal under this comparator. So the stable sort
+/// leaves them exactly where the claim query put them.
 ///
 /// That ordering detail is not incidental. An earlier version of this fix
 /// pre-acquired every batch's quota locks BEFORE firing any row (code
@@ -1378,11 +1391,7 @@ fn order_due_rows_for_deadlock_free_firing(due_rows: Vec<FireDueRow>) -> Vec<Fir
         .into_iter()
         .map(|row| (resolve_row_quota_lock_key(&row), row))
         .collect();
-    decorated.sort_by(|(a_key, a_row), (b_key, b_row)| {
-        a_key
-            .cmp(b_key)
-            .then_with(|| a_row.workflow_id.cmp(&b_row.workflow_id))
-    });
+    decorated.sort_by(|(a_key, _), (b_key, _)| a_key.cmp(b_key));
     decorated.into_iter().map(|(_, row)| row).collect()
 }
 
@@ -2320,6 +2329,58 @@ mod tests {
                     row("wf_a", "tenant-1"),
                 ];
                 assert_eq!(order_due_rows_for_deadlock_free_firing(rows).len(), 3);
+            });
+        }
+
+        #[test]
+        fn preserves_claim_order_for_rows_sharing_one_quota_key() {
+            // Review, P2: an earlier version broke ties on `workflow_id`,
+            // which scrambled the claim query's per-bucket FIFO admission
+            // order (issue #607) for same-key rows. `workflow_id` is a
+            // fresh random UUID per row, uncorrelated with claim order, so
+            // this regresses without a fix. The sort must be stable and
+            // compare ONLY the resolved key, leaving same-key rows exactly
+            // where the claim query put them.
+            let mut map = HashMap::new();
+            map.insert(
+                "wf_a".to_string(),
+                wf_meta(Some(
+                    QuotaPolicy::new("tenant_id").with_max_active_executions(100),
+                )),
+            );
+            with_metadata(map, || {
+                let claimed = vec![
+                    row("wf_a", "tenant-1"),
+                    row("wf_a", "tenant-1"),
+                    row("wf_a", "tenant-1"),
+                ];
+                let claim_order: Vec<_> = claimed.iter().map(|r| r.workflow_id.clone()).collect();
+
+                let fired = order_due_rows_for_deadlock_free_firing(claimed);
+                let fired_order: Vec<_> = fired.iter().map(|r| r.workflow_id.clone()).collect();
+
+                assert_eq!(fired_order, claim_order);
+            });
+        }
+
+        #[test]
+        fn preserves_claim_order_when_rows_have_no_quota_key() {
+            // Same regression as above (review, P2), but for the more
+            // common case: workflows with no quota policy at all. Every
+            // row resolves to `None`, so they all compare equal -- the
+            // stable sort must still leave them in claim order.
+            with_metadata(HashMap::new(), || {
+                let claimed = vec![
+                    row("wf_no_policy", "tenant-1"),
+                    row("wf_no_policy", "tenant-2"),
+                    row("wf_no_policy", "tenant-3"),
+                ];
+                let claim_order: Vec<_> = claimed.iter().map(|r| r.workflow_id.clone()).collect();
+
+                let fired = order_due_rows_for_deadlock_free_firing(claimed);
+                let fired_order: Vec<_> = fired.iter().map(|r| r.workflow_id.clone()).collect();
+
+                assert_eq!(fired_order, claim_order);
             });
         }
 
