@@ -241,20 +241,21 @@ pub struct WorkerRuntimeConfig {
     ///
     /// **On the struct, not only on the process-global [`DrConfig`] beside
     /// it, and that asymmetry is deliberate.** A runtime config can be built
-    /// and *stored* long before `Worker::new` consumes it — the plugin's
-    /// `PreparedHarvestRuntime` does exactly that — so any unrelated
+    /// and *stored* long before `Worker::new` consumes it. The plugin's
+    /// `PreparedHarvestRuntime` does exactly that. So any unrelated
     /// `WorkerConfig::default()` conversion in between would overwrite a
-    /// last-writer-wins global and this worker would snapshot the wrong
-    /// values: silently unfenced while `effective_config` still reported DR
-    /// enabled, or sampling the wrong slot prefix while
-    /// `effective_config` still advertised the configured one. So the whole
-    /// [`DrConfig`], not only `fencing`, travels with the conversion that
-    /// produced it (finding 6 — an earlier revision carried only `fencing`
-    /// on the struct on the theory that racing the other three fields "only
-    /// changes sampler timing". Finding 6 disproved that once `slot_prefix`
-    /// joined them: the prefix decides which walsenders count as this
-    /// deployment's DR replication at all, so racing it can silently change
-    /// *what* is sampled, not merely *when*).
+    /// last-writer-wins global, and this worker would snapshot the wrong
+    /// values. It would be silently unfenced while `effective_config`
+    /// still reported DR enabled. Or it would sample the wrong slot prefix
+    /// while `effective_config` still advertised the configured one.
+    ///
+    /// So the whole [`DrConfig`], not only `fencing`, travels with the
+    /// conversion that produced it (finding 6). An earlier revision carried
+    /// only `fencing` on the struct, on the theory that racing the other
+    /// three fields "only changes sampler timing". Finding 6 disproved that
+    /// once `slot_prefix` joined them. The prefix decides which walsenders
+    /// count as this deployment's DR replication at all, so racing it can
+    /// silently change *what* is sampled, not merely *when*.
     ///
     /// [`DrConfig`]: crate::replication::DrConfig
     pub dr: crate::replication::DrConfig,
@@ -398,9 +399,9 @@ impl From<WorkerConfig> for WorkerRuntimeConfig {
         // Also published to the process-global `DrConfig` the persist-assert
         // and admin-introspection paths read (issue #954). `Self.dr` below
         // carries the SAME value directly, rather than a later
-        // `Worker::new` reading it back off this global ( finding
-        // 6): a `WorkerRuntimeConfig` can be built and stored long before
-        // `Worker::new` consumes it, and an unrelated conversion in between
+        // `Worker::new` reading it back off this global (finding 6). A
+        // `WorkerRuntimeConfig` can be built and stored long before
+        // `Worker::new` consumes it. An unrelated conversion in between
         // would otherwise overwrite the last-writer-wins global underneath
         // it.
         let dr = crate::replication::DrConfig {
@@ -23309,13 +23310,14 @@ async fn sample_one_shard(
                     .record_replication_lag_seconds(shard_u16, seconds);
             }
             // Emitted every tick the views are readable, `known = false`
-            // included (issue #954, finding 2): a Prometheus gauge keeps
-            // exporting its last value, so skipping the lag gauge above when
-            // the RPO is unknown does not make the dashboard stale — it
-            // freezes it at the last healthy reading. This gauge is the
-            // signal that breaks that freeze for the "views readable, RPO
-            // unmeasurable" case that record_replication_observable's `false`
-            // arm does not cover.
+            // included (issue #954, finding 2). A Prometheus gauge keeps
+            // exporting its last value. Merely skipping the lag gauge above
+            // when the RPO is unknown does not make the dashboard stale. It
+            // instead freezes the dashboard at the last healthy reading.
+            // This gauge is the signal that breaks that freeze for the
+            // "views readable, RPO unmeasurable" case.
+            // `record_replication_observable`'s `false` arm does not cover
+            // that case.
             telemetry
                 .metrics
                 .record_replication_rpo_known(shard_u16, rpo_seconds.is_some());
@@ -25200,13 +25202,13 @@ impl Worker {
         // poll, so a DR-enabled worker is never briefly unfenced (issue
         // #954). This used to run AFTER the registration loop below,
         // contradicting this exact comment and the single-shard path's
-        // ordering ( finding 4): a worker in that window could not
-        // claim or persist — the claim/persist gates are structural and
-        // unaffected — but it could appear as a live worker in
-        // `harvest_workers` and mutate rate-limit buckets on a shard whose
-        // generation it had not yet pinned, and a subsequent
-        // `pin_dr_generations` failure then left those registrations behind
-        // with no heartbeat started to clean them up.
+        // ordering (finding 4). A worker in that window could not claim or
+        // persist — the claim/persist gates are structural and unaffected.
+        // But it could appear as a live worker in `harvest_workers`. It
+        // could also mutate rate-limit buckets on a shard whose generation
+        // it had not yet pinned. A subsequent `pin_dr_generations` failure
+        // then left those registrations behind, with no heartbeat started
+        // to clean them up.
         if !self.pin_dr_generations(default_pool).await {
             self.shutdown.cancel();
             return;

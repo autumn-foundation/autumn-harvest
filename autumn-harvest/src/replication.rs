@@ -191,11 +191,11 @@ pub enum ReplicationStatus {
 /// What the watermark trail can say about a shard's RPO.
 ///
 /// Five states, not `Option<f64>`, because several "no number" cases mean
-/// opposite things and collapsing them is dangerous. A trail the standby has
-/// fallen off the end of means the RPO is **huge**, a trail with nothing
-/// confirmed yet means it is merely **unmeasured**, and a trail this process
-/// could not even read is neither — it is a state `replay_lag` must never be
-/// allowed to paper over.
+/// opposite things. Collapsing them is dangerous. A trail the standby has
+/// fallen off the end of means the RPO is **huge**. A trail with nothing
+/// confirmed yet means it is merely **unmeasured**. A trail this process
+/// could not even read is neither one — it is a state `replay_lag` must
+/// never be allowed to paper over.
 #[derive(Debug, Clone, Copy, PartialEq)]
 #[non_exhaustive]
 pub enum WatermarkReading {
@@ -224,9 +224,9 @@ pub enum WatermarkReading {
     /// has consumed anything yet", where `replay_lag` is still a fair
     /// fallback. This means "one target is unmeasurable while another is
     /// fine" — an abandoned or never-connected slot sitting next to a
-    /// healthy standby. Falling back to `replay_lag` here would report the
-    /// healthy standby's small lag and hide the abandoned slot completely,
-    /// which is the failure this variant exists to stop.
+    /// healthy standby. Falling back to `replay_lag` here would report only
+    /// the healthy standby's small lag. That would hide the abandoned slot
+    /// completely, which is the failure this variant exists to stop.
     PartiallyMeasured {
         /// The watermark reading for the slots that DO have a position, if
         /// the trail has confirmed one for them yet. Never backed by
@@ -240,10 +240,10 @@ pub enum WatermarkReading {
     /// The watermark trail could not be read (a query error).
     ///
     /// Not the same as [`Self::Unknown`]: an unmeasured trail may still trust
-    /// `replay_lag`, but a trail read that FAILED is the one moment
-    /// `replay_lag` is least trustworthy — it is frozen or NULL whenever a
-    /// logical apply worker is stuck, which is the incident this trail exists
-    /// to measure. Never eligible for the `replay_lag` fallback.
+    /// `replay_lag`. A trail read that FAILED is different — it is the one
+    /// moment `replay_lag` is least trustworthy. It is frozen or NULL
+    /// whenever a logical apply worker is stuck, which is the incident this
+    /// trail exists to measure. Never eligible for the `replay_lag` fallback.
     Failed,
 }
 
@@ -307,10 +307,10 @@ impl ReplicationStatus {
 
     /// How many DR slots for this shard have no confirmed position at all.
     ///
-    /// `0` in every state except [`WatermarkReading::PartiallyMeasured`] — the
-    /// separate signal an abandoned or never-connected slot pages on, since it
-    /// does not lower [`Self::rpo_seconds`] the way a slow-but-connected
-    /// standby would.
+    /// `0` in every state except [`WatermarkReading::PartiallyMeasured`]. This
+    /// is the separate signal an abandoned or never-connected slot pages on,
+    /// since it does not lower [`Self::rpo_seconds`] the way a
+    /// slow-but-connected standby would.
     #[must_use]
     pub const fn unmeasurable_slot_count(&self) -> usize {
         match self {
@@ -349,15 +349,15 @@ impl ReplicationStatus {
     /// NULL `replay_lag` is the signature of a stuck apply worker.
     ///
     /// `None` means *unknown*, and unknown is the honest answer in three
-    /// distinct situations that all look like "no number": the views were
-    /// unreadable, no standby is connected at all, or **any** connected
-    /// standby has not reported a `replay_lag` yet. Each is a reason to page,
-    /// and none of them is `0.0`.
+    /// distinct situations that all look like "no number". The views were
+    /// unreadable, or no standby is connected at all, or **any** connected
+    /// standby has not reported a `replay_lag` yet. Each is a reason to
+    /// page, and none of them is `0.0`.
     ///
     /// A worst-case reduction must treat one missing reading as unknown, not
-    /// absent: dropping an unmeasurable standby from the `max` and keeping the
-    /// rest would let a healthy peer mask it, reporting that peer's small lag
-    /// as the fleet's worst case.
+    /// absent. Dropping an unmeasurable standby from the `max` and keeping the
+    /// rest would let a healthy peer mask it. The fleet's worst case would
+    /// then read as that peer's small lag.
     #[must_use]
     pub fn max_replay_lag_seconds(&self) -> Option<f64> {
         let Self::Observed { standbys, .. } = self else {
@@ -564,10 +564,10 @@ impl std::fmt::Display for PinConflict {
 /// A [`FenceRegistry::set_default_shard`] rejected because this process is
 /// already pinned to a different default shard.
 ///
-/// Same shape as [`PinConflict`], one level up: the default shard resolves
-/// every [`ShardId::UNENCODED`] execution id, so two workers in one process
+/// Same shape as [`PinConflict`], one level up. The default shard resolves
+/// every [`ShardId::UNENCODED`] execution id. Two workers in one process
 /// disagreeing about it is the same "write once per process" hazard as a
-/// generation conflict ( finding 13).
+/// generation conflict (finding 13).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DefaultShardConflict {
     /// The default shard this process is already pinned to.
@@ -637,12 +637,12 @@ pub struct FenceRegistry;
 impl FenceRegistry {
     /// Pin `shard` at `generation` for the lifetime of this process.
     ///
-    /// Conflict-checked exactly like [`Self::publish`] ( finding 3):
+    /// Conflict-checked exactly like [`Self::publish`] (finding 3):
     /// re-pinning an already-pinned shard to a *different* generation is
     /// refused rather than silently overwriting it. Without this check a
-    /// worker started after a fence could call this directly and hand write
-    /// authority back to a worker the fence already stopped — the same
-    /// split-brain [`Self::publish`]'s conflict check exists to prevent.
+    /// worker started after a fence could call this directly. It could then
+    /// hand write authority back to a worker the fence already stopped — the
+    /// same split-brain [`Self::publish`]'s conflict check exists to prevent.
     /// Re-registering the *same* generation is fine and idempotent.
     ///
     /// # Errors
@@ -710,9 +710,9 @@ impl FenceRegistry {
     /// # Errors
     ///
     /// Returns the conflicting generation or default shard when either is
-    /// already pinned to a different value ( finding 13 covers the
-    /// default shard — it is validated in the same pre-flight pass as the
-    /// generations, so a rejected publish mutates neither). The caller must
+    /// already pinned to a different value. Finding 13 covers the default
+    /// shard: it is validated in the same pre-flight pass as the
+    /// generations, so a rejected publish mutates neither. The caller must
     /// refuse to start; nothing is published.
     pub fn publish(
         pins: &[(ShardId, ShardGeneration)],
@@ -771,13 +771,13 @@ impl FenceRegistry {
     /// the pool's default shard exactly as [`crate::shard::ShardedDbPool`]
     /// routes them.
     ///
-    /// Conflict-checked like [`Self::publish`] ( finding 13):
+    /// Conflict-checked like [`Self::publish`] (finding 13):
     /// re-pinning an already-pinned default shard to a *different* shard is
-    /// refused. Without this check, two workers in one process disagreeing
-    /// about the default shard would let the later one silently redirect
-    /// every `UNENCODED` execution id the earlier one resolves — a spurious
-    /// fence, or a check against the wrong epoch. Re-setting the *same*
-    /// default shard is fine and idempotent.
+    /// refused. Two workers in one process could otherwise disagree about
+    /// the default shard. The later one would then silently redirect every
+    /// `UNENCODED` execution id the earlier one resolves. That is a
+    /// spurious fence, or a check against the wrong epoch. Re-setting the
+    /// *same* default shard is fine and idempotent.
     ///
     /// # Errors
     ///
@@ -1018,18 +1018,17 @@ mod db {
     /// `a_fresh_database_provisions_generation_zero_and_is_idempotent`.
     ///
     /// The fallback read is a **separate statement**, not a `UNION ALL`
-    /// trailing the `INSERT` ( finding 8). Under READ COMMITTED every
-    /// part of one statement shares the snapshot taken at that statement's
-    /// start. When two workers race to provision the same shard, the loser's
+    /// trailing the `INSERT` (finding 8). Under READ COMMITTED every part of
+    /// one statement shares the snapshot taken at that statement's start.
+    /// Two workers can race to provision the same shard. The loser's
     /// `ON CONFLICT DO NOTHING` blocks on the winner's transaction and, once
-    /// it commits, inserts nothing — but a fallback read in the SAME
-    /// statement still uses the pre-commit snapshot and sees no row either,
-    /// so the whole statement returns empty and this function spuriously
-    /// refuses to start. A worker started after this one commits is
-    /// unaffected by the pinned generation this fixes; a fleet-wide first
-    /// start, where every worker starts at once, is exactly when this race
-    /// bites hardest. A separate statement takes a fresh snapshot and is
-    /// guaranteed to see the winner's now-committed row.
+    /// it commits, inserts nothing. A fallback read in the SAME statement
+    /// still uses the pre-commit snapshot, though, and sees no row either.
+    /// The whole statement then returns empty, and this function spuriously
+    /// refuses to start. A fleet-wide first start, where every worker starts
+    /// at once, is exactly when this race bites hardest. A separate
+    /// statement takes a fresh snapshot and is guaranteed to see the
+    /// winner's now-committed row.
     ///
     /// # Errors
     ///
@@ -1256,10 +1255,10 @@ mod db {
     /// until a feedback round-trip has completed, and "we have not measured
     /// this standby yet" must not read as "this standby is caught up".
     ///
-    /// `starts_with($1)`, not `LIKE $1 || '%'` ( finding 7): `LIKE`
-    /// treats `_` and `%` as wildcards, and the shipped default prefix
-    /// `harvest_dr` contains an underscore, so on the default configuration
-    /// `LIKE` also matched an unrelated slot or `application_name` such as
+    /// `starts_with($1)`, not `LIKE $1 || '%'` (finding 7). `LIKE` treats `_`
+    /// and `%` as wildcards, and the shipped default prefix `harvest_dr`
+    /// contains an underscore. So on the default configuration `LIKE` also
+    /// matched an unrelated slot or `application_name` such as
     /// `harvestXdr_shard0`. `starts_with` is a literal prefix comparison.
     const STANDBY_SQL: &str = "SELECT \
             r.state::text AS state, \
@@ -1281,7 +1280,7 @@ mod db {
     /// `confirmed_flush_lsn`. `COALESCE` picks whichever the slot has, so one
     /// query covers both replication styles the topology doc offers.
     ///
-    /// `starts_with($1)`, not `LIKE $1 || '%'` — see [`STANDBY_SQL`] ( finding 7).
+    /// `starts_with($1)`, not `LIKE $1 || '%'`. See [`STANDBY_SQL`] (finding 7).
     const SLOT_SQL: &str = "SELECT \
             s.slot_name::text AS slot_name, \
             s.active, \
@@ -1380,15 +1379,15 @@ mod db {
                 // Half an interval of slack, so ordinary scheduling jitter does
                 // not skip a window outright and halve the effective cadence.
                 // `fence_generation` stamps the write-authority epoch in
-                // force when this beat was written ( finding 10).
+                // force when this beat was written (finding 10).
                 // `docs/cross-region-dr.md`'s setup SQL replicates this table
-                // with `FOR ALL TABLES`, so after a promotion the standby can
+                // with `FOR ALL TABLES`. So after a promotion the standby can
                 // carry pre-promotion beats whose LSNs belong to the OLD
                 // cluster's WAL stream. Those numbers are not comparable to
-                // the new primary's, and `measure_rpo` filters on this column
-                // so a beat from a superseded generation is never read back
-                // as if it were in the current WAL stream. Defaults to `0`
-                // (no fencing row yet) via `COALESCE`, matching the pre-#954
+                // the new primary's. `measure_rpo` filters on this column, so
+                // a beat from a superseded generation is never read back as
+                // if it were in the current WAL stream. Defaults to `0` (no
+                // fencing row yet) via `COALESCE`, matching the pre-#954
                 // behaviour on a shard where fencing was never enabled.
                 diesel::sql_query(
                     "INSERT INTO harvest_replication_heartbeat \
@@ -1480,33 +1479,35 @@ mod db {
     ///
     /// **Step 1 — the standbys' positions.** `MIN(COALESCE(confirmed_flush_lsn,
     /// replay_lsn, restart_lsn))` over every replication slot scoped to this
-    /// shard's database — the worst standby sets the RPO, and `COALESCE`
-    /// covers logical (`confirmed_flush_lsn`) and physical (`restart_lsn`)
-    /// slots with one query. The `MIN` is taken only over slots that DO have a
-    /// position; slots that do not are counted separately as
+    /// shard's database — the worst standby sets the RPO. `COALESCE` covers
+    /// logical (`confirmed_flush_lsn`) and physical (`restart_lsn`) slots
+    /// with one query. The `MIN` is taken only over slots that DO have a
+    /// position. Slots that do not are counted separately as
     /// `unmeasurable_slots` rather than dropped silently. Folding "one slot
     /// unmeasurable" into "nothing consumed anywhere" would let an abandoned
-    /// slot hide behind a healthy peer's small lag — precisely the "report a
-    /// perfect RPO for replication that is dead" outcome this module exists to
-    /// avoid ( finding 1). An abandoned slot is retaining WAL and is
-    /// exactly what an operator must be told about; see
+    /// slot hide behind a healthy peer's small lag. That is precisely the
+    /// "report a perfect RPO for replication that is dead" outcome this
+    /// module exists to avoid (finding 1). An abandoned slot is retaining
+    /// WAL and is exactly what an operator must be told about; see
     /// [`ReplicationStatus::inactive_slots`] and
     /// [`ReplicationStatus::unmeasurable_slot_count`].
     ///
     /// **Step 2 — the watermark.** Only issued when step 1 produced a
-    /// position for at least one slot. Doing it in a separate statement meant
-    /// that with no slot the predicate was never true and the index scan
-    /// walked the *entire* retained trail to return nothing (measured: 200k
-    /// rows, 2646 buffers, 22 ms) — on every sampler tick of every worker of a
-    /// deployment that has not finished wiring up replication.
+    /// position for at least one slot. Doing it in a separate statement
+    /// matters: with no slot the predicate was never true. The index scan
+    /// then walked the *entire* retained trail to return nothing (measured:
+    /// 200k rows, 2646 buffers, 22 ms). That happened on every sampler tick
+    /// of every worker of a deployment that has not finished wiring up
+    /// replication.
     ///
-    /// Returns [`WatermarkReading::Unknown`] when there is no slot at all, or
-    /// when every slot lacks a position (nothing has consumed anything yet —
-    /// `replay_lag` is still a fair fallback there).
-    /// [`WatermarkReading::PartiallyMeasured`] when some slots have a position
-    /// and others do not — never fallback-eligible. Otherwise
-    /// [`WatermarkReading::Measured`] or [`WatermarkReading::BeyondTrail`] from
-    /// the confirmed slots' watermark.
+    /// Returns [`WatermarkReading::Unknown`] when there is no slot at all,
+    /// or when every slot lacks a position. Nothing has consumed anything
+    /// yet in that case, so `replay_lag` is still a fair fallback there.
+    /// Returns [`WatermarkReading::PartiallyMeasured`] when some slots have
+    /// a position and others do not — never fallback-eligible. Otherwise
+    /// returns [`WatermarkReading::Measured`] or
+    /// [`WatermarkReading::BeyondTrail`] from the confirmed slots'
+    /// watermark.
     ///
     /// # Errors
     ///
@@ -1533,11 +1534,11 @@ mod db {
         // for the byte backlog (`SLOT_SQL`), which is a retention and
         // disk-pressure signal — that is exactly what `restart_lsn` measures.
         //
-        // `starts_with($1)`, not `LIKE $1 || '%'`: `LIKE` treats `_` and `%` as
-        // wildcards, and the shipped default prefix `harvest_dr` contains an
-        // underscore, so `LIKE` matched an unrelated slot such as
-        // `harvestXdr_shard0` on the default configuration ( finding
-        // 7). `starts_with` is a literal prefix comparison.
+        // `starts_with($1)`, not `LIKE $1 || '%'` (finding 7). `LIKE` treats
+        // `_` and `%` as wildcards, and the shipped default prefix
+        // `harvest_dr` contains an underscore. So on the default
+        // configuration `LIKE` matched an unrelated slot such as
+        // `harvestXdr_shard0`. `starts_with` is a literal prefix comparison.
         let positions: Vec<StandbyPositionRow> = diesel::sql_query(
             "SELECT (MIN(pos) FILTER (WHERE pos IS NOT NULL))::text AS position, \
                     COUNT(*) FILTER (WHERE pos IS NULL) AS unmeasurable_slots, \
@@ -1575,7 +1576,7 @@ mod db {
             return Ok(heartbeat);
         }
         // At least one matching slot has no position: flag as partial and
-        // never let this fall back to `replay_lag` ( finding 1).
+        // never let this fall back to `replay_lag` (finding 1).
         Ok(WatermarkReading::PartiallyMeasured {
             measured_seconds: heartbeat.measured_or_floor_seconds(),
             unmeasurable_slots,
@@ -1586,9 +1587,9 @@ mod db {
     /// a watermark reading.
     ///
     /// Split out so [`measure_rpo`] can share it between the ordinary path
-    /// (every slot measurable) and the partial path ( finding 1),
-    /// where the caller decides whether the result may stand on its own or
-    /// must be wrapped as [`WatermarkReading::PartiallyMeasured`].
+    /// (every slot measurable) and the partial path (finding 1). The caller
+    /// decides whether the result may stand on its own, or must be wrapped
+    /// as [`WatermarkReading::PartiallyMeasured`].
     async fn heartbeat_reading(
         conn: &mut AsyncPgConnection,
         shard: ShardId,
@@ -1604,16 +1605,16 @@ mod db {
         // `(shard_id, beat_at DESC)`; neither aggregates the trail.
         //
         // Both branches of `current_gen` are also filtered to the shard's
-        // CURRENT fence generation ( finding 10): the setup SQL in
+        // CURRENT fence generation (finding 10). The setup SQL in
         // `docs/cross-region-dr.md` replicates this table with `FOR ALL
-        // TABLES`, so a standby can carry beats from a superseded generation
-        // whose LSNs belong to a different WAL stream — comparable neither to
-        // each other nor to the new primary's positions. Restricting to the
-        // current generation keeps every comparison inside one WAL stream.
-        // The sampler that writes beats only runs once fencing is enabled,
-        // by which point the fencing row already exists (`ensure_generation_
-        // row` runs first), so a shard with no fencing row has no beats to
-        // read either way.
+        // TABLES`, so a standby can carry beats from a superseded
+        // generation. Those beats' LSNs belong to a different WAL stream —
+        // comparable neither to each other nor to the new primary's
+        // positions. Restricting to the current generation keeps every
+        // comparison inside one WAL stream. The sampler that writes beats
+        // only runs once fencing is enabled, by which point the fencing row
+        // already exists (`ensure_generation_row` runs first). So a shard
+        // with no fencing row has no beats to read either way.
         let rows: Vec<RpoRow> = diesel::sql_query(
             "WITH current_gen AS ( \
                  SELECT generation FROM harvest_shard_generation WHERE shard_id = $1 \
@@ -1673,11 +1674,11 @@ mod db {
         #[diesel(sql_type = Text)]
         sequence_name: String,
         /// `pg_sequences.increment_by`. Negative for a descending sequence
-        /// ( finding 11) — see [`advance_sequences_in_transaction`].
+        /// (finding 11) — see [`advance_sequences_in_transaction`].
         #[diesel(sql_type = BigInt)]
         increment_by: i64,
         /// `pg_sequences.min_value`: the ascending floor, used in place of a
-        /// hardcoded `1` ( finding 11).
+        /// hardcoded `1` (finding 11).
         #[diesel(sql_type = BigInt)]
         min_value: i64,
         /// `pg_sequences.max_value`: the descending ceiling.
@@ -1703,12 +1704,13 @@ mod db {
     /// is why this ships as a function the runbook calls rather than a sentence
     /// in the runbook hoping to be read.
     ///
-    /// Physical (streaming) replicas do not need this — they replicate the WAL
-    /// itself, sequences included — and running it there is harmless *because*
-    /// the target folds in `last_value` rather than using the table's extreme
-    /// value alone: a sequence already ahead of its table's data is left
-    /// where it is, never rewound. See the statement below for why "ahead of
-    /// the table" is an ordinary, expected state rather than corruption.
+    /// Physical (streaming) replicas do not need this — they replicate the
+    /// WAL itself, sequences included. Running it there is harmless. The
+    /// target folds in `last_value` rather than using the table's extreme
+    /// value alone. So a sequence already ahead of its table's data is
+    /// left where it is, never rewound. See the statement below for why
+    /// "ahead of the table" is an ordinary, expected state rather than
+    /// corruption.
     ///
     /// # Scope
     ///
@@ -1784,11 +1786,11 @@ mod db {
         .map_err(database_error)?;
 
         // `tn.nspname` (the OWNING TABLE's schema), not `sn.nspname` (the
-        // sequence's own schema) —  finding 5. A table in
-        // `current_schema()` can own a sequence created in another schema
-        // (legal, and something a migration that qualifies `CREATE SEQUENCE`
-        // produces); filtering on the sequence's own schema silently skipped
-        // it, leaving it un-advanced after promotion.
+        // sequence's own schema) — finding 5. A table in `current_schema()`
+        // can own a sequence created in another schema. That is legal, and
+        // something a migration that qualifies `CREATE SEQUENCE` produces.
+        // Filtering on the sequence's own schema silently skipped it,
+        // leaving it un-advanced after promotion.
         let columns: Vec<SerialColumn> = diesel::sql_query(
             "SELECT tn.nspname::text AS table_schema, \
                     c.relname::text  AS table_name, \
@@ -1829,26 +1831,26 @@ mod db {
             // `is_called = true` so the NEXT value handed out is one step past
             // whichever bound wins.
             //
-            // `pg_sequence_last_value` is in the reduction for a reason: a
+            // `pg_sequence_last_value` is in the reduction for a reason. A
             // sequence can legitimately sit AHEAD of the table's extreme
-            // value — cached values, a rolled-back transaction, deleted rows —
-            // and a physical replica replicates sequences already, so on that
-            // topology this command is meant to be a no-op. Skipping it would
-            // let `setval` *rewind* the sequence and re-issue ids the database
-            // already handed out: a duplicate-key outage caused by the very
-            // command that exists to prevent one. Measured on live Postgres:
-            // insert two rows, delete the second, and MAX is 1 while
-            // last_value is 2.
+            // value — cached values, a rolled-back transaction, deleted
+            // rows. A physical replica replicates sequences already, so on
+            // that topology this command is meant to be a no-op. Skipping
+            // it would let `setval` *rewind* the sequence and re-issue ids
+            // the database already handed out. That is a duplicate-key
+            // outage caused by the very command that exists to prevent one.
+            // Measured on live Postgres: insert two rows, delete the
+            // second, and MAX is 1 while last_value is 2.
             //
-            // Branches on `increment_by` ( finding 11): an ASCENDING
-            // sequence's "furthest issued" value is its MAXIMUM, so the
-            // reduction is `GREATEST` bounded below by `min_value` (never a
-            // hardcoded `1`, which can sit outside a custom-bounded
-            // sequence's own range). A DESCENDING sequence issues in
-            // decreasing order, so "furthest issued" is its MINIMUM, and the
-            // reduction is `LEAST` bounded above by `max_value`. Using
-            // `GREATEST` unconditionally reset a descending sequence that had
-            // issued 100 then 99 back to 100, re-issuing 99 next — a
+            // Branches on `increment_by` (finding 11). An ASCENDING
+            // sequence's "furthest issued" value is its MAXIMUM. So the
+            // reduction is `GREATEST`, bounded below by `min_value` — never
+            // a hardcoded `1`, which can sit outside a custom-bounded
+            // sequence's own range. A DESCENDING sequence issues in
+            // decreasing order, so "furthest issued" is its MINIMUM. The
+            // reduction there is `LEAST` bounded above by `max_value`. Using
+            // `GREATEST` unconditionally reset a descending sequence that
+            // had issued 100 then 99 back to 100. It re-issued 99 next — a
             // collision from the helper whose purpose is preventing one.
             let sql = if col.increment_by > 0 {
                 format!(
@@ -1925,10 +1927,10 @@ mod db {
 
         // A watermark-read failure degrades the same way a view-read failure
         // does: lose the number, never the sampler. `Failed`, not `Unknown`
-        // ( finding 12) — `Unknown` is fallback-eligible, and a
-        // failed read is precisely the moment `replay_lag` is least
-        // trustworthy: it is frozen or NULL whenever a logical apply worker
-        // is stuck, which is the incident this trail exists to measure.
+        // (finding 12) — `Unknown` is fallback-eligible, and a failed read
+        // is precisely the moment `replay_lag` is least trustworthy. It is
+        // frozen or NULL whenever a logical apply worker is stuck, which is
+        // the incident this trail exists to measure.
         let heartbeat = measure_rpo(conn, shard, slot_prefix)
             .await
             .unwrap_or(WatermarkReading::Failed);
@@ -2103,8 +2105,8 @@ mod tests {
     }
 
     /// A worst-case reduction must not let a healthy standby mask an
-    /// unmeasurable one ( finding 9 — the same defect as finding 1,
-    /// one layer down).
+    /// unmeasurable one (finding 9). This is the same defect as finding 1,
+    /// one layer down.
     #[test]
     fn an_unmeasurable_standby_is_not_masked_by_a_healthy_peer() {
         let s = observed(
@@ -2122,9 +2124,9 @@ mod tests {
         );
     }
 
-    /// A partial watermark reading must never fall back to `replay_lag`: that
-    /// column is a trap here precisely, since it can look small and healthy
-    /// while the abandoned slot is invisible in it ( finding 1).
+    /// A partial watermark reading must never fall back to `replay_lag`.
+    /// That column is a trap here precisely: it can look small and healthy
+    /// while the abandoned slot stays invisible in it (finding 1).
     #[test]
     fn a_partially_measured_reading_never_falls_back_to_replay_lag() {
         let s = ReplicationStatus::Observed {
@@ -2155,7 +2157,7 @@ mod tests {
     }
 
     /// A failed watermark read must not become a fallback-eligible `Unknown`
-    /// ( finding 12): the read failing is precisely when `replay_lag`
+    /// (finding 12): the read failing is precisely when `replay_lag`
     /// is least trustworthy.
     #[test]
     fn a_failed_watermark_read_never_falls_back_to_replay_lag() {
@@ -2293,9 +2295,9 @@ mod tests {
     }
 
     /// `register` must refuse a conflicting re-pin exactly like `publish`
-    /// ( finding 3): it is the one other public entry point into the
-    /// same process-global state, and an unconditional `insert` there was a
-    /// hole straight through the "write once per process" invariant.
+    /// (finding 3). It is the one other public entry point into the same
+    /// process-global state. An unconditional `insert` there was a hole
+    /// straight through the "write once per process" invariant.
     #[test]
     fn register_refuses_a_conflicting_re_pin() {
         let _serial = registry_guard();
@@ -2318,8 +2320,8 @@ mod tests {
     }
 
     /// `publish`'s default shard must be conflict-checked exactly like its
-    /// generations ( finding 13): the default shard resolves every
-    /// `UNENCODED` execution id, so two workers disagreeing about it is the
+    /// generations (finding 13). The default shard resolves every
+    /// `UNENCODED` execution id. Two workers disagreeing about it is the
     /// same process-wide hazard as a generation conflict.
     #[test]
     fn publish_refuses_a_conflicting_default_shard() {
@@ -2350,8 +2352,8 @@ mod tests {
         FenceRegistry::clear();
     }
 
-    /// `set_default_shard` must refuse a conflicting re-pin ( finding
-    /// 13): unconditional like `register` was, and the same fix applies.
+    /// `set_default_shard` must refuse a conflicting re-pin (finding 13).
+    /// It was unconditional like `register` was; the same fix applies.
     #[test]
     fn set_default_shard_refuses_a_conflicting_re_pin() {
         let _serial = registry_guard();

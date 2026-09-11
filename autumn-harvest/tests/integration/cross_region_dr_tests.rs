@@ -230,18 +230,18 @@ async fn a_fresh_database_provisions_generation_zero_and_is_idempotent() {
     );
 }
 
-/// Concurrent first starts must never spuriously fail to provision ( finding 8).
+/// Concurrent first starts must never spuriously fail to provision (finding 8).
 ///
 /// The old query read its `ON CONFLICT DO NOTHING` fallback in the SAME
 /// statement as the `INSERT`, sharing that statement's snapshot. Under READ
-/// COMMITTED, a losing `INSERT` blocks on the winner's commit and then finds
-/// nothing to insert — but its fallback read, sharing the pre-commit
-/// snapshot, could still see zero rows, so the whole statement returned
-/// empty and the losing worker refused to start. This is inherently a
-/// timing-dependent race, so this test cannot force the old bug to
-/// reproduce on every run, but with several connections racing the same
-/// shard on every run of this suite, it is a live regression guard rather
-/// than a coincidence.
+/// COMMITTED, a losing `INSERT` blocks on the winner's commit and then
+/// finds nothing to insert. Its fallback read, sharing the pre-commit
+/// snapshot, could still see zero rows, though. So the whole statement
+/// returned empty, and the losing worker refused to start. This is
+/// inherently a timing-dependent race, so this test cannot force the old
+/// bug to reproduce on every run. But with several connections racing the
+/// same shard on every run of this suite, it is a live regression guard
+/// rather than a coincidence.
 #[tokio::test]
 async fn concurrent_first_starts_always_agree_on_the_provisioned_generation() {
     let (url, _db) = require_db!("provisionrace");
@@ -270,15 +270,16 @@ async fn concurrent_first_starts_always_agree_on_the_provisioned_generation() {
 }
 
 /// A heartbeat written under a superseded generation must never be read back
-/// as if it were part of the current WAL stream ( finding 10).
+/// as if it were part of the current WAL stream (finding 10).
 ///
 /// `docs/cross-region-dr.md`'s setup SQL replicates
-/// `harvest_replication_heartbeat` with `FOR ALL TABLES`, so a standby can
+/// `harvest_replication_heartbeat` with `FOR ALL TABLES`. So a standby can
 /// carry beats the OLD primary wrote — LSNs from a WAL stream the new
-/// primary does not share. This plants exactly that: a stale, hour-old beat
-/// tagged with generation 0 at a LARGER LSN, and a fresh, current beat
-/// tagged with generation 1 at a SMALLER one, so only the generation filter
-/// — never `ORDER BY beat_lsn DESC` — can be why the fresh one wins.
+/// primary does not share. This plants exactly that: a stale, hour-old
+/// beat tagged with generation 0 at a LARGER LSN. Beside it sits a fresh,
+/// current beat tagged with generation 1 at a SMALLER one. Only the
+/// generation filter — never `ORDER BY beat_lsn DESC` — can be why the
+/// fresh one wins.
 #[tokio::test]
 async fn measure_rpo_ignores_heartbeats_from_a_superseded_generation() {
     let (url, _db) = require_db!("genscope");
@@ -1045,13 +1046,13 @@ async fn promotion_advances_reserved_word_and_mixed_case_relations() {
 }
 
 /// A sequence owned by a table in `current_schema()` must be advanced even
-/// when the sequence itself was created in a different schema ( finding 5).
+/// when the sequence itself was created in a different schema (finding 5).
 ///
 /// The catalog query filtered on the SEQUENCE's own schema
 /// (`sn.nspname = current_schema()`) rather than the OWNING TABLE's
 /// (`tn.nspname`). A migration that qualifies `CREATE SEQUENCE` into a
 /// second schema, with the table itself left in the connection's default
-/// schema, is legal — and was silently skipped, leaving the promoted
+/// schema, is legal. That case was silently skipped, leaving the promoted
 /// primary handing out already-used primary keys on its first writes.
 #[tokio::test]
 async fn promotion_advances_a_sequence_owned_by_a_table_in_a_different_schema() {
@@ -1096,13 +1097,13 @@ async fn promotion_advances_a_sequence_owned_by_a_table_in_a_different_schema() 
     );
 }
 
-/// Promotion must not rewind a DESCENDING sequence ( finding 11).
+/// Promotion must not rewind a DESCENDING sequence (finding 11).
 ///
 /// `GREATEST` assumes ascending issuance. For a descending sequence,
-/// "furthest issued" is the MINIMUM, not the maximum — using `GREATEST`
+/// "furthest issued" is the MINIMUM, not the maximum. Using `GREATEST`
 /// unconditionally reset a sequence that had issued 100 then 99 back to
-/// 100, so the next value handed out was 99 again: a collision, from the
-/// helper whose entire purpose is preventing one.
+/// 100. The next value handed out was then 99 again — a collision, from
+/// the helper whose entire purpose is preventing one.
 #[tokio::test]
 async fn promotion_never_rewinds_a_descending_sequence() {
     let (url, _db) = require_db!("seqdesc");
@@ -1321,13 +1322,13 @@ async fn replication_status_on_a_primary_with_no_standby_is_not_a_zero_rpo() {
 }
 
 /// One abandoned DR slot beside one healthy one must be a PARTIAL reading,
-/// never folded into "nothing measured" ( finding 1).
+/// never folded into "nothing measured" (finding 1).
 ///
 /// A physical slot created with `immediately_reserve = false` has a NULL
 /// `restart_lsn` until a standby connects — a never-connected or abandoned
 /// DR target. Before the fix, `bool_or(position IS NULL)` made the WHOLE
-/// reading `Unknown` whenever any one slot lacked a position, so a healthy
-/// slot's small lag masked the abandoned one entirely and
+/// reading `Unknown` whenever any one slot lacked a position. A healthy
+/// slot's small lag then masked the abandoned one entirely.
 /// `rpo_seconds()` fell back to `replay_lag`, which has no idea the
 /// abandoned slot exists either.
 #[tokio::test]
@@ -1454,14 +1455,13 @@ async fn a_non_dr_slot_is_not_counted_as_a_dr_standby() {
 }
 
 /// A slot name that would satisfy `LIKE <prefix> || '%'` but does NOT start
-/// with the prefix must never be counted as a DR standby ( finding
-/// 7).
+/// with the prefix must never be counted as a DR standby (finding 7).
 ///
 /// `LIKE` treats `_` as "any single character", and `DR_PREFIX`
 /// (`harvest_dr`, the shipped default) contains one. Reproduced against live
 /// Postgres in the finding: `'harvestXdr_shard0' LIKE 'harvest_dr' || '%'` is
-/// `true`. If the real DR sender then disconnected while this unrelated slot
-/// remained, `connected_standbys()` would stay non-zero and
+/// `true`. Suppose the real DR sender then disconnected while this unrelated
+/// slot remained. `connected_standbys()` would stay non-zero, and
 /// `harvest_replication_down` would never fire — on the DEFAULT
 /// configuration, not only a custom prefix.
 #[tokio::test]
