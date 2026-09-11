@@ -555,9 +555,9 @@ async fn a_cross_shard_childs_chain_deadline_is_anchored_at_its_own_creation() {
     let parent = start_parent(&sharded, "child_echo", "chain-deadline-1").await;
     let child_shard = ShardId::new(1);
     let child_id = ExecutionId::new_for_shard(child_shard);
-    // Short enough to tell two anchors apart after the delay below: THIS
-    // instant (the spec's creation — the pre-fix bug), versus the child's
-    // OWN creation (the fix).
+    // Short enough to tell two anchors apart after the delay below.
+    // THIS instant is the spec's creation (the pre-fix bug). The child's
+    // OWN creation is the fix.
     let chain_execution_timeout_secs = 5i64;
 
     let spec = autumn_harvest::cross_shard_child::CrossShardChildSpec {
