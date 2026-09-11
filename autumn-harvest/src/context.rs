@@ -7266,15 +7266,17 @@ impl WorkflowContext {
     /// one — never the process-global fallback (issue #1263 items 11/15/17).
     ///
     /// The worker's persist-time preflight
-    /// (`crate::cross_shard_child::preflight_target_shard`) needs to validate a
-    /// placement against the SAME router that resolved it, not against
-    /// whichever router happens to be installed by the time persistence runs.
-    /// Handing it the global router's OWN snapshot here would defeat that: a
-    /// context with no explicit router intends "ask the global, fresh, at the
-    /// time each question is asked" — which is exactly what the persist layer
-    /// already does on its own when this returns `None`. Only an EXPLICIT
-    /// context-local router is a genuine second topology that the persist
-    /// layer cannot otherwise see, so only that case is worth carrying
+    /// (`crate::cross_shard_child::preflight_target_shard`) needs to
+    /// validate a placement against the SAME router that resolved it. Not
+    /// against whichever router happens to be installed by the time
+    /// persistence runs.
+    ///
+    /// Handing it the global router's OWN snapshot here would defeat that.
+    /// A context with no explicit router intends "ask the global, fresh, at
+    /// the time each question is asked" — which is exactly what the persist
+    /// layer already does on its own when this returns `None`. Only an
+    /// EXPLICIT context-local router is a genuine second topology that the
+    /// persist layer cannot otherwise see. Only that case is worth carrying
     /// forward.
     pub(crate) fn resolved_placement_router(&self) -> Option<crate::shard::ShardRouter> {
         self.shard_router.clone()
@@ -15615,11 +15617,12 @@ mod tests {
         assert!(ctx.resolved_placement_router().is_none());
     }
 
-    /// `resolved_placement_router` must return the EXACT router installed via
-    /// `with_shard_router`, so the worker's persist-time preflight can
+    /// `resolved_placement_router` must return the EXACT router installed
+    /// via `with_shard_router`. The worker's persist-time preflight can then
     /// validate a placement against the same topology that resolved it,
-    /// rather than independently re-asking the process-global router — which
-    /// can be a different topology, or absent (issue #1263 items 11/15/17).
+    /// rather than independently re-asking the process-global router —
+    /// which can be a different topology, or absent (issue #1263 items
+    /// 11/15/17).
     #[test]
     fn resolved_placement_router_returns_the_explicitly_installed_router() {
         let router = ShardRouter::new(

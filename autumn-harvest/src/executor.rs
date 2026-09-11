@@ -1629,14 +1629,14 @@ pub(crate) async fn run_workflow_canary(
 ///   hold it alive while persisting producer-side side-effects (activity
 ///   schedules, child workflow starts) so those producer spans are nested inside
 ///   the executor cycle. Dropping the handle closes the span.
-/// - `resolved_router`: `Some` only when this run's [`WorkflowContext`] had an
-///   EXPLICIT router installed via `with_shard_router` (issue #1263 items
+/// - `resolved_router`: `Some` only when this run's [`WorkflowContext`] had
+///   an EXPLICIT router installed via `with_shard_router` (issue #1263 items
 ///   11/15/17) — tests and embedders running more than one topology in a
-///   single process. The worker's persist-time cross-shard preflight uses
-///   this, when present, instead of independently re-asking the
-///   process-global router, so a placement is always validated against the
-///   same topology that resolved it. `None` on the ordinary production path,
-///   where the persist layer keeps asking the global fresh.
+///   single process. When present, the worker's persist-time cross-shard
+///   preflight uses it instead of independently re-asking the
+///   process-global router. A placement is then always validated against
+///   the same topology that resolved it. `None` on the ordinary production
+///   path, where the persist layer keeps asking the global fresh.
 pub async fn run_workflow_with_state(
     exec_id: ExecutionId,
     history: Vec<WorkflowEvent>,
@@ -2052,13 +2052,14 @@ async fn drive_workflow(
     .instrument(span)
     .await;
 
-    // Issue #1263 items 11/15/17: carry the EXPLICIT context-local router (if
-    // this context installed one via `with_shard_router`) out to the caller,
-    // so the worker's persist-time preflight can validate a placement against
-    // the same router that resolved it rather than independently re-asking
-    // the process-global one. `None` when no context-local router was
-    // installed — the ordinary production case — and the persist layer keeps
-    // asking the global fresh, exactly as before this fix.
+    // Issue #1263 items 11/15/17: carry the EXPLICIT context-local router
+    // out to the caller, if this context installed one via
+    // `with_shard_router`. The worker's persist-time preflight can then
+    // validate a placement against the same router that resolved it,
+    // rather than independently re-asking the process-global one. `None`
+    // when no context-local router was installed — the ordinary production
+    // case. The persist layer then keeps asking the global fresh, exactly
+    // as before this fix.
     (
         outcome,
         pending,

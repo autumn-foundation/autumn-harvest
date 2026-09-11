@@ -10711,15 +10711,16 @@ fn placement_router() -> Option<crate::shard::ShardRouter> {
 }
 
 /// The router a persist-time preflight should validate a placement against
-/// (issue #1263 items 11/15/17): `resolved`, when the [`WorkflowContext`] that
-/// decided this placement had an EXPLICIT router installed via
-/// `with_shard_router` — tests and embedders running more than one topology in
-/// a single process — else the process-global one, asked fresh.
+/// (issue #1263 items 11/15/17). Returns `resolved`, when the
+/// [`WorkflowContext`] that decided this placement had an EXPLICIT router
+/// installed via `with_shard_router` — tests and embedders running more than
+/// one topology in a single process. Else the process-global one, asked
+/// fresh.
 ///
-/// Without this, the preflight always asked the global router, even when a
-/// context-local one (potentially a different topology, with different
-/// drain state) was what actually resolved the placement — so the router that
-/// decided and the router that checks could silently disagree.
+/// Without this, the preflight always asked the global router. Even when a
+/// context-local one — potentially a different topology, with different
+/// drain state — was what actually resolved the placement. So the router
+/// that decided and the router that checks could silently disagree.
 fn effective_placement_router(
     resolved: Option<&crate::shard::ShardRouter>,
 ) -> Option<crate::shard::ShardRouter> {
@@ -12528,20 +12529,21 @@ pub async fn materialize_due_child_timeout_deadlines(
 /// child's terminal straight back into the inline append this guard exists to
 /// prevent.
 ///
-/// An unencoded parent's shard is resolved from `conn` — a durable, `SELECT`ed
-/// fact — rather than from the installed router (issue #1263 item 11). Placement
-/// can be resolved by a **context-local** router
-/// ([`crate::context::WorkflowContext::with_shard_router`]), so asking the
-/// process-global router here can disagree with whatever router actually
-/// decided where the parent's own row was normalised to at start
-/// (`StartWorkflowParams::shard_id`). `conn` is always the shard this call is
-/// running on, so "is the parent's row visible on `conn`" is exactly the
-/// durable question this guard needs answered, with no router involved at all.
+/// An unencoded parent's shard is resolved from `conn` — a durable,
+/// `SELECT`ed fact — rather than from the installed router (issue #1263 item
+/// 11). Placement can be resolved by a **context-local** router
+/// ([`crate::context::WorkflowContext::with_shard_router`]). Asking the
+/// process-global router here can then disagree with whatever router
+/// actually decided where the parent's own row was normalised to at start
+/// (`StartWorkflowParams::shard_id`). `conn` is always the shard this call
+/// runs on. So "is the parent's row visible on `conn`" is exactly the
+/// durable question this guard needs answered, with no router involved at
+/// all.
 ///
-/// With no router installed there is no second database to be on, so nothing is
-/// cross-shard — this still holds with the DB-backed unencoded-parent check,
-/// since an unencoded parent's row is created on whichever single shard the
-/// deployment has, which is `conn`'s shard.
+/// With no router installed there is no second database to be on, so
+/// nothing is cross-shard. This still holds with the DB-backed
+/// unencoded-parent check: an unencoded parent's row is created on whichever
+/// single shard the deployment has, which is `conn`'s shard.
 ///
 /// # Errors
 ///

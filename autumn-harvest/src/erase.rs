@@ -358,7 +358,7 @@ mod db {
     /// terminal children on the same shard, within a single transaction.
     ///
     /// Children placed on another shard (issue #956) are NOT reachable this
-    /// way — this call has no [`ShardedDbPool`] to route to them, so they are
+    /// way. This call has no [`ShardedDbPool`] to route to them. They are
     /// reported as [`EraseFailure`] rather than silently skipped. Use
     /// [`erase_workflow_payloads_with_pool`] or
     /// [`erase_workflow_payloads_all_residences`] to reach them.
@@ -382,30 +382,31 @@ mod db {
     /// shard via `pool` (issue #1263 item 10).
     ///
     /// PII erasure is sanctioned exception #2 to `harvest_events` being
-    /// append-only (see `CLAUDE.md`), and that exception is only meaningful if
-    /// it actually reaches every payload it claims to. Before this, a
+    /// append-only (see `CLAUDE.md`). That exception is only meaningful if it
+    /// actually reaches every payload it claims to. Before this, a
     /// cross-shard child's row lived entirely outside the query
-    /// (`parent_id.eq`) this module used to find children, so an erase request
+    /// (`parent_id.eq`) this module used to find children. An erase request
     /// against a parent with a cross-shard child returned success while that
     /// child's input, output, history, and signals stayed unscrubbed on its
     /// own shard — a false success on a data-protection operation.
     ///
-    /// `pool` is `None` on a single-shard deployment or when the caller has no
-    /// [`ShardedDbPool`] to hand. A cross-shard child is then reported through
-    /// [`EraseFailure`] rather than silently skipped, so an erase never claims
-    /// success while PII a caller could not reach still survives.
+    /// `pool` is `None` on a single-shard deployment, or when the caller has
+    /// no [`ShardedDbPool`] to hand. A cross-shard child is then reported
+    /// through [`EraseFailure`] rather than silently skipped. An erase must
+    /// never claim success while PII a caller could not reach still
+    /// survives.
     ///
     /// # Scope boundary
     ///
     /// A cross-shard child is discovered through its still-live
     /// `harvest_cross_shard_children` outbox row on the parent's shard. That
     /// row is deleted once the child is fully settled and its terminal
-    /// delivered (or its parent-close cascade applied) — see
-    /// `docs/sharding.md`. A parent erased long after that point, once
-    /// retention has also collected the pointer, has no local trace left to
-    /// route from; reaching it needs a cluster-wide fan-out, the same gap
-    /// issue #1263 item 14 names for `GET /workflows/{id}/stack`. This fix
-    /// covers the common, realistic window: an erasure requested at or
+    /// delivered, or its parent-close cascade applied — see
+    /// `docs/sharding.md`. A parent erased long after that point has no
+    /// local trace left to route from, once retention has also collected the
+    /// pointer. Reaching it needs a cluster-wide fan-out, the same gap issue
+    /// #1263 item 14 names for `GET /workflows/{id}/stack`. This fix covers
+    /// the common, realistic window instead: an erasure requested at or
     /// shortly after both parent and child are terminal.
     ///
     /// # Errors
@@ -813,12 +814,14 @@ mod db {
     /// erased / skipped / failed.
     ///
     /// Shared by [`cascade_children`]'s same-shard and cross-shard branches
-    /// (issue #1263 item 10) — a child found live-and-terminal, live-and-held,
-    /// live-and-non-terminal, or summary-only is resolved identically whether
-    /// `conn` is the parent's own connection or a freshly checked-out one for
-    /// the child's target shard. Never propagates a `HarvestResult` error
-    /// itself: every failure becomes an [`EraseFailure`] entry, so a database
-    /// error on this transaction never means checking harm to another child.
+    /// (issue #1263 item 10). A child found live-and-terminal,
+    /// live-and-held, live-and-non-terminal, or summary-only is resolved
+    /// identically either way — whether `conn` is the parent's own
+    /// connection or a freshly checked-out one for the child's target shard.
+    ///
+    /// Never propagates a `HarvestResult` error itself. Every failure
+    /// becomes an [`EraseFailure`] entry instead, so one child's database
+    /// error never stops the check on any other child.
     async fn erase_one_child(
         conn: &mut AsyncPgConnection,
         child_exec_id: ExecutionId,
@@ -874,10 +877,10 @@ mod db {
                     ),
                 }
             }
-            // No execution row: a summary-only child (issue #752, AC6) — same
-            // treatment whether it is same-shard or cross-shard, since a
-            // cross-shard child's summary row (if any) is on ITS OWN target
-            // shard, exactly where `conn` already is.
+            // No execution row: a summary-only child (issue #752, AC6). Same
+            // treatment whether it is same-shard or cross-shard: a
+            // cross-shard child's summary row, if any, is on ITS OWN target
+            // shard — exactly where `conn` already is.
             Err(HarvestError::NotFound(_)) => {
                 match erase_summary_only_node(conn, child_exec_id, now, visited, pool).await {
                     // `None` = the summary vanished between the listing read
@@ -908,18 +911,18 @@ mod db {
     /// Cascade erasure to child executions, child summaries, AND cross-shard
     /// children; return (children, skipped, failures).
     ///
-    /// For each SAME-shard child id (from either of [`collect_child_ids`]'s two
-    /// sources, deduped): a live terminal, non-held execution row is scrubbed
-    /// and recursed; a non-terminal or held row is skipped; a child with no
-    /// execution row is a summary-only node whose summary (and any summarized
-    /// grandchildren) is scrubbed recursively.
+    /// For each SAME-shard child id (from either of [`collect_child_ids`]'s
+    /// two sources, deduped): a live terminal, non-held execution row is
+    /// scrubbed and recursed. A non-terminal or held row is skipped. A child
+    /// with no execution row is a summary-only node, whose summary (and any
+    /// summarized grandchildren) is scrubbed recursively.
     ///
     /// Each CROSS-SHARD child (issue #1263 item 10) is routed to its own
     /// target shard via `pool` and resolved by the identical
-    /// [`erase_one_child`] logic there. A target this call cannot reach — no
-    /// `pool`, an unreachable shard, or a genuine failure mid-erase — is
-    /// reported as an [`EraseFailure`], never silently dropped: an erase must
-    /// not claim success over PII it could not verify was scrubbed.
+    /// [`erase_one_child`] logic there. A target this call cannot reach —
+    /// no `pool`, an unreachable shard, or a genuine failure mid-erase — is
+    /// reported as an [`EraseFailure`], never silently dropped. An erase
+    /// must not claim success over PII it could not verify was scrubbed.
     async fn cascade_children(
         conn: &mut AsyncPgConnection,
         exec_id: ExecutionId,

@@ -119,21 +119,21 @@ pub struct CrossShardChildSpec {
     pub execution_timeout_secs: Option<i64>,
     /// The chain-execution-timeout DURATION, never an absolute deadline.
     ///
-    /// A child is its own logical chain origin (issue #617) — unlike a
-    /// continue-as-new successor, it never inherits an existing chain budget —
-    /// so, exactly like [`Self::execution_timeout_secs`] and [`Self::sla_secs`],
-    /// only the duration travels and the relay turns it into an absolute
+    /// A child is its own logical chain origin (issue #617). Unlike a
+    /// continue-as-new successor, it never inherits an existing chain budget.
+    /// So, exactly like [`Self::execution_timeout_secs`] and [`Self::sla_secs`],
+    /// only the duration travels here. The relay turns it into an absolute
     /// `chain_deadline_at` at the moment it actually creates the child.
     ///
     /// This field used to carry the resolved absolute `chain_deadline_at`
     /// instead (issue #1263 item 7). That anchored the chain deadline at the
-    /// PARENT's decision instant rather than the child's own creation, so a
-    /// relay running late — an unreachable target shard, a backlog, a worker
-    /// restart — could hand the child a deadline already in the past. The
-    /// per-run deadlines were fixed the same way in round 4 of issue #956; this
-    /// field was missed because a chain cap is anchored differently for a
-    /// CONTINUE-AS-NEW successor, which does inherit its predecessor's absolute
-    /// deadline. A child is not a successor.
+    /// PARENT's decision instant, not the child's own creation. A relay
+    /// running late — an unreachable target shard, a backlog, a worker
+    /// restart — could then hand the child a deadline already in the past.
+    /// The per-run deadlines were fixed the same way earlier in issue #956.
+    /// This field was missed then: a chain cap is anchored differently for a
+    /// CONTINUE-AS-NEW successor, which does inherit its predecessor's
+    /// absolute deadline. A child is not a successor.
     #[serde(default)]
     pub chain_execution_timeout_secs: Option<i64>,
     #[serde(default)]
@@ -1319,15 +1319,17 @@ async fn start_child_on_target(
                 }
 
                 // Anchor every deadline at creation, not at the parent's
-                // decision. The relay can be minutes behind that decision — an
-                // unreachable target shard, a large backlog, a worker restart — and
-                // an absolute deadline computed back then can already be in the
-                // past by the time the row lands, so the timeout, SLA, and chain
-                // scanners would seal a child that has not run a single step. The
-                // normal start path derives every deadline from the target's own
-                // start time for exactly this reason; only durations travel on the
-                // spec, and they become absolute here (issue #1263 item 7 extended
-                // this to the chain deadline, which used to be the one exception).
+                // decision. The relay can be minutes behind that decision —
+                // an unreachable target shard, a large backlog, a worker
+                // restart. An absolute deadline computed back then can
+                // already be in the past by the time the row lands. The
+                // timeout, SLA, and chain scanners would then seal a child
+                // that has not run a single step. The normal start path
+                // derives every deadline from the target's own start time for
+                // exactly this reason. Only durations travel on the spec, and
+                // they become absolute here — issue #1263 item 7 extended
+                // this to the chain deadline, which used to be the one
+                // exception.
                 let created_at = Utc::now();
                 let deadline_at = spec
                     .execution_timeout_secs
@@ -1417,11 +1419,12 @@ async fn start_child_on_target(
                 // placement. Every same-shard spawn path resolves its codecs from
                 // the runtime for exactly this reason.
                 //
-                // A row flagged for cancellation before this sweep ever created it
-                // (issue #1263 item 13) gets its `WorkflowCancelled` appended right
-                // behind `WorkflowStarted`, in the SAME batch — never a separate
-                // append after the task below is enqueued. See the cancellation
-                // arm's own comment for why.
+                // A row flagged for cancellation before this sweep ever
+                // created it (issue #1263 item 13) gets its
+                // `WorkflowCancelled` appended right behind `WorkflowStarted`.
+                // Both land in the SAME batch — never a separate append after
+                // the task below is enqueued. See the cancellation arm's own
+                // comment for why.
                 //
                 // KNOWN GAP: the large-payload *offloader* is not applied here. It
                 // lives on the handler registry, which a scanner does not hold, and
@@ -1454,19 +1457,23 @@ async fn start_child_on_target(
                         codecs,
                     )
                     .await?;
-                    // Sealed CANCELLED with no task ever enqueued (issue #1263 item
-                    // 13). The decision table (`shard::next_cross_shard_child_action`)
-                    // sends every `PENDING_START` row here regardless of
-                    // `cancel_requested`, because a cancel that lands mid-creation
-                    // still needs a row to act on. Enqueuing the task first and
-                    // cancelling it right after (mirroring a same-shard race loser)
-                    // would still leave a real window: unlike the same-shard path,
-                    // where the loser is cancelled inside the PARENT's own
-                    // transaction before any task for it exists, this transaction is
-                    // the one that WOULD create that task, so a worker could claim it
-                    // the instant this transaction committed and run a live decision
-                    // cycle for a child that had already lost its race. Never
-                    // creating the task closes that window outright.
+                    // Sealed CANCELLED with no task ever enqueued (issue
+                    // #1263 item 13). The decision table
+                    // (`shard::next_cross_shard_child_action`) sends every
+                    // `PENDING_START` row here regardless of
+                    // `cancel_requested`: a cancel that lands mid-creation
+                    // still needs a row to act on.
+                    //
+                    // Enqueuing the task first, then cancelling it right
+                    // after (mirroring a same-shard race loser), would still
+                    // leave a real window open. On the same-shard path the
+                    // loser is cancelled inside the PARENT's own transaction,
+                    // before any task for it exists. Here THIS transaction is
+                    // the one that would create that task. A worker could
+                    // claim it the instant this transaction committed, and
+                    // run a live decision cycle for a child that had already
+                    // lost its race. Never creating the task closes that
+                    // window outright.
                     diesel::update(
                         harvest_workflow_executions::table.find(child_exec_id.as_uuid()),
                     )
