@@ -693,10 +693,10 @@ impl PayloadCodecs {
     /// Several batches — one per shard, say — may pin the same key id at once;
     /// the pin is a count, not a flag.
     ///
-    /// `#[doc(hidden)] pub` rather than `pub(crate)`: the batch-oriented
-    /// public sweep entry point calls this internally, but the race this
-    /// guards is exercised directly by an integration test outside this
-    /// crate. Not part of the semver-stable surface.
+    /// This is `#[doc(hidden)] pub` rather than `pub(crate)`. The
+    /// batch-oriented public sweep entry point calls this internally. But
+    /// the race this guards is exercised directly by an integration test
+    /// outside this crate. Not part of the semver-stable surface.
     #[doc(hidden)]
     #[must_use = "dropping the guard immediately un-pins the key"]
     pub fn pin_key_for_sweep(&self, key_id: &str) -> SweepKeyPin {
