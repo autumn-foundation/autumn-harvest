@@ -916,7 +916,7 @@ async fn wake_parent_for_child_timeout(
     // transaction — leaving the child non-terminal forever. The cross-shard
     // relay delivers this wake instead, from the parent's own shard. Mirrors the
     // identical guard in `worker::wake_parent_for_child_completion`/`_failure`.
-    if crate::worker::parent_is_on_another_shard(parent_exec_id, child_exec_id) {
+    if crate::worker::parent_is_on_another_shard(conn, parent_exec_id, child_exec_id).await? {
         tracing::debug!(
             parent_execution_id = %parent_exec_id,
             child_execution_id = %child_exec_id,

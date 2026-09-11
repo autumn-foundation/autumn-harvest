@@ -1602,6 +1602,9 @@ struct DetachedSpawnPersistence<'a> {
     registry: &'a HandlerRegistry,
     parent_execution: &'a WorkflowExecution,
     execute_span: &'a tracing::Span,
+    // The EXPLICIT context-local router this placement was resolved against,
+    // if any (issue #1263 items 11/15/17) — see `effective_placement_router`.
+    resolved_router: Option<&'a crate::shard::ShardRouter>,
 }
 
 impl DetachedSpawnPersistence<'_> {
@@ -1616,6 +1619,7 @@ impl DetachedSpawnPersistence<'_> {
             self.parent_execution,
             commands,
             self.execute_span,
+            self.resolved_router,
         )
         .await
     }
@@ -9941,6 +9945,9 @@ async fn persist_all_started_child_workflows(
     children: &[StartedChildWorkflowCommand],
     sticky: Option<queue::StickyHint<'_>>,
     execute_span: &tracing::Span,
+    // The EXPLICIT context-local router this placement was resolved against,
+    // if any (issue #1263 items 11/15/17) — see `effective_placement_router`.
+    resolved_router: Option<&crate::shard::ShardRouter>,
 ) -> HarvestResult<()> {
     // Capability miss (#804): this worker cannot resolve the CHILD's handler,
     // so releasing the parent's task lets a capable peer persist the decision.
@@ -10094,7 +10101,7 @@ async fn persist_all_started_child_workflows(
         // parks and re-wakes the parent, making it retryable rather than fatal.
         if !remote_new_children.is_empty() {
             let pool = placement_sharded_pool();
-            let router = placement_router();
+            let router = effective_placement_router(resolved_router);
             for child in &remote_new_children {
                 crate::cross_shard_child::preflight_target_shard(
                     pool.as_ref(),
@@ -10177,8 +10184,15 @@ async fn persist_all_started_child_workflows(
         for event in parent_events {
             store::append_single_event(conn, parent_exec_id, event).await?;
         }
-        create_detached_child_executions(conn, registry, parent_execution, commands, &execute_span)
-            .await?;
+        create_detached_child_executions(
+            conn,
+            registry,
+            parent_execution,
+            commands,
+            &execute_span,
+            resolved_router,
+        )
+        .await?;
 
         let mut race_next_event_id =
             store::load_history_with_codecs(conn, parent_exec_id, registry.payload_codecs())
@@ -10635,10 +10649,12 @@ fn cross_shard_child_spec(
         owner: defaults.owner.map(str::to_string),
         runbook_url: defaults.runbook_url.map(str::to_string),
         severity: defaults.severity.map(str::to_string),
-        // Durations only for the per-run budgets: the relay turns them into
-        // absolute deadlines when it actually creates the child, so a relay that
-        // runs late cannot hand the child an already-expired deadline (issue
-        // #956, Codex round 4). The chain deadline stays absolute by design.
+        // Durations only, never absolute deadlines: the relay turns them into
+        // absolute deadlines when it actually creates the child, so a relay
+        // that runs late cannot hand the child an already-expired deadline
+        // (issue #956 Codex round 4; extended to the chain deadline by issue
+        // #1263 item 7 — a child is its own fresh chain origin, issue #617,
+        // never an inherited one, so there is no absolute value to preserve).
         sla_secs: defaults.sla.map(|d| d.num_seconds()),
         // A detached child resolves NO execution timeout at spawn on the local
         // path — and therefore no chain cap either — so a remotely placed one
@@ -10652,11 +10668,6 @@ fn cross_shard_child_spec(
         chain_execution_timeout_secs: (!detached)
             .then(|| defaults.chain_execution_timeout.map(|d| d.num_seconds()))
             .flatten(),
-        chain_deadline_at: if detached {
-            None
-        } else {
-            defaults.chain_deadline_at
-        },
         // Clamp a detached child's declared retry policy by the server-side
         // ceiling, exactly as the local detached path does. Detached children
         // bypass `StartWorkflowParams`, where the ceiling is normally applied, so
@@ -10697,6 +10708,22 @@ fn placement_router() -> Option<crate::shard::ShardRouter> {
         .read()
         .ok()
         .and_then(|guard| guard.as_ref().cloned())
+}
+
+/// The router a persist-time preflight should validate a placement against
+/// (issue #1263 items 11/15/17): `resolved`, when the [`WorkflowContext`] that
+/// decided this placement had an EXPLICIT router installed via
+/// `with_shard_router` — tests and embedders running more than one topology in
+/// a single process — else the process-global one, asked fresh.
+///
+/// Without this, the preflight always asked the global router, even when a
+/// context-local one (potentially a different topology, with different
+/// drain state) was what actually resolved the placement — so the router that
+/// decided and the router that checks could silently disagree.
+fn effective_placement_router(
+    resolved: Option<&crate::shard::ShardRouter>,
+) -> Option<crate::shard::ShardRouter> {
+    resolved.cloned().or_else(placement_router)
 }
 
 fn resolve_child_workflow_defaults(
@@ -10772,6 +10799,9 @@ async fn insert_awaited_child_execution(
     parent_exec_id: ExecutionId,
     child: &StartedChildWorkflowCommand,
     trace_context: Option<TraceContextCarrier>,
+    // The EXPLICIT context-local router this placement was resolved against,
+    // if any (issue #1263 items 11/15/17) — see `effective_placement_router`.
+    resolved_router: Option<&crate::shard::ShardRouter>,
 ) -> HarvestResult<()> {
     let shard_id = parent_execution.shard_id;
     let queue_name = parent_execution.queue_name.clone();
@@ -10786,7 +10816,7 @@ async fn insert_awaited_child_execution(
     if child_target_shard(child.child_id, shard_id) != shard_id {
         crate::cross_shard_child::preflight_target_shard(
             placement_sharded_pool().as_ref(),
-            placement_router().as_ref(),
+            effective_placement_router(resolved_router).as_ref(),
             child.child_id.shard(),
         )?;
         let spec = cross_shard_child_spec(
@@ -10952,6 +10982,9 @@ async fn persist_child_timeout_race(
     timer: &StartedTimerCommand,
     sticky: Option<queue::StickyHint<'_>>,
     execute_span: &tracing::Span,
+    // The EXPLICIT context-local router this placement was resolved against,
+    // if any (issue #1263 items 11/15/17) — see `effective_placement_router`.
+    resolved_router: Option<&crate::shard::ShardRouter>,
 ) -> HarvestResult<()> {
     // Capability miss (#804): release the parent's task for a capable peer
     // rather than terminally failing it because the child type is unknown here.
@@ -11103,6 +11136,7 @@ async fn persist_child_timeout_race(
                     parent_exec_id,
                     child,
                     child_trace_ctx,
+                    resolved_router,
                 )
                 .await?;
             }
@@ -11291,6 +11325,9 @@ async fn persist_mixed_suspension_batch(
     sticky: Option<queue::StickyHint<'_>>,
     execute_span: &tracing::Span,
     parent_priority: i32,
+    // The EXPLICIT context-local router this placement was resolved against,
+    // if any (issue #1263 items 11/15/17) — see `effective_placement_router`.
+    resolved_router: Option<&crate::shard::ShardRouter>,
 ) -> HarvestResult<()> {
     let exec_id = execution_id_from_uuid(parent_execution.id);
 
@@ -11601,6 +11638,7 @@ async fn persist_mixed_suspension_batch(
                 exec_id,
                 child,
                 trace_ctx,
+                resolved_router,
             )
             .await?;
         }
@@ -12488,27 +12526,52 @@ pub async fn materialize_due_child_timeout_deadlines(
 /// all about the child: an unencoded parent that opts into a placement mints a
 /// child encoded to a real remote shard, and exempting it here would send that
 /// child's terminal straight back into the inline append this guard exists to
-/// prevent. An unencoded parent's own row lives on the router's default shard
-/// (`StartWorkflowParams::shard_id` normalises it that way), so that is what the
-/// child's encoded shard is compared against.
+/// prevent.
+///
+/// An unencoded parent's shard is resolved from `conn` — a durable, `SELECT`ed
+/// fact — rather than from the installed router (issue #1263 item 11). Placement
+/// can be resolved by a **context-local** router
+/// ([`crate::context::WorkflowContext::with_shard_router`]), so asking the
+/// process-global router here can disagree with whatever router actually
+/// decided where the parent's own row was normalised to at start
+/// (`StartWorkflowParams::shard_id`). `conn` is always the shard this call is
+/// running on, so "is the parent's row visible on `conn`" is exactly the
+/// durable question this guard needs answered, with no router involved at all.
 ///
 /// With no router installed there is no second database to be on, so nothing is
-/// cross-shard.
-#[must_use]
-pub fn parent_is_on_another_shard(parent: ExecutionId, child: ExecutionId) -> bool {
+/// cross-shard — this still holds with the DB-backed unencoded-parent check,
+/// since an unencoded parent's row is created on whichever single shard the
+/// deployment has, which is `conn`'s shard.
+///
+/// # Errors
+///
+/// [`HarvestError::Database`] on any persistence failure resolving an
+/// unencoded parent's row. Never queries at all when `parent` is encoded or
+/// `child` is unencoded — the common, sharded-deployment path pays no extra
+/// round trip.
+pub async fn parent_is_on_another_shard(
+    conn: &mut AsyncPgConnection,
+    parent: ExecutionId,
+    child: ExecutionId,
+) -> HarvestResult<bool> {
     let child_shard = child.shard();
     if child_shard.is_unencoded() {
-        return false;
+        return Ok(false);
     }
-    let parent_shard = if parent.shard().is_unencoded() {
-        let Some(router) = placement_router() else {
-            return false;
-        };
-        router.default_shard()
-    } else {
-        parent.shard()
-    };
-    child_shard != parent_shard
+    if !parent.shard().is_unencoded() {
+        return Ok(child_shard != parent.shard());
+    }
+    // The parent's id carries no shard bits (a legacy/single-shard-minted id).
+    // Its row's presence on THIS connection is the durable answer: found here
+    // means co-located (never cross-shard), absent means it lives elsewhere.
+    let found: Option<uuid::Uuid> = harvest_workflow_executions::table
+        .find(parent.as_uuid())
+        .select(harvest_workflow_executions::id)
+        .first(conn)
+        .await
+        .optional()
+        .map_err(crate::error::database_error)?;
+    Ok(found.is_none())
 }
 
 pub async fn wake_parent_for_child_completion(
@@ -12522,7 +12585,7 @@ pub async fn wake_parent_for_child_completion(
     // transaction, so the child would never settle and the relay would never
     // have a terminal to deliver. The relay owns this wake instead: it pulls the
     // child's terminal state from here and appends on the parent's own shard.
-    if parent_is_on_another_shard(parent_exec_id, child_exec_id) {
+    if parent_is_on_another_shard(conn, parent_exec_id, child_exec_id).await? {
         tracing::debug!(
             parent_execution_id = %parent_exec_id,
             child_execution_id = %child_exec_id,
@@ -12556,7 +12619,7 @@ pub async fn wake_parent_for_child_failure(
     // Issue #956: same cross-shard guard as `wake_parent_for_child_completion` —
     // the parent is not on this connection, and appending here would roll back
     // the child's own terminal transaction. The relay delivers this wake.
-    if parent_is_on_another_shard(parent_exec_id, child_exec_id) {
+    if parent_is_on_another_shard(conn, parent_exec_id, child_exec_id).await? {
         tracing::debug!(
             parent_execution_id = %parent_exec_id,
             child_execution_id = %child_exec_id,
@@ -12745,6 +12808,9 @@ async fn create_detached_child_executions(
     parent_execution: &WorkflowExecution,
     commands: &[WorkflowCommand],
     execute_span: &tracing::Span,
+    // The EXPLICIT context-local router this placement was resolved against,
+    // if any (issue #1263 items 11/15/17) — see `effective_placement_router`.
+    resolved_router: Option<&crate::shard::ShardRouter>,
 ) -> HarvestResult<()> {
     // Capability miss (#804): pre-validate EVERY detached child's handler before
     // inserting any of them, so a miss on the second child cannot leave the
@@ -12782,7 +12848,7 @@ async fn create_detached_child_executions(
         if child_target_shard(*child_id, parent_execution.shard_id) != parent_execution.shard_id {
             crate::cross_shard_child::preflight_target_shard(
                 placement_sharded_pool().as_ref(),
-                placement_router().as_ref(),
+                effective_placement_router(resolved_router).as_ref(),
                 child_id.shard(),
             )?;
             let spec = cross_shard_child_spec(
@@ -14837,7 +14903,7 @@ pub async fn apply_race_loser_cancellations(
             // the parent's decision cycle. A same-shard child is cancelled
             // inline exactly as it was before this feature existed, touching no
             // new table.
-            if crate::worker::parent_is_on_another_shard(exec_id, *child_id)
+            if crate::worker::parent_is_on_another_shard(conn, exec_id, *child_id).await?
                 && crate::cross_shard_child::request_cross_shard_cancel(conn, *child_id).await? > 0
             {
                 continue;
@@ -15441,6 +15507,9 @@ async fn handle_suspended_workflow(
     registry: &HandlerRegistry,
     mut context: SuspendedWorkflowContext<'_>,
     commands: &[WorkflowCommand],
+    // The EXPLICIT context-local router this placement was resolved against,
+    // if any (issue #1263 items 11/15/17) — see `effective_placement_router`.
+    resolved_router: Option<&crate::shard::ShardRouter>,
 ) -> HarvestResult<()> {
     // Persist UpdateCompleted/UpdateFailed events for any update handlers that
     // ran in this execution cycle before the suspension side-effects.
@@ -15533,6 +15602,7 @@ async fn handle_suspended_workflow(
         registry,
         parent_execution: context.execution,
         execute_span: context.execute_span,
+        resolved_router,
     };
 
     let result = if should_requeue_signal_wait(commands) {
@@ -15604,6 +15674,7 @@ async fn handle_suspended_workflow(
             &timer,
             sticky,
             context.execute_span,
+            resolved_router,
         )
         .await;
         if res.is_ok() {
@@ -15648,6 +15719,7 @@ async fn handle_suspended_workflow(
             &children,
             sticky,
             context.execute_span,
+            resolved_router,
         )
         .await
     } else if let Some(scheduled) = extract_single_schedule_external_activity(commands) {
@@ -15697,6 +15769,7 @@ async fn handle_suspended_workflow(
             sticky,
             context.execute_span,
             context.persistence.task.priority,
+            resolved_router,
         )
         .await
     } else {
@@ -17415,6 +17488,11 @@ async fn persist_workflow_outcome(
     // A redirect makes that precomputed `ContinuedAsNew` accounting wrong.
     // The caller must correct it using this flag once this call returns.
     continue_as_new_redirected_to_failure: &mut bool,
+    // The EXPLICIT context-local router this outcome's placements were
+    // resolved against, if any (issue #1263 items 11/15/17) — see
+    // `effective_placement_router`. Threaded to `handle_suspended_workflow`'s
+    // `Suspended` arm, the only one that can still create a cross-shard child.
+    resolved_router: Option<&crate::shard::ShardRouter>,
 ) -> HarvestResult<(bool, Vec<(ExecutionId, Option<String>)>)> {
     let parent_exec_id = execution.parent_id.map(execution_id_from_uuid);
     // A detached child has parent_close_policy set (non-null). Detached children
@@ -17574,6 +17652,7 @@ async fn persist_workflow_outcome(
                     resolved_inline_external,
                 },
                 &commands,
+                resolved_router,
             )
             .await;
             if result.is_ok() && wake_inline_external {
@@ -17902,6 +17981,10 @@ async fn persist_terminal_outcome_commands(
     // Issue #1161: threaded straight through to `persist_workflow_outcome` —
     // see its identical parameter doc.
     continue_as_new_redirected_to_failure: &mut bool,
+    // Threaded straight through to `create_detached_child_executions` and
+    // `persist_workflow_outcome` — see either's identical parameter doc
+    // (issue #1263 items 11/15/17).
+    resolved_router: Option<&crate::shard::ShardRouter>,
 ) -> HarvestResult<(
     bool,
     Vec<(ExecutionId, Option<String>)>,
@@ -18004,7 +18087,15 @@ async fn persist_terminal_outcome_commands(
     )
     .await?;
 
-    create_detached_child_executions(conn, registry, execution, pending_cmds, execute_span).await?;
+    create_detached_child_executions(
+        conn,
+        registry,
+        execution,
+        pending_cmds,
+        execute_span,
+        resolved_router,
+    )
+    .await?;
 
     // `persist_search_attrs_from_commands` above wrote the UpsertSearchAttributes
     // patch to the DB, but `execution` is the row loaded before that update. A
@@ -18040,6 +18131,7 @@ async fn persist_terminal_outcome_commands(
         ResolvedExternalIds::default(),
         pending_cancel_metrics,
         continue_as_new_redirected_to_failure,
+        resolved_router,
     )
     .await?;
     Ok((retry_scheduled, deferred_checks, race_deferred_triggers))
@@ -19184,21 +19276,22 @@ async fn process_workflow_task(
         // instead would silently run every production guest under the *default*
         // (unrestricted) policy (Codex review round 1).
         #[cfg(feature = "hot-code-swap")]
-        let (run_outcome, pending_cmds, execute_span) = match registry.module_host() {
-            Some(policy) => {
-                crate::hot_swap::with_module_host(
-                    policy
-                        .clone()
-                        .with_optional_build_id(prepared.execution.assigned_build_id.clone())
-                        .with_optional_pinned_module(pinned_module.clone()),
-                    workflow_drive,
-                )
-                .await
-            }
-            None => workflow_drive.await,
-        };
+        let (run_outcome, pending_cmds, execute_span, resolved_router) =
+            match registry.module_host() {
+                Some(policy) => {
+                    crate::hot_swap::with_module_host(
+                        policy
+                            .clone()
+                            .with_optional_build_id(prepared.execution.assigned_build_id.clone())
+                            .with_optional_pinned_module(pinned_module.clone()),
+                        workflow_drive,
+                    )
+                    .await
+                }
+                None => workflow_drive.await,
+            };
         #[cfg(not(feature = "hot-code-swap"))]
-        let (run_outcome, pending_cmds, execute_span) = workflow_drive.await;
+        let (run_outcome, pending_cmds, execute_span, resolved_router) = workflow_drive.await;
 
         match run_outcome {
             WorkflowOutcome::Suspended { commands }
@@ -19441,6 +19534,7 @@ async fn process_workflow_task(
                     registry,
                     parent_execution: &prepared.execution,
                     execute_span: &detached_execute_span,
+                    resolved_router: resolved_router.as_ref(),
                 };
                 let local_batch = extract_run_local_activity(commands);
                 let local_context_headers = std::sync::Arc::new(exec_context_headers.clone());
@@ -19843,6 +19937,7 @@ async fn process_workflow_task(
                         },
                         pending_cmds,
                         execute_span,
+                        resolved_router,
                     );
                 }
             }
@@ -20026,13 +20121,14 @@ async fn process_workflow_task(
                     },
                     pending_cmds,
                     execute_span,
+                    resolved_router,
                 );
             }
-            other => break (other, pending_cmds, execute_span),
+            other => break (other, pending_cmds, execute_span, resolved_router),
         }
     };
 
-    let (outcome, mut pending_cmds, execute_span) = loop_result;
+    let (outcome, mut pending_cmds, execute_span, resolved_router) = loop_result;
 
     // Issue #383: an operator may have paused this execution while this
     // workflow decision task was running. Pause is enforced at the claim layer
@@ -20636,6 +20732,7 @@ async fn process_workflow_task(
                         &execute_span,
                         &mut pending_cancel_metrics,
                         &mut continue_as_new_redirected_to_failure,
+                        resolved_router.as_ref(),
                     )
                     .await?
                 } else {
@@ -20653,6 +20750,7 @@ async fn process_workflow_task(
                         resolved_inline_external,
                         &mut pending_cancel_metrics,
                         &mut continue_as_new_redirected_to_failure,
+                        resolved_router.as_ref(),
                     )
                     .await?;
                     (retry_scheduled, deferred_checks, Vec::new())
@@ -38820,7 +38918,7 @@ mod tests {
     /// contains all three dispatched children.
     #[tokio::test]
     async fn a_failing_cycle_persists_every_dispatched_child() {
-        let (outcome, pending, _span) = crate::executor::run_workflow_with_state(
+        let (outcome, pending, _span, _resolved_router) = crate::executor::run_workflow_with_state(
             ExecutionId::new(),
             vec![WorkflowEvent::WorkflowStarted {
                 input: Value::Null,
@@ -38903,15 +39001,16 @@ mod tests {
             last_error: None,
             scheduled_time: None,
         };
-        let (_outcome, pending, _span) = crate::executor::run_workflow_with_state(
-            exec_id,
-            vec![started.clone()],
-            dispatch_three_children_then_fail,
-            Value::Null,
-            crate::context::empty_shared_state(),
-            None,
-        )
-        .await;
+        let (_outcome, pending, _span, _resolved_router) =
+            crate::executor::run_workflow_with_state(
+                exec_id,
+                vec![started.clone()],
+                dispatch_three_children_then_fail,
+                Value::Null,
+                crate::context::empty_shared_state(),
+                None,
+            )
+            .await;
         let mut timer_events: Vec<Option<WorkflowEvent>> = vec![None; pending.len()];
         let mut history = vec![started];
         history.extend(terminal_pre_outcome_events_from_commands(

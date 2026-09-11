@@ -377,7 +377,7 @@ mod scanner {
             // this child terminal. Mirrors the identical guard in
             // `worker::wake_parent_for_child_completion`/`_failure` and
             // `timeout::wake_parent_for_child_timeout`.
-            if crate::worker::parent_is_on_another_shard(parent_exec_id, exec_id) {
+            if crate::worker::parent_is_on_another_shard(conn, parent_exec_id, exec_id).await? {
                 tracing::debug!(
                     parent_execution_id = %parent_exec_id,
                     child_execution_id = %exec_id,

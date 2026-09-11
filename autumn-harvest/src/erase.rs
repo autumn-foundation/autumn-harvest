@@ -341,11 +341,11 @@ mod db {
 
     use crate::error::{HarvestError, HarvestResult, database_error};
     use crate::schema::{
-        harvest_completion_deliveries, harvest_dead_letters, harvest_events,
-        harvest_execution_summaries, harvest_signals, harvest_workflow_executions,
+        harvest_completion_deliveries, harvest_cross_shard_children, harvest_dead_letters,
+        harvest_events, harvest_execution_summaries, harvest_signals, harvest_workflow_executions,
     };
     use crate::shard::ShardedDbPool;
-    use crate::types::ExecutionId;
+    use crate::types::{ExecutionId, ShardId};
 
     use super::{
         EraseFailure, EraseOutcome, ErasedResidence, SkippedChild, erasure_tombstone,
@@ -357,6 +357,12 @@ mod db {
     /// Erase the payload contents of a completed workflow execution and its
     /// terminal children on the same shard, within a single transaction.
     ///
+    /// Children placed on another shard (issue #956) are NOT reachable this
+    /// way — this call has no [`ShardedDbPool`] to route to them, so they are
+    /// reported as [`EraseFailure`] rather than silently skipped. Use
+    /// [`erase_workflow_payloads_with_pool`] or
+    /// [`erase_workflow_payloads_all_residences`] to reach them.
+    ///
     /// # Errors
     ///
     /// - [`HarvestError::NotFound`] when the execution does not exist (→ HTTP 404).
@@ -366,16 +372,59 @@ mod db {
     pub async fn erase_workflow_payloads(
         conn: &mut AsyncPgConnection,
         exec_id: ExecutionId,
+        reason: &str,
+    ) -> HarvestResult<EraseOutcome> {
+        erase_workflow_payloads_with_pool(conn, exec_id, reason, None).await
+    }
+
+    /// Like [`erase_workflow_payloads`], but also cascades into children
+    /// placed on another shard (issue #956), routing each to its own target
+    /// shard via `pool` (issue #1263 item 10).
+    ///
+    /// PII erasure is sanctioned exception #2 to `harvest_events` being
+    /// append-only (see `CLAUDE.md`), and that exception is only meaningful if
+    /// it actually reaches every payload it claims to. Before this, a
+    /// cross-shard child's row lived entirely outside the query
+    /// (`parent_id.eq`) this module used to find children, so an erase request
+    /// against a parent with a cross-shard child returned success while that
+    /// child's input, output, history, and signals stayed unscrubbed on its
+    /// own shard — a false success on a data-protection operation.
+    ///
+    /// `pool` is `None` on a single-shard deployment or when the caller has no
+    /// [`ShardedDbPool`] to hand. A cross-shard child is then reported through
+    /// [`EraseFailure`] rather than silently skipped, so an erase never claims
+    /// success while PII a caller could not reach still survives.
+    ///
+    /// # Scope boundary
+    ///
+    /// A cross-shard child is discovered through its still-live
+    /// `harvest_cross_shard_children` outbox row on the parent's shard. That
+    /// row is deleted once the child is fully settled and its terminal
+    /// delivered (or its parent-close cascade applied) — see
+    /// `docs/sharding.md`. A parent erased long after that point, once
+    /// retention has also collected the pointer, has no local trace left to
+    /// route from; reaching it needs a cluster-wide fan-out, the same gap
+    /// issue #1263 item 14 names for `GET /workflows/{id}/stack`. This fix
+    /// covers the common, realistic window: an erasure requested at or
+    /// shortly after both parent and child are terminal.
+    ///
+    /// # Errors
+    ///
+    /// Everything [`erase_workflow_payloads`] returns.
+    pub async fn erase_workflow_payloads_with_pool(
+        conn: &mut AsyncPgConnection,
+        exec_id: ExecutionId,
         _reason: &str,
+        pool: Option<&ShardedDbPool>,
     ) -> HarvestResult<EraseOutcome> {
         Box::pin(
             conn.transaction::<EraseOutcome, HarvestError, _>(async |conn| {
                 // A `visited` set guards the unified downward traversal against
-                // diamonds and any pathological `parent_id` cycle across the two
-                // child sources (`harvest_workflow_executions` and
-                // `harvest_execution_summaries`).
+                // diamonds and any pathological `parent_id` cycle across all
+                // three child sources (`harvest_workflow_executions`,
+                // `harvest_execution_summaries`, and cross-shard pointers).
                 let mut visited: HashSet<Uuid> = HashSet::new();
-                erase_top_level(conn, exec_id, &mut visited).await
+                erase_top_level(conn, exec_id, &mut visited, pool).await
             }),
         )
         .await
@@ -393,6 +442,7 @@ mod db {
         conn: &mut AsyncPgConnection,
         exec_id: ExecutionId,
         visited: &mut HashSet<Uuid>,
+        pool: Option<&ShardedDbPool>,
     ) -> HarvestResult<EraseOutcome> {
         visited.insert(exec_id.as_uuid());
         let now = Utc::now();
@@ -413,7 +463,7 @@ mod db {
                          is released"
                     )));
                 }
-                let mut outcome = scrub_execution_node(conn, exec_id, now, visited).await?;
+                let mut outcome = scrub_execution_node(conn, exec_id, now, visited, pool).await?;
                 // Scrub the matching summary (if any) in the same tx. A live
                 // execution row and a summary are mutually exclusive in the
                 // steady state, but this is harmless and idempotent.
@@ -424,7 +474,7 @@ mod db {
                 // No execution row: scrub a lingering summary (and any
                 // summarized child subtree) and report success on that basis.
                 // Nothing at all found → NotFound (404).
-                erase_summary_only_node(conn, exec_id, now, visited)
+                erase_summary_only_node(conn, exec_id, now, visited, pool)
                     .await?
                     .ok_or_else(|| HarvestError::NotFound(format!("workflow execution {exec_id}")))
             }
@@ -489,7 +539,8 @@ mod db {
         // exact form -- a sealed source is one specific database, and falling
         // back to the default there would scrub the wrong copy.
         let mut conn = crate::shard_rebalance::conn_for_live_shard(pool, *live).await?;
-        let mut outcome = erase_workflow_payloads(&mut conn, exec_id, reason).await?;
+        let mut outcome =
+            erase_workflow_payloads_with_pool(&mut conn, exec_id, reason, Some(pool)).await?;
         drop(conn);
 
         for shard in priors {
@@ -507,7 +558,7 @@ mod db {
                 continue;
             }
             let mut conn = crate::shard_rebalance::conn_for_shard(pool, *shard).await?;
-            match erase_workflow_payloads(&mut conn, exec_id, reason).await {
+            match erase_workflow_payloads_with_pool(&mut conn, exec_id, reason, Some(pool)).await {
                 Ok(prior) => outcome.prior_residences.push(ErasedResidence {
                     shard_id: shard.as_i32(),
                     outcome: prior,
@@ -564,9 +615,10 @@ mod db {
         exec_id: ExecutionId,
         now: DateTime<Utc>,
         visited: &'a mut HashSet<Uuid>,
+        pool: Option<&'a ShardedDbPool>,
     ) -> EraseFuture<'a> {
         Box::pin(async move {
-            let mut outcome = scrub_execution_node(conn, exec_id, now, visited).await?;
+            let mut outcome = scrub_execution_node(conn, exec_id, now, visited, pool).await?;
             outcome.summary_scrubbed = erase_execution_summary(conn, exec_id).await?;
             Ok(outcome)
         })
@@ -585,6 +637,7 @@ mod db {
         exec_id: ExecutionId,
         now: DateTime<Utc>,
         visited: &'a mut HashSet<Uuid>,
+        pool: Option<&'a ShardedDbPool>,
     ) -> OptEraseFuture<'a> {
         Box::pin(async move {
             let summary_scrubbed = erase_execution_summary(conn, exec_id).await?;
@@ -613,7 +666,7 @@ mod db {
             let (completion_deliveries_scrubbed, dead_letters_scrubbed) =
                 scrub_callback_pii(conn, exec_id).await?;
             let (children, skipped_children, failures) =
-                cascade_children(conn, exec_id, now, visited).await?;
+                cascade_children(conn, exec_id, now, visited, pool).await?;
             if !summary_scrubbed
                 && completion_deliveries_scrubbed == 0
                 && dead_letters_scrubbed == 0
@@ -729,87 +782,221 @@ mod db {
         Ok(ids)
     }
 
-    /// Cascade erasure to child executions AND child summaries; return
-    /// (children, skipped, failures).
+    /// Children placed on another shard (issue #956), read from the outbox
+    /// pointer on `exec_id`'s OWN shard (issue #1263 item 10).
     ///
-    /// For each child id (from either source, deduped): a live terminal,
-    /// non-held execution row is scrubbed and recursed; a non-terminal or held
-    /// row is skipped; a child with no execution row is a summary-only node
-    /// whose summary (and any summarized grandchildren) is scrubbed recursively.
+    /// Neither of [`collect_child_ids`]'s two sources can ever hold a
+    /// cross-shard child's id: that child's row lives entirely on its target
+    /// shard, never on the parent's. `harvest_cross_shard_children` is the
+    /// only pointer to it that this shard has.
+    ///
+    /// Returns `(child_exec_id, target_shard)` pairs so the caller can route
+    /// each to its own database. See [`erase_workflow_payloads_with_pool`]'s
+    /// scope-boundary note for the one case this cannot see: a child whose
+    /// outbox row has already been retired.
+    async fn collect_cross_shard_child_ids(
+        conn: &mut AsyncPgConnection,
+        exec_id: ExecutionId,
+    ) -> HarvestResult<Vec<(Uuid, i32)>> {
+        harvest_cross_shard_children::table
+            .filter(harvest_cross_shard_children::parent_exec_id.eq(exec_id.as_uuid()))
+            .select((
+                harvest_cross_shard_children::child_exec_id,
+                harvest_cross_shard_children::target_shard,
+            ))
+            .load::<(Uuid, i32)>(conn)
+            .await
+            .map_err(database_error)
+    }
+
+    /// Resolve ONE child, already known to live on `conn`, into exactly one of
+    /// erased / skipped / failed.
+    ///
+    /// Shared by [`cascade_children`]'s same-shard and cross-shard branches
+    /// (issue #1263 item 10) — a child found live-and-terminal, live-and-held,
+    /// live-and-non-terminal, or summary-only is resolved identically whether
+    /// `conn` is the parent's own connection or a freshly checked-out one for
+    /// the child's target shard. Never propagates a `HarvestResult` error
+    /// itself: every failure becomes an [`EraseFailure`] entry, so a database
+    /// error on this transaction never means checking harm to another child.
+    async fn erase_one_child(
+        conn: &mut AsyncPgConnection,
+        child_exec_id: ExecutionId,
+        now: DateTime<Utc>,
+        visited: &mut HashSet<Uuid>,
+        pool: Option<&ShardedDbPool>,
+    ) -> (
+        Option<EraseOutcome>,
+        Option<SkippedChild>,
+        Option<EraseFailure>,
+    ) {
+        // Re-read state + hold under a FOR UPDATE row lock (issue #747 MINOR
+        // 2a): the parent's erase tx only locks the parent, so a hold placed
+        // directly on this child after the unlocked list read above must
+        // still be caught. Locking here serializes against `set_legal_hold`.
+        match load_erase_gate_row(conn, child_exec_id).await {
+            Ok((child_state, set_at, until, reason)) => {
+                if !is_terminal_state(&child_state) {
+                    return (
+                        None,
+                        Some(SkippedChild {
+                            execution_id: child_exec_id.to_string(),
+                            state: child_state,
+                            reason: None,
+                        }),
+                        None,
+                    );
+                }
+                // A held child is a deliberate SKIP, not a failure (issue #747
+                // MINOR 2b): its events are left intact while the parent and
+                // other children erase normally.
+                if crate::retention::legal_hold_active(set_at, until, now) {
+                    let hold_reason = reason.as_deref().unwrap_or("no reason recorded");
+                    return (
+                        None,
+                        Some(SkippedChild {
+                            execution_id: child_exec_id.to_string(),
+                            state: child_state,
+                            reason: Some(format!("legal hold ({hold_reason})")),
+                        }),
+                        None,
+                    );
+                }
+                match erase_child_execution_node(conn, child_exec_id, now, visited, pool).await {
+                    Ok(outcome) => (Some(outcome), None, None),
+                    Err(e) => (
+                        None,
+                        None,
+                        Some(EraseFailure {
+                            execution_id: child_exec_id.to_string(),
+                            reason: e.to_string(),
+                        }),
+                    ),
+                }
+            }
+            // No execution row: a summary-only child (issue #752, AC6) — same
+            // treatment whether it is same-shard or cross-shard, since a
+            // cross-shard child's summary row (if any) is on ITS OWN target
+            // shard, exactly where `conn` already is.
+            Err(HarvestError::NotFound(_)) => {
+                match erase_summary_only_node(conn, child_exec_id, now, visited, pool).await {
+                    // `None` = the summary vanished between the listing read
+                    // and here (a concurrent GC race): nothing to do.
+                    Ok(None) => (None, None, None),
+                    Ok(Some(outcome)) => (Some(outcome), None, None),
+                    Err(e) => (
+                        None,
+                        None,
+                        Some(EraseFailure {
+                            execution_id: child_exec_id.to_string(),
+                            reason: e.to_string(),
+                        }),
+                    ),
+                }
+            }
+            Err(e) => (
+                None,
+                None,
+                Some(EraseFailure {
+                    execution_id: child_exec_id.to_string(),
+                    reason: e.to_string(),
+                }),
+            ),
+        }
+    }
+
+    /// Cascade erasure to child executions, child summaries, AND cross-shard
+    /// children; return (children, skipped, failures).
+    ///
+    /// For each SAME-shard child id (from either of [`collect_child_ids`]'s two
+    /// sources, deduped): a live terminal, non-held execution row is scrubbed
+    /// and recursed; a non-terminal or held row is skipped; a child with no
+    /// execution row is a summary-only node whose summary (and any summarized
+    /// grandchildren) is scrubbed recursively.
+    ///
+    /// Each CROSS-SHARD child (issue #1263 item 10) is routed to its own
+    /// target shard via `pool` and resolved by the identical
+    /// [`erase_one_child`] logic there. A target this call cannot reach — no
+    /// `pool`, an unreachable shard, or a genuine failure mid-erase — is
+    /// reported as an [`EraseFailure`], never silently dropped: an erase must
+    /// not claim success over PII it could not verify was scrubbed.
     async fn cascade_children(
         conn: &mut AsyncPgConnection,
         exec_id: ExecutionId,
         now: DateTime<Utc>,
         visited: &mut HashSet<Uuid>,
+        pool: Option<&ShardedDbPool>,
     ) -> HarvestResult<(Vec<EraseOutcome>, Vec<SkippedChild>, Vec<EraseFailure>)> {
-        let child_ids = collect_child_ids(conn, exec_id).await?;
-
         let mut children = Vec::new();
         let mut skipped_children = Vec::new();
         let mut failures = Vec::new();
-        for child_uuid in child_ids {
+
+        for child_uuid in collect_child_ids(conn, exec_id).await? {
             // Guard against diamonds / pathological parent_id cycles.
             if !visited.insert(child_uuid) {
                 continue;
             }
             let child_exec_id = ExecutionId::from_uuid(child_uuid);
-            // Re-read state + hold under a FOR UPDATE row lock (issue #747 MINOR
-            // 2a): the parent's erase tx only locks the parent, so a hold placed
-            // directly on this child after the unlocked list read above must
-            // still be caught. Locking here serializes against `set_legal_hold`.
-            match load_erase_gate_row(conn, child_exec_id).await {
-                Ok((child_state, set_at, until, reason)) => {
-                    if !is_terminal_state(&child_state) {
-                        skipped_children.push(SkippedChild {
-                            execution_id: child_exec_id.to_string(),
-                            state: child_state,
-                            reason: None,
-                        });
-                        continue;
-                    }
-                    // A held child is a deliberate SKIP, not a failure (issue
-                    // #747 MINOR 2b): its events are left intact while the parent
-                    // and other children erase normally.
-                    if crate::retention::legal_hold_active(set_at, until, now) {
-                        let hold_reason = reason.as_deref().unwrap_or("no reason recorded");
-                        skipped_children.push(SkippedChild {
-                            execution_id: child_exec_id.to_string(),
-                            state: child_state,
-                            reason: Some(format!("legal hold ({hold_reason})")),
-                        });
-                        continue;
-                    }
-                    match erase_child_execution_node(conn, child_exec_id, now, visited).await {
-                        Ok(outcome) => children.push(outcome),
-                        Err(e) => failures.push(EraseFailure {
-                            execution_id: child_exec_id.to_string(),
-                            reason: e.to_string(),
+            let (erased, skipped, failed) =
+                erase_one_child(conn, child_exec_id, now, visited, pool).await;
+            children.extend(erased);
+            skipped_children.extend(skipped);
+            failures.extend(failed);
+        }
+
+        for (child_uuid, target_shard) in collect_cross_shard_child_ids(conn, exec_id).await? {
+            if !visited.insert(child_uuid) {
+                continue;
+            }
+            let child_exec_id = ExecutionId::from_uuid(child_uuid);
+            let Some(pool) = pool else {
+                failures.push(EraseFailure {
+                    execution_id: child_exec_id.to_string(),
+                    reason: format!(
+                        "child is on shard {target_shard}; this erase call was given no \
+                         ShardedDbPool to reach it, so it could not be scrubbed — retry \
+                         through erase_workflow_payloads_with_pool or \
+                         erase_workflow_payloads_all_residences"
+                    ),
+                });
+                continue;
+            };
+            let outcome = match crate::shard_rebalance::conn_for_shard(
+                pool,
+                ShardId::new(target_shard),
+            )
+            .await
+            {
+                Ok(mut target_conn) => {
+                    Box::pin(
+                        target_conn.transaction::<_, HarvestError, _>(async |target_conn| {
+                            Ok(erase_one_child(
+                                target_conn,
+                                child_exec_id,
+                                now,
+                                visited,
+                                Some(pool),
+                            )
+                            .await)
                         }),
-                    }
+                    )
+                    .await
                 }
-                // No execution row: a summary-only child (issue #752, AC6). Its
-                // execution row was already retention-collected; scrub its
-                // summary and any summarized grandchildren.
-                Err(HarvestError::NotFound(_)) => {
-                    match erase_summary_only_node(conn, child_exec_id, now, visited).await {
-                        // `None` = the summary vanished between `collect_child_ids`
-                        // and here (a concurrent GC race): nothing to do.
-                        Ok(None) => {}
-                        Ok(Some(outcome)) => children.push(outcome),
-                        Err(e) => failures.push(EraseFailure {
-                            execution_id: child_exec_id.to_string(),
-                            reason: e.to_string(),
-                        }),
-                    }
+                Err(e) => Err(e),
+            };
+            match outcome {
+                Ok((erased, skipped, failed)) => {
+                    children.extend(erased);
+                    skipped_children.extend(skipped);
+                    failures.extend(failed);
                 }
-                Err(e) => {
-                    failures.push(EraseFailure {
-                        execution_id: child_exec_id.to_string(),
-                        reason: e.to_string(),
-                    });
-                }
+                Err(e) => failures.push(EraseFailure {
+                    execution_id: child_exec_id.to_string(),
+                    reason: e.to_string(),
+                }),
             }
         }
+
         Ok((children, skipped_children, failures))
     }
 
@@ -909,6 +1096,7 @@ mod db {
         exec_id: ExecutionId,
         now: DateTime<Utc>,
         visited: &mut HashSet<Uuid>,
+        pool: Option<&ShardedDbPool>,
     ) -> HarvestResult<EraseOutcome> {
         // ── Scrub events, execution row, signals ──────────────────────────────
         let (events_scrubbed, fields_tombstoned) = scrub_events(conn, exec_id).await?;
@@ -945,9 +1133,9 @@ mod db {
         let (completion_deliveries_scrubbed, dead_letters_scrubbed) =
             scrub_callback_pii(conn, exec_id).await?;
 
-        // ── Cascade to child executions AND child summaries ───────────────────
+        // ── Cascade to child executions, child summaries, AND cross-shard children ──
         let (children, skipped_children, failures) =
-            cascade_children(conn, exec_id, now, visited).await?;
+            cascade_children(conn, exec_id, now, visited, pool).await?;
 
         Ok(EraseOutcome {
             execution_id: exec_id.to_string(),
@@ -973,6 +1161,7 @@ mod db {
 #[cfg(feature = "db")]
 pub use db::{
     erase_execution_summary, erase_workflow_payloads, erase_workflow_payloads_all_residences,
+    erase_workflow_payloads_with_pool,
 };
 
 // ── Unit tests ────────────────────────────────────────────────────────────────
