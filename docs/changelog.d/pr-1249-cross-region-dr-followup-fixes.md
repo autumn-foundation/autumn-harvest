@@ -81,6 +81,10 @@ conflict shapes.
   stream than the new primary's. New migration column `fence_generation`
   stamps each beat with the epoch in force when it was written;
   `measure_rpo` now reads only beats from the shard's CURRENT generation.
+  The migration backfills existing rows written on or after the shard's
+  last recorded fence bump (safely known to belong to the current epoch);
+  older rows are left at the safe `0` default, which measure_rpo already
+  excludes correctly on any shard whose generation has moved past zero.
 - **Finding 11** — promotion's sequence-advance used `GREATEST` unconditionally,
   which assumes ascending issuance; a descending sequence's "furthest issued"
   value is its MINIMUM, so `GREATEST` could reset it backward into a value it
