@@ -124,24 +124,23 @@ struct MetadataGuard {
     _permit: tokio::sync::MutexGuard<'static, ()>,
 }
 
+fn wf_meta(quota: QuotaPolicy) -> WorkflowMetadata {
+    WorkflowMetadata {
+        concurrency: None,
+        max_input_bytes: None,
+        owner: None,
+        runbook_url: None,
+        severity: None,
+        input_schema: None,
+        sla: None,
+        retry_policy: None,
+        quota: Some(quota),
+    }
+}
+
 impl MetadataGuard {
-    async fn install_one(workflow_name: &str, quota: QuotaPolicy) -> Self {
+    async fn install(map: HashMap<String, WorkflowMetadata>) -> Self {
         let permit = TEST_SERIAL.lock().await;
-        let mut map = HashMap::new();
-        map.insert(
-            workflow_name.to_string(),
-            WorkflowMetadata {
-                concurrency: None,
-                max_input_bytes: None,
-                owner: None,
-                runbook_url: None,
-                severity: None,
-                input_schema: None,
-                sla: None,
-                retry_policy: None,
-                quota: Some(quota),
-            },
-        );
         let previous = {
             let mut lock = GLOBAL_WORKFLOW_METADATA.write().expect("metadata lock");
             lock.take()
@@ -154,6 +153,13 @@ impl MetadataGuard {
             previous,
             _permit: permit,
         }
+    }
+
+    /// Convenience for the common single-workflow-type case.
+    async fn install_one(workflow_name: &str, quota: QuotaPolicy) -> Self {
+        let mut map = HashMap::new();
+        map.insert(workflow_name.to_string(), wf_meta(quota));
+        Self::install(map).await
     }
 
     /// Install with NO declared policy for any workflow type (an empty
@@ -533,24 +539,30 @@ async fn batch_size_bounds_a_single_sweep_and_the_rest_finish_on_the_next_one() 
 #[tokio::test]
 async fn cursor_advances_past_permanently_stuck_rows_so_a_resolvable_row_is_not_starved() {
     let (mut conn, _container) = setup_db().await;
-    // `wf_stuck` has no registered policy -- every one of its rows
-    // classifies `NoPolicy` and can never leave the candidate set. Row
-    // `id`s are random UUIDs, so a stuck row can sort before OR after
-    // the one resolvable row. A fixed `LIMIT` with no cursor could
-    // therefore keep re-examining the same stuck rows forever, and
-    // never reach the resolvable one. `wf_resolvable` carries the only
-    // registered policy.
+    // Both workflow types carry a registered policy, so `CANDIDATE_SQL`'s
+    // `workflow_name = ANY($1)` filter returns rows for each -- otherwise
+    // this test would pass on the very first tick regardless of cursor
+    // behavior, since an unregistered type's rows are never fetched at
+    // all. `wf_stuck`'s input omits the policy's key field, so every one
+    // of its rows classifies `Unresolvable` and can never leave the
+    // candidate set. Row `id`s are random UUIDs, so a stuck row can sort
+    // before OR after the one resolvable row. A fixed `LIMIT` with no
+    // cursor could therefore keep re-examining the same stuck rows
+    // forever, and never reach the resolvable one.
     let stuck_workflow_name = leaked("wf_stuck");
     let resolvable_workflow_name = leaked("wf_resolvable");
     let policy = QuotaPolicy::new("tenant_id").with_max_active_executions(10);
-    let _guard = MetadataGuard::install_one(resolvable_workflow_name, policy).await;
+    let mut policies = HashMap::new();
+    policies.insert(stuck_workflow_name.to_string(), wf_meta(policy));
+    policies.insert(resolvable_workflow_name.to_string(), wf_meta(policy));
+    let _guard = MetadataGuard::install(policies).await;
 
     for _ in 0..3 {
         insert_execution(
             &mut conn,
             stuck_workflow_name,
             "RUNNING",
-            serde_json::json!({ "tenant_id": "acme" }),
+            serde_json::json!({ "other": "value" }),
             None,
         )
         .await;
