@@ -1408,6 +1408,77 @@ async fn sse_stream_end_block_carries_id_execution_id_and_state() {
     );
 }
 
+/// Issue #1458: a reconnect with `Last-Event-ID` set to the last row the
+/// client already saw yields an empty backfill. The `stream-end` block must
+/// then echo that client-supplied id, not `-1` or a stale value.
+#[tokio::test]
+async fn sse_stream_end_uses_last_event_id_header_when_backfill_is_empty() {
+    let (url, _container) = setup_database().await;
+    let pool = build_pool(&url);
+    let app = build_app_with(
+        &pool,
+        &AppConfig {
+            admin: true,
+            codecs: false,
+            decode_on_read: false,
+            notification_url: Some(&url),
+        },
+    );
+    let mut conn = AsyncPgConnection::establish(&url).await.unwrap();
+
+    let exec_id = seed_running(&mut conn, "sse-reconnect-terminal", json!({})).await;
+    append_events(
+        &mut conn,
+        exec_id,
+        &[WorkflowEvent::WorkflowCompleted {
+            output: json!(null),
+        }],
+    )
+    .await;
+    mark_completed(&mut conn, exec_id, json!(null)).await;
+
+    let last_row_id: i64 = harvest_events::table
+        .filter(harvest_events::workflow_exec_id.eq(exec_id.as_uuid()))
+        .select(harvest_events::id)
+        .order(harvest_events::id.desc())
+        .first(&mut conn)
+        .await
+        .unwrap();
+
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri(format!("/executions/{exec_id}/events/stream"))
+                .header("last-event-id", last_row_id.to_string())
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .expect("open SSE stream");
+    assert_eq!(response.status(), StatusCode::OK);
+    let bytes = tokio::time::timeout(
+        std::time::Duration::from_secs(30),
+        axum::body::to_bytes(response.into_body(), usize::MAX),
+    )
+    .await
+    .expect("terminal execution's stream must close after backfill")
+    .expect("read SSE body");
+    let stream_text = String::from_utf8_lossy(&bytes);
+
+    let end_block = stream_text
+        .split("\n\n")
+        .find(|block| block.contains("event: stream-end"))
+        .unwrap_or_else(|| panic!("no stream-end block in: {stream_text}"));
+
+    assert_eq!(
+        end_block.trim_start().lines().next(),
+        Some(format!("id: {last_row_id}")).as_deref(),
+        "an empty backfill must echo the client's own Last-Event-ID as id: {end_block}"
+    );
+}
+
 /// AC6: decode-only-when-admin. On an ungated route, a non-admin caller
 /// (flag on, no session) receives today's bytes — the stored ciphertext.
 #[tokio::test]

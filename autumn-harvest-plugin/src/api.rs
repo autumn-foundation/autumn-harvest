@@ -42107,6 +42107,30 @@ fn stream_end_payload(exec_id: ExecutionId, reason: &str) -> String {
     .to_string()
 }
 
+/// Send the terminal `stream-end` frame: one call site for all four places
+/// that detect a terminal execution (issue #1458). A single call site keeps
+/// the `id:`/`execution_id`/`state` fields from drifting out of sync again.
+async fn send_stream_end(
+    api: &HarvestApiState,
+    exec_id: ExecutionId,
+    tx: &mut futures::channel::mpsc::Sender<
+        Result<axum::response::sse::Event, std::convert::Infallible>,
+    >,
+    last_id: i64,
+    event_derived_state: &str,
+) {
+    use futures::SinkExt as _;
+
+    let reason = resolve_stream_end_reason(api, exec_id, event_derived_state).await;
+    let end_data = stream_end_payload(exec_id, &reason);
+    let _ = tx
+        .send(Ok(axum::response::sse::Event::default()
+            .id(last_id.to_string())
+            .event("stream-end")
+            .data(end_data)))
+        .await;
+}
+
 #[cfg(test)]
 mod stream_end_reason_tests {
     use super::stream_end_reason;
@@ -42457,15 +42481,8 @@ async fn stream_execution_events(
                 None
             });
         if let Some(state) = effective_terminal {
-            let reason = resolve_stream_end_reason(&api_clone, exec_id, state).await;
             let last_id = backfill.last().map_or(last_row_id, |r| r.id);
-            let end_data = stream_end_payload(exec_id, &reason);
-            let _ = tx
-                .send(Ok(Event::default()
-                    .id(last_id.to_string())
-                    .event("stream-end")
-                    .data(end_data)))
-                .await;
+            send_stream_end(&api_clone, exec_id, &mut tx, last_id, state).await;
         } else {
             // ── 3. Live-tail: LISTEN/NOTIFY loop ─────────────────────────────
             let mut last_seen_id = backfill.last().map_or(last_row_id, |r| r.id);
@@ -42523,14 +42540,7 @@ async fn stream_execution_events(
                         }
 
                         if let Some(state) = terminal_state {
-                            let reason =
-                                resolve_stream_end_reason(&api_clone, exec_id, state).await;
-                            let end_data = stream_end_payload(exec_id, &reason);
-                            let _ = tx
-                                .send(Ok(Event::default()
-                                    .id(last_seen_id.to_string())
-                                    .event("stream-end")
-                                    .data(end_data)))
+                            send_stream_end(&api_clone, exec_id, &mut tx, last_seen_id, state)
                                 .await;
                             break 'notify;
                         }
@@ -42571,14 +42581,7 @@ async fn stream_execution_events(
                             break 'notify;
                         }
                         if let Some(state) = terminal_state {
-                            let reason =
-                                resolve_stream_end_reason(&api_clone, exec_id, state).await;
-                            let end_data = stream_end_payload(exec_id, &reason);
-                            let _ = tx
-                                .send(Ok(Event::default()
-                                    .id(last_seen_id.to_string())
-                                    .event("stream-end")
-                                    .data(end_data)))
+                            send_stream_end(&api_clone, exec_id, &mut tx, last_seen_id, state)
                                 .await;
                             break 'notify;
                         }
@@ -42619,14 +42622,7 @@ async fn stream_execution_events(
                             break 'notify;
                         }
                         if let Some(state) = terminal_state {
-                            let reason =
-                                resolve_stream_end_reason(&api_clone, exec_id, state).await;
-                            let end_data = stream_end_payload(exec_id, &reason);
-                            let _ = tx
-                                .send(Ok(Event::default()
-                                    .id(last_seen_id.to_string())
-                                    .event("stream-end")
-                                    .data(end_data)))
+                            send_stream_end(&api_clone, exec_id, &mut tx, last_seen_id, state)
                                 .await;
                             break 'notify;
                         }
