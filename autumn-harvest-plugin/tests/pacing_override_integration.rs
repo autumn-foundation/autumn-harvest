@@ -2195,6 +2195,84 @@ async fn list_rate_limits_reports_disagreement_across_live_shards() {
     );
 }
 
+/// Issue #1222: a shard with NO bucket row for a key is not "no policy" --
+/// it is "un-overridden baseline policy, not yet materialized". The next
+/// dispatch on that shard lazily creates a baseline-only bucket and enforces
+/// a DIFFERENT effective rate than an active override on a sibling shard.
+/// `list_rate_limits` must flag that as disagreement, not silently drop the
+/// row-less shard from consideration.
+#[tokio::test]
+async fn list_rate_limits_reports_disagreement_when_a_shard_has_no_row() {
+    let (url_0, _container_0) = setup_one_shard().await;
+    let (url_1, _container_1) = setup_one_shard().await;
+    let pool_0 = build_pool(&url_0);
+    let pool_1 = build_pool(&url_1);
+
+    let name = leaked_name("send_email");
+
+    // Shard 0: a live ACTIVE override.
+    let expires_at = chrono::Utc::now() + chrono::Duration::seconds(300);
+    {
+        let mut conn = pool_0.get().await.expect("shard 0 conn");
+        diesel::sql_query(
+            "INSERT INTO harvest_rate_limit_buckets \
+             (key, refill_rate, burst, tokens, last_refilled_at, created_at, updated_at, \
+              override_refill_rate, override_burst, override_expires_at) \
+             VALUES ($1, $2, $2, $3, NOW(), NOW(), NOW(), $4, $4, $5)",
+        )
+        .bind::<diesel::sql_types::Text, _>(name)
+        .bind::<diesel::sql_types::Double, _>(0.001)
+        .bind::<diesel::sql_types::Double, _>(1000.0)
+        .bind::<diesel::sql_types::Double, _>(1000.0)
+        .bind::<diesel::sql_types::Timestamptz, _>(expires_at)
+        .execute(&mut conn)
+        .await
+        .expect("seed shard 0 (active)");
+    }
+
+    // Shard 1: NO row at all for this key -- not an inactive row, an absent
+    // one. This is the exact repro shape from issue #1222.
+
+    let mut pools = BTreeMap::new();
+    pools.insert(ShardId::new(0), pool_0);
+    pools.insert(ShardId::new(1), pool_1);
+    let sharded_pool = ShardedDbPool::from_map(pools, ShardId::new(0));
+    let router = ShardRouter::new(
+        vec![ShardId::new(0), ShardId::new(1)],
+        vec![ShardId::new(0), ShardId::new(1)],
+        ShardId::new(0),
+    );
+
+    let app = build_sharded_app(
+        HarvestDbPool::sharded(sharded_pool),
+        router,
+        vec![rate_limited_activity_info(name, 0.001, 5.0)],
+        vec![],
+    );
+
+    let (status, list) = get_json(&app, "/admin/rate-limits").await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "the list read itself never fails on a genuine disagreement, only surfaces it: {list}"
+    );
+    let entry = list
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|b| b["key"] == json!(name))
+        .unwrap_or_else(|| panic!("{name} bucket listed: {list:?}"));
+
+    assert_eq!(
+        entry["shard_disagreement"],
+        json!(true),
+        "shard 1 has not materialized a bucket row yet, but its NEXT \
+         dispatch will enforce the un-overridden baseline -- a genuinely \
+         different effective rate than shard 0's active override. That \
+         must count as disagreement even though only one row exists: {entry}"
+    );
+}
+
 /// Issue #945 review, round 5, finding 2: the round-4 disagreement check
 /// compared only the RAW `override_refill_rate`/`override_burst` columns.
 /// A partial legacy `POST /admin/rate-limits/{key}` fan-out (issue #332)
