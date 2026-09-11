@@ -10177,47 +10177,20 @@ async fn persist_all_started_child_workflows(
         for event in parent_events {
             store::append_single_event(conn, parent_exec_id, event).await?;
         }
-        create_detached_child_executions(conn, registry, parent_execution, commands, &execute_span)
-            .await?;
-
-        let mut race_next_event_id =
-            store::load_history_with_codecs(conn, parent_exec_id, registry.payload_codecs())
-                .await?
-                .next_event_id;
-        let (race_deferred, _race_loser_events) = apply_race_loser_cancellations(
-            conn,
-            parent_exec_id,
-            commands,
-            &mut race_next_event_id,
-            registry,
-        )
-        .await?;
-
-        // Issue #946, Codex round-5 review: pre-acquire every distinct quota
-        // advisory lock this fan-out will need, in one deterministic (sorted)
-        // order, BEFORE inserting any child row below. Without this, the
-        // per-child loop below acquires each `pg_advisory_xact_lock` one at a
-        // time as it iterates children in COMMAND order -- if two concurrent
-        // parents fan out to the same set of quota-governed keys in OPPOSITE
-        // command orders, each transaction can hold one key while waiting on
-        // the other (a classic ABBA wait-for cycle). Postgres resolves that
-        // by aborting one transaction with a raw `deadlock_detected` error,
-        // which is not `QuotaExceeded` and therefore not recovered by the
-        // loop below -- it propagates to `fail_execution_on_error` and
-        // terminally fails an otherwise-healthy parent over a transient
-        // serialization conflict, never a real quota breach. Sorting the
-        // lock-acquisition order makes a wait-for cycle impossible: every
-        // transaction that reaches this fan-out acquires the SAME keys in
-        // the SAME order, so no two transactions can ever hold a lock the
-        // other is waiting on. `lock_quota_key`'s `pg_advisory_xact_lock` is
-        // safely re-entrant within one session/transaction, so the per-child
-        // loop's own `enforce_quota_admission` -> `lock_quota_key` call below
-        // simply re-acquires what is already held here -- no other change
-        // needed. The set mirrors exactly what that loop would lock (a
-        // declared policy with `has_any_cap()` and a resolvable key), so no
-        // lock is taken here that the loop would not otherwise have taken.
-        let mut quota_lock_keys: std::collections::BTreeSet<(String, String)> =
-            std::collections::BTreeSet::new();
+        // Issue #1484 review: this transaction can spawn BOTH detached
+        // children (below, via `create_detached_child_executions`) and
+        // awaited children (further below, via the `local_new_children`
+        // loop). Locking each set in its own separately-sorted pass does not
+        // prevent an ABBA cycle across the two phases. A parent with
+        // detached key B and awaited key A can race a peer with detached
+        // key A and awaited key B. Each can then hold its phase-one key
+        // while it waits on the other's phase-two key. Issue #946 and issue
+        // #1228 Finding 2 each sorted one phase alone. This combines BOTH
+        // phases' keys into ONE `BTreeSet` instead. It locks the union
+        // before either insertion phase begins. No transaction can then
+        // ever hold a key here that another is waiting on.
+        let mut quota_lock_keys =
+            detached_child_quota_lock_keys(conn, registry, parent_execution, commands).await?;
         // Local children only (issue #956): a cross-shard child's quota is
         // enforced on ITS shard by the relay, under that shard's own advisory
         // lock, so taking the lock here would serialise unrelated parents on a
@@ -10234,6 +10207,22 @@ async fn persist_all_started_child_workflows(
         for (workflow_name, key) in &quota_lock_keys {
             crate::quota::lock_quota_key(conn, workflow_name, key).await?;
         }
+
+        create_detached_child_executions(conn, registry, parent_execution, commands, &execute_span)
+            .await?;
+
+        let mut race_next_event_id =
+            store::load_history_with_codecs(conn, parent_exec_id, registry.payload_codecs())
+                .await?
+                .next_event_id;
+        let (race_deferred, _race_loser_events) = apply_race_loser_cancellations(
+            conn,
+            parent_exec_id,
+            commands,
+            &mut race_next_event_id,
+            registry,
+        )
+        .await?;
 
         // Insert rows and enqueue tasks for new children.
         // Provenance ref for every child in this fan-out is the parent
@@ -11454,6 +11443,43 @@ async fn persist_mixed_suspension_batch(
             local
         };
 
+        // Issue #1484 review: this batch can carry BOTH `StartChildWorkflow`
+        // (awaited, below) and `SpawnDetachedChildWorkflow` (detached, resolved
+        // by `detached_spawns.persist` further below) commands together. Two
+        // separately-sorted lock passes, one per kind, do not prevent an ABBA
+        // cycle across the two. A parent with detached key B and awaited key
+        // A can race a peer with detached key A and awaited key B. Each
+        // transaction can then hold its own first-phase key while it waits
+        // on the other's second-phase key. Union both sets instead, and
+        // lock them in ONE sorted pass, before EITHER insertion phase runs.
+        // No transaction here can then ever hold a key another is waiting on.
+        // This mirrors how issue #946 and issue #1228 Finding 2 each closed
+        // the identical hazard within a single phase.
+        let mut quota_lock_keys =
+            detached_child_quota_lock_keys(conn, registry, parent_execution, commands).await?;
+        for child in &batch.children {
+            if existing_child_ids.contains(&child.child_id.as_uuid()) {
+                continue;
+            }
+            // A cross-shard child (issue #956) is admitted against its OWN
+            // shard's advisory lock by the relay, so locking its key here would
+            // serialise unrelated parents on a key this transaction never
+            // admits against.
+            if child_target_shard(child.child_id, shard_id) != shard_id {
+                continue;
+            }
+            let defaults = resolve_child_workflow_defaults(registry, &child.workflow_name);
+            if let Some(policy) = defaults.quota
+                && policy.has_any_cap()
+                && let Some(key) = crate::quota::resolve_quota_key(policy.key_expr, &child.input)
+            {
+                quota_lock_keys.insert((child.workflow_name.clone(), key));
+            }
+        }
+        for (workflow_name, key) in &quota_lock_keys {
+            crate::quota::lock_quota_key(conn, workflow_name, key).await?;
+        }
+
         // ADR-0001 §2.8: a `harvest.child_workflow.start` PRODUCER span per
         // genuinely new child, parented to this executor cycle's execute span.
         // `EnteredSpan` is `!Send`, so each span is fully dropped (via
@@ -11546,42 +11572,11 @@ async fn persist_mixed_suspension_batch(
                 .map_err(crate::error::database_error)?;
         }
 
-        // Issue #946: pre-acquire every distinct quota advisory lock this batch
-        // needs, in one deterministic (sorted) order, BEFORE inserting any child
-        // row. Without this, two concurrent parents fanning out to the same
-        // quota-governed keys in OPPOSITE command orders can each hold one key
-        // while waiting on the other -- a wait-for cycle Postgres resolves by
-        // aborting one with a raw `deadlock_detected` error, which is NOT
-        // `QuotaExceeded` and would therefore terminally fail an otherwise-healthy
-        // parent over a transient serialization conflict. `lock_quota_key`'s
-        // `pg_advisory_xact_lock` is re-entrant within one transaction, so
-        // `enforce_quota_admission`'s own later call simply re-acquires what is
-        // already held. The set mirrors exactly what that path would lock.
-        let mut quota_lock_keys: std::collections::BTreeSet<(String, String)> =
-            std::collections::BTreeSet::new();
-        for child in &batch.children {
-            if existing_child_ids.contains(&child.child_id.as_uuid()) {
-                continue;
-            }
-            // A cross-shard child (issue #956) is admitted against its OWN
-            // shard's advisory lock by the relay, so locking its key here would
-            // serialise unrelated parents on a key this transaction never
-            // admits against.
-            if child_target_shard(child.child_id, shard_id) != shard_id {
-                continue;
-            }
-            let defaults = resolve_child_workflow_defaults(registry, &child.workflow_name);
-            if let Some(policy) = defaults.quota
-                && policy.has_any_cap()
-                && let Some(key) = crate::quota::resolve_quota_key(policy.key_expr, &child.input)
-            {
-                quota_lock_keys.insert((child.workflow_name.clone(), key));
-            }
-        }
-        for (workflow_name, key) in &quota_lock_keys {
-            crate::quota::lock_quota_key(conn, workflow_name, key).await?;
-        }
-
+        // Issue #1484 review: already locked above. That combined pre-lock
+        // step ran jointly with the detached-child keys, before
+        // `detached_spawns.persist`. See its comment for why a separate pass
+        // here would not be safe.
+        //
         // Insert the row + enqueue the task for each genuinely new child, through
         // the same helper the #779 child-timeout race uses (which resolves the
         // child's OWN registered defaults and enforces its OWN declared quota).
@@ -12728,65 +12723,33 @@ pub async fn persist_child_workflow_failure(
     Ok((exec_id, None))
 }
 
-/// Perform the DB side-effects for all `SpawnDetachedChildWorkflow` commands in
-/// `commands`: insert a child execution row, start the child's event log with
-/// `WorkflowStarted`, and enqueue the child task.
+/// Compute the distinct `(workflow_name, quota_key)` pairs a batch of
+/// `SpawnDetachedChildWorkflow` commands needs locked, without acquiring any
+/// lock (issue #1228, Finding 2; issue #1484 review).
 ///
-/// The `ChildWorkflowSpawnedDetached` event written to the **parent** history is
-/// handled separately by `pre_suspension_events_from_commands` so that it lands
-/// at the correct position relative to `RecordMarker` events.
-/// Callers must invoke this inside the same transaction that appends those
-/// parent events, before the child task can be observed by another worker.
+/// [`create_detached_child_executions`] calls this and locks the result
+/// itself for a caller that spawns ONLY detached children in a transaction.
+/// A caller that ALSO spawns awaited children in the same transaction needs
+/// more (issue #1484 review: `persist_all_started_child_workflows` and
+/// `persist_mixed_suspension_batch`). Such a caller unions this set with its
+/// own awaited-child key set instead. It locks the combined result in one
+/// sorted pass, before either insertion phase runs. Splitting the
+/// computation out of the lock loop is what makes that union possible. No
+/// caller needs to duplicate the resolve-key logic below.
 ///
-/// Non-detached-spawn commands in `commands` are silently skipped. Already-existing
-/// child rows (idempotent re-run after a crash) are also skipped.
-#[allow(clippy::too_many_lines)]
-async fn create_detached_child_executions(
+/// Skips exactly what the insertion loop in `create_detached_child_executions`
+/// skips. A cross-shard child is skipped; the relay locks it on ITS OWN
+/// shard. An already-created child is skipped too (idempotent replay).
+/// `already_created` is one query taken BEFORE this batch's own inserts run.
+/// So it can miss an in-batch duplicate `child_id`. The insertion loop's own
+/// fresh per-child check still catches that case. Missing one here only
+/// means one harmless extra lock stays held for the rest of the transaction.
+async fn detached_child_quota_lock_keys(
     conn: &mut AsyncPgConnection,
     registry: &HandlerRegistry,
     parent_execution: &WorkflowExecution,
     commands: &[WorkflowCommand],
-    execute_span: &tracing::Span,
-) -> HarvestResult<()> {
-    // Capability miss (#804): pre-validate EVERY detached child's handler before
-    // inserting any of them, so a miss on the second child cannot leave the
-    // first already created. Releasing the parent's task lets a capable peer
-    // persist the whole batch instead of terminally failing the parent.
-    for cmd in commands {
-        if let WorkflowCommand::SpawnDetachedChildWorkflow { workflow_name, .. } = cmd
-            && !registry.workflows.contains_key(workflow_name.as_str())
-        {
-            return Err(HarvestError::HandlerNotRegistered {
-                kind: CapabilityMissKind::Workflow.as_str(),
-                name: workflow_name.clone(),
-                phase: CapabilityMissPhase::AfterHandler,
-            });
-        }
-    }
-
-    // Issue #1228, Finding 2: pre-acquire every distinct quota advisory lock
-    // this batch of detached children will need. Acquire them in one
-    // deterministic (sorted) order, BEFORE inserting any child row below.
-    // This mirrors the fix issue #946 already applied to the awaited-child
-    // fan-out (`persist_all_started_child_workflows`) for the identical
-    // hazard. The loop below used to lock each child's key one at a time,
-    // in raw command order. Two concurrent parents can spawn detached
-    // children under the same keys in OPPOSITE command order. Each could
-    // then hold one key while it waits on the other. That is a classic
-    // ABBA wait-for cycle. Postgres resolves it by aborting one transaction
-    // with a raw `deadlock_detected` error. That error is not
-    // `QuotaExceeded`, so it is never recovered. It terminally fails an
-    // otherwise-healthy parent over a transient conflict, not a real quota
-    // breach. Sorting the lock order removes the cycle. Every transaction
-    // reaching this fan-out locks the SAME keys in the SAME order.
-    //
-    // Skips what the loop below always skips: a cross-shard child. Its OWN
-    // shard locks that child, via the relay. Also skips, best-effort, an
-    // already-created child (idempotent replay). `already_created` is one
-    // query taken BEFORE this batch's own inserts run. So it can miss an
-    // in-batch duplicate `child_id` the loop's own fresh per-child check
-    // would still catch. Missing one here only means one harmless extra
-    // lock is held for the rest of this transaction.
+) -> HarvestResult<std::collections::BTreeSet<(String, String)>> {
     let requested_ids: Vec<uuid::Uuid> = commands
         .iter()
         .filter_map(|cmd| match cmd {
@@ -12841,6 +12804,76 @@ async fn create_detached_child_executions(
             quota_lock_keys.insert((workflow_name.clone(), key));
         }
     }
+    Ok(quota_lock_keys)
+}
+
+/// Perform the DB side-effects for all `SpawnDetachedChildWorkflow` commands in
+/// `commands`: insert a child execution row, start the child's event log with
+/// `WorkflowStarted`, and enqueue the child task.
+///
+/// The `ChildWorkflowSpawnedDetached` event written to the **parent** history is
+/// handled separately by `pre_suspension_events_from_commands` so that it lands
+/// at the correct position relative to `RecordMarker` events.
+/// Callers must invoke this inside the same transaction that appends those
+/// parent events, before the child task can be observed by another worker.
+///
+/// Non-detached-spawn commands in `commands` are silently skipped. Already-existing
+/// child rows (idempotent re-run after a crash) are also skipped.
+///
+/// Re-locks whatever [`detached_child_quota_lock_keys`] reports for this
+/// batch. `pg_advisory_xact_lock` is re-entrant per transaction (issue
+/// #1228, Finding 2). So a caller that already locked this exact set up
+/// front (issue #1484 review) pays only a harmless repeat acquisition. It
+/// never takes a second, distinct lock.
+#[allow(clippy::too_many_lines)]
+async fn create_detached_child_executions(
+    conn: &mut AsyncPgConnection,
+    registry: &HandlerRegistry,
+    parent_execution: &WorkflowExecution,
+    commands: &[WorkflowCommand],
+    execute_span: &tracing::Span,
+) -> HarvestResult<()> {
+    // Capability miss (#804): pre-validate EVERY detached child's handler before
+    // inserting any of them, so a miss on the second child cannot leave the
+    // first already created. Releasing the parent's task lets a capable peer
+    // persist the whole batch instead of terminally failing the parent.
+    for cmd in commands {
+        if let WorkflowCommand::SpawnDetachedChildWorkflow { workflow_name, .. } = cmd
+            && !registry.workflows.contains_key(workflow_name.as_str())
+        {
+            return Err(HarvestError::HandlerNotRegistered {
+                kind: CapabilityMissKind::Workflow.as_str(),
+                name: workflow_name.clone(),
+                phase: CapabilityMissPhase::AfterHandler,
+            });
+        }
+    }
+
+    // Issue #1228, Finding 2: pre-acquire every distinct quota advisory lock
+    // this batch of detached children will need. Acquire them in one
+    // deterministic (sorted) order, BEFORE inserting any child row below.
+    // This mirrors the fix issue #946 already applied to the awaited-child
+    // fan-out (`persist_all_started_child_workflows`) for the identical
+    // hazard. The loop below used to lock each child's key one at a time,
+    // in raw command order. Two concurrent parents can spawn detached
+    // children under the same keys in OPPOSITE command order. Each could
+    // then hold one key while it waits on the other. That is a classic
+    // ABBA wait-for cycle. Postgres resolves it by aborting one transaction
+    // with a raw `deadlock_detected` error. That error is not
+    // `QuotaExceeded`, so it is never recovered. It terminally fails an
+    // otherwise-healthy parent over a transient conflict, not a real quota
+    // breach. Sorting the lock order removes the cycle. Every transaction
+    // reaching this fan-out locks the SAME keys in the SAME order.
+    //
+    // Issue #1484 review: the key computation itself lives in
+    // `detached_child_quota_lock_keys`. A caller that ALSO spawns awaited
+    // children in this same transaction can then union both sets. It locks
+    // them together, before either insertion phase. Locking here always
+    // covers this batch's own detached keys either way. When such a caller
+    // already locked this exact set up front, `pg_advisory_xact_lock`'s
+    // re-entrancy makes the repeat acquisition below a safe no-op.
+    let quota_lock_keys =
+        detached_child_quota_lock_keys(conn, registry, parent_execution, commands).await?;
     for (workflow_name, key) in &quota_lock_keys {
         crate::quota::lock_quota_key(conn, workflow_name, key).await?;
     }

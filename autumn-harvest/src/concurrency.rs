@@ -559,6 +559,20 @@ pub async fn dry_run_supersede_credit(
     // and computes the identical `shed`. A row that starts existing only
     // AFTER this scan only grows `candidates.len()`. That can only raise
     // `shed`, never lower it -- the safe direction, so it needs no lock.
+    //
+    // `SKIP LOCKED` (issue #1228 review, P1) avoids a NEW deadlock class
+    // this lock alone would create. A concurrently completing incumbent
+    // can hold its own row lock while its terminal chokepoint starts a
+    // nested admission on the SAME quota key. That nested admission needs
+    // the SAME `lock_quota_key` this admission already holds. Meanwhile
+    // this scan would otherwise wait on that incumbent's row. That is an
+    // ABBA cycle between a row lock and the quota advisory lock. Skipping
+    // an already-locked row instead of waiting removes this scan from
+    // that wait-for graph entirely. A skipped row is one already
+    // transitioning away from RUNNING/PAUSED. Omitting it from the
+    // population only undercounts, never overcounts -- the safe
+    // direction. That is the same direction a row appearing only after
+    // the scan already relies on.
     let rows: Vec<Row> = diesel::sql_query(
         "SELECT e.id, e.quota_key \
          FROM harvest_workflow_executions e \
@@ -573,7 +587,7 @@ pub async fn dry_run_supersede_credit(
            ) \
          ORDER BY e.started_at ASC, e.id ASC \
          LIMIT $4 \
-         FOR UPDATE OF e",
+         FOR UPDATE OF e SKIP LOCKED",
     )
     .bind::<diesel::sql_types::Text, _>(workflow_name)
     .bind::<diesel::sql_types::Array<diesel::sql_types::Uuid>, _>(excluded)
