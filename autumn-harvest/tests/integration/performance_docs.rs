@@ -1689,48 +1689,222 @@ fn known_limitations_documents_the_pause_array_size_finding() {
     );
 }
 
+/// One row of `docs/perf-artifacts/pause-array-size/summary.txt`, keyed by
+/// the same three fields the doc table is keyed by.
+struct SummaryRow {
+    predicate: String,
+    array_size: u32,
+    backlog: u32,
+    disk_kb: Option<u32>,
+}
+
+fn field_after<'a>(line: &'a str, marker: &str) -> &'a str {
+    line.split(marker)
+        .nth(1)
+        .unwrap_or_else(|| panic!("summary line missing `{marker}`: {line}"))
+        .split_whitespace()
+        .next()
+        .unwrap_or_else(|| panic!("summary line has no token after `{marker}`: {line}"))
+}
+
+fn parse_summary_row(line: &str) -> SummaryRow {
+    let disk_kb = line.split("Disk: ").nth(1).map(|after| {
+        let digits: String = after.chars().take_while(char::is_ascii_digit).collect();
+        digits
+            .parse()
+            .unwrap_or_else(|_| panic!("could not parse a disk-kB figure out of: {line}"))
+    });
+    SummaryRow {
+        predicate: field_after(line, "predicate=").to_string(),
+        array_size: field_after(line, "array_size=")
+            .parse()
+            .unwrap_or_else(|_| panic!("could not parse array_size out of: {line}")),
+        backlog: field_after(line, "backlog=")
+            .parse()
+            .unwrap_or_else(|_| panic!("could not parse backlog out of: {line}")),
+        disk_kb,
+    }
+}
+
+/// One row of the doc's pause-array-size table, keyed the same way.
+/// `ballast_sizes` holds every seeded-pause count the row covers -- several
+/// rows collapse a shared outcome across sizes (`0 / 1 / 20`).
+struct DocRow {
+    predicate: String,
+    backlog: u32,
+    ballast_sizes: Vec<u32>,
+    disk_kb: Option<u32>,
+}
+
+fn parse_doc_row(line: &str) -> DocRow {
+    let cells: Vec<&str> = line
+        .trim()
+        .trim_matches('|')
+        .split('|')
+        .map(str::trim)
+        .collect();
+    assert!(
+        cells.len() == 6,
+        "pause-array-size table row does not have 6 columns, the table \
+         gained or lost a column: {line}"
+    );
+    let (predicate_cell, backlog_cell, bind_cell, ballast_cell, sort_cell) =
+        (cells[0], cells[1], cells[2], cells[3], cells[5]);
+
+    let predicate = if predicate_cell.contains("paused_activities") {
+        "activity-pause"
+    } else if bind_cell.contains("atypical") {
+        "queue-pause-wide"
+    } else if bind_cell.contains("typical") {
+        "queue-pause-bound"
+    } else {
+        panic!("could not classify pause-array-size table row: {line}")
+    }
+    .to_string();
+
+    let backlog: u32 = backlog_cell
+        .replace(' ', "")
+        .parse()
+        .unwrap_or_else(|_| panic!("could not parse the backlog column out of: {line}"));
+    let ballast_sizes: Vec<u32> = ballast_cell
+        .split('/')
+        .map(|s| {
+            s.trim()
+                .parse()
+                .unwrap_or_else(|_| panic!("could not parse a ballast count out of: {line}"))
+        })
+        .collect();
+
+    let sort_flat = sort_cell.replace(' ', "");
+    let disk_kb = if sort_flat.contains("disk") {
+        let idx = sort_flat
+            .find("kBdisk")
+            .unwrap_or_else(|| panic!("disk row has no kBdisk figure: {line}"));
+        let digits: String = sort_flat[..idx]
+            .chars()
+            .rev()
+            .take_while(char::is_ascii_digit)
+            .collect::<Vec<_>>()
+            .into_iter()
+            .rev()
+            .collect();
+        Some(
+            digits
+                .parse()
+                .unwrap_or_else(|_| panic!("could not parse the disk-kB figure out of: {line}")),
+        )
+    } else {
+        None
+    };
+
+    DocRow {
+        predicate,
+        backlog,
+        ballast_sizes,
+        disk_kb,
+    }
+}
+
 /// The pause-array-size table must quote the committed evidence, not a
 /// number someone typed by hand and forgot to update.
 ///
 /// Every earlier gate table on this page has its own cross-check against a
 /// committed source. This one had none. A reviewer of issue #1215's own fix
 /// found the two new prose-only guards above would not have caught a wrong
-/// number, only a missing one. This parses every disk-spill figure out of
-/// `docs/perf-artifacts/pause-array-size/summary.txt` and requires each one
-/// to appear in the doc.
+/// number, only a missing one.
+///
+/// A later reviewer found that first cross-check too weak. It only checked
+/// that every disk-kB figure from the summary appeared *somewhere* in the
+/// doc. Two figures transposed between rows, or a spill that later turned
+/// in-memory while its old figure stayed in the text, would still pass.
+/// This parses both the summary and the doc table into rows keyed by
+/// (predicate, ballast count, backlog). Each doc row is compared against
+/// its own matching summary row, not the document as one flat string.
 #[test]
 fn pause_array_size_table_matches_the_committed_summary() {
     let doc = read_performance_doc();
-    let doc_flat = doc.replace(' ', "");
+    let start = doc
+        .find("| Predicate | Backlog | Worker's own")
+        .expect("the pause-array-size table must exist");
+    let end = doc[start..]
+        .find("\n\n")
+        .map_or(doc.len(), |off| start + off);
+    let table = &doc[start..end];
+
     let summary =
         read_normalized(&repo_root().join("docs/perf-artifacts/pause-array-size/summary.txt"));
-
-    let mut checked = 0;
-    for line in summary.lines() {
-        let Some(after) = line.split("Disk: ").nth(1) else {
-            continue;
-        };
-        let kb: String = after.chars().take_while(char::is_ascii_digit).collect();
-        assert!(
-            !kb.is_empty(),
-            "could not parse a disk-kB figure out of summary line: {line}"
-        );
-        let needle = format!("{kb}kBdisk");
-        assert!(
-            doc_flat.contains(&needle),
-            "docs/performance.md does not quote {kb}kB disk, but \
-             docs/perf-artifacts/pause-array-size/summary.txt reports it on \
-             this line: {line}. Regenerate the table from the committed \
-             summary rather than retyping figures by hand."
-        );
-        checked += 1;
-    }
+    let summary_rows: Vec<SummaryRow> = summary.lines().map(parse_summary_row).collect();
     assert!(
-        checked >= 3,
-        "expected at least 3 disk-spill lines in the committed summary \
-         (activity-pause array=20/199, queue-pause-wide array=199); parsed \
-         {checked} -- the summary format may have drifted from what this \
-         guard expects"
+        summary_rows.len() >= 15,
+        "expected at least 15 rows in the committed pause-array-size \
+         summary; parsed {} -- the summary format may have drifted from \
+         what this guard expects",
+        summary_rows.len()
+    );
+
+    let mut matched = vec![false; summary_rows.len()];
+    let mut doc_ballast_entries = 0;
+    for line in table
+        .lines()
+        .skip(2)
+        .filter(|l| l.trim_start().starts_with('|'))
+    {
+        let doc_row = parse_doc_row(line);
+        for ballast in &doc_row.ballast_sizes {
+            doc_ballast_entries += 1;
+            let key_desc = format!(
+                "predicate={} array_size={ballast} backlog={}",
+                doc_row.predicate, doc_row.backlog
+            );
+            let (idx, summary_row) = summary_rows
+                .iter()
+                .enumerate()
+                .find(|(_, s)| {
+                    s.predicate == doc_row.predicate
+                        && s.array_size == *ballast
+                        && s.backlog == doc_row.backlog
+                })
+                .unwrap_or_else(|| {
+                    panic!(
+                        "docs/performance.md's pause-array-size table has a row \
+                         ({key_desc}) with no matching line in \
+                         docs/perf-artifacts/pause-array-size/summary.txt"
+                    )
+                });
+            matched[idx] = true;
+            match (doc_row.disk_kb, summary_row.disk_kb) {
+                (Some(doc_kb), Some(summary_kb)) => assert_eq!(
+                    doc_kb, summary_kb,
+                    "docs/performance.md's row for {key_desc} quotes \
+                     {doc_kb}kB disk, but the committed summary reports \
+                     {summary_kb}kB disk for this exact row"
+                ),
+                (Some(doc_kb), None) => panic!(
+                    "docs/performance.md's row for {key_desc} claims a \
+                     {doc_kb}kB disk spill, but the committed summary shows \
+                     this exact row staying in memory"
+                ),
+                (None, Some(summary_kb)) => panic!(
+                    "docs/performance.md's row for {key_desc} claims \
+                     in-memory, but the committed summary reports a \
+                     {summary_kb}kB disk spill for this exact row"
+                ),
+                (None, None) => {}
+            }
+        }
+    }
+
+    assert!(
+        matched.iter().all(|&m| m),
+        "the committed pause-array-size summary has a row this guard could \
+         not find in docs/performance.md's table -- the doc table dropped \
+         a captured scenario"
+    );
+    assert_eq!(
+        doc_ballast_entries,
+        summary_rows.len(),
+        "the doc table and the committed summary do not name the same set \
+         of rows"
     );
 }
 
