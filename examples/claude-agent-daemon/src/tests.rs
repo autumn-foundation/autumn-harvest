@@ -276,12 +276,14 @@ async fn settle_over_socket(socket: &Path, execution_id: &str) -> String {
                 pending.input
             );
 
-            // A decision that does not name the call it saw is refused.
+            // A decision that does not name the wait it saw is refused. The
+            // bare tool-use id is exactly what must NOT be enough: the model
+            // can reuse one, so an older status would release a later call.
             let stale = protocol::call(
                 socket,
                 &Request::Approve {
                     execution_id: execution_id.to_string(),
-                    call_id: "toolu_something_else".to_string(),
+                    token: pending.id.clone(),
                     approved: true,
                     note: None,
                 },
@@ -297,7 +299,7 @@ async fn settle_over_socket(socket: &Path, execution_id: &str) -> String {
                 socket,
                 &Request::Approve {
                     execution_id: execution_id.to_string(),
-                    call_id: pending.id.clone(),
+                    token: pending.token.clone(),
                     approved: true,
                     note: None,
                 },
@@ -1221,7 +1223,7 @@ async fn a_decision_can_only_be_delivered_once() {
     // Wait for the gate, then send the SAME decision twice in a row. The
     // second must be refused: two staged signals would leave one queued for a
     // later call to consume without being shown.
-    let mut call_id = None;
+    let mut token = None;
     for _ in 0..200 {
         let answer = protocol::call(
             &socket,
@@ -1236,27 +1238,27 @@ async fn a_decision_can_only_be_delivered_once() {
             panic!("unexpected answer: {answer:?}");
         };
         if let Some(pending) = session.pending {
-            call_id = Some(pending.id);
+            token = Some(pending.token);
             break;
         }
         tokio::time::sleep(Duration::from_millis(25)).await;
     }
-    let call_id = call_id.expect("the session never asked for approval");
+    let token = token.expect("the session never asked for approval");
 
-    let decision = |id: String| Request::Approve {
+    let decision = |token: String| Request::Approve {
         execution_id: execution_id.clone(),
-        call_id: id,
+        token,
         approved: true,
         note: None,
     };
-    let first = protocol::call(&socket, &decision(call_id.clone()))
+    let first = protocol::call(&socket, &decision(token.clone()))
         .await
         .expect("the first decision is answered");
     assert!(
         matches!(first, Response::Ack { .. }),
         "the first decision must be accepted: {first:?}"
     );
-    let second = protocol::call(&socket, &decision(call_id))
+    let second = protocol::call(&socket, &decision(token))
         .await
         .expect("the second decision is answered");
     assert!(

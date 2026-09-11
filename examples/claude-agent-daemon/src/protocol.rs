@@ -33,12 +33,13 @@ pub enum Request {
     History { execution_id: String },
     /// Release or refuse one approval-gated tool call.
     ///
-    /// `call_id` is the tool-use id the operator was shown. The daemon refuses
-    /// the decision when the session has since moved to another call, so a
-    /// decision can never authorize work nobody reviewed.
+    /// `token` is the approval token the operator was shown. It names ONE wait
+    /// of one run, so the daemon can compare it exactly. A tool-use id would
+    /// not do. The model can reuse one across turns, so a decision read from
+    /// an older status would then release a call nobody reviewed.
     Approve {
         execution_id: String,
-        call_id: String,
+        token: String,
         approved: bool,
         note: Option<String>,
     },
@@ -51,12 +52,26 @@ pub enum Request {
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "status", rename_all = "snake_case")]
 pub enum Response {
-    Submitted { execution_id: String },
-    Session { session: SessionView },
-    Sessions { sessions: Vec<SessionView> },
-    History { events: Vec<String> },
-    Ack { detail: String },
-    Error { message: String },
+    Submitted {
+        execution_id: String,
+    },
+    /// Boxed: this variant is much larger than its siblings, and the enum is
+    /// sized for its biggest one.
+    Session {
+        session: Box<SessionView>,
+    },
+    Sessions {
+        sessions: Vec<SessionView>,
+    },
+    History {
+        events: Vec<String>,
+    },
+    Ack {
+        detail: String,
+    },
+    Error {
+        message: String,
+    },
 }
 
 /// One session, as an operator sees it.
@@ -82,7 +97,10 @@ pub struct SessionView {
 /// the status. Approving what you cannot see is not approval.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PendingCall {
-    /// The tool-use id. The approval signal carries it.
+    /// The approval token: the one wait this call is parked on. A decision
+    /// carries it back, and the daemon matches it exactly.
+    pub token: String,
+    /// The tool-use id, for the operator to read.
     pub id: String,
     pub tool: String,
     /// The call arguments as JSON, truncated for a terminal.

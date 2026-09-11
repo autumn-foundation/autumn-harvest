@@ -353,7 +353,9 @@ fn handle(
                     || Response::Error {
                         message: format!("no session {execution_id}"),
                     },
-                    |session| Response::Session { session },
+                    |session| Response::Session {
+                        session: Box::new(session),
+                    },
                 ),
             Err(message) => Response::Error { message },
         },
@@ -364,10 +366,10 @@ fn handle(
         Request::History { execution_id } => history(runtime, &execution_id),
         Request::Approve {
             execution_id,
-            call_id,
+            token,
             approved,
             note,
-        } => approve(runtime, blocked, &execution_id, &call_id, approved, note),
+        } => approve(runtime, blocked, &execution_id, &token, approved, note),
     }
 }
 
@@ -417,7 +419,7 @@ fn approve(
     runtime: &mut SqliteRuntime,
     blocked: &mut Parked,
     execution_id: &str,
-    call_id: &str,
+    token: &str,
     approved: bool,
     note: Option<String>,
 ) -> Response {
@@ -435,14 +437,14 @@ fn approve(
         };
     };
     // The wait can move on between the status and the decision: a deadline can
-    // expire, and the session then parks on the NEXT call. Matching the id the
-    // operator was shown is what stops a decision landing on a call nobody
-    // reviewed.
-    let awaiting = session::approval_call_id(&signal).unwrap_or_default();
-    if awaiting != call_id {
+    // expire, and the session then parks on the NEXT call. The token names one
+    // wait of one run, and it is compared EXACTLY. A tool-use id would not be
+    // enough. The model can reuse one across turns, so a decision read from an
+    // older status would then release a call nobody reviewed.
+    if signal != token {
         return Response::Error {
             message: format!(
-                "session {execution_id} is now waiting on `{awaiting}`, not `{call_id}`. \
+                "session {execution_id} is now waiting on `{signal}`, not `{token}`. \
                  Read `agentd status {execution_id}` again before deciding."
             ),
         };
@@ -616,6 +618,7 @@ pub fn pending_call(
                 input.push_str(" … (truncated; read it all with `status --full`)");
             }
             return Some(PendingCall {
+                token: signal.to_string(),
                 id: call.id,
                 tool: call.name,
                 input,

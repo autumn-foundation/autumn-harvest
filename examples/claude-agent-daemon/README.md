@@ -39,9 +39,9 @@ cargo run -p claude-agent-daemon -- status <id>
 #    blocked: waiting for a tool approval
 #    pending: write_file (toolu_offline_write)
 #             {"content":"# Offline stub\n…","path":"agent-notes.md"}
-#    decide:  agentd approve ffffc7df-… toolu_offline_write   (or `deny`)
+#    decide:  agentd approve ffffc7df-… tool_approval:2:0:toolu_offline_write   (or `deny`)
 
-cargo run -p claude-agent-daemon -- approve <id> toolu_offline_write
+cargo run -p claude-agent-daemon -- approve <id> <token>
 cargo run -p claude-agent-daemon -- status <id>
 #  ffffc7df-…  COMPLETED
 #    answer:  [end_turn after 3 turns, 2 tool calls] …
@@ -75,7 +75,7 @@ cargo run -p claude-agent-daemon -- status <id>     # blocked: waiting for a too
 pkill -x agentd                                     # the process dies with work in flight
 
 cargo run -p claude-agent-daemon -- serve --workspace /tmp/agent-demo &
-cargo run -p claude-agent-daemon -- approve <id> <call-id>
+cargo run -p claude-agent-daemon -- approve <id> <token>
 cargo run -p claude-agent-daemon -- status <id>     # COMPLETED
 cargo run -p claude-agent-daemon -- history <id>
 #    1  WorkflowStarted  {"input":{"goal":"summarise the README",…}}
@@ -103,7 +103,7 @@ exactly that, by counting model calls in each process.
 | `agentd status <id> [--full]` | One session: state, why it is parked, the exact pending call, its answer. `--full` prints the call's arguments untrimmed. |
 | `agentd list` | Every session in the database. |
 | `agentd history <id>` | The recorded event log with each event's data — the audit trail. |
-| `agentd approve <id> <call-id>` / `deny <id> <call-id>` | Release or refuse the named gated tool call. |
+| `agentd approve <id> <token>` / `deny <id> <token>` | Release or refuse the gated tool call that token names. |
 
 Flags: `--db` (default `agentd.db`), `--socket` (default `agentd.sock`),
 `--workspace`, `--model`, `--max-tokens`, `--tick-ms`. Each also reads an
@@ -141,12 +141,13 @@ conversation on a different model, or move an offline session onto billed
 calls. `--max-tokens` is deliberately not fenced: it is a per-request budget
 rather than an identity, so changing it between restarts is ordinary tuning.
 
-**Approval is per call, not per session.** The workflow waits on a signal whose
-name carries the tool-use id, and `status` prints the exact call — the tool, its
-id, and its arguments — before you decide. The decision names that id, and the
-daemon refuses it when the session has since moved on: a deadline can expire
-while you read, and a decision must never land on the next call instead. An
-early or repeated decision has no live wait to land in and is refused too,
+**Approval is per wait, not per session — and not per tool-use id either.**
+`status` prints the exact call (the tool, its id, its arguments) and an
+**approval token** that names one wait of one run. The decision carries that
+token back, and the daemon matches it exactly. An id would not be enough: the
+model can reuse one across turns, so a decision read from an older status could
+release a later call. A deadline can also expire while you read, and an early
+or repeated decision has no live wait to land in — all of those are refused
 rather than stored for some later, unseen write.
 
 A decision is spent when it is delivered: a repeated `approve` is refused

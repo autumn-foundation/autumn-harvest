@@ -118,18 +118,18 @@ enum Command {
     History { execution_id: String },
     /// Release one gated tool call.
     ///
-    /// `call_id` is the tool-use id `status` printed. Naming it is what keeps
-    /// the decision tied to the call you read.
+    /// `token` is the approval token `status` printed. It names one wait of one
+    /// run, which is what keeps the decision tied to the call you read.
     Approve {
         execution_id: String,
-        call_id: String,
+        token: String,
         #[arg(long)]
         note: Option<String>,
     },
     /// Refuse one gated tool call.
     Deny {
         execution_id: String,
-        call_id: String,
+        token: String,
         #[arg(long)]
         note: Option<String>,
     },
@@ -200,14 +200,14 @@ async fn run(cli: Cli) -> Result<(), String> {
         }
         Command::Approve {
             execution_id,
-            call_id,
+            token,
             note,
         } => report(
             protocol::call(
                 &cli.socket,
                 &Request::Approve {
                     execution_id,
-                    call_id,
+                    token,
                     approved: true,
                     note,
                 },
@@ -216,14 +216,14 @@ async fn run(cli: Cli) -> Result<(), String> {
         ),
         Command::Deny {
             execution_id,
-            call_id,
+            token,
             note,
         } => report(
             protocol::call(
                 &cli.socket,
                 &Request::Approve {
                     execution_id,
-                    call_id,
+                    token,
                     approved: false,
                     note,
                 },
@@ -282,7 +282,7 @@ fn print_session(view: &SessionView) {
         line(&format!("           {}", pending.input));
         line(&format!(
             "  decide:  agentd approve {} {}   (or `deny`)",
-            view.execution_id, pending.id
+            view.execution_id, pending.token
         ));
     }
     if let Some(answer) = &view.answer {
