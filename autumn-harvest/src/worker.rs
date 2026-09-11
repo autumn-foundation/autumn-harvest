@@ -5804,8 +5804,7 @@ pub fn claim_eligible_workers(
                 return false;
             }
             reqs.as_ref().is_none_or(|reqs| {
-                let labels: std::collections::HashMap<String, String> =
-                    serde_json::from_value(w.labels.clone()).unwrap_or_default();
+                let labels = crate::payload_codec::string_valued_labels(&w.labels);
                 crate::eligibility::matches_requirements(reqs, &labels)
             })
         })
@@ -23096,8 +23095,8 @@ fn spawn_stranded_work_sampler(
                             return false;
                         }
                         reqs.as_ref().is_none_or(|reqs| {
-                            let labels: std::collections::HashMap<String, String> =
-                                serde_json::from_value(w.worker.labels.clone()).unwrap_or_default();
+                            let labels =
+                                crate::payload_codec::string_valued_labels(&w.worker.labels);
                             crate::eligibility::matches_requirements(reqs, &labels)
                         })
                     })

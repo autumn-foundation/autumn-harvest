@@ -13551,8 +13551,7 @@ fn eligible_worker_ids<'a>(
                 return true;
             }
             requirements.as_ref().is_none_or(|parsed| {
-                let labels: std::collections::HashMap<String, String> =
-                    serde_json::from_value(w.worker.labels.clone()).unwrap_or_default();
+                let labels = autumn_harvest::payload_codec::string_valued_labels(&w.worker.labels);
                 autumn_harvest::eligibility::matches_requirements(parsed, &labels)
             })
         })
@@ -43941,8 +43940,8 @@ async fn list_workers_handler(
                     }
 
                     parsed_reqs.as_ref().is_none_or(|reqs| {
-                        let worker_labels: std::collections::HashMap<String, String> =
-                            serde_json::from_value(w.worker.labels.clone()).unwrap_or_default();
+                        let worker_labels =
+                            autumn_harvest::payload_codec::string_valued_labels(&w.worker.labels);
                         autumn_harvest::eligibility::matches_requirements(reqs, &worker_labels)
                     })
                 });
@@ -46745,8 +46744,8 @@ async fn evaluate_eligibility_for_shard(
                 };
 
                 if let Some(reqs) = parsed_reqs {
-                    let worker_labels: std::collections::HashMap<String, String> =
-                        serde_json::from_value(w.worker.labels.clone()).unwrap_or_default();
+                    let worker_labels =
+                        autumn_harvest::payload_codec::string_valued_labels(&w.worker.labels);
                     for req in &reqs {
                         let satisfied = match req {
                             autumn_harvest::eligibility::Requirement::Exact { key, value } => {

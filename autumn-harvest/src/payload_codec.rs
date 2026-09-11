@@ -165,6 +165,35 @@ pub fn advertise_codec_capability(labels: &Value, registered_key_ids: &[String])
     merged
 }
 
+/// A worker's operator-set capability labels, read back for `requires` /
+/// `capable_of` matching (issue #382), as string values only.
+///
+/// `harvest_workers.labels` now always carries the two engine-owned,
+/// non-string entries [`advertise_codec_capability`] writes: an integer under
+/// [`CODEC_ENVELOPE_CAPABILITY_LABEL`] and an array under
+/// [`CODEC_REGISTERED_KEY_IDS_LABEL`]. A blanket
+/// `serde_json::from_value::<HashMap<String, String>>` of the whole object
+/// fails the instant either key is present. Every call site historically
+/// swallowed that error with `.unwrap_or_default()`, silently discarding
+/// every real operator label along with it, on every worker, on every call.
+/// That turns `requires`-based routing fleet-wide into a no-op the moment a
+/// worker advertises codec capabilities, which happens on every
+/// registration and heartbeat.
+///
+/// This keeps only the string-valued entries instead of failing the whole
+/// object. Operator labels keep matching exactly as before, and the two
+/// engine-owned keys are simply invisible to capability matching -- neither
+/// was ever an operator-settable capability.
+#[must_use]
+pub fn string_valued_labels(labels: &Value) -> std::collections::HashMap<String, String> {
+    labels
+        .as_object()
+        .into_iter()
+        .flat_map(serde_json::Map::iter)
+        .filter_map(|(k, v)| v.as_str().map(|s| (k.clone(), s.to_string())))
+        .collect()
+}
+
 /// Undecodable reason: the envelope names a codec that is not registered.
 pub const UNDECODABLE_REASON_UNKNOWN_CODEC: &str = "unknown_codec";
 /// Undecodable reason: the envelope names an unregistered codec **key id**.
@@ -1330,6 +1359,32 @@ mod tests {
             merged[CODEC_ENVELOPE_CAPABILITY_LABEL],
             CODEC_ENVELOPE_VERSION_KEYED
         );
+    }
+
+    #[test]
+    fn string_valued_labels_recovers_operator_labels_past_the_merged_engine_keys() {
+        // The exact shape `register_worker` / `heartbeat_worker` persist: an
+        // operator string label alongside both engine-owned, non-string keys.
+        let merged = advertise_codec_capability(
+            &json!({"gpu": "true", "region": "eu-west-1"}),
+            &["k1".to_string(), "k2".to_string()],
+        );
+        let labels = string_valued_labels(&merged);
+        assert_eq!(
+            labels.len(),
+            2,
+            "engine-owned non-string keys must be dropped, not fail the whole map: {labels:?}"
+        );
+        assert_eq!(labels.get("gpu").map(String::as_str), Some("true"));
+        assert_eq!(labels.get("region").map(String::as_str), Some("eu-west-1"));
+        assert!(!labels.contains_key(CODEC_ENVELOPE_CAPABILITY_LABEL));
+        assert!(!labels.contains_key(CODEC_REGISTERED_KEY_IDS_LABEL));
+    }
+
+    #[test]
+    fn string_valued_labels_on_a_non_object_value_is_empty() {
+        assert!(string_valued_labels(&json!("not-an-object")).is_empty());
+        assert!(string_valued_labels(&json!(null)).is_empty());
     }
 
     #[test]

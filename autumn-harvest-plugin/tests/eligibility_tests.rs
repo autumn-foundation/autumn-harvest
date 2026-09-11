@@ -2275,8 +2275,8 @@ async fn test_worker_heartbeat_updates_labels() {
             .unwrap()
             .expect("worker should exist");
 
-        let worker_labels: std::collections::HashMap<String, String> =
-            serde_json::from_value(worker_row.worker.labels).unwrap();
+        let worker_labels =
+            autumn_harvest::payload_codec::string_valued_labels(&worker_row.worker.labels);
         assert_eq!(worker_labels.get("gpu").map(String::as_str), Some("true"));
     }
 }
