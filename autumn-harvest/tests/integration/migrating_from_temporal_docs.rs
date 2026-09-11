@@ -277,13 +277,14 @@ fn comparison_page_links_back_to_the_migration_guide() {
 /// to harvest's own schedule pause and catchup primitives rather than leave
 /// them to guess.
 ///
-/// Two PR reviews (Codex, both P1) found real defects here. The first said
+/// Three PR reviews (Codex, all P1) found real defects here. The first said
 /// Temporal exposes a per-firing list an operator can inspect and accept or
 /// reject; it does not. The second said harvest's `CatchupPolicy::SkipAll`
 /// suppresses an entire missed interval; it does not, it fires the oldest
-/// slot. The fix now avoids relying on either engine's catchup machinery.
-/// Pause Temporal and create the harvest schedule close together, at one
-/// cutover timestamp, so no backlog accrues to reconcile.
+/// slot. The third found the "pause after create" sequence this fix then
+/// tried left a race window for a scheduler tick to fire into. The fix now
+/// creates the harvest schedule already paused, in the same insert, and
+/// resumes it at one cutover timestamp instead of reconciling a backlog.
 #[test]
 fn dual_run_playbook_covers_schedule_driven_cutover() {
     let guide = read_doc(GUIDE_PATH);
@@ -305,10 +306,10 @@ fn dual_run_playbook_covers_schedule_driven_cutover() {
          one defined cutover timestamp, not on pausing alone (issue #1219, PR #1473 Codex P1)"
     );
     assert!(
-        playbook.contains("as close together as you can"),
-        "the playbook must say to pause Temporal and create the harvest schedule close \
-         together at one cutover timestamp, not create the harvest schedule ahead of time \
-         and leave it accruing a backlog while paused (issue #1219, PR #1473 Codex P1)"
+        playbook.contains("WorkflowSchedule::with_paused(true)"),
+        "the playbook must create the harvest schedule already paused, in the same insert, \
+         not enabled-then-paused -- the gap a scheduler tick could fire into (issue #1219, \
+         PR #1473 Codex P1)"
     );
     assert!(
         playbook.contains("SkipAll` still fires the oldest missed slot"),
@@ -316,9 +317,9 @@ fn dual_run_playbook_covers_schedule_driven_cutover() {
          it does not suppress an entire missed interval (issue #1219, PR #1473 Codex P1)"
     );
     assert!(
-        playbook.contains("/admin/schedules/{id}/pause"),
-        "the playbook must point to harvest's own schedule pause primitive so the harvest \
-         side does not fire before the reader is ready (issue #229, issue #1219)"
+        playbook.contains("/admin/schedules/{id}/resume"),
+        "the playbook must point to harvest's own schedule resume primitive to activate the \
+         pre-paused harvest schedule at the cutover timestamp (issue #229, issue #1219)"
     );
     assert!(
         playbook.contains("CatchupPolicy"),
@@ -332,14 +333,17 @@ fn dual_run_playbook_covers_schedule_driven_cutover() {
 /// hosts it right now. It must never route by the current flag value, or
 /// by a fact fixed at start time.
 ///
-/// Three PR reviews (Codex, all P1) found real gaps in three successive
-/// attempts at this rule. A persisted "record at start time" cannot cover
-/// a schedule-driven execution, or one that predates the record. Comparing
-/// a start time to a cutover timestamp fails when a Temporal slot fires
-/// late. A record written once goes stale, too: `WorkflowIdReusePolicy`
-/// lets a new execution reuse the same id after a rollback. The fix drops
-/// all three attempts. It asks harvest live instead, through the by-id
-/// resolution harvest already ships (issue #805).
+/// Four PR reviews (Codex, three P1 and one P2) found real gaps in three
+/// successive attempts at this rule, plus one gap in the fourth. A
+/// persisted "record at start time" cannot cover a schedule-driven
+/// execution, or one that predates the record. Comparing a start time to
+/// a cutover timestamp fails when a Temporal slot fires late. A record
+/// written once goes stale, too: `WorkflowIdReusePolicy` lets a new
+/// execution reuse the same id after a rollback. The fix drops all three
+/// attempts. It asks harvest live instead, through the by-id resolution
+/// harvest already ships (issue #805). That resolution assumes a workflow
+/// id is active on at most one engine at a time. The by-id family also
+/// covers signals, queries, and cancellations only, not updates.
 #[test]
 fn dual_run_playbook_covers_follow_up_engine_routing() {
     let guide = read_doc(GUIDE_PATH);
@@ -367,14 +371,33 @@ fn dual_run_playbook_covers_follow_up_engine_routing() {
          (issue #1219, PR #1473 Codex P1)"
     );
     assert!(
+        playbook.contains("The family has no update route")
+            && playbook.contains("/workflows/{id}/update/{update_name}"),
+        "the playbook must not route an update through the by-id family, which does not \
+         carry one -- it must resolve the execution id first and use the exec-id update \
+         route (issue #1219, PR #1473 Codex P2)"
+    );
+    assert!(
+        playbook.contains("active on at most one engine at a time")
+            && playbook.contains("Temporal's own visibility API"),
+        "the playbook must say the by-id resolution assumes a workflow id is active on at \
+         most one engine, and must tell the reader to confirm that against both engines \
+         before starting a new execution under a reused id (issue #1219, PR #1473 Codex P1)"
+    );
+    assert!(
         playbook.contains("Never route it by the flag's current value"),
         "the playbook must state the negative rule too: never route a follow-up by \
          re-consulting the current flag value (issue #1219)"
     );
     assert!(
         playbook.contains("is a special case of step 1's general follow-up-routing rule"),
-        "step 7's end-of-lifecycle handoff must itself be framed as a special case of the \
+        "step 7's cancel-signal routing must itself be framed as a special case of the \
          general follow-up-routing rule, not a standalone exception (issue #1219)"
+    );
+    assert!(
+        playbook.contains("no engine left to resolve"),
+        "step 7's final read must be carved out from the general routing rule: it targets a \
+         known-terminal execution, not an unresolved one (issue #1219, PR #1473 Codex P1)"
     );
 }
 

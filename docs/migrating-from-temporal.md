@@ -326,27 +326,33 @@ your whole application.
    directly. No application code runs in that path. The flag above
    controls nothing for it.
 
-   Pick one cutover timestamp. Do not create the harvest schedule ahead
-   of time and leave it paused. A paused schedule accrues missed slots.
-   Neither engine's catchup policy resolves them for you. Temporal's
-   `CatchupWindow` and harvest's `CatchupPolicy` (issue #484) each govern
-   a missed interval as a whole, not slot by slot. Neither has a mode
-   that reliably fires none of it. Harvest's `CatchupPolicy::SkipAll`
-   still fires the oldest missed slot, for one example.
+   Pick one cutover timestamp. Create the harvest `WorkflowSchedule`
+   paused from the start, any time before that timestamp.
+   `WorkflowSchedule::with_paused(true)` sets this in the same insert
+   that creates the schedule. There is no window between an enabled
+   create and a separate pause call for a scheduler tick to land in.
 
-   Pause the Temporal Schedule and create the harvest `WorkflowSchedule`
-   as close together as you can, right at the cutover timestamp. Use
-   `POST /admin/schedules/{id}/pause` (issue #229) if any gap between the
-   two actions is unavoidable. Unpause the harvest schedule the moment
-   the Temporal Schedule is confirmed paused. Treat a slot missed inside
-   that gap as a deliberate, bounded loss, or fire it by hand through
-   `POST /admin/schedules/{id}/trigger`. Keep the gap short enough that
-   this stays rare.
+   A schedule paused at creation can still accrue a backlog. Pausing
+   prevents a fire, not the passage of time. A slot can still come due
+   between creation and the cutover timestamp. Neither engine's catchup
+   policy resolves that backlog for you. Temporal's `CatchupWindow` and
+   harvest's `CatchupPolicy` (issue #484) each govern a missed interval
+   as a whole, not slot by slot. Neither has a mode that reliably fires
+   none of it. Harvest's `CatchupPolicy::SkipAll` still fires the oldest
+   missed slot, for one example.
+
+   At the cutover timestamp, pause the Temporal Schedule first. Then
+   unpause the harvest schedule with `POST /admin/schedules/{id}/resume`
+   (issue #229). A small gap between the two calls is still possible.
+   Treat a slot missed inside it as a deliberate, bounded loss, or fire
+   it by hand through `POST /admin/schedules/{id}/trigger`. Keep the gap
+   short enough that this stays rare.
 
    A follow-up operation against one already-started execution follows a
    different rule. A signal, a query, an update, and a cancellation each
-   name one specific execution, not a workflow type. Route each by which
-   engine actually hosts it right now. Never route it by the flag's
+   name one specific execution, not a workflow type. When you do not
+   already know which engine hosts that execution, route the call to
+   whichever one hosts it right now. Never route it by the flag's
    current value. The flag can flip between an execution's start and a
    later follow-up call against it.
 
@@ -360,10 +366,13 @@ your whole application.
    own record. Harvest's `/workflows/by-id/{workflow_name}/{workflow_id}`
    route family (issue #805) already resolves a business id to its
    current run. That run is the active one if one exists, or the most
-   recent terminal run otherwise. Query it first. Route the follow-up
-   through that same by-id family when it reports an active run. Route
-   to Temporal when it reports no active run, whether that means no run
-   at all or only a terminal predecessor.
+   recent terminal run otherwise. Query it first. Route a signal, a
+   query, or a cancellation through that same by-id family when it
+   reports an active run. The family has no update route. Read the
+   resolved execution id from the query response instead, then send the
+   update to `POST /workflows/{id}/update/{update_name}` with that id.
+   Route any of these to Temporal when the by-id query reports no active
+   run. That covers no run at all, or only a terminal predecessor.
 
    This one check replaces three separate rules with one. A
    schedule-driven execution needs it because nothing else persists
@@ -372,15 +381,25 @@ your whole application.
    it because harvest's own resolution already prefers the active run
    over a stale terminal one.
 
+   That last case still assumes a workflow id is active on at most one
+   engine at a time. Confirm that before you start a new execution under
+   a reused id. Query harvest's by-id resolution above. Check Temporal's
+   own visibility API too. Start the new execution only once both report
+   no active run for that id. Step 7's handoff below already follows
+   this discipline. It waits for `COMPLETED` before starting the new
+   execution. Apply the same discipline to any other reused id,
+   including one reused across a rollback.
+
    A `cancel` signal routed to the wrong engine may not fail loudly. It
    can do nothing there, while the real execution stays un-cancelled.
    Against a `SignalWithStart`-shaped call, a wrong-engine route is
    worse. It can start a new, spurious execution on that engine instead.
 
-   The handoff in step 7, below, is a special case of this rule. It hands
-   off one long-lived entity execution at the end of its lifecycle. Apply
-   the rule above to every other follow-up operation during the whole
-   dual-run window, not only to that one case.
+   The handoff in step 7, below, is a special case of this rule, with one
+   exception. Its final read targets an execution you already know is
+   terminal. The general rule's "no active run" case does not apply
+   there. Apply the rule above to every other follow-up operation during
+   the whole dual-run window.
 2. **Port and validate one workflow type completely before you flip its
    flag.** Run the [Workflow-porting checklist](#workflow-porting-checklist)
    against it. Confirm `WorkflowReplayer` reports no non-determinism against
@@ -496,10 +515,13 @@ your whole application.
    `ctx.receive_signal_timeout` (issue #476) is the primitive for that
    race on the harvest side.
 
-   The handoff above is a special case of step 1's general
-   follow-up-routing rule. Route the `cancel` signal above, and the final
-   read after it, to whichever engine currently hosts this specific
-   execution. Never route either action by the flag's current value.
+   Routing the `cancel` signal above is a special case of step 1's
+   general follow-up-routing rule. Route it to whichever engine hosts
+   this specific execution right now. Never route it by the flag's
+   current value. The final read after it is not that same case. By the
+   time you make it, you already know the execution is terminal, so
+   there is no engine left to resolve. Read it directly by the harvest
+   execution id the cancel step resolved.
 
    Treat each entity's handoff as a deliberate cutover step, not a bulk
    migration. Each one is a live, stateful run. It is not disposable
