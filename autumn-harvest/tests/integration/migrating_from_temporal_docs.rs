@@ -502,6 +502,20 @@ fn dual_run_playbook_covers_follow_up_engine_routing() {
          logic a second time, since every admission mints a fresh update id with no dedup key \
          (issue #1219, PR #1473 Codex P1)"
     );
+}
+
+/// Issue #1219, gap 2 (continued): once a follow-up knows which engine
+/// owns an execution, it still has to resolve and address that execution
+/// correctly. This covers the resolution mechanics. Among them: harvest's
+/// by-id family, the update route it lacks, and the continue-as-new race
+/// between resolving an id and using it. Also covered: the activity check
+/// a reused id needs before a new start. So is the negative flag-routing
+/// rule, and step 7's own handoff as a special case of the general rule.
+#[test]
+fn dual_run_playbook_covers_follow_up_resolution_mechanics() {
+    let guide = read_doc(GUIDE_PATH);
+    let playbook = flatten_whitespace(section_body(&guide, "## Dual-run cutover playbook"));
+
     assert!(
         playbook.contains("This record names the current owner only")
             && playbook.contains("needs its own engine and execution id"),
