@@ -1246,6 +1246,35 @@ mod tests {
     }
 
     #[test]
+    fn a_payload_shaped_like_an_offload_envelope_is_still_encoded() {
+        // Issue #1243 review (P1, Codex): the codec boundary must stay
+        // unconditional. A workflow's own input can legally contain any
+        // JSON shape, including one that happens to carry the offload
+        // discriminator key. Nothing may use that shape as a signal to
+        // skip encoding -- doing so would store the field in plaintext
+        // under a real codec.
+        let mut codecs = PayloadCodecs::default();
+        codecs.set_default(Arc::new(ReverseCodec));
+
+        let event = crate::event::WorkflowEvent::WorkflowStarted {
+            input: serde_json::json!({
+                "_harvest_offload_envelope": 1,
+                "secret": "still must be encoded",
+            }),
+            timestamp: chrono::Utc::now(),
+            last_completion_result: None,
+            last_error: None,
+            scheduled_time: None,
+        };
+
+        let encoded = codecs.encode_event(&event).expect("encode");
+        assert_eq!(
+            encoded["data"]["input"]["_harvest_codec_envelope"], 1,
+            "an offload-shaped user payload must still be wrapped in a codec envelope: {encoded}"
+        );
+    }
+
+    #[test]
     fn encode_then_decode_round_trips_side_effect_recorded_value() {
         // issue #384: a custom side_effect closure result lands in
         // SideEffectRecorded.value and must be codec-encoded (encryption /

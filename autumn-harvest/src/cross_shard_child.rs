@@ -1121,7 +1121,7 @@ async fn apply_action(
                 // panicking inside a scanner.
                 return Ok(false);
             };
-            deliver_terminal(conn, row, child).await?;
+            deliver_terminal(conn, row, child, codecs).await?;
             Ok(true)
         }
     }
@@ -1586,6 +1586,9 @@ async fn deliver_terminal(
     conn: &mut AsyncPgConnection,
     row: &CrossShardChildRow,
     child: &TargetChildState,
+    // Issue #1243: `ChildWorkflowCompleted.output` / a typed
+    // `ChildWorkflowFailed.details` are payload-bearing.
+    codecs: &crate::payload_codec::PayloadCodecs,
 ) -> HarvestResult<()> {
     let child_exec_id = ExecutionId::from_uuid(row.child_exec_id);
     let parent_exec_id = ExecutionId::from_uuid(row.parent_exec_id);
@@ -1649,7 +1652,7 @@ async fn deliver_terminal(
                 });
                 WorkflowEvent::child_workflow_failed_typed(child_exec_id, &decoded)
             };
-            store::append_single_event(conn, parent_exec_id, event).await?;
+            store::append_single_event_with_codecs(conn, parent_exec_id, event, codecs).await?;
             queue::wake_workflow_task(conn, parent_exec_id).await?;
             Ok(())
         }

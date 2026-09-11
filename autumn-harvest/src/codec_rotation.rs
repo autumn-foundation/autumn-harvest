@@ -1830,10 +1830,17 @@ mod tests {
                 + text.matches("append_events_offloaded(").count()
         }
 
-        // Issue #1243's remaining write-path scope. `execution.rs` holds the
-        // start paths (`WorkflowStarted.input`); `reset.rs` the fork marker and
-        // the source-execution terminal.
-        const KNOWN_IDENTITY_APPENDS: &[(&str, usize)] = &[("execution.rs", 8), ("reset.rs", 2)];
+        // Issue #1243 closed the `WorkflowStarted.input` gap. `execution.rs`'s
+        // start paths now encode through `append_events_with_codecs`.
+        //
+        // The remaining 5 write `WorkflowCancelled` (from
+        // `cancel_workflow_execution_collect` and
+        // `terminate_workflow_execution_collect`), `WorkflowExecutionPaused`,
+        // `WorkflowExecutionResumed`, and `WorkflowRedriven`. None of these
+        // carry a `PAYLOAD_FIELD_KEYS` field, so identity is exact here.
+        // `reset.rs` keeps its fork marker and source-execution terminal, also
+        // both free of payload fields.
+        const KNOWN_IDENTITY_APPENDS: &[(&str, usize)] = &[("execution.rs", 5), ("reset.rs", 2)];
 
         let engine_sources: &[(&str, &str)] = &[
             ("worker.rs", include_str!("worker.rs")),

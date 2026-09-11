@@ -37,43 +37,52 @@ history onto the new key.
 
 ## Wiring it up
 
-> **Read this first — which writes are codec-aware.** Issue #1243 is partly
-> landed, so the answer differs by path. Be precise about this before you plan
-> a rotation, because it decides what the sweep will actually find.
+> **Read this first — which writes are codec-aware.** Every payload-bearing
+> write does (issue #1243). The worker replays with the *same* registry, so a
+> mixed-key history round-trips end to end.
 >
-> **Codec-aware today** — these go through `store::append_events_with_codecs`
-> under the configured registry, and the worker replays with the *same*
-> registry, so a mixed-key history round-trips:
+> This includes:
 >
-> - the worker's **batched** task-processing writes: activity results and
+> - the worker's batched task-processing writes: activity results and
 >   failures, workflow completions and failures, timers, signals, DLQ and
 >   quarantine writes;
 > - `ActivityCompleted.output` committed inline by `ctx.run_transactional`;
 > - `ActivityFailed.details` from a broken session;
-> - `WorkflowFailed.details` from the poison-pill reclaimer.
+> - `WorkflowFailed.details` from the poison-pill reclaimer;
+> - `execution.rs`'s start paths — `WorkflowStarted.input` and
+>   `last_completion_result`, the first event of every execution;
+> - every payload-bearing `store::append_single_event` call:
+>   `ChildWorkflowStarted.input`, `ChildWorkflowCompleted.output`, a typed
+>   `ChildWorkflowFailed.details` (both `worker.rs` and the cross-shard child
+>   relay), and `ActivityCompletedExternally.output` (`external_task.rs`);
+> - `UpdateAdmitted.input` (`store::admit_update_event`) and a workflow rerun's
+>   own start input (`execution::rerun_workflow_execution`);
+> - `scheduler.rs`'s three dispatch paths: a schedule tick, a buffered-run
+>   drain, and a unified-DAG trigger;
+> - `completion_trigger.rs`'s relay-gate-checked start, both
+>   `evaluate_triggers_for_execution` variants, the outbox sweep, and a
+>   cross-shard `DeferredTriggerStart` (the registry rides on the struct since
+>   `spawn` runs detached from the evaluating call's scope);
+> - the plugin layer: `admit_batched_start` (event-batch admission), the
+>   outbox relay's workflow-start dispatch, a UI-triggered manual schedule
+>   fire, and the outbound webhook-delivery start.
 >
-> **Still identity-only** — two groups, both tracked by #1243:
+> Two groups stay on the identity registry, for different reasons:
 >
-> - `execution.rs`'s start paths, so `WorkflowStarted.input` is stored in the
->   clear. That is the *first* event of every execution and often the most
->   sensitive payload in it.
-> - every write that goes through `store::append_single_event`, which has no
->   codec-aware counterpart yet. The payload-bearing ones are
->   `ChildWorkflowStarted.input` and `ChildWorkflowCompleted.output` (both
->   `worker.rs`) and `ActivityCompletedExternally.output`
->   (`external_task.rs`). Note the consequence for **child workflows
->   specifically**: a child's own history is codec-aware, but the parent's
->   mirror of the child's input and output is not.
->
-> Treat rotation as incomplete until #1243 closes: the sweep converts the rest
-> of the history, and anything written in the clear before the fix stays
-> plaintext (the sweep never newly encrypts plaintext, by design). It is an
-> ADR-0003 write-path defect rather than a rotation defect.
->
-> Nothing here is blocked by that gap — every rotation primitive operates
-> correctly on whatever the write path stores, and the census counts only what
-> is genuinely encoded — but a green retirement gate says nothing about start
-> inputs, and neither does a completed sweep.
+> - Events with no payload-bearing field at all: parent-close cascade
+>   bookkeeping, operator cancel/terminate reasons, pause/resume, and
+>   `WorkflowRedriven`. Encoding these is a byte-for-byte no-op (see
+>   `PayloadCodecs::encode_event`'s field list) — nothing in this group is
+>   reachable from a workflow's real input, output, or error detail.
+> - A disclosed residual gap: `cancel_workflow_execution_collect`,
+>   `terminate_workflow_execution_collect`, and
+>   `commit_workflow_execution_timeout` each fire a completion-trigger
+>   evaluation with the identity registry. These three public functions have
+>   many external callers with no configured registry threaded through, so
+>   closing this gap needs a signature change beyond issue #1243's scope. The
+>   events these three write directly carry no payload field either, so only
+>   a *downstream* trigger-fired start could be affected — track closing this
+>   under a follow-up issue.
 
 ```rust
 use autumn_harvest::payload_codec::CODEC_LEGACY_KEY_ID;

@@ -987,6 +987,7 @@ async fn fire_claimed_throttle_row(
     row: FireDueRow,
     now: DateTime<Utc>,
     metrics: &(dyn crate::telemetry::MetricsRecorder + Send + Sync),
+    codecs: &crate::payload_codec::PayloadCodecs,
 ) -> crate::error::HarvestResult<Option<FiredThrottle>> {
     // AC-c: a start deferred past its schedule_to_start deadline times out
     // rather than running stale.
@@ -1152,13 +1153,14 @@ async fn fire_claimed_throttle_row(
     // time", not merely "will run when tokens allow". `_collect` applies the
     // gate iff the start will CREATE and records `harvest.admission.blocked` on
     // the passed recorder when it blocks.
-    match crate::execution::start_or_load_workflow_execution_collect(
+    match crate::execution::start_or_load_workflow_execution_collect_with_codecs(
         conn,
         params,
         true,
         false,
         Some(metrics),
         Some(crate::admission_gate::GateMode::CheckCached),
+        codecs,
     )
     .await
     {
@@ -1306,6 +1308,7 @@ async fn fire_claimed_throttle_row(
 async fn fire_due_on_conn(
     conn: &mut diesel_async::AsyncPgConnection,
     metrics: &(dyn crate::telemetry::MetricsRecorder + Send + Sync),
+    codecs: &crate::payload_codec::PayloadCodecs,
 ) -> crate::error::HarvestResult<Vec<FiredThrottle>> {
     use diesel_async::{AsyncConnection, RunQueryDsl};
 
@@ -1431,7 +1434,9 @@ async fn fire_due_on_conn(
 
             let mut results = Vec::with_capacity(due_rows.len());
             for row in due_rows {
-                if let Some(item) = fire_claimed_throttle_row(conn, row, now, metrics).await? {
+                if let Some(item) =
+                    fire_claimed_throttle_row(conn, row, now, metrics, codecs).await?
+                {
                     results.push(item);
                 }
             }
@@ -1458,6 +1463,30 @@ pub async fn fire_due_throttled_starts(
     sharded_pool: &Option<crate::shard::ShardedDbPool>,
     shard_assignments: &[crate::types::ShardId],
     metrics: &(dyn crate::telemetry::MetricsRecorder + Send + Sync),
+) -> crate::error::HarvestResult<usize> {
+    fire_due_throttled_starts_with_codecs(
+        conn,
+        sharded_pool,
+        shard_assignments,
+        metrics,
+        &crate::store::DEFAULT_PAYLOAD_CODECS,
+    )
+    .await
+}
+
+/// [`fire_due_throttled_starts`], encoding a flushed `WorkflowStarted.input`
+/// through `codecs` (issue #1243).
+///
+/// # Errors
+///
+/// Same as [`fire_due_throttled_starts`].
+#[cfg(feature = "db")]
+pub async fn fire_due_throttled_starts_with_codecs(
+    conn: &mut diesel_async::AsyncPgConnection,
+    sharded_pool: &Option<crate::shard::ShardedDbPool>,
+    shard_assignments: &[crate::types::ShardId],
+    metrics: &(dyn crate::telemetry::MetricsRecorder + Send + Sync),
+    codecs: &crate::payload_codec::PayloadCodecs,
 ) -> crate::error::HarvestResult<usize> {
     async fn spawn_fired(
         fired: Vec<FiredThrottle>,
@@ -1529,12 +1558,12 @@ pub async fn fire_due_throttled_starts(
                         continue;
                     }
                 };
-                let fired = fire_due_on_conn(&mut shard_conn, metrics).await?;
+                let fired = fire_due_on_conn(&mut shard_conn, metrics, codecs).await?;
                 fired_count += spawn_fired(fired, metrics, &mut shard_conn).await;
             }
         }
         _ => {
-            let fired = fire_due_on_conn(conn, metrics).await?;
+            let fired = fire_due_on_conn(conn, metrics, codecs).await?;
             fired_count += spawn_fired(fired, metrics, conn).await;
         }
     }
