@@ -10716,9 +10716,9 @@ fn placement_router() -> Option<crate::shard::ShardRouter> {
 /// (issue #1263 items 11/15/17).
 ///
 /// Returns `resolved` when the [`WorkflowContext`] that decided this
-/// placement had an EXPLICIT router installed via `with_shard_router` —
-/// tests and embedders running more than one topology in a single
-/// process. Else the process-global one, asked fresh.
+/// placement had an EXPLICIT router installed via `with_shard_router`.
+/// That is for tests and embedders running more than one topology in a
+/// single process. Else the process-global one, asked fresh.
 ///
 /// Without this, the preflight always asked the global router. Even when a
 /// context-local one — potentially a different topology, with different

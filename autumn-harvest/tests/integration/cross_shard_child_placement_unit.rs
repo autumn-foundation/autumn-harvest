@@ -325,8 +325,8 @@ fn a_pin_to_a_drained_shard_resolves_and_is_rejected_at_the_persist_boundary() {
 /// none was made. Critically, it also makes the resulting child LOCAL. The
 /// persist-time preflight — which rejects a cross-shard target on a
 /// drained shard — can then never see it and reject it. See issue #1263
-/// item 15, which caught this returning `default_shard()` instead: a value
-/// that only coincides with the parent's shard when the parent already
+/// item 15, which caught this returning `default_shard()` instead. That
+/// value only coincides with the parent's shard when the parent already
 /// happens to live on the default shard.
 ///
 /// AC8 requires that a fallback never happen "without trace", which the
