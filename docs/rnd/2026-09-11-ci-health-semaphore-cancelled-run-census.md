@@ -34,19 +34,40 @@ reruns** — narrowed, not contradicted.
 
 ### 2. The 14 explicit failures
 
-**Disclosure:** the sub-investigation that gathered this section hit a
-context-compaction boundary mid-run. Full per-run detail survived for 1 of the 14
-runs; for the other 13 only the aggregate classification survived (the run IDs
-themselves were lost with the compacted turn). Reporting exactly what is verified,
-not reconstructing the missing 13 from memory:
+**Correction, per a Codex review comment on this PR:** an earlier draft of this
+section reported only an aggregate count for 13 of the 14 runs, disclosing that
+a context-compaction boundary in the sub-investigation had lost their individual
+IDs and signatures. The comment correctly flagged that an aggregate the reader
+cannot verify — against a `list_workflow_runs` window that keeps moving as new
+runs land — doesn't belong in a verified total. All 14 run IDs were preserved
+outside that sub-investigation's own context (saved to a local file before
+delegating), so they were re-pulled directly rather than left as an unverifiable
+aggregate:
 
-| Run | Signature | Class |
-|---|---|---|
-| `34573811773` | `Test (windows-latest)` compile step: `error[E0786]: found invalid metadata files for crate 'autumn_harvest'` → `failed to mmap file '...libautumn_harvest-*.rlib': The paging file is too small for this operation to complete. (os error 1455)` | **External infra** — Windows runner memory/paging-file exhaustion. A different infra-failure shape than any prior report in this series (those found a GitHub-runner shutdown and a Docker-registry pull failure; this is the first paging-file exhaustion observed) |
-| 13 others | Aggregate only, verified at the time but not re-derivable now: lint/fmt/doc-sync-gate class | Deterministic, commit-specific (13/13 per the preserved aggregate) |
+| Run | Failed job/step | Signature | Class |
+|---|---|---|---|
+| `34573811773` | `Test (windows-latest)` compile | `error[E0786]: found invalid metadata files for crate 'autumn_harvest'` → `failed to mmap file '...libautumn_harvest-*.rlib': The paging file is too small for this operation to complete. (os error 1455)` | **External infra** — Windows runner memory/paging-file exhaustion. A different infra-failure shape than any prior report in this series (those found a GitHub-runner shutdown and a Docker-registry pull failure; this is the first paging-file exhaustion observed) |
+| `34514846121` | Lint → Clippy autumn-harvest | Clippy violation in the core crate | Deterministic |
+| `34413355439` | Lint → Clippy autumn-harvest | Clippy violation in the core crate | Deterministic |
+| `34161210429` | Lint → Clippy autumn-harvest-plugin | Clippy violation in the plugin crate | Deterministic |
+| `34262115891` | Lint → `docs/performance.md` guards | Doc/code-sync gate — same class as `sqlite_feasibility_docs`/`migration_hygiene` in the 09-08 report | Deterministic |
+| `34163231968` | Lint → `docs/performance.md` guards | Same doc/code-sync gate, different commit | Deterministic |
+| `34411696665` | Lint → Comment hygiene (`docs/audits/comment-hygiene.py`) | Tier B ratchet violation | Deterministic |
+| `34325821650` | Lint → Comment hygiene | Tier B ratchet violation | Deterministic |
+| `34316264290` | Lint → Comment hygiene | Tier B ratchet violation | Deterministic |
+| `34268913672` | Lint → Comment hygiene | Tier B ratchet violation | Deterministic |
+| `34192557082` | Lint → Comment hygiene | Tier B ratchet violation | Deterministic |
+| `34163695062` | Lint → Comment hygiene | Tier B ratchet violation | Deterministic |
+| `34155387838` | Lint → Comment hygiene | Tier B ratchet violation | Deterministic |
+| `34151231594` | Lint → Comment hygiene | Tier B ratchet violation | Deterministic |
 
-**Row-level detail for the 13 should be re-pulled by whoever needs it** — flagging
-the gap rather than inventing run IDs or error text to fill it.
+**13/14 deterministic, commit-specific `Lint`-job failures (8 comment-hygiene,
+3 clippy, 2 doc/code-sync); 1/14 external infra** — matching the aggregate the
+prior draft reported, now backed by verifiable run IDs. None reproduce the
+`dispatch_tests` flake signature in §4, and none required pulling job logs
+beyond the job list itself — the failed step name identifies the check in
+every case here (unlike the cancelled-run table in §3, where several hidden
+failures needed a log pull to name the specific test or lint that fired).
 
 ### 3. The cancelled-run census, finished
 
@@ -128,6 +149,19 @@ successfully on a different flake):
 - 32 concurrent reps of the full `dispatch_tests` module, all ~18 tests per rep,
   serialized internally by `DISPATCH_SERIAL` (8 rounds × 4 concurrent copies):
   **0/32 failed.**
+
+Two Codex review comments on this PR flagged real gaps in how an earlier draft
+documented this reproduction (fixed in 🔬 Reproduce below) — confirmed neither
+affected the result actually obtained here: `HARVEST_TEST_DATABASE_URL` was
+unset in this session's shell for the whole run (checked directly), so every
+rep did go through `setup_test_database_url_or_env()`'s testcontainers path,
+corroborated by each solo rep taking ~13s (consistent with a fresh container
+plus migrations, not an instant shared-DB connection) and by `postgres:16`
+appearing in the local Docker image cache only after these runs. And the
+failure count was read from per-rep log files via `grep -L "test result: ok"`,
+not from the backgrounding loop's own exit status, so the 0/92 count is not
+subject to the `wait`-swallows-failures gap the comments correctly identified
+in the originally-documented commands.
 
 **92/92 clean locally.** Per this role's own hard gate, that is not a fix-ready
 result — it means the local harness (a 4-vCPU sandbox running one or a few
@@ -252,22 +286,39 @@ Four items routed forward, two carried from prior reports and two new:
 # perPage=100), confirm total_count matches the returned length, then check every
 # job's own `conclusion` field (not just the run's).
 
-# Flake-candidate local reproduction:
+# Flake-candidate local reproduction. Two Codex review comments on this PR
+# caught real gaps in an earlier draft of these commands, both fixed below:
+# (1) if HARVEST_TEST_DATABASE_URL is set in the shell, setup_test_database_url_or_env()
+#     (integration_e2e.rs:498) returns it without starting a container, silently
+#     testing a shared pre-migrated DB instead of the testcontainers startup path
+#     this reproduction exists to stress -- unset it explicitly first.
+# (2) a bare `wait` after backgrounding jobs with `&` does not propagate any
+#     individual job's failure -- redirect each rep to its own log file and grep
+#     the logs afterward, don't trust the loop's own exit status.
+unset HARVEST_TEST_DATABASE_URL
 cargo test -p autumn-harvest --features testing --test integration --no-run
 BIN=target/debug/deps/integration-<hash>
+mkdir -p /tmp/repro_logs
 # isolated-test contention:
 for round in $(seq 1 10); do
   for i in 1 2 3 4 5 6; do
     taskset -c 0,1 "$BIN" --test-threads=1 \
-      dispatch_tests::the_by_id_claim_honours_the_dr_fence &
-  done; wait
+      dispatch_tests::the_by_id_claim_honours_the_dr_fence \
+      > /tmp/repro_logs/round${round}_${i}.log 2>&1 &
+  done
+  wait
 done
+grep -L "test result: ok" /tmp/repro_logs/*.log  # empty output = 0 failures
 # full-module contention (DISPATCH_SERIAL still serializes within each process):
+rm -f /tmp/repro_logs/*.log
 for round in $(seq 1 8); do
   for i in 1 2 3 4; do
-    taskset -c 0,1 "$BIN" --test-threads=1 dispatch_tests:: &
-  done; wait
+    taskset -c 0,1 "$BIN" --test-threads=1 dispatch_tests:: \
+      > /tmp/repro_logs/round${round}_${i}.log 2>&1 &
+  done
+  wait
 done
+grep -L "test result: ok" /tmp/repro_logs/*.log  # empty output = 0 failures
 
 # Windows no-db timing:
 # list_workflow_jobs(resource_id=<run>, perPage=100), compute
