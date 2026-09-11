@@ -1737,3 +1737,7 @@ standalone note rather than part of the claim-path attribution table above:
   one statement per key (`calls` -66.7% at every swept size; buffers flat
   by design, so the fix is measured in DB-socket syscalls instead: `sendto`
   -44.5%, `recvfrom` -40.9%).
+* [`docs/performance-metrics-sampler-guard.md`](performance-metrics-sampler-guard.md)
+  — four worker samplers issuing SQL with no `metrics.is_enabled()` guard
+  (issue #1428), eliminated entirely rather than reduced (pool-touch count
+  and corroborating `strace` `connect` calls both N → 0).

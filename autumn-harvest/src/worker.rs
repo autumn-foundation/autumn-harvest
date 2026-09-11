@@ -28734,6 +28734,163 @@ mod tests {
             .expect("pool builds without connecting")
     }
 
+    // ── Issue #1428: metrics-disabled samplers must never touch the pool ────
+    //
+    // Four samplers issued their SQL with no `metrics.is_enabled()` guard,
+    // unlike their six siblings (`spawn_queue_depth_sampler` above sets the
+    // pattern). `unreachable_pool` makes the bug falsifiable without a
+    // database: a guarded sampler returns before its first `pool.get()`, so
+    // it never logs the failure below. An unguarded one logs it once per
+    // loop pass, so the count is a direct, deterministic proxy for "how many
+    // times a sampler touched the pool."
+
+    /// A [`tracing_subscriber::Layer`] that counts events carrying the
+    /// "could not acquire DB connection" message each sampler's failure
+    /// branch emits, scoped to this module's own tracing target.
+    struct PoolTouchCounter(Arc<std::sync::atomic::AtomicUsize>);
+
+    /// Captures a tracing event's `message` field text, ignoring every other
+    /// field.
+    struct EventMessage(Option<String>);
+
+    impl tracing::field::Visit for EventMessage {
+        fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+            if field.name() == "message" {
+                self.0 = Some(format!("{value:?}"));
+            }
+        }
+    }
+
+    impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for PoolTouchCounter {
+        fn on_event(
+            &self,
+            event: &tracing::Event<'_>,
+            _ctx: tracing_subscriber::layer::Context<'_, S>,
+        ) {
+            if event.metadata().target() != "autumn_harvest::worker" {
+                return;
+            }
+            let mut message = EventMessage(None);
+            event.record(&mut message);
+            let touched_pool = message
+                .0
+                .as_deref()
+                .is_some_and(|text| text.contains("could not acquire DB connection"));
+            if touched_pool {
+                self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            }
+        }
+    }
+
+    /// Reads `counter` via a fully-qualified call. `diesel_async::RunQueryDsl`
+    /// is implemented for every `Sized` type, including `Arc<AtomicUsize>`,
+    /// so a plain `counter.load(ordering)` resolves to that blanket trait
+    /// method instead of `AtomicUsize::load` and fails to compile.
+    fn load_pool_touch_count(counter: &Arc<std::sync::atomic::AtomicUsize>) -> usize {
+        std::sync::atomic::AtomicUsize::load(counter, std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// Advances the paused clock by `interval`, `n` times, yielding after
+    /// each advance. Each sampler loop sleeps for `interval` before its
+    /// body runs, so `n` advances let it complete up to `n` passes.
+    async fn advance_sampler_ticks(interval: Duration, n: usize) {
+        for _ in 0..n {
+            tokio::time::advance(interval).await;
+            tokio::task::yield_now().await;
+        }
+    }
+
+    /// Spawns the four samplers issue #1428 named, against the same `pool`,
+    /// `cancel`, `telemetry`, and `interval`. The extra per-sampler
+    /// arguments (queue names, shard id, soft threshold) are representative
+    /// values; none of them affect whether the pool is ever touched.
+    fn spawn_the_four_unguarded_samplers(
+        pool: &DbPool,
+        cancel: &CancellationToken,
+        telemetry: &Arc<crate::telemetry::TelemetryConfig>,
+        interval: Duration,
+    ) -> Vec<tokio::task::JoinHandle<()>> {
+        vec![
+            spawn_concurrency_sampler(
+                vec![pool.clone()],
+                cancel.clone(),
+                telemetry.clone(),
+                vec!["default".to_string()],
+                interval,
+            ),
+            spawn_rate_limit_sampler(
+                vec![pool.clone()],
+                cancel.clone(),
+                telemetry.clone(),
+                interval,
+            ),
+            spawn_dlq_depth_sampler(pool.clone(), cancel.clone(), telemetry.clone(), 0, interval),
+            spawn_history_oversized_sampler(
+                vec![pool.clone()],
+                cancel.clone(),
+                telemetry.clone(),
+                100,
+                interval,
+            ),
+        ]
+    }
+
+    /// Issue #1428 evidence generator. Spawns the four samplers against
+    /// [`unreachable_pool`] with metrics disabled, advances a paused clock by
+    /// `TICKS` sampler intervals, and counts pool-touch events. Not a CI
+    /// assertion — see `docs/performance-metrics-sampler-guard.md`. Set
+    /// `PERF_LABEL` to tag the artifact `before`/`after` the fix.
+    #[tokio::test(start_paused = true)]
+    #[ignore = "evidence generator, not a CI assertion -- see \
+                docs/performance-metrics-sampler-guard.md"]
+    async fn zz_capture_metrics_sampler_guard_pool_touch_evidence() {
+        use tracing_subscriber::layer::SubscriberExt;
+
+        const TICKS: usize = 20;
+        let interval = Duration::from_millis(50);
+
+        let counter = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let subscriber =
+            tracing_subscriber::registry().with(PoolTouchCounter(Arc::clone(&counter)));
+        let _guard = tracing::subscriber::set_default(subscriber);
+
+        let telemetry = Arc::new(crate::telemetry::TelemetryConfig::default());
+        assert!(
+            !telemetry.metrics.is_enabled(),
+            "this harness must model an unconfigured, metrics-disabled deployment"
+        );
+        let pool = unreachable_pool("postgres://127.0.0.1:1/sampler-guard-evidence");
+        let cancel = CancellationToken::new();
+        let handles = spawn_the_four_unguarded_samplers(&pool, &cancel, &telemetry, interval);
+
+        advance_sampler_ticks(interval, TICKS).await;
+        cancel.cancel();
+        for handle in handles {
+            let _ = tokio::time::timeout(Duration::from_secs(5), handle).await;
+        }
+
+        let touches = load_pool_touch_count(&counter);
+        let label = std::env::var("PERF_LABEL").unwrap_or_else(|_| "unlabeled".to_string());
+        eprintln!("label={label} ticks={TICKS} samplers=4 pool_touches={touches}");
+
+        let out_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .expect("autumn-harvest/ has a workspace-root parent")
+            .join("docs")
+            .join("perf-artifacts")
+            .join("metrics-sampler-guard");
+        std::fs::create_dir_all(&out_dir).expect("create artifact output directory");
+        std::fs::write(
+            out_dir.join(format!("{label}-counts.txt")),
+            format!(
+                "-- {label}: metrics-disabled sampler pool-touch count, 4 samplers, \
+                 {TICKS} ticks, interval={interval:?} --\nsamplers\tticks\tpool_touches\n4\t\
+                 {TICKS}\t{touches}\n"
+            ),
+        )
+        .expect("write evidence artifact");
+    }
+
     #[test]
     fn a_two_connection_pool_serving_one_shard_is_sufficient() {
         use crate::types::ShardId;
