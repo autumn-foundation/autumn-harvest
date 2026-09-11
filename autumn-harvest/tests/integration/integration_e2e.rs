@@ -782,6 +782,28 @@ pub(crate) async fn load_timers_for_execution_from_url(
         .expect("failed to reload timer rows")
 }
 
+/// Seed a pending `harvest_timers` row directly (issue #1247 regression
+/// coverage), standing in for the row a real `ArmTimer { for_await: true }`
+/// cycle would have inserted. Lets a test drive the DB-delete half of a
+/// `CancelTimer` co-batched with a `RunLocalActivity` without first fighting
+/// the scheduler for a genuine live race window.
+pub(crate) async fn seed_pending_timer_row(
+    conn: &mut AsyncPgConnection,
+    exec_id: ExecutionId,
+    timer_id: &str,
+    fires_at: chrono::DateTime<Utc>,
+) {
+    diesel::insert_into(harvest_timers::table)
+        .values(autumn_harvest::models::NewHarvestTimer {
+            workflow_exec_id: exec_id.as_uuid(),
+            timer_id,
+            fires_at,
+        })
+        .execute(conn)
+        .await
+        .expect("failed to seed a pending harvest_timers row");
+}
+
 pub(crate) async fn load_child_executions_from_url(
     database_url: &str,
     parent_exec_id: ExecutionId,

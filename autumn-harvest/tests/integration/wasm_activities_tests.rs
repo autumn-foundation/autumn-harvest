@@ -29,6 +29,7 @@ use autumn_harvest::models::{NewWorkflowExecution, WorkflowExecution};
 use autumn_harvest::policy::RetryPolicy;
 use autumn_harvest::queue::{self, EnqueueParams, TaskType};
 use autumn_harvest::schema::harvest_workflow_executions;
+use autumn_harvest::shard::ShardedDbPool;
 use autumn_harvest::telemetry::{MetricsRecorder, TelemetryConfig};
 use autumn_harvest::types::{ExecutionId, ShardId};
 use autumn_harvest::wasm_activities::{
@@ -47,7 +48,7 @@ use diesel::prelude::*;
 use diesel::sql_types::BigInt;
 use diesel_async::pooled_connection::AsyncDieselConnectionManager;
 use diesel_async::{AsyncConnection, AsyncPgConnection, RunQueryDsl};
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use testcontainers::ContainerAsync;
@@ -897,7 +898,7 @@ fn build_wasm_registry(
 }
 
 fn build_worker(worker_id: &str, queue: &str, registry: Arc<HandlerRegistry>) -> Arc<Worker> {
-    build_worker_with_shards(worker_id, queue, registry, vec![ShardId::new(0)])
+    build_worker_with_shards(worker_id, queue, registry, vec![ShardId::new(0)], None)
 }
 
 fn build_worker_with_shards(
@@ -905,6 +906,7 @@ fn build_worker_with_shards(
     queue: &str,
     registry: Arc<HandlerRegistry>,
     shard_assignments: Vec<ShardId>,
+    sharded_pool: Option<ShardedDbPool>,
 ) -> Arc<Worker> {
     Arc::new(
         Worker::new(
@@ -937,7 +939,7 @@ fn build_worker_with_shards(
                 max_workflow_pause_duration: Duration::from_secs(24 * 3600),
                 max_workflow_history_events: None,
                 shard_notification_database_urls: Vec::new(),
-                sharded_pool: None,
+                sharded_pool,
                 slot_tuner: None,
                 max_concurrent_sessions: 0,
             },
@@ -1225,8 +1227,13 @@ async fn worker_with_empty_shard_assignments_seeds_wasm_on_default_pool() {
     );
     // The one load-bearing difference from the passing echo test: EMPTY
     // shard_assignments (the default single-shard shape).
-    let worker =
-        build_worker_with_shards("w-wasm-default-shard", queue, Arc::clone(&registry), vec![]);
+    let worker = build_worker_with_shards(
+        "w-wasm-default-shard",
+        queue,
+        Arc::clone(&registry),
+        vec![],
+        None,
+    );
     let pool = build_pool(&url);
     run_to_state(
         &url,
@@ -1300,6 +1307,92 @@ async fn worker_fails_closed_when_seeding_wasm_modules_fails() {
         .await
         .expect("worker must fail closed and return on its own, not poll forever")
         .expect("worker task joins cleanly");
+
+    // The seeded workflow was never dispatched — it stays un-completed.
+    let execution = load_execution(&url, exec_id).await;
+    assert_ne!(
+        execution.state, "COMPLETED",
+        "a fail-closed worker must not have processed any work"
+    );
+}
+
+// ── bounded seed acquisition on multi-shard (issue #1212, Finding 2) ───────
+
+/// A single exhausted shard pool must not park the seed loop forever. It
+/// still fails closed, but within a bound, on the multi-shard path.
+///
+/// Shard 0 gets a one-connection pool. This test holds its only connection
+/// for the whole run, so every acquisition against shard 0 blocks. Shard 1
+/// is healthy. Both point at the same database: this test checks pool
+/// acquisition timing, not cross-shard routing.
+///
+/// This test fails against the pre-fix code: the seed loop's bare
+/// `shard_pool.get().await` blocks forever on shard 0. It passes once
+/// seeding routes through `acquire_shard_conn`, the same bounded
+/// acquisition the multi-shard poll loop already uses.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn worker_fails_closed_within_a_bound_when_a_shard_pool_is_exhausted_during_seed() {
+    let (url, _c) = setup_db().await;
+    let queue = "q-wasm-seed-exhausted";
+    let mut conn = connect(&url).await;
+    scrub(&mut conn).await;
+    let exec_id = seed_workflow(&mut conn, "wf_run_wasm", serde_json::json!(null), queue).await;
+
+    let echo = assemble(ECHO_WAT);
+    let registry = build_wasm_registry(
+        vec![wf_info("wf_run_wasm", wf_run_wasm)],
+        vec![WasmActivitySpec {
+            name: "echo_wasm",
+            bytes: echo,
+            caps: WasmCapabilities::default(),
+            limits: WasmLimits::default(),
+            retry: None,
+            schedule_to_close: None,
+        }],
+        Arc::new(RecordingMetrics::default()),
+    );
+
+    let manager = AsyncDieselConnectionManager::<AsyncPgConnection>::new(url.as_str());
+    let saturated_pool = deadpool::managed::Pool::builder(manager)
+        .max_size(1)
+        .build()
+        .expect("build saturated pool");
+    let saturating_conn = saturated_pool
+        .get()
+        .await
+        .expect("hold shard 0's only connection");
+    let healthy_pool = build_pool(&url);
+    let sharded = ShardedDbPool::from_map(
+        BTreeMap::from([
+            (ShardId::new(0), saturated_pool),
+            (ShardId::new(1), healthy_pool),
+        ]),
+        ShardId::new(0),
+    );
+
+    let worker = build_worker_with_shards(
+        "w-wasm-seed-exhausted",
+        queue,
+        Arc::clone(&registry),
+        vec![ShardId::new(0), ShardId::new(1)],
+        Some(sharded),
+    );
+    let default_pool = build_pool(&url);
+
+    let runner = Arc::clone(&worker);
+    let handle = tokio::spawn(async move { runner.run(&default_pool).await });
+
+    // run() must return on its own (fail closed), within a bound — never
+    // call shutdown(). Pre-fix this join never returns.
+    tokio::time::timeout(Duration::from_secs(30), handle)
+        .await
+        .expect(
+            "worker must fail closed within a bound while shard 0's pool is exhausted \
+             during seed, not park forever (issue #1212 Finding 2)",
+        )
+        .expect("worker task joins cleanly");
+
+    drop(saturating_conn);
 
     // The seeded workflow was never dispatched — it stays un-completed.
     let execution = load_execution(&url, exec_id).await;
