@@ -349,7 +349,7 @@ mod db {
 
     use super::{
         EraseFailure, EraseOutcome, ErasedResidence, SkippedChild, erasure_tombstone,
-        is_terminal_state, tombstone_payload_fields,
+        is_terminal_state, is_tombstone, tombstone_payload_fields,
     };
 
     type EraseFuture<'a> = Pin<Box<dyn Future<Output = HarvestResult<EraseOutcome>> + Send + 'a>>;
@@ -396,6 +396,13 @@ mod db {
     /// through [`EraseFailure`] rather than silently skipped. An erase must
     /// never claim success while PII a caller could not reach still
     /// survives.
+    ///
+    /// Two follow-up gaps, closed by this pass. The outbox row's own
+    /// `child_spec` copy of the child's input is a second, always-reachable
+    /// PII residence on the parent's own shard. It is scrubbed once the
+    /// row is `STARTED`. And a cross-shard child not yet visible on its
+    /// target shard is reported as [`SkippedChild`] instead of passed over
+    /// as a clean success.
     ///
     /// # Scope boundary
     ///
@@ -792,23 +799,74 @@ mod db {
     /// shard, never on the parent's. `harvest_cross_shard_children` is the
     /// only pointer to it that this shard has.
     ///
-    /// Returns `(child_exec_id, target_shard)` pairs so the caller can route
-    /// each to its own database. See [`erase_workflow_payloads_with_pool`]'s
-    /// scope-boundary note for the one case this cannot see: a child whose
-    /// outbox row has already been retired.
+    /// Returns `(child_exec_id, target_shard, status)` triples so the caller
+    /// can route each to its own database. See
+    /// [`erase_workflow_payloads_with_pool`]'s scope-boundary note for the
+    /// one case this cannot see: a child whose outbox row has already been
+    /// retired.
     async fn collect_cross_shard_child_ids(
         conn: &mut AsyncPgConnection,
         exec_id: ExecutionId,
-    ) -> HarvestResult<Vec<(Uuid, i32)>> {
+    ) -> HarvestResult<Vec<(Uuid, i32, String)>> {
         harvest_cross_shard_children::table
             .filter(harvest_cross_shard_children::parent_exec_id.eq(exec_id.as_uuid()))
             .select((
                 harvest_cross_shard_children::child_exec_id,
                 harvest_cross_shard_children::target_shard,
+                harvest_cross_shard_children::status,
             ))
-            .load::<(Uuid, i32)>(conn)
+            .load::<(Uuid, i32, String)>(conn)
             .await
             .map_err(database_error)
+    }
+
+    /// Tombstone the payload-bearing fields inside a cross-shard child's own
+    /// outbox `child_spec` copy (issue #1263 item 10 follow-up).
+    ///
+    /// `child_spec` carries the child's `input` un-encoded — never through
+    /// [`crate::payload_codec::PayloadCodecs`] — plus its `context_headers`.
+    /// This row lives on the PARENT's own shard. It is a second, fully
+    /// reachable copy of the child's PII. The target-shard scrub never
+    /// touches it.
+    ///
+    /// Only called once the relay has already created the child (`status =
+    /// STARTED`). No remaining relay action ever re-reads `child_spec` for
+    /// such a row, so scrubbing it here is safe. A `PENDING_START` row must
+    /// NOT be touched. The relay still needs that exact input to create the
+    /// child. This module's ordinary terminal-only gate cannot wait for
+    /// that creation first — see [`cascade_children`].
+    ///
+    /// Best-effort on a concurrent retire. If the row is gone by the time
+    /// this runs, there is nothing left to scrub. The caller's own remote
+    /// lookup independently reports whatever that implies.
+    async fn scrub_cross_shard_child_spec(
+        conn: &mut AsyncPgConnection,
+        child_exec_id: Uuid,
+    ) -> HarvestResult<()> {
+        let Some(mut spec_json): Option<serde_json::Value> = harvest_cross_shard_children::table
+            .find(child_exec_id)
+            .select(harvest_cross_shard_children::child_spec)
+            .first(conn)
+            .await
+            .optional()
+            .map_err(database_error)?
+        else {
+            return Ok(());
+        };
+        if let Some(obj) = spec_json.as_object_mut() {
+            if let Some(input) = obj.get_mut("input")
+                && !is_tombstone(input)
+            {
+                *input = erasure_tombstone();
+            }
+            obj.insert("context_headers".to_string(), serde_json::Value::Null);
+        }
+        diesel::update(harvest_cross_shard_children::table.find(child_exec_id))
+            .set(harvest_cross_shard_children::child_spec.eq(spec_json))
+            .execute(conn)
+            .await
+            .map_err(database_error)?;
+        Ok(())
     }
 
     /// Resolve ONE child, already known to live on `conn`, into exactly one of
@@ -949,11 +1007,29 @@ mod db {
             failures.extend(failed);
         }
 
-        for (child_uuid, target_shard) in collect_cross_shard_child_ids(conn, exec_id).await? {
+        for (child_uuid, target_shard, status) in
+            collect_cross_shard_child_ids(conn, exec_id).await?
+        {
             if !visited.insert(child_uuid) {
                 continue;
             }
             let child_exec_id = ExecutionId::from_uuid(child_uuid);
+            // The outbox's own `child_spec` copy of the child's `input` is a
+            // second, always-locally-reachable PII residence (Finding A).
+            // `start_child_on_target` commits the child's row on the target
+            // shard BEFORE this status flips to `STARTED`. So `STARTED` is
+            // the one durable proof the relay no longer needs this exact
+            // input to create anything. A `PENDING_START` row must stay
+            // untouched: the child may not exist yet, and scrubbing its
+            // only surviving input would corrupt a still-pending creation.
+            if status == crate::shard::CrossShardChildStatus::Started.as_db_str()
+                && let Err(e) = scrub_cross_shard_child_spec(conn, child_uuid).await
+            {
+                failures.push(EraseFailure {
+                    execution_id: child_exec_id.to_string(),
+                    reason: e.to_string(),
+                });
+            }
             let Some(pool) = pool else {
                 failures.push(EraseFailure {
                     execution_id: child_exec_id.to_string(),
@@ -990,6 +1066,24 @@ mod db {
                 Err(e) => Err(e),
             };
             match outcome {
+                // Nothing at all on the target shard: a `PENDING_START`
+                // child the relay has not created yet (issue #1263 item 10
+                // follow-up, Finding B). The outbox row is still live, so
+                // this is not the retired-pointer case
+                // [`erase_workflow_payloads_with_pool`]'s scope-boundary
+                // note describes. Report it as outstanding rather than
+                // silently passing over it as a clean success.
+                Ok((None, None, None)) => {
+                    skipped_children.push(SkippedChild {
+                        execution_id: child_exec_id.to_string(),
+                        state: status,
+                        reason: Some(
+                            "cross-shard child not yet visible on its target shard; retry \
+                             this erasure once the relay creates it"
+                                .to_string(),
+                        ),
+                    });
+                }
                 Ok((erased, skipped, failed)) => {
                     children.extend(erased);
                     skipped_children.extend(skipped);

@@ -63,6 +63,20 @@ cross-shard child's outbox pointer is deleted once fully settled, so this
 does not reach a child erased long after both sides are terminal — the
 same gap item 14 names for `GET /workflows/{id}/stack`.
 
+A follow-up review of this same fix surfaced two further gaps, both
+closed here. First, `harvest_cross_shard_children.child_spec` — the
+outbox row's own un-encoded copy of the child's `input`, on the PARENT's
+own shard — was never scrubbed at all, a second, always-reachable PII
+residence the target-shard erase never touched. `cascade_children` now
+scrubs it (`scrub_cross_shard_child_spec`) once the outbox row is
+`STARTED`; a `PENDING_START` row is left alone, since the relay still
+needs that exact input to create the child. Second, a cross-shard child
+not yet visible on its target shard (the relay's own crash-and-retry
+window between committing the child's row and marking the outbox row
+`STARTED`) fell through `erase_one_child` as `(None, None, None)` and was
+silently treated as a clean success. It is now reported as a
+`SkippedChild`, not dropped.
+
 **Item 17 — the persist-time preflight validated a placement against the
 process-global router even when a context-local one resolved it.**
 `WorkflowContext` gained `resolved_placement_router()`, returning the
@@ -91,8 +105,12 @@ from #1260 rather than folded in here.
 **Test evidence.** New DB-gated regression tests in
 `cross_shard_children_tests.rs`: chain-deadline anchoring, born-cancelled
 (no task ever enqueued), cross-shard erase (payload tombstoned on the
-target shard), and parent-locality (durable row check, not the router).
-The zero-writable-shard test is rewritten in place. A new pure unit test
-pair on `WorkflowContext::resolved_placement_router`. Full existing
-`cross_shard_children_tests.rs` suite (14 tests) passes unchanged. No new
-`WorkflowEvent` variant, no migration.
+target shard), parent-locality (durable row check, not the router),
+outbox `child_spec` scrubbing, and a `PENDING_START` child reported as
+skipped rather than dropped. The zero-writable-shard test is rewritten in
+place. A new pure unit test pair on
+`WorkflowContext::resolved_placement_router`. Full
+`cross_shard_children_tests.rs` and `cross_shard_child_placement_unit.rs`
+suites (51 tests) pass, plus `legal_hold_tests.rs` and
+`retention_summary_tests.rs` (26 tests) unaffected by the same-shard erase
+signature change. No new `WorkflowEvent` variant, no migration.
