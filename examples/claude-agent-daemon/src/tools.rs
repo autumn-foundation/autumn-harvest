@@ -128,11 +128,28 @@ fn string_arg(input: &Value, key: &str) -> Result<String, String> {
         .ok_or_else(|| format!("the `{key}` argument is missing or is not a string"))
 }
 
-/// Resolve a caller path against the workspace root.
+/// Resolve a caller path against the workspace root, and refuse a target that
+/// leaves it.
 ///
-/// The check is lexical, so it holds for a path that does not exist yet. An
-/// absolute path, a parent traversal, and a root prefix are all rejected.
+/// The check has three parts, because a lexical rule alone is not enough. A
+/// symbolic link inside the workspace redirects a read or a write after the
+/// path has already passed a lexical test.
+///
+/// 1. **Lexical.** An absolute path, a parent traversal, and a root prefix are
+///    rejected.
+/// 2. **The final component.** A symbolic link there is refused outright, even
+///    one that points inside the workspace. A dangling link reports
+///    `exists() == false`, so the link itself is tested, not its target.
+/// 3. **The path above it.** The deepest EXISTING ancestor is resolved through
+///    every symbolic link and must sit under the real workspace root. That
+///    catches a link in the middle of the path, and it works for a write target
+///    that does not exist yet.
 fn resolve(workspace: &Path, relative: &str) -> Result<PathBuf, String> {
+    // The root itself can sit behind a link, so compare against its real path.
+    let root = workspace
+        .canonicalize()
+        .map_err(|e| format!("cannot resolve the workspace: {e}"))?;
+
     let candidate = Path::new(relative);
     if candidate.is_absolute() {
         return Err(format!(
@@ -145,7 +162,28 @@ fn resolve(workspace: &Path, relative: &str) -> Result<PathBuf, String> {
             _ => return Err(format!("`{relative}` leaves the workspace")),
         }
     }
-    Ok(workspace.join(candidate))
+    let path = root.join(candidate);
+
+    if std::fs::symlink_metadata(&path).is_ok_and(|meta| meta.file_type().is_symlink()) {
+        return Err(format!(
+            "`{relative}` is a symbolic link, and the toolbox refuses one"
+        ));
+    }
+
+    let mut probe = path.as_path();
+    let resolved = loop {
+        if let Ok(real) = probe.canonicalize() {
+            break real;
+        }
+        probe = probe
+            .parent()
+            .ok_or_else(|| format!("cannot resolve `{relative}`"))?;
+    };
+    if !resolved.starts_with(&root) {
+        return Err(format!("`{relative}` leaves the workspace"));
+    }
+
+    Ok(path)
 }
 
 /// List one directory, sorted, with a trailing slash on each subdirectory.

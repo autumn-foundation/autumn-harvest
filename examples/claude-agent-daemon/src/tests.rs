@@ -14,10 +14,11 @@ use serde_json::{Value, json};
 
 use crate::claude;
 use crate::daemon;
+use crate::guard;
 use crate::protocol::{self, Request, Response};
 use crate::session::{
-    self, ApprovalDecision, SIGNAL_TOOL_APPROVAL, SessionTask, ToolCall, ToolOutcome, TurnRequest,
-    WORKFLOW_NAME,
+    self, ApprovalDecision, SIGNAL_TOOL_APPROVAL, SessionReport, SessionTask, ToolCall,
+    ToolOutcome, TurnReply, TurnRequest, WORKFLOW_NAME,
 };
 use crate::tools;
 
@@ -295,4 +296,112 @@ async fn the_daemon_serves_one_session_over_its_socket() {
     );
 
     daemon.abort();
+}
+
+#[tokio::test]
+async fn a_truncated_turn_never_reports_a_clean_finish() {
+    let dir = tempfile::tempdir().expect("a temporary directory");
+    let workspace = dir.path().join("workspace");
+    std::fs::create_dir_all(&workspace).expect("the workspace is created");
+
+    // A reply cut short by the output cap: text, no tool calls, and the
+    // `max_tokens` stop reason the API reports for a truncated turn.
+    let mut rt = SqliteRuntime::open(dir.path().join("agentd.db")).expect("the database opens");
+    rt.register_workflow(&session::agent_session_info());
+    rt.register_activity(&session::claude_turn_info(), |_input| {
+        serde_json::to_value(TurnReply {
+            content: json!([{ "type": "text", "text": "half an ans" }]),
+            stop_reason: "max_tokens".to_string(),
+            text: "half an ans".to_string(),
+            tool_calls: Vec::new(),
+        })
+        .map_err(|e| format!("bad reply: {e}"))
+    });
+    rt.register_activity(
+        &session::run_tool_info(),
+        tools::activity_body(workspace.clone()),
+    );
+
+    let exec = rt
+        .start_workflow(WORKFLOW_NAME, task())
+        .expect("the session starts");
+    let state = rt.run_until_blocked(exec).await.expect("the run finishes");
+    let RunState::Completed(output) = state else {
+        panic!("expected a terminal report, got {state:?}");
+    };
+
+    let report: SessionReport = serde_json::from_value(output).expect("the report decodes");
+    assert_eq!(
+        report.stop, "max_tokens",
+        "a truncated turn must not report as `end_turn`"
+    );
+}
+
+#[test]
+fn the_toolbox_refuses_a_symlink_that_escapes_the_workspace() {
+    let dir = tempfile::tempdir().expect("a temporary directory");
+    let workspace = dir.path().join("workspace");
+    let outside = dir.path().join("outside");
+    std::fs::create_dir_all(&workspace).expect("the workspace is created");
+    std::fs::create_dir_all(&outside).expect("the outside directory is created");
+    std::fs::write(outside.join("secret.txt"), "classified").expect("the secret is written");
+
+    // One link to a directory outside the workspace, and one straight to the
+    // file. The first escapes through the middle of a path, the second through
+    // its final component.
+    std::os::unix::fs::symlink(&outside, workspace.join("link")).expect("the link is created");
+    std::os::unix::fs::symlink(outside.join("secret.txt"), workspace.join("direct"))
+        .expect("the link is created");
+
+    let body = tools::activity_body(workspace);
+    for path in ["link/secret.txt", "direct"] {
+        let call = ToolCall {
+            id: "toolu_test".to_string(),
+            name: tools::TOOL_READ_FILE.to_string(),
+            input: json!({ "path": path }),
+        };
+        let raw = body(serde_json::to_value(call).expect("the call encodes"))
+            .expect("a tool failure is a result, not an activity error");
+        let outcome: ToolOutcome = serde_json::from_value(raw).expect("the outcome decodes");
+        assert!(outcome.is_error, "`{path}` must not resolve");
+        assert!(
+            !outcome.output.contains("classified"),
+            "`{path}` leaked the file outside the workspace"
+        );
+    }
+
+    // A write through the escaping link must not land outside either.
+    let call = ToolCall {
+        id: "toolu_test".to_string(),
+        name: tools::TOOL_WRITE_FILE.to_string(),
+        input: json!({ "path": "link/planted.txt", "content": "planted" }),
+    };
+    let raw = body(serde_json::to_value(call).expect("the call encodes"))
+        .expect("a tool failure is a result, not an activity error");
+    let outcome: ToolOutcome = serde_json::from_value(raw).expect("the outcome decodes");
+    assert!(outcome.is_error, "the write must not resolve");
+    assert!(
+        !outside.join("planted.txt").exists(),
+        "the write escaped the workspace"
+    );
+}
+
+#[test]
+fn a_second_daemon_cannot_open_a_database_another_one_holds() {
+    let dir = tempfile::tempdir().expect("a temporary directory");
+    let db = dir.path().join("agentd.db");
+
+    let held = guard::acquire(&db).expect("the first daemon takes the lock");
+    let refused = guard::acquire(&db);
+    assert!(
+        refused.is_err(),
+        "a second daemon must not open a database another one holds"
+    );
+
+    // Releasing the lock is what a process exit does, so a restart succeeds.
+    drop(held);
+    assert!(
+        guard::acquire(&db).is_ok(),
+        "the lock must be free once its holder is gone"
+    );
 }

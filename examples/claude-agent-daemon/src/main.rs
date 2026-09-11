@@ -25,6 +25,7 @@
 
 mod claude;
 mod daemon;
+mod guard;
 mod inspect;
 mod protocol;
 mod session;

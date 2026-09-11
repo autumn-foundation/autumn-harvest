@@ -24,6 +24,7 @@ use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::{mpsc, oneshot};
 
 use crate::claude::{self, ModelConfig};
+use crate::guard;
 use crate::inspect::{self, ExecutionRow};
 use crate::protocol::{Request, Response, SessionView};
 use crate::session::{
@@ -63,6 +64,12 @@ pub async fn serve(options: Options) -> Result<(), String> {
         )
     })?;
 
+    // Take the per-database lock FIRST. The open below reclaims every task left
+    // `RUNNING` by a dead process. A second daemon opening the same file would
+    // reclaim a LIVE task, and its activity would run twice. The lock lives as
+    // long as this call, and the kernel releases it if the process dies.
+    let lock = guard::acquire(&options.db)?;
+
     let model = ModelConfig::new(options.api_key, options.model, options.max_tokens)?;
     let live = model.is_live();
 
@@ -84,6 +91,7 @@ pub async fn serve(options: Options) -> Result<(), String> {
 
     tracing::info!(
         db = %options.db.display(),
+        lock = %lock.path().display(),
         socket = %options.socket.display(),
         workspace = %options.workspace.display(),
         model = if live { "claude api" } else { "offline stub" },

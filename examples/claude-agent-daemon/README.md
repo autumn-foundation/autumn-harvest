@@ -105,6 +105,11 @@ Flags: `--db` (default `agentd.db`), `--socket` (default `agentd.sock`),
 `--workspace`, `--model`, `--max-tokens`, `--tick-ms`. Each also reads an
 `AGENTD_*` environment variable.
 
+A finished session reports the model's own stop reason, so an incomplete run
+never reads as a clean one: `end_turn` is a finished answer, `max_tokens` means
+the turn hit the output cap and the answer is cut short (raise `--max-tokens`),
+and `refusal` means a classifier declined the request.
+
 ## How it is put together
 
 ```text
@@ -135,12 +140,17 @@ Flags: `--db` (default `agentd.db`), `--socket` (default `agentd.sock`),
   stored and replayed **verbatim**, which is what keeps thinking blocks valid
   across turns on the same model.
 - **[`src/tools.rs`](src/tools.rs)** — `list_files`, `read_file`, and
-  `write_file`, each confined to the workspace directory. `write_file` is the
-  one tool the workflow gates on approval.
+  `write_file`, each confined to the workspace directory. The confinement is
+  not only lexical: a symbolic link at the final component is refused, and the
+  deepest existing ancestor is resolved through every link and must stay under
+  the real workspace root. `write_file` is the one tool the workflow gates on
+  approval.
 - **[`src/daemon.rs`](src/daemon.rs)** — the socket, the drive tick, and the
   single-writer main loop.
 - **[`src/inspect.rs`](src/inspect.rs)** — a second, **read-only** connection
   for the listing the runtime does not expose.
+- **[`src/guard.rs`](src/guard.rs)** — the exclusive per-database lock that
+  keeps "one writer" true across processes.
 
 ## Tests
 
@@ -148,16 +158,20 @@ Flags: `--db` (default `agentd.db`), `--socket` (default `agentd.sock`),
 cargo test -p claude-agent-daemon
 ```
 
-Five tests, all offline: the happy path, a denied tool call, the restart proof,
-the workspace sandbox, and one end-to-end run through the daemon socket.
+Eight tests, all offline: the happy path, a denied tool call, the restart
+proof, the workspace sandbox (including two symlink escapes), a truncated turn,
+the single-writer lock, and one end-to-end run through the daemon socket.
 
 ## What this example does not do
 
 Honest limits, so nothing here reads as a promise:
 
-- **One writer.** The daemon owns the database file. A second `serve` against
-  the same file is refused while the first holds the socket, and two writers on
-  one file are outside the backend's contract. A fleet wants the Postgres core.
+- **One writer.** The daemon owns the database file, and holds an exclusive
+  `flock` on `<db>.lock` to prove it. The lock is taken **before** the database
+  is opened, because opening reclaims every task left `RUNNING` by a dead
+  process: a second daemon that opened the file first would reclaim a *live*
+  task and run its activity twice. The kernel releases the lock when the holder
+  dies, so a crash strands nothing. A fleet wants the Postgres core.
 - **The runtime is serialised.** A control command waits while a model call is
   in flight, because both need the runtime mutably. That is the single-writer
   model, made visible.

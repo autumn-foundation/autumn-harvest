@@ -15,6 +15,9 @@ autumn-harvest = { version = "0.6.0", path = "../../autumn-harvest", default-fea
 autumn-harvest-sqlite = { version = "0.6.0", path = "../../autumn-harvest-sqlite" }
 clap = { version = "4.5", features = ["derive", "env"] }
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+# `flock` for the per-database daemon lock. The kernel releases the lock when
+# the holder dies, so a crashed daemon strands nothing.
+rustix = { version = "1", features = ["fs"] }
 # A second, READ-ONLY connection for the inspector queries the runtime does not
 # expose. The version matches the one the backend links, so there is one SQLite.
 rusqlite = { workspace = true }

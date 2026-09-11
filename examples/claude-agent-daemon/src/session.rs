@@ -31,6 +31,9 @@ pub const WORKFLOW_NAME: &str = "agent_session";
 /// The `stop_reason` a safety classifier declines a request with.
 const STOP_REFUSAL: &str = "refusal";
 
+/// The `stop_reason` of a turn cut short by the output cap.
+const STOP_MAX_TOKENS: &str = "max_tokens";
+
 /// The instructions the model runs under. The value is part of every request,
 /// so a change to it alters the model input of later turns only.
 pub const SYSTEM_PROMPT: &str = "\
@@ -169,11 +172,20 @@ pub async fn agent_session(
             last_text = reply.text.clone();
         }
 
+        // A turn cut short by the output cap is not an answer. It ends the
+        // session under its own name, so incomplete work never reads as a clean
+        // finish. Its tool calls are dropped too: a truncated turn can carry a
+        // partial `tool_use` block, which is not safe to run.
+        if reply.stop_reason == STOP_MAX_TOKENS {
+            return Ok(report(&last_text, turn, tool_calls, STOP_MAX_TOKENS));
+        }
         if reply.stop_reason == STOP_REFUSAL {
             return Ok(report(&reply.text, turn, tool_calls, STOP_REFUSAL));
         }
         if reply.tool_calls.is_empty() {
-            return Ok(report(&last_text, turn, tool_calls, "end_turn"));
+            // Only a real `end_turn` reports success. Any other stop reason
+            // ends the session under its own name.
+            return Ok(report(&last_text, turn, tool_calls, &reply.stop_reason));
         }
 
         // Every tool_use block of one assistant turn must be answered in ONE
