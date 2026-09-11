@@ -60,11 +60,6 @@ LABEL_OPEN = re.compile(rf"(?<![\w-])label\b((?:{ATTR})*)\s*\{{")
 # with nothing, exactly like having no `for` at all.
 FOR_ATTR = re.compile(r'(?<![\w-])for\s*=\s*"([^"]+)"')
 
-# A labelable control anywhere inside the label's block, as a real element
-# (word boundary before the tag name, so `textinput_helper` or similar
-# never matches).
-CONTROL = re.compile(r"(?<![\w.-])(input|select|textarea)\b")
-
 # A labelable control's own opening tag, from the tag name to the `;` that
 # self-closes it (`input`) or the `{` that starts its block (`select`,
 # `textarea`) -- mirrors LABEL_OPEN's brace-based scan, but a control can
@@ -76,6 +71,57 @@ CONTROL_OPEN = re.compile(r"(?<![\w.-])(?:input|select|textarea)\b[^;{]*?[;{]")
 # pointing at one is never counted as resolved -- unverifiable is not the
 # same as verified.
 ID_ATTR = re.compile(r'(?<![\w-])id\s*=\s*"([^"]+)"')
+
+
+def strip_comments(src: str) -> str:
+    """Blank out `//` line comments (covers `///` and `//!` too, since both
+    start with `//`) and `/* … */` block comments, tracking string literals
+    so a comment marker inside a quoted value is left alone. Newlines are
+    preserved so every other regex's line numbers stay correct.
+
+    Without this, `label`/`input`/`select`/`textarea` appearing as *words*
+    in prose -- a code comment explaining a `<select>` two lines below it,
+    e.g. `ui.rs:3669`'s "This makes the select echo it back..." -- would
+    satisfy a bare word search exactly as well as the real element does
+    (Codex review, PR #1485). Stripping comments first, then requiring a
+    real element-opening shape (`control_ids`'s `CONTROL_OPEN`) rather than
+    a word search, closes that gap: prose can no longer stand in for
+    markup."""
+    out = []
+    i, n = 0, len(src)
+    in_string = False
+    while i < n:
+        ch = src[i]
+        if in_string:
+            out.append(ch)
+            if ch == "\\" and i + 1 < n:
+                out.append(src[i + 1])
+                i += 2
+                continue
+            if ch == '"':
+                in_string = False
+            i += 1
+            continue
+        if ch == '"':
+            in_string = True
+            out.append(ch)
+            i += 1
+            continue
+        if ch == "/" and src[i : i + 2] == "//":
+            end = src.find("\n", i)
+            end = n if end == -1 else end
+            out.append(" " * (end - i))
+            i = end
+            continue
+        if ch == "/" and src[i : i + 2] == "/*":
+            close = src.find("*/", i + 2)
+            end = n if close == -1 else close + 2
+            out.extend("\n" if c == "\n" else " " for c in src[i:end])
+            i = end
+            continue
+        out.append(ch)
+        i += 1
+    return "".join(out)
 
 
 def control_ids(src: str) -> set[str]:
@@ -138,7 +184,7 @@ def blank_style_block(src: str) -> str:
 
 
 def main():
-    src = blank_style_block(UI_RS.read_text())
+    src = strip_comments(blank_style_block(UI_RS.read_text()))
     ids = control_ids(src)
 
     sites = []
@@ -150,7 +196,7 @@ def main():
 
         for_match = FOR_ATTR.search(open_tag_attrs)
         has_for = bool(for_match) and for_match.group(1) in ids
-        has_control = bool(CONTROL.search(block_text))
+        has_control = bool(CONTROL_OPEN.search(block_text))
         sites.append((line_of(src, m.start()), has_for, has_control))
 
     sites.sort()
