@@ -149,3 +149,10 @@ created with the correct resolved `quota_key`.
 
 Three independent review agents (concurrency correctness, test coverage,
 comment style) found no other genuine defects in the shipped fix.
+
+The multi-spawn test's four lock acquisitions and four inserts left it
+occasionally over the file's usual 10s `wait_for_execution_state` bound
+under a busy test run, despite completing in ~5s in isolation. Gave it
+its own 30s poll loop instead, the same margin
+`wait_for_execution_state_with_timeout` documents for exactly this
+reason (that helper is private to `integration_e2e.rs`).
