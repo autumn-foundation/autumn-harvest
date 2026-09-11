@@ -187,6 +187,20 @@ jobs:
         # skipped ("command not found") and neither variable ends up set. See
         # scripts/check-no-powershell-env-syntax.sh.
         run: ./scripts/check-no-powershell-env-syntax.sh
+      - name: Check CHANGELOG connector migration version
+        # Guards a real, reproduced-live defect: CHANGELOG.md's [0.6.0]
+        # "Add broker event-source connectors" entry (issue #944) cited
+        # migration `20260719000000` for harvest_connector_dead_letters,
+        # but that version belongs to a different, already-shipped core
+        # migration (harvest_workflow_logs, issue #790, correctly cited two
+        # entries below in the same section). The connector migration's
+        # real on-disk version is `20260719900000`, deliberately bumped to
+        # avoid colliding with core under Diesel's single, source-blind
+        # __diesel_schema_migrations keyspace. docs/upgrading/0.6.0.md sends
+        # an upgrading operator straight to this CHANGELOG.md section to
+        # find 0.6.0's migrations. See
+        # scripts/check-changelog-connector-migration-version.sh.
+        run: ./scripts/check-changelog-connector-migration-version.sh
       - name: Check formatting
         run: cargo fmt --all -- --check
       - name: Clippy autumn-harvest
