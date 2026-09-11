@@ -5955,12 +5955,12 @@ fn redispatch_then_version<'a>(
     })
 }
 
-/// Issue #1262, end to end: the swallowed marker is a `version:gate` marker
-/// recording `1`, from the SAME failing cycle a redrive reopens. The
-/// reopened run must not read that stale value back. It must re-derive the
-/// version live, landing on `max` (`2`), exactly as the issue's "the
-/// reopened run replays from the last durable boundary and re-emits its
-/// own markers" describes.
+/// Issue #1262, end to end. The swallowed marker is a `version:gate`
+/// marker recording `1`, from the same failing cycle a redrive reopens.
+/// The reopened run must not read that stale value back. It must
+/// re-derive the version live and land on `max` (`2`). This matches the
+/// issue's own description: the reopened run replays from the last
+/// durable boundary and re-emits its own markers.
 #[tokio::test]
 async fn a_redriven_run_re_derives_a_version_gate_past_the_swallowed_marker() {
     let child_id = ExecutionId::new();

@@ -755,15 +755,15 @@ impl HistoryMatcher {
         // every cursor-based scan (issue #383). They carry no workflow command,
         // so settling them up front keeps the matcher's scan loops unchanged.
         //
-        // Post-terminal bookkeeping (a workflow-level retry's
-        // `WorkflowRetryScheduled` (#523), a parent-close cascade's
-        // `ChildWorkflowCascadeApplied` (#347)) gets the same treatment for the
-        // same reason (issue #1262): it has no workflow-command counterpart and
-        // the workflow function never consumes it, so it is always transparent,
-        // not only while searching for a redrive's superseded terminal. Left
-        // opaque, a retried-then-redriven run's cursor gets stuck on the
-        // bookkeeping event itself, before it ever reaches the marker or
-        // dispatch behind it.
+        // Post-terminal bookkeeping gets the same treatment, for the same
+        // reason (issue #1262): a workflow-level retry's
+        // `WorkflowRetryScheduled` (#523), and a parent-close cascade's
+        // `ChildWorkflowCascadeApplied` (#347), carry no workflow command.
+        // The workflow function never consumes either. Both are always
+        // transparent, not only while searching for a redrive's
+        // superseded terminal. Left opaque, a retried-then-redriven run's
+        // cursor gets stuck on the bookkeeping event itself, before it
+        // ever reaches the marker or dispatch behind it.
         let mut transparent_events: HashSet<usize> = events
             .iter()
             .enumerate()
@@ -788,10 +788,10 @@ impl HistoryMatcher {
             if Self::is_redrive_lifecycle_event(event) {
                 last_redrive = Some(i);
                 transparent_events.insert(i);
-                // Scan backward to the nearest WorkflowFailed, skipping events
-                // already settled transparent — an interleaved pause pair, or
-                // post-terminal bookkeeping (already marked transparent above)
-                // appended AFTER the terminal. Without that skip a
+                // Scan backward to the nearest WorkflowFailed. Skip events
+                // already settled transparent: an interleaved pause pair, or
+                // post-terminal bookkeeping (already marked transparent
+                // above) appended AFTER the terminal. Without that skip a
                 // retried-then-redriven run would leave its superseded
                 // terminal opaque and diverge against it.
                 let mut j = i;
@@ -940,10 +940,9 @@ impl HistoryMatcher {
     /// message that happens to collide keeps its genuine terminal.
     ///
     /// See also [`Self::superseded_cycle_tail_indices`], called right after
-    /// this function in [`Self::new`]. It covers the same failing cycle's
-    /// other pre-terminal records — a marker, a side effect, a detached
-    /// spawn, a timer arm or cancel — that this function does not (issue
-    /// #1262).
+    /// this function in [`Self::new`] (issue #1262). It covers the same
+    /// failing cycle's other records: a marker, a side effect, a detached
+    /// spawn, a timer arm or cancel. This function does not cover those.
     fn abandoned_dispatch_indices(events: &[WorkflowEvent]) -> Vec<usize> {
         let mut abandoned_activities: HashSet<ActivityExecId> = HashSet::new();
         let mut abandoned_children: HashSet<ExecutionId> = HashSet::new();
@@ -1013,13 +1012,13 @@ impl HistoryMatcher {
     /// records (issue #1262).
     ///
     /// [`Self::abandoned_dispatch_indices`] already covers the abandoned
-    /// dispatch pairs. This function covers the rest: every other event
-    /// kind `worker::terminal_command_policy` classifies
-    /// `PreTerminalEvent` — a record a failing cycle writes plainly, at
-    /// its own command-emission position, with no synthetic terminal and
-    /// no completion to pair it with. Today that set is `MarkerRecorded`,
-    /// `SideEffectRecorded`, `ChildWorkflowSpawnedDetached`,
-    /// `TimerStarted`, and `TimerCancelled`.
+    /// dispatch pairs. This function covers the rest. `worker::terminal_command_policy`
+    /// classifies these as `PreTerminalEvent`: a record a failing cycle
+    /// writes plainly, at its own command-emission position. It has no
+    /// synthetic terminal and no completion to pair it with. Today that
+    /// set is `MarkerRecorded`, `SideEffectRecorded`,
+    /// `ChildWorkflowSpawnedDetached`, `TimerStarted`, and
+    /// `TimerCancelled`.
     ///
     /// A decision cycle's events are contiguous. No durable wait settles
     /// mid-cycle. A wait settles only between cycles. So this walks
@@ -9766,8 +9765,9 @@ mod tests {
     }
 
     /// Issue #1262: `SideEffectRecorded` needs the same transparency as
-    /// `MarkerRecorded` — both are durable, completion-free records a
-    /// failing cycle can write after the dispatch a redrive re-issues.
+    /// `MarkerRecorded`. Both are durable, completion-free records. A
+    /// failing cycle can write either after the dispatch a redrive
+    /// re-issues.
     #[test]
     fn a_side_effect_recorded_after_an_abandoned_dispatch_still_re_dispatches_live() {
         let child_id = ExecutionId::new();
@@ -10347,9 +10347,9 @@ mod tests {
     }
 
     /// Issue #1262: post-terminal bookkeeping (`WorkflowRetryScheduled`,
-    /// `ChildWorkflowCascadeApplied`) carries no workflow command and the
-    /// workflow function never consumes it, so it must be transparent on
-    /// its own, not only while a redrive searches for its superseded
+    /// `ChildWorkflowCascadeApplied`) carries no workflow command. The
+    /// workflow function never consumes it. It must be transparent on its
+    /// own, not only while a redrive searches for its superseded
     /// terminal. A bare retry-then-redrive history with nothing else in
     /// between must not diverge on the bookkeeping event itself.
     #[test]
@@ -10387,11 +10387,11 @@ mod tests {
         );
     }
 
-    /// Issue #1262: the exact combination that motivated the fix above — a
-    /// failing cycle records an abandoned dispatch and a trailing marker,
-    /// AND the sealed run also picked up a workflow-level retry record
-    /// before the operator redrove it. The bookkeeping event must not stop
-    /// the tail walk before it reaches the marker behind it.
+    /// Issue #1262: the exact combination that motivated the fix above. A
+    /// failing cycle records an abandoned dispatch and a trailing marker.
+    /// The sealed run also picks up a workflow-level retry record before
+    /// the operator redrives it. The bookkeeping event must not stop the
+    /// tail walk before it reaches the marker behind it.
     #[test]
     fn a_marker_behind_retry_bookkeeping_still_re_dispatches_live() {
         let child_id = ExecutionId::new();
