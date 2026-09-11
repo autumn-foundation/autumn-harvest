@@ -415,6 +415,14 @@ your whole application.
    list right away. Wait past that deployment's own indexing delay
    before you trust the list as complete.
 
+   A fixed wait cannot guarantee the list has converged. There is no
+   completion signal to check, and no guaranteed upper bound. Do not
+   treat it as a proof. Reconcile instead. If a follow-up for an id
+   classified harvest's finds no matching execution there, describe
+   that specific id directly against Temporal. A per-id describe uses
+   its own live lookup, not the eventually consistent list. Treat a
+   match there as Temporal's after all.
+
    Treat a follow-up against one of those captured ids as Temporal's,
    permanently, no matter what state that execution reached. Treat any
    other id of that type as harvest's. Only harvest's schedule can
@@ -426,6 +434,14 @@ your whole application.
    since only Temporal's schedule can start one once harvest is
    paused. The ids captured at the forward cutover keep the
    classification they already have.
+
+   Resuming the Temporal Schedule can also refire the interval harvest
+   just owned. Temporal's own `CatchupWindow` decides whether a paused
+   schedule's missed backlog fires on resume, the same primitive the
+   forward cutover already names. Set it to exclude the harvest-owned
+   interval, or advance the schedule's own recorded state past it,
+   before you resume. Otherwise the resume duplicates every side
+   effect harvest's own firings already committed.
 
    Reconcile a record that names an engine with no matching execution.
    Query that engine's own resolution for the id. A miss there means

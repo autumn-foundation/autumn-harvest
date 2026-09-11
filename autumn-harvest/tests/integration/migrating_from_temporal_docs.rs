@@ -307,6 +307,15 @@ fn comparison_page_links_back_to_the_migration_guide() {
 /// `WorkflowSchedule` and its create request take no such anchor.
 /// `Utc::now()` at the real insert sets the phase instead, later still
 /// once request and database latency are added in.
+///
+/// A fourteenth review found two more gaps, both past the point where
+/// the last two fixes stopped. Waiting out an indexing delay is a
+/// guess, not a guarantee: nothing confirms the wait was long enough.
+/// A miss still needs a fallback, a direct per-id describe against
+/// Temporal instead of the list. Resuming the Temporal Schedule on
+/// rollback can also refire the interval harvest already covered.
+/// `CatchupWindow` does this, unless that backlog is excluded or the
+/// schedule's own state is advanced past it first.
 #[test]
 fn dual_run_playbook_covers_schedule_driven_cutover() {
     let guide = read_doc(GUIDE_PATH);
@@ -385,6 +394,24 @@ fn dual_run_playbook_covers_schedule_driven_cutover() {
          rollback resumes the Temporal Schedule, and every id fired after that point must \
          resolve to Temporal even though it postdates the forward-cutover snapshot \
          (issue #1219, PR #1473 Codex P1)"
+    );
+    assert!(
+        playbook.contains("A fixed wait cannot guarantee the list has converged")
+            && playbook.contains("describe that specific id directly against Temporal"),
+        "the playbook must not treat a fixed wait as proof that Temporal's visibility list has \
+         converged -- it must reconcile a follow-up for an id classified harvest's by \
+         describing that id directly against Temporal, which uses a live per-id lookup rather \
+         than the eventually consistent list (issue #1219, PR #1473 Codex P1)"
+    );
+    assert!(
+        playbook.contains(
+            "Resuming the Temporal Schedule can also refire the interval harvest \
+             just owned"
+        ) && playbook.contains("CatchupWindow"),
+        "the playbook must warn that resuming the Temporal Schedule on rollback can refire the \
+         interval harvest already owned via Temporal's own CatchupWindow, duplicating side \
+         effects, unless the reader excludes that interval or advances the schedule's state \
+         past it first (issue #1219, PR #1473 Codex P1)"
     );
 }
 
