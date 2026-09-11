@@ -1052,6 +1052,71 @@ fn a_turn_whose_tool_calls_share_an_id_is_refused() {
 }
 
 #[test]
+fn a_write_flushes_every_directory_it_creates() {
+    let dir = tempfile::tempdir().expect("a temporary directory");
+    let workspace = dir.path().to_path_buf();
+    let target = workspace.join("notes/day/1/log.md");
+
+    // The write creates three directories. Each is named by an entry in its own
+    // parent, so each parent has to be flushed.
+    let created = tools::create_parents(target.parent().expect("the target has a parent"))
+        .expect("the parents are created");
+    assert_eq!(
+        created,
+        vec![
+            workspace.join("notes"),
+            workspace.join("notes/day"),
+            workspace.join("notes/day/1"),
+        ],
+        "the list must name every directory the write created, shallowest first"
+    );
+    assert_eq!(
+        tools::directories_to_flush(&target, &created),
+        vec![
+            workspace.join("notes/day/1"),
+            workspace.join("notes/day"),
+            workspace.join("notes"),
+            workspace.clone(),
+        ],
+        "every directory that gained an entry must be flushed, deepest first"
+    );
+
+    // A second write into the same place creates nothing, so only the target's
+    // own parent gained an entry.
+    let again = tools::create_parents(target.parent().expect("the target has a parent"))
+        .expect("the parents already exist");
+    assert!(
+        again.is_empty(),
+        "a directory that already exists was not created here: {again:?}"
+    );
+    assert_eq!(
+        tools::directories_to_flush(&target, &again),
+        vec![workspace.join("notes/day/1")],
+        "an unchanged directory must not be flushed"
+    );
+
+    // The real path writes the nested file, and lands the content.
+    let body = tools::activity_body(workspace.clone());
+    let raw = body(tool_request(
+        &workspace,
+        tools::TOOL_WRITE_FILE,
+        json!({ "path": "deep/er/still/notes.md", "content": "hello" }),
+    ))
+    .expect("a tool failure is a result, not an activity error");
+    let outcome: ToolOutcome = serde_json::from_value(raw).expect("the outcome decodes");
+    assert!(
+        !outcome.is_error,
+        "the nested write must succeed: {}",
+        outcome.output
+    );
+    assert_eq!(
+        std::fs::read_to_string(workspace.join("deep/er/still/notes.md"))
+            .expect("the nested file exists"),
+        "hello"
+    );
+}
+
+#[test]
 fn a_write_keeps_the_mode_of_the_file_it_replaces() {
     use std::os::unix::fs::PermissionsExt;
 

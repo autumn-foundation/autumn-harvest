@@ -192,8 +192,8 @@ is ever approved sight unseen.
   deepest existing ancestor is resolved through every link and must stay under
   the real workspace root. The 64 KiB read cap is checked before the file is
   allocated, so one huge file cannot take the daemon down. A write lands
-  atomically, through a scratch file renamed over the target, with both the
-  file and the directory entry flushed, so an approved file is never left
+  atomically, through a scratch file renamed over the target, with the file and
+  every directory the write created flushed, so an approved file is never left
   half-written and the replacement survives a host crash. It keeps the mode of
   the file it replaces — a content change is not a permission change. A file the agent
   creates starts `0600`. `write_file` is the one tool the workflow gates on
@@ -268,6 +268,14 @@ Honest limits, so nothing here reads as a promise:
   `openat`-based traversal, which is more machinery than an example should
   carry. The model is the untrusted party here, and it cannot win that race;
   another process running as you already can do worse directly.
+- **A session is bound to its workspace path, not to the directory object.**
+  The path is recorded at submit time. A daemon serving a different one refuses
+  the call. The check cannot see a directory deleted and recreated at the same
+  path between an approval and the write. Binding to the inode instead would
+  refuse every legitimate recreation: a fresh clone, a restore, a rebuilt
+  container. That turns a resumable session into a dead one. It would also miss
+  the simpler substitution, where the contents change and the inode does not.
+  The path is the honest guarantee here.
 - **Startup paths are not race-free against a local attacker.** The daemon
   locks the database and then opens it by path, and it reclaims a stale socket
   by checking it and then replacing it. A local process racing either sequence

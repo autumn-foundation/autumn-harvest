@@ -338,10 +338,11 @@ fn write_file(workspace: &Path, relative: &str, content: &str) -> Result<String,
         return Err(format!("`{relative}` is not an ordinary file"));
     }
 
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)
-            .map_err(|e| format!("cannot create the parent of `{relative}`: {e}"))?;
-    }
+    let created = match path.parent() {
+        Some(parent) => create_parents(parent)
+            .map_err(|e| format!("cannot create the parent of `{relative}`: {e}"))?,
+        None => Vec::new(),
+    };
 
     // Write through a temporary file beside the target, then rename over it. A
     // write that fails part way, on a full disk or a quota, would otherwise
@@ -358,13 +359,66 @@ fn write_file(workspace: &Path, relative: &str, content: &str) -> Result<String,
     });
 
     let (temporary, file) = create_scratch(&path)?;
-    let outcome = write_through(file, &temporary, &path, content, mode);
+    let outcome = write_through(file, &temporary, &path, content, mode, &created);
     if outcome.is_err() {
         drop(std::fs::remove_file(&temporary));
     }
     outcome.map_err(|e| format!("cannot write `{relative}`: {e}"))?;
 
     Ok(format!("wrote {} bytes to `{relative}`", content.len()))
+}
+
+/// Create the missing parent directories of the target, shallowest first.
+///
+/// The return value is the directories this call created. Each one is named by
+/// an entry in its own parent, and that entry is durable only after the parent
+/// is flushed. `create_dir_all` does no flushing, so the caller needs the list.
+///
+/// A directory another process creates first is not in the list. That process
+/// owns the flush of its own entry.
+pub fn create_parents(parent: &Path) -> Result<Vec<PathBuf>, std::io::Error> {
+    let mut missing = Vec::new();
+    let mut cursor = Some(parent);
+    while let Some(directory) = cursor {
+        if directory.symlink_metadata().is_ok() {
+            break;
+        }
+        missing.push(directory.to_path_buf());
+        cursor = directory.parent();
+    }
+    missing.reverse();
+
+    let mut created = Vec::new();
+    for directory in missing {
+        match std::fs::create_dir(&directory) {
+            Ok(()) => created.push(directory),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(created)
+}
+
+/// The directories a finished write must flush, deepest first.
+///
+/// One entry changed in each of them: the target's own entry in its parent, and
+/// one entry for every directory the write created. A directory that gained no
+/// entry is not in the list, and no directory is in it twice.
+pub fn directories_to_flush(target: &Path, created: &[PathBuf]) -> Vec<PathBuf> {
+    let mut flush: Vec<PathBuf> = Vec::new();
+    let mut push = |directory: Option<&Path>| {
+        if let Some(directory) = directory
+            && !flush.iter().any(|seen| seen == directory)
+        {
+            flush.push(directory.to_path_buf());
+        }
+    };
+
+    push(target.parent());
+    for directory in created.iter().rev() {
+        push(directory.parent());
+    }
+    flush
 }
 
 /// Create a scratch file beside the target, and return it with its path.
@@ -416,6 +470,7 @@ fn write_through(
     target: &Path,
     content: &str,
     mode: u32,
+    created: &[PathBuf],
 ) -> Result<(), std::io::Error> {
     use std::io::Write;
 
@@ -437,8 +492,12 @@ fn write_through(
     // this, a host crash can restore the old target, or lose a new one. The
     // history meanwhile records the write as done and never re-runs it.
     // Syncing the file alone does not cover the entry that names it.
-    if let Some(parent) = target.parent() {
-        std::fs::File::open(parent)?.sync_all()?;
+    // A new directory needs the same treatment. A write to `a/b/notes.md` in an
+    // empty workspace creates two directories and the file. Flushing only the
+    // file's own parent leaves `b` missing from `a` after a crash, and the
+    // flushed file goes with it.
+    for directory in directories_to_flush(target, created) {
+        std::fs::File::open(&directory)?.sync_all()?;
     }
 
     Ok(())
