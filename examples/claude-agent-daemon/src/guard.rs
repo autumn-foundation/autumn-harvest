@@ -23,7 +23,7 @@
 //! which is a separate domain, so this lock never contends with the engine.
 
 use std::fs::{File, OpenOptions};
-use std::os::unix::fs::OpenOptionsExt;
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::Path;
 
 use rustix::fs::{FlockOperation, Mode, flock};
@@ -66,6 +66,27 @@ pub fn acquire(db: &Path) -> Result<DaemonLock, String> {
         .mode(PRIVATE_MODE)
         .open(db)
         .map_err(|e| format!("cannot open {}: {e}", db.display()))?;
+
+    // A hard-linked database has no single identity, and `SQLite` cannot work
+    // with that. It derives the `-wal` name from the PATH, so opening
+    // `alias.db` reads `alias.db-wal` and never sees what `real.db-wal` holds.
+    // After an unclean exit the committed sessions in the original write-ahead
+    // log become invisible, and the daemon reports an empty database. A
+    // symbolic link is fine, because `SQLite` resolves it and reaches the same
+    // sidecars. The lock below cannot help here: it makes the two names share
+    // one lock, not one write-ahead log.
+    let links = file
+        .metadata()
+        .map_err(|e| format!("cannot inspect {}: {e}", db.display()))?
+        .nlink();
+    if links > 1 {
+        return Err(format!(
+            "{} has {links} hard links. `SQLite` derives its write-ahead log \
+             from the path, so each name would read a different log and lose \
+             the other's committed sessions. Open it by one name only.",
+            db.display()
+        ));
+    }
 
     // Non-blocking, so a second daemon fails at once with a clear message
     // rather than hanging on a lock it will never get.

@@ -182,8 +182,10 @@ is ever approved sight unseen.
   the real workspace root. The 64 KiB read cap is checked before the file is
   allocated, so one huge file cannot take the daemon down. A write lands
   atomically, through a scratch file renamed over the target, so an approved
-  file is never left half-written. `write_file` is the one tool the workflow
-  gates on approval.
+  file is never left half-written, and it keeps the mode of the file it
+  replaces — a content change is not a permission change. A file the agent
+  creates starts `0600`. `write_file` is the one tool the workflow gates on
+  approval.
 - **[`src/daemon.rs`](src/daemon.rs)** — the socket, the drive tick, and the
   single-writer main loop.
 - **[`src/inspect.rs`](src/inspect.rs)** — a second, **read-only** connection
@@ -197,14 +199,15 @@ is ever approved sight unseen.
 cargo test -p claude-agent-daemon
 ```
 
-Twenty-two tests, all offline: the happy path, a denied tool call, the restart
+Twenty-six tests, all offline: the happy path, a denied tool call, the restart
 proof, the workspace sandbox (two symlink escapes, the read cap, and a named
 pipe), an atomic write, a truncated turn, a turn that says nothing, a stale
 approval, the full approval view, a session bound to another workspace and to
 another model, the single-writer lock through every alias, the database and
-socket permissions, the drive interval, which API failures may be retried, a
-billed response that is not a message, and one end-to-end run through the
-daemon socket.
+socket permissions, a refused hard-linked database, a turn whose tool calls
+share an id, a write that keeps its target's mode, the socket cleanup, the
+drive interval, which API failures may be retried, a billed response that is
+not a message, and one end-to-end run through the daemon socket.
 
 ## What this example does not do
 
@@ -212,9 +215,11 @@ Honest limits, so nothing here reads as a promise:
 
 - **One writer.** The daemon owns the database file, and holds an exclusive
   `flock` on that file to prove it. The lock is on the file itself rather than
-  on a name derived from its path, so every alias — a symbolic link, a hard
-  link, a different spelling — reaches the same lock. It is taken **before** the
-  database
+  on a name derived from its path, so a symbolic link or a different spelling
+  reaches the same lock. A **hard-linked** database is refused outright:
+  `SQLite` derives its write-ahead log from the path, so two names would read
+  two different logs and lose each other's committed sessions. The lock is
+  taken **before** the database
   is opened, because opening reclaims every task left `RUNNING` by a dead
   process: a second daemon that opened the file first would reclaim a *live*
   task and run its activity twice. The kernel releases the lock when the holder

@@ -173,6 +173,16 @@ fn call_api(
     }
 
     let reply = parse_reply(&payload);
+    // An approval is addressed by tool-use id, so a blank or repeated id would
+    // let one decision release a call the operator never saw. The API mints
+    // unique ids; a response that does not is malformed, and it is refused
+    // before it can reach the gate.
+    if !has_addressable_calls(&reply) {
+        return Err(body_failure(
+            status,
+            "its tool calls carried a blank or repeated id",
+        ));
+    }
     // A finished turn that says nothing and calls nothing is not an answer. A
     // malformed block, or an empty `content`, reaches this point as a clean
     // `end_turn` with no text. That would report a billed non-answer as a
@@ -249,6 +259,19 @@ fn http_failure(status: reqwest::StatusCode, body: &str) -> String {
 pub fn is_message(payload: &Value) -> bool {
     payload.get("content").is_some_and(Value::is_array)
         && payload.get("stop_reason").is_some_and(Value::is_string)
+}
+
+/// Can every tool call in this reply be addressed on its own?
+///
+/// The approval gate names a call by its tool-use id, so each id must be
+/// present and unique within the turn. Without that, one approval could
+/// release a different call with the same id and a payload nobody read.
+pub fn has_addressable_calls(reply: &TurnReply) -> bool {
+    let mut seen = std::collections::HashSet::with_capacity(reply.tool_calls.len());
+    reply
+        .tool_calls
+        .iter()
+        .all(|call| !call.id.is_empty() && seen.insert(call.id.as_str()))
 }
 
 /// Can this reply move the session forward?

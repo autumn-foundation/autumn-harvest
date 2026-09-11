@@ -9,7 +9,7 @@
 //! the rest of the disk.
 
 use std::io::Read;
-use std::os::unix::fs::OpenOptionsExt;
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Component, Path, PathBuf};
 
 use serde_json::{Value, json};
@@ -29,6 +29,12 @@ pub const TOOL_WRITE_FILE: &str = "write_file";
 const MAX_FILE_BYTES: usize = 64 * 1024;
 /// The largest directory listing this toolbox returns.
 const MAX_ENTRIES: usize = 200;
+
+/// The mode a file this toolbox CREATES is given.
+///
+/// A file the agent brings into being starts private. An existing file keeps
+/// its own mode instead, because a content change is not a permission change.
+const NEW_FILE_MODE: u32 = 0o600;
 
 /// Does a call to this tool wait for human approval?
 pub fn needs_approval(tool_name: &str) -> bool {
@@ -343,7 +349,15 @@ fn write_file(workspace: &Path, relative: &str, content: &str) -> Result<String,
     let temporary = temporary_beside(&path)?;
     drop(std::fs::remove_file(&temporary));
 
-    let outcome = write_through(&temporary, &path, content);
+    // The rename replaces the target's inode, so the scratch file carries the
+    // mode the result must have. An existing target keeps its own mode. The
+    // operator approved a change of content. Making a private file
+    // world-readable, or dropping a script's execute bits, is not that.
+    let mode = std::fs::metadata(&path).map_or(NEW_FILE_MODE, |existing| {
+        existing.permissions().mode() & 0o7777
+    });
+
+    let outcome = write_through(&temporary, &path, content, mode);
     if outcome.is_err() {
         drop(std::fs::remove_file(&temporary));
     }
@@ -368,14 +382,22 @@ fn temporary_beside(path: &Path) -> Result<PathBuf, String> {
 }
 
 /// Fill the scratch file, flush it, and rename it over the target.
-fn write_through(temporary: &Path, target: &Path, content: &str) -> Result<(), std::io::Error> {
+fn write_through(
+    temporary: &Path,
+    target: &Path,
+    content: &str,
+    mode: u32,
+) -> Result<(), std::io::Error> {
     use std::io::Write;
 
     // `create_new` refuses to write through anything that already exists, and
-    // `O_NOFOLLOW` refuses a link, as everywhere else in this module.
+    // `O_NOFOLLOW` refuses a link, as everywhere else in this module. The mode
+    // is set at creation, so the file is never briefly more open than the
+    // target it replaces.
     let mut file = std::fs::OpenOptions::new()
         .write(true)
         .create_new(true)
+        .mode(mode)
         .custom_flags(libc_o_nofollow())
         .open(temporary)?;
     file.write_all(content.as_bytes())?;

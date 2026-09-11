@@ -535,26 +535,23 @@ async fn a_stale_approval_cannot_release_a_later_tool_call() {
 }
 
 #[test]
-fn the_daemon_lock_follows_the_database_through_every_alias() {
+fn the_daemon_lock_follows_the_database_through_a_symlink() {
     let dir = tempfile::tempdir().expect("a temporary directory");
     let real = dir.path().join("real.db");
     let symlinked = dir.path().join("current.db");
-    let hard_linked = dir.path().join("same.db");
     std::fs::write(&real, b"").expect("the database file is created");
     std::os::unix::fs::symlink(&real, &symlinked).expect("the symbolic link is created");
-    std::fs::hard_link(&real, &hard_linked).expect("the hard link is created");
 
-    // Every name for one file must take one lock, or two daemons write it. A
-    // hard link is the case a resolved PATHNAME cannot collapse: both names are
-    // canonical. The lock is held on the file itself, so both reach it.
+    // Two spellings of one file must take one lock, or two daemons write it.
+    // The lock is held on the file itself, so both names reach it. A hard link
+    // is refused outright instead — see
+    // `a_hard_linked_database_is_refused`, because `SQLite` cannot share a
+    // write-ahead log across two pathnames.
     let held = guard::acquire(&real).expect("the first daemon takes the lock");
-    for alias in [&symlinked, &hard_linked] {
-        assert!(
-            guard::acquire(alias).is_err(),
-            "{} must not take a second lock on a held database",
-            alias.display()
-        );
-    }
+    assert!(
+        guard::acquire(&symlinked).is_err(),
+        "an alias of a held database must not take a second lock"
+    );
 
     drop(held);
     assert!(
@@ -971,4 +968,156 @@ fn a_turn_that_says_nothing_is_not_an_answer() {
         claude::is_usable(&refused),
         "a refusal reports itself and must not be re-classified"
     );
+}
+
+#[test]
+fn a_hard_linked_database_is_refused() {
+    let dir = tempfile::tempdir().expect("a temporary directory");
+    let real = dir.path().join("real.db");
+    let alias = dir.path().join("alias.db");
+    std::fs::write(&real, b"").expect("the database file is created");
+    std::fs::hard_link(&real, &alias).expect("the hard link is created");
+
+    // `SQLite` derives its write-ahead log from the PATH. After an unclean
+    // exit, opening `alias.db` reads `alias.db-wal` and never sees what
+    // `real.db-wal` holds, so committed sessions become invisible.
+    for name in [&real, &alias] {
+        let refused = guard::acquire(name);
+        let message = refused.err().unwrap_or_else(|| {
+            panic!(
+                "{} must be refused while it is multiply linked",
+                name.display()
+            )
+        });
+        assert!(
+            message.contains("hard links"),
+            "unexpected message: {message}"
+        );
+    }
+
+    // One name again, and it opens.
+    std::fs::remove_file(&alias).expect("the link is removed");
+    assert!(
+        guard::acquire(&real).is_ok(),
+        "a single-named database must open"
+    );
+}
+
+#[test]
+fn a_turn_whose_tool_calls_share_an_id_is_refused() {
+    let call = |id: &str| ToolCall {
+        id: id.to_string(),
+        name: tools::TOOL_WRITE_FILE.to_string(),
+        input: json!({ "path": "notes.md", "content": "x" }),
+    };
+    let reply = |calls: Vec<ToolCall>| TurnReply {
+        content: json!([]),
+        stop_reason: "tool_use".to_string(),
+        text: String::new(),
+        tool_calls: calls,
+    };
+
+    // An approval is addressed by id, so a repeated one would let a single
+    // decision release a call the operator never read.
+    assert!(
+        !claude::has_addressable_calls(&reply(vec![call("toolu_a"), call("toolu_a")])),
+        "a repeated id must be refused"
+    );
+    assert!(
+        !claude::has_addressable_calls(&reply(vec![call("")])),
+        "a blank id must be refused"
+    );
+    assert!(
+        claude::has_addressable_calls(&reply(vec![call("toolu_a"), call("toolu_b")])),
+        "distinct ids are addressable"
+    );
+    assert!(
+        claude::has_addressable_calls(&reply(Vec::new())),
+        "a turn with no tool calls has nothing to address"
+    );
+}
+
+#[test]
+fn a_write_keeps_the_mode_of_the_file_it_replaces() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = tempfile::tempdir().expect("a temporary directory");
+    let workspace = dir.path().to_path_buf();
+    let secret = workspace.join("secret.txt");
+    std::fs::write(&secret, "old").expect("the fixture is written");
+    std::fs::set_permissions(&secret, std::fs::Permissions::from_mode(0o600))
+        .expect("the fixture is made private");
+
+    let body = tools::activity_body(workspace.clone());
+    let raw = body(tool_request(
+        &workspace,
+        tools::TOOL_WRITE_FILE,
+        json!({ "path": "secret.txt", "content": "new" }),
+    ))
+    .expect("a tool failure is a result, not an activity error");
+    let outcome: ToolOutcome = serde_json::from_value(raw).expect("the outcome decodes");
+    assert!(
+        !outcome.is_error,
+        "the write must succeed: {}",
+        outcome.output
+    );
+
+    // A content change is not a permission change.
+    let mode = std::fs::metadata(&secret)
+        .expect("the target exists")
+        .permissions()
+        .mode()
+        & 0o777;
+    assert_eq!(
+        mode, 0o600,
+        "the target's mode must survive the replacement"
+    );
+
+    // A file the agent brings into being starts private.
+    let raw = body(tool_request(
+        &workspace,
+        tools::TOOL_WRITE_FILE,
+        json!({ "path": "fresh.txt", "content": "new" }),
+    ))
+    .expect("a tool failure is a result, not an activity error");
+    let outcome: ToolOutcome = serde_json::from_value(raw).expect("the outcome decodes");
+    assert!(
+        !outcome.is_error,
+        "the write must succeed: {}",
+        outcome.output
+    );
+    let mode = std::fs::metadata(workspace.join("fresh.txt"))
+        .expect("the new file exists")
+        .permissions()
+        .mode()
+        & 0o777;
+    assert_eq!(mode, 0o600, "a new file must be owner-only");
+}
+
+#[tokio::test]
+async fn the_socket_path_is_only_removed_while_it_is_still_ours() {
+    let dir = tempfile::tempdir().expect("a temporary directory");
+    let socket = dir.path().join("agentd.sock");
+
+    let listener = daemon::bind(&socket).await.expect("the socket binds");
+    let bound = daemon::socket_identity(&socket);
+    drop(listener);
+
+    // Something replaced the path while the daemon was running. The shutdown
+    // must not delete it: it could be another daemon's socket, or a file.
+    std::fs::remove_file(&socket).expect("the socket is removed");
+    std::fs::write(&socket, "someone else's file").expect("a replacement appears");
+    daemon::remove_own_socket(&socket, bound);
+    assert!(
+        socket.exists(),
+        "a replacement at the socket path must survive"
+    );
+
+    // Its own socket it does remove.
+    std::fs::remove_file(&socket).expect("the replacement is removed");
+    let listener = daemon::bind(&socket).await.expect("the socket binds again");
+    let bound = daemon::socket_identity(&socket);
+    drop(listener);
+    daemon::remove_own_socket(&socket, bound);
+    assert!(!socket.exists(), "its own socket must be cleaned up");
 }

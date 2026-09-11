@@ -233,29 +233,38 @@ async fn run(cli: Cli) -> Result<(), String> {
     }
 }
 
+/// Print one line, and end quietly when the reader has gone.
+///
+/// `println!` panics once stdout is closed, so `agentd history … | head` would
+/// end in a backtrace instead of a clean exit.
+fn line(text: &str) {
+    use std::io::Write;
+    drop(writeln!(std::io::stdout(), "{text}"));
+}
+
 /// Print one answer from the daemon.
 fn report(response: Response) -> Result<(), String> {
     match response {
         Response::Submitted { execution_id } => {
-            println!("{execution_id}");
-            println!("Watch it with: agentd status {execution_id}");
+            line(&execution_id);
+            line(&format!("Watch it with: agentd status {execution_id}"));
         }
         Response::Session { session } => print_session(&session),
         Response::Sessions { sessions } => {
             if sessions.is_empty() {
-                println!("no sessions yet");
+                line("no sessions yet");
             }
             for session in &sessions {
                 print_session(session);
-                println!();
+                line("");
             }
         }
         Response::History { events } => {
             for event in &events {
-                println!("{event}");
+                line(event);
             }
         }
-        Response::Ack { detail } => println!("{detail}"),
+        Response::Ack { detail } => line(&detail),
         Response::Error { message } => return Err(message),
     }
     Ok(())
@@ -263,23 +272,23 @@ fn report(response: Response) -> Result<(), String> {
 
 /// Print one session in a stable, greppable shape.
 fn print_session(view: &SessionView) {
-    println!("{}  {}", view.execution_id, view.state);
-    println!("  goal:    {}", view.goal);
+    line(&format!("{}  {}", view.execution_id, view.state));
+    line(&format!("  goal:    {}", view.goal));
     if let Some(blocked) = &view.blocked_on {
-        println!("  blocked: {blocked}");
+        line(&format!("  blocked: {blocked}"));
     }
     if let Some(pending) = &view.pending {
-        println!("  pending: {} ({})", pending.tool, pending.id);
-        println!("           {}", pending.input);
-        println!(
+        line(&format!("  pending: {} ({})", pending.tool, pending.id));
+        line(&format!("           {}", pending.input));
+        line(&format!(
             "  decide:  agentd approve {} {}   (or `deny`)",
             view.execution_id, pending.id
-        );
+        ));
     }
     if let Some(answer) = &view.answer {
-        println!("  answer:  {answer}");
+        line(&format!("  answer:  {answer}"));
     }
     if let Some(error) = &view.error {
-        println!("  error:   {error}");
+        line(&format!("  error:   {error}"));
     }
 }

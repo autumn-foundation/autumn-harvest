@@ -13,7 +13,7 @@
 //! Postgres core instead.
 
 use std::collections::HashMap;
-use std::os::unix::fs::FileTypeExt;
+use std::os::unix::fs::{FileTypeExt, MetadataExt};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -125,6 +125,9 @@ pub async fn serve(options: Options) -> Result<(), String> {
 
     let reader = inspect::open(&options.db)?;
     let listener = bind(&options.socket).await?;
+    // Remembered now, so the cleanup on the way out can tell whether the path
+    // still names this socket.
+    let bound = socket_identity(&options.socket);
     let (tx, mut rx) = mpsc::channel::<Job>(COMMAND_BACKLOG);
     tokio::spawn(accept_loop(listener, tx));
 
@@ -172,8 +175,44 @@ pub async fn serve(options: Options) -> Result<(), String> {
     }
 
     tracing::info!("agentd is stopping; in-flight sessions resume on the next start");
-    drop(std::fs::remove_file(&options.socket));
+    remove_own_socket(&options.socket, bound);
     Ok(())
+}
+
+/// The filesystem identity of the socket this daemon bound.
+pub type SocketIdentity = Option<(u64, u64)>;
+
+/// Read the identity of the entry at `socket`.
+pub fn socket_identity(socket: &Path) -> SocketIdentity {
+    std::fs::symlink_metadata(socket)
+        .ok()
+        .map(|meta| (meta.dev(), meta.ino()))
+}
+
+/// Remove the socket path, but only while it still names the bound socket.
+///
+/// The path can be replaced while the daemon runs, by cleanup tooling or by an
+/// operator. Removing whatever happens to be there on the way out would then
+/// delete another daemon's socket, or an unrelated file. The startup check
+/// cannot cover this: it ran before the replacement.
+///
+/// Both the type and the identity are checked. The type carries the weight
+/// here. An inode number is reused as soon as it is freed. A file created in
+/// place of the removed socket can therefore hold the same number. What
+/// remains is a
+/// replacement that is also a socket and reused that number. That is not worth
+/// more machinery than this.
+pub fn remove_own_socket(socket: &Path, bound: SocketIdentity) {
+    let still_ours = std::fs::symlink_metadata(socket)
+        .is_ok_and(|meta| meta.file_type().is_socket() && Some((meta.dev(), meta.ino())) == bound);
+    if bound.is_some() && still_ours {
+        drop(std::fs::remove_file(socket));
+    } else {
+        tracing::warn!(
+            socket = %socket.display(),
+            "the socket path no longer names this daemon's socket; leaving it alone",
+        );
+    }
 }
 
 /// Take the control socket, refusing to displace a live daemon.
