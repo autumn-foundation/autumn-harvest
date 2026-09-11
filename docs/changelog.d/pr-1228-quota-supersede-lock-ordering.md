@@ -290,3 +290,42 @@ supersede_ordering_tests.rs` (6/6, the new test included),
 (20/20), and `quota_enforcement_tests.rs` (35/39, the same known
 `quota_blocked_outbox_*` flake family). All green apart from that
 family.
+
+## Follow-up 4 — PR #1484 review: skip locked supersede rows, union child locks
+
+A fourth automated review round found two more P1 defects, one in each
+prior follow-up's own fix.
+
+**P1 — the new row lock could deadlock against a nested admission.** A
+concurrently completing incumbent can hold its own row lock while its
+terminal chokepoint starts a nested admission for the SAME quota key.
+That nested admission needs the SAME `lock_quota_key` this admission
+already holds, while the credit's row-lock scan would wait on the
+incumbent's row -- an ABBA cycle between a row lock and the quota
+advisory lock. Fixed: the scan now takes `FOR UPDATE OF e SKIP LOCKED`.
+An already-locked row is one already leaving `RUNNING`/`PAUSED`, so
+skipping it only undercounts the credit, never overcounts it -- the
+safe direction, the same one an unlocked new row already relies on.
+
+**P1 — detached and awaited child locks stayed in two separate sorted
+passes.** `create_detached_child_executions` and the awaited-child
+fan-out each pre-acquired their own `BTreeSet` of quota locks. Sorting
+within each phase does not prevent an ABBA cycle ACROSS the two phases:
+a parent with detached key B and awaited key A can race a peer with
+detached key A and awaited key B, each holding its own phase-one key
+while it waits on the other's phase-two key. Fixed: the key
+computation moved into a new `detached_child_quota_lock_keys` helper.
+`persist_all_started_child_workflows` and `persist_mixed_suspension_
+batch` -- the two call sites that spawn both detached and awaited
+children in one transaction -- now union both key sets and lock the
+combination in one sorted pass, before either insertion phase runs.
+`persist_terminal_outcome_commands`, which only ever spawns detached
+children, is unchanged.
+
+Re-ran all four suites above (`quota_supersede_ordering_tests.rs` 6/6,
+`quota_lock_ordering_tests.rs` 2/2, `concurrency_supersede_tests.rs`
+20/20, `quota_enforcement_tests.rs` 35/39, the same known flake family)
+against the corrected design. No new test covers the cross-phase
+detached/awaited race directly; the fix relies on manual verification
+of the lock-acquisition order plus the existing suites above staying
+green.
