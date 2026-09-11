@@ -1052,7 +1052,9 @@ async fn a_batch_pinned_to_a_key_blocks_its_retirement_through_a_double_rotation
     //
     // The pin closes step 3: retirement is refused for as long as the batch
     // holds it, by construction, not by timing.
-    use autumn_harvest::codec_rotation::{compare_and_swap_event, reencrypt_event_payload_fields_under};
+    use autumn_harvest::codec_rotation::{
+        compare_and_swap_event, reencrypt_event_payload_fields_under,
+    };
     use autumn_harvest::schema::harvest_events;
 
     let (url, _c) = setup_isolated_db().await;
