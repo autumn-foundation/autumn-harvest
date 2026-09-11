@@ -375,6 +375,17 @@ fn dual_run_playbook_covers_schedule_driven_cutover() {
 /// Applying the resolved-engine language to step 7's forward handoff also
 /// named the wrong engine for its final read. That execution never ran on
 /// harvest at all.
+///
+/// A later PR review found two more gaps in the persisted-record fix.
+/// Harvest's own schedule tick starts an execution the same way
+/// Temporal's schedule does. Neither has a flag decision point to write
+/// a record at. Route those by which schedule is active instead.
+///
+/// The record also only ever named the current owner, not every
+/// generation a reused id ever had. A follow-up against a superseded
+/// generation needs its own captured handle from when that generation
+/// was current. Issue #805 already expects this same discipline of a
+/// stale exec id.
 #[test]
 fn dual_run_playbook_covers_follow_up_engine_routing() {
     let guide = read_doc(GUIDE_PATH);
@@ -407,8 +418,24 @@ fn dual_run_playbook_covers_follow_up_engine_routing() {
     );
     assert!(
         playbook.contains("Treat a missing record as Temporal"),
-        "the playbook must resolve a not-yet-ported or schedule-driven execution's missing \
-         record to Temporal (issue #1219)"
+        "the playbook must resolve a not-yet-ported execution's missing record to Temporal \
+         (issue #1219)"
+    );
+    assert!(
+        playbook.contains("needs a different default once its harvest schedule is unpaused")
+            && playbook.contains("which schedule is currently active for that type"),
+        "the playbook must not apply the missing-record default to a schedule-driven type: \
+         harvest's own scheduler starts its executions with no flag decision point to write \
+         a record at either, so it must route by which schedule is active instead \
+         (issue #1219, PR #1473 Codex P1)"
+    );
+    assert!(
+        playbook.contains("This record names the current owner only")
+            && playbook.contains("needs its own engine and execution id"),
+        "the playbook must scope the routing record to the current owner only, matching \
+         harvest's own by-id resolution (issue #805) -- a follow-up against a superseded \
+         generation needs its own captured handle, not a lookup through this record \
+         (issue #1219, PR #1473 Codex P1)"
     );
     assert!(
         playbook.contains("/workflows/by-id/{workflow_name}/{workflow_id}"),
