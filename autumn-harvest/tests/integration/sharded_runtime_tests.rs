@@ -735,6 +735,98 @@ async fn shutdown_completes_when_a_shard_pool_is_permanently_exhausted() {
     }
 }
 
+// ── issue #1212 ──────────────────────────────────────────────────────────
+
+/// **Issue #1212, Finding 1.** `build_shard_listeners` must bound each
+/// per-shard `QueueListener::connect`. `run_poll_loop_multi` starts only
+/// after this loop finishes. A stalled connect on one shard used to strand
+/// every shard, not only the one with the bad notification URL.
+///
+/// The black-hole listener below accepts the TCP connection but never sends
+/// the Postgres startup response, so the handshake never completes. This is
+/// the same shape as an unreachable-but-not-refusing host, without any real
+/// network dependency.
+///
+/// This test fails against the pre-fix code: shard 0's stalled connect
+/// parks `build_shard_listeners` forever, so shard 1 is never drained
+/// within the test budget. It passes once the connect is wrapped in a
+/// `tokio::time::timeout`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn build_shard_listeners_bounded_by_a_stalled_handshake() {
+    let (urls, _container) = setup_shard_databases(&[0, 1]).await;
+    let sharded = build_sharded_pool(&urls);
+    let metrics = Arc::new(ShardMetrics::default());
+
+    // Accept the connection but never write a byte. The client-side
+    // Postgres handshake then waits forever for a response.
+    let black_hole = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind black-hole listener");
+    let black_hole_addr = black_hole.local_addr().expect("black hole addr");
+    tokio::spawn(async move {
+        while let Ok((stream, _)) = black_hole.accept().await {
+            // Keep the socket open. Do not read or write it.
+            // Forgetting it, instead of dropping it, is deliberate.
+            // A drop sends a FIN. That lets the client's handshake fail
+            // fast. This test needs the handshake to hang instead.
+            std::mem::forget(stream);
+        }
+    });
+
+    let worker = build_worker_with(
+        &sharded,
+        vec![ShardId::new(0), ShardId::new(1)],
+        Arc::clone(&metrics),
+        "w-listener-hang",
+        |cfg| {
+            cfg.shard_notification_database_urls = vec![(
+                ShardId::new(0),
+                format!("postgres://user:pass@{black_hole_addr}/db"),
+            )];
+        },
+    );
+
+    let default_pool = sharded
+        .exact_pool_for(ShardId::new(1))
+        .expect("shard 1 pool")
+        .clone();
+    let runner = Arc::clone(&worker);
+    let handle = tokio::spawn(async move {
+        runner.run(&default_pool).await;
+    });
+
+    // A workflow on shard 1 completing proves the poll loop was reached,
+    // which requires `build_shard_listeners` to have returned.
+    let exec_id = ExecutionId::new_for_shard(ShardId::new(1));
+    {
+        let pool = sharded.exact_pool_for(ShardId::new(1)).expect("shard pool");
+        let mut conn = pool.get().await.expect("shard conn");
+        start_or_load_workflow_execution(
+            &mut conn,
+            start_params(exec_id, "shard_probe", "listener-hang-peer"),
+            None,
+        )
+        .await
+        .expect("start workflow on healthy shard");
+    }
+
+    assert!(
+        wait_for_state(
+            &urls[&ShardId::new(1)],
+            exec_id,
+            "COMPLETED",
+            Duration::from_secs(30),
+        )
+        .await,
+        "shard 1 was never drained -- a stalled handshake on shard 0's \
+         notification URL must not park build_shard_listeners forever \
+         (issue #1212 Finding 1)",
+    );
+
+    worker.shutdown();
+    let _ = tokio::time::timeout(Duration::from_secs(10), handle).await;
+}
+
 // ── AC5 ───────────────────────────────────────────────────────────────────
 
 /// **AC5.** A deep backlog on one assigned shard must not starve dispatch on
