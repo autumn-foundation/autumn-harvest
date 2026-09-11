@@ -10649,12 +10649,14 @@ fn cross_shard_child_spec(
         owner: defaults.owner.map(str::to_string),
         runbook_url: defaults.runbook_url.map(str::to_string),
         severity: defaults.severity.map(str::to_string),
-        // Durations only, never absolute deadlines: the relay turns them into
-        // absolute deadlines when it actually creates the child, so a relay
-        // that runs late cannot hand the child an already-expired deadline
-        // (issue #956 Codex round 4; extended to the chain deadline by issue
-        // #1263 item 7 — a child is its own fresh chain origin, issue #617,
-        // never an inherited one, so there is no absolute value to preserve).
+        // Durations only, never absolute deadlines (issue #956). The relay
+        // turns them into absolute deadlines when it actually creates the
+        // child. A relay that runs late cannot then hand the child an
+        // already-expired deadline.
+        //
+        // Issue #1263 item 7 extended this to the chain deadline too. A
+        // child is its own fresh chain origin (issue #617), never an
+        // inherited one, so there is no absolute value to preserve.
         sla_secs: defaults.sla.map(|d| d.num_seconds()),
         // A detached child resolves NO execution timeout at spawn on the local
         // path — and therefore no chain cap either — so a remotely placed one
@@ -10711,11 +10713,12 @@ fn placement_router() -> Option<crate::shard::ShardRouter> {
 }
 
 /// The router a persist-time preflight should validate a placement against
-/// (issue #1263 items 11/15/17). Returns `resolved`, when the
-/// [`WorkflowContext`] that decided this placement had an EXPLICIT router
-/// installed via `with_shard_router` — tests and embedders running more than
-/// one topology in a single process. Else the process-global one, asked
-/// fresh.
+/// (issue #1263 items 11/15/17).
+///
+/// Returns `resolved` when the [`WorkflowContext`] that decided this
+/// placement had an EXPLICIT router installed via `with_shard_router` —
+/// tests and embedders running more than one topology in a single
+/// process. Else the process-global one, asked fresh.
 ///
 /// Without this, the preflight always asked the global router. Even when a
 /// context-local one — potentially a different topology, with different

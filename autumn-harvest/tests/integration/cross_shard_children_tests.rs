@@ -528,19 +528,21 @@ async fn a_distributed_fan_out_places_children_on_other_shards() {
 }
 
 /// **Regression (issue #1263 item 7).** A cross-shard child's CHAIN deadline
-/// must be anchored at its own creation on the target shard, exactly like its
-/// `deadline_at`/`sla_deadline_at` siblings — never carried as a stale
+/// must be anchored at its own creation on the target shard, exactly like
+/// its `deadline_at`/`sla_deadline_at` siblings. Never carried as a stale
 /// absolute timestamp computed back when the parent decided to spawn it.
 ///
-/// This writes the outbox row directly (bypassing the spawn path), so the
-/// test controls exactly how long the "relay" (the manual sweep call below)
-/// waits before creating the child — modelling a relay that runs late. The
-/// pre-fix relay carried an absolute `chain_deadline_at` computed at spawn
-/// time verbatim, so a late relay could hand the child an already-past chain
-/// deadline, sealed by the timeout scanner before it ran a single step. The
-/// fix derives the absolute deadline fresh from the duration at creation
-/// time, so it must land in the future and close to
-/// `created_at + chain_execution_timeout_secs` regardless of how long the
+/// This writes the outbox row directly, bypassing the spawn path. The test
+/// then controls exactly how long the "relay" — the manual sweep call
+/// below — waits before creating the child, modelling a relay that runs
+/// late. The pre-fix relay carried an absolute `chain_deadline_at` computed
+/// at spawn time verbatim. A late relay could then hand the child an
+/// already-past chain deadline, sealed by the timeout scanner before it
+/// ran a single step.
+///
+/// The fix derives the absolute deadline fresh from the duration at
+/// creation time. It must land in the future, and close to
+/// `created_at + chain_execution_timeout_secs`, regardless of how long the
 /// sweep was delayed.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_cross_shard_childs_chain_deadline_is_anchored_at_its_own_creation() {
@@ -551,9 +553,9 @@ async fn a_cross_shard_childs_chain_deadline_is_anchored_at_its_own_creation() {
     let parent = start_parent(&sharded, "child_echo", "chain-deadline-1").await;
     let child_shard = ShardId::new(1);
     let child_id = ExecutionId::new_for_shard(child_shard);
-    // Short enough that a chain deadline anchored at THIS instant (the spec's
-    // creation, i.e. the pre-fix bug) rather than at the child's OWN creation
-    // is easy to tell apart after the delay below.
+    // Short enough that a chain deadline anchored at THIS instant (the
+    // spec's creation — the pre-fix bug) is easy to tell apart from one
+    // anchored at the child's OWN creation, after the delay below.
     let chain_execution_timeout_secs = 5i64;
 
     let spec = autumn_harvest::cross_shard_child::CrossShardChildSpec {
@@ -590,7 +592,7 @@ async fn a_cross_shard_childs_chain_deadline_is_anchored_at_its_own_creation() {
 
         // Model a relay that runs late: an unreachable target shard, a
         // backlog, a worker restart. The pre-fix code anchored the chain
-        // deadline at THIS point (the spec's resolution time); the fix must
+        // deadline at THIS point (the spec's resolution time). The fix must
         // anchor it at the child's actual creation, below, instead.
         tokio::time::sleep(Duration::from_secs(3)).await;
 
@@ -645,13 +647,14 @@ async fn a_cross_shard_childs_chain_deadline_is_anchored_at_its_own_creation() {
 /// still `PENDING_START` must be created ALREADY `CANCELLED`, with no task
 /// ever enqueued for it — never started live and cancelled a moment later.
 ///
-/// The outbox row is flagged cancelled (`request_cross_shard_cancel`) BEFORE
-/// the relay ever runs, modelling a race loser whose cancel lands before its
-/// creation. The pre-fix decision table started it unconditionally on
-/// `PENDING_START` regardless of the flag, so the child's row and a runnable
-/// queue task were both committed before the cancel took effect — a window in
-/// which a worker could claim that task and run the child's first decision
-/// cycle for a child that had already lost its race.
+/// The outbox row is flagged cancelled (`request_cross_shard_cancel`)
+/// BEFORE the relay ever runs, modelling a race loser whose cancel lands
+/// before its creation. The pre-fix decision table started it
+/// unconditionally on `PENDING_START` regardless of the flag. The child's
+/// row and a runnable queue task were then both committed before the
+/// cancel took effect — a window in which a worker could claim that task.
+/// It could then run the child's first decision cycle for a child that had
+/// already lost its race.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_cross_shard_child_cancelled_before_creation_is_born_cancelled() {
     let (urls, _container) = setup_shard_databases(&SHARDS).await;
@@ -751,19 +754,20 @@ async fn a_cross_shard_child_cancelled_before_creation_is_born_cancelled() {
 /// parent must reach a terminal CROSS-SHARD child's payloads too, not just its
 /// same-shard children.
 ///
-/// The parent and child rows are built directly (no worker, no relay sweep)
-/// so the test controls the exact scenario: a terminal parent on shard 0, a
-/// terminal child on shard 1, and the `harvest_cross_shard_children` pointer
-/// between them still present on shard 0 — the realistic window is an
-/// erasure requested at or shortly after both are terminal, before either the
-/// relay or retention has swept the pointer away (see the scope-boundary note
-/// on [`autumn_harvest::erase::erase_workflow_payloads_with_pool`]).
+/// The parent and child rows are built directly, with no worker and no
+/// relay sweep, so the test controls the exact scenario: a terminal parent
+/// on shard 0, a terminal child on shard 1, and the
+/// `harvest_cross_shard_children` pointer between them still present on
+/// shard 0. The realistic window is an erasure requested at or shortly
+/// after both are terminal, before either the relay or retention has
+/// swept the pointer away — see the scope-boundary note on
+/// [`autumn_harvest::erase::erase_workflow_payloads_with_pool`].
 ///
 /// Pre-fix, `erase::collect_child_ids` only queries
 /// `harvest_workflow_executions`/`harvest_execution_summaries` on the
-/// PARENT's own connection — which a cross-shard child's row is never on — so
-/// this erase reported success while the child's `input`/`output` stayed in
-/// the clear on shard 1. The fix additionally reads
+/// PARENT's own connection, which a cross-shard child's row is never on.
+/// This erase reported success while the child's `input`/`output` stayed
+/// in the clear on shard 1. The fix additionally reads
 /// `harvest_cross_shard_children` and routes to the child's own shard.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn erasing_a_parent_reaches_a_terminal_cross_shard_childs_payloads() {
@@ -883,24 +887,27 @@ async fn erasing_a_parent_reaches_a_terminal_cross_shard_childs_payloads() {
     );
 }
 
-/// **Regression (Codex round 2, P1; re-grounded by issue #1263 item 11).** The
-/// child-terminal wake must be skipped when the parent lives on another shard.
+/// **Regression (issue #956; re-grounded by issue #1263 item 11).** The
+/// child-terminal wake must be skipped when the parent lives on another
+/// shard.
 ///
-/// `wake_parent_for_child_*` appends to the parent's history on the *child's*
-/// own connection. For a cross-shard child that connection is the target
-/// shard's database, where the parent row does not exist — and
-/// `store::append_single_event` requires it — so the append would `NotFound` and
-/// roll back the **child's entire terminal transaction**. The child would never
-/// settle, the relay would never have a terminal to deliver, and the parent
-/// would park forever: a silent, total failure of the feature.
+/// `wake_parent_for_child_*` appends to the parent's history on the
+/// *child's* own connection. For a cross-shard child that connection is
+/// the target shard's database, where the parent row does not exist. And
+/// `store::append_single_event` requires it, so the append would
+/// `NotFound` and roll back the **child's entire terminal transaction**.
+/// The child would then never settle, the relay would never have a
+/// terminal to deliver, and the parent would park forever — a silent,
+/// total failure of the feature.
 ///
 /// For an UNENCODED parent, `parent_is_on_another_shard` used to ask the
-/// installed router for its `default_shard()` — ambient process state that can
-/// disagree with wherever a context-local router actually placed that parent's
-/// row (issue #1263 item 11). It now asks the one durable fact that matters:
-/// is the parent's row visible on THIS connection. This moved the test out of
-/// `cross_shard_child_placement_unit.rs` ("no database" by design), since that
-/// question can no longer be answered without one.
+/// installed router for its `default_shard()`. That is ambient process
+/// state, and it can disagree with wherever a context-local router
+/// actually placed that parent's row (issue #1263 item 11). It now asks
+/// the one durable fact that matters: is the parent's row visible on THIS
+/// connection. This moved the test out of
+/// `cross_shard_child_placement_unit.rs` ("no database" by design), since
+/// that question can no longer be answered without one.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_cross_shard_parent_is_recognised_so_the_inline_wake_is_skipped() {
     let (urls, _container) = setup_shard_databases(&[PARENT_SHARD]).await;
@@ -939,9 +946,9 @@ async fn a_cross_shard_parent_is_recognised_so_the_inline_wake_is_skipped() {
             .expect("check")
     );
 
-    // An unencoded PARENT is the ambiguous case this fix targets: with no row
-    // for it on this connection, it must be treated as cross-shard — never
-    // silently assumed local.
+    // An unencoded PARENT is the ambiguous case this fix targets. With no
+    // row for it on this connection, it must be treated as cross-shard —
+    // never silently assumed local.
     assert!(
         autumn_harvest::worker::parent_is_on_another_shard(&mut conn, unencoded, on_0)
             .await

@@ -1630,13 +1630,14 @@ pub(crate) async fn run_workflow_canary(
 ///   schedules, child workflow starts) so those producer spans are nested inside
 ///   the executor cycle. Dropping the handle closes the span.
 /// - `resolved_router`: `Some` only when this run's [`WorkflowContext`] had
-///   an EXPLICIT router installed via `with_shard_router` (issue #1263 items
-///   11/15/17) — tests and embedders running more than one topology in a
-///   single process. When present, the worker's persist-time cross-shard
-///   preflight uses it instead of independently re-asking the
-///   process-global router. A placement is then always validated against
-///   the same topology that resolved it. `None` on the ordinary production
-///   path, where the persist layer keeps asking the global fresh.
+///   an EXPLICIT router installed via `with_shard_router` (issue #1263
+///   items 11/15/17). That is for tests and embedders running more than
+///   one topology in a single process. When present, the worker's
+///   persist-time cross-shard preflight uses it instead of independently
+///   re-asking the process-global router. A placement is then always
+///   validated against the same topology that resolved it. `None` on the
+///   ordinary production path, where the persist layer keeps asking the
+///   global fresh.
 pub async fn run_workflow_with_state(
     exec_id: ExecutionId,
     history: Vec<WorkflowEvent>,

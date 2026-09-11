@@ -313,19 +313,24 @@ fn a_pin_to_a_drained_shard_resolves_and_is_rejected_at_the_persist_boundary() {
 /// A fully-drained fleet degenerates a `Distributed` placement to the
 /// PARENT's own shard — deliberately, and with a trace.
 ///
-/// Every alternative is worse. Failing the spawn would be terminal (the handler
-/// ABI erases the error type). Requeuing it would *deadlock the drain*: a drained
-/// shard is one that should let its in-flight work finish, and a parent cannot
-/// finish while the children it awaits are refused. The parent's own shard is
-/// not an arbitrary consolation prize: with zero writable shards it is where an
-/// *unplaced* child would go, and it is where the parent already lives, so no
-/// cross-shard contract is broken — none was made. Critically, it also makes the
-/// resulting child LOCAL, so the persist-time preflight (which rejects a
-/// cross-shard target on a drained shard) can never see it and reject it — see
-/// issue #1263 item 15, which caught this returning `default_shard()` instead,
-/// a value that only coincides with the parent's shard when the parent already
-/// happens to live on the default shard. AC8 requires that a fallback never
-/// happen "without trace", which the `warn!` on this path provides.
+/// Every alternative is worse. Failing the spawn would be terminal — the
+/// handler ABI erases the error type. Requeuing it would *deadlock the
+/// drain*: a drained shard is one that should let its in-flight work
+/// finish. A parent cannot finish while the children it awaits are
+/// refused.
+///
+/// The parent's own shard is not an arbitrary consolation prize. With zero
+/// writable shards it is where an *unplaced* child would go, and it is
+/// where the parent already lives. So no cross-shard contract is broken —
+/// none was made. Critically, it also makes the resulting child LOCAL. The
+/// persist-time preflight — which rejects a cross-shard target on a
+/// drained shard — can then never see it and reject it. See issue #1263
+/// item 15, which caught this returning `default_shard()` instead: a value
+/// that only coincides with the parent's shard when the parent already
+/// happens to live on the default shard.
+///
+/// AC8 requires that a fallback never happen "without trace", which the
+/// `warn!` on this path provides.
 #[test]
 fn distributed_placement_with_no_writable_shard_stays_on_the_parents_shard() {
     let router = ShardRouter::new(
@@ -730,11 +735,11 @@ fn an_unreadable_parent_state_still_delivers_a_terminal_child() {
     );
 }
 
-// `a_cross_shard_parent_is_recognised_so_the_inline_wake_is_skipped` (Codex
-// round 2, P1) used to live here. Issue #1263 item 11 made
-// `parent_is_on_another_shard` take a connection and consult it (rather than
-// the installed router) for an unencoded parent, so it is no longer callable
-// without a database at all — moved to
+// `a_cross_shard_parent_is_recognised_so_the_inline_wake_is_skipped` used to
+// live here (issue #956). Issue #1263 item 11 made
+// `parent_is_on_another_shard` take a connection and consult it, rather
+// than the installed router, for an unencoded parent. It is no longer
+// callable without a database at all. Moved to
 // `cross_shard_children_tests.rs::a_cross_shard_parent_is_recognised_so_the_inline_wake_is_skipped`,
 // which already has one.
 

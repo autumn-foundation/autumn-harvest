@@ -378,17 +378,18 @@ mod db {
     }
 
     /// Like [`erase_workflow_payloads`], but also cascades into children
-    /// placed on another shard (issue #956), routing each to its own target
+    /// placed on another shard (issue #956). Routes each to its own target
     /// shard via `pool` (issue #1263 item 10).
     ///
     /// PII erasure is sanctioned exception #2 to `harvest_events` being
-    /// append-only (see `CLAUDE.md`). That exception is only meaningful if it
-    /// actually reaches every payload it claims to. Before this, a
+    /// append-only (see `CLAUDE.md`). That exception is only meaningful if
+    /// it actually reaches every payload it claims to. Before this, a
     /// cross-shard child's row lived entirely outside the query
     /// (`parent_id.eq`) this module used to find children. An erase request
-    /// against a parent with a cross-shard child returned success while that
-    /// child's input, output, history, and signals stayed unscrubbed on its
-    /// own shard — a false success on a data-protection operation.
+    /// against a parent with a cross-shard child returned success. That
+    /// happened while the child's input, output, history, and signals
+    /// stayed unscrubbed on its own shard — a false success on a
+    /// data-protection operation.
     ///
     /// `pool` is `None` on a single-shard deployment, or when the caller has
     /// no [`ShardedDbPool`] to hand. A cross-shard child is then reported
@@ -816,8 +817,9 @@ mod db {
     /// Shared by [`cascade_children`]'s same-shard and cross-shard branches
     /// (issue #1263 item 10). A child found live-and-terminal,
     /// live-and-held, live-and-non-terminal, or summary-only is resolved
-    /// identically either way — whether `conn` is the parent's own
-    /// connection or a freshly checked-out one for the child's target shard.
+    /// identically either way. It does not matter whether `conn` is the
+    /// parent's own connection, or a freshly checked-out one for the
+    /// child's target shard.
     ///
     /// Never propagates a `HarvestResult` error itself. Every failure
     /// becomes an [`EraseFailure`] entry instead, so one child's database
@@ -878,9 +880,9 @@ mod db {
                 }
             }
             // No execution row: a summary-only child (issue #752, AC6). Same
-            // treatment whether it is same-shard or cross-shard: a
-            // cross-shard child's summary row, if any, is on ITS OWN target
-            // shard — exactly where `conn` already is.
+            // treatment whether it is same-shard or cross-shard. A
+            // cross-shard child's summary row, if any, is on ITS OWN
+            // target shard — exactly where `conn` already is.
             Err(HarvestError::NotFound(_)) => {
                 match erase_summary_only_node(conn, child_exec_id, now, visited, pool).await {
                     // `None` = the summary vanished between the listing read
@@ -920,8 +922,8 @@ mod db {
     /// Each CROSS-SHARD child (issue #1263 item 10) is routed to its own
     /// target shard via `pool` and resolved by the identical
     /// [`erase_one_child`] logic there. A target this call cannot reach —
-    /// no `pool`, an unreachable shard, or a genuine failure mid-erase — is
-    /// reported as an [`EraseFailure`], never silently dropped. An erase
+    /// no `pool`, an unreachable shard, or a genuine failure mid-erase —
+    /// is reported as an [`EraseFailure`]. Never silently dropped: an erase
     /// must not claim success over PII it could not verify was scrubbed.
     async fn cascade_children(
         conn: &mut AsyncPgConnection,

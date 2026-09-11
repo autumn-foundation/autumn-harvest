@@ -126,13 +126,14 @@ pub struct CrossShardChildSpec {
     /// `chain_deadline_at` at the moment it actually creates the child.
     ///
     /// This field used to carry the resolved absolute `chain_deadline_at`
-    /// instead (issue #1263 item 7). That anchored the chain deadline at the
-    /// PARENT's decision instant, not the child's own creation. A relay
-    /// running late — an unreachable target shard, a backlog, a worker
-    /// restart — could then hand the child a deadline already in the past.
+    /// instead (issue #1263 item 7). That anchored the chain deadline at
+    /// the PARENT's decision instant, not the child's own creation. A
+    /// relay running late — an unreachable target shard, a backlog, a
+    /// worker restart — could then hand the child a deadline already past.
+    ///
     /// The per-run deadlines were fixed the same way earlier in issue #956.
-    /// This field was missed then: a chain cap is anchored differently for a
-    /// CONTINUE-AS-NEW successor, which does inherit its predecessor's
+    /// This field was missed then. A chain cap is anchored differently for
+    /// a CONTINUE-AS-NEW successor, which does inherit its predecessor's
     /// absolute deadline. A child is not a successor.
     #[serde(default)]
     pub chain_execution_timeout_secs: Option<i64>,
@@ -1325,11 +1326,11 @@ async fn start_child_on_target(
                 // already be in the past by the time the row lands. The
                 // timeout, SLA, and chain scanners would then seal a child
                 // that has not run a single step. The normal start path
-                // derives every deadline from the target's own start time for
-                // exactly this reason. Only durations travel on the spec, and
-                // they become absolute here — issue #1263 item 7 extended
-                // this to the chain deadline, which used to be the one
-                // exception.
+                // derives every deadline from the target's own start time,
+                // for exactly this reason. Only durations travel on the
+                // spec, and they become absolute here. Issue #1263 item 7
+                // extended this to the chain deadline, which used to be the
+                // one exception.
                 let created_at = Utc::now();
                 let deadline_at = spec
                     .execution_timeout_secs
