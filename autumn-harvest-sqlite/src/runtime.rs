@@ -674,16 +674,20 @@ impl SqliteRuntime {
                         Some((prior_exec, prior_state)),
                     ) => {
                         if prior_state == "FAILED" {
-                            // 🪝 Snag exploratory QA finding (sibling to issue #1374):
-                            // a direct `seal_execution` here skipped the undelivered-
-                            // signal cleanup `cancel_and_seal_prior` carries, orphaning
-                            // a signal staged while the prior was RUNNING and never
-                            // consumed before it failed on its own. Route through the
-                            // same helper `TerminateIfRunning` uses; `prior_state` is
-                            // "FAILED" here, so this is a seal-only call (no
-                            // cancellation event, no PENDING-task/timer cleanup),
-                            // identical to the direct call it replaces except for the
-                            // now-included signal cleanup.
+                            // Snag exploratory QA finding, sibling to issue #1374. A
+                            // direct `seal_execution` call here skipped the
+                            // undelivered-signal cleanup that `cancel_and_seal_prior`
+                            // performs.
+                            //
+                            // A signal staged while the prior was RUNNING can outlive
+                            // it. The prior can fail on its own before the workflow
+                            // consumes that signal.
+                            //
+                            // Route through the same helper that `TerminateIfRunning`
+                            // uses instead. `prior_state` is FAILED here, so this call
+                            // only seals the prior. It records no cancellation event.
+                            // It cleans up no PENDING task or timer. It adds only the
+                            // signal cleanup, compared to the direct call it replaces.
                             cancel_and_seal_prior(&tx, prior_exec, &prior_state)?;
                             insert_fresh_execution(&tx, workflow_name, Some(id), input)?
                         } else {
