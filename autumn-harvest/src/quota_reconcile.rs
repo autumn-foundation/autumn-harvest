@@ -22,10 +22,31 @@
 //!
 //! The sweep's own `WHERE quota_key IS NULL` predicate is what makes a
 //! re-run a no-op. A backfilled row drops out of every later scan on its
-//! own, with no separate cursor or completion marker to maintain. Contrast
+//! own, with no completion marker to maintain. Contrast
 //! [`crate::codec_rotation`]: its rows can cycle between "on the active
 //! key" and "not" as the active key itself changes. `quota_key` here is set
 //! at most once, ever, per row.
+//!
+//! # Fairness: a keyset cursor, not a bare `LIMIT`
+//!
+//! A row this sweep can never resolve -- no declared policy, an
+//! unresolvable key, or an over-cap key -- never leaves the candidate set.
+//! A bare `LIMIT` with no stable order could therefore return the SAME
+//! stuck rows every tick. That would starve a genuinely resolvable row
+//! sorted behind them, indefinitely -- the very quota-bypass gap this
+//! module exists to close.
+//!
+//! [`reconcile_quota_keys_from`] returns a resumable `id` cursor instead,
+//! and [`spawn_quota_key_reconciler_for_shard`] carries it forward across
+//! ticks. Every tick therefore moves strictly past whatever it just
+//! examined. A full pass over the candidate set completes in a bounded
+//! number of ticks as a result. `quota_key IS NULL` is not itself a
+//! stable cursor: a policy declared mid-uptime changes some rows' outcome
+//! between passes. Only `id` order does not.
+//!
+//! A deployment with no workflow type declaring a `QuotaPolicy` anywhere
+//! skips the scan entirely instead ([`any_quota_policy_registered`]).
+//! That avoids sweeping rows it already knows it cannot act on.
 //!
 //! # Runs periodically, not once at startup
 //!
@@ -70,7 +91,7 @@
 use crate::quota::{QuotaPolicy, quota_key_over_cap, resolve_quota_key};
 
 #[cfg(feature = "db")]
-use diesel::sql_types::{BigInt, Jsonb, Text};
+use diesel::sql_types::{BigInt, Jsonb, Nullable, Text};
 #[cfg(feature = "db")]
 use diesel_async::{AsyncPgConnection, RunQueryDsl};
 #[cfg(feature = "db")]
@@ -168,27 +189,43 @@ struct CandidateRow {
     input: serde_json::Value,
 }
 
-/// SQL for [`reconcile_quota_keys`]'s candidate scan.
+/// SQL for [`reconcile_quota_keys_from`]'s candidate scan.
 ///
 /// Backed by `idx_harvest_we_quota_reconcile_candidates` (migration
 /// `20260910192721_harvest_quota_reconcile_candidate_index`), a partial
-/// index on this exact predicate. `idx_harvest_we_state` (migration
+/// index on `(id) WHERE quota_key IS NULL AND state IN ('RUNNING',
+/// 'PAUSED')`. `idx_harvest_we_state` (migration
 /// `20260409000000_harvest_initial`) covers only `state = 'RUNNING'`, not
 /// `PAUSED`, so it cannot serve this query's `IN`. Without the dedicated
 /// index the scan falls back to a full sequential scan of
 /// `harvest_workflow_executions` on every tick, unbounded by the current
 /// non-terminal row count.
 ///
-/// The new index's predicate already includes `quota_key IS NULL`, so a
-/// row leaves the index the moment its `quota_key` is backfilled. The
-/// index therefore always covers exactly today's candidate set, never the
-/// table's full history. `LIMIT $1` then bounds one tick's work regardless
-/// of how large that set is.
+/// The index's predicate already includes `quota_key IS NULL`, so a row
+/// leaves the index the moment its `quota_key` is backfilled. The index
+/// therefore always covers exactly today's candidate set, never the
+/// table's full history.
+///
+/// `AND ($1::uuid IS NULL OR id > $1) ORDER BY id LIMIT $2` is a keyset
+/// cursor, not a bare `LIMIT`. A row this sweep can never resolve --
+/// [`ReconcileOutcome::Unresolvable`], [`ReconcileOutcome::OverCap`], or a
+/// workflow type still declaring no policy -- never leaves the index.
+/// A bare `LIMIT` with no stable order could therefore return the SAME
+/// stuck rows every tick, starving every resolvable row sorted behind
+/// them, indefinitely.
+///
+/// The cursor makes every tick move strictly past whatever it just
+/// examined. A full pass over the candidate set therefore completes in a
+/// bounded number of ticks, regardless of how many rows are permanently
+/// stuck. See [`reconcile_quota_keys_from`]'s doc comment for how the
+/// cursor wraps.
 #[cfg(feature = "db")]
 const CANDIDATE_SQL: &str = "\
     SELECT id, workflow_name, input FROM harvest_workflow_executions \
     WHERE quota_key IS NULL AND state IN ('RUNNING', 'PAUSED') \
-    LIMIT $1";
+      AND ($1::uuid IS NULL OR id > $1) \
+    ORDER BY id \
+    LIMIT $2";
 
 /// The exact SQL text [`reconcile_quota_keys`] executes for its candidate
 /// scan. Exposed read-only for tests, mirroring
@@ -213,34 +250,81 @@ fn registered_quota_policy(workflow_name: &str) -> Option<QuotaPolicy> {
         })
 }
 
-/// Scan up to `batch_size` non-terminal executions with `quota_key IS NULL`
-/// and backfill any whose workflow type currently has a declared
-/// `QuotaPolicy`.
+/// `true` when at least one currently-registered workflow type declares a
+/// [`QuotaPolicy`], anywhere in the process.
 ///
-/// `batch_size <= 0` is a no-op (mirrors `codec_rotation_batch_size`'s `0`
-/// meaning "disabled"). Idempotent: a row already backfilled, by this call
-/// or a concurrent one, no longer matches the candidate scan's
-/// `quota_key IS NULL` predicate. The UPDATE itself repeats that predicate,
-/// so a race between two sweeps skips rather than double-writes.
+/// A deployment that has not adopted quotas at all leaves every active
+/// execution matching the candidate scan's predicate forever. `NoPolicy`
+/// never sets `quota_key`, so nothing shrinks the index for such a
+/// deployment.
+///
+/// This check lets [`reconcile_quota_keys_from`] skip the scan entirely
+/// instead. That avoids a real, unbounded query cost sweeping rows it
+/// already knows it cannot act on. It matches issue #946 AC9's
+/// zero-overhead promise for a no-quota deployment.
+#[cfg(feature = "db")]
+fn any_quota_policy_registered() -> bool {
+    crate::completion_trigger::GLOBAL_WORKFLOW_METADATA
+        .read()
+        .ok()
+        .and_then(|lock| {
+            lock.as_ref()
+                .map(|map| map.values().any(|meta| meta.quota.is_some()))
+        })
+        .unwrap_or(false)
+}
+
+/// Scan up to `batch_size` non-terminal executions with `quota_key IS NULL`.
+///
+/// Starts strictly after `after_id` in `id` order, and backfills any row
+/// whose workflow type currently has a declared `QuotaPolicy`.
+///
+/// Returns the summary and the cursor for the NEXT call. That cursor is
+/// the id of the last row examined, or `None` once a batch returns fewer
+/// rows than `batch_size`. A short batch means the scan reached the end
+/// of the candidate set's current `id` order. The next call should then
+/// wrap back to the start.
+///
+/// A caller that keeps feeding the returned cursor back in (as
+/// [`spawn_quota_key_reconciler_for_shard`] does) is guaranteed to make
+/// forward progress past any row it cannot resolve. That row is never
+/// re-examined until a full pass wraps around. It can therefore never
+/// pin every tick's candidate scan on rows sorted ahead of it. An
+/// unordered `LIMIT` with no cursor could (see [`CANDIDATE_SQL`]'s doc
+/// comment).
+///
+/// `batch_size <= 0`, or no workflow type anywhere currently declaring a
+/// `QuotaPolicy` (see [`any_quota_policy_registered`]), is a no-op that
+/// returns `after_id` unchanged and issues no query at all.
+///
+/// Idempotent: a row already backfilled, by this call or a concurrent one,
+/// no longer matches the candidate scan's `quota_key IS NULL` predicate.
+/// The UPDATE itself repeats that predicate, so a race between two sweeps
+/// skips rather than double-writes.
 ///
 /// # Errors
 ///
 /// Returns [`crate::error::HarvestError::Database`] on query failure.
 #[cfg(feature = "db")]
-pub async fn reconcile_quota_keys(
+pub async fn reconcile_quota_keys_from(
     conn: &mut AsyncPgConnection,
     batch_size: i64,
-) -> HarvestResult<ReconcileSummary> {
+    after_id: Option<Uuid>,
+) -> HarvestResult<(ReconcileSummary, Option<Uuid>)> {
     let mut summary = ReconcileSummary::default();
-    if batch_size <= 0 {
-        return Ok(summary);
+    if batch_size <= 0 || !any_quota_policy_registered() {
+        return Ok((summary, after_id));
     }
 
     let rows: Vec<CandidateRow> = diesel::sql_query(CANDIDATE_SQL)
+        .bind::<Nullable<diesel::sql_types::Uuid>, _>(after_id)
         .bind::<BigInt, _>(batch_size)
         .load(conn)
         .await
         .map_err(database_error)?;
+
+    let returned = rows.len();
+    let last_id = rows.last().map(|row| row.id);
 
     for row in rows {
         let policy = registered_quota_policy(&row.workflow_name);
@@ -277,7 +361,39 @@ pub async fn reconcile_quota_keys(
         }
     }
 
-    Ok(summary)
+    // A short batch means the scan reached the end of the id-ordered
+    // candidate set. Wrap to the start so the next call's pass covers rows
+    // that sort ahead of every row already seen this pass. That includes
+    // any row inserted after this pass began. `batch_size` is already
+    // checked positive above, so this cast cannot wrap.
+    let next_cursor = if returned < usize::try_from(batch_size).unwrap_or(usize::MAX) {
+        None
+    } else {
+        last_id
+    };
+    Ok((summary, next_cursor))
+}
+
+/// Single-pass convenience wrapper over [`reconcile_quota_keys_from`].
+///
+/// Always starts from the beginning of the candidate set (`after_id =
+/// None`). Prefer this for a one-shot sweep, e.g. in tests. A long-lived
+/// periodic caller should instead use [`reconcile_quota_keys_from`]
+/// directly and carry its cursor forward. Otherwise a large
+/// permanently-stuck prefix can pin every call to the same rows (see
+/// [`CANDIDATE_SQL`]'s doc comment).
+///
+/// # Errors
+///
+/// Returns [`crate::error::HarvestError::Database`] on query failure.
+#[cfg(feature = "db")]
+pub async fn reconcile_quota_keys(
+    conn: &mut AsyncPgConnection,
+    batch_size: i64,
+) -> HarvestResult<ReconcileSummary> {
+    reconcile_quota_keys_from(conn, batch_size, None)
+        .await
+        .map(|(summary, _next_cursor)| summary)
 }
 
 /// Spawn a background task that periodically backfills `quota_key` on
@@ -298,26 +414,35 @@ pub fn spawn_quota_key_reconciler_for_shard(
         if batch_size <= 0 {
             return;
         }
+        // Carried across ticks so a permanently-stuck prefix of the
+        // candidate set (see `CANDIDATE_SQL`'s doc comment) cannot pin
+        // every tick to the same rows. Each tick resumes strictly past
+        // the last row the previous tick examined.
+        let mut cursor: Option<Uuid> = None;
         loop {
             tokio::select! {
                 () = cancel.cancelled() => break,
                 () = tokio::time::sleep(interval) => {}
             }
             match pool.get().await {
-                Ok(mut conn) => match reconcile_quota_keys(&mut conn, batch_size).await {
-                    Ok(summary) if summary.backfilled > 0 => {
-                        tracing::info!(
-                            backfilled = summary.backfilled,
-                            unresolvable = summary.unresolvable,
-                            over_cap = summary.over_cap,
-                            "backfilled quota_key on pre-upgrade executions"
-                        );
+                Ok(mut conn) => {
+                    match reconcile_quota_keys_from(&mut conn, batch_size, cursor).await {
+                        Ok((summary, next_cursor)) => {
+                            cursor = next_cursor;
+                            if summary.backfilled > 0 {
+                                tracing::info!(
+                                    backfilled = summary.backfilled,
+                                    unresolvable = summary.unresolvable,
+                                    over_cap = summary.over_cap,
+                                    "backfilled quota_key on pre-upgrade executions"
+                                );
+                            }
+                        }
+                        Err(e) => {
+                            tracing::error!(error = %e, "quota_key reconcile sweep failed");
+                        }
                     }
-                    Ok(_) => {}
-                    Err(e) => {
-                        tracing::error!(error = %e, "quota_key reconcile sweep failed");
-                    }
-                },
+                }
                 Err(e) => {
                     tracing::error!(
                         error = %e,

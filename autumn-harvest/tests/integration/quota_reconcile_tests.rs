@@ -15,13 +15,16 @@
 //! - Terminal rows are never touched.
 //! - An over-cap resolved key is left NULL rather than written.
 //! - A workflow type with no declared policy is left NULL.
+//! - A deployment with no policy registered anywhere skips the scan.
+//! - The keyset cursor advances past rows it can never resolve, so they
+//!   cannot starve a resolvable row sorted behind them.
 
 use std::collections::HashMap;
 use std::sync::LazyLock;
 
 use autumn_harvest::completion_trigger::{GLOBAL_WORKFLOW_METADATA, WorkflowMetadata};
 use autumn_harvest::quota::{QuotaPolicy, check_quota, load_quota_usage};
-use autumn_harvest::quota_reconcile::reconcile_quota_keys;
+use autumn_harvest::quota_reconcile::{reconcile_quota_keys, reconcile_quota_keys_from};
 use diesel::prelude::*;
 use diesel_async::AsyncConnection;
 use diesel_async::AsyncPgConnection;
@@ -365,7 +368,14 @@ async fn over_cap_resolved_key_is_left_null() {
 async fn workflow_type_with_no_declared_policy_is_left_null() {
     let (mut conn, _container) = setup_db().await;
     let workflow_name = leaked("wf_no_policy");
-    let _guard = MetadataGuard::install_empty().await;
+    // A DIFFERENT workflow type has a policy, so the registry is
+    // non-empty and the row is genuinely scanned and classified
+    // `NoPolicy`. It is not skipped by the zero-registrations early exit
+    // (covered separately by
+    // `zero_registered_policies_anywhere_skips_the_scan_entirely`).
+    let other_workflow_name = leaked("wf_has_policy");
+    let policy = QuotaPolicy::new("tenant_id").with_max_active_executions(10);
+    let _guard = MetadataGuard::install_one(other_workflow_name, policy).await;
 
     let exec_id = insert_execution(
         &mut conn,
@@ -379,6 +389,31 @@ async fn workflow_type_with_no_declared_policy_is_left_null() {
     let summary = reconcile_quota_keys(&mut conn, 100).await.expect("sweep");
 
     assert_eq!(summary.no_policy, 1);
+    assert_eq!(read_quota_key(&mut conn, exec_id).await, None);
+}
+
+#[tokio::test]
+async fn zero_registered_policies_anywhere_skips_the_scan_entirely() {
+    let (mut conn, _container) = setup_db().await;
+    let workflow_name = leaked("wf_no_policy_anywhere");
+    let _guard = MetadataGuard::install_empty().await;
+
+    let exec_id = insert_execution(
+        &mut conn,
+        workflow_name,
+        "RUNNING",
+        serde_json::json!({ "tenant_id": "acme" }),
+        None,
+    )
+    .await;
+
+    let summary = reconcile_quota_keys(&mut conn, 100).await.expect("sweep");
+
+    assert_eq!(
+        summary,
+        autumn_harvest::quota_reconcile::ReconcileSummary::default(),
+        "no workflow type anywhere declares a policy, so the scan itself is skipped"
+    );
     assert_eq!(read_quota_key(&mut conn, exec_id).await, None);
 }
 
@@ -464,4 +499,57 @@ async fn batch_size_bounds_a_single_sweep_and_the_rest_finish_on_the_next_one() 
             Some("acme".to_string())
         );
     }
+}
+
+#[tokio::test]
+async fn cursor_advances_past_permanently_stuck_rows_so_a_resolvable_row_is_not_starved() {
+    let (mut conn, _container) = setup_db().await;
+    // `wf_stuck` has no registered policy -- every one of its rows
+    // classifies `NoPolicy` and can never leave the candidate set. Row
+    // `id`s are random UUIDs, so a stuck row can sort before OR after
+    // the one resolvable row. A fixed `LIMIT` with no cursor could
+    // therefore keep re-examining the same stuck rows forever, and
+    // never reach the resolvable one. `wf_resolvable` carries the only
+    // registered policy.
+    let stuck_workflow_name = leaked("wf_stuck");
+    let resolvable_workflow_name = leaked("wf_resolvable");
+    let policy = QuotaPolicy::new("tenant_id").with_max_active_executions(10);
+    let _guard = MetadataGuard::install_one(resolvable_workflow_name, policy).await;
+
+    for _ in 0..3 {
+        insert_execution(
+            &mut conn,
+            stuck_workflow_name,
+            "RUNNING",
+            serde_json::json!({ "tenant_id": "acme" }),
+            None,
+        )
+        .await;
+    }
+    let resolvable_id = insert_execution(
+        &mut conn,
+        resolvable_workflow_name,
+        "RUNNING",
+        serde_json::json!({ "tenant_id": "acme" }),
+        None,
+    )
+    .await;
+
+    // 4 candidates total, batch_size 1: 4 ticks visit each exactly once
+    // in one pass, regardless of id order. Run more than that. A wrapped
+    // cursor (`None` once a batch returns fewer than batch_size rows)
+    // then still finds the resolvable row, even if it sorted last.
+    let mut cursor = None;
+    for _ in 0..8 {
+        let (_summary, next_cursor) = reconcile_quota_keys_from(&mut conn, 1, cursor)
+            .await
+            .expect("sweep tick");
+        cursor = next_cursor;
+    }
+
+    assert_eq!(
+        read_quota_key(&mut conn, resolvable_id).await,
+        Some("acme".to_string()),
+        "the cursor must eventually reach the resolvable row despite 3 permanently stuck rows"
+    );
 }
