@@ -387,6 +387,12 @@ fn dual_run_playbook_covers_schedule_driven_cutover() {
 /// only ran on a harvest miss. A reused workflow id's own older
 /// execution can satisfy that miss check without ever probing
 /// Temporal.
+///
+/// An eighteenth review found the rollback-reversal rule untestable.
+/// A follow-up request carries only a workflow id, not a timestamp,
+/// so "started after this point" cannot actually be evaluated against
+/// it. Capture harvest's own ids the same way the forward direction
+/// captures Temporal's, instead of comparing against a point in time.
 #[test]
 fn dual_run_playbook_covers_schedule_driven_capture_and_reconciliation() {
     let guide = read_doc(GUIDE_PATH);
@@ -403,9 +409,18 @@ fn dual_run_playbook_covers_schedule_driven_capture_and_reconciliation() {
         playbook.contains("A rollback of a schedule-driven type reverses this capture")
             && playbook.contains("resume the Temporal Schedule"),
         "the playbook must cover the reverse direction of the schedule-driven capture: a \
-         rollback resumes the Temporal Schedule, and every id fired after that point must \
-         resolve to Temporal even though it postdates the forward-cutover snapshot \
+         rollback pauses harvest and resumes the Temporal Schedule \
          (issue #1219, PR #1473 Codex P1)"
+    );
+    assert!(
+        playbook.contains(
+            "\"Started after this point\" is not something you can test against \
+             that id alone"
+        ) && playbook.contains("List every execution of that type harvest has ever started"),
+        "the playbook must not classify a rollback follow-up by whether its id was \"started \
+         after this point\" -- a follow-up request carries only a workflow id, not a \
+         timestamp, so that rule is untestable; it must instead capture harvest's own ids the \
+         same way the forward direction captures Temporal's (issue #1219, PR #1473 Codex P1)"
     );
     assert!(
         playbook.contains("A fixed wait cannot guarantee the list has converged")
@@ -526,6 +541,21 @@ fn dual_run_playbook_covers_schedule_driven_capture_and_reconciliation() {
 /// reads as a hit, even though this attempt never actually happened.
 /// Retry by a persisted idempotency key instead, scoped to this one
 /// attempt rather than to the workflow id's whole history.
+///
+/// A seventeenth review found three more gaps in that fix. A fresh
+/// key still runs the ordinary reuse policy once. `AllowDuplicate` and
+/// `RejectDuplicate` still never create the intended replacement under
+/// a reused id. Pair the key with `TerminateIfRunning` instead, which
+/// does.
+///
+/// Retrying Temporal's own start call is not automatically idempotent
+/// after a crash either. A reconciliation call is a new call, not a
+/// transport retry of the old one. Persist a request id of your own
+/// for it instead.
+///
+/// A definitive rejection also needs its own handling. Restore the
+/// record to its prior value, since no retry will ever succeed
+/// against a permanent failure.
 #[test]
 fn dual_run_playbook_covers_follow_up_engine_routing() {
     let guide = read_doc(GUIDE_PATH);
@@ -557,6 +587,15 @@ fn dual_run_playbook_covers_follow_up_engine_routing() {
          (issue #1219, PR #1473 Codex P1)"
     );
     assert!(
+        playbook.contains("A definitive rejection is not the same as an unknown outcome")
+            && playbook.contains("Restore the record to whatever it named before this attempt"),
+        "the playbook must distinguish a definitive, permanently failing rejection (validation, \
+         authorization, a reuse-policy conflict) from a genuinely unknown crash or lost \
+         response -- a definitive rejection can never succeed on retry, so the record must be \
+         restored to its prior value rather than left pointing at an engine where nothing will \
+         ever run (issue #1219, PR #1473 Codex P1)"
+    );
+    assert!(
         playbook.contains("Querying by workflow id alone cannot tell two things apart")
             && playbook.contains("reads as a hit"),
         "the playbook must not resolve a pending record's crash reconciliation by querying the \
@@ -573,11 +612,20 @@ fn dual_run_playbook_covers_follow_up_engine_routing() {
          (issue #1219, PR #1473 Codex P1)"
     );
     assert!(
-        playbook.contains("Neither is safe for this retry"),
-        "the playbook must restrict the reconciliation retry's own reuse policy to one that \
-         returns the original execution or refuses outright -- AllowDuplicateFailedOnly and \
-         TerminateIfRunning can each start a genuine second execution once the first reaches \
-         a terminal state, duplicating its side effects (issue #1219, PR #1473 Codex P1)"
+        playbook.contains("A fresh key still runs the ordinary reuse policy once")
+            && playbook.contains("harvest repoints the key at that outcome permanently"),
+        "the playbook must warn that a fresh idempotency key does not bypass the reuse-policy \
+         matrix -- AllowDuplicate and RejectDuplicate never create the intended replacement \
+         when an older terminal execution already sits under a reused id, and harvest repoints \
+         the key at whatever they find instead (issue #1219, PR #1473 Codex P1)"
+    );
+    assert!(
+        playbook.contains("WorkflowIdReusePolicy::TerminateIfRunning` for this call")
+            && playbook.contains("started_fresh"),
+        "the playbook must pair the idempotency key with a reuse policy that actually creates \
+         the intended replacement (TerminateIfRunning), not one that only ever returns or \
+         refuses a prior execution -- and tell the reader to check `started_fresh` to tell a \
+         real creation from a deduplicated repeat (issue #1219, PR #1473 Codex P1)"
     );
     assert!(
         playbook.contains("Treat a missing record as Temporal"),
@@ -593,11 +641,13 @@ fn dual_run_playbook_covers_follow_up_engine_routing() {
          API (issue #1219, PR #1473 Codex P1)"
     );
     assert!(
-        playbook.contains("Temporal's own start call is already idempotent per attempt")
-            && playbook.contains("client-generated request id"),
-        "the playbook must reconcile a Temporal-side pending record by retrying the start call \
-         directly, relying on Temporal's own client-generated request id for idempotency, \
-         rather than reusing harvest's reuse-policy naming (issue #1219, PR #1473 Codex P1)"
+        playbook.contains("A fresh call to Temporal's start API mints a fresh request id")
+            && playbook.contains("Generate your own request id before the first attempt"),
+        "the playbook must not claim a plain retry of Temporal's start call is automatically \
+         idempotent after a crash -- a reconciliation call is a new call, not a transport-level \
+         retry, so it mints a fresh request id unless the reader deliberately generates and \
+         persists their own before the first attempt and resupplies it on every reconciliation \
+         call (issue #1219, PR #1473 Codex P1)"
     );
     assert!(
         playbook.contains("Do not retry the update call itself if its result goes missing")

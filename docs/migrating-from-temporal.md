@@ -388,6 +388,15 @@ your whole application.
    opposite state undetectable. A real execution can exist with no
    record, defaulting to the wrong engine.
 
+   A definitive rejection is not the same as an unknown outcome.
+   Validation, authorization, and a reuse-policy conflict all fail
+   synchronously and permanently. Retrying that same call fails the
+   same way every time. Restore the record to whatever it named
+   before this attempt, or delete it if there was none. Do not leave
+   it pointing at an engine where nothing will ever run. A crash or a
+   lost response, unlike this case, is genuinely unknown and worth
+   reconciling by retry.
+
    An application-level flag routes a new request in your own code,
    whether it sends the request to harvest or, after a rollback, back
    to Temporal. Write the record at that same decision point. Overwrite
@@ -438,10 +447,17 @@ your whole application.
 
    A rollback of a schedule-driven type reverses this capture. Pause
    the harvest schedule first, then resume the Temporal Schedule.
-   Treat any id of that type started after this point as Temporal's,
-   since only Temporal's schedule can start one once harvest is
-   paused. The ids captured at the forward cutover keep the
-   classification they already have.
+
+   A follow-up request carries only a workflow id, not a timestamp.
+   "Started after this point" is not something you can test against
+   that id alone. List every execution of that type harvest has ever
+   started instead, the same way the forward capture lists Temporal's:
+   open and closed executions, not only the in-flight ones. Treat a
+   follow-up against one of those captured ids as harvest's,
+   permanently. Treat any other id of that type as Temporal's, since
+   only Temporal's schedule can start one once harvest is paused. The
+   ids captured at the forward cutover keep the classification they
+   already have.
 
    Resuming the Temporal Schedule can also refire the interval harvest
    just owned. Temporal's own `CatchupWindow` decides whether a paused
@@ -465,19 +481,38 @@ your whole application.
    the workflow id again. Harvest dedups a repeated key onto its own
    earlier same-key start. That dedup is scoped to `(workflow_name,
    idempotency_key)`, regardless of any older execution already under
-   that workflow id. The retry response's own `deduplicated` field
-   then says which case happened.
+   that workflow id.
+
+   A fresh key still runs the ordinary reuse policy once, the first
+   time harvest sees it. Only a repeat of that same key skips straight
+   to the dedup. `AllowDuplicate` and `RejectDuplicate` do not create
+   the intended replacement on that first run, if an older terminal
+   execution already sits under the reused id. Each attaches to it, or
+   refuses, and harvest repoints the key at that outcome permanently.
+   The intended new execution never gets created at all.
+
+   Use `WorkflowIdReusePolicy::TerminateIfRunning` for this call
+   instead. It starts a fresh run unconditionally once the prior one
+   is terminal, which is what a genuine reuse restart needs. Pairing
+   it with the idempotency key is what makes retrying it safe. A fresh
+   key evaluates `TerminateIfRunning` for real, creating the intended
+   execution. A repeated key deduplicates onto whatever that first
+   evaluation produced, without ever re-running its cancel-and-restart
+   logic. Check the response's `started_fresh` field to tell the two
+   cases apart.
 
    This dedup window is bounded, 24 hours by default. Reconcile well
-   inside it. Temporal's own start call is already idempotent per
-   attempt, through its client-generated request id. Retry it directly
-   for a Temporal-side reconciliation.
+   inside it.
 
-   `AllowDuplicateFailedOnly` and `TerminateIfRunning` do the opposite
-   on purpose. Each can start a genuine second execution once the first
-   reaches a terminal state. That duplicates whatever side effects the
-   first one already committed. Neither is safe for this retry, on a
-   genuine miss where the key was never processed before.
+   Do the same on the Temporal side, deliberately. A fresh call to
+   Temporal's start API mints a fresh request id of its own. Only a
+   transport-level retry of that exact call keeps the original id. A
+   reconciliation call written after a crash is a new call, not a
+   retry of the old one. Generate your own request id before the first
+   attempt. Persist it next to the pending record. Supply that same id
+   yourself on every reconciliation call. Temporal's own dedup then
+   applies to your attempt. It can no longer mistake a reconciliation
+   retry for a genuine new start.
 
    This record names the current owner only. It matches harvest's own
    by-id resolution (issue #805), which also resolves to the latest
