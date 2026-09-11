@@ -1254,3 +1254,91 @@ async fn a_decision_can_only_be_delivered_once() {
 
     daemon.abort();
 }
+
+#[tokio::test]
+async fn a_daemon_refuses_to_start_where_a_session_does_not_belong() {
+    let dir = tempfile::tempdir().expect("a temporary directory");
+    let db = dir.path().join("agentd.db");
+    let theirs = dir.path().join("their-project");
+    let ours = dir.path().join("our-project");
+    std::fs::create_dir_all(&theirs).expect("the workspace is created");
+    std::fs::create_dir_all(&ours).expect("the workspace is created");
+
+    // A session parked mid-run, recorded against one workspace.
+    let calls = Arc::new(AtomicUsize::new(0));
+    let exec = {
+        let mut rt = runtime(&db, &theirs, &calls);
+        let exec = rt
+            .start_workflow(WORKFLOW_NAME, task(&theirs))
+            .expect("the session starts");
+        drive_to_approval(&mut rt, exec).await;
+        exec
+    };
+
+    // Starting on another workspace must be refused BEFORE anything drives the
+    // session. A mismatched tool call fails the run non-retryably, and only
+    // `RUNNING` rows are ever driven, so a failure here could never be undone.
+    let refused = daemon::serve(daemon::Options {
+        db: db.clone(),
+        socket: dir.path().join("agentd.sock"),
+        workspace: ours,
+        model: claude::DEFAULT_MODEL.to_string(),
+        max_tokens: claude::DEFAULT_MAX_TOKENS,
+        tick: Duration::from_millis(50),
+        api_key: None,
+    })
+    .await;
+    let message = refused.expect_err("the daemon must refuse to start");
+    assert!(
+        message.contains("belongs to the workspace"),
+        "unexpected message: {message}"
+    );
+
+    // The session is untouched, so the operator can fix the flag and resume.
+    let mut rt = runtime(&db, &theirs, &calls);
+    assert!(
+        matches!(
+            rt.outcome(exec),
+            Ok(autumn_harvest_sqlite::ExecutionOutcome::Running)
+        ),
+        "the session must stay resumable"
+    );
+    let signal = drive_to_approval(&mut rt, exec).await;
+    approve(&mut rt, exec, &signal);
+    let state = rt.run_until_blocked(exec).await.expect("the run finishes");
+    assert!(
+        matches!(state, RunState::Completed(_)),
+        "the session must still complete, got {state:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_workspace_path_that_cannot_be_written_down_is_refused() {
+    use std::ffi::OsString;
+    use std::os::unix::ffi::OsStringExt;
+
+    let dir = tempfile::tempdir().expect("a temporary directory");
+
+    // A path that is not valid UTF-8 cannot be recorded exactly. A lossy name
+    // would never match the real path again, so every tool call in the session
+    // would fail.
+    let mut raw = OsString::from_vec(b"workspace-\xff".to_vec());
+    let workspace = dir.path().join(&mut raw);
+    std::fs::create_dir_all(&workspace).expect("the workspace is created");
+
+    let refused = daemon::serve(daemon::Options {
+        db: dir.path().join("agentd.db"),
+        socket: dir.path().join("agentd.sock"),
+        workspace,
+        model: claude::DEFAULT_MODEL.to_string(),
+        max_tokens: claude::DEFAULT_MAX_TOKENS,
+        tick: Duration::from_millis(50),
+        api_key: None,
+    })
+    .await;
+    let message = refused.expect_err("the daemon must refuse the path");
+    assert!(
+        message.contains("not valid UTF-8"),
+        "unexpected message: {message}"
+    );
+}

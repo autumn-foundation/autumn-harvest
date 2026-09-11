@@ -125,6 +125,13 @@ under a narrowed umask — private at creation, with no window to connect
 through. A path that already holds something other than a socket is never
 removed: a typo in `--socket` reports an error instead of deleting a file.
 
+**A mismatched daemon refuses to start.** The daemon checks every resumable
+session before it drives anything. Mistype `--workspace` and you get an error
+at startup with the session untouched — not a run failed past recovery, which
+is what a mismatched tool call would cause, because only a running session is
+ever driven again. A workspace path that is not valid UTF-8 is refused for the
+same reason: a name that cannot be recorded exactly could never match again.
+
 **A session is bound to its workspace and its model.** Both are recorded in the
 session's history at submit time, and a call is refused when the daemon serves
 a different one. Otherwise a restart pointed at another directory could apply

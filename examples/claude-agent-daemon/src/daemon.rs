@@ -86,17 +86,26 @@ pub async fn serve(options: Options) -> Result<(), String> {
     })?;
     // Resolve it once. Every session records this value, and the tool activity
     // refuses a call whose session belongs to a different workspace.
-    let workspace = options
-        .workspace
-        .canonicalize()
-        .map_err(|e| {
+    let resolved = options.workspace.canonicalize().map_err(|e| {
+        format!(
+            "cannot resolve the workspace {}: {e}",
+            options.workspace.display()
+        )
+    })?;
+    // A lossy conversion would mangle a path that is not valid UTF-8, and the
+    // recorded identity would then never match the real one again. Refuse the
+    // path instead of recording a name that cannot be compared.
+    let workspace = resolved
+        .to_str()
+        .ok_or_else(|| {
             format!(
-                "cannot resolve the workspace {}: {e}",
-                options.workspace.display()
+                "the workspace path {} is not valid UTF-8. Each session records \
+                 this path, so a name that cannot be written down exactly would \
+                 never match again.",
+                resolved.display()
             )
         })?
-        .to_string_lossy()
-        .into_owned();
+        .to_string();
 
     // Take the per-database lock FIRST. The open below reclaims every task left
     // `RUNNING` by a dead process. A second daemon opening the same file would
@@ -124,6 +133,12 @@ pub async fn serve(options: Options) -> Result<(), String> {
     );
 
     let reader = inspect::open(&options.db)?;
+    // Check the sessions already in the file BEFORE anything drives them. A
+    // mismatched tool call fails non-retryably, and a FAILED run is terminal.
+    // Only `RUNNING` rows are ever driven again, so restarting with the right
+    // flags could not bring it back. An operator who mistypes `--workspace`
+    // gets an error here, and every session stays resumable.
+    check_resumable(&reader, &workspace, &identity)?;
     let listener = bind(&options.socket).await?;
     let (tx, mut rx) = mpsc::channel::<Job>(COMMAND_BACKLOG);
     tokio::spawn(accept_loop(listener, tx));
@@ -190,6 +205,38 @@ pub async fn serve(options: Options) -> Result<(), String> {
         socket = %options.socket.display(),
         "agentd is stopping; in-flight sessions resume on the next start",
     );
+    Ok(())
+}
+
+/// Refuse to start when a session in this file belongs to another daemon.
+///
+/// The activity-level checks stay as a backstop, but they can only fail a run.
+/// This is the check that protects the work.
+fn check_resumable(reader: &Connection, workspace: &str, model: &str) -> Result<(), String> {
+    for row in inspect::executions(reader, WORKFLOW_NAME)? {
+        if row.state != "RUNNING" {
+            continue;
+        }
+        let Ok(task) = serde_json::from_str::<SessionTask>(&row.input_json) else {
+            continue;
+        };
+        if task.workspace != workspace {
+            return Err(format!(
+                "session {} belongs to the workspace `{}`, and this daemon serves \
+                 `{workspace}`. Start it with `--workspace {}` so the session can \
+                 resume.",
+                row.exec_id, task.workspace, task.workspace
+            ));
+        }
+        if task.model != model {
+            return Err(format!(
+                "session {} runs on the model `{}`, and this daemon serves `{model}`. \
+                 Start it with `--model {}`, or with the key that model needs, so the \
+                 session can resume.",
+                row.exec_id, task.model, task.model
+            ));
+        }
+    }
     Ok(())
 }
 
