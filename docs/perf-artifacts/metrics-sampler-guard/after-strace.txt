@@ -1,6 +1,6 @@
 
 running 1 test
-strace: Process 23324 attached
+strace: Process 31341 attached
 label=after ticks=20 samplers=4 pool_touches=0
 test worker::tests::zz_capture_metrics_sampler_guard_pool_touch_evidence ... ok
 

@@ -28765,65 +28765,88 @@ mod tests {
 
     // ── Issue #1428: metrics-disabled samplers must never touch the pool ────
     //
-    // Four samplers issued their SQL with no `metrics.is_enabled()` guard,
-    // unlike their six siblings (`spawn_queue_depth_sampler` above sets the
-    // pattern). `unreachable_pool` makes the bug falsifiable without a
-    // database: a guarded sampler returns before its first `pool.get()`.
-    // It never logs the failure below. An unguarded one logs it once per
-    // loop pass. The count is a direct, deterministic proxy for "how many
-    // times a sampler touched the pool."
+    // Four samplers issued their SQL with no `metrics.is_enabled()` guard.
+    // Their six siblings all check it first (`spawn_queue_depth_sampler`
+    // above sets the pattern).
     //
     // One exception: `spawn_concurrency_sampler`'s guard also stays open
-    // for a DEBUG subscriber (PR #1468 review). Its own touch count depends
-    // on the ambient tracing level too, not on `is_enabled()` alone. The
-    // tests below cover both halves of that guard separately.
+    // for a DEBUG subscriber. PR #1468 review (Codex, P2) found this gap.
+    // Its own touch count depends on the ambient tracing level too, not on
+    // `is_enabled()` alone. The tests below cover both halves separately.
+    //
+    // Evidence: a first version of this harness counted pool touches via
+    // a `tracing::debug!` message each sampler's failure branch emits. PR
+    // #1468 review (Codex, P2) found that vacuous. Filtering the
+    // subscriber to INFO, to model "no DEBUG subscriber," also suppresses
+    // the DEBUG event the counter relied on. The count then reads zero
+    // whether or not the guard actually works. `AcceptCountingListener`
+    // below counts real TCP `accept()`s on a loopback listener instead. No
+    // tracing level can silence that channel. "Zero touches" then only
+    // holds when the guard genuinely never reaches `pool.get()`.
 
-    /// A [`tracing_subscriber::Layer`] that counts events carrying the
-    /// "could not acquire DB connection" message each sampler's failure
-    /// branch emits, scoped to this module's own tracing target.
-    struct PoolTouchCounter(Arc<std::sync::atomic::AtomicUsize>);
+    /// A loopback listener standing in for Postgres, counting every
+    /// accepted connection before dropping it. The Postgres handshake then
+    /// fails, the same outward effect as [`unreachable_pool`]. The accept
+    /// itself is already counted by the time that happens.
+    struct AcceptCountingListener {
+        pool: DbPool,
+        accepts: Arc<std::sync::atomic::AtomicUsize>,
+        acceptor: tokio::task::JoinHandle<()>,
+    }
 
-    /// Captures a tracing event's `message` field text, ignoring every other
-    /// field.
-    struct EventMessage(Option<String>);
+    impl AcceptCountingListener {
+        fn touch_count(&self) -> usize {
+            // Fully qualified: `diesel_async::RunQueryDsl::load` is
+            // implemented for every `Sized` type, including
+            // `Arc<AtomicUsize>`. A plain `self.accepts.load(ordering)`
+            // resolves to that blanket trait method instead of
+            // `AtomicUsize::load`, and fails to compile.
+            std::sync::atomic::AtomicUsize::load(&self.accepts, std::sync::atomic::Ordering::SeqCst)
+        }
 
-    impl tracing::field::Visit for EventMessage {
-        fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
-            if field.name() == "message" {
-                self.0 = Some(format!("{value:?}"));
-            }
+        /// Stops the background accept loop. Tests call this once they are
+        /// done driving samplers against `self.pool`, before asserting.
+        fn stop(&self) {
+            self.acceptor.abort();
         }
     }
 
-    impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for PoolTouchCounter {
-        fn on_event(
-            &self,
-            event: &tracing::Event<'_>,
-            _ctx: tracing_subscriber::layer::Context<'_, S>,
-        ) {
-            if event.metadata().target() != "autumn_harvest::worker" {
-                return;
+    async fn accept_counting_pool() -> AcceptCountingListener {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind an ephemeral loopback port");
+        let addr = listener.local_addr().expect("listener has a local address");
+        let accepts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let accepts_for_task = Arc::clone(&accepts);
+        let acceptor = tokio::spawn(async move {
+            while let Ok((stream, _)) = listener.accept().await {
+                accepts_for_task.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                drop(stream);
             }
-            let mut message = EventMessage(None);
-            event.record(&mut message);
-            let touched_pool = message
-                .0
-                .as_deref()
-                .is_some_and(|text| text.contains("could not acquire DB connection"));
-            if touched_pool {
-                self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            }
+        });
+        let manager = diesel_async::pooled_connection::AsyncDieselConnectionManager::<
+            diesel_async::AsyncPgConnection,
+        >::new(format!("postgres://sampler-guard@{addr}/sampler-guard"));
+        let pool = deadpool::managed::Pool::builder(manager)
+            .max_size(1)
+            .build()
+            .expect("pool builds without connecting");
+        AcceptCountingListener {
+            pool,
+            accepts,
+            acceptor,
         }
     }
 
-    /// Reads `counter` via a fully-qualified call.
-    /// `diesel_async::RunQueryDsl` is implemented for every `Sized` type,
-    /// including `Arc<AtomicUsize>`. A plain `counter.load(ordering)`
-    /// resolves to that blanket trait method instead of
-    /// `AtomicUsize::load`, and fails to compile.
-    fn load_pool_touch_count(counter: &Arc<std::sync::atomic::AtomicUsize>) -> usize {
-        std::sync::atomic::AtomicUsize::load(counter, std::sync::atomic::Ordering::SeqCst)
-    }
+    /// A [`tracing_subscriber::Layer`] with every method left at its
+    /// default (no-op) implementation. Attaching one to a subscriber with
+    /// no filter makes `tracing::enabled!` read a level as on. That is
+    /// what the DEBUG-tracing test below needs. It records nothing, since
+    /// that test proves control flow (`pool.get()` is reached), not log
+    /// content.
+    struct DebugTracingOn;
+
+    impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for DebugTracingOn {}
 
     /// Advances the paused clock by `interval`, `n` times, yielding after
     /// each advance. Each sampler loop sleeps for `interval` before its
@@ -28870,50 +28893,38 @@ mod tests {
         ]
     }
 
-    /// Issue #1428 evidence generator. Spawns the four samplers against
-    /// [`unreachable_pool`] with metrics disabled, advances a paused clock by
-    /// `TICKS` sampler intervals, and counts pool-touch events. Not a CI
-    /// assertion — see `docs/performance-metrics-sampler-guard.md`. Set
-    /// `PERF_LABEL` to tag the artifact `before`/`after` the fix.
+    /// Issue #1428 evidence generator. Spawns the four samplers against an
+    /// [`accept_counting_pool`]. Metrics stay disabled and no tracing
+    /// subscriber is installed, so DEBUG is off. That is the realistic
+    /// unconfigured-deployment default. It advances a paused clock by
+    /// `TICKS` sampler intervals, and counts accepted connections. Not a
+    /// CI assertion — see `docs/performance-metrics-sampler-guard.md`.
+    /// Set `PERF_LABEL` to tag the artifact `before`/`after` the fix.
     #[tokio::test(start_paused = true)]
     #[ignore = "evidence generator, not a CI assertion -- see \
                 docs/performance-metrics-sampler-guard.md"]
     async fn zz_capture_metrics_sampler_guard_pool_touch_evidence() {
-        use tracing_subscriber::Layer;
-        use tracing_subscriber::layer::SubscriberExt;
-
         const TICKS: usize = 20;
         let interval = Duration::from_millis(50);
-
-        // INFO, not the harness's ambient default, models an unconfigured
-        // deployment's usual log level. `spawn_concurrency_sampler`'s
-        // DEBUG-tracing check then reads false here. That matches a real
-        // deployment with no metrics recorder and no DEBUG tracing on. See
-        // `concurrency_sampler_stays_active_for_its_saturation_trace_under_debug_tracing`
-        // for the other half.
-        let counter = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let subscriber = tracing_subscriber::registry().with(
-            PoolTouchCounter(Arc::clone(&counter))
-                .with_filter(tracing_subscriber::filter::LevelFilter::INFO),
-        );
-        let _guard = tracing::subscriber::set_default(subscriber);
 
         let telemetry = Arc::new(crate::telemetry::TelemetryConfig::default());
         assert!(
             !telemetry.metrics.is_enabled(),
             "this harness must model an unconfigured, metrics-disabled deployment"
         );
-        let pool = unreachable_pool("postgres://127.0.0.1:1/sampler-guard-evidence");
+        let listener = accept_counting_pool().await;
         let cancel = CancellationToken::new();
-        let handles = spawn_the_four_unguarded_samplers(&pool, &cancel, &telemetry, interval);
+        let handles =
+            spawn_the_four_unguarded_samplers(&listener.pool, &cancel, &telemetry, interval);
 
         advance_sampler_ticks(interval, TICKS).await;
         cancel.cancel();
         for handle in handles {
             let _ = tokio::time::timeout(Duration::from_secs(5), handle).await;
         }
+        listener.stop();
 
-        let touches = load_pool_touch_count(&counter);
+        let touches = listener.touch_count();
         let label = std::env::var("PERF_LABEL").unwrap_or_else(|_| "unlabeled".to_string());
         eprintln!("label={label} ticks={TICKS} samplers=4 pool_touches={touches}");
 
@@ -28939,36 +28950,28 @@ mod tests {
     /// samplers must never touch the pool under an unconfigured
     /// deployment's usual state: metrics disabled and no DEBUG subscriber
     /// listening. This matches every guarded sibling
-    /// (`spawn_queue_depth_sampler` and friends). Not timing-sensitive: the
-    /// guard makes the count exactly zero, unconditionally, under this
-    /// subscriber. No race with real connect-refusal timing can make this
-    /// test flaky in either direction.
+    /// (`spawn_queue_depth_sampler` and friends). It counts real accepted
+    /// connections (`AcceptCountingListener`), not a tracing event. A
+    /// subscriber filtered to hide the count cannot pass this test
+    /// vacuously. PR #1468 review (Codex, P2) found that gap.
     #[tokio::test(start_paused = true)]
     async fn metrics_disabled_samplers_never_touch_the_pool() {
-        use tracing_subscriber::Layer;
-        use tracing_subscriber::layer::SubscriberExt;
-
         let interval = Duration::from_millis(50);
-        let counter = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let subscriber = tracing_subscriber::registry().with(
-            PoolTouchCounter(Arc::clone(&counter))
-                .with_filter(tracing_subscriber::filter::LevelFilter::INFO),
-        );
-        let _guard = tracing::subscriber::set_default(subscriber);
-
         let telemetry = Arc::new(crate::telemetry::TelemetryConfig::default());
-        let pool = unreachable_pool("postgres://127.0.0.1:1/sampler-guard-regression");
+        let listener = accept_counting_pool().await;
         let cancel = CancellationToken::new();
-        let handles = spawn_the_four_unguarded_samplers(&pool, &cancel, &telemetry, interval);
+        let handles =
+            spawn_the_four_unguarded_samplers(&listener.pool, &cancel, &telemetry, interval);
 
         advance_sampler_ticks(interval, 20).await;
         cancel.cancel();
         for handle in handles {
             let _ = tokio::time::timeout(Duration::from_secs(5), handle).await;
         }
+        listener.stop();
 
         assert_eq!(
-            load_pool_touch_count(&counter),
+            listener.touch_count(),
             0,
             "a metrics-disabled deployment with no DEBUG subscriber must never reach \
              pool.get() in any of these four samplers"
@@ -28986,23 +28989,22 @@ mod tests {
     async fn concurrency_sampler_stays_active_for_its_saturation_trace_under_debug_tracing() {
         use tracing_subscriber::layer::SubscriberExt;
 
-        let interval = Duration::from_millis(50);
-        let counter = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        // No level filter: this subscriber's ambient default enables DEBUG,
-        // modeling a deployment that runs with DEBUG tracing on.
-        let subscriber =
-            tracing_subscriber::registry().with(PoolTouchCounter(Arc::clone(&counter)));
+        // No filter: attaching this layer at all is enough to make
+        // `tracing::enabled!` read DEBUG as on, modeling a deployment that
+        // runs with DEBUG tracing.
+        let subscriber = tracing_subscriber::registry().with(DebugTracingOn);
         let _guard = tracing::subscriber::set_default(subscriber);
 
+        let interval = Duration::from_millis(50);
         let telemetry = Arc::new(crate::telemetry::TelemetryConfig::default());
         assert!(
             !telemetry.metrics.is_enabled(),
             "this test's point is metrics disabled, DEBUG tracing enabled"
         );
-        let pool = unreachable_pool("postgres://127.0.0.1:1/sampler-guard-debug-exception");
+        let listener = accept_counting_pool().await;
         let cancel = CancellationToken::new();
         let handle = spawn_concurrency_sampler(
-            vec![pool],
+            vec![listener.pool.clone()],
             cancel.clone(),
             telemetry,
             vec!["default".to_string()],
@@ -29012,9 +29014,10 @@ mod tests {
         advance_sampler_ticks(interval, 5).await;
         cancel.cancel();
         let _ = tokio::time::timeout(Duration::from_secs(5), handle).await;
+        listener.stop();
 
         assert!(
-            load_pool_touch_count(&counter) > 0,
+            listener.touch_count() > 0,
             "with DEBUG tracing enabled, spawn_concurrency_sampler must still reach \
              pool.get() even though metrics are disabled, or its saturation trace goes dark"
         );

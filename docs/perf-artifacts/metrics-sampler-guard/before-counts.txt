@@ -1,3 +1,3 @@
 -- before: metrics-disabled sampler pool-touch count, 4 samplers, 20 ticks, interval=50ms --
 samplers	ticks	pool_touches
-4	20	38
+4	20	20

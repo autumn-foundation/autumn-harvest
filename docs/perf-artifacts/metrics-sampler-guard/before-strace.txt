@@ -1,14 +1,6 @@
-
-running 1 test
-strace: Process 8181 attached
-label=before_strace ticks=20 samplers=4 pool_touches=38
-test worker::tests::zz_capture_metrics_sampler_guard_pool_touch_evidence ... ok
-
-test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 3404 filtered out; finished in 0.03s
-
 % time     seconds  usecs/call     calls    errors syscall
 ------ ----------- ----------- --------- --------- ----------------
- 77.28    0.000330           8        38        38 connect
- 22.72    0.000097           2        38           socket
+ 83.19    0.001242          59        21        21 connect
+ 16.81    0.000251           6        40        20 accept4
 ------ ----------- ----------- --------- --------- ----------------
-100.00    0.000427           5        76        38 total
+100.00    0.001493          24        61        41 total
