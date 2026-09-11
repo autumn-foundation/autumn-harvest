@@ -22,14 +22,23 @@ pub enum Request {
         approval_timeout_secs: u64,
     },
     /// Report one session.
-    Status { execution_id: String },
+    Status {
+        execution_id: String,
+        /// Print the pending call's arguments in full, however long they are.
+        full: bool,
+    },
     /// Report every session this database holds.
     List,
     /// Report the recorded event log of one session.
     History { execution_id: String },
     /// Release or refuse one approval-gated tool call.
+    ///
+    /// `call_id` is the tool-use id the operator was shown. The daemon refuses
+    /// the decision when the session has since moved to another call, so a
+    /// decision can never authorize work nobody reviewed.
     Approve {
         execution_id: String,
+        call_id: String,
         approved: bool,
         note: Option<String>,
     },

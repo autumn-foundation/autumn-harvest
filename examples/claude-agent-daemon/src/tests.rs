@@ -226,6 +226,77 @@ fn the_toolbox_refuses_a_path_outside_the_workspace() {
     );
 }
 
+/// Poll one session over the socket until it leaves `RUNNING`, approving the
+/// call it shows. Returns the terminal state it reached.
+///
+/// The decision names the call the status printed, and a decision naming
+/// another call is asserted to be refused.
+async fn settle_over_socket(socket: &Path, execution_id: &str) -> String {
+    let mut approved = false;
+    for _ in 0..200 {
+        let answer = protocol::call(
+            socket,
+            &Request::Status {
+                execution_id: execution_id.to_string(),
+                full: false,
+            },
+        )
+        .await
+        .expect("the status is answered");
+        let Response::Session { session } = answer else {
+            panic!("unexpected answer: {answer:?}");
+        };
+        if session.state != "RUNNING" {
+            assert!(approved, "the session never asked for approval");
+            return session.state;
+        }
+
+        if !approved && session.blocked_on.is_some() {
+            // An operator approves an action, not a session, so the exact call
+            // must be visible before the decision.
+            let pending = session.pending.as_ref().expect("the pending call is shown");
+            assert_eq!(pending.tool, tools::TOOL_WRITE_FILE);
+            assert!(
+                pending.input.contains("agent-notes.md"),
+                "the status must show what the write does: {}",
+                pending.input
+            );
+
+            // A decision that does not name the call it saw is refused.
+            let stale = protocol::call(
+                socket,
+                &Request::Approve {
+                    execution_id: execution_id.to_string(),
+                    call_id: "toolu_something_else".to_string(),
+                    approved: true,
+                    note: None,
+                },
+            )
+            .await
+            .expect("the daemon answers");
+            assert!(
+                matches!(stale, Response::Error { .. }),
+                "a decision for another call must be refused: {stale:?}"
+            );
+
+            protocol::call(
+                socket,
+                &Request::Approve {
+                    execution_id: execution_id.to_string(),
+                    call_id: pending.id.clone(),
+                    approved: true,
+                    note: None,
+                },
+            )
+            .await
+            .expect("the approval is answered");
+            approved = true;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    panic!("the session never reached a terminal state");
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn the_daemon_serves_one_session_over_its_socket() {
     let dir = tempfile::tempdir().expect("a temporary directory");
@@ -266,51 +337,8 @@ async fn the_daemon_serves_one_session_over_its_socket() {
         panic!("unexpected answer: {submitted:?}");
     };
 
-    // Approve as soon as the session parks, then wait for the terminal state.
-    let mut approved = false;
-    let mut final_state = String::new();
-    for _ in 0..200 {
-        let answer = protocol::call(
-            &socket,
-            &Request::Status {
-                execution_id: execution_id.clone(),
-            },
-        )
-        .await
-        .expect("the status is answered");
-        let Response::Session { session: view } = answer else {
-            panic!("unexpected answer: {answer:?}");
-        };
-        if view.state != "RUNNING" {
-            final_state = view.state;
-            break;
-        }
-        if !approved && view.blocked_on.is_some() {
-            // An operator approves an action, not a session, so the exact call
-            // must be visible before the decision.
-            let pending = view.pending.as_ref().expect("the pending call is shown");
-            assert_eq!(pending.tool, tools::TOOL_WRITE_FILE);
-            assert!(
-                pending.input.contains("agent-notes.md"),
-                "the status must show what the write does: {}",
-                pending.input
-            );
-            protocol::call(
-                &socket,
-                &Request::Approve {
-                    execution_id: execution_id.clone(),
-                    approved: true,
-                    note: None,
-                },
-            )
-            .await
-            .expect("the approval is answered");
-            approved = true;
-        }
-        tokio::time::sleep(Duration::from_millis(25)).await;
-    }
+    let final_state = settle_over_socket(&socket, &execution_id).await;
 
-    assert!(approved, "the session never asked for approval");
     assert_eq!(final_state, "COMPLETED", "the session did not finish");
 
     // The list and history answers carry sequences, which an internally tagged
@@ -332,6 +360,13 @@ async fn the_daemon_serves_one_session_over_its_socket() {
     assert!(
         events.iter().any(|event| event.contains("WorkflowStarted")),
         "the event log is missing its start: {events:?}"
+    );
+    // An audit trail must say what the agent did, not only which events ran.
+    assert!(
+        events
+            .iter()
+            .any(|event| event.contains("agent-notes.md") || event.contains("write_file")),
+        "the event log does not record what the tools did: {events:?}"
     );
 
     daemon.abort();
@@ -609,5 +644,96 @@ fn a_zero_drive_interval_is_rejected() {
     assert!(
         crate::Cli::try_parse_from(["agentd", "serve", "--tick-ms", "1"]).is_ok(),
         "one millisecond is a usable period"
+    );
+}
+
+#[tokio::test]
+async fn the_full_view_shows_a_write_that_the_status_trims() {
+    let dir = tempfile::tempdir().expect("a temporary directory");
+    let workspace = dir.path().join("workspace");
+    std::fs::create_dir_all(&workspace).expect("the workspace is created");
+
+    // A write may carry up to 64 KiB, and an operator approves the WHOLE of it.
+    let content = "x".repeat(5000);
+    let tail = "THE-END-OF-THE-PAYLOAD";
+    let payload = format!("{content}{tail}");
+
+    let mut rt = SqliteRuntime::open(dir.path().join("agentd.db")).expect("the database opens");
+    rt.register_workflow(&session::agent_session_info());
+    let written = payload.clone();
+    rt.register_activity(&session::claude_turn_info(), move |_input| {
+        let input = json!({ "path": "notes.md", "content": written });
+        serde_json::to_value(TurnReply {
+            content: json!([
+                { "type": "tool_use", "id": "toolu_big", "name": tools::TOOL_WRITE_FILE, "input": input },
+            ]),
+            stop_reason: "tool_use".to_string(),
+            text: String::new(),
+            tool_calls: vec![ToolCall {
+                id: "toolu_big".to_string(),
+                name: tools::TOOL_WRITE_FILE.to_string(),
+                input: json!({ "path": "notes.md", "content": payload }),
+            }],
+        })
+        .map_err(|e| format!("bad reply: {e}"))
+    });
+    rt.register_activity(
+        &session::run_tool_info(),
+        tools::activity_body(workspace.clone()),
+    );
+
+    let exec = rt
+        .start_workflow(WORKFLOW_NAME, task(&workspace))
+        .expect("the session starts");
+    let signal = drive_to_approval(&mut rt, exec).await;
+
+    let trimmed = daemon::pending_call(&rt, exec, &signal, false).expect("the status shows a call");
+    assert!(
+        trimmed.input.contains("truncated"),
+        "the status must say when it has trimmed the payload"
+    );
+    assert!(
+        !trimmed.input.contains(tail),
+        "the trimmed view cannot hold the whole payload"
+    );
+
+    let whole = daemon::pending_call(&rt, exec, &signal, true).expect("the full view shows a call");
+    assert!(
+        whole.input.contains(tail),
+        "the full view must show every byte an approval authorises"
+    );
+    assert!(
+        !whole.input.contains("truncated"),
+        "the full view must not be trimmed"
+    );
+}
+
+#[test]
+fn only_an_accepted_request_is_refused_a_retry() {
+    use autumn_harvest::failure::parse_error_payload_full;
+    use reqwest::StatusCode;
+
+    // A body that fails after a 2xx means the turn was billed. Retrying buys it
+    // twice, so that case is terminal.
+    let accepted = parse_error_payload_full(&claude::body_failure(StatusCode::OK, "it went away"));
+    assert!(
+        accepted.non_retryable,
+        "a lost response to an accepted request must not be retried"
+    );
+
+    // A rate limit produced no turn, so it must still back off and retry.
+    for status in [StatusCode::TOO_MANY_REQUESTS, StatusCode::BAD_GATEWAY] {
+        let transient = parse_error_payload_full(&claude::body_failure(status, "it went away"));
+        assert!(
+            !transient.non_retryable,
+            "{status} must stay retryable even when its body is unreadable"
+        );
+    }
+
+    // A rejected request fails the same way whether or not its body read.
+    let rejected = parse_error_payload_full(&claude::body_failure(StatusCode::BAD_REQUEST, "gone"));
+    assert!(
+        rejected.non_retryable,
+        "a rejected request must not be retried"
     );
 }

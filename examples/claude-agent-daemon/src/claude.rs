@@ -116,28 +116,23 @@ fn call_api(
     let response = response.map_err(|e| format!("the request to the Claude API failed: {e}"))?;
     let status = response.status();
 
-    // A failure reading the body is NOT ambiguous: the request was accepted,
-    // and a retry would buy the same turn a second time for certain. Fail the
-    // attempt terminally instead, and let the operator decide.
     let text = match tokio::task::block_in_place(|| Handle::current().block_on(response.text())) {
         Ok(text) => text,
-        Err(e) => {
-            return Err(ActivityFailure::non_retryable(
-                "ClaudeApiResponseLost",
-                format!(
-                    "the Claude API accepted the request and its response was lost: {e}. \
-                     The turn is not retried, because a retry would be charged again."
-                ),
-            )
-            .into_error_payload());
-        }
+        Err(e) => return Err(body_failure(status, &format!("its response was lost: {e}"))),
     };
 
     if !status.is_success() {
         return Err(http_failure(status, &text));
     }
-    let payload: Value = serde_json::from_str(&text)
-        .map_err(|e| format!("the Claude API response is not JSON: {e}"))?;
+    let payload: Value = match serde_json::from_str(&text) {
+        Ok(payload) => payload,
+        Err(e) => {
+            return Err(body_failure(
+                status,
+                &format!("its response did not parse as JSON: {e}"),
+            ));
+        }
+    };
     Ok(parse_reply(&payload))
 }
 
@@ -154,6 +149,28 @@ fn request_body(config: &ModelConfig, request: &TurnRequest) -> Value {
         // Paired with the `anthropic-beta` header above.
         "fallbacks": "default",
     })
+}
+
+/// Classify a failure that happened AFTER the response headers arrived.
+///
+/// On a SUCCESS status the request was accepted and billed, so a retry buys the
+/// same turn a second time for certain. That is terminal: the operator decides,
+/// rather than the retry policy paying again. On any other status the request
+/// did not produce a turn. The status alone decides there, exactly as it does
+/// for a body that read cleanly. A rate limit therefore still backs off and
+/// retries, instead of ending the session.
+pub fn body_failure(status: reqwest::StatusCode, detail: &str) -> String {
+    if status.is_success() {
+        return ActivityFailure::non_retryable(
+            "ClaudeApiResponseLost",
+            format!(
+                "the Claude API accepted the request and {detail}. The turn is not \
+                 retried, because a retry would be charged again."
+            ),
+        )
+        .into_error_payload();
+    }
+    http_failure(status, "the error body could not be read")
 }
 
 /// Classify a non-2xx response.

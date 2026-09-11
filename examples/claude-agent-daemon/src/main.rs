@@ -101,20 +101,30 @@ enum Command {
         approval_timeout_secs: u64,
     },
     /// Report one session.
-    Status { execution_id: String },
+    Status {
+        execution_id: String,
+        /// Print the pending call's arguments in full.
+        #[arg(long)]
+        full: bool,
+    },
     /// Report every session.
     List,
     /// Print the recorded event log of one session.
     History { execution_id: String },
     /// Release one gated tool call.
+    ///
+    /// `call_id` is the tool-use id `status` printed. Naming it is what keeps
+    /// the decision tied to the call you read.
     Approve {
         execution_id: String,
+        call_id: String,
         #[arg(long)]
         note: Option<String>,
     },
     /// Refuse one gated tool call.
     Deny {
         execution_id: String,
+        call_id: String,
         #[arg(long)]
         note: Option<String>,
     },
@@ -176,29 +186,39 @@ async fn run(cli: Cli) -> Result<(), String> {
             )
             .await?,
         ),
-        Command::Status { execution_id } => {
-            report(protocol::call(&cli.socket, &Request::Status { execution_id }).await?)
+        Command::Status { execution_id, full } => {
+            report(protocol::call(&cli.socket, &Request::Status { execution_id, full }).await?)
         }
         Command::List => report(protocol::call(&cli.socket, &Request::List).await?),
         Command::History { execution_id } => {
             report(protocol::call(&cli.socket, &Request::History { execution_id }).await?)
         }
-        Command::Approve { execution_id, note } => report(
+        Command::Approve {
+            execution_id,
+            call_id,
+            note,
+        } => report(
             protocol::call(
                 &cli.socket,
                 &Request::Approve {
                     execution_id,
+                    call_id,
                     approved: true,
                     note,
                 },
             )
             .await?,
         ),
-        Command::Deny { execution_id, note } => report(
+        Command::Deny {
+            execution_id,
+            call_id,
+            note,
+        } => report(
             protocol::call(
                 &cli.socket,
                 &Request::Approve {
                     execution_id,
+                    call_id,
                     approved: false,
                     note,
                 },
@@ -246,6 +266,10 @@ fn print_session(view: &SessionView) {
     if let Some(pending) = &view.pending {
         println!("  pending: {} ({})", pending.tool, pending.id);
         println!("           {}", pending.input);
+        println!(
+            "  decide:  agentd approve {} {}   (or `deny`)",
+            view.execution_id, pending.id
+        );
     }
     if let Some(answer) = &view.answer {
         println!("  answer:  {answer}");

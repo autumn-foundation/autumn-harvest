@@ -60,6 +60,9 @@ type Job = (Request, oneshot::Sender<Response>);
 /// it is generous; the marker says when there is more.
 const MAX_PENDING_INPUT_CHARS: usize = 2000;
 
+/// The largest event detail one audit line carries.
+const MAX_EVENT_DETAIL_CHARS: usize = 240;
+
 /// Why one session is parked, and what would release it.
 #[derive(Clone)]
 struct ParkedState {
@@ -271,7 +274,7 @@ fn handle(
             max_turns,
             approval_timeout_secs,
         } => submit(runtime, workspace, goal, max_turns, approval_timeout_secs),
-        Request::Status { execution_id } => match sessions(runtime, reader, blocked) {
+        Request::Status { execution_id, full } => match sessions(runtime, reader, blocked, full) {
             Ok(views) => views
                 .into_iter()
                 .find(|view| view.execution_id == execution_id)
@@ -283,16 +286,17 @@ fn handle(
                 ),
             Err(message) => Response::Error { message },
         },
-        Request::List => match sessions(runtime, reader, blocked) {
+        Request::List => match sessions(runtime, reader, blocked, false) {
             Ok(sessions) => Response::Sessions { sessions },
             Err(message) => Response::Error { message },
         },
         Request::History { execution_id } => history(runtime, &execution_id),
         Request::Approve {
             execution_id,
+            call_id,
             approved,
             note,
-        } => approve(runtime, blocked, &execution_id, approved, note),
+        } => approve(runtime, blocked, &execution_id, &call_id, approved, note),
     }
 }
 
@@ -340,6 +344,7 @@ fn approve(
     runtime: &mut SqliteRuntime,
     blocked: &Parked,
     execution_id: &str,
+    call_id: &str,
     approved: bool,
     note: Option<String>,
 ) -> Response {
@@ -356,6 +361,19 @@ fn approve(
             message: format!("session {execution_id} is not waiting for a decision"),
         };
     };
+    // The wait can move on between the status and the decision: a deadline can
+    // expire, and the session then parks on the NEXT call. Matching the id the
+    // operator was shown is what stops a decision landing on a call nobody
+    // reviewed.
+    let awaiting = session::approval_call_id(&signal).unwrap_or_default();
+    if awaiting != call_id {
+        return Response::Error {
+            message: format!(
+                "session {execution_id} is now waiting on `{awaiting}`, not `{call_id}`. \
+                 Read `agentd status {execution_id}` again before deciding."
+            ),
+        };
+    }
     let decision = ApprovalDecision { approved, note };
     let payload = match serde_json::to_value(decision) {
         Ok(value) => value,
@@ -394,7 +412,7 @@ fn history(runtime: &SqliteRuntime, execution_id: &str) -> Response {
             events: events
                 .iter()
                 .enumerate()
-                .map(|(index, event)| format!("{:>3}  {}", index + 1, event_label(event)))
+                .map(|(index, event)| format!("{:>3}  {}", index + 1, describe(event)))
                 .collect(),
         },
         Err(e) => Response::Error {
@@ -403,17 +421,33 @@ fn history(runtime: &SqliteRuntime, execution_id: &str) -> Response {
     }
 }
 
-/// The `type` tag of one recorded event.
-fn event_label(event: &autumn_harvest::WorkflowEvent) -> String {
-    serde_json::to_value(event)
-        .ok()
-        .and_then(|value| {
-            value
-                .get("type")
-                .and_then(Value::as_str)
-                .map(ToString::to_string)
-        })
-        .unwrap_or_else(|| "unknown".to_string())
+/// Describe one recorded event for the audit trail.
+///
+/// A type label alone cannot answer what the agent did, which is the whole
+/// point of the command. So each event carries its own data too, rendered
+/// compactly and trimmed to one readable line. The rendering is generic and
+/// prints whatever the event holds. A new event variant therefore needs no
+/// change here, and is never reduced to a bare name.
+fn describe(event: &autumn_harvest::WorkflowEvent) -> String {
+    let Ok(value) = serde_json::to_value(event) else {
+        return "unreadable event".to_string();
+    };
+    let label = value
+        .get("type")
+        .and_then(Value::as_str)
+        .unwrap_or("unknown");
+
+    match value.get("data") {
+        Some(data) if !data.is_null() => {
+            let mut rendered = data.to_string();
+            if rendered.chars().count() > MAX_EVENT_DETAIL_CHARS {
+                rendered = rendered.chars().take(MAX_EVENT_DETAIL_CHARS).collect();
+                rendered.push('…');
+            }
+            format!("{label}  {rendered}")
+        }
+        _ => label.to_string(),
+    }
 }
 
 /// Project every execution row into an operator view.
@@ -421,15 +455,16 @@ fn sessions(
     runtime: &SqliteRuntime,
     reader: &Connection,
     blocked: &Parked,
+    full: bool,
 ) -> Result<Vec<SessionView>, String> {
     Ok(inspect::executions(reader, WORKFLOW_NAME)?
         .into_iter()
-        .map(|row| view(runtime, &row, blocked))
+        .map(|row| view(runtime, &row, blocked, full))
         .collect())
 }
 
 /// Build one operator view.
-fn view(runtime: &SqliteRuntime, row: &ExecutionRow, blocked: &Parked) -> SessionView {
+fn view(runtime: &SqliteRuntime, row: &ExecutionRow, blocked: &Parked, full: bool) -> SessionView {
     let goal = serde_json::from_str::<SessionTask>(&row.input_json)
         .map_or_else(|_| "<unreadable task>".to_string(), |task| task.goal);
     let answer = row
@@ -445,7 +480,7 @@ fn view(runtime: &SqliteRuntime, row: &ExecutionRow, blocked: &Parked) -> Sessio
     let exec = row.exec_id.parse::<ExecutionId>().ok();
     let state = exec.and_then(|exec| blocked.get(&exec));
     let pending = match (exec, state.and_then(|state| state.signal.as_deref())) {
-        (Some(exec), Some(signal)) => pending_call(runtime, exec, signal),
+        (Some(exec), Some(signal)) => pending_call(runtime, exec, signal, full),
         _ => None,
     };
 
@@ -466,7 +501,12 @@ fn view(runtime: &SqliteRuntime, row: &ExecutionRow, blocked: &Parked) -> Sessio
 /// model activity, so the history is the source of truth here. That is true of
 /// the run itself as well. The most recent model reply holds the awaited call,
 /// so the scan runs backwards.
-fn pending_call(runtime: &SqliteRuntime, exec: ExecutionId, signal: &str) -> Option<PendingCall> {
+pub fn pending_call(
+    runtime: &SqliteRuntime,
+    exec: ExecutionId,
+    signal: &str,
+    full: bool,
+) -> Option<PendingCall> {
     let call_id = session::approval_call_id(signal)?;
     let history = runtime.load_history(exec).ok()?;
 
@@ -483,9 +523,12 @@ fn pending_call(runtime: &SqliteRuntime, exec: ExecutionId, signal: &str) -> Opt
         };
         if let Some(call) = reply.tool_calls.into_iter().find(|call| call.id == call_id) {
             let mut input = call.input.to_string();
-            if input.chars().count() > MAX_PENDING_INPUT_CHARS {
+            // A decision needs the WHOLE payload, and a write carries up to
+            // 64 KiB. The status trims it to stay readable, and `--full` prints
+            // every byte, so nothing is ever approved sight unseen.
+            if !full && input.chars().count() > MAX_PENDING_INPUT_CHARS {
                 input = input.chars().take(MAX_PENDING_INPUT_CHARS).collect();
-                input.push_str(" … (truncated)");
+                input.push_str(" … (truncated; read it all with `status --full`)");
             }
             return Some(PendingCall {
                 id: call.id,

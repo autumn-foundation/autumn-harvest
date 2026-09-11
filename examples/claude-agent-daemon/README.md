@@ -38,8 +38,9 @@ cargo run -p claude-agent-daemon -- status <id>
 #    blocked: waiting for a tool approval
 #    pending: write_file (toolu_offline_write)
 #             {"content":"# Offline stub\n…","path":"agent-notes.md"}
+#    decide:  agentd approve ffffc7df-… toolu_offline_write   (or `deny`)
 
-cargo run -p claude-agent-daemon -- approve <id>
+cargo run -p claude-agent-daemon -- approve <id> toolu_offline_write
 cargo run -p claude-agent-daemon -- status <id>
 #  ffffc7df-…  COMPLETED
 #    answer:  [end_turn after 3 turns, 2 tool calls] …
@@ -73,18 +74,18 @@ cargo run -p claude-agent-daemon -- status <id>     # blocked: waiting for a too
 pkill -x agentd                                     # the process dies with work in flight
 
 cargo run -p claude-agent-daemon -- serve --workspace /tmp/agent-demo &
-cargo run -p claude-agent-daemon -- approve <id>
+cargo run -p claude-agent-daemon -- approve <id> <call-id>
 cargo run -p claude-agent-daemon -- status <id>     # COMPLETED
 cargo run -p claude-agent-daemon -- history <id>
-#    1  WorkflowStarted
-#    2  ActivityScheduled      ← turn 1: the model call
-#    3  ActivityCompleted
+#    1  WorkflowStarted  {"input":{"goal":"summarise the README",…}}
+#    2  ActivityScheduled  {"activity_name":"claude_turn",…}   ← turn 1
+#    3  ActivityCompleted  {"output":{"stop_reason":"tool_use",…}}
 #    …
-#    8  TimerStarted           ← the approval deadline
-#    9  SignalReceived         ← your `approve`
-#   10  ActivityScheduled      ← the gated write
+#    8  TimerStarted  {…}                    ← the approval deadline
+#    9  SignalReceived  {"name":"tool_approval:toolu_…",…}
+#   10  ActivityScheduled  {"activity_name":"run_tool",…}      ← the gated write
 #   …
-#   14  WorkflowCompleted
+#   14  WorkflowCompleted  {"output":{"stop":"end_turn",…}}
 ```
 
 The second daemon re-registers the same handlers and replays the recorded
@@ -98,10 +99,10 @@ exactly that, by counting model calls in each process.
 | --- | --- |
 | `agentd serve` | Run the daemon. This process is the single writer. |
 | `agentd submit "<goal>"` | Start one session; prints its execution id. |
-| `agentd status <id>` | One session: state, why it is parked, its answer. |
+| `agentd status <id> [--full]` | One session: state, why it is parked, the exact pending call, its answer. `--full` prints the call's arguments untrimmed. |
 | `agentd list` | Every session in the database. |
-| `agentd history <id>` | The recorded event log — the audit trail. |
-| `agentd approve <id>` / `deny <id>` | Release or refuse a gated tool call. |
+| `agentd history <id>` | The recorded event log with each event's data — the audit trail. |
+| `agentd approve <id> <call-id>` / `deny <id> <call-id>` | Release or refuse the named gated tool call. |
 
 Flags: `--db` (default `agentd.db`), `--socket` (default `agentd.sock`),
 `--workspace`, `--model`, `--max-tokens`, `--tick-ms`. Each also reads an
@@ -125,10 +126,15 @@ could apply an already-approved write to the wrong project.
 
 **Approval is per call, not per session.** The workflow waits on a signal whose
 name carries the tool-use id, and `status` prints the exact call — the tool, its
-id, and its arguments — before you decide. `approve <id>` is addressed to the
-call the daemon is currently parked on, so an early or repeated decision has no
-live wait to land in and is refused rather than stored for some later, unseen
-write.
+id, and its arguments — before you decide. The decision names that id, and the
+daemon refuses it when the session has since moved on: a deadline can expire
+while you read, and a decision must never land on the next call instead. An
+early or repeated decision has no live wait to land in and is refused too,
+rather than stored for some later, unseen write.
+
+A write can carry up to 64 KiB, and `status` trims a long one to stay readable.
+It says so when it does, and `status <id> --full` prints every byte — so nothing
+is ever approved sight unseen.
 
 ## How it is put together
 
@@ -179,11 +185,12 @@ write.
 cargo test -p claude-agent-daemon
 ```
 
-Fourteen tests, all offline: the happy path, a denied tool call, the restart
+Sixteen tests, all offline: the happy path, a denied tool call, the restart
 proof, the workspace sandbox (two symlink escapes and the read cap), a
-truncated turn, a stale approval, a session bound to another workspace, the
-single-writer lock through every alias, the socket's privacy, the drive
-interval, and one end-to-end run through the daemon socket.
+truncated turn, a stale approval, the full approval view, a session bound to
+another workspace, the single-writer lock through every alias, the socket's
+privacy, the drive interval, which API failures may be retried, and one
+end-to-end run through the daemon socket.
 
 ## What this example does not do
 
@@ -215,9 +222,11 @@ Honest limits, so nothing here reads as a promise:
   connection drops, after the API accepts a request but before the result is
   committed, that one turn is sent again on resume. The window is one turn
   wide, and only the uncommitted turn: every turn already in history replays
-  for free, which is the property the restart proof shows. The one unambiguous
-  case — the request accepted, its response lost — is not retried at all, since
-  a retry there would be charged again for certain.
+  for free, which is the property the restart proof shows. Every unambiguous
+  case — the request accepted, and its response then lost or unparseable — is
+  not retried at all, since a retry there would be charged again for certain. A
+  rate limit or a server fault produced no turn, so those still back off and
+  retry as the policy says.
 - **Unix only.** The control surface is a Unix domain socket, so the daemon
   runs on Linux and macOS. A Windows port needs a named pipe or a TCP port.
 - **The offline stub is not Claude.** It exists so the durability story is
