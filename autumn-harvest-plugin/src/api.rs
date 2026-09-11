@@ -33704,7 +33704,81 @@ async fn get_start_throttle_pacing_override(
     }
 }
 
+/// Record a `STATUS_FAILED` audit row for a pacing-override SET/CLEAR request
+/// rejected before any shard write (issue #1229, finding 3).
+///
+/// The four pacing-override mutation handlers early-return on a bad
+/// refill/burst, an unrecognized JSON field, an unregistered activity or
+/// workflow, or a dynamic-key policy. Every one of those branches ran before
+/// `audit_context` was ever called, so a rejected administrative attempt left
+/// no audit trace. Centralizing the insert here turns each branch into a
+/// one-line call. Mirrors `schedule_create_audit_failed`'s best-effort shape:
+/// an insert failure is swallowed, never surfaced, so a rejection response is
+/// never replaced by an unrelated error.
+#[allow(clippy::too_many_arguments)]
+async fn audit_rejected_pacing_override(
+    pool: &HarvestDbPool,
+    actor: &str,
+    source: &str,
+    request_id: Option<&str>,
+    operation: &str,
+    target_type: &str,
+    target_id: &str,
+    route: &str,
+    error_summary: &str,
+) {
+    let Ok(mut conn) = acquire_conn(pool.default_pool()).await else {
+        return;
+    };
+    let ar = NewAuditRecord {
+        actor,
+        operation,
+        target_type,
+        target_id: Some(target_id),
+        route_or_command: route,
+        request_id,
+        idempotency_key: None,
+        status: STATUS_FAILED,
+        error_summary: Some(error_summary),
+        shard_id: None,
+        source,
+    };
+    let _ = audit::insert_audit(&mut conn, &ar).await;
+}
+
+/// Audit a rejected pacing-override request, then return its response.
+///
+/// Every early return in the four pacing-override mutation handlers goes
+/// through this macro so it is audited before responding (issue #1229,
+/// finding 3). One module-level macro, instead of one copy per handler.
+/// Every argument is passed explicitly. It is not read from an enclosing
+/// local by bare name. A `macro_rules!` defined outside a function cannot
+/// see that function's locals. It only sees tokens its caller hands it.
+macro_rules! reject_pacing_override {
+    (
+        $pool:expr, $actor:expr, $source:expr, $request_id:expr,
+        $op:expr, $target_type:expr, $target_id:expr, $route:expr, $err:expr
+    ) => {{
+        let err = $err;
+        let error_summary = err.to_string();
+        audit_rejected_pacing_override(
+            $pool,
+            $actor,
+            $source,
+            $request_id,
+            $op,
+            $target_type,
+            $target_id,
+            $route,
+            &error_summary,
+        )
+        .await;
+        return err.into_response();
+    }};
+}
+
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct StartThrottlePacingOverrideRequest {
     refill_per_sec: Option<f64>,
     burst: Option<f64>,
@@ -33738,60 +33812,8 @@ async fn set_start_throttle_pacing_override(
     headers: axum::http::HeaderMap,
     Extension(api_state): Extension<HarvestApiState>,
     Path(workflow_name): Path<String>,
-    Json(request): Json<StartThrottlePacingOverrideRequest>,
+    body: Result<Json<StartThrottlePacingOverrideRequest>, JsonRejection>,
 ) -> impl axum::response::IntoResponse {
-    if let Some(rate) = request.refill_per_sec
-        && (!rate.is_finite() || rate <= 0.0)
-    {
-        return AutumnError::bad_request_msg(
-            "refill_per_sec must be a finite number greater than zero",
-        )
-        .into_response();
-    }
-    if let Some(burst) = request.burst
-        && (!burst.is_finite() || burst < 1.0)
-    {
-        return AutumnError::bad_request_msg("burst must be a finite number, at least 1.0")
-            .into_response();
-    }
-    if request.refill_per_sec.is_none() && request.burst.is_none() {
-        return AutumnError::bad_request_msg(
-            "must override at least one of refill_per_sec or burst",
-        )
-        .into_response();
-    }
-    let expires_at = match pacing_override_expiry(request.ttl_secs) {
-        Ok(v) => v,
-        Err(e) => return e.into_response(),
-    };
-
-    let runtime = match api_state.runtime().map_err(map_error) {
-        Ok(r) => r,
-        Err(e) => return e.into_response(),
-    };
-    let Some(workflow) = runtime.registry().workflows.get(&workflow_name) else {
-        return AutumnError::not_found_msg(format!("workflow '{workflow_name}' is not registered"))
-            .into_response();
-    };
-    let Some(policy) = workflow.throttle else {
-        return AutumnError::not_found_msg(format!(
-            "workflow '{workflow_name}' has no declared start throttle; nothing to override"
-        ))
-        .into_response();
-    };
-    if let Some(expr) = policy.key_expr {
-        return AutumnError::bad_request_msg(format!(
-            "workflow '{workflow_name}' uses a dynamic per-key start throttle \
-             (key expression '{expr}'); a pacing override targets a single \
-             static bucket and cannot be applied to a dynamically-keyed policy"
-        ))
-        .with_status(axum::http::StatusCode::CONFLICT)
-        .into_response();
-    }
-    let declared_refill_rate = policy.refill_per_sec;
-    let declared_burst = policy.burst;
-    let key = autumn_harvest::throttle::bucket_key(&workflow_name, "");
-
     let pool = match api_state.storage_pool().map_err(map_error) {
         Ok(p) => p,
         Err(e) => return e.into_response(),
@@ -33799,14 +33821,166 @@ async fn set_start_throttle_pacing_override(
     let (actor, source, request_id) = audit_context(&headers, &api_state);
     let route = "POST /admin/start-throttle/{workflow_name}/override";
 
+    // The body is unwrapped in-handler, not by a bare `Json` extractor. A
+    // rejected body -- most importantly an unknown field, rejected via
+    // `deny_unknown_fields` -- surfaces as this route's documented `400`.
+    // It carries a failed audit row, never axum's default plain-text `422`
+    // (mirrors `update_schedule_handler`).
+    let request = match body {
+        Ok(Json(req)) => req,
+        Err(rejection) => {
+            let err_summary = format!("invalid request body: {}", rejection.body_text());
+            reject_pacing_override!(
+                &pool,
+                &actor,
+                &source,
+                request_id.as_deref(),
+                OP_START_THROTTLE_PACING_OVERRIDE_SET,
+                TARGET_THROTTLE,
+                &workflow_name,
+                route,
+                AutumnError::bad_request_msg(err_summary)
+            );
+        }
+    };
+
+    if let Some(rate) = request.refill_per_sec
+        && (!rate.is_finite() || rate <= 0.0)
+    {
+        reject_pacing_override!(
+            &pool,
+            &actor,
+            &source,
+            request_id.as_deref(),
+            OP_START_THROTTLE_PACING_OVERRIDE_SET,
+            TARGET_THROTTLE,
+            &workflow_name,
+            route,
+            AutumnError::bad_request_msg(
+                "refill_per_sec must be a finite number greater than zero"
+            )
+        );
+    }
+    if let Some(burst) = request.burst
+        && (!burst.is_finite() || burst < 1.0)
+    {
+        reject_pacing_override!(
+            &pool,
+            &actor,
+            &source,
+            request_id.as_deref(),
+            OP_START_THROTTLE_PACING_OVERRIDE_SET,
+            TARGET_THROTTLE,
+            &workflow_name,
+            route,
+            AutumnError::bad_request_msg("burst must be a finite number, at least 1.0")
+        );
+    }
+    if request.refill_per_sec.is_none() && request.burst.is_none() {
+        reject_pacing_override!(
+            &pool,
+            &actor,
+            &source,
+            request_id.as_deref(),
+            OP_START_THROTTLE_PACING_OVERRIDE_SET,
+            TARGET_THROTTLE,
+            &workflow_name,
+            route,
+            AutumnError::bad_request_msg("must override at least one of refill_per_sec or burst")
+        );
+    }
+    let expires_at = match pacing_override_expiry(request.ttl_secs) {
+        Ok(v) => v,
+        Err(e) => reject_pacing_override!(
+            &pool,
+            &actor,
+            &source,
+            request_id.as_deref(),
+            OP_START_THROTTLE_PACING_OVERRIDE_SET,
+            TARGET_THROTTLE,
+            &workflow_name,
+            route,
+            e
+        ),
+    };
+
+    let runtime = match api_state.runtime().map_err(map_error) {
+        Ok(r) => r,
+        Err(e) => return e.into_response(),
+    };
+    let Some(workflow) = runtime.registry().workflows.get(&workflow_name) else {
+        reject_pacing_override!(
+            &pool,
+            &actor,
+            &source,
+            request_id.as_deref(),
+            OP_START_THROTTLE_PACING_OVERRIDE_SET,
+            TARGET_THROTTLE,
+            &workflow_name,
+            route,
+            AutumnError::not_found_msg(format!("workflow '{workflow_name}' is not registered"))
+        );
+    };
+    let Some(policy) = workflow.throttle else {
+        reject_pacing_override!(
+            &pool,
+            &actor,
+            &source,
+            request_id.as_deref(),
+            OP_START_THROTTLE_PACING_OVERRIDE_SET,
+            TARGET_THROTTLE,
+            &workflow_name,
+            route,
+            AutumnError::not_found_msg(format!(
+                "workflow '{workflow_name}' has no declared start throttle; nothing to override"
+            ))
+        );
+    };
+    if let Some(expr) = policy.key_expr {
+        reject_pacing_override!(
+            &pool,
+            &actor,
+            &source,
+            request_id.as_deref(),
+            OP_START_THROTTLE_PACING_OVERRIDE_SET,
+            TARGET_THROTTLE,
+            &workflow_name,
+            route,
+            AutumnError::bad_request_msg(format!(
+                "workflow '{workflow_name}' uses a dynamic per-key start throttle \
+                 (key expression '{expr}'); a pacing override targets a single \
+                 static bucket and cannot be applied to a dynamically-keyed policy"
+            ))
+            .with_status(axum::http::StatusCode::CONFLICT)
+        );
+    }
+    let declared_refill_rate = policy.refill_per_sec;
+    let declared_burst = policy.burst;
+    let key = autumn_harvest::throttle::bucket_key(&workflow_name, "");
+
+    // Fan out over every shard the ROUTER knows about. Do not merely use
+    // every shard this process holds a live pool for. `pool.iter_shards()`
+    // silently dropped a shard the router already advertises mid a
+    // shard-add rollout. A mutation could then return a bare `200` while a
+    // real, router-known shard never received the write (issue #1229,
+    // finding 1). A missing pool for an expected shard is now a fan-out
+    // failure. It is folded into `shard_errors` like any other unreachable
+    // shard.
+    let pools = crate::shard_fanout::pools_by_shard(&api_state);
+    let expected = crate::shard_fanout::expected_shards(&api_state, &pools);
+
     let mut any_success = false;
     let mut shard_errors: Vec<String> = Vec::new();
     let mut persisted_baseline: Option<(f64, f64)> = None;
-    for (shard_id, shard_pool) in pool.iter_shards() {
+    for shard_id in expected {
+        let Some(shard_pool) = pools.get(&shard_id) else {
+            shard_errors.push(format!("shard {shard_id}: has no configured storage pool"));
+            continue;
+        };
         let mut conn = match acquire_conn(shard_pool).await {
             Ok(c) => c,
             Err(e) => {
-                shard_errors.push(format!("shard {}: {e}", shard_id.as_i32()));
+                shard_errors.push(format!("shard {shard_id}: {e}"));
                 continue;
             }
         };
@@ -33830,7 +34004,7 @@ async fn set_start_throttle_pacing_override(
                     persisted_baseline = Some((row.refill_rate, row.burst));
                 }
             }
-            Err(e) => shard_errors.push(format!("shard {}: {e}", shard_id.as_i32())),
+            Err(e) => shard_errors.push(format!("shard {shard_id}: {e}")),
         }
     }
 
@@ -33935,33 +34109,6 @@ async fn clear_start_throttle_pacing_override(
     Extension(api_state): Extension<HarvestApiState>,
     Path(workflow_name): Path<String>,
 ) -> impl axum::response::IntoResponse {
-    let runtime = match api_state.runtime().map_err(map_error) {
-        Ok(r) => r,
-        Err(e) => return e.into_response(),
-    };
-    let Some(workflow) = runtime.registry().workflows.get(&workflow_name) else {
-        return AutumnError::not_found_msg(format!("workflow '{workflow_name}' is not registered"))
-            .into_response();
-    };
-    let Some(policy) = workflow.throttle else {
-        return AutumnError::not_found_msg(format!(
-            "workflow '{workflow_name}' has no declared start throttle; nothing to override"
-        ))
-        .into_response();
-    };
-    if let Some(expr) = policy.key_expr {
-        return AutumnError::bad_request_msg(format!(
-            "workflow '{workflow_name}' uses a dynamic per-key start throttle \
-             (key expression '{expr}'); a pacing override targets a single \
-             static bucket and cannot be applied to a dynamically-keyed policy"
-        ))
-        .with_status(axum::http::StatusCode::CONFLICT)
-        .into_response();
-    }
-    let declared_refill_rate = policy.refill_per_sec;
-    let declared_burst = policy.burst;
-    let key = autumn_harvest::throttle::bucket_key(&workflow_name, "");
-
     let pool = match api_state.storage_pool().map_err(map_error) {
         Ok(p) => p,
         Err(e) => return e.into_response(),
@@ -33969,14 +34116,79 @@ async fn clear_start_throttle_pacing_override(
     let (actor, source, request_id) = audit_context(&headers, &api_state);
     let route = "DELETE /admin/start-throttle/{workflow_name}/override";
 
+    let runtime = match api_state.runtime().map_err(map_error) {
+        Ok(r) => r,
+        Err(e) => return e.into_response(),
+    };
+    let Some(workflow) = runtime.registry().workflows.get(&workflow_name) else {
+        reject_pacing_override!(
+            &pool,
+            &actor,
+            &source,
+            request_id.as_deref(),
+            OP_START_THROTTLE_PACING_OVERRIDE_CLEAR,
+            TARGET_THROTTLE,
+            &workflow_name,
+            route,
+            AutumnError::not_found_msg(format!("workflow '{workflow_name}' is not registered"))
+        );
+    };
+    let Some(policy) = workflow.throttle else {
+        reject_pacing_override!(
+            &pool,
+            &actor,
+            &source,
+            request_id.as_deref(),
+            OP_START_THROTTLE_PACING_OVERRIDE_CLEAR,
+            TARGET_THROTTLE,
+            &workflow_name,
+            route,
+            AutumnError::not_found_msg(format!(
+                "workflow '{workflow_name}' has no declared start throttle; nothing to override"
+            ))
+        );
+    };
+    if let Some(expr) = policy.key_expr {
+        reject_pacing_override!(
+            &pool,
+            &actor,
+            &source,
+            request_id.as_deref(),
+            OP_START_THROTTLE_PACING_OVERRIDE_CLEAR,
+            TARGET_THROTTLE,
+            &workflow_name,
+            route,
+            AutumnError::bad_request_msg(format!(
+                "workflow '{workflow_name}' uses a dynamic per-key start throttle \
+                 (key expression '{expr}'); a pacing override targets a single \
+                 static bucket and cannot be applied to a dynamically-keyed policy"
+            ))
+            .with_status(axum::http::StatusCode::CONFLICT)
+        );
+    }
+    let declared_refill_rate = policy.refill_per_sec;
+    let declared_burst = policy.burst;
+    let key = autumn_harvest::throttle::bucket_key(&workflow_name, "");
+
+    // Fan out over every shard the ROUTER knows about. Do not merely use
+    // every shard this process holds a live pool for (issue #1229,
+    // finding 1). See the identical comment in
+    // `set_start_throttle_pacing_override`.
+    let pools = crate::shard_fanout::pools_by_shard(&api_state);
+    let expected = crate::shard_fanout::expected_shards(&api_state, &pools);
+
     let mut any_success = false;
     let mut shard_errors: Vec<String> = Vec::new();
     let mut persisted_baseline: Option<(f64, f64)> = None;
-    for (shard_id, shard_pool) in pool.iter_shards() {
+    for shard_id in expected {
+        let Some(shard_pool) = pools.get(&shard_id) else {
+            shard_errors.push(format!("shard {shard_id}: has no configured storage pool"));
+            continue;
+        };
         let mut conn = match acquire_conn(shard_pool).await {
             Ok(c) => c,
             Err(e) => {
-                shard_errors.push(format!("shard {}: {e}", shard_id.as_i32()));
+                shard_errors.push(format!("shard {shard_id}: {e}"));
                 continue;
             }
         };
@@ -33993,7 +34205,7 @@ async fn clear_start_throttle_pacing_override(
                     persisted_baseline = Some((row.refill_rate, row.burst));
                 }
             }
-            Err(e) => shard_errors.push(format!("shard {}: {e}", shard_id.as_i32())),
+            Err(e) => shard_errors.push(format!("shard {shard_id}: {e}")),
         }
     }
 
@@ -34654,6 +34866,7 @@ fn pacing_override_clear_sql() -> String {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct RateLimitPacingOverrideRequest {
     refill_rate: Option<f64>,
     burst: Option<f64>,
@@ -34680,59 +34893,8 @@ async fn set_rate_limit_pacing_override(
     headers: axum::http::HeaderMap,
     Extension(api_state): Extension<HarvestApiState>,
     Path(activity_name): Path<String>,
-    Json(request): Json<RateLimitPacingOverrideRequest>,
+    body: Result<Json<RateLimitPacingOverrideRequest>, JsonRejection>,
 ) -> impl axum::response::IntoResponse {
-    if let Some(rate) = request.refill_rate
-        && (!rate.is_finite() || rate <= 0.0)
-    {
-        return AutumnError::bad_request_msg(
-            "refill_rate must be a finite number greater than zero",
-        )
-        .into_response();
-    }
-    if let Some(burst) = request.burst
-        && (!burst.is_finite() || burst < 1.0)
-    {
-        return AutumnError::bad_request_msg("burst must be a finite number, at least 1.0")
-            .into_response();
-    }
-    if request.refill_rate.is_none() && request.burst.is_none() {
-        return AutumnError::bad_request_msg("must override at least one of refill_rate or burst")
-            .into_response();
-    }
-    let expires_at = match pacing_override_expiry(request.ttl_secs) {
-        Ok(v) => v,
-        Err(e) => return e.into_response(),
-    };
-
-    let runtime = match api_state.runtime().map_err(map_error) {
-        Ok(r) => r,
-        Err(e) => return e.into_response(),
-    };
-    let Some(activity) = runtime.registry().activities.get(&activity_name) else {
-        return AutumnError::not_found_msg(format!("activity '{activity_name}' is not registered"))
-            .into_response();
-    };
-    let Some(declared_refill_rate) = activity.rate_limit_rps else {
-        return AutumnError::not_found_msg(format!(
-            "activity '{activity_name}' has no declared rate limit; nothing to override"
-        ))
-        .into_response();
-    };
-    if let Some(expr) = activity.rate_limit_key_expr {
-        return AutumnError::bad_request_msg(format!(
-            "activity '{activity_name}' uses a dynamic per-key rate limit \
-             (key expression '{expr}'); a pacing override targets a single \
-             static bucket and cannot be applied to a dynamically-keyed policy"
-        ))
-        .with_status(axum::http::StatusCode::CONFLICT)
-        .into_response();
-    }
-    let declared_burst = activity.rate_limit_burst.unwrap_or(declared_refill_rate);
-    let key: String = activity
-        .rate_limit_key
-        .map_or_else(|| activity_name.clone(), std::string::ToString::to_string);
-
     let pool = match api_state.storage_pool().map_err(map_error) {
         Ok(p) => p,
         Err(e) => return e.into_response(),
@@ -34740,14 +34902,161 @@ async fn set_rate_limit_pacing_override(
     let (actor, source, request_id) = audit_context(&headers, &api_state);
     let route = "POST /admin/rate-limits/{activity_name}/override";
 
+    // The body is unwrapped in-handler, not by a bare `Json` extractor. A
+    // rejected body -- most importantly an unknown field, rejected via
+    // `deny_unknown_fields` -- surfaces as this route's documented `400`.
+    // It carries a failed audit row, never axum's default plain-text `422`
+    // (mirrors `update_schedule_handler`).
+    let request = match body {
+        Ok(Json(req)) => req,
+        Err(rejection) => {
+            let err_summary = format!("invalid request body: {}", rejection.body_text());
+            reject_pacing_override!(
+                &pool,
+                &actor,
+                &source,
+                request_id.as_deref(),
+                OP_RATE_LIMIT_PACING_OVERRIDE_SET,
+                TARGET_RATE_LIMIT,
+                &activity_name,
+                route,
+                AutumnError::bad_request_msg(err_summary)
+            );
+        }
+    };
+
+    if let Some(rate) = request.refill_rate
+        && (!rate.is_finite() || rate <= 0.0)
+    {
+        reject_pacing_override!(
+            &pool,
+            &actor,
+            &source,
+            request_id.as_deref(),
+            OP_RATE_LIMIT_PACING_OVERRIDE_SET,
+            TARGET_RATE_LIMIT,
+            &activity_name,
+            route,
+            AutumnError::bad_request_msg("refill_rate must be a finite number greater than zero")
+        );
+    }
+    if let Some(burst) = request.burst
+        && (!burst.is_finite() || burst < 1.0)
+    {
+        reject_pacing_override!(
+            &pool,
+            &actor,
+            &source,
+            request_id.as_deref(),
+            OP_RATE_LIMIT_PACING_OVERRIDE_SET,
+            TARGET_RATE_LIMIT,
+            &activity_name,
+            route,
+            AutumnError::bad_request_msg("burst must be a finite number, at least 1.0")
+        );
+    }
+    if request.refill_rate.is_none() && request.burst.is_none() {
+        reject_pacing_override!(
+            &pool,
+            &actor,
+            &source,
+            request_id.as_deref(),
+            OP_RATE_LIMIT_PACING_OVERRIDE_SET,
+            TARGET_RATE_LIMIT,
+            &activity_name,
+            route,
+            AutumnError::bad_request_msg("must override at least one of refill_rate or burst")
+        );
+    }
+    let expires_at = match pacing_override_expiry(request.ttl_secs) {
+        Ok(v) => v,
+        Err(e) => reject_pacing_override!(
+            &pool,
+            &actor,
+            &source,
+            request_id.as_deref(),
+            OP_RATE_LIMIT_PACING_OVERRIDE_SET,
+            TARGET_RATE_LIMIT,
+            &activity_name,
+            route,
+            e
+        ),
+    };
+
+    let runtime = match api_state.runtime().map_err(map_error) {
+        Ok(r) => r,
+        Err(e) => return e.into_response(),
+    };
+    let Some(activity) = runtime.registry().activities.get(&activity_name) else {
+        reject_pacing_override!(
+            &pool,
+            &actor,
+            &source,
+            request_id.as_deref(),
+            OP_RATE_LIMIT_PACING_OVERRIDE_SET,
+            TARGET_RATE_LIMIT,
+            &activity_name,
+            route,
+            AutumnError::not_found_msg(format!("activity '{activity_name}' is not registered"))
+        );
+    };
+    let Some(declared_refill_rate) = activity.rate_limit_rps else {
+        reject_pacing_override!(
+            &pool,
+            &actor,
+            &source,
+            request_id.as_deref(),
+            OP_RATE_LIMIT_PACING_OVERRIDE_SET,
+            TARGET_RATE_LIMIT,
+            &activity_name,
+            route,
+            AutumnError::not_found_msg(format!(
+                "activity '{activity_name}' has no declared rate limit; nothing to override"
+            ))
+        );
+    };
+    if let Some(expr) = activity.rate_limit_key_expr {
+        reject_pacing_override!(
+            &pool,
+            &actor,
+            &source,
+            request_id.as_deref(),
+            OP_RATE_LIMIT_PACING_OVERRIDE_SET,
+            TARGET_RATE_LIMIT,
+            &activity_name,
+            route,
+            AutumnError::bad_request_msg(format!(
+                "activity '{activity_name}' uses a dynamic per-key rate limit \
+                 (key expression '{expr}'); a pacing override targets a single \
+                 static bucket and cannot be applied to a dynamically-keyed policy"
+            ))
+            .with_status(axum::http::StatusCode::CONFLICT)
+        );
+    }
+    let declared_burst = activity.rate_limit_burst.unwrap_or(declared_refill_rate);
+    let key: String = activity
+        .rate_limit_key
+        .map_or_else(|| activity_name.clone(), std::string::ToString::to_string);
+
+    // Fan out over every shard the ROUTER knows about. Do not merely use
+    // every shard this process holds a live pool for (issue #1229,
+    // finding 1). See the identical comment in
+    // `set_start_throttle_pacing_override`.
+    let pools = crate::shard_fanout::pools_by_shard(&api_state);
+    let expected = crate::shard_fanout::expected_shards(&api_state, &pools);
+
     let mut any_success = false;
     let mut shard_errors: Vec<String> = Vec::new();
     let mut persisted_baseline: Option<(f64, f64)> = None;
-    for (shard_id, shard_pool) in pool.iter_shards() {
+    for shard_id in expected {
+        let Some(shard_pool) = pools.get(&shard_id) else {
+            shard_errors.push(format!("shard {shard_id}: has no configured storage pool"));
+            continue;
+        };
         let mut conn = match acquire_conn(shard_pool).await {
             Ok(c) => c,
             Err(e) => {
-                shard_errors.push(format!("shard {}: {e}", shard_id.as_i32()));
+                shard_errors.push(format!("shard {shard_id}: {e}"));
                 continue;
             }
         };
@@ -34769,7 +35078,7 @@ async fn set_rate_limit_pacing_override(
                     persisted_baseline = Some((row.refill_rate, row.burst));
                 }
             }
-            Err(e) => shard_errors.push(format!("shard {}: {e}", shard_id.as_i32())),
+            Err(e) => shard_errors.push(format!("shard {shard_id}: {e}")),
         }
     }
 
@@ -34874,34 +35183,6 @@ async fn clear_rate_limit_pacing_override(
     Extension(api_state): Extension<HarvestApiState>,
     Path(activity_name): Path<String>,
 ) -> impl axum::response::IntoResponse {
-    let runtime = match api_state.runtime().map_err(map_error) {
-        Ok(r) => r,
-        Err(e) => return e.into_response(),
-    };
-    let Some(activity) = runtime.registry().activities.get(&activity_name) else {
-        return AutumnError::not_found_msg(format!("activity '{activity_name}' is not registered"))
-            .into_response();
-    };
-    let Some(declared_refill_rate) = activity.rate_limit_rps else {
-        return AutumnError::not_found_msg(format!(
-            "activity '{activity_name}' has no declared rate limit; nothing to override"
-        ))
-        .into_response();
-    };
-    if let Some(expr) = activity.rate_limit_key_expr {
-        return AutumnError::bad_request_msg(format!(
-            "activity '{activity_name}' uses a dynamic per-key rate limit \
-             (key expression '{expr}'); a pacing override targets a single \
-             static bucket and cannot be applied to a dynamically-keyed policy"
-        ))
-        .with_status(axum::http::StatusCode::CONFLICT)
-        .into_response();
-    }
-    let declared_burst = activity.rate_limit_burst.unwrap_or(declared_refill_rate);
-    let key: String = activity
-        .rate_limit_key
-        .map_or_else(|| activity_name.clone(), std::string::ToString::to_string);
-
     let pool = match api_state.storage_pool().map_err(map_error) {
         Ok(p) => p,
         Err(e) => return e.into_response(),
@@ -34909,14 +35190,80 @@ async fn clear_rate_limit_pacing_override(
     let (actor, source, request_id) = audit_context(&headers, &api_state);
     let route = "DELETE /admin/rate-limits/{activity_name}/override";
 
+    let runtime = match api_state.runtime().map_err(map_error) {
+        Ok(r) => r,
+        Err(e) => return e.into_response(),
+    };
+    let Some(activity) = runtime.registry().activities.get(&activity_name) else {
+        reject_pacing_override!(
+            &pool,
+            &actor,
+            &source,
+            request_id.as_deref(),
+            OP_RATE_LIMIT_PACING_OVERRIDE_CLEAR,
+            TARGET_RATE_LIMIT,
+            &activity_name,
+            route,
+            AutumnError::not_found_msg(format!("activity '{activity_name}' is not registered"))
+        );
+    };
+    let Some(declared_refill_rate) = activity.rate_limit_rps else {
+        reject_pacing_override!(
+            &pool,
+            &actor,
+            &source,
+            request_id.as_deref(),
+            OP_RATE_LIMIT_PACING_OVERRIDE_CLEAR,
+            TARGET_RATE_LIMIT,
+            &activity_name,
+            route,
+            AutumnError::not_found_msg(format!(
+                "activity '{activity_name}' has no declared rate limit; nothing to override"
+            ))
+        );
+    };
+    if let Some(expr) = activity.rate_limit_key_expr {
+        reject_pacing_override!(
+            &pool,
+            &actor,
+            &source,
+            request_id.as_deref(),
+            OP_RATE_LIMIT_PACING_OVERRIDE_CLEAR,
+            TARGET_RATE_LIMIT,
+            &activity_name,
+            route,
+            AutumnError::bad_request_msg(format!(
+                "activity '{activity_name}' uses a dynamic per-key rate limit \
+                 (key expression '{expr}'); a pacing override targets a single \
+                 static bucket and cannot be applied to a dynamically-keyed policy"
+            ))
+            .with_status(axum::http::StatusCode::CONFLICT)
+        );
+    }
+    let declared_burst = activity.rate_limit_burst.unwrap_or(declared_refill_rate);
+    let key: String = activity
+        .rate_limit_key
+        .map_or_else(|| activity_name.clone(), std::string::ToString::to_string);
+
+    // Fan out over every shard the ROUTER knows about. Do not merely use
+    // every shard this process holds a live pool for (issue #1229,
+    // finding 1). See the identical comment in
+    // `set_start_throttle_pacing_override`.
+    let pools = crate::shard_fanout::pools_by_shard(&api_state);
+    let expected = crate::shard_fanout::expected_shards(&api_state, &pools);
+
     let mut any_success = false;
     let mut shard_errors: Vec<String> = Vec::new();
     let mut persisted_baseline: Option<(f64, f64)> = None;
-    for (shard_id, shard_pool) in pool.iter_shards() {
+    for shard_id in expected {
+        let Some(shard_pool) = pools.get(&shard_id) else {
+            shard_errors.push(format!("shard {shard_id}: has no configured storage pool"));
+            continue;
+        };
         let mut conn = match acquire_conn(shard_pool).await {
             Ok(c) => c,
             Err(e) => {
-                shard_errors.push(format!("shard {}: {e}", shard_id.as_i32()));
+                shard_errors.push(format!("shard {shard_id}: {e}"));
                 continue;
             }
         };
@@ -34933,7 +35280,7 @@ async fn clear_rate_limit_pacing_override(
                     persisted_baseline = Some((row.refill_rate, row.burst));
                 }
             }
-            Err(e) => shard_errors.push(format!("shard {}: {e}", shard_id.as_i32())),
+            Err(e) => shard_errors.push(format!("shard {shard_id}: {e}")),
         }
     }
 
