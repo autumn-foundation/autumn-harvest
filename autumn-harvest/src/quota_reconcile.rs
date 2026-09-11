@@ -40,18 +40,18 @@
 //! and [`spawn_quota_key_reconciler_for_shard`] carries it forward across
 //! ticks. Every tick therefore moves strictly past whatever it just
 //! examined. A full pass over the CURRENT candidate set completes in a
-//! bounded number of ticks as a result: at most `ceil(candidates /
+//! bounded number of ticks as a result. At most `ceil(candidates /
 //! batch_size)`, however large that backlog is. Nothing short-circuits
-//! that count early, on purpose -- an early, fixed-tick wrap would
-//! abandon a large permanently-stuck prefix before the pass reaches the
-//! resolvable rows sorted behind it, reopening the exact starvation this
-//! cursor exists to prevent.
+//! that count early, on purpose. An early, fixed-tick wrap would abandon
+//! a large permanently-stuck prefix before the pass reaches the
+//! resolvable rows sorted behind it. That reopens the exact starvation
+//! this cursor exists to prevent.
 //!
 //! `quota_key IS NULL` is not itself a stable cursor: a policy declared
 //! mid-uptime changes some rows' outcome between passes. Only `id` order
 //! does not. A row sorted AHEAD of the current cursor sees a newly
 //! declared policy on the very next tick. A row sorted BEHIND it is not
-//! revisited until the current pass finishes and wraps -- staleness
+//! revisited until the current pass finishes and wraps. Its staleness is
 //! bounded by that pass's own length, not by a fixed number of ticks.
 //!
 //! The scan is also restricted to workflow types with a currently-
@@ -260,12 +260,12 @@ struct CandidateRow {
 /// `quota_key`, so it never leaves the index on its own. Without this
 /// filter, a mixed deployment (some workflow types quota'd, others not)
 /// would re-fetch every no-policy row's JSON input on every tick,
-/// forever. `$1` is re-read from the live registry on every call, so a
-/// policy declared mid-uptime, or removed, takes effect starting with
-/// the very next tick -- not just at the next restart. See this
-/// module's doc comment for exactly when a given ROW becomes visible:
-/// immediately if sorted ahead of the cursor, or at the next pass wrap
-/// if sorted behind it.
+/// forever. `$1` is re-read from the live registry on every call. A
+/// policy declared mid-uptime, or removed, therefore takes effect
+/// starting with the very next tick, not just at the next restart. See
+/// this module's doc comment for exactly when a given ROW becomes
+/// visible: immediately if sorted ahead of the cursor, or at the next
+/// pass wrap if sorted behind it.
 ///
 /// KNOWN SCALING TRADE-OFF: this filter is a residual predicate, not an
 /// index seek. `idx_harvest_we_quota_reconcile_candidates` orders by
@@ -273,12 +273,14 @@ struct CandidateRow {
 /// each id-ordered candidate row, not by jumping straight to matches. In
 /// a mixed deployment with a huge non-quota'd population and few
 /// matching rows, one tick can touch many discarded rows before filling
-/// `batch_size`. A `(workflow_name, id)` index was considered and
-/// rejected: it would enable that seek, but could no longer serve
-/// `ORDER BY id LIMIT $3` without sorting every matching row first --
-/// trading today's bounded cost against a large EXCLUDED population for
-/// a bounded cost against a large REGISTERED one instead, not a strict
-/// win. See the migration's own comment for the full trade-off.
+/// `batch_size`.
+///
+/// A `(workflow_name, id)` index was considered and rejected. It would
+/// enable that seek, but could no longer serve `ORDER BY id LIMIT $3`
+/// without sorting every matching row first. That trades today's
+/// bounded cost against a large EXCLUDED population for a bounded cost
+/// against a large REGISTERED one instead, not a strict win. See the
+/// migration's own comment for the full trade-off.
 ///
 /// `AND ($2::uuid IS NULL OR id > $2) ORDER BY id LIMIT $3` is a keyset
 /// cursor, not a bare `LIMIT`. A row this sweep can never resolve --
