@@ -754,10 +754,22 @@ impl HistoryMatcher {
         // Pre-mark pause/resume events as consumed so they are transparent to
         // every cursor-based scan (issue #383). They carry no workflow command,
         // so settling them up front keeps the matcher's scan loops unchanged.
+        //
+        // Post-terminal bookkeeping (a workflow-level retry's
+        // `WorkflowRetryScheduled` (#523), a parent-close cascade's
+        // `ChildWorkflowCascadeApplied` (#347)) gets the same treatment for the
+        // same reason (issue #1262): it has no workflow-command counterpart and
+        // the workflow function never consumes it, so it is always transparent,
+        // not only while searching for a redrive's superseded terminal. Left
+        // opaque, a retried-then-redriven run's cursor gets stuck on the
+        // bookkeeping event itself, before it ever reaches the marker or
+        // dispatch behind it.
         let mut transparent_events: HashSet<usize> = events
             .iter()
             .enumerate()
-            .filter(|(_, e)| Self::is_pause_lifecycle_event(e))
+            .filter(|(_, e)| {
+                Self::is_pause_lifecycle_event(e) || Self::is_post_terminal_bookkeeping(e)
+            })
             .map(|(i, _)| i)
             .collect();
         // DLQ redrive (issue #510): a `WorkflowRedriven` event reopens a run that
@@ -777,18 +789,15 @@ impl HistoryMatcher {
                 last_redrive = Some(i);
                 transparent_events.insert(i);
                 // Scan backward to the nearest WorkflowFailed, skipping events
-                // already settled transparent (e.g. an interleaved pause pair)
-                // and post-terminal bookkeeping appended AFTER the terminal
-                // (a workflow-level retry's `WorkflowRetryScheduled` (#523), a
-                // parent-close cascade's `ChildWorkflowCascadeApplied` (#347)) —
-                // without that skip a retried-then-redriven run would leave its
-                // superseded terminal opaque and diverge against it.
+                // already settled transparent — an interleaved pause pair, or
+                // post-terminal bookkeeping (already marked transparent above)
+                // appended AFTER the terminal. Without that skip a
+                // retried-then-redriven run would leave its superseded
+                // terminal opaque and diverge against it.
                 let mut j = i;
                 while j > 0 {
                     j -= 1;
-                    if transparent_events.contains(&j)
-                        || Self::is_post_terminal_bookkeeping(&events[j])
-                    {
+                    if transparent_events.contains(&j) {
                         continue;
                     }
                     if matches!(events[j], WorkflowEvent::WorkflowFailed { .. }) {
@@ -929,6 +938,12 @@ impl HistoryMatcher {
     /// the CHILD's own author string, the reason is matched together with the
     /// exact shape the engine writes (untyped, non-retryable) so an author
     /// message that happens to collide keeps its genuine terminal.
+    ///
+    /// See also [`Self::superseded_cycle_tail_indices`], called right after
+    /// this function in [`Self::new`]. It covers the same failing cycle's
+    /// other pre-terminal records — a marker, a side effect, a detached
+    /// spawn, a timer arm or cancel — that this function does not (issue
+    /// #1262).
     fn abandoned_dispatch_indices(events: &[WorkflowEvent]) -> Vec<usize> {
         let mut abandoned_activities: HashSet<ActivityExecId> = HashSet::new();
         let mut abandoned_children: HashSet<ExecutionId> = HashSet::new();
@@ -998,30 +1013,35 @@ impl HistoryMatcher {
     /// records (issue #1262).
     ///
     /// [`Self::abandoned_dispatch_indices`] already covers the abandoned
-    /// dispatch pairs. This function covers the rest: `MarkerRecorded` and
-    /// `SideEffectRecorded` events the same cycle wrote, with or without
-    /// an abandoned pair present.
+    /// dispatch pairs. This function covers the rest: every other event
+    /// kind `worker::terminal_command_policy` classifies
+    /// `PreTerminalEvent` — a record a failing cycle writes plainly, at
+    /// its own command-emission position, with no synthetic terminal and
+    /// no completion to pair it with. Today that set is `MarkerRecorded`,
+    /// `SideEffectRecorded`, `ChildWorkflowSpawnedDetached`,
+    /// `TimerStarted`, and `TimerCancelled`.
     ///
     /// A decision cycle's events are contiguous. No durable wait settles
-    /// mid-cycle; a wait settles only between cycles. So this walks
+    /// mid-cycle. A wait settles only between cycles. So this walks
     /// backward from `events.len()` (the caller passes the pre-redrive
-    /// prefix) and swallows a run of `MarkerRecorded` / `SideEffectRecorded`
-    /// events. It skips an index the caller already marked transparent,
-    /// such as the terminal `WorkflowFailed` or an abandoned pair.
+    /// prefix) and swallows a run of these events. It skips an index the
+    /// caller already marked transparent, such as the terminal
+    /// `WorkflowFailed` or an abandoned pair.
     ///
     /// The walk cannot cross into an earlier cycle unless that cycle's own
     /// wait already resolved. It stops at the first event that is not
-    /// already transparent and not a marker or side effect. A settled
-    /// completion, such as `ActivityCompleted` or `TimerFired`, marks the
-    /// boundary of that earlier, non-superseded cycle. Its own markers
-    /// must stay positionally matchable. Swallowing them would silently
-    /// break `ctx.version()` and `ctx.patched()` determinism for a cycle
-    /// the redrive never touched (issues #687 and #603).
+    /// already transparent and not one of the kinds above. A settled
+    /// completion, such as `ActivityCompleted` or `TimerFired` from an
+    /// earlier arm, marks the boundary of that earlier, non-superseded
+    /// cycle. Its own markers must stay positionally matchable. If the
+    /// walk swallows one of those, it silently breaks `ctx.version()` and
+    /// `ctx.patched()` determinism for a cycle the redrive never touched
+    /// (issues #687 and #603).
     ///
     /// The function fails closed. An event that is neither already
-    /// transparent nor a marker or side effect stops the walk at once. An
-    /// event kind this function does not recognize stays opaque rather
-    /// than being guessed at.
+    /// transparent nor one of the recognized kinds stops the walk at
+    /// once. The function does not guess at an event kind it does not
+    /// recognize; it leaves that event opaque.
     fn superseded_cycle_tail_indices(
         events: &[WorkflowEvent],
         transparent_events: &HashSet<usize>,
@@ -1034,7 +1054,11 @@ impl HistoryMatcher {
                 continue;
             }
             match events[idx] {
-                WorkflowEvent::MarkerRecorded { .. } | WorkflowEvent::SideEffectRecorded { .. } => {
+                WorkflowEvent::MarkerRecorded { .. }
+                | WorkflowEvent::SideEffectRecorded { .. }
+                | WorkflowEvent::ChildWorkflowSpawnedDetached { .. }
+                | WorkflowEvent::TimerStarted { .. }
+                | WorkflowEvent::TimerCancelled { .. } => {
                     indices.push(idx);
                 }
                 _ => break,
@@ -9637,9 +9661,9 @@ mod tests {
     /// Negative control (issue #1262): a marker from an earlier,
     /// non-superseded cycle must stay opaque across the redrive. That
     /// cycle's own dispatch already completed before the failing cycle
-    /// started. Swallowing its marker would silently break
-    /// `ctx.version()` and `ctx.patched()` positional matching for a
-    /// cycle the redrive never touched.
+    /// started. If the walk swallows this marker instead, it silently
+    /// breaks `ctx.version()` and `ctx.patched()` positional matching for
+    /// a cycle the redrive never touched.
     #[test]
     fn a_marker_from_an_earlier_completed_cycle_stays_opaque_across_a_redrive() {
         let activity_id = ActivityExecId::new();
@@ -9686,6 +9710,423 @@ mod tests {
         assert!(
             matcher.is_consumed(4),
             "the failing cycle's own marker, past the last completion, must be transparent"
+        );
+    }
+
+    /// Issue #1262, stronger negative control: an earlier cycle's version
+    /// marker must not just stay unconsumed. It must still answer
+    /// `match_version` with the recorded value after a redrive. A silent
+    /// value flip would be worse than a divergence: `match_version` never
+    /// reports `Diverged`, so a bug here has no loud symptom.
+    #[test]
+    fn a_redriven_run_still_reads_an_earlier_cycles_version_marker() {
+        let activity_id = ActivityExecId::new();
+        let events = vec![
+            WorkflowEvent::WorkflowStarted {
+                input: Value::Null,
+                timestamp: chrono::Utc::now(),
+                last_completion_result: None,
+                last_error: None,
+                scheduled_time: None,
+            },
+            WorkflowEvent::MarkerRecorded {
+                name: "version:early".into(),
+                details: serde_json::json!(1),
+            },
+            WorkflowEvent::ActivityScheduled {
+                activity_id,
+                name: "charge".into(),
+                input: Value::Null,
+                queue: "default".into(),
+            },
+            // This completion ends the earlier cycle: the version marker
+            // above is settled, non-superseded history.
+            WorkflowEvent::ActivityCompleted {
+                activity_id,
+                output: Value::Null,
+            },
+            WorkflowEvent::MarkerRecorded {
+                name: "m".into(),
+                details: Value::Null,
+            },
+            WorkflowEvent::workflow_failed("budget exceeded"),
+            WorkflowEvent::WorkflowRedriven {
+                redriven_at: chrono::Utc::now(),
+                dead_letter_id: uuid::Uuid::new_v4(),
+                reason: None,
+            },
+        ];
+        let mut matcher = HistoryMatcher::new(events);
+        matcher.advance(); // past WorkflowStarted, cursor at the version marker
+        assert_eq!(
+            matcher.match_version("early", 1, 1),
+            1,
+            "the earlier cycle's own version marker must still be read positionally"
+        );
+    }
+
+    /// Issue #1262: `SideEffectRecorded` needs the same transparency as
+    /// `MarkerRecorded` — both are durable, completion-free records a
+    /// failing cycle can write after the dispatch a redrive re-issues.
+    #[test]
+    fn a_side_effect_recorded_after_an_abandoned_dispatch_still_re_dispatches_live() {
+        let child_id = ExecutionId::new();
+        let events = vec![
+            WorkflowEvent::WorkflowStarted {
+                input: Value::Null,
+                timestamp: chrono::Utc::now(),
+                last_completion_result: None,
+                last_error: None,
+                scheduled_time: None,
+            },
+            WorkflowEvent::ChildWorkflowStarted {
+                child_id,
+                workflow_name: "worker_child".into(),
+                input: Value::Null,
+            },
+            WorkflowEvent::ChildWorkflowFailed {
+                child_id,
+                error: crate::event::ABANDONED_DISPATCH_REASON.to_string(),
+                error_type: None,
+                details: None,
+                non_retryable: Some(true),
+            },
+            WorkflowEvent::SideEffectRecorded {
+                kind: SideEffectKind::Uuid,
+                name: None,
+                value: serde_json::json!("11111111-1111-1111-1111-111111111111"),
+            },
+            WorkflowEvent::workflow_failed("budget exceeded"),
+            WorkflowEvent::WorkflowRedriven {
+                redriven_at: chrono::Utc::now(),
+                dead_letter_id: uuid::Uuid::new_v4(),
+                reason: None,
+            },
+        ];
+        let mut matcher = HistoryMatcher::new(events);
+        assert!(
+            matcher.is_consumed(3),
+            "a side effect the failing cycle wrote after the dispatch must be transparent too"
+        );
+        matcher.advance(); // past WorkflowStarted
+        assert_eq!(
+            matcher.match_child_workflow("worker_child", &Value::Null),
+            HistoryMatch::NoMatch,
+            "a trailing side effect must not block re-dispatch"
+        );
+    }
+
+    /// Issue #1262: the failing cycle can write more than one trailing
+    /// record. The walk must swallow the whole run, not just the last one.
+    #[test]
+    fn a_run_of_several_markers_after_an_abandoned_dispatch_is_fully_swallowed() {
+        let child_id = ExecutionId::new();
+        let events = vec![
+            WorkflowEvent::WorkflowStarted {
+                input: Value::Null,
+                timestamp: chrono::Utc::now(),
+                last_completion_result: None,
+                last_error: None,
+                scheduled_time: None,
+            },
+            WorkflowEvent::ChildWorkflowStarted {
+                child_id,
+                workflow_name: "worker_child".into(),
+                input: Value::Null,
+            },
+            WorkflowEvent::ChildWorkflowFailed {
+                child_id,
+                error: crate::event::ABANDONED_DISPATCH_REASON.to_string(),
+                error_type: None,
+                details: None,
+                non_retryable: Some(true),
+            },
+            WorkflowEvent::MarkerRecorded {
+                name: "m1".into(),
+                details: Value::Null,
+            },
+            WorkflowEvent::MarkerRecorded {
+                name: "m2".into(),
+                details: Value::Null,
+            },
+            WorkflowEvent::MarkerRecorded {
+                name: "m3".into(),
+                details: Value::Null,
+            },
+            WorkflowEvent::workflow_failed("budget exceeded"),
+            WorkflowEvent::WorkflowRedriven {
+                redriven_at: chrono::Utc::now(),
+                dead_letter_id: uuid::Uuid::new_v4(),
+                reason: None,
+            },
+        ];
+        let mut matcher = HistoryMatcher::new(events);
+        for idx in [3_usize, 4, 5] {
+            assert!(
+                matcher.is_consumed(idx),
+                "marker {idx} in the trailing run must be transparent"
+            );
+        }
+        matcher.advance(); // past WorkflowStarted
+        assert_eq!(
+            matcher.match_child_workflow("worker_child", &Value::Null),
+            HistoryMatch::NoMatch,
+            "a run of trailing markers must not block re-dispatch"
+        );
+    }
+
+    /// Issue #1262: a marker sandwiched between two abandoned-dispatch
+    /// pairs. The walk must skip over the already-transparent second pair
+    /// to keep swallowing the marker behind it, not stop at the first
+    /// already-transparent index it meets.
+    #[test]
+    fn a_marker_sandwiched_between_two_abandoned_dispatch_pairs_is_swallowed() {
+        let first_child = ExecutionId::new();
+        let second_child = ExecutionId::new();
+        let events = vec![
+            WorkflowEvent::WorkflowStarted {
+                input: Value::Null,
+                timestamp: chrono::Utc::now(),
+                last_completion_result: None,
+                last_error: None,
+                scheduled_time: None,
+            },
+            WorkflowEvent::ChildWorkflowStarted {
+                child_id: first_child,
+                workflow_name: "worker_child".into(),
+                input: Value::Null,
+            },
+            WorkflowEvent::ChildWorkflowFailed {
+                child_id: first_child,
+                error: crate::event::ABANDONED_DISPATCH_REASON.to_string(),
+                error_type: None,
+                details: None,
+                non_retryable: Some(true),
+            },
+            WorkflowEvent::MarkerRecorded {
+                name: "m".into(),
+                details: Value::Null,
+            },
+            WorkflowEvent::ChildWorkflowStarted {
+                child_id: second_child,
+                workflow_name: "worker_child".into(),
+                input: Value::Null,
+            },
+            WorkflowEvent::ChildWorkflowFailed {
+                child_id: second_child,
+                error: crate::event::ABANDONED_DISPATCH_REASON.to_string(),
+                error_type: None,
+                details: None,
+                non_retryable: Some(true),
+            },
+            WorkflowEvent::workflow_failed("budget exceeded"),
+            WorkflowEvent::WorkflowRedriven {
+                redriven_at: chrono::Utc::now(),
+                dead_letter_id: uuid::Uuid::new_v4(),
+                reason: None,
+            },
+        ];
+        let mut matcher = HistoryMatcher::new(events);
+        for idx in 1..=6 {
+            assert!(
+                matcher.is_consumed(idx),
+                "event {idx} must be transparent: two abandoned pairs sandwiching a marker"
+            );
+        }
+        matcher.advance(); // past WorkflowStarted
+        assert_eq!(
+            matcher.match_child_workflow("worker_child", &Value::Null),
+            HistoryMatch::NoMatch,
+            "the sandwiched marker must not block re-dispatch of either child"
+        );
+    }
+
+    /// Issue #1262: an abandoned ACTIVITY dispatch, not a child workflow,
+    /// with a trailing marker. The new transparency rule is shape-agnostic,
+    /// so it must cover this event kind too.
+    #[test]
+    fn a_marker_after_an_abandoned_activity_dispatch_still_re_dispatches_live() {
+        let activity_id = ActivityExecId::new();
+        let events = vec![
+            WorkflowEvent::WorkflowStarted {
+                input: Value::Null,
+                timestamp: chrono::Utc::now(),
+                last_completion_result: None,
+                last_error: None,
+                scheduled_time: None,
+            },
+            WorkflowEvent::ActivityScheduled {
+                activity_id,
+                name: "charge".into(),
+                input: Value::Null,
+                queue: "default".into(),
+            },
+            WorkflowEvent::ActivityFailed {
+                activity_id,
+                error: crate::event::ABANDONED_DISPATCH_REASON.to_string(),
+                attempt: 1,
+                error_type: "Error".into(),
+                details: None,
+                non_retryable: true,
+            },
+            WorkflowEvent::MarkerRecorded {
+                name: "m".into(),
+                details: Value::Null,
+            },
+            WorkflowEvent::workflow_failed("budget exceeded"),
+            WorkflowEvent::WorkflowRedriven {
+                redriven_at: chrono::Utc::now(),
+                dead_letter_id: uuid::Uuid::new_v4(),
+                reason: None,
+            },
+        ];
+        let mut matcher = HistoryMatcher::new(events);
+        assert!(
+            matcher.is_consumed(3),
+            "the marker trailing an abandoned activity dispatch must be transparent too"
+        );
+        matcher.advance(); // past WorkflowStarted
+        assert_eq!(
+            matcher.match_activity("charge"),
+            HistoryMatch::NoMatch,
+            "a trailing marker must not block re-dispatch of an abandoned activity"
+        );
+    }
+
+    /// Issue #1262: a SECOND failing cycle, after the first redrive, writes
+    /// its own abandoned pair and marker. Those belong to the newest
+    /// terminal-failure tail, not the superseded cycle the first redrive
+    /// reopened, so they must stay positionally matchable.
+    #[test]
+    fn a_marker_written_after_the_last_redrive_stays_opaque() {
+        let superseded_child = ExecutionId::new();
+        let latest_child = ExecutionId::new();
+        let events = vec![
+            WorkflowEvent::WorkflowStarted {
+                input: Value::Null,
+                timestamp: chrono::Utc::now(),
+                last_completion_result: None,
+                last_error: None,
+                scheduled_time: None,
+            },
+            WorkflowEvent::ChildWorkflowStarted {
+                child_id: superseded_child,
+                workflow_name: "worker_child".into(),
+                input: Value::Null,
+            },
+            WorkflowEvent::ChildWorkflowFailed {
+                child_id: superseded_child,
+                error: crate::event::ABANDONED_DISPATCH_REASON.to_string(),
+                error_type: None,
+                details: None,
+                non_retryable: Some(true),
+            },
+            WorkflowEvent::MarkerRecorded {
+                name: "m".into(),
+                details: Value::Null,
+            },
+            WorkflowEvent::workflow_failed("budget exceeded"),
+            WorkflowEvent::WorkflowRedriven {
+                redriven_at: chrono::Utc::now(),
+                dead_letter_id: uuid::Uuid::new_v4(),
+                reason: None,
+            },
+            WorkflowEvent::ChildWorkflowStarted {
+                child_id: latest_child,
+                workflow_name: "worker_child".into(),
+                input: Value::Null,
+            },
+            WorkflowEvent::ChildWorkflowFailed {
+                child_id: latest_child,
+                error: crate::event::ABANDONED_DISPATCH_REASON.to_string(),
+                error_type: None,
+                details: None,
+                non_retryable: Some(true),
+            },
+            WorkflowEvent::MarkerRecorded {
+                name: "m2".into(),
+                details: Value::Null,
+            },
+            WorkflowEvent::workflow_failed("budget exceeded"),
+        ];
+        let matcher = HistoryMatcher::new(events);
+        for idx in [1_usize, 2, 3] {
+            assert!(
+                matcher.is_consumed(idx),
+                "event {idx} preceded the redrive, so it must be transparent"
+            );
+        }
+        for idx in [6_usize, 7, 8] {
+            assert!(
+                !matcher.is_consumed(idx),
+                "event {idx} was written by the cycle that failed AFTER the \
+                 redrive, so it must stay positionally matchable"
+            );
+        }
+    }
+
+    /// Issue #1262: `TimerStarted`, `TimerCancelled`, and
+    /// `ChildWorkflowSpawnedDetached` are the other event kinds
+    /// `worker::terminal_command_policy` classifies `PreTerminalEvent` —
+    /// the same class as `MarkerRecorded` / `SideEffectRecorded`. A
+    /// failing cycle can write any of them after the dispatch a redrive
+    /// re-issues, and the walk must swallow them too.
+    #[test]
+    fn timer_and_detached_spawn_records_after_an_abandoned_dispatch_are_swallowed() {
+        let child_id = ExecutionId::new();
+        let detached_child_id = ExecutionId::new();
+        let events = vec![
+            WorkflowEvent::WorkflowStarted {
+                input: Value::Null,
+                timestamp: chrono::Utc::now(),
+                last_completion_result: None,
+                last_error: None,
+                scheduled_time: None,
+            },
+            WorkflowEvent::ChildWorkflowStarted {
+                child_id,
+                workflow_name: "worker_child".into(),
+                input: Value::Null,
+            },
+            WorkflowEvent::ChildWorkflowFailed {
+                child_id,
+                error: crate::event::ABANDONED_DISPATCH_REASON.to_string(),
+                error_type: None,
+                details: None,
+                non_retryable: Some(true),
+            },
+            WorkflowEvent::TimerStarted {
+                timer_id: TimerId::new("cooldown"),
+                duration_secs: 30,
+            },
+            WorkflowEvent::TimerCancelled {
+                timer_id: TimerId::new("cooldown"),
+            },
+            WorkflowEvent::ChildWorkflowSpawnedDetached {
+                child_id: detached_child_id,
+                workflow_name: "fire_and_forget".into(),
+                input: Value::Null,
+                parent_close_policy: crate::types::ParentClosePolicy::Abandon,
+            },
+            WorkflowEvent::workflow_failed("budget exceeded"),
+            WorkflowEvent::WorkflowRedriven {
+                redriven_at: chrono::Utc::now(),
+                dead_letter_id: uuid::Uuid::new_v4(),
+                reason: None,
+            },
+        ];
+        let mut matcher = HistoryMatcher::new(events);
+        for idx in 1..=6 {
+            assert!(
+                matcher.is_consumed(idx),
+                "event {idx} must be transparent: a timer/detached-spawn tail"
+            );
+        }
+        matcher.advance(); // past WorkflowStarted
+        assert_eq!(
+            matcher.match_child_workflow("worker_child", &Value::Null),
+            HistoryMatch::NoMatch,
+            "a trailing timer/detached-spawn run must not block re-dispatch"
         );
     }
 
@@ -9902,6 +10343,106 @@ mod tests {
         assert!(
             matcher.is_consumed(1),
             "the superseded terminal must be transparent even behind a retry record"
+        );
+    }
+
+    /// Issue #1262: post-terminal bookkeeping (`WorkflowRetryScheduled`,
+    /// `ChildWorkflowCascadeApplied`) carries no workflow command and the
+    /// workflow function never consumes it, so it must be transparent on
+    /// its own, not only while a redrive searches for its superseded
+    /// terminal. A bare retry-then-redrive history with nothing else in
+    /// between must not diverge on the bookkeeping event itself.
+    #[test]
+    fn a_retry_then_redrive_with_no_dispatch_still_re_dispatches_live() {
+        let events = vec![
+            WorkflowEvent::WorkflowStarted {
+                input: Value::Null,
+                timestamp: chrono::Utc::now(),
+                last_completion_result: None,
+                last_error: None,
+                scheduled_time: None,
+            },
+            WorkflowEvent::workflow_failed("boom"),
+            WorkflowEvent::WorkflowRetryScheduled {
+                retry_exec_id: ExecutionId::new(),
+                attempt: 2,
+                fire_at: chrono::Utc::now(),
+            },
+            WorkflowEvent::WorkflowRedriven {
+                redriven_at: chrono::Utc::now(),
+                dead_letter_id: uuid::Uuid::new_v4(),
+                reason: None,
+            },
+        ];
+        let mut matcher = HistoryMatcher::new(events);
+        assert!(
+            matcher.is_consumed(2),
+            "post-terminal bookkeeping must be transparent on its own"
+        );
+        matcher.advance(); // past WorkflowStarted
+        assert_eq!(
+            matcher.match_activity("charge"),
+            HistoryMatch::NoMatch,
+            "a retry record between the terminal and the redrive must not block re-dispatch"
+        );
+    }
+
+    /// Issue #1262: the exact combination that motivated the fix above — a
+    /// failing cycle records an abandoned dispatch and a trailing marker,
+    /// AND the sealed run also picked up a workflow-level retry record
+    /// before the operator redrove it. The bookkeeping event must not stop
+    /// the tail walk before it reaches the marker behind it.
+    #[test]
+    fn a_marker_behind_retry_bookkeeping_still_re_dispatches_live() {
+        let child_id = ExecutionId::new();
+        let events = vec![
+            WorkflowEvent::WorkflowStarted {
+                input: Value::Null,
+                timestamp: chrono::Utc::now(),
+                last_completion_result: None,
+                last_error: None,
+                scheduled_time: None,
+            },
+            WorkflowEvent::ChildWorkflowStarted {
+                child_id,
+                workflow_name: "worker_child".into(),
+                input: Value::Null,
+            },
+            WorkflowEvent::ChildWorkflowFailed {
+                child_id,
+                error: crate::event::ABANDONED_DISPATCH_REASON.to_string(),
+                error_type: None,
+                details: None,
+                non_retryable: Some(true),
+            },
+            WorkflowEvent::MarkerRecorded {
+                name: "m".into(),
+                details: Value::Null,
+            },
+            WorkflowEvent::workflow_failed("budget exceeded"),
+            WorkflowEvent::WorkflowRetryScheduled {
+                retry_exec_id: ExecutionId::new(),
+                attempt: 2,
+                fire_at: chrono::Utc::now(),
+            },
+            WorkflowEvent::WorkflowRedriven {
+                redriven_at: chrono::Utc::now(),
+                dead_letter_id: uuid::Uuid::new_v4(),
+                reason: None,
+            },
+        ];
+        let mut matcher = HistoryMatcher::new(events);
+        for idx in 1..=5 {
+            assert!(
+                matcher.is_consumed(idx),
+                "event {idx} must be transparent behind the retry bookkeeping too"
+            );
+        }
+        matcher.advance(); // past WorkflowStarted
+        assert_eq!(
+            matcher.match_child_workflow("worker_child", &Value::Null),
+            HistoryMatch::NoMatch,
+            "retry bookkeeping must not stop the walk before it reaches the marker"
         );
     }
 
