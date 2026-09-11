@@ -512,6 +512,104 @@ async fn a_fenced_worker_cannot_re_encrypt_history() {
 }
 
 #[tokio::test]
+async fn a_fenced_worker_cannot_backfill_quota_keys() {
+    // The quota_key backfill reconciler (issue #1226, follow-up to #946)
+    // is a second module that UPDATEs `harvest_workflow_executions`
+    // outside the ordinary claim/dispatch path. It needs its own fence
+    // assertion for the same reason the codec-rotation sweep above does.
+    //
+    // A fenced worker's registry view can be stale relative to the
+    // promoted region. An unfenced backfill could therefore write a
+    // `quota_key` the new region's own reconciler would have resolved
+    // differently. It could even write one at all, for a row the new
+    // region has already moved past.
+    let _serial = registry_guard().await;
+    let (url, _db) = require_db!("quota_reconcile");
+    let mut conn = connect(&url).await;
+    ensure_generation_row(&mut conn, ShardId::new(0))
+        .await
+        .unwrap();
+
+    let workflow_name = format!("wf_dr_fenced_{}", DB_SEQ.fetch_add(1, Ordering::SeqCst));
+    let exec_id = ExecutionId::new_for_shard(ShardId::new(0));
+    diesel::sql_query(
+        "INSERT INTO harvest_workflow_executions \
+             (id, workflow_name, workflow_id, state, input, shard_id) \
+         VALUES ($1, $2, 'rotate-1', 'RUNNING', '{\"tenant_id\": \"acme\"}'::jsonb, 0)",
+    )
+    .bind::<diesel::sql_types::Uuid, _>(exec_id.as_uuid())
+    .bind::<diesel::sql_types::Text, _>(&workflow_name)
+    .execute(&mut conn)
+    .await
+    .unwrap();
+
+    let policy =
+        autumn_harvest::quota::QuotaPolicy::new("tenant_id").with_max_active_executions(10);
+    let previous_metadata = {
+        let mut lock = autumn_harvest::completion_trigger::GLOBAL_WORKFLOW_METADATA
+            .write()
+            .expect("metadata lock");
+        let mut map = std::collections::HashMap::new();
+        map.insert(
+            workflow_name.clone(),
+            autumn_harvest::completion_trigger::WorkflowMetadata {
+                concurrency: None,
+                max_input_bytes: None,
+                owner: None,
+                runbook_url: None,
+                severity: None,
+                input_schema: None,
+                sla: None,
+                retry_policy: None,
+                quota: Some(policy),
+            },
+        );
+        lock.replace(map)
+    };
+
+    // This worker is pinned to generation 0; the region has been promoted
+    // past it.
+    FenceRegistry::clear();
+    FenceRegistry::register(ShardId::new(0), ShardGeneration::new(0));
+    FenceRegistry::set_default_shard(ShardId::new(0));
+    bump_generation(&mut conn, ShardId::new(0), "promote", "oncall")
+        .await
+        .unwrap();
+
+    let result = autumn_harvest::quota_reconcile::reconcile_quota_keys(
+        &mut conn,
+        100,
+        Some(ShardId::new(0)),
+    )
+    .await;
+
+    #[derive(diesel::QueryableByName)]
+    struct QuotaKeyRow {
+        #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Text>)]
+        quota_key: Option<String>,
+    }
+    let rows: Vec<QuotaKeyRow> =
+        diesel::sql_query("SELECT quota_key FROM harvest_workflow_executions WHERE id = $1")
+            .bind::<diesel::sql_types::Uuid, _>(exec_id.as_uuid())
+            .load(&mut conn)
+            .await
+            .unwrap();
+    assert_eq!(
+        rows[0].quota_key, None,
+        "a fenced worker must not backfill a quota_key onto a row the promoted \
+         region now owns; sweep returned {result:?}"
+    );
+
+    {
+        let mut lock = autumn_harvest::completion_trigger::GLOBAL_WORKFLOW_METADATA
+            .write()
+            .expect("metadata lock");
+        *lock = previous_metadata;
+    }
+    FenceRegistry::clear();
+}
+
+#[tokio::test]
 async fn a_fenced_worker_cannot_claim_tasks() {
     let _serial = registry_guard().await;
     let (url, _db) = require_db!("claim");

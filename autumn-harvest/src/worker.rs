@@ -23276,6 +23276,9 @@ struct WorkerMonitoringHandles {
     /// Worker-session local-registry reconcilers (issue #606). Empty when
     /// `db` is disabled.
     session_slot_reconcilers: Vec<tokio::task::JoinHandle<()>>,
+    /// `quota_key` backfill reconcilers (issue #1226). Empty when `db` is
+    /// disabled.
+    quota_key_reconcilers: Vec<tokio::task::JoinHandle<()>>,
     history_oversized_sampler: tokio::task::JoinHandle<()>,
     /// Active-workflow population gauge sampler (issue #770). The task self-
     /// no-ops when metrics are disabled.
@@ -25040,6 +25043,11 @@ impl Worker {
                 tracing::warn!(error = %error, "session slot reconciler failed during shutdown");
             }
         }
+        for handle in monitors.quota_key_reconcilers {
+            if let Err(error) = handle.await {
+                tracing::warn!(error = %error, "quota_key reconciler failed during shutdown");
+            }
+        }
         for handle in monitors.pause_auto_resumers {
             if let Err(error) = handle.await {
                 tracing::warn!(error = %error, "pause auto-resumer failed during shutdown");
@@ -25596,6 +25604,31 @@ impl Worker {
                 )
             })
             .collect();
+        // `quota_key` backfill reconciler (issue #1226): one per assigned
+        // shard pool, mirroring the poison-pill/session reconcilers above.
+        // Each backfills `quota_key` on non-terminal executions left NULL by
+        // a `QuotaPolicy` declared after those rows started, scoped to that
+        // shard's own database. Reuses the heartbeat cadence rather than a
+        // dedicated interval knob, matching `session_slot_reconcilers`.
+        //
+        // The batch size is a fixed internal constant, not a `WorkerConfig`
+        // knob. `WorkerRuntimeConfig` is built as a bare struct literal at
+        // dozens of call sites across the test suite, with no
+        // `Default`/spread. A new required field there is disproportionate
+        // churn for a value that only needs to be "bounded", not
+        // operator-tunable.
+        let quota_key_reconcilers: Vec<_> = shard_pools_for_monitors
+            .iter()
+            .map(|(shard_pool, shard)| {
+                crate::quota_reconcile::spawn_quota_key_reconciler_for_shard(
+                    shard_pool.clone(),
+                    self.shutdown.clone(),
+                    self.config.worker_heartbeat_interval,
+                    crate::quota_reconcile::QUOTA_RECONCILE_DEFAULT_BATCH,
+                    *shard,
+                )
+            })
+            .collect();
         let pause_auto_resumers: Vec<_> = shard_pools_for_monitors
             .iter()
             .map(|(shard_pool, shard)| {
@@ -25853,6 +25886,7 @@ impl Worker {
             poison_pill_reclaimers,
             pause_auto_resumers,
             session_slot_reconcilers,
+            quota_key_reconcilers,
             history_oversized_sampler,
             workflow_active_sampler,
             worker_slot_sampler,
@@ -26543,6 +26577,15 @@ impl Worker {
                     worker_id = %self.config.worker_id,
                     error = %error,
                     "session slot reconciler task failed during shutdown"
+                );
+            }
+        }
+        for handle in monitors.quota_key_reconcilers {
+            if let Err(error) = handle.await {
+                tracing::warn!(
+                    worker_id = %self.config.worker_id,
+                    error = %error,
+                    "quota_key reconciler task failed during shutdown"
                 );
             }
         }
