@@ -1,0 +1,104 @@
+//! The control protocol between the `agentd` daemon and its CLI.
+//!
+//! One line of JSON in, one line of JSON out, over a Unix domain socket. The
+//! daemon holds the only write handle to the database, so every mutation
+//! travels this socket. That keeps the backend's single-writer contract intact
+//! with more than one process in play.
+
+use std::path::Path;
+
+use serde::{Deserialize, Serialize};
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::net::UnixStream;
+
+/// A command the CLI sends to the daemon.
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(tag = "cmd", rename_all = "snake_case")]
+pub enum Request {
+    /// Start one agent session.
+    Submit {
+        goal: String,
+        max_turns: u32,
+        approval_timeout_secs: u64,
+    },
+    /// Report one session.
+    Status { execution_id: String },
+    /// Report every session this database holds.
+    List,
+    /// Report the recorded event log of one session.
+    History { execution_id: String },
+    /// Release or refuse one approval-gated tool call.
+    Approve {
+        execution_id: String,
+        approved: bool,
+        note: Option<String>,
+    },
+}
+
+/// The daemon's answer.
+///
+/// Every variant is a struct variant. An internally tagged enum cannot carry a
+/// bare sequence, so a newtype variant over a `Vec` fails to serialize.
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(tag = "status", rename_all = "snake_case")]
+pub enum Response {
+    Submitted { execution_id: String },
+    Session { session: SessionView },
+    Sessions { sessions: Vec<SessionView> },
+    History { events: Vec<String> },
+    Ack { detail: String },
+    Error { message: String },
+}
+
+/// One session, as an operator sees it.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SessionView {
+    pub execution_id: String,
+    pub goal: String,
+    /// `RUNNING`, `COMPLETED`, or `FAILED`, read from the execution row.
+    pub state: String,
+    /// Why a running session is parked, when the daemon knows.
+    pub blocked_on: Option<String>,
+    /// The report of a finished session.
+    pub answer: Option<String>,
+    /// The error of a failed session.
+    pub error: Option<String>,
+}
+
+/// Send one request to the daemon and read its answer.
+///
+/// # Errors
+///
+/// Returns an error if the socket is absent, if the daemon closes the
+/// connection, or if either side writes something that is not valid JSON.
+pub async fn call(socket: &Path, request: &Request) -> Result<Response, String> {
+    let stream = UnixStream::connect(socket).await.map_err(|e| {
+        format!(
+            "cannot reach the daemon at {}: {e}. Start it with `agentd serve`.",
+            socket.display()
+        )
+    })?;
+    let (read_half, mut write_half) = stream.into_split();
+
+    let mut line =
+        serde_json::to_string(request).map_err(|e| format!("cannot encode the request: {e}"))?;
+    line.push('\n');
+    write_half
+        .write_all(line.as_bytes())
+        .await
+        .map_err(|e| format!("cannot send the request: {e}"))?;
+    write_half
+        .flush()
+        .await
+        .map_err(|e| format!("cannot send the request: {e}"))?;
+
+    let mut answer = String::new();
+    BufReader::new(read_half)
+        .read_line(&mut answer)
+        .await
+        .map_err(|e| format!("cannot read the answer: {e}"))?;
+    if answer.trim().is_empty() {
+        return Err("the daemon closed the connection without an answer".to_string());
+    }
+    serde_json::from_str(answer.trim()).map_err(|e| format!("malformed answer: {e}"))
+}
