@@ -2159,6 +2159,7 @@ async fn immediate_outbox_relay_counts_the_bypass_exactly_once() {
         sla: None,
         retry_policy: None,
         max_workflow_attempts_ceiling: None,
+        codecs: autumn_harvest::payload_codec::PayloadCodecs::default(),
     };
     deferred.spawn();
 
@@ -2374,6 +2375,7 @@ async fn immediate_outbox_relay_blocks_on_real_queue_gate() {
         sla: None,
         retry_policy: None,
         max_workflow_attempts_ceiling: None,
+        codecs: autumn_harvest::payload_codec::PayloadCodecs::default(),
     };
     deferred.spawn();
 

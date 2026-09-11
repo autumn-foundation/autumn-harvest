@@ -712,6 +712,7 @@ fn order_rows_by_quota_key(
 async fn fire_due_on_conn(
     conn: &mut diesel_async::AsyncPgConnection,
     _metrics: Option<&(dyn crate::telemetry::MetricsRecorder + Send + Sync)>,
+    codecs: &crate::payload_codec::PayloadCodecs,
 ) -> crate::error::HarvestResult<Vec<FiredDebounce>> {
     use diesel_async::{AsyncConnection, RunQueryDsl};
 
@@ -762,7 +763,7 @@ async fn fire_due_on_conn(
 
             let mut results = Vec::with_capacity(due_rows.len());
             for row in due_rows {
-                if let Some(item) = fire_claimed_debounce_row(conn, row).await? {
+                if let Some(item) = fire_claimed_debounce_row(conn, row, codecs).await? {
                     results.push(item);
                 }
             }
@@ -798,6 +799,30 @@ pub async fn fire_due_debounced_starts(
     sharded_pool: &Option<crate::shard::ShardedDbPool>,
     shard_assignments: &[crate::types::ShardId],
     metrics: &(dyn crate::telemetry::MetricsRecorder + Send + Sync),
+) -> crate::error::HarvestResult<usize> {
+    fire_due_debounced_starts_with_codecs(
+        conn,
+        sharded_pool,
+        shard_assignments,
+        metrics,
+        &crate::store::DEFAULT_PAYLOAD_CODECS,
+    )
+    .await
+}
+
+/// [`fire_due_debounced_starts`], encoding a flushed `WorkflowStarted.input`
+/// through `codecs` (issue #1243).
+///
+/// # Errors
+///
+/// Same as [`fire_due_debounced_starts`].
+#[cfg(feature = "db")]
+pub async fn fire_due_debounced_starts_with_codecs(
+    conn: &mut diesel_async::AsyncPgConnection,
+    sharded_pool: &Option<crate::shard::ShardedDbPool>,
+    shard_assignments: &[crate::types::ShardId],
+    metrics: &(dyn crate::telemetry::MetricsRecorder + Send + Sync),
+    codecs: &crate::payload_codec::PayloadCodecs,
 ) -> crate::error::HarvestResult<usize> {
     // Spawn a shard's fired follow-ups + record metrics, returning the count.
     // Done per-shard immediately after that shard's claim transaction commits, so
@@ -855,13 +880,13 @@ pub async fn fire_due_debounced_starts(
                 // Spawn this shard's results before moving on; on this shard's own
                 // error the transaction rolled back, so there is nothing committed
                 // to drain and propagating is safe.
-                let fired = fire_due_on_conn(&mut shard_conn, Some(metrics)).await?;
+                let fired = fire_due_on_conn(&mut shard_conn, Some(metrics), codecs).await?;
                 fired_count += spawn_fired(fired, metrics, &mut shard_conn).await;
             }
         }
         // Single-shard / no sharded pool: the passed connection is the only shard.
         _ => {
-            let fired = fire_due_on_conn(conn, Some(metrics)).await?;
+            let fired = fire_due_on_conn(conn, Some(metrics), codecs).await?;
             fired_count += spawn_fired(fired, metrics, conn).await;
         }
     }
@@ -965,6 +990,7 @@ async fn redefer_debounce_row(
 async fn fire_claimed_debounce_row(
     conn: &mut diesel_async::AsyncPgConnection,
     row: FireDueRow,
+    codecs: &crate::payload_codec::PayloadCodecs,
 ) -> crate::error::HarvestResult<Option<FiredDebounce>> {
     let opts: DebounceStartOptions = serde_json::from_value(row.start_options).unwrap_or_default();
 
@@ -1067,8 +1093,8 @@ async fn fire_claimed_debounce_row(
     // that rolls back with this transaction on error — the collect fn must not
     // spawn its follow-ups (they'd be orphaned). Deferred starts returned on
     // success are spawned by the caller only after the fire transaction commits.
-    match crate::execution::start_or_load_workflow_execution_collect(
-        conn, params, true, false, None, None, None,
+    match crate::execution::start_or_load_workflow_execution_collect_with_codecs(
+        conn, params, true, false, None, None, None, codecs,
     )
     .await
     {

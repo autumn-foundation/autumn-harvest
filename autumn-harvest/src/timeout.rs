@@ -1007,16 +1007,27 @@ async fn commit_workflow_execution_timeout(
             .await?;
         }
 
-        let (mut deferred, closed_children) = apply_parent_close_cascade(conn, exec_id).await?;
+        // Issue #1243: neither this cascade nor `timeout_event`
+        // (`WorkflowExecutionTimedOut`) carries a payload-bearing field.
+        // `enforce_workflow_execution_timeouts` also has no configured
+        // registry threaded through its many test call sites. Identity is
+        // exact here, not a shortcut.
+        let (mut deferred, closed_children) =
+            apply_parent_close_cascade(conn, exec_id, &crate::store::DEFAULT_PAYLOAD_CODECS)
+                .await?;
         let mut pending_cancel_metrics = Vec::new();
-        let triggers = crate::completion_trigger::evaluate_triggers_for_execution_collecting(
-            conn,
-            exec_id,
-            crate::completion_trigger::TerminalState::TimedOut,
-            metrics,
-            &mut pending_cancel_metrics,
-        )
-        .await?;
+        // Issue #1243: same identity-registry rationale as this function's
+        // `apply_parent_close_cascade` call above.
+        let triggers =
+            crate::completion_trigger::evaluate_triggers_for_execution_collecting_with_codecs(
+                conn,
+                exec_id,
+                crate::completion_trigger::TerminalState::TimedOut,
+                metrics,
+                &mut pending_cancel_metrics,
+                &crate::store::DEFAULT_PAYLOAD_CODECS,
+            )
+            .await?;
         deferred.extend(triggers);
         Ok((true, deferred, closed_children, pending_cancel_metrics))
     }))
@@ -1726,16 +1737,19 @@ async fn enforce_workflow_timeout(
         .await?;
         update_workflow_execution_timed_out(conn, exec_id, &error).await?;
         queue::fail_task(conn, task.id, &error).await?;
-        let (mut deferred, closed_children) = apply_parent_close_cascade(conn, exec_id).await?;
+        let (mut deferred, closed_children) =
+            apply_parent_close_cascade(conn, exec_id, codecs).await?;
         let mut pending_cancel_metrics = Vec::new();
-        let triggers = crate::completion_trigger::evaluate_triggers_for_execution_collecting(
-            conn,
-            exec_id,
-            crate::completion_trigger::TerminalState::TimedOut,
-            Some(metrics),
-            &mut pending_cancel_metrics,
-        )
-        .await?;
+        let triggers =
+            crate::completion_trigger::evaluate_triggers_for_execution_collecting_with_codecs(
+                conn,
+                exec_id,
+                crate::completion_trigger::TerminalState::TimedOut,
+                Some(metrics),
+                &mut pending_cancel_metrics,
+                codecs,
+            )
+            .await?;
         deferred.extend(triggers);
         if execution.parent_close_policy.is_none()
             && let Some(parent_uuid) = execution.parent_id
@@ -4254,11 +4268,12 @@ pub async fn enforce_timeouts_once(
         payload_codecs,
     )
     .await?;
-    count += crate::completion_trigger::enforce_completion_triggers_outbox(
+    count += crate::completion_trigger::enforce_completion_triggers_outbox_with_codecs(
         conn,
         metrics,
         sharded_pool,
         shard_assignments,
+        payload_codecs,
     )
     .await?;
     // Cross-shard child workflows (issue #956). Runs on this shard's own
@@ -4280,15 +4295,30 @@ pub async fn enforce_timeouts_once(
         metrics,
     )
     .await?;
-    count +=
-        crate::debounce::fire_due_debounced_starts(conn, sharded_pool, shard_assignments, metrics)
-            .await?;
-    count +=
-        crate::throttle::fire_due_throttled_starts(conn, sharded_pool, shard_assignments, metrics)
-            .await?;
-    count +=
-        crate::event_batch::fire_due_event_batches(conn, sharded_pool, shard_assignments, metrics)
-            .await?;
+    count += crate::debounce::fire_due_debounced_starts_with_codecs(
+        conn,
+        sharded_pool,
+        shard_assignments,
+        metrics,
+        payload_codecs,
+    )
+    .await?;
+    count += crate::throttle::fire_due_throttled_starts_with_codecs(
+        conn,
+        sharded_pool,
+        shard_assignments,
+        metrics,
+        payload_codecs,
+    )
+    .await?;
+    count += crate::event_batch::fire_due_event_batches_with_codecs(
+        conn,
+        sharded_pool,
+        shard_assignments,
+        metrics,
+        payload_codecs,
+    )
+    .await?;
     count += crate::completion_callback::fire_due_completion_deliveries(
         conn,
         sharded_pool,
@@ -4296,7 +4326,9 @@ pub async fn enforce_timeouts_once(
     )
     .await?;
     if let Some(ceiling) = max_workflow_history_events {
-        count += enforce_workflow_history_ceiling(conn, ceiling, metrics).await?;
+        count +=
+            enforce_workflow_history_ceiling_with_codecs(conn, ceiling, metrics, payload_codecs)
+                .await?;
     }
     count +=
         crate::sessions::enforce_broken_sessions(conn, session_worker_stale_secs, payload_codecs)
@@ -4565,12 +4597,39 @@ pub fn spawn_timeout_checker_for_shard(
 /// # Errors
 ///
 /// Returns the first database or persistence error encountered.
+///
+/// Delegates to [`enforce_workflow_history_ceiling_with_codecs`] under the
+/// identity registry (issue #1243 review, P2). A payload-bearing call site
+/// should use the `_with_codecs` sibling instead. This wrapper keeps the
+/// pre-#1243 public signature for an out-of-tree caller.
 #[cfg(feature = "db")]
-#[allow(clippy::too_many_lines)]
 pub async fn enforce_workflow_history_ceiling(
     conn: &mut AsyncPgConnection,
     ceiling: u64,
     metrics: &(dyn MetricsRecorder + Send + Sync),
+) -> HarvestResult<usize> {
+    enforce_workflow_history_ceiling_with_codecs(
+        conn,
+        ceiling,
+        metrics,
+        &crate::store::DEFAULT_PAYLOAD_CODECS,
+    )
+    .await
+}
+
+/// [`enforce_workflow_history_ceiling`], encoding through `codecs` (issue #1243).
+///
+/// # Errors
+///
+/// Same as [`enforce_workflow_history_ceiling`].
+#[cfg(feature = "db")]
+#[allow(clippy::too_many_lines)]
+pub async fn enforce_workflow_history_ceiling_with_codecs(
+    conn: &mut AsyncPgConnection,
+    ceiling: u64,
+    metrics: &(dyn MetricsRecorder + Send + Sync),
+    // Issue #1243: threaded to `apply_parent_close_cascade` below.
+    codecs: &crate::payload_codec::PayloadCodecs,
 ) -> HarvestResult<usize> {
     use diesel::sql_types::{BigInt, Nullable, Text, Uuid as SqlUuid};
 
@@ -4687,15 +4746,16 @@ pub async fn enforce_workflow_history_ceiling(
                 }
 
                 let (mut deferred, closed_children) =
-                    apply_parent_close_cascade(conn, exec_id).await?;
+                    apply_parent_close_cascade(conn, exec_id, codecs).await?;
                 let mut pending_cancel_metrics = Vec::new();
                 let triggers =
-                    crate::completion_trigger::evaluate_triggers_for_execution_collecting(
+                    crate::completion_trigger::evaluate_triggers_for_execution_collecting_with_codecs(
                         conn,
                         exec_id,
                         crate::completion_trigger::TerminalState::Failed,
                         Some(metrics),
                         &mut pending_cancel_metrics,
+                        codecs,
                     )
                     .await?;
                 deferred.extend(triggers);

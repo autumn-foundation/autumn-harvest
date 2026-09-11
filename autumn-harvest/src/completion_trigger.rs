@@ -922,6 +922,8 @@ async fn relay_gate_checked_start(
     source_exec_id: Uuid,
     trigger_id: Uuid,
     metrics: Option<&(dyn crate::telemetry::MetricsRecorder + Send + Sync)>,
+    // Issue #1243: `WorkflowStarted.input` is payload-bearing.
+    codecs: &crate::payload_codec::PayloadCodecs,
 ) -> crate::error::HarvestResult<()> {
     use crate::schema::harvest_completion_trigger_fires::dsl as fires_dsl;
     use crate::schema::harvest_completion_trigger_outbox::dsl as outbox_dsl;
@@ -1010,11 +1012,12 @@ async fn relay_gate_checked_start(
                 return Ok(RelayOutcome::Delivered);
             }
 
-            match crate::execution::start_or_load_workflow_execution_with_metrics(
+            match crate::execution::start_or_load_workflow_execution_with_metrics_and_codecs(
                 target_conn,
                 params,
                 metrics,
                 Some(crate::admission_gate::GateMode::CheckCached),
+                codecs,
             )
             .await
             {
@@ -1177,6 +1180,10 @@ pub struct DeferredTriggerStart {
     pub retry_policy: Option<crate::policy::RetryPolicy>,
     /// Server-side ceiling on `max_attempts` (issue #523). Clamped at start time.
     pub max_workflow_attempts_ceiling: Option<u32>,
+    /// The configured payload-codec registry (issue #1243). `spawn` runs
+    /// detached from the evaluating call's own scope, so the registry rides
+    /// along on the struct rather than through a process-global static.
+    pub codecs: crate::payload_codec::PayloadCodecs,
 }
 
 #[cfg(feature = "db")]
@@ -1309,6 +1316,7 @@ impl DeferredTriggerStart {
                 self.source_exec_id,
                 self.trigger_id,
                 metrics_ref,
+                &self.codecs,
             )
             .await
             {
@@ -1349,12 +1357,43 @@ pub fn evaluate_triggers_for_execution<'a>(
     use futures::FutureExt;
     async move {
         let mut discarded_cancel_metrics = Vec::new();
-        evaluate_triggers_for_execution_collecting(
+        evaluate_triggers_for_execution_collecting_with_codecs(
             conn,
             exec_id,
             state,
             metrics,
             &mut discarded_cancel_metrics,
+            &crate::store::DEFAULT_PAYLOAD_CODECS,
+        )
+        .await
+    }
+    .boxed()
+}
+
+/// [`evaluate_triggers_for_execution`], encoding a triggered target's
+/// `WorkflowStarted.input` through `codecs` (issue #1243).
+///
+/// # Errors
+///
+/// Same as [`evaluate_triggers_for_execution`].
+#[cfg(feature = "db")]
+pub fn evaluate_triggers_for_execution_with_codecs<'a>(
+    conn: &'a mut diesel_async::AsyncPgConnection,
+    exec_id: crate::types::ExecutionId,
+    state: TerminalState,
+    metrics: Option<&'a (dyn crate::telemetry::MetricsRecorder + Send + Sync)>,
+    codecs: &'a crate::payload_codec::PayloadCodecs,
+) -> futures::future::BoxFuture<'a, crate::error::HarvestResult<Vec<DeferredTriggerStart>>> {
+    use futures::FutureExt;
+    async move {
+        let mut discarded_cancel_metrics = Vec::new();
+        evaluate_triggers_for_execution_collecting_with_codecs(
+            conn,
+            exec_id,
+            state,
+            metrics,
+            &mut discarded_cancel_metrics,
+            codecs,
         )
         .await
     }
@@ -1376,7 +1415,6 @@ pub fn evaluate_triggers_for_execution<'a>(
 /// accumulated `pending` list only **after** their enclosing transaction has
 /// committed — the exact same discipline already required of the
 /// `StartCancelledRun`s a fresh workflow start collects.
-#[allow(clippy::too_many_lines)]
 #[cfg(feature = "db")]
 pub fn evaluate_triggers_for_execution_collecting<'a>(
     conn: &'a mut diesel_async::AsyncPgConnection,
@@ -1387,13 +1425,44 @@ pub fn evaluate_triggers_for_execution_collecting<'a>(
 ) -> futures::future::BoxFuture<'a, crate::error::HarvestResult<Vec<DeferredTriggerStart>>> {
     use futures::FutureExt;
     async move {
+        evaluate_triggers_for_execution_collecting_with_codecs(
+            conn,
+            exec_id,
+            state,
+            metrics,
+            pending,
+            &crate::store::DEFAULT_PAYLOAD_CODECS,
+        )
+        .await
+    }
+    .boxed()
+}
+
+/// [`evaluate_triggers_for_execution_collecting`], encoding a triggered
+/// target's `WorkflowStarted.input` through `codecs` (issue #1243).
+///
+/// # Errors
+///
+/// Same as [`evaluate_triggers_for_execution_collecting`].
+#[allow(clippy::too_many_lines, clippy::too_many_arguments)]
+#[cfg(feature = "db")]
+pub fn evaluate_triggers_for_execution_collecting_with_codecs<'a>(
+    conn: &'a mut diesel_async::AsyncPgConnection,
+    exec_id: crate::types::ExecutionId,
+    state: TerminalState,
+    metrics: Option<&'a (dyn crate::telemetry::MetricsRecorder + Send + Sync)>,
+    pending: &'a mut Vec<crate::execution::StartCancelledRun>,
+    codecs: &'a crate::payload_codec::PayloadCodecs,
+) -> futures::future::BoxFuture<'a, crate::error::HarvestResult<Vec<DeferredTriggerStart>>> {
+    use futures::FutureExt;
+    async move {
         use diesel::prelude::*;
         use diesel_async::RunQueryDsl;
         use crate::schema::harvest_completion_triggers::dsl as triggers_dsl;
         use crate::schema::harvest_completion_trigger_fires::dsl as fires_dsl;
         use crate::schema::harvest_workflow_executions::dsl as execs_dsl;
         use crate::models::{CompletionTriggerDb, NewCompletionTriggerFireDb, WorkflowExecution, NewCompletionTriggerOutboxDb};
-        use crate::execution::{StartWorkflowParams, start_or_load_workflow_execution_collect, check_and_report_unfinished_handlers};
+        use crate::execution::{StartWorkflowParams, start_or_load_workflow_execution_collect_with_codecs, check_and_report_unfinished_handlers};
         use crate::types::WorkflowIdReusePolicy;
         use crate::types::Priority;
 
@@ -1801,7 +1870,7 @@ pub fn evaluate_triggers_for_execution_collecting<'a>(
                 // `evaluate_triggers_for_execution_collecting` to emit once
                 // ITS OWN enclosing transaction has actually committed.
                 let (start_res, cancel_deferred_starts, cancel_deferred_checks, cancel_metrics) =
-                    match start_or_load_workflow_execution_collect(
+                    match start_or_load_workflow_execution_collect_with_codecs(
                     conn,
                     StartWorkflowParams {
                         workflow_name: &trigger_db.target_workflow_name,
@@ -1864,6 +1933,7 @@ pub fn evaluate_triggers_for_execution_collecting<'a>(
                     // here — pass `None` to avoid double-counting (issue #618).
                     None,
                     None,
+                    codecs,
                 )
                 .await
                 {
@@ -1996,6 +2066,7 @@ pub fn evaluate_triggers_for_execution_collecting<'a>(
                             sla: target_sla,
                             retry_policy: target_retry_policy,
                             max_workflow_attempts_ceiling,
+                            codecs: codecs.clone(),
                         });
 
                         continue;
@@ -2082,6 +2153,7 @@ pub fn evaluate_triggers_for_execution_collecting<'a>(
                     sla: target_sla,
                     retry_policy: target_retry_policy,
                     max_workflow_attempts_ceiling,
+                    codecs: codecs.clone(),
                 });
             }
         }
@@ -2169,6 +2241,31 @@ pub async fn enforce_completion_triggers_outbox(
     metrics: &(dyn crate::telemetry::MetricsRecorder + Send + Sync),
     sharded_pool: &Option<crate::shard::ShardedDbPool>,
     shard_assignments: &[crate::types::ShardId],
+) -> crate::error::HarvestResult<usize> {
+    enforce_completion_triggers_outbox_with_codecs(
+        conn,
+        metrics,
+        sharded_pool,
+        shard_assignments,
+        &crate::store::DEFAULT_PAYLOAD_CODECS,
+    )
+    .await
+}
+
+/// [`enforce_completion_triggers_outbox`], encoding a relayed target's
+/// `WorkflowStarted.input` through `codecs` (issue #1243).
+///
+/// # Errors
+///
+/// Same as [`enforce_completion_triggers_outbox`].
+#[cfg(feature = "db")]
+#[allow(clippy::too_many_lines)]
+pub async fn enforce_completion_triggers_outbox_with_codecs(
+    conn: &mut diesel_async::AsyncPgConnection,
+    metrics: &(dyn crate::telemetry::MetricsRecorder + Send + Sync),
+    sharded_pool: &Option<crate::shard::ShardedDbPool>,
+    shard_assignments: &[crate::types::ShardId],
+    codecs: &crate::payload_codec::PayloadCodecs,
 ) -> crate::error::HarvestResult<usize> {
     use crate::models::CompletionTriggerOutboxDb;
     use crate::schema::harvest_completion_trigger_outbox::dsl as outbox_dsl;
@@ -2446,6 +2543,7 @@ pub async fn enforce_completion_triggers_outbox(
             task.source_exec_id,
             task.trigger_id,
             Some(metrics),
+            codecs,
         )
         .await
         {
