@@ -273,6 +273,109 @@ fn queue_pause_alert_states_the_schedule_to_close_exception() {
     );
 }
 
+fn shard_undrained_rule() -> Value {
+    read_pack()["rules"]
+        .as_array()
+        .expect("rules must be an array")
+        .iter()
+        .find(|rule| rule["id"] == "harvest_shard_undrained")
+        .expect("shard-undrained alert must exist")
+        .clone()
+}
+
+#[test]
+fn shard_undrained_prose_allows_a_poller_that_cannot_claim_work() {
+    let rule = shard_undrained_rule();
+    for (field, value) in [
+        ("description", &rule["description"]),
+        ("notes", &rule["prometheus"]["notes"]),
+        ("note", &rule["prometheus"]["expressions"][1]["note"]),
+    ] {
+        let text = value.as_str().expect("alert text must be a string");
+        assert!(
+            text.contains("poller") && text.contains("cannot claim"),
+            "{field} must allow a poller that cannot claim pending work"
+        );
+        for cause in ["queue", "build", "capability", "sticky"] {
+            assert!(text.contains(cause), "{field} must name {cause} mismatch");
+        }
+        for claim in [
+            "genuinely no covering poller",
+            "distinguishes 'no poller at all'",
+            "no live worker is polling it",
+        ] {
+            assert!(
+                !text.contains(claim),
+                "{field} has a false diagnosis: {claim}"
+            );
+        }
+    }
+}
+
+#[test]
+fn shard_undrained_keeps_the_missing_dispatch_series_case() {
+    let rule = shard_undrained_rule();
+    let broad = "max by (shard) (harvest_shard_stranded_pending) > 0";
+    let narrow =
+        format!("{broad} unless (sum by (shard) (rate(harvest_shard_dispatched_total[5m])) > 0)");
+    assert_eq!(rule["prometheus"]["expressions"][0]["expr"], broad);
+    assert_eq!(rule["prometheus"]["expressions"][1]["expr"], narrow);
+
+    let runbook = read_doc("docs/runbooks/harvest-alerts.md");
+    let section = markdown_section(&runbook, "harvest_shard_undrained")
+        .expect("shard-undrained runbook must exist");
+    assert!(squeeze_whitespace(section).contains(&narrow));
+    for text in [rule["prometheus"]["notes"].as_str().unwrap(), section] {
+        assert!(text.contains("unless") && text.contains("== 0"));
+        assert!(text.contains("series"), "explain the missing-series case");
+    }
+}
+
+#[test]
+fn shard_undrained_runbook_uses_health_details_for_both_remediation_paths() {
+    let runbook = read_doc("docs/runbooks/harvest-alerts.md");
+    let section = markdown_section(&runbook, "harvest_shard_undrained")
+        .expect("shard-undrained runbook must exist");
+    let subsection = |heading| {
+        section
+            .split_once(heading)
+            .expect("runbook subsection must exist")
+            .1
+            .split("\n### ")
+            .next()
+            .unwrap()
+    };
+    let triage = subsection("### Triage steps");
+    for field in [
+        "harvest shard health --output json",
+        "harvest worker list --output json",
+        "no_live_worker",
+        "blocking_reasons",
+        "active_worker_count",
+        "worker_coverage",
+    ] {
+        assert!(triage.contains(field), "triage must use {field}");
+    }
+    let actions = squeeze_whitespace(subsection("### Safe actions"));
+    for guidance in [
+        "If no live worker covers the shard",
+        "If a live worker covers the shard",
+        "queue",
+        "build",
+        "capability",
+        "sticky",
+    ] {
+        assert!(
+            actions.contains(guidance),
+            "safe actions must include: {guidance}"
+        );
+    }
+    assert!(
+        squeeze_whitespace(triage).contains("does not prove that the shard has no poller"),
+        "triage must explain the limit of no_live_worker"
+    );
+}
+
 #[test]
 fn every_alert_links_to_a_complete_runbook_section() {
     let runbook = read_doc("docs/runbooks/harvest-alerts.md");
