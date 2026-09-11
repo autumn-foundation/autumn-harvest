@@ -526,12 +526,9 @@ pub(crate) async fn enforce_quota_admission(
     // subtracts out incumbents a `cancel_running` pass will shed before
     // commit, and their history bytes -- see this function's own doc
     // comment.
-    usage.active_executions = usage
-        .active_executions
-        .saturating_sub(1)
-        .saturating_sub(
-            i64::try_from(pending_supersede_credit.active_executions).unwrap_or(i64::MAX),
-        );
+    usage.active_executions = usage.active_executions.saturating_sub(1).saturating_sub(
+        i64::try_from(pending_supersede_credit.active_executions).unwrap_or(i64::MAX),
+    );
     usage.history_bytes = usage
         .history_bytes
         .saturating_sub(pending_supersede_credit.history_bytes);

@@ -569,9 +569,9 @@ pub async fn dry_run_supersede_credit(
     .await
     .map_err(crate::error::database_error)?;
 
-    let (candidates, protected): (Vec<Row>, Vec<Row>) = rows.into_iter().partition(|r| {
-        !inherited.contains(&crate::types::ExecutionId::from_uuid(r.id))
-    });
+    let (candidates, protected): (Vec<Row>, Vec<Row>) = rows
+        .into_iter()
+        .partition(|r| !inherited.contains(&crate::types::ExecutionId::from_uuid(r.id)));
     let shed = supersede_plan(candidates.len(), protected.len(), limit).shed;
 
     // The actual shed set: the OLDEST `shed` candidates, exactly what
