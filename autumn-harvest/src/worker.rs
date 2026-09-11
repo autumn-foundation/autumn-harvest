@@ -12935,9 +12935,10 @@ async fn create_detached_child_executions(
         // execution.rs: INSERT -> enforce_quota_admission -> append event). A
         // `QuotaExceeded` here rolls back the whole enclosing transaction
         // (nothing durable was created) and propagates via `?` to whichever
-        // caller-side recovery point applies -- `recover_from_child_quota_
-        // exceeded` parks the PARENT's task and wakes it, rather than
-        // terminally failing it over the CHILD's tenant quota.
+        // caller-side recovery point applies. `recover_from_child_quota_
+        // exceeded` (issue #1227) defers the PARENT with a bounded jittered
+        // backoff, rather than terminally failing it over the CHILD's tenant
+        // quota.
         crate::execution::enforce_quota_admission(
             conn,
             detached_quota,
