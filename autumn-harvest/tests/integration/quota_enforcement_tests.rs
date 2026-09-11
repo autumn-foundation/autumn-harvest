@@ -1480,42 +1480,53 @@ fn detached_quota_multi_key_parent<'a>(
 /// child. Their pre-acquisition `BTreeSet` degenerates to a single pair.
 /// This test exercises its dedup and sort over several pairs instead.
 #[tokio::test]
-// `child_a_*`/`child_b_*` are deliberately parallel-named. The test
-// compares two workflow types side by side. Renaming them to satisfy
-// clippy's Levenshtein-distance heuristic would make this harder to read.
-#[allow(clippy::similar_names)]
 async fn detached_child_multi_spawn_batch_locks_every_distinct_key_and_admits_all() {
     let (url, _c) = setup_test_database_url_or_env().await;
     let mut conn = connect(&url).await;
 
     let parent_wf_name = leaked("quota_detached_multikey_parent");
-    let child_a_name = leaked("quota_detached_multikey_child_a");
-    let child_b_name = leaked("quota_detached_multikey_child_b");
+    let child_alpha_name = leaked("quota_detached_multikey_child_a");
+    let child_beta_name = leaked("quota_detached_multikey_child_b");
 
     // Generous caps -- this test is about lock coverage, not rejection.
     let quota_policy = QuotaPolicy::new("tenant_id").with_max_active_executions(10);
-    let mut child_a_info = wf_info(child_a_name, detached_quota_child);
-    child_a_info.quota = Some(quota_policy);
-    let mut child_b_info = wf_info(child_b_name, detached_quota_child);
-    child_b_info.quota = Some(quota_policy);
+    let mut child_alpha_info = wf_info(child_alpha_name, detached_quota_child);
+    child_alpha_info.quota = Some(quota_policy);
+    let mut child_beta_info = wf_info(child_beta_name, detached_quota_child);
+    child_beta_info.quota = Some(quota_policy);
 
     let parent = start_root(
         &mut conn,
         parent_wf_name,
         &format!("parent-{}", Uuid::new_v4().simple()),
-        serde_json::json!({"child_a": child_a_name, "child_b": child_b_name}),
+        serde_json::json!({"child_a": child_alpha_name, "child_b": child_beta_name}),
     )
     .await;
 
     let reg = registry(vec![
         wf_info(parent_wf_name, detached_quota_multi_key_parent),
-        child_a_info,
-        child_b_info,
+        child_alpha_info,
+        child_beta_info,
     ]);
     let worker = build_runtime_worker("w-1228-detached-multikey", 2, 1, reg);
     let handle = spawn_test_worker(Arc::clone(&worker), build_test_pool(&url));
 
-    wait_for_execution_state(&url, parent, "COMPLETED").await;
+    // A longer bound than the usual 10s default. This decision cycle does
+    // FOUR lock acquisitions and four inserts, not one. It needs more
+    // margin under a busy CI runner. This mirrors
+    // `wait_for_execution_state_with_timeout`'s own documented reason for
+    // existing.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    loop {
+        if load_execution(&mut conn, parent).await.state == "COMPLETED" {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "parent must reach COMPLETED within 30s"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
     worker.shutdown();
     handle.await.expect("worker join");
 
@@ -1530,8 +1541,8 @@ async fn detached_child_multi_spawn_batch_locks_every_distinct_key_and_admits_al
         "SELECT workflow_name, quota_key FROM harvest_workflow_executions \
          WHERE workflow_name = $1 OR workflow_name = $2",
     )
-    .bind::<diesel::sql_types::Text, _>(child_a_name)
-    .bind::<diesel::sql_types::Text, _>(child_b_name)
+    .bind::<diesel::sql_types::Text, _>(child_alpha_name)
+    .bind::<diesel::sql_types::Text, _>(child_beta_name)
     .load(&mut conn)
     .await
     .expect("load children");
@@ -1543,10 +1554,10 @@ async fn detached_child_multi_spawn_batch_locks_every_distinct_key_and_admits_al
          created -- got {rows:?}"
     );
     for (name, key) in [
-        (child_a_name, "acme"),
-        (child_a_name, "beta"),
-        (child_b_name, "acme"),
-        (child_b_name, "beta"),
+        (child_alpha_name, "acme"),
+        (child_alpha_name, "beta"),
+        (child_beta_name, "acme"),
+        (child_beta_name, "beta"),
     ] {
         assert!(
             rows.contains(&ChildRow {
