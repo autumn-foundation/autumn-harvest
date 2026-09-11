@@ -1611,26 +1611,38 @@ mod db {
         // generation. Those beats' LSNs belong to a different WAL stream —
         // comparable neither to each other nor to the new primary's
         // positions. Restricting to the current generation keeps every
-        // comparison inside one WAL stream. The sampler that writes beats
-        // only runs once fencing is enabled, by which point the fencing row
-        // already exists (`ensure_generation_row` runs first). So a shard
-        // with no fencing row has no beats to read either way.
+        // comparison inside one WAL stream.
+        //
+        // `LEFT JOIN ... ON true`, not a comma join. A shard with no
+        // `harvest_shard_generation` row makes `current_gen` empty. That
+        // happens when fencing was never enabled for it, or when this trail
+        // was written directly rather than through the fencing-gated
+        // sampler. A comma join against an empty CTE returns no rows at
+        // all, regardless of the `WHERE` clause. That silently made every
+        // reading `Unknown`.
+        // `COALESCE(current_gen.generation, 0)` matches this table's own
+        // default: every beat is stamped `fence_generation = 0` when no
+        // fencing row exists at write time. An absent row still compares
+        // equal, so the trail reads exactly as it did before this column
+        // existed.
         let rows: Vec<RpoRow> = diesel::sql_query(
             "WITH current_gen AS ( \
                  SELECT generation FROM harvest_shard_generation WHERE shard_id = $1 \
              ) \
              SELECT ( \
                  SELECT EXTRACT(EPOCH FROM (NOW() - h.beat_at))::double precision \
-                 FROM harvest_replication_heartbeat h, current_gen \
+                 FROM harvest_replication_heartbeat h \
+                 LEFT JOIN current_gen ON true \
                  WHERE h.shard_id = $1 AND h.beat_lsn <= $2::pg_lsn \
-                   AND h.fence_generation = current_gen.generation \
+                   AND h.fence_generation = COALESCE(current_gen.generation, 0) \
                  ORDER BY h.beat_lsn DESC LIMIT 1 \
              ) AS lag_seconds, \
              ( \
                  SELECT EXTRACT(EPOCH FROM (NOW() - h.beat_at))::double precision \
-                 FROM harvest_replication_heartbeat h, current_gen \
+                 FROM harvest_replication_heartbeat h \
+                 LEFT JOIN current_gen ON true \
                  WHERE h.shard_id = $1 \
-                   AND h.fence_generation = current_gen.generation \
+                   AND h.fence_generation = COALESCE(current_gen.generation, 0) \
                  ORDER BY h.beat_at ASC LIMIT 1 \
              ) AS oldest_seconds",
         )

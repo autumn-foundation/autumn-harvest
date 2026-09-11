@@ -1063,9 +1063,13 @@ async fn promotion_advances_reserved_word_and_mixed_case_relations() {
 ///
 /// The catalog query filtered on the SEQUENCE's own schema
 /// (`sn.nspname = current_schema()`) rather than the OWNING TABLE's
-/// (`tn.nspname`). A migration that qualifies `CREATE SEQUENCE` into a
-/// second schema, with the table itself left in the connection's default
-/// schema, is legal. That case was silently skipped, leaving the promoted
+/// (`tn.nspname`). Postgres requires `ALTER SEQUENCE ... OWNED BY` to name a
+/// table in the SAME schema, but does not re-check that afterward. Moving
+/// either object with `ALTER ... SET SCHEMA` leaves the ownership link
+/// intact while the two diverge. That is exactly the shape a migration
+/// produces when it qualifies `CREATE SEQUENCE` into one schema while the
+/// table lives
+/// elsewhere produces. That case was silently skipped, leaving the promoted
 /// primary handing out already-used primary keys on its first writes.
 #[tokio::test]
 async fn promotion_advances_a_sequence_owned_by_a_table_in_a_different_schema() {
@@ -1074,8 +1078,9 @@ async fn promotion_advances_a_sequence_owned_by_a_table_in_a_different_schema() 
     conn.batch_execute(
         "CREATE SCHEMA dr_seq_home;
          CREATE SEQUENCE dr_seq_home.dr_cross_seq;
-         CREATE TABLE dr_cross (id BIGINT PRIMARY KEY DEFAULT nextval('dr_seq_home.dr_cross_seq'));
-         ALTER SEQUENCE dr_seq_home.dr_cross_seq OWNED BY dr_cross.id;
+         CREATE TABLE dr_seq_home.dr_cross (id BIGINT PRIMARY KEY DEFAULT nextval('dr_seq_home.dr_cross_seq'));
+         ALTER SEQUENCE dr_seq_home.dr_cross_seq OWNED BY dr_seq_home.dr_cross.id;
+         ALTER TABLE dr_seq_home.dr_cross SET SCHEMA public;
          INSERT INTO dr_cross DEFAULT VALUES;
          INSERT INTO dr_cross DEFAULT VALUES;
          SELECT setval('dr_seq_home.dr_cross_seq', 1, false);",
@@ -1490,9 +1495,10 @@ async fn a_slot_matching_the_prefix_only_under_like_wildcards_is_not_counted() {
     let (url, _db) = require_db!("likewild");
     let mut conn = connect(&url).await;
 
-    // `_` stands in for the prefix's own underscore: differs at that one
+    // `x` stands in for the prefix's own underscore: differs at that one
     // position, so `starts_with` correctly rejects it while `LIKE` would not.
-    let slot = format!("harvestXdr_wildprobe_{}", std::process::id());
+    // Lowercase only -- Postgres replication slot names allow no other case.
+    let slot = format!("harvestxdr_wildprobe_{}", std::process::id());
     assert_ne!(&slot[..10], DR_PREFIX, "the probe must not literally match");
     diesel::sql_query("SELECT pg_create_logical_replication_slot($1, 'pgoutput')")
         .bind::<diesel::sql_types::Text, _>(slot.clone())
