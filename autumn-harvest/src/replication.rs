@@ -190,10 +190,12 @@ pub enum ReplicationStatus {
 
 /// What the watermark trail can say about a shard's RPO.
 ///
-/// Three states, not `Option<f64>`, because two of the "no number" cases mean
-/// opposite things and collapsing them is dangerous: a trail the standby has
-/// fallen off the end of means the RPO is **huge**, while a trail with nothing
-/// confirmed yet means it is merely **unmeasured**.
+/// Five states, not `Option<f64>`, because several "no number" cases mean
+/// opposite things and collapsing them is dangerous. A trail the standby has
+/// fallen off the end of means the RPO is **huge**, a trail with nothing
+/// confirmed yet means it is merely **unmeasured**, and a trail this process
+/// could not even read is neither — it is a state `replay_lag` must never be
+/// allowed to paper over.
 #[derive(Debug, Clone, Copy, PartialEq)]
 #[non_exhaustive]
 pub enum WatermarkReading {
@@ -216,6 +218,50 @@ pub enum WatermarkReading {
     /// a legitimate fallback, because a standby that has consumed nothing has
     /// not stalled mid-apply.
     Unknown,
+    /// Some, but not all, DR slots for this shard have a confirmed position.
+    ///
+    /// Distinct from [`Self::Unknown`] on purpose. `Unknown` means "nothing
+    /// has consumed anything yet", where `replay_lag` is still a fair
+    /// fallback. This means "one target is unmeasurable while another is
+    /// fine" — an abandoned or never-connected slot sitting next to a
+    /// healthy standby. Falling back to `replay_lag` here would report the
+    /// healthy standby's small lag and hide the abandoned slot completely,
+    /// which is the failure this variant exists to stop.
+    PartiallyMeasured {
+        /// The watermark reading for the slots that DO have a position, if
+        /// the trail has confirmed one for them yet. Never backed by
+        /// `replay_lag`.
+        measured_seconds: Option<f64>,
+        /// How many matching slots have no position at all. The separate
+        /// signal an abandoned slot pages on, since it does not show up in
+        /// `measured_seconds`.
+        unmeasurable_slots: usize,
+    },
+    /// The watermark trail could not be read (a query error).
+    ///
+    /// Not the same as [`Self::Unknown`]: an unmeasured trail may still trust
+    /// `replay_lag`, but a trail read that FAILED is the one moment
+    /// `replay_lag` is least trustworthy — it is frozen or NULL whenever a
+    /// logical apply worker is stuck, which is the incident this trail exists
+    /// to measure. Never eligible for the `replay_lag` fallback.
+    Failed,
+}
+
+impl WatermarkReading {
+    /// The measured or floor seconds for the states that carry one directly,
+    /// never via the `replay_lag` fallback.
+    ///
+    /// A private helper `measure_rpo` uses to fold its own [`Self::Measured`]
+    /// / [`Self::BeyondTrail`] result into a `PartiallyMeasured` reading
+    /// without duplicating the match.
+    #[cfg(feature = "db")]
+    const fn measured_or_floor_seconds(&self) -> Option<f64> {
+        match self {
+            Self::Measured(seconds) => Some(*seconds),
+            Self::BeyondTrail { floor_seconds } => Some(*floor_seconds),
+            Self::Unknown | Self::PartiallyMeasured { .. } | Self::Failed => None,
+        }
+    }
 }
 
 impl ReplicationStatus {
@@ -249,7 +295,33 @@ impl ReplicationStatus {
                 WatermarkReading::Measured(seconds) => Some(*seconds),
                 WatermarkReading::BeyondTrail { floor_seconds } => Some(*floor_seconds),
                 WatermarkReading::Unknown => self.max_replay_lag_seconds(),
+                // Never falls back to `replay_lag`: see the two variants'
+                // docs for why each is a moment `replay_lag` is untrustworthy.
+                WatermarkReading::PartiallyMeasured {
+                    measured_seconds, ..
+                } => *measured_seconds,
+                WatermarkReading::Failed => None,
             },
+        }
+    }
+
+    /// How many DR slots for this shard have no confirmed position at all.
+    ///
+    /// `0` in every state except [`WatermarkReading::PartiallyMeasured`] — the
+    /// separate signal an abandoned or never-connected slot pages on, since it
+    /// does not lower [`Self::rpo_seconds`] the way a slow-but-connected
+    /// standby would.
+    #[must_use]
+    pub const fn unmeasurable_slot_count(&self) -> usize {
+        match self {
+            Self::Observed {
+                heartbeat:
+                    WatermarkReading::PartiallyMeasured {
+                        unmeasurable_slots, ..
+                    },
+                ..
+            } => *unmeasurable_slots,
+            _ => 0,
         }
     }
 
@@ -278,20 +350,27 @@ impl ReplicationStatus {
     ///
     /// `None` means *unknown*, and unknown is the honest answer in three
     /// distinct situations that all look like "no number": the views were
-    /// unreadable, no standby is connected at all, or no connected standby has
-    /// reported a `replay_lag` yet. Each is a reason to page, and none of them
-    /// is `0.0`.
+    /// unreadable, no standby is connected at all, or **any** connected
+    /// standby has not reported a `replay_lag` yet. Each is a reason to page,
+    /// and none of them is `0.0`.
+    ///
+    /// A worst-case reduction must treat one missing reading as unknown, not
+    /// absent: dropping an unmeasurable standby from the `max` and keeping the
+    /// rest would let a healthy peer mask it, reporting that peer's small lag
+    /// as the fleet's worst case.
     #[must_use]
     pub fn max_replay_lag_seconds(&self) -> Option<f64> {
         let Self::Observed { standbys, .. } = self else {
             return None;
         };
-        standbys
-            .iter()
-            .filter_map(|s| s.replay_lag_seconds)
-            .fold(None, |acc: Option<f64>, v| {
-                Some(acc.map_or(v, |a| a.max(v)))
-            })
+        if standbys.is_empty() {
+            return None;
+        }
+        let mut worst = f64::NEG_INFINITY;
+        for standby in standbys {
+            worst = worst.max(standby.replay_lag_seconds?);
+        }
+        Some(worst)
     }
 
     /// Worst-case WAL backlog in bytes across standbys **and** slots.
@@ -482,6 +561,64 @@ impl std::fmt::Display for PinConflict {
     }
 }
 
+/// A [`FenceRegistry::set_default_shard`] rejected because this process is
+/// already pinned to a different default shard.
+///
+/// Same shape as [`PinConflict`], one level up: the default shard resolves
+/// every [`ShardId::UNENCODED`] execution id, so two workers in one process
+/// disagreeing about it is the same "write once per process" hazard as a
+/// generation conflict ( finding 13).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DefaultShardConflict {
+    /// The default shard this process is already pinned to.
+    pub pinned: i32,
+    /// The default shard the rejected call tried to install.
+    pub attempted: i32,
+}
+
+impl std::fmt::Display for DefaultShardConflict {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "this process is already pinned to default shard {}; refusing to re-pin the \
+             default shard to {}. A process cannot resolve UNENCODED execution ids to two \
+             different shards. Restart the process.",
+            self.pinned, self.attempted
+        )
+    }
+}
+
+/// A [`FenceRegistry::publish`] rejected: either a shard's generation
+/// conflicted, or the default shard did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PublishConflict {
+    /// A shard's generation conflicted with one already pinned.
+    Generation(PinConflict),
+    /// The default shard conflicted with one already pinned.
+    DefaultShard(DefaultShardConflict),
+}
+
+impl std::fmt::Display for PublishConflict {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Generation(conflict) => write!(f, "{conflict}"),
+            Self::DefaultShard(conflict) => write!(f, "{conflict}"),
+        }
+    }
+}
+
+impl From<PinConflict> for PublishConflict {
+    fn from(conflict: PinConflict) -> Self {
+        Self::Generation(conflict)
+    }
+}
+
+impl From<DefaultShardConflict> for PublishConflict {
+    fn from(conflict: DefaultShardConflict) -> Self {
+        Self::DefaultShard(conflict)
+    }
+}
+
 /// Process-global record of the write-authority epoch this process pinned for
 /// each shard.
 ///
@@ -499,12 +636,36 @@ pub struct FenceRegistry;
 
 impl FenceRegistry {
     /// Pin `shard` at `generation` for the lifetime of this process.
-    pub fn register(shard: ShardId, generation: ShardGeneration) {
+    ///
+    /// Conflict-checked exactly like [`Self::publish`] ( finding 3):
+    /// re-pinning an already-pinned shard to a *different* generation is
+    /// refused rather than silently overwriting it. Without this check a
+    /// worker started after a fence could call this directly and hand write
+    /// authority back to a worker the fence already stopped — the same
+    /// split-brain [`Self::publish`]'s conflict check exists to prevent.
+    /// Re-registering the *same* generation is fine and idempotent.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PinConflict`] when `shard` is already pinned at a different
+    /// generation. Nothing is mutated.
+    pub fn register(shard: ShardId, generation: ShardGeneration) -> Result<(), PinConflict> {
         {
             let mut guard = PINNED
                 .write()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             let pinned = guard.get_or_insert_with(Pinned::default);
+            if let Some(existing) = pinned.generations.get(&shard.as_i32())
+                && *existing != generation
+            {
+                let conflict = PinConflict {
+                    shard_id: shard.as_i32(),
+                    pinned: existing.as_i64(),
+                    attempted: generation.as_i64(),
+                };
+                drop(guard);
+                return Err(conflict);
+            }
             pinned.generations.insert(shard.as_i32(), generation);
             drop(guard);
         }
@@ -512,6 +673,7 @@ impl FenceRegistry {
         // a reader that observes `is_enabled() == true` can never then find an
         // empty registry.
         ENABLED.store(true, Ordering::Release);
+        Ok(())
     }
 
     /// Publish a complete set of pins in **one** write.
@@ -547,21 +709,24 @@ impl FenceRegistry {
     ///
     /// # Errors
     ///
-    /// Returns the conflicting `(shard, already pinned, attempted)` when a shard
-    /// is already pinned at a different generation. The caller must refuse to
-    /// start; nothing is published.
+    /// Returns the conflicting generation or default shard when either is
+    /// already pinned to a different value ( finding 13 covers the
+    /// default shard — it is validated in the same pre-flight pass as the
+    /// generations, so a rejected publish mutates neither). The caller must
+    /// refuse to start; nothing is published.
     pub fn publish(
         pins: &[(ShardId, ShardGeneration)],
         default_shard: ShardId,
-    ) -> Result<(), PinConflict> {
+    ) -> Result<(), PublishConflict> {
         {
             let mut guard = PINNED
                 .write()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             let pinned = guard.get_or_insert_with(Pinned::default);
 
-            // Validate every pin BEFORE mutating any of them, so a rejected
-            // publish leaves the running workers' registry exactly as it was.
+            // Validate every pin AND the default shard BEFORE mutating
+            // anything, so a rejected publish leaves the running workers'
+            // registry exactly as it was.
             for (shard, generation) in pins {
                 if let Some(existing) = pinned.generations.get(&shard.as_i32())
                     && *existing != *generation
@@ -572,8 +737,18 @@ impl FenceRegistry {
                         attempted: generation.as_i64(),
                     };
                     drop(guard);
-                    return Err(conflict);
+                    return Err(conflict.into());
                 }
+            }
+            if let Some(existing) = pinned.default_shard
+                && existing != default_shard
+            {
+                let conflict = DefaultShardConflict {
+                    pinned: existing.as_i32(),
+                    attempted: default_shard.as_i32(),
+                };
+                drop(guard);
+                return Err(conflict.into());
             }
 
             for (shard, generation) in pins {
@@ -595,12 +770,37 @@ impl FenceRegistry {
     /// live in a real database and must still be fenced, so they resolve to
     /// the pool's default shard exactly as [`crate::shard::ShardedDbPool`]
     /// routes them.
-    pub fn set_default_shard(shard: ShardId) {
+    ///
+    /// Conflict-checked like [`Self::publish`] ( finding 13):
+    /// re-pinning an already-pinned default shard to a *different* shard is
+    /// refused. Without this check, two workers in one process disagreeing
+    /// about the default shard would let the later one silently redirect
+    /// every `UNENCODED` execution id the earlier one resolves — a spurious
+    /// fence, or a check against the wrong epoch. Re-setting the *same*
+    /// default shard is fine and idempotent.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DefaultShardConflict`] when the default shard is already
+    /// pinned to a different value. Nothing is mutated.
+    pub fn set_default_shard(shard: ShardId) -> Result<(), DefaultShardConflict> {
         let mut guard = PINNED
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        guard.get_or_insert_with(Pinned::default).default_shard = Some(shard);
+        let pinned = guard.get_or_insert_with(Pinned::default);
+        if let Some(existing) = pinned.default_shard
+            && existing != shard
+        {
+            let conflict = DefaultShardConflict {
+                pinned: existing.as_i32(),
+                attempted: shard.as_i32(),
+            };
+            drop(guard);
+            return Err(conflict);
+        }
+        pinned.default_shard = Some(shard);
         drop(guard);
+        Ok(())
     }
 
     /// The generation pinned for `shard`, or `None` when this shard is not
@@ -817,6 +1017,20 @@ mod db {
     /// the single worst thing this function could do — pinned by
     /// `a_fresh_database_provisions_generation_zero_and_is_idempotent`.
     ///
+    /// The fallback read is a **separate statement**, not a `UNION ALL`
+    /// trailing the `INSERT` ( finding 8). Under READ COMMITTED every
+    /// part of one statement shares the snapshot taken at that statement's
+    /// start. When two workers race to provision the same shard, the loser's
+    /// `ON CONFLICT DO NOTHING` blocks on the winner's transaction and, once
+    /// it commits, inserts nothing — but a fallback read in the SAME
+    /// statement still uses the pre-commit snapshot and sees no row either,
+    /// so the whole statement returns empty and this function spuriously
+    /// refuses to start. A worker started after this one commits is
+    /// unaffected by the pinned generation this fixes; a fleet-wide first
+    /// start, where every worker starts at once, is exactly when this race
+    /// bites hardest. A separate statement takes a fresh snapshot and is
+    /// guaranteed to see the winner's now-committed row.
+    ///
     /// # Errors
     ///
     /// Returns [`crate::error::HarvestError::Database`] on query failure.
@@ -824,24 +1038,32 @@ mod db {
         conn: &mut AsyncPgConnection,
         shard: ShardId,
     ) -> HarvestResult<ShardGeneration> {
-        let rows: Vec<GenerationRow> = diesel::sql_query(
-            "WITH ins AS ( \
-                 INSERT INTO harvest_shard_generation (shard_id, generation, fenced_reason) \
-                 VALUES ($1, 0, 'provisioned') \
-                 ON CONFLICT (shard_id) DO NOTHING \
-                 RETURNING generation \
-             ) \
-             SELECT generation FROM ins \
-             UNION ALL \
-             SELECT generation FROM harvest_shard_generation WHERE shard_id = $1 \
-             LIMIT 1",
+        let inserted: Vec<GenerationRow> = diesel::sql_query(
+            "INSERT INTO harvest_shard_generation (shard_id, generation, fenced_reason) \
+             VALUES ($1, 0, 'provisioned') \
+             ON CONFLICT (shard_id) DO NOTHING \
+             RETURNING generation",
+        )
+        .bind::<Integer, _>(shard.as_i32())
+        .load(conn)
+        .await
+        .map_err(database_error)?;
+        if let Some(row) = inserted.into_iter().next() {
+            return Ok(ShardGeneration(row.generation));
+        }
+
+        // This process's INSERT did not win the row: either it already
+        // existed, or a concurrent first start just provisioned it.
+        let existing: Vec<GenerationRow> = diesel::sql_query(
+            "SELECT generation FROM harvest_shard_generation WHERE shard_id = $1",
         )
         .bind::<Integer, _>(shard.as_i32())
         .load(conn)
         .await
         .map_err(database_error)?;
 
-        rows.into_iter()
+        existing
+            .into_iter()
             .next()
             .map(|r| ShardGeneration(r.generation))
             .ok_or_else(|| {
@@ -1033,6 +1255,12 @@ mod db {
     /// `replay_lag` is left `NULL` rather than coerced: Postgres reports NULL
     /// until a feedback round-trip has completed, and "we have not measured
     /// this standby yet" must not read as "this standby is caught up".
+    ///
+    /// `starts_with($1)`, not `LIKE $1 || '%'` ( finding 7): `LIKE`
+    /// treats `_` and `%` as wildcards, and the shipped default prefix
+    /// `harvest_dr` contains an underscore, so on the default configuration
+    /// `LIKE` also matched an unrelated slot or `application_name` such as
+    /// `harvestXdr_shard0`. `starts_with` is a literal prefix comparison.
     const STANDBY_SQL: &str = "SELECT \
             r.state::text AS state, \
             EXTRACT(EPOCH FROM r.replay_lag)::double precision AS replay_lag_seconds, \
@@ -1043,15 +1271,17 @@ mod db {
          WHERE ( \
                  s.slot_name IS NOT NULL \
                  AND (s.database IS NULL OR s.database = current_database()) \
-                 AND s.slot_name LIKE $1 || '%' \
+                 AND starts_with(s.slot_name, $1) \
                ) \
-            OR (s.slot_name IS NULL AND r.application_name LIKE $1 || '%')";
+            OR (s.slot_name IS NULL AND starts_with(r.application_name, $1))";
 
     /// `pg_replication_slots`, which outlives the walsender.
     ///
     /// Physical slots track `restart_lsn`; logical slots track
     /// `confirmed_flush_lsn`. `COALESCE` picks whichever the slot has, so one
     /// query covers both replication styles the topology doc offers.
+    ///
+    /// `starts_with($1)`, not `LIKE $1 || '%'` — see [`STANDBY_SQL`] ( finding 7).
     const SLOT_SQL: &str = "SELECT \
             s.slot_name::text AS slot_name, \
             s.active, \
@@ -1060,7 +1290,7 @@ mod db {
                        - COALESCE(s.confirmed_flush_lsn, s.restart_lsn))::bigint END AS lag_bytes \
          FROM pg_replication_slots s \
          WHERE (s.database IS NULL OR s.database = current_database()) \
-           AND s.slot_name LIKE $1 || '%'";
+           AND starts_with(s.slot_name, $1)";
 
     /// Write one replication watermark for `shard` and prune the trail.
     ///
@@ -1149,9 +1379,25 @@ mod db {
                 //
                 // Half an interval of slack, so ordinary scheduling jitter does
                 // not skip a window outright and halve the effective cadence.
+                // `fence_generation` stamps the write-authority epoch in
+                // force when this beat was written ( finding 10).
+                // `docs/cross-region-dr.md`'s setup SQL replicates this table
+                // with `FOR ALL TABLES`, so after a promotion the standby can
+                // carry pre-promotion beats whose LSNs belong to the OLD
+                // cluster's WAL stream. Those numbers are not comparable to
+                // the new primary's, and `measure_rpo` filters on this column
+                // so a beat from a superseded generation is never read back
+                // as if it were in the current WAL stream. Defaults to `0`
+                // (no fencing row yet) via `COALESCE`, matching the pre-#954
+                // behaviour on a shard where fencing was never enabled.
                 diesel::sql_query(
-                    "INSERT INTO harvest_replication_heartbeat (shard_id, beat_lsn, beat_at) \
-                     SELECT $1, pg_current_wal_lsn(), NOW() \
+                    "INSERT INTO harvest_replication_heartbeat \
+                         (shard_id, beat_lsn, beat_at, fence_generation) \
+                     SELECT $1, pg_current_wal_lsn(), NOW(), \
+                            COALESCE( \
+                                (SELECT generation FROM harvest_shard_generation \
+                                 WHERE shard_id = $1), \
+                                0) \
                      WHERE NOT EXISTS ( \
                          SELECT 1 FROM harvest_replication_heartbeat h \
                          WHERE h.shard_id = $1 \
@@ -1214,6 +1460,10 @@ mod db {
     struct StandbyPositionRow {
         #[diesel(sql_type = Nullable<Text>)]
         position: Option<String>,
+        #[diesel(sql_type = BigInt)]
+        unmeasurable_slots: i64,
+        #[diesel(sql_type = BigInt)]
+        total_slots: i64,
     }
 
     #[derive(diesel::QueryableByName)]
@@ -1228,32 +1478,35 @@ mod db {
     ///
     /// Two steps, deliberately not one query.
     ///
-    /// **Step 1 — the standby's position.** `MIN(COALESCE(confirmed_flush_lsn,
-    /// restart_lsn))` over every replication slot scoped to this shard's
-    /// database — the worst standby sets the RPO, and `COALESCE` covers logical
-    /// (`confirmed_flush_lsn`) and physical (`restart_lsn`) slots with one
-    /// query. **A slot with no position at all makes the whole reading
-    /// unknown**, because SQL's `MIN` skips NULLs: without the explicit
-    /// `bool_or(... IS NULL)` guard, a slot that has consumed *nothing* is
-    /// dropped from the reduction and the healthy standby's small lag is
-    /// reported as the fleet's RPO. That is precisely the "report a perfect RPO
-    /// for replication that is dead" outcome this module exists to avoid.
+    /// **Step 1 — the standbys' positions.** `MIN(COALESCE(confirmed_flush_lsn,
+    /// replay_lsn, restart_lsn))` over every replication slot scoped to this
+    /// shard's database — the worst standby sets the RPO, and `COALESCE`
+    /// covers logical (`confirmed_flush_lsn`) and physical (`restart_lsn`)
+    /// slots with one query. The `MIN` is taken only over slots that DO have a
+    /// position; slots that do not are counted separately as
+    /// `unmeasurable_slots` rather than dropped silently. Folding "one slot
+    /// unmeasurable" into "nothing consumed anywhere" would let an abandoned
+    /// slot hide behind a healthy peer's small lag — precisely the "report a
+    /// perfect RPO for replication that is dead" outcome this module exists to
+    /// avoid ( finding 1). An abandoned slot is retaining WAL and is
+    /// exactly what an operator must be told about; see
+    /// [`ReplicationStatus::inactive_slots`] and
+    /// [`ReplicationStatus::unmeasurable_slot_count`].
     ///
-    /// An abandoned slot therefore pegs the reading, which is correct and not
-    /// a bug to paper over: an abandoned slot is retaining WAL and is exactly
-    /// what an operator must be told about. [`ReplicationStatus::inactive_slots`]
-    /// names it.
+    /// **Step 2 — the watermark.** Only issued when step 1 produced a
+    /// position for at least one slot. Doing it in a separate statement meant
+    /// that with no slot the predicate was never true and the index scan
+    /// walked the *entire* retained trail to return nothing (measured: 200k
+    /// rows, 2646 buffers, 22 ms) — on every sampler tick of every worker of a
+    /// deployment that has not finished wiring up replication.
     ///
-    /// **Step 2 — the watermark.** Only issued when step 1 produced a position.
-    /// Doing it in one statement meant that with no slot the predicate was
-    /// never true and the index scan walked the *entire* retained trail to
-    /// return nothing (measured: 200k rows, 2646 buffers, 22 ms) — on every
-    /// sampler tick of every worker of a deployment that has not finished
-    /// wiring up replication.
-    ///
-    /// `None` — unknown — when there is no slot, when a slot has no position,
-    /// when no watermark has been confirmed, or when the standby is further
-    /// behind than the retained trail.
+    /// Returns [`WatermarkReading::Unknown`] when there is no slot at all, or
+    /// when every slot lacks a position (nothing has consumed anything yet —
+    /// `replay_lag` is still a fair fallback there).
+    /// [`WatermarkReading::PartiallyMeasured`] when some slots have a position
+    /// and others do not — never fallback-eligible. Otherwise
+    /// [`WatermarkReading::Measured`] or [`WatermarkReading::BeyondTrail`] from
+    /// the confirmed slots' watermark.
     ///
     /// # Errors
     ///
@@ -1279,30 +1532,68 @@ mod db {
         // topology this feature claims to support. It remains the right input
         // for the byte backlog (`SLOT_SQL`), which is a retention and
         // disk-pressure signal — that is exactly what `restart_lsn` measures.
+        //
+        // `starts_with($1)`, not `LIKE $1 || '%'`: `LIKE` treats `_` and `%` as
+        // wildcards, and the shipped default prefix `harvest_dr` contains an
+        // underscore, so `LIKE` matched an unrelated slot such as
+        // `harvestXdr_shard0` on the default configuration ( finding
+        // 7). `starts_with` is a literal prefix comparison.
         let positions: Vec<StandbyPositionRow> = diesel::sql_query(
-            "SELECT CASE \
-                        WHEN COUNT(*) = 0 THEN NULL \
-                        WHEN bool_or( \
-                            COALESCE(s.confirmed_flush_lsn, r.replay_lsn, s.restart_lsn) IS NULL \
-                        ) THEN NULL \
-                        ELSE MIN( \
-                            COALESCE(s.confirmed_flush_lsn, r.replay_lsn, s.restart_lsn) \
-                        )::text \
-                    END AS position \
-             FROM pg_replication_slots s \
-             LEFT JOIN pg_stat_replication r ON r.pid = s.active_pid \
-             WHERE (s.database IS NULL OR s.database = current_database()) \
-               AND s.slot_name LIKE $1 || '%'",
+            "SELECT (MIN(pos) FILTER (WHERE pos IS NOT NULL))::text AS position, \
+                    COUNT(*) FILTER (WHERE pos IS NULL) AS unmeasurable_slots, \
+                    COUNT(*) AS total_slots \
+             FROM ( \
+                 SELECT COALESCE(s.confirmed_flush_lsn, r.replay_lsn, s.restart_lsn) AS pos \
+                 FROM pg_replication_slots s \
+                 LEFT JOIN pg_stat_replication r ON r.pid = s.active_pid \
+                 WHERE (s.database IS NULL OR s.database = current_database()) \
+                   AND starts_with(s.slot_name, $1) \
+             ) matched",
         )
         .bind::<Text, _>(slot_prefix)
         .load(conn)
         .await
         .map_err(database_error)?;
 
-        let Some(position) = positions.into_iter().next().and_then(|r| r.position) else {
+        let Some(row) = positions.into_iter().next() else {
+            return Ok(WatermarkReading::Unknown);
+        };
+        if row.total_slots == 0 {
+            // No DR slot for this shard at all.
+            return Ok(WatermarkReading::Unknown);
+        }
+        let unmeasurable_slots = usize::try_from(row.unmeasurable_slots).unwrap_or(usize::MAX);
+        let Some(position) = row.position else {
+            // Every matching slot lacks a position: nothing has consumed
+            // anything yet, which is not the same as an abandoned slot beside
+            // a healthy one. `replay_lag` is still a fair fallback here.
             return Ok(WatermarkReading::Unknown);
         };
 
+        let heartbeat = heartbeat_reading(conn, shard, position).await?;
+        if unmeasurable_slots == 0 {
+            return Ok(heartbeat);
+        }
+        // At least one matching slot has no position: flag as partial and
+        // never let this fall back to `replay_lag` ( finding 1).
+        Ok(WatermarkReading::PartiallyMeasured {
+            measured_seconds: heartbeat.measured_or_floor_seconds(),
+            unmeasurable_slots,
+        })
+    }
+
+    /// Step 2 of [`measure_rpo`]: translate a confirmed standby position into
+    /// a watermark reading.
+    ///
+    /// Split out so [`measure_rpo`] can share it between the ordinary path
+    /// (every slot measurable) and the partial path ( finding 1),
+    /// where the caller decides whether the result may stand on its own or
+    /// must be wrapped as [`WatermarkReading::PartiallyMeasured`].
+    async fn heartbeat_reading(
+        conn: &mut AsyncPgConnection,
+        shard: ShardId,
+        position: String,
+    ) -> HarvestResult<WatermarkReading> {
         // One query, two answers, so the two cannot disagree across a round
         // trip: the age of the newest CONSUMED watermark (the reading), and the
         // age of the OLDEST retained one (the floor, used only when nothing has
@@ -1311,17 +1602,34 @@ mod db {
         //
         // Both are single index probes on `(shard_id, beat_lsn)` /
         // `(shard_id, beat_at DESC)`; neither aggregates the trail.
+        //
+        // Both branches of `current_gen` are also filtered to the shard's
+        // CURRENT fence generation ( finding 10): the setup SQL in
+        // `docs/cross-region-dr.md` replicates this table with `FOR ALL
+        // TABLES`, so a standby can carry beats from a superseded generation
+        // whose LSNs belong to a different WAL stream — comparable neither to
+        // each other nor to the new primary's positions. Restricting to the
+        // current generation keeps every comparison inside one WAL stream.
+        // The sampler that writes beats only runs once fencing is enabled,
+        // by which point the fencing row already exists (`ensure_generation_
+        // row` runs first), so a shard with no fencing row has no beats to
+        // read either way.
         let rows: Vec<RpoRow> = diesel::sql_query(
-            "SELECT ( \
+            "WITH current_gen AS ( \
+                 SELECT generation FROM harvest_shard_generation WHERE shard_id = $1 \
+             ) \
+             SELECT ( \
                  SELECT EXTRACT(EPOCH FROM (NOW() - h.beat_at))::double precision \
-                 FROM harvest_replication_heartbeat h \
+                 FROM harvest_replication_heartbeat h, current_gen \
                  WHERE h.shard_id = $1 AND h.beat_lsn <= $2::pg_lsn \
+                   AND h.fence_generation = current_gen.generation \
                  ORDER BY h.beat_lsn DESC LIMIT 1 \
              ) AS lag_seconds, \
              ( \
                  SELECT EXTRACT(EPOCH FROM (NOW() - h.beat_at))::double precision \
-                 FROM harvest_replication_heartbeat h \
+                 FROM harvest_replication_heartbeat h, current_gen \
                  WHERE h.shard_id = $1 \
+                   AND h.fence_generation = current_gen.generation \
                  ORDER BY h.beat_at ASC LIMIT 1 \
              ) AS oldest_seconds",
         )
@@ -1364,6 +1672,17 @@ mod db {
         sequence_schema: String,
         #[diesel(sql_type = Text)]
         sequence_name: String,
+        /// `pg_sequences.increment_by`. Negative for a descending sequence
+        /// ( finding 11) — see [`advance_sequences_in_transaction`].
+        #[diesel(sql_type = BigInt)]
+        increment_by: i64,
+        /// `pg_sequences.min_value`: the ascending floor, used in place of a
+        /// hardcoded `1` ( finding 11).
+        #[diesel(sql_type = BigInt)]
+        min_value: i64,
+        /// `pg_sequences.max_value`: the descending ceiling.
+        #[diesel(sql_type = BigInt)]
+        max_value: i64,
     }
 
     #[derive(diesel::QueryableByName)]
@@ -1386,10 +1705,10 @@ mod db {
     ///
     /// Physical (streaming) replicas do not need this — they replicate the WAL
     /// itself, sequences included — and running it there is harmless *because*
-    /// the target is `GREATEST(MAX(col), last_value, 1)` rather than
-    /// `MAX(col)`: a sequence already ahead of its table's maximum is left
+    /// the target folds in `last_value` rather than using the table's extreme
+    /// value alone: a sequence already ahead of its table's data is left
     /// where it is, never rewound. See the statement below for why "ahead of
-    /// MAX" is an ordinary, expected state rather than corruption.
+    /// the table" is an ordinary, expected state rather than corruption.
     ///
     /// # Scope
     ///
@@ -1464,23 +1783,34 @@ mod db {
         .await
         .map_err(database_error)?;
 
+        // `tn.nspname` (the OWNING TABLE's schema), not `sn.nspname` (the
+        // sequence's own schema) —  finding 5. A table in
+        // `current_schema()` can own a sequence created in another schema
+        // (legal, and something a migration that qualifies `CREATE SEQUENCE`
+        // produces); filtering on the sequence's own schema silently skipped
+        // it, leaving it un-advanced after promotion.
         let columns: Vec<SerialColumn> = diesel::sql_query(
             "SELECT tn.nspname::text AS table_schema, \
                     c.relname::text  AS table_name, \
                     a.attname::text  AS column_name, \
                     sn.nspname::text AS sequence_schema, \
-                    s.relname::text  AS sequence_name \
+                    s.relname::text  AS sequence_name, \
+                    sq.increment_by  AS increment_by, \
+                    sq.min_value     AS min_value, \
+                    sq.max_value     AS max_value \
              FROM pg_class s \
              JOIN pg_depend d ON d.objid = s.oid AND d.classid = 'pg_class'::regclass \
              JOIN pg_class c ON c.oid = d.refobjid \
              JOIN pg_attribute a ON a.attrelid = c.oid AND a.attnum = d.refobjsubid \
              JOIN pg_namespace sn ON sn.oid = s.relnamespace \
              JOIN pg_namespace tn ON tn.oid = c.relnamespace \
+             JOIN pg_sequences sq \
+                  ON sq.schemaname = sn.nspname AND sq.sequencename = s.relname \
              WHERE s.relkind = 'S' \
                AND d.refclassid = 'pg_class'::regclass \
                AND d.deptype IN ('a', 'i') \
                AND c.relkind IN ('r', 'p') \
-               AND sn.nspname = current_schema()",
+               AND tn.nspname = current_schema()",
         )
         .load(conn)
         .await
@@ -1488,38 +1818,57 @@ mod db {
 
         let mut advanced = Vec::with_capacity(columns.len());
         for col in columns {
-            // `is_called = true` so the NEXT value handed out is `max + 1`.
-            // `GREATEST(..., 1)` keeps `setval` legal on an empty table, where
-            // `MAX` is NULL and `0` is below the sequence minimum.
-            //
             // `setval`'s first argument is `regclass`, i.e. a *name* rather
             // than a relation reference, so the schema-qualified identifier is
             // passed as a single-quoted literal with any `'` doubled.
             let seq = qualified(&col.sequence_schema, &col.sequence_name);
-            // `pg_sequence_last_value` is inside the GREATEST for a reason: a
-            // sequence can legitimately sit AHEAD of `MAX(col)` — cached
-            // values, a rolled-back transaction, deleted rows — and a physical
-            // replica replicates sequences already, so on that topology this
-            // command is meant to be a no-op. Without it `setval` would
-            // *rewind* the sequence and start re-issuing ids the database has
+            let seq_literal = seq.replace('\'', "''");
+            let tbl = qualified(&col.table_schema, &col.table_name);
+            let ident_col = quote_ident(&col.column_name);
+
+            // `is_called = true` so the NEXT value handed out is one step past
+            // whichever bound wins.
+            //
+            // `pg_sequence_last_value` is in the reduction for a reason: a
+            // sequence can legitimately sit AHEAD of the table's extreme
+            // value — cached values, a rolled-back transaction, deleted rows —
+            // and a physical replica replicates sequences already, so on that
+            // topology this command is meant to be a no-op. Skipping it would
+            // let `setval` *rewind* the sequence and re-issue ids the database
             // already handed out: a duplicate-key outage caused by the very
             // command that exists to prevent one. Measured on live Postgres:
             // insert two rows, delete the second, and MAX is 1 while
             // last_value is 2.
             //
-            // NULL until the sequence has been called at least once, hence the
-            // COALESCE.
-            let sql = format!(
-                "SELECT setval('{seq_literal}', \
-                        GREATEST( \
-                            (SELECT COALESCE(MAX({col}), 0) FROM {tbl}), \
-                            COALESCE(pg_sequence_last_value('{seq_literal}'), 0), \
-                            1), \
-                        true)::bigint AS value",
-                seq_literal = seq.replace('\'', "''"),
-                col = quote_ident(&col.column_name),
-                tbl = qualified(&col.table_schema, &col.table_name),
-            );
+            // Branches on `increment_by` ( finding 11): an ASCENDING
+            // sequence's "furthest issued" value is its MAXIMUM, so the
+            // reduction is `GREATEST` bounded below by `min_value` (never a
+            // hardcoded `1`, which can sit outside a custom-bounded
+            // sequence's own range). A DESCENDING sequence issues in
+            // decreasing order, so "furthest issued" is its MINIMUM, and the
+            // reduction is `LEAST` bounded above by `max_value`. Using
+            // `GREATEST` unconditionally reset a descending sequence that had
+            // issued 100 then 99 back to 100, re-issuing 99 next — a
+            // collision from the helper whose purpose is preventing one.
+            let sql = if col.increment_by > 0 {
+                format!(
+                    "SELECT setval('{seq_literal}', \
+                            GREATEST( \
+                                COALESCE((SELECT MAX({ident_col}) FROM {tbl}), {min_value}), \
+                                COALESCE(pg_sequence_last_value('{seq_literal}'), {min_value})), \
+                            true)::bigint AS value",
+                    min_value = col.min_value,
+                )
+            } else {
+                format!(
+                    "SELECT setval('{seq_literal}', \
+                            LEAST( \
+                                COALESCE((SELECT MIN({ident_col}) FROM {tbl}), {max_value}), \
+                                COALESCE(pg_sequence_last_value('{seq_literal}'), {max_value})), \
+                            true)::bigint AS value",
+                    max_value = col.max_value,
+                )
+            };
             let rows: Vec<SetvalRow> = diesel::sql_query(sql)
                 .load(conn)
                 .await
@@ -1575,10 +1924,14 @@ mod db {
         };
 
         // A watermark-read failure degrades the same way a view-read failure
-        // does: lose the number, never the sampler.
+        // does: lose the number, never the sampler. `Failed`, not `Unknown`
+        // ( finding 12) — `Unknown` is fallback-eligible, and a
+        // failed read is precisely the moment `replay_lag` is least
+        // trustworthy: it is frozen or NULL whenever a logical apply worker
+        // is stuck, which is the incident this trail exists to measure.
         let heartbeat = measure_rpo(conn, shard, slot_prefix)
             .await
-            .unwrap_or(WatermarkReading::Unknown);
+            .unwrap_or(WatermarkReading::Failed);
 
         Ok(ReplicationStatus::Observed {
             heartbeat,
@@ -1749,6 +2102,87 @@ mod tests {
         assert_eq!(s.connected_standbys(), 2);
     }
 
+    /// A worst-case reduction must not let a healthy standby mask an
+    /// unmeasurable one ( finding 9 — the same defect as finding 1,
+    /// one layer down).
+    #[test]
+    fn an_unmeasurable_standby_is_not_masked_by_a_healthy_peer() {
+        let s = observed(
+            vec![
+                standby("catchup", None, Some(1_000)),
+                standby("streaming", Some(2.0), Some(10)),
+            ],
+            vec![],
+        );
+        assert_eq!(
+            s.max_replay_lag_seconds(),
+            None,
+            "one standby with no replay_lag must make the whole reduction unknown, \
+             not fall back to the healthy peer's small lag"
+        );
+    }
+
+    /// A partial watermark reading must never fall back to `replay_lag`: that
+    /// column is a trap here precisely, since it can look small and healthy
+    /// while the abandoned slot is invisible in it ( finding 1).
+    #[test]
+    fn a_partially_measured_reading_never_falls_back_to_replay_lag() {
+        let s = ReplicationStatus::Observed {
+            standbys: vec![standby("streaming", Some(0.3), Some(10))],
+            slots: vec![],
+            heartbeat: WatermarkReading::PartiallyMeasured {
+                measured_seconds: Some(4.0),
+                unmeasurable_slots: 1,
+            },
+        };
+        assert_eq!(s.rpo_seconds(), Some(4.0));
+        assert_eq!(s.unmeasurable_slot_count(), 1);
+    }
+
+    /// The measured side of a partial reading can itself be unconfirmed yet;
+    /// that must report unknown, not the frozen `replay_lag`.
+    #[test]
+    fn a_partially_measured_reading_with_no_confirmed_watermark_is_unknown() {
+        let s = ReplicationStatus::Observed {
+            standbys: vec![standby("streaming", Some(0.3), Some(10))],
+            slots: vec![],
+            heartbeat: WatermarkReading::PartiallyMeasured {
+                measured_seconds: None,
+                unmeasurable_slots: 1,
+            },
+        };
+        assert_eq!(s.rpo_seconds(), None);
+    }
+
+    /// A failed watermark read must not become a fallback-eligible `Unknown`
+    /// ( finding 12): the read failing is precisely when `replay_lag`
+    /// is least trustworthy.
+    #[test]
+    fn a_failed_watermark_read_never_falls_back_to_replay_lag() {
+        let s = ReplicationStatus::Observed {
+            standbys: vec![standby("streaming", Some(0.4), Some(9_000_000))],
+            slots: vec![],
+            heartbeat: WatermarkReading::Failed,
+        };
+        assert_eq!(
+            s.rpo_seconds(),
+            None,
+            "a failed watermark read must report unknown, never a frozen replay_lag"
+        );
+    }
+
+    #[test]
+    fn unmeasurable_slot_count_is_zero_outside_partial_readings() {
+        assert_eq!(observed(vec![], vec![]).unmeasurable_slot_count(), 0);
+        assert_eq!(
+            ReplicationStatus::Unavailable {
+                reason: "no grant".into()
+            }
+            .unmeasurable_slot_count(),
+            0
+        );
+    }
+
     #[test]
     fn a_connected_standby_with_null_replay_lag_is_not_silently_zero() {
         // pg_stat_replication.replay_lag is NULL until the first feedback
@@ -1810,6 +2244,9 @@ mod tests {
             ShardId::new(0),
         )
         .expect_err("re-pinning to a newer generation must be refused");
+        let PublishConflict::Generation(conflict) = conflict else {
+            panic!("expected a generation conflict, got {conflict:?}");
+        };
         assert_eq!(conflict.shard_id, 0);
         assert_eq!(conflict.pinned, 4);
         assert_eq!(conflict.attempted, 5);
@@ -1852,6 +2289,81 @@ mod tests {
             FenceRegistry::expected(ShardId::new(0)),
             Some(ShardGeneration::new(4))
         );
+        FenceRegistry::clear();
+    }
+
+    /// `register` must refuse a conflicting re-pin exactly like `publish`
+    /// ( finding 3): it is the one other public entry point into the
+    /// same process-global state, and an unconditional `insert` there was a
+    /// hole straight through the "write once per process" invariant.
+    #[test]
+    fn register_refuses_a_conflicting_re_pin() {
+        let _serial = registry_guard();
+        FenceRegistry::clear();
+        FenceRegistry::register(ShardId::new(0), ShardGeneration::new(4)).expect("first pin");
+        // Idempotent re-registration is ordinary.
+        FenceRegistry::register(ShardId::new(0), ShardGeneration::new(4))
+            .expect("re-registering the same generation is ordinary");
+
+        let conflict = FenceRegistry::register(ShardId::new(0), ShardGeneration::new(5))
+            .expect_err("re-pinning to a different generation must be refused");
+        assert_eq!(conflict.pinned, 4);
+        assert_eq!(conflict.attempted, 5);
+        assert_eq!(
+            FenceRegistry::expected(ShardId::new(0)),
+            Some(ShardGeneration::new(4)),
+            "a refused register must not mutate the pin"
+        );
+        FenceRegistry::clear();
+    }
+
+    /// `publish`'s default shard must be conflict-checked exactly like its
+    /// generations ( finding 13): the default shard resolves every
+    /// `UNENCODED` execution id, so two workers disagreeing about it is the
+    /// same process-wide hazard as a generation conflict.
+    #[test]
+    fn publish_refuses_a_conflicting_default_shard() {
+        let _serial = registry_guard();
+        FenceRegistry::clear();
+        FenceRegistry::publish(
+            &[(ShardId::new(0), ShardGeneration::new(1))],
+            ShardId::new(0),
+        )
+        .expect("first publish");
+
+        // A new, non-conflicting generation but a DIFFERENT default shard.
+        let conflict = FenceRegistry::publish(
+            &[(ShardId::new(1), ShardGeneration::new(1))],
+            ShardId::new(1),
+        )
+        .expect_err("a conflicting default shard must be refused");
+        let PublishConflict::DefaultShard(conflict) = conflict else {
+            panic!("expected a default-shard conflict, got {conflict:?}");
+        };
+        assert_eq!(conflict.pinned, 0);
+        assert_eq!(conflict.attempted, 1);
+        assert_eq!(
+            FenceRegistry::expected(ShardId::new(1)),
+            None,
+            "a refused publish must not install the non-conflicting generation either"
+        );
+        FenceRegistry::clear();
+    }
+
+    /// `set_default_shard` must refuse a conflicting re-pin ( finding
+    /// 13): unconditional like `register` was, and the same fix applies.
+    #[test]
+    fn set_default_shard_refuses_a_conflicting_re_pin() {
+        let _serial = registry_guard();
+        FenceRegistry::clear();
+        FenceRegistry::set_default_shard(ShardId::new(0)).expect("first default shard");
+        FenceRegistry::set_default_shard(ShardId::new(0))
+            .expect("re-setting the same default shard is ordinary");
+
+        let conflict = FenceRegistry::set_default_shard(ShardId::new(1))
+            .expect_err("re-pinning the default shard must be refused");
+        assert_eq!(conflict.pinned, 0);
+        assert_eq!(conflict.attempted, 1);
         FenceRegistry::clear();
     }
 
@@ -1928,7 +2440,7 @@ mod tests {
         assert!(!FenceRegistry::is_enabled(), "fencing is opt-in");
         assert_eq!(FenceRegistry::expected(ShardId::new(3)), None);
 
-        FenceRegistry::register(ShardId::new(3), ShardGeneration(7));
+        FenceRegistry::register(ShardId::new(3), ShardGeneration(7)).expect("first registration");
         assert!(FenceRegistry::is_enabled());
         assert_eq!(
             FenceRegistry::expected(ShardId::new(3)),
@@ -1944,8 +2456,8 @@ mod tests {
     fn unencoded_execution_shard_resolves_to_the_default_shard() {
         let _serial = registry_guard();
         FenceRegistry::clear();
-        FenceRegistry::register(ShardId::new(0), ShardGeneration(2));
-        FenceRegistry::set_default_shard(ShardId::new(0));
+        FenceRegistry::register(ShardId::new(0), ShardGeneration(2)).expect("first registration");
+        FenceRegistry::set_default_shard(ShardId::new(0)).expect("first default shard");
         assert_eq!(
             FenceRegistry::expected(ShardId::UNENCODED),
             Some(ShardGeneration(2)),

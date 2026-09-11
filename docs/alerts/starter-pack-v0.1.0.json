@@ -1315,6 +1315,38 @@
       "runbook": "docs/runbooks/harvest-alerts.md#harvest_replication_unobservable"
     },
     {
+      "id": "harvest_replication_rpo_unknown",
+      "status": "enforceable",
+      "signal_source": "harvest.replication.rpo_known{shard}, emitted every DR sampler tick the views are readable (issue #954).",
+      "default_threshold": "Ticket when harvest_replication_rpo_known is 0 for a shard for 10 minutes, gated on observable == 1 and at least one connected standby.",
+      "severity": "ticket",
+      "owner_persona": "platform team",
+      "description": "A shard's replication views are readable and a standby is connected, but its RPO has no source: no DR slot confirmed a position yet, and the standby has not reported a replay_lag either. This is the readable-but-unmeasurable gap harvest_replication_unobservable does not cover, and harvest.replication.lag_seconds is withheld rather than published as a stale or fabricated number. A Prometheus gauge keeps exporting its last value, so without this signal the dashboard would go on showing the last healthy RPO indefinitely.",
+      "first_action": "harvest dr status --shard <id>=<dsn> -o json",
+      "dependencies": [
+        {
+          "ref": "#1249",
+          "status": "shipped",
+          "surface": "harvest.replication.rpo_known and harvest dr status"
+        }
+      ],
+      "prometheus": {
+        "mode": "native",
+        "notes": "Gated on observable == 1 (readable) and standbys > 0 (not the harvest_replication_down case) so the three replication-health rules stay mutually exclusive.",
+        "expressions": [
+          {
+            "name": "harvest_replication_rpo_unknown",
+            "expr": "min by (shard) (harvest_replication_rpo_known) == 0 and on (shard) max by (shard) (harvest_replication_observable) == 1 and on (shard) min by (shard) (harvest_replication_standbys) > 0",
+            "for": "10m"
+          }
+        ]
+      },
+      "management_checks": [
+        "harvest dr status --shard <id>=<dsn> -o json"
+      ],
+      "runbook": "docs/runbooks/harvest-alerts.md#harvest_replication_rpo_unknown"
+    },
+    {
       "id": "harvest_audit_export_lag_high",
       "status": "enforceable",
       "signal_source": "harvest.audit.export_lag{shard} - age in seconds of the OLDEST audit record the SIEM sink has not acknowledged (issue #953).",

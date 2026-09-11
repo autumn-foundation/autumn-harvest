@@ -236,22 +236,28 @@ pub struct WorkerRuntimeConfig {
     /// Per-shard, per-tick batch size for the lazy payload-codec re-encryption
     /// sweep (issue #948). `0` disables it.
     pub codec_rotation_batch_size: i64,
-    /// Whether this worker enforces cross-region DR write-authority fencing
-    /// (issue #954). See [`crate::builder::WorkerConfig::dr_fencing`].
+    /// This worker's cross-region DR configuration (issue #954). See
+    /// [`crate::builder::WorkerConfig::dr_fencing`] and its sibling knobs.
     ///
-    /// **On the struct, not on the process-global beside the other two DR
-    /// knobs, and that asymmetry is deliberate.** A runtime config can be built
+    /// **On the struct, not only on the process-global [`DrConfig`] beside
+    /// it, and that asymmetry is deliberate.** A runtime config can be built
     /// and *stored* long before `Worker::new` consumes it — the plugin's
     /// `PreparedHarvestRuntime` does exactly that — so any unrelated
     /// `WorkerConfig::default()` conversion in between would overwrite a
-    /// last-writer-wins global and this worker would snapshot `false`: silently
-    /// unfenced, while `effective_config` still reported DR enabled. That is
-    /// the worst failure this feature has, so the flag travels with the
-    /// conversion that produced it.
+    /// last-writer-wins global and this worker would snapshot the wrong
+    /// values: silently unfenced while `effective_config` still reported DR
+    /// enabled, or sampling the wrong slot prefix while
+    /// `effective_config` still advertised the configured one. So the whole
+    /// [`DrConfig`], not only `fencing`, travels with the conversion that
+    /// produced it (finding 6 — an earlier revision carried only `fencing`
+    /// on the struct on the theory that racing the other three fields "only
+    /// changes sampler timing". Finding 6 disproved that once `slot_prefix`
+    /// joined them: the prefix decides which walsenders count as this
+    /// deployment's DR replication at all, so racing it can silently change
+    /// *what* is sampled, not merely *when*).
     ///
-    /// The cadence and retention knobs stay on the global: racing them changes
-    /// only sampler timing, never whether the fence is enforced.
-    pub dr_fencing: bool,
+    /// [`DrConfig`]: crate::replication::DrConfig
+    pub dr: crate::replication::DrConfig,
 }
 
 impl WorkerRuntimeConfig {
@@ -389,16 +395,21 @@ impl From<WorkerConfig> for WorkerRuntimeConfig {
         // `start_idempotency::set_purge_window_secs` threads a duration knob
         // without a new field on every call site.
         crate::mutex::set_mutex_lease_ttl(cfg.mutex_lease_ttl);
-        // Same pattern, same reason (issue #954): publish the DR knobs to the
-        // process-global they govern rather than adding three required fields
-        // to a struct built literally at ~50 call sites. See
-        // `crate::replication::DrConfig`.
-        crate::replication::set_dr_config(crate::replication::DrConfig {
+        // Also published to the process-global `DrConfig` the persist-assert
+        // and admin-introspection paths read (issue #954). `Self.dr` below
+        // carries the SAME value directly, rather than a later
+        // `Worker::new` reading it back off this global ( finding
+        // 6): a `WorkerRuntimeConfig` can be built and stored long before
+        // `Worker::new` consumes it, and an unrelated conversion in between
+        // would otherwise overwrite the last-writer-wins global underneath
+        // it.
+        let dr = crate::replication::DrConfig {
             fencing: cfg.dr_fencing,
             sample_interval: cfg.replication_sample_interval,
             watermark_retain: cfg.replication_watermark_retain,
             slot_prefix: cfg.replication_slot_prefix.clone(),
-        });
+        };
+        crate::replication::set_dr_config(dr.clone());
         if let Some(first_queue) = cfg.queues.as_slice().first()
             && let Ok(mut lock) = crate::completion_trigger::GLOBAL_DEFAULT_WORKFLOW_QUEUE.write()
             && lock.is_none()
@@ -440,7 +451,7 @@ impl From<WorkerConfig> for WorkerRuntimeConfig {
             deployment_name: cfg.deployment_name,
             workflow_cache_size: cfg.workflow_cache_size,
             priority_aging_secs: cfg.priority_aging_secs,
-            dr_fencing: cfg.dr_fencing,
+            dr,
             unknown_target_grace_window: cfg.unknown_target_grace_window,
             poison_pill_threshold: cfg.poison_pill_threshold,
             capability_miss_max_redeliveries: cfg.capability_miss_max_redeliveries,
@@ -23291,11 +23302,23 @@ async fn sample_one_shard(
             // Emitted ONLY when known. Publishing 0.0 for "unknown"
             // would read as a perfect RPO for replication that is
             // dead — see METRIC_REPLICATION_LAG_SECONDS.
-            if let Some(seconds) = status.rpo_seconds() {
+            let rpo_seconds = status.rpo_seconds();
+            if let Some(seconds) = rpo_seconds {
                 telemetry
                     .metrics
                     .record_replication_lag_seconds(shard_u16, seconds);
             }
+            // Emitted every tick the views are readable, `known = false`
+            // included (issue #954, finding 2): a Prometheus gauge keeps
+            // exporting its last value, so skipping the lag gauge above when
+            // the RPO is unknown does not make the dashboard stale — it
+            // freezes it at the last healthy reading. This gauge is the
+            // signal that breaks that freeze for the "views readable, RPO
+            // unmeasurable" case that record_replication_observable's `false`
+            // arm does not cover.
+            telemetry
+                .metrics
+                .record_replication_rpo_known(shard_u16, rpo_seconds.is_some());
         }
         Err(error) => {
             tracing::debug!(
@@ -23515,13 +23538,6 @@ pub struct Worker {
     pub registry: Arc<HandlerRegistry>,
     /// Set of activities that this worker cannot run because of unsatisfied requirements (issue #382).
     pub ineligible_activities: Vec<String>,
-    /// This worker's DR sampler cadence and watermark retention (issue #954).
-    ///
-    /// Snapshotted at construction from the process-global. Only the *timing*
-    /// knobs live there — whether fencing is enforced at all rides on
-    /// [`WorkerRuntimeConfig::dr_fencing`], because that one cannot tolerate a
-    /// last-writer-wins race. See that field.
-    dr: crate::replication::DrConfig,
     /// Bounds concurrent workflow task executions.
     workflow_semaphore: Arc<Semaphore>,
     /// Bounds concurrent activity task executions.
@@ -24694,7 +24710,6 @@ impl Worker {
             config,
             registry,
             ineligible_activities,
-            dr: crate::replication::dr_config(),
             workflow_semaphore: workflow_parts.semaphore,
             activity_semaphore: activity_parts.semaphore,
             workflow_permit_total: workflow_parts.permit_total,
@@ -25181,6 +25196,22 @@ impl Worker {
             );
         }
 
+        // Fence FIRST: pinning must precede fleet registration and the first
+        // poll, so a DR-enabled worker is never briefly unfenced (issue
+        // #954). This used to run AFTER the registration loop below,
+        // contradicting this exact comment and the single-shard path's
+        // ordering ( finding 4): a worker in that window could not
+        // claim or persist — the claim/persist gates are structural and
+        // unaffected — but it could appear as a live worker in
+        // `harvest_workers` and mutate rate-limit buckets on a shard whose
+        // generation it had not yet pinned, and a subsequent
+        // `pin_dr_generations` failure then left those registrations behind
+        // with no heartbeat started to clean them up.
+        if !self.pin_dr_generations(default_pool).await {
+            self.shutdown.cancel();
+            return;
+        }
+
         let startup_bound = shard_acquire_bound(true, self.config.poll_interval);
         let mut registration_pending_per_shard: Vec<Arc<AtomicBool>> =
             Vec::with_capacity(shard_targets.len());
@@ -25202,12 +25233,6 @@ impl Worker {
         // `default_pool`.
         let shard_pools_for_pressure: Vec<DbPool> =
             shard_targets.iter().map(|(_, p)| p.clone()).collect();
-        // Fence FIRST: pinning must precede fleet registration and the first
-        // poll, so a DR-enabled worker is never briefly unfenced (issue #954).
-        if !self.pin_dr_generations(default_pool).await {
-            self.shutdown.cancel();
-            return;
-        }
         let monitors = self.spawn_monitoring_tasks(default_pool, &shard_pools_for_pressure);
         let heartbeat_cancel = CancellationToken::new();
 
@@ -25675,7 +25700,7 @@ impl Worker {
     async fn pin_dr_generations(&self, fallback_pool: &DbPool) -> bool {
         use crate::replication::FenceRegistry;
 
-        if !self.config.dr_fencing {
+        if !self.config.dr.fencing {
             return true;
         }
 
@@ -25734,13 +25759,21 @@ impl Worker {
             }
         }
         if let Err(conflict) = FenceRegistry::publish(&pinned, default_shard) {
-            tracing::error!(
-                worker_id = %self.config.worker_id,
-                shard_id = conflict.shard_id,
-                already_pinned = conflict.pinned,
-                attempted = conflict.attempted,
-                "refusing to start: {conflict}"
-            );
+            match conflict {
+                crate::replication::PublishConflict::Generation(c) => tracing::error!(
+                    worker_id = %self.config.worker_id,
+                    shard_id = c.shard_id,
+                    already_pinned = c.pinned,
+                    attempted = c.attempted,
+                    "refusing to start: {conflict}"
+                ),
+                crate::replication::PublishConflict::DefaultShard(c) => tracing::error!(
+                    worker_id = %self.config.worker_id,
+                    already_pinned_default_shard = c.pinned,
+                    attempted_default_shard = c.attempted,
+                    "refusing to start: {conflict}"
+                ),
+            }
             return false;
         }
         true
@@ -26186,7 +26219,7 @@ impl Worker {
         // authority. Neither may be silently switched off by a deployment that
         // simply has no metrics sink.
         #[cfg(feature = "db")]
-        let replication_sampler = if self.config.dr_fencing {
+        let replication_sampler = if self.config.dr.fencing {
             // Every deployment shape, not just sharded ones. Gating this on
             // `sharded_pool.is_some()` left the DOCUMENTED single-database
             // configuration — `.with_dr_fencing(true)` and nothing else — with
@@ -26200,9 +26233,9 @@ impl Worker {
                     targets,
                     self.shutdown.clone(),
                     self.registry.telemetry().clone(),
-                    self.dr.sample_interval,
-                    self.dr.watermark_retain,
-                    self.dr.slot_prefix.clone(),
+                    self.config.dr.sample_interval,
+                    self.config.dr.watermark_retain,
+                    self.config.dr.slot_prefix.clone(),
                 )
             })
         } else {
@@ -29287,7 +29320,7 @@ mod tests {
 
     fn default_runtime_config() -> WorkerRuntimeConfig {
         WorkerRuntimeConfig {
-            dr_fencing: false,
+            dr: crate::replication::DrConfig::default(),
             worker_id: "test-worker-1".to_string(),
             queues: vec!["default".to_string()],
             notification_database_url: None,
@@ -30290,7 +30323,7 @@ mod tests {
     #[test]
     fn worker_rejects_invalid_config() {
         let cfg = WorkerRuntimeConfig {
-            dr_fencing: false,
+            dr: crate::replication::DrConfig::default(),
             queues: vec![],
             ..default_runtime_config()
         };
@@ -30855,7 +30888,7 @@ mod tests {
             .continue_as_new_threshold();
 
         let cfg = WorkerRuntimeConfig {
-            dr_fencing: false,
+            dr: crate::replication::DrConfig::default(),
             max_workflow_history_events: Some(threshold + 1),
             ..default_runtime_config()
         };
@@ -32987,7 +33020,7 @@ mod tests {
         labels.insert("gpu".to_string(), "true".to_string());
         labels.insert("region".to_string(), "eu-west-1".to_string());
         let cfg = WorkerRuntimeConfig {
-            dr_fencing: false,
+            dr: crate::replication::DrConfig::default(),
             labels,
             ..default_runtime_config()
         };
