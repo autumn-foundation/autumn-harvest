@@ -293,14 +293,6 @@ fn comparison_page_links_back_to_the_migration_guide() {
 /// slot from the creation moment, not from the original schedule's own
 /// phase.
 ///
-/// A twelfth review found two more gaps, in the pause-then-list capture
-/// added for the schedule-driven-type routing record. Pausing first
-/// closes the two ordering gaps that review found. But a store behind
-/// Temporal's own visibility can still lag its executions. A query
-/// right after the pause can still omit one. The same capture also only
-/// ever ran forward, at cutover. A rollback resumes the Temporal
-/// Schedule, and nothing captured the ids it fires after that.
-///
 /// A thirteenth review found the interval-phase advice itself does not
 /// hold up. Picking a cutover timestamp to land on the original phase
 /// assumes the reader can choose the actual insert moment.
@@ -308,14 +300,9 @@ fn comparison_page_links_back_to_the_migration_guide() {
 /// `Utc::now()` at the real insert sets the phase instead, later still
 /// once request and database latency are added in.
 ///
-/// A fourteenth review found two more gaps, both past the point where
-/// the last two fixes stopped. Waiting out an indexing delay is a
-/// guess, not a guarantee: nothing confirms the wait was long enough.
-/// A miss still needs a fallback, a direct per-id describe against
-/// Temporal instead of the list. Resuming the Temporal Schedule on
-/// rollback can also refire the interval harvest already covered.
-/// `CatchupWindow` does this, unless that backlog is excluded or the
-/// schedule's own state is advanced past it first.
+/// Capturing which engine owns a schedule-driven type's executions,
+/// and reconciling that capture, is covered separately below by
+/// `dual_run_playbook_covers_schedule_driven_capture_and_reconciliation`.
 #[test]
 fn dual_run_playbook_covers_schedule_driven_cutover() {
     let guide = read_doc(GUIDE_PATH);
@@ -380,6 +367,31 @@ fn dual_run_playbook_covers_schedule_driven_cutover() {
         "the playbook must point to the catchup-policy primitive for the harvest schedule's \
          backlog decision (issue #484, issue #1219)"
     );
+}
+
+/// Issue #1219, gap 1 (continued): capturing which engine owns a
+/// schedule-driven type's executions, and reconciling that capture
+/// against Temporal's own eventual consistency and workflow-id reuse.
+///
+/// A twelfth review found two gaps in the pause-then-list capture. An
+/// eventually consistent Temporal visibility store can still lag right
+/// after the pause. The capture also never covered a rollback resuming
+/// the Temporal Schedule.
+///
+/// A fourteenth review found two more gaps. Waiting out an indexing
+/// delay is a guess, not a guarantee. Resuming the Temporal Schedule
+/// on rollback can also refire the interval harvest already covered,
+/// through its own `CatchupWindow`.
+///
+/// A sixteenth review found the describe fallback for the prior gap
+/// only ran on a harvest miss. A reused workflow id's own older
+/// execution can satisfy that miss check without ever probing
+/// Temporal.
+#[test]
+fn dual_run_playbook_covers_schedule_driven_capture_and_reconciliation() {
+    let guide = read_doc(GUIDE_PATH);
+    let playbook = flatten_whitespace(section_body(&guide, "## Dual-run cutover playbook"));
+
     assert!(
         playbook.contains("Temporal's own visibility can lag behind its executions")
             && playbook.contains("eventually consistent"),
@@ -397,11 +409,21 @@ fn dual_run_playbook_covers_schedule_driven_cutover() {
     );
     assert!(
         playbook.contains("A fixed wait cannot guarantee the list has converged")
-            && playbook.contains("describe that specific id directly against Temporal"),
+            && playbook.contains("describing the id directly against Temporal"),
         "the playbook must not treat a fixed wait as proof that Temporal's visibility list has \
-         converged -- it must reconcile a follow-up for an id classified harvest's by \
-         describing that id directly against Temporal, which uses a live per-id lookup rather \
-         than the eventually consistent list (issue #1219, PR #1473 Codex P1)"
+         converged -- it must reconcile by describing the id directly against Temporal, which \
+         uses a live per-id lookup rather than the eventually consistent list \
+         (issue #1219, PR #1473 Codex P1)"
+    );
+    assert!(
+        playbook.contains(
+            "A harvest match is not conclusive either, if that workflow id was \
+             ever reused"
+        ) && playbook.contains("Describe the id against Temporal unconditionally"),
+        "the playbook must not gate the Temporal describe fallback on a harvest miss -- an \
+         older, unrelated execution can already sit under a reused workflow id on harvest, \
+         satisfying a miss-only check without ever probing Temporal, so the describe must run \
+         unconditionally (issue #1219, PR #1473 Codex P1)"
     );
     assert!(
         playbook.contains(

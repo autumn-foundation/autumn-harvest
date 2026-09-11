@@ -417,11 +417,19 @@ your whole application.
 
    A fixed wait cannot guarantee the list has converged. There is no
    completion signal to check, and no guaranteed upper bound. Do not
-   treat it as a proof. Reconcile instead. If a follow-up for an id
-   classified harvest's finds no matching execution there, describe
-   that specific id directly against Temporal. A per-id describe uses
-   its own live lookup, not the eventually consistent list. Treat a
-   match there as Temporal's after all.
+   treat it as a proof. Reconcile instead, by describing the id
+   directly against Temporal. A per-id describe uses its own live
+   lookup, not the eventually consistent list.
+
+   A harvest match is not conclusive either, if that workflow id was
+   ever reused. An older, unrelated harvest execution can already sit
+   under it, from a generation before this schedule-driven type
+   existed. Finding it satisfies a miss-only check without ever
+   probing Temporal. Describe the id against Temporal unconditionally
+   instead, whether or not harvest also has something under it. Treat
+   a match there as Temporal's, regardless of what harvest reports.
+   Fall back to the default classification only once both come back
+   empty.
 
    Treat a follow-up against one of those captured ids as Temporal's,
    permanently, no matter what state that execution reached. Treat any
