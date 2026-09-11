@@ -26,8 +26,11 @@
 //!   first `cancelled.load(...)` check, since nothing else has run between
 //!   registration and that check. `ctx.system_now()` is that flush point.
 //!   It is a cheap deterministic primitive call, not an activity or a
-//!   timer, so it costs nothing. Without it, the first check always reads
-//!   `false`, even for a signal already recorded in history;
+//!   timer, so it adds no extra compute or latency. On its first live
+//!   call it does add one event to durable history. Budget for that cost
+//!   in a hot loop or a frequently re-entered workflow. Without the
+//!   flush point, the first check always reads `false`, even for a
+//!   signal already recorded in history;
 //! - **while the workflow is waiting on the timer** is observed the moment
 //!   the timer resolves — the `ctx.timer(...)` call itself is the flush
 //!   point, so the second `cancelled.load(...)` check needs no extra call.
@@ -248,6 +251,17 @@ mod tests {
             "a pre-recorded cancellation must complete the run cleanly: {result:?}"
         );
 
+        // `for_replay` sets `strict_replay` to false, so a `NoMatch` at
+        // the frontier never counts as a divergence here. The fixture
+        // ends at `SignalReceived`; `system_now()` reads the live
+        // frontier there, not a replayed value, so no deferred error is
+        // recorded.
+        assert_eq!(
+            ctx.take_deferred_nd_error(),
+            None,
+            "no divergence expected: system_now() is a live frontier read here"
+        );
+
         let commands = ctx.drain_commands();
         assert!(
             !commands.iter().any(
@@ -273,10 +287,20 @@ mod tests {
                 subscription_id: subscription_id.clone(),
                 cycles: 3,
             })),
+            // The workflow's leading `ctx.system_now()` flush point (module
+            // docs above) records this event before the activity call.
+            WorkflowEvent::SideEffectRecorded {
+                kind: SideEffectKind::Now,
+                name: None,
+                value: json!(chrono::Utc::now().timestamp_millis()),
+            },
             WorkflowEvent::ActivityScheduled {
                 activity_id,
                 name: "charge_card".into(),
-                input: json!(3),
+                input: json!(ChargeRequest {
+                    idempotency_key: format!("{subscription_id}-cycle-3"),
+                    cycles: 3,
+                }),
                 queue: "default".into(),
             },
             WorkflowEvent::ActivityCompleted {
@@ -317,6 +341,14 @@ mod tests {
         assert!(
             result.is_ok(),
             "a mid-wait cancellation must complete the run cleanly: {result:?}"
+        );
+
+        // The fixture must replay clean. A missing or misplaced event here
+        // would silently pass this test otherwise (issue #1218).
+        assert_eq!(
+            ctx.take_deferred_nd_error(),
+            None,
+            "history must replay without a side-effect drift mismatch"
         );
 
         let commands = ctx.drain_commands();

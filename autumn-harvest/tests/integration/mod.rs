@@ -54,6 +54,8 @@ mod claim_budget_tests;
 #[cfg(all(feature = "db", feature = "testing"))]
 mod codec_rotation_db_tests;
 mod completion_callback_tests;
+#[cfg(feature = "db")]
+mod completion_trigger_outbox_queue_perf;
 mod concurrency_key_tests;
 mod concurrency_supersede_tests;
 mod context_headers_tests;
@@ -153,6 +155,7 @@ mod queue_pause_success_metric_tests;
 mod queue_pause_tests;
 mod quota_enforcement_tests;
 mod quota_history_bytes_perf_tests;
+mod quota_reconcile_tests;
 mod rate_limit_bucket_gc_tests;
 mod rate_limit_key_tests;
 mod redrive_tests;

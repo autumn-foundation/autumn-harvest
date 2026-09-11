@@ -320,6 +320,269 @@ your whole application.
    or a harvest execution. An in-flight execution of either engine keeps
    running on the engine that started it. See the
    [history-import non-goal](#non-goals) above.
+
+   A schedule-driven workflow type needs an extra step before you flip its
+   flag. The Temporal server starts a Temporal Schedule's executions
+   directly. No application code runs in that path. The flag above
+   controls nothing for it.
+
+   Pick one cutover timestamp. Create the harvest `WorkflowSchedule` at
+   that timestamp, already paused. `WorkflowSchedule::with_paused(true)`
+   sets this in the same insert that creates the schedule. Its first
+   computed slot then falls at or after the cutover timestamp, since
+   nothing was due before a schedule that did not yet exist.
+
+   An interval schedule re-anchors its phase to that creation moment.
+   `Schedule::Interval` computes its first slot as `Utc::now()` at the
+   actual insert, plus the interval. That is not the next occurrence
+   of the original Temporal schedule's own phase.
+
+   Neither `WorkflowSchedule` nor its create request accepts that
+   moment as an input. You cannot choose it to land on the original
+   phase, only observe it after the fact. Request and database latency
+   move it later still, past whatever instant you were aiming for. Use
+   `Schedule::Cron` instead when the phase must survive the cutover. A
+   cron expression computes its next slot from its own absolute phase,
+   not from when you happened to create it.
+
+   Do not create the harvest schedule earlier and leave it paused,
+   waiting for the cutover timestamp. A slot can come due during that
+   wait, and neither engine's catchup policy resolves it cleanly for
+   you. Temporal's `CatchupWindow` and harvest's `CatchupPolicy` (issue
+   #484) each govern a missed interval as a whole, not slot by slot.
+   Neither has a mode that reliably fires none of it. Harvest's
+   `CatchupPolicy::SkipAll` still fires the oldest missed slot, for one
+   example.
+
+   Pause the Temporal Schedule first, then create and unpause the
+   harvest schedule with `POST /admin/schedules/{id}/resume` (issue
+   #229). A small gap between the two calls is still possible. Treat a
+   slot missed inside it as a deliberate, bounded loss, or fire it by
+   hand through `POST /admin/schedules/{id}/trigger`. Keep the gap short
+   enough that this stays rare.
+
+   A follow-up operation against one already-started execution follows a
+   different rule. A signal, a query, an update, and a cancellation each
+   name one specific execution, not a workflow type. When you do not
+   already know which engine hosts that execution, route the call to
+   whichever one hosts it right now. Never route it by the flag's
+   current value. The flag can flip between an execution's start and a
+   later follow-up call against it.
+
+   A workflow id can also outlive one execution. `WorkflowIdReusePolicy`
+   lets a new execution reuse the same `(workflow_name, workflow_id)`
+   after the old one closes. That reuse can land on the other engine
+   after a rollback. A terminal execution is not the same thing as a
+   reused id, though. Most terminal executions just finished normally,
+   with nothing after them. Confusing the two is the hazard. Treating
+   every terminal run as "not here, try the other engine" misroutes it.
+   An ordinary completed run still needs its own follow-ups routed
+   correctly, such as a query for its result.
+
+   Write a `(workflow_name, workflow_id) -> engine` record before you
+   start the execution, not after. The start and the record write are
+   two separate operations. A crash between them is possible in either
+   order. Writing the record first bounds the damage. At worst, a
+   record names an engine with no matching execution yet. That is a
+   state you can detect and retry. Writing it after leaves the
+   opposite state undetectable. A real execution can exist with no
+   record, defaulting to the wrong engine.
+
+   A definitive rejection is not the same as an unknown outcome.
+   Validation, authorization, and a reuse-policy conflict all fail
+   synchronously and permanently. Retrying that same call fails the
+   same way every time. Restore the record to whatever it named
+   before this attempt, or delete it if there was none. Do not leave
+   it pointing at an engine where nothing will ever run. A crash or a
+   lost response, unlike this case, is genuinely unknown and worth
+   reconciling by retry.
+
+   An application-level flag routes a new request in your own code,
+   whether it sends the request to harvest or, after a rollback, back
+   to Temporal. Write the record at that same decision point. Overwrite
+   any earlier record for the same id. Treat a missing record as
+   Temporal. A flag-routed start there, and a rollback's restart, are
+   both Temporal's by default. Nothing in your system could have
+   started either one on harvest instead.
+
+   A schedule-driven type has no hook to write this record for a
+   harvest-fired execution. Harvest's built-in scheduler starts each
+   firing directly. It exposes no callback before or after admission
+   for your own code to run. Capture ownership a different way instead.
+
+   Pause the Temporal Schedule first. Then list every execution of
+   that type Temporal has ever started, through Temporal's own
+   visibility API. List open and closed executions, not only the
+   in-flight ones. A query taken before the pause misses two cases. It
+   misses an execution that finishes between the query and the pause.
+   It misses one the schedule fires in that same gap. Pausing first
+   closes both gaps. No new firing can start once Temporal is paused.
+
+   Temporal's own visibility can lag behind its executions. This lag is
+   real when the deployment uses an eventually consistent store for
+   it. A just-finished or just-started execution may not appear in the
+   list right away. Wait past that deployment's own indexing delay
+   before you trust the list as complete.
+
+   A fixed wait cannot guarantee the list has converged. There is no
+   completion signal to check, and no guaranteed upper bound. Do not
+   treat it as a proof. Reconcile instead, by describing the id
+   directly against Temporal. A per-id describe uses its own live
+   lookup, not the eventually consistent list.
+
+   A harvest match is not conclusive either, if that workflow id was
+   ever reused. An older, unrelated harvest execution can already sit
+   under it, from a generation before this schedule-driven type
+   existed. Finding it satisfies a miss-only check without ever
+   probing Temporal. Describe the id against Temporal unconditionally
+   instead, whether or not harvest also has something under it. Treat
+   a match there as Temporal's, regardless of what harvest reports.
+   Fall back to the default classification only once both come back
+   empty.
+
+   Treat a follow-up against one of those captured ids as Temporal's,
+   permanently, no matter what state that execution reached. Treat any
+   other id of that type as harvest's. Only harvest's schedule can
+   start a new one once Temporal is paused.
+
+   A rollback of a schedule-driven type reverses this capture. Pause
+   the harvest schedule first, then resume the Temporal Schedule.
+
+   A follow-up request carries only a workflow id, not a timestamp.
+   "Started after this point" is not something you can test against
+   that id alone. List every execution of that type harvest has ever
+   started instead, the same way the forward capture lists Temporal's:
+   open and closed executions, not only the in-flight ones. Treat a
+   follow-up against one of those captured ids as harvest's,
+   permanently. Treat any other id of that type as Temporal's, since
+   only Temporal's schedule can start one once harvest is paused. The
+   ids captured at the forward cutover keep the classification they
+   already have.
+
+   Resuming the Temporal Schedule can also refire the interval harvest
+   just owned. Temporal's own `CatchupWindow` decides whether a paused
+   schedule's missed backlog fires on resume, the same primitive the
+   forward cutover already names. Set it to exclude the harvest-owned
+   interval, or advance the schedule's own recorded state past it,
+   before you resume. Otherwise the resume duplicates every side
+   effect harvest's own firings already committed.
+
+   Querying by workflow id alone cannot tell two things apart, on a
+   reused id. That id can already carry an older, unrelated execution
+   on the engine the record names. A query then finds that older
+   execution and reads as a hit. The intended new start never actually
+   happened. `AllowDuplicate` then attaches to the old execution
+   instead of creating the intended one.
+
+   Generate a fresh idempotency key for the start attempt instead.
+   Persist it alongside the pending record, before the start call.
+   Pass it as the `Idempotency-Key` header (issue #808). Reconcile by
+   retrying that exact same call with that same key, not by querying
+   the workflow id again. Harvest dedups a repeated key onto its own
+   earlier same-key start. That dedup is scoped to `(workflow_name,
+   idempotency_key)`, regardless of any older execution already under
+   that workflow id.
+
+   A fresh key still runs the ordinary reuse policy once, the first
+   time harvest sees it. Only a repeat of that same key skips straight
+   to the dedup. `AllowDuplicate` and `RejectDuplicate` do not create
+   the intended replacement on that first run, if an older terminal
+   execution already sits under the reused id. Each attaches to it, or
+   refuses, and harvest repoints the key at that outcome permanently.
+   The intended new execution never gets created at all.
+
+   Use `WorkflowIdReusePolicy::TerminateIfRunning` for this call
+   instead. It starts a fresh run unconditionally once the prior one
+   is terminal, which is what a genuine reuse restart needs. Pairing
+   it with the idempotency key is what makes retrying it safe. A fresh
+   key evaluates `TerminateIfRunning` for real, creating the intended
+   execution. A repeated key deduplicates onto whatever that first
+   evaluation produced, without ever re-running its cancel-and-restart
+   logic. Check the response's `started_fresh` field to tell the two
+   cases apart.
+
+   This dedup window is bounded, 24 hours by default. Reconcile well
+   inside it.
+
+   Do the same on the Temporal side, deliberately. A fresh call to
+   Temporal's start API mints a fresh request id of its own. Only a
+   transport-level retry of that exact call keeps the original id. A
+   reconciliation call written after a crash is a new call, not a
+   retry of the old one. Generate your own request id before the first
+   attempt. Persist it next to the pending record. Supply that same id
+   yourself on every reconciliation call. Temporal's own dedup then
+   applies to your attempt. It can no longer mistake a reconciliation
+   retry for a genuine new start.
+
+   This record names the current owner only. It matches harvest's own
+   by-id resolution (issue #805), which also resolves to the latest
+   run, not a specific historical one. A follow-up against a specific
+   prior generation needs its own engine and execution id, captured
+   from when that generation was current.
+
+   Once you know the engine, resolve the current execution on it before
+   you act. Harvest's `/workflows/by-id/{workflow_name}/{workflow_id}`
+   route family (issue #805) does this on the harvest side. It resolves
+   a business id to its current run. A stale cached execution id can be
+   left behind by a continue-as-new or a reset. This resolution keeps
+   such a stale id from misdirecting a signal, a query, or a
+   cancellation. Route those three operations through that same by-id
+   family.
+
+   The family has no update route. Read the resolved execution id from
+   its response, then send the update to `POST
+   /workflows/{id}/update/{update_name}` with that id. A continue-as-new
+   between those two calls can still move the id you read out from
+   under the update. `admit_update` resolves only a workflow-level
+   retry chain, not a continue-as-new chain, so it will not find the
+   new current run for you there. Keep the gap between the two calls
+   short.
+
+   Do not retry the update call itself if its result goes missing.
+   Every admission mints a fresh update id, with no dedup key of its
+   own. A retry can run the update's own logic a second time. If you
+   lose the response, read the execution's state instead to confirm
+   whether the update already applied, rather than resending it. Use
+   Temporal's own equivalent business-id resolution on the Temporal
+   side.
+
+   This design replaces three separate resolution attempts. A terminal
+   execution keeps routing to the engine that finished it, since
+   nothing overwrote its record. A reused workflow id after a rollback
+   gets a fresh record the moment the rollback's own flag flip routes
+   the new start to Temporal. A schedule-driven type instead captures
+   its Temporal-side ids once, at cutover, since harvest's own
+   scheduler has no hook to write one.
+
+   Confirm the previous execution under a reused id is not still active
+   on its own engine before you start a new one elsewhere. Query
+   harvest's by-id resolution above. Check Temporal's own visibility API
+   too. Start the new execution only once both report no active run for
+   that id. Step 7's handoff below already follows this discipline. It
+   waits for `COMPLETED` before starting the new execution. Apply the
+   same discipline to any other reused id, including one reused across a
+   rollback.
+
+   This check-then-start sequence has its own race. Two concurrent
+   requests for the same reused id can each observe no active run,
+   then each start on a different engine. Neither engine's own query
+   is transactional with the other, and neither is transactional with
+   your own start call. Serialize this sequence yourself. Take an
+   application-level lock keyed on `(workflow_name, workflow_id)`
+   before you query either engine, and hold it until your own start
+   call returns. Release it only then.
+
+   A `cancel` signal routed to the wrong engine may not fail loudly. It
+   can do nothing there, while the real execution stays un-cancelled.
+   Against a `SignalWithStart`-shaped call, a wrong-engine route is
+   worse. It can start a new, spurious execution on that engine instead.
+
+   The handoff in step 7, below, is a special case of this rule. Its
+   `cancel` signal and its final read both route by the same record. A
+   terminal execution's record still names the engine that ran it.
+   Nothing has started a replacement yet at that point. Apply the rule
+   above to every other follow-up operation during the whole dual-run
+   window, not only to that one case.
 2. **Port and validate one workflow type completely before you flip its
    flag.** Run the [Workflow-porting checklist](#workflow-porting-checklist)
    against it. Confirm `WorkflowReplayer` reports no non-determinism against
@@ -434,6 +697,18 @@ your whole application.
    workflow to race the wait against the signal instead. Harvest's
    `ctx.receive_signal_timeout` (issue #476) is the primitive for that
    race on the harvest side.
+
+   Routing the `cancel` signal above is a special case of step 1's
+   general follow-up-routing rule. Route it by the entity's own
+   `(workflow_name, workflow_id) -> engine` record. For this forward
+   handoff, that record is missing or still names Temporal. No start has
+   ever routed this entity to harvest yet. Never route the signal by the
+   flag's current value.
+
+   Read the final state from that same engine: Temporal, not harvest.
+   The record does not change until a new execution actually starts
+   elsewhere. The harvest execution here only starts after this read,
+   not before it.
 
    Treat each entity's handoff as a deliberate cutover step, not a bulk
    migration. Each one is a live, stateful run. It is not disposable
@@ -640,6 +915,16 @@ async fn subscription_renewal(
   harvest's *pull*-based primitive. It matches Temporal's `condition()`
   helper instead. It blocks one code point, rather than reacting from
   anywhere in the workflow body. See the [Signals](#signals) row above.
+- **Routing the `cancel` signal itself.** This example assumes `cancel`
+  already reaches the engine hosting this subscription's execution. A
+  real dual-run cutover cannot assume that. Look up the
+  `(workflow_name, workflow_id) -> engine` record for this specific
+  execution first. See the general follow-up-routing rule in the
+  [Dual-run cutover playbook](#dual-run-cutover-playbook), step 1,
+  above. A `cancel` signal
+  sent to the wrong engine does nothing there. It leaves the real
+  execution un-cancelled. That un-cancelled execution then blocks the
+  step 7 drain this playbook depends on.
 - **Dispatch timing.** Temporal's `setHandler` callback fires as soon as the
   signal arrives, mid-await. Harvest's push handler dispatches only on the
   *next* history-consulting call the workflow body makes. A signal recorded

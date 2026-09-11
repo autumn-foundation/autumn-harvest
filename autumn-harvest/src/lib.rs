@@ -371,6 +371,12 @@ pub mod queue_pause;
 /// `db` feature; [`quota::load_quota_usage`]/[`quota::list_quota_usage`] are
 /// DB-gated.
 pub mod quota;
+/// Registry-aware `quota_key` backfill for pre-upgrade executions (issue #1226).
+///
+/// Pure logic ([`quota_reconcile::resolve_backfill`],
+/// [`quota_reconcile::ReconcileSummary`]) compiles without the `db` feature;
+/// the sweep and its periodic spawner are DB-gated.
+pub mod quota_reconcile;
 pub mod replay;
 /// Stratified in-flight history sampling for the replay-drift gate (issue #798).
 ///
