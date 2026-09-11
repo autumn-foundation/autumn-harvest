@@ -357,13 +357,13 @@ async fn terminate_idempotent_on_terminal() {
 
 /// Terminate's idempotent no-op reports a reason matching the row's real
 /// terminal state, not a cancel-specific fallback (issue #1456). A
-/// naturally-COMPLETED run — the reported repro — has no `error` and no
+/// naturally-`COMPLETED` run — the reported repro — has no `error` and no
 /// `WorkflowCancelled` event, so its reason must not claim cancellation.
-/// CONTINUED_AS_NEW never populates `error` either, so it exercises the
-/// same derived-reason path. CANCELLED reaches `idempotent()` here via
+/// `CONTINUED_AS_NEW` never populates `error` either, so it exercises the
+/// same derived-reason path. `CANCELLED` reaches `idempotent()` here via
 /// terminate's own terminal-state check, not cancel's. That pins the
 /// shared helper to answering "workflow already cancelled" from this
-/// call site too. FAILED, with a stored error, proves the derived
+/// call site too. `FAILED`, with a stored error, proves the derived
 /// reason never overrides a real one.
 #[tokio::test]
 async fn terminate_idempotent_reason_matches_state() {
