@@ -113,6 +113,37 @@ pub const CODEC_LEGACY_KEY_ID: &str = "legacy";
 /// `[A-Za-z0-9._:-]` — see [`PayloadCodecs::register_key`].
 pub const MAX_CODEC_KEY_ID_BYTES: usize = 64;
 
+/// Escape marker for plaintext that collides with a codec envelope shape
+/// (issue #1253).
+///
+/// `codec_envelope_parts` recognizes an envelope by shape alone. Under the
+/// identity codec, `encode_payload` stores caller input verbatim, so
+/// business data can coincidentally match a recognized shape. Such a value
+/// is wrapped in these two keys before it reaches storage —
+/// `{"_harvest_codec_escaped": <original value>, "_harvest_codec_escaped_v":
+/// 1}` — and every read path reverses the wrap. See
+/// [`escape_marker_collision`] and [`unescape_marker_collision`].
+///
+/// The lossy read path (`decode_value_lossy`) applies this reversal at
+/// every nesting depth, not only at a payload field's own top level. It
+/// walks a whole record without knowing field boundaries — the same
+/// reason [`codec_envelope_parts`] itself is shape-only. A single reserved
+/// key would then be an easier accidental target for nested business data
+/// than the envelope shapes it protects against. The companion version
+/// key below raises the bar back to "two specific keys coincide",
+/// matching the envelope shapes' own improbability.
+pub const CODEC_MARKER_ESCAPE_KEY: &str = "_harvest_codec_escaped";
+
+/// Companion key to [`CODEC_MARKER_ESCAPE_KEY`]: every escape wrapper
+/// carries both, so recognizing one takes two specific reserved keys, not
+/// one (issue #1253).
+const CODEC_MARKER_ESCAPE_VERSION_KEY: &str = "_harvest_codec_escaped_v";
+
+/// The only value [`CODEC_MARKER_ESCAPE_VERSION_KEY`] ever carries. A
+/// version number, not a boolean, so the wrapper can evolve the same way
+/// [`CODEC_ENVELOPE_VERSION_LEGACY`]/[`CODEC_ENVELOPE_VERSION_KEYED`] do.
+const CODEC_MARKER_ESCAPE_VERSION: i64 = 1;
+
 /// Undecodable reason: the envelope names a codec that is not registered.
 pub const UNDECODABLE_REASON_UNKNOWN_CODEC: &str = "unknown_codec";
 /// Undecodable reason: the envelope names an unregistered codec **key id**.
@@ -217,23 +248,30 @@ impl<'a> CodecEnvelopeParts<'a> {
 /// its own `codec_id` field), and keeps a four-key **version 1** value
 /// classified as plaintext exactly as it was before.
 ///
-/// # The one shape this does reinterpret
+/// # This function alone does not rule out a collision
 ///
-/// A pre-#948 reader rejected version 2 outright, so business data shaped
-/// *exactly* like a version-2 envelope — those four keys, integer `2` under the
-/// discriminator, a `kid` passing [`validate_key_id`] — was stored and read back
-/// as plaintext, and is now classified as ciphertext. Replay then fails with
-/// `UnknownCodecKey`, or, if a key with that id happens to be registered,
-/// decodes to garbage the sweep would re-encrypt permanently.
+/// A pre-#948 reader rejected version 2 outright. So business data shaped
+/// *exactly* like a version-2 envelope was legitimate stored plaintext
+/// before key rotation existed. That shape is four keys, integer `2`
+/// under the discriminator, a `kid` that passes [`validate_key_id`]. Read
+/// here in isolation, this function cannot tell that data apart from a real
+/// envelope.
 ///
-/// Bumping the version moved this collision rather than removing it: the
-/// envelope is *structurally* indistinguishable from user data that happens to
-/// match, and no choice of version number changes that. Eliminating it needs a
-/// representation user data cannot coincide with, which is an ADR-0003 envelope
-/// change rather than a rotation one. Tracked separately; the probability is
-/// remote (four exact keys under a deliberately obscure discriminator) but the
-/// guarantee is **not** unconditional, and this comment previously claimed it
-/// was.
+/// This shape check itself is frozen (issue #1253). It must keep
+/// recognizing both versions exactly as before, byte-for-byte, so
+/// already-rotated deployments keep decoding their real version-2 history.
+/// It never gains a third flat shape. No future version bump can widen this
+/// exact hazard again.
+///
+/// The collision is closed one layer up, at the point where caller data
+/// could reach storage un-transformed. [`PayloadCodecs::encode_payload`]
+/// escapes a value shaped like this — or like [`CODEC_MARKER_ESCAPE_KEY`]
+/// itself — before it is ever written. Every read path reverses the escape
+/// first. A value that reaches this function has already passed that
+/// check. So this function still cannot distinguish a coincidence from
+/// real ciphertext; it does not need to, once nothing new can coincide.
+/// Data stored before that guard shipped is a frozen, documented residual
+/// risk. See the ADR-0003 issue #1253 addendum.
 fn codec_envelope_parts(payload: &Value) -> Option<CodecEnvelopeParts<'_>> {
     let obj = payload.as_object()?;
     let version = obj.get(CODEC_ENVELOPE_KEY).and_then(Value::as_i64)?;
@@ -300,6 +338,76 @@ pub fn codec_envelope_key_id(payload: &Value) -> Option<&str> {
 #[must_use]
 pub fn is_codec_envelope(payload: &Value) -> bool {
     codec_envelope_parts(payload).is_some()
+}
+
+/// `true` when `payload` is exactly `{"_harvest_codec_escaped": <value>,
+/// "_harvest_codec_escaped_v": 1}` — two keys, both reserved (issue #1253).
+///
+/// Two specific keys, not one. A nested walk that does not know payload
+/// field boundaries (see [`PayloadCodecs::decode_value_lossy`]) has to
+/// reverse this shape at any depth. It needs the same order of
+/// improbability [`codec_envelope_parts`] already has, not a single-key
+/// shortcut that is easier for business data to hit by accident.
+///
+/// `pub(crate)` so `testing.rs`'s replay-drift fixture guard
+/// (`codec_opaque_fixture_reason`) can refuse a fixture holding an escaped
+/// field. It already refuses one holding an undecoded codec envelope, the
+/// same way. Neither is the candidate's real business value verbatim. A
+/// raw JSON comparison against either reports drift that does not exist.
+pub(crate) fn is_escape_wrapper(payload: &Value) -> bool {
+    payload.as_object().is_some_and(|obj| {
+        obj.len() == 2
+            && obj.contains_key(CODEC_MARKER_ESCAPE_KEY)
+            && obj
+                .get(CODEC_MARKER_ESCAPE_VERSION_KEY)
+                .and_then(Value::as_i64)
+                == Some(CODEC_MARKER_ESCAPE_VERSION)
+    })
+}
+
+/// `true` when `payload` would be misread by a downstream reader: a real
+/// codec envelope shape, or the escape wrapper itself (issue #1253).
+fn collides_with_a_reserved_marker(payload: &Value) -> bool {
+    is_codec_envelope(payload) || is_escape_wrapper(payload)
+}
+
+/// Wrap `payload` in the escape marker if storing it verbatim would collide
+/// with a reserved shape; otherwise return it unchanged (issue #1253).
+///
+/// Used only on the identity-codec passthrough path in
+/// [`PayloadCodecs::encode_payload`] — the one place caller-controlled bytes
+/// reach storage without becoming a fresh, engine-built envelope.
+///
+/// The wrap adds exactly one layer. It round-trips for any input,
+/// including plaintext that already looks like an escaped value.
+/// Escaping checks the shape BEFORE wrapping. So a second wrap lands on
+/// top, rather than being mistaken for one already applied.
+/// [`unescape_marker_collision`] reverses exactly one layer, matching
+/// this exactly.
+fn escape_marker_collision(payload: &Value) -> Value {
+    if collides_with_a_reserved_marker(payload) {
+        serde_json::json!({
+            CODEC_MARKER_ESCAPE_KEY: payload,
+            CODEC_MARKER_ESCAPE_VERSION_KEY: CODEC_MARKER_ESCAPE_VERSION,
+        })
+    } else {
+        payload.clone()
+    }
+}
+
+/// Reverse [`escape_marker_collision`]: `Some(original)` when `payload` is
+/// the escape wrapper, `None` otherwise (issue #1253).
+///
+/// Every read path checks this before its normal envelope/pass-through
+/// logic, so an escaped value never reaches the codec-envelope decoder.
+fn unescape_marker_collision(payload: &Value) -> Option<Value> {
+    if !is_escape_wrapper(payload) {
+        return None;
+    }
+    payload
+        .as_object()
+        .and_then(|obj| obj.get(CODEC_MARKER_ESCAPE_KEY))
+        .cloned()
 }
 
 /// A trait for intercepting and transforming raw payload bytes.
@@ -847,11 +955,19 @@ impl PayloadCodecs {
     /// Encode ONE payload-bearing field into a codec envelope under the
     /// **active** key (issue #948).
     ///
-    /// A no-op returning `payload` unchanged when the active codec is the
-    /// identity codec. The emitted envelope carries a
-    /// [`CODEC_ENVELOPE_KID_KEY`] only when the active key id is not
-    /// [`CODEC_LEGACY_KEY_ID`], so an un-rotated deployment's stored bytes are
-    /// byte-identical to pre-#948.
+    /// Returns `payload` unchanged when the active codec is the identity
+    /// codec, UNLESS `payload` itself collides with a reserved envelope or
+    /// escape shape (issue #1253). Then it is wrapped in the escape marker
+    /// first, so a later read never misreads business data as ciphertext.
+    ///
+    /// This is the only path where caller-controlled bytes reach storage
+    /// without becoming a fresh, engine-built envelope. It is therefore the
+    /// only path that needs the guard: a real envelope built below always
+    /// carries engine-chosen keys, so it cannot collide.
+    ///
+    /// The emitted envelope carries a [`CODEC_ENVELOPE_KID_KEY`] only when
+    /// the active key id is not [`CODEC_LEGACY_KEY_ID`], so an un-rotated
+    /// deployment's stored bytes are byte-identical to pre-#948.
     ///
     /// Public so the re-encryption sweep can re-encode a field it has just
     /// decoded with a retired key, without duplicating the envelope-writing
@@ -863,7 +979,7 @@ impl PayloadCodecs {
     pub fn encode_payload(&self, payload: &Value) -> HarvestResult<Value> {
         let (key_id, codec) = self.active_codec();
         if codec.codec_id() == "identity" {
-            return Ok(payload.clone());
+            return Ok(escape_marker_collision(payload));
         }
         let raw = serde_json::to_vec(payload)?;
         let encoded = codec
@@ -974,8 +1090,10 @@ impl PayloadCodecs {
     /// envelope names (issue #948) — so a mixed-key history decodes
     /// transparently throughout a rotation window.
     ///
-    /// Returns `payload` unchanged when it is not a codec envelope (plaintext,
-    /// an offload reference envelope, an erase tombstone).
+    /// Returns `payload` unchanged when it is not a codec envelope
+    /// (plaintext, an offload reference envelope, an erase tombstone).
+    /// Reverses the [`PayloadCodecs::encode_payload`] escape wrap first
+    /// when present (issue #1253) — see [`unescape_marker_collision`].
     ///
     /// Public for the same reason as [`PayloadCodecs::encode_payload`].
     ///
@@ -988,6 +1106,9 @@ impl PayloadCodecs {
     /// - [`HarvestError`] on invalid base64, a codec `decode` failure, or
     ///   plaintext that is not valid JSON.
     pub fn decode_payload(&self, payload: &Value) -> HarvestResult<Value> {
+        if let Some(original) = unescape_marker_collision(payload) {
+            return Ok(original);
+        }
         let Some(parts) = codec_envelope_parts(payload) else {
             return Ok(payload.clone());
         };
@@ -1120,6 +1241,14 @@ impl PayloadCodecs {
     }
 
     fn decode_value_lossy_inner(&self, value: &mut Value, outcome: &mut LossyDecodeOutcome) {
+        // Reverse an escape wrap (issue #1253) before the envelope check, so
+        // escaped plaintext is restored rather than mistaken for ciphertext.
+        if let Some(original) = unescape_marker_collision(value) {
+            *value = original;
+            // Single-pass rule: never re-scan a value the guard already
+            // proved is plaintext.
+            return;
+        }
         let replacement =
             codec_envelope_parts(value).map(|parts| self.decode_envelope_lossy(&parts));
         if let Some(result) = replacement {
@@ -1167,6 +1296,14 @@ impl PayloadCodecs {
         let Ok(parsed) = serde_json::from_str::<Value>(raw) else {
             return (None, LossyDecodeOutcome::default());
         };
+        // Reverse an escape wrap (issue #1253) before the envelope check.
+        if let Some(original) = unescape_marker_collision(&parsed) {
+            let restored = match original {
+                Value::String(s) => s,
+                other => other.to_string(),
+            };
+            return (Some(restored), LossyDecodeOutcome::default());
+        }
         let Some(parts) = codec_envelope_parts(&parsed) else {
             return (None, LossyDecodeOutcome::default());
         };
@@ -1613,6 +1750,29 @@ mod tests {
         let outcome = codecs.decode_value_lossy(&mut value);
 
         assert_eq!(value, pristine);
+        assert_eq!(outcome, LossyDecodeOutcome::default());
+    }
+
+    #[test]
+    fn decode_value_lossy_does_not_misread_a_nested_field_named_like_the_escape_key() {
+        // issue #1253 review: `encode_payload` only ever escapes a WHOLE
+        // payload field, never something nested inside one. But the lossy
+        // walk recurses through business data without knowing field
+        // boundaries. A single reserved key would be an easy accidental
+        // target at that depth. The two-key wrapper shape must not fire on
+        // a business field merely named `_harvest_codec_escaped`.
+        let codecs = lossy_test_codecs();
+        let mut value = serde_json::json!({
+            "output": {
+                "_harvest_codec_escaped": {"n": 1},
+                "other": "field",
+            }
+        });
+        let pristine = value.clone();
+
+        let outcome = codecs.decode_value_lossy(&mut value);
+
+        assert_eq!(value, pristine, "a lone reserved key must not be unwrapped");
         assert_eq!(outcome, LossyDecodeOutcome::default());
     }
 
@@ -2384,6 +2544,246 @@ mod tests {
             !is_codec_envelope(&numeric_kid),
             "a non-string kid is not an envelope"
         );
+    }
+
+    // ── issue #1253: envelope-shaped plaintext must never become ciphertext ──
+    //
+    // `codec_envelope_parts` recognizes an envelope by SHAPE alone. Under
+    // the identity codec (the common, un-rotated case), `encode_payload`
+    // used to store caller input verbatim. Business data that happens to
+    // match a recognized shape then came back misread as ciphertext on
+    // the next read. These tests pin the write-time fix. `encode_payload`
+    // escapes such a value before it reaches storage. Every read path
+    // reverses the escape, so the round trip is exact regardless of what
+    // the plaintext looks like.
+
+    /// The exact collision from issue #1253: business data shaped like a
+    /// **keyed** (four-key, version-2) envelope. A pre-#948 reader rejected
+    /// version 2 outright, so this shape was legitimate stored plaintext
+    /// before key rotation existed.
+    fn keyed_envelope_shaped_business_data() -> Value {
+        json!({
+            CODEC_ENVELOPE_KEY: CODEC_ENVELOPE_VERSION_KEYED,
+            "codec_id": "xor",
+            "data": "AAAA",
+            CODEC_ENVELOPE_KID_KEY: "2026-q3",
+        })
+    }
+
+    #[test]
+    fn a_row_stored_before_this_fix_shipped_is_a_documented_residual_risk_not_a_fix() {
+        // This PR does not rewrite history. It pins that fact with a test,
+        // not only prose. A row written by the OLD `encode_payload` (no
+        // escape guard -- exactly what shipped before this fix) is
+        // byte-identical to `keyed_envelope_shaped_business_data()` itself.
+        // The old code stored colliding plaintext verbatim. Reading that
+        // already-stored row with the NEW `decode_payload` still classifies
+        // it as ciphertext, exactly as before. The ADR-0003 issue #1253
+        // addendum's "migration / compatibility story" is that this is a
+        // frozen, already-existing risk, not a new one. This fix does not,
+        // and cannot, resolve it for data already on disk.
+        let codecs = PayloadCodecs::default();
+        let row_from_before_this_fix = keyed_envelope_shaped_business_data();
+
+        let err = codecs.decode_payload(&row_from_before_this_fix).expect_err(
+            "a pre-fix stored row is indistinguishable from ciphertext by design -- \
+                 closing this for already-stored data needs a real migration, not this PR",
+        );
+        assert!(
+            matches!(err, HarvestError::UnknownCodecKey { .. }),
+            "{err:?}"
+        );
+    }
+
+    #[test]
+    fn keyed_envelope_shaped_plaintext_round_trips_through_identity_write_path() {
+        let codecs = PayloadCodecs::default();
+        let business_data = keyed_envelope_shaped_business_data();
+
+        let stored = codecs
+            .encode_payload(&business_data)
+            .expect("encode must not fail");
+        let read_back = codecs
+            .decode_payload(&stored)
+            .expect("must not raise UnknownCodecKey for business data");
+
+        assert_eq!(
+            read_back, business_data,
+            "envelope-shaped plaintext must survive the write path unchanged"
+        );
+    }
+
+    #[test]
+    fn legacy_envelope_shaped_plaintext_round_trips_through_identity_write_path() {
+        let codecs = PayloadCodecs::default();
+        let business_data = json!({
+            CODEC_ENVELOPE_KEY: CODEC_ENVELOPE_VERSION_LEGACY,
+            "codec_id": "xor",
+            "data": "AAAA",
+        });
+
+        let stored = codecs.encode_payload(&business_data).expect("encode");
+        let read_back = codecs.decode_payload(&stored).expect("decode");
+
+        assert_eq!(read_back, business_data);
+    }
+
+    #[test]
+    fn keyed_envelope_shaped_input_survives_a_full_event_round_trip() {
+        // The replay-fidelity version of the collision: a `WorkflowStarted`
+        // input this shape must not fail replay with `UnknownCodecKey`.
+        let codecs = PayloadCodecs::default();
+        let business_input = keyed_envelope_shaped_business_data();
+
+        let stored = codecs
+            .encode_event(&started(business_input.clone()))
+            .expect("encode");
+        match codecs.decode_event(stored).expect("decode must not error") {
+            crate::event::WorkflowEvent::WorkflowStarted { input, .. } => {
+                assert_eq!(input, business_input);
+            }
+            other => panic!("unexpected event: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_registered_key_matching_the_crafted_kid_still_does_not_decode_business_data() {
+        // The sharper form of the same hazard (issue #1253 review). The
+        // business data is written FIRST, while the deployment is still on
+        // the identity codec -- exactly the ADR's "written earlier under
+        // identity" scenario. An operator LATER activates key rotation,
+        // with a key id that coincidentally matches the crafted `kid`.
+        // Plaintext must still come back byte-identical, not the codec's
+        // output run over the business bytes. Registering the key before
+        // writing would make it the active key: the first registration
+        // auto-activates. That would take the real-encryption branch
+        // instead of the identity passthrough this test means to exercise.
+        // So the order here is load-bearing.
+        let codecs = PayloadCodecs::default();
+        let business_data = keyed_envelope_shaped_business_data();
+        let stored = codecs.encode_payload(&business_data).expect("encode");
+        assert_ne!(
+            stored, business_data,
+            "sanity: the colliding shape must have been escaped at write time"
+        );
+
+        codecs
+            .register_key("2026-q3", Arc::new(XorCodec(0x11)))
+            .expect("register");
+
+        let read_back = codecs.decode_payload(&stored).expect("decode");
+        assert_eq!(read_back, business_data);
+    }
+
+    #[test]
+    fn plaintext_already_shaped_like_the_escape_marker_still_round_trips() {
+        // The escape wrapper is itself a reserved shape. Business data that
+        // ALREADY happens to look like an escaped value must not collide with
+        // it -- escaping must be exact-inverse, not merely shape-avoiding.
+        let codecs = PayloadCodecs::default();
+        let business_data = json!({
+            "_harvest_codec_escaped": { "n": 1 },
+            "_harvest_codec_escaped_v": 1,
+        });
+
+        let stored = codecs.encode_payload(&business_data).expect("encode");
+        let read_back = codecs.decode_payload(&stored).expect("decode");
+
+        assert_eq!(read_back, business_data);
+    }
+
+    #[test]
+    fn a_lone_escape_key_without_its_companion_does_not_collide() {
+        // issue #1253 review: the wrapper needs BOTH reserved keys. A
+        // recursive reader that does not know payload field boundaries
+        // (`decode_value_lossy`) must not mistake a business field merely
+        // named `_harvest_codec_escaped` for a real escape wrapper.
+        let codecs = PayloadCodecs::default();
+        let business_data = json!({ "_harvest_codec_escaped": { "n": 1 } });
+
+        let stored = codecs.encode_payload(&business_data).expect("encode");
+
+        assert_eq!(
+            stored, business_data,
+            "one reserved key alone must not be treated as colliding"
+        );
+    }
+
+    #[test]
+    fn ordinary_plaintext_is_stored_byte_identical_under_identity_codec() {
+        // The escape guard must be a no-op for the overwhelming common case:
+        // plaintext that does not collide with any reserved shape.
+        let codecs = PayloadCodecs::default();
+        let business_data = json!({"user": "alice", "amount": 42});
+
+        let stored = codecs.encode_payload(&business_data).expect("encode");
+
+        assert_eq!(
+            stored, business_data,
+            "non-colliding plaintext must not be wrapped at all"
+        );
+    }
+
+    #[test]
+    fn decode_value_lossy_reverses_an_escaped_top_level_field() {
+        // issue #1253: `decode_value_lossy` is one of the three read paths
+        // that must reverse the write-time escape guard, not only the
+        // strict `decode_payload`.
+        let codecs = PayloadCodecs::default();
+        let business_data = keyed_envelope_shaped_business_data();
+        let stored = codecs.encode_payload(&business_data).expect("encode");
+        let mut value = serde_json::json!({ "input": stored, "meta": "untouched" });
+
+        let outcome = codecs.decode_value_lossy(&mut value);
+
+        assert_eq!(value["input"], business_data);
+        assert_eq!(value["meta"], "untouched");
+        assert_eq!(
+            outcome,
+            LossyDecodeOutcome::default(),
+            "unescaping restores plaintext -- it is not a codec decode"
+        );
+    }
+
+    #[test]
+    fn decode_error_string_lossy_reverses_an_escaped_value() {
+        // issue #1253: the third read path, for the TEXT `error` column.
+        let codecs = PayloadCodecs::default();
+        let business_data = keyed_envelope_shaped_business_data();
+        let stored = codecs.encode_payload(&business_data).expect("encode");
+        let raw = stored.to_string();
+
+        let (restored, outcome) = codecs.decode_error_string_lossy(&raw);
+
+        let restored_value: Value = serde_json::from_str(
+            restored
+                .as_deref()
+                .expect("an escaped value must decode to Some"),
+        )
+        .expect("restored text must be valid JSON");
+        assert_eq!(restored_value, business_data);
+        assert_eq!(outcome, LossyDecodeOutcome::default());
+    }
+
+    #[test]
+    fn encode_payload_never_escapes_under_a_real_codec() {
+        // issue #1253 review: escaping guards only the identity passthrough.
+        // Under real encryption the stored bytes are always a fresh,
+        // engine-built envelope. There is nothing for the escape guard to
+        // protect, regardless of what the plaintext looked like.
+        let mut codecs = PayloadCodecs::default();
+        codecs.set_default(Arc::new(ReverseCodec));
+        let business_data = keyed_envelope_shaped_business_data();
+
+        let stored = codecs.encode_payload(&business_data).expect("encode");
+
+        assert!(
+            stored.get(CODEC_MARKER_ESCAPE_KEY).is_none(),
+            "a real-codec envelope must never be escape-wrapped: {stored:?}"
+        );
+        assert_eq!(stored["codec_id"], "reverse");
+        let read_back = codecs.decode_payload(&stored).expect("decode");
+        assert_eq!(read_back, business_data);
     }
 
     #[test]

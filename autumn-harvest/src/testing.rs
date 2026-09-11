@@ -4472,13 +4472,18 @@ fn offloaded_fixture_reason(json: &str, snapshot: &HistorySnapshot) -> Option<St
 /// class as a redacted or offloaded bundle, same treatment: a harness error
 /// (exit 2) naming the fix.
 ///
-/// Two discriminators, because a payload can be opaque for two different
-/// reasons and both are equally un-replayable:
+/// Three discriminators, because a payload can be opaque for three different
+/// reasons and all are equally un-replayable:
 /// - [`CODEC_ENVELOPE_KEY`](crate::payload_codec::CODEC_ENVELOPE_KEY) — never
 ///   decoded (flag off, or the caller was not an admin).
 /// - [`UNDECODABLE_MARKER_KEY`](crate::payload_codec::UNDECODABLE_MARKER_KEY) —
 ///   a lossy decode *was* attempted and failed (unknown codec, bad base64,
 ///   codec error, invalid JSON), so the plaintext is gone either way.
+/// - [`CODEC_MARKER_ESCAPE_KEY`](crate::payload_codec::CODEC_MARKER_ESCAPE_KEY)
+///   (issue #1253) — the stored field is a write-time escape wrapper around
+///   business data that collided with a reserved shape. Recoverable with no
+///   codec registry at all, but this replayer does not run that unwrap. So
+///   it is opaque here too, for the same practical reason.
 ///
 /// Scoped to the payload-bearing fields of each event's `data` object — exactly
 /// where the codec transform writes — so business data nested deeper cannot
@@ -4554,17 +4559,24 @@ fn erased_fixture_reason(json: &str, snapshot: &HistorySnapshot) -> Option<Strin
 }
 
 fn codec_opaque_fixture_reason(json: &str, snapshot: &HistorySnapshot) -> Option<String> {
-    use crate::payload_codec::{CODEC_ENVELOPE_KEY, UNDECODABLE_MARKER_KEY};
+    use crate::payload_codec::{
+        CODEC_ENVELOPE_KEY, CODEC_MARKER_ESCAPE_KEY, UNDECODABLE_MARKER_KEY,
+    };
 
-    // Fast reject on the raw text first: both discriminators are fixed keys, so
-    // a substring miss proves neither is present without re-serializing a single
-    // event. Only a hit pays for the structured confirmation below.
-    if !json.contains(CODEC_ENVELOPE_KEY) && !json.contains(UNDECODABLE_MARKER_KEY) {
+    // Fast reject on the raw text first. All three discriminators are
+    // fixed keys, so a substring miss proves none is present without
+    // re-serializing a single event. Only a hit pays for the structured
+    // confirmation below.
+    if !json.contains(CODEC_ENVELOPE_KEY)
+        && !json.contains(UNDECODABLE_MARKER_KEY)
+        && !json.contains(CODEC_MARKER_ESCAPE_KEY)
+    {
         return None;
     }
 
     let mut envelopes = 0usize;
     let mut undecodable = 0usize;
+    let mut escaped = 0usize;
     for value in snapshot
         .events
         .iter()
@@ -4577,6 +4589,15 @@ fn codec_opaque_fixture_reason(json: &str, snapshot: &HistorySnapshot) -> Option
             let Some(field) = data.get(key) else { continue };
             if crate::payload_codec::is_codec_envelope(field) {
                 envelopes += 1;
+            } else if crate::payload_codec::is_escape_wrapper(field) {
+                // issue #1253: `encode_payload` wraps a whole payload field
+                // that would otherwise collide with a reserved shape. A
+                // raw JSON comparison against the wrapper is not the
+                // candidate's real value either, same as an undecoded
+                // envelope. This is so even though unwrapping it needs no codec
+                // registry, only `PayloadCodecs::decode_payload`, which
+                // this registry-free replayer does not run.
+                escaped += 1;
             } else if field
                 .as_object()
                 .is_some_and(|obj| obj.contains_key(UNDECODABLE_MARKER_KEY))
@@ -4585,16 +4606,17 @@ fn codec_opaque_fixture_reason(json: &str, snapshot: &HistorySnapshot) -> Option
             }
         }
     }
-    if envelopes == 0 && undecodable == 0 {
+    if envelopes == 0 && undecodable == 0 && escaped == 0 {
         // The key appeared in payload *data* rather than as a real envelope
         // (e.g. a workflow whose own JSON mentions it). Nothing to decode.
         return None;
     }
 
     Some(format!(
-        "fixture carries {envelopes} undecoded codec envelope(s) and {undecodable} \
-         undecodable-payload marker(s) (issue #608) instead of the real payloads, so \
-         replaying it would compare the candidate's real inputs against ciphertext and \
+        "fixture carries {envelopes} undecoded codec envelope(s), {undecodable} \
+         undecodable-payload marker(s) (issue #608), and {escaped} escaped \
+         envelope-collision marker(s) (issue #1253) instead of the real payloads, so \
+         replaying it would compare the candidate's real inputs against a placeholder and \
          report drift that does not exist. Re-export with payload decoding enabled \
          (`HarvestPlugin::decode_payloads_on_read()`, and call the route as an admin), \
          or run the gate against a deployment with no payload codec registered."
@@ -7642,6 +7664,53 @@ mod tests {
         assert!(
             reason.contains("erased-payload tombstone"),
             "the routed-through reason should be erased_fixture_reason's message, got: {reason:?}"
+        );
+    }
+
+    #[test]
+    fn opaque_payload_fixture_reason_detects_an_escaped_envelope_collision_marker() {
+        // issue #1253 review: an escape-wrapped field must be refused the
+        // same way an undecoded codec envelope is. A raw JSON comparison
+        // against the wrapper is not the candidate's real business value.
+        let codecs = crate::payload_codec::PayloadCodecs::default();
+        let colliding_input = serde_json::json!({
+            crate::payload_codec::CODEC_ENVELOPE_KEY: 1,
+            "codec_id": "xor",
+            "data": "AAAA",
+        });
+        let escaped_input = codecs
+            .encode_payload(&colliding_input)
+            .expect("encode must not fail");
+        assert!(
+            escaped_input
+                .get(crate::payload_codec::CODEC_MARKER_ESCAPE_KEY)
+                .is_some(),
+            "sanity: this input must actually collide and get escaped"
+        );
+
+        let snapshot = HistorySnapshot {
+            workflow_name: "escaped_wf".to_string(),
+            execution_id: ExecutionId::new(),
+            events: vec![WorkflowEvent::WorkflowStarted {
+                input: escaped_input,
+                timestamp: Utc::now(),
+                last_completion_result: None,
+                last_error: None,
+                scheduled_time: None,
+            }],
+            context_headers: None,
+            execution_timeout: None,
+            deadline_at: None,
+            parent_execution_id: None,
+            workflow_id: None,
+            queue_name: None,
+        };
+        let json = serde_json::to_string(&snapshot).unwrap();
+        let reason = opaque_payload_fixture_reason(&json, &snapshot)
+            .expect("an escaped envelope-collision marker must be refused, not silently replayed");
+        assert!(
+            reason.contains("escaped envelope-collision marker"),
+            "got: {reason:?}"
         );
     }
 }
