@@ -1486,10 +1486,8 @@ mod tests {
                     row("wf_a", "tenant-1"),
                 ]);
 
-                let forward_keys: Vec<_> =
-                    forward.iter().map(resolve_row_quota_lock_key).collect();
-                let reverse_keys: Vec<_> =
-                    reverse.iter().map(resolve_row_quota_lock_key).collect();
+                let forward_keys: Vec<_> = forward.iter().map(resolve_row_quota_lock_key).collect();
+                let reverse_keys: Vec<_> = reverse.iter().map(resolve_row_quota_lock_key).collect();
 
                 assert_eq!(forward_keys, reverse_keys);
                 assert_eq!(
