@@ -2472,26 +2472,54 @@ async fn clear_start_throttle_pacing_override_reports_router_known_shard_with_no
 }
 
 // A total outage (every expected shard unreachable) must still fail closed
-// with a `503`, the same as it did before the fan-out fix. The fix folds a
-// missing pool into `shard_errors` alongside a live-but-dead pool; these
-// tests prove that never degrades a total outage into a false success.
+// with a `503` naming the unreachable shard(s). That matches its behavior
+// before the fan-out fix.
+//
+// These tests must NOT use an unreachable pool (a dead port) for the
+// outage. `HarvestDbPool::default_pool()` is the pool the audit write below
+// the shard loop uses. It resolves through the same `ShardedDbPool` the
+// fan-out reads via `pools_by_shard`/`expected_shards` (`state.rs`). A
+// single-shard fixture has only one pool. An unreachable pool kills the
+// audit connection too. The handler then 503s on "audit DB connection
+// unavailable". It never reaches the `{"errors": shard_errors}` branch this
+// PR's fix touches. A Codex review comment on this PR (issue #1229) caught
+// that. An earlier version of these tests used `dead_pool()` and asserted
+// only `body.get("errors").is_some()`. That wrong-branch response also
+// satisfies this assertion. Its problem-details envelope carries an
+// unrelated, always-present, empty `errors` field.
+//
+// Instead the fixture stays on ONE live, reachable connection, so the audit
+// write still succeeds. It drops `harvest_rate_limit_buckets`, the table
+// both the rate-limit and start-throttle bucket queries share (keyed by
+// `throttle::bucket_key`). So only the shard WRITE query fails. That
+// reaches the exact branch under test.
 
-fn single_dead_shard() -> (HarvestDbPool, ShardRouter) {
+async fn single_shard_with_bucket_table_dropped()
+-> (HarvestDbPool, ShardRouter, Option<ContainerAsync<Postgres>>) {
+    let (url, container) = setup_one_shard().await;
+    let pool = build_pool(&url);
+    {
+        let mut conn = pool.get().await.expect("pooled conn");
+        diesel::sql_query("DROP TABLE harvest_rate_limit_buckets")
+            .execute(&mut conn)
+            .await
+            .expect("drop the bucket table to fail the shard write, not the connection");
+    }
     let mut pools = BTreeMap::new();
-    pools.insert(ShardId::new(0), dead_pool());
+    pools.insert(ShardId::new(0), pool);
     let sharded_pool = ShardedDbPool::from_map(pools, ShardId::new(0));
     let router = ShardRouter::new(
         vec![ShardId::new(0)],
         vec![ShardId::new(0)],
         ShardId::new(0),
     );
-    (HarvestDbPool::sharded(sharded_pool), router)
+    (HarvestDbPool::sharded(sharded_pool), router, container)
 }
 
 #[tokio::test]
 async fn set_rate_limit_pacing_override_returns_503_on_total_shard_outage() {
     let name = leaked_name("send_email");
-    let (pool, router) = single_dead_shard();
+    let (pool, router, _container) = single_shard_with_bucket_table_dropped().await;
     let app = build_sharded_app(
         pool,
         router,
@@ -2512,7 +2540,9 @@ async fn set_rate_limit_pacing_override_returns_503_on_total_shard_outage() {
         "a total shard outage must fail closed, not report a false success: {body}"
     );
     assert!(
-        body.get("errors").is_some(),
+        body["errors"]
+            .as_array()
+            .is_some_and(|errs| !errs.is_empty()),
         "503 body should name the unreachable shard(s): {body}"
     );
 }
@@ -2520,7 +2550,7 @@ async fn set_rate_limit_pacing_override_returns_503_on_total_shard_outage() {
 #[tokio::test]
 async fn clear_rate_limit_pacing_override_returns_503_on_total_shard_outage() {
     let name = leaked_name("send_email");
-    let (pool, router) = single_dead_shard();
+    let (pool, router, _container) = single_shard_with_bucket_table_dropped().await;
     let app = build_sharded_app(
         pool,
         router,
@@ -2536,7 +2566,9 @@ async fn clear_rate_limit_pacing_override_returns_503_on_total_shard_outage() {
         "a total shard outage must fail closed, not report a false success: {body}"
     );
     assert!(
-        body.get("errors").is_some(),
+        body["errors"]
+            .as_array()
+            .is_some_and(|errs| !errs.is_empty()),
         "503 body should name the unreachable shard(s): {body}"
     );
 }
@@ -2544,7 +2576,7 @@ async fn clear_rate_limit_pacing_override_returns_503_on_total_shard_outage() {
 #[tokio::test]
 async fn set_start_throttle_pacing_override_returns_503_on_total_shard_outage() {
     let name = leaked_name("onboard_user");
-    let (pool, router) = single_dead_shard();
+    let (pool, router, _container) = single_shard_with_bucket_table_dropped().await;
     let app = build_sharded_app(
         pool,
         router,
@@ -2565,7 +2597,9 @@ async fn set_start_throttle_pacing_override_returns_503_on_total_shard_outage() 
         "a total shard outage must fail closed, not report a false success: {body}"
     );
     assert!(
-        body.get("errors").is_some(),
+        body["errors"]
+            .as_array()
+            .is_some_and(|errs| !errs.is_empty()),
         "503 body should name the unreachable shard(s): {body}"
     );
 }
@@ -2573,7 +2607,7 @@ async fn set_start_throttle_pacing_override_returns_503_on_total_shard_outage() 
 #[tokio::test]
 async fn clear_start_throttle_pacing_override_returns_503_on_total_shard_outage() {
     let name = leaked_name("onboard_user");
-    let (pool, router) = single_dead_shard();
+    let (pool, router, _container) = single_shard_with_bucket_table_dropped().await;
     let app = build_sharded_app(
         pool,
         router,
@@ -2589,7 +2623,9 @@ async fn clear_start_throttle_pacing_override_returns_503_on_total_shard_outage(
         "a total shard outage must fail closed, not report a false success: {body}"
     );
     assert!(
-        body.get("errors").is_some(),
+        body["errors"]
+            .as_array()
+            .is_some_and(|errs| !errs.is_empty()),
         "503 body should name the unreachable shard(s): {body}"
     );
 }
