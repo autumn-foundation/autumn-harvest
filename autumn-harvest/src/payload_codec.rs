@@ -680,10 +680,10 @@ impl PayloadCodecs {
     /// of the batch under that exact id (see
     /// [`crate::codec_rotation::reencrypt_event_payload_fields_under`]). Without
     /// a pin, a second rotation can move the active key away from the batch's
-    /// target *while the batch is still running*, and
-    /// [`PayloadCodecs::retire_key_local`] can then drop that target — its own
-    /// census reads zero rows because the batch has not committed yet. The next
-    /// row the batch writes then lands under a key that no longer has a
+    /// target *while the batch is still running*.
+    /// [`PayloadCodecs::retire_key_local`] can then drop that target. Its own
+    /// census reads zero rows, because the batch has not committed yet. The
+    /// next row the batch writes then lands under a key that no longer has a
     /// decoder anywhere: silent, permanent data loss.
     ///
     /// Call this once per batch, right after resolving the target key id, and
@@ -692,6 +692,12 @@ impl PayloadCodecs {
     ///
     /// Several batches — one per shard, say — may pin the same key id at once;
     /// the pin is a count, not a flag.
+    ///
+    /// `#[doc(hidden)] pub` rather than `pub(crate)`: the batch-oriented
+    /// public sweep entry point calls this internally, but the race this
+    /// guards is exercised directly by an integration test outside this
+    /// crate. Not part of the semver-stable surface.
+    #[doc(hidden)]
     #[must_use = "dropping the guard immediately un-pins the key"]
     pub fn pin_key_for_sweep(&self, key_id: &str) -> SweepKeyPin {
         let mut guard = self.keys_write();
@@ -705,9 +711,9 @@ impl PayloadCodecs {
 
     /// Release one pin taken by [`PayloadCodecs::pin_key_for_sweep`].
     ///
-    /// Only [`SweepKeyPin::drop`] calls this, so a pin always releases even
-    /// when its batch returns early on an error — an unpin lost to a failed
-    /// batch would block that key's retirement forever.
+    /// Only [`SweepKeyPin::drop`] calls this. A pin therefore always
+    /// releases, even when its batch returns early on an error. An unpin
+    /// lost to a failed batch would block that key's retirement forever.
     fn unpin_key_for_sweep(&self, key_id: &str) {
         let mut guard = self.keys_write();
         if let Some(count) = guard.sweep_pins.get_mut(key_id) {
@@ -721,6 +727,10 @@ impl PayloadCodecs {
 
     /// Whether an in-flight sweep batch currently holds a pin on `key_id`
     /// (issue #1251). See [`PayloadCodecs::pin_key_for_sweep`].
+    ///
+    /// `#[doc(hidden)] pub` for the same reason as `pin_key_for_sweep`: an
+    /// integration test outside this crate asserts on it directly.
+    #[doc(hidden)]
     #[must_use]
     pub fn is_pinned_by_sweep(&self, key_id: &str) -> bool {
         self.keys_read().sweep_pins.contains_key(key_id)
@@ -735,10 +745,10 @@ impl PayloadCodecs {
     ///
     /// # Errors
     ///
-    /// [`HarvestError::Config`] when `key_id` is the active key — retiring the
+    /// [`HarvestError::Config`] when `key_id` is the active key. Retiring the
     /// key new writes are being encoded under would immediately produce
-    /// undecodable history — or when a sweep batch holds a pin on it (issue
-    /// #1251; see [`PayloadCodecs::pin_key_for_sweep`]).
+    /// undecodable history. The same error applies when a sweep batch holds
+    /// a pin on it (issue #1251; see [`PayloadCodecs::pin_key_for_sweep`]).
     pub fn retire_key_local(&self, key_id: &str) -> HarvestResult<()> {
         let mut guard = self.keys_write();
         if guard.sweep_pins.contains_key(key_id) {
@@ -1267,9 +1277,9 @@ impl PayloadCodecs {
 /// RAII guard returned by [`PayloadCodecs::pin_key_for_sweep`] (issue #1251).
 ///
 /// Holds one key id pinned against retirement for as long as the guard lives.
-/// Dropping it — on the happy path or on an early return from a batch that
-/// hit an error — always releases the pin, so a failed batch can never leave
-/// a key permanently unretirable.
+/// Dropping it always releases the pin — on the happy path, and on an early
+/// return from a batch that hit an error. A failed batch can therefore
+/// never leave a key permanently unretirable.
 #[must_use = "the key is pinned only while this guard is alive; dropping it immediately un-pins"]
 pub struct SweepKeyPin {
     codecs: PayloadCodecs,
@@ -2563,10 +2573,10 @@ mod tests {
         assert!(codecs.codec_for_key("k1").is_none());
     }
 
-    /// Issue #1251: a sweep batch pins the key it is writing onto, and
-    /// retirement must refuse that key while the pin holds -- even though a
-    /// zero census (no rows committed under it yet) would otherwise say it
-    /// is safe.
+    /// Issue #1251: a sweep batch pins the key it is writing onto.
+    /// Retirement must refuse that key while the pin holds. That holds even
+    /// though a zero census -- no rows committed under it yet -- would
+    /// otherwise say it is safe.
     #[test]
     fn retire_key_local_refuses_a_key_pinned_by_a_sweep_batch() {
         let codecs = PayloadCodecs::default();

@@ -1165,7 +1165,7 @@ async fn a_batch_pinned_to_a_key_blocks_its_retirement_through_a_double_rotation
     );
 
     // Once the batch finishes and releases its pin, the ordinary census-based
-    // gate takes back over -- and correctly refuses for the ordinary reason,
+    // gate takes back over. It correctly refuses for the ordinary reason,
     // because a row genuinely references k2 now.
     drop(pin);
     assert!(!codecs.is_pinned_by_sweep("k2"));
@@ -1183,7 +1183,7 @@ async fn a_batch_pinned_to_a_key_blocks_its_retirement_through_a_double_rotation
         "the refusal reason must now be the ordinary census, not the pin: {err:?}"
     );
 
-    // A later pass converges the row onto the current active key, and only
+    // A later pass converges the row onto the current active key. Only
     // then does retirement of k2 succeed -- the fix does not deadlock it.
     sweep_codec_reencryption_once(&mut conn, 0, &codecs, 100, &NoOpMetrics)
         .await
