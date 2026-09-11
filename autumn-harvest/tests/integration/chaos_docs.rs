@@ -268,19 +268,28 @@ fn local_iteration_example_is_scoped_to_chaos_tests_module() {
 /// that echoes the command before executing it. Picking the first one
 /// would risk comparing against a stale logged command instead of the
 /// one cargo actually runs.
+///
+/// A lone `\` right after `flag` is not a real boundary either. Bash
+/// escapes the next character instead of separating words.
+/// `--test integration\ chaos_tests::` glues `integration` and the rest
+/// into ONE escaped-space argument, not a flag followed by a filter.
 fn find_flag_end(command: &str, flag: &str) -> Option<usize> {
     let before_ok = |prefix: &str| match prefix.chars().next_back() {
         None => true,
         Some('\n') => prefix.ends_with("\\\n"),
         Some(c) => c.is_whitespace(),
     };
-    let after_ok = |c: char| c.is_whitespace() || c == '\\';
+    let after_ok = |suffix: &str| match suffix.chars().next() {
+        None => true,
+        Some('\\') => suffix.starts_with("\\\n"),
+        Some(c) => c.is_whitespace(),
+    };
     let mut search_from = 0;
     let mut found = None::<usize>;
     while let Some(rel) = command[search_from..].find(flag) {
         let start = search_from + rel;
         let end = start + flag.len();
-        if before_ok(&command[..start]) && command[end..].chars().next().is_none_or(after_ok) {
+        if before_ok(&command[..start]) && after_ok(&command[end..]) {
             assert!(
                 found.is_none(),
                 "multiple {flag:?} occurrences in command, ambiguous which \
@@ -454,6 +463,17 @@ fn extract_filter_argument_panics_on_multiple_flag_occurrences() {
     extract_filter_argument(
         "echo cargo test --test integration chaos_tests:: && cargo test --test integration chaos_tests::specific",
     );
+}
+
+#[test]
+#[should_panic(expected = "command has no")]
+fn extract_filter_argument_rejects_a_lone_backslash_after_the_flag() {
+    // Codex finding on PR #1474: bash escapes the space after a lone
+    // `\`. `--test integration\ chaos_tests::specific` is ONE argument
+    // to cargo, not a flag followed by a filter. The guard must not
+    // treat that `\` as a boundary just because `skip_continuation_gap`
+    // never consumed it.
+    extract_filter_argument("cargo test --test integration\\ chaos_tests::specific");
 }
 
 #[test]
@@ -664,8 +684,9 @@ fn step_stanza_covers_keys_written_after_run() {
     );
 }
 
-/// The step stanza's `run:` value, from the `run:` key to the end of the
-/// stanza.
+/// The step stanza's `run:` value. Starts at the `run:` key. Ends at
+/// the line before the next sibling key at the same indentation, or at
+/// the end of the stanza.
 ///
 /// A step's `- name:` line can itself contain text that reads like
 /// `--test integration <filter>`, e.g. a name describing the check the
@@ -673,16 +694,35 @@ fn step_stanza_covers_keys_written_after_run() {
 /// Passing the whole stanza risks matching that prose instead of the
 /// real command. That could mask a real divergence if the `run:` line
 /// has since narrowed. Anchoring to `run:` specifically rules that out.
+///
+/// The end bound matters too: a sibling key after `run:` (`env:`,
+/// `if:`, ...) is not part of the run value. A more-indented line is a
+/// continuation of `run:`'s own value. A line at the same or shallower
+/// indentation is the next key. It ends the slice.
 fn run_command(stanza: &str) -> &str {
     let mut offset = 0;
+    let mut run: Option<(usize, usize)> = None;
     for line in stanza.split_inclusive('\n') {
         let trimmed = line.trim_start();
-        if trimmed.starts_with("run:") {
-            return &stanza[offset + (line.len() - trimmed.len())..];
+        let indent = line.len() - trimmed.len();
+        match run {
+            None => {
+                if trimmed.starts_with("run:") {
+                    run = Some((offset + indent, indent));
+                }
+            }
+            Some((start, run_indent)) => {
+                if !trimmed.trim_end().is_empty() && indent <= run_indent {
+                    return &stanza[start..offset];
+                }
+            }
         }
         offset += line.len();
     }
-    panic!("stanza has no `run:` key: {stanza}");
+    match run {
+        Some((start, _)) => &stanza[start..],
+        None => panic!("stanza has no `run:` key: {stanza}"),
+    }
 }
 
 #[test]
@@ -695,6 +735,19 @@ fn run_command_skips_a_look_alike_filter_in_the_step_name() {
         extract_filter_argument(run_command(stanza)),
         "chaos_tests::specific"
     );
+}
+
+#[test]
+#[should_panic(expected = "command has no")]
+fn run_command_excludes_a_sibling_key_after_run() {
+    // Codex finding on PR #1474: a sibling key after `run:` (here
+    // `env:`) is not part of the run value. That holds even if its text
+    // reads like a broader `--test integration` filter. The real run:
+    // command uses an unsupported target name here
+    // (`integration_tests`). It must fail loudly on that, not silently
+    // succeed by reading past it into the env: block.
+    let stanza = "\n      - name: Run chaos reproducers\n        run: cargo test --features chaos --test integration_tests chaos_tests::specific\n        env:\n          NOTE: \"--test integration chaos_tests::\"\n";
+    extract_filter_argument(run_command(stanza));
 }
 
 /// This module's own guards must run on a docs-only PR, where the `test`

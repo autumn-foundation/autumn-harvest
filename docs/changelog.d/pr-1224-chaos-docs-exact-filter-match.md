@@ -128,10 +128,26 @@ issue #1202 as P2 round 4).
   command, when it finds more than one boundary-valid occurrence,
   instead of guessing which one is real. Fixture test confirmed against
   an echoed-then-executed command with two different filters.
+- An eighth Codex round found two more gaps in the same family. (1)
+  `find_flag_end`'s AFTER-boundary check still accepted a lone `\` --
+  the same class of bug fixed for the BEFORE-check in round 5, now
+  found on the other side: bash escapes the next character after a lone
+  `\` instead of separating words, so `--test integration\
+  chaos_tests::specific` is one argument to cargo, not a flag plus a
+  filter. `after_ok` now mirrors `before_ok`'s "whitespace, or the exact
+  `\` + newline ending of a real continuation" rule. (2) `run_command`
+  (round 6) returned everything from `run:` to the end of the stanza,
+  which could include a sibling key after it (`env:`, `if:`, ...) whose
+  text reads like a filter. It now stops at the first line indented no
+  deeper than `run:` itself -- a sibling key, not a continuation of
+  `run:`'s own value -- mirroring how `workflow_step_stanza` already
+  stops at the next step. Both are fixture tests, confirmed against a
+  glued-backslash-then-space command and a step with a misleading `env:`
+  block.
 
 No production code changed — `chaos_docs.rs` is a test-only doc/CI parity
 guard behind no feature flag. `cargo test -p autumn-harvest --test
-integration chaos_docs::` (25/25), `cargo fmt -p autumn-harvest -- --check`,
+integration chaos_docs::` (27/27), `cargo fmt -p autumn-harvest -- --check`,
 `cargo clippy -p autumn-harvest --all-features --tests -- -D warnings`,
 and `python3 docs/audits/comment-hygiene.py --base origin/trunk-dev` are
 all clean.
