@@ -1694,6 +1694,7 @@ fn known_limitations_documents_the_pause_array_size_finding() {
 struct SummaryRow {
     predicate: String,
     ballast: u32,
+    array_size: u32,
     backlog: u32,
     sort_method: String,
     disk_kb: Option<u32>,
@@ -1729,6 +1730,9 @@ fn parse_summary_row(line: &str) -> SummaryRow {
         ballast: field_after(line, "ballast=")
             .parse()
             .unwrap_or_else(|_| panic!("could not parse ballast out of: {line}")),
+        array_size: field_after(line, "array_size=")
+            .parse()
+            .unwrap_or_else(|_| panic!("could not parse array_size out of: {line}")),
         backlog: field_after(line, "backlog=")
             .parse()
             .unwrap_or_else(|_| panic!("could not parse backlog out of: {line}")),
@@ -1738,14 +1742,35 @@ fn parse_summary_row(line: &str) -> SummaryRow {
 }
 
 /// One row of the doc's pause-array-size table, keyed the same way.
-/// `ballast_sizes` holds every seeded-pause count the row covers -- several
-/// rows collapse a shared outcome across sizes (`0 / 1 / 20`).
+/// `ballast_sizes` holds every seeded-pause count the row covers. Several
+/// rows collapse a shared outcome across sizes (`0 / 1 / 20`). `array_sizes`
+/// holds the materialized array size claimed for each of those same
+/// entries, in the same order. A single-value column broadcasts to every
+/// ballast entry: the typical-worker row claims array size 0 for all four.
 struct DocRow {
     predicate: String,
     backlog: u32,
     ballast_sizes: Vec<u32>,
+    array_sizes: Vec<u32>,
     sort_method: String,
     disk_kb: Option<u32>,
+}
+
+/// A table cell holding one or more `/`-separated numbers, each optionally
+/// followed by trailing prose (`0 (none of these ballast queues ...)`).
+fn parse_number_list_cell(cell: &str, line: &str) -> Vec<u32> {
+    cell.split('/')
+        .map(|entry| {
+            let digits: String = entry
+                .trim()
+                .chars()
+                .take_while(char::is_ascii_digit)
+                .collect();
+            digits.parse().unwrap_or_else(|_| {
+                panic!("could not parse a number out of table cell {cell:?}: {line}")
+            })
+        })
+        .collect()
 }
 
 fn parse_doc_row(line: &str) -> DocRow {
@@ -1760,8 +1785,8 @@ fn parse_doc_row(line: &str) -> DocRow {
         "pause-array-size table row does not have 6 columns, the table \
          gained or lost a column: {line}"
     );
-    let (predicate_cell, backlog_cell, bind_cell, ballast_cell, sort_cell) =
-        (cells[0], cells[1], cells[2], cells[3], cells[5]);
+    let (predicate_cell, backlog_cell, bind_cell, ballast_cell, array_size_cell, sort_cell) =
+        (cells[0], cells[1], cells[2], cells[3], cells[4], cells[5]);
 
     let predicate = if predicate_cell.contains("paused_activities") {
         "activity-pause"
@@ -1778,14 +1803,20 @@ fn parse_doc_row(line: &str) -> DocRow {
         .replace(' ', "")
         .parse()
         .unwrap_or_else(|_| panic!("could not parse the backlog column out of: {line}"));
-    let ballast_sizes: Vec<u32> = ballast_cell
-        .split('/')
-        .map(|s| {
-            s.trim()
-                .parse()
-                .unwrap_or_else(|_| panic!("could not parse a ballast count out of: {line}"))
-        })
-        .collect();
+    let ballast_sizes = parse_number_list_cell(ballast_cell, line);
+    let array_sizes_raw = parse_number_list_cell(array_size_cell, line);
+    let array_sizes: Vec<u32> = if array_sizes_raw.len() == 1 {
+        vec![array_sizes_raw[0]; ballast_sizes.len()]
+    } else if array_sizes_raw.len() == ballast_sizes.len() {
+        array_sizes_raw
+    } else {
+        panic!(
+            "pause-array-size table row's ballast column ({} entries) and \
+             array-size column ({} entries) do not line up: {line}",
+            ballast_sizes.len(),
+            array_sizes_raw.len()
+        )
+    };
 
     let sort_method = sort_cell
         .split(',')
@@ -1820,6 +1851,7 @@ fn parse_doc_row(line: &str) -> DocRow {
         predicate,
         backlog,
         ballast_sizes,
+        array_sizes,
         sort_method,
         disk_kb,
     }
@@ -1847,6 +1879,15 @@ fn parse_doc_row(line: &str) -> DocRow {
 /// heapsort`, would still show `disk_kb: None` on both sides and pass.
 /// This also compares the sort method name itself, not only whether it
 /// spilled.
+///
+/// A fourth round found the doc table's own materialized-array-size
+/// column was parsed and thrown away: nothing compared it to anything.
+/// That column was added to stop the table implying a 199-element array
+/// stays in memory. Regressing it back to 199 for the typical-worker row
+/// left this guard green as long as ballast and sort method stayed put.
+/// That is exactly what the column exists to prevent. This now parses
+/// and compares it too, against a matching `array_size=` field this guard
+/// added to the raw summary alongside `ballast=`.
 #[test]
 fn pause_array_size_table_matches_the_committed_summary() {
     let doc = read_performance_doc();
@@ -1877,7 +1918,7 @@ fn pause_array_size_table_matches_the_committed_summary() {
         .filter(|l| l.trim_start().starts_with('|'))
     {
         let doc_row = parse_doc_row(line);
-        for ballast in &doc_row.ballast_sizes {
+        for (ballast, array_size) in doc_row.ballast_sizes.iter().zip(&doc_row.array_sizes) {
             doc_ballast_entries += 1;
             let key_desc = format!(
                 "predicate={} ballast={ballast} backlog={}",
@@ -1899,6 +1940,13 @@ fn pause_array_size_table_matches_the_committed_summary() {
                     )
                 });
             matched[idx] = true;
+            assert_eq!(
+                *array_size, summary_row.array_size,
+                "docs/performance.md's row for {key_desc} claims a \
+                 materialized array size of {array_size}, but the \
+                 committed summary reports {} for this exact row",
+                summary_row.array_size
+            );
             assert_eq!(
                 doc_row.sort_method, summary_row.sort_method,
                 "docs/performance.md's row for {key_desc} names sort method \
