@@ -648,7 +648,6 @@ async fn over_deadline_child_completion_orders_deadline_first_and_resolves_none(
         parent_exec_id,
         child_exec_id,
         serde_json::json!({"processed": true}),
-        &autumn_harvest::payload_codec::PayloadCodecs::default(),
     )
     .await
     .expect("wake parent for child completion");

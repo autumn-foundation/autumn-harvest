@@ -834,18 +834,6 @@ impl PayloadCodecs {
         // output carried; it is unique to WorkflowStarted among event variants.
         for key in crate::payload_store::PAYLOAD_FIELD_KEYS {
             if let Some(payload) = data.get_mut(key) {
-                // Issue #1243 review: offload composes AFTER codec encode
-                // (see `PayloadOffloader::offload_event_value`). A
-                // continue-as-new carryover (issue #524) can forward an
-                // offload reference verbatim, and that reference already
-                // holds a blob pointer, not ciphertext. Encoding it here
-                // would encrypt the pointer instead of the payload and hide
-                // it from the offloader's own already-offloaded check. Skip
-                // it, matching the re-encryption sweep's identical guard in
-                // `codec_rotation.rs`.
-                if encode && crate::payload_store::is_offload_envelope(payload) {
-                    continue;
-                }
                 if encode {
                     *payload = self.encode_payload(payload)?;
                 } else {
@@ -1255,6 +1243,35 @@ mod tests {
             }
             _ => panic!("unexpected event"),
         }
+    }
+
+    #[test]
+    fn a_payload_shaped_like_an_offload_envelope_is_still_encoded() {
+        // Issue #1243 review (P1, Codex): the codec boundary must stay
+        // unconditional. A workflow's own input can legally contain any
+        // JSON shape, including one that happens to carry the offload
+        // discriminator key. Nothing may use that shape as a signal to
+        // skip encoding -- doing so would store the field in plaintext
+        // under a real codec.
+        let mut codecs = PayloadCodecs::default();
+        codecs.set_default(Arc::new(ReverseCodec));
+
+        let event = crate::event::WorkflowEvent::WorkflowStarted {
+            input: serde_json::json!({
+                "_harvest_offload_envelope": 1,
+                "secret": "still must be encoded",
+            }),
+            timestamp: chrono::Utc::now(),
+            last_completion_result: None,
+            last_error: None,
+            scheduled_time: None,
+        };
+
+        let encoded = codecs.encode_event(&event).expect("encode");
+        assert_eq!(
+            encoded["data"]["input"]["_harvest_codec_envelope"], 1,
+            "an offload-shaped user payload must still be wrapped in a codec envelope: {encoded}"
+        );
     }
 
     #[test]

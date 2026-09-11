@@ -12347,13 +12347,43 @@ pub fn parent_is_on_another_shard(parent: ExecutionId, child: ExecutionId) -> bo
     child_shard != parent_shard
 }
 
+/// Append `ChildWorkflowCompleted` and wake the parent's workflow task.
+///
+/// Delegates to [`wake_parent_for_child_completion_with_codecs`] under the
+/// identity registry (issue #1243 review, P2). A payload-bearing call site
+/// should use the `_with_codecs` sibling instead. This wrapper keeps the
+/// pre-#1243 public signature for an out-of-tree caller.
+///
+/// # Errors
+///
+/// Same as [`wake_parent_for_child_completion_with_codecs`].
 pub async fn wake_parent_for_child_completion(
     conn: &mut AsyncPgConnection,
     parent_exec_id: ExecutionId,
     child_exec_id: ExecutionId,
     output: serde_json::Value,
-    // Issue #1243: `ChildWorkflowCompleted.output` is payload-bearing, so this
-    // write encodes under the same registry replay decodes with.
+) -> HarvestResult<()> {
+    wake_parent_for_child_completion_with_codecs(
+        conn,
+        parent_exec_id,
+        child_exec_id,
+        output,
+        &crate::store::DEFAULT_PAYLOAD_CODECS,
+    )
+    .await
+}
+
+/// [`wake_parent_for_child_completion`], encoding
+/// `ChildWorkflowCompleted.output` through `codecs` (issue #1243).
+///
+/// # Errors
+///
+/// Same as [`wake_parent_for_child_completion`].
+pub async fn wake_parent_for_child_completion_with_codecs(
+    conn: &mut AsyncPgConnection,
+    parent_exec_id: ExecutionId,
+    child_exec_id: ExecutionId,
+    output: serde_json::Value,
     codecs: &crate::payload_codec::PayloadCodecs,
 ) -> HarvestResult<()> {
     // Issue #956: a cross-shard parent is not on this connection. Appending to it
@@ -12469,7 +12499,14 @@ pub async fn persist_child_workflow_completion(
                 )
                 .await?;
             deferred.extend(triggers);
-            wake_parent_for_child_completion(conn, parent_exec_id, exec_id, output, codecs).await?;
+            wake_parent_for_child_completion_with_codecs(
+                conn,
+                parent_exec_id,
+                exec_id,
+                output,
+                codecs,
+            )
+            .await?;
             Ok((deferred, closed_children, tx_cancel_metrics))
         }))
         .await?;
@@ -16686,7 +16723,7 @@ pub async fn persist_workflow_continue_as_new(
     input: serde_json::Value,
     new_workflow_type: Option<String>,
 ) -> HarvestResult<bool> {
-    use crate::schema::{harvest_signals, harvest_workflow_executions};
+    use crate::schema::{harvest_events, harvest_signals, harvest_workflow_executions};
 
     let offloader = registry.payload_offloader();
 
@@ -16778,16 +16815,20 @@ pub async fn persist_workflow_continue_as_new(
     let carried_lcr_ref = raw_carryover
         .as_ref()
         .and_then(crate::payload_store::extract_offload_ref);
-    // Issue #1243 review: `raw_carryover` is the STORED representation, a
-    // codec envelope under a real codec. `decode_payload` leaves an offload
-    // reference untouched, so the blob-forwarding path above still applies.
-    // It returns plaintext unchanged too. So it only unwraps an inline codec
-    // envelope -- exactly the case that needs one decode before the
+    // Issue #1243 review (P1): the generic codec boundary stays
+    // unconditional for every ordinary payload field. An offload reference
+    // is patched into the successor raw, after the write below. It never
+    // goes through `encode_payload`. `raw_carryover` is otherwise the
+    // STORED representation, a codec envelope under a real codec.
+    // `decode_payload` passes a non-codec value through unchanged, an
+    // offload reference included. So it only unwraps an inline codec
+    // envelope. That is exactly the case that needs one decode before the
     // successor's write re-encodes it once.
-    let raw_carryover = raw_carryover
+    let decoded_carryover = raw_carryover
+        .clone()
         .map(|value| registry.payload_codecs().decode_payload(&value))
         .transpose()?;
-    let carryover_for_event = raw_carryover.or_else(|| persistence.carryover_result.clone());
+    let carryover_for_event = decoded_carryover.or_else(|| persistence.carryover_result.clone());
 
     // The new execution stays on the same shard so all of its event log,
     // queue rows, timers, and signals continue to live in the same Postgres
@@ -16814,7 +16855,15 @@ pub async fn persist_workflow_continue_as_new(
         // Preserve scheduled carryover across the fork (issue #488): the continuation is
         // the same logical scheduled run, so it must see the same frozen values rather
         // than re-resolving (which could pick up a newer sibling fire's output).
-        last_completion_result: carryover_for_event,
+        //
+        // Issue #1243 review (P1): an offloaded carryover (`carried_lcr_ref`
+        // is `Some`) is patched in raw after this event is written, bypassing
+        // the codec. `None` here is only a placeholder for that case.
+        last_completion_result: if carried_lcr_ref.is_some() {
+            None
+        } else {
+            carryover_for_event
+        },
         last_error: persistence.carryover_error.clone(),
         // Preserve the nominal scheduled slot across the fork (issue #508): a continued
         // run is the same logical scheduled run and must see the same slot. The row
@@ -17097,6 +17146,34 @@ pub async fn persist_workflow_continue_as_new(
         // blob survives until the successor is also retained (issue #524).
         if let Some(ref carried) = carried_lcr_ref {
             store::insert_payload_refs(conn, new_exec_id, std::slice::from_ref(carried)).await?;
+            // Issue #1243 review (P1): patch the offload reference into the
+            // row the write above just inserted with a `None` placeholder.
+            // This never goes through `encode_payload` -- the reference is
+            // a blob pointer, not ciphertext, and it must reach storage
+            // byte-identical to the predecessor's copy. Mirrors the raw
+            // `event_data` patch `erase.rs` uses for the same reason.
+            let raw_value = raw_carryover.clone().expect(
+                "carried_lcr_ref is Some only when raw_carryover parsed as an offload envelope",
+            );
+            let mut event_data: serde_json::Value = harvest_events::table
+                .filter(harvest_events::workflow_exec_id.eq(new_exec_id.as_uuid()))
+                .filter(harvest_events::event_id.eq(0))
+                .select(harvest_events::event_data)
+                .first(conn)
+                .await
+                .map_err(crate::error::database_error)?;
+            if let Some(data) = event_data.get_mut("data") {
+                data["last_completion_result"] = raw_value;
+            }
+            diesel::update(
+                harvest_events::table
+                    .filter(harvest_events::workflow_exec_id.eq(new_exec_id.as_uuid()))
+                    .filter(harvest_events::event_id.eq(0)),
+            )
+            .set(harvest_events::event_data.eq(event_data))
+            .execute(conn)
+            .await
+            .map_err(crate::error::database_error)?;
         }
 
         // Reassign unconsumed signals to the new execution so signals
