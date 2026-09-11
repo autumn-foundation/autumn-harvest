@@ -33856,7 +33856,9 @@ async fn set_start_throttle_pacing_override(
             TARGET_THROTTLE,
             &workflow_name,
             route,
-            AutumnError::bad_request_msg("refill_per_sec must be a finite number greater than zero")
+            AutumnError::bad_request_msg(
+                "refill_per_sec must be a finite number greater than zero"
+            )
         );
     }
     if let Some(burst) = request.burst

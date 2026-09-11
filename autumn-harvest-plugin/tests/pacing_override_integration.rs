@@ -1596,7 +1596,10 @@ async fn rate_limit_override_set_and_clear_record_audit_rows() {
     // Issue #1229's new audit-on-rejection machinery must never double-fire
     // on a SUCCESSFUL request. `.find` above passes even on a duplicate row.
     assert_eq!(
-        records.iter().filter(|r| r["target_id"] == json!(name)).count(),
+        records
+            .iter()
+            .filter(|r| r["target_id"] == json!(name))
+            .count(),
         1,
         "a successful SET must record exactly one audit row: {records:?}"
     );
@@ -1618,7 +1621,10 @@ async fn rate_limit_override_set_and_clear_record_audit_rows() {
         json!("DELETE /admin/rate-limits/{activity_name}/override")
     );
     assert_eq!(
-        records.iter().filter(|r| r["target_id"] == json!(name)).count(),
+        records
+            .iter()
+            .filter(|r| r["target_id"] == json!(name))
+            .count(),
         1,
         "a successful CLEAR must record exactly one audit row: {records:?}"
     );
@@ -1659,7 +1665,10 @@ async fn throttle_override_set_and_clear_record_audit_rows() {
     // Issue #1229's new audit-on-rejection machinery must never double-fire
     // on a SUCCESSFUL request. `.find` above passes even on a duplicate row.
     assert_eq!(
-        records.iter().filter(|r| r["target_id"] == json!(key)).count(),
+        records
+            .iter()
+            .filter(|r| r["target_id"] == json!(key))
+            .count(),
         1,
         "a successful SET must record exactly one audit row: {records:?}"
     );
@@ -1681,7 +1690,10 @@ async fn throttle_override_set_and_clear_record_audit_rows() {
         json!("DELETE /admin/start-throttle/{workflow_name}/override")
     );
     assert_eq!(
-        records.iter().filter(|r| r["target_id"] == json!(key)).count(),
+        records
+            .iter()
+            .filter(|r| r["target_id"] == json!(key))
+            .count(),
         1,
         "a successful CLEAR must record exactly one audit row: {records:?}"
     );
@@ -2360,11 +2372,9 @@ async fn set_rate_limit_pacing_override_reports_router_known_shard_with_no_pool(
          shard 1 never having been attempted: {body}"
     );
     assert!(
-        body["shard_errors"]
-            .as_array()
-            .is_some_and(|errs| errs.iter().any(|e| e
-                .as_str()
-                .is_some_and(|s| s.contains("shard 1")))),
+        body["shard_errors"].as_array().is_some_and(|errs| errs
+            .iter()
+            .any(|e| e.as_str().is_some_and(|s| s.contains("shard 1")))),
         "shard 1 must be named as unreachable, not silently dropped: {body}"
     );
 }
@@ -2391,11 +2401,9 @@ async fn clear_rate_limit_pacing_override_reports_router_known_shard_with_no_poo
          from the fan-out: {body}"
     );
     assert!(
-        body["shard_errors"]
-            .as_array()
-            .is_some_and(|errs| errs.iter().any(|e| e
-                .as_str()
-                .is_some_and(|s| s.contains("shard 1")))),
+        body["shard_errors"].as_array().is_some_and(|errs| errs
+            .iter()
+            .any(|e| e.as_str().is_some_and(|s| s.contains("shard 1")))),
         "shard 1 must be named as unreachable, not silently dropped: {body}"
     );
 }
@@ -2427,11 +2435,9 @@ async fn set_start_throttle_pacing_override_reports_router_known_shard_with_no_p
          from the fan-out: {body}"
     );
     assert!(
-        body["shard_errors"]
-            .as_array()
-            .is_some_and(|errs| errs.iter().any(|e| e
-                .as_str()
-                .is_some_and(|s| s.contains("shard 1")))),
+        body["shard_errors"].as_array().is_some_and(|errs| errs
+            .iter()
+            .any(|e| e.as_str().is_some_and(|s| s.contains("shard 1")))),
         "shard 1 must be named as unreachable, not silently dropped: {body}"
     );
 }
@@ -2449,8 +2455,7 @@ async fn clear_start_throttle_pacing_override_reports_router_known_shard_with_no
         vec![static_throttled_info(name, "5/m", 5.0)],
     );
 
-    let (status, body) =
-        delete_json(&app, &format!("/admin/start-throttle/{name}/override")).await;
+    let (status, body) = delete_json(&app, &format!("/admin/start-throttle/{name}/override")).await;
 
     assert_eq!(
         status,
@@ -2459,11 +2464,9 @@ async fn clear_start_throttle_pacing_override_reports_router_known_shard_with_no
          from the fan-out: {body}"
     );
     assert!(
-        body["shard_errors"]
-            .as_array()
-            .is_some_and(|errs| errs.iter().any(|e| e
-                .as_str()
-                .is_some_and(|s| s.contains("shard 1")))),
+        body["shard_errors"].as_array().is_some_and(|errs| errs
+            .iter()
+            .any(|e| e.as_str().is_some_and(|s| s.contains("shard 1")))),
         "shard 1 must be named as unreachable, not silently dropped: {body}"
     );
 }
@@ -2542,7 +2545,12 @@ async fn clear_rate_limit_pacing_override_returns_503_on_total_shard_outage() {
 async fn set_start_throttle_pacing_override_returns_503_on_total_shard_outage() {
     let name = leaked_name("onboard_user");
     let (pool, router) = single_dead_shard();
-    let app = build_sharded_app(pool, router, vec![], vec![static_throttled_info(name, "5/m", 5.0)]);
+    let app = build_sharded_app(
+        pool,
+        router,
+        vec![],
+        vec![static_throttled_info(name, "5/m", 5.0)],
+    );
 
     let (status, body) = post_json(
         &app,
@@ -2566,10 +2574,14 @@ async fn set_start_throttle_pacing_override_returns_503_on_total_shard_outage() 
 async fn clear_start_throttle_pacing_override_returns_503_on_total_shard_outage() {
     let name = leaked_name("onboard_user");
     let (pool, router) = single_dead_shard();
-    let app = build_sharded_app(pool, router, vec![], vec![static_throttled_info(name, "5/m", 5.0)]);
+    let app = build_sharded_app(
+        pool,
+        router,
+        vec![],
+        vec![static_throttled_info(name, "5/m", 5.0)],
+    );
 
-    let (status, body) =
-        delete_json(&app, &format!("/admin/start-throttle/{name}/override")).await;
+    let (status, body) = delete_json(&app, &format!("/admin/start-throttle/{name}/override")).await;
 
     assert_eq!(
         status,
@@ -2677,7 +2689,11 @@ async fn set_rate_limit_pacing_override_audits_every_rejection_branch() {
 
     let (status, body) =
         post_json(&app, &path, json!({ "refill_rate": -1.0, "ttl_secs": 60 })).await;
-    assert_eq!(status, StatusCode::BAD_REQUEST, "invalid refill_rate: {body}");
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "invalid refill_rate: {body}"
+    );
 
     let (status, body) = post_json(&app, &path, json!({ "burst": 0.5, "ttl_secs": 60 })).await;
     assert_eq!(status, StatusCode::BAD_REQUEST, "invalid burst: {body}");
@@ -2685,8 +2701,7 @@ async fn set_rate_limit_pacing_override_audits_every_rejection_branch() {
     let (status, body) = post_json(&app, &path, json!({ "ttl_secs": 60 })).await;
     assert_eq!(status, StatusCode::BAD_REQUEST, "empty override: {body}");
 
-    let (status, body) =
-        post_json(&app, &path, json!({ "refill_rate": 5.0, "ttl_secs": 0 })).await;
+    let (status, body) = post_json(&app, &path, json!({ "refill_rate": 5.0, "ttl_secs": 0 })).await;
     assert_eq!(status, StatusCode::BAD_REQUEST, "invalid ttl_secs: {body}");
 
     let (status, body) = post_json(
@@ -2711,7 +2726,11 @@ async fn set_rate_limit_pacing_override_audits_every_rejection_branch() {
         json!({ "refill_rate": 5.0, "ttl_secs": 60 }),
     )
     .await;
-    assert_eq!(status, StatusCode::NOT_FOUND, "no declared rate limit: {body}");
+    assert_eq!(
+        status,
+        StatusCode::NOT_FOUND,
+        "no declared rate limit: {body}"
+    );
 
     let (status, body) = post_json(
         &app,
@@ -2752,11 +2771,13 @@ async fn set_rate_limit_pacing_override_audits_every_rejection_branch() {
     // body. The audit row is still keyed by the path's `activity_name`,
     // same as every other pre-parse rejection.
     assert!(
-        records.iter().any(|r| r["target_id"] == json!(declared_name)
-            && r["status"] == json!("failed")
-            && r["error_summary"]
-                .as_str()
-                .is_some_and(|s| s.contains("brust") || s.to_lowercase().contains("unknown"))),
+        records
+            .iter()
+            .any(|r| r["target_id"] == json!(declared_name)
+                && r["status"] == json!("failed")
+                && r["error_summary"]
+                    .as_str()
+                    .is_some_and(|s| s.contains("brust") || s.to_lowercase().contains("unknown"))),
         "the unknown-field rejection must also be audited: {records:?}"
     );
 
@@ -2792,13 +2813,23 @@ async fn clear_rate_limit_pacing_override_audits_every_rejection_branch() {
 
     let app = build_app(&pool, vec![dynamic_activity, no_limit_activity], vec![]);
 
-    let (status, body) =
-        delete_json(&app, &format!("/admin/rate-limits/{undeclared_name}/override")).await;
+    let (status, body) = delete_json(
+        &app,
+        &format!("/admin/rate-limits/{undeclared_name}/override"),
+    )
+    .await;
     assert_eq!(status, StatusCode::NOT_FOUND, "undeclared activity: {body}");
 
-    let (status, body) =
-        delete_json(&app, &format!("/admin/rate-limits/{no_limit_name}/override")).await;
-    assert_eq!(status, StatusCode::NOT_FOUND, "no declared rate limit: {body}");
+    let (status, body) = delete_json(
+        &app,
+        &format!("/admin/rate-limits/{no_limit_name}/override"),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::NOT_FOUND,
+        "no declared rate limit: {body}"
+    );
 
     let (status, body) =
         delete_json(&app, &format!("/admin/rate-limits/{dynamic_name}/override")).await;
@@ -2858,8 +2889,12 @@ async fn set_start_throttle_pacing_override_audits_every_rejection_branch() {
     );
     let path = format!("/admin/start-throttle/{declared_name}/override");
 
-    let (status, body) =
-        post_json(&app, &path, json!({ "refill_per_sec": -1.0, "ttl_secs": 60 })).await;
+    let (status, body) = post_json(
+        &app,
+        &path,
+        json!({ "refill_per_sec": -1.0, "ttl_secs": 60 }),
+    )
+    .await;
     assert_eq!(
         status,
         StatusCode::BAD_REQUEST,
@@ -2890,7 +2925,11 @@ async fn set_start_throttle_pacing_override_audits_every_rejection_branch() {
         json!({ "refill_per_sec": 5.0, "ttl_secs": 60 }),
     )
     .await;
-    assert_eq!(status, StatusCode::NOT_FOUND, "no declared throttle: {body}");
+    assert_eq!(
+        status,
+        StatusCode::NOT_FOUND,
+        "no declared throttle: {body}"
+    );
 
     let (status, body) = post_json(
         &app,
@@ -2976,7 +3015,11 @@ async fn clear_start_throttle_pacing_override_audits_every_rejection_branch() {
         &format!("/admin/start-throttle/{no_throttle_name}/override"),
     )
     .await;
-    assert_eq!(status, StatusCode::NOT_FOUND, "no declared throttle: {body}");
+    assert_eq!(
+        status,
+        StatusCode::NOT_FOUND,
+        "no declared throttle: {body}"
+    );
 
     let (status, body) = delete_json(
         &app,
