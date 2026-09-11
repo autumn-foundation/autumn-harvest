@@ -1077,10 +1077,10 @@ async fn promotion_advances_a_sequence_owned_by_a_table_in_a_different_schema() 
     let mut conn = connect(&url).await;
     conn.batch_execute(
         "CREATE SCHEMA dr_seq_home;
-         CREATE SEQUENCE dr_seq_home.dr_cross_seq;
-         CREATE TABLE dr_seq_home.dr_cross (id BIGINT PRIMARY KEY DEFAULT nextval('dr_seq_home.dr_cross_seq'));
-         ALTER SEQUENCE dr_seq_home.dr_cross_seq OWNED BY dr_seq_home.dr_cross.id;
-         ALTER TABLE dr_seq_home.dr_cross SET SCHEMA public;
+         CREATE SEQUENCE dr_cross_seq;
+         CREATE TABLE dr_cross (id BIGINT PRIMARY KEY DEFAULT nextval('dr_cross_seq'));
+         ALTER SEQUENCE dr_cross_seq OWNED BY dr_cross.id;
+         ALTER SEQUENCE dr_cross_seq SET SCHEMA dr_seq_home;
          INSERT INTO dr_cross DEFAULT VALUES;
          INSERT INTO dr_cross DEFAULT VALUES;
          SELECT setval('dr_seq_home.dr_cross_seq', 1, false);",
