@@ -131,34 +131,58 @@ def strip_comments(src: str) -> str:
     return "".join(out)
 
 
+# A window ending in `let`/`@let`, whitespace, an identifier, and `=` is a
+# Rust (or maud `@let`) binding's right-hand side, e.g.
+# `@let hint = "select one;";` -- the string is assigned to `hint`, then
+# rendered later via `(hint)`. It is never an element's attribute, however
+# closely `ident\s*=\s*$` alone would otherwise resemble one; checked
+# before the generic attribute-tail pattern below so a let-binding is
+# never classified as an attribute value even though its tail also
+# matches that pattern.
+LET_BINDING_TAIL = re.compile(r"(?:^|[^\w])(?:@let|let)\s+[\w-]+\s*=\s*\Z")
+
+# A window ending in an identifier immediately followed by `=` -- maud
+# attribute syntax (`ident="…"` or `ident = "…"`, arbitrary whitespace
+# either side, matching `ATTR` above). The identifier must itself start
+# at a real boundary (`^` or a non-word, non-`=` character) so this
+# cannot match the tail end of some longer identifier or a chained `==`.
+ATTR_TAIL = re.compile(r"(?:^|[^\w=])[\w-]+\s*=\s*\Z")
+
+
+def is_attribute_value(src: str, quote_index: int) -> bool:
+    """True when the string literal opening at `quote_index` is a maud
+    attribute value on some element's own tag, not a Rust (or maud
+    `@let`) binding's right-hand side or any other string that merely
+    happens to sit after an `=` (Codex review, PR #1485, third round)."""
+    window = src[max(0, quote_index - 200) : quote_index]
+    if LET_BINDING_TAIL.search(window):
+        return False
+    return bool(ATTR_TAIL.search(window))
+
+
 def mask_text_strings(src: str) -> str:
     """Blank the contents of every string literal that is not an attribute
-    value -- a maud rendered-text node (`"Task kind"`) or an ordinary Rust
-    string argument (`String::from("Paused")`) -- while leaving an
+    value -- a maud rendered-text node (`"Task kind"`), a `let`/`@let`
+    binding's right-hand side (`is_attribute_value` above), or an ordinary
+    Rust string argument (`String::from("Paused")`) -- while leaving an
     attribute value's own quotes and content untouched (`ID_ATTR` and
-    `FOR_ATTR` both read real content out of those). A string is an
-    attribute value only when the previous non-whitespace character is
-    `=`; anything else is text, and gets masked.
+    `FOR_ATTR` both read real content out of those).
 
     Without this, `CONTROL_OPEN`'s own terminator search can be satisfied
     from *inside* a rendered string. A label whose real control moved to a
-    sibling, but which still renders text like `"select one;"`, supplies
-    the trailing `;` `CONTROL_OPEN` is looking for from the quoted text
-    itself, not from a real element (Codex review, PR #1485, following up
-    on the comment-only version of the same gap already closed by
-    `strip_comments`). Call this after `strip_comments` so a quote that
-    was only ever inside a comment has already been removed and cannot be
-    mistaken for the start of a string here."""
+    sibling, but which still renders text like `"select one;"` -- directly,
+    or bound first via `@let hint = "select one;"; (hint)` -- supplies the
+    trailing `;` `CONTROL_OPEN` is looking for from the quoted text itself,
+    not from a real element. Call this after `strip_comments` so a quote
+    that was only ever inside a comment has already been removed and
+    cannot be mistaken for the start of a string here."""
     out = list(src)
     i, n = 0, len(src)
     while i < n:
         if src[i] != '"':
             i += 1
             continue
-        j = i - 1
-        while j >= 0 and src[j] in " \t\n\r":
-            j -= 1
-        is_attr_value = j >= 0 and src[j] == "="
+        is_attr_value = is_attribute_value(src, i)
         k = i + 1
         while k < n and src[k] != '"':
             k += 2 if src[k] == "\\" else 1
