@@ -119,6 +119,14 @@ one pair that cannot be reconciled is refused instead: a turn that says it
 ended and still asks for a tool is malformed, and no guess about which half is
 wrong would be safe.
 
+**The database lives outside the workspace.** The agent can write any path
+inside the workspace, and a write replaces its target. A database the agent can
+reach is therefore one approved tool call away from replacement, while `SQLite`
+still holds the old inode — the recorded history of every session, gone. The
+daemon refuses to start in that layout, and names the flag to change. Pointing
+`--workspace` at the directory that holds `agentd.db` is the easy way to meet
+it.
+
 **The database is owner-only too.** It holds every prompt, tool input, and tool
 result, including the content of each file the agent read — so a new database
 is created `0600`, and the `-wal` and `-shm` sidecars are created under a

@@ -110,6 +110,11 @@ pub async fn serve(options: Options) -> Result<(), String> {
             options.workspace.display()
         )
     })?;
+    // The model can write to any path inside the workspace, and `write_file`
+    // replaces its target. The database, and its `-wal` sidecar beside it,
+    // must therefore not be reachable from there.
+    refuse_state_in_workspace(&options.db, &resolved)?;
+
     // A lossy conversion would mangle a path that is not valid UTF-8, and the
     // recorded identity would then never match the real one again. Refuse the
     // path instead of recording a name that cannot be compared.
@@ -669,6 +674,43 @@ pub fn pending_call(
         }
     }
     None
+}
+
+/// Refuse a database that the agent can reach.
+///
+/// `write_file` replaces its target through a rename. A database inside the
+/// workspace is therefore one approved tool call away from replacement.
+/// `SQLite` and the daemon lock still hold the old inode after that. The next
+/// commits fail, and a restart opens the replacement instead of the recorded
+/// history. The `-wal` and `-shm` sidecars sit beside the database and carry
+/// the same data, so one containment test covers all three.
+///
+/// The refusal is at startup, where it costs an operator one flag. The
+/// alternative is a list of reserved names in the toolbox, which has to stay
+/// in step with whatever the engine writes beside its database.
+fn refuse_state_in_workspace(db: &Path, workspace: &Path) -> Result<(), String> {
+    let directory = match db.parent() {
+        Some(parent) if !parent.as_os_str().is_empty() => parent,
+        _ => Path::new("."),
+    };
+    let resolved = directory
+        .canonicalize()
+        .map_err(|e| format!("cannot resolve the directory of {}: {e}", db.display()))?;
+    let name = db
+        .file_name()
+        .ok_or_else(|| format!("{} does not name a database file", db.display()))?;
+    if !resolved.join(name).starts_with(workspace) {
+        return Ok(());
+    }
+
+    Err(format!(
+        "the database {} is inside the workspace {}. A tool call can write to \
+         any path in the workspace. Replacing the database, or its `-wal` \
+         sidecar, would destroy the history this daemon runs from. Keep the \
+         database outside the workspace with `--db` or `--workspace`.",
+        db.display(),
+        workspace.display()
+    ))
 }
 
 /// The sessions a previous process left running.

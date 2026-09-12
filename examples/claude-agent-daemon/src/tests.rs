@@ -1696,6 +1696,61 @@ async fn a_decision_can_only_be_delivered_once() {
 }
 
 #[tokio::test]
+async fn a_daemon_refuses_a_database_the_agent_could_write() {
+    let dir = tempfile::tempdir().expect("a temporary directory");
+    let workspace = dir.path().join("workspace");
+    std::fs::create_dir_all(&workspace).expect("the workspace is created");
+
+    // `--workspace .` with the default database name is the natural way into
+    // this. The model can write any path in the workspace, and a write
+    // replaces its target. The daemon would then run from a file that one
+    // approved tool call could destroy.
+    let inside = daemon::Options {
+        db: workspace.join("agentd.db"),
+        socket: dir.path().join("agentd.sock"),
+        workspace: workspace.clone(),
+        model: claude::DEFAULT_MODEL.to_string(),
+        max_tokens: claude::DEFAULT_MAX_TOKENS,
+        tick: Duration::from_millis(50),
+        api_key: None,
+    };
+    // A timeout, because a daemon that does NOT refuse runs until `Ctrl-C`.
+    // Without it a regression would hang the suite instead of failing it.
+    let refusal = tokio::time::timeout(Duration::from_secs(10), daemon::serve(inside))
+        .await
+        .expect("the daemon must refuse rather than start")
+        .expect_err("a database inside the workspace must be refused");
+    assert!(
+        refusal.contains("inside the workspace"),
+        "the refusal must name the problem: {refusal}"
+    );
+    assert!(
+        !dir.path().join("agentd.sock").exists(),
+        "a refused daemon must not bind its socket"
+    );
+
+    // A directory below the workspace is no better: the model reaches that too.
+    std::fs::create_dir_all(workspace.join("state")).expect("the directory is created");
+    let nested = daemon::Options {
+        db: workspace.join("state/agentd.db"),
+        socket: dir.path().join("agentd.sock"),
+        workspace: workspace.clone(),
+        model: claude::DEFAULT_MODEL.to_string(),
+        max_tokens: claude::DEFAULT_MAX_TOKENS,
+        tick: Duration::from_millis(50),
+        api_key: None,
+    };
+    assert!(
+        tokio::time::timeout(Duration::from_secs(10), daemon::serve(nested))
+            .await
+            .expect("the daemon must refuse rather than start")
+            .expect_err("a nested database must be refused")
+            .contains("inside the workspace"),
+        "a database below the workspace must be refused too"
+    );
+}
+
+#[tokio::test]
 async fn a_daemon_refuses_to_start_where_a_session_does_not_belong() {
     let dir = tempfile::tempdir().expect("a temporary directory");
     let db = dir.path().join("agentd.db");
