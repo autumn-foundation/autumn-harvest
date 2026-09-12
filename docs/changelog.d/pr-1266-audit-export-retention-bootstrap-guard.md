@@ -391,6 +391,32 @@ New tests:
   never protect rows a still-relevant, colocated shard has already
   acknowledged.
 
+A fifteenth review round found two more defects, both P2.
+
+The first found that `extract_search_path` recognized `-c search_path=...`
+and `-csearch_path=...` but not PostgreSQL's long-form `--search_path=...`,
+which its own server documentation names as an equally valid spelling for
+any run-time parameter. Two DSNs setting different schemas through
+`--search_path=...` both extracted `None`, so they could collapse into
+one canonical key despite resolving to different schemas -- risking the
+premature-deletion failure this key exists to prevent.
+`extract_search_path` now recognizes all three spellings; the last one
+found still wins, unchanged from the fourteenth round's fix.
+`from_dsns_recognizes_the_long_form_search_path_options_spelling` pins
+this.
+
+The second found that a per-shard exemption can be defeated by
+`is_configured()`, the pre-existing, process-wide "does this process have
+a local sink installed" signal from #953: a process hosting a live sink
+for some other shard on the same pool group keeps `is_configured()` true,
+which still blocks a purge on a shard an operator just exempted. This is
+documented as an accepted gap rather than fixed in this round.
+`is_configured()` cannot be narrowed to "is this specific shard's export
+live" without knowing which shard a given sink instance actually serves --
+information this guard does not have -- and guessing wrong risks the
+dangerous direction, treating a shard's own still-live export as finished.
+See `docs/audit-export.md` for the operator-facing note.
+
 **Zero migration, zero engine impact beyond the new parameter.** No new
 `WorkflowEvent` variant, no schema change, no change to any existing call
 site's behavior when the new flag is left at its default (disabled).

@@ -1083,15 +1083,16 @@ fn canonical_dsn_key(dsn: &str) -> String {
 /// same pool, differing only in an unrelated `-c` flag, no longer
 /// merged.
 ///
-/// This recognizes two shapes, both used elsewhere in this codebase's
-/// own tests. One is whitespace-separated tokens where a `-c` token is
-/// immediately followed by a `search_path=value` token. The other is
-/// the compact `-csearch_path=value` spelling in one token. Neither
-/// allows embedded whitespace in the value. A quoted value with
-/// embedded spaces is not recognized. Treating an unparsed `options`
-/// string as carrying no `search_path` is the conservative direction
-/// here. It only widens which DSNs compare as different, never the
-/// reverse.
+/// This recognizes three shapes. One is whitespace-separated tokens
+/// where a `-c` token is immediately followed by a `search_path=value`
+/// token. The other two are one-token spellings: the compact
+/// `-csearch_path=value`, and the long-form `--search_path=value`.
+/// `PostgreSQL`'s own server documentation names the long form as an
+/// alternate spelling for any run-time parameter. None allows embedded
+/// whitespace in the value. A quoted value with embedded spaces is not
+/// recognized. Treating an unparsed `options` string as carrying no
+/// `search_path` is the conservative direction here. It only widens
+/// which DSNs compare as different, never the reverse.
 ///
 /// `options` can repeat `-c search_path=...` more than once. libpq
 /// applies each as a `SET` in order at session start, so only the last
@@ -1109,6 +1110,8 @@ fn extract_search_path(options: &str) -> Option<String> {
                 search_path = Some(value.to_string());
             }
         } else if let Some(value) = tok.strip_prefix("-csearch_path=") {
+            search_path = Some(value.to_string());
+        } else if let Some(value) = tok.strip_prefix("--search_path=") {
             search_path = Some(value.to_string());
         }
     }
@@ -2491,6 +2494,34 @@ mod tests {
             2,
             "the compact `-csearch_path=` spelling must select a schema \
              just as the spaced form does, so these must never collapse"
+        );
+    }
+
+    #[cfg(feature = "db")]
+    #[test]
+    fn from_dsns_recognizes_the_long_form_search_path_options_spelling() {
+        let sharded = ShardedDbPool::from_dsns(
+            [
+                (
+                    ShardId::new(0),
+                    "postgres://db.example/shared?options=--search_path%3Dschema_a".to_string(),
+                ),
+                (
+                    ShardId::new(1),
+                    "postgres://db.example/shared?options=--search_path%3Dschema_b".to_string(),
+                ),
+            ],
+            ShardId::new(0),
+            1,
+        )
+        .expect("pool builds without connecting");
+
+        let groups = sharded.pool_groups();
+        assert_eq!(
+            groups.len(),
+            2,
+            "the long-form `--search_path=` spelling must select a schema \
+             just as `-c search_path=` does, so these must never collapse"
         );
     }
 

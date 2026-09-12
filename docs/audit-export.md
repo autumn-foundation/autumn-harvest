@@ -341,9 +341,10 @@ shard records:
   disagrees with it on percent-decoding, on `?dbname=`/`?host=`/`?port=`/
   `?hostaddr=` overrides, and on comma-separated multi-host DSNs.
   Only a `search_path` setting is extracted from `options` (`options`
-  itself can carry `-c search_path=...` or `-csearch_path=...`, both
-  recognized, but also any other GUC an operator sets, so the whole
-  string is not kept). Postgres applies repeated `-c` flags in order, so
+  itself can carry `-c search_path=...`, `-csearch_path=...`, or
+  PostgreSQL's long-form `--search_path=...`, all three recognized, but
+  also any other GUC an operator sets, so the whole string is not kept).
+  Postgres applies repeated `-c` flags in order, so
   a later `-c search_path=...` overrides an earlier one; the extraction
   keeps only the last occurrence, matching that sequential-`SET`
   semantic rather than the first or a concatenation. `search_path` picks
@@ -389,6 +390,21 @@ shard records:
   remember to set the flag on every process, including ones added later.
   Forgetting it only reopens the original bootstrap window; it never causes
   data loss beyond that.
+
+  One further gap is accepted rather than fixed here: exempting shard A
+  restores purging only if the *sweeping process itself* has no local
+  sink installed (`is_configured()` is process-wide, not per-shard, and
+  predates this guard). A process that hosts a live sink for some other
+  shard on the same pool group leaves `is_configured()` true, which
+  still blocks shard A's purge even after its exemption. Narrowing
+  `is_configured()` to "does this specific shard have a live sink" needs
+  to know which shard a given sink instance actually serves — information
+  this guard does not have today, and getting it wrong risks the opposite,
+  dangerous direction: treating a shard's own still-live export as
+  finished. Until that scoping exists, an operator retiring shard A on a
+  process that also actively exports another colocated shard must stop
+  that process's sink too, exactly as the pre-existing `is_configured()`
+  trade already required before per-shard exemption existed.
 
 The guard is deliberately **not** time-based. An earlier revision expired it 24
 hours after the exporter's last heartbeat, so a long worker outage lifted it. A
