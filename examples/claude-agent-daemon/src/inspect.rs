@@ -562,13 +562,19 @@ fn races_signal(timer_id: &str, signal: &str) -> bool {
 ///
 /// The characters are cut here, because the database was asked for a budget
 /// of bytes. See [`MAX_LISTED_BYTES`].
+///
+/// A field that decodes to NOTHING is reported as no field. A JSON string of
+/// one unpaired surrogate is text to `SQLite` and not text to Rust, so its
+/// valid prefix is empty. Calling that an empty stop reason would have the
+/// row claim something it never held.
 fn cut_text(bytes: Option<Vec<u8>>) -> Option<String> {
     let bytes = bytes?;
     let whole = match std::str::from_utf8(&bytes) {
         Ok(text) => text,
         Err(split) => std::str::from_utf8(&bytes[..split.valid_up_to()]).unwrap_or_default(),
     };
-    Some(whole.chars().take(MAX_LISTED_CHARS as usize).collect())
+    let cut: String = whole.chars().take(MAX_LISTED_CHARS as usize).collect();
+    (!cut.is_empty()).then_some(cut)
 }
 
 /// One page of the agent workflow's executions, oldest first.
@@ -606,6 +612,12 @@ pub fn executions(
     // `typeof` guards the two integers beside `json_type`, and the two catch
     // different faults. A number too large for a signed 64-bit integer is
     // still an `integer` to `json_type`, while `json_extract` returns a real.
+    //
+    // Every TEXT field is read as bytes, and none of them as a string. A JSON
+    // string can hold an unpaired surrogate, which `SQLite` accepts and calls
+    // text. `json_extract` then yields bytes that are not UTF-8, and reading
+    // those into a `String` fails the whole statement. The bytes are decoded
+    // by the caller, which keeps what is readable.
     let mut statement = conn
         .prepare(
             "SELECT exec_id, state, \
@@ -615,7 +627,8 @@ pub fn executions(
                                      1, ?3) END, \
                     CASE WHEN json_valid(output_json) \
                           AND json_type(output_json, '$.stop') = 'text' \
-                         THEN json_extract(output_json, '$.stop') END, \
+                         THEN substr(cast(json_extract(output_json, '$.stop') as blob), \
+                                     1, ?3) END, \
                     CASE WHEN json_valid(output_json) \
                           AND json_type(output_json, '$.turns') = 'integer' \
                           AND typeof(json_extract(output_json, '$.turns')) = 'integer' \
@@ -649,7 +662,7 @@ pub fn executions(
                     exec_id: row.get(0)?,
                     state: row.get(1)?,
                     goal: cut_text(row.get(2)?),
-                    stop: row.get(3)?,
+                    stop: cut_text(row.get(3)?),
                     turns: row.get(4)?,
                     tool_calls: row.get(5)?,
                     answer: cut_text(row.get(6)?),

@@ -3204,50 +3204,12 @@ fn a_damaged_row_does_not_hide_the_listing() {
             rusqlite::params![WORKFLOW_NAME, READABLE_TASK],
         )
         .expect("the damaged report is recorded");
-    // Valid JSON that says the wrong thing. `json_extract` returns the type
-    // the document holds, and reading an integer as text aborts the whole
-    // statement exactly as a damaged document does.
-    writer
-        .execute(
-            "INSERT INTO harvest_executions \
-             VALUES ('wrong-types', ?1, 'COMPLETED', ?2, ?3, NULL)",
-            rusqlite::params![
-                WORKFLOW_NAME,
-                json!({
-                    "goal": 7,
-                    "max_turns": 4,
-                    "approval_timeout_secs": 300,
-                    "workspace": "/tmp/w",
-                    "model": "offline",
-                })
-                .to_string(),
-                json!({
-                    "stop": 1,
-                    "turns": "many",
-                    "tool_calls": [],
-                    "answer": false,
-                })
-                .to_string(),
-            ],
-        )
-        .expect("the mistyped row is recorded");
     drop(writer);
 
     let reader = rusqlite::Connection::open(&db).expect("the database opens");
     let listed = inspect::executions(&reader, WORKFLOW_NAME, None).expect("the listing answers");
-    let named: Vec<&str> = listed.iter().map(|row| row.exec_id.as_str()).collect();
-    for session in ["readable", "damaged-task", "damaged-report", "wrong-types"] {
-        assert!(
-            named.contains(&session),
-            "{session} must still be listed: {named:?}"
-        );
-    }
-    let row = |exec: &str| {
-        listed
-            .iter()
-            .find(|row| row.exec_id == exec)
-            .expect("the session is listed")
-    };
+    assert_eq!(listed.len(), 3, "every row is still named");
+    let row = |exec: &str| listed_row(&listed, exec);
     assert_eq!(
         row("readable").goal.as_deref(),
         Some("summarise it"),
@@ -3272,7 +3234,66 @@ fn a_damaged_row_does_not_hide_the_listing() {
         Some("summarise it"),
         "the task of that row is readable, and is still read"
     );
-    // Valid JSON of the wrong type reads as nothing, field by field.
+}
+
+/// Valid JSON that this row cannot be read from is read as nothing.
+///
+/// Two faults hide behind valid JSON. A field can hold the WRONG TYPE: a
+/// report of `{"stop":1}` is valid, and reading that integer as text aborts
+/// the whole statement. A field can also hold text that Rust cannot read. A
+/// JSON string of one unpaired surrogate is text to `SQLite`, and
+/// `json_extract` yields bytes that are not UTF-8.
+///
+/// Either one would hide every valid session, which is the fault the
+/// malformed-document guard was added to prevent.
+#[test]
+fn a_row_that_cannot_be_read_is_read_as_nothing() {
+    let dir = tempfile::tempdir().expect("a temporary directory");
+    let db = dir.path().join("unreadable.db");
+    let writer = rusqlite::Connection::open(&db).expect("the database opens");
+    fixture_table(&writer);
+    record_task(&writer, "readable", READABLE_TASK);
+    // Valid JSON, wrong types, field by field.
+    writer
+        .execute(
+            "INSERT INTO harvest_executions VALUES ('wrong-types', ?1, 'COMPLETED', ?2, ?3, NULL)",
+            rusqlite::params![
+                WORKFLOW_NAME,
+                json!({
+                    "goal": 7,
+                    "max_turns": 4,
+                    "approval_timeout_secs": 300,
+                    "workspace": "/tmp/w",
+                    "model": "offline",
+                })
+                .to_string(),
+                json!({ "stop": 1, "turns": "many", "tool_calls": [], "answer": false })
+                    .to_string(),
+            ],
+        )
+        .expect("the mistyped row is recorded");
+    // Text to SQLite, and not text to Rust.
+    writer
+        .execute(
+            "INSERT INTO harvest_executions \
+             VALUES ('bad-unicode', ?1, 'COMPLETED', ?2, \
+                     '{\"stop\":\"\\uD800\",\"turns\":2,\"tool_calls\":1,\"answer\":\"done\"}', \
+                     NULL)",
+            rusqlite::params![WORKFLOW_NAME, READABLE_TASK],
+        )
+        .expect("the surrogate row is recorded");
+    drop(writer);
+
+    let reader = rusqlite::Connection::open(&db).expect("the database opens");
+    let listed = inspect::executions(&reader, WORKFLOW_NAME, None).expect("the listing answers");
+    assert_eq!(listed.len(), 3, "every row is still named");
+    let row = |exec: &str| listed_row(&listed, exec);
+    assert_eq!(
+        row("readable").goal.as_deref(),
+        Some("summarise it"),
+        "the readable session is still listed"
+    );
+
     let mistyped = row("wrong-types");
     assert!(
         mistyped.goal.is_none(),
@@ -3286,6 +3307,31 @@ fn a_damaged_row_does_not_hide_the_listing() {
         mistyped.turns.is_none() && mistyped.tool_calls.is_none(),
         "counts that are not integers read as nothing"
     );
+
+    // A stop reason Rust cannot read is no stop reason, and the readable
+    // fields of that same row still read.
+    let surrogate = row("bad-unicode");
+    assert!(
+        surrogate.stop.is_none(),
+        "a stop reason that is not valid Unicode reads as nothing"
+    );
+    assert_eq!(
+        surrogate.answer.as_deref(),
+        Some("done"),
+        "the readable fields of that row are still read"
+    );
+    assert_eq!(surrogate.turns, Some(2), "as are its counts");
+}
+
+/// One listed session, by id.
+fn listed_row<'a>(
+    listed: &'a [inspect::SessionSummary],
+    exec: &str,
+) -> &'a inspect::SessionSummary {
+    listed
+        .iter()
+        .find(|row| row.exec_id == exec)
+        .expect("the session is listed")
 }
 
 /// A listing and a status agree about a goal holding a NUL.
