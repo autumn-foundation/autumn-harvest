@@ -215,11 +215,20 @@ pub async fn serve(options: Options) -> Result<(), String> {
     // process left RUNNING. In-flight sessions resume by replay from here.
     // The `-wal` and `-shm` sidecars are created by `SQLite`, and they carry
     // the same data as the database. The mask makes them private too.
+    // The identity is proved on BOTH sides of the open, because the open is
+    // not inert. It flips every RUNNING task of whatever database it opens
+    // back to PENDING. Opening a file swapped in here would re-queue the live
+    // work of the daemon that owns it. That daemon would then run those tasks
+    // a second time, and each one can spend money.
+    //
+    // A check that ran only afterwards would refuse this start AFTER that
+    // write had landed on another file. See [`guard::DaemonLock::still_names`].
+    lock.still_names(&options.db)?;
     let mut runtime = guard::with_private_umask(|| SqliteRuntime::open(&options.db))
         .map_err(|e| format!("cannot open {}: {e}", options.db.display()))?;
-    // The lock is held on an inode, and the runtime was handed a path. A file
-    // replaced between the two would leave this daemon writing a database it
-    // does not hold the lock for. See [`guard::DaemonLock::still_names`].
+    // Again, because the check above cannot cover the open itself. This one
+    // catches a swap that landed inside it. The one above keeps the reclaim
+    // off another daemon's file in every slower case.
     lock.still_names(&options.db)?;
     runtime.register_workflow(&session::agent_session_info());
     runtime.register_activity(&session::claude_turn_info(), claude::activity_body(model));

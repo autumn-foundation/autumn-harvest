@@ -9089,4 +9089,65 @@ fn a_database_replaced_while_the_daemon_starts_is_refused() {
         refused.contains("was replaced while this daemon started"),
         "the refusal must say what happened: {refused}"
     );
+
+    // The open is NOT inert. It flips every RUNNING task of the database it
+    // opens back to PENDING. Opening a file swapped in here re-queues the
+    // live work of the daemon that owns it.
+    let other = dir.path().join("other-daemon.db");
+    {
+        let runtime = SqliteRuntime::open(&other).expect("the other database opens");
+        drop(runtime);
+    }
+    let writer = rusqlite::Connection::open(&other).expect("the database opens");
+    writer
+        .execute(
+            "INSERT INTO harvest_tasks (task_id, exec_id, activity_id, name, input_json, \
+             queue, state, attempt, run_at, seq, scheduled_at) \
+             VALUES ('t1', 'e1', 'a1', 'claude_turn', '{}', 'default', 'RUNNING', 0, 0, 1, 0)",
+            [],
+        )
+        .expect("a live task is recorded");
+    let running = |conn: &rusqlite::Connection| -> i64 {
+        conn.query_row(
+            "SELECT count(*) FROM harvest_tasks WHERE state = 'RUNNING'",
+            [],
+            |row| row.get(0),
+        )
+        .expect("the count answers")
+    };
+    assert_eq!(running(&writer), 1, "the other daemon has live work");
+    drop(writer);
+
+    // Opening it is what does the damage, which is why the check has to run
+    // BEFORE the open and not only after it.
+    drop(SqliteRuntime::open(&other).expect("the swapped database opens"));
+    let reader = rusqlite::Connection::open(&other).expect("the database opens");
+    assert_eq!(
+        running(&reader),
+        0,
+        "opening another daemon's database re-queues its live work"
+    );
+
+    // So the start proves the identity on BOTH sides of the open. No test can
+    // schedule a swap between two system calls. The order is read from the
+    // source instead, as the other guards in this suite are.
+    let source = include_str!("daemon.rs");
+    let body = source
+        .split("pub async fn serve(")
+        .nth(1)
+        .expect("serve is in the source");
+    let opened = body
+        .find("SqliteRuntime::open(&options.db)")
+        .expect("the runtime is opened");
+    let before = body
+        .find("lock.still_names(&options.db)")
+        .expect("the identity is proved before the open");
+    let after = body[opened..]
+        .find("lock.still_names(&options.db)")
+        .map(|at| at + opened)
+        .expect("the identity is proved after the open");
+    assert!(
+        before < opened && opened < after,
+        "the identity must be proved on both sides of the open"
+    );
 }

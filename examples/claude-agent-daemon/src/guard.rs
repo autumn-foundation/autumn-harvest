@@ -61,10 +61,17 @@ impl DaemonLock {
     /// Both would write one database, and each would reclaim work the other
     /// is running.
     ///
-    /// This is checked AFTER the runtime opens, so a replacement that landed
-    /// in that window is refused. It does not close the window: the file can
-    /// be replaced again after this read. Closing it needs an identity the
-    /// pathname cannot carry.
+    /// This is checked on BOTH sides of the runtime open, and the order
+    /// matters. The open is not inert: it flips every RUNNING task of the
+    /// database it opens back to PENDING. A check that ran only afterwards
+    /// would refuse the start after that write had landed on another
+    /// daemon's file. That daemon would run the re-queued work again.
+    ///
+    /// It does not close the window. A file replaced between the first check
+    /// and the open inside `SQLite` is still opened, and one replaced after
+    /// the second check is still there. Closing it needs an identity the
+    /// pathname cannot carry, and `SQLite` must be handed a path, because
+    /// that is how it names its write-ahead log.
     ///
     /// # Errors
     ///
