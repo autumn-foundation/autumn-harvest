@@ -292,8 +292,11 @@ fn line(text: &str) {
 /// return is NOT kept: it returns to the start of the line, and what follows
 /// overwrites what the operator already read.
 ///
-/// The bidirectional overrides are escaped as well. They obey nothing, but
+/// The bidirectional controls are escaped as well. They obey nothing, but
 /// they reorder what is displayed, so a path can be shown as a different path.
+/// The whole `Bidi_Control` set is covered, and not only the overrides: a
+/// single mark beside right-to-left text reorders it too.
+///
 /// The other format characters are left alone, because a joiner is part of
 /// ordinary text.
 ///
@@ -316,7 +319,10 @@ fn visible(text: &str) -> std::borrow::Cow<'_, str> {
 
 /// Would a terminal act on this character rather than print it?
 fn is_obeyed(character: char) -> bool {
-    let bidi = matches!(character, '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}');
+    // The Unicode `Bidi_Control` property, in full: the marks, the embeddings
+    // and overrides, and the isolates.
+    let bidi = matches!(character,
+        '\u{061c}' | '\u{200e}' | '\u{200f}' | '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}');
     bidi || (character.is_control() && character != '\n' && character != '\t')
 }
 

@@ -465,23 +465,54 @@ pub fn directories_to_flush(target: &Path, workspace: &Path) -> Vec<PathBuf> {
 /// umask is one value for the whole process, and this daemon creates its
 /// private files on other threads.
 pub fn create_enterable(directory: &Path) -> std::io::Result<()> {
+    // An earlier attempt can be killed between the creation and the mode. It
+    // leaves a directory its owner cannot enter, and the level below that one
+    // cannot be created at all. The debris is repaired first, from the top
+    // down. The walk stops at the first level the owner CAN enter, so it never
+    // reaches a directory this daemon had no part in.
+    let blocked: Vec<&Path> = directory
+        .ancestors()
+        .filter(|level| level.exists())
+        .take_while(|level| !owner_can_enter(level))
+        .collect();
+    for level in blocked.into_iter().rev() {
+        grant_owner_entry(level)?;
+    }
+
     let missing: Vec<&Path> = directory
         .ancestors()
         .take_while(|level| !level.exists())
         .collect();
     for level in missing.into_iter().rev() {
         match std::fs::create_dir(level) {
-            Ok(()) => {
-                let mut mode = std::fs::metadata(level)?.permissions();
-                mode.set_mode(mode.mode() | 0o700);
-                std::fs::set_permissions(level, mode)?;
-            }
+            Ok(()) => grant_owner_entry(level)?,
             // Another process reached the same name first. It owns the mode.
             Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
             Err(e) => return Err(e),
         }
     }
     Ok(())
+}
+
+/// Can the owner enter this directory?
+///
+/// A directory without the owner's `x` bit cannot be entered or listed by its
+/// owner. It is unusable to this daemon, and it is what an interrupted
+/// creation leaves behind.
+///
+/// The test is deliberately narrow. A directory that is narrow but USABLE,
+/// such as `0500`, is a mode an operator can mean, and it is left alone. A
+/// write under it then fails with a plain permission error that names the
+/// path, which is honest. Widening it would undo a choice the operator made.
+fn owner_can_enter(directory: &Path) -> bool {
+    std::fs::metadata(directory).is_ok_and(|entry| entry.permissions().mode() & 0o100 != 0)
+}
+
+/// Give the owner `rwx` on a directory, keeping the rest of the mode.
+fn grant_owner_entry(directory: &Path) -> std::io::Result<()> {
+    let mut mode = std::fs::metadata(directory)?.permissions();
+    mode.set_mode(mode.mode() | 0o700);
+    std::fs::set_permissions(directory, mode)
 }
 
 /// Create a scratch file beside the target, and return it with its path.

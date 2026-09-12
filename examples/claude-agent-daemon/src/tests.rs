@@ -1505,12 +1505,21 @@ fn model_text_cannot_drive_the_terminal() {
         "a carriage return must not reach the terminal: {overwrite}"
     );
 
-    // An override reorders what is displayed, so one path reads as another.
-    let reordered = crate::visible("notes\u{202e}gnp.md");
-    assert!(
-        !reordered.contains('\u{202e}'),
-        "a bidirectional override must not reach the terminal: {reordered}"
-    );
+    // A bidirectional control reorders what is displayed, so one path reads
+    // as another. The whole `Bidi_Control` set counts, and not only the
+    // overrides: a single mark beside right-to-left text reorders it too.
+    for control in [
+        '\u{061c}', '\u{200e}', '\u{200f}', '\u{202a}', '\u{202b}', '\u{202c}', '\u{202d}',
+        '\u{202e}', '\u{2066}', '\u{2067}', '\u{2068}', '\u{2069}',
+    ] {
+        let path = format!("notes{control}gnp.md");
+        let reordered = crate::visible(&path);
+        assert!(
+            !reordered.contains(control),
+            "a bidirectional control must not reach the terminal: {:04x}",
+            control as u32
+        );
+    }
 
     // An answer keeps its own layout, and ordinary text is untouched.
     let answer = "line one\nline two\n\tindented 👩‍💻 done";
@@ -1597,6 +1606,42 @@ fn a_created_directory_can_be_entered_by_its_owner() {
 
     // The point of the owner bits: a file can be written inside.
     std::fs::write(nested.join("notes.md"), "hello").expect("a write lands inside");
+
+    // Debris from an attempt killed between the creation and the mode. The
+    // level below it cannot be created until this one is repaired, so a retry
+    // must repair it rather than step over it.
+    let interrupted = workspace.join("interrupted");
+    std::fs::create_dir(&interrupted).expect("the debris is created");
+    std::fs::set_permissions(&interrupted, std::fs::Permissions::from_mode(0o000))
+        .expect("the debris is left unenterable");
+    tools::create_enterable(&interrupted.join("child")).expect("the retry repairs the debris");
+    let repaired = std::fs::metadata(&interrupted)
+        .expect("the directory exists")
+        .permissions()
+        .mode()
+        & 0o7777;
+    assert_eq!(
+        repaired & 0o700,
+        0o700,
+        "an interrupted creation must be repaired, and has mode {repaired:o}"
+    );
+
+    // A directory that is narrow but USABLE is a mode an operator can mean.
+    // It is left exactly as they set it.
+    let narrow = workspace.join("narrow");
+    std::fs::create_dir(&narrow).expect("the directory is created");
+    std::fs::set_permissions(&narrow, std::fs::Permissions::from_mode(0o500))
+        .expect("the directory is made read-only");
+    tools::create_enterable(&narrow).expect("an existing usable directory is accepted");
+    let kept = std::fs::metadata(&narrow)
+        .expect("the directory exists")
+        .permissions()
+        .mode()
+        & 0o7777;
+    assert_eq!(
+        kept, 0o500,
+        "a usable narrow directory keeps the mode the operator chose"
+    );
 }
 
 #[test]
