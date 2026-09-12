@@ -173,7 +173,10 @@ pub async fn serve(options: Options) -> Result<(), String> {
     }
     let listener = bind(&options.socket).await?;
     let (tx, mut rx) = mpsc::channel::<Job>(COMMAND_BACKLOG);
-    tokio::spawn(accept_loop(listener, tx));
+    // The socket's mode is not a control surface on its own. See
+    // [`peer_is_owner`].
+    let owner = rustix::process::geteuid().as_raw();
+    tokio::spawn(accept_loop(listener, tx, owner));
 
     tracing::info!(
         db = %options.db.display(),
@@ -320,7 +323,7 @@ pub async fn bind(socket: &Path) -> Result<UnixListener, String> {
 }
 
 /// Accept connections and forward each request to the main loop.
-async fn accept_loop(listener: UnixListener, tx: mpsc::Sender<Job>) {
+async fn accept_loop(listener: UnixListener, tx: mpsc::Sender<Job>, owner: u32) {
     let permits = Arc::new(Semaphore::new(MAX_CONNECTIONS));
     loop {
         // Take the permit first. See [`MAX_CONNECTIONS`].
@@ -329,6 +332,11 @@ async fn accept_loop(listener: UnixListener, tx: mpsc::Sender<Job>) {
         };
         match listener.accept().await {
             Ok((stream, _)) => {
+                // Every caller is identified before it is served.
+                if !peer_is_owner(&stream, owner) {
+                    drop(permit);
+                    continue;
+                }
                 let tx = tx.clone();
                 tokio::spawn(async move {
                     // The permit is released when this connection is done.
@@ -341,6 +349,33 @@ async fn accept_loop(listener: UnixListener, tx: mpsc::Sender<Job>) {
                 tracing::warn!(error = %e, "cannot accept a control connection");
                 tokio::time::sleep(ACCEPT_BACKOFF).await;
             }
+        }
+    }
+}
+
+/// Is the caller the user this daemon runs as?
+///
+/// The socket is created `0600`, and that is not enough on its own. Linux
+/// enforces a socket's mode on `connect`. macOS does not, and this example
+/// supports both. A socket in a directory that other users can search would
+/// therefore accept them there.
+///
+/// The kernel reports the peer's credentials, and no directory mode can forge
+/// them. The check fails CLOSED: a peer that cannot be identified is refused,
+/// because this connection spends money and approves writes.
+pub fn peer_is_owner(stream: &UnixStream, owner: u32) -> bool {
+    match stream.peer_cred() {
+        Ok(peer) if peer.uid() == owner => true,
+        Ok(peer) => {
+            tracing::warn!(
+                uid = peer.uid(),
+                "refused a control connection from another user"
+            );
+            false
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, "refused a control connection of unknown origin");
+            false
         }
     }
 }

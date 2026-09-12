@@ -134,10 +134,14 @@ result, including the content of each file the agent read — so a new database
 is created `0600`, and the `-wal` and `-shm` sidecars are created under a
 narrowed umask. An existing database keeps whatever mode the operator gave it.
 
-**The control socket is owner-only.** Whoever can connect can spend money and
-approve writes with the daemon's privileges, so the socket is created `0600`
-under a narrowed umask — private at creation, with no window to connect
-through. A path that already holds something other than a socket is never
+**The control socket is owner-only, and the daemon checks.** Whoever can
+connect can spend money and approve writes with the daemon's privileges, so the
+socket is created `0600` under a narrowed umask — private at creation, with no
+window to connect through. That mode is not the whole control: Linux enforces a
+socket's mode on `connect`, and macOS does not, so a socket in a directory
+other users can search would accept them there. The daemon therefore asks the
+kernel who is calling and serves only its own user. A caller it cannot identify
+is refused. A path that already holds something other than a socket is never
 removed: a typo in `--socket` reports an error instead of deleting a file.
 
 **A mismatched daemon refuses to start.** The daemon checks every resumable

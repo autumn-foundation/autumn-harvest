@@ -405,6 +405,34 @@ async fn a_second_daemon_resumes_a_session_the_first_one_left_running() {
     second.abort();
 }
 
+#[tokio::test]
+async fn a_control_connection_is_identified_by_its_peer() {
+    let dir = tempfile::tempdir().expect("a temporary directory");
+    let socket = dir.path().join("probe.sock");
+    let listener = tokio::net::UnixListener::bind(&socket).expect("the socket binds");
+
+    let caller = tokio::spawn(async move {
+        tokio::net::UnixStream::connect(&socket)
+            .await
+            .expect("the caller connects")
+    });
+    let (served, _) = listener.accept().await.expect("the daemon accepts");
+    drop(caller.await.expect("the caller finishes"));
+
+    // The kernel reports the caller's user, and no directory mode can forge
+    // it. This is what the daemon checks, because a socket's own mode is
+    // enforced on `connect` by Linux and not by macOS.
+    let owner = rustix::process::geteuid().as_raw();
+    assert!(
+        daemon::peer_is_owner(&served, owner),
+        "a caller running as the daemon's own user must be served"
+    );
+    assert!(
+        !daemon::peer_is_owner(&served, owner.wrapping_add(1)),
+        "a caller running as anyone else must be refused"
+    );
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn the_daemon_answers_more_connections_than_it_holds_at_once() {
     let dir = tempfile::tempdir().expect("a temporary directory");
