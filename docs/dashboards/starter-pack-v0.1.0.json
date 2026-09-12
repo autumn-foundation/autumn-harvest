@@ -6139,6 +6139,55 @@
         }
       ],
       "description": "Rate of audit records the sink acknowledged, per shard \u2014 counted only after the export cursor actually advanced, so this is a delivery rate, not an attempt rate. Delivery is at-least-once, so a redelivered batch counts again; receiver-side (shard, seq) accounting is the completeness proof, not this counter. Pair with the lag panel: throughput at zero while lag climbs is a sink outage; both healthy is a working export."
+    },
+    {
+      "id": 955,
+      "type": "timeseries",
+      "title": "RPO known (0 = readable but unmeasurable)",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 24,
+        "x": 0,
+        "y": 159
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "custom": {
+            "fillOpacity": 10,
+            "showPoints": "never",
+            "lineWidth": 1
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "min by (shard) (harvest_replication_rpo_known{shard=~\"$shard\"})",
+          "legendFormat": "shard {{shard}}",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          }
+        }
+      ],
+      "description": "Alert: harvest_replication_rpo_unknown (docs/runbooks/harvest-alerts.md#harvest_replication_rpo_unknown) Whether this shard's measured RPO has a source at all. 0 means the replication views are readable and a standby is connected, but no DR slot has confirmed a position and the standby has not reported a replay_lag either \u2014 the RPO gauge is withheld rather than published as a stale or fabricated number."
     }
   ]
 }
