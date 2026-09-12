@@ -2607,6 +2607,90 @@ fn the_decide_line_reaches_the_daemon_that_printed_it() {
     );
 }
 
+/// A restored wait is the ARMED one, and not one already answered.
+///
+/// Two tables decide this, and the backend's own rule is that an armed but
+/// unfired timer proves a wait. A fired timer is an approval that ran out of
+/// time, and a timed-out wait carries no answer either. Reading every timer
+/// would therefore restore the EXPIRED call of an earlier turn.
+///
+/// A decision is staged in `harvest_signals` when it is sent, and its event
+/// is appended later. A daemon that stopped between the two holds a decision
+/// that wins on the next drive, so the wait must not come back.
+#[test]
+fn a_restored_wait_is_armed_and_unanswered() {
+    let dir = tempfile::tempdir().expect("a temporary directory");
+    let db = dir.path().join("waits.db");
+    let conn = rusqlite::Connection::open(&db).expect("the database opens");
+    conn.execute_batch(
+        "CREATE TABLE harvest_timers (timer_id TEXT, exec_id TEXT, fire_at INTEGER, \
+         fired INTEGER NOT NULL DEFAULT 0, arm_seq INTEGER, \
+         PRIMARY KEY (exec_id, timer_id)); \
+         CREATE TABLE harvest_events (exec_id TEXT, seq INTEGER, event_json TEXT, \
+         PRIMARY KEY (exec_id, seq)); \
+         CREATE TABLE harvest_signals (signal_seq INTEGER PRIMARY KEY AUTOINCREMENT, \
+         exec_id TEXT NOT NULL, name TEXT NOT NULL, payload_json TEXT NOT NULL, \
+         delivered INTEGER NOT NULL DEFAULT 0, received_at INTEGER NOT NULL DEFAULT 0)",
+    )
+    .expect("the fixture tables are created");
+
+    let expired = "tool_approval:1:0:toolu_first";
+    let armed = "tool_approval:2:0:toolu_second";
+    // The earlier call timed out, so its timer stays behind as FIRED. The
+    // current call waits on an armed timer.
+    conn.execute(
+        "INSERT INTO harvest_timers VALUES (?1, 'e', 10, 1, 1)",
+        [format!("__signal_timeout:1:{expired}")],
+    )
+    .expect("the expired timer is recorded");
+    conn.execute(
+        "INSERT INTO harvest_timers VALUES (?1, 'e', 99, 0, 2)",
+        [format!("__signal_timeout:2:{armed}")],
+    )
+    .expect("the armed timer is recorded");
+
+    let found = inspect::outstanding_signal(&conn, "e")
+        .expect("the wait query runs")
+        .expect("an armed wait must be reported");
+    assert_eq!(
+        found, armed,
+        "the armed wait must be restored, and not the timed-out one"
+    );
+
+    // A decision sent but not yet taken up lives only in the staged table.
+    // The wait must not come back over it, or a second answer would be taken
+    // for a call that is already decided.
+    conn.execute(
+        "INSERT INTO harvest_signals (exec_id, name, payload_json) VALUES ('e', ?1, '{}')",
+        [armed],
+    )
+    .expect("the decision is staged");
+    let staged = inspect::outstanding_signal(&conn, "e").expect("the wait query runs");
+    assert!(
+        staged.is_none(),
+        "a staged decision ends the wait, and got {staged:?}"
+    );
+
+    // Once the workflow takes the decision up, the row is marked delivered
+    // and the event carries it. The wait stays closed.
+    conn.execute("UPDATE harvest_signals SET delivered = 1", [])
+        .expect("the decision is taken up");
+    let event = json!({
+        "type": "SignalReceived",
+        "data": { "signal_name": armed, "payload": { "approved": true } },
+    });
+    conn.execute(
+        "INSERT INTO harvest_events VALUES ('e', 0, ?1)",
+        [event.to_string()],
+    )
+    .expect("the delivery is appended");
+    let done = inspect::outstanding_signal(&conn, "e").expect("the wait query runs");
+    assert!(
+        done.is_none(),
+        "a delivered decision ends the wait, and got {done:?}"
+    );
+}
+
 /// A restarted daemon knows what a parked session awaits before it serves.
 ///
 /// The parked state was empty until the first drive, while the socket already

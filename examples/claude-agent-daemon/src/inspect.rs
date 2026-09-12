@@ -413,17 +413,23 @@ pub fn signal_deadline(
 /// The wait is durable, so it can be read instead. A signal wait with a
 /// deadline records a `__signal_timeout:` timer, which names the signal.
 ///
-/// The delivery is checked as well. A previous daemon may have delivered the
-/// signal and stopped before the drive that consumed it. The timer can
+/// A decision already in hand is checked as well. A previous daemon may have
+/// taken one and stopped before the drive that consumed it. The timer can
 /// outlive that, so a timer ALONE would report a wait that is already over.
-/// This is an approval gate, and a decision must not be accepted twice.
+/// This is an approval gate, and a decision must not be accepted twice. See
+/// [`answered`], which reads the staged decision and the event both.
 ///
 /// # Errors
 ///
 /// Returns an error if either query fails.
 pub fn outstanding_signal(conn: &Connection, exec_id: &str) -> Result<Option<String>, String> {
+    // `fired = 0` is the backend's own proof of a wait that is still armed.
+    // An approval that timed out leaves its timer behind with `fired = 1`,
+    // and a timed-out wait has no answer either. Reading every timer would
+    // therefore return the EXPIRED signal of an earlier call. The status
+    // would show a token nobody can approve, and hide the one that works.
     let mut timers = conn
-        .prepare("SELECT timer_id FROM harvest_timers WHERE exec_id = ?1")
+        .prepare("SELECT timer_id FROM harvest_timers WHERE exec_id = ?1 AND fired = 0")
         .map_err(|e| format!("cannot prepare the wait query: {e}"))?;
     let named = timers
         .query_map([exec_id], |row| row.get::<_, String>(0))
@@ -434,7 +440,7 @@ pub fn outstanding_signal(conn: &Connection, exec_id: &str) -> Result<Option<Str
         let Some(name) = signal_of(&timer) else {
             continue;
         };
-        if received(conn, exec_id, &name)? {
+        if answered(conn, exec_id, &name)? {
             continue;
         }
         return Ok(Some(name));
@@ -450,21 +456,47 @@ fn signal_of(timer_id: &str) -> Option<String> {
         .map(|(_seq, name)| name.to_string())
 }
 
-/// Did this signal already arrive?
-fn received(conn: &Connection, exec_id: &str, signal: &str) -> Result<bool, String> {
+/// Is a decision for this signal already in hand?
+///
+/// TWO tables answer that, and one of them alone is not enough. A decision is
+/// STAGED in `harvest_signals` when it is sent, and the event is appended
+/// later, when the workflow takes it up. A daemon that stopped between the
+/// two holds a decision that will win on the next drive.
+///
+/// Reading the event alone would restore the wait over such a decision, and a
+/// second answer would be taken for a call already decided.
+fn answered(conn: &Connection, exec_id: &str, signal: &str) -> Result<bool, String> {
+    let staged = one_row(
+        conn,
+        "SELECT 1 FROM harvest_signals WHERE exec_id = ?1 AND name = ?2 \
+         AND delivered = 0 LIMIT 1",
+        exec_id,
+        signal,
+    )?;
+    if staged {
+        return Ok(true);
+    }
+    one_row(
+        conn,
+        "SELECT 1 FROM harvest_events WHERE exec_id = ?1 \
+         AND json_extract(event_json, '$.type') = 'SignalReceived' \
+         AND json_extract(event_json, '$.data.signal_name') = ?2 LIMIT 1",
+        exec_id,
+        signal,
+    )
+}
+
+/// Does this query find a row?
+fn one_row(conn: &Connection, sql: &str, exec_id: &str, signal: &str) -> Result<bool, String> {
     let mut statement = conn
-        .prepare(
-            "SELECT 1 FROM harvest_events WHERE exec_id = ?1 \
-             AND json_extract(event_json, '$.type') = 'SignalReceived' \
-             AND json_extract(event_json, '$.data.signal_name') = ?2 LIMIT 1",
-        )
-        .map_err(|e| format!("cannot prepare the delivery query: {e}"))?;
+        .prepare(sql)
+        .map_err(|e| format!("cannot prepare the decision query: {e}"))?;
     let mut rows = statement
         .query([exec_id, signal])
-        .map_err(|e| format!("cannot read the deliveries: {e}"))?;
+        .map_err(|e| format!("cannot read the decisions: {e}"))?;
     rows.next()
         .map(|row| row.is_some())
-        .map_err(|e| format!("cannot read a delivery: {e}"))
+        .map_err(|e| format!("cannot read a decision: {e}"))
 }
 
 /// Is this timer the deadline of that signal's wait?
