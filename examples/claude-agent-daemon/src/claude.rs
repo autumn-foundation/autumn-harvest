@@ -188,9 +188,27 @@ fn call_api(
     let response = response.map_err(|e| format!("the request to the Claude API failed: {e}"))?;
     let status = response.status();
 
-    let text = match tokio::task::block_in_place(|| Handle::current().block_on(response.text())) {
-        Ok(text) => text,
-        Err(e) => return Err(body_failure(status, &format!("its response was lost: {e}"))),
+    // The body is read under the same flag as the request above. A response
+    // whose headers arrived can still stall on its body. That would hold the
+    // daemon for the rest of the timeout, which is the case this race exists
+    // for.
+    let body = tokio::task::block_in_place(|| {
+        Handle::current().block_on(async {
+            tokio::select! {
+                result = response.text() => Some(result),
+                () = stop.raised() => None,
+            }
+        })
+    });
+    let text = match body {
+        Some(Ok(text)) => text,
+        Some(Err(e)) => return Err(body_failure(status, &format!("its response was lost: {e}"))),
+        // A stop is not a malformed answer, so this stays RETRYABLE even though
+        // the request was accepted. A non-retryable failure here would end the
+        // session, and `Ctrl-C` would then destroy what a `kill` leaves
+        // resumable. The turn is re-sent on the next start, in the window the
+        // README names.
+        None => return Err("the daemon is stopping, so this turn did not finish".to_string()),
     };
 
     if !status.is_success() {

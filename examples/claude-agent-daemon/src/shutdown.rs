@@ -2,7 +2,7 @@
 //!
 //! `Ctrl-C` cannot be seen by the task that drives a session. The model
 //! activity is synchronous, and it blocks its own thread for the whole HTTP
-//! request, so nothing else on that task is polled until the request returns.
+//! request. Nothing else on that task is polled until the request returns.
 //!
 //! A separate task therefore waits for the signal and raises this flag. The
 //! drive loop waits on the flag, and so does the request itself, inside the
