@@ -103,7 +103,7 @@ conflict shapes.
 - `autumn-harvest/tests/integration/cross_region_dr_tests.rs` (DB, live
   Postgres): `one_unmeasurable_slot_beside_a_measurable_one_is_a_partial_reading`,
   `a_slot_matching_the_prefix_only_under_like_wildcards_is_not_counted`,
-  `promotion_advances_a_sequence_owned_by_a_table_in_a_different_schema`,
+  `promotion_advances_a_sequence_owned_by_a_table_in_a_non_public_schema`,
   `promotion_never_rewinds_a_descending_sequence`,
   `concurrent_first_starts_always_agree_on_the_provisioned_generation`,
   `measure_rpo_ignores_heartbeats_from_a_superseded_generation`.

@@ -1797,12 +1797,13 @@ mod db {
         .await
         .map_err(database_error)?;
 
-        // `tn.nspname` (the OWNING TABLE's schema), not `sn.nspname` (the
-        // sequence's own schema) — finding 5. A table in `current_schema()`
-        // can own a sequence created in another schema. That is legal, and
-        // something a migration that qualifies `CREATE SEQUENCE` produces.
-        // Filtering on the sequence's own schema silently skipped it,
-        // leaving it un-advanced after promotion.
+        // `tn.nspname` names the OWNING TABLE's schema, not `sn.nspname`,
+        // the sequence's own schema (finding 5). Postgres keeps an owned
+        // sequence in the same schema as its table. The two schemas never
+        // diverge in practice. This filter still names the table, since
+        // promotion advances sequences for tables in the current schema.
+        // The choice keeps intent clear, even though it behaves the same
+        // as filtering on the sequence today.
         let columns: Vec<SerialColumn> = diesel::sql_query(
             "SELECT tn.nspname::text AS table_schema, \
                     c.relname::text  AS table_name, \

@@ -1058,35 +1058,34 @@ async fn promotion_advances_reserved_word_and_mixed_case_relations() {
     );
 }
 
-/// A sequence owned by a table in `current_schema()` must be advanced even
-/// when the sequence itself was created in a different schema (finding 5).
+/// A sequence owned by a table in a non-public schema must be advanced,
+/// using the OWNING TABLE's schema rather than the sequence's own
+/// (finding 5).
 ///
-/// The catalog query filtered on the SEQUENCE's own schema
-/// (`sn.nspname = current_schema()`) rather than the OWNING TABLE's
-/// (`tn.nspname`). Postgres requires `ALTER SEQUENCE ... OWNED BY` to name a
-/// table in the SAME schema, but does not re-check that afterward. Moving
-/// either object with `ALTER ... SET SCHEMA` leaves the ownership link
-/// intact while the two diverge. That is exactly the shape a migration
-/// produces when it qualifies `CREATE SEQUENCE` into one schema while the
-/// table lives
-/// elsewhere produces. That case was silently skipped, leaving the promoted
-/// primary handing out already-used primary keys on its first writes.
+/// The catalog query selected `tn.nspname` (the owning table's namespace)
+/// but filtered on `sn.nspname = current_schema()` (the sequence's own).
+/// Postgres always keeps an owned sequence in the same schema as its
+/// table. The two names never diverge, so this distinction has no
+/// effect on the current query. Filtering on the table's schema states
+/// the intent plainly: promotion advances sequences for tables, not for
+/// the sequences themselves. This test exercises the qualified-name path
+/// with both objects outside `public`.
 #[tokio::test]
-async fn promotion_advances_a_sequence_owned_by_a_table_in_a_different_schema() {
+async fn promotion_advances_a_sequence_owned_by_a_table_in_a_non_public_schema() {
     let (url, _db) = require_db!("crossschema");
     let mut conn = connect(&url).await;
     conn.batch_execute(
         "CREATE SCHEMA dr_seq_home;
-         CREATE SEQUENCE dr_cross_seq;
-         CREATE TABLE dr_cross (id BIGINT PRIMARY KEY DEFAULT nextval('dr_cross_seq'));
-         ALTER SEQUENCE dr_cross_seq OWNED BY dr_cross.id;
-         ALTER SEQUENCE dr_cross_seq SET SCHEMA dr_seq_home;
+         CREATE SEQUENCE dr_seq_home.dr_cross_seq;
+         CREATE TABLE dr_seq_home.dr_cross (id BIGINT PRIMARY KEY DEFAULT nextval('dr_seq_home.dr_cross_seq'));
+         ALTER SEQUENCE dr_seq_home.dr_cross_seq OWNED BY dr_seq_home.dr_cross.id;
+         SET search_path TO dr_seq_home, public;
          INSERT INTO dr_cross DEFAULT VALUES;
          INSERT INTO dr_cross DEFAULT VALUES;
          SELECT setval('dr_seq_home.dr_cross_seq', 1, false);",
     )
     .await
-    .expect("seed a table owning a sequence in another schema");
+    .expect("seed a table owning a sequence in a non-public schema");
 
     let advanced = autumn_harvest::replication::advance_sequences_after_promotion(&mut conn)
         .await
@@ -1095,8 +1094,8 @@ async fn promotion_advances_a_sequence_owned_by_a_table_in_a_different_schema() 
         advanced
             .iter()
             .any(|(name, _)| name.contains("dr_cross_seq")),
-        "a sequence owned by a table in current_schema() must be advanced even \
-         though the sequence itself lives in a different schema; advanced: {advanced:?}"
+        "a sequence owned by a table in a non-public current_schema() must \
+         be advanced; advanced: {advanced:?}"
     );
 
     #[derive(diesel::QueryableByName)]
