@@ -1551,6 +1551,55 @@ fn model_text_cannot_drive_the_terminal() {
 }
 
 #[test]
+fn a_created_directory_can_be_entered_by_its_owner() {
+    use std::os::unix::fs::PermissionsExt;
+
+    // The umask is one value for the whole process, so the hostile mask runs
+    // in a CHILD. A sibling test creating a file at the same moment would
+    // otherwise see it, and the mode it asserts would be wrong. The child is
+    // this same test binary, told by the marker to do the second half.
+    const MARKER: &str = "AGENTD_UMASK_WORKSPACE";
+    let Ok(workspace) = std::env::var(MARKER) else {
+        let dir = tempfile::tempdir().expect("a temporary directory");
+        let status =
+            std::process::Command::new(std::env::current_exe().expect("the running test binary"))
+                .args([
+                    "--exact",
+                    "tests::a_created_directory_can_be_entered_by_its_owner",
+                ])
+                .env(MARKER, dir.path())
+                .status()
+                .expect("the child runs");
+        assert!(status.success(), "the child must pass: {status}");
+        return;
+    };
+
+    // A umask that masks every owner bit. `create_dir_all` asks for 0777, so
+    // what survives is 000, and nothing can be written inside the result.
+    unsafe { libc::umask(0o777) };
+    let workspace = Path::new(&workspace);
+    let nested = workspace.join("deep/nested");
+    tools::create_enterable(&nested).expect("the directories are created");
+
+    for level in [workspace.join("deep"), nested.clone()] {
+        let mode = std::fs::metadata(&level)
+            .expect("the directory exists")
+            .permissions()
+            .mode()
+            & 0o7777;
+        assert_eq!(
+            mode & 0o700,
+            0o700,
+            "{} must stay enterable by its owner, and has mode {mode:o}",
+            level.display()
+        );
+    }
+
+    // The point of the owner bits: a file can be written inside.
+    std::fs::write(nested.join("notes.md"), "hello").expect("a write lands inside");
+}
+
+#[test]
 fn a_key_of_whitespace_is_not_a_key() {
     // A key of whitespace would count as present, and the daemon would run
     // live against it. Every turn would fail at the API. An absent key runs

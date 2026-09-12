@@ -893,7 +893,10 @@ pub fn pending_call(
 /// Returns an error if the workspace cannot be created or resolved, if its
 /// name is not valid UTF-8, or if the database is inside it.
 fn prepare_workspace(workspace: &Path, db: &Path) -> Result<String, String> {
-    std::fs::create_dir_all(workspace)
+    // Created enterable by its owner. A umask that masks the owner bits would
+    // otherwise give the new workspace mode `000`. Nothing could then be
+    // written inside it. See [`tools::create_enterable`].
+    tools::create_enterable(workspace)
         .map_err(|e| format!("cannot create the workspace {}: {e}", workspace.display()))?;
     // Resolve it once. Every session records this value, and the tool activity
     // refuses a call whose session belongs to a different workspace.

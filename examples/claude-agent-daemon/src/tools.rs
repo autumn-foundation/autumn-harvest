@@ -370,7 +370,7 @@ fn write_file(workspace: &Path, relative: &str, content: &str) -> Result<String,
     }
 
     if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)
+        create_enterable(parent)
             .map_err(|e| format!("cannot create the parent of `{relative}`: {e}"))?;
     }
     // Every directory between the target and the workspace root can hold an
@@ -447,6 +447,41 @@ pub fn directories_to_flush(target: &Path, workspace: &Path) -> Vec<PathBuf> {
         return target.parent().map(Path::to_path_buf).into_iter().collect();
     }
     chain
+}
+
+/// Create a directory and its missing parents, each one the owner can enter.
+///
+/// `create_dir_all` asks for mode `0777`, and the umask decides what survives.
+/// A umask that masks the owner bits therefore gives a new directory mode
+/// `000`. The daemon cannot enter its own directory after that. The next level
+/// down fails, and so does the scratch file of the write. An approved write
+/// would need the operator to repair the permissions by hand.
+///
+/// Only a directory this call creates is adjusted, and only by adding the
+/// owner bits. A directory the operator already made narrow keeps the mode
+/// they chose.
+///
+/// The mode is widened after creation, rather than through the umask. The
+/// umask is one value for the whole process, and this daemon creates its
+/// private files on other threads.
+pub fn create_enterable(directory: &Path) -> std::io::Result<()> {
+    let missing: Vec<&Path> = directory
+        .ancestors()
+        .take_while(|level| !level.exists())
+        .collect();
+    for level in missing.into_iter().rev() {
+        match std::fs::create_dir(level) {
+            Ok(()) => {
+                let mut mode = std::fs::metadata(level)?.permissions();
+                mode.set_mode(mode.mode() | 0o700);
+                std::fs::set_permissions(level, mode)?;
+            }
+            // Another process reached the same name first. It owns the mode.
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(())
 }
 
 /// Create a scratch file beside the target, and return it with its path.
