@@ -15,6 +15,7 @@
 use std::collections::HashMap;
 use std::os::unix::fs::FileTypeExt;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::Duration;
 
 use autumn_harvest_sqlite::{ExecutionId, RunState, SqliteRuntime};
@@ -22,7 +23,7 @@ use rusqlite::Connection;
 use serde_json::Value;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{Semaphore, mpsc, oneshot};
 
 use crate::claude::{self, ModelConfig};
 use crate::guard;
@@ -35,6 +36,26 @@ use crate::tools;
 
 /// How many control commands may queue while the runtime is busy.
 const COMMAND_BACKLOG: usize = 32;
+
+/// How many control connections the daemon holds at once.
+///
+/// A command waits while the runtime is busy, and a model call holds it for as
+/// long as the API takes. Without this bound, every connection accepted during
+/// that time is a task and a descriptor parked in the channel send. A polling
+/// script would spend the daemon's descriptors, and the answer to every
+/// command would arrive no sooner.
+///
+/// The permit is taken BEFORE the accept. A connection that has nowhere to go
+/// is not accepted at all, so the kernel queues it on the listening socket
+/// instead. The operator sees one command wait, rather than a daemon that ran
+/// out of descriptors.
+const MAX_CONNECTIONS: usize = COMMAND_BACKLOG;
+
+/// How long to wait after `accept` fails.
+///
+/// A descriptor limit makes `accept` fail at once, every time. Without a pause
+/// the loop spins on it and fills the log.
+const ACCEPT_BACKOFF: Duration = Duration::from_millis(100);
 
 /// Everything the daemon needs to start.
 pub struct Options {
@@ -311,12 +332,26 @@ pub async fn bind(socket: &Path) -> Result<UnixListener, String> {
 
 /// Accept connections and forward each request to the main loop.
 async fn accept_loop(listener: UnixListener, tx: mpsc::Sender<Job>) {
+    let permits = Arc::new(Semaphore::new(MAX_CONNECTIONS));
     loop {
+        // Take the permit first. See [`MAX_CONNECTIONS`].
+        let Ok(permit) = Arc::clone(&permits).acquire_owned().await else {
+            return;
+        };
         match listener.accept().await {
             Ok((stream, _)) => {
-                tokio::spawn(serve_connection(stream, tx.clone()));
+                let tx = tx.clone();
+                tokio::spawn(async move {
+                    // The permit is released when this connection is done.
+                    let _permit = permit;
+                    serve_connection(stream, tx).await;
+                });
             }
-            Err(e) => tracing::warn!(error = %e, "cannot accept a control connection"),
+            Err(e) => {
+                drop(permit);
+                tracing::warn!(error = %e, "cannot accept a control connection");
+                tokio::time::sleep(ACCEPT_BACKOFF).await;
+            }
         }
     }
 }

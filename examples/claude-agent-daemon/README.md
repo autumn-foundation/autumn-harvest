@@ -260,7 +260,9 @@ Honest limits, so nothing here reads as a promise:
   dies, so a crash strands nothing. A fleet wants the Postgres core.
 - **The runtime is serialised.** A control command waits while a model call is
   in flight, because both need the runtime mutably. That is the single-writer
-  model, made visible.
+  model, made visible. The daemon holds at most 32 control connections while it
+  waits, and the kernel queues the rest on the listening socket, so a polling
+  script cannot spend its descriptors.
 - **The transcript rides in history.** Each turn stores the whole conversation
   as its activity input, which is simple and replay-exact but grows with the
   session. A long-running agent should store the transcript outside the engine

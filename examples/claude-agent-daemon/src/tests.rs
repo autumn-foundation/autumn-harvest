@@ -406,6 +406,45 @@ async fn a_second_daemon_resumes_a_session_the_first_one_left_running() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn the_daemon_answers_more_connections_than_it_holds_at_once() {
+    let dir = tempfile::tempdir().expect("a temporary directory");
+    let socket = dir.path().join("agentd.sock");
+    let options = daemon::Options {
+        db: dir.path().join("agentd.db"),
+        socket: socket.clone(),
+        workspace: dir.path().join("workspace"),
+        model: claude::DEFAULT_MODEL.to_string(),
+        max_tokens: claude::DEFAULT_MAX_TOKENS,
+        tick: Duration::from_millis(50),
+        api_key: None,
+    };
+    let daemon = tokio::spawn(daemon::serve(options));
+    await_daemon(&socket).await;
+
+    // More callers at once than the daemon holds connections for. The bound
+    // stops a polling script from spending the daemon's descriptors. This test
+    // proves the bound costs no answers. The kernel queues the callers that
+    // wait on the listening socket.
+    let callers = 80;
+    let mut answers = Vec::with_capacity(callers);
+    for _ in 0..callers {
+        let socket = socket.clone();
+        answers.push(tokio::spawn(async move {
+            protocol::call(&socket, &Request::List).await
+        }));
+    }
+
+    for answer in answers {
+        let answered = answer.await.expect("the caller finishes");
+        assert!(
+            matches!(answered, Ok(Response::Sessions { .. })),
+            "every caller must be answered: {answered:?}"
+        );
+    }
+    daemon.abort();
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn the_daemon_serves_one_session_over_its_socket() {
     let dir = tempfile::tempdir().expect("a temporary directory");
     let socket = dir.path().join("agentd.sock");
