@@ -4,7 +4,7 @@
 //! no network. The stub drives the same loop the live model does: one tool
 //! call, one approval-gated write, then a final answer.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
@@ -1725,6 +1725,54 @@ async fn a_decision_can_only_be_delivered_once() {
         "a repeated decision must be refused: {second:?}"
     );
 
+    daemon.abort();
+}
+
+#[tokio::test]
+async fn a_daemon_flushes_the_path_above_its_workspace() {
+    let dir = tempfile::tempdir().expect("a temporary directory");
+    let root = dir.path().canonicalize().expect("the directory resolves");
+    let workspace = root.join("projects/agent/workspace");
+
+    // The write path flushes from a target up to the workspace root. The entry
+    // that NAMES the root lives above it, so the chain above is the daemon's
+    // to flush at startup.
+    let chain = daemon::path_above(&workspace);
+    assert_eq!(
+        chain.get(..3),
+        Some(
+            &[
+                root.join("projects/agent"),
+                root.join("projects"),
+                root.clone()
+            ][..]
+        ),
+        "the chain must start in the directory just above the workspace"
+    );
+    assert_eq!(
+        chain.last().map(PathBuf::as_path),
+        Some(Path::new("/")),
+        "the chain must end at the filesystem root"
+    );
+    assert!(
+        !chain.contains(&workspace),
+        "the workspace itself is flushed by every write, not here"
+    );
+
+    // A workspace several levels deep is created and served. The startup flush
+    // must not stop that.
+    let options = daemon::Options {
+        db: root.join("agentd.db"),
+        socket: root.join("agentd.sock"),
+        workspace: workspace.clone(),
+        model: claude::DEFAULT_MODEL.to_string(),
+        max_tokens: claude::DEFAULT_MAX_TOKENS,
+        tick: Duration::from_millis(50),
+        api_key: None,
+    };
+    let daemon = tokio::spawn(daemon::serve(options));
+    await_daemon(&root.join("agentd.sock")).await;
+    assert!(workspace.is_dir(), "the workspace must exist");
     daemon.abort();
 }
 

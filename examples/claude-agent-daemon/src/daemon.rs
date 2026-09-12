@@ -110,6 +110,10 @@ pub async fn serve(options: Options) -> Result<(), String> {
             options.workspace.display()
         )
     })?;
+    // `create_dir_all` above wrote no directory entry to disk. The write path
+    // flushes from a target up to the workspace root, and the entry that NAMES
+    // the root lives above it. See [`flush_workspace_path`].
+    flush_workspace_path(&resolved);
     // The model can write to any path inside the workspace, and `write_file`
     // replaces its target. The database, and its `-wal` sidecar beside it,
     // must therefore not be reachable from there.
@@ -674,6 +678,45 @@ pub fn pending_call(
         }
     }
     None
+}
+
+/// The directories above the workspace, closest first.
+///
+/// The workspace itself is not in the list. Every write flushes it already,
+/// because it is the top of the chain the write path walks.
+pub fn path_above(workspace: &Path) -> Vec<PathBuf> {
+    workspace
+        .ancestors()
+        .skip(1)
+        .map(Path::to_path_buf)
+        .collect()
+}
+
+/// Make the workspace's own directory entry durable.
+///
+/// `create_dir_all` writes no entry to disk. A power loss after a committed
+/// write could therefore remove the workspace that the daemon created, and the
+/// recorded file with it. The write path cannot cover this: it flushes from a
+/// target up to the root, and the entry that names the root is above it.
+///
+/// The whole chain is flushed, and not only what this process created.
+/// A daemon that created those directories and then died would leave the next
+/// start with nothing to flush and the same unwritten entries.
+///
+/// A directory that cannot be opened or flushed is logged and skipped. This is
+/// durability work on an operator's own tree. It is not a reason to refuse to
+/// serve.
+fn flush_workspace_path(workspace: &Path) {
+    for directory in path_above(workspace) {
+        let flushed = std::fs::File::open(&directory).and_then(|handle| handle.sync_all());
+        if let Err(e) = flushed {
+            tracing::warn!(
+                path = %directory.display(),
+                error = %e,
+                "cannot flush a directory above the workspace"
+            );
+        }
+    }
 }
 
 /// Refuse a database that the agent can reach.
