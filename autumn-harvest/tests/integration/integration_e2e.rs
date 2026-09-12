@@ -4984,6 +4984,15 @@ async fn wait_for_completion_with_diagnostics(
 /// diagnosis and reproduction steps. This is a product-level gap, not a
 /// test-tolerance problem. The bound below is not widened again for this
 /// cause.
+///
+/// **2026-09-12 partial fix (PR #1499):** `reset_timed_out_workflow_task`'s
+/// pool-connection retry budget was `[0, 200, 500, 2_000]`, ~2.7s total. It
+/// exhausted twice on this exact commit, on two different shards. Each
+/// left a subset of children `RUNNING` on a live worker past the 180s
+/// bound. Widened to the same capped exponential backoff (1s * 2^n, capped
+/// at 30s) used elsewhere in this file, ~61s total. This narrows, but does
+/// not close, #1459: a wedged task still has no reclaim path if the
+/// underlying contention outlasts the new budget.
 #[tokio::test(flavor = "multi_thread", worker_threads = 12)]
 async fn worker_completes_ten_child_fan_out_within_wall_clock_bound() {
     let (database_url, _container) = setup_test_database_url().await;

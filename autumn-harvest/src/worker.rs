@@ -28516,9 +28516,29 @@ pub async fn reset_timed_out_workflow_task(pool: &DbPool, task_id: uuid::Uuid, w
     // Retry acquiring a pool connection: a transient pool saturation during
     // timeout handling would otherwise leave the task stuck in RUNNING on a
     // live worker (the orphan reclaimer skips tasks owned by live workers).
+    //
+    // Issue #1459 diagnosed this exact budget as the gap. The original
+    // schedule (`[0, 200, 500, 2_000]`, ~2.7s total) exhausts under
+    // multi-second connection-pool contention. A busy CI runner or a
+    // loaded shard can produce that contention. Once the budget exhausts,
+    // the row has no other backstop. The poison-pill orphan reclaimer only
+    // reclaims tasks owned by a dead worker, never a wedged task on a
+    // still-live one.
+    //
+    // Widened to the same capped exponential backoff (1s * 2^n, capped at
+    // 30s) `capability_miss_max_redeliveries` already uses elsewhere in
+    // this file. A genuinely transient saturation now gets ~61s to clear
+    // before this path gives up and logs the "task may be stuck RUNNING"
+    // error below.
+    //
+    // This narrows, but does not close, #1459. A connection outage longer
+    // than ~61s still leaves the row stuck with no backstop, since nothing
+    // here adds a reclaim path for a wedged task on a live worker. A
+    // dedicated liveness check for the claiming worker is a separate,
+    // larger question, tracked on the issue and not attempted here.
     let mut conn = {
         let mut last_err = None;
-        let backoff_ms: &[u64] = &[0, 200, 500, 2_000];
+        let backoff_ms: &[u64] = &[0, 1_000, 2_000, 4_000, 8_000, 16_000, 30_000];
         let mut result = None;
         for &delay_ms in backoff_ms {
             if delay_ms > 0 {
