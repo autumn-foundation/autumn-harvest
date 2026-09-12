@@ -1165,8 +1165,14 @@ fn strip_search_path_name(token: &str) -> Option<&str> {
 /// whitespace character embeds that character literally in the
 /// current argument instead of ending it there. `PostgreSQL`'s own
 /// splitter (`pg_split_opts`) tests with `isspace()`, not specifically
-/// a space, so a tab or other whitespace escapes the same way. `\\`
-/// embeds a literal backslash. Naive whitespace splitting would end an
+/// a space, so a tab or other whitespace escapes the same way. A
+/// backslash before any other character consumes the backslash too
+/// (issue #1266). `pg_split_opts` removes it unconditionally, so
+/// `public\,public` reaches the server the same as `public,public` --
+/// the backslash never survives to `SplitIdentifierString`. Keeping it
+/// here would compare two equivalent values as different.
+/// A trailing backslash with nothing after it has nothing to escape,
+/// so it is kept literally. Naive whitespace splitting would end an
 /// argument at an escaped whitespace character, corrupting any value
 /// that contains one.
 #[cfg(feature = "db")]
@@ -1176,11 +1182,7 @@ fn split_options_preserving_escapes(options: &str) -> Vec<String> {
     let mut has_token = false;
     let mut chars = options.chars().peekable();
     while let Some(c) = chars.next() {
-        if c == '\\'
-            && chars
-                .peek()
-                .is_some_and(|next| next.is_whitespace() || *next == '\\')
-        {
+        if c == '\\' && chars.peek().is_some() {
             current.push(chars.next().expect("peeked Some above"));
             has_token = true;
         } else if c.is_whitespace() {
@@ -3065,6 +3067,36 @@ mod tests {
             "omitting pg_temp always searches it first, but naming it \
              explicitly last searches it last -- a genuinely different \
              resolution order that must never collapse with the implicit one"
+        );
+    }
+
+    #[cfg(feature = "db")]
+    #[test]
+    fn from_dsns_groups_dsns_whose_search_path_differs_only_by_an_escaped_comma() {
+        let sharded = ShardedDbPool::from_dsns(
+            [
+                (
+                    ShardId::new(0),
+                    "postgres://db.example/shared?options=-c%20search_path%3Dpublic".to_string(),
+                ),
+                (
+                    ShardId::new(1),
+                    "postgres://db.example/shared?options=-c%20search_path%3Dpublic%5C%2Cpublic"
+                        .to_string(),
+                ),
+            ],
+            ShardId::new(0),
+            1,
+        )
+        .expect("pool builds without connecting");
+
+        let groups = sharded.pool_groups();
+        assert_eq!(
+            groups.len(),
+            1,
+            "pg_split_opts removes a backslash before any character, so \
+             public\\,public reaches the server the same as \
+             public,public, and both must select the same schema"
         );
     }
 

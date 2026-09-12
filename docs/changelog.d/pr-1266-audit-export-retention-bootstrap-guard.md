@@ -619,6 +619,42 @@ pins the first fix.
 `from_dsns_keeps_an_explicit_trailing_pg_temp_distinct_from_the_implicit_leading_one`
 pin the second, mirroring the twentieth round's `pg_catalog` test pair.
 
+A twenty-third review round raised two more findings in the same area,
+both P2: one fixed, one declined.
+
+The first found that `split_options_preserving_escapes` only consumed
+a backslash before whitespace or another backslash, but
+`pg_split_opts` removes a backslash before *any* character
+unconditionally, so `public\,public` reaches the server the same as
+`public,public` -- the backslash never survives to
+`SplitIdentifierString`. This finding sits in tension with this same
+PR's own twenty-first-round reasoning, which assumed the opposite
+(that `pg_split_opts` keeps an escaped character's backslash in
+place). Neither could be checked against the actual `PostgreSQL` C
+source in this environment. The fix was applied anyway, because the
+risk here is asymmetric: implementing it and being wrong lands in the
+safe, over-merging direction (two genuinely different values compare
+equal), while leaving it unfixed and being wrong stays in the
+dangerous, under-merging direction this whole key exists to close. The
+escape condition now consumes a backslash before any character, with a
+trailing, nothing-following backslash kept literally.
+`from_dsns_groups_dsns_whose_search_path_differs_only_by_an_escaped_comma`
+pins the fix.
+
+The second restates a gap the eighth review round already accepted,
+not a new one: `search_path="$user"` resolves to a schema named after
+the connecting role, so two DSNs differing only in username but
+sharing this setting can resolve `harvest_audit_log` through different
+schemas. Substituting the real username into that comparison would
+require keeping the username in the key at all -- exactly what the
+eighth round rejected, since `from_dsns` has a documented use
+(`harvest shard rebalance`, issue #964) with one database reached under
+different usernames, which dropping the username exists to keep
+merged. The finding's own description confirms the failure direction
+is the safe one -- a schema silently never purged, not a row deleted
+early -- consistent with why the eighth round accepted this gap rather
+than fixing it. Not fixed; replied with this reasoning instead.
+
 **Zero migration, zero engine impact beyond the new parameter.** No new
 `WorkflowEvent` variant, no schema change, no change to any existing call
 site's behavior when the new flag is left at its default (disabled).

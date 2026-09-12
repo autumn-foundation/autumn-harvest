@@ -370,11 +370,13 @@ shard records:
   must stay in separate groups, and two DSNs whose last `search_path`
   setting agrees must stay in one even if an earlier, overridden setting
   differs. Splitting `options` into arguments honors libpq's own
-  escaping: a backslash before any whitespace character (not only a
-  space — Postgres's own splitter, `pg_split_opts`, tests with
-  `isspace()`) embeds that character literally in the current argument
-  instead of ending it, so a `search_path` value is not truncated at an
-  escaped space or tab. The extracted value is then parsed as a
+  escaping: a backslash before any other character — not only
+  whitespace — is consumed by `pg_split_opts`, which removes it
+  unconditionally before the value ever reaches `SplitIdentifierString`,
+  so `public\,public` reaches the server the same as `public,public`.
+  Keeping the value from being truncated at an escaped space or tab
+  falls out of this same general rule. The extracted value is then
+  parsed as a
   Postgres identifier list, the same grammar `SplitIdentifierString`
   uses for `search_path` server-side: comma-separated, with
   insignificant whitespace around each name, an unquoted name folded to
