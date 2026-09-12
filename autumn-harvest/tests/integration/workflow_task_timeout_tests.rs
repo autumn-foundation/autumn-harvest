@@ -286,10 +286,10 @@ async fn reset_is_idempotent_on_wrong_state_or_worker() {
 ///
 /// `poison_pill::requeue_orphan` hands an orphan back as `PENDING` with
 /// `crash_strikes + 1`, and nothing stops the same worker from winning it
-/// again. A `(state, worker_id)` guard alone matches that new claim, so a
-/// reset still in flight from the previous dispatch would re-`PENDING` a row
-/// whose replacement handler is already running. That invites a second
-/// concurrent claim of one workflow task.
+/// again. A `(state, worker_id)` guard alone matches that new claim. A reset
+/// still in flight from the previous dispatch would then re-`PENDING` a row
+/// whose replacement handler already runs. That invites a second concurrent
+/// claim of one workflow task.
 ///
 /// `crash_strikes` is the discriminator, because the requeue that creates the
 /// race is what bumps it (issue #1459). It is the same argument
