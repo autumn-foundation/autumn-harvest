@@ -422,3 +422,43 @@ Re-ran all four suites above (`quota_supersede_ordering_tests.rs` 6/6,
 the new test included, `quota_lock_ordering_tests.rs` 2/2,
 `concurrency_supersede_tests.rs` 20/20, `quota_enforcement_tests.rs`
 35/39, the same known flake family) against the corrected design.
+
+## Follow-up 7 — PR #1484 review: the reconciliation gap was rejectable, not just observable
+
+A seventh automated review round challenged an assumption follow-up 5
+made: that a credited-but-unshed run could only be reported, never
+rejected, because the admission was "already committed" by the time the
+gap was knowable. Verified directly against the code: that assumption
+was wrong. `run_latest_wins_supersede` runs INSIDE the same open
+`conn.transaction(...)` closure the admission's row insert, quota
+check, `WorkflowStarted` event, and `queue::enqueue` call all share.
+Nothing commits until that closure returns `Ok`. No non-transactional
+side effect (a spawned completion-trigger task, an in-process dispatch
+hint) fires before that point either -- both are gated behind the
+`collected?` in the caller, unreachable on `Err`.
+
+**P1 — a real over-cap gap only emitted a counter.** Fixed by
+re-validating: when `credited_but_not_shed_count` finds a gap,
+`run_latest_wins_supersede` now calls `enforce_quota_admission` again,
+with `pending_supersede: None` (the real pass already ran, so there is
+nothing left to dry-run), reloading usage against the real, final
+population instead of the dry run's credit. A still-violating recheck
+returns `QuotaExceeded`, which rolls the whole transaction back through
+the exact path an ordinary quota rejection already uses -- no fresh
+row, no event, no enqueued task. `quota_policy`/`quota_key` are threaded
+through all four `run_latest_wins_supersede` call sites, the same
+values each caller already passes to `enforce_quota_admission`. The
+`harvest.quota.supersede_credit_not_shed` counter still fires on every
+gap, since the rarer cancellation-skip case is worth alerting on even
+when the recheck finds enough OTHER freed capacity to let the admission
+stand.
+
+Re-ran all four suites above (`quota_supersede_ordering_tests.rs` 6/6,
+`quota_lock_ordering_tests.rs` 2/2, `concurrency_supersede_tests.rs`
+20/20, `quota_enforcement_tests.rs` 35/39, the same known flake family)
+against the corrected design. No new test exercises the recheck's own
+rejection path directly -- doing so needs a genuine mid-transaction
+state change between the dry run and the real pass, which (unlike the
+row-lock tests earlier in this file) has no deterministic hook once the
+scan is unlocked; the existing suites confirm the ordinary,
+no-gap path stays byte-for-byte unchanged.

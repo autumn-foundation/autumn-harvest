@@ -1215,6 +1215,8 @@ pub async fn start_or_load_workflow_execution_collect(
                 &mut tx_deferred_checks,
                 metrics,
                 &credited_ids,
+                quota_enforcement_policy,
+                quota_key.as_deref(),
             )
             .await?;
 
@@ -1417,6 +1419,8 @@ pub async fn start_or_load_workflow_execution_collect(
                         &mut tx_deferred_checks,
                         metrics,
                         &credited_ids,
+                        quota_enforcement_policy,
+                        quota_key.as_deref(),
                     )
                     .await?;
                     tx_cancel_metrics.append(&mut sup_metrics);
@@ -1475,6 +1479,8 @@ pub async fn start_or_load_workflow_execution_collect(
                                 &mut tx_deferred_checks,
                                 metrics,
                                 &credited_ids,
+                                quota_enforcement_policy,
+                                quota_key.as_deref(),
                             )
                             .await?;
                             deferred.append(&mut sup_deferred);
@@ -1528,6 +1534,8 @@ pub async fn start_or_load_workflow_execution_collect(
                         &mut tx_deferred_checks,
                         metrics,
                         &credited_ids,
+                        quota_enforcement_policy,
+                        quota_key.as_deref(),
                     )
                     .await?;
                     extra_deferred.append(&mut sup_deferred);
@@ -2383,11 +2391,31 @@ mod resolve_by_workflow_id_tests {
 /// candidate can simply have changed state on its own. That can happen
 /// between the dry run's deliberately unlocked scan and this pass's own,
 /// later, independent re-scan. See `supersede_inner`'s own doc comment,
-/// and [`crate::concurrency::dry_run_supersede_credit`]'s. Either way, the
-/// admission already committed on the assumption that candidate would be
-/// gone. So a gap here is a real, if rare, over-cap breach, not merely a
-/// log line. This function reconciles `credited_ids` against
-/// `outcome.superseded` below and reports any gap.
+/// and [`crate::concurrency::dry_run_supersede_credit`]'s.
+///
+/// Either way, `enforce_quota_admission` already admitted on the
+/// assumption that candidate would be gone. Fresh evidence (issue #1228
+/// review): this function still runs INSIDE the same open transaction
+/// that admission started. The row insert, the quota check, the
+/// `WorkflowStarted` event, and the enqueued task have not committed
+/// yet. So a real gap here is not a fait accompli.
+///
+/// When `credited_ids` and `outcome.superseded` disagree, this function
+/// re-validates the SAME quota check against current usage. It uses the
+/// real pass's actual outcome instead of the dry run's credit. `quota_
+/// policy` and `quota_key` are `enforce_quota_admission`'s own inputs.
+/// Every caller below passes them straight through. `None` for either
+/// one means no policy, no cap, and so nothing to re-validate. The
+/// recheck is then skipped entirely -- the same zero-overhead default
+/// that call already keeps. A still-violating recheck returns
+/// `QuotaExceeded`. That rolls the whole transaction back through the
+/// same path an ordinary rejection already uses.
+///
+/// `emit_quota_supersede_credit_not_shed` still records the gap either
+/// way. The rare cancellation-skip case, a corrupted
+/// `parent_close_policy`, is worth alerting on. That holds even when
+/// this recheck finds enough OTHER capacity freed to let the admission
+/// stand.
 #[cfg(feature = "db")]
 async fn run_latest_wins_supersede(
     conn: &mut AsyncPgConnection,
@@ -2400,6 +2428,8 @@ async fn run_latest_wins_supersede(
     // can be counted, not just logged.
     metrics: Option<&(dyn crate::telemetry::MetricsRecorder + Send + Sync)>,
     credited_ids: &[uuid::Uuid],
+    quota_policy: Option<crate::quota::QuotaPolicy>,
+    quota_key: Option<&str>,
 ) -> HarvestResult<(Vec<StartCancelledRun>, Vec<DeferredTriggerStart>)> {
     if !request.concurrency_on_conflict.is_cancel_running() {
         return Ok((Vec::new(), Vec::new()));
@@ -2418,9 +2448,9 @@ async fn run_latest_wins_supersede(
     )
     .await?;
 
-    // Issue #1228 review, P2: a credited id this pass did not actually shed
-    // (see this function's own doc comment). Reported, never blocked -- the
-    // admission this credited is already committed by the time this runs.
+    // Issue #1228 review: a credited id this pass did not actually shed
+    // (see this function's own doc comment). Always recorded. Only
+    // rejected below when the recheck finds the key still over cap.
     let shed_ids: Vec<uuid::Uuid> = outcome
         .superseded
         .iter()
@@ -2429,6 +2459,22 @@ async fn run_latest_wins_supersede(
     let not_shed = crate::concurrency::credited_but_not_shed_count(credited_ids, &shed_ids);
     if let (Some(m), Ok(gap @ 1..)) = (metrics, u64::try_from(not_shed)) {
         crate::telemetry::emit_quota_supersede_credit_not_shed(m, request.workflow_name, gap);
+    }
+    if not_shed > 0 {
+        // `pending_supersede: None` -- the real pass already ran above, so
+        // there is nothing left to dry-run. This reloads usage and checks
+        // it against `quota_policy`, exactly as the caller's own earlier
+        // `enforce_quota_admission` call did. It uses the real, final
+        // population instead of a credited guess.
+        enforce_quota_admission(
+            conn,
+            quota_policy,
+            quota_key,
+            request.workflow_name,
+            metrics,
+            None,
+        )
+        .await?;
     }
 
     let cancel_metrics = outcome
