@@ -36,8 +36,9 @@
 //!   would open.
 //! - `every_batch_is_hmac_signed_and_carries_its_shard_and_seq_range` — AC1/AC4.
 //! - `a_shard_the_scanner_cannot_acquire_a_connection_for_is_marked_unobserved`
-//!   — issue #1268: `harvest.audit.export_observed` reports an unreachable
-//!   shard, so the lag gauge is never the only signal.
+//!   and `a_shard_whose_database_is_unreachable_is_marked_unobserved` — issue
+//!   #1268: `harvest.audit.export_observed` reports an unreachable shard, so
+//!   the lag gauge is never the only signal.
 
 use std::sync::{Arc, Mutex};
 
@@ -279,7 +280,8 @@ async fn unconfigured_export_never_touches_anything() {
     let (mut conn, _c) = make_conn().await;
     insert_audit_rows(&mut conn, 5).await;
 
-    let processed = fire_due_audit_exports(&mut conn, &None, &[], &NoOpMetrics)
+    let metrics = RecordingMetrics::default();
+    let processed = fire_due_audit_exports(&mut conn, &None, &[], &metrics)
         .await
         .expect("scanner runs");
     assert_eq!(processed, 0, "no sink configured means no work at all");
@@ -294,6 +296,16 @@ async fn unconfigured_export_never_touches_anything() {
             .expect("status query"),
         None,
         "no cursor row is created when no sink is configured"
+    );
+    assert!(
+        metrics.lag.lock().expect("lag").is_empty(),
+        "the lag gauge must not be touched when no sink is configured"
+    );
+    assert!(
+        metrics.observed.lock().expect("observed").is_empty(),
+        "harvest.audit.export_observed is part of the same AC8 contract: an \
+         embedder who never configures a sink must see zero metrics, not \
+         just zero database writes"
     );
 }
 
@@ -1680,6 +1692,48 @@ async fn a_shard_the_scanner_cannot_acquire_a_connection_for_is_marked_unobserve
         metrics.lag.lock().expect("lag").is_empty(),
         "the lag gauge must not be given a fabricated reading for a shard \
          that was never actually queried"
+    );
+}
+
+// The sibling of the test above. That one covers a shard with no pool at
+// all. This one covers a shard that IS mapped to a pool, but whose database
+// has gone away. Both must be marked unobserved, through the two different
+// arms of the connection-acquire match. Stopping the container gives an
+// immediate connection refusal, so this exercises the `Ok(Err(e))` arm
+// without waiting out `SHARD_ACQUIRE_BOUND`'s five-second timeout.
+#[tokio::test]
+async fn a_shard_whose_database_is_unreachable_is_marked_unobserved() {
+    let _guard = TEST_SERIAL.lock().await;
+    let _installed = install(Arc::new(RecordingSink::new(200)), 100);
+    let (mut conn, container) = make_conn().await;
+
+    let pool = single_connection_pool(&container).await;
+    container
+        .stop_with_timeout(Some(0))
+        .await
+        .expect("stop container");
+
+    let sharded = autumn_harvest::shard::ShardedDbPool::single(pool);
+    let metrics = RecordingMetrics::default();
+    let _ = fire_due_audit_exports(
+        &mut conn,
+        &Some(sharded),
+        &[autumn_harvest::types::ShardId::new(0)],
+        &metrics,
+    )
+    .await;
+    uninstall();
+
+    assert_eq!(
+        *metrics.observed.lock().expect("observed"),
+        vec![(0_u16, false)],
+        "a connection error acquiring a mapped shard's pool must be \
+         reported unobserved, exactly like a shard with no pool at all"
+    );
+    assert!(
+        metrics.lag.lock().expect("lag").is_empty(),
+        "the lag gauge must not be given a fabricated reading for a shard \
+         the exporter could never connect to"
     );
 }
 
