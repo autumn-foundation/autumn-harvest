@@ -3806,6 +3806,41 @@ fn a_capped_listing_walks_the_whole_directory() {
     );
 }
 
+/// The words a shell hands to the program, with the quoting removed.
+///
+/// The split is on the spaces OUTSIDE the quotes, so this reads a printed
+/// line the way a shell reads it. A test using it asserts nothing about how a
+/// flag is spelled. A value printed as its own word arrives as its own
+/// argument, which is the case that fails.
+fn words(line: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut word = String::new();
+    let mut quoted = false;
+    let mut started = false;
+    for character in line.chars() {
+        match character {
+            '\'' => {
+                quoted = !quoted;
+                started = true;
+            }
+            ' ' if !quoted => {
+                if started {
+                    out.push(std::mem::take(&mut word));
+                    started = false;
+                }
+            }
+            other => {
+                word.push(other);
+                started = true;
+            }
+        }
+    }
+    if started {
+        out.push(word);
+    }
+    out
+}
+
 /// What the daemon prints parses back to the socket it printed.
 ///
 /// Every follow-up command names the socket, and an operator copies the line.
@@ -3820,41 +3855,6 @@ fn a_capped_listing_walks_the_whole_directory() {
 #[test]
 fn a_printed_socket_flag_parses_back_to_the_same_socket() {
     use clap::Parser;
-
-    /// The words a shell hands to the program, with the quoting removed.
-    ///
-    /// The split is on the spaces OUTSIDE the quotes, so this reads the
-    /// printed line the way a shell reads it. The test asserts nothing about
-    /// how the flag is spelled. A value printed as its own word arrives as
-    /// its own argument, which is the case that fails.
-    fn words(line: &str) -> Vec<String> {
-        let mut out = Vec::new();
-        let mut word = String::new();
-        let mut quoted = false;
-        let mut started = false;
-        for character in line.chars() {
-            match character {
-                '\'' => {
-                    quoted = !quoted;
-                    started = true;
-                }
-                ' ' if !quoted => {
-                    if started {
-                        out.push(std::mem::take(&mut word));
-                        started = false;
-                    }
-                }
-                other => {
-                    word.push(other);
-                    started = true;
-                }
-            }
-        }
-        if started {
-            out.push(word);
-        }
-        out
-    }
 
     for raw in [
         "/run/agentd/project-b.sock",
@@ -5990,6 +5990,123 @@ async fn a_daemon_refuses_a_database_the_agent_could_write() {
             .expect_err("a dangling link must be refused")
             .contains("resolves to nothing"),
         "a link to nothing must be refused"
+    );
+}
+
+/// A restart hint parses back to the workspace it names.
+///
+/// The refusal tells the operator which `--workspace` resumes the session,
+/// and the line is made to be copied. A path holding a space split into two
+/// arguments, so the copied line named neither workspace and failed before it
+/// started. A path holding `;` was worse: a shell ran the rest of the line as
+/// a command.
+///
+/// This asserts the property, and not the spelling. The printed hint is split
+/// the way a shell splits it, and the words go to the real parser. See
+/// [`words`].
+#[tokio::test]
+async fn a_restart_hint_parses_back_to_the_workspace_it_names() {
+    use clap::Parser;
+
+    /// The backticked span that names the flag, which is the copied command.
+    ///
+    /// The message also names the workspace in PROSE. That value is read and
+    /// not copied, so only the span holding the flag is under test.
+    fn hint(message: &str) -> String {
+        message
+            .split('`')
+            .find(|span| span.starts_with("--workspace"))
+            .expect("the message holds a workspace hint")
+            .to_string()
+    }
+
+    let dir = tempfile::tempdir().expect("a temporary directory");
+    let db = dir.path().join("agentd.db");
+    // A name a shell reads as more than one word, and as a command.
+    let theirs = dir.path().join("my project; reboot");
+    let ours = dir.path().join("ours");
+    std::fs::create_dir_all(&theirs).expect("the workspace is created");
+    std::fs::create_dir_all(&ours).expect("the workspace is created");
+
+    let calls = Arc::new(AtomicUsize::new(0));
+    {
+        let mut rt = runtime(&db, &theirs, &calls);
+        let exec = rt
+            .start_workflow(WORKFLOW_NAME, task(&theirs))
+            .expect("the session starts");
+        drive_to_approval(&mut rt, exec).await;
+    }
+
+    let message = daemon::serve(daemon::Options {
+        db: db.clone(),
+        socket: dir.path().join("agentd.sock"),
+        workspace: ours,
+        model: claude::DEFAULT_MODEL.to_string(),
+        max_tokens: claude::DEFAULT_MAX_TOKENS,
+        tick: Duration::from_millis(50),
+        api_key: None,
+    })
+    .await
+    .expect_err("the daemon must refuse to start");
+    assert!(
+        message.contains("belongs to the workspace"),
+        "unexpected message: {message}"
+    );
+
+    // The hint is one word to a shell, so it cannot carry a command.
+    let printed = hint(&message);
+    let split = words(&printed);
+    assert_eq!(
+        split.len(),
+        1,
+        "the hint must be ONE shell word: {printed} -> {split:?}"
+    );
+    // One word proves the SPACE is quoted. The `;` needs its own reading,
+    // because a shell ends a command on it and this split does not.
+    let mut open = false;
+    for character in printed.chars() {
+        if character == '\'' {
+            open = !open;
+        }
+        assert!(
+            character != ';' || open,
+            "a `;` outside the quotes ends the copied command: {printed}"
+        );
+    }
+    assert!(!open, "the quoting must be closed: {printed}");
+
+    // And it parses back to the workspace the session belongs to.
+    let argv = vec!["agentd".to_string(), "serve".to_string(), split[0].clone()];
+    let cli = crate::Cli::try_parse_from(&argv)
+        .unwrap_or_else(|e| panic!("the printed hint must parse: {printed} -> {e}"));
+    let crate::Command::Serve { workspace, .. } = cli.command else {
+        panic!("the hint must name the serve command: {printed}");
+    };
+    assert_eq!(
+        workspace, theirs,
+        "the parsed workspace must be the recorded one: {printed}"
+    );
+
+    // Why the value is ATTACHED. A workspace may begin with a dash, and
+    // `AGENTD_WORKSPACE` or `--workspace=-x` can put a daemon on one. As a
+    // separate word, `clap` reads that value as more options. This is the
+    // parser reading both spellings, because a recorded path under a
+    // temporary directory is absolute and cannot carry the case.
+    let dashed = "-x/project";
+    assert!(
+        crate::Cli::try_parse_from(["agentd", "serve", "--workspace", dashed]).is_err(),
+        "a separate word must fail, which is why the value is attached"
+    );
+    let attached =
+        crate::Cli::try_parse_from(["agentd", "serve", &format!("--workspace={dashed}")])
+            .expect("an attached value parses");
+    let crate::Command::Serve { workspace, .. } = attached.command else {
+        panic!("the attached value must name the serve command");
+    };
+    assert_eq!(
+        workspace,
+        Path::new(dashed),
+        "an attached value reaches the daemon whole"
     );
 }
 

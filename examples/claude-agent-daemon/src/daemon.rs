@@ -368,20 +368,29 @@ fn check_resumable(
             return Err(unreadable(&row.exec_id));
         }
         let (recorded_workspace, recorded_model) = (&task.workspace, &task.model);
+        // Both restart hints are made to be COPIED, so each value is one
+        // shell word and is attached to its flag. A workspace holding a space
+        // would otherwise split into two arguments. One holding `;` would run
+        // the rest of the line as a command. A value that begins with a dash
+        // reads as more options as a separate word. This is the argument
+        // [`crate::protocol::socket_flag`] carries, applied to the two flags
+        // that name a recorded value.
         if recorded_workspace != workspace {
             return Err(format!(
                 "session {} belongs to the workspace `{recorded_workspace}`, and \
                  this daemon serves `{workspace}`. Start it with \
-                 `--workspace {recorded_workspace}` so the session can resume.",
-                row.exec_id
+                 `--workspace={}` so the session can resume.",
+                row.exec_id,
+                crate::protocol::quoted(recorded_workspace)
             ));
         }
         if recorded_model != model {
             return Err(format!(
                 "session {} runs on the model `{recorded_model}`, and this daemon \
-                 serves `{model}`. Start it with `--model {recorded_model}`, or \
-                 with the key that model needs, so the session can resume.",
-                row.exec_id
+                 serves `{model}`. Start it with `--model={}`, or with the key \
+                 that model needs, so the session can resume.",
+                row.exec_id,
+                crate::protocol::quoted(recorded_model)
             ));
         }
         // An id that does not parse is the same failure one step on. The
