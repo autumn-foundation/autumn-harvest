@@ -74,4 +74,22 @@ if ! grep -q "PostgresDeadLetterSink" <<<"$window"; then
   exit 1
 fi
 
-echo "OK: the 'record into harvest' example installs PostgresDeadLetterSink."
+# The name must actually resolve. This example is its own fenced block with
+# no `use` statement of its own (unlike the "Testing without a broker"
+# example above it), so a bare `PostgresDeadLetterSink::new(` here is an
+# unresolved name for anyone assembling the snippet as shown — caught live
+# in PR #1499 review, where the first fix used the bare name and the shared
+# import block above only imports RecordingDeadLetterSink.
+if grep -qF "PostgresDeadLetterSink::new(" <<<"$window" \
+  && ! grep -qF "autumn_harvest_plugin::connector::PostgresDeadLetterSink" <<<"$window"; then
+  echo "$doc: the example calls PostgresDeadLetterSink::new(...) by its bare" \
+    "name, but this fenced block has no 'use' statement importing it (the" \
+    "shared import block in the 'Testing without a broker' example above" \
+    "only imports RecordingDeadLetterSink), so the name does not resolve." >&2
+  echo >&2
+  echo "Fix: qualify it as" \
+    "autumn_harvest_plugin::connector::PostgresDeadLetterSink::new(...)." >&2
+  exit 1
+fi
+
+echo "OK: the 'record into harvest' example installs a resolvable PostgresDeadLetterSink."
