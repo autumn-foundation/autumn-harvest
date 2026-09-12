@@ -390,6 +390,12 @@ pub fn has_replayable_content(reply: &TurnReply) -> bool {
         .is_some_and(|blocks| blocks.iter().all(is_replayable_block))
 }
 
+/// The block types this example knows how to check.
+///
+/// A type outside this list is one a later API added, and its fields cannot
+/// be guessed. A type INSIDE it must carry that type's fields.
+const KNOWN_BLOCKS: [&str; 4] = ["text", "thinking", "redacted_thinking", "tool_use"];
+
 /// Is one content block whole enough to send back?
 fn is_replayable_block(block: &Value) -> bool {
     let Some(kind) = block.get("type").and_then(Value::as_str) else {
@@ -401,22 +407,36 @@ fn is_replayable_block(block: &Value) -> bool {
             .and_then(Value::as_str)
             .is_some_and(|text| !text.trim().is_empty())
     };
-    match kind.trim() {
-        "" => false,
+    // The type is matched EXACTLY. `parse_reply` matches it exactly, and the
+    // API accepts no padded name, so a trimmed match here would accept a
+    // block that both of them refuse.
+    match kind {
         "text" => block.get("text").is_some_and(Value::is_string),
-        // The text of a thinking block may be EMPTY, and an empty one is
-        // still replayed unchanged. This request asks for adaptive thinking
-        // and does not ask for a display, and the default display returns
-        // every thinking block with an empty text. A check for text here
-        // would refuse the model's ordinary replies.
-        "thinking" => block.get("thinking").is_some_and(Value::is_string),
+        // The thinking text may be EMPTY, and an empty one is still replayed.
+        // This request asks for adaptive thinking and asks for no display,
+        // and the default display returns every thinking block with an empty
+        // text. A check for text here would refuse ordinary replies.
+        //
+        // The SIGNATURE is the field that must be there. It carries the
+        // encrypted reasoning whatever the display setting, and the API reads
+        // it to prove the block came from the model.
+        "thinking" => block.get("thinking").is_some_and(Value::is_string) && names("signature"),
+        // The same argument, for the block that carries only the ciphertext.
+        "redacted_thinking" => names("data"),
         // The input must be an OBJECT. A tool input is declared with an
         // object schema, so `null` is a value the API refuses on replay.
         "tool_use" => {
             names("id") && names("name") && block.get("input").is_some_and(Value::is_object)
         }
         // A type from a later API. Its name is all this example can judge.
-        _ => true,
+        //
+        // A name that is blank, or that becomes a KNOWN name when the space
+        // around it is removed, is not such a type. It is a corrupted block
+        // of a type this example knows, and the API refuses it by name.
+        other => {
+            let bare = other.trim();
+            !bare.is_empty() && !KNOWN_BLOCKS.contains(&bare)
+        }
     }
 }
 

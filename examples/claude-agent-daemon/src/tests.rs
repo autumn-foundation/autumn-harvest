@@ -1594,9 +1594,25 @@ fn a_block_that_cannot_be_replayed_is_refused() {
         json!([{ "type": "tool_use", "id": "toolu_a", "name": "write_file", "input": Value::Null }]),
         json!([{ "type": "tool_use", "id": "toolu_a", "name": "write_file", "input": "text" }]),
         json!([{ "type": "tool_use", "id": "toolu_a", "name": "write_file", "input": [] }]),
-        json!([{ "type": "thinking" }]),
-        json!([{ "type": "thinking", "thinking": Value::Null }]),
-        json!([{ "type": "thinking", "thinking": 7 }]),
+        json!([{ "type": "thinking", "signature": "abc" }]),
+        json!([{ "type": "thinking", "thinking": Value::Null, "signature": "abc" }]),
+        json!([{ "type": "thinking", "thinking": 7, "signature": "abc" }]),
+        // The signature carries the encrypted reasoning, and the API reads it
+        // to prove the block came from the model. It is present whatever the
+        // display setting, so a block without one cannot be replayed.
+        json!([{ "type": "thinking", "thinking": "reasoned" }]),
+        json!([{ "type": "thinking", "thinking": "", "signature": "" }]),
+        json!([{ "type": "thinking", "thinking": "", "signature": " " }]),
+        json!([{ "type": "thinking", "thinking": "", "signature": 7 }]),
+        json!([{ "type": "redacted_thinking" }]),
+        json!([{ "type": "redacted_thinking", "data": "" }]),
+        // A padded name is a CORRUPTED block of a type this example knows,
+        // and not a type from a later API. `parse_reply` matches the type
+        // exactly, so it would ignore the block while the API refuses it.
+        json!([{ "type": " text ", "text": "hello" }]),
+        json!([{ "type": "text\n", "text": "hello" }]),
+        json!([{ "type": " thinking ", "thinking": "", "signature": "abc" }]),
+        json!([{ "type": " tool_use ", "id": "toolu_a", "name": "write_file", "input": {} }]),
     ] {
         assert!(
             !claude::has_replayable_content(&reply(incomplete.clone())),
@@ -1610,8 +1626,8 @@ fn a_block_that_cannot_be_replayed_is_refused() {
     // comes back with an empty text. A check for text here would refuse the
     // model's ORDINARY replies, which is a worse fault than the one above.
     for empty in [
-        json!([{ "type": "thinking", "thinking": "" }]),
         json!([{ "type": "thinking", "thinking": "", "signature": "abc" }]),
+        json!([{ "type": "thinking", "thinking": "reasoned", "signature": "abc" }]),
         json!([{ "type": "redacted_thinking", "data": "abc" }]),
     ] {
         assert!(
@@ -1626,7 +1642,6 @@ fn a_block_that_cannot_be_replayed_is_refused() {
     for fine in [
         json!([{ "type": "text", "text": "hello" }]),
         json!([{ "type": "text", "text": "" }]),
-        json!([{ "type": "thinking", "thinking": "…" }]),
         json!([{ "type": "a_type_from_a_later_api" }]),
         json!([{ "type": "tool_use", "id": "toolu_a", "name": "write_file", "input": {} }]),
         json!([]),
