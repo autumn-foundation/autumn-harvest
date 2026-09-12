@@ -1105,11 +1105,17 @@ fn canonical_dsn_key(dsn: &str) -> String {
 /// combined.
 ///
 /// The extracted value is then normalized the way `PostgreSQL` itself
-/// parses a schema list: comma-separated, with insignificant whitespace
-/// around each name. `tenant,public` and `tenant, public` name the same
-/// search path, so they must compare equal here too. A double-quoted
-/// schema name is not specially handled; trimming only surrounding
-/// whitespace never touches whitespace a quoted name encloses.
+/// parses a schema list (`SplitIdentifierString`): comma-separated,
+/// with insignificant whitespace around each name. An unquoted name is
+/// folded to lowercase, since `PostgreSQL` folds unquoted identifiers
+/// the same way. A double-quoted name keeps its case. It can also
+/// contain a comma or space that is not a separator. `""` inside one is
+/// a literal quote character. `tenant,public` and `tenant, public` name
+/// the same search path and must compare equal. `"tenant, one"` (one
+/// quoted name) must never compare equal to `tenant,one` (two unquoted
+/// names). Full `PostgreSQL` locale-dependent case folding is not
+/// chased here; ASCII/Unicode lowercasing is the accepted
+/// approximation, alongside the other documented gaps below.
 ///
 /// `options` can repeat `-c search_path=...` more than once. libpq
 /// applies each as a `SET` in order at session start, so only the last
@@ -1169,18 +1175,71 @@ fn split_options_preserving_escapes(options: &str) -> Vec<String> {
     tokens
 }
 
-/// Normalizes a `search_path` value the way `PostgreSQL`'s own schema-list
-/// parser does (issue #1266): names are comma-separated, and whitespace
-/// around each name is not significant. `tenant,public` and
-/// `tenant, public` must compare equal, since a session resolves both
-/// to the identical schema list.
+/// Normalizes a `search_path` value by parsing it as a `PostgreSQL`
+/// identifier list and rejoining the result (issue #1266). Falls back
+/// to the value unchanged when it does not parse. A malformed value
+/// cannot be normalized, so it is kept distinguishable from every other
+/// value rather than guessed at. This is the same conservative choice
+/// made elsewhere in this key.
 #[cfg(feature = "db")]
 fn normalize_search_path(value: &str) -> String {
-    value
-        .split(',')
-        .map(str::trim)
-        .collect::<Vec<_>>()
-        .join(",")
+    parse_identifier_list(value).map_or_else(|| value.to_string(), |items| items.join(","))
+}
+
+/// Parses a comma-separated identifier list the way `PostgreSQL`'s own
+/// `SplitIdentifierString` does (issue #1266), used for `search_path`
+/// and similar GUCs. Whitespace around an item is not significant. An
+/// unquoted item is folded to lowercase, matching `PostgreSQL`'s own
+/// folding of an unquoted identifier. A double-quoted item keeps its
+/// case verbatim, including any comma or whitespace it encloses; `""`
+/// inside one is a literal quote character. Returns `None` on anything
+/// that does not fit this grammar, rather than guessing at a malformed
+/// value. An unterminated quote is one such case. Content trailing a
+/// closing quote before the next comma is another.
+#[cfg(feature = "db")]
+fn parse_identifier_list(value: &str) -> Option<Vec<String>> {
+    let mut items = Vec::new();
+    let mut chars = value.chars().peekable();
+    loop {
+        while chars.next_if(|c| c.is_whitespace()).is_some() {}
+        match chars.peek() {
+            None => break,
+            Some('"') => {
+                chars.next();
+                let mut ident = String::new();
+                loop {
+                    match chars.next() {
+                        None => return None,
+                        Some('"') if chars.peek() == Some(&'"') => {
+                            ident.push('"');
+                            chars.next();
+                        }
+                        Some('"') => break,
+                        Some(c) => ident.push(c),
+                    }
+                }
+                items.push(ident);
+            }
+            Some(_) => {
+                let mut ident = String::new();
+                while let Some(&c) = chars.peek() {
+                    if c == ',' || c.is_whitespace() {
+                        break;
+                    }
+                    ident.push(c);
+                    chars.next();
+                }
+                items.push(ident.to_lowercase());
+            }
+        }
+        while chars.next_if(|c| c.is_whitespace()).is_some() {}
+        match chars.next() {
+            None => break,
+            Some(',') => {}
+            Some(_) => return None,
+        }
+    }
+    Some(items)
 }
 
 #[cfg(feature = "db")]
@@ -2618,6 +2677,65 @@ mod tests {
             "an escaped space in one alias's search_path value must not \
              stop it from collapsing with the other: PostgreSQL treats \
              `tenant,public` and `tenant, public` as the same schema list"
+        );
+    }
+
+    #[cfg(feature = "db")]
+    #[test]
+    fn from_dsns_groups_search_path_identifiers_that_differ_only_by_case() {
+        let sharded = ShardedDbPool::from_dsns(
+            [
+                (
+                    ShardId::new(0),
+                    "postgres://db.example/shared?options=-c%20search_path%3DPUBLIC".to_string(),
+                ),
+                (
+                    ShardId::new(1),
+                    "postgres://db.example/shared?options=-c%20search_path%3Dpublic".to_string(),
+                ),
+            ],
+            ShardId::new(0),
+            1,
+        )
+        .expect("pool builds without connecting");
+
+        let groups = sharded.pool_groups();
+        assert_eq!(
+            groups.len(),
+            1,
+            "PostgreSQL folds an unquoted identifier to lowercase, so \
+             `PUBLIC` and `public` name the same schema and must collapse"
+        );
+    }
+
+    #[cfg(feature = "db")]
+    #[test]
+    fn from_dsns_keeps_a_quoted_comma_containing_schema_distinct_from_two_plain_ones() {
+        let sharded = ShardedDbPool::from_dsns(
+            [
+                (
+                    ShardId::new(0),
+                    "postgres://db.example/shared?options=-c%20search_path%3D%22tenant%2C%20one%22"
+                        .to_string(),
+                ),
+                (
+                    ShardId::new(1),
+                    "postgres://db.example/shared?options=-c%20search_path%3Dtenant%2Cone"
+                        .to_string(),
+                ),
+            ],
+            ShardId::new(0),
+            1,
+        )
+        .expect("pool builds without connecting");
+
+        let groups = sharded.pool_groups();
+        assert_eq!(
+            groups.len(),
+            2,
+            "a quoted schema named literally `tenant, one` is one \
+             identifier, distinct from the two unquoted identifiers \
+             `tenant` and `one`, and must never collapse with them"
         );
     }
 

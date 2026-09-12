@@ -438,6 +438,40 @@ whitespace a quoted name encloses.
 `from_dsns_groups_dsns_whose_search_path_differs_only_by_an_escaped_space`
 pins this.
 
+A seventeenth review round found two more defects in the normalized
+`search_path` comparison, one P1 and one P2, both in the sixteenth
+round's own comma-split-and-trim normalization.
+
+The P1 found that two aliases setting `search_path=PUBLIC` and
+`search_path=public` resolve to the identical schema server-side --
+Postgres folds an unquoted identifier to lowercase -- but the prior
+normalization compared case verbatim, splitting them into separate pool
+groups. That is the dangerous direction: an unprotected purge on one
+alias could delete rows a still-protected alias has not exported.
+
+The P2 found the opposite failure on quoted identifiers: a value like
+`"tenant, one"` names one schema literally containing a comma, but
+splitting on every comma before trimming treated it the same as the
+two distinct unquoted schemas `tenant` and `one`, merging pools that
+resolve to different schemas -- the same silent-never-purged failure
+the seventh round's fix was written to prevent.
+
+Both trace to the same root cause: comma-splitting and trimming is not
+how Postgres actually parses an identifier list. `extract_search_path`
+now calls `parse_identifier_list`, a small parser matching Postgres's
+own `SplitIdentifierString` grammar -- quoting, `""` as an escaped
+literal quote, and case-folding applied only to unquoted names. A value
+that does not fit this grammar (an unterminated quote, trailing content
+after a closing quote) falls back to unparsed comparison, the same
+conservative choice made elsewhere in this key. Full Postgres
+locale-dependent case folding is not chased; Unicode lowercasing is the
+accepted approximation.
+
+New tests: `from_dsns_groups_search_path_identifiers_that_differ_only_by_case`
+pins the P1 fix, and
+`from_dsns_keeps_a_quoted_comma_containing_schema_distinct_from_two_plain_ones`
+pins the P2 fix.
+
 **Zero migration, zero engine impact beyond the new parameter.** No new
 `WorkflowEvent` variant, no schema change, no change to any existing call
 site's behavior when the new flag is left at its default (disabled).

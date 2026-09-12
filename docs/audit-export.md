@@ -354,11 +354,17 @@ shard records:
   differs. Splitting `options` into arguments honors libpq's own
   escaping: a backslash before a space embeds a literal space in the
   current argument instead of ending it, so a `search_path` value is not
-  truncated at an escaped space. The extracted value is then normalized
-  the way Postgres itself parses a schema list — comma-separated, with
-  insignificant whitespace around each name — so `tenant,public` and
-  `tenant, public` compare equal, exactly as two sessions setting either
-  one resolve to the same schema.
+  truncated at an escaped space. The extracted value is then parsed as a
+  Postgres identifier list, the same grammar `SplitIdentifierString`
+  uses for `search_path` server-side: comma-separated, with
+  insignificant whitespace around each name, an unquoted name folded to
+  lowercase, and a double-quoted name kept verbatim — case, embedded
+  commas, embedded spaces, and all, with `""` inside one read as a
+  literal quote. `tenant,public` and `tenant, public` compare equal, and
+  `PUBLIC` collapses with `public`, but a quoted `"tenant, one"` (one
+  schema) never collapses with the two unquoted schemas `tenant` and
+  `one`. A value that does not fit this grammar is compared unparsed,
+  the conservative fallback.
   Every other query parameter (`application_name`, `sslmode`, and so on)
   is dropped, since none of them changes which relation a query resolves
   against — except `host`, `hostaddr`, and `port`: a Unix-socket DSN
