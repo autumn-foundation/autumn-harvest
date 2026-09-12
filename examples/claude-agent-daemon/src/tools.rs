@@ -9,7 +9,7 @@
 //! the rest of the disk.
 
 use std::io::Read;
-use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Component, Path, PathBuf};
 
 use serde_json::{Value, json};
@@ -396,6 +396,9 @@ fn list_files(workspace: &Path, relative: &str, after: Option<&str>) -> Result<S
 fn read_file(workspace: &Path, relative: &str) -> Result<String, String> {
     let path = resolve(workspace, relative)?;
     let file = open_regular(&path, relative)?;
+    // The open above proved the final component is no link. The levels ABOVE
+    // it are proved here, against the descriptor. See [`opened_inside`].
+    opened_inside(&file, &path, workspace).map_err(|e| format!("cannot read `{relative}`: {e}"))?;
 
     // The size comes from the OPEN descriptor, so it describes the file that
     // was opened rather than whatever the path named a moment earlier.
@@ -447,6 +450,45 @@ fn open_regular(path: &Path, relative: &str) -> Result<std::fs::File, String> {
         return Err(format!("`{relative}` is not an ordinary file"));
     }
     Ok(file)
+}
+
+/// Prove an OPEN descriptor holds the file at a contained path.
+///
+/// `O_NOFOLLOW` refuses a link at the FINAL component only. An intermediate
+/// component replaced between [`resolve`] and the open sends the open THROUGH
+/// it, and the descriptor then holds a file outside the workspace. Measured:
+/// a `read_file` of `a/passwd` returned the contents of an outside file.
+///
+/// A descriptor pins the file it opened, so the proof can come after the
+/// open. The path must still resolve under the real root, and the file there
+/// must be the SAME file: one device and one inode.
+///
+/// That CLOSES this window rather than narrowing it. A swap after the check
+/// cannot change what the descriptor reads, because the descriptor no longer
+/// depends on the name. The write path cannot be proven this way: a rename
+/// acts on a name, and not on a descriptor. See [`contained`].
+///
+/// A file hard-linked into the workspace passes, because it IS in the
+/// workspace. The model could name it directly.
+///
+/// # Errors
+///
+/// Returns an error if either path cannot be resolved, if the path leaves the
+/// workspace, or if the descriptor holds another file.
+pub fn opened_inside(file: &std::fs::File, path: &Path, workspace: &Path) -> Result<(), String> {
+    contained(path, workspace)?;
+    let opened = file
+        .metadata()
+        .map_err(|e| format!("cannot stat the open file: {e}"))?;
+    let named = std::fs::metadata(path).map_err(|e| format!("cannot stat the path: {e}"))?;
+    if opened.dev() != named.dev() || opened.ino() != named.ino() {
+        return Err(
+            "the file it opened is no longer the file that path names: another process \
+             replaced a directory above it"
+                .to_string(),
+        );
+    }
+    Ok(())
 }
 
 /// `O_NOFOLLOW`, from the platform's own headers.
@@ -700,7 +742,7 @@ pub fn contained(directory: &Path, workspace: &Path) -> Result<(), String> {
     if !real.starts_with(&root) {
         return Err(
             "a directory above it now leaves the workspace: another process replaced one \
-             after this write resolved its path"
+             after this path was resolved"
                 .to_string(),
         );
     }

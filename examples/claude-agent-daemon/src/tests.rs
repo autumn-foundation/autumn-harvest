@@ -8662,3 +8662,98 @@ async fn a_model_restart_hint_names_a_command_that_works() {
         "a live daemon records the model it was given"
     );
 }
+
+/// A read follows no directory swapped in after the path resolved.
+///
+/// `O_NOFOLLOW` refuses a link at the FINAL component only, so an
+/// intermediate component replaced between `resolve` and the open sent the
+/// open THROUGH it.
+///
+/// Measured before the fix: the open succeeded and `read_file` returned the
+/// contents of a file outside the workspace.
+///
+/// A descriptor pins the file it opened, so this window CLOSES rather than
+/// narrowing. A swap after the proof cannot change what the descriptor reads.
+#[test]
+fn a_read_follows_no_directory_swapped_in_after_the_path_resolved() {
+    use std::os::unix::fs::OpenOptionsExt;
+
+    let dir = tempfile::tempdir().expect("a temporary directory");
+    let workspace = dir.path().join("ws");
+    let outside = dir.path().join("outside");
+    std::fs::create_dir_all(&workspace).expect("the workspace is created");
+    std::fs::create_dir_all(&outside).expect("the outside directory is created");
+    std::fs::write(outside.join("passwd"), b"root:x:0:0").expect("the secret is written");
+
+    let open = |path: &Path| {
+        std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(rustix::fs::OFlags::NOFOLLOW.bits().cast_signed())
+            .open(path)
+    };
+
+    // The state the window leaves, reached directly: `resolve` has already
+    // run and passed, and the link appears after it.
+    std::os::unix::fs::symlink(&outside, workspace.join("a")).expect("the link is made");
+    let escaped = workspace.join("a").join("passwd");
+
+    // The hazard, stated before the refusal. The open still succeeds and
+    // still reads the outside file, because the link is not the final
+    // component. That is why the descriptor has to be proved.
+    let file = open(&escaped).expect("the open walks through the link");
+    let mut text = String::new();
+    {
+        use std::io::Read;
+        let mut handle = &file;
+        handle
+            .read_to_string(&mut text)
+            .expect("the outside file reads");
+    }
+    assert_eq!(
+        text, "root:x:0:0",
+        "the window must be real, or this test proves nothing"
+    );
+
+    // The proof the read now runs before it returns any bytes.
+    let refused = tools::opened_inside(&file, &escaped, &workspace)
+        .expect_err("a path that leaves the workspace must be refused");
+    assert!(
+        refused.contains("leaves the workspace"),
+        "the refusal must say what is wrong: {refused}"
+    );
+
+    // The identity half. Containment holds here, and the descriptor is still
+    // a DIFFERENT file, because the name was replaced after it was opened.
+    let target = workspace.join("real.txt");
+    std::fs::write(&target, b"mine").expect("the file is written");
+    let pinned = open(&target).expect("the honest file opens");
+    tools::opened_inside(&pinned, &target, &workspace).expect("it is inside the workspace");
+    std::fs::remove_file(&target).expect("the file is removed");
+    std::fs::write(&target, b"theirs").expect("another file takes the name");
+    let swapped = tools::opened_inside(&pinned, &target, &workspace)
+        .expect_err("a descriptor holding another file must be refused");
+    assert!(
+        swapped.contains("no longer the file that path names"),
+        "the refusal must name what changed: {swapped}"
+    );
+
+    // The read path must RUN the proof, and no test can open the window it
+    // closes. The link has to appear between the resolve and the open, which
+    // a test cannot schedule. The source is read instead, as the other
+    // guards in this suite are.
+    let source = include_str!("tools.rs");
+    let body = source
+        .split("fn read_file(")
+        .nth(1)
+        .expect("read_file is in the source");
+    let body = &body[..body.find("\nfn ").unwrap_or(body.len())];
+    let opened = body.find("open_regular(").expect("the file is opened");
+    let proof = body
+        .find("opened_inside(&file")
+        .expect("the read path proves what it opened");
+    let read = body.find("read_to_end(").expect("the file is read");
+    assert!(
+        opened < proof && proof < read,
+        "the proof must run after the open and BEFORE any bytes are read"
+    );
+}

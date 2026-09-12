@@ -395,12 +395,21 @@ Honest limits, so nothing here reads as a promise:
   open, so a link appearing after the check loses too), and anything that is
   not an ordinary file. What it does not do is traverse through opened
   directory descriptors, so a *concurrent local process* that swaps a parent
-  directory for a symlink mid-call can still win that race. The window is
-  narrow rather than the whole call: a write re-proves that its parent
-  resolves inside the workspace AFTER creating the missing levels, and
-  refuses before any scratch file exists, so a swap the write can observe is
-  refused instead of followed. A swap that lands between that proof and the
-  scratch file still wins. Closing that needs `openat`-based traversal, which
+  directory for a symlink mid-call is the race to think about. The two sides
+  of the toolbox stand differently against it.
+
+  A **read** is proved against the descriptor it opened, not against the
+  name: the path must still resolve inside the workspace, and the file there
+  must be the same device and inode as the open file. A descriptor pins the
+  file it opened, so a later swap cannot change what is read, and no bytes
+  are returned before that proof. That race is lost by the attacker.
+
+  A **write** can only narrow it. The write re-proves that its parent
+  resolves inside the workspace after creating the missing levels, and
+  refuses before any scratch file exists, so a swap it can observe is
+  refused instead of followed. A swap landing between that proof and the
+  scratch file still wins, because a rename acts on a name and cannot be
+  pinned to a descriptor. Closing that needs `openat`-based traversal, which
   is more machinery than an example should carry. The model is the untrusted party here, and it cannot win that race;
   another process running as you already can do worse directly.
 - **A session is bound to its workspace path, not to the directory object.**
