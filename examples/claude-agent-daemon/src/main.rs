@@ -397,6 +397,12 @@ fn report(response: Response, socket: &Path) -> Result<(), String> {
     if let Response::Error { message } = response {
         return Err(message);
     }
+    // A stale decision is a failure as well, and its message names a
+    // follow-up command. The CLIENT renders it, so the command carries the
+    // socket this command reached. See [`socket_flag`].
+    if matches!(response, Response::Stale { .. }) {
+        return Err(rendered_lines(&response, socket).join("\n"));
+    }
     for text in rendered_lines(&response, socket) {
         line(&text);
     }
@@ -461,6 +467,15 @@ fn rendered_lines(response: &Response, socket: &Path) -> Vec<String> {
             }
             lines
         }
+        Response::Stale {
+            execution_id,
+            waiting_on,
+            sent,
+        } => vec![format!(
+            "session {execution_id} is now waiting on `{waiting_on}`, not `{sent}`. \
+             Read it again with `agentd status{} {execution_id}` before deciding.",
+            socket_flag(socket)
+        )],
         Response::Ack { detail } => vec![detail.clone()],
         // Returned as an error by `report`, which never reaches here.
         Response::Error { message } => vec![message.clone()],

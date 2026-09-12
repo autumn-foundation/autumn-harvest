@@ -685,11 +685,12 @@ pub fn approve(
     // enough. The model can reuse one across turns, so a decision read from an
     // older status would then release a call nobody reviewed.
     if signal != token {
-        return Response::Error {
-            message: format!(
-                "session {execution_id} is now waiting on `{signal}`, not `{token}`. \
-                 Read `agentd status {execution_id}` again before deciding."
-            ),
+        // The names travel as data. The client renders the command that reads
+        // the status again, because only it knows which socket it asked.
+        return Response::Stale {
+            execution_id: execution_id.to_string(),
+            waiting_on: signal,
+            sent: token.to_string(),
         };
     }
     // A decision that arrives after the deadline cannot win. The backend fires

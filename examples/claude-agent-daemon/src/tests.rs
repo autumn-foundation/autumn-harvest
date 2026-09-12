@@ -340,8 +340,18 @@ async fn settle_over_socket(socket: &Path, execution_id: &str) -> String {
             .await
             .expect("the daemon answers");
             assert!(
-                matches!(stale, Response::Error { .. }),
+                matches!(stale, Response::Stale { .. }),
                 "a decision for another call must be refused: {stale:?}"
+            );
+            // The refusal names a follow-up command, so the CLIENT renders it
+            // against the socket this command reached. A command built in the
+            // daemon would send the operator to `agentd.sock`.
+            let told = crate::rendered_lines(&stale, Path::new("/run/agentd/project-b.sock"));
+            assert!(
+                told[0].contains("--socket /run/agentd/project-b.sock")
+                    && told[0].contains(execution_id),
+                "the recovery command must reach the same daemon: {}",
+                told[0]
             );
 
             protocol::call(
@@ -1587,6 +1597,9 @@ fn a_block_that_cannot_be_replayed_is_refused() {
     for incomplete in [
         json!([{ "type": "text" }]),
         json!([{ "type": "text", "text": 7 }]),
+        // A text block is declared with a minimum length of one character,
+        // so an empty one is refused on replay.
+        json!([{ "type": "text", "text": "" }]),
         json!([{ "type": "tool_use", "id": "toolu_a", "input": {} }]),
         json!([{ "type": "tool_use", "id": "toolu_a", "name": " ", "input": {} }]),
         json!([{ "type": "tool_use", "name": "write_file", "input": {} }]),
@@ -1641,7 +1654,9 @@ fn a_block_that_cannot_be_replayed_is_refused() {
     // from a later API would refuse replies that are perfectly good.
     for fine in [
         json!([{ "type": "text", "text": "hello" }]),
-        json!([{ "type": "text", "text": "" }]),
+        // One space is a character, so it meets the minimum. This asks for
+        // length and not for content.
+        json!([{ "type": "text", "text": " " }]),
         json!([{ "type": "a_type_from_a_later_api" }]),
         json!([{ "type": "tool_use", "id": "toolu_a", "name": "write_file", "input": {} }]),
         json!([]),
@@ -2203,6 +2218,12 @@ async fn a_daemon_refuses_a_session_it_cannot_read() {
     // type guard and not the value is what refuses it.
     let broken = [
         ("goal", Value::Null),
+        // A goal of no characters is refused for the reason `submit` refuses
+        // one. An empty text block is below the minimum the API accepts, so
+        // the first live turn would end the session terminally.
+        ("goal", json!("")),
+        ("goal", json!("   ")),
+        ("goal", json!("\t\n ")),
         ("max_turns", Value::Null),
         ("max_turns", json!(-1)),
         ("max_turns", json!(0)),

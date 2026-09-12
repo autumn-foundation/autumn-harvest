@@ -411,7 +411,14 @@ fn is_replayable_block(block: &Value) -> bool {
     // API accepts no padded name, so a trimmed match here would accept a
     // block that both of them refuse.
     match kind {
-        "text" => block.get("text").is_some_and(Value::is_string),
+        // The text must say SOMETHING. A text block is declared with a
+        // minimum length of one character, so an empty one is refused on
+        // replay. A block of one space is a character and passes, which is
+        // why this asks for length and not for content.
+        "text" => block
+            .get("text")
+            .and_then(Value::as_str)
+            .is_some_and(|text| !text.is_empty()),
         // The thinking text may be EMPTY, and an empty one is still replayed.
         // This request asks for adaptive thinking and asks for no display,
         // and the default display returns every thinking block with an empty

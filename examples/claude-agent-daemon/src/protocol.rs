@@ -88,6 +88,15 @@ pub enum Response {
         #[serde(default)]
         older: Option<i64>,
     },
+    /// The decision named a wait the session no longer holds.
+    ///
+    /// The two names travel as DATA. The CLIENT renders the command that
+    /// reads the status again, because only it knows which socket it asked.
+    Stale {
+        execution_id: String,
+        waiting_on: String,
+        sent: String,
+    },
     Ack {
         detail: String,
     },

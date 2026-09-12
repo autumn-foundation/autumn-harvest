@@ -57,10 +57,11 @@ pub struct RunningSession {
     /// The recorded approval deadline, read the same way and checked the same
     /// way.
     pub approval_timeout_secs: Option<i64>,
-    /// Does the recorded task carry a goal of the right type?
+    /// Does the recorded task carry a goal that says something?
     ///
-    /// The goal itself is never read here. Its TYPE answers whether the task
-    /// can be deserialised, and the bytes are what this query exists to avoid.
+    /// The goal itself is never read here. The database answers its type and
+    /// the LENGTH of it once the space is removed, and the bytes are what
+    /// this query exists to avoid.
     pub has_goal: bool,
 }
 
@@ -155,6 +156,11 @@ pub fn running(conn: &Connection, workflow_name: &str) -> Result<Vec<RunningSess
     // deserialises on the first drive. One that did not would be sealed
     // FAILED by the runtime, where no later daemon could resume it.
     //
+    // The goal is measured and not read: `trim` and `length` run inside the
+    // database, so a goal of any size answers in one number. The character
+    // set is given, because `trim` alone removes the space and not the tab or
+    // the newline.
+    //
     // Each number is read only when its JSON TYPE is `integer`. `json_extract`
     // alone does not answer the type: a JSON `true` comes back as the integer
     // 1, which the task's unsigned field refuses on deserialisation. The
@@ -173,7 +179,10 @@ pub fn running(conn: &Connection, workflow_name: &str) -> Result<Vec<RunningSess
                           AND json_type(input_json, '$.approval_timeout_secs') = 'integer' \
                          THEN json_extract(input_json, '$.approval_timeout_secs') END, \
                     CASE WHEN json_valid(input_json) \
-                         THEN json_type(input_json, '$.goal') END \
+                          AND json_type(input_json, '$.goal') = 'text' \
+                         THEN length(trim(json_extract(input_json, '$.goal'), \
+                                          char(32) || char(9) || char(10) || char(13))) \
+                         END \
              FROM harvest_executions \
              WHERE workflow_name = ?1 AND state = 'RUNNING' ORDER BY rowid",
         )
@@ -186,8 +195,12 @@ pub fn running(conn: &Connection, workflow_name: &str) -> Result<Vec<RunningSess
                 model: row.get(2)?,
                 max_turns: row.get(3)?,
                 approval_timeout_secs: row.get(4)?,
-                // `json_type` names the type without reading the value.
-                has_goal: row.get::<_, Option<String>>(5)?.as_deref() == Some("text"),
+                // The LENGTH of the trimmed goal comes back, and never the
+                // goal. A goal of no characters is refused for the reason
+                // `submit` refuses one.
+                has_goal: row
+                    .get::<_, Option<i64>>(5)?
+                    .is_some_and(|length| length > 0),
             })
         })
         .map_err(|e| format!("cannot read the running sessions: {e}"))?;
