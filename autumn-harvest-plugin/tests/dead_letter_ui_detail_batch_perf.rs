@@ -337,8 +337,7 @@ async fn pg_stat_statements_available(conn: &mut AsyncPgConnection) -> bool {
     )
     .get_result::<BoolRow>(conn)
     .await
-    .map(|r| r.preloaded)
-    .unwrap_or(false)
+    .is_ok_and(|r| r.preloaded)
 }
 
 async fn fetch_html(app: &axum::Router, uri: &str) -> (StatusCode, String) {
