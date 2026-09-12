@@ -20508,7 +20508,8 @@ async fn process_workflow_task(
     };
     // Issue #1265: captured here so the `history_size` gauge below can reuse
     // the SAME dedup-resolved count instead of recomputing a pre-dedup one.
-    // Stays 0 for every non-`Failed` outcome, which never resolves this.
+    // It stays 0 for every non-`Failed` outcome (mirrors
+    // `records_abandoned_dispatches`): none of those resolve this count.
     let mut resolved_abandoned_dispatch_event_count: u64 = 0;
     let pending_durable_event_count = match &outcome {
         WorkflowOutcome::Suspended { commands } => {
@@ -38936,8 +38937,8 @@ mod tests {
 
     /// The `harvest.workflow.history_size` gauge must describe the same
     /// durable count the hard-cap preflight resolves, not a pre-dedup upper
-    /// bound (issue #1265). A re-parked dispatch the preflight already
-    /// resolved to zero appended events must not inflate the gauge by two.
+    /// bound (issue #1265). A re-parked dispatch that the preflight already
+    /// resolved to zero events must not inflate the gauge by two events.
     #[test]
     fn terminal_history_event_count_uses_the_resolved_count_not_the_pre_dedup_bound() {
         let already_started = ExecutionId::new();
