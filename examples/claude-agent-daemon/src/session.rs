@@ -20,6 +20,7 @@ use autumn_harvest::prelude::*;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
+use crate::claude;
 use crate::tools;
 
 /// The signal-name prefix the CLI sends a decision to.
@@ -237,9 +238,11 @@ pub async fn agent_session(
         if reply.stop_reason == STOP_REFUSAL {
             return Ok(report(&reply.text, turn, tool_calls, STOP_REFUSAL));
         }
-        if reply.tool_calls.is_empty() {
-            // Only a real `end_turn` reports success. Any other stop reason
-            // ends the session under its own name.
+        // A tool runs only under the stop reason that asks for one. A turn
+        // that stopped for another reason ends the session under its own name,
+        // and its tool calls are dropped unrun. Only a real `end_turn` reports
+        // success.
+        if reply.stop_reason != claude::STOP_TOOL_USE || reply.tool_calls.is_empty() {
             return Ok(report(&last_text, turn, tool_calls, &reply.stop_reason));
         }
 

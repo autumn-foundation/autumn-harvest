@@ -35,6 +35,27 @@ pub fn open(db: &Path) -> Result<Connection, String> {
     Ok(conn)
 }
 
+/// Is this execution id a session of the agent workflow?
+///
+/// A history read needs the answer. The event query of a session that does not
+/// exist returns no rows, which looks the same as a session that has recorded
+/// nothing yet.
+///
+/// # Errors
+///
+/// Returns an error if the query fails.
+pub fn is_session(conn: &Connection, workflow_name: &str, exec_id: &str) -> Result<bool, String> {
+    conn.query_row(
+        "SELECT 1 FROM harvest_executions WHERE workflow_name = ?1 AND exec_id = ?2",
+        [workflow_name, exec_id],
+        |_| Ok(true),
+    )
+    .or_else(|e| match e {
+        rusqlite::Error::QueryReturnedNoRows => Ok(false),
+        other => Err(format!("cannot look up the session: {other}")),
+    })
+}
+
 /// Every execution of the agent workflow, oldest first.
 ///
 /// # Errors

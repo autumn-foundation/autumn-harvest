@@ -385,6 +385,24 @@ async fn the_daemon_serves_one_session_over_its_socket() {
         "the event log does not record what the tools did: {events:?}"
     );
 
+    // A well-formed id that names no session is an error, not an empty log. A
+    // mistyped audit target must not read as a session that did nothing.
+    let missing = protocol::call(
+        &socket,
+        &Request::History {
+            execution_id: "00000000-0000-4000-8000-000000000000".to_string(),
+        },
+    )
+    .await
+    .expect("the history is answered");
+    let Response::Error { message } = missing else {
+        panic!("an unknown session must be refused, got {missing:?}");
+    };
+    assert!(
+        message.contains("no session"),
+        "the refusal must name the missing session: {message}"
+    );
+
     daemon.abort();
 }
 
@@ -1113,6 +1131,94 @@ fn a_write_flushes_every_directory_it_creates() {
         std::fs::read_to_string(workspace.join("deep/er/still/notes.md"))
             .expect("the nested file exists"),
         "hello"
+    );
+}
+
+#[test]
+fn a_turn_that_ends_and_still_asks_for_a_tool_is_refused() {
+    let reply = |stop: &str, calls: Vec<ToolCall>| TurnReply {
+        content: json!([]),
+        stop_reason: stop.to_string(),
+        text: String::new(),
+        tool_calls: calls,
+    };
+    let call = vec![ToolCall {
+        id: "toolu_a".to_string(),
+        name: tools::TOOL_WRITE_FILE.to_string(),
+        input: json!({ "path": "notes.md", "content": "x" }),
+    }];
+
+    // A turn cannot both end and ask for a tool. Running the call and then
+    // reporting a clean finish, or dropping it and reporting one, both present
+    // a malformed billed response as a finished session.
+    assert!(
+        !claude::agrees_with_its_content(&reply(claude::STOP_END_TURN, call.clone())),
+        "`end_turn` with a tool call must be refused"
+    );
+    assert!(
+        claude::agrees_with_its_content(&reply(claude::STOP_TOOL_USE, call.clone())),
+        "a tool call under `tool_use` is the ordinary case"
+    );
+    assert!(
+        claude::agrees_with_its_content(&reply(claude::STOP_END_TURN, Vec::new())),
+        "a finished turn with no tool call is consistent"
+    );
+
+    // A truncated turn can carry a partial block. The loop drops it unrun and
+    // reports `max_tokens`, so this must stay a report and not become a
+    // refusal.
+    assert!(
+        claude::agrees_with_its_content(&reply("max_tokens", call)),
+        "a truncated turn must still report rather than fail"
+    );
+}
+
+#[tokio::test]
+async fn a_tool_call_under_an_unknown_stop_reason_is_not_run() {
+    let dir = tempfile::tempdir().expect("a temporary directory");
+    let workspace = dir.path().join("workspace");
+    std::fs::create_dir_all(&workspace).expect("the workspace is created");
+
+    // A stop reason this example does not know about, carrying a write. The
+    // pair is not a contradiction, so the turn is not refused. The call is
+    // still not what the stop reason asked for, so it must not run.
+    let mut rt = SqliteRuntime::open(dir.path().join("agentd.db")).expect("the database opens");
+    rt.register_workflow(&session::agent_session_info());
+    rt.register_activity(&session::claude_turn_info(), |_input| {
+        serde_json::to_value(TurnReply {
+            content: json!([]),
+            stop_reason: "pause_turn".to_string(),
+            text: "thinking".to_string(),
+            tool_calls: vec![ToolCall {
+                id: "toolu_paused".to_string(),
+                name: tools::TOOL_WRITE_FILE.to_string(),
+                input: json!({ "path": "unasked.md", "content": "never" }),
+            }],
+        })
+        .map_err(|e| format!("bad reply: {e}"))
+    });
+    rt.register_activity(
+        &session::run_tool_info(),
+        tools::activity_body(workspace.clone()),
+    );
+
+    let exec = rt
+        .start_workflow(WORKFLOW_NAME, task(&workspace))
+        .expect("the session starts");
+    let state = rt.run_until_blocked(exec).await.expect("the run finishes");
+    let RunState::Completed(output) = state else {
+        panic!("expected a terminal report, got {state:?}");
+    };
+
+    let report: SessionReport = serde_json::from_value(output).expect("the report decodes");
+    assert_eq!(
+        report.stop, "pause_turn",
+        "the session must end under the stop reason it was given"
+    );
+    assert_eq!(report.tool_calls, 0, "the unasked call must not run");
+    assert!(
+        !workspace.join("unasked.md").exists(),
+        "the unasked write must not land"
     );
 }
 

@@ -102,7 +102,7 @@ exactly that, by counting model calls in each process.
 | `agentd submit "<goal>"` | Start one session; prints its execution id. |
 | `agentd status <id> [--full]` | One session: state, why it is parked, the exact pending call, its answer. `--full` prints the call's arguments untrimmed. |
 | `agentd list` | Every session in the database. |
-| `agentd history <id>` | The recorded event log with each event's data — the audit trail. |
+| `agentd history <id>` | The recorded event log with each event's data — the audit trail. An id that names no session is refused, so a typo cannot read as a session that did nothing. |
 | `agentd approve <id> <token>` / `deny <id> <token>` | Release or refuse the gated tool call that token names. |
 
 Flags: `--db` (default `agentd.db`), `--socket` (default `agentd.sock`),
@@ -112,7 +112,12 @@ Flags: `--db` (default `agentd.db`), `--socket` (default `agentd.sock`),
 A finished session reports the model's own stop reason, so an incomplete run
 never reads as a clean one: `end_turn` is a finished answer, `max_tokens` means
 the turn hit the output cap and the answer is cut short (raise `--max-tokens`),
-and `refusal` means a classifier declined the request.
+and `refusal` means a classifier declined the request. A tool runs only under
+the `tool_use` stop reason that asks for one. A turn that stops for any other
+reason ends the session under that name, with its tool calls dropped unrun. The
+one pair that cannot be reconciled is refused instead: a turn that says it
+ended and still asks for a tool is malformed, and no guess about which half is
+wrong would be safe.
 
 **The database is owner-only too.** It holds every prompt, tool input, and tool
 result, including the content of each file the agent read — so a new database

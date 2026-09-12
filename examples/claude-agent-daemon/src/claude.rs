@@ -27,7 +27,10 @@ const API_VERSION: &str = "2023-06-01";
 /// header and the `fallbacks` field together to turn the behaviour off.
 const FALLBACK_BETA: &str = "server-side-fallback-2026-07-01";
 /// The `stop_reason` of a turn that stopped to call a tool.
-const STOP_TOOL_USE: &str = "tool_use";
+pub const STOP_TOOL_USE: &str = "tool_use";
+
+/// The `stop_reason` of a turn the model finished on its own.
+pub const STOP_END_TURN: &str = "end_turn";
 
 /// The default model. Adaptive thinking is on by default on this model.
 pub const DEFAULT_MODEL: &str = "claude-opus-5";
@@ -186,6 +189,14 @@ fn call_api(
             "its tool calls carried a blank or repeated id",
         ));
     }
+    // A turn cannot both end and ask for a tool. The pair is malformed, and it
+    // is refused here rather than resolved by a guess.
+    if !agrees_with_its_content(&reply) {
+        return Err(body_failure(
+            status,
+            "its response ended the turn and still asked for a tool",
+        ));
+    }
     // A finished turn that says nothing and calls nothing is not an answer. A
     // malformed block, or an empty `content`, reaches this point as a clean
     // `end_turn` with no text. That would report a billed non-answer as a
@@ -277,6 +288,21 @@ pub fn has_addressable_calls(reply: &TurnReply) -> bool {
         .all(|call| !call.id.is_empty() && seen.insert(call.id.as_str()))
 }
 
+/// Does the stop reason agree with the content?
+///
+/// This module defines `tool_use` as the stop reason of a turn that asks for a
+/// tool. A turn that ENDED and still carries a tool call contradicts itself.
+/// One of the two is wrong, and nothing here can say which. The loop would run
+/// the call and then report a clean finish, or drop the call and report one.
+/// Both report a malformed billed response as a finished session.
+///
+/// A stop reason this example does not know about is not a contradiction. Such
+/// a turn is reported under its own name, and its tool calls are dropped
+/// unrun, which is the same treatment a truncated turn gets.
+pub fn agrees_with_its_content(reply: &TurnReply) -> bool {
+    reply.stop_reason != STOP_END_TURN || reply.tool_calls.is_empty()
+}
+
 /// Can this reply move the session forward?
 ///
 /// The test is on the projection rather than on each content block. A reply is
@@ -292,7 +318,7 @@ pub fn is_usable(reply: &TurnReply) -> bool {
     if reply.stop_reason == STOP_TOOL_USE {
         return !reply.tool_calls.is_empty();
     }
-    !reply.text.is_empty() || !reply.tool_calls.is_empty() || reply.stop_reason != "end_turn"
+    !reply.text.is_empty() || !reply.tool_calls.is_empty() || reply.stop_reason != STOP_END_TURN
 }
 
 /// Project one API response into the durable [`TurnReply`].

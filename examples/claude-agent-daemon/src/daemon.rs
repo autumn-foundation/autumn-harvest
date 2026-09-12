@@ -363,7 +363,7 @@ fn handle(
             Ok(sessions) => Response::Sessions { sessions },
             Err(message) => Response::Error { message },
         },
-        Request::History { execution_id } => history(runtime, &execution_id),
+        Request::History { execution_id } => history(runtime, reader, &execution_id),
         Request::Approve {
             execution_id,
             token,
@@ -485,7 +485,11 @@ fn approve(
 }
 
 /// Report the recorded event log of one session.
-fn history(runtime: &SqliteRuntime, execution_id: &str) -> Response {
+///
+/// The session must exist. An event read of an unknown id returns no rows, so
+/// without this check a mistyped audit target prints an empty history and
+/// exits clean. That reads as a session that did nothing.
+fn history(runtime: &SqliteRuntime, reader: &Connection, execution_id: &str) -> Response {
     let exec = match execution_id.parse::<ExecutionId>() {
         Ok(exec) => exec,
         Err(e) => {
@@ -494,6 +498,15 @@ fn history(runtime: &SqliteRuntime, execution_id: &str) -> Response {
             };
         }
     };
+    match inspect::is_session(reader, WORKFLOW_NAME, execution_id) {
+        Ok(true) => {}
+        Ok(false) => {
+            return Response::Error {
+                message: format!("no session {execution_id}"),
+            };
+        }
+        Err(message) => return Response::Error { message },
+    }
     match runtime.load_history(exec) {
         Ok(events) => Response::History {
             events: events
