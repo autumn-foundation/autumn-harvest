@@ -1160,7 +1160,6 @@ async fn fire_claimed_throttle_row(
         false,
         Some(metrics),
         Some(crate::admission_gate::GateMode::CheckCached),
-        None,
         codecs,
     )
     .await

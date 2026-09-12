@@ -583,15 +583,11 @@ pub(crate) async fn enforce_quota_admission(
 /// [`GateMode`](crate::admission_gate::GateMode) selects the cache read (fail-closed
 /// `Check` for fresh admissions, snapshot-only `CheckCached` for continuation).
 ///
-/// `quota_key_input_override`, when `Some`, is resolved against instead of
-/// `request.input` for the declared [`crate::quota::QuotaPolicy`]'s key
-/// expression (issue #1230 Finding 1). Only [`crate::event_batch`] passes
-/// one. A batched fire's `request.input` is the whole merged array of
-/// every admitted payload. That is not the single admission a quota key
-/// expression is meant to resolve against. `event_batch.rs` passes the
-/// first buffered payload here instead. Every other caller passes
-/// `None`, so `request.input`
-/// resolves the key exactly as before this parameter existed.
+/// The quota key (declared [`crate::quota::QuotaPolicy`] key expression) is
+/// always resolved against `request.input`. See
+/// [`start_or_load_workflow_execution_collect_with_codecs_and_quota_override`]
+/// for the crate-private variant [`crate::event_batch`] uses to override
+/// that (Codex review, issue #1230 Finding 1 follow-up).
 ///
 /// # Errors
 ///
@@ -610,7 +606,6 @@ pub async fn start_or_load_workflow_execution_collect(
     reject_fresh_if_debounced: bool,
     metrics: Option<&(dyn crate::telemetry::MetricsRecorder + Send + Sync)>,
     gate: Option<crate::admission_gate::GateMode>,
-    quota_key_input_override: Option<&serde_json::Value>,
 ) -> HarvestResult<(
     StartedWorkflowExecution,
     Vec<DeferredTriggerStart>,
@@ -624,7 +619,6 @@ pub async fn start_or_load_workflow_execution_collect(
         reject_fresh_if_debounced,
         metrics,
         gate,
-        quota_key_input_override,
         &store::DEFAULT_PAYLOAD_CODECS,
     )
     .await
@@ -637,8 +631,57 @@ pub async fn start_or_load_workflow_execution_collect(
 /// # Errors
 ///
 /// Same as [`start_or_load_workflow_execution_collect`].
-#[allow(clippy::too_many_lines, clippy::too_many_arguments)]
 pub async fn start_or_load_workflow_execution_collect_with_codecs(
+    conn: &mut AsyncPgConnection,
+    request: StartWorkflowParams<'_>,
+    in_outer_transaction: bool,
+    reject_fresh_if_debounced: bool,
+    metrics: Option<&(dyn crate::telemetry::MetricsRecorder + Send + Sync)>,
+    gate: Option<crate::admission_gate::GateMode>,
+    codecs: &crate::payload_codec::PayloadCodecs,
+) -> HarvestResult<(
+    StartedWorkflowExecution,
+    Vec<DeferredTriggerStart>,
+    Vec<(ExecutionId, String)>,
+    Vec<StartCancelledRun>,
+)> {
+    start_or_load_workflow_execution_collect_with_codecs_and_quota_override(
+        conn,
+        request,
+        in_outer_transaction,
+        reject_fresh_if_debounced,
+        metrics,
+        gate,
+        None,
+        codecs,
+    )
+    .await
+}
+
+/// [`start_or_load_workflow_execution_collect_with_codecs`], with an extra
+/// `quota_key_input_override` parameter. Crate-private: exposing this on
+/// the public API would let an external embedder pass an arbitrary value,
+/// e.g. `Some(&json!({}))`. That could make quota key resolution silently
+/// return `None` for a request whose real `input` resolves one. Every
+/// declared cap on that request would then go unenforced (Codex review,
+/// issue #1230 Finding 1 follow-up). Only [`crate::event_batch`] calls
+/// this directly; every other caller goes through the public,
+/// override-free wrapper above.
+///
+/// `quota_key_input_override`, when `Some`, is resolved against instead of
+/// `request.input` for the declared [`crate::quota::QuotaPolicy`]'s key
+/// expression (issue #1230 Finding 1). A batched fire's `request.input` is
+/// the whole merged array of every admitted payload. That is not the
+/// single admission a quota key expression is meant to resolve against.
+/// `event_batch.rs` passes the first buffered payload here instead. Every
+/// other caller passes `None`, so `request.input` resolves the key exactly
+/// as before this parameter existed.
+///
+/// # Errors
+///
+/// Same as [`start_or_load_workflow_execution_collect`].
+#[allow(clippy::too_many_lines, clippy::too_many_arguments)]
+pub(crate) async fn start_or_load_workflow_execution_collect_with_codecs_and_quota_override(
     conn: &mut AsyncPgConnection,
     request: StartWorkflowParams<'_>,
     in_outer_transaction: bool,
@@ -1625,7 +1668,7 @@ pub async fn start_or_load_workflow_execution_with_codecs(
     // here pushes each caller over the `clippy::large_futures` threshold.
     let (collected, hints) = Box::pin(crate::dispatch::buffered(
         start_or_load_workflow_execution_collect_with_codecs(
-            conn, request, false, false, None, gate, None, codecs,
+            conn, request, false, false, None, gate, codecs,
         ),
     ))
     .await;
@@ -1674,7 +1717,7 @@ pub async fn start_or_load_workflow_execution_with_metrics_and_codecs(
     // `Box::pin` for the same reason as the call above.
     let (collected, hints) = Box::pin(crate::dispatch::buffered(
         start_or_load_workflow_execution_collect_with_codecs(
-            conn, request, false, false, metrics, gate, None, codecs,
+            conn, request, false, false, metrics, gate, codecs,
         ),
     ))
     .await;
@@ -1812,7 +1855,7 @@ pub async fn start_or_load_workflow_execution_idempotent_with_codecs(
                     let workflow_name = request.workflow_name;
                     let (started, ds, dc, cm) =
                         start_or_load_workflow_execution_collect_with_codecs(
-                            conn, request, true, false, metrics, gate, None, codecs,
+                            conn, request, true, false, metrics, gate, codecs,
                         )
                         .await?;
                     // The reserve wrote the claim pointing at `new_exec_id`.
@@ -5569,7 +5612,6 @@ pub async fn signal_with_start_workflow_execution_with_metrics_and_codecs(
                         true,
                         metrics,
                         None,
-                        None,
                         codecs,
                     )
                     .await?;
@@ -5586,7 +5628,6 @@ pub async fn signal_with_start_workflow_execution_with_metrics_and_codecs(
                         false,
                         metrics,
                         gate,
-                        None,
                         codecs,
                     )
                     .await?;
@@ -5641,7 +5682,6 @@ pub async fn signal_with_start_workflow_execution_with_metrics_and_codecs(
                         false,
                         metrics,
                         gate,
-                        None,
                         codecs,
                     )
                     .await?;
@@ -6298,7 +6338,6 @@ pub async fn rerun_workflow_execution_with_codecs(
                     /* reject_fresh_if_debounced = */ false,
                     metrics,
                     Some(crate::admission_gate::GateMode::Check),
-                    None,
                     codecs,
                 )
                 .await?;
@@ -6837,7 +6876,6 @@ pub async fn update_with_start_workflow_execution_with_metrics_and_codecs(
                         true,
                         metrics,
                         None,
-                        None,
                         codecs,
                     )
                     .await?;
@@ -6854,7 +6892,6 @@ pub async fn update_with_start_workflow_execution_with_metrics_and_codecs(
                         false,
                         metrics,
                         gate,
-                        None,
                         codecs,
                     )
                     .await?;
@@ -6900,7 +6937,6 @@ pub async fn update_with_start_workflow_execution_with_metrics_and_codecs(
                         false,
                         metrics,
                         gate,
-                        None,
                         codecs,
                     )
                     .await?;

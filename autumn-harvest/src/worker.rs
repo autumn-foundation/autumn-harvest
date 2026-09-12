@@ -7939,7 +7939,6 @@ pub async fn persist_workflow_failure(
                     // Workflow-level retry (#523) is in-flight continuation of an
                     // existing logical run, not a fresh admission — never gated.
                     None,
-                    None,
                     codecs,
                 )
                 .await

@@ -877,7 +877,6 @@ impl WorkflowHandleClient {
                         Some(self.inner.metrics.as_ref()
                             as &(dyn crate::telemetry::MetricsRecorder + Send + Sync)),
                         Some(crate::admission_gate::GateMode::CheckCached),
-                        None,
                         &self.inner.payload_codecs,
                     )
                     .await
@@ -1356,7 +1355,6 @@ impl WorkflowHandleClient {
                             false,
                             metrics,
                             Some(crate::admission_gate::GateMode::CheckCached),
-                            None,
                             &self.inner.payload_codecs,
                         )
                         .await?;

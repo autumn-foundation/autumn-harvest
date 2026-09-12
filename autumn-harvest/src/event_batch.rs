@@ -367,7 +367,7 @@ pub async fn admit_batched_start_with_codecs(
                     };
 
                     let (started, deferred_starts, deferred_checks, cancel_metrics) =
-                        crate::execution::start_or_load_workflow_execution_collect_with_codecs(
+                        crate::execution::start_or_load_workflow_execution_collect_with_codecs_and_quota_override(
                             conn,
                             params,
                             true,
@@ -714,17 +714,18 @@ async fn fire_claimed_batch_row(
         started_by: batch_started_by.as_deref(),
     };
 
-    let start_res = crate::execution::start_or_load_workflow_execution_collect_with_codecs(
-        conn,
-        params,
-        true,
-        false,
-        metrics,
-        None,
-        quota_key_input_override.as_ref(),
-        codecs,
-    )
-    .await;
+    let start_res =
+        crate::execution::start_or_load_workflow_execution_collect_with_codecs_and_quota_override(
+            conn,
+            params,
+            true,
+            false,
+            metrics,
+            None,
+            quota_key_input_override.as_ref(),
+            codecs,
+        )
+        .await;
 
     match start_res {
         Ok((started, deferred_starts, deferred_checks, cancel_metrics)) => {
