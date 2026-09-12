@@ -70,13 +70,19 @@ pub fn definitions() -> Value {
         {
             "name": TOOL_LIST_FILES,
             "description": "List the files and directories under a path in the workspace. \
-                            Use \".\" for the workspace root.",
+                            Use \".\" for the workspace root. A long listing names the \
+                            `after` value that reads the next page.",
             "input_schema": {
                 "type": "object",
                 "properties": {
-                    "path": { "type": "string", "description": "Directory path, relative to the workspace root." }
+                    "path": { "type": "string", "description": "Directory path, relative to the workspace root." },
+                    "after": {
+                        "type": ["string", "null"],
+                        "description": "Continue after this entry, copied from a previous listing. \
+                                        Null for the first page."
+                    }
                 },
-                "required": ["path"],
+                "required": ["path", "after"],
                 "additionalProperties": false
             },
             "strict": true
@@ -159,9 +165,16 @@ fn serves(root: &Path, recorded: &str) -> bool {
 fn dispatch(workspace: &Path, call: &ToolCall) -> ToolOutcome {
     let reads = |result: Result<String, String>| result.map_err(Failure::from);
     let result = match call.name.as_str() {
-        TOOL_LIST_FILES => {
-            reads(string_arg(&call.input, "path").and_then(|p| list_files(workspace, &p)))
-        }
+        TOOL_LIST_FILES => reads(string_arg(&call.input, "path").and_then(|p| {
+            // Absent, null or blank all mean the first page. A strict schema
+            // makes the field required, so the model sends null for it.
+            let after = call
+                .input
+                .get("after")
+                .and_then(serde_json::Value::as_str)
+                .filter(|cursor| !cursor.is_empty());
+            list_files(workspace, &p, after)
+        })),
         TOOL_READ_FILE => {
             reads(string_arg(&call.input, "path").and_then(|p| read_file(workspace, &p)))
         }
@@ -273,35 +286,49 @@ fn resolve(workspace: &Path, relative: &str) -> Result<PathBuf, String> {
     Ok(path)
 }
 
-/// List one directory, sorted, with a trailing slash on each subdirectory.
-fn list_files(workspace: &Path, relative: &str) -> Result<String, String> {
+/// List one directory, in order, with a trailing slash on each subdirectory.
+///
+/// `after` continues a listing from the last name it showed. Without one, a
+/// cap hides entries FOREVER. `read_dir` gives no order, so a truncated read
+/// returns some arbitrary subset, and the same call returns that same subset
+/// again. Everything outside it is then unreachable to the model.
+///
+/// The selection is bounded rather than the read. Every name is looked at,
+/// and only the smallest `MAX_ENTRIES` after the cursor are held, so memory
+/// is the page and not the directory. A million entries are walked without a
+/// million names in hand, and each one can be reached by asking again.
+///
+/// The key is the name AS PRINTED, so the cursor a caller passes back is
+/// exactly a line it read.
+fn list_files(workspace: &Path, relative: &str, after: Option<&str>) -> Result<String, String> {
     let dir = resolve(workspace, relative)?;
-    let mut entries = Vec::new();
+    let mut page: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
     let mut more = false;
     for entry in std::fs::read_dir(&dir).map_err(|e| format!("cannot list `{relative}`: {e}"))? {
-        // The cap stops the read, and does not trim the result afterwards. A
-        // directory of a million entries would otherwise be named in full
-        // before the trim. The tool bodies run on the one runtime, so that
-        // blocks every session and every control command too.
-        if entries.len() == MAX_ENTRIES {
-            more = true;
-            break;
-        }
         let entry = entry.map_err(|e| format!("cannot list `{relative}`: {e}"))?;
         let name = entry.file_name().to_string_lossy().into_owned();
         let is_dir = entry.file_type().is_ok_and(|t| t.is_dir());
-        entries.push(if is_dir { format!("{name}/") } else { name });
+        let shown = if is_dir { format!("{name}/") } else { name };
+        if after.is_some_and(|cursor| shown.as_str() <= cursor) {
+            continue;
+        }
+        page.insert(shown);
+        if page.len() > MAX_ENTRIES {
+            // The largest falls out, so what stays is the smallest page.
+            page.pop_last();
+            more = true;
+        }
     }
-    entries.sort();
-    // The count of the rest is not reported, because counting it is the work
-    // this cap exists to refuse.
+
+    let mut entries: Vec<String> = page.into_iter().collect();
     if more {
+        let last = entries.last().cloned().unwrap_or_default();
         entries.push(format!(
-            "... more entries; the listing stops at {MAX_ENTRIES}"
+            "... more entries; read the next {MAX_ENTRIES} with `after` set to \"{last}\""
         ));
     }
     if entries.is_empty() {
-        return Ok(format!("`{relative}` is empty"));
+        return Ok("(no entries)".to_string());
     }
     Ok(entries.join("\n"))
 }

@@ -95,6 +95,20 @@ pub struct SessionSummary {
     pub row: i64,
 }
 
+/// Every character Rust's `trim` removes, for SQL that must agree with it.
+///
+/// `submit` refuses a goal that says nothing, and the startup check refuses a
+/// recorded one. The two must draw the line in the same place, or a session
+/// one end accepts is refused by the other.
+///
+/// Rust removes the Unicode `White_Space` set. `SQLite`'s `trim` removes only
+/// the characters it is given, so the set is written out here. A narrower one
+/// leaves a goal of non-breaking spaces looking like a goal to the database,
+/// while `submit` calls it blank.
+const WHITESPACE: &str = "char(9,10,11,12,13,32,133,160,5760,8192,8193,8194,\
+                          8195,8196,8197,8198,8199,8200,8201,8202,8232,8233,\
+                          8239,8287,12288)";
+
 /// How many characters of one listed field are read.
 ///
 /// A goal, an answer and an error are all written by somebody else: the
@@ -163,7 +177,8 @@ pub fn running(conn: &Connection, workflow_name: &str) -> Result<Vec<RunningSess
     // The goal is measured and not read: `trim` and `length` run inside the
     // database, so a goal of any size answers in one number. The character
     // set is given, because `trim` alone removes the space and not the tab or
-    // the newline.
+    // the newline. It is the set Rust's own `trim` removes, so the two ends
+    // of this invariant agree about a goal of nothing but space.
     //
     // The length is of the BYTES. `length` on text counts to the first NUL
     // and stops, so a goal that opens with one measures zero. The daemon
@@ -184,7 +199,7 @@ pub fn running(conn: &Connection, workflow_name: &str) -> Result<Vec<RunningSess
     //
     // The caller checks the RANGE of the value the two tests admit.
     let mut statement = conn
-        .prepare(
+        .prepare(&format!(
             "SELECT exec_id, \
                     CASE WHEN json_valid(input_json) \
                          THEN json_extract(input_json, '$.workspace') END, \
@@ -203,12 +218,11 @@ pub fn running(conn: &Connection, workflow_name: &str) -> Result<Vec<RunningSess
                     CASE WHEN json_valid(input_json) \
                           AND json_type(input_json, '$.goal') = 'text' \
                          THEN length(cast(trim(json_extract(input_json, '$.goal'), \
-                                               char(32) || char(9) || char(10) \
-                                               || char(13)) as blob)) \
+                                               {WHITESPACE}) as blob)) \
                          END \
              FROM harvest_executions \
-             WHERE workflow_name = ?1 AND state = 'RUNNING' ORDER BY rowid",
-        )
+             WHERE workflow_name = ?1 AND state = 'RUNNING' ORDER BY rowid"
+        ))
         .map_err(|e| format!("cannot prepare the running-session query: {e}"))?;
     let rows = statement
         .query_map([workflow_name], |row| {

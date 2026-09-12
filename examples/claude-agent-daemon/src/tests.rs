@@ -2682,6 +2682,190 @@ fn a_goal_opening_with_a_nul_is_measured_whole() {
     );
 }
 
+/// The startup check draws the blank-goal line where `submit` draws it.
+///
+/// Rust's `trim` removes the whole Unicode whitespace set. `SQLite`'s removes
+/// only the characters it is given. A goal of non-breaking spaces says
+/// nothing, and `submit` refuses it. A narrower set in SQL would resume a
+/// session the other end of this invariant calls blank.
+#[test]
+fn a_goal_of_unicode_space_is_refused_as_submit_refuses_it() {
+    let dir = tempfile::tempdir().expect("a temporary directory");
+    let db = dir.path().join("space.db");
+    let conn = rusqlite::Connection::open(&db).expect("the database opens");
+    conn.execute(
+        "CREATE TABLE harvest_executions (exec_id TEXT, workflow_name TEXT, \
+         state TEXT, input_json TEXT, output_json TEXT, error TEXT)",
+        [],
+    )
+    .expect("the fixture table is created");
+    drop(conn);
+    let task = |goal: &str| {
+        json!({
+            "goal": goal,
+            "max_turns": 4,
+            "approval_timeout_secs": 300,
+            "workspace": "/tmp/w",
+            "model": claude::OFFLINE_MODEL,
+        })
+        .to_string()
+    };
+    let writer = rusqlite::Connection::open(&db).expect("the database opens");
+    for (exec, goal) in [
+        ("nbsp", "\u{a0}\u{a0}"),
+        ("ideographic", "\u{3000}"),
+        ("thin", "\u{2009}\u{2009}"),
+        ("nel", "\u{85}"),
+    ] {
+        writer
+            .execute(
+                "INSERT INTO harvest_executions VALUES (?1, ?2, 'RUNNING', ?3, NULL, NULL)",
+                rusqlite::params![exec, WORKFLOW_NAME, task(goal)],
+            )
+            .expect("the session is recorded");
+    }
+    // One wrapped in that space is still a goal, so the trim is a trim.
+    writer
+        .execute(
+            "INSERT INTO harvest_executions VALUES ('wrapped', ?1, 'RUNNING', ?2, NULL, NULL)",
+            rusqlite::params![WORKFLOW_NAME, task("\u{a0}do it\u{3000}")],
+        )
+        .expect("the session is recorded");
+    drop(writer);
+
+    let reader = rusqlite::Connection::open(&db).expect("the database opens");
+    let running = inspect::running(&reader, WORKFLOW_NAME).expect("the query runs");
+    let unicode_goal = |exec: &str| {
+        running
+            .iter()
+            .find(|row| row.exec_id == exec)
+            .expect("the session is RUNNING")
+            .has_goal
+    };
+    for blank in ["nbsp", "ideographic", "thin", "nel"] {
+        assert!(
+            !unicode_goal(blank),
+            "a goal of only {blank} space must be refused, as `submit` refuses it"
+        );
+    }
+    assert!(
+        unicode_goal("wrapped"),
+        "a real goal wrapped in that space is still a goal"
+    );
+}
+
+/// A capped directory listing reaches every entry.
+///
+/// `read_dir` gives no order, so a truncated READ returns an arbitrary subset
+/// and the same call returns that same subset again. Everything outside it is
+/// unreachable to the model, which has only a path to ask with.
+///
+/// The selection is bounded instead: the smallest names after the cursor. The
+/// page is therefore in order, and the cursor walks the whole directory.
+#[test]
+fn a_capped_listing_walks_the_whole_directory() {
+    let dir = tempfile::tempdir().expect("a temporary directory");
+    let workspace = dir.path().join("workspace");
+    std::fs::create_dir_all(&workspace).expect("the workspace is created");
+    // Enough to overflow one page, named so that sorted order is known.
+    let total = tools::MAX_ENTRIES + 5;
+    for index in 0..total {
+        std::fs::write(workspace.join(format!("f{index:04}.txt")), "x").expect("a file");
+    }
+
+    let body = tools::activity_body(workspace.clone());
+    let call = |after: Option<&str>| -> String {
+        let mut input = json!({ "path": "." });
+        if let Some(after) = after {
+            input["after"] = json!(after);
+        }
+        let raw = body(tool_request(&workspace, tools::TOOL_LIST_FILES, input))
+            .expect("a tool failure is a result, not an activity error");
+        let outcome: ToolOutcome = serde_json::from_value(raw).expect("the outcome decodes");
+        assert!(
+            !outcome.is_error,
+            "the listing must succeed: {}",
+            outcome.output
+        );
+        outcome.output
+    };
+
+    let first = call(None);
+    let named: Vec<&str> = first.lines().filter(|line| line.starts_with('f')).collect();
+    assert_eq!(
+        named.len(),
+        tools::MAX_ENTRIES,
+        "the first page holds one page of entries"
+    );
+    assert_eq!(
+        named[0], "f0000.txt",
+        "the page is the SMALLEST names, and not an arbitrary subset"
+    );
+    assert!(
+        first.contains("after"),
+        "a truncated listing must name the cursor that continues it: {first}"
+    );
+
+    // The cursor reaches the entries the first page left out, which a capped
+    // read with no cursor could never do.
+    let last = named.last().expect("the page is not empty");
+    let second = call(Some(last));
+    let rest: Vec<&str> = second
+        .lines()
+        .filter(|line| line.starts_with('f'))
+        .collect();
+    assert_eq!(rest.len(), 5, "the rest of the directory is reachable");
+    assert_eq!(
+        rest[0],
+        format!("f{:04}.txt", tools::MAX_ENTRIES),
+        "the second page starts after the cursor"
+    );
+}
+
+/// A socket path a terminal would rewrite is refused.
+///
+/// Being UTF-8 is not enough. Every printed line leaves through `visible`,
+/// which rewrites a character a terminal would act on. A path holding one is
+/// printed as an escape, and the copied command names another socket.
+#[test]
+fn a_socket_path_the_terminal_would_rewrite_is_refused() {
+    use clap::Parser;
+
+    for raw in [
+        "/tmp/a\u{1b}[2K.sock",
+        "/tmp/a\u{202e}b.sock",
+        "/tmp/a\u{0}b.sock",
+    ] {
+        let cli = crate::Cli::try_parse_from(["agentd", "--socket", raw, "list"])
+            .expect("clap accepts the text; the refusal is the daemon's own");
+        let refused = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("a runtime")
+            .block_on(crate::run(cli));
+        let message = refused.expect_err("a path the renderer rewrites must be refused");
+        assert!(
+            message.contains("act on"),
+            "the refusal must name the reason: {message}"
+        );
+    }
+
+    // An ordinary path is still served, so the check refuses only what the
+    // renderer would rewrite.
+    let plain = crate::Cli::try_parse_from(["agentd", "--socket", "/tmp/plain.sock", "list"])
+        .expect("clap accepts the path");
+    let answered = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("a runtime")
+        .block_on(crate::run(plain));
+    let message = answered.expect_err("no daemon listens there");
+    assert!(
+        message.contains("cannot reach the daemon"),
+        "an ordinary path must reach the connect attempt: {message}"
+    );
+}
+
 /// A socket is replaced only when nothing is proved to be listening.
 ///
 /// The reclaim removes a name and binds over it. Doing that to a LIVE socket

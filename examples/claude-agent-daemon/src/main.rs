@@ -211,18 +211,35 @@ fn usable_key(raw: &str) -> Option<String> {
 /// The refusal comes before any command runs. The daemon does not print a
 /// path it cannot print.
 ///
+/// Being UTF-8 is not enough on its own. Every printed line leaves through
+/// [`visible`], which REWRITES a character a terminal would act on. A path
+/// holding one is printed as the escape rather than as itself, so the copied
+/// command names a different socket. That is the same fault as a path that is
+/// not text, one step further on.
+///
 /// # Errors
 ///
-/// Returns an error if the path is not UTF-8.
+/// Returns an error if the path is not UTF-8, or if it holds a character the
+/// renderer would rewrite.
 fn printable(socket: &Path) -> Result<(), String> {
-    if socket.to_str().is_some() {
-        return Ok(());
+    let Some(text) = socket.to_str() else {
+        return Err(format!(
+            "the socket path {} is not UTF-8. This daemon prints commands that name \
+             the socket, and it cannot print this one. Choose a path of text.",
+            socket.display()
+        ));
+    };
+    if let Some(rewritten) = text.chars().find(|c| is_obeyed(*c)) {
+        return Err(format!(
+            "the socket path {} holds {}, which a terminal would act on rather \
+             than print. Every command this daemon prints shows that character \
+             as an escape, so a copied command would name another socket. \
+             Choose a path of ordinary text.",
+            socket.display(),
+            rewritten.escape_unicode()
+        ));
     }
-    Err(format!(
-        "the socket path {} is not UTF-8. This daemon prints commands that name \
-         the socket, and it cannot print this one. Choose a path of text.",
-        socket.display()
-    ))
+    Ok(())
 }
 
 /// Dispatch one command.

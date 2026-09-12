@@ -433,8 +433,22 @@ pub async fn bind(socket: &Path) -> Result<UnixListener, String> {
             Err(_) => {}
         }
         // The socket outlived its process, so it is safe to replace.
-        std::fs::remove_file(socket)
-            .map_err(|e| format!("cannot remove the stale socket {}: {e}", socket.display()))?;
+        //
+        // A name already gone is the outcome this wanted, not a failure. The
+        // entry can vanish between the two calls above. A missing entry is
+        // one of the two answers that prove nothing listens, so this path is
+        // reached with the name already free. The bind below still refuses if
+        // something has taken the name again.
+        match std::fs::remove_file(socket) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => {
+                return Err(format!(
+                    "cannot remove the stale socket {}: {e}",
+                    socket.display()
+                ));
+            }
+        }
     }
 
     guard::with_private_umask(|| UnixListener::bind(socket))
