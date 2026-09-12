@@ -295,26 +295,28 @@ fn check_resumable(
         // therefore stays RUNNING for as long as the file lasts, and nothing
         // ever says so. The daemon refuses to start instead, under the same
         // policy as the two checks below.
-        let task = serde_json::from_str::<SessionTask>(&row.input_json).map_err(|e| {
-            format!(
-                "session {} carries an input this daemon cannot read: {e}. The                  session stays RUNNING and no daemon of this version can resume                  it. A newer daemon wrote it, or the row is damaged.",
-                row.exec_id
-            )
-        })?;
-        if task.workspace != workspace {
+        let (Some(recorded_workspace), Some(recorded_model)) = (&row.workspace, &row.model) else {
             return Err(format!(
-                "session {} belongs to the workspace `{}`, and this daemon serves \
-                 `{workspace}`. Start it with `--workspace {}` so the session can \
-                 resume.",
-                row.exec_id, task.workspace, task.workspace
+                "session {} carries an input this daemon cannot read. The session \
+                 stays RUNNING and no daemon of this version can resume it. A \
+                 newer daemon wrote it, or the row is damaged.",
+                row.exec_id
+            ));
+        };
+        if recorded_workspace != workspace {
+            return Err(format!(
+                "session {} belongs to the workspace `{recorded_workspace}`, and \
+                 this daemon serves `{workspace}`. Start it with \
+                 `--workspace {recorded_workspace}` so the session can resume.",
+                row.exec_id
             ));
         }
-        if task.model != model {
+        if recorded_model != model {
             return Err(format!(
-                "session {} runs on the model `{}`, and this daemon serves `{model}`. \
-                 Start it with `--model {}`, or with the key that model needs, so the \
-                 session can resume.",
-                row.exec_id, task.model, task.model
+                "session {} runs on the model `{recorded_model}`, and this daemon \
+                 serves `{model}`. Start it with `--model {recorded_model}`, or \
+                 with the key that model needs, so the session can resume.",
+                row.exec_id
             ));
         }
         // An id that does not parse is the same failure one step on. The

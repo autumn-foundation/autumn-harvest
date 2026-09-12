@@ -46,7 +46,11 @@ const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 /// One RUNNING session: its id, and the task it started from.
 pub struct RunningSession {
     pub exec_id: String,
-    pub input_json: String,
+    /// The workspace this session was recorded against, read out of its task.
+    /// `None` when the task cannot be read at all.
+    pub workspace: Option<String>,
+    /// The model this session was recorded against. `None` as above.
+    pub model: Option<String>,
 }
 
 /// One row of `harvest_executions`.
@@ -126,9 +130,22 @@ pub fn is_session(conn: &Connection, workflow_name: &str, exec_id: &str) -> Resu
 ///
 /// Returns an error if the query fails.
 pub fn running(conn: &Connection, workflow_name: &str) -> Result<Vec<RunningSession>, String> {
+    // The two identity FIELDS are read, and not the task. A recorded goal can
+    // approach the control-request cap, and a restart reads every session
+    // parked on a long approval deadline. Reading the tasks whole could spend
+    // the daemon's memory before it is ready to serve anything.
+    //
+    // `json_valid` guards the extraction. A task that is not JSON at all
+    // yields NULL rather than failing the whole query. The caller can then
+    // name the row it cannot read.
     let mut statement = conn
         .prepare(
-            "SELECT exec_id, input_json FROM harvest_executions \
+            "SELECT exec_id, \
+                    CASE WHEN json_valid(input_json) \
+                         THEN json_extract(input_json, '$.workspace') END, \
+                    CASE WHEN json_valid(input_json) \
+                         THEN json_extract(input_json, '$.model') END \
+             FROM harvest_executions \
              WHERE workflow_name = ?1 AND state = 'RUNNING' ORDER BY rowid",
         )
         .map_err(|e| format!("cannot prepare the running-session query: {e}"))?;
@@ -136,7 +153,8 @@ pub fn running(conn: &Connection, workflow_name: &str) -> Result<Vec<RunningSess
         .query_map([workflow_name], |row| {
             Ok(RunningSession {
                 exec_id: row.get(0)?,
-                input_json: row.get(1)?,
+                workspace: row.get(1)?,
+                model: row.get(2)?,
             })
         })
         .map_err(|e| format!("cannot read the running sessions: {e}"))?;

@@ -375,18 +375,39 @@ pub fn is_message(payload: &Value) -> bool {
 /// calls of this turn have run. A malformed billed response would leave a
 /// real change on the disk, and a failed session behind it.
 ///
-/// The test is on the shape alone. Each block must be an object naming its
-/// type. A block type this example does not know about still passes, because
-/// the API knows types this example does not.
+/// Each block must be an object naming its type. A block of a type this
+/// example KNOWS must also carry that type's fields. A `text` block with no
+/// text, or a `tool_use` with no name, is one the API refuses on replay.
+/// `parse_reply` would quietly default it here.
+///
+/// A type this example does not know is checked for its name alone. The API
+/// knows types this example does not, and guessing at their required fields
+/// would refuse replies that are perfectly good.
 pub fn has_replayable_content(reply: &TurnReply) -> bool {
-    reply.content.as_array().is_some_and(|blocks| {
-        blocks.iter().all(|block| {
-            block
-                .get("type")
-                .and_then(Value::as_str)
-                .is_some_and(|kind| !kind.trim().is_empty())
-        })
-    })
+    reply
+        .content
+        .as_array()
+        .is_some_and(|blocks| blocks.iter().all(is_replayable_block))
+}
+
+/// Is one content block whole enough to send back?
+fn is_replayable_block(block: &Value) -> bool {
+    let Some(kind) = block.get("type").and_then(Value::as_str) else {
+        return false;
+    };
+    let names = |field: &str| {
+        block
+            .get(field)
+            .and_then(Value::as_str)
+            .is_some_and(|text| !text.trim().is_empty())
+    };
+    match kind.trim() {
+        "" => false,
+        "text" => block.get("text").is_some_and(Value::is_string),
+        "tool_use" => names("id") && names("name") && block.get("input").is_some(),
+        // A type from a later API. Its name is all this example can judge.
+        _ => true,
+    }
 }
 
 /// Can every tool call in this reply be addressed on its own?

@@ -1559,12 +1559,33 @@ fn a_block_that_cannot_be_replayed_is_refused() {
         );
     }
 
+    // A block of a type this example KNOWS must carry that type's fields. The
+    // API refuses these on replay, and `parse_reply` would quietly default
+    // them here. A text block with no text reads as an empty answer. A call
+    // with no name reads as a call to nothing.
+    for incomplete in [
+        json!([{ "type": "text" }]),
+        json!([{ "type": "text", "text": 7 }]),
+        json!([{ "type": "tool_use", "id": "toolu_a", "input": {} }]),
+        json!([{ "type": "tool_use", "id": "toolu_a", "name": " ", "input": {} }]),
+        json!([{ "type": "tool_use", "name": "write_file", "input": {} }]),
+        json!([{ "type": "tool_use", "id": "toolu_a", "name": "write_file" }]),
+    ] {
+        assert!(
+            !claude::has_replayable_content(&reply(incomplete.clone())),
+            "a known block missing its fields must be refused: {incomplete}"
+        );
+    }
+
     // A block type this example does not know about still passes, because the
-    // API knows types this example does not.
+    // API knows types this example does not. Guessing at the fields of a type
+    // from a later API would refuse replies that are perfectly good.
     for fine in [
         json!([{ "type": "text", "text": "hello" }]),
+        json!([{ "type": "text", "text": "" }]),
         json!([{ "type": "thinking", "thinking": "…" }]),
         json!([{ "type": "a_type_from_a_later_api" }]),
+        json!([{ "type": "tool_use", "id": "toolu_a", "name": "write_file", "input": {} }]),
         json!([]),
     ] {
         assert!(
@@ -2776,13 +2797,25 @@ async fn the_startup_and_status_queries_read_only_what_they_need() {
         vec![parked.to_string()],
         "only the parked session is drivable"
     );
-    // The startup check reads the task out of this row, so the query carries
-    // the input as well as the id.
+    // The startup check compares the workspace and the model, so the query
+    // carries those two FIELDS and not the whole recorded task. A goal can
+    // approach the control-request cap, and a restart reads every parked
+    // session. Reading the tasks whole could spend the daemon's memory before
+    // it is ready.
+    let first = running.first().expect("the parked session is listed");
+    assert_eq!(
+        first.workspace.as_deref(),
+        Some(workspace.to_str().expect("the workspace path is UTF-8")),
+        "the running row must carry the workspace it was recorded against"
+    );
+    assert_eq!(
+        first.model.as_deref(),
+        Some(claude::OFFLINE_MODEL),
+        "the running row must carry the model it was recorded against"
+    );
     assert!(
-        running
-            .first()
-            .is_some_and(|session| session.input_json.contains("summarise the workspace")),
-        "the running row must carry the task it started from"
+        !format!("{:?} {:?}", first.workspace, first.model).contains("summarise the workspace"),
+        "the running row must not carry the goal"
     );
     assert_eq!(
         crate::inspect::executions(&reader, WORKFLOW_NAME)
