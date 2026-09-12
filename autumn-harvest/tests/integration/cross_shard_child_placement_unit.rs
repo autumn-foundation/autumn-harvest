@@ -310,36 +310,47 @@ fn a_pin_to_a_drained_shard_resolves_and_is_rejected_at_the_persist_boundary() {
     assert!(err.is_shard_unavailable(), "got {err:?}");
 }
 
-/// A fully-drained fleet degenerates a `Distributed` placement to the default
-/// shard — deliberately, and with a trace.
+/// A fully-drained fleet degenerates a `Distributed` placement to the
+/// PARENT's own shard — deliberately, and with a trace.
 ///
-/// Every alternative is worse. Failing the spawn would be terminal (the handler
-/// ABI erases the error type). Requeuing it would *deadlock the drain*: a drained
-/// shard is one that should let its in-flight work finish, and a parent cannot
-/// finish while the children it awaits are refused. And with zero writable
-/// shards the default shard is where an *unplaced* child would go and where the
-/// parent already lives, so no cross-shard contract is broken — none was made.
-/// AC8 requires that a fallback never happen "without trace", which the `warn!`
-/// on this path provides.
+/// Every alternative is worse. Failing the spawn would be terminal — the
+/// handler ABI erases the error type. Requeuing it would *deadlock the
+/// drain*: a drained shard is one that should let its in-flight work
+/// finish. A parent cannot finish while the children it awaits are
+/// refused.
+///
+/// The parent's own shard is not an arbitrary consolation prize. With zero
+/// writable shards it is where an *unplaced* child would go, and it is
+/// where the parent already lives. So no cross-shard contract is broken —
+/// none was made. Critically, it also makes the resulting child LOCAL. The
+/// persist-time preflight — which rejects a cross-shard target on a
+/// drained shard — can then never see it and reject it. See issue #1263
+/// item 15, which caught this returning `default_shard()` instead. That
+/// value only coincides with the parent's shard when the parent already
+/// happens to live on the default shard.
+///
+/// AC8 requires that a fallback never happen "without trace", which the
+/// `warn!` on this path provides.
 #[test]
-fn distributed_placement_with_no_writable_shard_degenerates_to_the_default_shard() {
+fn distributed_placement_with_no_writable_shard_stays_on_the_parents_shard() {
     let router = ShardRouter::new(
         vec![ShardId::new(0), ShardId::new(1)],
         vec![],
         ShardId::new(0),
     );
+    let parent_shard = ShardId::new(1);
     let resolved = resolve_child_placement(
         Some(&router),
         &ChildPlacement::Distributed,
-        ShardId::new(0),
+        parent_shard,
         "child_wf",
         "parent#1",
     )
     .expect("a drained fleet must not fail the handler");
     assert_eq!(
-        resolved,
-        router.default_shard(),
-        "the degenerate pick is the default shard, not an arbitrary one"
+        resolved, parent_shard,
+        "the degenerate pick is the PARENT's shard, not the default shard \
+         (which the parent need not be on)"
     );
 }
 
@@ -724,41 +735,13 @@ fn an_unreadable_parent_state_still_delivers_a_terminal_child() {
     );
 }
 
-/// **Regression (Codex round 2, P1).** The child-terminal wake must be skipped
-/// when the parent lives on another shard.
-///
-/// `wake_parent_for_child_*` appends to the parent's history on the *child's*
-/// own connection. For a cross-shard child that connection is the target
-/// shard's database, where the parent row does not exist — and
-/// `store::append_single_event` requires it — so the append would `NotFound` and
-/// roll back the **child's entire terminal transaction**. The child would never
-/// settle, the relay would never have a terminal to deliver, and the parent
-/// would park forever: a silent, total failure of the feature.
-#[cfg(feature = "db")]
-#[test]
-fn a_cross_shard_parent_is_recognised_so_the_inline_wake_is_skipped() {
-    use autumn_harvest::worker::parent_is_on_another_shard;
-
-    let on_0 = ExecutionId::new_for_shard(ShardId::new(0));
-    let on_2 = ExecutionId::new_for_shard(ShardId::new(2));
-    assert!(
-        parent_is_on_another_shard(on_0, on_2),
-        "a parent on shard 0 and a child on shard 2 must be recognised as split"
-    );
-
-    // Same shard: the inline wake is correct and must NOT be skipped.
-    let also_0 = ExecutionId::new_for_shard(ShardId::new(0));
-    assert!(!parent_is_on_another_shard(on_0, also_0));
-
-    // The unencoded sentinel means "the parent's shard" by construction, on
-    // either side, so it is never cross-shard — the same normalisation the
-    // spawn path applies. Getting this wrong would divert an ordinary
-    // single-shard child's wake into a relay that will never run for it.
-    let unencoded = ExecutionId::new();
-    assert!(!parent_is_on_another_shard(unencoded, on_0));
-    assert!(!parent_is_on_another_shard(on_0, unencoded));
-    assert!(!parent_is_on_another_shard(unencoded, unencoded));
-}
+// `a_cross_shard_parent_is_recognised_so_the_inline_wake_is_skipped` used to
+// live here (issue #956). Issue #1263 item 11 made
+// `parent_is_on_another_shard` take a connection and consult it, rather
+// than the installed router, for an unencoded parent. It is no longer
+// callable without a database at all. Moved to
+// `cross_shard_children_tests.rs::a_cross_shard_parent_is_recognised_so_the_inline_wake_is_skipped`,
+// which already has one.
 
 #[test]
 fn status_round_trips_through_its_database_representation() {

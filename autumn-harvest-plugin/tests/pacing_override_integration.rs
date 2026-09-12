@@ -849,6 +849,7 @@ async fn eligibility_endpoint_reports_the_saturation_claim_task_actually_enforce
         None,
         &std::collections::HashMap::new(),
         0,
+        &[],
     )
     .await
     .expect("worker registration should succeed");

@@ -335,22 +335,27 @@ pub const CODEC_ROTATION_DEFAULT_BATCH: i64 = 200;
 
 #[cfg(feature = "db")]
 pub use db::{
-    CodecRotationCursor, FleetWriteFence, ShardRotationProgress, compare_and_swap_event,
-    count_rows_by_key_id, load_shard_rotation_progress, load_shard_rotation_progress_against,
-    retire_codec_key, sweep_codec_reencryption, sweep_codec_reencryption_once,
+    CodecRotationCursor, FleetWriteFence, ShardRotationProgress, activate_codec_key,
+    compare_and_swap_event, count_rows_by_key_id, load_shard_rotation_progress,
+    load_shard_rotation_progress_against, refresh_active_codec_key, retire_codec_key,
+    sweep_codec_reencryption, sweep_codec_reencryption_once, write_cursor,
 };
 
 #[cfg(feature = "db")]
 mod db {
     use std::collections::BTreeMap;
+    use std::time::Duration;
 
     use chrono::{DateTime, Utc};
-    use diesel::sql_types::{Array, BigInt, Integer, Jsonb, Nullable, Text, Timestamptz};
-    use diesel_async::{AsyncPgConnection, RunQueryDsl};
+    use diesel::sql_types::{Array, BigInt, Double, Integer, Jsonb, Nullable, Text, Timestamptz};
+    use diesel_async::{AsyncConnection, AsyncPgConnection, RunQueryDsl};
     use serde::Serialize;
     use serde_json::Value;
 
-    use crate::error::{CodecKeyShardRemainder, HarvestError, HarvestResult, database_error};
+    use crate::error::{
+        CodecKeyActivationBlocker, CodecKeyShardRemainder, HarvestError, HarvestResult,
+        database_error,
+    };
     use crate::payload_codec::PayloadCodecs;
     use crate::payload_store::PAYLOAD_FIELD_KEYS;
     use crate::telemetry::MetricsRecorder;
@@ -714,6 +719,7 @@ mod db {
         if !cursor_table_present(conn).await? {
             return Ok(0);
         }
+        let shard = crate::types::ShardId::new(shard_id);
         // Resolve the target key ONCE for the whole batch. Every row is
         // re-encoded under this exact key id, so a concurrent `set_active_key`
         // cannot straddle a row, and the progress we file below is attributed to
@@ -759,15 +765,7 @@ mod db {
             let mut candidate = original.clone();
             match reencrypt_event_payload_fields_under(codecs, &active_key_id, &mut candidate) {
                 Ok(outcome) if outcome.changed() => {
-                    if compare_and_swap_event(
-                        conn,
-                        crate::types::ShardId::new(shard_id),
-                        row.id,
-                        &original,
-                        &candidate,
-                    )
-                    .await?
-                    {
+                    if compare_and_swap_event(conn, shard, row.id, &original, &candidate).await? {
                         rewritten += 1;
                     } else {
                         // The row changed under us — a PII erasure, or another
@@ -854,7 +852,7 @@ mod db {
         // that commits below the cursor is only ever found this way.
         let census_needed = if reached_end && unresolved_total == 0 {
             if already_complete {
-                claim_completed_cursor_revalidation(conn, shard_id).await?
+                claim_completed_cursor_revalidation(conn, shard).await?
             } else {
                 true
             }
@@ -931,7 +929,7 @@ mod db {
         if !cursor_unchanged {
             write_cursor(
                 conn,
-                shard_id,
+                shard,
                 &active_key_id,
                 next_last_event_id,
                 rows_reencrypted_total,
@@ -1026,13 +1024,6 @@ mod db {
         Ok(updated > 0)
     }
 
-    /// Persist the pass's absolute state.
-    ///
-    /// Absolute rather than incremental (`SET x = x + n`) because the values are
-    /// computed from a read this same call made: only one scanner per shard runs
-    /// this, and a second one racing it simply overwrites with its own
-    /// consistent view rather than compounding two partial increments onto a
-    /// row whose meaning it never read.
     /// Atomically claim the right to re-census a completed shard.
     ///
     /// Returns `true` for the ONE caller that wins the interval.
@@ -1062,7 +1053,31 @@ mod db {
     /// the interval is a rate limit on an expensive scan, not a lease on
     /// completing it. A crash mid-census costs one skipped revalidation, which
     /// the next interval picks up.
+    ///
+    /// ## Fencing (issue #954, issue #1257)
+    ///
+    /// Fenced the same way as [`write_cursor`]. Claiming the interval writes
+    /// `updated_at`, so a worker pinned to a superseded generation must not
+    /// be the one who wins the claim.
     async fn claim_completed_cursor_revalidation(
+        conn: &mut AsyncPgConnection,
+        shard: crate::types::ShardId,
+    ) -> HarvestResult<bool> {
+        use diesel_async::AsyncConnection as _;
+
+        if crate::replication::FenceRegistry::is_enabled() {
+            return Box::pin(
+                conn.transaction::<bool, HarvestError, _>(async move |conn| {
+                    crate::replication::assert_fence(conn, shard).await?;
+                    claim_completed_cursor_revalidation_statement(conn, shard.as_i32()).await
+                }),
+            )
+            .await;
+        }
+        claim_completed_cursor_revalidation_statement(conn, shard.as_i32()).await
+    }
+
+    async fn claim_completed_cursor_revalidation_statement(
         conn: &mut AsyncPgConnection,
         shard_id: i32,
     ) -> HarvestResult<bool> {
@@ -1081,7 +1096,101 @@ mod db {
         Ok(claimed > 0)
     }
 
-    async fn write_cursor(
+    /// Persist the pass's absolute state.
+    ///
+    /// The value is absolute, not incremental (`SET x = x + n`), because it
+    /// comes from one read this same call already did.
+    ///
+    /// ## The write is a compare-and-swap (issue #1257)
+    ///
+    /// Two sweepers can read the same cursor row and each compute their own
+    /// next state from it. The write that commits last must not silently
+    /// overwrite a fresher one -- a lost update moves the cursor backward or
+    /// drops rows from `rows_reencrypted`.
+    ///
+    /// The `WHERE` clause on `DO UPDATE` guards against that. For the same
+    /// `active_key_id`, it applies the write only when the new
+    /// `rows_reencrypted` is at least the stored value. A write computed
+    /// from a stale read fails this check and is dropped, not applied --
+    /// mirroring [`compare_and_swap_event`] for `harvest_events`.
+    ///
+    /// `rows_reencrypted` never gets a rewind exception. Every branch that
+    /// resets `last_event_id` still carries `rows_reencrypted` forward from
+    /// the same read (see `sweep_codec_reencryption_once`). A stale write
+    /// can never legitimately need to lower it.
+    ///
+    /// `last_event_id` gets two exceptions:
+    /// - A different `active_key_id` starts a fresh pass. Its
+    ///   `last_event_id` is not comparable to the previous key's, so the
+    ///   whole write applies regardless of `rows_reencrypted` too.
+    /// - `last_event_id = 0` is the deliberate rewind a pass takes when it
+    ///   leaves rows unresolved. That reset must stay possible even over a
+    ///   higher stored `last_event_id`. It still needs `rows_reencrypted`
+    ///   to pass its own check, or a stale rewind could drop rows from the
+    ///   count it carries forward.
+    ///
+    /// ## Fencing (issue #954, issue #1257)
+    ///
+    /// Fenced the same way as [`compare_and_swap_event`]. When
+    /// [`crate::replication::FenceRegistry::is_enabled`] holds, the write
+    /// runs inside a transaction behind [`crate::replication::assert_fence`].
+    /// A worker pinned to a superseded generation cannot advance the cursor
+    /// this way. That covers a batch that converted no rows too, since such
+    /// a batch never reaches the per-row CAS. The fence check is skipped
+    /// when fencing is off: one statement, no extra round trip.
+    ///
+    /// `#[doc(hidden)] pub` so the CAS is directly testable by an
+    /// integration test. Not part of the engine's stable API.
+    ///
+    /// # Errors
+    ///
+    /// Propagates database failures, and
+    /// [`crate::error::HarvestError::ShardFenced`] when this process is
+    /// pinned to a superseded generation.
+    #[doc(hidden)]
+    pub async fn write_cursor(
+        conn: &mut AsyncPgConnection,
+        shard: crate::types::ShardId,
+        active_key_id: &str,
+        last_event_id: i64,
+        rows_reencrypted: i64,
+        unresolved_rows: i64,
+        completed_at: Option<DateTime<Utc>>,
+    ) -> HarvestResult<bool> {
+        use diesel_async::AsyncConnection as _;
+
+        if crate::replication::FenceRegistry::is_enabled() {
+            let active_key_id = active_key_id.to_string();
+            return Box::pin(
+                conn.transaction::<bool, HarvestError, _>(async move |conn| {
+                    crate::replication::assert_fence(conn, shard).await?;
+                    write_cursor_statement(
+                        conn,
+                        shard.as_i32(),
+                        &active_key_id,
+                        last_event_id,
+                        rows_reencrypted,
+                        unresolved_rows,
+                        completed_at,
+                    )
+                    .await
+                }),
+            )
+            .await;
+        }
+        write_cursor_statement(
+            conn,
+            shard.as_i32(),
+            active_key_id,
+            last_event_id,
+            rows_reencrypted,
+            unresolved_rows,
+            completed_at,
+        )
+        .await
+    }
+
+    async fn write_cursor_statement(
         conn: &mut AsyncPgConnection,
         shard_id: i32,
         active_key_id: &str,
@@ -1089,8 +1198,8 @@ mod db {
         rows_reencrypted: i64,
         unresolved_rows: i64,
         completed_at: Option<DateTime<Utc>>,
-    ) -> HarvestResult<()> {
-        diesel::sql_query(
+    ) -> HarvestResult<bool> {
+        let applied = diesel::sql_query(
             "INSERT INTO harvest_codec_rotation_cursor \
                  (shard_id, active_key_id, last_event_id, rows_reencrypted, unresolved_rows, \
                   completed_at, updated_at) \
@@ -1101,7 +1210,14 @@ mod db {
                  rows_reencrypted = EXCLUDED.rows_reencrypted, \
                  unresolved_rows = EXCLUDED.unresolved_rows, \
                  completed_at = EXCLUDED.completed_at, \
-                 updated_at = NOW()",
+                 updated_at = NOW() \
+             WHERE harvest_codec_rotation_cursor.active_key_id <> EXCLUDED.active_key_id \
+                OR ( \
+                     (EXCLUDED.last_event_id = 0 \
+                      OR harvest_codec_rotation_cursor.last_event_id <= EXCLUDED.last_event_id) \
+                     AND harvest_codec_rotation_cursor.rows_reencrypted \
+                         <= EXCLUDED.rows_reencrypted \
+                   )",
         )
         .bind::<Integer, _>(shard_id)
         .bind::<Text, _>(active_key_id)
@@ -1112,7 +1228,14 @@ mod db {
         .execute(conn)
         .await
         .map_err(database_error)?;
-        Ok(())
+        if applied == 0 {
+            tracing::debug!(
+                shard_id,
+                "codec rotation cursor write dropped: a newer pass already advanced this \
+                 shard's cursor"
+            );
+        }
+        Ok(applied > 0)
     }
 
     /// Run one sweep batch for the shard this connection already serves
@@ -1159,10 +1282,313 @@ mod db {
         sweep_codec_reencryption_once(conn, shard_id, codecs, batch_limit, metrics).await
     }
 
-    /// Operator attestation that no writer anywhere in the fleet can still
-    /// encode a payload under the key being retired.
+    // ── Durable fleet-wide key state (issue #1244) ───────────────────────
+
+    #[derive(diesel::QueryableByName)]
+    struct KeyStateRow {
+        #[diesel(sql_type = Text)]
+        state: String,
+        #[diesel(sql_type = Nullable<Timestamptz>)]
+        retiring_since: Option<DateTime<Utc>>,
+        /// Seconds since `retiring_since`, computed entirely on this shard's
+        /// own database clock. `NULL` when `retiring_since` is `NULL`.
+        ///
+        /// [`staleness_gate`] uses this, never `Utc::now() -
+        /// retiring_since`. Comparing a DB-stamped timestamp against the
+        /// *caller's* host clock is only correct when the two clocks agree.
+        ///
+        /// A retirement host whose clock runs ahead of a shard's database
+        /// would otherwise see an inflated `elapsed`. It could pass the gate
+        /// before that shard's own live workers had actually had
+        /// `staleness_window` to refresh.
+        #[diesel(sql_type = Nullable<Double>)]
+        elapsed_secs: Option<f64>,
+    }
+
+    #[derive(diesel::QueryableByName)]
+    struct BlockingWorkerRow {
+        #[diesel(sql_type = Text)]
+        worker_id: String,
+        #[diesel(sql_type = Text)]
+        host: String,
+        #[diesel(sql_type = Text)]
+        reason: String,
+    }
+
+    #[derive(diesel::QueryableByName)]
+    struct ActiveKeyRow {
+        #[diesel(sql_type = Text)]
+        key_id: String,
+    }
+
+    /// Read `key_id`'s durable lifecycle row on this connection's shard
+    /// (issue #1244). `None` when the key has never been activated here.
+    async fn read_key_state(
+        conn: &mut AsyncPgConnection,
+        key_id: &str,
+    ) -> HarvestResult<Option<KeyStateRow>> {
+        let rows: Vec<KeyStateRow> = diesel::sql_query(
+            "SELECT state, retiring_since, \
+                    EXTRACT(EPOCH FROM (NOW() - retiring_since))::float8 AS elapsed_secs \
+               FROM harvest_codec_key_state WHERE key_id = $1",
+        )
+        .bind::<Text, _>(key_id)
+        .load(conn)
+        .await
+        .map_err(database_error)?;
+        Ok(rows.into_iter().next())
+    }
+
+    /// Durably record `key_id` becoming the active key on this connection's
+    /// shard (issue #1244). Any other row still marked `active` is demoted to
+    /// `retiring` with `retiring_since = NOW()`, in the same transaction. So
+    /// there is never a moment with zero or two active rows.
     ///
-    /// # Why the census cannot establish this on its own
+    /// `outgoing_key_id` is `codecs.active_key_id()` as read *before* this
+    /// call -- the key this process considered active a moment ago.
+    ///
+    /// A first activation ever, on an empty `harvest_codec_key_state`, has
+    /// no durable `"active"` row for the UPDATE above to demote. The
+    /// in-memory outgoing key was never durable to begin with. Left alone,
+    /// that key would carry no `"retiring"` row forever, and
+    /// [`retire_codec_key`]'s structural gate would refuse it permanently.
+    ///
+    /// So when that UPDATE demotes nothing, this seeds a `"retiring"` row
+    /// for `outgoing_key_id` directly. It uses `ON CONFLICT DO NOTHING`: a
+    /// row already there, in any state, is a fact this call must not
+    /// overwrite.
+    async fn write_key_state_activation(
+        conn: &mut AsyncPgConnection,
+        key_id: &str,
+        outgoing_key_id: &str,
+    ) -> HarvestResult<()> {
+        conn.transaction::<(), HarvestError, _>(async |conn| {
+            let demoted = diesel::sql_query(
+                "UPDATE harvest_codec_key_state \
+                    SET state = 'retiring', retiring_since = NOW(), updated_at = NOW() \
+                  WHERE state = 'active' AND key_id <> $1",
+            )
+            .bind::<Text, _>(key_id)
+            .execute(conn)
+            .await
+            .map_err(database_error)?;
+
+            if demoted == 0 && outgoing_key_id != key_id {
+                diesel::sql_query(
+                    "INSERT INTO harvest_codec_key_state \
+                         (key_id, state, retiring_since, updated_at) \
+                     VALUES ($1, 'retiring', NOW(), NOW()) \
+                     ON CONFLICT (key_id) DO NOTHING",
+                )
+                .bind::<Text, _>(outgoing_key_id)
+                .execute(conn)
+                .await
+                .map_err(database_error)?;
+            }
+
+            diesel::sql_query(
+                "INSERT INTO harvest_codec_key_state (key_id, state, activated_at, updated_at) \
+                     VALUES ($1, 'active', NOW(), NOW()) \
+                 ON CONFLICT (key_id) DO UPDATE SET \
+                     state = 'active', activated_at = NOW(), retiring_since = NULL, \
+                     retired_at = NULL, updated_at = NOW()",
+            )
+            .bind::<Text, _>(key_id)
+            .execute(conn)
+            .await
+            .map_err(database_error)?;
+            Ok(())
+        })
+        .await
+    }
+
+    /// Durably record `key_id` as retired on this connection's shard (issue
+    /// #1244). Best-effort bookkeeping: the in-memory
+    /// [`PayloadCodecs::retire_key_local`] drop is what actually stops this
+    /// process encoding or decoding with the key. A failure here is logged by
+    /// the caller rather than un-retiring the key.
+    async fn write_key_state_retired(
+        conn: &mut AsyncPgConnection,
+        key_id: &str,
+    ) -> HarvestResult<()> {
+        diesel::sql_query(
+            "UPDATE harvest_codec_key_state \
+                SET state = 'retired', retired_at = NOW(), updated_at = NOW() \
+              WHERE key_id = $1",
+        )
+        .bind::<Text, _>(key_id)
+        .execute(conn)
+        .await
+        .map_err(database_error)?;
+        Ok(())
+    }
+
+    /// Live workers on this connection's shard that cannot safely read or
+    /// write under `key_id` (issue #1244).
+    ///
+    /// Blocks on either of two independent conditions:
+    ///
+    /// 1. The worker does not advertise support for the keyed (version-2)
+    ///    codec envelope, so it cannot even parse a `kid`-bearing payload.
+    /// 2. The worker's binary does support version 2, but its own
+    ///    `PayloadCodecs` does not have `key_id` registered. It cannot
+    ///    decode a payload some other worker encoded under it.
+    ///
+    /// A staggered rollout can deploy the new binary fleet-wide before the
+    /// new key's material reaches every worker's config. So condition 2 is
+    /// not implied by condition 1.
+    ///
+    /// "Live" mirrors [`crate::worker::worker_stale_secs`]'s convention: a
+    /// heartbeat within `worker_stale_secs`. `labels` is an operator-facing
+    /// JSONB column, so its value is never trusted to parse. Both checks
+    /// treat a malformed or absent label as failing — fail closed, not a
+    /// query error.
+    #[allow(clippy::cast_precision_loss)] // a liveness window in seconds never approaches 2^53
+    async fn blocking_workers(
+        conn: &mut AsyncPgConnection,
+        worker_stale_secs: i64,
+        key_id: &str,
+    ) -> HarvestResult<Vec<BlockingWorkerRow>> {
+        diesel::sql_query(
+            "SELECT worker_id, host, \
+                    CASE WHEN COALESCE( \
+                                 CASE WHEN labels ->> $2 ~ '^[0-9]+$' \
+                                      THEN (labels ->> $2)::bigint \
+                                      ELSE NULL END, \
+                                 1 \
+                               ) < $3 \
+                         THEN 'cannot read envelope version 2' \
+                         ELSE 'codec key ' || $4 || ' is not registered on this worker' \
+                    END AS reason \
+               FROM harvest_workers \
+              WHERE status <> 'Stopped' \
+                AND NOW() - last_heartbeat_at <= make_interval(secs => $1::float8) \
+                AND ( \
+                      COALESCE( \
+                        CASE WHEN labels ->> $2 ~ '^[0-9]+$' \
+                             THEN (labels ->> $2)::bigint \
+                             ELSE NULL END, \
+                        1 \
+                      ) < $3 \
+                      OR NOT COALESCE(labels -> $5 ? $4, false) \
+                    )",
+        )
+        .bind::<Double, _>(worker_stale_secs as f64)
+        .bind::<Text, _>(crate::payload_codec::CODEC_ENVELOPE_CAPABILITY_LABEL)
+        .bind::<BigInt, _>(crate::payload_codec::CODEC_ENVELOPE_VERSION_KEYED)
+        .bind::<Text, _>(key_id)
+        .bind::<Text, _>(crate::payload_codec::CODEC_REGISTERED_KEY_IDS_LABEL)
+        .load(conn)
+        .await
+        .map_err(database_error)
+    }
+
+    /// Wrap [`blocking_workers`]'s rows as [`CodecKeyActivationBlocker`]s for
+    /// one shard (issue #1244).
+    fn blockers_from_rows(
+        shard_id: i32,
+        rows: Vec<BlockingWorkerRow>,
+    ) -> Vec<CodecKeyActivationBlocker> {
+        rows.into_iter()
+            .map(|r| CodecKeyActivationBlocker {
+                shard_id,
+                worker_id: Some(r.worker_id),
+                host: Some(r.host),
+                reachable: true,
+                reason: Some(r.reason),
+            })
+            .collect()
+    }
+
+    /// This connection's shard's current fleet-wide active key, per
+    /// `harvest_codec_key_state` (issue #1244). `None` when no row is marked
+    /// `active` yet (a fresh deployment that has never called
+    /// [`activate_codec_key`]).
+    async fn active_key_row(conn: &mut AsyncPgConnection) -> HarvestResult<Option<String>> {
+        let rows: Vec<ActiveKeyRow> = diesel::sql_query(
+            "SELECT key_id FROM harvest_codec_key_state WHERE state = 'active' LIMIT 1",
+        )
+        .load(conn)
+        .await
+        .map_err(database_error)?;
+        Ok(rows.into_iter().next().map(|r| r.key_id))
+    }
+
+    /// Resolve a connection to `shard` within `sharded_pool`, or the reason it
+    /// could not be reached (issue #1244).
+    ///
+    /// A missing pool or a failed acquisition must fail closed, never skip the
+    /// shard silently. Shared by every per-shard loop in this module that
+    /// needs that guarantee: [`census_remaining`], [`staleness_gate`], and
+    /// [`activate_codec_key`]'s capability check.
+    async fn resolve_shard_conn(
+        sharded_pool: &crate::shard::ShardedDbPool,
+        shard: crate::types::ShardId,
+    ) -> Result<
+        deadpool::managed::Object<
+            diesel_async::pooled_connection::AsyncDieselConnectionManager<AsyncPgConnection>,
+        >,
+        String,
+    > {
+        let Some(pool) = sharded_pool.exact_pool_for(shard) else {
+            return Err("no connection pool for this shard in this process".to_string());
+        };
+        pool.get()
+            .await
+            .map_err(|e| format!("connection unavailable: {e}"))
+    }
+
+    /// One census pass: `key_id`'s remaining `harvest_events` rows per
+    /// expected shard (issue #948, AC6). Never checks `expected_shards`
+    /// completeness against `sharded_pool` — callers that need the
+    /// fail-closed omission guard run it once, before any census pass.
+    async fn census_remaining(
+        sharded_pool: &crate::shard::ShardedDbPool,
+        expected_shards: &[crate::types::ShardId],
+        key_id: &str,
+    ) -> Vec<CodecKeyShardRemainder> {
+        let mut remaining = Vec::new();
+        for shard in expected_shards {
+            let shard_id = shard.as_i32();
+            let mut conn = match resolve_shard_conn(sharded_pool, *shard).await {
+                Ok(c) => c,
+                Err(reason) => {
+                    remaining.push(CodecKeyShardRemainder {
+                        shard_id,
+                        rows: 0,
+                        reachable: false,
+                        reason: Some(reason),
+                    });
+                    continue;
+                }
+            };
+            match count_rows_by_key_id(&mut conn).await {
+                Ok(counts) => {
+                    let rows = counts.get(key_id).copied().unwrap_or(0);
+                    if rows > 0 {
+                        remaining.push(CodecKeyShardRemainder {
+                            shard_id,
+                            rows,
+                            reachable: true,
+                            reason: None,
+                        });
+                    }
+                }
+                Err(e) => remaining.push(CodecKeyShardRemainder {
+                    shard_id,
+                    rows: 0,
+                    reachable: false,
+                    reason: Some(format!("census failed: {e}")),
+                }),
+            }
+        }
+        remaining
+    }
+
+    /// Escape hatch for [`retire_codec_key`]'s structural write fence (issue
+    /// #1244; formerly the *only* fence, issue #948).
+    ///
+    /// # Why the census alone cannot establish the fence
     ///
     /// [`PayloadCodecs`] is a **per-process** registry: `set_active_key` on one
     /// worker is invisible to every other worker. The census counts rows that
@@ -1170,46 +1596,61 @@ mod db {
     /// instant. Neither of the two ways a new old-key row can still appear is
     /// observable to it:
     ///
-    /// 1. **Another live writer.** A worker that has not yet been told to
-    ///    activate the new key keeps encoding under the old one, and will do so
-    ///    again a millisecond after the census reads zero.
+    /// 1. **Another live writer.** A worker that has not yet observed the new
+    ///    active key keeps encoding under the old one. It writes another
+    ///    old-key row a millisecond after the census reads zero.
     /// 2. **An in-flight append.** A transaction that already encoded its
     ///    payload under the old key, but has not committed, is invisible to the
     ///    census and becomes visible immediately afterwards.
     ///
-    /// In either case the gate would have removed the decoder from this
-    /// process's registry — and, if the operator took `Ok` as licence to
-    /// destroy the key material, the row is unreadable for good.
+    /// The default path (`NotConfirmed`) narrows hazard 1 structurally. It
+    /// requires every expected shard's durable `harvest_codec_key_state` row to
+    /// have named this key `"retiring"` for at least `staleness_window`.
+    /// [`activate_codec_key`] stamps that row the instant a newer key becomes
+    /// active.
     ///
-    /// So the gate demands the half it cannot prove. Establishing the fence is
-    /// a deployment-level act (roll the new active key to every worker, then
-    /// drain or await in-flight appends); this crate does not coordinate the
-    /// fleet and does not pretend to.
+    /// Every other process refreshes its own view of the active key.
+    /// Roughly every scanner-tick interval, see
+    /// [`refresh_active_codec_key`], **provided that process's scanner
+    /// loop is actually ticking on schedule.**
+    ///
+    /// That proviso is not free. [`crate::timeout::spawn_timeout_checker_for_shard`]
+    /// bounds its own pool acquisition to one `interval`, so pool contention
+    /// alone cannot stretch a tick unboundedly. It does **not** bound the
+    /// enforcement pass itself: a single slow or wedged query inside that
+    /// pass can still delay the refresh beyond `interval`.
+    ///
+    /// `staleness_window` is an operational margin, set generously past the
+    /// deployment's nominal `interval` for exactly this reason. It is not a
+    /// proof immune to a stuck scanner. A scanner loop that has stopped
+    /// ticking entirely is `crate::scanner_health`'s job to surface, separately from
+    /// this gate.
+    ///
+    /// This path narrows hazard 2 with an immediate recensus before
+    /// finalizing (see `retire_codec_key`'s `recheck_delay`). It cannot close
+    /// hazard 2 completely without tracking individual transaction lifetimes
+    /// — a known, documented limitation, not a silent gap.
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     pub enum FleetWriteFence {
-        /// The caller has confirmed **both** that no process in the fleet holds
-        /// this key active and that every append already encoded under it has
-        /// settled. The census still has to come back zero on top of this.
+        /// Skip the durable staleness-window wait and go straight to the
+        /// census. For single-process embedders and tests where "another live
+        /// writer" cannot exist by construction — the operator is attesting to
+        /// exactly that. The census (and its recheck) still has to come back
+        /// zero on top of this.
         ConfirmedByOperator,
-        /// No such confirmation. The gate refuses regardless of the census —
-        /// a zero it cannot trust is exactly the case this whole type exists
-        /// to stop being reported as success.
+        /// Use the structural gate: every expected shard's durable key state
+        /// must show `key_id` `"retiring"` for at least `staleness_window`
+        /// before the census even runs.
         NotConfirmed,
     }
 
-    /// The four preconditions that are decidable *without* touching the
-    /// database, split out of [`retire_codec_key`] so the gate itself reads as
-    /// census-then-verdict.
-    ///
-    /// Each one is a refusal to report a vacuous success: retiring the active
-    /// key, proving zero over no shards at all, proving zero for a key this
-    /// process never registered, or trusting a census whose blind spots
-    /// nobody has attested are covered.
+    /// The preconditions decidable *without* touching the database, split out
+    /// of [`retire_codec_key`] so the gate itself reads as validate-then-fence-
+    /// then-census.
     fn validate_retirement_request(
         expected_shards: &[crate::types::ShardId],
         codecs: &PayloadCodecs,
         key_id: &str,
-        fence: FleetWriteFence,
     ) -> HarvestResult<()> {
         if codecs.active_key_id() == key_id {
             return Err(HarvestError::Config(format!(
@@ -1229,20 +1670,123 @@ mod db {
                  without having proved anything about the rows that reference it"
             )));
         }
-        if fence == FleetWriteFence::NotConfirmed {
-            return Err(HarvestError::Config(format!(
-                "cannot retire codec key id {key_id:?}: no fleet write fence was attested. A \
-                 zero census only proves no row references the key *right now* on the shards \
-                 this process can reach; it cannot see another worker that still holds the key \
-                 active, nor an append that encoded under it and has not committed yet. \
-                 Confirm both fleet-wide, then pass FleetWriteFence::ConfirmedByOperator"
-            )));
+        Ok(())
+    }
+
+    /// The structural half of [`FleetWriteFence::NotConfirmed`] (issue #1244).
+    /// Every expected shard must show `key_id` durably `"retiring"`. The
+    /// least-aged of those transitions (the straggling shard sets the pace)
+    /// must be at least `staleness_window` in the past.
+    ///
+    /// Elapsed time is computed on each shard's own database clock, never
+    /// the caller's host clock -- see [`KeyStateRow::elapsed_secs`].
+    async fn staleness_gate(
+        sharded_pool: &crate::shard::ShardedDbPool,
+        expected_shards: &[crate::types::ShardId],
+        key_id: &str,
+        staleness_window: Duration,
+    ) -> HarvestResult<()> {
+        let mut remaining: Vec<CodecKeyShardRemainder> = Vec::new();
+        // The binding constraint is the LEAST-elapsed shard. Every shard's
+        // own window must have elapsed, so the whole gate is only as stale
+        // as its freshest transition. Kept alongside its own
+        // `retiring_since` purely for the error message below.
+        let mut least_elapsed: Option<(f64, DateTime<Utc>)> = None;
+        for shard in expected_shards {
+            let shard_id = shard.as_i32();
+            let mut conn = match resolve_shard_conn(sharded_pool, *shard).await {
+                Ok(c) => c,
+                Err(reason) => {
+                    remaining.push(CodecKeyShardRemainder {
+                        shard_id,
+                        rows: 0,
+                        reachable: false,
+                        reason: Some(reason),
+                    });
+                    continue;
+                }
+            };
+            match read_key_state(&mut conn, key_id).await {
+                Ok(Some(row)) if row.state == "retiring" => {
+                    let since = row.retiring_since.unwrap_or_else(Utc::now);
+                    // A `NULL` `elapsed_secs` (retiring_since somehow NULL on a
+                    // "retiring" row) fails closed as zero elapsed, never as
+                    // "already stale enough".
+                    let elapsed_secs = row.elapsed_secs.unwrap_or(0.0);
+                    let is_new_min =
+                        least_elapsed.is_none_or(|(min_secs, _)| elapsed_secs < min_secs);
+                    if is_new_min {
+                        least_elapsed = Some((elapsed_secs, since));
+                    }
+                }
+                Ok(Some(row)) => remaining.push(CodecKeyShardRemainder {
+                    shard_id,
+                    rows: 0,
+                    reachable: true,
+                    reason: Some(format!(
+                        "durable key state on this shard is {:?}, not \"retiring\"; call \
+                         activate_codec_key with a different key first",
+                        row.state
+                    )),
+                }),
+                Ok(None) => remaining.push(CodecKeyShardRemainder {
+                    shard_id,
+                    rows: 0,
+                    reachable: true,
+                    reason: Some(
+                        "no durable key state on this shard yet; call activate_codec_key with a \
+                         different key first so this key transitions to \"retiring\""
+                            .to_string(),
+                    ),
+                }),
+                Err(e) => remaining.push(CodecKeyShardRemainder {
+                    shard_id,
+                    rows: 0,
+                    reachable: false,
+                    reason: Some(format!("key state read failed: {e}")),
+                }),
+            }
+        }
+        if !remaining.is_empty() {
+            return Err(HarvestError::CodecKeyRetirementBlocked {
+                key_id: key_id.to_string(),
+                remaining,
+            });
+        }
+        // `remaining` is empty, so every expected shard matched the `Ok(Some(_))`
+        // "retiring" arm above and contributed to `least_elapsed`.
+        let (elapsed_secs, since) =
+            least_elapsed.expect("every shard reached the retiring arm when `remaining` is empty");
+        let window_secs = staleness_window.as_secs_f64();
+        if elapsed_secs < window_secs {
+            // A staleness window measured in seconds never remotely
+            // approaches `i64::MAX`.
+            #[allow(clippy::cast_possible_truncation)]
+            let remaining_secs = (window_secs - elapsed_secs).round().max(0.0) as i64;
+            return Err(HarvestError::CodecKeyRetirementBlocked {
+                key_id: key_id.to_string(),
+                remaining: expected_shards
+                    .iter()
+                    .map(|s| CodecKeyShardRemainder {
+                        shard_id: s.as_i32(),
+                        rows: 0,
+                        reachable: true,
+                        reason: Some(format!(
+                            "retirement staleness window not yet elapsed: {remaining_secs}s \
+                             remaining (least-aged shard retiring since {since})"
+                        )),
+                    })
+                    .collect(),
+            });
         }
         Ok(())
     }
 
     /// Retire a codec key, refusing unless **every** expected shard proves it
     /// holds zero rows referencing it (issue #948, AC6).
+    ///
+    /// By default, also refuses unless the durable write fence has held for
+    /// `staleness_window` (issue #1244).
     ///
     /// Fail-closed by construction: a shard whose pool is missing or whose
     /// census errors is recorded as `reachable = false` and blocks the
@@ -1251,13 +1795,12 @@ mod db {
     /// incident. An empty `expected_shards` proves nothing and is refused for
     /// the same reason.
     ///
-    /// A zero census is **necessary but not sufficient**, so `fence` supplies
-    /// the other half: see [`FleetWriteFence`] for why a per-process registry
-    /// cannot observe another worker still writing under the key, nor an
-    /// uncommitted append about to become visible. Passing
-    /// [`FleetWriteFence::NotConfirmed`] refuses the retirement outright — use
-    /// `GET /admin/codec/rotation` to watch the counts without asserting
-    /// anything.
+    /// The census runs **twice**: once, and — only if the first came back
+    /// zero — again after `recheck_delay`, before anything is finalized. This
+    /// narrows (does not eliminate; see [`FleetWriteFence`]) the in-flight-
+    /// append hazard, catching a transaction that committed in the gap.
+    ///
+    /// See [`FleetWriteFence`] for the two ways to supply the fence.
     ///
     /// On success the key is dropped from this process's in-memory registry via
     /// [`PayloadCodecs::retire_key_local`]; disposing of the key *material* is
@@ -1268,18 +1811,22 @@ mod db {
     /// # Errors
     ///
     /// - [`HarvestError::Config`] when `key_id` is the active key, when
-    ///   `expected_shards` is empty, when `key_id` is not registered, or when
-    ///   `fence` is [`FleetWriteFence::NotConfirmed`].
-    /// - [`HarvestError::CodecKeyRetirementBlocked`] naming the per-shard
-    ///   remaining count (or unreadability) of every blocking shard.
+    ///   `expected_shards` is empty, or when `key_id` is not registered.
+    /// - [`HarvestError::CodecKeyRetirementBlocked`] naming, per blocking
+    ///   shard, the remaining row count, an unreadable shard, an incomplete
+    ///   durable transition to `"retiring"`, or time left on the staleness
+    ///   window.
     pub async fn retire_codec_key(
         sharded_pool: &crate::shard::ShardedDbPool,
         expected_shards: &[crate::types::ShardId],
         codecs: &PayloadCodecs,
         key_id: &str,
         fence: FleetWriteFence,
+        staleness_window: Duration,
+        recheck_delay: Duration,
     ) -> HarvestResult<()> {
-        validate_retirement_request(expected_shards, codecs, key_id, fence)?;
+        validate_retirement_request(expected_shards, codecs, key_id)?;
+
         // Fail closed on an INCOMPLETE list, not just an unreachable shard. A
         // caller that passes a stale or process-local subset would otherwise get
         // a vacuous `Ok` while whole shards were never censused -- and the
@@ -1307,58 +1854,312 @@ mod db {
             });
         }
 
-        let mut remaining: Vec<CodecKeyShardRemainder> = Vec::new();
+        if fence == FleetWriteFence::NotConfirmed {
+            staleness_gate(sharded_pool, expected_shards, key_id, staleness_window).await?;
+        }
+
+        let first_pass = census_remaining(sharded_pool, expected_shards, key_id).await;
+        if !first_pass.is_empty() {
+            return Err(HarvestError::CodecKeyRetirementBlocked {
+                key_id: key_id.to_string(),
+                remaining: first_pass,
+            });
+        }
+        if !recheck_delay.is_zero() {
+            tokio::time::sleep(recheck_delay).await;
+        }
+        let second_pass = census_remaining(sharded_pool, expected_shards, key_id).await;
+        if !second_pass.is_empty() {
+            return Err(HarvestError::CodecKeyRetirementBlocked {
+                key_id: key_id.to_string(),
+                remaining: second_pass,
+            });
+        }
+
+        // Bookkeeping runs regardless of `fence`. The escape hatch skips only
+        // the staleness-window *wait* (see `FleetWriteFence`'s doc), never the
+        // durable record that the key is now retired. Best-effort -- a failed
+        // write here does not un-retire the key.
+        for shard in expected_shards {
+            if let Some(pool) = sharded_pool.exact_pool_for(*shard)
+                && let Ok(mut conn) = pool.get().await
+                && let Err(e) = write_key_state_retired(&mut conn, key_id).await
+            {
+                tracing::warn!(
+                    error = %e,
+                    key_id,
+                    shard_id = shard.as_i32(),
+                    "codec key state: failed to record retirement (bookkeeping only; the \
+                     in-memory key was still dropped)"
+                );
+            }
+        }
+
+        codecs.retire_key_local(key_id)
+    }
+
+    /// Activate a codec key fleet-wide, refusing while any live worker cannot
+    /// safely read or write under `key_id` (issue #1244).
+    ///
+    /// # Why the check exists
+    ///
+    /// A pre-#948 reader recognises an envelope only as exactly three keys at
+    /// version 1. A version-2 envelope (four keys, a `kid`) comes back
+    /// unchanged from its decoder — silent wrong data, not an error. See
+    /// [`PayloadCodecs::set_active_key`]'s rustdoc.
+    ///
+    /// This function is the structural version of that rustdoc's manual
+    /// rollout-ordering warning. Every live worker's `harvest_workers.labels`
+    /// row must advertise [`crate::payload_codec::CODEC_ENVELOPE_VERSION_KEYED`]
+    /// support, **and** carry `key_id` in
+    /// [`crate::payload_codec::CODEC_REGISTERED_KEY_IDS_LABEL`], before
+    /// activation is allowed to proceed at all.
+    ///
+    /// The second half matters separately from the first. A binary can
+    /// support the version-2 envelope's *syntax* fleet-wide before the
+    /// target key's *material* reaches every worker's config. A worker
+    /// missing the key cannot decode a payload some other worker encodes
+    /// under it.
+    ///
+    /// "Live" mirrors [`crate::worker::worker_stale_secs`]: pass that
+    /// function's result (computed from the deployment's configured
+    /// `worker_heartbeat_interval`) as `worker_stale_secs`.
+    ///
+    /// Fail-closed like [`retire_codec_key`]: an unreachable shard, or one
+    /// omitted from `expected_shards` while this process holds a pool for it,
+    /// blocks activation on its own.
+    ///
+    /// # Two passes, not one
+    ///
+    /// The capability check above runs as one bulk pass over every expected
+    /// shard before anything is written. A second, per-shard pass then
+    /// re-checks and writes each shard back to back, on the same connection.
+    ///
+    /// The bulk pass alone would leave a gap. A worker that registers, or
+    /// sends its first heartbeat, strictly after that pass and before this
+    /// call's last shard write was never scanned. The per-shard recheck
+    /// catches that worker on its own shard. It runs immediately before the
+    /// write that shard would otherwise make unsafe for it.
+    ///
+    /// This narrows the gap; it does not close it to zero. A worker can
+    /// still slip in between one shard's own recheck and that shard's own
+    /// write. Those are two statements back to back, on one already-open
+    /// connection. Closing that residual fully would need a
+    /// registration-side fence:
+    /// worker registration itself consulting `harvest_codec_key_state`. This
+    /// function does not implement that.
+    ///
+    /// On success, every expected shard's `harvest_codec_key_state` is updated
+    /// durably (the previously active row, if any, becomes `"retiring"`), and
+    /// this process's registry is flipped via [`PayloadCodecs::set_active_key`].
+    /// Shard writes are sequential, not two-phase-committed. A failure partway
+    /// through — a database error, or the per-shard recheck above finding a
+    /// new blocker — leaves some shards active and others not-yet-written.
+    /// The call therefore returns the first such error rather than continuing
+    /// past it. Re-running once the underlying failure is fixed converges
+    /// every shard via `ON CONFLICT DO UPDATE`.
+    ///
+    /// This function does not coordinate across concurrent calls activating
+    /// **different** keys. Each shard resolves such a race independently, and
+    /// whichever write commits last on a shard wins it. So two operators
+    /// racing to rotate onto different keys at once can leave different
+    /// shards durably active on different keys. Nothing in this crate detects
+    /// that split automatically. An operator who runs concurrent rotations
+    /// must reconcile it by hand: re-run one `activate_codec_key` call to
+    /// converge every shard.
+    ///
+    /// # Errors
+    ///
+    /// - [`HarvestError::Config`] when `key_id` is not registered or
+    ///   `expected_shards` is empty.
+    /// - [`HarvestError::CodecKeyActivationBlocked`] naming every blocking live
+    ///   worker or unreachable/omitted shard.
+    /// - Any database error from the durable write, after the checks pass.
+    ///   This includes a shard that became unreachable between the capability
+    ///   check and this call's own write. A connection is re-resolved per
+    ///   shard rather than held across the two passes.
+    pub async fn activate_codec_key(
+        sharded_pool: &crate::shard::ShardedDbPool,
+        expected_shards: &[crate::types::ShardId],
+        codecs: &PayloadCodecs,
+        key_id: &str,
+        worker_stale_secs: i64,
+    ) -> HarvestResult<()> {
+        if codecs.codec_for_key(key_id).is_none() {
+            return Err(HarvestError::Config(format!(
+                "cannot activate unregistered codec key id {key_id:?}; register it with \
+                 PayloadCodecs::register_key first"
+            )));
+        }
+        if expected_shards.is_empty() {
+            return Err(HarvestError::Config(
+                "cannot activate a codec key: no shards were supplied to inspect for live \
+                 workers"
+                    .to_string(),
+            ));
+        }
+
+        let mut blockers: Vec<CodecKeyActivationBlocker> = sharded_pool
+            .iter_shards()
+            .map(|(shard, _)| shard)
+            .filter(|shard| !expected_shards.contains(shard))
+            .map(|shard| CodecKeyActivationBlocker {
+                shard_id: shard.as_i32(),
+                worker_id: None,
+                host: None,
+                reachable: false,
+                reason: Some(
+                    "this process has a pool for this shard but it was omitted from the \
+                     supplied shard list"
+                        .to_string(),
+                ),
+            })
+            .collect();
+
         for shard in expected_shards {
             let shard_id = shard.as_i32();
-            let Some(pool) = sharded_pool.exact_pool_for(*shard) else {
-                remaining.push(CodecKeyShardRemainder {
-                    shard_id,
-                    rows: 0,
-                    reachable: false,
-                    reason: Some("no connection pool for this shard in this process".to_string()),
-                });
-                continue;
-            };
-            let mut conn = match pool.get().await {
+            let mut conn = match resolve_shard_conn(sharded_pool, *shard).await {
                 Ok(c) => c,
-                Err(e) => {
-                    remaining.push(CodecKeyShardRemainder {
+                Err(reason) => {
+                    blockers.push(CodecKeyActivationBlocker {
                         shard_id,
-                        rows: 0,
+                        worker_id: None,
+                        host: None,
                         reachable: false,
-                        reason: Some(format!("connection unavailable: {e}")),
+                        reason: Some(reason),
                     });
                     continue;
                 }
             };
-            match count_rows_by_key_id(&mut conn).await {
-                Ok(counts) => {
-                    let rows = counts.get(key_id).copied().unwrap_or(0);
-                    if rows > 0 {
-                        remaining.push(CodecKeyShardRemainder {
-                            shard_id,
-                            rows,
-                            reachable: true,
-                            reason: None,
-                        });
-                    }
-                }
-                Err(e) => remaining.push(CodecKeyShardRemainder {
+            match blocking_workers(&mut conn, worker_stale_secs, key_id).await {
+                Ok(rows) => blockers.extend(blockers_from_rows(shard_id, rows)),
+                Err(e) => blockers.push(CodecKeyActivationBlocker {
                     shard_id,
-                    rows: 0,
+                    worker_id: None,
+                    host: None,
                     reachable: false,
-                    reason: Some(format!("census failed: {e}")),
+                    reason: Some(format!("capability query failed: {e}")),
                 }),
             }
         }
 
-        if !remaining.is_empty() {
-            return Err(HarvestError::CodecKeyRetirementBlocked {
+        if !blockers.is_empty() {
+            return Err(HarvestError::CodecKeyActivationBlocked {
                 key_id: key_id.to_string(),
-                remaining,
+                blockers,
             });
         }
-        codecs.retire_key_local(key_id)
+
+        // Re-check each shard's capability immediately before writing it, on
+        // the same connection the write itself uses. The bulk census above
+        // ran as one pass over every shard. A worker that registered or
+        // heartbeated *after* it -- one that never advertised `key_id` --
+        // would otherwise go durably unblocked.
+        //
+        // This narrows that window. It shrinks "the whole census-plus-write
+        // pass" down to "this one shard's own back-to-back
+        // recheck-then-write". It catches the same case the bulk census
+        // exists for, just later.
+        //
+        // A shard that fails this recheck stops the loop without writing
+        // that shard or any shard after it. Shards already written in this
+        // call are not rolled back. This is the same partial-write outcome
+        // this function's own rustdoc already documents for a plain
+        // database error here, converged by re-running once fixed.
+        //
+        // Read before any shard is written, once, not per shard. It names
+        // the single in-memory key this process is rotating away from --
+        // the same fact on every shard this call touches.
+        let outgoing_key_id = codecs.active_key_id();
+        for shard in expected_shards {
+            let shard_id = shard.as_i32();
+            let mut conn = resolve_shard_conn(sharded_pool, *shard)
+                .await
+                .map_err(|reason| {
+                    HarvestError::Database(format!(
+                        "codec key activation: shard {} became unreachable between the capability \
+                     check and the durable write: {reason}",
+                        shard.as_i32()
+                    ))
+                })?;
+            let recheck = blocking_workers(&mut conn, worker_stale_secs, key_id)
+                .await
+                .map_err(|e| {
+                    HarvestError::Database(format!(
+                        "codec key activation: shard {shard_id} pre-write capability recheck \
+                         failed: {e}"
+                    ))
+                })?;
+            if !recheck.is_empty() {
+                return Err(HarvestError::CodecKeyActivationBlocked {
+                    key_id: key_id.to_string(),
+                    blockers: blockers_from_rows(shard_id, recheck),
+                });
+            }
+            write_key_state_activation(&mut conn, key_id, &outgoing_key_id).await?;
+        }
+
+        codecs.set_active_key(key_id)
+    }
+
+    /// Refresh this process's active codec key from the durable, fleet-wide
+    /// `harvest_codec_key_state` table (issue #1244).
+    ///
+    /// Folded into [`crate::timeout::enforce_timeouts_once`] — shard-local, on
+    /// the connection the caller already holds, on the same nominal cadence.
+    /// This is what turns [`activate_codec_key`]'s durable write into a fact
+    /// every *other* process eventually observes.
+    ///
+    /// The deployment's configured scanner-tick interval is the operational
+    /// margin [`FleetWriteFence`]'s docs discuss. See the caveats there
+    /// about what that margin does and does not actually bound.
+    ///
+    /// This call runs on *every* tick that reaches it. So
+    /// `enforce_timeouts_once` places it before any resident that can end
+    /// the tick early with `?`, not beside the re-encryption sweep.
+    ///
+    /// The sweep sits later, among the fallible residents, because its own
+    /// safety comes from idempotent, re-run-to-converge CAS writes. It does
+    /// not depend on a staleness-window timing proof the way this call does.
+    ///
+    /// Never surfaces an error that should break the rest of the tick. Three
+    /// things are logged and swallowed by the caller instead: an unreachable
+    /// table, an active key this process never registered, and a local flip
+    /// failure. That is the same posture as [`sweep_codec_reencryption`]
+    /// beside it. Returns `true` when this call actually changed the local
+    /// active key.
+    ///
+    /// # Errors
+    ///
+    /// Propagates database failures reading the table. Never a local-flip
+    /// failure. That is logged separately, because flipping to an
+    /// unregistered key is expected during a rotation window. It must not
+    /// look like a query failure.
+    pub async fn refresh_active_codec_key(
+        conn: &mut AsyncPgConnection,
+        codecs: &PayloadCodecs,
+    ) -> HarvestResult<bool> {
+        let Some(key_id) = active_key_row(conn).await? else {
+            return Ok(false);
+        };
+        if key_id == codecs.active_key_id() {
+            return Ok(false);
+        }
+        if codecs.codec_for_key(&key_id).is_none() {
+            tracing::warn!(
+                key_id,
+                "codec key state refresh: fleet-wide active key is not registered on this \
+                 process; new writes here still use the previous key until it is"
+            );
+            return Ok(false);
+        }
+        match codecs.set_active_key(&key_id) {
+            Ok(()) => Ok(true),
+            Err(e) => {
+                tracing::warn!(error = %e, key_id, "codec key state refresh: local flip failed");
+                Ok(false)
+            }
+        }
     }
 }
 

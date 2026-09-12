@@ -17,12 +17,13 @@ and the one that has accreted roughly a `WHERE` predicate per phase since 3.7:
 | queue pauses | #619 |
 | capability labels | #382 |
 | sticky routing | #235 |
+| activity pauses | #807 |
 
 Each was added for correctness. None was measured. This page is the measurement
 — **for five of them**. The attribution table below varies build-id routing,
 per-key concurrency, the rate-limit gate, the circuit-breaker tracked set and
-the PAUSED skip. The other five are present in the query and held constant, so
-this page says nothing about what they cost; see
+the PAUSED skip. The other six are present in the query and held constant, so
+this page says nothing about what they cost in *that* table; see
 [known limitations](#known-limitations).
 
 > **Looking for end-to-end numbers?** This page measures the claim and enqueue
@@ -811,6 +812,83 @@ which also covers resuming the queue). Reproduce with
 `HARVEST_TEST_DATABASE_URL` (an admin connection string) or a reachable Docker
 daemon for its testcontainer fallback — not both.
 
+## The pause-array-size sweep (issue #1215)
+
+The fix above closes the queue-pause anti-join's per-row cost, but every
+measurement on this page still tests both pause tables at a single array
+size: one active pause, or none. Issue #1215 swept array size instead — 0,
+1, 20 and 199 ballast rows, each excluding zero real candidate rows (0%
+selectivity, isolating array width from backlog depth the same way issue
+#1177 isolates predicate presence from selectivity). The `paused_activities`
+sweep is crossed against every depth in the published `BACKLOG_SWEEP`
+(1,000 / 10,000 / 100,000), not held at the headline depth alone — the
+queue-pause sweeps stay at the 10,000-row headline, since they answer a
+yes/no bound question the query already settles identically at every depth,
+not a magnitude question depth could shift. Full artifacts are committed
+under [`docs/perf-artifacts/pause-array-size/`](perf-artifacts/pause-array-size/),
+reproducible via
+`autumn-harvest/scripts/pause_array_size_claim_perf_repro.sh`.
+
+| Predicate | Backlog | Worker's own `$2` | Ballast pauses seeded | `paused_*` array size | Sort method |
+|:--|--:|:--|--:|--:|:--|
+| `paused_activities` (#807) | 1 000 | 4 queues | 0 / 1 / 20 | 0 / 1 / 20 | quicksort, in memory |
+| `paused_activities` (#807) | 1 000 | 4 queues | 199 | 199 | external merge, 6 368kB disk |
+| `paused_activities` (#807) | 10 000 | 4 queues | 0 / 1 | 0 / 1 | quicksort, in memory |
+| `paused_activities` (#807) | 10 000 | 4 queues | 20 | 20 | external merge, 7 504kB disk |
+| `paused_activities` (#807) | 10 000 | 4 queues | 199 | 199 | external merge, 63 656kB disk |
+| `paused_activities` (#807) | 100 000 | 4 queues | 0 | 0 | external merge, 15 280kB disk |
+| `paused_activities` (#807) | 100 000 | 4 queues | 1 | 1 | external merge, 18 432kB disk |
+| `paused_activities` (#807) | 100 000 | 4 queues | 20 | 20 | external merge, 74 992kB disk |
+| `paused_activities` (#807) | 100 000 | 4 queues | 199 | 199 | external merge, 635 488kB disk |
+| `paused_queues` (#619) | 10 000 | 4 queues (typical) | 0 / 1 / 20 / 199 | 0 (none of these ballast queues are in `$2`) | quicksort, in memory |
+| `paused_queues` (#619) | 10 000 | 203 queues (atypical) | 0 | 0 | quicksort, in memory |
+| `paused_queues` (#619) | 10 000 | 203 queues (atypical) | 199 | 199 | external merge, 40 704kB disk |
+
+For `paused_activities`, ballast seeded and array size are always equal — it
+reads the whole table unconditionally, so nothing filters the array down.
+For `paused_queues`, they diverge exactly when `$2` excludes the ballast:
+the typical-worker rows above seed up to 199 pauses but never widen the
+array past zero, because `$2` (this worker's 4 polled queues) never
+includes any of the seeded names. The Sort Method column tracks array
+size, not ballast count, in every row — consistently zero disk cost while
+the array stays at zero, regardless of how large the underlying pause
+table grows.
+
+**`paused_activities` has no bound to protect it, and the array-size
+threshold that spills it is itself lower at greater backlog depth.** It
+reads the whole `harvest_activity_pauses` table on every claim, so array
+size tracks the pause table's total population directly. At the
+10,000-row headline depth, twenty paused activity types — a realistic
+response to a multi-service incident, not an edge case — is enough to
+spill the claim sort to disk; that is far below the
+[few-hundred-thousand-row depth](#any-residual-predicate-defeats-sort-elision-issue-1177)
+issue #1177's own locked-scenario reproduction needed to trigger the same
+spill against an empty pause table. At 1,000 rows the threshold is higher
+(between 20 and 199). At 100,000 rows this sweep found the sort already
+spilling with **zero** paused activities — a backlog-depth-driven spill
+this page's own [claim-latency-vs-backlog-depth table](#claim-latency-vs-backlog-depth)
+is already consistent with, independent of this predicate; array size
+still compounds it further there, from 15 280kB at zero paused activities
+to 635 488kB at 199.
+
+**`paused_queues` stays cheap only while the worker's own bind stays
+small.** [The `$2` bound above](#the-queue-pause-anti-join-fix) keeps a
+typical worker's array width capped at its own polled-queue count, so 199
+fleet-wide pauses on queues this worker never polls never widened its array
+past zero real elements, and the sort stayed in-memory throughout. The same
+mechanism does reappear once a worker's own `$2` bind is itself wide:
+pairing 199 polled queues with 199 matching pauses reproduced the identical
+disk-spill shape. A worker subscribed to hundreds of distinct queues is not
+this page's measured or expected deployment shape (`Scenario.queues` holds
+at 4 everywhere else on this page), so this is reported as a confirmed
+mechanism, not a claimed realistic exposure — unlike `paused_activities`,
+whose exposure needs no unusual worker shape at all.
+
+**Zero engine impact.** Like every other finding on this page, this changes
+nothing about `claim_task_query()`: no code-shape fix is proposed here, only
+a documented cost and a committed regression surface (see
+`tests/integration/claim_budget_tests.rs::zz_capture_pause_array_size_claim_evidence`).
+
 ## The concurrency-key gate fix
 
 The `concurrency_key` row above — flagged as "the one genuinely expensive
@@ -1439,10 +1517,11 @@ from the benchmark are directly comparable.
 * **Half the claim-path predicates are varied; the other half are not measured
   at all.** The attribution table covers five: build-id routing (#171), per-key
   concurrency (#247), the rate-limit gate (#332/#699), the circuit-breaker
-  tracked set (#369) and the PAUSED skip (#383). Five more are present in the
-  query on every claim but are never given anything to match, so their subplans
-  run against empty or null input and this page reports nothing about their
-  cost. Ranked by how much that omission is likely to matter:
+  tracked set (#369) and the PAUSED skip (#383). Six more are present in the
+  query on every claim but are never given anything to match in *this*
+  table, so their subplans run against empty or null input here and this
+  table reports nothing about their cost. Ranked by how much that omission
+  is likely to matter:
   * **Capability labels (#382)** — measured directly:
     [`docs/performance-capability-labels.md`](performance-capability-labels.md) seeds `required_capabilities`
     (rather than leaving it null) and finds a real, +24–36% buffer cost on the
@@ -1457,7 +1536,27 @@ from the benchmark are directly comparable.
     predicate's cost on its own. A dedicated harness variant that actively
     pauses a queue closed that specific gap and, as a direct result, replaced
     the correlated anti-join with a one-time prefilter — see
-    [the queue-pause anti-join fix](#the-queue-pause-anti-join-fix).
+    [the queue-pause anti-join fix](#the-queue-pause-anti-join-fix). That fix
+    was measured against exactly one active pause. Issue #1215 swept the
+    array wider — up to 199 paused queues — and confirms the fix holds at
+    that scale for a typical worker: see
+    [the pause-array-size sweep](#the-pause-array-size-sweep-issue-1215) for
+    why, and for the one atypical worker shape where it does not.
+  * **Activity pauses (#807)** — not previously in this list at all. Issue
+    #1215 swept `harvest_activity_pauses`' array size, crossed against the
+    full `BACKLOG_SWEEP`, and found the claim sort spills to disk once the
+    array holds around 20 rows at the 10,000-row headline depth — far below
+    the [few-hundred-thousand-row depth issue #1177's own locked-scenario
+    reproduction needed](#any-residual-predicate-defeats-sort-elision-issue-1177)
+    to trigger the same spill against an empty pause table. That threshold
+    is depth-dependent, not fixed: higher at 1,000 rows, and already crossed
+    at 100,000 rows with zero paused activities. Unlike queue pauses,
+    `paused_activities` reads the whole table on every claim with no bind to
+    keep the array small, so this exposure needs no unusual worker shape —
+    pausing 20 or more activity types during a multi-service incident is
+    realistic on its own, at the headline depth. See
+    [the pause-array-size sweep](#the-pause-array-size-sweep-issue-1215) for
+    the full measurement. No query-shape fix is proposed here.
   * **`schedule_to_close` (#378)** — measured directly:
     [`docs/performance-schedule-to-close.md`](performance-schedule-to-close.md) seeds `schedule_to_close_at`
     (rather than leaving it null) and **confirms this page's own suspicion on
@@ -1633,6 +1732,10 @@ from the benchmark are directly comparable.
   [the queue-pause anti-join fix](#the-queue-pause-anti-join-fix).
 * `autumn-harvest/scripts/queue_pause_claim_perf_repro.sh` — regenerates that
   evidence from a clean checkout.
+* `docs/perf-artifacts/pause-array-size/` — committed `EXPLAIN` evidence for
+  [the pause-array-size sweep](#the-pause-array-size-sweep-issue-1215).
+* `autumn-harvest/scripts/pause_array_size_claim_perf_repro.sh` — regenerates
+  that evidence from a clean checkout.
 * `docs/perf-artifacts/concurrency-key-claim-predicate/` — committed
   before/after `EXPLAIN`/`pg_stat_statements` evidence for
   [the concurrency-key gate fix](#the-concurrency-key-gate-fix).

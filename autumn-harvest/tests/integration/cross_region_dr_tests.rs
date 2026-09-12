@@ -230,6 +230,129 @@ async fn a_fresh_database_provisions_generation_zero_and_is_idempotent() {
     );
 }
 
+/// Concurrent first starts must never spuriously fail to provision (finding 8).
+///
+/// The old query read its `ON CONFLICT DO NOTHING` fallback in the SAME
+/// statement as the `INSERT`, sharing that statement's snapshot. Under READ
+/// COMMITTED, a losing `INSERT` blocks on the winner's commit and then
+/// finds nothing to insert. Its fallback read, sharing the pre-commit
+/// snapshot, could still see zero rows, though. So the whole statement
+/// returned empty, and the losing worker refused to start. This is
+/// inherently a timing-dependent race, so this test cannot force the old
+/// bug to reproduce on every run. But with several connections racing the
+/// same shard on every run of this suite, it is a live regression guard
+/// rather than a coincidence.
+#[tokio::test]
+async fn concurrent_first_starts_always_agree_on_the_provisioned_generation() {
+    let (url, _db) = require_db!("provisionrace");
+    let shard = ShardId::new(0);
+
+    let mut conns = Vec::new();
+    for _ in 0..8 {
+        conns.push(connect(&url).await);
+    }
+
+    let results = futures::future::join_all(
+        conns
+            .iter_mut()
+            .map(|conn| ensure_generation_row(conn, shard)),
+    )
+    .await;
+
+    for result in &results {
+        assert_eq!(
+            result.as_ref().ok().copied(),
+            Some(ShardGeneration::INITIAL),
+            "every racing first start must observe the provisioned row, never a spurious \
+             failure: {results:?}"
+        );
+    }
+}
+
+/// A heartbeat written under a superseded generation must never be read back
+/// as if it were part of the current WAL stream (finding 10).
+///
+/// `docs/cross-region-dr.md`'s setup SQL replicates
+/// `harvest_replication_heartbeat` with `FOR ALL TABLES`. So a standby can
+/// carry beats the OLD primary wrote — LSNs from a WAL stream the new
+/// primary does not share. This plants exactly that: a stale, hour-old
+/// beat tagged with generation 0 at a LARGER LSN. Beside it sits a fresh,
+/// current beat tagged with generation 1 at a SMALLER one. Only the
+/// generation filter — never `ORDER BY beat_lsn DESC` — can be why the
+/// fresh one wins.
+#[tokio::test]
+async fn measure_rpo_ignores_heartbeats_from_a_superseded_generation() {
+    let (url, _db) = require_db!("genscope");
+    let mut conn = connect(&url).await;
+    let shard = ShardId::new(0);
+
+    ensure_generation_row(&mut conn, shard)
+        .await
+        .expect("provision generation 0");
+
+    let slot = format!("{DR_PREFIX}_genscope_{}", std::process::id());
+    diesel::sql_query("SELECT pg_create_physical_replication_slot($1, true)")
+        .bind::<diesel::sql_types::Text, _>(slot.clone())
+        .execute(&mut conn)
+        .await
+        .expect("create a reserved physical slot");
+
+    // Stale: generation 0, an hour old, at a LARGE LSN.
+    diesel::sql_query(
+        "INSERT INTO harvest_replication_heartbeat \
+             (shard_id, beat_lsn, beat_at, fence_generation) \
+         VALUES ($1, pg_current_wal_lsn(), NOW() - INTERVAL '1 hour', 0)",
+    )
+    .bind::<diesel::sql_types::Integer, _>(shard.as_i32())
+    .execute(&mut conn)
+    .await
+    .expect("seed a stale, wrong-generation beat with a LARGE LSN");
+
+    bump_generation(&mut conn, shard, "drill", "test")
+        .await
+        .expect("bump to generation 1");
+
+    // Fresh: generation 1, just now, at a SMALL LSN -- smaller than the stale
+    // row above, so `ORDER BY beat_lsn DESC` alone would pick the stale one.
+    diesel::sql_query(
+        "INSERT INTO harvest_replication_heartbeat \
+             (shard_id, beat_lsn, beat_at, fence_generation) \
+         VALUES ($1, '0/1'::pg_lsn, NOW(), 1)",
+    )
+    .bind::<diesel::sql_types::Integer, _>(shard.as_i32())
+    .execute(&mut conn)
+    .await
+    .expect("seed a fresh, current-generation beat with a SMALL LSN");
+
+    // Advance the slot's position past both beats, so the position query's
+    // `beat_lsn <= position` predicate admits both rows and only the
+    // generation filter can decide between them.
+    diesel::sql_query("SELECT pg_replication_slot_advance($1, pg_current_wal_lsn())")
+        .bind::<diesel::sql_types::Text, _>(slot.clone())
+        .execute(&mut conn)
+        .await
+        .expect("advance the slot's position past both beats");
+
+    let reading = autumn_harvest::replication::measure_rpo(&mut conn, shard, DR_PREFIX)
+        .await
+        .expect("measure_rpo");
+    match reading {
+        WatermarkReading::Measured(seconds) => {
+            assert!(
+                seconds < 30.0,
+                "must read the fresh current-generation beat, not the hour-old \
+                 superseded-generation one that sorts ahead of it by LSN: got {seconds}s"
+            );
+        }
+        other => panic!("expected a fresh Measured reading, got {other:?}"),
+    }
+
+    let _ = diesel::sql_query("SELECT pg_drop_replication_slot($1)")
+        .bind::<diesel::sql_types::Text, _>(slot)
+        .execute(&mut conn)
+        .await;
+}
+
 #[tokio::test]
 async fn bump_is_monotonic_and_records_who_and_why() {
     let (url, _db) = require_db!("bump");
@@ -284,8 +407,10 @@ async fn assert_fence_rejects_a_stale_generation_and_names_both_epochs() {
         .unwrap();
 
     FenceRegistry::clear();
-    FenceRegistry::register(ShardId::new(0), ShardGeneration::new(0));
-    FenceRegistry::set_default_shard(ShardId::new(0));
+    FenceRegistry::register(ShardId::new(0), ShardGeneration::new(0))
+        .expect("no conflicting pin in this test");
+    FenceRegistry::set_default_shard(ShardId::new(0))
+        .expect("no conflicting default shard in this test");
 
     // Still current: the assert is a no-op.
     assert_fence(&mut conn, ShardId::new(0))
@@ -343,7 +468,8 @@ async fn a_missing_generation_row_fences_a_pinned_worker() {
     // Pinned, but the row this worker pinned against is gone — a restore from a
     // backup taken before DR was enabled, or a hand-edited database. Fail
     // closed: a pinned worker with nothing to check against must stop.
-    FenceRegistry::register(ShardId::new(0), ShardGeneration::new(3));
+    FenceRegistry::register(ShardId::new(0), ShardGeneration::new(3))
+        .expect("no conflicting pin in this test");
     let err = assert_fence(&mut conn, ShardId::new(0))
         .await
         .expect_err("a pinned worker must fail closed when the row is absent");
@@ -377,8 +503,10 @@ async fn a_fenced_worker_cannot_persist_events() {
     .unwrap();
 
     FenceRegistry::clear();
-    FenceRegistry::register(ShardId::new(0), ShardGeneration::new(0));
-    FenceRegistry::set_default_shard(ShardId::new(0));
+    FenceRegistry::register(ShardId::new(0), ShardGeneration::new(0))
+        .expect("no conflicting pin in this test");
+    FenceRegistry::set_default_shard(ShardId::new(0))
+        .expect("no conflicting default shard in this test");
     bump_generation(&mut conn, ShardId::new(0), "promote", "oncall")
         .await
         .unwrap();
@@ -475,8 +603,10 @@ async fn a_fenced_worker_cannot_re_encrypt_history() {
     // This worker is pinned to generation 0; the region has been promoted past
     // it.
     FenceRegistry::clear();
-    FenceRegistry::register(ShardId::new(0), ShardGeneration::new(0));
-    FenceRegistry::set_default_shard(ShardId::new(0));
+    FenceRegistry::register(ShardId::new(0), ShardGeneration::new(0))
+        .expect("no conflicting pin in this test");
+    FenceRegistry::set_default_shard(ShardId::new(0))
+        .expect("no conflicting default shard in this test");
     bump_generation(&mut conn, ShardId::new(0), "promote", "oncall")
         .await
         .unwrap();
@@ -507,6 +637,191 @@ async fn a_fenced_worker_cannot_re_encrypt_history() {
         Some("k1"),
         "a fenced worker must not re-encrypt history the promoted region owns; \
          sweep returned {swept:?}"
+    );
+    FenceRegistry::clear();
+}
+
+#[tokio::test]
+async fn a_fenced_worker_cannot_advance_the_rotation_cursor() {
+    // Sibling to `a_fenced_worker_cannot_re_encrypt_history` (issue #1257).
+    // A worker pinned to a superseded generation must not record any
+    // rotation progress at all, not just leave `harvest_events` untouched.
+    //
+    // With a convertible row present, the existing per-row fence on
+    // `compare_and_swap_event` (issue #954) already errors out of the
+    // sweep before `write_cursor` is reached. So this scenario alone does
+    // not discriminate the fix from before it. See
+    // `a_fenced_sweep_that_converts_nothing_still_fails_closed` for the
+    // batch that reaches `write_cursor` with nothing to convert. This test
+    // stays as a direct check that no cursor row leaks in the common case
+    // too.
+    let _serial = registry_guard().await;
+    let (url, _db) = require_db!("rotate_cursor");
+    let mut conn = connect(&url).await;
+    ensure_generation_row(&mut conn, ShardId::new(0))
+        .await
+        .unwrap();
+
+    let exec_id = ExecutionId::new_for_shard(ShardId::new(0));
+    diesel::sql_query(
+        "INSERT INTO harvest_workflow_executions \
+             (id, workflow_name, workflow_id, state, input, shard_id) \
+         VALUES ($1, 'wf', 'rotate-cursor-1', 'RUNNING', '{}'::jsonb, 0)",
+    )
+    .bind::<diesel::sql_types::Uuid, _>(exec_id.as_uuid())
+    .execute(&mut conn)
+    .await
+    .unwrap();
+
+    // A history row encoded under `k1`, with `k2` now active: exactly what
+    // the sweep exists to convert.
+    let codecs = autumn_harvest::payload_codec::PayloadCodecs::default();
+    codecs
+        .register_key("k1", std::sync::Arc::new(DrXorCodec(0x5a)))
+        .unwrap();
+    codecs
+        .register_key("k2", std::sync::Arc::new(DrXorCodec(0x33)))
+        .unwrap();
+    codecs.set_active_key("k1").unwrap();
+    let encoded = codecs
+        .encode_payload(&serde_json::json!({"secret": "value"}))
+        .unwrap();
+    diesel::sql_query(
+        "INSERT INTO harvest_events (workflow_exec_id, event_id, event_type, event_data) \
+         VALUES ($1, 0, 'WorkflowStarted', $2)",
+    )
+    .bind::<diesel::sql_types::Uuid, _>(exec_id.as_uuid())
+    .bind::<diesel::sql_types::Jsonb, _>(serde_json::json!({
+        "type": "WorkflowStarted",
+        "data": {"input": encoded, "timestamp": "2026-08-31T00:00:00Z"}
+    }))
+    .execute(&mut conn)
+    .await
+    .unwrap();
+    codecs.set_active_key("k2").unwrap();
+
+    // This worker is pinned to generation 0; the region has been promoted
+    // past it.
+    FenceRegistry::clear();
+    FenceRegistry::register(ShardId::new(0), ShardGeneration::new(0));
+    FenceRegistry::set_default_shard(ShardId::new(0));
+    bump_generation(&mut conn, ShardId::new(0), "promote", "oncall")
+        .await
+        .unwrap();
+
+    let _ = autumn_harvest::codec_rotation::sweep_codec_reencryption_once(
+        &mut conn,
+        0,
+        &codecs,
+        100,
+        &NoOpMetrics,
+    )
+    .await;
+
+    #[derive(diesel::QueryableByName)]
+    struct Count {
+        #[diesel(sql_type = diesel::sql_types::BigInt)]
+        n: i64,
+    }
+    let rows: Vec<Count> =
+        diesel::sql_query("SELECT COUNT(*) AS n FROM harvest_codec_rotation_cursor")
+            .load(&mut conn)
+            .await
+            .unwrap();
+    assert_eq!(
+        rows[0].n, 0,
+        "a fenced worker must not record rotation progress it was fenced away from"
+    );
+    FenceRegistry::clear();
+}
+
+#[tokio::test]
+async fn a_fenced_sweep_that_converts_nothing_still_fails_closed() {
+    // Sibling to `a_fenced_worker_cannot_re_encrypt_history` (issue #1257,
+    // acceptance criterion: a sweep batch that converts no rows must still
+    // fail closed under a stale fence). A batch with nothing to convert
+    // never calls the per-row fenced CAS at all. `write_cursor` and
+    // `claim_completed_cursor_revalidation` are the only writes left on
+    // this path, so they are the only guard against a stale worker
+    // recording progress.
+    //
+    // The cursor here is already complete and due for revalidation. An
+    // unfenced worker would also win `claim_completed_cursor_revalidation`
+    // and bump `updated_at` even though it converted nothing.
+    let _serial = registry_guard().await;
+    let (url, _db) = require_db!("rotate_cursor_empty");
+    let mut conn = connect(&url).await;
+    ensure_generation_row(&mut conn, ShardId::new(0))
+        .await
+        .unwrap();
+
+    diesel::sql_query(
+        "INSERT INTO harvest_codec_rotation_cursor \
+             (shard_id, active_key_id, last_event_id, rows_reencrypted, \
+              unresolved_rows, completed_at, updated_at) \
+         VALUES (0, 'k2', 0, 0, 0, NOW() - interval '1 hour', \
+                 NOW() - interval '1 hour')",
+    )
+    .execute(&mut conn)
+    .await
+    .unwrap();
+
+    let codecs = autumn_harvest::payload_codec::PayloadCodecs::default();
+    codecs
+        .register_key("k2", std::sync::Arc::new(DrXorCodec(0x33)))
+        .unwrap();
+    codecs.set_active_key("k2").unwrap();
+
+    // This worker is pinned to generation 0; the region has been promoted
+    // past it.
+    FenceRegistry::clear();
+    FenceRegistry::register(ShardId::new(0), ShardGeneration::new(0));
+    FenceRegistry::set_default_shard(ShardId::new(0));
+    bump_generation(&mut conn, ShardId::new(0), "promote", "oncall")
+        .await
+        .unwrap();
+
+    let _ = autumn_harvest::codec_rotation::sweep_codec_reencryption_once(
+        &mut conn,
+        0,
+        &codecs,
+        100,
+        &NoOpMetrics,
+    )
+    .await;
+
+    #[derive(diesel::QueryableByName)]
+    struct Row {
+        #[diesel(sql_type = diesel::sql_types::BigInt)]
+        last_event_id: i64,
+        #[diesel(sql_type = diesel::sql_types::Timestamptz)]
+        updated_at: chrono::DateTime<chrono::Utc>,
+    }
+    let rows: Vec<Row> = diesel::sql_query(
+        "SELECT last_event_id, updated_at FROM harvest_codec_rotation_cursor \
+         WHERE shard_id = 0",
+    )
+    .load(&mut conn)
+    .await
+    .unwrap();
+    // `rows.len()` and `last_event_id` hold both before and after this
+    // fix. The seeded row already starts at `last_event_id = 0`, so they
+    // document the row is untouched rather than proving the fence fired.
+    // `updated_at` is the assertion that actually distinguishes a fenced
+    // `claim_completed_cursor_revalidation` from an unfenced one. An
+    // unfenced worker would have won the claim and bumped it to `NOW()`.
+    assert_eq!(
+        rows.len(),
+        1,
+        "the pre-existing cursor row must survive untouched"
+    );
+    assert_eq!(
+        rows[0].last_event_id, 0,
+        "a fenced worker must not advance a cursor it examined nothing under"
+    );
+    assert!(
+        rows[0].updated_at < chrono::Utc::now() - chrono::Duration::minutes(30),
+        "a fenced worker must not win the revalidation claim and bump updated_at"
     );
     FenceRegistry::clear();
 }
@@ -570,8 +885,10 @@ async fn a_fenced_worker_cannot_backfill_quota_keys() {
     // This worker is pinned to generation 0; the region has been promoted
     // past it.
     FenceRegistry::clear();
-    FenceRegistry::register(ShardId::new(0), ShardGeneration::new(0));
-    FenceRegistry::set_default_shard(ShardId::new(0));
+    FenceRegistry::register(ShardId::new(0), ShardGeneration::new(0))
+        .expect("no conflicting pin in this test");
+    FenceRegistry::set_default_shard(ShardId::new(0))
+        .expect("no conflicting default shard in this test");
     bump_generation(&mut conn, ShardId::new(0), "promote", "oncall")
         .await
         .unwrap();
@@ -628,8 +945,10 @@ async fn a_fenced_worker_cannot_claim_tasks() {
         .expect("enqueue");
 
     FenceRegistry::clear();
-    FenceRegistry::register(ShardId::new(0), ShardGeneration::new(0));
-    FenceRegistry::set_default_shard(ShardId::new(0));
+    FenceRegistry::register(ShardId::new(0), ShardGeneration::new(0))
+        .expect("no conflicting pin in this test");
+    FenceRegistry::set_default_shard(ShardId::new(0))
+        .expect("no conflicting default shard in this test");
 
     // Current epoch: the claim succeeds exactly as it did before #954.
     let claimed = autumn_harvest::queue::claim_task_on_shard(
@@ -709,8 +1028,10 @@ async fn a_fence_bump_cannot_commit_while_a_persist_holds_the_fence() {
         .unwrap();
 
     FenceRegistry::clear();
-    FenceRegistry::register(ShardId::new(0), ShardGeneration::new(0));
-    FenceRegistry::set_default_shard(ShardId::new(0));
+    FenceRegistry::register(ShardId::new(0), ShardGeneration::new(0))
+        .expect("no conflicting pin in this test");
+    FenceRegistry::set_default_shard(ShardId::new(0))
+        .expect("no conflicting default shard in this test");
 
     // Session A: open a transaction and pass the fence check. Its ACCESS SHARE
     // on harvest_shard_generation is now held until A commits.
@@ -922,6 +1243,122 @@ async fn promotion_advances_reserved_word_and_mixed_case_relations() {
     );
 }
 
+/// A sequence owned by a table in a non-public schema must be advanced,
+/// using the OWNING TABLE's schema rather than the sequence's own
+/// (finding 5).
+///
+/// The catalog query selected `tn.nspname` (the owning table's namespace)
+/// but filtered on `sn.nspname = current_schema()` (the sequence's own).
+/// Postgres always keeps an owned sequence in the same schema as its
+/// table. The two names never diverge, so this distinction has no
+/// effect on the current query. Filtering on the table's schema states
+/// the intent plainly: promotion advances sequences for tables, not for
+/// the sequences themselves. This test exercises the qualified-name path
+/// with both objects outside `public`.
+#[tokio::test]
+async fn promotion_advances_a_sequence_owned_by_a_table_in_a_non_public_schema() {
+    let (url, _db) = require_db!("crossschema");
+    let mut conn = connect(&url).await;
+    conn.batch_execute(
+        "CREATE SCHEMA dr_seq_home;
+         CREATE SEQUENCE dr_seq_home.dr_cross_seq;
+         CREATE TABLE dr_seq_home.dr_cross (id BIGINT PRIMARY KEY DEFAULT nextval('dr_seq_home.dr_cross_seq'));
+         ALTER SEQUENCE dr_seq_home.dr_cross_seq OWNED BY dr_seq_home.dr_cross.id;
+         SET search_path TO dr_seq_home, public;
+         INSERT INTO dr_cross DEFAULT VALUES;
+         INSERT INTO dr_cross DEFAULT VALUES;
+         SELECT setval('dr_seq_home.dr_cross_seq', 1, false);",
+    )
+    .await
+    .expect("seed a table owning a sequence in a non-public schema");
+
+    let advanced = autumn_harvest::replication::advance_sequences_after_promotion(&mut conn)
+        .await
+        .expect("promotion");
+    assert!(
+        advanced
+            .iter()
+            .any(|(name, _)| name.contains("dr_cross_seq")),
+        "a sequence owned by a table in a non-public current_schema() must \
+         be advanced; advanced: {advanced:?}"
+    );
+
+    #[derive(diesel::QueryableByName)]
+    struct N {
+        #[diesel(sql_type = diesel::sql_types::BigInt)]
+        v: i64,
+    }
+    let rows: Vec<N> = diesel::sql_query("SELECT nextval('dr_seq_home.dr_cross_seq') AS v")
+        .load(&mut conn)
+        .await
+        .unwrap();
+    assert_eq!(
+        rows.into_iter().next().map_or(0, |n| n.v),
+        3,
+        "the next id must clear the two already-inserted rows, not collide with one"
+    );
+}
+
+/// Promotion must not rewind a DESCENDING sequence (finding 11).
+///
+/// `GREATEST` assumes ascending issuance. For a descending sequence,
+/// "furthest issued" is the MINIMUM, not the maximum. Using `GREATEST`
+/// unconditionally reset a sequence that had issued 100 then 99 back to
+/// 100. The next value handed out was then 99 again — a collision, from
+/// the helper whose entire purpose is preventing one.
+#[tokio::test]
+async fn promotion_never_rewinds_a_descending_sequence() {
+    let (url, _db) = require_db!("seqdesc");
+    let mut conn = connect(&url).await;
+    conn.batch_execute(
+        "CREATE SEQUENCE dr_desc_seq INCREMENT BY -1 MINVALUE -1000000 MAXVALUE -1 START -1;
+         CREATE TABLE dr_desc (id BIGINT PRIMARY KEY DEFAULT nextval('dr_desc_seq'));
+         ALTER SEQUENCE dr_desc_seq OWNED BY dr_desc.id;
+         INSERT INTO dr_desc DEFAULT VALUES; -- issues -1
+         INSERT INTO dr_desc DEFAULT VALUES; -- issues -2",
+    )
+    .await
+    .expect("seed a descending owned sequence that has issued -1 then -2");
+
+    #[derive(diesel::QueryableByName)]
+    struct N {
+        #[diesel(sql_type = diesel::sql_types::BigInt)]
+        v: i64,
+    }
+    async fn scalar(conn: &mut AsyncPgConnection, sql: &str) -> i64 {
+        let rows: Vec<N> = diesel::sql_query(sql).load(conn).await.expect("scalar");
+        rows.into_iter().next().map_or(i64::MIN, |n| n.v)
+    }
+
+    assert_eq!(
+        scalar(
+            &mut conn,
+            "SELECT pg_sequence_last_value('dr_desc_seq') AS v"
+        )
+        .await,
+        -2
+    );
+
+    autumn_harvest::replication::advance_sequences_after_promotion(&mut conn)
+        .await
+        .expect("promotion");
+
+    assert_eq!(
+        scalar(
+            &mut conn,
+            "SELECT pg_sequence_last_value('dr_desc_seq') AS v"
+        )
+        .await,
+        -2,
+        "a descending sequence must not be reset back up to a table MAX"
+    );
+    assert_eq!(
+        scalar(&mut conn, "SELECT nextval('dr_desc_seq') AS v").await,
+        -3,
+        "the next id must continue descending past what was already issued, not collide"
+    );
+}
+
 /// The watermark beat must never leave an advisory lock behind.
 ///
 /// The single-writer gate uses `pg_try_advisory_xact_lock`, not the
@@ -1094,6 +1531,73 @@ async fn replication_status_on_a_primary_with_no_standby_is_not_a_zero_rpo() {
     assert!(matches!(status, ReplicationStatus::Observed { .. }));
 }
 
+/// One abandoned DR slot beside one healthy one must be a PARTIAL reading,
+/// never folded into "nothing measured" (finding 1).
+///
+/// A physical slot created with `immediately_reserve = false` has a NULL
+/// `restart_lsn` until a standby connects — a never-connected or abandoned
+/// DR target. Before the fix, `bool_or(position IS NULL)` made the WHOLE
+/// reading `Unknown` whenever any one slot lacked a position. A healthy
+/// slot's small lag then masked the abandoned one entirely.
+/// `rpo_seconds()` fell back to `replay_lag`, which has no idea the
+/// abandoned slot exists either.
+#[tokio::test]
+async fn one_unmeasurable_slot_beside_a_measurable_one_is_a_partial_reading() {
+    let (url, _db) = require_db!("partialslot");
+    let mut conn = connect(&url).await;
+    let shard = ShardId::new(0);
+
+    let reserved = format!("{DR_PREFIX}_reserved_{}", std::process::id());
+    let unreserved = format!("{DR_PREFIX}_unreserved_{}", std::process::id());
+    diesel::sql_query("SELECT pg_create_physical_replication_slot($1, true)")
+        .bind::<diesel::sql_types::Text, _>(reserved.clone())
+        .execute(&mut conn)
+        .await
+        .expect("create the reserved (measurable) physical slot");
+    diesel::sql_query("SELECT pg_create_physical_replication_slot($1, false)")
+        .bind::<diesel::sql_types::Text, _>(unreserved.clone())
+        .execute(&mut conn)
+        .await
+        .expect("create the unreserved (never-connected) physical slot");
+
+    let reading = autumn_harvest::replication::measure_rpo(&mut conn, shard, DR_PREFIX)
+        .await
+        .expect("measure_rpo");
+    match reading {
+        WatermarkReading::PartiallyMeasured {
+            unmeasurable_slots, ..
+        } => {
+            assert_eq!(
+                unmeasurable_slots, 1,
+                "exactly the unreserved slot must be counted unmeasurable"
+            );
+        }
+        other => panic!(
+            "one measurable slot beside one unmeasurable one must be a partial reading, got \
+             {other:?}"
+        ),
+    }
+    let status = query_replication_status(&mut conn, shard, DR_PREFIX)
+        .await
+        .expect("status");
+    assert_eq!(
+        status.unmeasurable_slot_count(),
+        1,
+        "the count must also be visible from ReplicationStatus"
+    );
+    assert!(
+        status.rpo_seconds().is_none() || status.max_replay_lag_seconds().is_none(),
+        "a partial reading with nothing measured yet must never silently resolve via replay_lag"
+    );
+
+    for name in [reserved, unreserved] {
+        let _ = diesel::sql_query("SELECT pg_drop_replication_slot($1)")
+            .bind::<diesel::sql_types::Text, _>(name)
+            .execute(&mut conn)
+            .await;
+    }
+}
+
 /// An unrelated logical-decoding consumer must not read as a DR standby.
 ///
 /// A shard database can legitimately host a CDC pipeline's slot alongside its
@@ -1158,6 +1662,52 @@ async fn a_non_dr_slot_is_not_counted_as_a_dr_standby() {
             .execute(&mut conn)
             .await;
     }
+}
+
+/// A slot name that would satisfy `LIKE <prefix> || '%'` but does NOT start
+/// with the prefix must never be counted as a DR standby (finding 7).
+///
+/// `LIKE` treats `_` as "any single character", and `DR_PREFIX`
+/// (`harvest_dr`, the shipped default) contains one. Reproduced against live
+/// Postgres in the finding: `'harvestXdr_shard0' LIKE 'harvest_dr' || '%'` is
+/// `true`. Suppose the real DR sender then disconnected while this unrelated
+/// slot remained. `connected_standbys()` would stay non-zero, and
+/// `harvest_replication_down` would never fire — on the DEFAULT
+/// configuration, not only a custom prefix.
+#[tokio::test]
+async fn a_slot_matching_the_prefix_only_under_like_wildcards_is_not_counted() {
+    let (url, _db) = require_db!("likewild");
+    let mut conn = connect(&url).await;
+
+    // `x` stands in for the prefix's own underscore: differs at that one
+    // position, so `starts_with` correctly rejects it while `LIKE` would not.
+    // Lowercase only -- Postgres replication slot names allow no other case.
+    let slot = format!("harvestxdr_wildprobe_{}", std::process::id());
+    assert_ne!(&slot[..10], DR_PREFIX, "the probe must not literally match");
+    diesel::sql_query("SELECT pg_create_logical_replication_slot($1, 'pgoutput')")
+        .bind::<diesel::sql_types::Text, _>(slot.clone())
+        .execute(&mut conn)
+        .await
+        .expect("create the wildcard-matching slot");
+
+    let status = query_replication_status(&mut conn, ShardId::new(0), DR_PREFIX)
+        .await
+        .expect("status");
+    assert_eq!(
+        status.connected_standbys(),
+        0,
+        "a slot that only matches under LIKE's wildcard semantics must not count"
+    );
+    assert_eq!(
+        status.inactive_slots(),
+        0,
+        "and must not appear in the DR slot inventory either: {status:?}"
+    );
+
+    let _ = diesel::sql_query("SELECT pg_drop_replication_slot($1)")
+        .bind::<diesel::sql_types::Text, _>(slot)
+        .execute(&mut conn)
+        .await;
 }
 
 // ── The worker lifecycle: pin at startup, self-fence, stop ─────────────────
@@ -1828,8 +2378,9 @@ async fn promotion_body(regions: &Regions) -> Result<(), String> {
 
     // ── A surviving region-A worker, pinned to the pre-failover epoch. ────
     FenceRegistry::clear();
-    FenceRegistry::register(shard, ShardGeneration::new(0));
-    FenceRegistry::set_default_shard(shard);
+    FenceRegistry::register(shard, ShardGeneration::new(0))
+        .expect("no conflicting pin in this test");
+    FenceRegistry::set_default_shard(shard).expect("no conflicting default shard in this test");
 
     let stale_claim = autumn_harvest::queue::claim_task_on_shard(
         &mut b,
@@ -1859,8 +2410,8 @@ async fn promotion_body(regions: &Regions) -> Result<(), String> {
 
     // ── A region-B worker, pinned to the promoted epoch, carries on. ──────
     FenceRegistry::clear();
-    FenceRegistry::register(shard, promoted_gen);
-    FenceRegistry::set_default_shard(shard);
+    FenceRegistry::register(shard, promoted_gen).expect("no conflicting pin in this test");
+    FenceRegistry::set_default_shard(shard).expect("no conflicting default shard in this test");
 
     let claim = autumn_harvest::queue::claim_task_on_shard(
         &mut b,
