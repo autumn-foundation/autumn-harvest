@@ -1995,14 +1995,13 @@ mod tests {
 
     #[test]
     fn bridges_quota_supersede_credit_not_shed_with_workflow_and_gap_labels() {
-        // Mirrors `bridges_concurrency_residual_over_limit_with_workflow_and_gap_labels`
-        // exactly, for the same reason: a full-surface `MetricsRsRecorder`
-        // that forgets to override a new trait method silently resolves to
-        // the no-op default, so the counter would never be exported for any
-        // deployment using this adapter. A real `metrics::Recorder` captures
-        // the registered counter key so a dropped/swapped label (or an
-        // accidentally-added quota-key label — forbidden by ADR-0001 §7) is
-        // caught here.
+        // Mirrors `bridges_concurrency_residual_over_limit_with_workflow_and_gap_labels`.
+        // A full-surface `MetricsRsRecorder` that forgets to override a new
+        // trait method silently resolves to the no-op default. The counter
+        // would then never be exported for any deployment using this
+        // adapter. A real `metrics::Recorder` captures the registered
+        // counter key so a dropped/swapped label, or an accidentally-added
+        // quota-key label (forbidden by ADR-0001 §7), is caught here.
         type CounterKey = (String, Vec<(String, String)>);
 
         #[derive(Default)]

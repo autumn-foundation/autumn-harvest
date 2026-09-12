@@ -382,3 +382,43 @@ Re-ran all four suites above (`quota_supersede_ordering_tests.rs` 6/6,
 20/20, `quota_enforcement_tests.rs` 36/39, the same known flake family)
 plus the full `cargo test --lib` unit suite (3453/3453) against the
 corrected design.
+
+## Follow-up 6 — PR #1484 review: the row lock itself was the last defect
+
+A sixth automated review round found the `FOR UPDATE ... SKIP LOCKED`
+row lock, added two follow-ups earlier to keep the dry run's scanned
+population stable, was itself the remaining defect.
+
+**P1 — `SKIP LOCKED` also skips rows locked for ordinary reasons.**
+`store::next_event_id_for` takes a plain `FOR UPDATE` on a workflow's
+row during EVERY ordinary decision cycle, without ever transitioning it
+out of `RUNNING`. `SKIP LOCKED` cannot tell that apart from a row
+genuinely leaving the population. A `cancel_running` admission that
+scans an incumbent at the exact moment some unrelated decision cycle
+holds its lock would undercount the credit, and could see
+`enforce_quota_admission` reject an otherwise-healthy admission with
+`QuotaExceeded` -- defeating `cancel_running` far more often than the
+deadlock the row lock itself was added to prevent.
+
+Fixed by removing the row lock (and the `lock_concurrency_key` call
+follow-up 5 added around it) entirely, going back to a plain, unlocked
+scan. Follow-up 5's `credited_ids` reconciliation already built the
+correct safety net for exactly this kind of staleness: it does not care
+WHY a credited candidate went unshed, so a skipped cancellation and a
+stale, unlocked scan both surface identically as a gap reported via
+`harvest.quota.supersede_credit_not_shed`. No lock is needed here at
+all -- an unlocked read can only make the scanned population MORE
+stale, never less honest about what it saw, and the reconciliation
+catches every resulting gap after the fact.
+
+Rewrote `dry_run_credit_row_locks_the_scanned_population` (which
+proved the lock blocked a second connection) into
+`dry_run_credit_counts_a_row_locked_for_unrelated_reasons`: it holds
+one incumbent's row locked from a separate connection, for the whole
+scan, and asserts the scan still credits it -- neither blocking on the
+lock nor skipping the row it guards.
+
+Re-ran all four suites above (`quota_supersede_ordering_tests.rs` 6/6,
+the new test included, `quota_lock_ordering_tests.rs` 2/2,
+`concurrency_supersede_tests.rs` 20/20, `quota_enforcement_tests.rs`
+35/39, the same known flake family) against the corrected design.

@@ -870,16 +870,17 @@ pub const METRIC_CONCURRENCY_RESIDUAL_OVER_LIMIT: &str = "harvest.concurrency.re
 ///
 /// `crate::concurrency::dry_run_supersede_credit` credits an admission for
 /// the exact runs it expects `supersede_inner` to cancel a moment later.
-/// `supersede_inner` can skip one of those runs on an unexpected error —
-/// a candidate's own corrupted `parent_close_policy`, or a `Config` error
-/// from its terminal chokepoint that is not the benign already-terminal
-/// race — and leave it running rather than wedge every future admission for
-/// the key on one corrupt neighbor. The admission already committed on the
-/// assumption that run was gone, so the key is now genuinely over its
+/// `supersede_inner` can skip one of those runs on an unexpected error and
+/// leave it running instead. A candidate's own corrupted
+/// `parent_close_policy` is one cause. A `Config` error from its terminal
+/// chokepoint, that is not the benign already-terminal race, is another.
+/// Either way, one corrupt neighbor must never wedge every future
+/// admission for the key. The admission already committed on the
+/// assumption that run was gone. So the key is now genuinely over its
 /// declared cap, not merely transiently the way
-/// [`METRIC_CONCURRENCY_RESIDUAL_OVER_LIMIT`] describes. There is no way to
-/// retract that admission by the time this is detected — its
-/// `WorkflowStarted` event is already durable — so this counter is the
+/// [`METRIC_CONCURRENCY_RESIDUAL_OVER_LIMIT`] describes. There is no way
+/// to retract that admission by the time this is detected. Its
+/// `WorkflowStarted` event is already durable. So this counter is the
 /// alertable signal, not a rejection.
 ///
 /// Incremented once per admission whose real supersede pass left at least
@@ -2621,13 +2622,13 @@ pub trait MetricsRecorder: Send + Sync {
     /// be shed, and the real supersede pass skipped them instead (issue
     /// #1228 review, P2).
     ///
-    /// Maps to the counter [`METRIC_QUOTA_SUPERSEDE_CREDIT_NOT_SHED`]. Unlike
-    /// [`Self::record_concurrency_residual_over_limit`], the key here is not
-    /// merely transient: the admission that spent this credit is already
-    /// committed, so the key is genuinely over its declared cap until an
-    /// operator intervenes or the corrupt candidate is fixed. Additive with
-    /// a no-op default: implementing it is optional and no existing
-    /// implementor breaks.
+    /// Maps to the counter [`METRIC_QUOTA_SUPERSEDE_CREDIT_NOT_SHED`].
+    /// Unlike [`Self::record_concurrency_residual_over_limit`], the key
+    /// here is not merely transient. The admission that spent this credit
+    /// is already committed. So the key is genuinely over its declared cap
+    /// until an operator intervenes or the corrupt candidate is fixed.
+    /// Additive with a no-op default: implementing it is optional and no
+    /// existing implementor breaks.
     fn record_quota_supersede_credit_not_shed(&self, workflow: &str, gap: u64) {
         let _ = (workflow, gap);
     }
@@ -3556,18 +3557,18 @@ pub fn emit_concurrency_residual_over_limit<M: MetricsRecorder + ?Sized>(
 }
 
 /// Emit [`METRIC_QUOTA_SUPERSEDE_CREDIT_NOT_SHED`] for a `cancel_running`
-/// admission whose quota credit assumed `gap` runs would be shed, and whose
-/// real supersede pass skipped them instead (issue #1228 review, P2).
+/// admission whose quota credit assumed `gap` runs would be shed. Its real
+/// supersede pass skipped them instead (issue #1228 review, P2).
 ///
-/// Called INLINE from [`crate::execution::run_latest_wins_supersede`], right
-/// after the real supersede pass returns — same convention as
-/// [`emit_concurrency_residual_over_limit`], and for the same reason: this is
-/// a brand-new counter with no pre-existing post-commit convention to
-/// violate, and the condition it reports is itself already a rare edge case
-/// (a corrupted `parent_close_policy` or an unexpected `Config` error on one
-/// candidate). An occasional phantom sample from a rolled-back transaction
-/// is an accepted, documented simplification, not the gap this counter
-/// exists to close.
+/// Called INLINE from [`crate::execution::run_latest_wins_supersede`],
+/// right after the real supersede pass returns. Same convention as
+/// [`emit_concurrency_residual_over_limit`], and for the same reason: this
+/// is a brand-new counter with no pre-existing post-commit convention to
+/// violate. The condition it reports is itself already a rare edge case,
+/// like a corrupted `parent_close_policy` or an unexpected `Config` error
+/// on one candidate. An occasional phantom sample from a rolled-back
+/// transaction is an accepted, documented simplification, not the gap
+/// this counter exists to close.
 ///
 /// Canary probe workflows (issue #796) are excluded, mirroring
 /// [`emit_workflow_terminal`].

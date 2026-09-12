@@ -486,13 +486,19 @@ pub struct SupersedeCredit {
     pub active_executions: u64,
     /// Their combined `harvest_events` payload bytes.
     pub history_bytes: i64,
-    /// The exact executions this credit counted on (issue #1228 review, P2).
+    /// The exact executions this credit counted on (issue #1228 review).
     ///
-    /// The real supersede pass can skip one of these -- see
-    /// `supersede_inner`'s `Config`/`InvalidParentClosePolicy` arms -- and
-    /// leave it running. `active_executions` and `history_bytes` already
-    /// assumed it was shed. Every caller reconciles this list against the
-    /// real pass's [`SupersedeOutcome::superseded`] and reports the gap; see
+    /// The real supersede pass can leave one of these running instead of
+    /// cancelling it. A skipped cancellation on a `Config` or
+    /// `InvalidParentClosePolicy` error inside `supersede_inner` is one
+    /// cause. A candidate that changed state on its own is another. That
+    /// can happen between this dry run's deliberately unlocked scan and
+    /// the real pass's own, later, independent re-scan. See
+    /// [`dry_run_supersede_credit`]'s own doc comment for why that scan
+    /// takes no lock. Either way, `active_executions` and `history_bytes`
+    /// already assumed the candidate was shed. Every caller reconciles
+    /// this list against the real pass's [`SupersedeOutcome::superseded`]
+    /// and reports the gap. See
     /// [`crate::execution::run_latest_wins_supersede`].
     pub credited_ids: Vec<uuid::Uuid>,
 }
@@ -519,38 +525,48 @@ pub struct SupersedeCredit {
 /// the same `candidates.into_iter().take(shed)` selection `supersede_inner`
 /// uses.
 ///
-/// # Advisory lock ordering (Codex review, PR #1484)
+/// # No advisory lock, no row lock (issue #1228 review)
 ///
-/// This takes `lock_concurrency_key` itself, first, before the row scan
-/// below. `enforce_quota_admission` already took `lock_quota_key` before
-/// calling this function. So the order here is quota lock, then
-/// concurrency lock, then row locks. `replace_execution`'s three admission
-/// arms take the quota lock first too, inside that same
-/// `enforce_quota_admission` call. They take the concurrency lock later,
-/// in the real supersede pass run after `replace_execution` returns.
-/// Taking it here, AFTER the quota lock, does not invert that order.
+/// This takes neither `lock_concurrency_key` nor a row lock on the
+/// candidates it scans. Earlier review passes each tried locking this
+/// scan, to keep its population stable until the real pass re-scans it.
+/// Each attempt opened a new hazard:
 ///
-/// Issue #1228 review, P1: skipping this lock entirely was not enough.
-/// The row lock below is held for the rest of this transaction. That
-/// outlasts the point where the real supersede pass needs the
-/// concurrency lock. A concurrent admission can already hold that
-/// concurrency lock and be cancelling THIS transaction's scanned row, via
-/// [`crate::execution::cancel_workflow_execution_collect`]'s own,
-/// non-`SKIP LOCKED` `FOR UPDATE`. That admission would then wait on a
-/// row this transaction holds. Meanwhile this transaction waits on the
-/// concurrency lock that other transaction holds. That is an ABBA cycle
-/// between a row lock and the concurrency advisory lock. Taking the
-/// concurrency lock BEFORE the row scan closes it. Whichever transaction
-/// reaches this point first serializes the other entirely behind the
-/// concurrency lock. So no two transactions contending on the same key
-/// can ever hold a row the other is waiting on. `supersede_inner`'s own
-/// later `lock_concurrency_key` call becomes a safe re-entrant no-op once
-/// this one already ran in the same transaction.
+/// * A plain `FOR UPDATE` on every scanned row can deadlock against a
+///   concurrently completing incumbent's own row lock. That happens if the
+///   incumbent's terminal chokepoint starts a nested admission on the SAME
+///   quota key -- an ABBA cycle against `lock_quota_key`.
+/// * `FOR UPDATE ... SKIP LOCKED` closes that cycle. It skips an
+///   already-locked row instead of waiting on it. But
+///   [`crate::store::next_event_id_for`] takes a plain `FOR UPDATE` on a
+///   workflow's row during EVERY ordinary decision cycle. It does that
+///   without transitioning the row out of `RUNNING`. `SKIP LOCKED` cannot
+///   tell that apart from a row genuinely leaving the population. A
+///   `cancel_running` admission that scans an incumbent at the exact
+///   moment some unrelated decision cycle holds its lock would undercount
+///   the credit. `enforce_quota_admission` could then reject an
+///   otherwise-healthy admission with `QuotaExceeded` -- defeating
+///   `cancel_running` far more often than the deadlock this was meant to
+///   prevent.
+/// * Adding `lock_concurrency_key` around the row lock closed a THIRD
+///   cycle the row lock itself created, against
+///   [`crate::execution::cancel_workflow_execution_collect`]'s own row
+///   lock. It did nothing for the `SKIP LOCKED` problem above, since that
+///   lock only changes what the scan waits FOR, not what it SKIPS.
 ///
-/// # Row locks (issue #1228 review, P1)
-///
-/// The candidate scan below takes `FOR UPDATE` on every row it returns.
-/// See that query's own comment for the staleness this closes.
+/// A later pass built a second, independent safety net for exactly this
+/// kind of staleness: [`SupersedeCredit::credited_ids`]. It is reconciled
+/// by [`crate::execution::run_latest_wins_supersede`] against the real
+/// pass's actual outcome. That mechanism does not care WHY a credited
+/// candidate went unshed. A skipped cancellation and a stale scan both
+/// surface identically as a gap between `credited_ids` and
+/// `outcome.superseded`. Both get reported via
+/// `harvest.quota.supersede_credit_not_shed`. With that net in place, no
+/// lock here is needed at all. An unlocked read can only ever make the
+/// scanned population MORE stale, never less honest about what it saw.
+/// The reconciliation catches every resulting gap after the fact. Each
+/// lock design tried here instead carried its own deadlock or
+/// availability cost.
 ///
 /// # Errors
 ///
@@ -581,12 +597,6 @@ pub async fn dry_run_supersede_credit(
         history_bytes: Option<i64>,
     }
 
-    // See "Advisory lock ordering" above. Taken before the row scan below,
-    // after the caller's own `lock_quota_key`. No transaction here can then
-    // retain a row lock the real supersede pass's concurrency-lock holder
-    // is waiting on.
-    lock_concurrency_key(conn, concurrency_key).await?;
-
     let inherited: Vec<crate::types::ExecutionId> =
         ADMITTING.try_with(Clone::clone).unwrap_or_default();
     let fetch_cap =
@@ -597,32 +607,9 @@ pub async fn dry_run_supersede_credit(
     // same oldest-first order), plus the `quota_key` column that function
     // has no need for.
     //
-    // `FOR UPDATE` (issue #1228 review, P1) freezes this population for the
-    // rest of the transaction. A candidate outside the credited set could
-    // otherwise complete before the real pass re-scans, shrinking
-    // `candidates.len()` and lowering the `shed` target computed there. The
-    // real pass would then shed FEWER runs than this credit assumed,
-    // admitting an over-cap population that never converges. Locking the
-    // full scanned population, not only the credited rows, prevents that.
-    // No row here can change state until this transaction ends. The real
-    // pass's later, independent re-scan then sees the identical population
-    // and computes the identical `shed`. A row that starts existing only
-    // AFTER this scan only grows `candidates.len()`. That can only raise
-    // `shed`, never lower it -- the safe direction, so it needs no lock.
-    //
-    // `SKIP LOCKED` (issue #1228 review, P1) avoids a NEW deadlock class
-    // this lock alone would create. A concurrently completing incumbent
-    // can hold its own row lock while its terminal chokepoint starts a
-    // nested admission on the SAME quota key. That nested admission needs
-    // the SAME `lock_quota_key` this admission already holds. Meanwhile
-    // this scan would otherwise wait on that incumbent's row. That is an
-    // ABBA cycle between a row lock and the quota advisory lock. Skipping
-    // an already-locked row instead of waiting removes this scan from
-    // that wait-for graph entirely. A skipped row is one already
-    // transitioning away from RUNNING/PAUSED. Omitting it from the
-    // population only undercounts, never overcounts -- the safe
-    // direction. That is the same direction a row appearing only after
-    // the scan already relies on.
+    // Deliberately unlocked (issue #1228 review). See this function's own
+    // doc comment for the three lock designs tried and discarded here, and
+    // why `credited_ids` reconciliation replaces all of them.
     let rows: Vec<Row> = diesel::sql_query(
         "SELECT e.id, e.quota_key \
          FROM harvest_workflow_executions e \
@@ -636,8 +623,7 @@ pub async fn dry_run_supersede_credit(
                  AND t.concurrency_key = $3 \
            ) \
          ORDER BY e.started_at ASC, e.id ASC \
-         LIMIT $4 \
-         FOR UPDATE OF e SKIP LOCKED",
+         LIMIT $4",
     )
     .bind::<diesel::sql_types::Text, _>(workflow_name)
     .bind::<diesel::sql_types::Array<diesel::sql_types::Uuid>, _>(excluded)

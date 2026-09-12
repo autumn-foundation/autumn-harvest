@@ -2375,15 +2375,19 @@ mod resolve_by_workflow_id_tests {
 /// makes a tight quota cap see the freed slot; the actual cancellation
 /// stays here, unmoved.
 ///
-/// `credited_ids` (issue #1228 review, P2) is that same call's returned
-/// credit: the exact executions it counted as shed. This pass can skip one
-/// of them. A candidate's own corrupted `parent_close_policy`, or an
-/// unexpected `Config` error from its terminal chokepoint, can leave it
-/// running instead. See `supersede_inner`'s own doc comment. The admission
-/// already committed on the assumption that candidate would be gone. So a
-/// skip here is a real, if rare, over-cap breach, not merely a log line.
-/// This function reconciles `credited_ids` against `outcome.superseded`
-/// below and reports any gap.
+/// `credited_ids` (issue #1228 review) is that same call's returned
+/// credit: the exact executions it counted as shed. This pass can leave
+/// one of them running instead. A candidate's own corrupted
+/// `parent_close_policy`, or an unexpected `Config` error from its
+/// terminal chokepoint, can make `supersede_inner` skip it. Or the
+/// candidate can simply have changed state on its own. That can happen
+/// between the dry run's deliberately unlocked scan and this pass's own,
+/// later, independent re-scan. See `supersede_inner`'s own doc comment,
+/// and [`crate::concurrency::dry_run_supersede_credit`]'s. Either way, the
+/// admission already committed on the assumption that candidate would be
+/// gone. So a gap here is a real, if rare, over-cap breach, not merely a
+/// log line. This function reconciles `credited_ids` against
+/// `outcome.superseded` below and reports any gap.
 #[cfg(feature = "db")]
 async fn run_latest_wins_supersede(
     conn: &mut AsyncPgConnection,
