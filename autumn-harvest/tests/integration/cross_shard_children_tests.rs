@@ -1124,6 +1124,124 @@ async fn erasing_a_parent_scrubs_the_outbox_child_specs_input() {
     );
 }
 
+/// **Regression (issue #1263 item 10 follow-up).** A `STARTED` child
+/// still running must keep its outbox `child_spec` untouched, matching
+/// the target-side row it also preserves.
+///
+/// `status = STARTED` proves the relay created the child. It does not
+/// prove the child is terminal or free of a legal hold. Both of those
+/// `erase_one_child` on the target shard still gates on. Scrubbing the
+/// outbox copy on status alone would destroy PII for a child this same
+/// call reports as skipped, not erased.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn erasing_a_parent_preserves_a_still_running_started_childs_outbox_spec() {
+    let (urls, _container) = setup_shard_databases(&SHARDS).await;
+    let sharded = build_sharded_pool(&urls);
+    install_globals(&router_for(&SHARDS), &sharded);
+
+    let parent = start_parent(&sharded, "child_echo", "erase-running-1").await;
+    let child_shard = ShardId::new(1);
+    let child_id = ExecutionId::new_for_shard(child_shard);
+    let secret_input = json!({ "secret": "still-running-pii" });
+
+    {
+        let mut parent_conn = shard_conn(&sharded, PARENT_SHARD).await;
+        diesel::update(harvest_workflow_executions::table.find(parent.as_uuid()))
+            .set((
+                harvest_workflow_executions::state.eq("COMPLETED"),
+                harvest_workflow_executions::completed_at.eq(Some(Utc::now())),
+            ))
+            .execute(&mut *parent_conn)
+            .await
+            .expect("force parent terminal");
+
+        let spec = autumn_harvest::cross_shard_child::CrossShardChildSpec {
+            input: secret_input.clone(),
+            queue_name: "default".to_string(),
+            assigned_build_id: None,
+            context_headers: None,
+            owner: None,
+            runbook_url: None,
+            severity: None,
+            sla_secs: None,
+            execution_timeout_secs: None,
+            chain_execution_timeout_secs: None,
+            retry_policy: None,
+            quota_key: None,
+            quota: None,
+            concurrency_key: None,
+            max_concurrent: None,
+            trace_context: None,
+        };
+        autumn_harvest::cross_shard_child::record_cross_shard_child(
+            &mut parent_conn,
+            parent,
+            child_id,
+            "child_echo",
+            None,
+            &spec,
+        )
+        .await
+        .expect("record cross-shard child pointer");
+        diesel::update(harvest_cross_shard_children::table.find(child_id.as_uuid()))
+            .set(harvest_cross_shard_children::status.eq("STARTED"))
+            .execute(&mut *parent_conn)
+            .await
+            .expect("mark outbox row started");
+    }
+
+    {
+        // Created but never forced terminal: this child is still RUNNING,
+        // exactly the case a `STARTED`-only scrub would wrongly destroy.
+        let mut child_conn = shard_conn(&sharded, child_shard.as_i32()).await;
+        start_or_load_workflow_execution(
+            &mut child_conn,
+            parent_start_params(child_id, "child_echo", "erase-running-1-child"),
+            None,
+        )
+        .await
+        .expect("child start");
+    }
+
+    let mut parent_conn = shard_conn(&sharded, PARENT_SHARD).await;
+    let outcome = autumn_harvest::erase::erase_workflow_payloads_with_pool(
+        &mut parent_conn,
+        parent,
+        "gdpr",
+        Some(&sharded),
+    )
+    .await
+    .expect("erase must succeed");
+    assert!(
+        outcome.failures.is_empty(),
+        "a running child must not be reported as a failure: {:?}",
+        outcome.failures
+    );
+    assert!(
+        outcome.children.is_empty(),
+        "a still-running child must not be erased: {:?}",
+        outcome.children
+    );
+    assert_eq!(
+        outcome.skipped_children.len(),
+        1,
+        "a still-running child must be reported as skipped: {:?}",
+        outcome.skipped_children
+    );
+
+    let child_spec: Value = harvest_cross_shard_children::table
+        .find(child_id.as_uuid())
+        .select(harvest_cross_shard_children::child_spec)
+        .first(&mut *parent_conn)
+        .await
+        .expect("outbox row must still exist on the parent's shard");
+    assert_eq!(
+        child_spec["input"], secret_input,
+        "a still-running child's outbox input must stay untouched, got {}",
+        child_spec["input"]
+    );
+}
+
 /// **Regression (issue #1263 item 10 follow-up, Finding B).** A cross-shard
 /// child the relay has not yet created must be reported as skipped, not
 /// passed over as a clean success.

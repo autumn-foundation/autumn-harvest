@@ -399,8 +399,11 @@ mod db {
     ///
     /// Two follow-up gaps, closed by this pass. The outbox row's own
     /// `child_spec` copy of the child's input is a second, always-reachable
-    /// PII residence on the parent's own shard. It is scrubbed once the
-    /// row is `STARTED`. And a cross-shard child not yet visible on its
+    /// PII residence on the parent's own shard. It is scrubbed only once
+    /// the target-side gate confirms the child was actually erased. A
+    /// `STARTED` child still running, or under an active legal hold, is
+    /// correctly preserved there instead, and its outbox copy must stay
+    /// untouched too. And a cross-shard child not yet visible on its
     /// target shard is reported as [`SkippedChild`] instead of passed over
     /// as a clean success.
     ///
@@ -829,12 +832,14 @@ mod db {
     /// reachable copy of the child's PII. The target-shard scrub never
     /// touches it.
     ///
-    /// Only called once the relay has already created the child (`status =
-    /// STARTED`). No remaining relay action ever re-reads `child_spec` for
-    /// such a row, so scrubbing it here is safe. A `PENDING_START` row must
-    /// NOT be touched. The relay still needs that exact input to create the
-    /// child. This module's ordinary terminal-only gate cannot wait for
-    /// that creation first — see [`cascade_children`].
+    /// Only called once the target-shard gate has confirmed the child was
+    /// ACTUALLY erased. Not merely on `status = STARTED` (issue #1263 item
+    /// 10 follow-up). A `STARTED` child still running, or under an active
+    /// legal hold, is correctly preserved by that gate. Scrubbing its
+    /// outbox copy regardless would destroy PII for a child this call must
+    /// report as preserved, not erased. A `PENDING_START` row must NOT be
+    /// touched either way: the relay still needs that exact input to
+    /// create the child. See [`cascade_children`].
     ///
     /// Best-effort on a concurrent retire. If the row is gone by the time
     /// this runs, there is nothing left to scrub. The caller's own remote
@@ -1014,22 +1019,6 @@ mod db {
                 continue;
             }
             let child_exec_id = ExecutionId::from_uuid(child_uuid);
-            // The outbox's own `child_spec` copy of the child's `input` is a
-            // second, always-locally-reachable PII residence (Finding A).
-            // `start_child_on_target` commits the child's row on the target
-            // shard BEFORE this status flips to `STARTED`. So `STARTED` is
-            // the one durable proof the relay no longer needs this exact
-            // input to create anything. A `PENDING_START` row must stay
-            // untouched: the child may not exist yet, and scrubbing its
-            // only surviving input would corrupt a still-pending creation.
-            if status == crate::shard::CrossShardChildStatus::Started.as_db_str()
-                && let Err(e) = scrub_cross_shard_child_spec(conn, child_uuid).await
-            {
-                failures.push(EraseFailure {
-                    execution_id: child_exec_id.to_string(),
-                    reason: e.to_string(),
-                });
-            }
             let Some(pool) = pool else {
                 failures.push(EraseFailure {
                     execution_id: child_exec_id.to_string(),
@@ -1103,6 +1092,25 @@ mod db {
                     });
                 }
                 Ok((erased, skipped, failed)) => {
+                    // The outbox's own `child_spec` copy of the child's
+                    // `input` is a second, always-locally-reachable PII
+                    // residence (Finding A). Scrub it only once
+                    // `erase_one_child` on the target shard confirms this
+                    // child was ACTUALLY erased. Not merely `STARTED`
+                    // (issue #1263 item 10 follow-up). A `STARTED` child
+                    // still running, or under an active legal hold, is
+                    // correctly preserved on its own shard by that same
+                    // gate. Scrubbing the outbox copy regardless would
+                    // destroy PII for a child this erase just reported as
+                    // skipped, not erased.
+                    if erased.is_some()
+                        && let Err(e) = scrub_cross_shard_child_spec(conn, child_uuid).await
+                    {
+                        failures.push(EraseFailure {
+                            execution_id: child_exec_id.to_string(),
+                            reason: e.to_string(),
+                        });
+                    }
                     children.extend(erased);
                     skipped_children.extend(skipped);
                     failures.extend(failed);
