@@ -16,6 +16,7 @@ use serde_json::{Value, json};
 use tokio::runtime::Handle;
 
 use crate::session::{SYSTEM_PROMPT, ToolCall, TurnReply, TurnRequest};
+use crate::shutdown::Signal;
 use crate::tools;
 
 /// The Messages API endpoint.
@@ -46,6 +47,8 @@ pub struct ModelConfig {
     pub model: String,
     pub max_tokens: u32,
     pub http: reqwest::Client,
+    /// Raised when the daemon is asked to stop. See [`call_api`].
+    pub shutdown: Signal,
 }
 
 /// The identity an offline session records, in place of a model name.
@@ -57,7 +60,12 @@ impl ModelConfig {
     /// # Errors
     ///
     /// Returns an error if the HTTP client cannot be built.
-    pub fn new(api_key: Option<String>, model: String, max_tokens: u32) -> Result<Self, String> {
+    pub fn new(
+        api_key: Option<String>,
+        model: String,
+        max_tokens: u32,
+        shutdown: Signal,
+    ) -> Result<Self, String> {
         // The stub's identity is not a model name. With a key, `identity`
         // returns the model as given, so this one name would match a session
         // recorded against the stub. That session would then resume on the
@@ -80,6 +88,7 @@ impl ModelConfig {
             model,
             max_tokens,
             http,
+            shutdown,
         })
     }
 
@@ -136,25 +145,40 @@ pub fn activity_body(
 /// request runs through `block_in_place`. Tokio moves the other tasks of this
 /// worker thread elsewhere for the duration. A multi-thread runtime is
 /// therefore required, which is what `#[tokio::main]` builds by default.
+///
+/// `block_in_place` does not yield this task. Nothing else on it is polled
+/// until the request returns, so the drive loop cannot see `Ctrl-C` from the
+/// outside. The request therefore waits on the shutdown flag itself. A stop
+/// abandons the request and reports a retryable error, because the turn is not
+/// committed and the daemon is going away.
 fn call_api(
     config: &ModelConfig,
     api_key: &str,
     request: &TurnRequest,
 ) -> Result<TurnReply, String> {
     let body = request_body(config, request);
+    let mut stop = config.shutdown.clone();
     let response = tokio::task::block_in_place(|| {
         Handle::current().block_on(async {
-            config
-                .http
-                .post(API_URL)
-                .header("x-api-key", api_key)
-                .header("anthropic-version", API_VERSION)
-                .header("anthropic-beta", FALLBACK_BETA)
-                .json(&body)
-                .send()
-                .await
+            tokio::select! {
+                result = config
+                    .http
+                    .post(API_URL)
+                    .header("x-api-key", api_key)
+                    .header("anthropic-version", API_VERSION)
+                    .header("anthropic-beta", FALLBACK_BETA)
+                    .json(&body)
+                    .send() => Some(result),
+                () = stop.raised() => None,
+            }
         })
     });
+    let Some(response) = response else {
+        // The same ambiguous window a dropped connection leaves: the API may
+        // have this request. The error is retryable, so the turn runs again on
+        // the next start, and the README names the window.
+        return Err("the daemon is stopping, so this turn did not finish".to_string());
+    };
 
     // A failure BEFORE a response arrived keeps the plain error string, so the
     // activity retry policy applies. This is the ambiguous window. The request

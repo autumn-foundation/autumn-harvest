@@ -32,6 +32,7 @@ use crate::protocol::{PendingCall, Request, Response, SessionView};
 use crate::session::{
     self, ApprovalDecision, SessionReport, SessionTask, TurnReply, WORKFLOW_NAME,
 };
+use crate::shutdown;
 use crate::tools;
 
 /// How many control commands may queue while the runtime is busy.
@@ -125,7 +126,23 @@ pub async fn serve(options: Options) -> Result<(), String> {
     // long as this call, and the kernel releases it if the process dies.
     let _lock = guard::acquire(&options.db)?;
 
-    let model = ModelConfig::new(options.api_key, options.model, options.max_tokens)?;
+    // One task waits for `Ctrl-C` and raises the flag. The drive loop cannot
+    // wait for the signal itself. A model call blocks its thread, so nothing
+    // else on that task is polled until the call returns. See `shutdown`.
+    let (trigger, signal) = shutdown::channel();
+    tokio::spawn(async move {
+        if let Err(e) = tokio::signal::ctrl_c().await {
+            tracing::error!(error = %e, "cannot listen for Ctrl-C");
+        }
+        trigger.send_replace(true);
+    });
+
+    let model = ModelConfig::new(
+        options.api_key,
+        options.model,
+        options.max_tokens,
+        signal.clone(),
+    )?;
     let live = model.is_live();
     // Every session records this, and a turn is refused by a daemon serving a
     // different model. See `ModelConfig::identity`.
@@ -177,12 +194,10 @@ pub async fn serve(options: Options) -> Result<(), String> {
     // it validated. One query, not two.
     let mut live: Live = resumed;
     let mut ticker = tokio::time::interval(options.tick);
-    // One `Ctrl-C` future for the whole loop, so the drive work below can race
-    // against the SAME signal. A model call can hold a drive for the whole HTTP
-    // timeout. A daemon that answered `Ctrl-C` only between ticks would look
-    // dead for that long.
-    let shutdown = tokio::signal::ctrl_c();
-    tokio::pin!(shutdown);
+    // Every branch below waits on the same flag. It stays raised once it is
+    // raised, so a fresh wait returns at once rather than missing the signal.
+    let mut stop = signal.clone();
+    let mut stop_during_drive = signal;
     'serve: loop {
         tokio::select! {
             job = rx.recv() => {
@@ -207,21 +222,17 @@ pub async fn serve(options: Options) -> Result<(), String> {
                 for exec in ready {
                     tokio::select! {
                         () = drive_one(&mut runtime, exec, &mut blocked, &mut live) => {}
-                        result = &mut shutdown => {
+                        () = stop_during_drive.raised() => {
                             // The drive is dropped where it stands. Its task
                             // stays RUNNING in the file, and the next start
                             // reclaims it and replays the recorded history.
                             // That is the same path a crash takes.
-                            report_shutdown(result);
                             break 'serve;
                         }
                     }
                 }
             }
-            result = &mut shutdown => {
-                report_shutdown(result);
-                break;
-            }
+            () = stop.raised() => break,
         }
     }
 
@@ -737,13 +748,6 @@ fn prepare_workspace(workspace: &Path, db: &Path) -> Result<String, String> {
             )
         })?
         .to_string())
-}
-
-/// Log a `Ctrl-C` that could not be listened for.
-fn report_shutdown(result: std::io::Result<()>) {
-    if let Err(e) = result {
-        tracing::error!(error = %e, "cannot listen for Ctrl-C");
-    }
 }
 
 /// The directories above the workspace, closest first.

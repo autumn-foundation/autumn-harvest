@@ -926,6 +926,7 @@ async fn a_session_refuses_to_continue_on_another_model() {
         Some("sk-ant-not-a-real-key".to_string()),
         claude::DEFAULT_MODEL.to_string(),
         claude::DEFAULT_MAX_TOKENS,
+        crate::shutdown::channel().1,
     )
     .expect("the configuration builds");
 
@@ -1573,6 +1574,7 @@ fn a_live_daemon_refuses_the_offline_identity() {
         Some("sk-not-a-real-key".to_string()),
         claude::OFFLINE_MODEL.to_string(),
         claude::DEFAULT_MAX_TOKENS,
+        crate::shutdown::channel().1,
     ) else {
         panic!("the stub's name must not be accepted as a model");
     };
@@ -1587,6 +1589,7 @@ fn a_live_daemon_refuses_the_offline_identity() {
         None,
         claude::OFFLINE_MODEL.to_string(),
         claude::DEFAULT_MAX_TOKENS,
+        crate::shutdown::channel().1,
     )
     .expect("the stub needs no key");
     assert_eq!(offline.identity(), claude::OFFLINE_MODEL);
@@ -1595,9 +1598,43 @@ fn a_live_daemon_refuses_the_offline_identity() {
         Some("sk-not-a-real-key".to_string()),
         claude::DEFAULT_MODEL.to_string(),
         claude::DEFAULT_MAX_TOKENS,
+        crate::shutdown::channel().1,
     )
     .expect("a real model with a key is ordinary");
     assert_eq!(live.identity(), claude::DEFAULT_MODEL);
+}
+
+#[tokio::test]
+async fn the_shutdown_flag_is_never_missed() {
+    // A waiter that starts AFTER the signal must not wait forever. The model
+    // request waits on this flag from inside a blocking call, so it starts
+    // late by construction.
+    let (trigger, signal) = crate::shutdown::channel();
+    trigger.send_replace(true);
+    let mut late = signal.clone();
+    tokio::time::timeout(Duration::from_secs(5), late.raised())
+        .await
+        .expect("a raised flag must not make a late waiter wait");
+
+    // A waiter that starts first is released when the flag goes up.
+    let (trigger, signal) = crate::shutdown::channel();
+    let mut early = signal.clone();
+    let waiting = tokio::spawn(async move { early.raised().await });
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    trigger.send_replace(true);
+    tokio::time::timeout(Duration::from_secs(5), waiting)
+        .await
+        .expect("the waiter must be released")
+        .expect("the waiter finishes");
+
+    // A trigger that is dropped reads as a stop. Its only holder is the task
+    // that waits for the signal, so losing it means the daemon is going away.
+    let (trigger, signal) = crate::shutdown::channel();
+    let mut orphaned = signal.clone();
+    drop(trigger);
+    tokio::time::timeout(Duration::from_secs(5), orphaned.raised())
+        .await
+        .expect("a lost trigger must not make a waiter wait");
 }
 
 #[test]

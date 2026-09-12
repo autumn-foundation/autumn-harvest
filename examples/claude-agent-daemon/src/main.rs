@@ -29,6 +29,7 @@ mod guard;
 mod inspect;
 mod protocol;
 mod session;
+mod shutdown;
 mod tools;
 
 #[cfg(test)]
