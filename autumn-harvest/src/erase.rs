@@ -976,6 +976,12 @@ mod db {
     /// Cascade erasure to child executions, child summaries, AND cross-shard
     /// children; return (children, skipped, failures).
     ///
+    /// Long by construction. The cross-shard branch alone must gate
+    /// outbox scrubbing on erase eligibility, detect pool aliasing, bound
+    /// its own checkout, and branch on outbox status. Splitting it into
+    /// smaller helpers would scatter one decision across several
+    /// functions a reader would have to reassemble.
+    ///
     /// For each SAME-shard child id (from either of [`collect_child_ids`]'s
     /// two sources, deduped): a live terminal, non-held execution row is
     /// scrubbed and recursed. A non-terminal or held row is skipped. A child
@@ -988,6 +994,7 @@ mod db {
     /// no `pool`, an unreachable shard, or a genuine failure mid-erase —
     /// is reported as an [`EraseFailure`]. Never silently dropped: an erase
     /// must not claim success over PII it could not verify was scrubbed.
+    #[allow(clippy::too_many_lines)]
     async fn cascade_children(
         conn: &mut AsyncPgConnection,
         exec_id: ExecutionId,
@@ -1040,56 +1047,95 @@ mod db {
             // deadlock right here. This is the same class of bug
             // `worker::shard_acquire_bound` (issue #961) exists to convert
             // from a permanent hang into a reportable failure.
-            let checkout = tokio::time::timeout(
-                crate::worker::MIN_SHARD_ACQUIRE_BOUND,
-                crate::shard_rebalance::conn_for_shard(pool, ShardId::new(target_shard)),
-            )
-            .await
-            .unwrap_or_else(|_| {
-                Err(HarvestError::ShardUnavailable {
-                    shard_id: target_shard,
-                    reason: format!(
-                        "pool checkout did not complete within {:?}",
-                        crate::worker::MIN_SHARD_ACQUIRE_BOUND
-                    ),
-                })
-            });
-            let outcome = match checkout {
-                Ok(mut target_conn) => {
-                    Box::pin(
-                        target_conn.transaction::<_, HarvestError, _>(async |target_conn| {
-                            Ok(erase_one_child(
-                                target_conn,
-                                child_exec_id,
-                                now,
-                                visited,
-                                Some(pool),
-                            )
-                            .await)
-                        }),
-                    )
-                    .await
+            // A small deployment can map two logical shards onto the SAME
+            // physical pool (issue #1146's aliasing). A second connection
+            // checkout from a pool this call already holds one from can
+            // starve a `max_size = 1` pool outright. The bound above only
+            // turns that into a reportable failure, five seconds later, on
+            // every retry. Detecting the alias and reusing `conn` directly
+            // avoids the wait entirely: it is
+            // already connected to the exact same database.
+            let aliased = pool
+                .exact_pool_for_execution(exec_id)
+                .zip(pool.exact_pool_for(ShardId::new(target_shard)))
+                .is_some_and(|(parent_pool, target_pool)| {
+                    crate::external_target_location::same_underlying_pool(parent_pool, target_pool)
+                });
+            let outcome = if aliased {
+                Ok(erase_one_child(conn, child_exec_id, now, visited, Some(pool)).await)
+            } else {
+                let checkout = tokio::time::timeout(
+                    crate::worker::MIN_SHARD_ACQUIRE_BOUND,
+                    crate::shard_rebalance::conn_for_shard(pool, ShardId::new(target_shard)),
+                )
+                .await
+                .unwrap_or_else(|_| {
+                    Err(HarvestError::ShardUnavailable {
+                        shard_id: target_shard,
+                        reason: format!(
+                            "pool checkout did not complete within {:?}",
+                            crate::worker::MIN_SHARD_ACQUIRE_BOUND
+                        ),
+                    })
+                });
+                match checkout {
+                    Ok(mut target_conn) => {
+                        Box::pin(target_conn.transaction::<_, HarvestError, _>(
+                            async |target_conn| {
+                                Ok(erase_one_child(
+                                    target_conn,
+                                    child_exec_id,
+                                    now,
+                                    visited,
+                                    Some(pool),
+                                )
+                                .await)
+                            },
+                        ))
+                        .await
+                    }
+                    Err(e) => Err(e),
                 }
-                Err(e) => Err(e),
             };
             match outcome {
-                // Nothing at all on the target shard: a `PENDING_START`
-                // child the relay has not created yet (issue #1263 item 10
-                // follow-up, Finding B). The outbox row is still live, so
-                // this is not the retired-pointer case
+                // Nothing at all on the target shard. What this means
+                // depends on `status` (issue #1263 item 10 follow-up).
+                //
+                // `PENDING_START`: the relay has not created the child yet
+                // (Finding B). The outbox row is still live, so this is not
+                // the retired-pointer case
                 // [`erase_workflow_payloads_with_pool`]'s scope-boundary
                 // note describes. Report it as outstanding rather than
                 // silently passing over it as a clean success.
+                //
+                // `STARTED`: creation already committed. Absence now means
+                // the target shard's own retention already purged the
+                // execution and its summary. Most often that is because
+                // terminal delivery to the parent ran later than that
+                // horizon. Retrying can never make the row reappear, so
+                // this is NOT the `PENDING_START` case above. Scrub the
+                // outbox's own
+                // surviving `child_spec` copy, the one thing still
+                // reachable, and stop: there is nothing left to wait for.
                 Ok((None, None, None)) => {
-                    skipped_children.push(SkippedChild {
-                        execution_id: child_exec_id.to_string(),
-                        state: status,
-                        reason: Some(
-                            "cross-shard child not yet visible on its target shard; retry \
-                             this erasure once the relay creates it"
-                                .to_string(),
-                        ),
-                    });
+                    if status == crate::shard::CrossShardChildStatus::Started.as_db_str() {
+                        if let Err(e) = scrub_cross_shard_child_spec(conn, child_uuid).await {
+                            failures.push(EraseFailure {
+                                execution_id: child_exec_id.to_string(),
+                                reason: e.to_string(),
+                            });
+                        }
+                    } else {
+                        skipped_children.push(SkippedChild {
+                            execution_id: child_exec_id.to_string(),
+                            state: status,
+                            reason: Some(
+                                "cross-shard child not yet visible on its target shard; retry \
+                                 this erasure once the relay creates it"
+                                    .to_string(),
+                            ),
+                        });
+                    }
                 }
                 Ok((erased, skipped, failed)) => {
                     // The outbox's own `child_spec` copy of the child's
