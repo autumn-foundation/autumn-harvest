@@ -18,8 +18,11 @@
 //! counts vary around the `LIMIT 10` boundary: 0, 3, exactly 10, and 15.
 //! The last-10-events lookup is exercised at and past its own limit.
 //!
-//! Run against a real Postgres via `HARVEST_TEST_DATABASE_URL` (this test
-//! does not fall back to a testcontainer; Docker is not assumed available).
+//! Prefers `HARVEST_TEST_DATABASE_URL` (a real, already-running Postgres,
+//! for a sandbox with no Docker daemon). Falls back to a testcontainer,
+//! same as `tests/ui_integration.rs`'s `overdue_read_database_url`, since
+//! this is wired into CI's linux-osclass suite manifest and CI runners
+//! carry Docker but not a pre-set `HARVEST_TEST_DATABASE_URL`.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -46,6 +49,10 @@ use diesel_async::pooled_connection::AsyncDieselConnectionManager;
 use diesel_async::{AsyncConnection, AsyncPgConnection, RunQueryDsl};
 use serde_json::json;
 use std::fmt::Write as _;
+use testcontainers::ContainerAsync;
+use testcontainers::ImageExt;
+use testcontainers_modules::postgres::Postgres;
+use testcontainers_modules::testcontainers::runners::AsyncRunner;
 use tower::ServiceExt;
 use uuid::Uuid;
 
@@ -56,16 +63,34 @@ const TOTAL_DEAD_LETTERS: usize = 200;
 /// of "hot" executions, not most of the fixture.
 const SHARED_EXEC_EVERY: usize = 40;
 
-fn admin_url_or_skip() -> Option<String> {
+/// Prefers `HARVEST_TEST_DATABASE_URL`. Falls back to a fresh testcontainer
+/// otherwise, so CI (Docker present, no pre-set env var) can run this suite.
+/// The returned container, when present, must outlive the whole test: drop
+/// it and the admin connection stops working immediately.
+async fn admin_url_or_skip() -> Option<(String, Option<ContainerAsync<Postgres>>)> {
     if let Ok(url) = std::env::var("HARVEST_TEST_DATABASE_URL") {
-        return Some(url);
+        return Some((url, None));
     }
-    assert!(
-        std::env::var("CI").is_err(),
-        "dead-letter UI batch perf test needs HARVEST_TEST_DATABASE_URL under CI"
-    );
-    eprintln!("SKIP: HARVEST_TEST_DATABASE_URL not set and no Docker fallback here");
-    None
+    match Postgres::default().with_tag("16").start().await {
+        Ok(container) => {
+            let host = container.get_host().await.expect("container host");
+            let port = container
+                .get_host_port_ipv4(5432)
+                .await
+                .expect("container port");
+            let url = format!("postgres://postgres:postgres@{host}:{port}/postgres");
+            Some((url, Some(container)))
+        }
+        Err(e) => {
+            assert!(
+                std::env::var("CI").is_err(),
+                "dead-letter UI batch perf test needs either HARVEST_TEST_DATABASE_URL or a \
+                 reachable Docker daemon under CI: {e}"
+            );
+            eprintln!("SKIP: no HARVEST_TEST_DATABASE_URL and no reachable Docker daemon ({e})");
+            None
+        }
+    }
 }
 
 async fn create_fresh_database(admin_url: &str) -> String {
@@ -392,7 +417,7 @@ async fn reset_pg_stat_statements(conn: &mut AsyncPgConnection) -> bool {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn dead_letter_ui_page_hydrates_details_correctly_and_batches_lookups() {
-    let Some(admin_url) = admin_url_or_skip() else {
+    let Some((admin_url, _container)) = admin_url_or_skip().await else {
         return;
     };
     let database_url = create_fresh_database(&admin_url).await;
