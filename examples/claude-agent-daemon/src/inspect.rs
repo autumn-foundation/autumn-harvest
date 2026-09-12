@@ -81,6 +81,7 @@ pub struct ExecutionRow {
 /// A listing names many sessions, so it carries no whole payload. The single
 /// status of one session still reads its row entire, because that is the one
 /// session the operator asked about.
+#[derive(Debug)]
 pub struct SessionSummary {
     pub exec_id: String,
     pub state: String,
@@ -265,8 +266,12 @@ pub fn no_cursor(before: Option<i64>) -> i64 {
 }
 
 /// One page of a session's events, newest first. See [`no_cursor`].
-pub const EVENTS_QUERY: &str = "SELECT seq, json_extract(event_json, '$.type'), \
-            substr(json_extract(event_json, '$.data'), 1, ?4) \
+pub const EVENTS_QUERY: &str = "SELECT seq, \
+            CASE WHEN json_valid(event_json) \
+                  AND json_type(event_json, '$.type') = 'text' \
+                 THEN substr(cast(json_extract(event_json, '$.type') as blob), 1, ?4) END, \
+            CASE WHEN json_valid(event_json) \
+                 THEN substr(cast(json_extract(event_json, '$.data') as blob), 1, ?4) END \
      FROM harvest_events \
      WHERE exec_id = ?1 AND seq < ?2 \
      ORDER BY seq DESC LIMIT ?3";
@@ -275,9 +280,12 @@ pub const EVENTS_QUERY: &str = "SELECT seq, json_extract(event_json, '$.type'), 
 ///
 /// The `stop_reason` test is not indexed, so it is applied to the rows the
 /// bound admits, and not used to find them. See [`no_cursor`].
-pub const REPLIES_QUERY: &str = "SELECT seq, json_extract(event_json, '$.data.output.tool_calls') \
+pub const REPLIES_QUERY: &str = "SELECT seq, \
+            CASE WHEN json_valid(event_json) \
+                 THEN json_extract(event_json, '$.data.output.tool_calls') END \
      FROM harvest_events \
      WHERE exec_id = ?1 AND seq < ?2 \
+     AND json_valid(event_json) \
      AND json_extract(event_json, '$.data.output.stop_reason') IS NOT NULL \
      ORDER BY seq DESC LIMIT ?3";
 
@@ -286,11 +294,14 @@ pub const REPLIES_QUERY: &str = "SELECT seq, json_extract(event_json, '$.data.ou
 /// The whole event is never read. A recorded activity can approach the
 /// backend's payload cap, and a page names hundreds of them. A page that read
 /// them whole would hold gigabytes for one command.
+#[derive(Debug)]
 pub struct EventLine {
     /// The event's own position in the log, and the cursor of the next page.
     pub seq: i64,
+    /// The event's type. `unknown` when the row does not hold a readable one.
     pub label: String,
-    /// The event's data, cut in the database. `None` when it carries none.
+    /// The event's data, cut in the database. `None` when it carries none, or
+    /// when no part of it decodes.
     pub detail: Option<String>,
 }
 
@@ -319,14 +330,13 @@ pub fn event_lines(
         .map_err(|e| format!("cannot prepare the event query: {e}"))?;
     let rows = statement
         .query_map(
-            rusqlite::params![exec_id, no_cursor(before), limit, detail_cap],
+            rusqlite::params![exec_id, no_cursor(before), limit, MAX_EVENT_DETAIL_BYTES],
             |row| {
                 Ok(EventLine {
                     seq: row.get(0)?,
-                    label: row
-                        .get::<_, Option<String>>(1)?
+                    label: cut_text(row.get(1)?, detail_cap)
                         .unwrap_or_else(|| "unknown".to_string()),
-                    detail: row.get(2)?,
+                    detail: cut_text(row.get(2)?, detail_cap),
                 })
             },
         )
@@ -338,6 +348,14 @@ pub fn event_lines(
 
 /// How many characters of one event's data an audit line prints.
 pub const MAX_EVENT_DETAIL_CHARS: u32 = 240;
+
+/// The BYTES of one event field the database is asked for.
+///
+/// The cut is on bytes for the reason [`MAX_LISTED_BYTES`] gives: `substr` on
+/// TEXT counts to the first NUL and stops. The budget carries one character
+/// past the printed cap, so a caller can still tell a cut line from a whole
+/// one. The caller cuts the characters.
+const MAX_EVENT_DETAIL_BYTES: u32 = (MAX_EVENT_DETAIL_CHARS + 1) * 4;
 
 /// Read one page of the TOOL CALLS a session's model replies asked for.
 ///
@@ -551,6 +569,7 @@ fn answered(conn: &Connection, exec_id: &str, signal: &str) -> Result<bool, Stri
     one_row(
         conn,
         "SELECT 1 FROM harvest_events WHERE exec_id = ?1 \
+         AND json_valid(event_json) \
          AND json_extract(event_json, '$.type') = 'SignalReceived' \
          AND json_extract(event_json, '$.data.signal_name') = ?2 LIMIT 1",
         exec_id,
@@ -586,42 +605,42 @@ fn races_signal(timer_id: &str, signal: &str) -> bool {
 /// operator would read a character nobody wrote.
 ///
 /// The characters are cut here, because the database was asked for a budget
-/// of bytes. See [`MAX_LISTED_BYTES`].
+/// of bytes. See [`MAX_LISTED_BYTES`] and [`MAX_EVENT_DETAIL_BYTES`].
 ///
 /// A field that decodes to NOTHING is reported as no field. A JSON string of
 /// one unpaired surrogate is text to `SQLite` and not text to Rust, so its
 /// valid prefix is empty. Calling that an empty stop reason would have the
 /// row claim something it never held.
-fn cut_text(bytes: Option<Vec<u8>>) -> Option<String> {
+fn cut_text(bytes: Option<Vec<u8>>, chars: u32) -> Option<String> {
     let bytes = bytes?;
     let whole = match std::str::from_utf8(&bytes) {
         Ok(text) => text,
         Err(split) => std::str::from_utf8(&bytes[..split.valid_up_to()]).unwrap_or_default(),
     };
-    let cut: String = whole.chars().take(MAX_LISTED_CHARS as usize).collect();
+    let cut: String = whole.chars().take(chars as usize).collect();
     (!cut.is_empty()).then_some(cut)
 }
 
 /// One page of the sessions a listing names, newest first. See [`no_cursor`].
 pub const SESSIONS_QUERY: &str = "SELECT exec_id, state, \
-                    CASE WHEN json_valid(input_json) \
+                    CASE WHEN typeof(input_json) = 'text' AND json_valid(input_json) \
                           AND json_type(input_json, '$.goal') = 'text' \
                          THEN substr(cast(json_extract(input_json, '$.goal') as blob), \
                                      1, ?3) END, \
-                    CASE WHEN json_valid(output_json) \
+                    CASE WHEN typeof(output_json) = 'text' AND json_valid(output_json) \
                           AND json_type(output_json, '$.stop') = 'text' \
                          THEN substr(cast(json_extract(output_json, '$.stop') as blob), \
                                      1, ?3) END, \
-                    CASE WHEN json_valid(output_json) \
+                    CASE WHEN typeof(output_json) = 'text' AND json_valid(output_json) \
                           AND json_type(output_json, '$.turns') = 'integer' \
                           AND typeof(json_extract(output_json, '$.turns')) = 'integer' \
                          THEN json_extract(output_json, '$.turns') END, \
-                    CASE WHEN json_valid(output_json) \
+                    CASE WHEN typeof(output_json) = 'text' AND json_valid(output_json) \
                           AND json_type(output_json, '$.tool_calls') = 'integer' \
                           AND typeof(json_extract(output_json, '$.tool_calls')) \
                               = 'integer' \
                          THEN json_extract(output_json, '$.tool_calls') END, \
-                    CASE WHEN json_valid(output_json) \
+                    CASE WHEN typeof(output_json) = 'text' AND json_valid(output_json) \
                           AND json_type(output_json, '$.answer') = 'text' \
                          THEN substr(cast(json_extract(output_json, '$.answer') as blob), \
                                      1, ?3) END, \
@@ -704,12 +723,12 @@ pub fn executions(
                 Ok(SessionSummary {
                     exec_id: row.get(0)?,
                     state: row.get(1)?,
-                    goal: cut_text(row.get(2)?),
-                    stop: cut_text(row.get(3)?),
+                    goal: cut_text(row.get(2)?, MAX_LISTED_CHARS),
+                    stop: cut_text(row.get(3)?, MAX_LISTED_CHARS),
                     turns: row.get(4)?,
                     tool_calls: row.get(5)?,
-                    answer: cut_text(row.get(6)?),
-                    error: cut_text(row.get(7)?),
+                    answer: cut_text(row.get(6)?, MAX_LISTED_CHARS),
+                    error: cut_text(row.get(7)?, MAX_LISTED_CHARS),
                     row: row.get(8)?,
                 })
             },

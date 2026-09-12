@@ -3509,6 +3509,92 @@ fn a_row_that_cannot_be_read_is_read_as_nothing() {
     assert_eq!(surrogate.turns, Some(2), "as are its counts");
 }
 
+/// A listed document in the wrong storage class reads as nothing.
+///
+/// `json_valid` answers 1 for JSON text stored as a BLOB, so a `json_valid`
+/// guard alone admits a class the engine cannot read. The listing would then
+/// print a goal from a document no drive can load. The operator reads a
+/// session the runtime treats as unreadable.
+///
+/// This is the guard `running` already carries, applied where the listing
+/// reads the same two columns.
+#[test]
+fn a_listed_document_in_the_wrong_storage_class_reads_as_nothing() {
+    let dir = tempfile::tempdir().expect("a temporary directory");
+    let db = dir.path().join("listed-class.db");
+    let writer = rusqlite::Connection::open(&db).expect("the database opens");
+    fixture_table(&writer);
+    record_task(&writer, "readable", READABLE_TASK);
+    writer
+        .execute(
+            "INSERT INTO harvest_executions VALUES \
+             ('blob-task', ?1, 'RUNNING', CAST(?2 AS BLOB), NULL, NULL)",
+            rusqlite::params![WORKFLOW_NAME, READABLE_TASK],
+        )
+        .expect("the blob task is recorded");
+    let report = r#"{"stop":"end_turn","turns":2,"tool_calls":1,"answer":"done"}"#;
+    writer
+        .execute(
+            "INSERT INTO harvest_executions VALUES \
+             ('blob-report', ?1, 'COMPLETED', ?2, CAST(?3 AS BLOB), NULL)",
+            rusqlite::params![WORKFLOW_NAME, READABLE_TASK, report],
+        )
+        .expect("the blob report is recorded");
+
+    // The fault these rows carry: the class is blob, and `json_valid` still
+    // answers 1 over it. A `json_valid` guard on its own admits them.
+    let valid = |exec: &str, column: &str| -> (String, i64) {
+        writer
+            .query_row(
+                &format!(
+                    "SELECT typeof({column}), json_valid({column}) \
+                     FROM harvest_executions WHERE exec_id = ?1"
+                ),
+                [exec],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("the class answers")
+    };
+    assert_eq!(
+        valid("blob-task", "input_json"),
+        ("blob".to_string(), 1),
+        "a stored BLOB stays a BLOB, and reads as valid JSON"
+    );
+    assert_eq!(
+        valid("blob-report", "output_json"),
+        ("blob".to_string(), 1),
+        "the report column carries the same fault"
+    );
+    drop(writer);
+
+    let reader = rusqlite::Connection::open(&db).expect("the database opens");
+    let listed = inspect::executions(&reader, WORKFLOW_NAME, None).expect("the listing answers");
+    assert_eq!(listed.len(), 3, "every row is still named");
+    let row = |exec: &str| listed_row(&listed, exec);
+    assert_eq!(
+        row("readable").goal.as_deref(),
+        Some("summarise it"),
+        "a document in the right class still reads"
+    );
+    assert!(
+        row("blob-task").goal.is_none(),
+        "a task the engine cannot read is listed with no goal"
+    );
+    let blob_report = row("blob-report");
+    assert!(
+        blob_report.stop.is_none()
+            && blob_report.answer.is_none()
+            && blob_report.turns.is_none()
+            && blob_report.tool_calls.is_none(),
+        "no field of a report in the wrong class is read: {blob_report:?}"
+    );
+    assert_eq!(
+        blob_report.goal.as_deref(),
+        Some("summarise it"),
+        "the task of that row is in the right class, and is still read"
+    );
+}
+
 /// One listed session, by id.
 fn listed_row<'a>(
     listed: &'a [inspect::SessionSummary],
@@ -4624,6 +4710,128 @@ fn the_reply_search_reads_no_further_than_the_newest_reply() {
         wide.len(),
         4,
         "a wide page reads back to the end of the log: {wide:?}"
+    );
+}
+
+/// One damaged event does not hide a session's whole history.
+///
+/// `json_extract` over a value that is not JSON raises `malformed JSON`, and
+/// that error aborts the STATEMENT, not the row. One unreadable event would
+/// therefore answer `status --history` with an error and name no event at
+/// all. An operator reads the audit trail of a run to learn what the model
+/// did. Hiding all of it over one row is the worst reading.
+///
+/// A second fault hides behind valid JSON: an event of `{"type":7}` extracts
+/// an INTEGER. The byte cast renders it as its digits, so the audit line
+/// would name an event type of `7` that no event carries. `json_type` reads
+/// the type INSIDE the document, and `typeof` on the column cannot.
+///
+/// The guards keep the "one row cannot hide the others" property the listing
+/// already holds. This test asserts it for the history and the replies.
+#[test]
+fn a_damaged_event_does_not_hide_a_history() {
+    let dir = tempfile::tempdir().expect("a temporary directory");
+    let db = dir.path().join("damaged-events.db");
+    let writer = rusqlite::Connection::open(&db).expect("the database opens");
+    writer
+        .execute(
+            "CREATE TABLE harvest_events (exec_id TEXT, seq INTEGER, event_json TEXT, \
+             PRIMARY KEY (exec_id, seq))",
+            [],
+        )
+        .expect("the fixture table is created");
+
+    let readable = json!({
+        "type": "ActivityCompleted",
+        "data": { "output": { "stop_reason": "end_turn", "tool_calls": [] } },
+    })
+    .to_string();
+    // A reply whose row is readable, so the reply page has something to hold.
+    let rows: [(i64, &str); 5] = [
+        (0, readable.as_str()),
+        // Not JSON at all. `json_extract` raises over this row.
+        (1, "not json at all"),
+        // Valid JSON, wrong type. Reading the integer as text raises.
+        (2, r#"{"type":7,"data":{"output":{"stop_reason":"x"}}}"#),
+        // Valid JSON, and text SQLite accepts that Rust cannot read.
+        (3, r#"{"type":"\ud800","data":"d"}"#),
+        // A type that is valid JSON but not a scalar.
+        (4, r#"{"type":{"nested":true},"data":null}"#),
+    ];
+    for (seq, document) in rows {
+        writer
+            .execute(
+                "INSERT INTO harvest_events VALUES ('e', ?1, ?2)",
+                rusqlite::params![seq, document],
+            )
+            .expect("the event is recorded");
+    }
+
+    // The fault each damaged row carries, measured before it is read.
+    let extract = |seq: i64| -> Result<Option<String>, rusqlite::Error> {
+        writer.query_row(
+            "SELECT json_extract(event_json, '$.type') FROM harvest_events WHERE seq = ?1",
+            [seq],
+            |row| row.get(0),
+        )
+    };
+    assert!(
+        extract(1).is_err(),
+        "an unguarded extract over row 1 must fail"
+    );
+    assert!(
+        extract(2).is_err(),
+        "an unguarded extract over row 2 must fail"
+    );
+    assert!(
+        extract(3).is_err(),
+        "an unguarded extract over row 3 must fail"
+    );
+    drop(writer);
+
+    let reader = rusqlite::Connection::open(&db).expect("the database opens");
+    let page = inspect::event_lines(&reader, "e", None, 16).expect("the history still answers");
+    assert_eq!(page.len(), 5, "every event is still named: {page:?}");
+    let label = |seq: i64| -> &str {
+        &page
+            .iter()
+            .find(|line| line.seq == seq)
+            .expect("the event is named")
+            .label
+    };
+    assert_eq!(
+        label(0),
+        "ActivityCompleted",
+        "a readable event still reads"
+    );
+    for seq in [1, 2, 3, 4] {
+        assert_eq!(
+            label(seq),
+            "unknown",
+            "event {seq} carries a type this reader cannot take"
+        );
+    }
+
+    // The reply page is the other statement over the same rows, and the
+    // damaged rows sit NEWER than the reply it must find. Row 2 also holds a
+    // `stop_reason`, so the page counts it as a reply and reads no calls from
+    // it. A damaged reply is still not allowed to hide a readable one.
+    let replies = inspect::reply_calls(&reader, "e", None, 8).expect("the replies still answer");
+    let calls = |seq: i64| {
+        replies
+            .iter()
+            .find(|reply| reply.0 == seq)
+            .map(|reply| &reply.1)
+    };
+    assert_eq!(
+        calls(0),
+        Some(&json!([])),
+        "the readable reply still holds its calls: {replies:?}"
+    );
+    assert_eq!(
+        calls(2),
+        Some(&serde_json::Value::Null),
+        "a reply whose calls cannot be read holds none: {replies:?}"
     );
 }
 
