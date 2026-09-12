@@ -3204,12 +3204,39 @@ fn a_damaged_row_does_not_hide_the_listing() {
             rusqlite::params![WORKFLOW_NAME, READABLE_TASK],
         )
         .expect("the damaged report is recorded");
+    // Valid JSON that says the wrong thing. `json_extract` returns the type
+    // the document holds, and reading an integer as text aborts the whole
+    // statement exactly as a damaged document does.
+    writer
+        .execute(
+            "INSERT INTO harvest_executions \
+             VALUES ('wrong-types', ?1, 'COMPLETED', ?2, ?3, NULL)",
+            rusqlite::params![
+                WORKFLOW_NAME,
+                json!({
+                    "goal": 7,
+                    "max_turns": 4,
+                    "approval_timeout_secs": 300,
+                    "workspace": "/tmp/w",
+                    "model": "offline",
+                })
+                .to_string(),
+                json!({
+                    "stop": 1,
+                    "turns": "many",
+                    "tool_calls": [],
+                    "answer": false,
+                })
+                .to_string(),
+            ],
+        )
+        .expect("the mistyped row is recorded");
     drop(writer);
 
     let reader = rusqlite::Connection::open(&db).expect("the database opens");
     let listed = inspect::executions(&reader, WORKFLOW_NAME, None).expect("the listing answers");
     let named: Vec<&str> = listed.iter().map(|row| row.exec_id.as_str()).collect();
-    for session in ["readable", "damaged-task", "damaged-report"] {
+    for session in ["readable", "damaged-task", "damaged-report", "wrong-types"] {
         assert!(
             named.contains(&session),
             "{session} must still be listed: {named:?}"
@@ -3244,6 +3271,20 @@ fn a_damaged_row_does_not_hide_the_listing() {
         row("damaged-report").goal.as_deref(),
         Some("summarise it"),
         "the task of that row is readable, and is still read"
+    );
+    // Valid JSON of the wrong type reads as nothing, field by field.
+    let mistyped = row("wrong-types");
+    assert!(
+        mistyped.goal.is_none(),
+        "a goal that is not text reads as no goal"
+    );
+    assert!(
+        mistyped.stop.is_none() && mistyped.answer.is_none(),
+        "a stop reason and an answer that are not text read as nothing"
+    );
+    assert!(
+        mistyped.turns.is_none() && mistyped.tool_calls.is_none(),
+        "counts that are not integers read as nothing"
     );
 }
 
@@ -3770,8 +3811,8 @@ fn a_socket_path_no_printed_command_can_carry_is_refused() {
         // refuses would do the damage it exists to prevent.
         let printed = crate::failure(&message);
         assert!(
-            !printed.chars().any(crate::is_obeyed),
-            "the printed refusal must obey nothing: {printed:?}"
+            !printed.chars().any(crate::breaks_one_line),
+            "the printed refusal must obey nothing, and stay on one line: {printed:?}"
         );
     }
 

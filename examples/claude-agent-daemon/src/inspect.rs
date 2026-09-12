@@ -596,19 +596,37 @@ pub fn executions(
     // statement. One damaged row would hide every session in the file,
     // including one waiting for a decision. The guard leaves that row's
     // fields NULL, which the caller already shows as an unreadable task.
+    //
+    // The TYPE is guarded as well, because valid JSON can still say the
+    // wrong thing. A report of `{"stop":1}` is valid, and `json_extract`
+    // returns the integer 1, which fails to read as the text this row
+    // expects. That failure aborts the whole statement exactly as a damaged
+    // document does.
+    //
+    // `typeof` guards the two integers beside `json_type`, and the two catch
+    // different faults. A number too large for a signed 64-bit integer is
+    // still an `integer` to `json_type`, while `json_extract` returns a real.
     let mut statement = conn
         .prepare(
             "SELECT exec_id, state, \
                     CASE WHEN json_valid(input_json) \
+                          AND json_type(input_json, '$.goal') = 'text' \
                          THEN substr(cast(json_extract(input_json, '$.goal') as blob), \
                                      1, ?3) END, \
                     CASE WHEN json_valid(output_json) \
+                          AND json_type(output_json, '$.stop') = 'text' \
                          THEN json_extract(output_json, '$.stop') END, \
                     CASE WHEN json_valid(output_json) \
+                          AND json_type(output_json, '$.turns') = 'integer' \
+                          AND typeof(json_extract(output_json, '$.turns')) = 'integer' \
                          THEN json_extract(output_json, '$.turns') END, \
                     CASE WHEN json_valid(output_json) \
+                          AND json_type(output_json, '$.tool_calls') = 'integer' \
+                          AND typeof(json_extract(output_json, '$.tool_calls')) \
+                              = 'integer' \
                          THEN json_extract(output_json, '$.tool_calls') END, \
                     CASE WHEN json_valid(output_json) \
+                          AND json_type(output_json, '$.answer') = 'text' \
                          THEN substr(cast(json_extract(output_json, '$.answer') as blob), \
                                      1, ?3) END, \
                     substr(cast(error as blob), 1, ?3), \

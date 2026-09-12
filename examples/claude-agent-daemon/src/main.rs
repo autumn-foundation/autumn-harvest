@@ -239,21 +239,26 @@ fn usable_key(raw: &str) -> Option<String> {
 /// Returns an error if the path is not UTF-8, or if it holds a character no
 /// printed command can carry.
 fn printable(socket: &Path) -> Result<(), String> {
+    // The refusal NAMES the path, and a failure leaves through [`visible`],
+    // which keeps the newline and the tab. Those are two of the characters
+    // refused here, so the path is rendered by the ONE-LINE sink instead. A
+    // refusal that split itself into forged lines would do the damage it
+    // exists to refuse.
+    let shown = one_line(&socket.display().to_string()).into_owned();
     let Some(text) = socket.to_str() else {
         return Err(format!(
-            "the socket path {} is not UTF-8. This daemon prints commands that name \
-             the socket, and it cannot print this one. Choose a path of text.",
-            socket.display()
+            "the socket path {shown} is not UTF-8. This daemon prints commands \
+             that name the socket, and it cannot print this one. Choose a path \
+             of text."
         ));
     };
     if let Some(refused) = text.chars().find(|c| breaks_one_line(*c)) {
         return Err(format!(
-            "the socket path {} holds {}, which no command this daemon prints \
-             can carry. Every one of them names the socket on ONE line, and \
-             that character would split the line or be shown as an escape. A \
-             copied command would then name another socket. Choose a path of \
+            "the socket path {shown} holds {}, which no command this daemon \
+             prints can carry. Every one of them names the socket on ONE line, \
+             and that character would split the line or be shown as an escape. \
+             A copied command would then name another socket. Choose a path of \
              ordinary text.",
-            socket.display(),
             refused.escape_unicode()
         ));
     }
