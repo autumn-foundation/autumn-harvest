@@ -1088,11 +1088,28 @@ fn canonical_dsn_key(dsn: &str) -> String {
 /// token. The other two are one-token spellings: the compact
 /// `-csearch_path=value`, and the long-form `--search_path=value`.
 /// `PostgreSQL`'s own server documentation names the long form as an
-/// alternate spelling for any run-time parameter. None allows embedded
-/// whitespace in the value. A quoted value with embedded spaces is not
-/// recognized. Treating an unparsed `options` string as carrying no
-/// `search_path` is the conservative direction here. It only widens
-/// which DSNs compare as different, never the reverse.
+/// alternate spelling for any run-time parameter. A quoted value with
+/// embedded spaces is not recognized. Treating an unparsed `options`
+/// string as carrying no `search_path` is the conservative direction
+/// here. It only widens which DSNs compare as different, never the
+/// reverse.
+///
+/// Splitting honors libpq's own escaping rule for `options` (issue
+/// #1266). A backslash before a space embeds a literal space in the
+/// current argument rather than ending it. `\\` embeds a literal
+/// backslash. Splitting on bare whitespace instead can truncate a value
+/// at an escaped space. A truncated value can then differ from an
+/// alias's untruncated one even when both name the same effective
+/// schema. That is exactly the false difference this key must not
+/// create, since it stops two aliases of one physical pool from being
+/// combined.
+///
+/// The extracted value is then normalized the way `PostgreSQL` itself
+/// parses a schema list: comma-separated, with insignificant whitespace
+/// around each name. `tenant,public` and `tenant, public` name the same
+/// search path, so they must compare equal here too. A double-quoted
+/// schema name is not specially handled; trimming only surrounding
+/// whitespace never touches whitespace a quoted name encloses.
 ///
 /// `options` can repeat `-c search_path=...` more than once. libpq
 /// applies each as a `SET` in order at session start, so only the last
@@ -1102,20 +1119,68 @@ fn canonical_dsn_key(dsn: &str) -> String {
 /// as it scans, so the last match wins, matching what the server does.
 #[cfg(feature = "db")]
 fn extract_search_path(options: &str) -> Option<String> {
-    let mut tokens = options.split_whitespace();
+    let mut tokens = split_options_preserving_escapes(options).into_iter();
     let mut search_path = None;
     while let Some(tok) = tokens.next() {
         if tok == "-c" {
-            if let Some(value) = tokens.next().and_then(|kv| kv.strip_prefix("search_path=")) {
-                search_path = Some(value.to_string());
+            if let Some(value) = tokens
+                .next()
+                .and_then(|kv| kv.strip_prefix("search_path=").map(str::to_string))
+            {
+                search_path = Some(normalize_search_path(&value));
             }
         } else if let Some(value) = tok.strip_prefix("-csearch_path=") {
-            search_path = Some(value.to_string());
+            search_path = Some(normalize_search_path(value));
         } else if let Some(value) = tok.strip_prefix("--search_path=") {
-            search_path = Some(value.to_string());
+            search_path = Some(normalize_search_path(value));
         }
     }
     search_path
+}
+
+/// Splits a libpq `options` string into arguments, honoring its
+/// documented escaping (issue #1266). `\ ` embeds a literal space in
+/// the current argument instead of ending it. `\\` embeds a literal
+/// backslash. Naive whitespace splitting would end an argument at an
+/// escaped space, corrupting any value that contains one.
+#[cfg(feature = "db")]
+fn split_options_preserving_escapes(options: &str) -> Vec<String> {
+    let mut tokens = Vec::new();
+    let mut current = String::new();
+    let mut has_token = false;
+    let mut chars = options.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '\\' && matches!(chars.peek(), Some(' ' | '\\')) {
+            current.push(chars.next().expect("peeked Some above"));
+            has_token = true;
+        } else if c.is_whitespace() {
+            if has_token {
+                tokens.push(std::mem::take(&mut current));
+                has_token = false;
+            }
+        } else {
+            current.push(c);
+            has_token = true;
+        }
+    }
+    if has_token {
+        tokens.push(current);
+    }
+    tokens
+}
+
+/// Normalizes a `search_path` value the way `PostgreSQL`'s own schema-list
+/// parser does (issue #1266): names are comma-separated, and whitespace
+/// around each name is not significant. `tenant,public` and
+/// `tenant, public` must compare equal, since a session resolves both
+/// to the identical schema list.
+#[cfg(feature = "db")]
+fn normalize_search_path(value: &str) -> String {
+    value
+        .split(',')
+        .map(str::trim)
+        .collect::<Vec<_>>()
+        .join(",")
 }
 
 #[cfg(feature = "db")]
@@ -2522,6 +2587,37 @@ mod tests {
             2,
             "the long-form `--search_path=` spelling must select a schema \
              just as `-c search_path=` does, so these must never collapse"
+        );
+    }
+
+    #[cfg(feature = "db")]
+    #[test]
+    fn from_dsns_groups_dsns_whose_search_path_differs_only_by_an_escaped_space() {
+        let sharded = ShardedDbPool::from_dsns(
+            [
+                (
+                    ShardId::new(0),
+                    "postgres://db.example/shared?options=-c%20search_path%3Dtenant%2Cpublic"
+                        .to_string(),
+                ),
+                (
+                    ShardId::new(1),
+                    "postgres://db.example/shared?options=-c%20search_path%3Dtenant%2C%5C%20public"
+                        .to_string(),
+                ),
+            ],
+            ShardId::new(0),
+            1,
+        )
+        .expect("pool builds without connecting");
+
+        let groups = sharded.pool_groups();
+        assert_eq!(
+            groups.len(),
+            1,
+            "an escaped space in one alias's search_path value must not \
+             stop it from collapsing with the other: PostgreSQL treats \
+             `tenant,public` and `tenant, public` as the same schema list"
         );
     }
 

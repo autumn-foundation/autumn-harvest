@@ -351,7 +351,14 @@ shard records:
   which schema a query resolves against — two DSNs differing only there
   must stay in separate groups, and two DSNs whose last `search_path`
   setting agrees must stay in one even if an earlier, overridden setting
-  differs.
+  differs. Splitting `options` into arguments honors libpq's own
+  escaping: a backslash before a space embeds a literal space in the
+  current argument instead of ending it, so a `search_path` value is not
+  truncated at an escaped space. The extracted value is then normalized
+  the way Postgres itself parses a schema list — comma-separated, with
+  insignificant whitespace around each name — so `tenant,public` and
+  `tenant, public` compare equal, exactly as two sessions setting either
+  one resolve to the same schema.
   Every other query parameter (`application_name`, `sslmode`, and so on)
   is dropped, since none of them changes which relation a query resolves
   against — except `host`, `hostaddr`, and `port`: a Unix-socket DSN

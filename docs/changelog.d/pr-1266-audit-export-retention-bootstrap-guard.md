@@ -417,6 +417,27 @@ information this guard does not have -- and guessing wrong risks the
 dangerous direction, treating a shard's own still-live export as finished.
 See `docs/audit-export.md` for the operator-facing note.
 
+A sixteenth review round (P1) found that `extract_search_path` split
+`options` on bare whitespace, ignoring libpq's own escaping rule: a
+backslash before a space embeds a literal space in the current argument
+rather than ending it. A `search_path` value containing an escaped
+space was truncated at that space, so two aliases of one physical pool
+whose sessions resolve to the identical schema list (`tenant,public`
+and `tenant, public`, the latter written with an escaped space) could
+extract different, truncated values and be split into separate pool
+groups -- exactly the under-merging this key exists to prevent, and the
+dangerous direction: an unprotected purge on one alias could then delete
+rows a still-protected alias has not exported. `extract_search_path` now
+splits `options` with an escape-aware tokenizer
+(`split_options_preserving_escapes`), and normalizes the extracted value
+the way Postgres's own schema-list parser does -- comma-separated, with
+insignificant whitespace around each name -- so the two values above
+compare equal. A double-quoted schema name is not specially handled;
+normalization only trims surrounding whitespace, so it never touches
+whitespace a quoted name encloses.
+`from_dsns_groups_dsns_whose_search_path_differs_only_by_an_escaped_space`
+pins this.
+
 **Zero migration, zero engine impact beyond the new parameter.** No new
 `WorkflowEvent` variant, no schema change, no change to any existing call
 site's behavior when the new flag is left at its default (disabled).
