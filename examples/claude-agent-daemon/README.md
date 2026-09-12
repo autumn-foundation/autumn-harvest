@@ -166,14 +166,15 @@ daemon refuses to start in that layout, and names the flags to change. The
 defaults already meet the rule: `agentd.db` in the current directory, and
 `--workspace agent-workspace` beside it rather than around it.
 
-**A workspace path must be printable.** The daemon prints a `--workspace`
-command when a session belongs to another workspace, and that command is made
-to be copied. A path holding a newline, a tab, or any other character a
-terminal acts on cannot survive that round trip: the newline splits the line,
-the tab renders as spaces, and every other one is shown as an escape, so a
-copied command would name a path nobody recorded. Quoting does not help — the
-fault is the rendering, not the argument — so such a path is refused at
-startup, where the `--socket` path already is.
+**A recorded name must be printable.** The daemon prints a `--workspace` or
+`--model` command when a session belongs to another workspace or model, and
+that command is made to be copied. A value holding a newline, a tab, or any
+other character a terminal acts on cannot survive that round trip: the newline
+splits the line, the tab renders as spaces, and every other one is shown as an
+escape, so a copied command would name something nobody recorded. Quoting does
+not help — the fault is the rendering, not the argument — so such a value is
+refused at startup, where the `--socket` path already is. A value that merely
+needs quoting is accepted: `--workspace '/my project'` is ordinary.
 
 **The database is owner-only too.** It holds every prompt, tool input, and tool
 result, including the content of each file the agent read — so a new database

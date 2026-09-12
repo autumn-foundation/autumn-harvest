@@ -1072,20 +1072,27 @@ fn summary_view(
         (None, None, None, None) => None,
         _ => Some("<unreadable report>".to_string()),
     };
-    let state = row
-        .exec_id
-        .parse::<ExecutionId>()
-        .ok()
+    // A row whose id cannot be read is still LISTED. An operator can see
+    // that the row exists, which a silent omission would deny them. No
+    // follow-up command can name it, because it holds no id to name. The
+    // reads below are given an id that parses as nothing, so the row shows
+    // no pending call rather than another session's.
+    let exec_id = row.exec_id.as_deref();
+    let state = exec_id
+        .and_then(|id| id.parse::<ExecutionId>().ok())
         .and_then(|exec| blocked.get(&exec));
-    let (pending, blocked_on) = decidable(reader, &row.exec_id, state, full);
+    let (pending, blocked_on) = decidable(reader, exec_id.unwrap_or_default(), state, full);
 
     SessionView {
-        execution_id: row.exec_id.clone(),
+        execution_id: exec_id.map_or_else(|| "<unreadable id>".to_string(), shortened),
         goal: row
             .goal
             .as_deref()
             .map_or_else(|| "<unreadable task>".to_string(), shortened),
-        state: row.state.clone(),
+        state: row
+            .state
+            .as_deref()
+            .map_or_else(|| "<unreadable state>".to_string(), shortened),
         blocked_on,
         pending,
         answer,

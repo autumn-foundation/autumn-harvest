@@ -105,6 +105,22 @@ impl ModelConfig {
                     .to_string(),
             );
         }
+        // A session records this name, and a daemon started on another model
+        // prints a `--model` command to resume it. That command is made to be
+        // copied, so the name must survive being printed. The same check
+        // guards the socket path and the workspace path.
+        // The TRIM does not cover this. It removes the whitespace at the
+        // ends, and an interior tab or newline stays.
+        if let Some(refused) = crate::unprintable(&model) {
+            return Err(format!(
+                "the model name {} holds {}, which no command this daemon \
+                 prints can carry. A session recorded against another model \
+                 is refused with the command that resumes it, and that \
+                 command names the model on ONE line. Name a real model.",
+                crate::one_line(&model),
+                refused.escape_unicode()
+            ));
+        }
         if let Some(message) = header_refusal(api_key.as_deref()) {
             return Err(message);
         }

@@ -83,8 +83,11 @@ pub struct ExecutionRow {
 /// session the operator asked about.
 #[derive(Debug)]
 pub struct SessionSummary {
-    pub exec_id: String,
-    pub state: String,
+    /// The session's id, or `None` when the row does not hold one this
+    /// daemon can read. An id is what every follow-up command names, so a
+    /// row without one can be SEEN and cannot be acted on.
+    pub exec_id: Option<String>,
+    pub state: Option<String>,
     /// `None` when the recorded task cannot be read.
     pub goal: Option<String>,
     pub stop: Option<String>,
@@ -671,7 +674,13 @@ fn cut_text(bytes: Option<Vec<u8>>, chars: u32, budget: u32) -> Option<String> {
 }
 
 /// One page of the sessions a listing names, newest first. See [`no_cursor`].
-pub const SESSIONS_QUERY: &str = "SELECT exec_id, state, \
+pub const SESSIONS_QUERY: &str = "SELECT \
+                    CASE WHEN typeof(exec_id) = 'text' \
+                         THEN coalesce(substr(cast(exec_id as blob), 1, ?3), \
+                                       zeroblob(0)) END, \
+                    CASE WHEN typeof(state) = 'text' \
+                         THEN coalesce(substr(cast(state as blob), 1, ?3), \
+                                       zeroblob(0)) END, \
                     CASE WHEN typeof(input_json) = 'text' AND json_valid(input_json) \
                           AND json_type(input_json, '$.goal') = 'text' \
                          THEN coalesce(substr(cast(json_extract(input_json, '$.goal') \
@@ -776,8 +785,8 @@ pub fn executions(
             ],
             |row| {
                 Ok(SessionSummary {
-                    exec_id: row.get(0)?,
-                    state: row.get(1)?,
+                    exec_id: cut_text(row.get(0)?, LISTED_READ_CHARS, MAX_LISTED_BYTES),
+                    state: cut_text(row.get(1)?, LISTED_READ_CHARS, MAX_LISTED_BYTES),
                     goal: cut_text(row.get(2)?, LISTED_READ_CHARS, MAX_LISTED_BYTES),
                     stop: cut_text(row.get(3)?, LISTED_READ_CHARS, MAX_LISTED_BYTES),
                     turns: row.get(4)?,

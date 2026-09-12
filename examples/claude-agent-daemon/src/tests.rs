@@ -1143,7 +1143,7 @@ fn a_long_history_does_not_make_one_unbounded_listing() {
     let last = listed.last().expect("the listing is not empty");
     assert_eq!(
         last.exec_id,
-        format!("exec-{:04}", rows - 1),
+        Some(format!("exec-{:04}", rows - 1)),
         "the newest session must be in the listing"
     );
 }
@@ -3996,6 +3996,148 @@ fn an_unreadable_answer_is_not_shown_as_an_empty_one() {
     );
 }
 
+/// A damaged identity does not hide every other session.
+///
+/// `exec_id` and `state` were read straight into a `String`, so one row in
+/// the wrong storage class aborted the WHOLE listing with `Invalid column
+/// type Blob at index: 0`. Every readable session then disappeared, which is
+/// the fault the payload projections beside them already refused.
+///
+/// A row with no readable id is still LISTED. An operator can see that it
+/// exists, and no command can name it, because it holds no id to name.
+/// Hiding it would deny them both.
+#[test]
+fn a_damaged_identity_does_not_hide_every_session() {
+    let dir = tempfile::tempdir().expect("a temporary directory");
+    let db = dir.path().join("identity.db");
+    let writer = rusqlite::Connection::open(&db).expect("the database opens");
+    fixture_table(&writer);
+    record_task(&writer, "readable", READABLE_TASK);
+    writer
+        .execute(
+            "INSERT INTO harvest_executions \
+             VALUES (CAST('blob-id' AS BLOB), ?1, 'RUNNING', ?2, NULL, NULL)",
+            rusqlite::params![WORKFLOW_NAME, READABLE_TASK],
+        )
+        .expect("the blob id is recorded");
+    writer
+        .execute(
+            "INSERT INTO harvest_executions VALUES ('num-state', ?1, 7, ?2, NULL, NULL)",
+            rusqlite::params![WORKFLOW_NAME, READABLE_TASK],
+        )
+        .expect("the numeric state is recorded");
+
+    // The class each damaged row carries, measured before it is read. A TEXT
+    // column keeps a stored BLOB, and affinity turns a stored integer into
+    // text, so only the id is in the wrong class here.
+    let class = |column: &str, exec: &str| -> String {
+        writer
+            .query_row(
+                &format!("SELECT typeof({column}) FROM harvest_executions WHERE rowid = ?1"),
+                [exec],
+                |row| row.get(0),
+            )
+            .expect("the class answers")
+    };
+    assert_eq!(
+        class("exec_id", "2"),
+        "blob",
+        "the second row holds a BLOB id"
+    );
+    assert_eq!(
+        class("state", "3"),
+        "text",
+        "affinity converts a stored integer, so that row is readable"
+    );
+    drop(writer);
+
+    let reader = inspect::open(&db).expect("the reader opens");
+    let listed = inspect::executions(&reader, WORKFLOW_NAME, None).expect("the listing answers");
+    assert_eq!(listed.len(), 3, "every row is still named");
+    assert_eq!(
+        listed_row(&listed, "readable").goal.as_deref(),
+        Some("summarise it"),
+        "a readable session still reads"
+    );
+
+    // The damaged row is present, and its id reads as nothing.
+    let damaged = listed
+        .iter()
+        .find(|row| row.exec_id.is_none())
+        .expect("the damaged row is listed");
+    assert!(
+        damaged.goal.is_some(),
+        "the readable fields of that row are still read: {damaged:?}"
+    );
+
+    // The rendering NAMES it rather than dropping it, and offers no call on
+    // it: nothing could name that session to approve or deny.
+    let (views, _, _) = daemon::sessions(&reader, &daemon::Parked::new(), false, None)
+        .expect("the listing renders");
+    assert_eq!(views.len(), 3, "every row is still shown");
+    let shown = views
+        .iter()
+        .find(|view| view.execution_id == "<unreadable id>")
+        .expect("the damaged row is shown");
+    assert!(
+        shown.pending.is_none(),
+        "no decision is offered on a session nothing can name"
+    );
+}
+
+/// A model name a printed command cannot carry is refused.
+///
+/// A session records the model it runs on, and a daemon started on another
+/// model prints a `--model` command to resume it. Quoting made that command
+/// one shell word, and it cannot make a character visible. This is the check
+/// the workspace path already carries, applied to the twin I missed.
+///
+/// The TRIM does not reach this. It removes the whitespace at the ENDS, so an
+/// interior tab or newline passed straight through it.
+#[test]
+fn a_model_no_printed_command_can_carry_is_refused() {
+    for name in ["claude\ropus", "claude\topus", "claude\nopus"] {
+        let (_, signal) = crate::shutdown::channel();
+        let refused = claude::ModelConfig::new(
+            Some("sk-ant-example".to_string()),
+            name,
+            claude::DEFAULT_MAX_TOKENS,
+            signal,
+        )
+        .err()
+        .expect("the model name must be refused");
+        assert!(
+            refused.contains("no command this daemon prints can carry"),
+            "unexpected message for {name:?}: {refused}"
+        );
+        // The refusal names the model on ONE line, which is the property it
+        // exists to protect.
+        assert_eq!(
+            crate::failure(&refused).lines().count(),
+            1,
+            "the refusal itself must stay on one line: {refused}"
+        );
+    }
+
+    // A name that only needs QUOTING is still accepted, and is recorded
+    // verbatim after the trim.
+    for name in ["claude-opus-5", " claude-opus-5\n", "my model"] {
+        let (_, signal) = crate::shutdown::channel();
+        let config = claude::ModelConfig::new(
+            Some("sk-ant-example".to_string()),
+            name,
+            claude::DEFAULT_MAX_TOKENS,
+            signal,
+        )
+        .expect("an ordinary model name must be accepted");
+        assert_eq!(
+            config.identity(),
+            name.trim(),
+            "the recorded identity is the trimmed name"
+        );
+    }
+}
+
 /// One listed session, by id.
 fn listed_row<'a>(
     listed: &'a [inspect::SessionSummary],
@@ -4003,7 +4145,7 @@ fn listed_row<'a>(
 ) -> &'a inspect::SessionSummary {
     listed
         .iter()
-        .find(|row| row.exec_id == exec)
+        .find(|row| row.exec_id.as_deref() == Some(exec))
         .expect("the session is listed")
 }
 
@@ -4862,7 +5004,8 @@ fn a_listing_walks_back_through_its_cursor() {
     let all = inspect::executions(&reader, WORKFLOW_NAME, None).expect("the listing reads");
     assert_eq!(all.len(), 5, "the fixture holds five sessions");
     assert_eq!(
-        all[0].exec_id, "exec-0",
+        all[0].exec_id.as_deref(),
+        Some("exec-0"),
         "the listing reads oldest first: {:?}",
         all[0].exec_id
     );
@@ -4871,7 +5014,10 @@ fn a_listing_walks_back_through_its_cursor() {
     // nothing newer.
     let cursor = all[2].row;
     let older = inspect::executions(&reader, WORKFLOW_NAME, Some(cursor)).expect("the page reads");
-    let named: Vec<&str> = older.iter().map(|row| row.exec_id.as_str()).collect();
+    let named: Vec<&str> = older
+        .iter()
+        .map(|row| row.exec_id.as_deref().unwrap_or_default())
+        .collect();
     assert_eq!(
         named,
         vec!["exec-0", "exec-1"],
@@ -4948,8 +5094,9 @@ fn a_full_page_carries_its_cursor() {
         "the cursor must reach the one session this page omitted"
     );
     assert_eq!(
-        before[0].exec_id, "exec-0",
-        "the omitted session is the oldest one: {}",
+        before[0].exec_id.as_deref(),
+        Some("exec-0"),
+        "the omitted session is the oldest one: {:?}",
         before[0].exec_id
     );
 }
