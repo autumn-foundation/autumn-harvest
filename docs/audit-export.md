@@ -299,6 +299,13 @@ shard records:
   accidentally strips shard B's protection just because they share a
   database. No operator action is needed for this case.
 
+  Detection covers both ways a fleet builds a `ShardedDbPool`.
+  `ShardedDbPool::from_map` can receive one cloned `Pool` under two shard
+  IDs; the sweep groups these by pool identity. `ShardedDbPool::from_dsns`
+  builds a separate `Pool` per entry even for two identical connection
+  strings, so identity alone cannot see the alias; the sweep groups these
+  by the DSN string instead, before it is consumed into a pool.
+
   The remaining cost is operational, not architectural: an operator must
   remember to set the flag on every process, including ones added later.
   Forgetting it only reopens the original bootstrap window; it never causes

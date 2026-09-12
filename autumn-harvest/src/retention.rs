@@ -1647,12 +1647,11 @@ impl Drop for RetentionLeaseGuard {
     }
 }
 
-/// Group shards by underlying pool identity, and compute each group's
-/// combined `protect_unexported_audit` decision (issue #1266).
+/// Compute each pool group's combined `protect_unexported_audit` decision
+/// (issue #1266).
 ///
-/// Two logical shards may alias one physical pool. `ShardedDbPool::from_map`
-/// supports this. A pre-split staging deployment inserts clones of one pool
-/// under more than one `ShardId`.
+/// Two logical shards may share one physical pool. See
+/// `ShardedDbPool::pool_groups` for how that is detected.
 ///
 /// `purge_old_audit_records` issues one unscoped `DELETE` per call. It
 /// relies on the connection alone to identify which shard it purges.
@@ -1661,31 +1660,17 @@ impl Drop for RetentionLeaseGuard {
 /// audit table, within one tick. A less protective decision would commit
 /// before a more protective one ever ran.
 ///
-/// This groups shards by pool identity first. It then combines each
-/// group's decision with `any`. That decision is `true` when any aliased
-/// shard wants protection. Each physical pool is purged once per tick.
-/// That one decision already accounts for every shard sharing it.
-///
-/// Two `Pool` values are the same physical pool exactly when they are
-/// clones of one `Arc`. `Pool::manager()` returns a reference into that
-/// shared allocation, so `ptr::eq` on it detects aliasing without needing
-/// any private field or unsafe code.
+/// Combining each group's decision with `any` avoids that. The combined
+/// decision is `true` when any aliased shard wants protection. Each
+/// physical pool is purged once per tick with that one decision, already
+/// accounting for every shard sharing it.
 #[cfg(feature = "db")]
 fn group_shards_by_pool<'a>(
     pools: &'a ShardedDbPool,
     config: &RetentionConfig,
 ) -> Vec<(&'a crate::worker::DbPool, bool)> {
-    let mut groups: Vec<(&crate::worker::DbPool, Vec<ShardId>)> = Vec::new();
-    for (shard, pool) in pools.iter_shards() {
-        match groups
-            .iter_mut()
-            .find(|(existing, _)| std::ptr::eq(existing.manager(), pool.manager()))
-        {
-            Some((_, shards)) => shards.push(shard),
-            None => groups.push((pool, vec![shard])),
-        }
-    }
-    groups
+    pools
+        .pool_groups()
         .into_iter()
         .map(|(pool, shards)| {
             let protect = shards

@@ -65,6 +65,16 @@ combines each group's decision with `any`: protect the shared pool
 whenever any aliased shard wants protection. This also purges each
 physical pool exactly once per tick instead of once per logical shard.
 
+A fifth review round (P1) found the fourth round's fix incomplete:
+`ShardedDbPool::from_dsns` builds a separate `Pool` object per shard entry
+even when two entries carry the same DSN, so `ptr::eq` on `Pool::manager()`
+never sees the alias. `ShardedDbPool` now records each shard's pool-group
+number at construction time and exposes it via `pool_groups()`.
+`from_map` still groups by `Pool::manager()` identity. `from_dsns` groups
+by the DSN string instead, compared before each string is consumed into a
+manager. The retention sweep's own grouping logic moved into
+`ShardedDbPool::pool_groups()`, so both callers share one grouping.
+
 New tests:
 - `retention_protects_unexported_audit_when_configured_with_no_cursor_and_no_local_sink`
   reproduces the exact bootstrap window (no cursor row anywhere, no sink in
@@ -83,6 +93,13 @@ New tests:
   `excluding_a_shard_while_disabled_changes_nothing` pin the per-shard
   exemption: excluding shard 0 never touches shard 1's protection, and
   excluding a shard while the flag is off entirely is a no-op.
+- `from_map_groups_cloned_pools_together` pins the fourth round's fix at
+  its new home in `shard.rs`. `from_dsns_groups_shards_sharing_one_dsn`
+  pins the fifth round's fix: two shards built from one DSN string
+  through `from_dsns` still collapse to one group, even though `from_dsns`
+  built them as two distinct `Pool` objects.
+  `from_dsns_keeps_distinct_dsns_separate` confirms two different DSNs
+  never collapse.
 
 **Zero migration, zero engine impact beyond the new parameter.** No new
 `WorkflowEvent` variant, no schema change, no change to any existing call

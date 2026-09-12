@@ -910,6 +910,40 @@ fn rendezvous_hash(shard: ShardId, primary: &str, secondary: &str) -> u64 {
 pub struct ShardedDbPool {
     pools: BTreeMap<ShardId, DbPool>,
     default_shard: ShardId,
+    /// Which shards share one physical pool (issue #1266). Shards with the
+    /// same group number are the same physical database. A group number
+    /// is otherwise opaque. It has no meaning across two `ShardedDbPool`
+    /// instances. See `pool_groups`.
+    pool_group: BTreeMap<ShardId, u32>,
+}
+
+/// Group shards by underlying pool identity (issue #1266).
+///
+/// Two `Pool` values are the same physical pool exactly when they are
+/// clones of one `Arc`. `Pool::manager()` returns a reference into that
+/// shared allocation, so `ptr::eq` on it detects aliasing safely, with no
+/// private field or unsafe code.
+///
+/// This is the right signal for `from_map`, whose caller may hand in
+/// clones of one pool under two shard ids. It cannot see through two
+/// independently built pools that merely share a connection string.
+/// `from_dsns` computes its own grouping for that case instead. It
+/// compares the DSNs directly, before they are ever built into a pool.
+#[cfg(feature = "db")]
+fn group_by_pool_identity(pools: &BTreeMap<ShardId, DbPool>) -> BTreeMap<ShardId, u32> {
+    let mut representatives: Vec<&DbPool> = Vec::new();
+    let mut groups = BTreeMap::new();
+    for (shard, pool) in pools {
+        let group = representatives
+            .iter()
+            .position(|existing| std::ptr::eq(existing.manager(), pool.manager()))
+            .unwrap_or_else(|| {
+                representatives.push(pool);
+                representatives.len() - 1
+            });
+        groups.insert(*shard, u32::try_from(group).unwrap_or(u32::MAX));
+    }
+    groups
 }
 
 #[cfg(feature = "db")]
@@ -976,6 +1010,7 @@ impl ShardedDbPool {
         let this = Self {
             pools,
             default_shard: shard,
+            pool_group: BTreeMap::from([(shard, 0)]),
         };
         if let Ok(mut lock) = GLOBAL_SHARDED_POOL.write() {
             *lock = Some(this.clone());
@@ -998,14 +1033,40 @@ impl ShardedDbPool {
             pools.contains_key(&default_shard),
             "default_shard {default_shard} has no configured pool"
         );
+        let pool_group = group_by_pool_identity(&pools);
         let this = Self {
             pools,
             default_shard,
+            pool_group,
         };
         if let Ok(mut lock) = GLOBAL_SHARDED_POOL.write() {
             *lock = Some(this.clone());
         }
         this
+    }
+
+    /// Every shard, grouped by underlying physical pool (issue #1266).
+    ///
+    /// `from_map` detects a shared pool by object identity — aliased
+    /// clones, the shape a pre-split staging deployment uses. `from_dsns`
+    /// detects it by comparing connection strings directly, since it
+    /// builds a fresh pool per entry even for two identical DSNs.
+    #[must_use]
+    pub fn pool_groups(&self) -> Vec<(&DbPool, Vec<ShardId>)> {
+        let mut by_group: BTreeMap<u32, Vec<ShardId>> = BTreeMap::new();
+        for (shard, group) in &self.pool_group {
+            by_group.entry(*group).or_default().push(*shard);
+        }
+        by_group
+            .into_values()
+            .map(|shards| {
+                let pool = self
+                    .pools
+                    .get(&shards[0])
+                    .expect("pool_group only names shards with a pool");
+                (pool, shards)
+            })
+            .collect()
     }
 
     /// The default shard used when an `ExecutionId` carries the unencoded
@@ -1115,7 +1176,22 @@ impl ShardedDbPool {
         max_size: usize,
     ) -> crate::error::HarvestResult<Self> {
         let mut pools = BTreeMap::new();
+        // A fresh `Pool` is built per entry here, even for two identical
+        // DSNs (issue #1266). `group_by_pool_identity` could never see
+        // through that, so the DSN itself is the grouping key, compared
+        // before it is consumed into a manager.
+        let mut seen_dsns: Vec<String> = Vec::new();
+        let mut pool_group = BTreeMap::new();
         for (shard, dsn) in entries {
+            let group = seen_dsns
+                .iter()
+                .position(|seen| *seen == dsn)
+                .unwrap_or_else(|| {
+                    seen_dsns.push(dsn.clone());
+                    seen_dsns.len() - 1
+                });
+            pool_group.insert(shard, u32::try_from(group).unwrap_or(u32::MAX));
+
             let manager = diesel_async::pooled_connection::AsyncDieselConnectionManager::<
                 diesel_async::AsyncPgConnection,
             >::new(dsn);
@@ -1129,7 +1205,12 @@ impl ShardedDbPool {
                 })?;
             pools.insert(shard, pool);
         }
-        Ok(Self::from_map(pools, default_shard))
+        let mut this = Self::from_map(pools, default_shard);
+        this.pool_group = pool_group;
+        if let Ok(mut lock) = GLOBAL_SHARDED_POOL.write() {
+            *lock = Some(this.clone());
+        }
+        Ok(this)
     }
 
     /// Resolve the pool that owns a given `ExecutionId`.
@@ -1726,6 +1807,91 @@ mod tests {
     #[should_panic(expected = "residency key")]
     fn residency_map_with_a_blank_key_panics_at_construction() {
         let _ = router_with(&[0, 1]).with_residency_map([(String::new(), ShardId::new(1))]);
+    }
+
+    // Building a `Pool` never connects, so these need no live database.
+    #[cfg(feature = "db")]
+    fn test_pool() -> DbPool {
+        let manager = diesel_async::pooled_connection::AsyncDieselConnectionManager::<
+            diesel_async::AsyncPgConnection,
+        >::new("postgres://unused/db");
+        DbPool::builder(manager)
+            .max_size(1)
+            .build()
+            .expect("pool builds without connecting")
+    }
+
+    // `from_map` sees a shared pool by object identity: two shard ids
+    // backed by clones of one `Pool` must land in one group (issue #1266).
+    #[cfg(feature = "db")]
+    #[test]
+    fn from_map_groups_cloned_pools_together() {
+        let pool = test_pool();
+        let mut pools = BTreeMap::new();
+        pools.insert(ShardId::new(0), pool.clone());
+        pools.insert(ShardId::new(1), pool.clone());
+        let sharded = ShardedDbPool::from_map(pools, ShardId::new(0));
+
+        let groups = sharded.pool_groups();
+        assert_eq!(
+            groups.len(),
+            1,
+            "two clones of one pool must collapse to one group"
+        );
+        let mut shards = groups[0].1.clone();
+        shards.sort();
+        assert_eq!(shards, vec![ShardId::new(0), ShardId::new(1)]);
+    }
+
+    // `from_dsns` builds a fresh `Pool` per entry, even for one DSN reused
+    // across two shard ids. Object identity alone would report these as
+    // unrelated. The DSN itself must still group them (issue #1266).
+    #[cfg(feature = "db")]
+    #[test]
+    fn from_dsns_groups_shards_sharing_one_dsn() {
+        let sharded = ShardedDbPool::from_dsns(
+            [
+                (ShardId::new(0), "postgres://unused/shared".to_string()),
+                (ShardId::new(1), "postgres://unused/shared".to_string()),
+            ],
+            ShardId::new(0),
+            1,
+        )
+        .expect("pool builds without connecting");
+
+        let groups = sharded.pool_groups();
+        assert_eq!(
+            groups.len(),
+            1,
+            "two shards on the same DSN must collapse to one group, even \
+             though from_dsns built them as two separate Pool objects"
+        );
+        let mut shards = groups[0].1.clone();
+        shards.sort();
+        assert_eq!(shards, vec![ShardId::new(0), ShardId::new(1)]);
+    }
+
+    // Two shards on genuinely different DSNs must never be combined
+    // (issue #1266).
+    #[cfg(feature = "db")]
+    #[test]
+    fn from_dsns_keeps_distinct_dsns_separate() {
+        let sharded = ShardedDbPool::from_dsns(
+            [
+                (ShardId::new(0), "postgres://unused/db-a".to_string()),
+                (ShardId::new(1), "postgres://unused/db-b".to_string()),
+            ],
+            ShardId::new(0),
+            1,
+        )
+        .expect("pool builds without connecting");
+
+        let groups = sharded.pool_groups();
+        assert_eq!(
+            groups.len(),
+            2,
+            "two different DSNs must never collapse into one group"
+        );
     }
 }
 
