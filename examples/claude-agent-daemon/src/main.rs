@@ -36,7 +36,7 @@ mod tools;
 mod tests;
 
 use std::fmt::Write as _;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::Duration;
 
@@ -44,6 +44,12 @@ use clap::{Parser, Subcommand};
 use tracing_subscriber::EnvFilter;
 
 use crate::protocol::{Request, Response, SessionView};
+
+/// The socket a command uses when the operator names none.
+///
+/// The printed `approve` line carries `--socket` only when the operator chose
+/// another one, so the common case stays short.
+const DEFAULT_SOCKET: &str = "agentd.sock";
 
 /// The durable Claude agent daemon.
 #[derive(Parser)]
@@ -61,7 +67,7 @@ struct Cli {
         long,
         global = true,
         env = "AGENTD_SOCKET",
-        default_value = "agentd.sock"
+        default_value = DEFAULT_SOCKET
     )]
     socket: PathBuf,
     #[command(subcommand)]
@@ -224,14 +230,20 @@ async fn run(cli: Cli) -> Result<(), String> {
                 },
             )
             .await?,
+            &cli.socket,
         ),
-        Command::Status { execution_id, full } => {
-            report(protocol::call(&cli.socket, &Request::Status { execution_id, full }).await?)
-        }
-        Command::List => report(protocol::call(&cli.socket, &Request::List).await?),
-        Command::History { execution_id } => {
-            report(protocol::call(&cli.socket, &Request::History { execution_id }).await?)
-        }
+        Command::Status { execution_id, full } => report(
+            protocol::call(&cli.socket, &Request::Status { execution_id, full }).await?,
+            &cli.socket,
+        ),
+        Command::List => report(
+            protocol::call(&cli.socket, &Request::List).await?,
+            &cli.socket,
+        ),
+        Command::History { execution_id } => report(
+            protocol::call(&cli.socket, &Request::History { execution_id }).await?,
+            &cli.socket,
+        ),
         Command::Approve {
             execution_id,
             token,
@@ -247,6 +259,7 @@ async fn run(cli: Cli) -> Result<(), String> {
                 },
             )
             .await?,
+            &cli.socket,
         ),
         Command::Deny {
             execution_id,
@@ -263,6 +276,7 @@ async fn run(cli: Cli) -> Result<(), String> {
                 },
             )
             .await?,
+            &cli.socket,
         ),
     }
 }
@@ -277,6 +291,37 @@ async fn run(cli: Cli) -> Result<(), String> {
 fn line(text: &str) {
     use std::io::Write;
     drop(writeln!(std::io::stdout(), "{}", visible(text)));
+}
+
+/// The `--socket` the printed command needs, or nothing.
+///
+/// `status` reaches the daemon the operator named, and the command it prints
+/// must reach the same one. Without the flag the copied line goes to the
+/// default socket, which is another daemon or nothing at all. The documented
+/// setup gives each daemon its own socket.
+///
+/// The path is quoted when a shell would read it as more than one word. It
+/// comes from the operator rather than from the model. A directory with a
+/// space in its name is ordinary, and the line is made to be copied.
+fn socket_flag(socket: &Path) -> String {
+    if socket == Path::new(DEFAULT_SOCKET) {
+        return String::new();
+    }
+    format!(" --socket {}", quoted(&socket.to_string_lossy()))
+}
+
+/// One shell word, quoted only when it needs to be.
+fn quoted(word: &str) -> String {
+    let plain = !word.is_empty()
+        && word
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.' | '/'));
+    if plain {
+        return word.to_string();
+    }
+    // Single quotes take everything literally. A single quote itself cannot
+    // appear inside them, so it is closed, escaped, and reopened.
+    format!("'{}'", word.replace('\'', "'\\''"))
 }
 
 /// Show a character a terminal would obey, instead of obeying it.
@@ -327,19 +372,19 @@ fn is_obeyed(character: char) -> bool {
 }
 
 /// Print one answer from the daemon.
-fn report(response: Response) -> Result<(), String> {
+fn report(response: Response, socket: &Path) -> Result<(), String> {
     match response {
         Response::Submitted { execution_id } => {
             line(&execution_id);
             line(&format!("Watch it with: agentd status {execution_id}"));
         }
-        Response::Session { session } => print_session(&session),
+        Response::Session { session } => print_session(&session, socket),
         Response::Sessions { sessions } => {
             if sessions.is_empty() {
                 line("no sessions yet");
             }
             for session in &sessions {
-                print_session(session);
+                print_session(session, socket);
                 line("");
             }
         }
@@ -355,8 +400,8 @@ fn report(response: Response) -> Result<(), String> {
 }
 
 /// Print one session in a stable, greppable shape.
-fn print_session(view: &SessionView) {
-    for text in session_lines(view) {
+fn print_session(view: &SessionView, socket: &Path) {
+    for text in session_lines(view, socket) {
         line(&text);
     }
 }
@@ -367,7 +412,7 @@ fn print_session(view: &SessionView) {
 /// the operator would see. This view carries the model's own words, and the
 /// operator approves a pending call from it, so every line leaves through
 /// [`visible`].
-fn session_lines(view: &SessionView) -> Vec<String> {
+fn session_lines(view: &SessionView, socket: &Path) -> Vec<String> {
     let mut lines = vec![
         format!("{}  {}", view.execution_id, view.state),
         format!("  goal:    {}", view.goal),
@@ -379,8 +424,10 @@ fn session_lines(view: &SessionView) -> Vec<String> {
         lines.push(format!("  pending: {} ({})", pending.tool, pending.id));
         lines.push(format!("           {}", pending.input));
         lines.push(format!(
-            "  decide:  agentd approve {} {}   (or `deny`)",
-            view.execution_id, pending.token
+            "  decide:  agentd approve{} {} {}   (or `deny`)",
+            socket_flag(socket),
+            view.execution_id,
+            pending.token
         ));
     }
     if let Some(answer) = &view.answer {

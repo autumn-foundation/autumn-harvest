@@ -212,13 +212,23 @@ async fn a_denied_call_is_reported_to_the_model_and_the_session_continues() {
         .expect("the signal is staged");
 
     let state = rt.run_until_blocked(exec).await.expect("the run finishes");
-    assert!(
-        matches!(state, RunState::Completed(_)),
-        "expected completion, got {state:?}"
-    );
+    let RunState::Completed(output) = state else {
+        panic!("expected completion, got {state:?}");
+    };
     assert!(
         !workspace.join("agent-notes.md").exists(),
         "a denied write must never run"
+    );
+
+    // The session must say what happened. The stub proposed the write, the
+    // operator denied it, and there is no file. An answer that reported the
+    // note as recorded would be a false success in the one demonstration that
+    // needs no key.
+    let report: SessionReport = serde_json::from_value(output).expect("the report decodes");
+    assert!(
+        report.answer.contains("NOT recorded"),
+        "a denied write must be reported as such: {}",
+        report.answer
     );
 }
 
@@ -1545,7 +1555,7 @@ fn model_text_cannot_drive_the_terminal() {
         answer: Some("done\u{1b}]52;c;cm0K\u{7}".to_string()),
         error: None,
     };
-    for rendered in crate::session_lines(&view) {
+    for rendered in crate::session_lines(&view, Path::new("agentd.sock")) {
         assert!(
             !rendered
                 .chars()
@@ -1642,6 +1652,90 @@ fn a_created_directory_can_be_entered_by_its_owner() {
         kept, 0o500,
         "a usable narrow directory keeps the mode the operator chose"
     );
+}
+
+#[test]
+fn the_decide_line_reaches_the_daemon_that_printed_it() {
+    let view = |token: &str| protocol::SessionView {
+        execution_id: "01JCEXEC".to_string(),
+        goal: "tidy the notes".to_string(),
+        state: "RUNNING".to_string(),
+        blocked_on: None,
+        pending: Some(protocol::PendingCall {
+            token: token.to_string(),
+            id: "toolu_a".to_string(),
+            tool: "write_file".to_string(),
+            input: "{}".to_string(),
+        }),
+        answer: None,
+        error: None,
+    };
+    let decide = |socket: &str| {
+        crate::session_lines(&view("tool_approval:1:0:toolu_a"), Path::new(socket))
+            .into_iter()
+            .find(|line| line.contains("decide:"))
+            .expect("the decide line is printed")
+    };
+
+    // The documented setup gives each daemon its own socket. A command copied
+    // out of one daemon's status must not go to another daemon, or to none.
+    let named = decide("/run/agentd/project-b.sock");
+    assert!(
+        named.contains("--socket /run/agentd/project-b.sock"),
+        "the chosen socket must be carried: {named}"
+    );
+
+    // The common case stays short.
+    let default = decide("agentd.sock");
+    assert!(
+        !default.contains("--socket"),
+        "the default socket needs no flag: {default}"
+    );
+
+    // A directory with a space in its name is ordinary, and the line is made
+    // to be copied into a shell.
+    let spaced = decide("/home/a b/agentd.sock");
+    assert!(
+        spaced.contains("--socket '/home/a b/agentd.sock'"),
+        "a socket a shell would split must be quoted: {spaced}"
+    );
+}
+
+#[test]
+fn a_workspace_that_is_a_file_is_refused() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = tempfile::tempdir().expect("a temporary directory");
+    let file = dir.path().join("not-a-directory");
+    std::fs::write(&file, "I am a file").expect("the fixture is written");
+
+    // A file with the owner's execute bit reads as enterable by mode alone.
+    // Nothing is missing above it, so nothing would be created, and the
+    // daemon would start over a workspace no tool can use.
+    std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o700))
+        .expect("the fixture is made executable");
+    let refusal = tools::create_enterable(&file).expect_err("a file must be refused");
+    assert_eq!(
+        refusal.kind(),
+        std::io::ErrorKind::NotADirectory,
+        "the refusal must say what is wrong: {refusal}"
+    );
+
+    // Without the owner bits the repair path would have changed the mode of
+    // a file nobody asked this daemon to touch.
+    std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o600))
+        .expect("the fixture is made unexecutable");
+    tools::create_enterable(&file).expect_err("a file must still be refused");
+    let mode = std::fs::metadata(&file)
+        .expect("the file exists")
+        .permissions()
+        .mode()
+        & 0o7777;
+    assert_eq!(mode, 0o600, "the file's mode must be untouched");
+
+    // A file BELOW the target is refused too, rather than created through.
+    let under = file.join("child");
+    tools::create_enterable(&under).expect_err("a path through a file must be refused");
 }
 
 #[test]

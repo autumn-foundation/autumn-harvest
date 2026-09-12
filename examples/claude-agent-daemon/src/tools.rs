@@ -465,6 +465,23 @@ pub fn directories_to_flush(target: &Path, workspace: &Path) -> Vec<PathBuf> {
 /// umask is one value for the whole process, and this daemon creates its
 /// private files on other threads.
 pub fn create_enterable(directory: &Path) -> std::io::Result<()> {
+    // An existing entry on this path must be a directory. A regular file
+    // named as the workspace has nothing missing above it. Nothing would be
+    // created, and the daemon would start over a workspace no tool can use.
+    // The repair below would also change the mode of that file, which is a
+    // change to something nobody asked this daemon to touch.
+    //
+    // Only the DEEPEST existing level can be a file. Every level above it has
+    // a child, so every level above it is a directory.
+    if let Some(deepest) = directory.ancestors().find(|level| level.exists())
+        && !deepest.is_dir()
+    {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::NotADirectory,
+            format!("{} exists and is not a directory", deepest.display()),
+        ));
+    }
+
     // An earlier attempt can be killed between the creation and the mode. It
     // leaves a directory its owner cannot enter, and the level below that one
     // cannot be created at all. The debris is repaired first, from the top

@@ -508,6 +508,10 @@ pub fn parse_reply(payload: &Value) -> TurnReply {
 pub mod offline {
     use super::{ToolCall, TurnReply, TurnRequest, Value, json, tools};
 
+    /// The tool-use id of the write this stub proposes. The final turn reads
+    /// the result recorded against it.
+    const WRITE_CALL_ID: &str = "toolu_offline_write";
+
     /// The reply for the transcript so far.
     pub fn reply(request: &TurnRequest) -> TurnReply {
         let turn = request
@@ -523,7 +527,7 @@ pub mod offline {
                 "I will look at the workspace first.",
             ),
             1 => tool_turn(
-                "toolu_offline_write",
+                WRITE_CALL_ID,
                 tools::TOOL_WRITE_FILE,
                 json!({
                     "path": "agent-notes.md",
@@ -531,11 +535,52 @@ pub mod offline {
                 }),
                 "I will record a note. This write needs your approval.",
             ),
-            _ => text_turn(
-                "Done. The workspace is listed and the note is recorded. \
-                 This answer comes from the offline stub, not from Claude.",
-            ),
+            // The last turn reports what actually happened. The operator can
+            // deny the write, or let the approval expire, or the write can
+            // fail. The workflow hands that back as a tool result. A stub
+            // that ignored it would end the advertised no-key demonstration
+            // with a success message and no file on disk.
+            _ => text_turn(&match write_outcome(request) {
+                Some(Ok(())) => "Done. The workspace is listed and the note is recorded. \
+                     This answer comes from the offline stub, not from Claude."
+                    .to_string(),
+                Some(Err(reason)) => format!(
+                    "The workspace is listed. The note is NOT recorded: {reason}. \
+                     This answer comes from the offline stub, not from Claude."
+                ),
+                None => "The workspace is listed. The note was never attempted. \
+                     This answer comes from the offline stub, not from Claude."
+                    .to_string(),
+            }),
         }
+    }
+
+    /// What became of the write this stub proposed?
+    ///
+    /// `None` means no result for it is recorded yet. `Some(Err)` carries the
+    /// reason the workflow gave, which is what the operator needs to read.
+    fn write_outcome(request: &TurnRequest) -> Option<Result<(), String>> {
+        request
+            .messages
+            .iter()
+            .filter(|message| message.role == "user")
+            .filter_map(|message| message.content.as_array())
+            .flatten()
+            .find(|block| {
+                block.get("type").and_then(Value::as_str) == Some("tool_result")
+                    && block.get("tool_use_id").and_then(Value::as_str) == Some(WRITE_CALL_ID)
+            })
+            .map(|block| {
+                if block.get("is_error").and_then(Value::as_bool) == Some(true) {
+                    Err(block
+                        .get("content")
+                        .and_then(Value::as_str)
+                        .unwrap_or("the reason is not recorded")
+                        .to_string())
+                } else {
+                    Ok(())
+                }
+            })
     }
 
     /// One assistant turn that calls a tool.
