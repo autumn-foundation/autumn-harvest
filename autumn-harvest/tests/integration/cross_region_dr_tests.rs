@@ -703,8 +703,8 @@ async fn a_fenced_worker_cannot_advance_the_rotation_cursor() {
     // This worker is pinned to generation 0; the region has been promoted
     // past it.
     FenceRegistry::clear();
-    FenceRegistry::register(ShardId::new(0), ShardGeneration::new(0));
-    FenceRegistry::set_default_shard(ShardId::new(0));
+    FenceRegistry::register(ShardId::new(0), ShardGeneration::new(0)).expect("pin generation 0");
+    FenceRegistry::set_default_shard(ShardId::new(0)).expect("set the default shard");
     bump_generation(&mut conn, ShardId::new(0), "promote", "oncall")
         .await
         .unwrap();
@@ -775,8 +775,8 @@ async fn a_fenced_sweep_that_converts_nothing_still_fails_closed() {
     // This worker is pinned to generation 0; the region has been promoted
     // past it.
     FenceRegistry::clear();
-    FenceRegistry::register(ShardId::new(0), ShardGeneration::new(0));
-    FenceRegistry::set_default_shard(ShardId::new(0));
+    FenceRegistry::register(ShardId::new(0), ShardGeneration::new(0)).expect("pin generation 0");
+    FenceRegistry::set_default_shard(ShardId::new(0)).expect("set the default shard");
     bump_generation(&mut conn, ShardId::new(0), "promote", "oncall")
         .await
         .unwrap();
