@@ -674,7 +674,9 @@ pub async fn dry_run_supersede_credit(
 ///
 /// Propagates database failures from the advisory lock, the candidate scan, or a
 /// cancellation. A candidate that reached a terminal state between the scan and
-/// the cancel is skipped, not an error.
+/// the cancel is skipped, not an error. So is a candidate whose row lock this
+/// function's own non-blocking probe could not claim (issue #1228 review, P1).
+/// See the shed loop's own comment for why waiting there is unsafe.
 #[cfg(feature = "db")]
 pub async fn supersede_running_for_key(
     conn: &mut diesel_async::AsyncPgConnection,
@@ -703,6 +705,81 @@ pub async fn supersede_running_for_key(
             ),
         )
         .await
+}
+
+/// Non-blockingly claims one candidate's row lock, returning its id when
+/// claimed or `None` when it is locked elsewhere right now (issue #1228
+/// review, P1).
+///
+/// `supersede_inner`'s transaction already holds `lock_quota_key` for the
+/// admission being checked. An incumbent can be completing on its own at
+/// the same time, holding this candidate's row lock. Its own inline,
+/// same-shard completion-trigger admission (issue #618) then waits on that
+/// SAME quota lock, if the triggered start shares the checked admission's
+/// `(workflow_name, quota_key)`. Waiting on the row lock here would
+/// complete that ABBA cycle. Postgres could only break it by aborting one
+/// side with `40P01`.
+///
+/// `SKIP LOCKED` avoids ever waiting. A candidate locked elsewhere is
+/// simply not shed this round. `supersede_inner`'s own caller already
+/// tolerates that same outcome for a corrupt neighbour or a benign
+/// terminal race. `credited_ids` reconciliation in
+/// `crate::execution::run_latest_wins_supersede` catches this the same way
+/// it catches every other reason a candidate goes unshed.
+///
+/// A successful claim is re-entrant: the immediately following
+/// `cancel_workflow_execution_collect` call takes the SAME row lock again,
+/// inside the SAME transaction, which Postgres grants at once.
+///
+/// # Errors
+///
+/// Propagates database failures from the claim query.
+#[cfg(feature = "db")]
+async fn try_claim_candidate_row(
+    conn: &mut diesel_async::AsyncPgConnection,
+    exec_id: crate::types::ExecutionId,
+) -> crate::error::HarvestResult<Option<uuid::Uuid>> {
+    use diesel::OptionalExtension;
+    use diesel_async::RunQueryDsl;
+
+    #[derive(diesel::QueryableByName)]
+    struct ClaimedId {
+        #[diesel(sql_type = diesel::sql_types::Uuid)]
+        id: uuid::Uuid,
+    }
+
+    let claimed: Option<ClaimedId> = diesel::sql_query(
+        "SELECT id FROM harvest_workflow_executions WHERE id = $1 FOR UPDATE SKIP LOCKED",
+    )
+    .bind::<diesel::sql_types::Uuid, _>(exec_id.as_uuid())
+    .get_result(conn)
+    .await
+    .optional()
+    .map_err(crate::error::database_error)?;
+    Ok(claimed.map(|row| row.id))
+}
+
+/// [`try_claim_candidate_row`], plus a warning log on a miss. `true` when
+/// claimed. `supersede_inner`'s shed loop skips the candidate on `false`.
+#[cfg(feature = "db")]
+async fn claim_candidate_row_or_warn(
+    conn: &mut diesel_async::AsyncPgConnection,
+    exec_id: crate::types::ExecutionId,
+    workflow_name: &str,
+    concurrency_key: &str,
+) -> crate::error::HarvestResult<bool> {
+    if try_claim_candidate_row(conn, exec_id).await?.is_some() {
+        return Ok(true);
+    }
+    tracing::warn!(
+        candidate = %exec_id,
+        workflow = %workflow_name,
+        concurrency_key = %concurrency_key,
+        "harvest: latest-wins supersede skipped a candidate whose row was \
+         locked elsewhere; the key may remain over its declared limit until \
+         the next admission",
+    );
+    Ok(false)
 }
 
 #[cfg(feature = "db")]
@@ -795,6 +872,16 @@ async fn supersede_inner(
 
     let mut outcome = SupersedeOutcome::default();
     for candidate in candidates.into_iter().take(shed) {
+        // Non-blocking probe for the row lock `cancel_workflow_execution_collect`
+        // is about to take (issue #1228 review, P1). See
+        // `try_claim_candidate_row`'s own doc comment for the ABBA cycle this
+        // avoids.
+        if !claim_candidate_row_or_warn(conn, candidate.exec_id, workflow_name, concurrency_key)
+            .await?
+        {
+            continue;
+        }
+
         let (cancelled, mut deferred, mut checks, _terminal_metric) =
             match crate::execution::cancel_workflow_execution_collect(
                 conn,

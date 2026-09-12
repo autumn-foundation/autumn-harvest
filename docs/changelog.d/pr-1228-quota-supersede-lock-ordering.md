@@ -513,3 +513,52 @@ assertion included, `quota_lock_ordering_tests.rs` 2/2,
 the corrected design. Confirmed the two flakes pre-exist against the
 merge base, before this follow-up's changes, by re-running them in
 isolation there.
+
+## Follow-up 9 — PR #1484 review: the real supersede pass's own row lock, not the dry run's, closed the loop
+
+A ninth automated review round found an ABBA cycle distinct from every
+prior one in this file: not the dry run's candidate scan (unlocked since
+follow-up 6), but the REAL supersede pass's row lock inside
+`cancel_workflow_execution_collect`.
+
+**P1 -- the quota lock and a real cancellation's row lock can form a
+cycle.** A `cancel_running` admission's transaction holds the quota
+advisory lock (`lock_quota_key`) for its whole duration, then later waits
+on an incumbent's row lock to cancel it. An incumbent completing on its
+own can hold that same row lock while its own inline, same-shard
+completion-trigger admission (issue #618) waits on that SAME quota lock,
+if the triggered start shares the checked admission's `(workflow_name,
+quota_key)`. Postgres can only break the resulting wait-for cycle by
+aborting one side with `40P01`.
+
+Fixed by adding `try_claim_candidate_row`: a non-blocking `FOR UPDATE SKIP
+LOCKED` probe run immediately before each candidate's real cancellation.
+A claimed row proceeds exactly as before -- the immediately following
+`cancel_workflow_execution_collect` call re-acquires the SAME lock inside
+the SAME transaction, which Postgres grants at once. A row locked
+elsewhere is simply not shed this round, through the new
+`claim_candidate_row_or_warn` wrapper. That is the identical outcome
+`supersede_inner`'s shed loop already tolerates for a corrupt neighbour
+or a benign terminal race, and `credited_ids` reconciliation in
+`run_latest_wins_supersede` (follow-up 5) already catches it the same way
+regardless of cause.
+
+Verified the cycle was real, not just plausible, before fixing it: traced
+the exact `worker.rs`/`completion_trigger.rs` call chain showing a
+same-shard completion-trigger start runs inline on the source execution's
+own terminal transaction, pre-commit, reaching `enforce_quota_admission`
+before that transaction releases its row lock on the source.
+
+Re-ran all four suites above (`quota_supersede_ordering_tests.rs` 6/6,
+`quota_lock_ordering_tests.rs` 2/2, `concurrency_supersede_tests.rs`
+20/20, `quota_enforcement_tests.rs` 39/41 in isolation, the same known
+`quota_blocked_outbox_*` flake pair) against the corrected design. A
+third test, `completion_trigger_defers_to_outbox_when_target_quota_
+exceeded`, failed once in a full-suite run alongside the other three
+suites but passed in isolation both alone and together with only
+`quota_enforcement_tests.rs` -- confirmed flaky, not a regression.
+
+Also ports a second pre-existing trunk-dev CI defect surfaced only once
+follow-up 8's Lint fix let the job run far enough to reach it:
+`docs/rnd/sqlite-feasibility.md` still said 102 migrations against a live
+count of 103. Fixed per the already-open autumn-foundation/autumn-harvest#1513.

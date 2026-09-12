@@ -568,9 +568,10 @@ pub async fn load_quota_usage(
 /// SQL for [`load_quota_usage_excluding`]. Identical to [`QUOTA_USAGE_SQL`]
 /// except the `active` CTE also excludes `$3`, an array of execution ids.
 ///
-/// A separate query text, not a wrapper around [`QUOTA_USAGE_SQL`], so the
-/// unqualified admission-time read every OTHER caller still uses keeps the
-/// exact query shape `docs/performance-quota-history-bytes.md` measured.
+/// A separate query text, not a wrapper around [`QUOTA_USAGE_SQL`]. Every
+/// OTHER caller still uses the unqualified admission-time read, unchanged.
+/// It keeps the exact query shape `docs/performance-quota-history-bytes.md`
+/// measured.
 #[cfg(feature = "db")]
 const QUOTA_USAGE_EXCLUDING_SQL: &str = "\
     WITH active AS ( \
@@ -593,26 +594,27 @@ const QUOTA_USAGE_EXCLUDING_SQL: &str = "\
 /// specific executions entirely from the `active_executions`/`history_bytes`
 /// counters (issue #1228 review).
 ///
-/// An admission that plans to shed some incumbents, or that just inserted
-/// its own row, needs usage as it will read once those executions are gone
-/// or once its own row's history is set aside — not usage as it stands
-/// right now. [`load_quota_usage`] followed by a separate subtraction
-/// computed the excluded executions' contribution from an EARLIER, separate
-/// read. A row that changed state between that earlier read and this one
-/// (an incumbent completing on its own, or the caller's own row picking up
-/// a `WorkflowStarted` event) made the subtraction stale. Excluding the ids
-/// directly inside this ONE query removes the gap: there is no earlier read
-/// to go stale relative to, because there is no earlier read.
+/// An admission can plan to shed some incumbents. Or it can have just
+/// inserted its own row. Either way it needs usage as it will read once
+/// those executions are gone, or once its own row's history is set aside.
+/// Neither is usage as it stands right now. [`load_quota_usage`] followed
+/// by a separate subtraction computed the excluded executions'
+/// contribution from an EARLIER, separate read. A row could change state
+/// between that earlier read and this one. An incumbent could complete on
+/// its own. Or the caller's own row could pick up a `WorkflowStarted`
+/// event. Either change made the subtraction stale. Excluding the ids
+/// directly inside this ONE query removes the gap. There is no earlier
+/// read to go stale relative to, because there is no earlier read.
 ///
-/// `excluded_ids` is typically the caller's own `self_exec_id` (always,
-/// since that row is already `RUNNING` and would otherwise double-count
-/// itself against the very cap it is being checked against) plus, on the
-/// `cancel_running` dry-run path, the executions a pending supersede pass
-/// is about to shed. A row that starts existing, or newly matches the key,
-/// only AFTER this query runs is not excluded and could not be -- but that
-/// case can only raise the reported usage, never lower it below the true
-/// value, so it is the safe direction the rest of this mechanism already
-/// relies on.
+/// `excluded_ids` is typically the caller's own `self_exec_id`. That row
+/// is already `RUNNING`, so it always needs excluding: it would otherwise
+/// double-count itself against the very cap it is being checked against.
+/// On the `cancel_running` dry-run path, `excluded_ids` also holds the
+/// executions a pending supersede pass is about to shed. A row that
+/// starts existing, or newly matches the key, only AFTER this query runs
+/// is not excluded, and could not be. That case can only raise the
+/// reported usage, never lower it below the true value. It is the safe
+/// direction the rest of this mechanism already relies on.
 ///
 /// # Errors
 ///
