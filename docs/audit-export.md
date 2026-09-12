@@ -421,7 +421,7 @@ shard records:
   username — the key uses the username only in that case, never when a
   path is present.
 
-  Three gaps are accepted rather than chased further. A host alias (two
+  Four gaps are accepted rather than chased further. A host alias (two
   hostnames resolving to one address) needs a live connection to detect
   and is left undetected. A role's own `search_path` set server-side with
   `ALTER ROLE ... SET search_path` is invisible in the DSN, and not fully
@@ -436,7 +436,19 @@ shard records:
   name different endpoints; `from_dsns` is built for one host per shard
   entry, where this never arises, and getting it wrong skips a purge
   rather than causing a premature one, so it is left for whoever first
-  needs multi-host entries to fix.
+  needs multi-host entries to fix. Two different `search_path` orders can
+  also resolve one unqualified relation to the identical schema when the
+  earlier-searched schemas in one order simply do not define that
+  relation — `tenant_a,public` and `tenant_b,public` both resolve
+  `harvest_audit_log` from `public` whenever neither tenant schema
+  defines its own copy. Unlike the other three gaps, this one is not
+  conservative: two aliases of one physical table can compare as
+  distinct pools, the same under-merging risk this key exists to close
+  elsewhere. Detecting it needs to know what each named schema actually
+  contains, a live catalog lookup rather than a fact the DSN text
+  carries, so it is out of reach for the same reason as the host alias
+  gap: building a pool must stay a pure, local operation with no network
+  access.
 
   The remaining cost is operational, not architectural: an operator must
   remember to set the flag on every process, including ones added later.

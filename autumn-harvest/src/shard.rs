@@ -992,7 +992,7 @@ fn group_by_pool_identity(pools: &BTreeMap<ShardId, DbPool>) -> BTreeMap<ShardId
 /// case. The rest of this comment's reasoning against using the
 /// username still holds whenever a path is present.
 ///
-/// Three gaps are accepted rather than chased further:
+/// Four gaps are accepted rather than chased further:
 /// - A host alias — two hostnames that resolve to one address — is not
 ///   detected. Closing it needs a live connection, and building a pool
 ///   must stay a pure, local operation with no network access.
@@ -1013,6 +1013,20 @@ fn group_by_pool_identity(pools: &BTreeMap<ShardId, DbPool>) -> BTreeMap<ShardId
 ///   skipped purge on one endpoint, not a premature delete. It is left
 ///   for whoever first needs multi-host `from_dsns` entries to fix
 ///   alongside a real use case to test it against.
+/// - Two different `search_path` orders can still resolve one unqualified
+///   relation to the identical schema. This happens when the
+///   earlier-searched schemas in one order do not contain that relation
+///   at all. `tenant_a,public` and `tenant_b,public` both resolve
+///   `harvest_audit_log` from `public`, whenever neither tenant schema
+///   defines its own copy of that table. Unlike the other three gaps,
+///   this one is not conservative. Two aliases of one physical table can
+///   compare as distinct pools. That is the same under-merging risk this
+///   key exists to close elsewhere. Detecting it needs to know what each
+///   named schema actually contains. That is a live catalog lookup, not
+///   a fact this key can read from the DSN text. It is out of reach for
+///   the same reason as the host alias gap above. Building a pool must
+///   stay a pure, local operation with no network access. It is left
+///   undetected rather than guessed at without a connection.
 ///
 /// A DSN that does not parse falls back to the raw string, unchanged
 /// from before this key existed.

@@ -655,6 +655,25 @@ is the safe one -- a schema silently never purged, not a row deleted
 early -- consistent with why the eighth round accepted this gap rather
 than fixing it. Not fixed; replied with this reasoning instead.
 
+A twenty-fourth review round (P1) found a defect different in kind from
+every prior round in this stretch: not a parsing bug, but a limit on
+what any DSN-text-only key can determine. Two different `search_path`
+orders can resolve one unqualified relation to the identical schema
+when the earlier-searched schemas in one order simply do not define
+that relation -- `tenant_a,public` and `tenant_b,public` both resolve
+`harvest_audit_log` from `public` whenever neither tenant schema
+defines its own copy. Unlike every fix in rounds fourteen through
+twenty-three, closing this needs to know what each named schema
+actually contains: a live catalog lookup, not a fact derivable from the
+DSN text no matter how precisely `search_path` is parsed. `canonical_dsn_key`
+is built to stay a pure, local operation with no network access, the
+same constraint that already leaves the host-alias gap (two hostnames
+resolving to one address) undetected. This is documented as a fourth
+accepted gap alongside it, rather than attempted: unlike the other
+three, it is not conservative, since two aliases of one physical table
+can compare as distinct pools. Not fixed; replied explaining why a
+fix would require the connection this function is built not to make.
+
 **Zero migration, zero engine impact beyond the new parameter.** No new
 `WorkflowEvent` variant, no schema change, no change to any existing call
 site's behavior when the new flag is left at its default (disabled).
