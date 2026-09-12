@@ -333,6 +333,22 @@ pub struct RetentionConfig {
     /// Audit log retention in days, independent of workflow-history retention.
     /// Defaults to 90 days (3 months). Set to 0 to disable audit purging.
     pub audit_retention_days: i64,
+    /// Protect every unexported audit row, regardless of local signals
+    /// (issue #1266). Defaults to `false`.
+    ///
+    /// `purge_old_audit_records` already refuses to delete an unexported row
+    /// in two cases. The first case: a live cursor exists for the shard. The
+    /// second case: this process has a sink configured.
+    ///
+    /// Both signals can be absent at once. This happens in a split
+    /// web/worker deployment, before the worker's first successful tick on a
+    /// shard. A fresh enablement has no tick yet. A newly added shard may
+    /// also have no tick yet, if the worker cannot reach it. In that window,
+    /// retention finds no sink and no cursor row.
+    ///
+    /// Set this flag to `true` on every process in such a deployment. This
+    /// closes the window. See `docs/audit-export.md`.
+    pub protect_unexported_audit: bool,
     /// Schedule decisions retention in days.
     /// Defaults to 7 days. Set to 0 to disable schedule decision purging.
     pub schedule_decision_retention_days: i64,
@@ -447,6 +463,7 @@ impl Default for RetentionConfig {
             batch_size: DEFAULT_BATCH_SIZE,
             dry_run: false,
             audit_retention_days: 90,
+            protect_unexported_audit: false,
             schedule_decision_retention_days: 7,
             archival_timeout_secs: DEFAULT_ARCHIVAL_TIMEOUT_SECS,
             summary: None,
@@ -498,6 +515,15 @@ impl RetentionConfig {
     #[must_use]
     pub const fn with_audit_retention_days(mut self, days: i64) -> Self {
         self.audit_retention_days = days;
+        self
+    }
+
+    /// Protect every unexported audit row on this process's sweeps, closing
+    /// the split-deployment bootstrap window (issue #1266). Set `true` on
+    /// every process in a split web/worker deployment.
+    #[must_use]
+    pub const fn with_protect_unexported_audit(mut self, protect: bool) -> Self {
+        self.protect_unexported_audit = protect;
         self
     }
 
@@ -1281,6 +1307,7 @@ impl RetentionRuntime {
                             && let Err(err) = crate::audit::purge_old_audit_records(
                                 &mut conn,
                                 config.audit_retention_days,
+                                config.protect_unexported_audit,
                             )
                             .await
                         {

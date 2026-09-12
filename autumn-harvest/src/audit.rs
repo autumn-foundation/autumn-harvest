@@ -1546,7 +1546,7 @@ pub async fn list_audit(
 ///
 /// ## Deciding whether export is live
 ///
-/// The guard applies when **either** signal says an exporter owes this shard
+/// The guard applies when **any** signal says an exporter owes this shard
 /// records:
 ///
 /// - **A live (non-retired) cursor row exists** for the shard. Durable, shared
@@ -1560,6 +1560,15 @@ pub async fn list_audit(
 ///   exporter's first tick on a shard has created the cursor row at all
 ///   (freshly enabled, newly added to the fleet, or a shard whose pool has
 ///   been failing).
+/// - **`protect_unexported_audit` is `true`** (issue #1266). The first two
+///   signals can both be absent at once. This happens in a split web/worker
+///   deployment, before the worker's first successful tick on a shard. The
+///   process running retention then has no sink and no cursor row to read.
+///   Neither signal can close that window: both need the worker to have
+///   reached the shard at least once. This third signal needs no such
+///   contact. An operator sets it the same way on every process. The guard
+///   then holds from the moment export is configured, not from the moment it
+///   first succeeds.
 ///
 /// Deliberately **not** time-based. An earlier revision expired the guard 24h
 /// after the exporter's last heartbeat, so a long worker outage lifted it; a
@@ -1579,7 +1588,11 @@ pub async fn list_audit(
 /// `last_error` on `GET /admin/audit-export` are how the condition is
 /// surfaced. See `docs/audit-export.md`.
 ///
-/// With export inactive by both signals the guard is skipped entirely and the
+/// `protect_unexported_audit` does not remove that operator step. A cursor
+/// row still must be decommissioned before purging resumes for its shard.
+/// This holds even once the flag is unset, or was never needed.
+///
+/// With export inactive by every signal the guard is skipped entirely and the
 /// delete is byte-identical to the pre-#953 statement.
 ///
 /// The pending-check subquery is uncorrelated by shard because a shard's
@@ -1593,10 +1606,12 @@ pub async fn list_audit(
 pub async fn purge_old_audit_records(
     conn: &mut AsyncPgConnection,
     retention_days: i64,
+    protect_unexported_audit: bool,
 ) -> HarvestResult<usize> {
     use diesel_async::RunQueryDsl as _;
 
     let cutoff = chrono::Utc::now() - chrono::Duration::days(retention_days);
+    let export_may_be_live = protect_unexported_audit || crate::audit_export::is_configured();
 
     // Delete an aged row UNLESS export is live AND that row is still pending.
     diesel::sql_query(
@@ -1620,7 +1635,7 @@ pub async fn purge_old_audit_records(
            )",
     )
     .bind::<diesel::sql_types::Timestamptz, _>(cutoff)
-    .bind::<diesel::sql_types::Bool, _>(crate::audit_export::is_configured())
+    .bind::<diesel::sql_types::Bool, _>(export_may_be_live)
     .execute(conn)
     .await
     .map_err(database_error)

@@ -34,6 +34,9 @@
 //! - `retention_never_purges_an_unexported_record` and its
 //!   unconfigured counterpart — the silent-loss hole a naive retention sweep
 //!   would open.
+//! - `retention_protects_unexported_audit_when_configured_with_no_cursor_and_no_local_sink`
+//!   — the split-deployment bootstrap window (issue #1266): no cursor row,
+//!   no local sink, closed only by `protect_unexported_audit`.
 //! - `every_batch_is_hmac_signed_and_carries_its_shard_and_seq_range` — AC1/AC4.
 
 use std::sync::{Arc, Mutex};
@@ -880,7 +883,7 @@ async fn retention_never_purges_an_unexported_record() {
         .await
         .expect("age rows");
 
-    let deleted = purge_old_audit_records(&mut conn, 90)
+    let deleted = purge_old_audit_records(&mut conn, 90, false)
         .await
         .expect("purge runs");
     assert_eq!(
@@ -919,7 +922,7 @@ async fn retention_is_unchanged_when_export_is_unconfigured() {
         .await
         .expect("age rows");
 
-    let deleted = purge_old_audit_records(&mut conn, 90)
+    let deleted = purge_old_audit_records(&mut conn, 90, false)
         .await
         .expect("purge runs");
     assert_eq!(
@@ -1255,7 +1258,7 @@ async fn retention_purges_nothing_when_export_is_configured_but_has_not_run_yet(
         .await
         .expect("age rows");
 
-    let deleted = purge_old_audit_records(&mut conn, 90)
+    let deleted = purge_old_audit_records(&mut conn, 90, false)
         .await
         .expect("purge runs");
     uninstall();
@@ -1298,7 +1301,7 @@ async fn removing_the_sink_alone_does_not_resume_retention() {
         .await
         .expect("age rows");
 
-    let deleted = purge_old_audit_records(&mut conn, 90)
+    let deleted = purge_old_audit_records(&mut conn, 90, false)
         .await
         .expect("purge runs");
     assert_eq!(
@@ -1705,7 +1708,7 @@ async fn retention_respects_a_live_exporter_heartbeat_from_another_process() {
         "this stands in for the process that runs retention"
     );
 
-    let deleted = purge_old_audit_records(&mut conn, 90)
+    let deleted = purge_old_audit_records(&mut conn, 90, false)
         .await
         .expect("purge runs");
     assert_eq!(
@@ -1747,7 +1750,7 @@ async fn retention_resumes_only_after_the_cursor_is_decommissioned() {
             .await
             .expect("age heartbeat");
     }
-    let deleted = purge_old_audit_records(&mut conn, 90)
+    let deleted = purge_old_audit_records(&mut conn, 90, false)
         .await
         .expect("purge runs");
     assert_eq!(
@@ -1763,7 +1766,7 @@ async fn retention_resumes_only_after_the_cursor_is_decommissioned() {
             .expect("decommission"),
         "the cursor row existed, so it must report as removed"
     );
-    let deleted = purge_old_audit_records(&mut conn, 90)
+    let deleted = purge_old_audit_records(&mut conn, 90, false)
         .await
         .expect("purge runs");
     assert_eq!(
@@ -1771,6 +1774,46 @@ async fn retention_resumes_only_after_the_cursor_is_decommissioned() {
         "once an operator retires the cursor, retention resumes over the \
          remaining aged rows"
     );
+}
+
+// The bootstrap-window gap (issue #1266). In a split web/worker deployment,
+// the web process runs retention and never configures a sink. So it can
+// never see signal 2 locally. Signal 1 needs a live cursor row. That row
+// does not exist until the worker's first successful tick. A newly added
+// shard the worker cannot reach may never get one. Neither signal fires
+// then. An operator must be able to say "protect audit rows here" without
+// relying on either signal.
+#[tokio::test]
+async fn retention_protects_unexported_audit_when_configured_with_no_cursor_and_no_local_sink() {
+    let _guard = TEST_SERIAL.lock().await;
+    uninstall();
+    let (mut conn, _c) = make_conn().await;
+    insert_audit_rows(&mut conn, 5).await;
+    diesel::update(harvest_audit_log::table)
+        .set(harvest_audit_log::occurred_at.eq(chrono::Utc::now() - chrono::Duration::days(365)))
+        .execute(&mut conn)
+        .await
+        .expect("age rows");
+
+    // No sink in this process, no cursor row anywhere -- exactly the window
+    // between enabling export and the worker's first successful tick.
+    assert!(!autumn_harvest::audit_export::is_configured());
+
+    let deleted = purge_old_audit_records(&mut conn, 90, true)
+        .await
+        .expect("purge runs");
+    assert_eq!(
+        deleted, 0,
+        "an operator who declares protect_unexported_audit must not lose \
+         records to a sweep that starts before the worker's first tick"
+    );
+
+    let remaining: i64 = harvest_audit_log::table
+        .count()
+        .get_result(&mut conn)
+        .await
+        .expect("count");
+    assert_eq!(remaining, 5);
 }
 
 #[tokio::test]
@@ -1892,7 +1935,9 @@ async fn the_sequence_survives_a_decommission_that_purges_every_stamped_row() {
         .execute(&mut conn)
         .await
         .expect("age rows");
-    let deleted = purge_old_audit_records(&mut conn, 90).await.expect("purge");
+    let deleted = purge_old_audit_records(&mut conn, 90, false)
+        .await
+        .expect("purge");
     assert_eq!(deleted, 3, "retiring the cursor must permit the purge");
 
     let remaining: i64 = harvest_audit_log::table
