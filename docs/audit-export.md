@@ -364,7 +364,12 @@ shard records:
   `PUBLIC` collapses with `public`, but a quoted `"tenant, one"` (one
   schema) never collapses with the two unquoted schemas `tenant` and
   `one`. A value that does not fit this grammar is compared unparsed,
-  the conservative fallback.
+  the conservative fallback. Each parsed name is escaped before the
+  names are rejoined into the key, quoting its own backslashes and
+  commas: joining with a bare comma would let a quoted name's own
+  embedded comma read back as a name boundary, so the one name
+  `tenant,one` and the two names `tenant` and `one` would otherwise join
+  to the identical string.
   Every other query parameter (`application_name`, `sslmode`, and so on)
   is dropped, since none of them changes which relation a query resolves
   against — except `host`, `hostaddr`, and `port`: a Unix-socket DSN

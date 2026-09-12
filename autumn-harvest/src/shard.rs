@@ -1181,9 +1181,41 @@ fn split_options_preserving_escapes(options: &str) -> Vec<String> {
 /// cannot be normalized, so it is kept distinguishable from every other
 /// value rather than guessed at. This is the same conservative choice
 /// made elsewhere in this key.
+///
+/// Each item is escaped before rejoining, backslash-quoting its own
+/// backslashes and commas (issue #1266). Joining with a bare `,` would
+/// let a quoted item's own embedded comma read back as an item
+/// boundary. The one item `tenant,one` and the two items `tenant` and
+/// `one` would then both join to the same string `tenant,one` -- a
+/// real collision. Escaping first keeps every item's boundary in the
+/// joined key, so the two cases above never compare equal.
 #[cfg(feature = "db")]
 fn normalize_search_path(value: &str) -> String {
-    parse_identifier_list(value).map_or_else(|| value.to_string(), |items| items.join(","))
+    parse_identifier_list(value).map_or_else(
+        || value.to_string(),
+        |items| {
+            items
+                .iter()
+                .map(|item| escape_identifier_list_item(item))
+                .collect::<Vec<_>>()
+                .join(",")
+        },
+    )
+}
+
+/// Backslash-escapes a parsed identifier-list item's own backslashes
+/// and commas (issue #1266). Joining escaped items with a bare `,`
+/// then keeps every item boundary recoverable in the joined string.
+#[cfg(feature = "db")]
+fn escape_identifier_list_item(item: &str) -> String {
+    let mut escaped = String::with_capacity(item.len());
+    for c in item.chars() {
+        if c == '\\' || c == ',' {
+            escaped.push('\\');
+        }
+        escaped.push(c);
+    }
+    escaped
 }
 
 /// Parses a comma-separated identifier list the way `PostgreSQL`'s own
@@ -2736,6 +2768,38 @@ mod tests {
             "a quoted schema named literally `tenant, one` is one \
              identifier, distinct from the two unquoted identifiers \
              `tenant` and `one`, and must never collapse with them"
+        );
+    }
+
+    #[cfg(feature = "db")]
+    #[test]
+    fn from_dsns_keeps_a_quoted_comma_containing_schema_distinct_with_no_space_to_hide_behind() {
+        let sharded = ShardedDbPool::from_dsns(
+            [
+                (
+                    ShardId::new(0),
+                    "postgres://db.example/shared?options=-c%20search_path%3D%22tenant%2Cone%22"
+                        .to_string(),
+                ),
+                (
+                    ShardId::new(1),
+                    "postgres://db.example/shared?options=-c%20search_path%3Dtenant%2Cone"
+                        .to_string(),
+                ),
+            ],
+            ShardId::new(0),
+            1,
+        )
+        .expect("pool builds without connecting");
+
+        let groups = sharded.pool_groups();
+        assert_eq!(
+            groups.len(),
+            2,
+            "the one quoted item `tenant,one` and the two unquoted items \
+             `tenant` and `one` must not join to the same string just \
+             because a bare comma also separates joined items -- an \
+             unescaped join collapses both to `tenant,one`"
         );
     }
 

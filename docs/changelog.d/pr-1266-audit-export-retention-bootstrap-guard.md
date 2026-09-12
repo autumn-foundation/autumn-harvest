@@ -472,6 +472,29 @@ pins the P1 fix, and
 `from_dsns_keeps_a_quoted_comma_containing_schema_distinct_from_two_plain_ones`
 pins the P2 fix.
 
+An eighteenth review round (P2) found a defect in the seventeenth
+round's own fix: `normalize_search_path` rejoined the parsed names with
+a bare comma, the same character that separates them. A quoted name
+containing a literal comma and two separate unquoted names could then
+join to the identical string -- `"tenant,one"` parses as the single
+name `tenant,one`, while `tenant,one` parses as the two names `tenant`
+and `one`, and both rejoin to the same key `tenant,one`. Two DSNs
+resolving `harvest_audit_log` through different schema lists would then
+merge into one pool group, and `pool_groups()` keeps only one
+representative -- the collapsed-away shard's audit table silently stops
+being purged, the same failure the seventh round's fix was written to
+prevent.
+
+Each name is now escaped before rejoining
+(`escape_identifier_list_item`), backslash-quoting its own backslashes
+and commas, so a name boundary can never be confused with the join
+delimiter.
+`from_dsns_keeps_a_quoted_comma_containing_schema_distinct_with_no_space_to_hide_behind`
+pins this: an earlier test for the same distinction happened to pass
+for the wrong reason, since its quoted value also differed in
+whitespace from the two-name case: this test uses values that agree on
+everything except the escaping this round adds.
+
 **Zero migration, zero engine impact beyond the new parameter.** No new
 `WorkflowEvent` variant, no schema change, no change to any existing call
 site's behavior when the new flag is left at its default (disabled).
