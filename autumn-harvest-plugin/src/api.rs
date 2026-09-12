@@ -13551,8 +13551,7 @@ fn eligible_worker_ids<'a>(
                 return true;
             }
             requirements.as_ref().is_none_or(|parsed| {
-                let labels: std::collections::HashMap<String, String> =
-                    serde_json::from_value(w.worker.labels.clone()).unwrap_or_default();
+                let labels = autumn_harvest::payload_codec::string_valued_labels(&w.worker.labels);
                 autumn_harvest::eligibility::matches_requirements(parsed, &labels)
             })
         })
@@ -42085,6 +42084,52 @@ async fn resolve_stream_end_reason(
     stream_end_reason(state.as_deref(), event_derived)
 }
 
+/// Map a `stream-end` `reason` back to its raw execution-state form.
+///
+/// Reverses `stream_end_reason`'s lowercase-hyphen mapping, e.g.
+/// `"timed-out"` becomes `"TIMED_OUT"`. The result matches
+/// `harvest_workflow_executions.state` exactly (issue #1458).
+fn stream_end_state(reason: &str) -> String {
+    reason.to_uppercase().replace('-', "_")
+}
+
+/// Build the `stream-end` terminal-marker JSON payload.
+///
+/// Adds `execution_id` and `state` alongside `reason`, per
+/// `docs/management-api.md`'s "Terminal marker" section (issue #1458).
+fn stream_end_payload(exec_id: ExecutionId, reason: &str) -> String {
+    serde_json::json!({
+        "reason": reason,
+        "execution_id": exec_id.to_string(),
+        "state": stream_end_state(reason),
+    })
+    .to_string()
+}
+
+/// Send the terminal `stream-end` frame: one call site for all four places
+/// that detect a terminal execution (issue #1458). A single call site keeps
+/// the `id:`/`execution_id`/`state` fields from drifting out of sync again.
+async fn send_stream_end(
+    api: &HarvestApiState,
+    exec_id: ExecutionId,
+    tx: &mut futures::channel::mpsc::Sender<
+        Result<axum::response::sse::Event, std::convert::Infallible>,
+    >,
+    last_id: i64,
+    event_derived_state: &str,
+) {
+    use futures::SinkExt as _;
+
+    let reason = resolve_stream_end_reason(api, exec_id, event_derived_state).await;
+    let end_data = stream_end_payload(exec_id, &reason);
+    let _ = tx
+        .send(Ok(axum::response::sse::Event::default()
+            .id(last_id.to_string())
+            .event("stream-end")
+            .data(end_data)))
+        .await;
+}
+
 #[cfg(test)]
 mod stream_end_reason_tests {
     use super::stream_end_reason;
@@ -42130,6 +42175,31 @@ mod stream_end_reason_tests {
         // before the state column flipped — keep the event-derived label.
         assert_eq!(stream_end_reason(Some("RUNNING"), "cancelled"), "cancelled");
         assert_eq!(stream_end_reason(None, "terminated"), "terminated");
+    }
+}
+
+#[cfg(test)]
+mod stream_end_payload_tests {
+    use super::{ExecutionId, stream_end_payload, stream_end_state};
+
+    #[test]
+    fn state_reverses_the_reason_mapping() {
+        assert_eq!(stream_end_state("completed"), "COMPLETED");
+        assert_eq!(stream_end_state("failed"), "FAILED");
+        assert_eq!(stream_end_state("cancelled"), "CANCELLED");
+        assert_eq!(stream_end_state("timed-out"), "TIMED_OUT");
+        assert_eq!(stream_end_state("terminated"), "TERMINATED");
+        assert_eq!(stream_end_state("continued-as-new"), "CONTINUED_AS_NEW");
+    }
+
+    #[test]
+    fn payload_carries_reason_execution_id_and_state() {
+        let exec_id = ExecutionId::new();
+        let payload = stream_end_payload(exec_id, "timed-out");
+        let value: serde_json::Value = serde_json::from_str(&payload).unwrap();
+        assert_eq!(value["reason"], "timed-out");
+        assert_eq!(value["execution_id"], exec_id.to_string());
+        assert_eq!(value["state"], "TIMED_OUT");
     }
 }
 
@@ -42410,11 +42480,8 @@ async fn stream_execution_events(
                 None
             });
         if let Some(state) = effective_terminal {
-            let reason = resolve_stream_end_reason(&api_clone, exec_id, state).await;
-            let end_data = serde_json::json!({"reason": reason}).to_string();
-            let _ = tx
-                .send(Ok(Event::default().event("stream-end").data(end_data)))
-                .await;
+            let last_id = backfill.last().map_or(last_row_id, |r| r.id);
+            send_stream_end(&api_clone, exec_id, &mut tx, last_id, state).await;
         } else {
             // ── 3. Live-tail: LISTEN/NOTIFY loop ─────────────────────────────
             let mut last_seen_id = backfill.last().map_or(last_row_id, |r| r.id);
@@ -42472,11 +42539,7 @@ async fn stream_execution_events(
                         }
 
                         if let Some(state) = terminal_state {
-                            let reason =
-                                resolve_stream_end_reason(&api_clone, exec_id, state).await;
-                            let end_data = serde_json::json!({"reason": reason}).to_string();
-                            let _ = tx
-                                .send(Ok(Event::default().event("stream-end").data(end_data)))
+                            send_stream_end(&api_clone, exec_id, &mut tx, last_seen_id, state)
                                 .await;
                             break 'notify;
                         }
@@ -42517,11 +42580,7 @@ async fn stream_execution_events(
                             break 'notify;
                         }
                         if let Some(state) = terminal_state {
-                            let reason =
-                                resolve_stream_end_reason(&api_clone, exec_id, state).await;
-                            let end_data = serde_json::json!({"reason": reason}).to_string();
-                            let _ = tx
-                                .send(Ok(Event::default().event("stream-end").data(end_data)))
+                            send_stream_end(&api_clone, exec_id, &mut tx, last_seen_id, state)
                                 .await;
                             break 'notify;
                         }
@@ -42562,11 +42621,7 @@ async fn stream_execution_events(
                             break 'notify;
                         }
                         if let Some(state) = terminal_state {
-                            let reason =
-                                resolve_stream_end_reason(&api_clone, exec_id, state).await;
-                            let end_data = serde_json::json!({"reason": reason}).to_string();
-                            let _ = tx
-                                .send(Ok(Event::default().event("stream-end").data(end_data)))
+                            send_stream_end(&api_clone, exec_id, &mut tx, last_seen_id, state)
                                 .await;
                             break 'notify;
                         }
@@ -44424,8 +44479,8 @@ async fn list_workers_handler(
                     }
 
                     parsed_reqs.as_ref().is_none_or(|reqs| {
-                        let worker_labels: std::collections::HashMap<String, String> =
-                            serde_json::from_value(w.worker.labels.clone()).unwrap_or_default();
+                        let worker_labels =
+                            autumn_harvest::payload_codec::string_valued_labels(&w.worker.labels);
                         autumn_harvest::eligibility::matches_requirements(reqs, &worker_labels)
                     })
                 });
@@ -47230,8 +47285,8 @@ async fn evaluate_eligibility_for_shard(
                 };
 
                 if let Some(reqs) = parsed_reqs {
-                    let worker_labels: std::collections::HashMap<String, String> =
-                        serde_json::from_value(w.worker.labels.clone()).unwrap_or_default();
+                    let worker_labels =
+                        autumn_harvest::payload_codec::string_valued_labels(&w.worker.labels);
                     for req in &reqs {
                         let satisfied = match req {
                             autumn_harvest::eligibility::Requirement::Exact { key, value } => {

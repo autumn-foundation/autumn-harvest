@@ -84,6 +84,11 @@ const POLL_BATCH: i64 = 1_000;
 const DUE_PREDICATE: &str = "(last_attempt_at IS NULL OR last_attempt_at < NOW() - \
      (LEAST(attempts, 6) * INTERVAL '5 seconds'))";
 
+/// Recorded as the `WorkflowCancelled` reason for a child born cancelled
+/// (issue #1263 item 13). See [`start_child_on_target`]'s cancellation arm.
+const CROSS_SHARD_BORN_CANCELLED_REASON: &str =
+    "parent requested cancellation before the relay created this child";
+
 /// Everything the relay needs to create the child on the target shard, with
 /// every default **already resolved** at spawn time.
 ///
@@ -117,17 +122,26 @@ pub struct CrossShardChildSpec {
     pub sla_secs: Option<i64>,
     #[serde(default)]
     pub execution_timeout_secs: Option<i64>,
+    /// The chain-execution-timeout DURATION, never an absolute deadline.
+    ///
+    /// A child is its own logical chain origin (issue #617). Unlike a
+    /// continue-as-new successor, it never inherits an existing chain budget.
+    /// So, exactly like [`Self::execution_timeout_secs`] and [`Self::sla_secs`],
+    /// only the duration travels here. The relay turns it into an absolute
+    /// `chain_deadline_at` at the moment it actually creates the child.
+    ///
+    /// This field used to carry the resolved absolute `chain_deadline_at`
+    /// instead (issue #1263 item 7). That anchored the chain deadline at
+    /// the PARENT's decision instant, not the child's own creation. A
+    /// relay running late — an unreachable target shard, a backlog, a
+    /// worker restart — could then hand the child a deadline already past.
+    ///
+    /// The per-run deadlines were fixed the same way earlier in issue #956.
+    /// This field was missed then. A chain cap is anchored differently for
+    /// a CONTINUE-AS-NEW successor, which does inherit its predecessor's
+    /// absolute deadline. A child is not a successor.
     #[serde(default)]
     pub chain_execution_timeout_secs: Option<i64>,
-    /// The absolute **chain** deadline, carried verbatim.
-    ///
-    /// Unlike the per-run deadlines, this one is deliberately absolute: a chain
-    /// cap is anchored at the chain origin's start and carried unchanged across
-    /// every continue-as-new precisely so a runaway loop cannot escape it by
-    /// continuing. Re-anchoring it at relay time would hand the child a fresh
-    /// chain budget and defeat the cap.
-    #[serde(default)]
-    pub chain_deadline_at: Option<DateTime<Utc>>,
     #[serde(default)]
     pub retry_policy: Option<serde_json::Value>,
     /// The child's OWN resolved quota key (issue #946), never the parent's.
@@ -1055,7 +1069,7 @@ async fn apply_action(
             Ok(deleted > 0)
         }
         CrossShardChildAction::StartChild => {
-            start_child_on_target(pool, row, acquire_bound, codecs, metrics).await?;
+            start_child_on_target(conn, pool, row, acquire_bound, codecs, metrics).await?;
             // Only after the child is durably committed on the target shard.
             // A crash before this update simply re-runs the insert, which the
             // child's primary key makes a no-op.
@@ -1275,6 +1289,7 @@ async fn record_attempt_failure(
 // cross-shard child gets, which is the one thing a reader needs to check here.
 #[allow(clippy::too_many_lines)]
 async fn start_child_on_target(
+    parent_conn: &mut AsyncPgConnection,
     pool: &ShardedDbPool,
     row: &CrossShardChildRow,
     acquire_bound: Option<std::time::Duration>,
@@ -1292,11 +1307,37 @@ async fn start_child_on_target(
     let workflow_name = row.workflow_name.clone();
     let parent_close_policy = row.parent_close_policy.clone();
 
+    // Re-read the cancel flag now rather than trust `row`'s snapshot from
+    // the top of this sweep (issue #1263 item 13 follow-up). The snapshot
+    // cannot see a cancellation that commits after the sweep's batch read
+    // but before this specific child's creation. A target worker could
+    // otherwise claim and run a task the parent already cancelled. This
+    // narrows that window to the time between this query and the target
+    // transaction's own commit. It runs on `parent_conn`'s own connection,
+    // held in no transaction of its own, so it never blocks on the target
+    // shard's work below.
+    let cancel_requested: bool = harvest_cross_shard_children::table
+        .find(row.child_exec_id)
+        .select(harvest_cross_shard_children::cancel_requested)
+        .first(parent_conn)
+        .await
+        .optional()
+        .map_err(crate::error::database_error)?
+        .unwrap_or(row.cancel_requested);
+
     // The child's queue task is written inside this transaction, so it raises a
     // dispatch hint (issue #1312). The buffering scope holds the hint until the
     // transaction commits on the target shard.
-    crate::dispatch::buffered_settled(Box::pin(conn.transaction::<(), HarvestError, _>(
-        async |conn| {
+    // The born-cancelled path's terminal metric is deferred past this call
+    // (issue #1263 item 13 follow-up). Emitting it INSIDE the transaction
+    // would double-count on a retry after a rollback here. This matches
+    // the same "record after commit" contract `cancel_workflow_execution`
+    // already documents for the same-shard path.
+    let (deferred_terminal, pending_cancel_metrics) =
+        crate::dispatch::buffered_settled(Box::pin(conn.transaction::<(
+            Option<(String, String)>,
+            Vec<crate::execution::StartCancelledRun>,
+        ), HarvestError, _>(async |conn| {
             let spec = spec.clone();
             {
                 let already: Option<uuid::Uuid> = harvest_workflow_executions::table
@@ -1307,28 +1348,36 @@ async fn start_child_on_target(
                     .optional()
                     .map_err(crate::error::database_error)?;
                 if already.is_some() {
-                    return Ok(());
+                    return Ok((None, Vec::new()));
                 }
 
-                // Anchor the PER-RUN deadlines at creation, not at the parent's
-                // decision. The relay can be minutes behind that decision — an
-                // unreachable target shard, a large backlog, a worker restart — and
-                // an absolute `deadline_at`/`sla_deadline_at` computed back then can
-                // already be in the past by the time the row lands, so the timeout
-                // and SLA scanners would time out or breach a child that has not run
-                // a single step. The normal start path derives these from the
-                // target's own start time for exactly this reason; the durations
-                // travel on the spec and become absolute here.
-                //
-                // The CHAIN deadline is the deliberate exception and is carried
-                // verbatim — see `CrossShardChildSpec::chain_deadline_at`.
+                // Anchor every deadline at creation, not at the parent's
+                // decision. The relay can be minutes behind that decision —
+                // an unreachable target shard, a large backlog, a worker
+                // restart. An absolute deadline computed back then can
+                // already be in the past by the time the row lands. The
+                // timeout, SLA, and chain scanners would then seal a child
+                // that has not run a single step. The normal start path
+                // derives every deadline from the target's own start time,
+                // for exactly this reason. Only durations travel on the
+                // spec, and they become absolute here. Issue #1263 item 7
+                // extended this to the chain deadline, which used to be the
+                // one exception.
                 let created_at = Utc::now();
-                let deadline_at = spec
-                    .execution_timeout_secs
-                    .map(|secs| created_at + chrono::Duration::seconds(secs));
-                let sla_deadline_at = spec
-                    .sla_secs
-                    .map(|secs| created_at + chrono::Duration::seconds(secs));
+                // `checked_add_signed` (not `+`): `DateTime + Duration` panics
+                // on overflow, and these seconds values are caller-supplied.
+                // `execution::start_or_load_workflow_execution`'s chain-ceiling
+                // computation uses the same guard for the same reason. `None`
+                // on overflow means no deadline, not a crashed relay sweep.
+                let deadline_at = spec.execution_timeout_secs.and_then(|secs| {
+                    created_at.checked_add_signed(chrono::Duration::seconds(secs))
+                });
+                let sla_deadline_at = spec.sla_secs.and_then(|secs| {
+                    created_at.checked_add_signed(chrono::Duration::seconds(secs))
+                });
+                let chain_deadline_at = spec.chain_execution_timeout_secs.and_then(|secs| {
+                    created_at.checked_add_signed(chrono::Duration::seconds(secs))
+                });
 
                 let child_row = NewWorkflowExecution {
                     continued_from_exec_id: None,
@@ -1336,7 +1385,7 @@ async fn start_child_on_target(
                     chain_execution_timeout: spec
                         .chain_execution_timeout_secs
                         .map(chrono::Duration::seconds),
-                    chain_deadline_at: spec.chain_deadline_at,
+                    chain_deadline_at,
                     id: child_exec_id.as_uuid(),
                     workflow_name: &workflow_name,
                     workflow_id: &child_workflow_id,
@@ -1383,22 +1432,8 @@ async fn start_child_on_target(
                 if inserted == 0 {
                     // Another sweep won the race; its transaction owns the child's
                     // event and task.
-                    return Ok(());
+                    return Ok((None, Vec::new()));
                 }
-
-                // The child's OWN declared quota (issue #946), enforced against the
-                // row this transaction just inserted and BEFORE its `WorkflowStarted`
-                // event is appended — the identical insert-then-enforce ordering the
-                // same-shard child path uses, so `history_bytes` reports usage
-                // strictly before this admission.
-                crate::execution::enforce_quota_admission(
-                    conn,
-                    spec.quota.map(QuotaCaps::to_policy),
-                    spec.quota_key.as_deref(),
-                    &workflow_name,
-                    Some(metrics),
-                )
-                .await?;
 
                 // The CONFIGURED codec registry, never `PayloadCodecs::default()`.
                 // The child's `WorkflowStarted` carries its input, so writing it
@@ -1408,6 +1443,13 @@ async fn start_child_on_target(
                 // placement. Every same-shard spawn path resolves its codecs from
                 // the runtime for exactly this reason.
                 //
+                // A row flagged for cancellation before this sweep ever
+                // created it (issue #1263 item 13) gets its
+                // `WorkflowCancelled` appended right behind `WorkflowStarted`.
+                // Both land in the SAME batch — never a separate append after
+                // the task below is enqueued. See the cancellation arm's own
+                // comment for why.
+                //
                 // KNOWN GAP: the large-payload *offloader* is not applied here. It
                 // lives on the handler registry, which a scanner does not hold, and
                 // threading it would touch ~29 call sites across the repo for what
@@ -1415,16 +1457,125 @@ async fn start_child_on_target(
                 // confidentiality property — the child-input cap is already enforced
                 // at spawn time, so an over-cap payload never becomes a cross-shard
                 // child in the first place. Tracked as a follow-up.
+                let started_event = WorkflowEvent::WorkflowStarted {
+                    input: spec.input.clone(),
+                    timestamp: created_at,
+                    last_completion_result: None,
+                    last_error: None,
+                    scheduled_time: None,
+                };
+                if cancel_requested {
+                    store::append_events_offloaded_with_codecs(
+                        conn,
+                        child_exec_id,
+                        &[
+                            started_event,
+                            WorkflowEvent::WorkflowCancelled {
+                                reason: CROSS_SHARD_BORN_CANCELLED_REASON.to_string(),
+                            },
+                        ],
+                        0,
+                        None,
+                        codecs,
+                    )
+                    .await?;
+                    // Sealed CANCELLED with no task ever enqueued (issue
+                    // #1263 item 13). The decision table
+                    // (`shard::next_cross_shard_child_action`) sends every
+                    // `PENDING_START` row here regardless of
+                    // `cancel_requested`: a cancel that lands mid-creation
+                    // still needs a row to act on.
+                    //
+                    // Enqueuing the task first, then cancelling it right
+                    // after (mirroring a same-shard race loser), would still
+                    // leave a real window open. On the same-shard path the
+                    // loser is cancelled inside the PARENT's own transaction,
+                    // before any task for it exists. Here THIS transaction is
+                    // the one that would create that task. A worker could
+                    // claim it the instant this transaction committed, and
+                    // run a live decision cycle for a child that had already
+                    // lost its race. Never creating the task closes that
+                    // window outright.
+                    //
+                    // This check runs BEFORE quota admission below (issue
+                    // #1263 item 13 follow-up). A race loser that is ALSO
+                    // over quota must still settle into CANCELLED. It will
+                    // never run, so it never actually consumes the quota it
+                    // would otherwise be rejected for. Enforcing admission
+                    // first would instead roll back this transaction every
+                    // sweep, leaving the loser stuck `PENDING_START` for as
+                    // long as the quota stays exceeded.
+                    diesel::update(
+                        harvest_workflow_executions::table.find(child_exec_id.as_uuid()),
+                    )
+                    .set((
+                        harvest_workflow_executions::state.eq("CANCELLED"),
+                        harvest_workflow_executions::error
+                            .eq(Some(CROSS_SHARD_BORN_CANCELLED_REASON)),
+                        harvest_workflow_executions::completed_at.eq(Some(created_at)),
+                    ))
+                    .execute(conn)
+                    .await
+                    .map_err(crate::error::database_error)?;
+                    // A born-cancelled child bypasses `cancel_workflow_execution`.
+                    // So its terminal metric and completion triggers need this
+                    // explicit handling (issue #1263 item 13 follow-up).
+                    // Otherwise the fleet-wide cancelled count would silently
+                    // undercount, and a workflow configured to start on this
+                    // child's cancellation never would. Every trigger start
+                    // returned already has its own durable outbox row,
+                    // committed by this same call. `spawn()` here is a
+                    // best-effort latency nudge, not the only path to it.
+                    // The terminal metric itself is NOT emitted here — see
+                    // this function's own call site, past the transaction's
+                    // commit.
+                    //
+                    // `_collecting`, not the plain wrapper, and `Some(metrics)`
+                    // (issue #1263 item 13 follow-up). This relay has the real
+                    // recorder in scope. Passing `None` would silently drop
+                    // every `record_completion_trigger_fired` /
+                    // `_skipped` sample below. A same-shard trigger start can
+                    // also latest-wins supersede an incumbent run (issue
+                    // #811). Those samples must wait for this transaction to
+                    // commit, exactly like the terminal metric above. They
+                    // are returned rather than emitted inline.
+                    let mut pending_cancel_metrics = Vec::new();
+                    for start in
+                        crate::completion_trigger::evaluate_triggers_for_execution_collecting(
+                            conn,
+                            child_exec_id,
+                            crate::completion_trigger::TerminalState::Cancelled,
+                            Some(metrics),
+                            &mut pending_cancel_metrics,
+                        )
+                        .await?
+                    {
+                        start.spawn();
+                    }
+                    return Ok((
+                        Some((workflow_name.clone(), spec.queue_name.clone())),
+                        pending_cancel_metrics,
+                    ));
+                }
+
+                // The child's OWN declared quota (issue #946), enforced against the
+                // row this transaction just inserted and BEFORE its `WorkflowStarted`
+                // event is appended — the identical insert-then-enforce ordering the
+                // same-shard child path uses, so `history_bytes` reports usage
+                // strictly before this admission. Skipped entirely above when the
+                // child is already cancelled — see that branch's own comment.
+                crate::execution::enforce_quota_admission(
+                    conn,
+                    spec.quota.map(QuotaCaps::to_policy),
+                    spec.quota_key.as_deref(),
+                    &workflow_name,
+                    Some(metrics),
+                )
+                .await?;
                 store::append_events_offloaded_with_codecs(
                     conn,
                     child_exec_id,
-                    &[WorkflowEvent::WorkflowStarted {
-                        input: spec.input.clone(),
-                        timestamp: created_at,
-                        last_completion_result: None,
-                        last_error: None,
-                        scheduled_time: None,
-                    }],
+                    &[started_event],
                     0,
                     None,
                     codecs,
@@ -1442,11 +1593,24 @@ async fn start_child_on_target(
                 params.max_concurrent = spec.max_concurrent;
                 params.trace_context = spec.trace_context.clone();
                 queue::enqueue(conn, &params).await?;
-                Ok(())
+                Ok((None, Vec::new()))
             }
-        },
-    )))
-    .await
+        })))
+        .await?;
+
+    // Only reached once the transaction above has actually committed.
+    // Neither the terminal metric nor the trigger-supersede samples below
+    // can double-count on a retry after a rollback.
+    if let Some((workflow_name, queue_name)) = deferred_terminal {
+        crate::telemetry::emit_workflow_terminal(
+            metrics,
+            &workflow_name,
+            &queue_name,
+            crate::telemetry::WorkflowStatus::Cancelled,
+        );
+    }
+    crate::execution::emit_start_cancel_metrics(metrics, &pending_cancel_metrics);
+    Ok(())
 }
 
 /// Deliver an idempotent cancel to a cross-shard child on its target shard.

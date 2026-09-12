@@ -193,6 +193,8 @@ const DASHBOARD_PROMETHEUS_SERIES: &[&str] = &[
     "harvest_replication_lag_bytes",
     "harvest_replication_standbys",
     "harvest_replication_observable",
+    // Issue #1249 — readable-but-unmeasurable RPO signal.
+    "harvest_replication_rpo_known",
     "harvest_shard_generation",
     // Issue #953 — audit export to a SIEM sink (gauge, bare).
     "harvest_audit_export_lag",
@@ -323,6 +325,7 @@ const SERIES_LABELS: &[(&str, &[&str])] = &[
     ("harvest_replication_lag_bytes", &["shard"]),
     ("harvest_replication_standbys", &["shard"]),
     ("harvest_replication_observable", &["shard"]),
+    ("harvest_replication_rpo_known", &["shard"]),
     ("harvest_shard_generation", &["shard"]),
     ("harvest_shard_fenced", &["shard"]),
     ("harvest_worker_slots_in_use", &["slot_type"]),

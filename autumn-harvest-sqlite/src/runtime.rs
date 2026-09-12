@@ -1114,36 +1114,37 @@ impl SqliteRuntime {
         // `span_meta.workflow_id`, so build a minimal meta carrying it (see
         // [`drive_span_meta`]).
         let span_meta = drive_span_meta(&workflow_name, &workflow_id);
-        let (outcome, pending, _span) = run_workflow_with_state_history_policy_and_caps(
-            exec,
-            history.clone(),
-            handler,
-            input,
-            empty_shared_state(),
-            WorkflowHistoryPolicy::default(),
-            Some(&span_meta), // FIX: the sole seam carrying business workflow_id → ctx.info()
-            &[],              // declarative query handlers (none on this backend)
-            &[],              // declarative update handlers (none on this backend)
-            &workflow_name,   // FIX C: the load-bearing name → ctx.info().workflow_type
-            DEFAULT_MAX_ACTIVITY_INPUT_BYTES,
-            DEFAULT_MAX_SIGNAL_PAYLOAD_BYTES,
-            DEFAULT_MAX_WORKFLOW_INPUT_BYTES,
-            DEFAULT_CURRENT_DETAILS_CAP_BYTES,
-            // Issue #790: the durable per-execution log sink is a Postgres-only
-            // table this backend does not have, so it is always disabled here.
-            // `ctx.logger()` still emits to `tracing` exactly as before.
-            None,
-            std::collections::HashMap::new(), // context headers (none)
-            None,                             // payload offload threshold (none)
-            std::sync::Arc::new(NoOpMetrics),
-            // Issue #620: builder-level default activity retry/timeout floor. This
-            // lightweight SQLite driver has no `HarvestBuilder` behind it, so there
-            // is no fleet-wide default to thread — `None`/`None` preserve today's
-            // "no floor" behavior (call-site/activity-level defaults still apply).
-            None,
-            None,
-        )
-        .await;
+        let (outcome, pending, _span, _resolved_router) =
+            run_workflow_with_state_history_policy_and_caps(
+                exec,
+                history.clone(),
+                handler,
+                input,
+                empty_shared_state(),
+                WorkflowHistoryPolicy::default(),
+                Some(&span_meta), // FIX: the sole seam carrying business workflow_id → ctx.info()
+                &[],              // declarative query handlers (none on this backend)
+                &[],              // declarative update handlers (none on this backend)
+                &workflow_name,   // FIX C: the load-bearing name → ctx.info().workflow_type
+                DEFAULT_MAX_ACTIVITY_INPUT_BYTES,
+                DEFAULT_MAX_SIGNAL_PAYLOAD_BYTES,
+                DEFAULT_MAX_WORKFLOW_INPUT_BYTES,
+                DEFAULT_CURRENT_DETAILS_CAP_BYTES,
+                // Issue #790: the durable per-execution log sink is a Postgres-only
+                // table this backend does not have, so it is always disabled here.
+                // `ctx.logger()` still emits to `tracing` exactly as before.
+                None,
+                std::collections::HashMap::new(), // context headers (none)
+                None,                             // payload offload threshold (none)
+                std::sync::Arc::new(NoOpMetrics),
+                // Issue #620: builder-level default activity retry/timeout floor. This
+                // lightweight SQLite driver has no `HarvestBuilder` behind it, so there
+                // is no fleet-wide default to thread — `None`/`None` preserve today's
+                // "no floor" behavior (call-site/activity-level defaults still apply).
+                None,
+                None,
+            )
+            .await;
 
         // Contained workflow-handler panic gate (issue #782 analog), BEFORE any
         // terminal side effect and beside the non-determinism gate below. A

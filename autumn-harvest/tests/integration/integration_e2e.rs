@@ -151,6 +151,9 @@ const INIT_SQL: &str = concat!(
     // issue #499: enforce_timeouts_once now scans harvest_debounce.
     include_str!("../../migrations/20260618000001_harvest_debounce/up.sql"),
     "\n",
+    // issue #518: event-batched starts persist pending admissions here.
+    include_str!("../../migrations/20260624000000_harvest_event_batches/up.sql"),
+    "\n",
     // issue #523: workflow-level retry policy columns.
     include_str!("../../migrations/20260626000001_harvest_workflow_retry/up.sql"),
     "\n",
@@ -1244,7 +1247,7 @@ pub(crate) fn runtime_config(
 ) -> WorkerRuntimeConfig {
     WorkerRuntimeConfig {
         codec_rotation_batch_size: 0,
-        dr_fencing: false,
+        dr: autumn_harvest::replication::DrConfig::default(),
         worker_id: worker_id.to_string(),
         queues: vec!["default".to_string()],
         notification_database_url: None,
@@ -2186,7 +2189,7 @@ async fn worker_threads_execution_timeout_into_ctx_deadline() {
         Worker::new(
             WorkerRuntimeConfig {
                 codec_rotation_batch_size: 0,
-                dr_fencing: false,
+                dr: autumn_harvest::replication::DrConfig::default(),
                 worker_id: "worker-deadline-echo".to_string(),
                 queues: vec!["default".to_string()],
                 notification_database_url: None,
@@ -2420,7 +2423,7 @@ async fn worker_surfaces_nominal_deadline_not_shifted_deadline_at() {
         Worker::new(
             WorkerRuntimeConfig {
                 codec_rotation_batch_size: 0,
-                dr_fencing: false,
+                dr: autumn_harvest::replication::DrConfig::default(),
                 worker_id: "worker-deadline-echo-shifted".to_string(),
                 queues: vec!["default".to_string()],
                 notification_database_url: None,
@@ -2588,7 +2591,7 @@ async fn worker_completes_workflow_task_and_persists_result() {
         Worker::new(
             WorkerRuntimeConfig {
                 codec_rotation_batch_size: 0,
-                dr_fencing: false,
+                dr: autumn_harvest::replication::DrConfig::default(),
                 worker_id: "worker-e2e-complete".to_string(),
                 queues: vec!["default".to_string()],
                 notification_database_url: None,
@@ -2728,7 +2731,7 @@ async fn worker_marks_workflow_failed_when_handler_errors() {
         Worker::new(
             WorkerRuntimeConfig {
                 codec_rotation_batch_size: 0,
-                dr_fencing: false,
+                dr: autumn_harvest::replication::DrConfig::default(),
                 worker_id: "worker-e2e-fail".to_string(),
                 queues: vec!["default".to_string()],
                 notification_database_url: None,
@@ -2902,7 +2905,7 @@ async fn worker_completes_workflow_with_activity_round_trip() {
         Worker::new(
             WorkerRuntimeConfig {
                 codec_rotation_batch_size: 0,
-                dr_fencing: false,
+                dr: autumn_harvest::replication::DrConfig::default(),
                 worker_id: "worker-e2e-activity-round-trip".to_string(),
                 queues: vec!["default".to_string()],
                 notification_database_url: None,
@@ -3141,7 +3144,7 @@ async fn worker_fails_orphaned_activity_task_without_scheduled_event() {
         Worker::new(
             WorkerRuntimeConfig {
                 codec_rotation_batch_size: 0,
-                dr_fencing: false,
+                dr: autumn_harvest::replication::DrConfig::default(),
                 worker_id: "worker-e2e-activity-orphaned".to_string(),
                 queues: vec!["default".to_string()],
                 notification_database_url: None,
@@ -3405,7 +3408,7 @@ async fn worker_fails_workflow_when_activity_start_to_close_timeout_elapses() {
         Worker::new(
             WorkerRuntimeConfig {
                 codec_rotation_batch_size: 0,
-                dr_fencing: false,
+                dr: autumn_harvest::replication::DrConfig::default(),
                 worker_id: "worker-e2e-activity-timeout".to_string(),
                 queues: vec!["default".to_string()],
                 notification_database_url: None,
@@ -3580,7 +3583,7 @@ async fn worker_completes_workflow_with_timer_round_trip() {
         Worker::new(
             WorkerRuntimeConfig {
                 codec_rotation_batch_size: 0,
-                dr_fencing: false,
+                dr: autumn_harvest::replication::DrConfig::default(),
                 worker_id: "worker-e2e-timer-round-trip".to_string(),
                 queues: vec!["default".to_string()],
                 notification_database_url: None,
@@ -8148,7 +8151,7 @@ async fn workflow_schedule_baseline_dispatches_multiple_runs() {
         Worker::new(
             WorkerRuntimeConfig {
                 codec_rotation_batch_size: 0,
-                dr_fencing: false,
+                dr: autumn_harvest::replication::DrConfig::default(),
                 worker_id: "worker-sched-baseline".to_string(),
                 queues: vec!["default".to_string()],
                 notification_database_url: None,
@@ -8283,7 +8286,7 @@ async fn workflow_schedule_max_active_runs_enforced() {
         Worker::new(
             WorkerRuntimeConfig {
                 codec_rotation_batch_size: 0,
-                dr_fencing: false,
+                dr: autumn_harvest::replication::DrConfig::default(),
                 worker_id: "worker-sched-maxruns".to_string(),
                 queues: vec!["default".to_string()],
                 notification_database_url: None,
@@ -8407,7 +8410,7 @@ async fn workflow_schedule_pause_and_resume() {
         Worker::new(
             WorkerRuntimeConfig {
                 codec_rotation_batch_size: 0,
-                dr_fencing: false,
+                dr: autumn_harvest::replication::DrConfig::default(),
                 worker_id: "worker-sched-pause".to_string(),
                 queues: vec!["default".to_string()],
                 notification_database_url: None,
@@ -9030,6 +9033,7 @@ async fn drain_accepted_sets_status_to_draining() {
         None,
         &std::collections::HashMap::new(),
         0,
+        &[],
     )
     .await
     .unwrap();
@@ -9080,6 +9084,7 @@ async fn drain_already_draining_on_second_call() {
         None,
         &std::collections::HashMap::new(),
         0,
+        &[],
     )
     .await
     .unwrap();
@@ -9140,6 +9145,7 @@ async fn drain_already_stopped_after_transition() {
         None,
         &std::collections::HashMap::new(),
         0,
+        &[],
     )
     .await
     .unwrap();
@@ -9195,6 +9201,7 @@ async fn drain_with_explicit_deadline_is_stored() {
         None,
         &std::collections::HashMap::new(),
         0,
+        &[],
     )
     .await
     .unwrap();
@@ -9236,6 +9243,7 @@ async fn drain_preview_returns_active_workers() {
             None,
             &std::collections::HashMap::new(),
             0,
+            &[],
         )
         .await
         .unwrap();
@@ -11564,6 +11572,7 @@ async fn test_rolling_deploy_capability_routing_with_database_enforcement() {
         None,
         &std::collections::HashMap::new(),
         0,
+        &[],
     )
     .await
     .unwrap();
@@ -11601,6 +11610,7 @@ async fn test_rolling_deploy_capability_routing_with_database_enforcement() {
         None,
         &new_labels,
         0,
+        &[],
     )
     .await
     .unwrap();
@@ -12226,14 +12236,14 @@ async fn windowed_fan_out_peak_task_rows_bounded_by_window() {
 /// [`INIT_SQL`] is a deliberately-partial, hand-maintained bundle (it omits the
 /// workflow-start-uniqueness migration on purpose), so it is one of the few
 /// fixtures allowed to skip [`autumn_harvest::full_migrations_sql`]. That makes
-/// it a standing drift hazard: `queue::claim_task` runs on essentially every
-/// test in this suite — and in every suite that borrows
+/// it a standing drift hazard. `queue::claim_task` runs on essentially every
+/// test in this suite. It also runs in every suite that borrows
 /// `setup_test_database_url_or_env` from here (`chain_timeout_tests`,
 /// `child_timeout_tests`, `cross_type_continue_as_new_tests`, `ctx_info_tests`,
 /// `dag_execution_timeout_tests`, `rate_limit_key_tests`,
-/// `workflow_retry_tests`) — so a migration that adds a table to the claim query
-/// and forgets this bundle takes out eight suites at once with
-/// `relation "..." does not exist`.
+/// `quota_enforcement_tests`, `workflow_retry_tests`). A migration that adds a
+/// table to the claim query, then forgets this bundle, breaks nine suites at
+/// once with `relation "..." does not exist`.
 ///
 /// That is exactly what issue #619's `harvest_queue_pauses` anti-join did. It
 /// cost a full Docker-backed CI cycle (~13 min) to surface, yet it is decidable
