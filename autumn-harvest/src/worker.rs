@@ -4033,19 +4033,20 @@ const fn effective_workflow_task_timeout(configured: Duration, local_cap: Durati
 /// #1459), in seconds, derived from the effective workflow-task budget.
 ///
 /// The engine hard-cancels a workflow-task dispatch once it exceeds
-/// `effective_workflow_task_timeout` (`run_under_workflow_body_budget`), so a
+/// `effective_workflow_task_timeout` (`run_under_workflow_body_budget`). So a
 /// `workflow` row still `RUNNING` past that budget already stopped
-/// processing — the only question is whether its reset call
+/// processing. The only question is whether its reset call
 /// (`reset_timed_out_workflow_task`) landed. That reset retries a bounded
-/// ~2.7 seconds of pool-connection backoff before giving up. Four times the
-/// budget plus a flat 30-second margin is generous headroom past both: wide
-/// enough that a merely slow (not stuck) decision cycle is never caught by
-/// it, since the engine's own cancellation already bounds a cycle to one
-/// budget's length.
+/// ~2.7 seconds of pool-connection backoff before giving up.
 ///
-/// `None` when `workflow_task_timeout` is disabled (`Duration::ZERO`): there
-/// is then no per-cycle budget to compare against, so the backstop stays off
-/// and only the existing dead-worker reclaim path applies.
+/// Four times the budget plus a flat 30-second margin is generous headroom
+/// past both. It is wide enough that a merely slow, not stuck, decision
+/// cycle is never caught by it. The engine's own cancellation already
+/// bounds a cycle to one budget's length.
+///
+/// `None` when `workflow_task_timeout` is disabled (`Duration::ZERO`).
+/// There is then no per-cycle budget to compare against. The backstop stays
+/// off, and only the existing dead-worker reclaim path applies.
 fn stuck_running_threshold_secs(effective_workflow_task_timeout: Duration) -> Option<i64> {
     if effective_workflow_task_timeout.is_zero() {
         return None;
@@ -29775,7 +29776,7 @@ mod tests {
 
     /// Issue #1459: the poison-pill stuck-running backstop threshold must
     /// leave generous headroom past the engine's own hard cancellation of a
-    /// decision cycle, so a merely slow (not stuck) cycle is never caught.
+    /// decision cycle. A merely slow, not stuck, cycle must never be caught.
     #[test]
     fn stuck_running_threshold_gives_headroom_past_the_task_budget() {
         let budget = Duration::from_secs(60);

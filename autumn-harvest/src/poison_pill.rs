@@ -18,11 +18,11 @@
 //! ([`reclaim_orphaned_tasks`]) is gated behind `db`.
 //!
 //! [`reclaim_orphaned_tasks`] also runs a second, independent backstop pass
-//! (issue #1459): a `workflow` decision-cycle task can stay `RUNNING` on a
-//! worker that is still alive when the in-process timeout's own reset call
-//! fails to reach the database in time. The worker-liveness pass above never
-//! catches that case, since the worker itself never died. See
-//! [`stuck_running_tasks_query`].
+//! (issue #1459). A `workflow` decision-cycle task can stay `RUNNING` on a
+//! worker that is still alive. This happens when the in-process timeout's
+//! own reset call fails to reach the database in time. The worker-liveness
+//! pass above never catches that case, since the worker itself never died.
+//! See [`stuck_running_tasks_query`].
 
 /// What to do with an orphaned `RUNNING` task whose claiming worker has died.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -119,10 +119,10 @@ pub const fn orphaned_running_tasks_query() -> &'static str {
 /// The engine hard-cancels a workflow-task dispatch once it exceeds its
 /// configured `workflow_task_timeout` (`run_under_workflow_body_budget` in
 /// `worker.rs`). A `workflow` row still `RUNNING` well past that budget did
-/// not merely run long: its processing already stopped. The only reason the
-/// row itself still says `RUNNING` is that the cancellation path's own reset
-/// call (`reset_timed_out_workflow_task`) failed — most often a database-pool
-/// connection that could not be acquired within its own bounded retry budget.
+/// not merely run long: its processing already stopped. The reset call
+/// (`reset_timed_out_workflow_task`) is the only thing that could still leave
+/// the row `RUNNING`. It failed — most often a database-pool connection that
+/// could not be acquired within its own bounded retry budget.
 ///
 /// [`orphaned_running_tasks_query`] does not catch this case: the claiming
 /// worker is still alive, busy with other tasks, so the dead-worker liveness
@@ -277,8 +277,8 @@ mod scanner {
     /// backstop threshold, on a worker that may still be alive (issue #1459).
     ///
     /// Never touches `crash_strikes` and never quarantines. Being stuck this
-    /// way says nothing about the task itself — it means a reset attempt
-    /// could not reach the database in time, not that the task is poisonous.
+    /// way says nothing about the task itself. It means a reset attempt could
+    /// not reach the database in time, not that the task is poisonous.
     ///
     /// Returns `true` if the row was actually transitioned (it was still the
     /// same stuck `RUNNING` attempt), `false` if a concurrent actor already
@@ -292,7 +292,13 @@ mod scanner {
 
         // Row shape re-read fresh under the lock below: state, worker id,
         // crash strikes, task type, started-at.
-        type StuckRowState = (String, Option<String>, i32, String, Option<chrono::DateTime<Utc>>);
+        type StuckRowState = (
+            String,
+            Option<String>,
+            i32,
+            String,
+            Option<chrono::DateTime<Utc>>,
+        );
 
         let task_id = task.id;
         let Some(worker_id) = task.worker_id.clone() else {
@@ -303,9 +309,9 @@ mod scanner {
         Box::pin(conn.transaction::<bool, HarvestError, _>(async |conn| {
             // Lock the row and re-verify it is still the same stuck attempt.
             // `started_at` is re-read fresh under the lock, not taken from
-            // the pre-scan snapshot: a reset or a fresh re-claim between the
-            // scan and here always changes it, so re-checking its age here
-            // is what stops this from undoing a legitimate new attempt.
+            // the pre-scan snapshot. A reset or a fresh re-claim between the
+            // scan and here always changes it. Re-checking its age here is
+            // what stops this from undoing a legitimate new attempt.
             let current: Option<StuckRowState> = dsl::harvest_task_queue
                 .find(task_id)
                 .for_update()
@@ -832,13 +838,14 @@ mod scanner {
     /// attributed and the issue #1459 stuck-running backstop disabled. The
     /// shard is only used to label this loop in the `scanner_liveness` health
     /// check (issue #797); it never affects which tasks the loop reclaims --
-    /// that is the connection's own database. This function's signature is
-    /// frozen (see `the_public_spawn_signatures_are_unchanged_by_shard_attribution`
-    /// in `tests/integration/scanner_tick_db_tests.rs`) for the same reason
-    /// the shard parameter never reached it: an embedder calling this
-    /// directly should not be forced to opt into an observability or
-    /// reliability feature it never asked for. Call
-    /// [`spawn_poison_pill_reclaimer_for_shard`] directly to enable the
+    /// that is the connection's own database.
+    ///
+    /// This function's signature is frozen. See
+    /// `the_public_spawn_signatures_are_unchanged_by_shard_attribution` in
+    /// `tests/integration/scanner_tick_db_tests.rs`. The reason matches why
+    /// the shard parameter never reached it. An embedder calling this
+    /// directly should not have to opt into a feature it never asked for.
+    /// Call [`spawn_poison_pill_reclaimer_for_shard`] directly to enable the
     /// backstop.
     #[must_use]
     pub fn spawn_poison_pill_reclaimer(
