@@ -324,7 +324,60 @@ fn call_api(
             "its response carried no text and no tool call",
         ));
     }
+    // The reply is measured as it will be STORED, which no arithmetic over
+    // the body can promise. `MAX_BODY_BYTES` divides the recorded cap by the
+    // duplication factor of today's representation, and a field added later
+    // would change that factor. This reads the serialised length instead, so
+    // the two cannot drift.
+    //
+    // A turn refused here is still billed. It is refused all the same. The
+    // backend would refuse the same reply as `PayloadTooLarge`, which is NOT
+    // retryable. The session would then fail with no reason an operator can
+    // act on. This refusal names the cap.
+    if let Some(refusal) = activity_refusal_for_oversized_reply(&reply) {
+        return Err(body_failure(status, &refusal));
+    }
     Ok(reply)
+}
+
+/// The recorded size of one activity result this backend accepts.
+pub const DURABLE_CAP_BYTES: u64 = autumn_harvest::builder::DEFAULT_MAX_ACTIVITY_RESULT_BYTES;
+
+/// The recorded size of this reply, when the backend would refuse it.
+///
+/// The check is on the SERIALISED reply, because that is what the backend
+/// measures. A reply over the cap is refused here rather than recorded. The
+/// backend answers `PayloadTooLarge`, which is not retryable, so the session
+/// would fail with nothing an operator could act on.
+///
+/// NOTHING REACHES THIS TODAY, and that is the point. A body at
+/// [`MAX_BODY_BYTES`] records at most that many bytes times
+/// [`DURABLE_BYTES_PER_BODY_BYTE`], which is the cap. The read therefore
+/// refuses such a body first, and pays for no turn.
+///
+/// This guard is what survives a CHANGE to the representation. A field added
+/// to `TurnReply` raises the real factor, and the derived cap then stops
+/// holding silently. This measures the reply as STORED instead of trusting
+/// the arithmetic.
+fn oversized(reply: &TurnReply) -> Option<u64> {
+    let bytes = serde_json::to_vec(reply)
+        .map(|json| json.len() as u64)
+        .ok()?;
+    (bytes > DURABLE_CAP_BYTES).then_some(bytes)
+}
+
+/// The refusal this turn answers with when the reply cannot be recorded.
+///
+/// Split out so a test can drive the decision without an HTTP response. The
+/// caller pairs it with the status, which is what `body_failure` needs.
+#[must_use]
+pub fn activity_refusal_for_oversized_reply(reply: &TurnReply) -> Option<String> {
+    oversized(reply).map(|bytes| {
+        format!(
+            "its reply is {bytes} bytes once recorded, over the backend's \
+             {DURABLE_CAP_BYTES}-byte cap. Lower `--max-tokens`."
+        )
+    })
 }
 
 /// Build the request body.
@@ -351,12 +404,43 @@ fn request_body(config: &ModelConfig, request: &TurnRequest) -> Value {
     })
 }
 
+/// How many bytes the durable reply holds per byte of response body.
+///
+/// [`TurnReply`] keeps the assistant blocks VERBATIM in
+/// `content`, and `parse_reply` copies their text and their tool calls into
+/// `text` and `tool_calls`. Every payload byte is therefore stored twice, and
+/// the measured factor is exactly 2.
+///
+/// The duplication is the cost of the replay guarantee, and it stays. The
+/// workflow and the report read the derived fields, and deriving them on READ
+/// would put that parsing in the replay path. A later change to it would then
+/// make a past run mean something new, which is what `content` exists to
+/// prevent. The cap below pays for the copy instead.
+pub const DURABLE_BYTES_PER_BODY_BYTE: u64 = 2;
+
 /// The most of one response body this turn reads.
 ///
-/// A reply the backend cannot record is of no use, and the recorded payload
-/// cap is 2 MiB. This is twice that, so no reply that could be recorded is
-/// refused for its size, and a body that never ends is still bounded.
-pub const MAX_BODY_BYTES: usize = 4 * 1024 * 1024;
+/// A reply the backend cannot record is of no use. The recorded payload cap
+/// is `DEFAULT_MAX_ACTIVITY_RESULT_BYTES`. This is that cap divided by
+/// [`DURABLE_BYTES_PER_BODY_BYTE`], so a body this reader ACCEPTS always fits
+/// once it is stored. A body that never ends is still bounded.
+///
+/// This was once twice the recorded cap, on the reasoning that no recordable
+/// reply should be refused for its size. The factor runs the other way. A
+/// body of 1.8 MB became a durable reply of 3.6 MB, and the backend refused
+/// it as `PayloadTooLarge` after the turn was billed. A turn paid for and
+/// discarded is worse than one refused while it is still being read.
+pub const MAX_BODY_BYTES: usize = {
+    let cap =
+        autumn_harvest::builder::DEFAULT_MAX_ACTIVITY_RESULT_BYTES / DURABLE_BYTES_PER_BODY_BYTE;
+    // The cast cannot lose a bit on any platform this daemon builds for, and
+    // a `usize` narrower than the cap would clamp rather than wrap.
+    if cap > usize::MAX as u64 {
+        usize::MAX
+    } else {
+        cap as usize
+    }
+};
 
 /// Read one response body, and stop at [`MAX_BODY_BYTES`].
 ///

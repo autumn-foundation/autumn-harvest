@@ -5697,11 +5697,107 @@ fn a_response_body_is_read_under_a_byte_cap() {
     );
     assert_eq!(body.len(), cap, "a full body grows no further");
 
-    // The cap is above the recorded payload cap of 2 MiB, so no reply that
-    // could be recorded is refused for its size.
+    // The property the cap must hold, read from the same constants the code
+    // uses so the two cannot drift. A body this reader ACCEPTS always fits
+    // once it is recorded.
+    //
+    // This once asserted the opposite — that the cap was ABOVE the recorded
+    // payload cap, so no recordable reply would be refused for its size. The
+    // factor runs the other way. The durable reply is twice the body, so a
+    // cap above the recorded one accepted bodies nothing could store.
+    let recordable = cap as u64 * claude::DURABLE_BYTES_PER_BODY_BYTE;
     assert!(
-        cap > 2 * 1024 * 1024,
-        "the cap must not refuse a recordable reply: {cap}"
+        recordable <= claude::DURABLE_CAP_BYTES,
+        "a body at the cap must fit once recorded: {recordable} against \
+         {}",
+        claude::DURABLE_CAP_BYTES
+    );
+}
+
+/// A reply the backend cannot record is refused, and the two caps agree.
+///
+/// `TurnReply` keeps the assistant blocks verbatim in `content` and copies
+/// their text and tool calls into `text` and `tool_calls`. Every payload byte
+/// is therefore stored TWICE, so a body well under the recorded cap became a
+/// durable reply above it. The backend answers `PayloadTooLarge`, which is
+/// not retryable, and the turn was billed and then discarded.
+#[test]
+fn a_reply_the_backend_cannot_record_is_refused() {
+    let reply_of = |chars: usize| {
+        claude::parse_reply(&json!({
+            "content": [
+                { "type": "text", "text": "t".repeat(chars) },
+                { "type": "tool_use", "id": "toolu_1", "name": "write_file",
+                  "input": { "path": "notes.md", "content": "c".repeat(chars) } },
+            ],
+            "stop_reason": "tool_use",
+        }))
+    };
+    let sizes = |chars: usize| -> (u64, u64) {
+        let payload = json!({
+            "content": [
+                { "type": "text", "text": "t".repeat(chars) },
+                { "type": "tool_use", "id": "toolu_1", "name": "write_file",
+                  "input": { "path": "notes.md", "content": "c".repeat(chars) } },
+            ],
+            "stop_reason": "tool_use",
+        });
+        let body = serde_json::to_vec(&payload).expect("the body serialises");
+        let durable = serde_json::to_vec(&reply_of(chars)).expect("the reply serialises");
+        (body.len() as u64, durable.len() as u64)
+    };
+
+    // The duplication, measured rather than assumed. The constant the caps
+    // are derived from must be a SOUND bound. It must also be no looser than
+    // it needs to be, so a smaller factor is shown not to hold.
+    let (body, durable) = sizes(400_000);
+    let factor = claude::DURABLE_BYTES_PER_BODY_BYTE;
+    assert!(
+        durable <= body * factor,
+        "the factor must bound the cost: {durable} recorded for a body of {body}"
+    );
+    assert!(
+        durable > body * (factor - 1),
+        "and a smaller factor must not: {durable} recorded for a body of {body}"
+    );
+
+    // A body UNDER the recorded cap whose reply is OVER it. This is the case
+    // that was accepted, billed, and then discarded by the backend.
+    let (body, durable) = sizes(900_000);
+    assert!(
+        body < claude::DURABLE_CAP_BYTES && durable > claude::DURABLE_CAP_BYTES,
+        "the fixture must straddle the cap: body {body}, recorded {durable}"
+    );
+
+    // The read cap now refuses that body while it is still arriving, so the
+    // turn is not paid for first.
+    assert!(
+        body > claude::MAX_BODY_BYTES as u64,
+        "the read cap must refuse a body whose reply cannot be recorded"
+    );
+
+    // And the reply itself is measured as it will be STORED, which no
+    // arithmetic over the body can promise. This decision is UNREACHABLE
+    // over HTTP while the cap above holds, because the read refuses such a
+    // body first. It is the guard that survives a change to `TurnReply`: a
+    // new field raises the real factor, and the derived cap stops holding
+    // silently. So the decision is driven directly here, and the wiring into
+    // the turn is the one line above `Ok(reply)`.
+    let refusal = claude::activity_refusal_for_oversized_reply(&reply_of(900_000));
+    assert!(
+        refusal.is_some(),
+        "a reply over the recorded cap must be refused"
+    );
+    let message = refusal.expect("the refusal says why");
+    assert!(
+        message.contains("once recorded") && message.contains("--max-tokens"),
+        "the refusal must name the cap and what to lower: {message}"
+    );
+
+    // A reply that FITS is not refused, so the guard is not simply a wall.
+    assert!(
+        claude::activity_refusal_for_oversized_reply(&reply_of(1_000)).is_none(),
+        "an ordinary reply must still be accepted"
     );
 }
 

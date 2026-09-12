@@ -335,6 +335,15 @@ Honest limits, so nothing here reads as a promise:
   as its activity input, which is simple and replay-exact but grows with the
   session. A long-running agent should store the transcript outside the engine
   and pass a handle instead. The 2 MiB payload cap is the hard bound.
+- **A recorded turn costs twice its response.** The durable reply keeps the
+  assistant blocks verbatim — that is what makes the next request replay-exact
+  — and also the text and tool calls copied out of them, so every payload byte
+  is stored twice. The response-body cap is therefore the recorded cap
+  *divided* by two, not a multiple of it: a body this daemon accepts always
+  fits once it is stored. A larger body is refused while it is still arriving,
+  which costs nothing, rather than after the turn is billed and the backend
+  answers a non-retryable `PayloadTooLarge`. With the default `--max-tokens`
+  no real reply comes close.
 - **Polling, not push.** `SQLite` has no `LISTEN`/`NOTIFY`, so progress comes
   from the `--tick-ms` poll. The poll reads no database at all: the daemon is
   the only writer, so it holds the live sessions in memory, seeded once at
