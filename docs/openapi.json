@@ -10134,7 +10134,7 @@
             "description": "Execution not found."
           },
           "409": {
-            "description": "The execution is paused, so the mutation was rejected. Resume it first, or wait for the hold to clear."
+            "description": "Reserved for a future state conflict (issue #1457). No path in the current handler returns this status."
           },
           "500": {
             "description": "Database error."
@@ -10192,7 +10192,7 @@
             "description": "Execution not found."
           },
           "409": {
-            "description": "The execution is paused, so the mutation was rejected. Resume it first, or wait for the hold to clear."
+            "description": "Reserved for a future state conflict (issue #1457). No path in the current handler returns this status."
           },
           "500": {
             "description": "Database error."
@@ -10952,7 +10952,7 @@
             "description": "Execution not found."
           },
           "409": {
-            "description": "The execution is paused, so the mutation was rejected. Resume it first, or wait for the hold to clear."
+            "description": "Reserved for a future state conflict (issue #1457). No path in the current handler returns this status."
           },
           "500": {
             "description": "Database error."
@@ -11483,7 +11483,7 @@
             "description": "Execution not found. Also returned when the id encodes a shard neither this node's pools nor the router know about (nothing here could host it)."
           },
           "409": {
-            "description": "The execution is paused, so the mutation was rejected. Resume it first, or wait for the hold to clear."
+            "description": "Reserved for a future state conflict (issue #1457). No path in the current handler returns this status."
           },
           "500": {
             "description": "Database error."
