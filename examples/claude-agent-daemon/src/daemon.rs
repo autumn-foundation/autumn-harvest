@@ -117,43 +117,7 @@ type Live = Vec<ExecutionId>;
 /// Returns an error if the database, the workspace, or the socket cannot be
 /// opened, or if another daemon already holds the socket.
 pub async fn serve(options: Options) -> Result<(), String> {
-    std::fs::create_dir_all(&options.workspace).map_err(|e| {
-        format!(
-            "cannot create the workspace {}: {e}",
-            options.workspace.display()
-        )
-    })?;
-    // Resolve it once. Every session records this value, and the tool activity
-    // refuses a call whose session belongs to a different workspace.
-    let resolved = options.workspace.canonicalize().map_err(|e| {
-        format!(
-            "cannot resolve the workspace {}: {e}",
-            options.workspace.display()
-        )
-    })?;
-    // `create_dir_all` above wrote no directory entry to disk. The write path
-    // flushes from a target up to the workspace root, and the entry that NAMES
-    // the root lives above it. See [`flush_workspace_path`].
-    flush_workspace_path(&resolved);
-    // The model can write to any path inside the workspace, and `write_file`
-    // replaces its target. The database, and its `-wal` sidecar beside it,
-    // must therefore not be reachable from there.
-    refuse_state_in_workspace(&options.db, &resolved)?;
-
-    // A lossy conversion would mangle a path that is not valid UTF-8, and the
-    // recorded identity would then never match the real one again. Refuse the
-    // path instead of recording a name that cannot be compared.
-    let workspace = resolved
-        .to_str()
-        .ok_or_else(|| {
-            format!(
-                "the workspace path {} is not valid UTF-8. Each session records \
-                 this path, so a name that cannot be written down exactly would \
-                 never match again.",
-                resolved.display()
-            )
-        })?
-        .to_string();
+    let workspace = prepare_workspace(&options.workspace, &options.db)?;
 
     // Take the per-database lock FIRST. The open below reclaims every task left
     // `RUNNING` by a dead process. A second daemon opening the same file would
@@ -213,7 +177,13 @@ pub async fn serve(options: Options) -> Result<(), String> {
     // it validated. One query, not two.
     let mut live: Live = resumed;
     let mut ticker = tokio::time::interval(options.tick);
-    loop {
+    // One `Ctrl-C` future for the whole loop, so the drive work below can race
+    // against the SAME signal. A model call can hold a drive for the whole HTTP
+    // timeout. A daemon that answered `Ctrl-C` only between ticks would look
+    // dead for that long.
+    let shutdown = tokio::signal::ctrl_c();
+    tokio::pin!(shutdown);
+    'serve: loop {
         tokio::select! {
             job = rx.recv() => {
                 let Some((request, answer)) = job else { break };
@@ -235,13 +205,21 @@ pub async fn serve(options: Options) -> Result<(), String> {
                 // short whatever the recorded history holds.
                 let ready = live.clone();
                 for exec in ready {
-                    drive_one(&mut runtime, exec, &mut blocked, &mut live).await;
+                    tokio::select! {
+                        () = drive_one(&mut runtime, exec, &mut blocked, &mut live) => {}
+                        result = &mut shutdown => {
+                            // The drive is dropped where it stands. Its task
+                            // stays RUNNING in the file, and the next start
+                            // reclaims it and replays the recorded history.
+                            // That is the same path a crash takes.
+                            report_shutdown(result);
+                            break 'serve;
+                        }
+                    }
                 }
             }
-            result = tokio::signal::ctrl_c() => {
-                if let Err(e) = result {
-                    tracing::error!(error = %e, "cannot listen for Ctrl-C");
-                }
+            result = &mut shutdown => {
+                report_shutdown(result);
                 break;
             }
         }
@@ -720,6 +698,52 @@ pub fn pending_call(
         }
     }
     None
+}
+
+/// Create the workspace, make it durable, and record its resolved name.
+///
+/// # Errors
+///
+/// Returns an error if the workspace cannot be created or resolved, if its
+/// name is not valid UTF-8, or if the database is inside it.
+fn prepare_workspace(workspace: &Path, db: &Path) -> Result<String, String> {
+    std::fs::create_dir_all(workspace)
+        .map_err(|e| format!("cannot create the workspace {}: {e}", workspace.display()))?;
+    // Resolve it once. Every session records this value, and the tool activity
+    // refuses a call whose session belongs to a different workspace.
+    let resolved = workspace
+        .canonicalize()
+        .map_err(|e| format!("cannot resolve the workspace {}: {e}", workspace.display()))?;
+    // `create_dir_all` above wrote no directory entry to disk. The write path
+    // flushes from a target up to the workspace root, and the entry that NAMES
+    // the root lives above it. See [`flush_workspace_path`].
+    flush_workspace_path(&resolved);
+    // The model can write to any path inside the workspace, and `write_file`
+    // replaces its target. The database, and its `-wal` sidecar beside it,
+    // must therefore not be reachable from there.
+    refuse_state_in_workspace(db, &resolved)?;
+
+    // A lossy conversion would mangle a path that is not valid UTF-8, and the
+    // recorded identity would then never match the real one again. Refuse the
+    // path instead of recording a name that cannot be compared.
+    Ok(resolved
+        .to_str()
+        .ok_or_else(|| {
+            format!(
+                "the workspace path {} is not valid UTF-8. Each session records \
+                 this path, so a name that cannot be written down exactly would \
+                 never match again.",
+                resolved.display()
+            )
+        })?
+        .to_string())
+}
+
+/// Log a `Ctrl-C` that could not be listened for.
+fn report_shutdown(result: std::io::Result<()>) {
+    if let Err(e) = result {
+        tracing::error!(error = %e, "cannot listen for Ctrl-C");
+    }
 }
 
 /// The directories above the workspace, closest first.

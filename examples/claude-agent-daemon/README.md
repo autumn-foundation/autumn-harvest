@@ -107,7 +107,9 @@ exactly that, by counting model calls in each process.
 
 Flags: `--db` (default `agentd.db`), `--socket` (default `agentd.sock`),
 `--workspace`, `--model`, `--max-tokens`, `--tick-ms`. Each also reads an
-`AGENTD_*` environment variable.
+`AGENTD_*` environment variable. The API key is **not** among them: it comes
+from `ANTHROPIC_API_KEY` only. A process's arguments are readable by every user
+of the host, and this daemon runs for as long as its sessions do.
 
 A finished session reports the model's own stop reason, so an incomplete run
 never reads as a clean one: `end_turn` is a finished answer, `max_tokens` means

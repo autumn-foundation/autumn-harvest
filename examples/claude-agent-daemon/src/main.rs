@@ -90,9 +90,6 @@ enum Command {
             value_parser = clap::value_parser!(u64).range(1..)
         )]
         tick_ms: u64,
-        /// The API key. An absent key selects the offline stub model.
-        #[arg(long, env = "ANTHROPIC_API_KEY", hide_env_values = true)]
-        api_key: Option<String>,
     },
     /// Start one session.
     Submit {
@@ -150,6 +147,21 @@ async fn main() -> ExitCode {
     }
 }
 
+/// The API key, from the environment only.
+///
+/// There is deliberately no `--api-key` flag. A process's arguments are
+/// readable by every user of the host, through `ps` or `/proc/<pid>/cmdline`.
+/// This daemon runs for as long as its sessions do. A key on the command line
+/// would therefore be readable by the users the owner-only socket exists to
+/// keep out.
+///
+/// An absent key selects the offline stub model.
+fn api_key() -> Option<String> {
+    std::env::var("ANTHROPIC_API_KEY")
+        .ok()
+        .filter(|key| !key.is_empty())
+}
+
 /// Dispatch one command.
 async fn run(cli: Cli) -> Result<(), String> {
     match cli.command {
@@ -158,7 +170,6 @@ async fn run(cli: Cli) -> Result<(), String> {
             model,
             max_tokens,
             tick_ms,
-            api_key,
         } => {
             tracing_subscriber::fmt()
                 .with_env_filter(
@@ -172,7 +183,7 @@ async fn run(cli: Cli) -> Result<(), String> {
                 model,
                 max_tokens,
                 tick: Duration::from_millis(tick_ms),
-                api_key,
+                api_key: api_key(),
             })
             .await
         }
