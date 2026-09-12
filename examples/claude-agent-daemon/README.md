@@ -158,6 +158,15 @@ one pair that cannot be reconciled is refused instead: a turn that says it
 ended and still asks for a tool is malformed, and no guess about which half is
 wrong would be safe.
 
+A turn stopped at the cap is also the one reply whose blocks are **not**
+required to be whole. The cut can land inside a block, and the checks that
+refuse a malformed block exist for what comes after a turn: the blocks are
+replayed into the next request, and the calls reach the approval gate. This
+turn has neither, so refusing it would turn an already-billed answer into a
+failed session instead of a reported one. Every other stop reason still
+requires whole blocks, `end_turn` most of all, because its report carries the
+answer.
+
 Two stop reasons are the daemon's own rather than the model's. `max_turns`
 means the turn budget ran out, and `transcript_full` means the conversation no
 longer fits one request. Both end the session with the work of the turns that

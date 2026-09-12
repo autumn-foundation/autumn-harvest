@@ -39,7 +39,11 @@ pub const WORKFLOW_NAME: &str = "agent_session";
 const STOP_REFUSAL: &str = "refusal";
 
 /// The `stop_reason` of a turn cut short by the output cap.
-const STOP_MAX_TOKENS: &str = "max_tokens";
+///
+/// This turn ENDS the session. Its content is never replayed and its tool
+/// calls are never run. The reply validation therefore accepts a reply cut
+/// off inside a block. See [`crate::claude::malformed_reply`].
+pub const STOP_MAX_TOKENS: &str = "max_tokens";
 
 /// The stop reason of a session whose transcript no longer fits one request.
 ///

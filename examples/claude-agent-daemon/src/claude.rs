@@ -294,17 +294,8 @@ fn call_api(
     // not is malformed, and it is refused before it can reach the gate.
     // Checked BEFORE the tool calls are handed back, because a block that
     // cannot be replayed fails the turn after the tools have already run.
-    if !has_replayable_content(&reply) {
-        return Err(body_failure(
-            status,
-            "its response carried a content block that cannot be replayed",
-        ));
-    }
-    if !has_addressable_calls(&reply) {
-        return Err(body_failure(
-            status,
-            "its tool calls carried a blank, repeated, unsafe, or undecidable id",
-        ));
+    if let Some(reason) = malformed_reply(&reply) {
+        return Err(body_failure(status, reason));
     }
     // A turn cannot both end and ask for a tool. The pair is malformed, and it
     // is refused here rather than resolved by a guess.
@@ -616,6 +607,36 @@ pub fn is_message(payload: &Value) -> bool {
             .get("stop_reason")
             .and_then(Value::as_str)
             .is_some_and(|reason| !reason.is_empty() && reason.trim() == reason)
+}
+
+/// Why this reply cannot be used, when it cannot.
+///
+/// The two checks here exist for what comes AFTER this turn. The blocks are
+/// replayed into the next request, and the calls reach the approval gate.
+///
+/// A turn stopped at the OUTPUT CAP has neither. The loop drops its calls and
+/// ends the session under `max_tokens`. A reply cut off inside a block is
+/// therefore a finished session rather than a failed one. Refusing it turned
+/// a billed answer into a non-retryable failure, and the session ended FAILED
+/// where the loop would have ended it with a report.
+///
+/// The narrowing is to that ONE stop reason, and not to every reason that
+/// ends the session. An `end_turn` also ends it, and its report carries the
+/// answer. A text block this example accepted unchecked would be defaulted to
+/// nothing by `parse_reply`. The report would then show an EARLIER turn's
+/// text as a clean finish. `max_tokens` names the session incomplete, so it
+/// claims nothing a damaged block could falsify.
+pub fn malformed_reply(reply: &TurnReply) -> Option<&'static str> {
+    if reply.stop_reason == crate::session::STOP_MAX_TOKENS {
+        return None;
+    }
+    if !has_replayable_content(reply) {
+        return Some("its response carried a content block that cannot be replayed");
+    }
+    if !has_addressable_calls(reply) {
+        return Some("its tool calls carried a blank, repeated, unsafe, or undecidable id");
+    }
+    None
 }
 
 /// Can every block of this reply be replayed to the API?

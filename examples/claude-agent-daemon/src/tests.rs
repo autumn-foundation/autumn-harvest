@@ -9151,3 +9151,112 @@ fn a_database_replaced_while_the_daemon_starts_is_refused() {
         "the identity must be proved on both sides of the open"
     );
 }
+
+/// One reply body with this content and stop reason.
+fn reply_body(content: &Value, stop: &str) -> TurnReply {
+    claude::parse_reply(&json!({
+        "id": "msg_1",
+        "type": "message",
+        "role": "assistant",
+        "model": "claude-opus-5",
+        "content": content,
+        "stop_reason": stop,
+    }))
+}
+
+/// A turn cut short at the output cap is a finished session, not a failure.
+///
+/// The reply validation exists for what comes AFTER a turn: the blocks are
+/// replayed into the next request, and the calls reach the approval gate. A
+/// turn stopped at the cap has neither. The loop drops its calls and ends the
+/// session under `max_tokens`.
+///
+/// Measured before the fix: a `max_tokens` reply cut off inside a block was
+/// refused. An already-billed answer ended the session FAILED, where the loop
+/// would have ended it with a report.
+///
+/// The narrowing is to that ONE stop reason. `end_turn` also ends the
+/// session, and its report carries the answer. A block accepted unchecked
+/// there could show an earlier turn's text as a clean finish.
+#[test]
+fn a_turn_cut_short_at_the_cap_is_not_refused() {
+    // Every shape a cut leaves partway through a block.
+    let cut = [
+        (
+            "a tool_use with no input",
+            json!([{"type":"text","text":"I will write"},
+                   {"type":"tool_use","id":"toolu_a","name":"write_file"}]),
+        ),
+        (
+            "a tool_use with no name",
+            json!([{"type":"text","text":"I will write"},
+                   {"type":"tool_use","id":"toolu_a"}]),
+        ),
+        (
+            "a tool_use with nothing but its type",
+            json!([{"type":"text","text":"I will write"}, {"type":"tool_use"}]),
+        ),
+        (
+            "a text block cut to nothing",
+            json!([{"type":"text","text":""}]),
+        ),
+    ];
+
+    for (case, content) in &cut {
+        // The hazard: the block really is one the API would refuse back.
+        // This is a choice about when that matters, and not a failure to see
+        // it.
+        let truncated = reply_body(content, "max_tokens");
+        assert!(
+            !claude::has_replayable_content(&truncated),
+            "[{case}] the block must be unreplayable, or this proves nothing"
+        );
+        assert_eq!(
+            claude::malformed_reply(&truncated),
+            None,
+            "[{case}] a turn stopped at the cap must not be refused"
+        );
+
+        // The SAME content under a stop reason that continues the session is
+        // still refused, because that reply is replayed.
+        let continuing = reply_body(content, claude::STOP_TOOL_USE);
+        assert!(
+            claude::malformed_reply(&continuing).is_some(),
+            "[{case}] a turn that asks for a tool must still be refused"
+        );
+
+        // And under the reason whose report carries the answer.
+        let ending = reply_body(content, "end_turn");
+        assert!(
+            claude::malformed_reply(&ending).is_some(),
+            "[{case}] a turn that reports an answer must still be refused"
+        );
+    }
+
+    // The ordinary case: a whole reply that merely stopped at the cap was
+    // never refused, and still is not.
+    let whole = reply_body(
+        &json!([{"type":"text","text":"as far as I got"}]),
+        "max_tokens",
+    );
+    assert!(claude::has_replayable_content(&whole));
+    assert_eq!(claude::malformed_reply(&whole), None);
+
+    // The loop is what makes this safe. A reply stopped at the cap ends the
+    // session, so its content is never replayed and its calls never run.
+    let source = include_str!("session.rs");
+    let body = source
+        .split("pub async fn agent_session(")
+        .nth(1)
+        .expect("the workflow is in the source");
+    let capped = body
+        .find("if reply.stop_reason == STOP_MAX_TOKENS {")
+        .expect("the loop ends the session at the cap");
+    let runs_tools = body
+        .find("if reply.stop_reason != claude::STOP_TOOL_USE")
+        .expect("the loop runs tools under one reason");
+    assert!(
+        capped < runs_tools,
+        "the cap must end the session before any tool call is considered"
+    );
+}
