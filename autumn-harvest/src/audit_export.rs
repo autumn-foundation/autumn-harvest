@@ -422,7 +422,7 @@ pub fn classify_export_outcome(
 
 /// Result of resolving an operator's redrive request against the live
 /// cursor.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RewindOutcome {
     /// The cursor moves backwards from `from` to `to`; every record with
     /// `seq > to` re-exports.
@@ -1741,11 +1741,12 @@ pub async fn rewind_cursor_locked(
 /// redeliver.
 ///
 /// Counts `harvest_audit_log` rows with `to < export_seq <= from`. A retention
-/// sweep does not take the cursor row's `FOR UPDATE` lock (issue #1267), so it
-/// can read the pre-rewind cursor and purge part of this window before the
-/// rewind commits a lower one. `from - to` is the count the redrive was asked
-/// for; this function is the count it can actually deliver. A caller compares
-/// the two to report a gap instead of a recovery the database cannot back up.
+/// sweep does not take the cursor row's `FOR UPDATE` lock (issue #1267). It
+/// can read the pre-rewind cursor and purge part of this window. The rewind
+/// then still commits a lower one. `from - to` is the count the redrive was
+/// asked for; this function is the count it can actually deliver. A caller
+/// compares the two to report a gap instead of a recovery the database
+/// cannot back up.
 ///
 /// # Errors
 /// Returns `HarvestError` on a database failure.
@@ -1767,6 +1768,27 @@ pub async fn count_redrive_recoverable(
         .get_result(conn)
         .await
         .map_err(crate::error::database_error)
+}
+
+/// `(recoverable_records, already_purged_records)` for a
+/// [`rewind_cursor_locked`] outcome (issue #1267).
+///
+/// `(0, 0)` for [`RewindOutcome::NoOp`] and [`RewindOutcome::NotConfigured`]:
+/// a refused rewind moved nothing, so there is no window to measure. For
+/// [`RewindOutcome::Rewound`], see [`count_redrive_recoverable`].
+///
+/// # Errors
+/// Returns `HarvestError` on a database failure.
+#[cfg(feature = "db")]
+pub async fn redrive_recovery_counts(
+    conn: &mut diesel_async::AsyncPgConnection,
+    outcome: RewindOutcome,
+) -> crate::error::HarvestResult<(i64, i64)> {
+    let RewindOutcome::Rewound { from, to } = outcome else {
+        return Ok((0, 0));
+    };
+    let recoverable = count_redrive_recoverable(conn, from, to).await?;
+    Ok((recoverable, (from - to - recoverable).max(0)))
 }
 
 // ---------------------------------------------------------------------

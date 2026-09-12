@@ -37347,12 +37347,26 @@ async fn audit_export_redrive_handler(
     let applied: Result<RedriveApplied, String> = match shard_pool {
         Some(shard_pool) => match acquire_conn(shard_pool).await {
             Ok(mut conn) => {
-                use diesel_async::AsyncConnection as _;
                 let actor = actor.clone();
                 let source = source.clone();
                 let request_id = request_id.clone();
                 let target_label = target_label.clone();
-                Box::pin(conn.transaction::<
+                // Pinned to READ COMMITTED, not inherited (issue #1267,
+                // matching `queue::claim_task`, `activity_pause`,
+                // `queue_pause`, the timeout enforcer, and the scheduler).
+                // The recoverable-records count below depends on seeing a
+                // retention purge that commits after this transaction's
+                // first statement. Under READ COMMITTED each statement gets
+                // a fresh snapshot, so that holds. Under REPEATABLE READ (or
+                // SERIALIZABLE), every statement shares one snapshot instead,
+                // taken at the cursor's `FOR UPDATE`. A purge committed after
+                // that point would stay invisible to the count. It would
+                // silently report full recovery of records already gone.
+                // Pinning the level on `BEGIN` keeps the guarantee
+                // independent of an operator's
+                // `default_transaction_isolation` setting.
+                let mut tx = conn.build_transaction().read_committed();
+                Box::pin(tx.run::<
                     RedriveApplied,
                     ::autumn_harvest::error::HarvestError,
                     _,
@@ -37371,20 +37385,8 @@ async fn audit_export_redrive_handler(
                     // #1267). Count what survives, in this same transaction,
                     // before the response claims anything.
                     let (recoverable_records, already_purged_records) =
-                        if let ::autumn_harvest::audit_export::RewindOutcome::Rewound {
-                            from,
-                            to,
-                        } = outcome
-                        {
-                            let recoverable =
-                                ::autumn_harvest::audit_export::count_redrive_recoverable(
-                                    conn, from, to,
-                                )
-                                .await?;
-                            (recoverable, (from - to - recoverable).max(0))
-                        } else {
-                            (0, 0)
-                        };
+                        ::autumn_harvest::audit_export::redrive_recovery_counts(conn, outcome)
+                            .await?;
 
                     // Only a rewind that actually moved the cursor is a
                     // SUCCEEDED privileged action; a refused request changed

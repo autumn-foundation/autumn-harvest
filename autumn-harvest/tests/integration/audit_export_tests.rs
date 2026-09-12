@@ -820,21 +820,58 @@ async fn redrive_recoverable_count_matches_the_full_window_when_nothing_was_purg
         .expect("rewind");
     assert_eq!(outcome, RewindOutcome::Rewound { from: 5, to: 0 });
 
-    let recoverable = autumn_harvest::audit_export::count_redrive_recoverable(&mut conn, 5, 0)
-        .await
-        .expect("count");
+    // Drive the exact function the handler calls, on the outcome it actually
+    // got back, rather than re-typing `(from, to)` by hand.
+    let (recoverable, already_purged) =
+        autumn_harvest::audit_export::redrive_recovery_counts(&mut conn, outcome)
+            .await
+            .expect("counts");
     assert_eq!(
         recoverable, 5,
         "every record in the redrive window still exists, so all 5 recover"
     );
+    assert_eq!(already_purged, 0, "nothing raced this redrive");
 }
 
-// A retention sweep does not take the cursor row's lock, so it can act on the
-// stale, pre-rewind cursor and purge part of the window a redrive is about to
-// promise back (issue #1267). Reproduce the race's end state directly:
-// records old enough and already acknowledged are exactly what the purge
-// removes regardless of which cursor value it read, so purging BEFORE the
-// redrive lands the database in the same state a true interleaving would.
+// `redrive_recovery_counts` must not treat a refused rewind as a window to
+// measure. `NoOp` and `NotConfigured` moved nothing, so both counts are `0`,
+// and neither touches `harvest_audit_log`.
+#[tokio::test]
+async fn redrive_recovery_counts_is_zero_for_a_refused_rewind() {
+    let _guard = TEST_SERIAL.lock().await;
+    uninstall();
+    let (mut conn, _c) = make_conn().await;
+
+    let noop = RewindOutcome::NoOp {
+        cursor: 5,
+        requested: 5,
+    };
+    assert_eq!(
+        autumn_harvest::audit_export::redrive_recovery_counts(&mut conn, noop)
+            .await
+            .expect("counts"),
+        (0, 0)
+    );
+
+    assert_eq!(
+        autumn_harvest::audit_export::redrive_recovery_counts(
+            &mut conn,
+            RewindOutcome::NotConfigured
+        )
+        .await
+        .expect("counts"),
+        (0, 0)
+    );
+}
+
+// A retention sweep does not take the cursor row's lock. It can act on the
+// stale, pre-rewind cursor and purge part of the window a redrive is about
+// to promise back (issue #1267).
+//
+// Reproduce the race's end state directly. Records old enough and already
+// acknowledged are exactly what the purge removes, regardless of which
+// cursor value it read. Purging BEFORE the redrive therefore lands the
+// database in the same state a true interleaving would.
 #[tokio::test]
 async fn redrive_recoverable_count_falls_short_when_a_purge_already_removed_part_of_the_window() {
     let _guard = TEST_SERIAL.lock().await;
@@ -869,12 +906,17 @@ async fn redrive_recoverable_count_falls_short_when_a_purge_already_removed_part
          which really are recoverable"
     );
 
-    let recoverable = autumn_harvest::audit_export::count_redrive_recoverable(&mut conn, 5, 0)
-        .await
-        .expect("count");
+    let (recoverable, already_purged) =
+        autumn_harvest::audit_export::redrive_recovery_counts(&mut conn, outcome)
+            .await
+            .expect("counts");
     assert_eq!(
         recoverable, 2,
         "only records 4-5 survive; the redrive must report 2, not the 5 it was asked for"
+    );
+    assert_eq!(
+        already_purged, 3,
+        "the 3 records retention already removed must be named, not silently dropped"
     );
 }
 
