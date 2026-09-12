@@ -165,7 +165,10 @@ pub async fn serve(options: Options) -> Result<(), String> {
     // Only `RUNNING` rows are ever driven again, so restarting with the right
     // flags could not bring it back. An operator who mistypes `--workspace`
     // gets an error here, and every session stays resumable.
-    check_resumable(&reader, &workspace, &identity)?;
+    let resumed = check_resumable(&reader, &workspace, &identity)?;
+    if !resumed.is_empty() {
+        tracing::info!(count = resumed.len(), "resuming the sessions left running");
+    }
     let listener = bind(&options.socket).await?;
     let (tx, mut rx) = mpsc::channel::<Job>(COMMAND_BACKLOG);
     tokio::spawn(accept_loop(listener, tx));
@@ -185,9 +188,9 @@ pub async fn serve(options: Options) -> Result<(), String> {
     }
 
     let mut blocked: Parked = Parked::new();
-    // Seed the live set once. Every session already RUNNING in the file resumes
-    // by replay, so the tick has to know about it.
-    let mut live: Live = seed_live(&reader);
+    // The startup check already read the RUNNING rows, so the live set is what
+    // it validated. One query, not two.
+    let mut live: Live = resumed;
     let mut ticker = tokio::time::interval(options.tick);
     loop {
         tokio::select! {
@@ -243,11 +246,13 @@ pub async fn serve(options: Options) -> Result<(), String> {
 ///
 /// The activity-level checks stay as a backstop, but they can only fail a run.
 /// This is the check that protects the work.
-fn check_resumable(reader: &Connection, workspace: &str, model: &str) -> Result<(), String> {
-    for row in inspect::executions(reader, WORKFLOW_NAME)? {
-        if row.state != "RUNNING" {
-            continue;
-        }
+fn check_resumable(
+    reader: &Connection,
+    workspace: &str,
+    model: &str,
+) -> Result<Vec<ExecutionId>, String> {
+    let mut live = Vec::new();
+    for row in inspect::running(reader, WORKFLOW_NAME)? {
         let Ok(task) = serde_json::from_str::<SessionTask>(&row.input_json) else {
             continue;
         };
@@ -267,8 +272,11 @@ fn check_resumable(reader: &Connection, workspace: &str, model: &str) -> Result<
                 row.exec_id, task.model, task.model
             ));
         }
+        if let Ok(exec) = row.exec_id.parse::<ExecutionId>() {
+            live.push(exec);
+        }
     }
-    Ok(())
+    Ok(live)
 }
 
 /// Take the control socket, refusing to displace a live daemon.
@@ -378,20 +386,19 @@ fn handle(
             max_turns,
             approval_timeout_secs,
         ),
-        Request::Status { execution_id, full } => match sessions(runtime, reader, blocked, full) {
-            Ok(views) => views
-                .into_iter()
-                .find(|view| view.execution_id == execution_id)
-                .map_or_else(
-                    || Response::Error {
-                        message: format!("no session {execution_id}"),
-                    },
-                    |session| Response::Session {
-                        session: Box::new(session),
-                    },
-                ),
-            Err(message) => Response::Error { message },
-        },
+        // One session is named, so one row is read. The listing would select
+        // the input and the output of every session that ever ran.
+        Request::Status { execution_id, full } => {
+            match inspect::execution(reader, WORKFLOW_NAME, &execution_id) {
+                Ok(Some(row)) => Response::Session {
+                    session: Box::new(view(runtime, &row, blocked, full)),
+                },
+                Ok(None) => Response::Error {
+                    message: format!("no session {execution_id}"),
+                },
+                Err(message) => Response::Error { message },
+            }
+        }
         Request::List => match sessions(runtime, reader, blocked, false) {
             Ok(sessions) => Response::Sessions { sessions },
             Err(message) => Response::Error { message },
@@ -782,37 +789,6 @@ fn resolve_database(db: &Path) -> Result<PathBuf, String> {
         .file_name()
         .ok_or_else(|| format!("{} does not name a database file", db.display()))?;
     Ok(resolved.join(name))
-}
-
-/// The sessions a previous process left running.
-///
-/// This is the one database read of the live set. It runs before the socket
-/// accepts a command, so nothing can be submitted in between and no session is
-/// missed.
-///
-/// A failure here is not fatal, and it is not silent. The daemon still serves
-/// its socket, and a submitted session still runs. What an operator loses is
-/// the resumption of the older ones, which the log says plainly.
-fn seed_live(reader: &Connection) -> Live {
-    match inspect::running(reader, WORKFLOW_NAME) {
-        Ok(ids) => {
-            let live: Live = ids
-                .iter()
-                .filter_map(|id| id.parse::<ExecutionId>().ok())
-                .collect();
-            if !live.is_empty() {
-                tracing::info!(count = live.len(), "resuming the sessions left running");
-            }
-            live
-        }
-        Err(message) => {
-            tracing::error!(
-                error = %message,
-                "cannot enumerate the running sessions, so none of them resumes"
-            );
-            Vec::new()
-        }
-    }
 }
 
 /// Add a session to the set the tick drives.

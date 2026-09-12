@@ -477,8 +477,21 @@ async fn the_daemon_serves_one_session_over_its_socket() {
         "the event log does not record what the tools did: {events:?}"
     );
 
-    // A well-formed id that names no session is an error, not an empty log. A
-    // mistyped audit target must not read as a session that did nothing.
+    // A well-formed id that names no session is an error from both commands.
+    // A mistyped audit target must not read as a session that did nothing.
+    let unknown = protocol::call(
+        &socket,
+        &Request::Status {
+            execution_id: "00000000-0000-4000-8000-000000000000".to_string(),
+            full: false,
+        },
+    )
+    .await
+    .expect("the status is answered");
+    assert!(
+        matches!(unknown, Response::Error { .. }),
+        "an unknown session must be refused: {unknown:?}"
+    );
     let missing = protocol::call(
         &socket,
         &Request::History {
@@ -1379,7 +1392,7 @@ fn the_toolbox_stops_listing_a_directory_at_the_cap() {
 }
 
 #[tokio::test]
-async fn the_drive_query_reads_only_the_running_sessions() {
+async fn the_startup_and_status_queries_read_only_what_they_need() {
     let dir = tempfile::tempdir().expect("a temporary directory");
     let workspace = dir.path().join("workspace");
     std::fs::create_dir_all(&workspace).expect("the workspace is created");
@@ -1410,9 +1423,20 @@ async fn the_drive_query_reads_only_the_running_sessions() {
     let reader = crate::inspect::open(&db).expect("the inspector opens");
     let running = crate::inspect::running(&reader, WORKFLOW_NAME).expect("the drive query answers");
     assert_eq!(
-        running,
+        running
+            .iter()
+            .map(|session| session.exec_id.clone())
+            .collect::<Vec<_>>(),
         vec![parked.to_string()],
         "only the parked session is drivable"
+    );
+    // The startup check reads the task out of this row, so the query carries
+    // the input as well as the id.
+    assert!(
+        running
+            .first()
+            .is_some_and(|session| session.input_json.contains("summarise the workspace")),
+        "the running row must carry the task it started from"
     );
     assert_eq!(
         crate::inspect::executions(&reader, WORKFLOW_NAME)
@@ -1420,6 +1444,33 @@ async fn the_drive_query_reads_only_the_running_sessions() {
             .len(),
         2,
         "both sessions are still listed for the operator"
+    );
+
+    // `status` names one session, so it reads one row rather than building a
+    // view of every session that ever ran.
+    let one = |exec: ExecutionId| {
+        crate::inspect::execution(&reader, WORKFLOW_NAME, &exec.to_string())
+            .expect("the single-row query answers")
+    };
+    assert_eq!(
+        one(done).map(|row| row.state),
+        Some("COMPLETED".to_string()),
+        "the finished session is readable by id"
+    );
+    assert_eq!(
+        one(parked).map(|row| row.state),
+        Some("RUNNING".to_string()),
+        "the parked session is readable by id"
+    );
+    assert!(
+        crate::inspect::execution(
+            &reader,
+            WORKFLOW_NAME,
+            "00000000-0000-4000-8000-000000000000",
+        )
+        .expect("the single-row query answers")
+        .is_none(),
+        "an id that names no session reads as nothing"
     );
 }
 

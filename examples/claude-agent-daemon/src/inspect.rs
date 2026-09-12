@@ -13,6 +13,12 @@ use rusqlite::{Connection, OpenFlags};
 /// How long a read waits for the writer's transaction to commit.
 const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// One RUNNING session: its id, and the task it started from.
+pub struct RunningSession {
+    pub exec_id: String,
+    pub input_json: String,
+}
+
 /// One row of `harvest_executions`.
 pub struct ExecutionRow {
     pub exec_id: String,
@@ -56,29 +62,69 @@ pub fn is_session(conn: &Connection, workflow_name: &str, exec_id: &str) -> Resu
     })
 }
 
-/// The ids of every RUNNING session, oldest first.
+/// Every RUNNING session, oldest first, with the task it started from.
 ///
-/// The drive tick runs this on every poll, so it reads one column of the rows
-/// it can act on. The full listing selects the input and output payloads of
-/// every session that ever ran. An idle daemon must not pay for its whole
-/// history several times a second.
+/// The startup check reads this, and the drive tick is seeded from it. Both
+/// want the sessions that can still run, and neither wants the output of every
+/// session that ever finished. A daemon must not pay for its whole history to
+/// start.
 ///
 /// # Errors
 ///
 /// Returns an error if the query fails.
-pub fn running(conn: &Connection, workflow_name: &str) -> Result<Vec<String>, String> {
+pub fn running(conn: &Connection, workflow_name: &str) -> Result<Vec<RunningSession>, String> {
     let mut statement = conn
         .prepare(
-            "SELECT exec_id FROM harvest_executions \
+            "SELECT exec_id, input_json FROM harvest_executions \
              WHERE workflow_name = ?1 AND state = 'RUNNING' ORDER BY rowid",
         )
-        .map_err(|e| format!("cannot prepare the drive query: {e}"))?;
+        .map_err(|e| format!("cannot prepare the running-session query: {e}"))?;
     let rows = statement
-        .query_map([workflow_name], |row| row.get(0))
+        .query_map([workflow_name], |row| {
+            Ok(RunningSession {
+                exec_id: row.get(0)?,
+                input_json: row.get(1)?,
+            })
+        })
         .map_err(|e| format!("cannot read the running sessions: {e}"))?;
 
     rows.collect::<Result<Vec<_>, _>>()
         .map_err(|e| format!("cannot read the running sessions: {e}"))
+}
+
+/// One session, by id.
+///
+/// `status` names one session, so it reads one row. The listing would select
+/// and allocate the input and the output of every session that ever ran. The
+/// daemon serves its commands one at a time, so that cost blocks every one.
+///
+/// # Errors
+///
+/// Returns an error if the query fails.
+pub fn execution(
+    conn: &Connection,
+    workflow_name: &str,
+    exec_id: &str,
+) -> Result<Option<ExecutionRow>, String> {
+    conn.query_row(
+        "SELECT exec_id, state, input_json, output_json, error FROM harvest_executions \
+         WHERE workflow_name = ?1 AND exec_id = ?2",
+        [workflow_name, exec_id],
+        |row| {
+            Ok(ExecutionRow {
+                exec_id: row.get(0)?,
+                state: row.get(1)?,
+                input_json: row.get(2)?,
+                output_json: row.get(3)?,
+                error: row.get(4)?,
+            })
+        },
+    )
+    .map(Some)
+    .or_else(|e| match e {
+        rusqlite::Error::QueryReturnedNoRows => Ok(None),
+        other => Err(format!("cannot read session {exec_id}: {other}")),
+    })
 }
 
 /// Every execution of the agent workflow, oldest first.

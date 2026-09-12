@@ -220,7 +220,9 @@ is ever approved sight unseen.
 - **[`src/daemon.rs`](src/daemon.rs)** — the socket, the drive tick, and the
   single-writer main loop.
 - **[`src/inspect.rs`](src/inspect.rs)** — a second, **read-only** connection
-  for the listing the runtime does not expose.
+  for the reads the runtime does not expose. Each one asks for what it needs: a
+  `status` reads one row, the startup check and the drive tick read the running
+  rows, and only `list` reads them all.
 - **[`src/guard.rs`](src/guard.rs)** — the exclusive lock on the database file
   that keeps "one writer" true across processes.
 
