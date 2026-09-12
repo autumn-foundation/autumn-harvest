@@ -167,9 +167,21 @@ async fn main() -> ExitCode {
 ///
 /// An absent key selects the offline stub model.
 fn api_key() -> Option<String> {
-    std::env::var("ANTHROPIC_API_KEY")
-        .ok()
-        .filter(|key| !key.is_empty())
+    usable_key(&std::env::var("ANTHROPIC_API_KEY").unwrap_or_default())
+}
+
+/// Read one environment value as a key, or as no key at all.
+///
+/// A key of whitespace is not a key. It would otherwise count as present, and
+/// the daemon would run live against it. Every turn would then fail at the
+/// API, where an absent key runs the offline stub instead.
+///
+/// The value is trimmed, because an operator commonly reads a key out of a
+/// file and keeps the newline. A header carries that byte to the API, which
+/// rejects it, and the error names neither the newline nor the file.
+fn usable_key(raw: &str) -> Option<String> {
+    let key = raw.trim();
+    (!key.is_empty()).then(|| key.to_string())
 }
 
 /// Dispatch one command.

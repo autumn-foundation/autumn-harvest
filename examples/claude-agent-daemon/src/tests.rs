@@ -1409,6 +1409,28 @@ fn a_hard_linked_database_is_refused() {
 }
 
 #[test]
+fn a_key_of_whitespace_is_not_a_key() {
+    // A key of whitespace would count as present, and the daemon would run
+    // live against it. Every turn would fail at the API. An absent key runs
+    // the offline stub instead, which is the quieter and correct outcome.
+    for blank in ["", " ", "\t\n", "   "] {
+        assert_eq!(
+            crate::usable_key(blank),
+            None,
+            "a key of whitespace must read as no key: {blank:?}"
+        );
+    }
+
+    // An operator commonly reads a key out of a file and keeps the newline.
+    // A header carries that byte to the API, which rejects it.
+    assert_eq!(
+        crate::usable_key("sk-ant-example\n").as_deref(),
+        Some("sk-ant-example"),
+        "a key keeps none of the whitespace around it"
+    );
+}
+
+#[test]
 fn a_turn_whose_tool_calls_share_an_id_is_refused() {
     let call = |id: &str| ToolCall {
         id: id.to_string(),

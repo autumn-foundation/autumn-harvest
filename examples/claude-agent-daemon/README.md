@@ -20,7 +20,8 @@ this example shows what the engine gives you once the loop lives inside one:
 ## Try it in one minute — no API key needed
 
 With no `ANTHROPIC_API_KEY` set, the daemon registers a small **offline stub
-model** instead of calling the API. The stub drives the same loop: it lists the
+model** instead of calling the API. A variable holding only whitespace counts
+as unset, and a key is trimmed before use. The stub drives the same loop: it lists the
 workspace, proposes one file write (which needs your approval), and answers.
 
 Run these from the repository root — Cargo needs the workspace manifest:
