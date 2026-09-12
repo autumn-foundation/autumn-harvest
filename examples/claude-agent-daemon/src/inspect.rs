@@ -127,6 +127,52 @@ pub fn execution(
     })
 }
 
+/// When the deadline of one awaited signal expires, in epoch milliseconds.
+///
+/// `wait_for_signal_timeout` arms a race timer named
+/// `__signal_timeout:{seq}:{signal}`. The backend fires an EXPIRED timer of
+/// this kind before a signal that arrives after it, so a late decision can
+/// never win the race. The daemon reads the deadline for the same reason. An
+/// acknowledgement after it would tell an operator that a call was approved.
+/// The session is going to report that call as denied.
+///
+/// The name is matched the way the backend matches it, rather than with a
+/// `LIKE` pattern. A signal name can hold `%` or `_`.
+///
+/// # Errors
+///
+/// Returns an error if the query fails.
+pub fn signal_deadline(
+    conn: &Connection,
+    exec_id: &str,
+    signal: &str,
+) -> Result<Option<i64>, String> {
+    let mut statement = conn
+        .prepare("SELECT timer_id, fire_at FROM harvest_timers WHERE exec_id = ?1")
+        .map_err(|e| format!("cannot prepare the deadline query: {e}"))?;
+    let rows = statement
+        .query_map([exec_id], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+        })
+        .map_err(|e| format!("cannot read the deadlines: {e}"))?;
+
+    for row in rows {
+        let (timer_id, fire_at) = row.map_err(|e| format!("cannot read a deadline: {e}"))?;
+        if races_signal(&timer_id, signal) {
+            return Ok(Some(fire_at));
+        }
+    }
+    Ok(None)
+}
+
+/// Is this timer the deadline of that signal's wait?
+fn races_signal(timer_id: &str, signal: &str) -> bool {
+    timer_id
+        .strip_prefix("__signal_timeout:")
+        .and_then(|rest| rest.split_once(':'))
+        .is_some_and(|(_seq, name)| name == signal)
+}
+
 /// Every execution of the agent workflow, oldest first.
 ///
 /// # Errors

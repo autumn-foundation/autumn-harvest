@@ -478,6 +478,81 @@ async fn a_caller_that_sends_nothing_does_not_hold_the_daemon() {
     daemon.abort();
 }
 
+#[tokio::test]
+async fn a_decision_after_the_deadline_is_refused() {
+    let dir = tempfile::tempdir().expect("a temporary directory");
+    let workspace = dir.path().join("workspace");
+    std::fs::create_dir_all(&workspace).expect("the workspace is created");
+    let db = dir.path().join("agentd.db");
+
+    let calls = Arc::new(AtomicUsize::new(0));
+    let mut rt = runtime(&db, &workspace, &calls);
+    // A deadline short enough to pass while the operator thinks.
+    let task = serde_json::to_value(SessionTask {
+        goal: "summarise the workspace".to_string(),
+        max_turns: 6,
+        approval_timeout_secs: 1,
+        workspace: workspace_id(&workspace),
+        model: claude::OFFLINE_MODEL.to_string(),
+    })
+    .expect("the task encodes");
+    let exec = rt
+        .start_workflow(WORKFLOW_NAME, task)
+        .expect("the session starts");
+    let signal = drive_to_approval(&mut rt, exec).await;
+
+    let reader = crate::inspect::open(&db).expect("the inspector opens");
+    let parked = |signal: &str| {
+        let mut blocked = std::collections::HashMap::new();
+        blocked.insert(
+            exec,
+            daemon::ParkedState {
+                reason: "waiting for a tool approval".to_string(),
+                signal: Some(signal.to_string()),
+            },
+        );
+        blocked
+    };
+
+    // Before the deadline the decision is taken.
+    let mut blocked = parked(&signal);
+    let answer = daemon::approve(
+        &mut rt,
+        &reader,
+        &mut blocked,
+        &exec.to_string(),
+        &signal,
+        true,
+        None,
+    );
+    assert!(
+        matches!(answer, Response::Ack { .. }),
+        "an on-time decision must be taken: {answer:?}"
+    );
+
+    // After it, the backend fires the expired timer BEFORE a late signal, so
+    // the session denies the call however this answer reads. An "approved"
+    // here would be a lie the operator finds only in the history.
+    tokio::time::sleep(Duration::from_millis(1200)).await;
+    let mut blocked = parked(&signal);
+    let refused = daemon::approve(
+        &mut rt,
+        &reader,
+        &mut blocked,
+        &exec.to_string(),
+        &signal,
+        true,
+        None,
+    );
+    let Response::Error { message } = refused else {
+        panic!("a late decision must not be acknowledged, got {refused:?}");
+    };
+    assert!(
+        message.contains("deadline"),
+        "the refusal must say why: {message}"
+    );
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn the_daemon_answers_more_connections_than_it_holds_at_once() {
     let dir = tempfile::tempdir().expect("a temporary directory");

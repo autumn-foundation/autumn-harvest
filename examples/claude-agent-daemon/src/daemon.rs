@@ -107,12 +107,12 @@ const MAX_EVENT_DETAIL_CHARS: usize = 240;
 
 /// Why one session is parked, and what would release it.
 #[derive(Clone)]
-struct ParkedState {
+pub struct ParkedState {
     /// The operator-facing reason.
-    reason: String,
+    pub reason: String,
     /// The signal name a decision must carry, when the session waits for one.
     /// It names the exact tool call, so an approval cannot release another.
-    signal: Option<String>,
+    pub signal: Option<String>,
 }
 
 /// The parked sessions this daemon knows about.
@@ -534,7 +534,15 @@ fn handle(
             token,
             approved,
             note,
-        } => approve(runtime, blocked, &execution_id, &token, approved, note),
+        } => approve(
+            runtime,
+            reader,
+            blocked,
+            &execution_id,
+            &token,
+            approved,
+            note,
+        ),
     }
 }
 
@@ -586,8 +594,9 @@ fn submit(
 /// name carries the tool-use id. A decision can therefore only release the call
 /// the operator was shown. An early, repeated, or stale `approve` has no live
 /// wait to land in, so it is refused here rather than staged for a later call.
-fn approve(
+pub fn approve(
     runtime: &mut SqliteRuntime,
+    reader: &Connection,
     blocked: &mut Parked,
     execution_id: &str,
     token: &str,
@@ -620,6 +629,23 @@ fn approve(
             ),
         };
     }
+    // A decision that arrives after the deadline cannot win. The backend fires
+    // the expired race timer BEFORE a late signal, on purpose, so the session
+    // reports the call as denied however this answer reads. Saying "approved"
+    // here would be a lie the operator only discovers in the history.
+    match expired(reader, execution_id, &signal) {
+        Ok(Some(passed)) => {
+            return Response::Error {
+                message: format!(
+                    "the deadline for this call passed {passed} seconds ago, so the \
+                     session denies it on its next drive. Nothing was delivered."
+                ),
+            };
+        }
+        Ok(None) => {}
+        Err(message) => return Response::Error { message },
+    }
+
     let decision = ApprovalDecision { approved, note };
     let payload = match serde_json::to_value(decision) {
         Ok(value) => value,
@@ -653,6 +679,24 @@ fn approve(
             message: format!("cannot deliver the decision: {e}"),
         },
     }
+}
+
+/// How long ago the deadline of this wait passed, in seconds.
+///
+/// `None` means the wait still has time, or has no deadline at all.
+fn expired(reader: &Connection, execution_id: &str, signal: &str) -> Result<Option<i64>, String> {
+    let Some(fire_at) = inspect::signal_deadline(reader, execution_id, signal)? else {
+        return Ok(None);
+    };
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_err(|e| format!("cannot read the clock: {e}"))?;
+    let now =
+        i64::try_from(now.as_millis()).map_err(|e| format!("the clock is out of range: {e}"))?;
+    if now < fire_at {
+        return Ok(None);
+    }
+    Ok(Some((now - fire_at) / 1000))
 }
 
 /// Report the recorded event log of one session.
