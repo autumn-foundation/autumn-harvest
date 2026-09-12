@@ -425,14 +425,24 @@ fn http_failure(status: reqwest::StatusCode, body: &str) -> String {
 /// The stop reason must say something. A blank one is not a stop reason, and
 /// it differs from `end_turn`, so the usability test below would accept it.
 /// The loop then records a completed session whose stop reason says nothing.
-/// The test is on the trimmed reason. A reason of one space is as blank as an
-/// empty one, and it reaches the same place by the same path.
+///
+/// It must also say it EXACTLY. A reason with space around it is refused
+/// here, rather than normalised later, because normalising it has no safe
+/// answer. Trimming turns ` tool_use ` into the reason that AUTHORISES a
+/// tool call, so a malformed response would reach the approval gate and run
+/// an approved write. Keeping it verbatim matches no reason this loop acts
+/// on, so ` end_turn ` would instead record a session as complete with no
+/// answer.
+///
+/// A padded reason is a malformed body, and this example already ends a turn
+/// on one. The refusal is terminal, because the response was billed, so an
+/// operator sees it rather than a session that quietly did nothing.
 pub fn is_message(payload: &Value) -> bool {
     payload.get("content").is_some_and(Value::is_array)
         && payload
             .get("stop_reason")
             .and_then(Value::as_str)
-            .is_some_and(|reason| !reason.trim().is_empty())
+            .is_some_and(|reason| !reason.is_empty() && reason.trim() == reason)
 }
 
 /// Can every block of this reply be replayed to the API?
@@ -647,11 +657,17 @@ pub fn parse_reply(payload: &Value) -> TurnReply {
         }
     }
 
+    // VERBATIM, and not trimmed. The value is compared exactly against the two
+    // reasons this loop acts on, the way a content block's type is.
+    //
+    // Trimming would turn ` tool_use ` into the reason that AUTHORISES a tool
+    // call. A malformed response could then reach the approval gate and run
+    // an approved write. `is_message` refuses a padded reason before this
+    // runs, so neither normalisation is needed here.
     let stop_reason = payload
         .get("stop_reason")
         .and_then(Value::as_str)
-        .unwrap_or("end_turn")
-        .trim()
+        .unwrap_or(STOP_END_TURN)
         .to_string();
 
     // A refusal carries no usable content, so the category becomes the answer.

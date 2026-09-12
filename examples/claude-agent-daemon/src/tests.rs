@@ -1912,37 +1912,63 @@ fn a_billed_response_that_is_not_a_message_is_refused() {
 }
 
 #[test]
-fn a_padded_stop_reason_is_read_under_its_own_name() {
-    // A reason with surrounding space passes the shape check, because its
-    // trimmed value says something. The projection must then classify it by
-    // that same trimmed name. A verbatim ` end_turn ` matches no comparison
-    // below. The loop then reports a completed session with no answer. A
-    // verbatim ` tool_use ` drops the calls the turn asked for.
-    let ended = claude::parse_reply(&json!({
-        "content": [{ "type": "text", "text": "done" }],
-        "stop_reason": " end_turn ",
-    }));
-    assert_eq!(
-        ended.stop_reason,
-        claude::STOP_END_TURN,
-        "a padded end_turn must read as end_turn"
-    );
+fn a_padded_stop_reason_is_refused_rather_than_normalised() {
+    // A reason with space around it has no safe normalisation. Trimming turns
+    // ` tool_use ` into the reason that AUTHORISES a tool call, so a
+    // malformed response would reach the approval gate and run an approved
+    // write. Keeping it verbatim matches no reason this loop acts on, so
+    // ` end_turn ` would record a session as complete with no answer.
+    //
+    // So it is refused as the malformed body it is, before either.
+    for padded in [" end_turn ", " tool_use ", "tool_use\t", "\nend_turn"] {
+        let payload = json!({
+            "content": [{ "type": "text", "text": "done" }],
+            "stop_reason": padded,
+        });
+        assert!(
+            !claude::is_message(&payload),
+            "a padded stop reason must be refused: {padded:?}"
+        );
+    }
 
-    let calling = claude::parse_reply(&json!({
-        "content": [{ "type": "tool_use", "id": "t1", "name": "list_files", "input": {} }],
-        "stop_reason": "\ttool_use\n",
+    // The two reasons this loop acts on still pass, exactly as they arrive.
+    for exact in [claude::STOP_END_TURN, claude::STOP_TOOL_USE, "max_tokens"] {
+        let payload = json!({
+            "content": [{ "type": "text", "text": "done" }],
+            "stop_reason": exact,
+        });
+        assert!(
+            claude::is_message(&payload),
+            "an exact stop reason must pass: {exact}"
+        );
+    }
+
+    // A blank one is still refused, which is what this check was built for.
+    for blank in ["", " ", "\t"] {
+        let payload = json!({
+            "content": [{ "type": "text", "text": "done" }],
+            "stop_reason": blank,
+        });
+        assert!(
+            !claude::is_message(&payload),
+            "a blank stop reason must be refused: {blank:?}"
+        );
+    }
+
+    // The projection keeps the reason VERBATIM, so nothing downstream can
+    // turn a padded one into the reason that authorises a tool call.
+    let padded = claude::parse_reply(&json!({
+        "content": [{ "type": "text", "text": "done" }],
+        "stop_reason": " tool_use ",
     }));
     assert_eq!(
-        calling.stop_reason,
-        claude::STOP_TOOL_USE,
-        "a padded tool_use must read as tool_use"
+        padded.stop_reason, " tool_use ",
+        "the projection must not normalise the reason"
     );
-    assert!(
-        !claude::is_usable(&claude::parse_reply(&json!({
-            "content": [Value::Null],
-            "stop_reason": " tool_use ",
-        }))),
-        "a padded tool_use with no call must still be refused"
+    assert_ne!(
+        padded.stop_reason,
+        claude::STOP_TOOL_USE,
+        "a padded reason must never match the one that authorises a tool call"
     );
 }
 
