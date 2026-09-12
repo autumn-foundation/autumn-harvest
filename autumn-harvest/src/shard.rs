@@ -1189,11 +1189,23 @@ fn split_options_preserving_escapes(options: &str) -> Vec<String> {
 /// `one` would then both join to the same string `tenant,one` -- a
 /// real collision. Escaping first keeps every item's boundary in the
 /// joined key, so the two cases above never compare equal.
+///
+/// `pg_catalog` is inserted at the front when the parsed list omits it
+/// (issue #1266). `PostgreSQL` always searches `pg_catalog` first when
+/// it is not named explicitly. `public` and `pg_catalog,public`
+/// therefore resolve an unqualified relation the same way, and must
+/// key the same. A list that already names `pg_catalog` anywhere is
+/// left as-is. Its explicit position then decides the resolution
+/// order, and an explicit, non-leading position is a genuinely
+/// different order from the implicit one.
 #[cfg(feature = "db")]
 fn normalize_search_path(value: &str) -> String {
     parse_identifier_list(value).map_or_else(
         || value.to_string(),
-        |items| {
+        |mut items| {
+            if !items.iter().any(|item| item == "pg_catalog") {
+                items.insert(0, "pg_catalog".to_string());
+            }
             items
                 .iter()
                 .map(|item| escape_identifier_list_item(item))
@@ -2800,6 +2812,66 @@ mod tests {
              `tenant` and `one` must not join to the same string just \
              because a bare comma also separates joined items -- an \
              unescaped join collapses both to `tenant,one`"
+        );
+    }
+
+    #[cfg(feature = "db")]
+    #[test]
+    fn from_dsns_groups_an_implicit_pg_catalog_with_an_explicit_leading_one() {
+        let sharded = ShardedDbPool::from_dsns(
+            [
+                (
+                    ShardId::new(0),
+                    "postgres://db.example/shared?options=-c%20search_path%3Dpublic".to_string(),
+                ),
+                (
+                    ShardId::new(1),
+                    "postgres://db.example/shared?options=-c%20search_path%3Dpg_catalog%2Cpublic"
+                        .to_string(),
+                ),
+            ],
+            ShardId::new(0),
+            1,
+        )
+        .expect("pool builds without connecting");
+
+        let groups = sharded.pool_groups();
+        assert_eq!(
+            groups.len(),
+            1,
+            "PostgreSQL always searches pg_catalog first when it is \
+             omitted, so `public` and `pg_catalog,public` resolve an \
+             unqualified relation the same way and must collapse"
+        );
+    }
+
+    #[cfg(feature = "db")]
+    #[test]
+    fn from_dsns_keeps_an_explicit_trailing_pg_catalog_distinct_from_the_implicit_leading_one() {
+        let sharded = ShardedDbPool::from_dsns(
+            [
+                (
+                    ShardId::new(0),
+                    "postgres://db.example/shared?options=-c%20search_path%3Dpublic".to_string(),
+                ),
+                (
+                    ShardId::new(1),
+                    "postgres://db.example/shared?options=-c%20search_path%3Dpublic%2Cpg_catalog"
+                        .to_string(),
+                ),
+            ],
+            ShardId::new(0),
+            1,
+        )
+        .expect("pool builds without connecting");
+
+        let groups = sharded.pool_groups();
+        assert_eq!(
+            groups.len(),
+            2,
+            "omitting pg_catalog always searches it first, but naming it \
+             explicitly last searches it last -- a genuinely different \
+             resolution order that must never collapse with the implicit one"
         );
     }
 

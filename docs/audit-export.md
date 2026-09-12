@@ -384,7 +384,12 @@ shard records:
   commas: joining with a bare comma would let a quoted name's own
   embedded comma read back as a name boundary, so the one name
   `tenant,one` and the two names `tenant` and `one` would otherwise join
-  to the identical string.
+  to the identical string. `pg_catalog` is inserted at the front of the
+  parsed list when it is not already named: Postgres always searches
+  `pg_catalog` first when it is omitted, so `public` and
+  `pg_catalog,public` resolve an unqualified relation identically and
+  must key the same, while `public,pg_catalog` (an explicit, trailing
+  `pg_catalog`) names a genuinely different order and stays distinct.
   Every other query parameter (`application_name`, `sslmode`, and so on)
   is dropped, since none of them changes which relation a query resolves
   against — except `host`, `hostaddr`, and `port`: a Unix-socket DSN

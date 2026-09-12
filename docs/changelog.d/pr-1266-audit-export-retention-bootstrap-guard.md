@@ -542,6 +542,29 @@ pins the fix, and
 `retention_still_waits_on_a_decommissioned_shards_ack_while_the_flag_protects_the_group`
 pins that the first round's re-enablement guarantee still holds.
 
+A twentieth review round (P1) found that `search_path=public` and
+`search_path=pg_catalog,public` resolve an unqualified relation
+identically: Postgres always searches `pg_catalog` first when it is
+not named explicitly, so omitting it is equivalent to naming it first.
+The parsed-list normalization treated the two lists as different --
+`["public"]` versus `["pg_catalog", "public"]` -- the same dangerous
+under-merging direction as the earlier case-folding and quoted-comma
+findings, since it stops two aliases of one physical pool from being
+combined and can reopen the premature-deletion race this key exists to
+prevent. `normalize_search_path` now inserts `pg_catalog` at the front
+of the parsed list whenever it is not already present, matching
+Postgres's implicit-first search order. A list that already names
+`pg_catalog` anywhere is left alone, since its explicit position then
+decides the resolution order -- an explicit, non-leading `pg_catalog`
+names a genuinely different order from the implicit one and must not
+collapse with it.
+
+New tests:
+`from_dsns_groups_an_implicit_pg_catalog_with_an_explicit_leading_one`
+pins the fix, and
+`from_dsns_keeps_an_explicit_trailing_pg_catalog_distinct_from_the_implicit_leading_one`
+pins that an explicit, non-leading `pg_catalog` still stays distinct.
+
 **Zero migration, zero engine impact beyond the new parameter.** No new
 `WorkflowEvent` variant, no schema change, no change to any existing call
 site's behavior when the new flag is left at its default (disabled).
