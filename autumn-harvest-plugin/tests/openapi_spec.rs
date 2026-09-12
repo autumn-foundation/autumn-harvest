@@ -369,6 +369,57 @@ fn known_routes_carry_their_expected_class() {
     }
 }
 
+/// Issue #1457: resume, triage, and legal-hold never reject a paused
+/// execution. Their handlers do not check pause state. A 409 stays declared
+/// on these routes, reserved for a future conflict. Its text must never
+/// claim a conflict that cannot happen.
+#[test]
+fn resume_triage_and_legal_hold_do_not_document_a_pause_conflict() {
+    let contract: Value = serde_json::from_str(API_CONTRACT_JSON).expect("contract must parse");
+    let routes = contract["routes"].as_array().unwrap();
+
+    for (method, path) in [
+        ("POST", "/workflows/{id}/resume"),
+        ("PATCH", "/workflows/{id}/triage"),
+        ("POST", "/workflows/{id}/legal-hold"),
+        ("POST", "/workflows/{id}/legal-hold/release"),
+    ] {
+        let route = routes
+            .iter()
+            .find(|route| route["method"] == method && route["path"] == path)
+            .unwrap_or_else(|| panic!("{method} {path} is missing from the contract"));
+        let responses = route["error_responses"].as_array().unwrap();
+        let pause_wording = responses.iter().find(|entry| {
+            entry["status"] == 409
+                && entry["description"]
+                    .as_str()
+                    .is_some_and(|text| text.to_lowercase().contains("paus"))
+        });
+        assert!(
+            pause_wording.is_none(),
+            "{method} {path} documents a 409 that mentions pause state, but the \
+             handler never checks pause state: {pause_wording:?}"
+        );
+
+        let reserved = responses
+            .iter()
+            .find(|entry| entry["status"] == 409)
+            .unwrap_or_else(|| {
+                panic!(
+                    "{method} {path} must still declare a 409 (issue #1457): \
+                     docs/audits/openapi-response-coverage.py requires it, since \
+                     the handler routes through the generic conflict_from helper"
+                )
+            });
+        assert_eq!(
+            reserved["description"],
+            "Reserved for a future state conflict (issue #1457). No path in the \
+             current handler returns this status.",
+            "{method} {path}: the reserved 409 description drifted"
+        );
+    }
+}
+
 /// A documented response header reaches the document, so a generated client
 /// can read it. The by-id family resolves a business id, and returns that
 /// resolution in `X-Harvest-Execution-Id`.

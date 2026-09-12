@@ -151,6 +151,9 @@ const INIT_SQL: &str = concat!(
     // issue #499: enforce_timeouts_once now scans harvest_debounce.
     include_str!("../../migrations/20260618000001_harvest_debounce/up.sql"),
     "\n",
+    // issue #518: event-batched starts persist pending admissions here.
+    include_str!("../../migrations/20260624000000_harvest_event_batches/up.sql"),
+    "\n",
     // issue #523: workflow-level retry policy columns.
     include_str!("../../migrations/20260626000001_harvest_workflow_retry/up.sql"),
     "\n",
@@ -9021,6 +9024,7 @@ async fn drain_accepted_sets_status_to_draining() {
         None,
         &std::collections::HashMap::new(),
         0,
+        &[],
     )
     .await
     .unwrap();
@@ -9071,6 +9075,7 @@ async fn drain_already_draining_on_second_call() {
         None,
         &std::collections::HashMap::new(),
         0,
+        &[],
     )
     .await
     .unwrap();
@@ -9131,6 +9136,7 @@ async fn drain_already_stopped_after_transition() {
         None,
         &std::collections::HashMap::new(),
         0,
+        &[],
     )
     .await
     .unwrap();
@@ -9186,6 +9192,7 @@ async fn drain_with_explicit_deadline_is_stored() {
         None,
         &std::collections::HashMap::new(),
         0,
+        &[],
     )
     .await
     .unwrap();
@@ -9227,6 +9234,7 @@ async fn drain_preview_returns_active_workers() {
             None,
             &std::collections::HashMap::new(),
             0,
+            &[],
         )
         .await
         .unwrap();
@@ -11555,6 +11563,7 @@ async fn test_rolling_deploy_capability_routing_with_database_enforcement() {
         None,
         &std::collections::HashMap::new(),
         0,
+        &[],
     )
     .await
     .unwrap();
@@ -11592,6 +11601,7 @@ async fn test_rolling_deploy_capability_routing_with_database_enforcement() {
         None,
         &new_labels,
         0,
+        &[],
     )
     .await
     .unwrap();
@@ -12217,14 +12227,14 @@ async fn windowed_fan_out_peak_task_rows_bounded_by_window() {
 /// [`INIT_SQL`] is a deliberately-partial, hand-maintained bundle (it omits the
 /// workflow-start-uniqueness migration on purpose), so it is one of the few
 /// fixtures allowed to skip [`autumn_harvest::full_migrations_sql`]. That makes
-/// it a standing drift hazard: `queue::claim_task` runs on essentially every
-/// test in this suite — and in every suite that borrows
+/// it a standing drift hazard. `queue::claim_task` runs on essentially every
+/// test in this suite. It also runs in every suite that borrows
 /// `setup_test_database_url_or_env` from here (`chain_timeout_tests`,
 /// `child_timeout_tests`, `cross_type_continue_as_new_tests`, `ctx_info_tests`,
 /// `dag_execution_timeout_tests`, `rate_limit_key_tests`,
-/// `workflow_retry_tests`) — so a migration that adds a table to the claim query
-/// and forgets this bundle takes out eight suites at once with
-/// `relation "..." does not exist`.
+/// `quota_enforcement_tests`, `workflow_retry_tests`). A migration that adds a
+/// table to the claim query, then forgets this bundle, breaks nine suites at
+/// once with `relation "..." does not exist`.
 ///
 /// That is exactly what issue #619's `harvest_queue_pauses` anti-join did. It
 /// cost a full Docker-backed CI cycle (~13 min) to surface, yet it is decidable

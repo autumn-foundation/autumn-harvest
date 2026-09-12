@@ -3410,6 +3410,7 @@ async fn a_failed_evidence_cleanup_rolls_back_the_registration() {
     let cleared = autumn_harvest::workers::register_worker_and_clear_stale_miss_evidence(
         &mut conn,
         &registration,
+        &[],
     )
     .await
     .expect("the happy path commits both writes");
@@ -3435,6 +3436,7 @@ async fn a_failed_evidence_cleanup_rolls_back_the_registration() {
     let failed = autumn_harvest::workers::register_worker_and_clear_stale_miss_evidence(
         &mut conn,
         &registration,
+        &[],
     )
     .await;
 
@@ -3482,6 +3484,7 @@ async fn tick_once(
         &Mutex::new(None),
         0,
         registration_pending,
+        &[],
     )
     .await;
 }
