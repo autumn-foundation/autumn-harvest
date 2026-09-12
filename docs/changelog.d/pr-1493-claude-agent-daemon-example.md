@@ -25,12 +25,19 @@ history rather than daemon state.
   burn the retry curve. The assistant content blocks are stored and replayed
   **verbatim**, which keeps thinking blocks valid across turns on one model.
 - `run_tool` — `list_files`, `read_file`, `write_file`, each confined to one
-  workspace directory by a lexical path check, so the check holds for a path
-  that does not exist yet. A tool failure is a `tool_result`, not an activity
-  error, so the model can recover from it.
-- `write_file` parks on the `tool_approval` signal with a durable deadline
-  (`receive_signal_timeout`), so an unattended session denies the call and
-  continues.
+  workspace directory. The confinement is lexical, plus a refusal of a symbolic
+  link at the final component, plus a resolution of the deepest existing
+  ancestor that must stay under the real root — so it holds for a path that does
+  not exist yet. A tool failure is a `tool_result`, not an activity error, so
+  the model can recover from it.
+- `write_file` parks on one occurrence of the `tool_approval` signal with a
+  durable deadline (`receive_signal_timeout`), so an unattended session denies
+  the call and continues. The signal name carries the turn, the position in that
+  turn and the tool-use id, and the daemon requires that whole name as the
+  approval token, so a decision releases only the wait the operator read.
+- A write lands whole or not at all: a scratch file on a unique name, given the
+  target's mode, with the file and every directory the write created flushed
+  before the rename is reported as done.
 
 **The daemon is the single writer** (`src/daemon.rs`): a Unix-socket control
 surface, a drive tick in place of `LISTEN`/`NOTIFY`, and a second READ-ONLY
