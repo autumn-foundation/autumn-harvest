@@ -56,6 +56,31 @@ pub fn is_session(conn: &Connection, workflow_name: &str, exec_id: &str) -> Resu
     })
 }
 
+/// The ids of every RUNNING session, oldest first.
+///
+/// The drive tick runs this on every poll, so it reads one column of the rows
+/// it can act on. The full listing selects the input and output payloads of
+/// every session that ever ran. An idle daemon must not pay for its whole
+/// history several times a second.
+///
+/// # Errors
+///
+/// Returns an error if the query fails.
+pub fn running(conn: &Connection, workflow_name: &str) -> Result<Vec<String>, String> {
+    let mut statement = conn
+        .prepare(
+            "SELECT exec_id FROM harvest_executions \
+             WHERE workflow_name = ?1 AND state = 'RUNNING' ORDER BY rowid",
+        )
+        .map_err(|e| format!("cannot prepare the drive query: {e}"))?;
+    let rows = statement
+        .query_map([workflow_name], |row| row.get(0))
+        .map_err(|e| format!("cannot read the running sessions: {e}"))?;
+
+    rows.collect::<Result<Vec<_>, _>>()
+        .map_err(|e| format!("cannot read the running sessions: {e}"))
+}
+
 /// Every execution of the agent workflow, oldest first.
 ///
 /// # Errors

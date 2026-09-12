@@ -1223,6 +1223,110 @@ async fn a_tool_call_under_an_unknown_stop_reason_is_not_run() {
 }
 
 #[test]
+fn the_toolbox_stops_listing_a_directory_at_the_cap() {
+    let dir = tempfile::tempdir().expect("a temporary directory");
+    let workspace = dir.path().join("workspace");
+    std::fs::create_dir_all(&workspace).expect("the workspace is created");
+
+    // One entry over the cap is enough to prove the read stops. The tool bodies
+    // run on the one runtime, so naming a huge directory in full would block
+    // every session and every control command.
+    for index in 0..=tools::MAX_ENTRIES {
+        std::fs::write(workspace.join(format!("file-{index:05}.txt")), "x")
+            .expect("the fixture is written");
+    }
+
+    let body = tools::activity_body(workspace.clone());
+    let listed = |input: Value| -> String {
+        let raw = body(input).expect("a tool failure is a result, not an activity error");
+        let outcome: ToolOutcome = serde_json::from_value(raw).expect("the outcome decodes");
+        assert!(
+            !outcome.is_error,
+            "the listing must succeed: {}",
+            outcome.output
+        );
+        outcome.output
+    };
+
+    let output = listed(tool_request(
+        &workspace,
+        tools::TOOL_LIST_FILES,
+        json!({ "path": "." }),
+    ));
+    let lines: Vec<&str> = output.lines().collect();
+    assert_eq!(
+        lines.len(),
+        tools::MAX_ENTRIES + 1,
+        "the listing must carry the cap and one marker"
+    );
+    let marker = lines.last().expect("the marker is present");
+    assert!(
+        marker.starts_with("... more entries"),
+        "the truncation must be reported: {marker}"
+    );
+
+    // A directory inside the cap is listed whole, sorted, with no marker.
+    let small = workspace.join("small");
+    std::fs::create_dir(&small).expect("the directory is created");
+    std::fs::write(small.join("b.txt"), "x").expect("the fixture is written");
+    std::fs::write(small.join("a.txt"), "x").expect("the fixture is written");
+    assert_eq!(
+        listed(tool_request(
+            &workspace,
+            tools::TOOL_LIST_FILES,
+            json!({ "path": "small" }),
+        )),
+        "a.txt\nb.txt",
+        "a small directory must be listed whole and sorted"
+    );
+}
+
+#[tokio::test]
+async fn the_drive_query_reads_only_the_running_sessions() {
+    let dir = tempfile::tempdir().expect("a temporary directory");
+    let workspace = dir.path().join("workspace");
+    std::fs::create_dir_all(&workspace).expect("the workspace is created");
+    let db = dir.path().join("agentd.db");
+
+    let calls = Arc::new(AtomicUsize::new(0));
+    let mut rt = runtime(&db, &workspace, &calls);
+
+    // One session driven to completion, and one parked on its approval.
+    let done = rt
+        .start_workflow(WORKFLOW_NAME, task(&workspace))
+        .expect("the session starts");
+    let signal = drive_to_approval(&mut rt, done).await;
+    approve(&mut rt, done, &signal);
+    let state = rt.run_until_blocked(done).await.expect("the run finishes");
+    assert!(
+        matches!(state, RunState::Completed(_)),
+        "expected completion, got {state:?}"
+    );
+
+    let parked = rt
+        .start_workflow(WORKFLOW_NAME, task(&workspace))
+        .expect("the second session starts");
+    drive_to_approval(&mut rt, parked).await;
+
+    // The tick polls several times a second, so it must not read the rows it
+    // cannot act on.
+    let reader = crate::inspect::open(&db).expect("the inspector opens");
+    let running = crate::inspect::running(&reader, WORKFLOW_NAME).expect("the drive query answers");
+    assert_eq!(
+        running,
+        vec![parked.to_string()],
+        "only the parked session is drivable"
+    );
+    assert_eq!(
+        crate::inspect::executions(&reader, WORKFLOW_NAME)
+            .expect("the listing answers")
+            .len(),
+        2,
+        "both sessions are still listed for the operator"
+    );
+}
+
+#[test]
 fn a_write_keeps_the_mode_of_the_file_it_replaces() {
     use std::os::unix::fs::PermissionsExt;
 

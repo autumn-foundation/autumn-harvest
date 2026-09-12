@@ -28,7 +28,7 @@ pub const TOOL_WRITE_FILE: &str = "write_file";
 /// The largest file this toolbox reads or writes.
 const MAX_FILE_BYTES: usize = 64 * 1024;
 /// The largest directory listing this toolbox returns.
-const MAX_ENTRIES: usize = 200;
+pub const MAX_ENTRIES: usize = 200;
 
 /// How many scratch names one write tries before it gives up.
 const SCRATCH_ATTEMPTS: u32 = 16;
@@ -227,17 +227,28 @@ fn resolve(workspace: &Path, relative: &str) -> Result<PathBuf, String> {
 fn list_files(workspace: &Path, relative: &str) -> Result<String, String> {
     let dir = resolve(workspace, relative)?;
     let mut entries = Vec::new();
+    let mut more = false;
     for entry in std::fs::read_dir(&dir).map_err(|e| format!("cannot list `{relative}`: {e}"))? {
+        // The cap stops the read, and does not trim the result afterwards. A
+        // directory of a million entries would otherwise be named in full
+        // before the trim. The tool bodies run on the one runtime, so that
+        // blocks every session and every control command too.
+        if entries.len() == MAX_ENTRIES {
+            more = true;
+            break;
+        }
         let entry = entry.map_err(|e| format!("cannot list `{relative}`: {e}"))?;
         let name = entry.file_name().to_string_lossy().into_owned();
         let is_dir = entry.file_type().is_ok_and(|t| t.is_dir());
         entries.push(if is_dir { format!("{name}/") } else { name });
     }
     entries.sort();
-    let total = entries.len();
-    entries.truncate(MAX_ENTRIES);
-    if total > MAX_ENTRIES {
-        entries.push(format!("... {} more entries", total - MAX_ENTRIES));
+    // The count of the rest is not reported, because counting it is the work
+    // this cap exists to refuse.
+    if more {
+        entries.push(format!(
+            "... more entries; the listing stops at {MAX_ENTRIES}"
+        ));
     }
     if entries.is_empty() {
         return Ok(format!("`{relative}` is empty"));

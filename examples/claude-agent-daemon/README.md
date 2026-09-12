@@ -196,7 +196,9 @@ is ever approved sight unseen.
   not only lexical: a symbolic link at the final component is refused, and the
   deepest existing ancestor is resolved through every link and must stay under
   the real workspace root. The 64 KiB read cap is checked before the file is
-  allocated, so one huge file cannot take the daemon down. A write lands
+  allocated, and the 200-entry listing cap stops the directory read rather than
+  trimming its result, so neither one huge file nor one huge directory can take
+  the daemon down. A write lands
   atomically, through a scratch file renamed over the target, with the file and
   every directory the write created flushed, so an approved file is never left
   half-written and the replacement survives a host crash. It keeps the mode of
@@ -250,8 +252,9 @@ Honest limits, so nothing here reads as a promise:
   session. A long-running agent should store the transcript outside the engine
   and pass a handle instead. The 2 MiB payload cap is the hard bound.
 - **Polling, not push.** `SQLite` has no `LISTEN`/`NOTIFY`, so progress comes
-  from the `--tick-ms` poll. A production daemon would sleep until the next
-  timer deadline.
+  from the `--tick-ms` poll. The poll reads the ids of the `RUNNING` rows only,
+  so an idle daemon does not pay for its recorded history several times a
+  second. A production daemon would sleep until the next timer deadline.
 - **No streaming.** One turn is one non-streaming request, because an activity
   result is a value, not a stream. Token-by-token output needs a side channel.
 - **One turn can be paid for twice.** Activity execution is at-least-once, and

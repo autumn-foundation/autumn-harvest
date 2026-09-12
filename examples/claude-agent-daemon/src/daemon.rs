@@ -646,12 +646,14 @@ pub fn pending_call(
 /// The backend has no push wake-up, so progress comes from this poll. A daemon
 /// with many sessions would track the next timer deadline and sleep until it;
 /// a fixed tick keeps the example short.
+///
+/// The query reads the ids of the RUNNING rows only. A poll that runs several
+/// times a second must not cost the whole recorded history.
 fn running_sessions(reader: &Connection) -> Vec<ExecutionId> {
-    match inspect::executions(reader, WORKFLOW_NAME) {
-        Ok(rows) => rows
+    match inspect::running(reader, WORKFLOW_NAME) {
+        Ok(ids) => ids
             .iter()
-            .filter(|row| row.state == "RUNNING")
-            .filter_map(|row| row.exec_id.parse::<ExecutionId>().ok())
+            .filter_map(|id| id.parse::<ExecutionId>().ok())
             .collect(),
         Err(message) => {
             tracing::error!(error = %message, "cannot enumerate the sessions");
