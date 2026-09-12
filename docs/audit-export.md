@@ -292,6 +292,13 @@ shard records:
   Shard A resumes purging. Every other shard, including a genuinely
   bootstrapping shard B, stays protected.
 
+  A pre-split staging deployment can back two logical shards with one
+  physical pool. The sweep detects this on its own and combines their
+  decisions conservatively — protecting the shared pool whenever any
+  aliased shard wants protection — so exempting shard A never
+  accidentally strips shard B's protection just because they share a
+  database. No operator action is needed for this case.
+
   The remaining cost is operational, not architectural: an operator must
   remember to set the flag on every process, including ones added later.
   Forgetting it only reopens the original bootstrap window; it never causes

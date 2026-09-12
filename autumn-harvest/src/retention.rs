@@ -1336,24 +1336,7 @@ impl RetentionRuntime {
                 // Audit rows may live on any shard (workflow starts use shard-aware
                 // inserts), so iterate every shard to honour the retention window.
                 if config.audit_retention_days > 0 && !config.dry_run {
-                    for (shard, pool) in pools.iter_shards() {
-                        // A shard in the exempt set stays unprotected. This
-                        // holds even when the rest of the fleet is not.
-                        // Decommissioning it then resumes purging there. It
-                        // never reopens the bootstrap window for every
-                        // other shard (issue #1266).
-                        let protect_unexported_audit = config.protects_unexported_audit(shard);
-                        if let Ok(mut conn) = pool.get().await
-                            && let Err(err) = crate::audit::purge_old_audit_records(
-                                &mut conn,
-                                config.audit_retention_days,
-                                protect_unexported_audit,
-                            )
-                            .await
-                        {
-                            tracing::warn!(error = %err, "harvest audit log purge failed");
-                        }
-                    }
+                    purge_audit_records_across_shards(&pools, &config).await;
                 }
 
                 // Purge old schedule decisions once per tick, best-effort.
@@ -1660,6 +1643,71 @@ impl Drop for RetentionLeaseGuard {
                     }
                 });
             }
+        }
+    }
+}
+
+/// Group shards by underlying pool identity, and compute each group's
+/// combined `protect_unexported_audit` decision (issue #1266).
+///
+/// Two logical shards may alias one physical pool. `ShardedDbPool::from_map`
+/// supports this. A pre-split staging deployment inserts clones of one pool
+/// under more than one `ShardId`.
+///
+/// `purge_old_audit_records` issues one unscoped `DELETE` per call. It
+/// relies on the connection alone to identify which shard it purges.
+/// Calling it once per logical shard would let two aliased shards apply
+/// two different `protect_unexported_audit` decisions to one physical
+/// audit table, within one tick. A less protective decision would commit
+/// before a more protective one ever ran.
+///
+/// This groups shards by pool identity first. It then combines each
+/// group's decision with `any`. That decision is `true` when any aliased
+/// shard wants protection. Each physical pool is purged once per tick.
+/// That one decision already accounts for every shard sharing it.
+///
+/// Two `Pool` values are the same physical pool exactly when they are
+/// clones of one `Arc`. `Pool::manager()` returns a reference into that
+/// shared allocation, so `ptr::eq` on it detects aliasing without needing
+/// any private field or unsafe code.
+#[cfg(feature = "db")]
+fn group_shards_by_pool<'a>(
+    pools: &'a ShardedDbPool,
+    config: &RetentionConfig,
+) -> Vec<(&'a crate::worker::DbPool, bool)> {
+    let mut groups: Vec<(&crate::worker::DbPool, Vec<ShardId>)> = Vec::new();
+    for (shard, pool) in pools.iter_shards() {
+        match groups
+            .iter_mut()
+            .find(|(existing, _)| std::ptr::eq(existing.manager(), pool.manager()))
+        {
+            Some((_, shards)) => shards.push(shard),
+            None => groups.push((pool, vec![shard])),
+        }
+    }
+    groups
+        .into_iter()
+        .map(|(pool, shards)| {
+            let protect = shards
+                .iter()
+                .any(|shard| config.protects_unexported_audit(*shard));
+            (pool, protect)
+        })
+        .collect()
+}
+
+#[cfg(feature = "db")]
+async fn purge_audit_records_across_shards(pools: &ShardedDbPool, config: &RetentionConfig) {
+    for (pool, protect_unexported_audit) in group_shards_by_pool(pools, config) {
+        if let Ok(mut conn) = pool.get().await
+            && let Err(err) = crate::audit::purge_old_audit_records(
+                &mut conn,
+                config.audit_retention_days,
+                protect_unexported_audit,
+            )
+            .await
+        {
+            tracing::warn!(error = %err, "harvest audit log purge failed");
         }
     }
 }
@@ -3280,6 +3328,77 @@ mod tests {
             .excluding_shard_from_protect_unexported_audit(ShardId::new(0));
         assert!(!config.protects_unexported_audit(ShardId::new(0)));
         assert!(!config.protects_unexported_audit(ShardId::new(1)));
+    }
+
+    // Two logical shards may alias one physical pool (a supported pre-split
+    // staging topology). Building a `Pool` never connects, so this needs no
+    // live database.
+    #[cfg(feature = "db")]
+    fn test_pool(url: &str) -> crate::worker::DbPool {
+        let manager = diesel_async::pooled_connection::AsyncDieselConnectionManager::<
+            diesel_async::AsyncPgConnection,
+        >::new(url);
+        crate::worker::DbPool::builder(manager)
+            .max_size(1)
+            .build()
+            .expect("pool builds without connecting")
+    }
+
+    // A shard exempted for decommission must not drag its physical-pool
+    // alias down with it. One aliased shard still wants protection, so the
+    // whole shared pool must stay protected (issue #1266).
+    #[cfg(feature = "db")]
+    #[test]
+    fn group_shards_by_pool_combines_aliased_shards_conservatively() {
+        let pool = test_pool("postgres://unused/db");
+        let mut aliased = BTreeMap::new();
+        aliased.insert(ShardId::new(0), pool.clone());
+        aliased.insert(ShardId::new(1), pool.clone());
+        let sharded = ShardedDbPool::from_map(aliased, ShardId::new(0));
+
+        let config = RetentionConfig::default()
+            .with_protect_unexported_audit(true)
+            .excluding_shard_from_protect_unexported_audit(ShardId::new(0));
+
+        let groups = group_shards_by_pool(&sharded, &config);
+        assert_eq!(
+            groups.len(),
+            1,
+            "both shards alias one pool, so they must collapse to one group"
+        );
+        assert!(
+            groups[0].1,
+            "shard 1 still wants protection, so the shared pool stays protected"
+        );
+    }
+
+    // Two shards on genuinely separate pools must never be combined. Shard
+    // 0's exemption must stay local to its own pool (issue #1266).
+    #[cfg(feature = "db")]
+    #[test]
+    fn group_shards_by_pool_keeps_distinct_pools_separate() {
+        let pool_a = test_pool("postgres://unused/db-a");
+        let pool_b = test_pool("postgres://unused/db-b");
+        let mut distinct = BTreeMap::new();
+        distinct.insert(ShardId::new(0), pool_a);
+        distinct.insert(ShardId::new(1), pool_b);
+        let sharded = ShardedDbPool::from_map(distinct, ShardId::new(0));
+
+        let config = RetentionConfig::default()
+            .with_protect_unexported_audit(true)
+            .excluding_shard_from_protect_unexported_audit(ShardId::new(0));
+
+        let groups = group_shards_by_pool(&sharded, &config);
+        assert_eq!(
+            groups.len(),
+            2,
+            "two distinct pools must never collapse into one group"
+        );
+        let protections: Vec<bool> = groups.iter().map(|(_, protect)| *protect).collect();
+        assert!(
+            protections.contains(&false) && protections.contains(&true),
+            "shard 0's exemption must not leak into shard 1's own, separate pool"
+        );
     }
 
     // --- Issue #737: per-workflow-type history retention overrides ---

@@ -51,6 +51,20 @@ since it already took a plain `bool` per call. `with_protect_unexported_audit`
 keeps its `bool` shape for the common case; a new
 `excluding_shard_from_protect_unexported_audit` adds the exemption.
 
+A fourth review round (P1) found that the per-shard fix above was still
+unsafe under a supported topology: two logical shards can alias one
+physical pool (`ShardedDbPool::from_map`, a pre-split staging shape).
+`purge_old_audit_records` issues one unscoped `DELETE` per call, so calling
+it once per logical shard let two aliased shards apply two different
+decisions to the same physical audit table within one tick — a less
+protective decision could commit before a more protective one ever ran.
+The sweep now groups shards by pool identity first (`Pool::manager()`
+returns a reference into the pool's shared `Arc` allocation, so `ptr::eq`
+on it detects aliasing safely, with no private field or unsafe code), and
+combines each group's decision with `any`: protect the shared pool
+whenever any aliased shard wants protection. This also purges each
+physical pool exactly once per tick instead of once per logical shard.
+
 New tests:
 - `retention_protects_unexported_audit_when_configured_with_no_cursor_and_no_local_sink`
   reproduces the exact bootstrap window (no cursor row anywhere, no sink in
