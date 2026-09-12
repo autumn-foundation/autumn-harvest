@@ -4419,6 +4419,92 @@ fn a_listed_error_in_the_wrong_storage_class_reads_as_nothing() {
     );
 }
 
+/// A failure whose reason cannot be read says so, and is not a silence.
+///
+/// The `typeof(error) = 'text'` gate answers SQL NULL over a damaged class,
+/// and `error` already answers NULL for a row that recorded no reason. So a
+/// FAILED session with a corrupt reason looked exactly like one that failed
+/// with no reason recorded, while `status` calls the same row unreadable.
+///
+/// This is the fault the previous gate introduced. A guard that reports
+/// "unreadable" as the SAME value the renderer reads as "absent" moves the
+/// lie one layer down rather than removing it.
+#[test]
+fn a_failure_whose_reason_cannot_be_read_says_so() {
+    let dir = tempfile::tempdir().expect("a temporary directory");
+    let db = dir.path().join("damaged-error.db");
+    let writer = rusqlite::Connection::open(&db).expect("the database opens");
+    fixture_table(&writer);
+    writer
+        .execute(
+            "INSERT INTO harvest_executions \
+             VALUES ('readable', ?1, 'FAILED', ?2, NULL, 'it broke')",
+            rusqlite::params![WORKFLOW_NAME, READABLE_TASK],
+        )
+        .expect("the readable failure is recorded");
+    writer
+        .execute(
+            "INSERT INTO harvest_executions \
+             VALUES ('damaged', ?1, 'FAILED', ?2, NULL, CAST('it broke' AS BLOB))",
+            rusqlite::params![WORKFLOW_NAME, READABLE_TASK],
+        )
+        .expect("the damaged failure is recorded");
+    writer
+        .execute(
+            "INSERT INTO harvest_executions VALUES ('silent', ?1, 'FAILED', ?2, NULL, NULL)",
+            rusqlite::params![WORKFLOW_NAME, READABLE_TASK],
+        )
+        .expect("the reasonless failure is recorded");
+    drop(writer);
+
+    let reader = inspect::open(&db).expect("the reader opens");
+    let listed = inspect::executions(&reader, WORKFLOW_NAME, None).expect("the listing answers");
+
+    // The projection tells the two apart, which is the fact the renderer
+    // needs. Both read as no error text, and only one is damaged.
+    let row = |exec: &str| listed_row(&listed, exec);
+    assert!(
+        row("damaged").error.is_none() && row("damaged").error_is_damaged,
+        "a damaged reason reads as no text, and is marked: {:?}",
+        row("damaged")
+    );
+    assert!(
+        row("silent").error.is_none() && !row("silent").error_is_damaged,
+        "a reasonless failure reads as no text, and is NOT marked: {:?}",
+        row("silent")
+    );
+    assert!(
+        !row("readable").error_is_damaged,
+        "a readable reason is not marked either"
+    );
+
+    let (views, _, _) = daemon::sessions(&reader, &daemon::Parked::new(), false, None)
+        .expect("the listing renders");
+    let shown = |exec: &str| -> Option<String> {
+        views
+            .iter()
+            .find(|view| view.execution_id == exec)
+            .expect("the session is listed")
+            .error
+            .clone()
+    };
+    assert_eq!(
+        shown("readable").as_deref(),
+        Some("it broke"),
+        "a readable reason is shown as it stands"
+    );
+    assert_eq!(
+        shown("damaged").as_deref(),
+        Some("<unreadable error>"),
+        "a damaged reason is NAMED"
+    );
+    assert_eq!(
+        shown("silent"),
+        None,
+        "and a failure that recorded no reason stays silent"
+    );
+}
+
 /// One listed session, by id.
 fn listed_row<'a>(
     listed: &'a [inspect::SessionSummary],

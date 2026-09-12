@@ -1096,7 +1096,13 @@ fn summary_view(
         blocked_on,
         pending,
         answer,
-        error: row.error.as_deref().map(shortened),
+        // A damaged reason is NAMED. A silence there would read as a failure
+        // that recorded no reason, and `status` calls the same row
+        // unreadable. See [`inspect::SessionSummary::error_is_damaged`].
+        error: row.error.as_deref().map(shortened).or_else(|| {
+            row.error_is_damaged
+                .then(|| "<unreadable error>".to_string())
+        }),
     }
 }
 

@@ -96,7 +96,17 @@ pub struct SessionSummary {
     pub turns: Option<u32>,
     pub tool_calls: Option<u32>,
     pub answer: Option<String>,
+    /// The recorded failure reason, or `None` when the row holds none this
+    /// daemon can read. See [`SessionSummary::error_is_damaged`], which says
+    /// WHICH of those two a `None` is.
     pub error: Option<String>,
+    /// Does the row hold an error that cannot be read?
+    ///
+    /// `error` answers `None` for a row that recorded no failure reason AND
+    /// for one whose reason is in a class the engine cannot read. A `FAILED`
+    /// session with a damaged reason would otherwise look like one that
+    /// recorded no reason, and `status` calls the same row unreadable.
+    pub error_is_damaged: bool,
     /// Where this row sits in the table, which is the cursor that reads the
     /// rows BEFORE it. The listing is capped, so an old session waiting for a
     /// decision would otherwise become unreachable once enough newer ones
@@ -720,6 +730,7 @@ pub const SESSIONS_QUERY: &str = "SELECT \
                     CASE WHEN typeof(error) = 'text' \
                          THEN coalesce(substr(cast(error as blob), 1, ?3), \
                                        zeroblob(0)) END, \
+                    error IS NOT NULL AND typeof(error) <> 'text', \
                     rowid \
              FROM harvest_executions WHERE +workflow_name = ?1 \
              AND rowid < ?4 \
@@ -805,7 +816,8 @@ pub fn executions(
                     tool_calls: row.get(5)?,
                     answer: cut_text(row.get(6)?, LISTED_READ_CHARS, MAX_LISTED_BYTES),
                     error: cut_text(row.get(7)?, LISTED_READ_CHARS, MAX_LISTED_BYTES),
-                    row: row.get(8)?,
+                    error_is_damaged: row.get(8)?,
+                    row: row.get(9)?,
                 })
             },
         )
