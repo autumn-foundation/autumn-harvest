@@ -1124,14 +1124,20 @@ fn a_billed_response_that_is_not_a_message_is_refused() {
     });
     assert!(claude::is_message(&message), "a real message must pass");
 
-    // An empty stop reason is not a stop reason. It also differs from
+    // A blank stop reason is not a stop reason. It also differs from
     // `end_turn`, so the usability test would accept it, and the loop would
-    // record a completed session with a blank stop reason.
-    let blank = json!({ "content": [Value::Null], "stop_reason": "" });
-    assert!(
-        !claude::is_message(&blank),
-        "a blank stop reason must be refused"
-    );
+    // record a completed session whose stop reason says nothing. Whitespace
+    // is as blank as an empty string, and it takes the same path.
+    for blank in [
+        json!({ "content": [Value::Null], "stop_reason": "" }),
+        json!({ "content": [Value::Null], "stop_reason": " " }),
+        json!({ "content": [Value::Null], "stop_reason": "\t\n" }),
+    ] {
+        assert!(
+            !claude::is_message(&blank),
+            "{blank} must not pass as a message"
+        );
+    }
 
     // A malformed body from an accepted request is terminal, like the others.
     let refused = parse_error_payload_full(&claude::body_failure(
