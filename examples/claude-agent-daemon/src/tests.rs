@@ -923,6 +923,15 @@ fn a_billed_response_that_is_not_a_message_is_refused() {
     });
     assert!(claude::is_message(&message), "a real message must pass");
 
+    // An empty stop reason is not a stop reason. It also differs from
+    // `end_turn`, so the usability test would accept it, and the loop would
+    // record a completed session with a blank stop reason.
+    let blank = json!({ "content": [Value::Null], "stop_reason": "" });
+    assert!(
+        !claude::is_message(&blank),
+        "a blank stop reason must be refused"
+    );
+
     // A malformed body from an accepted request is terminal, like the others.
     let refused = parse_error_payload_full(&claude::body_failure(
         reqwest::StatusCode::OK,
@@ -1415,6 +1424,56 @@ async fn the_drive_query_reads_only_the_running_sessions() {
             .len(),
         2,
         "both sessions are still listed for the operator"
+    );
+}
+
+#[test]
+fn a_write_lands_on_a_name_at_the_component_limit() {
+    let dir = tempfile::tempdir().expect("a temporary directory");
+    let workspace = dir.path().join("workspace");
+    std::fs::create_dir_all(&workspace).expect("the workspace is created");
+
+    // A 255-byte name is legal on the common filesystems. A scratch name that
+    // copied it whole would be 20 bytes longer. Every attempt then failed with
+    // `ENAMETOOLONG`, and the approved write could not land at all.
+    let long = "n".repeat(255);
+    // A name of multi-byte characters, to prove the cut lands on a boundary.
+    let wide = "é".repeat(120);
+
+    let body = tools::activity_body(workspace.clone());
+    for name in [long.as_str(), wide.as_str()] {
+        let raw = body(tool_request(
+            &workspace,
+            tools::TOOL_WRITE_FILE,
+            json!({ "path": name, "content": "landed" }),
+        ))
+        .expect("a tool failure is a result, not an activity error");
+        let outcome: ToolOutcome = serde_json::from_value(raw).expect("the outcome decodes");
+        assert!(
+            !outcome.is_error,
+            "the write must land on a {}-byte name: {}",
+            name.len(),
+            outcome.output
+        );
+        assert_eq!(
+            std::fs::read_to_string(workspace.join(name)).expect("the file exists"),
+            "landed"
+        );
+    }
+
+    // The scratch name fits whatever the target does, and a short target keeps
+    // its whole stem so a leftover file stays identifiable.
+    for name in [long.as_str(), wide.as_str(), "notes.md"] {
+        let scratch = tools::scratch_name(name, 4_294_967_295, 15);
+        assert!(
+            scratch.len() <= name.len().max(64),
+            "`{scratch}` is longer than the name it replaces"
+        );
+        assert!(scratch.len() <= 255, "`{scratch}` is over the limit");
+    }
+    assert!(
+        tools::scratch_name("notes.md", 123, 0).contains("notes.md"),
+        "a short target must keep its stem"
     );
 }
 

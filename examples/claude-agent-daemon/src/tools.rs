@@ -33,6 +33,23 @@ pub const MAX_ENTRIES: usize = 200;
 /// How many scratch names one write tries before it gives up.
 const SCRATCH_ATTEMPTS: u32 = 16;
 
+/// The longest scratch basename this module builds.
+///
+/// A file name component is limited by the filesystem, and 255 bytes is the
+/// common limit. A 255-byte target is therefore legal, and a scratch name that
+/// copies it whole is not. All 16 attempts then fail with `ENAMETOOLONG`, and
+/// an approved write becomes impossible.
+const SCRATCH_CAP: usize = 255;
+
+/// The scratch length a SHORT target still allows.
+///
+/// The cap above assumes the common limit. This floor removes the assumption
+/// for a long target. The scratch name never exceeds the target's own name
+/// once that name is longer than this floor. The target name is itself proof
+/// that the length is allowed. An ordinary short name keeps its whole stem in
+/// the scratch name, which is what makes a leftover file identifiable.
+const SCRATCH_FLOOR: usize = 64;
+
 /// The mode a file this toolbox CREATES is given.
 ///
 /// A file the agent brings into being starts private. An existing file keeps
@@ -452,7 +469,7 @@ fn create_scratch(path: &Path) -> Result<(PathBuf, std::fs::File), String> {
     let pid = std::process::id();
     let mut last = None;
     for attempt in 0..SCRATCH_ATTEMPTS {
-        let candidate = parent.join(format!(".{name}.agentd-{pid}-{attempt}.tmp"));
+        let candidate = parent.join(scratch_name(&name, pid, attempt));
         // `O_NOFOLLOW` refuses a link, as everywhere else in this module. The
         // mode is deliberately conservative here; the target's mode is applied
         // to the descriptor below, where no umask can filter it.
@@ -472,6 +489,32 @@ fn create_scratch(path: &Path) -> Result<(PathBuf, std::fs::File), String> {
         || format!("cannot create a scratch file beside `{name}`"),
         |e| format!("cannot create a scratch file beside `{name}`: {e}"),
     ))
+}
+
+/// The scratch basename for one attempt.
+///
+/// The name carries the target's stem, so a leftover file says what it was
+/// for. The stem is cut when the whole name would not fit (see [`SCRATCH_CAP`]
+/// and [`SCRATCH_FLOOR`]). The cut lands on a character boundary, so a name
+/// of multi-byte characters is never split through one.
+pub fn scratch_name(name: &str, pid: u32, attempt: u32) -> String {
+    let suffix = format!(".agentd-{pid}-{attempt}.tmp");
+    let cap = name.len().clamp(SCRATCH_FLOOR, SCRATCH_CAP);
+    // One byte for the leading dot.
+    let room = cap.saturating_sub(suffix.len() + 1);
+    format!(".{}{suffix}", &name[..floor_boundary(name, room)])
+}
+
+/// The largest character boundary of `text` at or below `limit`.
+const fn floor_boundary(text: &str, limit: usize) -> usize {
+    if limit >= text.len() {
+        return text.len();
+    }
+    let mut index = limit;
+    while index > 0 && !text.is_char_boundary(index) {
+        index -= 1;
+    }
+    index
 }
 
 /// Fill the scratch file, give it the target's mode, and rename it over it.

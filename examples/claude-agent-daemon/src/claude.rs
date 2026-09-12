@@ -174,7 +174,7 @@ fn call_api(
     if !is_message(&payload) {
         return Err(body_failure(
             status,
-            "its response was not a message: `content` and `stop_reason` are required",
+            "its response was not a message: `content` and a `stop_reason` are required",
         ));
     }
 
@@ -270,9 +270,16 @@ fn http_failure(status: reqwest::StatusCode, body: &str) -> String {
 /// Only the two fields the reply is built from are required. A response that
 /// carries them can be projected; one that does not is malformed, however well
 /// formed its JSON is.
+///
+/// The stop reason must say something. An empty one is not a stop reason, and
+/// it differs from `end_turn`, so the usability test below would accept it.
+/// The loop then records a completed session whose stop reason is blank.
 pub fn is_message(payload: &Value) -> bool {
     payload.get("content").is_some_and(Value::is_array)
-        && payload.get("stop_reason").is_some_and(Value::is_string)
+        && payload
+            .get("stop_reason")
+            .and_then(Value::as_str)
+            .is_some_and(|reason| !reason.is_empty())
 }
 
 /// Can every tool call in this reply be addressed on its own?
