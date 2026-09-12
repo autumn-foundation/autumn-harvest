@@ -78,7 +78,16 @@ enum Command {
         #[arg(long, env = "AGENTD_MODEL", default_value = claude::DEFAULT_MODEL)]
         model: String,
         /// The output cap of one turn.
-        #[arg(long, env = "AGENTD_MAX_TOKENS", default_value_t = claude::DEFAULT_MAX_TOKENS)]
+        ///
+        /// The Messages API requires at least one token, and a zero cap would
+        /// be refused there. That refusal is not retryable, so every session
+        /// submitted to such a daemon would fail. The floor is here instead.
+        #[arg(
+            long,
+            env = "AGENTD_MAX_TOKENS",
+            default_value_t = claude::DEFAULT_MAX_TOKENS,
+            value_parser = clap::value_parser!(u32).range(1..)
+        )]
         max_tokens: u32,
         /// How often the daemon drives its sessions, in milliseconds.
         ///

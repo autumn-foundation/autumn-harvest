@@ -434,6 +434,51 @@ async fn a_control_connection_is_identified_by_its_peer() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn a_caller_that_sends_nothing_does_not_hold_the_daemon() {
+    let dir = tempfile::tempdir().expect("a temporary directory");
+    let socket = dir.path().join("agentd.sock");
+    let options = daemon::Options {
+        db: dir.path().join("agentd.db"),
+        socket: socket.clone(),
+        workspace: dir.path().join("workspace"),
+        model: claude::DEFAULT_MODEL.to_string(),
+        max_tokens: claude::DEFAULT_MAX_TOKENS,
+        tick: Duration::from_millis(50),
+        api_key: None,
+    };
+    let daemon = tokio::spawn(daemon::serve(options));
+    await_daemon(&socket).await;
+
+    // Connections that open and send no newline. Each one holds a permit until
+    // its deadline, and there are more of them than the daemon holds at once.
+    let mut silent = Vec::new();
+    for _ in 0..40 {
+        silent.push(
+            tokio::net::UnixStream::connect(&socket)
+                .await
+                .expect("the caller connects"),
+        );
+    }
+
+    // An honest caller is still answered. The silent ones are not holding the
+    // daemon: a bounded read gives their permits back.
+    let answered = tokio::time::timeout(
+        Duration::from_secs(60),
+        protocol::call(&socket, &Request::List),
+    )
+    .await
+    .expect("the honest caller must not wait on the silent ones")
+    .expect("the list is answered");
+    assert!(
+        matches!(answered, Response::Sessions { .. }),
+        "unexpected answer: {answered:?}"
+    );
+
+    drop(silent);
+    daemon.abort();
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn the_daemon_answers_more_connections_than_it_holds_at_once() {
     let dir = tempfile::tempdir().expect("a temporary directory");
     let socket = dir.path().join("agentd.sock");

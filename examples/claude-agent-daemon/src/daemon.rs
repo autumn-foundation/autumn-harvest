@@ -21,7 +21,7 @@ use std::time::Duration;
 use autumn_harvest_sqlite::{ExecutionId, RunState, SqliteRuntime};
 use rusqlite::Connection;
 use serde_json::Value;
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::{Semaphore, mpsc, oneshot};
 
@@ -51,6 +51,23 @@ const COMMAND_BACKLOG: usize = 32;
 /// instead. The operator sees one command wait, rather than a daemon that ran
 /// out of descriptors.
 const MAX_CONNECTIONS: usize = COMMAND_BACKLOG;
+
+/// The longest control request the daemon reads.
+///
+/// A request is one line of JSON. A goal can be long, and a megabyte is far
+/// past anything an operator types. The cap stops one caller from growing the
+/// daemon's memory without end.
+const MAX_REQUEST_BYTES: u64 = 1024 * 1024;
+
+/// How long one caller may take to send its request.
+///
+/// The deadline covers the REQUEST only. The answer can take as long as the
+/// runtime needs, because a command waits for the drive loop.
+///
+/// A real client writes its line as soon as it connects, so this is generous
+/// by a wide margin. It is deliberately SHORT, because a connection that
+/// sends nothing still holds one of the daemon's connections until it expires.
+const REQUEST_DEADLINE: Duration = Duration::from_secs(5);
 
 /// How long to wait after `accept` fails.
 ///
@@ -384,15 +401,37 @@ pub fn peer_is_owner(stream: &UnixStream, owner: u32) -> bool {
 async fn serve_connection(stream: UnixStream, tx: mpsc::Sender<Job>) {
     let (read_half, mut write_half) = stream.into_split();
     let mut line = String::new();
-    if BufReader::new(read_half)
-        .read_line(&mut line)
-        .await
-        .is_err()
-    {
-        return;
-    }
+    // The read is bounded in BOTH size and time. A caller that sends no
+    // newline would otherwise grow this buffer without end, and hold one of
+    // the daemon's connections while it did. Enough such callers would leave
+    // no connection for the operator.
+    let read = tokio::time::timeout(
+        REQUEST_DEADLINE,
+        BufReader::new(read_half.take(MAX_REQUEST_BYTES)).read_line(&mut line),
+    )
+    .await;
+    let request = match read {
+        Ok(Ok(_)) => line,
+        // A caller that stopped mid-request gets a reason, not a closed
+        // connection. The cap makes a truncated line malformed JSON, which is
+        // reported the same way.
+        Ok(Err(_)) => return,
+        Err(_) => {
+            answer(
+                &mut write_half,
+                &Response::Error {
+                    message: format!(
+                        "the request did not arrive within {} seconds",
+                        REQUEST_DEADLINE.as_secs()
+                    ),
+                },
+            )
+            .await;
+            return;
+        }
+    };
 
-    let response = match serde_json::from_str::<Request>(line.trim()) {
+    let response = match serde_json::from_str::<Request>(request.trim()) {
         Ok(request) => {
             let (answer_tx, answer_rx) = oneshot::channel();
             if tx.send((request, answer_tx)).await.is_err() {
@@ -410,9 +449,15 @@ async fn serve_connection(stream: UnixStream, tx: mpsc::Sender<Job>) {
         },
     };
 
-    // An answer that cannot be encoded still gets a line, so the client reads a
-    // reason instead of a closed connection.
-    let mut encoded = serde_json::to_string(&response).unwrap_or_else(|e| {
+    answer(&mut write_half, &response).await;
+}
+
+/// Write one answer back, and end the line.
+///
+/// An answer that cannot be encoded still gets a line, so the client reads a
+/// reason instead of a closed connection.
+async fn answer(write_half: &mut tokio::net::unix::OwnedWriteHalf, response: &Response) {
+    let mut encoded = serde_json::to_string(response).unwrap_or_else(|e| {
         tracing::error!(error = %e, "cannot encode an answer");
         r#"{"status":"error","message":"the daemon cannot encode its answer"}"#.to_string()
     });
