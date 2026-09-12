@@ -230,14 +230,14 @@ fn call_api(
 
     let reply = parse_reply(&payload);
     // An approval is addressed by tool-use id, so a blank or repeated id would
-    // let one decision release a call the operator never saw. An id carrying
-    // whitespace cannot be copied out of the printed approve command. The API
-    // mints unique, quotable ids. A response that does not is malformed, and
-    // it is refused before it can reach the gate.
+    // let one decision release a call the operator never saw. An id the shell
+    // reads differently turns the printed approve command into something the
+    // model chose. The API mints unique, shell-safe ids. A response that does
+    // not is malformed, and it is refused before it can reach the gate.
     if !has_addressable_calls(&reply) {
         return Err(body_failure(
             status,
-            "its tool calls carried a blank, repeated, or unquotable id",
+            "its tool calls carried a blank, repeated, or unsafe id",
         ));
     }
     // A turn cannot both end and ask for a tool. The pair is malformed, and it
@@ -352,18 +352,36 @@ pub fn is_message(payload: &Value) -> bool {
 ///
 /// The id must also survive a copy. It becomes part of the approval token,
 /// and the status view prints that token unquoted in an `agentd approve`
-/// command line. A shell drops a trailing space and splits an inner one, so
-/// an id that carries whitespace gives an operator a command that cannot
-/// work. The decision would never match the staged name, and the call would
-/// stay blocked until its deadline. Such an id is refused here instead,
-/// before the session parks on it.
+/// command line. An operator copies that line into a shell, so the id must
+/// mean to the shell exactly what it means here. See [`is_shell_safe`].
 pub fn has_addressable_calls(reply: &TurnReply) -> bool {
     let mut seen = std::collections::HashSet::with_capacity(reply.tool_calls.len());
-    reply.tool_calls.iter().all(|call| {
-        !call.id.is_empty()
-            && !call.id.chars().any(char::is_whitespace)
-            && seen.insert(call.id.as_str())
-    })
+    reply
+        .tool_calls
+        .iter()
+        .all(|call| !call.id.is_empty() && is_shell_safe(&call.id) && seen.insert(call.id.as_str()))
+}
+
+/// Does this tool-use id mean the same thing to a shell?
+///
+/// The id reaches an operator inside a printed `agentd approve` command. A
+/// shell reads what the operator copies. An id of `x;reboot` is therefore not
+/// a token at all: it is a command, and the model chose it. An id carrying a
+/// space, a quote, a backtick, a pipe or a glob is mangled or obeyed in the
+/// same way.
+///
+/// The id is restricted to characters a shell has no meaning for, rather than
+/// quoted at the one place it is printed today. The restriction holds wherever
+/// the token goes next, and it is a property of the value instead of a
+/// property of one format string. The API mints ids from this set.
+///
+/// A leading `-` is refused as well. The token is a positional argument, and
+/// the command parser reads a leading dash as a flag.
+pub fn is_shell_safe(id: &str) -> bool {
+    !id.starts_with('-')
+        && id
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.'))
 }
 
 /// Does the stop reason agree with the content?

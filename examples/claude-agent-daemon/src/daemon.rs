@@ -296,9 +296,17 @@ fn check_resumable(
 ) -> Result<Vec<ExecutionId>, String> {
     let mut live = Vec::new();
     for row in inspect::running(reader, WORKFLOW_NAME)? {
-        let Ok(task) = serde_json::from_str::<SessionTask>(&row.input_json) else {
-            continue;
-        };
+        // A row this daemon cannot read is not a row it can skip. The
+        // returned ids are the only set the tick drives. An omitted session
+        // therefore stays RUNNING for as long as the file lasts, and nothing
+        // ever says so. The daemon refuses to start instead, under the same
+        // policy as the two checks below.
+        let task = serde_json::from_str::<SessionTask>(&row.input_json).map_err(|e| {
+            format!(
+                "session {} carries an input this daemon cannot read: {e}. The                  session stays RUNNING and no daemon of this version can resume                  it. A newer daemon wrote it, or the row is damaged.",
+                row.exec_id
+            )
+        })?;
         if task.workspace != workspace {
             return Err(format!(
                 "session {} belongs to the workspace `{}`, and this daemon serves \
@@ -315,9 +323,15 @@ fn check_resumable(
                 row.exec_id, task.model, task.model
             ));
         }
-        if let Ok(exec) = row.exec_id.parse::<ExecutionId>() {
-            live.push(exec);
-        }
+        // An id that does not parse is the same failure one step on. The
+        // session would pass every check above and then never be driven.
+        let exec = row.exec_id.parse::<ExecutionId>().map_err(|_| {
+            format!(
+                "session {} has an id this daemon cannot parse. The session                  stays RUNNING and nothing resumes it.",
+                row.exec_id
+            )
+        })?;
+        live.push(exec);
     }
     Ok(live)
 }

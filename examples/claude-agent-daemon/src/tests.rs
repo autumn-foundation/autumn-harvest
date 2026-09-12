@@ -1408,6 +1408,74 @@ fn a_hard_linked_database_is_refused() {
     );
 }
 
+#[tokio::test(flavor = "multi_thread")]
+async fn a_daemon_refuses_a_session_it_cannot_read() {
+    let dir = tempfile::tempdir().expect("a temporary directory");
+    let db = dir.path().join("agentd.db");
+    let first_socket = dir.path().join("first.sock");
+    let second_socket = dir.path().join("second.sock");
+    let options = |socket: &Path| daemon::Options {
+        db: db.clone(),
+        socket: socket.to_path_buf(),
+        workspace: dir.path().join("workspace"),
+        model: claude::DEFAULT_MODEL.to_string(),
+        max_tokens: claude::DEFAULT_MAX_TOKENS,
+        tick: Duration::from_millis(50),
+        api_key: None,
+    };
+
+    // Park one session, then drop the daemon holding it.
+    let first = tokio::spawn(daemon::serve(options(&first_socket)));
+    await_daemon(&first_socket).await;
+    let submitted = protocol::call(
+        &first_socket,
+        &Request::Submit {
+            goal: "summarise the workspace".to_string(),
+            max_turns: 6,
+            approval_timeout_secs: 300,
+        },
+    )
+    .await
+    .expect("the submit is answered");
+    let Response::Submitted { execution_id } = submitted else {
+        panic!("unexpected answer: {submitted:?}");
+    };
+    await_parked(&first_socket, &execution_id).await;
+    first.abort();
+    drop(first.await);
+
+    // Stand in for a row a newer daemon wrote. The fixture edits the EXECUTION
+    // row, which is state rather than history: the append-only event log is
+    // not touched.
+    let writer = rusqlite::Connection::open(&db).expect("the database opens");
+    writer
+        .execute(
+            "UPDATE harvest_executions SET input_json = '{\"unknown\":1}' WHERE exec_id = ?1",
+            [&execution_id],
+        )
+        .expect("the input is replaced");
+    drop(writer);
+
+    // The daemon must say so rather than report readiness over a session it
+    // silently dropped. Without the refusal `serve` runs until Ctrl-C, so the
+    // timeout keeps a regression short.
+    let refusal = tokio::time::timeout(
+        Duration::from_secs(10),
+        daemon::serve(options(&second_socket)),
+    )
+    .await
+    .expect("the daemon must refuse rather than start");
+    let message = refusal.expect_err("an unreadable session must refuse the start");
+    assert!(
+        message.contains(&execution_id),
+        "the refusal must name the row: {message}"
+    );
+    assert!(
+        message.contains("cannot read"),
+        "the refusal must say what is wrong: {message}"
+    );
+}
+
 #[test]
 fn a_key_of_whitespace_is_not_a_key() {
     // A key of whitespace would count as present, and the daemon would run
@@ -1468,18 +1536,35 @@ fn a_turn_whose_tool_calls_share_an_id_is_refused() {
     // copies that line. A shell drops a trailing space and splits an inner
     // one, so the copied token no longer matches the staged name. The write
     // then stays blocked until its deadline, with no sign of why.
-    for mangled in [" ", "\t", "toolu_a ", " toolu_a", "toolu a"] {
+    // A shell reads what the operator copies. An id of `x;reboot` is not a
+    // token at all under that reading: it is a command, and the model chose
+    // it. Whitespace, a quote, a backtick, a pipe and a glob mangle or obey
+    // the line in the same way. A leading dash reads as a flag.
+    for mangled in [
+        " ", "\t", "toolu_a ", " toolu_a", "toolu a", "x;reboot", "$(id)", "`id`", "a|b", "a&b",
+        "a>b", "a*", "a'b", "a\"b", "-toolu_a",
+    ] {
         assert!(
             !claude::has_addressable_calls(&reply(vec![call(mangled)])),
-            "an id a shell would mangle must be refused: {mangled:?}"
+            "an id a shell would read differently must be refused: {mangled:?}"
         );
     }
 
-    // An accepted id therefore always yields a token that survives a copy.
-    let token = session::approval_signal(1, 0, "toolu_a");
+    // The shape the API actually mints stays acceptable.
+    for minted in ["toolu_01A09q90qw90lq917835lq9", "call-1.2_3"] {
+        assert!(
+            claude::has_addressable_calls(&reply(vec![call(minted)])),
+            "a minted id must be addressable: {minted:?}"
+        );
+    }
+
+    // An accepted id therefore always yields a token an operator can copy.
+    let token = session::approval_signal(1, 0, "toolu_01A09q90qw90lq917835lq9");
     assert!(
-        !token.chars().any(char::is_whitespace),
-        "an accepted id must give a token with no whitespace: {token:?}"
+        token
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.' | ':')),
+        "an accepted id must give a token a shell leaves alone: {token:?}"
     );
 }
 
