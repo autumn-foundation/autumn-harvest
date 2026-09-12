@@ -253,9 +253,13 @@ approval by hand from a trimmed view is still yours to do.
   not only lexical: a symbolic link at the final component is refused, and the
   deepest existing ancestor is resolved through every link and must stay under
   the real workspace root. The 64 KiB read cap is checked before the file is
-  allocated, and the 200-entry listing cap stops the directory read rather than
-  trimming its result, so neither one huge file nor one huge directory can take
-  the daemon down. A listing ends with its own count of the names above it: any
+  allocated, so one huge file cannot take the daemon down. The 200-entry
+  listing cap bounds the MEMORY of one page and not the walk: every entry is
+  looked at, and only the smallest page after the cursor is held. That is what
+  makes a capped listing reach every entry, and it is deliberate — a truncated
+  read returns an arbitrary subset and leaves the rest unreachable. The cost is
+  one walk per page, on the same serialized loop as the session drives, so a
+  directory of millions of entries delays them. A listing ends with its own count of the names above it: any
   filename is legal text, so no line of names can be reserved for an answer
   about the listing. A write lands
   atomically, through a scratch file renamed over the target, with the file and

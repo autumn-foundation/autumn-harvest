@@ -1018,14 +1018,26 @@ fn summary_view(
     blocked: &Parked,
     full: bool,
 ) -> SessionView {
-    let answer = row.stop.as_ref().map(|stop| {
-        format!(
-            "[{stop} after {} turns, {} tool calls] {}",
-            row.turns.unwrap_or_default(),
-            row.tool_calls.unwrap_or_default(),
+    // A report is shown only when the three fields its line ASSERTS are
+    // readable. The projection reports an unreadable count as nothing, and a
+    // zero in its place would present a damaged report as a genuine result:
+    // `[end_turn after 0 turns, 0 tool calls]`.
+    //
+    // A row with none of them readable says nothing, which is what the single
+    // status does with a report it cannot deserialise. A row with some of
+    // them is named as unreadable. The line cannot be built, and a silence
+    // would read as "no report yet".
+    //
+    // The ANSWER is shown as whatever could be read. An empty answer is a
+    // real outcome: a session can end with the model writing no text.
+    let answer = match (row.stop.as_deref(), row.turns, row.tool_calls) {
+        (Some(stop), Some(turns), Some(calls)) => Some(format!(
+            "[{stop} after {turns} turns, {calls} tool calls] {}",
             row.answer.as_deref().unwrap_or_default()
-        )
-    });
+        )),
+        (None, None, None) => None,
+        _ => Some("<unreadable report>".to_string()),
+    };
     let state = row
         .exec_id
         .parse::<ExecutionId>()

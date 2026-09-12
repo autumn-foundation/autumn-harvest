@@ -3276,6 +3276,89 @@ fn every_paged_query_is_planned_as_a_seek() {
     );
 }
 
+/// A report is never shown with a count nobody recorded.
+///
+/// The listing projects an unreadable field as nothing, and a zero in its
+/// place would read as a genuine result: `[end_turn after 0 turns, 0 tool
+/// calls]`. An operator cannot tell that from a session that really did stop
+/// after no turns.
+///
+/// A row with nothing readable says nothing, which is what the single status
+/// does with a report it cannot deserialise. A row with only some of the
+/// fields is named as unreadable, so a silence is never read as "no report
+/// yet".
+#[test]
+fn a_listed_report_is_shown_only_when_it_reads() {
+    let dir = tempfile::tempdir().expect("a temporary directory");
+    let db = dir.path().join("reports.db");
+    let writer = rusqlite::Connection::open(&db).expect("the database opens");
+    fixture_table(&writer);
+    let report = |exec: &str, output: &str| {
+        writer
+            .execute(
+                "INSERT INTO harvest_executions \
+                 VALUES (?1, ?2, 'COMPLETED', ?3, ?4, NULL)",
+                rusqlite::params![exec, WORKFLOW_NAME, READABLE_TASK, output],
+            )
+            .expect("the session is recorded");
+    };
+    report(
+        "whole",
+        r#"{"stop":"end_turn","turns":3,"tool_calls":2,"answer":"done"}"#,
+    );
+    // A readable stop reason beside a count that is not an integer.
+    report(
+        "part",
+        r#"{"stop":"end_turn","turns":"many","tool_calls":2,"answer":"done"}"#,
+    );
+    // Nothing readable at all, which is the shape of a damaged report.
+    report("none", "}{");
+    // A session that ended with no text is a real outcome, not a fault.
+    report(
+        "quiet",
+        r#"{"stop":"end_turn","turns":1,"tool_calls":0,"answer":""}"#,
+    );
+    drop(writer);
+
+    let reader = inspect::open(&db).expect("the reader opens");
+    let (views, _, _) = daemon::sessions(&reader, &daemon::Parked::new(), false, None)
+        .expect("the listing renders");
+    let shown = |exec: &str| -> Option<String> {
+        views
+            .iter()
+            .find(|view| view.execution_id == exec)
+            .expect("the session is listed")
+            .answer
+            .clone()
+    };
+
+    assert_eq!(
+        shown("whole").as_deref(),
+        Some("[end_turn after 3 turns, 2 tool calls] done"),
+        "a readable report is shown as it stands"
+    );
+    assert_eq!(
+        shown("part").as_deref(),
+        Some("<unreadable report>"),
+        "a report missing a field it asserts is named unreadable"
+    );
+    assert_eq!(
+        shown("none"),
+        None,
+        "a report with nothing readable says nothing, as the status does"
+    );
+    assert_eq!(
+        shown("quiet").as_deref(),
+        Some("[end_turn after 1 turns, 0 tool calls] "),
+        "an answer of no text is still a report"
+    );
+    // The zero that would have been invented is nowhere in the listing.
+    assert!(
+        !shown("part").unwrap_or_default().contains("0 turns"),
+        "no count is invented for a field nobody recorded"
+    );
+}
+
 /// One damaged row does not hide every other session.
 ///
 /// `json_extract` on a document that is not JSON raises `malformed JSON`, and
