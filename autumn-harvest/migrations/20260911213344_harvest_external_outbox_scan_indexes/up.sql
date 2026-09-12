@@ -16,7 +16,7 @@
 -- `idx_harvest_events_reset_terminated`, both in
 -- `20260702000000_harvest_usage_report_indexes`). It carried none for these
 -- three. On a 1.02M-event fixture one cold claim read 1,020,000 rows to
--- return one, at 21,243 buffers, and every claim of every drain loop paid it.
+-- return one, at 21,245 buffers, and every claim of every drain loop paid it.
 --
 -- The paired resolution check asks whether a request is already delivered or
 -- failed. It was unindexed too, and that half is the larger cost. The check
@@ -47,13 +47,13 @@
 -- So this migration and the `timeout.rs` rewrite ship together, and the
 -- measurement that matters is of the pair. A full 50-request drain costs
 -- about 300,000 buffers before and about 10,000 after. One committed instance
--- of that is 319,706 against 16,867, with the plans and the
+-- of that is 299,082 against 16,679, with the plans and the
 -- `pg_stat_statements` snapshots, in
 -- `docs/perf-artifacts/external-outbox-scan/`.
 --
 -- Read those as orders of magnitude. A drain total is not reproducible to the
 -- digit in either direction. The per-claim plan is the stable part: a cold
--- claim falls from a 21,243-buffer sequential scan to 7 buffers.
+-- claim falls from a 21,245-buffer sequential scan to 7 buffers.
 --
 -- One limit belongs here rather than only in the writeup. `harvest_events` is
 -- append-only, so the pending index below holds every request the deployment

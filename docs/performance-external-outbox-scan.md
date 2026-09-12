@@ -123,9 +123,17 @@ FOR UPDATE OF e SKIP LOCKED
 A `LIMIT 1` inside a `LATERAL` cannot be pulled up into the outer query, so the
 executions probe is structurally correlated rather than correlated by a plan
 the planner happens to prefer today. `harvest_workflow_executions.id` is the
-primary key, so the subquery returns at most one row either way and the pin
-changes no result. Under the stale estimate below it is worth 35% of a drain
-(6,995 buffers against 10,820).
+primary key, so the subquery returns at most one row either way, and the pin
+changes no result.
+
+**The pin is free, not a win, and the harness says so.** Its `stale: as
+shipped, executions join plain` scenario is the identical query with this one
+join written as an ordinary `INNER JOIN`: 6,350 buffers against the pinned
+form's 6,358. An earlier draft of this page claimed it was worth 35% of a
+drain, from a fixture carrying 200,000 resolution events; that figure is not
+reproducible from the committed harness and is withdrawn. What the pin buys is
+a plan that cannot change shape with the statistics, at no measured cost --
+which is the argument for it, and the only one this page makes.
 
 **The resolution check stays a `NOT EXISTS`, and that is measured too.** An
 earlier revision of this change pinned it the same way, as a `LEFT JOIN
@@ -188,7 +196,7 @@ Three things this table says, in order of how much they matter.
 
 **The indexes are the fix.** Roughly 300,000 buffers become roughly 10,000, a
 reduction around 95 to 97%. The committed evidence capture, through the real
-query path, puts one instance at 319,706 → 16,867.
+query path, puts one instance at 299,082 → 16,679.
 
 **With accurate statistics the rewrite adds nothing measurable.** The last two
 rows overlap completely; across runs each is sometimes the lower one. This page
@@ -208,7 +216,7 @@ Single cold claim:
 
 | scenario | buffers | dominant node |
 |:--|--:|:--|
-| before | 21,243 | `Seq Scan on harvest_events` (`Rows Removed by Filter: 1,020,000`) |
+| before | 21,245 | `Seq Scan on harvest_events` (`Rows Removed by Filter: 1,020,000`) |
 | after | 7 | none -- every node is a keyed index scan |
 
 ### Under a stale row estimate
@@ -255,7 +263,7 @@ Same fixture, adding N already-resolved signal requests back-dated 30 days:
 
 | resolved requests in the index | pre-change drain | as-shipped drain | pre-change cold claim | as-shipped cold claim |
 |--:|--:|--:|--:|--:|
-| 0 | ~300,000 | ~10,000 | 21,243 | 7 |
+| 0 | ~300,000 | ~10,000 | 21,245 | 7 |
 | 2,000 | 725,078 | 419,508 | 21,250 | 8,100 |
 | 8,000 | 2,275,566 | 1,657,511 | 21,260 | 32,369 |
 | 20,000 | 5,109,855 | 4,132,989 | 21,287 | 80,908 |

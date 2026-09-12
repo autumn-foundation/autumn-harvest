@@ -831,6 +831,57 @@ const EVIDENCE_TERMINAL_EXECUTIONS: usize = 2_000;
 const EVIDENCE_EVENTS_PER_TERMINAL: usize = 10;
 const EVIDENCE_PENDING_REQUESTS: usize = 50;
 
+/// The four indexes the migration adds, as the evidence capture rebuilds them.
+///
+/// Deliberately not an `include_str!` of the migration. `migration_hygiene`
+/// forbids a test fixture from building schema out of a migration bundle, and
+/// this capture needs four indexes rather than a schema.
+///
+/// Copying DDL into a test invites drift, so the capture does not rely on this
+/// text being right. `setup_bench_db` applies the real migration first, so the
+/// capture records what the migration built, drops it, rebuilds from here, and
+/// compares. A difference fails the capture instead of publishing numbers for
+/// indexes the engine does not ship.
+const CANDIDATE_INDEXES_SQL: &str = "\
+    CREATE INDEX idx_harvest_events_external_outbox_pending \
+        ON harvest_events (event_type, timestamp, id) \
+        WHERE event_type IN ('ExternalSignalRequested', 'ExternalCancelRequested', 'ExternalAwaitRequested'); \
+    CREATE INDEX idx_harvest_events_external_signal_resolved \
+        ON harvest_events (workflow_exec_id, (event_data->'data'->>'signal_id')) \
+        WHERE event_type IN ('ExternalSignalDelivered', 'ExternalSignalFailed'); \
+    CREATE INDEX idx_harvest_events_external_cancel_resolved \
+        ON harvest_events (workflow_exec_id, (event_data->'data'->>'cancel_id')) \
+        WHERE event_type IN ('ExternalCancelDelivered', 'ExternalCancelFailed'); \
+    CREATE INDEX idx_harvest_events_external_await_resolved \
+        ON harvest_events (workflow_exec_id, (event_data->'data'->>'await_id')) \
+        WHERE event_type IN ('ExternalAwaitResolved', 'ExternalAwaitFailed');";
+
+#[derive(QueryableByName, Debug, PartialEq, Eq)]
+struct IndexDefinition {
+    #[diesel(sql_type = Text)]
+    name: String,
+    #[diesel(sql_type = Text)]
+    definition: String,
+}
+
+/// Report every external-outbox index on `harvest_events`, name and body.
+///
+/// The body comes from `pg_get_indexdef`, so two builds of the same index
+/// compare equal whatever spelling produced them.
+async fn outbox_index_definitions(conn: &mut AsyncPgConnection) -> Vec<IndexDefinition> {
+    diesel::sql_query(
+        "SELECT c.relname AS name, pg_get_indexdef(c.oid) AS definition \
+         FROM pg_class c \
+         JOIN pg_index i ON i.indexrelid = c.oid \
+         WHERE i.indrelid = 'harvest_events'::regclass \
+           AND c.relname LIKE 'idx_harvest_events_external_%' \
+         ORDER BY c.relname",
+    )
+    .load(conn)
+    .await
+    .expect("read the outbox index definitions")
+}
+
 /// Regenerate `docs/perf-artifacts/external-outbox-scan/`.
 ///
 /// Captures the before and after form of one drain: the legacy query against
@@ -880,8 +931,17 @@ async fn zz_capture_external_outbox_scan_evidence() {
     seed_evidence_fixture(&mut conn).await;
 
     // `setup_bench_db` runs every migration, so the four indexes already
-    // exist. Drop them for the before capture, so this test reproduces the
-    // pre-fix baseline on either side of the migration.
+    // exist. Record what the migration built before dropping them, so the
+    // rebuild below can be checked against it.
+    let shipped_indexes = outbox_index_definitions(&mut conn).await;
+    assert_eq!(
+        shipped_indexes.len(),
+        4,
+        "the migration must have built four indexes for this capture to check its rebuild"
+    );
+
+    // Drop them for the before capture, so this test reproduces the pre-fix
+    // baseline on either side of the migration.
     conn.batch_execute(
         "DROP INDEX IF EXISTS idx_harvest_events_external_outbox_pending; \
          DROP INDEX IF EXISTS idx_harvest_events_external_signal_resolved; \
@@ -902,11 +962,16 @@ async fn zz_capture_external_outbox_scan_evidence() {
     .await;
 
     reset_evidence_outbox(&mut conn, family).await;
-    conn.batch_execute(include_str!(
-        "../../migrations/20260911213344_harvest_external_outbox_scan_indexes/up.sql"
-    ))
-    .await
-    .expect("build the candidate indexes");
+    conn.batch_execute(CANDIDATE_INDEXES_SQL)
+        .await
+        .expect("build the candidate indexes");
+    assert_eq!(
+        outbox_index_definitions(&mut conn).await,
+        shipped_indexes,
+        "the rebuilt indexes differ from the ones the migration builds, so this \
+         capture would measure something the engine does not ship -- reconcile \
+         CANDIDATE_INDEXES_SQL with the migration"
+    );
     analyze(&mut conn).await;
 
     let after = capture_drain(&mut conn, &out_dir, "after", (family.query)(), family).await;

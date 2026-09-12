@@ -134,6 +134,29 @@ LIMIT 1
 FOR UPDATE OF e SKIP LOCKED
 SQL
 
+# The shipped query with the executions join written as a plain `INNER JOIN`
+# instead of a `LATERAL`. Everything else -- the `ORDER BY` pin and the
+# `NOT EXISTS` resolution check -- is identical, so a comparison against
+# `rewritten.sql` isolates what pinning that one join is worth.
+cat > "$WORK/rewritten_plain_join.sql" <<'SQL'
+SELECT e.* FROM harvest_events e
+INNER JOIN harvest_workflow_executions execs ON e.workflow_exec_id = execs.id
+WHERE e.event_type = 'ExternalSignalRequested'
+  AND execs.state = 'RUNNING'
+  AND execs.shard_id = ANY('{0}'::int[])
+  AND (e.event_data->'data'->>'signal_id') IS NOT NULL
+  AND NOT (e.id = ANY('{}'::bigint[]))
+  AND NOT EXISTS (
+      SELECT 1 FROM harvest_events res
+      WHERE res.workflow_exec_id = e.workflow_exec_id
+        AND res.event_type IN ('ExternalSignalDelivered', 'ExternalSignalFailed')
+        AND res.event_data->'data'->>'signal_id' = e.event_data->'data'->>'signal_id'
+  )
+ORDER BY e.timestamp, e.id
+LIMIT 1
+FOR UPDATE OF e SKIP LOCKED
+SQL
+
 # The indexes, minus the migration's guard, so a scenario can install a subset.
 cat > "$WORK/idx_pending.sql" <<'SQL'
 CREATE INDEX idx_harvest_events_external_outbox_pending
@@ -241,6 +264,7 @@ echo
 echo "== the same drain under a row estimate left 400x above the truth =="
 run_scenario "stale: baseline"                    "$WORK/legacy.sql"    ""                  "$WORK/stale.sql"
 run_scenario "stale: all indexes, legacy query"   "$WORK/legacy.sql"    "$WORK/idx_all.sql" "$WORK/stale.sql"
+run_scenario "stale: as shipped, executions join plain" "$WORK/rewritten_plain_join.sql" "$WORK/idx_all.sql" "$WORK/stale.sql"
 run_scenario "stale: as shipped"                  "$WORK/rewritten.sql" "$WORK/idx_all.sql" "$WORK/stale.sql"
 
 # ---------------------------------------------------------------------------

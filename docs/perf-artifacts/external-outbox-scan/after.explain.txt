@@ -1,17 +1,17 @@
-Limit  (cost=0.53..24.51 rows=1 width=170) (actual rows=1 loops=1)
+Limit  (cost=0.53..24.52 rows=1 width=170) (actual rows=1 loops=1)
   Output: e.id, e.workflow_exec_id, e.event_id, e.event_type, e.event_data, e."timestamp", e.cohort, e.ctid, running.*, res.ctid
   Buffers: shared hit=6 read=1
-  ->  LockRows  (cost=0.53..24.51 rows=1 width=170) (actual rows=1 loops=1)
+  ->  LockRows  (cost=0.53..24.52 rows=1 width=170) (actual rows=1 loops=1)
         Output: e.id, e.workflow_exec_id, e.event_id, e.event_type, e.event_data, e."timestamp", e.cohort, e.ctid, running.*, res.ctid
         Buffers: shared hit=6 read=1
-        ->  Nested Loop Anti Join  (cost=0.53..24.50 rows=1 width=170) (actual rows=1 loops=1)
+        ->  Nested Loop Anti Join  (cost=0.53..24.51 rows=1 width=170) (actual rows=1 loops=1)
               Output: e.id, e.workflow_exec_id, e.event_id, e.event_type, e.event_data, e."timestamp", e.cohort, e.ctid, running.*, res.ctid
               Join Filter: ((res.workflow_exec_id = e.workflow_exec_id) AND (((res.event_data -> 'data'::text) ->> 'signal_id'::text) = ((e.event_data -> 'data'::text) ->> 'signal_id'::text)))
               Buffers: shared hit=5 read=1
-              ->  Nested Loop  (cost=0.41..16.33 rows=1 width=164) (actual rows=1 loops=1)
+              ->  Nested Loop  (cost=0.41..16.34 rows=1 width=164) (actual rows=1 loops=1)
                     Output: e.id, e.workflow_exec_id, e.event_id, e.event_type, e.event_data, e."timestamp", e.cohort, e.ctid, running.*
                     Buffers: shared hit=4 read=1
-                    ->  Index Scan using idx_harvest_events_external_outbox_pending on public.harvest_events e  (cost=0.12..8.01 rows=1 width=140) (actual rows=1 loops=1)
+                    ->  Index Scan using idx_harvest_events_external_outbox_pending on public.harvest_events e  (cost=0.12..8.02 rows=1 width=140) (actual rows=1 loops=1)
                           Output: e.id, e.workflow_exec_id, e.event_id, e.event_type, e.event_data, e."timestamp", e.cohort, e.ctid
                           Index Cond: (e.event_type = 'ExternalSignalRequested'::text)
                           Filter: (((e.event_data -> 'data'::text) ->> 'signal_id'::text) IS NOT NULL)
@@ -31,8 +31,8 @@ Limit  (cost=0.53..24.51 rows=1 width=170) (actual rows=1 loops=1)
                     Output: res.ctid, res.workflow_exec_id, res.event_data
                     Filter: (res.event_type = ANY ('{ExternalSignalDelivered,ExternalSignalFailed}'::text[]))
                     Buffers: shared hit=1
-Query Identifier: -5436251119485096488
+Query Identifier: 8285574398957116261
 Planning:
-  Buffers: shared hit=154 read=4
-Planning Time: 1.164 ms
-Execution Time: 0.114 ms
+  Buffers: shared hit=158 read=4
+Planning Time: 0.913 ms
+Execution Time: 0.088 ms

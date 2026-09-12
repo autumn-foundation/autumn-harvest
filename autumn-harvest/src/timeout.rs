@@ -262,8 +262,10 @@ pub const fn workflow_history_ceiling_query() -> &'static str {
 /// 1` inside a `LATERAL` cannot be pulled up into the outer query, so the
 /// shape is structural. `harvest_workflow_executions.id` is the primary key,
 /// so the subquery returns at most one row with or without that `LIMIT`, and
-/// the pin changes no result. Under a stale row estimate it is worth 35% of
-/// a drain (issue #1486).
+/// the pin changes no result. It is also free: the same query with this join
+/// written as an ordinary `INNER JOIN` measures 6,350 buffers against 6,358.
+/// The pin buys a plan that cannot change shape with the statistics, at no
+/// measured cost. That is the whole argument for it.
 ///
 /// The resolution check stays a `NOT EXISTS`, and that is also measured. An
 /// earlier revision of this change pinned it the same way, as a `LEFT JOIN

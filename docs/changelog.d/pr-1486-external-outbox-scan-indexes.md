@@ -68,8 +68,8 @@ digit in either direction: the pre-change form moves with where
 `synchronize_seqscans` starts its scan, and the as-shipped form moves with
 cache state, since each claim walks what earlier claims resolved. The committed
 evidence capture, driving the real query text through the real drain loop, put
-one instance at 319,706 → 16,867. The per-claim plan is the stable part: a cold
-claim falls from 21,243 buffers (`Seq Scan`, `Rows Removed by Filter:
+one instance at 299,082 → 16,679. The per-claim plan is the stable part: a cold
+claim falls from 21,245 buffers (`Seq Scan`, `Rows Removed by Filter:
 1,020,000`) to 7, in every run of every fixture measured.
 
 With accurate statistics the indexes carry the whole win and the rewrite adds
