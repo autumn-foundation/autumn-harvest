@@ -245,14 +245,15 @@ shard records:
 - **A sink is configured in the sweeping process.** Covers the window before the
   exporter's first tick on a shard has created the cursor row at all (freshly
   enabled, newly added to the fleet, or a shard whose pool has been failing).
-- **`RetentionConfig::protect_unexported_audit` is `true`.** Covers a gap the
-  first two signals share (issue #1266). In a split web/worker deployment, the
-  process running retention may have no sink and no cursor row at the same
-  time. This happens before the worker's first successful tick on a shard.
-  Neither of the first two signals can close that window alone. Both need the
-  worker to have reached the shard at least once. Set this flag the same way
-  on every process in the deployment. This closes the window from the moment
-  export is configured, not from the moment it first succeeds.
+- **`RetentionConfig::protect_unexported_audit` is `true`, and no cursor row
+  exists yet for the shard.** Covers a gap the first two signals share (issue
+  #1266). In a split web/worker deployment, the process running retention may
+  have no sink and no cursor row at the same time. This happens before the
+  worker's first successful tick on a shard. Neither of the first two signals
+  can close that window alone. Both need the worker to have reached the shard
+  at least once. Set this flag the same way on every process in the
+  deployment. This closes the window from the moment export is configured,
+  not from the moment it first succeeds.
 
   ```rust
   autumn_harvest::retention::RetentionConfig::default()
@@ -260,9 +261,24 @@ shard records:
       .with_protect_unexported_audit(true);
   ```
 
-  The cost is operational, not architectural: an operator must remember to set
-  the flag on every process, including ones added later. Forgetting it only
-  reopens the original bootstrap window; it never causes data loss beyond that.
+  Two cheaper fixes were considered and rejected. Seeding the cursor row in a
+  migration cannot work: a shard's own database does not know its own shard
+  id, which is the same reason `ensure_cursor_row` provisions it lazily
+  instead (see `harvest_shard_generation`'s migration, issue #954, for the
+  identical argument). Having the retention process create the row itself
+  cannot work either: that process does not know whether an exporter is
+  coming, which is exactly the information this flag supplies instead.
+
+  The signal steps aside the moment any cursor row exists for the shard,
+  retired or not. A live cursor already protects the shard under the first
+  signal above. A retired cursor is an explicit operator decision, and
+  decommissioning must keep working even where this flag stays `true`
+  forever — see "Retiring audit export on a shard" below.
+
+  The remaining cost is operational, not architectural: an operator must
+  remember to set the flag on every process, including ones added later.
+  Forgetting it only reopens the original bootstrap window; it never causes
+  data loss beyond that.
 
 The guard is deliberately **not** time-based. An earlier revision expired it 24
 hours after the exporter's last heartbeat, so a long worker outage lifted it. A

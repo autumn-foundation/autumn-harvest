@@ -37,6 +37,12 @@
 //! - `retention_protects_unexported_audit_when_configured_with_no_cursor_and_no_local_sink`
 //!   — the split-deployment bootstrap window (issue #1266): no cursor row,
 //!   no local sink, closed only by `protect_unexported_audit`.
+//! - `retention_decommission_overrides_protect_unexported_audit` — the flag
+//!   must step aside for a retired cursor, or decommissioning would silently
+//!   stop working wherever the flag is left on.
+//! - `retention_still_purges_acknowledged_rows_when_protect_unexported_audit_is_true`
+//!   — the flag widens only the liveness signal, never the per-row pending
+//!   check.
 //! - `every_batch_is_hmac_signed_and_carries_its_shard_and_seq_range` — AC1/AC4.
 
 use std::sync::{Arc, Mutex};
@@ -1814,6 +1820,93 @@ async fn retention_protects_unexported_audit_when_configured_with_no_cursor_and_
         .await
         .expect("count");
     assert_eq!(remaining, 5);
+}
+
+// The flag must never outrank an explicit decommission. It exists only for
+// the window before a shard has a cursor row at all. A retired cursor is a
+// real signal. It must still resume purging even if the flag stays `true`
+// forever. That is how a split deployment is meant to run it.
+#[tokio::test]
+async fn retention_decommission_overrides_protect_unexported_audit() {
+    let _guard = TEST_SERIAL.lock().await;
+    let _sink = install(Arc::new(RecordingSink::new(200)), 2);
+    let (mut conn, _c) = make_conn().await;
+    insert_audit_rows(&mut conn, 5).await;
+    fire_due_audit_exports(&mut conn, &None, &[], &NoOpMetrics)
+        .await
+        .expect("tick");
+    assert_eq!(cursor_acked(&mut conn, 0).await, 2);
+    uninstall();
+
+    diesel::update(harvest_audit_log::table)
+        .set(harvest_audit_log::occurred_at.eq(chrono::Utc::now() - chrono::Duration::days(365)))
+        .execute(&mut conn)
+        .await
+        .expect("age rows");
+
+    // Before decommission, the flag is superfluous: the live cursor already
+    // protects the three unacknowledged rows.
+    let deleted = purge_old_audit_records(&mut conn, 90, true)
+        .await
+        .expect("purge runs");
+    assert_eq!(deleted, 2, "only the acknowledged records may go");
+
+    assert!(
+        autumn_harvest::audit_export::decommission_cursor(&mut conn, 0)
+            .await
+            .expect("decommission"),
+        "the cursor row existed, so it must report as removed"
+    );
+
+    // After decommission, purging must resume for the remaining rows. This
+    // holds even though the flag is still `true`. A retired cursor is the
+    // operator's explicit word that nothing owes this shard records any
+    // more.
+    let deleted = purge_old_audit_records(&mut conn, 90, true)
+        .await
+        .expect("purge runs");
+    assert_eq!(
+        deleted, 3,
+        "protect_unexported_audit must step aside once the shard has an \
+         explicit retired cursor, or decommissioning would silently stop \
+         working for every deployment that leaves the flag on"
+    );
+}
+
+// The flag widens only the "export may be live" signal. It must never touch
+// the per-row pending check, or a deployment that sets it permanently would
+// stop purging records the exporter already shipped and acknowledged.
+#[tokio::test]
+async fn retention_still_purges_acknowledged_rows_when_protect_unexported_audit_is_true() {
+    let _guard = TEST_SERIAL.lock().await;
+    let _sink = install(Arc::new(RecordingSink::new(200)), 2);
+    let (mut conn, _c) = make_conn().await;
+    insert_audit_rows(&mut conn, 5).await;
+    fire_due_audit_exports(&mut conn, &None, &[], &NoOpMetrics)
+        .await
+        .expect("tick");
+    assert_eq!(cursor_acked(&mut conn, 0).await, 2);
+    diesel::update(harvest_audit_log::table)
+        .set(harvest_audit_log::occurred_at.eq(chrono::Utc::now() - chrono::Duration::days(365)))
+        .execute(&mut conn)
+        .await
+        .expect("age rows");
+
+    let deleted = purge_old_audit_records(&mut conn, 90, true)
+        .await
+        .expect("purge runs");
+    assert_eq!(
+        deleted, 2,
+        "the flag must not protect rows the exporter already acknowledged, \
+         only the three still pending"
+    );
+
+    let remaining: i64 = harvest_audit_log::table
+        .count()
+        .get_result(&mut conn)
+        .await
+        .expect("count");
+    assert_eq!(remaining, 3);
 }
 
 #[tokio::test]

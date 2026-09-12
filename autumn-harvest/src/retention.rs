@@ -333,7 +333,7 @@ pub struct RetentionConfig {
     /// Audit log retention in days, independent of workflow-history retention.
     /// Defaults to 90 days (3 months). Set to 0 to disable audit purging.
     pub audit_retention_days: i64,
-    /// Protect every unexported audit row, regardless of local signals
+    /// Protect every unexported audit row before its shard has a cursor row
     /// (issue #1266). Defaults to `false`.
     ///
     /// `purge_old_audit_records` already refuses to delete an unexported row
@@ -347,7 +347,9 @@ pub struct RetentionConfig {
     /// retention finds no sink and no cursor row.
     ///
     /// Set this flag to `true` on every process in such a deployment. This
-    /// closes the window. See `docs/audit-export.md`.
+    /// closes the window. It steps aside the moment a cursor row exists for
+    /// the shard, retired or not. Decommissioning a shard still resumes
+    /// purging even with the flag left on. See `docs/audit-export.md`.
     pub protect_unexported_audit: bool,
     /// Schedule decisions retention in days.
     /// Defaults to 7 days. Set to 0 to disable schedule decision purging.
