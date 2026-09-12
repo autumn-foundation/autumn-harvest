@@ -33,15 +33,32 @@
 //! - **AC8** (composition with offload / erasure) —
 //!   [`offload_envelopes_and_tombstones_survive_a_sweep_untouched`].
 //!
+//! # Issue #1244: the two structural fleet-wide preconditions
+//!
+//! - **Durable write fence, replacing operator attestation** —
+//!   [`retirement_waits_for_the_staleness_window_even_at_a_zero_census`],
+//!   [`retirement_via_the_structural_gate_refuses_a_purely_local_flip`]
+//!   (the "another live writer" hazard), and
+//!   [`retirement_recheck_catches_a_row_that_commits_after_the_first_zero_census`]
+//!   (the "uncommitted append" hazard).
+//! - **Reader-capability handshake before activation** —
+//!   [`activation_is_refused_while_a_live_worker_cannot_read_the_keyed_envelope`],
+//!   [`activation_succeeds_once_every_live_worker_advertises_the_keyed_envelope`],
+//!   [`activation_ignores_a_worker_whose_heartbeat_is_stale`].
+//! - **Bounded staleness** —
+//!   [`refresh_active_codec_key_picks_up_a_fleet_wide_activation_from_another_process`].
+//!
 //! Runs against `HARVEST_TEST_DATABASE_URL` when set (each test gets its own
 //! throwaway database, because the rotation census is shard-wide by design),
 //! otherwise against a per-test Postgres container.
 
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use autumn_harvest::codec_rotation::{
-    FleetWriteFence, load_shard_rotation_progress, load_shard_rotation_progress_against,
-    retire_codec_key, sweep_codec_reencryption_once,
+    FleetWriteFence, activate_codec_key, load_shard_rotation_progress,
+    load_shard_rotation_progress_against, refresh_active_codec_key, retire_codec_key,
+    sweep_codec_reencryption_once,
 };
 use autumn_harvest::erase::erasure_tombstone;
 use autumn_harvest::error::HarvestError;
@@ -279,6 +296,22 @@ async fn cursor_row_count(conn: &mut AsyncPgConnection) -> i64 {
             .await
             .expect("count cursor rows");
     row.n
+}
+
+/// `harvest_codec_key_state.state` for `key_id`, or `None` when no row exists.
+async fn key_state(conn: &mut AsyncPgConnection, key_id: &str) -> Option<String> {
+    #[derive(diesel::QueryableByName)]
+    struct State {
+        #[diesel(sql_type = diesel::sql_types::Text)]
+        state: String,
+    }
+    let rows: Vec<State> =
+        diesel::sql_query("SELECT state FROM harvest_codec_key_state WHERE key_id = $1")
+            .bind::<diesel::sql_types::Text, _>(key_id)
+            .load(conn)
+            .await
+            .expect("load key state");
+    rows.into_iter().next().map(|r| r.state)
 }
 
 fn kid_of(event_data: &Value, field: &str) -> Option<String> {
@@ -1175,6 +1208,8 @@ async fn retirement_is_refused_while_rows_remain_and_succeeds_at_zero() {
         &codecs,
         "k1",
         FleetWriteFence::ConfirmedByOperator,
+        std::time::Duration::ZERO,
+        std::time::Duration::ZERO,
     )
     .await
     .expect_err("retirement must be refused while a row remains");
@@ -1203,69 +1238,290 @@ async fn retirement_is_refused_while_rows_remain_and_succeeds_at_zero() {
         &codecs,
         "k1",
         FleetWriteFence::ConfirmedByOperator,
+        std::time::Duration::ZERO,
+        std::time::Duration::ZERO,
     )
     .await
     .expect("retirement must succeed at exactly zero remaining rows");
     assert!(codecs.codec_for_key("k1").is_none());
 }
 
+// ── issue #1244: the structural write fence ──────────────────────────────────
+
+/// `activate_codec_key` is what durably marks the superseded key "retiring".
+/// `retire_codec_key`'s default (structural) path refuses until that has held
+/// for `staleness_window` -- even though the census is a genuine zero. That
+/// is exactly the case the old boolean `FleetWriteFence` could not
+/// distinguish from "another worker has not rolled forward yet".
 #[tokio::test]
-async fn retirement_is_refused_without_an_attested_fleet_write_fence() {
-    // Codex round 3 (P1): a zero census is necessary but NOT sufficient. The
-    // registry is per-process, so the census cannot see (a) another worker that
-    // still holds the old key active and will encode under it a millisecond
-    // later, or (b) an append that already encoded under the old key and has
-    // not committed yet. Either makes a new old-key row appear *after* the gate
-    // reported zero and dropped the decoder.
-    //
-    // The gate therefore demands the half it cannot prove. This pins that an
-    // otherwise-perfect retirement -- zero rows, key registered, every shard
-    // supplied and reachable -- is still refused without the attestation, so
-    // the unprovable half can never be skipped by accident.
+async fn retirement_waits_for_the_staleness_window_even_at_a_zero_census() {
     let (url, _c) = setup_isolated_db().await;
     let codecs = two_key_registry();
-    codecs.set_active_key("k2").expect("flip");
-
     let pool = build_pool(&url);
     let sharded = ShardedDbPool::single(pool);
     let shards = [ShardId::new(0)];
 
-    // Nothing was ever written under k1: the census is a genuine zero.
+    // `two_key_registry` bootstraps k1 active only in this process's local
+    // memory (mirroring `register_key`'s "first key becomes active"
+    // convenience). An operator durably activates it too, so it has a
+    // `harvest_codec_key_state` row to demote when a newer key supersedes it.
+    activate_codec_key(&sharded, &shards, &codecs, "k1", 60)
+        .await
+        .expect("no live workers to block activation");
+    activate_codec_key(&sharded, &shards, &codecs, "k2", 60)
+        .await
+        .expect("no live workers to block activation");
+    assert_eq!(codecs.active_key_id(), "k2");
+
+    let window = Duration::from_millis(200);
     let err = retire_codec_key(
         &sharded,
         &shards,
         &codecs,
         "k1",
         FleetWriteFence::NotConfirmed,
+        window,
+        Duration::ZERO,
     )
     .await
-    .expect_err("a zero census alone must not authorise retirement");
+    .expect_err("the staleness window has not elapsed yet");
     match err {
-        HarvestError::Config(msg) => {
+        HarvestError::CodecKeyRetirementBlocked { remaining, .. } => {
             assert!(
-                msg.contains("fleet write fence"),
-                "the refusal must name the missing fence, got {msg:?}"
+                remaining
+                    .iter()
+                    .all(|r| r.reason.as_deref().is_some_and(|r| r.contains("staleness"))),
+                "{remaining:?}"
             );
         }
-        other => panic!("expected Config, got {other:?}"),
+        other => panic!("expected CodecKeyRetirementBlocked, got {other:?}"),
     }
-    assert!(
-        codecs.codec_for_key("k1").is_some(),
-        "a refused retirement must not drop the decoder"
-    );
+    assert!(codecs.codec_for_key("k1").is_some());
 
-    // The same call, with the fence attested, succeeds -- proving the refusal
-    // above was the fence and nothing else.
+    tokio::time::sleep(window + Duration::from_millis(100)).await;
+    retire_codec_key(
+        &sharded,
+        &shards,
+        &codecs,
+        "k1",
+        FleetWriteFence::NotConfirmed,
+        window,
+        Duration::ZERO,
+    )
+    .await
+    .expect("the window has now elapsed and the census is zero");
+    assert!(codecs.codec_for_key("k1").is_none());
+}
+
+/// A **local-only** flip (the old #948 behaviour, `PayloadCodecs::set_active_key`
+/// called directly rather than through `activate_codec_key`) never durably
+/// marks the superseded key "retiring". The structural gate refuses on
+/// exactly that basis. This is the regression test for the hazard #1244
+/// exists to close: a per-process flip must never be mistaken for a
+/// fleet-wide one.
+#[tokio::test]
+async fn retirement_via_the_structural_gate_refuses_a_purely_local_flip() {
+    let (url, _c) = setup_isolated_db().await;
+    let codecs = two_key_registry();
+    codecs.set_active_key("k2").expect("local-only flip");
+
+    let pool = build_pool(&url);
+    let sharded = ShardedDbPool::single(pool);
+    let shards = [ShardId::new(0)];
+
+    let err = retire_codec_key(
+        &sharded,
+        &shards,
+        &codecs,
+        "k1",
+        FleetWriteFence::NotConfirmed,
+        Duration::ZERO,
+        Duration::ZERO,
+    )
+    .await
+    .expect_err("no durable key state was ever written for k1");
+    match err {
+        HarvestError::CodecKeyRetirementBlocked { remaining, .. } => {
+            assert!(
+                remaining
+                    .iter()
+                    .all(|r| r.reason.as_deref().is_some_and(|r| r.contains("durable"))),
+                "{remaining:?}"
+            );
+        }
+        other => panic!("expected CodecKeyRetirementBlocked, got {other:?}"),
+    }
+    assert!(codecs.codec_for_key("k1").is_some());
+
+    // The escape hatch is unaffected: an operator who has confirmed the fence
+    // out of band still bypasses the durable-state requirement entirely.
     retire_codec_key(
         &sharded,
         &shards,
         &codecs,
         "k1",
         FleetWriteFence::ConfirmedByOperator,
+        Duration::ZERO,
+        Duration::ZERO,
     )
     .await
-    .expect("zero rows plus an attested fence retires the key");
+    .expect("the escape hatch skips the structural gate");
     assert!(codecs.codec_for_key("k1").is_none());
+}
+
+/// The escape hatch skips only the staleness-window *wait* (see
+/// `FleetWriteFence`'s doc). It must not also skip durably recording the
+/// retirement, or `harvest_codec_key_state` would claim a destroyed key is
+/// still merely "retiring" forever.
+#[tokio::test]
+async fn retirement_via_the_escape_hatch_still_records_the_durable_retirement() {
+    let (url, _c) = setup_isolated_db().await;
+    let mut conn = connect(&url).await;
+    let codecs = two_key_registry();
+    let pool = build_pool(&url);
+    let sharded = ShardedDbPool::single(pool);
+    let shards = [ShardId::new(0)];
+
+    activate_codec_key(&sharded, &shards, &codecs, "k1", 60)
+        .await
+        .expect("no live workers to block activation");
+    activate_codec_key(&sharded, &shards, &codecs, "k2", 60)
+        .await
+        .expect("no live workers to block activation");
+    assert_eq!(
+        key_state(&mut conn, "k1").await.as_deref(),
+        Some("retiring")
+    );
+
+    retire_codec_key(
+        &sharded,
+        &shards,
+        &codecs,
+        "k1",
+        FleetWriteFence::ConfirmedByOperator,
+        Duration::ZERO,
+        Duration::ZERO,
+    )
+    .await
+    .expect("zero rows and the escape hatch retire the key");
+
+    assert_eq!(
+        key_state(&mut conn, "k1").await.as_deref(),
+        Some("retired"),
+        "the escape hatch must not leave the durable row stuck at \"retiring\" \
+         after the key is actually gone"
+    );
+}
+
+/// The very first `activate_codec_key` call an embedder ever makes finds an
+/// empty `harvest_codec_key_state`. Nothing is there to demote. So the key
+/// this process is rotating *away from* must be seeded as `"retiring"`
+/// directly -- otherwise it would never be retirable.
+#[tokio::test]
+async fn first_activation_ever_seeds_the_outgoing_key_as_retiring() {
+    let (url, _c) = setup_isolated_db().await;
+    let mut conn = connect(&url).await;
+    let codecs = two_key_registry();
+    let pool = build_pool(&url);
+    let sharded = ShardedDbPool::single(pool);
+    let shards = [ShardId::new(0)];
+
+    assert_eq!(
+        key_state(&mut conn, "k1").await,
+        None,
+        "harvest_codec_key_state starts empty -- \"k1\" was never durable"
+    );
+
+    // The first-ever call, activating "k2" directly -- never a prior call
+    // activating the already-active "k1" first.
+    activate_codec_key(&sharded, &shards, &codecs, "k2", 60)
+        .await
+        .expect("no live workers to block activation");
+
+    assert_eq!(
+        key_state(&mut conn, "k1").await.as_deref(),
+        Some("retiring"),
+        "the outgoing key must be seeded as retiring even though it was \
+         never durably active"
+    );
+
+    retire_codec_key(
+        &sharded,
+        &shards,
+        &codecs,
+        "k1",
+        FleetWriteFence::NotConfirmed,
+        Duration::ZERO,
+        Duration::ZERO,
+    )
+    .await
+    .expect(
+        "the seeded row must satisfy the real structural staleness gate, not just the \
+         escape hatch",
+    );
+    assert_eq!(key_state(&mut conn, "k1").await.as_deref(), Some("retired"));
+}
+
+/// AC5's second required interleaving: a row that was not even written at the
+/// first census commits **during** the recheck delay. `retire_codec_key` must
+/// catch it on the second pass rather than finalizing on the first zero.
+#[tokio::test]
+async fn retirement_recheck_catches_a_row_that_commits_after_the_first_zero_census() {
+    let (url, _c) = setup_isolated_db().await;
+    let codecs = two_key_registry();
+    let exec_id = insert_execution(&mut connect(&url).await, "race").await;
+    let pool = build_pool(&url);
+    let sharded = ShardedDbPool::single(pool);
+    let shards = [ShardId::new(0)];
+
+    activate_codec_key(&sharded, &shards, &codecs, "k1", 60)
+        .await
+        .expect("no live workers to block activation");
+    activate_codec_key(&sharded, &shards, &codecs, "k2", 60)
+        .await
+        .expect("no live workers to block activation");
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    let write_url = url.clone();
+    let writer_codecs = two_key_registry();
+    writer_codecs
+        .set_active_key("k2")
+        .expect("mirror the fleet's active key");
+    let writer = tokio::spawn(async move {
+        // Lands after the first (zero) census but well inside the recheck
+        // delay below -- the straggling write AC5 asks for.
+        tokio::time::sleep(Duration::from_millis(75)).await;
+        let mut conn = connect(&write_url).await;
+        append_under_key(
+            &mut conn,
+            &writer_codecs,
+            exec_id,
+            "k1",
+            0,
+            &[started(json!({"straggler": true}))],
+        )
+        .await;
+    });
+
+    let err = retire_codec_key(
+        &sharded,
+        &shards,
+        &codecs,
+        "k1",
+        FleetWriteFence::NotConfirmed,
+        Duration::ZERO,
+        Duration::from_millis(300),
+    )
+    .await
+    .expect_err("the recheck must observe the row that committed mid-delay");
+    match err {
+        HarvestError::CodecKeyRetirementBlocked { remaining, .. } => {
+            assert_eq!(remaining.len(), 1);
+            assert_eq!(remaining[0].rows, 1);
+        }
+        other => panic!("expected CodecKeyRetirementBlocked, got {other:?}"),
+    }
+    writer.await.expect("writer task");
 }
 
 #[tokio::test]
@@ -1286,6 +1542,8 @@ async fn retirement_fails_closed_on_an_unreachable_shard() {
         &codecs,
         "k1",
         FleetWriteFence::ConfirmedByOperator,
+        std::time::Duration::ZERO,
+        std::time::Duration::ZERO,
     )
     .await
     .expect_err("an unreadable shard must block retirement");
@@ -1318,6 +1576,8 @@ async fn retirement_with_no_shards_to_inspect_is_refused() {
         &codecs,
         "k1",
         FleetWriteFence::ConfirmedByOperator,
+        std::time::Duration::ZERO,
+        std::time::Duration::ZERO,
     )
     .await
     .expect_err("proving nothing must not be treated as proving zero");
@@ -1337,10 +1597,189 @@ async fn the_active_key_can_never_be_retired() {
         &codecs,
         "k1",
         FleetWriteFence::ConfirmedByOperator,
+        std::time::Duration::ZERO,
+        std::time::Duration::ZERO,
     )
     .await
     .expect_err("k1 is active");
     assert!(matches!(err, HarvestError::Config(_)), "{err:?}");
+}
+
+// ── issue #1244: the reader-capability handshake ──────────────────────────────
+
+/// Insert a minimal `harvest_workers` row directly, bypassing `register_worker`,
+/// so the test controls `last_heartbeat_at` and `labels` precisely.
+#[allow(clippy::cast_precision_loss)] // a heartbeat age in seconds never approaches 2^53
+async fn insert_worker_row(
+    conn: &mut AsyncPgConnection,
+    worker_id: &str,
+    heartbeat_age_secs: i64,
+    labels: &Value,
+) {
+    diesel::sql_query(
+        "INSERT INTO harvest_workers \
+             (worker_id, last_heartbeat_at, max_concurrency, host, build_id, labels) \
+         VALUES ($1, NOW() - make_interval(secs => $2::float8), 1, 'test-host', 'test-build', $3)",
+    )
+    .bind::<diesel::sql_types::Text, _>(worker_id)
+    .bind::<diesel::sql_types::Double, _>(heartbeat_age_secs as f64)
+    .bind::<diesel::sql_types::Jsonb, _>(labels)
+    .execute(conn)
+    .await
+    .expect("insert worker row");
+}
+
+#[tokio::test]
+async fn activation_is_refused_while_a_live_worker_cannot_read_the_keyed_envelope() {
+    let (url, _c) = setup_isolated_db().await;
+    let mut conn = connect(&url).await;
+    // No `codec_envelope_version` label at all -- exactly what a pre-#948
+    // binary's row looks like.
+    insert_worker_row(&mut conn, "worker-old", 0, &json!({})).await;
+
+    let codecs = two_key_registry();
+    let pool = build_pool(&url);
+    let sharded = ShardedDbPool::single(pool);
+
+    let err = activate_codec_key(&sharded, &[ShardId::new(0)], &codecs, "k2", 60)
+        .await
+        .expect_err("a live worker cannot read a version-2 envelope");
+    match err {
+        HarvestError::CodecKeyActivationBlocked { key_id, blockers } => {
+            assert_eq!(key_id, "k2");
+            assert_eq!(blockers.len(), 1);
+            assert_eq!(blockers[0].worker_id.as_deref(), Some("worker-old"));
+            assert!(blockers[0].reachable);
+        }
+        other => panic!("expected CodecKeyActivationBlocked, got {other:?}"),
+    }
+    assert_eq!(
+        codecs.active_key_id(),
+        "k1",
+        "a refused activation must not flip the local registry"
+    );
+}
+
+#[tokio::test]
+async fn activation_succeeds_once_every_live_worker_advertises_the_keyed_envelope() {
+    let (url, _c) = setup_isolated_db().await;
+    let mut conn = connect(&url).await;
+    insert_worker_row(
+        &mut conn,
+        "worker-new",
+        0,
+        &json!({"codec_envelope_version": 2, "codec_registered_key_ids": ["k2"]}),
+    )
+    .await;
+
+    let codecs = two_key_registry();
+    let pool = build_pool(&url);
+    let sharded = ShardedDbPool::single(pool);
+
+    activate_codec_key(&sharded, &[ShardId::new(0)], &codecs, "k2", 60)
+        .await
+        .expect("every live worker advertises version 2 and has k2 registered");
+    assert_eq!(codecs.active_key_id(), "k2");
+}
+
+/// A worker's binary can support the version-2 envelope's syntax fleet-wide
+/// before the target key's material reaches every worker's config.
+/// Envelope support alone must not be read as proof this worker can decode
+/// payloads written under the specific key being activated.
+#[tokio::test]
+async fn activation_is_refused_while_a_live_worker_lacks_the_target_key() {
+    let (url, _c) = setup_isolated_db().await;
+    let mut conn = connect(&url).await;
+    // Envelope v2 capable, but only "k1" ever reached this worker's config --
+    // "k2" is the key this test activates.
+    insert_worker_row(
+        &mut conn,
+        "worker-partial",
+        0,
+        &json!({"codec_envelope_version": 2, "codec_registered_key_ids": ["k1"]}),
+    )
+    .await;
+
+    let codecs = two_key_registry();
+    let pool = build_pool(&url);
+    let sharded = ShardedDbPool::single(pool);
+
+    let err = activate_codec_key(&sharded, &[ShardId::new(0)], &codecs, "k2", 60)
+        .await
+        .expect_err("a live worker without k2 registered cannot decode payloads written under it");
+    match err {
+        HarvestError::CodecKeyActivationBlocked { key_id, blockers } => {
+            assert_eq!(key_id, "k2");
+            assert_eq!(blockers.len(), 1);
+            assert_eq!(blockers[0].worker_id.as_deref(), Some("worker-partial"));
+            assert!(blockers[0].reachable);
+            assert!(
+                blockers[0]
+                    .reason
+                    .as_deref()
+                    .is_some_and(|r| r.contains("k2") && r.contains("not registered")),
+                "{:?}",
+                blockers[0].reason
+            );
+        }
+        other => panic!("expected CodecKeyActivationBlocked, got {other:?}"),
+    }
+    assert_eq!(
+        codecs.active_key_id(),
+        "k1",
+        "a refused activation must not flip the local registry"
+    );
+}
+
+#[tokio::test]
+async fn activation_ignores_a_worker_whose_heartbeat_is_stale() {
+    let (url, _c) = setup_isolated_db().await;
+    let mut conn = connect(&url).await;
+    // Version-1-only, but its heartbeat is far older than the 60s liveness
+    // window below -- a dead worker cannot silently mis-decode anything.
+    insert_worker_row(&mut conn, "worker-dead", 999, &json!({})).await;
+
+    let codecs = two_key_registry();
+    let pool = build_pool(&url);
+    let sharded = ShardedDbPool::single(pool);
+
+    activate_codec_key(&sharded, &[ShardId::new(0)], &codecs, "k2", 60)
+        .await
+        .expect("a stale worker must not block activation");
+    assert_eq!(codecs.active_key_id(), "k2");
+}
+
+// ── issue #1244: bounded-staleness refresh ────────────────────────────────────
+
+/// `refresh_active_codec_key` is the mechanism that turns a durable
+/// `activate_codec_key` write into a fact another process's `PayloadCodecs`
+/// observes. Simulated here as two independent registries sharing a
+/// database: one calls `activate_codec_key`, the other only refreshes.
+#[tokio::test]
+async fn refresh_active_codec_key_picks_up_a_fleet_wide_activation_from_another_process() {
+    let (url, _c) = setup_isolated_db().await;
+    let activator = two_key_registry();
+    let observer = two_key_registry();
+    let pool = build_pool(&url);
+    let sharded = ShardedDbPool::single(pool);
+
+    activate_codec_key(&sharded, &[ShardId::new(0)], &activator, "k2", 60)
+        .await
+        .expect("no live workers to block activation");
+    assert_eq!(observer.active_key_id(), "k1", "unaffected until refreshed");
+
+    let mut conn = connect(&url).await;
+    let flipped = refresh_active_codec_key(&mut conn, &observer)
+        .await
+        .expect("refresh");
+    assert!(flipped);
+    assert_eq!(observer.active_key_id(), "k2");
+
+    // Idempotent: refreshing again with nothing new to observe is a no-op.
+    let flipped_again = refresh_active_codec_key(&mut conn, &observer)
+        .await
+        .expect("refresh");
+    assert!(!flipped_again);
 }
 
 // ── AC7: progress reporting and the metric ───────────────────────────────────
@@ -1741,6 +2180,8 @@ async fn retirement_fails_closed_when_a_shards_census_errors() {
         &codecs,
         "k1",
         FleetWriteFence::ConfirmedByOperator,
+        std::time::Duration::ZERO,
+        std::time::Duration::ZERO,
     )
     .await
     .expect_err("a failed census must block retirement");
@@ -1779,6 +2220,8 @@ async fn retirement_refuses_a_shard_list_that_omits_a_known_shard() {
         &codecs,
         "k1",
         FleetWriteFence::ConfirmedByOperator,
+        std::time::Duration::ZERO,
+        std::time::Duration::ZERO,
     )
     .await
     .expect_err("an incomplete shard list must block retirement");
@@ -1802,6 +2245,8 @@ async fn retirement_refuses_an_unregistered_key_id() {
         &codecs,
         "never-registered",
         FleetWriteFence::ConfirmedByOperator,
+        std::time::Duration::ZERO,
+        std::time::Duration::ZERO,
     )
     .await
     .expect_err("an unregistered key proves nothing");

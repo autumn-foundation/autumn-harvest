@@ -9024,6 +9024,7 @@ async fn drain_accepted_sets_status_to_draining() {
         None,
         &std::collections::HashMap::new(),
         0,
+        &[],
     )
     .await
     .unwrap();
@@ -9074,6 +9075,7 @@ async fn drain_already_draining_on_second_call() {
         None,
         &std::collections::HashMap::new(),
         0,
+        &[],
     )
     .await
     .unwrap();
@@ -9134,6 +9136,7 @@ async fn drain_already_stopped_after_transition() {
         None,
         &std::collections::HashMap::new(),
         0,
+        &[],
     )
     .await
     .unwrap();
@@ -9189,6 +9192,7 @@ async fn drain_with_explicit_deadline_is_stored() {
         None,
         &std::collections::HashMap::new(),
         0,
+        &[],
     )
     .await
     .unwrap();
@@ -9230,6 +9234,7 @@ async fn drain_preview_returns_active_workers() {
             None,
             &std::collections::HashMap::new(),
             0,
+            &[],
         )
         .await
         .unwrap();
@@ -11558,6 +11563,7 @@ async fn test_rolling_deploy_capability_routing_with_database_enforcement() {
         None,
         &std::collections::HashMap::new(),
         0,
+        &[],
     )
     .await
     .unwrap();
@@ -11595,6 +11601,7 @@ async fn test_rolling_deploy_capability_routing_with_database_enforcement() {
         None,
         &new_labels,
         0,
+        &[],
     )
     .await
     .unwrap();

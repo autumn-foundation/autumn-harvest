@@ -4191,6 +4191,29 @@ pub async fn enforce_timeouts_once(
             "[audit_export] export pass failed; continuing with the rest of the scanner"
         ),
     }
+    // Refresh this process's active codec key from the durable, fleet-wide
+    // `harvest_codec_key_state` table (issue #1244). Placed here, before the
+    // first `?`-propagating resident, deliberately.
+    //
+    // Every resident below this point can end the tick early with `?`.
+    // `codec_rotation::FleetWriteFence`'s retirement gate treats elapsed
+    // wall-clock time as proof that every live process has refreshed within
+    // one scanner-tick interval. A refresh reachable only after fallible
+    // residents would break that proof. A process stuck failing earlier in
+    // the tick would never refresh, yet retirement would still count its
+    // staleness window as satisfied.
+    //
+    // Shard-local, on this connection, and never allowed to break the rest
+    // of the tick. Same posture as the audit-export call above and the
+    // re-encryption sweep below.
+    match crate::codec_rotation::refresh_active_codec_key(conn, payload_codecs).await {
+        Ok(_flipped) => {}
+        Err(e) => tracing::warn!(
+            error = %e,
+            "codec key state refresh failed; continuing with the remaining timeout-pass \
+             residents"
+        ),
+    }
 
     let timed_out = find_timed_out_tasks(conn).await?;
     count += timed_out.len();
@@ -4526,8 +4549,18 @@ pub fn spawn_timeout_checker_for_shard(
                 }
             }
 
-            match pool.get().await {
-                Ok(mut conn) => match enforce_timeouts_once(
+            // Bounded to `interval`. Unbounded pool contention here would
+            // silently stretch this loop's actual period past `interval`,
+            // which is exactly the assumption
+            // `codec_rotation::FleetWriteFence`'s staleness window relies
+            // on.
+            //
+            // Skipping this tick and retrying next `interval` is the same
+            // posture `acquire_shard_conn` already uses for registration and
+            // heartbeats. It is better than blocking the whole scanner on
+            // one contested pool.
+            match tokio::time::timeout(interval, pool.get()).await {
+                Ok(Ok(mut conn)) => match enforce_timeouts_once(
                     &mut conn,
                     &*telemetry.metrics,
                     unknown_target_grace_window,
@@ -4549,8 +4582,14 @@ pub fn spawn_timeout_checker_for_shard(
                         tracing::error!(error = %e, "failed to enforce timed-out tasks");
                     }
                 },
-                Err(e) => {
+                Ok(Err(e)) => {
                     tracing::error!(error = %e, "failed to acquire DB connection for timeout check");
+                }
+                Err(_elapsed) => {
+                    tracing::error!(
+                        ?interval,
+                        "pool acquisition exceeded the tick interval; skipping this tick"
+                    );
                 }
             }
 
