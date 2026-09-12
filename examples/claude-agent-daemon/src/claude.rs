@@ -404,7 +404,11 @@ fn is_replayable_block(block: &Value) -> bool {
     match kind.trim() {
         "" => false,
         "text" => block.get("text").is_some_and(Value::is_string),
-        "tool_use" => names("id") && names("name") && block.get("input").is_some(),
+        // The input must be an OBJECT. A tool input is declared with an
+        // object schema, so `null` is a value the API refuses on replay.
+        "tool_use" => {
+            names("id") && names("name") && block.get("input").is_some_and(Value::is_object)
+        }
         // A type from a later API. Its name is all this example can judge.
         _ => true,
     }

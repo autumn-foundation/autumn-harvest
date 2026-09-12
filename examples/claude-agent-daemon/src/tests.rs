@@ -1511,6 +1511,27 @@ async fn an_empty_goal_never_starts_a_session() {
         );
     }
 
+    // The field beside it takes the same argument. A protocol client can send
+    // a bound of zero even though the CLI refuses it. The loop would then run
+    // `1..=0` and record a COMPLETED session that never called the model.
+    let zero = protocol::call(
+        &socket,
+        &Request::Submit {
+            goal: "a real goal".to_string(),
+            max_turns: 0,
+            approval_timeout_secs: 60,
+        },
+    )
+    .await
+    .expect("the submit is answered");
+    let Response::Error { message } = zero else {
+        panic!("a zero turn bound must be refused, and got: {zero:?}");
+    };
+    assert!(
+        message.contains("turn"),
+        "the refusal must say what is wrong: {message}"
+    );
+
     // Nothing was recorded, so no session is left to fail.
     let listed = protocol::call(&socket, &Request::List)
         .await
@@ -1570,6 +1591,9 @@ fn a_block_that_cannot_be_replayed_is_refused() {
         json!([{ "type": "tool_use", "id": "toolu_a", "name": " ", "input": {} }]),
         json!([{ "type": "tool_use", "name": "write_file", "input": {} }]),
         json!([{ "type": "tool_use", "id": "toolu_a", "name": "write_file" }]),
+        json!([{ "type": "tool_use", "id": "toolu_a", "name": "write_file", "input": Value::Null }]),
+        json!([{ "type": "tool_use", "id": "toolu_a", "name": "write_file", "input": "text" }]),
+        json!([{ "type": "tool_use", "id": "toolu_a", "name": "write_file", "input": [] }]),
     ] {
         assert!(
             !claude::has_replayable_content(&reply(incomplete.clone())),
@@ -2117,11 +2141,24 @@ async fn a_daemon_refuses_a_session_it_cannot_read() {
     // Stand in for a row a newer daemon wrote. The fixture edits the EXECUTION
     // row, which is state rather than history: the append-only event log is
     // not touched.
+    //
+    // The task here carries a valid workspace and model and is missing the
+    // GOAL. The startup check reads those two as values and the goal by its
+    // type. A check that read only the two would enlist this row. The first
+    // drive would then fail to deserialise the task, and the runtime would
+    // seal the session FAILED where no later daemon could resume it.
     let writer = rusqlite::Connection::open(&db).expect("the database opens");
+    let partial = json!({
+        "workspace": dir.path().join("workspace").to_string_lossy(),
+        "model": claude::OFFLINE_MODEL,
+        "max_turns": 6,
+        "approval_timeout_secs": 300,
+    })
+    .to_string();
     writer
         .execute(
-            "UPDATE harvest_executions SET input_json = '{\"unknown\":1}' WHERE exec_id = ?1",
-            [&execution_id],
+            "UPDATE harvest_executions SET input_json = ?2 WHERE exec_id = ?1",
+            rusqlite::params![&execution_id, partial],
         )
         .expect("the input is replaced");
     drop(writer);

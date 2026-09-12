@@ -279,6 +279,15 @@ pub async fn serve(options: Options) -> Result<(), String> {
     Ok(())
 }
 
+/// The refusal for a recorded task this daemon cannot read.
+fn unreadable(exec_id: &str) -> String {
+    format!(
+        "session {exec_id} carries an input this daemon cannot read. The session \
+         stays RUNNING and no daemon of this version can resume it. A newer \
+         daemon wrote it, or the row is damaged."
+    )
+}
+
 /// Refuse to start when a session in this file belongs to another daemon.
 ///
 /// The activity-level checks stay as a backstop, but they can only fail a run.
@@ -295,14 +304,18 @@ fn check_resumable(
         // therefore stays RUNNING for as long as the file lasts, and nothing
         // ever says so. The daemon refuses to start instead, under the same
         // policy as the two checks below.
+        // EVERY field of the task is checked, and not only the two compared
+        // below. A row that passes this check deserialises on the first
+        // drive. One that did not would be sealed FAILED by the runtime the
+        // moment it ran, and no later daemon could resume it.
+        let readable =
+            row.has_goal && row.max_turns.is_some() && row.approval_timeout_secs.is_some();
         let (Some(recorded_workspace), Some(recorded_model)) = (&row.workspace, &row.model) else {
-            return Err(format!(
-                "session {} carries an input this daemon cannot read. The session \
-                 stays RUNNING and no daemon of this version can resume it. A \
-                 newer daemon wrote it, or the row is damaged.",
-                row.exec_id
-            ));
+            return Err(unreadable(&row.exec_id));
         };
+        if !readable {
+            return Err(unreadable(&row.exec_id));
+        }
         if recorded_workspace != workspace {
             return Err(format!(
                 "session {} belongs to the workspace `{recorded_workspace}`, and \
@@ -583,6 +596,15 @@ fn submit(
     if goal.is_empty() {
         return Response::Error {
             message: "the goal is empty. Say what the session is to do.".to_string(),
+        };
+    }
+    // The same argument as the goal above, for the field beside it. A bound of
+    // zero runs `1..=0`, which is no iteration at all. The session would be
+    // recorded COMPLETED with a blank answer, and would never call the model.
+    // The CLI refuses it too, and this is where every client crosses.
+    if max_turns == 0 {
+        return Response::Error {
+            message: "the turn bound is zero. A session needs at least one turn.".to_string(),
         };
     }
     let task = SessionTask {

@@ -51,6 +51,15 @@ pub struct RunningSession {
     pub workspace: Option<String>,
     /// The model this session was recorded against. `None` as above.
     pub model: Option<String>,
+    /// The recorded turn bound. `None` when it is absent or not a number.
+    pub max_turns: Option<i64>,
+    /// The recorded approval deadline. `None` as above.
+    pub approval_timeout_secs: Option<i64>,
+    /// Does the recorded task carry a goal of the right type?
+    ///
+    /// The goal itself is never read here. Its TYPE answers whether the task
+    /// can be deserialised, and the bytes are what this query exists to avoid.
+    pub has_goal: bool,
 }
 
 /// One row of `harvest_executions`.
@@ -138,13 +147,24 @@ pub fn running(conn: &Connection, workflow_name: &str) -> Result<Vec<RunningSess
     // `json_valid` guards the extraction. A task that is not JSON at all
     // yields NULL rather than failing the whole query. The caller can then
     // name the row it cannot read.
+    //
+    // Every field of the recorded task is covered. The small ones are read as
+    // VALUES, and the goal only by its TYPE. A row that passes here therefore
+    // deserialises on the first drive. One that did not would be sealed
+    // FAILED by the runtime, where no later daemon could resume it.
     let mut statement = conn
         .prepare(
             "SELECT exec_id, \
                     CASE WHEN json_valid(input_json) \
                          THEN json_extract(input_json, '$.workspace') END, \
                     CASE WHEN json_valid(input_json) \
-                         THEN json_extract(input_json, '$.model') END \
+                         THEN json_extract(input_json, '$.model') END, \
+                    CASE WHEN json_valid(input_json) \
+                         THEN json_extract(input_json, '$.max_turns') END, \
+                    CASE WHEN json_valid(input_json) \
+                         THEN json_extract(input_json, '$.approval_timeout_secs') END, \
+                    CASE WHEN json_valid(input_json) \
+                         THEN json_type(input_json, '$.goal') END \
              FROM harvest_executions \
              WHERE workflow_name = ?1 AND state = 'RUNNING' ORDER BY rowid",
         )
@@ -155,6 +175,10 @@ pub fn running(conn: &Connection, workflow_name: &str) -> Result<Vec<RunningSess
                 exec_id: row.get(0)?,
                 workspace: row.get(1)?,
                 model: row.get(2)?,
+                max_turns: row.get(3)?,
+                approval_timeout_secs: row.get(4)?,
+                // `json_type` names the type without reading the value.
+                has_goal: row.get::<_, Option<String>>(5)?.as_deref() == Some("text"),
             })
         })
         .map_err(|e| format!("cannot read the running sessions: {e}"))?;
