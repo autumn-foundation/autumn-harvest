@@ -222,6 +222,11 @@ pub async fn serve(options: Options) -> Result<(), String> {
     // it validated. One query, not two.
     let mut live: Live = resumed;
     let mut ticker = tokio::time::interval(options.tick);
+    // A model call can hold a drive for the whole HTTP timeout, which is
+    // thousands of tick periods. The default behaviour fires every missed tick
+    // at once when the drive returns, and each one drives every live session.
+    // The poll wants the NEXT tick, not the ones it slept through.
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     // Every branch below waits on the same flag. It stays raised once it is
     // raised, so a fresh wait returns at once rather than missing the signal.
     let mut stop = signal.clone();
@@ -657,6 +662,12 @@ pub fn approve(
     };
     match runtime.send_signal(exec, &signal, payload) {
         Ok(()) => {
+            // The deadline can pass between the check above and the moment the
+            // backend stamps this signal. It records its own arrival time, so
+            // the daemon cannot stage a decision AT a chosen instant. When the
+            // deadline has gone by now, the answer says what is true: the
+            // decision is delivered, and the session may still deny the call.
+            let crossed = matches!(expired(reader, execution_id, &signal), Ok(Some(_)));
             // The wait is spent the moment a decision is staged. Without this,
             // a second `approve` before the next drive tick would stage a
             // SECOND signal. The first releases this call and the other stays
@@ -667,11 +678,16 @@ pub fn approve(
                 state.signal = None;
                 state.reason = "a decision is delivered; awaiting the next drive".to_string();
             }
+            let decision = if approved { "approved" } else { "denied" };
             Response::Ack {
-                detail: if approved {
-                    "approved".to_string()
+                detail: if crossed {
+                    format!(
+                        "{decision}, and the deadline passed while it was delivered. \
+                         The session may report this call as denied. Read \
+                         `agentd history {execution_id}` to see which won."
+                    )
                 } else {
-                    "denied".to_string()
+                    decision.to_string()
                 },
             }
         }
