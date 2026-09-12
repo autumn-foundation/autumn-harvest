@@ -53,19 +53,27 @@ pub fn acquire(db: &Path) -> Result<DaemonLock, String> {
     // Create the file when it is absent. An empty file is a valid, empty
     // `SQLite` database, and the runtime initializes it on open. Creating it
     // here is what gives a brand-new database an identity to lock.
-    let file = OpenOptions::new()
-        .create(true)
-        .read(true)
-        .write(true)
-        .truncate(false)
-        // The database holds every prompt, tool input, and tool result, which
-        // includes the content of each file the agent read. It is at least as
-        // sensitive as the control socket, so it is private from the moment it
-        // exists. The mode applies at CREATION only, so an existing database
-        // keeps whatever the operator chose for it.
-        .mode(PRIVATE_MODE)
-        .open(db)
-        .map_err(|e| format!("cannot open {}: {e}", db.display()))?;
+    // The database holds every prompt, tool input, and tool result, which
+    // includes the content of each file the agent read. It is at least as
+    // sensitive as the control socket, so it is private from the moment it
+    // exists. The mode applies at CREATION only, so an existing database keeps
+    // whatever the operator chose for it.
+    //
+    // The umask is narrowed around the open, and the mode alone is not enough.
+    // A creation mode is filtered by the umask in force. Under `0777` the file
+    // would be created mode `000`, and `SQLite` could then not reopen the path
+    // it was just given. The daemon would leave a database no later start
+    // could use.
+    let file = with_private_umask(|| {
+        OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .truncate(false)
+            .mode(PRIVATE_MODE)
+            .open(db)
+    })
+    .map_err(|e| format!("cannot open {}: {e}", db.display()))?;
 
     // A hard-linked database has no single identity, and `SQLite` cannot work
     // with that. It derives the `-wal` name from the PATH, so opening

@@ -69,6 +69,14 @@ const MAX_REQUEST_BYTES: u64 = 1024 * 1024;
 /// sends nothing still holds one of the daemon's connections until it expires.
 const REQUEST_DEADLINE: Duration = Duration::from_secs(5);
 
+/// How long one caller may take to read its answer.
+///
+/// A client that asks for an answer and then stops reading would otherwise
+/// hold a connection until it disconnected. The socket is local, so it moves
+/// at memory speed: a client that has not taken its answer in this long is not
+/// reading it.
+const RESPONSE_DEADLINE: Duration = Duration::from_secs(5);
+
 /// How long to wait after `accept` fails.
 ///
 /// A descriptor limit makes `accept` fail at once, every time. Without a pause
@@ -462,8 +470,21 @@ async fn answer(write_half: &mut tokio::net::unix::OwnedWriteHalf, response: &Re
         r#"{"status":"error","message":"the daemon cannot encode its answer"}"#.to_string()
     });
     encoded.push('\n');
-    drop(write_half.write_all(encoded.as_bytes()).await);
-    drop(write_half.flush().await);
+    // Bounded, like the read. A client that stops reading cannot hold this
+    // connection for longer than the deadline. See [`RESPONSE_DEADLINE`].
+    let written = tokio::time::timeout(RESPONSE_DEADLINE, async {
+        write_half.write_all(encoded.as_bytes()).await?;
+        write_half.flush().await
+    })
+    .await;
+    match written {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => tracing::debug!(error = %e, "a caller did not take its answer"),
+        Err(_) => tracing::warn!(
+            seconds = RESPONSE_DEADLINE.as_secs(),
+            "a caller did not read its answer in time"
+        ),
+    }
 }
 
 /// Apply one control command.
