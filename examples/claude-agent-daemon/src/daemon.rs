@@ -1017,6 +1017,22 @@ pub fn sessions(
     ))
 }
 
+/// One listed field, cut to the printed cap and MARKED when it was cut.
+///
+/// The projection reads one character past the cap, so a longer field is
+/// known to be cut without reading the rest of it. An unmarked prefix
+/// presented a partial answer as the whole one, and the operator had no
+/// reason to open the single status. This is what [`describe`] does for one
+/// event, applied to the four fields a listing prints.
+fn shortened(text: &str) -> String {
+    let cap = inspect::MAX_LISTED_CHARS as usize;
+    let mut rendered: String = text.chars().take(cap).collect();
+    if text.chars().count() > cap {
+        rendered.push('…');
+    }
+    rendered
+}
+
 /// Build one operator view from a bounded listing row.
 ///
 /// The listing reads each field already cut, so this never holds a whole
@@ -1041,8 +1057,9 @@ fn summary_view(
     // real outcome: a session can end with the model writing no text.
     let answer = match (row.stop.as_deref(), row.turns, row.tool_calls) {
         (Some(stop), Some(turns), Some(calls)) => Some(format!(
-            "[{stop} after {turns} turns, {calls} tool calls] {}",
-            row.answer.as_deref().unwrap_or_default()
+            "[{} after {turns} turns, {calls} tool calls] {}",
+            shortened(stop),
+            row.answer.as_deref().map(shortened).unwrap_or_default()
         )),
         (None, None, None) => None,
         _ => Some("<unreadable report>".to_string()),
@@ -1058,13 +1075,13 @@ fn summary_view(
         execution_id: row.exec_id.clone(),
         goal: row
             .goal
-            .clone()
-            .unwrap_or_else(|| "<unreadable task>".to_string()),
+            .as_deref()
+            .map_or_else(|| "<unreadable task>".to_string(), shortened),
         state: row.state.clone(),
         blocked_on,
         pending,
         answer,
-        error: row.error.clone(),
+        error: row.error.as_deref().map(shortened),
     }
 }
 
@@ -1275,17 +1292,33 @@ fn prepare_workspace(workspace: &Path, db: &Path) -> Result<String, String> {
     // A lossy conversion would mangle a path that is not valid UTF-8, and the
     // recorded identity would then never match the real one again. Refuse the
     // path instead of recording a name that cannot be compared.
-    Ok(resolved
-        .to_str()
-        .ok_or_else(|| {
-            format!(
-                "the workspace path {} is not valid UTF-8. Each session records \
+    let recorded = resolved.to_str().ok_or_else(|| {
+        format!(
+            "the workspace path {} is not valid UTF-8. Each session records \
                  this path, so a name that cannot be written down exactly would \
                  never match again.",
-                resolved.display()
-            )
-        })?
-        .to_string())
+            resolved.display()
+        )
+    })?;
+
+    // A character no printed command can carry is refused HERE, before any
+    // session records the path. A workspace mismatch prints a `--workspace`
+    // command to resume the session, and `visible` shows such a character as
+    // an escape. A copied command would then name a path nobody recorded, and
+    // it would start a daemon on a NEW directory rather than resume anything.
+    // Quoting cannot fix that: the fault is the rendering, not the argument.
+    // See [`crate::unprintable`], which the socket path goes through too.
+    if let Some(refused) = crate::unprintable(recorded) {
+        return Err(format!(
+            "the workspace path {} holds {}, which no command this daemon \
+             prints can carry. A session that belongs to another workspace is \
+             refused with the command that resumes it, and that command names \
+             the path on ONE line. Choose a workspace of ordinary text.",
+            crate::one_line(recorded),
+            refused.escape_unicode()
+        ));
+    }
+    Ok(recorded.to_string())
 }
 
 /// The directories above the workspace, closest first.

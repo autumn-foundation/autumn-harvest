@@ -143,6 +143,11 @@ Flags: `--db` (default `agentd.db`), `--socket` (default `agentd.sock`),
 from `ANTHROPIC_API_KEY` only. A process's arguments are readable by every user
 of the host, and this daemon runs for as long as its sessions do.
 
+`list` shows at most 500 characters of a goal, an answer or an error, and
+marks a field it cut with a trailing `…`. The mark is the point: a model answer
+routinely runs longer, and an unmarked prefix would read as the whole answer.
+`status <id>` shows the field in full.
+
 A finished session reports the model's own stop reason, so an incomplete run
 never reads as a clean one: `end_turn` is a finished answer, `max_tokens` means
 the turn hit the output cap and the answer is cut short (raise `--max-tokens`),
@@ -160,6 +165,15 @@ still holds the old inode — the recorded history of every session, gone. The
 daemon refuses to start in that layout, and names the flags to change. The
 defaults already meet the rule: `agentd.db` in the current directory, and
 `--workspace agent-workspace` beside it rather than around it.
+
+**A workspace path must be printable.** The daemon prints a `--workspace`
+command when a session belongs to another workspace, and that command is made
+to be copied. A path holding a newline, a tab, or any other character a
+terminal acts on cannot survive that round trip: the newline splits the line,
+the tab renders as spaces, and every other one is shown as an escape, so a
+copied command would name a path nobody recorded. Quoting does not help — the
+fault is the rendering, not the argument — so such a path is refused at
+startup, where the `--socket` path already is.
 
 **The database is owner-only too.** It holds every prompt, tool input, and tool
 result, including the content of each file the agent read — so a new database

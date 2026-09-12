@@ -124,8 +124,18 @@ pub const MAX_LISTED_CHARS: u32 = 500;
 /// listing showed nothing for it while the single status showed all of it.
 ///
 /// Four bytes is the longest UTF-8 character, so this budget always carries
-/// at least [`MAX_LISTED_CHARS`] characters. The caller cuts the characters.
-const MAX_LISTED_BYTES: u32 = MAX_LISTED_CHARS * 4;
+/// at least [`LISTED_READ_CHARS`] characters. The caller cuts the characters.
+const MAX_LISTED_BYTES: u32 = LISTED_READ_CHARS * 4;
+
+/// How many characters of one listed field are READ.
+///
+/// One character past the printed cap, so a reader can tell a field that was
+/// CUT from one that ended by itself. The renderer marks the cut. This is the
+/// budget [`event_lines`] reads its detail under, applied to the listing.
+///
+/// Without the extra character the listing showed a 4000-character answer as
+/// a complete one. An operator then had no reason to open the single status.
+const LISTED_READ_CHARS: u32 = MAX_LISTED_CHARS + 1;
 
 /// The largest counter a recorded report can carry.
 ///
@@ -749,12 +759,12 @@ pub fn executions(
                 Ok(SessionSummary {
                     exec_id: row.get(0)?,
                     state: row.get(1)?,
-                    goal: cut_text(row.get(2)?, MAX_LISTED_CHARS),
-                    stop: cut_text(row.get(3)?, MAX_LISTED_CHARS),
+                    goal: cut_text(row.get(2)?, LISTED_READ_CHARS),
+                    stop: cut_text(row.get(3)?, LISTED_READ_CHARS),
                     turns: row.get(4)?,
                     tool_calls: row.get(5)?,
-                    answer: cut_text(row.get(6)?, MAX_LISTED_CHARS),
-                    error: cut_text(row.get(7)?, MAX_LISTED_CHARS),
+                    answer: cut_text(row.get(6)?, LISTED_READ_CHARS),
+                    error: cut_text(row.get(7)?, LISTED_READ_CHARS),
                     row: row.get(8)?,
                 })
             },

@@ -215,6 +215,21 @@ fn usable_key(raw: &str) -> Option<String> {
     (!key.is_empty()).then(|| key.to_string())
 }
 
+/// The first character of this text that no printed command can carry.
+///
+/// A refusal and the command it suggests are printed on ONE line, and that
+/// line is made to be read and to be copied. A newline splits it. A tab
+/// renders as spaces, so the line an operator READS is not the line they
+/// copy. Every other character a terminal acts on is shown as an escape by
+/// [`visible`], so a copied command would name a path nobody recorded.
+///
+/// Quoting does not answer this. `--workspace='a\u{000d}b'` carries the
+/// character into `argv` faithfully, and the refusal still SHOWS the escape.
+/// See [`breaks_one_line`].
+fn unprintable(text: &str) -> Option<char> {
+    text.chars().find(|c| breaks_one_line(*c))
+}
+
 /// Refuse a socket path this daemon cannot print.
 ///
 /// Every command prints follow-up commands that name the socket, and a path
@@ -252,7 +267,7 @@ fn printable(socket: &Path) -> Result<(), String> {
              of text."
         ));
     };
-    if let Some(refused) = text.chars().find(|c| breaks_one_line(*c)) {
+    if let Some(refused) = unprintable(text) {
         return Err(format!(
             "the socket path {shown} holds {}, which no command this daemon \
              prints can carry. Every one of them names the socket on ONE line, \

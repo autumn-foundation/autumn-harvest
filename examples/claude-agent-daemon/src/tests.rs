@@ -1195,10 +1195,14 @@ fn a_listing_reads_no_whole_payload() {
         // Both halves matter. The first says the field obeys the cap. The
         // second says the cap is doing work: an assertion against the cap
         // alone would hold however large the cap became.
-        assert!(
-            held.len() <= cap,
-            "the listing must cut `{name}` to the cap, and read {} bytes",
-            held.len()
+        //
+        // The projection reads ONE character past the printed cap. That
+        // character is how the renderer knows the field was cut, and it is
+        // the only reason this bound is not the cap itself.
+        assert_eq!(
+            held.len(),
+            cap + 1,
+            "the listing must read `{name}` to one character past the cap"
         );
         assert!(
             held.len() < huge.len(),
@@ -3786,6 +3790,126 @@ fn a_listed_field_of_malformed_bytes_is_not_shown_as_its_prefix() {
     );
 }
 
+/// A listing MARKS a field it cut, and the single status still shows it all.
+///
+/// A model answer routinely passes 500 characters. The listing showed the
+/// first 500 as if they were the whole answer. An operator then had no reason
+/// to open the single status, and no way to know there was more.
+///
+/// The projection reads one character past the cap, and the renderer marks
+/// the cut. This is what `describe` already did for one event.
+#[test]
+fn a_listing_marks_a_field_it_cut() {
+    let dir = tempfile::tempdir().expect("a temporary directory");
+    let db = dir.path().join("marked.db");
+    let writer = rusqlite::Connection::open(&db).expect("the database opens");
+    fixture_table(&writer);
+    let cap = inspect::MAX_LISTED_CHARS as usize;
+    // One character short of the cap, exactly at it, and past it.
+    let long_answer = "a".repeat(cap + 700);
+    let exact_goal = "g".repeat(cap);
+    let short_goal = "s".repeat(cap - 1);
+    let rows = [
+        ("cut", exact_goal.clone(), long_answer),
+        ("exact", exact_goal, "b".repeat(cap)),
+        ("short", short_goal, "c".repeat(cap - 1)),
+    ];
+    for (exec, goal, answer) in &rows {
+        writer
+            .execute(
+                "INSERT INTO harvest_executions VALUES (?1, ?2, 'COMPLETED', ?3, ?4, NULL)",
+                rusqlite::params![
+                    exec,
+                    WORKFLOW_NAME,
+                    json!({ "goal": goal, "workspace": "/w", "model": "m",
+                            "max_turns": 4, "approval_timeout_secs": 1 })
+                    .to_string(),
+                    json!({ "stop": "end_turn", "turns": 2, "tool_calls": 1,
+                            "answer": answer })
+                    .to_string(),
+                ],
+            )
+            .expect("the row is recorded");
+    }
+    drop(writer);
+
+    let reader = inspect::open(&db).expect("the reader opens");
+    let (views, _, _) = daemon::sessions(&reader, &daemon::Parked::new(), false, None)
+        .expect("the listing renders");
+    let view = |exec: &str| {
+        views
+            .iter()
+            .find(|view| view.execution_id == exec)
+            .expect("the session is listed")
+    };
+
+    // A field past the cap is marked. The mark is the LAST character, so an
+    // operator reads it at the end of what they were given.
+    let cut = view("cut");
+    let answer = cut.answer.as_deref().expect("the report reads");
+    assert!(
+        answer.ends_with('…'),
+        "an answer past the cap must be marked as cut: {}",
+        &answer[answer.len().saturating_sub(40)..]
+    );
+    // The rendered line prefixes the report, so the answer is the tail after
+    // it. Counting `a` over the whole line would also count the prefix.
+    let (prefix, shown_answer) = answer
+        .split_once("] ")
+        .expect("the report line names its counts first");
+    assert_eq!(
+        shown_answer.chars().filter(|c| *c == 'a').count(),
+        cap,
+        "the marked answer must hold exactly the printed cap, in {prefix}]"
+    );
+    assert_eq!(
+        shown_answer.chars().count(),
+        cap + 1,
+        "and the mark is the one character beyond it"
+    );
+
+    // A field exactly AT the cap ended by itself, so it carries no mark. This
+    // is the boundary the extra character exists to tell apart.
+    let exact = view("exact");
+    assert!(
+        !exact.goal.contains('…'),
+        "a goal exactly at the cap is not cut, and must not be marked"
+    );
+    assert_eq!(
+        exact.goal.chars().count(),
+        cap,
+        "and it is shown whole: {} characters",
+        exact.goal.chars().count()
+    );
+    let exact_answer = exact.answer.as_deref().expect("the report reads");
+    assert!(
+        !exact_answer.contains('…'),
+        "an answer exactly at the cap is not marked either"
+    );
+
+    // A short field is untouched.
+    assert_eq!(
+        view("short").goal.chars().count(),
+        cap - 1,
+        "a field under the cap is shown as it stands"
+    );
+
+    // The single status is what the mark points at, and the row it reads
+    // holds the whole field. The cap is a LISTING bound, and not a loss.
+    let row = inspect::execution(&reader, WORKFLOW_NAME, "cut")
+        .expect("the row reads")
+        .expect("the session is named");
+    let report = serde_json::from_str::<session::SessionReport>(
+        row.output_json.as_deref().expect("the report is recorded"),
+    )
+    .expect("the single status reads the same report");
+    assert_eq!(
+        report.answer.chars().count(),
+        cap + 700,
+        "the row a single status reads holds the whole answer"
+    );
+}
+
 /// One listed session, by id.
 fn listed_row<'a>(
     listed: &'a [inspect::SessionSummary],
@@ -6181,6 +6305,82 @@ async fn a_daemon_refuses_a_database_the_agent_could_write() {
             .expect_err("a dangling link must be refused")
             .contains("resolves to nothing"),
         "a link to nothing must be refused"
+    );
+}
+
+/// A workspace a printed command cannot carry is refused before it is used.
+///
+/// Quoting made the restart hint one shell word, and it cannot make a
+/// character visible. `visible` shows a carriage return as `\u{000d}`, so the
+/// printed command named a path holding those twelve characters. Copying it
+/// would start a daemon on a NEW directory and resume nothing.
+///
+/// A tab is the quieter case. It survives the quoting into `argv`, and it
+/// renders as spaces, so the line an operator READS is not the line they
+/// copy. Neither is a fault the hint can fix, so the path is refused where
+/// the socket path already is.
+#[tokio::test]
+async fn a_workspace_no_printed_command_can_carry_is_refused() {
+    let dir = tempfile::tempdir().expect("a temporary directory");
+    // One database and one socket PER CASE. A daemon that accepted the path
+    // would still hold both when the next case ran. That case would then fail
+    // on the lock rather than on the path.
+    for (index, name) in ["my\rproject", "my\tproject", "my\nproject"]
+        .into_iter()
+        .enumerate()
+    {
+        let workspace = dir.path().join(name);
+        std::fs::create_dir_all(&workspace).expect("the workspace is created");
+        // The refusal is bounded in TIME as well. A daemon that accepted the
+        // path would serve forever, and a hang says less than a failure.
+        let refused = tokio::time::timeout(
+            Duration::from_secs(5),
+            daemon::serve(daemon::Options {
+                db: dir.path().join(format!("agentd-{index}.db")),
+                socket: dir.path().join(format!("agentd-{index}.sock")),
+                workspace: workspace.clone(),
+                model: claude::DEFAULT_MODEL.to_string(),
+                max_tokens: claude::DEFAULT_MAX_TOKENS,
+                tick: Duration::from_millis(50),
+                api_key: None,
+            }),
+        )
+        .await
+        .unwrap_or_else(|_| panic!("the daemon must refuse {name:?} rather than serve it"))
+        .expect_err("the daemon must refuse to start");
+        assert!(
+            refused.contains("no command this daemon prints can carry"),
+            "unexpected message for {name:?}: {refused}"
+        );
+        // The refusal names the path on ONE line, which is the property it
+        // exists to protect. A message that split itself would do the damage.
+        assert_eq!(
+            crate::failure(&refused).lines().count(),
+            1,
+            "the refusal itself must stay on one line: {refused}"
+        );
+    }
+
+    // An ordinary name is still accepted, including one that needs quoting.
+    let ordinary = dir.path().join("my project; reboot");
+    std::fs::create_dir_all(&ordinary).expect("the workspace is created");
+    let started = tokio::time::timeout(
+        Duration::from_millis(600),
+        daemon::serve(daemon::Options {
+            db: dir.path().join("ordinary.db"),
+            socket: dir.path().join("ordinary.sock"),
+            workspace: ordinary,
+            model: claude::DEFAULT_MODEL.to_string(),
+            max_tokens: claude::DEFAULT_MAX_TOKENS,
+            tick: Duration::from_millis(50),
+            api_key: None,
+        }),
+    )
+    .await;
+    assert!(
+        started.is_err(),
+        "a path that only needs quoting must be accepted, and the daemon \
+         must then keep serving: {started:?}"
     );
 }
 
