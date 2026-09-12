@@ -967,10 +967,13 @@ fn group_by_pool_identity(pools: &BTreeMap<ShardId, DbPool>) -> BTreeMap<ShardId
 /// same pool.
 ///
 /// The key keeps host and `hostaddr` (a numeric `host` counts as an
-/// address, needing no DNS to compare). It keeps port (defaulted to
-/// 5432 when absent), the database name, and only a `search_path`
-/// setting extracted from the `options` parameter — see
-/// [`extract_search_path`]. `options` is libpq's escape hatch for
+/// address, needing no DNS to compare). It prefers `hostaddr` over
+/// `host` whenever `hostaddr` is given at all, since `hostaddr` pins
+/// the actual TCP destination. Two DSNs sharing one stay one pool
+/// however differently each spells the hostname. The key also keeps
+/// port (defaulted to 5432 when absent) and the database name. It keeps
+/// only a `search_path` setting extracted from the `options` parameter
+/// — see [`extract_search_path`]. `options` is libpq's escape hatch for
 /// arbitrary session settings, and `search_path` is the one setting it
 /// can carry that picks the schema `harvest_audit_log` resolves to. Two
 /// DSNs that differ only there can still reach different data and must
@@ -1046,6 +1049,16 @@ fn canonical_dsn_key(dsn: &str) -> String {
     hosts.dedup();
     hostaddrs.sort_unstable();
     hostaddrs.dedup();
+    // `hostaddr` pins the actual TCP destination, so it wins over `host`
+    // text. `backup_verify.rs`'s `parse_dsn_identity` treats it the same
+    // way. Two DSNs sharing an address are one pool however differently
+    // each spells the hostname. `host` matters only when neither side
+    // pins an address.
+    let location = if hostaddrs.is_empty() {
+        &hosts
+    } else {
+        &hostaddrs
+    };
 
     let mut ports: Vec<u16> = config.get_ports().to_vec();
     if ports.is_empty() {
@@ -1057,7 +1070,7 @@ fn canonical_dsn_key(dsn: &str) -> String {
     let db = config.get_dbname().or_else(|| config.get_user());
     let search_path = extract_search_path(config.get_options().unwrap_or_default());
 
-    format!("{hosts:?}{hostaddrs:?}{ports:?}/{db:?}?search_path={search_path:?}")
+    format!("{location:?}{ports:?}/{db:?}?search_path={search_path:?}")
 }
 
 /// Pulls only `search_path` settings out of a libpq `options` string,
@@ -1070,23 +1083,25 @@ fn canonical_dsn_key(dsn: &str) -> String {
 /// same pool, differing only in an unrelated `-c` flag, no longer
 /// merged.
 ///
-/// This recognizes exactly one shape: whitespace-separated tokens where
-/// a `-c` token is immediately followed by a `search_path=value` token,
-/// with no embedded whitespace in the value. That is the shape every
-/// `options` value in this codebase's own tests uses. A quoted value
-/// with embedded spaces is not recognized. Neither is
-/// `-csearch_path=...` with no space before `-c`. Treating an unparsed
-/// `options` string as carrying no `search_path` is the conservative
-/// direction here. It only widens which DSNs compare as different,
-/// never the reverse.
+/// This recognizes two shapes, both used elsewhere in this codebase's
+/// own tests. One is whitespace-separated tokens where a `-c` token is
+/// immediately followed by a `search_path=value` token. The other is
+/// the compact `-csearch_path=value` spelling in one token. Neither
+/// allows embedded whitespace in the value. A quoted value with
+/// embedded spaces is not recognized. Treating an unparsed `options`
+/// string as carrying no `search_path` is the conservative direction
+/// here. It
+/// only widens which DSNs compare as different, never the reverse.
 #[cfg(feature = "db")]
 fn extract_search_path(options: &str) -> Vec<String> {
     let mut tokens = options.split_whitespace();
     let mut search_paths = Vec::new();
     while let Some(tok) = tokens.next() {
-        if tok == "-c"
-            && let Some(value) = tokens.next().and_then(|kv| kv.strip_prefix("search_path="))
-        {
+        if tok == "-c" {
+            if let Some(value) = tokens.next().and_then(|kv| kv.strip_prefix("search_path=")) {
+                search_paths.push(value.to_string());
+            }
+        } else if let Some(value) = tok.strip_prefix("-csearch_path=") {
             search_paths.push(value.to_string());
         }
     }
@@ -2407,6 +2422,68 @@ mod tests {
             1,
             "`application_name` set through `options` never affects \
              relation resolution, so these must collapse into one group"
+        );
+    }
+
+    // `hostaddr` pins the actual TCP destination. Two DSNs sharing one
+    // must collapse regardless of how each spells the hostname (issue
+    // #1266).
+    #[cfg(feature = "db")]
+    #[test]
+    fn from_dsns_groups_shards_sharing_one_hostaddr_regardless_of_hostname() {
+        let sharded = ShardedDbPool::from_dsns(
+            [
+                (
+                    ShardId::new(0),
+                    "postgres://alias-a/shared?hostaddr=10.0.0.5".to_string(),
+                ),
+                (
+                    ShardId::new(1),
+                    "postgres://alias-b/shared?hostaddr=10.0.0.5".to_string(),
+                ),
+            ],
+            ShardId::new(0),
+            1,
+        )
+        .expect("pool builds without connecting");
+
+        let groups = sharded.pool_groups();
+        assert_eq!(
+            groups.len(),
+            1,
+            "a shared `hostaddr` names one physical destination, so these \
+             must collapse into one group even though the hostnames differ"
+        );
+    }
+
+    // The compact `-csearch_path=value` spelling has no space before
+    // `-c`. It is already used elsewhere in this codebase. It must be
+    // recognized the same as the spaced form (issue #1266).
+    #[cfg(feature = "db")]
+    #[test]
+    fn from_dsns_recognizes_the_compact_search_path_options_spelling() {
+        let sharded = ShardedDbPool::from_dsns(
+            [
+                (
+                    ShardId::new(0),
+                    "postgres://db.example/shared?options=-csearch_path%3Dschema_a".to_string(),
+                ),
+                (
+                    ShardId::new(1),
+                    "postgres://db.example/shared?options=-csearch_path%3Dschema_b".to_string(),
+                ),
+            ],
+            ShardId::new(0),
+            1,
+        )
+        .expect("pool builds without connecting");
+
+        let groups = sharded.pool_groups();
+        assert_eq!(
+            groups.len(),
+            2,
+            "the compact `-csearch_path=` spelling must select a schema \
+             just as the spaced form does, so these must never collapse"
         );
     }
 }

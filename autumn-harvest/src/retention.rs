@@ -1665,13 +1665,21 @@ impl Drop for RetentionLeaseGuard {
 /// physical pool is purged once per tick with that one decision, already
 /// accounting for every shard sharing it.
 ///
-/// The shard ids travel with the decision for the same reason (issue
-/// #1266). `purge_old_audit_records`'s pending check needs to know which
-/// colocated shards should each have a cursor row, not only whether the
-/// combined protection flag is set. A cursor-row count is not enough. A
-/// decommissioned shard's row is retired, never deleted, so a count can
-/// look complete even when a currently colocated shard has none of its
-/// own. See `purge_old_audit_records`'s doc comment.
+/// A list of shard ids travels with the decision for the same reason
+/// (issue #1266). `purge_old_audit_records`'s pending check needs to
+/// know which colocated shards should each have a cursor row, not only
+/// whether the combined protection flag is set. A cursor-row count is
+/// not enough. A decommissioned shard's row is retired, never deleted,
+/// so a count can look complete even when a currently colocated shard
+/// has none of its own. See `purge_old_audit_records`'s doc comment.
+///
+/// The list names only shards that currently want protection, not every
+/// shard sharing the pool. An exempted shard may never tick, and so may
+/// have no cursor row at all. It is not a shard the guard needs to hear
+/// from: exempting it is exactly how an operator says its progress no
+/// longer matters. Naming it anyway would make the missing-cursor check
+/// permanently true. That blocks purges of rows a still-protected shard
+/// has genuinely already acknowledged, defeating the exemption's purpose.
 #[cfg(feature = "db")]
 fn group_shards_by_pool<'a>(
     pools: &'a ShardedDbPool,
@@ -1684,7 +1692,11 @@ fn group_shards_by_pool<'a>(
             let protect = shards
                 .iter()
                 .any(|shard| config.protects_unexported_audit(*shard));
-            (pool, protect, shards)
+            let expects_cursor: Vec<ShardId> = shards
+                .into_iter()
+                .filter(|shard| config.protects_unexported_audit(*shard))
+                .collect();
+            (pool, protect, expects_cursor)
         })
         .collect()
 }
@@ -3368,9 +3380,11 @@ mod tests {
             "shard 1 still wants protection, so the shared pool stays protected"
         );
         assert_eq!(
-            groups[0].2.len(),
-            2,
-            "both aliased shards must be named in the colocated shard list"
+            groups[0].2,
+            vec![ShardId::new(1)],
+            "only shard 1 wants protection, so only it belongs in the \
+             expected-cursor list; exempted shard 0 must not appear \
+             there even though it shares the pool"
         );
     }
 
@@ -3401,9 +3415,50 @@ mod tests {
             protections.contains(&false) && protections.contains(&true),
             "shard 0's exemption must not leak into shard 1's own, separate pool"
         );
-        assert!(
-            groups.iter().all(|(_, _, shards)| shards.len() == 1),
-            "two genuinely separate pools each have exactly one shard"
+        for (_, protect, shards) in &groups {
+            if *protect {
+                assert_eq!(
+                    *shards,
+                    vec![ShardId::new(1)],
+                    "shard 1's own pool expects a cursor from shard 1"
+                );
+            } else {
+                assert!(
+                    shards.is_empty(),
+                    "exempted shard 0's own pool expects no cursor at all"
+                );
+            }
+        }
+    }
+
+    // An exempted shard that never ticks must not permanently block
+    // purging on a colocated shard that has (issue #1266). Naming an
+    // exempted shard in the expected-cursor list would make the
+    // missing-cursor check true forever, defeating the exemption.
+    #[cfg(feature = "db")]
+    #[test]
+    fn group_shards_by_pool_excludes_an_exempted_shard_from_the_expected_cursor_list() {
+        let pool = test_pool("postgres://unused/db");
+        let mut aliased = BTreeMap::new();
+        aliased.insert(ShardId::new(0), pool.clone());
+        aliased.insert(ShardId::new(1), pool);
+        let sharded = ShardedDbPool::from_map(aliased, ShardId::new(0));
+
+        // Shard 0 is exempted -- an unreachable shard whose export was
+        // abandoned, never ticked, never decommissioned. Shard 1 still
+        // wants protection.
+        let config = RetentionConfig::default()
+            .with_protect_unexported_audit(true)
+            .excluding_shard_from_protect_unexported_audit(ShardId::new(0));
+
+        let groups = group_shards_by_pool(&sharded, &config);
+        assert_eq!(
+            groups[0].2,
+            vec![ShardId::new(1)],
+            "shard 0's exemption must remove it from the expected-cursor \
+             list entirely, not merely from the protection decision, or \
+             its permanent lack of a cursor row would block purging of \
+             rows shard 1 has genuinely acknowledged"
         );
     }
 

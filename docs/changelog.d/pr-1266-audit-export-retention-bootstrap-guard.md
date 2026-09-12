@@ -214,6 +214,35 @@ delete. Documented as an accepted gap alongside host-alias detection
 and role-level `search_path`, left for whoever first needs multi-host
 `from_dsns` entries to fix alongside a real case to test it against.
 
+A thirteenth review round found three more defects: two P1, one P2.
+
+The first (P1) found that `canonical_dsn_key` kept `host` and
+`hostaddr` as two independent identity components, so `host=alias-a
+&hostaddr=10.0.0.5` and `host=alias-b&hostaddr=10.0.0.5` no longer
+merged despite sharing the same actual TCP destination -- exactly the
+disagreement `backup_verify.rs`'s own `parse_dsn_identity` was already
+built to avoid, and cited as this round's own precedent. The key now
+prefers `hostaddr` outright whenever it is given at all, matching
+`parse_dsn_identity`'s stated rule that a shared address is the same
+database "however differently each DSN spells the hostname."
+
+The second (P2) found that the twelfth round's `search_path` tokenizer
+missed the compact `-csearch_path=value` spelling (no space before
+`-c`) -- fresh evidence being that this exact spelling already appears
+in this codebase's own `claim_bench_support.rs`. `extract_search_path`
+now recognizes both the spaced and compact forms.
+
+The third (P1) found a defect in `retention.rs`'s own new code, not a
+carryover: an exempted shard that never ticks (an unreachable shard
+whose export is abandoned, never formally decommissioned) was still
+named in `colocated_shard_ids`, so `purge_old_audit_records`'s
+missing-cursor check stayed permanently true and blocked purging of
+rows a colocated, still-protected shard had genuinely acknowledged --
+defeating the whole point of exempting it. `group_shards_by_pool` now
+filters the expected-cursor list to shards that currently want
+protection, not every shard sharing the pool; an exempted shard's own
+permanent lack of a cursor no longer blocks anyone else's purge.
+
 New tests:
 - `retention_protects_unexported_audit_when_configured_with_no_cursor_and_no_local_sink`
   reproduces the exact bootstrap window (no cursor row anywhere, no sink in
@@ -280,6 +309,17 @@ New tests:
 - `from_dsns_ignores_non_search_path_options_flags` pins the twelfth
   round's second fix: two DSNs differing only in `application_name` set
   through `options` still collapse into one group.
+- `from_dsns_groups_shards_sharing_one_hostaddr_regardless_of_hostname`
+  pins the thirteenth round's first fix: a shared `hostaddr` collapses
+  two DSNs into one group even when their `host` text differs.
+- `from_dsns_recognizes_the_compact_search_path_options_spelling` pins
+  the thirteenth round's second fix: `-csearch_path=` (no space) selects
+  a schema exactly as the spaced form does.
+- `group_shards_by_pool_excludes_an_exempted_shard_from_the_expected_cursor_list`
+  pins the thirteenth round's third fix: an exempted shard that never
+  ticks is left out of the expected-cursor list, so its permanent lack
+  of a cursor never blocks purging rows a colocated, protected shard has
+  genuinely acknowledged.
 
 **Zero migration, zero engine impact beyond the new parameter.** No new
 `WorkflowEvent` variant, no schema change, no change to any existing call

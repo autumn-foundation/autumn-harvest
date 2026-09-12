@@ -307,8 +307,12 @@ shard records:
   by identity rather than counted — a decommissioned shard's cursor row
   is retired, never deleted, so a shard removed from the fleet entirely
   can leave a row behind that would make a mere count look complete. The
-  sweep sources the list from the same `ShardedDbPool::pool_groups()`
-  call that computes the combined decision, so this needs no separate
+  list names only shards that currently want protection, not every shard
+  sharing the pool: an exempted shard that never ticks has no cursor row
+  of its own by design, and naming it anyway would block purging rows a
+  still-protected, colocated shard has genuinely acknowledged. The sweep
+  sources the list from the same `ShardedDbPool::pool_groups()` call
+  that computes the combined decision, so this needs no separate
   operator action either.
 
   Detection covers both ways a fleet builds a `ShardedDbPool`.
@@ -325,23 +329,26 @@ shard records:
   disagrees with it on percent-decoding, on `?dbname=`/`?host=`/`?port=`/
   `?hostaddr=` overrides, and on comma-separated multi-host DSNs.
   Only a `search_path` setting is extracted from `options` (`options`
-  itself can carry `-c search_path=...`, but also any other GUC an
-  operator sets, so the whole string is not kept). `search_path` picks
-  which schema a query resolves against — two DSNs differing only there
-  must stay in separate groups. Every other query parameter
-  (`application_name`, `sslmode`, and so on) is dropped, since none of
-  them changes which relation a query resolves against — except `host`,
-  `hostaddr`, and `port`: a Unix-socket DSN carries its real endpoint
-  there rather than in the URI authority
+  itself can carry `-c search_path=...` or `-csearch_path=...`, both
+  recognized, but also any other GUC an operator sets, so the whole
+  string is not kept). `search_path` picks which schema a query resolves
+  against — two DSNs differing only there must stay in separate groups.
+  Every other query parameter (`application_name`, `sslmode`, and so on)
+  is dropped, since none of them changes which relation a query resolves
+  against — except `host`, `hostaddr`, and `port`: a Unix-socket DSN
+  carries its real endpoint there rather than in the URI authority
   (`postgresql:///harvest?host=%2Frun%2Fpg`), so the key falls back to
-  them when the authority host is empty, or to `hostaddr` whenever it is
-  given at all, matching libpq's own precedence. A resolved host is
-  lowercased only when it does not start with `/`: a DNS name is
-  case-insensitive, but a Unix-socket path is a case-sensitive filesystem
-  path (`/run/PG-A` and `/run/pg-a` name different sockets). A DSN with
-  no path is not treated as naming no database, since libpq defaults an
-  omitted `dbname` to the connecting username — the key uses the
-  username only in that case, never when a path is present.
+  them when the authority host is empty. `hostaddr` wins over `host`
+  outright whenever it is given at all, matching `backup_verify.rs`'s
+  `parse_dsn_identity`: it pins the actual TCP destination, so two DSNs
+  sharing one stay one pool however differently each spells the
+  hostname. A resolved host is lowercased only when it does not start
+  with `/`: a DNS name is case-insensitive, but a Unix-socket path is a
+  case-sensitive filesystem path (`/run/PG-A` and `/run/pg-a` name
+  different sockets). A DSN with no path is not treated as naming no
+  database, since libpq defaults an omitted `dbname` to the connecting
+  username — the key uses the username only in that case, never when a
+  path is present.
 
   Three gaps are accepted rather than chased further. A host alias (two
   hostnames resolving to one address) needs a live connection to detect
