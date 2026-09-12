@@ -401,8 +401,15 @@ Honest limits, so nothing here reads as a promise:
   A **read** is proved against the descriptor it opened, not against the
   name: the path must still resolve inside the workspace, and the file there
   must be the same device and inode as the open file. A descriptor pins the
-  file it opened, so a later swap cannot change what is read, and no bytes
-  are returned before that proof. That race is lost by the attacker.
+  file it opened, so a swap after that proof cannot change what is read, and
+  no bytes are returned before it. A **listing** is read from the descriptor
+  as well, so the names come from the directory that was proved.
+
+  That narrows the race; it does not end it. The containment and the identity
+  are two separate resolutions of the same name, so a process that can time
+  three swaps — outside for the open, back while the path is canonicalised,
+  outside again before the identity is read — is still not caught. Ending it
+  needs the `openat` traversal below.
 
   A **write** can only narrow it. The write re-proves that its parent
   resolves inside the workspace after creating the missing levels, and

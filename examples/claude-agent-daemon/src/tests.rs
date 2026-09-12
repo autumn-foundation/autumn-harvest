@@ -8757,3 +8757,201 @@ fn a_read_follows_no_directory_swapped_in_after_the_path_resolved() {
         "the proof must run after the open and BEFORE any bytes are read"
     );
 }
+
+/// A note too large to deliver is refused where the operator types it.
+///
+/// The decision crosses the socket as one request and is delivered as one
+/// SIGNAL. The signal cap is a quarter of the request cap, so a note can pass
+/// the socket and still be undeliverable.
+///
+/// Measured before the fix: a note of 262144 bytes encodes to 262171, over
+/// the 262144-byte signal cap, inside a 262290-byte request the socket
+/// accepts. The backend then refused the delivery, so the approve command the
+/// status advertises could not answer the call.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_note_too_large_to_deliver_is_refused() {
+    let dir = tempfile::tempdir().expect("a temporary directory");
+    let workspace = dir.path().join("workspace");
+    std::fs::create_dir_all(&workspace).expect("the workspace is created");
+    let socket = dir.path().join("agentd.sock");
+    let daemon = tokio::spawn(daemon::serve(socket_options(dir.path(), &socket)));
+    await_daemon(&socket).await;
+
+    let submitted = protocol::call(
+        &socket,
+        &Request::Submit {
+            goal: "summarise the workspace".to_string(),
+            max_turns: 6,
+            approval_timeout_secs: 300,
+        },
+    )
+    .await
+    .expect("the submit is answered");
+    let Response::Submitted { execution_id } = submitted else {
+        panic!("unexpected answer: {submitted:?}");
+    };
+    await_parked(&socket, &execution_id).await;
+
+    // The token the operator reads, from the status they read it in.
+    let answer = protocol::call(
+        &socket,
+        &Request::Status {
+            execution_id: execution_id.clone(),
+            full: false,
+        },
+    )
+    .await
+    .expect("the status is answered");
+    let Response::Session { session } = answer else {
+        panic!("unexpected answer: {answer:?}");
+    };
+    let token = session
+        .pending
+        .expect("the session offers a call to decide")
+        .token;
+
+    // The hazard: this note passes the request cap and not the signal cap.
+    let note = "n".repeat(usize::try_from(daemon::SIGNAL_CAP_BYTES).expect("the cap fits"));
+    let decision = Request::Approve {
+        execution_id: execution_id.clone(),
+        token: token.clone(),
+        approved: true,
+        note: Some(note.clone()),
+    };
+    let mut line = serde_json::to_string(&decision).expect("the request encodes");
+    line.push('\n');
+    assert!(
+        line.len() <= daemon::MAX_REQUEST_BYTES,
+        "the request must still fit the socket, or this tests the wrong cap: {}",
+        line.len()
+    );
+
+    let refused = protocol::call(&socket, &decision)
+        .await
+        .expect("the decision is answered");
+    let Response::Error { message } = refused else {
+        panic!("a note past the signal cap must be refused: {refused:?}");
+    };
+    assert!(
+        message.contains(&daemon::SIGNAL_CAP_BYTES.to_string())
+            && message.contains("Shorten the note"),
+        "the refusal must name the cap and what to do: {message}"
+    );
+
+    // The call is still decidable, which is the point of refusing early.
+    let accepted = protocol::call(
+        &socket,
+        &Request::Approve {
+            execution_id,
+            token,
+            approved: true,
+            note: Some("short".to_string()),
+        },
+    )
+    .await
+    .expect("the decision is answered");
+    assert!(
+        matches!(accepted, Response::Ack { .. }),
+        "a note inside the cap must still be delivered: {accepted:?}"
+    );
+
+    daemon.abort();
+}
+
+/// A listing names entries of the directory it OPENED.
+///
+/// `read_dir` takes a path, so it resolves the name a second time. A
+/// directory swapped in between was listed instead, and the model reads that
+/// listing, so names from outside the workspace reached it.
+///
+/// The listing is now read from the descriptor. This proves the property
+/// directly. The path is replaced with a link to another directory AFTER the
+/// open, and the entries are still the ones that were opened.
+#[test]
+fn a_listing_names_entries_of_the_directory_it_opened() {
+    use std::os::unix::fs::OpenOptionsExt;
+
+    let dir = tempfile::tempdir().expect("a temporary directory");
+    let workspace = dir.path().join("ws");
+    let outside = dir.path().join("outside");
+    let inside = workspace.join("sub");
+    std::fs::create_dir_all(&inside).expect("the workspace is created");
+    std::fs::create_dir_all(&outside).expect("the outside directory is created");
+    std::fs::write(inside.join("mine.txt"), b"x").expect("the inside file is written");
+    std::fs::write(outside.join("secret.txt"), b"x").expect("the outside file is written");
+
+    let handle = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(
+            rustix::fs::OFlags::NOFOLLOW.bits().cast_signed()
+                | rustix::fs::OFlags::DIRECTORY.bits().cast_signed(),
+        )
+        .open(&inside)
+        .expect("the directory opens");
+    tools::opened_inside(&handle, &inside, &workspace).expect("it is inside the workspace");
+
+    // The swap lands after the open, which is the window a path read loses.
+    // The directory is MOVED rather than removed, so it still holds its
+    // entries and the descriptor still names them.
+    std::fs::rename(&inside, workspace.join("moved")).expect("the directory is moved");
+    std::os::unix::fs::symlink(&outside, &inside).expect("the link takes its place");
+
+    // A path read would now name the outside entry. This is the hazard.
+    let by_path: Vec<String> = std::fs::read_dir(&inside)
+        .expect("the path reads")
+        .map(|entry| {
+            entry
+                .expect("the entry reads")
+                .file_name()
+                .to_string_lossy()
+                .into_owned()
+        })
+        .collect();
+    assert!(
+        by_path.contains(&"secret.txt".to_string()),
+        "a path read must be shown to follow the swap: {by_path:?}"
+    );
+
+    // The descriptor read does not.
+    let names: Vec<String> = rustix::fs::Dir::read_from(&handle)
+        .expect("the descriptor reads")
+        .map(|entry| {
+            String::from_utf8_lossy(entry.expect("the entry reads").file_name().to_bytes())
+                .into_owned()
+        })
+        .collect();
+    assert!(
+        names.contains(&"mine.txt".to_string()),
+        "the opened directory's own entry must be named: {names:?}"
+    );
+    assert!(
+        !names.contains(&"secret.txt".to_string()),
+        "and nothing from outside the workspace: {names:?}"
+    );
+
+    // The proof the listing runs before it names anything, and that the
+    // entries come from the handle rather than the path.
+    let source = include_str!("tools.rs");
+    let body = source
+        .split("fn list_files(")
+        .nth(1)
+        .expect("list_files is in the source");
+    let body = &body[..body.find("\nfn ").unwrap_or(body.len())];
+    assert!(
+        !body.contains("read_dir("),
+        "the listing must not resolve the path a second time"
+    );
+    let opened = body
+        .find("open_directory(")
+        .expect("the directory is opened");
+    let proof = body
+        .find("opened_inside(&handle")
+        .expect("the listing proves what it opened");
+    let read = body
+        .find("Dir::read_from(&handle)")
+        .expect("the entries come from the descriptor");
+    assert!(
+        opened < proof && proof < read,
+        "the proof must run after the open and BEFORE any entry is named"
+    );
+}

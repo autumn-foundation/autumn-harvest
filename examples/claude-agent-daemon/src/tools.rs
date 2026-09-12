@@ -321,14 +321,30 @@ fn resolve(workspace: &Path, relative: &str) -> Result<PathBuf, String> {
 /// of those two lines would page the walk onto a name that is not there.
 fn list_files(workspace: &Path, relative: &str, after: Option<&str>) -> Result<String, String> {
     let dir = resolve(workspace, relative)?;
+    // The directory is OPENED, proved, and then read from that DESCRIPTOR.
+    // `read_dir` takes a path, so it resolves the name a second time, and a
+    // directory swapped in between would be listed instead. The model reads
+    // this listing, so those names would leave the workspace. See
+    // [`opened_inside`].
+    let handle = open_directory(&dir, relative)?;
+    opened_inside(&handle, &dir, workspace)
+        .map_err(|e| format!("cannot list `{relative}`: {e}"))?;
+    let listing = rustix::fs::Dir::read_from(&handle)
+        .map_err(|e| format!("cannot list `{relative}`: {e}"))?;
+
     let mut page: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
     let mut more = false;
     let mut unnamed = 0_usize;
     let mut split = 0_usize;
-    for entry in std::fs::read_dir(&dir).map_err(|e| format!("cannot list `{relative}`: {e}"))? {
+    for entry in listing {
         let entry = entry.map_err(|e| format!("cannot list `{relative}`: {e}"))?;
         let raw = entry.file_name();
-        let Some(name) = raw.to_str() else {
+        // A directory read from a descriptor carries its own two links. They
+        // are not entries of it, and `read_dir` never showed them.
+        if raw.to_bytes() == b"." || raw.to_bytes() == b".." {
+            continue;
+        }
+        let Ok(name) = std::str::from_utf8(raw.to_bytes()) else {
             unnamed += 1;
             continue;
         };
@@ -338,7 +354,7 @@ fn list_files(workspace: &Path, relative: &str, after: Option<&str>) -> Result<S
             split += 1;
             continue;
         }
-        let is_dir = entry.file_type().is_ok_and(|t| t.is_dir());
+        let is_dir = entry.file_type().is_dir();
         let shown = if is_dir {
             format!("{name}/")
         } else {
@@ -425,6 +441,24 @@ fn read_file(workspace: &Path, relative: &str) -> Result<String, String> {
     String::from_utf8(bytes).map_err(|_| format!("`{relative}` is not UTF-8 text"))
 }
 
+/// Open a directory for listing, refusing a link at the final component.
+///
+/// `O_DIRECTORY` fails the open when the name is not a directory, so the kind
+/// is decided by the OPEN and cannot be swapped after it. `O_NOFOLLOW` does
+/// the same job here that it does for a file.
+fn open_directory(path: &Path, relative: &str) -> Result<std::fs::File, String> {
+    std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc_o_nofollow() | libc_o_directory())
+        .open(path)
+        .map_err(|e| format!("cannot list `{relative}`: {e}"))
+}
+
+/// `O_DIRECTORY`, from the platform's own headers.
+const fn libc_o_directory() -> i32 {
+    rustix::fs::OFlags::DIRECTORY.bits().cast_signed()
+}
+
 /// Open a path for reading, and prove it is an ordinary file.
 ///
 /// Two flags carry the safety here. `O_NOFOLLOW` refuses a symbolic link at the
@@ -463,10 +497,21 @@ fn open_regular(path: &Path, relative: &str) -> Result<std::fs::File, String> {
 /// open. The path must still resolve under the real root, and the file there
 /// must be the SAME file: one device and one inode.
 ///
-/// That CLOSES this window rather than narrowing it. A swap after the check
-/// cannot change what the descriptor reads, because the descriptor no longer
-/// depends on the name. The write path cannot be proven this way: a rename
-/// acts on a name, and not on a descriptor. See [`contained`].
+/// What the descriptor gives is that the bytes read AFTERWARDS belong to the
+/// file that was proved. A swap after the proof cannot redirect the read.
+///
+/// This NARROWS the window. It does not close it. A single swap is refused,
+/// because the path no longer resolves inside the workspace, or the file
+/// there is another file. A caller that can time THREE swaps still wins: the
+/// containment and the identity are two separate resolutions of the same
+/// name. It can point a parent outside for the open. It can restore that
+/// parent while the path is canonicalised, and point it outside again before
+/// the identity is read. Both reads then describe the same outside file.
+///
+/// Closing that needs every component opened relative to a held descriptor,
+/// which is the `openat` design this example does not carry. The write path
+/// stands further back again: a rename acts on a name, and not on a
+/// descriptor. See [`contained`].
 ///
 /// A file hard-linked into the workspace passes, because it IS in the
 /// workspace. The model could name it directly.

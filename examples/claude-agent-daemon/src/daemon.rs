@@ -341,6 +341,26 @@ pub async fn serve(options: Options) -> Result<(), String> {
     Ok(())
 }
 
+/// The largest signal payload the backend accepts.
+///
+/// A decision is delivered as one signal, so this bounds the note an operator
+/// can attach. It is a QUARTER of the control request cap, so a note can pass
+/// [`MAX_REQUEST_BYTES`] and still be undeliverable.
+pub const SIGNAL_CAP_BYTES: u64 = autumn_harvest::builder::DEFAULT_MAX_SIGNAL_PAYLOAD_BYTES;
+
+/// The encoded size of this decision, when the backend would refuse it.
+///
+/// The note is the only field an operator can grow. A note between the two
+/// caps was accepted at the socket and then refused on delivery. The
+/// advertised approve command could not deliver it, and the call stayed
+/// parked.
+fn oversized_decision(payload: &serde_json::Value) -> Option<u64> {
+    let bytes = serde_json::to_vec(payload)
+        .map(|json| json.len() as u64)
+        .ok()?;
+    (bytes > SIGNAL_CAP_BYTES).then_some(bytes)
+}
+
 /// The refusal for a recorded task this daemon cannot read.
 fn unreadable(exec_id: &str) -> String {
     format!(
@@ -905,6 +925,17 @@ pub fn approve(
             };
         }
     };
+    // The backend refuses a signal payload past its own cap, and that refusal
+    // arrives after the operator typed the note. The cap is checked HERE, so
+    // the answer names the note rather than a delivery failure.
+    if let Some(bytes) = oversized_decision(&payload) {
+        return Response::Error {
+            message: format!(
+                "the decision is {bytes} bytes once encoded, over the backend's \
+                 {SIGNAL_CAP_BYTES}-byte signal cap. Shorten the note."
+            ),
+        };
+    }
     match runtime.send_signal(exec, &signal, payload) {
         Ok(()) => {
             // The deadline can pass between the check above and the moment the
