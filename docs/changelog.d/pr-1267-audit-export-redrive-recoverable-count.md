@@ -75,3 +75,14 @@ Also: `docs/api-contract.json`, `management_api_response_fields()`, and both
 (`scripts/regenerate-openapi.sh`); `contract_regression` and `openapi_spec`
 suites pass. Fixed a pre-existing run-on sentence in the redrive route's
 `success_response.notes` while it was already being edited.
+
+**Known limitation, documented and filed rather than fixed here (issue
+#1508):** `already_purged_records` is exact for a `to_seq` rewind, where `to`
+is the operator's own number. For a `before` rewind, `to` is derived from the
+lowest *surviving* record at or after the given instant, so an already-purged
+prefix is invisible to both the resolver and to `already_purged_records` —
+closing that needs a persisted purge watermark, since nothing in
+`harvest_audit_log` records that a purged row ever existed. Caught in review
+(Codex); documented in code (`audit_export.rs`, the `Before` branch of
+`rewind_cursor_locked` and the `redrive_recovery_counts` doc comment),
+`docs/audit-export.md`, and `docs/api-contract.json`.

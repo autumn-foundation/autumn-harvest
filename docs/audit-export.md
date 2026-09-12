@@ -406,6 +406,12 @@ Three properties worth knowing:
   and timestamp order can disagree; anchoring this way means any skew makes the
   rewind reach *further back* (costing duplicate deliveries your receiver
   dedupes) rather than skipping records the operator asked for.
+  **Known gap (issue #1508):** that lowest sequence is found among *surviving*
+  rows. If retention already purged the earliest records at or after the
+  instant, `before` silently resolves as if they were never part of the
+  window — `already_purged_records` (below) cannot see a prefix the resolver
+  itself already dropped. `to_seq` does not have this gap: it names an exact
+  position, so `already_purged_records` is exact for it.
 - **The redrive is itself audited** (`audit_export.redrive`), so re-exporting is
   as auditable as the operations being exported. The rewind and its audit
   record are **one transaction on one connection** — the audit row is written

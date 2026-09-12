@@ -1699,6 +1699,17 @@ pub async fn rewind_cursor_locked(
                     // on `(shard, seq)`, never a missing record. No sequenced
                     // record at or after the instant means there is nothing to
                     // re-export from there, so the cursor stays put.
+                    //
+                    // Known gap (issue #1508): this MIN only sees SURVIVING
+                    // rows. If retention already purged the earliest records
+                    // at or after `instant`, the query lands on the lowest
+                    // row still present instead. The resolved `to` then reads
+                    // as the operator's full request. `from - to` silently
+                    // excludes the purged prefix. `already_purged_records`
+                    // (computed only over the resolved window) then reports
+                    // `0`, even though records the operator's timestamp named
+                    // are gone. Closing this needs a persisted purge
+                    // watermark. No row survives to compute it from here.
                     let lowest: Option<Option<i64>> = log::harvest_audit_log
                         .filter(log::occurred_at.ge(instant))
                         .filter(log::export_seq.is_not_null())
@@ -1776,6 +1787,12 @@ pub async fn count_redrive_recoverable(
 /// `(0, 0)` for [`RewindOutcome::NoOp`] and [`RewindOutcome::NotConfigured`]:
 /// a refused rewind moved nothing, so there is no window to measure. For
 /// [`RewindOutcome::Rewound`], see [`count_redrive_recoverable`].
+///
+/// Exact for a [`RewindRequest::Seq`] rewind: `to` is the operator's own
+/// number, independent of what still exists. Understates a purged prefix for
+/// a [`RewindRequest::Before`] rewind (issue #1508). `to` there is derived
+/// from surviving rows. An already-purged prefix is invisible to this count
+/// too, not only to the resolver that picked `to`.
 ///
 /// # Errors
 /// Returns `HarvestError` on a database failure.
