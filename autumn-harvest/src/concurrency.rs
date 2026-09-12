@@ -670,13 +670,26 @@ pub async fn dry_run_supersede_credit(
 /// its `ParentClosePolicy` cascade runs normally. No new `WorkflowEvent` variant
 /// and no migration (AC5).
 ///
+/// `quota_lock_held` (issue #1228 review, P1 on the prior round's own
+/// fix). `true` only when THIS transaction's `enforce_quota_admission`
+/// call actually acquired `lock_quota_key`, for the admission being
+/// checked. That happens exactly when its `quota_policy` had a cap and
+/// its `quota_key` resolved. Only then can waiting on a candidate's row
+/// lock complete the ABBA cycle the shed loop's non-blocking probe
+/// avoids (see that comment). A `cancel_running` workflow with no quota
+/// policy never takes that lock, so the cycle cannot form there. This
+/// function then falls back to the plain, blocking cancel every caller
+/// used before that fix. A probe would skip candidates locked by an
+/// ordinary, unrelated decision cycle there, for no safety benefit.
+///
 /// # Errors
 ///
 /// Propagates database failures from the advisory lock, the candidate scan, or a
 /// cancellation. A candidate that reached a terminal state between the scan and
 /// the cancel is skipped, not an error. So is a candidate whose row lock this
-/// function's own non-blocking probe could not claim (issue #1228 review, P1).
-/// See the shed loop's own comment for why waiting there is unsafe.
+/// function's own non-blocking probe could not claim, when `quota_lock_held`
+/// applies that probe (issue #1228 review, P1). See the shed loop's own
+/// comment for why waiting there is unsafe only in that case.
 #[cfg(feature = "db")]
 pub async fn supersede_running_for_key(
     conn: &mut diesel_async::AsyncPgConnection,
@@ -685,6 +698,7 @@ pub async fn supersede_running_for_key(
     limit: u32,
     self_exec_id: crate::types::ExecutionId,
     metrics: Option<&(dyn crate::telemetry::MetricsRecorder + Send + Sync)>,
+    quota_lock_held: bool,
 ) -> crate::error::HarvestResult<SupersedeOutcome> {
     let inherited: Vec<crate::types::ExecutionId> =
         ADMITTING.try_with(Clone::clone).unwrap_or_default();
@@ -702,6 +716,7 @@ pub async fn supersede_running_for_key(
                 self_exec_id,
                 inherited,
                 metrics,
+                quota_lock_held,
             ),
         )
         .await
@@ -783,6 +798,7 @@ async fn claim_candidate_row_or_warn(
 }
 
 #[cfg(feature = "db")]
+#[allow(clippy::too_many_arguments)]
 async fn supersede_inner(
     conn: &mut diesel_async::AsyncPgConnection,
     workflow_name: &str,
@@ -791,6 +807,7 @@ async fn supersede_inner(
     self_exec_id: crate::types::ExecutionId,
     inherited: Vec<crate::types::ExecutionId>,
     metrics: Option<&(dyn crate::telemetry::MetricsRecorder + Send + Sync)>,
+    quota_lock_held: bool,
 ) -> crate::error::HarvestResult<SupersedeOutcome> {
     lock_concurrency_key(conn, concurrency_key).await?;
 
@@ -873,11 +890,14 @@ async fn supersede_inner(
     let mut outcome = SupersedeOutcome::default();
     for candidate in candidates.into_iter().take(shed) {
         // Non-blocking probe for the row lock `cancel_workflow_execution_collect`
-        // is about to take (issue #1228 review, P1). See
-        // `try_claim_candidate_row`'s own doc comment for the ABBA cycle this
-        // avoids.
-        if !claim_candidate_row_or_warn(conn, candidate.exec_id, workflow_name, concurrency_key)
-            .await?
+        // is about to take. Applied ONLY when this transaction holds the
+        // quota lock the ABBA cycle needs (issue #1228 review, P1 on the
+        // probe's own prior-round fix). See `try_claim_candidate_row`'s
+        // and this function's own `quota_lock_held` doc. Skipping there
+        // is unsafe, not just unnecessary, outside that case.
+        if quota_lock_held
+            && !claim_candidate_row_or_warn(conn, candidate.exec_id, workflow_name, concurrency_key)
+                .await?
         {
             continue;
         }

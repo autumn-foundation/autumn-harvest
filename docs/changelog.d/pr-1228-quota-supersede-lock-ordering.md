@@ -562,3 +562,45 @@ Also ports a second pre-existing trunk-dev CI defect surfaced only once
 follow-up 8's Lint fix let the job run far enough to reach it:
 `docs/rnd/sqlite-feasibility.md` still said 102 migrations against a live
 count of 103. Fixed per the already-open autumn-foundation/autumn-harvest#1513.
+
+## Follow-up 10 — PR #1484 review: the non-blocking probe skipped candidates it never needed to
+
+A tenth automated review round found follow-up 9's own fix regressed a
+case it never needed to touch.
+
+**P1 -- a `cancel_running` workflow with no quota policy lost its
+blocking guarantee for no safety benefit.** `enforce_quota_admission`
+only calls `lock_quota_key` when a quota policy with a cap is in play
+and its key resolves; a concurrency-only `cancel_running` workflow never
+takes that lock, so the ABBA cycle follow-up 9 fixed cannot form there.
+The unconditional `try_claim_candidate_row` probe still applied in that
+case, so a candidate merely locked by an ordinary, unrelated decision
+cycle -- previously waited out, then cancelled -- was now skipped
+outright, with no quota-side reconciliation to catch the gap (credited
+ids are always empty without a quota policy). A concurrency limit could
+stay violated indefinitely instead of converging on the next admission.
+
+Fixed by threading a new `quota_lock_held: bool` into
+`supersede_running_for_key`/`supersede_inner`, computed by
+`run_latest_wins_supersede` from the same `quota_policy`/`quota_key`
+values already passed to this transaction's earlier
+`enforce_quota_admission` call (the same values that decided whether
+`lock_quota_key` was actually taken). The shed loop's probe now applies
+only when `quota_lock_held` is true; otherwise it falls back to the
+plain, blocking cancel every caller used before follow-up 9, exactly
+preserving the pre-existing convergence guarantee where no cycle was
+ever possible.
+
+Also closes a genuine, unrelated coverage gap the same CI run surfaced:
+`harvest.quota.supersede_credit_not_shed` (added in follow-up 5) had no
+dashboard panel and no `SERIES_LABELS` entry, tripping the anti-drift
+dashboard-coverage gate. Added a panel mirroring
+`harvest_concurrency_residual_over_limit`'s, and the matching
+`SERIES_LABELS`/`DASHBOARD_PROMETHEUS_SERIES` entries.
+
+Re-ran `quota_supersede_ordering_tests.rs` (6/6),
+`quota_lock_ordering_tests.rs` (2/2), `concurrency_supersede_tests.rs`
+(20/20), `quota_enforcement_tests.rs` (38/41, the same known
+`quota_blocked_outbox_*`/`completion_trigger_defers_to_outbox_...`
+flakes), and all 18 `dashboard_pack_docs.rs` tests against the corrected
+design.

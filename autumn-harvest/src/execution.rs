@@ -2759,6 +2759,14 @@ async fn run_latest_wins_supersede(
         return Ok((Vec::new(), Vec::new()));
     };
 
+    // Every caller of this function already ran `enforce_quota_admission`
+    // earlier in this same transaction. That call acquires `lock_quota_key`
+    // under exactly this condition -- see its own early returns.
+    // `supersede_running_for_key` needs to know whether that lock is
+    // actually held. Waiting on a candidate's row lock could otherwise
+    // complete an ABBA cycle against it (issue #1228 review, P1 on the
+    // probe's own prior-round fix).
+    let quota_lock_held = quota_policy.is_some_and(|p| p.has_any_cap()) && quota_key.is_some();
     let outcome = crate::concurrency::supersede_running_for_key(
         conn,
         request.workflow_name,
@@ -2766,6 +2774,7 @@ async fn run_latest_wins_supersede(
         request.concurrency_limit.unwrap_or(1),
         exec_id,
         metrics,
+        quota_lock_held,
     )
     .await?;
 
