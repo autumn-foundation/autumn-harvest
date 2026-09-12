@@ -461,15 +461,29 @@ fn write_file(workspace: &Path, relative: &str, content: &str) -> Result<String,
 /// The retry then creates nothing. A list of its own creations would name
 /// nothing to flush, while the entry naming the directory is still unwritten.
 pub fn directories_to_flush(target: &Path, workspace: &Path) -> Vec<PathBuf> {
-    let root = workspace
-        .canonicalize()
-        .unwrap_or_else(|_| workspace.to_path_buf());
+    // BOTH sides are canonical, or neither comparison means anything. The
+    // workspace may be named through a symlink. The root would then be the
+    // real path while the target kept the link spelling, and the first
+    // ancestor would already fail the test below. The chain would be empty,
+    // and the fallback would flush the target's own directory alone. Every
+    // directory above it holds an entry this write created, so a crash could
+    // lose the file while the history says the write finished.
+    //
+    // The directories exist by the time this runs, because the write has
+    // landed. Flushing the canonical directory flushes the same inode as the
+    // link spelling names.
+    let real = |path: &Path| path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+    let root = real(workspace);
     let chain: Vec<PathBuf> = target
         .parent()
+        .map(real)
         .into_iter()
-        .flat_map(Path::ancestors)
-        .take_while(|directory| directory.starts_with(&root))
-        .map(Path::to_path_buf)
+        .flat_map(|leaf| {
+            leaf.ancestors()
+                .take_while(|directory| directory.starts_with(&root))
+                .map(Path::to_path_buf)
+                .collect::<Vec<_>>()
+        })
         .collect();
 
     // The target sits under the root, so the chain holds the root at least. A

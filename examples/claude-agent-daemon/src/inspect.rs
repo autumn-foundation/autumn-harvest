@@ -78,6 +78,11 @@ pub struct SessionSummary {
     pub tool_calls: Option<i64>,
     pub answer: Option<String>,
     pub error: Option<String>,
+    /// Where this row sits in the table, which is the cursor that reads the
+    /// rows BEFORE it. The listing is capped, so an old session waiting for a
+    /// decision would otherwise become unreachable once enough newer ones
+    /// arrive.
+    pub row: i64,
 }
 
 /// How many characters of one listed field are read.
@@ -405,12 +410,19 @@ fn races_signal(timer_id: &str, signal: &str) -> bool {
         .is_some_and(|(_seq, name)| name == signal)
 }
 
-/// Every execution of the agent workflow, oldest first.
+/// One page of the agent workflow's executions, oldest first.
+///
+/// `before` reads the page before a row this listing named. The cap is on one
+/// page and not on the table, so every session stays reachable.
 ///
 /// # Errors
 ///
 /// Returns an error if the query fails.
-pub fn executions(conn: &Connection, workflow_name: &str) -> Result<Vec<SessionSummary>, String> {
+pub fn executions(
+    conn: &Connection,
+    workflow_name: &str,
+    before: Option<i64>,
+) -> Result<Vec<SessionSummary>, String> {
     // The FIELDS are selected, and not the rows. A recorded task and a
     // recorded report can each approach the backend's payload cap. A listing
     // that read them whole would hold hundreds of megabytes for a capped
@@ -425,14 +437,21 @@ pub fn executions(conn: &Connection, workflow_name: &str) -> Result<Vec<SessionS
                     json_extract(output_json, '$.turns'), \
                     json_extract(output_json, '$.tool_calls'), \
                     substr(json_extract(output_json, '$.answer'), 1, ?3), \
-                    substr(error, 1, ?3) \
+                    substr(error, 1, ?3), \
+                    rowid \
              FROM harvest_executions WHERE workflow_name = ?1 \
+             AND (?4 IS NULL OR rowid < ?4) \
              ORDER BY rowid DESC LIMIT ?2",
         )
         .map_err(|e| format!("cannot prepare the session query: {e}"))?;
     let rows = statement
         .query_map(
-            rusqlite::params![workflow_name, MAX_LISTED_SESSIONS + 1, MAX_LISTED_CHARS],
+            rusqlite::params![
+                workflow_name,
+                MAX_LISTED_SESSIONS + 1,
+                MAX_LISTED_CHARS,
+                before
+            ],
             |row| {
                 Ok(SessionSummary {
                     exec_id: row.get(0)?,
@@ -443,6 +462,7 @@ pub fn executions(conn: &Connection, workflow_name: &str) -> Result<Vec<SessionS
                     tool_calls: row.get(5)?,
                     answer: row.get(6)?,
                     error: row.get(7)?,
+                    row: row.get(8)?,
                 })
             },
         )

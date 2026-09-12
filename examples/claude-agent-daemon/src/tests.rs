@@ -113,7 +113,9 @@ fn approve(rt: &mut SqliteRuntime, exec: ExecutionId, signal: &str) {
 /// name.
 async fn await_daemon(socket: &Path) {
     for _ in 0..200 {
-        if let Ok(Response::Sessions { .. }) = protocol::call(socket, &Request::List).await {
+        if let Ok(Response::Sessions { .. }) =
+            protocol::call(socket, &Request::List { before: None }).await
+        {
             return;
         }
         tokio::time::sleep(Duration::from_millis(20)).await;
@@ -485,7 +487,7 @@ async fn a_caller_that_sends_nothing_does_not_hold_the_daemon() {
     // daemon: a bounded read gives their permits back.
     let answered = tokio::time::timeout(
         Duration::from_secs(60),
-        protocol::call(&socket, &Request::List),
+        protocol::call(&socket, &Request::List { before: None }),
     )
     .await
     .expect("the honest caller must not wait on the silent ones")
@@ -599,7 +601,7 @@ async fn the_daemon_answers_more_connections_than_it_holds_at_once() {
     for _ in 0..callers {
         let socket = socket.clone();
         answers.push(tokio::spawn(async move {
-            protocol::call(&socket, &Request::List).await
+            protocol::call(&socket, &Request::List { before: None }).await
         }));
     }
 
@@ -659,7 +661,7 @@ async fn the_daemon_serves_one_session_over_its_socket() {
 
     // The list and history answers carry sequences, which an internally tagged
     // enum only encodes from a struct variant. Assert both over the socket.
-    let listed = protocol::call(&socket, &Request::List)
+    let listed = protocol::call(&socket, &Request::List { before: None })
         .await
         .expect("the list is answered");
     let Response::Sessions { sessions, .. } = listed else {
@@ -1129,7 +1131,7 @@ fn a_long_history_does_not_make_one_unbounded_listing() {
     drop(conn);
 
     let reader = inspect::open(&db).expect("the read-only connection opens");
-    let listed = inspect::executions(&reader, WORKFLOW_NAME).expect("the listing reads");
+    let listed = inspect::executions(&reader, WORKFLOW_NAME, None).expect("the listing reads");
     assert_eq!(
         listed.len(),
         inspect::MAX_LISTED_SESSIONS as usize + 1,
@@ -1180,7 +1182,7 @@ fn a_listing_reads_no_whole_payload() {
     drop(conn);
 
     let reader = inspect::open(&db).expect("the reader opens");
-    let listed = inspect::executions(&reader, WORKFLOW_NAME).expect("the listing reads");
+    let listed = inspect::executions(&reader, WORKFLOW_NAME, None).expect("the listing reads");
     let row = listed.first().expect("the session is listed");
     let cap = inspect::MAX_LISTED_CHARS as usize;
 
@@ -1562,7 +1564,7 @@ async fn an_empty_goal_never_starts_a_session() {
     );
 
     // Nothing was recorded, so no session is left to fail.
-    let listed = protocol::call(&socket, &Request::List)
+    let listed = protocol::call(&socket, &Request::List { before: None })
         .await
         .expect("the listing is answered");
     let Response::Sessions { sessions, .. } = listed else {
@@ -2596,12 +2598,222 @@ fn the_decide_line_reaches_the_daemon_that_printed_it() {
         .expect("a runtime")
         .block_on(protocol::call(
             Path::new("/run/agentd/project-b.sock"),
-            &Request::List,
+            &Request::List { before: None },
         ))
         .expect_err("no daemon listens there");
     assert!(
         unreachable.contains("agentd serve --socket /run/agentd/project-b.sock"),
         "the start command must name the socket that failed: {unreachable}"
+    );
+}
+
+/// A capped listing stays reachable through its cursor.
+///
+/// The listing is capped so an old database cannot be read whole into memory.
+/// Without a cursor that cap HIDES rows. An old session still waiting for a
+/// decision becomes unreachable once enough newer sessions arrive, unless the
+/// operator kept its execution id.
+#[test]
+fn a_listing_walks_back_through_its_cursor() {
+    let dir = tempfile::tempdir().expect("a temporary directory");
+    let db = dir.path().join("listing.db");
+    let writer = rusqlite::Connection::open(&db).expect("the database opens");
+    writer
+        .execute(
+            "CREATE TABLE harvest_executions (exec_id TEXT, workflow_name TEXT, \
+             state TEXT, input_json TEXT, output_json TEXT, error TEXT)",
+            [],
+        )
+        .expect("the fixture table is created");
+    for index in 0..5 {
+        let task = json!({
+            "goal": format!("goal {index}"),
+            "max_turns": 4,
+            "approval_timeout_secs": 300,
+            "workspace": "/tmp/w",
+            "model": claude::OFFLINE_MODEL,
+        });
+        writer
+            .execute(
+                "INSERT INTO harvest_executions VALUES (?1, ?2, 'COMPLETED', ?3, NULL, NULL)",
+                rusqlite::params![format!("exec-{index}"), WORKFLOW_NAME, task.to_string()],
+            )
+            .expect("the session is recorded");
+    }
+    drop(writer);
+
+    let reader = rusqlite::Connection::open(&db).expect("the database opens");
+    let all = inspect::executions(&reader, WORKFLOW_NAME, None).expect("the listing reads");
+    assert_eq!(all.len(), 5, "the fixture holds five sessions");
+    assert_eq!(
+        all[0].exec_id, "exec-0",
+        "the listing reads oldest first: {:?}",
+        all[0].exec_id
+    );
+
+    // Walk back from the third row. The page before it is the first two, and
+    // nothing newer.
+    let cursor = all[2].row;
+    let older = inspect::executions(&reader, WORKFLOW_NAME, Some(cursor)).expect("the page reads");
+    let named: Vec<&str> = older.iter().map(|row| row.exec_id.as_str()).collect();
+    assert_eq!(
+        named,
+        vec!["exec-0", "exec-1"],
+        "the cursor must read the rows BEFORE it"
+    );
+
+    // The oldest row has nothing before it, which is how a walk ends.
+    let none =
+        inspect::executions(&reader, WORKFLOW_NAME, Some(all[0].row)).expect("the page reads");
+    assert!(
+        none.is_empty(),
+        "the oldest row ends the walk, and got {} rows",
+        none.len()
+    );
+}
+
+/// A full page carries the cursor that reads the page before it.
+///
+/// The query and the renderer are covered above and below. This covers the
+/// DAEMON deciding to send the cursor, which neither of those reaches: a
+/// reverted cursor left both of them passing.
+#[test]
+fn a_full_page_carries_its_cursor() {
+    let dir = tempfile::tempdir().expect("a temporary directory");
+    let db = dir.path().join("full.db");
+    let writer = rusqlite::Connection::open(&db).expect("the database opens");
+    writer
+        .execute(
+            "CREATE TABLE harvest_executions (exec_id TEXT, workflow_name TEXT, \
+             state TEXT, input_json TEXT, output_json TEXT, error TEXT)",
+            [],
+        )
+        .expect("the fixture table is created");
+
+    // One session past the cap, which is what makes the page full.
+    let rows = inspect::MAX_LISTED_SESSIONS + 1;
+    let task = json!({
+        "goal": "tidy the notes",
+        "max_turns": 4,
+        "approval_timeout_secs": 300,
+        "workspace": "/tmp/w",
+        "model": claude::OFFLINE_MODEL,
+    })
+    .to_string();
+    for index in 0..rows {
+        writer
+            .execute(
+                "INSERT INTO harvest_executions VALUES (?1, ?2, 'COMPLETED', ?3, NULL, NULL)",
+                rusqlite::params![format!("exec-{index}"), WORKFLOW_NAME, task],
+            )
+            .expect("the session is recorded");
+    }
+    drop(writer);
+
+    let reader = rusqlite::Connection::open(&db).expect("the database opens");
+    let parked = daemon::Parked::new();
+    let (shown, more, older) =
+        daemon::sessions(&reader, &parked, false, None).expect("the listing reads");
+    assert_eq!(
+        shown.len(),
+        inspect::MAX_LISTED_SESSIONS as usize,
+        "a full page shows the cap and no more"
+    );
+    assert!(more, "the table holds more than one page");
+    let cursor = older.expect("a full page must carry its cursor");
+
+    // The cursor reads the page BEFORE this one, so it must find the session
+    // the page left out and not repeat one it showed.
+    let before =
+        inspect::executions(&reader, WORKFLOW_NAME, Some(cursor)).expect("the earlier page reads");
+    assert_eq!(
+        before.len(),
+        1,
+        "the cursor must reach the one session this page omitted"
+    );
+    assert_eq!(
+        before[0].exec_id, "exec-0",
+        "the omitted session is the oldest one: {}",
+        before[0].exec_id
+    );
+}
+
+/// The listing's own continuation command carries the socket.
+#[test]
+fn the_listing_cursor_reaches_the_daemon_that_printed_it() {
+    let view = protocol::SessionView {
+        execution_id: "01JCEXEC".to_string(),
+        goal: "tidy the notes".to_string(),
+        state: "RUNNING".to_string(),
+        blocked_on: None,
+        pending: None,
+        answer: None,
+        error: None,
+    };
+    let rendered = crate::rendered_lines(
+        &Response::Sessions {
+            sessions: vec![view],
+            more: true,
+            older: Some(41),
+        },
+        Path::new("/run/agentd/project-b.sock"),
+    );
+    let hint = rendered
+        .iter()
+        .find(|line| line.contains("--before"))
+        .expect("the continuation command is printed");
+    assert!(
+        hint.contains("--socket /run/agentd/project-b.sock") && hint.contains("--before 41"),
+        "the continuation command must reach the same daemon: {hint}"
+    );
+}
+
+/// The flush chain holds every directory above a write.
+///
+/// An entry is durable only after the directory naming it is flushed. A write
+/// that creates nested directories therefore needs each one above it flushed,
+/// up to the workspace root.
+///
+/// The workspace may be named through a symlink. Both sides of the comparison
+/// must be canonical. The chain otherwise collapses to the target's own
+/// directory, and a crash loses the file while the history says the write
+/// finished.
+#[test]
+fn the_flush_chain_reaches_the_root_through_a_symlink() {
+    let dir = tempfile::tempdir().expect("a temporary directory");
+    let real = dir.path().join("real");
+    std::fs::create_dir_all(real.join("a/b")).expect("the tree is created");
+    let link = dir.path().join("link");
+    std::os::unix::fs::symlink(&real, &link).expect("the symlink is made");
+
+    // The workspace is named through the link, which is how an operator who
+    // keeps a stable path to a moving directory names it.
+    let chain = tools::directories_to_flush(&link.join("a/b/notes.md"), &link);
+    let canonical = real.canonicalize().expect("the real path resolves");
+
+    assert_eq!(
+        chain.len(),
+        3,
+        "the chain must hold b, a and the root: {chain:?}"
+    );
+    assert!(
+        chain[0].ends_with("a/b") && chain[1].ends_with("a") && chain[2] == canonical,
+        "the chain must run deepest first up to the root: {chain:?}"
+    );
+
+    // The directory holding the entry that names `b` is the one a collapsed
+    // chain leaves out, so it is named here on its own.
+    assert!(
+        chain.iter().any(|entry| entry.ends_with("a")),
+        "the parent that names the deepest directory must be flushed: {chain:?}"
+    );
+
+    // The same workspace named directly gives the same chain, so the fix is
+    // about the spelling and not about the walk.
+    let direct = tools::directories_to_flush(&real.join("a/b/notes.md"), &real);
+    assert_eq!(
+        direct, chain,
+        "a link and the real path must flush the same directories"
     );
 }
 
@@ -3222,7 +3434,7 @@ async fn the_startup_and_status_queries_read_only_what_they_need() {
         "the running row must not carry the goal"
     );
     assert_eq!(
-        crate::inspect::executions(&reader, WORKFLOW_NAME)
+        crate::inspect::executions(&reader, WORKFLOW_NAME, None)
             .expect("the listing answers")
             .len(),
         2,

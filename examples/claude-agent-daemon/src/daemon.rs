@@ -126,7 +126,7 @@ pub struct ParkedState {
 }
 
 /// The parked sessions this daemon knows about.
-type Parked = HashMap<ExecutionId, ParkedState>;
+pub type Parked = HashMap<ExecutionId, ParkedState>;
 
 /// The sessions the drive tick advances, in the order they arrived.
 ///
@@ -580,8 +580,12 @@ fn handle(
                 Err(message) => Response::Error { message },
             }
         }
-        Request::List => match sessions(reader, blocked, false) {
-            Ok((sessions, more)) => Response::Sessions { sessions, more },
+        Request::List { before } => match sessions(reader, blocked, false, before) {
+            Ok((sessions, more, older)) => Response::Sessions {
+                sessions,
+                more,
+                older,
+            },
             Err(message) => Response::Error { message },
         },
         Request::History {
@@ -888,23 +892,30 @@ fn describe(line: &inspect::EventLine) -> String {
 }
 
 /// Project every execution row into an operator view.
-fn sessions(
+pub fn sessions(
     reader: &Connection,
     blocked: &Parked,
     full: bool,
-) -> Result<(Vec<SessionView>, bool), String> {
-    let mut rows = inspect::executions(reader, WORKFLOW_NAME)?;
+    before: Option<i64>,
+) -> Result<(Vec<SessionView>, bool, Option<i64>), String> {
+    let mut rows = inspect::executions(reader, WORKFLOW_NAME, before)?;
     // One row past the cap was read, so the caller can say there are more
     // without a second query. The extra one is not shown.
     let more = rows.len() > inspect::MAX_LISTED_SESSIONS as usize;
     if more {
         rows.remove(0);
     }
+    // The cursor is the OLDEST row this page shows, and the rows read oldest
+    // first. A page of sessions is therefore reachable from the one after it,
+    // however many newer sessions arrive. A capped listing with no cursor
+    // would hide an old session still waiting for a decision.
+    let older = more.then(|| rows.first().map(|row| row.row)).flatten();
     Ok((
         rows.iter()
             .map(|row| summary_view(reader, row, blocked, full))
             .collect(),
         more,
+        older,
     ))
 }
 

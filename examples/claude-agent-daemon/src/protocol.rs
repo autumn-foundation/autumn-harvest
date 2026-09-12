@@ -28,7 +28,12 @@ pub enum Request {
         full: bool,
     },
     /// Report every session this database holds.
-    List,
+    List {
+        /// Read the page of sessions BEFORE this row. The row comes from a
+        /// listing this daemon printed. See [`Response::Sessions`].
+        #[serde(default)]
+        before: Option<i64>,
+    },
     /// Report the recorded event log of one session.
     ///
     /// `before` reads the page that ENDS just before that sequence number. An
@@ -75,6 +80,11 @@ pub enum Response {
         /// into memory by one command. See `inspect::MAX_LISTED_SESSIONS`.
         #[serde(default)]
         more: bool,
+        /// The cursor that reads the page BEFORE this one, when the table
+        /// holds more. The CLIENT renders the command, because only it knows
+        /// which socket it asked.
+        #[serde(default)]
+        older: Option<i64>,
     },
     History {
         events: Vec<String>,

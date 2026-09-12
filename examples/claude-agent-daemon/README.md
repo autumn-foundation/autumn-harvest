@@ -105,7 +105,7 @@ exactly that, by counting model calls in each process.
 | `agentd serve` | Run the daemon. This process is the single writer. |
 | `agentd submit "<goal>"` | Start one session; prints its execution id. |
 | `agentd status <id> [--full]` | One session: state, why it is parked, the exact pending call, its answer. `--full` prints the call's arguments untrimmed. |
-| `agentd list` | Every session in the database. |
+| `agentd list` | Every session in the database. A long listing prints its newest sessions and names the `--before <row>` that reads the ones before them, so an old session waiting for a decision stays reachable however many newer ones arrive. |
 | `agentd history <id>` | The recorded event log with each event's data — the audit trail. An id that names no session is refused, so a typo cannot read as a session that did nothing. A long log prints its newest events and names the `--before <seq>` that reads the ones before them. |
 | `agentd approve <id> <token>` / `deny <id> <token>` | Release or refuse the gated tool call that token names. A decision after the call's deadline is refused, because the session denies that call whatever the answer says. |
 

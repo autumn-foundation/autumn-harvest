@@ -124,7 +124,12 @@ enum Command {
         full: bool,
     },
     /// Report every session.
-    List,
+    List {
+        /// Read the page of sessions before this row, from a listing this
+        /// daemon printed.
+        #[arg(long)]
+        before: Option<i64>,
+    },
     /// Print the recorded event log of one session.
     History {
         execution_id: String,
@@ -266,8 +271,8 @@ async fn run(cli: Cli) -> Result<(), String> {
             protocol::call(&cli.socket, &Request::Status { execution_id, full }).await?,
             &cli.socket,
         ),
-        Command::List => report(
-            protocol::call(&cli.socket, &Request::List).await?,
+        Command::List { before } => report(
+            protocol::call(&cli.socket, &Request::List { before }).await?,
             &cli.socket,
         ),
         Command::History {
@@ -412,7 +417,11 @@ fn rendered_lines(response: &Response, socket: &Path) -> Vec<String> {
             ),
         ],
         Response::Session { session } => session_lines(session, socket),
-        Response::Sessions { sessions, more } => {
+        Response::Sessions {
+            sessions,
+            more,
+            older,
+        } => {
             if sessions.is_empty() {
                 return vec!["no sessions yet".to_string()];
             }
@@ -424,7 +433,19 @@ fn rendered_lines(response: &Response, socket: &Path) -> Vec<String> {
                     lines
                 })
                 .collect();
-            if *more {
+            // The daemon returns the cursor and the CLIENT builds the
+            // command, so it reaches the daemon this command reached. A
+            // listing that only said MORE would leave an old session waiting
+            // for a decision with no way to reach it. See
+            // [`protocol::socket_flag`].
+            if let Some(older) = older {
+                lines.push(format!(
+                    "{} sessions shown; read the ones before them with `agentd list{} \
+                     --before {older}`",
+                    sessions.len(),
+                    protocol::socket_flag(socket)
+                ));
+            } else if *more {
                 lines.push(format!(
                     "the newest {} sessions are shown; the database holds more",
                     sessions.len()
