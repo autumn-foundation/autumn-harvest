@@ -554,6 +554,244 @@ type FiredDebounce = (
     Vec<crate::execution::StartCancelledRun>,
 );
 
+/// Resolve the `(workflow_name, quota_key)` a row's fresh start would lock
+/// in `enforce_quota_admission`, or `None` when no cap applies. Takes the
+/// caller's already-resolved per-workflow quota policy as a plain map. It
+/// does not read
+/// [`crate::completion_trigger::GLOBAL_WORKFLOW_METADATA`] directly. So
+/// [`order_rows_by_quota_lock_id`]'s ordering invariant is unit-testable with
+/// a local map -- no database, and no process-global state at all (issue
+/// #1230 Finding 2 review). See
+/// [`order_due_rows_for_deadlock_free_firing`]'s doc comment for the full
+/// history.
+#[cfg(feature = "db")]
+fn resolve_row_quota_lock_key(
+    row: &FireDueRow,
+    quota_by_workflow: &std::collections::HashMap<String, crate::quota::QuotaPolicy>,
+) -> Option<(String, String)> {
+    let policy = *quota_by_workflow.get(&row.workflow_name)?;
+    if !policy.has_any_cap() {
+        return None;
+    }
+    let key = crate::quota::resolve_quota_key(policy.key_expr, &row.last_input)?;
+    Some((row.workflow_name.clone(), key))
+}
+
+/// Snapshot every declared quota policy out of
+/// [`crate::completion_trigger::GLOBAL_WORKFLOW_METADATA`] in one read, for
+/// [`order_due_rows_for_deadlock_free_firing`] to resolve an entire batch
+/// against. One read per batch, not one per row.
+#[cfg(feature = "db")]
+fn snapshot_quota_policies() -> std::collections::HashMap<String, crate::quota::QuotaPolicy> {
+    crate::completion_trigger::GLOBAL_WORKFLOW_METADATA
+        .read()
+        .ok()
+        .and_then(|lock| {
+            lock.as_ref().map(|map| {
+                map.iter()
+                    .filter_map(|(name, meta)| meta.quota.map(|q| (name.clone(), q)))
+                    .collect()
+            })
+        })
+        .unwrap_or_default()
+}
+
+/// Order a claimed due-row batch so any two transactions that reach this
+/// function visit shared quota keys in the same order. This revises issue
+/// #1230 Finding 2 after review -- see below.
+///
+/// Two concurrent scanner transactions can claim disjoint row batches --
+/// two replicas of this scanner, or this scanner racing `throttle`'s.
+/// `SKIP LOCKED` guarantees the batches do not overlap. But both can
+/// still need the same set of quota locks, in opposite claim order. Batch
+/// A fires row `p` (key1) then row `q` (key2). Batch B fires row `r`
+/// (key2) then row `s` (key1). A holds key1 waiting for key2; B holds
+/// key2 waiting for key1: an ABBA wait-for cycle. Postgres aborts one
+/// transaction with a raw `deadlock_detected` error. That error is not
+/// [`crate::error::HarvestError::QuotaExceeded`], so no arm in this
+/// scanner's fire path catches it. It propagates out through
+/// `enforce_timeouts_once` and aborts every OTHER duty in that tick, not
+/// just the one row that collided.
+///
+/// Sorting each batch by its rows' resolved quota key fixes this. Every
+/// transaction now visits key1 before key2. So no two transactions can
+/// ever hold a key the other waits for. This function only REORDERS the
+/// batch -- it does not lock anything itself. Each row still locks its
+/// own execution row first, then its own quota key. That is the SAME
+/// order a direct (non-batched) start uses. This fire loop behaved the
+/// same way before this fix.
+///
+/// The sort is stable and compares ONLY the resolved key (review, P2).
+/// Two rows with the same key -- or with no key at all -- keep their
+/// original relative order. That order is the claim query's
+/// `effective_fire_at ASC` (see `fire_due_on_conn`'s claim SQL): oldest
+/// due row first.
+///
+/// An earlier version of this fix broke ties on `workflow_id` instead.
+/// That scrambled the claim order whenever two claimed rows shared a
+/// quota key, or carried no quota policy at all. A fresh `workflow_id`
+/// does not correlate with due order. Comparing only the key avoids
+/// that. Same-key rows are equal under this comparator. So the stable
+/// sort leaves them exactly where the claim query put them.
+///
+/// That ordering detail is not incidental. An earlier version of this fix
+/// pre-acquired every batch's quota locks BEFORE firing any row (code
+/// review, issue #1230 Finding 2 follow-up, P1). That inverted the lock
+/// order for every row fired afterward. A direct start for the same
+/// `workflow_id` locks its execution row first, then waits on
+/// `enforce_quota_admission` for the quota lock. The scanner -- now
+/// holding that quota lock up front -- blocks on the direct start's
+/// uncommitted execution row instead. That is the same ABBA hazard, one
+/// level down. Sorting instead of pre-locking keeps every row's own
+/// execution-row-then-quota-key order intact. So it cannot invert against
+/// a direct start's order.
+///
+/// This narrows, but does not close, one related hazard (review,
+/// revised). Once this transaction holds any row's key, every LATER
+/// row's execution is exposed. A concurrent direct start under
+/// `TerminateIfRunning` can touch that later row's execution. That
+/// direct start resolves its OWN quota key from its OWN, possibly
+/// newer, input -- not from the later row's stale, persisted input.
+///
+/// If that freshly-resolved key matches a key this transaction already
+/// holds, a cycle is possible. This transaction waits on the execution
+/// row the direct start holds. The direct start waits on the key this
+/// transaction already holds.
+///
+/// This hazard does not depend on row order. Whichever row processes
+/// first holds nothing while it waits, so it cannot cycle. Every later
+/// row can. No reordering of a multi-row batch closes this. Only ever
+/// holding at most one execution's locks at a time would close it
+/// fully. That conflicts with enforcing one cap across a whole batch in
+/// one transaction.
+///
+/// Holding a quota lock across multiple rows in one batch is inherent
+/// to batch-wide enforcement, and it predates Finding 2. This change
+/// does not introduce the hazard. It only changes which specific row
+/// and key pairings are exposed on a given tick.
+///
+/// This function is a thin wrapper. It snapshots the declared quota
+/// policies once, then delegates the actual sort to
+/// [`order_rows_by_quota_lock_id`]. An earlier revision instead had
+/// [`resolve_row_quota_lock_key`] read
+/// [`crate::completion_trigger::GLOBAL_WORKFLOW_METADATA`] directly. Tests
+/// guarded that read with a mutex shared with `throttle`'s identical
+/// tests (review). That mutex only serialized the two test modules
+/// against EACH OTHER. `HandlerRegistry::with_state_and_telemetry`
+/// (`worker.rs`) also writes that same global, unconditionally, on every
+/// call. Dozens of unrelated `worker.rs` unit tests construct a registry.
+/// None of them took the shared mutex (review). Splitting the map out as
+/// an explicit argument removes the shared global from the tested code
+/// path entirely. So there is nothing left to race.
+#[cfg(feature = "db")]
+async fn order_due_rows_for_deadlock_free_firing(
+    conn: &mut diesel_async::AsyncPgConnection,
+    due_rows: Vec<FireDueRow>,
+) -> crate::error::HarvestResult<Vec<FireDueRow>> {
+    let quota_by_workflow = snapshot_quota_policies();
+    let lock_id_of = resolve_quota_lock_ids(conn, &due_rows, &quota_by_workflow).await?;
+    Ok(order_rows_by_quota_lock_id(
+        due_rows,
+        &quota_by_workflow,
+        &lock_id_of,
+    ))
+}
+
+/// Resolve every row's ACTUAL advisory-lock id -- the literal `hashtext`
+/// value [`crate::quota::lock_quota_key`] will lock on -- keyed by its
+/// `(workflow_name, quota_key)` pair. One round trip for the whole batch
+/// (`hashtext(unnest($1::text[]))`), not one per row.
+///
+/// This cannot be done purely in Rust without reimplementing `hashtext`'s
+/// internal algorithm, which Postgres documents as an implementation
+/// detail, not a stable contract. Asking Postgres for the real value is
+/// the only way to guarantee a match. The match needed is between
+/// [`order_rows_by_quota_lock_id`]'s sort and the lock
+/// [`crate::quota::lock_quota_key`] will actually take (Codex review,
+/// issue #1230 Finding 2 follow-up).
+#[cfg(feature = "db")]
+async fn resolve_quota_lock_ids(
+    conn: &mut diesel_async::AsyncPgConnection,
+    due_rows: &[FireDueRow],
+    quota_by_workflow: &std::collections::HashMap<String, crate::quota::QuotaPolicy>,
+) -> crate::error::HarvestResult<std::collections::HashMap<(String, String), i32>> {
+    // Defined before any statements to satisfy clippy::items_after_statements.
+    #[derive(diesel::QueryableByName)]
+    struct HashRow {
+        #[diesel(sql_type = diesel::sql_types::Text)]
+        namespace: String,
+        #[diesel(sql_type = diesel::sql_types::Integer)]
+        lock_id: i32,
+    }
+
+    use diesel_async::RunQueryDsl;
+
+    let distinct_keys: std::collections::BTreeSet<(String, String)> = due_rows
+        .iter()
+        .filter_map(|row| resolve_row_quota_lock_key(row, quota_by_workflow))
+        .collect();
+    if distinct_keys.is_empty() {
+        return Ok(std::collections::HashMap::new());
+    }
+
+    let namespaces: Vec<String> = distinct_keys
+        .iter()
+        .map(|(workflow_name, quota_key)| {
+            crate::quota::quota_lock_namespace(workflow_name, quota_key)
+        })
+        .collect();
+
+    let hash_of_namespace: std::collections::HashMap<String, i32> = diesel::sql_query(
+        "SELECT n AS namespace, hashtext(n) AS lock_id FROM unnest($1::text[]) AS n",
+    )
+    .bind::<diesel::sql_types::Array<diesel::sql_types::Text>, _>(&namespaces)
+    .load::<HashRow>(conn)
+    .await
+    .map_err(crate::error::database_error)?
+    .into_iter()
+    .map(|r| (r.namespace, r.lock_id))
+    .collect();
+
+    Ok(distinct_keys
+        .into_iter()
+        .filter_map(|(workflow_name, quota_key)| {
+            let namespace = crate::quota::quota_lock_namespace(&workflow_name, &quota_key);
+            let lock_id = *hash_of_namespace.get(&namespace)?;
+            Some(((workflow_name, quota_key), lock_id))
+        })
+        .collect())
+}
+
+/// Pure half of [`order_due_rows_for_deadlock_free_firing`]. Sorts
+/// `due_rows` by each row's ALREADY-RESOLVED advisory-lock id (from
+/// [`resolve_quota_lock_ids`]), not by the pre-image `(workflow_name,
+/// quota_key)` pair. The ordering invariant is therefore unit-testable
+/// with a plain local map, no database (issue #1230 Finding 2 review).
+/// It is also correct, unlike sorting the pre-image strings.
+/// `hashtext` is only 32 bits wide, so two DISTINCT keys CAN collide
+/// onto the same id (Codex review). Sorting the strings does not
+/// preserve the hashed order across such a pair. That can reopen
+/// exactly the ABBA cycle this ordering exists to close. Sorting the
+/// id itself cannot have that failure mode. A colliding pair simply
+/// compares equal, like same-key rows already do.
+#[cfg(feature = "db")]
+fn order_rows_by_quota_lock_id(
+    due_rows: Vec<FireDueRow>,
+    quota_by_workflow: &std::collections::HashMap<String, crate::quota::QuotaPolicy>,
+    lock_id_of: &std::collections::HashMap<(String, String), i32>,
+) -> Vec<FireDueRow> {
+    let mut decorated: Vec<(Option<i32>, FireDueRow)> = due_rows
+        .into_iter()
+        .map(|row| {
+            let id = resolve_row_quota_lock_key(&row, quota_by_workflow)
+                .and_then(|key| lock_id_of.get(&key).copied());
+            (id, row)
+        })
+        .collect();
+    decorated.sort_by_key(|(id, _)| *id);
+    decorated.into_iter().map(|(_, row)| row).collect()
+}
+
 /// Scan and fire due debounce rows on a single shard connection. Returns the
 /// fired records (`workflow_name`, `queue_name`, deferred trigger-starts, deferred checks) for the
 /// caller to spawn + record metrics after all shards are processed.
@@ -607,6 +845,8 @@ async fn fire_due_on_conn(
                 .load(conn)
                 .await
                 .map_err(crate::error::database_error)?;
+
+            let due_rows = order_due_rows_for_deadlock_free_firing(conn, due_rows).await?;
 
             let mut results = Vec::with_capacity(due_rows.len());
             for row in due_rows {
@@ -1343,4 +1583,215 @@ mod tests {
     }
 
     const QUOTA_REDEFER_BACKOFF_FOR_TEST: chrono::Duration = chrono::Duration::seconds(5);
+
+    // ── order_due_rows_for_deadlock_free_firing (issue #1230 Finding 2) ──────
+
+    #[cfg(feature = "db")]
+    mod quota_row_ordering {
+        use super::*;
+        use crate::quota::QuotaPolicy;
+        use std::collections::HashMap;
+
+        fn row(workflow_name: &str, tenant: &str) -> FireDueRow {
+            FireDueRow {
+                id: uuid::Uuid::new_v4(),
+                workflow_name: workflow_name.to_string(),
+                debounce_key: "irrelevant".to_string(),
+                workflow_id: uuid::Uuid::new_v4().to_string(),
+                queue_name: "default".to_string(),
+                last_input: serde_json::json!({ "tenant_id": tenant }),
+                start_options: serde_json::json!({}),
+                shard_id: 0,
+                max_fire_at: Utc::now(),
+            }
+        }
+
+        #[test]
+        fn sorts_rows_by_quota_lock_id_the_same_regardless_of_claim_order() {
+            // The exact invariant that closes the ABBA hazard. Two claimed
+            // batches need the SAME two keys, presented in OPPOSITE claim
+            // order. They must still fire those keys in the SAME order.
+            let quota = HashMap::from([(
+                "wf_a".to_string(),
+                QuotaPolicy::new("tenant_id").with_max_active_executions(100),
+            )]);
+            let lock_id_of = HashMap::from([
+                (("wf_a".to_string(), "tenant-1".to_string()), 1),
+                (("wf_a".to_string(), "tenant-2".to_string()), 2),
+            ]);
+
+            let forward = order_rows_by_quota_lock_id(
+                vec![row("wf_a", "tenant-1"), row("wf_a", "tenant-2")],
+                &quota,
+                &lock_id_of,
+            );
+            let reverse = order_rows_by_quota_lock_id(
+                vec![row("wf_a", "tenant-2"), row("wf_a", "tenant-1")],
+                &quota,
+                &lock_id_of,
+            );
+
+            let forward_keys: Vec<_> = forward
+                .iter()
+                .map(|r| resolve_row_quota_lock_key(r, &quota))
+                .collect();
+            let reverse_keys: Vec<_> = reverse
+                .iter()
+                .map(|r| resolve_row_quota_lock_key(r, &quota))
+                .collect();
+
+            assert_eq!(forward_keys, reverse_keys);
+            assert_eq!(
+                forward_keys,
+                vec![
+                    Some(("wf_a".to_string(), "tenant-1".to_string())),
+                    Some(("wf_a".to_string(), "tenant-2".to_string())),
+                ]
+            );
+        }
+
+        #[test]
+        fn rows_whose_keys_collide_on_the_same_advisory_lock_id_still_sort_consistently() {
+            // Codex review, issue #1230 Finding 2 follow-up: `hashtext` is
+            // only 32 bits wide. Two DISTINCT quota keys CAN map to the
+            // SAME advisory lock id. Sorting the raw `(workflow_name,
+            // quota_key)` strings does not preserve that shared identity.
+            // Two batches needing a colliding pair plus a third,
+            // non-colliding key could visit the colliding pair in
+            // different relative positions. That reopens the ABBA cycle
+            // this ordering exists to close. Sorting by the resolved lock
+            // id itself cannot have that failure: two colliding keys
+            // simply compare equal, exactly like same-key rows already do.
+            let quota = HashMap::from([(
+                "wf_a".to_string(),
+                QuotaPolicy::new("tenant_id").with_max_active_executions(100),
+            )]);
+            // tenant-a and tenant-b are DISTINCT keys that happen to
+            // collide onto the same lock id (5); tenant-c does not.
+            let lock_id_of = HashMap::from([
+                (("wf_a".to_string(), "tenant-a".to_string()), 5),
+                (("wf_a".to_string(), "tenant-b".to_string()), 5),
+                (("wf_a".to_string(), "tenant-c".to_string()), 10),
+            ]);
+
+            let batch_1 = order_rows_by_quota_lock_id(
+                vec![row("wf_a", "tenant-c"), row("wf_a", "tenant-a")],
+                &quota,
+                &lock_id_of,
+            );
+            let batch_2 = order_rows_by_quota_lock_id(
+                vec![row("wf_a", "tenant-b"), row("wf_a", "tenant-c")],
+                &quota,
+                &lock_id_of,
+            );
+
+            let tenant_of =
+                |r: &FireDueRow| r.last_input["tenant_id"].as_str().unwrap().to_string();
+            assert_eq!(
+                batch_1.iter().map(tenant_of).collect::<Vec<_>>(),
+                vec!["tenant-a".to_string(), "tenant-c".to_string()],
+                "the id-5 row must precede the id-10 row"
+            );
+            assert_eq!(
+                batch_2.iter().map(tenant_of).collect::<Vec<_>>(),
+                vec!["tenant-b".to_string(), "tenant-c".to_string()],
+                "the OTHER id-5 row must precede the id-10 row too"
+            );
+        }
+
+        #[test]
+        fn keeps_every_row_when_multiple_rows_share_one_quota_key() {
+            // Unlike the pre-lock-everything design this replaced, ordering
+            // never merges or drops rows. A shared key still fires once per
+            // row. Re-entrant advisory locking within the one transaction
+            // serializes those fires.
+            let quota = HashMap::from([(
+                "wf_a".to_string(),
+                QuotaPolicy::new("tenant_id").with_max_active_executions(100),
+            )]);
+            let lock_id_of = HashMap::from([(("wf_a".to_string(), "tenant-1".to_string()), 1)]);
+            let rows = vec![
+                row("wf_a", "tenant-1"),
+                row("wf_a", "tenant-1"),
+                row("wf_a", "tenant-1"),
+            ];
+            assert_eq!(
+                order_rows_by_quota_lock_id(rows, &quota, &lock_id_of).len(),
+                3
+            );
+        }
+
+        #[test]
+        fn preserves_claim_order_for_rows_sharing_one_quota_key() {
+            // Review, P2: an earlier version broke ties on `workflow_id`,
+            // which scrambled the claim query's `effective_fire_at ASC`
+            // order for same-key rows. `workflow_id` is a fresh random
+            // UUID per row, uncorrelated with claim order, so this
+            // regresses without a fix. The sort must be stable and compare
+            // ONLY the resolved lock id, leaving same-key rows exactly
+            // where the claim query put them.
+            let quota = HashMap::from([(
+                "wf_a".to_string(),
+                QuotaPolicy::new("tenant_id").with_max_active_executions(100),
+            )]);
+            let lock_id_of = HashMap::from([(("wf_a".to_string(), "tenant-1".to_string()), 1)]);
+            let claimed = vec![
+                row("wf_a", "tenant-1"),
+                row("wf_a", "tenant-1"),
+                row("wf_a", "tenant-1"),
+            ];
+            let claim_order: Vec<_> = claimed.iter().map(|r| r.workflow_id.clone()).collect();
+
+            let fired = order_rows_by_quota_lock_id(claimed, &quota, &lock_id_of);
+            let fired_order: Vec<_> = fired.iter().map(|r| r.workflow_id.clone()).collect();
+
+            assert_eq!(fired_order, claim_order);
+        }
+
+        #[test]
+        fn preserves_claim_order_when_rows_have_no_quota_key() {
+            // Same regression as above (review, P2), but for the more
+            // common case: workflows with no quota policy at all. Every
+            // row resolves to `None`, so they all compare equal -- the
+            // stable sort must still leave them in claim order.
+            let claimed = vec![
+                row("wf_no_policy", "tenant-1"),
+                row("wf_no_policy", "tenant-2"),
+                row("wf_no_policy", "tenant-3"),
+            ];
+            let claim_order: Vec<_> = claimed.iter().map(|r| r.workflow_id.clone()).collect();
+
+            let fired = order_rows_by_quota_lock_id(claimed, &HashMap::new(), &HashMap::new());
+            let fired_order: Vec<_> = fired.iter().map(|r| r.workflow_id.clone()).collect();
+
+            assert_eq!(fired_order, claim_order);
+        }
+
+        #[test]
+        fn a_workflow_with_no_declared_quota_policy_resolves_to_no_lock_key() {
+            let r = row("wf_no_policy", "tenant-1");
+            assert_eq!(resolve_row_quota_lock_key(&r, &HashMap::new()), None);
+        }
+
+        #[test]
+        fn a_policy_with_no_caps_declared_resolves_to_no_lock_key() {
+            let quota = HashMap::from([("wf_a".to_string(), QuotaPolicy::new("tenant_id"))]);
+            let r = row("wf_a", "tenant-1");
+            assert_eq!(
+                resolve_row_quota_lock_key(&r, &quota),
+                None,
+                "has_any_cap() == false must never be locked -- it is never enforced"
+            );
+        }
+
+        #[test]
+        fn a_row_whose_key_expression_does_not_resolve_has_no_lock_key() {
+            let quota = HashMap::from([(
+                "wf_a".to_string(),
+                QuotaPolicy::new("no_such_field").with_max_active_executions(100),
+            )]);
+            let r = row("wf_a", "tenant-1");
+            assert_eq!(resolve_row_quota_lock_key(&r, &quota), None);
+        }
+    }
 }

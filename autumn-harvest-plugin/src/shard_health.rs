@@ -428,8 +428,8 @@ fn check_no_live_worker_gate(
                     .is_none_or(|owner| owner == w.worker.worker_id)
                 && compat.is_eligible(&w.worker.build_id, demand.required_build_id.as_deref())
                 && reqs.as_ref().is_none_or(|reqs| {
-                    let labels: std::collections::HashMap<String, String> =
-                        serde_json::from_value(w.worker.labels.clone()).unwrap_or_default();
+                    let labels =
+                        autumn_harvest::payload_codec::string_valued_labels(&w.worker.labels);
                     autumn_harvest::eligibility::matches_requirements(reqs, &labels)
                 })
         });

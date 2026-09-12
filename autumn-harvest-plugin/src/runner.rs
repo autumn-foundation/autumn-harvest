@@ -858,6 +858,7 @@ pub struct HarvestRunner {
     scheduler: Option<SchedulerRuntime>,
     retention: Option<RetentionRuntime>,
     batch: Option<BatchRuntime>,
+    codec_refresh: Option<CodecRefreshRuntime>,
     /// True when this runner installed the process-global dispatch channel.
     ///
     /// The slot is process wide and outlives one runner, so `stop` must give it
@@ -906,6 +907,96 @@ impl BatchRuntime {
         self.cancel.cancel();
         if let Err(error) = self.handle.await {
             tracing::warn!(error = %error, "harvest batch executor task failed during shutdown");
+        }
+    }
+}
+
+/// Independent codec-key refresh loop for a process that owns no local
+/// worker (issue #1244).
+///
+/// `refresh_active_codec_key` is normally reached through the worker's own
+/// timeout-checker loop. A worker-enabled process needs no second copy of
+/// it here (`HarvestRunner::start` only spawns this when `!worker_enabled`).
+///
+/// An API-only or scheduler-only process spawns no timeout checker at all,
+/// though it can still read and write codec-bearing payloads. `api.rs`'s
+/// `force_fail_activity` handler is one such path. Left unrefreshed, that
+/// process's `PayloadCodecs` would stay pinned to whichever key was active
+/// at startup, forever.
+///
+/// This closes that half of the gap: the process's own view of the active
+/// key catches up on a bounded cadence, same as a worker's.
+///
+/// It does **not** close the other half. `codec_rotation::activate_codec_key`'s
+/// capability scan reads `harvest_workers`. A process with no local worker
+/// never has a row there, so it stays invisible to that scan. An operator
+/// whose API/scheduler-only processes must gate activation on their own
+/// capability needs a separate mechanism; none exists yet.
+struct CodecRefreshRuntime {
+    cancel: CancellationToken,
+    handle: JoinHandle<()>,
+}
+
+impl CodecRefreshRuntime {
+    fn spawn(
+        sharded_pool: ShardedDbPool,
+        payload_codecs: autumn_harvest::payload_codec::PayloadCodecs,
+        interval: std::time::Duration,
+    ) -> Self {
+        let cancel = CancellationToken::new();
+        let cancel_for_task = cancel.clone();
+        let handle = tokio::spawn(async move {
+            'outer: loop {
+                for (shard, pool) in sharded_pool.iter_shards() {
+                    // Selected against `cancel`, mirroring
+                    // `spawn_worker_heartbeat` (issue #1209). Harvest
+                    // configures no deadpool `Timeouts`, so a bare
+                    // `pool.get()` can park this task indefinitely on an
+                    // exhausted shard pool or a database outage. Without
+                    // this, `shutdown` cancels the token and then awaits
+                    // this task's handle, so a parked acquisition would
+                    // make an API- or scheduler-only `HarvestRunner::stop`
+                    // hang forever.
+                    let get_result = tokio::select! {
+                        () = cancel_for_task.cancelled() => break 'outer,
+                        result = pool.get() => result,
+                    };
+                    match get_result {
+                        Ok(mut conn) => {
+                            if let Err(error) =
+                                autumn_harvest::codec_rotation::refresh_active_codec_key(
+                                    &mut conn,
+                                    &payload_codecs,
+                                )
+                                .await
+                            {
+                                tracing::warn!(
+                                    %error,
+                                    shard_id = shard.as_i32(),
+                                    "codec key refresh failed on a worker-less runtime"
+                                );
+                            }
+                        }
+                        Err(error) => tracing::warn!(
+                            %error,
+                            shard_id = shard.as_i32(),
+                            "codec key refresh: failed to acquire a connection"
+                        ),
+                    }
+                }
+                tokio::select! {
+                    () = cancel_for_task.cancelled() => return,
+                    () = tokio::time::sleep(interval) => {}
+                }
+            }
+        });
+        Self { cancel, handle }
+    }
+
+    async fn shutdown(self) {
+        self.cancel.cancel();
+        if let Err(error) = self.handle.await {
+            tracing::warn!(error = %error, "harvest codec refresh task failed during shutdown");
         }
     }
 }
@@ -1106,6 +1197,18 @@ impl HarvestRunner {
         } else {
             None
         };
+        // Issue #1244: a worker-enabled process already refreshes its
+        // active codec key through its own timeout-checker loop. Only a
+        // process with no local worker needs this independent one.
+        let codec_refresh = if config.worker_enabled {
+            None
+        } else {
+            Some(CodecRefreshRuntime::spawn(
+                prepared.storage_pool.sharded_pool().clone(),
+                registry.payload_codecs().clone(),
+                prepared.worker_runtime_config.poll_interval,
+            ))
+        };
         let api_runtime = HarvestApiRuntime::new(
             registry,
             dag_catalog,
@@ -1131,6 +1234,7 @@ impl HarvestRunner {
             scheduler,
             retention,
             batch,
+            codec_refresh,
             dispatch_installed,
         })
     }
@@ -1161,6 +1265,7 @@ impl HarvestRunner {
             scheduler,
             retention,
             batch,
+            codec_refresh,
             dispatch_installed,
         } = self;
 
@@ -1185,6 +1290,9 @@ impl HarvestRunner {
         }
         if let Some(batch) = batch {
             batch.shutdown().await;
+        }
+        if let Some(codec_refresh) = codec_refresh {
+            codec_refresh.shutdown().await;
         }
         if let Some(worker_handle) = worker_handle
             && let Err(error) = worker_handle.await
@@ -2230,6 +2338,7 @@ mod tests {
             scheduler: None,
             retention: None,
             batch: None,
+            codec_refresh: None,
             dispatch_installed: installed,
         }
     }

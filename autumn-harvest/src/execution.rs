@@ -349,19 +349,59 @@ pub struct CancelledWorkflowExecution {
 }
 
 impl CancelledWorkflowExecution {
+    /// Idempotent no-op result for cancel and terminate alike, shared by
+    /// both call sites (issue #1456).
+    ///
+    /// `execution.error` wins when present. Otherwise the reason names the
+    /// row's own state, not a fixed cancel-specific string. A terminate
+    /// against a COMPLETED run does not claim a cancellation that never
+    /// happened. Cancel only reaches this on a CANCELLED row, so its derived
+    /// reason is unchanged: "workflow already cancelled".
     fn idempotent(exec_id: ExecutionId, execution: WorkflowExecution) -> Self {
+        let reason = match execution.error {
+            Some(error) => error,
+            None => Self::default_idempotent_reason(&execution.state),
+        };
         Self {
             exec_id,
             state: execution.state.clone(),
-            reason: execution
-                .error
-                .unwrap_or_else(|| "workflow already cancelled".to_string()),
+            reason,
             newly_cancelled: false,
             failed_task_count: 0,
             workflow_name: execution.workflow_name,
             queue_name: execution.queue_name,
             prior_state: execution.state,
         }
+    }
+
+    /// Default reason for a terminal row with no stored `error`.
+    ///
+    /// Named after the row's actual state per [`crate::erase::TERMINAL_STATES`],
+    /// not a single fixed phrase. An unrecognised state still names itself.
+    ///
+    /// MIGRATED deliberately gets no specific phrase here. It is terminal
+    /// only in the narrow sense that nothing more happens on THIS shard
+    /// (issue #964). The run stays alive on another shard, not done.
+    /// Cancel and signal both refuse to call it plainly terminal, for the
+    /// same reason (`execution.rs`'s own cancel arm, `signal.rs`). The
+    /// generic fallback below states only what is true here: this row is
+    /// sealed. It does not imply the run itself has ended.
+    fn default_idempotent_reason(state: &str) -> String {
+        let phrase = match state {
+            "COMPLETED" => "completed",
+            "FAILED" => "failed",
+            "CANCELLED" => "cancelled",
+            "TIMED_OUT" => "timed out",
+            "CONTINUED_AS_NEW" => "continued as new",
+            "TERMINATED" => "terminated",
+            other => {
+                return format!(
+                    "workflow already in terminal state {}",
+                    other.to_lowercase()
+                );
+            }
+        };
+        format!("workflow already {phrase}")
     }
 
     fn newly_cancelled(
@@ -382,6 +422,84 @@ impl CancelledWorkflowExecution {
             workflow_name,
             queue_name,
             prior_state,
+        }
+    }
+}
+
+#[cfg(test)]
+mod idempotent_reason_tests {
+    use super::CancelledWorkflowExecution;
+
+    /// Every named state maps to its exact reason (issue #1456). A loose
+    /// `contains` check would still pass a reason that also says
+    /// "cancelled" alongside the right word, so this pins the full string.
+    #[test]
+    fn named_states_map_to_exact_reasons() {
+        let cases = [
+            ("COMPLETED", "workflow already completed"),
+            ("FAILED", "workflow already failed"),
+            ("CANCELLED", "workflow already cancelled"),
+            ("TIMED_OUT", "workflow already timed out"),
+            ("CONTINUED_AS_NEW", "workflow already continued as new"),
+            ("TERMINATED", "workflow already terminated"),
+        ];
+        for (state, expected) in cases {
+            assert_eq!(
+                CancelledWorkflowExecution::default_idempotent_reason(state),
+                expected
+            );
+        }
+    }
+
+    /// No state but CANCELLED itself may claim a cancellation that never
+    /// happened — the exact defect this issue reported for COMPLETED.
+    #[test]
+    fn only_cancelled_names_cancellation() {
+        for state in crate::erase::TERMINAL_STATES {
+            let reason = CancelledWorkflowExecution::default_idempotent_reason(state);
+            if *state == "CANCELLED" {
+                assert_eq!(reason, "workflow already cancelled");
+            } else {
+                assert!(
+                    !reason.contains("cancelled"),
+                    "reason for {state} must not claim cancellation, got: {reason}"
+                );
+            }
+        }
+    }
+
+    /// MIGRATED gets the generic fallback, not a specific claim (issue
+    /// #1456 review). The run is alive on another shard, not done, so
+    /// the reason must not read as a completed termination.
+    #[test]
+    fn migrated_uses_the_generic_fallback() {
+        assert_eq!(
+            CancelledWorkflowExecution::default_idempotent_reason("MIGRATED"),
+            "workflow already in terminal state migrated"
+        );
+    }
+
+    /// A state outside `TERMINAL_STATES` still names itself instead of
+    /// panicking or silently defaulting to cancel's text.
+    #[test]
+    fn unrecognised_state_names_itself() {
+        assert_eq!(
+            CancelledWorkflowExecution::default_idempotent_reason("SOME_FUTURE_STATE"),
+            "workflow already in terminal state some_future_state"
+        );
+    }
+
+    /// Every terminal state in `TERMINAL_STATES` gets a reason naming it,
+    /// so a state added there without a matching arm here is caught.
+    #[test]
+    fn every_terminal_state_names_itself() {
+        for state in crate::erase::TERMINAL_STATES {
+            let reason = CancelledWorkflowExecution::default_idempotent_reason(state);
+            let lowercase_state = state.to_lowercase().replace('_', " ");
+            assert!(
+                reason.contains(&lowercase_state),
+                "reason for {state} must name it, got: {reason}"
+            );
         }
     }
 }
@@ -583,6 +701,12 @@ pub(crate) async fn enforce_quota_admission(
 /// [`GateMode`](crate::admission_gate::GateMode) selects the cache read (fail-closed
 /// `Check` for fresh admissions, snapshot-only `CheckCached` for continuation).
 ///
+/// The quota key (declared [`crate::quota::QuotaPolicy`] key expression) is
+/// always resolved against `request.input`. See
+/// [`start_or_load_workflow_execution_collect_with_codecs_and_quota_override`]
+/// for the crate-private variant [`crate::event_batch`] uses to override
+/// that (Codex review, issue #1230 Finding 1 follow-up).
+///
 /// # Errors
 ///
 /// - [`HarvestError::AlreadyExists`] when `RejectDuplicate` rejects.
@@ -625,7 +749,6 @@ pub async fn start_or_load_workflow_execution_collect(
 /// # Errors
 ///
 /// Same as [`start_or_load_workflow_execution_collect`].
-#[allow(clippy::too_many_lines, clippy::too_many_arguments)]
 pub async fn start_or_load_workflow_execution_collect_with_codecs(
     conn: &mut AsyncPgConnection,
     request: StartWorkflowParams<'_>,
@@ -633,6 +756,57 @@ pub async fn start_or_load_workflow_execution_collect_with_codecs(
     reject_fresh_if_debounced: bool,
     metrics: Option<&(dyn crate::telemetry::MetricsRecorder + Send + Sync)>,
     gate: Option<crate::admission_gate::GateMode>,
+    codecs: &crate::payload_codec::PayloadCodecs,
+) -> HarvestResult<(
+    StartedWorkflowExecution,
+    Vec<DeferredTriggerStart>,
+    Vec<(ExecutionId, String)>,
+    Vec<StartCancelledRun>,
+)> {
+    start_or_load_workflow_execution_collect_with_codecs_and_quota_override(
+        conn,
+        request,
+        in_outer_transaction,
+        reject_fresh_if_debounced,
+        metrics,
+        gate,
+        None,
+        codecs,
+    )
+    .await
+}
+
+/// [`start_or_load_workflow_execution_collect_with_codecs`], with an extra
+/// `quota_key_input_override` parameter. Crate-private: exposing this on
+/// the public API would let an external embedder pass an arbitrary value,
+/// e.g. `Some(&json!({}))`. That could make quota key resolution silently
+/// return `None` for a request whose real `input` resolves one. Every
+/// declared cap on that request would then go unenforced (Codex review,
+/// issue #1230 Finding 1 follow-up). Only [`crate::event_batch`] calls
+/// this directly; every other caller goes through the public,
+/// override-free wrapper above.
+///
+/// `quota_key_input_override`, when `Some`, is resolved against instead of
+/// `request.input` for the declared [`crate::quota::QuotaPolicy`]'s key
+/// expression (issue #1230 Finding 1). A batched fire's `request.input` is
+/// the whole merged array of every admitted payload. That is not the
+/// single admission a quota key expression is meant to resolve against.
+/// `event_batch.rs` passes the first buffered payload here instead. Every
+/// other caller passes `None`, so `request.input` resolves the key exactly
+/// as before this parameter existed.
+///
+/// # Errors
+///
+/// Same as [`start_or_load_workflow_execution_collect`].
+#[allow(clippy::too_many_lines, clippy::too_many_arguments)]
+pub(crate) async fn start_or_load_workflow_execution_collect_with_codecs_and_quota_override(
+    conn: &mut AsyncPgConnection,
+    request: StartWorkflowParams<'_>,
+    in_outer_transaction: bool,
+    reject_fresh_if_debounced: bool,
+    metrics: Option<&(dyn crate::telemetry::MetricsRecorder + Send + Sync)>,
+    gate: Option<crate::admission_gate::GateMode>,
+    quota_key_input_override: Option<&serde_json::Value>,
     codecs: &crate::payload_codec::PayloadCodecs,
 ) -> HarvestResult<(
     StartedWorkflowExecution,
@@ -729,8 +903,31 @@ pub async fn start_or_load_workflow_execution_collect_with_codecs(
                     .and_then(|map| map.get(request.workflow_name))
                     .and_then(|meta| meta.quota)
             });
-    let quota_key: Option<String> =
-        quota_policy.and_then(|p| crate::quota::resolve_quota_key(p.key_expr, &request.input));
+    // Resolve against `quota_key_input_override` when the caller supplies
+    // one, not `request.input` (issue #1230 Finding 1). `event_batch.rs`
+    // merges every buffered admission's payload into one JSON array before
+    // calling this function. So `request.input` is that merged array, not
+    // an object, for a batched-start fire. `resolve_quota_key` requires an
+    // object at the first path segment. It returned `None` for that array.
+    // That silently skipped all three quota dimensions for EVERY batched
+    // execution. `event_batch.rs` now passes the FIRST buffered payload
+    // (a plain object) as the override, restoring enforcement. See
+    // `event_batch.rs`'s call sites for the first-admission-wins rationale.
+    //
+    // This is an explicit override, not a peek into `request.input`
+    // itself. A direct (non-batched) start's `input` is caller-controlled
+    // application data. Nothing in this crate requires it to be an
+    // object. Peeking into a top-level array there would silently change
+    // quota resolution for any embedder whose workflow legitimately takes
+    // an array as its input. This fix must not do that. Only
+    // `event_batch.rs`'s own known-shape aggregate is ever unwrapped this
+    // way.
+    let quota_key: Option<String> = quota_policy.and_then(|p| {
+        crate::quota::resolve_quota_key(
+            p.key_expr,
+            quota_key_input_override.unwrap_or(&request.input),
+        )
+    });
     // A resolved key is stamped onto the row for EVERY admission that has
     // one -- including a retry-exempt admission below, which still tags its
     // row for future usage accounting -- so this bound must be checked

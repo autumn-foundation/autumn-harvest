@@ -104,6 +104,8 @@ const STABLE_PROMETHEUS_METRICS: &[&str] = &[
     "harvest_replication_lag_bytes",
     "harvest_replication_standbys",
     "harvest_replication_observable",
+    // Issue #1249 — readable-but-unmeasurable RPO signal.
+    "harvest_replication_rpo_known",
     "harvest_shard_generation",
     "harvest_shard_fenced_total",
 ];

@@ -88,6 +88,34 @@
 //! takes effect. See [`crate::quota_reconcile`]'s module doc for the full
 //! design (why periodic rather than startup-once, and why that residual
 //! window is not a new risk class).
+//!
+//! # Known limitation — batched-start key attribution (issue #1230)
+//!
+//! A batched execution charges its quota to whichever admission arrived
+//! first for the shared `batch(key = ...)` (see
+//! `crate::event_batch`'s own doc for the mechanism). Two consequences
+//! follow directly from that rule, not from a defect in it:
+//!
+//! - A caller who admits into a batch without a resolvable quota-key
+//!   field pays no quota charge for that admission. A direct start has
+//!   the same gap. Fail-open on an unresolvable key is this crate's
+//!   existing, uniform contract — see `unresolvable_key_fails_open` in
+//!   `quota_enforcement_tests.rs`. Batching does not change that
+//!   contract. It does not add a NEW way to evade it.
+//! - When a `batch(key = ...)` is shared across more than one tenant,
+//!   the resolved quota key belongs to the FIRST admission. That need
+//!   not be the admission whose payload happened to fill the batch and
+//!   trigger the fire. A caller who triggers a synchronous flush
+//!   (`admit_batched_start`'s in-request path) can therefore observe
+//!   another admission's resolved key. That key appears in the
+//!   [`HarvestError::QuotaExceeded`](crate::error::HarvestError::QuotaExceeded)
+//!   `key` field of a `429` response. Issue #946 AC4 already returns
+//!   that same wire shape for every other quota rejection. Batching
+//!   only changes whose key a caller might see, not the shape or
+//!   existence of the field. Sharing one `batch_key` across tenants is
+//!   an unusual workflow design choice. The common case, collapsing one
+//!   tenant's own burst into one run, never exposes another tenant's
+//!   key, because there is no other tenant in the batch.
 
 #[cfg(feature = "db")]
 use diesel::sql_types::{BigInt, Nullable, Text};
@@ -646,6 +674,16 @@ pub async fn list_quota_usage(conn: &mut AsyncPgConnection) -> HarvestResult<Vec
 // Advisory lock — serializes check-then-admit for one key (issue #946)
 // ---------------------------------------------------------------------------
 
+/// The exact advisory-lock namespace string [`lock_quota_key`] hashes. A
+/// single source of truth. A scanner's pre-fire lock-ordering pass
+/// (`debounce`/`throttle`'s `order_due_rows_for_deadlock_free_firing`) can
+/// then resolve the SAME string this function locks on. It never uses an
+/// independently-formatted copy that could silently drift from it.
+#[cfg(feature = "db")]
+pub(crate) fn quota_lock_namespace(workflow_name: &str, quota_key: &str) -> String {
+    format!("quota:{workflow_name}:{quota_key}")
+}
+
 /// Serialize a quota check-then-admit sequence for one key behind a
 /// transaction-scoped advisory lock.
 ///
@@ -673,7 +711,7 @@ pub async fn lock_quota_key(
     workflow_name: &str,
     quota_key: &str,
 ) -> HarvestResult<()> {
-    let namespaced = format!("quota:{workflow_name}:{quota_key}");
+    let namespaced = quota_lock_namespace(workflow_name, quota_key);
     diesel::sql_query("SELECT pg_advisory_xact_lock(hashtext($1)::bigint)")
         .bind::<Text, _>(namespaced)
         .execute(conn)
