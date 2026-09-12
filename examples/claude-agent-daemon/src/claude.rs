@@ -303,7 +303,7 @@ fn call_api(
     if !has_addressable_calls(&reply) {
         return Err(body_failure(
             status,
-            "its tool calls carried a blank, repeated, or unsafe id",
+            "its tool calls carried a blank, repeated, unsafe, or undecidable id",
         ));
     }
     // A turn cannot both end and ask for a tool. The pair is malformed, and it
@@ -698,6 +698,33 @@ fn is_replayable_block(block: &Value) -> bool {
     }
 }
 
+/// Bytes of a decision frame that the tool-use id does not occupy.
+///
+/// The frame is the `approve` request on one line. It carries the request
+/// type, the execution id, and the `tool_approval` prefix with its turn and
+/// position. It also carries the decision, the note field and the newline.
+/// The measured frame of a full-length id is 129 bytes more than the id.
+///
+/// The allowance is generous, so a wider turn number or a short note still
+/// fits. `a_decision_for_the_longest_id_fits_its_frame` measures the real
+/// frame and proves the allowance is enough.
+const DECISION_FRAME_ALLOWANCE: usize = 512;
+
+/// The longest tool-use id a reply may carry.
+///
+/// The id becomes part of the approval token, and a decision crosses the
+/// control socket as ONE line under [`crate::daemon::MAX_REQUEST_BYTES`]. An
+/// id too long for that line is a call nobody can approve AND nobody can
+/// deny. The session then parks until its deadline, and the operator has no
+/// way to answer it.
+///
+/// The durable cap does not catch this. A reply costs about twice its ids,
+/// and the request cap is about half the recorded cap. A band of ids
+/// therefore records and cannot be decided. Measured: an id of 1048456 bytes
+/// records in 2097137 bytes, under the cap, and needs a 1048585-byte
+/// decision.
+pub const MAX_CALL_ID_BYTES: usize = crate::daemon::MAX_REQUEST_BYTES - DECISION_FRAME_ALLOWANCE;
+
 /// Can every tool call in this reply be addressed on its own?
 ///
 /// The approval gate names a call by its tool-use id, so each id must be
@@ -708,12 +735,18 @@ fn is_replayable_block(block: &Value) -> bool {
 /// and the status view prints that token unquoted in an `agentd approve`
 /// command line. An operator copies that line into a shell, so the id must
 /// mean to the shell exactly what it means here. See [`is_shell_safe`].
+///
+/// The id must also FIT a decision. It is carried back over the control
+/// socket inside one request, and that request is refused past its cap. See
+/// [`MAX_CALL_ID_BYTES`].
 pub fn has_addressable_calls(reply: &TurnReply) -> bool {
     let mut seen = std::collections::HashSet::with_capacity(reply.tool_calls.len());
-    reply
-        .tool_calls
-        .iter()
-        .all(|call| !call.id.is_empty() && is_shell_safe(&call.id) && seen.insert(call.id.as_str()))
+    reply.tool_calls.iter().all(|call| {
+        !call.id.is_empty()
+            && call.id.len() <= MAX_CALL_ID_BYTES
+            && is_shell_safe(&call.id)
+            && seen.insert(call.id.as_str())
+    })
 }
 
 /// Does this tool-use id mean the same thing to a shell?

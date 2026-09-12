@@ -8438,3 +8438,93 @@ async fn a_live_parked_session_still_shows_its_awaited_call() {
     );
     assert_eq!(found.token, signal, "beside its own token");
 }
+
+/// One reply carrying a tool call with this id.
+fn reply_with_call_id(id: &str) -> TurnReply {
+    TurnReply {
+        content: json!([{ "type": "tool_use", "id": id, "name": "write_file",
+                          "input": { "path": "notes.md", "content": "x" } }]),
+        stop_reason: "tool_use".to_string(),
+        text: String::new(),
+        tool_calls: vec![ToolCall {
+            id: id.to_string(),
+            name: "write_file".to_string(),
+            input: json!({ "path": "notes.md", "content": "x" }),
+        }],
+    }
+}
+
+/// The decision an operator sends for one approval token, as a wire line.
+fn decision_frame(token: &str) -> String {
+    let mut line = serde_json::to_string(&Request::Approve {
+        execution_id: "ffffffff-1111-2222-3333-444444444444".to_string(),
+        token: token.to_string(),
+        approved: true,
+        note: None,
+    })
+    .expect("the request encodes");
+    line.push('\n');
+    line
+}
+
+/// A tool-use id too long to decide is refused when the reply arrives.
+///
+/// The id becomes part of the approval token, and a decision crosses the
+/// control socket as one line under the request cap. The reply itself is
+/// RECORDABLE, so the durable cap never sees this. A reply costs about twice
+/// its ids, and the request cap is about half the recorded cap.
+///
+/// Measured before the fix, at an id of 1048456 bytes. The reply records in
+/// 2097137 bytes, under the 2097152-byte cap. Its decision needs 1048585
+/// bytes against a 1048576-byte cap. The call could then be neither approved
+/// nor denied, and the session parked until its deadline.
+#[test]
+fn an_id_too_long_to_decide_is_refused() {
+    let cap = daemon::MAX_REQUEST_BYTES;
+
+    // The hazard, stated first. This reply is recordable, so nothing else
+    // refuses it, and its decision does not fit.
+    let undecidable = "a".repeat(1_048_456);
+    let reply = reply_with_call_id(&undecidable);
+    assert!(
+        claude::activity_refusal_for_oversized_reply(&reply).is_none(),
+        "the durable cap must NOT catch this, or the test proves nothing"
+    );
+    let frame = decision_frame(&session::approval_signal(2, 0, &undecidable));
+    assert!(
+        frame.len() > cap,
+        "the decision must not fit the control frame: {} against {cap}",
+        frame.len()
+    );
+
+    // So the reply is refused where a call is checked for being addressable.
+    assert!(
+        !claude::has_addressable_calls(&reply),
+        "a call nobody can approve or deny is not addressable"
+    );
+
+    // The boundary. An id AT the cap is accepted, and its decision fits with
+    // room to spare, which is what proves the allowance is not a guess.
+    let longest = "a".repeat(claude::MAX_CALL_ID_BYTES);
+    assert!(
+        claude::has_addressable_calls(&reply_with_call_id(&longest)),
+        "the longest allowed id must still be addressable"
+    );
+    let widest = decision_frame(&session::approval_signal(u32::MAX, usize::MAX, &longest));
+    assert!(
+        widest.len() <= cap,
+        "the widest decision for the longest id must fit: {} against {cap}",
+        widest.len()
+    );
+    assert!(
+        cap - widest.len() >= 64,
+        "and leave room for a short note: {} spare",
+        cap - widest.len()
+    );
+
+    // An ordinary id is untouched by any of this.
+    assert!(
+        claude::has_addressable_calls(&reply_with_call_id("toolu_01A2b3C4d5E6f7")),
+        "a real tool-use id must still be addressable"
+    );
+}

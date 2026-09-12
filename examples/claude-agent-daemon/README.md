@@ -365,6 +365,11 @@ Honest limits, so nothing here reads as a promise:
   one that continued. A request that passed the cap is refused, never
   truncated. Trailing whitespace makes a truncated line parse. A prefix could
   otherwise start a session, or release an approval nobody sent in full.
+
+  A tool-use id is bounded by the same cap, because the approval token carries
+  it back through this frame. The recorded cap is about twice the request cap,
+  so a reply could otherwise record an id whose decision would not fit, and
+  the call could be neither approved nor denied.
 - **Polling, not push.** `SQLite` has no `LISTEN`/`NOTIFY`, so progress comes
   from the `--tick-ms` poll. The poll reads no database at all: the daemon is
   the only writer, so it holds the live sessions in memory, seeded once at
