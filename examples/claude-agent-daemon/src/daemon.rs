@@ -1043,25 +1043,33 @@ fn summary_view(
     blocked: &Parked,
     full: bool,
 ) -> SessionView {
-    // A report is shown only when the three fields its line ASSERTS are
-    // readable. The projection reports an unreadable count as nothing, and a
-    // zero in its place would present a damaged report as a genuine result:
-    // `[end_turn after 0 turns, 0 tool calls]`.
+    // A report is shown only when ALL FOUR fields `SessionReport` declares
+    // are readable. The projection reports an unreadable count as nothing,
+    // and a zero in its place would present a damaged report as a genuine
+    // result: `[end_turn after 0 turns, 0 tool calls]`.
     //
     // A row with none of them readable says nothing, which is what the single
     // status does with a report it cannot deserialise. A row with some of
     // them is named as unreadable. The line cannot be built, and a silence
     // would read as "no report yet".
     //
-    // The ANSWER is shown as whatever could be read. An empty answer is a
-    // real outcome: a session can end with the model writing no text.
-    let answer = match (row.stop.as_deref(), row.turns, row.tool_calls) {
-        (Some(stop), Some(turns), Some(calls)) => Some(format!(
+    // The ANSWER is one of the four. An empty answer is a real outcome: a
+    // session can end with the model writing no text. The projection reports
+    // that as an empty string, and not as nothing. So a report with NO
+    // readable answer is named unreadable, rather than shown as that
+    // outcome. `status` refuses the same document, and the two must agree.
+    let answer = match (
+        row.stop.as_deref(),
+        row.turns,
+        row.tool_calls,
+        row.answer.as_deref(),
+    ) {
+        (Some(stop), Some(turns), Some(calls), Some(text)) => Some(format!(
             "[{} after {turns} turns, {calls} tool calls] {}",
             shortened(stop),
-            row.answer.as_deref().map(shortened).unwrap_or_default()
+            shortened(text)
         )),
-        (None, None, None) => None,
+        (None, None, None, None) => None,
         _ => Some("<unreadable report>".to_string()),
     };
     let state = row

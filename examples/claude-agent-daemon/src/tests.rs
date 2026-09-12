@@ -3910,6 +3910,92 @@ fn a_listing_marks_a_field_it_cut() {
     );
 }
 
+/// An unreadable answer is not an empty one, and the listing says which.
+///
+/// An empty answer is a REAL outcome: a session can end with the model
+/// writing no text, and `status` reads that report. An answer that is
+/// absent, not a string, or not valid Unicode is a report `status` refuses.
+///
+/// The projection reported all four as nothing, and the renderer turned that
+/// nothing into an empty answer. So four documents the daemon reads four
+/// different ways printed one identical line.
+///
+/// `SQLite` is why this needed a query change rather than a Rust one.
+/// `substr` answers NULL over a zero-length value, so an empty field arrived
+/// as the same nothing as an absent one. The cut is wrapped in
+/// `coalesce(..., zeroblob(0))`, so a readable empty field is zero BYTES.
+#[test]
+fn an_unreadable_answer_is_not_shown_as_an_empty_one() {
+    let dir = tempfile::tempdir().expect("a temporary directory");
+    let db = dir.path().join("answers.db");
+    let writer = rusqlite::Connection::open(&db).expect("the database opens");
+    fixture_table(&writer);
+    let counts = r#""stop":"end_turn","turns":2,"tool_calls":1"#;
+    let cases = [
+        ("absent", format!("{{{counts}}}")),
+        ("number", format!(r#"{{{counts},"answer":7}}"#)),
+        ("surrogate", format!(r#"{{{counts},"answer":"\ud800"}}"#)),
+        ("empty", format!(r#"{{{counts},"answer":""}}"#)),
+        ("whole", format!(r#"{{{counts},"answer":"done"}}"#)),
+    ];
+    for (exec, document) in &cases {
+        writer
+            .execute(
+                "INSERT INTO harvest_executions VALUES (?1, ?2, 'COMPLETED', ?3, ?4, NULL)",
+                rusqlite::params![exec, WORKFLOW_NAME, READABLE_TASK, document],
+            )
+            .expect("the row is recorded");
+    }
+    drop(writer);
+
+    let reader = inspect::open(&db).expect("the reader opens");
+    let listed = inspect::executions(&reader, WORKFLOW_NAME, None).expect("the listing answers");
+    let (views, _, _) = daemon::sessions(&reader, &daemon::Parked::new(), false, None)
+        .expect("the listing renders");
+
+    for (exec, document) in &cases {
+        let readable = serde_json::from_str::<session::SessionReport>(document).is_ok();
+        let projected = listed_row(&listed, exec).answer.clone();
+        let shown = views
+            .iter()
+            .find(|view| view.execution_id == *exec)
+            .expect("the session is listed")
+            .answer
+            .clone();
+
+        // The property: the listing and the single status agree about whether
+        // this report reads at all. Anything else is the two views
+        // disagreeing about the same document.
+        assert_eq!(
+            projected.is_some(),
+            readable,
+            "{exec}: the projection must agree with what `status` reads"
+        );
+        assert_eq!(
+            shown.as_deref() == Some("<unreadable report>"),
+            !readable,
+            "{exec}: the rendering must agree too, and showed {shown:?}"
+        );
+    }
+
+    // An EMPTY answer keeps its own reading, and is not merely "readable".
+    // This is the case the fix had to preserve rather than sweep up.
+    assert_eq!(
+        listed_row(&listed, "empty").answer.as_deref(),
+        Some(""),
+        "an answer of no text reads as an empty answer"
+    );
+    let quiet = views
+        .iter()
+        .find(|view| view.execution_id == "empty")
+        .expect("the session is listed");
+    assert_eq!(
+        quiet.answer.as_deref(),
+        Some("[end_turn after 2 turns, 1 tool calls] "),
+        "and it is still shown as a genuine report"
+    );
+}
+
 /// One listed session, by id.
 fn listed_row<'a>(
     listed: &'a [inspect::SessionSummary],

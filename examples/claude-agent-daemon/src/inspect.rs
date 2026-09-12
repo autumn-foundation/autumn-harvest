@@ -292,9 +292,11 @@ pub fn no_cursor(before: Option<i64>) -> i64 {
 pub const EVENTS_QUERY: &str = "SELECT seq, \
             CASE WHEN json_valid(event_json) \
                   AND json_type(event_json, '$.type') = 'text' \
-                 THEN substr(cast(json_extract(event_json, '$.type') as blob), 1, ?4) END, \
+                 THEN coalesce(substr(cast(json_extract(event_json, '$.type') as blob), \
+                                       1, ?4), zeroblob(0)) END, \
             CASE WHEN json_valid(event_json) \
-                 THEN substr(cast(json_extract(event_json, '$.data') as blob), 1, ?4) END \
+                 THEN coalesce(substr(cast(json_extract(event_json, '$.data') as blob), \
+                                       1, ?4), zeroblob(0)) END \
      FROM harvest_events \
      WHERE exec_id = ?1 AND seq < ?2 \
      ORDER BY seq DESC LIMIT ?3";
@@ -357,9 +359,12 @@ pub fn event_lines(
             |row| {
                 Ok(EventLine {
                     seq: row.get(0)?,
-                    label: cut_text(row.get(1)?, detail_cap)
+                    // A type is a NAME, and an empty one names nothing. It
+                    // is reported like a type that cannot be read.
+                    label: cut_text(row.get(1)?, detail_cap, MAX_EVENT_DETAIL_BYTES)
+                        .filter(|label| !label.is_empty())
                         .unwrap_or_else(|| "unknown".to_string()),
-                    detail: cut_text(row.get(2)?, detail_cap),
+                    detail: cut_text(row.get(2)?, detail_cap, MAX_EVENT_DETAIL_BYTES),
                 })
             },
         )
@@ -630,39 +635,51 @@ fn races_signal(timer_id: &str, signal: &str) -> bool {
 /// The characters are cut here, because the database was asked for a budget
 /// of bytes. See [`MAX_LISTED_BYTES`] and [`MAX_EVENT_DETAIL_BYTES`].
 ///
-/// A field that decodes to NOTHING is reported as no field. A JSON string of
-/// one unpaired surrogate is text to `SQLite` and not text to Rust, so its
-/// valid prefix is empty. Calling that an empty stop reason would have the
-/// row claim something it never held.
-fn cut_text(bytes: Option<Vec<u8>>, chars: u32) -> Option<String> {
+/// `None` means the field CANNOT BE READ, and it never means empty. An empty
+/// answer is a real outcome: a session can end with the model writing no
+/// text. A read that answered `None` for both would make a report with no
+/// answer look like that outcome. `status` refuses such a report.
+///
+/// A readable field that is EMPTY arrives as zero bytes rather than as
+/// nothing. `substr` answers NULL over a zero-length value, so every query
+/// here wraps the cut in `coalesce(..., zeroblob(0))`. Without it `SQLite`
+/// collapses an empty field into the same answer as an absent one, and no
+/// test in Rust could tell them apart.
+///
+/// `budget` is the byte budget the query was given. It separates the two
+/// reasons the bytes can end inside a character: the database CUT them there,
+/// or nobody ever wrote a whole one.
+fn cut_text(bytes: Option<Vec<u8>>, chars: u32, budget: u32) -> Option<String> {
     let bytes = bytes?;
     let whole = match std::str::from_utf8(&bytes) {
         Ok(text) => text,
-        // `error_len` answers NOTHING only when the bytes end inside a
+        // `error_len` answers NOTHING only when the bytes END inside a
         // character. That is the cut the database was asked to make, so the
         // valid prefix is the field. Any other error is a sequence nobody
         // wrote, and a prefix of it would name a value the field never held.
         // A stop reason of `"end_turn\ud800"` decodes to a valid `end_turn`,
         // and the listing would show a session that ended well.
-        Err(split) if split.error_len().is_none() => {
+        //
+        // The budget is what says a cut happened. Bytes SHORTER than it were
+        // returned whole, so an unfinished character in them is damage.
+        Err(split) if split.error_len().is_none() && bytes.len() >= budget as usize => {
             std::str::from_utf8(&bytes[..split.valid_up_to()]).unwrap_or_default()
         }
         Err(_) => return None,
     };
-    let cut: String = whole.chars().take(chars as usize).collect();
-    (!cut.is_empty()).then_some(cut)
+    Some(whole.chars().take(chars as usize).collect())
 }
 
 /// One page of the sessions a listing names, newest first. See [`no_cursor`].
 pub const SESSIONS_QUERY: &str = "SELECT exec_id, state, \
                     CASE WHEN typeof(input_json) = 'text' AND json_valid(input_json) \
                           AND json_type(input_json, '$.goal') = 'text' \
-                         THEN substr(cast(json_extract(input_json, '$.goal') as blob), \
-                                     1, ?3) END, \
+                         THEN coalesce(substr(cast(json_extract(input_json, '$.goal') \
+                                                   as blob), 1, ?3), zeroblob(0)) END, \
                     CASE WHEN typeof(output_json) = 'text' AND json_valid(output_json) \
                           AND json_type(output_json, '$.stop') = 'text' \
-                         THEN substr(cast(json_extract(output_json, '$.stop') as blob), \
-                                     1, ?3) END, \
+                         THEN coalesce(substr(cast(json_extract(output_json, '$.stop') \
+                                                   as blob), 1, ?3), zeroblob(0)) END, \
                     CASE WHEN typeof(output_json) = 'text' AND json_valid(output_json) \
                           AND json_type(output_json, '$.turns') = 'integer' \
                           AND typeof(json_extract(output_json, '$.turns')) = 'integer' \
@@ -677,9 +694,11 @@ pub const SESSIONS_QUERY: &str = "SELECT exec_id, state, \
                          THEN json_extract(output_json, '$.tool_calls') END, \
                     CASE WHEN typeof(output_json) = 'text' AND json_valid(output_json) \
                           AND json_type(output_json, '$.answer') = 'text' \
-                         THEN substr(cast(json_extract(output_json, '$.answer') as blob), \
-                                     1, ?3) END, \
-                    substr(cast(error as blob), 1, ?3), \
+                         THEN coalesce(substr(cast(json_extract(output_json, '$.answer') \
+                                                   as blob), 1, ?3), zeroblob(0)) END, \
+                    CASE WHEN error IS NOT NULL \
+                         THEN coalesce(substr(cast(error as blob), 1, ?3), \
+                                       zeroblob(0)) END, \
                     rowid \
              FROM harvest_executions WHERE +workflow_name = ?1 \
              AND rowid < ?4 \
@@ -759,12 +778,12 @@ pub fn executions(
                 Ok(SessionSummary {
                     exec_id: row.get(0)?,
                     state: row.get(1)?,
-                    goal: cut_text(row.get(2)?, LISTED_READ_CHARS),
-                    stop: cut_text(row.get(3)?, LISTED_READ_CHARS),
+                    goal: cut_text(row.get(2)?, LISTED_READ_CHARS, MAX_LISTED_BYTES),
+                    stop: cut_text(row.get(3)?, LISTED_READ_CHARS, MAX_LISTED_BYTES),
                     turns: row.get(4)?,
                     tool_calls: row.get(5)?,
-                    answer: cut_text(row.get(6)?, LISTED_READ_CHARS),
-                    error: cut_text(row.get(7)?, LISTED_READ_CHARS),
+                    answer: cut_text(row.get(6)?, LISTED_READ_CHARS, MAX_LISTED_BYTES),
+                    error: cut_text(row.get(7)?, LISTED_READ_CHARS, MAX_LISTED_BYTES),
                     row: row.get(8)?,
                 })
             },
