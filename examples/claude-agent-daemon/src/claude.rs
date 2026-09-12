@@ -23,10 +23,6 @@ use crate::tools;
 const API_URL: &str = "https://api.anthropic.com/v1/messages";
 /// The API version header every request carries.
 const API_VERSION: &str = "2023-06-01";
-/// Server-side refusal fallbacks. A declined request is routed to a fallback
-/// model by category, so one refusal does not end the session. Remove this
-/// header and the `fallbacks` field together to turn the behaviour off.
-const FALLBACK_BETA: &str = "server-side-fallback-2026-07-01";
 /// The `stop_reason` of a turn that stopped to call a tool.
 pub const STOP_TOOL_USE: &str = "tool_use";
 
@@ -166,7 +162,6 @@ fn call_api(
                     .post(API_URL)
                     .header("x-api-key", api_key)
                     .header("anthropic-version", API_VERSION)
-                    .header("anthropic-beta", FALLBACK_BETA)
                     .json(&body)
                     .send() => Some(result),
                 () = stop.raised() => None,
@@ -266,6 +261,17 @@ fn call_api(
 }
 
 /// Build the request body.
+///
+/// There are deliberately NO server-side refusal fallbacks here. A fallback
+/// answers one turn on a DIFFERENT model, and this is a multi-turn loop. The
+/// next request would go back to the configured model, which switches the
+/// conversation's model without saying so. The assistant blocks are replayed
+/// verbatim, so thinking a fallback produced would also be sent to a model
+/// that did not produce it.
+///
+/// A refusal therefore ends the session under its own stop reason, where the
+/// operator can see it. It is not routed to a model the session is not
+/// recorded against.
 fn request_body(config: &ModelConfig, request: &TurnRequest) -> Value {
     json!({
         "model": config.model,
@@ -275,8 +281,6 @@ fn request_body(config: &ModelConfig, request: &TurnRequest) -> Value {
         "thinking": { "type": "adaptive" },
         "tools": tools::definitions(),
         "messages": request.messages,
-        // Paired with the `anthropic-beta` header above.
-        "fallbacks": "default",
     })
 }
 

@@ -1725,6 +1725,43 @@ async fn the_shutdown_flag_is_never_missed() {
 }
 
 #[test]
+fn a_written_file_never_keeps_set_id_bits() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = tempfile::tempdir().expect("a temporary directory");
+    let workspace = dir.path().to_path_buf();
+    let target = workspace.join("helper.sh");
+    std::fs::write(&target, "old").expect("the fixture is written");
+    // A `setuid` script the agent is then asked to rewrite.
+    std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o4755))
+        .expect("the fixture is made set-user-id");
+
+    let body = tools::activity_body(workspace.clone());
+    let raw = body(tool_request(
+        &workspace,
+        tools::TOOL_WRITE_FILE,
+        json!({ "path": "helper.sh", "content": "#!/bin/sh\necho mine\n" }),
+    ))
+    .expect("a tool failure is a result, not an activity error");
+    let outcome: ToolOutcome = serde_json::from_value(raw).expect("the outcome decodes");
+    assert!(
+        !outcome.is_error,
+        "the write must succeed: {}",
+        outcome.output
+    );
+
+    // The new inode belongs to the daemon and the model chose its bytes. A
+    // `setuid` file here would run as the daemon's user for anyone who could
+    // execute it, and the approval never showed the mode.
+    let mode = std::fs::metadata(&target)
+        .expect("the target exists")
+        .permissions()
+        .mode()
+        & 0o7777;
+    assert_eq!(mode, 0o0755, "the set-user-id bit must not survive a write");
+}
+
+#[test]
 fn a_write_keeps_the_mode_of_the_file_it_replaces() {
     use std::os::unix::fs::PermissionsExt;
 

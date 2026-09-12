@@ -19,7 +19,7 @@ is rebuilt from activity results on every replay, so it is a projection of
 history rather than daemon state.
 
 - `claude_turn` — one Messages API request (`claude-opus-5`, adaptive thinking,
-  server-side refusal fallbacks), `start_to_close = 15m`, exponential retry. A
+  no server-side fallbacks), `start_to_close = 15m`, exponential retry. A
   429 or a 5xx keeps the plain error string so the policy retries; a rejected
   request returns a typed non-retryable `ActivityFailure`, so bad bytes never
   burn the retry curve. The assistant content blocks are stored and replayed

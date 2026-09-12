@@ -50,6 +50,9 @@ const SCRATCH_CAP: usize = 255;
 /// the scratch name, which is what makes a leftover file identifiable.
 const SCRATCH_FLOOR: usize = 96;
 
+/// The `setuid` and `setgid` bits, which a written file never keeps.
+const SET_ID_BITS: u32 = 0o6000;
+
 /// The mode a file this toolbox CREATES is given.
 ///
 /// A file the agent brings into being starts private. An existing file keeps
@@ -385,18 +388,33 @@ fn write_file(workspace: &Path, relative: &str, content: &str) -> Result<String,
     // mode the result must have. An existing target keeps its own mode. The
     // operator approved a change of content. Making a private file
     // world-readable, or dropping a script's execute bits, is not that.
+    //
+    // The set-ID bits are the exception, and they are dropped. The new inode
+    // belongs to the daemon, and the model chose every byte in it. A `setuid`
+    // file here would run as the daemon's user for anyone who could execute
+    // it. The approval shows the path and the content, and never the mode, so
+    // an operator cannot see that they approved such a thing.
     let mode = std::fs::metadata(&path).map_or(NEW_FILE_MODE, |existing| {
-        existing.permissions().mode() & 0o7777
+        existing.permissions().mode() & 0o7777 & !SET_ID_BITS
     });
 
     let (temporary, file) = create_scratch(&path)?;
-    let outcome = write_through(file, &temporary, &path, content, mode, &flush);
-    if outcome.is_err() {
-        drop(std::fs::remove_file(&temporary));
+    match write_through(file, &temporary, &path, content, mode, &flush) {
+        Ok(()) => Ok(format!("wrote {} bytes to `{relative}`", content.len())),
+        Err(WriteFailure::BeforeRename(e)) => {
+            // Nothing replaced the target, so the scratch file is litter.
+            drop(std::fs::remove_file(&temporary));
+            Err(format!("cannot write `{relative}`: {e}"))
+        }
+        // The target IS replaced. Reporting that nothing was written would be
+        // false, and the model could undo work that landed. What failed is the
+        // durability of the change, not the change.
+        Err(WriteFailure::AfterRename(e)) => Err(format!(
+            "`{relative}` now holds the {} bytes, and the change is not flushed \
+             to the disk yet: {e}. A host crash could still lose it.",
+            content.len()
+        )),
     }
-    outcome.map_err(|e| format!("cannot write `{relative}`: {e}"))?;
-
-    Ok(format!("wrote {} bytes to `{relative}`", content.len()))
 }
 
 /// The directories a finished write must flush, deepest first.
@@ -531,22 +549,24 @@ fn write_through(
     content: &str,
     mode: u32,
     flush: &[PathBuf],
-) -> Result<(), std::io::Error> {
+) -> Result<(), WriteFailure> {
     use std::io::Write;
 
-    file.write_all(content.as_bytes())?;
+    file.write_all(content.as_bytes())
+        .map_err(WriteFailure::BeforeRename)?;
 
     // `chmod` on the open descriptor, NOT a creation mode. A mode passed to
     // `open` is filtered through the umask, so a `0660` target would come back
     // `0640` under the common one. This sets exactly what was captured.
-    file.set_permissions(std::fs::Permissions::from_mode(mode))?;
+    file.set_permissions(std::fs::Permissions::from_mode(mode))
+        .map_err(WriteFailure::BeforeRename)?;
 
     // Flush before the rename, so a crash cannot leave the target naming a file
     // whose content never reached the disk.
-    file.sync_all()?;
+    file.sync_all().map_err(WriteFailure::BeforeRename)?;
     drop(file);
 
-    std::fs::rename(temporary, target)?;
+    std::fs::rename(temporary, target).map_err(WriteFailure::BeforeRename)?;
 
     // The rename itself is durable only once the DIRECTORY entry is. Without
     // this, a host crash can restore the old target, or lose a new one. The
@@ -557,8 +577,23 @@ fn write_through(
     // file's own parent leaves `b` missing from `a` after a crash, and the
     // flushed file goes with it.
     for directory in flush {
-        std::fs::File::open(directory)?.sync_all()?;
+        std::fs::File::open(directory)
+            .and_then(|handle| handle.sync_all())
+            .map_err(WriteFailure::AfterRename)?;
     }
 
     Ok(())
+}
+
+/// Where a write stopped.
+///
+/// The two sides of the rename are not the same outcome. Before it, the target
+/// is untouched and the tool reports that nothing was written. After it, the
+/// target IS replaced, and a report of "nothing was written" would be false.
+/// The model could then undo work that had in fact landed.
+enum WriteFailure {
+    /// The target was not touched.
+    BeforeRename(std::io::Error),
+    /// The target was replaced, and the durability work did not finish.
+    AfterRename(std::io::Error),
 }

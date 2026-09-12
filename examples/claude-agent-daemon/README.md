@@ -55,12 +55,15 @@ cargo run -p claude-agent-daemon -- serve --workspace /path/to/your/project
 cargo run -p claude-agent-daemon -- submit "find the TODOs and write them to TODO.md"
 ```
 
-The request uses `claude-opus-5` with adaptive thinking, the three workspace
-tools below, and server-side refusal fallbacks (beta
-`server-side-fallback-2026-07-01`), so a declined request is routed by category
-instead of ending the session. To turn the fallbacks off, delete the
-`anthropic-beta` header and the `"fallbacks"` field in
-[`src/claude.rs`](src/claude.rs) together. Pick another model with `--model`.
+The request uses `claude-opus-5` with adaptive thinking and the three workspace
+tools below. Pick another model with `--model`.
+
+Server-side refusal fallbacks are deliberately **not** used. A fallback answers
+one turn on a different model, and this is a multi-turn loop: the next request
+would return to the configured model, which changes the conversation's model
+without saying so, and would send thinking blocks to a model that did not
+produce them. A refusal ends the session under its own stop reason instead,
+where the operator can see it.
 
 ## The restart proof
 
