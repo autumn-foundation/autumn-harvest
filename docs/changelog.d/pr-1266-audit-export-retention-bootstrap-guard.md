@@ -18,26 +18,37 @@ the retention process create it) both fail for the same reason: a shard's
 own database cannot know whether an exporter is coming, and the retention
 process does not know either.
 
-`purge_old_audit_records` gained a third parameter,
-`protect_unexported_audit: bool`, bound as its own SQL parameter — no schema
-change. It is gated on `NOT EXISTS(any cursor row for the shard)` rather than
-OR'd flatly into the existing `is_configured()` signal: an adversarial review
-round caught that the flatter version would make the flag override a retired
-cursor too, silently defeating `decommission_cursor` for as long as the flag
-stayed set — exactly the deployment shape this fix targets, since the flag is
-meant to be left on permanently. Scoped to "no cursor row yet", the flag does
-one job (the bootstrap window) and a retired cursor stays the unconditional
-override it has always been. Retiring export is still the explicit two-step
-it always was: the flag protects rows before a shard has any cursor row, it
-never blocks a decommission from taking effect once one exists.
+`purge_old_audit_records` gained a third parameter, `protect_unexported_audit:
+bool`, OR'd flatly with the existing `is_configured()` signal — no schema
+change. A first draft instead scoped the flag to `NOT EXISTS(any cursor row)`,
+so a retired cursor always overrode it; a Codex review (round 1 P1) caught
+that this reopened the exact bootstrap window for a shard being **re-enabled**
+after decommission, since its cursor stays retired until the worker's first
+new tick, and is indistinguishable from a shard meant to stay decommissioned.
+The flag now shares `is_configured`'s existing "both steps required" trade
+instead: decommissioning a shard does not resume purging there while either
+signal stays `true` on the sweeping process, an operational cost documented
+next to the pre-existing one for `is_configured`.
+
+The same review round found a second, independent defect in the per-row
+pending check: a row already stamped with an `export_seq` was treated as
+already acknowledged whenever no cursor row existed at all — exactly backward
+from `ensure_cursor_row`'s own handling of a cursor lost to a manual `DELETE`
+or a partial restore, which rebuilds it at `last_acked_seq = 0` so every
+stamped row is redelivered. The pending check now also treats "no cursor row
+for the shard" as pending, matching that rebuild.
 
 New tests:
 - `retention_protects_unexported_audit_when_configured_with_no_cursor_and_no_local_sink`
   reproduces the exact bootstrap window (no cursor row anywhere, no sink in
   the sweeping process) and asserts the flag alone keeps every row.
-- `retention_decommission_overrides_protect_unexported_audit`
-  pins the scoping fix: with the flag left `true`, decommissioning a shard
-  still resumes purging its unacknowledged rows.
+- `retention_decommission_alone_does_not_resume_purging_while_the_flag_is_true`
+  and `retention_protects_a_shard_being_re_enabled_after_decommission` pin the
+  round 1 P1 fix: the flag survives a retired cursor, and a shard coming back
+  from decommission stays protected until the worker ticks it again.
+- `retention_protects_a_stamped_row_when_its_cursor_row_is_gone` pins the
+  second round 1 P1 fix: a stamped row with no cursor row to check against
+  is never treated as acknowledged.
 - `retention_still_purges_acknowledged_rows_when_protect_unexported_audit_is_true`
   confirms the flag never blocks purging of rows the exporter already
   shipped, even while a live cursor exists.

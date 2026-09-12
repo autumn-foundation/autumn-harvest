@@ -333,7 +333,7 @@ pub struct RetentionConfig {
     /// Audit log retention in days, independent of workflow-history retention.
     /// Defaults to 90 days (3 months). Set to 0 to disable audit purging.
     pub audit_retention_days: i64,
-    /// Protect every unexported audit row before its shard has a cursor row
+    /// Protect every unexported audit row, regardless of local signals
     /// (issue #1266). Defaults to `false`.
     ///
     /// `purge_old_audit_records` already refuses to delete an unexported row
@@ -343,13 +343,15 @@ pub struct RetentionConfig {
     /// Both signals can be absent at once. This happens in a split
     /// web/worker deployment, before the worker's first successful tick on a
     /// shard. A fresh enablement has no tick yet. A newly added shard may
-    /// also have no tick yet, if the worker cannot reach it. In that window,
-    /// retention finds no sink and no cursor row.
+    /// also have no tick yet, if the worker cannot reach it. A shard being
+    /// re-enabled after decommission has no tick yet either. In every one of
+    /// these, retention finds no sink and no cursor row it can trust.
     ///
     /// Set this flag to `true` on every process in such a deployment. This
-    /// closes the window. It steps aside the moment a cursor row exists for
-    /// the shard, retired or not. Decommissioning a shard still resumes
-    /// purging even with the flag left on. See `docs/audit-export.md`.
+    /// closes the window. Like `is_configured`, it overrides a retired
+    /// cursor too. Decommissioning a shard does not resume purging there
+    /// while this flag stays `true`. Unset it as part of that step. See
+    /// `docs/audit-export.md`.
     pub protect_unexported_audit: bool,
     /// Schedule decisions retention in days.
     /// Defaults to 7 days. Set to 0 to disable schedule decision purging.

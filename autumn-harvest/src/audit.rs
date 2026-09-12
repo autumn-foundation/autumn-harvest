@@ -1560,21 +1560,27 @@ pub async fn list_audit(
 ///   exporter's first tick on a shard has created the cursor row at all
 ///   (freshly enabled, newly added to the fleet, or a shard whose pool has
 ///   been failing).
-/// - **`protect_unexported_audit` is `true`** (issue #1266) **and no cursor
-///   row exists yet for the shard**. The first two signals can both be
-///   absent at once. This happens in a split web/worker deployment, before
-///   the worker's first successful tick on a shard. The process running
-///   retention then has no sink and no cursor row to read. Neither signal
-///   can close that window: both need the worker to have reached the shard
-///   at least once. This third signal needs no such contact. An operator
-///   sets it the same way on every process. The guard then holds from the
-///   moment export is configured, not from the moment it first succeeds.
+/// - **`protect_unexported_audit` is `true`** (issue #1266). The first two
+///   signals can both be absent at once. This happens in a split web/worker
+///   deployment, before the worker's first successful tick on a shard. The
+///   process running retention then has no sink and no cursor row to read.
+///   Neither signal can close that window: both need the worker to have
+///   reached the shard at least once. This third signal needs no such
+///   contact. An operator sets it the same way on every process. The guard
+///   then holds from the moment export is configured, not from the moment it
+///   first succeeds.
 ///
-///   This signal steps aside the moment any cursor row exists, retired or
-///   not. A live cursor already protects the shard under the first signal
-///   above. A retired cursor is an explicit operator decision, and it must
-///   keep working even where this flag is left permanently `true` — see
-///   below.
+///   This includes a shard whose cursor is **retired**. A previously
+///   decommissioned shard being re-enabled has exactly this gap. The worker
+///   has not yet ticked it since. Its cursor is still retired. New rows
+///   would otherwise be unprotected until that tick lands.
+///
+///   An earlier draft scoped this flag to "no cursor row at all" (issue
+///   #1266). That reopened precisely this window. `is_configured` has the
+///   identical shape: it too overrides a retired
+///   cursor. Both signals therefore share one cost, spelled out below.
+///   Decommissioning a shard does not resume purging there while either
+///   stays `true`.
 ///
 /// Deliberately **not** time-based. An earlier revision expired the guard 24h
 /// after the exporter's last heartbeat, so a long worker outage lifted it; a
@@ -1594,12 +1600,27 @@ pub async fn list_audit(
 /// `last_error` on `GET /admin/audit-export` are how the condition is
 /// surfaced. See `docs/audit-export.md`.
 ///
-/// `protect_unexported_audit` does not remove that operator step. A cursor
-/// row still must be decommissioned before purging resumes for its shard.
-/// This holds even once the flag is unset, or was never needed.
+/// `protect_unexported_audit` shares the exact "both steps required" trade
+/// as `is_configured`. Decommissioning alone does not resume purging on a
+/// shard while the flag stays `true` on the sweeping process. The operator
+/// must also unset it there, exactly as they would stop the sink to fully
+/// retire a shard today.
 ///
 /// With export inactive by every signal the guard is skipped entirely and the
 /// delete is byte-identical to the pre-#953 statement.
+///
+/// The pending check treats a row as pending, and so protected, in three
+/// cases. Its `export_seq` may be unassigned. No cursor row may exist for
+/// the shard at all. Or a cursor row may exist and simply not have
+/// acknowledged it yet.
+///
+/// The middle case matters on its own (issue #1266). A stamped row can
+/// survive a cursor row's manual deletion. It can
+/// also survive a partial restore. [`crate::audit_export::ensure_cursor_row`]
+/// rebuilds such a cursor with `last_acked_seq = 0`, treating every
+/// already-stamped row as unacknowledged again. The pending check must
+/// agree, or a sweep landing first would delete rows `ensure_cursor_row`
+/// intended to redeliver.
 ///
 /// The pending-check subquery is uncorrelated by shard because a shard's
 /// database holds at most one cursor row (the exporter provisions only the
@@ -1617,20 +1638,20 @@ pub async fn purge_old_audit_records(
     use diesel_async::RunQueryDsl as _;
 
     let cutoff = chrono::Utc::now() - chrono::Duration::days(retention_days);
+    let export_may_be_live = protect_unexported_audit || crate::audit_export::is_configured();
 
     // Delete an aged row UNLESS export is live AND that row is still pending.
     //
-    // `protect_unexported_audit` (issue #1266) is bound separately from
-    // `is_configured()`. It is gated on `NOT EXISTS(any cursor row)`.
+    // `protect_unexported_audit` is OR'd flatly with `is_configured()`
+    // (issue #1266). Both override a retired cursor the same way, so
+    // decommissioning shares one cost across both signals: see the doc
+    // comment above.
     //
-    // Folding it into the same OR as `is_configured()` would break
-    // decommission. The flag would keep the shard's "export may be live"
-    // clause true forever. A retired cursor row would then never be enough
-    // to resume purging.
-    //
-    // Scoping it to "no cursor row yet" keeps the flag doing one job. It
-    // only covers the window before any cursor exists. A retired cursor
-    // stays the unconditional override it has always been.
+    // The pending check's middle disjunct is `NOT EXISTS(any cursor row)`.
+    // It fixes a second defect found alongside the first (issue #1266).
+    // Without it, a stamped row surviving a cursor's manual deletion
+    // looked already acknowledged. It was deletable, exactly backwards
+    // from what `ensure_cursor_row` intends when it rebuilds that row.
     diesel::sql_query(
         "DELETE FROM harvest_audit_log a \
          WHERE a.occurred_at < $1 \
@@ -1641,15 +1662,12 @@ pub async fn purge_old_audit_records(
                         SELECT 1 FROM harvest_audit_export_cursor \
                         WHERE retired_at IS NULL \
                    ) \
-                   OR ( \
-                     $3::BOOLEAN \
-                     AND NOT EXISTS ( \
-                          SELECT 1 FROM harvest_audit_export_cursor \
-                     ) \
-                   ) \
                  ) \
                  AND ( \
                    a.export_seq IS NULL \
+                   OR NOT EXISTS ( \
+                        SELECT 1 FROM harvest_audit_export_cursor \
+                   ) \
                    OR EXISTS ( \
                         SELECT 1 FROM harvest_audit_export_cursor c \
                         WHERE a.export_seq > c.last_acked_seq \
@@ -1658,8 +1676,7 @@ pub async fn purge_old_audit_records(
            )",
     )
     .bind::<diesel::sql_types::Timestamptz, _>(cutoff)
-    .bind::<diesel::sql_types::Bool, _>(crate::audit_export::is_configured())
-    .bind::<diesel::sql_types::Bool, _>(protect_unexported_audit)
+    .bind::<diesel::sql_types::Bool, _>(export_may_be_live)
     .execute(conn)
     .await
     .map_err(database_error)

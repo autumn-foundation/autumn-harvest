@@ -245,15 +245,16 @@ shard records:
 - **A sink is configured in the sweeping process.** Covers the window before the
   exporter's first tick on a shard has created the cursor row at all (freshly
   enabled, newly added to the fleet, or a shard whose pool has been failing).
-- **`RetentionConfig::protect_unexported_audit` is `true`, and no cursor row
-  exists yet for the shard.** Covers a gap the first two signals share (issue
-  #1266). In a split web/worker deployment, the process running retention may
-  have no sink and no cursor row at the same time. This happens before the
-  worker's first successful tick on a shard. Neither of the first two signals
-  can close that window alone. Both need the worker to have reached the shard
-  at least once. Set this flag the same way on every process in the
-  deployment. This closes the window from the moment export is configured,
-  not from the moment it first succeeds.
+- **`RetentionConfig::protect_unexported_audit` is `true`.** Covers a gap the
+  first two signals share (issue #1266). In a split web/worker deployment, the
+  process running retention may have no sink and no cursor row at the same
+  time. This happens before the worker's first successful tick on a shard —
+  a fresh enablement, a newly added shard, or a shard being re-enabled after
+  decommission all have this same gap. Neither of the first two signals can
+  close that window alone. Both need the worker to have reached the shard at
+  least once. Set this flag the same way on every process in the deployment.
+  This closes the window from the moment export is configured, not from the
+  moment it first succeeds.
 
   ```rust
   autumn_harvest::retention::RetentionConfig::default()
@@ -269,11 +270,11 @@ shard records:
   cannot work either: that process does not know whether an exporter is
   coming, which is exactly the information this flag supplies instead.
 
-  The signal steps aside the moment any cursor row exists for the shard,
-  retired or not. A live cursor already protects the shard under the first
-  signal above. A retired cursor is an explicit operator decision, and
-  decommissioning must keep working even where this flag stays `true`
-  forever — see "Retiring audit export on a shard" below.
+  Like `is_configured`, this flag overrides a retired cursor too — an
+  earlier draft scoped it to "no cursor row at all" instead, which reopened
+  the exact re-enablement window it exists to close (issue #1266). The two
+  signals therefore share one cost: see "Retiring audit export on a shard"
+  below.
 
   The remaining cost is operational, not architectural: an operator must
   remember to set the flag on every process, including ones added later.
@@ -310,6 +311,9 @@ reach the SIEM.
 Stopping the exporter alone does **not** restore purging — the guard keys on
 the cursor row, not on the sweeping process's sink configuration, which is what
 makes it safe across a split web/worker deployment. Both steps are required.
+Where `RetentionConfig::protect_unexported_audit` is also `true` on the
+sweeping process, it is a third thing to unset: purging does not resume for
+a decommissioned shard while any of the three signals still holds.
 
 Re-enabling export afterwards is safe: the next exporter tick un-retires the
 cursor and resumes from the preserved `last_assigned_seq`, so new records

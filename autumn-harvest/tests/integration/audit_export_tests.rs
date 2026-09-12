@@ -37,9 +37,14 @@
 //! - `retention_protects_unexported_audit_when_configured_with_no_cursor_and_no_local_sink`
 //!   — the split-deployment bootstrap window (issue #1266): no cursor row,
 //!   no local sink, closed only by `protect_unexported_audit`.
-//! - `retention_decommission_overrides_protect_unexported_audit` — the flag
-//!   must step aside for a retired cursor, or decommissioning would silently
-//!   stop working wherever the flag is left on.
+//! - `retention_decommission_alone_does_not_resume_purging_while_the_flag_is_true`
+//!   and `retention_protects_a_shard_being_re_enabled_after_decommission`.
+//!   The flag shares `is_configured`'s "both steps required" trade. It also
+//!   protects a shard coming back from decommission. That holds until the
+//!   worker's first new tick (issue #1266).
+//! - `retention_protects_a_stamped_row_when_its_cursor_row_is_gone` — a
+//!   stamped row with no cursor row to check must count as pending. This
+//!   matches `ensure_cursor_row`'s own rebuild semantics (issue #1266).
 //! - `retention_still_purges_acknowledged_rows_when_protect_unexported_audit_is_true`
 //!   — the flag widens only the liveness signal, never the per-row pending
 //!   check.
@@ -1822,12 +1827,16 @@ async fn retention_protects_unexported_audit_when_configured_with_no_cursor_and_
     assert_eq!(remaining, 5);
 }
 
-// The flag must never outrank an explicit decommission. It exists only for
-// the window before a shard has a cursor row at all. A retired cursor is a
-// real signal. It must still resume purging even if the flag stays `true`
-// forever. That is how a split deployment is meant to run it.
+// The flag shares `is_configured`'s exact "both steps required" trade
+// (issue #1266). An earlier draft let a retired
+// cursor override the flag, so decommissioning alone always resumed
+// purging. That reopened the re-enablement window below. A shard coming
+// back from decommission has a retired cursor until the worker's first new
+// tick. That state is indistinguishable from one meant to stay
+// decommissioned. The flag must protect through that window, so
+// decommissioning alone cannot be enough while the flag stays `true`.
 #[tokio::test]
-async fn retention_decommission_overrides_protect_unexported_audit() {
+async fn retention_decommission_alone_does_not_resume_purging_while_the_flag_is_true() {
     let _guard = TEST_SERIAL.lock().await;
     let _sink = install(Arc::new(RecordingSink::new(200)), 2);
     let (mut conn, _c) = make_conn().await;
@@ -1838,38 +1847,125 @@ async fn retention_decommission_overrides_protect_unexported_audit() {
     assert_eq!(cursor_acked(&mut conn, 0).await, 2);
     uninstall();
 
-    diesel::update(harvest_audit_log::table)
-        .set(harvest_audit_log::occurred_at.eq(chrono::Utc::now() - chrono::Duration::days(365)))
-        .execute(&mut conn)
-        .await
-        .expect("age rows");
-
-    // Before decommission, the flag is superfluous: the live cursor already
-    // protects the three unacknowledged rows.
-    let deleted = purge_old_audit_records(&mut conn, 90, true)
-        .await
-        .expect("purge runs");
-    assert_eq!(deleted, 2, "only the acknowledged records may go");
-
     assert!(
         autumn_harvest::audit_export::decommission_cursor(&mut conn, 0)
             .await
             .expect("decommission"),
         "the cursor row existed, so it must report as removed"
     );
+    diesel::update(harvest_audit_log::table)
+        .set(harvest_audit_log::occurred_at.eq(chrono::Utc::now() - chrono::Duration::days(365)))
+        .execute(&mut conn)
+        .await
+        .expect("age rows");
 
-    // After decommission, purging must resume for the remaining rows. This
-    // holds even though the flag is still `true`. A retired cursor is the
-    // operator's explicit word that nothing owes this shard records any
-    // more.
+    // The flag is still `true`, so the three unacknowledged rows stay
+    // protected even though the cursor is retired.
     let deleted = purge_old_audit_records(&mut conn, 90, true)
         .await
         .expect("purge runs");
     assert_eq!(
+        deleted, 2,
+        "decommissioning is not enough on its own; only unsetting the flag \
+         too resumes purging, exactly like stopping the sink for \
+         is_configured"
+    );
+
+    // Unsetting the flag (as an operator must, per docs/audit-export.md) is
+    // what finally resumes purging on this decommissioned shard.
+    let deleted = purge_old_audit_records(&mut conn, 90, false)
+        .await
+        .expect("purge runs");
+    assert_eq!(
         deleted, 3,
-        "protect_unexported_audit must step aside once the shard has an \
-         explicit retired cursor, or decommissioning would silently stop \
-         working for every deployment that leaves the flag on"
+        "with the flag also unset, retention resumes over the remaining \
+         aged rows"
+    );
+}
+
+// The re-enablement window a PR review's finding protects (issue #1266).
+// A shard coming back from decommission has a retired cursor until
+// the worker's first new tick. Before that tick, is_configured() may be
+// false in the sweeping process too. That is exactly the original
+// bootstrap window. It is just triggered by re-enabling rather than first
+// enabling.
+#[tokio::test]
+async fn retention_protects_a_shard_being_re_enabled_after_decommission() {
+    let _guard = TEST_SERIAL.lock().await;
+    let _sink = install(Arc::new(RecordingSink::new(200)), 2);
+    let (mut conn, _c) = make_conn().await;
+    insert_audit_rows(&mut conn, 2).await;
+    fire_due_audit_exports(&mut conn, &None, &[], &NoOpMetrics)
+        .await
+        .expect("tick");
+    assert!(
+        autumn_harvest::audit_export::decommission_cursor(&mut conn, 0)
+            .await
+            .expect("decommission")
+    );
+    uninstall();
+
+    // The operator re-enables export, but the worker has not ticked this
+    // shard since: the cursor is still retired. New audit activity keeps
+    // happening regardless.
+    insert_audit_rows(&mut conn, 3).await;
+    diesel::update(harvest_audit_log::table)
+        .set(harvest_audit_log::occurred_at.eq(chrono::Utc::now() - chrono::Duration::days(365)))
+        .execute(&mut conn)
+        .await
+        .expect("age rows");
+
+    let deleted = purge_old_audit_records(&mut conn, 90, true)
+        .await
+        .expect("purge runs");
+    assert_eq!(
+        deleted, 0,
+        "protect_unexported_audit must protect every unshipped row even \
+         while the shard's cursor is still retired from before, or \
+         re-enabling export would silently reopen the bootstrap window"
+    );
+}
+
+// Issue #1266. A stamped row must count as
+// pending when its shard has no cursor row at all. This holds even though
+// its `export_seq` is already assigned. `ensure_cursor_row` rebuilds a
+// missing cursor at `last_acked_seq = 0`. That treats every already-stamped
+// row as unacknowledged again. The pending check must agree.
+#[tokio::test]
+async fn retention_protects_a_stamped_row_when_its_cursor_row_is_gone() {
+    let _guard = TEST_SERIAL.lock().await;
+    let _sink = install(Arc::new(RecordingSink::new(200)), 100);
+    let (mut conn, _c) = make_conn().await;
+    insert_audit_rows(&mut conn, 3).await;
+    fire_due_audit_exports(&mut conn, &None, &[], &NoOpMetrics)
+        .await
+        .expect("tick");
+    assert_eq!(
+        export_seqs(&mut conn).await,
+        vec![Some(1), Some(2), Some(3)]
+    );
+    uninstall();
+
+    // Simulate the cursor row genuinely going missing (a manual DELETE, or
+    // a partial restore) while the stamped rows themselves survive.
+    diesel::delete(autumn_harvest::schema::harvest_audit_export_cursor::table)
+        .execute(&mut conn)
+        .await
+        .expect("delete cursor");
+    diesel::update(harvest_audit_log::table)
+        .set(harvest_audit_log::occurred_at.eq(chrono::Utc::now() - chrono::Duration::days(365)))
+        .execute(&mut conn)
+        .await
+        .expect("age rows");
+
+    let deleted = purge_old_audit_records(&mut conn, 90, true)
+        .await
+        .expect("purge runs");
+    assert_eq!(
+        deleted, 0,
+        "a stamped row with no cursor row to check against must be treated \
+         as pending, matching ensure_cursor_row's own last_acked_seq = 0 \
+         rebuild"
     );
 }
 
