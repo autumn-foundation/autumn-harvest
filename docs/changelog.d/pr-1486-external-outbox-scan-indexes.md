@@ -57,11 +57,11 @@ harness:
 
 | scenario | buffers (3 runs) |
 |:--|--:|
-| baseline (no index, legacy query) | 299,077 – 1,078,868 |
-| this change's outer index only, legacy query | 277,421 – 277,763 |
-| rewrite only, no indexes | 1,604,802 – 2,133,805 |
-| all four indexes, legacy query | 5,890 – 15,110 |
-| **all four indexes + rewrite (as shipped)** | **5,863 – 15,216** |
+| baseline (no index, legacy query) | ~299,000 – ~1,079,000 |
+| this change's outer index only, legacy query | ~277,400 – ~277,800 |
+| rewrite only, no indexes | ~1,605,000 – ~2,134,000 |
+| all four indexes, legacy query | ~5,900 – ~15,100 |
+| **all four indexes + rewrite (as shipped)** | **~5,800 – ~15,200** |
 
 Read these as orders of magnitude. A drain total is not reproducible to the
 digit in either direction: the pre-change form moves with where

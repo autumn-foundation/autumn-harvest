@@ -178,11 +178,11 @@ claim measured 6 to 8 buffers in every run of every fixture on this page.
 
 | scenario | buffers (3 runs) |
 |:--|--:|
-| baseline -- no index, legacy query | 299,077 -- 1,078,868 |
-| this change's outer index only, legacy query | 277,421 -- 277,763 |
-| **rewrite only**, no indexes | 1,604,802 -- 2,133,805 |
-| all four indexes, legacy query | 5,890 -- 15,110 |
-| **all four indexes + rewrite (as shipped)** | 5,863 -- 15,216 |
+| baseline -- no index, legacy query | ~299,000 -- ~1,079,000 |
+| this change's outer index only, legacy query | ~277,400 -- ~277,800 |
+| **rewrite only**, no indexes | ~1,605,000 -- ~2,134,000 |
+| all four indexes, legacy query | ~5,900 -- ~15,100 |
+| **all four indexes + rewrite (as shipped)** | ~5,800 -- ~15,200 |
 
 Three things this table says, in order of how much they matter.
 
@@ -226,6 +226,10 @@ Same fixture, with the row estimate left 400x above the real pending count:
 | baseline | 1,104,220 | 42,567 |
 | all four indexes, legacy query | 27,605 | 21,042 |
 | **all four indexes + rewrite (as shipped)** | **6,351** | **8** |
+
+Unlike the table above, these reproduce closely: a second run gave 1,104,221,
+27,606 and 6,364. Pinning the statistics removes the planner's freedom to pick
+a different scan start, which is most of what made the other table move.
 
 The index-only form gives back most of its win here: its cold claim is 21,042
 buffers, because the planner abandons the partial index for a `Seq Scan`. The
@@ -381,8 +385,8 @@ Artifacts land in `docs/perf-artifacts/external-outbox-scan/`.
   profiled.
 
 * **Drain totals are not reproducible to the digit, in either direction.**
-  Measured spreads over three runs: baseline 299,077 to 1,078,868, as shipped
-  5,863 to 15,216. The pre-change form moves because `synchronize_seqscans`
+  Measured spreads over four runs: baseline about 299,000 to 1,079,000, as
+  shipped about 5,800 to 15,200. The pre-change form moves because `synchronize_seqscans`
   changes where its sequential scan starts; the as-shipped form moves with
   cache state, because each claim walks what earlier claims resolved. Only the
   per-claim plan is stable: the as-shipped cold claim measured 6 to 8 buffers

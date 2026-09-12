@@ -25,6 +25,13 @@
 # What it prints, per scenario: total buffers over a full 50-request drain
 # (`pg_stat_statements`, scoped to this run's own database), and the cold
 # single-claim plan's buffer count.
+#
+# Every scenario builds its own 1.02M-row database from scratch, so each one
+# costs about three minutes. The default run is the two tables the page leads
+# with, and takes roughly 25 minutes. The request-history sweep triples that,
+# so it is opt-in:
+#
+#   OUTBOX_MATRIX_HISTORY=1 ./autumn-harvest/scripts/external_outbox_scan_matrix.sh
 set -euo pipefail
 
 PGURL="${PGURL:-postgres://postgres:postgres@localhost:5432}"
@@ -33,7 +40,12 @@ WORK="$(mktemp -d)"
 trap 'rm -rf "$WORK"' EXIT
 
 psql_run() { psql "$PGURL/$1" -v ON_ERROR_STOP=1 -q "${@:2}"; }
-psql_at() { psql "$PGURL/$1" -At "${@:2}"; }
+# `ON_ERROR_STOP` here too, and deliberately so. `psql -f` otherwise continues
+# past a failed statement, and the drain would still print a
+# `pg_stat_statements` total covering only the steps that ran. A partial total
+# is indistinguishable from a real one once it reaches the page, so this
+# harness stops instead of publishing it.
+psql_at() { psql "$PGURL/$1" -At -v ON_ERROR_STOP=1 "${@:2}"; }
 
 # ---------------------------------------------------------------------------
 # Schema and fixture
@@ -177,12 +189,20 @@ run_scenario() {
     # stale, or add history the statistics already describe.
     [ -n "$extra" ] && psql_run "$db" -f "$extra" >/dev/null
 
-    local cold
-    cold=$(psql_at "$db" -c "BEGIN; EXPLAIN (ANALYZE, BUFFERS, TIMING OFF) $(cat "$query"); ROLLBACK;" \
-        | grep -oE 'shared hit=[0-9]+( read=[0-9]+)?' | head -1)
+    local cold plan
+    if ! plan=$(psql_at "$db" -c "BEGIN; EXPLAIN (ANALYZE, BUFFERS, TIMING OFF) $(cat "$query"); ROLLBACK;"); then
+        echo "scenario '$name': the cold-claim plan failed; refusing to report" >&2
+        exit 1
+    fi
+    cold=$(printf '%s\n' "$plan" | grep -oE 'shared hit=[0-9]+( read=[0-9]+)?' | head -1)
+
     gen_drain "$query" > "$WORK/drain.sql"
-    local total
-    total=$(psql_at "$db" -f "$WORK/drain.sql" 2>/dev/null | tail -1 | cut -d'|' -f1)
+    local drain total
+    if ! drain=$(psql_at "$db" -f "$WORK/drain.sql"); then
+        echo "scenario '$name': the drain failed part way; refusing to report a partial total" >&2
+        exit 1
+    fi
+    total=$(printf '%s\n' "$drain" | tail -1 | cut -d'|' -f1)
     printf '%-44s drain=%-12s cold claim: %s\n' "$name" "$total" "$cold"
     psql "$PGURL/postgres" -q -c "DROP DATABASE IF EXISTS $db;" >/dev/null
 }
@@ -230,7 +250,10 @@ run_scenario "stale: as shipped"                  "$WORK/rewritten.sql" "$WORK/i
 # `harvest_events` is append-only, so the pending index holds every request the
 # deployment ever made. Each claim walks the resolved ones before it reaches a
 # pending one, so the claim cost tracks lifetime requests, not backlog.
-for h in 2000 8000 20000; do
+#
+# Opt in with OUTBOX_MATRIX_HISTORY=1. Three more fixtures is three times the
+# runtime, and the two tables above are the ones most readers want.
+for h in ${OUTBOX_MATRIX_HISTORY:+2000 8000 20000}; do
     cat > "$WORK/history.sql" <<SQL
 INSERT INTO harvest_events (workflow_exec_id, event_id, event_type, event_data, timestamp)
 SELECT e.id, 800000 + gs, 'ExternalSignalRequested',
