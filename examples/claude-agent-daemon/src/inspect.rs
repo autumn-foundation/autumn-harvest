@@ -439,17 +439,34 @@ pub fn signal_deadline(
 /// # Errors
 ///
 /// Returns an error if either query fails.
-pub fn outstanding_signal(conn: &Connection, exec_id: &str) -> Result<Option<String>, String> {
+pub fn outstanding_signal(
+    conn: &Connection,
+    exec_id: &str,
+    now_ms: i64,
+) -> Result<Option<String>, String> {
     // `fired = 0` is the backend's own proof of a wait that is still armed.
     // An approval that timed out leaves its timer behind with `fired = 1`,
     // and a timed-out wait has no answer either. Reading every timer would
     // therefore return the EXPIRED signal of an earlier call. The status
     // would show a token nobody can approve, and hide the one that works.
+    // The DEADLINE must still be ahead as well. A daemon stopped past one has
+    // had no drive in which to mark the timer fired, so an overdue wait still
+    // reads as armed. Restoring it would print a token that `approve` refuses
+    // every time, because the session denies that call on its next drive.
+    //
+    // `fire_at` is an absolute epoch-millisecond, so the caller's clock is
+    // read in the same unit. The clock is a parameter, so a test can place a
+    // deadline on either side of it.
     let mut timers = conn
-        .prepare("SELECT timer_id FROM harvest_timers WHERE exec_id = ?1 AND fired = 0")
+        .prepare(
+            "SELECT timer_id FROM harvest_timers WHERE exec_id = ?1 \
+             AND fired = 0 AND fire_at > ?2",
+        )
         .map_err(|e| format!("cannot prepare the wait query: {e}"))?;
     let named = timers
-        .query_map([exec_id], |row| row.get::<_, String>(0))
+        .query_map(rusqlite::params![exec_id, now_ms], |row| {
+            row.get::<_, String>(0)
+        })
         .map_err(|e| format!("cannot read the waits: {e}"))?;
 
     for timer in named {

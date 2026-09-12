@@ -2682,6 +2682,42 @@ fn a_goal_opening_with_a_nul_is_measured_whole() {
     );
 }
 
+/// A socket is replaced only when nothing is proved to be listening.
+///
+/// The reclaim removes a name and binds over it. Doing that to a LIVE socket
+/// leaves the daemon behind it running with nothing able to reach it. Only an
+/// answer that proves the name has no listener may license the removal.
+///
+/// A refusal and a missing entry prove it. A permission error does not, and
+/// that is the reported case: another user's live socket in a shared
+/// directory. Exhausted file descriptors have the same shape on a socket this
+/// daemon owns.
+#[test]
+fn only_a_proven_absence_licenses_a_reclaim() {
+    use std::io::{Error, ErrorKind};
+
+    for proof in [ErrorKind::ConnectionRefused, ErrorKind::NotFound] {
+        assert!(
+            daemon::proves_nothing_listens(&Error::new(proof, "probe")),
+            "{proof:?} proves the name has no listener"
+        );
+    }
+    // Every other answer leaves the question open, so the name is not known
+    // to be free and the socket must stay.
+    for open in [
+        ErrorKind::PermissionDenied,
+        ErrorKind::ConnectionAborted,
+        ErrorKind::TimedOut,
+        ErrorKind::WouldBlock,
+        ErrorKind::Other,
+    ] {
+        assert!(
+            !daemon::proves_nothing_listens(&Error::new(open, "probe")),
+            "{open:?} does not prove the name has no listener"
+        );
+    }
+}
+
 /// A restored wait is the ARMED one, and not one already answered.
 ///
 /// Two tables decide this, and the backend's own rule is that an armed but
@@ -2694,6 +2730,9 @@ fn a_goal_opening_with_a_nul_is_measured_whole() {
 /// that wins on the next drive, so the wait must not come back.
 #[test]
 fn a_restored_wait_is_armed_and_unanswered() {
+    // A fixed clock, so a deadline can be placed on either side of it.
+    const NOW: i64 = 1_000;
+
     let dir = tempfile::tempdir().expect("a temporary directory");
     let db = dir.path().join("waits.db");
     let conn = rusqlite::Connection::open(&db).expect("the database opens");
@@ -2711,6 +2750,7 @@ fn a_restored_wait_is_armed_and_unanswered() {
 
     let expired = "tool_approval:1:0:toolu_first";
     let armed = "tool_approval:2:0:toolu_second";
+    let overdue = "tool_approval:3:0:toolu_third";
     // The earlier call timed out, so its timer stays behind as FIRED. The
     // current call waits on an armed timer.
     conn.execute(
@@ -2719,18 +2759,58 @@ fn a_restored_wait_is_armed_and_unanswered() {
     )
     .expect("the expired timer is recorded");
     conn.execute(
-        "INSERT INTO harvest_timers VALUES (?1, 'e', 99, 0, 2)",
+        "INSERT INTO harvest_timers VALUES (?1, 'e', 9999, 0, 2)",
         [format!("__signal_timeout:2:{armed}")],
     )
     .expect("the armed timer is recorded");
 
-    let found = inspect::outstanding_signal(&conn, "e")
+    let found = inspect::outstanding_signal(&conn, "e", NOW)
         .expect("the wait query runs")
         .expect("an armed wait must be reported");
     assert_eq!(
         found, armed,
         "the armed wait must be restored, and not the timed-out one"
     );
+
+    // A daemon stopped PAST a deadline has had no drive in which to mark the
+    // timer fired, so an overdue wait still reads as armed. Restoring it
+    // would print a token that `approve` refuses every time.
+    conn.execute("DELETE FROM harvest_timers WHERE exec_id = 'e'", [])
+        .expect("the timers are cleared");
+    conn.execute(
+        "INSERT INTO harvest_timers VALUES (?1, 'e', 500, 0, 3)",
+        [format!("__signal_timeout:3:{overdue}")],
+    )
+    .expect("the overdue timer is recorded");
+    let gone = inspect::outstanding_signal(&conn, "e", NOW).expect("the wait query runs");
+    assert!(
+        gone.is_none(),
+        "an overdue wait must not be restored, and got {gone:?}"
+    );
+
+    // The same timer with its deadline ahead is restored, so the filter is
+    // the deadline and not the row.
+    conn.execute(
+        "UPDATE harvest_timers SET fire_at = 9999 WHERE exec_id = 'e'",
+        [],
+    )
+    .expect("the deadline is moved ahead");
+    let ahead = inspect::outstanding_signal(&conn, "e", NOW)
+        .expect("the wait query runs")
+        .expect("a wait with time left must be restored");
+    assert_eq!(
+        ahead, overdue,
+        "the wait with time left is the one reported"
+    );
+
+    // Back to the armed pair for the answer checks below.
+    conn.execute("DELETE FROM harvest_timers WHERE exec_id = 'e'", [])
+        .expect("the timers are cleared");
+    conn.execute(
+        "INSERT INTO harvest_timers VALUES (?1, 'e', 9999, 0, 2)",
+        [format!("__signal_timeout:2:{armed}")],
+    )
+    .expect("the armed timer is recorded");
 
     // A decision sent but not yet taken up lives only in the staged table.
     // The wait must not come back over it, or a second answer would be taken
@@ -2740,7 +2820,7 @@ fn a_restored_wait_is_armed_and_unanswered() {
         [armed],
     )
     .expect("the decision is staged");
-    let staged = inspect::outstanding_signal(&conn, "e").expect("the wait query runs");
+    let staged = inspect::outstanding_signal(&conn, "e", NOW).expect("the wait query runs");
     assert!(
         staged.is_none(),
         "a staged decision ends the wait, and got {staged:?}"
@@ -2759,7 +2839,7 @@ fn a_restored_wait_is_armed_and_unanswered() {
         [event.to_string()],
     )
     .expect("the delivery is appended");
-    let done = inspect::outstanding_signal(&conn, "e").expect("the wait query runs");
+    let done = inspect::outstanding_signal(&conn, "e", NOW).expect("the wait query runs");
     assert!(
         done.is_none(),
         "a delivered decision ends the wait, and got {done:?}"
@@ -2828,7 +2908,14 @@ async fn a_parked_wait_is_read_from_the_database() {
     // A fresh reader, as a restarted daemon opens. The wait must be readable
     // with no drive at all, and it must be the SAME token.
     let reader = inspect::open(&db).expect("the database opens");
-    let waited = inspect::outstanding_signal(&reader, &execution_id)
+    let now_ms = i64::try_from(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("the clock is after the epoch")
+            .as_millis(),
+    )
+    .expect("the clock is in range");
+    let waited = inspect::outstanding_signal(&reader, &execution_id, now_ms)
         .expect("the wait query runs")
         .expect("a parked session must report its wait");
     assert_eq!(
@@ -2859,7 +2946,8 @@ async fn a_parked_wait_is_read_from_the_database() {
         .expect("the delivery is appended");
     drop(writer);
 
-    let after = inspect::outstanding_signal(&reader, &execution_id).expect("the wait query runs");
+    let after =
+        inspect::outstanding_signal(&reader, &execution_id, now_ms).expect("the wait query runs");
     assert!(
         after.is_none(),
         "a delivered signal ends the wait, and got {after:?}"

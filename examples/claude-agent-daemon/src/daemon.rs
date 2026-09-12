@@ -20,6 +20,7 @@ use std::time::Duration;
 
 use autumn_harvest_sqlite::{ExecutionId, RunState, SqliteRuntime};
 use rusqlite::Connection;
+use std::os::unix::fs::MetadataExt;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::{Semaphore, mpsc, oneshot};
@@ -211,8 +212,11 @@ pub async fn serve(options: Options) -> Result<(), String> {
     // that window was refused as a session that is not waiting. The restart
     // recipe describes exactly that sequence.
     let mut blocked: Parked = Parked::new();
+    // One clock reading for the whole rebuild, so two sessions cannot be
+    // judged against two different instants.
+    let now_ms = epoch_millis()?;
     for exec in &resumed {
-        match inspect::outstanding_signal(&reader, &exec.to_string()) {
+        match inspect::outstanding_signal(&reader, &exec.to_string(), now_ms) {
             Ok(Some(name)) => note(&mut blocked, *exec, waiting_reason(&name), Some(name)),
             Ok(None) => {}
             Err(message) => return Err(message),
@@ -402,8 +406,31 @@ pub async fn bind(socket: &Path) -> Result<UnixListener, String> {
                 socket.display()
             ));
         }
-        if UnixStream::connect(socket).await.is_ok() {
-            return Err(format!("a daemon already listens on {}", socket.display()));
+        // A socket another user owns is never this daemon's to replace. Whoever
+        // owns it owns the daemon behind it, and removing the name would leave
+        // that daemon running and unreachable.
+        let owner = rustix::process::geteuid().as_raw();
+        if existing.uid() != owner {
+            return Err(format!(
+                "{} belongs to uid {} and this daemon runs as uid {owner}. \
+                 Refusing to replace another user's socket.",
+                socket.display(),
+                existing.uid()
+            ));
+        }
+        match UnixStream::connect(socket).await {
+            Ok(_) => return Err(format!("a daemon already listens on {}", socket.display())),
+            // Only these two answers prove that nothing listens. Every other
+            // failure means the question was not answered, and the name is
+            // NOT known to be free. See [`proves_nothing_listens`].
+            Err(e) if !proves_nothing_listens(&e) => {
+                return Err(format!(
+                    "cannot tell whether a daemon listens on {}: {e}. Refusing to \
+                     remove a socket that may be live.",
+                    socket.display()
+                ));
+            }
+            Err(_) => {}
         }
         // The socket outlived its process, so it is safe to replace.
         std::fs::remove_file(socket)
@@ -412,6 +439,25 @@ pub async fn bind(socket: &Path) -> Result<UnixListener, String> {
 
     guard::with_private_umask(|| UnixListener::bind(socket))
         .map_err(|e| format!("cannot listen on {}: {e}", socket.display()))
+}
+
+/// Does this connection failure prove that nothing listens?
+///
+/// Only two answers do. A refusal is the kernel saying the name has no
+/// listener, and a missing entry is the name being gone between the two
+/// calls. Every other failure leaves the question open.
+///
+/// The difference decides whether a socket is REMOVED. A permission error is
+/// the reported case: another user's live socket in a shared directory this
+/// process can write. Exhausted file descriptors are the same shape, on a
+/// socket this daemon owns. Treating either as proof would unlink the name a
+/// live daemon is listening on. That daemon would keep running, with nothing
+/// able to reach it.
+pub fn proves_nothing_listens(error: &std::io::Error) -> bool {
+    matches!(
+        error.kind(),
+        std::io::ErrorKind::ConnectionRefused | std::io::ErrorKind::NotFound
+    )
 }
 
 /// Accept connections and forward each request to the main loop.
@@ -803,6 +849,18 @@ pub fn approve(
     }
 }
 
+/// Now, as the absolute epoch-millisecond the timer table stores.
+///
+/// # Errors
+///
+/// Returns an error if the clock is before the epoch or out of range.
+fn epoch_millis() -> Result<i64, String> {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_err(|e| format!("cannot read the clock: {e}"))?;
+    i64::try_from(now.as_millis()).map_err(|e| format!("the clock is out of range: {e}"))
+}
+
 /// How long ago the deadline of this wait passed, in seconds.
 ///
 /// `None` means the wait still has time, or has no deadline at all.
@@ -810,11 +868,7 @@ fn expired(reader: &Connection, execution_id: &str, signal: &str) -> Result<Opti
     let Some(fire_at) = inspect::signal_deadline(reader, execution_id, signal)? else {
         return Ok(None);
     };
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_err(|e| format!("cannot read the clock: {e}"))?;
-    let now =
-        i64::try_from(now.as_millis()).map_err(|e| format!("the clock is out of range: {e}"))?;
+    let now = epoch_millis()?;
     if now < fire_at {
         return Ok(None);
     }
