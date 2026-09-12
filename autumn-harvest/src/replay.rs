@@ -9625,6 +9625,61 @@ mod tests {
         }
     }
 
+    /// A genuine activity failure can quote the reserved reason AND land on
+    /// attempt 1, non-retryable, with no details — the full shape the matcher
+    /// checks (issue #1265). What the synthetic path never writes is an
+    /// `ActivityStarted` between the schedule and the failure: an abandoned
+    /// dispatch never actually ran. An intervening `ActivityStarted` is proof
+    /// this is a real terminal, so it must stay matchable — otherwise a
+    /// redrive marks it transparent, the real `ActivityStarted` stays opaque,
+    /// and the reopened run parks on it instead of re-dispatching.
+    #[test]
+    fn a_genuine_activity_failure_with_an_intervening_started_is_not_an_abandoned_record() {
+        let activity_id = ActivityExecId::new();
+        let events = vec![
+            WorkflowEvent::WorkflowStarted {
+                input: Value::Null,
+                timestamp: chrono::Utc::now(),
+                last_completion_result: None,
+                last_error: None,
+                scheduled_time: None,
+            },
+            WorkflowEvent::ActivityScheduled {
+                activity_id,
+                name: "charge".into(),
+                input: Value::Null,
+                queue: "default".into(),
+            },
+            WorkflowEvent::ActivityStarted {
+                activity_id,
+                worker_id: WorkerId::new("worker-1"),
+            },
+            // Quotes the engine's exact abandoned shape, but a real activity
+            // ran and failed this way on its own.
+            WorkflowEvent::ActivityFailed {
+                activity_id,
+                error: crate::event::ABANDONED_DISPATCH_REASON.to_string(),
+                attempt: 1,
+                error_type: "Error".into(),
+                details: None,
+                non_retryable: true,
+            },
+            WorkflowEvent::workflow_failed("budget exceeded"),
+            WorkflowEvent::WorkflowRedriven {
+                redriven_at: chrono::Utc::now(),
+                dead_letter_id: uuid::Uuid::new_v4(),
+                reason: None,
+            },
+        ];
+        let matcher = HistoryMatcher::new(events);
+        for idx in [1_usize, 2, 3] {
+            assert!(
+                !matcher.is_consumed(idx),
+                "event {idx} is a genuine activity failure and must stay matchable"
+            );
+        }
+    }
+
     /// Without a redrive the same records are ordinary, positionally-matched
     /// history: they are what makes a failing cycle's own replay resolvable.
     #[test]
