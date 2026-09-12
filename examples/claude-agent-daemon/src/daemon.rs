@@ -1223,6 +1223,14 @@ fn view(reader: &Connection, row: &ExecutionRow, blocked: &Parked, full: bool) -
     }
 }
 
+/// What `status` says when the newest model reply cannot be named.
+///
+/// A tool-use id is unique inside ONE reply. Offering the newest reply this
+/// daemon CAN read would offer a call from an older turn beside a live
+/// approval token. See [`inspect::newer_turn_evidence`].
+const UNNAMEABLE_REPLY: &str = "a model reply newer than the newest readable one is \
+     recorded, so the reply holding the awaited call cannot be named";
+
 /// Read the awaited tool call back out of the event log.
 ///
 /// The daemon holds no copy of it. The call was recorded as the result of the
@@ -1279,9 +1287,24 @@ pub fn pending_call(
     // The transcript stays in the database.
     let page = inspect::reply_calls(reader, exec_id, None, REPLY_PAGE)
         .map_err(|e| format!("the model replies cannot be read: {e}"))?;
-    let Some((_, newest)) = page.into_iter().next() else {
-        return Ok(None);
+    let Some((seq, newest)) = page.into_iter().next() else {
+        // No reply this daemon can read. A turn may still be recorded, and
+        // a row it cannot read at all may be one. An absence is therefore
+        // reported only when there is no evidence of either.
+        return match inspect::newer_turn_evidence(reader, exec_id, i64::MIN)? {
+            (0, 0) => Ok(None),
+            _ => Err(UNNAMEABLE_REPLY.to_string()),
+        };
     };
+
+    // The reply above was found by a `stop_reason` in its OWN payload. A
+    // newer reply with a damaged payload is therefore not in the page at all.
+    // Two rows that the damage cannot reach say when that happened: a turn
+    // scheduled after this reply, and a row of unknown kind after it. Either
+    // means the awaited call may sit in a reply this daemon cannot name.
+    if inspect::newer_turn_evidence(reader, exec_id, seq)? != (0, 0) {
+        return Err(UNNAMEABLE_REPLY.to_string());
+    }
 
     // Every answer below comes from the NEWEST reply. A reply further back
     // can hold the awaited id for a different tool, so it is never read.

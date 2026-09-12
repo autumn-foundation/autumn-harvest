@@ -3360,6 +3360,21 @@ fn every_paged_query_is_planned_as_a_seek() {
             "seq<?",
         ),
         (
+            // The two evidence reads are bounded the OTHER way: they look
+            // only at rows after the reply in hand. A scan here would put
+            // the whole log back into one `status`.
+            "newer turns",
+            crate::inspect::NEWER_TURN_QUERY,
+            vec![&"exec-1" as &dyn rusqlite::ToSql, &7_i64, &"claude_turn"],
+            "seq>?",
+        ),
+        (
+            "unreadable events",
+            crate::inspect::UNREADABLE_AFTER_QUERY,
+            vec![&"exec-1" as &dyn rusqlite::ToSql, &7_i64],
+            "seq>?",
+        ),
+        (
             "sessions",
             crate::inspect::SESSIONS_QUERY,
             vec![
@@ -8235,4 +8250,191 @@ fn a_parent_swapped_after_the_path_resolved_is_refused() {
         !outside.join("b").join("note.md").exists(),
         "and nothing is written outside by either half"
     );
+}
+
+/// One hidden-reply fixture, and everything the daemon must do with it.
+fn assert_no_older_call_answers(case: &str, older: &str, schedule: String, newest: String) {
+    let scheduled_old = json!({"type":"ActivityScheduled",
+           "data":{"activity_id":"act_old","name":"claude_turn","queue":"default"}})
+    .to_string();
+    let dir = tempfile::tempdir().expect("a temporary directory");
+    let db = dir.path().join("hidden-reply.db");
+    let writer = rusqlite::Connection::open(&db).expect("the database opens");
+    writer
+        .execute_batch(
+            "CREATE TABLE harvest_events (exec_id TEXT, seq INTEGER, event_json TEXT,              PRIMARY KEY (exec_id, seq));",
+        )
+        .expect("the fixture schema is created");
+    for (seq, row) in [
+        (0_i64, scheduled_old),
+        (1, older.to_string()),
+        (2, schedule),
+        (3, newest),
+    ] {
+        writer
+            .execute(
+                "INSERT INTO harvest_events VALUES ('e', ?1, ?2)",
+                rusqlite::params![seq, row],
+            )
+            .expect("the row is recorded");
+    }
+    drop(writer);
+
+    let reader = rusqlite::Connection::open(&db).expect("the database opens");
+
+    // The hazard, stated first. The page still answers with the OLDER reply,
+    // because the newest one carries no `stop_reason` it can read. A refusal
+    // below is therefore a choice, and not a failure to read.
+    let page = inspect::reply_calls(&reader, "e", None, 8).expect("the replies read");
+    assert_eq!(
+        page.first().map(|reply| reply.0),
+        Some(1),
+        "[{case}] the page must still name the older reply as its newest: {page:?}"
+    );
+
+    // The rows the damage cannot reach say so.
+    let evidence = inspect::newer_turn_evidence(&reader, "e", 1).expect("the evidence reads");
+    assert_ne!(
+        evidence,
+        (0, 0),
+        "[{case}] a turn after that reply must be visible in another row"
+    );
+
+    let signal = session::approval_signal(2, 0, "toolu_same");
+    let refused = daemon::pending_call(&reader, "e", &signal, false)
+        .expect_err("no call may be offered from an older reply");
+    assert!(
+        refused.contains("cannot be named"),
+        "[{case}] the refusal must say what stopped it: {refused}"
+    );
+    assert!(
+        !refused.contains("secrets.txt") && !refused.contains("read_file"),
+        "[{case}] and never name the older call: {refused}"
+    );
+
+    // The rendering offers no decision, and still says the session waits.
+    let parked = daemon::ParkedState {
+        signal: Some(signal),
+        reason: "waiting for approval of write_file".to_string(),
+    };
+    let (pending, blocked_on) = daemon::decidable(&reader, "e", Some(&parked), false);
+    assert!(
+        pending.is_none(),
+        "[{case}] the older call must NEVER be offered: {pending:?}"
+    );
+    let reason = blocked_on.expect("the session still says why it is parked");
+    assert!(
+        reason.contains("waiting for approval of write_file") && reason.contains("cannot be named"),
+        "[{case}] the reason keeps the wait and names what stopped: {reason}"
+    );
+    assert!(
+        !reason.contains("secrets.txt") && !reason.contains("read_file"),
+        "[{case}] and it never names the older call: {reason}"
+    );
+}
+
+/// A reply the page cannot see does not let an OLDER call answer.
+///
+/// [`inspect::REPLIES_QUERY`] finds a reply by a `stop_reason` in its own
+/// payload. A reply whose payload is damaged is therefore dropped from the
+/// page, and the search answered with the newest reply it COULD read.
+///
+/// Measured before the fix, with the older reply reusing the awaited id: the
+/// stale `read_file secrets.txt` was offered beside the current token. The
+/// newest-reply rule of the previous fix was defeated by the query that
+/// decides which reply is newest.
+///
+/// The evidence that the damage cannot reach is in other rows. A turn is
+/// scheduled in a row of its own, before its reply exists.
+#[test]
+fn a_reply_the_page_cannot_see_does_not_let_an_older_call_answer() {
+    let scheduled = |id: &str| {
+        json!({"type":"ActivityScheduled",
+               "data":{"activity_id":id,"name":"claude_turn","queue":"default"}})
+        .to_string()
+    };
+    let older = json!({"type":"ActivityCompleted","data":{"activity_id":"act_old","output":{
+        "stop_reason":"tool_use",
+        "tool_calls":[{"id":"toolu_same","name":"read_file",
+                       "input":{"path":"secrets.txt"}}]}}})
+    .to_string();
+
+    // Each newest reply holds the awaited call, and each is invisible to the
+    // page for a different reason. The last case damages the SCHEDULE too, so
+    // no row left can say a turn happened. Only a count of rows with no
+    // readable kind catches that one.
+    let hidden = json!({"type":"ActivityCompleted","data":{"activity_id":"act_new","output":{
+        "tool_calls":[{"id":"toolu_same","name":"write_file",
+                       "input":{"path":"notes.md"}}]}}})
+    .to_string();
+    let cases = [
+        ("no stop_reason", scheduled("act_new"), hidden.clone()),
+        (
+            "a null stop_reason",
+            scheduled("act_new"),
+            json!({"type":"ActivityCompleted","data":{"activity_id":"act_new","output":{
+                "stop_reason":null,
+                "tool_calls":[{"id":"toolu_same","name":"write_file",
+                               "input":{"path":"notes.md"}}]}}})
+            .to_string(),
+        ),
+        (
+            "no valid JSON at all",
+            scheduled("act_new"),
+            r#"{"type":"ActivityCompleted","data":{"activity_id":"act_new","output":{"#.to_string(),
+        ),
+        (
+            "a schedule with no readable kind either",
+            r#"{"type":"ActivityScheduled","data":{"activity_id":"act_new","name":"#.to_string(),
+            hidden,
+        ),
+    ];
+
+    for (case, schedule, newest) in cases {
+        assert_no_older_call_answers(case, &older, schedule, newest);
+    }
+}
+
+/// A REAL parked session still shows its call, with the evidence read live.
+///
+/// The refusals above must cost nothing a healthy history needs. This runs
+/// the stub model to a parked approval, so the rows are the engine's own.
+/// A turn is scheduled before each reply, and tool events follow the newest
+/// one.
+#[tokio::test]
+async fn a_live_parked_session_still_shows_its_awaited_call() {
+    let dir = tempfile::tempdir().expect("a temporary directory");
+    let workspace = dir.path().join("workspace");
+    std::fs::create_dir_all(&workspace).expect("the workspace is created");
+    std::fs::write(workspace.join("README.md"), "hello").expect("the fixture is written");
+    let db = dir.path().join("agentd.db");
+    let calls = Arc::new(AtomicUsize::new(0));
+    let mut rt = runtime(&db, &workspace, &calls);
+    let exec = rt
+        .start_workflow(WORKFLOW_NAME, task(&workspace))
+        .expect("the session starts");
+    let signal = drive_to_approval(&mut rt, exec).await;
+    drop(rt);
+
+    let reader = rusqlite::Connection::open(&db).expect("the database opens");
+    let exec_id = exec.to_string();
+
+    // Tool events sit after the newest reply, and none of them is a turn.
+    // This is what the guard must not mistake for a newer reply.
+    let page = inspect::reply_calls(&reader, &exec_id, None, 1).expect("the replies read");
+    let seq = page.first().expect("a reply is recorded").0;
+    assert_eq!(
+        inspect::newer_turn_evidence(&reader, &exec_id, seq).expect("the evidence reads"),
+        (0, 0),
+        "a healthy history records no turn after its newest reply"
+    );
+
+    let found = daemon::pending_call(&reader, &exec_id, &signal, false)
+        .expect("the replies read")
+        .expect("a parked session shows the call it waits on");
+    assert_eq!(
+        found.tool, "write_file",
+        "the awaited call answers: {found:?}"
+    );
+    assert_eq!(found.token, signal, "beside its own token");
 }

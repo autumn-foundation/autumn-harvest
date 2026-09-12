@@ -336,6 +336,69 @@ pub const REPLIES_QUERY: &str = "SELECT seq, \
      AND json_extract(event_json, '$.data.output.stop_reason') IS NOT NULL \
      ORDER BY seq DESC LIMIT ?3";
 
+/// Is a model turn scheduled AFTER this event?
+///
+/// [`REPLIES_QUERY`] finds a reply by a `stop_reason` in its own payload, so a
+/// reply whose payload is damaged is dropped from the page. The search then
+/// answered with an OLDER reply. A tool-use id is unique inside one reply
+/// only, so that offered the wrong call beside the current approval token.
+///
+/// This asks a question the damaged row cannot corrupt. The engine records
+/// `ActivityScheduled` for a turn BEFORE the reply arrives, in a row of its
+/// own. A schedule newer than the reply in hand therefore proves that reply
+/// is not the newest one, whatever its payload says.
+///
+/// The read is bounded by `seq >`, so it looks only at rows after the reply
+/// the page returned. For a parked session that is the tool events of the
+/// current turn. A correlated read of activity identities would instead parse
+/// every row of the log, which is the unbounded read this module avoids. See
+/// [`REPLY_PAGE`] in `daemon`.
+///
+/// The activity name is a PARAMETER, so it comes from the registration
+/// itself. A hardcoded name could drift from the one the engine records.
+pub const NEWER_TURN_QUERY: &str = "SELECT count(*) FROM harvest_events \
+     WHERE exec_id = ?1 AND seq > ?2 AND json_valid(event_json) \
+     AND json_extract(event_json, '$.type') = 'ActivityScheduled' \
+     AND json_extract(event_json, '$.data.name') = ?3";
+
+/// How many events after `seq` this daemon cannot read at all.
+///
+/// [`NEWER_TURN_QUERY`] needs a row to be JSON to say what the row is. A row
+/// that is not JSON carries no readable kind, so it can be a model turn
+/// nothing can name.
+///
+/// `json_valid` answers for every row and aborts nothing, so a corrupt row is
+/// COUNTED here rather than skipped in silence.
+pub const UNREADABLE_AFTER_QUERY: &str = "SELECT count(*) FROM harvest_events \
+     WHERE exec_id = ?1 AND seq > ?2 AND NOT json_valid(event_json)";
+
+/// Count the events after `seq` that a query cannot classify or name.
+///
+/// # Errors
+///
+/// Returns an error if either count cannot be read.
+pub fn newer_turn_evidence(
+    conn: &Connection,
+    exec_id: &str,
+    seq: i64,
+) -> Result<(i64, i64), String> {
+    let turns = conn
+        .query_row(
+            NEWER_TURN_QUERY,
+            rusqlite::params![exec_id, seq, session::claude_turn_info().name],
+            |row| row.get::<_, i64>(0),
+        )
+        .map_err(|e| format!("cannot count the newer turns: {e}"))?;
+    let unreadable = conn
+        .query_row(
+            UNREADABLE_AFTER_QUERY,
+            rusqlite::params![exec_id, seq],
+            |row| row.get::<_, i64>(0),
+        )
+        .map_err(|e| format!("cannot count the unreadable events: {e}"))?;
+    Ok((turns, unreadable))
+}
+
 /// One recorded event, already cut to what an audit line prints.
 ///
 /// The whole event is never read. A recorded activity can approach the
