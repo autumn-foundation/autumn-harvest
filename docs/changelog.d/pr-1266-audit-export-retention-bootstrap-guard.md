@@ -495,6 +495,53 @@ for the wrong reason, since its quoted value also differed in
 whitespace from the two-name case: this test uses values that agree on
 everything except the escaping this round adds.
 
+A nineteenth review round raised two findings, one rebutted and one fixed.
+
+The first (P1) proposed normalizing an omitted `host` to `localhost`
+before keying `from_dsns` aliases, on the premise that `tokio_postgres`
+defaults an omitted host to a `localhost` TCP connection. Checking that
+premise against the actual crate this codebase connects through found
+it false: `tokio-postgres` 0.7.18's own `connect()` rejects a config
+with both `host` and `hostaddr` empty outright (`"both host and
+hostaddr are missing"`), and its DSN parser adds no default host at
+all when the authority host is empty (`parse_host` simply returns).
+`diesel-async` 0.9.2 calls `tokio_postgres::connect` directly, with no
+wrapper that fills in a default. A DSN naming neither `host` nor
+`hostaddr` therefore cannot successfully connect through this
+codebase's actual connector at all, so it can never execute a purge in
+the first place; the premature-deletion scenario the finding describes
+cannot occur for that pairing. This differs from libpq's C client,
+which does default an unspecified host to a local socket or
+`localhost` -- the finding's premise held for that connector, not this
+one. Not fixed; replied with this evidence instead.
+
+The second (P2) found that a decommissioned colocated shard's retired
+cursor can block a still-active colocated shard's rows forever under
+the default policy (`protect_unexported_audit` never configured).
+`decommission_cursor`'s own doc comment says retiring a cursor "is
+precisely what lets retention purge" that shard's rows, but the
+acknowledgment disjunct counted a retired cursor's frozen
+`last_acked_seq` the same as a live one, so a permanently decommissioned
+shard's stale ack shielded rows a still-relevant, active shard had
+already acknowledged, with no way to ever stop.
+`purge_old_audit_records` gains a fourth parameter, the raw
+`protect_unexported_audit` bool (previously only folded into the
+combined `export_may_be_live` signal), and the acknowledgment
+disjunct now reads `AND ($4::BOOLEAN OR c.retired_at IS NULL)`: a
+retired cursor's stale ack is ignored only while the flag is not
+itself protecting this pool group. When the flag *is* protecting the
+group, a retired cursor still blocks, preserving the first review
+round's re-enablement guarantee: an operator keeping the flag on
+through a decommission-then-resume transition still needs the
+re-enabling shard's retired, not-yet-un-retired cursor treated as
+pending.
+
+New tests:
+`retention_resumes_purging_once_a_colocated_shard_is_decommissioned_under_the_default_policy`
+pins the fix, and
+`retention_still_waits_on_a_decommissioned_shards_ack_while_the_flag_protects_the_group`
+pins that the first round's re-enablement guarantee still holds.
+
 **Zero migration, zero engine impact beyond the new parameter.** No new
 `WorkflowEvent` variant, no schema change, no change to any existing call
 site's behavior when the new flag is left at its default (disabled).

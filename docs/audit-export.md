@@ -327,6 +327,21 @@ shard records:
   decommissioning, and that stale row must not go on shielding rows a
   still-relevant, colocated shard has already fully acknowledged.
 
+  A shard still named in `colocated_shard_ids` — the default policy
+  never excludes anyone — can also be decommissioned, and its retired
+  cursor's stale ack is ignored the same way, but only while
+  `protect_unexported_audit` is not itself protecting this pool group.
+  `decommission_cursor`'s own guarantee is that retiring a cursor "is
+  precisely what lets retention purge" that shard's rows; without this,
+  a decommissioned shard's frozen ack would block a still-active
+  colocated shard's rows forever, since a retired cursor row is never
+  deleted. Gating this on `protect_unexported_audit` preserves the
+  flag's guarantee for a shard mid-re-enablement: an operator who keeps
+  the flag protecting this group through a decommission-then-resume
+  transition still sees the re-enabling shard's retired cursor treated
+  as pending, exactly as before this change, until its next tick
+  un-retires it.
+
   Detection covers both ways a fleet builds a `ShardedDbPool`.
   `ShardedDbPool::from_map` can receive one cloned `Pool` under two shard
   IDs; the sweep groups these by pool identity. `ShardedDbPool::from_dsns`

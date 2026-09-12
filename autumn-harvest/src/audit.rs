@@ -1618,8 +1618,11 @@ pub async fn list_audit(
 /// The pending check treats a row as pending, and so protected, in three
 /// cases. Its `export_seq` may be unassigned. Some shard in
 /// `colocated_shard_ids` may have no cursor row at all. Or a cursor row
-/// belonging to a shard in `colocated_shard_ids` may exist and simply
-/// not have acknowledged it yet.
+/// belonging to a shard in `colocated_shard_ids` may exist, not be
+/// retired, and simply not have acknowledged it yet. A retired
+/// cursor's own stale ack counts too, but only while
+/// `protect_unexported_audit` is itself protecting this pool group.
+/// See the note above the SQL for why.
 ///
 /// The second case matters on its own (issue #1266). A stamped row can
 /// survive a cursor row's manual deletion. It can
@@ -1683,6 +1686,20 @@ pub async fn purge_old_audit_records(
     // matters had genuinely acknowledged it. `colocated_shard_ids` names
     // only shards an operator has not explicitly exempted, so this
     // matches the middle disjunct's own notion of "who still counts".
+    //
+    // A retired cursor's own stale ack is ignored too, but only while
+    // `protect_unexported_audit` is not itself protecting this pool
+    // group (issue #1266). `decommission_cursor`'s own doc comment says
+    // retiring a cursor "is precisely what lets retention purge" that
+    // shard's rows. `harvest_audit_export_cursor` rows are retired,
+    // never deleted. Without this, a permanently decommissioned
+    // shard's frozen ack would block a still-active colocated shard's
+    // rows forever. Gating on `$4` preserves the flag's own guarantee
+    // for a shard mid-re-enablement. An operator who explicitly keeps
+    // `protect_unexported_audit` protecting this group through a
+    // decommission-then-resume transition still needs a re-enabling
+    // shard's retired, not-yet-un-retired cursor treated as pending.
+    // That stays true exactly as before this change.
     diesel::sql_query(
         "DELETE FROM harvest_audit_log a \
          WHERE a.occurred_at < $1 \
@@ -1707,6 +1724,7 @@ pub async fn purge_old_audit_records(
                         SELECT 1 FROM harvest_audit_export_cursor c \
                         WHERE c.shard_id = ANY($3::int4[]) \
                           AND a.export_seq > c.last_acked_seq \
+                          AND ($4::BOOLEAN OR c.retired_at IS NULL) \
                    ) \
                  ) \
            )",
@@ -1714,6 +1732,7 @@ pub async fn purge_old_audit_records(
     .bind::<diesel::sql_types::Timestamptz, _>(cutoff)
     .bind::<diesel::sql_types::Bool, _>(export_may_be_live)
     .bind::<diesel::sql_types::Array<diesel::sql_types::Integer>, _>(colocated_shard_ids.to_vec())
+    .bind::<diesel::sql_types::Bool, _>(protect_unexported_audit)
     .execute(conn)
     .await
     .map_err(database_error)
