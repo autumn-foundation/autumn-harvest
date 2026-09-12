@@ -27858,6 +27858,10 @@ impl Worker {
         let registry = Arc::clone(&self.registry);
         let task_id = task.id;
         let task_type = task.task_type.clone();
+        // The `crash_strikes` this dispatch claimed the row at. It is the claim
+        // epoch, so a release can apply to this claim and not merely to this
+        // worker. Only `poison_pill::requeue_orphan` changes it.
+        let claim_crash_strikes = task.crash_strikes;
         let worker_id = self.config.worker_id.clone();
         let build_id = self.config.build_id.clone();
         let cancellation_grace_period = self.config.cancellation_grace_period;
@@ -28069,7 +28073,13 @@ impl Worker {
                         #[cfg(feature = "db")]
                         if task_type == "workflow" {
                             drop(permit);
-                            reset_timed_out_workflow_task(&pool, task_id, &worker_id).await;
+                            reset_timed_out_workflow_task(
+                                &pool,
+                                task_id,
+                                &worker_id,
+                                claim_crash_strikes,
+                            )
+                            .await;
                         }
                     }
                     Ok(TaskDispatchOutcome::BodyTimedOut) => {
@@ -28158,7 +28168,13 @@ impl Worker {
                                 // Reset the task to PENDING so any worker can
                                 // re-claim it on the next poll, without waiting
                                 // for the orphan-reclaim staleness window.
-                                reset_timed_out_workflow_task(&pool, task_id, &worker_id).await;
+                                reset_timed_out_workflow_task(
+                                    &pool,
+                                    task_id,
+                                    &worker_id,
+                                    claim_crash_strikes,
+                                )
+                                .await;
                             }
                         }
                         #[cfg(not(feature = "db"))]
@@ -28215,7 +28231,13 @@ impl Worker {
                     #[cfg(feature = "db")]
                     if task_type == "workflow" {
                         drop(permit);
-                        reset_timed_out_workflow_task(&pool, task_id, &worker_id).await;
+                        reset_timed_out_workflow_task(
+                            &pool,
+                            task_id,
+                            &worker_id,
+                            claim_crash_strikes,
+                        )
+                        .await;
                     }
                 }
             }
@@ -28715,7 +28737,12 @@ pub async fn quarantine_workflow_task_timeout(
 /// Uses an optimistic `WHERE state = 'RUNNING' AND worker_id = …` guard so a
 /// concurrent reclaim or a different worker that somehow picked it up does not
 /// get its state overwritten.
-pub async fn reset_timed_out_workflow_task(pool: &DbPool, task_id: uuid::Uuid, worker_id: &str) {
+pub async fn reset_timed_out_workflow_task(
+    pool: &DbPool,
+    task_id: uuid::Uuid,
+    worker_id: &str,
+    claim_crash_strikes: i32,
+) {
     use crate::schema::harvest_task_queue::dsl;
 
     // Retry acquiring a pool connection: a transient pool saturation during
@@ -28762,7 +28789,15 @@ pub async fn reset_timed_out_workflow_task(pool: &DbPool, task_id: uuid::Uuid, w
         dsl::harvest_task_queue
             .find(task_id)
             .filter(dsl::state.eq("RUNNING"))
-            .filter(dsl::worker_id.eq(worker_id)),
+            .filter(dsl::worker_id.eq(worker_id))
+            // Claim-epoch guard (issue #1459). It is the same race
+            // `queue::release_task_for_capability_miss` already guards.
+            // `poison_pill::requeue_orphan` hands an orphan back as `PENDING`
+            // with `crash_strikes + 1`, and the same worker can win it again.
+            // A `(state, worker_id)` guard alone then matches that new claim.
+            // This reset would re-`PENDING` a row whose replacement handler
+            // already runs, and invite a second concurrent dispatch.
+            .filter(dsl::crash_strikes.eq(claim_crash_strikes)),
     )
     .set((
         dsl::state.eq("PENDING"),
