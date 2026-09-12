@@ -961,7 +961,15 @@ async fn the_control_socket_is_private_and_never_deletes_another_file() {
         .permissions()
         .mode()
         & 0o777;
-    assert_eq!(mode, 0o600, "the control socket must be owner-only");
+    // The property is that no other local user can reach it. The owner's
+    // execute bit is meaningless on a socket. The mask keeps that bit so a
+    // DIRECTORY created while the mask is held stays enterable.
+    assert_eq!(
+        mode & 0o077,
+        0,
+        "the control socket must be owner-only, and has mode {mode:o}"
+    );
+    assert_eq!(mode & 0o700, 0o700, "the owner must reach its own socket");
     drop(listener);
 }
 
@@ -1617,23 +1625,60 @@ fn a_created_directory_can_be_entered_by_its_owner() {
     // The point of the owner bits: a file can be written inside.
     std::fs::write(nested.join("notes.md"), "hello").expect("a write lands inside");
 
-    // Debris from an attempt killed between the creation and the mode. The
-    // level below it cannot be created until this one is repaired, so a retry
-    // must repair it rather than step over it.
-    let interrupted = workspace.join("interrupted");
-    std::fs::create_dir(&interrupted).expect("the debris is created");
-    std::fs::set_permissions(&interrupted, std::fs::Permissions::from_mode(0o000))
-        .expect("the debris is left unenterable");
-    tools::create_enterable(&interrupted.join("child")).expect("the retry repairs the debris");
-    let repaired = std::fs::metadata(&interrupted)
+    // A directory that exists and cannot be entered is refused, not widened.
+    // An operator can lock one deliberately, and a daemon killed between the
+    // creation and the mode leaves the same thing. The two are identical on
+    // disk, so the mode is left alone and the path is named instead.
+    let locked = workspace.join("locked");
+    std::fs::create_dir(&locked).expect("the directory is created");
+    std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000))
+        .expect("the directory is locked");
+    let refusal =
+        tools::create_enterable(&locked.join("child")).expect_err("a locked parent is refused");
+    assert_eq!(
+        refusal.kind(),
+        std::io::ErrorKind::PermissionDenied,
+        "the refusal must say what is wrong: {refusal}"
+    );
+    assert!(
+        refusal.to_string().contains("locked"),
+        "the refusal must name the path: {refusal}"
+    );
+    let kept = std::fs::metadata(&locked)
         .expect("the directory exists")
         .permissions()
         .mode()
         & 0o7777;
     assert_eq!(
-        repaired & 0o700,
+        kept, 0o000,
+        "a locked directory keeps the mode it was given"
+    );
+
+    // The private mask is held around the database open and the socket bind.
+    // It is one value for the whole process, so a directory created by any
+    // other thread in that window takes it. A mask that hid the owner's
+    // execute bit would make such a directory unusable. The refusal above
+    // would then fire on a directory the daemon itself caused.
+    let under_mask = guard::with_private_umask(|| {
+        let held = workspace.join("held");
+        std::fs::create_dir(&held).expect("the directory is created");
+        std::fs::metadata(&held)
+            .expect("the directory exists")
+            .permissions()
+            .mode()
+            & 0o7777
+    });
+    assert_eq!(
+        under_mask & 0o700,
         0o700,
-        "an interrupted creation must be repaired, and has mode {repaired:o}"
+        "a directory created under the private mask must stay usable, \
+         and has mode {under_mask:o}"
+    );
+    assert_eq!(
+        under_mask & 0o077,
+        0,
+        "a directory created under the private mask must stay private, \
+         and has mode {under_mask:o}"
     );
 
     // A directory that is narrow but USABLE is a mode an operator can mean.

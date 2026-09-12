@@ -465,35 +465,36 @@ pub fn directories_to_flush(target: &Path, workspace: &Path) -> Vec<PathBuf> {
 /// umask is one value for the whole process, and this daemon creates its
 /// private files on other threads.
 pub fn create_enterable(directory: &Path) -> std::io::Result<()> {
-    // An existing entry on this path must be a directory. A regular file
-    // named as the workspace has nothing missing above it. Nothing would be
-    // created, and the daemon would start over a workspace no tool can use.
-    // The repair below would also change the mode of that file, which is a
-    // change to something nobody asked this daemon to touch.
-    //
-    // Only the DEEPEST existing level can be a file. Every level above it has
-    // a child, so every level above it is a directory.
-    if let Some(deepest) = directory.ancestors().find(|level| level.exists())
-        && !deepest.is_dir()
-    {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::NotADirectory,
-            format!("{} exists and is not a directory", deepest.display()),
-        ));
-    }
-
-    // An earlier attempt can be killed between the creation and the mode. It
-    // leaves a directory its owner cannot enter, and the level below that one
-    // cannot be created at all. The debris is repaired first, from the top
-    // down. The walk stops at the first level the owner CAN enter, so it never
-    // reaches a directory this daemon had no part in.
-    let blocked: Vec<&Path> = directory
-        .ancestors()
-        .filter(|level| level.exists())
-        .take_while(|level| !owner_can_enter(level))
-        .collect();
-    for level in blocked.into_iter().rev() {
-        grant_owner_entry(level)?;
+    // The deepest existing level decides. Every level above it has a child.
+    // Every level above it is therefore a directory this daemon can enter,
+    // which the stat that found the deepest one proves.
+    if let Some(deepest) = directory.ancestors().find(|level| level.exists()) {
+        // A regular file named as the workspace has nothing missing above it.
+        // Nothing would be created, and the daemon would start over a
+        // workspace no tool can use.
+        if !deepest.is_dir() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::NotADirectory,
+                format!("{} exists and is not a directory", deepest.display()),
+            ));
+        }
+        // A directory that exists and cannot be entered is REFUSED, and not
+        // repaired. This call cannot prove it created that directory. An
+        // operator can lock one deliberately, and a daemon killed between the
+        // creation and the mode leaves the same thing. The two are identical
+        // on disk, so widening it would undo a choice that may have been
+        // meant. The refusal names the path, which a silent stall did not.
+        if !owner_can_enter(deepest) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                format!(
+                    "{} exists and its owner cannot enter it. Repair it or \
+                     remove it: this daemon does not change the mode of a \
+                     directory it cannot prove it created.",
+                    deepest.display()
+                ),
+            ));
+        }
     }
 
     let missing: Vec<&Path> = directory
@@ -514,13 +515,12 @@ pub fn create_enterable(directory: &Path) -> std::io::Result<()> {
 /// Can the owner enter this directory?
 ///
 /// A directory without the owner's `x` bit cannot be entered or listed by its
-/// owner. It is unusable to this daemon, and it is what an interrupted
-/// creation leaves behind.
+/// owner. Nothing below it can be created, so the caller is refused rather
+/// than left to fail one level down.
 ///
-/// The test is deliberately narrow. A directory that is narrow but USABLE,
-/// such as `0500`, is a mode an operator can mean, and it is left alone. A
-/// write under it then fails with a plain permission error that names the
-/// path, which is honest. Widening it would undo a choice the operator made.
+/// Every existing mode is left as it is. A directory that is narrow but
+/// usable, such as `0500`, is a mode an operator can mean. A write under it
+/// fails with a plain permission error that names the path, which is honest.
 fn owner_can_enter(directory: &Path) -> bool {
     std::fs::metadata(directory).is_ok_and(|entry| entry.permissions().mode() & 0o100 != 0)
 }

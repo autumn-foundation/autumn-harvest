@@ -33,7 +33,15 @@ use rustix::process::umask;
 const PRIVATE_MODE: u32 = 0o600;
 
 /// The mask that yields [`PRIVATE_MODE`] for anything created under it.
-const PRIVATE_UMASK: u32 = 0o177;
+///
+/// The owner's execute bit is NOT masked. A file is created from `0666`, which
+/// carries no execute bit, so this mask and `0o177` give a file the same
+/// `0600`. They differ for a DIRECTORY, which is created from `0777`: under
+/// `0o177` it would come back `0600`, and its owner could not enter it.
+///
+/// The mask is one value for the whole process while it is held. A directory
+/// created by any other thread in that window would be the one that breaks.
+const PRIVATE_UMASK: u32 = 0o077;
 
 /// The lock one daemon holds for the life of its process.
 ///
