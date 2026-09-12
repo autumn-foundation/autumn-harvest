@@ -289,6 +289,14 @@ async fn a_transcript_too_large_to_send_ends_the_session() {
         files as u64,
         "every read of the turn that ran is counted"
     );
+    // And ONLY the turns that ran. The guard fires before the model call of
+    // turn two, so one turn happened. A report of two would count a turn
+    // nobody made and nobody paid for. That report is what `list` and
+    // `status` show for the rest of the session's life.
+    assert_eq!(
+        report.turns, 1,
+        "the report must count the turns that ran, not the one refused"
+    );
     assert_eq!(
         report.answer, "reading everything",
         "and the text of that turn is the answer"

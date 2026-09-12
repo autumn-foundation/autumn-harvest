@@ -254,8 +254,19 @@ pub async fn agent_session(
         // A transcript that no longer fits ends the session HERE, under its
         // own name. See [`over_input_cap`]. The turn is not attempted, so the
         // report carries the work of the turns that did run.
+        //
+        // `turn - 1` is that count, and it is the ONE report site that needs
+        // it. Every other one runs after its reply arrived, so its turn ran.
+        // This one runs before the model is asked, and a report of `turn`
+        // would count a turn nobody made and nobody paid for. The subtraction
+        // cannot go below zero, because `turn` counts from one.
         if over_input_cap(&request) {
-            return Ok(report(&last_text, turn, tool_calls, STOP_TRANSCRIPT_FULL));
+            return Ok(report(
+                &last_text,
+                turn - 1,
+                tool_calls,
+                STOP_TRANSCRIPT_FULL,
+            ));
         }
         let reply: TurnReply = ctx
             .execute_activity(&claude_turn_info(), request)
