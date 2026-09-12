@@ -149,6 +149,7 @@ panel finds the way back to the rule and its runbook section.
 | `harvest_shard_fenced` | Cross-region DR → *Workers fenced (never self-healing)* |
 | `harvest_replication_unobservable` | Cross-region DR → *Replication observable (0 = the other DR panels are STALE)* |
 | `harvest_audit_export_lag_high` | Audit export to SIEM → *Audit export lag (oldest unshipped audit record)*, with *Audit records exported* to tell a sink outage from a quiet fleet |
+| `harvest_audit_export_unobservable` | Audit export to SIEM → *Audit export observed (0 = the lag panel above is STALE)* |
 
 ### Readiness-style alerts (no native metric)
 

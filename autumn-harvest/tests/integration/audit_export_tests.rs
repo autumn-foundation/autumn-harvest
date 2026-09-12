@@ -35,6 +35,9 @@
 //!   unconfigured counterpart — the silent-loss hole a naive retention sweep
 //!   would open.
 //! - `every_batch_is_hmac_signed_and_carries_its_shard_and_seq_range` — AC1/AC4.
+//! - `a_shard_the_scanner_cannot_acquire_a_connection_for_is_marked_unobserved`
+//!   — issue #1268: `harvest.audit.export_observed` reports an unreachable
+//!   shard, so the lag gauge is never the only signal.
 
 use std::sync::{Arc, Mutex};
 
@@ -169,16 +172,24 @@ impl AuditSink for RecordingSink {
     }
 }
 
-/// Records `harvest.audit.export_lag` / `harvest.audit.exported` samples.
+/// Records `harvest.audit.export_lag` / `harvest.audit.export_observed` /
+/// `harvest.audit.exported` samples.
 #[derive(Default)]
 struct RecordingMetrics {
     lag: Mutex<Vec<(u16, f64)>>,
+    observed: Mutex<Vec<(u16, bool)>>,
     exported: Mutex<Vec<(u16, u64)>>,
 }
 
 impl MetricsRecorder for RecordingMetrics {
     fn record_audit_export_lag(&self, shard: u16, seconds: f64) {
         self.lag.lock().expect("lag lock").push((shard, seconds));
+    }
+    fn record_audit_export_observed(&self, shard: u16, observed: bool) {
+        self.observed
+            .lock()
+            .expect("observed lock")
+            .push((shard, observed));
     }
     fn record_audit_exported(&self, shard: u16, count: u64) {
         self.exported
@@ -834,6 +845,11 @@ async fn export_status_reports_cursor_lag_and_state() {
     assert!(
         !metrics.lag.lock().expect("lag").is_empty(),
         "harvest.audit.export_lag must be emitted every tick"
+    );
+    assert_eq!(
+        *metrics.observed.lock().expect("observed"),
+        vec![(0_u16, true)],
+        "a successful tick reports the shard as observed"
     );
     assert_eq!(
         *metrics.exported.lock().expect("exported"),
@@ -1589,6 +1605,12 @@ async fn the_exported_counter_is_not_bumped_when_delivery_fails() {
         !metrics.lag.lock().expect("lag").is_empty(),
         "the lag gauge must still be emitted on a tick that delivered nothing"
     );
+    assert_eq!(
+        *metrics.observed.lock().expect("observed"),
+        vec![(0_u16, true)],
+        "a sink rejecting the batch is not the same as the exporter being \
+         unable to observe the shard: the cursor and lag were read fine"
+    );
 }
 
 #[tokio::test]
@@ -1613,6 +1635,51 @@ async fn an_idle_tick_never_calls_the_sink_but_still_emits_lag() {
         *metrics.lag.lock().expect("lag"),
         vec![(0_u16, 0.0)],
         "the gauge is emitted with 0 rather than going stale"
+    );
+    assert_eq!(
+        *metrics.observed.lock().expect("observed"),
+        vec![(0_u16, true)],
+        "an idle tick still observed the shard fine, so the availability \
+         gauge reports true alongside the lag gauge"
+    );
+}
+
+// Issue #1268: a shard the scanner cannot acquire a connection for must not
+// leave `harvest.audit.export_lag` as the only signal. Before this fix, the
+// sharded loop `continue`d past an unreachable shard without touching either
+// gauge. The lag gauge then kept serving a stale, commonly caught-up value
+// forever, and no alert could tell "healthy" apart from "unobservable".
+#[tokio::test]
+async fn a_shard_the_scanner_cannot_acquire_a_connection_for_is_marked_unobserved() {
+    let _guard = TEST_SERIAL.lock().await;
+    let _installed = install(Arc::new(RecordingSink::new(200)), 100);
+    let (mut conn, container) = make_conn().await;
+
+    // The sharded pool only maps shard 0; shard 7 is assigned but has no
+    // pool, the shape `sp.exact_pool_for` reports for an unreachable shard.
+    let pool = single_connection_pool(&container).await;
+    let sharded = autumn_harvest::shard::ShardedDbPool::single(pool);
+
+    let metrics = RecordingMetrics::default();
+    let _ = fire_due_audit_exports(
+        &mut conn,
+        &Some(sharded),
+        &[autumn_harvest::types::ShardId::new(7)],
+        &metrics,
+    )
+    .await;
+    uninstall();
+
+    assert_eq!(
+        *metrics.observed.lock().expect("observed"),
+        vec![(7_u16, false)],
+        "an unreachable shard must be reported unobserved, loudly, rather \
+         than silently skipped"
+    );
+    assert!(
+        metrics.lag.lock().expect("lag").is_empty(),
+        "the lag gauge must not be given a fabricated reading for a shard \
+         that was never actually queried"
     );
 }
 
