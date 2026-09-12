@@ -1356,15 +1356,20 @@ async fn start_child_on_target(
                 // extended this to the chain deadline, which used to be the
                 // one exception.
                 let created_at = Utc::now();
-                let deadline_at = spec
-                    .execution_timeout_secs
-                    .map(|secs| created_at + chrono::Duration::seconds(secs));
-                let sla_deadline_at = spec
-                    .sla_secs
-                    .map(|secs| created_at + chrono::Duration::seconds(secs));
-                let chain_deadline_at = spec
-                    .chain_execution_timeout_secs
-                    .map(|secs| created_at + chrono::Duration::seconds(secs));
+                // `checked_add_signed` (not `+`): `DateTime + Duration` panics
+                // on overflow, and these seconds values are caller-supplied.
+                // `execution::start_or_load_workflow_execution`'s chain-ceiling
+                // computation uses the same guard for the same reason. `None`
+                // on overflow means no deadline, not a crashed relay sweep.
+                let deadline_at = spec.execution_timeout_secs.and_then(|secs| {
+                    created_at.checked_add_signed(chrono::Duration::seconds(secs))
+                });
+                let sla_deadline_at = spec.sla_secs.and_then(|secs| {
+                    created_at.checked_add_signed(chrono::Duration::seconds(secs))
+                });
+                let chain_deadline_at = spec.chain_execution_timeout_secs.and_then(|secs| {
+                    created_at.checked_add_signed(chrono::Duration::seconds(secs))
+                });
 
                 let child_row = NewWorkflowExecution {
                     continued_from_exec_id: None,
@@ -1421,20 +1426,6 @@ async fn start_child_on_target(
                     // event and task.
                     return Ok(());
                 }
-
-                // The child's OWN declared quota (issue #946), enforced against the
-                // row this transaction just inserted and BEFORE its `WorkflowStarted`
-                // event is appended — the identical insert-then-enforce ordering the
-                // same-shard child path uses, so `history_bytes` reports usage
-                // strictly before this admission.
-                crate::execution::enforce_quota_admission(
-                    conn,
-                    spec.quota.map(QuotaCaps::to_policy),
-                    spec.quota_key.as_deref(),
-                    &workflow_name,
-                    Some(metrics),
-                )
-                .await?;
 
                 // The CONFIGURED codec registry, never `PayloadCodecs::default()`.
                 // The child's `WorkflowStarted` carries its input, so writing it
@@ -1497,6 +1488,15 @@ async fn start_child_on_target(
                     // run a live decision cycle for a child that had already
                     // lost its race. Never creating the task closes that
                     // window outright.
+                    //
+                    // This check runs BEFORE quota admission below (issue
+                    // #1263 item 13 follow-up). A race loser that is ALSO
+                    // over quota must still settle into CANCELLED. It will
+                    // never run, so it never actually consumes the quota it
+                    // would otherwise be rejected for. Enforcing admission
+                    // first would instead roll back this transaction every
+                    // sweep, leaving the loser stuck `PENDING_START` for as
+                    // long as the quota stays exceeded.
                     diesel::update(
                         harvest_workflow_executions::table.find(child_exec_id.as_uuid()),
                     )
@@ -1510,12 +1510,20 @@ async fn start_child_on_target(
                     .await
                     .map_err(crate::error::database_error)?;
                     // A born-cancelled child bypasses `cancel_workflow_execution`.
-                    // So its completion triggers need this explicit call (issue
-                    // #1263 item 13 follow-up). Otherwise a workflow configured
-                    // to start on this child's cancellation never would. Every
-                    // returned start already has its own durable outbox row,
+                    // So its terminal metric and completion triggers need this
+                    // explicit handling (issue #1263 item 13 follow-up).
+                    // Otherwise the fleet-wide cancelled count would silently
+                    // undercount, and a workflow configured to start on this
+                    // child's cancellation never would. Every trigger start
+                    // returned already has its own durable outbox row,
                     // committed by this same call. `spawn()` here is a
                     // best-effort latency nudge, not the only path to it.
+                    crate::telemetry::emit_workflow_terminal(
+                        metrics,
+                        &workflow_name,
+                        &spec.queue_name,
+                        crate::telemetry::WorkflowStatus::Cancelled,
+                    );
                     for start in crate::completion_trigger::evaluate_triggers_for_execution(
                         conn,
                         child_exec_id,
@@ -1528,6 +1536,21 @@ async fn start_child_on_target(
                     }
                     return Ok(());
                 }
+
+                // The child's OWN declared quota (issue #946), enforced against the
+                // row this transaction just inserted and BEFORE its `WorkflowStarted`
+                // event is appended — the identical insert-then-enforce ordering the
+                // same-shard child path uses, so `history_bytes` reports usage
+                // strictly before this admission. Skipped entirely above when the
+                // child is already cancelled — see that branch's own comment.
+                crate::execution::enforce_quota_admission(
+                    conn,
+                    spec.quota.map(QuotaCaps::to_policy),
+                    spec.quota_key.as_deref(),
+                    &workflow_name,
+                    Some(metrics),
+                )
+                .await?;
                 store::append_events_offloaded_with_codecs(
                     conn,
                     child_exec_id,

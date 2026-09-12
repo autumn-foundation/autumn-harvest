@@ -754,6 +754,99 @@ async fn a_cross_shard_child_cancelled_before_creation_is_born_cancelled() {
     );
 }
 
+/// **Regression (issue #1263 item 13 follow-up).** A race loser born
+/// cancelled must settle into `CANCELLED` even when its own quota is
+/// already exceeded, not retry a doomed admission forever.
+///
+/// `max_active_executions: Some(0)` guarantees `enforce_quota_admission`
+/// rejects this child if it ever runs. `check_quota` treats `current >=
+/// max` as a violation, and the just-inserted row's own count is
+/// subtracted back out before the check. Before this fix, quota
+/// admission ran BEFORE the cancellation check. So this exact child
+/// would roll back and retry the same rejected admission on every
+/// sweep, stuck `PENDING_START` forever.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_cross_shard_child_cancelled_before_creation_bypasses_an_exceeded_quota() {
+    let (urls, _container) = setup_shard_databases(&SHARDS).await;
+    let sharded = build_sharded_pool(&urls);
+    install_globals(&router_for(&SHARDS), &sharded);
+
+    let parent = start_parent(&sharded, "child_echo", "born-cancelled-quota-1").await;
+    let child_shard = ShardId::new(1);
+    let child_id = ExecutionId::new_for_shard(child_shard);
+
+    let spec = autumn_harvest::cross_shard_child::CrossShardChildSpec {
+        input: json!({}),
+        queue_name: "default".to_string(),
+        assigned_build_id: None,
+        context_headers: None,
+        owner: None,
+        runbook_url: None,
+        severity: None,
+        sla_secs: None,
+        execution_timeout_secs: None,
+        chain_execution_timeout_secs: None,
+        retry_policy: None,
+        quota_key: Some("born-cancelled-quota-key".to_string()),
+        quota: Some(autumn_harvest::cross_shard_child::QuotaCaps {
+            max_active_executions: Some(0),
+            max_history_bytes: None,
+            max_dead_letters: None,
+        }),
+        concurrency_key: None,
+        max_concurrent: None,
+        trace_context: None,
+    };
+
+    let mut conn = shard_conn(&sharded, PARENT_SHARD).await;
+    autumn_harvest::cross_shard_child::record_cross_shard_child(
+        &mut conn,
+        parent,
+        child_id,
+        "child_echo",
+        None,
+        &spec,
+    )
+    .await
+    .expect("record cross-shard child");
+    autumn_harvest::cross_shard_child::request_cross_shard_cancel(&mut conn, child_id)
+        .await
+        .expect("request cancel");
+
+    let created = std::time::Instant::now();
+    loop {
+        let progressed = autumn_harvest::cross_shard_child::enforce_cross_shard_children(
+            &mut conn,
+            &Some(sharded.clone()),
+            &autumn_harvest::payload_codec::PayloadCodecs::default(),
+            &autumn_harvest::telemetry::NoOpMetrics,
+        )
+        .await
+        .expect("relay sweep must not fail even though the quota is exceeded");
+        if progressed > 0 {
+            break;
+        }
+        assert!(
+            created.elapsed() < Duration::from_secs(30),
+            "the relay never acted on the child; an exceeded quota must not block \
+             settling an already-cancelled race loser"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
+    let mut child_conn = shard_conn(&sharded, child_shard.as_i32()).await;
+    let state: String = harvest_workflow_executions::table
+        .find(child_id.as_uuid())
+        .select(harvest_workflow_executions::state)
+        .first(&mut *child_conn)
+        .await
+        .expect("child row must exist on its target shard");
+    assert_eq!(
+        state, "CANCELLED",
+        "a race loser must settle into CANCELLED even over an exceeded quota"
+    );
+}
+
 /// **Regression (issue #1263 item 10, compliance-sensitive).** Erasing a
 /// parent must reach a terminal CROSS-SHARD child's payloads too, not just its
 /// same-shard children.
