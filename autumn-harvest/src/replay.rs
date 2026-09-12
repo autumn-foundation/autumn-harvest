@@ -918,11 +918,11 @@ impl HistoryMatcher {
     ///
     /// An activity author can also quote the reason AND match the shape (issue
     /// #1265): `ActivityFailure::non_retryable` reproduces both. The
-    /// synthetic path never dispatches, so it never writes `ActivityStarted`
-    /// or `ActivityHeartbeat` for the id. A real attempt does. This is a
-    /// structural check, not another field-value guess, so a candidate
-    /// activity with either event anywhere in the scanned window keeps its
-    /// genuine terminal instead of being marked transparent.
+    /// synthetic path never dispatches. It never writes `ActivityStarted` or
+    /// `ActivityHeartbeat` for the id. A real attempt does. This is a
+    /// structural check, not another field-value guess. A candidate activity
+    /// with either event anywhere in the scanned window keeps its genuine
+    /// terminal instead of being marked transparent.
     fn abandoned_dispatch_indices(events: &[WorkflowEvent]) -> Vec<usize> {
         let mut started_activities: HashSet<ActivityExecId> = HashSet::new();
         for event in events {
@@ -9648,12 +9648,12 @@ mod tests {
         }
     }
 
-    /// A genuine activity failure can quote the reserved reason AND land on
-    /// attempt 1, non-retryable, with no details — the full shape the matcher
-    /// checks (issue #1265). What the synthetic path never writes is an
+    /// A genuine activity failure can quote the reserved reason. It can also
+    /// land on attempt 1, non-retryable, with no details — the full shape
+    /// the matcher checks (issue #1265). The synthetic path never writes an
     /// `ActivityStarted` between the schedule and the failure: an abandoned
-    /// dispatch never actually ran. An intervening `ActivityStarted` is proof
-    /// this is a real terminal, so it must stay matchable — otherwise a
+    /// dispatch never actually ran. So an intervening `ActivityStarted` is
+    /// proof this is a real terminal, and it must stay matchable. Otherwise a
     /// redrive marks it transparent, the real `ActivityStarted` stays opaque,
     /// and the reopened run parks on it instead of re-dispatching.
     #[test]

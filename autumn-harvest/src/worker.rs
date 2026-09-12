@@ -18294,11 +18294,11 @@ fn terminal_history_event_count(
     next_event_id: i32,
     pending_cmds: &[WorkflowCommand],
     // Issue #952: nonzero for a FAILING terminal, whose batch also appends
-    // the abandoned-dispatch records. Issue #1265: this must be the SAME
-    // dedup-resolved count the hard-cap preflight computed
-    // (`abandoned_dispatch_event_count_resolved`), not a pre-dedup recount —
-    // a re-parked dispatch the dedup already zeroed must not inflate this
-    // gauge.
+    // the abandoned-dispatch records. Issue #1265: pass the hard-cap
+    // preflight's resolved value here, from
+    // `abandoned_dispatch_event_count_resolved`. Do not recompute a
+    // pre-dedup count. A re-parked dispatch the dedup already zeroed must
+    // not inflate this gauge.
     resolved_abandoned_dispatch_event_count: u64,
 ) -> u64 {
     u64::try_from(next_event_id)
