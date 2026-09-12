@@ -564,6 +564,12 @@ type FiredDebounce = (
 /// #1230 Finding 2 review). See
 /// [`order_due_rows_for_deadlock_free_firing`]'s doc comment for the full
 /// history.
+///
+/// Clone-class note: this function, [`order_due_rows_for_deadlock_free_firing`],
+/// [`resolve_quota_lock_ids`], and [`order_rows_by_quota_lock_id`] are a
+/// near-identical copy of the same four functions in `throttle.rs`. Commit
+/// #1480 added both copies together for issue #1230. Apply any future fix
+/// to the ordering algorithm to both files.
 #[cfg(feature = "db")]
 fn resolve_row_quota_lock_key(
     row: &FireDueRow,
