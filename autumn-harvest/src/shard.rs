@@ -927,8 +927,8 @@ pub struct ShardedDbPool {
 /// This is the right signal for `from_map`, whose caller may hand in
 /// clones of one pool under two shard ids. It cannot see through two
 /// independently built pools that merely share a connection string.
-/// `from_dsns` computes its own grouping for that case instead. It
-/// compares the DSNs directly, before they are ever built into a pool.
+/// `from_dsns` computes its own grouping for that case instead, with
+/// [`canonical_dsn_key`], before the DSNs are ever built into a pool.
 #[cfg(feature = "db")]
 fn group_by_pool_identity(pools: &BTreeMap<ShardId, DbPool>) -> BTreeMap<ShardId, u32> {
     let mut representatives: Vec<&DbPool> = Vec::new();
@@ -944,6 +944,35 @@ fn group_by_pool_identity(pools: &BTreeMap<ShardId, DbPool>) -> BTreeMap<ShardId
         groups.insert(*shard, u32::try_from(group).unwrap_or(u32::MAX));
     }
     groups
+}
+
+/// Canonical grouping key for a DSN (issue #1266).
+///
+/// Two DSNs can reach the same physical database while written
+/// differently: different credentials, an explicit default port, or extra
+/// connection parameters. Comparing the raw strings would treat these as
+/// separate databases. Each apparent group would then apply its own
+/// protection decision to rows the other group was meant to protect.
+///
+/// The key keeps only host, port (defaulted to 5432 when absent), and
+/// database name, lowercasing the host. It drops credentials and query
+/// parameters, since neither changes which physical database a
+/// connection reaches.
+///
+/// A host alias — two hostnames that resolve to one address — is not
+/// detected. That needs a DNS lookup, and building a pool must stay a
+/// pure, local operation with no network access. A DSN that does not
+/// parse as a URL falls back to the raw string, unchanged from before
+/// this key existed.
+#[cfg(feature = "db")]
+fn canonical_dsn_key(dsn: &str) -> String {
+    let Ok(url) = url::Url::parse(dsn) else {
+        return dsn.to_string();
+    };
+    let host = url.host_str().unwrap_or_default().to_ascii_lowercase();
+    let port = url.port().unwrap_or(5432);
+    let dbname = url.path().trim_start_matches('/');
+    format!("{host}:{port}/{dbname}")
 }
 
 #[cfg(feature = "db")]
@@ -1049,8 +1078,9 @@ impl ShardedDbPool {
     ///
     /// `from_map` detects a shared pool by object identity — aliased
     /// clones, the shape a pre-split staging deployment uses. `from_dsns`
-    /// detects it by comparing connection strings directly, since it
-    /// builds a fresh pool per entry even for two identical DSNs.
+    /// builds a fresh pool per entry, even for two DSNs that reach one
+    /// physical database. It detects the alias from a canonical form of
+    /// each connection string instead.
     #[must_use]
     pub fn pool_groups(&self) -> Vec<(&DbPool, Vec<ShardId>)> {
         let mut by_group: BTreeMap<u32, Vec<ShardId>> = BTreeMap::new();
@@ -1176,19 +1206,21 @@ impl ShardedDbPool {
         max_size: usize,
     ) -> crate::error::HarvestResult<Self> {
         let mut pools = BTreeMap::new();
-        // A fresh `Pool` is built per entry here, even for two identical
-        // DSNs (issue #1266). `group_by_pool_identity` could never see
-        // through that, so the DSN itself is the grouping key, compared
-        // before it is consumed into a manager.
-        let mut seen_dsns: Vec<String> = Vec::new();
+        // A fresh `Pool` is built per entry here, even for two DSNs that
+        // reach one physical database (issue #1266).
+        // `group_by_pool_identity` could never see through that, so
+        // `canonical_dsn_key` is the grouping key, compared before the
+        // DSN is consumed into a manager.
+        let mut seen_keys: Vec<String> = Vec::new();
         let mut pool_group = BTreeMap::new();
         for (shard, dsn) in entries {
-            let group = seen_dsns
+            let key = canonical_dsn_key(&dsn);
+            let group = seen_keys
                 .iter()
-                .position(|seen| *seen == dsn)
+                .position(|seen| *seen == key)
                 .unwrap_or_else(|| {
-                    seen_dsns.push(dsn.clone());
-                    seen_dsns.len() - 1
+                    seen_keys.push(key.clone());
+                    seen_keys.len() - 1
                 });
             pool_group.insert(shard, u32::try_from(group).unwrap_or(u32::MAX));
 
@@ -1891,6 +1923,64 @@ mod tests {
             groups.len(),
             2,
             "two different DSNs must never collapse into one group"
+        );
+    }
+
+    // Two DSNs can reach one physical database while written differently:
+    // different credentials, and an explicit default port versus none
+    // (issue #1266). Comparing the raw strings would miss this.
+    #[cfg(feature = "db")]
+    #[test]
+    fn from_dsns_groups_equivalent_dsns_with_different_credentials_and_port() {
+        let sharded = ShardedDbPool::from_dsns(
+            [
+                (
+                    ShardId::new(0),
+                    "postgres://alice:secret1@db.example/shared".to_string(),
+                ),
+                (
+                    ShardId::new(1),
+                    "postgres://bob:secret2@db.example:5432/shared".to_string(),
+                ),
+            ],
+            ShardId::new(0),
+            1,
+        )
+        .expect("pool builds without connecting");
+
+        let groups = sharded.pool_groups();
+        assert_eq!(
+            groups.len(),
+            1,
+            "same host and database, differing only in credentials and an \
+             explicit default port, must collapse to one group"
+        );
+        let mut shards = groups[0].1.clone();
+        shards.sort();
+        assert_eq!(shards, vec![ShardId::new(0), ShardId::new(1)]);
+    }
+
+    // Same host, different database name: never the same physical
+    // database (issue #1266).
+    #[cfg(feature = "db")]
+    #[test]
+    fn from_dsns_keeps_distinct_dbnames_on_the_same_host_separate() {
+        let sharded = ShardedDbPool::from_dsns(
+            [
+                (ShardId::new(0), "postgres://db.example/db-a".to_string()),
+                (ShardId::new(1), "postgres://db.example/db-b".to_string()),
+            ],
+            ShardId::new(0),
+            1,
+        )
+        .expect("pool builds without connecting");
+
+        let groups = sharded.pool_groups();
+        assert_eq!(
+            groups.len(),
+            2,
+            "two different database names on the same host must never \
+             collapse into one group"
         );
     }
 }

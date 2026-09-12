@@ -75,6 +75,18 @@ by the DSN string instead, compared before each string is consumed into a
 manager. The retention sweep's own grouping logic moved into
 `ShardedDbPool::pool_groups()`, so both callers share one grouping.
 
+A sixth review round (P1) found the DSN-string comparison itself too
+narrow: two DSNs reaching one physical database can differ in
+credentials, an explicit default port, or extra connection parameters,
+none of which change which database a connection reaches. `from_dsns`
+now compares a canonical key instead — host, port (defaulted to 5432),
+and database name, with the host lowercased — dropping credentials and
+query parameters. A DSN that does not parse as a URL falls back to the
+raw string, the prior behavior. A host alias (two hostnames resolving to
+one address) stays undetected by design: resolving it needs a DNS lookup,
+and building a pool must stay a pure, local operation with no network
+access.
+
 New tests:
 - `retention_protects_unexported_audit_when_configured_with_no_cursor_and_no_local_sink`
   reproduces the exact bootstrap window (no cursor row anywhere, no sink in
@@ -100,6 +112,11 @@ New tests:
   built them as two distinct `Pool` objects.
   `from_dsns_keeps_distinct_dsns_separate` confirms two different DSNs
   never collapse.
+- `from_dsns_groups_equivalent_dsns_with_different_credentials_and_port`
+  pins the sixth round's fix: two DSNs for one database, differing only
+  in credentials and an explicit default port, still collapse to one
+  group. `from_dsns_keeps_distinct_dbnames_on_the_same_host_separate`
+  confirms two database names on the same host never collapse.
 
 **Zero migration, zero engine impact beyond the new parameter.** No new
 `WorkflowEvent` variant, no schema change, no change to any existing call

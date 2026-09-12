@@ -302,9 +302,13 @@ shard records:
   Detection covers both ways a fleet builds a `ShardedDbPool`.
   `ShardedDbPool::from_map` can receive one cloned `Pool` under two shard
   IDs; the sweep groups these by pool identity. `ShardedDbPool::from_dsns`
-  builds a separate `Pool` per entry even for two identical connection
-  strings, so identity alone cannot see the alias; the sweep groups these
-  by the DSN string instead, before it is consumed into a pool.
+  builds a separate `Pool` per entry even for two connection strings that
+  reach one database, so identity alone cannot see the alias; the sweep
+  groups these by a canonical form of the DSN instead (host, port, and
+  database name, ignoring credentials and query parameters), compared
+  before the DSN is consumed into a pool. A host alias — two hostnames
+  that resolve to one address — is not detected; that would need a DNS
+  lookup, and building a pool must stay a pure, local operation.
 
   The remaining cost is operational, not architectural: an operator must
   remember to set the flag on every process, including ones added later.
