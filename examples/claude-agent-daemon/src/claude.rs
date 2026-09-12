@@ -544,7 +544,12 @@ pub mod offline {
                 Some(Ok(())) => "Done. The workspace is listed and the note is recorded. \
                      This answer comes from the offline stub, not from Claude."
                     .to_string(),
-                Some(Err(reason)) => format!(
+                Some(Err(Outcome::Changed(reason))) => format!(
+                    "The workspace is listed. The note IS recorded, and the \
+                     change is not durable yet: {reason}. This answer comes \
+                     from the offline stub, not from Claude."
+                ),
+                Some(Err(Outcome::Unchanged(reason))) => format!(
                     "The workspace is listed. The note is NOT recorded: {reason}. \
                      This answer comes from the offline stub, not from Claude."
                 ),
@@ -555,11 +560,21 @@ pub mod offline {
         }
     }
 
+    /// A failed write that changed the workspace, or one that did not.
+    ///
+    /// A write can fail AFTER its rename: the file holds the new bytes, and
+    /// only the flush to the disk failed. Reporting that as "not recorded"
+    /// would be false, and it would contradict the reason printed beside it.
+    pub enum Outcome {
+        Changed(String),
+        Unchanged(String),
+    }
+
     /// What became of the write this stub proposed?
     ///
     /// `None` means no result for it is recorded yet. `Some(Err)` carries the
     /// reason the workflow gave, which is what the operator needs to read.
-    fn write_outcome(request: &TurnRequest) -> Option<Result<(), String>> {
+    fn write_outcome(request: &TurnRequest) -> Option<Result<(), Outcome>> {
         request
             .messages
             .iter()
@@ -572,11 +587,16 @@ pub mod offline {
             })
             .map(|block| {
                 if block.get("is_error").and_then(Value::as_bool) == Some(true) {
-                    Err(block
+                    let reason = block
                         .get("content")
                         .and_then(Value::as_str)
                         .unwrap_or("the reason is not recorded")
-                        .to_string())
+                        .to_string();
+                    if block.get("changed").and_then(Value::as_bool) == Some(true) {
+                        Err(Outcome::Changed(reason))
+                    } else {
+                        Err(Outcome::Unchanged(reason))
+                    }
                 } else {
                     Ok(())
                 }

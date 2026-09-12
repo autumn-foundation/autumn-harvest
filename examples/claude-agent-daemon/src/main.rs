@@ -113,7 +113,10 @@ enum Command {
         /// The task, in your own words.
         goal: String,
         /// The hard bound on model calls.
-        #[arg(long, default_value_t = 8)]
+        ///
+        /// Zero turns is not a session. The loop would run no iteration and
+        /// record a completed run with a blank answer.
+        #[arg(long, default_value_t = 8, value_parser = clap::value_parser!(u32).range(1..))]
         max_turns: u32,
         /// How long a gated tool call waits for approval.
         #[arg(long, default_value_t = 900)]
@@ -373,36 +376,47 @@ fn is_obeyed(character: char) -> bool {
 
 /// Print one answer from the daemon.
 fn report(response: Response, socket: &Path) -> Result<(), String> {
-    match response {
-        Response::Submitted { execution_id } => {
-            line(&execution_id);
-            line(&format!("Watch it with: agentd status {execution_id}"));
-        }
-        Response::Session { session } => print_session(&session, socket),
-        Response::Sessions { sessions } => {
-            if sessions.is_empty() {
-                line("no sessions yet");
-            }
-            for session in &sessions {
-                print_session(session, socket);
-                line("");
-            }
-        }
-        Response::History { events } => {
-            for event in &events {
-                line(event);
-            }
-        }
-        Response::Ack { detail } => line(&detail),
-        Response::Error { message } => return Err(message),
+    if let Response::Error { message } = response {
+        return Err(message);
+    }
+    for text in rendered_lines(&response, socket) {
+        line(&text);
     }
     Ok(())
 }
 
-/// Print one session in a stable, greppable shape.
-fn print_session(view: &SessionView, socket: &Path) {
-    for text in session_lines(view, socket) {
-        line(&text);
+/// Render one answer as the lines an operator reads.
+///
+/// Built apart from the printing, so a test can read what the operator would
+/// see. Every follow-up command printed here must reach the daemon this
+/// command reached, which is what `socket` carries.
+fn rendered_lines(response: &Response, socket: &Path) -> Vec<String> {
+    match response {
+        Response::Submitted { execution_id } => vec![
+            execution_id.clone(),
+            format!(
+                "Watch it with: agentd status{} {execution_id}",
+                socket_flag(socket)
+            ),
+        ],
+        Response::Session { session } => session_lines(session, socket),
+        Response::Sessions { sessions } => {
+            if sessions.is_empty() {
+                return vec!["no sessions yet".to_string()];
+            }
+            sessions
+                .iter()
+                .flat_map(|session| {
+                    let mut lines = session_lines(session, socket);
+                    lines.push(String::new());
+                    lines
+                })
+                .collect()
+        }
+        Response::History { events } => events.clone(),
+        Response::Ack { detail } => vec![detail.clone()],
+        // Returned as an error by `report`, which never reaches here.
+        Response::Error { message } => vec![message.clone()],
     }
 }
 

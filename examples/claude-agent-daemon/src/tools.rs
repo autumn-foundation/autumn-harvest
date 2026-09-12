@@ -157,22 +157,52 @@ fn serves(root: &Path, recorded: &str) -> bool {
 /// The model reads the message and picks its next step, which is how a real
 /// harness recovers from a bad path or a missing file.
 fn dispatch(workspace: &Path, call: &ToolCall) -> ToolOutcome {
+    let reads = |result: Result<String, String>| result.map_err(Failure::from);
     let result = match call.name.as_str() {
-        TOOL_LIST_FILES => string_arg(&call.input, "path").and_then(|p| list_files(workspace, &p)),
-        TOOL_READ_FILE => string_arg(&call.input, "path").and_then(|p| read_file(workspace, &p)),
-        TOOL_WRITE_FILE => string_arg(&call.input, "path").and_then(|p| {
+        TOOL_LIST_FILES => {
+            reads(string_arg(&call.input, "path").and_then(|p| list_files(workspace, &p)))
+        }
+        TOOL_READ_FILE => {
+            reads(string_arg(&call.input, "path").and_then(|p| read_file(workspace, &p)))
+        }
+        TOOL_WRITE_FILE => (|| {
+            let path = string_arg(&call.input, "path")?;
             let content = string_arg(&call.input, "content")?;
-            write_file(workspace, &p, &content)
-        }),
-        other => Err(format!("unknown tool `{other}`")),
+            write_file(workspace, &path, &content)
+        })(),
+        other => Err(Failure::from(format!("unknown tool `{other}`"))),
     };
 
     match result {
+        // Only the write changes anything, and only it reports success here
+        // with the workspace changed.
         Ok(output) => ToolOutcome {
             output,
             is_error: false,
+            changed: call.name == TOOL_WRITE_FILE,
         },
-        Err(message) => ToolOutcome::error(message),
+        Err(failure) => ToolOutcome {
+            output: failure.message,
+            is_error: true,
+            changed: failure.changed,
+        },
+    }
+}
+
+/// One failed tool call, and whether it left the workspace changed.
+pub struct Failure {
+    message: String,
+    /// Set only where the workspace changed despite the failure.
+    changed: bool,
+}
+
+impl From<String> for Failure {
+    /// The ordinary failure: nothing was changed.
+    fn from(message: String) -> Self {
+        Self {
+            message,
+            changed: false,
+        }
     }
 }
 
@@ -353,12 +383,12 @@ const fn libc_o_nonblock() -> i32 {
 /// The body is idempotent: the same call writes the same bytes. That matters
 /// because activity execution is at-least-once. A crash between the write and
 /// its commit re-runs this body on resume.
-fn write_file(workspace: &Path, relative: &str, content: &str) -> Result<String, String> {
+fn write_file(workspace: &Path, relative: &str, content: &str) -> Result<String, Failure> {
     if content.len() > MAX_FILE_BYTES {
-        return Err(format!(
+        return Err(Failure::from(format!(
             "the content is {} bytes; the limit is {MAX_FILE_BYTES}",
             content.len()
-        ));
+        )));
     }
     let path = resolve(workspace, relative)?;
 
@@ -366,7 +396,9 @@ fn write_file(workspace: &Path, relative: &str, content: &str) -> Result<String,
     // body, and with it the whole daemon, and a device is not something a tool
     // call should write through.
     if std::fs::symlink_metadata(&path).is_ok_and(|existing| !existing.file_type().is_file()) {
-        return Err(format!("`{relative}` is not an ordinary file"));
+        return Err(Failure::from(format!(
+            "`{relative}` is not an ordinary file"
+        )));
     }
 
     if let Some(parent) = path.parent() {
@@ -404,16 +436,20 @@ fn write_file(workspace: &Path, relative: &str, content: &str) -> Result<String,
         Err(WriteFailure::BeforeRename(e)) => {
             // Nothing replaced the target, so the scratch file is litter.
             drop(std::fs::remove_file(&temporary));
-            Err(format!("cannot write `{relative}`: {e}"))
+            Err(Failure::from(format!("cannot write `{relative}`: {e}")))
         }
         // The target IS replaced. Reporting that nothing was written would be
         // false, and the model could undo work that landed. What failed is the
-        // durability of the change, not the change.
-        Err(WriteFailure::AfterRename(e)) => Err(format!(
-            "`{relative}` now holds the {} bytes, and the change is not flushed \
-             to the disk yet: {e}. A host crash could still lose it.",
-            content.len()
-        )),
+        // durability of the change, not the change. The flag says so to every
+        // reader of the result, and not only to one that reads the message.
+        Err(WriteFailure::AfterRename(e)) => Err(Failure {
+            message: format!(
+                "`{relative}` now holds the {} bytes, and the change is not \
+                 flushed to the disk yet: {e}. A host crash could still lose it.",
+                content.len()
+            ),
+            changed: true,
+        }),
     }
 }
 

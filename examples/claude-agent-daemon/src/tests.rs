@@ -974,6 +974,80 @@ async fn the_control_socket_is_private_and_never_deletes_another_file() {
 }
 
 #[test]
+fn a_write_that_landed_is_never_reported_as_absent() {
+    use crate::session::Message;
+
+    // Two assistant turns put the stub on its final turn, where it reports.
+    let transcript = |result: Value| TurnRequest {
+        model: claude::OFFLINE_MODEL.to_string(),
+        messages: vec![
+            Message::user(json!([{ "type": "text", "text": "go" }])),
+            Message::assistant(json!([{ "type": "text", "text": "listing" }])),
+            Message::assistant(json!([{ "type": "text", "text": "writing" }])),
+            Message::user(json!([result])),
+        ],
+    };
+    let answer = |result: Value| claude::offline::reply(&transcript(result)).text;
+
+    // A write can fail AFTER its rename: the file holds the new bytes, and
+    // only the flush failed. Reporting that as "not recorded" would be false,
+    // and it would contradict the reason printed beside it.
+    let durable_failure = answer(json!({
+        "type": "tool_result",
+        "tool_use_id": "toolu_offline_write",
+        "content": "`agent-notes.md` now holds the 62 bytes, and the change is not flushed",
+        "is_error": true,
+        "changed": true,
+    }));
+    assert!(
+        durable_failure.contains("IS recorded"),
+        "a write that landed must not be reported as absent: {durable_failure}"
+    );
+
+    // A write that never landed is still reported as absent.
+    let refused = answer(json!({
+        "type": "tool_result",
+        "tool_use_id": "toolu_offline_write",
+        "content": "the operator denied this call",
+        "is_error": true,
+        "changed": false,
+    }));
+    assert!(
+        refused.contains("NOT recorded"),
+        "a denied write must be reported as absent: {refused}"
+    );
+
+    // A result recorded before the flag existed carries no `changed` key, and
+    // reads back as unchanged.
+    let legacy = answer(json!({
+        "type": "tool_result",
+        "tool_use_id": "toolu_offline_write",
+        "content": "the operator denied this call",
+        "is_error": true,
+    }));
+    assert!(
+        legacy.contains("NOT recorded"),
+        "a result without the flag reads as unchanged: {legacy}"
+    );
+}
+
+#[test]
+fn a_zero_turn_session_is_rejected() {
+    use clap::Parser;
+
+    // Zero turns is not a session. The loop runs no iteration, and the run is
+    // recorded COMPLETED with a blank answer and `max_turns` as its reason.
+    assert!(
+        crate::Cli::try_parse_from(["agentd", "submit", "goal", "--max-turns", "0"]).is_err(),
+        "a zero turn bound must be refused at the boundary"
+    );
+    assert!(
+        crate::Cli::try_parse_from(["agentd", "submit", "goal", "--max-turns", "1"]).is_ok(),
+        "one turn is a session"
+    );
+}
+
+#[test]
 fn a_zero_drive_interval_is_rejected() {
     use clap::Parser;
 
@@ -1728,6 +1802,29 @@ fn the_decide_line_reaches_the_daemon_that_printed_it() {
     assert!(
         named.contains("--socket /run/agentd/project-b.sock"),
         "the chosen socket must be carried: {named}"
+    );
+
+    // The submit command prints a follow-up too, and it is the same failure
+    // one branch away.
+    let watch = |socket: &str| {
+        crate::rendered_lines(
+            &Response::Submitted {
+                execution_id: "01JCEXEC".to_string(),
+            },
+            Path::new(socket),
+        )
+        .into_iter()
+        .find(|line| line.contains("Watch it with"))
+        .expect("the watch line is printed")
+    };
+    let watch_named = watch("/run/agentd/project-b.sock");
+    assert!(
+        watch_named.contains("--socket /run/agentd/project-b.sock"),
+        "the watch command must carry the socket: {watch_named}"
+    );
+    assert!(
+        !watch("agentd.sock").contains("--socket"),
+        "the default socket needs no flag on the watch command"
     );
 
     // The common case stays short.
