@@ -142,18 +142,6 @@ pub struct TurnReply {
 pub struct ToolOutcome {
     pub output: String,
     pub is_error: bool,
-    /// Did this call change the workspace?
-    ///
-    /// A write that fails AFTER its rename changed the workspace and still
-    /// reports an error. What failed is the durability of the change, not the
-    /// change. A reader cannot tell that from the error flag alone. It would
-    /// report the file as absent when it is present.
-    ///
-    /// The field is absent from a result recorded before it existed, and it
-    /// reads back as `false`. No such result can be a write that landed,
-    /// because the flag is set wherever one is reported.
-    #[serde(default)]
-    pub changed: bool,
 }
 
 impl ToolOutcome {
@@ -162,7 +150,6 @@ impl ToolOutcome {
         Self {
             output: message.into(),
             is_error: true,
-            changed: false,
         }
     }
 }
@@ -334,13 +321,17 @@ async fn run_tool_call(
 }
 
 /// Build the `tool_result` block the next request carries.
-fn tool_result_block(tool_use_id: &str, outcome: &ToolOutcome) -> Value {
+///
+/// The fields are the ones the Messages API defines for a `tool_result`, and
+/// nothing else. This block is replayed to the API on the next turn, so a
+/// field invented here would travel with it. Bookkeeping this daemon wants
+/// for itself belongs in the recorded [`ToolOutcome`], which is never sent.
+pub fn tool_result_block(tool_use_id: &str, outcome: &ToolOutcome) -> Value {
     json!({
         "type": "tool_result",
         "tool_use_id": tool_use_id,
         "content": outcome.output,
         "is_error": outcome.is_error,
-        "changed": outcome.changed,
     })
 }
 

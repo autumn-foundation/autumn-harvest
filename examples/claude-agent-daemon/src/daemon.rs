@@ -544,7 +544,7 @@ fn handle(
             }
         }
         Request::List => match sessions(runtime, reader, blocked, false) {
-            Ok(sessions) => Response::Sessions { sessions },
+            Ok((sessions, more)) => Response::Sessions { sessions, more },
             Err(message) => Response::Error { message },
         },
         Request::History { execution_id } => history(runtime, reader, &execution_id),
@@ -801,11 +801,20 @@ fn sessions(
     reader: &Connection,
     blocked: &Parked,
     full: bool,
-) -> Result<Vec<SessionView>, String> {
-    Ok(inspect::executions(reader, WORKFLOW_NAME)?
-        .into_iter()
-        .map(|row| view(runtime, &row, blocked, full))
-        .collect())
+) -> Result<(Vec<SessionView>, bool), String> {
+    let mut rows = inspect::executions(reader, WORKFLOW_NAME)?;
+    // One row past the cap was read, so the caller can say there are more
+    // without a second query. The extra one is not shown.
+    let more = rows.len() > inspect::MAX_LISTED_SESSIONS as usize;
+    if more {
+        rows.remove(0);
+    }
+    Ok((
+        rows.iter()
+            .map(|row| view(runtime, row, blocked, full))
+            .collect(),
+        more,
+    ))
 }
 
 /// Build one operator view.

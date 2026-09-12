@@ -10,6 +10,18 @@ use std::time::Duration;
 
 use rusqlite::{Connection, OpenFlags};
 
+/// How many sessions one listing carries.
+///
+/// `list` reads the whole row of every session it names. A session's goal and
+/// its report are both unbounded, and the count grows for the life of the
+/// file. An ordinary `agentd list` on an old database would read all of it
+/// into memory, build a view of every row, and serialise the lot. The runtime
+/// is serialised, so that also blocks every session drive until it ends.
+///
+/// The newest sessions are the ones an operator looks for. The cap takes
+/// those, and the listing says when it is not the whole history.
+pub const MAX_LISTED_SESSIONS: u32 = 200;
+
 /// How long a read waits for the writer's transaction to commit.
 const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -182,21 +194,29 @@ pub fn executions(conn: &Connection, workflow_name: &str) -> Result<Vec<Executio
     let mut statement = conn
         .prepare(
             "SELECT exec_id, state, input_json, output_json, error \
-             FROM harvest_executions WHERE workflow_name = ?1 ORDER BY rowid",
+             FROM harvest_executions WHERE workflow_name = ?1 \
+             ORDER BY rowid DESC LIMIT ?2",
         )
         .map_err(|e| format!("cannot prepare the session query: {e}"))?;
     let rows = statement
-        .query_map([workflow_name], |row| {
-            Ok(ExecutionRow {
-                exec_id: row.get(0)?,
-                state: row.get(1)?,
-                input_json: row.get(2)?,
-                output_json: row.get(3)?,
-                error: row.get(4)?,
-            })
-        })
+        .query_map(
+            rusqlite::params![workflow_name, MAX_LISTED_SESSIONS + 1],
+            |row| {
+                Ok(ExecutionRow {
+                    exec_id: row.get(0)?,
+                    state: row.get(1)?,
+                    input_json: row.get(2)?,
+                    output_json: row.get(3)?,
+                    error: row.get(4)?,
+                })
+            },
+        )
         .map_err(|e| format!("cannot read the sessions: {e}"))?;
 
-    rows.collect::<Result<Vec<_>, _>>()
-        .map_err(|e| format!("cannot read the sessions: {e}"))
+    let mut listed = rows
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| format!("cannot read the sessions: {e}"))?;
+    // The newest are read first, so the listing reads oldest first again.
+    listed.reverse();
+    Ok(listed)
 }

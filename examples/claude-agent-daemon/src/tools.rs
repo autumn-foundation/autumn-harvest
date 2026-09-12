@@ -174,35 +174,35 @@ fn dispatch(workspace: &Path, call: &ToolCall) -> ToolOutcome {
     };
 
     match result {
-        // Only the write changes anything, and only it reports success here
-        // with the workspace changed.
         Ok(output) => ToolOutcome {
             output,
             is_error: false,
-            changed: call.name == TOOL_WRITE_FILE,
         },
-        Err(failure) => ToolOutcome {
-            output: failure.message,
-            is_error: true,
-            changed: failure.changed,
-        },
+        Err(failure) => ToolOutcome::error(failure.message),
     }
 }
 
-/// One failed tool call, and whether it left the workspace changed.
+/// The words a post-rename failure says about the target.
+///
+/// The write landed and only the flush failed, so the file DOES hold the new
+/// bytes. A reader must tell that apart from a write that never happened. The
+/// only channel to a model is this text.
+///
+/// The producer and every reader share this one constant, so the two cannot
+/// drift apart. It is deliberately not a field on the result. Such a field
+/// would travel into the API `tool_result` block, and the Messages API
+/// defines no such property there.
+pub const LANDED_UNFLUSHED: &str =
+    "now holds the new bytes, and the change is not flushed to the disk";
+
+/// One failed tool call.
 pub struct Failure {
     message: String,
-    /// Set only where the workspace changed despite the failure.
-    changed: bool,
 }
 
 impl From<String> for Failure {
-    /// The ordinary failure: nothing was changed.
     fn from(message: String) -> Self {
-        Self {
-            message,
-            changed: false,
-        }
+        Self { message }
     }
 }
 
@@ -442,14 +442,10 @@ fn write_file(workspace: &Path, relative: &str, content: &str) -> Result<String,
         // false, and the model could undo work that landed. What failed is the
         // durability of the change, not the change. The flag says so to every
         // reader of the result, and not only to one that reads the message.
-        Err(WriteFailure::AfterRename(e)) => Err(Failure {
-            message: format!(
-                "`{relative}` now holds the {} bytes, and the change is not \
-                 flushed to the disk yet: {e}. A host crash could still lose it.",
-                content.len()
-            ),
-            changed: true,
-        }),
+        Err(WriteFailure::AfterRename(e)) => Err(Failure::from(format!(
+            "`{relative}` {LANDED_UNFLUSHED} yet: {e}. A host crash could \
+             still lose it.",
+        ))),
     }
 }
 

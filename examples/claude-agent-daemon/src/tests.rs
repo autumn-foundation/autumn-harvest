@@ -15,6 +15,7 @@ use serde_json::{Value, json};
 use crate::claude;
 use crate::daemon;
 use crate::guard;
+use crate::inspect;
 use crate::protocol::{self, Request, Response};
 use crate::session::{
     self, ApprovalDecision, SIGNAL_TOOL_APPROVAL, SessionReport, SessionTask, ToolCall,
@@ -651,7 +652,7 @@ async fn the_daemon_serves_one_session_over_its_socket() {
     let listed = protocol::call(&socket, &Request::List)
         .await
         .expect("the list is answered");
-    let Response::Sessions { sessions } = listed else {
+    let Response::Sessions { sessions, .. } = listed else {
         panic!("unexpected answer: {listed:?}");
     };
     assert_eq!(sessions.len(), 1, "one session is recorded");
@@ -995,9 +996,8 @@ fn a_write_that_landed_is_never_reported_as_absent() {
     let durable_failure = answer(json!({
         "type": "tool_result",
         "tool_use_id": "toolu_offline_write",
-        "content": "`agent-notes.md` now holds the 62 bytes, and the change is not flushed",
+        "content": format!("`agent-notes.md` {} yet: no space left", tools::LANDED_UNFLUSHED),
         "is_error": true,
-        "changed": true,
     }));
     assert!(
         durable_failure.contains("IS recorded"),
@@ -1010,24 +1010,112 @@ fn a_write_that_landed_is_never_reported_as_absent() {
         "tool_use_id": "toolu_offline_write",
         "content": "the operator denied this call",
         "is_error": true,
-        "changed": false,
     }));
     assert!(
         refused.contains("NOT recorded"),
         "a denied write must be reported as absent: {refused}"
     );
 
-    // A result recorded before the flag existed carries no `changed` key, and
-    // reads back as unchanged.
-    let legacy = answer(json!({
-        "type": "tool_result",
-        "tool_use_id": "toolu_offline_write",
-        "content": "the operator denied this call",
-        "is_error": true,
-    }));
+    // The block this daemon builds is replayed to the Messages API on the
+    // next turn. It carries the fields that API defines for a tool_result,
+    // and nothing else. A field invented here would travel with it.
+    let outcome = session::ToolOutcome {
+        output: "wrote 12 bytes".to_string(),
+        is_error: false,
+    };
+    let block = session::tool_result_block("toolu_a", &outcome);
+    let mut keys: Vec<&str> = block
+        .as_object()
+        .expect("the block is an object")
+        .keys()
+        .map(String::as_str)
+        .collect();
+    keys.sort_unstable();
+    assert_eq!(
+        keys,
+        vec!["content", "is_error", "tool_use_id", "type"],
+        "the tool_result block must carry no invented property"
+    );
+}
+
+#[test]
+fn a_blank_model_name_is_refused() {
+    // A blank name is not a model. Every request would carry it, the API
+    // would refuse each one, and the refusal of an accepted request is
+    // terminal. The daemon would advertise readiness and fail every session.
+    for blank in ["", " ", "\t\n"] {
+        let (_, signal) = crate::shutdown::channel();
+        let refusal = claude::ModelConfig::new(
+            Some("sk-ant-example".to_string()),
+            blank.to_string(),
+            claude::DEFAULT_MAX_TOKENS,
+            signal,
+        );
+        let Err(message) = refusal else {
+            panic!("a blank model name must be refused: {blank:?}");
+        };
+        assert!(
+            message.contains("blank"),
+            "the refusal must say what is wrong: {message}"
+        );
+    }
+
+    // A real name still opens.
+    let (_, signal) = crate::shutdown::channel();
     assert!(
-        legacy.contains("NOT recorded"),
-        "a result without the flag reads as unchanged: {legacy}"
+        claude::ModelConfig::new(
+            Some("sk-ant-example".to_string()),
+            claude::DEFAULT_MODEL.to_string(),
+            claude::DEFAULT_MAX_TOKENS,
+            signal,
+        )
+        .is_ok(),
+        "a real model name must be accepted"
+    );
+}
+
+#[test]
+fn a_long_history_does_not_make_one_unbounded_listing() {
+    // `list` reads the whole row of every session it names, and both the goal
+    // and the report are unbounded. The runtime is serialised, so an
+    // unbounded listing would also block every session drive while it ran.
+    let dir = tempfile::tempdir().expect("a temporary directory");
+    let db = dir.path().join("agentd.db");
+    let conn = rusqlite::Connection::open(&db).expect("the database opens");
+    conn.execute_batch(
+        "CREATE TABLE harvest_executions (
+            rowid_alias INTEGER, exec_id TEXT, workflow_name TEXT, state TEXT,
+            input_json TEXT, output_json TEXT, error TEXT
+        );",
+    )
+    .expect("the fixture schema is created");
+    let rows = inspect::MAX_LISTED_SESSIONS + 25;
+    for n in 0..rows {
+        conn.execute(
+            "INSERT INTO harvest_executions
+             (exec_id, workflow_name, state, input_json, output_json, error)
+             VALUES (?1, ?2, 'COMPLETED', '{}', NULL, NULL)",
+            rusqlite::params![format!("exec-{n:04}"), WORKFLOW_NAME],
+        )
+        .expect("the fixture row is inserted");
+    }
+    drop(conn);
+
+    let reader = inspect::open(&db).expect("the read-only connection opens");
+    let listed = inspect::executions(&reader, WORKFLOW_NAME).expect("the listing reads");
+    assert_eq!(
+        listed.len(),
+        inspect::MAX_LISTED_SESSIONS as usize + 1,
+        "the listing must stop one past the cap, so the caller can say there are more"
+    );
+
+    // The newest are the ones an operator is looking for, and they read in
+    // the order they were submitted.
+    let last = listed.last().expect("the listing is not empty");
+    assert_eq!(
+        last.exec_id,
+        format!("exec-{:04}", rows - 1),
+        "the newest session must be in the listing"
     );
 }
 

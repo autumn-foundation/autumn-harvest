@@ -62,6 +62,11 @@ pub enum Response {
     },
     Sessions {
         sessions: Vec<SessionView>,
+        /// Set when the database holds more sessions than this listing shows.
+        /// The listing is capped, so an old database cannot be read whole
+        /// into memory by one command. See `inspect::MAX_LISTED_SESSIONS`.
+        #[serde(default)]
+        more: bool,
     },
     History {
         events: Vec<String>,

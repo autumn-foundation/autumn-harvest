@@ -400,18 +400,25 @@ fn rendered_lines(response: &Response, socket: &Path) -> Vec<String> {
             ),
         ],
         Response::Session { session } => session_lines(session, socket),
-        Response::Sessions { sessions } => {
+        Response::Sessions { sessions, more } => {
             if sessions.is_empty() {
                 return vec!["no sessions yet".to_string()];
             }
-            sessions
+            let mut lines: Vec<String> = sessions
                 .iter()
                 .flat_map(|session| {
                     let mut lines = session_lines(session, socket);
                     lines.push(String::new());
                     lines
                 })
-                .collect()
+                .collect();
+            if *more {
+                lines.push(format!(
+                    "the newest {} sessions are shown; the database holds more",
+                    sessions.len()
+                ));
+            }
+            lines
         }
         Response::History { events } => events.clone(),
         Response::Ack { detail } => vec![detail.clone()],

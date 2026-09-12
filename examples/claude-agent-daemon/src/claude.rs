@@ -66,6 +66,17 @@ impl ModelConfig {
         // returns the model as given, so this one name would match a session
         // recorded against the stub. That session would then resume on the
         // API, and the transcript an operator kept local would be sent.
+        // A blank name is not a model. Every request would carry it, the API
+        // would refuse each one, and the refusal of an accepted request is
+        // terminal here. The daemon would advertise readiness and fail every
+        // session it was given.
+        if model.trim().is_empty() {
+            return Err(
+                "the model name is blank. Name a real model with `--model`, or \
+                 unset `ANTHROPIC_API_KEY` to use the offline stub."
+                    .to_string(),
+            );
+        }
         if api_key.is_some() && model == OFFLINE_MODEL {
             return Err(format!(
                 "`{OFFLINE_MODEL}` is the name this daemon records for its own stub, \
@@ -565,6 +576,9 @@ pub mod offline {
     /// A write can fail AFTER its rename: the file holds the new bytes, and
     /// only the flush to the disk failed. Reporting that as "not recorded"
     /// would be false, and it would contradict the reason printed beside it.
+    ///
+    /// The two are told apart by the words of the reason, because that text
+    /// is the only channel a model has. See [`tools::LANDED_UNFLUSHED`].
     pub enum Outcome {
         Changed(String),
         Unchanged(String),
@@ -592,7 +606,10 @@ pub mod offline {
                         .and_then(Value::as_str)
                         .unwrap_or("the reason is not recorded")
                         .to_string();
-                    if block.get("changed").and_then(Value::as_bool) == Some(true) {
+                    // A real model reads this text and writes its own
+                    // summary, so the stub reads the same text. The marker is
+                    // one shared constant, so the words cannot drift.
+                    if reason.contains(tools::LANDED_UNFLUSHED) {
                         Err(Outcome::Changed(reason))
                     } else {
                         Err(Outcome::Unchanged(reason))
