@@ -30,7 +30,15 @@ pub enum Request {
     /// Report every session this database holds.
     List,
     /// Report the recorded event log of one session.
-    History { execution_id: String },
+    ///
+    /// `before` reads the page that ENDS just before that sequence number. An
+    /// operator can then walk back through a log too long to print at once.
+    /// The answer names the number to pass next.
+    History {
+        execution_id: String,
+        #[serde(default)]
+        before: Option<i64>,
+    },
     /// Release or refuse one approval-gated tool call.
     ///
     /// `token` is the approval token the operator was shown. It names ONE wait

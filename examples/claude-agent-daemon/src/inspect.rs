@@ -58,6 +58,29 @@ pub struct ExecutionRow {
     pub error: Option<String>,
 }
 
+/// One session as a LISTING shows it, with every field already bounded.
+///
+/// A listing names many sessions, so it carries no whole payload. The single
+/// status of one session still reads its row entire, because that is the one
+/// session the operator asked about.
+pub struct SessionSummary {
+    pub exec_id: String,
+    pub state: String,
+    /// `None` when the recorded task cannot be read.
+    pub goal: Option<String>,
+    pub stop: Option<String>,
+    pub turns: Option<i64>,
+    pub tool_calls: Option<i64>,
+    pub answer: Option<String>,
+    pub error: Option<String>,
+}
+
+/// How many characters of one listed field are read.
+///
+/// A goal, an answer and an error are all written by somebody else: the
+/// operator, the model, or the engine. None of them is bounded at the source.
+pub const MAX_LISTED_CHARS: u32 = 500;
+
 /// Open the inspector connection.
 ///
 /// # Errors
@@ -141,12 +164,57 @@ pub fn events_before(
     before: Option<i64>,
     limit: u32,
 ) -> Result<Vec<(i64, serde_json::Value)>, String> {
+    read_events(conn, EVERY_EVENT, exec_id, before, limit)
+}
+
+/// Read one page of a session's MODEL REPLIES, newest first.
+///
+/// Same page walk as [`events_before`], over the replies alone. The database
+/// applies the filter. A turn that asked for many tools therefore does not
+/// put its results in front of the reply that named them.
+///
+/// That bounds the work as well as the memory. A search for an awaited call
+/// visits at most one row per model turn, and the turn count is what
+/// `--max-turns` already bounds. Without the filter, one status could walk
+/// every tool result of every turn, on the loop that drives every session.
+///
+/// # Errors
+///
+/// Returns an error if the query cannot run, or if a row is not readable.
+pub fn replies_before(
+    conn: &Connection,
+    exec_id: &str,
+    before: Option<i64>,
+    limit: u32,
+) -> Result<Vec<(i64, serde_json::Value)>, String> {
+    read_events(conn, ONLY_REPLIES, exec_id, before, limit)
+}
+
+/// Every recorded event.
+const EVERY_EVENT: &str = "";
+
+/// Only the events that carry a model reply.
+///
+/// A reply has a stop reason and a tool result does not, so the presence of
+/// that field is what tells the two apart. The engine records both as
+/// `ActivityCompleted`, and the event carries no activity name.
+const ONLY_REPLIES: &str = "AND json_extract(event_json, '$.data.output.stop_reason') IS NOT NULL ";
+
+/// One page of events, optionally narrowed by `filter`.
+fn read_events(
+    conn: &Connection,
+    filter: &str,
+    exec_id: &str,
+    before: Option<i64>,
+    limit: u32,
+) -> Result<Vec<(i64, serde_json::Value)>, String> {
+    let sql = format!(
+        "SELECT seq, event_json FROM harvest_events \
+         WHERE exec_id = ?1 AND (?2 IS NULL OR seq < ?2) {filter}\
+         ORDER BY seq DESC LIMIT ?3"
+    );
     let mut statement = conn
-        .prepare(
-            "SELECT seq, event_json FROM harvest_events \
-             WHERE exec_id = ?1 AND (?2 IS NULL OR seq < ?2) \
-             ORDER BY seq DESC LIMIT ?3",
-        )
+        .prepare(&sql)
         .map_err(|e| format!("cannot prepare the event query: {e}"))?;
     let rows = statement
         .query_map(rusqlite::params![exec_id, before, limit], |row| {
@@ -251,24 +319,39 @@ fn races_signal(timer_id: &str, signal: &str) -> bool {
 /// # Errors
 ///
 /// Returns an error if the query fails.
-pub fn executions(conn: &Connection, workflow_name: &str) -> Result<Vec<ExecutionRow>, String> {
+pub fn executions(conn: &Connection, workflow_name: &str) -> Result<Vec<SessionSummary>, String> {
+    // The FIELDS are selected, and not the rows. A recorded task and a
+    // recorded report can each approach the backend's payload cap. A listing
+    // that read them whole would hold hundreds of megabytes for a capped
+    // number of sessions. It would then copy that to build the views, and
+    // once more to serialise the answer. Each field is cut in the database,
+    // where the bytes already are.
     let mut statement = conn
         .prepare(
-            "SELECT exec_id, state, input_json, output_json, error \
+            "SELECT exec_id, state, \
+                    substr(json_extract(input_json, '$.goal'), 1, ?3), \
+                    json_extract(output_json, '$.stop'), \
+                    json_extract(output_json, '$.turns'), \
+                    json_extract(output_json, '$.tool_calls'), \
+                    substr(json_extract(output_json, '$.answer'), 1, ?3), \
+                    substr(error, 1, ?3) \
              FROM harvest_executions WHERE workflow_name = ?1 \
              ORDER BY rowid DESC LIMIT ?2",
         )
         .map_err(|e| format!("cannot prepare the session query: {e}"))?;
     let rows = statement
         .query_map(
-            rusqlite::params![workflow_name, MAX_LISTED_SESSIONS + 1],
+            rusqlite::params![workflow_name, MAX_LISTED_SESSIONS + 1, MAX_LISTED_CHARS],
             |row| {
-                Ok(ExecutionRow {
+                Ok(SessionSummary {
                     exec_id: row.get(0)?,
                     state: row.get(1)?,
-                    input_json: row.get(2)?,
-                    output_json: row.get(3)?,
-                    error: row.get(4)?,
+                    goal: row.get(2)?,
+                    stop: row.get(3)?,
+                    turns: row.get(4)?,
+                    tool_calls: row.get(5)?,
+                    answer: row.get(6)?,
+                    error: row.get(7)?,
                 })
             },
         )

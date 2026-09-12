@@ -657,9 +657,15 @@ async fn the_daemon_serves_one_session_over_its_socket() {
     };
     assert_eq!(sessions.len(), 1, "one session is recorded");
 
-    let logged = protocol::call(&socket, &Request::History { execution_id })
-        .await
-        .expect("the history is answered");
+    let logged = protocol::call(
+        &socket,
+        &Request::History {
+            execution_id,
+            before: None,
+        },
+    )
+    .await
+    .expect("the history is answered");
     let Response::History { events } = logged else {
         panic!("unexpected answer: {logged:?}");
     };
@@ -694,6 +700,7 @@ async fn the_daemon_serves_one_session_over_its_socket() {
         &socket,
         &Request::History {
             execution_id: "00000000-0000-4000-8000-000000000000".to_string(),
+            before: None,
         },
     )
     .await
@@ -1129,6 +1136,77 @@ fn a_long_history_does_not_make_one_unbounded_listing() {
     );
 }
 
+#[test]
+fn a_listing_reads_no_whole_payload() {
+    let dir = tempfile::tempdir().expect("a temporary directory");
+    let db = dir.path().join("agentd.db");
+    let conn = rusqlite::Connection::open(&db).expect("the database opens");
+    conn.execute_batch(
+        "CREATE TABLE harvest_executions (
+            exec_id TEXT, workflow_name TEXT, state TEXT,
+            input_json TEXT, output_json TEXT, error TEXT
+        );",
+    )
+    .expect("the fixture schema is created");
+
+    // A recorded task and a recorded report are each written by somebody
+    // else, and neither is bounded at the source. A listing that read them
+    // whole would hold every byte of every session it names.
+    let huge = "x".repeat(200_000);
+    conn.execute(
+        "INSERT INTO harvest_executions
+         (exec_id, workflow_name, state, input_json, output_json, error)
+         VALUES ('exec-1', ?1, 'COMPLETED', ?2, ?3, ?4)",
+        rusqlite::params![
+            WORKFLOW_NAME,
+            json!({ "goal": huge, "workspace": "/w", "model": "m", "max_turns": 4,
+                    "approval_timeout_secs": 1 })
+            .to_string(),
+            json!({ "answer": huge, "turns": 2, "tool_calls": 1, "stop": "end_turn" }).to_string(),
+            huge,
+        ],
+    )
+    .expect("the fixture row is inserted");
+    drop(conn);
+
+    let reader = inspect::open(&db).expect("the reader opens");
+    let listed = inspect::executions(&reader, WORKFLOW_NAME).expect("the listing reads");
+    let row = listed.first().expect("the session is listed");
+    let cap = inspect::MAX_LISTED_CHARS as usize;
+
+    for (name, field) in [
+        ("goal", &row.goal),
+        ("answer", &row.answer),
+        ("error", &row.error),
+    ] {
+        let held = field.as_deref().unwrap_or_default();
+        // Both halves matter. The first says the field obeys the cap. The
+        // second says the cap is doing work: an assertion against the cap
+        // alone would hold however large the cap became.
+        assert!(
+            held.len() <= cap,
+            "the listing must cut `{name}` to the cap, and read {} bytes",
+            held.len()
+        );
+        assert!(
+            held.len() < huge.len(),
+            "the listing must not read the whole `{name}`, and read {} of {} bytes",
+            held.len(),
+            huge.len()
+        );
+    }
+
+    // The fields it does not cut are the ones that are already small, and the
+    // listing still says what the session did.
+    assert_eq!(
+        row.stop.as_deref(),
+        Some("end_turn"),
+        "the stop reason reads"
+    );
+    assert_eq!(row.turns, Some(2), "the turn count reads");
+    assert_eq!(row.tool_calls, Some(1), "the tool call count reads");
+}
+
 #[tokio::test]
 async fn a_status_reads_a_bounded_slice_of_the_history() {
     let dir = tempfile::tempdir().expect("a temporary directory");
@@ -1285,6 +1363,7 @@ async fn a_history_command_reads_a_bounded_page() {
         &socket,
         &Request::History {
             execution_id: execution_id.clone(),
+            before: None,
         },
     )
     .await
@@ -1314,6 +1393,27 @@ async fn a_history_command_reads_a_bounded_page() {
         events[0].trim_start().starts_with("0  "),
         "the first line must carry the log's own first sequence number: {}",
         events[0]
+    );
+
+    // A truncated log must be reachable. The marker names the command that
+    // reads the events before this page, and that command must work.
+    let page = protocol::call(
+        &socket,
+        &Request::History {
+            execution_id: execution_id.clone(),
+            before: Some(2),
+        },
+    )
+    .await
+    .expect("the page is answered");
+    let Response::History { events: older } = page else {
+        panic!("unexpected answer: {page:?}");
+    };
+    assert_eq!(older.len(), 2, "the page before event 2 holds two events");
+    assert!(
+        older[0].trim_start().starts_with("0  "),
+        "the page must start at the log's own first event: {}",
+        older[0]
     );
 
     served.abort();

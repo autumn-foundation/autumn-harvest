@@ -132,7 +132,15 @@ enum Command {
     /// Report every session.
     List,
     /// Print the recorded event log of one session.
-    History { execution_id: String },
+    History {
+        execution_id: String,
+        /// Read the events BEFORE this sequence number.
+        ///
+        /// A long log prints its newest events and names the number to pass
+        /// here for the ones before them.
+        #[arg(long)]
+        before: Option<i64>,
+    },
     /// Release one gated tool call.
     ///
     /// `token` is the approval token `status` printed. It names one wait of one
@@ -243,8 +251,18 @@ async fn run(cli: Cli) -> Result<(), String> {
             protocol::call(&cli.socket, &Request::List).await?,
             &cli.socket,
         ),
-        Command::History { execution_id } => report(
-            protocol::call(&cli.socket, &Request::History { execution_id }).await?,
+        Command::History {
+            execution_id,
+            before,
+        } => report(
+            protocol::call(
+                &cli.socket,
+                &Request::History {
+                    execution_id,
+                    before,
+                },
+            )
+            .await?,
             &cli.socket,
         ),
         Command::Approve {

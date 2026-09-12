@@ -547,7 +547,10 @@ fn handle(
             Ok((sessions, more)) => Response::Sessions { sessions, more },
             Err(message) => Response::Error { message },
         },
-        Request::History { execution_id } => history(reader, &execution_id),
+        Request::History {
+            execution_id,
+            before,
+        } => history(reader, &execution_id, before),
         Request::Approve {
             execution_id,
             token,
@@ -734,7 +737,7 @@ fn expired(reader: &Connection, execution_id: &str, signal: &str) -> Result<Opti
 /// The session must exist. An event read of an unknown id returns no rows, so
 /// without this check a mistyped audit target prints an empty history and
 /// exits clean. That reads as a session that did nothing.
-fn history(reader: &Connection, execution_id: &str) -> Response {
+fn history(reader: &Connection, execution_id: &str, before: Option<i64>) -> Response {
     // Parsed for the message it gives, and not for a value. A mistyped id is
     // told apart from a real one this database does not hold.
     if let Err(e) = execution_id.parse::<ExecutionId>() {
@@ -755,24 +758,33 @@ fn history(reader: &Connection, execution_id: &str) -> Response {
     // whole transcript, and the count grows with every turn. Loading the log
     // entire would spend the daemon's memory on one command. It would also
     // block every session drive while it ran.
-    match inspect::events_before(reader, execution_id, None, inspect::MAX_HISTORY_EVENTS + 1) {
-        Ok(mut newest) => {
-            let more = newest.len() > inspect::MAX_HISTORY_EVENTS as usize;
+    match inspect::events_before(
+        reader,
+        execution_id,
+        before,
+        inspect::MAX_HISTORY_EVENTS + 1,
+    ) {
+        Ok(mut page) => {
+            let more = page.len() > inspect::MAX_HISTORY_EVENTS as usize;
             if more {
-                newest.pop();
+                page.pop();
             }
             // The log reads forward, and each line carries the event's own
             // sequence number rather than a position in this page.
-            newest.reverse();
-            let mut events: Vec<String> = newest
+            page.reverse();
+            let oldest = page.first().map(|(seq, _)| *seq);
+            let mut events: Vec<String> = page
                 .iter()
                 .map(|(seq, value)| format!("{seq:>3}  {}", describe(value)))
                 .collect();
-            if more {
+            // The omitted events must be reachable, or a bounded audit trail
+            // is a lost one. The line names the command that reads them.
+            if let (true, Some(oldest)) = (more, oldest) {
                 events.insert(
                     0,
                     format!(
-                        "… the newest {} events are shown; the log holds more",
+                        "… {} events shown; read the ones before them with \
+                         `agentd history {execution_id} --before {oldest}`",
                         events.len()
                     ),
                 );
@@ -824,10 +836,51 @@ fn sessions(
     }
     Ok((
         rows.iter()
-            .map(|row| view(reader, row, blocked, full))
+            .map(|row| summary_view(reader, row, blocked, full))
             .collect(),
         more,
     ))
+}
+
+/// Build one operator view from a bounded listing row.
+///
+/// The listing reads each field already cut, so this never holds a whole
+/// recorded payload. See [`inspect::SessionSummary`].
+fn summary_view(
+    reader: &Connection,
+    row: &inspect::SessionSummary,
+    blocked: &Parked,
+    full: bool,
+) -> SessionView {
+    let answer = row.stop.as_ref().map(|stop| {
+        format!(
+            "[{stop} after {} turns, {} tool calls] {}",
+            row.turns.unwrap_or_default(),
+            row.tool_calls.unwrap_or_default(),
+            row.answer.as_deref().unwrap_or_default()
+        )
+    });
+    let state = row
+        .exec_id
+        .parse::<ExecutionId>()
+        .ok()
+        .and_then(|exec| blocked.get(&exec));
+    let pending = state
+        .and_then(|state| state.signal.as_deref())
+        .and_then(|signal| pending_call(reader, &row.exec_id, signal, full));
+
+    SessionView {
+        execution_id: row.exec_id.clone(),
+        goal: row
+            .goal
+            .clone()
+            .unwrap_or_else(|| "<unreadable task>".to_string()),
+        state: row.state.clone(),
+        blocked_on: state.map(|state| state.reason.clone()),
+        pending,
+        answer,
+        error: row.error.clone(),
+    }
 }
 
 /// Build one operator view.
@@ -876,8 +929,11 @@ fn view(reader: &Connection, row: &ExecutionRow, blocked: &Parked, full: bool) -
 /// calls, and each one records events of its own. The model reply that holds
 /// the awaited call can therefore sit any distance back.
 ///
-/// The search walks pages until it finds the call or the log ends. Only the
-/// memory in hand at one moment is bounded. See [`inspect::EVENT_PAGE`].
+/// The search walks pages until it finds the call or the log ends, and it
+/// walks MODEL REPLIES alone. The database drops the tool results, so the
+/// work is one row per turn and not one row per event. `--max-turns` already
+/// bounds the turns. Memory and work are both bounded, and no page size can
+/// hide the call. See [`inspect::replies_before`].
 pub fn pending_call(
     reader: &Connection,
     exec_id: &str,
@@ -888,7 +944,7 @@ pub fn pending_call(
     let mut before = None;
 
     loop {
-        let page = inspect::events_before(reader, exec_id, before, inspect::EVENT_PAGE).ok()?;
+        let page = inspect::replies_before(reader, exec_id, before, inspect::EVENT_PAGE).ok()?;
         let (last, _) = *page.last()?;
         before = Some(last);
 
