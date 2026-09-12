@@ -4455,74 +4455,183 @@ fn a_search_refuses_to_walk_past_a_reply_it_cannot_read() {
     );
 }
 
-/// The search walks past a reply that asked for NOTHING, and finds the call.
+/// The search never looks past the newest reply, whatever that reply holds.
 ///
-/// This is the other half of the page property. A reply that asked for no
-/// tool is a fact the search can act on. An awaited call behind such replies
-/// is still found, however deep it sits.
+/// A parked session waits on a call of its NEWEST reply: the run cannot call
+/// the model again until the call it parked on resolves. So a newest reply
+/// that does not hold the awaited call is a fault, and not a reason to look
+/// further back.
+///
+/// Looking further back is unsafe, for the reason
+/// `a_search_refuses_to_walk_past_a_reply_it_cannot_read` gives. A tool-use
+/// id is unique inside ONE reply. An older reply can hold the same id for a
+/// different tool, so the operator reads one call and releases another.
+///
+/// An earlier fix made the unreadable reply fail closed, and kept the walk
+/// for the other two cases. That was half a fix. The id argument condemns the
+/// walk itself, and not only the walk past damage.
 #[test]
-fn a_search_walks_past_replies_that_asked_for_nothing() {
+fn a_search_never_looks_past_the_newest_reply() {
+    // The older reply reuses the awaited id for a different tool and target.
+    // This is the call that must never be offered.
+    let older = json!({
+        "type": "ActivityCompleted",
+        "data": { "output": {
+            "stop_reason": "tool_use",
+            "tool_calls": [{ "id": "toolu_same", "name": "read_file",
+                             "input": { "path": "secrets.txt" } }],
+        }},
+    })
+    .to_string();
+
+    // Each newest reply is READABLE, and none of them holds `toolu_same`.
+    let cases = [
+        (
+            "asked for nothing",
+            json!({ "type": "ActivityCompleted",
+                    "data": { "output": { "stop_reason": "end_turn" } } }),
+            "asked for no tool call",
+        ),
+        (
+            "holds another call",
+            json!({ "type": "ActivityCompleted", "data": { "output": {
+                "stop_reason": "tool_use",
+                "tool_calls": [{ "id": "toolu_other", "name": "write_file",
+                                 "input": { "path": "notes.md", "content": "x" } }],
+            }}}),
+            "does not hold the call",
+        ),
+        (
+            "holds an empty array",
+            json!({ "type": "ActivityCompleted", "data": { "output": {
+                "stop_reason": "tool_use", "tool_calls": [],
+            }}}),
+            "asked for no tool call",
+        ),
+    ];
+
+    for (case, newest, expected) in cases {
+        let dir = tempfile::tempdir().expect("a temporary directory");
+        let db = dir.path().join("stale-id-walk.db");
+        let writer = rusqlite::Connection::open(&db).expect("the database opens");
+        writer
+            .execute_batch(
+                "CREATE TABLE harvest_events (exec_id TEXT, seq INTEGER, event_json TEXT,              PRIMARY KEY (exec_id, seq));",
+            )
+            .expect("the fixture schema is created");
+        writer
+            .execute(
+                "INSERT INTO harvest_events VALUES ('e', 0, ?1)",
+                rusqlite::params![older],
+            )
+            .expect("the older reply is recorded");
+        writer
+            .execute(
+                "INSERT INTO harvest_events VALUES ('e', 1, ?1)",
+                rusqlite::params![newest.to_string()],
+            )
+            .expect("the newest reply is recorded");
+        drop(writer);
+
+        let reader = rusqlite::Connection::open(&db).expect("the database opens");
+
+        // The hazard is reachable only because the older call IS there and IS
+        // readable. The page proves both, so a refusal below is a choice and
+        // not a failure to read.
+        let page = inspect::reply_calls(&reader, "e", None, 8).expect("the replies read");
+        let older_calls = page.iter().find(|reply| reply.0 == 0).map(|reply| &reply.1);
+        assert!(
+            matches!(older_calls, Some(inspect::ReplyCalls::Calls(calls))
+                     if calls.iter().any(|call| call.id == "toolu_same")),
+            "[{case}] the older reply holds the awaited id: {page:?}"
+        );
+
+        // The awaited call belongs to the newer turn, and its id collides.
+        let signal = session::approval_signal(1, 0, "toolu_same");
+        let refused = daemon::pending_call(&reader, "e", &signal, false)
+            .expect_err("no call may be offered from an older reply");
+        assert!(
+            refused.contains(expected),
+            "[{case}] the refusal must say what stopped it: {refused}"
+        );
+        assert!(
+            !refused.contains("secrets.txt") && !refused.contains("read_file"),
+            "[{case}] and never name the older call: {refused}"
+        );
+
+        // The rendering offers no decision, and still says the session waits.
+        let parked = daemon::ParkedState {
+            signal: Some(signal),
+            reason: "waiting for approval of write_file".to_string(),
+        };
+        let (pending, blocked_on) = daemon::decidable(&reader, "e", Some(&parked), false);
+        assert!(
+            pending.is_none(),
+            "[{case}] the older call must NEVER be offered: {pending:?}"
+        );
+        let reason = blocked_on.expect("the session still says why it is parked");
+        assert!(
+            reason.contains("waiting for approval of write_file") && reason.contains(expected),
+            "[{case}] the reason keeps the wait and names what stopped: {reason}"
+        );
+        assert!(
+            !reason.contains("secrets.txt") && !reason.contains("read_file"),
+            "[{case}] and it never names the older call: {reason}"
+        );
+    }
+}
+
+/// A parked session finds its call in the newest reply, which is where it is.
+///
+/// The refusals above cost nothing a real run needs. This is the case the
+/// daemon actually serves. The same id sits in an older reply for a different
+/// tool. A search that looked back could answer with the wrong one even
+/// here.
+#[test]
+fn a_parked_call_in_the_newest_reply_is_still_found() {
     let dir = tempfile::tempdir().expect("a temporary directory");
-    let db = dir.path().join("quiet-replies.db");
+    let db = dir.path().join("newest-call.db");
     let writer = rusqlite::Connection::open(&db).expect("the database opens");
     writer
         .execute_batch(
             "CREATE TABLE harvest_events (exec_id TEXT, seq INTEGER, event_json TEXT,              PRIMARY KEY (exec_id, seq));",
         )
         .expect("the fixture schema is created");
-    let wanted = json!({
-        "type": "ActivityCompleted",
-        "data": { "output": {
-            "stop_reason": "tool_use",
-            "tool_calls": [{
-                "id": "toolu_wanted",
-                "name": "write_file",
-                "input": { "path": "notes.md", "content": "x" },
-            }],
-        }},
-    })
-    .to_string();
-    writer
-        .execute(
-            "INSERT INTO harvest_events VALUES ('e', 0, ?1)",
-            rusqlite::params![wanted],
-        )
-        .expect("the awaited reply is recorded");
-    // Three readable replies that asked for nothing sit NEWER than it.
-    let quiet = json!({
-        "type": "ActivityCompleted",
-        "data": { "output": { "stop_reason": "end_turn" } },
-    })
-    .to_string();
-    for seq in 1..4_i64 {
+    for (seq, tool, path) in [
+        (0_i64, "read_file", "secrets.txt"),
+        (1, "write_file", "notes.md"),
+    ] {
+        let reply = json!({
+            "type": "ActivityCompleted",
+            "data": { "output": {
+                "stop_reason": "tool_use",
+                "tool_calls": [{ "id": "toolu_same", "name": tool,
+                                 "input": { "path": path } }],
+            }},
+        })
+        .to_string();
         writer
             .execute(
                 "INSERT INTO harvest_events VALUES ('e', ?1, ?2)",
-                rusqlite::params![seq, quiet],
+                rusqlite::params![seq, reply],
             )
-            .expect("the quiet reply is recorded");
+            .expect("the reply is recorded");
     }
     drop(writer);
 
     let reader = rusqlite::Connection::open(&db).expect("the database opens");
-    let page = inspect::reply_calls(&reader, "e", None, 16).expect("the replies read");
-    assert_eq!(
-        page.iter()
-            .filter(|(_, calls)| matches!(calls, inspect::ReplyCalls::NoCalls))
-            .count(),
-        3,
-        "the quiet replies are named as asking for nothing: {page:?}"
-    );
-
-    let signal = session::approval_signal(0, 0, "toolu_wanted");
+    let signal = session::approval_signal(1, 0, "toolu_same");
     let found = daemon::pending_call(&reader, "e", &signal, false)
         .expect("the replies read")
-        .expect("the awaited call must be found behind the quiet replies");
+        .expect("the awaited call is in the newest reply");
     assert_eq!(
-        found.id, "toolu_wanted",
-        "and it is the call that was recorded"
+        found.tool, "write_file",
+        "the NEWEST call answers: {found:?}"
     );
-    assert_eq!(found.tool, "write_file", "with the tool it asked for");
+    assert!(
+        found.input.contains("notes.md") && !found.input.contains("secrets.txt"),
+        "with its own arguments and not the older ones: {found:?}"
+    );
 }
 
 /// The fault each recorded reply carries, before any of them is read.
@@ -8006,4 +8115,124 @@ async fn a_request_that_ends_at_the_cap_is_answered() {
     );
 
     daemon.abort();
+}
+
+/// A parent swapped after the path resolved is refused, and nothing is
+/// written.
+///
+/// `resolve` proves the chain contained WHEN IT RUNS, and the missing levels
+/// are created after that. Another process can put a symbolic link at one of
+/// those names in between.
+///
+/// Measured before the fix: the creation walked THROUGH the link, made a
+/// directory outside the workspace, reported success, and the write landed
+/// there. `exists` follows a link, so the swapped parent read as an ordinary
+/// existing directory and `create_dir` never saw `AlreadyExists` at all.
+///
+/// The review named the `AlreadyExists` arm. That arm is real but is not the
+/// reachable path, which is why both are covered here.
+#[test]
+fn a_parent_swapped_after_the_path_resolved_is_refused() {
+    let dir = tempfile::tempdir().expect("a temporary directory");
+    let workspace = dir.path().join("ws");
+    let outside = dir.path().join("outside");
+    std::fs::create_dir_all(&workspace).expect("the workspace is created");
+    std::fs::create_dir_all(&outside).expect("the outside directory is created");
+
+    // The state the window leaves behind, reached directly: `resolve` has
+    // already run and passed, and the link appears after it.
+    std::os::unix::fs::symlink(&outside, workspace.join("a")).expect("the link is made");
+    let parent = workspace.join("a").join("b");
+
+    // The hazard, stated before the refusal. The creation still succeeds and
+    // still lands outside, because it cannot know the root. That is exactly
+    // why the caller re-proves containment.
+    tools::create_enterable(&parent).expect("the creation walks through the link");
+    assert!(
+        outside.join("b").exists(),
+        "the window must be real, or this test proves nothing"
+    );
+
+    // The guard the write runs before it creates any scratch file.
+    let refused = tools::contained(&parent, &workspace)
+        .expect_err("a parent that leaves the workspace must be refused");
+    assert!(
+        refused.contains("leaves the workspace"),
+        "the refusal must say what is wrong: {refused}"
+    );
+    assert!(
+        !outside.join("b").join("note.md").exists(),
+        "and no content may be written outside: {refused}"
+    );
+
+    // The other arm. A DANGLING link occupies the name, so `exists` reads
+    // false, the level is treated as missing, and `create_dir` reports
+    // `AlreadyExists`. That was accepted in silence.
+    let dangling = workspace.join("c");
+    std::os::unix::fs::symlink(outside.join("gone"), &dangling).expect("the link is made");
+    assert!(!dangling.exists(), "the link dangles");
+    let owned = tools::create_enterable(&dangling)
+        .expect_err("a name another process owns is not a directory this call vouches for");
+    assert_eq!(
+        owned.kind(),
+        std::io::ErrorKind::AlreadyExists,
+        "and it says what it found: {owned}"
+    );
+
+    // The not-the-fault case: an ordinary nested parent inside the workspace
+    // is created and accepted, so the guard costs no legitimate write.
+    let honest = workspace.join("d").join("e");
+    tools::create_enterable(&honest).expect("an ordinary parent is created");
+    tools::contained(&honest, &workspace).expect("and it is inside the workspace");
+
+    // The write path must RUN that guard. No test can open the window it
+    // closes. The link has to appear between the resolve and the creation,
+    // which a test cannot schedule. The source is read instead, as the log
+    // guards in this suite do.
+    let source = include_str!("tools.rs");
+    let body = source
+        .split("fn write_file(")
+        .nth(1)
+        .expect("write_file is in the source");
+    let body = &body[..body.find("\nfn ").unwrap_or(body.len())];
+    let created = body
+        .find("create_enterable(")
+        .expect("the parents are created");
+    let guard = body
+        .find("contained(parent, workspace)")
+        .expect("the write path re-proves containment");
+    let scratch = body
+        .find("create_scratch(")
+        .expect("the scratch file is created");
+    assert!(
+        created < guard && guard < scratch,
+        "the guard must run after the creation and BEFORE any scratch file"
+    );
+
+    // End to end, the toolbox refuses a link that is there FIRST. That is
+    // `resolve`, and it is a different half from the guard above.
+    let fresh = dir.path().join("ws2");
+    std::fs::create_dir_all(&fresh).expect("the second workspace is created");
+    std::os::unix::fs::symlink(&outside, fresh.join("a")).expect("the link is made");
+    let body = tools::activity_body(fresh.clone());
+    let answered = body(
+        serde_json::to_value(session::ToolRequest {
+            workspace: fresh.to_string_lossy().into_owned(),
+            call: session::ToolCall {
+                id: "toolu_probe".to_string(),
+                name: "write_file".to_string(),
+                input: json!({ "path": "a/b/note.md", "content": "secret" }),
+            },
+        })
+        .expect("the request encodes"),
+    )
+    .expect("the tool answers");
+    assert_eq!(
+        answered["output"], "`a/b/note.md` leaves the workspace",
+        "a link that is there first is refused by the resolve: {answered}"
+    );
+    assert!(
+        !outside.join("b").join("note.md").exists(),
+        "and nothing is written outside by either half"
+    );
 }

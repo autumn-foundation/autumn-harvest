@@ -485,6 +485,9 @@ fn write_file(workspace: &Path, relative: &str, content: &str) -> Result<String,
     if let Some(parent) = path.parent() {
         create_enterable(parent)
             .map_err(|e| format!("cannot create the parent of `{relative}`: {e}"))?;
+        // The levels above were created just now, so the containment
+        // `resolve` proved is re-proved here. See [`contained`].
+        contained(parent, workspace).map_err(|e| format!("cannot write `{relative}`: {e}"))?;
     }
     // Every directory between the target and the workspace root can hold an
     // entry this write created, so the whole chain is flushed after the
@@ -631,10 +634,75 @@ pub fn create_enterable(directory: &Path) -> std::io::Result<()> {
     for level in missing.into_iter().rev() {
         match std::fs::create_dir(level) {
             Ok(()) => grant_owner_entry(level)?,
-            // Another process reached the same name first. It owns the mode.
-            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+            // Another process reached the same name first. It owns the mode,
+            // and a directory it made is accepted.
+            //
+            // A symbolic link is NOT. This call proved the chain contained
+            // before it started, and a link put here since points wherever
+            // its maker chose. Everything below would be created through it.
+            // The stat does not follow the link, so it sees the name itself.
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                let entry = std::fs::symlink_metadata(level)?;
+                if !entry.file_type().is_dir() {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::AlreadyExists,
+                        format!(
+                            "{} was created by another process, and it is not a \
+                             directory",
+                            level.display()
+                        ),
+                    ));
+                }
+            }
             Err(e) => return Err(e),
         }
+    }
+    Ok(())
+}
+
+/// Is this directory still inside the workspace?
+///
+/// [`resolve`] proves containment for the chain that exists WHEN IT RUNS. The
+/// missing levels are created after that. Another process can put a symbolic
+/// link at one of those names in between. `exists` follows a link, so the
+/// creation walks through it and reports success.
+///
+/// A write would then put its scratch file, and its rename, outside the
+/// workspace that approved it. This check is what refuses that, and it runs
+/// before any scratch file exists.
+///
+/// The comparison is against the REAL root, so a workspace behind a link is
+/// still served. [`resolve`] compares the same way.
+///
+/// # A window remains
+///
+/// This proves the chain contained at the moment it is read. Another process
+/// can still swap a level between this check and the scratch file. Closing
+/// that needs the directory to be held OPEN. The file must be created through
+/// that handle. A later rename of a name cannot then redirect it. `openat`
+/// and `renameat` do that, and `rustix` is already a dependency here.
+///
+/// That change belongs to the write path as a whole, and not to one review
+/// round. This check narrows the window to the swap that happens inside one
+/// pair of system calls, and refuses every slower one.
+///
+/// # Errors
+///
+/// Returns an error if either path cannot be resolved, or if the directory no
+/// longer sits under the workspace root.
+pub fn contained(directory: &Path, workspace: &Path) -> Result<(), String> {
+    let root = workspace
+        .canonicalize()
+        .map_err(|e| format!("cannot resolve the workspace: {e}"))?;
+    let real = directory
+        .canonicalize()
+        .map_err(|e| format!("cannot resolve the parent directory: {e}"))?;
+    if !real.starts_with(&root) {
+        return Err(
+            "a directory above it now leaves the workspace: another process replaced one \
+             after this write resolved its path"
+                .to_string(),
+        );
     }
     Ok(())
 }

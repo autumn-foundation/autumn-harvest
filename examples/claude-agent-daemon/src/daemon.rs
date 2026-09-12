@@ -117,20 +117,21 @@ type Job = (Request, oneshot::Sender<Response>);
 /// it is generous; the marker says when there is more.
 const MAX_PENDING_INPUT_CHARS: usize = 2000;
 
-/// How many model replies one step of the pending-call search reads.
+/// How many model replies the pending-call search reads.
 ///
 /// One. A parked session waits on a call of its newest reply, so one row
 /// answers and the database stops reading there. The `stop_reason` test is
-/// not indexed. A larger page would therefore read backward past older
+/// not indexed. A larger read would therefore go backward past older
 /// replies until it had that many, and decode every tool event on the way.
 ///
 /// Reading a whole history is unbounded twice over: the event count grows
 /// with every turn, and each model activity carries the whole transcript. The
 /// runtime is serialised, so one such read blocks every session drive.
 ///
-/// This is a PAGE, and not a window. The search reads pages until it finds
-/// the call or the history ends, so no page size can hide a reply from it.
-/// Only the memory in hand at one moment is bounded.
+/// One row is also every row the search MAY use. A tool-use id is unique
+/// inside one reply. Nothing makes an id unique across a run, so an older
+/// reply can hold the same id for a different tool. A read further back can
+/// therefore only offer the wrong call. See [`pending_call`].
 const REPLY_PAGE: u32 = 1;
 
 /// Why one session is parked, and what would release it.
@@ -1176,18 +1177,19 @@ pub fn decidable(
             )),
         );
     }
-    // A read that FAILS is not a call that is not there. The projections
-    // degrade a damaged reply on their own, so an error here is the query or
-    // the table. Saying nothing would leave a session named as waiting with
-    // no call to read and no command to answer it.
+    // A read that FAILS is not a call that is not there. An error here is the
+    // query, the table, or a newest reply that does not hold the awaited
+    // call. Saying nothing would leave a session named as waiting with no
+    // call to read and no command to answer it.
+    //
+    // The message says which of those happened. No call is offered from any
+    // of them, because the call the operator would read may not be the call
+    // the token releases.
     match pending_call(reader, exec_id, signal, full) {
         Ok(pending) => (pending, Some(state.reason.clone())),
         Err(message) => (
             None,
-            Some(format!(
-                "{}; the call it waits on cannot be read: {message}",
-                state.reason
-            )),
+            Some(format!("{}; no call is offered: {message}", state.reason)),
         ),
     }
 }
@@ -1236,10 +1238,10 @@ fn view(reader: &Connection, row: &ExecutionRow, blocked: &Parked, full: bool) -
 /// calls, and each one records events of its own. The model reply that holds
 /// the awaited call can therefore sit any distance back.
 ///
-/// The search walks MODEL REPLIES, newest first, and asks for ONE of them at
-/// a time. A parked session waits on a call of its newest reply. The first
-/// row therefore answers, and the database stops reading as soon as it finds
-/// it. The tool events after that reply are the only ones it passes over.
+/// The search reads ONE model reply, the newest. A parked session waits on a
+/// call of that reply: the run cannot call the model again until the call it
+/// parked on resolves. The tool events after that reply are the only ones the
+/// read passes over.
 ///
 /// The page size is one for that reason, and it is not a memory bound. The
 /// `stop_reason` test is not indexed, so the database must read and decode
@@ -1247,14 +1249,22 @@ fn view(reader: &Connection, row: &ExecutionRow, blocked: &Parked, full: bool) -
 /// older replies until it has that many, which on a long history means the
 /// whole log for one `status`.
 ///
-/// The walk remains, so a call the newest reply does not hold is still found
-/// and no page size can hide it. See [`inspect::reply_calls`].
+/// The search does NOT go further back, and that is a safety property rather
+/// than a saving. A tool-use id is unique inside one reply only. An older
+/// reply can hold the same id for a different tool, so a read further back
+/// could offer THAT call beside this token. The operator would approve what
+/// they read and release the call they never saw.
+///
+/// A newest reply that does not hold the awaited call is therefore a fault,
+/// not a reason to look elsewhere. No parked session can produce one. See
+/// [`inspect::reply_calls`].
 ///
 /// # Errors
 ///
-/// Returns an error if the replies cannot be read. That is NOT the same as a
-/// call the history does not hold. The caller says so, rather than showing a
-/// waiting session with nothing to decide.
+/// Returns an error if the replies cannot be read, or if the newest reply
+/// does not hold the awaited call. Neither is the same as a call the history
+/// does not hold. The caller says so, rather than showing a waiting session
+/// with nothing to decide.
 pub fn pending_call(
     reader: &Connection,
     exec_id: &str,
@@ -1264,66 +1274,67 @@ pub fn pending_call(
     let Some(call_id) = session::approval_call_id(signal) else {
         return Ok(None);
     };
-    let mut before = None;
 
-    loop {
-        let page = inspect::reply_calls(reader, exec_id, before, REPLY_PAGE)?;
-        let Some(last) = page.last().map(|&(seq, _)| seq) else {
-            return Ok(None);
-        };
-        before = Some(last);
+    // The query returns the calls of one model reply, and nothing else of it.
+    // The transcript stays in the database.
+    let page = inspect::reply_calls(reader, exec_id, None, REPLY_PAGE)
+        .map_err(|e| format!("the model replies cannot be read: {e}"))?;
+    let Some((_, newest)) = page.into_iter().next() else {
+        return Ok(None);
+    };
 
-        for (_, calls) in page {
-            // The query returns the calls of one model reply, and nothing
-            // else of it. The transcript stays in the database.
-            //
-            // A reply this daemon CANNOT READ ends the search. The awaited
-            // call may be in it, and a tool-use id is unique only within one
-            // reply. An older reply can hold the same id for a different
-            // tool, so walking on could offer THAT call beside this token.
-            // The operator would approve what they read and release the call
-            // they never saw.
-            let calls = match calls {
-                inspect::ReplyCalls::Calls(calls) => calls,
-                inspect::ReplyCalls::NoCalls => continue,
-                inspect::ReplyCalls::Unreadable => {
-                    return Err(
-                        "a model reply between this one and its call cannot be read, so \
-                         the call it waits on cannot be shown"
-                            .to_string(),
-                    );
-                }
-            };
-            if let Some(call) = calls.into_iter().find(|call| call.id == call_id) {
-                let mut input = call.input.to_string();
-                // A decision needs the WHOLE payload, and a write carries up
-                // to 64 KiB. The status trims it to stay readable, and
-                // `--full` prints every byte.
-                //
-                // A trimmed view says so, and the client offers no approval
-                // from it. The operator would otherwise read a cut call and
-                // paste the command that authorises all of it.
-                let truncated = !full && input.chars().count() > MAX_PENDING_INPUT_CHARS;
-                if truncated {
-                    input = shortest_first(&call.input)
-                        .chars()
-                        .take(MAX_PENDING_INPUT_CHARS)
-                        .collect();
-                    input.push_str(
-                        " … (truncated; no approval is offered from this view; \
-                         read it all with `status --full`)",
-                    );
-                }
-                return Ok(Some(PendingCall {
-                    token: signal.to_string(),
-                    id: call.id,
-                    tool: call.name,
-                    input,
-                    truncated,
-                }));
-            }
+    // Every answer below comes from the NEWEST reply. A reply further back
+    // can hold the awaited id for a different tool, so it is never read.
+    let calls = match newest {
+        inspect::ReplyCalls::Calls(calls) => calls,
+        inspect::ReplyCalls::NoCalls => {
+            return Err(
+                "the newest model reply asked for no tool call, so the call this session \
+                 waits on cannot be shown"
+                    .to_string(),
+            );
         }
+        inspect::ReplyCalls::Unreadable => {
+            return Err(
+                "the newest model reply cannot be read, so the call it waits on cannot \
+                 be shown"
+                    .to_string(),
+            );
+        }
+    };
+    let Some(call) = calls.into_iter().find(|call| call.id == call_id) else {
+        return Err(
+            "the newest model reply does not hold the call this session waits on, so \
+             that call cannot be shown"
+                .to_string(),
+        );
+    };
+
+    let mut input = call.input.to_string();
+    // A decision needs the WHOLE payload, and a write carries up to 64 KiB.
+    // The status trims it to stay readable, and `--full` prints every byte.
+    //
+    // A trimmed view says so, and the client offers no approval from it. The
+    // operator would otherwise read a cut call and paste the command that
+    // authorises all of it.
+    let truncated = !full && input.chars().count() > MAX_PENDING_INPUT_CHARS;
+    if truncated {
+        input = shortest_first(&call.input)
+            .chars()
+            .take(MAX_PENDING_INPUT_CHARS)
+            .collect();
+        input.push_str(
+            " … (truncated; no approval is offered from this view; \
+             read it all with `status --full`)",
+        );
     }
+    Ok(Some(PendingCall {
+        token: signal.to_string(),
+        id: call.id,
+        tool: call.name,
+        input,
+        truncated,
+    }))
 }
 
 /// One call's arguments with the SHORTEST field first.

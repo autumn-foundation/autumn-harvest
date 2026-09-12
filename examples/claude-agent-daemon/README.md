@@ -305,8 +305,9 @@ approval by hand from a trimmed view is still yours to do.
 cargo test -p claude-agent-daemon
 ```
 
-Twenty-eight tests, all offline: the happy path, a denied tool call, the restart
-proof, the workspace sandbox (two symlink escapes, the read cap, and a named
+All offline, and no count is given here because the suite grows: the happy
+path, a denied tool call, the restart proof, the workspace sandbox (two symlink
+escapes, a parent swapped after the path resolved, the read cap, and a named
 pipe), an atomic write, a truncated turn, a turn that says nothing, a stale
 approval, the full approval view, a session bound to another workspace and to
 another model, the single-writer lock through every alias, the database and
@@ -314,7 +315,9 @@ socket permissions, a refused hard-linked database, a turn whose tool calls
 share an id, a repeated decision, a write that keeps its target's mode
 (including one the umask would strip) and never deletes a file on a scratch
 name, the drive interval, which API failures may be retried, a billed response
-that is not a message, and one end-to-end run through the daemon socket.
+that is not a message, the request and response size caps, the reply the
+pending-call search is allowed to read, and one end-to-end run through the
+daemon socket.
 
 ## What this example does not do
 
@@ -387,9 +390,13 @@ Honest limits, so nothing here reads as a promise:
   open, so a link appearing after the check loses too), and anything that is
   not an ordinary file. What it does not do is traverse through opened
   directory descriptors, so a *concurrent local process* that swaps a parent
-  directory for a symlink mid-call can still win that race. Closing it needs
-  `openat`-based traversal, which is more machinery than an example should
-  carry. The model is the untrusted party here, and it cannot win that race;
+  directory for a symlink mid-call can still win that race. The window is
+  narrow rather than the whole call: a write re-proves that its parent
+  resolves inside the workspace AFTER creating the missing levels, and
+  refuses before any scratch file exists, so a swap the write can observe is
+  refused instead of followed. A swap that lands between that proof and the
+  scratch file still wins. Closing that needs `openat`-based traversal, which
+  is more machinery than an example should carry. The model is the untrusted party here, and it cannot win that race;
   another process running as you already can do worse directly.
 - **A session is bound to its workspace path, not to the directory object.**
   The path is recorded at submit time. A daemon serving a different one refuses
