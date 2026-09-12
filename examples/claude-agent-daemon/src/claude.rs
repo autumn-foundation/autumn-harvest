@@ -255,7 +255,7 @@ fn call_api(
     });
     let text = match body {
         Some(Ok(text)) => text,
-        Some(Err(e)) => return Err(body_failure(status, &format!("its response was lost: {e}"))),
+        Some(Err(reason)) => return Err(body_failure(status, &reason)),
         // A stop is not a malformed answer, so this stays RETRYABLE even though
         // the request was accepted. A non-retryable failure here would end the
         // session, and `Ctrl-C` would then destroy what a `kill` leaves
@@ -465,16 +465,48 @@ pub const MAX_BODY_BYTES: usize = {
 /// spend the daemon's memory and stall every session with it. An error body
 /// is the likelier offender, because it comes from whatever is between this
 /// daemon and the API rather than from the API itself.
-async fn read_capped(mut response: reqwest::Response) -> Result<String, reqwest::Error> {
+async fn read_capped(mut response: reqwest::Response) -> Result<String, String> {
     let mut body: Vec<u8> = Vec::new();
-    while let Some(chunk) = response.chunk().await? {
+    loop {
+        let chunk = response
+            .chunk()
+            .await
+            .map_err(|e| format!("its response was lost: {e}"))?;
+        let Some(chunk) = chunk else { break };
         if push_capped(&mut body, &chunk) {
             break;
         }
     }
-    // The bytes are read as text the same way `text()` reads them, so a body
-    // cut mid-character loses that character and nothing else.
-    Ok(String::from_utf8_lossy(&body).into_owned())
+    decode_body(body)
+}
+
+/// Read one response body as text, STRICTLY.
+///
+/// A lossy read replaces an invalid byte with U+FFFD. That can turn a
+/// malformed body into valid JSON carrying a value the model never sent.
+/// Measured, with a raw `FF` inside a tool path: the lossy body parses, and
+/// the daemon runs `write_file` on `note\u{fffd}.md`. The operator approves
+/// the path they are shown, and the model asked for another one.
+///
+/// Strict costs nothing here. A body cut at the read cap is refused either
+/// way. This check refuses it when the cut splits a character. The JSON
+/// parse refuses it when the cut does not, because the document then ends
+/// unclosed. So the lossy read never rescued a body that would have worked.
+///
+/// Split out from the read above so a test can drive the decision without an
+/// HTTP response, the way [`push_capped`] carries the arithmetic.
+///
+/// # Errors
+///
+/// Returns the reason phrase for [`body_failure`] when the bytes are not
+/// text.
+pub fn decode_body(body: Vec<u8>) -> Result<String, String> {
+    String::from_utf8(body).map_err(|e| {
+        format!(
+            "its response is not UTF-8 text: the byte at {} begins no character",
+            e.utf8_error().valid_up_to()
+        )
+    })
 }
 
 /// Append as much of one chunk as the cap allows.

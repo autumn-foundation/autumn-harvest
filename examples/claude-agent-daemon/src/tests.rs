@@ -6257,6 +6257,72 @@ fn a_recordable_thinking_reply_is_never_cut() {
     );
 }
 
+/// A response body that is not text is refused, and never repaired.
+///
+/// `from_utf8_lossy` replaces an invalid byte with U+FFFD. That can turn a
+/// malformed body into VALID JSON carrying a value the model never sent, and
+/// the daemon then records and runs it. A `write_file` path is the sharp
+/// case: the operator approves the path they are shown, and the model asked
+/// for another one.
+///
+/// Strict decoding costs nothing. A body cut at the read cap is refused
+/// either way. The decode refuses it when the cut splits a character, and
+/// the JSON parse refuses it when the document ends unclosed.
+#[test]
+fn a_response_body_that_is_not_text_is_refused() {
+    // A raw invalid byte inside the `path` of a gated write.
+    let mut body: Vec<u8> =
+        br#"{"content":[{"type":"tool_use","id":"toolu_1","name":"write_file","#.to_vec();
+    body.extend_from_slice(br#""input":{"path":"note"#);
+    body.push(0xFF);
+    body.extend_from_slice(br#".md","content":"x"}}],"stop_reason":"tool_use"}"#);
+
+    // What the lossy read would have done, which is why this matters. The
+    // repaired body PARSES, and the call it carries names a path the model
+    // never sent.
+    let repaired = String::from_utf8_lossy(&body).into_owned();
+    let parsed: Value =
+        serde_json::from_str(&repaired).expect("the repaired body parses, which is the hazard");
+    let reply = claude::parse_reply(&parsed);
+    let path = reply
+        .tool_calls
+        .first()
+        .and_then(|call| call.input.get("path"))
+        .and_then(Value::as_str)
+        .expect("the repaired call carries a path");
+    assert!(
+        path.contains(char::REPLACEMENT_CHARACTER),
+        "the repaired path is not the one sent: {path}"
+    );
+
+    // The strict read refuses those bytes, and says where.
+    let refused = claude::decode_body(body).expect_err("a body that is not text must be refused");
+    assert!(
+        refused.contains("not UTF-8 text") && refused.contains("begins no character"),
+        "the refusal must say what is wrong: {refused}"
+    );
+
+    // An ordinary body still reads, so the check is not simply a wall.
+    let whole = serde_json::to_vec(&json!({
+        "content": [{ "type": "text", "text": "caf\u{e9} \u{20ac}" }],
+        "stop_reason": "end_turn",
+    }))
+    .expect("the body serialises");
+    assert!(
+        claude::decode_body(whole.clone()).is_ok(),
+        "a body of ordinary text must still read"
+    );
+
+    // And the case the lossy read was written for: a body CUT at the cap. It
+    // is refused either way, so nothing that worked is lost.
+    let cut = whole[..whole.len() - 2].to_vec();
+    let by_json = serde_json::from_str::<Value>(&String::from_utf8_lossy(&cut));
+    assert!(
+        claude::decode_body(cut).is_err() || by_json.is_err(),
+        "a cut body must be refused by one check or the other"
+    );
+}
+
 #[test]
 fn a_key_that_cannot_be_a_header_is_refused() {
     // A key read out of a file can carry an interior newline. The trim on the
