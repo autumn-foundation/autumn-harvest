@@ -253,7 +253,9 @@ approval by hand from a trimmed view is still yours to do.
   the real workspace root. The 64 KiB read cap is checked before the file is
   allocated, and the 200-entry listing cap stops the directory read rather than
   trimming its result, so neither one huge file nor one huge directory can take
-  the daemon down. A write lands
+  the daemon down. A listing ends with its own count of the names above it: any
+  filename is legal text, so no line of names can be reserved for an answer
+  about the listing. A write lands
   atomically, through a scratch file renamed over the target, with the file and
   every directory from there up to the workspace root flushed, so an approved
   file is never left half-written and the replacement survives a host crash.

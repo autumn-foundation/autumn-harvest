@@ -114,6 +114,16 @@ pub struct SessionSummary {
 /// operator, the model, or the engine. None of them is bounded at the source.
 pub const MAX_LISTED_CHARS: u32 = 500;
 
+/// The BYTES of one listed field the database is asked for.
+///
+/// The cut is on bytes, because `substr` on TEXT counts to the first NUL and
+/// stops. A goal of `"\u0000do it"` is a goal `submit` accepts, and the
+/// listing showed nothing for it while the single status showed all of it.
+///
+/// Four bytes is the longest UTF-8 character, so this budget always carries
+/// at least [`MAX_LISTED_CHARS`] characters. The caller cuts the characters.
+const MAX_LISTED_BYTES: u32 = MAX_LISTED_CHARS * 4;
+
 /// Open the inspector connection.
 ///
 /// # Errors
@@ -544,6 +554,23 @@ fn races_signal(timer_id: &str, signal: &str) -> bool {
         .is_some_and(|(_seq, name)| name == signal)
 }
 
+/// Decode one field the database cut to BYTES.
+///
+/// The cut can land inside a character, so only the valid prefix is kept. A
+/// replacement character would name bytes the field does not hold, and the
+/// operator would read a character nobody wrote.
+///
+/// The characters are cut here, because the database was asked for a budget
+/// of bytes. See [`MAX_LISTED_BYTES`].
+fn cut_text(bytes: Option<Vec<u8>>) -> Option<String> {
+    let bytes = bytes?;
+    let whole = match std::str::from_utf8(&bytes) {
+        Ok(text) => text,
+        Err(split) => std::str::from_utf8(&bytes[..split.valid_up_to()]).unwrap_or_default(),
+    };
+    Some(whole.chars().take(MAX_LISTED_CHARS as usize).collect())
+}
+
 /// One page of the agent workflow's executions, oldest first.
 ///
 /// `before` reads the page before a row this listing named. The cap is on one
@@ -566,12 +593,12 @@ pub fn executions(
     let mut statement = conn
         .prepare(
             "SELECT exec_id, state, \
-                    substr(json_extract(input_json, '$.goal'), 1, ?3), \
+                    substr(cast(json_extract(input_json, '$.goal') as blob), 1, ?3), \
                     json_extract(output_json, '$.stop'), \
                     json_extract(output_json, '$.turns'), \
                     json_extract(output_json, '$.tool_calls'), \
-                    substr(json_extract(output_json, '$.answer'), 1, ?3), \
-                    substr(error, 1, ?3), \
+                    substr(cast(json_extract(output_json, '$.answer') as blob), 1, ?3), \
+                    substr(cast(error as blob), 1, ?3), \
                     rowid \
              FROM harvest_executions WHERE workflow_name = ?1 \
              AND (?4 IS NULL OR rowid < ?4) \
@@ -583,19 +610,19 @@ pub fn executions(
             rusqlite::params![
                 workflow_name,
                 MAX_LISTED_SESSIONS + 1,
-                MAX_LISTED_CHARS,
+                MAX_LISTED_BYTES,
                 before
             ],
             |row| {
                 Ok(SessionSummary {
                     exec_id: row.get(0)?,
                     state: row.get(1)?,
-                    goal: row.get(2)?,
+                    goal: cut_text(row.get(2)?),
                     stop: row.get(3)?,
                     turns: row.get(4)?,
                     tool_calls: row.get(5)?,
-                    answer: row.get(6)?,
-                    error: row.get(7)?,
+                    answer: cut_text(row.get(6)?),
+                    error: cut_text(row.get(7)?),
                     row: row.get(8)?,
                 })
             },

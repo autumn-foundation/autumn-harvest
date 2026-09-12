@@ -310,6 +310,10 @@ fn resolve(workspace: &Path, relative: &str) -> Result<PathBuf, String> {
 /// would also collapse into one, and the second would vanish from the walk.
 /// The count says they are there.
 ///
+/// The last line is always the COUNT of the names above it. An entry can
+/// hold any text, so no line of names can be reserved for an answer about
+/// the listing. The count is appended after the names, where none can be.
+///
 /// A name holding the LINE BREAK this listing is joined with is counted the
 /// same way. One entry named `a\nb` would render as the two lines `a` and
 /// `b`, which is what a directory of `a` and `b` renders as. Neither line
@@ -351,6 +355,7 @@ fn list_files(workspace: &Path, relative: &str, after: Option<&str>) -> Result<S
         }
     }
 
+    let named = page.len();
     let mut entries: Vec<String> = page.into_iter().collect();
     if more {
         let last = entries.last().cloned().unwrap_or_default();
@@ -370,9 +375,15 @@ fn list_files(workspace: &Path, relative: &str, after: Option<&str>) -> Result<S
              listing of one name per line cannot name them"
         ));
     }
-    if entries.is_empty() {
-        return Ok("(no entries)".to_string());
-    }
+    // The LAST line is always this tool's own count, and it is appended after
+    // every name. No entry can take its place.
+    //
+    // An empty directory used to answer `(no entries)`, which is a legal
+    // filename. A directory holding only that one file read exactly like an
+    // empty one. The model could not tell whether the file was there, and
+    // could never reach it. The count tells the two apart: one names the file
+    // and counts one, the other names nothing and counts none.
+    entries.push(format!("... entries named: {named}"));
     Ok(entries.join("\n"))
 }
 

@@ -3173,6 +3173,138 @@ fn a_directory_entry_holding_a_line_break_is_counted_and_not_named() {
     );
 }
 
+/// A listing and a status agree about a goal holding a NUL.
+///
+/// `submit` accepts a goal with an embedded NUL: Rust's `trim` keeps that
+/// byte, so the goal says something. The listing cut each field with
+/// `substr` on TEXT, which counts to the first NUL and stops. A goal opening
+/// with one measured empty, so `agentd list` showed no goal while
+/// `agentd status` showed all of it.
+///
+/// The two views read the same row. Neither may show a goal the other one
+/// does not.
+#[test]
+fn a_listing_shows_a_goal_that_holds_a_nul() {
+    let dir = tempfile::tempdir().expect("a temporary directory");
+    let db = dir.path().join("nul-listing.db");
+    let writer = rusqlite::Connection::open(&db).expect("the database opens");
+    writer
+        .execute(
+            "CREATE TABLE harvest_executions (exec_id TEXT, workflow_name TEXT, \
+             state TEXT, input_json TEXT, output_json TEXT, error TEXT)",
+            [],
+        )
+        .expect("the fixture table is created");
+    let goal = "\u{0}do it";
+    let task = json!({
+        "goal": goal,
+        "max_turns": 4,
+        "approval_timeout_secs": 300,
+        "workspace": "/tmp/w",
+        "model": "offline",
+    })
+    .to_string();
+    writer
+        .execute(
+            "INSERT INTO harvest_executions VALUES ('nul', ?1, 'RUNNING', ?2, NULL, NULL)",
+            rusqlite::params![WORKFLOW_NAME, task],
+        )
+        .expect("the session is recorded");
+    drop(writer);
+
+    let reader = rusqlite::Connection::open(&db).expect("the database opens");
+    let listed = inspect::executions(&reader, WORKFLOW_NAME, None).expect("the listing answers");
+    let row = listed.first().expect("the session is listed");
+    assert_eq!(
+        row.goal.as_deref(),
+        Some(goal),
+        "the listing must show the whole goal"
+    );
+
+    // The single status reads the row whole. The two views must not disagree.
+    let whole = inspect::execution(&reader, WORKFLOW_NAME, "nul")
+        .expect("the single-row query answers")
+        .expect("the session is readable by id");
+    let status_goal = serde_json::from_str::<session::SessionTask>(&whole.input_json)
+        .expect("the task reads")
+        .goal;
+    assert_eq!(
+        row.goal.as_deref(),
+        Some(status_goal.as_str()),
+        "the listing and the status must agree about the goal"
+    );
+}
+
+/// The listing's own answer cannot be a filename.
+///
+/// `(no entries)` is a legal name. An empty directory answered with exactly
+/// that text, so a directory holding only that one file read as an empty
+/// one. The model could not tell whether the file was there, and could never
+/// reach a file it could otherwise read.
+///
+/// The count is appended after every name, so no entry can take its place.
+#[test]
+fn an_empty_listing_is_not_a_filename() {
+    let dir = tempfile::tempdir().expect("a temporary directory");
+    let workspace = dir.path().join("workspace");
+    std::fs::create_dir_all(&workspace).expect("the workspace is created");
+    std::fs::create_dir(workspace.join("empty")).expect("the directory is created");
+    let trap = workspace.join("trap");
+    std::fs::create_dir(&trap).expect("the directory is created");
+    std::fs::write(trap.join("(no entries)"), "x").expect("the legal name is written");
+
+    let body = tools::activity_body(workspace.clone());
+    let listed = |path: &str| -> String {
+        let raw = body(tool_request(
+            &workspace,
+            tools::TOOL_LIST_FILES,
+            json!({ "path": path }),
+        ))
+        .expect("a tool failure is a result, not an activity error");
+        let outcome: ToolOutcome = serde_json::from_value(raw).expect("the outcome decodes");
+        assert!(
+            !outcome.is_error,
+            "the listing must succeed: {}",
+            outcome.output
+        );
+        outcome.output
+    };
+
+    let empty = listed("empty");
+    let trapped = listed("trap");
+    assert_ne!(
+        empty, trapped,
+        "an empty directory must not read like one holding that name"
+    );
+    assert_eq!(
+        empty, "... entries named: 0",
+        "an empty directory names nothing and counts none"
+    );
+    assert!(
+        trapped.lines().any(|line| line == "(no entries)"),
+        "the legal name must be listed: {trapped}"
+    );
+    assert!(
+        trapped.ends_with("... entries named: 1"),
+        "the count is the last line, after the name: {trapped}"
+    );
+
+    // The named file is reachable, which is what the ambiguity cost.
+    let raw = body(tool_request(
+        &workspace,
+        tools::TOOL_READ_FILE,
+        json!({ "path": "trap/(no entries)" }),
+    ))
+    .expect("a tool failure is a result, not an activity error");
+    let outcome: ToolOutcome = serde_json::from_value(raw).expect("the outcome decodes");
+    assert!(
+        !outcome.is_error,
+        "the listed name must read: {}",
+        outcome.output
+    );
+    assert_eq!(outcome.output, "x", "the file's own bytes come back");
+}
+
 /// A capped directory listing reaches every entry.
 ///
 /// `read_dir` gives no order, so a truncated READ returns an arbitrary subset
@@ -4351,10 +4483,15 @@ fn the_toolbox_stops_listing_a_directory_at_the_cap() {
     let lines: Vec<&str> = output.lines().collect();
     assert_eq!(
         lines.len(),
-        tools::MAX_ENTRIES + 1,
-        "the listing must carry the cap and one marker"
+        tools::MAX_ENTRIES + 2,
+        "the listing must carry the cap, one marker and the count"
     );
-    let marker = lines.last().expect("the marker is present");
+    assert_eq!(
+        lines.last().copied(),
+        Some(format!("... entries named: {}", tools::MAX_ENTRIES).as_str()),
+        "the count is the last line"
+    );
+    let marker = lines[lines.len() - 2];
     assert!(
         marker.starts_with("... more entries"),
         "the truncation must be reported: {marker}"
@@ -4371,8 +4508,8 @@ fn the_toolbox_stops_listing_a_directory_at_the_cap() {
             tools::TOOL_LIST_FILES,
             json!({ "path": "small" }),
         )),
-        "a.txt\nb.txt",
-        "a small directory must be listed whole and sorted"
+        "a.txt\nb.txt\n... entries named: 2",
+        "a small directory must be listed whole and sorted, and counted"
     );
 }
 
