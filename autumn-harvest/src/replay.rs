@@ -939,16 +939,30 @@ impl HistoryMatcher {
     /// exact shape the engine writes (untyped, non-retryable) so an author
     /// message that happens to collide keeps its genuine terminal.
     ///
+    /// An activity author can also quote the reason AND match the shape (issue
+    /// #1265): `ActivityFailure::non_retryable` reproduces both. The
+    /// synthetic path never dispatches. It never writes `ActivityStarted` or
+    /// `ActivityHeartbeat` for the id. A real attempt does. This is a
+    /// structural check, not another field-value guess. A candidate activity
+    /// with either event earlier in `events` keeps its genuine terminal
+    /// instead of being marked transparent. History is chronological, so one
+    /// forward scan sees a real start before its own first-attempt failure.
+    ///
     /// See also [`Self::superseded_cycle_tail_indices`], called right after
     /// this function in [`Self::new`] (issue #1262). It covers the same
     /// failing cycle's other records: a marker, a side effect, a detached
     /// spawn, a timer arm or cancel. This function does not cover those.
     fn abandoned_dispatch_indices(events: &[WorkflowEvent]) -> Vec<usize> {
+        let mut started_activities: HashSet<ActivityExecId> = HashSet::new();
         let mut abandoned_activities: HashSet<ActivityExecId> = HashSet::new();
         let mut abandoned_children: HashSet<ExecutionId> = HashSet::new();
         let mut indices: Vec<usize> = Vec::new();
         for (i, event) in events.iter().enumerate() {
             match event {
+                WorkflowEvent::ActivityStarted { activity_id, .. }
+                | WorkflowEvent::ActivityHeartbeat { activity_id, .. } => {
+                    started_activities.insert(*activity_id);
+                }
                 // An activity's `error` is the ACTIVITY author's own message,
                 // exactly as a child's is (Codex P2 round 2), so the reason
                 // string alone is not proof the engine wrote this event. Pair it
@@ -957,7 +971,9 @@ impl HistoryMatcher {
                 // structured details — so a genuine activity failure that
                 // happens to return this message keeps its real terminal
                 // instead of being re-dispatched (and its side effects
-                // repeated) by a redriven run.
+                // repeated) by a redriven run. A real `ActivityStarted` /
+                // `ActivityHeartbeat` for this id is the same guard, checked
+                // structurally instead of by field value (issue #1265).
                 WorkflowEvent::ActivityFailed {
                     activity_id,
                     error,
@@ -965,7 +981,10 @@ impl HistoryMatcher {
                     error_type,
                     non_retryable: true,
                     details: None,
-                } if error == crate::event::ABANDONED_DISPATCH_REASON && error_type == "Error" => {
+                } if error == crate::event::ABANDONED_DISPATCH_REASON
+                    && error_type == "Error"
+                    && !started_activities.contains(activity_id) =>
+                {
                     abandoned_activities.insert(*activity_id);
                     indices.push(i);
                 }
@@ -10271,6 +10290,137 @@ mod tests {
                 matcher.is_consumed(idx),
                 "event {idx} carries the engine's exact abandoned shape, so a redrive \
                  must make it transparent"
+            );
+        }
+    }
+
+    /// A genuine activity failure can quote the reserved reason. It can also
+    /// land on attempt 1, non-retryable, with no details — the full shape
+    /// the matcher checks (issue #1265). The synthetic path never writes an
+    /// `ActivityStarted` between the schedule and the failure: an abandoned
+    /// dispatch never actually ran. An intervening `ActivityStarted` is proof
+    /// this is a real terminal, and it must stay matchable. Otherwise a
+    /// redrive marks it transparent, the real `ActivityStarted` stays opaque,
+    /// and the reopened run parks on it instead of re-dispatching.
+    #[test]
+    fn a_genuine_activity_failure_with_an_intervening_started_is_not_an_abandoned_record() {
+        let activity_id = ActivityExecId::new();
+        let events = vec![
+            WorkflowEvent::WorkflowStarted {
+                input: Value::Null,
+                timestamp: chrono::Utc::now(),
+                last_completion_result: None,
+                last_error: None,
+                scheduled_time: None,
+            },
+            WorkflowEvent::ActivityScheduled {
+                activity_id,
+                name: "charge".into(),
+                input: Value::Null,
+                queue: "default".into(),
+            },
+            WorkflowEvent::ActivityStarted {
+                activity_id,
+                worker_id: WorkerId::new("worker-1"),
+            },
+            // Quotes the engine's exact abandoned shape, but a real activity
+            // ran and failed this way on its own.
+            WorkflowEvent::ActivityFailed {
+                activity_id,
+                error: crate::event::ABANDONED_DISPATCH_REASON.to_string(),
+                attempt: 1,
+                error_type: "Error".into(),
+                details: None,
+                non_retryable: true,
+            },
+            WorkflowEvent::workflow_failed("budget exceeded"),
+            WorkflowEvent::WorkflowRedriven {
+                redriven_at: chrono::Utc::now(),
+                dead_letter_id: uuid::Uuid::new_v4(),
+                reason: None,
+            },
+        ];
+        let matcher = HistoryMatcher::new(events);
+        for idx in [1_usize, 2, 3] {
+            assert!(
+                !matcher.is_consumed(idx),
+                "event {idx} is a genuine activity failure and must stay matchable"
+            );
+        }
+    }
+
+    /// Two redrives, each with an activity, must not cross-contaminate (issue
+    /// #1265). Activity ids are fresh per dispatch. A real `ActivityStarted`
+    /// for one activity must never suppress the synthetic pair of an
+    /// unrelated, earlier one, even across a redrive boundary.
+    #[test]
+    fn a_later_genuine_activity_does_not_mask_an_earlier_synthetic_pair() {
+        let synthetic_activity = ActivityExecId::new();
+        let genuine_activity = ActivityExecId::new();
+        let events = vec![
+            WorkflowEvent::WorkflowStarted {
+                input: Value::Null,
+                timestamp: chrono::Utc::now(),
+                last_completion_result: None,
+                last_error: None,
+                scheduled_time: None,
+            },
+            WorkflowEvent::ActivityScheduled {
+                activity_id: synthetic_activity,
+                name: "charge".into(),
+                input: Value::Null,
+                queue: "default".into(),
+            },
+            WorkflowEvent::ActivityFailed {
+                activity_id: synthetic_activity,
+                error: crate::event::ABANDONED_DISPATCH_REASON.to_string(),
+                attempt: 1,
+                error_type: "Error".into(),
+                details: None,
+                non_retryable: true,
+            },
+            WorkflowEvent::workflow_failed("budget exceeded"),
+            WorkflowEvent::WorkflowRedriven {
+                redriven_at: chrono::Utc::now(),
+                dead_letter_id: uuid::Uuid::new_v4(),
+                reason: None,
+            },
+            WorkflowEvent::ActivityScheduled {
+                activity_id: genuine_activity,
+                name: "refund".into(),
+                input: Value::Null,
+                queue: "default".into(),
+            },
+            WorkflowEvent::ActivityStarted {
+                activity_id: genuine_activity,
+                worker_id: WorkerId::new("worker-1"),
+            },
+            WorkflowEvent::ActivityFailed {
+                activity_id: genuine_activity,
+                error: crate::event::ABANDONED_DISPATCH_REASON.to_string(),
+                attempt: 1,
+                error_type: "Error".into(),
+                details: None,
+                non_retryable: true,
+            },
+            WorkflowEvent::workflow_failed("budget exceeded"),
+            WorkflowEvent::WorkflowRedriven {
+                redriven_at: chrono::Utc::now(),
+                dead_letter_id: uuid::Uuid::new_v4(),
+                reason: None,
+            },
+        ];
+        let matcher = HistoryMatcher::new(events);
+        for idx in [1_usize, 2] {
+            assert!(
+                matcher.is_consumed(idx),
+                "event {idx} is the pre-redrive synthetic pair and must stay transparent"
+            );
+        }
+        for idx in [5_usize, 6, 7] {
+            assert!(
+                !matcher.is_consumed(idx),
+                "event {idx} is a genuine activity failure and must stay matchable"
             );
         }
     }
