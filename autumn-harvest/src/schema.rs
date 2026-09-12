@@ -1115,6 +1115,21 @@ diesel::table! {
 diesel::table! {
     use diesel::sql_types::*;
 
+    /// Durable fleet-wide codec key lifecycle state (issue #1244). One row per
+    /// key id, `state` one of `active` / `retiring` / `retired`.
+    harvest_codec_key_state (key_id) {
+        key_id -> Text,
+        state -> Text,
+        activated_at -> Nullable<Timestamptz>,
+        retiring_since -> Nullable<Timestamptz>,
+        retired_at -> Nullable<Timestamptz>,
+        updated_at -> Timestamptz,
+    }
+}
+
+diesel::table! {
+    use diesel::sql_types::*;
+
     /// Durable per-execution shard-migration record (issue #964).
     ///
     /// Lives on the **source** shard -- the one that stays authoritative right
@@ -1205,4 +1220,5 @@ diesel::allow_tables_to_appear_in_same_query!(
     harvest_mutex_waiters,
     harvest_workflow_logs,
     harvest_codec_rotation_cursor,
+    harvest_codec_key_state,
 );

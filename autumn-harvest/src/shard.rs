@@ -1902,19 +1902,30 @@ pub fn resolve_child_placement(
             // child would go, and where the parent already lives, so no
             // cross-shard placement contract is broken: none was made.
             //
+            // MUST be `parent_shard`, never `default_shard()` (issue #1263 item
+            // 15). The two coincide only when the parent happens to already live
+            // on the default shard. For any other in-flight parent,
+            // `default_shard()` would encode the child onto a DIFFERENT shard
+            // than the parent. The persist path then classifies that child
+            // remote, and `preflight_target_shard` rejects it — an empty
+            // writable set makes every shard, including the default one,
+            // unwritable. That is the exact drain deadlock this fallback exists
+            // to prevent. Returning the parent's own shard makes the child
+            // genuinely LOCAL, so it can never reach that remote-classifying
+            // check at all.
+            //
             // Traced, because AC8's requirement is that a fallback never happens
             // "without trace". A `warn!` naming the workflow and the shard is
             // that trace; the operator draining the fleet can see exactly which
             // placed spawns degenerated while the window was open.
             if router.writable_shards().is_empty() {
-                let shard = router.default_shard();
                 tracing::warn!(
                     workflow_name,
-                    shard = shard.as_i32(),
+                    shard = parent_shard.as_i32(),
                     "no shard is currently writable; a Distributed child placement \
-                     degenerates to the default shard for the duration of the drain"
+                     stays on the parent's own shard for the duration of the drain"
                 );
-                return Ok(shard);
+                return Ok(parent_shard);
             }
             return Ok(router.pick_for_new_workflow(workflow_name, placement_key));
         }

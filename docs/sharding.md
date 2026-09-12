@@ -417,6 +417,24 @@ Every `spawn_child_workflow*` entry point has a `_placed` sibling taking a `&Chi
 | `Shard(id)` | An explicit pin, validated exactly like `ShardPlacement::Shard` (unknown or drained ⇒ rejected). |
 | `ResidencyKey(key)` | An explicit residency pin, resolved through the declared map (undeclared ⇒ rejected, never hashed). |
 
+### `Distributed` during a full drain
+
+A fully-drained fleet (`writable_shards` empty — every shard mid-maintenance
+at once) is the one case a `Distributed` placement does not reject outright.
+Rejecting it would either fail the spawn terminally (the handler ABI erases
+the error type) or deadlock the drain itself: a drained shard must let its
+in-flight work finish, and a parent cannot finish while the children it
+awaits are refused.
+
+The child stays on the **parent's own shard** for the duration of the drain,
+not the deployment's configured default shard. The two differ whenever the
+parent is not itself on the default shard, and only the parent's own shard
+guarantees the child is classified local — never cross-shard — so it can
+never reach (and be rejected by) the persist-time drain check that governs
+genuine cross-shard targets. A `warn!` names the workflow and the shard on
+every occurrence, so an operator draining the fleet can see exactly which
+placed spawns degenerated while the window was open.
+
 ### Restart stability
 
 A top-level start's rendezvous key is the caller-supplied `workflow_id`, which is stable by construction. A child's `ExecutionId` is minted fresh on every dispatch, so hashing *it* would re-roll the shard whenever a decision cycle is retried after a crash. `Distributed` instead hashes a deterministic per-parent key, `"{parent_exec_id}#{n}"`, so a retried cycle re-derives the identical shard for every slot — the same restart-stability contract top-level starts have.

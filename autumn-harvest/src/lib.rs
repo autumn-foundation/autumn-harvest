@@ -567,10 +567,15 @@ pub use execution::{
     redrive_target, resolve_execution_id_by_workflow_id, resolve_live_attempt,
     resolve_live_attempt_id, resume_live_attempt, resume_workflow_execution,
     schedule_run_state_summary, select_resolved_run, signal_with_start_workflow_execution,
-    signal_with_start_workflow_execution_with_metrics, start_or_load_workflow_execution,
-    start_or_load_workflow_execution_idempotent, start_or_load_workflow_execution_with_metrics,
-    terminate_live_attempt, terminate_workflow_execution, update_with_start_workflow_execution,
+    signal_with_start_workflow_execution_with_metrics,
+    signal_with_start_workflow_execution_with_metrics_and_codecs, start_or_load_workflow_execution,
+    start_or_load_workflow_execution_idempotent,
+    start_or_load_workflow_execution_idempotent_with_codecs,
+    start_or_load_workflow_execution_with_codecs, start_or_load_workflow_execution_with_metrics,
+    start_or_load_workflow_execution_with_metrics_and_codecs, terminate_live_attempt,
+    terminate_workflow_execution, update_with_start_workflow_execution,
     update_with_start_workflow_execution_with_metrics,
+    update_with_start_workflow_execution_with_metrics_and_codecs,
 };
 pub use executor::{WorkflowOutcome, run_workflow};
 pub use guardrail::{

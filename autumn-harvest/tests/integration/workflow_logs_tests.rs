@@ -1092,7 +1092,7 @@ async fn drive_once(
     autumn_harvest::WorkflowOutcome,
     Vec<autumn_harvest::context::WorkflowCommand>,
 ) {
-    let (outcome, pending, _span) =
+    let (outcome, pending, _span, _resolved_router) =
         autumn_harvest::executor::run_workflow_with_state_history_policy_and_caps(
             exec_id,
             history.to_vec(),

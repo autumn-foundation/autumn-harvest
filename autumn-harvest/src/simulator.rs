@@ -247,7 +247,7 @@ impl WorkflowSimulator {
                 });
             }
 
-            let (outcome, pending, _span) = run_workflow_with_state(
+            let (outcome, pending, _span, _resolved_router) = run_workflow_with_state(
                 exec_id,
                 history.clone(),
                 self.handler,

@@ -709,6 +709,7 @@ async fn over_deadline_child_failure_orders_deadline_first_and_resolves_none() {
         parent_exec_id,
         child_exec_id,
         "downstream 503",
+        &autumn_harvest::payload_codec::PayloadCodecs::default(),
     )
     .await
     .expect("wake parent for child failure");
