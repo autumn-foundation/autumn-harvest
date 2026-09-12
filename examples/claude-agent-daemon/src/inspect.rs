@@ -308,9 +308,17 @@ pub const EVENTS_QUERY: &str = "SELECT seq, \
 ///
 /// The `stop_reason` test is not indexed, so it is applied to the rows the
 /// bound admits, and not used to find them. See [`no_cursor`].
+///
+/// The calls are read as an ARRAY, and as bytes. A recorded `"tool_calls": 1`
+/// extracts an integer, and reading that as text aborted the whole page. One
+/// such reply then hid the call an operator was waiting to decide, while the
+/// status still said the session was waiting. A call `input` can also hold
+/// text Rust cannot read, and bytes let the caller drop that ONE reply.
 pub const REPLIES_QUERY: &str = "SELECT seq, \
             CASE WHEN json_valid(event_json) \
-                 THEN json_extract(event_json, '$.data.output.tool_calls') END \
+                  AND json_type(event_json, '$.data.output.tool_calls') = 'array' \
+                 THEN cast(json_extract(event_json, '$.data.output.tool_calls') \
+                           as blob) END \
      FROM harvest_events \
      WHERE exec_id = ?1 AND seq < ?2 \
      AND json_valid(event_json) \
@@ -417,14 +425,18 @@ pub fn reply_calls(
     let rows = statement
         .query_map(
             rusqlite::params![exec_id, no_cursor(before), limit],
-            |row| Ok((row.get::<_, i64>(0)?, row.get::<_, Option<String>>(1)?)),
+            |row| Ok((row.get::<_, i64>(0)?, row.get::<_, Option<Vec<u8>>>(1)?)),
         )
         .map_err(|e| format!("cannot read the replies: {e}"))?;
 
     rows.map(|row| {
         row.map_err(|e| format!("cannot read the replies: {e}"))
             .map(|(seq, calls)| {
+                // An array is read WHOLE, never cut: a cut one is not JSON.
+                // A reply this reader cannot decode carries no calls, and the
+                // page still names it, so the search walks past it.
                 let value = calls
+                    .and_then(|bytes| String::from_utf8(bytes).ok())
                     .and_then(|json| serde_json::from_str(&json).ok())
                     .unwrap_or(serde_json::Value::Null);
                 (seq, value)

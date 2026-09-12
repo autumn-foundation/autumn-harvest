@@ -1137,10 +1137,20 @@ pub fn decidable(
             )),
         );
     }
-    (
-        pending_call(reader, exec_id, signal, full),
-        Some(state.reason.clone()),
-    )
+    // A read that FAILS is not a call that is not there. The projections
+    // degrade a damaged reply on their own, so an error here is the query or
+    // the table. Saying nothing would leave a session named as waiting with
+    // no call to read and no command to answer it.
+    match pending_call(reader, exec_id, signal, full) {
+        Ok(pending) => (pending, Some(state.reason.clone())),
+        Err(message) => (
+            None,
+            Some(format!(
+                "{}; the call it waits on cannot be read: {message}",
+                state.reason
+            )),
+        ),
+    }
 }
 
 /// Build one operator view.
@@ -1200,18 +1210,28 @@ fn view(reader: &Connection, row: &ExecutionRow, blocked: &Parked, full: bool) -
 ///
 /// The walk remains, so a call the newest reply does not hold is still found
 /// and no page size can hide it. See [`inspect::reply_calls`].
+///
+/// # Errors
+///
+/// Returns an error if the replies cannot be read. That is NOT the same as a
+/// call the history does not hold. The caller says so, rather than showing a
+/// waiting session with nothing to decide.
 pub fn pending_call(
     reader: &Connection,
     exec_id: &str,
     signal: &str,
     full: bool,
-) -> Option<PendingCall> {
-    let call_id = session::approval_call_id(signal)?;
+) -> Result<Option<PendingCall>, String> {
+    let Some(call_id) = session::approval_call_id(signal) else {
+        return Ok(None);
+    };
     let mut before = None;
 
     loop {
-        let page = inspect::reply_calls(reader, exec_id, before, REPLY_PAGE).ok()?;
-        let (last, _) = *page.last()?;
+        let page = inspect::reply_calls(reader, exec_id, before, REPLY_PAGE)?;
+        let Some(last) = page.last().map(|&(seq, _)| seq) else {
+            return Ok(None);
+        };
         before = Some(last);
 
         for (_, calls) in page {
@@ -1240,13 +1260,13 @@ pub fn pending_call(
                          read it all with `status --full`)",
                     );
                 }
-                return Some(PendingCall {
+                return Ok(Some(PendingCall {
                     token: signal.to_string(),
                     id: call.id,
                     tool: call.name,
                     input,
                     truncated,
-                });
+                }));
             }
         }
     }

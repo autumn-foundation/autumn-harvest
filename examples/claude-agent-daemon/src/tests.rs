@@ -1245,6 +1245,7 @@ async fn a_status_reads_a_bounded_slice_of_the_history() {
     // activity carries the whole transcript, so reading the history entire is
     // unbounded twice over, and one status would block every session drive.
     let call = daemon::pending_call(&reader, &exec_id, &signal, false)
+        .expect("the replies read")
         .expect("the awaited call is in the newest events");
     assert_eq!(call.token, signal, "the call must be the awaited one");
 
@@ -1340,6 +1341,7 @@ async fn a_status_finds_a_call_behind_more_events_than_one_page() {
 
     // The daemon's own lookup finds it whatever the page size.
     let call = daemon::pending_call(&reader, &exec_id, &signal, false)
+        .expect("the replies read")
         .expect("the awaited call must be found however deep it sits");
     assert_eq!(call.token, signal, "the call must be the awaited one");
 
@@ -1776,8 +1778,9 @@ async fn the_full_view_shows_a_write_that_the_status_trims() {
     // history. See `inspect::MAX_SCANNED_EVENTS`.
     let reader = inspect::open(&dir.path().join("agentd.db")).expect("the reader opens");
     let exec_id = exec.to_string();
-    let trimmed =
-        daemon::pending_call(&reader, &exec_id, &signal, false).expect("the status shows a call");
+    let trimmed = daemon::pending_call(&reader, &exec_id, &signal, false)
+        .expect("the replies read")
+        .expect("the status shows a call");
     assert!(
         trimmed.input.contains("truncated"),
         "the status must say when it has trimmed the payload"
@@ -1800,8 +1803,9 @@ async fn the_full_view_shows_a_write_that_the_status_trims() {
         trimmed.input
     );
 
-    let whole =
-        daemon::pending_call(&reader, &exec_id, &signal, true).expect("the full view shows a call");
+    let whole = daemon::pending_call(&reader, &exec_id, &signal, true)
+        .expect("the replies read")
+        .expect("the full view shows a call");
     assert!(
         whole.input.contains(tail),
         "the full view must show every byte an approval authorises"
@@ -4136,6 +4140,200 @@ fn a_model_no_printed_command_can_carry_is_refused() {
             "the recorded identity is the trimmed name"
         );
     }
+}
+
+/// A damaged reply does not hide the call an operator waits on.
+///
+/// `tool_calls` was extracted without a type test. A recorded
+/// `"tool_calls": 1` yields an INTEGER, and reading that as text aborted the
+/// whole page. `pending_call` turned the error into "no call". A session was
+/// then named as WAITING FOR APPROVAL while showing no call and no command.
+/// The operator is asked to decide and given nothing.
+///
+/// The damaged replies here are NEWER than the awaited one, which is the
+/// order that matters: the search walks replies newest first.
+#[test]
+fn a_damaged_reply_does_not_hide_the_awaited_call() {
+    let dir = tempfile::tempdir().expect("a temporary directory");
+    let db = dir.path().join("replies-damaged.db");
+    let writer = rusqlite::Connection::open(&db).expect("the database opens");
+    writer
+        .execute_batch(
+            "CREATE TABLE harvest_events (exec_id TEXT, seq INTEGER, event_json TEXT, \
+             PRIMARY KEY (exec_id, seq));",
+        )
+        .expect("the fixture schema is created");
+    let wanted = json!({
+        "type": "ActivityCompleted",
+        "data": { "output": {
+            "stop_reason": "tool_use",
+            "tool_calls": [{
+                "id": "toolu_wanted",
+                "name": "write_file",
+                "input": { "path": "notes.md", "content": "x" },
+            }],
+        }},
+    })
+    .to_string();
+    writer
+        .execute(
+            "INSERT INTO harvest_events VALUES ('e', 0, ?1)",
+            rusqlite::params![wanted],
+        )
+        .expect("the awaited reply is recorded");
+
+    // Each of these sits AFTER the awaited reply, so the search meets it
+    // first. Valid JSON, and not an array; then a row that is not JSON.
+    let damaged = [
+        r#"{"type":"ActivityCompleted","data":{"output":{"stop_reason":"tool_use","tool_calls":1}}}"#,
+        r#"{"type":"ActivityCompleted","data":{"output":{"stop_reason":"tool_use","tool_calls":"x"}}}"#,
+        "not json at all",
+    ];
+    for (offset, document) in damaged.iter().enumerate() {
+        writer
+            .execute(
+                "INSERT INTO harvest_events VALUES ('e', ?1, ?2)",
+                rusqlite::params![i64::try_from(offset).unwrap() + 1, document],
+            )
+            .expect("the damaged reply is recorded");
+    }
+
+    // An array whose BYTES are not text. This one needs RAW bytes: an
+    // escaped surrogate is re-serialised as its escape, so the array text
+    // stays ASCII. Only a raw sequence reaches Rust as damage.
+    let mut raw: Vec<u8> = br#"{"type":"ActivityCompleted","data":{"output":"#.to_vec();
+    raw.extend_from_slice(br#"{"stop_reason":"tool_use","tool_calls":[{"id":""#);
+    raw.extend_from_slice(&[0xED, 0xA0, 0x80]);
+    raw.extend_from_slice(br#""}]}}}"#);
+    writer
+        .execute(
+            "INSERT INTO harvest_events VALUES ('e', 9, ?1)",
+            rusqlite::params![raw],
+        )
+        .expect("the raw-byte reply is recorded");
+
+    assert_the_recorded_faults(&writer);
+    drop(writer);
+
+    let reader = rusqlite::Connection::open(&db).expect("the database opens");
+    assert_every_reply_is_still_named(&reader);
+
+    let signal = session::approval_signal(0, 0, "toolu_wanted");
+    let found = daemon::pending_call(&reader, "e", &signal, false)
+        .expect("the replies read")
+        .expect("the awaited call must be found behind the damaged replies");
+    assert_eq!(
+        found.id, "toolu_wanted",
+        "and it is the call that was recorded"
+    );
+    assert_eq!(found.tool, "write_file", "with the tool it asked for");
+}
+
+/// The fault each recorded reply carries, before any of them is read.
+fn assert_the_recorded_faults(writer: &rusqlite::Connection) {
+    let kind = |seq: i64| -> Option<String> {
+        writer
+            .query_row(
+                "SELECT json_type(event_json, '$.data.output.tool_calls') \
+                 FROM harvest_events WHERE seq = ?1",
+                [seq],
+                |row| row.get(0),
+            )
+            .expect("the classification answers")
+    };
+    assert_eq!(
+        kind(0).as_deref(),
+        Some("array"),
+        "the awaited reply is an array"
+    );
+    assert_eq!(
+        kind(1).as_deref(),
+        Some("integer"),
+        "a scalar is not an array"
+    );
+    assert_eq!(kind(2).as_deref(), Some("text"), "nor is a string");
+
+    // The raw-byte row passes BOTH database tests, so only the decode in
+    // Rust can refuse it. That row is what the byte read exists for.
+    assert_eq!(
+        kind(9).as_deref(),
+        Some("array"),
+        "the raw-byte reply is an array to SQLite"
+    );
+    let raw_bytes: Option<Vec<u8>> = writer
+        .query_row(
+            "SELECT cast(json_extract(event_json, '$.data.output.tool_calls') as blob) \
+             FROM harvest_events WHERE seq = 9",
+            [],
+            |row| row.get(0),
+        )
+        .expect("the bytes answer");
+    assert!(
+        raw_bytes.is_some_and(|bytes| std::str::from_utf8(&bytes).is_err()),
+        "and its array bytes are not text"
+    );
+}
+
+/// Every REPLY is still named, so the search can walk past the damaged ones.
+///
+/// The `not json at all` row is not among them: it carries no `stop_reason`,
+/// so the page does not count it as a reply. Its part here is to prove the
+/// WHERE clause does not raise over it.
+fn assert_every_reply_is_still_named(reader: &rusqlite::Connection) {
+    let page = inspect::reply_calls(reader, "e", None, 16).expect("the replies still read");
+    assert_eq!(page.len(), 4, "every reply is still named: {page:?}");
+    assert!(
+        page.iter().all(|(seq, _)| *seq != 3),
+        "a row that is not JSON is not a reply: {page:?}"
+    );
+    assert!(
+        page.iter()
+            .filter(|(seq, _)| *seq != 0)
+            .all(|(_, calls)| calls.is_null()),
+        "a reply this reader cannot decode holds no calls: {page:?}"
+    );
+}
+
+/// A status that cannot read the reply SAYS so, rather than showing nothing.
+///
+/// The projections degrade a damaged reply on their own, so a read that still
+/// fails is the query or the table. Reporting "no call" for that would name
+/// a session as waiting and give the operator nothing to answer with. That is
+/// the worse of the two readings.
+#[test]
+fn a_status_that_cannot_read_a_reply_says_so() {
+    let dir = tempfile::tempdir().expect("a temporary directory");
+    let db = dir.path().join("no-events.db");
+    let writer = rusqlite::Connection::open(&db).expect("the database opens");
+    fixture_table(&writer);
+    record_task(&writer, "waiting", READABLE_TASK);
+    // No `harvest_events` table at all, so the reply read fails outright.
+    drop(writer);
+
+    let reader = rusqlite::Connection::open(&db).expect("the database opens");
+    let signal = session::approval_signal(0, 0, "toolu_wanted");
+    let read = daemon::pending_call(&reader, "waiting", &signal, false);
+    assert!(
+        read.is_err(),
+        "the reply read must fail on this database: {read:?}"
+    );
+
+    // The parked state the last drive left behind is what names the session
+    // as waiting, and it is what the operator reads.
+    let parked = daemon::ParkedState {
+        signal: Some(signal),
+        reason: "waiting for approval of write_file".to_string(),
+    };
+    let (pending, blocked_on) = daemon::decidable(&reader, "waiting", Some(&parked), false);
+    assert!(
+        pending.is_none(),
+        "no call can be offered when the reply cannot be read"
+    );
+    let reason = blocked_on.expect("the session still says why it is parked");
+    assert!(
+        reason.contains("waiting for approval of write_file") && reason.contains("cannot be read"),
+        "the reason must keep the wait AND name the read that failed: {reason}"
+    );
 }
 
 /// One listed session, by id.
