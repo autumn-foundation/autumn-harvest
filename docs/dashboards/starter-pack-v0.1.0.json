@@ -6188,6 +6188,55 @@
         }
       ],
       "description": "Alert: harvest_audit_export_unobservable (docs/runbooks/harvest-alerts.md#harvest_audit_export_unobservable) Whether the exporter could read this shard's cursor and lag this tick \u2014 a connection it cannot acquire, a failed cursor read, or a failed lag query all report 0. Read this panel FIRST: a Prometheus gauge keeps exporting its last value, so while this is 0 the lag panel above is frozen at its last reading rather than reflecting reality."
+    },
+    {
+      "id": 956,
+      "type": "timeseries",
+      "title": "RPO known (0 = readable but unmeasurable)",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 24,
+        "x": 0,
+        "y": 167
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "custom": {
+            "fillOpacity": 10,
+            "showPoints": "never",
+            "lineWidth": 1
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "min by (shard) (harvest_replication_rpo_known{shard=~\"$shard\"})",
+          "legendFormat": "shard {{shard}}",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          }
+        }
+      ],
+      "description": "Alert: harvest_replication_rpo_unknown (docs/runbooks/harvest-alerts.md#harvest_replication_rpo_unknown) Whether this shard's measured RPO has a source at all. 0 means the replication views are readable and a standby is connected, but no DR slot has confirmed a position and the standby has not reported a replay_lag either \u2014 the RPO gauge is withheld rather than published as a stale or fabricated number."
     }
   ]
 }

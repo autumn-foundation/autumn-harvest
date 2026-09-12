@@ -359,6 +359,27 @@ pub const METRIC_REPLICATION_LAG_BYTES: &str = "harvest.replication.lag_bytes";
 /// Labelled `{shard}`.
 pub const METRIC_REPLICATION_STANDBYS: &str = "harvest.replication.standbys";
 
+/// Gauge: `1` while a shard's measured RPO is known. `0` when the
+/// replication views are readable but the RPO itself is not (issue #954,
+/// finding 2).
+///
+/// [`METRIC_REPLICATION_OBSERVABLE`] covers the views-unreadable case. It
+/// does not cover a shard whose views read fine but whose RPO has no
+/// source yet. That happens for a physical standby attached with no DR
+/// slot, before it has reported its first `replay_lag`.
+///
+/// A Prometheus gauge keeps exporting its last value. So simply skipping
+/// [`METRIC_REPLICATION_LAG_SECONDS`] in that case does not make the
+/// series stale; it freezes the dashboard at the last healthy reading.
+/// This gauge is emitted on every sampler tick the views are readable, `0`
+/// included, so it cannot go stale the same way.
+///
+/// Alerting: ticket when this is `0` while
+/// [`METRIC_REPLICATION_OBSERVABLE`] is `1` (readable but unmeasurable) — see
+/// `harvest_replication_rpo_unknown` in the starter alert pack. Labelled
+/// `{shard}`.
+pub const METRIC_REPLICATION_RPO_KNOWN: &str = "harvest.replication.rpo_known";
+
 /// Gauge: the write-authority epoch a shard's database currently reports
 /// (issue #954).
 ///
@@ -2768,6 +2789,16 @@ pub trait MetricsRecorder: Send + Sync {
         let _ = (shard, count);
     }
 
+    /// Whether a shard's measured RPO is known (issue #954, finding 2).
+    ///
+    /// Emitted on every sampler tick the views are readable, `0` included —
+    /// like [`Self::record_replication_observable`], it must never go stale.
+    ///
+    /// Maps to the gauge [`METRIC_REPLICATION_RPO_KNOWN`].
+    fn record_replication_rpo_known(&self, shard: u16, known: bool) {
+        let _ = (shard, known);
+    }
+
     /// The write-authority epoch a shard's database currently reports
     /// (issue #954).
     ///
@@ -4424,6 +4455,7 @@ mod tests {
         rec.record_replication_observable(0, false);
         rec.record_replication_lag_bytes(0, 4_096);
         rec.record_replication_standbys(0, 1);
+        rec.record_replication_rpo_known(0, false);
         rec.record_shard_generation(0, 7);
         rec.record_shard_fenced(0);
         assert_eq!(
@@ -4435,6 +4467,10 @@ mod tests {
             "harvest.replication.lag_bytes"
         );
         assert_eq!(METRIC_REPLICATION_STANDBYS, "harvest.replication.standbys");
+        assert_eq!(
+            METRIC_REPLICATION_RPO_KNOWN,
+            "harvest.replication.rpo_known"
+        );
         assert_eq!(METRIC_SHARD_GENERATION, "harvest.shard.generation");
         assert_eq!(METRIC_SHARD_FENCED, "harvest.shard.fenced");
     }

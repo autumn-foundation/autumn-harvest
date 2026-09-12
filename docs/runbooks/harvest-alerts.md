@@ -2868,6 +2868,60 @@ incident channel rather than recorded as zero.
 
 ---
 
+## harvest_replication_rpo_unknown
+
+**What to do when a shard's RPO has no source.** The replication views are
+readable and a standby is connected, but no signal can produce an RPO number
+yet: no DR slot has confirmed a position, and the standby has not reported a
+`replay_lag` either. This differs from `harvest_replication_unobservable`: the
+views are not the problem here, the RPO itself has no source.
+
+`harvest.replication.lag_seconds` is withheld rather than published as a stale
+or fabricated number. A Prometheus gauge keeps exporting its last value, so
+withholding it alone does not make the panel stale — it freezes at the last
+healthy reading. `harvest.replication.rpo_known` is the signal that breaks
+that freeze: it is emitted every tick the views are readable, `0` included.
+
+### Triage steps
+
+1. `harvest dr status --shard <id>=<dsn> -o json`. Read the standby and slot
+   list for the affected shard.
+2. Confirm a DR slot exists and carries the configured prefix
+   (`replication_slot_prefix`, default `harvest_dr`). A standby attached
+   without one cannot report a watermark.
+3. Check how long ago the standby connected. A `replay_lag` of `NULL` is
+   normal until the first feedback round trip completes; give it one sampler
+   interval before treating it as stuck.
+
+### Likely causes
+
+- A physical standby attached to the primary without a `primary_slot_name`,
+  so no slot exists for the sampler to read a position from.
+- A freshly created DR slot with no watermark beat written yet (the sampler
+  writes at most one beat per shard per interval).
+- A standby that connected moments ago and has not completed a feedback round
+  trip.
+
+### False positives
+
+- The first sampler tick after a new standby connects. The `for: 10m` window
+  covers ordinary startup.
+
+### Safe actions
+
+- Create the missing replication slot and reattach the standby with
+  `primary_slot_name` set, per `docs/cross-region-dr.md`.
+- Wait one sampler interval past standby connection before escalating.
+
+### Escalation criteria
+
+Escalate if this fires for longer than the standby's expected catch-up time,
+or if a failover is being considered while this is firing — the RPO for this
+shard is unmeasured, and that must be said out loud in the incident channel
+rather than assumed to be small.
+
+---
+
 ## harvest_audit_export_lag_high
 
 `harvest.audit.export_lag` is the age of the **oldest** audit record the SIEM
