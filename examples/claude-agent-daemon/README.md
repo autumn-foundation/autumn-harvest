@@ -123,9 +123,9 @@ wrong would be safe.
 inside the workspace, and a write replaces its target. A database the agent can
 reach is therefore one approved tool call away from replacement, while `SQLite`
 still holds the old inode — the recorded history of every session, gone. The
-daemon refuses to start in that layout, and names the flag to change. Pointing
-`--workspace` at the directory that holds `agentd.db` is the easy way to meet
-it.
+daemon refuses to start in that layout, and names the flags to change. The
+defaults already meet the rule: `agentd.db` in the current directory, and
+`--workspace agent-workspace` beside it rather than around it.
 
 **The database is owner-only too.** It holds every prompt, tool input, and tool
 result, including the content of each file the agent read — so a new database

@@ -1748,6 +1748,52 @@ async fn a_daemon_refuses_a_database_the_agent_could_write() {
             .contains("inside the workspace"),
         "a database below the workspace must be refused too"
     );
+
+    // A link OUTSIDE the workspace can name a target inside it. The lock and
+    // `SQLite` both follow the link. A test on the link's own path would
+    // report the safe side of a rule the daemon then breaks.
+    std::fs::write(workspace.join("real.db"), "").expect("the target exists");
+    let link = dir.path().join("linked.db");
+    std::os::unix::fs::symlink(workspace.join("real.db"), &link).expect("the link is made");
+    let linked = daemon::Options {
+        db: link,
+        socket: dir.path().join("agentd.sock"),
+        workspace: workspace.clone(),
+        model: claude::DEFAULT_MODEL.to_string(),
+        max_tokens: claude::DEFAULT_MAX_TOKENS,
+        tick: Duration::from_millis(50),
+        api_key: None,
+    };
+    assert!(
+        tokio::time::timeout(Duration::from_secs(10), daemon::serve(linked))
+            .await
+            .expect("the daemon must refuse rather than start")
+            .expect_err("a linked database must be refused")
+            .contains("inside the workspace"),
+        "a link into the workspace must be refused"
+    );
+
+    // A link that resolves to nothing would create its file wherever it
+    // points, so it is refused rather than guessed at.
+    let dangling = dir.path().join("dangling.db");
+    std::os::unix::fs::symlink(workspace.join("absent.db"), &dangling).expect("the link is made");
+    let broken = daemon::Options {
+        db: dangling,
+        socket: dir.path().join("agentd.sock"),
+        workspace,
+        model: claude::DEFAULT_MODEL.to_string(),
+        max_tokens: claude::DEFAULT_MAX_TOKENS,
+        tick: Duration::from_millis(50),
+        api_key: None,
+    };
+    assert!(
+        tokio::time::timeout(Duration::from_secs(10), daemon::serve(broken))
+            .await
+            .expect("the daemon must refuse rather than start")
+            .expect_err("a dangling link must be refused")
+            .contains("resolves to nothing"),
+        "a link to nothing must be refused"
+    );
 }
 
 #[tokio::test]

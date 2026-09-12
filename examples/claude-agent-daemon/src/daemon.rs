@@ -689,17 +689,8 @@ pub fn pending_call(
 /// alternative is a list of reserved names in the toolbox, which has to stay
 /// in step with whatever the engine writes beside its database.
 fn refuse_state_in_workspace(db: &Path, workspace: &Path) -> Result<(), String> {
-    let directory = match db.parent() {
-        Some(parent) if !parent.as_os_str().is_empty() => parent,
-        _ => Path::new("."),
-    };
-    let resolved = directory
-        .canonicalize()
-        .map_err(|e| format!("cannot resolve the directory of {}: {e}", db.display()))?;
-    let name = db
-        .file_name()
-        .ok_or_else(|| format!("{} does not name a database file", db.display()))?;
-    if !resolved.join(name).starts_with(workspace) {
+    let real = resolve_database(db)?;
+    if !real.starts_with(workspace) {
         return Ok(());
     }
 
@@ -711,6 +702,43 @@ fn refuse_state_in_workspace(db: &Path, workspace: &Path) -> Result<(), String> 
         db.display(),
         workspace.display()
     ))
+}
+
+/// Where the database really is.
+///
+/// The final component is resolved too, and not only the directory that holds
+/// it. A symbolic link outside the workspace can name a target inside it, and
+/// the lock and `SQLite` both follow the link. A test on the link's own path
+/// would report the safe side of a rule the daemon then breaks.
+///
+/// A database that does not exist yet has no target to resolve, so the
+/// directory that will hold it is resolved instead. A link that resolves to
+/// nothing is refused rather than guessed at. The file it creates would land
+/// wherever the link points, and that is the question being asked here.
+fn resolve_database(db: &Path) -> Result<PathBuf, String> {
+    if let Ok(real) = db.canonicalize() {
+        return Ok(real);
+    }
+    if db.symlink_metadata().is_ok() {
+        return Err(format!(
+            "the database {} is a symbolic link that resolves to nothing. \
+             The daemon cannot say where it would write. Name the database \
+             itself with `--db`.",
+            db.display()
+        ));
+    }
+
+    let directory = match db.parent() {
+        Some(parent) if !parent.as_os_str().is_empty() => parent,
+        _ => Path::new("."),
+    };
+    let resolved = directory
+        .canonicalize()
+        .map_err(|e| format!("cannot resolve the directory of {}: {e}", db.display()))?;
+    let name = db
+        .file_name()
+        .ok_or_else(|| format!("{} does not name a database file", db.display()))?;
+    Ok(resolved.join(name))
 }
 
 /// The sessions a previous process left running.
