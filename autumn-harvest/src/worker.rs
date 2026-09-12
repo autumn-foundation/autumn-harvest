@@ -29781,8 +29781,9 @@ mod tests {
     fn stuck_running_threshold_gives_headroom_past_the_task_budget() {
         let budget = Duration::from_secs(60);
         let threshold = stuck_running_threshold_secs(budget).expect("budget is nonzero");
+        let budget_secs = i64::try_from(budget.as_secs()).expect("test budget fits in i64");
         assert!(
-            threshold > budget.as_secs() as i64,
+            threshold > budget_secs,
             "the threshold must exceed the budget a cycle can legitimately run for"
         );
         // Four times the budget plus the documented 30-second margin.
