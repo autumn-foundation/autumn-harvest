@@ -679,6 +679,7 @@ pub async fn list_quota_usage(conn: &mut AsyncPgConnection) -> HarvestResult<Vec
 /// (`debounce`/`throttle`'s `order_due_rows_for_deadlock_free_firing`) can
 /// then resolve the SAME string this function locks on. It never uses an
 /// independently-formatted copy that could silently drift from it.
+#[cfg(feature = "db")]
 pub(crate) fn quota_lock_namespace(workflow_name: &str, quota_key: &str) -> String {
     format!("quota:{workflow_name}:{quota_key}")
 }
