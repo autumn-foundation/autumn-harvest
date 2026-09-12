@@ -2112,6 +2112,59 @@ async fn retention_ignores_an_unrelated_shards_lingering_cursor_row() {
     );
 }
 
+// An excluded shard's stale, frozen acknowledgment must not block
+// purging rows a still-relevant colocated shard has genuinely
+// acknowledged (issue #1266). The acknowledgment check, not only the
+// missing-cursor check, must scope to shards that still count.
+#[tokio::test]
+async fn retention_ignores_an_excluded_shards_stale_acknowledgment() {
+    let _guard = TEST_SERIAL.lock().await;
+    let _sink = install(Arc::new(RecordingSink::new(200)), 5);
+    let (mut conn, _c) = make_conn().await;
+    insert_audit_rows(&mut conn, 5).await;
+    fire_due_audit_exports(&mut conn, &None, &[], &NoOpMetrics)
+        .await
+        .expect("tick");
+    assert_eq!(cursor_acked(&mut conn, 0).await, 5);
+    uninstall();
+
+    // Shard 1 shares this physical pool but was decommissioned early,
+    // with a stale cursor that only ever acknowledged the first row.
+    ensure_cursor_row(&mut conn, 1).await.expect("cursor row");
+    {
+        use autumn_harvest::schema::harvest_audit_export_cursor::dsl as cur;
+        diesel::update(cur::harvest_audit_export_cursor.find(1))
+            .set(cur::last_acked_seq.eq(1))
+            .execute(&mut conn)
+            .await
+            .expect("stamp stale ack");
+    }
+    assert!(
+        autumn_harvest::audit_export::decommission_cursor(&mut conn, 1)
+            .await
+            .expect("decommission"),
+        "the cursor row existed, so it must report as removed"
+    );
+
+    diesel::update(harvest_audit_log::table)
+        .set(harvest_audit_log::occurred_at.eq(chrono::Utc::now() - chrono::Duration::days(365)))
+        .execute(&mut conn)
+        .await
+        .expect("age rows");
+
+    // Shard 1 is excluded, so only shard 0 is in the expected-cursor
+    // list. Shard 0 has acknowledged all 5 rows; shard 1's stale,
+    // decommissioned cursor (stuck at seq 1) must not block the rest.
+    let deleted = purge_old_audit_records(&mut conn, 90, false, &[0])
+        .await
+        .expect("purge runs");
+    assert_eq!(
+        deleted, 5,
+        "shard 1's stale, excluded cursor must not keep protecting rows \
+         shard 0 has already fully acknowledged"
+    );
+}
+
 #[tokio::test]
 async fn every_tick_refreshes_the_exporter_heartbeat() {
     let _guard = TEST_SERIAL.lock().await;

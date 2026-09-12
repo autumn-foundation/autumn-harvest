@@ -1673,8 +1673,17 @@ impl Drop for RetentionLeaseGuard {
 /// so a count can look complete even when a currently colocated shard
 /// has none of its own. See `purge_old_audit_records`'s doc comment.
 ///
-/// The list names only shards that currently want protection, not every
-/// shard sharing the pool. An exempted shard may never tick, and so may
+/// The list excludes only shards an operator has explicitly exempted,
+/// not every shard that merely lacks today's `protect_unexported_audit`
+/// flag. Those are different things. The flag can be unset for every
+/// shard (`protect_unexported_audit: None`, the common case). That means
+/// the operator never opted into it at all. Every shard's cursor still
+/// matters exactly as it did before this flag existed.
+/// [`RetentionConfig::protects_unexported_audit`] answers a different
+/// question -- "does the flag protect this shard right now". It returns
+/// `false` for every shard when the flag is off. Using it here would
+/// silently empty this list and disable the check across the board. An
+/// explicitly exempted shard (issue #1266) may never tick, and so may
 /// have no cursor row at all. It is not a shard the guard needs to hear
 /// from: exempting it is exactly how an operator says its progress no
 /// longer matters. Naming it anyway would make the missing-cursor check
@@ -1694,7 +1703,12 @@ fn group_shards_by_pool<'a>(
                 .any(|shard| config.protects_unexported_audit(*shard));
             let expects_cursor: Vec<ShardId> = shards
                 .into_iter()
-                .filter(|shard| config.protects_unexported_audit(*shard))
+                .filter(|shard| {
+                    !config
+                        .protect_unexported_audit
+                        .as_ref()
+                        .is_some_and(|exempt| exempt.contains(shard))
+                })
                 .collect();
             (pool, protect, expects_cursor)
         })
@@ -3459,6 +3473,39 @@ mod tests {
              list entirely, not merely from the protection decision, or \
              its permanent lack of a cursor row would block purging of \
              rows shard 1 has genuinely acknowledged"
+        );
+    }
+
+    // Leaving `protect_unexported_audit` unset entirely (the common
+    // case, issue #1266) must not empty the expected-cursor list.
+    // `protects_unexported_audit` answers "does the flag protect this
+    // shard today". That is `false` for every shard when the flag is
+    // off. It is a different question from "is this shard exempted",
+    // which is what the expected-cursor list must filter on. Confusing
+    // the two would silently disable the missing-cursor check for every
+    // deployment that never configures this flag at all.
+    #[cfg(feature = "db")]
+    #[test]
+    fn group_shards_by_pool_expects_every_shard_when_the_flag_is_never_configured() {
+        let pool = test_pool("postgres://unused/db");
+        let mut aliased = BTreeMap::new();
+        aliased.insert(ShardId::new(0), pool.clone());
+        aliased.insert(ShardId::new(1), pool);
+        let sharded = ShardedDbPool::from_map(aliased, ShardId::new(0));
+
+        let config = RetentionConfig::default();
+        assert!(
+            !config.protects_unexported_audit(ShardId::new(0)),
+            "the flag protects nobody when it is off, by design"
+        );
+
+        let groups = group_shards_by_pool(&sharded, &config);
+        assert_eq!(
+            groups[0].2,
+            vec![ShardId::new(0), ShardId::new(1)],
+            "an unconfigured flag exempts no one, so both colocated \
+             shards must still be expected to have a cursor row, exactly \
+             as they were before this flag existed"
         );
     }
 

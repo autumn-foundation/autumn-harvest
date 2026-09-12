@@ -1618,7 +1618,8 @@ pub async fn list_audit(
 /// The pending check treats a row as pending, and so protected, in three
 /// cases. Its `export_seq` may be unassigned. Some shard in
 /// `colocated_shard_ids` may have no cursor row at all. Or a cursor row
-/// may exist and simply not have acknowledged it yet.
+/// belonging to a shard in `colocated_shard_ids` may exist and simply
+/// not have acknowledged it yet.
 ///
 /// The second case matters on its own (issue #1266). A stamped row can
 /// survive a cursor row's manual deletion. It can
@@ -1673,6 +1674,15 @@ pub async fn purge_old_audit_records(
     // has no row of its own. `unnest` walks the caller's exact
     // shard-id list; the disjunct is true the moment any of them has no
     // matching row.
+    //
+    // The last disjunct now also scopes to `colocated_shard_ids` (issue
+    // #1266). An excluded shard's cursor row can carry a stale
+    // `last_acked_seq` forever, since decommissioning retires a row
+    // rather than deleting it. Without this scope, that stale row alone
+    // could keep a row "pending" long after every shard that still
+    // matters had genuinely acknowledged it. `colocated_shard_ids` names
+    // only shards an operator has not explicitly exempted, so this
+    // matches the middle disjunct's own notion of "who still counts".
     diesel::sql_query(
         "DELETE FROM harvest_audit_log a \
          WHERE a.occurred_at < $1 \
@@ -1695,7 +1705,8 @@ pub async fn purge_old_audit_records(
                    ) \
                    OR EXISTS ( \
                         SELECT 1 FROM harvest_audit_export_cursor c \
-                        WHERE a.export_seq > c.last_acked_seq \
+                        WHERE c.shard_id = ANY($3::int4[]) \
+                          AND a.export_seq > c.last_acked_seq \
                    ) \
                  ) \
            )",

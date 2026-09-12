@@ -307,13 +307,25 @@ shard records:
   by identity rather than counted — a decommissioned shard's cursor row
   is retired, never deleted, so a shard removed from the fleet entirely
   can leave a row behind that would make a mere count look complete. The
-  list names only shards that currently want protection, not every shard
-  sharing the pool: an exempted shard that never ticks has no cursor row
-  of its own by design, and naming it anyway would block purging rows a
-  still-protected, colocated shard has genuinely acknowledged. The sweep
+  list names every shard sharing the pool except one an operator has
+  explicitly exempted. That is not the same list as "shards that
+  currently want protection": when the flag is unset fleet-wide (the
+  common case), no shard wants protection today, yet every shard's
+  cursor still matters exactly as it did before the flag existed, so all
+  of them belong in the list. An exempted shard that never ticks has no
+  cursor row of its own by design, and naming it anyway would block
+  purging rows a still-protected, colocated shard has genuinely
+  acknowledged. Only its explicit exemption removes it. The sweep
   sources the list from the same `ShardedDbPool::pool_groups()` call
   that computes the combined decision, so this needs no separate
   operator action either.
+
+  The acknowledgment check itself is scoped the same way: a colocated
+  shard's `last_acked_seq` only protects rows once that shard's id
+  appears in `colocated_shard_ids`. A shard excluded from the list keeps
+  its last cursor row, frozen at whatever it last acknowledged before
+  decommissioning, and that stale row must not go on shielding rows a
+  still-relevant, colocated shard has already fully acknowledged.
 
   Detection covers both ways a fleet builds a `ShardedDbPool`.
   `ShardedDbPool::from_map` can receive one cloned `Pool` under two shard
@@ -331,8 +343,14 @@ shard records:
   Only a `search_path` setting is extracted from `options` (`options`
   itself can carry `-c search_path=...` or `-csearch_path=...`, both
   recognized, but also any other GUC an operator sets, so the whole
-  string is not kept). `search_path` picks which schema a query resolves
-  against — two DSNs differing only there must stay in separate groups.
+  string is not kept). Postgres applies repeated `-c` flags in order, so
+  a later `-c search_path=...` overrides an earlier one; the extraction
+  keeps only the last occurrence, matching that sequential-`SET`
+  semantic rather than the first or a concatenation. `search_path` picks
+  which schema a query resolves against — two DSNs differing only there
+  must stay in separate groups, and two DSNs whose last `search_path`
+  setting agrees must stay in one even if an earlier, overridden setting
+  differs.
   Every other query parameter (`application_name`, `sslmode`, and so on)
   is dropped, since none of them changes which relation a query resolves
   against — except `host`, `hostaddr`, and `port`: a Unix-socket DSN

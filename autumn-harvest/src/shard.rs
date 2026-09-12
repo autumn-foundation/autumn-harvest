@@ -1090,22 +1090,29 @@ fn canonical_dsn_key(dsn: &str) -> String {
 /// allows embedded whitespace in the value. A quoted value with
 /// embedded spaces is not recognized. Treating an unparsed `options`
 /// string as carrying no `search_path` is the conservative direction
-/// here. It
-/// only widens which DSNs compare as different, never the reverse.
+/// here. It only widens which DSNs compare as different, never the
+/// reverse.
+///
+/// `options` can repeat `-c search_path=...` more than once. libpq
+/// applies each as a `SET` in order at session start, so only the last
+/// one takes effect. Returning every match found would keep an
+/// overridden, inert value in the key, splitting two DSNs whose
+/// sessions actually resolve to the same schema. This keeps overwriting
+/// as it scans, so the last match wins, matching what the server does.
 #[cfg(feature = "db")]
-fn extract_search_path(options: &str) -> Vec<String> {
+fn extract_search_path(options: &str) -> Option<String> {
     let mut tokens = options.split_whitespace();
-    let mut search_paths = Vec::new();
+    let mut search_path = None;
     while let Some(tok) = tokens.next() {
         if tok == "-c" {
             if let Some(value) = tokens.next().and_then(|kv| kv.strip_prefix("search_path=")) {
-                search_paths.push(value.to_string());
+                search_path = Some(value.to_string());
             }
         } else if let Some(value) = tok.strip_prefix("-csearch_path=") {
-            search_paths.push(value.to_string());
+            search_path = Some(value.to_string());
         }
     }
-    search_paths
+    search_path
 }
 
 #[cfg(feature = "db")]
@@ -2484,6 +2491,41 @@ mod tests {
             2,
             "the compact `-csearch_path=` spelling must select a schema \
              just as the spaced form does, so these must never collapse"
+        );
+    }
+
+    // libpq applies a repeated `-c search_path=...` as a `SET`, in
+    // order, so only the last one has any effect. Two DSNs with the
+    // same effective `search_path` must collapse even when one carries
+    // an earlier, overridden value the other never mentions at all
+    // (issue #1266).
+    #[cfg(feature = "db")]
+    #[test]
+    fn from_dsns_groups_dsns_with_the_same_effective_search_path() {
+        let sharded = ShardedDbPool::from_dsns(
+            [
+                (
+                    ShardId::new(0),
+                    "postgres://db.example/shared?options=-c%20search_path%3Dold%20-c%20search_path%3Dshared"
+                        .to_string(),
+                ),
+                (
+                    ShardId::new(1),
+                    "postgres://db.example/shared?options=-c%20search_path%3Dshared".to_string(),
+                ),
+            ],
+            ShardId::new(0),
+            1,
+        )
+        .expect("pool builds without connecting");
+
+        let groups = sharded.pool_groups();
+        assert_eq!(
+            groups.len(),
+            1,
+            "only the last `-c search_path=` takes effect, so an \
+             overridden earlier value must not stop these from \
+             collapsing into one group"
         );
     }
 }

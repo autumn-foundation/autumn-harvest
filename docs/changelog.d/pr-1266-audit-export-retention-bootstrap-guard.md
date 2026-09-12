@@ -321,6 +321,76 @@ New tests:
   of a cursor never blocks purging rows a colocated, protected shard has
   genuinely acknowledged.
 
+A fourteenth review round found three defects, plus a regression caught
+before it ever reached a review comment.
+
+Verifying the round's third finding meant re-reading `group_shards_by_pool`
+against its own new test from the thirteenth round, and that reading
+surfaced a defect the review had not flagged: the thirteenth round's fix
+computed the expected-cursor list with
+`shards.filter(|s| config.protects_unexported_audit(*s))`.
+`protects_unexported_audit` answers "does the flag protect this shard
+**today**", which is `false` for every shard whenever
+`protect_unexported_audit` is left at its default, `None` -- the common
+case, and the case every test up to that point happened to leave
+untested, since each configured the flag explicitly. Filtering on it
+silently emptied the expected-cursor list, and so disabled this PR's own
+bootstrap-window guard, for any deployment that never sets the flag at
+all. The filter now tests exemption directly --
+`!exempt.contains(shard)` when the flag is `Some(exempt)`, true
+unconditionally when it is `None` -- so an unconfigured flag once again
+leaves every shard's cursor mattering, exactly as before the flag
+existed. `group_shards_by_pool_expects_every_shard_when_the_flag_is_never_configured`
+pins this directly.
+
+The first finding (P2) proposed falling back to another handle sharing a
+pool group when one shard's connection fails, so a purge is not skipped
+purely because the shard the sweep happened to pick is unreachable. This
+is deferred: it is a connection-pool resilience question, not a defect in
+the guard logic this PR closes, and risks masking a real per-shard outage
+as a routine skip. Left for a follow-up with its own test for a partial
+pool failure.
+
+The second finding (P1) found that `extract_search_path` kept every
+`-c search_path=...` occurrence it found in `options`, joined, rather
+than the one Postgres actually applies. Postgres processes repeated `-c`
+flags in the order given, so a later `search_path` setting overrides an
+earlier one; keeping both meant two DSNs whose *effective* search path
+agreed, because a later flag on one matched the only flag on the other,
+could still compare unequal and be split into separate groups --
+over-merging is not at risk here, but the two DSNs disagreeing on
+apparent history could also under-merge two aliases of the same shard
+into different groups, reopening the premature-deletion failure this key
+exists to prevent. `extract_search_path` now returns `Option<String>`
+instead of `Vec<String>` and keeps only the last occurrence.
+`from_dsns_groups_dsns_with_the_same_effective_search_path` pins this: a
+DSN with two `-c search_path=...` flags groups with one whose single flag
+matches only the second.
+
+The third finding (P2) found the acknowledgment check itself unscoped:
+`purge_old_audit_records` treated any colocated shard's cursor row with
+`last_acked_seq` past a row's `export_seq` as sufficient, even one for a
+shard no longer in `colocated_shard_ids`. `decommission_cursor` retires a
+row rather than deleting it, so an excluded shard's cursor persists,
+frozen at whatever it last acknowledged, and could keep shielding rows a
+still-relevant, colocated shard had already fully acknowledged. The
+acknowledgment disjunct now scopes to `c.shard_id = ANY($3::int4[])`, so
+only a shard still named in `colocated_shard_ids` can satisfy it.
+`retention_ignores_an_excluded_shards_stale_acknowledgment` pins this.
+
+New tests:
+- `group_shards_by_pool_expects_every_shard_when_the_flag_is_never_configured`
+  pins the self-discovered regression fix: leaving
+  `protect_unexported_audit` unset must not empty the expected-cursor
+  list.
+- `from_dsns_groups_dsns_with_the_same_effective_search_path` pins the
+  second finding: only the last `-c search_path=...` in `options`
+  decides the group, matching Postgres's own sequential-`SET` semantics.
+- `retention_ignores_an_excluded_shards_stale_acknowledgment` pins the
+  third finding: an excluded shard's stale, frozen acknowledgment must
+  never protect rows a still-relevant, colocated shard has already
+  acknowledged.
+
 **Zero migration, zero engine impact beyond the new parameter.** No new
 `WorkflowEvent` variant, no schema change, no change to any existing call
 site's behavior when the new flag is left at its default (disabled).
