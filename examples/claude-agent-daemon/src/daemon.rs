@@ -350,6 +350,41 @@ fn unreadable(exec_id: &str) -> String {
     )
 }
 
+/// The refusal for a session recorded against another model identity.
+///
+/// The advice has to be a command that WORKS. An operator copies it.
+///
+/// The recorded identity is NOT the `--model` flag. A daemon holding a key
+/// records the model it was given. A daemon without one records the stub. So
+/// `--model` alone cannot cross that line, in either direction.
+///
+/// Both errors were reachable. `--model=offline-stub` is refused outright
+/// while a key is set. `--model=<a real model>` builds without a key, and
+/// then records the stub, so the same refusal arrives again.
+fn model_mismatch(exec_id: &str, recorded: &str, served: &str) -> String {
+    if recorded == claude::OFFLINE_MODEL {
+        return format!(
+            "session {exec_id} ran on this daemon's own stub, and this daemon \
+             serves the model `{served}`. Unset `ANTHROPIC_API_KEY` so the \
+             session can resume. `--model` cannot do it: a daemon holding a key \
+             records every session against a real model."
+        );
+    }
+    if served == claude::OFFLINE_MODEL {
+        return format!(
+            "session {exec_id} runs on the model `{recorded}`, and this daemon \
+             serves its own stub because no key is set. Set `ANTHROPIC_API_KEY` \
+             and start it with `--model={}` so the session can resume.",
+            crate::protocol::quoted(recorded)
+        );
+    }
+    format!(
+        "session {exec_id} runs on the model `{recorded}`, and this daemon serves \
+         `{served}`. Start it with `--model={}` so the session can resume.",
+        crate::protocol::quoted(recorded)
+    )
+}
+
 /// Refuse to start when a session in this file belongs to another daemon.
 ///
 /// The activity-level checks stay as a backstop, but they can only fail a run.
@@ -403,13 +438,7 @@ fn check_resumable(
             ));
         }
         if recorded_model != model {
-            return Err(format!(
-                "session {} runs on the model `{recorded_model}`, and this daemon \
-                 serves `{model}`. Start it with `--model={}`, or with the key \
-                 that model needs, so the session can resume.",
-                row.exec_id,
-                crate::protocol::quoted(recorded_model)
-            ));
+            return Err(model_mismatch(&row.exec_id, recorded_model, model));
         }
         // An id that does not parse is the same failure one step on. The
         // session would pass every check above and then never be driven.

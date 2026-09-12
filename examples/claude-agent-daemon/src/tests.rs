@@ -8528,3 +8528,137 @@ fn an_id_too_long_to_decide_is_refused() {
         "a real tool-use id must still be addressable"
     );
 }
+
+/// The identity a daemon started with these two settings records.
+///
+/// This is the value `check_resumable` compares a recorded session against.
+/// Following a restart hint can therefore be checked against the same
+/// function the hint exists to satisfy.
+fn identity_for(key: Option<&str>, model: &str) -> String {
+    claude::ModelConfig::new(
+        key.map(str::to_string),
+        model,
+        claude::DEFAULT_MAX_TOKENS,
+        crate::shutdown::channel().1,
+    )
+    .expect("the configuration builds")
+    .identity()
+}
+
+/// A model restart hint names a command that actually resumes the session.
+///
+/// The recorded identity is not the `--model` flag. A daemon holding a key
+/// records the model it was given, and one without a key records the stub.
+///
+/// Measured before the fix, in both directions. An offline session under a
+/// daemon with a key was told `--model=offline-stub`, which that daemon
+/// refuses outright. A live session under a daemon with no key was told
+/// `--model=claude-opus-5`, which builds and still records the stub, so the
+/// same refusal arrives again.
+#[tokio::test]
+async fn a_model_restart_hint_names_a_command_that_works() {
+    let dir = tempfile::tempdir().expect("a temporary directory");
+    let workspace = dir.path().join("workspace");
+    std::fs::create_dir_all(&workspace).expect("the workspace is created");
+    let calls = Arc::new(AtomicUsize::new(0));
+    let live_model = "claude-opus-5";
+
+    for (case, recorded, key) in [
+        (
+            "an offline session under a daemon with a key",
+            claude::OFFLINE_MODEL,
+            Some("sk-ant-example".to_string()),
+        ),
+        (
+            "a live session under a daemon with no key",
+            live_model,
+            None,
+        ),
+    ] {
+        let db = dir
+            .path()
+            .join(format!("{}.db", recorded.replace('-', "_")));
+        {
+            // The runtime creates the schema. A live row is written directly,
+            // because the offline stub refuses to serve a live identity.
+            let mut rt = runtime(&db, &workspace, &calls);
+            let exec = rt
+                .start_workflow(WORKFLOW_NAME, task(&workspace))
+                .expect("the session starts");
+            drive_to_approval(&mut rt, exec).await;
+        }
+        if recorded != claude::OFFLINE_MODEL {
+            let writer = rusqlite::Connection::open(&db).expect("the database opens");
+            writer
+                .execute(
+                    "INSERT INTO harvest_executions \
+                     (exec_id, workflow_name, workflow_id, input_json, state) \
+                     VALUES (?1, ?2, '', ?3, 'RUNNING')",
+                    rusqlite::params![
+                        "ffffffff-1111-2222-3333-444444444444",
+                        WORKFLOW_NAME,
+                        task_on(&workspace, recorded).to_string()
+                    ],
+                )
+                .expect("the live session is recorded");
+        }
+
+        let message = daemon::serve(daemon::Options {
+            db,
+            socket: dir.path().join(format!("{recorded}.sock")),
+            workspace: workspace.clone(),
+            model: claude::DEFAULT_MODEL.to_string(),
+            max_tokens: claude::DEFAULT_MAX_TOKENS,
+            tick: Duration::from_millis(50),
+            api_key: key,
+        })
+        .await
+        .expect_err("the daemon must refuse to start");
+
+        if recorded == claude::OFFLINE_MODEL {
+            // The key is what records a real identity, so the key is what has
+            // to go. The old advice named a model this daemon refuses.
+            assert!(
+                message.contains("Unset `ANTHROPIC_API_KEY`"),
+                "[{case}] the hint must name the key: {message}"
+            );
+            assert!(
+                !message.contains("--model=offline-stub"),
+                "[{case}] and must not advertise a model this daemon refuses: {message}"
+            );
+            // Following it resumes the session: the identity then matches.
+            assert_eq!(
+                identity_for(None, claude::DEFAULT_MODEL),
+                recorded,
+                "[{case}] unsetting the key must record the identity the session has"
+            );
+        } else {
+            // A flag alone cannot make this daemon live, so the hint names
+            // both halves. The old advice named only the flag.
+            assert!(
+                message.contains("Set `ANTHROPIC_API_KEY`")
+                    && message.contains(&format!("--model={recorded}")),
+                "[{case}] the hint must name the key AND the model: {message}"
+            );
+            assert_eq!(
+                identity_for(Some("sk-ant-example"), recorded),
+                recorded,
+                "[{case}] both together must record the identity the session has"
+            );
+            // The flag on its own is what the old hint advertised.
+            assert_ne!(
+                identity_for(None, recorded),
+                recorded,
+                "[{case}] the flag alone must be known NOT to resume it"
+            );
+        }
+    }
+
+    // Two live daemons on different models need only the flag, and that hint
+    // is unchanged. The key is already set in that case.
+    assert_eq!(
+        identity_for(Some("sk-ant-example"), live_model),
+        live_model,
+        "a live daemon records the model it was given"
+    );
+}
