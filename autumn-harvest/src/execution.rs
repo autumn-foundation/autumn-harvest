@@ -505,6 +505,12 @@ pub(crate) struct PendingSupersede<'a> {
 /// credited capacity between the scan and this function's check. Taking the
 /// lock first serializes every admission for this key through this
 /// function. No such race survives.
+///
+/// Returns the exact execution ids this admission credited (issue #1228
+/// review, P2) -- empty when `pending_supersede` was `None` or credited
+/// nothing. The caller passes this on to
+/// [`run_latest_wins_supersede`], which reconciles it against the real
+/// supersede pass's actual outcome once that pass runs.
 pub(crate) async fn enforce_quota_admission(
     conn: &mut AsyncPgConnection,
     quota_policy: Option<crate::quota::QuotaPolicy>,
@@ -512,15 +518,15 @@ pub(crate) async fn enforce_quota_admission(
     workflow_name: &str,
     metrics: Option<&(dyn crate::telemetry::MetricsRecorder + Send + Sync)>,
     pending_supersede: Option<PendingSupersede<'_>>,
-) -> HarvestResult<()> {
+) -> HarvestResult<Vec<uuid::Uuid>> {
     let Some(policy) = quota_policy else {
-        return Ok(());
+        return Ok(Vec::new());
     };
     if !policy.has_any_cap() {
-        return Ok(());
+        return Ok(Vec::new());
     }
     let Some(key) = quota_key else {
-        return Ok(());
+        return Ok(Vec::new());
     };
 
     // Serialize check-then-admit for this key under a transaction-scoped
@@ -572,7 +578,7 @@ pub(crate) async fn enforce_quota_admission(
             current: violation.current,
         });
     }
-    Ok(())
+    Ok(pending_supersede_credit.credited_ids)
 }
 
 /// Start a workflow execution or load the existing one, returning both the result
@@ -1161,7 +1167,7 @@ pub async fn start_or_load_workflow_execution_collect(
             // `quota_enforcement_policy` (not the bare `quota_policy`) so a
             // workflow-level retry continuation is exempt (see its
             // definition above) while a genuinely fresh start is not.
-            enforce_quota_admission(
+            let credited_ids = enforce_quota_admission(
                 conn,
                 quota_enforcement_policy,
                 quota_key.as_deref(),
@@ -1208,6 +1214,7 @@ pub async fn start_or_load_workflow_execution_collect(
                 exec_id,
                 &mut tx_deferred_checks,
                 metrics,
+                &credited_ids,
             )
             .await?;
 
@@ -1387,7 +1394,7 @@ pub async fn start_or_load_workflow_execution_collect(
                         &mut tx_deferred_checks,
                     )
                     .await?;
-                    let (started_wf, mut extra_deferred) = replace_execution(
+                    let (started_wf, mut extra_deferred, credited_ids) = replace_execution(
                         conn,
                         existing,
                         &row,
@@ -1409,6 +1416,7 @@ pub async fn start_or_load_workflow_execution_collect(
                         exec_id,
                         &mut tx_deferred_checks,
                         metrics,
+                        &credited_ids,
                     )
                     .await?;
                     tx_cancel_metrics.append(&mut sup_metrics);
@@ -1444,7 +1452,7 @@ pub async fn start_or_load_workflow_execution_collect(
                                 });
                             }
                             // Only these two explicitly abnormal states start fresh.
-                            let (started_wf, mut deferred) = replace_execution(
+                            let (started_wf, mut deferred, credited_ids) = replace_execution(
                                 conn,
                                 existing,
                                 &row,
@@ -1466,6 +1474,7 @@ pub async fn start_or_load_workflow_execution_collect(
                                 exec_id,
                                 &mut tx_deferred_checks,
                                 metrics,
+                                &credited_ids,
                             )
                             .await?;
                             deferred.append(&mut sup_deferred);
@@ -1497,7 +1506,7 @@ pub async fn start_or_load_workflow_execution_collect(
                             workflow_id: request.workflow_id.to_string(),
                         });
                     }
-                    let (started_wf, mut extra_deferred) = replace_execution(
+                    let (started_wf, mut extra_deferred, credited_ids) = replace_execution(
                         conn,
                         existing,
                         &row,
@@ -1518,6 +1527,7 @@ pub async fn start_or_load_workflow_execution_collect(
                         exec_id,
                         &mut tx_deferred_checks,
                         metrics,
+                        &credited_ids,
                     )
                     .await?;
                     extra_deferred.append(&mut sup_deferred);
@@ -2364,6 +2374,16 @@ mod resolve_by_workflow_id_tests {
 /// [`crate::concurrency::dry_run_supersede_credit`]. That credit is what
 /// makes a tight quota cap see the freed slot; the actual cancellation
 /// stays here, unmoved.
+///
+/// `credited_ids` (issue #1228 review, P2) is that same call's returned
+/// credit: the exact executions it counted as shed. This pass can skip one
+/// of them. A candidate's own corrupted `parent_close_policy`, or an
+/// unexpected `Config` error from its terminal chokepoint, can leave it
+/// running instead. See `supersede_inner`'s own doc comment. The admission
+/// already committed on the assumption that candidate would be gone. So a
+/// skip here is a real, if rare, over-cap breach, not merely a log line.
+/// This function reconciles `credited_ids` against `outcome.superseded`
+/// below and reports any gap.
 #[cfg(feature = "db")]
 async fn run_latest_wins_supersede(
     conn: &mut AsyncPgConnection,
@@ -2375,6 +2395,7 @@ async fn run_latest_wins_supersede(
     // because the only over-limit runs were protected in-flight admissions)
     // can be counted, not just logged.
     metrics: Option<&(dyn crate::telemetry::MetricsRecorder + Send + Sync)>,
+    credited_ids: &[uuid::Uuid],
 ) -> HarvestResult<(Vec<StartCancelledRun>, Vec<DeferredTriggerStart>)> {
     if !request.concurrency_on_conflict.is_cancel_running() {
         return Ok((Vec::new(), Vec::new()));
@@ -2392,6 +2413,19 @@ async fn run_latest_wins_supersede(
         metrics,
     )
     .await?;
+
+    // Issue #1228 review, P2: a credited id this pass did not actually shed
+    // (see this function's own doc comment). Reported, never blocked -- the
+    // admission this credited is already committed by the time this runs.
+    let shed_ids: Vec<uuid::Uuid> = outcome
+        .superseded
+        .iter()
+        .map(|run| run.exec_id.as_uuid())
+        .collect();
+    let not_shed = crate::concurrency::credited_but_not_shed_count(credited_ids, &shed_ids);
+    if let (Some(m), Ok(gap @ 1..)) = (metrics, u64::try_from(not_shed)) {
+        crate::telemetry::emit_quota_supersede_credit_not_shed(m, request.workflow_name, gap);
+    }
 
     let cancel_metrics = outcome
         .superseded
@@ -2418,7 +2452,11 @@ async fn replace_execution(
     quota_policy: Option<crate::quota::QuotaPolicy>,
     quota_key: Option<&str>,
     metrics: Option<&(dyn crate::telemetry::MetricsRecorder + Send + Sync)>,
-) -> HarvestResult<(StartedWorkflowExecution, Vec<DeferredTriggerStart>)> {
+) -> HarvestResult<(
+    StartedWorkflowExecution,
+    Vec<DeferredTriggerStart>,
+    Vec<uuid::Uuid>,
+)> {
     if request.start_at.is_some_and(|sa| sa < now) {
         return Err(HarvestError::Config(
             "Requested start_at is in the past".to_string(),
@@ -2487,7 +2525,7 @@ async fn replace_execution(
     } else {
         None
     };
-    enforce_quota_admission(
+    let credited_ids = enforce_quota_admission(
         conn,
         quota_policy,
         quota_key,
@@ -2526,6 +2564,7 @@ async fn replace_execution(
     Ok((
         StartedWorkflowExecution::from_row(new_execution, true),
         Vec::new(),
+        credited_ids,
     ))
 }
 

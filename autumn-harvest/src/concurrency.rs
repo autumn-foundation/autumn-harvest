@@ -196,6 +196,25 @@ pub struct SupersedePlan {
     pub shed: usize,
 }
 
+/// How many `credited_ids` are absent from `shed_ids` (issue #1228 review, P2).
+///
+/// A quota admission credits an execution's slot on the assumption that a
+/// later, real supersede pass will cancel it. `shed_ids` is the population
+/// that pass actually cancelled. The count returned here is how many
+/// credited runs it left running instead. A credited run can go unshed on
+/// a candidate's own corrupted `parent_close_policy`, or on an unexpected
+/// `Config` error from its terminal chokepoint. See
+/// [`crate::execution::run_latest_wins_supersede`]'s own doc comment. A
+/// non-zero result means the admission that spent this credit is now
+/// genuinely over its declared quota cap.
+#[must_use]
+pub fn credited_but_not_shed_count(credited_ids: &[uuid::Uuid], shed_ids: &[uuid::Uuid]) -> usize {
+    credited_ids
+        .iter()
+        .filter(|id| !shed_ids.contains(id))
+        .count()
+}
+
 /// Resolve a dot-notation key expression against a JSON input payload.
 ///
 /// The `"input."` prefix is stripped if present so both `"tenant_id"` and
@@ -461,12 +480,21 @@ tokio::task_local! {
 /// Slots [`dry_run_supersede_credit`] finds a pending `cancel_running` pass
 /// will free, scoped to ONE `quota_key`.
 #[cfg(feature = "db")]
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct SupersedeCredit {
     /// How many of the shed runs share the checked `quota_key`.
     pub active_executions: u64,
     /// Their combined `harvest_events` payload bytes.
     pub history_bytes: i64,
+    /// The exact executions this credit counted on (issue #1228 review, P2).
+    ///
+    /// The real supersede pass can skip one of these -- see
+    /// `supersede_inner`'s `Config`/`InvalidParentClosePolicy` arms -- and
+    /// leave it running. `active_executions` and `history_bytes` already
+    /// assumed it was shed. Every caller reconciles this list against the
+    /// real pass's [`SupersedeOutcome::superseded`] and reports the gap; see
+    /// [`crate::execution::run_latest_wins_supersede`].
+    pub credited_ids: Vec<uuid::Uuid>,
 }
 
 /// Dry-run count of the shed slots a `cancel_running` pass would free.
@@ -491,17 +519,33 @@ pub struct SupersedeCredit {
 /// the same `candidates.into_iter().take(shed)` selection `supersede_inner`
 /// uses.
 ///
-/// # No advisory lock (Codex review, PR #1484)
+/// # Advisory lock ordering (Codex review, PR #1484)
 ///
-/// This takes no `lock_concurrency_key`. Taking it here would acquire it
-/// BEFORE `enforce_quota_admission`'s `lock_quota_key` on this path.
-/// `replace_execution`'s three admission arms take the quota lock first
-/// and the concurrency lock later, in the real supersede pass run after
-/// `replace_execution` returns. Locking here first would invert that
-/// order between the two paths — an ABBA hazard. Skipping it keeps this
-/// path's lock order identical to every other: quota lock in
-/// `enforce_quota_admission`, then concurrency lock in the real supersede
-/// pass.
+/// This takes `lock_concurrency_key` itself, first, before the row scan
+/// below. `enforce_quota_admission` already took `lock_quota_key` before
+/// calling this function. So the order here is quota lock, then
+/// concurrency lock, then row locks. `replace_execution`'s three admission
+/// arms take the quota lock first too, inside that same
+/// `enforce_quota_admission` call. They take the concurrency lock later,
+/// in the real supersede pass run after `replace_execution` returns.
+/// Taking it here, AFTER the quota lock, does not invert that order.
+///
+/// Issue #1228 review, P1: skipping this lock entirely was not enough.
+/// The row lock below is held for the rest of this transaction. That
+/// outlasts the point where the real supersede pass needs the
+/// concurrency lock. A concurrent admission can already hold that
+/// concurrency lock and be cancelling THIS transaction's scanned row, via
+/// [`crate::execution::cancel_workflow_execution_collect`]'s own,
+/// non-`SKIP LOCKED` `FOR UPDATE`. That admission would then wait on a
+/// row this transaction holds. Meanwhile this transaction waits on the
+/// concurrency lock that other transaction holds. That is an ABBA cycle
+/// between a row lock and the concurrency advisory lock. Taking the
+/// concurrency lock BEFORE the row scan closes it. Whichever transaction
+/// reaches this point first serializes the other entirely behind the
+/// concurrency lock. So no two transactions contending on the same key
+/// can ever hold a row the other is waiting on. `supersede_inner`'s own
+/// later `lock_concurrency_key` call becomes a safe re-entrant no-op once
+/// this one already ran in the same transaction.
 ///
 /// # Row locks (issue #1228 review, P1)
 ///
@@ -536,6 +580,12 @@ pub async fn dry_run_supersede_credit(
         #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::BigInt>)]
         history_bytes: Option<i64>,
     }
+
+    // See "Advisory lock ordering" above. Taken before the row scan below,
+    // after the caller's own `lock_quota_key`. No transaction here can then
+    // retain a row lock the real supersede pass's concurrency-lock holder
+    // is waiting on.
+    lock_concurrency_key(conn, concurrency_key).await?;
 
     let inherited: Vec<crate::types::ExecutionId> =
         ADMITTING.try_with(Clone::clone).unwrap_or_default();
@@ -616,6 +666,7 @@ pub async fn dry_run_supersede_credit(
         return Ok(SupersedeCredit {
             active_executions,
             history_bytes: 0,
+            credited_ids: shed_matching_ids,
         });
     }
 
@@ -623,7 +674,7 @@ pub async fn dry_run_supersede_credit(
         "SELECT SUM(pg_column_size(event_data))::BIGINT AS history_bytes \
          FROM harvest_events WHERE workflow_exec_id = ANY($1)",
     )
-    .bind::<diesel::sql_types::Array<diesel::sql_types::Uuid>, _>(shed_matching_ids)
+    .bind::<diesel::sql_types::Array<diesel::sql_types::Uuid>, _>(shed_matching_ids.clone())
     .get_result(conn)
     .await
     .map_err(crate::error::database_error)?;
@@ -631,6 +682,7 @@ pub async fn dry_run_supersede_credit(
     Ok(SupersedeCredit {
         active_executions,
         history_bytes: history_row.history_bytes.unwrap_or(0),
+        credited_ids: shed_matching_ids,
     })
 }
 
@@ -1073,5 +1125,26 @@ mod tests {
     #[test]
     fn supersede_count_saturates_on_absurd_limit() {
         assert_eq!(supersede_count(3, u32::MAX), 0);
+    }
+
+    #[test]
+    fn credited_but_not_shed_count_reports_every_credited_id_that_was_not_shed() {
+        let a = uuid::Uuid::from_u128(1);
+        let b = uuid::Uuid::from_u128(2);
+        let c = uuid::Uuid::from_u128(3);
+
+        // The real pass shed everything it was credited for -- no gap.
+        assert_eq!(credited_but_not_shed_count(&[a, b], &[a, b]), 0);
+        // The real pass shed a superset -- still no gap.
+        assert_eq!(credited_but_not_shed_count(&[a], &[a, b]), 0);
+        // The real pass shed nothing at all.
+        assert_eq!(credited_but_not_shed_count(&[a, b], &[]), 2);
+        // The real pass shed one of the two credited ids -- `b`'s own
+        // cancellation was skipped (issue #1228 review, P2).
+        assert_eq!(credited_but_not_shed_count(&[a, b], &[a]), 1);
+        // A shed id the credit never counted on is irrelevant to the gap.
+        assert_eq!(credited_but_not_shed_count(&[a], &[c]), 1);
+        // No credit, no gap, regardless of what the real pass shed.
+        assert_eq!(credited_but_not_shed_count(&[], &[a, b]), 0);
     }
 }

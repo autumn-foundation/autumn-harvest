@@ -329,3 +329,56 @@ against the corrected design. No new test covers the cross-phase
 detached/awaited race directly; the fix relies on manual verification
 of the lock-acquisition order plus the existing suites above staying
 green.
+
+## Follow-up 5 — PR #1484 review: concurrency-lock ordering, credit reconciliation
+
+A fifth automated review round found a P1 in follow-up 4's own fix and a
+P2 in the original supersede-credit design.
+
+**P1 — the row lock could still deadlock, this time against the
+concurrency lock.** `dry_run_supersede_credit`'s row lock (added in
+follow-up 3, `SKIP LOCKED`-guarded in follow-up 4) is held for the rest
+of the transaction -- past the point where the real supersede pass needs
+`lock_concurrency_key`. A concurrent admission already holding that
+concurrency lock, and cancelling THIS transaction's scanned row via
+`cancel_workflow_execution_collect`'s own, non-`SKIP LOCKED` `FOR
+UPDATE`, would wait on a row this transaction holds while this
+transaction waits on the concurrency lock that other transaction holds.
+Fixed: `dry_run_supersede_credit` now takes `lock_concurrency_key`
+itself, before its row scan, right after the caller's `lock_quota_key`.
+Every path now acquires the two advisory locks in the same order --
+quota, then concurrency -- before any row lock, closing the cycle.
+
+**P2 — a skipped cancellation still spent its credit.** `supersede_
+inner` deliberately skips a candidate on a corrupted `parent_close_
+policy` or an unexpected `Config` error, to keep one bad neighbor from
+wedging every future admission on the key. The dry-run credit had
+already assumed that candidate was gone, so the admission could commit
+slightly over its declared cap in that rare case. Fixed with
+reconciliation, not admission-time blocking (the admission is already
+committed by the time a skip is knowable): `SupersedeCredit` now carries
+the exact `credited_ids` it counted, `enforce_quota_admission` and
+`replace_execution` return them, and `run_latest_wins_supersede`
+compares them against the real pass's actual `outcome.superseded` once
+it returns. Any credited id the real pass left running increments a new
+counter, `harvest.quota.supersede_credit_not_shed` (workflow-labeled
+only, mirroring `harvest.concurrency.residual_over_limit`'s cardinality
+rule) -- the alertable signal for a rare, already-documented edge case,
+not a rejection.
+
+New tests: `credited_but_not_shed_count_reports_every_credited_id_
+that_was_not_shed` (`concurrency.rs`, a pure unit test of the
+reconciliation math) and `bridges_quota_supersede_credit_not_shed_
+with_workflow_and_gap_labels` (`metrics_rs_adapter.rs`, proving the new
+counter is actually wired to the `metrics-rs` backend and not silently
+resolving to the trait's no-op default -- the exact bug class issue
+#1367's review caught for `harvest.concurrency.residual_over_limit`).
+No test exercises the underlying fault-injection scenario itself (a
+genuinely corrupted `parent_close_policy` or a forced `Config` error
+mid-cancel); none existed for that skip path before this change either.
+
+Re-ran all four suites above (`quota_supersede_ordering_tests.rs` 6/6,
+`quota_lock_ordering_tests.rs` 2/2, `concurrency_supersede_tests.rs`
+20/20, `quota_enforcement_tests.rs` 36/39, the same known flake family)
+plus the full `cargo test --lib` unit suite (3453/3453) against the
+corrected design.
