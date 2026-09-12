@@ -1333,8 +1333,11 @@ async fn start_child_on_target(
     // would double-count on a retry after a rollback here. This matches
     // the same "record after commit" contract `cancel_workflow_execution`
     // already documents for the same-shard path.
-    let deferred_terminal = crate::dispatch::buffered_settled(Box::pin(
-        conn.transaction::<Option<(String, String)>, HarvestError, _>(async |conn| {
+    let (deferred_terminal, pending_cancel_metrics) =
+        crate::dispatch::buffered_settled(Box::pin(conn.transaction::<(
+            Option<(String, String)>,
+            Vec<crate::execution::StartCancelledRun>,
+        ), HarvestError, _>(async |conn| {
             let spec = spec.clone();
             {
                 let already: Option<uuid::Uuid> = harvest_workflow_executions::table
@@ -1345,7 +1348,7 @@ async fn start_child_on_target(
                     .optional()
                     .map_err(crate::error::database_error)?;
                 if already.is_some() {
-                    return Ok(None);
+                    return Ok((None, Vec::new()));
                 }
 
                 // Anchor every deadline at creation, not at the parent's
@@ -1429,7 +1432,7 @@ async fn start_child_on_target(
                 if inserted == 0 {
                     // Another sweep won the race; its transaction owns the child's
                     // event and task.
-                    return Ok(None);
+                    return Ok((None, Vec::new()));
                 }
 
                 // The CONFIGURED codec registry, never `PayloadCodecs::default()`.
@@ -1526,17 +1529,33 @@ async fn start_child_on_target(
                     // The terminal metric itself is NOT emitted here — see
                     // this function's own call site, past the transaction's
                     // commit.
-                    for start in crate::completion_trigger::evaluate_triggers_for_execution(
-                        conn,
-                        child_exec_id,
-                        crate::completion_trigger::TerminalState::Cancelled,
-                        None,
-                    )
-                    .await?
+                    //
+                    // `_collecting`, not the plain wrapper, and `Some(metrics)`
+                    // (issue #1263 item 13 follow-up). This relay has the real
+                    // recorder in scope. Passing `None` would silently drop
+                    // every `record_completion_trigger_fired` /
+                    // `_skipped` sample below. A same-shard trigger start can
+                    // also latest-wins supersede an incumbent run (issue
+                    // #811). Those samples must wait for this transaction to
+                    // commit, exactly like the terminal metric above. They
+                    // are returned rather than emitted inline.
+                    let mut pending_cancel_metrics = Vec::new();
+                    for start in
+                        crate::completion_trigger::evaluate_triggers_for_execution_collecting(
+                            conn,
+                            child_exec_id,
+                            crate::completion_trigger::TerminalState::Cancelled,
+                            Some(metrics),
+                            &mut pending_cancel_metrics,
+                        )
+                        .await?
                     {
                         start.spawn();
                     }
-                    return Ok(Some((workflow_name.clone(), spec.queue_name.clone())));
+                    return Ok((
+                        Some((workflow_name.clone(), spec.queue_name.clone())),
+                        pending_cancel_metrics,
+                    ));
                 }
 
                 // The child's OWN declared quota (issue #946), enforced against the
@@ -1574,14 +1593,14 @@ async fn start_child_on_target(
                 params.max_concurrent = spec.max_concurrent;
                 params.trace_context = spec.trace_context.clone();
                 queue::enqueue(conn, &params).await?;
-                Ok(None)
+                Ok((None, Vec::new()))
             }
-        }),
-    ))
-    .await?;
+        })))
+        .await?;
 
-    // Only reached once the transaction above has actually committed, so
-    // this can never double-count on a retry after a rollback.
+    // Only reached once the transaction above has actually committed.
+    // Neither the terminal metric nor the trigger-supersede samples below
+    // can double-count on a retry after a rollback.
     if let Some((workflow_name, queue_name)) = deferred_terminal {
         crate::telemetry::emit_workflow_terminal(
             metrics,
@@ -1590,6 +1609,7 @@ async fn start_child_on_target(
             crate::telemetry::WorkflowStatus::Cancelled,
         );
     }
+    crate::execution::emit_start_cancel_metrics(metrics, &pending_cancel_metrics);
     Ok(())
 }
 

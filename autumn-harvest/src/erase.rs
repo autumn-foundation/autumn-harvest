@@ -1005,6 +1005,15 @@ mod db {
         let mut children = Vec::new();
         let mut skipped_children = Vec::new();
         let mut failures = Vec::new();
+        // Rows this call itself confirmed erased, tracked separately from
+        // `visited` (issue #1263 item 10 follow-up). Pool aliasing (issue
+        // #1146) can put a cross-shard child's execution row in the SAME
+        // physical database as this parent. The loop below can then see it
+        // through `parent_id`, before the cross-shard loop ever runs.
+        // The cross-shard loop still needs to know whether that first
+        // sighting erased the row, not merely that it saw the id. That is
+        // what decides whether to scrub the outbox's own `child_spec` copy.
+        let mut erased_ids: HashSet<Uuid> = HashSet::new();
 
         for child_uuid in collect_child_ids(conn, exec_id).await? {
             // Guard against diamonds / pathological parent_id cycles.
@@ -1014,6 +1023,9 @@ mod db {
             let child_exec_id = ExecutionId::from_uuid(child_uuid);
             let (erased, skipped, failed) =
                 erase_one_child(conn, child_exec_id, now, visited, pool).await;
+            if erased.is_some() {
+                erased_ids.insert(child_uuid);
+            }
             children.extend(erased);
             skipped_children.extend(skipped);
             failures.extend(failed);
@@ -1023,6 +1035,19 @@ mod db {
             collect_cross_shard_child_ids(conn, exec_id).await?
         {
             if !visited.insert(child_uuid) {
+                // The same-shard loop above already resolved this exact row
+                // (pool aliasing put it in both places). Do not erase it a
+                // second time. Still scrub its outbox `child_spec` copy if
+                // that first pass actually erased it. This loop is the only
+                // place that touches the outbox row at all.
+                if erased_ids.contains(&child_uuid)
+                    && let Err(e) = scrub_cross_shard_child_spec(conn, child_uuid).await
+                {
+                    failures.push(EraseFailure {
+                        execution_id: ExecutionId::from_uuid(child_uuid).to_string(),
+                        reason: e.to_string(),
+                    });
+                }
                 continue;
             }
             let child_exec_id = ExecutionId::from_uuid(child_uuid);
