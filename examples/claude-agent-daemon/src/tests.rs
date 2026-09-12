@@ -105,6 +105,44 @@ fn approve(rt: &mut SqliteRuntime, exec: ExecutionId, signal: &str) {
         .expect("the signal is staged");
 }
 
+/// Wait for a daemon to answer on its socket.
+///
+/// The path existing is not enough. A dead daemon leaves its socket file
+/// behind on purpose, so the test has to wait for an answer rather than for a
+/// name.
+async fn await_daemon(socket: &Path) {
+    for _ in 0..200 {
+        if let Ok(Response::Sessions { .. }) = protocol::call(socket, &Request::List).await {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    panic!("the daemon never answered on its socket");
+}
+
+/// Wait for a session to park on its approval.
+async fn await_parked(socket: &Path, execution_id: &str) {
+    for _ in 0..200 {
+        let answer = protocol::call(
+            socket,
+            &Request::Status {
+                execution_id: execution_id.to_string(),
+                full: false,
+            },
+        )
+        .await
+        .expect("the status is answered");
+        let Response::Session { session } = answer else {
+            panic!("unexpected answer: {answer:?}");
+        };
+        if session.blocked_on.is_some() {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    panic!("the session never parked");
+}
+
 /// Drive to the next stop and return the approval signal the run waits on.
 async fn drive_to_approval(rt: &mut SqliteRuntime, exec: ExecutionId) -> String {
     let state = rt.run_until_blocked(exec).await.expect("the run advances");
@@ -311,6 +349,60 @@ async fn settle_over_socket(socket: &Path, execution_id: &str) -> String {
         tokio::time::sleep(Duration::from_millis(25)).await;
     }
     panic!("the session never reached a terminal state");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_second_daemon_resumes_a_session_the_first_one_left_running() {
+    let dir = tempfile::tempdir().expect("a temporary directory");
+    // One database, one socket each. Both daemons run in THIS process, and the
+    // accept loop of an aborted one keeps its listener, which a killed process
+    // would not. The socket reclaim has its own test; this one is about the
+    // session surviving in the file.
+    let first_socket = dir.path().join("first.sock");
+    let second_socket = dir.path().join("second.sock");
+    let options = |socket: &Path| daemon::Options {
+        db: dir.path().join("agentd.db"),
+        socket: socket.to_path_buf(),
+        workspace: dir.path().join("workspace"),
+        model: claude::DEFAULT_MODEL.to_string(),
+        max_tokens: claude::DEFAULT_MAX_TOKENS,
+        tick: Duration::from_millis(50),
+        api_key: None,
+    };
+
+    let first = tokio::spawn(daemon::serve(options(&first_socket)));
+    await_daemon(&first_socket).await;
+    let submitted = protocol::call(
+        &first_socket,
+        &Request::Submit {
+            goal: "summarise the workspace".to_string(),
+            max_turns: 6,
+            approval_timeout_secs: 300,
+        },
+    )
+    .await
+    .expect("the submit is answered");
+    let Response::Submitted { execution_id } = submitted else {
+        panic!("unexpected answer: {submitted:?}");
+    };
+    await_parked(&first_socket, &execution_id).await;
+
+    // The process dies with the session parked. Aborting the task drops the
+    // listener and the database lock, which is what a kill does.
+    first.abort();
+    drop(first.await);
+
+    // The second daemon holds no memory of the session. It has to find the
+    // session in the file, or nothing advances it again: this daemon is the
+    // only writer.
+    let second = tokio::spawn(daemon::serve(options(&second_socket)));
+    await_daemon(&second_socket).await;
+    let state = settle_over_socket(&second_socket, &execution_id).await;
+    assert_eq!(
+        state, "COMPLETED",
+        "the resumed session did not finish under the second daemon"
+    );
+    second.abort();
 }
 
 #[tokio::test(flavor = "multi_thread")]

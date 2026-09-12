@@ -71,6 +71,24 @@ struct ParkedState {
 /// The parked sessions this daemon knows about.
 type Parked = HashMap<ExecutionId, ParkedState>;
 
+/// The sessions the drive tick advances, in the order they arrived.
+///
+/// The daemon is the only writer of this database, so it knows every live
+/// session. It starts them, and it sees each one reach a terminal state. The
+/// set is seeded once at startup and maintained in memory after that.
+///
+/// The alternative is a query on every tick. That query cannot use an index.
+/// `harvest_executions` is indexed on `(workflow_name, workflow_id)`, so a
+/// filter on `state` visits every session that ever ran under this workflow
+/// name. The cost of an idle daemon would grow with its whole history, several
+/// times a second. The engine owns that schema, and an example does not add an
+/// index to it.
+///
+/// A `Vec` rather than a set, for two reasons. The order stays the submit
+/// order. The length is the number of LIVE sessions, and not of the recorded
+/// history.
+type Live = Vec<ExecutionId>;
+
 /// Run the daemon until `Ctrl-C`.
 ///
 /// # Errors
@@ -158,6 +176,9 @@ pub async fn serve(options: Options) -> Result<(), String> {
     }
 
     let mut blocked: Parked = Parked::new();
+    // Seed the live set once. Every session already RUNNING in the file resumes
+    // by replay, so the tick has to know about it.
+    let mut live: Live = seed_live(&reader);
     let mut ticker = tokio::time::interval(options.tick);
     loop {
         tokio::select! {
@@ -167,6 +188,7 @@ pub async fn serve(options: Options) -> Result<(), String> {
                     &mut runtime,
                     &reader,
                     &mut blocked,
+                    &mut live,
                     &workspace,
                     &identity,
                     request,
@@ -175,12 +197,12 @@ pub async fn serve(options: Options) -> Result<(), String> {
                 drop(answer.send(response));
             }
             _ = ticker.tick() => {
-                // The read is synchronous, so its borrow of the reader ends
-                // here. That keeps this future `Send`. A `&Connection` is not
-                // `Send`, because a SQLite connection is not `Sync`.
-                let ready = running_sessions(&reader);
+                // A copy, because each drive can remove its own session from
+                // the set. The set holds the live sessions only, so this is
+                // short whatever the recorded history holds.
+                let ready = live.clone();
                 for exec in ready {
-                    drive_one(&mut runtime, exec, &mut blocked).await;
+                    drive_one(&mut runtime, exec, &mut blocked, &mut live).await;
                 }
             }
             result = tokio::signal::ctrl_c() => {
@@ -328,6 +350,7 @@ fn handle(
     runtime: &mut SqliteRuntime,
     reader: &Connection,
     blocked: &mut Parked,
+    live: &mut Live,
     workspace: &str,
     model: &str,
     request: Request,
@@ -339,6 +362,7 @@ fn handle(
             approval_timeout_secs,
         } => submit(
             runtime,
+            live,
             workspace,
             model,
             goal,
@@ -376,6 +400,7 @@ fn handle(
 /// Start one session.
 fn submit(
     runtime: &mut SqliteRuntime,
+    live: &mut Live,
     workspace: &str,
     model: &str,
     goal: String,
@@ -400,9 +425,14 @@ fn submit(
     // The call records the start and returns at once. The drive tick runs the
     // first turn, so a slow model call never holds up the answer here.
     match runtime.start_workflow(WORKFLOW_NAME, input) {
-        Ok(exec) => Response::Submitted {
-            execution_id: exec.to_string(),
-        },
+        Ok(exec) => {
+            // The tick drives it from here. A session the set does not hold
+            // would sit at its first turn forever.
+            enlist(live, exec);
+            Response::Submitted {
+                execution_id: exec.to_string(),
+            }
+        }
         Err(e) => Response::Error {
             message: format!("cannot start the session: {e}"),
         },
@@ -641,29 +671,62 @@ pub fn pending_call(
     None
 }
 
-/// Every session the tick must drive.
+/// The sessions a previous process left running.
 ///
-/// The backend has no push wake-up, so progress comes from this poll. A daemon
-/// with many sessions would track the next timer deadline and sleep until it;
-/// a fixed tick keeps the example short.
+/// This is the one database read of the live set. It runs before the socket
+/// accepts a command, so nothing can be submitted in between and no session is
+/// missed.
 ///
-/// The query reads the ids of the RUNNING rows only. A poll that runs several
-/// times a second must not cost the whole recorded history.
-fn running_sessions(reader: &Connection) -> Vec<ExecutionId> {
+/// A failure here is not fatal, and it is not silent. The daemon still serves
+/// its socket, and a submitted session still runs. What an operator loses is
+/// the resumption of the older ones, which the log says plainly.
+fn seed_live(reader: &Connection) -> Live {
     match inspect::running(reader, WORKFLOW_NAME) {
-        Ok(ids) => ids
-            .iter()
-            .filter_map(|id| id.parse::<ExecutionId>().ok())
-            .collect(),
+        Ok(ids) => {
+            let live: Live = ids
+                .iter()
+                .filter_map(|id| id.parse::<ExecutionId>().ok())
+                .collect();
+            if !live.is_empty() {
+                tracing::info!(count = live.len(), "resuming the sessions left running");
+            }
+            live
+        }
         Err(message) => {
-            tracing::error!(error = %message, "cannot enumerate the sessions");
+            tracing::error!(
+                error = %message,
+                "cannot enumerate the running sessions, so none of them resumes"
+            );
             Vec::new()
         }
     }
 }
 
+/// Add a session to the set the tick drives.
+fn enlist(live: &mut Live, exec: ExecutionId) {
+    if !live.contains(&exec) {
+        live.push(exec);
+    }
+}
+
+/// Drop a session that reached a terminal state.
+fn retire(blocked: &mut Parked, live: &mut Live, exec: ExecutionId) {
+    blocked.remove(&exec);
+    live.retain(|id| *id != exec);
+}
+
 /// Drive one session to its next stopping point.
-async fn drive_one(runtime: &mut SqliteRuntime, exec: ExecutionId, blocked: &mut Parked) {
+///
+/// A session leaves the live set only on a state that cannot be driven again.
+/// An unrecognised outcome, or a drive error, keeps it. One wasted drive costs
+/// a tick. A session dropped in error would never be driven again, because
+/// this daemon is the only writer.
+async fn drive_one(
+    runtime: &mut SqliteRuntime,
+    exec: ExecutionId,
+    blocked: &mut Parked,
+    live: &mut Live,
+) {
     match runtime.run_until_blocked(exec).await {
         Ok(RunState::WaitingSignal(name)) => {
             let reason = if session::approval_call_id(&name).is_some() {
@@ -682,11 +745,11 @@ async fn drive_one(runtime: &mut SqliteRuntime, exec: ExecutionId, blocked: &mut
             );
         }
         Ok(RunState::Completed(output)) => {
-            blocked.remove(&exec);
+            retire(blocked, live, exec);
             tracing::info!(%exec, output = %output, "session completed");
         }
         Ok(RunState::Failed(error)) => {
-            blocked.remove(&exec);
+            retire(blocked, live, exec);
             tracing::error!(%exec, error = %error, "session failed");
         }
         Ok(RunState::InProgress) => {
