@@ -196,8 +196,33 @@ fn usable_key(raw: &str) -> Option<String> {
     (!key.is_empty()).then(|| key.to_string())
 }
 
+/// Refuse a socket path this daemon cannot print.
+///
+/// Every command prints follow-up commands that name the socket, and a path
+/// is bytes rather than text on this platform. A path that is not UTF-8
+/// cannot be written into one of those lines unchanged. A copied line would
+/// then reach another socket, or none at all.
+///
+/// The refusal comes before any command runs. The daemon does not print a
+/// path it cannot print.
+///
+/// # Errors
+///
+/// Returns an error if the path is not UTF-8.
+fn printable(socket: &Path) -> Result<(), String> {
+    if socket.to_str().is_some() {
+        return Ok(());
+    }
+    Err(format!(
+        "the socket path {} is not UTF-8. This daemon prints commands that name \
+         the socket, and it cannot print this one. Choose a path of text.",
+        socket.display()
+    ))
+}
+
 /// Dispatch one command.
 async fn run(cli: Cli) -> Result<(), String> {
+    printable(&cli.socket)?;
     match cli.command {
         Command::Serve {
             workspace,

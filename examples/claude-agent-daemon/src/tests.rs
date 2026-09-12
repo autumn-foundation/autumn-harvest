@@ -2686,6 +2686,124 @@ fn the_reply_search_reads_no_further_than_the_newest_reply() {
     );
 }
 
+#[test]
+fn a_response_body_is_read_under_a_byte_cap() {
+    // `text()` buffers whatever arrives. The request timeout bounds the TIME
+    // a body may take, and not the BYTES it carries. One answer could
+    // therefore spend the daemon's memory and stall every session.
+    let cap = claude::MAX_BODY_BYTES;
+
+    // A body that ends under the cap is read whole.
+    let mut body = Vec::new();
+    assert!(
+        !claude::push_capped(&mut body, b"{\"ok\":true}"),
+        "a small chunk must not end the read"
+    );
+    assert_eq!(body.len(), 11, "a small chunk is taken whole");
+
+    // A chunk that STRADDLES the cap is cut at it, and the read ends. This is
+    // the arithmetic worth testing: the body must hold exactly the cap, and
+    // not the cap plus the overshoot.
+    let mut body = vec![b'a'; cap - 10];
+    assert!(
+        claude::push_capped(&mut body, &vec![b'b'; 4096]),
+        "a chunk past the cap must end the read"
+    );
+    assert_eq!(body.len(), cap, "the body must hold exactly the cap");
+
+    // A body already at the cap takes nothing more and still ends.
+    let mut body = vec![b'a'; cap];
+    assert!(
+        claude::push_capped(&mut body, b"more"),
+        "a full body must end the read"
+    );
+    assert_eq!(body.len(), cap, "a full body grows no further");
+
+    // The cap is above the recorded payload cap of 2 MiB, so no reply that
+    // could be recorded is refused for its size.
+    assert!(
+        cap > 2 * 1024 * 1024,
+        "the cap must not refuse a recordable reply: {cap}"
+    );
+}
+
+#[test]
+fn a_key_that_cannot_be_a_header_is_refused() {
+    // A key read out of a file can carry an interior newline. The trim on the
+    // way in removes the ends and not the middle. The value therefore counts
+    // as present, and the daemon would run live against it.
+    let interior = "sk-ant-aa\nbb";
+    assert_eq!(
+        crate::usable_key(interior),
+        Some(interior.to_string()),
+        "the trim leaves an interior newline, which is why this check exists"
+    );
+
+    // The key is tested as the thing it becomes. Reqwest is asked, rather
+    // than this example guessing which bytes a header value accepts.
+    for bad in ["sk-ant-aa\nbb", "sk-ant-aa\rbb", "sk-ant-aa\u{0}bb"] {
+        let (_, signal) = crate::shutdown::channel();
+        let refused = claude::ModelConfig::new(
+            Some(bad.to_string()),
+            claude::DEFAULT_MODEL,
+            claude::DEFAULT_MAX_TOKENS,
+            signal,
+        );
+        let Err(message) = refused else {
+            panic!("{bad:?} cannot be a header value and must be refused");
+        };
+        assert!(
+            message.contains("header"),
+            "the refusal must name the reason: {message}"
+        );
+    }
+
+    // A key of ordinary characters is accepted, so the check refuses only
+    // what the header refuses.
+    let (_, signal) = crate::shutdown::channel();
+    assert!(
+        claude::ModelConfig::new(
+            Some("sk-ant-api03-aAbB09_-".to_string()),
+            claude::DEFAULT_MODEL,
+            claude::DEFAULT_MAX_TOKENS,
+            signal,
+        )
+        .is_ok(),
+        "an ordinary key must be accepted"
+    );
+}
+
+#[test]
+fn a_socket_path_that_cannot_be_printed_is_refused() {
+    use clap::Parser;
+    use std::ffi::OsString;
+    use std::os::unix::ffi::OsStringExt;
+
+    // A path is bytes on this platform. Every command prints follow-up
+    // commands naming the socket, and a byte that is not UTF-8 cannot be
+    // written into one of those lines unchanged. The printed line would then
+    // name another socket, or none.
+    let raw = OsString::from_vec(vec![b'/', b't', b'm', b'p', b'/', 0xff, b'.', b's']);
+    let cli = crate::Cli::try_parse_from([
+        OsString::from("agentd"),
+        OsString::from("--socket"),
+        raw,
+        OsString::from("list"),
+    ])
+    .expect("clap accepts the bytes; the refusal is the daemon's own");
+
+    let refused = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("a runtime")
+        .block_on(crate::run(cli));
+    let message = refused.expect_err("a path that cannot be printed must be refused");
+    assert!(
+        message.contains("not UTF-8"),
+        "the refusal must name the reason: {message}"
+    );
+}
+
 /// The daemon builds no command an operator can copy.
 ///
 /// Five separate findings were one defect: a command formatted in the daemon,

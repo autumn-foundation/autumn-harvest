@@ -164,6 +164,10 @@ pub fn socket_flag(socket: &Path) -> String {
     if socket == Path::new(DEFAULT_SOCKET) {
         return String::new();
     }
+    // A path that is not UTF-8 is refused before any command runs, so the
+    // lossy branch here is unreachable in the binary. It is kept rather than
+    // unwrapped for two reasons. A wrong character in a printed command
+    // reaches the wrong daemon, and a panic is worse than either.
     format!(" --socket {}", quoted(&socket.to_string_lossy()))
 }
 

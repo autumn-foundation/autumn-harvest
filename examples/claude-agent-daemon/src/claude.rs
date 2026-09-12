@@ -47,6 +47,30 @@ pub struct ModelConfig {
     pub shutdown: Signal,
 }
 
+/// Why this key cannot go in an HTTP header, if it cannot.
+///
+/// The key travels as a header value, and not every byte can. A key read out
+/// of a file can carry an interior newline. The trim on the way in does not
+/// remove that byte, because it is not at an end.
+///
+/// Reqwest then refuses to build the header on EVERY turn. That failure reads
+/// as retryable, so each session spends its attempts and fails without one
+/// request reaching the API. The daemon advertises readiness the whole time.
+///
+/// The key is tested as the thing it becomes. This example does not keep its
+/// own list of the bytes a header value accepts.
+fn header_refusal(api_key: Option<&str>) -> Option<String> {
+    api_key
+        .filter(|key| reqwest::header::HeaderValue::from_str(key).is_err())
+        .map(|_| {
+            "`ANTHROPIC_API_KEY` holds a byte that cannot go in an HTTP header, \
+             such as a newline inside the value. Every turn would fail before it \
+             reached the API. Read the key without the surrounding line, or unset \
+             it to use the offline stub."
+                .to_string()
+        })
+}
+
 /// The identity an offline session records, in place of a model name.
 pub const OFFLINE_MODEL: &str = "offline-stub";
 
@@ -80,6 +104,9 @@ impl ModelConfig {
                  unset `ANTHROPIC_API_KEY` to use the offline stub."
                     .to_string(),
             );
+        }
+        if let Some(message) = header_refusal(api_key.as_deref()) {
+            return Err(message);
         }
         if api_key.is_some() && model == OFFLINE_MODEL {
             return Err(format!(
@@ -205,7 +232,7 @@ fn call_api(
     let body = tokio::task::block_in_place(|| {
         Handle::current().block_on(async {
             tokio::select! {
-                result = response.text() => Some(result),
+                result = read_capped(response) => Some(result),
                 () = stop.raised() => None,
             }
         })
@@ -306,6 +333,47 @@ fn request_body(config: &ModelConfig, request: &TurnRequest) -> Value {
         "tools": tools::definitions(),
         "messages": request.messages,
     })
+}
+
+/// The most of one response body this turn reads.
+///
+/// A reply the backend cannot record is of no use, and the recorded payload
+/// cap is 2 MiB. This is twice that, so no reply that could be recorded is
+/// refused for its size, and a body that never ends is still bounded.
+pub const MAX_BODY_BYTES: usize = 4 * 1024 * 1024;
+
+/// Read one response body, and stop at [`MAX_BODY_BYTES`].
+///
+/// `text()` buffers whatever arrives. The timeout above bounds the TIME a
+/// body may take, and not the BYTES it may carry. One answer could therefore
+/// spend the daemon's memory and stall every session with it. An error body
+/// is the likelier offender, because it comes from whatever is between this
+/// daemon and the API rather than from the API itself.
+async fn read_capped(mut response: reqwest::Response) -> Result<String, reqwest::Error> {
+    let mut body: Vec<u8> = Vec::new();
+    while let Some(chunk) = response.chunk().await? {
+        if push_capped(&mut body, &chunk) {
+            break;
+        }
+    }
+    // The bytes are read as text the same way `text()` reads them, so a body
+    // cut mid-character loses that character and nothing else.
+    Ok(String::from_utf8_lossy(&body).into_owned())
+}
+
+/// Append as much of one chunk as the cap allows.
+///
+/// Returns `true` once the body is full, which ends the read. Split out from
+/// the loop above so a test can drive the arithmetic, including a chunk that
+/// straddles the cap. The loop itself is three lines of reqwest.
+pub fn push_capped(body: &mut Vec<u8>, chunk: &[u8]) -> bool {
+    let room = MAX_BODY_BYTES.saturating_sub(body.len());
+    if chunk.len() >= room {
+        body.extend_from_slice(&chunk[..room]);
+        return true;
+    }
+    body.extend_from_slice(chunk);
+    false
 }
 
 /// Classify a failure that happened AFTER the response headers arrived.
