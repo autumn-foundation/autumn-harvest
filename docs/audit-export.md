@@ -276,6 +276,22 @@ shard records:
   signals therefore share one cost: see "Retiring audit export on a shard"
   below.
 
+  A fleet has more than one shard, and this flag would otherwise apply to
+  all of them at once. Decommissioning shard A must resume purging there.
+  Turning the flag off fleet-wide to do that would also strip protection
+  from shard B, still mid-bootstrap on the same sweep. Exempt shard A
+  instead:
+
+  ```rust
+  autumn_harvest::retention::RetentionConfig::default()
+      .with_audit_retention_days(90)
+      .with_protect_unexported_audit(true)
+      .excluding_shard_from_protect_unexported_audit(shard_a);
+  ```
+
+  Shard A resumes purging. Every other shard, including a genuinely
+  bootstrapping shard B, stays protected.
+
   The remaining cost is operational, not architectural: an operator must
   remember to set the flag on every process, including ones added later.
   Forgetting it only reopens the original bootstrap window; it never causes
@@ -311,9 +327,11 @@ reach the SIEM.
 Stopping the exporter alone does **not** restore purging — the guard keys on
 the cursor row, not on the sweeping process's sink configuration, which is what
 makes it safe across a split web/worker deployment. Both steps are required.
-Where `RetentionConfig::protect_unexported_audit` is also `true` on the
-sweeping process, it is a third thing to unset: purging does not resume for
-a decommissioned shard while any of the three signals still holds.
+Where `RetentionConfig::protect_unexported_audit` also covers this shard on
+the sweeping process, it is a third thing to clear: purging does not resume
+for a decommissioned shard while any of the three signals still holds. Add
+the shard to the exempt set rather than disabling the flag fleet-wide, or
+every other shard loses its bootstrap protection too.
 
 Re-enabling export afterwards is safe: the next exporter tick un-retires the
 cursor and resumes from the preserved `last_assigned_seq`, so new records

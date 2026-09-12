@@ -1,6 +1,6 @@
 //! Time-based retention janitor for completed workflow history.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 #[cfg(feature = "db")]
@@ -333,8 +333,8 @@ pub struct RetentionConfig {
     /// Audit log retention in days, independent of workflow-history retention.
     /// Defaults to 90 days (3 months). Set to 0 to disable audit purging.
     pub audit_retention_days: i64,
-    /// Protect every unexported audit row, regardless of local signals
-    /// (issue #1266). Defaults to `false`.
+    /// Protect every unexported audit row, per shard (issue #1266).
+    /// Defaults to `None` (disabled).
     ///
     /// `purge_old_audit_records` already refuses to delete an unexported row
     /// in two cases. The first case: a live cursor exists for the shard. The
@@ -347,12 +347,21 @@ pub struct RetentionConfig {
     /// re-enabled after decommission has no tick yet either. In every one of
     /// these, retention finds no sink and no cursor row it can trust.
     ///
-    /// Set this flag to `true` on every process in such a deployment. This
-    /// closes the window. Like `is_configured`, it overrides a retired
-    /// cursor too. Decommissioning a shard does not resume purging there
-    /// while this flag stays `true`. Unset it as part of that step. See
-    /// `docs/audit-export.md`.
-    pub protect_unexported_audit: bool,
+    /// `Some(exempt)` protects every shard not in `exempt`. `None` protects
+    /// none. An empty set protects every shard.
+    ///
+    /// The exempt set exists for one reason. A fleet has more than one
+    /// shard. This flag would otherwise apply to all of them at once.
+    /// Decommissioning shard A must resume purging there. Doing that by
+    /// disabling the whole flag would also strip protection from shard B,
+    /// mid-bootstrap on the same sweep. Add A to the exempt set instead,
+    /// and B stays protected.
+    ///
+    /// Like `is_configured`, an unexempted shard's flag overrides a
+    /// retired cursor there too. Decommissioning that shard does not
+    /// resume purging while it stays unexempted. Exempt it as part of
+    /// that step. See `docs/audit-export.md`.
+    pub protect_unexported_audit: Option<BTreeSet<ShardId>>,
     /// Schedule decisions retention in days.
     /// Defaults to 7 days. Set to 0 to disable schedule decision purging.
     pub schedule_decision_retention_days: i64,
@@ -467,7 +476,7 @@ impl Default for RetentionConfig {
             batch_size: DEFAULT_BATCH_SIZE,
             dry_run: false,
             audit_retention_days: 90,
-            protect_unexported_audit: false,
+            protect_unexported_audit: None,
             schedule_decision_retention_days: 7,
             archival_timeout_secs: DEFAULT_ARCHIVAL_TIMEOUT_SECS,
             summary: None,
@@ -526,9 +535,30 @@ impl RetentionConfig {
     /// the split-deployment bootstrap window (issue #1266). Set `true` on
     /// every process in a split web/worker deployment.
     #[must_use]
-    pub const fn with_protect_unexported_audit(mut self, protect: bool) -> Self {
-        self.protect_unexported_audit = protect;
+    pub fn with_protect_unexported_audit(mut self, protect: bool) -> Self {
+        self.protect_unexported_audit = if protect { Some(BTreeSet::new()) } else { None };
         self
+    }
+
+    /// Exempt one shard from `protect_unexported_audit` (issue #1266). Call
+    /// this for a shard being decommissioned, so its purge can resume
+    /// without also unprotecting every other shard in the fleet.
+    #[must_use]
+    pub fn excluding_shard_from_protect_unexported_audit(mut self, shard: ShardId) -> Self {
+        if let Some(exempt) = &mut self.protect_unexported_audit {
+            exempt.insert(shard);
+        }
+        self
+    }
+
+    /// Whether `protect_unexported_audit` covers this shard (issue #1266).
+    /// `true` only when protection is enabled and the shard is not
+    /// exempted.
+    #[must_use]
+    pub fn protects_unexported_audit(&self, shard: ShardId) -> bool {
+        self.protect_unexported_audit
+            .as_ref()
+            .is_some_and(|exempt| !exempt.contains(&shard))
     }
 
     /// Override the schedule decision retention window.
@@ -1306,12 +1336,18 @@ impl RetentionRuntime {
                 // Audit rows may live on any shard (workflow starts use shard-aware
                 // inserts), so iterate every shard to honour the retention window.
                 if config.audit_retention_days > 0 && !config.dry_run {
-                    for (_, pool) in pools.iter_shards() {
+                    for (shard, pool) in pools.iter_shards() {
+                        // A shard in the exempt set stays unprotected. This
+                        // holds even when the rest of the fleet is not.
+                        // Decommissioning it then resumes purging there. It
+                        // never reopens the bootstrap window for every
+                        // other shard (issue #1266).
+                        let protect_unexported_audit = config.protects_unexported_audit(shard);
                         if let Ok(mut conn) = pool.get().await
                             && let Err(err) = crate::audit::purge_old_audit_records(
                                 &mut conn,
                                 config.audit_retention_days,
-                                config.protect_unexported_audit,
+                                protect_unexported_audit,
                             )
                             .await
                         {
@@ -3201,6 +3237,49 @@ mod tests {
             ..Default::default()
         };
         assert!(config.validate().is_err());
+    }
+
+    // --- Issue #1266: per-shard protect_unexported_audit exemption ---
+
+    #[test]
+    fn protect_unexported_audit_disabled_by_default() {
+        let config = RetentionConfig::default();
+        assert!(!config.protects_unexported_audit(ShardId::new(0)));
+        assert!(!config.protects_unexported_audit(ShardId::new(1)));
+    }
+
+    #[test]
+    fn protect_unexported_audit_true_covers_every_shard() {
+        let config = RetentionConfig::default().with_protect_unexported_audit(true);
+        assert!(config.protects_unexported_audit(ShardId::new(0)));
+        assert!(config.protects_unexported_audit(ShardId::new(1)));
+    }
+
+    // A fleet decommissioning shard 0 must not lose bootstrap protection
+    // for shard 1, still mid-bootstrap on the same sweep. One process-wide
+    // boolean cannot represent both states at once, which is why the
+    // exemption exists.
+    #[test]
+    fn excluding_a_shard_leaves_every_other_shard_protected() {
+        let config = RetentionConfig::default()
+            .with_protect_unexported_audit(true)
+            .excluding_shard_from_protect_unexported_audit(ShardId::new(0));
+        assert!(
+            !config.protects_unexported_audit(ShardId::new(0)),
+            "the exempted shard must be free to resume purging"
+        );
+        assert!(
+            config.protects_unexported_audit(ShardId::new(1)),
+            "a different shard must stay protected"
+        );
+    }
+
+    #[test]
+    fn excluding_a_shard_while_disabled_changes_nothing() {
+        let config = RetentionConfig::default()
+            .excluding_shard_from_protect_unexported_audit(ShardId::new(0));
+        assert!(!config.protects_unexported_audit(ShardId::new(0)));
+        assert!(!config.protects_unexported_audit(ShardId::new(1)));
     }
 
     // --- Issue #737: per-workflow-type history retention overrides ---

@@ -10,13 +10,13 @@ that window deleted every retention-aged audit row, including rows the
 exporter had not shipped yet.
 
 Adds a third, explicit signal: `RetentionConfig::protect_unexported_audit`
-(default `false`). Set the same way on every process in a split deployment,
-it closes the window from the moment export is configured rather than from
-the moment the exporter's first tick succeeds — the two cheaper fixes the
-issue considered and rejected (seeding the cursor row in a migration; letting
-the retention process create it) both fail for the same reason: a shard's
-own database cannot know whether an exporter is coming, and the retention
-process does not know either.
+(default `None`, disabled). Set the same way on every process in a split
+deployment, it closes the window from the moment export is configured rather
+than from the moment the exporter's first tick succeeds — the two cheaper
+fixes the issue considered and rejected (seeding the cursor row in a
+migration; letting the retention process create it) both fail for the same
+reason: a shard's own database cannot know whether an exporter is coming,
+and the retention process does not know either.
 
 `purge_old_audit_records` gained a third parameter, `protect_unexported_audit:
 bool`, OR'd flatly with the existing `is_configured()` signal — no schema
@@ -38,6 +38,19 @@ or a partial restore, which rebuilds it at `last_acked_seq = 0` so every
 stamped row is redelivered. The pending check now also treats "no cursor row
 for the shard" as pending, matching that rebuild.
 
+A further review round (P1) found that a single process-wide boolean cannot
+represent a fleet with more than one shard: decommissioning shard A requires
+disabling the flag, which simultaneously strips bootstrap protection from
+shard B if B is mid-bootstrap on the same sweep. `RetentionConfig` changed
+`protect_unexported_audit` from `bool` to `Option<BTreeSet<ShardId>>` —
+`None` disables it, `Some(exempt)` protects every shard not in `exempt`. The
+retention sweep now computes the per-shard bool itself
+(`RetentionConfig::protects_unexported_audit`) instead of passing one flag
+to every shard; `purge_old_audit_records`'s own signature is unaffected,
+since it already took a plain `bool` per call. `with_protect_unexported_audit`
+keeps its `bool` shape for the common case; a new
+`excluding_shard_from_protect_unexported_audit` adds the exemption.
+
 New tests:
 - `retention_protects_unexported_audit_when_configured_with_no_cursor_and_no_local_sink`
   reproduces the exact bootstrap window (no cursor row anywhere, no sink in
@@ -52,7 +65,11 @@ New tests:
 - `retention_still_purges_acknowledged_rows_when_protect_unexported_audit_is_true`
   confirms the flag never blocks purging of rows the exporter already
   shipped, even while a live cursor exists.
+- `excluding_a_shard_leaves_every_other_shard_protected` and
+  `excluding_a_shard_while_disabled_changes_nothing` pin the per-shard
+  exemption: excluding shard 0 never touches shard 1's protection, and
+  excluding a shard while the flag is off entirely is a no-op.
 
 **Zero migration, zero engine impact beyond the new parameter.** No new
 `WorkflowEvent` variant, no schema change, no change to any existing call
-site's behavior when the new flag is left at its default `false`.
+site's behavior when the new flag is left at its default (disabled).

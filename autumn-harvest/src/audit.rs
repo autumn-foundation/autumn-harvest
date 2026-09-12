@@ -1582,6 +1582,12 @@ pub async fn list_audit(
 ///   Decommissioning a shard does not resume purging there while either
 ///   stays `true`.
 ///
+///   This `bool` is a single shard's answer, not a fleet-wide switch. A
+///   caller with more than one shard computes it separately per shard.
+///   See [`crate::retention::RetentionConfig::protects_unexported_audit`].
+///   Decommissioning one shard then need not also drop protection from
+///   another, still mid-bootstrap on the same sweep.
+///
 /// Deliberately **not** time-based. An earlier revision expired the guard 24h
 /// after the exporter's last heartbeat, so a long worker outage lifted it; a
 /// timeout cannot distinguish "export was intentionally removed" from "the
