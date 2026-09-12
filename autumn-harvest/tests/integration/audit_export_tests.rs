@@ -1919,10 +1919,23 @@ async fn retention_protects_a_shard_being_re_enabled_after_decommission() {
         .await
         .expect("purge runs");
     assert_eq!(
-        deleted, 0,
-        "protect_unexported_audit must protect every unshipped row even \
-         while the shard's cursor is still retired from before, or \
-         re-enabling export would silently reopen the bootstrap window"
+        deleted, 2,
+        "the two rows the exporter already acknowledged before \
+         decommission may still go; only the three new, unclaimed rows \
+         are protect_unexported_audit's concern here"
+    );
+
+    let remaining: i64 = harvest_audit_log::table
+        .count()
+        .get_result(&mut conn)
+        .await
+        .expect("count");
+    assert_eq!(
+        remaining, 3,
+        "the three rows written during re-enablement must survive: \
+         protect_unexported_audit must protect them even while the \
+         shard's cursor is still retired from before, or re-enabling \
+         export would silently reopen the bootstrap window"
     );
 }
 
