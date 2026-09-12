@@ -968,14 +968,16 @@ fn group_by_pool_identity(pools: &BTreeMap<ShardId, DbPool>) -> BTreeMap<ShardId
 ///
 /// The key keeps host and `hostaddr` (a numeric `host` counts as an
 /// address, needing no DNS to compare). It keeps port (defaulted to
-/// 5432 when absent), the database name, and only the `options`
-/// parameter. `options` is libpq's escape hatch for arbitrary session
-/// settings, including `-c search_path=...`. It picks the schema
-/// `harvest_audit_log` resolves to. Two DSNs that differ only there can
-/// still reach different data and must never be grouped as one pool.
-/// Every other parameter (`application_name`, `sslmode`, and so on) is
-/// dropped, since none of them changes which relation a query resolves
-/// against.
+/// 5432 when absent), the database name, and only a `search_path`
+/// setting extracted from the `options` parameter — see
+/// [`extract_search_path`]. `options` is libpq's escape hatch for
+/// arbitrary session settings, and `search_path` is the one setting it
+/// can carry that picks the schema `harvest_audit_log` resolves to. Two
+/// DSNs that differ only there can still reach different data and must
+/// never be grouped as one pool. Every other query parameter is
+/// dropped. So is every other `options` flag, such as
+/// `application_name` or `client_min_messages`. None of it changes
+/// which relation a query resolves against.
 ///
 /// A DNS hostname is lowercased, since it is case-insensitive. A
 /// Unix-socket path is kept as written instead, since a filesystem path
@@ -987,11 +989,10 @@ fn group_by_pool_identity(pools: &BTreeMap<ShardId, DbPool>) -> BTreeMap<ShardId
 /// case. The rest of this comment's reasoning against using the
 /// username still holds whenever a path is present.
 ///
-/// Two gaps are accepted rather than chased further. Closing either
-/// needs a live connection. Building a pool must stay a pure, local
-/// operation with no network access:
+/// Three gaps are accepted rather than chased further:
 /// - A host alias — two hostnames that resolve to one address — is not
-///   detected.
+///   detected. Closing it needs a live connection, and building a pool
+///   must stay a pure, local operation with no network access.
 /// - A role's own `search_path`, set server-side with `ALTER ROLE ...
 ///   SET search_path`, is invisible in the DSN. The username is dropped
 ///   with the rest of the credentials, not kept as a proxy for it. Two
@@ -999,6 +1000,16 @@ fn group_by_pool_identity(pools: &BTreeMap<ShardId, DbPool>) -> BTreeMap<ShardId
 ///   topology (`from_dsns`'s own `harvest shard rebalance` use, issue
 ///   #964). Treating them as different pools would reopen the exact bug
 ///   this key exists to close.
+/// - A multi-host DSN's hosts and ports are each sorted and deduplicated
+///   independently, not paired positionally. `host=a,b port=5432,6432`
+///   and `host=a,b port=6432,5432` can name different endpoint pairs,
+///   yet compare equal. `from_dsns` is built for its one documented use
+///   — one host per shard entry (`harvest shard rebalance`, issue #964)
+///   — where this never arises. Unlike the other two gaps, getting this
+///   wrong over-merges rather than under-merges. The failure is a
+///   skipped purge on one endpoint, not a premature delete. It is left
+///   for whoever first needs multi-host `from_dsns` entries to fix
+///   alongside a real use case to test it against.
 ///
 /// A DSN that does not parse falls back to the raw string, unchanged
 /// from before this key existed.
@@ -1044,9 +1055,42 @@ fn canonical_dsn_key(dsn: &str) -> String {
     ports.dedup();
 
     let db = config.get_dbname().or_else(|| config.get_user());
-    let options = config.get_options().unwrap_or_default();
+    let search_path = extract_search_path(config.get_options().unwrap_or_default());
 
-    format!("{hosts:?}{hostaddrs:?}{ports:?}/{db:?}?options={options}")
+    format!("{hosts:?}{hostaddrs:?}{ports:?}/{db:?}?search_path={search_path:?}")
+}
+
+/// Pulls only `search_path` settings out of a libpq `options` string,
+/// discarding every other `-c name=value` flag it may carry (issue
+/// #1266). `options` is a general escape hatch. An operator can set
+/// `application_name`, `client_min_messages`, or anything else through
+/// it just as easily as `search_path`. None of those change which
+/// relation a query resolves against. Keeping the whole string verbatim
+/// reopened the same bug this key exists to close. Two DSNs for the
+/// same pool, differing only in an unrelated `-c` flag, no longer
+/// merged.
+///
+/// This recognizes exactly one shape: whitespace-separated tokens where
+/// a `-c` token is immediately followed by a `search_path=value` token,
+/// with no embedded whitespace in the value. That is the shape every
+/// `options` value in this codebase's own tests uses. A quoted value
+/// with embedded spaces is not recognized. Neither is
+/// `-csearch_path=...` with no space before `-c`. Treating an unparsed
+/// `options` string as carrying no `search_path` is the conservative
+/// direction here. It only widens which DSNs compare as different,
+/// never the reverse.
+#[cfg(feature = "db")]
+fn extract_search_path(options: &str) -> Vec<String> {
+    let mut tokens = options.split_whitespace();
+    let mut search_paths = Vec::new();
+    while let Some(tok) = tokens.next() {
+        if tok == "-c"
+            && let Some(value) = tokens.next().and_then(|kv| kv.strip_prefix("search_path="))
+        {
+            search_paths.push(value.to_string());
+        }
+    }
+    search_paths
 }
 
 #[cfg(feature = "db")]
@@ -2331,6 +2375,38 @@ mod tests {
             1,
             "`%68` decodes to `h`, so both DSNs name the same database \
              and must collapse into one group"
+        );
+    }
+
+    // `options` can carry any `-c name=value` GUC, not only
+    // `search_path`. Two DSNs differing only in an unrelated one must
+    // still collapse (issue #1266).
+    #[cfg(feature = "db")]
+    #[test]
+    fn from_dsns_ignores_non_search_path_options_flags() {
+        let sharded = ShardedDbPool::from_dsns(
+            [
+                (
+                    ShardId::new(0),
+                    "postgres://db.example/shared?options=-c%20application_name%3Dweb".to_string(),
+                ),
+                (
+                    ShardId::new(1),
+                    "postgres://db.example/shared?options=-c%20application_name%3Dworker"
+                        .to_string(),
+                ),
+            ],
+            ShardId::new(0),
+            1,
+        )
+        .expect("pool builds without connecting");
+
+        let groups = sharded.pool_groups();
+        assert_eq!(
+            groups.len(),
+            1,
+            "`application_name` set through `options` never affects \
+             relation resolution, so these must collapse into one group"
         );
     }
 }

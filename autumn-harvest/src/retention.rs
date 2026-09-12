@@ -1665,15 +1665,18 @@ impl Drop for RetentionLeaseGuard {
 /// physical pool is purged once per tick with that one decision, already
 /// accounting for every shard sharing it.
 ///
-/// The shard count travels with the decision for the same reason (issue
-/// #1266). `purge_old_audit_records`'s pending check needs to know how
-/// many colocated shards should have a cursor row, not only whether the
-/// combined protection flag is set. See its doc comment.
+/// The shard ids travel with the decision for the same reason (issue
+/// #1266). `purge_old_audit_records`'s pending check needs to know which
+/// colocated shards should each have a cursor row, not only whether the
+/// combined protection flag is set. A cursor-row count is not enough. A
+/// decommissioned shard's row is retired, never deleted, so a count can
+/// look complete even when a currently colocated shard has none of its
+/// own. See `purge_old_audit_records`'s doc comment.
 #[cfg(feature = "db")]
 fn group_shards_by_pool<'a>(
     pools: &'a ShardedDbPool,
     config: &RetentionConfig,
-) -> Vec<(&'a crate::worker::DbPool, bool, i64)> {
+) -> Vec<(&'a crate::worker::DbPool, bool, Vec<ShardId>)> {
     pools
         .pool_groups()
         .into_iter()
@@ -1681,27 +1684,27 @@ fn group_shards_by_pool<'a>(
             let protect = shards
                 .iter()
                 .any(|shard| config.protects_unexported_audit(*shard));
-            let shard_count = i64::try_from(shards.len()).unwrap_or(i64::MAX);
-            (pool, protect, shard_count)
+            (pool, protect, shards)
         })
         .collect()
 }
 
 #[cfg(feature = "db")]
 async fn purge_audit_records_across_shards(pools: &ShardedDbPool, config: &RetentionConfig) {
-    for (pool, protect_unexported_audit, colocated_shard_count) in
-        group_shards_by_pool(pools, config)
-    {
-        if let Ok(mut conn) = pool.get().await
-            && let Err(err) = crate::audit::purge_old_audit_records(
+    for (pool, protect_unexported_audit, colocated_shards) in group_shards_by_pool(pools, config) {
+        if let Ok(mut conn) = pool.get().await {
+            let colocated_shard_ids: Vec<i32> =
+                colocated_shards.iter().map(|s| s.as_i32()).collect();
+            if let Err(err) = crate::audit::purge_old_audit_records(
                 &mut conn,
                 config.audit_retention_days,
                 protect_unexported_audit,
-                colocated_shard_count,
+                &colocated_shard_ids,
             )
             .await
-        {
-            tracing::warn!(error = %err, "harvest audit log purge failed");
+            {
+                tracing::warn!(error = %err, "harvest audit log purge failed");
+            }
         }
     }
 }
@@ -3365,8 +3368,9 @@ mod tests {
             "shard 1 still wants protection, so the shared pool stays protected"
         );
         assert_eq!(
-            groups[0].2, 2,
-            "both aliased shards must be counted for the colocated shard count"
+            groups[0].2.len(),
+            2,
+            "both aliased shards must be named in the colocated shard list"
         );
     }
 
@@ -3398,7 +3402,7 @@ mod tests {
             "shard 0's exemption must not leak into shard 1's own, separate pool"
         );
         assert!(
-            groups.iter().all(|(_, _, count)| *count == 1),
+            groups.iter().all(|(_, _, shards)| shards.len() == 1),
             "two genuinely separate pools each have exactly one shard"
         );
     }

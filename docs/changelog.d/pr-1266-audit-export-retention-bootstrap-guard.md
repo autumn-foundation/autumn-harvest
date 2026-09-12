@@ -171,12 +171,48 @@ acknowledged even though B has acknowledged nothing. The pending check's
 own doc comment had assumed "a shard's database holds at most one cursor
 row" -- an assumption the fourth through tenth rounds' own colocated-pool
 work had already made false. `purge_old_audit_records` gains a fourth
-parameter, `colocated_shard_count`, and the pending check now compares
-the cursor count against it instead of testing for zero rows. A
-single-shard caller passes `1`, unchanged from before. The real caller,
-`retention.rs`'s `group_shards_by_pool`, now returns each pool group's
-shard count alongside its combined protection decision, sourced from
+parameter (`colocated_shard_count` in this round, revised below), and
+the pending check now compares against it instead of testing for zero
+rows. The real caller, `retention.rs`'s `group_shards_by_pool`, now
+carries this alongside its combined protection decision, sourced from
 `ShardedDbPool::pool_groups()`.
+
+A twelfth review round found three more defects, two of them P1.
+
+The first (P1) found that comparing a *count* of cursor rows, as the
+eleventh round's fix did, is not the same as confirming the *right*
+shards each have one. `decommission_cursor` retires a row rather than
+deleting it, so a shard removed from the fleet entirely can leave a
+row behind that makes the count look complete while a currently
+colocated shard still has none. `colocated_shard_count: i64` is
+replaced with `colocated_shard_ids: &[i32]`; the pending check now
+walks that exact list with `unnest` and is satisfied only when every
+named id has a matching cursor row, regardless of how many other rows
+exist. A single-shard caller passes that one shard's id, unchanged in
+effect from the very first "no cursor row at all" test.
+
+The second (P1) found that `options` is a general escape hatch, not a
+`search_path`-only channel: an operator can set `application_name` or
+any other GUC through it just as easily, and keeping the whole string
+verbatim (the seventh round's fix) meant two DSNs for one pool,
+differing only in such an unrelated flag, no longer merged --
+reopening the same premature-deletion bug this key exists to close.
+`canonical_dsn_key` now extracts only `search_path` settings from
+`options` with a small, deliberately narrow tokenizer (`-c` immediately
+followed by `search_path=value`, no embedded whitespace), and drops
+everything else it finds there.
+
+The third (P2) found that a multi-host DSN's hosts and ports are
+sorted and deduplicated independently, not paired positionally, so
+`host=a,b port=5432,6432` and `host=a,b port=6432,5432` can name
+different endpoint pairs yet compare equal. This one is deliberately
+not fixed: `from_dsns` is built for its one documented use, one host
+per shard entry (`harvest shard rebalance`, issue #964), where this
+never arises, and getting it wrong over-merges rather than
+under-merges -- a skipped purge on one endpoint, not a premature
+delete. Documented as an accepted gap alongside host-alias detection
+and role-level `search_path`, left for whoever first needs multi-host
+`from_dsns` entries to fix alongside a real case to test it against.
 
 New tests:
 - `retention_protects_unexported_audit_when_configured_with_no_cursor_and_no_local_sink`
@@ -237,6 +273,13 @@ New tests:
   but only one has a cursor row, no stamped row purges even if already
   acknowledged by the shard that has ticked; told to expect only that one
   shard, the same rows purge normally.
+- `retention_ignores_an_unrelated_shards_lingering_cursor_row` pins the
+  twelfth round's first fix: a decommissioned, unrelated shard's retired
+  cursor row must never stand in for an actually colocated shard's
+  missing one, even when the row count happens to match.
+- `from_dsns_ignores_non_search_path_options_flags` pins the twelfth
+  round's second fix: two DSNs differing only in `application_name` set
+  through `options` still collapse into one group.
 
 **Zero migration, zero engine impact beyond the new parameter.** No new
 `WorkflowEvent` variant, no schema change, no change to any existing call

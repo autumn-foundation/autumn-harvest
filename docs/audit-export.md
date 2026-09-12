@@ -299,13 +299,17 @@ shard records:
   accidentally strips shard B's protection just because they share a
   database. No operator action is needed for this case.
 
-  The per-row pending check also needs to know how many shards share the
+  The per-row pending check also needs to know which shard ids share the
   pool, not only the combined decision. A row already acknowledged by
   one colocated shard is not acknowledged by another that has not
-  ticked yet and so has no cursor row there at all. `purge_old_audit_records`
-  takes this count as `colocated_shard_count`; the sweep sources it from
-  the same `ShardedDbPool::pool_groups()` call that computes the
-  combined decision, so this needs no separate operator action either.
+  ticked yet and so has no cursor row there at all.
+  `purge_old_audit_records` takes this as `colocated_shard_ids`, matched
+  by identity rather than counted — a decommissioned shard's cursor row
+  is retired, never deleted, so a shard removed from the fleet entirely
+  can leave a row behind that would make a mere count look complete. The
+  sweep sources the list from the same `ShardedDbPool::pool_groups()`
+  call that computes the combined decision, so this needs no separate
+  operator action either.
 
   Detection covers both ways a fleet builds a `ShardedDbPool`.
   `ShardedDbPool::from_map` can receive one cloned `Pool` under two shard
@@ -320,9 +324,11 @@ shard records:
   choice `backup_verify.rs`'s `parse_dsn_identity` makes, since `url::Url`
   disagrees with it on percent-decoding, on `?dbname=`/`?host=`/`?port=`/
   `?hostaddr=` overrides, and on comma-separated multi-host DSNs.
-  `options` is kept because it can carry `-c search_path=...`, which
-  picks which schema a query resolves against — two DSNs differing only
-  there must stay in separate groups. Every other query parameter
+  Only a `search_path` setting is extracted from `options` (`options`
+  itself can carry `-c search_path=...`, but also any other GUC an
+  operator sets, so the whole string is not kept). `search_path` picks
+  which schema a query resolves against — two DSNs differing only there
+  must stay in separate groups. Every other query parameter
   (`application_name`, `sslmode`, and so on) is dropped, since none of
   them changes which relation a query resolves against — except `host`,
   `hostaddr`, and `port`: a Unix-socket DSN carries its real endpoint
@@ -337,15 +343,22 @@ shard records:
   omitted `dbname` to the connecting username — the key uses the
   username only in that case, never when a path is present.
 
-  Two gaps are accepted rather than chased further, since closing either
-  needs a live connection: a host alias (two hostnames resolving to one
-  address), and a role's own `search_path` set server-side with `ALTER
-  ROLE ... SET search_path` (invisible in the DSN, and not fully covered
-  by keeping the username, since the same role name can be granted
-  identical or different search paths across environments). Two DSNs for
-  one database under different usernames are also a documented topology
-  (`harvest shard rebalance`, issue #964), so treating different
-  usernames as different pools was rejected as reopening a worse bug.
+  Three gaps are accepted rather than chased further. A host alias (two
+  hostnames resolving to one address) needs a live connection to detect
+  and is left undetected. A role's own `search_path` set server-side with
+  `ALTER ROLE ... SET search_path` is invisible in the DSN, and not fully
+  covered by keeping the username, since the same role name can be
+  granted identical or different search paths across environments — two
+  DSNs for one database under different usernames are also a documented
+  topology (`harvest shard rebalance`, issue #964), so treating different
+  usernames as different pools was rejected as reopening a worse bug. A
+  multi-host DSN's hosts and ports are sorted and deduplicated
+  independently rather than paired positionally, so two DSNs that pair
+  the same hosts and ports differently can compare equal even though they
+  name different endpoints; `from_dsns` is built for one host per shard
+  entry, where this never arises, and getting it wrong skips a purge
+  rather than causing a premature one, so it is left for whoever first
+  needs multi-host entries to fix.
 
   The remaining cost is operational, not architectural: an operator must
   remember to set the flag on every process, including ones added later.

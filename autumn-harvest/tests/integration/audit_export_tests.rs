@@ -894,7 +894,7 @@ async fn retention_never_purges_an_unexported_record() {
         .await
         .expect("age rows");
 
-    let deleted = purge_old_audit_records(&mut conn, 90, false, 1)
+    let deleted = purge_old_audit_records(&mut conn, 90, false, &[0])
         .await
         .expect("purge runs");
     assert_eq!(
@@ -933,7 +933,7 @@ async fn retention_is_unchanged_when_export_is_unconfigured() {
         .await
         .expect("age rows");
 
-    let deleted = purge_old_audit_records(&mut conn, 90, false, 1)
+    let deleted = purge_old_audit_records(&mut conn, 90, false, &[0])
         .await
         .expect("purge runs");
     assert_eq!(
@@ -1269,7 +1269,7 @@ async fn retention_purges_nothing_when_export_is_configured_but_has_not_run_yet(
         .await
         .expect("age rows");
 
-    let deleted = purge_old_audit_records(&mut conn, 90, false, 1)
+    let deleted = purge_old_audit_records(&mut conn, 90, false, &[0])
         .await
         .expect("purge runs");
     uninstall();
@@ -1312,7 +1312,7 @@ async fn removing_the_sink_alone_does_not_resume_retention() {
         .await
         .expect("age rows");
 
-    let deleted = purge_old_audit_records(&mut conn, 90, false, 1)
+    let deleted = purge_old_audit_records(&mut conn, 90, false, &[0])
         .await
         .expect("purge runs");
     assert_eq!(
@@ -1719,7 +1719,7 @@ async fn retention_respects_a_live_exporter_heartbeat_from_another_process() {
         "this stands in for the process that runs retention"
     );
 
-    let deleted = purge_old_audit_records(&mut conn, 90, false, 1)
+    let deleted = purge_old_audit_records(&mut conn, 90, false, &[0])
         .await
         .expect("purge runs");
     assert_eq!(
@@ -1761,7 +1761,7 @@ async fn retention_resumes_only_after_the_cursor_is_decommissioned() {
             .await
             .expect("age heartbeat");
     }
-    let deleted = purge_old_audit_records(&mut conn, 90, false, 1)
+    let deleted = purge_old_audit_records(&mut conn, 90, false, &[0])
         .await
         .expect("purge runs");
     assert_eq!(
@@ -1777,7 +1777,7 @@ async fn retention_resumes_only_after_the_cursor_is_decommissioned() {
             .expect("decommission"),
         "the cursor row existed, so it must report as removed"
     );
-    let deleted = purge_old_audit_records(&mut conn, 90, false, 1)
+    let deleted = purge_old_audit_records(&mut conn, 90, false, &[0])
         .await
         .expect("purge runs");
     assert_eq!(
@@ -1810,7 +1810,7 @@ async fn retention_protects_unexported_audit_when_configured_with_no_cursor_and_
     // between enabling export and the worker's first successful tick.
     assert!(!autumn_harvest::audit_export::is_configured());
 
-    let deleted = purge_old_audit_records(&mut conn, 90, true, 1)
+    let deleted = purge_old_audit_records(&mut conn, 90, true, &[0])
         .await
         .expect("purge runs");
     assert_eq!(
@@ -1861,7 +1861,7 @@ async fn retention_decommission_alone_does_not_resume_purging_while_the_flag_is_
 
     // The flag is still `true`, so the three unacknowledged rows stay
     // protected even though the cursor is retired.
-    let deleted = purge_old_audit_records(&mut conn, 90, true, 1)
+    let deleted = purge_old_audit_records(&mut conn, 90, true, &[0])
         .await
         .expect("purge runs");
     assert_eq!(
@@ -1873,7 +1873,7 @@ async fn retention_decommission_alone_does_not_resume_purging_while_the_flag_is_
 
     // Unsetting the flag (as an operator must, per docs/audit-export.md) is
     // what finally resumes purging on this decommissioned shard.
-    let deleted = purge_old_audit_records(&mut conn, 90, false, 1)
+    let deleted = purge_old_audit_records(&mut conn, 90, false, &[0])
         .await
         .expect("purge runs");
     assert_eq!(
@@ -1915,7 +1915,7 @@ async fn retention_protects_a_shard_being_re_enabled_after_decommission() {
         .await
         .expect("age rows");
 
-    let deleted = purge_old_audit_records(&mut conn, 90, true, 1)
+    let deleted = purge_old_audit_records(&mut conn, 90, true, &[0])
         .await
         .expect("purge runs");
     assert_eq!(
@@ -1971,7 +1971,7 @@ async fn retention_protects_a_stamped_row_when_its_cursor_row_is_gone() {
         .await
         .expect("age rows");
 
-    let deleted = purge_old_audit_records(&mut conn, 90, true, 1)
+    let deleted = purge_old_audit_records(&mut conn, 90, true, &[0])
         .await
         .expect("purge runs");
     assert_eq!(
@@ -2001,7 +2001,7 @@ async fn retention_still_purges_acknowledged_rows_when_protect_unexported_audit_
         .await
         .expect("age rows");
 
-    let deleted = purge_old_audit_records(&mut conn, 90, true, 1)
+    let deleted = purge_old_audit_records(&mut conn, 90, true, &[0])
         .await
         .expect("purge runs");
     assert_eq!(
@@ -2020,9 +2020,10 @@ async fn retention_still_purges_acknowledged_rows_when_protect_unexported_audit_
 
 // A physical pool can be shared by more than one logical shard (issue
 // #1266). Each colocated shard keeps its own cursor row once it ticks.
-// `purge_old_audit_records` must know how many shards to expect. A row
-// already acknowledged by the one shard that has ticked must still stay
-// pending while another shard sharing the pool has not.
+// `purge_old_audit_records` must know which shard ids to expect a
+// cursor row from. A row already acknowledged by the one shard that has
+// ticked must still stay pending while another shard sharing the pool
+// has not.
 #[tokio::test]
 async fn retention_protects_rows_until_every_colocated_shard_has_a_cursor() {
     let _guard = TEST_SERIAL.lock().await;
@@ -2044,7 +2045,7 @@ async fn retention_protects_rows_until_every_colocated_shard_has_a_cursor() {
     // ticked yet, so it has no cursor row at all. Told to expect two
     // shards, nothing may be deleted -- not even the two rows shard 0
     // already acknowledged, since shard 1 has acknowledged nothing.
-    let deleted = purge_old_audit_records(&mut conn, 90, false, 2)
+    let deleted = purge_old_audit_records(&mut conn, 90, false, &[0, 1])
         .await
         .expect("purge runs");
     assert_eq!(
@@ -2055,13 +2056,59 @@ async fn retention_protects_rows_until_every_colocated_shard_has_a_cursor() {
 
     // Told the pool holds only shard 0, the same two rows purge exactly
     // as they would with no colocated shard at all.
-    let deleted = purge_old_audit_records(&mut conn, 90, false, 1)
+    let deleted = purge_old_audit_records(&mut conn, 90, false, &[0])
         .await
         .expect("purge runs");
     assert_eq!(
         deleted, 2,
         "with only one shard expected, the previously-acknowledged rows \
          resume purging"
+    );
+}
+
+// A decommissioned shard's cursor row is retired, never deleted (issue
+// #1266). Its lingering presence must never make an unrelated colocated
+// shard's still-missing cursor look covered, just because the row count
+// happens to match.
+#[tokio::test]
+async fn retention_ignores_an_unrelated_shards_lingering_cursor_row() {
+    let _guard = TEST_SERIAL.lock().await;
+    let _sink = install(Arc::new(RecordingSink::new(200)), 2);
+    let (mut conn, _c) = make_conn().await;
+    insert_audit_rows(&mut conn, 5).await;
+    fire_due_audit_exports(&mut conn, &None, &[], &NoOpMetrics)
+        .await
+        .expect("tick");
+    assert_eq!(cursor_acked(&mut conn, 0).await, 2);
+    uninstall();
+
+    // Shard 2 was removed from the fleet entirely. Decommissioning
+    // retires its cursor row rather than deleting it.
+    ensure_cursor_row(&mut conn, 2).await.expect("cursor row");
+    assert!(
+        autumn_harvest::audit_export::decommission_cursor(&mut conn, 2)
+            .await
+            .expect("decommission"),
+        "the cursor row existed, so it must report as removed"
+    );
+
+    diesel::update(harvest_audit_log::table)
+        .set(harvest_audit_log::occurred_at.eq(chrono::Utc::now() - chrono::Duration::days(365)))
+        .execute(&mut conn)
+        .await
+        .expect("age rows");
+
+    // Two cursor rows exist now (shard 0 and the retired shard 2),
+    // matching the size of the colocated set [0, 1] by coincidence. A
+    // count-based check would read that as complete. Matching identities
+    // still finds shard 1 missing and protects every stamped row.
+    let deleted = purge_old_audit_records(&mut conn, 90, false, &[0, 1])
+        .await
+        .expect("purge runs");
+    assert_eq!(
+        deleted, 0,
+        "an unrelated shard's lingering, retired cursor row must never \
+         stand in for the actually colocated shard 1's missing one"
     );
 }
 
@@ -2184,7 +2231,7 @@ async fn the_sequence_survives_a_decommission_that_purges_every_stamped_row() {
         .execute(&mut conn)
         .await
         .expect("age rows");
-    let deleted = purge_old_audit_records(&mut conn, 90, false, 1)
+    let deleted = purge_old_audit_records(&mut conn, 90, false, &[0])
         .await
         .expect("purge");
     assert_eq!(deleted, 3, "retiring the cursor must permit the purge");

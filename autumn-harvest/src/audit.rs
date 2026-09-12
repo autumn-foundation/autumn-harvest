@@ -1616,9 +1616,9 @@ pub async fn list_audit(
 /// delete is byte-identical to the pre-#953 statement.
 ///
 /// The pending check treats a row as pending, and so protected, in three
-/// cases. Its `export_seq` may be unassigned. Fewer cursor rows may exist
-/// than `colocated_shard_count`. Or a cursor row may exist and simply not
-/// have acknowledged it yet.
+/// cases. Its `export_seq` may be unassigned. Some shard in
+/// `colocated_shard_ids` may have no cursor row at all. Or a cursor row
+/// may exist and simply not have acknowledged it yet.
 ///
 /// The second case matters on its own (issue #1266). A stamped row can
 /// survive a cursor row's manual deletion. It can
@@ -1628,19 +1628,21 @@ pub async fn list_audit(
 /// agree, or a sweep landing first would delete rows `ensure_cursor_row`
 /// intended to redeliver.
 ///
-/// `colocated_shard_count` exists because a pool is not always one
-/// shard's own database. [`crate::shard::ShardedDbPool::pool_groups`] can
-/// name several logical shards sharing one physical pool. Each keeps its
-/// own cursor row there once it ticks.
+/// `colocated_shard_ids` exists because a pool is not always one shard's
+/// own database. [`crate::shard::ShardedDbPool::pool_groups`] can name
+/// several logical shards sharing one physical pool. Each keeps its own
+/// cursor row there once it ticks.
 ///
-/// Comparing the cursor count against a hardcoded "zero rows" missed a
-/// gap. "No shard has ticked" is not the same as "not every colocated
-/// shard has ticked yet". A row already acknowledged by the shard that
-/// has ticked looked fully acknowledged. A shard sharing the same pool
-/// that has not ticked still needed it. The caller passes the number of
-/// shards `pool_groups` named for this pool. A single-shard caller
-/// passes `1`. The check is then exactly the previous "no cursor row at
-/// all" test.
+/// An earlier draft compared the cursor row *count* against the number
+/// of colocated shards instead of matching shard identities. A
+/// decommissioned shard's cursor row is never deleted, only retired. A
+/// shard removed from the fleet entirely can leave a row behind that
+/// makes the count look complete. A currently colocated shard can still
+/// have none. Comparing identities closes that gap: every id this
+/// parameter names must have a cursor row of its own, regardless of how
+/// many other rows exist. A single-shard caller passes that one shard's
+/// id, and the check is then exactly the previous "no cursor row at all"
+/// test.
 ///
 /// # Errors
 ///
@@ -1649,7 +1651,7 @@ pub async fn purge_old_audit_records(
     conn: &mut AsyncPgConnection,
     retention_days: i64,
     protect_unexported_audit: bool,
-    colocated_shard_count: i64,
+    colocated_shard_ids: &[i32],
 ) -> HarvestResult<usize> {
     use diesel_async::RunQueryDsl as _;
 
@@ -1663,14 +1665,14 @@ pub async fn purge_old_audit_records(
     // decommissioning shares one cost across both signals: see the doc
     // comment above.
     //
-    // The pending check's middle disjunct compares the cursor count
-    // against `colocated_shard_count` rather than testing for zero rows
-    // (issue #1266). A shared physical pool can hold one cursor row per
-    // colocated shard. Testing only for zero missed the gap where some,
-    // but not all, of those shards have ticked yet. A stamped row
-    // already acknowledged by the shard that has ticked still looked
-    // fully acknowledged. That is exactly backwards from what a shard
-    // that has not ticked needs.
+    // The pending check's middle disjunct matches shard identities
+    // rather than comparing a cursor-row count (issue #1266). A shared
+    // physical pool can hold one cursor row per colocated shard. A
+    // decommissioned shard's row is retired, never deleted. A count
+    // can look complete even when a currently colocated shard still
+    // has no row of its own. `unnest` walks the caller's exact
+    // shard-id list; the disjunct is true the moment any of them has no
+    // matching row.
     diesel::sql_query(
         "DELETE FROM harvest_audit_log a \
          WHERE a.occurred_at < $1 \
@@ -1684,7 +1686,13 @@ pub async fn purge_old_audit_records(
                  ) \
                  AND ( \
                    a.export_seq IS NULL \
-                   OR (SELECT COUNT(*) FROM harvest_audit_export_cursor) < $3 \
+                   OR EXISTS ( \
+                        SELECT 1 FROM unnest($3::int4[]) AS expected(shard_id) \
+                        WHERE NOT EXISTS ( \
+                             SELECT 1 FROM harvest_audit_export_cursor c \
+                             WHERE c.shard_id = expected.shard_id \
+                        ) \
+                   ) \
                    OR EXISTS ( \
                         SELECT 1 FROM harvest_audit_export_cursor c \
                         WHERE a.export_seq > c.last_acked_seq \
@@ -1694,7 +1702,7 @@ pub async fn purge_old_audit_records(
     )
     .bind::<diesel::sql_types::Timestamptz, _>(cutoff)
     .bind::<diesel::sql_types::Bool, _>(export_may_be_live)
-    .bind::<diesel::sql_types::BigInt, _>(colocated_shard_count)
+    .bind::<diesel::sql_types::Array<diesel::sql_types::Integer>, _>(colocated_shard_ids.to_vec())
     .execute(conn)
     .await
     .map_err(database_error)
