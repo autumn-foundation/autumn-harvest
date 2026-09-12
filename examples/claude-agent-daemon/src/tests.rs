@@ -3173,6 +3173,80 @@ fn a_directory_entry_holding_a_line_break_is_counted_and_not_named() {
     );
 }
 
+/// One damaged row does not hide every other session.
+///
+/// `json_extract` on a document that is not JSON raises `malformed JSON`, and
+/// that aborts the whole statement. A listing names many sessions, so one
+/// damaged row would hide all of them. That includes a session waiting for a
+/// decision, which is the one an operator most needs to find.
+///
+/// The damaged row is still named, with no goal, which is what the caller
+/// already shows as an unreadable task.
+#[test]
+fn a_damaged_row_does_not_hide_the_listing() {
+    let dir = tempfile::tempdir().expect("a temporary directory");
+    let db = dir.path().join("damaged.db");
+    let writer = rusqlite::Connection::open(&db).expect("the database opens");
+    fixture_table(&writer);
+    record_task(&writer, "readable", READABLE_TASK);
+    // Not JSON at all, in the two payload columns a listing reads.
+    writer
+        .execute(
+            "INSERT INTO harvest_executions \
+             VALUES ('damaged-task', ?1, 'FAILED', 'not json at all', NULL, 'it broke')",
+            rusqlite::params![WORKFLOW_NAME],
+        )
+        .expect("the damaged row is recorded");
+    writer
+        .execute(
+            "INSERT INTO harvest_executions \
+             VALUES ('damaged-report', ?1, 'COMPLETED', ?2, '}{', NULL)",
+            rusqlite::params![WORKFLOW_NAME, READABLE_TASK],
+        )
+        .expect("the damaged report is recorded");
+    drop(writer);
+
+    let reader = rusqlite::Connection::open(&db).expect("the database opens");
+    let listed = inspect::executions(&reader, WORKFLOW_NAME, None).expect("the listing answers");
+    let named: Vec<&str> = listed.iter().map(|row| row.exec_id.as_str()).collect();
+    for session in ["readable", "damaged-task", "damaged-report"] {
+        assert!(
+            named.contains(&session),
+            "{session} must still be listed: {named:?}"
+        );
+    }
+    let row = |exec: &str| {
+        listed
+            .iter()
+            .find(|row| row.exec_id == exec)
+            .expect("the session is listed")
+    };
+    assert_eq!(
+        row("readable").goal.as_deref(),
+        Some("summarise it"),
+        "a readable task still reads"
+    );
+    assert!(
+        row("damaged-task").goal.is_none(),
+        "a document that is not JSON reads as no goal"
+    );
+    // The error column is not JSON, so it is readable whatever the task holds.
+    assert_eq!(
+        row("damaged-task").error.as_deref(),
+        Some("it broke"),
+        "a plain column is unaffected by the guard"
+    );
+    assert!(
+        row("damaged-report").stop.is_none() && row("damaged-report").answer.is_none(),
+        "a damaged report reads as no report"
+    );
+    assert_eq!(
+        row("damaged-report").goal.as_deref(),
+        Some("summarise it"),
+        "the task of that row is readable, and is still read"
+    );
+}
+
 /// A listing and a status agree about a goal holding a NUL.
 ///
 /// `submit` accepts a goal with an embedded NUL: Rust's `trim` keeps that
@@ -3552,7 +3626,13 @@ fn a_log_field_obeys_nothing() {
     // the source, because a `tracing` call writes to a subscriber this suite
     // does not install.
     let source = include_str!("daemon.rs");
-    for field in ["output = %", "error = %", "path = %"] {
+    for field in [
+        "output = %",
+        "error = %",
+        "path = %",
+        "db = %",
+        "workspace = %",
+    ] {
         for line in source.lines().filter(|line| line.contains(field)) {
             assert!(
                 line.contains("one_line("),

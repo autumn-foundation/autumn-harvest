@@ -590,14 +590,27 @@ pub fn executions(
     // number of sessions. It would then copy that to build the views, and
     // once more to serialise the answer. Each field is cut in the database,
     // where the bytes already are.
+    //
+    // `json_valid` guards every extraction. `json_extract` on a document
+    // that is not JSON raises `malformed JSON`, and that aborts the WHOLE
+    // statement. One damaged row would hide every session in the file,
+    // including one waiting for a decision. The guard leaves that row's
+    // fields NULL, which the caller already shows as an unreadable task.
     let mut statement = conn
         .prepare(
             "SELECT exec_id, state, \
-                    substr(cast(json_extract(input_json, '$.goal') as blob), 1, ?3), \
-                    json_extract(output_json, '$.stop'), \
-                    json_extract(output_json, '$.turns'), \
-                    json_extract(output_json, '$.tool_calls'), \
-                    substr(cast(json_extract(output_json, '$.answer') as blob), 1, ?3), \
+                    CASE WHEN json_valid(input_json) \
+                         THEN substr(cast(json_extract(input_json, '$.goal') as blob), \
+                                     1, ?3) END, \
+                    CASE WHEN json_valid(output_json) \
+                         THEN json_extract(output_json, '$.stop') END, \
+                    CASE WHEN json_valid(output_json) \
+                         THEN json_extract(output_json, '$.turns') END, \
+                    CASE WHEN json_valid(output_json) \
+                         THEN json_extract(output_json, '$.tool_calls') END, \
+                    CASE WHEN json_valid(output_json) \
+                         THEN substr(cast(json_extract(output_json, '$.answer') as blob), \
+                                     1, ?3) END, \
                     substr(cast(error as blob), 1, ?3), \
                     rowid \
              FROM harvest_executions WHERE workflow_name = ?1 \

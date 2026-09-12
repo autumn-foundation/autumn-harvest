@@ -229,10 +229,14 @@ pub async fn serve(options: Options) -> Result<(), String> {
     let owner = rustix::process::geteuid().as_raw();
     tokio::spawn(accept_loop(listener, tx, owner));
 
+    // The socket path is logged as itself: `printable` refuses one that holds
+    // anything a terminal acts on before any command runs. The database and
+    // the workspace carry no such rule, because neither appears in a printed
+    // command. The log sink keeps them from reaching a terminal.
     tracing::info!(
-        db = %options.db.display(),
+        db = %crate::one_line(&options.db.display().to_string()),
         socket = %options.socket.display(),
-        workspace = %options.workspace.display(),
+        workspace = %crate::one_line(&options.workspace.display().to_string()),
         model = if live { "claude api" } else { "offline stub" },
         "agentd is ready",
     );
