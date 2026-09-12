@@ -6065,23 +6065,38 @@ fn a_response_body_is_read_under_a_byte_cap() {
     );
     assert_eq!(body.len(), 11, "a small chunk is taken whole");
 
-    // A chunk that STRADDLES the cap is cut at it, and the read ends. This is
-    // the arithmetic worth testing: the body must hold exactly the cap, and
-    // not the cap plus the overshoot.
+    // A chunk that PASSES the cap ends the read, and the buffer holds one
+    // byte more than the cap. That one byte is how the caller knows the body
+    // did not end there, rather than reading the prefix as the whole answer.
+    // See `a_response_body_longer_than_the_cap_is_refused`.
     let mut body = vec![b'a'; cap - 10];
     assert!(
         claude::push_capped(&mut body, &vec![b'b'; 4096]),
         "a chunk past the cap must end the read"
     );
-    assert_eq!(body.len(), cap, "the body must hold exactly the cap");
+    assert_eq!(
+        body.len(),
+        cap + 1,
+        "the buffer must hold one byte past the cap, and not the overshoot"
+    );
 
-    // A body already at the cap takes nothing more and still ends.
+    // A body already at the cap takes ONE more byte and ends. It must not
+    // grow by the whole chunk.
     let mut body = vec![b'a'; cap];
     assert!(
         claude::push_capped(&mut body, b"more"),
         "a full body must end the read"
     );
-    assert_eq!(body.len(), cap, "a full body grows no further");
+    assert_eq!(body.len(), cap + 1, "a full body grows by one byte only");
+
+    // A chunk that reaches the cap EXACTLY does not pass it, so a body of
+    // exactly the cap is still accepted.
+    let mut body = Vec::new();
+    assert!(
+        !claude::push_capped(&mut body, &vec![b'a'; cap]),
+        "a body of exactly the cap must not end the read"
+    );
+    assert_eq!(body.len(), cap, "and it is taken whole");
 
     // The property this cap must hold. It is a MEMORY bound, so it must sit
     // ABOVE the recorded payload cap. A reply the backend could record must
@@ -6320,6 +6335,90 @@ fn a_response_body_that_is_not_text_is_refused() {
     assert!(
         claude::decode_body(cut).is_err() || by_json.is_err(),
         "a cut body must be refused by one check or the other"
+    );
+}
+
+/// A body longer than the cap is refused, not read as its prefix.
+///
+/// The read once stopped AT the cap and handed back what it had. JSON allows
+/// trailing whitespace, so a complete message padded to the boundary parses,
+/// and the daemon ran a tool call from it. The bytes after the cap were
+/// never seen. The WHOLE body does not parse, which is the answer the turn
+/// should have given.
+///
+/// The read now takes one byte past the cap. That byte tells a body which
+/// ENDED at the cap from one that merely reached it.
+#[test]
+fn a_response_body_longer_than_the_cap_is_refused() {
+    let cap = claude::MAX_BODY_BYTES;
+
+    // A complete, valid `tool_use` message, padded with whitespace to
+    // exactly the cap, and then more data.
+    let message = serde_json::to_vec(&json!({
+        "content": [{ "type": "tool_use", "id": "toolu_1", "name": "write_file",
+                      "input": { "path": "note.md", "content": "x" } }],
+        "stop_reason": "tool_use",
+    }))
+    .expect("the message serialises");
+    let mut whole = message;
+    whole.resize(cap, b' ');
+    whole.extend_from_slice(br#"{"content":[],"stop_reason":"end_turn"}"#);
+
+    // The hazard, stated first. The PREFIX is a valid message carrying a
+    // call, and the whole body is not valid JSON at all.
+    let prefix = whole[..cap].to_vec();
+    let parsed: Value = serde_json::from_slice(&prefix).expect("the prefix parses on its own");
+    assert_eq!(
+        claude::parse_reply(&parsed).tool_calls.len(),
+        1,
+        "the prefix carries a tool call, which is what made this dangerous"
+    );
+    assert!(
+        serde_json::from_slice::<Value>(&whole).is_err(),
+        "the whole body must not parse, so the turn should be refused"
+    );
+
+    // The read, driven the way `read_capped` drives it.
+    let mut body: Vec<u8> = Vec::new();
+    let mut stopped = false;
+    for chunk in whole.chunks(64 * 1024) {
+        if claude::push_capped(&mut body, chunk) {
+            stopped = true;
+            break;
+        }
+    }
+    assert!(stopped, "the read must end on a body past the cap");
+    assert_eq!(
+        body.len(),
+        cap + 1,
+        "and it must hold the one byte that proves the body continued"
+    );
+
+    // So the body is refused, and its prefix is never parsed. The read is
+    // mapped to its LENGTH before asserting, because a failure here would
+    // otherwise print four megabytes of padding.
+    let refused = claude::decode_body(body)
+        .map(|text| text.len())
+        .expect_err("a body past the cap must be refused");
+    assert!(
+        refused.contains("longer than") && refused.contains("--max-tokens"),
+        "the refusal must say what is wrong and what to lower: {refused}"
+    );
+
+    // A body of EXACTLY the cap is still accepted. This is the boundary the
+    // extra byte exists to draw, and refusing here would refuse a response
+    // that genuinely ended.
+    let mut body: Vec<u8> = Vec::new();
+    for chunk in prefix.chunks(64 * 1024) {
+        assert!(
+            !claude::push_capped(&mut body, chunk),
+            "a body of exactly the cap must not end the read early"
+        );
+    }
+    assert_eq!(body.len(), cap, "the whole body is buffered");
+    assert!(
+        claude::decode_body(body).is_ok(),
+        "a body that ends at the cap must still be read"
     );
 }
 

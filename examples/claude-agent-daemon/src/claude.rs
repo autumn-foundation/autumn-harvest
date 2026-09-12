@@ -480,27 +480,38 @@ async fn read_capped(mut response: reqwest::Response) -> Result<String, String> 
     decode_body(body)
 }
 
-/// Read one response body as text, STRICTLY.
+/// Read one response body as the text a turn parses, or refuse it.
 ///
-/// A lossy read replaces an invalid byte with U+FFFD. That can turn a
-/// malformed body into valid JSON carrying a value the model never sent.
-/// Measured, with a raw `FF` inside a tool path: the lossy body parses, and
-/// the daemon runs `write_file` on `note\u{fffd}.md`. The operator approves
-/// the path they are shown, and the model asked for another one.
+/// A body PAST the cap is refused, and never read as its prefix. The read
+/// takes one byte more than the cap. That byte tells a body which ENDED at
+/// the cap from one that merely reached it. See [`push_capped`].
+///
+/// The bytes are decoded STRICTLY. A lossy read replaces an invalid byte with
+/// U+FFFD. That can turn a malformed body into valid JSON carrying a value
+/// the model never sent. Measured, with a raw `FF` inside a tool path: the
+/// lossy body parses, and the daemon runs `write_file` on
+/// `note\u{fffd}.md`. The operator approves the path they are shown, and the
+/// model asked for another one.
 ///
 /// Strict costs nothing here. A body cut at the read cap is refused either
 /// way. This check refuses it when the cut splits a character. The JSON
 /// parse refuses it when the cut does not, because the document then ends
 /// unclosed. So the lossy read never rescued a body that would have worked.
 ///
-/// Split out from the read above so a test can drive the decision without an
-/// HTTP response, the way [`push_capped`] carries the arithmetic.
+/// Split out from the read above so a test can drive both decisions without
+/// an HTTP response, the way [`push_capped`] carries the arithmetic.
 ///
 /// # Errors
 ///
-/// Returns the reason phrase for [`body_failure`] when the bytes are not
-/// text.
+/// Returns the reason phrase for [`body_failure`] when the body is longer
+/// than the cap, or when its bytes are not text.
 pub fn decode_body(body: Vec<u8>) -> Result<String, String> {
+    if body.len() > MAX_BODY_BYTES {
+        return Err(format!(
+            "its response is longer than the {MAX_BODY_BYTES} bytes this daemon \
+             reads. Lower `--max-tokens`."
+        ));
+    }
     String::from_utf8(body).map_err(|e| {
         format!(
             "its response is not UTF-8 text: the byte at {} begins no character",
@@ -509,13 +520,27 @@ pub fn decode_body(body: Vec<u8>) -> Result<String, String> {
     })
 }
 
-/// Append as much of one chunk as the cap allows.
+/// Append as much of one chunk as the cap allows, and ONE byte more.
 ///
-/// Returns `true` once the body is full, which ends the read. Split out from
-/// the loop above so a test can drive the arithmetic, including a chunk that
-/// straddles the cap. The loop itself is three lines of reqwest.
+/// Returns `true` once the body has passed the cap, which ends the read. The
+/// buffer then holds `MAX_BODY_BYTES + 1` bytes, and the caller refuses it.
+///
+/// That one extra byte is the whole point. The read once stopped AT the cap
+/// and handed back the prefix. A body of exactly the cap followed by more
+/// data was then read as though it had ended there. JSON allows trailing
+/// whitespace, so a complete message padded to the boundary parses, and the
+/// daemon ran a tool call from it. The whole body did not parse, which is
+/// the answer it should have given.
+///
+/// A body that fits the cap EXACTLY is still accepted. The buffer reaches
+/// the cap and no more arrives, so nothing passes it.
+///
+/// Split out from the loop above so a test can drive the arithmetic,
+/// including a chunk that straddles the cap. The loop itself is three lines
+/// of reqwest.
 pub fn push_capped(body: &mut Vec<u8>, chunk: &[u8]) -> bool {
-    let room = MAX_BODY_BYTES.saturating_sub(body.len());
+    // One past the cap, so reaching the cap is not the same as passing it.
+    let room = MAX_BODY_BYTES.saturating_sub(body.len()) + 1;
     if chunk.len() >= room {
         body.extend_from_slice(&chunk[..room]);
         return true;
