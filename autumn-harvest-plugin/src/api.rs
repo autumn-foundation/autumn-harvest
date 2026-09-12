@@ -128,9 +128,9 @@ use autumn_harvest::{
     SignalWithStartOutcome, SignalWithStartParams, StartWorkflowParams, TriageFieldChange,
     TriageOutcome, TriagePatch, UpdateWithStartOutcome, UpdateWithStartParams,
     WorkflowHandleClient, WorkflowResult, annotate_workflow_execution,
-    signal_with_start_workflow_execution_with_metrics,
-    start_or_load_workflow_execution_with_metrics,
-    update_with_start_workflow_execution_with_metrics,
+    signal_with_start_workflow_execution_with_metrics_and_codecs,
+    start_or_load_workflow_execution_with_metrics_and_codecs,
+    update_with_start_workflow_execution_with_metrics_and_codecs,
 };
 
 use crate::lineage::{
@@ -13551,8 +13551,7 @@ fn eligible_worker_ids<'a>(
                 return true;
             }
             requirements.as_ref().is_none_or(|parsed| {
-                let labels: std::collections::HashMap<String, String> =
-                    serde_json::from_value(w.worker.labels.clone()).unwrap_or_default();
+                let labels = autumn_harvest::payload_codec::string_valued_labels(&w.worker.labels);
                 autumn_harvest::eligibility::matches_requirements(parsed, &labels)
             })
         })
@@ -17978,10 +17977,11 @@ pub(crate) async fn start_workflow(
             },
         };
 
-        match autumn_harvest::event_batch::admit_batched_start(
+        match autumn_harvest::event_batch::admit_batched_start_with_codecs(
             &mut batch_conn,
             admit_params,
             Some(runtime.registry.telemetry().metrics.as_ref()),
+            runtime.registry.payload_codecs(),
         )
         .await
         {
@@ -18502,7 +18502,7 @@ pub(crate) async fn start_workflow(
                 .into_response();
         }
         let window_secs = api_state.start_idempotency_window().as_secs_f64();
-        let idem = autumn_harvest::start_or_load_workflow_execution_idempotent(
+        let idem = autumn_harvest::start_or_load_workflow_execution_idempotent_with_codecs(
             &mut conn,
             StartWorkflowParams {
                 workflow_name: &workflow_name,
@@ -18563,6 +18563,7 @@ pub(crate) async fn start_workflow(
             // back the idempotency reservation (retryable); a committed-replay
             // short-circuited to `200` above never reaches here.
             Some(autumn_harvest::admission_gate::GateMode::Check),
+            runtime.registry.payload_codecs(),
         )
         .await;
 
@@ -18799,11 +18800,12 @@ pub(crate) async fn start_workflow(
     // attach admits nothing and is never gated (returns the existing run). This path
     // is reached by every non-debounce / non-batch start (plain, auto-id, and a
     // throttle-`Reserved` fall-through — its token is refunded on a block below).
-    let result = start_or_load_workflow_execution_with_metrics(
+    let result = start_or_load_workflow_execution_with_metrics_and_codecs(
         &mut conn,
         start_params,
         metrics_ref,
         Some(autumn_harvest::admission_gate::GateMode::Check),
+        runtime.registry.payload_codecs(),
     )
     .await;
 
@@ -19847,70 +19849,73 @@ async fn batch_start_workflows(
             // rejection below (issue #499).
             let item_reject_fresh =
                 workflow_has_resolving_debounce(&runtime.registry, &item.workflow_name, &input);
-            let start_result = autumn_harvest::execution::start_or_load_workflow_execution_collect(
-                &mut conn,
-                StartWorkflowParams {
-                    workflow_name: &item.workflow_name,
-                    workflow_id,
-                    exec_id,
-                    input,
-                    parent_id: None,
-                    queue_name: &queue_name,
-                    execution_timeout: None,
-                    memo: None,
-                    search_attrs: item.search_attributes.clone(),
-                    reuse_policy: WorkflowIdReusePolicy::AllowDuplicate,
-                    conflict_policy: autumn_harvest::types::WorkflowIdConflictPolicy::Unspecified,
-                    trace_context: trace_ctx,
-                    max_execution_timeout_ceiling: max_exec_timeout_ceiling,
-                    // Chain-scoped lifetime cap (issue #617): workflow-type default
-                    // + fleet-wide ceiling-as-default, at parity with the per-run
-                    // ceiling threaded above.
-                    chain_execution_timeout: info_chain_execution_timeout
-                        .and_then(|d| chrono::Duration::from_std(d).ok()),
-                    max_workflow_chain_timeout_ceiling: max_chain_timeout_ceiling,
-                    inherited_chain_deadline_at: None,
-                    concurrency_key,
-                    concurrency_limit,
-                    concurrency_on_conflict,
-                    priority: item.priority.unwrap_or_default(),
-                    max_workflow_input_bytes: effective_wf_cap,
-                    start_at: None,
-                    delay: None,
-                    max_workflow_start_delay: None,
-                    owner,
-                    runbook_url,
-                    severity,
-                    context_headers: item.context_headers.clone(),
-                    sla,
-                    schedule_id: None,
-                    scheduled_for: None,
-                    workflow_attempt: 1,
-                    workflow_retry_policy: item_workflow_retry_policy,
-                    retry_of_exec_id: None,
-                    max_workflow_attempts_ceiling: api_state.max_workflow_attempts(),
-                    origin: None,
-                    completion_callbacks: None,
-                    // Batch-start API immediate path (issue #740): provenance is
-                    // `batch`, attributed to the operator that issued the batch.
-                    // Mirrors the throttle-carrier branch above.
-                    start_source: autumn_harvest::StartSource::Batch,
-                    start_source_ref: None,
-                    started_by: Some(actor.as_str()),
-                },
-                false,
-                item_reject_fresh,
-                Some(runtime.registry.telemetry().metrics.as_ref()),
-                // issue #618 (PR #1014): gate each batch item authoritatively under
-                // the primitive's `FOR UPDATE` lock. This closes the batch TOCTOU
-                // (Phase 1's policy-blind pre-check can skip the gate for an item
-                // whose prior seals before Phase 2 starts it). A blocked item's
-                // `Err(AdmissionBlocked)` is mapped to a per-item rejection by the
-                // `Err(e)` arm below (never a hard batch failure) — the block is
-                // counted once by the primitive.
-                Some(autumn_harvest::admission_gate::GateMode::Check),
-            )
-            .await;
+            let start_result =
+                autumn_harvest::execution::start_or_load_workflow_execution_collect_with_codecs(
+                    &mut conn,
+                    StartWorkflowParams {
+                        workflow_name: &item.workflow_name,
+                        workflow_id,
+                        exec_id,
+                        input,
+                        parent_id: None,
+                        queue_name: &queue_name,
+                        execution_timeout: None,
+                        memo: None,
+                        search_attrs: item.search_attributes.clone(),
+                        reuse_policy: WorkflowIdReusePolicy::AllowDuplicate,
+                        conflict_policy:
+                            autumn_harvest::types::WorkflowIdConflictPolicy::Unspecified,
+                        trace_context: trace_ctx,
+                        max_execution_timeout_ceiling: max_exec_timeout_ceiling,
+                        // Chain-scoped lifetime cap (issue #617): workflow-type default
+                        // + fleet-wide ceiling-as-default, at parity with the per-run
+                        // ceiling threaded above.
+                        chain_execution_timeout: info_chain_execution_timeout
+                            .and_then(|d| chrono::Duration::from_std(d).ok()),
+                        max_workflow_chain_timeout_ceiling: max_chain_timeout_ceiling,
+                        inherited_chain_deadline_at: None,
+                        concurrency_key,
+                        concurrency_limit,
+                        concurrency_on_conflict,
+                        priority: item.priority.unwrap_or_default(),
+                        max_workflow_input_bytes: effective_wf_cap,
+                        start_at: None,
+                        delay: None,
+                        max_workflow_start_delay: None,
+                        owner,
+                        runbook_url,
+                        severity,
+                        context_headers: item.context_headers.clone(),
+                        sla,
+                        schedule_id: None,
+                        scheduled_for: None,
+                        workflow_attempt: 1,
+                        workflow_retry_policy: item_workflow_retry_policy,
+                        retry_of_exec_id: None,
+                        max_workflow_attempts_ceiling: api_state.max_workflow_attempts(),
+                        origin: None,
+                        completion_callbacks: None,
+                        // Batch-start API immediate path (issue #740): provenance is
+                        // `batch`, attributed to the operator that issued the batch.
+                        // Mirrors the throttle-carrier branch above.
+                        start_source: autumn_harvest::StartSource::Batch,
+                        start_source_ref: None,
+                        started_by: Some(actor.as_str()),
+                    },
+                    false,
+                    item_reject_fresh,
+                    Some(runtime.registry.telemetry().metrics.as_ref()),
+                    // issue #618 (PR #1014): gate each batch item authoritatively under
+                    // the primitive's `FOR UPDATE` lock. This closes the batch TOCTOU
+                    // (Phase 1's policy-blind pre-check can skip the gate for an item
+                    // whose prior seals before Phase 2 starts it). A blocked item's
+                    // `Err(AdmissionBlocked)` is mapped to a per-item rejection by the
+                    // `Err(e)` arm below (never a hard batch failure) — the block is
+                    // counted once by the primitive.
+                    Some(autumn_harvest::admission_gate::GateMode::Check),
+                    runtime.registry.payload_codecs(),
+                )
+                .await;
 
             let start_result = match start_result {
                 Ok((started, deferred, checks, cancel_metrics)) => {
@@ -21000,7 +21005,7 @@ pub(crate) async fn signal_with_start_workflow(
     let sws_workflow_retry_policy =
         info_retry_policy_sws.and_then(|p| serde_json::to_value(&p).ok());
 
-    let result = signal_with_start_workflow_execution_with_metrics(
+    let result = signal_with_start_workflow_execution_with_metrics_and_codecs(
         &mut conn,
         SignalWithStartParams {
             workflow_name: &workflow_name,
@@ -21060,6 +21065,7 @@ pub(crate) async fn signal_with_start_workflow(
         // pre-check block short-circuits before this call, so a fresh create is
         // never double-counted.
         Some(autumn_harvest::admission_gate::GateMode::Check),
+        runtime.registry.payload_codecs(),
     )
     .await;
 
@@ -21849,7 +21855,7 @@ async fn update_with_start_workflow(
     let result = match probe_outcome {
         Some(outcome) => Ok(outcome),
         None => {
-            update_with_start_workflow_execution_with_metrics(
+            update_with_start_workflow_execution_with_metrics_and_codecs(
                 &mut conn,
                 params,
                 Some(runtime.registry.telemetry().metrics.as_ref()),
@@ -21859,6 +21865,7 @@ async fn update_with_start_workflow(
                 // create TOCTOU; a pre-check block short-circuits before this call,
                 // so no double-count.
                 Some(autumn_harvest::admission_gate::GateMode::Check),
+                runtime.registry.payload_codecs(),
             )
             .await
         }
@@ -22821,11 +22828,12 @@ async fn rerun_workflow(
         trace_context: runtime.registry.telemetry().capture_trace_context(),
     };
 
-    let result = autumn_harvest::execution::rerun_workflow_execution(
+    let result = autumn_harvest::execution::rerun_workflow_execution_with_codecs(
         &mut conn,
         exec_id,
         rerun_request,
         metrics_ref,
+        runtime.registry.payload_codecs(),
     )
     .await;
 
@@ -28936,7 +28944,7 @@ async fn trigger_schedule_now(
     // schedule id and attributed to the operator (mirrors the throttle-carrier
     // branch above). Bound in the enclosing scope so the ref outlives the params.
     let manual_schedule_id_str = schedule_id.to_string();
-    let result = start_or_load_workflow_execution_with_metrics(
+    let result = start_or_load_workflow_execution_with_metrics_and_codecs(
         &mut exec_conn,
         StartWorkflowParams {
             workflow_name: &workflow_name,
@@ -29003,6 +29011,7 @@ async fn trigger_schedule_now(
         },
         Some(runtime.registry.telemetry().metrics.as_ref()),
         None,
+        runtime.registry.payload_codecs(),
     )
     .await;
 
@@ -30395,7 +30404,7 @@ pub(crate) async fn schedule_backfill_inner(
                 // `backfill`, referencing the schedule id and the operator actor —
                 // matching the throttled branch above.
                 let schedule_id_str = schedule_id.to_string();
-                let result = start_or_load_workflow_execution_with_metrics(
+                let result = start_or_load_workflow_execution_with_metrics_and_codecs(
                     &mut conn,
                     StartWorkflowParams {
                         workflow_name: &wf_name,
@@ -30473,6 +30482,7 @@ pub(crate) async fn schedule_backfill_inner(
                     },
                     Some(runtime.registry.telemetry().metrics.as_ref()),
                     None,
+                    runtime.registry.payload_codecs(),
                 )
                 .await;
                 match result {
@@ -30751,7 +30761,7 @@ pub(crate) async fn schedule_backfill_inner(
                 // Provenance for a non-throttled DAG backfill (issue #740):
                 // `backfill`, referencing the schedule id and the operator actor.
                 let schedule_id_str = schedule_id.to_string();
-                let start_result = start_or_load_workflow_execution_with_metrics(
+                let start_result = start_or_load_workflow_execution_with_metrics_and_codecs(
                     &mut conn,
                     StartWorkflowParams {
                         workflow_name: &dag_name,
@@ -30807,6 +30817,7 @@ pub(crate) async fn schedule_backfill_inner(
                     },
                     Some(runtime.registry.telemetry().metrics.as_ref()),
                     None,
+                    runtime.registry.payload_codecs(),
                 )
                 .await;
                 match start_result {
@@ -42073,6 +42084,52 @@ async fn resolve_stream_end_reason(
     stream_end_reason(state.as_deref(), event_derived)
 }
 
+/// Map a `stream-end` `reason` back to its raw execution-state form.
+///
+/// Reverses `stream_end_reason`'s lowercase-hyphen mapping, e.g.
+/// `"timed-out"` becomes `"TIMED_OUT"`. The result matches
+/// `harvest_workflow_executions.state` exactly (issue #1458).
+fn stream_end_state(reason: &str) -> String {
+    reason.to_uppercase().replace('-', "_")
+}
+
+/// Build the `stream-end` terminal-marker JSON payload.
+///
+/// Adds `execution_id` and `state` alongside `reason`, per
+/// `docs/management-api.md`'s "Terminal marker" section (issue #1458).
+fn stream_end_payload(exec_id: ExecutionId, reason: &str) -> String {
+    serde_json::json!({
+        "reason": reason,
+        "execution_id": exec_id.to_string(),
+        "state": stream_end_state(reason),
+    })
+    .to_string()
+}
+
+/// Send the terminal `stream-end` frame: one call site for all four places
+/// that detect a terminal execution (issue #1458). A single call site keeps
+/// the `id:`/`execution_id`/`state` fields from drifting out of sync again.
+async fn send_stream_end(
+    api: &HarvestApiState,
+    exec_id: ExecutionId,
+    tx: &mut futures::channel::mpsc::Sender<
+        Result<axum::response::sse::Event, std::convert::Infallible>,
+    >,
+    last_id: i64,
+    event_derived_state: &str,
+) {
+    use futures::SinkExt as _;
+
+    let reason = resolve_stream_end_reason(api, exec_id, event_derived_state).await;
+    let end_data = stream_end_payload(exec_id, &reason);
+    let _ = tx
+        .send(Ok(axum::response::sse::Event::default()
+            .id(last_id.to_string())
+            .event("stream-end")
+            .data(end_data)))
+        .await;
+}
+
 #[cfg(test)]
 mod stream_end_reason_tests {
     use super::stream_end_reason;
@@ -42118,6 +42175,31 @@ mod stream_end_reason_tests {
         // before the state column flipped — keep the event-derived label.
         assert_eq!(stream_end_reason(Some("RUNNING"), "cancelled"), "cancelled");
         assert_eq!(stream_end_reason(None, "terminated"), "terminated");
+    }
+}
+
+#[cfg(test)]
+mod stream_end_payload_tests {
+    use super::{ExecutionId, stream_end_payload, stream_end_state};
+
+    #[test]
+    fn state_reverses_the_reason_mapping() {
+        assert_eq!(stream_end_state("completed"), "COMPLETED");
+        assert_eq!(stream_end_state("failed"), "FAILED");
+        assert_eq!(stream_end_state("cancelled"), "CANCELLED");
+        assert_eq!(stream_end_state("timed-out"), "TIMED_OUT");
+        assert_eq!(stream_end_state("terminated"), "TERMINATED");
+        assert_eq!(stream_end_state("continued-as-new"), "CONTINUED_AS_NEW");
+    }
+
+    #[test]
+    fn payload_carries_reason_execution_id_and_state() {
+        let exec_id = ExecutionId::new();
+        let payload = stream_end_payload(exec_id, "timed-out");
+        let value: serde_json::Value = serde_json::from_str(&payload).unwrap();
+        assert_eq!(value["reason"], "timed-out");
+        assert_eq!(value["execution_id"], exec_id.to_string());
+        assert_eq!(value["state"], "TIMED_OUT");
     }
 }
 
@@ -42398,11 +42480,8 @@ async fn stream_execution_events(
                 None
             });
         if let Some(state) = effective_terminal {
-            let reason = resolve_stream_end_reason(&api_clone, exec_id, state).await;
-            let end_data = serde_json::json!({"reason": reason}).to_string();
-            let _ = tx
-                .send(Ok(Event::default().event("stream-end").data(end_data)))
-                .await;
+            let last_id = backfill.last().map_or(last_row_id, |r| r.id);
+            send_stream_end(&api_clone, exec_id, &mut tx, last_id, state).await;
         } else {
             // ── 3. Live-tail: LISTEN/NOTIFY loop ─────────────────────────────
             let mut last_seen_id = backfill.last().map_or(last_row_id, |r| r.id);
@@ -42460,11 +42539,7 @@ async fn stream_execution_events(
                         }
 
                         if let Some(state) = terminal_state {
-                            let reason =
-                                resolve_stream_end_reason(&api_clone, exec_id, state).await;
-                            let end_data = serde_json::json!({"reason": reason}).to_string();
-                            let _ = tx
-                                .send(Ok(Event::default().event("stream-end").data(end_data)))
+                            send_stream_end(&api_clone, exec_id, &mut tx, last_seen_id, state)
                                 .await;
                             break 'notify;
                         }
@@ -42505,11 +42580,7 @@ async fn stream_execution_events(
                             break 'notify;
                         }
                         if let Some(state) = terminal_state {
-                            let reason =
-                                resolve_stream_end_reason(&api_clone, exec_id, state).await;
-                            let end_data = serde_json::json!({"reason": reason}).to_string();
-                            let _ = tx
-                                .send(Ok(Event::default().event("stream-end").data(end_data)))
+                            send_stream_end(&api_clone, exec_id, &mut tx, last_seen_id, state)
                                 .await;
                             break 'notify;
                         }
@@ -42550,11 +42621,7 @@ async fn stream_execution_events(
                             break 'notify;
                         }
                         if let Some(state) = terminal_state {
-                            let reason =
-                                resolve_stream_end_reason(&api_clone, exec_id, state).await;
-                            let end_data = serde_json::json!({"reason": reason}).to_string();
-                            let _ = tx
-                                .send(Ok(Event::default().event("stream-end").data(end_data)))
+                            send_stream_end(&api_clone, exec_id, &mut tx, last_seen_id, state)
                                 .await;
                             break 'notify;
                         }
@@ -43979,10 +44046,14 @@ async fn complete_external_activity(
         }
     };
     let output = request.output.unwrap_or(Value::Null);
+    let codecs = api_state.payload_codecs();
 
     let complete_result = resolve_external_on_shards(&api_state, token, |conn, tok| {
         let out = output.clone();
-        Box::pin(async move { external_task::complete_externally(conn, tok, out).await })
+        let codecs = codecs.clone();
+        Box::pin(async move {
+            external_task::complete_externally_with_codecs(conn, tok, out, &codecs).await
+        })
     })
     .await;
 
@@ -44408,8 +44479,8 @@ async fn list_workers_handler(
                     }
 
                     parsed_reqs.as_ref().is_none_or(|reqs| {
-                        let worker_labels: std::collections::HashMap<String, String> =
-                            serde_json::from_value(w.worker.labels.clone()).unwrap_or_default();
+                        let worker_labels =
+                            autumn_harvest::payload_codec::string_valued_labels(&w.worker.labels);
                         autumn_harvest::eligibility::matches_requirements(reqs, &worker_labels)
                     })
                 });
@@ -45061,13 +45132,14 @@ pub(crate) async fn admit_update(
     // attempt. `admit_update_event` verifies RUNNING under the same FOR UPDATE
     // lock and rolls back on rejection, so a re-driven admit can never
     // double-admit.
-    let mut admit = store::admit_update_event(
+    let mut admit = store::admit_update_event_with_codecs(
         &mut conn,
         target,
         update_id,
         update_name.clone(),
         request.input.clone(),
         Some(runtime.registry.telemetry().metrics.as_ref()),
+        runtime.registry.payload_codecs(),
     )
     .await;
     for _ in 0..autumn_harvest::execution::RETRY_CHAIN_MAX_REDRIVES {
@@ -45079,13 +45151,14 @@ pub(crate) async fn admit_update(
             return map_error(error).into_response();
         }
         target = fresh;
-        admit = store::admit_update_event(
+        admit = store::admit_update_event_with_codecs(
             &mut conn,
             target,
             update_id,
             update_name.clone(),
             request.input.clone(),
             Some(runtime.registry.telemetry().metrics.as_ref()),
+            runtime.registry.payload_codecs(),
         )
         .await;
     }
@@ -47212,8 +47285,8 @@ async fn evaluate_eligibility_for_shard(
                 };
 
                 if let Some(reqs) = parsed_reqs {
-                    let worker_labels: std::collections::HashMap<String, String> =
-                        serde_json::from_value(w.worker.labels.clone()).unwrap_or_default();
+                    let worker_labels =
+                        autumn_harvest::payload_codec::string_valued_labels(&w.worker.labels);
                     for req in &reqs {
                         let satisfied = match req {
                             autumn_harvest::eligibility::Requirement::Exact { key, value } => {

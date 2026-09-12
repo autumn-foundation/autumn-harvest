@@ -95,7 +95,7 @@ type WorkflowChildProjection = (
 /// small, regression for every deployment. One shared instance costs nothing
 /// and behaves identically: it registers no keyed codec, so its rotation state
 /// is inert.
-static DEFAULT_PAYLOAD_CODECS: std::sync::LazyLock<crate::payload_codec::PayloadCodecs> =
+pub(crate) static DEFAULT_PAYLOAD_CODECS: std::sync::LazyLock<crate::payload_codec::PayloadCodecs> =
     std::sync::LazyLock::new(crate::payload_codec::PayloadCodecs::default);
 
 /// Convert in-memory events to insertable rows with sequential event IDs
@@ -498,6 +498,26 @@ pub async fn load_raw_started_carryover(
 
 /// Append a single event to a workflow's history without loading the full log.
 ///
+/// Delegates to [`append_single_event_with_codecs`] under the identity
+/// registry (issue #1243). A payload-bearing call site should use the
+/// `_with_codecs` sibling instead. This wrapper exists for tests that do not
+/// exercise a configured codec.
+///
+/// # Errors
+///
+/// Returns [`crate::error::HarvestError::Database`] if the query or insert fails,
+/// or [`crate::error::HarvestError::NotFound`] if the execution does not exist.
+pub async fn append_single_event(
+    conn: &mut AsyncPgConnection,
+    exec_id: ExecutionId,
+    event: WorkflowEvent,
+) -> HarvestResult<()> {
+    append_single_event_with_codecs(conn, exec_id, event, &DEFAULT_PAYLOAD_CODECS).await
+}
+
+/// [`append_single_event`], encoding payload-bearing fields through `codecs`
+/// (issue #1243).
+///
 /// Acquires a row-level lock on the workflow execution before reading
 /// `MAX(event_id)`, serializing concurrent appenders (management API paths,
 /// timeout enforcement) so they never race to allocate the same event ID.
@@ -508,10 +528,11 @@ pub async fn load_raw_started_carryover(
 ///
 /// Returns [`crate::error::HarvestError::Database`] if the query or insert fails,
 /// or [`crate::error::HarvestError::NotFound`] if the execution does not exist.
-pub async fn append_single_event(
+pub async fn append_single_event_with_codecs(
     conn: &mut AsyncPgConnection,
     exec_id: ExecutionId,
     event: WorkflowEvent,
+    codecs: &crate::payload_codec::PayloadCodecs,
 ) -> HarvestResult<()> {
     use crate::models::WorkflowExecution;
     use crate::schema::harvest_workflow_executions;
@@ -545,7 +566,7 @@ pub async fn append_single_event(
         .map_err(crate::error::database_error)?;
 
     let next_id = max_id.map_or(0, |id| id.saturating_add(1));
-    append_events(conn, exec_id, &[event], next_id).await?;
+    append_events_with_codecs(conn, exec_id, &[event], next_id, codecs).await?;
     Ok(())
 }
 
@@ -667,6 +688,33 @@ pub async fn admit_update_event(
     input: serde_json::Value,
     metrics: Option<&dyn crate::telemetry::MetricsRecorder>,
 ) -> HarvestResult<()> {
+    admit_update_event_with_codecs(
+        conn,
+        exec_id,
+        update_id,
+        name,
+        input,
+        metrics,
+        &DEFAULT_PAYLOAD_CODECS,
+    )
+    .await
+}
+
+/// [`admit_update_event`], encoding `UpdateAdmitted.input` through `codecs`
+/// (issue #1243).
+///
+/// # Errors
+///
+/// Same as [`admit_update_event`].
+pub async fn admit_update_event_with_codecs(
+    conn: &mut AsyncPgConnection,
+    exec_id: ExecutionId,
+    update_id: crate::types::UpdateId,
+    name: String,
+    input: serde_json::Value,
+    metrics: Option<&dyn crate::telemetry::MetricsRecorder>,
+    codecs: &crate::payload_codec::PayloadCodecs,
+) -> HarvestResult<()> {
     use crate::models::WorkflowExecution;
     use crate::schema::harvest_workflow_executions;
     use diesel::dsl::max;
@@ -719,7 +767,7 @@ pub async fn admit_update_event(
                 input,
                 timestamp: chrono::Utc::now(),
             };
-            append_events(conn, exec_id, &[event], next_id).await?;
+            append_events_with_codecs(conn, exec_id, &[event], next_id, codecs).await?;
             Ok((execution.workflow_name, execution.queue_name))
         }),
     )
