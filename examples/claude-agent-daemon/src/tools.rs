@@ -300,15 +300,33 @@ fn resolve(workspace: &Path, relative: &str) -> Result<PathBuf, String> {
 ///
 /// The key is the name AS PRINTED, so the cursor a caller passes back is
 /// exactly a line it read.
+///
+/// A name that is not text is COUNTED and not listed. A filename is bytes on
+/// this platform, and the model can only send a string. Such an entry cannot
+/// be named through this tool at all.
+///
+/// Rendering it with the replacement character would cost twice over. The
+/// name would address no file. Two entries differing only in those bytes
+/// would also collapse into one, and the second would vanish from the walk.
+/// The count says they are there.
 fn list_files(workspace: &Path, relative: &str, after: Option<&str>) -> Result<String, String> {
     let dir = resolve(workspace, relative)?;
     let mut page: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
     let mut more = false;
+    let mut unnamed = 0_usize;
     for entry in std::fs::read_dir(&dir).map_err(|e| format!("cannot list `{relative}`: {e}"))? {
         let entry = entry.map_err(|e| format!("cannot list `{relative}`: {e}"))?;
-        let name = entry.file_name().to_string_lossy().into_owned();
+        let raw = entry.file_name();
+        let Some(name) = raw.to_str() else {
+            unnamed += 1;
+            continue;
+        };
         let is_dir = entry.file_type().is_ok_and(|t| t.is_dir());
-        let shown = if is_dir { format!("{name}/") } else { name };
+        let shown = if is_dir {
+            format!("{name}/")
+        } else {
+            name.to_string()
+        };
         if after.is_some_and(|cursor| shown.as_str() <= cursor) {
             continue;
         }
@@ -325,6 +343,12 @@ fn list_files(workspace: &Path, relative: &str, after: Option<&str>) -> Result<S
         let last = entries.last().cloned().unwrap_or_default();
         entries.push(format!(
             "... more entries; read the next {MAX_ENTRIES} with `after` set to \"{last}\""
+        ));
+    }
+    if unnamed > 0 {
+        entries.push(format!(
+            "... {unnamed} entries are not listed: their names are not text, so this \
+             tool cannot name them"
         ));
     }
     if entries.is_empty() {

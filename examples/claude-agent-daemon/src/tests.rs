@@ -2754,6 +2754,61 @@ fn a_goal_of_unicode_space_is_refused_as_submit_refuses_it() {
     );
 }
 
+/// A name that is not text is counted, and never rendered.
+///
+/// A filename is bytes on this platform and the model can only send a string,
+/// so such an entry cannot be named through this tool. Rendering it with the
+/// replacement character costs twice. The name addresses no file, and two
+/// entries differing only in those bytes collapse into one. The second then
+/// disappears from a walk that claims to reach everything.
+#[test]
+fn a_directory_entry_that_is_not_text_is_counted_and_not_named() {
+    use std::ffi::OsStr;
+    use std::os::unix::ffi::OsStrExt;
+
+    let dir = tempfile::tempdir().expect("a temporary directory");
+    let workspace = dir.path().join("workspace");
+    std::fs::create_dir_all(&workspace).expect("the workspace is created");
+    std::fs::write(workspace.join("good.txt"), "x").expect("a readable name");
+    // Two names that differ ONLY in a byte that is not UTF-8. Lossy rendering
+    // maps both to the same string, and a set keyed on that loses one.
+    for raw in [b"bad\xff.txt".as_slice(), b"bad\xfe.txt".as_slice()] {
+        std::fs::write(workspace.join(OsStr::from_bytes(raw)), "x").expect("a byte name");
+    }
+
+    let body = tools::activity_body(workspace.clone());
+    let raw = body(tool_request(
+        &workspace,
+        tools::TOOL_LIST_FILES,
+        json!({ "path": "." }),
+    ))
+    .expect("a tool failure is a result, not an activity error");
+    let outcome: ToolOutcome = serde_json::from_value(raw).expect("the outcome decodes");
+    assert!(
+        !outcome.is_error,
+        "the listing must succeed: {}",
+        outcome.output
+    );
+
+    assert!(
+        !outcome.output.contains('\u{fffd}'),
+        "a name that is not text must never be rendered: {}",
+        outcome.output
+    );
+    assert!(
+        outcome.output.lines().any(|line| line == "good.txt"),
+        "a readable name is still listed: {}",
+        outcome.output
+    );
+    // BOTH are accounted for. A lossy rendering would have collapsed them
+    // into one line and reported nothing missing.
+    assert!(
+        outcome.output.contains("2 entries are not listed"),
+        "both unnameable entries must be counted: {}",
+        outcome.output
+    );
+}
+
 /// A capped directory listing reaches every entry.
 ///
 /// `read_dir` gives no order, so a truncated READ returns an arbitrary subset
