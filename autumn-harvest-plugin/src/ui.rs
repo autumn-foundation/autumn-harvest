@@ -11458,9 +11458,7 @@ mod tests {
 
     #[test]
     fn parse_event_page_query_field_rejects_i64_overflow() {
-        assert!(
-            parse_event_page_query_field("event_page", Some("99999999999999999999")).is_err()
-        );
+        assert!(parse_event_page_query_field("event_page", Some("99999999999999999999")).is_err());
     }
 
     #[test]

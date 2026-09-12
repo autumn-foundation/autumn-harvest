@@ -5056,8 +5056,11 @@ async fn detail_page_invalid_jump_event_renders_page_with_flash_instead_of_abort
         insert_workflow_on_url(&database_url, ShardId::new(0), "jump_wf2", "jump-2").await;
 
     let app = build_single_shard_ui_app(&database_url);
-    let (status, html) =
-        fetch_html(&app, &format!("/workflows/{exec_id}?jump_event=not-a-number")).await;
+    let (status, html) = fetch_html(
+        &app,
+        &format!("/workflows/{exec_id}?jump_event=not-a-number"),
+    )
+    .await;
     assert_eq!(
         status,
         StatusCode::OK,
