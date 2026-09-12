@@ -210,8 +210,8 @@ is ever approved sight unseen.
   trimming its result, so neither one huge file nor one huge directory can take
   the daemon down. A write lands
   atomically, through a scratch file renamed over the target, with the file and
-  every directory the write created flushed, so an approved file is never left
-  half-written and the replacement survives a host crash. It keeps the mode of
+  every directory from there up to the workspace root flushed, so an approved
+  file is never left half-written and the replacement survives a host crash. It keeps the mode of
   the file it replaces — a content change is not a permission change. A file the agent
   creates starts `0600`. `write_file` is the one tool the workflow gates on
   approval.

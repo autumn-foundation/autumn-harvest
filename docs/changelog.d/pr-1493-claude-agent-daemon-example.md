@@ -36,8 +36,8 @@ history rather than daemon state.
   turn and the tool-use id, and the daemon requires that whole name as the
   approval token, so a decision releases only the wait the operator read.
 - A write lands whole or not at all: a scratch file on a unique name, given the
-  target's mode, with the file and every directory the write created flushed
-  before the rename is reported as done.
+  target's mode, with the file and every directory up to the workspace root
+  flushed before the rename is reported as done.
 
 **The daemon is the single writer** (`src/daemon.rs`): a Unix-socket control
 surface, a drive tick in place of `LISTEN`/`NOTIFY`, and a second READ-ONLY

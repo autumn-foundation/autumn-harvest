@@ -1171,50 +1171,47 @@ fn a_turn_whose_tool_calls_share_an_id_is_refused() {
 }
 
 #[test]
-fn a_write_flushes_every_directory_it_creates() {
+fn a_write_flushes_the_whole_chain_below_the_workspace() {
     let dir = tempfile::tempdir().expect("a temporary directory");
-    let workspace = dir.path().to_path_buf();
-    let target = workspace.join("notes/day/1/log.md");
+    let workspace = dir.path().join("workspace");
+    std::fs::create_dir_all(&workspace).expect("the workspace is created");
+    let root = workspace.canonicalize().expect("the workspace resolves");
+    let target = root.join("notes/day/1/log.md");
+    let chain = vec![
+        root.join("notes/day/1"),
+        root.join("notes/day"),
+        root.join("notes"),
+        root.clone(),
+    ];
 
-    // The write creates three directories. Each is named by an entry in its own
-    // parent, so each parent has to be flushed.
-    let created = tools::create_parents(target.parent().expect("the target has a parent"))
-        .expect("the parents are created");
+    // Each directory between the target and the root can hold an entry this
+    // write created. An entry is durable only once its own directory is
+    // flushed.
     assert_eq!(
-        created,
-        vec![
-            workspace.join("notes"),
-            workspace.join("notes/day"),
-            workspace.join("notes/day/1"),
-        ],
-        "the list must name every directory the write created, shallowest first"
-    );
-    assert_eq!(
-        tools::directories_to_flush(&target, &created),
-        vec![
-            workspace.join("notes/day/1"),
-            workspace.join("notes/day"),
-            workspace.join("notes"),
-            workspace.clone(),
-        ],
-        "every directory that gained an entry must be flushed, deepest first"
+        tools::directories_to_flush(&target, &workspace),
+        chain,
+        "the flush must run from the target's directory up to the root"
     );
 
-    // A second write into the same place creates nothing, so only the target's
-    // own parent gained an entry.
-    let again = tools::create_parents(target.parent().expect("the target has a parent"))
-        .expect("the parents already exist");
-    assert!(
-        again.is_empty(),
-        "a directory that already exists was not created here: {again:?}"
-    );
+    // The same list after the directories already exist. Activity execution is
+    // at-least-once, so a retry can find the directories a crashed attempt
+    // created and never flushed. A list built from this attempt's own
+    // creations would name nothing.
+    std::fs::create_dir_all(target.parent().expect("a parent")).expect("the chain exists");
     assert_eq!(
-        tools::directories_to_flush(&target, &again),
-        vec![workspace.join("notes/day/1")],
-        "an unchanged directory must not be flushed"
+        tools::directories_to_flush(&target, &workspace),
+        chain,
+        "a retry must flush the chain it did not create"
     );
 
-    // The real path writes the nested file, and lands the content.
+    // A target in the root itself flushes the root, and nothing above it.
+    assert_eq!(
+        tools::directories_to_flush(&root.join("notes.md"), &workspace),
+        vec![root.clone()],
+        "the walk must stop at the workspace"
+    );
+
+    // The real path still writes the nested file and lands the content.
     let body = tools::activity_body(workspace.clone());
     let raw = body(tool_request(
         &workspace,
@@ -1229,8 +1226,7 @@ fn a_write_flushes_every_directory_it_creates() {
         outcome.output
     );
     assert_eq!(
-        std::fs::read_to_string(workspace.join("deep/er/still/notes.md"))
-            .expect("the nested file exists"),
+        std::fs::read_to_string(root.join("deep/er/still/notes.md")).expect("the file exists"),
         "hello"
     );
 }
