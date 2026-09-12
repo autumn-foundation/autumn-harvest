@@ -230,13 +230,14 @@ fn call_api(
 
     let reply = parse_reply(&payload);
     // An approval is addressed by tool-use id, so a blank or repeated id would
-    // let one decision release a call the operator never saw. The API mints
-    // unique ids; a response that does not is malformed, and it is refused
-    // before it can reach the gate.
+    // let one decision release a call the operator never saw. An id carrying
+    // whitespace cannot be copied out of the printed approve command. The API
+    // mints unique, quotable ids. A response that does not is malformed, and
+    // it is refused before it can reach the gate.
     if !has_addressable_calls(&reply) {
         return Err(body_failure(
             status,
-            "its tool calls carried a blank or repeated id",
+            "its tool calls carried a blank, repeated, or unquotable id",
         ));
     }
     // A turn cannot both end and ask for a tool. The pair is malformed, and it
@@ -348,12 +349,21 @@ pub fn is_message(payload: &Value) -> bool {
 /// The approval gate names a call by its tool-use id, so each id must be
 /// present and unique within the turn. Without that, one approval could
 /// release a different call with the same id and a payload nobody read.
+///
+/// The id must also survive a copy. It becomes part of the approval token,
+/// and the status view prints that token unquoted in an `agentd approve`
+/// command line. A shell drops a trailing space and splits an inner one, so
+/// an id that carries whitespace gives an operator a command that cannot
+/// work. The decision would never match the staged name, and the call would
+/// stay blocked until its deadline. Such an id is refused here instead,
+/// before the session parks on it.
 pub fn has_addressable_calls(reply: &TurnReply) -> bool {
     let mut seen = std::collections::HashSet::with_capacity(reply.tool_calls.len());
-    reply
-        .tool_calls
-        .iter()
-        .all(|call| !call.id.is_empty() && seen.insert(call.id.as_str()))
+    reply.tool_calls.iter().all(|call| {
+        !call.id.is_empty()
+            && !call.id.chars().any(char::is_whitespace)
+            && seen.insert(call.id.as_str())
+    })
 }
 
 /// Does the stop reason agree with the content?

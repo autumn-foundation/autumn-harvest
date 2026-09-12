@@ -1440,6 +1440,25 @@ fn a_turn_whose_tool_calls_share_an_id_is_refused() {
         claude::has_addressable_calls(&reply(Vec::new())),
         "a turn with no tool calls has nothing to address"
     );
+
+    // The id becomes part of the approval token, and the status view prints
+    // that token unquoted in an `agentd approve` command line. An operator
+    // copies that line. A shell drops a trailing space and splits an inner
+    // one, so the copied token no longer matches the staged name. The write
+    // then stays blocked until its deadline, with no sign of why.
+    for mangled in [" ", "\t", "toolu_a ", " toolu_a", "toolu a"] {
+        assert!(
+            !claude::has_addressable_calls(&reply(vec![call(mangled)])),
+            "an id a shell would mangle must be refused: {mangled:?}"
+        );
+    }
+
+    // An accepted id therefore always yields a token that survives a copy.
+    let token = session::approval_signal(1, 0, "toolu_a");
+    assert!(
+        !token.chars().any(char::is_whitespace),
+        "an accepted id must give a token with no whitespace: {token:?}"
+    );
 }
 
 #[test]
