@@ -426,6 +426,10 @@ pub fn classify_export_outcome(
 pub enum RewindOutcome {
     /// The cursor moves backwards from `from` to `to`; every record with
     /// `seq > to` re-exports.
+    ///
+    /// Not every record in `(to, from]` is guaranteed to still exist. Retention
+    /// can purge part of that window first — see
+    /// [`count_redrive_recoverable`] (issue #1267).
     Rewound { from: i64, to: i64 },
     /// Nothing to do — the request did not move the cursor backwards.
     NoOp { cursor: i64, requested: i64 },
@@ -1731,6 +1735,38 @@ pub async fn rewind_cursor_locked(
             Ok(outcome)
         }
     }
+}
+
+/// Rows still present that a [`RewindOutcome::Rewound`] window can actually
+/// redeliver.
+///
+/// Counts `harvest_audit_log` rows with `to < export_seq <= from`. A retention
+/// sweep does not take the cursor row's `FOR UPDATE` lock (issue #1267), so it
+/// can read the pre-rewind cursor and purge part of this window before the
+/// rewind commits a lower one. `from - to` is the count the redrive was asked
+/// for; this function is the count it can actually deliver. A caller compares
+/// the two to report a gap instead of a recovery the database cannot back up.
+///
+/// # Errors
+/// Returns `HarvestError` on a database failure.
+#[cfg(feature = "db")]
+pub async fn count_redrive_recoverable(
+    conn: &mut diesel_async::AsyncPgConnection,
+    from: i64,
+    to: i64,
+) -> crate::error::HarvestResult<i64> {
+    use diesel::prelude::*;
+    use diesel_async::RunQueryDsl;
+
+    use crate::schema::harvest_audit_log::dsl as log;
+
+    log::harvest_audit_log
+        .filter(log::export_seq.gt(to))
+        .filter(log::export_seq.le(from))
+        .count()
+        .get_result(conn)
+        .await
+        .map_err(crate::error::database_error)
 }
 
 // ---------------------------------------------------------------------

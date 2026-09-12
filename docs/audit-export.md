@@ -422,9 +422,19 @@ Three properties worth knowing:
   moved, and the trail must not say otherwise.
 - **It invalidates in-flight deliveries.** The rewind bumps the shard's claim
   epoch, so a batch already in flight cannot acknowledge over it.
+- **The response says what it can actually deliver, not just what you asked
+  for** (issue #1267). Retention does not take the cursor row's lock, so a
+  sweep can read the cursor before this redrive rewinds it and purge part of
+  the window the redrive is about to promise back. The `200` response carries
+  `recoverable_records` — records in `(to, from]` that still exist, counted
+  in the same transaction as the rewind — and `already_purged_records`, the
+  rest of that window, gone before this redrive could reach it.
+  `already_purged_records` is `0` on the common path, where nothing raced the
+  rewind.
 
 Only records still present in the audit table can be re-exported; a redrive
-past the retention window returns whatever survives.
+past the retention window returns whatever survives, and
+`already_purged_records` in the response says how much that was.
 
 ---
 
