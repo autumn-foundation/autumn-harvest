@@ -69,9 +69,11 @@ use std::sync::{Arc, LazyLock};
 use autumn_harvest::completion_trigger::{
     GLOBAL_WORKFLOW_METADATA, WorkflowMetadata, enforce_completion_triggers_outbox,
 };
+use autumn_harvest::debounce::DebounceStartOptions;
 use autumn_harvest::dlq::{NewDeadLetterEntry, dead_letter};
 use autumn_harvest::error::{HarvestError, HarvestResult, PayloadKind};
 use autumn_harvest::event::WorkflowEvent;
+use autumn_harvest::event_batch::{AdmitBatchParams, admit_batched_start};
 use autumn_harvest::execution::{StartWorkflowParams, start_or_load_workflow_execution};
 use autumn_harvest::info::{ActivityHandlerFn, ActivityInfo, WorkflowHandlerFn};
 use autumn_harvest::models::{
@@ -662,6 +664,170 @@ async fn unresolvable_key_fails_open() {
     for _ in 0..5 {
         start_ok(&mut conn, wf, serde_json::json!({"other_field": 1})).await;
     }
+}
+
+// ---------------------------------------------------------------------------
+// Batched-start quota key resolution (issue #1230 Finding 1)
+// ---------------------------------------------------------------------------
+
+/// Admit one payload into a batch, sharing `batch_key` and `workflow_id`
+/// across calls so repeated admissions collapse into one pending row.
+async fn admit_batch(
+    conn: &mut AsyncPgConnection,
+    workflow_name: &str,
+    batch_key: &str,
+    workflow_id: &str,
+    payload: serde_json::Value,
+    max_size: usize,
+) -> autumn_harvest::event_batch::BatchAdmitOutcome {
+    let params = AdmitBatchParams {
+        workflow_name: workflow_name.to_string(),
+        batch_key: batch_key.to_string(),
+        workflow_id: workflow_id.to_string(),
+        queue_name: "default".to_string(),
+        payload,
+        start_options: DebounceStartOptions::default(),
+        max_wait: std::time::Duration::from_secs(3600),
+        max_size,
+        shard_id: 0,
+    };
+    admit_batched_start(conn, params, None)
+        .await
+        .expect("admission must not error")
+        .expect("admission must return an outcome")
+        .0
+}
+
+#[tokio::test]
+async fn batched_start_at_max_size_stamps_quota_key_from_first_admission() {
+    let (url, _c) = setup_test_database_url_or_env().await;
+    let mut conn = connect(&url).await;
+
+    let wf = leaked("quota_batched_start");
+    let policy = QuotaPolicy::new("tenant_id").with_max_active_executions(100);
+    let _guard = MetadataGuard::install_one(wf, policy).await;
+
+    let batch_key = format!("batch-{}", Uuid::new_v4().simple());
+    let workflow_id = format!("wid-{}", Uuid::new_v4().simple());
+
+    // Admission 1 of 2: below `max_size`, buffered but not fired.
+    let first = admit_batch(
+        &mut conn,
+        wf,
+        &batch_key,
+        &workflow_id,
+        serde_json::json!({"tenant_id": "acme"}),
+        2,
+    )
+    .await;
+    assert!(!first.is_flushed);
+
+    // Admission 2 of 2 reaches `max_size` and fires SYNCHRONOUSLY inside
+    // this call. `event_batch.rs` merges both admissions' payloads into
+    // one JSON ARRAY. It passes that array as the fired execution's
+    // `input` -- the exact shape issue #1230 Finding 1 describes.
+    let second = admit_batch(
+        &mut conn,
+        wf,
+        &batch_key,
+        &workflow_id,
+        serde_json::json!({"tenant_id": "someone_else"}),
+        2,
+    )
+    .await;
+    assert!(second.is_flushed);
+
+    // Before the fix, `resolve_quota_key` required an object at the first
+    // path segment. It returned `None` for this array `input` -- silently
+    // bypassing all three quota dimensions and leaving `quota_key = NULL`
+    // on the fired row. `active_count` below reads 0 regardless of tenant
+    // in that case. The fix resolves against the FIRST admission's
+    // payload, so the batch's charge lands on "acme".
+    assert_eq!(
+        active_count(&mut conn, wf, "acme").await,
+        1,
+        "the first-admitted payload's tenant_id must be the fired batch's \
+         resolved quota key (issue #1230 Finding 1)"
+    );
+    assert_eq!(
+        active_count(&mut conn, wf, "someone_else").await,
+        0,
+        "the second admission's tenant_id must NOT be picked up -- \
+         first-admission-wins, matching harvest_event_batches' own rule for \
+         every other captured start option"
+    );
+}
+
+#[tokio::test]
+async fn batched_start_over_cap_is_rejected_at_fire_time() {
+    let (url, _c) = setup_test_database_url_or_env().await;
+    let mut conn = connect(&url).await;
+
+    let wf = leaked("quota_batched_start_over_cap");
+    let policy = QuotaPolicy::new("tenant_id").with_max_active_executions(1);
+    let _guard = MetadataGuard::install_one(wf, policy).await;
+
+    // Fill the cap of 1 with a direct (non-batched) start for the same key.
+    start_ok(&mut conn, wf, serde_json::json!({"tenant_id": "acme"})).await;
+    assert_eq!(active_count(&mut conn, wf, "acme").await, 1);
+
+    // A batched start for the SAME tenant, flushed at max_size, must now
+    // observe the cap. Before the fix this was unreachable. The fired
+    // batch's `quota_key` always resolved to `None`, so
+    // `enforce_quota_admission` returned `Ok(())` unconditionally. The
+    // batch fired regardless of the tenant's already-exhausted cap.
+    let batch_key = format!("batch-{}", Uuid::new_v4().simple());
+    let workflow_id = format!("wid-{}", Uuid::new_v4().simple());
+    admit_batch(
+        &mut conn,
+        wf,
+        &batch_key,
+        &workflow_id,
+        serde_json::json!({"tenant_id": "acme"}),
+        2,
+    )
+    .await;
+
+    // The second admission reaches `max_size` and attempts the SYNCHRONOUS
+    // in-request flush. `admit_batched_start` has no dedicated
+    // `QuotaExceeded` catch, unlike the scanner's `fire_claimed_batch_row`,
+    // which re-defers. It propagates the rejection as an `Err` instead,
+    // rolling back the whole admission transaction, batch row included.
+    // That transactional propagation is pre-existing, correct behavior: an
+    // in-request caller gets an authoritative rejection, not a silent
+    // buffer into a batch that can never fire. This test's job is only to
+    // prove the cap is observed at all. It could not be observed before
+    // the fix, since `quota_key` always resolved to `None` for a batched
+    // fire.
+    let params = AdmitBatchParams {
+        workflow_name: wf.to_string(),
+        batch_key: batch_key.clone(),
+        workflow_id: workflow_id.clone(),
+        queue_name: "default".to_string(),
+        payload: serde_json::json!({"tenant_id": "acme"}),
+        start_options: DebounceStartOptions::default(),
+        max_wait: std::time::Duration::from_secs(3600),
+        max_size: 2,
+        shard_id: 0,
+    };
+    let err = admit_batched_start(&mut conn, params, None)
+        .await
+        .expect_err("the tenant's cap of 1 is already exhausted");
+    assert!(
+        matches!(
+            err,
+            HarvestError::QuotaExceeded {
+                resource: QuotaResource::ActiveExecutions,
+                ..
+            }
+        ),
+        "expected QuotaExceeded, got {err:?}"
+    );
+    assert_eq!(
+        active_count(&mut conn, wf, "acme").await,
+        1,
+        "the batch must not be admitted on top of an already-exhausted cap"
+    );
 }
 
 // ---------------------------------------------------------------------------

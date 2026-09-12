@@ -1,0 +1,33 @@
+-- EXPLAIN (ANALYZE, BUFFERS, VERBOSE, SETTINGS) for the per-row
+-- resolve_target_queue lookup enforce_completion_triggers_outbox issues once
+-- per outbox row lacking an explicit queue_name (before the batching fix).
+-- Captured against a 303-row harvest_schedules fixture (300 unrelated DAG
+-- rows + 3 workflow-kind rows), same shape as the n=50 headline sweep point.
+-- Postgres 16.13. SETTINGS requested; no non-default planner-relevant
+-- parameter to report, hence no "Settings:" line below.
+--
+--     psql -c "EXPLAIN (ANALYZE, BUFFERS, VERBOSE, SETTINGS)
+--       SELECT \"harvest_schedules\".\"queue_name\" FROM \"harvest_schedules\"
+--       WHERE (\"harvest_schedules\".\"workflow_name\" = '<name>') LIMIT 1;"
+--
+-- Already an index scan (harvest_schedules_workflow_name_unique) at 2
+-- execution buffers -- this fix is a calls claim, not a per-call buffers
+-- claim: the point is that 50 rows pay this cost 50 times over instead of
+-- once. See docs/performance-completion-trigger-outbox-queue.md.
+
+                                                                               QUERY PLAN
+------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+ Limit  (cost=0.15..8.17 rows=1 width=27) (actual time=0.017..0.018 rows=1 loops=1)
+   Output: queue_name
+   Buffers: shared hit=2
+   ->  Index Scan using harvest_schedules_workflow_name_unique on public.harvest_schedules  (cost=0.15..8.17 rows=1 width=27) (actual time=0.016..0.016 rows=1 loops=1)
+         Output: queue_name
+         Index Cond: (harvest_schedules.workflow_name = 'outbox_perf_wf_0_ba15ab7834b146129f21e49107bd765a'::text)
+         Buffers: shared hit=2
+ Query Identifier: 2275511960989452955
+ Planning:
+   Buffers: shared hit=150
+ Planning Time: 0.538 ms
+ Execution Time: 0.041 ms
+(12 rows)
+

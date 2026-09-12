@@ -5991,8 +5991,7 @@ pub fn claim_eligible_workers(
                 return false;
             }
             reqs.as_ref().is_none_or(|reqs| {
-                let labels: std::collections::HashMap<String, String> =
-                    serde_json::from_value(w.labels.clone()).unwrap_or_default();
+                let labels = crate::payload_codec::string_valued_labels(&w.labels);
                 crate::eligibility::matches_requirements(reqs, &labels)
             })
         })
@@ -7625,16 +7624,19 @@ pub async fn persist_workflow_completion(
             .await?;
             update_workflow_execution_completed(conn, exec_id, worker_id, &output).await?;
             queue::complete_task(conn, task_id, output).await?;
-            let (mut deferred, closed_children) = apply_parent_close_cascade(conn, exec_id).await?;
+            let (mut deferred, closed_children) =
+                apply_parent_close_cascade(conn, exec_id, codecs).await?;
             let mut tx_cancel_metrics = Vec::new();
-            let triggers = crate::completion_trigger::evaluate_triggers_for_execution_collecting(
-                conn,
-                exec_id,
-                crate::completion_trigger::TerminalState::Completed,
-                metrics,
-                &mut tx_cancel_metrics,
-            )
-            .await?;
+            let triggers =
+                crate::completion_trigger::evaluate_triggers_for_execution_collecting_with_codecs(
+                    conn,
+                    exec_id,
+                    crate::completion_trigger::TerminalState::Completed,
+                    metrics,
+                    &mut tx_cancel_metrics,
+                    codecs,
+                )
+                .await?;
             deferred.extend(triggers);
             Ok((deferred, closed_children, tx_cancel_metrics))
         }))
@@ -7927,7 +7929,7 @@ pub async fn persist_workflow_failure(
                     started_by: exec_ref.started_by.as_deref(),
                 };
 
-                match crate::execution::start_or_load_workflow_execution_collect(
+                match crate::execution::start_or_load_workflow_execution_collect_with_codecs(
                     conn,
                     retry_params,
                     true,
@@ -7936,6 +7938,7 @@ pub async fn persist_workflow_failure(
                     // Workflow-level retry (#523) is in-flight continuation of an
                     // existing logical run, not a fresh admission — never gated.
                     None,
+                    codecs,
                 )
                 .await
                 {
@@ -7986,16 +7989,17 @@ pub async fn persist_workflow_failure(
 
             let mut tx_cancel_metrics = Vec::new();
             if !retry_committed {
-                let (cascade, closed_children) = apply_parent_close_cascade(conn, exec_id).await?;
+                let (cascade, closed_children) = apply_parent_close_cascade(conn, exec_id, codecs).await?;
                 deferred.extend(cascade);
                 deferred_checks.extend(closed_children);
                 let triggers =
-                    crate::completion_trigger::evaluate_triggers_for_execution_collecting(
+                    crate::completion_trigger::evaluate_triggers_for_execution_collecting_with_codecs(
                         conn,
                         exec_id,
                         crate::completion_trigger::TerminalState::Failed,
                         metrics,
                         &mut tx_cancel_metrics,
+                    codecs,
                     )
                     .await?;
                 deferred.extend(triggers);
@@ -9087,7 +9091,10 @@ async fn persist_activity_wait_park(
             plan_timer_lifecycle(conn, exec_id, commands).await?;
         let marker_events = pre_suspension_events_from_commands(commands, &mut timer_events);
         for event in marker_events {
-            store::append_single_event(conn, exec_id, event).await?;
+            // Issue #1243: a marker/side-effect/detached-child-spawn event
+            // here can carry `details`/`value`/`input`, all payload-bearing.
+            store::append_single_event_with_codecs(conn, exec_id, event, registry.payload_codecs())
+                .await?;
         }
         detached_spawns.persist(conn, commands).await?;
 
@@ -10175,7 +10182,14 @@ async fn persist_all_started_child_workflows(
         let parent_events: Vec<WorkflowEvent> =
             all_events_by_pos.into_iter().map(|(_, e)| e).collect();
         for event in parent_events {
-            store::append_single_event(conn, parent_exec_id, event).await?;
+            // Issue #1243: `ChildWorkflowStarted.input` is payload-bearing.
+            store::append_single_event_with_codecs(
+                conn,
+                parent_exec_id,
+                event,
+                registry.payload_codecs(),
+            )
+            .await?;
         }
         create_detached_child_executions(conn, registry, parent_execution, commands, &execute_span)
             .await?;
@@ -11074,7 +11088,15 @@ async fn persist_child_timeout_race(
                 _ => None,
             });
             for event in events {
-                store::append_single_event(conn, parent_exec_id, event).await?;
+                // Issue #1243: a raced `ChildWorkflowStarted.input` is
+                // payload-bearing.
+                store::append_single_event_with_codecs(
+                    conn,
+                    parent_exec_id,
+                    event,
+                    registry.payload_codecs(),
+                )
+                .await?;
             }
 
             // Defensive: a suspension batch never carries CancelRaceLosers in
@@ -12511,11 +12533,44 @@ pub fn parent_is_on_another_shard(parent: ExecutionId, child: ExecutionId) -> bo
     child_shard != parent_shard
 }
 
+/// Append `ChildWorkflowCompleted` and wake the parent's workflow task.
+///
+/// Delegates to [`wake_parent_for_child_completion_with_codecs`] under the
+/// identity registry (issue #1243 review, P2). A payload-bearing call site
+/// should use the `_with_codecs` sibling instead. This wrapper keeps the
+/// pre-#1243 public signature for an out-of-tree caller.
+///
+/// # Errors
+///
+/// Same as [`wake_parent_for_child_completion_with_codecs`].
 pub async fn wake_parent_for_child_completion(
     conn: &mut AsyncPgConnection,
     parent_exec_id: ExecutionId,
     child_exec_id: ExecutionId,
     output: serde_json::Value,
+) -> HarvestResult<()> {
+    wake_parent_for_child_completion_with_codecs(
+        conn,
+        parent_exec_id,
+        child_exec_id,
+        output,
+        &crate::store::DEFAULT_PAYLOAD_CODECS,
+    )
+    .await
+}
+
+/// [`wake_parent_for_child_completion`], encoding
+/// `ChildWorkflowCompleted.output` through `codecs` (issue #1243).
+///
+/// # Errors
+///
+/// Same as [`wake_parent_for_child_completion`].
+pub async fn wake_parent_for_child_completion_with_codecs(
+    conn: &mut AsyncPgConnection,
+    parent_exec_id: ExecutionId,
+    child_exec_id: ExecutionId,
+    output: serde_json::Value,
+    codecs: &crate::payload_codec::PayloadCodecs,
 ) -> HarvestResult<()> {
     // Issue #956: a cross-shard parent is not on this connection. Appending to it
     // here would return `NotFound` and roll back the CHILD's terminal
@@ -12542,7 +12597,7 @@ pub async fn wake_parent_for_child_completion(
         child_id: child_exec_id,
         output,
     };
-    store::append_single_event(conn, parent_exec_id, event).await?;
+    store::append_single_event_with_codecs(conn, parent_exec_id, event, codecs).await?;
     queue::wake_workflow_task(conn, parent_exec_id).await
 }
 
@@ -12552,6 +12607,8 @@ pub async fn wake_parent_for_child_failure(
     parent_exec_id: ExecutionId,
     child_exec_id: ExecutionId,
     error: &str,
+    // Issue #1243: a typed `ChildWorkflowFailed.details` is payload-bearing.
+    codecs: &crate::payload_codec::PayloadCodecs,
 ) -> HarvestResult<()> {
     // Issue #956: same cross-shard guard as `wake_parent_for_child_completion` —
     // the parent is not on this connection, and appending here would roll back
@@ -12574,7 +12631,7 @@ pub async fn wake_parent_for_child_failure(
     // which decode to all-None typed fields (legacy behaviour preserved).
     let decoded = crate::failure::decode_workflow_failure(error);
     let event = WorkflowEvent::child_workflow_failed_typed(child_exec_id, &decoded);
-    store::append_single_event(conn, parent_exec_id, event).await?;
+    store::append_single_event_with_codecs(conn, parent_exec_id, event, codecs).await?;
     queue::wake_workflow_task(conn, parent_exec_id).await
 }
 
@@ -12614,18 +12671,28 @@ pub async fn persist_child_workflow_completion(
                 .await?;
             update_workflow_execution_completed(conn, exec_id, worker_id, &output).await?;
             queue::complete_task(conn, task_id, output.clone()).await?;
-            let (mut deferred, closed_children) = apply_parent_close_cascade(conn, exec_id).await?;
+            let (mut deferred, closed_children) =
+                apply_parent_close_cascade(conn, exec_id, codecs).await?;
             let mut tx_cancel_metrics = Vec::new();
-            let triggers = crate::completion_trigger::evaluate_triggers_for_execution_collecting(
+            let triggers =
+                crate::completion_trigger::evaluate_triggers_for_execution_collecting_with_codecs(
+                    conn,
+                    exec_id,
+                    crate::completion_trigger::TerminalState::Completed,
+                    metrics,
+                    &mut tx_cancel_metrics,
+                    codecs,
+                )
+                .await?;
+            deferred.extend(triggers);
+            wake_parent_for_child_completion_with_codecs(
                 conn,
+                parent_exec_id,
                 exec_id,
-                crate::completion_trigger::TerminalState::Completed,
-                metrics,
-                &mut tx_cancel_metrics,
+                output,
+                codecs,
             )
             .await?;
-            deferred.extend(triggers);
-            wake_parent_for_child_completion(conn, parent_exec_id, exec_id, output).await?;
             Ok((deferred, closed_children, tx_cancel_metrics))
         }))
         .await?;
@@ -12694,18 +12761,22 @@ pub async fn persist_child_workflow_failure(
             update_workflow_execution_failed(conn, exec_id, worker_id, &message, nd_details)
                 .await?;
             queue::fail_task(conn, task_id, &message).await?;
-            let (mut deferred, closed_children) = apply_parent_close_cascade(conn, exec_id).await?;
+            let (mut deferred, closed_children) =
+                apply_parent_close_cascade(conn, exec_id, codecs).await?;
             let mut tx_cancel_metrics = Vec::new();
-            let triggers = crate::completion_trigger::evaluate_triggers_for_execution_collecting(
-                conn,
-                exec_id,
-                crate::completion_trigger::TerminalState::Failed,
-                metrics,
-                &mut tx_cancel_metrics,
-            )
-            .await?;
+            let triggers =
+                crate::completion_trigger::evaluate_triggers_for_execution_collecting_with_codecs(
+                    conn,
+                    exec_id,
+                    crate::completion_trigger::TerminalState::Failed,
+                    metrics,
+                    &mut tx_cancel_metrics,
+                    codecs,
+                )
+                .await?;
             deferred.extend(triggers);
-            wake_parent_for_child_failure(conn, parent_exec_id, exec_id, &raw_error).await?;
+            wake_parent_for_child_failure(conn, parent_exec_id, exec_id, &raw_error, codecs)
+                .await?;
             Ok((deferred, closed_children, tx_cancel_metrics))
         }))
         .await?;
@@ -12935,9 +13006,10 @@ async fn create_detached_child_executions(
         // execution.rs: INSERT -> enforce_quota_admission -> append event). A
         // `QuotaExceeded` here rolls back the whole enclosing transaction
         // (nothing durable was created) and propagates via `?` to whichever
-        // caller-side recovery point applies -- `recover_from_child_quota_
-        // exceeded` parks the PARENT's task and wakes it, rather than
-        // terminally failing it over the CHILD's tenant quota.
+        // caller-side recovery point applies. `recover_from_child_quota_
+        // exceeded` (issue #1227) defers the PARENT with a bounded jittered
+        // backoff, rather than terminally failing it over the CHILD's tenant
+        // quota.
         crate::execution::enforce_quota_admission(
             conn,
             detached_quota,
@@ -14541,7 +14613,9 @@ async fn persist_scheduled_external_activity(
                 plan_timer_lifecycle(conn, exec_id, commands).await?;
             let marker_events = pre_suspension_events_from_commands(commands, &mut timer_events);
             for event in marker_events {
-                store::append_single_event(conn, exec_id, event).await?;
+                // Issue #1243: a marker/side-effect/detached-child-spawn
+                // event here can carry `details`/`value`/`input`.
+                store::append_single_event_with_codecs(conn, exec_id, event, codecs).await?;
             }
             detached_spawns.persist(conn, commands).await?;
 
@@ -16950,7 +17024,7 @@ pub async fn persist_workflow_continue_as_new(
     input: serde_json::Value,
     new_workflow_type: Option<String>,
 ) -> HarvestResult<bool> {
-    use crate::schema::{harvest_signals, harvest_workflow_executions};
+    use crate::schema::{harvest_events, harvest_signals, harvest_workflow_executions};
 
     let offloader = registry.payload_offloader();
 
@@ -17042,7 +17116,20 @@ pub async fn persist_workflow_continue_as_new(
     let carried_lcr_ref = raw_carryover
         .as_ref()
         .and_then(crate::payload_store::extract_offload_ref);
-    let carryover_for_event = raw_carryover.or_else(|| persistence.carryover_result.clone());
+    // Issue #1243 review (P1): the generic codec boundary stays
+    // unconditional for every ordinary payload field. An offload reference
+    // is patched into the successor raw, after the write below. It never
+    // goes through `encode_payload`. `raw_carryover` is otherwise the
+    // STORED representation, a codec envelope under a real codec.
+    // `decode_payload` passes a non-codec value through unchanged, an
+    // offload reference included. So it only unwraps an inline codec
+    // envelope. That is exactly the case that needs one decode before the
+    // successor's write re-encodes it once.
+    let decoded_carryover = raw_carryover
+        .clone()
+        .map(|value| registry.payload_codecs().decode_payload(&value))
+        .transpose()?;
+    let carryover_for_event = decoded_carryover.or_else(|| persistence.carryover_result.clone());
 
     // The new execution stays on the same shard so all of its event log,
     // queue rows, timers, and signals continue to live in the same Postgres
@@ -17069,7 +17156,15 @@ pub async fn persist_workflow_continue_as_new(
         // Preserve scheduled carryover across the fork (issue #488): the continuation is
         // the same logical scheduled run, so it must see the same frozen values rather
         // than re-resolving (which could pick up a newer sibling fire's output).
-        last_completion_result: carryover_for_event,
+        //
+        // Issue #1243 review (P1): an offloaded carryover (`carried_lcr_ref`
+        // is `Some`) is patched in raw after this event is written, bypassing
+        // the codec. `None` here is only a placeholder for that case.
+        last_completion_result: if carried_lcr_ref.is_some() {
+            None
+        } else {
+            carryover_for_event
+        },
         last_error: persistence.carryover_error.clone(),
         // Preserve the nominal scheduled slot across the fork (issue #508): a continued
         // run is the same logical scheduled run and must see the same slot. The row
@@ -17352,6 +17447,34 @@ pub async fn persist_workflow_continue_as_new(
         // blob survives until the successor is also retained (issue #524).
         if let Some(ref carried) = carried_lcr_ref {
             store::insert_payload_refs(conn, new_exec_id, std::slice::from_ref(carried)).await?;
+            // Issue #1243 review (P1): patch the offload reference into the
+            // row the write above just inserted with a `None` placeholder.
+            // This never goes through `encode_payload` -- the reference is
+            // a blob pointer, not ciphertext, and it must reach storage
+            // byte-identical to the predecessor's copy. Mirrors the raw
+            // `event_data` patch `erase.rs` uses for the same reason.
+            let raw_value = raw_carryover.clone().expect(
+                "carried_lcr_ref is Some only when raw_carryover parsed as an offload envelope",
+            );
+            let mut event_data: serde_json::Value = harvest_events::table
+                .filter(harvest_events::workflow_exec_id.eq(new_exec_id.as_uuid()))
+                .filter(harvest_events::event_id.eq(0))
+                .select(harvest_events::event_data)
+                .first(conn)
+                .await
+                .map_err(crate::error::database_error)?;
+            if let Some(data) = event_data.get_mut("data") {
+                data["last_completion_result"] = raw_value;
+            }
+            diesel::update(
+                harvest_events::table
+                    .filter(harvest_events::workflow_exec_id.eq(new_exec_id.as_uuid()))
+                    .filter(harvest_events::event_id.eq(0)),
+            )
+            .set(harvest_events::event_data.eq(event_data))
+            .execute(conn)
+            .await
+            .map_err(crate::error::database_error)?;
         }
 
         // Reassign unconsumed signals to the new execution so signals
@@ -18425,20 +18548,23 @@ pub async fn move_workflow_to_dlq_for_history_cap(
             // execution to RUNNING. Mirrors the poison-pill quarantine and
             // workflow-task-timeout seal paths.
             queue::fail_open_tasks_for_execution(conn, exec_id, &reason).await?;
-            let (mut deferred, closed_children) = apply_parent_close_cascade(conn, exec_id).await?;
+            let (mut deferred, closed_children) =
+                apply_parent_close_cascade(conn, exec_id, codecs).await?;
             let mut pending_cancel_metrics = Vec::new();
             let failed_triggers =
-                crate::completion_trigger::evaluate_triggers_for_execution_collecting(
+                crate::completion_trigger::evaluate_triggers_for_execution_collecting_with_codecs(
                     conn,
                     exec_id,
                     crate::completion_trigger::TerminalState::Failed,
                     metrics,
                     &mut pending_cancel_metrics,
+                    codecs,
                 )
                 .await?;
             deferred.extend(failed_triggers);
             if let Some(parent_exec_id) = parent_exec_id {
-                wake_parent_for_child_failure(conn, parent_exec_id, exec_id, &reason).await?;
+                wake_parent_for_child_failure(conn, parent_exec_id, exec_id, &reason, codecs)
+                    .await?;
             }
             Ok((deferred, closed_children, pending_cancel_metrics))
         }))
@@ -22601,6 +22727,20 @@ fn spawn_concurrency_sampler(
     interval: Duration,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
+        // No recorder configured, and no DEBUG subscriber would observe the
+        // saturation trace below either: skip the sampler SQL entirely
+        // (issue #1428). Unlike its three siblings, this sampler's
+        // saturation trace is a metrics-independent operator signal (see
+        // the doc comment above). PR #1468 review (Codex, P2) found that a
+        // blanket `is_enabled()`-only guard would silence it. That happens
+        // for a deployment with no metrics recorder but with DEBUG tracing
+        // on. `tracing::enabled!` keeps that deployment's sampler active,
+        // at zero extra cost for one with neither configured.
+        if !telemetry.metrics.is_enabled()
+            && !tracing::enabled!(target: "autumn_harvest::worker", tracing::Level::DEBUG)
+        {
+            return;
+        }
         loop {
             tokio::select! {
                 () = cancel.cancelled() => break,
@@ -22697,6 +22837,11 @@ fn spawn_rate_limit_sampler(
     interval: Duration,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
+        // No recorder configured: never issue the sampler SQL (issue #1428,
+        // matching `spawn_queue_depth_sampler`'s guard above).
+        if !telemetry.metrics.is_enabled() {
+            return;
+        }
         loop {
             tokio::select! {
                 () = cancel.cancelled() => break,
@@ -22796,6 +22941,11 @@ fn spawn_dlq_depth_sampler(
     interval: Duration,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
+        // No recorder configured: never issue the sampler SQL (issue #1428,
+        // matching `spawn_queue_depth_sampler`'s guard above).
+        if !telemetry.metrics.is_enabled() {
+            return;
+        }
         loop {
             tokio::select! {
                 () = cancel.cancelled() => break,
@@ -23481,8 +23631,8 @@ fn spawn_stranded_work_sampler(
                             return false;
                         }
                         reqs.as_ref().is_none_or(|reqs| {
-                            let labels: std::collections::HashMap<String, String> =
-                                serde_json::from_value(w.worker.labels.clone()).unwrap_or_default();
+                            let labels =
+                                crate::payload_codec::string_valued_labels(&w.worker.labels);
                             crate::eligibility::matches_requirements(reqs, &labels)
                         })
                     })
@@ -23777,6 +23927,11 @@ fn spawn_history_oversized_sampler(
     interval: Duration,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
+        // No recorder configured: never issue the sampler SQL (issue #1428,
+        // matching `spawn_queue_depth_sampler`'s guard above).
+        if !telemetry.metrics.is_enabled() {
+            return;
+        }
         let mut reported_workflows = std::collections::HashSet::new();
         loop {
             tokio::select! {
@@ -26346,6 +26501,7 @@ impl Worker {
             Arc::clone(&self.drain_deadline_max),
             Arc::clone(&self.session_slots_in_use),
             registration_pending,
+            self.registry.payload_codecs().clone(),
         )
     }
 
@@ -27143,6 +27299,7 @@ impl Worker {
                 match crate::workers::register_worker_and_clear_stale_miss_evidence(
                     &mut conn,
                     &registration,
+                    &self.registry.payload_codecs().registered_key_ids(),
                 )
                 .await
                 {
@@ -28213,15 +28370,16 @@ pub async fn quarantine_workflow_task_timeout(
                         .execute(conn)
                         .await;
                         let (mut deferred, closed_children) =
-                            apply_parent_close_cascade(conn, exec_id).await?;
+                            apply_parent_close_cascade(conn, exec_id, codecs).await?;
                         let mut pending_cancel_metrics = Vec::new();
                         let triggers =
-                            crate::completion_trigger::evaluate_triggers_for_execution_collecting(
+                            crate::completion_trigger::evaluate_triggers_for_execution_collecting_with_codecs(
                                 conn,
                                 exec_id,
                                 crate::completion_trigger::TerminalState::Failed,
                                 Some(metrics),
                                 &mut pending_cancel_metrics,
+                            codecs,
                             )
                             .await?;
                         deferred.extend(triggers);
@@ -28238,6 +28396,7 @@ pub async fn quarantine_workflow_task_timeout(
                                 parent_exec_id,
                                 exec_id,
                                 &error_msg,
+                                codecs,
                             )
                             .await;
                         }
@@ -29200,6 +29359,266 @@ mod tests {
             .max_size(max_size)
             .build()
             .expect("pool builds without connecting")
+    }
+
+    // ── Issue #1428: metrics-disabled samplers must never touch the pool ────
+    //
+    // Four samplers issued their SQL with no `metrics.is_enabled()` guard.
+    // Their six siblings all check it first (`spawn_queue_depth_sampler`
+    // above sets the pattern).
+    //
+    // One exception: `spawn_concurrency_sampler`'s guard also stays open
+    // for a DEBUG subscriber. PR #1468 review (Codex, P2) found this gap.
+    // Its own touch count depends on the ambient tracing level too, not on
+    // `is_enabled()` alone. The tests below cover both halves separately.
+    //
+    // Evidence: a first version of this harness counted pool touches via
+    // a `tracing::debug!` message each sampler's failure branch emits. PR
+    // #1468 review (Codex, P2) found that vacuous. Filtering the
+    // subscriber to INFO, to model "no DEBUG subscriber," also suppresses
+    // the DEBUG event the counter relied on. The count then reads zero
+    // whether or not the guard actually works. `AcceptCountingListener`
+    // below counts real TCP `accept()`s on a loopback listener instead. No
+    // tracing level can silence that channel. "Zero touches" then only
+    // holds when the guard genuinely never reaches `pool.get()`.
+
+    /// A loopback listener standing in for Postgres, counting every
+    /// accepted connection before dropping it. The Postgres handshake then
+    /// fails, the same outward effect as [`unreachable_pool`]. The accept
+    /// itself is already counted by the time that happens.
+    struct AcceptCountingListener {
+        pool: DbPool,
+        accepts: Arc<std::sync::atomic::AtomicUsize>,
+        acceptor: tokio::task::JoinHandle<()>,
+    }
+
+    impl AcceptCountingListener {
+        fn touch_count(&self) -> usize {
+            // Fully qualified: `diesel_async::RunQueryDsl::load` is
+            // implemented for every `Sized` type, including
+            // `Arc<AtomicUsize>`. A plain `self.accepts.load(ordering)`
+            // resolves to that blanket trait method instead of
+            // `AtomicUsize::load`, and fails to compile.
+            std::sync::atomic::AtomicUsize::load(&self.accepts, std::sync::atomic::Ordering::SeqCst)
+        }
+
+        /// Stops the background accept loop. Tests call this once they are
+        /// done driving samplers against `self.pool`, before asserting.
+        fn stop(&self) {
+            self.acceptor.abort();
+        }
+    }
+
+    async fn accept_counting_pool() -> AcceptCountingListener {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind an ephemeral loopback port");
+        let addr = listener.local_addr().expect("listener has a local address");
+        let accepts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let accepts_for_task = Arc::clone(&accepts);
+        let acceptor = tokio::spawn(async move {
+            while let Ok((stream, _)) = listener.accept().await {
+                accepts_for_task.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                drop(stream);
+            }
+        });
+        let manager = diesel_async::pooled_connection::AsyncDieselConnectionManager::<
+            diesel_async::AsyncPgConnection,
+        >::new(format!("postgres://sampler-guard@{addr}/sampler-guard"));
+        let pool = deadpool::managed::Pool::builder(manager)
+            .max_size(1)
+            .build()
+            .expect("pool builds without connecting");
+        AcceptCountingListener {
+            pool,
+            accepts,
+            acceptor,
+        }
+    }
+
+    /// A [`tracing_subscriber::Layer`] with every method left at its
+    /// default (no-op) implementation. Attaching one to a subscriber with
+    /// no filter makes `tracing::enabled!` read a level as on. That is
+    /// what the DEBUG-tracing test below needs. It records nothing, since
+    /// that test proves control flow (`pool.get()` is reached), not log
+    /// content.
+    struct DebugTracingOn;
+
+    impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for DebugTracingOn {}
+
+    /// Advances the paused clock by `interval`, `n` times, yielding after
+    /// each advance. Each sampler loop sleeps for `interval` before its
+    /// body runs, so `n` advances let it complete up to `n` passes.
+    async fn advance_sampler_ticks(interval: Duration, n: usize) {
+        for _ in 0..n {
+            tokio::time::advance(interval).await;
+            tokio::task::yield_now().await;
+        }
+    }
+
+    /// Spawns the four samplers issue #1428 named, against the same `pool`,
+    /// `cancel`, `telemetry`, and `interval`. The extra per-sampler
+    /// arguments (queue names, shard id, soft threshold) are representative
+    /// values; none of them affect whether the pool is ever touched.
+    fn spawn_the_four_unguarded_samplers(
+        pool: &DbPool,
+        cancel: &CancellationToken,
+        telemetry: &Arc<crate::telemetry::TelemetryConfig>,
+        interval: Duration,
+    ) -> Vec<tokio::task::JoinHandle<()>> {
+        vec![
+            spawn_concurrency_sampler(
+                vec![pool.clone()],
+                cancel.clone(),
+                telemetry.clone(),
+                vec!["default".to_string()],
+                interval,
+            ),
+            spawn_rate_limit_sampler(
+                vec![pool.clone()],
+                cancel.clone(),
+                telemetry.clone(),
+                interval,
+            ),
+            spawn_dlq_depth_sampler(pool.clone(), cancel.clone(), telemetry.clone(), 0, interval),
+            spawn_history_oversized_sampler(
+                vec![pool.clone()],
+                cancel.clone(),
+                telemetry.clone(),
+                100,
+                interval,
+            ),
+        ]
+    }
+
+    /// Issue #1428 evidence generator. Spawns the four samplers against an
+    /// [`accept_counting_pool`]. Metrics stay disabled and no tracing
+    /// subscriber is installed, so DEBUG is off. That is the realistic
+    /// unconfigured-deployment default. It advances a paused clock by
+    /// `TICKS` sampler intervals, and counts accepted connections. Not a
+    /// CI assertion — see `docs/performance-metrics-sampler-guard.md`.
+    /// Set `PERF_LABEL` to tag the artifact `before`/`after` the fix.
+    #[tokio::test(start_paused = true)]
+    #[ignore = "evidence generator, not a CI assertion -- see \
+                docs/performance-metrics-sampler-guard.md"]
+    async fn zz_capture_metrics_sampler_guard_pool_touch_evidence() {
+        const TICKS: usize = 20;
+        let interval = Duration::from_millis(50);
+
+        let telemetry = Arc::new(crate::telemetry::TelemetryConfig::default());
+        assert!(
+            !telemetry.metrics.is_enabled(),
+            "this harness must model an unconfigured, metrics-disabled deployment"
+        );
+        let listener = accept_counting_pool().await;
+        let cancel = CancellationToken::new();
+        let handles =
+            spawn_the_four_unguarded_samplers(&listener.pool, &cancel, &telemetry, interval);
+
+        advance_sampler_ticks(interval, TICKS).await;
+        cancel.cancel();
+        for handle in handles {
+            let _ = tokio::time::timeout(Duration::from_secs(5), handle).await;
+        }
+        listener.stop();
+
+        let touches = listener.touch_count();
+        let label = std::env::var("PERF_LABEL").unwrap_or_else(|_| "unlabeled".to_string());
+        eprintln!("label={label} ticks={TICKS} samplers=4 pool_touches={touches}");
+
+        let out_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .expect("autumn-harvest/ has a workspace-root parent")
+            .join("docs")
+            .join("perf-artifacts")
+            .join("metrics-sampler-guard");
+        std::fs::create_dir_all(&out_dir).expect("create artifact output directory");
+        std::fs::write(
+            out_dir.join(format!("{label}-counts.txt")),
+            format!(
+                "-- {label}: metrics-disabled sampler pool-touch count, 4 samplers, \
+                 {TICKS} ticks, interval={interval:?} --\nsamplers\tticks\tpool_touches\n4\t\
+                 {TICKS}\t{touches}\n"
+            ),
+        )
+        .expect("write evidence artifact");
+    }
+
+    /// Regression pin for issue #1428. The four previously-unguarded
+    /// samplers must never touch the pool under an unconfigured
+    /// deployment's usual state: metrics disabled and no DEBUG subscriber
+    /// listening. This matches every guarded sibling
+    /// (`spawn_queue_depth_sampler` and friends). It counts real accepted
+    /// connections (`AcceptCountingListener`), not a tracing event. A
+    /// subscriber filtered to hide the count cannot pass this test
+    /// vacuously. PR #1468 review (Codex, P2) found that gap.
+    #[tokio::test(start_paused = true)]
+    async fn metrics_disabled_samplers_never_touch_the_pool() {
+        let interval = Duration::from_millis(50);
+        let telemetry = Arc::new(crate::telemetry::TelemetryConfig::default());
+        let listener = accept_counting_pool().await;
+        let cancel = CancellationToken::new();
+        let handles =
+            spawn_the_four_unguarded_samplers(&listener.pool, &cancel, &telemetry, interval);
+
+        advance_sampler_ticks(interval, 20).await;
+        cancel.cancel();
+        for handle in handles {
+            let _ = tokio::time::timeout(Duration::from_secs(5), handle).await;
+        }
+        listener.stop();
+
+        assert_eq!(
+            listener.touch_count(),
+            0,
+            "a metrics-disabled deployment with no DEBUG subscriber must never reach \
+             pool.get() in any of these four samplers"
+        );
+    }
+
+    /// Codex review on PR #1468 (P2) found a gap: a blanket
+    /// `is_enabled()`-only guard on `spawn_concurrency_sampler` would
+    /// silence its documented saturation trace. That happens for a
+    /// deployment that runs with DEBUG tracing but no metrics recorder.
+    /// Pins the fix: with metrics disabled but DEBUG enabled, the sampler
+    /// still reaches `pool.get()`. Its three siblings keep no such tracing
+    /// exception.
+    #[tokio::test(start_paused = true)]
+    async fn concurrency_sampler_stays_active_for_its_saturation_trace_under_debug_tracing() {
+        use tracing_subscriber::layer::SubscriberExt;
+
+        // No filter: attaching this layer at all is enough to make
+        // `tracing::enabled!` read DEBUG as on, modeling a deployment that
+        // runs with DEBUG tracing.
+        let subscriber = tracing_subscriber::registry().with(DebugTracingOn);
+        let _guard = tracing::subscriber::set_default(subscriber);
+
+        let interval = Duration::from_millis(50);
+        let telemetry = Arc::new(crate::telemetry::TelemetryConfig::default());
+        assert!(
+            !telemetry.metrics.is_enabled(),
+            "this test's point is metrics disabled, DEBUG tracing enabled"
+        );
+        let listener = accept_counting_pool().await;
+        let cancel = CancellationToken::new();
+        let handle = spawn_concurrency_sampler(
+            vec![listener.pool.clone()],
+            cancel.clone(),
+            telemetry,
+            vec!["default".to_string()],
+            interval,
+        );
+
+        advance_sampler_ticks(interval, 5).await;
+        cancel.cancel();
+        let _ = tokio::time::timeout(Duration::from_secs(5), handle).await;
+        listener.stop();
+
+        assert!(
+            listener.touch_count() > 0,
+            "with DEBUG tracing enabled, spawn_concurrency_sampler must still reach \
+             pool.get() even though metrics are disabled, or its saturation trace goes dark"
+        );
     }
 
     #[test]

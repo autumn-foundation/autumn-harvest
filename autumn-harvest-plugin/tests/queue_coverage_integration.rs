@@ -316,6 +316,7 @@ async fn insert_worker(
         None,
         &HashMap::<String, String>::new(),
         0,
+        &[],
     )
     .await
     .expect("failed to register worker");
@@ -679,6 +680,7 @@ async fn stale_workers_exceeding_the_cap_do_not_crowd_out_a_healthy_poller() {
             None,
             &HashMap::<String, String>::new(),
             0,
+            &[],
         )
         .await
         .expect("failed to register stale worker");
@@ -760,6 +762,7 @@ async fn healthy_workers_exceeding_the_cap_do_not_crowd_out_a_covering_poller() 
             None,
             &HashMap::<String, String>::new(),
             0,
+            &[],
         )
         .await
         .expect("failed to register noise worker");

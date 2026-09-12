@@ -348,15 +348,17 @@ mod scanner {
             .map_err(crate::error::database_error)?;
         }
 
-        let (mut deferred, closed_children) = apply_parent_close_cascade(conn, exec_id).await?;
+        let (mut deferred, closed_children) =
+            apply_parent_close_cascade(conn, exec_id, codecs).await?;
         let mut pending_cancel_metrics = Vec::new();
         let failed_triggers =
-            crate::completion_trigger::evaluate_triggers_for_execution_collecting(
+            crate::completion_trigger::evaluate_triggers_for_execution_collecting_with_codecs(
                 conn,
                 exec_id,
                 crate::completion_trigger::TerminalState::Failed,
                 metrics,
                 &mut pending_cancel_metrics,
+                codecs,
             )
             .await?;
         deferred.extend(failed_triggers);
@@ -385,10 +387,11 @@ mod scanner {
                      relay's to deliver"
                 );
             } else {
-                crate::store::append_single_event(
+                crate::store::append_single_event_with_codecs(
                     conn,
                     parent_exec_id,
                     WorkflowEvent::child_workflow_failed(exec_id, error.to_string()),
+                    codecs,
                 )
                 .await?;
                 crate::queue::wake_workflow_task(conn, parent_exec_id).await?;
