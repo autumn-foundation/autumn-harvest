@@ -92,14 +92,15 @@ impl CriticalPathAnalyzer {
 
         let mut distances = vec![Duration::ZERO; tasks.len()];
         let mut predecessors = vec![None; tasks.len()];
-        // Sink detection (a node is a sink iff no other node names it as an
-        // upstream) is folded into the main DP loop below instead of a
-        // second full pass over `tasks`/`task.upstreams`: the DP loop
-        // already visits every (task, upstream) edge exactly once, in the
-        // same order `for task in tasks { for &up_idx in &task.upstreams }`
-        // would, so marking `is_sink[up_idx] = false` there produces the
-        // identical result -- level order does not affect which indices are
-        // named as an upstream, only when that fact is discovered.
+        // A node is a sink only when no other node names it as an upstream.
+        // Sink detection folds into the main DP loop below, instead of
+        // running as a second full pass over `tasks`/`task.upstreams`. The
+        // DP loop already visits every task-upstream edge exactly once, in
+        // the same order `for task in tasks { for &up_idx in
+        // &task.upstreams }` would. So marking `is_sink[up_idx] = false`
+        // there produces the identical result. Level order does not affect
+        // which indices are named as an upstream, only when that fact is
+        // discovered.
         let mut is_sink = vec![true; tasks.len()];
 
         // `activity_durations` is keyed by activity NAME, not by task, so a
