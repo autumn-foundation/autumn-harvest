@@ -158,6 +158,11 @@ one pair that cannot be reconciled is refused instead: a turn that says it
 ended and still asks for a tool is malformed, and no guess about which half is
 wrong would be safe.
 
+Two stop reasons are the daemon's own rather than the model's. `max_turns`
+means the turn budget ran out, and `transcript_full` means the conversation no
+longer fits one request. Both end the session with the work of the turns that
+did run, and neither reads as a finished answer.
+
 **The database lives outside the workspace.** The agent can write any path
 inside the workspace, and a write replaces its target. A database the agent can
 reach is therefore one approved tool call away from replacement, while `SQLite`
@@ -334,7 +339,13 @@ Honest limits, so nothing here reads as a promise:
 - **The transcript rides in history.** Each turn stores the whole conversation
   as its activity input, which is simple and replay-exact but grows with the
   session. A long-running agent should store the transcript outside the engine
-  and pass a handle instead. The 2 MiB payload cap is the hard bound.
+  and pass a handle instead. The 2 MiB payload cap is the hard bound, and one
+  turn can reach it alone: 33 `read_file` calls, each returning the 64 KiB a
+  read may return, build a request of about 2.1 MB. The session **ends** at
+  that bound with the stop reason `transcript_full`, before the next model
+  call. It does not fail: the engine would answer a non-retryable
+  `PayloadTooLarge`, which would discard a turn already billed and whose
+  approved writes had already run.
 - **A recorded turn can cost twice its response.** The durable reply keeps the
   assistant blocks verbatim — that is what makes the next request replay-exact
   — and also the text and tool calls copied out of them, so a reply of text

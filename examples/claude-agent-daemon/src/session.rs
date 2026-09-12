@@ -41,6 +41,41 @@ const STOP_REFUSAL: &str = "refusal";
 /// The `stop_reason` of a turn cut short by the output cap.
 const STOP_MAX_TOKENS: &str = "max_tokens";
 
+/// The stop reason of a session whose transcript no longer fits one request.
+///
+/// This one is the DAEMON's, like `max_turns`, and not the model's.
+pub const STOP_TRANSCRIPT_FULL: &str = "transcript_full";
+
+/// Would this request be refused as too large to record?
+///
+/// The transcript rides in the activity input, so it grows with every turn
+/// and every tool result. One turn can reach the cap on its own. A reply
+/// asking for 33 `read_file` calls, each returning the 64 KiB a read may
+/// return, builds a request of about 2.1 MB. The cap is 2 MiB.
+///
+/// The engine would answer `PayloadTooLarge`, which is NOT retryable, and the
+/// session would FAIL. It would fail after the model turn was billed and
+/// after this turn's approved writes had already run. The session ends under
+/// its own stop reason instead, so that work is kept and the reason is named.
+///
+/// The check is on the SERIALISED request, which is what the engine measures.
+/// It runs BEFORE the activity, so a request that cannot be sent costs no
+/// model call. It refuses only what is certain to be refused, and never a
+/// request that would fit.
+///
+/// The cost is one extra serialisation of the transcript per turn. The engine
+/// serialises it again to send it, and there is no way to ask for the size of
+/// what it would send.
+///
+/// This runs inside the workflow, so it must answer the same way on replay.
+/// It reads no clock and no state outside its argument, and the cap is a
+/// constant of the build.
+fn over_input_cap(request: &TurnRequest) -> bool {
+    serde_json::to_vec(request)
+        .map(|json| json.len() as u64 > autumn_harvest::builder::DEFAULT_MAX_ACTIVITY_INPUT_BYTES)
+        .unwrap_or(false)
+}
+
 /// The instructions the model runs under. The value is part of every request,
 /// so a change to it alters the model input of later turns only.
 pub const SYSTEM_PROMPT: &str = "\
@@ -212,14 +247,18 @@ pub async fn agent_session(
     let mut last_text = String::new();
 
     for turn in 1..=task.max_turns {
+        let request = TurnRequest {
+            model: task.model.clone(),
+            messages: messages.clone(),
+        };
+        // A transcript that no longer fits ends the session HERE, under its
+        // own name. See [`over_input_cap`]. The turn is not attempted, so the
+        // report carries the work of the turns that did run.
+        if over_input_cap(&request) {
+            return Ok(report(&last_text, turn, tool_calls, STOP_TRANSCRIPT_FULL));
+        }
         let reply: TurnReply = ctx
-            .execute_activity(
-                &claude_turn_info(),
-                TurnRequest {
-                    model: task.model.clone(),
-                    messages: messages.clone(),
-                },
-            )
+            .execute_activity(&claude_turn_info(), request)
             .await
             .map_err(|e| e.to_string())?;
 

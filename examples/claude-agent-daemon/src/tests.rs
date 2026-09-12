@@ -193,6 +193,116 @@ async fn a_session_runs_its_tools_and_finishes_after_approval() {
     assert_eq!(calls.load(Ordering::SeqCst), 3, "three model calls");
 }
 
+/// A transcript that no longer fits ENDS the session, and does not fail it.
+///
+/// The transcript rides in the activity input, so one turn can reach the cap
+/// on its own. A reply asking for 33 `read_file` calls, each returning the
+/// 64 KiB a read may return, builds a request of about 2.1 MB. The cap is
+/// 2 MiB. Measured at 33 calls: 2164819 bytes.
+///
+/// The engine answers `PayloadTooLarge`, which is not retryable. The session
+/// FAILED at the top of the next turn, after that turn's model call was
+/// billed and after its approved writes had already run. The work was done,
+/// paid for, and then thrown away with an error naming none of it.
+///
+/// It now ends under its own stop reason, before the next model call.
+#[tokio::test]
+async fn a_transcript_too_large_to_send_ends_the_session() {
+    let dir = tempfile::tempdir().expect("a temporary directory");
+    let workspace = dir.path().join("workspace");
+    std::fs::create_dir_all(&workspace).expect("the workspace is created");
+
+    // Enough files at the read cap that ONE turn of reads passes the cap.
+    let files: usize = 35;
+    for index in 0..files {
+        std::fs::write(
+            workspace.join(format!("big-{index}.txt")),
+            "x".repeat(64 * 1024),
+        )
+        .expect("the fixture is written");
+    }
+
+    // A model that asks for every file in its first reply, and would keep
+    // asking afterwards. The session must stop before it is asked again.
+    let calls = Arc::new(AtomicUsize::new(0));
+    let counted = calls.clone();
+    let model = move |input: Value| -> Result<Value, String> {
+        let request: TurnRequest =
+            serde_json::from_value(input).map_err(|e| format!("bad request: {e}"))?;
+        counted.fetch_add(1, Ordering::SeqCst);
+        let reads: Vec<Value> = (0..files)
+            .map(|index| {
+                json!({
+                    "type": "tool_use",
+                    "id": format!("toolu_read_{index}"),
+                    "name": tools::TOOL_READ_FILE,
+                    "input": { "path": format!("big-{index}.txt") },
+                })
+            })
+            .collect();
+        let mut content = vec![json!({ "type": "text", "text": "reading everything" })];
+        content.extend(reads);
+        let _ = &request;
+        serde_json::to_value(session::TurnReply {
+            content: Value::Array(content),
+            stop_reason: claude::STOP_TOOL_USE.to_string(),
+            text: "reading everything".to_string(),
+            tool_calls: (0..files)
+                .map(|index| session::ToolCall {
+                    id: format!("toolu_read_{index}"),
+                    name: tools::TOOL_READ_FILE.to_string(),
+                    input: json!({ "path": format!("big-{index}.txt") }),
+                })
+                .collect(),
+        })
+        .map_err(|e| format!("bad reply: {e}"))
+    };
+
+    let mut rt = SqliteRuntime::open(dir.path().join("agentd.db")).expect("the database opens");
+    rt.register_workflow(&session::agent_session_info());
+    rt.register_activity(&session::claude_turn_info(), model);
+    rt.register_activity(
+        &session::run_tool_info(),
+        tools::activity_body(workspace.clone()),
+    );
+    let exec = rt
+        .start_workflow(WORKFLOW_NAME, task(&workspace))
+        .expect("the session starts");
+
+    let state = rt.run_until_blocked(exec).await.expect("the run advances");
+
+    // COMPLETED, and not FAILED. That distinction is the whole fix: a
+    // non-retryable failure here would discard a turn already paid for.
+    let RunState::Completed(output) = state else {
+        panic!("the session must end rather than fail: {state:?}");
+    };
+    let report: session::SessionReport = serde_json::from_value(output).expect("the report reads");
+    assert_eq!(
+        report.stop,
+        session::STOP_TRANSCRIPT_FULL,
+        "and it must end under its own name: {report:?}"
+    );
+
+    // The work of the turn that DID run is kept and counted.
+    assert_eq!(
+        u64::from(report.tool_calls),
+        files as u64,
+        "every read of the turn that ran is counted"
+    );
+    assert_eq!(
+        report.answer, "reading everything",
+        "and the text of that turn is the answer"
+    );
+
+    // The model was asked ONCE. The turn that could not be sent was never
+    // billed, which is what checking before the activity buys.
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        1,
+        "the turn that cannot be sent must cost no model call"
+    );
+}
+
 #[tokio::test]
 async fn a_denied_call_is_reported_to_the_model_and_the_session_continues() {
     let dir = tempfile::tempdir().expect("a temporary directory");
