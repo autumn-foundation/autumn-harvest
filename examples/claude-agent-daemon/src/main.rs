@@ -438,7 +438,29 @@ fn rendered_lines(response: &Response, socket: &Path) -> Vec<String> {
             }
             lines
         }
-        Response::History { events } => events.clone(),
+        Response::History {
+            events,
+            execution_id,
+            older,
+        } => {
+            let mut lines = events.clone();
+            // The daemon returns the cursor, and the CLIENT builds the
+            // command. Only the client knows which socket it asked. A command
+            // that dropped the socket would send the operator to another
+            // daemon. See [`socket_flag`].
+            if let Some(older) = older {
+                lines.insert(
+                    0,
+                    format!(
+                        "… {} events shown; read the ones before them with \
+                         `agentd history{} {execution_id} --before {older}`",
+                        events.len(),
+                        socket_flag(socket)
+                    ),
+                );
+            }
+            lines
+        }
         Response::Ack { detail } => vec![detail.clone()],
         // Returned as an error by `report`, which never reaches here.
         Response::Error { message } => vec![message.clone()],

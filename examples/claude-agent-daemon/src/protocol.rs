@@ -78,6 +78,15 @@ pub enum Response {
     },
     History {
         events: Vec<String>,
+        /// The session this page belongs to, so the client can name it in the
+        /// command that reads the page before this one.
+        #[serde(default)]
+        execution_id: String,
+        /// The cursor that reads the events BEFORE this page, when the log
+        /// holds more. The CLIENT renders the command, because only it knows
+        /// which socket it asked.
+        #[serde(default)]
+        older: Option<i64>,
     },
     Ack {
         detail: String,

@@ -145,12 +145,23 @@ pub fn running(conn: &Connection, workflow_name: &str) -> Result<Vec<RunningSess
         .map_err(|e| format!("cannot read the running sessions: {e}"))
 }
 
-/// Read one page of a session's events, newest first.
+/// One recorded event, already cut to what an audit line prints.
+///
+/// The whole event is never read. A recorded activity can approach the
+/// backend's payload cap, and a page names hundreds of them. A page that read
+/// them whole would hold gigabytes for one command.
+pub struct EventLine {
+    /// The event's own position in the log, and the cursor of the next page.
+    pub seq: i64,
+    pub label: String,
+    /// The event's data, cut in the database. `None` when it carries none.
+    pub detail: Option<String>,
+}
+
+/// Read one page of a session's events, newest first, cut for printing.
 ///
 /// `before` is the sequence number the previous page ended on, so a caller
-/// walks backwards page by page. `None` starts at the newest event. Each item
-/// carries its own sequence number, which is the event's real position in the
-/// log and the cursor for the next page.
+/// walks backwards page by page. `None` starts at the newest event.
 ///
 /// The engine owns this table. The rows are read here, never written: the
 /// event log is append-only, and a reader of it must stay a reader.
@@ -158,76 +169,91 @@ pub fn running(conn: &Connection, workflow_name: &str) -> Result<Vec<RunningSess
 /// # Errors
 ///
 /// Returns an error if the query cannot run, or if a row is not readable.
-pub fn events_before(
+pub fn event_lines(
     conn: &Connection,
     exec_id: &str,
     before: Option<i64>,
     limit: u32,
-) -> Result<Vec<(i64, serde_json::Value)>, String> {
-    read_events(conn, EVERY_EVENT, exec_id, before, limit)
+) -> Result<Vec<EventLine>, String> {
+    // One character past the printed cap, so the caller can tell a cut line
+    // from one that ended by itself.
+    let detail_cap = MAX_EVENT_DETAIL_CHARS + 1;
+    let mut statement = conn
+        .prepare(
+            "SELECT seq, json_extract(event_json, '$.type'), \
+                    substr(json_extract(event_json, '$.data'), 1, ?4) \
+             FROM harvest_events \
+             WHERE exec_id = ?1 AND (?2 IS NULL OR seq < ?2) \
+             ORDER BY seq DESC LIMIT ?3",
+        )
+        .map_err(|e| format!("cannot prepare the event query: {e}"))?;
+    let rows = statement
+        .query_map(
+            rusqlite::params![exec_id, before, limit, detail_cap],
+            |row| {
+                Ok(EventLine {
+                    seq: row.get(0)?,
+                    label: row
+                        .get::<_, Option<String>>(1)?
+                        .unwrap_or_else(|| "unknown".to_string()),
+                    detail: row.get(2)?,
+                })
+            },
+        )
+        .map_err(|e| format!("cannot read the events: {e}"))?;
+
+    rows.map(|row| row.map_err(|e| format!("cannot read the events: {e}")))
+        .collect()
 }
 
-/// Read one page of a session's MODEL REPLIES, newest first.
+/// How many characters of one event's data an audit line prints.
+pub const MAX_EVENT_DETAIL_CHARS: u32 = 240;
+
+/// Read one page of the TOOL CALLS a session's model replies asked for.
 ///
-/// Same page walk as [`events_before`], over the replies alone. The database
-/// applies the filter. A turn that asked for many tools therefore does not
-/// put its results in front of the reply that named them.
+/// Newest first, and the calls alone. The database drops the tool results,
+/// which is what bounds the WORK. The walk visits one row per model turn and
+/// not one row per event, and `--max-turns` bounds the turns.
 ///
-/// That bounds the work as well as the memory. A search for an awaited call
-/// visits at most one row per model turn, and the turn count is what
-/// `--max-turns` already bounds. Without the filter, one status could walk
-/// every tool result of every turn, on the loop that drives every session.
+/// It also drops the transcript. A reply carries every earlier turn in its
+/// content, and none of that names an awaited call. Only the calls are read,
+/// which is what bounds the BYTES.
+///
+/// A reply has a stop reason and a tool result does not, which is how the two
+/// are told apart. The engine records both as `ActivityCompleted`, and the
+/// event carries no activity name.
 ///
 /// # Errors
 ///
 /// Returns an error if the query cannot run, or if a row is not readable.
-pub fn replies_before(
+pub fn reply_calls(
     conn: &Connection,
     exec_id: &str,
     before: Option<i64>,
     limit: u32,
 ) -> Result<Vec<(i64, serde_json::Value)>, String> {
-    read_events(conn, ONLY_REPLIES, exec_id, before, limit)
-}
-
-/// Every recorded event.
-const EVERY_EVENT: &str = "";
-
-/// Only the events that carry a model reply.
-///
-/// A reply has a stop reason and a tool result does not, so the presence of
-/// that field is what tells the two apart. The engine records both as
-/// `ActivityCompleted`, and the event carries no activity name.
-const ONLY_REPLIES: &str = "AND json_extract(event_json, '$.data.output.stop_reason') IS NOT NULL ";
-
-/// One page of events, optionally narrowed by `filter`.
-fn read_events(
-    conn: &Connection,
-    filter: &str,
-    exec_id: &str,
-    before: Option<i64>,
-    limit: u32,
-) -> Result<Vec<(i64, serde_json::Value)>, String> {
-    let sql = format!(
-        "SELECT seq, event_json FROM harvest_events \
-         WHERE exec_id = ?1 AND (?2 IS NULL OR seq < ?2) {filter}\
-         ORDER BY seq DESC LIMIT ?3"
-    );
     let mut statement = conn
-        .prepare(&sql)
-        .map_err(|e| format!("cannot prepare the event query: {e}"))?;
+        .prepare(
+            "SELECT seq, json_extract(event_json, '$.data.output.tool_calls') \
+             FROM harvest_events \
+             WHERE exec_id = ?1 AND (?2 IS NULL OR seq < ?2) \
+             AND json_extract(event_json, '$.data.output.stop_reason') IS NOT NULL \
+             ORDER BY seq DESC LIMIT ?3",
+        )
+        .map_err(|e| format!("cannot prepare the reply query: {e}"))?;
     let rows = statement
         .query_map(rusqlite::params![exec_id, before, limit], |row| {
-            Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+            Ok((row.get::<_, i64>(0)?, row.get::<_, Option<String>>(1)?))
         })
-        .map_err(|e| format!("cannot read the events: {e}"))?;
+        .map_err(|e| format!("cannot read the replies: {e}"))?;
 
     rows.map(|row| {
-        row.map_err(|e| format!("cannot read the events: {e}"))
-            .and_then(|(seq, json)| {
-                serde_json::from_str(&json)
-                    .map(|value| (seq, value))
-                    .map_err(|e| format!("cannot decode an event: {e}"))
+        row.map_err(|e| format!("cannot read the replies: {e}"))
+            .map(|(seq, calls)| {
+                let value = calls
+                    .and_then(|json| serde_json::from_str(&json).ok())
+                    .unwrap_or(serde_json::Value::Null);
+                (seq, value)
             })
     })
     .collect()

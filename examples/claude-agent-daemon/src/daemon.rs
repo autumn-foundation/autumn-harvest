@@ -20,7 +20,6 @@ use std::time::Duration;
 
 use autumn_harvest_sqlite::{ExecutionId, RunState, SqliteRuntime};
 use rusqlite::Connection;
-use serde_json::Value;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::{Semaphore, mpsc, oneshot};
@@ -29,9 +28,7 @@ use crate::claude::{self, ModelConfig};
 use crate::guard;
 use crate::inspect::{self, ExecutionRow};
 use crate::protocol::{PendingCall, Request, Response, SessionView};
-use crate::session::{
-    self, ApprovalDecision, SessionReport, SessionTask, TurnReply, WORKFLOW_NAME,
-};
+use crate::session::{self, ApprovalDecision, SessionReport, SessionTask, WORKFLOW_NAME};
 use crate::shutdown;
 use crate::tools;
 
@@ -101,9 +98,6 @@ type Job = (Request, oneshot::Sender<Response>);
 /// The largest tool input the status prints. An operator decides from it, so
 /// it is generous; the marker says when there is more.
 const MAX_PENDING_INPUT_CHARS: usize = 2000;
-
-/// The largest event detail one audit line carries.
-const MAX_EVENT_DETAIL_CHARS: usize = 240;
 
 /// Why one session is parked, and what would release it.
 #[derive(Clone)]
@@ -758,7 +752,7 @@ fn history(reader: &Connection, execution_id: &str, before: Option<i64>) -> Resp
     // whole transcript, and the count grows with every turn. Loading the log
     // entire would spend the daemon's memory on one command. It would also
     // block every session drive while it ran.
-    match inspect::events_before(
+    match inspect::event_lines(
         reader,
         execution_id,
         before,
@@ -772,24 +766,19 @@ fn history(reader: &Connection, execution_id: &str, before: Option<i64>) -> Resp
             // The log reads forward, and each line carries the event's own
             // sequence number rather than a position in this page.
             page.reverse();
-            let oldest = page.first().map(|(seq, _)| *seq);
-            let mut events: Vec<String> = page
-                .iter()
-                .map(|(seq, value)| format!("{seq:>3}  {}", describe(value)))
-                .collect();
             // The omitted events must be reachable, or a bounded audit trail
-            // is a lost one. The line names the command that reads them.
-            if let (true, Some(oldest)) = (more, oldest) {
-                events.insert(
-                    0,
-                    format!(
-                        "… {} events shown; read the ones before them with \
-                         `agentd history {execution_id} --before {oldest}`",
-                        events.len()
-                    ),
-                );
+            // is a lost one. The CURSOR is returned and not a command. Only
+            // the client knows which socket it asked, and a command built
+            // here would send the operator to another daemon.
+            let older = more.then(|| page.first().map(|line| line.seq)).flatten();
+            Response::History {
+                events: page
+                    .iter()
+                    .map(|line| format!("{:>3}  {}", line.seq, describe(line)))
+                    .collect(),
+                execution_id: execution_id.to_string(),
+                older,
             }
-            Response::History { events }
         }
         Err(message) => Response::Error { message },
     }
@@ -802,22 +791,19 @@ fn history(reader: &Connection, execution_id: &str, before: Option<i64>) -> Resp
 /// compactly and trimmed to one readable line. The rendering is generic and
 /// prints whatever the event holds. A new event variant therefore needs no
 /// change here, and is never reduced to a bare name.
-fn describe(value: &Value) -> String {
-    let label = value
-        .get("type")
-        .and_then(Value::as_str)
-        .unwrap_or("unknown");
-
-    match value.get("data") {
-        Some(data) if !data.is_null() => {
-            let mut rendered = data.to_string();
-            if rendered.chars().count() > MAX_EVENT_DETAIL_CHARS {
-                rendered = rendered.chars().take(MAX_EVENT_DETAIL_CHARS).collect();
+fn describe(line: &inspect::EventLine) -> String {
+    let cap = inspect::MAX_EVENT_DETAIL_CHARS as usize;
+    match line.detail.as_deref() {
+        Some(detail) if !detail.is_empty() && detail != "null" => {
+            // The database read one character past the cap, so a longer
+            // detail is known to be cut without reading the rest of it.
+            let mut rendered: String = detail.chars().take(cap).collect();
+            if detail.chars().count() > cap {
                 rendered.push('…');
             }
-            format!("{label}  {rendered}")
+            format!("{}  {rendered}", line.label)
         }
-        _ => label.to_string(),
+        _ => line.label.clone(),
     }
 }
 
@@ -944,21 +930,17 @@ pub fn pending_call(
     let mut before = None;
 
     loop {
-        let page = inspect::replies_before(reader, exec_id, before, inspect::EVENT_PAGE).ok()?;
+        let page = inspect::reply_calls(reader, exec_id, before, inspect::EVENT_PAGE).ok()?;
         let (last, _) = *page.last()?;
         before = Some(last);
 
-        for (_, value) in page {
-            if value.get("type").and_then(Value::as_str) != Some("ActivityCompleted") {
-                continue;
-            }
-            let Some(output) = value.pointer("/data/output") else {
-                continue;
-            };
-            let Ok(reply) = serde_json::from_value::<TurnReply>(output.clone()) else {
+        for (_, calls) in page {
+            // The query returns the calls of one model reply, and nothing
+            // else of it. The transcript stays in the database.
+            let Ok(calls) = serde_json::from_value::<Vec<session::ToolCall>>(calls) else {
                 continue;
             };
-            if let Some(call) = reply.tool_calls.into_iter().find(|call| call.id == call_id) {
+            if let Some(call) = calls.into_iter().find(|call| call.id == call_id) {
                 let mut input = call.input.to_string();
                 // A decision needs the WHOLE payload, and a write carries up
                 // to 64 KiB. The status trims it to stay readable, and

@@ -666,7 +666,7 @@ async fn the_daemon_serves_one_session_over_its_socket() {
     )
     .await
     .expect("the history is answered");
-    let Response::History { events } = logged else {
+    let Response::History { events, .. } = logged else {
         panic!("unexpected answer: {logged:?}");
     };
     assert!(
@@ -1236,13 +1236,13 @@ async fn a_status_reads_a_bounded_slice_of_the_history() {
     // than `MAX_SCANNED_EVENTS`, so asserting against that cap would pass
     // whether or not the query carries a limit. The assertion uses a small
     // limit instead, which only holds if the limit reaches the query.
-    let whole = inspect::events_before(&reader, &exec_id, None, u32::MAX).expect("the events read");
+    let whole = inspect::event_lines(&reader, &exec_id, None, u32::MAX).expect("the events read");
     assert!(
         whole.len() > 3,
         "the fixture must hold more events than the limit below, and holds {}",
         whole.len()
     );
-    let capped = inspect::events_before(&reader, &exec_id, None, 3).expect("the events read");
+    let capped = inspect::event_lines(&reader, &exec_id, None, 3).expect("the events read");
     assert_eq!(
         capped.len(),
         3,
@@ -1251,19 +1251,19 @@ async fn a_status_reads_a_bounded_slice_of_the_history() {
 
     // Newest first, so the scan reaches the last model reply immediately.
     assert_eq!(
-        capped.first(),
-        whole.first(),
+        capped.first().map(|line| line.seq),
+        whole.first().map(|line| line.seq),
         "the bounded read must start at the newest event"
     );
 
     // A page is not a window. The search must reach an event that sits further
     // back than one page. A turn with many tool calls before its gated write
     // would otherwise leave the operator with no token to approve.
-    let (oldest_seq, _) = *whole.last().expect("the history is not empty");
+    let oldest_seq = whole.last().expect("the history is not empty").seq;
     let reached = (0..)
         .scan(None, |before: &mut Option<i64>, _| {
-            let page = inspect::events_before(&reader, &exec_id, *before, 1).ok()?;
-            let (seq, _) = *page.first()?;
+            let page = inspect::event_lines(&reader, &exec_id, *before, 1).ok()?;
+            let seq = page.first()?.seq;
             *before = Some(seq);
             Some(seq)
         })
@@ -1301,16 +1301,17 @@ async fn a_status_finds_a_call_behind_more_events_than_one_page() {
     let mut before = None;
     let mut walked = 0;
     let found = loop {
-        let page = inspect::events_before(&reader, &exec_id, before, 1).expect("the page reads");
-        let Some((seq, value)) = page.first() else {
+        let page = inspect::event_lines(&reader, &exec_id, before, 1).expect("the page reads");
+        let Some(line) = page.first() else {
             break None;
         };
-        before = Some(*seq);
+        before = Some(line.seq);
         walked += 1;
-        if value.get("type").and_then(serde_json::Value::as_str) == Some("ActivityCompleted")
-            && let Some(output) = value.pointer("/data/output")
-            && serde_json::from_value::<TurnReply>(output.clone())
-                .is_ok_and(|reply| !reply.tool_calls.is_empty())
+        if line.label == "ActivityCompleted"
+            && line
+                .detail
+                .as_deref()
+                .is_some_and(|detail| detail.contains("tool_use"))
         {
             break Some(walked);
         }
@@ -1325,6 +1326,27 @@ async fn a_status_finds_a_call_behind_more_events_than_one_page() {
     let call = daemon::pending_call(&reader, &exec_id, &signal, false)
         .expect("the awaited call must be found however deep it sits");
     assert_eq!(call.token, signal, "the call must be the awaited one");
+
+    // The lookup reads the CALLS of a reply and not the reply. A reply holds
+    // every earlier turn in its content, and none of that names a call. A read
+    // of the whole reply would carry the transcript with it.
+    let replies =
+        inspect::reply_calls(&reader, &exec_id, None, inspect::EVENT_PAGE).expect("the calls read");
+    let (_, calls) = replies.first().expect("a reply is recorded");
+    assert!(calls.is_array(), "the query must return the calls: {calls}");
+    assert!(
+        calls.get(0).is_some_and(|call| call.get("id").is_some()),
+        "the calls must carry their ids: {calls}"
+    );
+    // The discriminating assertion. The whole reply is an OBJECT carrying a
+    // stop reason and the replayed content blocks. The calls are an array
+    // carrying neither. A tool input may hold a `content` field of its own,
+    // so the stop reason is the field that tells the two shapes apart.
+    let rendered = calls.to_string();
+    assert!(
+        !rendered.contains("stop_reason"),
+        "the read must carry the calls alone: {rendered}"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -1368,7 +1390,7 @@ async fn a_history_command_reads_a_bounded_page() {
     )
     .await
     .expect("the history is answered");
-    let Response::History { events } = answer else {
+    let Response::History { events, .. } = answer else {
         panic!("unexpected answer: {answer:?}");
     };
 
@@ -1385,6 +1407,18 @@ async fn a_history_command_reads_a_bounded_page() {
         "a short session is the whole log: {}",
         events[0]
     );
+
+    // An event's data is cut in the DATABASE. A recorded activity can approach
+    // the backend's payload cap, and a page names hundreds of them. A page
+    // that read them whole would hold gigabytes for one command.
+    let cap = inspect::MAX_EVENT_DETAIL_CHARS as usize;
+    for line in &events {
+        assert!(
+            line.chars().count() <= cap + 64,
+            "an audit line must be cut, and printed {} characters",
+            line.chars().count()
+        );
+    }
 
     // Each line carries the event's OWN sequence number, which the log counts
     // from zero. A bounded read therefore never renumbers the log it shows,
@@ -1406,10 +1440,29 @@ async fn a_history_command_reads_a_bounded_page() {
     )
     .await
     .expect("the page is answered");
-    let Response::History { events: older } = page else {
+    let Response::History { events: older, .. } = page else {
         panic!("unexpected answer: {page:?}");
     };
     assert_eq!(older.len(), 2, "the page before event 2 holds two events");
+
+    // The continuation command is rendered by the CLIENT, so it carries the
+    // socket the operator asked. A command built in the daemon cannot know
+    // it, and would send the operator to whatever answers the default.
+    let hinted = crate::rendered_lines(
+        &Response::History {
+            events: vec!["0  WorkflowStarted".to_string()],
+            execution_id: execution_id.clone(),
+            older: Some(7),
+        },
+        Path::new("/run/agentd/project-b.sock"),
+    );
+    assert!(
+        hinted[0].contains("--socket /run/agentd/project-b.sock")
+            && hinted[0].contains("--before 7")
+            && hinted[0].contains(&execution_id),
+        "the continuation command must reach the same daemon: {}",
+        hinted[0]
+    );
     assert!(
         older[0].trim_start().starts_with("0  "),
         "the page must start at the log's own first event: {}",
