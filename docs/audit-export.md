@@ -316,7 +316,13 @@ shard records:
   there rather than in the URI authority
   (`postgresql:///harvest?host=%2Frun%2Fpg`), so the key falls back to
   them when the authority host is empty, or to `hostaddr` whenever it is
-  given at all, matching libpq's own precedence.
+  given at all, matching libpq's own precedence. A resolved host is
+  lowercased only when it does not start with `/`: a DNS name is
+  case-insensitive, but a Unix-socket path is a case-sensitive filesystem
+  path (`/run/PG-A` and `/run/pg-a` name different sockets). A DSN with
+  no path is not treated as naming no database, since libpq defaults an
+  omitted `dbname` to the connecting username — the key uses the
+  username only in that case, never when a path is present.
 
   Two gaps are accepted rather than chased further, since closing either
   needs a live connection: a host alias (two hostnames resolving to one

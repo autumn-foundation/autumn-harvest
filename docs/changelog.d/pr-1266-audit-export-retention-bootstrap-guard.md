@@ -130,6 +130,19 @@ or `hostaddr` query parameter when the authority host is empty, or to
 `hostaddr` whenever it is given at all, matching libpq's own precedence
 between the two. A `port` query parameter is honored the same way.
 
+A tenth review round found two more gaps in the same host-resolution
+fix. First (P2): a resolved host was always lowercased, which is correct
+for a DNS name but wrong for a Unix-socket path — `/run/PG-A` and
+`/run/pg-a` name different sockets on a case-sensitive filesystem, so
+lowercasing them could falsely merge two different databases.
+`canonical_dsn_key` now lowercases a resolved host only when it does not
+start with `/`. Second (P2): a DSN with no path was treated as naming no
+database, but libpq defaults an omitted `dbname` to the connecting
+username, so two DSNs with no path but different usernames can already
+name two different databases today, silently. The key now uses the
+username only when the path is empty; an explicit path still ignores the
+username, so this does not reopen the sixth round's credentials fix.
+
 New tests:
 - `retention_protects_unexported_audit_when_configured_with_no_cursor_and_no_local_sink`
   reproduces the exact bootstrap window (no cursor row anywhere, no sink in
@@ -171,6 +184,15 @@ New tests:
   `from_dsns_groups_shards_sharing_one_unix_socket_host` pin the ninth
   round's fix: two Unix-socket DSNs naming different sockets through
   `host` never collapse, and two naming the same socket still do.
+- `from_dsns_keeps_distinctly_cased_socket_paths_separate` and
+  `from_dsns_groups_shards_sharing_one_hostname_regardless_of_case` pin
+  the tenth round's first fix: a socket path's case is significant and
+  is never folded, while a DNS hostname's case still is.
+- `from_dsns_keeps_distinct_users_with_no_explicit_dbname_separate` and
+  `from_dsns_ignores_username_when_dbname_is_explicit` pin the tenth
+  round's second fix: two users with no explicit dbname reach different
+  databases and must never collapse, while an explicit, shared dbname
+  still collapses regardless of username.
 
 **Zero migration, zero engine impact beyond the new parameter.** No new
 `WorkflowEvent` variant, no schema change, no change to any existing call

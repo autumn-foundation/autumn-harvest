@@ -970,7 +970,15 @@ fn group_by_pool_identity(pools: &BTreeMap<ShardId, DbPool>) -> BTreeMap<ShardId
 /// either one when the authority host is empty. It falls back to
 /// `hostaddr` whenever that is given at all, since `hostaddr` wins over
 /// `host` in libpq's own precedence. A `port` query parameter is
-/// honored the same way.
+/// honored the same way. A resolved host is lowercased, since a DNS
+/// name is case-insensitive. A socket path (it always starts with `/`)
+/// is kept as written instead, since a filesystem path is not.
+///
+/// A DSN with no path names no database. That is not the same as
+/// naming none: libpq defaults an omitted `dbname` to the connecting
+/// username. The key uses the username in that case, and only in that
+/// case. The rest of this comment's reasoning against using the
+/// username still holds whenever a path is present.
 ///
 /// Two gaps are accepted rather than chased further. Closing either
 /// needs a live connection. Building a pool must stay a pure, local
@@ -992,7 +1000,7 @@ fn canonical_dsn_key(dsn: &str) -> String {
     let Ok(url) = url::Url::parse(dsn) else {
         return dsn.to_string();
     };
-    let mut host = url.host_str().unwrap_or_default().to_ascii_lowercase();
+    let mut host = normalize_host(url.host_str().unwrap_or_default());
     let mut port = url.port().unwrap_or(5432);
     let path = url.path();
     let mut options = String::new();
@@ -1006,13 +1014,33 @@ fn canonical_dsn_key(dsn: &str) -> String {
             // reads the real endpoint from `host` or `hostaddr` here
             // instead. `hostaddr` wins when both are given, matching
             // libpq's own precedence.
-            "host" if host.is_empty() => host = value.to_ascii_lowercase(),
-            "hostaddr" => host = value.to_ascii_lowercase(),
+            "host" if host.is_empty() => host = normalize_host(&value),
+            "hostaddr" => host = normalize_host(&value),
             "port" => port = value.parse().unwrap_or(port),
             _ => {}
         }
     }
+    // libpq defaults an omitted dbname to the connecting username, so
+    // an empty path still names a real, specific database.
+    let path = if path.is_empty() || path == "/" {
+        format!("/{}", url.username())
+    } else {
+        path.to_string()
+    };
     format!("{host}:{port}{path}?options={options}")
+}
+
+/// Lowercases a host, since DNS names are case-insensitive. A Unix-socket
+/// directory path is not: `/run/PG-A` and `/run/pg-a` name different
+/// sockets on a case-sensitive filesystem, so a leading `/` is left
+/// untouched.
+#[cfg(feature = "db")]
+fn normalize_host(value: &str) -> String {
+    if value.starts_with('/') {
+        value.to_string()
+    } else {
+        value.to_ascii_lowercase()
+    }
 }
 
 #[cfg(feature = "db")]
@@ -2152,6 +2180,122 @@ mod tests {
             1,
             "the same `host` query parameter names the same socket, so \
              these must collapse into one group"
+        );
+    }
+
+    // Unix filesystem paths are case-sensitive: `/run/PG-A` and
+    // `/run/pg-a` name different sockets (issue #1266).
+    #[cfg(feature = "db")]
+    #[test]
+    fn from_dsns_keeps_distinctly_cased_socket_paths_separate() {
+        let sharded = ShardedDbPool::from_dsns(
+            [
+                (
+                    ShardId::new(0),
+                    "postgresql:///harvest?host=%2Frun%2FPG-A".to_string(),
+                ),
+                (
+                    ShardId::new(1),
+                    "postgresql:///harvest?host=%2Frun%2Fpg-a".to_string(),
+                ),
+            ],
+            ShardId::new(0),
+            1,
+        )
+        .expect("pool builds without connecting");
+
+        let groups = sharded.pool_groups();
+        assert_eq!(
+            groups.len(),
+            2,
+            "a socket path's case is significant, so these must never \
+             collapse into one group"
+        );
+    }
+
+    // A DNS hostname stays case-insensitive even when it arrives through
+    // `host=`, unlike a socket path (issue #1266).
+    #[cfg(feature = "db")]
+    #[test]
+    fn from_dsns_groups_shards_sharing_one_hostname_regardless_of_case() {
+        let sharded = ShardedDbPool::from_dsns(
+            [
+                (
+                    ShardId::new(0),
+                    "postgresql:///harvest?host=DB.EXAMPLE".to_string(),
+                ),
+                (
+                    ShardId::new(1),
+                    "postgresql:///harvest?host=db.example".to_string(),
+                ),
+            ],
+            ShardId::new(0),
+            1,
+        )
+        .expect("pool builds without connecting");
+
+        let groups = sharded.pool_groups();
+        assert_eq!(
+            groups.len(),
+            1,
+            "a DNS hostname is case-insensitive, so these must collapse \
+             into one group"
+        );
+    }
+
+    // libpq defaults an omitted dbname to the connecting username, so
+    // two users with no explicit dbname reach different databases
+    // (issue #1266).
+    #[cfg(feature = "db")]
+    #[test]
+    fn from_dsns_keeps_distinct_users_with_no_explicit_dbname_separate() {
+        let sharded = ShardedDbPool::from_dsns(
+            [
+                (ShardId::new(0), "postgres://alice@db.example".to_string()),
+                (ShardId::new(1), "postgres://bob@db.example".to_string()),
+            ],
+            ShardId::new(0),
+            1,
+        )
+        .expect("pool builds without connecting");
+
+        let groups = sharded.pool_groups();
+        assert_eq!(
+            groups.len(),
+            2,
+            "an omitted dbname defaults to the username, so two \
+             different users must never collapse into one group"
+        );
+    }
+
+    // The username-as-dbname fallback applies only when no path is
+    // given. An explicit, shared dbname still groups regardless of
+    // username (issue #1266).
+    #[cfg(feature = "db")]
+    #[test]
+    fn from_dsns_ignores_username_when_dbname_is_explicit() {
+        let sharded = ShardedDbPool::from_dsns(
+            [
+                (
+                    ShardId::new(0),
+                    "postgres://alice@db.example/shared".to_string(),
+                ),
+                (
+                    ShardId::new(1),
+                    "postgres://bob@db.example/shared".to_string(),
+                ),
+            ],
+            ShardId::new(0),
+            1,
+        )
+        .expect("pool builds without connecting");
+
+        let groups = sharded.pool_groups();
+        assert_eq!(
+            groups.len(),
+            1,
+            "an explicit dbname is not defaulted from the username, so \
+             these must still collapse into one group"
         );
     }
 }
