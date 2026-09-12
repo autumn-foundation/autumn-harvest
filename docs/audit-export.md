@@ -359,6 +359,9 @@ shard records:
   itself can carry `-c search_path=...`, `-csearch_path=...`, or
   PostgreSQL's long-form `--search_path=...`, all three recognized, but
   also any other GUC an operator sets, so the whole string is not kept).
+  The GUC name is matched case-insensitively in all three spellings,
+  since PostgreSQL parameter names are: `SEARCH_PATH=shared` sets the
+  identical GUC as `search_path=shared`.
   Postgres applies repeated `-c` flags in order, so
   a later `-c search_path=...` overrides an earlier one; the extraction
   keeps only the last occurrence, matching that sequential-`SET`
@@ -392,7 +395,10 @@ shard records:
   `pg_catalog,public` resolve an unqualified relation identically and
   must key the same, while `public,pg_catalog` (an explicit, trailing
   `pg_catalog`) names a genuinely different order and stays distinct.
-  A repeated name is then dropped, keeping only its first occurrence:
+  `pg_temp`, the session's temporary-object schema, is inserted the
+  same way but ahead of `pg_catalog`, matching Postgres's own
+  precedence when both are implicit. A repeated name is then dropped,
+  keeping only its first occurrence:
   `public` and `public,public` search the identical schema in the
   identical order, so a later repeat changes nothing about where a
   relation resolves.

@@ -590,6 +590,35 @@ New tests:
 pins the first fix, and
 `from_dsns_groups_a_search_path_with_a_repeated_name` pins the second.
 
+A twenty-second review round raised two more findings, both P1, both
+the dangerous under-merging direction, continuing the pattern from the
+rounds above.
+
+The first found that GUC parameter names are case-insensitive in
+Postgres, so `SEARCH_PATH=shared` sets the identical GUC as
+`search_path=shared`, but the prefix check was case-sensitive and
+extracted `None` for the uppercase spelling, splitting the two
+aliases. `extract_search_path` now matches the GUC name
+case-insensitively across all three recognized spellings via a shared
+`strip_search_path_name` helper.
+
+The second found that `search_path=public` and
+`search_path=pg_temp,pg_catalog,public` resolve the identical order:
+the session's temporary-object schema, `pg_temp`, is implicitly
+searched first when omitted, just as `pg_catalog` is implicitly
+searched first (ahead of the listed path) when it is omitted.
+`normalize_search_path` now inserts `pg_temp` at the very front when
+absent, applied after the existing `pg_catalog` insertion so it lands
+ahead of `pg_catalog` exactly when both were omitted. A list that
+already names `pg_temp` anywhere keeps its explicit position, matching
+`pg_catalog`'s own rule.
+
+New tests: `from_dsns_recognizes_an_uppercase_search_path_guc_name`
+pins the first fix.
+`from_dsns_groups_an_implicit_pg_temp_with_an_explicit_leading_one` and
+`from_dsns_keeps_an_explicit_trailing_pg_temp_distinct_from_the_implicit_leading_one`
+pin the second, mirroring the twentieth round's `pg_catalog` test pair.
+
 **Zero migration, zero engine impact beyond the new parameter.** No new
 `WorkflowEvent` variant, no schema change, no change to any existing call
 site's behavior when the new flag is left at its default (disabled).

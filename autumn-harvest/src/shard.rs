@@ -1088,11 +1088,14 @@ fn canonical_dsn_key(dsn: &str) -> String {
 /// token. The other two are one-token spellings: the compact
 /// `-csearch_path=value`, and the long-form `--search_path=value`.
 /// `PostgreSQL`'s own server documentation names the long form as an
-/// alternate spelling for any run-time parameter. A quoted value with
-/// embedded spaces is not recognized. Treating an unparsed `options`
-/// string as carrying no `search_path` is the conservative direction
-/// here. It only widens which DSNs compare as different, never the
-/// reverse.
+/// alternate spelling for any run-time parameter. The GUC name itself
+/// is matched case-insensitively in all three shapes (issue #1266).
+/// `PostgreSQL` parameter names are case-insensitive, so
+/// `SEARCH_PATH=shared` sets the identical GUC as `search_path=shared`.
+/// A quoted value with embedded spaces is not recognized. Treating an
+/// unparsed `options` string as carrying no `search_path` is the
+/// conservative direction here. It only widens which DSNs compare as
+/// different, never the reverse.
 ///
 /// Splitting honors libpq's own escaping rule for `options` (issue
 /// #1266). A backslash before a space embeds a literal space in the
@@ -1128,20 +1131,33 @@ fn extract_search_path(options: &str) -> Option<String> {
     let mut tokens = split_options_preserving_escapes(options).into_iter();
     let mut search_path = None;
     while let Some(tok) = tokens.next() {
-        if tok == "-c" {
-            if let Some(value) = tokens
+        let value: Option<String> = if tok == "-c" {
+            tokens
                 .next()
-                .and_then(|kv| kv.strip_prefix("search_path=").map(str::to_string))
-            {
-                search_path = Some(normalize_search_path(&value));
-            }
-        } else if let Some(value) = tok.strip_prefix("-csearch_path=") {
-            search_path = Some(normalize_search_path(value));
-        } else if let Some(value) = tok.strip_prefix("--search_path=") {
-            search_path = Some(normalize_search_path(value));
+                .and_then(|kv| strip_search_path_name(&kv).map(str::to_string))
+        } else if let Some(rest) = tok.strip_prefix("-c") {
+            strip_search_path_name(rest).map(str::to_string)
+        } else if let Some(rest) = tok.strip_prefix("--") {
+            strip_search_path_name(rest).map(str::to_string)
+        } else {
+            None
+        };
+        if let Some(value) = value {
+            search_path = Some(normalize_search_path(&value));
         }
     }
     search_path
+}
+
+/// Splits a `name=value` token and returns `value` only when `name`
+/// case-insensitively equals `search_path` (issue #1266). `PostgreSQL`
+/// parameter names are case-insensitive, so `SEARCH_PATH=shared` sets
+/// the identical GUC as `search_path=shared` and must extract the same
+/// way.
+#[cfg(feature = "db")]
+fn strip_search_path_name(token: &str) -> Option<&str> {
+    let (name, value) = token.split_once('=')?;
+    name.eq_ignore_ascii_case("search_path").then_some(value)
 }
 
 /// Splits a libpq `options` string into arguments, honoring its
@@ -1207,6 +1223,13 @@ fn split_options_preserving_escapes(options: &str) -> Vec<String> {
 /// order, and an explicit, non-leading position is a genuinely
 /// different order from the implicit one.
 ///
+/// `pg_temp` is inserted the same way, but at the very front (issue
+/// #1266). `PostgreSQL` searches the session's temporary-object schema
+/// before `pg_catalog` too, unless `pg_temp` is named explicitly. The
+/// two implicit insertions are independent, so `pg_temp` is applied
+/// after `pg_catalog`'s, landing ahead of it exactly when both were
+/// omitted.
+///
 /// A repeated name is then dropped, keeping only its first occurrence
 /// (issue #1266). `public` and `public,public` search the identical
 /// schema in the identical order. A later repeat of a name already
@@ -1219,6 +1242,9 @@ fn normalize_search_path(value: &str) -> String {
         |mut items| {
             if !items.iter().any(|item| item == "pg_catalog") {
                 items.insert(0, "pg_catalog".to_string());
+            }
+            if !items.iter().any(|item| item == "pg_temp") {
+                items.insert(0, "pg_temp".to_string());
             }
             let mut seen = std::collections::HashSet::new();
             items.retain(|item| seen.insert(item.clone()));
@@ -2949,6 +2975,96 @@ mod tests {
             "an escaped tab in one alias's search_path value must not \
              stop it from collapsing with the other, just as an escaped \
              space does not"
+        );
+    }
+
+    #[cfg(feature = "db")]
+    #[test]
+    fn from_dsns_recognizes_an_uppercase_search_path_guc_name() {
+        let sharded = ShardedDbPool::from_dsns(
+            [
+                (
+                    ShardId::new(0),
+                    "postgres://db.example/shared?options=-c%20SEARCH_PATH%3Dshared".to_string(),
+                ),
+                (
+                    ShardId::new(1),
+                    "postgres://db.example/shared?options=-c%20search_path%3Dshared".to_string(),
+                ),
+            ],
+            ShardId::new(0),
+            1,
+        )
+        .expect("pool builds without connecting");
+
+        let groups = sharded.pool_groups();
+        assert_eq!(
+            groups.len(),
+            1,
+            "PostgreSQL parameter names are case-insensitive, so \
+             SEARCH_PATH=shared sets the identical GUC as \
+             search_path=shared and must select the same schema"
+        );
+    }
+
+    #[cfg(feature = "db")]
+    #[test]
+    fn from_dsns_groups_an_implicit_pg_temp_with_an_explicit_leading_one() {
+        let sharded = ShardedDbPool::from_dsns(
+            [
+                (
+                    ShardId::new(0),
+                    "postgres://db.example/shared?options=-c%20search_path%3Dpublic".to_string(),
+                ),
+                (
+                    ShardId::new(1),
+                    "postgres://db.example/shared?options=-c%20search_path%3Dpg_temp%2Cpg_catalog%2Cpublic"
+                        .to_string(),
+                ),
+            ],
+            ShardId::new(0),
+            1,
+        )
+        .expect("pool builds without connecting");
+
+        let groups = sharded.pool_groups();
+        assert_eq!(
+            groups.len(),
+            1,
+            "PostgreSQL always searches the session's temporary schema \
+             before pg_catalog when it is omitted, so public and \
+             pg_temp,pg_catalog,public resolve the same way and must \
+             collapse"
+        );
+    }
+
+    #[cfg(feature = "db")]
+    #[test]
+    fn from_dsns_keeps_an_explicit_trailing_pg_temp_distinct_from_the_implicit_leading_one() {
+        let sharded = ShardedDbPool::from_dsns(
+            [
+                (
+                    ShardId::new(0),
+                    "postgres://db.example/shared?options=-c%20search_path%3Dpublic".to_string(),
+                ),
+                (
+                    ShardId::new(1),
+                    "postgres://db.example/shared?options=-c%20search_path%3Dpublic%2Cpg_temp"
+                        .to_string(),
+                ),
+            ],
+            ShardId::new(0),
+            1,
+        )
+        .expect("pool builds without connecting");
+
+        let groups = sharded.pool_groups();
+        assert_eq!(
+            groups.len(),
+            2,
+            "omitting pg_temp always searches it first, but naming it \
+             explicitly last searches it last -- a genuinely different \
+             resolution order that must never collapse with the implicit one"
         );
     }
 
