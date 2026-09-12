@@ -28042,6 +28042,24 @@ impl Worker {
                         error = %error,
                         "task execution failed"
                     );
+                    // Release the claim here too (issue #1459, Codex P1 on PR
+                    // #1497). This arm runs when the task is not a workflow
+                    // task. It also runs when `with_workflow_task_timeout` is
+                    // `Duration::ZERO`. The builder documents that value as a
+                    // supported way to disable the wall-clock guard. A workflow
+                    // task on that path met the same abandoned claim, so the
+                    // recovery cannot live only in the timed arm.
+                    //
+                    // An activity task needs nothing here. Its `heartbeat_timeout`
+                    // and `start_to_close` columns give the server-side scan in
+                    // `timeout::find_timed_out_tasks` a deadline to find it by. A
+                    // workflow task has no such column, which is why only its
+                    // claim strands.
+                    #[cfg(feature = "db")]
+                    if task_type == "workflow" {
+                        drop(permit);
+                        reset_timed_out_workflow_task(&pool, task_id, &worker_id).await;
+                    }
                 }
             }
         };
