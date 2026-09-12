@@ -1073,6 +1073,7 @@ async fn chaos_ac1d_session_lease_expiry_marks_broken() {
         None,
         &std::collections::HashMap::new(),
         1,
+        &[],
     )
     .await
     .expect("register live host worker");

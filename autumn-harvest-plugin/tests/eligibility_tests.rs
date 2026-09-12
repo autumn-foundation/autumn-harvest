@@ -135,6 +135,7 @@ async fn register_active_worker_with_build(
         Some("test-deploy"),
         &std::collections::HashMap::new(),
         0,
+        &[],
     )
     .await
     .expect("worker registration should succeed");
@@ -1115,6 +1116,7 @@ async fn test_worker_capabilities_routing_and_triage() {
             None,
             &matching_labels,
             0,
+            &[],
         )
         .await
         .unwrap();
@@ -1135,6 +1137,7 @@ async fn test_worker_capabilities_routing_and_triage() {
             None,
             &std::collections::HashMap::new(),
             0,
+            &[],
         )
         .await
         .unwrap();
@@ -2083,6 +2086,7 @@ async fn test_worker_queue_filtering_for_capable_of() {
             None,
             &matching_labels,
             0,
+            &[],
         )
         .await
         .unwrap();
@@ -2103,6 +2107,7 @@ async fn test_worker_queue_filtering_for_capable_of() {
             None,
             &matching_labels,
             0,
+            &[],
         )
         .await
         .unwrap();
@@ -2178,6 +2183,7 @@ async fn test_worker_queue_filtering_with_explicit_queue_override() {
             None,
             &matching_labels,
             0,
+            &[],
         )
         .await
         .unwrap();
@@ -2198,6 +2204,7 @@ async fn test_worker_queue_filtering_with_explicit_queue_override() {
             None,
             &matching_labels,
             0,
+            &[],
         )
         .await
         .unwrap();
@@ -2240,6 +2247,7 @@ async fn test_worker_heartbeat_updates_labels() {
             None,
             &std::collections::HashMap::new(),
             0,
+            &[],
         )
         .await
         .unwrap();
@@ -2252,9 +2260,10 @@ async fn test_worker_heartbeat_updates_labels() {
 
     {
         let mut conn = pool.get().await.unwrap();
-        let affected = heartbeat_worker(&mut conn, "worker-hb-labels-test", 0, &labels_json, 0)
-            .await
-            .unwrap();
+        let affected =
+            heartbeat_worker(&mut conn, "worker-hb-labels-test", 0, &labels_json, 0, &[])
+                .await
+                .unwrap();
         assert_eq!(affected, 1);
     }
 
@@ -2266,8 +2275,8 @@ async fn test_worker_heartbeat_updates_labels() {
             .unwrap()
             .expect("worker should exist");
 
-        let worker_labels: std::collections::HashMap<String, String> =
-            serde_json::from_value(worker_row.worker.labels).unwrap();
+        let worker_labels =
+            autumn_harvest::payload_codec::string_valued_labels(&worker_row.worker.labels);
         assert_eq!(worker_labels.get("gpu").map(String::as_str), Some("true"));
     }
 }
