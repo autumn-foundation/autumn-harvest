@@ -425,6 +425,14 @@ impl MetricsRecorder for MetricsRsRecorder {
         .set(count as f64);
     }
 
+    fn record_replication_rpo_known(&self, shard: u16, known: bool) {
+        gauge!(
+            crate::telemetry::METRIC_REPLICATION_RPO_KNOWN,
+            METRIC_LABEL_SHARD => shard.to_string(),
+        )
+        .set(if known { 1.0 } else { 0.0 });
+    }
+
     #[allow(clippy::cast_precision_loss)]
     fn record_shard_generation(&self, shard: u16, generation: i64) {
         gauge!(

@@ -22,8 +22,9 @@ use crate::completion_trigger::DeferredTriggerStart;
 use crate::error::{HarvestError, HarvestResult, TimeoutType, database_error};
 use crate::execution::{
     CancelledWorkflowExecution, StartWorkflowParams, StartedWorkflowExecution,
-    check_and_report_unfinished_handlers, load_execution, start_or_load_workflow_execution,
-    start_or_load_workflow_execution_collect,
+    check_and_report_unfinished_handlers, load_execution,
+    start_or_load_workflow_execution_collect_with_codecs,
+    start_or_load_workflow_execution_with_codecs,
 };
 use crate::models::WorkflowExecution;
 use crate::notify::{WorkflowEventListener, WorkflowEventWaitOutcome};
@@ -649,7 +650,13 @@ impl WorkflowHandleClient {
         conn: &mut AsyncPgConnection,
         request: StartWorkflowParams<'_>,
     ) -> HarvestResult<StartedWorkflowHandle> {
-        let started = start_or_load_workflow_execution(conn, request, None).await?;
+        let started = start_or_load_workflow_execution_with_codecs(
+            conn,
+            request,
+            None,
+            &self.inner.payload_codecs,
+        )
+        .await?;
         let handle = self.handle(started.exec_id);
         Ok(StartedWorkflowHandle { started, handle })
     }
@@ -862,7 +869,7 @@ impl WorkflowHandleClient {
                     Vec<crate::execution::StartCancelledRun>,
                 ), HarvestError, _>(async |conn| {
                     let params = params;
-                    start_or_load_workflow_execution_collect(
+                    start_or_load_workflow_execution_collect_with_codecs(
                         conn,
                         params,
                         /* in_outer_transaction = */ true,
@@ -870,6 +877,7 @@ impl WorkflowHandleClient {
                         Some(self.inner.metrics.as_ref()
                             as &(dyn crate::telemetry::MetricsRecorder + Send + Sync)),
                         Some(crate::admission_gate::GateMode::CheckCached),
+                        &self.inner.payload_codecs,
                     )
                     .await
                 }))
@@ -1340,13 +1348,14 @@ impl WorkflowHandleClient {
                 )),
                 StartIdempotencyReservation::Reserved => {
                     let (started, deferred_starts, deferred_checks, cancel_metrics) =
-                        start_or_load_workflow_execution_collect(
+                        start_or_load_workflow_execution_collect_with_codecs(
                             conn,
                             params,
                             true,
                             false,
                             metrics,
                             Some(crate::admission_gate::GateMode::CheckCached),
+                            &self.inner.payload_codecs,
                         )
                         .await?;
                     // The reserve wrote the claim pointing at `new_exec_id`. If the
@@ -2278,13 +2287,14 @@ impl WorkflowHandle {
         // (woken below), which emits update.completed/failed, so admitting
         // without recording admitted would leave this path asymmetric. The
         // recorder defaults to a no-op when the client was built without one.
-        let mut admit = crate::store::admit_update_event(
+        let mut admit = crate::store::admit_update_event_with_codecs(
             conn,
             target,
             update_id,
             name.to_string(),
             input.clone(),
             Some(self.client.inner.metrics.as_ref()),
+            &self.client.inner.payload_codecs,
         )
         .await;
         for _ in 0..crate::execution::RETRY_CHAIN_MAX_REDRIVES {
@@ -2298,13 +2308,14 @@ impl WorkflowHandle {
             target = fresh;
             self.validate_workflow_type_for(conn, target, workflow_name)
                 .await?;
-            admit = crate::store::admit_update_event(
+            admit = crate::store::admit_update_event_with_codecs(
                 conn,
                 target,
                 update_id,
                 name.to_string(),
                 input.clone(),
                 Some(self.client.inner.metrics.as_ref()),
+                &self.client.inner.payload_codecs,
             )
             .await;
         }

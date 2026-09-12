@@ -852,15 +852,27 @@ pub async fn enqueue_batch(
 /// new bind — it reuses `$2`, pre-filtering `harvest_queue_pauses` to the
 /// worker's own polled queues once via `paused_queues` rather than probing it
 /// once per candidate row (see the `NOTE` above `claim_task_query` for why).
+/// That `$2` bound also caps `paused_queues`' array width at the worker's own
+/// polled-queue count, typically single digits. A fleet-wide operator pause
+/// of many queues does not widen it for a typical worker — see issue #1215.
 ///
 /// The per-activity-type pause (issue #807) needs no bind either: unlike
 /// `paused_queues` there is no natural bound to pre-filter by — a worker's
 /// polled queues say nothing about which activity types are held — so
-/// `paused_activities` reads the whole table. That is deliberate and cheap: the
-/// table is keyed by activity name and holds one row per *currently paused*
-/// activity, so it is empty in steady state and a handful of rows during an
-/// incident. It is `MATERIALIZED` for the same reason `paused_queues` is —
-/// evaluated once per claim, never once per candidate row.
+/// `paused_activities` reads the whole table. It is `MATERIALIZED` for the
+/// same reason `paused_queues` is — evaluated once per claim, never once per
+/// candidate row.
+///
+/// **That unbounded width has a measured cost, not only a theoretical one.**
+/// Issue #1215 found the claim sort spills to disk once
+/// `harvest_activity_pauses` holds around 20 rows, at a 10 000-row backlog.
+/// That is far below the few-hundred-thousand-row depth issue #1177's own
+/// locked-scenario reproduction needed to trigger the same spill against an
+/// empty pause table. Pausing that many activity types during one incident
+/// is a realistic operator action, not an edge case. See
+/// `docs/performance.md`'s Known limitations section for the measured
+/// comparison against `paused_queues`. That page explains why no
+/// query-shape fix is proposed here.
 ///
 /// **Both activity-name gates (`$6` and `paused_activities`) are guarded by
 /// `task_type != 'activity' OR activity_name IS NULL` and this is load-bearing,

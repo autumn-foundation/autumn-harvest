@@ -2010,6 +2010,13 @@ async fn start_harvest_runtime(
                 let metrics = registry
                     .as_ref()
                     .map(|r| std::sync::Arc::clone(&r.telemetry().metrics));
+                // Issue #1243: `input` above is payload-bearing. Fall back to
+                // the identity registry only in the boot window where the
+                // registry extension is not yet installed.
+                let codecs = registry
+                    .as_ref()
+                    .map(|r| r.payload_codecs().clone())
+                    .unwrap_or_default();
                 let (owner, runbook_url, severity, info_sla, info_retry_policy) = registry
                     .and_then(|registry| {
                         registry.workflows.get("webhook_delivery").map(|wf| {
@@ -2135,11 +2142,12 @@ async fn start_harvest_runtime(
                     // webhook delivery is in-flight continuation of already-committed
                     // work and must not be permanently dropped by a boot/DB blip it
                     // cannot retry past.
-                    match autumn_harvest::execution::start_or_load_workflow_execution_with_metrics(
+                    match autumn_harvest::execution::start_or_load_workflow_execution_with_metrics_and_codecs(
                         &mut conn,
                         start_params,
                         metrics_ref,
                         Some(autumn_harvest::admission_gate::GateMode::CheckCached),
+                        &codecs,
                     )
                     .await
                     {

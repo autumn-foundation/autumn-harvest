@@ -685,6 +685,79 @@ fn default_workflow_queue() -> String {
         .unwrap_or_else(|| "default".to_string())
 }
 
+/// Batch form of [`resolve_target_queue`]'s `harvest_schedules` lookup. It
+/// makes one round trip for every distinct `target_workflow_name` in
+/// `names`, instead of one per row (issue #1227 follow-up, Ledger).
+///
+/// `harvest_schedules` carries `harvest_schedules_workflow_name_unique`
+/// (issue #91's migration). So `workflow_name = ANY($1)` returns **at most
+/// one row per name** — the same "at most one match" cardinality
+/// [`resolve_target_queue`] relies on via `.first()`. Batching therefore
+/// cannot reorder or drop a match. The per-name answer this returns is
+/// byte-for-byte the one [`resolve_target_queue`] would return for that
+/// name; only the round-trip count changes. A name with no schedule row,
+/// or a schedule row whose `queue_name` is `NULL`, resolves to
+/// [`default_workflow_queue`] — identical to the per-row path.
+///
+/// Schedules live only on the default shard. That is the same reason
+/// [`resolve_target_queue`] always ends up there for a non-default target
+/// shard, so this always queries `default_conn`. The caller passes a
+/// connection already checked out from the default shard's pool.
+#[cfg(feature = "db")]
+async fn resolve_target_queues_batch(
+    default_conn: &mut diesel_async::AsyncPgConnection,
+    names: &[String],
+) -> std::collections::HashMap<String, String> {
+    use crate::schema::harvest_schedules::dsl as sched_dsl;
+    use diesel::prelude::*;
+    use diesel_async::RunQueryDsl;
+
+    if names.is_empty() {
+        return std::collections::HashMap::new();
+    }
+
+    let Ok(rows) = sched_dsl::harvest_schedules
+        .filter(sched_dsl::workflow_name.eq_any(names))
+        .select((sched_dsl::workflow_name, sched_dsl::queue_name))
+        .load::<(Option<String>, Option<String>)>(default_conn)
+        .await
+    else {
+        // Same fail-open shape as `resolve_target_queue`'s own
+        // `Ok(...).optional()` handling. A lookup failure here is not
+        // fatal to the relay. It just means every name in this batch
+        // falls through to the per-row fallback the caller keeps for
+        // exactly this case.
+        return std::collections::HashMap::new();
+    };
+
+    // `workflow_name` is `Nullable<Text>` in the schema (DAG-kind schedule
+    // rows leave it NULL). But every row this filter can match came from
+    // `names`, a list of non-empty `String`s. So a NULL name here would
+    // mean the `ANY($1)` predicate matched a NULL, which SQL's `= ANY`
+    // never does. Skip defensively rather than unwrap. This filters
+    // nothing in practice, and turns a would-be panic into a harmless
+    // miss; the caller's per-row fallback still covers it.
+    let mut resolved: std::collections::HashMap<String, String> = rows
+        .into_iter()
+        .filter_map(|(name, queue)| name.map(|n| (n, queue.unwrap_or_else(default_workflow_queue))))
+        .collect();
+
+    // A name with no `harvest_schedules` row at all is simply absent from
+    // `rows` -- SQL's `= ANY` has nothing to return a NULL match for.
+    // Without this backfill, such a name would fall through to the
+    // per-row fallback exactly like a genuine lookup failure. That would
+    // defeat the batch for every such name, instead of resolving it to
+    // the correct default here. `resolve_target_queue` reaches the
+    // identical `default_workflow_queue()` answer for this case, via its
+    // own `.optional()` returning `Ok(None)`.
+    for name in names {
+        resolved
+            .entry(name.clone())
+            .or_insert_with(default_workflow_queue);
+    }
+    resolved
+}
+
 /// Resolve the start queue for a **cross-shard** completion-trigger target.
 ///
 /// Mirrors how `enforce_completion_triggers_outbox` resolves the queue at fire
@@ -849,6 +922,8 @@ async fn relay_gate_checked_start(
     source_exec_id: Uuid,
     trigger_id: Uuid,
     metrics: Option<&(dyn crate::telemetry::MetricsRecorder + Send + Sync)>,
+    // Issue #1243: `WorkflowStarted.input` is payload-bearing.
+    codecs: &crate::payload_codec::PayloadCodecs,
 ) -> crate::error::HarvestResult<()> {
     use crate::schema::harvest_completion_trigger_fires::dsl as fires_dsl;
     use crate::schema::harvest_completion_trigger_outbox::dsl as outbox_dsl;
@@ -937,11 +1012,12 @@ async fn relay_gate_checked_start(
                 return Ok(RelayOutcome::Delivered);
             }
 
-            match crate::execution::start_or_load_workflow_execution_with_metrics(
+            match crate::execution::start_or_load_workflow_execution_with_metrics_and_codecs(
                 target_conn,
                 params,
                 metrics,
                 Some(crate::admission_gate::GateMode::CheckCached),
+                codecs,
             )
             .await
             {
@@ -1104,6 +1180,10 @@ pub struct DeferredTriggerStart {
     pub retry_policy: Option<crate::policy::RetryPolicy>,
     /// Server-side ceiling on `max_attempts` (issue #523). Clamped at start time.
     pub max_workflow_attempts_ceiling: Option<u32>,
+    /// The configured payload-codec registry (issue #1243). `spawn` runs
+    /// detached from the evaluating call's own scope, so the registry rides
+    /// along on the struct rather than through a process-global static.
+    pub codecs: crate::payload_codec::PayloadCodecs,
 }
 
 #[cfg(feature = "db")]
@@ -1236,6 +1316,7 @@ impl DeferredTriggerStart {
                 self.source_exec_id,
                 self.trigger_id,
                 metrics_ref,
+                &self.codecs,
             )
             .await
             {
@@ -1276,12 +1357,43 @@ pub fn evaluate_triggers_for_execution<'a>(
     use futures::FutureExt;
     async move {
         let mut discarded_cancel_metrics = Vec::new();
-        evaluate_triggers_for_execution_collecting(
+        evaluate_triggers_for_execution_collecting_with_codecs(
             conn,
             exec_id,
             state,
             metrics,
             &mut discarded_cancel_metrics,
+            &crate::store::DEFAULT_PAYLOAD_CODECS,
+        )
+        .await
+    }
+    .boxed()
+}
+
+/// [`evaluate_triggers_for_execution`], encoding a triggered target's
+/// `WorkflowStarted.input` through `codecs` (issue #1243).
+///
+/// # Errors
+///
+/// Same as [`evaluate_triggers_for_execution`].
+#[cfg(feature = "db")]
+pub fn evaluate_triggers_for_execution_with_codecs<'a>(
+    conn: &'a mut diesel_async::AsyncPgConnection,
+    exec_id: crate::types::ExecutionId,
+    state: TerminalState,
+    metrics: Option<&'a (dyn crate::telemetry::MetricsRecorder + Send + Sync)>,
+    codecs: &'a crate::payload_codec::PayloadCodecs,
+) -> futures::future::BoxFuture<'a, crate::error::HarvestResult<Vec<DeferredTriggerStart>>> {
+    use futures::FutureExt;
+    async move {
+        let mut discarded_cancel_metrics = Vec::new();
+        evaluate_triggers_for_execution_collecting_with_codecs(
+            conn,
+            exec_id,
+            state,
+            metrics,
+            &mut discarded_cancel_metrics,
+            codecs,
         )
         .await
     }
@@ -1303,7 +1415,6 @@ pub fn evaluate_triggers_for_execution<'a>(
 /// accumulated `pending` list only **after** their enclosing transaction has
 /// committed — the exact same discipline already required of the
 /// `StartCancelledRun`s a fresh workflow start collects.
-#[allow(clippy::too_many_lines)]
 #[cfg(feature = "db")]
 pub fn evaluate_triggers_for_execution_collecting<'a>(
     conn: &'a mut diesel_async::AsyncPgConnection,
@@ -1314,13 +1425,44 @@ pub fn evaluate_triggers_for_execution_collecting<'a>(
 ) -> futures::future::BoxFuture<'a, crate::error::HarvestResult<Vec<DeferredTriggerStart>>> {
     use futures::FutureExt;
     async move {
+        evaluate_triggers_for_execution_collecting_with_codecs(
+            conn,
+            exec_id,
+            state,
+            metrics,
+            pending,
+            &crate::store::DEFAULT_PAYLOAD_CODECS,
+        )
+        .await
+    }
+    .boxed()
+}
+
+/// [`evaluate_triggers_for_execution_collecting`], encoding a triggered
+/// target's `WorkflowStarted.input` through `codecs` (issue #1243).
+///
+/// # Errors
+///
+/// Same as [`evaluate_triggers_for_execution_collecting`].
+#[allow(clippy::too_many_lines, clippy::too_many_arguments)]
+#[cfg(feature = "db")]
+pub fn evaluate_triggers_for_execution_collecting_with_codecs<'a>(
+    conn: &'a mut diesel_async::AsyncPgConnection,
+    exec_id: crate::types::ExecutionId,
+    state: TerminalState,
+    metrics: Option<&'a (dyn crate::telemetry::MetricsRecorder + Send + Sync)>,
+    pending: &'a mut Vec<crate::execution::StartCancelledRun>,
+    codecs: &'a crate::payload_codec::PayloadCodecs,
+) -> futures::future::BoxFuture<'a, crate::error::HarvestResult<Vec<DeferredTriggerStart>>> {
+    use futures::FutureExt;
+    async move {
         use diesel::prelude::*;
         use diesel_async::RunQueryDsl;
         use crate::schema::harvest_completion_triggers::dsl as triggers_dsl;
         use crate::schema::harvest_completion_trigger_fires::dsl as fires_dsl;
         use crate::schema::harvest_workflow_executions::dsl as execs_dsl;
         use crate::models::{CompletionTriggerDb, NewCompletionTriggerFireDb, WorkflowExecution, NewCompletionTriggerOutboxDb};
-        use crate::execution::{StartWorkflowParams, start_or_load_workflow_execution_collect, check_and_report_unfinished_handlers};
+        use crate::execution::{StartWorkflowParams, start_or_load_workflow_execution_collect_with_codecs, check_and_report_unfinished_handlers};
         use crate::types::WorkflowIdReusePolicy;
         use crate::types::Priority;
 
@@ -1728,7 +1870,7 @@ pub fn evaluate_triggers_for_execution_collecting<'a>(
                 // `evaluate_triggers_for_execution_collecting` to emit once
                 // ITS OWN enclosing transaction has actually committed.
                 let (start_res, cancel_deferred_starts, cancel_deferred_checks, cancel_metrics) =
-                    match start_or_load_workflow_execution_collect(
+                    match start_or_load_workflow_execution_collect_with_codecs(
                     conn,
                     StartWorkflowParams {
                         workflow_name: &trigger_db.target_workflow_name,
@@ -1790,6 +1932,7 @@ pub fn evaluate_triggers_for_execution_collecting<'a>(
                     // counting that the primitive cannot), so it is not gated again
                     // here — pass `None` to avoid double-counting (issue #618).
                     None,
+                    codecs,
                 )
                 .await
                 {
@@ -1922,6 +2065,7 @@ pub fn evaluate_triggers_for_execution_collecting<'a>(
                             sla: target_sla,
                             retry_policy: target_retry_policy,
                             max_workflow_attempts_ceiling,
+                            codecs: codecs.clone(),
                         });
 
                         continue;
@@ -2008,6 +2152,7 @@ pub fn evaluate_triggers_for_execution_collecting<'a>(
                     sla: target_sla,
                     retry_policy: target_retry_policy,
                     max_workflow_attempts_ceiling,
+                    codecs: codecs.clone(),
                 });
             }
         }
@@ -2095,6 +2240,31 @@ pub async fn enforce_completion_triggers_outbox(
     metrics: &(dyn crate::telemetry::MetricsRecorder + Send + Sync),
     sharded_pool: &Option<crate::shard::ShardedDbPool>,
     shard_assignments: &[crate::types::ShardId],
+) -> crate::error::HarvestResult<usize> {
+    enforce_completion_triggers_outbox_with_codecs(
+        conn,
+        metrics,
+        sharded_pool,
+        shard_assignments,
+        &crate::store::DEFAULT_PAYLOAD_CODECS,
+    )
+    .await
+}
+
+/// [`enforce_completion_triggers_outbox`], encoding a relayed target's
+/// `WorkflowStarted.input` through `codecs` (issue #1243).
+///
+/// # Errors
+///
+/// Same as [`enforce_completion_triggers_outbox`].
+#[cfg(feature = "db")]
+#[allow(clippy::too_many_lines)]
+pub async fn enforce_completion_triggers_outbox_with_codecs(
+    conn: &mut diesel_async::AsyncPgConnection,
+    metrics: &(dyn crate::telemetry::MetricsRecorder + Send + Sync),
+    sharded_pool: &Option<crate::shard::ShardedDbPool>,
+    shard_assignments: &[crate::types::ShardId],
+    codecs: &crate::payload_codec::PayloadCodecs,
 ) -> crate::error::HarvestResult<usize> {
     use crate::models::CompletionTriggerOutboxDb;
     use crate::schema::harvest_completion_trigger_outbox::dsl as outbox_dsl;
@@ -2196,6 +2366,39 @@ pub async fn enforce_completion_triggers_outbox(
         return Ok(0);
     }
 
+    // Pre-resolve every distinct `target_workflow_name` among rows that
+    // carry no explicit `queue_name`, in one round trip (issue #1227
+    // follow-up, Ledger). This replaces a per-row `resolve_target_queue`
+    // call below. Each such call opens its own connection to the default
+    // shard, on its own turn through the loop. `CompletionTrigger::new` defaults
+    // `queue_name` to `None`. So an unremarkable fan-in deployment (many
+    // source executions, one downstream trigger) fills a claim batch with
+    // rows that all take this path. Commonly, they all name the same
+    // handful of target workflows.
+    //
+    // Best-effort: an empty map here (no default-shard pool, or the batch
+    // query itself failing) is not a correctness problem. It is only a
+    // missed optimization. The per-row loop below falls back to
+    // `resolve_target_queue` for any name the map has no entry for,
+    // exactly as it always has.
+    let names_needing_lookup: Vec<String> = {
+        let mut set = std::collections::HashSet::new();
+        for task in &pending_tasks {
+            if task.queue_name.is_none() {
+                set.insert(task.target_workflow_name.clone());
+            }
+        }
+        set.into_iter().collect()
+    };
+    let resolved_queues = if !names_needing_lookup.is_empty()
+        && let Some(sp) = sharded_pool.as_ref()
+        && let Ok(mut default_conn) = sp.pool_for(sp.default_shard()).get().await
+    {
+        resolve_target_queues_batch(&mut default_conn, &names_needing_lookup).await
+    } else {
+        std::collections::HashMap::new()
+    };
+
     let mut processed_count = 0;
     for task in pending_tasks {
         let target_shard = crate::types::ShardId::new(task.target_shard);
@@ -2226,6 +2429,8 @@ pub async fn enforce_completion_triggers_outbox(
         };
 
         let queue_name = if let Some(ref q) = task.queue_name {
+            q.clone()
+        } else if let Some(q) = resolved_queues.get(&task.target_workflow_name) {
             q.clone()
         } else {
             resolve_target_queue(&mut target_conn, &task.target_workflow_name, target_shard).await
@@ -2337,6 +2542,7 @@ pub async fn enforce_completion_triggers_outbox(
             task.source_exec_id,
             task.trigger_id,
             Some(metrics),
+            codecs,
         )
         .await
         {

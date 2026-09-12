@@ -799,7 +799,7 @@ pub async fn run_workflow(
     handler: WorkflowHandlerFn,
     input: Value,
 ) -> WorkflowOutcome {
-    let (outcome, _pending, _span) =
+    let (outcome, _pending, _span, _resolved_router) =
         run_workflow_with_state(exec_id, history, handler, input, empty_shared_state(), None).await;
     outcome
 }
@@ -819,7 +819,8 @@ pub async fn run_workflow_with_context(
     handler: WorkflowHandlerFn,
     input: Value,
 ) -> WorkflowOutcome {
-    let (outcome, _pending, _span) = drive_workflow(ctx, handler, input, None).await;
+    let (outcome, _pending, _span, _resolved_router) =
+        drive_workflow(ctx, handler, input, None).await;
     outcome
 }
 
@@ -1616,7 +1617,7 @@ pub(crate) async fn run_workflow_canary(
 
 /// Run a workflow function through replay and live execution with shared state.
 ///
-/// Returns a triple of `(outcome, pending_commands, span_handle)`:
+/// Returns a 4-tuple of `(outcome, pending_commands, span_handle, resolved_router)`:
 /// - `outcome`: the workflow's terminal or suspended state.
 /// - `pending_commands`: commands emitted during a `Completed` or `Failed` run
 ///   that the worker must persist before recording the terminal event. This is
@@ -1628,6 +1629,15 @@ pub(crate) async fn run_workflow_canary(
 ///   hold it alive while persisting producer-side side-effects (activity
 ///   schedules, child workflow starts) so those producer spans are nested inside
 ///   the executor cycle. Dropping the handle closes the span.
+/// - `resolved_router`: `Some` only when this run's [`WorkflowContext`] had
+///   an EXPLICIT router installed via `with_shard_router` (issue #1263
+///   items 11/15/17). That is for tests and embedders running more than
+///   one topology in a single process. When present, the worker's
+///   persist-time cross-shard preflight uses it instead of independently
+///   re-asking the process-global router. A placement is then always
+///   validated against the same topology that resolved it. `None` on the
+///   ordinary production path, where the persist layer keeps asking the
+///   global fresh.
 pub async fn run_workflow_with_state(
     exec_id: ExecutionId,
     history: Vec<WorkflowEvent>,
@@ -1635,7 +1645,12 @@ pub async fn run_workflow_with_state(
     input: Value,
     state: SharedState,
     span_meta: Option<&WorkflowExecuteSpanMeta>,
-) -> (WorkflowOutcome, Vec<WorkflowCommand>, tracing::Span) {
+) -> (
+    WorkflowOutcome,
+    Vec<WorkflowCommand>,
+    tracing::Span,
+    Option<crate::shard::ShardRouter>,
+) {
     run_workflow_with_state_and_history_policy(
         exec_id,
         history,
@@ -1675,7 +1690,12 @@ pub async fn run_workflow_with_state_advancing_clock(
     // exercise `ctx.log_*`'s durable sink without a database. `None` (the
     // default) reproduces a deployment with the sink disabled.
     workflow_log_policy: Option<crate::context::WorkflowLogPolicy>,
-) -> (WorkflowOutcome, Vec<WorkflowCommand>, tracing::Span) {
+) -> (
+    WorkflowOutcome,
+    Vec<WorkflowCommand>,
+    tracing::Span,
+    Option<crate::shard::ShardRouter>,
+) {
     use crate::context::WorkflowContext;
     let ctx = WorkflowContext::for_replay_with_state_and_history_policy(
         exec_id,
@@ -1730,7 +1750,12 @@ pub async fn run_workflow_with_state_and_history_policy(
     declarative_query_handlers: &[&QueryHandlerInfo],
     declarative_update_handlers: &[&UpdateHandlerInfo],
     metrics: std::sync::Arc<dyn MetricsRecorder>,
-) -> (WorkflowOutcome, Vec<WorkflowCommand>, tracing::Span) {
+) -> (
+    WorkflowOutcome,
+    Vec<WorkflowCommand>,
+    tracing::Span,
+    Option<crate::shard::ShardRouter>,
+) {
     run_workflow_with_state_history_policy_and_caps(
         exec_id,
         history,
@@ -1783,7 +1808,12 @@ pub async fn run_workflow_with_state_history_policy_and_caps(
     metrics: std::sync::Arc<dyn MetricsRecorder>,
     default_activity_retry_policy: Option<crate::policy::RetryPolicy>,
     default_activity_start_to_close: Option<std::time::Duration>,
-) -> (WorkflowOutcome, Vec<WorkflowCommand>, tracing::Span) {
+) -> (
+    WorkflowOutcome,
+    Vec<WorkflowCommand>,
+    tracing::Span,
+    Option<crate::shard::ShardRouter>,
+) {
     let ctx = WorkflowContext::for_replay_with_state_and_history_policy(
         exec_id,
         history,
@@ -1844,7 +1874,12 @@ async fn drive_workflow(
     handler: WorkflowHandlerFn,
     input: Value,
     span_meta: Option<&WorkflowExecuteSpanMeta>,
-) -> (WorkflowOutcome, Vec<WorkflowCommand>, tracing::Span) {
+) -> (
+    WorkflowOutcome,
+    Vec<WorkflowCommand>,
+    tracing::Span,
+    Option<crate::shard::ShardRouter>,
+) {
     let exec_id = ctx.execution_id();
 
     // ADR-0001 §2.1: emit harvest.workflow.execute for every executor cycle.
@@ -2018,7 +2053,20 @@ async fn drive_workflow(
     .instrument(span)
     .await;
 
-    (outcome, pending, span_handle)
+    // Issue #1263 items 11/15/17: carry the EXPLICIT context-local router
+    // out to the caller, if this context installed one via
+    // `with_shard_router`. The worker's persist-time preflight can then
+    // validate a placement against the same router that resolved it,
+    // rather than independently re-asking the process-global one. `None`
+    // when no context-local router was installed — the ordinary production
+    // case. The persist layer then keeps asking the global fresh, exactly
+    // as before this fix.
+    (
+        outcome,
+        pending,
+        span_handle,
+        ctx.resolved_placement_router(),
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -2689,7 +2737,7 @@ mod tests {
         // executor emits NOTHING itself (the worker emits from the carried map).
         let recorder = std::sync::Arc::new(UnhandledSignalRecorder::default());
         let meta = span_meta("notif", "q");
-        let (outcome, _cmds, _span) = run_workflow_with_state_advancing_clock(
+        let (outcome, _cmds, _span, _resolved_router) = run_workflow_with_state_advancing_clock(
             ExecutionId::new(),
             started_then_late_signal(),
             echo_workflow,
@@ -2722,7 +2770,7 @@ mod tests {
         // "unhandled").
         let recorder = std::sync::Arc::new(UnhandledSignalRecorder::default());
         let meta = span_meta("notif", "q");
-        let (outcome, _cmds, _span) = run_workflow_with_state_advancing_clock(
+        let (outcome, _cmds, _span, _resolved_router) = run_workflow_with_state_advancing_clock(
             ExecutionId::new(),
             started_then_late_signal(),
             failing_workflow,
@@ -2748,7 +2796,7 @@ mod tests {
         // and the executor emits nothing.
         let recorder = std::sync::Arc::new(UnhandledSignalRecorder::default());
         let meta = span_meta("notif", "q");
-        let (outcome, _cmds, _span) = run_workflow_with_state_advancing_clock(
+        let (outcome, _cmds, _span, _resolved_router) = run_workflow_with_state_advancing_clock(
             ExecutionId::new(),
             started_then_late_signal(),
             activity_workflow, // suspends on send_email (not in history)
