@@ -1391,7 +1391,7 @@
       "default_threshold": "Ticket when harvest_audit_export_observed is 0 for a shard for 10 minutes.",
       "severity": "ticket",
       "owner_persona": "security/compliance engineer",
-      "description": "The exporter could not read this shard's cursor, or its lag, or could not even acquire a connection to the shard this tick. harvest_audit_export_lag is not a reliable signal here: a Prometheus gauge keeps its last value, so the lag reading for this shard is frozen, commonly at 0, and looks healthy. This is the companion signal harvest_audit_export_lag_high's own notes call for: it is the metric-only detection for a shard the exporter cannot observe, distinct from a shard that has never been scanned at all (which absent() still catches).",
+      "description": "The exporter could not read this shard's cursor, or its lag, or could not even acquire a connection to the shard this tick. harvest_audit_export_lag is not a reliable signal here: a Prometheus gauge keeps its last value, so the lag reading for this shard is frozen, commonly at 0, and looks healthy. This is the companion signal harvest_audit_export_lag_high's own notes call for: it is the metric-only detection for a shard the exporter cannot observe, distinct from a shard missing from shard_assignments entirely, which neither this rule nor the lag threshold can see -- only a per-shard absent(harvest_audit_export_lag{shard=\"N\"}) rule templated from your own inventory catches that case; see the runbook's coverage table.",
       "first_action": "curl -s $HARVEST/admin/audit-export | jq '.shards[] | select(.shard == <id>)'",
       "dependencies": [
         {
