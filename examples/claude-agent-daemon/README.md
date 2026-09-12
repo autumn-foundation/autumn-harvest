@@ -430,7 +430,11 @@ Honest limits, so nothing here reads as a promise:
 - **Startup paths are not race-free against a local attacker.** The daemon
   locks the database and then opens it by path, and it reclaims a stale socket
   by checking it and then replacing it. A local process racing either sequence
-  can defeat it. Both would need an identity the pathname cannot carry — and
+  can defeat it. The database half is checked after the fact: the lock is held
+  on an inode, so once the runtime has opened the path the two are compared,
+  and a file replaced in that window makes the daemon refuse to start rather
+  than write a database it does not hold the lock for. A file replaced again
+  after that check is still not caught. Both would need an identity the pathname cannot carry — and
   `SQLite` must be handed a path, since that is how it names its write-ahead
   log. The same reasoning applies: whoever can win these races already runs as
   you.

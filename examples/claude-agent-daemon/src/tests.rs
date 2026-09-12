@@ -8955,3 +8955,138 @@ fn a_listing_names_entries_of_the_directory_it_opened() {
         "the proof must run after the open and BEFORE any entry is named"
     );
 }
+
+/// A listing never shows a report the single status refuses.
+///
+/// Each field is projected on its own, so a document that repeats one of the
+/// four declared keys answers every projection. `json_type` reports the FIRST
+/// value of a repeated key, so a repeat of another type passes the type
+/// guards too.
+///
+/// Measured before the fix: `list` rendered `[end_turn after 1 turns, 1 tool
+/// calls] ok` for a document `serde` refuses, while `status` showed nothing.
+///
+/// The cases are chosen against what `serde` actually does, not against what
+/// looks damaged. A repeated key the report does not DECLARE deserialises.
+/// So does an unpaired surrogate in such a key. Both must still show their
+/// report.
+#[test]
+fn a_listing_never_shows_a_report_the_status_refuses() {
+    let cases: [(&str, &str); 6] = [
+        (
+            "a repeated declared key",
+            r#"{"answer":"ok","turns":1,"tool_calls":1,"stop":"end_turn","stop":"refusal"}"#,
+        ),
+        (
+            "a repeated declared key of another type",
+            r#"{"answer":"ok","turns":1,"turns":"two","tool_calls":1,"stop":"end_turn"}"#,
+        ),
+        (
+            "an unpaired surrogate in the answer",
+            r#"{"answer":"a\ud800b","turns":1,"tool_calls":1,"stop":"end_turn"}"#,
+        ),
+        (
+            "a repeated key the report does not declare",
+            r#"{"answer":"ok","turns":1,"tool_calls":1,"stop":"end_turn","x":1,"x":2}"#,
+        ),
+        (
+            "an unpaired surrogate in a key it does not declare",
+            r#"{"answer":"ok","turns":1,"tool_calls":1,"stop":"end_turn","x":"a\ud800b"}"#,
+        ),
+        (
+            "a readable report",
+            r#"{"answer":"ok","turns":1,"tool_calls":1,"stop":"end_turn"}"#,
+        ),
+    ];
+
+    let dir = tempfile::tempdir().expect("a temporary directory");
+    let db = dir.path().join("report-divergence.db");
+    let writer = rusqlite::Connection::open(&db).expect("the database opens");
+    fixture_table(&writer);
+    for (index, (_, document)) in cases.iter().enumerate() {
+        writer
+            .execute(
+                "INSERT INTO harvest_executions VALUES (?1, ?2, 'COMPLETED', ?3, ?4, NULL)",
+                rusqlite::params![
+                    format!("exec-{index}"),
+                    WORKFLOW_NAME,
+                    READABLE_TASK,
+                    document
+                ],
+            )
+            .expect("the row is recorded");
+    }
+    drop(writer);
+
+    let reader = inspect::open(&db).expect("the reader opens");
+    let (views, _, _) = daemon::sessions(&reader, &daemon::Parked::new(), false, None)
+        .expect("the listing renders");
+
+    for (index, (case, document)) in cases.iter().enumerate() {
+        let exec = format!("exec-{index}");
+        let shown = views
+            .iter()
+            .find(|view| view.execution_id == exec)
+            .unwrap_or_else(|| panic!("[{case}] the session is listed"))
+            .answer
+            .clone();
+        // The single status reads the WHOLE document, and the listing must
+        // not claim more than that read allows.
+        let whole = serde_json::from_str::<SessionReport>(document).is_ok();
+        if whole {
+            assert_eq!(
+                shown.as_deref(),
+                Some("[end_turn after 1 turns, 1 tool calls] ok"),
+                "[{case}] a document the status reads must keep its report"
+            );
+        } else {
+            assert_eq!(
+                shown.as_deref(),
+                Some("<unreadable report>"),
+                "[{case}] a document the status refuses must not be shown as a result"
+            );
+        }
+    }
+}
+
+/// A database replaced while the daemon starts is refused.
+///
+/// The lock is held on an INODE, and the runtime is handed a PATH, because
+/// that is how `SQLite` names its write-ahead log. A file replaced between
+/// the two leaves the lock on the file that was there and the runtime on the
+/// one that is there now. A second daemon can then lock the replacement and
+/// open it too. Two runtimes would write one database, and each would reclaim
+/// work the other is running.
+///
+/// The swap is applied directly, which is the state that window leaves.
+#[test]
+fn a_database_replaced_while_the_daemon_starts_is_refused() {
+    let dir = tempfile::tempdir().expect("a temporary directory");
+    let db = dir.path().join("agentd.db");
+    std::fs::write(&db, b"").expect("the database file is created");
+
+    let lock = guard::acquire(&db).expect("the lock is taken");
+    // The not-the-fault case: nothing moved, so the check costs a start
+    // nothing.
+    lock.still_names(&db)
+        .expect("the locked file is the named file");
+
+    // The hazard: another process replaces the file atomically. The lock is
+    // still held, and it is held on a file this path no longer names.
+    let replacement = dir.path().join("other.db");
+    std::fs::write(&replacement, b"").expect("the replacement is created");
+    std::fs::rename(&replacement, &db).expect("the database is replaced");
+
+    // A second lock on the NEW file succeeds, which is the damage: two
+    // daemons would each believe they are the only writer.
+    let second = guard::acquire(&db).expect("the replacement locks freely");
+    drop(second);
+
+    let refused = lock
+        .still_names(&db)
+        .expect_err("a replaced database must be refused");
+    assert!(
+        refused.contains("was replaced while this daemon started"),
+        "the refusal must say what happened: {refused}"
+    );
+}

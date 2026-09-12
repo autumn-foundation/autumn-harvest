@@ -51,6 +51,45 @@ pub struct DaemonLock {
     _file: File,
 }
 
+impl DaemonLock {
+    /// Is the locked file still the file this path names?
+    ///
+    /// The lock is held on an INODE. The runtime is handed a PATH, because
+    /// that is how `SQLite` names its write-ahead log. A file replaced between
+    /// the two leaves the lock on the old inode. The runtime then opens the
+    /// new one, and a second daemon can lock the replacement and open it too.
+    /// Both would write one database, and each would reclaim work the other
+    /// is running.
+    ///
+    /// This is checked AFTER the runtime opens, so a replacement that landed
+    /// in that window is refused. It does not close the window: the file can
+    /// be replaced again after this read. Closing it needs an identity the
+    /// pathname cannot carry.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if either file cannot be read, or if the path now
+    /// names another file.
+    pub fn still_names(&self, path: &Path) -> Result<(), String> {
+        let locked = self
+            ._file
+            .metadata()
+            .map_err(|e| format!("cannot read the locked database: {e}"))?;
+        let named =
+            std::fs::metadata(path).map_err(|e| format!("cannot read {}: {e}", path.display()))?;
+        if locked.dev() != named.dev() || locked.ino() != named.ino() {
+            return Err(format!(
+                "{} was replaced while this daemon started. The lock is held on \
+                 the file that was there, and the runtime opened the one that is \
+                 there now, so a second daemon could write the same database. \
+                 Start again.",
+                path.display()
+            ));
+        }
+        Ok(())
+    }
+}
+
 /// Take the exclusive lock for `db`, or report that another daemon holds it.
 ///
 /// # Errors

@@ -178,7 +178,7 @@ pub async fn serve(options: Options) -> Result<(), String> {
     // `RUNNING` by a dead process. A second daemon opening the same file would
     // reclaim a LIVE task, and its activity would run twice. The lock lives as
     // long as this call, and the kernel releases it if the process dies.
-    let _lock = guard::acquire(&options.db)?;
+    let lock = guard::acquire(&options.db)?;
 
     // And the per-SOCKET lock, which the database lock cannot stand in for.
     // Two daemons on different databases contend for neither the file nor the
@@ -217,6 +217,10 @@ pub async fn serve(options: Options) -> Result<(), String> {
     // the same data as the database. The mask makes them private too.
     let mut runtime = guard::with_private_umask(|| SqliteRuntime::open(&options.db))
         .map_err(|e| format!("cannot open {}: {e}", options.db.display()))?;
+    // The lock is held on an inode, and the runtime was handed a path. A file
+    // replaced between the two would leave this daemon writing a database it
+    // does not hold the lock for. See [`guard::DaemonLock::still_names`].
+    lock.still_names(&options.db)?;
     runtime.register_workflow(&session::agent_session_info());
     runtime.register_activity(&session::claude_turn_info(), claude::activity_body(model));
     runtime.register_activity(
@@ -1152,12 +1156,17 @@ fn summary_view(
     // that as an empty string, and not as nothing. So a report with NO
     // readable answer is named unreadable, rather than shown as that
     // outcome. `status` refuses the same document, and the two must agree.
+    //
+    // A document that REPEATS a key answers every projection and still fails
+    // to deserialise. Nothing in the four fields shows it, so the row carries
+    // that fault on its own. See [`inspect::SessionSummary::report_is_damaged`].
     let answer = match (
         row.stop.as_deref(),
         row.turns,
         row.tool_calls,
         row.answer.as_deref(),
     ) {
+        _ if row.report_is_damaged => Some("<unreadable report>".to_string()),
         (Some(stop), Some(turns), Some(calls), Some(text)) => Some(format!(
             "[{} after {turns} turns, {calls} tool calls] {}",
             shortened(stop),

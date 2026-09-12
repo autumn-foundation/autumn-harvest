@@ -107,6 +107,26 @@ pub struct SessionSummary {
     /// session with a damaged reason would otherwise look like one that
     /// recorded no reason, and `status` calls the same row unreadable.
     pub error_is_damaged: bool,
+    /// Does the recorded report repeat one of the four fields it declares?
+    ///
+    /// Each field is projected on its own, so a document that repeats a key
+    /// answers every projection and still fails to deserialise as a whole.
+    /// `json_type` reports the FIRST value of a repeated key, so even a
+    /// repeat of another type passes the type guards.
+    ///
+    /// The listing then showed a genuine report for a document the single
+    /// status refuses. The two must agree, so the repeat is reported and the
+    /// caller names the row unreadable.
+    ///
+    /// Only the DECLARED keys are counted. A repeated key the report does not
+    /// declare is measured to deserialise, because the whole document reads
+    /// and the field is ignored. Counting every key would refuse a report
+    /// that `status` shows.
+    ///
+    /// The count is filtered rather than made distinct. A `count(DISTINCT)`
+    /// sorts in a temporary B-tree, which the plan guard refuses for this
+    /// query.
+    pub report_is_damaged: bool,
     /// Where this row sits in the table, which is the cursor that reads the
     /// rows BEFORE it. The listing is capped, so an old session waiting for a
     /// decision would otherwise become unreachable once enough newer ones
@@ -841,6 +861,11 @@ pub const SESSIONS_QUERY: &str = "SELECT \
                          THEN coalesce(substr(cast(error as blob), 1, ?3), \
                                        zeroblob(0)) END, \
                     error IS NOT NULL AND typeof(error) <> 'text', \
+                    CASE WHEN typeof(output_json) = 'text' AND json_valid(output_json) \
+                         THEN (SELECT count(*) FROM json_each(output_json) \
+                               WHERE key IN ('answer', 'turns', 'tool_calls', 'stop')) \
+                              > 4 \
+                         ELSE 0 END, \
                     rowid \
              FROM harvest_executions WHERE +workflow_name = ?1 \
              AND rowid < ?4 \
@@ -927,7 +952,8 @@ pub fn executions(
                     answer: cut_text(row.get(6)?, LISTED_READ_CHARS, MAX_LISTED_BYTES),
                     error: cut_text(row.get(7)?, LISTED_READ_CHARS, MAX_LISTED_BYTES),
                     error_is_damaged: row.get(8)?,
-                    row: row.get(9)?,
+                    report_is_damaged: row.get(9)?,
+                    row: row.get(10)?,
                 })
             },
         )
