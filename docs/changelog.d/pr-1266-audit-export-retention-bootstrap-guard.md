@@ -143,6 +143,41 @@ name two different databases today, silently. The key now uses the
 username only when the path is empty; an explicit path still ignores the
 username, so this does not reopen the sixth round's credentials fix.
 
+An eleventh review round found two further defects, in different files.
+
+The first (P1) found that `url::Url` and `tokio_postgres::Config`
+disagree on percent-decoding, on `?dbname=`/`?host=`/`?port=`/
+`?hostaddr=` overrides, and on comma-separated multi-host DSNs -- fresh
+evidence pointed at `backup_verify.rs`'s own `parse_dsn_identity`
+comment, which documents this exact divergence for the guard that keeps
+a backup off a live production database. Rather than continue chasing
+individual `url`-versus-connector mismatches one at a time, as rounds
+six through ten each did, `canonical_dsn_key` now parses with
+`tokio_postgres::Config` directly, the same parser `parse_dsn_identity`
+uses and the one `diesel_async` actually hands the DSN to at connect
+time. This closes the percent-decoding gap by construction, along with
+any other divergence class between the two parsers, rather than adding
+another special case. Unlike `parse_dsn_identity`, which serves a
+different guard with different needs, this key still keeps `options`
+(schema-relevant) and drops every other query parameter, and keeps a
+resolved Unix-socket path's case instead of folding it, matching the
+ninth and tenth rounds' fixes.
+
+The second (P1) found a defect in `audit.rs`, not `shard.rs`. Verifying
+it meant tracing the actual SQL: with two colocated shards sharing one
+pool, shard A ticked and acknowledged some rows while shard B has no
+cursor row yet, a row already acknowledged by A read as fully
+acknowledged even though B has acknowledged nothing. The pending check's
+own doc comment had assumed "a shard's database holds at most one cursor
+row" -- an assumption the fourth through tenth rounds' own colocated-pool
+work had already made false. `purge_old_audit_records` gains a fourth
+parameter, `colocated_shard_count`, and the pending check now compares
+the cursor count against it instead of testing for zero rows. A
+single-shard caller passes `1`, unchanged from before. The real caller,
+`retention.rs`'s `group_shards_by_pool`, now returns each pool group's
+shard count alongside its combined protection decision, sourced from
+`ShardedDbPool::pool_groups()`.
+
 New tests:
 - `retention_protects_unexported_audit_when_configured_with_no_cursor_and_no_local_sink`
   reproduces the exact bootstrap window (no cursor row anywhere, no sink in
@@ -193,6 +228,15 @@ New tests:
   round's second fix: two users with no explicit dbname reach different
   databases and must never collapse, while an explicit, shared dbname
   still collapses regardless of username.
+- `from_dsns_groups_percent_encoded_and_plain_dbname_spellings` pins the
+  eleventh round's first fix: `postgres://db.example/harvest` and
+  `postgres://db.example/%68arvest` collapse into one group now that the
+  key is parsed with the real connector's parser.
+- `retention_protects_rows_until_every_colocated_shard_has_a_cursor` pins
+  the eleventh round's second fix: told to expect two colocated shards
+  but only one has a cursor row, no stamped row purges even if already
+  acknowledged by the shard that has ticked; told to expect only that one
+  shard, the same rows purge normally.
 
 **Zero migration, zero engine impact beyond the new parameter.** No new
 `WorkflowEvent` variant, no schema change, no change to any existing call

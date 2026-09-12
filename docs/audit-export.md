@@ -299,6 +299,14 @@ shard records:
   accidentally strips shard B's protection just because they share a
   database. No operator action is needed for this case.
 
+  The per-row pending check also needs to know how many shards share the
+  pool, not only the combined decision. A row already acknowledged by
+  one colocated shard is not acknowledged by another that has not
+  ticked yet and so has no cursor row there at all. `purge_old_audit_records`
+  takes this count as `colocated_shard_count`; the sweep sources it from
+  the same `ShardedDbPool::pool_groups()` call that computes the
+  combined decision, so this needs no separate operator action either.
+
   Detection covers both ways a fleet builds a `ShardedDbPool`.
   `ShardedDbPool::from_map` can receive one cloned `Pool` under two shard
   IDs; the sweep groups these by pool identity. `ShardedDbPool::from_dsns`
@@ -306,7 +314,12 @@ shard records:
   reach one database, so identity alone cannot see the alias; the sweep
   groups these by a canonical form of the DSN instead (host, port, path,
   and the `options` query parameter, ignoring everything else including
-  credentials), compared before the DSN is consumed into a pool.
+  credentials), compared before the DSN is consumed into a pool. The
+  canonical form is parsed with `tokio_postgres::Config`, the exact
+  parser `diesel_async` hands the DSN to at connect time — the same
+  choice `backup_verify.rs`'s `parse_dsn_identity` makes, since `url::Url`
+  disagrees with it on percent-decoding, on `?dbname=`/`?host=`/`?port=`/
+  `?hostaddr=` overrides, and on comma-separated multi-host DSNs.
   `options` is kept because it can carry `-c search_path=...`, which
   picks which schema a query resolves against — two DSNs differing only
   there must stay in separate groups. Every other query parameter

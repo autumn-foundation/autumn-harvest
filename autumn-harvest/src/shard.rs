@@ -955,24 +955,31 @@ fn group_by_pool_identity(pools: &BTreeMap<ShardId, DbPool>) -> BTreeMap<ShardId
 /// as separate databases. Each apparent group would then apply its own
 /// protection decision to rows the other group was meant to protect.
 ///
-/// The key keeps host (lowercased), port (defaulted to 5432 when
-/// absent), the path, and only the `options` query parameter. `options`
-/// is libpq's escape hatch for arbitrary session settings, including
-/// `-c search_path=...`, so it picks the schema `harvest_audit_log`
-/// resolves to. Two DSNs that differ only there can still reach
-/// different data and must never be grouped as one pool. Every other
-/// query parameter is dropped: none of them changes which relation a
-/// query resolves against.
+/// Parsed with **`tokio_postgres::Config`**, the exact parser
+/// `diesel_async` hands the DSN to at connect time. This is the same
+/// choice `backup_verify.rs`'s `parse_dsn_identity` makes, for the same
+/// reason. `url::Url` disagrees with it on percent-decoding
+/// (`/%68arvest` is database `harvest`). It also disagrees on
+/// `?dbname=`/`?host=`/`?port=`/`?hostaddr=` overrides, and on
+/// comma-separated multi-host DSNs. Every one of those parses cleanly
+/// under `url`. Each resolves somewhere else entirely at connect time.
+/// A key built on `url` cannot see two spellings of one database as the
+/// same pool.
 ///
-/// A Unix-socket DSN has no host in its authority. libpq then reads the
-/// real endpoint from a `host` or `hostaddr` query parameter instead
-/// (`postgresql:///harvest?host=%2Frun%2Fpg`). The key falls back to
-/// either one when the authority host is empty. It falls back to
-/// `hostaddr` whenever that is given at all, since `hostaddr` wins over
-/// `host` in libpq's own precedence. A `port` query parameter is
-/// honored the same way. A resolved host is lowercased, since a DNS
-/// name is case-insensitive. A socket path (it always starts with `/`)
-/// is kept as written instead, since a filesystem path is not.
+/// The key keeps host and `hostaddr` (a numeric `host` counts as an
+/// address, needing no DNS to compare). It keeps port (defaulted to
+/// 5432 when absent), the database name, and only the `options`
+/// parameter. `options` is libpq's escape hatch for arbitrary session
+/// settings, including `-c search_path=...`. It picks the schema
+/// `harvest_audit_log` resolves to. Two DSNs that differ only there can
+/// still reach different data and must never be grouped as one pool.
+/// Every other parameter (`application_name`, `sslmode`, and so on) is
+/// dropped, since none of them changes which relation a query resolves
+/// against.
+///
+/// A DNS hostname is lowercased, since it is case-insensitive. A
+/// Unix-socket path is kept as written instead, since a filesystem path
+/// is not: `/run/PG-A` and `/run/pg-a` name different sockets.
 ///
 /// A DSN with no path names no database. That is not the same as
 /// naming none: libpq defaults an omitted `dbname` to the connecting
@@ -993,54 +1000,53 @@ fn group_by_pool_identity(pools: &BTreeMap<ShardId, DbPool>) -> BTreeMap<ShardId
 ///   #964). Treating them as different pools would reopen the exact bug
 ///   this key exists to close.
 ///
-/// A DSN that does not parse as a URL falls back to the raw string,
-/// unchanged from before this key existed.
+/// A DSN that does not parse falls back to the raw string, unchanged
+/// from before this key existed.
 #[cfg(feature = "db")]
 fn canonical_dsn_key(dsn: &str) -> String {
-    let Ok(url) = url::Url::parse(dsn) else {
+    use std::str::FromStr as _;
+
+    let Ok(config) = tokio_postgres::Config::from_str(dsn.trim()) else {
         return dsn.to_string();
     };
-    let mut host = normalize_host(url.host_str().unwrap_or_default());
-    let mut port = url.port().unwrap_or(5432);
-    let path = url.path();
-    let mut options = String::new();
-    for (key, value) in url.query_pairs() {
-        match &*key {
-            "options" => {
-                options.push_str(&value);
-                options.push('\u{0}');
+
+    let mut hostaddrs: Vec<String> = config
+        .get_hostaddrs()
+        .iter()
+        .map(ToString::to_string)
+        .collect();
+    let mut hosts: Vec<String> = Vec::new();
+    for h in config.get_hosts() {
+        match h {
+            tokio_postgres::config::Host::Tcp(name) => {
+                if let Ok(addr) = std::net::IpAddr::from_str(name) {
+                    hostaddrs.push(addr.to_string());
+                } else {
+                    hosts.push(name.to_ascii_lowercase());
+                }
             }
-            // A Unix-socket DSN carries no authority host, so libpq
-            // reads the real endpoint from `host` or `hostaddr` here
-            // instead. `hostaddr` wins when both are given, matching
-            // libpq's own precedence.
-            "host" if host.is_empty() => host = normalize_host(&value),
-            "hostaddr" => host = normalize_host(&value),
-            "port" => port = value.parse().unwrap_or(port),
-            _ => {}
+            #[cfg(unix)]
+            tokio_postgres::config::Host::Unix(path) => {
+                hosts.push(path.to_string_lossy().into_owned());
+            }
         }
     }
-    // libpq defaults an omitted dbname to the connecting username, so
-    // an empty path still names a real, specific database.
-    let path = if path.is_empty() || path == "/" {
-        format!("/{}", url.username())
-    } else {
-        path.to_string()
-    };
-    format!("{host}:{port}{path}?options={options}")
-}
+    hosts.sort_unstable();
+    hosts.dedup();
+    hostaddrs.sort_unstable();
+    hostaddrs.dedup();
 
-/// Lowercases a host, since DNS names are case-insensitive. A Unix-socket
-/// directory path is not: `/run/PG-A` and `/run/pg-a` name different
-/// sockets on a case-sensitive filesystem, so a leading `/` is left
-/// untouched.
-#[cfg(feature = "db")]
-fn normalize_host(value: &str) -> String {
-    if value.starts_with('/') {
-        value.to_string()
-    } else {
-        value.to_ascii_lowercase()
+    let mut ports: Vec<u16> = config.get_ports().to_vec();
+    if ports.is_empty() {
+        ports.push(5432);
     }
+    ports.sort_unstable();
+    ports.dedup();
+
+    let db = config.get_dbname().or_else(|| config.get_user());
+    let options = config.get_options().unwrap_or_default();
+
+    format!("{hosts:?}{hostaddrs:?}{ports:?}/{db:?}?options={options}")
 }
 
 #[cfg(feature = "db")]
@@ -2296,6 +2302,35 @@ mod tests {
             1,
             "an explicit dbname is not defaulted from the username, so \
              these must still collapse into one group"
+        );
+    }
+
+    // `url::Url` and `tokio_postgres::Config` disagree on percent-decoding:
+    // `url::Url::path()` returns the raw, still-encoded path, but the real
+    // connector decodes it. Two spellings of one database name must
+    // collapse (issue #1266).
+    #[cfg(feature = "db")]
+    #[test]
+    fn from_dsns_groups_percent_encoded_and_plain_dbname_spellings() {
+        let sharded = ShardedDbPool::from_dsns(
+            [
+                (ShardId::new(0), "postgres://db.example/harvest".to_string()),
+                (
+                    ShardId::new(1),
+                    "postgres://db.example/%68arvest".to_string(),
+                ),
+            ],
+            ShardId::new(0),
+            1,
+        )
+        .expect("pool builds without connecting");
+
+        let groups = sharded.pool_groups();
+        assert_eq!(
+            groups.len(),
+            1,
+            "`%68` decodes to `h`, so both DSNs name the same database \
+             and must collapse into one group"
         );
     }
 }

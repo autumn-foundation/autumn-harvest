@@ -1616,11 +1616,11 @@ pub async fn list_audit(
 /// delete is byte-identical to the pre-#953 statement.
 ///
 /// The pending check treats a row as pending, and so protected, in three
-/// cases. Its `export_seq` may be unassigned. No cursor row may exist for
-/// the shard at all. Or a cursor row may exist and simply not have
-/// acknowledged it yet.
+/// cases. Its `export_seq` may be unassigned. Fewer cursor rows may exist
+/// than `colocated_shard_count`. Or a cursor row may exist and simply not
+/// have acknowledged it yet.
 ///
-/// The middle case matters on its own (issue #1266). A stamped row can
+/// The second case matters on its own (issue #1266). A stamped row can
 /// survive a cursor row's manual deletion. It can
 /// also survive a partial restore. [`crate::audit_export::ensure_cursor_row`]
 /// rebuilds such a cursor with `last_acked_seq = 0`, treating every
@@ -1628,10 +1628,19 @@ pub async fn list_audit(
 /// agree, or a sweep landing first would delete rows `ensure_cursor_row`
 /// intended to redeliver.
 ///
-/// The pending-check subquery is uncorrelated by shard because a shard's
-/// database holds at most one cursor row (the exporter provisions only the
-/// shard it is scanning). Should two ever coexist, `EXISTS` errs toward
-/// retaining, never deleting.
+/// `colocated_shard_count` exists because a pool is not always one
+/// shard's own database. [`crate::shard::ShardedDbPool::pool_groups`] can
+/// name several logical shards sharing one physical pool. Each keeps its
+/// own cursor row there once it ticks.
+///
+/// Comparing the cursor count against a hardcoded "zero rows" missed a
+/// gap. "No shard has ticked" is not the same as "not every colocated
+/// shard has ticked yet". A row already acknowledged by the shard that
+/// has ticked looked fully acknowledged. A shard sharing the same pool
+/// that has not ticked still needed it. The caller passes the number of
+/// shards `pool_groups` named for this pool. A single-shard caller
+/// passes `1`. The check is then exactly the previous "no cursor row at
+/// all" test.
 ///
 /// # Errors
 ///
@@ -1640,6 +1649,7 @@ pub async fn purge_old_audit_records(
     conn: &mut AsyncPgConnection,
     retention_days: i64,
     protect_unexported_audit: bool,
+    colocated_shard_count: i64,
 ) -> HarvestResult<usize> {
     use diesel_async::RunQueryDsl as _;
 
@@ -1653,11 +1663,14 @@ pub async fn purge_old_audit_records(
     // decommissioning shares one cost across both signals: see the doc
     // comment above.
     //
-    // The pending check's middle disjunct is `NOT EXISTS(any cursor row)`.
-    // It fixes a second defect found alongside the first (issue #1266).
-    // Without it, a stamped row surviving a cursor's manual deletion
-    // looked already acknowledged. It was deletable, exactly backwards
-    // from what `ensure_cursor_row` intends when it rebuilds that row.
+    // The pending check's middle disjunct compares the cursor count
+    // against `colocated_shard_count` rather than testing for zero rows
+    // (issue #1266). A shared physical pool can hold one cursor row per
+    // colocated shard. Testing only for zero missed the gap where some,
+    // but not all, of those shards have ticked yet. A stamped row
+    // already acknowledged by the shard that has ticked still looked
+    // fully acknowledged. That is exactly backwards from what a shard
+    // that has not ticked needs.
     diesel::sql_query(
         "DELETE FROM harvest_audit_log a \
          WHERE a.occurred_at < $1 \
@@ -1671,9 +1684,7 @@ pub async fn purge_old_audit_records(
                  ) \
                  AND ( \
                    a.export_seq IS NULL \
-                   OR NOT EXISTS ( \
-                        SELECT 1 FROM harvest_audit_export_cursor \
-                   ) \
+                   OR (SELECT COUNT(*) FROM harvest_audit_export_cursor) < $3 \
                    OR EXISTS ( \
                         SELECT 1 FROM harvest_audit_export_cursor c \
                         WHERE a.export_seq > c.last_acked_seq \
@@ -1683,6 +1694,7 @@ pub async fn purge_old_audit_records(
     )
     .bind::<diesel::sql_types::Timestamptz, _>(cutoff)
     .bind::<diesel::sql_types::Bool, _>(export_may_be_live)
+    .bind::<diesel::sql_types::BigInt, _>(colocated_shard_count)
     .execute(conn)
     .await
     .map_err(database_error)
