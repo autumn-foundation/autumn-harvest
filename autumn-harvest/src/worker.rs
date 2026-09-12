@@ -18305,21 +18305,18 @@ fn pending_update_result_event_count(commands: &[WorkflowCommand]) -> u64 {
 fn terminal_history_event_count(
     next_event_id: i32,
     pending_cmds: &[WorkflowCommand],
-    // Issue #952: `true` for a FAILING terminal, whose batch also appends the
-    // abandoned-dispatch records. The hard-cap preflight counts them, and this
-    // `harvest.workflow.history_size` gauge is meant to describe the same
-    // number, so it counts them too.
-    records_abandoned_dispatches: bool,
+    // Issue #952: nonzero for a FAILING terminal, whose batch also appends
+    // the abandoned-dispatch records. Issue #1265: pass the hard-cap
+    // preflight's resolved value here, from
+    // `abandoned_dispatch_event_count_resolved`. Do not recompute a
+    // pre-dedup count. A re-parked dispatch the dedup already zeroed must
+    // not inflate this gauge.
+    resolved_abandoned_dispatch_event_count: u64,
 ) -> u64 {
-    let abandoned = if records_abandoned_dispatches {
-        abandoned_dispatch_event_count(pending_cmds)
-    } else {
-        0
-    };
     u64::try_from(next_event_id)
         .unwrap_or(0)
         .saturating_add(pending_update_result_event_count(pending_cmds))
-        .saturating_add(abandoned)
+        .saturating_add(resolved_abandoned_dispatch_event_count)
         .saturating_add(1)
 }
 
@@ -20521,6 +20518,11 @@ async fn process_workflow_task(
     } else {
         0
     };
+    // Issue #1265: captured here so the `history_size` gauge below can reuse
+    // the SAME dedup-resolved count instead of recomputing a pre-dedup one.
+    // It stays 0 for every non-`Failed` outcome (mirrors
+    // `records_abandoned_dispatches`): none of those resolve this count.
+    let mut resolved_abandoned_dispatch_event_count: u64 = 0;
     let pending_durable_event_count = match &outcome {
         WorkflowOutcome::Suspended { commands } => {
             match suspended_command_event_count(conn, task.workflow_exec_id, commands).await {
@@ -20566,6 +20568,7 @@ async fn process_workflow_task(
                     .await;
                 }
             };
+            resolved_abandoned_dispatch_event_count = abandoned;
             pending_update_result_event_count(&pending_cmds)
                 .saturating_add(pre_suspension_event_count(&pending_cmds))
                 .saturating_add(terminal_parent_close_cascade_events)
@@ -20635,7 +20638,7 @@ async fn process_workflow_task(
             terminal_history_event_count(
                 next_event_id,
                 &pending_cmds,
-                records_abandoned_dispatches(&outcome),
+                resolved_abandoned_dispatch_event_count,
             )
             .saturating_add(terminal_parent_close_cascade_events),
         )
@@ -38964,6 +38967,29 @@ mod tests {
             u64::try_from(written).unwrap_or(u64::MAX),
             counted,
             "the preflight must count exactly the abandoned-dispatch events appended"
+        );
+    }
+
+    /// The `harvest.workflow.history_size` gauge must describe the same
+    /// durable count the hard-cap preflight resolves, not a pre-dedup upper
+    /// bound (issue #1265). A re-parked dispatch that the preflight already
+    /// resolved to zero events must not inflate the gauge by two events.
+    #[test]
+    fn terminal_history_event_count_uses_the_resolved_count_not_the_pre_dedup_bound() {
+        let already_started = ExecutionId::new();
+        let commands = vec![abandoned_child_cmd(
+            already_started,
+            "worker_child",
+            Value::Null,
+        )];
+        let plan = AbandonedDispatchPlan::with_started_children([already_started.as_uuid()]);
+        let resolved = abandoned_dispatch_event_count_for_plan(&commands, &plan);
+        assert_eq!(resolved, 0, "the re-park contributes no durable event");
+
+        let gauge = terminal_history_event_count(5, &commands, resolved);
+        assert_eq!(
+            gauge, 6,
+            "next_event_id (5) + resolved abandoned count (0) + terminal event (1)"
         );
     }
 
