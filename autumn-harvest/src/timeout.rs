@@ -4667,7 +4667,8 @@ fn mark_audit_export_unobserved_for_checker_shard(
         }
         _ => {
             let shard_id = sharded_pool.map_or(0, |pool| pool.default_shard().as_i32());
-            metrics.record_audit_export_observed(u16::try_from(shard_id).unwrap_or(u16::MAX), false);
+            metrics
+                .record_audit_export_observed(u16::try_from(shard_id).unwrap_or(u16::MAX), false);
         }
     }
 }
