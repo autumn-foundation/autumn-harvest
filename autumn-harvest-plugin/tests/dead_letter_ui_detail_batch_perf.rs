@@ -11,12 +11,12 @@
 //!
 //! # Fixture
 //!
-//! Seeded, deterministic, one full page (200 dead letters): most point to a
-//! distinct workflow execution each, a handful share one execution (two
-//! task failures against the same run), and one has no execution at all
+//! Seeded, deterministic, one full page (200 dead letters). Most point to a
+//! distinct workflow execution each. A handful share one execution: two
+//! task failures against the same run. One has no execution at all
 //! (`workflow_exec_id = NULL`, a queue-level dead letter). Execution event
-//! counts are varied around the `LIMIT 10` boundary: 0, 3, exactly 10, and
-//! 15, so the last-10-events lookup is exercised at and past its own limit.
+//! counts vary around the `LIMIT 10` boundary: 0, 3, exactly 10, and 15.
+//! The last-10-events lookup is exercised at and past its own limit.
 //!
 //! Run against a real Postgres via `HARVEST_TEST_DATABASE_URL` (this test
 //! does not fall back to a testcontainer; Docker is not assumed available).
@@ -208,13 +208,13 @@ async fn insert_workflow(database_url: &str, workflow_id: &str) -> ExecutionId {
     exec_id
 }
 
-/// Event `event_type` uses a `<` / `>` delimiter (`"Ev<N>"`) so an HTML
-/// substring search for one execution's event can never match another
-/// execution's, or a different event count of the SAME execution: `exec`
-/// and `event_id` are both delimited on both sides (`N` / `Z`), so
+/// Builds an `event_type` marker for one execution's one event. Both
+/// `exec` and `event_id` sit between delimiters (`X` / `N` / `Z`) on every
+/// side. An HTML substring search for one marker can then never match a
+/// different event, or a different execution's marker, by accident.
 /// `event_marker(3, 1)` (`"EvX3N1Z"`) is not a substring of
-/// `event_marker(3, 15)` (`"EvX3N15Z"`) or of `event_marker(31, 1)`
-/// (`"EvX31N1Z"`).
+/// `event_marker(3, 15)` (`"EvX3N15Z"`). It is also not a substring of
+/// `event_marker(31, 1)` (`"EvX31N1Z"`).
 fn event_marker(exec: usize, event_id: i32) -> String {
     format!("EvX{exec}N{event_id}Z")
 }
@@ -312,30 +312,38 @@ const fn event_count_for(i: usize) -> i32 {
     }
 }
 
-/// Seeds [`TOTAL_DEAD_LETTERS`] dead letters and returns the execution
-/// ordinal `i` of one execution with 15 events (past the `LIMIT 10`
-/// boundary), for the truncation check in the test below. That ordinal is
-/// also the exec-id parameter [`event_marker`] takes, so the caller can
-/// reconstruct that execution's own event markers without looking anything
-/// up. Every other dead letter's expected workflow name is checked instead
-/// through a plain page-wide count, since the fixture always names the
-/// same one workflow type.
-/// Returns `(boundary_exec, named_row_count)`: the ordinal from the doc
-/// comment above, and the number of seeded rows whose `exec_uuid` ended up
-/// `Some` (and so should render `dlq_perf_workflow` as their name) --
-/// computed from the same branch the seeding loop itself takes, rather
-/// than a separately hand-counted expectation that could drift from it.
-async fn seed_fixture(database_url: &str) -> (usize, usize) {
+/// Seeds [`TOTAL_DEAD_LETTERS`] dead letters and returns `(boundary_exec,
+/// named_row_count, shared_donor_exec)`:
+///
+/// - `boundary_exec`: the ordinal of one execution with 15 events, past the
+///   `LIMIT 10` boundary, for the truncation check below. The ordinal
+///   doubles as the exec-id parameter [`event_marker`] takes. The caller
+///   reconstructs that execution's own event markers without a lookup.
+/// - `named_row_count`: the number of seeded rows whose `exec_uuid` ended up
+///   `Some`, and so should render `dlq_perf_workflow`. Computed from the
+///   same branch the seeding loop itself takes. A separately hand-counted
+///   expectation could drift from that branch instead.
+/// - `shared_donor_exec`: the ordinal of an execution seeded with a fixed 12
+///   events. TWO dead letters point at it: the donor row, and the row
+///   right after it, which shares rather than mints a fresh execution.
+///   Forced to 12, not [`event_count_for`]'s formula. Every
+///   `SHARED_EXEC_EVERY`th donor otherwise lands on that formula's
+///   zero-event bucket. Zero events would hide a duplicate-id bug in the
+///   batch lookup instead of exposing it. A lookup run twice for one id
+///   renders the same duplicated events in both rows that share it, but
+///   renders zero events identically either way.
+async fn seed_fixture(database_url: &str) -> (usize, usize, usize) {
     let mut last_exec: Option<Uuid> = None;
     let mut boundary_exec = None;
+    let mut shared_donor_exec = None;
     let mut named_rows = 0usize;
 
     for i in 0..TOTAL_DEAD_LETTERS {
         let exec_uuid = if i % SHARED_EXEC_EVERY == 1 {
             // Share the previous row's execution instead of minting a new one.
-            // `last_exec` is still `None` here for i == 1 (the row right
-            // after the deliberately exec-less i == 0), so this branch can
-            // itself produce a `None`.
+            // `last_exec` is still `None` here for i == 1, the row right
+            // after the deliberately exec-less i == 0. This branch can
+            // itself produce a `None` in that one case.
             last_exec
         } else if i == 0 {
             // The very first row is the queue-level, execution-less case.
@@ -343,9 +351,13 @@ async fn seed_fixture(database_url: &str) -> (usize, usize) {
         } else {
             let workflow_id = format!("dlq-perf-{i}");
             let exec_id = insert_workflow(database_url, &workflow_id).await;
-            let count = event_count_for(i);
+            let is_donor = (i + 1) % SHARED_EXEC_EVERY == 1;
+            let count = if is_donor { 12 } else { event_count_for(i) };
             append_events(database_url, i, exec_id, count).await;
             last_exec = Some(exec_id.as_uuid());
+            if is_donor {
+                shared_donor_exec = Some(i);
+            }
             if count == 15 && boundary_exec.is_none() {
                 boundary_exec = Some(i);
             }
@@ -361,6 +373,7 @@ async fn seed_fixture(database_url: &str) -> (usize, usize) {
     (
         boundary_exec.expect("fixture always seeds at least one 15-event execution"),
         named_rows,
+        shared_donor_exec.expect("fixture always seeds at least one shared execution"),
     )
 }
 
@@ -383,7 +396,7 @@ async fn dead_letter_ui_page_hydrates_details_correctly_and_batches_lookups() {
         return;
     };
     let database_url = create_fresh_database(&admin_url).await;
-    let (boundary_exec, named_rows) = seed_fixture(&database_url).await;
+    let (boundary_exec, named_rows, shared_donor_exec) = seed_fixture(&database_url).await;
 
     let app = build_single_shard_ui_app(&database_url);
 
@@ -396,9 +409,9 @@ async fn dead_letter_ui_page_hydrates_details_correctly_and_batches_lookups() {
     let (status, html) = fetch_html(&app, "/ui/dead-letters?limit=200").await;
     assert_eq!(status, StatusCode::OK, "DLQ page should render: {html}");
 
-    // -- correctness: every named dead letter's workflow name renders, and
-    // the boundary row (15 events) shows only its last 10 (events 6-15), not
-    // the 5 that fall outside the window. -----------------------------------
+    // -- correctness: every named dead letter's workflow name renders. The
+    // boundary row (15 events) shows only its last 10 (events 6-15). It
+    // does not show the 5 that fall outside the window. --------------------
     assert!(
         html.matches("dlq_perf_workflow").count() >= named_rows,
         "expected every named dead letter's workflow_name to render at least once"
@@ -412,6 +425,25 @@ async fn dead_letter_ui_page_hydrates_details_correctly_and_batches_lookups() {
         !html.contains(&event_marker(boundary_exec, 5))
             && !html.contains(&event_marker(boundary_exec, 1)),
         "boundary execution {boundary_exec} should NOT show events past the LIMIT 10 window"
+    );
+
+    // -- correctness: two dead letters share `shared_donor_exec` (12
+    // events). Each of those two rows renders that execution's last 10
+    // events (3-12) exactly once. A duplicate exec id in the batch query's
+    // `unnest($1::uuid[])` array would run the per-id event lookup twice
+    // for it. Each of the two rows would then render every one of those 10
+    // events twice. That is 4 page-wide occurrences of each marker instead
+    // of 2, one render per legitimate sharing row. --------------------------
+    let donor_event_12_occurrences = html.matches(&event_marker(shared_donor_exec, 12)).count();
+    assert_eq!(
+        donor_event_12_occurrences, 2,
+        "shared execution {shared_donor_exec}'s last event should render exactly once per \
+         sharing row (2 rows point at it); {donor_event_12_occurrences} occurrences found \
+         suggests the batch query re-ran its lookup once per duplicate id"
+    );
+    assert!(
+        !html.contains(&event_marker(shared_donor_exec, 2)),
+        "shared execution {shared_donor_exec} should NOT show events past its LIMIT 10 window"
     );
 
     if has_stats {

@@ -9,7 +9,7 @@
 use std::fmt::Write as _;
 use std::sync::Arc;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use autumn_web::AppState;
 use autumn_web::error::AutumnError;
@@ -2542,8 +2542,16 @@ async fn load_dead_letters_from_shards_for_ui(
                 let rows = query_dead_letters_for_ui(&mut conn, filters, limit)
                     .await
                     .map_err(|e| e.to_string())?;
-                let exec_ids: Vec<uuid::Uuid> =
-                    rows.iter().filter_map(|d| d.workflow_exec_id).collect();
+                // Deduplicated. Two dead letters can share one execution.
+                // An `unnest($1::uuid[])` id appearing twice would run the
+                // per-id LATERAL event lookup twice for that id. The rendered
+                // event count would double instead of staying capped at 10.
+                let exec_ids: Vec<uuid::Uuid> = rows
+                    .iter()
+                    .filter_map(|d| d.workflow_exec_id)
+                    .collect::<HashSet<_>>()
+                    .into_iter()
+                    .collect();
                 let (names, events) = load_dead_letter_details_batch(&mut conn, &exec_ids)
                     .await
                     .map_err(|e| e.to_string())?;
