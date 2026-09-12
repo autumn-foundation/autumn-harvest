@@ -10,17 +10,23 @@ use std::time::Duration;
 
 use rusqlite::{Connection, OpenFlags};
 
-/// How many recorded events one pending-call lookup reads.
+/// How many recorded events one read of the event log carries at a time.
 ///
-/// The awaited call is in the LAST model reply, so the scan runs backwards and
-/// stops. Reading the whole history instead would be unbounded twice over: the
-/// event count grows with every turn, and each model activity carries the
-/// whole transcript. A status call is not worth that, and the runtime is
-/// serialised, so one status would block every session drive.
+/// Reading a whole history is unbounded twice over: the event count grows
+/// with every turn, and each model activity carries the whole transcript. The
+/// runtime is serialised, so one such read blocks every session drive.
 ///
-/// The cap is generous. One turn records the model reply and one event for
-/// each tool call it asked for, so the newest reply is a few events back.
-pub const MAX_SCANNED_EVENTS: u32 = 64;
+/// This is a PAGE, and not a window. A search reads pages until it finds what
+/// it wants or the history ends, so no page size can hide an event from it.
+/// Only the memory in hand at one moment is bounded.
+pub const EVENT_PAGE: u32 = 64;
+
+/// How many events one `history` command prints.
+///
+/// The audit trail is the reason the command exists, so the cap is high. The
+/// newest events are kept, because they are what an operator reads first, and
+/// the command says when it is not the whole log.
+pub const MAX_HISTORY_EVENTS: u32 = 500;
 
 /// How many sessions one listing carries.
 ///
@@ -116,7 +122,12 @@ pub fn running(conn: &Connection, workflow_name: &str) -> Result<Vec<RunningSess
         .map_err(|e| format!("cannot read the running sessions: {e}"))
 }
 
-/// Read the newest recorded events of one session, newest first.
+/// Read one page of a session's events, newest first.
+///
+/// `before` is the sequence number the previous page ended on, so a caller
+/// walks backwards page by page. `None` starts at the newest event. Each item
+/// carries its own sequence number, which is the event's real position in the
+/// log and the cursor for the next page.
 ///
 /// The engine owns this table. The rows are read here, never written: the
 /// event log is append-only, and a reader of it must stay a reader.
@@ -124,27 +135,31 @@ pub fn running(conn: &Connection, workflow_name: &str) -> Result<Vec<RunningSess
 /// # Errors
 ///
 /// Returns an error if the query cannot run, or if a row is not readable.
-pub fn recent_events(
+pub fn events_before(
     conn: &Connection,
     exec_id: &str,
+    before: Option<i64>,
     limit: u32,
-) -> Result<Vec<serde_json::Value>, String> {
+) -> Result<Vec<(i64, serde_json::Value)>, String> {
     let mut statement = conn
         .prepare(
-            "SELECT event_json FROM harvest_events WHERE exec_id = ?1 \
-             ORDER BY seq DESC LIMIT ?2",
+            "SELECT seq, event_json FROM harvest_events \
+             WHERE exec_id = ?1 AND (?2 IS NULL OR seq < ?2) \
+             ORDER BY seq DESC LIMIT ?3",
         )
         .map_err(|e| format!("cannot prepare the event query: {e}"))?;
     let rows = statement
-        .query_map(rusqlite::params![exec_id, limit], |row| {
-            row.get::<_, String>(0)
+        .query_map(rusqlite::params![exec_id, before, limit], |row| {
+            Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
         })
         .map_err(|e| format!("cannot read the events: {e}"))?;
 
     rows.map(|row| {
         row.map_err(|e| format!("cannot read the events: {e}"))
-            .and_then(|json| {
-                serde_json::from_str(&json).map_err(|e| format!("cannot decode an event: {e}"))
+            .and_then(|(seq, json)| {
+                serde_json::from_str(&json)
+                    .map(|value| (seq, value))
+                    .map_err(|e| format!("cannot decode an event: {e}"))
             })
     })
     .collect()

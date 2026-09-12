@@ -547,7 +547,7 @@ fn handle(
             Ok((sessions, more)) => Response::Sessions { sessions, more },
             Err(message) => Response::Error { message },
         },
-        Request::History { execution_id } => history(runtime, reader, &execution_id),
+        Request::History { execution_id } => history(reader, &execution_id),
         Request::Approve {
             execution_id,
             token,
@@ -734,15 +734,14 @@ fn expired(reader: &Connection, execution_id: &str, signal: &str) -> Result<Opti
 /// The session must exist. An event read of an unknown id returns no rows, so
 /// without this check a mistyped audit target prints an empty history and
 /// exits clean. That reads as a session that did nothing.
-fn history(runtime: &SqliteRuntime, reader: &Connection, execution_id: &str) -> Response {
-    let exec = match execution_id.parse::<ExecutionId>() {
-        Ok(exec) => exec,
-        Err(e) => {
-            return Response::Error {
-                message: format!("`{execution_id}` is not an execution id: {e}"),
-            };
-        }
-    };
+fn history(reader: &Connection, execution_id: &str) -> Response {
+    // Parsed for the message it gives, and not for a value. A mistyped id is
+    // told apart from a real one this database does not hold.
+    if let Err(e) = execution_id.parse::<ExecutionId>() {
+        return Response::Error {
+            message: format!("`{execution_id}` is not an execution id: {e}"),
+        };
+    }
     match inspect::is_session(reader, WORKFLOW_NAME, execution_id) {
         Ok(true) => {}
         Ok(false) => {
@@ -752,17 +751,35 @@ fn history(runtime: &SqliteRuntime, reader: &Connection, execution_id: &str) -> 
         }
         Err(message) => return Response::Error { message },
     }
-    match runtime.load_history(exec) {
-        Ok(events) => Response::History {
-            events: events
+    // Read the newest events and no more. Each model activity records the
+    // whole transcript, and the count grows with every turn. Loading the log
+    // entire would spend the daemon's memory on one command. It would also
+    // block every session drive while it ran.
+    match inspect::events_before(reader, execution_id, None, inspect::MAX_HISTORY_EVENTS + 1) {
+        Ok(mut newest) => {
+            let more = newest.len() > inspect::MAX_HISTORY_EVENTS as usize;
+            if more {
+                newest.pop();
+            }
+            // The log reads forward, and each line carries the event's own
+            // sequence number rather than a position in this page.
+            newest.reverse();
+            let mut events: Vec<String> = newest
                 .iter()
-                .enumerate()
-                .map(|(index, event)| format!("{:>3}  {}", index + 1, describe(event)))
-                .collect(),
-        },
-        Err(e) => Response::Error {
-            message: format!("cannot read the history: {e}"),
-        },
+                .map(|(seq, value)| format!("{seq:>3}  {}", describe(value)))
+                .collect();
+            if more {
+                events.insert(
+                    0,
+                    format!(
+                        "… the newest {} events are shown; the log holds more",
+                        events.len()
+                    ),
+                );
+            }
+            Response::History { events }
+        }
+        Err(message) => Response::Error { message },
     }
 }
 
@@ -773,10 +790,7 @@ fn history(runtime: &SqliteRuntime, reader: &Connection, execution_id: &str) -> 
 /// compactly and trimmed to one readable line. The rendering is generic and
 /// prints whatever the event holds. A new event variant therefore needs no
 /// change here, and is never reduced to a bare name.
-fn describe(event: &autumn_harvest::WorkflowEvent) -> String {
-    let Ok(value) = serde_json::to_value(event) else {
-        return "unreadable event".to_string();
-    };
+fn describe(value: &Value) -> String {
     let label = value
         .get("type")
         .and_then(Value::as_str)
@@ -854,9 +868,16 @@ fn view(reader: &Connection, row: &ExecutionRow, blocked: &Parked, full: bool) -
 /// the run itself as well. The most recent model reply holds the awaited call,
 /// so the scan runs backwards.
 ///
-/// The read is BOUNDED. Every status of a parked session comes here, and the
-/// whole history grows with every turn while each model activity carries the
-/// whole transcript. See [`inspect::MAX_SCANNED_EVENTS`].
+/// The read is PAGED, and not windowed. Every status of a parked session comes
+/// here. The history grows with every turn, and each model activity carries
+/// the whole transcript, so reading it entire would block every session drive.
+///
+/// A fixed window would be worse than slow. One turn may ask for many tool
+/// calls, and each one records events of its own. The model reply that holds
+/// the awaited call can therefore sit any distance back.
+///
+/// The search walks pages until it finds the call or the log ends. Only the
+/// memory in hand at one moment is bounded. See [`inspect::EVENT_PAGE`].
 pub fn pending_call(
     reader: &Connection,
     exec_id: &str,
@@ -864,36 +885,42 @@ pub fn pending_call(
     full: bool,
 ) -> Option<PendingCall> {
     let call_id = session::approval_call_id(signal)?;
-    let recent = inspect::recent_events(reader, exec_id, inspect::MAX_SCANNED_EVENTS).ok()?;
+    let mut before = None;
 
-    for value in recent {
-        if value.get("type").and_then(Value::as_str) != Some("ActivityCompleted") {
-            continue;
-        }
-        let Some(output) = value.pointer("/data/output") else {
-            continue;
-        };
-        let Ok(reply) = serde_json::from_value::<TurnReply>(output.clone()) else {
-            continue;
-        };
-        if let Some(call) = reply.tool_calls.into_iter().find(|call| call.id == call_id) {
-            let mut input = call.input.to_string();
-            // A decision needs the WHOLE payload, and a write carries up to
-            // 64 KiB. The status trims it to stay readable, and `--full` prints
-            // every byte, so nothing is ever approved sight unseen.
-            if !full && input.chars().count() > MAX_PENDING_INPUT_CHARS {
-                input = input.chars().take(MAX_PENDING_INPUT_CHARS).collect();
-                input.push_str(" … (truncated; read it all with `status --full`)");
+    loop {
+        let page = inspect::events_before(reader, exec_id, before, inspect::EVENT_PAGE).ok()?;
+        let (last, _) = *page.last()?;
+        before = Some(last);
+
+        for (_, value) in page {
+            if value.get("type").and_then(Value::as_str) != Some("ActivityCompleted") {
+                continue;
             }
-            return Some(PendingCall {
-                token: signal.to_string(),
-                id: call.id,
-                tool: call.name,
-                input,
-            });
+            let Some(output) = value.pointer("/data/output") else {
+                continue;
+            };
+            let Ok(reply) = serde_json::from_value::<TurnReply>(output.clone()) else {
+                continue;
+            };
+            if let Some(call) = reply.tool_calls.into_iter().find(|call| call.id == call_id) {
+                let mut input = call.input.to_string();
+                // A decision needs the WHOLE payload, and a write carries up
+                // to 64 KiB. The status trims it to stay readable, and
+                // `--full` prints every byte, so nothing is ever approved
+                // sight unseen.
+                if !full && input.chars().count() > MAX_PENDING_INPUT_CHARS {
+                    input = input.chars().take(MAX_PENDING_INPUT_CHARS).collect();
+                    input.push_str(" … (truncated; read it all with `status --full`)");
+                }
+                return Some(PendingCall {
+                    token: signal.to_string(),
+                    id: call.id,
+                    tool: call.name,
+                    input,
+                });
+            }
         }
     }
-    None
 }
 
 /// Create the workspace, make it durable, and record its resolved name.

@@ -1158,13 +1158,13 @@ async fn a_status_reads_a_bounded_slice_of_the_history() {
     // than `MAX_SCANNED_EVENTS`, so asserting against that cap would pass
     // whether or not the query carries a limit. The assertion uses a small
     // limit instead, which only holds if the limit reaches the query.
-    let whole = inspect::recent_events(&reader, &exec_id, u32::MAX).expect("the events read");
+    let whole = inspect::events_before(&reader, &exec_id, None, u32::MAX).expect("the events read");
     assert!(
         whole.len() > 3,
         "the fixture must hold more events than the limit below, and holds {}",
         whole.len()
     );
-    let capped = inspect::recent_events(&reader, &exec_id, 3).expect("the events read");
+    let capped = inspect::events_before(&reader, &exec_id, None, 3).expect("the events read");
     assert_eq!(
         capped.len(),
         3,
@@ -1177,6 +1177,147 @@ async fn a_status_reads_a_bounded_slice_of_the_history() {
         whole.first(),
         "the bounded read must start at the newest event"
     );
+
+    // A page is not a window. The search must reach an event that sits further
+    // back than one page. A turn with many tool calls before its gated write
+    // would otherwise leave the operator with no token to approve.
+    let (oldest_seq, _) = *whole.last().expect("the history is not empty");
+    let reached = (0..)
+        .scan(None, |before: &mut Option<i64>, _| {
+            let page = inspect::events_before(&reader, &exec_id, *before, 1).ok()?;
+            let (seq, _) = *page.first()?;
+            *before = Some(seq);
+            Some(seq)
+        })
+        .take(whole.len())
+        .last()
+        .expect("the walk reads at least one page");
+    assert_eq!(
+        reached, oldest_seq,
+        "a page-by-page walk must reach the oldest event"
+    );
+}
+
+#[tokio::test]
+async fn a_status_finds_a_call_behind_more_events_than_one_page() {
+    let dir = tempfile::tempdir().expect("a temporary directory");
+    let db = dir.path().join("agentd.db");
+    let workspace = dir.path().join("workspace");
+    std::fs::create_dir_all(&workspace).expect("the workspace is created");
+
+    let calls = Arc::new(AtomicUsize::new(0));
+    let mut rt = runtime(&db, &workspace, &calls);
+    let exec = rt
+        .start_workflow(WORKFLOW_NAME, task(&workspace))
+        .expect("the session starts");
+    let signal = drive_to_approval(&mut rt, exec).await;
+    drop(rt);
+
+    let reader = inspect::open(&db).expect("the reader opens");
+    let exec_id = exec.to_string();
+
+    // One page of ONE event. A fixed window of this size would step over the
+    // model reply that holds the awaited call. The status would then print no
+    // token at all, and the operator could not approve before the deadline. A
+    // page must bound the memory in hand, and nothing else.
+    let mut before = None;
+    let mut walked = 0;
+    let found = loop {
+        let page = inspect::events_before(&reader, &exec_id, before, 1).expect("the page reads");
+        let Some((seq, value)) = page.first() else {
+            break None;
+        };
+        before = Some(*seq);
+        walked += 1;
+        if value.get("type").and_then(serde_json::Value::as_str) == Some("ActivityCompleted")
+            && let Some(output) = value.pointer("/data/output")
+            && serde_json::from_value::<TurnReply>(output.clone())
+                .is_ok_and(|reply| !reply.tool_calls.is_empty())
+        {
+            break Some(walked);
+        }
+    };
+    let depth = found.expect("a model reply with a call is in the log");
+    assert!(
+        depth > 1,
+        "the fixture must hide the reply behind at least one other event"
+    );
+
+    // The daemon's own lookup finds it whatever the page size.
+    let call = daemon::pending_call(&reader, &exec_id, &signal, false)
+        .expect("the awaited call must be found however deep it sits");
+    assert_eq!(call.token, signal, "the call must be the awaited one");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_history_command_reads_a_bounded_page() {
+    let dir = tempfile::tempdir().expect("a temporary directory");
+    let db = dir.path().join("agentd.db");
+    let socket = dir.path().join("agentd.sock");
+    let options = daemon::Options {
+        db: db.clone(),
+        socket: socket.clone(),
+        workspace: dir.path().join("workspace"),
+        model: claude::DEFAULT_MODEL.to_string(),
+        max_tokens: claude::DEFAULT_MAX_TOKENS,
+        tick: Duration::from_millis(50),
+        api_key: None,
+    };
+    let served = tokio::spawn(daemon::serve(options));
+    await_daemon(&socket).await;
+
+    let submitted = protocol::call(
+        &socket,
+        &Request::Submit {
+            goal: "summarise the workspace".to_string(),
+            max_turns: 6,
+            approval_timeout_secs: 300,
+        },
+    )
+    .await
+    .expect("the submit is answered");
+    let Response::Submitted { execution_id } = submitted else {
+        panic!("unexpected answer: {submitted:?}");
+    };
+    await_parked(&socket, &execution_id).await;
+
+    let answer = protocol::call(
+        &socket,
+        &Request::History {
+            execution_id: execution_id.clone(),
+        },
+    )
+    .await
+    .expect("the history is answered");
+    let Response::History { events } = answer else {
+        panic!("unexpected answer: {answer:?}");
+    };
+
+    // The audit trail is the point of the command, so a short session prints
+    // whole. The bound is on what one command reads, not on what it may show.
+    assert!(!events.is_empty(), "the history must not be empty");
+    assert!(
+        events.len() <= inspect::MAX_HISTORY_EVENTS as usize + 1,
+        "the history must stay bounded, and printed {} lines",
+        events.len()
+    );
+    assert!(
+        !events[0].contains("the log holds more"),
+        "a short session is the whole log: {}",
+        events[0]
+    );
+
+    // Each line carries the event's OWN sequence number, which the log counts
+    // from zero. A bounded read therefore never renumbers the log it shows,
+    // and a later page reads on from where this one ended.
+    assert!(
+        events[0].trim_start().starts_with("0  "),
+        "the first line must carry the log's own first sequence number: {}",
+        events[0]
+    );
+
+    served.abort();
+    drop(served.await);
 }
 
 #[test]
