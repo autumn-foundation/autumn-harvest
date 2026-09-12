@@ -28531,37 +28531,48 @@ pub async fn reset_timed_out_workflow_task(pool: &DbPool, task_id: uuid::Uuid, w
     // before this path gives up and logs the "task may be stuck RUNNING"
     // error below.
     //
-    // Codex review (PR #1499) found the widened schedule alone
-    // insufficient. Harvest's deadpool configuration sets no acquisition
-    // timeout. A bare `pool.get().await` under real exhaustion waits
-    // forever instead of returning `Err`. The backoff loop below would
-    // then never reach a second iteration, and the wider schedule would
-    // govern nothing. Each attempt is now bounded by `ACQUIRE_BOUND`. That
-    // mirrors the same `tokio::time::timeout(bound, pool.get())` pattern
-    // `acquire_shard_conn` already uses in this file, so a genuinely
-    // exhausted pool times out and retries instead of hanging forever.
+    // The widened schedule alone is insufficient (PR #1499). Harvest's
+    // deadpool configuration sets no acquisition timeout. A bare
+    // `pool.get().await` under real exhaustion waits forever instead of
+    // returning `Err`. The backoff loop below would then never reach a
+    // second iteration, and the wider schedule would govern nothing.
+    //
+    // Wrapping each attempt in its own `tokio::time::timeout` is not the
+    // fix, either: it cancels a still-pending checkout every few
+    // seconds. deadpool queues waiters fairly, so reissuing `pool.get()`
+    // sends it to the back of that queue each time. Under sustained,
+    // non-permanent contention, this can starve the reset indefinitely.
+    // Every other task's checkout keeps its place in the queue; only
+    // this one keeps losing its own. An uninterrupted wait would
+    // eventually have succeeded.
+    //
+    // Fixed by bounding the whole operation once, not each attempt. The
+    // inner loop's `pool.get().await` is never wrapped in its own
+    // timeout. A legitimately queued checkout keeps its place for as
+    // long as it takes. Only a genuine `Err` from `pool.get()` triggers
+    // a backoff and a retry -- never a timeout of our own making. One
+    // outer `tokio::time::timeout(TOTAL_BUDGET, ...)` bounds the sum of
+    // every retry and every wait between them. It is the only point
+    // that can cancel a pending checkout, and it does so once, after
+    // the full budget, not repeatedly.
     //
     // This narrows, but does not close, #1459. A connection outage longer
-    // than the full retry budget still leaves the row stuck with no
-    // backstop. Nothing here adds a reclaim path for a wedged task on a
-    // live worker. A dedicated liveness check for the claiming worker is a
+    // than `TOTAL_BUDGET` still leaves the row stuck with no backstop.
+    // Nothing here adds a reclaim path for a wedged task on a live
+    // worker. A dedicated liveness check for the claiming worker is a
     // separate, larger question, tracked on the issue and not attempted
     // here.
-    const ACQUIRE_BOUND: Duration = Duration::from_secs(5);
-    let mut conn = {
-        let mut last_err: Option<String> = None;
+    const TOTAL_BUDGET: Duration = Duration::from_secs(61);
+    let attempt = async {
         let backoff_ms: &[u64] = &[0, 1_000, 2_000, 4_000, 8_000, 16_000, 30_000];
-        let mut result = None;
+        let mut last_err: Option<String> = None;
         for &delay_ms in backoff_ms {
             if delay_ms > 0 {
                 tokio::time::sleep(Duration::from_millis(delay_ms)).await;
             }
-            match tokio::time::timeout(ACQUIRE_BOUND, pool.get()).await {
-                Ok(Ok(c)) => {
-                    result = Some(c);
-                    break;
-                }
-                Ok(Err(e)) => {
+            match pool.get().await {
+                Ok(c) => return Ok(c),
+                Err(e) => {
                     tracing::warn!(
                         task_id = %task_id,
                         worker_id = %worker_id,
@@ -28570,25 +28581,28 @@ pub async fn reset_timed_out_workflow_task(pool: &DbPool, task_id: uuid::Uuid, w
                     );
                     last_err = Some(e.to_string());
                 }
-                Err(_elapsed) => {
-                    tracing::warn!(
-                        task_id = %task_id,
-                        worker_id = %worker_id,
-                        bound = ?ACQUIRE_BOUND,
-                        "workflow task timeout reset: pool acquisition timed out, retrying"
-                    );
-                    last_err = Some(format!("pool acquisition exceeded {ACQUIRE_BOUND:?}"));
-                }
             }
         }
-        if let Some(c) = result {
-            c
-        } else {
+        Err(last_err)
+    };
+    let mut conn = match tokio::time::timeout(TOTAL_BUDGET, attempt).await {
+        Ok(Ok(c)) => c,
+        Ok(Err(last_err)) => {
             tracing::error!(
                 task_id = %task_id,
                 worker_id = %worker_id,
                 error = ?last_err,
                 "workflow task timeout reset: pool exhausted after retries; \
+                 task may be stuck RUNNING until worker stops"
+            );
+            return;
+        }
+        Err(_elapsed) => {
+            tracing::error!(
+                task_id = %task_id,
+                worker_id = %worker_id,
+                bound = ?TOTAL_BUDGET,
+                "workflow task timeout reset: pool acquisition still pending after budget; \
                  task may be stuck RUNNING until worker stops"
             );
             return;
