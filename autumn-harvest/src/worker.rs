@@ -38942,7 +38942,11 @@ mod tests {
     #[test]
     fn terminal_history_event_count_uses_the_resolved_count_not_the_pre_dedup_bound() {
         let already_started = ExecutionId::new();
-        let commands = vec![abandoned_child_cmd(already_started, "worker_child", Value::Null)];
+        let commands = vec![abandoned_child_cmd(
+            already_started,
+            "worker_child",
+            Value::Null,
+        )];
         let plan = AbandonedDispatchPlan::with_started_children([already_started.as_uuid()]);
         let resolved = abandoned_dispatch_event_count_for_plan(&commands, &plan);
         assert_eq!(resolved, 0, "the re-park contributes no durable event");
