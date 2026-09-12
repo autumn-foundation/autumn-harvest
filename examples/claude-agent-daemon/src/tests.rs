@@ -1340,8 +1340,7 @@ async fn a_status_finds_a_call_behind_more_events_than_one_page() {
     // The lookup reads the CALLS of a reply and not the reply. A reply holds
     // every earlier turn in its content, and none of that names a call. A read
     // of the whole reply would carry the transcript with it.
-    let replies =
-        inspect::reply_calls(&reader, &exec_id, None, inspect::EVENT_PAGE).expect("the calls read");
+    let replies = inspect::reply_calls(&reader, &exec_id, None, 1).expect("the calls read");
     let (_, calls) = replies.first().expect("a reply is recorded");
     assert!(calls.is_array(), "the query must return the calls: {calls}");
     assert!(
@@ -1524,6 +1523,26 @@ async fn an_empty_goal_never_starts_a_session() {
     // The field beside it takes the same argument. A protocol client can send
     // a bound of zero even though the CLI refuses it. The loop would then run
     // `1..=0` and record a COMPLETED session that never called the model.
+    // The deadline is recorded and read back as a signed integer. A larger
+    // one would be accepted here and would then stop every later daemon.
+    let huge = protocol::call(
+        &socket,
+        &Request::Submit {
+            goal: "a real goal".to_string(),
+            max_turns: 4,
+            approval_timeout_secs: u64::MAX,
+        },
+    )
+    .await
+    .expect("the submit is answered");
+    let Response::Error { message } = huge else {
+        panic!("an unrecordable deadline must be refused, and got: {huge:?}");
+    };
+    assert!(
+        message.contains("approval deadline"),
+        "the refusal must name the field: {message}"
+    );
+
     let zero = protocol::call(
         &socket,
         &Request::Submit {
@@ -2224,6 +2243,13 @@ async fn a_daemon_refuses_a_session_it_cannot_read() {
         ("goal", json!("")),
         ("goal", json!("   ")),
         ("goal", json!("\t\n ")),
+        // `json_type` calls this an integer and `json_extract` returns a
+        // real. The type test alone therefore admits it. Reading it as an
+        // integer then fails the WHOLE query, which names no session.
+        (
+            "approval_timeout_secs",
+            json!(9_223_372_036_854_775_808_u64),
+        ),
         ("max_turns", Value::Null),
         ("max_turns", json!(-1)),
         ("max_turns", json!(0)),
@@ -2576,6 +2602,87 @@ fn the_decide_line_reaches_the_daemon_that_printed_it() {
     assert!(
         unreachable.contains("agentd serve --socket /run/agentd/project-b.sock"),
         "the start command must name the socket that failed: {unreachable}"
+    );
+}
+
+/// The reply search stops at the newest reply.
+///
+/// The `stop_reason` test is not indexed. The database reads and decodes each
+/// row to know whether it matches, and `LIMIT` counts only the rows that DO.
+/// A page of many therefore reads backward past older replies until it has
+/// that many. On a long history that is the whole log for one `status`.
+///
+/// This asserts the property the page size buys: a page of one returns the
+/// NEWEST reply and no older one. What it cannot assert is the row count the
+/// database read to get there, which needs a progress hook this build does
+/// not carry.
+#[test]
+fn the_reply_search_reads_no_further_than_the_newest_reply() {
+    let dir = tempfile::tempdir().expect("a temporary directory");
+    let db = dir.path().join("replies.db");
+    let writer = rusqlite::Connection::open(&db).expect("the database opens");
+    writer
+        .execute(
+            "CREATE TABLE harvest_events (exec_id TEXT, seq INTEGER, event_json TEXT, \
+             PRIMARY KEY (exec_id, seq))",
+            [],
+        )
+        .expect("the fixture table is created");
+
+    // Four turns, each a reply and then the events of its tool calls. The
+    // newest reply sits behind the tool events of its own turn, and three
+    // older replies sit behind those.
+    let mut seq = 0_i64;
+    for turn in 0..4 {
+        let reply = json!({
+            "type": "ActivityCompleted",
+            "data": { "output": {
+                "stop_reason": "tool_use",
+                "tool_calls": [{
+                    "id": format!("toolu_{turn}"),
+                    "name": "write_file",
+                    "input": { "path": "notes.md", "content": "x" },
+                }],
+            }},
+        });
+        writer
+            .execute(
+                "INSERT INTO harvest_events VALUES ('e', ?1, ?2)",
+                rusqlite::params![seq, reply.to_string()],
+            )
+            .expect("the reply is recorded");
+        seq += 1;
+        for _ in 0..20 {
+            let result = json!({
+                "type": "ActivityCompleted",
+                "data": { "output": { "ok": true } },
+            });
+            writer
+                .execute(
+                    "INSERT INTO harvest_events VALUES ('e', ?1, ?2)",
+                    rusqlite::params![seq, result.to_string()],
+                )
+                .expect("the tool event is recorded");
+            seq += 1;
+        }
+    }
+    drop(writer);
+
+    let reader = rusqlite::Connection::open(&db).expect("the database opens");
+    let page = inspect::reply_calls(&reader, "e", None, 1).expect("the page reads");
+    assert_eq!(page.len(), 1, "a page of one must hold one reply: {page:?}");
+    assert_eq!(
+        page[0].0, 63,
+        "the page must hold the NEWEST reply and stop there"
+    );
+
+    // The whole log holds four replies, so a larger page walks back over the
+    // older three. That is the reading this page size avoids.
+    let wide = inspect::reply_calls(&reader, "e", None, 64).expect("the page reads");
+    assert_eq!(
+        wide.len(),
+        4,
+        "a wide page reads back to the end of the log: {wide:?}"
     );
 }
 

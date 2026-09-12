@@ -99,6 +99,22 @@ type Job = (Request, oneshot::Sender<Response>);
 /// it is generous; the marker says when there is more.
 const MAX_PENDING_INPUT_CHARS: usize = 2000;
 
+/// How many model replies one step of the pending-call search reads.
+///
+/// One. A parked session waits on a call of its newest reply, so one row
+/// answers and the database stops reading there. The `stop_reason` test is
+/// not indexed. A larger page would therefore read backward past older
+/// replies until it had that many, and decode every tool event on the way.
+///
+/// Reading a whole history is unbounded twice over: the event count grows
+/// with every turn, and each model activity carries the whole transcript. The
+/// runtime is serialised, so one such read blocks every session drive.
+///
+/// This is a PAGE, and not a window. The search reads pages until it finds
+/// the call or the history ends, so no page size can hide a reply from it.
+/// Only the memory in hand at one moment is bounded.
+const REPLY_PAGE: u32 = 1;
+
 /// Why one session is parked, and what would release it.
 #[derive(Clone)]
 pub struct ParkedState {
@@ -619,6 +635,19 @@ fn submit(
             message: "the turn bound is zero. A session needs at least one turn.".to_string(),
         };
     }
+    // The deadline is recorded in the task and read back as a SIGNED 64-bit
+    // integer. A larger value is stored as a JSON number. The database
+    // returns that number as a real, and reading a real as an integer fails
+    // the whole startup query. The session would be recorded here and then
+    // stop every later daemon of this version from starting.
+    if i64::try_from(approval_timeout_secs).is_err() {
+        return Response::Error {
+            message: format!(
+                "the approval deadline of {approval_timeout_secs} seconds is past                  {} and cannot be recorded. Choose a smaller one.",
+                i64::MAX
+            ),
+        };
+    }
     let task = SessionTask {
         goal,
         max_turns,
@@ -966,11 +995,19 @@ fn view(reader: &Connection, row: &ExecutionRow, blocked: &Parked, full: bool) -
 /// calls, and each one records events of its own. The model reply that holds
 /// the awaited call can therefore sit any distance back.
 ///
-/// The search walks pages until it finds the call or the log ends, and it
-/// walks MODEL REPLIES alone. The database drops the tool results, so the
-/// work is one row per turn and not one row per event. `--max-turns` already
-/// bounds the turns. Memory and work are both bounded, and no page size can
-/// hide the call. See [`inspect::replies_before`].
+/// The search walks MODEL REPLIES, newest first, and asks for ONE of them at
+/// a time. A parked session waits on a call of its newest reply. The first
+/// row therefore answers, and the database stops reading as soon as it finds
+/// it. The tool events after that reply are the only ones it passes over.
+///
+/// The page size is one for that reason, and it is not a memory bound. The
+/// `stop_reason` test is not indexed, so the database must read and decode
+/// each row to know whether it matches. A larger page reads BACKWARD past
+/// older replies until it has that many, which on a long history means the
+/// whole log for one `status`.
+///
+/// The walk remains, so a call the newest reply does not hold is still found
+/// and no page size can hide it. See [`inspect::reply_calls`].
 pub fn pending_call(
     reader: &Connection,
     exec_id: &str,
@@ -981,7 +1018,7 @@ pub fn pending_call(
     let mut before = None;
 
     loop {
-        let page = inspect::reply_calls(reader, exec_id, before, inspect::EVENT_PAGE).ok()?;
+        let page = inspect::reply_calls(reader, exec_id, before, REPLY_PAGE).ok()?;
         let (last, _) = *page.last()?;
         before = Some(last);
 

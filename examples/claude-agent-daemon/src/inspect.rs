@@ -10,17 +10,6 @@ use std::time::Duration;
 
 use rusqlite::{Connection, OpenFlags};
 
-/// How many recorded events one read of the event log carries at a time.
-///
-/// Reading a whole history is unbounded twice over: the event count grows
-/// with every turn, and each model activity carries the whole transcript. The
-/// runtime is serialised, so one such read blocks every session drive.
-///
-/// This is a PAGE, and not a window. A search reads pages until it finds what
-/// it wants or the history ends, so no page size can hide an event from it.
-/// Only the memory in hand at one moment is bounded.
-pub const EVENT_PAGE: u32 = 64;
-
 /// How many events one `history` command prints.
 ///
 /// The audit trail is the reason the command exists, so the cap is high. The
@@ -161,10 +150,18 @@ pub fn running(conn: &Connection, workflow_name: &str) -> Result<Vec<RunningSess
     // set is given, because `trim` alone removes the space and not the tab or
     // the newline.
     //
-    // Each number is read only when its JSON TYPE is `integer`. `json_extract`
-    // alone does not answer the type: a JSON `true` comes back as the integer
-    // 1, which the task's unsigned field refuses on deserialisation. The
-    // caller checks the RANGE of the value the type guard admits.
+    // Each number is read only when BOTH tests pass, and the two catch
+    // different faults.
+    //
+    // `json_type` reads the type in the document. It refuses a JSON `true`,
+    // which `json_extract` alone would return as the integer 1.
+    //
+    // `typeof` reads the class of the value that comes out. It refuses a
+    // number too large for a signed 64-bit integer, which `json_type` still
+    // calls an integer while `json_extract` returns a real. Reading that into
+    // an integer fails the WHOLE query, which would name no row at all.
+    //
+    // The caller checks the RANGE of the value the two tests admit.
     let mut statement = conn
         .prepare(
             "SELECT exec_id, \
@@ -174,9 +171,13 @@ pub fn running(conn: &Connection, workflow_name: &str) -> Result<Vec<RunningSess
                          THEN json_extract(input_json, '$.model') END, \
                     CASE WHEN json_valid(input_json) \
                           AND json_type(input_json, '$.max_turns') = 'integer' \
+                          AND typeof(json_extract(input_json, '$.max_turns')) \
+                              = 'integer' \
                          THEN json_extract(input_json, '$.max_turns') END, \
                     CASE WHEN json_valid(input_json) \
                           AND json_type(input_json, '$.approval_timeout_secs') = 'integer' \
+                          AND typeof(json_extract(input_json, '$.approval_timeout_secs')) \
+                              = 'integer' \
                          THEN json_extract(input_json, '$.approval_timeout_secs') END, \
                     CASE WHEN json_valid(input_json) \
                           AND json_type(input_json, '$.goal') = 'text' \
