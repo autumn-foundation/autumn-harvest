@@ -1810,6 +1810,89 @@ async fn a_checkers_own_connection_failure_marks_its_shard_unobserved() {
     uninstall();
 }
 
+// Issue #1268: the legacy `spawn_timeout_checker` entry point passes
+// `shard: None` for a process-wide loop. That loop can still cover a real,
+// non-default `shard_assignments` (e.g. `[7]`) when driving a sharded pool.
+// The fix above must label the shards `shard_assignments` actually names.
+// It must never fall back to the pool's own default shard. Otherwise a
+// connection failure here would mark the WRONG shard (0) unobserved, while
+// the actually-affected shard (7) stays frozen.
+#[tokio::test]
+async fn a_process_wide_checkers_connection_failure_marks_its_real_shards_unobserved() {
+    let _guard = TEST_SERIAL.lock().await;
+    let _installed = install(Arc::new(RecordingSink::new(200)), 100);
+
+    let (_conn, container) = make_conn().await;
+    let pool = single_connection_pool(&container).await;
+    // `ShardedDbPool::single` always defaults to shard 0. That is exactly
+    // the wrong-shard label a naive fix would fall back to, so the
+    // assignment below names a different shard on purpose. Built before
+    // the container stops: `get_host_port_ipv4` needs the live mapping.
+    let sharded =
+        autumn_harvest::shard::ShardedDbPool::single(single_connection_pool(&container).await);
+    container
+        .stop_with_timeout(Some(0))
+        .await
+        .expect("stop container");
+
+    let metrics = Arc::new(RecordingMetrics::default());
+    let telemetry = Arc::new(autumn_harvest::telemetry::TelemetryConfig {
+        metrics: metrics.clone(),
+        ..Default::default()
+    });
+    let cancel = tokio_util::sync::CancellationToken::new();
+
+    let handle = autumn_harvest::timeout::spawn_timeout_checker_for_shard(
+        pool,
+        cancel.clone(),
+        std::time::Duration::from_millis(50),
+        telemetry,
+        std::time::Duration::from_secs(5),
+        Some(sharded),
+        vec![autumn_harvest::types::ShardId::new(7)],
+        Arc::new(autumn_harvest::circuit_breaker::CircuitBreakerRegistry::default()),
+        None,
+        60,
+        None, // the legacy, process-wide entry point's own shard label
+        autumn_harvest::payload_codec::PayloadCodecs::default(),
+        0,
+    );
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        if metrics
+            .observed
+            .lock()
+            .expect("observed")
+            .contains(&(7_u16, false))
+        {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the checker must mark shard 7 -- the shard `shard_assignments` \
+             actually names -- unobserved, never the pool's own default \
+             shard 0; got {:?}",
+            metrics.observed.lock().expect("observed")
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    }
+    assert!(
+        !metrics
+            .observed
+            .lock()
+            .expect("observed")
+            .contains(&(0_u16, false)),
+        "shard 0 was never assigned to this loop and must not be reported \
+         at all; got {:?}",
+        metrics.observed.lock().expect("observed")
+    );
+
+    cancel.cancel();
+    let _ = handle.await;
+    uninstall();
+}
+
 // A mismatched (conn, shard_assignments) pair must never stamp rows in the
 // connection's own database under the assigned shard's key.
 //
