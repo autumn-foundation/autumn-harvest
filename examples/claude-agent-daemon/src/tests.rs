@@ -1473,6 +1473,114 @@ async fn a_history_command_reads_a_bounded_page() {
     drop(served.await);
 }
 
+#[tokio::test(flavor = "multi_thread")]
+async fn an_empty_goal_never_starts_a_session() {
+    let dir = tempfile::tempdir().expect("a temporary directory");
+    let socket = dir.path().join("agentd.sock");
+    let served = tokio::spawn(daemon::serve(daemon::Options {
+        db: dir.path().join("agentd.db"),
+        socket: socket.clone(),
+        workspace: dir.path().join("workspace"),
+        model: claude::DEFAULT_MODEL.to_string(),
+        max_tokens: claude::DEFAULT_MAX_TOKENS,
+        tick: Duration::from_millis(50),
+        api_key: None,
+    }));
+    await_daemon(&socket).await;
+
+    // An empty goal is sent as an empty text block, which the API refuses.
+    // The refusal of an accepted request is terminal here, so the daemon
+    // would acknowledge a session that could never make its first call.
+    for empty in ["", "   ", "\t\n"] {
+        let answer = protocol::call(
+            &socket,
+            &Request::Submit {
+                goal: empty.to_string(),
+                max_turns: 4,
+                approval_timeout_secs: 60,
+            },
+        )
+        .await
+        .expect("the submit is answered");
+        let Response::Error { message } = answer else {
+            panic!("an empty goal must be refused, and got: {answer:?}");
+        };
+        assert!(
+            message.contains("empty"),
+            "the refusal must say what is wrong: {message}"
+        );
+    }
+
+    // Nothing was recorded, so no session is left to fail.
+    let listed = protocol::call(&socket, &Request::List)
+        .await
+        .expect("the listing is answered");
+    let Response::Sessions { sessions, .. } = listed else {
+        panic!("unexpected answer: {listed:?}");
+    };
+    assert!(
+        sessions.is_empty(),
+        "a refused submit must record nothing: {sessions:?}"
+    );
+
+    served.abort();
+    drop(served.await);
+}
+
+#[test]
+fn a_block_that_cannot_be_replayed_is_refused() {
+    use autumn_harvest::failure::parse_error_payload_full;
+
+    let reply = |content: Value| TurnReply {
+        content,
+        stop_reason: "tool_use".to_string(),
+        text: String::new(),
+        tool_calls: vec![ToolCall {
+            id: "toolu_a".to_string(),
+            name: tools::TOOL_WRITE_FILE.to_string(),
+            input: json!({ "path": "notes.md", "content": "x" }),
+        }],
+    };
+
+    // The assistant blocks are replayed VERBATIM on the next request. A block
+    // the API will not accept back fails the turn AFTER this turn's tools
+    // have run. A malformed billed response would therefore leave a real
+    // change on the disk, and a failed session behind it.
+    for malformed in [
+        json!([Value::Null, { "type": "tool_use", "id": "toolu_a" }]),
+        json!(["a bare string"]),
+        json!([{ "text": "a block with no type" }]),
+        json!([{ "type": "" }]),
+        json!("not an array at all"),
+    ] {
+        assert!(
+            !claude::has_replayable_content(&reply(malformed.clone())),
+            "a block that cannot be replayed must be refused: {malformed}"
+        );
+    }
+
+    // A block type this example does not know about still passes, because the
+    // API knows types this example does not.
+    for fine in [
+        json!([{ "type": "text", "text": "hello" }]),
+        json!([{ "type": "thinking", "thinking": "…" }]),
+        json!([{ "type": "a_type_from_a_later_api" }]),
+        json!([]),
+    ] {
+        assert!(
+            claude::has_replayable_content(&reply(fine.clone())),
+            "a well-formed block must pass: {fine}"
+        );
+    }
+
+    // The refusal is terminal, because the response was billed.
+    let refused = parse_error_payload_full(&claude::body_failure(
+        reqwest::StatusCode::OK,
+        "its response carried a content block that cannot be replayed",
+    ));
+    assert!(refused.non_retryable, "a billed malformed body is terminal");
+}
+
 #[test]
 fn a_zero_turn_session_is_rejected() {
     use clap::Parser;

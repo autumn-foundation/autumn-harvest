@@ -520,7 +520,7 @@ fn handle(
             live,
             workspace,
             model,
-            goal,
+            &goal,
             max_turns,
             approval_timeout_secs,
         ),
@@ -568,10 +568,21 @@ fn submit(
     live: &mut Live,
     workspace: &str,
     model: &str,
-    goal: String,
+    goal: &str,
     max_turns: u32,
     approval_timeout_secs: u64,
 ) -> Response {
+    // A session needs something to do. An empty goal is sent as an empty text
+    // block, which the API refuses, and the refusal of an accepted request is
+    // terminal here. The daemon would acknowledge a session that could never
+    // make its first model call. The check is HERE and not only in the CLI,
+    // because this socket is the boundary every client crosses.
+    let goal = goal.trim().to_string();
+    if goal.is_empty() {
+        return Response::Error {
+            message: "the goal is empty. Say what the session is to do.".to_string(),
+        };
+    }
     let task = SessionTask {
         goal,
         max_turns,

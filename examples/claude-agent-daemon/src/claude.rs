@@ -249,6 +249,14 @@ fn call_api(
     // reads differently turns the printed approve command into something the
     // model chose. The API mints unique, shell-safe ids. A response that does
     // not is malformed, and it is refused before it can reach the gate.
+    // Checked BEFORE the tool calls are handed back, because a block that
+    // cannot be replayed fails the turn after the tools have already run.
+    if !has_replayable_content(&reply) {
+        return Err(body_failure(
+            status,
+            "its response carried a content block that cannot be replayed",
+        ));
+    }
     if !has_addressable_calls(&reply) {
         return Err(body_failure(
             status,
@@ -357,6 +365,28 @@ pub fn is_message(payload: &Value) -> bool {
             .get("stop_reason")
             .and_then(Value::as_str)
             .is_some_and(|reason| !reason.trim().is_empty())
+}
+
+/// Can every block of this reply be replayed to the API?
+///
+/// The assistant blocks are replayed VERBATIM on the next request, which is
+/// what keeps thinking blocks valid. A block the API will not accept back is
+/// therefore a session that fails one turn later. It fails AFTER the tool
+/// calls of this turn have run. A malformed billed response would leave a
+/// real change on the disk, and a failed session behind it.
+///
+/// The test is on the shape alone. Each block must be an object naming its
+/// type. A block type this example does not know about still passes, because
+/// the API knows types this example does not.
+pub fn has_replayable_content(reply: &TurnReply) -> bool {
+    reply.content.as_array().is_some_and(|blocks| {
+        blocks.iter().all(|block| {
+            block
+                .get("type")
+                .and_then(Value::as_str)
+                .is_some_and(|kind| !kind.trim().is_empty())
+        })
+    })
 }
 
 /// Can every tool call in this reply be addressed on its own?
