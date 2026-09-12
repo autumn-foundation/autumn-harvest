@@ -3453,6 +3453,122 @@ fn a_printed_socket_flag_parses_back_to_the_same_socket() {
     );
 }
 
+/// A status offers no approval once the deadline has passed.
+///
+/// The parked state is what the last drive left behind, and it says nothing
+/// about the clock. A deadline can pass between that drive and the next tick,
+/// and `--tick-ms` decides how wide that window is. `approve` refuses a wait
+/// whose deadline has fired, so a status that still printed the approval
+/// advertised a command the daemon rejects.
+///
+/// The runtime is not driven here, so nothing clears the wait. The deadline
+/// passes by the clock alone, which is the case the tick cannot cover.
+#[tokio::test]
+async fn a_status_offers_no_approval_past_the_deadline() {
+    let dir = tempfile::tempdir().expect("a temporary directory");
+    let workspace = dir.path().join("workspace");
+    std::fs::create_dir_all(&workspace).expect("the workspace is created");
+    let db = dir.path().join("agentd.db");
+    let calls = Arc::new(AtomicUsize::new(0));
+    let mut rt = runtime(&db, &workspace, &calls);
+
+    // One second, so the deadline passes while the run stays parked.
+    let brief = json!({
+        "goal": "summarise the workspace",
+        "max_turns": 6,
+        "approval_timeout_secs": 1,
+        "workspace": workspace.to_str().expect("the workspace path is UTF-8"),
+        "model": claude::OFFLINE_MODEL,
+    });
+    let exec = rt
+        .start_workflow(WORKFLOW_NAME, brief)
+        .expect("the session starts");
+    let signal = drive_to_approval(&mut rt, exec).await;
+    let exec_id = exec.to_string();
+    let parked = daemon::ParkedState {
+        reason: "waiting for a tool approval".to_string(),
+        signal: Some(signal),
+    };
+
+    let reader = inspect::open(&db).expect("the reader opens");
+    // While the deadline still has time, the call is shown.
+    let (pending, reason) = daemon::decidable(&reader, &exec_id, Some(&parked), false);
+    assert!(
+        pending.is_some(),
+        "a live wait must still show its pending call"
+    );
+    assert_eq!(
+        reason.as_deref(),
+        Some("waiting for a tool approval"),
+        "the parked reason is shown as it stands"
+    );
+
+    // The wait is never driven again, so only the clock moves.
+    tokio::time::sleep(Duration::from_millis(1200)).await;
+    let (gone, expired) = daemon::decidable(&reader, &exec_id, Some(&parked), false);
+    assert!(
+        gone.is_none(),
+        "a wait past its deadline must offer no approval"
+    );
+    let expired = expired.expect("the status still says why it is parked");
+    assert!(
+        expired.contains("deadline") && expired.contains("denies it"),
+        "the status must say why there is nothing to decide: {expired}"
+    );
+}
+
+/// A log field carries nothing a terminal would act on.
+///
+/// The daemon's log holds text the model wrote (a session's answer) and text
+/// the API wrote (up to 400 characters of an error body). That log goes to a
+/// terminal, and `tracing` does not escape a field.
+///
+/// The newline is escaped here, unlike in `visible`. A log line is ONE line,
+/// and a newline inside a field would split it into a second entry that
+/// nothing wrote.
+#[test]
+fn a_log_field_obeys_nothing() {
+    let forged = "done\u{1b}]52;c;cm0K\u{7}\nINFO forged entry\r\u{202e}";
+    let escaped = crate::one_line(forged);
+    assert!(
+        !escaped.chars().any(crate::is_obeyed),
+        "the field must obey nothing: {escaped}"
+    );
+    assert!(
+        !escaped.contains('\n'),
+        "one field stays on one line: {escaped}"
+    );
+    assert!(
+        escaped.starts_with("done") && escaped.contains("forged entry"),
+        "the text an operator needs is still readable: {escaped}"
+    );
+    // `visible` keeps the newline, which is why the log needs its own sink.
+    assert!(
+        crate::visible(forged).contains('\n'),
+        "a printed message may hold several lines"
+    );
+
+    // Every log field that carries such text goes through it. The guard reads
+    // the source, because a `tracing` call writes to a subscriber this suite
+    // does not install.
+    let source = include_str!("daemon.rs");
+    for field in ["output = %", "error = %", "path = %"] {
+        for line in source.lines().filter(|line| line.contains(field)) {
+            assert!(
+                line.contains("one_line("),
+                "an untrusted log field must be escaped: {line}"
+            );
+        }
+    }
+    // The socket path is the one field logged as it stands. `printable`
+    // refuses a socket path that carries any of this before a command runs,
+    // so there is nothing left for a sink to escape.
+    assert!(
+        source.contains("socket = %options.socket.display()"),
+        "the socket path is logged as itself, because it is validated"
+    );
+}
+
 /// A socket path no printed command can carry is refused.
 ///
 /// Being UTF-8 is not enough. Every printed line leaves through `visible`,

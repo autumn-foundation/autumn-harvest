@@ -168,7 +168,7 @@ pub async fn serve(options: Options) -> Result<(), String> {
     let (trigger, signal) = shutdown::channel();
     tokio::spawn(async move {
         if let Err(e) = tokio::signal::ctrl_c().await {
-            tracing::error!(error = %e, "cannot listen for Ctrl-C");
+            tracing::error!(error = %crate::one_line(&e.to_string()), "cannot listen for Ctrl-C");
         }
         trigger.send_replace(true);
     });
@@ -494,7 +494,7 @@ async fn accept_loop(listener: UnixListener, tx: mpsc::Sender<Job>, owner: u32) 
             }
             Err(e) => {
                 drop(permit);
-                tracing::warn!(error = %e, "cannot accept a control connection");
+                tracing::warn!(error = %crate::one_line(&e.to_string()), "cannot accept a control connection");
                 tokio::time::sleep(ACCEPT_BACKOFF).await;
             }
         }
@@ -522,7 +522,7 @@ pub fn peer_is_owner(stream: &UnixStream, owner: u32) -> bool {
             false
         }
         Err(e) => {
-            tracing::warn!(error = %e, "refused a control connection of unknown origin");
+            tracing::warn!(error = %crate::one_line(&e.to_string()), "refused a control connection of unknown origin");
             false
         }
     }
@@ -589,7 +589,7 @@ async fn serve_connection(stream: UnixStream, tx: mpsc::Sender<Job>) {
 /// reason instead of a closed connection.
 async fn answer(write_half: &mut tokio::net::unix::OwnedWriteHalf, response: &Response) {
     let mut encoded = serde_json::to_string(response).unwrap_or_else(|e| {
-        tracing::error!(error = %e, "cannot encode an answer");
+        tracing::error!(error = %crate::one_line(&e.to_string()), "cannot encode an answer");
         r#"{"status":"error","message":"the daemon cannot encode its answer"}"#.to_string()
     });
     encoded.push('\n');
@@ -602,7 +602,9 @@ async fn answer(write_half: &mut tokio::net::unix::OwnedWriteHalf, response: &Re
     .await;
     match written {
         Ok(Ok(())) => {}
-        Ok(Err(e)) => tracing::debug!(error = %e, "a caller did not take its answer"),
+        Ok(Err(e)) => {
+            tracing::debug!(error = %crate::one_line(&e.to_string()), "a caller did not take its answer");
+        }
         Err(_) => tracing::warn!(
             seconds = RESPONSE_DEADLINE.as_secs(),
             "a caller did not read its answer in time"
@@ -1016,9 +1018,7 @@ fn summary_view(
         .parse::<ExecutionId>()
         .ok()
         .and_then(|exec| blocked.get(&exec));
-    let pending = state
-        .and_then(|state| state.signal.as_deref())
-        .and_then(|signal| pending_call(reader, &row.exec_id, signal, full));
+    let (pending, blocked_on) = decidable(reader, &row.exec_id, state, full);
 
     SessionView {
         execution_id: row.exec_id.clone(),
@@ -1027,11 +1027,54 @@ fn summary_view(
             .clone()
             .unwrap_or_else(|| "<unreadable task>".to_string()),
         state: row.state.clone(),
-        blocked_on: state.map(|state| state.reason.clone()),
+        blocked_on,
         pending,
         answer,
         error: row.error.clone(),
     }
+}
+
+/// The pending call a status shows, and the reason beside it.
+///
+/// A wait whose deadline has ALREADY fired is not decidable. `approve`
+/// refuses it, and the session denies that call on its next drive, so a
+/// status must not print a decision the daemon will reject.
+///
+/// The parked state is what the last drive left behind, and it says nothing
+/// about the clock. The tick clears the wait when it next runs, and
+/// `--tick-ms` decides how long that takes. This reads the deadline itself,
+/// rather than waiting for the tick to catch up.
+///
+/// A deadline read that FAILS is not an expiry. Hiding a call the operator
+/// can still decide is worse than showing one they cannot.
+///
+/// Both views are built from this, so a listing and a single status cannot
+/// disagree about what is decidable.
+pub fn decidable(
+    reader: &Connection,
+    exec_id: &str,
+    state: Option<&ParkedState>,
+    full: bool,
+) -> (Option<PendingCall>, Option<String>) {
+    let Some(state) = state else {
+        return (None, None);
+    };
+    let Some(signal) = state.signal.as_deref() else {
+        return (None, Some(state.reason.clone()));
+    };
+    if let Ok(Some(seconds)) = expired(reader, exec_id, signal) {
+        return (
+            None,
+            Some(format!(
+                "the deadline for this call passed {seconds} seconds ago; the \
+                 session denies it on its next drive"
+            )),
+        );
+    }
+    (
+        pending_call(reader, exec_id, signal, full),
+        Some(state.reason.clone()),
+    )
 }
 
 /// Build one operator view.
@@ -1050,15 +1093,13 @@ fn view(reader: &Connection, row: &ExecutionRow, blocked: &Parked, full: bool) -
         });
     let exec = row.exec_id.parse::<ExecutionId>().ok();
     let state = exec.and_then(|exec| blocked.get(&exec));
-    let pending = state
-        .and_then(|state| state.signal.as_deref())
-        .and_then(|signal| pending_call(reader, &row.exec_id, signal, full));
+    let (pending, blocked_on) = decidable(reader, &row.exec_id, state, full);
 
     SessionView {
         execution_id: row.exec_id.clone(),
         goal,
         state: row.state.clone(),
-        blocked_on: state.map(|state| state.reason.clone()),
+        blocked_on,
         pending,
         answer,
         error: row.error.clone(),
@@ -1244,8 +1285,8 @@ fn flush_workspace_path(workspace: &Path) {
         let flushed = std::fs::File::open(&directory).and_then(|handle| handle.sync_all());
         if let Err(e) = flushed {
             tracing::warn!(
-                path = %directory.display(),
-                error = %e,
+                path = %crate::one_line(&directory.display().to_string()),
+                error = %crate::one_line(&e.to_string()),
                 "cannot flush a directory above the workspace"
             );
         }
@@ -1369,16 +1410,24 @@ async fn drive_one(
         }
         Ok(RunState::Completed(output)) => {
             retire(blocked, live, exec);
-            tracing::info!(%exec, output = %output, "session completed");
+            // The output holds the model's own answer, and this log reaches a
+            // terminal. See [`crate::one_line`].
+            tracing::info!(%exec, output = %crate::one_line(&output.to_string()), "session completed");
         }
         Ok(RunState::Failed(error)) => {
             retire(blocked, live, exec);
-            tracing::error!(%exec, error = %error, "session failed");
+            // The reason carries the API's error body, up to 400 characters
+            // of it, which is text this daemon did not write.
+            tracing::error!(%exec, error = %crate::one_line(&error), "session failed");
         }
         Ok(RunState::InProgress) => {
             blocked.remove(&exec);
         }
-        Err(e) => tracing::error!(%exec, error = %e, "cannot drive the session"),
+        // A drive failure carries the activity's own message, which holds
+        // the same untrusted text one step further in.
+        Err(e) => {
+            tracing::error!(%exec, error = %crate::one_line(&e.to_string()), "cannot drive the session");
+        }
     }
 }
 

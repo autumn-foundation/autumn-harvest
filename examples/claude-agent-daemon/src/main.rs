@@ -232,7 +232,7 @@ fn usable_key(raw: &str) -> Option<String> {
 /// not text, one step further on.
 ///
 /// A newline is refused here as well, and `visible` keeps that character.
-/// See [`breaks_a_command`].
+/// See [`breaks_one_line`].
 ///
 /// # Errors
 ///
@@ -246,7 +246,7 @@ fn printable(socket: &Path) -> Result<(), String> {
             socket.display()
         ));
     };
-    if let Some(refused) = text.chars().find(|c| breaks_a_command(*c)) {
+    if let Some(refused) = text.chars().find(|c| breaks_one_line(*c)) {
         return Err(format!(
             "the socket path {} holds {}, which no command this daemon prints \
              can carry. Every one of them names the socket on ONE line, and \
@@ -397,31 +397,54 @@ fn line(text: &str) {
 /// The characters are shown, not removed. An operator can then see what
 /// arrived, rather than a tidied version of it.
 fn visible(text: &str) -> std::borrow::Cow<'_, str> {
-    if !text.chars().any(is_obeyed) {
-        return std::borrow::Cow::Borrowed(text);
-    }
-    let mut shown = String::with_capacity(text.len());
-    for character in text.chars() {
-        if is_obeyed(character) {
-            let _ = write!(shown, "\\u{{{:04x}}}", character as u32);
-        } else {
-            shown.push(character);
-        }
-    }
-    std::borrow::Cow::Owned(shown)
+    shown(text, is_obeyed)
 }
 
-/// Would this character break a command that names the socket?
+/// One LOG field, with everything a terminal would act on shown instead.
+///
+/// The daemon logs values the model wrote: a session's answer, and the reason
+/// a run failed, which carries the API's own error body. Its log goes to a
+/// terminal, so it needs what the CLI's output already gets.
+///
+/// The newline is escaped here, and [`visible`] keeps it. A log line is ONE
+/// line. A newline inside a field splits it, and the half that follows reads
+/// as another log entry that nothing wrote.
+fn one_line(text: &str) -> std::borrow::Cow<'_, str> {
+    shown(text, breaks_one_line)
+}
+
+/// Escape every character the given test names, and keep the rest.
+///
+/// The characters are shown, not removed. A reader can then see what arrived,
+/// rather than a tidied version of it.
+fn shown(text: &str, refused: fn(char) -> bool) -> std::borrow::Cow<'_, str> {
+    if !text.chars().any(refused) {
+        return std::borrow::Cow::Borrowed(text);
+    }
+    let mut safe = String::with_capacity(text.len());
+    for character in text.chars() {
+        if refused(character) {
+            let _ = write!(safe, "\\u{{{:04x}}}", character as u32);
+        } else {
+            safe.push(character);
+        }
+    }
+    std::borrow::Cow::Owned(safe)
+}
+
+/// Would this character break the ONE line it is written into?
 ///
 /// [`is_obeyed`] covers what a terminal ACTS on, and it exempts the newline.
 /// A printed message carries newlines legitimately, and escaping those would
 /// break the messages that put a follow-up command on its own line.
 ///
-/// A socket path is different. Every printed command names it inside ONE
-/// line, so a newline in the path splits that line. The first half ends
-/// inside an unterminated quote, and what an operator copies reaches another
-/// socket, or none.
-fn breaks_a_command(character: char) -> bool {
+/// A socket path and a log field are different. Every printed command names
+/// the socket inside ONE line, so a newline in the path splits that line. The
+/// first half ends inside an unterminated quote, and what an operator copies
+/// reaches another socket, or none.
+///
+/// A log field has the same shape of fault. See [`one_line`].
+fn breaks_one_line(character: char) -> bool {
     is_obeyed(character) || character == '\n'
 }
 
