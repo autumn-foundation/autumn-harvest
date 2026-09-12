@@ -612,8 +612,8 @@ pub(crate) struct PendingSupersede<'a> {
 /// admission's supersede pass, which has not run yet. It WILL shed some
 /// incumbents, and their history bytes, on the same key before the
 /// transaction commits. This function dry-runs that shed count itself (see
-/// below) and subtracts it from `active_executions` and `history_bytes`,
-/// beyond the caller's own row. Every caller except the fresh-insert path in
+/// below) and excludes those incumbents from usage, beyond the caller's own
+/// row. Every caller except the fresh-insert path in
 /// `start_or_load_workflow_execution_collect` and `replace_execution`
 /// passes `None` (no effect).
 ///
@@ -623,6 +623,17 @@ pub(crate) struct PendingSupersede<'a> {
 /// credited capacity between the scan and this function's check. Taking the
 /// lock first serializes every admission for this key through this
 /// function. No such race survives.
+///
+/// `self_exec_id` (issue #1228 review) is always excluded from usage too,
+/// via the SAME query as the credited incumbents -- see
+/// [`crate::quota::load_quota_usage_excluding`]. It is not necessarily the
+/// row `pending_supersede.self_exec_id` names. That field describes the
+/// supersede pass specifically. `self_exec_id` here is whichever row THIS
+/// admission's own quota check is being run for. They agree on the
+/// fresh-insert and `replace_execution` paths, the only two that ever pass
+/// `Some(pending_supersede)`. `self_exec_id` alone still matters on
+/// [`run_latest_wins_supersede`]'s post-supersede recheck, which always
+/// passes `None` for `pending_supersede`.
 ///
 /// Returns the exact execution ids this admission credited (issue #1228
 /// review, P2) -- empty when `pending_supersede` was `None` or credited
@@ -636,6 +647,7 @@ pub(crate) async fn enforce_quota_admission(
     workflow_name: &str,
     metrics: Option<&(dyn crate::telemetry::MetricsRecorder + Send + Sync)>,
     pending_supersede: Option<PendingSupersede<'_>>,
+    self_exec_id: ExecutionId,
 ) -> HarvestResult<Vec<uuid::Uuid>> {
     let Some(policy) = quota_policy else {
         return Ok(Vec::new());
@@ -654,7 +666,7 @@ pub(crate) async fn enforce_quota_admission(
     // closes for issue #247, under a namespace-disjoint key so the two
     // primitives' advisory locks can never collide.
     crate::quota::lock_quota_key(conn, workflow_name, key).await?;
-    let pending_supersede_credit = if let Some(info) = pending_supersede {
+    let credited_ids = if let Some(info) = pending_supersede {
         crate::concurrency::dry_run_supersede_credit(
             conn,
             workflow_name,
@@ -664,28 +676,21 @@ pub(crate) async fn enforce_quota_admission(
             key,
         )
         .await?
+        .credited_ids
     } else {
-        crate::concurrency::SupersedeCredit::default()
+        Vec::new()
     };
-    let mut usage = crate::quota::load_quota_usage(conn, workflow_name, key).await?;
-    // The row this admission just inserted is already RUNNING and therefore
-    // already counted in `usage.active_executions` -- subtract it back out
-    // so `current` reports usage BEFORE this admission, matching
-    // `check_quota`'s documented contract (and the success metric's
-    // "capped at exactly 100": the 100th admission must observe
-    // current=99, not 100). `history_bytes`/`dead_letters` need no such
-    // adjustment: the just-inserted row has appended no events yet
-    // (`WorkflowStarted` is appended by the caller, AFTER this check) and
-    // has no dead-letter rows of its own. `pending_supersede_credit` also
-    // subtracts out incumbents a `cancel_running` pass will shed before
-    // commit, and their history bytes -- see this function's own doc
-    // comment.
-    usage.active_executions = usage.active_executions.saturating_sub(1).saturating_sub(
-        i64::try_from(pending_supersede_credit.active_executions).unwrap_or(i64::MAX),
-    );
-    usage.history_bytes = usage
-        .history_bytes
-        .saturating_sub(pending_supersede_credit.history_bytes);
+    // `self_exec_id` is excluded unconditionally. It is already `RUNNING`,
+    // and would otherwise double-count itself against the very cap it is
+    // being checked against (issue #946's original "-1" adjustment). That
+    // adjustment is now folded into the same query as the credited
+    // exclusions below, instead of a later, separately-computed
+    // subtraction. See `load_quota_usage_excluding`'s own doc comment for
+    // why that removes a staleness window rather than merely narrowing it.
+    let mut excluded_ids = credited_ids.clone();
+    excluded_ids.push(self_exec_id.as_uuid());
+    let usage =
+        crate::quota::load_quota_usage_excluding(conn, workflow_name, key, &excluded_ids).await?;
     if let Some(violation) = crate::quota::check_quota(&usage, &policy) {
         record_quota_rejected_metric(metrics, workflow_name, violation.resource);
         return Err(HarvestError::QuotaExceeded {
@@ -696,7 +701,7 @@ pub(crate) async fn enforce_quota_admission(
             current: violation.current,
         });
     }
-    Ok(pending_supersede_credit.credited_ids)
+    Ok(credited_ids)
 }
 
 /// Start a workflow execution or load the existing one, returning both the result
@@ -1405,6 +1410,7 @@ pub(crate) async fn start_or_load_workflow_execution_collect_with_codecs_and_quo
                 request.workflow_name,
                 metrics,
                 pending_supersede,
+                exec_id,
             )
             .await?;
             // Resolve last-completion-result carryover (issue #488).
@@ -2731,6 +2737,7 @@ mod resolve_by_workflow_id_tests {
 /// this recheck finds enough OTHER capacity freed to let the admission
 /// stand.
 #[cfg(feature = "db")]
+#[allow(clippy::too_many_arguments)]
 async fn run_latest_wins_supersede(
     conn: &mut AsyncPgConnection,
     request: &StartWorkflowParams<'_>,
@@ -2787,6 +2794,7 @@ async fn run_latest_wins_supersede(
             request.workflow_name,
             metrics,
             None,
+            exec_id,
         )
         .await?;
     }
@@ -2899,6 +2907,7 @@ async fn replace_execution(
         request.workflow_name,
         metrics,
         pending_supersede,
+        new_exec_id,
     )
     .await?;
     let start_timestamp = if request.delay.is_some_and(|d| d > chrono::Duration::zero())

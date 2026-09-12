@@ -10419,6 +10419,7 @@ async fn persist_all_started_child_workflows(
                 &child.workflow_name,
                 Some(registry.telemetry().metrics.as_ref()),
                 None, // no dry-run credit on a child spawn (children never declare cancel_running)
+                child.child_id,
             )
             .await?;
             store::append_events_offloaded_with_codecs(
@@ -10959,6 +10960,7 @@ async fn insert_awaited_child_execution(
         &child.workflow_name,
         Some(registry.telemetry().metrics.as_ref()),
         None, // no dry-run credit on a child spawn (children never declare cancel_running)
+        child.child_id,
     )
     .await?;
     store::append_events_offloaded_with_codecs(
@@ -13234,6 +13236,7 @@ async fn create_detached_child_executions(
             workflow_name.as_str(),
             Some(registry.telemetry().metrics.as_ref()),
             None, // no dry-run credit on a detached child spawn (children never declare cancel_running)
+            *child_id,
         )
         .await?;
 

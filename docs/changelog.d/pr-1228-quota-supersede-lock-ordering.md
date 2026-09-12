@@ -462,3 +462,54 @@ state change between the dry run and the real pass, which (unlike the
 row-lock tests earlier in this file) has no deterministic hook once the
 scan is unlocked; the existing suites confirm the ordinary,
 no-gap path stays byte-for-byte unchanged.
+
+## Follow-up 8 — PR #1484 review: two-read subtraction was itself the staleness source
+
+An eighth automated review round found two findings on the same
+mechanism, both traced to one root cause: `enforce_quota_admission`
+computed usage with one query, then adjusted it with numbers computed
+by a SEPARATE, earlier query (or a caller-supplied constant). Two reads
+of the same underlying rows, taken moments apart inside one open
+transaction, can each see a different snapshot.
+
+**P1 -- the usage read and the credit dry-run read could disagree.**
+`load_quota_usage` ran after `dry_run_supersede_credit` computed its
+credited ids, but neither shared a snapshot, so a row that changed
+between the two reads (an incumbent completing on its own) made the
+subsequent `active_executions`/`history_bytes` subtraction stale in
+either direction.
+
+**P2 -- `self_exec_id`'s own "-1" adjustment double-counted alongside
+the credited exclusions.** The two adjustments were computed by
+different code paths and merely summed, with no shared query to keep
+them consistent as the credited-ids list grew.
+
+Fixed both by construction rather than by adding a third adjustment:
+added `quota::load_quota_usage_excluding`, a sibling to
+`load_quota_usage` whose `active` CTE also excludes an explicit array
+of execution ids, in the SAME query that computes `active_executions`
+and `history_bytes`. `enforce_quota_admission` now takes an explicit
+`self_exec_id: ExecutionId` parameter, builds one `excluded_ids` vector
+(the dry-run's `credited_ids` plus `self_exec_id`), and passes it to
+`load_quota_usage_excluding` in place of the old read-then-subtract
+pair. `SupersedeCredit` drops its `active_executions`/`history_bytes`
+fields entirely -- `credited_ids` is now the only output the caller
+needs, since counting happens in the one query instead of being
+assembled from two. `load_quota_usage` itself is untouched, so every
+OTHER caller (the admin read-model included) keeps the exact query
+shape `docs/performance-quota-history-bytes.md` measured.
+
+All seven call sites of `enforce_quota_admission` (the fresh-insert
+path, `replace_execution`, `run_latest_wins_supersede`'s recheck, both
+awaited- and detached-child spawn paths in `worker.rs`, and the
+cross-shard child spawn path) now pass the execution id of the row
+each call is itself admitting.
+
+Re-ran all four suites above (`quota_supersede_ordering_tests.rs` 6/6,
+the updated `dry_run_credit_counts_a_row_locked_for_unrelated_reasons`
+assertion included, `quota_lock_ordering_tests.rs` 2/2,
+`concurrency_supersede_tests.rs` 20/20, `quota_enforcement_tests.rs`
+37/39, the same known `quota_blocked_outbox_*` flake family) against
+the corrected design. Confirmed the two flakes pre-exist against the
+merge base, before this follow-up's changes, by re-running them in
+isolation there.

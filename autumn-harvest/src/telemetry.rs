@@ -3587,9 +3587,11 @@ pub fn emit_concurrency_residual_over_limit<M: MetricsRecorder + ?Sized>(
     metrics.record_concurrency_residual_over_limit(workflow_name, gap);
 }
 
-/// Emit [`METRIC_QUOTA_SUPERSEDE_CREDIT_NOT_SHED`] for a `cancel_running`
-/// admission whose quota credit assumed `gap` runs would be shed. Its real
-/// supersede pass skipped them instead (issue #1228 review, P2).
+/// Emit [`METRIC_QUOTA_SUPERSEDE_CREDIT_NOT_SHED`] for a skipped credited run.
+///
+/// A `cancel_running` admission's quota credit assumed `gap` runs would be
+/// shed. Its real supersede pass skipped them instead (issue #1228 review,
+/// P2).
 ///
 /// Called INLINE from [`crate::execution::run_latest_wins_supersede`],
 /// right after the real supersede pass returns. Same convention as

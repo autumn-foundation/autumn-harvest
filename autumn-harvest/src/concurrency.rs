@@ -479,14 +479,21 @@ tokio::task_local! {
 
 /// Slots [`dry_run_supersede_credit`] finds a pending `cancel_running` pass
 /// will free, scoped to ONE `quota_key`.
+///
+/// Issue #1228 review: this used to also carry `active_executions` and
+/// `history_bytes` aggregates, subtracted from a separately-read
+/// [`crate::quota::QuotaUsage`] by the caller. Two separate reads meant two
+/// separate snapshots. A row could change between them -- an incumbent
+/// completing on its own, or the checked admission's own row picking up a
+/// `WorkflowStarted` event. Either change made the subtraction stale.
+/// [`crate::quota::load_quota_usage_excluding`] now excludes `credited_ids`
+/// directly inside the SAME query that reads usage, so there is no earlier
+/// read left to go stale relative to. `credited_ids` alone is what a caller
+/// needs to build that exclusion list.
 #[cfg(feature = "db")]
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct SupersedeCredit {
-    /// How many of the shed runs share the checked `quota_key`.
-    pub active_executions: u64,
-    /// Their combined `harvest_events` payload bytes.
-    pub history_bytes: i64,
-    /// The exact executions this credit counted on (issue #1228 review).
+    /// The exact executions this credit counted on.
     ///
     /// The real supersede pass can leave one of these running instead of
     /// cancelling it. A skipped cancellation on a `Config` or
@@ -495,10 +502,8 @@ pub struct SupersedeCredit {
     /// can happen between this dry run's deliberately unlocked scan and
     /// the real pass's own, later, independent re-scan. See
     /// [`dry_run_supersede_credit`]'s own doc comment for why that scan
-    /// takes no lock. Either way, `active_executions` and `history_bytes`
-    /// already assumed the candidate was shed. Every caller reconciles
-    /// this list against the real pass's [`SupersedeOutcome::superseded`]
-    /// and reports the gap. See
+    /// takes no lock. Every caller reconciles this list against the real
+    /// pass's [`SupersedeOutcome::superseded`] and reports the gap. See
     /// [`crate::execution::run_latest_wins_supersede`].
     pub credited_ids: Vec<uuid::Uuid>,
 }
@@ -570,8 +575,7 @@ pub struct SupersedeCredit {
 ///
 /// # Errors
 ///
-/// Propagates database failures from the candidate scan or the history-bytes
-/// lookup.
+/// Propagates database failures from the candidate scan.
 #[cfg(feature = "db")]
 pub async fn dry_run_supersede_credit(
     conn: &mut diesel_async::AsyncPgConnection,
@@ -589,12 +593,6 @@ pub async fn dry_run_supersede_credit(
         id: uuid::Uuid,
         #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Text>)]
         quota_key: Option<String>,
-    }
-
-    #[derive(diesel::QueryableByName)]
-    struct HistoryRow {
-        #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::BigInt>)]
-        history_bytes: Option<i64>,
     }
 
     let inherited: Vec<crate::types::ExecutionId> =
@@ -647,27 +645,8 @@ pub async fn dry_run_supersede_credit(
         .filter(|r| r.quota_key.as_deref() == Some(quota_key))
         .map(|r| r.id)
         .collect();
-    let active_executions = u64::try_from(shed_matching_ids.len()).unwrap_or(u64::MAX);
-    if shed_matching_ids.is_empty() {
-        return Ok(SupersedeCredit {
-            active_executions,
-            history_bytes: 0,
-            credited_ids: shed_matching_ids,
-        });
-    }
-
-    let history_row: HistoryRow = diesel::sql_query(
-        "SELECT SUM(pg_column_size(event_data))::BIGINT AS history_bytes \
-         FROM harvest_events WHERE workflow_exec_id = ANY($1)",
-    )
-    .bind::<diesel::sql_types::Array<diesel::sql_types::Uuid>, _>(shed_matching_ids.clone())
-    .get_result(conn)
-    .await
-    .map_err(crate::error::database_error)?;
 
     Ok(SupersedeCredit {
-        active_executions,
-        history_bytes: history_row.history_bytes.unwrap_or(0),
         credited_ids: shed_matching_ids,
     })
 }

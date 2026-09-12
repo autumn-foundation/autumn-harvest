@@ -668,7 +668,8 @@ async fn dry_run_credit_counts_a_row_locked_for_unrelated_reasons() {
     .expect("dry run must scan the shared-key population");
 
     assert_eq!(
-        credit.active_executions, 1,
+        credit.credited_ids.len(),
+        1,
         "the locked incumbent (x, the older run) must still be credited, \
          not silently omitted because another connection holds its row lock"
     );
