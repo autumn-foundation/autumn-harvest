@@ -206,6 +206,18 @@ pub async fn serve(options: Options) -> Result<(), String> {
     if !resumed.is_empty() {
         tracing::info!(count = resumed.len(), "resuming the sessions left running");
     }
+    // The parked state is rebuilt BEFORE the socket accepts anything. It was
+    // otherwise empty until the first drive, and a decision that arrived in
+    // that window was refused as a session that is not waiting. The restart
+    // recipe describes exactly that sequence.
+    let mut blocked: Parked = Parked::new();
+    for exec in &resumed {
+        match inspect::outstanding_signal(&reader, &exec.to_string()) {
+            Ok(Some(name)) => note(&mut blocked, *exec, waiting_reason(&name), Some(name)),
+            Ok(None) => {}
+            Err(message) => return Err(message),
+        }
+    }
     let listener = bind(&options.socket).await?;
     let (tx, mut rx) = mpsc::channel::<Job>(COMMAND_BACKLOG);
     // The socket's mode is not a control surface on its own. See
@@ -227,7 +239,6 @@ pub async fn serve(options: Options) -> Result<(), String> {
         );
     }
 
-    let mut blocked: Parked = Parked::new();
     // The startup check already read the RUNNING rows, so the live set is what
     // it validated. One query, not two.
     let mut live: Live = resumed;
@@ -1219,6 +1230,19 @@ fn retire(blocked: &mut Parked, live: &mut Live, exec: ExecutionId) {
     live.retain(|id| *id != exec);
 }
 
+/// What a session waiting on this signal is waiting FOR.
+///
+/// Written once, because two places record it. The drive learns the wait from
+/// the engine, and the startup reads the wait out of the database. A second
+/// spelling would let the two disagree about the same session.
+fn waiting_reason(name: &str) -> String {
+    if session::approval_call_id(name).is_some() {
+        "waiting for a tool approval".to_string()
+    } else {
+        format!("waiting for the `{name}` signal")
+    }
+}
+
 /// Drive one session to its next stopping point.
 ///
 /// A session leaves the live set only on a state that cannot be driven again.
@@ -1233,12 +1257,7 @@ async fn drive_one(
 ) {
     match runtime.run_until_blocked(exec).await {
         Ok(RunState::WaitingSignal(name)) => {
-            let reason = if session::approval_call_id(&name).is_some() {
-                "waiting for a tool approval".to_string()
-            } else {
-                format!("waiting for the `{name}` signal")
-            };
-            note(blocked, exec, reason, Some(name));
+            note(blocked, exec, waiting_reason(&name), Some(name));
         }
         Ok(RunState::WaitingTimer) => {
             note(

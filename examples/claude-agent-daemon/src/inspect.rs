@@ -402,6 +402,71 @@ pub fn signal_deadline(
     Ok(None)
 }
 
+/// The signal one RUNNING session is still waiting for, if it waits.
+///
+/// A restarted daemon knows which sessions are RUNNING, and not what each one
+/// awaits. That is learned from a drive, so the parked state is empty until
+/// the first drive runs. An operator who approves a call in that window is
+/// told the session is not waiting, on the very path the restart recipe
+/// describes.
+///
+/// The wait is durable, so it can be read instead. A signal wait with a
+/// deadline records a `__signal_timeout:` timer, which names the signal.
+///
+/// The delivery is checked as well. A previous daemon may have delivered the
+/// signal and stopped before the drive that consumed it. The timer can
+/// outlive that, so a timer ALONE would report a wait that is already over.
+/// This is an approval gate, and a decision must not be accepted twice.
+///
+/// # Errors
+///
+/// Returns an error if either query fails.
+pub fn outstanding_signal(conn: &Connection, exec_id: &str) -> Result<Option<String>, String> {
+    let mut timers = conn
+        .prepare("SELECT timer_id FROM harvest_timers WHERE exec_id = ?1")
+        .map_err(|e| format!("cannot prepare the wait query: {e}"))?;
+    let named = timers
+        .query_map([exec_id], |row| row.get::<_, String>(0))
+        .map_err(|e| format!("cannot read the waits: {e}"))?;
+
+    for timer in named {
+        let timer = timer.map_err(|e| format!("cannot read a wait: {e}"))?;
+        let Some(name) = signal_of(&timer) else {
+            continue;
+        };
+        if received(conn, exec_id, &name)? {
+            continue;
+        }
+        return Ok(Some(name));
+    }
+    Ok(None)
+}
+
+/// The signal a deadline timer belongs to, if it is one.
+fn signal_of(timer_id: &str) -> Option<String> {
+    timer_id
+        .strip_prefix("__signal_timeout:")
+        .and_then(|rest| rest.split_once(':'))
+        .map(|(_seq, name)| name.to_string())
+}
+
+/// Did this signal already arrive?
+fn received(conn: &Connection, exec_id: &str, signal: &str) -> Result<bool, String> {
+    let mut statement = conn
+        .prepare(
+            "SELECT 1 FROM harvest_events WHERE exec_id = ?1 \
+             AND json_extract(event_json, '$.type') = 'SignalReceived' \
+             AND json_extract(event_json, '$.data.signal_name') = ?2 LIMIT 1",
+        )
+        .map_err(|e| format!("cannot prepare the delivery query: {e}"))?;
+    let mut rows = statement
+        .query([exec_id, signal])
+        .map_err(|e| format!("cannot read the deliveries: {e}"))?;
+    rows.next()
+        .map(|row| row.is_some())
+        .map_err(|e| format!("cannot read a delivery: {e}"))
+}
+
 /// Is this timer the deadline of that signal's wait?
 fn races_signal(timer_id: &str, signal: &str) -> bool {
     timer_id

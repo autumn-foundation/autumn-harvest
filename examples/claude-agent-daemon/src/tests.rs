@@ -2607,6 +2607,106 @@ fn the_decide_line_reaches_the_daemon_that_printed_it() {
     );
 }
 
+/// A restarted daemon knows what a parked session awaits before it serves.
+///
+/// The parked state was empty until the first drive, while the socket already
+/// accepted requests and readiness was announced. A decision that arrived in
+/// that window was refused as a session that is not waiting. That is the
+/// sequence the restart recipe describes.
+///
+/// The wait is durable, so it is read rather than driven. This drives the
+/// reconstruction itself. The window it closes is a race, so an end-to-end
+/// test of it would pass either way on a lucky schedule.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_parked_wait_is_read_from_the_database() {
+    let dir = tempfile::tempdir().expect("a temporary directory");
+    let db = dir.path().join("agentd.db");
+    let socket = dir.path().join("agentd.sock");
+    let served = tokio::spawn(daemon::serve(daemon::Options {
+        db: db.clone(),
+        socket: socket.clone(),
+        workspace: dir.path().join("workspace"),
+        model: claude::DEFAULT_MODEL.to_string(),
+        max_tokens: claude::DEFAULT_MAX_TOKENS,
+        tick: Duration::from_millis(50),
+        api_key: None,
+    }));
+    await_daemon(&socket).await;
+    let submitted = protocol::call(
+        &socket,
+        &Request::Submit {
+            goal: "summarise the workspace".to_string(),
+            max_turns: 6,
+            approval_timeout_secs: 300,
+        },
+    )
+    .await
+    .expect("the submit is answered");
+    let Response::Submitted { execution_id } = submitted else {
+        panic!("unexpected answer: {submitted:?}");
+    };
+    await_parked(&socket, &execution_id).await;
+
+    // The token the operator would approve, read while the daemon still holds
+    // its own parked state.
+    let view = protocol::call(
+        &socket,
+        &Request::Status {
+            execution_id: execution_id.clone(),
+            full: false,
+        },
+    )
+    .await
+    .expect("the status is answered");
+    let Response::Session { session } = view else {
+        panic!("unexpected answer: {view:?}");
+    };
+    let token = session.pending.expect("the call is pending").token;
+
+    served.abort();
+    drop(served.await);
+
+    // A fresh reader, as a restarted daemon opens. The wait must be readable
+    // with no drive at all, and it must be the SAME token.
+    let reader = inspect::open(&db).expect("the database opens");
+    let waited = inspect::outstanding_signal(&reader, &execution_id)
+        .expect("the wait query runs")
+        .expect("a parked session must report its wait");
+    assert_eq!(
+        waited, token,
+        "the wait read from the database must be the one the operator approves"
+    );
+
+    // A signal the previous daemon delivered before it stopped ends the wait.
+    // The timer can outlive that, so a timer alone would report a wait that is
+    // over, and this is an approval gate.
+    let writer = rusqlite::Connection::open(&db).expect("the database opens");
+    let next: i64 = writer
+        .query_row(
+            "SELECT COALESCE(MAX(seq), -1) + 1 FROM harvest_events WHERE exec_id = ?1",
+            [&execution_id],
+            |row| row.get(0),
+        )
+        .expect("the log is read");
+    let delivered = json!({
+        "type": "SignalReceived",
+        "data": { "signal_name": waited, "payload": { "approved": true } },
+    });
+    writer
+        .execute(
+            "INSERT INTO harvest_events (exec_id, seq, event_json) VALUES (?1, ?2, ?3)",
+            rusqlite::params![&execution_id, next, delivered.to_string()],
+        )
+        .expect("the delivery is appended");
+    drop(writer);
+
+    let after = inspect::outstanding_signal(&reader, &execution_id).expect("the wait query runs");
+    assert!(
+        after.is_none(),
+        "a delivered signal ends the wait, and got {after:?}"
+    );
+}
+
 /// A capped listing stays reachable through its cursor.
 ///
 /// The listing is capped so an old database cannot be read whole into memory.
@@ -3013,6 +3113,38 @@ fn a_socket_path_that_cannot_be_printed_is_refused() {
     assert!(
         message.contains("not UTF-8"),
         "the refusal must name the reason: {message}"
+    );
+}
+
+/// The parked state is built before the socket accepts anything.
+///
+/// This is an ORDERING, and the window it closes is a race. No end-to-end
+/// test fails reliably without it, because a lucky schedule lets the first
+/// drive win and the answer comes out right anyway. The reconstruction query
+/// has its own test. This pins the daemon using it, and using it first.
+///
+/// Reverting the startup rebuild left the query's own test passing, which is
+/// why this guard exists rather than a comment promising the order.
+#[test]
+fn the_parked_state_is_rebuilt_before_the_socket_is_bound() {
+    let daemon = include_str!("daemon.rs");
+    let built = daemon
+        .find("Parked::new()")
+        .expect("the daemon builds its parked state");
+    let bound = daemon
+        .find("bind(&options.socket)")
+        .expect("the daemon binds its socket");
+    assert!(
+        built < bound,
+        "the parked state must be built before the socket accepts anything"
+    );
+    // Built early and left empty would pass the order and fix nothing.
+    let read = daemon
+        .find("outstanding_signal")
+        .expect("the daemon reads each durable wait");
+    assert!(
+        read < bound,
+        "each durable wait must be read before the socket accepts anything"
     );
 }
 
