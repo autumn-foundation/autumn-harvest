@@ -10,7 +10,7 @@ use std::time::Duration;
 
 use rusqlite::{Connection, OpenFlags};
 
-use crate::session::SessionTask;
+use crate::session::{self, SessionTask};
 
 /// How many events one `history` command prints.
 ///
@@ -328,7 +328,8 @@ pub const REPLIES_QUERY: &str = "SELECT seq, \
             CASE WHEN json_valid(event_json) \
                   AND json_type(event_json, '$.data.output.tool_calls') = 'array' \
                  THEN cast(json_extract(event_json, '$.data.output.tool_calls') \
-                           as blob) END \
+                           as blob) END, \
+            json_type(event_json, '$.data.output.tool_calls') \
      FROM harvest_events \
      WHERE exec_id = ?1 AND seq < ?2 \
      AND json_valid(event_json) \
@@ -428,31 +429,77 @@ pub fn reply_calls(
     exec_id: &str,
     before: Option<i64>,
     limit: u32,
-) -> Result<Vec<(i64, serde_json::Value)>, String> {
+) -> Result<Vec<(i64, ReplyCalls)>, String> {
     let mut statement = conn
         .prepare(REPLIES_QUERY)
         .map_err(|e| format!("cannot prepare the reply query: {e}"))?;
     let rows = statement
         .query_map(
             rusqlite::params![exec_id, no_cursor(before), limit],
-            |row| Ok((row.get::<_, i64>(0)?, row.get::<_, Option<Vec<u8>>>(1)?)),
+            |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, Option<Vec<u8>>>(1)?,
+                    row.get::<_, Option<String>>(2)?,
+                ))
+            },
         )
         .map_err(|e| format!("cannot read the replies: {e}"))?;
 
     rows.map(|row| {
         row.map_err(|e| format!("cannot read the replies: {e}"))
-            .map(|(seq, calls)| {
-                // An array is read WHOLE, never cut: a cut one is not JSON.
-                // A reply this reader cannot decode carries no calls, and the
-                // page still names it, so the search walks past it.
-                let value = calls
-                    .and_then(|bytes| String::from_utf8(bytes).ok())
-                    .and_then(|json| serde_json::from_str(&json).ok())
-                    .unwrap_or(serde_json::Value::Null);
-                (seq, value)
-            })
+            .map(|(seq, calls, kind)| (seq, ReplyCalls::read(calls, kind.as_deref())))
     })
     .collect()
+}
+
+/// What one model reply says about the tool calls it asked for.
+///
+/// The three answers are kept APART. A reply that asked for nothing and a
+/// reply holding calls nobody can read are different facts. A caller that
+/// treats them alike walks past the second as though it were the first. See
+/// [`ReplyCalls::Unreadable`].
+#[derive(Debug)]
+pub enum ReplyCalls {
+    /// The reply asked for no tool call. An `end_turn` reply looks like this,
+    /// and so does any reply with no `tool_calls` field.
+    NoCalls,
+    /// The calls the reply asked for, in the order it asked for them.
+    Calls(Vec<session::ToolCall>),
+    /// The reply holds calls this daemon cannot read.
+    ///
+    /// A caller searching for ONE call cannot walk past this, because the
+    /// call it wants may be here. A tool-use id is unique within one reply.
+    /// Nothing makes it unique across a run, so an older reply can hold the
+    /// same id for a DIFFERENT tool. Walking on would show that one.
+    Unreadable,
+}
+
+impl ReplyCalls {
+    /// Read one reply's calls from the projection.
+    ///
+    /// `kind` is the JSON type of the `tool_calls` field, which says whether
+    /// the field is there at all. `bytes` carries the array when it is one.
+    ///
+    /// An array is read WHOLE, and never cut: a cut array is not JSON.
+    fn read(bytes: Option<Vec<u8>>, kind: Option<&str>) -> Self {
+        // No field at all. The reply asked for nothing.
+        if kind.is_none() {
+            return Self::NoCalls;
+        }
+        // A field that is not an array, or bytes that are not text, or an
+        // array this daemon cannot read as calls. Each is the same answer.
+        let Some(calls) = bytes
+            .and_then(|bytes| String::from_utf8(bytes).ok())
+            .and_then(|json| serde_json::from_str::<Vec<session::ToolCall>>(&json).ok())
+        else {
+            return Self::Unreadable;
+        };
+        if calls.is_empty() {
+            return Self::NoCalls;
+        }
+        Self::Calls(calls)
+    }
 }
 
 /// One session, by id.

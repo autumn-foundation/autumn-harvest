@@ -1243,8 +1243,23 @@ pub fn pending_call(
         for (_, calls) in page {
             // The query returns the calls of one model reply, and nothing
             // else of it. The transcript stays in the database.
-            let Ok(calls) = serde_json::from_value::<Vec<session::ToolCall>>(calls) else {
-                continue;
+            //
+            // A reply this daemon CANNOT READ ends the search. The awaited
+            // call may be in it, and a tool-use id is unique only within one
+            // reply. An older reply can hold the same id for a different
+            // tool, so walking on could offer THAT call beside this token.
+            // The operator would approve what they read and release the call
+            // they never saw.
+            let calls = match calls {
+                inspect::ReplyCalls::Calls(calls) => calls,
+                inspect::ReplyCalls::NoCalls => continue,
+                inspect::ReplyCalls::Unreadable => {
+                    return Err(
+                        "a model reply between this one and its call cannot be read, so \
+                         the call it waits on cannot be shown"
+                            .to_string(),
+                    );
+                }
             };
             if let Some(call) = calls.into_iter().find(|call| call.id == call_id) {
                 let mut input = call.input.to_string();

@@ -1350,16 +1350,18 @@ async fn a_status_finds_a_call_behind_more_events_than_one_page() {
     // of the whole reply would carry the transcript with it.
     let replies = inspect::reply_calls(&reader, &exec_id, None, 1).expect("the calls read");
     let (_, calls) = replies.first().expect("a reply is recorded");
-    assert!(calls.is_array(), "the query must return the calls: {calls}");
+    let inspect::ReplyCalls::Calls(calls) = calls else {
+        panic!("the query must return the calls it read: {calls:?}");
+    };
     assert!(
-        calls.get(0).is_some_and(|call| call.get("id").is_some()),
-        "the calls must carry their ids: {calls}"
+        calls.first().is_some_and(|call| !call.id.is_empty()),
+        "the calls must carry their ids: {calls:?}"
     );
     // The discriminating assertion. The whole reply is an OBJECT carrying a
-    // stop reason and the replayed content blocks. The calls are an array
-    // carrying neither. A tool input may hold a `content` field of its own,
+    // stop reason and the replayed content blocks. What the read returns is
+    // the calls alone. A tool input may hold a `content` field of its own,
     // so the stop reason is the field that tells the two shapes apart.
-    let rendered = calls.to_string();
+    let rendered = serde_json::to_string(calls).expect("the calls serialise");
     assert!(
         !rendered.contains("stop_reason"),
         "the read must carry the calls alone: {rendered}"
@@ -4218,10 +4220,186 @@ fn a_damaged_reply_does_not_hide_the_awaited_call() {
     let reader = rusqlite::Connection::open(&db).expect("the database opens");
     assert_every_reply_is_still_named(&reader);
 
+    // The PAGE holds every reply. The SEARCH is a different question. It
+    // refuses to walk past a reply it cannot read, because the awaited call
+    // may be in that reply. A tool-use id is unique only within one reply.
+    // `a_search_refuses_to_walk_past_a_reply_it_cannot_read` states why.
+    let signal = session::approval_signal(0, 0, "toolu_wanted");
+    let refused = daemon::pending_call(&reader, "e", &signal, false)
+        .expect_err("the search must not walk past a reply it cannot read");
+    assert!(
+        refused.contains("cannot be read"),
+        "and it must say so: {refused}"
+    );
+}
+
+/// A search refuses to walk past a reply it cannot read.
+///
+/// A tool-use id is unique within ONE reply, which `has_addressable_calls`
+/// proves. Nothing makes an id unique across a run, so an older reply can
+/// hold the same id for a DIFFERENT tool.
+///
+/// The search walks replies newest first. When the newest reply cannot be
+/// read, walking on found the older call and showed ITS tool and arguments
+/// beside the current approval token. The operator reads one call, pastes the
+/// command beside it, and releases the call they never saw.
+///
+/// This was reachable only after the reply projection stopped failing closed:
+/// an unreadable array became a skipped reply rather than an aborted page.
+/// A fix that makes a read degrade has to say what the degraded value means
+/// to every reader of it.
+#[test]
+fn a_search_refuses_to_walk_past_a_reply_it_cannot_read() {
+    let dir = tempfile::tempdir().expect("a temporary directory");
+    let db = dir.path().join("stale-id.db");
+    let writer = rusqlite::Connection::open(&db).expect("the database opens");
+    writer
+        .execute_batch(
+            "CREATE TABLE harvest_events (exec_id TEXT, seq INTEGER, event_json TEXT,              PRIMARY KEY (exec_id, seq));",
+        )
+        .expect("the fixture schema is created");
+
+    // An OLDER turn that reused the awaited id, for a different tool and a
+    // different target. This is the call that must never be offered.
+    let older = json!({
+        "type": "ActivityCompleted",
+        "data": { "output": {
+            "stop_reason": "tool_use",
+            "tool_calls": [{ "id": "toolu_same", "name": "read_file",
+                             "input": { "path": "secrets.txt" } }],
+        }},
+    })
+    .to_string();
+    writer
+        .execute(
+            "INSERT INTO harvest_events VALUES ('e', 0, ?1)",
+            rusqlite::params![older],
+        )
+        .expect("the older reply is recorded");
+    // The NEWEST reply, which is the one the session waits on, and whose
+    // calls cannot be read.
+    writer
+        .execute(
+            "INSERT INTO harvest_events VALUES ('e', 1, ?1)",
+            rusqlite::params![
+                r#"{"type":"ActivityCompleted","data":{"output":{"stop_reason":"tool_use","tool_calls":1}}}"#
+            ],
+        )
+        .expect("the unreadable reply is recorded");
+    drop(writer);
+
+    let reader = rusqlite::Connection::open(&db).expect("the database opens");
+
+    // The two replies are told apart, which is what lets the search stop.
+    let page = inspect::reply_calls(&reader, "e", None, 8).expect("the replies read");
+    let calls = |seq: i64| {
+        page.iter()
+            .find(|reply| reply.0 == seq)
+            .map(|reply| &reply.1)
+    };
+    assert!(
+        matches!(calls(1), Some(inspect::ReplyCalls::Unreadable)),
+        "the newest reply is unreadable: {page:?}"
+    );
+    assert!(
+        matches!(calls(0), Some(inspect::ReplyCalls::Calls(_))),
+        "and the older one is readable: {page:?}"
+    );
+
+    // The awaited call belongs to the NEWER turn, and its id collides.
+    let signal = session::approval_signal(1, 0, "toolu_same");
+    let refused = daemon::pending_call(&reader, "e", &signal, false)
+        .expect_err("no call may be offered past a reply that cannot be read");
+    assert!(
+        refused.contains("cannot be read"),
+        "the refusal must say what stopped it: {refused}"
+    );
+
+    // The rendering offers no decision, and still says the session waits.
+    // A silence would read as a session with nothing to answer.
+    let parked = daemon::ParkedState {
+        signal: Some(signal),
+        reason: "waiting for approval of write_file".to_string(),
+    };
+    let (pending, blocked_on) = daemon::decidable(&reader, "e", Some(&parked), false);
+    assert!(
+        pending.is_none(),
+        "the older call must NEVER be offered: {pending:?}"
+    );
+    let reason = blocked_on.expect("the session still says why it is parked");
+    assert!(
+        reason.contains("waiting for approval of write_file") && reason.contains("cannot be read"),
+        "the reason keeps the wait and names the read that stopped: {reason}"
+    );
+    assert!(
+        !reason.contains("secrets.txt") && !reason.contains("read_file"),
+        "and it never names the older call: {reason}"
+    );
+}
+
+/// The search walks past a reply that asked for NOTHING, and finds the call.
+///
+/// This is the other half of the page property. A reply that asked for no
+/// tool is a fact the search can act on. An awaited call behind such replies
+/// is still found, however deep it sits.
+#[test]
+fn a_search_walks_past_replies_that_asked_for_nothing() {
+    let dir = tempfile::tempdir().expect("a temporary directory");
+    let db = dir.path().join("quiet-replies.db");
+    let writer = rusqlite::Connection::open(&db).expect("the database opens");
+    writer
+        .execute_batch(
+            "CREATE TABLE harvest_events (exec_id TEXT, seq INTEGER, event_json TEXT,              PRIMARY KEY (exec_id, seq));",
+        )
+        .expect("the fixture schema is created");
+    let wanted = json!({
+        "type": "ActivityCompleted",
+        "data": { "output": {
+            "stop_reason": "tool_use",
+            "tool_calls": [{
+                "id": "toolu_wanted",
+                "name": "write_file",
+                "input": { "path": "notes.md", "content": "x" },
+            }],
+        }},
+    })
+    .to_string();
+    writer
+        .execute(
+            "INSERT INTO harvest_events VALUES ('e', 0, ?1)",
+            rusqlite::params![wanted],
+        )
+        .expect("the awaited reply is recorded");
+    // Three readable replies that asked for nothing sit NEWER than it.
+    let quiet = json!({
+        "type": "ActivityCompleted",
+        "data": { "output": { "stop_reason": "end_turn" } },
+    })
+    .to_string();
+    for seq in 1..4_i64 {
+        writer
+            .execute(
+                "INSERT INTO harvest_events VALUES ('e', ?1, ?2)",
+                rusqlite::params![seq, quiet],
+            )
+            .expect("the quiet reply is recorded");
+    }
+    drop(writer);
+
+    let reader = rusqlite::Connection::open(&db).expect("the database opens");
+    let page = inspect::reply_calls(&reader, "e", None, 16).expect("the replies read");
+    assert_eq!(
+        page.iter()
+            .filter(|(_, calls)| matches!(calls, inspect::ReplyCalls::NoCalls))
+            .count(),
+        3,
+        "the quiet replies are named as asking for nothing: {page:?}"
+    );
+
     let signal = session::approval_signal(0, 0, "toolu_wanted");
     let found = daemon::pending_call(&reader, "e", &signal, false)
         .expect("the replies read")
-        .expect("the awaited call must be found behind the damaged replies");
+        .expect("the awaited call must be found behind the quiet replies");
     assert_eq!(
         found.id, "toolu_wanted",
         "and it is the call that was recorded"
@@ -4286,11 +4464,14 @@ fn assert_every_reply_is_still_named(reader: &rusqlite::Connection) {
         page.iter().all(|(seq, _)| *seq != 3),
         "a row that is not JSON is not a reply: {page:?}"
     );
+    // A reply this reader cannot decode is named UNREADABLE, and not as a
+    // reply that asked for nothing. The searcher must be able to tell those
+    // apart: it may walk past the second, and never past the first.
     assert!(
         page.iter()
             .filter(|(seq, _)| *seq != 0)
-            .all(|(_, calls)| calls.is_null()),
-        "a reply this reader cannot decode holds no calls: {page:?}"
+            .all(|(_, calls)| matches!(calls, inspect::ReplyCalls::Unreadable)),
+        "a reply this reader cannot decode is unreadable: {page:?}"
     );
 }
 
@@ -5738,15 +5919,16 @@ fn a_damaged_event_does_not_hide_a_history() {
             .find(|reply| reply.0 == seq)
             .map(|reply| &reply.1)
     };
-    assert_eq!(
-        calls(0),
-        Some(&json!([])),
-        "the readable reply still holds its calls: {replies:?}"
+    assert!(
+        matches!(calls(0), Some(inspect::ReplyCalls::NoCalls)),
+        "the readable reply asked for no call: {replies:?}"
     );
-    assert_eq!(
-        calls(2),
-        Some(&serde_json::Value::Null),
-        "a reply whose calls cannot be read holds none: {replies:?}"
+    // Row 2 is `{"type":7,...}` with a `stop_reason` and NO `tool_calls`, so
+    // it asked for nothing. That is a fact, and not damage: the type fault
+    // this test is about is in a field the reply search never reads.
+    assert!(
+        matches!(calls(2), Some(inspect::ReplyCalls::NoCalls)),
+        "a reply with no tool_calls field asked for nothing: {replies:?}"
     );
 }
 
