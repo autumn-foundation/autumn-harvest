@@ -2607,6 +2607,81 @@ fn the_decide_line_reaches_the_daemon_that_printed_it() {
     );
 }
 
+/// A goal opening with a NUL is still a goal.
+///
+/// Rust keeps that byte through `trim`, so `submit` accepts such a goal. The
+/// database counts TEXT to the first NUL and stops, so a count of characters
+/// measures zero there. The startup check would then refuse to start over a
+/// task it can read perfectly well. No daemon of this version could resume
+/// the session. The two checks must agree about the same value.
+#[test]
+fn a_goal_opening_with_a_nul_is_measured_whole() {
+    let dir = tempfile::tempdir().expect("a temporary directory");
+    let db = dir.path().join("nul.db");
+    let writer = rusqlite::Connection::open(&db).expect("the database opens");
+    writer
+        .execute(
+            "CREATE TABLE harvest_executions (exec_id TEXT, workflow_name TEXT, \
+             state TEXT, input_json TEXT, output_json TEXT, error TEXT)",
+            [],
+        )
+        .expect("the fixture table is created");
+    let task = |goal: &str| {
+        json!({
+            "goal": goal,
+            "max_turns": 4,
+            "approval_timeout_secs": 300,
+            "workspace": "/tmp/w",
+            "model": claude::OFFLINE_MODEL,
+        })
+        .to_string()
+    };
+    for (exec, goal) in [
+        ("nul-first", "\u{0}summarise the workspace"),
+        ("nul-middle", "summarise\u{0}the workspace"),
+        ("plain", "summarise the workspace"),
+    ] {
+        writer
+            .execute(
+                "INSERT INTO harvest_executions VALUES (?1, ?2, 'RUNNING', ?3, NULL, NULL)",
+                rusqlite::params![exec, WORKFLOW_NAME, task(goal)],
+            )
+            .expect("the session is recorded");
+    }
+    // A goal that is only space is still refused, so the byte count did not
+    // trade one fault for another.
+    writer
+        .execute(
+            "INSERT INTO harvest_executions VALUES ('blank', ?1, 'RUNNING', ?2, NULL, NULL)",
+            rusqlite::params![WORKFLOW_NAME, task("   ")],
+        )
+        .expect("the blank session is recorded");
+    drop(writer);
+
+    let reader = rusqlite::Connection::open(&db).expect("the database opens");
+    let running = inspect::running(&reader, WORKFLOW_NAME).expect("the query runs");
+    let goal_of = |exec: &str| {
+        running
+            .iter()
+            .find(|row| row.exec_id == exec)
+            .expect("the session is RUNNING")
+            .has_goal
+    };
+    assert!(
+        goal_of("nul-first"),
+        "a goal opening with a NUL must count as a goal"
+    );
+    assert!(
+        goal_of("nul-middle"),
+        "a goal holding a NUL must count as a goal"
+    );
+    assert!(goal_of("plain"), "an ordinary goal must count as a goal");
+    assert!(
+        !goal_of("blank"),
+        "a goal of only space must still be refused"
+    );
+}
+
 /// A restored wait is the ARMED one, and not one already answered.
 ///
 /// Two tables decide this, and the backend's own rule is that an armed but

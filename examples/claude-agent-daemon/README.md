@@ -112,6 +112,29 @@ exactly that, by counting model calls in each process.
 The `decide:` line carries `--socket` whenever you chose one, so the command
 you copy reaches the daemon that printed it.
 
+### One loop drives and serves, and that bounds how fast it answers
+
+The daemon drives sessions and answers commands on ONE task. A drive runs
+`run_until_blocked`, which carries a session forward until it needs a decision,
+needs a timer, or ends. A session whose turns call only read tools reaches none
+of those, so one drive can run every turn it has.
+
+Each turn can take up to the request timeout of 840 seconds, and `--max-turns`
+defaults to 8. A session that uses its whole budget can therefore hold the loop
+for around two hours, and no command is answered in that time. Raising
+`--max-turns` raises that bound with it.
+
+The cause is the loop and not the engine. A `status`, `list` or `history` reads
+through a second, read-only connection and needs nothing the drive holds, so
+those three could be answered during a drive by a daemon that served them on
+another task. `submit` and `approve` write, and they would still wait: this
+backend has one writer by design.
+
+A reader who wants an always-answering control socket should serve commands on
+a task of their own and leave the drive to this one. That is a change to the
+shape of the daemon rather than a setting, so this example keeps the single
+loop and states the cost here.
+
 Flags: `--db` (default `agentd.db`), `--socket` (default `agentd.sock`),
 `--workspace`, `--model`, `--max-tokens`, `--tick-ms`. Each also reads an
 `AGENTD_*` environment variable. The API key is **not** among them: it comes

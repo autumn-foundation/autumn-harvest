@@ -165,6 +165,12 @@ pub fn running(conn: &Connection, workflow_name: &str) -> Result<Vec<RunningSess
     // set is given, because `trim` alone removes the space and not the tab or
     // the newline.
     //
+    // The length is of the BYTES. `length` on text counts to the first NUL
+    // and stops, so a goal that opens with one measures zero. The daemon
+    // would refuse to start over a task it can read perfectly well. Rust
+    // keeps that byte through `trim`, so `submit` accepts such a goal, and
+    // the two checks have to agree about the same value.
+    //
     // Each number is read only when BOTH tests pass, and the two catch
     // different faults.
     //
@@ -196,8 +202,9 @@ pub fn running(conn: &Connection, workflow_name: &str) -> Result<Vec<RunningSess
                          THEN json_extract(input_json, '$.approval_timeout_secs') END, \
                     CASE WHEN json_valid(input_json) \
                           AND json_type(input_json, '$.goal') = 'text' \
-                         THEN length(trim(json_extract(input_json, '$.goal'), \
-                                          char(32) || char(9) || char(10) || char(13))) \
+                         THEN length(cast(trim(json_extract(input_json, '$.goal'), \
+                                               char(32) || char(9) || char(10) \
+                                               || char(13)) as blob)) \
                          END \
              FROM harvest_executions \
              WHERE workflow_name = ?1 AND state = 'RUNNING' ORDER BY rowid",
