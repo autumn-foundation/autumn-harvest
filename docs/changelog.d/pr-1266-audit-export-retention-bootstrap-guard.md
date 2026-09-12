@@ -97,6 +97,29 @@ audit table would silently stop being purged at all — the opposite
 failure from the rest of this PR, which is about purging too early, not
 too rarely. The key now keeps the query string verbatim.
 
+An eighth review round produced two findings pulling in opposite
+directions on the same line. A P1 finding noted that keeping the whole
+query string reintroduced the original problem for parameters that carry
+no schema meaning: two DSNs differing only in `application_name` or
+`sslmode` would no longer collapse, so an exempt shard's unprotected pass
+could again run before a colocated protected shard's pass. A P2 finding
+argued the opposite for username: dropping it can combine two roles whose
+own `search_path` (or PostgreSQL's default, which includes the
+connecting user's own schema) differ, again risking the silent
+never-purged case above.
+
+`canonical_dsn_key` now keeps only the `options` query parameter — the
+one libpq mechanism that can carry `-c search_path=...` — and drops every
+other query parameter, including credentials. The username finding is
+documented as an accepted, unfixed gap rather than chased further: a
+role's own server-side `search_path` is invisible in the DSN regardless
+of username, so keeping the username would not fully close the gap; it
+would only reopen the sixth round's original bug, since a documented
+`from_dsns` use (`harvest shard rebalance`, issue #964) targets one
+database under different usernames. Between an accepted, narrow,
+documented gap and reopening a P1-severity bug this PR exists to close,
+the gap stays.
+
 New tests:
 - `retention_protects_unexported_audit_when_configured_with_no_cursor_and_no_local_sink`
   reproduces the exact bootstrap window (no cursor row anywhere, no sink in
@@ -131,6 +154,9 @@ New tests:
   seventh round's fix: two DSNs whose `options` set a different
   `search_path` never collapse into one group, even with the same host,
   port, and database name.
+- `from_dsns_ignores_connection_only_parameters` pins the eighth round's
+  P1 fix: two DSNs differing only in `application_name` and `sslmode`,
+  and in credentials, still collapse into one group.
 
 **Zero migration, zero engine impact beyond the new parameter.** No new
 `WorkflowEvent` variant, no schema change, no change to any existing call

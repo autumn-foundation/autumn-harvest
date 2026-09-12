@@ -949,26 +949,36 @@ fn group_by_pool_identity(pools: &BTreeMap<ShardId, DbPool>) -> BTreeMap<ShardId
 /// Canonical grouping key for a DSN (issue #1266).
 ///
 /// Two DSNs can reach the same physical database while written
-/// differently: different credentials, or an explicit default port versus
-/// none. Comparing the raw strings would treat these as separate
-/// databases. Each apparent group would then apply its own protection
-/// decision to rows the other group was meant to protect.
+/// differently. Credentials can differ, a port can be explicit or
+/// default, or a connection-tuning parameter such as `application_name`
+/// or `sslmode` can differ. Comparing the raw strings would treat these
+/// as separate databases. Each apparent group would then apply its own
+/// protection decision to rows the other group was meant to protect.
 ///
-/// The key keeps host (lowercased), port (defaulted to 5432 when absent),
-/// the path, and the query string. It drops only credentials, since a
-/// username and password never change which physical database or schema
-/// a connection reaches.
-///
-/// The query string is kept verbatim, not dropped. A `?options=-c%20
-/// search_path%3D...` parameter picks the schema `harvest_audit_log`
+/// The key keeps host (lowercased), port (defaulted to 5432 when
+/// absent), the path, and only the `options` query parameter. `options`
+/// is libpq's escape hatch for arbitrary session settings, including
+/// `-c search_path=...`, so it picks the schema `harvest_audit_log`
 /// resolves to. Two DSNs that differ only there can still reach
-/// different data. They must never be grouped as one pool.
+/// different data and must never be grouped as one pool. Every other
+/// query parameter is dropped: none of them changes which relation a
+/// query resolves against.
 ///
-/// A host alias — two hostnames that resolve to one address — is not
-/// detected. That needs a DNS lookup, and building a pool must stay a
-/// pure, local operation with no network access. A DSN that does not
-/// parse as a URL falls back to the raw string, unchanged from before
-/// this key existed.
+/// Two gaps are accepted rather than chased further. Closing either
+/// needs a live connection. Building a pool must stay a pure, local
+/// operation with no network access:
+/// - A host alias — two hostnames that resolve to one address — is not
+///   detected.
+/// - A role's own `search_path`, set server-side with `ALTER ROLE ...
+///   SET search_path`, is invisible in the DSN. The username is dropped
+///   with the rest of the credentials, not kept as a proxy for it. Two
+///   DSNs for one database under different usernames are a supported
+///   topology (`from_dsns`'s own `harvest shard rebalance` use, issue
+///   #964). Treating them as different pools would reopen the exact bug
+///   this key exists to close.
+///
+/// A DSN that does not parse as a URL falls back to the raw string,
+/// unchanged from before this key existed.
 #[cfg(feature = "db")]
 fn canonical_dsn_key(dsn: &str) -> String {
     let Ok(url) = url::Url::parse(dsn) else {
@@ -977,8 +987,13 @@ fn canonical_dsn_key(dsn: &str) -> String {
     let host = url.host_str().unwrap_or_default().to_ascii_lowercase();
     let port = url.port().unwrap_or(5432);
     let path = url.path();
-    let query = url.query().unwrap_or_default();
-    format!("{host}:{port}{path}?{query}")
+    let options = url
+        .query_pairs()
+        .filter(|(k, _)| k == "options")
+        .map(|(_, v)| v.into_owned())
+        .collect::<Vec<String>>()
+        .join("\u{0}");
+    format!("{host}:{port}{path}?options={options}")
 }
 
 #[cfg(feature = "db")]
@@ -2024,6 +2039,39 @@ mod tests {
             2,
             "different `options` can select a different schema, so these \
              must never collapse into one group"
+        );
+    }
+
+    // `application_name` and `sslmode` never change which relation a
+    // query resolves against. Two shards on the same database, differing
+    // only in credentials and these tuning parameters, must still
+    // collapse to one group (issue #1266).
+    #[cfg(feature = "db")]
+    #[test]
+    fn from_dsns_ignores_connection_only_parameters() {
+        let sharded = ShardedDbPool::from_dsns(
+            [
+                (
+                    ShardId::new(0),
+                    "postgres://alice@db.example/shared?application_name=web".to_string(),
+                ),
+                (
+                    ShardId::new(1),
+                    "postgres://bob@db.example/shared?application_name=worker&sslmode=require"
+                        .to_string(),
+                ),
+            ],
+            ShardId::new(0),
+            1,
+        )
+        .expect("pool builds without connecting");
+
+        let groups = sharded.pool_groups();
+        assert_eq!(
+            groups.len(),
+            1,
+            "application_name and sslmode never affect relation \
+             resolution, so these must collapse to one group"
         );
     }
 }

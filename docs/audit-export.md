@@ -305,13 +305,23 @@ shard records:
   builds a separate `Pool` per entry even for two connection strings that
   reach one database, so identity alone cannot see the alias; the sweep
   groups these by a canonical form of the DSN instead (host, port, path,
-  and query string, ignoring only credentials), compared before the DSN
-  is consumed into a pool. The query string is kept, not stripped: a
-  `search_path` set through `?options=...` picks which schema a query
-  resolves against, so two DSNs differing only there must stay in
-  separate groups. A host alias — two hostnames that resolve to one
-  address — is not detected; that would need a DNS lookup, and building
-  a pool must stay a pure, local operation.
+  and the `options` query parameter, ignoring everything else including
+  credentials), compared before the DSN is consumed into a pool.
+  `options` is kept because it can carry `-c search_path=...`, which
+  picks which schema a query resolves against — two DSNs differing only
+  there must stay in separate groups. Every other query parameter
+  (`application_name`, `sslmode`, and so on) is dropped, since none of
+  them changes which relation a query resolves against.
+
+  Two gaps are accepted rather than chased further, since closing either
+  needs a live connection: a host alias (two hostnames resolving to one
+  address), and a role's own `search_path` set server-side with `ALTER
+  ROLE ... SET search_path` (invisible in the DSN, and not fully covered
+  by keeping the username, since the same role name can be granted
+  identical or different search paths across environments). Two DSNs for
+  one database under different usernames are also a documented topology
+  (`harvest shard rebalance`, issue #964), so treating different
+  usernames as different pools was rejected as reopening a worse bug.
 
   The remaining cost is operational, not architectural: an operator must
   remember to set the flag on every process, including ones added later.
