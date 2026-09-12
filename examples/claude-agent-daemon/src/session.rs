@@ -224,7 +224,10 @@ pub async fn agent_session(
             .map_err(|e| e.to_string())?;
 
         messages.push(Message::assistant(reply.content.clone()));
-        if !reply.text.is_empty() {
+        // Blank text is not an answer, and it must not replace one. A turn
+        // that carries only whitespace would otherwise erase the text a tool
+        // turn before it produced.
+        if claude::says_something(&reply.text) {
             last_text = reply.text.clone();
         }
 

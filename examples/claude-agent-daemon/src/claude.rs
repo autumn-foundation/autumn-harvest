@@ -371,6 +371,19 @@ pub fn agrees_with_its_content(reply: &TurnReply) -> bool {
     reply.stop_reason != STOP_END_TURN || reply.tool_calls.is_empty()
 }
 
+/// Does this text say anything?
+///
+/// Whitespace is not an answer. A turn that carries only blank text would pass
+/// an emptiness test, and the session would report a clean finish with nothing
+/// in it.
+///
+/// The test is on the trimmed text, but the bytes are never changed. A code
+/// answer carries its own indentation and line breaks, and those are content.
+/// Only the decision reads the trim.
+pub fn says_something(text: &str) -> bool {
+    !text.trim().is_empty()
+}
+
 /// Can this reply move the session forward?
 ///
 /// The test is on the projection rather than on each content block. A reply is
@@ -386,11 +399,18 @@ pub fn is_usable(reply: &TurnReply) -> bool {
     if reply.stop_reason == STOP_TOOL_USE {
         return !reply.tool_calls.is_empty();
     }
-    !reply.text.is_empty() || !reply.tool_calls.is_empty() || reply.stop_reason != STOP_END_TURN
+    says_something(&reply.text)
+        || !reply.tool_calls.is_empty()
+        || reply.stop_reason != STOP_END_TURN
 }
 
 /// Project one API response into the durable [`TurnReply`].
-fn parse_reply(payload: &Value) -> TurnReply {
+///
+/// The stop reason is normalised here, once. Every test below compares it to a
+/// known name, and a reason with surrounding space matches none of them. A
+/// padded `end_turn` would report a completed session with no answer, and a
+/// padded `tool_use` would drop the calls the turn asked for.
+pub fn parse_reply(payload: &Value) -> TurnReply {
     let blocks = payload
         .get("content")
         .and_then(Value::as_array)
@@ -432,10 +452,11 @@ fn parse_reply(payload: &Value) -> TurnReply {
         .get("stop_reason")
         .and_then(Value::as_str)
         .unwrap_or("end_turn")
+        .trim()
         .to_string();
 
     // A refusal carries no usable content, so the category becomes the answer.
-    if stop_reason == "refusal" && text.is_empty() {
+    if stop_reason == "refusal" && !says_something(&text) {
         let category = payload
             .pointer("/stop_details/category")
             .and_then(Value::as_str)

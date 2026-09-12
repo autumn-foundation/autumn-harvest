@@ -1148,6 +1148,71 @@ fn a_billed_response_that_is_not_a_message_is_refused() {
 }
 
 #[test]
+fn a_padded_stop_reason_is_read_under_its_own_name() {
+    // A reason with surrounding space passes the shape check, because its
+    // trimmed value says something. The projection must then classify it by
+    // that same trimmed name. A verbatim ` end_turn ` matches no comparison
+    // below. The loop then reports a completed session with no answer. A
+    // verbatim ` tool_use ` drops the calls the turn asked for.
+    let ended = claude::parse_reply(&json!({
+        "content": [{ "type": "text", "text": "done" }],
+        "stop_reason": " end_turn ",
+    }));
+    assert_eq!(
+        ended.stop_reason,
+        claude::STOP_END_TURN,
+        "a padded end_turn must read as end_turn"
+    );
+
+    let calling = claude::parse_reply(&json!({
+        "content": [{ "type": "tool_use", "id": "t1", "name": "list_files", "input": {} }],
+        "stop_reason": "\ttool_use\n",
+    }));
+    assert_eq!(
+        calling.stop_reason,
+        claude::STOP_TOOL_USE,
+        "a padded tool_use must read as tool_use"
+    );
+    assert!(
+        !claude::is_usable(&claude::parse_reply(&json!({
+            "content": [Value::Null],
+            "stop_reason": " tool_use ",
+        }))),
+        "a padded tool_use with no call must still be refused"
+    );
+}
+
+#[test]
+fn a_turn_of_whitespace_is_not_an_answer() {
+    // Whitespace is not an answer. A turn carrying only blank text passes an
+    // emptiness test, so the session reports a clean finish with nothing in
+    // it. The bytes are kept as they arrive, because indentation and line
+    // breaks are part of a code answer. Only the decision reads the trim.
+    let blank = claude::parse_reply(&json!({
+        "content": [{ "type": "text", "text": "  \n\t " }],
+        "stop_reason": "end_turn",
+    }));
+    assert_eq!(blank.text, "  \n\t ", "the bytes must arrive unchanged");
+    assert!(
+        !claude::is_usable(&blank),
+        "a turn of whitespace must not pass as an answer"
+    );
+
+    let indented = claude::parse_reply(&json!({
+        "content": [{ "type": "text", "text": "    let x = 1;\n" }],
+        "stop_reason": "end_turn",
+    }));
+    assert!(
+        claude::is_usable(&indented),
+        "an indented answer must still pass"
+    );
+    assert_eq!(
+        indented.text, "    let x = 1;\n",
+        "an answer keeps its own layout"
+    );
+}
+
+#[test]
 fn a_new_database_and_its_sidecars_are_owner_only() {
     use std::os::unix::fs::PermissionsExt;
 
