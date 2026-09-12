@@ -560,6 +560,7 @@ async fn chaos_repro_367_crash_orphan_is_reclaimed() {
         &mut conn,
         3,
         0,
+        None,
         &NoOpMetrics,
         &autumn_harvest::payload_codec::PayloadCodecs::default(),
     )
@@ -1366,6 +1367,7 @@ async fn chaos_seeded_convergence_sweep() {
                 &mut conn,
                 3,
                 0,
+                None,
                 &NoOpMetrics,
                 &autumn_harvest::payload_codec::PayloadCodecs::default(),
             )
