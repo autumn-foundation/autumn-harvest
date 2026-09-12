@@ -3239,6 +3239,7 @@ fn every_paged_query_is_planned_as_a_seek() {
                 &201_i64,
                 &2000_i64,
                 &top,
+                &crate::inspect::COUNTER_CEILING,
             ],
             "rowid<?",
         ),
@@ -3592,6 +3593,196 @@ fn a_listed_document_in_the_wrong_storage_class_reads_as_nothing() {
         blob_report.goal.as_deref(),
         Some("summarise it"),
         "the task of that row is in the right class, and is still read"
+    );
+}
+
+/// A counter outside the Rust range is no report.
+///
+/// `SessionReport` declares both counts as `u32`. A recorded `-1` or
+/// `4294967296` is a report `status` refuses, and both are `integer` to
+/// `json_type` AND to `typeof`. Neither guard sees the range, so the listing
+/// rendered `[end_turn after -1 turns, 1 tool calls]` — a result that looks
+/// genuine and that the rest of the daemon cannot read.
+///
+/// The bound is passed to the query FROM the Rust type, so this asserts the
+/// range and not a literal.
+#[test]
+fn a_listed_counter_outside_the_rust_range_is_no_report() {
+    let dir = tempfile::tempdir().expect("a temporary directory");
+    let db = dir.path().join("range.db");
+    let writer = rusqlite::Connection::open(&db).expect("the database opens");
+    fixture_table(&writer);
+    let report = |turns: &str, calls: &str| {
+        format!(r#"{{"stop":"end_turn","turns":{turns},"tool_calls":{calls},"answer":"done"}}"#)
+    };
+    let rows = [
+        ("readable", report("2", "3")),
+        ("negative", report("-1", "3")),
+        ("too-wide", report("4294967296", "3")),
+        ("wide-calls", report("2", "4294967296")),
+        ("at-the-ceiling", report("4294967295", "0")),
+    ];
+    for (exec, document) in &rows {
+        writer
+            .execute(
+                "INSERT INTO harvest_executions VALUES (?1, ?2, 'COMPLETED', ?3, ?4, NULL)",
+                rusqlite::params![exec, WORKFLOW_NAME, READABLE_TASK, document],
+            )
+            .expect("the row is recorded");
+    }
+
+    // Why the two existing guards do not see this. Both values are
+    // `integer` to each of them, and Rust still refuses the document.
+    for (exec, document) in &rows {
+        let (kind, class): (String, String) = writer
+            .query_row(
+                "SELECT json_type(output_json, '$.turns'), \
+                        typeof(json_extract(output_json, '$.turns')) \
+                 FROM harvest_executions WHERE exec_id = ?1",
+                [exec],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("the classification answers");
+        assert_eq!(
+            (kind.as_str(), class.as_str()),
+            ("integer", "integer"),
+            "{exec} passes both existing guards"
+        );
+        let readable = serde_json::from_str::<session::SessionReport>(document).is_ok();
+        assert_eq!(
+            readable,
+            exec == &"readable" || exec == &"at-the-ceiling",
+            "{exec} must agree with what `status` reads"
+        );
+    }
+    drop(writer);
+
+    let reader = rusqlite::Connection::open(&db).expect("the database opens");
+    let listed = inspect::executions(&reader, WORKFLOW_NAME, None).expect("the listing answers");
+    let row = |exec: &str| listed_row(&listed, exec);
+    assert_eq!(
+        (row("readable").turns, row("readable").tool_calls),
+        (Some(2), Some(3)),
+        "a report inside the range still reads"
+    );
+    // The ceiling itself is inside the range, so it is not refused.
+    assert_eq!(
+        (
+            row("at-the-ceiling").turns,
+            row("at-the-ceiling").tool_calls
+        ),
+        (Some(u32::MAX), Some(0)),
+        "the largest readable count is still read"
+    );
+    // Each column is guarded on its own, so the out-of-range count reads as
+    // nothing and the other one still reads. The RENDERING is the layer that
+    // matters to an operator, so it is asserted too.
+    assert_eq!(
+        (row("negative").turns, row("negative").tool_calls),
+        (None, Some(3)),
+        "the out-of-range count reads as nothing, and its neighbour reads"
+    );
+    assert_eq!(
+        (row("wide-calls").turns, row("wide-calls").tool_calls),
+        (Some(2), None),
+        "either counter is guarded on its own"
+    );
+
+    let rendered = inspect::open(&db).expect("the reader opens");
+    let (views, _, _) = daemon::sessions(&rendered, &daemon::Parked::new(), false, None)
+        .expect("the listing renders");
+    let shown = |exec: &str| -> Option<String> {
+        views
+            .iter()
+            .find(|view| view.execution_id == exec)
+            .expect("the session is listed")
+            .answer
+            .clone()
+    };
+    assert_eq!(
+        shown("readable").as_deref(),
+        Some("[end_turn after 2 turns, 3 tool calls] done"),
+        "a report inside the range is shown as it stands"
+    );
+    for exec in ["negative", "too-wide", "wide-calls"] {
+        assert_eq!(
+            shown(exec).as_deref(),
+            Some("<unreadable report>"),
+            "{exec} must never be shown as a genuine result"
+        );
+    }
+}
+
+/// A field whose bytes are not text is no field, prefix or not.
+///
+/// A stop reason of `"end_turn\ud800"` is text to `SQLite`. `json_extract`
+/// yields `end_turn` followed by `ED A0 80`, so keeping the valid prefix
+/// showed a session that ended well, while `status` refused the same report.
+///
+/// A valid prefix is kept for ONE reason: the database cuts on bytes, and the
+/// cut can land inside a character. `Utf8Error::error_len` separates the two.
+/// It answers nothing only when the bytes END inside a character.
+#[test]
+fn a_listed_field_of_malformed_bytes_is_not_shown_as_its_prefix() {
+    let dir = tempfile::tempdir().expect("a temporary directory");
+    let db = dir.path().join("prefix.db");
+    let writer = rusqlite::Connection::open(&db).expect("the database opens");
+    fixture_table(&writer);
+    let bad = r#"{"stop":"end_turn\ud800","turns":2,"tool_calls":1,"answer":"done"}"#;
+    writer
+        .execute(
+            "INSERT INTO harvest_executions VALUES \
+             ('bad-suffix', ?1, 'COMPLETED', ?2, ?3, NULL)",
+            rusqlite::params![WORKFLOW_NAME, READABLE_TASK, bad],
+        )
+        .expect("the row is recorded");
+
+    // The bytes the guard admits, and the error that separates the two cases.
+    let bytes: Vec<u8> = writer
+        .query_row(
+            "SELECT cast(json_extract(output_json, '$.stop') as blob) \
+             FROM harvest_executions WHERE exec_id = 'bad-suffix'",
+            [],
+            |row| row.get(0),
+        )
+        .expect("the bytes answer");
+    let split = std::str::from_utf8(&bytes).expect_err("the bytes are not text");
+    assert_eq!(
+        std::str::from_utf8(&bytes[..split.valid_up_to()]),
+        Ok("end_turn"),
+        "the valid prefix is a stop reason that reads as success"
+    );
+    assert!(
+        split.error_len().is_some(),
+        "a malformed sequence is not the end of the input"
+    );
+    assert!(
+        serde_json::from_str::<session::SessionReport>(bad).is_err(),
+        "`status` refuses the same report"
+    );
+    drop(writer);
+
+    let reader = rusqlite::Connection::open(&db).expect("the database opens");
+    let listed = inspect::executions(&reader, WORKFLOW_NAME, None).expect("the listing answers");
+    let row = listed_row(&listed, "bad-suffix");
+    assert!(
+        row.stop.is_none(),
+        "a stop reason of bytes nobody wrote must read as nothing: {row:?}"
+    );
+    assert_eq!(
+        row.goal.as_deref(),
+        Some("summarise it"),
+        "the readable fields of that row are still read"
+    );
+
+    // The cut is the case a prefix is kept for. A character split by the byte
+    // budget ends the input, so `error_len` answers nothing.
+    let split_character = "ab\u{20ac}".as_bytes();
+    let cut = &split_character[..split_character.len() - 1];
+    let ending = std::str::from_utf8(cut).expect_err("the cut bytes are not text");
+    assert!(
+        ending.error_len().is_none(),
+        "a character cut by the budget must stay readable as its prefix"
     );
 }
 

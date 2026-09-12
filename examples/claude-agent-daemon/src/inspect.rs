@@ -88,8 +88,10 @@ pub struct SessionSummary {
     /// `None` when the recorded task cannot be read.
     pub goal: Option<String>,
     pub stop: Option<String>,
-    pub turns: Option<i64>,
-    pub tool_calls: Option<i64>,
+    /// The recorded turn count, or `None` when no report this daemon can read
+    /// is stored. The type is the range: see [`COUNTER_CEILING`].
+    pub turns: Option<u32>,
+    pub tool_calls: Option<u32>,
     pub answer: Option<String>,
     pub error: Option<String>,
     /// Where this row sits in the table, which is the cursor that reads the
@@ -124,6 +126,17 @@ pub const MAX_LISTED_CHARS: u32 = 500;
 /// Four bytes is the longest UTF-8 character, so this budget always carries
 /// at least [`MAX_LISTED_CHARS`] characters. The caller cuts the characters.
 const MAX_LISTED_BYTES: u32 = MAX_LISTED_CHARS * 4;
+
+/// The largest counter a recorded report can carry.
+///
+/// `SessionReport` declares both counts as `u32`, so a recorded `-1` or
+/// `4294967296` is a report `status` refuses to read. Both are still
+/// `integer` to `json_type` AND to `typeof`, so neither of those guards sees
+/// the range, and the listing showed `[end_turn after -1 turns, ...]`.
+///
+/// The bound is the Rust type's own maximum, and it is PASSED to the query.
+/// The SQL and the field it protects therefore cannot drift apart.
+pub const COUNTER_CEILING: i64 = u32::MAX as i64;
 
 /// Open the inspector connection.
 ///
@@ -615,7 +628,16 @@ fn cut_text(bytes: Option<Vec<u8>>, chars: u32) -> Option<String> {
     let bytes = bytes?;
     let whole = match std::str::from_utf8(&bytes) {
         Ok(text) => text,
-        Err(split) => std::str::from_utf8(&bytes[..split.valid_up_to()]).unwrap_or_default(),
+        // `error_len` answers NOTHING only when the bytes end inside a
+        // character. That is the cut the database was asked to make, so the
+        // valid prefix is the field. Any other error is a sequence nobody
+        // wrote, and a prefix of it would name a value the field never held.
+        // A stop reason of `"end_turn\ud800"` decodes to a valid `end_turn`,
+        // and the listing would show a session that ended well.
+        Err(split) if split.error_len().is_none() => {
+            std::str::from_utf8(&bytes[..split.valid_up_to()]).unwrap_or_default()
+        }
+        Err(_) => return None,
     };
     let cut: String = whole.chars().take(chars as usize).collect();
     (!cut.is_empty()).then_some(cut)
@@ -634,11 +656,14 @@ pub const SESSIONS_QUERY: &str = "SELECT exec_id, state, \
                     CASE WHEN typeof(output_json) = 'text' AND json_valid(output_json) \
                           AND json_type(output_json, '$.turns') = 'integer' \
                           AND typeof(json_extract(output_json, '$.turns')) = 'integer' \
+                          AND json_extract(output_json, '$.turns') BETWEEN 0 AND ?5 \
                          THEN json_extract(output_json, '$.turns') END, \
                     CASE WHEN typeof(output_json) = 'text' AND json_valid(output_json) \
                           AND json_type(output_json, '$.tool_calls') = 'integer' \
                           AND typeof(json_extract(output_json, '$.tool_calls')) \
                               = 'integer' \
+                          AND json_extract(output_json, '$.tool_calls') \
+                              BETWEEN 0 AND ?5 \
                          THEN json_extract(output_json, '$.tool_calls') END, \
                     CASE WHEN typeof(output_json) = 'text' AND json_valid(output_json) \
                           AND json_type(output_json, '$.answer') = 'text' \
@@ -717,7 +742,8 @@ pub fn executions(
                 workflow_name,
                 MAX_LISTED_SESSIONS + 1,
                 MAX_LISTED_BYTES,
-                no_cursor(before)
+                no_cursor(before),
+                COUNTER_CEILING
             ],
             |row| {
                 Ok(SessionSummary {
