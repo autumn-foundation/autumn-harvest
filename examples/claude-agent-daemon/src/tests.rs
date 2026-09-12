@@ -350,7 +350,7 @@ async fn settle_over_socket(socket: &Path, execution_id: &str) -> String {
             // daemon would send the operator to `agentd.sock`.
             let told = crate::rendered_lines(&stale, Path::new("/run/agentd/project-b.sock"));
             assert!(
-                told[0].contains("--socket /run/agentd/project-b.sock")
+                told[0].contains("--socket=/run/agentd/project-b.sock")
                     && told[0].contains(execution_id),
                 "the recovery command must reach the same daemon: {}",
                 told[0]
@@ -1468,7 +1468,7 @@ async fn a_history_command_reads_a_bounded_page() {
         Path::new("/run/agentd/project-b.sock"),
     );
     assert!(
-        hinted[0].contains("--socket /run/agentd/project-b.sock")
+        hinted[0].contains("--socket=/run/agentd/project-b.sock")
             && hinted[0].contains("--before 7")
             && hinted[0].contains(&execution_id),
         "the continuation command must reach the same daemon: {}",
@@ -2629,7 +2629,7 @@ fn the_decide_line_reaches_the_daemon_that_printed_it() {
     // out of one daemon's status must not go to another daemon, or to none.
     let named = decide("/run/agentd/project-b.sock");
     assert!(
-        named.contains("--socket /run/agentd/project-b.sock"),
+        named.contains("--socket=/run/agentd/project-b.sock"),
         "the chosen socket must be carried: {named}"
     );
 
@@ -2648,7 +2648,7 @@ fn the_decide_line_reaches_the_daemon_that_printed_it() {
     };
     let watch_named = watch("/run/agentd/project-b.sock");
     assert!(
-        watch_named.contains("--socket /run/agentd/project-b.sock"),
+        watch_named.contains("--socket=/run/agentd/project-b.sock"),
         "the watch command must carry the socket: {watch_named}"
     );
     assert!(
@@ -2667,7 +2667,7 @@ fn the_decide_line_reaches_the_daemon_that_printed_it() {
     // to be copied into a shell.
     let spaced = decide("/home/a b/agentd.sock");
     assert!(
-        spaced.contains("--socket '/home/a b/agentd.sock'"),
+        spaced.contains("--socket='/home/a b/agentd.sock'"),
         "a socket a shell would split must be quoted: {spaced}"
     );
 
@@ -2687,7 +2687,7 @@ fn the_decide_line_reaches_the_daemon_that_printed_it() {
     };
     let late_named = late("/run/agentd/project-b.sock");
     assert!(
-        late_named.contains("--socket /run/agentd/project-b.sock")
+        late_named.contains("--socket=/run/agentd/project-b.sock")
             && late_named.contains("01JCEXEC"),
         "the history command must carry the socket: {late_named}"
     );
@@ -2705,7 +2705,7 @@ fn the_decide_line_reaches_the_daemon_that_printed_it() {
         ))
         .expect_err("no daemon listens there");
     assert!(
-        unreachable.contains("agentd serve --socket /run/agentd/project-b.sock"),
+        unreachable.contains("agentd serve --socket=/run/agentd/project-b.sock"),
         "the start command must name the socket that failed: {unreachable}"
     );
 }
@@ -3373,6 +3373,86 @@ fn a_capped_listing_walks_the_whole_directory() {
     );
 }
 
+/// What the daemon prints parses back to the socket it printed.
+///
+/// Every follow-up command names the socket, and an operator copies the line.
+/// The value is attached to the flag, because a path may begin with a dash.
+/// `AGENTD_SOCKET=-team.sock` puts the daemon on one. As a separate word,
+/// `clap` reads that value as more options. This argument sets no
+/// `allow_hyphen_values`, and an attached value needs none.
+///
+/// The test is the round trip, and not the spelling. The printed flag goes
+/// back through the real parser, and the path that comes out must be the one
+/// that went in.
+#[test]
+fn a_printed_socket_flag_parses_back_to_the_same_socket() {
+    use clap::Parser;
+
+    /// The words a shell hands to the program, with the quoting removed.
+    ///
+    /// The split is on the spaces OUTSIDE the quotes, so this reads the
+    /// printed line the way a shell reads it. The test asserts nothing about
+    /// how the flag is spelled. A value printed as its own word arrives as
+    /// its own argument, which is the case that fails.
+    fn words(line: &str) -> Vec<String> {
+        let mut out = Vec::new();
+        let mut word = String::new();
+        let mut quoted = false;
+        let mut started = false;
+        for character in line.chars() {
+            match character {
+                '\'' => {
+                    quoted = !quoted;
+                    started = true;
+                }
+                ' ' if !quoted => {
+                    if started {
+                        out.push(std::mem::take(&mut word));
+                        started = false;
+                    }
+                }
+                other => {
+                    word.push(other);
+                    started = true;
+                }
+            }
+        }
+        if started {
+            out.push(word);
+        }
+        out
+    }
+
+    for raw in [
+        "/run/agentd/project-b.sock",
+        "/home/a b/agentd.sock",
+        "-team.sock",
+        "--socket.sock",
+        "./-team.sock",
+        "-",
+    ] {
+        let printed = protocol::socket_flag(Path::new(raw));
+        let mut argv = vec!["agentd".to_string()];
+        argv.extend(words(&printed));
+        argv.push("list".to_string());
+        let cli = crate::Cli::try_parse_from(&argv)
+            .unwrap_or_else(|e| panic!("the printed flag must parse:{printed} -> {e}"));
+        assert_eq!(
+            cli.socket,
+            Path::new(raw),
+            "the parsed socket must be the printed one:{printed}"
+        );
+    }
+
+    // The default socket prints no flag at all, so the common line stays
+    // short. See `protocol::DEFAULT_SOCKET`.
+    assert_eq!(
+        protocol::socket_flag(Path::new(protocol::DEFAULT_SOCKET)),
+        "",
+        "the default socket needs no flag"
+    );
+}
+
 /// A socket path no printed command can carry is refused.
 ///
 /// Being UTF-8 is not enough. Every printed line leaves through `visible`,
@@ -3865,7 +3945,7 @@ fn the_listing_cursor_reaches_the_daemon_that_printed_it() {
         .find(|line| line.contains("--before"))
         .expect("the continuation command is printed");
     assert!(
-        hint.contains("--socket /run/agentd/project-b.sock") && hint.contains("--before 41"),
+        hint.contains("--socket=/run/agentd/project-b.sock") && hint.contains("--before 41"),
         "the continuation command must reach the same daemon: {hint}"
     );
 }

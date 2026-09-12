@@ -110,7 +110,9 @@ exactly that, by counting model calls in each process.
 | `agentd approve <id> <token>` / `deny <id> <token>` | Release or refuse the gated tool call that token names. A decision after the call's deadline is refused, because the session denies that call whatever the answer says. |
 
 The `decide:` line carries `--socket` whenever you chose one, so the command
-you copy reaches the daemon that printed it.
+you copy reaches the daemon that printed it. The value is attached as
+`--socket=<path>`, because a socket path may begin with a dash and a separate
+word would be read as more options.
 
 ### One loop drives and serves, and that bounds how fast it answers
 

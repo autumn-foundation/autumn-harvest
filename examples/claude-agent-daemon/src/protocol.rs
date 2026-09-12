@@ -184,7 +184,12 @@ pub fn socket_flag(socket: &Path) -> String {
     // lossy branch here is unreachable in the binary. It is kept rather than
     // unwrapped for two reasons. A wrong character in a printed command
     // reaches the wrong daemon, and a panic is worse than either.
-    format!(" --socket {}", quoted(&socket.to_string_lossy()))
+    // The value is ATTACHED to the flag. A path may begin with a dash, and
+    // `AGENTD_SOCKET` or `--socket=-team.sock` can put the daemon on one. As
+    // a separate word, `clap` reads `-team.sock` as more options and the
+    // copied command fails before it connects. This argument does not set
+    // `allow_hyphen_values`, and an attached value needs none.
+    format!(" --socket={}", quoted(&socket.to_string_lossy()))
 }
 
 /// One shell word, quoted only when it needs to be.
