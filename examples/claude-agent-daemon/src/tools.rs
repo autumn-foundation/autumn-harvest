@@ -309,11 +309,18 @@ fn resolve(workspace: &Path, relative: &str) -> Result<PathBuf, String> {
 /// name would address no file. Two entries differing only in those bytes
 /// would also collapse into one, and the second would vanish from the walk.
 /// The count says they are there.
+///
+/// A name holding the LINE BREAK this listing is joined with is counted the
+/// same way. One entry named `a\nb` would render as the two lines `a` and
+/// `b`, which is what a directory of `a` and `b` renders as. Neither line
+/// names a file. The cursor of the next page is a line of this listing. One
+/// of those two lines would page the walk onto a name that is not there.
 fn list_files(workspace: &Path, relative: &str, after: Option<&str>) -> Result<String, String> {
     let dir = resolve(workspace, relative)?;
     let mut page: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
     let mut more = false;
     let mut unnamed = 0_usize;
+    let mut split = 0_usize;
     for entry in std::fs::read_dir(&dir).map_err(|e| format!("cannot list `{relative}`: {e}"))? {
         let entry = entry.map_err(|e| format!("cannot list `{relative}`: {e}"))?;
         let raw = entry.file_name();
@@ -321,6 +328,12 @@ fn list_files(workspace: &Path, relative: &str, after: Option<&str>) -> Result<S
             unnamed += 1;
             continue;
         };
+        // The delimiter of the listing cannot appear inside an entry of it.
+        // Such a name is counted, exactly as one that is not text is.
+        if name.contains('\n') {
+            split += 1;
+            continue;
+        }
         let is_dir = entry.file_type().is_ok_and(|t| t.is_dir());
         let shown = if is_dir {
             format!("{name}/")
@@ -349,6 +362,12 @@ fn list_files(workspace: &Path, relative: &str, after: Option<&str>) -> Result<S
         entries.push(format!(
             "... {unnamed} entries are not listed: their names are not text, so this \
              tool cannot name them"
+        ));
+    }
+    if split > 0 {
+        entries.push(format!(
+            "... {split} entries are not listed: their names hold a line break, so a \
+             listing of one name per line cannot name them"
         ));
     }
     if entries.is_empty() {

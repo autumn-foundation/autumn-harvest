@@ -3030,6 +3030,70 @@ fn a_directory_entry_that_is_not_text_is_counted_and_not_named() {
     );
 }
 
+/// A name holding the listing's delimiter is counted, and never rendered.
+///
+/// The listing is one entry per line. A name with a line break in it renders
+/// as two lines, and a directory of `a` and `b` renders as those same two
+/// lines. Neither line names the file.
+///
+/// The cursor of the next page is a line of this listing. Such a line would
+/// also page the walk onto a name that does not exist. The entry is counted
+/// instead.
+#[test]
+fn a_directory_entry_holding_a_line_break_is_counted_and_not_named() {
+    let dir = tempfile::tempdir().expect("a temporary directory");
+    let workspace = dir.path().join("workspace");
+    std::fs::create_dir_all(&workspace).expect("the workspace is created");
+    std::fs::write(workspace.join("a\nb"), "x").expect("a name with a line break");
+
+    let body = tools::activity_body(workspace.clone());
+    let listing = |path: &str| -> String {
+        let raw = body(tool_request(
+            &workspace,
+            tools::TOOL_LIST_FILES,
+            json!({ "path": path }),
+        ))
+        .expect("a tool failure is a result, not an activity error");
+        let outcome: ToolOutcome = serde_json::from_value(raw).expect("the outcome decodes");
+        assert!(
+            !outcome.is_error,
+            "the listing must succeed: {}",
+            outcome.output
+        );
+        outcome.output
+    };
+
+    // EVERY line that names an entry names one that is there. The two halves
+    // of the broken name would each fail this.
+    let output = listing(".");
+    for line in output.lines().filter(|line| !line.starts_with("... ")) {
+        assert!(
+            workspace.join(line).symlink_metadata().is_ok(),
+            "the listing named `{line}`, which is not an entry: {output}"
+        );
+    }
+    assert!(
+        output.contains("1 entries are not listed"),
+        "the entry must be counted: {output}"
+    );
+    assert!(
+        !output.lines().any(|line| line == "a" || line == "b"),
+        "neither half of the name may be rendered: {output}"
+    );
+
+    // A real entry beside it is still listed, and the count still holds.
+    std::fs::write(workspace.join("a"), "x").expect("a plain name");
+    let output = listing(".");
+    assert!(
+        output.lines().any(|line| line == "a"),
+        "a nameable entry is still listed: {output}"
+    );
+    assert!(
+        output.contains("1 entries are not listed"),
+        "the unnameable entry is still counted: {output}"
+    );
+}
+
 /// A capped directory listing reaches every entry.
 ///
 /// `read_dir` gives no order, so a truncated READ returns an arbitrary subset
