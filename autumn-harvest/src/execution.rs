@@ -583,6 +583,12 @@ pub(crate) async fn enforce_quota_admission(
 /// [`GateMode`](crate::admission_gate::GateMode) selects the cache read (fail-closed
 /// `Check` for fresh admissions, snapshot-only `CheckCached` for continuation).
 ///
+/// The quota key (declared [`crate::quota::QuotaPolicy`] key expression) is
+/// always resolved against `request.input`. See
+/// [`start_or_load_workflow_execution_collect_with_codecs_and_quota_override`]
+/// for the crate-private variant [`crate::event_batch`] uses to override
+/// that (Codex review, issue #1230 Finding 1 follow-up).
+///
 /// # Errors
 ///
 /// - [`HarvestError::AlreadyExists`] when `RejectDuplicate` rejects.
@@ -625,7 +631,6 @@ pub async fn start_or_load_workflow_execution_collect(
 /// # Errors
 ///
 /// Same as [`start_or_load_workflow_execution_collect`].
-#[allow(clippy::too_many_lines, clippy::too_many_arguments)]
 pub async fn start_or_load_workflow_execution_collect_with_codecs(
     conn: &mut AsyncPgConnection,
     request: StartWorkflowParams<'_>,
@@ -633,6 +638,57 @@ pub async fn start_or_load_workflow_execution_collect_with_codecs(
     reject_fresh_if_debounced: bool,
     metrics: Option<&(dyn crate::telemetry::MetricsRecorder + Send + Sync)>,
     gate: Option<crate::admission_gate::GateMode>,
+    codecs: &crate::payload_codec::PayloadCodecs,
+) -> HarvestResult<(
+    StartedWorkflowExecution,
+    Vec<DeferredTriggerStart>,
+    Vec<(ExecutionId, String)>,
+    Vec<StartCancelledRun>,
+)> {
+    start_or_load_workflow_execution_collect_with_codecs_and_quota_override(
+        conn,
+        request,
+        in_outer_transaction,
+        reject_fresh_if_debounced,
+        metrics,
+        gate,
+        None,
+        codecs,
+    )
+    .await
+}
+
+/// [`start_or_load_workflow_execution_collect_with_codecs`], with an extra
+/// `quota_key_input_override` parameter. Crate-private: exposing this on
+/// the public API would let an external embedder pass an arbitrary value,
+/// e.g. `Some(&json!({}))`. That could make quota key resolution silently
+/// return `None` for a request whose real `input` resolves one. Every
+/// declared cap on that request would then go unenforced (Codex review,
+/// issue #1230 Finding 1 follow-up). Only [`crate::event_batch`] calls
+/// this directly; every other caller goes through the public,
+/// override-free wrapper above.
+///
+/// `quota_key_input_override`, when `Some`, is resolved against instead of
+/// `request.input` for the declared [`crate::quota::QuotaPolicy`]'s key
+/// expression (issue #1230 Finding 1). A batched fire's `request.input` is
+/// the whole merged array of every admitted payload. That is not the
+/// single admission a quota key expression is meant to resolve against.
+/// `event_batch.rs` passes the first buffered payload here instead. Every
+/// other caller passes `None`, so `request.input` resolves the key exactly
+/// as before this parameter existed.
+///
+/// # Errors
+///
+/// Same as [`start_or_load_workflow_execution_collect`].
+#[allow(clippy::too_many_lines, clippy::too_many_arguments)]
+pub(crate) async fn start_or_load_workflow_execution_collect_with_codecs_and_quota_override(
+    conn: &mut AsyncPgConnection,
+    request: StartWorkflowParams<'_>,
+    in_outer_transaction: bool,
+    reject_fresh_if_debounced: bool,
+    metrics: Option<&(dyn crate::telemetry::MetricsRecorder + Send + Sync)>,
+    gate: Option<crate::admission_gate::GateMode>,
+    quota_key_input_override: Option<&serde_json::Value>,
     codecs: &crate::payload_codec::PayloadCodecs,
 ) -> HarvestResult<(
     StartedWorkflowExecution,
@@ -729,8 +785,31 @@ pub async fn start_or_load_workflow_execution_collect_with_codecs(
                     .and_then(|map| map.get(request.workflow_name))
                     .and_then(|meta| meta.quota)
             });
-    let quota_key: Option<String> =
-        quota_policy.and_then(|p| crate::quota::resolve_quota_key(p.key_expr, &request.input));
+    // Resolve against `quota_key_input_override` when the caller supplies
+    // one, not `request.input` (issue #1230 Finding 1). `event_batch.rs`
+    // merges every buffered admission's payload into one JSON array before
+    // calling this function. So `request.input` is that merged array, not
+    // an object, for a batched-start fire. `resolve_quota_key` requires an
+    // object at the first path segment. It returned `None` for that array.
+    // That silently skipped all three quota dimensions for EVERY batched
+    // execution. `event_batch.rs` now passes the FIRST buffered payload
+    // (a plain object) as the override, restoring enforcement. See
+    // `event_batch.rs`'s call sites for the first-admission-wins rationale.
+    //
+    // This is an explicit override, not a peek into `request.input`
+    // itself. A direct (non-batched) start's `input` is caller-controlled
+    // application data. Nothing in this crate requires it to be an
+    // object. Peeking into a top-level array there would silently change
+    // quota resolution for any embedder whose workflow legitimately takes
+    // an array as its input. This fix must not do that. Only
+    // `event_batch.rs`'s own known-shape aggregate is ever unwrapped this
+    // way.
+    let quota_key: Option<String> = quota_policy.and_then(|p| {
+        crate::quota::resolve_quota_key(
+            p.key_expr,
+            quota_key_input_override.unwrap_or(&request.input),
+        )
+    });
     // A resolved key is stamped onto the row for EVERY admission that has
     // one -- including a retry-exempt admission below, which still tags its
     // row for future usage accounting -- so this bound must be checked
