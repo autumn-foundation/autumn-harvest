@@ -35,6 +35,7 @@ mod tools;
 #[cfg(test)]
 mod tests;
 
+use std::fmt::Write as _;
 use std::path::PathBuf;
 use std::process::ExitCode;
 use std::time::Duration;
@@ -270,9 +271,53 @@ async fn run(cli: Cli) -> Result<(), String> {
 ///
 /// `println!` panics once stdout is closed, so `agentd history … | head` would
 /// end in a backtrace instead of a clean exit.
+///
+/// Every line this command prints goes through here, so [`visible`] is applied
+/// once, at the sink, rather than at each place that formats model text.
 fn line(text: &str) {
     use std::io::Write;
-    drop(writeln!(std::io::stdout(), "{text}"));
+    drop(writeln!(std::io::stdout(), "{}", visible(text)));
+}
+
+/// Show a character a terminal would obey, instead of obeying it.
+///
+/// The model writes into this output: the answer, a tool name, a tool
+/// argument. A file in the workspace can tell the model what to write, so all
+/// of it is untrusted. An escape sequence would rewrite the display an
+/// operator reads a pending call from, and `OSC 52` would write their
+/// clipboard. The operator approves a call from what this prints.
+///
+/// A newline and a tab are kept. An answer uses them for layout, and neither
+/// one moves the cursor back over text that is already written. A carriage
+/// return is NOT kept: it returns to the start of the line, and what follows
+/// overwrites what the operator already read.
+///
+/// The bidirectional overrides are escaped as well. They obey nothing, but
+/// they reorder what is displayed, so a path can be shown as a different path.
+/// The other format characters are left alone, because a joiner is part of
+/// ordinary text.
+///
+/// The characters are shown, not removed. An operator can then see what
+/// arrived, rather than a tidied version of it.
+fn visible(text: &str) -> std::borrow::Cow<'_, str> {
+    if !text.chars().any(is_obeyed) {
+        return std::borrow::Cow::Borrowed(text);
+    }
+    let mut shown = String::with_capacity(text.len());
+    for character in text.chars() {
+        if is_obeyed(character) {
+            let _ = write!(shown, "\\u{{{:04x}}}", character as u32);
+        } else {
+            shown.push(character);
+        }
+    }
+    std::borrow::Cow::Owned(shown)
+}
+
+/// Would a terminal act on this character rather than print it?
+fn is_obeyed(character: char) -> bool {
+    let bidi = matches!(character, '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}');
+    bidi || (character.is_control() && character != '\n' && character != '\t')
 }
 
 /// Print one answer from the daemon.
@@ -305,23 +350,41 @@ fn report(response: Response) -> Result<(), String> {
 
 /// Print one session in a stable, greppable shape.
 fn print_session(view: &SessionView) {
-    line(&format!("{}  {}", view.execution_id, view.state));
-    line(&format!("  goal:    {}", view.goal));
+    for text in session_lines(view) {
+        line(&text);
+    }
+}
+
+/// Render one session as the lines an operator reads.
+///
+/// The lines are built here, apart from the printing, so a test can read what
+/// the operator would see. This view carries the model's own words, and the
+/// operator approves a pending call from it, so every line leaves through
+/// [`visible`].
+fn session_lines(view: &SessionView) -> Vec<String> {
+    let mut lines = vec![
+        format!("{}  {}", view.execution_id, view.state),
+        format!("  goal:    {}", view.goal),
+    ];
     if let Some(blocked) = &view.blocked_on {
-        line(&format!("  blocked: {blocked}"));
+        lines.push(format!("  blocked: {blocked}"));
     }
     if let Some(pending) = &view.pending {
-        line(&format!("  pending: {} ({})", pending.tool, pending.id));
-        line(&format!("           {}", pending.input));
-        line(&format!(
+        lines.push(format!("  pending: {} ({})", pending.tool, pending.id));
+        lines.push(format!("           {}", pending.input));
+        lines.push(format!(
             "  decide:  agentd approve {} {}   (or `deny`)",
             view.execution_id, pending.token
         ));
     }
     if let Some(answer) = &view.answer {
-        line(&format!("  answer:  {answer}"));
+        lines.push(format!("  answer:  {answer}"));
     }
     if let Some(error) = &view.error {
-        line(&format!("  error:   {error}"));
+        lines.push(format!("  error:   {error}"));
     }
+    lines
+        .into_iter()
+        .map(|text| visible(&text).into_owned())
+        .collect()
 }

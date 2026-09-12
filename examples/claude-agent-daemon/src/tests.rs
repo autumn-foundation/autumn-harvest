@@ -1477,6 +1477,80 @@ async fn a_daemon_refuses_a_session_it_cannot_read() {
 }
 
 #[test]
+fn model_text_cannot_drive_the_terminal() {
+    // A file in the workspace can tell the model what to answer, so the
+    // answer is untrusted. The operator reads a pending call from this
+    // output and approves it.
+    let clearing = crate::visible("done\u{1b}[2K\u{1b}[1A");
+    assert!(
+        !clearing.contains('\u{1b}'),
+        "an escape must not reach the terminal: {clearing}"
+    );
+    assert!(
+        clearing.contains("\\u{001b}"),
+        "the escape must be shown instead: {clearing}"
+    );
+
+    // OSC 52 writes the operator's clipboard.
+    let clipboard = crate::visible("\u{1b}]52;c;cm0K\u{7}");
+    assert!(
+        !clipboard.contains('\u{1b}') && !clipboard.contains('\u{7}'),
+        "a clipboard sequence must not reach the terminal: {clipboard}"
+    );
+
+    // A carriage return overwrites the line the operator already read.
+    let overwrite = crate::visible("safe.md\rmalicious.md");
+    assert!(
+        !overwrite.contains('\r'),
+        "a carriage return must not reach the terminal: {overwrite}"
+    );
+
+    // An override reorders what is displayed, so one path reads as another.
+    let reordered = crate::visible("notes\u{202e}gnp.md");
+    assert!(
+        !reordered.contains('\u{202e}'),
+        "a bidirectional override must not reach the terminal: {reordered}"
+    );
+
+    // An answer keeps its own layout, and ordinary text is untouched.
+    let answer = "line one\nline two\n\tindented 👩‍💻 done";
+    assert_eq!(
+        crate::visible(answer),
+        answer,
+        "a newline, a tab and a joiner are part of the answer"
+    );
+
+    // The status view is the thing an operator reads before approving, and
+    // every field of it carries the model's own words.
+    let view = protocol::SessionView {
+        execution_id: "01JCEXEC".to_string(),
+        goal: "tidy the notes\u{1b}[31m".to_string(),
+        state: "RUNNING".to_string(),
+        blocked_on: Some("a tool approval\r".to_string()),
+        pending: Some(protocol::PendingCall {
+            token: "tool_approval:1:0:toolu_a".to_string(),
+            id: "toolu_a".to_string(),
+            tool: "write_file\u{1b}[2K".to_string(),
+            input: "{\"path\":\"notes\u{202e}gnp.md\"}".to_string(),
+        }),
+        answer: Some("done\u{1b}]52;c;cm0K\u{7}".to_string()),
+        error: None,
+    };
+    for rendered in crate::session_lines(&view) {
+        assert!(
+            !rendered
+                .chars()
+                .any(|c| c.is_control() && c != '\n' && c != '\t'),
+            "a printed line must carry no control character: {rendered:?}"
+        );
+        assert!(
+            !rendered.contains('\u{202e}'),
+            "a printed line must carry no override: {rendered:?}"
+        );
+    }
+}
+
+#[test]
 fn a_key_of_whitespace_is_not_a_key() {
     // A key of whitespace would count as present, and the daemon would run
     // live against it. Every turn would fail at the API. An absent key runs
