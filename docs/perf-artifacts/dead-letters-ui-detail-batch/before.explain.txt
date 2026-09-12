@@ -1,0 +1,27 @@
+-- OLD: one workflow_name lookup, per row --
+                                                                          QUERY PLAN                                                                           
+---------------------------------------------------------------------------------------------------------------------------------------------------------------
+ Index Scan using harvest_workflow_executions_pkey on harvest_workflow_executions  (cost=0.14..8.16 rows=1 width=32) (actual time=0.030..0.030 rows=1 loops=1)
+   Index Cond: (id = '0000d579-9868-43f8-b056-d1235472e97e'::uuid)
+   Buffers: shared hit=2
+ Planning:
+   Buffers: shared hit=752
+ Planning Time: 1.428 ms
+ Execution Time: 0.049 ms
+(7 rows)
+
+
+-- OLD: one last-10-events lookup, per row --
+                                                                         QUERY PLAN                                                                         
+------------------------------------------------------------------------------------------------------------------------------------------------------------
+ Limit  (cost=0.28..22.15 rows=10 width=95) (actual time=0.026..0.029 rows=10 loops=1)
+   Buffers: shared hit=3
+   ->  Index Scan Backward using idx_harvest_events_exec on harvest_events  (cost=0.28..100.89 rows=46 width=95) (actual time=0.025..0.027 rows=10 loops=1)
+         Index Cond: (workflow_exec_id = '0000d579-9868-43f8-b056-d1235472e97e'::uuid)
+         Buffers: shared hit=3
+ Planning:
+   Buffers: shared hit=286
+ Planning Time: 0.690 ms
+ Execution Time: 0.069 ms
+(9 rows)
+
