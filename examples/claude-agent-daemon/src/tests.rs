@@ -4336,6 +4336,89 @@ fn a_status_that_cannot_read_a_reply_says_so() {
     );
 }
 
+/// An error in the wrong storage class is no error the listing can show.
+///
+/// `error` is a plain column, so the guard the JSON columns carry did not
+/// look at it. A BLOB holding valid UTF-8 was cast and decoded as though it
+/// were an ordinary failure reason. The listing then showed a genuine-looking
+/// one for a row `status` refuses to read at all.
+///
+/// The single status ABORTS on that row rather than degrading. That is the
+/// right boundary there. The operator named one row, and the error names
+/// exactly the row they asked for. The listing has to hold every other
+/// session, so it degrades instead.
+#[test]
+fn a_listed_error_in_the_wrong_storage_class_reads_as_nothing() {
+    let dir = tempfile::tempdir().expect("a temporary directory");
+    let db = dir.path().join("error-class.db");
+    let writer = rusqlite::Connection::open(&db).expect("the database opens");
+    fixture_table(&writer);
+    writer
+        .execute(
+            "INSERT INTO harvest_executions \
+             VALUES ('text-error', ?1, 'FAILED', ?2, NULL, 'it broke')",
+            rusqlite::params![WORKFLOW_NAME, READABLE_TASK],
+        )
+        .expect("the readable failure is recorded");
+    writer
+        .execute(
+            "INSERT INTO harvest_executions \
+             VALUES ('blob-error', ?1, 'FAILED', ?2, NULL, CAST('it broke' AS BLOB))",
+            rusqlite::params![WORKFLOW_NAME, READABLE_TASK],
+        )
+        .expect("the blob failure is recorded");
+
+    // The same bytes in both rows, and only the class differs.
+    let class = |exec: &str| -> String {
+        writer
+            .query_row(
+                "SELECT typeof(error) FROM harvest_executions WHERE exec_id = ?1",
+                [exec],
+                |row| row.get(0),
+            )
+            .expect("the class answers")
+    };
+    assert_eq!(class("text-error"), "text", "the readable row is TEXT");
+    assert_eq!(
+        class("blob-error"),
+        "blob",
+        "a TEXT column keeps a stored BLOB in that class"
+    );
+    drop(writer);
+
+    let reader = inspect::open(&db).expect("the reader opens");
+
+    // The single status refuses the blob row, and the listing must not claim
+    // to have read what that path cannot.
+    assert!(
+        inspect::execution(&reader, WORKFLOW_NAME, "blob-error").is_err(),
+        "the single status refuses this row"
+    );
+
+    let listed = inspect::executions(&reader, WORKFLOW_NAME, None).expect("the listing answers");
+    assert_eq!(listed.len(), 2, "both rows are still named");
+    assert_eq!(
+        listed_row(&listed, "text-error").error.as_deref(),
+        Some("it broke"),
+        "an error in the right class still reads"
+    );
+    let damaged = listed_row(&listed, "blob-error");
+    assert!(
+        damaged.error.is_none(),
+        "an error the single status cannot read is listed as none: {damaged:?}"
+    );
+    assert_eq!(
+        damaged.goal.as_deref(),
+        Some("summarise it"),
+        "the readable fields of that row are still read"
+    );
+    assert_eq!(
+        damaged.state.as_deref(),
+        Some("FAILED"),
+        "and the row still says it failed"
+    );
+}
+
 /// One listed session, by id.
 fn listed_row<'a>(
     listed: &'a [inspect::SessionSummary],

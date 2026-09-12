@@ -717,7 +717,7 @@ pub const SESSIONS_QUERY: &str = "SELECT \
                           AND json_type(output_json, '$.answer') = 'text' \
                          THEN coalesce(substr(cast(json_extract(output_json, '$.answer') \
                                                    as blob), 1, ?3), zeroblob(0)) END, \
-                    CASE WHEN error IS NOT NULL \
+                    CASE WHEN typeof(error) = 'text' \
                          THEN coalesce(substr(cast(error as blob), 1, ?3), \
                                        zeroblob(0)) END, \
                     rowid \
