@@ -13,25 +13,36 @@
 //!
 //! 1. No index served `event_type = 'External<X>Requested'`, so the outer
 //!    scan read every row of the largest table in the engine to return one.
-//! 2. The paired `NOT EXISTS` resolution check is costed from a row estimate
-//!    that swings across the outbox's own draining range. An index on the
-//!    outer predicate alone moves that estimate rather than removing it, so
-//!    the planner can abandon the new index for a `Seq Scan` again.
+//! 2. The paired `NOT EXISTS` resolution check was unindexed too, and it
+//!    costs more. It is correlated per execution, so each probe re-read every
+//!    event of the owning execution.
 //!
 //! The fix pairs four partial indexes
 //! (`20260911213344_harvest_external_outbox_scan_indexes`) with a query
-//! rewrite that pins every join to its correlated form. Each test below
-//! guards one half, because each half alone is a regression. The rewrite
-//! without the indexes measured 5.4x worse than doing nothing.
+//! rewrite that pins the outer scan and the executions join. The indexes do
+//! most of the work. The rewrite matters when the planner's row estimate goes
+//! stale, which is what a drained outage backlog leaves behind.
 //!
-//! - [`outbox_claim_plans_are_index_only`] and
-//!   [`outbox_claim_plans_survive_a_stale_row_estimate`] guard the plan.
+//! Which gate covers which half is worth stating, because they are not
+//! symmetric:
+//!
+//! - [`outbox_claim_plans_are_index_only`] gates the MIGRATION. The legacy
+//!   query also produces an all-index plan once these indexes exist, so this
+//!   one passes with the rewrite reverted. Its `Anti Join` assertion is the
+//!   exception, and guards one specific regression the rewrite could
+//!   reintroduce.
+//! - [`outbox_claim_plans_survive_a_stale_row_estimate`] gates the REWRITE.
+//!   With the rewrite reverted the legacy form degrades to a `Seq Scan` here.
 //! - [`outbox_claim_queries_match_the_legacy_anti_join`] guards the result
 //!   set, against the exact SQL this rewrite replaced.
 //! - [`outbox_claim_returns_the_oldest_pending_request_first`] guards the
 //!   drain order the `ORDER BY` pin also buys.
 //! - [`zz_capture_external_outbox_scan_evidence`] is `#[ignore]`d and
 //!   regenerates `docs/perf-artifacts/external-outbox-scan/`.
+//!
+//! `timeout::tests` carries two DB-free gates on the same queries. They cover
+//! the defect class a template introduces: a transposed event type, or a
+//! correlation key borrowed from another family.
 
 use std::fmt::Write as _;
 
@@ -44,6 +55,7 @@ use autumn_harvest::timeout::{
     external_signal_outbox_claim_query,
 };
 
+use crate::claim_bench_support::db as claim_bench_db;
 use crate::integration_e2e::setup_test_database_url_or_env;
 
 /// Shard every fixture row belongs to.
@@ -109,8 +121,7 @@ const FAMILIES: [OutboxFamily; 3] = [
 
 #[derive(QueryableByName, Debug)]
 struct PlanLine {
-    #[diesel(sql_type = Text)]
-    #[diesel(column_name = "QUERY PLAN")]
+    #[diesel(sql_type = Text, column_name = "QUERY PLAN")]
     line: String,
 }
 
@@ -190,7 +201,38 @@ async fn seed_event(
     .load(conn)
     .await
     .expect("seed event");
-    rows[0].id
+    rows.into_iter()
+        .next()
+        .map(|r| r.id)
+        .expect("INSERT ... RETURNING yields one row")
+}
+
+/// Append one event with an explicit `timestamp` expression.
+///
+/// `timestamp_sql` is SQL, not a literal, so a caller can seed a row whose
+/// append order and request order disagree.
+async fn seed_event_at(
+    conn: &mut AsyncPgConnection,
+    exec_id: uuid::Uuid,
+    event_id: i32,
+    event_type: &str,
+    data: &str,
+    timestamp_sql: &str,
+) -> i64 {
+    let rows: Vec<EventId> = diesel::sql_query(format!(
+        "INSERT INTO harvest_events (workflow_exec_id, event_id, event_type, event_data, timestamp) \
+         VALUES ('{exec_id}', {event_id}, '{event_type}', \
+                 jsonb_build_object('type', '{event_type}', 'data', '{data}'::jsonb), \
+                 {timestamp_sql}) \
+         RETURNING id"
+    ))
+    .load(conn)
+    .await
+    .expect("seed event");
+    rows.into_iter()
+        .next()
+        .map(|r| r.id)
+        .expect("INSERT ... RETURNING yields one row")
 }
 
 async fn analyze(conn: &mut AsyncPgConnection) {
@@ -218,8 +260,6 @@ async fn plan_gate_db() -> claim_bench_db::BenchDb {
     })
 }
 
-use crate::claim_bench_support::db as claim_bench_db;
-
 // ---------------------------------------------------------------------------
 // Query-text helpers
 // ---------------------------------------------------------------------------
@@ -229,9 +269,16 @@ use crate::claim_bench_support::db as claim_bench_db;
 /// `EXPLAIN` on a parameterised statement can report a generic plan, which is
 /// not the plan the scanner runs. Literals measure the real one.
 fn with_literal_binds(sql: &str, shards: &[i32], excluded: &[i64]) -> String {
-    let list = |values: &[String]| values.join(",");
-    let shard_list = list(&shards.iter().map(ToString::to_string).collect::<Vec<_>>());
-    let excluded_list = list(&excluded.iter().map(ToString::to_string).collect::<Vec<_>>());
+    let shard_list = shards
+        .iter()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>()
+        .join(",");
+    let excluded_list = excluded
+        .iter()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>()
+        .join(",");
     sql.replace("$1", &format!("'{{{shard_list}}}'::int[]"))
         .replace("$2", &format!("'{{{excluded_list}}}'::bigint[]"))
 }
@@ -242,8 +289,8 @@ fn with_literal_binds(sql: &str, shards: &[i32], excluded: &[i64]) -> String {
 /// The equivalence gate compares sets. `LIMIT 1` compares one row, which two
 /// queries can agree on while disagreeing about every other row.
 ///
-/// The cut is the LAST `LIMIT 1`: the rewritten query also carries one inside
-/// each `LATERAL`, and those are part of the predicate rather than the tail.
+/// The cut is the LAST `LIMIT 1`. The rewritten query also carries one inside
+/// each `LATERAL`. Those belong to the predicate, not to the tail.
 fn as_full_result_set(sql: &str) -> String {
     const TAIL: &str = "FOR UPDATE OF e SKIP LOCKED";
     let cut = sql
@@ -261,8 +308,8 @@ fn as_full_result_set(sql: &str) -> String {
 /// The claim query as it stood before issue #1486.
 ///
 /// This is the equivalence oracle. A rewrite that changes which rows the
-/// scanner claims is a behaviour change, not an optimisation, so the new SQL
-/// is compared against the replaced text rather than against a hand-listed
+/// scanner claims is a behaviour change, not an optimisation. So the new SQL
+/// is compared against the replaced text, and not against a hand-listed
 /// expectation.
 fn legacy_claim_query(family: &OutboxFamily) -> String {
     let OutboxFamily {
@@ -391,6 +438,21 @@ async fn outbox_claim_plans_are_index_only() {
             !plan.contains("Materialize"),
             "{tag}: the resolution check must stay correlated, not materialised\n{plan}"
         );
+        // The resolution check must remain an anti-join, and this is the one
+        // assertion that is about cost rather than correctness.
+        //
+        // `harvest_events` is append-only, so a resolved request stays in the
+        // pending index and every later claim walks past it. An anti-join
+        // lets the planner discard such a row before the executions probe,
+        // which then runs once. Written as an outer join the check cannot be
+        // reordered, so both probes run for every discarded row. An earlier
+        // revision of this change did exactly that, and measured twice the
+        // buffers over a backlog of 8,000 resolved requests.
+        assert!(
+            plan.contains("Anti Join"),
+            "{tag}: the resolution check must be an anti-join, so a discarded \
+             candidate does not also pay the executions probe\n{plan}"
+        );
         assert!(
             !plan.contains("Sort"),
             "{tag}: the index must supply the order, so no sort is needed\n{plan}"
@@ -403,15 +465,23 @@ async fn outbox_claim_plans_are_index_only() {
 /// This is the failure mode the issue measured, from a cause a deployment
 /// meets in practice. An outage fills the outbox, `ANALYZE` records the
 /// backlog, and the backlog drains. The stored estimate is then orders of
-/// magnitude above the truth, and a plan that depends on it reverts to a
-/// `Seq Scan`, or walks `harvest_events_pkey` filtering every unrelated event.
-/// The `ORDER BY e.timestamp, e.id` pin removes the dependency: no other
-/// index supplies that order, so every competing plan needs a sort, and a
-/// sort under `LIMIT 1` must read every candidate before returning one.
+/// magnitude above the truth. A plan that depends on it reverts to a `Seq
+/// Scan`, or walks `harvest_events_pkey` and filters every unrelated event.
+///
+/// The `ORDER BY e.timestamp, e.id` pin removes the dependency. No other
+/// index supplies that order, so every competing plan needs a sort. A sort
+/// under `LIMIT 1` must read every candidate before it returns one.
 #[tokio::test]
 async fn outbox_claim_plans_survive_a_stale_row_estimate() {
     let bench = plan_gate_db().await;
     let mut conn = claim_bench_db::connect(&bench.url).await;
+
+    // This gate deletes about 12,000 rows, then reads the plan the STALE
+    // statistics produce. Autoanalyze would refresh them mid-test, so turn it
+    // off rather than race it.
+    conn.batch_execute("ALTER TABLE harvest_events SET (autovacuum_enabled = false)")
+        .await
+        .expect("pin the statistics this gate is about");
 
     seed_bulk_history(&mut conn, "outbox_stale_wf", BULK_EXECUTIONS).await;
 
@@ -585,9 +655,10 @@ async fn seed_equivalence_cases(
 
 /// The rewritten query selects exactly the rows the legacy anti-join did.
 ///
-/// The fixture covers every predicate the rewrite touches, including the two
-/// the issue named as needing their own correctness review: the `NOT EXISTS`
-/// NULL semantics, and the per-execution correlation of the resolution check.
+/// The fixture covers every predicate the rewrite touches. That includes the
+/// two the issue named as needing their own correctness review: the `NOT
+/// EXISTS` NULL semantics, and the per-execution correlation of the
+/// resolution check.
 #[tokio::test]
 async fn outbox_claim_queries_match_the_legacy_anti_join() {
     let (database_url, _container) = setup_test_database_url_or_env().await;
@@ -601,6 +672,14 @@ async fn outbox_claim_queries_match_the_legacy_anti_join() {
 
     for family in &FAMILIES {
         let tag = family.requested;
+        // The oracle is a hand-copy of the replaced SQL. If the shipped query
+        // ever returns to that text, comparing the two proves nothing.
+        assert_ne!(
+            (family.query)(),
+            legacy_claim_query(family),
+            "{tag}: the shipped query is identical to the pre-#1486 oracle -- \
+             update `legacy_claim_query` before trusting this comparison"
+        );
         let cases = seed_equivalence_cases(&mut conn, family, &suffix).await;
 
         let legacy = as_full_result_set(&with_literal_binds(
@@ -625,6 +704,18 @@ async fn outbox_claim_queries_match_the_legacy_anti_join() {
             rewritten_ids, cases.expected,
             "{tag}: unexpected row set, so both queries agree on the wrong answer"
         );
+
+        // Remove the fixture. These are live `External*Requested` rows on
+        // RUNNING executions. Left behind on a shared
+        // `HARVEST_TEST_DATABASE_URL`, they give every other suite's outbox
+        // sweep a permanent candidate it cannot decode. The foreign key
+        // cascade takes the events with the executions.
+        conn.batch_execute(&format!(
+            "DELETE FROM harvest_workflow_executions WHERE workflow_name = '{}'",
+            cases.scope
+        ))
+        .await
+        .expect("clean up the equivalence fixture");
     }
 }
 
@@ -638,6 +729,12 @@ async fn outbox_claim_queries_match_the_legacy_anti_join() {
 /// drain order. `timestamp` is the request instant and `id` breaks ties, so
 /// the oldest pending request goes first and a backlog cannot be starved by
 /// newer arrivals.
+///
+/// The fixture appends one request LAST that carries the OLDEST timestamp.
+/// Without that row every order in play agrees. Append order, `id` order,
+/// `timestamp` order and heap order are then the same, so the test passes
+/// against an unordered query and proves nothing. That row separates them,
+/// and it must be claimed first.
 ///
 /// Runs against an isolated database, because it reads what the real
 /// `LIMIT 1` claim returns. On a shared database that row can belong to
@@ -653,33 +750,62 @@ async fn outbox_claim_returns_the_oldest_pending_request_first() {
         let scope = format!("outbox_order_{tag}");
         let exec = seed_execution(&mut conn, &scope, &scope, "RUNNING", SHARD_ID).await;
 
-        let mut appended = Vec::new();
-        for n in 1..=5 {
-            appended.push(
-                seed_event(&mut conn, exec, n, tag, &format!("{{\"{key}\": \"q{n}\"}}")).await,
-            );
+        // Appended first, and newest. Each carries the label the resolution
+        // marker must repeat, so a claim can be resolved by id lookup.
+        let mut seeded: Vec<(i64, String)> = Vec::new();
+        for n in 1..=4 {
+            let label = format!("q{n}");
+            let id = seed_event_at(
+                &mut conn,
+                exec,
+                n,
+                tag,
+                &format!("{{\"{key}\": \"{label}\"}}"),
+                &format!("NOW() - INTERVAL '{} minutes'", 5 - n),
+            )
+            .await;
+            seeded.push((id, label));
         }
+        // Appended last, and oldest. This is the row that makes the test mean
+        // something: the highest `id`, and the lowest timestamp.
+        let oldest = seed_event_at(
+            &mut conn,
+            exec,
+            5,
+            tag,
+            &format!("{{\"{key}\": \"q5\"}}"),
+            "NOW() - INTERVAL '30 minutes'",
+        )
+        .await;
+        seeded.insert(0, (oldest, "q5".to_string()));
+        let expected: Vec<i64> = seeded.iter().map(|(id, _)| *id).collect();
 
         // Drain one claim at a time, marking each claim resolved exactly as
         // the scanner does.
         let mut drained = Vec::new();
         for n in 1..=5 {
             let sql = with_literal_binds((family.query)(), &[SHARD_ID], &[]);
-            let claimed = claim_one(&mut conn, &sql).await;
-            drained.push(claimed.unwrap_or_else(|| panic!("{tag}: the outbox drained early")));
+            let claimed = claim_one(&mut conn, &sql)
+                .await
+                .unwrap_or_else(|| panic!("{tag}: the outbox drained early"));
+            let label = seeded.iter().find(|(id, _)| *id == claimed).map_or_else(
+                || panic!("{tag}: claimed an event the fixture never seeded"),
+                |(_, label)| label.clone(),
+            );
+            drained.push(claimed);
             seed_event(
                 &mut conn,
                 exec,
                 100 + n,
                 family.resolved[0],
-                &format!("{{\"{key}\": \"q{n}\"}}"),
+                &format!("{{\"{key}\": \"{label}\"}}"),
             )
             .await;
         }
 
         assert_eq!(
-            drained, appended,
-            "{tag}: the outbox must drain in append order"
+            drained, expected,
+            "{tag}: the outbox must drain oldest request first"
         );
         assert!(
             claim_one(
@@ -745,6 +871,12 @@ async fn zz_capture_external_outbox_scan_evidence() {
         .ok();
 
     let family = &FAMILIES[0];
+    assert_ne!(
+        (family.query)(),
+        legacy_claim_query(family),
+        "the before leg replays the pre-#1486 oracle; it is now identical to \
+         the shipped query, so this capture would compare nothing"
+    );
     seed_evidence_fixture(&mut conn).await;
 
     // `setup_bench_db` runs every migration, so the four indexes already
@@ -834,12 +966,20 @@ async fn seed_evidence_fixture(conn: &mut AsyncPgConnection) {
 ///
 /// The before capture drains the outbox and appends a delivery marker per
 /// request. The after capture has to start from the same place.
+///
+/// The `DELETE` is scoped to this fixture's own workflow names. Only the
+/// evidence capture calls this, and only against the throwaway database
+/// `setup_bench_db` provisions. An unscoped delete of three event types
+/// would be destructive if that ever changed.
 async fn reset_evidence_outbox(conn: &mut AsyncPgConnection, family: &OutboxFamily) {
     let types = [family.requested, family.resolved[0], family.resolved[1]]
         .map(|t| format!("'{t}'"))
         .join(", ");
     conn.batch_execute(&format!(
-        "DELETE FROM harvest_events WHERE event_type IN ({types}); \
+        "DELETE FROM harvest_events e USING harvest_workflow_executions x \
+         WHERE x.id = e.workflow_exec_id \
+           AND x.workflow_name IN ('outbox_evidence_wf', 'outbox_evidence_done_wf') \
+           AND e.event_type IN ({types}); \
          INSERT INTO harvest_events (workflow_exec_id, event_id, event_type, event_data, timestamp) \
          SELECT e.id, 900000, '{requested}', \
                 jsonb_build_object('type', '{requested}', \
@@ -882,9 +1022,11 @@ async fn capture_drain(
     .expect("reset statement statistics for this database");
 
     let mut resolved = Vec::new();
-    loop {
+    // Bounded, so a marker that stops resolving its own claim fails loudly
+    // instead of spinning.
+    for _ in 0..EVIDENCE_PENDING_REQUESTS * 2 {
         let rows: Vec<ClaimedRequest> = diesel::sql_query(format!(
-            "SELECT e.id, e.workflow_exec_id, e.event_data->'data'->>'{}' AS correlation_id \
+            "SELECT e.workflow_exec_id, e.event_data->'data'->>'{}' AS correlation_id \
              FROM ({claim}) e",
             family.id_key
         ))
@@ -909,6 +1051,11 @@ async fn capture_drain(
         .expect("append the delivery marker");
         resolved.push(row.correlation_id);
     }
+    assert_eq!(
+        resolved.len(),
+        EVIDENCE_PENDING_REQUESTS,
+        "the drain must resolve every seeded request, and only those"
+    );
 
     let stats = statement_statistics(conn).await;
     std::fs::write(
@@ -924,9 +1071,6 @@ async fn capture_drain(
 
 #[derive(QueryableByName, Debug)]
 struct ClaimedRequest {
-    #[diesel(sql_type = BigInt)]
-    #[allow(dead_code)]
-    id: i64,
     #[diesel(sql_type = diesel::sql_types::Uuid)]
     workflow_exec_id: uuid::Uuid,
     #[diesel(sql_type = Text)]
