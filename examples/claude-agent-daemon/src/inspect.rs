@@ -10,6 +10,8 @@ use std::time::Duration;
 
 use rusqlite::{Connection, OpenFlags};
 
+use crate::session::SessionTask;
+
 /// How many events one `history` command prints.
 ///
 /// The audit trail is the reason the command exists, so the cap is high. The
@@ -35,22 +37,33 @@ const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 /// One RUNNING session: its id, and the task it started from.
 pub struct RunningSession {
     pub exec_id: String,
-    /// The workspace this session was recorded against, read out of its task.
-    /// `None` when the task cannot be read at all.
-    pub workspace: Option<String>,
-    /// The model this session was recorded against. `None` as above.
-    pub model: Option<String>,
-    /// The recorded turn bound. `None` unless the task holds a JSON integer
-    /// there. The caller checks the range the task's own field accepts.
-    pub max_turns: Option<i64>,
-    /// The recorded approval deadline, read the same way and checked the same
-    /// way.
-    pub approval_timeout_secs: Option<i64>,
+    /// The recorded task. `None` when this daemon cannot read the row.
+    pub task: Option<RecordedTask>,
+}
+
+/// The recorded task of a RUNNING session, cut to what a startup check reads.
+///
+/// The fields carry the types the task itself declares, so a value outside
+/// one of them is not represented here. A recorded `-1` turn bound, or a
+/// bound wider than the field, leaves no `RecordedTask` at all.
+pub struct RecordedTask {
+    /// The workspace this session was recorded against.
+    pub workspace: String,
+    /// The model this session was recorded against.
+    pub model: String,
+    /// The recorded turn bound. The caller refuses a zero, as `submit` does.
+    pub max_turns: u32,
+    /// The recorded approval deadline. The caller refuses one too large to
+    /// arm, as `submit` refuses one.
+    pub approval_timeout_secs: u64,
     /// Does the recorded task carry a goal that says something?
     ///
-    /// The goal itself is never read here. The database answers its type and
-    /// the LENGTH of it once the space is removed, and the bytes are what
-    /// this query exists to avoid.
+    /// The goal itself is dropped, and never returned. A restart reads every
+    /// RUNNING row, a goal reaches the size of a control request, and the
+    /// returned set must not grow with them.
+    ///
+    /// The test is Rust's own `trim`, which is what `submit` refuses a goal
+    /// by. The two ends of that invariant therefore run the same code.
     pub has_goal: bool,
 }
 
@@ -94,20 +107,6 @@ pub struct SessionSummary {
     /// `VACUUM`, so this is the bound of what the schema allows.
     pub row: i64,
 }
-
-/// Every character Rust's `trim` removes, for SQL that must agree with it.
-///
-/// `submit` refuses a goal that says nothing, and the startup check refuses a
-/// recorded one. The two must draw the line in the same place, or a session
-/// one end accepts is refused by the other.
-///
-/// Rust removes the Unicode `White_Space` set. `SQLite`'s `trim` removes only
-/// the characters it is given, so the set is written out here. A narrower one
-/// leaves a goal of non-breaking spaces looking like a goal to the database,
-/// while `submit` calls it blank.
-const WHITESPACE: &str = "char(9,10,11,12,13,32,133,160,5760,8192,8193,8194,\
-                          8195,8196,8197,8198,8199,8200,8201,8202,8232,8233,\
-                          8239,8287,12288)";
 
 /// How many characters of one listed field are read.
 ///
@@ -160,90 +159,68 @@ pub fn is_session(conn: &Connection, workflow_name: &str, exec_id: &str) -> Resu
 ///
 /// Returns an error if the query fails.
 pub fn running(conn: &Connection, workflow_name: &str) -> Result<Vec<RunningSession>, String> {
-    // The two identity FIELDS are read, and not the task. A recorded goal can
-    // approach the control-request cap, and a restart reads every session
-    // parked on a long approval deadline. Reading the tasks whole could spend
-    // the daemon's memory before it is ready to serve anything.
+    // The task is read the way the RUNTIME reads it, and not projected field
+    // by field in SQL. `SQLite` and `serde_json` do not agree about what a
+    // document says, so no projection can prove a row is readable.
+    // `json_valid` accepts a goal of `"\uD800"` and gives it a type and a
+    // length, while `serde_json` refuses the unpaired surrogate. A row the
+    // projection called readable would be sealed FAILED by the runtime on
+    // its first drive, where no later daemon could resume it.
     //
-    // `json_valid` guards the extraction. A task that is not JSON at all
-    // yields NULL rather than failing the whole query. The caller can then
-    // name the row it cannot read.
+    // `recorded` runs the runtime's own three steps, so a row that answers
+    // here deserialises on the first drive by construction.
     //
-    // Every field of the recorded task is covered. The small ones are read as
-    // VALUES, and the goal only by its TYPE. A row that passes here therefore
-    // deserialises on the first drive. One that did not would be sealed
-    // FAILED by the runtime, where no later daemon could resume it.
+    // The document is read as BLOB bytes. A field can hold bytes that are
+    // not valid UTF-8. Reading one of those as text fails the WHOLE query,
+    // which would name no row at all. The bytes name their own row.
     //
-    // The goal is measured and not read: `trim` and `length` run inside the
-    // database, so a goal of any size answers in one number. The character
-    // set is given, because `trim` alone removes the space and not the tab or
-    // the newline. It is the set Rust's own `trim` removes, so the two ends
-    // of this invariant agree about a goal of nothing but space.
-    //
-    // The length is of the BYTES. `length` on text counts to the first NUL
-    // and stops, so a goal that opens with one measures zero. The daemon
-    // would refuse to start over a task it can read perfectly well. Rust
-    // keeps that byte through `trim`, so `submit` accepts such a goal, and
-    // the two checks have to agree about the same value.
-    //
-    // Each number is read only when BOTH tests pass, and the two catch
-    // different faults.
-    //
-    // `json_type` reads the type in the document. It refuses a JSON `true`,
-    // which `json_extract` alone would return as the integer 1.
-    //
-    // `typeof` reads the class of the value that comes out. It refuses a
-    // number too large for a signed 64-bit integer, which `json_type` still
-    // calls an integer while `json_extract` returns a real. Reading that into
-    // an integer fails the WHOLE query, which would name no row at all.
-    //
-    // The caller checks the RANGE of the value the two tests admit.
+    // The cost is ONE document at a time. The rows are read as a stream, and
+    // the task is cut down before the next row, so the returned set holds no
+    // goal. A single control request already costs the daemon that memory.
     let mut statement = conn
-        .prepare(&format!(
-            "SELECT exec_id, \
-                    CASE WHEN json_valid(input_json) \
-                         THEN json_extract(input_json, '$.workspace') END, \
-                    CASE WHEN json_valid(input_json) \
-                         THEN json_extract(input_json, '$.model') END, \
-                    CASE WHEN json_valid(input_json) \
-                          AND json_type(input_json, '$.max_turns') = 'integer' \
-                          AND typeof(json_extract(input_json, '$.max_turns')) \
-                              = 'integer' \
-                         THEN json_extract(input_json, '$.max_turns') END, \
-                    CASE WHEN json_valid(input_json) \
-                          AND json_type(input_json, '$.approval_timeout_secs') = 'integer' \
-                          AND typeof(json_extract(input_json, '$.approval_timeout_secs')) \
-                              = 'integer' \
-                         THEN json_extract(input_json, '$.approval_timeout_secs') END, \
-                    CASE WHEN json_valid(input_json) \
-                          AND json_type(input_json, '$.goal') = 'text' \
-                         THEN length(cast(trim(json_extract(input_json, '$.goal'), \
-                                               {WHITESPACE}) as blob)) \
-                         END \
-             FROM harvest_executions \
-             WHERE workflow_name = ?1 AND state = 'RUNNING' ORDER BY rowid"
-        ))
+        .prepare(
+            "SELECT exec_id, cast(input_json as blob) FROM harvest_executions \
+             WHERE workflow_name = ?1 AND state = 'RUNNING' ORDER BY rowid",
+        )
         .map_err(|e| format!("cannot prepare the running-session query: {e}"))?;
     let rows = statement
         .query_map([workflow_name], |row| {
             Ok(RunningSession {
                 exec_id: row.get(0)?,
-                workspace: row.get(1)?,
-                model: row.get(2)?,
-                max_turns: row.get(3)?,
-                approval_timeout_secs: row.get(4)?,
-                // The LENGTH of the trimmed goal comes back, and never the
-                // goal. A goal of no characters is refused for the reason
-                // `submit` refuses one.
-                has_goal: row
-                    .get::<_, Option<i64>>(5)?
-                    .is_some_and(|length| length > 0),
+                task: row
+                    .get::<_, Option<Vec<u8>>>(1)?
+                    .as_deref()
+                    .and_then(recorded),
             })
         })
         .map_err(|e| format!("cannot read the running sessions: {e}"))?;
 
     rows.collect::<Result<Vec<_>, _>>()
         .map_err(|e| format!("cannot read the running sessions: {e}"))
+}
+
+/// Read one recorded task, keeping only what a startup check needs.
+///
+/// `None` when the document is not a task this daemon can read. The goal is
+/// measured here and dropped, so it never leaves this function.
+///
+/// The three steps are the runtime's own, in its order. The backend reads
+/// `input_json` as TEXT, parses the WHOLE document into a `Value`, and the
+/// workflow takes its task from that value. Each step refuses something the
+/// next one never sees. The middle step is why a fault in a field no check
+/// reads still answers `None`. Parsing a document unescapes every string in
+/// it, including one this daemon ignores.
+fn recorded(document: &[u8]) -> Option<RecordedTask> {
+    let text = std::str::from_utf8(document).ok()?;
+    let whole = serde_json::from_str::<serde_json::Value>(text).ok()?;
+    let task = serde_json::from_value::<SessionTask>(whole).ok()?;
+    Some(RecordedTask {
+        has_goal: !task.goal.trim().is_empty(),
+        workspace: task.workspace,
+        model: task.model,
+        max_turns: task.max_turns,
+        approval_timeout_secs: task.approval_timeout_secs,
+    })
 }
 
 /// One recorded event, already cut to what an audit line prints.

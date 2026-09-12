@@ -2239,9 +2239,9 @@ async fn a_daemon_refuses_a_session_it_cannot_read() {
     // not touched.
     //
     // Each task below is complete APART FROM the one field named against it.
-    // The startup check reads the small fields as values and the goal by its
-    // type. A check that read fewer of them, or that read a number without
-    // its range, would enlist the row. The first drive would then fail to
+    // The startup check reads the recorded task the way the runtime reads it,
+    // so a fault in any field answers with nothing. A check that read fewer
+    // of them would enlist the row. The first drive would then fail to
     // deserialise the task, and the runtime would seal the session FAILED
     // where no later daemon could resume it.
     let workspace = dir.path().join("workspace").to_string_lossy().to_string();
@@ -2261,8 +2261,6 @@ async fn a_daemon_refuses_a_session_it_cannot_read() {
         }
         whole.to_string()
     };
-    // A JSON `true` reads back from `json_extract` as the integer 1, so the
-    // type guard and not the value is what refuses it.
     let broken = [
         ("goal", Value::Null),
         // A goal of no characters is refused for the reason `submit` refuses
@@ -2271,9 +2269,9 @@ async fn a_daemon_refuses_a_session_it_cannot_read() {
         ("goal", json!("")),
         ("goal", json!("   ")),
         ("goal", json!("\t\n ")),
-        // `json_type` calls this an integer and `json_extract` returns a
-        // real. The type test alone therefore admits it. Reading it as an
-        // integer then fails the WHOLE query, which names no session.
+        // A deadline past `i64::MAX` seconds reads as the `u64` the task
+        // declares. It cannot be armed as a timer, and `submit` refuses one,
+        // so the recorded one is refused here.
         (
             "approval_timeout_secs",
             json!(9_223_372_036_854_775_808_u64),
@@ -2635,11 +2633,13 @@ fn the_decide_line_reaches_the_daemon_that_printed_it() {
 
 /// A goal opening with a NUL is still a goal.
 ///
-/// Rust keeps that byte through `trim`, so `submit` accepts such a goal. The
-/// database counts TEXT to the first NUL and stops, so a count of characters
-/// measures zero there. The startup check would then refuse to start over a
-/// task it can read perfectly well. No daemon of this version could resume
-/// the session. The two checks must agree about the same value.
+/// Rust keeps that byte through `trim`, so `submit` accepts such a goal. A
+/// check that measured the goal in the database would disagree. `SQLite`
+/// counts TEXT to the first NUL and stops, so such a goal measures zero
+/// there. The startup check would refuse to start over a task it can read
+/// perfectly well, and no daemon of this version could resume the session.
+/// The check reads the goal in Rust, so the two ends cannot diverge. This
+/// test holds that line where `submit` draws it.
 #[test]
 fn a_goal_opening_with_a_nul_is_measured_whole() {
     let dir = tempfile::tempdir().expect("a temporary directory");
@@ -2691,6 +2691,9 @@ fn a_goal_opening_with_a_nul_is_measured_whole() {
             .iter()
             .find(|row| row.exec_id == exec)
             .expect("the session is RUNNING")
+            .task
+            .as_ref()
+            .expect("the recorded task is readable")
             .has_goal
     };
     assert!(
@@ -2708,12 +2711,127 @@ fn a_goal_opening_with_a_nul_is_measured_whole() {
     );
 }
 
+/// A recorded task `SQLite` calls readable, and Rust cannot read at all.
+///
+/// The two readers disagree. `json_valid` accepts a goal of `"\uD800"`. It
+/// gives the goal the type `text` and a length of three bytes. A projection
+/// built from those three terms calls the row readable. `serde_json` refuses
+/// the unpaired surrogate, because a Rust string cannot hold one.
+///
+/// The startup check has to refuse the row. An enlisted session is driven,
+/// the drive deserialises the same task, and the runtime seals the session
+/// FAILED on that failure. No later daemon could resume it.
+///
+/// The test measures the OLD predicate on the same document, so it carries
+/// the evidence that the row would have been enlisted.
+#[test]
+fn a_recorded_task_rust_cannot_read_is_never_enlisted() {
+    let dir = tempfile::tempdir().expect("a temporary directory");
+    let db = dir.path().join("surrogate.db");
+    let writer = rusqlite::Connection::open(&db).expect("the database opens");
+    writer
+        .execute(
+            "CREATE TABLE harvest_executions (exec_id TEXT, workflow_name TEXT, \
+             state TEXT, input_json TEXT, output_json TEXT, error TEXT)",
+            [],
+        )
+        .expect("the fixture table is created");
+    // The documents are written as TEXT, the way a writer of another version
+    // would leave them. A Rust string cannot carry a lone surrogate, so the
+    // escape is written and never built from a `Value`.
+    let good = r#"{"goal":"summarise it","max_turns":4,
+                   "approval_timeout_secs":300,
+                   "workspace":"/tmp/w","model":"offline"}"#;
+    let bad_goal = r#"{"goal":"\uD800","max_turns":4,
+                       "approval_timeout_secs":300,
+                       "workspace":"/tmp/w","model":"offline"}"#;
+    let bad_workspace = r#"{"goal":"summarise it","max_turns":4,
+                            "approval_timeout_secs":300,
+                            "workspace":"\uD800","model":"offline"}"#;
+    // A surrogate in a field no check reads still fails the whole document.
+    let bad_spare = r#"{"goal":"summarise it","max_turns":4,
+                        "approval_timeout_secs":300,
+                        "workspace":"/tmp/w","model":"offline",
+                        "note":"\uD800"}"#;
+    for (exec, document) in [
+        ("good", good),
+        ("bad-goal", bad_goal),
+        ("bad-workspace", bad_workspace),
+        ("bad-spare", bad_spare),
+    ] {
+        writer
+            .execute(
+                "INSERT INTO harvest_executions VALUES (?1, ?2, 'RUNNING', ?3, NULL, NULL)",
+                rusqlite::params![exec, WORKFLOW_NAME, document],
+            )
+            .expect("the session is recorded");
+    }
+    // One document of bytes that are not UTF-8 at all. Reading a field of it
+    // as text fails the WHOLE query, which would name no row.
+    let mut raw = br#"{"goal":"x"#.to_vec();
+    raw.push(0xED);
+    raw.extend_from_slice(br#"","max_turns":4,"approval_timeout_secs":300,"#);
+    raw.extend_from_slice(br#""workspace":"/tmp/w","model":"offline"}"#);
+    writer
+        .execute(
+            "INSERT INTO harvest_executions \
+             VALUES ('raw-bytes', ?1, 'RUNNING', CAST(?2 AS TEXT), NULL, NULL)",
+            rusqlite::params![WORKFLOW_NAME, raw],
+        )
+        .expect("the byte session is recorded");
+
+    // The three terms the old projection read, on the document it admitted.
+    let (valid, kind, length): (i64, Option<String>, Option<i64>) = writer
+        .query_row(
+            "SELECT json_valid(?1), json_type(?1, '$.goal'), \
+                    length(cast(trim(json_extract(?1, '$.goal'), \
+                                     char(9,10,13,32)) as blob))",
+            [bad_goal],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .expect("the projection answers");
+    assert_eq!(valid, 1, "SQLite calls the document valid JSON");
+    assert_eq!(
+        kind.as_deref(),
+        Some("text"),
+        "SQLite calls the goal a string"
+    );
+    assert!(
+        length.is_some_and(|bytes| bytes > 0),
+        "SQLite measures the goal as saying something"
+    );
+    assert!(
+        serde_json::from_str::<session::SessionTask>(bad_goal).is_err(),
+        "Rust cannot read the same document"
+    );
+    drop(writer);
+
+    let reader = rusqlite::Connection::open(&db).expect("the database opens");
+    let running = inspect::running(&reader, WORKFLOW_NAME).expect("the query still answers");
+    let readable = |exec: &str| {
+        running
+            .iter()
+            .find(|row| row.exec_id == exec)
+            .expect("the session is RUNNING")
+            .task
+            .is_some()
+    };
+    assert!(readable("good"), "a readable task is still enlisted");
+    for row in ["bad-goal", "bad-workspace", "bad-spare", "raw-bytes"] {
+        assert!(
+            !readable(row),
+            "{row} carries a task Rust cannot read and must not be enlisted"
+        );
+    }
+}
+
 /// The startup check draws the blank-goal line where `submit` draws it.
 ///
-/// Rust's `trim` removes the whole Unicode whitespace set. `SQLite`'s removes
-/// only the characters it is given. A goal of non-breaking spaces says
-/// nothing, and `submit` refuses it. A narrower set in SQL would resume a
-/// session the other end of this invariant calls blank.
+/// Rust's `trim` removes the whole Unicode whitespace set. A goal of
+/// non-breaking spaces says nothing, and `submit` refuses it. A check written
+/// in SQL would remove only the characters it was given. A narrower set would
+/// resume a session the other end of this invariant calls blank. Both ends
+/// now run the same `trim`, and this test holds the line.
 #[test]
 fn a_goal_of_unicode_space_is_refused_as_submit_refuses_it() {
     let dir = tempfile::tempdir().expect("a temporary directory");
@@ -2766,6 +2884,9 @@ fn a_goal_of_unicode_space_is_refused_as_submit_refuses_it() {
             .iter()
             .find(|row| row.exec_id == exec)
             .expect("the session is RUNNING")
+            .task
+            .as_ref()
+            .expect("the recorded task is readable")
             .has_goal
     };
     for blank in ["nbsp", "ideographic", "thin", "nel"] {
@@ -4062,19 +4183,28 @@ async fn the_startup_and_status_queries_read_only_what_they_need() {
     // approach the control-request cap, and a restart reads every parked
     // session. Reading the tasks whole could spend the daemon's memory before
     // it is ready.
-    let first = running.first().expect("the parked session is listed");
+    let first = running
+        .first()
+        .expect("the parked session is listed")
+        .task
+        .as_ref()
+        .expect("the parked task is readable");
     assert_eq!(
-        first.workspace.as_deref(),
-        Some(workspace.to_str().expect("the workspace path is UTF-8")),
+        first.workspace,
+        workspace.to_str().expect("the workspace path is UTF-8"),
         "the running row must carry the workspace it was recorded against"
     );
     assert_eq!(
-        first.model.as_deref(),
-        Some(claude::OFFLINE_MODEL),
+        first.model,
+        claude::OFFLINE_MODEL,
         "the running row must carry the model it was recorded against"
     );
     assert!(
-        !format!("{:?} {:?}", first.workspace, first.model).contains("summarise the workspace"),
+        first.has_goal,
+        "the parked session was recorded with a goal"
+    );
+    assert!(
+        !format!("{} {}", first.workspace, first.model).contains("summarise the workspace"),
         "the running row must not carry the goal"
     );
     assert_eq!(

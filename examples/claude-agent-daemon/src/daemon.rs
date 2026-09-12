@@ -335,30 +335,26 @@ fn check_resumable(
         // therefore stays RUNNING for as long as the file lasts, and nothing
         // ever says so. The daemon refuses to start instead, under the same
         // policy as the two checks below.
-        // EVERY field of the task is checked, and not only the two compared
-        // below. A row that passes this check deserialises on the first
-        // drive. One that did not would be sealed FAILED by the runtime the
-        // moment it ran, and no later daemon could resume it.
-        // The RANGE is checked, and not only the presence. The query admits a
-        // JSON integer, and the task's fields are unsigned. A recorded `-1`,
-        // or a value wider than the field, deserialises to nothing and would
-        // seal the session FAILED on its first drive. A zero turn bound is
+        // The read above is the runtime's own read of the whole task, so a
+        // row that answers here deserialises on the first drive. One that did
+        // not would be sealed FAILED by the runtime the moment it ran, and no
+        // later daemon could resume it.
+        // The RANGE comes with the read. The task's fields are unsigned, so
+        // a recorded `-1` answers with nothing here. So does a value wider
+        // than the field. A zero turn bound reads perfectly well. It is
         // refused for the reason `submit` refuses one: the loop would run no
         // turn and report the session COMPLETE.
-        let turns = row
-            .max_turns
-            .and_then(|turns| u32::try_from(turns).ok())
-            .is_some_and(|turns| turns > 0);
-        let deadline = row
-            .approval_timeout_secs
-            .is_some_and(|seconds| u64::try_from(seconds).is_ok());
-        let readable = row.has_goal && turns && deadline;
-        let (Some(recorded_workspace), Some(recorded_model)) = (&row.workspace, &row.model) else {
+        let Some(task) = row.task else {
             return Err(unreadable(&row.exec_id));
         };
-        if !readable {
+        // The deadline is bounded where `submit` bounds it. A recorded one
+        // past `i64::MAX` seconds cannot be armed as a timer, so a session
+        // carrying one would be driven and could never wait.
+        let armable = i64::try_from(task.approval_timeout_secs).is_ok();
+        if !task.has_goal || task.max_turns == 0 || !armable {
             return Err(unreadable(&row.exec_id));
         }
+        let (recorded_workspace, recorded_model) = (&task.workspace, &task.model);
         if recorded_workspace != workspace {
             return Err(format!(
                 "session {} belongs to the workspace `{recorded_workspace}`, and \
@@ -710,11 +706,10 @@ fn submit(
             message: "the turn bound is zero. A session needs at least one turn.".to_string(),
         };
     }
-    // The deadline is recorded in the task and read back as a SIGNED 64-bit
-    // integer. A larger value is stored as a JSON number. The database
-    // returns that number as a real, and reading a real as an integer fails
-    // the whole startup query. The session would be recorded here and then
-    // stop every later daemon of this version from starting.
+    // The deadline becomes a timer, and the engine records a fire time as a
+    // SIGNED 64-bit epoch millisecond. A deadline past `i64::MAX` seconds
+    // cannot be armed as one. It is refused here so a session is never
+    // recorded with a deadline it can never wait on.
     if i64::try_from(approval_timeout_secs).is_err() {
         return Response::Error {
             message: format!(
