@@ -1478,6 +1478,43 @@ fn a_write_lands_on_a_name_at_the_component_limit() {
 }
 
 #[test]
+fn a_live_daemon_refuses_the_offline_identity() {
+    // A key plus the stub's own name would make `identity` match a session
+    // recorded offline. The restart would send that transcript to the API.
+    // `expect_err` is not available here on purpose: `ModelConfig` holds the
+    // API key, so it does not implement `Debug`.
+    let Err(refusal) = claude::ModelConfig::new(
+        Some("sk-not-a-real-key".to_string()),
+        claude::OFFLINE_MODEL.to_string(),
+        claude::DEFAULT_MAX_TOKENS,
+    ) else {
+        panic!("the stub's name must not be accepted as a model");
+    };
+    assert!(
+        refusal.contains("would leave this machine"),
+        "the refusal must say what is at stake: {refusal}"
+    );
+
+    // Without a key the name is what the daemon records anyway, so it is no
+    // error. A real model with a key is the ordinary case.
+    let offline = claude::ModelConfig::new(
+        None,
+        claude::OFFLINE_MODEL.to_string(),
+        claude::DEFAULT_MAX_TOKENS,
+    )
+    .expect("the stub needs no key");
+    assert_eq!(offline.identity(), claude::OFFLINE_MODEL);
+
+    let live = claude::ModelConfig::new(
+        Some("sk-not-a-real-key".to_string()),
+        claude::DEFAULT_MODEL.to_string(),
+        claude::DEFAULT_MAX_TOKENS,
+    )
+    .expect("a real model with a key is ordinary");
+    assert_eq!(live.identity(), claude::DEFAULT_MODEL);
+}
+
+#[test]
 fn a_write_keeps_the_mode_of_the_file_it_replaces() {
     use std::os::unix::fs::PermissionsExt;
 

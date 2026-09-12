@@ -151,7 +151,9 @@ a different one. Otherwise a restart pointed at another directory could apply
 an already-approved write to the wrong project, and a restart under another
 model — or with an API key where there was none — would continue one
 conversation on a different model, or move an offline session onto billed
-calls. `--max-tokens` is deliberately not fenced: it is a per-request budget
+calls. `offline-stub` is the identity the daemon records for its own stub, so
+it is refused as a `--model` name when a key is set: it would otherwise match
+an offline session and send that local transcript to the API. `--max-tokens` is deliberately not fenced: it is a per-request budget
 rather than an identity, so changing it between restarts is ordinary tuning.
 
 **Approval is per wait, not per session — and not per tool-use id either.**

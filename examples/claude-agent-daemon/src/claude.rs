@@ -58,6 +58,19 @@ impl ModelConfig {
     ///
     /// Returns an error if the HTTP client cannot be built.
     pub fn new(api_key: Option<String>, model: String, max_tokens: u32) -> Result<Self, String> {
+        // The stub's identity is not a model name. With a key, `identity`
+        // returns the model as given, so this one name would match a session
+        // recorded against the stub. That session would then resume on the
+        // API, and the transcript an operator kept local would be sent.
+        if api_key.is_some() && model == OFFLINE_MODEL {
+            return Err(format!(
+                "`{OFFLINE_MODEL}` is the name this daemon records for its own stub, \
+                 and not a model. A session recorded against the stub would resume \
+                 on the API, and its transcript would leave this machine. Name a \
+                 real model with `--model`, or unset `ANTHROPIC_API_KEY` to stay \
+                 offline."
+            ));
+        }
         let http = reqwest::Client::builder()
             .timeout(HTTP_TIMEOUT)
             .build()
