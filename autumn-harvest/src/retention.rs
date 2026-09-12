@@ -3338,7 +3338,7 @@ mod tests {
         let pool = test_pool("postgres://unused/db");
         let mut aliased = BTreeMap::new();
         aliased.insert(ShardId::new(0), pool.clone());
-        aliased.insert(ShardId::new(1), pool.clone());
+        aliased.insert(ShardId::new(1), pool);
         let sharded = ShardedDbPool::from_map(aliased, ShardId::new(0));
 
         let config = RetentionConfig::default()

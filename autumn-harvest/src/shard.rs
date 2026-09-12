@@ -949,15 +949,20 @@ fn group_by_pool_identity(pools: &BTreeMap<ShardId, DbPool>) -> BTreeMap<ShardId
 /// Canonical grouping key for a DSN (issue #1266).
 ///
 /// Two DSNs can reach the same physical database while written
-/// differently: different credentials, an explicit default port, or extra
-/// connection parameters. Comparing the raw strings would treat these as
-/// separate databases. Each apparent group would then apply its own
-/// protection decision to rows the other group was meant to protect.
+/// differently: different credentials, or an explicit default port versus
+/// none. Comparing the raw strings would treat these as separate
+/// databases. Each apparent group would then apply its own protection
+/// decision to rows the other group was meant to protect.
 ///
-/// The key keeps only host, port (defaulted to 5432 when absent), and
-/// database name, lowercasing the host. It drops credentials and query
-/// parameters, since neither changes which physical database a
-/// connection reaches.
+/// The key keeps host (lowercased), port (defaulted to 5432 when absent),
+/// the path, and the query string. It drops only credentials, since a
+/// username and password never change which physical database or schema
+/// a connection reaches.
+///
+/// The query string is kept verbatim, not dropped. A `?options=-c%20
+/// search_path%3D...` parameter picks the schema `harvest_audit_log`
+/// resolves to. Two DSNs that differ only there can still reach
+/// different data. They must never be grouped as one pool.
 ///
 /// A host alias — two hostnames that resolve to one address — is not
 /// detected. That needs a DNS lookup, and building a pool must stay a
@@ -971,8 +976,9 @@ fn canonical_dsn_key(dsn: &str) -> String {
     };
     let host = url.host_str().unwrap_or_default().to_ascii_lowercase();
     let port = url.port().unwrap_or(5432);
-    let dbname = url.path().trim_start_matches('/');
-    format!("{host}:{port}/{dbname}")
+    let path = url.path();
+    let query = url.query().unwrap_or_default();
+    format!("{host}:{port}{path}?{query}")
 }
 
 #[cfg(feature = "db")]
@@ -981,6 +987,7 @@ impl std::fmt::Debug for ShardedDbPool {
         f.debug_struct("ShardedDbPool")
             .field("shards", &self.pools.keys())
             .field("default_shard", &self.default_shard)
+            .field("pool_group", &self.pool_group)
             .finish()
     }
 }
@@ -1081,6 +1088,11 @@ impl ShardedDbPool {
     /// builds a fresh pool per entry, even for two DSNs that reach one
     /// physical database. It detects the alias from a canonical form of
     /// each connection string instead.
+    ///
+    /// # Panics
+    ///
+    /// Never, in practice. Every constructor keeps `pool_group` naming
+    /// exactly the shards present in `pools`.
     #[must_use]
     pub fn pool_groups(&self) -> Vec<(&DbPool, Vec<ShardId>)> {
         let mut by_group: BTreeMap<u32, Vec<ShardId>> = BTreeMap::new();
@@ -1861,7 +1873,7 @@ mod tests {
         let pool = test_pool();
         let mut pools = BTreeMap::new();
         pools.insert(ShardId::new(0), pool.clone());
-        pools.insert(ShardId::new(1), pool.clone());
+        pools.insert(ShardId::new(1), pool);
         let sharded = ShardedDbPool::from_map(pools, ShardId::new(0));
 
         let groups = sharded.pool_groups();
@@ -1981,6 +1993,37 @@ mod tests {
             2,
             "two different database names on the same host must never \
              collapse into one group"
+        );
+    }
+
+    // A `search_path` set through `?options=...` selects which schema
+    // `harvest_audit_log` resolves to. Two DSNs differing only there
+    // must never collapse (issue #1266).
+    #[cfg(feature = "db")]
+    #[test]
+    fn from_dsns_keeps_distinct_search_path_options_separate() {
+        let sharded = ShardedDbPool::from_dsns(
+            [
+                (
+                    ShardId::new(0),
+                    "postgres://db.example/shared?options=-c%20search_path%3Dschema_a".to_string(),
+                ),
+                (
+                    ShardId::new(1),
+                    "postgres://db.example/shared?options=-c%20search_path%3Dschema_b".to_string(),
+                ),
+            ],
+            ShardId::new(0),
+            1,
+        )
+        .expect("pool builds without connecting");
+
+        let groups = sharded.pool_groups();
+        assert_eq!(
+            groups.len(),
+            2,
+            "different `options` can select a different schema, so these \
+             must never collapse into one group"
         );
     }
 }

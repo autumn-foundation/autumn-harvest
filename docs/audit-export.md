@@ -304,11 +304,14 @@ shard records:
   IDs; the sweep groups these by pool identity. `ShardedDbPool::from_dsns`
   builds a separate `Pool` per entry even for two connection strings that
   reach one database, so identity alone cannot see the alias; the sweep
-  groups these by a canonical form of the DSN instead (host, port, and
-  database name, ignoring credentials and query parameters), compared
-  before the DSN is consumed into a pool. A host alias — two hostnames
-  that resolve to one address — is not detected; that would need a DNS
-  lookup, and building a pool must stay a pure, local operation.
+  groups these by a canonical form of the DSN instead (host, port, path,
+  and query string, ignoring only credentials), compared before the DSN
+  is consumed into a pool. The query string is kept, not stripped: a
+  `search_path` set through `?options=...` picks which schema a query
+  resolves against, so two DSNs differing only there must stay in
+  separate groups. A host alias — two hostnames that resolve to one
+  address — is not detected; that would need a DNS lookup, and building
+  a pool must stay a pure, local operation.
 
   The remaining cost is operational, not architectural: an operator must
   remember to set the flag on every process, including ones added later.
