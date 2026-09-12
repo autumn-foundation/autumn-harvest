@@ -1328,8 +1328,13 @@ async fn start_child_on_target(
     // The child's queue task is written inside this transaction, so it raises a
     // dispatch hint (issue #1312). The buffering scope holds the hint until the
     // transaction commits on the target shard.
-    crate::dispatch::buffered_settled(Box::pin(conn.transaction::<(), HarvestError, _>(
-        async |conn| {
+    // The born-cancelled path's terminal metric is deferred past this call
+    // (issue #1263 item 13 follow-up). Emitting it INSIDE the transaction
+    // would double-count on a retry after a rollback here. This matches
+    // the same "record after commit" contract `cancel_workflow_execution`
+    // already documents for the same-shard path.
+    let deferred_terminal = crate::dispatch::buffered_settled(Box::pin(
+        conn.transaction::<Option<(String, String)>, HarvestError, _>(async |conn| {
             let spec = spec.clone();
             {
                 let already: Option<uuid::Uuid> = harvest_workflow_executions::table
@@ -1340,7 +1345,7 @@ async fn start_child_on_target(
                     .optional()
                     .map_err(crate::error::database_error)?;
                 if already.is_some() {
-                    return Ok(());
+                    return Ok(None);
                 }
 
                 // Anchor every deadline at creation, not at the parent's
@@ -1424,7 +1429,7 @@ async fn start_child_on_target(
                 if inserted == 0 {
                     // Another sweep won the race; its transaction owns the child's
                     // event and task.
-                    return Ok(());
+                    return Ok(None);
                 }
 
                 // The CONFIGURED codec registry, never `PayloadCodecs::default()`.
@@ -1518,12 +1523,9 @@ async fn start_child_on_target(
                     // returned already has its own durable outbox row,
                     // committed by this same call. `spawn()` here is a
                     // best-effort latency nudge, not the only path to it.
-                    crate::telemetry::emit_workflow_terminal(
-                        metrics,
-                        &workflow_name,
-                        &spec.queue_name,
-                        crate::telemetry::WorkflowStatus::Cancelled,
-                    );
+                    // The terminal metric itself is NOT emitted here — see
+                    // this function's own call site, past the transaction's
+                    // commit.
                     for start in crate::completion_trigger::evaluate_triggers_for_execution(
                         conn,
                         child_exec_id,
@@ -1534,7 +1536,7 @@ async fn start_child_on_target(
                     {
                         start.spawn();
                     }
-                    return Ok(());
+                    return Ok(Some((workflow_name.clone(), spec.queue_name.clone())));
                 }
 
                 // The child's OWN declared quota (issue #946), enforced against the
@@ -1572,11 +1574,23 @@ async fn start_child_on_target(
                 params.max_concurrent = spec.max_concurrent;
                 params.trace_context = spec.trace_context.clone();
                 queue::enqueue(conn, &params).await?;
-                Ok(())
+                Ok(None)
             }
-        },
-    )))
-    .await
+        }),
+    ))
+    .await?;
+
+    // Only reached once the transaction above has actually committed, so
+    // this can never double-count on a retry after a rollback.
+    if let Some((workflow_name, queue_name)) = deferred_terminal {
+        crate::telemetry::emit_workflow_terminal(
+            metrics,
+            &workflow_name,
+            &queue_name,
+            crate::telemetry::WorkflowStatus::Cancelled,
+        );
+    }
+    Ok(())
 }
 
 /// Deliver an idempotent cancel to a cross-shard child on its target shard.
