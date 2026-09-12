@@ -51,9 +51,11 @@ pub struct RunningSession {
     pub workspace: Option<String>,
     /// The model this session was recorded against. `None` as above.
     pub model: Option<String>,
-    /// The recorded turn bound. `None` when it is absent or not a number.
+    /// The recorded turn bound. `None` unless the task holds a JSON integer
+    /// there. The caller checks the range the task's own field accepts.
     pub max_turns: Option<i64>,
-    /// The recorded approval deadline. `None` as above.
+    /// The recorded approval deadline, read the same way and checked the same
+    /// way.
     pub approval_timeout_secs: Option<i64>,
     /// Does the recorded task carry a goal of the right type?
     ///
@@ -152,6 +154,11 @@ pub fn running(conn: &Connection, workflow_name: &str) -> Result<Vec<RunningSess
     // VALUES, and the goal only by its TYPE. A row that passes here therefore
     // deserialises on the first drive. One that did not would be sealed
     // FAILED by the runtime, where no later daemon could resume it.
+    //
+    // Each number is read only when its JSON TYPE is `integer`. `json_extract`
+    // alone does not answer the type: a JSON `true` comes back as the integer
+    // 1, which the task's unsigned field refuses on deserialisation. The
+    // caller checks the RANGE of the value the type guard admits.
     let mut statement = conn
         .prepare(
             "SELECT exec_id, \
@@ -160,8 +167,10 @@ pub fn running(conn: &Connection, workflow_name: &str) -> Result<Vec<RunningSess
                     CASE WHEN json_valid(input_json) \
                          THEN json_extract(input_json, '$.model') END, \
                     CASE WHEN json_valid(input_json) \
+                          AND json_type(input_json, '$.max_turns') = 'integer' \
                          THEN json_extract(input_json, '$.max_turns') END, \
                     CASE WHEN json_valid(input_json) \
+                          AND json_type(input_json, '$.approval_timeout_secs') = 'integer' \
                          THEN json_extract(input_json, '$.approval_timeout_secs') END, \
                     CASE WHEN json_valid(input_json) \
                          THEN json_type(input_json, '$.goal') END \

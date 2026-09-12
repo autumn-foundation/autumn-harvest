@@ -308,8 +308,20 @@ fn check_resumable(
         // below. A row that passes this check deserialises on the first
         // drive. One that did not would be sealed FAILED by the runtime the
         // moment it ran, and no later daemon could resume it.
-        let readable =
-            row.has_goal && row.max_turns.is_some() && row.approval_timeout_secs.is_some();
+        // The RANGE is checked, and not only the presence. The query admits a
+        // JSON integer, and the task's fields are unsigned. A recorded `-1`,
+        // or a value wider than the field, deserialises to nothing and would
+        // seal the session FAILED on its first drive. A zero turn bound is
+        // refused for the reason `submit` refuses one: the loop would run no
+        // turn and report the session COMPLETE.
+        let turns = row
+            .max_turns
+            .and_then(|turns| u32::try_from(turns).ok())
+            .is_some_and(|turns| turns > 0);
+        let deadline = row
+            .approval_timeout_secs
+            .is_some_and(|seconds| u64::try_from(seconds).is_ok());
+        let readable = row.has_goal && turns && deadline;
         let (Some(recorded_workspace), Some(recorded_model)) = (&row.workspace, &row.model) else {
             return Err(unreadable(&row.exec_id));
         };

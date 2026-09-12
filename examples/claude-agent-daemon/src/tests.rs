@@ -1594,10 +1594,29 @@ fn a_block_that_cannot_be_replayed_is_refused() {
         json!([{ "type": "tool_use", "id": "toolu_a", "name": "write_file", "input": Value::Null }]),
         json!([{ "type": "tool_use", "id": "toolu_a", "name": "write_file", "input": "text" }]),
         json!([{ "type": "tool_use", "id": "toolu_a", "name": "write_file", "input": [] }]),
+        json!([{ "type": "thinking" }]),
+        json!([{ "type": "thinking", "thinking": Value::Null }]),
+        json!([{ "type": "thinking", "thinking": 7 }]),
     ] {
         assert!(
             !claude::has_replayable_content(&reply(incomplete.clone())),
             "a known block missing its fields must be refused: {incomplete}"
+        );
+    }
+
+    // The text of a thinking block may be EMPTY, and the block is still
+    // replayed unchanged. This request asks for adaptive thinking and asks
+    // for no display, and under the default display every thinking block
+    // comes back with an empty text. A check for text here would refuse the
+    // model's ORDINARY replies, which is a worse fault than the one above.
+    for empty in [
+        json!([{ "type": "thinking", "thinking": "" }]),
+        json!([{ "type": "thinking", "thinking": "", "signature": "abc" }]),
+        json!([{ "type": "redacted_thinking", "data": "abc" }]),
+    ] {
+        assert!(
+            claude::has_replayable_content(&reply(empty.clone())),
+            "an empty thinking block must still be replayed: {empty}"
         );
     }
 
@@ -2138,49 +2157,77 @@ async fn a_daemon_refuses_a_session_it_cannot_read() {
     first.abort();
     drop(first.await);
 
-    // Stand in for a row a newer daemon wrote. The fixture edits the EXECUTION
+    // Stand in for rows a newer daemon wrote. The fixture edits the EXECUTION
     // row, which is state rather than history: the append-only event log is
     // not touched.
     //
-    // The task here carries a valid workspace and model and is missing the
-    // GOAL. The startup check reads those two as values and the goal by its
-    // type. A check that read only the two would enlist this row. The first
-    // drive would then fail to deserialise the task, and the runtime would
-    // seal the session FAILED where no later daemon could resume it.
-    let writer = rusqlite::Connection::open(&db).expect("the database opens");
-    let partial = json!({
-        "workspace": dir.path().join("workspace").to_string_lossy(),
-        "model": claude::OFFLINE_MODEL,
-        "max_turns": 6,
-        "approval_timeout_secs": 300,
-    })
-    .to_string();
-    writer
-        .execute(
-            "UPDATE harvest_executions SET input_json = ?2 WHERE exec_id = ?1",
-            rusqlite::params![&execution_id, partial],
-        )
-        .expect("the input is replaced");
-    drop(writer);
+    // Each task below is complete APART FROM the one field named against it.
+    // The startup check reads the small fields as values and the goal by its
+    // type. A check that read fewer of them, or that read a number without
+    // its range, would enlist the row. The first drive would then fail to
+    // deserialise the task, and the runtime would seal the session FAILED
+    // where no later daemon could resume it.
+    let workspace = dir.path().join("workspace").to_string_lossy().to_string();
+    let task = |field: &str, value: Value| {
+        let mut whole = json!({
+            "goal": "summarise the workspace",
+            "max_turns": 6,
+            "approval_timeout_secs": 300,
+            "workspace": workspace,
+            "model": claude::OFFLINE_MODEL,
+        });
+        let object = whole.as_object_mut().expect("the task is an object");
+        if value.is_null() {
+            object.remove(field);
+        } else {
+            object.insert(field.to_string(), value);
+        }
+        whole.to_string()
+    };
+    // A JSON `true` reads back from `json_extract` as the integer 1, so the
+    // type guard and not the value is what refuses it.
+    let broken = [
+        ("goal", Value::Null),
+        ("max_turns", Value::Null),
+        ("max_turns", json!(-1)),
+        ("max_turns", json!(0)),
+        ("max_turns", json!(true)),
+        ("max_turns", json!(4_294_967_296i64)),
+        ("approval_timeout_secs", Value::Null),
+        ("approval_timeout_secs", json!(-1)),
+    ];
 
-    // The daemon must say so rather than report readiness over a session it
-    // silently dropped. Without the refusal `serve` runs until Ctrl-C, so the
-    // timeout keeps a regression short.
-    let refusal = tokio::time::timeout(
-        Duration::from_secs(10),
-        daemon::serve(options(&second_socket)),
-    )
-    .await
-    .expect("the daemon must refuse rather than start");
-    let message = refusal.expect_err("an unreadable session must refuse the start");
-    assert!(
-        message.contains(&execution_id),
-        "the refusal must name the row: {message}"
-    );
-    assert!(
-        message.contains("cannot read"),
-        "the refusal must say what is wrong: {message}"
-    );
+    for (field, value) in broken {
+        let writer = rusqlite::Connection::open(&db).expect("the database opens");
+        writer
+            .execute(
+                "UPDATE harvest_executions SET input_json = ?2 WHERE exec_id = ?1",
+                rusqlite::params![&execution_id, task(field, value.clone())],
+            )
+            .expect("the input is replaced");
+        drop(writer);
+
+        // The daemon must say so rather than report readiness over a session
+        // it silently dropped. Without the refusal `serve` runs until Ctrl-C,
+        // so the timeout keeps a regression short.
+        let refusal = tokio::time::timeout(
+            Duration::from_secs(10),
+            daemon::serve(options(&second_socket)),
+        )
+        .await
+        .unwrap_or_else(|_| {
+            panic!("the daemon must refuse rather than start on {field} = {value}")
+        });
+        let message = refusal.expect_err(&format!("{field} = {value} must refuse the start"));
+        assert!(
+            message.contains(&execution_id),
+            "the refusal must name the row: {message}"
+        );
+        assert!(
+            message.contains("cannot read"),
+            "the refusal must say what is wrong: {message}"
+        );
+    }
 }
 
 #[test]

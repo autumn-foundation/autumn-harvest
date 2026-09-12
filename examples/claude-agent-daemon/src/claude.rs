@@ -404,6 +404,12 @@ fn is_replayable_block(block: &Value) -> bool {
     match kind.trim() {
         "" => false,
         "text" => block.get("text").is_some_and(Value::is_string),
+        // The text of a thinking block may be EMPTY, and an empty one is
+        // still replayed unchanged. This request asks for adaptive thinking
+        // and does not ask for a display, and the default display returns
+        // every thinking block with an empty text. A check for text here
+        // would refuse the model's ordinary replies.
+        "thinking" => block.get("thinking").is_some_and(Value::is_string),
         // The input must be an OBJECT. A tool input is declared with an
         // object schema, so `null` is a value the API refuses on replay.
         "tool_use" => {
