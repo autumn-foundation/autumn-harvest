@@ -3528,15 +3528,15 @@ async fn a_status_offers_no_approval_past_the_deadline() {
 /// nothing wrote.
 #[test]
 fn a_log_field_obeys_nothing() {
-    let forged = "done\u{1b}]52;c;cm0K\u{7}\nINFO forged entry\r\u{202e}";
+    let forged = "done\u{1b}]52;c;cm0K\u{7}\nINFO\tforged entry\r\u{202e}";
     let escaped = crate::one_line(forged);
     assert!(
         !escaped.chars().any(crate::is_obeyed),
         "the field must obey nothing: {escaped}"
     );
     assert!(
-        !escaped.contains('\n'),
-        "one field stays on one line: {escaped}"
+        !escaped.contains('\n') && !escaped.contains('\t'),
+        "one field stays on one line, and no column is moved: {escaped}"
     );
     assert!(
         escaped.starts_with("done") && escaped.contains("forged entry"),
@@ -3544,8 +3544,8 @@ fn a_log_field_obeys_nothing() {
     );
     // `visible` keeps the newline, which is why the log needs its own sink.
     assert!(
-        crate::visible(forged).contains('\n'),
-        "a printed message may hold several lines"
+        crate::visible(forged).contains('\n') && crate::visible(forged).contains('\t'),
+        "a printed message may hold several lines, and use a tab for layout"
     );
 
     // Every log field that carries such text goes through it. The guard reads
@@ -3575,10 +3575,12 @@ fn a_log_field_obeys_nothing() {
 /// which rewrites a character a terminal would act on. A path holding one is
 /// printed as an escape, and the copied command names another socket.
 ///
-/// A NEWLINE is refused too, and for the opposite reason: `visible` keeps it,
-/// because a printed message may hold several lines. Every printed command
-/// names the socket on ONE line. A newline in the path splits that line, and
-/// leaves an unterminated quote in what an operator copies.
+/// A NEWLINE and a TAB are refused too, and for the opposite reason:
+/// `visible` keeps both, because a printed message uses them for layout.
+/// Every printed command names the socket on ONE line, and an operator reads
+/// that socket back off the screen. A newline splits the line and leaves an
+/// unterminated quote. A tab is drawn as the gap to the next tab stop, and a
+/// copy of that gap commonly carries spaces.
 ///
 /// The refusal itself is a printed line. It names the path, so it must leave
 /// through the same renderer: the last assertion holds the message an
@@ -3592,6 +3594,10 @@ fn a_socket_path_no_printed_command_can_carry_is_refused() {
         "/tmp/a\u{202e}b.sock",
         "/tmp/a\u{0}b.sock",
         "/tmp/a\nb.sock",
+        // A tab is not its own text on screen. A terminal draws the gap to
+        // the next tab stop, and a copy of that gap commonly carries spaces.
+        // The line an operator reads is not the line they copy.
+        "/tmp/a\tb.sock",
         // `OSC 52` writes the operator's clipboard, so the refusal of this
         // path must not emit it while saying so.
         "/tmp/a\u{1b}]52;c;cm0K\u{7}.sock",

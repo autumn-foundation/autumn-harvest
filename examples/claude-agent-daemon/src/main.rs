@@ -434,18 +434,27 @@ fn shown(text: &str, refused: fn(char) -> bool) -> std::borrow::Cow<'_, str> {
 
 /// Would this character break the ONE line it is written into?
 ///
-/// [`is_obeyed`] covers what a terminal ACTS on, and it exempts the newline.
-/// A printed message carries newlines legitimately, and escaping those would
-/// break the messages that put a follow-up command on its own line.
+/// [`is_obeyed`] covers what a terminal ACTS on, and it exempts the newline
+/// and the tab. A printed message carries both legitimately: an answer uses
+/// them for layout, and a refusal puts a follow-up command on its own line.
 ///
-/// A socket path and a log field are different. Every printed command names
-/// the socket inside ONE line, so a newline in the path splits that line. The
-/// first half ends inside an unterminated quote, and what an operator copies
-/// reaches another socket, or none.
+/// A socket path and a log field are different. Both are read back from ONE
+/// rendered line, so a character whose RENDERING is not its own text cannot
+/// appear in either.
+///
+/// A newline in a socket path splits the printed command. The first half ends
+/// inside an unterminated quote, and what an operator copies reaches another
+/// socket, or none.
+///
+/// A tab is not its own text on screen. A terminal renders it as the gap to
+/// the next tab stop. A copy of that region commonly carries the spaces it
+/// drew, and not the tab. The quoting around the path preserves the byte, so
+/// the fault is not the shell. The line an operator reads is not the line
+/// they copy.
 ///
 /// A log field has the same shape of fault. See [`one_line`].
 fn breaks_one_line(character: char) -> bool {
-    is_obeyed(character) || character == '\n'
+    is_obeyed(character) || character == '\n' || character == '\t'
 }
 
 /// Would a terminal act on this character rather than print it?
