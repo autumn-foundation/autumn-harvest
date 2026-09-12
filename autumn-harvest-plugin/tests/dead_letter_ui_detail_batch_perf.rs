@@ -19,10 +19,11 @@
 //! The last-10-events lookup is exercised at and past its own limit.
 //!
 //! Prefers `HARVEST_TEST_DATABASE_URL` (a real, already-running Postgres,
-//! for a sandbox with no Docker daemon). Falls back to a testcontainer,
-//! same as `tests/ui_integration.rs`'s `overdue_read_database_url`, since
-//! this is wired into CI's linux-osclass suite manifest and CI runners
-//! carry Docker but not a pre-set `HARVEST_TEST_DATABASE_URL`.
+//! for a sandbox with no Docker daemon). Falls back to a testcontainer
+//! otherwise, same as `tests/ui_integration.rs`'s
+//! `overdue_read_database_url`. This suite is wired into CI's
+//! linux-osclass manifest. CI runners carry Docker but not a pre-set
+//! `HARVEST_TEST_DATABASE_URL`.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -71,7 +72,22 @@ async fn admin_url_or_skip() -> Option<(String, Option<ContainerAsync<Postgres>>
     if let Ok(url) = std::env::var("HARVEST_TEST_DATABASE_URL") {
         return Some((url, None));
     }
-    match Postgres::default().with_tag("16").start().await {
+    // Overriding `cmd` replaces the image's own default (`-c fsync=off`),
+    // so it is repeated here. The default testcontainers Postgres image
+    // does not preload `shared_preload_libraries`. Without that setting,
+    // the pg_stat_statements-based regression guard below would silently
+    // degrade to skipped on every CI run through this fallback path.
+    match Postgres::default()
+        .with_tag("16")
+        .with_cmd([
+            "-c",
+            "shared_preload_libraries=pg_stat_statements",
+            "-c",
+            "fsync=off",
+        ])
+        .start()
+        .await
+    {
         Ok(container) => {
             let host = container.get_host().await.expect("container host");
             let port = container
@@ -296,16 +312,33 @@ struct StatRow {
     calls: i64,
 }
 
+#[derive(QueryableByName)]
+struct BoolRow {
+    #[diesel(sql_type = diesel::sql_types::Bool)]
+    preloaded: bool,
+}
+
+/// Checks `shared_preload_libraries` directly, rather than probing
+/// `pg_stat_statements` with a `WHERE FALSE` query. Postgres can prove a
+/// `WHERE FALSE` predicate false without ever invoking the underlying
+/// set-returning function. `EXPLAIN` shows this as a `Result` node whose
+/// child scan never executes, a "one-time filter". `CREATE EXTENSION`
+/// alone also always succeeds regardless of preload. A probe built on
+/// either would report "available" even when the view errors on any real
+/// query. `current_setting` has no such short-circuit: it always
+/// evaluates.
 async fn pg_stat_statements_available(conn: &mut AsyncPgConnection) -> bool {
     let _ = diesel::sql_query("CREATE EXTENSION IF NOT EXISTS pg_stat_statements")
         .execute(conn)
         .await;
     diesel::sql_query(
-        "SELECT 1::bigint AS calls, ''::text AS label FROM pg_stat_statements WHERE FALSE",
+        "SELECT current_setting('shared_preload_libraries', true) \
+            LIKE '%pg_stat_statements%' AS preloaded",
     )
-    .load::<StatRow>(conn)
+    .get_result::<BoolRow>(conn)
     .await
-    .is_ok()
+    .map(|r| r.preloaded)
+    .unwrap_or(false)
 }
 
 async fn fetch_html(app: &axum::Router, uri: &str) -> (StatusCode, String) {
