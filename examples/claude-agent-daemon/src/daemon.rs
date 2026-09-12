@@ -738,16 +738,19 @@ pub fn approve(
                 state.reason = "a decision is delivered; awaiting the next drive".to_string();
             }
             let decision = if approved { "approved" } else { "denied" };
+            // The session id travels as DATA when the answer points at the
+            // history. The client renders that command, because only it
+            // knows which socket it asked.
             Response::Ack {
                 detail: if crossed {
                     format!(
                         "{decision}, and the deadline passed while it was delivered. \
-                         The session may report this call as denied. Read \
-                         `agentd history {execution_id}` to see which won."
+                         The session may report this call as denied."
                     )
                 } else {
                     decision.to_string()
                 },
+                history_of: crossed.then(|| execution_id.to_string()),
             }
         }
         Err(e) => Response::Error {

@@ -99,6 +99,11 @@ pub enum Response {
     },
     Ack {
         detail: String,
+        /// Set when the answer points the operator at a session's history.
+        /// The CLIENT renders that command, because only it knows which
+        /// socket it asked. See [`socket_flag`].
+        #[serde(default)]
+        history_of: Option<String>,
     },
     Error {
         message: String,
@@ -138,6 +143,44 @@ pub struct PendingCall {
     pub input: String,
 }
 
+/// The socket a command uses when the operator names none.
+///
+/// A printed follow-up command carries `--socket` only when the operator
+/// chose another one, so the common case stays short. It lives beside
+/// [`socket_flag`], which is the one place that compares against it.
+pub const DEFAULT_SOCKET: &str = "agentd.sock";
+
+/// The `--socket` the printed command needs, or nothing.
+///
+/// `status` reaches the daemon the operator named, and the command it prints
+/// must reach the same one. Without the flag the copied line goes to the
+/// default socket, which is another daemon or nothing at all. The documented
+/// setup gives each daemon its own socket.
+///
+/// The path is quoted when a shell would read it as more than one word. It
+/// comes from the operator rather than from the model. A directory with a
+/// space in its name is ordinary, and the line is made to be copied.
+pub fn socket_flag(socket: &Path) -> String {
+    if socket == Path::new(DEFAULT_SOCKET) {
+        return String::new();
+    }
+    format!(" --socket {}", quoted(&socket.to_string_lossy()))
+}
+
+/// One shell word, quoted only when it needs to be.
+pub fn quoted(word: &str) -> String {
+    let plain = !word.is_empty()
+        && word
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.' | '/'));
+    if plain {
+        return word.to_string();
+    }
+    // Single quotes take everything literally. A single quote itself cannot
+    // appear inside them, so it is closed, escaped, and reopened.
+    format!("'{}'", word.replace('\'', "'\\''"))
+}
+
 /// Send one request to the daemon and read its answer.
 ///
 /// # Errors
@@ -147,8 +190,10 @@ pub struct PendingCall {
 pub async fn call(socket: &Path, request: &Request) -> Result<Response, String> {
     let stream = UnixStream::connect(socket).await.map_err(|e| {
         format!(
-            "cannot reach the daemon at {}: {e}. Start it with `agentd serve`.",
-            socket.display()
+            "cannot reach the daemon at {}: {e}. Start it with \
+             `agentd serve{}`.",
+            socket.display(),
+            socket_flag(socket)
         )
     })?;
     let (read_half, mut write_half) = stream.into_split();

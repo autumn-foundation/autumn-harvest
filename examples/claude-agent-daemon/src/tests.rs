@@ -2539,6 +2539,65 @@ fn the_decide_line_reaches_the_daemon_that_printed_it() {
         spaced.contains("--socket '/home/a b/agentd.sock'"),
         "a socket a shell would split must be quoted: {spaced}"
     );
+
+    // A late decision points at the history, and that command is the same
+    // failure again. The daemon sends the id and the client builds the line.
+    let late = |socket: &str| {
+        crate::rendered_lines(
+            &Response::Ack {
+                detail: "approved, and the deadline passed".to_string(),
+                history_of: Some("01JCEXEC".to_string()),
+            },
+            Path::new(socket),
+        )
+        .into_iter()
+        .find(|line| line.contains("history"))
+        .expect("the history line is printed")
+    };
+    let late_named = late("/run/agentd/project-b.sock");
+    assert!(
+        late_named.contains("--socket /run/agentd/project-b.sock")
+            && late_named.contains("01JCEXEC"),
+        "the history command must carry the socket: {late_named}"
+    );
+
+    // The refusal an operator meets when no daemon answers names the socket
+    // it tried, so the command that STARTS one must name it too. This line is
+    // built in the protocol module rather than the renderer.
+    let unreachable = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("a runtime")
+        .block_on(protocol::call(
+            Path::new("/run/agentd/project-b.sock"),
+            &Request::List,
+        ))
+        .expect_err("no daemon listens there");
+    assert!(
+        unreachable.contains("agentd serve --socket /run/agentd/project-b.sock"),
+        "the start command must name the socket that failed: {unreachable}"
+    );
+}
+
+/// The daemon builds no command an operator can copy.
+///
+/// Five separate findings were one defect: a command formatted in the daemon,
+/// which cannot know which socket the client asked. Fixing them one at a time
+/// left the next one to be found. This reads the source as data, so a command
+/// added to the daemon fails here rather than in review.
+#[test]
+fn no_operator_command_is_built_in_the_daemon() {
+    let daemon = include_str!("daemon.rs");
+    assert!(
+        !daemon.contains("`agentd "),
+        "the daemon must send data and let the client render the command"
+    );
+    // The guard is only worth having if the pattern it looks for is the one
+    // the client actually uses.
+    assert!(
+        include_str!("main.rs").contains("`agentd "),
+        "the client is where these commands belong"
+    );
 }
 
 #[test]
