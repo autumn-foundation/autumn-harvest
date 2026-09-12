@@ -2542,19 +2542,25 @@ async fn load_dead_letters_from_shards_for_ui(
                 let rows = query_dead_letters_for_ui(&mut conn, filters, limit)
                     .await
                     .map_err(|e| e.to_string())?;
+                let exec_ids: Vec<uuid::Uuid> =
+                    rows.iter().filter_map(|d| d.workflow_exec_id).collect();
+                let (names, events) = load_dead_letter_details_batch(&mut conn, &exec_ids)
+                    .await
+                    .map_err(|e| e.to_string())?;
                 let mut out = Vec::with_capacity(rows.len());
                 for dead_letter in rows {
-                    let workflow_name = load_dead_letter_workflow_name(&mut conn, &dead_letter)
-                        .await
-                        .map_err(|e| e.to_string())?;
-                    let events = load_dead_letter_events(&mut conn, &dead_letter)
-                        .await
-                        .map_err(|e| e.to_string())?;
+                    let workflow_name = dead_letter
+                        .workflow_exec_id
+                        .and_then(|id| names.get(&id).cloned());
+                    let row_events = dead_letter
+                        .workflow_exec_id
+                        .and_then(|id| events.get(&id).cloned())
+                        .unwrap_or_default();
                     out.push(DeadLetterUiRow {
                         shard_id,
                         dead_letter,
                         workflow_name,
-                        events,
+                        events: row_events,
                     });
                 }
                 Ok(out)
@@ -2643,39 +2649,71 @@ async fn count_dead_letters_for_ui(
     query.count().get_result(conn).await.map_err(database_error)
 }
 
-async fn load_dead_letter_workflow_name(
+/// Batched replacement for two lookups this function used to run once per
+/// dead letter in a page (`load_dead_letter_workflow_name` and
+/// `load_dead_letter_events`). A page holds up to `MAX_PAGE_SIZE` (200) rows.
+/// The old shape issued up to 400 extra round trips per page load. Each
+/// round trip was cheap alone, an index lookup or less. The count stayed
+/// invisible in a buffer-ranked profile and dominant in a calls-ranked one.
+///
+/// Returns `(workflow_name_by_exec_id, last_10_events_by_exec_id)`. A dead
+/// letter absent from a map had no matching row. That matches the `None` or
+/// empty `Vec` the old per-row functions returned for the same case.
+async fn load_dead_letter_details_batch(
     conn: &mut AsyncPgConnection,
-    dead_letter: &DeadLetter,
-) -> HarvestResult<Option<String>> {
-    let Some(exec_id) = dead_letter.workflow_exec_id else {
-        return Ok(None);
-    };
-    harvest_workflow_executions::table
-        .find(exec_id)
-        .select(harvest_workflow_executions::workflow_name)
-        .first(conn)
-        .await
-        .optional()
-        .map_err(database_error)
-}
+    exec_ids: &[uuid::Uuid],
+) -> HarvestResult<(
+    HashMap<uuid::Uuid, String>,
+    HashMap<uuid::Uuid, Vec<HarvestEvent>>,
+)> {
+    if exec_ids.is_empty() {
+        return Ok((HashMap::new(), HashMap::new()));
+    }
 
-async fn load_dead_letter_events(
-    conn: &mut AsyncPgConnection,
-    dead_letter: &DeadLetter,
-) -> HarvestResult<Vec<HarvestEvent>> {
-    let Some(exec_id) = dead_letter.workflow_exec_id else {
-        return Ok(Vec::new());
-    };
-    let mut events = harvest_events::table
-        .filter(harvest_events::workflow_exec_id.eq(exec_id))
-        .order(harvest_events::event_id.desc())
-        .limit(10)
-        .select(HarvestEvent::as_select())
-        .load(conn)
+    let names: HashMap<uuid::Uuid, String> = harvest_workflow_executions::table
+        .filter(harvest_workflow_executions::id.eq_any(exec_ids))
+        .select((
+            harvest_workflow_executions::id,
+            harvest_workflow_executions::workflow_name,
+        ))
+        .load::<(uuid::Uuid, String)>(conn)
         .await
-        .map_err(database_error)?;
-    events.reverse();
-    Ok(events)
+        .map_err(database_error)?
+        .into_iter()
+        .collect();
+
+    // One `LATERAL`-per-id "last 10" query instead of N separate
+    // `ORDER BY ... LIMIT 10` queries. Each `LATERAL` subquery uses the
+    // same `idx_harvest_events_exec (workflow_exec_id, event_id)` index
+    // the old per-row query relied on. The outer `ORDER BY` groups each
+    // id's rows in ascending `event_id` order already, so no per-group
+    // reverse step is needed here. The old function fetched descending
+    // order and reversed each group in Rust instead.
+    let rows: Vec<HarvestEvent> = diesel::sql_query(
+        "SELECT e.id, e.workflow_exec_id, e.event_id, e.event_type, e.event_data, e.timestamp \
+         FROM unnest($1::uuid[]) AS w(exec_id) \
+         CROSS JOIN LATERAL ( \
+             SELECT * FROM harvest_events \
+             WHERE workflow_exec_id = w.exec_id \
+             ORDER BY event_id DESC \
+             LIMIT 10 \
+         ) e \
+         ORDER BY e.workflow_exec_id, e.event_id",
+    )
+    .bind::<diesel::sql_types::Array<diesel::sql_types::Uuid>, _>(exec_ids)
+    .load(conn)
+    .await
+    .map_err(database_error)?;
+
+    let mut events: HashMap<uuid::Uuid, Vec<HarvestEvent>> = HashMap::new();
+    for event in rows {
+        events
+            .entry(event.workflow_exec_id)
+            .or_default()
+            .push(event);
+    }
+
+    Ok((names, events))
 }
 
 // ---------------------------------------------------------------------------
