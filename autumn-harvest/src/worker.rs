@@ -27884,6 +27884,36 @@ impl Worker {
                             error = %error,
                             "task execution failed"
                         );
+                        // Release the claim so the row stays retryable (issue
+                        // #1459). A workflow task that returns an error here
+                        // keeps its claim: `state` is `RUNNING` and `worker_id`
+                        // is this worker. Nothing recovers that row. The
+                        // in-process timeout above cannot fire, because
+                        // `process_task` already returned. The orphan reclaimer
+                        // skips a task that a live worker owns. So the execution
+                        // wedges until this worker stops.
+                        //
+                        // The dominant error here is a Postgres deadlock. The
+                        // parent's decision cycle and a child's terminal write
+                        // contend under load. Postgres aborts one side so the
+                        // other proceeds, and the aborted side must retry. An
+                        // aborted transaction wrote nothing, so a retry replays
+                        // the same cycle from the same history.
+                        //
+                        // Measured with issue #1459's recipe, four copies pinned
+                        // to two CPUs, rounds alternating between builds: 7
+                        // wedges in 16 runs before, 0 in 16 after.
+                        //
+                        // The reset is guarded on `state = 'RUNNING' AND
+                        // worker_id = <self>`, so it never disturbs a row that a
+                        // reclaim or a new owner already took. The slot is
+                        // dropped first, as the timeout arm does, so recovery
+                        // I/O holds no concurrency permit.
+                        #[cfg(feature = "db")]
+                        if task_type == "workflow" {
+                            drop(permit);
+                            reset_timed_out_workflow_task(&pool, task_id, &worker_id).await;
+                        }
                     }
                     Ok(TaskDispatchOutcome::BodyTimedOut) => {
                         // Release the concurrency slot immediately so other
