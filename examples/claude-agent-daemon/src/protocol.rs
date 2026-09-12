@@ -151,6 +151,12 @@ pub struct PendingCall {
     pub tool: String,
     /// The call arguments as JSON, truncated for a terminal.
     pub input: String,
+    /// Was the call CUT to fit this view?
+    ///
+    /// An approval is a decision about the whole call, so a client must not
+    /// offer to approve one it only partly showed. The flag travels as data,
+    /// because only the client knows what it printed.
+    pub truncated: bool,
 }
 
 /// The socket a command uses when the operator names none.

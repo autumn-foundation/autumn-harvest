@@ -1782,6 +1782,19 @@ async fn the_full_view_shows_a_write_that_the_status_trims() {
         !trimmed.input.contains(tail),
         "the trimmed view cannot hold the whole payload"
     );
+    assert!(
+        trimmed.truncated,
+        "the trimmed view must say it was cut, so no client offers an approval from it"
+    );
+    // The destination survives the cut. The arguments serialise in key order,
+    // so `content` comes before `path`, and a payload this long would push
+    // the path past the cut. The operator would read a cut write with no
+    // destination in it.
+    assert!(
+        trimmed.input.contains("\"path\":\"notes.md\""),
+        "the cut view must still name where the write goes: {}",
+        trimmed.input
+    );
 
     let whole =
         daemon::pending_call(&reader, &exec_id, &signal, true).expect("the full view shows a call");
@@ -1792,6 +1805,70 @@ async fn the_full_view_shows_a_write_that_the_status_trims() {
     assert!(
         !whole.input.contains("truncated"),
         "the full view must not be trimmed"
+    );
+    assert!(
+        !whole.truncated,
+        "the full view carries the approval, so it must not be marked cut"
+    );
+    // The full view is the recorded call, verbatim. The cut view reorders the
+    // arguments to save the short ones, and that reordering must never reach
+    // the text an approval is given against.
+    assert_eq!(
+        whole.input,
+        json!({ "path": "notes.md", "content": format!("{content}{tail}") }).to_string(),
+        "the full view must print the recorded call exactly"
+    );
+}
+
+/// A cut view offers no approval, and a whole one does.
+///
+/// An approval decides about the WHOLE call. The truncated flag is the only
+/// thing that separates these two views, and `pending_call` sets it from the
+/// call it actually cut. See
+/// [`the_full_view_shows_a_write_that_the_status_trims`].
+///
+/// The `deny` command stays on the cut view. Refusing a call nobody has read
+/// refuses a write. Making an operator read 64 KiB before they may refuse it
+/// is a reason to skip the reading.
+#[test]
+fn a_cut_pending_call_offers_no_approval() {
+    let view = |truncated: bool| protocol::SessionView {
+        execution_id: "01JCEXEC".to_string(),
+        goal: "tidy the notes".to_string(),
+        state: "RUNNING".to_string(),
+        blocked_on: Some("waiting for a tool approval".to_string()),
+        pending: Some(protocol::PendingCall {
+            token: "tool_approval:toolu_a".to_string(),
+            id: "toolu_a".to_string(),
+            tool: tools::TOOL_WRITE_FILE.to_string(),
+            input: "{\"path\":\"notes.md\"}".to_string(),
+            truncated,
+        }),
+        answer: None,
+        error: None,
+    };
+    let rendered = |truncated: bool| {
+        crate::session_lines(&view(truncated), Path::new("agentd.sock")).join("\n")
+    };
+
+    let cut = rendered(true);
+    assert!(
+        !cut.contains("agentd approve"),
+        "a cut view must offer no approval: {cut}"
+    );
+    assert!(
+        cut.contains("agentd status 01JCEXEC --full"),
+        "a cut view must name the command that shows the call whole: {cut}"
+    );
+    assert!(
+        cut.contains("agentd deny 01JCEXEC tool_approval:toolu_a"),
+        "a cut view must still offer the refusal: {cut}"
+    );
+
+    let whole = rendered(false);
+    assert!(
+        whole.contains("agentd approve 01JCEXEC tool_approval:toolu_a"),
+        "a whole view carries the approval: {whole}"
     );
 }
 
@@ -2383,6 +2460,7 @@ fn model_text_cannot_drive_the_terminal() {
             id: "toolu_a".to_string(),
             tool: "write_file\u{1b}[2K".to_string(),
             input: "{\"path\":\"notes\u{202e}gnp.md\"}".to_string(),
+            truncated: false,
         }),
         answer: Some("done\u{1b}]52;c;cm0K\u{7}".to_string()),
         error: None,
@@ -2535,6 +2613,7 @@ fn the_decide_line_reaches_the_daemon_that_printed_it() {
             id: "toolu_a".to_string(),
             tool: "write_file".to_string(),
             input: "{}".to_string(),
+            truncated: false,
         }),
         answer: None,
         error: None,

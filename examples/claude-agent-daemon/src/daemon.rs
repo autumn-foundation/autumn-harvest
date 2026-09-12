@@ -1117,21 +1117,58 @@ pub fn pending_call(
                 let mut input = call.input.to_string();
                 // A decision needs the WHOLE payload, and a write carries up
                 // to 64 KiB. The status trims it to stay readable, and
-                // `--full` prints every byte, so nothing is ever approved
-                // sight unseen.
-                if !full && input.chars().count() > MAX_PENDING_INPUT_CHARS {
-                    input = input.chars().take(MAX_PENDING_INPUT_CHARS).collect();
-                    input.push_str(" … (truncated; read it all with `status --full`)");
+                // `--full` prints every byte.
+                //
+                // A trimmed view says so, and the client offers no approval
+                // from it. The operator would otherwise read a cut call and
+                // paste the command that authorises all of it.
+                let truncated = !full && input.chars().count() > MAX_PENDING_INPUT_CHARS;
+                if truncated {
+                    input = shortest_first(&call.input)
+                        .chars()
+                        .take(MAX_PENDING_INPUT_CHARS)
+                        .collect();
+                    input.push_str(
+                        " … (truncated; no approval is offered from this view; \
+                         read it all with `status --full`)",
+                    );
                 }
                 return Some(PendingCall {
                     token: signal.to_string(),
                     id: call.id,
                     tool: call.name,
                     input,
+                    truncated,
                 });
             }
         }
     }
+}
+
+/// One call's arguments with the SHORTEST field first.
+///
+/// A cut view keeps what comes first, and the fields serialise in key order.
+/// A `write_file` call carries `content` before `path`, so a long content
+/// pushes the destination past the cut. The operator would read a cut call
+/// that does not say where it writes.
+///
+/// The order is by the LENGTH of each value, so this is not the recorded
+/// call. It is built only for a view that is already cut, and the full view
+/// prints the call verbatim.
+fn shortest_first(input: &serde_json::Value) -> String {
+    let Some(fields) = input.as_object() else {
+        return input.to_string();
+    };
+    let mut pairs: Vec<(&String, String)> = fields
+        .iter()
+        .map(|(key, value)| (key, value.to_string()))
+        .collect();
+    pairs.sort_by_key(|(_, text)| text.chars().count());
+    let body: Vec<String> = pairs
+        .iter()
+        .map(|(key, text)| format!("{}:{text}", serde_json::Value::String((*key).clone())))
+        .collect();
+    format!("{{{}}}", body.join(","))
 }
 
 /// Create the workspace, make it durable, and record its resolved name.

@@ -537,12 +537,33 @@ fn session_lines(view: &SessionView, socket: &Path) -> Vec<String> {
     if let Some(pending) = &view.pending {
         lines.push(format!("  pending: {} ({})", pending.tool, pending.id));
         lines.push(format!("           {}", pending.input));
-        lines.push(format!(
-            "  decide:  agentd approve{} {} {}   (or `deny`)",
-            protocol::socket_flag(socket),
-            view.execution_id,
-            pending.token
-        ));
+        if pending.truncated {
+            // An approval decides about the WHOLE call, and this view is cut.
+            // The command that approves it is not offered here.
+            //
+            // The command that DENIES it is. A denial of a call nobody has
+            // read refuses a write, which is the safe answer. Making the
+            // operator read 64 KiB before they may refuse it is a reason to
+            // skip the reading.
+            lines.push(format!(
+                "  decide:  read it all first: agentd status{} {} --full",
+                protocol::socket_flag(socket),
+                view.execution_id,
+            ));
+            lines.push(format!(
+                "           agentd deny{} {} {}",
+                protocol::socket_flag(socket),
+                view.execution_id,
+                pending.token
+            ));
+        } else {
+            lines.push(format!(
+                "  decide:  agentd approve{} {} {}   (or `deny`)",
+                protocol::socket_flag(socket),
+                view.execution_id,
+                pending.token
+            ));
+        }
     }
     if let Some(answer) = &view.answer {
         lines.push(format!("  answer:  {answer}"));

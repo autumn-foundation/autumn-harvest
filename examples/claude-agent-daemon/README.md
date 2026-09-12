@@ -205,8 +205,17 @@ A decision is spent when it is delivered: a repeated `approve` is refused
 rather than staging a second signal that a later call could consume.
 
 A write can carry up to 64 KiB, and `status` trims a long one to stay readable.
-It says so when it does, and `status <id> --full` prints every byte — so nothing
-is ever approved sight unseen.
+A trimmed view says so, and it offers NO approval command: it prints the
+`--full` command to read the call whole, and the `deny` command, which needs no
+more than what you have seen. `status <id> --full` prints every byte, and the
+`approve` command appears there.
+
+A trimmed view also leads with the SHORTEST arguments, so a 64 KiB `content`
+cannot push the destination `path` past the cut. The arguments serialise in key
+order, and `content` sorts before `path`.
+
+The daemon cannot know what you read; it decides what it OFFERS. Typing an
+approval by hand from a trimmed view is still yours to do.
 
 ## How it is put together
 
