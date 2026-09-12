@@ -168,10 +168,24 @@ async fn main() -> ExitCode {
     match run(cli).await {
         Ok(()) => ExitCode::SUCCESS,
         Err(message) => {
-            eprintln!("agentd: {message}");
+            eprintln!("{}", failure(&message));
             ExitCode::FAILURE
         }
     }
+}
+
+/// The line an operator reads when a command fails.
+///
+/// The message leaves through [`visible`], as every printed line does. A
+/// failure names what it refused, and the refusal of a socket path holds that
+/// path. Writing it raw would obey the very characters the refusal exists to
+/// refuse.
+///
+/// A message of several lines stays several lines. `visible` keeps the
+/// newline, because a refusal that names a follow-up command puts it on its
+/// own line.
+fn failure(message: &str) -> String {
+    format!("agentd: {}", visible(message))
 }
 
 /// The API key, from the environment only.
@@ -217,10 +231,13 @@ fn usable_key(raw: &str) -> Option<String> {
 /// command names a different socket. That is the same fault as a path that is
 /// not text, one step further on.
 ///
+/// A newline is refused here as well, and `visible` keeps that character.
+/// See [`breaks_a_command`].
+///
 /// # Errors
 ///
-/// Returns an error if the path is not UTF-8, or if it holds a character the
-/// renderer would rewrite.
+/// Returns an error if the path is not UTF-8, or if it holds a character no
+/// printed command can carry.
 fn printable(socket: &Path) -> Result<(), String> {
     let Some(text) = socket.to_str() else {
         return Err(format!(
@@ -229,14 +246,15 @@ fn printable(socket: &Path) -> Result<(), String> {
             socket.display()
         ));
     };
-    if let Some(rewritten) = text.chars().find(|c| is_obeyed(*c)) {
+    if let Some(refused) = text.chars().find(|c| breaks_a_command(*c)) {
         return Err(format!(
-            "the socket path {} holds {}, which a terminal would act on rather \
-             than print. Every command this daemon prints shows that character \
-             as an escape, so a copied command would name another socket. \
-             Choose a path of ordinary text.",
+            "the socket path {} holds {}, which no command this daemon prints \
+             can carry. Every one of them names the socket on ONE line, and \
+             that character would split the line or be shown as an escape. A \
+             copied command would then name another socket. Choose a path of \
+             ordinary text.",
             socket.display(),
-            rewritten.escape_unicode()
+            refused.escape_unicode()
         ));
     }
     Ok(())
@@ -391,6 +409,20 @@ fn visible(text: &str) -> std::borrow::Cow<'_, str> {
         }
     }
     std::borrow::Cow::Owned(shown)
+}
+
+/// Would this character break a command that names the socket?
+///
+/// [`is_obeyed`] covers what a terminal ACTS on, and it exempts the newline.
+/// A printed message carries newlines legitimately, and escaping those would
+/// break the messages that put a follow-up command on its own line.
+///
+/// A socket path is different. Every printed command names it inside ONE
+/// line, so a newline in the path splits that line. The first half ends
+/// inside an unterminated quote, and what an operator copies reaches another
+/// socket, or none.
+fn breaks_a_command(character: char) -> bool {
+    is_obeyed(character) || character == '\n'
 }
 
 /// Would a terminal act on this character rather than print it?

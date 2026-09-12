@@ -3241,19 +3241,32 @@ fn a_capped_listing_walks_the_whole_directory() {
     );
 }
 
-/// A socket path a terminal would rewrite is refused.
+/// A socket path no printed command can carry is refused.
 ///
 /// Being UTF-8 is not enough. Every printed line leaves through `visible`,
 /// which rewrites a character a terminal would act on. A path holding one is
 /// printed as an escape, and the copied command names another socket.
+///
+/// A NEWLINE is refused too, and for the opposite reason: `visible` keeps it,
+/// because a printed message may hold several lines. Every printed command
+/// names the socket on ONE line. A newline in the path splits that line, and
+/// leaves an unterminated quote in what an operator copies.
+///
+/// The refusal itself is a printed line. It names the path, so it must leave
+/// through the same renderer: the last assertion holds the message an
+/// operator actually reads.
 #[test]
-fn a_socket_path_the_terminal_would_rewrite_is_refused() {
+fn a_socket_path_no_printed_command_can_carry_is_refused() {
     use clap::Parser;
 
     for raw in [
         "/tmp/a\u{1b}[2K.sock",
         "/tmp/a\u{202e}b.sock",
         "/tmp/a\u{0}b.sock",
+        "/tmp/a\nb.sock",
+        // `OSC 52` writes the operator's clipboard, so the refusal of this
+        // path must not emit it while saying so.
+        "/tmp/a\u{1b}]52;c;cm0K\u{7}.sock",
     ] {
         let cli = crate::Cli::try_parse_from(["agentd", "--socket", raw, "list"])
             .expect("clap accepts the text; the refusal is the daemon's own");
@@ -3262,10 +3275,17 @@ fn a_socket_path_the_terminal_would_rewrite_is_refused() {
             .build()
             .expect("a runtime")
             .block_on(crate::run(cli));
-        let message = refused.expect_err("a path the renderer rewrites must be refused");
+        let message = refused.expect_err("a path no printed command can carry must be refused");
         assert!(
-            message.contains("act on"),
+            message.contains("no command this daemon prints"),
             "the refusal must name the reason: {message}"
+        );
+        // The line an operator READS. A refusal that obeyed the characters it
+        // refuses would do the damage it exists to prevent.
+        let printed = crate::failure(&message);
+        assert!(
+            !printed.chars().any(crate::is_obeyed),
+            "the printed refusal must obey nothing: {printed:?}"
         );
     }
 
