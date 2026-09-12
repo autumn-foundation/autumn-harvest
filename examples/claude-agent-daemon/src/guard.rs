@@ -116,6 +116,58 @@ pub fn acquire(db: &Path) -> Result<DaemonLock, String> {
     Ok(DaemonLock { _file: file })
 }
 
+/// Take the exclusive lock for the socket PATHNAME, or report who holds it.
+///
+/// The database lock above is held on the file's own identity, because many
+/// names reach one database. This lock is the other way round: what two
+/// daemons contend for here IS the name. A control socket is reached by the
+/// pathname an operator types, and only one listener can answer on it.
+///
+/// Without this, reclaiming a stale socket is a race. Two daemons of the same
+/// user, on different databases, can both find the name stale and refused.
+/// The first removes it and binds; the second then removes the live socket the
+/// first is listening on and binds its own. The first keeps running, with
+/// nothing able to reach it, and never learns.
+///
+/// The lock is a sidecar named after the socket, because a socket file cannot
+/// be opened. That bounds what it covers: two spellings of one path, such as a
+/// symbolic link, take two locks. The pathname is what an operator gives and
+/// what a printed command carries, so the spelling is the thing being claimed.
+///
+/// # Errors
+///
+/// Returns an error if the lock file cannot be opened, or if another daemon
+/// already holds it.
+pub fn acquire_socket(socket: &Path) -> Result<DaemonLock, String> {
+    let mut name = socket.as_os_str().to_owned();
+    name.push(".lock");
+    let path = std::path::PathBuf::from(name);
+    // Owner-only, like the socket beside it. Whoever can reach the socket can
+    // spend money and approve writes, and this file names it.
+    let file = with_private_umask(|| {
+        OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .truncate(false)
+            .mode(PRIVATE_MODE)
+            .open(&path)
+    })
+    .map_err(|e| format!("cannot open {}: {e}", path.display()))?;
+
+    // Non-blocking, so the loser of the race exits at once with a message
+    // naming the socket, rather than binding over a live daemon.
+    flock(&file, FlockOperation::NonBlockingLockExclusive).map_err(|_| {
+        format!(
+            "another daemon holds the socket {}. One listener owns one socket \
+             path; give this daemon its own `--socket`.",
+            socket.display()
+        )
+    })?;
+
+    Ok(DaemonLock { _file: file })
+}
+
 /// Run `f` with a mask that makes everything it creates owner-only.
 ///
 /// `SQLite` creates the `-wal` and `-shm` sidecars itself, and the control

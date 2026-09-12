@@ -360,10 +360,14 @@ Honest limits, so nothing here reads as a promise:
   `SQLite` must be handed a path, since that is how it names its write-ahead
   log. The same reasoning applies: whoever can win these races already runs as
   you.
-- **Two daemons must not share one socket path.** Pointed at the same
-  `--socket` with different databases, two daemons starting at once can both
-  find the socket stale, and the loser ends up running but unreachable. Give
-  each daemon its own `--socket`.
+- **One socket path has one daemon**, held by a lock beside the socket. The
+  database lock cannot stand in for it: two daemons on different databases
+  contend for neither the file nor the task reclaim, so both could find one
+  stale socket refused and replace it, and the first would end up running with
+  nothing able to reach it. The second daemon now exits naming the socket,
+  before it inspects or removes anything. The lock is on the PATHNAME, so two
+  spellings of one path — a symbolic link, say — take two locks; the pathname
+  is what an operator types and what a printed command carries.
 - **An atomic write replaces the file, so it replaces its owner.** The rename
   that makes a write all-or-nothing installs a new inode, which the daemon
   owns. Its mode is carried over, but an unprivileged process cannot give a

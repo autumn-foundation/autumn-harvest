@@ -162,6 +162,15 @@ pub async fn serve(options: Options) -> Result<(), String> {
     // long as this call, and the kernel releases it if the process dies.
     let _lock = guard::acquire(&options.db)?;
 
+    // And the per-SOCKET lock, which the database lock cannot stand in for.
+    // Two daemons on different databases contend for neither the file nor the
+    // reclaim. Both could therefore find one stale socket, and the second
+    // would unlink the first's live one. See [`guard::acquire_socket`].
+    //
+    // It is taken here, before the runtime opens, so a daemon that has lost
+    // the socket exits without reclaiming anything.
+    let _socket_lock = guard::acquire_socket(&options.socket)?;
+
     // One task waits for `Ctrl-C` and raises the flag. The drive loop cannot
     // wait for the signal itself. A model call blocks its thread, so nothing
     // else on that task is polled until the call returns. See `shutdown`.

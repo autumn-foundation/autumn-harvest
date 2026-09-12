@@ -3649,6 +3649,78 @@ fn a_log_field_obeys_nothing() {
     );
 }
 
+/// One socket path has one daemon, whatever database each one holds.
+///
+/// The database lock cannot stand in for this. Two daemons on different
+/// databases contend for neither the file nor the task reclaim. Both could
+/// therefore find one stale socket refused and decide to replace it. The
+/// first removes it and binds; the second then unlinks the live socket the
+/// first is listening on and binds its own. The first keeps running,
+/// unreachable, and never learns.
+///
+/// The loser now exits instead, naming the socket, and the winner stays
+/// reachable.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_second_daemon_cannot_take_a_socket_another_one_holds() {
+    let dir = tempfile::tempdir().expect("a temporary directory");
+    let socket = dir.path().join("shared.sock");
+    let options = |db: &str| daemon::Options {
+        db: dir.path().join(db),
+        socket: socket.clone(),
+        workspace: dir.path().join("workspace"),
+        model: claude::DEFAULT_MODEL.to_string(),
+        max_tokens: claude::DEFAULT_MAX_TOKENS,
+        tick: Duration::from_millis(50),
+        api_key: None,
+    };
+
+    let first = tokio::spawn(daemon::serve(options("first.db")));
+    await_daemon(&socket).await;
+
+    // A second daemon, its own database, the same socket.
+    let refusal =
+        tokio::time::timeout(Duration::from_secs(10), daemon::serve(options("second.db")))
+            .await
+            .expect("the second daemon must refuse rather than start");
+    let message = refusal.expect_err("the second daemon must not take the socket");
+    assert!(
+        message.contains("another daemon holds the socket"),
+        "the refusal must say what is held: {message}"
+    );
+    assert!(
+        message.contains(socket.to_str().expect("the socket path is UTF-8")),
+        "the refusal must name the socket: {message}"
+    );
+
+    // The first daemon is still the one behind the name.
+    let answer = protocol::call(&socket, &Request::List { before: None })
+        .await
+        .expect("the first daemon still answers");
+    assert!(
+        matches!(answer, Response::Sessions { .. }),
+        "unexpected answer: {answer:?}"
+    );
+
+    first.abort();
+    drop(first.await);
+
+    // The descriptor IS the lock, so dropping it frees the socket for a later
+    // daemon. This is asserted on the guard itself. Aborting `serve` drops its
+    // locks, and the accept loop it spawned keeps the listener. The daemon
+    // path therefore cannot show the release without a second process.
+    let held = guard::acquire_socket(&socket).expect("the lock is free again");
+    let denied = guard::acquire_socket(&socket);
+    assert!(
+        denied.is_err(),
+        "a held socket lock must refuse a second holder"
+    );
+    drop(held);
+    assert!(
+        guard::acquire_socket(&socket).is_ok(),
+        "dropping the lock frees the socket"
+    );
+}
+
 /// A socket path no printed command can carry is refused.
 ///
 /// Being UTF-8 is not enough. Every printed line leaves through `visible`,
