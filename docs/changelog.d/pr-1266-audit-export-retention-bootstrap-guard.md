@@ -565,6 +565,31 @@ pins the fix, and
 `from_dsns_keeps_an_explicit_trailing_pg_catalog_distinct_from_the_implicit_leading_one`
 pins that an explicit, non-leading `pg_catalog` still stays distinct.
 
+A twenty-first review round raised two more findings in the same area,
+both P1, both the dangerous under-merging direction.
+
+The first found that `split_options_preserving_escapes` only
+recognized an escaped space or backslash, but `PostgreSQL`'s own
+splitter (`pg_split_opts`) tests with `isspace()`, not specifically a
+space -- a tab or other whitespace escapes the same way. An alias using
+an escaped tab within a `search_path` value truncated at that tab, the
+same failure mode the sixteenth round's escaped-space fix closed for
+spaces specifically. The escape condition now recognizes a backslash
+before any whitespace character, not only a literal space.
+
+The second found that `search_path=public` and `search_path=public,
+public` resolve the identical schema in the identical order --
+Postgres does not treat a repeated name specially, so a later repeat
+changes nothing about where a relation resolves -- but the
+normalization kept both copies, splitting the two aliases into
+separate pool groups. `normalize_search_path` now drops a repeated name
+after the `pg_catalog` insertion, keeping only its first occurrence.
+
+New tests:
+`from_dsns_groups_dsns_whose_search_path_differs_only_by_an_escaped_tab`
+pins the first fix, and
+`from_dsns_groups_a_search_path_with_a_repeated_name` pins the second.
+
 **Zero migration, zero engine impact beyond the new parameter.** No new
 `WorkflowEvent` variant, no schema change, no change to any existing call
 site's behavior when the new flag is left at its default (disabled).

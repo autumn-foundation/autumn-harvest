@@ -1145,10 +1145,14 @@ fn extract_search_path(options: &str) -> Option<String> {
 }
 
 /// Splits a libpq `options` string into arguments, honoring its
-/// documented escaping (issue #1266). `\ ` embeds a literal space in
-/// the current argument instead of ending it. `\\` embeds a literal
-/// backslash. Naive whitespace splitting would end an argument at an
-/// escaped space, corrupting any value that contains one.
+/// documented escaping (issue #1266). A backslash before any
+/// whitespace character embeds that character literally in the
+/// current argument instead of ending it there. `PostgreSQL`'s own
+/// splitter (`pg_split_opts`) tests with `isspace()`, not specifically
+/// a space, so a tab or other whitespace escapes the same way. `\\`
+/// embeds a literal backslash. Naive whitespace splitting would end an
+/// argument at an escaped whitespace character, corrupting any value
+/// that contains one.
 #[cfg(feature = "db")]
 fn split_options_preserving_escapes(options: &str) -> Vec<String> {
     let mut tokens = Vec::new();
@@ -1156,7 +1160,11 @@ fn split_options_preserving_escapes(options: &str) -> Vec<String> {
     let mut has_token = false;
     let mut chars = options.chars().peekable();
     while let Some(c) = chars.next() {
-        if c == '\\' && matches!(chars.peek(), Some(' ' | '\\')) {
+        if c == '\\'
+            && chars
+                .peek()
+                .is_some_and(|next| next.is_whitespace() || *next == '\\')
+        {
             current.push(chars.next().expect("peeked Some above"));
             has_token = true;
         } else if c.is_whitespace() {
@@ -1198,6 +1206,12 @@ fn split_options_preserving_escapes(options: &str) -> Vec<String> {
 /// left as-is. Its explicit position then decides the resolution
 /// order, and an explicit, non-leading position is a genuinely
 /// different order from the implicit one.
+///
+/// A repeated name is then dropped, keeping only its first occurrence
+/// (issue #1266). `public` and `public,public` search the identical
+/// schema in the identical order. A later repeat of a name already
+/// searched changes nothing about where a relation resolves, so they
+/// must key the same too.
 #[cfg(feature = "db")]
 fn normalize_search_path(value: &str) -> String {
     parse_identifier_list(value).map_or_else(
@@ -1206,6 +1220,8 @@ fn normalize_search_path(value: &str) -> String {
             if !items.iter().any(|item| item == "pg_catalog") {
                 items.insert(0, "pg_catalog".to_string());
             }
+            let mut seen = std::collections::HashSet::new();
+            items.retain(|item| seen.insert(item.clone()));
             items
                 .iter()
                 .map(|item| escape_identifier_list_item(item))
@@ -2872,6 +2888,67 @@ mod tests {
             "omitting pg_catalog always searches it first, but naming it \
              explicitly last searches it last -- a genuinely different \
              resolution order that must never collapse with the implicit one"
+        );
+    }
+
+    #[cfg(feature = "db")]
+    #[test]
+    fn from_dsns_groups_a_search_path_with_a_repeated_name() {
+        let sharded = ShardedDbPool::from_dsns(
+            [
+                (
+                    ShardId::new(0),
+                    "postgres://db.example/shared?options=-c%20search_path%3Dpublic".to_string(),
+                ),
+                (
+                    ShardId::new(1),
+                    "postgres://db.example/shared?options=-c%20search_path%3Dpublic%2Cpublic"
+                        .to_string(),
+                ),
+            ],
+            ShardId::new(0),
+            1,
+        )
+        .expect("pool builds without connecting");
+
+        let groups = sharded.pool_groups();
+        assert_eq!(
+            groups.len(),
+            1,
+            "public and public,public search the identical schema in \
+             the identical order, so a repeated name must not stop \
+             these from collapsing into one group"
+        );
+    }
+
+    #[cfg(feature = "db")]
+    #[test]
+    fn from_dsns_groups_dsns_whose_search_path_differs_only_by_an_escaped_tab() {
+        let sharded = ShardedDbPool::from_dsns(
+            [
+                (
+                    ShardId::new(0),
+                    "postgres://db.example/shared?options=-c%20search_path%3Dtenant%2Cpublic"
+                        .to_string(),
+                ),
+                (
+                    ShardId::new(1),
+                    "postgres://db.example/shared?options=-c%20search_path%3Dtenant%2C%5C%09public"
+                        .to_string(),
+                ),
+            ],
+            ShardId::new(0),
+            1,
+        )
+        .expect("pool builds without connecting");
+
+        let groups = sharded.pool_groups();
+        assert_eq!(
+            groups.len(),
+            1,
+            "an escaped tab in one alias's search_path value must not \
+             stop it from collapsing with the other, just as an escaped \
+             space does not"
         );
     }
 

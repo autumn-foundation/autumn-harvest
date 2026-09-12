@@ -367,9 +367,11 @@ shard records:
   must stay in separate groups, and two DSNs whose last `search_path`
   setting agrees must stay in one even if an earlier, overridden setting
   differs. Splitting `options` into arguments honors libpq's own
-  escaping: a backslash before a space embeds a literal space in the
-  current argument instead of ending it, so a `search_path` value is not
-  truncated at an escaped space. The extracted value is then parsed as a
+  escaping: a backslash before any whitespace character (not only a
+  space — Postgres's own splitter, `pg_split_opts`, tests with
+  `isspace()`) embeds that character literally in the current argument
+  instead of ending it, so a `search_path` value is not truncated at an
+  escaped space or tab. The extracted value is then parsed as a
   Postgres identifier list, the same grammar `SplitIdentifierString`
   uses for `search_path` server-side: comma-separated, with
   insignificant whitespace around each name, an unquoted name folded to
@@ -390,6 +392,10 @@ shard records:
   `pg_catalog,public` resolve an unqualified relation identically and
   must key the same, while `public,pg_catalog` (an explicit, trailing
   `pg_catalog`) names a genuinely different order and stays distinct.
+  A repeated name is then dropped, keeping only its first occurrence:
+  `public` and `public,public` search the identical schema in the
+  identical order, so a later repeat changes nothing about where a
+  relation resolves.
   Every other query parameter (`application_name`, `sslmode`, and so on)
   is dropped, since none of them changes which relation a query resolves
   against — except `host`, `hostaddr`, and `port`: a Unix-socket DSN
