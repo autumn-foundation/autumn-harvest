@@ -435,17 +435,25 @@ async fn seed_fixture(database_url: &str) -> (usize, usize, usize) {
     )
 }
 
+/// Returns `true` only when `pg_stat_statements` is both preloaded AND
+/// successfully reset. Consider a silently ignored reset failure, say a
+/// connected role lacking permission to call `pg_stat_statements_reset`.
+/// That permission defaults to superuser-only. Fixture-setup queries'
+/// counts would stay in place. Those counts can land in the same bucket
+/// the real per-request query does. A genuinely batched query could then
+/// still fail the `calls == 1` assertion below, over a stale count that
+/// has nothing to do with batching.
 async fn reset_pg_stat_statements(conn: &mut AsyncPgConnection) -> bool {
-    let has_stats = pg_stat_statements_available(conn).await;
-    if has_stats {
-        let _ = diesel::sql_query(
-            "SELECT pg_stat_statements_reset(0, \
-                    (SELECT oid FROM pg_database WHERE datname = current_database()), 0)",
-        )
-        .execute(conn)
-        .await;
+    if !pg_stat_statements_available(conn).await {
+        return false;
     }
-    has_stats
+    diesel::sql_query(
+        "SELECT pg_stat_statements_reset(0, \
+                (SELECT oid FROM pg_database WHERE datname = current_database()), 0)",
+    )
+    .execute(conn)
+    .await
+    .is_ok()
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
