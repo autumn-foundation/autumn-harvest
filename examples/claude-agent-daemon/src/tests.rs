@@ -5783,19 +5783,17 @@ fn a_response_body_is_read_under_a_byte_cap() {
     );
     assert_eq!(body.len(), cap, "a full body grows no further");
 
-    // The property the cap must hold, read from the same constants the code
-    // uses so the two cannot drift. A body this reader ACCEPTS always fits
-    // once it is recorded.
+    // The property this cap must hold. It is a MEMORY bound, so it must sit
+    // ABOVE the recorded payload cap. A reply the backend could record must
+    // never be cut, whatever proportion of it duplicates.
     //
-    // This once asserted the opposite — that the cap was ABOVE the recorded
-    // payload cap, so no recordable reply would be refused for its size. The
-    // factor runs the other way. The durable reply is twice the body, so a
-    // cap above the recorded one accepted bodies nothing could store.
-    let recordable = cap as u64 * claude::DURABLE_BYTES_PER_BODY_BYTE;
+    // The durable limit is NOT enforced here. A cap of half the recorded one
+    // would enforce both at once only if every reply duplicated, and a
+    // thinking-heavy reply duplicates nothing. See
+    // `a_recordable_thinking_reply_is_never_cut`.
     assert!(
-        recordable <= claude::DURABLE_CAP_BYTES,
-        "a body at the cap must fit once recorded: {recordable} against \
-         {}",
+        cap as u64 >= claude::DURABLE_CAP_BYTES,
+        "the read cap must not cut a recordable reply: {cap} against {}",
         claude::DURABLE_CAP_BYTES
     );
 }
@@ -5833,11 +5831,13 @@ fn a_reply_the_backend_cannot_record_is_refused() {
         (body.len() as u64, durable.len() as u64)
     };
 
-    // The duplication, measured rather than assumed. The constant the caps
-    // are derived from must be a SOUND bound. It must also be no looser than
-    // it needs to be, so a smaller factor is shown not to hold.
+    // The duplication, measured rather than assumed. The factor must BOUND
+    // the cost of a reply of text and tool calls. It must also be no looser
+    // than it needs to be for that shape.
     let (body, durable) = sizes(400_000);
-    let factor = claude::DURABLE_BYTES_PER_BODY_BYTE;
+    // The worst case, which is a property of the representation rather than
+    // a constant any code path derives from. Nothing but this test reads it.
+    let factor = 2_u64;
     assert!(
         durable <= body * factor,
         "the factor must bound the cost: {durable} recorded for a body of {body}"
@@ -5855,20 +5855,16 @@ fn a_reply_the_backend_cannot_record_is_refused() {
         "the fixture must straddle the cap: body {body}, recorded {durable}"
     );
 
-    // The read cap now refuses that body while it is still arriving, so the
-    // turn is not paid for first.
+    // The read cap does NOT refuse that body, and must not. The same size of
+    // body carrying thinking blocks records half as much, and is recordable.
+    // Only the reply itself can tell the two apart.
     assert!(
-        body > claude::MAX_BODY_BYTES as u64,
-        "the read cap must refuse a body whose reply cannot be recorded"
+        body <= claude::MAX_BODY_BYTES as u64,
+        "the read cap is a memory bound and must admit this body"
     );
 
-    // And the reply itself is measured as it will be STORED, which no
-    // arithmetic over the body can promise. This decision is UNREACHABLE
-    // over HTTP while the cap above holds, because the read refuses such a
-    // body first. It is the guard that survives a change to `TurnReply`: a
-    // new field raises the real factor, and the derived cap stops holding
-    // silently. So the decision is driven directly here, and the wiring into
-    // the turn is the one line above `Ok(reply)`.
+    // So the reply is measured as it will be STORED, which no arithmetic over
+    // the body can promise. That measurement is the durable limit.
     let refusal = claude::activity_refusal_for_oversized_reply(&reply_of(900_000));
     assert!(
         refusal.is_some(),
@@ -5884,6 +5880,80 @@ fn a_reply_the_backend_cannot_record_is_refused() {
     assert!(
         claude::activity_refusal_for_oversized_reply(&reply_of(1_000)).is_none(),
         "an ordinary reply must still be accepted"
+    );
+}
+
+/// A recordable thinking-heavy reply is never cut by the read cap.
+///
+/// `parse_reply` copies text and tool calls out of `content` into `text` and
+/// `tool_calls`, and copies NOTHING out of a `thinking` or
+/// `redacted_thinking` block. So the duplication factor is a worst case and
+/// not a rate: a thinking-heavy reply is stored once.
+///
+/// A read cap derived by DIVIDING the recorded cap by that worst case cuts
+/// such a reply in half. A cut body
+/// does not parse, so the turn failed as a malformed response. The spend was
+/// the same, and the response was perfectly recordable. The cap is a memory
+/// bound, and the durable limit belongs on the reply.
+#[test]
+fn a_recordable_thinking_reply_is_never_cut() {
+    let thinking = |chars: usize| {
+        json!({
+            "id": "msg_1", "type": "message", "role": "assistant", "model": "m",
+            "content": [
+                { "type": "thinking", "thinking": "r".repeat(chars), "signature": "sig" },
+                { "type": "text", "text": "done" },
+            ],
+            "stop_reason": "end_turn",
+            "usage": { "input_tokens": 10, "output_tokens": 20 },
+        })
+    };
+
+    // A thinking block is NOT duplicated, so the reply is about the size of
+    // the body rather than twice it.
+    let payload = thinking(1_800_000);
+    let body = serde_json::to_vec(&payload).expect("the body serialises");
+    let reply = claude::parse_reply(&payload);
+    let durable = serde_json::to_vec(&reply).expect("the reply serialises");
+    assert!(
+        durable.len() <= body.len(),
+        "a thinking-heavy reply must not grow: {} recorded for a body of {}",
+        durable.len(),
+        body.len()
+    );
+    assert!(
+        reply.text == "done" && reply.tool_calls.is_empty(),
+        "nothing is copied out of a thinking block: {:?}",
+        reply.text
+    );
+
+    // The backend would record it, so this daemon must not refuse it.
+    assert!(
+        durable.len() as u64 <= claude::DURABLE_CAP_BYTES,
+        "the fixture must be recordable: {} against {}",
+        durable.len(),
+        claude::DURABLE_CAP_BYTES
+    );
+    assert!(
+        claude::activity_refusal_for_oversized_reply(&reply).is_none(),
+        "a recordable reply must not be refused"
+    );
+
+    // And the read cap must not cut it. This is the assertion that fails
+    // against a cap derived by dividing the recorded cap.
+    assert!(
+        body.len() <= claude::MAX_BODY_BYTES,
+        "the read cap must admit a recordable body: {} against {}",
+        body.len(),
+        claude::MAX_BODY_BYTES
+    );
+
+    // Why a cut is terminal rather than merely lossy: the bytes stop mid
+    // document, so nothing can read them.
+    let cut = &body[..body.len() / 2];
+    assert!(
+        serde_json::from_slice::<serde_json::Value>(cut).is_err(),
+        "a cut body does not parse, so a cut turn is a malformed one"
     );
 }
 

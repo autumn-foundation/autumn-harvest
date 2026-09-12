@@ -345,6 +345,21 @@ pub const DURABLE_CAP_BYTES: u64 = autumn_harvest::builder::DEFAULT_MAX_ACTIVITY
 
 /// The recorded size of this reply, when the backend would refuse it.
 ///
+/// A reply can cost up to TWICE its response body. [`TurnReply`] keeps the
+/// assistant blocks verbatim in `content`, and `parse_reply` copies their
+/// text and their tool calls into `text` and `tool_calls`. That doubling is
+/// a worst case and not a rate. Nothing is copied out of a `thinking` or a
+/// `redacted_thinking` block, so a thinking-heavy reply is stored once.
+///
+/// No cap on the BODY can therefore stand in for this check. One divided by
+/// the worst case cuts every reply that does not hit that case, and a cut
+/// body does not parse. See [`MAX_BODY_BYTES`].
+///
+/// The duplication itself stays. The workflow and the report read the derived
+/// fields, and deriving them on READ would put that parsing in the replay
+/// path. A later change to it would then make a past run mean something new,
+/// which is what `content` exists to prevent.
+///
 /// The check is on the SERIALISED reply, because that is what the backend
 /// measures. A reply over the cap is refused here rather than recorded. The
 /// backend answers `PayloadTooLarge`, which is not retryable, so the session
@@ -404,42 +419,43 @@ fn request_body(config: &ModelConfig, request: &TurnRequest) -> Value {
     })
 }
 
-/// How many bytes the durable reply holds per byte of response body.
+/// How much room the read cap leaves above the recorded payload cap.
 ///
-/// [`TurnReply`] keeps the assistant blocks VERBATIM in
-/// `content`, and `parse_reply` copies their text and their tool calls into
-/// `text` and `tool_calls`. Every payload byte is therefore stored twice, and
-/// the measured factor is exactly 2.
-///
-/// The duplication is the cost of the replay guarantee, and it stays. The
-/// workflow and the report read the derived fields, and deriving them on READ
-/// would put that parsing in the replay path. A later change to it would then
-/// make a past run mean something new, which is what `content` exists to
-/// prevent. The cap below pays for the copy instead.
-pub const DURABLE_BYTES_PER_BODY_BYTE: u64 = 2;
+/// A recordable reply can have a body LARGER than the reply itself: the
+/// response carries `id`, `model` and `usage` fields that `TurnReply` drops.
+/// The room is doubled rather than trimmed to the measured overhead. The
+/// read cap exists to bound MEMORY. A body it cuts is one this daemon pays
+/// for and then cannot parse at all.
+const BODY_READ_HEADROOM: u64 = 2;
 
 /// The most of one response body this turn reads.
 ///
-/// A reply the backend cannot record is of no use. The recorded payload cap
-/// is `DEFAULT_MAX_ACTIVITY_RESULT_BYTES`. This is that cap divided by
-/// [`DURABLE_BYTES_PER_BODY_BYTE`], so a body this reader ACCEPTS always fits
-/// once it is stored. A body that never ends is still bounded.
+/// This is a MEMORY bound. A body that never ends is refused, and no body
+/// whose reply the backend could record is ever cut. The recorded payload cap
+/// is `DEFAULT_MAX_ACTIVITY_RESULT_BYTES`, and this is that cap with
+/// [`BODY_READ_HEADROOM`] to spare.
 ///
-/// This was once twice the recorded cap, on the reasoning that no recordable
-/// reply should be refused for its size. The factor runs the other way. A
-/// body of 1.8 MB became a durable reply of 3.6 MB, and the backend refused
-/// it as `PayloadTooLarge` after the turn was billed. A turn paid for and
-/// discarded is worse than one refused while it is still being read.
+/// The DURABLE limit is enforced on the reply itself, by [`oversized`], and
+/// not here. Dividing this cap by the worst-case duplication factor looks
+/// like it would enforce both at once. It does not. A thinking-heavy reply
+/// duplicates nothing, so a 1.8 MB body records 1.8 MB and is well inside
+/// the cap. A read cap of half the recorded cap CUT that body, and a cut
+/// body does not parse. The turn then failed as a malformed response, after
+/// the same spend, so a working turn became a broken one.
 pub const MAX_BODY_BYTES: usize = {
-    let cap =
-        autumn_harvest::builder::DEFAULT_MAX_ACTIVITY_RESULT_BYTES / DURABLE_BYTES_PER_BODY_BYTE;
-    // The cast cannot lose a bit on any platform this daemon builds for, and
-    // a `usize` narrower than the cap would clamp rather than wrap.
-    if cap > usize::MAX as u64 {
-        usize::MAX
-    } else {
-        cap as usize
-    }
+    // The conversion is PROVED rather than clamped. A `usize` narrower than
+    // the cap fails the build here, instead of silently reading short.
+    let cap = autumn_harvest::builder::DEFAULT_MAX_ACTIVITY_RESULT_BYTES * BODY_READ_HEADROOM;
+    assert!(
+        cap <= usize::MAX as u64,
+        "the read cap does not fit this platform's usize"
+    );
+    #[allow(
+        clippy::cast_possible_truncation,
+        reason = "the assertion above proves the value fits"
+    )]
+    let bytes = cap as usize;
+    bytes
 };
 
 /// Read one response body, and stop at [`MAX_BODY_BYTES`].
