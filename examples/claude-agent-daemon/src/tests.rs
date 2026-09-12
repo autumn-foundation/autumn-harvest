@@ -2729,19 +2729,10 @@ fn a_recorded_task_rust_cannot_read_is_never_enlisted() {
     let dir = tempfile::tempdir().expect("a temporary directory");
     let db = dir.path().join("surrogate.db");
     let writer = rusqlite::Connection::open(&db).expect("the database opens");
-    writer
-        .execute(
-            "CREATE TABLE harvest_executions (exec_id TEXT, workflow_name TEXT, \
-             state TEXT, input_json TEXT, output_json TEXT, error TEXT)",
-            [],
-        )
-        .expect("the fixture table is created");
+    fixture_table(&writer);
     // The documents are written as TEXT, the way a writer of another version
     // would leave them. A Rust string cannot carry a lone surrogate, so the
     // escape is written and never built from a `Value`.
-    let good = r#"{"goal":"summarise it","max_turns":4,
-                   "approval_timeout_secs":300,
-                   "workspace":"/tmp/w","model":"offline"}"#;
     let bad_goal = r#"{"goal":"\uD800","max_turns":4,
                        "approval_timeout_secs":300,
                        "workspace":"/tmp/w","model":"offline"}"#;
@@ -2754,17 +2745,12 @@ fn a_recorded_task_rust_cannot_read_is_never_enlisted() {
                         "workspace":"/tmp/w","model":"offline",
                         "note":"\uD800"}"#;
     for (exec, document) in [
-        ("good", good),
+        ("good", READABLE_TASK),
         ("bad-goal", bad_goal),
         ("bad-workspace", bad_workspace),
         ("bad-spare", bad_spare),
     ] {
-        writer
-            .execute(
-                "INSERT INTO harvest_executions VALUES (?1, ?2, 'RUNNING', ?3, NULL, NULL)",
-                rusqlite::params![exec, WORKFLOW_NAME, document],
-            )
-            .expect("the session is recorded");
+        record_task(&writer, exec, document);
     }
     // One document of bytes that are not UTF-8 at all. Reading a field of it
     // as text fails the WHOLE query, which would name no row.
@@ -2808,21 +2794,109 @@ fn a_recorded_task_rust_cannot_read_is_never_enlisted() {
 
     let reader = rusqlite::Connection::open(&db).expect("the database opens");
     let running = inspect::running(&reader, WORKFLOW_NAME).expect("the query still answers");
-    let readable = |exec: &str| {
-        running
-            .iter()
-            .find(|row| row.exec_id == exec)
-            .expect("the session is RUNNING")
-            .task
-            .is_some()
-    };
-    assert!(readable("good"), "a readable task is still enlisted");
+    assert!(enlisted(&running, "good"), "a readable task is enlisted");
     for row in ["bad-goal", "bad-workspace", "bad-spare", "raw-bytes"] {
         assert!(
-            !readable(row),
+            !enlisted(&running, row),
             "{row} carries a task Rust cannot read and must not be enlisted"
         );
     }
+}
+
+/// A task of the right bytes in the wrong storage class is never enlisted.
+///
+/// The engine reads `input_json` straight into a `String`, so a BLOB value
+/// fails there whatever it holds. A column of TEXT affinity keeps a stored
+/// BLOB as a BLOB, so a damaged row can carry a perfect task in that class.
+///
+/// Casting to a blob hides the class. Such a row would be enlisted, and the
+/// drive would fail on every tick over a session nothing ever seals.
+#[test]
+fn a_task_document_in_the_wrong_storage_class_is_never_enlisted() {
+    let dir = tempfile::tempdir().expect("a temporary directory");
+    let db = dir.path().join("class.db");
+    let writer = rusqlite::Connection::open(&db).expect("the database opens");
+    fixture_table(&writer);
+    record_task(&writer, "good", READABLE_TASK);
+    writer
+        .execute(
+            "INSERT INTO harvest_executions \
+             VALUES ('blob-class', ?1, 'RUNNING', CAST(?2 AS BLOB), NULL, NULL)",
+            rusqlite::params![WORKFLOW_NAME, READABLE_TASK],
+        )
+        .expect("the blob session is recorded");
+
+    // The same bytes in both rows, and only the class differs.
+    let class = |exec: &str| -> String {
+        writer
+            .query_row(
+                "SELECT typeof(input_json) FROM harvest_executions WHERE exec_id = ?1",
+                [exec],
+                |row| row.get(0),
+            )
+            .expect("the class answers")
+    };
+    assert_eq!(class("good"), "text", "the readable row is TEXT");
+    assert_eq!(
+        class("blob-class"),
+        "blob",
+        "a TEXT column keeps a stored BLOB as a BLOB"
+    );
+    // The engine's own read of the row, which is what the drive would do.
+    let engine_read: Result<String, _> = writer.query_row(
+        "SELECT input_json FROM harvest_executions WHERE exec_id = 'blob-class'",
+        [],
+        |row| row.get(0),
+    );
+    assert!(
+        engine_read.is_err(),
+        "the engine's own read of this row must fail"
+    );
+    drop(writer);
+
+    let reader = rusqlite::Connection::open(&db).expect("the database opens");
+    let running = inspect::running(&reader, WORKFLOW_NAME).expect("the query still answers");
+    assert!(enlisted(&running, "good"), "a readable task is enlisted");
+    assert!(
+        !enlisted(&running, "blob-class"),
+        "a task in the wrong storage class must not be enlisted"
+    );
+}
+
+/// A recorded task both ends of the startup check can read.
+const READABLE_TASK: &str = r#"{"goal":"summarise it","max_turns":4,
+                                "approval_timeout_secs":300,
+                                "workspace":"/tmp/w","model":"offline"}"#;
+
+/// The one table the two enlistment tests read, with the columns they name.
+fn fixture_table(writer: &rusqlite::Connection) {
+    writer
+        .execute(
+            "CREATE TABLE harvest_executions (exec_id TEXT, workflow_name TEXT, \
+             state TEXT, input_json TEXT, output_json TEXT, error TEXT)",
+            [],
+        )
+        .expect("the fixture table is created");
+}
+
+/// Record one RUNNING session against a document written as TEXT.
+fn record_task(writer: &rusqlite::Connection, exec: &str, document: &str) {
+    writer
+        .execute(
+            "INSERT INTO harvest_executions VALUES (?1, ?2, 'RUNNING', ?3, NULL, NULL)",
+            rusqlite::params![exec, WORKFLOW_NAME, document],
+        )
+        .expect("the session is recorded");
+}
+
+/// Did the startup check read a task for this session?
+fn enlisted(running: &[inspect::RunningSession], exec: &str) -> bool {
+    running
+        .iter()
+        .find(|row| row.exec_id == exec)
+        .expect("the session is RUNNING")
+        .task
+        .is_some()
 }
 
 /// The startup check draws the blank-goal line where `submit` draws it.

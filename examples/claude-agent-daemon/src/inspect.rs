@@ -174,12 +174,22 @@ pub fn running(conn: &Connection, workflow_name: &str) -> Result<Vec<RunningSess
     // not valid UTF-8. Reading one of those as text fails the WHOLE query,
     // which would name no row at all. The bytes name their own row.
     //
+    // The STORAGE CLASS is checked first, because the cast hides it. The
+    // engine reads this column straight into a `String`, and `rusqlite`
+    // refuses a BLOB value there. A column of TEXT affinity still keeps a
+    // stored BLOB as a BLOB. A damaged row can therefore hold the right
+    // bytes in the wrong class. The cast alone would accept it, and the
+    // drive would fail on every tick over a session nothing ever seals.
+    //
     // The cost is ONE document at a time. The rows are read as a stream, and
     // the task is cut down before the next row, so the returned set holds no
     // goal. A single control request already costs the daemon that memory.
     let mut statement = conn
         .prepare(
-            "SELECT exec_id, cast(input_json as blob) FROM harvest_executions \
+            "SELECT exec_id, \
+                    CASE WHEN typeof(input_json) = 'text' \
+                         THEN cast(input_json as blob) END \
+             FROM harvest_executions \
              WHERE workflow_name = ?1 AND state = 'RUNNING' ORDER BY rowid",
         )
         .map_err(|e| format!("cannot prepare the running-session query: {e}"))?;
@@ -206,7 +216,9 @@ pub fn running(conn: &Connection, workflow_name: &str) -> Result<Vec<RunningSess
 ///
 /// The three steps are the runtime's own, in its order. The backend reads
 /// `input_json` as TEXT, parses the WHOLE document into a `Value`, and the
-/// workflow takes its task from that value. Each step refuses something the
+/// workflow takes its task from that value. The caller has already refused a
+/// value of another storage class. That is the first half of the TEXT read,
+/// and the UTF-8 test here is the second. Each step refuses something the
 /// next one never sees. The middle step is why a fault in a field no check
 /// reads still answers `None`. Parsing a document unescapes every string in
 /// it, including one this daemon ignores.
