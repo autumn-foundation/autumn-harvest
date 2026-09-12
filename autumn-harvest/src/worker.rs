@@ -18293,21 +18293,18 @@ fn pending_update_result_event_count(commands: &[WorkflowCommand]) -> u64 {
 fn terminal_history_event_count(
     next_event_id: i32,
     pending_cmds: &[WorkflowCommand],
-    // Issue #952: `true` for a FAILING terminal, whose batch also appends the
-    // abandoned-dispatch records. The hard-cap preflight counts them, and this
-    // `harvest.workflow.history_size` gauge is meant to describe the same
-    // number, so it counts them too.
-    records_abandoned_dispatches: bool,
+    // Issue #952: nonzero for a FAILING terminal, whose batch also appends
+    // the abandoned-dispatch records. Issue #1265: this must be the SAME
+    // dedup-resolved count the hard-cap preflight computed
+    // (`abandoned_dispatch_event_count_resolved`), not a pre-dedup recount —
+    // a re-parked dispatch the dedup already zeroed must not inflate this
+    // gauge.
+    resolved_abandoned_dispatch_event_count: u64,
 ) -> u64 {
-    let abandoned = if records_abandoned_dispatches {
-        abandoned_dispatch_event_count(pending_cmds)
-    } else {
-        0
-    };
     u64::try_from(next_event_id)
         .unwrap_or(0)
         .saturating_add(pending_update_result_event_count(pending_cmds))
-        .saturating_add(abandoned)
+        .saturating_add(resolved_abandoned_dispatch_event_count)
         .saturating_add(1)
 }
 
@@ -20509,6 +20506,10 @@ async fn process_workflow_task(
     } else {
         0
     };
+    // Issue #1265: captured here so the `history_size` gauge below can reuse
+    // the SAME dedup-resolved count instead of recomputing a pre-dedup one.
+    // Stays 0 for every non-`Failed` outcome, which never resolves this.
+    let mut resolved_abandoned_dispatch_event_count: u64 = 0;
     let pending_durable_event_count = match &outcome {
         WorkflowOutcome::Suspended { commands } => {
             match suspended_command_event_count(conn, task.workflow_exec_id, commands).await {
@@ -20554,6 +20555,7 @@ async fn process_workflow_task(
                     .await;
                 }
             };
+            resolved_abandoned_dispatch_event_count = abandoned;
             pending_update_result_event_count(&pending_cmds)
                 .saturating_add(pre_suspension_event_count(&pending_cmds))
                 .saturating_add(terminal_parent_close_cascade_events)
@@ -20623,7 +20625,7 @@ async fn process_workflow_task(
             terminal_history_event_count(
                 next_event_id,
                 &pending_cmds,
-                records_abandoned_dispatches(&outcome),
+                resolved_abandoned_dispatch_event_count,
             )
             .saturating_add(terminal_parent_close_cascade_events),
         )

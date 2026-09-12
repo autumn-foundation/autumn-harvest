@@ -915,7 +915,25 @@ impl HistoryMatcher {
     /// the CHILD's own author string, the reason is matched together with the
     /// exact shape the engine writes (untyped, non-retryable) so an author
     /// message that happens to collide keeps its genuine terminal.
+    ///
+    /// An activity author can also quote the reason AND match the shape (issue
+    /// #1265): `ActivityFailure::non_retryable` reproduces both. The
+    /// synthetic path never dispatches, so it never writes `ActivityStarted`
+    /// or `ActivityHeartbeat` for the id. A real attempt does. This is a
+    /// structural check, not another field-value guess, so a candidate
+    /// activity with either event anywhere in the scanned window keeps its
+    /// genuine terminal instead of being marked transparent.
     fn abandoned_dispatch_indices(events: &[WorkflowEvent]) -> Vec<usize> {
+        let mut started_activities: HashSet<ActivityExecId> = HashSet::new();
+        for event in events {
+            match event {
+                WorkflowEvent::ActivityStarted { activity_id, .. }
+                | WorkflowEvent::ActivityHeartbeat { activity_id, .. } => {
+                    started_activities.insert(*activity_id);
+                }
+                _ => {}
+            }
+        }
         let mut abandoned_activities: HashSet<ActivityExecId> = HashSet::new();
         let mut abandoned_children: HashSet<ExecutionId> = HashSet::new();
         let mut indices: Vec<usize> = Vec::new();
@@ -929,7 +947,9 @@ impl HistoryMatcher {
                 // structured details — so a genuine activity failure that
                 // happens to return this message keeps its real terminal
                 // instead of being re-dispatched (and its side effects
-                // repeated) by a redriven run.
+                // repeated) by a redriven run. A real `ActivityStarted` /
+                // `ActivityHeartbeat` for this id is the same guard, checked
+                // structurally instead of by field value (issue #1265).
                 WorkflowEvent::ActivityFailed {
                     activity_id,
                     error,
@@ -937,7 +957,10 @@ impl HistoryMatcher {
                     error_type,
                     non_retryable: true,
                     details: None,
-                } if error == crate::event::ABANDONED_DISPATCH_REASON && error_type == "Error" => {
+                } if error == crate::event::ABANDONED_DISPATCH_REASON
+                    && error_type == "Error"
+                    && !started_activities.contains(activity_id) =>
+                {
                     abandoned_activities.insert(*activity_id);
                     indices.push(i);
                 }
