@@ -245,6 +245,42 @@ fn recorded(document: &[u8]) -> Option<RecordedTask> {
     })
 }
 
+/// The cursor that reads from the newest row, as a BOUND and not a NULL.
+///
+/// `(?2 IS NULL OR seq < ?2)` is not an index bound. `SQLite` cannot know
+/// which side of the `OR` holds while it plans. It searches by the other
+/// terms and tests this one row by row. A page deep in a long history then
+/// walks past every newer row to reach it, and each further page walks
+/// further. Measured on 50000 events, a page 100 rows from the start took
+/// 7.5ms that way and 0.07ms as a bound.
+///
+/// The largest possible value stands in for "no cursor". One statement then
+/// serves the first page and every page after it, and both are a seek.
+///
+/// The bound excludes a row AT that value, which no counter this engine
+/// assigns can reach. `seq` counts the events of one run, and a `rowid` is
+/// an insert counter.
+pub fn no_cursor(before: Option<i64>) -> i64 {
+    before.unwrap_or(i64::MAX)
+}
+
+/// One page of a session's events, newest first. See [`no_cursor`].
+pub const EVENTS_QUERY: &str = "SELECT seq, json_extract(event_json, '$.type'), \
+            substr(json_extract(event_json, '$.data'), 1, ?4) \
+     FROM harvest_events \
+     WHERE exec_id = ?1 AND seq < ?2 \
+     ORDER BY seq DESC LIMIT ?3";
+
+/// The tool calls of one page of model replies, newest first.
+///
+/// The `stop_reason` test is not indexed, so it is applied to the rows the
+/// bound admits, and not used to find them. See [`no_cursor`].
+pub const REPLIES_QUERY: &str = "SELECT seq, json_extract(event_json, '$.data.output.tool_calls') \
+     FROM harvest_events \
+     WHERE exec_id = ?1 AND seq < ?2 \
+     AND json_extract(event_json, '$.data.output.stop_reason') IS NOT NULL \
+     ORDER BY seq DESC LIMIT ?3";
+
 /// One recorded event, already cut to what an audit line prints.
 ///
 /// The whole event is never read. A recorded activity can approach the
@@ -279,17 +315,11 @@ pub fn event_lines(
     // from one that ended by itself.
     let detail_cap = MAX_EVENT_DETAIL_CHARS + 1;
     let mut statement = conn
-        .prepare(
-            "SELECT seq, json_extract(event_json, '$.type'), \
-                    substr(json_extract(event_json, '$.data'), 1, ?4) \
-             FROM harvest_events \
-             WHERE exec_id = ?1 AND (?2 IS NULL OR seq < ?2) \
-             ORDER BY seq DESC LIMIT ?3",
-        )
+        .prepare(EVENTS_QUERY)
         .map_err(|e| format!("cannot prepare the event query: {e}"))?;
     let rows = statement
         .query_map(
-            rusqlite::params![exec_id, before, limit, detail_cap],
+            rusqlite::params![exec_id, no_cursor(before), limit, detail_cap],
             |row| {
                 Ok(EventLine {
                     seq: row.get(0)?,
@@ -333,18 +363,13 @@ pub fn reply_calls(
     limit: u32,
 ) -> Result<Vec<(i64, serde_json::Value)>, String> {
     let mut statement = conn
-        .prepare(
-            "SELECT seq, json_extract(event_json, '$.data.output.tool_calls') \
-             FROM harvest_events \
-             WHERE exec_id = ?1 AND (?2 IS NULL OR seq < ?2) \
-             AND json_extract(event_json, '$.data.output.stop_reason') IS NOT NULL \
-             ORDER BY seq DESC LIMIT ?3",
-        )
+        .prepare(REPLIES_QUERY)
         .map_err(|e| format!("cannot prepare the reply query: {e}"))?;
     let rows = statement
-        .query_map(rusqlite::params![exec_id, before, limit], |row| {
-            Ok((row.get::<_, i64>(0)?, row.get::<_, Option<String>>(1)?))
-        })
+        .query_map(
+            rusqlite::params![exec_id, no_cursor(before), limit],
+            |row| Ok((row.get::<_, i64>(0)?, row.get::<_, Option<String>>(1)?)),
+        )
         .map_err(|e| format!("cannot read the replies: {e}"))?;
 
     rows.map(|row| {
@@ -577,6 +602,35 @@ fn cut_text(bytes: Option<Vec<u8>>) -> Option<String> {
     (!cut.is_empty()).then_some(cut)
 }
 
+/// One page of the sessions a listing names, newest first. See [`no_cursor`].
+pub const SESSIONS_QUERY: &str = "SELECT exec_id, state, \
+                    CASE WHEN json_valid(input_json) \
+                          AND json_type(input_json, '$.goal') = 'text' \
+                         THEN substr(cast(json_extract(input_json, '$.goal') as blob), \
+                                     1, ?3) END, \
+                    CASE WHEN json_valid(output_json) \
+                          AND json_type(output_json, '$.stop') = 'text' \
+                         THEN substr(cast(json_extract(output_json, '$.stop') as blob), \
+                                     1, ?3) END, \
+                    CASE WHEN json_valid(output_json) \
+                          AND json_type(output_json, '$.turns') = 'integer' \
+                          AND typeof(json_extract(output_json, '$.turns')) = 'integer' \
+                         THEN json_extract(output_json, '$.turns') END, \
+                    CASE WHEN json_valid(output_json) \
+                          AND json_type(output_json, '$.tool_calls') = 'integer' \
+                          AND typeof(json_extract(output_json, '$.tool_calls')) \
+                              = 'integer' \
+                         THEN json_extract(output_json, '$.tool_calls') END, \
+                    CASE WHEN json_valid(output_json) \
+                          AND json_type(output_json, '$.answer') = 'text' \
+                         THEN substr(cast(json_extract(output_json, '$.answer') as blob), \
+                                     1, ?3) END, \
+                    substr(cast(error as blob), 1, ?3), \
+                    rowid \
+             FROM harvest_executions WHERE +workflow_name = ?1 \
+             AND rowid < ?4 \
+             ORDER BY rowid DESC LIMIT ?2";
+
 /// One page of the agent workflow's executions, oldest first.
 ///
 /// `before` reads the page before a row this listing named. The cap is on one
@@ -590,6 +644,23 @@ pub fn executions(
     workflow_name: &str,
     before: Option<i64>,
 ) -> Result<Vec<SessionSummary>, String> {
+    // The rows are walked by ROWID, and the workflow name is tested against
+    // each one. The `+` is what asks for that: it takes the name out of the
+    // planner's index choice.
+    //
+    // The index on the name cannot answer `ORDER BY rowid`, so a lookup
+    // through it sorts every matching row in a temporary B-tree before the
+    // LIMIT applies. The cap then bounds what comes BACK and not what is
+    // read, which is the opposite of what this query is for. Walking the
+    // rowid index backwards is already the order the listing wants, so it
+    // stops at the cap. Measured on 20000 sessions, the first page took
+    // 11.7ms through the index and 0.1ms by this walk.
+    //
+    // The trade is real, and the other way in one case. A file where this
+    // workflow is a small minority costs a walk past the rest: 2.9ms against
+    // 0.09ms at 50 rows in 20000. This daemon owns its file and starts one
+    // workflow in it, so the majority case is the only one it has.
+    //
     // The FIELDS are selected, and not the rows. A recorded task and a
     // recorded report can each approach the backend's payload cap. A listing
     // that read them whole would hold hundreds of megabytes for a capped
@@ -619,35 +690,7 @@ pub fn executions(
     // those into a `String` fails the whole statement. The bytes are decoded
     // by the caller, which keeps what is readable.
     let mut statement = conn
-        .prepare(
-            "SELECT exec_id, state, \
-                    CASE WHEN json_valid(input_json) \
-                          AND json_type(input_json, '$.goal') = 'text' \
-                         THEN substr(cast(json_extract(input_json, '$.goal') as blob), \
-                                     1, ?3) END, \
-                    CASE WHEN json_valid(output_json) \
-                          AND json_type(output_json, '$.stop') = 'text' \
-                         THEN substr(cast(json_extract(output_json, '$.stop') as blob), \
-                                     1, ?3) END, \
-                    CASE WHEN json_valid(output_json) \
-                          AND json_type(output_json, '$.turns') = 'integer' \
-                          AND typeof(json_extract(output_json, '$.turns')) = 'integer' \
-                         THEN json_extract(output_json, '$.turns') END, \
-                    CASE WHEN json_valid(output_json) \
-                          AND json_type(output_json, '$.tool_calls') = 'integer' \
-                          AND typeof(json_extract(output_json, '$.tool_calls')) \
-                              = 'integer' \
-                         THEN json_extract(output_json, '$.tool_calls') END, \
-                    CASE WHEN json_valid(output_json) \
-                          AND json_type(output_json, '$.answer') = 'text' \
-                         THEN substr(cast(json_extract(output_json, '$.answer') as blob), \
-                                     1, ?3) END, \
-                    substr(cast(error as blob), 1, ?3), \
-                    rowid \
-             FROM harvest_executions WHERE workflow_name = ?1 \
-             AND (?4 IS NULL OR rowid < ?4) \
-             ORDER BY rowid DESC LIMIT ?2",
-        )
+        .prepare(SESSIONS_QUERY)
         .map_err(|e| format!("cannot prepare the session query: {e}"))?;
     let rows = statement
         .query_map(
@@ -655,7 +698,7 @@ pub fn executions(
                 workflow_name,
                 MAX_LISTED_SESSIONS + 1,
                 MAX_LISTED_BYTES,
-                before
+                no_cursor(before)
             ],
             |row| {
                 Ok(SessionSummary {

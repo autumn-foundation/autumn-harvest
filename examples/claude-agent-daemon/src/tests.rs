@@ -3173,6 +3173,109 @@ fn a_directory_entry_holding_a_line_break_is_counted_and_not_named() {
     );
 }
 
+/// Every paged query is planned as a SEEK, and none of them sorts.
+///
+/// A cap on the rows a query RETURNS is not a cap on the rows it reads. Two
+/// shapes break that, and both were here:
+///
+/// `(?2 IS NULL OR seq < ?2)` is not an index bound. `SQLite` cannot know
+/// which side of the `OR` holds while it plans. It finds rows by the other
+/// terms and tests this one on each. A page deep in a long history walks
+/// past every newer row to reach it.
+///
+/// An index on the workflow name cannot answer `ORDER BY rowid`. A lookup
+/// through it therefore sorts every matching session in a temporary B-tree
+/// before the LIMIT applies. The `+` takes the name out of the planner's
+/// index choice, which leaves the rowid walk the listing already wants.
+///
+/// The test reads the PRODUCTION query strings and asks the database how it
+/// would run them. The fixture carries the schema shapes and the index the
+/// engine creates. A plan is what the engine decides, so no other assertion
+/// here can stand in for it.
+#[test]
+fn every_paged_query_is_planned_as_a_seek() {
+    let conn = rusqlite::Connection::open_in_memory().expect("the database opens");
+    conn.execute_batch(
+        "CREATE TABLE harvest_executions (exec_id TEXT, workflow_name TEXT, \
+         workflow_id TEXT, state TEXT, input_json TEXT, output_json TEXT, error TEXT);
+         CREATE INDEX idx_harvest_executions_key \
+             ON harvest_executions (workflow_name, workflow_id);
+         CREATE TABLE harvest_events (exec_id TEXT NOT NULL, seq INTEGER NOT NULL, \
+         event_json TEXT NOT NULL, PRIMARY KEY (exec_id, seq));",
+    )
+    .expect("the fixture schema is created");
+
+    let plan = |sql: &str, params: &[&dyn rusqlite::ToSql]| -> String {
+        let mut statement = conn
+            .prepare(&format!("EXPLAIN QUERY PLAN {sql}"))
+            .expect("the plan is explained");
+        statement
+            .query_map(params, |row| row.get::<_, String>(3))
+            .expect("the plan reads")
+            .map(|row| row.expect("a plan line reads"))
+            .collect::<Vec<_>>()
+            .join(" | ")
+    };
+
+    let top = crate::inspect::no_cursor(None);
+    let cases = [
+        (
+            "events",
+            crate::inspect::EVENTS_QUERY,
+            vec![&"exec-1" as &dyn rusqlite::ToSql, &top, &500_i64, &240_i64],
+            "seq<?",
+        ),
+        (
+            "replies",
+            crate::inspect::REPLIES_QUERY,
+            vec![&"exec-1" as &dyn rusqlite::ToSql, &top, &1_i64],
+            "seq<?",
+        ),
+        (
+            "sessions",
+            crate::inspect::SESSIONS_QUERY,
+            vec![
+                &"agent_session" as &dyn rusqlite::ToSql,
+                &201_i64,
+                &2000_i64,
+                &top,
+            ],
+            "rowid<?",
+        ),
+    ];
+    for (name, sql, params, bound) in cases {
+        let shown = plan(sql, &params);
+        assert!(
+            shown.contains(bound),
+            "the {name} query must seek on {bound}: {shown}"
+        );
+        assert!(
+            !shown.contains("TEMP B-TREE"),
+            "the {name} query must not sort what it reads: {shown}"
+        );
+        assert!(
+            !shown.contains("SCAN harvest_events"),
+            "the {name} query must not scan the event log: {shown}"
+        );
+    }
+
+    // A later page is planned the same way as the first. That is the point
+    // of standing a bound in for the absent cursor.
+    let deep = plan(
+        crate::inspect::EVENTS_QUERY,
+        &[
+            &"exec-1" as &dyn rusqlite::ToSql,
+            &100_i64,
+            &500_i64,
+            &240_i64,
+        ],
+    );
+    assert!(
+        deep.contains("seq<?") && !deep.contains("TEMP B-TREE"),
+        "a later page is a seek too: {deep}"
+    );
+}
+
 /// One damaged row does not hide every other session.
 ///
 /// `json_extract` on a document that is not JSON raises `malformed JSON`, and
