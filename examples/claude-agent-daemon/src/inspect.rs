@@ -82,6 +82,16 @@ pub struct SessionSummary {
     /// rows BEFORE it. The listing is capped, so an old session waiting for a
     /// decision would otherwise become unreachable once enough newer ones
     /// arrive.
+    ///
+    /// This is the `rowid`, because `harvest_executions` carries no time and
+    /// no sequence of its own. The rows are ordered by it, and a rowid is
+    /// assigned in insert order, so the order is the order sessions started.
+    ///
+    /// A `VACUUM` may renumber a rowid, unlike the event `seq` the history
+    /// cursor uses. A cursor copied before one and used after it would name
+    /// another page. The window is the seconds between reading a listing and
+    /// typing the next command. No column in this table is stable across a
+    /// `VACUUM`, so this is the bound of what the schema allows.
     pub row: i64,
 }
 
