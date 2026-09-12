@@ -28532,9 +28532,9 @@ pub async fn reset_timed_out_workflow_task(pool: &DbPool, task_id: uuid::Uuid, w
     // error below.
     //
     // This narrows, but does not close, #1459. A connection outage longer
-    // than ~61s still leaves the row stuck with no backstop, since nothing
-    // here adds a reclaim path for a wedged task on a live worker. A
-    // dedicated liveness check for the claiming worker is a separate,
+    // than ~61s still leaves the row stuck with no backstop. Nothing here
+    // adds a reclaim path for a wedged task on a live worker. A dedicated
+    // liveness check for the claiming worker is a separate,
     // larger question, tracked on the issue and not attempted here.
     let mut conn = {
         let mut last_err = None;
